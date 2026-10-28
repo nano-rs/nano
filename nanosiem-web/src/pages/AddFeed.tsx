@@ -57,7 +57,13 @@ import {
 import { Button } from '@/components/ui/button';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useToast } from '@/hooks/use-toast';
-import { pollMelodJob, useMelodJob } from '@/enterprise/hooks/use-melod-job';
+import {
+  formatElapsed,
+  PARSER_JOB_MAX_WAIT_MS,
+  pollMelodJob,
+  useElapsedWhile,
+  useMelodJob,
+} from '@/enterprise/hooks/use-melod-job';
 import { api, ApiClientError } from '@/lib/api';
 import { safeErrorMessage } from '@/lib/api/http-error';
 import type {
@@ -681,12 +687,16 @@ export function AddFeed() {
           }),
         {
           signal: controller.signal,
-          onProgress: (message) => {
+          // NAN-4778: a large draft can take many minutes; wait as long as
+          // the server job can live.
+          maxWaitMs: PARSER_JOB_MAX_WAIT_MS,
+          onProgress: (message, elapsedMs) => {
             if (controller.signal.aborted) return;
             // Progress creeps toward 90 % while the job runs; the job reports
-            // its own stage text.
-            setGenProgress((p) => Math.min(90, p + 2));
-            setGenStatus(message && message !== 'Working...' ? message : 'Drafting parser…');
+            // its own stage text, plus how long it has been working.
+            setGenProgress((p) => Math.min(90, p + 1));
+            const stage = message && message !== 'Working...' ? message : 'Drafting parser…';
+            setGenStatus(`${stage} · ${formatElapsed(elapsedMs)}`);
           },
         },
       );
@@ -746,15 +756,17 @@ export function AddFeed() {
       setPivtSuggestion(null);
       try {
         const samples = splitSamples(sampleText);
-        const result = await editParserJob.start(() =>
-          api.melodEditParser({
-            // Drafts have no id — pass empty string; backend treats as unsaved.
-            parser_id: draftId ?? '',
-            current_vrl: vrl,
-            message,
-            sample_logs: samples,
-            session_id: sessionIdRef.current,
-          }),
+        const result = await editParserJob.start(
+          () =>
+            api.melodEditParser({
+              // Drafts have no id — pass empty string; backend treats as unsaved.
+              parser_id: draftId ?? '',
+              current_vrl: vrl,
+              message,
+              sample_logs: samples,
+              session_id: sessionIdRef.current,
+            }),
+          { maxWaitMs: PARSER_JOB_MAX_WAIT_MS },
         );
         setPivtSuggestion(result);
         setPivtMessage('');
@@ -3348,6 +3360,7 @@ function AiPane({
     'Find redundant logic',
   ];
   const disabled = pending || !draftSaved;
+  const elapsedMs = useElapsedWhile(pending);
   return (
     <div className="flex flex-col flex-1 min-h-0">
       <div className="px-3 py-3 space-y-3 flex-1 overflow-auto scrollbar-thin">
@@ -3381,6 +3394,13 @@ function AiPane({
             </button>
           ))}
         </div>
+        {pending && (
+          <div className="flex items-center gap-1.5 text-[10.5px] text-muted-foreground" role="status">
+            <Zap className="w-3 h-3 animate-pulse text-primary" />
+            <span>pivt is editing the parser…</span>
+            <span className="font-mono">{formatElapsed(elapsedMs)}</span>
+          </div>
+        )}
         {suggestion && (
           <div className="rounded-md border border-border bg-card p-2.5 space-y-2">
             <div className="text-[10.5px] text-muted-foreground leading-relaxed">{suggestion.message}</div>

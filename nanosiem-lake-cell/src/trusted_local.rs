@@ -51,6 +51,9 @@ pub const EXIT_USAGE: i32 = 2;
 const INGEST_LAB_KIND: &str = "nano.lake.ingest-lab-credentials.v1";
 const QUERY_BOOTSTRAP_FORMAT: &str = "nano.lake-query-bootstrap.v1";
 const SIGNER_KEY_ID: &str = "trusted-local-signer-0001";
+/// `nanosiem_lake_worker::lean_platform_feeds::ALL_BUNDLED_GRANTS_SCHEMA`
+/// (this crate sits below the worker; a worker test pins the equality).
+pub const ALL_BUNDLED_GRANTS_SCHEMA: &str = "nano/lake-cell-platform-grants-all-bundled/1";
 
 /// A conflict that `--force` would override (exit 3).
 #[derive(Debug, thiserror::Error)]
@@ -99,6 +102,12 @@ pub struct InitArgs {
     /// `uid:gid` owning `app/` files (the app services' user).
     pub app_owner: Option<(u32, u32)>,
     pub require_landlock: bool,
+    /// NAN-4759: the node platform feed volume inside the cell container
+    /// (`<feed_dir>/bundles`: content-addressed bundles and `current.json`,
+    /// kept by the `lean-platform-feeds` service).
+    pub feed_dir: PathBuf,
+    /// NAN-4759: `<policy_root>/<tenant>/policy.json`, outside `feed_dir`.
+    pub policy_root: PathBuf,
 }
 
 impl Default for InitArgs {
@@ -127,6 +136,8 @@ impl Default for InitArgs {
             host_root: "/".into(),
             app_owner: None,
             require_landlock: true,
+            feed_dir: "/var/lib/nano-platform-feeds".into(),
+            policy_root: "/var/lib/nano-platform-policy".into(),
         }
     }
 }
@@ -135,7 +146,8 @@ const USAGE: &str = "usage: nanosiem-lake-cell trusted-local init --out <dir> [-
 [--cell-id <id>] [--cell-config-root <path>] [--cell-data-root <path>] [--app-config-root <path>] \
 [--listen <addr:port>] [--cell-origin <url>] [--bronze-endpoint <url>] [--bronze-region <r>] \
 [--bronze-bucket <b>] [--bronze-prefix <p>] [--bin-dir <path>] [--chdb-library <path>] [--chdb-sha256 <hex>] \
-[--compiler <path>] [--memory-bytes <n>] [--cpus <n>] [--target-eps <n>] [--app-owner <uid:gid>] [--no-require-landlock]";
+[--compiler <path>] [--memory-bytes <n>] [--cpus <n>] [--target-eps <n>] [--app-owner <uid:gid>] [--no-require-landlock] \
+[--feed-dir <path>] [--policy-root <path>]";
 
 pub fn usage() -> &'static str {
     USAGE
@@ -167,6 +179,8 @@ pub fn parse_args(args: &[String]) -> std::result::Result<InitArgs, Usage> {
             "--cell-id" => out.cell_id = take(&mut i)?,
             "--cell-config-root" => out.cell_config_root = take(&mut i)?.into(),
             "--cell-data-root" => out.cell_data_root = take(&mut i)?.into(),
+            "--feed-dir" => out.feed_dir = take(&mut i)?.into(),
+            "--policy-root" => out.policy_root = take(&mut i)?.into(),
             "--app-config-root" => out.app_config_root = take(&mut i)?.into(),
             "--listen" => out.listen = take(&mut i)?,
             "--cell-origin" => out.cell_origin = take(&mut i)?,
@@ -214,7 +228,8 @@ impl InitArgs {
             "--cell-id must be 1-63 of [a-z0-9-]");
         for (name, path) in [("--cell-config-root", &self.cell_config_root), ("--cell-data-root", &self.cell_data_root),
             ("--app-config-root", &self.app_config_root), ("--bin-dir", &self.bin_dir),
-            ("--chdb-library", &self.chdb_library), ("--compiler", &self.compiler)] {
+            ("--chdb-library", &self.chdb_library), ("--compiler", &self.compiler),
+            ("--feed-dir", &self.feed_dir), ("--policy-root", &self.policy_root)] {
             ensure!(path.is_absolute(), "{name} must be an absolute path");
         }
         ensure!(self.listen.parse::<std::net::SocketAddr>().is_ok(), "--listen must be addr:port");
@@ -553,6 +568,10 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
         "router_query_token_file": cfg_root.join("secret/router-query.token"),
         "placement_file": cfg_root.join("placement.json"),
         "dev_key_dir": cfg_root.join("secret"),
+        // NAN-4759: platform enrichment (IPinfo Lite geo/ASN, ThreatFox, Tor)
+        // through the same bundle dir + per-tenant policy a hosted cell reads.
+        "feed_dir": args.feed_dir,
+        "platform_bundle_dir": args.feed_dir.join("bundles"),
     });
     let (i, d, q) = (sizing.ingest, sizing.detect, sizing.query);
     let placement = json!({
@@ -568,6 +587,7 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
             "detect_request_memory_bytes": d.2, "detect_limit_memory_bytes": d.3,
             "query_request_millicores": q.0, "query_limit_millicores": q.1,
             "query_request_memory_bytes": q.2, "query_limit_memory_bytes": q.3,
+            "platform_policy_file": args.policy_root.join(&tenant_s).join("policy.json"),
         }],
     });
     // Self-check against the supervisor's own validation before writing.
@@ -606,6 +626,19 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
     write_file(&out.join("cell/placement.json"), &serde_json::to_vec_pretty(&placement)?, 0o644, None)?;
     write_file(&out.join("app/routes.json"), &serde_json::to_vec_pretty(&routes)?, 0o644, args.app_owner)?;
     write_file(&out.join("app/lake-cell.env"), app_env.as_bytes(), 0o644, args.app_owner)?;
+    // NAN-4759: the self-hosted default grant (every bundled feed, at the
+    // installed bundle's revision, until its hard expiry), read by the
+    // `lean-platform-feeds` publisher (`lean_platform_feeds`).
+    ensure_dir(&out.join("platform-grants"), 0o755)?;
+    let grants = json!({"schema": ALL_BUNDLED_GRANTS_SCHEMA, "tenant_id": tenant_s, "rows": []});
+    // One tenant per install: a `--force` re-mint drops the old tenant's grant.
+    for entry in std::fs::read_dir(out.join("platform-grants"))? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "json") && path.file_stem().is_some_and(|s| s != tenant_s.as_str()) {
+            std::fs::remove_file(path)?;
+        }
+    }
+    write_file(&out.join("platform-grants").join(format!("{tenant_s}.json")), &serde_json::to_vec_pretty(&grants)?, 0o644, None)?;
     write_file(&out.join("tenant_id"), format!("{tenant_s}\n").as_bytes(), 0o644, None)?;
     Ok(json!({
         "tenant_id": tenant_s,
@@ -693,6 +726,13 @@ mod tests {
         let cell: Value = serde_json::from_slice(&std::fs::read(out.join("cell/cell.json")).unwrap()).unwrap();
         assert_eq!(cell["trusted_local"], true, "init owns the trusted-local flag");
         assert_eq!(cell["mode"], "dedicated");
+        // NAN-4759: platform feeds through the hosted bundle-dir + policy path.
+        assert_eq!(cell["feed_dir"], "/var/lib/nano-platform-feeds");
+        assert_eq!(cell["platform_bundle_dir"], "/var/lib/nano-platform-feeds/bundles");
+        let placement: Value = serde_json::from_slice(&std::fs::read(out.join("cell/placement.json")).unwrap()).unwrap();
+        assert_eq!(placement["tenants"][0]["platform_policy_file"], format!("/var/lib/nano-platform-policy/{tenant}/policy.json"));
+        let grants: Value = serde_json::from_slice(&std::fs::read(out.join(format!("platform-grants/{tenant}.json"))).unwrap()).unwrap();
+        assert_eq!(grants, serde_json::json!({"schema": ALL_BUNDLED_GRANTS_SCHEMA, "tenant_id": tenant, "rows": []}));
         let env_file = std::fs::read_to_string(out.join("app/lake-cell.env")).unwrap();
         assert!(env_file.contains(&format!("NANO_LAKE_TENANT_ID={tenant}\n")));
         // The explicit trusted-local opt-in for api/search/jobs comes only from init.
@@ -727,6 +767,8 @@ mod tests {
         let forced = init(&other, &env).unwrap();
         assert_eq!(forced["created"], true);
         assert_eq!(forced["tenant_id"], other.tenant_id.unwrap().to_string());
+        let grant_files: Vec<_> = std::fs::read_dir(out.join("platform-grants")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(grant_files, vec![std::ffi::OsString::from(format!("{}.json", other.tenant_id.unwrap()))], "re-mint drops the old grant");
     }
 
     #[test]

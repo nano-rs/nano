@@ -128,6 +128,11 @@ struct Stored {
     /// in a ledger written before NAN-4553 (and outside recovery).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     isolate: Option<u32>,
+    /// NAN-4553: objects the process that wrote this ledger charged (an
+    /// admission alone), so a coded exit can undo them. NAN-4755: stored,
+    /// so the next process can forgive them when the death was a merge's.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    charged: std::collections::BTreeSet<String>,
 }
 
 /// The durable admission-attempt ledger in ingest[T]'s work dir.
@@ -145,9 +150,8 @@ pub struct AdmissionAttempts {
     /// their flush until it commits, so the next crash counts against the
     /// one object in flight and never against the healthy ones beside it.
     isolating: std::collections::BTreeSet<String>,
-    /// NAN-4553: objects this process charged (an admission alone), so a
-    /// coded exit can undo the charge.
-    charged: std::collections::BTreeSet<String>,
+    /// NAN-4755: the charges of the process that wrote the ledger last.
+    last_charged: std::collections::BTreeSet<String>,
     /// NAN-4553: suspects admitted together during recovery (bisection).
     group_limit: usize,
 }
@@ -162,7 +166,7 @@ impl AdmissionAttempts {
     /// the counts only delays a refusal, it never refuses good data.
     pub fn open(work_dir: &Path) -> Self {
         let path = work_dir.join(FILE);
-        let stored = match std::fs::read(&path) {
+        let mut stored: Stored = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
                 tracing::warn!(error = %error, "admission attempt ledger unreadable; starting over");
                 Stored::default()
@@ -179,7 +183,9 @@ impl AdmissionAttempts {
             None => suspects.len().div_ceil(2),
         }
         .max(1);
-        Self { path, stored, suspects, isolating: Default::default(), charged: Default::default(), group_limit }
+        // This process's own charges start empty.
+        let last_charged = std::mem::take(&mut stored.charged);
+        Self { path, stored, suspects, isolating: Default::default(), last_charged, group_limit }
     }
 
     /// NAN-4553: how many suspects recovery admits together (from idle, in
@@ -243,7 +249,7 @@ impl AdmissionAttempts {
         self.suspects.retain(|id, _| pending.contains(id.as_str()));
         self.isolating.retain(|id| pending.contains(id.as_str()));
         self.stored.reserve_refused.retain(|id| pending.contains(id.as_str()));
-        self.charged.retain(|id| pending.contains(id.as_str()));
+        self.stored.charged.retain(|id| pending.contains(id.as_str()));
         let recovered = self.clear_recovered();
         if self.stored.attempts.len() != before || recovered {
             self.persist()?;
@@ -289,7 +295,7 @@ impl AdmissionAttempts {
             // One process death counts once: an object this process already
             // charged (recorded before a fetch that then failed and was
             // retried) is not charged again.
-            if alone && self.charged.insert(id.to_string()) {
+            if alone && self.stored.charged.insert(id.to_string()) {
                 *attempts += 1;
             }
         }
@@ -300,12 +306,12 @@ impl AdmissionAttempts {
     /// recorded before its fetch as part of a larger admission, and turned
     /// out to be admitted alone).
     pub fn charge(&mut self, id: &str) -> Result<()> {
-        if self.charged.contains(id) {
+        if self.stored.charged.contains(id) {
             return Ok(());
         }
         let Some(attempts) = self.stored.attempts.get_mut(id) else { return Ok(()) };
         *attempts += 1;
-        self.charged.insert(id.to_string());
+        self.stored.charged.insert(id.to_string());
         self.persist()
     }
 
@@ -313,7 +319,7 @@ impl AdmissionAttempts {
     /// the object too, and may die there). Once per process; it stays a
     /// suspect, so a failed refusal is retried.
     pub fn charge_suspect(&mut self, id: &str) -> Result<()> {
-        if !self.suspects.contains_key(id) || !self.charged.insert(id.to_string()) {
+        if !self.suspects.contains_key(id) || !self.stored.charged.insert(id.to_string()) {
             return Ok(());
         }
         *self.stored.attempts.entry(id.to_string()).or_default() += 1;
@@ -326,10 +332,32 @@ impl AdmissionAttempts {
     /// are still admitted and unacknowledged). Returns how many were undone.
     pub fn uncharge_this_process(&mut self) -> Result<usize> {
         let mut undone = 0;
-        for id in std::mem::take(&mut self.charged) {
+        for id in std::mem::take(&mut self.stored.charged) {
             if let Some(attempts) = self.stored.attempts.get_mut(&id).filter(|attempts| **attempts > 0) {
                 *attempts -= 1;
                 undone += 1;
+            }
+        }
+        if undone > 0 {
+            self.persist()?;
+        }
+        Ok(undone)
+    }
+
+    /// NAN-4755: the previous process died with a merge in flight, so its
+    /// death may have been the merge's, not its object's: undo the charges
+    /// it made (the objects stay suspects and stay isolated). Bounded: a
+    /// merge that keeps killing ingest is parked (`merge_attempts`), after
+    /// which deaths are charged again. Returns how many were undone.
+    pub fn forgive_last_process(&mut self) -> Result<usize> {
+        let mut undone = 0;
+        for id in std::mem::take(&mut self.last_charged) {
+            if let Some(attempts) = self.stored.attempts.get_mut(&id).filter(|attempts| **attempts > 0) {
+                *attempts -= 1;
+                undone += 1;
+                if let Some(count) = self.suspects.get_mut(&id) {
+                    *count = *attempts;
+                }
             }
         }
         if undone > 0 {
@@ -342,7 +370,7 @@ impl AdmissionAttempts {
     pub fn forget(&mut self, id: &str) -> Result<()> {
         self.suspects.remove(id);
         self.isolating.remove(id);
-        self.charged.remove(id);
+        self.stored.charged.remove(id);
         // NAN-4553: the culprit of the group the bisection narrowed is named;
         // the suspects left are most likely healthy: try them together again
         // (a second culprit among them is bisected the same way).
@@ -364,11 +392,8 @@ impl AdmissionAttempts {
             file.sync_all()?;
         }
         std::fs::rename(&tmp, &self.path).with_context(|| format!("rename {}", self.path.display()))?;
-        if let Some(dir) = self.path.parent() {
-            if let Ok(dir) = std::fs::File::open(dir) {
-                let _ = dir.sync_all();
-            }
-        }
+        let dir = self.path.parent().context("admission ledger has no directory")?;
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     }
 }

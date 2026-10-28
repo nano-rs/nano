@@ -35,6 +35,7 @@ pub mod lean_collector_errors;
 pub mod lean_enrichment_coordinator;
 pub mod lean_platform_bundle;
 pub mod lean_platform_policy;
+pub mod lean_platform_feeds;
 pub mod enrichment_read;
 // Hosted (hosted-shared) modules: compiled only into the enterprise
 // build and stripped from the open mirror (NAN-3861). Open code reaches them

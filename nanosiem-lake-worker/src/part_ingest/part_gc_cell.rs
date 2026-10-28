@@ -2157,12 +2157,23 @@ async fn collect_report(runner: &mut Runner, now_ms: i64) -> Option<Result<PassR
     });
     runner.resume_after_backoff = result.as_ref().map_or(true, |report| report.backoff);
     if result.as_ref().map_or(true, |report| report.backoff) {
-        runner.failures = runner.failures.saturating_add(1);
         let base = Duration::from_millis(super::ingest::SANCTIONED_GC_INTERVAL_MS as u64);
+        // NAN-4769: a task that deleted files and then stopped (under live
+        // ingest that is routinely `index_catch_up_no_progress` after NL009
+        // races) made progress. It used to count as a failure, so every such
+        // task doubled the back-off (20 min .. 6 h) and never reset: one
+        // hosted tenant deleted ~900 files/h against ~2k/h superseded and
+        // its writer ledger grew ~25k rows/day. Progress waits one ordinary
+        // interval and resets the count; only tasks that deleted nothing
+        // keep growing the exponential back-off.
+        let progressed = result.as_ref().is_ok_and(|report| report.deleted > 0);
+        runner.failures = if progressed { 0 } else { runner.failures.saturating_add(1) };
         // NAN-3495: jittered, so passes that failed together spread out.
-        let delay = jittered(
-            base.saturating_mul(1_u32 << runner.failures.min(16)).min(crate::lake_part_gc::executor::MAX_BACKOFF),
-        );
+        let delay = jittered(if progressed {
+            base
+        } else {
+            base.saturating_mul(1_u32 << runner.failures.min(16)).min(crate::lake_part_gc::executor::MAX_BACKOFF)
+        });
         runner.next_allowed_ms = now_ms.saturating_add(delay.as_millis() as i64);
     } else {
         runner.failures = 0;
@@ -3795,6 +3806,61 @@ mod tests {
         let mut runner = finished(Ok(done)).await;
         collect_report(&mut runner, 1_000).await;
         assert!(!runner.resume_now, "a finished deletion pass keeps ingest's cadence");
+    }
+
+    /// NAN-4769: the FP shape. Under live ingest a task deletes hundreds of
+    /// files and then ends `index_catch_up_no_progress` with back-off. That
+    /// is progress: the runner waits one jittered ordinary interval and
+    /// never compounds it, however many such tasks run in a row. A task that
+    /// deleted nothing still grows the exponential back-off, and the next
+    /// productive task resets it.
+    #[tokio::test]
+    async fn productive_back_off_tasks_never_compound_the_back_off() {
+        async fn collect(runner: &mut Runner, report: PassReport, now_ms: i64) {
+            let task = tokio::spawn(async move { Ok(report) });
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            runner.task = Some(task);
+            assert!(collect_report(runner, now_ms).await.is_some_and(|result| result.is_ok()));
+        }
+        let interval = crate::part_ingest::ingest::SANCTIONED_GC_INTERVAL_MS;
+        let stalled = |deleted| PassReport {
+            paused_reason: Some("index_catch_up_no_progress".into()),
+            backoff: true,
+            deleted,
+            ..PassReport::default()
+        };
+        let mut runner = Runner { armed: true, ..Runner::default() };
+        let mut now = 1_000_000_i64;
+        for task in 0..12 {
+            collect(&mut runner, stalled(648), now).await;
+            assert_eq!(runner.failures, 0, "task {task}: a task that deleted is not a failure");
+            let wait = runner.next_allowed_ms - now;
+            assert!((interval / 2..=interval).contains(&wait), "task {task}: waited {wait} ms, not one interval");
+            assert!(runner.resume_after_backoff && pass_due_at_poll(&runner, runner.next_allowed_ms));
+            now = runner.next_allowed_ms + 120_000;
+        }
+        // Twelve productive tasks used to reach the 6 h cap; one interval each now.
+        collect(&mut runner, stalled(0), now).await;
+        assert_eq!(runner.failures, 1);
+        assert!((interval..=2 * interval).contains(&(runner.next_allowed_ms - now)));
+        now = runner.next_allowed_ms;
+        collect(&mut runner, stalled(0), now).await;
+        assert_eq!(runner.failures, 2, "a task that deleted nothing still compounds");
+        assert!((2 * interval..=4 * interval).contains(&(runner.next_allowed_ms - now)));
+        now = runner.next_allowed_ms;
+        collect(&mut runner, stalled(1), now).await;
+        assert_eq!(runner.failures, 0, "the next productive task resets the count");
+        assert!((interval / 2..=interval).contains(&(runner.next_allowed_ms - now)));
+        // A task error is never progress.
+        let task = tokio::spawn(async { Err(anyhow::anyhow!("route withdrawn")) });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        runner.task = Some(task);
+        collect_report(&mut runner, now).await;
+        assert_eq!(runner.failures, 1);
     }
 
     /// NAN-3495: unauthorizable-key markers survive a restart on the same

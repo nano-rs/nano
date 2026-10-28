@@ -51,7 +51,9 @@ export class MelodApi {
     void _baseUrl;
   }
 
-  getMelodJobStatus(_jobId: string): Promise<MelodJobStatusResponse> {
+  getMelodJobStatus(_jobId: string, _signal?: AbortSignal): Promise<MelodJobStatusResponse> {
+    void _jobId;
+    void _signal;
     return ENTERPRISE_ONLY();
   }
   melodChat(_request: MelodChatRequest): Promise<MelodJobStartResponse> {

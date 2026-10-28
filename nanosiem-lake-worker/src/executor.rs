@@ -1257,18 +1257,23 @@ fn start_connection(
             while let Some(command) = receiver.blocking_recv() {
                 match command {
                     Command::Query(job) => {
-                        status.queued.fetch_sub(1, Ordering::Relaxed);
                         // The HTTP client can time out while this job waits
                         // behind native work. The receiver is then gone and
                         // executing the abandoned query would only consume a
                         // lane and delay live callers. A query already inside
                         // chDB remains bounded by its SQL execution deadline.
                         if job.response.is_closed() {
+                            status.queued.fetch_sub(1, Ordering::Relaxed);
                             continue;
                         }
+                        // NAN-4772: waiting for threads is still lane queue
+                        // time. Check abandonment and the queue deadline
+                        // after the wait, before reporting a native start.
+                        let grant = thread_budget.get().map(|budget| budget.grant_for_request(job.priority, &job.request_id));
+                        status.queued.fetch_sub(1, Ordering::Relaxed);
                         let started_at = Instant::now();
                         debug_assert!(started_at >= job.admitted_at);
-                        if started_at >= job.deadline || job.started.send(started_at).is_err() {
+                        if started_at >= job.deadline || job.response.is_closed() || job.started.send(started_at).is_err() {
                             continue;
                         }
                         *status
@@ -1291,7 +1296,6 @@ fn start_connection(
                         };
                         // NAN-4174: threads by what runs now, held to the end;
                         // NAN-4751: one share per request, not per statement.
-                        let grant = thread_budget.get().map(|budget| budget.grant_for_request(job.priority, &job.request_id));
                         let sql = grant_sql(grant.as_ref(), sql, job.timing.as_ref());
                         if let Some(timing) = &job.timing {
                             timing.lock().unwrap_or_else(|e| e.into_inner()).sql_prepare_ms += prepare_started.elapsed().as_secs_f64() * 1000.0;
@@ -1361,12 +1365,14 @@ fn start_connection(
                         let _ = job.response.send(result);
                     }
                     Command::Stream(job) => {
-                        status.queued.fetch_sub(1, Ordering::Relaxed);
                         if job.chunks.is_closed() {
+                            status.queued.fetch_sub(1, Ordering::Relaxed);
                             continue;
                         }
+                        let grant = thread_budget.get().map(|budget| budget.grant_for_request(job.priority, &job.request_id));
+                        status.queued.fetch_sub(1, Ordering::Relaxed);
                         let started_at = Instant::now();
-                        if started_at >= job.deadline || job.started.send(started_at).is_err() {
+                        if started_at >= job.deadline || job.chunks.is_closed() || job.started.send(started_at).is_err() {
                             continue;
                         }
                         *status.started.lock().expect("executor lane status poisoned") = Some(Instant::now());
@@ -1382,7 +1388,6 @@ fn start_connection(
                         };
                         // NAN-4174: threads by what runs now, held to the end;
                         // NAN-4751: one share per request, not per statement.
-                        let grant = thread_budget.get().map(|budget| budget.grant_for_request(job.priority, &job.request_id));
                         let sql = grant_sql(grant.as_ref(), sql, job.timing.as_ref());
                         if let Some(timing) = &job.timing {
                             timing.lock().unwrap_or_else(|e| e.into_inner()).sql_prepare_ms += prepare_started.elapsed().as_secs_f64() * 1000.0;

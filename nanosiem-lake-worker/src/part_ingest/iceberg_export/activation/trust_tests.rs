@@ -156,6 +156,34 @@ fn body(record: &CatalogActivation) -> String {
         .to_string()
 }
 
+#[tokio::test]
+async fn writer_adopt_control_contract_binds_the_request_and_refuses_status_or_response_drift() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let ca = Ca::new();
+    let r = super::tests::record();
+    let server = server(&ca, "localhost", 200, body(&r)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let control = Control::new(&r, &r.tenant_id, dir.path(), &server.url, "cell-a", ca.trust()).unwrap();
+    let table = format!("agent.events_{}_v1", "1".repeat(32));
+    control.call_with("writer_adopt", json!({"table":table})).await.unwrap();
+    let request: Value = serde_json::from_str(&server.bodies.read().unwrap()[0]).unwrap();
+    assert_eq!(request, json!({"op":"writer_adopt","tenant_id":r.tenant_id,"activation_id":r.activation_id,"details":{"table":table}}));
+    // An older platform refuses the unknown operation. All refusals, including
+    // transport/server failures, stay errors for adopt_serving_epoch's fallback.
+    for status in [400, 403, 404, 500] {
+        server.status.store(status, SeqCst);
+        let error = control.call_with("writer_adopt", json!({"table":table})).await.unwrap_err();
+        assert_eq!(error.downcast_ref::<ControlRefused>().unwrap().0, status);
+    }
+    server.status.store(200, SeqCst);
+    for bad in [json!({"tenant_id":uuid::Uuid::new_v4(),"activation_id":r.activation_id,"verified":true}),
+        json!({"tenant_id":r.tenant_id,"activation_id":uuid::Uuid::new_v4(),"verified":true}),
+        json!({"tenant_id":r.tenant_id,"activation_id":r.activation_id,"verified":false})] {
+        *server.body.write().unwrap() = bad.to_string();
+        assert!(control.call_with("writer_adopt", json!({"table":table})).await.is_err());
+    }
+}
+
 fn recovery(
     record: &CatalogActivation,
     dir: &Path,
@@ -907,14 +935,17 @@ async fn catalog_attach_scoped_credentials_reach_close_and_drain() {
     assert!(cfg.catalog.is_some() && cfg.catalog_attachment_failure.is_none());
     assert!(attached.recovery().is_none(), "attached: no recovery probe, no restart");
     // Past verify_maintenance, through schema conversion of the real seed
-    // schema, serving backend, custody lock and the installation fence.
-    assert_eq!(server.ops(), ["verify_maintenance", "close_and_drain"]);
+    // schema, serving backend, custody lock and the installation marker.
+    // NAN-4774: a first install (or a wiped volume) defers the fence to the
+    // first sync, whose missing planned index takes the privacy pass unless
+    // the platform confirms an adoptable epoch.
+    assert_eq!(server.ops(), ["verify_maintenance"]);
     assert_eq!(
         std::fs::read_to_string(dir.path().join("catalog/installation-id")).unwrap(),
         r.activation_id.to_string()
     );
     assert!(dir.path().join("catalog/custody/writer.lock").exists());
-    assert!(dir.path().join("catalog/custody/reads-closed").exists(), "fenced until the first sync reopens reads");
+    assert!(!dir.path().join("catalog/custody/planned-index-ready").exists(), "the first sync must reconcile");
     // Every R2 request used the credential scoped to its key; none was refused.
     let root = format!("lake/parts/v1/tenant={}/", r.tenant_id);
     let seen = scoped::seen(&lake);
@@ -985,7 +1016,7 @@ async fn catalog_attach_scoped_credentials_reach_close_and_drain() {
         origin: lake.origin.clone(), state: lake.state.clone(), part: part2.clone(), log: log2.clone(),
     }, &server, &ca).await;
     assert_eq!(again.failure, None);
-    assert_eq!(server.ops(), ["verify_maintenance", "close_and_drain", "verify_maintenance", "verify_maintenance"]);
+    assert_eq!(server.ops(), ["verify_maintenance", "verify_maintenance", "verify_maintenance"]);
 }
 
 /// The large-tenant incident: the old wiring loaded the log through a store on the
@@ -1032,11 +1063,16 @@ async fn catalog_attach_failure_stage_names_control_refusal() {
     let (attached, _) = scoped::attach_scoped(&r, dir.path(), &lake, &server, &ca).await;
     assert_eq!(attached.failure, Some(("verify_maintenance", "control_status_5xx")));
     assert!(scoped::seen(&lake).is_empty(), "no storage IO before the platform verifies");
-    // close_and_drain refused after a verified maintenance: fence stage.
+    // close_and_drain refused after a verified maintenance: fence stage. A
+    // rotation (another activation's marker) fences at attach.
+    let previous = uuid::Uuid::new_v4().to_string();
+    std::fs::create_dir_all(dir.path().join("catalog")).unwrap();
+    std::fs::write(dir.path().join("catalog/installation-id"), &previous).unwrap();
     let refuse_fence = server_with_ops(&ca, &r, &[("close_and_drain", 409)]).await;
     let (attached, _) = scoped::attach_scoped(&r, dir.path(), &lake, &refuse_fence, &ca).await;
     assert_eq!(attached.failure, Some(("fence_close_and_drain", "control_status_4xx")));
-    assert!(!dir.path().join("catalog/installation-id").exists(), "an unfenced installation is retried");
+    assert_eq!(std::fs::read_to_string(dir.path().join("catalog/installation-id")).unwrap(), previous,
+        "an unfenced installation is retried");
 }
 
 /// A TLS control fake that answers `op`s listed in `refuse` with that status.

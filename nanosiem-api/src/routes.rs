@@ -1187,6 +1187,8 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::configure_ipinfo),
         )
         .route_if(!shared_product, "/api/enrichment/ipinfo/sync", post(handlers::sync_ipinfo))
+        // NAN-4759: self-hosted platform feed freshness (hosted uses /api/marketplace/items).
+        .route_if(!shared_product, "/api/enrichment/platform-feeds", get(handlers::get_platform_feeds))
         .route_if(!shared_product, 
             "/api/enrichment/sources/{id}/enable",
             post(handlers::enable_enrichment_source),

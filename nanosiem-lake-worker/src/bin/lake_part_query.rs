@@ -653,6 +653,8 @@ async fn open_query_service(assignment: &Assignment, mut bootstrap: QueryBootstr
         // A rule is background work: it waits for a native slot longer
         // than an analyst would, instead of failing its window with a 429.
         service.set_admission_deadline(DETECT_ADMISSION_DEADLINE);
+        // NAN-4772: no analyst reaches detect[T]; its rules use every slot.
+        service.engine().serve_without_analysts();
     }
     if let Some(job_results) = &job_results {
         service.attach_job_results(job_results.clone())?;

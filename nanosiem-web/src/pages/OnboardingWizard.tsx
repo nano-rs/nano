@@ -40,9 +40,12 @@ import {
   useDismissOnboarding,
   useSystemConfig,
   useLogSources,
+  useTenantAiSettings,
+  useUserList,
 } from '@/hooks/use-api';
 import { useSharedTenant } from '@/hooks/use-shared-tenant';
-import { overlayLogSourceStatus } from '@/lib/onboarding-status';
+import { useRefetchOnFocus } from '@/hooks/use-refetch-on-focus';
+import { resolveHostedChecklistStatus } from '@/lib/onboarding-status';
 import { useTierContext } from '@/hooks/use-tier';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import type { Capabilities } from '@/hooks/use-capabilities';
@@ -152,15 +155,36 @@ const Eyebrow = ({ children }: { children: React.ReactNode }) => (
 export function OnboardingWizard() {
   const navigate = useNavigate();
   const { data: progress, loading: progressLoading, refetch: refetchProgress } = useOnboardingProgress();
-  const { data: probedStatus } = useOnboardingStatus();
-  // NAN-3241: shared/lean tenants keep sources + parsers in the tenant
-  // registry (/api/log-sources); the status probe cannot see them.
+  const { data: probedStatus, refetch: refetchStatus } = useOnboardingStatus();
+  // NAN-3241 / NAN-4779: the hosted-shared status probe cannot see the tenant
+  // source registry, tenant AI guidance or pending invitations; fold in the
+  // tenant APIs the Log Sources, AI Guidance and Access Control pages read.
   const isSharedTenant = useSharedTenant();
-  const { data: registrySources } = useLogSources({ skip: !isSharedTenant });
+  const { data: registrySources, refetch: refetchSources } = useLogSources({ skip: !isSharedTenant });
+  const { data: tenantAiSettings, refetch: refetchAiSettings } = useTenantAiSettings({ skip: !isSharedTenant });
+  const { data: tenantUsers, refetch: refetchUsers } = useUserList({ skip: !isSharedTenant });
   const status = useMemo(
-    () => (isSharedTenant ? overlayLogSourceStatus(probedStatus, registrySources) : probedStatus),
-    [isSharedTenant, probedStatus, registrySources],
+    () =>
+      isSharedTenant
+        ? resolveHostedChecklistStatus(probedStatus, {
+            sources: registrySources,
+            orgContext: tenantAiSettings?.organizational_context,
+            users: tenantUsers?.users,
+          })
+        : probedStatus,
+    [isSharedTenant, probedStatus, registrySources, tenantAiSettings, tenantUsers],
   );
+  // NAN-4779: steps are completed on other pages and often in another tab;
+  // re-probe whenever the user comes back to this one.
+  useRefetchOnFocus(() => {
+    void refetchStatus();
+    void refetchProgress();
+    if (isSharedTenant) {
+      void refetchSources();
+      void refetchAiSettings();
+      void refetchUsers();
+    }
+  });
   const { data: systemConfig } = useSystemConfig();
   const { hasSso } = useTierContext();
   const { capabilities } = useCapabilities();
@@ -260,7 +284,8 @@ export function OnboardingWizard() {
     }
   }, [dismissOnboarding, navigate]);
 
-  if (progressLoading) {
+  // Spinner only on first load; a focus refetch must not blank the page.
+  if (progressLoading && !progress) {
     return (
       <div className="flex h-[60vh] items-center justify-center">
         <LoadingIcon className="h-6 w-6 text-muted-foreground" />

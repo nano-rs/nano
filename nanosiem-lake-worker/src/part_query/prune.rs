@@ -87,6 +87,12 @@ pub struct FileSummary {
     /// (empty without that flat column), so a source-family hint prunes
     /// files whose family is not signed (L0/M parts) by their value range.
     pub source_family: Vec<EntityGroup>,
+    /// NAN-4772: each row group's exact integer `class_uid` `[min, max]`
+    /// (`None` where the statistics are missing or inexact; empty without
+    /// that flat column), so a class hint prunes row groups of files whose
+    /// class is not signed: class-sorted minute parts, multi-class rest
+    /// families and labelled-or-not L0 parts.
+    pub class_groups: Vec<Option<(i64, i64)>>,
     /// NAN-4664: the file carries the derived IOC indicator columns (its
     /// footer marker names the current derivation). Their per-group
     /// statistics and blooms are in `entities` under the column names.
@@ -283,6 +289,10 @@ impl FileSummary {
             .position(|column| column.max_rep_level() == 0 && column.path().string() == SOURCE_FAMILY_PATH)
             .map(|index| metadata.row_groups().iter().map(|group| EntityGroup::of(group.column(index))).collect())
             .unwrap_or_default();
+        let class_groups = metadata.file_metadata().schema_descr().columns().iter()
+            .position(|column| column.max_rep_level() == 0 && column.path().string() == CLASS_PATH && class_has_integer_type(column))
+            .map(|index| metadata.row_groups().iter().map(|group| class_bounds(group.column(index).statistics())).collect())
+            .unwrap_or_default();
         let column_bytes = metadata.file_metadata().schema_descr().columns().iter().enumerate()
             .map(|(index, column)| {
                 let bytes = metadata.row_groups().iter()
@@ -292,7 +302,7 @@ impl FileSummary {
             })
             .collect();
         let column_bytes = ColumnBytes::new(column_bytes);
-        Some(Self { ranges, group_times, entities, entities_located, column_bytes, source_family, indicators })
+        Some(Self { ranges, group_times, entities, entities_located, column_bytes, source_family, class_groups, indicators })
     }
 
     /// Compressed bytes per event leaf over the row groups `kept` (every
@@ -326,6 +336,7 @@ impl FileSummary {
             + self.entities.iter().map(|(path, groups)| path.len() + 24 + groups.iter().map(EntityGroup::bytes).sum::<usize>()).sum::<usize>()
             + self.column_bytes.owned_bytes()
             + self.source_family.iter().map(EntityGroup::bytes).sum::<usize>()
+            + self.class_groups.len() * 24
     }
 
     /// NAN-3221: per row group, whether its exact `metadata.log_source`
@@ -336,6 +347,26 @@ impl FileSummary {
             return None;
         }
         Some(self.source_family.iter().map(|group| hints.iter().all(|hint| family_range_hint(group, hint))).collect())
+    }
+
+    /// NAN-4772: every row group proven empty (`Some(all false)`) when no
+    /// group's exact `class_uid` range can hold a value every class hint
+    /// accepts; otherwise `None` (no evidence). The row-group form of
+    /// [`class_may_match`] for files whose class is not signed (L0 parts,
+    /// class-sorted minute parts, multi-class rest families): such a file
+    /// is then never handed to the statement (`infile_pruned_files`).
+    ///
+    /// A partial mask is deliberately not returned. chDB already skips the
+    /// other classes' row groups of a file it reads, from these same
+    /// statistics (`input_format_parquet_filter_push_down`), while a partial
+    /// mask would add a `_row_number` row fence evaluated on every decoded
+    /// row (NAN-3179) and save nothing.
+    fn class_mask(&self, hints: &[CandidateHint]) -> Mask {
+        if !uses_class(hints) || self.class_groups.len() != self.ranges.len() || self.ranges.is_empty() {
+            return None;
+        }
+        let none = self.class_groups.iter().all(|bounds| !hints.iter().all(|hint| class_range_hint(*bounds, hint)));
+        none.then(|| vec![false; self.ranges.len()])
     }
 
     fn entity(&self, path: &str) -> Option<&[EntityGroup]> {
@@ -782,7 +813,7 @@ impl FileMetadataCache {
         } else if let Some(evidence) = evidence {
             Some((0..groups).map(|group| hints.iter().all(|hint| entity_hint(evidence, group, hint))).collect())
         } else { None };
-        let hint_mask = and(hint_mask, summary.source_family_mask(hints));
+        let hint_mask = and(and(hint_mask, summary.source_family_mask(hints)), summary.class_mask(hints));
         let time_mask = buckets.and_then(|buckets| summary.time_mask(buckets));
         Some((hint_mask, time_mask, summary.ranges.clone(), summary.time_bounds()))
     }
@@ -917,6 +948,56 @@ fn class_hint(class_id: i64, hint: &CandidateHint) -> bool {
         CandidateHint::Class { value } => *value == class_id,
         CandidateHint::Any { alternatives } => {
             alternatives.is_empty() || alternatives.iter().any(|alternative| class_hint(class_id, alternative))
+        }
+        _ => true,
+    }
+}
+
+/// The flat column a class hint compares (`class_uid = v`).
+pub const CLASS_PATH: &str = "class_uid";
+
+/// Physical integers also encode scaled decimals, dates and timestamps.
+/// Their stored bounds are not class ids; unsigned bounds also cannot be
+/// interpreted as signed i64. Unknown logical types must keep the file.
+fn class_has_integer_type(column: &parquet::schema::types::ColumnDescriptor) -> bool {
+    use parquet::basic::{ConvertedType, LogicalType, Type};
+    matches!(column.physical_type(), Type::INT32 | Type::INT64)
+        && matches!(column.converted_type(), ConvertedType::NONE | ConvertedType::INT_8 | ConvertedType::INT_16 | ConvertedType::INT_32 | ConvertedType::INT_64)
+        && matches!(column.logical_type_ref(), None | Some(LogicalType::Integer { is_signed: true, .. }))
+}
+
+/// A row group's exact integer `class_uid` `[min, max]`; `None` (keep) for
+/// missing, inexact, inverted or non-integer statistics. The caller checks
+/// the column's logical type before interpreting its physical statistics.
+fn class_bounds(statistics: Option<&Statistics>) -> Option<(i64, i64)> {
+    let (min, max) = match statistics? {
+        Statistics::Int32(stats) if stats.min_is_exact() && stats.max_is_exact() => {
+            (i64::from(*stats.min_opt()?), i64::from(*stats.max_opt()?))
+        }
+        Statistics::Int64(stats) if stats.min_is_exact() && stats.max_is_exact() => (*stats.min_opt()?, *stats.max_opt()?),
+        _ => return None,
+    };
+    (min <= max).then_some((min, max))
+}
+
+fn uses_class(hints: &[CandidateHint]) -> bool {
+    hints.iter().any(|hint| match hint {
+        CandidateHint::Class { .. } => true,
+        CandidateHint::Any { alternatives } => uses_class(alternatives),
+        _ => false,
+    })
+}
+
+/// NAN-4772: can a row group whose exact `class_uid` statistics are
+/// `bounds` hold a row the hint accepts? A class hint is a top-level-AND
+/// `class_uid = v`, so a group whose `[min, max]` excludes `v` holds no
+/// matching row (a NULL `class_uid` never equals `v`). Missing statistics
+/// and every other hint keep the group.
+fn class_range_hint(bounds: Option<(i64, i64)>, hint: &CandidateHint) -> bool {
+    match hint {
+        CandidateHint::Class { value } => bounds.is_none_or(|(min, max)| (min..=max).contains(value)),
+        CandidateHint::Any { alternatives } => {
+            alternatives.is_empty() || alternatives.iter().any(|alternative| class_range_hint(bounds, alternative))
         }
         _ => true,
     }
@@ -2126,6 +2207,144 @@ mod tests {
         assert_eq!(mask(&[family("b_absent")]), Some(vec![true, false, true, true]));
     }
 
+    fn parquet_with_classes(groups: &[&[Option<i32>]]) -> tempfile::NamedTempFile {
+        let schema = Arc::new(Schema::new(vec![Field::new(CLASS_PATH, DataType::Int32, true)]));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let props = WriterProperties::builder().set_max_row_group_row_count(Some(1_000)).build();
+        let mut writer = ArrowWriter::try_new(file.reopen().unwrap(), schema.clone(), Some(props)).unwrap();
+        for values in groups {
+            writer.write(&RecordBatch::try_new(schema.clone(), vec![Arc::new(arrow_array::Int32Array::from(values.to_vec())) as ArrayRef]).unwrap()).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+        file
+    }
+
+    fn parquet_class_column(values: ArrayRef, statistics: parquet::file::properties::EnabledStatistics) -> tempfile::NamedTempFile {
+        let schema = Arc::new(Schema::new(vec![Field::new(CLASS_PATH, values.data_type().clone(), true)]));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let props = WriterProperties::builder().set_statistics_enabled(statistics).build();
+        let mut writer = ArrowWriter::try_new(file.reopen().unwrap(), schema.clone(), Some(props)).unwrap();
+        writer.write(&RecordBatch::try_new(schema, vec![values]).unwrap()).unwrap();
+        writer.close().unwrap();
+        file
+    }
+
+    #[test]
+    fn class_statistics_keep_missing_and_non_integer_logical_types() {
+        use arrow_array::{Decimal32Array, Decimal64Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray, UInt64Array};
+        use parquet::file::properties::EnabledStatistics;
+        // Decimal 1007.00 has integer physical statistics 100700. Comparing
+        // the hint against those unscaled bytes would hide a matching row.
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Decimal32Array::from(vec![100700]).with_precision_and_scale(9, 2).unwrap()),
+            Arc::new(Decimal64Array::from(vec![100700]).with_precision_and_scale(18, 2).unwrap()),
+            Arc::new(TimestampMicrosecondArray::from(vec![1007000000])),
+            Arc::new(UInt64Array::from(vec![u64::MAX])),
+            Arc::new(Float64Array::from(vec![1007.0])),
+            Arc::new(StringArray::from(vec!["1007"])),
+        ];
+        for values in arrays {
+            let kind = values.data_type().clone();
+            let file = parquet_class_column(values, EnabledStatistics::Chunk);
+            let cache = FileMetadataCache::default();
+            let hints = [CandidateHint::Class { value: 1007 }];
+            assert_eq!(cache.evidence(file.path(), "typed-class", &hints, None, false, true, None).unwrap().0, None, "{kind}");
+        }
+        let file = parquet_class_column(Arc::new(Int64Array::from(vec![1007])), EnabledStatistics::None);
+        let cache = FileMetadataCache::default();
+        for value in [1007, 9999] {
+            assert_eq!(cache.evidence(file.path(), "no-statistics", &[CandidateHint::Class { value }], None, false, true, None).unwrap().0, None);
+        }
+    }
+
+    #[test]
+    fn class_statistics_require_complete_exact_ordered_bounds() {
+        use parquet::file::statistics::ValueStatistics;
+        let exact = || ValueStatistics::new(Some(1007_i64), Some(3002_i64), None, None, false);
+        assert_eq!(class_bounds(Some(&Statistics::Int64(exact()))), Some((1007, 3002)));
+        for stats in [
+            None,
+            Some(Statistics::int64(None, None, None, Some(2), false)),
+            Some(Statistics::int64(None, Some(3002), None, None, false)),
+            Some(Statistics::int64(Some(1007), None, None, None, false)),
+            Some(Statistics::Int64(exact().with_min_is_exact(false))),
+            Some(Statistics::Int64(exact().with_max_is_exact(false))),
+            Some(Statistics::int64(Some(3002), Some(1007), None, None, false)),
+        ] {
+            assert_eq!(class_bounds(stats.as_ref()), None, "{stats:?}");
+        }
+    }
+
+    #[test]
+    fn class_statistics_accept_signed_integer_columns() {
+        use arrow_array::{Int8Array, Int16Array, Int32Array, Int64Array};
+        use parquet::file::properties::EnabledStatistics;
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int8Array::from(vec![Some(7), None])),
+            Arc::new(Int16Array::from(vec![Some(7), None])),
+            Arc::new(Int32Array::from(vec![Some(7), None])),
+            Arc::new(Int64Array::from(vec![Some(7), None])),
+        ];
+        for values in arrays {
+            let file = parquet_class_column(values, EnabledStatistics::Chunk);
+            let cache = FileMetadataCache::default();
+            for (value, expected) in [(7, None), (8, Some(vec![false]))] {
+                assert_eq!(cache.evidence(file.path(), "signed-class", &[CandidateHint::Class { value }], None, false, true, None).unwrap().0, expected);
+            }
+        }
+    }
+
+    /// NAN-4772: `class_uid` row-group statistics prove a whole file empty
+    /// for a class hint only when no group's range can hold the class (a
+    /// rest family or L0 part without it); a group without statistics, or
+    /// any group that may hold it, keeps the file (no partial mask: chDB
+    /// skips those groups itself). ORs need every branch excluded.
+    #[test]
+    fn class_statistics_prune_only_groups_that_cannot_hold_the_class() {
+        let file = parquet_with_classes(&[
+            &[Some(1001), Some(1001)],
+            &[Some(1007), Some(1007), Some(1007)],
+            &[Some(3002), Some(4001)],
+            &[Some(4001), Some(4003)],
+            &[None, None],
+        ]);
+        let cache = FileMetadataCache::default();
+        let mask = |hints: &[CandidateHint]| cache.evidence(file.path(), "digest-classes", hints, None, false, true, None).unwrap().0;
+        let class = |value: i64| CandidateHint::Class { value };
+        // A group may hold the class: no evidence, chDB's own statistics
+        // skip the other groups of the file it reads.
+        for value in [1001, 1007, 3002, 4000, 4001, 4003, 6003] {
+            assert_eq!(mask(&[class(value)]), None, "{value}: the all-NULL group has no statistics");
+        }
+        let file = parquet_with_classes(&[
+            &[Some(1001), Some(1001)],
+            &[Some(1007), Some(1007), Some(1007)],
+            &[Some(3002), Some(4001)],
+            &[Some(4001), Some(4003)],
+        ]);
+        let mask = |hints: &[CandidateHint]| cache.evidence(file.path(), "digest-classes-2", hints, None, false, true, None).unwrap().0;
+        assert_eq!(mask(&[class(1007)]), None);
+        assert_eq!(mask(&[class(4000)]), None, "inside a mixed group's range: kept");
+        // No group can hold it: the whole file is proven empty.
+        assert_eq!(mask(&[class(6003)]), Some(vec![false; 4]));
+        assert_eq!(mask(&[class(1000)]), Some(vec![false; 4]));
+        assert_eq!(mask(&[CandidateHint::Any { alternatives: vec![class(6003), class(5001)] }]), Some(vec![false; 4]));
+        assert_eq!(mask(&[CandidateHint::Any { alternatives: vec![class(6003), class(4003)] }]), None);
+        // A non-class branch keeps the file (entity evidence answers it).
+        assert_ne!(mask(&[CandidateHint::Any { alternatives: vec![class(6003), entity("user.name", "x")] }]), Some(vec![false; 4]));
+        // ANDed hints: one class hint excluding every group is enough.
+        assert_eq!(mask(&[class(6003), family("anything")]), Some(vec![false; 4]));
+        // No class hint: no mask (and a file without the column proves nothing).
+        assert_eq!(mask(&[CandidateHint::Keyword { mode: "token".into(), value: "x".into() }]), None);
+        let sources = parquet_with_sources(&[&[Some("a")]]);
+        assert_eq!(cache.evidence(sources.path(), "digest-no-class", &[class(1007)], None, false, true, None).unwrap().0, None);
+        // Exhaustive: a file holding a class is never dropped for it.
+        for value in [1001_i64, 1007, 3002, 4001, 4003] {
+            assert_eq!(mask(&[class(value)]), None, "{value}");
+        }
+    }
+
     /// Exhaustive negative check of the range rule: for every short value
     /// and every spelling of it placed in a group, that group is kept.
     #[test]
@@ -2235,6 +2454,7 @@ mod tests {
             ranges: vec![(0, 10), (10, 20), (20, 30)], group_times: None, entities: vec![], entities_located: true,
             column_bytes: ColumnBytes::new(vec![("time".into(), vec![1, 2, 4].into()), ("raw_data".into(), vec![10, 20, 40].into())]),
             source_family: Vec::new(),
+            class_groups: Vec::new(),
             indicators: false,
         };
         let whole = BTreeMap::from([("raw_data".to_string(), 70), ("time".to_string(), 7)]);
@@ -2248,8 +2468,8 @@ mod tests {
 
     #[test]
     fn summary_cache_rejects_oversized_replacements_and_remains_byte_bounded() {
-        let small = Arc::new(FileSummary { ranges: vec![(0, 1)], group_times: None, entities: vec![], entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new(), indicators: false });
-        let big = Arc::new(FileSummary { ranges: vec![(0, 1); MAX_SUMMARY_BYTES / 16 + 1], group_times: None, entities: vec![], entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new(), indicators: false });
+        let small = Arc::new(FileSummary { ranges: vec![(0, 1)], group_times: None, entities: vec![], entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new(), class_groups: Vec::new(), indicators: false });
+        let big = Arc::new(FileSummary { ranges: vec![(0, 1); MAX_SUMMARY_BYTES / 16 + 1], group_times: None, entities: vec![], entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new(), class_groups: Vec::new(), indicators: false });
         let mut cache = SummaryCache::default();
         let key = "signed-digest".to_string();
         cache.insert(key.clone(), small);
@@ -2436,6 +2656,7 @@ mod tests {
             entities_located: true,
             column_bytes: ColumnBytes::default(),
             source_family: Vec::new(),
+            class_groups: Vec::new(),
             indicators: false,
         });
         let per = big.bytes();
@@ -2463,6 +2684,7 @@ mod tests {
                 entities_located: true,
                 column_bytes: ColumnBytes::new(columns),
                 source_family: vec![group.clone(); 2],
+                class_groups: vec![Some((1007, 1007)); 2],
                 indicators: false,
             })
         };
@@ -2481,7 +2703,7 @@ mod tests {
         assert!(Arc::ptr_eq(a.paths.as_ref().unwrap(), b.paths.as_ref().unwrap()));
         assert_eq!(a.iter().collect::<Vec<_>>(), vec![("time", &[1, 2][..]), ("device.hostname", &[3, 4][..])]);
         assert!(ColumnBytes::new(vec![("a".into(), vec![1].into()), ("b".into(), vec![1, 2].into())]).is_empty(), "ragged is no evidence");
-        let summary = |column_bytes| Arc::new(FileSummary { ranges: vec![(0, 1), (1, 2)], group_times: None, entities: vec![], entities_located: true, column_bytes, source_family: vec![], indicators: false });
+        let summary = |column_bytes| Arc::new(FileSummary { ranges: vec![(0, 1), (1, 2)], group_times: None, entities: vec![], entities_located: true, column_bytes, source_family: vec![], class_groups: vec![], indicators: false });
         let (one, two) = (summary(a), summary(b));
         let shared = one.column_bytes.shared().unwrap().1;
         let mut cache = SummaryCache::default();
@@ -2498,7 +2720,7 @@ mod tests {
     #[test]
     fn summary_cache_evicts_the_least_recently_used_at_its_bound() {
         let mut cache = SummaryCache::default();
-        let summary = Arc::new(FileSummary { ranges: vec![(0, 1)], group_times: None, entities: Vec::new(), entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new(), indicators: false });
+        let summary = Arc::new(FileSummary { ranges: vec![(0, 1)], group_times: None, entities: Vec::new(), entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new(), class_groups: Vec::new(), indicators: false });
         let key = |i: usize| format!("digest-{i}");
         for i in 0..MAX_FILE_SUMMARIES {
             cache.insert(key(i), summary.clone());

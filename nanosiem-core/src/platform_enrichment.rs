@@ -13,8 +13,12 @@ pub mod publisher;
 #[cfg(feature = "enterprise")]
 pub mod retention;
 mod stamp;
+#[cfg(unix)]
+pub mod nanpfb;
+#[cfg(unix)]
 pub mod portable;
 pub mod read;
+pub mod self_hosted;
 pub use admission::*;
 pub use stamp::*;
 

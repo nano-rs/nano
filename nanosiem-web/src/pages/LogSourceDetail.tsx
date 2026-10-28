@@ -84,7 +84,12 @@ import { useDefaultLayout } from 'react-resizable-panels';
 import { computeDiff, type DiffLine, type VrlUpdateInfo } from '@/lib/parser-diff';
 import { ParserTestLab } from '@/components/parser/ParserTestLab';
 import { Markdown } from '@/components/ui/markdown';
-import { useMelodJob } from '@/enterprise/hooks/use-melod-job';
+import {
+  formatElapsed,
+  PARSER_JOB_MAX_WAIT_MS,
+  useElapsedWhile,
+  useMelodJob,
+} from '@/enterprise/hooks/use-melod-job';
 import { useMelodStatus } from '@/hooks/use-api';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { useParserSidePanelTabs, type SidePanelTabId } from '@/components/log-sources/parserSidePanelTabs';
@@ -3018,6 +3023,7 @@ export function LogSourceAiPanel({
   const { data: melodStatus, loading: melodStatusLoading } = useMelodStatus({ skip: !melodCapable });
   const editParserJob = useMelodJob<MelodEditParserResponse>();
   const loading = editParserJob.loading;
+  const elapsedMs = useElapsedWhile(loading);
   const rawPassThrough = mode === 'parser' && isRawPassThroughVrl(currentVrl);
 
   const [messages, setMessages] = useState<AiChatMessage[]>([]);
@@ -3112,6 +3118,8 @@ export function LogSourceAiPanel({
             ? { base_parser_vrl: baseParserVrl }
             : {}),
         }),
+        // NAN-4778: parser edits can run many minutes; wait for the job.
+        { maxWaitMs: PARSER_JOB_MAX_WAIT_MS },
       );
       if (response.session_id) {
         setSessionId(response.session_id);
@@ -3209,9 +3217,10 @@ export function LogSourceAiPanel({
         ))}
 
         {loading && (
-          <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+          <div className="flex items-center gap-2 text-[11px] text-muted-foreground" role="status">
             <PivtIcon className="w-3.5 h-3.5 animate-spin text-primary" />
-            <span>pivt is thinking…</span>
+            <span>{editParserJob.progress && editParserJob.progress !== 'Working...' ? editParserJob.progress : 'pivt is thinking…'}</span>
+            <span className="font-mono text-[10.5px]">{formatElapsed(elapsedMs)}</span>
           </div>
         )}
         {fetchingSamples && (

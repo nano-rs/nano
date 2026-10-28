@@ -48,6 +48,25 @@
 //!   half the pool, not a third. Agent and background statements are
 //!   unchanged (they never count against the interactive share).
 //!
+//! - **Floor of two, bounded total** (NAN-4772): the equal share is never
+//!   below [`INTERACTIVE_MIN_THREADS`] (a pool of one keeps one). At five
+//!   or more concurrent requests it fell to one thread: in the Mythos
+//!   1.0.12 bakeoff 349 of 619 statements ran on one thread (median 258 ms
+//!   vs 93 ms at six), and the eight slowest hunts (1.5-2.2 s) were all
+//!   one-thread aggregates. Grants are fixed at start, so shares alone
+//!   oversubscribed the pool (6+3+2+2+2 = 15 threads on 6). The threads
+//!   held by running interactive statements are now bounded by the pool
+//!   plus [`INTERACTIVE_SLACK_THREADS`]: a new statement takes its share,
+//!   lowered to the room left (so only later statements shrink, down to
+//!   one thread), and with no room left it waits on its lane until a
+//!   running interactive statement ends. Two of slack: a second analyst
+//!   never waits behind a lone whole-pool scan, it starts on the floor at
+//!   once (6 + 2 on a 6-thread pool); a third waits for the first to end
+//!   instead of oversubscribing the cores it would share anyway. Agent,
+//!   background and companion grants are outside the bound and unchanged
+//!   (one thread each beside an analyst; a companion at most two, at most
+//!   `slots - 1` of them), so agents still yield to every analyst.
+//!
 //! A grant only ever lowers a statement's own setting, so a statement that
 //! asked for fewer threads (a bounded reader, the degraded rung, a payload
 //! page) keeps its value, and no statement's rows change.
@@ -58,10 +77,16 @@
 //! niced too.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// A companion statement's most threads.
 pub const COMPANION_MAX_THREADS: u64 = 2;
+/// NAN-4772: an interactive statement's equal share is never below this
+/// (on a pool of at least that many; see the module docs).
+pub const INTERACTIVE_MIN_THREADS: u64 = 2;
+/// NAN-4772: running interactive statements hold at most the pool plus
+/// this many threads (one floor: see the module docs).
+pub const INTERACTIVE_SLACK_THREADS: u64 = INTERACTIVE_MIN_THREADS;
 /// Request-id prefix that marks a statement as background work (a scheduled
 /// detection sent to query[T]).
 pub const BACKGROUND_REQUEST_PREFIX: &str = "detect-";
@@ -141,6 +166,8 @@ impl Priority {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Running {
     interactive: u64,
+    /// NAN-4772: threads held by running interactive statements.
+    interactive_threads: u64,
     /// NAN-4751: running interactive statements per request
     /// ([`request_root`]); a grant without a request is its own.
     interactive_requests: HashMap<String, u64>,
@@ -156,13 +183,15 @@ struct Running {
 pub struct ThreadBudget {
     total: u64,
     running: Mutex<Running>,
+    /// NAN-4772: signalled when an interactive grant is returned.
+    released: Condvar,
 }
 
 impl ThreadBudget {
     /// A pool of `total` threads (at least one): the role's CPU quota in
     /// whole cores, `budget::query_threads`.
     pub fn new(total: u64) -> Arc<Self> {
-        Arc::new(Self { total: total.max(1), running: Mutex::default() })
+        Arc::new(Self { total: total.max(1), running: Mutex::default(), released: Condvar::new() })
     }
 
     pub fn total(&self) -> u64 {
@@ -171,7 +200,8 @@ impl ThreadBudget {
 
     /// Threads granted to a `priority` statement starting now that belongs
     /// to no other running statement's request; held until the grant is
-    /// dropped.
+    /// dropped. An interactive statement may wait (blocking the calling
+    /// lane thread) until a running one ends (NAN-4772).
     pub fn grant(self: &Arc<Self>, priority: Priority) -> ThreadGrant {
         self.grant_for(priority, None)
     }
@@ -183,13 +213,56 @@ impl ThreadBudget {
         self.grant_for(priority, Some(request_root(request_id).to_string()))
     }
 
-    fn grant_for(self: &Arc<Self>, priority: Priority, request: Option<String>) -> ThreadGrant {
+    /// [`Self::grant`] without waiting: `None` when an interactive
+    /// statement would have to wait for room.
+    pub fn try_grant(self: &Arc<Self>, priority: Priority) -> Option<ThreadGrant> {
+        let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        self.take(running, priority, None).ok()
+    }
+
+    /// [`Self::grant_for_request`] without waiting (see [`Self::try_grant`]).
+    pub fn try_grant_for_request(self: &Arc<Self>, priority: Priority, request_id: &str) -> Option<ThreadGrant> {
+        let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        self.take(running, priority, Some(request_root(request_id).to_string())).ok()
+    }
+
+    /// Threads held by running interactive statements (NAN-4772: at most
+    /// the pool plus [`INTERACTIVE_SLACK_THREADS`]).
+    pub fn interactive_threads(&self) -> u64 {
+        self.running.lock().unwrap_or_else(|e| e.into_inner()).interactive_threads
+    }
+
+    fn grant_for(self: &Arc<Self>, priority: Priority, mut request: Option<String>) -> ThreadGrant {
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
-        let threads = threads_for(self.total, &running, priority, request.as_deref());
+        loop {
+            match self.take(running, priority, request) {
+                Ok(grant) => return grant,
+                Err((guard, back)) => {
+                    // No room: a running interactive statement returns some.
+                    running = self.released.wait(guard).unwrap_or_else(|e| e.into_inner());
+                    request = back;
+                }
+            }
+        }
+    }
+
+    /// Take a grant under the lock, or hand the lock (and request) back
+    /// when an interactive statement has no room.
+    #[allow(clippy::type_complexity)]
+    fn take<'a>(
+        self: &Arc<Self>,
+        mut running: std::sync::MutexGuard<'a, Running>,
+        priority: Priority,
+        request: Option<String>,
+    ) -> Result<ThreadGrant, (std::sync::MutexGuard<'a, Running>, Option<String>)> {
+        let Some(threads) = threads_for(self.total, &running, priority, request.as_deref()) else {
+            return Err((running, request));
+        };
         let request = (priority == Priority::Interactive).then_some(request).flatten();
         match priority {
             Priority::Interactive => {
                 running.interactive += 1;
+                running.interactive_threads += threads;
                 if let Some(request) = request.as_ref() {
                     *running.interactive_requests.entry(request.clone()).or_default() += 1;
                 }
@@ -204,7 +277,7 @@ impl ThreadBudget {
                 running.agent_threads += threads;
             }
         }
-        ThreadGrant { budget: self.clone(), priority, threads, request }
+        Ok(ThreadGrant { budget: self.clone(), priority, threads, request })
     }
 
     /// Statements holding a grant: (interactive, companion, background).
@@ -223,6 +296,8 @@ impl ThreadBudget {
         match priority {
             Priority::Interactive => {
                 running.interactive = running.interactive.saturating_sub(1);
+                running.interactive_threads = running.interactive_threads.saturating_sub(threads);
+                self.released.notify_all();
                 if let Some(request) = request {
                     if let Some(count) = running.interactive_requests.get_mut(request) {
                         *count = count.saturating_sub(1);
@@ -245,9 +320,10 @@ impl ThreadBudget {
     }
 }
 
-fn threads_for(total: u64, running: &Running, priority: Priority, request: Option<&str>) -> u64 {
+/// `None`: an interactive statement with no room under the bound (it waits).
+fn threads_for(total: u64, running: &Running, priority: Priority, request: Option<&str>) -> Option<u64> {
     let share = (total / (running.interactive + 1)).max(1);
-    match priority {
+    Some(match priority {
         Priority::Interactive => {
             // NAN-4751: other requests count once each, however many
             // statements they run; this request's running statements split
@@ -257,14 +333,21 @@ fn threads_for(total: u64, running: &Running, priority: Priority, request: Optio
             let keyed = running.interactive_requests.values().sum::<u64>();
             let unkeyed = running.interactive.saturating_sub(keyed);
             let other_requests = running.interactive_requests.len() as u64 - u64::from(siblings > 0) + unkeyed;
-            (total / (other_requests + 1) / (siblings + 1)).max(1)
+            // NAN-4772: never below the floor (a one-core role keeps one),
+            // then within the room the running statements leave.
+            let share = (total / (other_requests + 1) / (siblings + 1)).max(INTERACTIVE_MIN_THREADS.min(total));
+            let room = (total + INTERACTIVE_SLACK_THREADS).saturating_sub(running.interactive_threads);
+            if room == 0 {
+                return None;
+            }
+            share.min(room)
         }
         Priority::Companion => share.min(COMPANION_MAX_THREADS),
         Priority::Background if running.interactive + running.companion > 0 => 1,
         Priority::Background => total.saturating_sub(running.background_threads).min(total / 2).max(1),
         Priority::Agent if running.interactive + running.companion + running.background > 0 => 1,
         Priority::Agent => (total / AGENT_POOL_DIVISOR).saturating_sub(running.agent_threads).max(1),
-    }
+    })
 }
 
 /// One statement's threads, returned to the pool on drop.
@@ -324,18 +407,78 @@ mod tests {
     fn concurrent_interactive_statements_share_the_pool() {
         let budget = ThreadBudget::new(6);
         let first = budget.grant(Priority::Interactive);
+        // NAN-4772: a newcomer's half share is lowered to the slack left.
         let second = budget.grant(Priority::Interactive);
-        let third = budget.grant(Priority::Interactive);
-        assert_eq!((first.threads(), second.threads(), third.threads()), (6, 3, 2));
+        assert_eq!((first.threads(), second.threads()), (6, INTERACTIVE_SLACK_THREADS));
+        assert!(budget.try_grant(Priority::Interactive).is_none(), "a third waits for room");
         drop(first);
-        // Two running: a newcomer gets a third.
+        // One running: a newcomer gets half, the next a third.
+        let third = budget.grant(Priority::Interactive);
+        assert_eq!(third.threads(), 3);
         assert_eq!(budget.grant(Priority::Interactive).threads(), 2);
         drop((second, third));
         assert_eq!(budget.grant(Priority::Interactive).threads(), 6);
-        // Never below one thread, however many run.
-        let many = (0..10).map(|_| budget.grant(Priority::Interactive)).collect::<Vec<_>>();
+        // However many arrive, the running total stays within the bound and
+        // every admitted statement has at least one thread.
+        let many = std::iter::from_fn(|| budget.try_grant(Priority::Interactive)).take(64).collect::<Vec<_>>();
         assert!(many.iter().all(|grant| grant.threads() >= 1));
-        assert_eq!(budget.grant(Priority::Interactive).threads(), 1);
+        assert_eq!(many.iter().map(ThreadGrant::threads).sum::<u64>(), 6 + INTERACTIVE_SLACK_THREADS);
+        assert_eq!(budget.interactive_threads(), 6 + INTERACTIVE_SLACK_THREADS);
+        drop(many);
+        assert_eq!(budget.interactive_threads(), 0);
+    }
+
+    /// NAN-4772: the Mythos 1.0.12 bakeoff shape. On a six-thread role,
+    /// five concurrent analyst requests used to start on 6+3+2+1+1 threads
+    /// (and on 6+3+2+2+2 = 15 with the floor alone). Shares stay at least
+    /// the floor; the running total is bounded by the pool plus the slack:
+    /// only later statements shrink (down to one), and with no room left a
+    /// statement waits. A pool smaller than the floor keeps its own size,
+    /// and agent, background and companion grants are unchanged.
+    #[test]
+    fn interactive_grants_keep_the_floor_within_a_bounded_total() {
+        let budget = ThreadBudget::new(6);
+        let bound = 6 + INTERACTIVE_SLACK_THREADS;
+        let first = budget.grant_for_request(Priority::Interactive, "req-0");
+        let second = budget.grant_for_request(Priority::Interactive, "req-1");
+        assert_eq!((first.threads(), second.threads()), (6, 2), "the second starts on the floor at once");
+        assert!(budget.try_grant_for_request(Priority::Interactive, "req-2").is_none(), "the third waits for room");
+        drop(first);
+        let third = budget.grant_for_request(Priority::Interactive, "req-2");
+        let fourth = budget.grant_for_request(Priority::Interactive, "req-3");
+        let fifth = budget.grant_for_request(Priority::Interactive, "req-4");
+        assert_eq!((third.threads(), fourth.threads(), fifth.threads()), (3, 2, 1), "a later share shrinks to the room left");
+        assert_eq!(budget.interactive_threads(), bound);
+        assert!(budget.try_grant_for_request(Priority::Interactive, "req-0-stats-0").is_none(), "a slice waits too");
+        // Lower classes keep their single thread beside analysts.
+        assert_eq!(budget.grant(Priority::Agent).threads(), 1);
+        assert_eq!(budget.grant(Priority::Background).threads(), 1);
+        assert_eq!(budget.grant(Priority::Companion).threads(), 1);
+        drop((second, third, fourth, fifth));
+        assert_eq!(budget.interactive_threads(), 0);
+        assert_eq!(ThreadBudget::new(1).grant(Priority::Interactive).threads(), 1, "a one-core role is not oversubscribed");
+        let two = ThreadBudget::new(2);
+        let first = two.grant(Priority::Interactive);
+        assert_eq!((first.threads(), two.grant(Priority::Interactive).threads()), (2, 2));
+    }
+
+    /// NAN-4772: a statement with no room waits on its lane thread and
+    /// starts as soon as a running interactive statement ends.
+    #[test]
+    fn a_statement_without_room_waits_for_a_release() {
+        let budget = ThreadBudget::new(6);
+        let first = budget.grant_for_request(Priority::Interactive, "a");
+        let second = budget.grant_for_request(Priority::Interactive, "b");
+        let waiter = {
+            let budget = budget.clone();
+            std::thread::spawn(move || budget.grant_for_request(Priority::Interactive, "c").threads())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!waiter.is_finished(), "no room: it waits");
+        drop(first);
+        assert_eq!(waiter.join().unwrap(), 3, "half the pool beside b, once a ended");
+        drop(second);
+        assert_eq!(budget.interactive_threads(), 0);
     }
 
     /// Two users, each issuing a statement while the other's runs: every
@@ -346,6 +489,12 @@ mod tests {
         let budget = ThreadBudget::new(6);
         let mut a = budget.grant(Priority::Interactive);
         let mut b = budget.grant(Priority::Interactive);
+        // NAN-4772: b started on the slack beside a lone a; one rotation
+        // settles them.
+        drop(a);
+        a = budget.grant(Priority::Interactive);
+        drop(b);
+        b = budget.grant(Priority::Interactive);
         for _ in 0..4 {
             drop(a);
             a = budget.grant(Priority::Interactive);
@@ -363,9 +512,10 @@ mod tests {
         assert_eq!(companion.threads(), COMPANION_MAX_THREADS);
         assert_eq!(budget.grant(Priority::Interactive).threads(), 6, "a primary beside its own companion");
         let primary = budget.grant(Priority::Interactive);
-        let _others = (0..5).map(|_| budget.grant(Priority::Interactive)).collect::<Vec<_>>();
-        assert_eq!(budget.grant(Priority::Companion).threads(), 1);
-        drop(primary);
+        let others = std::iter::from_fn(|| budget.try_grant(Priority::Interactive)).take(8).collect::<Vec<_>>();
+        assert_eq!(budget.grant(Priority::Companion).threads(), (6 / (1 + others.len() as u64 + 1)).clamp(1, COMPANION_MAX_THREADS));
+        assert_eq!(budget.interactive_threads(), 6 + INTERACTIVE_SLACK_THREADS, "companions take nothing from the interactive bound");
+        drop((primary, others));
         assert_eq!(ThreadBudget::new(1).grant(Priority::Companion).threads(), 1);
     }
 
@@ -386,28 +536,40 @@ mod tests {
     /// requests and split their own request's share.
     #[test]
     fn one_requests_slices_share_one_slot() {
+        // The share alone (the NAN-4772 room is checked separately): on 12
+        // threads with A running two slices and B one, a new request C is
+        // one of three requests (12 / 3 = 4; a third when every statement
+        // counted, 12 / 4 = 3); A's third slice splits A's half three ways;
+        // B's second slice splits B's half.
+        let running = Running {
+            interactive: 3,
+            interactive_requests: [("a".to_string(), 2), ("b".to_string(), 1)].into_iter().collect(),
+            ..Running::default()
+        };
+        let share = |request: &str| threads_for(12, &running, Priority::Interactive, Some(request));
+        assert_eq!(share("c"), Some(4));
+        assert_eq!(share("a"), Some(2));
+        assert_eq!(share("b"), Some(3));
+        // Statements without a request id each count as their own request.
+        let unkeyed = Running { interactive: 4, ..running.clone() };
+        assert_eq!(threads_for(12, &unkeyed, Priority::Interactive, Some("c")), Some(3));
+
+        // Grants: siblings are counted and released per request.
         let budget = ThreadBudget::new(8);
         let a_left = budget.grant_for_request(Priority::Interactive, "a-dc-0l");
         assert_eq!(a_left.threads(), 8, "alone: the whole pool");
         let a_right = budget.grant_for_request(Priority::Interactive, "a-dc-0r");
-        assert_eq!(a_right.threads(), 4, "a sibling splits its request's share");
-        // Analyst B beside A's two slices: one other request, half the pool
-        // (it was a third when every statement counted).
-        let b = budget.grant_for_request(Priority::Interactive, "b");
-        assert_eq!(b.threads(), 4);
-        assert_eq!(budget.running(), (3, 0, 0));
-        // A third slice of A beside B: half the pool, split three ways.
-        assert_eq!(budget.grant_for_request(Priority::Interactive, "a-dc-0ll").threads(), 1);
+        assert_eq!(a_right.threads(), INTERACTIVE_SLACK_THREADS, "a sibling's half, within the room");
+        assert_eq!(budget.running(), (2, 0, 0));
+        assert_eq!(budget.running.lock().unwrap().interactive_requests.get("a"), Some(&2));
         drop((a_left, a_right));
-        assert_eq!(budget.grant_for_request(Priority::Interactive, "a-stats-0").threads(), 4, "A's slot is released");
-        drop(b);
-        assert_eq!(budget.grant_for_request(Priority::Interactive, "c").threads(), 8);
-        // Statements without a request id each count as their own request.
+        let b = budget.grant_for_request(Priority::Interactive, "b");
+        assert_eq!(b.threads(), 8, "A's slot is released");
         let anonymous = budget.grant(Priority::Interactive);
-        assert_eq!(budget.grant_for_request(Priority::Interactive, "d").threads(), 4);
-        assert_eq!(budget.grant(Priority::Interactive).threads(), 4);
-        drop(anonymous);
+        assert_eq!(anonymous.threads(), INTERACTIVE_SLACK_THREADS);
+        drop((b, anonymous));
         assert_eq!(budget.running(), (0, 0, 0));
+        assert_eq!(budget.interactive_threads(), 0);
         assert!(budget.running.lock().unwrap().interactive_requests.is_empty(), "no request is leaked");
     }
 
@@ -426,7 +588,8 @@ mod tests {
         assert_eq!(analyst.threads(), 8, "agents never shrink an analyst");
         assert_eq!(budget.grant_for_request(Priority::Agent, "agent-x").threads(), 1);
         assert_eq!(budget.grant_for_request(Priority::Companion, "u-hist").threads(), COMPANION_MAX_THREADS);
-        assert_eq!(budget.grant_for_request(Priority::Interactive, "u-stats-1").threads(), 4);
+        // Its sibling: 8 / 2 = 4, within the slack left (NAN-4772).
+        assert_eq!(budget.grant_for_request(Priority::Interactive, "u-stats-1").threads(), INTERACTIVE_SLACK_THREADS);
         drop(analyst);
         drop(agents);
         assert_eq!(budget.running_agents(), 0);
@@ -509,11 +672,11 @@ mod tests {
         let budget = ThreadBudget::new(6);
         let user = budget.grant(Priority::Interactive);
         let other = budget.grant(Priority::Interactive);
-        assert_eq!(other.threads(), 3);
+        assert_eq!(other.threads(), 2);
         assert_eq!(other.apply("SELECT 1 SETTINGS max_threads=6, max_execution_time=55"),
-            "SELECT 1 SETTINGS max_threads=3, max_execution_time=55, max_parsing_threads=3");
+            "SELECT 1 SETTINGS max_threads=2, max_execution_time=55, max_parsing_threads=2");
         assert_eq!(other.apply("SELECT 1 SETTINGS max_threads=6, max_parsing_threads=6"),
-            "SELECT 1 SETTINGS max_threads=3, max_parsing_threads=3");
+            "SELECT 1 SETTINGS max_threads=2, max_parsing_threads=2");
         // A bounded reader keeps its own two threads.
         assert_eq!(user.apply("SELECT 1 SETTINGS max_threads=2, max_parsing_threads=2"),
             "SELECT 1 SETTINGS max_threads=2, max_parsing_threads=2");

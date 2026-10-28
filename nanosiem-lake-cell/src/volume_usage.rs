@@ -559,6 +559,104 @@ impl Accountant {
     }
 }
 
+/// The filesystem `path` lives on: its own device, or its nearest existing
+/// ancestor's (the hot root may not exist before the accountant creates it).
+/// Stacked/shared-capacity filesystems are unknown: distinct device IDs do
+/// not prove independent capacity for overlay upper dirs or Btrfs subvolumes.
+fn device_of(path: &Path) -> Option<u64> {
+    for dir in path.ancestors() {
+        match std::fs::metadata(dir) {
+            Ok(meta) => {
+                let filesystem = nix::sys::statfs::statfs(dir).ok()?.filesystem_type();
+                return independent_device(meta.dev(), filesystem);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            // Permission, symlink-loop and I/O errors do not prove the
+            // path is absent: its parent may be on a different filesystem.
+            // Keep the root charged rather than guessing that device.
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn independent_device(device: u64, filesystem: nix::sys::statfs::FsType) -> Option<u64> {
+    use nix::sys::statfs::{BTRFS_SUPER_MAGIC, OVERLAYFS_SUPER_MAGIC};
+    if filesystem == OVERLAYFS_SUPER_MAGIC || filesystem == BTRFS_SUPER_MAGIC {
+        None
+    } else {
+        Some(device)
+    }
+}
+
+/// NAN-4777: the `candidates` that share `root`'s filesystem, `root` first.
+/// The hot-window target is the size of the volume holding `root`. Bytes on
+/// another filesystem never use that space, so they must not count as
+/// "other data" on it.
+///
+/// Before this, the persistent A/B hot PVC (NAN-3647) was still charged
+/// with the whole data volume (#5207 predates the split). On one hosted
+/// tenant that was
+/// 34.7 GB: the producer warm-on-write tier, ingest, slatedb and the
+/// agent-catalog export. Together with 37 GB of product state actually on
+/// the hot volume, it shrank the window to a 4-18 GB target against the
+/// ~47 GB a 168 h window needs. The fence then refused hot downloads as
+/// "saturated by leased or protected objects", although the cache held
+/// almost no leases.
+///
+/// When a device is unknown (unreadable path or shared-capacity filesystem),
+/// the candidate is kept. That over-counts, the safe direction for a fence.
+pub fn same_volume_roots(root: &Path, candidates: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    same_volume_roots_by(root, candidates, device_of)
+}
+
+fn same_volume_roots_by(
+    root: &Path,
+    candidates: impl IntoIterator<Item = PathBuf>,
+    device: impl Fn(&Path) -> Option<u64>,
+) -> Vec<PathBuf> {
+    let home = device(root);
+    let mut roots = vec![root.to_path_buf()];
+    for candidate in candidates {
+        if roots.contains(&candidate) {
+            continue;
+        }
+        let same = match (home, device(&candidate)) {
+            (Some(home), Some(other)) => home == other,
+            _ => true,
+        };
+        if same {
+            roots.push(candidate);
+        } else {
+            tracing::info!(root = %root.display(), excluded = %candidate.display(),
+                "volume accountant: root is on another filesystem; not charged to the hot-window volume");
+        }
+    }
+    roots
+}
+
+/// NAN-4777: the cell's hot-window accountant. It is bound at `hot_root` and
+/// charges only the `other_roots` that share its filesystem (see
+/// [`same_volume_roots`]). The supervisor passes the data dir. When the hot
+/// window lives on the data volume (no A/B hot PVC), the data dir is still
+/// counted, as before.
+pub fn start_hot_window_accountant(hot_root: PathBuf, other_roots: Vec<PathBuf>) -> std::io::Result<Accountant> {
+    let roots = same_volume_roots(&hot_root, other_roots);
+    start(hot_root, roots)
+}
+
+/// [`start_hot_window_accountant`] with an explicit config and device lookup
+/// (tests: two filesystems in one temp dir).
+pub fn start_hot_window_accountant_with(
+    hot_root: PathBuf,
+    other_roots: Vec<PathBuf>,
+    config: AccountantConfig,
+    device: impl Fn(&Path) -> Option<u64>,
+) -> std::io::Result<Accountant> {
+    let roots = same_volume_roots_by(&hot_root, other_roots, device);
+    start_with(hot_root, roots, config)
+}
+
 /// Bind before starting tenant processes. Requests contain no paths or tenant
 /// identifiers: clients cannot use the supervisor to read arbitrary files.
 /// Jailed tenant processes cannot reach the socket; give them [`Accountant::pair`].
@@ -953,5 +1051,121 @@ mod tests {
         assert_eq!(target_from(Some(" 1024 ")), 1024);
         assert_eq!(target_from(Some("0")), DEFAULT_TARGET_BYTES);
         assert!(AccountantConfig::from_env().target_bytes.is_some(), "the supervisor always caps");
+    }
+
+    /// NAN-4777: only roots on the hot root's filesystem are charged to it.
+    /// An unknown device is kept (over-counting is the safe side).
+    #[test]
+    fn hot_window_accountant_charges_only_its_own_filesystem() {
+        let (hot, data, shared) = (PathBuf::from("/hot"), PathBuf::from("/data"), PathBuf::from("/hot-scratch"));
+        let device = |path: &Path| match path.to_str() {
+            Some("/hot" | "/hot-scratch") => Some(1),
+            Some("/data") => Some(2),
+            _ => None,
+        };
+        assert_eq!(same_volume_roots_by(&hot, [data.clone(), shared.clone(), hot.clone()], device), vec![hot.clone(), shared]);
+        // The hot window on the data volume (no A/B PVC): both, as before.
+        assert_eq!(same_volume_roots_by(&data, [data.clone()], device), vec![data.clone()]);
+        assert_eq!(same_volume_roots_by(&hot, [PathBuf::from("/unknown")], device), vec![hot.clone(), PathBuf::from("/unknown")]);
+        // Real devices: a temp dir shares its own filesystem, and a root
+        // that does not exist yet resolves through its ancestors.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-yet");
+        assert_eq!(same_volume_roots(&missing, [dir.path().to_path_buf()]), vec![missing.clone(), dir.path().to_path_buf()]);
+
+        // Production start: a separate "data volume" full of bytes is not
+        // charged to the hot volume's figure.
+        let (hot_dir, data_dir) = (dir.path().join("hot"), dir.path().join("data"));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::File::create(data_dir.join("producer-tier")).unwrap().set_len(1 << 30).unwrap();
+        let config = || AccountantConfig::every(std::time::Duration::from_secs(3600));
+        let apart = |path: &Path| Some(if path.starts_with(&data_dir) { 2 } else { 1 });
+        start_hot_window_accountant_with(hot_dir.clone(), vec![data_dir.clone()], config(), apart).unwrap();
+        assert!(usage(&hot_dir).unwrap() < 1 << 20, "data volume charged to the hot volume");
+        start_hot_window_accountant_with(hot_dir.clone(), vec![data_dir.clone()], config(), |_: &Path| Some(1)).unwrap();
+        assert!(usage(&hot_dir).unwrap() >= 1 << 30, "one shared volume still counts the data dir");
+    }
+
+    #[test]
+    fn device_lookup_errors_do_not_guess_the_parent_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-yet/created");
+        assert_eq!(device_of(&missing), device_of(dir.path()));
+
+        // ELOOP is deterministic even when the test runs as root. Like
+        // EACCES or EIO it must leave identity unknown, not use the parent.
+        let unreadable = dir.path().join("loop");
+        std::os::unix::fs::symlink("loop", &unreadable).unwrap();
+        assert_eq!(device_of(&unreadable), None);
+        assert_eq!(
+            same_volume_roots(&unreadable, [dir.path().to_path_buf()]),
+            vec![unreadable.clone(), dir.path().to_path_buf()],
+        );
+        assert_eq!(
+            same_volume_roots(dir.path(), [unreadable.clone()]),
+            vec![dir.path().to_path_buf(), unreadable],
+        );
+    }
+
+    #[test]
+    fn shared_volume_accountant_counts_nested_data_and_hot_roots_once() {
+        let data = tempfile::tempdir().unwrap();
+        let hot = data.path().join("hot");
+        std::fs::create_dir_all(&hot).unwrap();
+        std::fs::File::create(data.path().join("producer-tier")).unwrap().set_len(1 << 20).unwrap();
+        std::fs::File::create(hot.join("reader-cache")).unwrap().set_len(1 << 20).unwrap();
+        let _accountant = start_hot_window_accountant(hot.clone(), vec![data.path().to_path_buf()]).unwrap();
+        assert_eq!(usage(&hot).unwrap(), directory_bytes(data.path()).unwrap());
+    }
+
+    #[test]
+    fn production_accountant_rechecks_the_device_for_each_hot_root() {
+        let data = tempfile::tempdir().unwrap();
+        let Ok(hot_a) = tempfile::tempdir_in("/dev/shm") else {
+            eprintln!("no writable /dev/shm for the real two-filesystem test");
+            return;
+        };
+        let (Some(data_device), Some(hot_device)) = (device_of(data.path()), device_of(hot_a.path())) else {
+            eprintln!("stacked/shared-capacity filesystem; cannot prove separate devices");
+            return;
+        };
+        if data_device == hot_device {
+            eprintln!("temp dir and /dev/shm share one filesystem");
+            return;
+        }
+        std::fs::File::create(data.path().join("producer-tier")).unwrap().set_len(1 << 20).unwrap();
+        let _a = start_hot_window_accountant(hot_a.path().to_path_buf(), vec![data.path().to_path_buf()]).unwrap();
+        assert_eq!(usage(hot_a.path()).unwrap(), directory_bytes(hot_a.path()).unwrap());
+
+        // A fresh accountant on a shared filesystem must select roots
+        // again; it must not reuse the previous hot root's device decision.
+        let hot_b = data.path().join("hot-b");
+        let _b = start_hot_window_accountant(hot_b.clone(), vec![data.path().to_path_buf()]).unwrap();
+        assert_eq!(usage(&hot_b).unwrap(), directory_bytes(data.path()).unwrap());
+        assert!(usage(&hot_b).unwrap() >= 1 << 20);
+    }
+
+    #[test]
+    fn shared_capacity_devices_remain_charged() {
+        use nix::sys::statfs::{BTRFS_SUPER_MAGIC, EXT4_SUPER_MAGIC, OVERLAYFS_SUPER_MAGIC};
+        let (hot, data) = (PathBuf::from("/hot"), PathBuf::from("/data"));
+        // Different overlay instances or Btrfs subvolumes can share one
+        // backing filesystem. Exercise both directions of the comparison.
+        for shared in [OVERLAYFS_SUPER_MAGIC, BTRFS_SUPER_MAGIC] {
+            for hot_shared in [true, false] {
+                let device = |path: &Path| {
+                    let is_hot = path == hot;
+                    independent_device(
+                        if is_hot { 1 } else { 2 },
+                        if is_hot == hot_shared { shared } else { EXT4_SUPER_MAGIC },
+                    )
+                };
+                assert_eq!(same_volume_roots_by(&hot, [data.clone()], device), vec![hot.clone(), data.clone()]);
+            }
+        }
+        let separate = |path: &Path| {
+            independent_device(if path == hot { 1 } else { 2 }, EXT4_SUPER_MAGIC)
+        };
+        assert_eq!(same_volume_roots_by(&hot, [data], separate), vec![hot.clone()]);
     }
 }

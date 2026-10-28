@@ -2292,8 +2292,8 @@ class ApiClient {
   }
 
   // Generic meloD job polling
-  async getMelodJobStatus(jobId: string): Promise<import('./types').MelodJobStatusResponse> {
-    return this._melod.getMelodJobStatus(jobId);
+  async getMelodJobStatus(jobId: string, signal?: AbortSignal): Promise<import('./types').MelodJobStatusResponse> {
+    return this._melod.getMelodJobStatus(jobId, signal);
   }
 
   // Notifications
@@ -2319,6 +2319,10 @@ class ApiClient {
   }
 
   // Enrichment
+  async getPlatformFeeds(): Promise<import('./enrichment').PlatformFeedsStatus> {
+    return this._enrichment.getPlatformFeeds();
+  }
+
   async listEnrichmentSources(): Promise<import('./types').EnrichmentSource[]> {
     return this._enrichment.listEnrichmentSources();
   }

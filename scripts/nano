@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# nano operator commands for a self-hosted lean install (open core, or the
+# sovereign single-host install). Run from the install directory.
+#
+#   scripts/nano feeds update               fetch the current signed feed bundle and install it
+#   scripts/nano feeds update --file FILE   install a bundle file you copied here (offline drop)
+#   scripts/nano feeds update --license-file LICENSE  sovereign authenticated online fetch
+#   scripts/nano feeds update --url URL     metadata endpoint on an https mirror
+#   scripts/nano feeds status               installed feeds, revision, age and hard expiry
+#
+# NAN-4759: IPinfo Lite geo/ASN, ThreatFox and Tor are stamped at ingest from
+# one signed feed bundle kept on this host (the lean-platform-feeds service).
+# The runtime never fetches anything. This command is the only online step:
+# it downloads the bundle on the host, then the lean-platform-feeds image
+# verifies its signature and swaps it in atomically, with no network. New
+# events are stamped from it within about a minute, without a restart. A feed
+# past its hard expiry stops stamping new events; stamped values are kept.
+{ set +x; } 2>/dev/null
+set -euo pipefail
+umask 077
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+max_bytes=$((512 * 1024 * 1024 + 16 + 65536))
+# The bundle path inside the one-shot import container.
+import_path=/run/nano-feed-import/bundle
+
+die() { printf 'nano: %s\n' "$*" >&2; exit 1; }
+cleanup=()
+trap 'rm -rf -- "${cleanup[@]}"' EXIT
+log() { printf '==> %s\n' "$*" >&2; }
+
+usage() {
+    sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    exit 2
+}
+
+env_value() { awk -F= -v k="$1" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$root/.env" 2>/dev/null || true; }
+
+# The compose files this install runs with: a sovereign single-host install
+# (scripts/sovereign/single-host.sh) adds its overlay and TLS.
+compose_files() {
+    files=(-f docker-compose.opensource.yml)
+    if [[ -d $root/.nano-sovereign ]]; then
+        files+=(-f docker-compose.sovereign.yml -f docker-compose.tls.yml)
+    fi
+}
+
+compose() {
+    local files
+    compose_files
+    (cd "$root" && docker </dev/null compose "${files[@]}" "$@")
+}
+
+require_lean() {
+    [[ -f $root/.env ]] || die "no install in $root (.env missing)"
+    [[ $(env_value COMPOSE_PROFILES) == *lean* ]] || die "platform feeds need the lean lake profile (COMPOSE_PROFILES=lean)"
+    [[ -d $root/.nano-lean/platform-grants ]] || die "this install predates platform feeds: re-run the installer once to render them"
+}
+
+# The distribution route returns a descriptor plus a short-lived presigned
+# bundle URL. Only an operator-run fetch makes either request. A mirror may
+# expose the same response contract via --url; signatures remain authoritative.
+fetch() { # <out file> <metadata URL override> <license file>
+    local out=$1 url=$2 license=$3 metadata header bundle_url
+    local auth=()
+    if [[ -d $root/.nano-sovereign ]]; then
+        [[ -n $license ]] || die "sovereign online update needs --license-file <signed license>; offline updates use --file"
+        [[ -f $license && ! -L $license ]] || die "license must be a regular file"
+        [[ $(stat -c %a "$license") == 600 ]] || die "license file must have mode 0600"
+        (( $(stat -c %s "$license") <= 9216 )) || die "license is oversized"
+        [[ -n $url ]] || url=https://api.nano.rs/api/feeds/v1/sovereign/current
+        header=${out}.header
+        # Keep the license out of argv, logs, and the bundle request. Curl
+        # does not follow redirects on this authenticated metadata request.
+        python3 - "$license" "$header" <<'PYHEADER'
+import base64, pathlib, sys
+artifact = pathlib.Path(sys.argv[1]).read_bytes()
+pathlib.Path(sys.argv[2]).write_text("X-Nano-License: " + base64.urlsafe_b64encode(artifact).decode().rstrip("=") + "\n")
+PYHEADER
+        auth=(--header "@$header")
+    else
+        [[ -z $license ]] || die "--license-file is only used by sovereign installs"
+        [[ -n $url ]] || url=https://api.nano.rs/api/feeds/v1/open/current
+    fi
+    [[ $url =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] || die "--url must be a plain https metadata URL"
+    log "Fetching the current feed descriptor"
+    metadata=${out}.json
+    curl --disable --fail --silent --show-error --proto '=https' --tlsv1.2 \
+        --max-filesize 131072 --connect-timeout 20 --max-time 60 \
+        "${auth[@]}" --output "$metadata" "$url" || die "descriptor fetch failed; retry, or use --file"
+    # Public signed metadata; the verifier runs as UID 999 with no network.
+    chmod 755 "$(dirname -- "$out")"
+    chmod 444 "$metadata"
+    bundle_url=$(compose run --rm --no-deps -T -v "$metadata:$import_path:ro" lean-platform-feeds check-current --file "$import_path") \
+        || die "the feed source descriptor was refused; nothing was changed"
+    if [[ -z $bundle_url ]]; then
+        log "The installed signed descriptor is current."
+        return 0
+    fi
+    log "Fetching the signed feed bundle"
+    curl --disable --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --max-filesize "$max_bytes" --connect-timeout 20 --max-time 900 \
+        --output "$out" "$bundle_url" || die "bundle fetch failed; retry, or use --file"
+}
+
+install_file() { # <bundle file>
+    local src=$1 work staged
+    [[ -f $src && ! -L $src ]] || die "$src is not a regular file"
+    (( $(stat -c %s "$src") <= max_bytes )) || die "$src exceeds the signed container size bound"
+    work=$(mktemp -d "$root/.nano-feeds-import.XXXXXX")
+    cleanup+=("$work")
+    staged=$work/bundle
+    cp -- "$src" "$staged"
+    # Public, signed feed data (no secret); the service runs as UID 999.
+    chmod 755 "$work"
+    chmod 444 "$staged"
+    log "Verifying and installing $(sha256sum "$staged" | cut -d' ' -f1)"
+    compose run --rm --no-deps -T -v "$staged:$import_path:ro" lean-platform-feeds import --file "$import_path" \
+        || die "the bundle was refused; nothing was changed"
+    log "Installed. New events are stamped from it within about a minute (no restart)."
+}
+
+feeds_update() {
+    local file="" url="" license=""
+    while (($#)); do
+        case $1 in
+            --file) file=${2:-}; [[ -n $file ]] || die "--file needs a path"; shift 2 ;;
+            --url) url=${2:-}; [[ -n $url ]] || die "--url needs a URL"; shift 2 ;;
+            --license-file) license=${2:-}; [[ -n $license ]] || die "--license-file needs a path"; shift 2 ;;
+            *) usage ;;
+        esac
+    done
+    [[ -z $file || ( -z $url && -z $license ) ]] || die "--file cannot be combined with online options"
+    require_lean
+    if [[ -n $file ]]; then
+        install_file "$(realpath -- "$file")"
+    else
+        local tmp
+        tmp=$(mktemp -d "$root/.nano-feeds-fetch.XXXXXX")
+        cleanup+=("$tmp")
+        fetch "$tmp/bundle" "$url" "$license"
+        [[ ! -f $tmp/bundle ]] || install_file "$tmp/bundle"
+    fi
+    feeds_status
+}
+
+feeds_status() {
+    require_lean
+    if [[ -n $(compose ps -q lean-platform-feeds 2>/dev/null) ]]; then
+        compose exec -T lean-platform-feeds lake_platform_feeds status
+    else
+        compose run --rm --no-deps -T lean-platform-feeds status
+    fi
+}
+
+case ${1:-} in
+    feeds)
+        shift
+        case ${1:-} in
+            update) shift; feeds_update "$@" ;;
+            status) shift; (($# == 0)) || usage; feeds_status ;;
+            *) usage ;;
+        esac
+        ;;
+    *) usage ;;
+esac

@@ -37,6 +37,33 @@ pub struct LocalDeleteAuthority {
     view: tokio::sync::Mutex<LakePartLogView>,
     signer: SigningKey,
     bronze: std::sync::Mutex<Option<super::local_bronze::LocalBronzeRetention>>,
+    /// NAN-4766: which removed parts are already reclaimed and when the
+    /// parts prefix was last listed in full.
+    reclaim: std::sync::Mutex<Reclaim>,
+    /// Test clock (ms); `None` reads the wall clock.
+    clock: Option<Arc<std::sync::atomic::AtomicI64>>,
+}
+
+/// NAN-4766: least time between full listings of the tenant's parts prefix.
+/// Between them a pass lists only the directories of parts the log removed
+/// past the grace window and not yet reclaimed, so its cost follows the
+/// supersede rate instead of the store's history (every superseded part
+/// keeps its provenance file, so a full listing grows by ~1.7k files an hour
+/// at 12k eps, forever without a retention policy). The full listing finds
+/// what the removal memory cannot: orphans (eligible only after 49 h),
+/// retention deletes of parts retired more than 48 h earlier, and removals
+/// that aged out of the log's 48 h id memory before they were reclaimed.
+/// The first pass of every process is a full listing.
+pub const FULL_SWEEP_INTERVAL_MS: i64 = 6 * 3_600_000;
+
+#[derive(Default)]
+struct Reclaim {
+    /// Removed parts whose directory held no deletable file at the last look
+    /// (only kept provenance, or nothing). Pruned to the log's removal memory.
+    drained: std::collections::BTreeSet<crate::parts::format::PartId>,
+    full_listed_at_ms: Option<i64>,
+    /// Keys the last pass listed (tests assert the pass cost).
+    last_listed: usize,
 }
 
 impl LocalDeleteAuthority {
@@ -61,7 +88,41 @@ impl LocalDeleteAuthority {
             view: tokio::sync::Mutex::new(LakePartLogView::genesis()),
             signer: SigningKey::from_bytes(&seed),
             bronze: std::sync::Mutex::new(None),
+            reclaim: std::sync::Mutex::new(Reclaim::default()),
+            clock: None,
         }))
+    }
+
+    /// [`Self::new`] on a test clock (ms since the epoch).
+    #[cfg(test)]
+    pub(crate) fn new_with_clock(
+        store: Arc<LocalObjectStore>,
+        tenant: &str,
+        trusted: TenantKeySet,
+        policy: GcPolicy,
+        clock: Arc<std::sync::atomic::AtomicI64>,
+    ) -> Result<Arc<Self>> {
+        let mut authority = Arc::into_inner(Self::new(store, tenant, trusted, policy, None)?)
+            .expect("a fresh authority has one owner");
+        authority.clock = Some(clock);
+        Ok(Arc::new(authority))
+    }
+
+    fn now_ms(&self) -> i64 {
+        self.clock.as_ref().map_or_else(
+            || chrono::Utc::now().timestamp_millis(),
+            |clock| clock.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    fn reclaim(&self) -> Result<std::sync::MutexGuard<'_, Reclaim>> {
+        self.reclaim.lock().map_err(|_| anyhow::anyhow!("local GC reclaim lock poisoned"))
+    }
+
+    /// Keys the last [`Self::collect`] listed under the parts prefix.
+    #[cfg(test)]
+    pub(crate) fn last_listed(&self) -> usize {
+        self.reclaim().map_or(0, |reclaim| reclaim.last_listed)
     }
 
     pub fn attach_bronze(&self, bronze: super::local_bronze::LocalBronzeRetention) {
@@ -230,7 +291,7 @@ impl LocalDeleteAuthority {
             &view,
             &live_keys,
             &[object.expect("present object")],
-            chrono::Utc::now().timestamp_millis(),
+            self.now_ms(),
             &policy,
         )?;
         ensure!(
@@ -287,23 +348,56 @@ impl LocalDeleteAuthority {
             });
         }
         let live_keys = live_part_keys(&self.tenant, &mut view, &self.reader).await?;
+        let now_ms = self.now_ms();
+        // NAN-4766: list in full on the first pass and every
+        // FULL_SWEEP_INTERVAL_MS; otherwise only the directories of removed
+        // parts past the grace window that are not yet reclaimed. Selection
+        // only: every listed file still goes through the same planner, and
+        // every permit and delete re-checks the complete log.
+        let full = self.reclaim()?.full_listed_at_ms
+            .is_none_or(|at| now_ms.saturating_sub(at) >= FULL_SWEEP_INTERVAL_MS);
+        let (keys, candidates) = if full {
+            (self.store.list(&prefix).await?, None)
+        } else {
+            let cutoff = now_ms.saturating_sub((policy.grace_seconds as i64).saturating_mul(1_000));
+            let candidates: Vec<(crate::parts::format::PartId, String)> = {
+                let reclaim = self.reclaim()?;
+                let live = view.live();
+                live.removed_before(cutoff)
+                    .filter(|id| !reclaim.drained.contains(*id))
+                    .filter_map(|id| {
+                        let part = live.removed_ref(id)?;
+                        let keys = crate::parts::format::PartKeys::new(&self.tenant, part.level, part.event_hour, id).ok()?;
+                        Some((id.clone(), format!("{}/", keys.dir)))
+                    })
+                    .collect()
+            };
+            let mut keys = Vec::new();
+            for (_, dir) in &candidates {
+                keys.extend(self.store.list(dir).await?);
+            }
+            (keys, Some(candidates))
+        };
+        let listed = keys.len();
         // Parts are immutable, and GC runs under the ingestor mutex. A
         // fresh log check is still performed for every permit and delete.
         let mut objects = Vec::new();
         let mut more_eligible = false;
+        // Parts with a deletable file at this listing (not reclaimed yet).
+        let mut unreclaimed = std::collections::BTreeSet::new();
         let eligible = |object: &ListedPartObject| -> Result<bool> {
             Ok(!plan_local(
                 &self.tenant,
                 &view,
                 &live_keys,
                 std::slice::from_ref(object),
-                chrono::Utc::now().timestamp_millis(),
+                now_ms,
                 &policy,
             )?
             .requests
             .is_empty())
         };
-        for key in self.store.list(&prefix).await? {
+        for key in keys {
             let Some(parsed) = parse_part_file_key(&key) else {
                 continue;
             };
@@ -315,6 +409,7 @@ impl LocalDeleteAuthority {
             if !eligible(&self.listed(&key, false)?)? {
                 continue;
             }
+            unreclaimed.insert(parsed.part_id.clone());
             if objects.len() >= policy.max_requests {
                 more_eligible = true;
                 break;
@@ -329,9 +424,28 @@ impl LocalDeleteAuthority {
             &view,
             &live_keys,
             &objects,
-            chrono::Utc::now().timestamp_millis(),
+            now_ms,
             &policy,
         )?;
+        {
+            let mut reclaim = self.reclaim()?;
+            reclaim.last_listed = listed;
+            // An incomplete full sweep must stay full on the catch-up
+            // cadence: incremental listing cannot recover old removals,
+            // orphans, or provenance that only retention now makes eligible.
+            if full && !more_eligible {
+                reclaim.full_listed_at_ms = Some(now_ms);
+            }
+            // A part is reclaimed once a complete look at its directory found
+            // nothing deletable; a batch cut short proves nothing.
+            if let (Some(candidates), false) = (&candidates, more_eligible) {
+                reclaim.drained.extend(candidates.iter()
+                    .filter(|(id, _)| !unreclaimed.contains(id))
+                    .map(|(id, _)| id.clone()));
+            }
+            let live = view.live();
+            reclaim.drained.retain(|id| live.removed_ref(id).is_some());
+        }
         drop(view);
         // Recover unlink-before-receipt crashes using durable prepare records.
         let prepared_prefix = format!("lake/parts/v1/tenant={}/gc/prepared/", self.tenant);
@@ -944,6 +1058,280 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), store.path(&key).unwrap()).unwrap();
         assert!(authority.object(&key).is_err());
         assert!(outside.path().exists());
+    }
+
+    /// A full sweep must drain beyond one batch even when incremental
+    /// listing cannot find its remaining files: forgotten removals, orphans,
+    /// and provenance that becomes eligible for retention later.
+    #[tokio::test]
+    async fn full_sweeps_drain_old_removals_orphans_and_late_retention() {
+        use crate::lake_part_gc::planner::tests::part_ref;
+        use crate::part_ingest::ingest::{pass_is_catching_up, SANCTIONED_GC_CATCH_UP_INTERVAL_MS};
+        use crate::part_ingest::part_gc_gate::SanctionedPartGc;
+        use crate::parts::part_log::ID_MEMORY_MS;
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        const HOUR: i64 = 3_600_000;
+        // Both the process's initial sweep and a later six-hour sweep.
+        for initial_sweep in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(LocalObjectStore::new(dir.path()).unwrap());
+            let mut chain = Chain::new();
+            for n in 1..=3 {
+                chain.add(n, T0 + n as i64);
+                for file in ["data-00000.parquet", "tokens-00000.nti", "provenance.json"] {
+                    store.put(&key(n, Level::L0, file), b"old input").await.unwrap();
+                }
+            }
+            persist(&store, &chain).await;
+            let clock = Arc::new(AtomicI64::new(T0 + HOUR));
+            let authority = LocalDeleteAuthority::new_with_clock(
+                store.clone(), TENANT_UUID, TenantKeySet::new(vec![]),
+                GcPolicy { max_requests: 2, ..GcPolicy::default() }, clock.clone(),
+            ).unwrap();
+            if !initial_sweep {
+                assert_eq!(authority.run_pass(T0 + HOUR).await.unwrap().deleted, 0);
+            }
+            chain.push(LogOp::Merge {
+                output: part_ref(4, Level::Minute),
+                supersedes: (1..=3).map(id).collect(),
+            }, T0 + 2 * HOUR);
+            // Advance the verified log beyond its removal-memory horizon.
+            let mut now = T0 + ID_MEMORY_MS + 3 * HOUR;
+            let mut recent = part_ref(5, Level::L0);
+            recent.part_id = crate::parts::format::PartId::parse(
+                &format!("{now:013}-{:016x}", 5),
+            ).unwrap();
+            chain.push(LogOp::Add {
+                parts: vec![recent], consumed: vec![crate::parts::part_log::SourceRef {
+                    key: "bronze/recent".into(), version: "1".into(), sha256: "d".repeat(64),
+                }], edge_log: None,
+            }, now);
+            let view = chain.view();
+            assert!(view.live().removed_ref(&id(1)).is_none());
+            assert!(view.removal(&id(1)).is_some());
+            persist(&store, &chain).await;
+            let live = key(4, Level::Minute, "data-00000.parquet");
+            store.put(&live, b"live output").await.unwrap();
+            let orphan = key(90, Level::L0, "data-00000.parquet");
+            store.put(&orphan, b"orphan").await.unwrap();
+            std::fs::File::open(store.path(&orphan).unwrap()).unwrap().set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_millis(T0 as u64),
+                ),
+            ).unwrap();
+
+            // Six superseded files and an orphan drain on the production
+            // catch-up cadence, without waiting another six hours.
+            for expected in [2, 2, 2, 1] {
+                clock.store(now, Ordering::SeqCst);
+                let report = authority.run_pass(now).await.unwrap();
+                assert_eq!(report.deleted, expected, "initial={initial_sweep}: {report:?}");
+                assert_eq!(pass_is_catching_up(&report), expected == 2, "{report:?}");
+                now += SANCTIONED_GC_CATCH_UP_INTERVAL_MS;
+            }
+            assert!(store.get(&orphan).await.unwrap().is_none());
+            for n in 1..=3 {
+                for file in ["data-00000.parquet", "tokens-00000.nti"] {
+                    assert!(store.get(&key(n, Level::L0, file)).await.unwrap().is_none());
+                }
+                assert!(store.get(&key(n, Level::L0, "provenance.json")).await.unwrap().is_some());
+            }
+            assert!(store.get(&live).await.unwrap().is_some());
+
+            // Retention later makes the kept provenance eligible. It must
+            // wait for the next full sweep, then drain all of its batches.
+            authority.policy.lock().unwrap().0.retention_days = Some(1);
+            let next_full = now - SANCTIONED_GC_CATCH_UP_INTERVAL_MS + FULL_SWEEP_INTERVAL_MS;
+            clock.store(next_full - 1, Ordering::SeqCst);
+            assert_eq!(authority.run_pass(next_full - 1).await.unwrap().deleted, 0);
+            now = next_full;
+            for expected in [2, 1] {
+                clock.store(now, Ordering::SeqCst);
+                let report = authority.run_pass(now).await.unwrap();
+                assert_eq!(report.deleted, expected, "initial={initial_sweep}: {report:?}");
+                assert_eq!(pass_is_catching_up(&report), expected == 2, "{report:?}");
+                now += SANCTIONED_GC_CATCH_UP_INTERVAL_MS;
+            }
+            for n in 1..=3 {
+                assert!(store.get(&key(n, Level::L0, "provenance.json")).await.unwrap().is_none());
+            }
+            assert!(store.get(&live).await.unwrap().is_some());
+        }
+    }
+
+    /// NAN-4766: GC keeps pace with a steady merge rate. A four-hour run on
+    /// a fake clock with ingest's production scheduler
+    /// (`sanctioned_pass_due_paced` + `pass_is_catching_up`) driving the
+    /// production pass (`SanctionedPartGc::run_pass`) over a real directory
+    /// store: 6 L0 parts a minute, each minute's L0s superseded by an M
+    /// merge, each hour's Ms by an H merge (~21 superseded files a minute).
+    /// Every superseded file is gone within grace + one pass interval (so
+    /// the superseded-pending set is bounded by that window), its bytes
+    /// plateau, no live file is ever deleted, and a pass between full
+    /// listings lists only the newly reclaimable parts, not the store's
+    /// history (the kept provenance of every part ever superseded).
+    #[tokio::test]
+    async fn gc_keeps_pace_with_a_steady_merge_rate_and_superseded_disk_plateaus() {
+        use crate::lake_part_gc::planner::tests::part_ref;
+        use crate::part_ingest::ingest::{pass_is_catching_up, sanctioned_pass_due_paced, SANCTIONED_GC_INTERVAL_MS};
+        use crate::part_ingest::part_gc_gate::SanctionedPartGc;
+        use crate::parts::part_log::{PartRef, SourceRef};
+        use crate::parts::format::PartId;
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicI64, Ordering};
+        const MINUTE: i64 = 60_000;
+        const HOUR: i64 = 3_600_000;
+        const HOURS: i64 = 4;
+        const L0_PER_MINUTE: u64 = 6;
+        const TICK: i64 = 5_000;
+        const FILES: [&str; 3] = ["data-00000.parquet", "tokens-00000.nti", "partials/rollup.parquet"];
+        // Superseded files a minute: the L0s, plus the Ms at each hour.
+        const RATE: usize = (L0_PER_MINUTE as usize + 1) * FILES.len();
+        let body = vec![7_u8; 1024];
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(dir.path()).unwrap());
+        // A past, hour-aligned timeline: permits still expire on the wall clock.
+        let start = (chrono::Utc::now().timestamp_millis() - (HOURS + 2) * HOUR).div_euclid(HOUR) * HOUR;
+        let clock = Arc::new(AtomicI64::new(start));
+        let policy = GcPolicy::default();
+        let grace = policy.grace_seconds as i64 * 1_000;
+        let authority = LocalDeleteAuthority::new_with_clock(
+            store.clone(), TENANT_UUID, TenantKeySet::new(vec![]), policy, clock.clone()).unwrap();
+
+        let mut chain = Chain::new();
+        let mut persisted = 0;
+        let mut n = 0_u64;
+        let mut part = |level: Level, at: i64| -> PartRef {
+            n += 1;
+            let mut part = part_ref(n, level);
+            part.part_id = PartId::parse(&format!("{:013}-{:016x}", at, n)).unwrap();
+            part.event_hour = at.div_euclid(HOUR) as i32;
+            // Written parts (L0/M/H merges) are sorted; adopted ones are not.
+            part.sorted = true;
+            part
+        };
+        let keys_of = |part: &PartRef| -> Vec<String> {
+            let keys = crate::parts::format::PartKeys::new(TENANT_UUID, part.level, part.event_hour, &part.part_id).unwrap();
+            FILES.iter().map(|file| keys.file(file)).collect()
+        };
+        async fn write(store: &LocalObjectStore, part: &PartRef, keys: &[String], body: &[u8]) {
+            for key in keys {
+                store.put(key, body).await.unwrap();
+            }
+            let keys = crate::parts::format::PartKeys::new(TENANT_UUID, part.level, part.event_hour, &part.part_id).unwrap();
+            store.put(&keys.provenance(), b"{}").await.unwrap();
+        }
+        let present = |key: &str| store.path(key).unwrap().exists();
+
+        // (removed at, deletable keys) of every superseded part; live keys.
+        let mut removed: Vec<(i64, Vec<String>)> = Vec::new();
+        let mut live: BTreeMap<PartId, Vec<String>> = BTreeMap::new();
+        let (mut minute_l0, mut hour_m): (Vec<PartRef>, Vec<PartRef>) = (Vec::new(), Vec::new());
+        let (mut last, mut catching_up, mut busy) = (None, false, 0_i64);
+        let (mut deleted, mut targeted_listed_max_late) = (0_u64, 0_usize);
+        let mut samples: Vec<(i64, u64)> = Vec::new();
+        let mut source = 0_u64;
+
+        let mut now = start;
+        while now < start + HOURS * HOUR {
+            clock.store(now, Ordering::SeqCst);
+            if now % MINUTE == 0 {
+                // The previous minute's L0s merge into one M part.
+                if !minute_l0.is_empty() {
+                    let output = part(Level::Minute, now);
+                    let keys = keys_of(&output);
+                    write(&store, &output, &keys, &body).await;
+                    chain.push(LogOp::Merge { output: output.clone(),
+                        supersedes: minute_l0.iter().map(|p| p.part_id.clone()).collect() }, now);
+                    for input in minute_l0.drain(..) {
+                        removed.push((now, live.remove(&input.part_id).unwrap()));
+                    }
+                    live.insert(output.part_id.clone(), keys);
+                    hour_m.push(output);
+                }
+                // At the hour, the last hour's Ms merge into one H part.
+                if now % HOUR == 0 && hour_m.len() > 1 {
+                    let output = part(Level::Hour, now);
+                    let keys = keys_of(&output);
+                    write(&store, &output, &keys, &body).await;
+                    chain.push(LogOp::Merge { output: output.clone(),
+                        supersedes: hour_m.iter().map(|p| p.part_id.clone()).collect() }, now);
+                    for input in hour_m.drain(..) {
+                        removed.push((now, live.remove(&input.part_id).unwrap()));
+                    }
+                    live.insert(output.part_id.clone(), keys);
+                }
+                // This minute's ingest: one Add of the minute's L0 parts.
+                let parts: Vec<_> = (0..L0_PER_MINUTE).map(|_| part(Level::L0, now)).collect();
+                let consumed = parts.iter().map(|_| {
+                    source += 1;
+                    SourceRef { key: format!("bronze/{source}"), version: "1".into(), sha256: "d".repeat(64) }
+                }).collect();
+                for p in &parts {
+                    let keys = keys_of(p);
+                    write(&store, p, &keys, &body).await;
+                    live.insert(p.part_id.clone(), keys);
+                }
+                chain.push(LogOp::Add { parts: parts.clone(), consumed, edge_log: None }, now);
+                minute_l0 = parts;
+                let keys = LogKeys::new(TENANT_UUID).unwrap();
+                for (entry, _) in &chain.entries[persisted..] {
+                    store.put_if_absent(&keys.entry(entry.seq), &entry.to_bytes().unwrap()).await.unwrap();
+                }
+                persisted = chain.entries.len();
+            }
+            if sanctioned_pass_due_paced(last, catching_up, busy, now) {
+                last = Some(now);
+                let started = std::time::Instant::now();
+                let report = authority.run_pass(now).await.unwrap();
+                busy = started.elapsed().as_millis() as i64;
+                assert!(report.paused_reason.is_none(), "{report:?}");
+                deleted += report.deleted;
+                catching_up = pass_is_catching_up(&report);
+                let full = authority.reclaim().unwrap().full_listed_at_ms == Some(now);
+                if !full && now >= start + (HOURS - 1) * HOUR {
+                    targeted_listed_max_late = targeted_listed_max_late.max(authority.last_listed());
+                }
+            }
+            if now % (10 * MINUTE) == 0 {
+                // Every superseded file is gone within grace + one interval
+                // (+ one minute: a pass runs at most a tick after it is due).
+                let overdue = now - grace - SANCTIONED_GC_INTERVAL_MS - MINUTE;
+                for (at, keys) in removed.iter().filter(|(at, _)| *at <= overdue) {
+                    for key in keys {
+                        assert!(!present(key), "{key} superseded at {} still present at {}", at - start, now - start);
+                    }
+                }
+                for keys in live.values() {
+                    for key in keys {
+                        assert!(present(key), "live {key} was deleted");
+                    }
+                }
+                let pending = removed.iter().flat_map(|(_, keys)| keys).filter(|key| present(key)).count() as u64;
+                samples.push((now, pending * body.len() as u64));
+            }
+            now += TICK;
+        }
+
+        // All but the last ~72 min of supersedes reclaimed.
+        let total: usize = removed.iter().map(|(_, keys)| keys.len()).sum();
+        assert!(deleted as usize >= total - RATE * 72, "deleted {deleted} of {total}");
+        // Bounded: never above ~72 min of the supersede rate (grace + an
+        // interval + slack), and flat over the last 90 min.
+        let bound = (RATE * 72 * body.len()) as u64;
+        for (at, bytes) in &samples {
+            assert!(*bytes <= bound, "superseded-pending {bytes} B at +{} min exceeds {bound}", (at - start) / MINUTE);
+        }
+        let late: Vec<u64> = samples.iter().filter(|(at, _)| *at >= start + HOURS * HOUR - 90 * MINUTE)
+            .map(|(_, bytes)| *bytes).collect();
+        let (low, high) = (*late.iter().min().unwrap(), *late.iter().max().unwrap());
+        assert!(low > 0 && high as f64 <= low as f64 * 1.25, "superseded-pending did not plateau: {late:?}");
+        // A targeted pass lists the newly reclaimable parts, not history.
+        let stored = store.list(&format!("lake/parts/v1/tenant={TENANT_UUID}/parts/")).await.unwrap().len();
+        assert!(targeted_listed_max_late > 0 && targeted_listed_max_late * 4 < stored,
+            "a targeted pass listed {targeted_listed_max_late} of {stored} stored keys");
     }
 
     #[test]

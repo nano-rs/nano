@@ -11,7 +11,7 @@ const BUCKET: &str = "nano-shared-r2-3867aaaa-0000-4000-8000-000000000001";
 #[derive(Default)]
 struct Provider {
     tables: Mutex<HashMap<String, Arc<Table>>>,
-    registry: Mutex<Option<String>>,
+    registry: Arc<Mutex<Option<String>>>,
     trace: Arc<Mutex<Vec<String>>>,
     fail_publish: AtomicBool,
     fail_retire: Arc<AtomicBool>,
@@ -33,9 +33,14 @@ struct Provider {
     /// `publish_serving` has since recorded a fresh serving proof.
     /// `writer_reopen` deletes it; `invalidate_results` and `writer_reopen`
     /// are refused without the fresh proof, exactly like the platform.
-    fence: Mutex<Option<(BTreeSet<String>, bool)>>,
+    fence: Arc<Mutex<Option<(BTreeSet<String>, bool)>>>,
     /// Every control call the platform model refused.
     refused: Mutex<Vec<String>>,
+    /// NAN-4774: the activation is not `active`/`deactivated` (a rotation
+    /// onto the wiped volume, or still converging): `writer_adopt` refuses.
+    not_active: AtomicBool,
+    /// NAN-4774: platform `custody.converged`, reset by `writer_attached`.
+    converged: AtomicBool,
 }
 impl Provider {
     fn refuse(&self, op: &str, code: &str) -> Result<()> {
@@ -45,6 +50,8 @@ impl Provider {
 }
 struct Table {
     name: String,
+    registry: Arc<Mutex<Option<String>>>,
+    fence: Arc<Mutex<Option<(BTreeSet<String>, bool)>>>,
     parts: Mutex<BTreeSet<String>>,
     /// NAN-4627: the export chain head, enforced with the REST committer's
     /// own ordering rule, and each part's key hour.
@@ -146,6 +153,11 @@ impl CatalogLifecycleBackend for Table {
 #[async_trait::async_trait]
 impl ServingTable for Table {
     async fn retire(&self) -> Result<()> {
+        // The production broker requires an open privacy fence even for an
+        // unpublished leftover, and refuses any still-registered serving name.
+        ensure!(self.fence.lock().unwrap().is_some(), "agent_catalog_table_still_serving");
+        ensure!(self.registry.lock().unwrap().as_deref() != Some(&format!("agent.{}_v1", self.name)),
+            "agent_catalog_table_still_serving");
         ensure!(
             !self.fail_retire.load(Ordering::SeqCst),
             "provider delete unavailable"
@@ -175,6 +187,8 @@ impl ServingFactory for Provider {
             .or_insert_with(|| {
                 Arc::new(Table {
                     name: name.into(),
+                    registry: self.registry.clone(),
+                    fence: self.fence.clone(),
                     parts: Mutex::new(BTreeSet::new()),
                     head: Mutex::new(None),
                     hours: Mutex::new(Default::default()),
@@ -254,7 +268,24 @@ impl ServingFactory for Provider {
             return self.refuse("writer_reopen", "catalog_fresh_serving_proof_missing");
         }
         *self.fence.lock().unwrap() = None;
+        self.converged.store(true, Ordering::SeqCst);
         self.trace.lock().unwrap().push("open".into());
+        Ok(())
+    }
+    /// Like platform `writer_adopt`: only this activation's sole registered
+    /// serving name, with no open privacy fence and an active activation.
+    async fn adopt(&self, table: &str) -> Result<()> {
+        if self.not_active.load(Ordering::SeqCst) {
+            return self.refuse("writer_adopt", "catalog_adopt_activation_not_active");
+        }
+        if self.fence.lock().unwrap().is_some() {
+            return self.refuse("writer_adopt", "catalog_adopt_privacy_open");
+        }
+        if self.registry.lock().unwrap().as_deref() != Some(table) {
+            return self.refuse("writer_adopt", "catalog_adopt_not_registered");
+        }
+        self.converged.store(true, Ordering::SeqCst);
+        self.trace.lock().unwrap().push(format!("adopt:{table}"));
         Ok(())
     }
     async fn list_epochs(&self) -> Result<BTreeSet<String>> {
@@ -568,6 +599,9 @@ async fn wiped_writer_with_no_sealed_part_probes_the_hour_before_the_master_chec
     drop(catalog);
     std::fs::remove_dir_all(dir.path().join("serving")).unwrap();
     std::fs::remove_dir_all(dir.path().join("custody")).unwrap();
+    // NAN-4774: a rotation onto the wiped volume: the platform refuses to
+    // adopt the old activation's epoch, so a fresh one is published.
+    provider.not_active.store(true, Ordering::SeqCst);
     let backend = Arc::new(FreshServingBackend::new(provider.clone(), dir.path().join("serving")).unwrap());
     let catalog = TenantCatalog::new(T, dir.path().join("custody"), backend.clone()).unwrap();
     catalog.sync_parts(T, vec![], 50 * 3600000, &MergePolicy::default()).await.unwrap();
@@ -601,6 +635,7 @@ async fn no_committed_snapshot_needs_no_epoch_and_an_uncommitted_master() {
     let epoch = provider.build("events_0123456789abcdef0123456789abcdef").unwrap();
     epoch.commit(&manifest(1)).await.unwrap();
     assert!(!backend.no_committed_snapshot().await.unwrap(), "a serving epoch exists");
+    provider.close().await.unwrap();
     epoch.retire().await.unwrap();
     assert!(backend.no_committed_snapshot().await.unwrap());
     provider.build("events").unwrap().commit(&manifest(2)).await.unwrap();
@@ -1267,4 +1302,283 @@ async fn a_merge_with_new_data_in_the_same_sync_takes_the_privacy_fence() {
         catalog.require_removed(T, replaced.part_id.as_str()).unwrap();
     }
     assert!(catalog.require_removed(T, parts[3].part_id.as_str()).is_err(), "a kept part is never receipted");
+}
+
+/// NAN-4774: one activation's writer volume, through the production attach
+/// installation step (`install_or_fence`), TenantCatalog and FreshServingBackend.
+struct Writer {
+    backend: Arc<FreshServingBackend>,
+    catalog: Arc<TenantCatalog>,
+}
+async fn attach_writer(dir: &std::path::Path, provider: &Arc<Provider>, activation: uuid::Uuid) -> Writer {
+    let backend = Arc::new(FreshServingBackend::new(provider.clone(), dir.join("serving")).unwrap().with_batch(BATCH));
+    let catalog = Arc::new(TenantCatalog::new(T, dir.join("custody"), backend.clone()).unwrap().with_limits(ONE_BATCH_PER_SYNC));
+    super::super::install_or_fence(&catalog, dir, activation, &super::super::AttachProgress::default()).await.unwrap();
+    // `writer_attached` resets the platform's convergence on every attach.
+    provider.converged.store(false, Ordering::SeqCst);
+    Writer { backend, catalog }
+}
+/// The roll: the successor pod mounts the other A/B claim (an empty volume)
+/// with the same activation; the platform rows and the R2 catalog persist.
+async fn roll(dir: &std::path::Path, provider: &Arc<Provider>, old: Writer, activation: uuid::Uuid) -> Writer {
+    drop(old);
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    provider.trace.lock().unwrap().clear();
+    let writer = attach_writer(dir, provider, activation).await;
+    assert!(provider.trace.lock().unwrap().is_empty(), "a wiped volume defers the fence to the first sync");
+    writer
+}
+async fn converge_at(catalog: &TenantCatalog, parts: &[PartRef], at: i64) {
+    for pass in 0..32 {
+        match catalog.sync_parts(T, parts.to_vec(), at + pass, &MergePolicy::default()).await {
+            Ok(()) => return,
+            Err(error) => assert!(
+                error.downcast_ref::<super::super::super::lifecycle::CatalogSyncIncomplete>().is_some(),
+                "only budget stops: {error:#}"
+            ),
+        }
+    }
+    panic!("sync did not converge");
+}
+/// A validated activation: the first install publishes epoch E holding `parts`.
+async fn validated(dir: &std::path::Path, provider: &Arc<Provider>, parts: &[PartRef]) -> (Writer, uuid::Uuid, String) {
+    let activation = uuid::Uuid::new_v4();
+    let writer = attach_writer(dir, provider, activation).await;
+    converge_at(&writer.catalog, parts, LIVE_NOW).await;
+    assert!(provider.converged.load(Ordering::SeqCst) && provider.fence.lock().unwrap().is_none());
+    let published = provider.registry.lock().unwrap().clone().unwrap();
+    assert_registered_once(&table(provider, &epoch(&published)), parts);
+    (writer, activation, published)
+}
+
+/// NAN-4774 full sequence: validated epoch -> roll (A/B claim swap wipes the
+/// volume) -> restart -> the successor ADOPTS the published epoch: no close,
+/// no new pending epoch, no publish, no part registered twice (no rebuild
+/// read), platform custody converged again, the next delta lands on the
+/// master AND the adopted epoch, and GC proofs work again (planned index rebuilt).
+#[tokio::test]
+async fn a_rolled_writer_adopts_its_published_epoch_without_a_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("catalog");
+    let provider = Arc::new(Provider::default());
+    let parts = live_set(6);
+    let (writer, activation, published) = validated(&work, &provider, &parts).await;
+    let e = epoch(&published);
+    let writer = roll(&work, &provider, writer, activation).await;
+    assert!(!writer.catalog.recovery_required(), "reads stay open across the roll");
+    // The lake kept ingesting during the roll: one new sealed hour.
+    let more = live_set(7);
+    converge_at(&writer.catalog, &more, LIVE_NOW + 3_600_000).await;
+    assert!(provider.refused.lock().unwrap().is_empty(), "{:?}", provider.refused.lock().unwrap());
+    let trace = provider.trace.lock().unwrap().clone();
+    assert_eq!(trace.first(), Some(&format!("adopt:{published}")), "{trace:?}");
+    assert!(!trace.iter().any(|t| t == "closed" || t.starts_with("publish:") || t == "open"), "no fence, no fresh epoch: {trace:?}");
+    assert_eq!(provider.registry.lock().unwrap().as_ref(), Some(&published), "same serving name");
+    assert_eq!(provider.list_epochs().await.unwrap(), BTreeSet::from([e.clone()]), "no new pending epoch");
+    assert!(provider.converged.load(Ordering::SeqCst), "platform custody converged on the adopted epoch");
+    let state = writer.backend.state();
+    assert_eq!((state.active.as_deref(), state.pending.as_deref()), (Some(e.as_str()), None));
+    assert!(state.retired.is_empty());
+    // Every part registered exactly once in the epoch: nothing was rebuilt.
+    assert_registered_once(&table(&provider, &e), &more);
+    assert_registered_once(&table(&provider, "events"), &more);
+    let master = table(&provider, "events");
+    assert_eq!(table(&provider, &e).export_head(false).await.unwrap().checkpoint, master.export_head(false).await.unwrap().checkpoint);
+    // GC custody is whole again: a live part is pinned, never receipted.
+    assert!(writer.catalog.fence_retirement(T, more[0].part_id.as_str()).await.is_err());
+    // A later erasure still takes the full fence and a fresh name.
+    converge_at(&writer.catalog, &more[1..], LIVE_NOW + 2 * 3_600_000).await;
+    let fresh = provider.registry.lock().unwrap().clone().unwrap();
+    assert_ne!(fresh, published);
+    assert!(!table(&provider, &epoch(&fresh)).parts.lock().unwrap().contains(more[0].part_id.as_str()));
+    writer.catalog.require_removed(T, more[0].part_id.as_str()).unwrap();
+}
+
+/// NAN-4774 negative: the epoch's watermark differs from the master's (the
+/// roll landed between the master commit and the epoch commit). Not proven:
+/// today's privacy pass and fresh build, the old epoch retired after publish.
+/// Same for an epoch at the master's watermark whose referenced parts differ
+/// (it still names a part the master no longer holds): the parts proof alone
+/// refuses it, before the platform is asked.
+#[tokio::test]
+async fn a_rolled_writer_rebuilds_when_the_epoch_watermark_or_parts_differ() {
+    for case in ["watermark", "parts"] {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("catalog");
+        let provider = Arc::new(Provider::default());
+        let parts = live_set(3);
+        let (writer, activation, published) = validated(&work, &provider, &parts).await;
+        let e = table(&provider, &epoch(&published));
+        if case == "watermark" {
+            let mut head = e.head.lock().unwrap();
+            let (at, digest) = head.clone().unwrap();
+            *head = Some((at - 1, digest));
+        } else {
+            e.parts.lock().unwrap().insert("0000000000099-aaaaaaaaaaaaaaaa".into());
+        }
+        let writer = roll(&work, &provider, writer, activation).await;
+        converge_at(&writer.catalog, &parts, LIVE_NOW + 3_600_000).await;
+        assert_rebuilt(&provider, &published, false);
+        assert_eq!(writer.backend.state().active.as_deref(), Some(epoch(provider.registry.lock().unwrap().as_ref().unwrap()).as_str()), "{case}");
+    }
+}
+
+/// NAN-4774 negative: an erasure committed to the master after the epoch
+/// was published (the old writer's privacy pass was cut off by the roll
+/// before its fresh epoch published). The epoch still holds the erased part:
+/// never adopted, never served again; the part is receipted only after the
+/// fresh name is published.
+#[tokio::test]
+async fn a_rolled_writer_never_adopts_an_epoch_holding_an_erased_part() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("catalog");
+    let provider = Arc::new(Provider::default());
+    let parts = live_set(3);
+    let (writer, activation, published) = validated(&work, &provider, &parts).await;
+    let erased = parts[0].part_id.to_string();
+    provider.fail_publish.store(true, Ordering::SeqCst);
+    for pass in 0..32 {
+        let _ = writer.catalog.sync_parts(T, parts[1..].to_vec(), LIVE_NOW + 3_600_000 + pass, &MergePolicy::default()).await;
+        if !table(&provider, "events").parts.lock().unwrap().contains(&erased) { break; }
+    }
+    assert!(!table(&provider, "events").parts.lock().unwrap().contains(&erased), "the master committed the erasure");
+    assert!(table(&provider, &epoch(&published)).parts.lock().unwrap().contains(&erased));
+    provider.fail_publish.store(false, Ordering::SeqCst);
+    // The platform fence the cut-off pass opened ends with that pod's life
+    // only through a fresh publish; model the worst case (fence gone) so the
+    // writer's own proof is what refuses the adoption.
+    *provider.fence.lock().unwrap() = None;
+    let writer = roll(&work, &provider, writer, activation).await;
+    converge_at(&writer.catalog, &parts[1..], LIVE_NOW + 2 * 3_600_000).await;
+    // Multiple epochs require fenced retirement; neither is adopted.
+    assert_rebuilt(&provider, &published, false);
+    let fresh = provider.registry.lock().unwrap().clone().unwrap();
+    assert!(!table(&provider, &epoch(&fresh)).parts.lock().unwrap().contains(&erased));
+    assert!(table(&provider, &epoch(&published)).dropped.load(Ordering::SeqCst), "the epoch holding it is gone");
+    // The wiped volume lost the old receipt; part GC proves it again now
+    // that no retained metadata references the part.
+    writer.catalog.fence_retirement(T, &erased).await.unwrap();
+}
+
+/// NAN-4774 negative: an erasure in the part log that the master has not
+/// seen yet (it ran during the roll). Equality with the master is insufficient:
+/// the pending removal must refuse adoption before custody can converge.
+#[tokio::test]
+async fn an_erasure_during_the_roll_refuses_adoption_and_takes_the_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("catalog");
+    let provider = Arc::new(Provider::default());
+    let parts = live_set(3);
+    let (writer, activation, published) = validated(&work, &provider, &parts).await;
+    let erased = parts[0].part_id.to_string();
+    let writer = roll(&work, &provider, writer, activation).await;
+    converge_at(&writer.catalog, &parts[1..], LIVE_NOW + 3_600_000).await;
+    assert_rebuilt(&provider, &published, false);
+    let fresh = provider.registry.lock().unwrap().clone().unwrap();
+    assert_ne!(fresh, published, "the erasure publishes a fresh name");
+    let trace = provider.trace.lock().unwrap().clone();
+    let at = |s: &str| trace.iter().position(|t| t == s).unwrap_or_else(|| panic!("{s} missing: {trace:?}"));
+    assert!(at("closed") < at(&format!("publish:{fresh}")));
+    assert!(at(&format!("publish:{fresh}")) < at(&format!("retire:{}", epoch(&published))));
+    assert!(at(&format!("publish:{fresh}")) < at("fresh-cache-fence"));
+    assert!(!table(&provider, &epoch(&fresh)).parts.lock().unwrap().contains(&erased));
+    writer.catalog.require_removed(T, &erased).unwrap();
+}
+
+#[tokio::test]
+async fn a_rolled_writer_with_a_leftover_epoch_rebuilds_under_the_broker_retirement_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("catalog");
+    let provider = Arc::new(Provider::default());
+    let parts = live_set(3);
+    let (writer, activation, published) = validated(&work, &provider, &parts).await;
+    let leftover = format!("events_{}", uuid::Uuid::new_v4().simple());
+    let extra = provider.build(&leftover).unwrap();
+    assert!(extra.retire().await.is_err(), "the production broker requires privacy even for a leftover");
+    let writer = roll(&work, &provider, writer, activation).await;
+    converge_at(&writer.catalog, &parts, LIVE_NOW + 3_600_000).await;
+    assert_rebuilt(&provider, &published, false);
+    assert!(table(&provider, &leftover).dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn local_closed_reads_or_unsettled_removals_refuse_adoption_before_platform_io() {
+    for closed in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("catalog");
+        let provider = Arc::new(Provider::default());
+        let parts = live_set(3);
+        let (writer, activation, published) = validated(&work, &provider, &parts).await;
+        let writer = roll(&work, &provider, writer, activation).await;
+        if closed {
+            std::fs::write(work.join("custody/reads-closed"), T).unwrap();
+        } else {
+            let unsettled = work.join("custody/export/unsettled");
+            std::fs::create_dir_all(&unsettled).unwrap();
+            std::fs::write(unsettled.join("0000000000001.json"),
+                serde_json::to_vec(&vec![("0000000000099-aaaaaaaaaaaaaaaa", "a".repeat(64))]).unwrap()).unwrap();
+        }
+        converge_at(&writer.catalog, &parts, LIVE_NOW + 3_600_000).await;
+        assert_rebuilt(&provider, &published, false);
+    }
+}
+
+#[tokio::test]
+async fn an_add_only_backlog_on_the_wiped_writer_refuses_adoption() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("catalog");
+    let provider = Arc::new(Provider::default());
+    let parts = live_set(3);
+    let (writer, activation, published) = validated(&work, &provider, &parts).await;
+    let mut state = ExportState::load_durable(&work.join("custody")).unwrap();
+    let writer = roll(&work, &provider, writer, activation).await;
+    let more = live_set(4);
+    let at = LIVE_NOW + 3_600_000;
+    let pending = plan_export_reconciled(&more, &state, at, &MergePolicy::default());
+    let batches = state.split_plan(T, &pending, BATCH).unwrap();
+    assert!(batches.iter().all(|m| m.remove_parts.is_empty()));
+    state.record_durable_batches(&work.join("custody"), batches, at).unwrap();
+    converge_at(&writer.catalog, &more, at).await;
+    assert_rebuilt(&provider, &published, false);
+}
+
+/// NAN-4774 negative: custody not held for this epoch. A rotation onto the
+/// wiped volume (another activation, not active) or an open privacy fence:
+/// the platform refuses `writer_adopt` and the writer rebuilds.
+#[tokio::test]
+async fn a_rolled_writer_rebuilds_when_the_platform_refuses_custody() {
+    for case in ["not_active", "fence_open"] {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("catalog");
+        let provider = Arc::new(Provider::default());
+        let parts = live_set(3);
+        let (writer, activation, published) = validated(&work, &provider, &parts).await;
+        match case {
+            "not_active" => provider.not_active.store(true, Ordering::SeqCst),
+            _ => *provider.fence.lock().unwrap() = Some((BTreeSet::from([published.clone()]), false)),
+        }
+        let writer = roll(&work, &provider, writer, activation).await;
+        converge_at(&writer.catalog, &parts, LIVE_NOW + 3_600_000).await;
+        assert_rebuilt(&provider, &published, true);
+        assert!(provider.converged.load(Ordering::SeqCst), "{case}: converged through the fresh publish");
+    }
+}
+
+/// The fallback: closed reads, a fresh epoch published, the old one retired
+/// after that publish, and nothing adopted.
+fn assert_rebuilt(provider: &Provider, published: &str, refused: bool) {
+    let fresh = provider.registry.lock().unwrap().clone().unwrap();
+    assert_ne!(fresh, published, "a fresh epoch replaces the unproven one");
+    let trace = provider.trace.lock().unwrap().clone();
+    assert!(!trace.iter().any(|t| t.starts_with("adopt:")), "{trace:?}");
+    let at = |s: &str| trace.iter().position(|t| t == s).unwrap_or_else(|| panic!("{s} missing: {trace:?}"));
+    assert!(at("closed") < at(&format!("publish:{fresh}")));
+    assert!(at(&format!("publish:{fresh}")) < at(&format!("retire:{}", epoch(published))));
+    assert_eq!(
+        provider.refused.lock().unwrap().iter().any(|r| r.starts_with("writer_adopt:")),
+        refused,
+        "{:?}",
+        provider.refused.lock().unwrap()
+    );
 }

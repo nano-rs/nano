@@ -952,9 +952,14 @@ services:
       NANO_LAKE_PREVALENCE_SNAPSHOT_24H: prevalence-${NANO_LAKE_TENANT_ID:-default}-24h
       NANO_LAKE_PREVALENCE_SNAPSHOT_7D: prevalence-${NANO_LAKE_TENANT_ID:-default}-7d
       NANO_LAKE_PREVALENCE_SNAPSHOT_30D: prevalence-${NANO_LAKE_TENANT_ID:-default}-30d
-      # API sync/import atomically publishes here; Bronze observes the same
-      # isolated volume and pins each validated generation by content digest.
+      # The operator IPinfo token sync / air-gap import publishes this MMDB for
+      # the API's on-demand IP lookups only. Ingest-time geo/ASN, ThreatFox and
+      # Tor stamping comes from the signed platform feed bundle the
+      # lean-platform-feeds service installs (NAN-4759), not from this file.
       NANO_IPINFO_MMDB_PATH: /var/lib/nano-enrichment/ipinfo_lite.mmdb
+      # NAN-4759: read-only view of that bundle dir for feed freshness
+      # (GET /api/enrichment/platform-feeds). Absent outside the lean profile.
+      PLATFORM_BUNDLE_DIR: /var/lib/nano-platform-feeds/bundles
       LOG_FORMAT: ${LOG_FORMAT:-}
       SIEM_FORWARD_URL: ${SIEM_FORWARD_URL:-}
       SIEM_FORWARD_TOKEN: ${SIEM_FORWARD_TOKEN:-}
@@ -965,6 +970,7 @@ services:
       - nano-vector-dynamic:/app/config/vector
       - nano-lake-runtime:/var/lib/nano-lake:ro
       - nano-lake-enrichment:/var/lib/nano-enrichment
+      - nano-platform-feeds:/var/lib/nano-platform-feeds:ro
     depends_on:
       lake-cell:
         condition: service_healthy
@@ -1091,6 +1097,7 @@ services:
       NANO_LAKE_ENRICHMENT_COORDINATOR_URL: http://${NANO_LAKE_ENRICHMENT_HOST:-lake-enrichment-coordinator}:3016
       NANO_LAKE_ENRICHMENT_COORDINATOR_TOKEN_FILE: ${NANO_LAKE_ENRICHMENT_COORDINATOR_TOKEN_FILE:-/var/lib/nano-lake/config/enrichment-token}
       NANO_IPINFO_MMDB_PATH: /var/lib/nano-enrichment/ipinfo_lite.mmdb
+      PLATFORM_BUNDLE_DIR: /var/lib/nano-platform-feeds/bundles
       NANO_LAKE_SINK_STATIC_AUTH: ${NANO_LAKE_SINK_STATIC_AUTH:-true}
       CONNECTOR_INGEST_URL: http://vector:8088/services/collector/event
       VECTOR_ENRICHMENT_INGEST_URL: http://vector:8090/
@@ -1113,6 +1120,7 @@ services:
       - nano-vector-dynamic:/app/config/vector
       - nano-lake-runtime:/var/lib/nano-lake:ro
       - nano-lake-enrichment:/var/lib/nano-enrichment
+      - nano-platform-feeds:/var/lib/nano-platform-feeds:ro
     depends_on:
       lake-cell:
         condition: service_healthy
@@ -1437,9 +1445,15 @@ services:
     volumes:
       - ./.nano-lean/cell:/etc/nano-cell:ro
       - nano-lean-cell:/var/lib/nano-cell
+      # NAN-4759: the node platform feed bundle (feed_dir) and this tenant's
+      # policy (platform_policy_file), both read-only: ingest stamps IPinfo
+      # Lite geo/ASN, ThreatFox and Tor through the hosted bundle path.
+      - nano-platform-feeds:/var/lib/nano-platform-feeds:ro
+      - nano-platform-policy:/var/lib/nano-platform-policy:ro
     depends_on:
       lean-object-init: {condition: service_completed_successfully}
       postgres-migrate: {condition: service_completed_successfully}
+      lean-platform-feeds: {condition: service_healthy}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8790/healthz"]
       interval: 5s
@@ -1452,10 +1466,44 @@ services:
     image: *cell-image
     restart: "no"
     entrypoint: ["/bin/sh", "-eu", "-c"]
-    command: ["chown 999:999 /var/lib/nano-otel /var/lib/nano-enrichment"]
+    command: ["chown 999:999 /var/lib/nano-otel /var/lib/nano-enrichment /var/lib/nano-platform-feeds /var/lib/nano-platform-policy"]
     volumes:
       - nano-lean-otel:/var/lib/nano-otel
       - nano-lean-enrichment:/var/lib/nano-enrichment
+      - nano-platform-feeds:/var/lib/nano-platform-feeds
+      - nano-platform-policy:/var/lib/nano-platform-policy
+
+  # NAN-4759: self-hosted platform feeds. Keeps <feed_dir>/bundles holding the
+  # installed signed feed bundle (an empty one until the first import) and
+  # writes this tenant's policy from the grants file lean-init renders (every
+  # bundled feed granted). No network: the runtime makes no egress. Updates
+  # come from `scripts/nano feeds update` (online fetch, or --file for an
+  # offline drop), which verifies and atomically swaps the bundle; ingest
+  # picks it up within ~1 min without a restart.
+  lean-platform-feeds:
+    profiles: ["lean"]
+    image: *cell-image
+    restart: unless-stopped
+    logging: *default-logging
+    user: "999:999"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    network_mode: none
+    entrypoint: ["lake_platform_feeds"]
+    command: ["serve"]
+    volumes:
+      - ./.nano-lean/platform-grants:/etc/nano-platform-grants:ro
+      - nano-platform-feeds:/var/lib/nano-platform-feeds
+      - nano-platform-policy:/var/lib/nano-platform-policy
+    depends_on:
+      lean-init: {condition: service_completed_successfully}
+      lean-volume-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "lake_platform_feeds", "ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
 
   lean-otel:
     profiles: ["lean"]
@@ -1692,3 +1740,8 @@ volumes:
     name: ${COMPOSE_PROJECT_NAME:-nano}_lean-otel-${NANO_LAKE_TENANT_ID:-uninitialized}
   nano-lean-enrichment:
     name: ${COMPOSE_PROJECT_NAME:-nano}_lean-enrichment-${NANO_LAKE_TENANT_ID:-uninitialized}
+  # NAN-4759: node platform feed bundles (shared, signed public feed data, no
+  # tenant data) and per-tenant platform policies. Kept across tenant re-mints:
+  # a policy names its tenant, and a new tenant gets its own policy dir.
+  nano-platform-feeds:
+  nano-platform-policy:

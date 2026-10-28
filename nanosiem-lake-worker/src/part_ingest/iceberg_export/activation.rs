@@ -640,17 +640,7 @@ async fn attach_inner(
     }
     progress.enter(AttachStage::CustodyLock);
     let catalog = Arc::new(TenantCatalog::new(tenant, work.join("custody"), backend)?);
-    let installation = work.join("installation-id");
-    if std::fs::read_to_string(&installation).ok().as_deref()
-        != Some(&record.activation_id.to_string())
-    {
-        // Rotation must publish a new serving epoch even when the committed
-        // part set and the writer's durable checkpoint did not change.
-        progress.enter(AttachStage::FenceCloseAndDrain);
-        catalog.fence_installation().await?;
-        progress.enter(AttachStage::InstallationMarker);
-        write_private(&installation, record.activation_id.to_string().as_bytes())?;
-    }
+    install_or_fence(&catalog, work, record.activation_id, progress).await?;
     Ok(Some(Arc::new(ActivatedCatalog {
         catalog,
         control,
@@ -659,6 +649,35 @@ async fn attach_inner(
         record: record.clone(),
         activation_id: record.activation_id,
     })))
+}
+/// The installation marker decides the attach fence. Same activation: none.
+/// Another activation (a rotation): close reads now, so the first sync must
+/// publish a fresh serving epoch even when the committed part set and the
+/// writer's durable checkpoint did not change.
+///
+/// NAN-4774: no marker at all is a first install or a wiped volume (a cell
+/// roll's A/B claim swap). The fence is deferred to the first sync: with no
+/// planned index it takes the privacy pass, unless the platform confirms this
+/// activation still serves the published epoch and the writer proves that
+/// epoch equals the master. A rotation onto a wiped volume is refused that
+/// adoption by the platform (its activation is not active).
+async fn install_or_fence(catalog: &TenantCatalog, work: &Path, activation: uuid::Uuid, progress: &AttachProgress) -> Result<()> {
+    let installation = work.join("installation-id");
+    let installed = match std::fs::read_to_string(&installation) {
+        Ok(id) => Some(id),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    match installed {
+        Some(id) if id == activation.to_string() => return Ok(()),
+        None => {}
+        Some(_) => {
+            progress.enter(AttachStage::FenceCloseAndDrain);
+            catalog.fence_installation().await?;
+        }
+    }
+    progress.enter(AttachStage::InstallationMarker);
+    write_private(&installation, activation.to_string().as_bytes())
 }
 struct BackendFactory {
     record: CatalogActivation,
@@ -761,6 +780,10 @@ impl serving::ServingFactory for BackendFactory {
     }
     async fn reopen(&self) -> Result<()> {
         self.control.reopen().await
+    }
+    async fn adopt(&self, table: &str) -> Result<()> {
+        self.control.call_with("writer_adopt", json!({"table":table})).await?;
+        Ok(())
     }
 }
 fn write_private(path: &PathBuf, bytes: &[u8]) -> Result<()> {

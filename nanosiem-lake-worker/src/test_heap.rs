@@ -82,6 +82,11 @@ pub(crate) fn track_current_thread(enabled: bool) {
     TRACKED.with(|flag| flag.set(enabled));
 }
 
+/// Is this thread's heap counted?
+pub(crate) fn tracking_current_thread() -> bool {
+    TRACKED.try_with(Cell::get).unwrap_or(false)
+}
+
 /// Serializes measured scenarios: the counters are process-wide.
 pub(crate) static MEASUREMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

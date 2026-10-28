@@ -492,3 +492,174 @@ fn disk_cache_follows_the_measured_state_within_the_cap() {
     assert_eq!(object_cache_bytes(Some(3 * 1024 * MIB), 4 * 1024 * MIB), 4 * 1024 * MIB, "never past the cap");
     assert_eq!(object_cache_bytes(Some(u64::MAX), u64::MAX), u64::MAX);
 }
+
+/// NAN-4765: write `keys` (hash and IP entries, as [`seed`] does) into an
+/// open state from `from`, then flush and let its compactor settle.
+async fn grow_local_state(state: &mut IngestPrevalence, from: usize, keys: usize) {
+    let mark = 10 * DAY_US;
+    for first in (from..keys).step_by(8_192) {
+        let mut writes = WriteBatch::new();
+        for i in first..(first + 8_192).min(keys) {
+            let row = WindowState { first_seen: mark, last_seen: mark, days: vec![(10, 4)],
+                hosts: (0..4).map(|h| ((i * 4 + h) as u64, 10)).collect() };
+            writes.put(key("hash", &artifact(i)), encode(&row));
+            let ip = format!("8.{}.{}.{}", i / 65_536, i / 256 % 256, i % 256);
+            writes.put(key("ip", &ip), encode(&row));
+        }
+        writes.put(WATERMARK_KEY, mark.to_le_bytes());
+        state.commit(writes, true).await.unwrap();
+    }
+    state.advance_watermark(mark);
+    state.flush_memtable().await.unwrap();
+}
+
+/// NAN-4765: physical state bytes (every read path) and wall time per point
+/// read for `batch` distinct keys that no cache has seen.
+async fn point_read_cost(state: &IngestPrevalence, batch: BTreeSet<String>) -> (f64, f64) {
+    let bytes = || state.read_stats().iter().map(|s| s.bytes).sum::<u64>();
+    let wanted = batch.len();
+    let (b0, t0) = (bytes(), std::time::Instant::now());
+    let observed = state.lookup().observe(batch).await.unwrap();
+    assert_eq!(observed.rows.len(), wanted);
+    assert!(observed.scalars().values().all(|n| *n == 4), "every artifact reads its seeded count");
+    ((bytes() - b0) as f64 / wanted as f64, t0.elapsed().as_secs_f64() * 1e6 / wanted as f64)
+}
+
+/// NAN-4765: a state on the local filesystem (open core, sovereign, the
+/// NAN-4689 soak), opened by the production path (`open_sized`, as
+/// `spawn_prevalence_open` calls it), has no disk cache. A point read costs
+/// at most about one SST block of physical reads at every size, as the state
+/// grows 16x past the decoded block cache. The pre-fix shape (the same local SSTs behind a disk cache
+/// that holds a small share of them: the soak's 256 MiB against 9.7 GB,
+/// scaled here to one 4 MiB part) pays a whole part per miss and writes it
+/// to the cache again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_state_point_reads_cost_a_block_not_a_cache_part() {
+    let _workload = super::super::test_resources::PREVALENCE_WORKLOAD.write().await;
+    const BATCH: usize = 1_000;
+    let temp = tempfile::tempdir().unwrap();
+    let work = temp.path().join("work");
+    let root = work.join("prevalence").join(TENANT);
+    let cache_dir = root.join("object-cache");
+    // An earlier version's cache directory is removed on open.
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(cache_dir.join("stale-part"), vec![0_u8; 4096]).unwrap();
+    let mut state = IngestPrevalence::open_sized(TENANT, &work, None, None, OBJECT_CACHE_FLOOR_BYTES,
+        LocalStateSizing::FLOOR).await.unwrap();
+    assert_eq!(state.object_cache_sizing(), (None, 0), "a local state has no disk cache");
+    assert!(!cache_dir.exists(), "the unused cache of an earlier version is removed");
+    state.initialize_at(0, &"0".repeat(64)).await.unwrap();
+    let sst_bytes = || -> u64 {
+        let mut total = 0;
+        let mut pending = vec![root.join("db")];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() { pending.push(entry.path()) } else if entry.path().extension().is_some_and(|e| e == "sst") {
+                    total += meta.len();
+                }
+            }
+        }
+        total
+    };
+    // Distinct keys per round, spread over everything written so far.
+    let batch = |keys: usize, round: usize| -> BTreeSet<String> {
+        let stride = keys / BATCH;
+        (0..BATCH).map(|j| artifact(j * stride + round % stride.max(1))).collect()
+    };
+    let mut measured = Vec::new();
+    let mut written = 0;
+    for (round, keys) in [16_384_usize, 65_536, 262_144].into_iter().enumerate() {
+        grow_local_state(&mut state, written, keys).await;
+        written = keys;
+        let (bytes, micros) = point_read_cost(&state, batch(keys, round)).await;
+        measured.push((keys, sst_bytes(), bytes, micros));
+    }
+    assert!(!cache_dir.exists(), "nothing is copied into a disk cache");
+    state.close().await.unwrap();
+    // The pre-fix shape on the same SSTs, cache scaled to one part.
+    let part = OBJECT_CACHE_PART_BYTES as u64;
+    let local: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(&root).unwrap());
+    let before_cache = temp.path().join("before-cache");
+    std::fs::create_dir_all(&before_cache).unwrap();
+    let before = IngestPrevalence::open_store(TENANT, local, "db", Some((&before_cache, part)), false, Some(root.clone()),
+        Some(LocalStateSizing::FLOOR)).await.unwrap();
+    let (before_bytes, before_micros) = point_read_cost(&before, batch(written, 7)).await;
+    before.close().await.unwrap();
+    eprintln!("NAN-4765 local point reads (keys, SST bytes, state bytes/read, us/read): {measured:?}; \
+        pre-fix one-part disk cache at {written} keys: {before_bytes:.0} B/read, {before_micros:.0} us/read");
+    let large = measured[2].2;
+    assert!(measured[2].1 >= 8 * measured[0].1, "the state grew: {measured:?}");
+    assert!(measured[2].1 >= 4 * part, "the state spans several cache parts: {measured:?}");
+    for (keys, _, bytes, _) in &measured {
+        // A zstd SST block is ~4 KiB; a cache part is 4 MiB.
+        assert!(*bytes <= 8.0 * 1024.0, "{keys} keys: a point read costs about a block, not a 4 MiB part: {bytes} B");
+    }
+    assert!(before_bytes >= 16.0 * large.max(1024.0),
+        "the pre-fix disk cache reads whole parts: {before_bytes} B/read against {large} B/read");
+}
+
+/// Cleanup must not traverse symlinks in the cache or its parents, or touch
+/// another tenant's cache. Exercise the production local open, not a helper.
+#[tokio::test]
+async fn nan4765_local_cache_cleanup_stays_within_its_own_directory() {
+    use std::os::unix::fs::symlink;
+    for shape in ["cache", "nested", "tenant", "prevalence"] {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        let prevalence = work.join("prevalence");
+        let root = prevalence.join(TENANT);
+        let outside = temp.path().join("outside");
+        let sentinel = outside.join("object-cache").join("keep");
+        std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        std::fs::write(&sentinel, b"foreign cache").unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        match shape {
+            "prevalence" => {
+                std::fs::create_dir_all(outside.join(TENANT).join("object-cache")).unwrap();
+                std::fs::write(outside.join(TENANT).join("object-cache/keep"), b"foreign tenant").unwrap();
+                symlink(&outside, &prevalence).unwrap();
+            }
+            "tenant" => {
+                std::fs::create_dir_all(&prevalence).unwrap();
+                symlink(&outside, &root).unwrap();
+            }
+            _ => {
+                std::fs::create_dir_all(&root).unwrap();
+                if shape == "cache" {
+                    symlink(&outside, root.join("object-cache")).unwrap();
+                } else {
+                    std::fs::create_dir_all(root.join("object-cache")).unwrap();
+                    symlink(&outside, root.join("object-cache/link")).unwrap();
+                }
+            }
+        }
+        let other = prevalence.join(OTHER).join("object-cache/keep");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, b"other tenant").unwrap();
+        let state = IngestPrevalence::open_sized(TENANT, &work, None, None,
+            OBJECT_CACHE_FLOOR_BYTES, LocalStateSizing::FLOOR).await.unwrap();
+        assert_eq!(state.object_cache_sizing(), (None, 0));
+        state.close().await.unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"foreign cache", "{shape}");
+        assert_eq!(std::fs::read(&other).unwrap(), b"other tenant", "{shape}");
+        if shape == "prevalence" {
+            assert_eq!(std::fs::read(outside.join(TENANT).join("object-cache/keep")).unwrap(), b"foreign tenant");
+        } else if shape == "cache" || shape == "nested" {
+            assert!(std::fs::symlink_metadata(root.join("object-cache")).is_err(), "{shape}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn nan4765_invalid_tenant_cannot_select_a_cache_to_remove() {
+    let temp = tempfile::tempdir().unwrap();
+    let sentinel = temp.path().join("prevalence/other/object-cache/keep");
+    std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+    std::fs::write(&sentinel, b"keep").unwrap();
+    for tenant in ["../other", "other", "/tmp", "00000000-0000-4000-8000-00000000447A"] {
+        assert!(IngestPrevalence::open_sized(tenant, temp.path(), None, None,
+            OBJECT_CACHE_FLOOR_BYTES, LocalStateSizing::FLOOR).await.is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+    }
+}

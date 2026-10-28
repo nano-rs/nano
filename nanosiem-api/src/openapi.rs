@@ -1966,6 +1966,7 @@ mod tests {
         let min_paths = min_paths + 1; // NAN-4585: /api/soar/flows/validate-search (POST).
         #[cfg(feature = "enterprise")]
         let min_paths = min_paths + 1; // NAN-4653: /api/melod/edit/turn (POST).
+        let min_paths = min_paths + 1; // NAN-4759: /api/enrichment/platform-feeds (GET).
 
         assert!(
             path_count >= min_paths,

@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use nanosiem_lake_worker::enrichment::{BronzeIngestEnricher, IocSnapshot};
 use nanosiem_lake_worker::ip_context::IpContextSnapshot;
-use nanosiem_lake_worker::lean_platform_bundle::{PlatformBundle, TenantPlatformPolicy};
+use nanosiem_lake_worker::lean_platform_bundle::{PlatformBundleSource, TenantPlatformPolicy};
 use nanosiem_lake_worker::part_ingest::ingest::{cpu_now, seed_schema};
 use nanosiem_lake_worker::part_ingest::{IngestConfig, Ingestor, NoticeQueue, SourceNotice, SpoolQueue};
 use nanosiem_lake_worker::parts::part_log::LocalObjectStore;
@@ -332,12 +332,18 @@ fn lab_enricher(flags: &Flags, tenant: &str) -> Result<(BronzeIngestEnricher, La
         _ => bail!("custom snapshot and digest file must be configured together"),
     };
     let mut enricher = BronzeIngestEnricher::new(None, ioc, custom);
-    let (platform_digest, policy_revision) = match (flags.opt("platform-bundle-file"), flags.opt("platform-policy-file")) {
+    // NAN-4759: `--platform-bundle-dir` selects the bundle exactly as a cell
+    // does (`platform_bundle_dir`: the policy names a content-addressed file).
+    let source = PlatformBundleSource::from_paths(
+        flags.opt("platform-bundle-file").map(std::path::Path::new),
+        flags.opt("platform-bundle-dir").map(std::path::Path::new),
+    )?;
+    let (platform_digest, policy_revision) = match (source, flags.opt("platform-policy-file")) {
         (None, None) => (None, None),
-        (Some(bundle_file), Some(policy_file)) => {
+        (Some(source), Some(policy_file)) => {
             let tenant_id = tenant.parse()?;
             let policy = TenantPlatformPolicy::read_for_query(std::path::Path::new(policy_file), tenant_id)?;
-            let bundle = Arc::new(PlatformBundle::open(std::path::Path::new(bundle_file), &policy.bundle_sha256)?);
+            let bundle = Arc::new(source.open(&policy.bundle_sha256)?);
             let identity = (Some(bundle.digest().to_string()), Some(policy.revision));
             enricher = enricher.with_lean_platform(bundle, policy);
             identity

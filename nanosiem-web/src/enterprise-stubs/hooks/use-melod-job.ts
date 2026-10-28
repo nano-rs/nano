@@ -8,6 +8,16 @@
 // renders the buttons as inert.
 
 import type { MelodJobStartResponse } from '@/lib/api/types';
+import type { PollMelodJobOptions, StartMelodJobOptions } from '@/lib/melod-job-time';
+
+export {
+  DEFAULT_JOB_MAX_WAIT_MS,
+  PARSER_JOB_SERVER_TIMEOUT_MS,
+  PARSER_JOB_MAX_WAIT_MS,
+  formatElapsed,
+  jobTimeoutMessage,
+  useElapsedWhile,
+} from '@/lib/melod-job-time';
 
 export interface UseMelodJobReturn<TResult> {
   isRunning: boolean;
@@ -16,15 +26,17 @@ export interface UseMelodJobReturn<TResult> {
   status: string | null;
   error: string | null;
   result: TResult | null;
-  start: (fn: () => Promise<MelodJobStartResponse>) => Promise<TResult>;
+  start: (fn: () => Promise<MelodJobStartResponse>, options?: StartMelodJobOptions) => Promise<TResult>;
   cancel: () => void;
   reset: () => void;
 }
 
 export async function pollMelodJob<TResult>(
-  _fn: () => Promise<MelodJobStartResponse>,
-  _opts?: { signal?: AbortSignal; onProgress?: (message: string | undefined) => void },
+  _fn: () => Promise<MelodJobStartResponse | TResult>,
+  _opts?: PollMelodJobOptions,
 ): Promise<TResult> {
+  void _fn;
+  void _opts;
   throw new Error(
     'pollMelodJob is unavailable in open-core builds. Gate callers with ' +
       'useCapabilities().capabilities.melod before invoking.',

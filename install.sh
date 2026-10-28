@@ -140,6 +140,8 @@ done
 HOST_PORT="${NANO_HOST_PORT:-80}"
 API_BASE="http://localhost:${HOST_PORT}"
 NANO_NONINTERACTIVE="${NANO_NONINTERACTIVE:-0}"
+platform_feeds_file=""
+platform_feeds_license=""
 
 c_reset='\033[0m'
 c_bold='\033[1m'
@@ -159,7 +161,7 @@ require_cmd() {
 
 usage() {
     cat <<'EOF'
-Usage: install.sh [--non-interactive | --yes | -y] [--tenzir | --add-vector] [--target-eps N] [--help]
+Usage: install.sh [--non-interactive | --yes | -y] [--tenzir | --add-vector] [--target-eps N] [--feeds-file F | --feeds-license F] [--help]
 
   --non-interactive, --yes, -y
       Never prompt. Every value comes from its env var or its default
@@ -175,6 +177,11 @@ Usage: install.sh [--non-interactive | --yes | -y] [--tenzir | --add-vector] [--
   --target-eps N
       Size the lake cell to admit N events per second sustained (same as
       NANO_LAKE_TARGET_EPS=N; kept in .env for re-runs).
+
+  --feeds-file F
+      Install an offline signed platform feed bundle instead of pulling online.
+  --feeds-license F
+      Authenticate the sovereign install-time pull with its signed license file.
 
 See the header of this script for every NANO_* environment variable.
 EOF
@@ -1265,11 +1272,17 @@ while (( $# > 0 )); do
             [[ $# -ge 2 ]] || { usage >&2; fail "--target-eps needs a value"; }
             NANO_LAKE_TARGET_EPS="$2"; shift ;;
         --target-eps=*) NANO_LAKE_TARGET_EPS="${1#--target-eps=}" ;;
+        --feeds-file|--feeds-license)
+            [[ $# -ge 2 ]] || { usage >&2; fail "$1 needs a file"; }
+            if [[ $1 == --feeds-file ]]; then platform_feeds_file=$(realpath -- "$2");
+            else platform_feeds_license=$(realpath -- "$2"); fi
+            shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; fail "Unknown argument: $1" ;;
     esac
     shift
 done
+[[ -z $platform_feeds_file || -z $platform_feeds_license ]] || fail "--feeds-file and --feeds-license cannot be combined"
 # NAN-4749: lake cell target rate (trusted-local init validates the range).
 if [[ -n "${NANO_LAKE_TARGET_EPS:-}" && ! "${NANO_LAKE_TARGET_EPS}" =~ ^[1-9][0-9]*$ ]]; then
     fail "NANO_LAKE_TARGET_EPS must be a positive integer (got '${NANO_LAKE_TARGET_EPS}')."
@@ -1950,6 +1963,26 @@ start_and_wait_for_api
 # 6. Initialize admin user — keyed on the live setup status, not on .env
 # ----------------------------------------------------------------------------
 bootstrap_admin
+
+# ----------------------------------------------------------------------------
+# 6b. NAN-4759: platform feeds (IPinfo Lite geo/ASN, ThreatFox, Tor). An online
+#     install pulls the signed feed bundle once here; the runtime never fetches.
+#     --feeds-file installs a bundle copied to this host instead (offline).
+#     A failed pull warns; the operator can retry with scripts/nano feeds update.
+# ----------------------------------------------------------------------------
+install_platform_feeds() {
+    [[ "${USE_LEAN:-0}" == "1" && -x scripts/nano ]] || return 0
+    local args=()
+    if [[ -n "$platform_feeds_file" ]]; then
+        args=(--file "$platform_feeds_file")
+    elif [[ -n "$platform_feeds_license" ]]; then
+        args=(--license-file "$platform_feeds_license")
+    fi
+    log "Installing the signed platform feed bundle"
+    scripts/nano feeds update "${args[@]}" >/dev/null \
+        || warn "Platform feed install failed; run 'scripts/nano feeds update' (sovereign: --license-file <license>) or import with --file."
+}
+install_platform_feeds
 
 # ----------------------------------------------------------------------------
 # 7. Done

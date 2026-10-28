@@ -10,7 +10,10 @@ import { VrlPanel } from './AddFeed';
 
 const mocks = vi.hoisted(() => ({ capabilities: {} as Record<string, boolean> }));
 vi.mock('@/hooks/use-capabilities', () => ({ useCapabilities: () => ({ capabilities: mocks.capabilities }) }));
-vi.mock('@/enterprise/hooks/use-melod-job', () => ({ useMelodJob: () => ({ start: vi.fn(), loading: false }) }));
+vi.mock('@/enterprise/hooks/use-melod-job', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/enterprise/hooks/use-melod-job')>()),
+  useMelodJob: () => ({ start: vi.fn(), loading: false }),
+}));
 vi.mock('@/components/editor/VrlEditor', () => ({ VrlEditor: () => null }));
 vi.mock('@/hooks/use-toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
 

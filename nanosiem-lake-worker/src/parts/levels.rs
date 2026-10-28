@@ -324,6 +324,25 @@ pub fn plan_merges_with(live: &[PartRef], now_ms: i64, policy: &MergePolicy, his
     split(out)
 }
 
+/// NAN-4755: `merge` (an `m` or `h` merge that could not fit its memory
+/// even at the smallest shape) as time-ordered chunks of at most
+/// `max_inputs` unmerged (L0/M) inputs, each its own output part of the
+/// same level. The hour's existing `h` parts are never inputs again, so a
+/// committed chunk is final: every chunk is strictly smaller work, and an
+/// hour whose unmerged parts are all chunked plans nothing more. A lone
+/// leftover part stays as it is. Day merges are not split.
+pub fn split_merge(merge: PlannedMerge, max_inputs: usize) -> Vec<PlannedMerge> {
+    if merge.output_level == Level::Day {
+        return vec![merge];
+    }
+    let max_inputs = max_inputs.max(2);
+    let mut unmerged = merge.inputs.into_iter().filter(|p| matches!(p.level, Level::L0 | Level::Minute)).collect::<Vec<_>>();
+    unmerged.sort_by(|a, b| (a.min_time_us, a.max_time_us, &a.part_id).cmp(&(b.min_time_us, b.max_time_us, &b.part_id)));
+    unmerged.chunks(max_inputs).filter(|chunk| chunk.len() >= 2).map(|chunk| PlannedMerge {
+        output_level: merge.output_level, event_hour: merge.event_hour, inputs: chunk.to_vec(),
+    }).collect()
+}
+
 fn plan_merges_uncapped(live: &[PartRef], now_ms: i64, policy: &MergePolicy, history_open: bool) -> Vec<PlannedMerge> {
     let mut by_hour: BTreeMap<i32, Vec<&PartRef>> = BTreeMap::new();
     let mut days: BTreeMap<i32, Vec<&PartRef>> = BTreeMap::new();

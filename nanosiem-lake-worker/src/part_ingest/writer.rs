@@ -512,7 +512,7 @@ impl PartWriter {
             let mut mixed: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
             for batch in reader {
                 let batch = batch?;
-                super::merge_quota::charge(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch));
+                super::merge_quota::charge_checked(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch))?;
                 for field in &eligible {
                     let Some(compiled) = CompiledStringPath::new(&batch, field) else { continue };
                     let set = values.get_mut(field).expect("eligible field");
@@ -570,7 +570,7 @@ impl PartWriter {
             let mut unknown = std::collections::BTreeSet::new();
             for batch in &mut reader {
                 let batch = batch?;
-                super::merge_quota::charge(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch));
+                super::merge_quota::charge_checked(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch))?;
                 for path in &eligible {
                     if unknown.contains(*path) { continue; }
                     let Some(compiled) = CompiledStringPath::new(&batch, path) else { unknown.insert((*path).clone()); continue };
@@ -643,6 +643,9 @@ impl PartWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
+        // NAN-4755: the open row group, digests and sidecar state grow with
+        // every batch written; a guarded merge checks its cgroup here too.
+        super::merge_quota::memory_guard_bytes(super::merge_quota::batch_bytes(batch))?;
         ensure!(batch.schema().fields() == self.draft.schema.fields(), "part batch schema differs from the part schema");
         let time = batch.column_by_name("time").context("part batch has no time")?.clone();
         let uids = uid_strings(batch)?;

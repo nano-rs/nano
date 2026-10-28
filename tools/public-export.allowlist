@@ -57,6 +57,8 @@
 /docs/deployment/
 /docs/deployment/open-lean-install.md
 /scripts/
+# Operator-run portable signed feed updates and status (NAN-4759).
+/scripts/nano
 /scripts/start-microservices-dev.sh
 /scripts/rollout-lake-runtime.sh
 /scripts/preflight-postgres-major.sh

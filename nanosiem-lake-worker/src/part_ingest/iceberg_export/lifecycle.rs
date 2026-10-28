@@ -74,6 +74,19 @@ pub trait CatalogLifecycleBackend: IcebergCommitter {
     /// NAN-4721: the tenant's ingest-lag signal. Agent-catalog work yields
     /// to ingest while it is set (see [`crate::part_ingest::agent_lane`]).
     fn set_ingest_pressure(&self, _pressure: Arc<crate::part_ingest::agent_lane::IngestPressure>) {}
+    /// NAN-4774: a cell roll swaps the A/B data volume, so the writer starts
+    /// with no local custody while the remote catalog and the platform still
+    /// hold its published serving epoch. `Ok(true)` only when the backend
+    /// proved that epoch identical to the master (checkpoint and every
+    /// referenced part, under the current schema contract) AND the platform
+    /// confirmed it is this installation's sole registered serving name with
+    /// no open privacy fence; the sync then continues it instead of taking
+    /// the privacy pass a wiped volume otherwise forces (a fresh epoch built
+    /// from the whole live set). Called under custody, after the export chain
+    /// was reconciled with the catalog. The default never adopts.
+    async fn adopt_serving(&self) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// See [`CatalogLifecycleBackend::set_vanished`].
@@ -768,7 +781,10 @@ impl TenantCatalog {
                 pending = plan_export_reconciled(&refs, &state, now_ms, policy);
             }
             custody.generation = custody.generation.checked_add(1).context("catalog generation overflow")?;
-            let mut privacy = closed || !self.work_dir.join(PLANNED_INDEX_READY).try_exists()? || pending.iter().any(|(hour, _)| {
+            // Decide every removal fence before adoption can mark platform
+            // custody converged. Equality with the master alone does not prove
+            // that the master has already seen an erasure from this live set.
+            let mut privacy = closed || pending.iter().any(|(hour, _)| {
                 state.exported.get(&hour.event_hour).is_some_and(|old| old.iter().any(|p| !hour.parts.contains(p)))
             });
             for path in &plans {
@@ -779,6 +795,26 @@ impl TenantCatalog {
             // batch and not yet settled; this sync's last batch settles them.
             let mut removed = self.unsettled()?;
             privacy |= !removed.is_empty();
+            // NAN-4774: a wiped volume has no planned index, which alone
+            // forced a privacy pass: close reads, mint a fresh epoch and build
+            // it from the whole live set (hours of cold reads after every
+            // cell roll). When nothing else needs the fence (no closed reads,
+            // no backlog, no unsettled removal) and the backend proves the
+            // published epoch still equals the reconciled master, continue it.
+            // A removal already implied by this live set refuses adoption.
+            let indexed = self.work_dir.join(PLANNED_INDEX_READY).try_exists()?;
+            let adopted = !privacy && !indexed && plans.is_empty()
+                && match self.backend.adopt_serving().await {
+                    Ok(adopted) => adopted,
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "serving epoch not adopted; rebuilding it");
+                        false
+                    }
+                };
+            if adopted {
+                tracing::info!("wiped writer adopted the published serving epoch; no rebuild");
+            }
+            privacy |= !indexed && !adopted;
             if privacy { self.close().await?; }
             self.backend.verify_maintenance().await?;
             let plans = self.rebatch_backlog_head(plans).await?;

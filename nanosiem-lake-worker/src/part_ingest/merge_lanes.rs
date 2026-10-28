@@ -182,34 +182,55 @@ pub struct MemorySnapshot {
 
 impl MemorySnapshot {
     pub fn read() -> Self {
+        Self::read_for(false)
+    }
+
+    fn read_for(guard: bool) -> Self {
+        Self::read_from(std::path::Path::new("/sys/fs/cgroup"),
+            &std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default(),
+            super::merge::memory_cap_bytes(), guard,
+            || std::fs::read_to_string("/proc/self/status").ok())
+    }
+
+    fn read_from(root: &std::path::Path, membership: &str, assignment_cap: Option<u64>, guard: bool,
+        status: impl FnOnce() -> Option<String>) -> Self {
         let read = |path: &std::path::Path| std::fs::read_to_string(path).ok();
         let number = |s: Option<String>| s.and_then(|s| s.trim().parse::<u64>().ok());
-        // The cell puts each role in a leaf cgroup (ingest[T]); without a
-        // cgroup namespace /sys/fs/cgroup is the pod's, so resolve our own.
-        let dir = read(std::path::Path::new("/proc/self/cgroup"))
-            .and_then(|s| {
-                s.lines()
-                    .find_map(|l| l.strip_prefix("0::").map(|p| p.trim().to_owned()))
-            })
-            .map(|path| std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')))
-            .unwrap_or_else(|| "/sys/fs/cgroup".into());
-        let cgroup_limit = number(read(&dir.join("memory.max")))
+        let (dir, v1) = own_cgroup_dir(root, membership);
+        let cgroup_limit = number(read(&dir.join(if v1 { "memory.limit_in_bytes" } else { "memory.max" })))
             .filter(|limit| *limit > 0 && *limit < (1_u64 << 60));
-        let limit_bytes = match (cgroup_limit, super::merge::memory_cap_bytes()) {
+        let limit_bytes = match (cgroup_limit, assignment_cap) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        let inactive_file = read(&dir.join("memory.stat"))
-            .and_then(|stat| {
-                stat.lines()
-                    .find_map(|l| l.strip_prefix("inactive_file ").map(str::to_owned))
+        let reclaimable = read(&dir.join("memory.stat"))
+            .map(|stat| {
+                let value = |field: &str| stat.lines().find_map(|line| line.strip_prefix(field)
+                    .and_then(|value| value.trim().parse::<u64>().ok())).unwrap_or(0);
+                if guard {
+                    // Clean active cache can also be reclaimed: counting it
+                    // could keep the start gate closed on an otherwise idle
+                    // role forever. Shmem and pinned/dirty pages stay charged.
+                    let (cache, shmem, dirty, writeback, unevictable) = if v1 {
+                        ("total_cache ", "total_shmem ", "total_dirty ", "total_writeback ", "total_unevictable ")
+                    } else { ("file ", "shmem ", "file_dirty ", "file_writeback ", "unevictable ") };
+                    return value(cache).saturating_sub(value(shmem)).saturating_sub(value(dirty))
+                        .saturating_sub(value(writeback)).saturating_sub(value(unevictable));
+                }
+                // v1 usage includes descendants; its total_* stat matches
+                // that accounting. Preserve the concurrency gate's working set.
+                let field = if v1 { "total_inactive_file " } else { "inactive_file " };
+                value(field)
             })
-            .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(0);
-        let working_set_bytes = number(read(&dir.join("memory.current")))
-            .map(|current| current.saturating_sub(inactive_file))
+        let current = number(read(&dir.join(if v1 { "memory.usage_in_bytes" } else { "memory.current" })));
+        let working_set_bytes = current
+            .map(|current| current.saturating_sub(reclaimable))
             .or_else(|| {
-                read(std::path::Path::new("/proc/self/status")).and_then(|status| {
+                // A known cgroup limit with unreadable usage cannot safely
+                // admit a merge using the process RSS (other charges exist).
+                if cgroup_limit.is_some() { return None; }
+                status().and_then(|status| {
                     status
                         .lines()
                         .find_map(|l| l.strip_prefix("VmRSS:"))
@@ -222,6 +243,35 @@ impl MemorySnapshot {
             limit_bytes,
         }
     }
+}
+
+/// This process's own cgroup directory. The cell puts each role in a leaf
+/// cgroup (ingest[T]); without a cgroup namespace /sys/fs/cgroup is the
+/// pod's, so resolve our own (read each time: the supervisor may move a
+/// stray process into its leaf).
+fn own_cgroup_dir(root: &std::path::Path, membership: &str) -> (std::path::PathBuf, bool) {
+    // A hybrid host can expose a unified hierarchy while memory is v1.
+    for line in membership.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (_, Some(controllers), Some(path)) = (fields.next(), fields.next(), fields.next()) else { continue };
+        if controllers.split(',').any(|controller| controller == "memory") {
+            return (root.join("memory").join(path.trim().trim_start_matches('/')), true);
+        }
+    }
+    if let Some(path) = membership.lines().find_map(|line| line.strip_prefix("0::")) {
+        return (root.join(path.trim().trim_start_matches('/')), false);
+    }
+    (root.to_path_buf(), false)
+}
+
+/// NAN-4755: (unreclaimable bytes in use, `memory.max`) of this process's
+/// cgroup, for the merge memory guard: usage minus clean reclaimable file
+/// cache. Shmem, dirty/writeback and unevictable pages remain charged.
+/// `None` without a cgroup limit (lab, tests).
+pub fn cgroup_memory() -> Option<(u64, u64)> {
+    let memory = MemorySnapshot::read_for(true);
+    let limit = memory.limit_bytes?;
+    Some((memory.working_set_bytes.unwrap_or(limit), limit))
 }
 
 /// Whether one more history merge fits. No cgroup limit (lab, tests): there
@@ -251,7 +301,16 @@ pub async fn compute<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> anyhow::Result<T> {
     let (tx, rx) = tokio::sync::oneshot::channel();
+    #[cfg(test)]
+    let (probe, tracked) = (super::merge_quota::MEMORY_PROBE_FOR_TEST.get(), crate::test_heap::tracking_current_thread());
     std::thread::Builder::new().name("lake-merge".into()).spawn(move || {
+        // Tests: the starting thread's memory probe and heap tracking
+        // follow the merge onto its thread.
+        #[cfg(test)]
+        {
+            super::merge_quota::MEMORY_PROBE_FOR_TEST.set(probe);
+            crate::test_heap::track_current_thread(tracked);
+        }
         // SAFETY: Linux setpriority with pid 0 changes only this calling thread.
         if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19) } != 0 {
             tracing::warn!(error = %std::io::Error::last_os_error(), "could not lower merge thread priority");
@@ -265,6 +324,53 @@ pub async fn compute<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_reads_the_own_leaf_on_both_cgroup_versions() {
+        for v1 in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let leaf = root.path().join(if v1 { "memory/role/ingest" } else { "role/ingest" });
+            std::fs::create_dir_all(&leaf).unwrap();
+            let (membership, limit, usage, stat) = if v1 {
+                ("0::/unified\n5:cpu,cpuacct:/elsewhere\n7:memory:/role/ingest\n", "memory.limit_in_bytes", "memory.usage_in_bytes",
+                    "cache 500\ninactive_file 20\ntotal_cache 500\ntotal_shmem 300\ntotal_dirty 20\ntotal_writeback 30\ntotal_unevictable 10\ntotal_inactive_file 100\n")
+            } else {
+                ("0::/role/ingest\n", "memory.max", "memory.current", "file 500\nshmem 300\nfile_dirty 20\nfile_writeback 30\nunevictable 10\ninactive_file 100\n")
+            };
+            std::fs::write(leaf.join(limit), "1000\n").unwrap();
+            std::fs::write(leaf.join(usage), "800\n").unwrap();
+            std::fs::write(leaf.join("memory.stat"), stat).unwrap();
+            let memory = MemorySnapshot::read_from(root.path(), membership, Some(900), false, || None);
+            assert_eq!(memory.limit_bytes, Some(900));
+            assert_eq!(memory.working_set_bytes, Some(700), "only inactive cache is subtracted, v1={v1}");
+            let guarded = MemorySnapshot::read_from(root.path(), membership, Some(900), true, || None);
+            assert_eq!(guarded.working_set_bytes, Some(660), "the guard discounts clean cache only, v1={v1}");
+            std::fs::write(leaf.join("memory.stat"), if v1 { "total_cache 800\ntotal_inactive_file 10\n" }
+                else { "file 800\ninactive_file 10\n" }).unwrap();
+            let clean_cache = MemorySnapshot::read_from(root.path(), membership, Some(900), true, || None);
+            assert_eq!(clean_cache.working_set_bytes, Some(0), "clean active cache cannot hold the start gate closed");
+            // A missing stat is conservative, while a missing usage with
+            // a known cgroup limit must never fall back to process RSS.
+            std::fs::remove_file(leaf.join("memory.stat")).unwrap();
+            assert_eq!(MemorySnapshot::read_from(root.path(), membership, None, true, || None).working_set_bytes, Some(800));
+            std::fs::remove_file(leaf.join(usage)).unwrap();
+            let unreadable = MemorySnapshot::read_from(root.path(), membership, None, true, || Some("VmRSS: 1 kB\n".into()));
+            assert_eq!(unreadable.working_set_bytes, None);
+            assert!(!history_memory_admits(unreadable));
+        }
+    }
+
+    #[test]
+    fn an_unlimited_cgroup_uses_the_assignment_cap_and_rss() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("memory.max"), "max\n").unwrap();
+        let memory = MemorySnapshot::read_from(root.path(), "0::/\n", Some(8192), true, || Some("VmRSS: 2 kB\n".into()));
+        assert_eq!(memory.limit_bytes, Some(8192));
+        assert_eq!(memory.working_set_bytes, Some(2048));
+        std::fs::write(root.path().join("memory.current"), "4096\n").unwrap();
+        let memory = MemorySnapshot::read_from(root.path(), "0::/\n", None, true, || None);
+        assert_eq!(memory.limit_bytes, None, "an unlimited lab cgroup stays unlimited");
+    }
     use crate::parts::format::PartId;
     use crate::parts::levels::{plan_merges, MergePolicy};
     use crate::parts::part_log::PartRef;

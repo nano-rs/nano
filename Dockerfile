@@ -204,13 +204,14 @@ RUN --mount=type=secret,id=sccache,required=false \
     && cargo build --release --locked -p nanosiem-lake-worker \
        --bin lake_part_ingest --bin lake_part_query --bin lake_job_runner \
        --bin lake_result_gc --bin lake_otel_ingest --bin lake_lean_enrichment_coordinator \
-       --bin lake_local_audit_deliver --bin lake_landing_ingest \
+       --bin lake_local_audit_deliver --bin lake_landing_ingest --bin lake_platform_feeds \
     && cargo build --release --locked -p nanosiem-core --bin lake_query_compile \
     && mkdir -p /app/open-cell-bin \
     && install -m 0755 target/release/nanosiem-lake-cell target/release/lake_job_runner \
        target/release/lake_result_gc target/release/lake_otel_ingest \
        target/release/lake_lean_enrichment_coordinator target/release/lake_query_compile \
-       target/release/lake_local_audit_deliver target/release/lake_landing_ingest /app/open-cell-bin/ \
+       target/release/lake_local_audit_deliver target/release/lake_landing_ingest \
+       target/release/lake_platform_feeds /app/open-cell-bin/ \
     && install -m 0755 target/release/lake_part_ingest /app/open-cell-bin/nanosiem-lake-ingest \
     && install -m 0755 target/release/lake_part_query /app/open-cell-bin/nanosiem-lake-query
 

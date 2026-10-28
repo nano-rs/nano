@@ -39,6 +39,7 @@ import {
 } from '@/components/marketplace/MarketplaceDrawer';
 import { InstallDialog } from '@/components/marketplace/InstallDialog';
 import { CoverageHero } from '@/components/marketplace/CoverageHero';
+import { PlatformFeedsCard } from '@/components/marketplace/PlatformFeedsCard';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -140,6 +141,16 @@ function DedicatedMarketplace() {
   // finer-grained effective-source-scope partition.
   const COVERAGE_QUERY_KEY = ['marketplace', 'coverage', user?.id] as const;
   const canViewCoverage = hasAllPermissions(['enrichments:view', 'search:execute']);
+  // NAN-4759: self-hosted lean installs show the signed platform feed bundle's
+  // freshness. `available: false` (or an error) renders nothing.
+  const platformFeedsQuery = useQuery({
+    queryKey: ['enrichment', 'platform-feeds'],
+    queryFn: () => api.getPlatformFeeds(),
+    enabled: hasAllPermissions(['enrichments:view']),
+    staleTime: 60_000,
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
   const canCreateIntegration = capabilities.customEnrichment
     && hasAllPermissions(['log_sources:create', 'enrichments:code']);
   const coverageQuery = useQuery({
@@ -366,6 +377,11 @@ function DedicatedMarketplace() {
       </>}
       statsStrip={stats && <StatsStrip stats={stats} />}
       coverage={<>
+      {platformFeedsQuery.data?.available && (
+        <div className="mt-4">
+          <PlatformFeedsCard status={platformFeedsQuery.data} />
+        </div>
+      )}
       {canViewCoverage && (
         <div className="mt-4">
           <CoverageHero

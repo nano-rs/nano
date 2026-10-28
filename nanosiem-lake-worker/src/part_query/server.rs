@@ -2141,7 +2141,8 @@ async fn query_pages(
     }
     let inflight = OwnedInflight::begin(&service);
     let started = Instant::now();
-    let slot = service.admit().await?;
+    let class = super::engine::RequestClass::of_window(&request.request_id, false, &request.start, &request.end);
+    let slot = service.admit_class(class).await?;
     service.refresh().await?;
     service.require_ready()?;
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<StreamMessage>(1);

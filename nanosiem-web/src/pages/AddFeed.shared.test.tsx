@@ -231,7 +231,7 @@ describe('AddFeed → Add data (NAN-2593)', () => {
     fireEvent.change(await screen.findByLabelText('VRL'), { target: { value: '. = parse_json!(.message)\nb = 1' } });
     fireEvent.click(screen.getAllByText('Review & activate')[0]);
     await waitFor(() => expect(screen.getByTestId('deploy-gate').textContent).toContain('unused variable b'), { timeout: 3000 });
-    expect(within(screen.getByTestId('deploy-gate')).getByRole('checkbox').getAttribute('aria-checked')).toBe('false');
+    await waitFor(() => expect(within(screen.getByTestId('deploy-gate')).getByRole('checkbox').getAttribute('aria-checked')).toBe('false'));
   });
 
   it('a server preflight refusal is not announced as activated (NAN-4754)', async () => {

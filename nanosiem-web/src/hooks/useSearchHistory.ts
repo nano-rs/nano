@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
+import { api } from '@/lib/api';
 import type { TimeRangeValue } from '@/hooks/use-api';
 import { getAccessToken } from '@/lib/auth-token';
 import { requestCredentials } from '@/lib/request-credentials';
@@ -71,6 +72,7 @@ export function useSearchHistory({ enabled = true }: { enabled?: boolean } = {})
   const [searchHistory, setSearchHistory] = useState<SearchHistoryEntry[]>([]);
   const [historyEnabled, setHistoryEnabled] = useState(enabled);
   const [isLoading, setIsLoading] = useState(enabled);
+  const firstSearchCompletion = useRef<Promise<unknown> | null>(null);
 
   // Fetch history from API
   const fetchHistory = useCallback(async () => {
@@ -157,8 +159,21 @@ export function useSearchHistory({ enabled = true }: { enabled?: boolean } = {})
     }
   }, [enabled]);
 
+  const completeFirstSearch = useCallback(async () => {
+    // Persist only the step flag, with no query or time-range data. Share the
+    // request across runs on this page and allow a later run to retry errors.
+    firstSearchCompletion.current ??= api.onboarding.completeStep({ step: 'first_searches' })
+      .catch(() => { firstSearchCompletion.current = null; });
+    await firstSearchCompletion.current;
+  }, []);
+
   const addToSearchHistory = useCallback(async (entry: Omit<SearchHistoryEntry, 'id' | 'timestamp'>) => {
-    if (!enabled || !historyEnabled) return;
+    if (!enabled) return;
+    if (!historyEnabled) {
+      // Running a query still completes First Search when history is disabled.
+      await completeFirstSearch();
+      return;
+    }
     
     // Build request body
     const body: Record<string, unknown> = {
@@ -194,11 +209,16 @@ export function useSearchHistory({ enabled = true }: { enabled?: boolean } = {})
           const filtered = prev.filter(h => h.id !== localEntry.id);
           return [localEntry, ...filtered];
         });
+      } else {
+        // The first run can race the initial history-settings GET, or history
+        // can be disabled in another tab. A refused history write must not
+        // leave First Search unchecked after a query was run.
+        await completeFirstSearch();
       }
     } catch (err) {
       console.error('Failed to add to history:', err);
     }
-  }, [enabled, historyEnabled]);
+  }, [enabled, historyEnabled, completeFirstSearch]);
 
   const refreshHistory = useCallback(() => {
     fetchHistory();

@@ -129,7 +129,7 @@ where
         // One class: the input order, `(time, uid)`, is already the sort order.
         for batch in read_stream(&path)? {
             let batch = batch?;
-            super::merge_quota::charge(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch));
+            super::merge_quota::charge_checked(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch))?;
             bucket_rows += batch.num_rows() as u64;
             sink(ClassSortEvent::Rows(&batch))?;
         }
@@ -157,7 +157,8 @@ pub const MAX_RESTORE_RUNS: usize = 64;
 /// unpublished merge input) this matches row for row.
 ///
 /// `Ok(None)` (nothing written) when the file is not made of strictly
-/// time-ordered class runs or has more than [`MAX_RESTORE_RUNS`]; the caller
+/// time-ordered class runs or has more than [`super::merge::restore_runs_cap`]
+/// ([`MAX_RESTORE_RUNS`] at full merge shape, NAN-4755); the caller
 /// then uses the bucket sort. `batch_budget_rows` bounds the decoded rows
 /// held across the run readers.
 pub fn restore_class_runs(source: &Path, target: &Path, batch_budget_rows: usize) -> Result<Option<u64>> {
@@ -195,7 +196,7 @@ pub fn restore_class_runs(source: &Path, target: &Path, batch_budget_rows: usize
                 }
                 Some(open) if class < open => return Ok(None),
                 _ => {
-                    if runs.len() == MAX_RESTORE_RUNS {
+                    if runs.len() == super::merge::restore_runs_cap() {
                         return Ok(None);
                     }
                     current = Some(class);
@@ -219,7 +220,7 @@ pub fn restore_class_runs(source: &Path, target: &Path, batch_budget_rows: usize
     }
     let next = |reader: &mut parquet::arrow::arrow_reader::ParquetRecordBatchReader| -> Result<Option<(RecordBatch, Vec<i64>, arrow_array::StringArray)>> {
         let Some(batch) = reader.next().transpose()? else { return Ok(None) };
-        super::merge_quota::charge(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch));
+        super::merge_quota::charge_checked(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch))?;
         let time = batch.column_by_name("time").context("class-sorted file has no time")?;
         let times = (0..batch.num_rows()).map(|row| event_time_us_from_array(time.as_ref(), row).context("row has no time")).collect::<Result<Vec<_>>>()?;
         let uids = super::writer::uid_strings(&batch)?;

@@ -1457,6 +1457,33 @@ mod tests {
         assert!(restarted.journal_path(&key).exists());
     }
 
+    /// The production granted open keeps its cache directory and requested
+    /// cap. With room available, the cached files survive as well.
+    #[tokio::test]
+    async fn nan4765_granted_open_preserves_its_cache() {
+        use super::super::prevalence::{IngestPrevalence, LocalStateSizing};
+        use std::os::unix::fs::MetadataExt;
+        for cap in [0, 4 * 1024 * 1024] {
+            let (objects, access, _fixture, tmp) = setup(0).await;
+            let cache = tmp.path().join("prevalence").join(TENANT).join("object-cache");
+            std::fs::create_dir_all(&cache).unwrap();
+            let sentinel = cache.join("keep");
+            std::fs::write(&sentinel, b"existing granted cache").unwrap();
+            // Pin the directory: unlinking it is visible through this fd
+            // even if a new directory at the same path reuses its inode.
+            let directory = std::fs::File::open(&cache).unwrap();
+            let mut state = IngestPrevalence::open_sized(TENANT, tmp.path(), Some(&access),
+                Some(objects), cap, LocalStateSizing::FLOOR).await.unwrap();
+            assert_eq!(state.object_cache_sizing(), (Some(0), cap));
+            state.initialize_at(0, &"0".repeat(64)).await.unwrap();
+            state.close().await.unwrap();
+            assert!(directory.metadata().unwrap().nlink() > 0, "a granted cache directory is never removed");
+            if cap > 0 {
+                assert_eq!(std::fs::read(sentinel).unwrap(), b"existing granted cache");
+            }
+        }
+    }
+
     /// NAN-3849 (tenant-a 2026-10-14): every ~5 min credential refresh closed and
     /// reopened the tenant state (17-19 s, WAL replay, block/index/filter
     /// caches dropped, catch-up reads in flight aborted). A refresh for the

@@ -916,9 +916,199 @@ async fn transfer_with_progress<T>(
     }
 }
 
+/// NAN-4755: share of the ingest role's `memory.max` at which a running
+/// merge gives up (with [`MemoryPressure`]) instead of letting the kernel
+/// OOM-kill the whole process. The scheduler then reruns it smaller
+/// ([`super::merge_attempts`]).
+pub const MEMORY_GUARD_SHARE: f64 = 0.85;
+/// A merge thread reads its cgroup again after this long, or after
+/// [`MEMORY_GUARD_BYTES`] of decoded batches, whichever comes first: a
+/// burst of reader opens allocates tens of MiB within milliseconds, which a
+/// time-only interval misses.
+const MEMORY_GUARD_INTERVAL: Duration = Duration::from_millis(25);
+const MEMORY_GUARD_BYTES: u64 = 4 * 1024 * 1024;
+/// The guard stops a merge when the memory in use plus this many times
+/// the batch just charged would cross [`MEMORY_GUARD_SHARE`]: each batch is
+/// copied once more per family and once more by its encoder before it is
+/// released, so the next step needs about twice its size. A check after
+/// the fact would let one large batch take the process past the limit.
+const MEMORY_GUARD_LOOKAHEAD: u64 = 2;
+
+/// A merge stopped by the memory guard: the process's unreclaimable memory
+/// reached [`MEMORY_GUARD_SHARE`] of its cgroup limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryPressure {
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+}
+
+impl std::fmt::Display for MemoryPressure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "merge stopped under memory pressure: {} of {} bytes in use (guard at {:.0}%)",
+            self.used_bytes, self.limit_bytes, MEMORY_GUARD_SHARE * 100.0)
+    }
+}
+
+impl std::error::Error for MemoryPressure {}
+
+/// Did the memory guard end this merge?
+pub fn is_memory_pressure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.downcast_ref::<MemoryPressure>().is_some())
+}
+
+thread_local! {
+    /// `Some` while this thread runs a guarded merge: the last cgroup read.
+    static MEMORY_GUARD: std::cell::Cell<Option<Option<Instant>>> = const { std::cell::Cell::new(None) };
+    /// Batch bytes charged on this thread since its last cgroup read.
+    static MEMORY_GUARD_PENDING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Guards the merge running on this thread until dropped.
+pub struct MemoryGuardScope {
+    previous: Option<Option<Instant>>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+/// Arm the memory guard on this thread (the merge compute thread).
+pub fn memory_guard_scope() -> MemoryGuardScope {
+    MemoryGuardScope { previous: MEMORY_GUARD.replace(Some(None)), _thread_bound: std::marker::PhantomData }
+}
+
+impl Drop for MemoryGuardScope {
+    fn drop(&mut self) {
+        MEMORY_GUARD.set(self.previous);
+    }
+}
+
+/// [`charge`], then the memory guard.
+pub fn charge_checked(rows: u64, bytes: u64) -> Result<()> {
+    charge(rows, bytes);
+    memory_guard_after(bytes)
+}
+
+/// [`charge_input`], then the memory guard.
+pub fn charge_input_checked(rows: u64, bytes: u64) -> Result<()> {
+    charge_input(rows, bytes);
+    memory_guard_after(bytes)
+}
+
+/// NAN-4755: fail the merge on this thread with [`MemoryPressure`] once the
+/// process's unreclaimable memory reaches [`MEMORY_GUARD_SHARE`] of its
+/// cgroup `memory.max`. A no-op off a guarded merge thread (admission and
+/// flush code share these readers) and where no limit is known.
+pub fn memory_guard() -> Result<()> {
+    memory_guard_after(0)
+}
+
+/// [`memory_guard`] after `bytes` more were decoded or buffered on this
+/// thread.
+pub fn memory_guard_bytes(bytes: u64) -> Result<()> {
+    memory_guard_after(bytes)
+}
+
+fn memory_guard_after(bytes: u64) -> Result<()> {
+    let pending = MEMORY_GUARD_PENDING.get().saturating_add(bytes);
+    let due = MEMORY_GUARD.with(|guard| match guard.get() {
+        None => false,
+        Some(Some(last)) if last.elapsed() < MEMORY_GUARD_INTERVAL && pending < MEMORY_GUARD_BYTES => false,
+        Some(_) => {
+            guard.set(Some(Some(Instant::now())));
+            true
+        }
+    });
+    MEMORY_GUARD_PENDING.set(if due { 0 } else { pending });
+    if !due {
+        return Ok(());
+    }
+    let Some((used_bytes, limit_bytes)) = memory_probe() else { return Ok(()) };
+    if memory_guard_stops(used_bytes, limit_bytes, bytes) {
+        return Err(MemoryPressure { used_bytes, limit_bytes }.into());
+    }
+    Ok(())
+}
+
+/// Would `batch_bytes` more, at [`MEMORY_GUARD_LOOKAHEAD`], take `used` of
+/// `limit` past [`MEMORY_GUARD_SHARE`]?
+fn memory_guard_stops(used: u64, limit: u64, batch_bytes: u64) -> bool {
+    used.saturating_add(batch_bytes.saturating_mul(MEMORY_GUARD_LOOKAHEAD)) as f64 >= limit as f64 * MEMORY_GUARD_SHARE
+}
+
+/// NAN-4755: share of the ingest role's `memory.max` below which a history
+/// merge may START. Catch-up admission and flushes share the role with the
+/// merges; above this the room is theirs, and the merge waits for a later
+/// tick instead of starting into the memory admission is using (FP
+/// cell-us-1: the stall hour's merge fit alone, and died beside the
+/// catch-up's 128-object flushes).
+pub const MERGE_START_SHARE: f64 = 0.70;
+
+/// May a history merge start now? True without a known limit (lab).
+pub fn history_merge_may_start() -> bool {
+    match memory_probe() {
+        Some((used, limit)) => (used as f64) < limit as f64 * MERGE_START_SHARE,
+        None => true,
+    }
+}
+
+/// This process's cgroup `memory.max`, if known.
+pub fn memory_limit() -> Option<u64> {
+    memory_probe().map(|(_, limit)| limit)
+}
+
+/// (unreclaimable bytes in use, `memory.max`) of this process's cgroup.
+fn memory_probe() -> Option<(u64, u64)> {
+    #[cfg(test)]
+    if let Some(probe) = MEMORY_PROBE_FOR_TEST.get() {
+        return probe();
+    }
+    super::merge_lanes::cgroup_memory()
+}
+
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: a memory probe for merges started from this thread (carried
+    /// onto the merge compute thread by `merge_lanes::compute`).
+    pub(crate) static MEMORY_PROBE_FOR_TEST: std::cell::Cell<Option<fn() -> Option<(u64, u64)>>> = const { std::cell::Cell::new(None) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_memory_guard_stops_before_a_batch_would_cross_the_share() {
+        // 85% of 100: 80 in use with no batch is fine.
+        assert!(!memory_guard_stops(80, 100, 0));
+        assert!(memory_guard_stops(85, 100, 0));
+        // A 5-byte batch needs ~10 more: 80 + 10 crosses 85.
+        assert!(memory_guard_stops(80, 100, 5));
+        assert!(!memory_guard_stops(70, 100, 5));
+    }
+
+    #[test]
+    fn the_memory_guard_only_acts_inside_a_guarded_merge() {
+        fn full() -> Option<(u64, u64)> { Some((99, 100)) }
+        MEMORY_PROBE_FOR_TEST.set(Some(full));
+        assert!(memory_guard().is_ok(), "unguarded threads (admission, flush) are never stopped");
+        {
+            let _scope = memory_guard_scope();
+            let error = memory_guard().unwrap_err();
+            assert!(is_memory_pressure(&error.context("merge pass")), "the stop survives added context");
+        }
+        assert!(memory_guard().is_ok(), "the scope ended");
+        MEMORY_PROBE_FOR_TEST.set(None);
+    }
+
+    #[test]
+    fn every_history_merge_waits_at_the_start_share() {
+        fn below() -> Option<(u64, u64)> { Some((69, 100)) }
+        fn at() -> Option<(u64, u64)> { Some((70, 100)) }
+        MEMORY_PROBE_FOR_TEST.set(Some(below));
+        assert!(history_merge_may_start());
+        MEMORY_PROBE_FOR_TEST.set(Some(at));
+        assert!(!history_merge_may_start());
+        MEMORY_PROBE_FOR_TEST.set(None);
+    }
     fn pace_rows() -> Option<(u64, u64)> {
         BUDGET.with(|budget| match budget.borrow().as_ref() {
             Some(Pace::Backfill(pace)) => Some((pace.rows, pace.row_cap)),

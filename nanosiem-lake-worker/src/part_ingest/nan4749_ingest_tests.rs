@@ -17,12 +17,12 @@ use crate::parts::part_log::LocalObjectStore;
 use crate::parts::provenance::LocalPartSigner;
 use serde_json::json;
 
-const TENANT: &str = "47490000-0000-4000-8000-000000000001";
-const BASE_HOUR: i64 = 492_096;
-const CLOCK: i64 = BASE_HOUR * 3_600_000 + 600_000;
+pub(super) const TENANT: &str = "47490000-0000-4000-8000-000000000001";
+pub(super) const BASE_HOUR: i64 = 492_096;
+pub(super) const CLOCK: i64 = BASE_HOUR * 3_600_000 + 600_000;
 
 /// The NAN-4553 raw-log-blaster row shape (a ~1.5 KB raw event).
-fn event(i: usize) -> Value {
+pub(super) fn event(i: usize) -> Value {
     let fat = 1;
     let time = chrono::DateTime::<chrono::Utc>::from_timestamp(BASE_HOUR * 3_600 + (i as i64 % 3_000), 0).unwrap();
     let uid = format!("nan4749-{i:06}");
@@ -47,7 +47,7 @@ fn event(i: usize) -> Value {
     })
 }
 
-fn write_bronze(path: &std::path::Path, events: &[Value]) {
+pub(super) fn write_bronze(path: &std::path::Path, events: &[Value]) {
     use arrow_json::reader::infer_json_schema_from_seekable;
     let mut lines = Vec::new();
     for event in events {
@@ -67,19 +67,19 @@ fn write_bronze(path: &std::path::Path, events: &[Value]) {
     writer.unwrap().close().unwrap();
 }
 
-struct Lab {
+pub(super) struct Lab {
     _root: tempfile::TempDir,
-    root: std::path::PathBuf,
+    pub(super) root: std::path::PathBuf,
     parts: LocalObjectStore,
     sources: LocalObjectStore,
-    spool: SpoolQueue,
+    pub(super) spool: SpoolQueue,
     signer: LocalPartSigner,
-    config: IngestConfig,
+    pub(super) config: IngestConfig,
 }
 
 impl Lab {
     /// An ingest[T] sized from `memory_cap` the way the cell sizes it.
-    fn new(memory_cap: u64) -> Self {
+    pub(super) fn new(memory_cap: u64) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join("sources").join("bronze")).unwrap();
@@ -99,7 +99,7 @@ impl Lab {
         }
     }
 
-    fn land(&self, name: &str, events: &[Value], at: i64) -> u64 {
+    pub(super) fn land(&self, name: &str, events: &[Value], at: i64) -> u64 {
         let key = format!("bronze/{name}.parquet");
         let path = self.root.join("sources").join(&key);
         write_bronze(&path, events);
@@ -108,7 +108,7 @@ impl Lab {
         crate::bronze::bronze_file_decoded_bytes(&path).unwrap()
     }
 
-    async fn open(&self) -> Ingestor<'_> {
+    pub(super) async fn open(&self) -> Ingestor<'_> {
         Ingestor::open(self.config.clone(), &self.parts, &self.sources, &self.spool as &dyn NoticeQueue, &self.signer,
             self.signer.trusted(), BronzeIngestEnricher::disabled(), &seed_schema(), CLOCK).await.expect("ingest opens")
     }
@@ -116,7 +116,7 @@ impl Lab {
 
 /// Heap high-water mark of `work`, counting this thread, the Tokio blocking
 /// pool and a private rayon pool (as `nan4553_ingest_tests::measured`).
-fn measured<T: Send>(work: impl FnOnce(&tokio::runtime::Runtime) -> T + Send) -> (T, isize) {
+pub(super) fn measured<T: Send>(work: impl FnOnce(&tokio::runtime::Runtime) -> T + Send) -> (T, isize) {
     let _serial = crate::test_heap::MEASUREMENT.lock().unwrap_or_else(|e| e.into_inner());
     let pool = rayon::ThreadPoolBuilder::new().num_threads(4)
         .start_handler(|_| crate::test_heap::track_current_thread(true)).build().unwrap();

@@ -13,9 +13,9 @@
 
 use axum::{extract::State, Extension, Json};
 use nanosiem_core::onboarding::{
-    OnboardingProgress, OnboardingStatus, OnboardingStep, StepActionRequest, UpdateProgressRequest,
+    probe_dedicated_onboarding_status, DedicatedProbeInputs, OnboardingProgress, OnboardingStatus,
+    OnboardingStep, StepActionRequest, UpdateProgressRequest,
 };
-use tracing::warn;
 
 use crate::error::ApiError;
 use crate::middleware::{ensure_interactive_session, ensure_permission, AuthContext};
@@ -225,85 +225,27 @@ pub async fn get_onboarding_status(
 ) -> Result<Json<OnboardingStatus>, ApiError> {
     ensure_onboarding_settings_access(&auth)?;
 
-    // Check if any AI provider is configured. AI providers live in the
-    // enterprise meloD stack — open-core builds always report `false`.
+    // NAN-4779: every probe reads a row the matching settings page or wizard
+    // writes, and ignores rows migrations seed on a fresh install. See
+    // `nanosiem_core::onboarding::probe_dedicated_onboarding_status`.
     #[cfg(feature = "enterprise")]
-    let has_ai_provider = {
-        let melod = state.melod_service.read().await;
-        melod.is_some()
-    };
+    let (ai_available, ai_service_loaded) = (true, state.melod_service.read().await.is_some());
     #[cfg(not(feature = "enterprise"))]
-    let has_ai_provider = false;
+    let (ai_available, ai_service_loaded) = (false, false);
 
-    // Helper: query a boolean status, log on failure
-    let check = |pool: &sqlx::PgPool, label: &'static str, query: &'static str| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query_scalar::<_, bool>(query)
-                .fetch_one(&pool)
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(check = label, error = %e, "Onboarding status check failed");
-                    false
-                })
-        }
-    };
-
-    let has_org_context = check(&state.pool, "org_context",
-        "SELECT EXISTS(SELECT 1 FROM system_settings WHERE id = 'default' AND org_context_name IS NOT NULL AND org_context_name != '')").await;
-
-    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or_else(|e| {
-            warn!(error = %e, "Onboarding user count check failed");
-            0
-        });
-    let has_users = user_count > 1;
-
-    // SSO is enterprise-only and `oidc_providers` exists only under the
-    // enterprise overlay; the open edition has no SSO to detect (NAN-3463).
-    let has_sso = if crate::handlers::capabilities::SSO_AVAILABLE {
-        check(
-            &state.pool,
-            "sso",
-            "SELECT EXISTS(SELECT 1 FROM oidc_providers WHERE enabled = true)",
-        )
-        .await
-    } else {
-        false
-    };
-
-    let has_log_sources = check(
+    let status = probe_dedicated_onboarding_status(
         &state.pool,
-        "log_sources",
-        "SELECT EXISTS(SELECT 1 FROM log_sources)",
+        DedicatedProbeInputs {
+            ai_available,
+            ai_service_loaded,
+            // SSO is enterprise-only and `oidc_providers` exists only under the
+            // enterprise overlay (NAN-3463).
+            sso_available: crate::handlers::capabilities::SSO_AVAILABLE,
+        },
     )
     .await;
 
-    let has_parsers = check(
-        &state.pool,
-        "parsers",
-        "SELECT EXISTS(SELECT 1 FROM parser_imports)",
-    )
-    .await;
-
-    let has_search_history = check(
-        &state.pool,
-        "search_history",
-        "SELECT EXISTS(SELECT 1 FROM search_history)",
-    )
-    .await;
-
-    Ok(Json(OnboardingStatus {
-        has_ai_provider,
-        has_org_context,
-        has_users,
-        has_sso,
-        has_log_sources,
-        has_parsers,
-        has_search_history,
-    }))
+    Ok(Json(status))
 }
 
 /// Onboarding is a human wizard, not an API-key automation surface. API keys

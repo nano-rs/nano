@@ -474,6 +474,87 @@ async fn class_uid_pruning_over_a_clustered_hour(layout: Option<(&str, &str)>) {
     }
 }
 
+/// NAN-4772: small L0 files have no signed class label. Only their footer
+/// statistics can prove absence; OR, NOT and computed predicates still read
+/// every candidate. Check cold/warm selections and native row/count parity.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn class_statistics_prune_unlabelled_l0_without_hiding_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let hour = (Utc::now() - Duration::hours(8)).duration_trunc(Duration::hours(1)).unwrap();
+    let parts = LocalObjectStore::new(root.path().join("parts")).unwrap();
+    let sources_dir = root.path().join("sources");
+    std::fs::create_dir_all(sources_dir.join("bronze")).unwrap();
+    let sources = LocalObjectStore::new(&sources_dir).unwrap();
+    let spool = SpoolQueue::new(root.path().join("spool"), TENANT).unwrap();
+    let owner = signer();
+    let mut ingestor = Ingestor::open(
+        IngestConfig::new(TENANT, root.path().join("work")), &parts, &sources, &spool,
+        &owner, owner.trusted(), BronzeIngestEnricher::disabled(), &seed_schema(), hour.timestamp_millis(),
+    ).await.unwrap();
+    let mut by_class = Vec::new();
+    for n in 0..2 {
+        let at = hour + Duration::seconds(10 + n as i64 * 20);
+        let indices = (0..6).map(|i| (n * 6 + i) * 3 + n).collect::<Vec<_>>();
+        let rows = indices.iter().map(|&i| event(i, &at.to_rfc3339())).collect::<Vec<_>>();
+        by_class.push(indices.iter().map(|i| format!("uid-{i:08}")).collect::<Vec<_>>());
+        let key = format!("bronze/{n}.parquet");
+        write_bronze(&sources_dir.join(&key), &rows);
+        crate::bronze::admit_bronze_files(&[sources_dir.join(&key)], TENANT).unwrap();
+        spool.deliver(&SourceNotice {
+            tenant_id: TENANT.into(), key, version: "1".into(), bytes: 0,
+            sha256: None, edge_sha256: None, notified_at_ms: at.timestamp_millis(),
+        }).unwrap();
+        ingestor.tick_ingest(at.timestamp_millis()).await.unwrap();
+        ingestor.flush_now(at.timestamp_millis() + 1_000).await.unwrap();
+    }
+    drop(ingestor);
+    let live = crate::parts::part_log::load_log(&parts, TENANT).await.unwrap();
+    assert_eq!(live.parts().count(), 2);
+    for part in live.parts() {
+        let keys = crate::parts::format::PartKeys::new(TENANT, part.level, part.event_hour, &part.part_id).unwrap();
+        let bytes = parts.get(&keys.provenance()).await.unwrap().unwrap();
+        let signed = crate::parts::provenance::SignedProvenance::verify_bytes(&bytes, TENANT, &owner.trusted()).unwrap();
+        assert!(signed.record.files.data.iter().all(|file| file.class_id.is_none()));
+    }
+    let engine = engine(root.path()).await;
+    let all = by_class.concat();
+    for _ in 0..2 {
+        for (value, pruned) in [(1007, 1), (3002, 1), (4001, 2)] {
+            let selection = engine.select(
+                hour.timestamp_micros(), (hour + Duration::hours(1)).timestamp_micros(),
+                &[crate::planner::CandidateHint::Class { value }],
+            ).await.unwrap();
+            assert_eq!(selection.evidence.source_family_pruned_files, 0);
+            assert_eq!(selection.evidence.infile_pruned_files, pruned);
+            assert_eq!(selection.manifest.objects.len(), 2 - pruned);
+        }
+        for (query, expected, pruned) in [
+            ("class_uid=1007", by_class[0].as_slice(), 1),
+            ("class_uid=3002", by_class[1].as_slice(), 1),
+            ("class_uid=4001", &[][..], 2),
+            ("class_uid=1007 OR class_uid=3002", all.as_slice(), 0),
+            ("class_uid=4001 OR class_uid=1007", by_class[0].as_slice(), 0),
+            ("class_uid=4001 OR status=Success", by_class[0].as_slice(), 0),
+            ("NOT class_uid=1007", by_class[1].as_slice(), 0),
+            ("* | eval c=class_uid+0 | where c=1007", by_class[0].as_slice(), 0),
+            ("*", all.as_slice(), 0),
+        ] {
+            for table_view in [false, true] {
+                let (rows, funnel) = run(&engine, query, hour, table_view).await;
+                assert_eq!(sorted_uids(&rows), expected, "{query}");
+                assert_eq!(funnel.source_family_pruned_files, 0, "unlabelled L0: {query}");
+                // Progressive reads may select more than once per request.
+                assert_eq!(funnel.infile_pruned_files > 0, pruned > 0, "{query}: {funnel:?}");
+            }
+            let (rows, _) = run(&engine, &format!("{query} | stats count() as n"), hour, false).await;
+            assert_eq!(rows.len(), 1, "{query}: {rows:?}");
+            let count = rows[0]["n"].as_u64().or_else(|| rows[0]["n"].as_str().and_then(|n| n.parse().ok()));
+            assert_eq!(count, Some(expected.len() as u64), "{query}: {rows:?}");
+        }
+    }
+}
+
 /// NAN-4292: an event-id lookup over the class-families hour prunes files
 /// by uid sidecar through the engine's positioned probe and still returns
 /// exactly the one row, cold (layouts built) and warm (layouts cached).

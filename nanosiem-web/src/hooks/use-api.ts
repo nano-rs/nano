@@ -1401,6 +1401,11 @@ export function useOnboardingStatus(options?: UseQueryOptions) {
   );
 }
 
+/** NAN-4779: tenant members (and, on hosted-shared, pending invitations) for the Team step. */
+export function useUserList(options?: UseQueryOptions) {
+  return useQuery(() => api.listUsers(), [], options);
+}
+
 export function useCompleteOnboardingStep() {
   return useMutation((req: import('@/lib/api/onboarding').StepActionRequest) =>
     api.onboarding.completeStep(req)

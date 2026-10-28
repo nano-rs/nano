@@ -101,7 +101,7 @@ impl Cursor {
                     return Ok(false);
                 }
                 Some(batch) => {
-                    super::merge_quota::charge_input(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch));
+                    super::merge_quota::charge_input_checked(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch))?;
                     let mut batch = align(batch, schema)?;
                     if let Some(active) = &self.filter {
                         let (kept, removed, rewritten) = active.filter.apply(batch)?;
@@ -190,7 +190,42 @@ pub fn merge_reserve_bytes() -> u64 {
 }
 
 fn decode_window_rows() -> usize {
-    DECODE_WINDOW_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+    (DECODE_WINDOW_ROWS.load(std::sync::atomic::Ordering::Relaxed) >> shape_shift()).max(512)
+}
+
+thread_local! {
+    /// NAN-4755: the shape step of the merge running on this thread.
+    static SHAPE_SHIFT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// NAN-4755: run `work` (one merge, on its compute thread) at shape step
+/// `shift` (see [`super::merge_attempts`]) with the memory guard armed.
+/// Each step halves the decode window, the open input readers (at least 2)
+/// and the class runs a restore opens at once (at least 8), so a merge that
+/// ran out of memory reruns with about half the working set.
+pub fn with_shape<T>(shift: u8, work: impl FnOnce() -> T) -> T {
+    let previous = SHAPE_SHIFT.replace(shift.min(super::merge_attempts::MAX_SHIFT));
+    let _guard = super::merge_quota::memory_guard_scope();
+    let out = work();
+    SHAPE_SHIFT.set(previous);
+    out
+}
+
+fn shape_shift() -> u8 {
+    SHAPE_SHIFT.get()
+}
+
+/// Most input readers this thread's merge opens at once ([`MAX_OPEN_INPUTS`]
+/// at full size, halved per shape step, at least 2).
+pub fn open_inputs_cap() -> usize {
+    (MAX_OPEN_INPUTS >> shape_shift()).max(2)
+}
+
+/// Most class runs a restore of this thread's merge reads at once
+/// ([`super::class_sort::MAX_RESTORE_RUNS`] at full size, halved per shape
+/// step, at least 8); a file with more is bucket-sorted instead.
+pub fn restore_runs_cap() -> usize {
+    (super::class_sort::MAX_RESTORE_RUNS >> shape_shift()).max(8)
 }
 
 /// Rows one host-sort bucket holds in memory (NAN-3412): half the merge
@@ -233,7 +268,7 @@ fn class_sort_max_rows(inputs: &[MergeInput]) -> u64 {
 }
 
 fn host_sort_bucket_rows() -> usize {
-    (decode_window_rows() / 2).max(1_024)
+    (decode_window_rows() / 2).max(1_024 >> shape_shift())
 }
 
 /// Most input readers open at once. Every open Parquet reader holds decoded
@@ -496,6 +531,9 @@ impl FamilySpool {
     }
 
     fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        // NAN-4755: each merged batch is copied per family and IPC-encoded
+        // here: the merge's working set peaks in this write, not in decode.
+        super::merge_quota::memory_guard_bytes(super::merge_quota::batch_bytes(batch))?;
         let sources = log_source_strings(batch)?;
         let classes = batch.column_by_name("class_uid");
         let uids = uid_strings(batch)?;
@@ -594,7 +632,7 @@ impl FamilySpool {
             let mut reader = StreamReader::try_new(File::open(path)?, None)?;
             for batch in &mut reader {
                 let batch = batch?;
-                super::merge_quota::charge(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch));
+                super::merge_quota::charge_checked(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch))?;
                 writer.write(&batch)?;
             }
         }
@@ -771,11 +809,12 @@ fn merge_parts_with(
         }
         current = expanded;
         let mut pass = 0;
-        while current.len() > MAX_OPEN_INPUTS && max_overlap(&current) > MAX_OPEN_INPUTS {
+        let open_cap = open_inputs_cap();
+        while current.len() > open_cap && max_overlap(&current) > open_cap {
             pass += 1;
             current.sort_by_key(|i| (i.part.min_time_us, i.part.max_time_us));
             let mut next = Vec::new();
-            for group in current.chunks(MAX_OPEN_INPUTS) {
+            for group in current.chunks(open_cap) {
                 if group.len() == 1 {
                     next.push(group[0].clone());
                     continue;
@@ -836,6 +875,9 @@ fn merge_parts_with(
                     Ok(merged)
                 }) {
                     Ok(merged) => Some(merged),
+                    // NAN-4755: out of memory is not a layout problem: the
+                    // time-sorted redo would run into the same limit.
+                    Err(error) if super::merge_quota::is_memory_pressure(&error) => return Err(error),
                     Err(error) => {
                         tracing::warn!(error = %format!("{error:#}"), event_hour, "host/class-sorted hour merge failed; writing time-sorted layout");
                         None
@@ -1012,7 +1054,8 @@ fn merge_pass(
     let rows_in: u64 = inputs.iter().map(|i| i.part.rows).sum();
     // Decoded OCSF rows are ~5–10 KB wide: hold at most ~32k decoded input
     // rows in total across the (at most MAX_OPEN_INPUTS) open readers.
-    let batch_rows = (decode_window_rows() / inputs.len().min(MAX_OPEN_INPUTS)).clamp(256, 8_192);
+    let open_cap = open_inputs_cap();
+    let batch_rows = (decode_window_rows() / inputs.len().min(open_cap)).clamp(256 >> shape_shift(), 8_192);
     let draft = PartDraft {
         tenant_id: tenant_id.to_string(),
         signer_key_id: signer_key_id.to_string(),
@@ -1134,7 +1177,7 @@ fn merge_pass(
                 let (t, u) = cursor.key();
                 heap.push(Reverse((t, u.to_string(), index)));
                 open_now += 1;
-                ensure!(open_now <= MAX_OPEN_INPUTS, "merge exceeded the open reader cap");
+                ensure!(open_now <= open_cap, "merge exceeded the open reader cap");
                 cursors[index] = Some(cursor);
             }
         }
@@ -1229,6 +1272,54 @@ pub(crate) fn cluster_fixture(work_dir: &Path, batch: &RecordBatch, writer: &mut
 mod tests {
     use super::*;
     use crate::parts::format::PartId;
+
+    #[test]
+    fn sliced_ipc_batches_do_not_falsely_stop_either_merge_write_path() {
+        use super::super::merge_quota::{batch_bytes, memory_guard_scope, MEMORY_PROBE_FOR_TEST};
+        use super::super::schema::{decode, infer_schema};
+        use crate::parts::provenance::tests::{TENANT, SIGNER};
+        use std::sync::Arc;
+        const LIMIT: u64 = 8 * 1024 * 1024;
+        fn memory() -> Option<(u64, u64)> { Some((0, LIMIT)) }
+        let events = (0..4_096).map(|row| serde_json::json!({
+            "time": "2026-10-28T00:00:00Z",
+            "metadata": { "uid": format!("u{row:05}"), "log_source": "sysmon" },
+            "message": "m".repeat(1_024),
+        })).collect::<Vec<_>>();
+        let refs = events.iter().collect::<Vec<_>>();
+        let schema = Arc::new(infer_schema(&refs).unwrap());
+        let rows = decode(schema.clone(), &refs).unwrap();
+        let mut ipc = Vec::new();
+        {
+            let mut stream = StreamWriter::try_new(&mut ipc, &schema).unwrap();
+            stream.write(&rows).unwrap();
+            stream.finish().unwrap();
+        }
+        let decoded = StreamReader::try_new(std::io::Cursor::new(ipc), None).unwrap().next().unwrap().unwrap();
+        let slice = decoded.slice(2_048, 16);
+        assert!(slice.get_array_memory_size() as u64 * 2 > LIMIT,
+            "fixture must falsely stop with the retained-buffer measure");
+        assert!(batch_bytes(&slice) * 2 < LIMIT / 100,
+            "the slice itself needs well under the limit");
+        let dir = tempfile::tempdir().unwrap();
+        let mut spool = FamilySpool::new(dir.path(), schema.clone(), BTreeSet::new()).unwrap();
+        let draft = PartDraft {
+            tenant_id: TENANT.into(), signer_key_id: SIGNER.into(), level: Level::Hour, event_hour: 498_096,
+            schema: schema.clone(), schema_fingerprint: crate::parts::format::schema_fingerprint(&schema).unwrap(),
+            inputs: PartInputs::Parts { parts: vec![InputPart { part_id: PartId::new(1).unwrap(), level: Level::L0,
+                provenance_sha256: "0".repeat(64), rows: 16, merkle_root: "0".repeat(64) }] },
+            admission: None, rows_in: 16, duplicates_dropped: 0, window: DedupWindow::Exact, build: "test".into(),
+        };
+        let mut writer = PartWriter::create(dir.path(), draft, PartialSource::FromRows, 2, 16).unwrap();
+        MEMORY_PROBE_FOR_TEST.set(Some(memory));
+        // A fresh scope forces each site's first check, independent of cadence.
+        let spooled = { let _guard = memory_guard_scope(); spool.write(&slice) };
+        let written = { let _guard = memory_guard_scope(); writer.write(&slice) };
+        MEMORY_PROBE_FOR_TEST.set(None);
+        spooled.expect("a small IPC slice fits the family spool");
+        written.expect("a small IPC slice fits the part writer");
+        assert_eq!(writer.rows(), 16);
+    }
 
     #[test]
     fn family_spool_caps_dedicated_sources() {
@@ -2027,6 +2118,30 @@ mod tests {
             assert_eq!(kept_time, groups_time, "{classes:?}: time order prunes nothing");
             assert!(kept < groups, "{classes:?}: the class sort skips other classes' row groups");
             assert!(kept_rows < matching + 2 * crate::parts::format::ROW_GROUP_ROWS as u64, "{classes:?}: {kept_rows} rows read for {matching}");
+            // NAN-4772: the planner's footer evidence (what every selection
+            // probes) proves the file empty exactly when its statistics
+            // keep no group, and leaves a file that may hold the class to
+            // chDB's own row-group skipping (no row fence).
+            if let [class] = classes {
+                let hints = [CandidateHint::Class { value: *class }];
+                let evidence = crate::part_query::prune::FileMetadataCache::default()
+                    .evidence(&path, &file.sha256, &hints, None, false, true, None).unwrap();
+                if kept == 0 {
+                    assert_eq!(matching, 0);
+                    assert_eq!(evidence.0, Some(vec![false; groups]), "{class}: no group can hold it");
+                } else {
+                    assert_eq!(evidence.0, None, "{class}: a file that may hold the class is read");
+                }
+            }
+        }
+        // A class the open-hour minute part does not hold (its statistics
+        // span 1001..6003): the file is proven empty and never handed to
+        // chDB.
+        let groups = file.row_groups as usize;
+        for absent in [1, 9_999] {
+            let evidence = crate::part_query::prune::FileMetadataCache::default()
+                .evidence(&path, &file.sha256, &[CandidateHint::Class { value: absent }], None, false, true, None).unwrap();
+            assert_eq!(evidence.0, Some(vec![false; groups]), "{absent}");
         }
 
         // Sealed hour: the hour merge of the published (class-sorted) minute

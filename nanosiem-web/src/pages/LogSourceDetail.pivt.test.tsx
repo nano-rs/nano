@@ -19,7 +19,10 @@ vi.mock('@/hooks/use-api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/hooks/use-api')>()),
   useMelodStatus: mocks.melodStatus,
 }));
-vi.mock('@/enterprise/hooks/use-melod-job', () => ({ useMelodJob: () => ({ start: vi.fn(), loading: false }) }));
+vi.mock('@/enterprise/hooks/use-melod-job', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/enterprise/hooks/use-melod-job')>()),
+  useMelodJob: () => ({ start: vi.fn(), loading: false }),
+}));
 vi.mock('@/hooks/use-toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
 vi.mock('@/lib/api', () => ({
   ApiClientError: class extends Error {},

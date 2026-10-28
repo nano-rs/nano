@@ -48,11 +48,14 @@ vi.mock('@/hooks/use-api', () => ({
       has_ai_provider: false, has_org_context: false, has_users: true, has_sso: false,
       has_log_sources: true, has_parsers: false, has_search_history: false,
     },
+    refetch: vi.fn(),
   }),
   useCompleteOnboardingStep: () => ({ mutate: vi.fn() }),
   useSkipOnboardingStep: () => ({ mutate: vi.fn() }),
   useDismissOnboarding: () => ({ mutate: vi.fn() }),
-  useLogSources: () => ({ data: undefined }),
+  useLogSources: () => ({ data: undefined, refetch: vi.fn() }),
+  useTenantAiSettings: () => ({ data: undefined, refetch: vi.fn() }),
+  useUserList: () => ({ data: undefined, refetch: vi.fn() }),
 }));
 
 import { SettingsLanding } from './SettingsLanding';

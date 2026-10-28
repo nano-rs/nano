@@ -167,6 +167,146 @@ impl AdmissionGroups {
     }
 }
 
+/// NAN-4770: what admission predicts per decoded (uncompressed bronze)
+/// byte, learned per object prefix from the rows it actually admitted.
+///
+/// The fixed model ([`super::ingest::HEAP_PER_DECODED_BYTE`] 16.0 modelled
+/// JSON heap, [`super::ingest::ARROW_PER_DECODED_BYTE`] 1.0 Arrow) was
+/// measured on narrow Tenzir OCSF rows. It is not a large overestimate for
+/// every shape: on the ~1 KB blaster row (`nan4770_ingest_tests`) the rows
+/// model at 18-23 heap bytes per decoded byte and the measured admission
+/// peak was 15.6-17.9 allocated bytes per decoded byte, so that shape keeps
+/// the prior. Rows dominated by long strings model at a fraction of it, and
+/// those objects were sliced (or kept out of a group) for nothing.
+///
+/// What is learned is the SAME modelled heap ([`super::ingest::value_heap_bytes`],
+/// sampled on the admitted rows) and Arrow bytes the fixed constants
+/// approximate, so the measured admission peak per modelled heap byte
+/// ([`ADMISSION_PEAK_PER_MODELLED_HEAP`]) still applies on top. Bounds:
+/// - an unmeasured prefix uses the fixed constants (the prior);
+/// - the learned ratio carries [`CALIBRATION_MARGIN`] and is clamped to
+///   [`MIN_CALIBRATED_HEAP_SHARE`]..1 of the prior: never above the fixed
+///   model; this is an estimate, not a bound on a different next object;
+/// - a heavier group raises the ratio at once; a lighter one lowers it by
+///   a quarter of the gap per observation (a burst of narrow rows after
+///   wide ones is not trusted at once);
+/// - a group that mixes prefixes may only raise each prefix's ratio;
+/// - at most [`MAX_CALIBRATED_PREFIXES`] prefixes are kept (least recently
+///   observed dropped: it falls back to the prior).
+///
+/// History cannot bound the next object's shape, or an unsampled row.
+/// [`Self::reservation_cost`] therefore keeps the fixed model as its
+/// minimum reservation, independently of the learned estimate.
+#[derive(Debug, Clone, Default)]
+pub struct AdmissionCalibration {
+    by_prefix: std::collections::BTreeMap<String, Learned>,
+    observations: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Learned {
+    heap: f64,
+    arrow: f64,
+    last: u64,
+}
+
+/// Safety margin on a learned ratio.
+pub const CALIBRATION_MARGIN: f64 = 1.25;
+/// Lowest share of the fixed model a learned heap ratio may predict.
+pub const MIN_CALIBRATED_HEAP_SHARE: f64 = 1.0 / 4.0;
+/// Lowest share of the fixed Arrow ratio a learned one may predict.
+pub const MIN_CALIBRATED_ARROW_SHARE: f64 = 1.0 / 4.0;
+/// Fewest rows a group must hold to calibrate (the heap is sampled every
+/// 16th row).
+pub const MIN_CALIBRATION_ROWS: u64 = 256;
+/// Prefixes remembered.
+pub const MAX_CALIBRATED_PREFIXES: usize = 64;
+
+/// The calibration prefix of a bronze object key: its folder (the shard
+/// and tenant), so one writer's objects share a ratio.
+pub fn calibration_prefix(key: &str) -> &str {
+    key.rsplit_once('/').map_or("", |(folder, _)| folder)
+}
+
+impl AdmissionCalibration {
+    /// (modelled JSON heap, Arrow bytes) per decoded byte for `prefix`.
+    pub fn per_decoded_byte(&self, prefix: &str) -> (f64, f64) {
+        let (heap, arrow) = (super::ingest::HEAP_PER_DECODED_BYTE, super::ingest::ARROW_PER_DECODED_BYTE);
+        match self.by_prefix.get(prefix) {
+            None => (heap, arrow),
+            Some(learned) => (
+                (learned.heap * CALIBRATION_MARGIN).clamp(heap * MIN_CALIBRATED_HEAP_SHARE, heap),
+                (learned.arrow * CALIBRATION_MARGIN).clamp(arrow * MIN_CALIBRATED_ARROW_SHARE, arrow),
+            ),
+        }
+    }
+
+    /// Predicted (modelled JSON heap, Arrow rows) of an object under
+    /// `prefix` whose rows decode to `decoded` bytes.
+    pub fn cost(&self, prefix: &str, decoded: u64) -> (f64, f64) {
+        let (heap, arrow) = self.per_decoded_byte(prefix);
+        (decoded as f64 * heap, decoded as f64 * arrow)
+    }
+
+    /// Memory authority must not shrink when a previous object was light.
+    /// Learning a heavier ratio after decoding it would be too late to
+    /// protect that admission (including groups selected in the same tick).
+    pub fn reservation_cost(&self, prefix: &str, decoded: u64) -> (f64, f64) {
+        let (heap, arrow) = self.cost(prefix, decoded);
+        let (fixed_heap, fixed_arrow) = super::ingest::decoded_admission_cost(decoded);
+        (heap.max(fixed_heap), arrow.max(fixed_arrow))
+    }
+
+    /// Whether `prefix` has a learned ratio.
+    pub fn measured(&self, prefix: &str) -> bool {
+        self.by_prefix.contains_key(prefix)
+    }
+
+    /// Record one admitted group: its `prefixes` (one per object), `rows`
+    /// kept, `decoded` bytes, sampled modelled `heap` and Arrow `arrow` bytes.
+    pub fn observe(&mut self, prefixes: &[&str], rows: u64, decoded: u64, heap: f64, arrow: f64) {
+        if rows < MIN_CALIBRATION_ROWS || decoded == 0 || !(heap.is_finite() && arrow.is_finite()) || heap <= 0.0 || arrow <= 0.0 {
+            return;
+        }
+        let (heap, arrow) = (heap / decoded as f64, arrow / decoded as f64);
+        let mut unique = prefixes.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let mixed = unique.len() > 1;
+        self.observations += 1;
+        let now = self.observations;
+        for prefix in unique {
+            match self.by_prefix.get_mut(prefix) {
+                Some(learned) => {
+                    learned.heap = Self::step(learned.heap, heap, mixed);
+                    learned.arrow = Self::step(learned.arrow, arrow, mixed);
+                    learned.last = now;
+                }
+                // A mixed group's ratio is a blend: never a first measure.
+                None if mixed => {}
+                None => {
+                    if self.by_prefix.len() >= MAX_CALIBRATED_PREFIXES {
+                        if let Some(oldest) = self.by_prefix.iter().min_by_key(|(_, l)| l.last).map(|(k, _)| k.clone()) {
+                            self.by_prefix.remove(&oldest);
+                        }
+                    }
+                    self.by_prefix.insert(prefix.to_string(), Learned { heap, arrow, last: now });
+                }
+            }
+        }
+    }
+
+    fn step(learned: f64, observed: f64, raise_only: bool) -> f64 {
+        if observed >= learned {
+            observed
+        } else if raise_only {
+            learned
+        } else {
+            learned - (learned - observed) / 4.0
+        }
+    }
+}
+
 /// Fewest rows in one admission slice (NAN-4553): below this the per-slice
 /// overhead (a Parquet file, one admission pass) outweighs the memory saved.
 pub const MIN_ADMISSION_SLICE_ROWS: u64 = 256;
@@ -184,6 +324,44 @@ pub fn admission_slice_rows(working_budget: u64, committed: u64, predicted_heap:
     let per_row = predicted_heap * ADMISSION_PEAK_PER_MODELLED_HEAP / rows as f64;
     let fit = if per_row > 0.0 { (json_room / per_row).floor() as u64 } else { rows };
     fit.clamp(MIN_ADMISSION_SLICE_ROWS.min(rows), rows)
+}
+
+/// Fewest rows per slice of an object admitted beside flushes in flight
+/// (NAN-4770): smaller slices wait for the flights to commit instead.
+pub const MIN_PIPELINED_SLICE_ROWS: u64 = 4_096;
+
+/// NAN-4770: rows per slice of the next buffer's first object, admitted
+/// beside the flushes still in flight (`committed`), or `None` when it must
+/// wait for them. Unlike [`admission_slice_rows`] (idle: progress at any
+/// size), the object's Arrow rows AND every slice's peak must fit the room
+/// left: the flights keep their reservation.
+pub fn pipelined_slice_rows(working_budget: u64, committed: u64, predicted_heap: f64, predicted_arrow: f64, rows: u64) -> Option<u64> {
+    if rows == 0 || committed >= working_budget || !predicted_heap.is_finite() || !predicted_arrow.is_finite()
+        || predicted_heap <= 0.0 || predicted_arrow <= 0.0 {
+        return None;
+    }
+    let room = working_budget.saturating_sub(committed) as f64;
+    let json_room = room - predicted_arrow;
+    let per_row = predicted_heap * ADMISSION_PEAK_PER_MODELLED_HEAP / rows as f64;
+    if json_room <= 0.0 || per_row <= 0.0 {
+        return (json_room >= 0.0 && per_row <= 0.0).then_some(rows);
+    }
+    let fit = (json_room / per_row).floor() as u64;
+    (fit >= MIN_PIPELINED_SLICE_ROWS.min(rows)).then(|| fit.min(rows))
+}
+
+/// Check the actual rewritten slices before decoding any JSON. An
+/// object's average bytes per row does not bound its heaviest slice, and
+/// rewriting dictionaries can increase its decoded bytes. Charge all
+/// retained Arrow rows plus the heaviest slice's fixed-model JSON peak.
+pub fn pipelined_slices_fit(working_budget: u64, committed: u64, object_decoded: u64, decoded: &[u64]) -> bool {
+    if object_decoded == 0 || decoded.is_empty() || decoded.contains(&0) || committed >= working_budget {
+        return false;
+    }
+    let total = decoded.iter().fold(0_u64, |total, bytes| total.saturating_add(*bytes));
+    let heap = super::ingest::decoded_admission_cost(*decoded.iter().max().expect("nonempty slices")).0;
+    let arrow = super::ingest::decoded_admission_cost(total.max(object_decoded)).1;
+    admission_fits(working_budget, committed, heap, arrow)
 }
 
 /// Cap glibc's malloc retention: a fixed mmap threshold so large Arrow and
@@ -337,6 +515,87 @@ mod tests {
             assert_eq!(admitted as u64, (crate::parts::levels::FLUSH_MAX_ROWS as u64 - buffered_rows) / 5_000);
             assert!(buffered_rows + groups.rows <= crate::parts::levels::FLUSH_MAX_ROWS as u64);
         }
+    }
+
+    /// NAN-4770: the prior until measured; the learned ratio with its
+    /// margin inside its bounds; heavier rises at once, lighter decays;
+    /// mixed groups only raise; prefixes are bounded.
+    #[test]
+    fn calibration_is_bounded_and_rises_at_once() {
+        use super::super::ingest::{ARROW_PER_DECODED_BYTE as ARROW, HEAP_PER_DECODED_BYTE as HEAP};
+        let mut c = AdmissionCalibration::default();
+        assert_eq!(c.per_decoded_byte("a"), (HEAP, ARROW));
+        // Too few rows: not a measure.
+        c.observe(&["a"], MIN_CALIBRATION_ROWS - 1, 1_000, 4_000.0, 500.0);
+        assert!(!c.measured("a"));
+        c.observe(&["a"], 10_000, 1_000, 4_000.0, 500.0);
+        assert_eq!(c.per_decoded_byte("a"), (4.0 * CALIBRATION_MARGIN, 0.5 * CALIBRATION_MARGIN));
+        assert_eq!(c.cost("a", 1_000), (5_000.0, 625.0));
+        // Another prefix keeps the prior.
+        assert_eq!(c.per_decoded_byte("b"), (HEAP, ARROW));
+        // Heavier: at once. Lighter: a quarter of the gap.
+        c.observe(&["a"], 10_000, 1_000, 8_000.0, 500.0);
+        assert_eq!(c.per_decoded_byte("a").0, 8.0 * CALIBRATION_MARGIN);
+        c.observe(&["a"], 10_000, 1_000, 4_000.0, 500.0);
+        assert_eq!(c.per_decoded_byte("a").0, 7.0 * CALIBRATION_MARGIN);
+        // Never above the prior; never below the floor.
+        c.observe(&["a"], 10_000, 1_000, 100_000.0, 5_000.0);
+        assert_eq!(c.per_decoded_byte("a"), (HEAP, ARROW));
+        let mut tiny = AdmissionCalibration::default();
+        tiny.observe(&["t"], 10_000, 1_000_000, 1.0, 1.0);
+        assert_eq!(tiny.per_decoded_byte("t"), (HEAP * MIN_CALIBRATED_HEAP_SHARE, ARROW * MIN_CALIBRATED_ARROW_SHARE));
+        assert_eq!(tiny.reservation_cost("t", 1_000), (HEAP * 1_000.0, ARROW * 1_000.0),
+            "a learned estimate cannot lower the hard memory reservation");
+        // A mixed group: no first measure, and only raises.
+        let mut m = AdmissionCalibration::default();
+        m.observe(&["x"], 10_000, 1_000, 5_000.0, 500.0);
+        m.observe(&["x", "y"], 10_000, 1_000, 4_000.0, 400.0);
+        assert!(!m.measured("y"));
+        assert_eq!(m.per_decoded_byte("x").0, 5.0 * CALIBRATION_MARGIN);
+        m.observe(&["x", "y"], 10_000, 1_000, 6_000.0, 400.0);
+        assert_eq!(m.per_decoded_byte("x").0, 6.0 * CALIBRATION_MARGIN);
+        // Non-finite or empty observations are ignored.
+        m.observe(&["z"], 10_000, 0, 1.0, 1.0);
+        m.observe(&["z"], 10_000, 1_000, f64::NAN, 1.0);
+        assert!(!m.measured("z"));
+        // Bounded: the least recently observed prefix falls back to the prior.
+        let mut many = AdmissionCalibration::default();
+        for i in 0..=MAX_CALIBRATED_PREFIXES {
+            many.observe(&[format!("p{i}").as_str()], 10_000, 1_000, 2_000.0, 500.0);
+        }
+        assert_eq!(many.by_prefix.len(), MAX_CALIBRATED_PREFIXES);
+        assert!(!many.measured("p0") && many.measured(&format!("p{MAX_CALIBRATED_PREFIXES}")));
+        assert_eq!(calibration_prefix("bronze-v2/shard=3/tenant_id=t/1-u.parquet"), "bronze-v2/shard=3/tenant_id=t");
+        assert_eq!(calibration_prefix("flat.parquet"), "");
+    }
+
+    /// NAN-4770: beside flights, the object's Arrow rows and a slice of at
+    /// least MIN_PIPELINED_SLICE_ROWS must fit the room they leave.
+    #[test]
+    fn pipelined_slices_take_only_the_room_the_flights_leave() {
+        let budget = 600 * MIB;
+        let flight = flight_bytes(60 * MIB, 2);
+        // 140k rows: 110 MiB of Arrow, 2.5 GiB modelled heap (whole: never fits).
+        let (heap, arrow, rows) = (2_560.0 * MIB as f64, 110.0 * MIB as f64, 140_000);
+        assert!(!admission_fits(budget, flight, heap, arrow));
+        let slice = pipelined_slice_rows(budget, flight, heap, arrow, rows).expect("a slice fits beside the flight");
+        let room = (budget - flight) as f64;
+        assert!(arrow + heap * ADMISSION_PEAK_PER_MODELLED_HEAP * slice as f64 / rows as f64 <= room);
+        assert!((MIN_PIPELINED_SLICE_ROWS..rows).contains(&slice));
+        // The Arrow rows alone do not fit: wait for the flight.
+        assert_eq!(pipelined_slice_rows(budget, budget - 100 * MIB, heap, arrow, rows), None);
+        // Room for slices smaller than the minimum: wait.
+        assert_eq!(pipelined_slice_rows(budget, budget - arrow as u64 - MIB, heap, arrow, rows), None);
+        // A small object fits in one slice.
+        assert_eq!(pipelined_slice_rows(budget, 0, 10.0 * MIB as f64, MIB as f64, 100), Some(100));
+        assert_eq!(pipelined_slice_rows(budget, 0, 0.0, 0.0, 0), None, "unknown footer is not free admission");
+        assert_eq!(pipelined_slice_rows(budget, budget, 0.0, 0.0, rows), None);
+        assert_eq!(pipelined_slice_rows(budget, 0, f64::NAN, arrow, rows), None);
+        assert!(pipelined_slices_fit(budget, flight, 4 * MIB, &[MIB; 4]));
+        assert!(!pipelined_slices_fit(budget, flight, 23 * MIB, &[20 * MIB, MIB, MIB, MIB]), "a heavy slice exceeds the room");
+        assert!(!pipelined_slices_fit(budget, flight, 4 * MIB, &[MIB; 400]), "all slices' Arrow stays resident");
+        assert!(!pipelined_slices_fit(budget, flight, 400 * MIB, &[MIB; 4]), "the original Arrow reserve is retained too");
+        assert!(!pipelined_slices_fit(budget, flight, MIB, &[0]));
     }
 
     #[test]

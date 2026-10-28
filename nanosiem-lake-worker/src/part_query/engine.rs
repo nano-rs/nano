@@ -267,6 +267,11 @@ pub enum RequestClass {
     /// [`WIDE_WINDOW_HOURS`]): at most `slots - SHORT_RESERVED_SLOTS` at
     /// once, so short-window primaries always find a slot.
     Wide,
+    /// NAN-4772: an agent-class (`agent-`, NAN-4738) or background
+    /// (`detect-`) request, its companions included: at most
+    /// `slots - ANALYST_RESERVED_SLOTS` at once, and it takes a free slot
+    /// only when no analyst is queued for one (see [`admit_yielding`]).
+    Yielding,
 }
 
 impl RequestClass {
@@ -274,6 +279,10 @@ impl RequestClass {
     pub fn of(request_id: &str, fetch_log: bool) -> Self {
         if fetch_log {
             Self::Point
+        } else if request_id.starts_with(crate::thread_budget::AGENT_REQUEST_PREFIX)
+            || request_id.starts_with(crate::thread_budget::BACKGROUND_REQUEST_PREFIX)
+        {
+            Self::Yielding
         } else if request_id.contains("-hist") {
             Self::Companion
         } else {
@@ -316,6 +325,60 @@ pub const WIDE_WINDOW_HOURS: i64 = 24;
 /// Wide-gate permits for `slots` admission slots (at least one).
 pub(crate) fn wide_permits(slots: usize) -> usize {
     slots.saturating_sub(SHORT_RESERVED_SLOTS).max(1)
+}
+
+/// NAN-4772: admission slots agent and background requests never take, so
+/// an analyst is admitted at once beside any number of agents (Mythos
+/// 1.0.12: 16 agents held all 7 slots and an analyst timed out while a
+/// native lane was free). Two: one analyst search's primary and its
+/// histogram companion run together. A one- or two-slot role keeps one
+/// slot agents may use (else agents could never run there).
+pub const ANALYST_RESERVED_SLOTS: usize = 2;
+
+/// Yielding-gate permits for `slots` admission slots (at least one).
+pub(crate) fn yielding_permits(slots: usize) -> usize {
+    slots.saturating_sub(ANALYST_RESERVED_SLOTS).max(1)
+}
+
+/// How often a yielding request re-checks for a free slot. Low: it only
+/// waits while every slot is busy or an analyst is queued.
+const YIELDING_POLL: Duration = Duration::from_millis(10);
+
+/// NAN-4772: admit a yielding (agent / background) request: a `gate` permit
+/// (at most `slots - ANALYST_RESERVED_SLOTS` such requests hold slots or
+/// wait for one), then a slot taken only with `try_acquire`. A released
+/// slot goes straight to a queued analyst (the semaphore hands permits to
+/// its waiters first), so a yielding request never queues ahead of one.
+pub(crate) async fn admit_yielding(
+    gate: &Arc<tokio::sync::Semaphore>,
+    admission: &Arc<tokio::sync::Semaphore>,
+    deadline: Duration,
+) -> Result<(tokio::sync::OwnedSemaphorePermit, tokio::sync::OwnedSemaphorePermit), YieldingRefusal> {
+    let started = Instant::now();
+    let gate = match tokio::time::timeout(deadline, gate.clone().acquire_owned()).await {
+        Ok(Ok(gate)) => gate,
+        Ok(Err(_)) => return Err(YieldingRefusal::Closed),
+        Err(_) => return Err(YieldingRefusal::Busy),
+    };
+    loop {
+        match admission.clone().try_acquire_owned() {
+            Ok(permit) => return Ok((gate, permit)),
+            Err(tokio::sync::TryAcquireError::Closed) => return Err(YieldingRefusal::Closed),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {}
+        }
+        let left = deadline.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(YieldingRefusal::Busy);
+        }
+        tokio::time::sleep(left.min(YIELDING_POLL)).await;
+    }
+}
+
+/// Why [`admit_yielding`] admitted nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum YieldingRefusal {
+    Closed,
+    Busy,
 }
 
 /// NAN-4174: whether a `[start, end]` (RFC 3339) request window is wide.
@@ -901,6 +964,11 @@ pub struct PartQueryEngine {
     companion_gate: Arc<tokio::sync::Semaphore>,
     /// NAN-4174: wide-window primaries hold one of these beside their slot.
     wide_gate: Arc<tokio::sync::Semaphore>,
+    /// NAN-4772: agent and background requests hold one of these beside
+    /// their slot.
+    yielding_gate: Arc<tokio::sync::Semaphore>,
+    /// Set once [`Self::serve_without_analysts`] gave the reserved slots back.
+    analysts_absent: std::sync::atomic::AtomicBool,
     /// NAN-3077: durable jobs (one at a time, on the read-write lane).
     job_admission: Arc<tokio::sync::Semaphore>,
     /// NAN-4290: the small-job lane: its own read-write connection and one
@@ -1129,6 +1197,8 @@ impl PartQueryEngine {
             point: None, large: None, lane_memo: Default::default(), point_admission: Arc::new(tokio::sync::Semaphore::new(POINT_PERMITS)),
             companion_gate: Arc::new(tokio::sync::Semaphore::new(companion_permits(slots))),
             wide_gate: Arc::new(tokio::sync::Semaphore::new(wide_permits(slots))),
+            yielding_gate: Arc::new(tokio::sync::Semaphore::new(yielding_permits(slots))),
+            analysts_absent: Default::default(),
             job_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             small_job_writer: None, small_job_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             admission: Arc::new(tokio::sync::Semaphore::new(slots)), product: Default::default() })
@@ -1179,6 +1249,14 @@ impl PartQueryEngine {
                 slot.gate = Some(gate);
                 Ok(slot)
             }
+            RequestClass::Yielding => match admit_yielding(&self.yielding_gate, &self.admission, deadline).await {
+                Ok((gate, permit)) => Ok(AdmissionSlot { permit: Some(permit), slots: self.admission_slots(), gate: Some(gate) }),
+                Err(YieldingRefusal::Closed) => Err(PartQueryError::Unavailable("query admission is closed".into())),
+                Err(YieldingRefusal::Busy) => Err(PartQueryError::ConcurrencyBudget(format!(
+                    "agent and background searches stayed at their limit ({} of {} query slots, the rest kept for analysts) for {} s; retry later",
+                    yielding_permits(self.admission_slots()), self.admission_slots(), deadline.as_secs()
+                ))),
+            },
             RequestClass::Companion => {
                 let started = Instant::now();
                 let gate = match tokio::time::timeout(deadline, self.companion_gate.clone().acquire_owned()).await {
@@ -1305,9 +1383,18 @@ impl PartQueryEngine {
             // connection (NAN-3393) serves the statements of requests already
             // admitted; it adds no request, so the Rust-side result headroom
             // (`QueryMemoryBudget::result_bytes`) is unchanged.
+            let slots = self.admission_slots();
             self.admission.add_permits(1);
             self.companion_gate.add_permits(1);
             self.wide_gate.add_permits(1);
+            // The one-permit floor means adding the large lane to a tiny
+            // role need not create another yielding permit.
+            let yielding_added = if self.analysts_absent.load(std::sync::atomic::Ordering::SeqCst) {
+                1
+            } else {
+                yielding_permits(slots + 1) - yielding_permits(slots)
+            };
+            self.yielding_gate.add_permits(yielding_added);
         }
         self.large = Some(large);
         self
@@ -1400,6 +1487,17 @@ impl PartQueryEngine {
                 memo.clear();
             }
             memo.insert(part, covered);
+        }
+    }
+
+    /// NAN-4772: a role no analyst reaches (detect[T]: every request is a
+    /// `detect-` rule search) keeps no slots for analysts: background
+    /// requests may take every slot. Idempotent; call after the lanes are
+    /// attached.
+    pub fn serve_without_analysts(&self) {
+        if !self.analysts_absent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let slots = self.admission_slots();
+            self.yielding_gate.add_permits(slots.saturating_sub(yielding_permits(slots)));
         }
     }
 
@@ -5432,6 +5530,50 @@ mod admission_class_tests {
         assert_eq!(companion_permits(1), 1);
         assert_eq!(companion_permits(2), 1);
         assert_eq!(companion_permits(4), 3);
+        // NAN-4772: agent and background requests (their companions too)
+        // yield; their point lookups keep the point lane.
+        for id in ["agent-0192", "agent-0192-hist", "agent-0192-stats-0", "detect-0192"] {
+            assert_eq!(RequestClass::of(id, false), RequestClass::Yielding, "{id}");
+            assert_eq!(RequestClass::of_window(id, false, week.0, week.1), RequestClass::Yielding, "{id}");
+        }
+        assert_eq!(RequestClass::of("agent-0192", true), RequestClass::Point);
+        assert_eq!(RequestClass::of("0192-agent-x", false), RequestClass::Primary);
+        assert_eq!((yielding_permits(7), yielding_permits(3), yielding_permits(2), yielding_permits(1)), (5, 1, 1, 1));
+    }
+
+    /// NAN-4772 (review P1): on the 7-slot query role, agents saturating
+    /// their gate hold five slots; an analyst is admitted at once, and once
+    /// every slot is busy a queued analyst gets the next free slot ahead of
+    /// any agent (an agent only takes a slot no analyst is waiting for).
+    #[tokio::test]
+    async fn agents_never_take_the_analyst_slots_or_queue_ahead_of_one() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(7));
+        let gate = Arc::new(tokio::sync::Semaphore::new(yielding_permits(7)));
+        let wait = Duration::from_millis(100);
+        let mut agents = Vec::new();
+        for _ in 0..5 {
+            agents.push(admit_yielding(&gate, &slots, wait).await.unwrap());
+        }
+        assert_eq!(admit_yielding(&gate, &slots, Duration::from_millis(30)).await.err(), Some(YieldingRefusal::Busy), "a sixth agent waits");
+        let analysts = (0..2).map(|_| slots.clone().try_acquire_owned()).collect::<Vec<_>>();
+        assert!(analysts.iter().all(Result::is_ok), "both analyst slots are free at once");
+        // Every slot busy: an analyst queues, then an agent queues behind it.
+        let analyst = tokio::spawn({
+            let slots = slots.clone();
+            async move { slots.acquire_owned().await.unwrap() }
+        });
+        tokio::task::yield_now().await;
+        let finished = agents.pop().unwrap();
+        let agent = tokio::spawn({
+            let (gate, slots) = (gate.clone(), slots.clone());
+            async move { admit_yielding(&gate, &slots, Duration::from_millis(200)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(finished);
+        let analyst_slot = tokio::time::timeout(wait, analyst).await.expect("the analyst is admitted").unwrap();
+        assert_eq!(agent.await.unwrap().err(), Some(YieldingRefusal::Busy), "the agent never took the analyst's slot");
+        drop((analyst_slot, analysts, agents));
+        assert!(admit_yielding(&gate, &slots, wait).await.is_ok(), "slots and gate are returned");
     }
 
     #[tokio::test]

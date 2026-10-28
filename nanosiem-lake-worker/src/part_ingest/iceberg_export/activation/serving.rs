@@ -34,6 +34,11 @@ pub(super) trait ServingFactory: Send + Sync {
     /// NAN-4615: serving epochs (dataset names, `events_<32 hex>`) the remote
     /// catalog still holds. Survives the cell roll that wipes local state.
     async fn list_epochs(&self) -> Result<BTreeSet<String>>;
+    /// NAN-4774: ask the platform to confirm `table` (`agent.events_<hex>_v1`)
+    /// as this installation's registered serving name with no open privacy
+    /// fence and custody attached, and to mark custody converged on it. An
+    /// error (any refusal, or a platform without the op) means "not adopted".
+    async fn adopt(&self, table: &str) -> Result<()>;
     /// NAN-4614: a fresh epoch holding exactly `live` was published; target
     /// bookkeeping about files outside it may go.
     fn retain_verified(&self, _live: &[PartRef]) -> Result<()> {
@@ -166,6 +171,70 @@ impl FreshServingBackend {
         state.retired.extend(unknown);
         self.save(state.clone())?;
         Ok(state)
+    }
+    /// NAN-4774: the roll's A/B claim swap leaves this writer with no serving
+    /// state while the catalog and the platform still hold the epoch it
+    /// published. Adopt it as the active epoch only with proof that it is
+    /// exactly what a fresh epoch would be:
+    /// - the same export checkpoint (watermark) as the master, under the
+    ///   current schema contract (`export_head` validates the table);
+    /// - the same referenced parts as the master in every retained snapshot
+    ///   (the predicate every publish and every sync already enforces). An
+    ///   active epoch only ever receives add-only deltas (every removal takes
+    ///   the privacy fence and a fresh name), so equality also proves that no
+    ///   part it ever served has since been erased or merged away;
+    /// - the platform confirms it as the sole registered serving name of this
+    ///   installation (active custody, no open privacy fence).
+    /// Any other listed epoch requires a privacy pass too: the platform
+    /// broker refuses epoch retirement without an open privacy fence. Without
+    /// full proof the writer falls back to today's privacy pass and fresh build.
+    async fn adopt_serving_epoch(&self) -> Result<bool> {
+        let state = self.state();
+        if state.active.is_some() || state.pending.is_some() || !state.retired.is_empty() {
+            return Ok(false);
+        }
+        let listed = self.factory.list_epochs().await?;
+        if listed.len() != 1 {
+            return Ok(false);
+        }
+        let Some(checkpoint) = self.master.export_head(false).await?.checkpoint else {
+            return Ok(false);
+        };
+        let master = self.master.expire_and_inspect().await?;
+        for name in &listed {
+            let serving = self.factory.build(name)?;
+            let head = match serving.export_head(false).await {
+                Ok(head) => head,
+                Err(error) => {
+                    tracing::info!(epoch = %name, error = %format!("{error:#}"), "serving epoch not adoptable (contract)");
+                    continue;
+                }
+            };
+            if head.checkpoint != Some(checkpoint) {
+                tracing::info!(epoch = %name, epoch_checkpoint = ?head.checkpoint, checkpoint,
+                    "serving epoch not adoptable (watermark differs from the master)");
+                continue;
+            }
+            if serving.expire_and_inspect().await? != master {
+                tracing::info!(epoch = %name, "serving epoch not adoptable (parts differ from the master)");
+                continue;
+            }
+            if let Err(error) = self.factory.adopt(&format!("agent.{name}_v1")).await {
+                tracing::info!(epoch = %name, error = %format!("{error:#}"), "serving epoch not adoptable (platform refused)");
+                continue;
+            }
+            tracing::warn!(epoch = %name, checkpoint, parts = master.len(),
+                "adopted the published serving epoch after a wiped writer volume");
+            self.save(State {
+                active: Some(name.clone()),
+                pending: None,
+                retired: listed.iter().filter(|n| *n != name).cloned().collect(),
+                last_plan_ms: checkpoint,
+                probe_hour: None,
+            })?;
+            return Ok(true);
+        }
+        Ok(false)
     }
     /// NAN-4627: a roll wipes `probe_hour` too. With no sealed live part the
     /// lake has nothing to probe, and the master has already committed that
@@ -438,6 +507,9 @@ impl CatalogLifecycleBackend for FreshServingBackend {
     }
     async fn reopen(&self) -> Result<()> {
         self.factory.reopen().await
+    }
+    async fn adopt_serving(&self) -> Result<bool> {
+        self.adopt_serving_epoch().await
     }
 }
 

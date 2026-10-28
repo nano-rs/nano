@@ -9,6 +9,7 @@
 //!   pre-built provider that stays native — see
 //!   `project_ipinfo_lite_stays_native` for the volume + schema
 //!   rationale)
+//! - `platform_feeds` — self-hosted platform feed freshness (NAN-4759)
 //! - `agent` — generic agent enrichment lookup runtime (Deno providers)
 //!
 //! NAN-1111 sunset the per-provider ThreatFox and TOR Exit Nodes
@@ -23,12 +24,14 @@
 #[cfg(feature = "enterprise")]
 mod agent;
 mod ipinfo;
+mod platform_feeds;
 mod sources;
 mod types;
 
 #[cfg(feature = "enterprise")]
 pub use agent::*;
 pub use ipinfo::*;
+pub use platform_feeds::*;
 pub use sources::*;
 pub use types::*;
 
@@ -150,6 +153,7 @@ impl utoipa::OpenApi for EnrichmentApiDoc {
                 configure_auto_sync,
                 get_enrichment_stats,
                 lookup_ip,
+                get_platform_feeds,
             ),
             components(schemas(
                 EnrichmentSourcesResponse,
@@ -161,6 +165,9 @@ impl utoipa::OpenApi for EnrichmentApiDoc {
                 IpLookupResponse,
                 AutoSyncConfigRequest,
                 AutoSyncConfigResponse,
+                nanosiem_core::platform_enrichment::self_hosted::FeedsStatus,
+                nanosiem_core::platform_enrichment::self_hosted::FeedStatus,
+                nanosiem_core::platform_enrichment::self_hosted::FeedState,
             ))
         )]
         struct ApiDoc;

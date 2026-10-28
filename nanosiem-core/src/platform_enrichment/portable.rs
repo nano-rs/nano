@@ -68,7 +68,7 @@ const DOMAIN: &[u8] = b"nano/feed-bundle/descriptor/v1\0";
 const MAX_DESCRIPTOR_BYTES: u64 = 64 * 1024;
 /// Same bound the cell applies to a NANPFB01 file.
 pub const MAX_PAYLOAD_BYTES: u64 = 512 * 1024 * 1024;
-const NANPFB_MAGIC: &[u8; 8] = b"NANPFB01";
+use super::nanpfb::MAGIC as NANPFB_MAGIC;
 const NANPFB_MAX_HEADER: usize = 16_384;
 
 /// Production verification keys: `(key id, Ed25519 public key hex)`. The
@@ -543,21 +543,6 @@ fn hash_stream(mut reader: impl Read, cap: u64) -> Result<(String, u64)> {
     Ok((hex::encode(hasher.finalize()), total))
 }
 
-/// Mirror of the cell's NANPFB01 header (`lean_platform_bundle::Header`).
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PayloadHeader {
-    mmdb_len: u64,
-    ioc_len: u64,
-    #[serde(default)]
-    prefix_len: u64,
-    #[serde(default)]
-    prefix_rows: u64,
-    feed_revisions: BTreeMap<String, i64>,
-    #[serde(default)]
-    feed_valid_until: BTreeMap<String, DateTime<Utc>>,
-}
-
 /// The NANPFB01 header must state exactly the signed feed set, revisions and
 /// expiries, carry no prefix (premium) section, and account for every byte.
 fn check_payload_header(prefix: &[u8], d: &Descriptor) -> Result<()> {
@@ -569,7 +554,7 @@ fn check_payload_header(prefix: &[u8], d: &Descriptor) -> Result<()> {
     if len == 0 || len > NANPFB_MAX_HEADER || prefix.len() < 16 + len {
         return Err(bad("payload header length"));
     }
-    let h: PayloadHeader =
+    let h: super::nanpfb::Header =
         serde_json::from_slice(&prefix[16..16 + len]).map_err(|_| bad("payload header"))?;
     let revisions: BTreeMap<&str, i64> = d
         .feeds
@@ -602,8 +587,8 @@ fn check_payload_header(prefix: &[u8], d: &Descriptor) -> Result<()> {
         return Err(bad("ipinfo section"));
     }
     let total = (16 + len as u64)
-        .checked_add(h.mmdb_len)
-        .and_then(|t| t.checked_add(h.ioc_len));
+        .checked_add(h.mmdb_len as u64)
+        .and_then(|t| t.checked_add(h.ioc_len as u64));
     if total != Some(d.payload.bytes) {
         return Err(bad("payload length"));
     }

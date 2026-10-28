@@ -134,35 +134,8 @@ struct IocSnapshotRow {
     last_seen_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct IocSnapshotInput {
-    pub ioc_value: String,
-    pub ioc_type: String,
-    pub source_id: String,
-    #[serde(default)]
-    pub enrichment_name: String,
-    #[serde(default = "default_true")]
-    pub is_ioc: bool,
-    #[serde(default)]
-    pub threat_type: String,
-    #[serde(default)]
-    pub malware: String,
-    #[serde(default)]
-    pub confidence_level: i32,
-    #[serde(default)]
-    pub risk_score: Option<i32>,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub data: Value,
-    #[serde(default)]
-    pub published_at_ms: i64,
-    #[serde(default)]
-    pub first_seen_at: Option<String>,
-    #[serde(default)]
-    pub last_seen_at: Option<String>,
-}
+/// Moved to `nanosiem-core` with the NANPFB01 writer (NAN-4759).
+pub use nanosiem_core::platform_enrichment::nanpfb::IocSnapshotInput;
 
 /// Bounded source record returned to product features that need to enumerate a
 /// feed (interactive `| retro feed=...` and scheduled retro-hunt candidates).
@@ -178,26 +151,6 @@ pub struct IocSourceRecord {
     pub published_at_ms: i64,
 }
 
-impl Default for IocSnapshotInput {
-    fn default() -> Self {
-        Self {
-            ioc_value: String::new(),
-            ioc_type: String::new(),
-            source_id: String::new(),
-            enrichment_name: String::new(),
-            is_ioc: true,
-            threat_type: String::new(),
-            malware: String::new(),
-            confidence_level: 0,
-            risk_score: None,
-            tags: Vec::new(),
-            data: Value::Null,
-            published_at_ms: 0,
-            first_seen_at: None,
-            last_seen_at: None,
-        }
-    }
-}
 
 /// Write one deterministic immutable IOC serving snapshot. Callers publish the
 /// returned digest as the version and must never mutate the resulting file in

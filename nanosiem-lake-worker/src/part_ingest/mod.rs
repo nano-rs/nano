@@ -28,6 +28,7 @@ pub mod ingest;
 pub mod maintenance;
 pub mod memory;
 pub mod merge;
+pub mod merge_attempts;
 pub(crate) mod merge_lanes;
 pub(crate) mod merge_quota;
 pub mod part_gc_cell;

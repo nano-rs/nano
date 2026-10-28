@@ -208,7 +208,7 @@ where
         if batch.num_rows() == 0 {
             continue;
         }
-        super::merge_quota::charge(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch));
+        super::merge_quota::charge_checked(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch))?;
         let assigned = bucket_of(&batch)?;
         let mut rows: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
         for (row, bucket) in assigned.into_iter().enumerate() {
@@ -244,10 +244,17 @@ where
     S: FnMut(&RecordBatch) -> Result<()>,
 {
     use arrow_ord::sort::{lexsort_to_indices, SortColumn};
-    let batches = read_stream(path)?.collect::<Result<Vec<_>>>()?;
-    for batch in &batches {
-        super::merge_quota::charge(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch));
+    let mut batches = Vec::new();
+    let mut bytes = 0_u64;
+    for batch in read_stream(path)? {
+        let batch = batch?;
+        super::merge_quota::charge_checked(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch))?;
+        bytes = bytes.saturating_add(super::merge_quota::batch_bytes(&batch));
+        batches.push(batch);
     }
+    // Check while collecting, and reserve the whole concatenated bucket's
+    // copies before concat/sort. A check after collect cannot stop its peak.
+    super::merge_quota::memory_guard_bytes(bytes)?;
     let batch = arrow_select::concat::concat_batches(schema, &batches)?;
     drop(batches);
     if batch.num_rows() == 0 {
@@ -294,7 +301,7 @@ where
             // One host: the input order, `(time, uid)`, is already the sort order.
             for batch in read_stream(&path)? {
                 let batch = batch?;
-                super::merge_quota::charge(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch));
+                super::merge_quota::charge_checked(batch.num_rows() as u64, super::merge_quota::batch_bytes(&batch))?;
                 sink(&batch)?;
             }
         } else {
@@ -376,6 +383,30 @@ mod native;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_guard_stops_a_sort_bucket_before_collecting_the_remaining_stream() {
+        use super::super::merge_quota::{is_memory_pressure, memory_guard_scope, MEMORY_PROBE_FOR_TEST};
+        fn full() -> Option<(u64, u64)> { Some((99, 100)) }
+        let batch = RecordBatch::try_from_iter([("time", std::sync::Arc::new(arrow_array::Int64Array::from(vec![1_i64])) as ArrayRef)]).unwrap();
+        let mut ipc = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc, &batch.schema()).unwrap();
+            writer.write(&batch).unwrap();
+            // No end marker: the next message below is deliberately invalid.
+        }
+        ipc.extend_from_slice(&[0xff; 8]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bucket.arrow");
+        std::fs::write(&path, ipc).unwrap();
+        MEMORY_PROBE_FOR_TEST.set(Some(full));
+        let result = {
+            let _scope = memory_guard_scope();
+            sort_bucket(&path, &batch.schema(), |_| panic!("must stop before sorting"), &mut |_| panic!("must not emit"))
+        };
+        MEMORY_PROBE_FOR_TEST.set(None);
+        assert!(is_memory_pressure(&result.unwrap_err()), "stop at the first batch, before reading the invalid tail");
+    }
 
     #[test]
     fn switch_is_default_off_and_bounded() {

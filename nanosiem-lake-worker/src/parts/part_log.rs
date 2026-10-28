@@ -1086,6 +1086,29 @@ impl LocalObjectStore {
         Ok(self.root.join(key))
     }
 
+    /// NAN-4766: where [`ObjectStore::list`] starts its walk: the deepest
+    /// directory the prefix names, so listing one part directory (or the GC
+    /// tombstones) no longer walks the tenant's whole store. Every key under
+    /// `prefix` lives below it; the walk still filters by `prefix`. Falls
+    /// back to the root for a prefix with no valid directory, and for one
+    /// whose directory path crosses a symlink (the root walk never followed
+    /// symlinked directories, so neither does this).
+    fn list_base(&self, prefix: &str) -> PathBuf {
+        let Some((dir, _)) = prefix.rsplit_once('/') else { return self.root.clone() };
+        let Ok(base) = self.path(dir) else { return self.root.clone() };
+        let mut current = self.root.clone();
+        for component in Path::new(dir).components() {
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(meta) if meta.file_type().is_dir() => {}
+                // Absent: nothing under the prefix (the walk lists nothing).
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return base,
+                _ => return self.root.clone(),
+            }
+        }
+        base
+    }
+
     fn temp_path(&self, path: &Path) -> PathBuf {
         let name = format!(".tmp-{}", uuid::Uuid::new_v4().simple());
         path.with_file_name(name)
@@ -1242,7 +1265,7 @@ impl ObjectStore for LocalObjectStore {
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let mut keys = Vec::new();
-        let mut stack = vec![self.root.clone()];
+        let mut stack = vec![self.list_base(prefix)];
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
                 Ok(entries) => entries,
@@ -1882,6 +1905,68 @@ mod tests {
     use super::*;
     use crate::parts::provenance::tests::TENANT;
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+    #[tokio::test]
+    async fn local_listing_preserves_partial_prefixes_and_missing_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(dir.path()).unwrap();
+        for key in ["parts/one/data", "parts/one/partials/rollup", "parts/one-more/data",
+            "parts/one.json", "parts/one/.tmp-hidden", "other/data"] {
+            store.put(key, b"x").await.unwrap();
+        }
+        let cases: &[(&str, &[&str])] = &[
+            ("", &["other/data", "parts/one-more/data", "parts/one.json", "parts/one/data", "parts/one/partials/rollup"]),
+            ("parts/one", &["parts/one-more/data", "parts/one.json", "parts/one/data", "parts/one/partials/rollup"]),
+            ("parts/one/", &["parts/one/data", "parts/one/partials/rollup"]),
+            ("parts/one/d", &["parts/one/data"]),
+            ("parts/one/partials/", &["parts/one/partials/rollup"]),
+            ("parts/missing/", &[]),
+            ("parts/one/data/", &[]),
+        ];
+        for (prefix, expected) in cases {
+            assert_eq!(store.list(prefix).await.unwrap(), *expected, "prefix={prefix:?}");
+        }
+        // An unrelated unreadable tree must not be walked by a scoped
+        // listing. This also detects a regression to whole-store traversal.
+        use std::os::unix::fs::PermissionsExt;
+        let unrelated = dir.path().join("unreadable");
+        std::fs::create_dir(&unrelated).unwrap();
+        std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0)).unwrap();
+        // Root can read mode-000 directories; exercise the refusal where
+        // filesystem permissions are enforced for this test process.
+        let refused = std::fs::read_dir(&unrelated).is_err();
+        let scoped = store.list("parts/one/").await;
+        let whole = store.list("").await;
+        std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(scoped.unwrap(), ["parts/one/data", "parts/one/partials/rollup"]);
+        if refused {
+            assert!(whole.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn local_listing_never_descends_through_symlinked_directories() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(dir.path()).unwrap();
+        std::fs::write(outside.path().join("data"), b"outside").unwrap();
+        store.put("parts/plain/data", b"inside").await.unwrap();
+        symlink(outside.path(), dir.path().join("linked")).unwrap();
+        symlink(outside.path(), dir.path().join("parts/linked")).unwrap();
+        symlink(outside.path().join("data"), dir.path().join("parts/file")).unwrap();
+        symlink(dir.path(), dir.path().join("parts/cycle")).unwrap();
+
+        for prefix in ["linked/", "linked/missing/", "parts/linked/", "parts/cycle/"] {
+            assert!(store.list(prefix).await.unwrap().is_empty(), "prefix={prefix}");
+        }
+        // Symlinks themselves stay visible to callers that reject them.
+        assert_eq!(store.list("linked").await.unwrap(), ["linked"]);
+        assert_eq!(store.list("parts/").await.unwrap(),
+            ["parts/cycle", "parts/file", "parts/linked", "parts/plain/data"]);
+        assert_eq!(std::fs::read(outside.path().join("data")).unwrap(), b"outside");
+    }
 
     #[tokio::test]
     async fn setgid_root_shares_tenant_and_detect_leaves_but_not_log() {

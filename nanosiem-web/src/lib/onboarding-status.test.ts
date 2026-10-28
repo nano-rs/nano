@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { describe, expect, it } from 'vitest';
-import { overlayLogSourceStatus } from './onboarding-status';
+import {
+  countTeamMembers,
+  isOrgContextConfigured,
+  overlayLogSourceStatus,
+  resolveHostedChecklistStatus,
+} from './onboarding-status';
 import type { OnboardingStatus } from '@/lib/api/onboarding';
 
 const base: OnboardingStatus = {
@@ -31,5 +36,46 @@ describe('overlayLogSourceStatus', () => {
       .toMatchObject({ has_log_sources: true, has_parsers: true });
     expect(overlayLogSourceStatus(base, [{ deployed: false, parser_vrl: '  ' }]))
       .toMatchObject({ has_log_sources: true, has_parsers: false });
+  });
+});
+
+describe('isOrgContextConfigured (NAN-4779)', () => {
+  const empty = {
+    organization_name: null, industry: null, environment: null,
+    attack_vectors: null, compliance_frameworks: [], custom_context: null,
+  };
+  it('is false for no context or only blank fields', () => {
+    expect(isOrgContextConfigured(undefined)).toBe(false);
+    expect(isOrgContextConfigured(empty)).toBe(false);
+    expect(isOrgContextConfigured({ ...empty, organization_name: '   ' })).toBe(false);
+  });
+  it('is true for any saved guidance field, not only the name', () => {
+    expect(isOrgContextConfigured({ ...empty, organization_name: 'Acme' })).toBe(true);
+    expect(isOrgContextConfigured({ ...empty, custom_context: 'We run Okta' })).toBe(true);
+    expect(isOrgContextConfigured({ ...empty, compliance_frameworks: ['HIPAA'] })).toBe(true);
+  });
+});
+
+describe('countTeamMembers (NAN-4779)', () => {
+  it('counts active dedicated users', () => {
+    expect(countTeamMembers([{ status: 'active' }, { status: 'disabled' }, { status: 'active' }])).toBe(2);
+  });
+  it('counts active memberships and pending invitations on hosted-shared', () => {
+    expect(
+      countTeamMembers([
+        { status: 'active', membership_status: 'active', invitation_state: 'consumed' },
+        { status: 'active', membership_status: 'suspended', invitation_state: 'pending' },
+        { status: 'active', membership_status: 'suspended', invitation_state: 'expired' },
+      ]),
+    ).toBe(2);
+  });
+});
+
+describe('resolveHostedChecklistStatus (NAN-4779)', () => {
+  it('only ever turns steps on', () => {
+    const done = { ...base, has_org_context: true, has_users: true };
+    expect(resolveHostedChecklistStatus(done, {})).toMatchObject({ has_org_context: true, has_users: true });
+    expect(resolveHostedChecklistStatus(base, {})).toMatchObject({ has_org_context: false, has_users: false });
+    expect(resolveHostedChecklistStatus(undefined, { users: [] })).toBeUndefined();
   });
 });

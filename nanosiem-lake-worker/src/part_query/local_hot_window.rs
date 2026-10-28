@@ -2055,6 +2055,107 @@ mod tests {
         assert!(accountant.stats().walks >= 1);
     }
 
+    /// NAN-4777 (a hosted tenant, 10-28): the cell's accountant charged the data
+    /// volume to the persistent A/B hot volume. That was 34.7 GB: the producer
+    /// warm-on-write tier, ingest and the agent-catalog export. The window
+    /// target fell to 4-18 GB against the ~47 GB that 168 h needs. Every pass
+    /// ended "deferred download" on "saturated by leased or protected
+    /// objects", and covered_hours fell from 47 h to 14-26 h.
+    ///
+    /// Production path: the supervisor's accountant constructor, its socket
+    /// and walker, the hot-window capacity and the reader-cache fence, and a
+    /// real hydration pass. The data volume is half the hot target (a
+    /// sparse file).
+    /// - Charged to the hot volume (the bug, and still correct when both
+    ///   share one filesystem), the window is starved.
+    /// - On its own filesystem, the window fills, converges with nothing
+    ///   deferred, and stays put while the data volume keeps growing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn data_volume_bytes_never_starve_the_hot_window() {
+        async fn window(data_apart: bool) -> (crate::local_hot_window::Coverage, crate::local_hot_window::Coverage, crate::local_hot_window::Coverage) {
+            let root = tempfile::tempdir().unwrap();
+            let (store, source, signer, live) = slow_fixture(root.path(), 48, 512 * 1024).await;
+            let volume = 16_u64 << 20;
+            // Production layout: <hot>/tenants/<T>/query/cache, the accountant
+            // bound at <hot> (NANO_LAKE_LOCAL_HOT_WINDOW_DIR).
+            let (hot, data) = (root.path().join("hot"), root.path().join("data"));
+            let cache_root = hot.join("tenants").join(TENANT).join("query/cache");
+            std::fs::create_dir_all(&cache_root).unwrap();
+            std::fs::create_dir_all(data.join("tenants").join(TENANT).join("parts/reader-objects")).unwrap();
+            let producer_tier = data.join("tenants").join(TENANT).join("parts/reader-objects/tier.bin");
+            std::fs::File::create(&producer_tier).unwrap().set_len(volume / 2).unwrap();
+            let device = {
+                let data = data.clone();
+                move |path: &std::path::Path| Some(if data_apart && path.starts_with(&data) { 2 } else { 1 })
+            };
+            let _accountant = nanosiem_lake_cell::volume_usage::start_hot_window_accountant_with(
+                hot.clone(),
+                vec![data.clone()],
+                nanosiem_lake_cell::volume_usage::AccountantConfig {
+                    // A slow walk must not age out into the statvfs fallback.
+                    max_age: Duration::from_secs(60),
+                    ..nanosiem_lake_cell::volume_usage::AccountantConfig::every(Duration::from_millis(50)).with_target(volume)
+                },
+                device,
+            )
+            .unwrap();
+            let cache = ReaderObjectCache::open(
+                ReaderObjectCacheSettings {
+                    root: cache_root.clone(),
+                    max_bytes: volume,
+                    query_max_bytes: 1 << 20,
+                    fetch_concurrency: 8,
+                    fetch_deadline: Duration::from_secs(5),
+                },
+                TENANT,
+                "lab",
+                &parts_key_prefix(TENANT).unwrap(),
+                Arc::new(StoreObjectSource::local("lab", store.clone(), source.clone())),
+            )
+            .unwrap();
+            let settings = crate::local_hot_window::Settings {
+                root: cache_root.clone(),
+                hours: 48,
+                bytes_per_second: 1 << 30,
+                reserve_bytes: Some(0),
+                max_bytes: volume,
+                schedule: crate::local_hot_window::Schedule { concurrency: 4, ..Default::default() },
+                persistent: true,
+            };
+            cache.set_hot_capacity(settings.clone());
+            let fetcher = PartFetcher::new(TENANT, "lab", store.clone(), signer.trusted(), cache)
+                .unwrap()
+                .with_hot_window(Some(settings));
+            let pass = || async {
+                hydrate(&fetcher, TENANT, live.clone(), &AtomicU64::new(0), Instant::now()).await.unwrap();
+                fetcher.hot_coverage.lock().unwrap().clone()
+            };
+            let first = pass().await;
+            let second = pass().await;
+            // The data volume keeps growing (warm-on-write, merges, the
+            // agent-catalog export): the walker sees it before the next pass.
+            std::fs::File::create(&producer_tier).unwrap().set_len(volume).unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let third = pass().await;
+            (first, second, third)
+        }
+
+        let (starved, _, _) = window(false).await;
+        let (first, second, third) = window(true).await;
+        assert!(first.selected_parts > 4, "the window fills: {first:?}");
+        assert!(
+            starved.selected_bytes * 2 <= first.selected_bytes,
+            "repro: data-volume bytes charged to the hot volume starve the window ({} vs {} bytes)",
+            starved.selected_bytes,
+            first.selected_bytes
+        );
+        assert!(first.warm && first.deferred_objects == 0, "{first:?}");
+        for again in [&second, &third] {
+            assert_eq!((again.cache_miss_objects, again.deferred_objects), (0, 0), "converged: {again:?}");
+            assert_eq!(again.selected_parts, first.selected_parts, "the window holds while the data volume grows");
+        }
+    }
+
     /// NAN-3180: one hourly part with a data file, its token index, and the
     /// rollup and entity-ranges partials.
     async fn rollup_part(

@@ -12,6 +12,33 @@ import type {
   AsyncSyncResponse,
 } from './types';
 
+/** NAN-4759: freshness of one installed platform feed (GET /api/enrichment/platform-feeds). */
+export type PlatformFeedState = 'fresh' | 'stale' | 'expired';
+export interface PlatformFeedStatus {
+  feed_id: string;
+  name: string;
+  revision: number;
+  produced_at: string | null;
+  hard_expiry: string;
+  age_seconds: number | null;
+  state: PlatformFeedState;
+  license_id: string | null;
+  terms_revision: string | null;
+  records: number | null;
+}
+export interface PlatformFeedsStatus {
+  /** This deployment keeps a local feed bundle (self-hosted lean). */
+  available: boolean;
+  /** A real feed bundle (not the empty placeholder) is installed. */
+  installed: boolean;
+  bundle_sha256: string | null;
+  source: string | null;
+  installed_at: string | null;
+  stale_after_days: number;
+  feeds: PlatformFeedStatus[];
+  notice: string | null;
+}
+
 /** Result of starting an async sync operation */
 export interface SyncStartResult {
   /** Whether this was a new sync (202) or already in progress (409) */
@@ -93,6 +120,11 @@ export class EnrichmentApi {
   }
 
   // Basic Enrichment Sources
+
+  /** NAN-4759: self-hosted platform feed bundle and per-feed freshness. */
+  async getPlatformFeeds(): Promise<PlatformFeedsStatus> {
+    return this.request<PlatformFeedsStatus>('/api/enrichment/platform-feeds');
+  }
 
   async listEnrichmentSources(): Promise<EnrichmentSource[]> {
     const response = await this.request<{ sources: EnrichmentSource[] }>('/api/enrichment/sources');

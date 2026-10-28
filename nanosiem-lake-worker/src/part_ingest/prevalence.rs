@@ -116,6 +116,21 @@ async fn measure_state_bytes(store: &Arc<dyn ObjectStore>) -> Result<u64> {
     }
     Ok(bytes)
 }
+
+/// Only remove our cache below real directories in the tenant-private work
+/// root. `remove_dir_all` does not follow the cache itself or nested symlinks,
+/// but would follow a symlink in a parent. IngestService holds its appender
+/// lock throughout open/close; nothing concurrently renames these parents.
+fn remove_stale_local_cache(work_dir: &Path, tenant_id: &str) -> Result<()> {
+    let prevalence = work_dir.join("prevalence");
+    let tenant = prevalence.join(tenant_id);
+    for parent in [&prevalence, &tenant] {
+        ensure!(std::fs::symlink_metadata(parent)?.is_dir(),
+            "refusing prevalence cache cleanup through a non-directory or symlink: {}", parent.display());
+    }
+    std::fs::remove_dir_all(tenant.join("object-cache"))?;
+    Ok(())
+}
 /// Nominal analytical budget; production adapts between 16 and 128 lanes.
 #[cfg(test)]
 const RESTAMP_READS: usize = 64;
@@ -1242,7 +1257,7 @@ impl IngestPrevalence {
     /// the production open: `spawn_prevalence_open`). A remote state (a
     /// grant, or `reads`) sizes its disk cache from the state's measured
     /// SSTs within `cache_cap_bytes` ([`object_cache_bytes`]); a state on the
-    /// local filesystem keeps the floor (it is already local).
+    /// local filesystem has no disk cache (it is already local, NAN-4765).
     ///
     /// NAN-4723: a state on the local filesystem (compacted in-process) is
     /// sized by `local_sizing`, the ingest role's placement
@@ -1264,7 +1279,6 @@ impl IngestPrevalence {
             .join("prevalence")
             .join(tenant_id)
             .join("object-cache");
-        std::fs::create_dir_all(&cache)?;
         // NAN-3781: only the state this process keeps on its own disk is
         // compacted in-process; a granted state is compacted by
         // `maintenance[T]` (the owner refuses `compactions/*` from ingest).
@@ -1301,9 +1315,33 @@ impl IngestPrevalence {
         // NAN-4592: only a remote state's reads cost R2 GETs. The cache
         // directory is this tenant's own (`prevalence/<tenant>/object-cache`)
         // and every SST path is under the tenant's prefix: nothing is shared.
+        //
+        // NAN-4765: a state on the local filesystem gets no disk cache. Its
+        // SSTs are already on this disk (and in the page cache); a disk
+        // cache in front of them only copied them. Every block miss read
+        // the whole 4 MiB cache part holding it, and wrote that part a
+        // second time under `object-cache/`. Every flush and compaction
+        // output was written twice, and the evictor deleted parts as fast
+        // as they landed. The NAN-4689 v3 soak (12.5k eps, a 9.7 GB local
+        // state after 1 h against the 256 MiB cache) read 81 GB of state
+        // parts in that hour, and the rate rose with the state: about 3
+        // MB/s at minute 5, then 37 MB/s at minute 55. Host io full60
+        // reached 35% and the SlateDB "evictor queue full" warnings ran
+        // into the thousands per 30 s. Commit eps fell from 12.5k to 7.4k
+        // and stayed there after the hour roll had emptied the uid window.
+        // Without the cache, a point read fetches only its block.
         let (measured, cache_bytes) = if embedded_compaction.is_some() {
-            (None, OBJECT_CACHE_FLOOR_BYTES.min(cache_cap_bytes))
+            // An earlier version's cache is dead weight (up to the 256 MiB
+            // floor) and is never read again.
+            match remove_stale_local_cache(work_dir, tenant_id) {
+                Ok(()) => tracing::info!(tenant = %tenant_id, "removed the unused disk cache of a local prevalence state"),
+                Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {}
+                Err(error) => tracing::warn!(tenant = %tenant_id, error = %error,
+                    "could not remove the unused disk cache of a local prevalence state"),
+            }
+            (None, 0)
         } else {
+            std::fs::create_dir_all(&cache)?;
             let measured = match measure_state_bytes(&store).await {
                 Ok(bytes) => Some(bytes),
                 Err(error) => {
@@ -1318,7 +1356,8 @@ impl IngestPrevalence {
             (measured, bytes)
         };
         let local_root = work_dir.join("prevalence").join(tenant_id);
-        let mut state = Self::open_store(tenant_id, store, "db", Some((&cache, cache_bytes)), access.is_some(),
+        let cache_dir = embedded_compaction.is_none().then_some((cache.as_path(), cache_bytes));
+        let mut state = Self::open_store(tenant_id, store, "db", cache_dir, access.is_some(),
             Some(local_root), embedded_compaction)
             .await?;
         state.owner = owner_store;

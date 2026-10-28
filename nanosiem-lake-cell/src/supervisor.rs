@@ -1885,7 +1885,9 @@ impl Supervisor {
         if local_hot_window_enabled() {
             let root = std::env::var_os("NANO_LAKE_LOCAL_HOT_WINDOW_DIR")
                 .map(PathBuf::from).unwrap_or_else(|| self.cfg.data_dir.clone());
-            match crate::volume_usage::start(root.clone(), vec![self.cfg.data_dir.clone(), root]) {
+            // NAN-4777: only roots on the hot root's filesystem are charged
+            // to the hot window (the A/B hot PVC is not the data volume).
+            match crate::volume_usage::start_hot_window_accountant(root, vec![self.cfg.data_dir.clone()]) {
                 Ok(accountant) => { let _ = self.volume_accountant.set(accountant); }
                 Err(error) => tracing::error!(%error,
                     "hot-window volume accountant unavailable; query caches fall back to statvfs headroom"),
