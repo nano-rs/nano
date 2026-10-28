@@ -192,6 +192,27 @@ pub const FLUSH_MAX_ROWS: usize = nanosiem_lake_cell::contract::IngestFlush::MAX
 /// Maximum L0 inputs per minute job (72k rows at the default 300-eps flush).
 pub const MAX_MINUTE_MERGE_INPUTS: usize = 24;
 
+/// NAN-4674: live parts in one event hour from which that hour counts as
+/// fragmented. A healthy sealed hour holds about 30-35 (one M part per
+/// minute merge of the open hour plus a few L0s at 10 s flushes), so this
+/// never triggers on live data; a backfill whose objects each span many
+/// hours adds a part to every hour on every flush and reaches it. A
+/// fragmented sealed hour merges into `h` without waiting to settle (see
+/// [`plan_merges_with`]), and the background scheduler runs one such merge
+/// even while ingest catches up. The per-hour part count is exported
+/// (`max_parts_per_hour`) and alerts past twice this bound.
+pub const FRAGMENTED_HOUR_PARTS: usize = 64;
+
+/// NAN-4674: an hour holding `parts` live parts is fragmented.
+pub fn hour_is_fragmented(parts: usize) -> bool {
+    parts >= FRAGMENTED_HOUR_PARTS
+}
+
+/// NAN-4674: a planned merge that consolidates a fragmented hour into `h`.
+pub fn is_fragmented_hour_merge(merge: &PlannedMerge) -> bool {
+    merge.output_level == Level::Hour && hour_is_fragmented(merge.inputs.len())
+}
+
 /// One merge the planner decided is due.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedMerge {
@@ -211,7 +232,8 @@ pub struct PlannedMerge {
 /// - H: a sealed hour with any L0/M part, or with more than one H part; all
 ///   of the hour's L0/M/H parts merge, once the L0/M parts have settled
 ///   (newest older than `sealed_remerge_debounce_ms`, or oldest older than
-///   `sealed_remerge_max_defer_ms`); until then its L0s merge into M.
+///   `sealed_remerge_max_defer_ms`); until then its L0s merge into M. A
+///   fragmented hour ([`FRAGMENTED_HOUR_PARTS`] live parts) merges at once.
 /// - D: a sealed day whose every non-empty hour is exactly one H part (no
 ///   L0/M), plus at most one prior D; all merge. Empty hours are fine.
 ///   Late data for a day that already has a D part produces H parts that
@@ -332,8 +354,12 @@ fn plan_merges_uncapped(live: &[PartRef], now_ms: i64, policy: &MergePolicy, his
         // unless the hour is quiet and an `h` merge can start (NAN-3187):
         // then its L0s go straight into the `h` part.
         let direct = history_open && sealed && unmerged_quiet(parts.iter().copied(), now_ms, policy);
-        if sealed && (unmerged > 0 || hour_parts > 1) && settled()
-            && (direct || parts.iter().filter(|p| p.level == Level::L0).count() < policy.minute_min_l0_parts) {
+        // NAN-4674: a fragmented sealed hour (a backfill's) merges into `h`
+        // without waiting to settle: its rewrite is earned by the parts it
+        // removes, and settling never comes while a backfill feeds it.
+        let fragmented = hour_is_fragmented(parts.len());
+        if sealed && (unmerged > 0 || hour_parts > 1) && (settled() || fragmented)
+            && (direct || fragmented || parts.iter().filter(|p| p.level == Level::L0).count() < policy.minute_min_l0_parts) {
             planned.push(PlannedMerge {
                 output_level: Level::Hour,
                 event_hour: *hour,
@@ -817,6 +843,53 @@ mod tests {
         let planned = plan_merges(&live, now, &policy);
         assert_eq!(planned.iter().map(|m| (m.output_level, m.event_hour, m.inputs.len())).collect::<Vec<_>>(),
             vec![(Level::Hour, H, 30), (Level::Hour, H + 1, 30)]);
+    }
+
+    /// NAN-4674: a sealed hour a backfill keeps feeding (newest part fresh,
+    /// oldest inside the defer cap: never settled) merges into `h` once it
+    /// is fragmented, with the hour lane open or closed. Below the bound the
+    /// plan is unchanged: its L0s go to M (lane closed or not).
+    #[test]
+    fn fragmented_sealed_hour_merges_into_h_without_settling() {
+        let policy = MergePolicy::default();
+        let now = hour_ms(H + 30);
+        let mut live = l0s(H, FRAGMENTED_HOUR_PARTS as i64 - 20, now - 1_000);
+        live.extend((0..20).map(|i| part(Level::Minute, H, now - 2_000 - i)));
+        assert_eq!(live.len(), FRAGMENTED_HOUR_PARTS);
+        for open in [true, false] {
+            let planned = plan_merges_with(&live, now, &policy, open);
+            assert_eq!(planned.len(), 1, "{planned:?}");
+            assert!(is_fragmented_hour_merge(&planned[0]));
+            assert_eq!((planned[0].output_level, planned[0].inputs.len()), (Level::Hour, FRAGMENTED_HOUR_PARTS));
+        }
+        // One part fewer: the pre-NAN-4674 plan (L0 → M chunks, no `h`).
+        live.pop();
+        for open in [true, false] {
+            let planned = plan_merges_with(&live, now, &policy, open);
+            assert!(!planned.is_empty() && planned.iter().all(|m| m.output_level == Level::Minute), "{planned:?}");
+            assert!(!planned.iter().any(is_fragmented_hour_merge));
+        }
+        // An unsealed (live) hour is never forced into `h`, whatever its count.
+        let now = hour_ms(H) + 30 * 60_000;
+        let live = l0s(H, 2 * FRAGMENTED_HOUR_PARTS as i64, now - 1_000);
+        let planned = plan_merges_with(&live, now, &policy, true);
+        assert!(!planned.is_empty() && planned.iter().all(|m| m.output_level == Level::Minute), "{planned:?}");
+    }
+
+    /// NAN-4674: a healthy live hour at its seal (~30 M parts + a few L0s at
+    /// 10 s flushes) is below the bound, so its plan is unchanged.
+    #[test]
+    fn a_healthy_sealed_hour_is_not_fragmented() {
+        assert!(!hour_is_fragmented(35));
+        assert!(hour_is_fragmented(FRAGMENTED_HOUR_PARTS));
+        let policy = MergePolicy::default();
+        let now = hour_ms(H + 1) + policy.hour_seal_ms;
+        let mut live = (0..30).map(|i| part(Level::Minute, H, hour_ms(H) + i * 120_000)).collect::<Vec<_>>();
+        live.extend(l0s(H, 4, hour_ms(H + 1) - 1_000));
+        let planned = plan_merges(&live, now, &policy);
+        assert_eq!(planned.len(), 1);
+        assert!(!is_fragmented_hour_merge(&planned[0]), "settled the ordinary way");
+        assert_eq!(planned[0].output_level, Level::Hour);
     }
 
     /// NAN-3701: a lone L0 is not overdue until its hour merge is due.

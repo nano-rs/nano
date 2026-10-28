@@ -44,7 +44,8 @@
 //! A bad file is refused whole and moved aside; an object-store or database
 //! outage leaves the lease to expire and the file is retried; a file that
 //! keeps failing is refused after [`MAX_ATTEMPTS`]. One file never blocks
-//! another.
+//! another: a tick handles up to [`landing_concurrency`] files at once, each
+//! converted on a blocking thread (NAN-4682), every one under its own claim.
 //!
 //! Hosted tenants (NAN-3885 / NAN-4137) run the same conversion in the
 //! `landing[T]` lake-cell child behind two traits: [`Discover`] (here the
@@ -579,14 +580,54 @@ fn normalize_time(row: &mut Value) {
 /// over the fixed bronze row contract: `_nano_bronze_event` Utf8, `time`
 /// Timestamp(µs, UTC), zstd).
 pub fn encode_bronze(rows: &[&BronzeRow]) -> Result<Vec<u8>> {
+    encode_bronze_batch(&bronze_batch(rows)?)
+}
+
+/// The bronze record batch [`encode_bronze`] writes: the fixed bronze row
+/// contract over `rows`, in order.
+fn bronze_batch(rows: &[&BronzeRow]) -> Result<RecordBatch> {
     let schema = Arc::new(Schema::new(vec![
         Field::new(BRONZE_EVENT_COLUMN, DataType::Utf8, true),
         Field::new(BRONZE_TIME_COLUMN, DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
     ]));
     let events = StringArray::from_iter_values(rows.iter().map(|row| row.event_json.as_str()));
     let times = TimestampMicrosecondArray::from_iter_values(rows.iter().map(|row| row.time_micros)).with_timezone("UTC");
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(events) as ArrayRef, Arc::new(times) as ArrayRef])?;
-    encode_bronze_batch(&batch)
+    Ok(RecordBatch::try_new(schema, vec![Arc::new(events) as ArrayRef, Arc::new(times) as ArrayRef])?)
+}
+
+/// One bronze record batch read the way admission reads a bronze object:
+/// Arrow's line-delimited JSON writer, then [`decode_bronze_row`] per row.
+fn admitted_rows(batch: &RecordBatch, out: &mut Vec<Result<Value>>) -> Result<()> {
+    let mut writer = LineDelimitedWriter::new(Vec::new());
+    writer.write(batch)?;
+    writer.finish()?;
+    for line in writer.into_inner().split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        out.push(serde_json::from_slice::<Value>(line).map_err(anyhow::Error::from).and_then(decode_bronze_row));
+    }
+    Ok(())
+}
+
+/// NAN-4682: what admission will read back for `rows`, without the Parquet
+/// round trip. The bronze columns are a Utf8 string and a
+/// `Timestamp(µs, "UTC")`, both stored losslessly by Parquet (the Arrow
+/// schema, time zone included, travels in the file), so the batch admission
+/// decodes is this very batch: rendering it with the same JSON writer gives
+/// the same values. `landing_precheck_in_memory_matches_the_parquet_round_trip`
+/// proves it over the fixture corpus.
+fn precheck_view(rows: &[&BronzeRow]) -> Result<Vec<Result<Value>>> {
+    let mut out = Vec::with_capacity(rows.len());
+    admitted_rows(&bronze_batch(rows)?, &mut out)?;
+    Ok(out)
+}
+
+/// How the pre-check reads back prepared rows. Production reads the
+/// in-memory batch ([`precheck_view`]); the Parquet round trip it replaced
+/// (NAN-4682) stays as the reference the equivalence test compares with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Precheck {
+    InMemory,
+    #[cfg_attr(not(test), allow(dead_code))]
+    ParquetRoundTrip,
 }
 
 /// Encode one bronze record batch (the fixed bronze row contract) exactly
@@ -609,12 +650,7 @@ pub(crate) fn decode_bronze(bytes: &[u8]) -> Result<Vec<Result<Value>>> {
     let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))?.build()?;
     let mut out = Vec::new();
     for batch in reader {
-        let mut writer = LineDelimitedWriter::new(Vec::new());
-        writer.write(&batch?)?;
-        writer.finish()?;
-        for line in writer.into_inner().split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-            out.push(serde_json::from_slice::<Value>(line).map_err(anyhow::Error::from).and_then(decode_bronze_row));
-        }
+        admitted_rows(&batch?, &mut out)?;
     }
     Ok(out)
 }
@@ -690,7 +726,25 @@ pub fn convert_landed(
     source: &LandingSource,
     now: DateTime<Utc>,
 ) -> std::result::Result<Converted, FileRefusal> {
+    convert_landed_with(bytes, format, partition_class_uid, stage, tenant_id, source, now, Precheck::InMemory)
+}
+
+/// [`convert_landed`] with the pre-check read-back chosen (tests compare the
+/// two; production is always [`Precheck::InMemory`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn convert_landed_with(
+    bytes: &[u8],
+    format: FileFormat,
+    partition_class_uid: Option<u32>,
+    stage: &LandingOcsfStage,
+    tenant_id: &str,
+    source: &LandingSource,
+    now: DateTime<Utc>,
+    precheck: Precheck,
+) -> std::result::Result<Converted, FileRefusal> {
     let content_sha256 = hex::encode(Sha256::digest(bytes));
+    // NAN-4682: one VRL runtime for the whole file, cleared after each row.
+    let mut runner = stage.runner();
     let credential = source.credential_id.hyphenated().to_string();
     let mut rows_refused = 0_u64;
     let mut rows_accepted = 0_u64;
@@ -742,7 +796,7 @@ pub fn convert_landed(
                 credential_id: &credential,
                 event_key: Some(format!("{content_sha256}:{this}")),
             };
-            match stage.prepare(row, &ctx) {
+            match runner.prepare(row, &ctx) {
                 Ok(bronze) => {
                     prepared.push(bronze);
                     classes.push(class_uid);
@@ -754,12 +808,14 @@ pub fn convert_landed(
         if prepared.is_empty() {
             return Ok(());
         }
-        // Pre-check exactly what admission will read: encode, decode, check.
+        // Pre-check exactly what admission will read ([`precheck_view`]).
         let all = prepared.iter().collect::<Vec<_>>();
-        let encoded = encode_bronze(&all).or_else(|_| refuse("bronze_encode_failed"))?;
+        let decoded = match precheck {
+            Precheck::InMemory => precheck_view(&all),
+            Precheck::ParquetRoundTrip => encode_bronze(&all).and_then(|encoded| decode_bronze(&encoded)),
+        }
+        .or_else(|_| refuse("bronze_encode_failed"))?;
         drop(all);
-        let decoded = decode_bronze(&encoded).or_else(|_| refuse("bronze_encode_failed"))?;
-        drop(encoded);
         if decoded.len() != prepared.len() {
             return refuse("bronze_encode_failed");
         }
@@ -1116,12 +1172,21 @@ pub struct BronzeObjects;
 #[async_trait]
 impl Emit for BronzeObjects {
     async fn emit(&self, store: &Operator, _tenant_id: &str, _candidate: &Candidate, converted: &Converted) -> Result<String> {
-        let mut keys = Vec::with_capacity(converted.objects.len());
-        for (bronze_key, body, _) in &converted.objects {
-            store.write(bronze_key, body.clone()).await.context("write bronze object")?;
-            keys.push(bronze_key.as_str());
-        }
-        Ok(keys.join(","))
+        // NAN-4682: the objects go up concurrently (bounded); `emit` returns
+        // only once every one is durable, so the file is never finished early.
+        use futures::{StreamExt, TryStreamExt};
+        let writes = converted
+            .objects
+            .iter()
+            .map(|(bronze_key, body, _)| async move {
+                store.write(bronze_key, body.clone()).await.context("write bronze object").map(|_| ())
+            })
+            .collect::<Vec<_>>();
+        futures::stream::iter(writes)
+            .buffer_unordered(MAX_CONCURRENT_BRONZE_PUTS)
+            .try_collect::<Vec<()>>()
+            .await?;
+        Ok(converted.objects.iter().map(|(key, _, _)| key.as_str()).collect::<Vec<_>>().join(","))
     }
 }
 
@@ -1136,16 +1201,24 @@ pub struct PublishedBronze<S: crate::parts::part_log::ObjectStore> {
 #[async_trait]
 impl<S: crate::parts::part_log::ObjectStore> Emit for PublishedBronze<S> {
     async fn emit(&self, _landing: &Operator, _tenant_id: &str, _candidate: &Candidate, converted: &Converted) -> Result<String> {
-        let mut keys = Vec::with_capacity(converted.objects.len());
-        for (bronze_key, body, _) in &converted.objects {
-            // `false`: the key already exists (a retried emit after a lost
-            // reply). Bronze keys carry a fresh suffix per conversion, so it
-            // is this conversion's own object; a reconversion writes new keys
-            // whose rows the uid window drops.
-            self.store.put_if_absent(bronze_key, body).await.context("publish bronze object")?;
-            keys.push(bronze_key.as_str());
-        }
-        Ok(keys.join(","))
+        // `false`: the key already exists (a retried emit after a lost
+        // reply). Bronze keys carry a fresh suffix per conversion, so it is
+        // this conversion's own object; a reconversion writes new keys whose
+        // rows the uid window drops. NAN-4682: published concurrently
+        // (bounded); `emit` returns once every one is published.
+        use futures::{StreamExt, TryStreamExt};
+        let puts = converted
+            .objects
+            .iter()
+            .map(|(bronze_key, body, _)| async move {
+                self.store.put_if_absent(bronze_key, body).await.context("publish bronze object").map(|_| ())
+            })
+            .collect::<Vec<_>>();
+        futures::stream::iter(puts)
+            .buffer_unordered(MAX_CONCURRENT_BRONZE_PUTS)
+            .try_collect::<Vec<()>>()
+            .await?;
+        Ok(converted.objects.iter().map(|(key, _, _)| key.as_str()).collect::<Vec<_>>().join(","))
     }
 
     /// The refused copy is published too (the converter's own object-store
@@ -1232,6 +1305,21 @@ impl<L: Ledger, E: Emit> Converter<L, E> {
     }
 }
 
+/// NAN-4682: landed files one converter handles at once: the machine's
+/// cores, at least 4 (claims, reads and uploads overlap the conversions) and
+/// at most 8.
+pub fn landing_concurrency() -> usize {
+    std::thread::available_parallelism().map_or(4, usize::from).clamp(4, 8)
+}
+
+/// NAN-4682: most landed bytes (listed object sizes) in flight at once. It is
+/// [`MAX_LANDING_BYTES`], the largest file the serial converter held, so
+/// concurrency never raises peak memory past the serial worst case.
+pub const MAX_IN_FLIGHT_LANDED_BYTES: u64 = MAX_LANDING_BYTES;
+
+/// NAN-4682: bronze objects of one file written at once.
+pub const MAX_CONCURRENT_BRONZE_PUTS: usize = 8;
+
 /// One tick's wiring: a store, a [`Discover`], an [`Emit`] and the stage.
 pub struct Engine<'a, D: Discover, E: Emit> {
     pub store: &'a Operator,
@@ -1246,36 +1334,92 @@ pub struct Engine<'a, D: Discover, E: Emit> {
 impl<D: Discover, E: Emit> Engine<'_, D, E> {
     /// Discover and handle every unfinished file. One file never blocks
     /// another: a transient failure leaves it for a later tick.
+    ///
+    /// NAN-4682: up to [`landing_concurrency`] files are handled at once,
+    /// each converted on a blocking thread. Every file is still claimed,
+    /// converted, emitted and finished by its own `handle`, in that order,
+    /// exactly as before: the claim (Postgres `(key, etag)` row, or the
+    /// hosted ledger's lease) is what makes one file one owner, and it does
+    /// not depend on the order files are handled in. Two candidates with
+    /// the same key (an object overwritten between listings) never run at
+    /// once; they keep their listed order. At most
+    /// [`MAX_IN_FLIGHT_LANDED_BYTES`] of landed objects are in flight (a
+    /// larger file runs alone), so peak memory stays the serial worst case.
+    /// A held file (output backpressure) or a fenced lease stops new files
+    /// from starting; files already started finish first.
     pub async fn tick(&self) -> Result<TickReport> {
         let mut report = TickReport::default();
         let (listed, candidates) = self.discover.discover(self.store, self.tenant_id, self.max_files_per_tick).await?;
         report.listed = listed;
-        for candidate in candidates {
-            match self.handle(&candidate).await {
+        let limit = landing_concurrency();
+        let mut queue: std::collections::VecDeque<Candidate> = candidates.into();
+        let mut running = futures::stream::FuturesUnordered::new();
+        let mut keys_running: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut bytes_running = 0_u64;
+        let mut stopped = false;
+        let mut fenced: Option<anyhow::Error> = None;
+        loop {
+            while !stopped && running.len() < limit {
+                // The first queued file whose key is not running (same-key
+                // files keep their order: an earlier one is always running).
+                let Some(position) = queue.iter().position(|c| !keys_running.contains(&c.key)) else { break };
+                let size = queue[position].size.min(MAX_IN_FLIGHT_LANDED_BYTES);
+                if !running.is_empty() && bytes_running + size > MAX_IN_FLIGHT_LANDED_BYTES {
+                    break;
+                }
+                let candidate = queue.remove(position).expect("position is in the queue");
+                keys_running.insert(candidate.key.clone());
+                bytes_running += size;
+                running.push(async move {
+                    let outcome = self.handle(&candidate).await;
+                    // A transient failure is handed back inside this file's
+                    // own future, so it never stalls the other files.
+                    let handback = match &outcome {
+                        Err(error) if error.downcast_ref::<Fenced>().is_none() => {
+                            tracing::warn!(error = %format!("{error:#}"), "landing file not finished; retrying it later");
+                            Some(self.discover.failed(self.store, &candidate).await)
+                        }
+                        _ => None,
+                    };
+                    (candidate, size, outcome, handback)
+                });
+            }
+            let Some((candidate, size, outcome, handback)) = futures::StreamExt::next(&mut running).await else { break };
+            keys_running.remove(&candidate.key);
+            bytes_running -= size;
+            match outcome {
                 Ok(Outcome::Accepted) => report.accepted += 1,
                 Ok(Outcome::Refused) => report.refused += 1,
                 Ok(Outcome::Redelivered) => report.redelivered += 1,
                 Ok(Outcome::Skipped) => report.skipped += 1,
                 Ok(Outcome::Held) => {
                     report.held += 1;
-                    break;
+                    stopped = true;
                 }
-                Err(error) if error.downcast_ref::<Fenced>().is_some() => return Err(error),
-                Err(error) => {
+                Err(error) if error.downcast_ref::<Fenced>().is_some() => {
+                    stopped = true;
+                    fenced.get_or_insert(error);
+                }
+                Err(_) => {
                     // Transient (store, database or output): open core lets
                     // the lease expire; hosted hands the file back to the
                     // ledger. A later tick retries it; the rest go on.
-                    tracing::warn!(error = %format!("{error:#}"), "landing file not finished; retrying it later");
                     report.failed += 1;
-                    match self.discover.failed(self.store, &candidate).await {
+                    match handback.unwrap_or(Ok(())) {
                         Ok(()) => {}
-                        Err(error) if error.downcast_ref::<Fenced>().is_some() => return Err(error),
+                        Err(error) if error.downcast_ref::<Fenced>().is_some() => {
+                            stopped = true;
+                            fenced.get_or_insert(error);
+                        }
                         Err(error) => tracing::warn!(error = %format!("{error:#}"), "landing file hand-back failed"),
                     }
                 }
             }
         }
-        Ok(report)
+        match fenced {
+            Some(error) => Err(error),
+            None => Ok(report),
+        }
     }
 
     async fn handle(&self, candidate: &Candidate) -> Result<Outcome> {
@@ -1314,13 +1458,24 @@ impl<D: Discover, E: Emit> Engine<'_, D, E> {
         if bytes.len() as u64 > MAX_LANDING_BYTES {
             return self.refuse_whole(candidate, id, FileRefusal::new("file_too_large"), None).await;
         }
-        let converted = match convert_landed(&bytes, parsed.format, parsed.partition_class_uid, self.stage, self.tenant_id, &source, Utc::now()) {
+        // NAN-4682: the conversion is CPU work; it runs on a blocking thread
+        // so files convert in parallel and the runtime keeps serving I/O.
+        let (stage, tenant_id, landed) = (self.stage.clone(), self.tenant_id.to_string(), source.clone());
+        let (format, partition_class_uid) = (parsed.format, parsed.partition_class_uid);
+        let (bytes, converted) = tokio::task::spawn_blocking(move || {
+            let converted = convert_landed(&bytes, format, partition_class_uid, &stage, &tenant_id, &landed, Utc::now());
+            (bytes, converted)
+        })
+        .await
+        .context("landing conversion task")?;
+        let converted = match converted {
             Ok(converted) => converted,
             Err(refusal) => {
                 let sha = hex::encode(Sha256::digest(&bytes));
                 return self.refuse_whole(candidate, id, refusal, Some(&sha)).await;
             }
         };
+        drop(bytes);
         let emitted = match self.emit.emit(self.store, self.tenant_id, candidate, &converted).await {
             Ok(emitted) => emitted,
             Err(error) if error.downcast_ref::<Backpressure>().is_some() => {

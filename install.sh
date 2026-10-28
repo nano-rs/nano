@@ -114,6 +114,18 @@ NANO_BRANCH="${NANO_BRANCH:-main}"
 # pulls it (see resolve_lean_version).
 NANO_VERSION="${NANO_VERSION:-}"
 COMPOSE_FILE="docker-compose.opensource.yml"
+# NAN-4686: extra compose files layered on the base, space-separated and
+# relative to the install dir (the sovereign single-host wrapper passes
+# docker-compose.sovereign.yml). Empty, the open-core default, changes nothing.
+COMPOSE_ARGS=(-f "$COMPOSE_FILE")
+read -r -a NANO_OVERLAY_LIST <<< "${NANO_COMPOSE_OVERLAYS:-}" # split on spaces, never globbed
+for overlay in ${NANO_OVERLAY_LIST[@]+"${NANO_OVERLAY_LIST[@]}"}; do
+    if [[ ! "$overlay" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$ ]]; then
+        printf '%s\n' "NANO_COMPOSE_OVERLAYS: '$overlay' is not a compose file name in the install dir" >&2
+        exit 1
+    fi
+    COMPOSE_ARGS+=(-f "$overlay")
+done
 # All traffic goes through the nginx reverse proxy on port 80. The internal
 # nano-api / nano-search ports are not exposed to the host by default.
 HOST_PORT="${NANO_HOST_PORT:-80}"
@@ -795,7 +807,7 @@ verify_image_digests() {
     log "Verifying pulled image digests against images.lock"
     local ref expected basename repo_notag inspect_ref result active_images
     local mismatch=0 verified_fp=0 verified_tp=0
-    active_images=$(docker </dev/null compose -f "$COMPOSE_FILE" config --images 2>/dev/null || true)
+    active_images=$(docker </dev/null compose "${COMPOSE_ARGS[@]}" config --images 2>/dev/null || true)
 
     # First-party lines (no tag): inspect repo:NANO_VERSION, from fp_lockfile.
     if [[ -n "$fp_lockfile" ]]; then
@@ -900,8 +912,8 @@ ensure_bind_mounts_readable() {
 # done its work and is not listed. Returns 1 if Compose cannot be queried.
 unconverged_services() {
     local services ps_out svc line id state code policy
-    services=$(docker </dev/null compose -f "$COMPOSE_FILE" config --services 2>/dev/null) || return 1
-    ps_out=$(docker </dev/null compose -f "$COMPOSE_FILE" ps -a \
+    services=$(docker </dev/null compose "${COMPOSE_ARGS[@]}" config --services 2>/dev/null) || return 1
+    ps_out=$(docker </dev/null compose "${COMPOSE_ARGS[@]}" ps -a \
         --format '{{.Service}} {{.ID}} {{.State}} {{.ExitCode}}' 2>/dev/null) || return 1
     while IFS= read -r svc; do
         [[ -n "$svc" ]] || continue
@@ -939,7 +951,7 @@ converge_services() {
         [[ -z "$pending" ]] && break
         warn "Services not running after docker compose up: $(echo "$pending" | tr '\n' ' ')— starting them again (attempt $attempt of 3)."
         # shellcheck disable=SC2086 # one word per service name
-        docker </dev/null compose -f "$COMPOSE_FILE" up -d $pending >> "${COMPOSE_UP_LOG:-/dev/null}" 2>&1 || true
+        docker </dev/null compose "${COMPOSE_ARGS[@]}" up -d $pending >> "${COMPOSE_UP_LOG:-/dev/null}" 2>&1 || true
         retried=1
         sleep "$delay"
         delay=$((delay * 2))
@@ -950,14 +962,14 @@ converge_services() {
     if [[ -n "$pending" ]]; then
         for svc in $pending; do
             printf "%b✗ Service '%s' is not running after 3 attempts. Last 30 log lines:%b\n" "$c_red$c_bold" "$svc" "$c_reset" >&2
-            docker </dev/null compose -f "$COMPOSE_FILE" logs --no-color --tail 30 "$svc" 1>&2 || true
+            docker </dev/null compose "${COMPOSE_ARGS[@]}" logs --no-color --tail 30 "$svc" 1>&2 || true
         done
         fail "Services did not start: $(echo "$pending" | tr '\n' ' ')— see the logs above. Fix the cause and re-run this installer."
     fi
     if (( retried )); then
         ok "All services running after retry"
         # Recreated app containers have new IPs; see compose_up (NAN-1237).
-        docker </dev/null compose -f "$COMPOSE_FILE" exec -T nginx nginx -s reload >/dev/null 2>&1 || true
+        docker </dev/null compose "${COMPOSE_ARGS[@]}" exec -T nginx nginx -s reload >/dev/null 2>&1 || true
     fi
     return 0
 }
@@ -1002,11 +1014,11 @@ start_and_wait_for_api() {
     converge_services
     # The compose profile also starts the dedicated pull-feed worker. Do not
     # report a successful upgrade while its boot/sandbox/database check fails.
-    if docker </dev/null compose -f "$COMPOSE_FILE" config --services | grep -qx connector-runner; then
+    if docker </dev/null compose "${COMPOSE_ARGS[@]}" config --services | grep -qx connector-runner; then
         local connector_id connector_status connector_start
         connector_start=$(date +%s)
         while :; do
-            connector_id=$(docker </dev/null compose -f "$COMPOSE_FILE" ps -q connector-runner)
+            connector_id=$(docker </dev/null compose "${COMPOSE_ARGS[@]}" ps -q connector-runner)
             connector_status=$(docker </dev/null inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$connector_id" 2>/dev/null || true)
             [[ "$connector_status" == healthy ]] && break
             if (( $(date +%s) - connector_start >= 180 )); then
@@ -1047,15 +1059,15 @@ compose_up() {
         COMPOSE_UP_LOG=$(mktemp "${TMPDIR:-/tmp}/nano-compose-up.XXXXXX" 2>/dev/null) || COMPOSE_UP_LOG=/dev/null
     fi
     if [[ "$mode" == "loud" ]]; then
-        docker </dev/null compose -f "$COMPOSE_FILE" up -d 2>&1 | tee -a "$COMPOSE_UP_LOG"
+        docker </dev/null compose "${COMPOSE_ARGS[@]}" up -d 2>&1 | tee -a "$COMPOSE_UP_LOG"
         rc=${PIPESTATUS[0]}
     else
-        docker </dev/null compose -f "$COMPOSE_FILE" up -d >> "$COMPOSE_UP_LOG" 2>&1
+        docker </dev/null compose "${COMPOSE_ARGS[@]}" up -d >> "$COMPOSE_UP_LOG" 2>&1
         rc=$?
     fi
     (( rc == 0 )) || return "$rc"
     # container_name is gone (one install per compose project): address nginx by service.
-    docker </dev/null compose -f "$COMPOSE_FILE" exec -T nginx nginx -s reload >/dev/null 2>&1 || true
+    docker </dev/null compose "${COMPOSE_ARGS[@]}" exec -T nginx nginx -s reload >/dev/null 2>&1 || true
 }
 
 # While waiting, COMPOSE_RETRY_WHILE_WAITING=1 re-runs the idempotent
@@ -1087,7 +1099,7 @@ wait_for_api_health() {
             next_up=$((now + retry_every))
         fi
         if (( now >= next_report )); then
-            pending=$(docker </dev/null compose -f "$COMPOSE_FILE" ps --format '{{.Name}}={{.Health}}' 2>/dev/null \
+            pending=$(docker </dev/null compose "${COMPOSE_ARGS[@]}" ps --format '{{.Name}}={{.Health}}' 2>/dev/null \
                 | grep -E '=(starting|unhealthy)$' | tr '\n' ' ' || true)
             log "Still waiting for the API ($(( (now - start) / 60 ))m of $(( timeout / 60 ))m)${pending:+ — not yet healthy: $pending}"
             next_report=$((now + 60))
@@ -1273,7 +1285,10 @@ fi
 # 2. Clone or update the repo
 # ----------------------------------------------------------------------------
 if [[ -d "$NANO_INSTALL_DIR/.git" ]]; then
-    if [[ -n "$(git -C "$NANO_INSTALL_DIR" status --porcelain 2>/dev/null)" ]]; then
+    if [[ "${NANO_SKIP_GIT_UPDATE:-0}" == "1" ]]; then
+        # NAN-4686: a wrapper shipped inside this exact checkout installs it as is.
+        log "NANO_SKIP_GIT_UPDATE=1 — installing the checkout at $NANO_INSTALL_DIR as is"
+    elif [[ -n "$(git -C "$NANO_INSTALL_DIR" status --porcelain 2>/dev/null)" ]]; then
         warn "$NANO_INSTALL_DIR has local changes — skipping git update so your edits stay intact."
     else
         log "Updating existing checkout at $NANO_INSTALL_DIR"
@@ -1761,7 +1776,7 @@ if [[ "${NANO_SKIP_IMAGE_PULL:-0}" == "1" ]]; then
     # NANO_SKIP_IMAGE_VERIFY=1 is set too.
     warn "NANO_SKIP_IMAGE_PULL=1 — using images already present locally."
 elif log "Pulling images from ghcr.io/nano-rs (this may take a minute on first run)" \
-    && ! docker </dev/null compose -f "$COMPOSE_FILE" pull; then
+    && ! docker </dev/null compose "${COMPOSE_ARGS[@]}" pull; then
     fail "docker compose pull failed. A '403 Forbidden' on ghcr.io/token (or '401 Unauthorized') means that GHCR package is not public yet — the error names the repository. Run 'docker login ghcr.io' if you have access, or wait for nano-rs to publish it."
 fi
 
@@ -1774,10 +1789,10 @@ if [[ "$USE_LEAN" == "1" ]]; then
         # gen1 legacy/tenzir services (ClickHouse, its migrator, Tenzir): they
         # are still defined, so not orphans, and would keep running beside
         # lean. Stop every profile; volumes are retained for rollback.
-        docker </dev/null compose -f "$COMPOSE_FILE" --profile '*' down --remove-orphans
+        docker </dev/null compose "${COMPOSE_ARGS[@]}" --profile '*' down --remove-orphans
     fi
     log "Initializing the trusted-local UUID tenant using the cell initializer"
-    docker </dev/null compose -f "$COMPOSE_FILE" run --rm --no-deps -e NANO_LEAN_FRESH_TENANT="$FRESH_LEAN_CUTOVER" lean-init \
+    docker </dev/null compose "${COMPOSE_ARGS[@]}" run --rm --no-deps -e NANO_LEAN_FRESH_TENANT="$FRESH_LEAN_CUTOVER" lean-init \
         || fail "Lean initializer failed. No services have started."
     # A retry after initializer completion reuses its UUID rather than rotating again.
     if [[ -f .nano-lean/cutover-pending ]]; then
@@ -1829,7 +1844,7 @@ PYJOBS
     log "Sized nano-jobs memory limit to $LEAN_JOBS_MEM_LIMIT"
     log "Probing cell isolation; missing Landlock warns on trusted-local only"
     LEAN_PROBE_LOG=$(mktemp "${TMPDIR:-/tmp}/nano-lean-probe.XXXXXX")
-    if ! docker </dev/null compose -f "$COMPOSE_FILE" run --rm --no-deps --entrypoint nanosiem-lake-cell lake-cell \
+    if ! docker </dev/null compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint nanosiem-lake-cell lake-cell \
         probe --write --config /etc/nano-cell/cell.json > "$LEAN_PROBE_LOG"; then
         rm -f "$LEAN_PROBE_LOG"
         fail "Cell isolation probe failed."
@@ -1861,7 +1876,7 @@ fi
 # normal Compose bootstrap below.
 if [[ "${USE_LEAN:-0}" != "1" && "${REUSE_ENV:-0}" == "1" && "${ENABLE_LAKE_CONTROL_PLANE:-0}" == "1" ]]; then
     log "Staging the lake query/compiler upgrade"
-    if ! ./scripts/rollout-lake-runtime.sh -f "$COMPOSE_FILE"; then
+    if ! ./scripts/rollout-lake-runtime.sh "${COMPOSE_ARGS[@]}"; then
         fail "Lake runtime rollout failed before the general service update. The prior loaded generation remains the recovery target; inspect lake-generation-manager and lake-query-worker logs."
     fi
 fi
@@ -1874,7 +1889,16 @@ if [[ "${TENZIR_DIRECT:-0}" == "1" ]]; then
     # Switching an existing install to Tenzir-direct: Vector and the connector
     # runner are no longer in the stack, so `up -d` would leave their old
     # containers running. Remove them; their volumes stay for --add-vector.
-    docker </dev/null compose -f "$COMPOSE_FILE" --profile '*' rm -sf vector connector-runner >/dev/null 2>&1 || true
+    docker </dev/null compose "${COMPOSE_ARGS[@]}" --profile '*' rm -sf vector connector-runner >/dev/null 2>&1 || true
+fi
+# NAN-4686: a wrapper (scripts/sovereign/single-host.sh) renders material
+# that needs this run's .env and lean tenant (installation facts, product
+# PostgreSQL DSN) before any product service starts.
+if [[ -n "${NANO_PRE_START_HOOK:-}" ]]; then
+    [[ "$NANO_PRE_START_HOOK" == /* && -x "$NANO_PRE_START_HOOK" ]] \
+        || fail "NANO_PRE_START_HOOK must be an absolute path to an executable."
+    log "Running the pre-start hook"
+    "$NANO_PRE_START_HOOK" pre-start || fail "Pre-start hook failed. No product services have started."
 fi
 start_and_wait_for_api
 

@@ -344,10 +344,12 @@ async fn erasure_e2e_keeps_receipts_and_completion_blocked_until_expiry_and_cach
         assert!(catalog
             .require_removed(TENANT, part.part_id.as_str())
             .is_err());
-        assert!(catalog
-            .fence_retirement(TENANT, part.part_id.as_str())
-            .await
-            .is_err());
+        // Decoupled GC: receipted with the lane degraded; erasure
+        // completion (the ledger) still waits for expiry and the cache.
+        let receipt = catalog.fence_retirement(TENANT, part.part_id.as_str()).await.unwrap();
+        assert_eq!(receipt.manifest_sha256,
+            crate::part_ingest::iceberg_export::lifecycle::degraded_receipt_sha256(TENANT, part.part_id.as_str()));
+        assert!(basin.blocked.load(Ordering::SeqCst), "erased rows are never served");
         let keys = PartKeys::new(TENANT, part.level, part.event_hour, &part.part_id).unwrap();
         assert!(
             lake.parts().get(&keys.data(0)).await.unwrap().is_some(),
@@ -446,9 +448,15 @@ async fn erasure_e2e_lost_planner_state_rebuilds_from_the_catalog_before_any_rec
     let before = basin.checkpoint().await.unwrap();
     let lost =
         TenantCatalog::new(TENANT, lake.root.join("lost-planner-state"), basin.clone()).unwrap();
+    // Part GC never waits on the agent catalog: each erased part is
+    // receipted with the lane degraded (reads closed) before the rebuild.
     for part in &removed {
         assert!(lost.require_removed(TENANT, part.as_str()).is_err());
-        assert!(lost.fence_retirement(TENANT, part.as_str()).await.is_err());
+        let receipt = lost.fence_retirement(TENANT, part.as_str()).await.unwrap();
+        assert_eq!(receipt.manifest_sha256,
+            crate::part_ingest::iceberg_export::lifecycle::degraded_receipt_sha256(TENANT, part.as_str()));
+        assert!(basin.blocked.load(Ordering::SeqCst), "erased rows are never served");
+        assert!(basin.query(TENANT, None).await.is_err());
     }
     lost.sync(TENANT, writer.live(), lake.clock + 2, &Default::default())
         .await
@@ -531,7 +539,11 @@ async fn wiped_export_state_rebuilds_from_the_catalog_and_the_next_commit_contin
 
     let catalog = TenantCatalog::new(TENANT, custody.clone(), basin.clone()).unwrap();
     let retired = parts[0].part_id.as_str();
-    assert!(catalog.fence_retirement(TENANT, retired).await.is_err(), "GC waits for the rebuild");
+    // GC never waits for the rebuild: the lane degrades (reads closed).
+    let receipt = catalog.fence_retirement(TENANT, retired).await.unwrap();
+    assert_eq!(receipt.manifest_sha256,
+        crate::part_ingest::iceberg_export::lifecycle::degraded_receipt_sha256(TENANT, retired));
+    assert!(basin.blocked.load(Ordering::SeqCst));
     // Retention drops the oldest hour; the attempt dies after the rebuild.
     let kept = parts[1..].to_vec();
     basin.maintenance_on.store(true, Ordering::SeqCst);
@@ -541,7 +553,7 @@ async fn wiped_export_state_rebuilds_from_the_catalog_and_the_next_commit_contin
     let rebuilt = crate::part_ingest::export::ExportState::load(&custody).unwrap();
     assert_eq!(rebuilt.last_plan_ms, c1, "the predecessor is the catalog checkpoint");
     assert_eq!(rebuilt.exported.values().flatten().count(), parts.len());
-    assert!(catalog.require_removed(TENANT, retired).is_err());
+    assert!(basin.blocked.load(Ordering::SeqCst), "the degraded lane stays closed");
     drop(catalog);
 
     // Restart mid-recovery.
@@ -652,12 +664,14 @@ async fn persistent_ingestor_recovers_gc_read_barrier_without_waiting_for_hourly
     .unwrap();
     let before = ingestor.live_parts();
     basin.fail_expiry.store(true, Ordering::SeqCst);
+    // A live part is held per key (pinned) whatever the catalog state; the
+    // failed strict inspection still closed the read barrier.
     assert!(catalog
         .fence_retirement(TENANT, before[0].part_id.as_str())
         .await
         .unwrap_err()
         .to_string()
-        .contains("expiry unavailable"));
+        .contains("still pins part"));
     assert!(basin.blocked.load(Ordering::SeqCst));
     basin.fail_expiry.store(false, Ordering::SeqCst);
     tokio::time::timeout(std::time::Duration::from_secs(20), async {

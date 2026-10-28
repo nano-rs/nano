@@ -2221,6 +2221,7 @@ impl IngestService {
                 lag_seconds: health.lag_ms as f64 / 1_000.0,
                 oldest_unmerged_l0_age_seconds: health.oldest_unmerged_l0_age_ms as f64 / 1_000.0,
                 l0_merge_overdue_seconds: health.l0_merge_overdue_ms as f64 / 1_000.0,
+                max_parts_per_hour: health.max_parts_per_hour as u64,
                 prevalence_behind_seconds: health.prevalence_behind_ms as f64 / 1_000.0,
                 prevalence_behind_entries: health.prevalence_behind_entries,
                 prevalence_degraded_seconds: health.prevalence_degraded_ms as f64 / 1_000.0,

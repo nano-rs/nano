@@ -1369,6 +1369,158 @@ pub async fn catch_up(store: &dyn ObjectStore, tenant_id: &str, set: &mut LiveSe
 /// Most entry GETs [`catch_up`] has in flight.
 pub const CATCH_UP_MAX_WINDOW: u64 = 32;
 
+/// NAN-4691: the part log's head and its schema there, and nothing else.
+///
+/// The finding drain publishes parts in the log's current schema; it never
+/// reads the live set. Folding a [`LiveSet`] (every live part, plus the
+/// ids, removals and consumptions inside the id memory horizon) made its
+/// memory grow with the tenant's log: with the live set, and with the whole
+/// history inside the 48 h horizon wherever no checkpoint fits one log
+/// object or a replay proof starts at genesis. The drain-only detect[T] runs
+/// at 256 MiB-1 GiB (NAN-4690). This view is O(schema + one fetch window),
+/// whatever the log's length or live set.
+///
+/// It verifies exactly what a reader must: the checkpoint's entry digest,
+/// then every later entry's sequence, hash chain and writer epoch, and every
+/// schema it adopts (`LogSchema::to_arrow` checks the fingerprint). It does
+/// not re-check the live-set rules of `Add`/`Merge`/...: the drain never
+/// relies on them, and the owner (ingest[T]) checks its append against its
+/// own folded log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogSchemaView {
+    head: Option<(u64, String, u64)>,
+    schema: Option<LogSchema>,
+}
+
+impl LogSchemaView {
+    pub fn head(&self) -> Option<(u64, &str, u64)> {
+        self.head.as_ref().map(|(seq, sha, epoch)| (*seq, sha.as_str(), *epoch))
+    }
+
+    pub fn schema(&self) -> Option<&LogSchema> {
+        self.schema.as_ref()
+    }
+
+    /// Apply one entry; `entry_sha256` is SHA-256 of its bytes. A refused
+    /// entry leaves the view unchanged.
+    pub fn apply(&mut self, entry: &LogEntry, entry_sha256: &str) -> Result<()> {
+        let expected_seq = self.head.as_ref().map_or(0, |(seq, _, _)| seq + 1);
+        let expected_prev = self.head.as_ref().map_or(GENESIS_PREV, |(_, sha, _)| sha.as_str());
+        let min_epoch = self.head.as_ref().map_or(0, |(_, _, epoch)| *epoch);
+        if entry.seq != expected_seq || entry.prev_sha256 != expected_prev {
+            bail!("log chain is broken at seq {}", entry.seq);
+        }
+        if entry.writer_epoch < min_epoch {
+            bail!("log entry {} regresses the writer epoch", entry.seq);
+        }
+        match (&entry.op, entry.seq) {
+            (LogOp::Genesis { schema }, 0) => {
+                schema.to_arrow()?;
+                self.schema = Some(schema.clone());
+            }
+            (LogOp::Genesis { .. }, _) => bail!("genesis after seq 0"),
+            (_, 0) => bail!("seq 0 must be genesis"),
+            (LogOp::Schema { schema }, _) => {
+                schema.to_arrow()?;
+                self.schema = Some(schema.clone());
+            }
+            _ => {}
+        }
+        self.head = Some((entry.seq, entry_sha256.to_owned(), entry.writer_epoch));
+        Ok(())
+    }
+}
+
+/// A checkpoint's head and schema; its live list is skipped while parsing
+/// (`IgnoredAny` allocates nothing for it).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointSchemaOnly {
+    format: String,
+    tenant_id: String,
+    seq: u64,
+    entry_sha256: String,
+    writer_epoch: u64,
+    schema: LogSchema,
+    #[allow(dead_code)]
+    live: serde::de::IgnoredAny,
+    #[allow(dead_code)]
+    #[serde(default)]
+    edge_log: Option<serde::de::IgnoredAny>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    edge_ended: Option<serde::de::IgnoredAny>,
+}
+
+/// [`load_log`] for a consumer that needs only the head and the schema
+/// ([`LogSchemaView`]): the same newest-valid-checkpoint choice and digest
+/// check, then [`catch_up_schema`]. Memory is bounded by one checkpoint
+/// object ([`MAX_CHECKPOINT_BYTES`]) and one fetch window, never by the
+/// log's history.
+pub async fn load_log_schema(store: &dyn ObjectStore, tenant_id: &str) -> Result<LogSchemaView> {
+    let log_keys = LogKeys::new(tenant_id)?;
+    let mut view = LogSchemaView::default();
+    let checkpoints = store.list(&log_keys.checkpoints_prefix()).await?;
+    for key in checkpoints.iter().rev() {
+        if !is_snapshot_checkpoint_key(key) {
+            continue;
+        }
+        let Some(bytes) = store.get(key).await? else { continue };
+        let parsed = (|| -> Result<CheckpointSchemaOnly> {
+            if bytes.len() > MAX_CHECKPOINT_BYTES {
+                bail!("checkpoint exceeds its byte bound");
+            }
+            let checkpoint: CheckpointSchemaOnly = serde_json::from_slice(&bytes).context("checkpoint does not parse")?;
+            if checkpoint.format != CHECKPOINT_FORMAT || checkpoint.tenant_id != tenant_id {
+                bail!("checkpoint format or tenant is wrong");
+            }
+            checkpoint.schema.to_arrow()?;
+            Ok(checkpoint)
+        })();
+        drop(bytes);
+        match parsed {
+            Ok(checkpoint) => {
+                let entry_bytes = store
+                    .get(&log_keys.entry(checkpoint.seq))
+                    .await?
+                    .context("checkpoint names a missing entry")?;
+                if sha256_hex(&entry_bytes) != checkpoint.entry_sha256 {
+                    bail!("checkpoint does not match its entry");
+                }
+                view.head = Some((checkpoint.seq, checkpoint.entry_sha256, checkpoint.writer_epoch));
+                view.schema = Some(checkpoint.schema);
+                break;
+            }
+            Err(error) => tracing::warn!(%key, error = %error, "skipping unreadable part-log checkpoint"),
+        }
+    }
+    catch_up_schema(store, tenant_id, &mut view).await?;
+    Ok(view)
+}
+
+/// [`catch_up`] for a [`LogSchemaView`]: the same doubling fetch windows,
+/// each entry verified in order and dropped once applied.
+pub async fn catch_up_schema(store: &dyn ObjectStore, tenant_id: &str, view: &mut LogSchemaView) -> Result<u64> {
+    let log_keys = LogKeys::new(tenant_id)?;
+    let mut applied = 0;
+    let mut window = 1_u64;
+    loop {
+        let first = view.head().map_or(0, |(seq, _, _)| seq + 1);
+        let fetched = futures::future::try_join_all((first..first + window)
+            .map(|seq| { let key = log_keys.entry(seq); async move { store.get(&key).await } })).await?;
+        let complete = fetched.iter().all(Option::is_some);
+        for bytes in fetched {
+            let Some(bytes) = bytes else { return Ok(applied) };
+            let entry = LogEntry::parse_bytes(&bytes, tenant_id)?;
+            view.apply(&entry, &sha256_hex(&bytes))?;
+            applied += 1;
+        }
+        if complete {
+            window = (window * 2).min(CATCH_UP_MAX_WINDOW);
+        }
+    }
+}
+
 /// Result of an append.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppendOutcome {
@@ -1881,6 +2033,64 @@ mod tests {
         let reloaded = load_log(&store, TENANT).await.unwrap();
         assert_eq!(reloaded.parts().map(|p| p.part_id.clone()).collect::<Vec<_>>(), vec![part(3, Level::Minute).part_id]);
         assert_eq!(reloaded.head().unwrap().0, 3);
+    }
+
+    /// NAN-4691: the drain's head+schema view is exactly the `LiveSet`
+    /// fold's head and schema, through schema evolution, merges, retires,
+    /// checkpoints and the empty log; and from genesis without a checkpoint.
+    #[tokio::test]
+    async fn the_schema_view_matches_the_live_set_head_and_schema() {
+        async fn same(store: &LocalObjectStore) {
+            let full = load_log(store, TENANT).await.unwrap();
+            let view = load_log_schema(store, TENANT).await.unwrap();
+            assert_eq!(view.head(), full.head());
+            assert_eq!(view.schema(), full.schema());
+            let mut genesis = LogSchemaView::default();
+            catch_up_schema(store, TENANT, &mut genesis).await.unwrap();
+            assert_eq!(genesis, view, "a genesis fold reaches the same view as the checkpoint");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(dir.path()).unwrap();
+        // Empty log: no head, no schema, on both.
+        same(&store).await;
+        assert_eq!(load_log_schema(&store, TENANT).await.unwrap(), LogSchemaView::default());
+
+        let mut writer = PartLogWriter::open(&store, TENANT, 1, &schema(), 1).await.unwrap();
+        same(&store).await;
+        let mut fields = schema().fields().iter().map(|field| field.as_ref().clone()).collect::<Vec<_>>();
+        let mut evolve = |name: &str| {
+            fields.push(Field::new(name, DataType::Utf8, true));
+            LogSchema::from_arrow(&Schema::new(fields.clone())).unwrap()
+        };
+        writer.append(LogOp::Add { parts: vec![part(1, Level::L0)], consumed: vec![source(1)], edge_log: None }, 2).await.unwrap();
+        writer.append(LogOp::Schema { schema: evolve("a") }, 3).await.unwrap();
+        writer.append(LogOp::Add { parts: vec![part(2, Level::L0)], consumed: vec![source(2)], edge_log: None }, 4).await.unwrap();
+        same(&store).await;
+        writer
+            .append(LogOp::Merge { output: part(3, Level::Minute), supersedes: vec![part(1, Level::L0).part_id, part(2, Level::L0).part_id] }, 5)
+            .await
+            .unwrap();
+        writer.append(LogOp::Retire { parts: vec![part(3, Level::Minute).part_id], reason: RetireReason::Retention, deletion_unit: "u".into() }, 6).await.unwrap();
+        writer.write_checkpoint(7).await.unwrap();
+        same(&store).await;
+        // Evolution after the checkpoint, then a second checkpoint.
+        writer.append(LogOp::Add { parts: vec![part(4, Level::L0)], consumed: vec![source(4)], edge_log: None }, 8).await.unwrap();
+        let widened = evolve("b");
+        writer.append(LogOp::Schema { schema: widened.clone() }, 9).await.unwrap();
+        same(&store).await;
+        assert_eq!(load_log_schema(&store, TENANT).await.unwrap().schema(), Some(&widened));
+        writer.write_checkpoint(10).await.unwrap();
+        writer.append(LogOp::Add { parts: vec![part(5, Level::L0)], consumed: vec![source(5)], edge_log: None }, 11).await.unwrap();
+        same(&store).await;
+
+        // A checkpoint whose entry digest differs fails both, as before.
+        let keys = LogKeys::new(TENANT).unwrap();
+        let newest = store.list(&keys.checkpoints_prefix()).await.unwrap().into_iter().filter(|key| is_snapshot_checkpoint_key(key)).last().unwrap();
+        let mut forged: serde_json::Value = serde_json::from_slice(&store.get(&newest).await.unwrap().unwrap()).unwrap();
+        forged["entry_sha256"] = serde_json::Value::String("0".repeat(64));
+        store.put(&newest, &serde_json::to_vec(&forged).unwrap()).await.unwrap();
+        assert!(load_log(&store, TENANT).await.is_err());
+        assert!(load_log_schema(&store, TENANT).await.is_err());
     }
 
     #[tokio::test]

@@ -402,3 +402,76 @@ fn errors_never_carry_secret_material() {
     let message = facts.load().err().unwrap().to_string();
     assert!(!message.contains("hunter2"), "{message}");
 }
+
+/// NAN-4686: the single-host installer's renderer
+/// (scripts/sovereign/render_single_host_facts.py, run by
+/// scripts/sovereign/single-host.sh) produces facts this reader accepts,
+/// with the installer's real DSN shape, modes and ownership.
+#[test]
+fn single_host_installer_renders_facts_the_runtime_loads() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    std::fs::write(
+        dir.join("installation.json"),
+        r#"{"domain":"10-1-2-3.sslip.io","installation_id":"inst-0123456789abcdef","organization_id":"org-fedcba9876543210"}"#,
+    )
+    .unwrap();
+    // Password with URL-reserved bytes: the renderer must percent-encode it.
+    std::fs::write(
+        dir.join(".env"),
+        "POSTGRES_PASSWORD=p@ss/w:rd?#%\nJWT_SECRET=x\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("ca.crt"), b"-----BEGIN CERTIFICATE-----\nsynthetic\n").unwrap();
+    let out = dir.join("app");
+    // SAFETY: geteuid/getegid have no preconditions.
+    let owner = unsafe { format!("{}:{}", libc::geteuid(), libc::getegid()) };
+    let status = std::process::Command::new("python3")
+        .arg(repo.join("scripts/sovereign/render_single_host_facts.py"))
+        .args(["--out".as_ref(), out.as_os_str()])
+        .args(["--installation".as_ref(), dir.join("installation.json").as_os_str()])
+        .args(["--env-file".as_ref(), dir.join(".env").as_os_str()])
+        .args(["--ca-file".as_ref(), dir.join("ca.crt").as_os_str()])
+        .args(["--release-digest", &format!("sha256:{}", "b".repeat(64))])
+        .args(["--owner", &owner])
+        .status()
+        .expect("run python3");
+    assert!(status.success());
+
+    assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o700);
+    for name in [DEPLOYMENT_FILE, PRODUCT_POSTGRES_RUNTIME_FILE, PRODUCT_POSTGRES_CA_FILE] {
+        let mode = std::fs::metadata(out.join(name)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o400, "{name}");
+    }
+    let runtime = SovereignRuntime::load(&out).expect("installer-rendered facts load");
+    assert_eq!(runtime.target(), SovereignTarget::Linux);
+    assert_eq!(runtime.connectivity(), SovereignConnectivity::Connected);
+    assert_eq!(runtime.domain(), "10-1-2-3.sslip.io");
+    assert_eq!(runtime.browser_origin(), "https://10-1-2-3.sslip.io");
+    assert_eq!(runtime.installation_id(), "inst-0123456789abcdef");
+    assert_eq!(runtime.organization_id(), "org-fedcba9876543210");
+    let url = url::Url::parse(runtime.database_url()).unwrap();
+    assert_eq!(url.host_str(), Some("postgres"));
+    assert_eq!(url.username(), "nanosiem");
+    assert_eq!(url.password(), Some("p%40ss%2Fw%3Ard%3F%23%25"));
+    assert_eq!(url.path(), "/nanosiem");
+    let query: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+    assert_eq!(query[0], ("sslmode".into(), "verify-full".into()));
+    assert_eq!(query[1].0, "sslrootcert");
+    assert!(query[1].1.ends_with("/product-postgres-ca"));
+
+    // Re-rendering in place (installer re-run) replaces the files and still loads.
+    let status = std::process::Command::new("python3")
+        .arg(repo.join("scripts/sovereign/render_single_host_facts.py"))
+        .args(["--out".as_ref(), out.as_os_str()])
+        .args(["--installation".as_ref(), dir.join("installation.json").as_os_str()])
+        .args(["--env-file".as_ref(), dir.join(".env").as_os_str()])
+        .args(["--ca-file".as_ref(), dir.join("ca.crt").as_os_str()])
+        .args(["--release-digest", &format!("sha256:{}", "c".repeat(64))])
+        .args(["--owner", &owner])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    SovereignRuntime::load(&out).expect("re-rendered facts load");
+}

@@ -379,14 +379,21 @@ impl LaneMemo {
     }
 }
 
-/// NAN-3411: `:p{threads}x{rows}` for non-default effective payload reader
-/// settings (before a tenant's own thread budget), else empty.
+/// NAN-3411: `:p{threads}x{rows}` when payload reader settings are asked
+/// for (an override or the env; clamped before a tenant's own thread
+/// budget), else empty. NAN-4694: the unrequested defaults come from the
+/// process's own role, the same for every statement it plans, so they need
+/// no key.
 fn payload_key_suffix() -> String {
-    use crate::planner::{payload_block_rows_env, payload_max_threads_env, payload_read_settings, PAYLOAD_DEFAULT_BLOCK_ROWS, PAYLOAD_DEFAULT_THREADS};
-    let (threads, rows) = crate::perf_overrides::payload_read(payload_max_threads_env(), payload_block_rows_env());
-    match payload_read_settings(threads, rows, INTERACTIVE_MAX_THREADS) {
-        (PAYLOAD_DEFAULT_THREADS, PAYLOAD_DEFAULT_BLOCK_ROWS) => String::new(),
-        (threads, rows) => format!(":p{threads}x{rows}"),
+    use crate::planner::{payload_block_rows_env, payload_max_threads_env, payload_read_settings, PAYLOAD_ROLE_ROWS_MIN_MEMORY_BYTES};
+    match crate::perf_overrides::payload_read(payload_max_threads_env(), payload_block_rows_env()) {
+        (None, None) => String::new(),
+        (threads, rows) => {
+            // A side not asked for keys at the 4-thread / 512-row default
+            // of a full-size role.
+            let (threads, rows) = payload_read_settings(threads, rows, 2 * INTERACTIVE_MAX_THREADS, PAYLOAD_ROLE_ROWS_MIN_MEMORY_BYTES);
+            format!(":p{threads}x{rows}")
+        }
     }
 }
 
@@ -609,7 +616,8 @@ mod tests {
              input_format_parquet_max_block_size=8192, input_format_parquet_memory_high_watermark=33554432"
         );
         // A payload-bounded statement (max_threads=1, 128-row blocks) keeps its tighter values.
-        let payload = crate::planner::bounded_payload_settings("SELECT 1 SETTINGS max_threads=4".into(), 4);
+        // (A small role's: one reader thread under a 64 MiB statement cap.)
+        let payload = crate::planner::bounded_payload_settings("SELECT 1 SETTINGS max_threads=4".into(), 4, crate::planner::PAYLOAD_READER_MEMORY_BYTES);
         let bounded = bounded_reader_sql(&payload, 2);
         for kept in ["max_threads=1", "input_format_parquet_max_block_size=128", "input_format_parquet_prefer_block_bytes=1048576",
             "input_format_parquet_memory_high_watermark=33554432"] {
@@ -723,8 +731,9 @@ mod tests {
         assert_eq!(modes.needed(&nested_key), LaneClass::Small);
     }
 
-    /// NAN-3411: payload reader overrides key the lane memo apart; the
-    /// defaults (and an override equal to them) keep the key unchanged.
+    /// NAN-3411: payload reader overrides key the lane memo apart; no
+    /// override keeps the key unchanged (NAN-4694: the role defaults are
+    /// the process's own).
     #[test]
     fn payload_read_override_keys_the_lane_memo_apart() {
         use crate::perf_overrides::{sync_scoped, Overrides};
@@ -733,9 +742,9 @@ mod tests {
         let payload = |threads: Option<u64>, rows: Option<u64>| Overrides { payload_threads: threads, payload_block_rows: rows, ..Overrides::default() };
         let base = LaneMemo::key(&wide).unwrap();
         assert!(!base.contains(":p"), "{base}");
-        assert_eq!(sync_scoped(payload(Some(1), Some(128)), || LaneMemo::key(&wide)).unwrap(), base);
+        assert_eq!(sync_scoped(payload(Some(1), Some(128)), || LaneMemo::key(&wide)).unwrap(), format!("{base}:p1x128"));
         let four = sync_scoped(payload(Some(4), None), || LaneMemo::key(&wide)).unwrap();
-        assert_eq!(four, format!("{base}:p4x128"));
+        assert_eq!(four, format!("{base}:p4x512"));
         // Clamped like the planner: 64 threads is the 4-thread key.
         assert_eq!(sync_scoped(payload(Some(64), None), || LaneMemo::key(&wide)).unwrap(), four);
         let memo = LaneMemo::default();

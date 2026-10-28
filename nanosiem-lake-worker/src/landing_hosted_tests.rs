@@ -1076,7 +1076,7 @@ async fn an_older_worker_still_gets_every_decision() {
 
 /// The same bytes landed under two keys: both convert (their rows carry the
 /// same uids, so ingest[T]'s uid window drops the repeat), both commit with
-/// the same content hash, and the ledger decides the second `duplicate`:
+/// the same content hash, and the ledger decides the second to commit `duplicate`:
 /// 1 accepted + 1 duplicate, the rows counted once.
 #[tokio::test]
 async fn the_same_file_under_two_keys_is_one_accepted_and_one_duplicate() {
@@ -1086,17 +1086,25 @@ async fn the_same_file_under_two_keys_is_one_accepted_and_one_duplicate() {
     let again = hosted.land(&key(TENANT, "again.ndjson"), bytes.clone()).await;
     let report = hosted.tick().await.unwrap();
     assert_eq!(report.failed, 0, "{report:?}");
-    assert_eq!((hosted.ledger.file(first).state, hosted.ledger.file(again).state), ("accepted", "duplicate"));
+    // NAN-4682: files of one tick are handled concurrently, so which of two
+    // identical files commits first (and is `accepted`) is not defined; the
+    // outcome is: exactly one accepted, one duplicate, rows counted once.
+    let mut states = [hosted.ledger.file(first).state, hosted.ledger.file(again).state];
+    states.sort();
+    assert_eq!(states, ["accepted", "duplicate"]);
     let commits = hosted.ledger.0.lock().unwrap().commits.clone();
     let hashes = commits.iter().map(|c| c.content_sha256.clone()).collect::<Vec<_>>();
     assert_eq!(hashes, vec![Some(sha256_hex(&bytes)); 2], "both commits carry the landed bytes' sha256");
     let status = hosted.counters.status();
     assert_eq!((status.files_accepted, status.rows_accepted, status.rows_refused), (1, 2, 1), "rows are not double-counted");
     assert_eq!(status.sources[SOURCE].files_accepted, 1);
-    // Both were emitted with identical uids: search keeps one copy.
+    // Both were emitted with identical uids: search keeps one copy. NAN-4682:
+    // converted concurrently in the same millisecond, the two files are the
+    // same bytes under the same deterministic segment key, and the edge log
+    // replays the second instead of appending it (one segment).
     let segments = hosted.producer.segments();
-    assert_eq!(segments.len(), 2);
-    assert_eq!(uids_of(&segments[..1]), uids_of(&segments[1..]));
+    assert!(matches!(segments.len(), 1 | 2), "{}", segments.len());
+    assert_eq!(uids_of(&segments[..1]), uids_of(&segments[segments.len() - 1..]));
     assert!(keys_under(&hosted.store, LANDING_PREFIX).await.is_empty(), "the duplicate's landed object is deleted too");
     assert_eq!(hosted.discover.outstanding(), 0);
 }

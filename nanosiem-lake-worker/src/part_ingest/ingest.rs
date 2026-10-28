@@ -357,6 +357,13 @@ pub struct IngestHealth {
     pub buffered_rows: usize,
     pub live_parts: usize,
     pub live_parts_by_level: BTreeMap<String, usize>,
+    /// NAN-4674: the most live parts any one event hour holds (what a query
+    /// over that hour opens), and the hours at or past
+    /// [`crate::parts::levels::FRAGMENTED_HOUR_PARTS`].
+    pub max_parts_per_hour: usize,
+    pub fragmented_hours: usize,
+    /// NAN-4674: runs of tiny batches folded by [`compact_tiny_batches`].
+    pub tiny_batch_folds_total: u64,
     pub merge_backlog: usize,
     /// Arrival age, independent of continuing successful ingest commits.
     pub oldest_unmerged_l0_age_ms: i64,
@@ -1318,6 +1325,18 @@ pub async fn validate_finding(context: &FindingAppendContext<'_>, request: Findi
     Ok(ValidatedFinding { request, proposed, needs_replay_proof, attempted, objects, registered: false })
 }
 
+/// NAN-3067: never START an append whose requester already gave up on it
+/// (its acknowledgement would be lost). Checked before the parts are
+/// registered with the writer authority; once they are, the append commits
+/// even past the deadline (NAN-4700, [`Ingestor::commit_finding`]).
+pub fn requester_still_waiting(request: &FindingAppendRequest, now_ms: i64) -> Result<()> {
+    if let Some(deadline) = request.deadline_unix_ms {
+        ensure!(now_ms <= deadline,
+            super::finding_gate::FindingRefused::Deadline("the requester's deadline passed before the registration"));
+    }
+    Ok(())
+}
+
 /// NAN-3499: detect's finding drain PUTs finding parts with its own
 /// credential, outside the owner writer authority, so control holds no
 /// completion receipt for their files. A committed part file without one can
@@ -1756,6 +1775,47 @@ pub fn l0_chunks(rows: usize) -> Vec<(usize, usize)> {
     let parts = (rows / L0_PARALLEL_MIN_ROWS).clamp(1, MAX_PARALLEL_L0_WRITES);
     let size = rows.div_ceil(parts);
     (0..rows).step_by(size).map(|offset| (offset, size.min(rows - offset))).collect()
+}
+
+/// NAN-4674: a buffered batch below this many rows is tiny.
+pub const TINY_BATCH_ROWS: usize = 256;
+/// NAN-4674: a run of this many tiny batches at the end of an hour is folded
+/// into one.
+pub const TINY_BATCH_RUN: usize = 32;
+
+/// NAN-4674: fold the trailing run of tiny batches of one hour (same
+/// schema, in order) into one batch once it is [`TINY_BATCH_RUN`] long.
+/// A backfill object spread over ~166 hours leaves about one row per hour,
+/// and a one-row batch of the wide OCSF schema holds a 64-byte-aligned
+/// buffer per array: tens of KB for one row, which sealed a wide buffer on
+/// its byte cap long before its row cap. Live batches (hundreds of rows per
+/// object in one or two hours) are never touched. Rows, their order and
+/// schema are unchanged; the flush concatenates and sorts each hour anyway.
+/// Returns the Arrow bytes freed and added.
+pub fn compact_tiny_batches(batches: &mut Vec<RecordBatch>) -> Result<(u64, u64)> {
+    // Cheap first: only a tail of TINY_BATCH_RUN tiny batches is worth a
+    // schema check (a deep compare, about once per run, not per push).
+    let n = batches.len();
+    if n < TINY_BATCH_RUN || batches[n - TINY_BATCH_RUN..].iter().any(|batch| batch.num_rows() >= TINY_BATCH_ROWS) {
+        return Ok((0, 0));
+    }
+    let schema = batches[n - 1].schema();
+    let run = batches.iter().rev()
+        .take_while(|batch| batch.num_rows() < TINY_BATCH_ROWS
+            && (Arc::ptr_eq(&batch.schema(), &schema) || batch.schema() == schema))
+        .count();
+    if run < TINY_BATCH_RUN {
+        return Ok((0, 0));
+    }
+    // Fold first, then replace: an error leaves the hour's batches as they were.
+    let start = n - run;
+    let folded = arrow_select::concat::concat_batches(&schema, &batches[start..])?;
+    debug_assert_eq!(folded.num_rows(), batches[start..].iter().map(RecordBatch::num_rows).sum::<usize>());
+    let freed = batches[start..].iter().map(|batch| batch.get_array_memory_size() as u64).sum::<u64>();
+    let added = folded.get_array_memory_size() as u64;
+    batches.truncate(start);
+    batches.push(folded);
+    Ok((freed, added))
 }
 
 /// One hour's buffered batches (each under the pending schema of its
@@ -2345,6 +2405,7 @@ impl<'a> Ingestor<'a> {
                 return Ok(committed);
             }
         }
+        requester_still_waiting(&validated.request, now_ms)?;
         register_finding_parts(&context, &mut validated).await?;
         self.commit_finding(validated, now_ms).await
     }
@@ -2370,11 +2431,19 @@ impl<'a> Ingestor<'a> {
     pub async fn commit_finding(&mut self, validated: ValidatedFinding, now_ms: i64) -> Result<FindingAppendResponse> {
         ensure!(validated.registered, "finding part objects are not registered with the writer authority");
         let ValidatedFinding { request, proposed, .. } = validated;
-        // Never commit an append its requester already gave up on: its ack
-        // would be lost (Broken pipe) and the next pass would have to prove
-        // the replay against the log (a lean test tenant 2026-09-30, NAN-3067).
-        if let Some(deadline) = request.deadline_unix_ms {
-            ensure!(now_ms <= deadline, super::finding_gate::FindingRefused::Deadline("the requester's deadline passed before the commit"));
+        // NAN-4700: the requester's deadline is checked BEFORE the parts are
+        // registered ([`requester_still_waiting`]), not here. An append whose
+        // registration outlived it still commits: refusing threw the
+        // registration away, the next pass built new parts and registered
+        // them from scratch, and a slow writer authority (FP ops, 2026-10-27:
+        // `lake-writers:complete` 503s, no batch completion) refused every
+        // pass. The lost acknowledgement is the ordinary lost-ack path: the
+        // attempt marker and the floor written below send the next pass's
+        // proof to the entries after this head, and it acknowledges this
+        // `Add` instead of appending a second one.
+        if let Some(deadline) = request.deadline_unix_ms.filter(|deadline| now_ms > *deadline) {
+            tracing::info!(tenant = %self.cfg.tenant_id, late_ms = now_ms - deadline, receipts = request.receipts.len(),
+                "finding append commits past its requester's deadline; the next drain pass acknowledges it from the log");
         }
         ensure!(request.tenant_id == self.cfg.tenant_id, "finding append tenant differs");
         ensure!(request.writer_epoch == self.cfg.writer_epoch && request.writer_epoch > 0,
@@ -4250,7 +4319,10 @@ impl<'a> Ingestor<'a> {
         self.admission_deferred = false;
         // Never admit into a buffer that is partly in the log (B1): its
         // appends are skipped on retry, so new rows would be acked unwritten.
-        if !fresh.is_empty() && !self.buffer.partially_committed() && !self.admission_paused && self.buffer.hours.len() < MAX_FLUSH_EVENT_HOURS
+        // NAN-4674: behind, a wide (backfill) buffer keeps admitting up to
+        // the wide hour cap; see [`flush_event_hour_cap`].
+        if !fresh.is_empty() && !self.buffer.partially_committed() && !self.admission_paused
+            && self.buffer.hours.len() < flush_event_hour_cap(self.behind_last_tick)
             && self.buffer.replay.is_none()
             && !self.buffer_holds_suspect()
         {
@@ -5261,7 +5333,16 @@ impl<'a> Ingestor<'a> {
                 self.buffer.rows += kept.num_rows();
                 self.buffer.buffered_since.get_or_insert_with(std::time::Instant::now);
                 self.update_pipeline_diagnostics();
-                self.buffer.hours.entry(hour).or_default().push(kept);
+                let batches = self.buffer.hours.entry(hour).or_default();
+                batches.push(kept);
+                // NAN-4674: a wide object leaves a row or two per hour; fold
+                // runs of such tiny batches so their per-array overhead does
+                // not spend the buffer's byte cap.
+                let (freed, added) = compact_tiny_batches(batches)?;
+                if freed > 0 {
+                    self.health.tiny_batch_folds_total += 1;
+                }
+                self.buffer.bytes = self.buffer.bytes.saturating_sub(freed).saturating_add(added);
             }
             for (handle, notice, path, sha, bytes) in group {
                 if let Some((count, first)) = refused.get(path) {
@@ -6287,7 +6368,7 @@ impl<'a> Ingestor<'a> {
             // The budget is spent (flight + merges + buffer): admission is
             // stalled, so seal what is buffered rather than wait out the age.
             || (self.buffer.rows > 0 && self.committed_bytes() >= self.cfg.buffer_budget_bytes)
-            || self.buffer.hours.len() >= MAX_FLUSH_EVENT_HOURS
+            || self.buffer.hours.len() >= flush_event_hour_cap(behind)
             || self.buffer.handles.len() >= MAX_FLUSH_OBJECTS
             || self.buffer.rejections.len() >= MAX_REJECTIONS_PER_ENTRY
             // NAN-4319: the next object's decoded rows did not fit beside
@@ -6944,7 +7025,8 @@ impl<'a> Ingestor<'a> {
         super::merge_lanes::launch_order(&mut planned);
         for merge in planned {
             let minute = merge.output_level == Level::Minute;
-            if !minute && (self.catching_up(lag_ms) || self.buffer.rows > 0 || !self.buffer.handles.is_empty()) {
+            if !minute && (self.catching_up(lag_ms) || self.buffer.rows > 0 || !self.buffer.handles.is_empty())
+                && !self.fragmented_merge_may_run_beside_admission(&merge) {
                 continue;
             }
             // NAN-3795: count rewrites are bounded by their own lane, not the
@@ -7200,6 +7282,16 @@ impl<'a> Ingestor<'a> {
         self.coverage_backfill_rows_done = 0;
         self.counted_rows_base = super::count_record::counted_totals().1;
         Ok(())
+    }
+
+    /// NAN-4674: history merges wait while ingest catches up or rows are
+    /// buffered, except ONE that consolidates a fragmented hour (a
+    /// backfill adds a part to every hour it spans on every flush, and
+    /// catch-up lasts as long as the backfill). One at a time: no other
+    /// history merge (or count rewrite) may be in flight, so admission keeps
+    /// the rest of the cell. Lane, memory and budget gates still apply.
+    fn fragmented_merge_may_run_beside_admission(&self, merge: &crate::parts::levels::PlannedMerge) -> bool {
+        super::merge_lanes::fragmented_runs_beside_admission(merge, self.merge_in_flight.iter().map(|flight| &flight.merge))
     }
 
     /// Lag past the hour seal: the backlog is feeding sealed hours.
@@ -7815,12 +7907,18 @@ impl<'a> Ingestor<'a> {
             None => 0,
         };
         let mut by_level = BTreeMap::new();
+        let mut by_hour: BTreeMap<i32, usize> = BTreeMap::new();
         let mut live = 0;
         for part in self.log.live().parts() {
             *by_level.entry(part.level.code().to_string()).or_default() += 1;
+            if part.level.is_hourly() {
+                *by_hour.entry(part.event_hour).or_default() += 1;
+            }
             live += 1;
         }
         h.live_parts = live;
+        h.max_parts_per_hour = by_hour.values().copied().max().unwrap_or(0);
+        h.fragmented_hours = by_hour.values().filter(|parts| crate::parts::levels::hour_is_fragmented(**parts)).count();
         h.log_key_held_total = self.log.log_key_held_total();
         h.live_parts_by_level = by_level;
         h.oldest_unmerged_l0_age_ms = self.log.live().parts()
@@ -7918,6 +8016,24 @@ pub const MAX_FLUSH_OBJECTS: usize = 512;
 /// Seal wide-history buffers promptly. Admission is atomic per source group,
 /// so a single admission may exceed this trigger; no subsequent tick adds to it.
 pub const MAX_FLUSH_EVENT_HOURS: usize = 48;
+/// NAN-4674: the event-hour cap of a buffer while ingest is behind. Every
+/// hour of a flush is at least one L0 part, so with the 48-hour cap a
+/// backfill whose objects each span ~166 hours sealed after ONE admission
+/// group: ~8k rows over 166 hours, ~50-row parts, each paying an owner sign,
+/// ~8 PUTs, an `add` line and a prevalence apply (Dan's bakeoff 2026-10-27:
+/// 21,929 parts for 1.1M rows, admission at 1/7 of the firehose). Behind, the
+/// buffer instead fills to its row, byte, object and catch-up age caps, so
+/// each hour's part carries many groups' rows. 512 hours is the publication
+/// fanout NAN-3947 proved under a slow owner. One buffer is still one `add`
+/// entry and its acks follow that entry: custody is unchanged.
+pub const MAX_WIDE_FLUSH_EVENT_HOURS: usize = 512;
+
+/// NAN-4674: the event hours a buffer may span before it is due (and before
+/// admission stops adding to it). Not behind, the live lane's 48-hour cap,
+/// unchanged; behind, [`MAX_WIDE_FLUSH_EVENT_HOURS`].
+pub fn flush_event_hour_cap(behind: bool) -> usize {
+    if behind { MAX_WIDE_FLUSH_EVENT_HOURS } else { MAX_FLUSH_EVENT_HOURS }
+}
 
 /// Rejections per `reject` entry (the log's validation cap).
 pub const MAX_REJECTIONS_PER_ENTRY: usize = 1_000;

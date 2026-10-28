@@ -49,8 +49,24 @@ impl WritePermission {
         Ok(())
     }
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Intent { request: Value, identity: Value, object: Option<Value>, registered: Option<Value> }
+/// NAN-4676: has the owner's completion window for `identity` closed? Only a
+/// schema-3 identity carries `completion_deadline_at`; anything else (or an
+/// unparseable value) is never treated as expired.
+fn completion_window_closed(identity: &Value) -> bool {
+    identity["completion_deadline_at"].as_str()
+        .and_then(|deadline| chrono::DateTime::parse_from_rfc3339(deadline).ok())
+        .is_some_and(|deadline| deadline.with_timezone(&Utc) <= Utc::now())
+}
+/// NAN-4676: the owner refused this exact request for good (409 conflict,
+/// 410 gone, 422 refused reservation). Auth (401/403), a missing route
+/// (404), rate limits, 5xx and transport errors say nothing about the
+/// request itself and never abandon an intent.
+fn owner_refused_permanently(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.downcast_ref::<OwnerRefused>()
+        .is_some_and(|refused| matches!(refused.status, 409 | 410 | 422)))
+}
 fn digest(value: &Value) -> bool {
     value.as_str().is_some_and(|v| v.len() == 64 && v != "0".repeat(64)
         && v.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
@@ -158,6 +174,12 @@ struct WriterCounters {
     batch_fallbacks: std::sync::atomic::AtomicU64,
     /// Part-object completions taken off the write path (write-behind).
     completion_deferred: std::sync::atomic::AtomicU64,
+    /// NAN-4676: journaled intents whose completion window closed before the
+    /// owner registered them, renewed and completed under a fresh identity.
+    expired_renewed: std::sync::atomic::AtomicU64,
+    /// NAN-4676: expired part-object intents the owner would not renew,
+    /// quarantined so their unpublished part is rebuilt under a new part ID.
+    expired_abandoned: std::sync::atomic::AtomicU64,
 }
 pub struct NativePartWriter {
     counters: WriterCounters,
@@ -171,6 +193,11 @@ pub struct NativePartWriter {
     owner_call_interval: Duration,
     origin: String, tenant: String, cell: String, bucket: String,
     permission: RwLock<WritePermission>, tls: OwnerTlsClient, dir: PathBuf, archive: PathBuf,
+    /// NAN-4676: evidence of journaled intents the owner refused after their
+    /// completion window closed (`<request_id>.superseded.<owner_reservation_sha256>.json` per refused attempt once
+    /// renewed, `<request_id>.abandoned.json` when it could not be). Never
+    /// replayed and never deleted by the writer.
+    quarantine: PathBuf,
     /// Writes hold this shared, so independent objects upload concurrently
     /// (a part's files, ingest flushes beside merges). Journal replay holds
     /// it exclusively: no write is in flight while pending intents are read.
@@ -197,6 +224,8 @@ pub struct NativePartWriter {
     batch: lanes::BatchSupport,
     /// How long calls that arrive together are gathered into one batch.
     coalesce_window: Duration,
+    /// NAN-4713: write-behind completion hold cap (see `lanes::COMPLETION_HOLD_MAX`).
+    completion_hold: Duration,
     /// Test-only: complete every write on its own write path, as before
     /// NAN-4592 (the throughput comparison's baseline).
     #[cfg(test)]
@@ -228,23 +257,25 @@ impl NativePartWriter {
         let root = state.join("native-writer-receipts");
         let dir = root.join("pending");
         let archive = root.join("registered");
-        for path in [&root, &dir, &archive] {
+        let quarantine = root.join("quarantined");
+        for path in [&root, &dir, &archive, &quarantine] {
             std::fs::create_dir_all(path)?;
             ensure!(std::fs::symlink_metadata(path)?.file_type().is_dir(), "native journal requires directories");
             std::fs::File::open(path)?.sync_all()?;
         }
         std::fs::File::open(state)?.sync_all()?;
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt;
-            for path in [&root, &dir, &archive] {
+            for path in [&root, &dir, &archive, &quarantine] {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
                 std::fs::File::open(path)?.sync_all()?;
             } }
         Ok(Self { counters: WriterCounters::default(), writes: tokio::sync::Semaphore::new(super::writer::PUBLISH_CONCURRENCY), next_owner_call: tokio::sync::Mutex::new(tokio::time::Instant::now()), owner_call_interval: Duration::from_millis(50), origin: origin.trim_end_matches('/').into(), tenant: tenant.into(), cell: cell.into(),
             bucket: bucket.into(), permission: RwLock::new(permission),
-            tls: OwnerTlsClient::new(origin, ca, Duration::from_secs(30))?, dir, archive, gate: Default::default(),
+            tls: OwnerTlsClient::new(origin, ca, Duration::from_secs(30))?, dir, archive, quarantine, gate: Default::default(),
             keys: Default::default(), needs_replay: std::sync::atomic::AtomicBool::new(true),
             unavailable_retry_window: OWNER_UNAVAILABLE_RETRY_WINDOW, lane: Default::default(),
             authorizer: Default::default(), batch: Default::default(), coalesce_window: lanes::COALESCE_WINDOW,
+            completion_hold: lanes::COMPLETION_HOLD_MAX,
             #[cfg(test)] synchronous_completion: false })
     }
     /// Match the existing owner admission envelope without changing contract
@@ -276,6 +307,8 @@ impl NativePartWriter {
             "complete_batch_objects_total": c.complete_batch_objects.load(Relaxed),
             "batch_fallbacks_total": c.batch_fallbacks.load(Relaxed),
             "completion_deferred_total": c.completion_deferred.load(Relaxed),
+            "expired_intent_renewed_total": c.expired_renewed.load(Relaxed),
+            "expired_intent_abandoned_total": c.expired_abandoned.load(Relaxed),
             "completion_outstanding": self.lane.outstanding(),
             "batch_routes": self.batch.diagnostics(),
             "timings": c.timings.snapshot()})
@@ -337,6 +370,12 @@ impl NativePartWriter {
     #[cfg(test)]
     pub(crate) fn with_coalesce_window(mut self, window: Duration) -> Self {
         self.coalesce_window = window;
+        self
+    }
+    /// NAN-4713: the write-behind completion hold cap.
+    #[cfg(test)]
+    pub(crate) fn with_completion_hold(mut self, hold: Duration) -> Self {
+        self.completion_hold = hold;
         self
     }
     /// The pre-NAN-4592 write path: every completion on its own write.
@@ -528,7 +567,17 @@ impl NativePartWriter {
                     && intent.request["object_bucket"] == self.bucket
                     && intent.identity["tenant_uuid"] == self.tenant,
                     "native receipt replay binding differs");
-                self.complete_intent(&path, intent).await?;
+                match self.complete_intent(&path, intent).await {
+                    // NAN-4676: an expired part-object intent the owner would
+                    // not renew is quarantined (evidence kept) and no longer
+                    // pending: its unpublished part is rebuilt under a new part
+                    // ID, so it must not hold every later write hostage.
+                    Err(error) if error.downcast_ref::<NativePutUnresolved>().is_some() && !path.exists() => {
+                        tracing::warn!(error = %format!("{error:#}"),
+                            "native replay quarantined an expired part-object intent; its part is rebuilt");
+                    }
+                    other => other?,
+                }
             }
             Ok::<(), anyhow::Error>(())
         }).await.context("native receipt replay time cap exceeded")??;
@@ -612,6 +661,14 @@ impl NativePartWriter {
             self.complete_intent(&path, intent).await?;
             return Ok(None);
         }
+        // NAN-4676: the owner refused this exact write after its window
+        // closed and would not renew it. Its bytes may sit under the key, but
+        // no receipt can ever be issued for this request: report the outcome
+        // unresolved so the enclosing unpublished part is rebuilt under a
+        // fresh part ID (never re-authorized, never re-PUT).
+        if self.quarantine.join(format!("{request_id}.abandoned.json")).exists() {
+            return Err(NativePutUnresolved { key: key.to_string() }.into());
+        }
         let identity = if family == lanes::DEFERRABLE_FAMILY {
             match coalesce {
                 Some(writer) => lanes::AuthorizeCoalescer::authorize(writer, &request).await?,
@@ -658,13 +715,116 @@ impl NativePartWriter {
             "native owner authorization identity differs");
         Ok(())
     }
-    async fn complete_intent(&self, path: &Path, mut intent: Intent) -> Result<()> {
+    async fn complete_intent(&self, path: &Path, intent: Intent) -> Result<()> {
         Self::validate_put_evidence(&intent)?;
-        let receipt = self.post(COMPLETE_PATH, &Self::completion_body(&intent)).await?;
+        let refusal = match self.post(COMPLETE_PATH, &Self::completion_body(&intent)).await {
+            Ok(receipt) => return self.register_receipt(path, intent, receipt),
+            Err(error) => error,
+        };
+        // NAN-4676: the owner refuses every completion past the identity's
+        // completion deadline (409 "completion differs from the stable
+        // owner-authorized writer"), so a replay of that exact body can never
+        // succeed. FP-INC-1027: the control DB was read-only for 5 h, every
+        // completion answered 503 until the 70-minute window closed, and the
+        // replay at cell start then crash-looped ingest on the 409.
+        let expired = refusal.downcast_ref::<OwnerRefused>().is_some_and(|refused| refused.status == 409)
+            && completion_window_closed(&intent.identity);
+        if !expired {
+            return Err(refusal);
+        }
+        self.renew_expired_intent(path, intent, &refusal).await
+    }
+    fn register_receipt(&self, path: &Path, mut intent: Intent, receipt: Value) -> Result<()> {
         intent.registered = Some(receipt);
         Self::validate_registered(&intent)?;
         self.save(path, &intent)?;
         self.archive_registered(path, &intent)
+    }
+    /// NAN-4676: complete an intent whose completion window closed before the
+    /// owner registered it. The PUT landed (its strong ETag is journaled), so
+    /// the same request — same key, bytes and digest — is renewed by the
+    /// owner's append-only stale-attempt renewal (`stale_recovery: "renew"`,
+    /// migration 9000123: a fresh window, an advanced attempt revision and
+    /// stable identity) and the journaled PUT evidence is completed under that
+    /// fresh owner-authorized identity. The owner still HEADs the provider
+    /// (ETag, length, SHA-256) before registering. The refused intent is
+    /// quarantined first, so its identity, PUT evidence and the refusal stay
+    /// on disk. Nothing is re-PUT and the key never changes, so the object is
+    /// registered once (no duplicate rows) and no landed byte is dropped.
+    ///
+    /// When the owner refuses the renewal itself (e.g. its renewal limit), a
+    /// part object (`lake_part_file`: a random part ID, never named by the log
+    /// before it is registered) is abandoned: the intent leaves the pending
+    /// journal for quarantine and the write reports [`NativePutUnresolved`],
+    /// so the enclosing unpublished part is rebuilt under a new part ID. A
+    /// part-log entry or checkpoint (a deterministic key the log may already
+    /// name) is never abandoned: it stays pending and fails closed.
+    async fn renew_expired_intent(&self, path: &Path, intent: Intent, refusal: &anyhow::Error) -> Result<()> {
+        let request = &intent.request;
+        let request_id = request["request_id"].as_str().context("native request id missing")?.to_string();
+        let key = request["object_key"].as_str().context("native object key missing")?.to_string();
+        let sha = request["content_sha256"].as_str().context("native content digest missing")?.to_string();
+        let bytes = request["content_length"].as_u64().context("native content length missing")?;
+        let deferrable = request["key_family"] == lanes::DEFERRABLE_FAMILY;
+        // One superseded record per refused owner attempt (its reservation
+        // digest), never one per retry: while the owner cannot renew (e.g. a
+        // control outage answering 503), every replay comes back here, and a
+        // timestamped name would grow the quarantine without bound.
+        let attempt = intent.identity["owner_reservation_sha256"].as_str()
+            .filter(|_| digest(&intent.identity["owner_reservation_sha256"]))
+            .context("native refused identity authority digest invalid")?;
+        let superseded = format!("{request_id}.superseded.{attempt}.json");
+        if !self.quarantine.join(&superseded).exists() {
+            self.quarantine_intent(&superseded, &intent, refusal)?;
+        }
+        tracing::warn!(key = %key, request_id = %request_id,
+            completion_deadline_at = %intent.identity["completion_deadline_at"],
+            "native writer intent expired before the owner registered it; renewing the exact request");
+        let mut renewal = request.clone();
+        renewal["stale_recovery"] = json!("renew");
+        let renewed = self.post(AUTHORIZE_PATH, &renewal).await.and_then(|identity| {
+            self.validate_identity(request, &identity, &key, &sha, bytes)?;
+            ensure!(!completion_window_closed(&identity), "native stale-attempt renewal did not open a fresh window");
+            Ok(identity)
+        });
+        let identity = match renewed {
+            Ok(identity) => identity,
+            Err(error) if deferrable && owner_refused_permanently(&error) => {
+                self.quarantine_intent(&format!("{request_id}.abandoned.json"), &intent, &error)?;
+                std::fs::remove_file(path)?;
+                std::fs::File::open(&self.dir)?.sync_all()?;
+                self.counters.expired_abandoned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(key = %key, request_id = %request_id, error = %format!("{error:#}"),
+                    "owner refused to renew an expired part-object intent; quarantined, its part is rebuilt under a new part ID");
+                return Err(NativePutUnresolved { key }.into());
+            }
+            Err(error) => return Err(error.context("renew expired native writer intent")),
+        };
+        let mut object = intent.object.clone().context("native PUT evidence missing")?;
+        object["writer_authority_sha256"] = identity["owner_reservation_sha256"].clone();
+        let renewed = Intent { request: intent.request, identity, object: Some(object), registered: None };
+        // The renewed intent replaces the pending one (the refused one is in
+        // quarantine): a crash from here replays the renewed identity.
+        self.save(path, &renewed)?;
+        let receipt = self.post(COMPLETE_PATH, &Self::completion_body(&renewed)).await
+            .context("complete renewed native writer intent")?;
+        self.register_receipt(path, renewed, receipt)?;
+        self.counters.expired_renewed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(key = %key, request_id = %request_id, "expired native writer intent completed under a renewed owner identity");
+        Ok(())
+    }
+    /// Durably record a refused intent and the refusal (no secret: the
+    /// journal never holds the bearer).
+    fn quarantine_intent(&self, name: &str, intent: &Intent, refusal: &anyhow::Error) -> Result<()> {
+        use std::io::Write;
+        let status = refusal.chain().find_map(|cause| cause.downcast_ref::<OwnerRefused>().map(|refused| refused.status));
+        let record = json!({"schema_version":1,"quarantined_at":Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            "owner_status":status,"refusal":format!("{refusal:#}"),"intent":intent});
+        let mut temp = tempfile::NamedTempFile::new_in(&self.quarantine)?;
+        temp.write_all(&serde_json::to_vec(&record)?)?; temp.as_file().sync_all()?;
+        temp.persist(self.quarantine.join(name)).map_err(|e| e.error)?;
+        std::fs::File::open(&self.quarantine)?.sync_all()?;
+        Ok(())
     }
     /// The exact single-route completion body of a journaled intent.
     fn completion_body(intent: &Intent) -> Value {
@@ -711,6 +871,10 @@ impl NativePartWriter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "native_expired_intent_tests.rs"]
+mod expired_intent_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

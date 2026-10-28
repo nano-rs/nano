@@ -85,12 +85,25 @@ async fn widest_real_payload_matches_reference_under_statement_cap() {
         .unwrap();
         let base = "SELECT * FROM file({paths:String}, Parquet) ORDER BY time DESC, metadata.uid DESC LIMIT 201 SETTINGS max_threads=8, max_memory_usage=10737418240, max_execution_time=600, max_bytes_before_external_sort=805306368, max_temporary_data_on_disk_size_for_query=6442450944, use_query_cache=0";
         let budget_threads = if mode == "one-budget" { 1 } else { 8 };
-        let reader_threads = if mode == "reference" {
-            8
+        // NAN-4694: "role-small-lane" is an 8-core query role's role-derived
+        // payload reader (4 threads x 512 rows) at the small-lane statement
+        // cap it actually runs under.
+        let small_lane_bytes = nanosiem_lake_worker::part_query::memory_budget::SMALL_QUERY_BYTES;
+        let statement_cap = if mode == "role-small-lane" {
+            small_lane_bytes
         } else {
-            budget_threads.min(1)
+            nanosiem_lake_worker::planner::PAYLOAD_READER_MEMORY_BYTES
         };
-        let memory_cap = if file_limit == 0 {
+        let reader_threads = match mode.as_str() {
+            "reference" => 8,
+            _ => nanosiem_lake_worker::planner::payload_role_defaults(budget_threads, statement_cap).0,
+        };
+        // The whole day (`NAN3077_PAYLOAD_FILES=0`) outgrows a small lane at
+        // any reader setting (~0.9 GiB of sort state at 1 x 128), so the role
+        // mode is held to the large-lane cap there like the others.
+        let memory_cap = if mode == "role-small-lane" && file_limit != 0 {
+            small_lane_bytes
+        } else if file_limit == 0 {
             1_503_238_553_u64
         } else {
             1_288_490_188_u64
@@ -98,9 +111,13 @@ async fn widest_real_payload_matches_reference_under_statement_cap() {
         let sql = if mode == "reference" {
             base.into()
         } else {
+            // NAN-3077's statement (one reader thread, 128-row blocks) is the
+            // role defaults at a one-reader statement cap; "role-small-lane"
+            // is the 8-core role's (NAN-4694).
             let bounded = nanosiem_lake_worker::planner::bounded_payload_settings(
                 base.into(),
                 budget_threads,
+                statement_cap,
             )
             .replace(
                 "max_memory_usage=10737418240",
@@ -168,7 +185,7 @@ async fn widest_real_payload_matches_reference_under_statement_cap() {
     // Fresh processes keep the unbounded reference's allocations out of the
     // bounded memory measurement and avoid a failure/retry on any executor.
     let mut reference = None;
-    for mode in ["reference", "eight-budget", "one-budget"] {
+    for mode in ["reference", "eight-budget", "one-budget", "role-small-lane"] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--ignored", "--nocapture"])
             .env(CHILD, mode)

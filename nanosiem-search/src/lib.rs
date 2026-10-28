@@ -475,6 +475,8 @@ impl SearchState {
                 );
             }
 
+            // NAN-4703: agent-class searches fail closed without Redis here.
+            admission_controller.expect_redis();
             // Wire Redis into admission controller for cluster-wide limits
             match Self::connect_redis(url).await {
                 Some(conn) => {

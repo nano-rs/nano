@@ -153,6 +153,8 @@ pub mod enterprise_shared_r2_owner_recovery;
 #[cfg(feature = "enterprise")]
 pub mod enterprise_shared_r2_writer_authority;
 #[cfg(feature = "enterprise")]
+pub mod enterprise_shared_registry_maintenance;
+#[cfg(feature = "enterprise")]
 pub mod enterprise_shared_writer_registry_gc;
 #[cfg(feature = "enterprise")]
 pub mod enterprise_shared_r2_delete_authority;

@@ -925,7 +925,7 @@ pub async fn open_engine_timed(options: &OpenOptions, phases: &mut StartupPhases
         tracing::info!(small_lanes = classes.small_lanes, small_bytes = classes.small_bytes, large_bytes = classes.large_bytes,
             large_lanes = super::lanes::large_lane_connections(classes.large_bytes, routing_v2), routing_v2, "query lanes by size");
     }
-    let threads = u64::from(nanosiem_lake_cell::budget::query_threads(options.cpu_millis));
+    let (threads, statement_memory_bytes) = role_statement_limits(options.cpu_millis, &budget);
     // NAN-4174: query[T]'s statements share one thread pool sized to the
     // role quota (interactive first; see `thread_budget`). The point lane is
     // outside it (one row group per statement). Roles without size classes
@@ -971,7 +971,7 @@ pub async fn open_engine_timed(options: &OpenOptions, phases: &mut StartupPhases
         bucket: boot.bucket.clone(),
         compiler: boot.engine.compiler.clone(),
         max_query_bytes: boot.engine.max_query_bytes,
-        max_memory_bytes: budget.per_query_bytes.min(crate::planner::DEFAULT_QUERY_MEMORY_BYTES),
+        max_memory_bytes: statement_memory_bytes,
         max_execution_seconds: boot.engine.max_execution_seconds,
         threads,
     };
@@ -993,6 +993,16 @@ pub async fn open_engine_timed(options: &OpenOptions, phases: &mut StartupPhases
     gate.seed(live_ranges);
     phases.lap("engine_and_gate");
     Ok((engine, gate))
+}
+
+/// query[T]'s per-statement `(threads, memory cap)` from the role: its CPU
+/// quota in whole cores and its (size-classed) memory budget. The planner
+/// derives the payload reader's defaults from these (NAN-4694).
+pub(crate) fn role_statement_limits(cpu_millis: u32, budget: &super::memory_budget::QueryMemoryBudget) -> (u64, u64) {
+    (
+        u64::from(nanosiem_lake_cell::budget::query_threads(cpu_millis)),
+        budget.per_query_bytes.min(crate::planner::DEFAULT_QUERY_MEMORY_BYTES),
+    )
 }
 
 /// Query readiness vs. prewarm requests (NAN-2984). Only a gated request
@@ -3561,6 +3571,7 @@ impl nanosiem_lake_cell::child::TenantService for QueryService {
             lag_seconds: 0.0,
             oldest_unmerged_l0_age_seconds: 0.0,
             l0_merge_overdue_seconds: 0.0,
+            max_parts_per_hour: 0,
             prevalence_behind_seconds: 0.0,
             prevalence_behind_entries: 0,
             prevalence_degraded_seconds: 0.0,

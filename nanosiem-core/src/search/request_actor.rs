@@ -59,6 +59,11 @@ where
             Some(budget) => Box::pin(crate::search::admission::with_wait_budget(budget, future)),
             None => future,
         };
+    // NAN-4703: the query class follows too, so a side task of an agent
+    // search admits in the agent class.
+    let class = crate::search::admission::current_query_class();
+    let future: std::pin::Pin<Box<dyn Future<Output = F::Output> + Send>> =
+        Box::pin(crate::search::admission::with_query_class(class, future));
     use tracing::Instrument;
     use tracing::instrument::WithSubscriber;
     let future = Box::pin(future.instrument(tracing::Span::current()).with_current_subscriber());
@@ -84,6 +89,19 @@ mod tests {
         })
         .await;
         assert_eq!(current_request_actor(), None);
+    }
+
+    #[tokio::test]
+    async fn spawned_tasks_inherit_the_query_class() {
+        use crate::search::admission::{current_query_class, with_query_class, QueryClass};
+        with_query_class(QueryClass::Agent, async {
+            let bare = tokio::spawn(async { current_query_class() }).await.unwrap();
+            assert_eq!(bare, QueryClass::Human);
+            let inherited = tokio::spawn(inherit(async { current_query_class() })).await.unwrap();
+            assert_eq!(inherited, QueryClass::Agent);
+        })
+        .await;
+        assert_eq!(current_query_class(), QueryClass::Human);
     }
 
     #[tokio::test]

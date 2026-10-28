@@ -2102,6 +2102,10 @@ struct LakeDistinctPipelinePlan {
     count_output_alias: Option<String>,
     values_alias: String,
     aggregate_query: Query,
+    /// NAN-4695: the original `stats dc(..) [, count] [by ..]` (gated), for a
+    /// `dc()` without `values()`: one whole-range statement answers it
+    /// exactly (`uniqExact` in the GROUP BY) without shipping value sets.
+    exact_query: Option<Query>,
     post_commands: Vec<Command>,
 }
 
@@ -3645,6 +3649,10 @@ fn lake_distinct_pipeline_plan(query: &Query) -> Option<LakeDistinctPipelinePlan
                             group_by: (!group_by.is_empty()).then_some(group_by.clone()),
                         },
                     };
+                    let exact_query = values.is_none().then(|| Query::Piped {
+                        source: source.clone(),
+                        command: command.clone(),
+                    });
                     return Some(LakeDistinctPipelinePlan {
                         group_by,
                         output_alias: distinct.output_alias(),
@@ -3652,6 +3660,7 @@ fn lake_distinct_pipeline_plan(query: &Query) -> Option<LakeDistinctPipelinePlan
                         count_output_alias: count.map(crate::query::Aggregation::output_alias),
                         values_alias,
                         aggregate_query,
+                        exact_query,
                         post_commands: Vec::new(),
                     });
                 }
@@ -3886,6 +3895,59 @@ const LAKE_MAX_SLICE_ATTEMPTS: usize = 64;
 /// `bin/lake_query_compile.rs`, `groupUniqArray(10001)`). A state this full
 /// may be truncated.
 const LAKE_DISTINCT_STATE_CAP: usize = 10_001;
+
+/// NAN-4695: the rows of a whole-range `stats dc(..) [, count] [by ..]`
+/// statement in the sliced merge's shape and order: group fields, the
+/// distinct count and the count as numbers, sorted by the count (else the
+/// distinct count) descending, then by group.
+fn lake_distinct_exact_rows(
+    plan: &LakeDistinctPipelinePlan,
+    rows: Vec<serde_json::Value>,
+    max_groups: usize,
+) -> Result<Vec<serde_json::Value>, SearchError> {
+    if rows.len() > max_groups {
+        return Err(SearchError::ResourceExhausted(format!(
+            "distinct count produced {} groups above the configured bound of {max_groups}",
+            rows.len()
+        )));
+    }
+    let number = |object: &serde_json::Map<String, serde_json::Value>, alias: &str| {
+        object
+            .get(alias)
+            .and_then(|value| value.as_u64().or_else(|| value.as_str().and_then(|value| value.parse().ok())))
+            .ok_or_else(|| SearchError::SqlValidationError(format!("lake distinct count omitted numeric {alias}")))
+    };
+    let mut complete = rows
+        .into_iter()
+        .map(|row| -> Result<_, SearchError> {
+            let object = row.as_object().ok_or_else(|| {
+                SearchError::SqlValidationError("lake distinct count returned a non-object row".to_string())
+            })?;
+            let groups = plan
+                .group_by
+                .iter()
+                .map(|field| object.get(field).cloned().unwrap_or(serde_json::Value::Null))
+                .collect::<Vec<_>>();
+            let key = serde_json::to_string(&groups).map_err(|error| {
+                SearchError::SqlValidationError(format!("lake distinct group key could not be encoded: {error}"))
+            })?;
+            let distinct = number(object, &plan.output_alias)?;
+            let mut out = serde_json::Map::new();
+            for (field, value) in plan.group_by.iter().zip(groups) {
+                out.insert(field.clone(), value);
+            }
+            out.insert(plan.output_alias.clone(), serde_json::Value::from(distinct));
+            let mut sort_count = distinct;
+            if let Some(alias) = plan.count_output_alias.as_deref() {
+                sort_count = number(object, alias)?;
+                out.insert(alias.to_string(), serde_json::Value::from(sort_count));
+            }
+            Ok((key, sort_count, serde_json::Value::Object(out)))
+        })
+        .collect::<Result<Vec<_>, SearchError>>()?;
+    complete.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    Ok(complete.into_iter().map(|(_, _, row)| row).collect())
+}
 
 fn lake_distinct_state_len(state: &serde_json::Value) -> usize {
     match state {
@@ -6024,9 +6086,48 @@ impl SearchService {
             )
         })?;
         let chunk_limit = max_groups.clamp(1, self.config.max_limit);
-        let mut pending = vec![("0".to_string(), request.time_range.clone())];
-        let mut chunks = Vec::new();
+        // NAN-4695: a dc() without values() is exact in one whole-range
+        // statement (uniqExact in the GROUP BY), with no value sets shipped
+        // or merged here. Only a scan-budget rejection falls back to the
+        // sliced value-state merge below, which stays exact at any range
+        // and starts from the rejected range's halves.
         let mut retries = LakeSliceRetries::new();
+        let mut pending = vec![("0".to_string(), request.time_range.clone())];
+        if let Some(exact_query) = plan.exact_query.as_ref() {
+            let query_id = format!("{query_id}-dc-x");
+            let mut exact_request = request.clone();
+            exact_request.query = exact_query.pretty_print();
+            exact_request.limit = Some(chunk_limit);
+            exact_request.offset = Some(0);
+            exact_request.skip_histogram = true;
+            exact_request.skip_field_stats = true;
+            exact_request.table_view = false;
+            exact_request.request_id = Some(query_id.clone());
+            match client.search(&exact_request, &query_id, None, scope.deny_set()).await {
+                Ok(response) => {
+                    if !response.total_count_exact || response.total_count > response.results.len() as u64 {
+                        return Err(SearchError::ResourceExhausted(format!(
+                            "distinct count exceeded the group bound of {chunk_limit}"
+                        )));
+                    }
+                    let complete = lake_distinct_exact_rows(plan, response.results, max_groups)?;
+                    return self.finish_primary_lake_count_stats(
+                        request,
+                        start_time,
+                        parsed,
+                        complete,
+                        &plan.post_commands,
+                        max_groups,
+                    );
+                }
+                Err(error) if is_lake_scan_budget_rejection(&error) => {
+                    let (left, right) = retries.split("0", &request.time_range, error, &request.query)?;
+                    pending = vec![("0l".to_string(), left), ("0r".to_string(), right)];
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let mut chunks = Vec::new();
         let mut truncation_splits = 0_usize;
         while !pending.is_empty() {
             let attempts = futures::stream::iter(pending.drain(..).map(|(path, range)| {
@@ -11450,6 +11551,13 @@ mod ext_remap_note_tests {
                 assert_eq!(scoped.values_output_alias, unrestricted.values_output_alias);
                 assert_eq!(scoped.count_output_alias, unrestricted.count_output_alias);
                 assert_eq!(scoped.post_commands, unrestricted.post_commands);
+                // NAN-4695: a dc() without values() also plans its exact
+                // whole-range statement, on the same gated source.
+                assert_eq!(scoped.exact_query.is_some(), !query.contains("values("), "{query}");
+                if let Some(exact) = &scoped.exact_query {
+                    assert!(exact.pretty_print().contains("metadata.log_source"), "{deny:?} {}", exact.pretty_print());
+                    assert!(exact.pretty_print().contains("dc("), "{}", exact.pretty_print());
+                }
                 // The executed query keeps exactly this caller's gate, so a
                 // denied source can never be counted.
                 assert_ne!(scoped.aggregate_query, unrestricted.aggregate_query);
@@ -12669,6 +12777,9 @@ mod nan3078_durable_post_processing_tests {
                 "a": some.then(|| sum.unwrap() as f64 / ports.len() as f64),
                 "lo": ports.iter().min(),
                 "hi": ports.iter().max(),
+                // NAN-4695: a whole-range `dc(actor.user.name) as users`
+                // (uniqExact; quoted UInt64 like a cell's).
+                "users": rows.iter().map(|(_, user, _)| *user).collect::<BTreeSet<_>>().len().to_string(),
                 "__nano_distinct_values": some.then(|| rows.iter()
                     .map(|(_, user, _)| base64::engine::general_purpose::STANDARD.encode(user))
                     .collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(", ")),
@@ -12689,6 +12800,19 @@ mod nan3078_durable_post_processing_tests {
                 .map(|(user, rows)| {
                     let mut row = state(&rows);
                     row["actor.user.name"] = serde_json::json!(user);
+                    row
+                })
+                .collect()
+        } else if query.contains(" by dst_endpoint.port") {
+            let mut ports = BTreeMap::<i64, Vec<&SliceEvent>>::new();
+            for event in events {
+                ports.entry(event.2).or_default().push(event);
+            }
+            ports
+                .into_iter()
+                .map(|(port, rows)| {
+                    let mut row = state(&rows);
+                    row["dst_endpoint.port"] = serde_json::json!(port);
                     row
                 })
                 .collect()
@@ -12767,6 +12891,208 @@ mod nan3078_durable_post_processing_tests {
             .unwrap();
     }
 
+    /// NAN-4695: a `dc()` without `values()` whose whole range the budget
+    /// admits is one statement, the original `stats` (uniqExact), not the
+    /// value-state merge: ungrouped and grouped, exact, ordered like the
+    /// merge (by count, then group), with the post commands applied.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn a_whole_range_dc_is_one_exact_statement() {
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(whole_range_dc_case())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "enterprise")]
+    async fn whole_range_dc_case() {
+        let tenant = uuid::Uuid::from_u128(0x4695);
+        let now = chrono::SubsecRound::trunc_subsecs(chrono::Utc::now(), 6);
+        let start = now - chrono::Duration::hours(4);
+        let at = |minutes: i64| start + chrono::Duration::minutes(minutes);
+        let events: Vec<SliceEvent> =
+            vec![(at(10), "alice", 443), (at(20), "bob", 22), (at(200), "bob", 8080), (at(230), "carol", 3389)];
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(SlicingAggregateWorker {
+                tenant: tenant.to_string(),
+                max_width: chrono::Duration::hours(5),
+                events,
+            })
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let view = tenant_view(&server, tenant, dir.path()).await;
+        let number = |value: &serde_json::Value| {
+            value.as_f64().or_else(|| value.as_str().and_then(|s| s.parse().ok())).unwrap_or_else(|| panic!("{value}"))
+        };
+        for (query, expected) in [
+            ("metadata.log_source=aws_cloudtrail | stats dc(actor.user.name) as users, count", vec![(None, 3.0, Some(4.0))]),
+            ("metadata.log_source=aws_cloudtrail | stats dc(actor.user.name) as users", vec![(None, 3.0, None)]),
+            (
+                "metadata.log_source=aws_cloudtrail | stats dc(actor.user.name) as users, count by actor.user.name",
+                vec![(Some("bob"), 1.0, Some(2.0)), (Some("alice"), 1.0, Some(1.0)), (Some("carol"), 1.0, Some(1.0))],
+            ),
+            (
+                "metadata.log_source=aws_cloudtrail | stats dc(actor.user.name) as users, count by actor.user.name | where count < 2",
+                vec![(Some("alice"), 1.0, Some(1.0)), (Some("carol"), 1.0, Some(1.0))],
+            ),
+        ] {
+            let before = server.received_requests().await.unwrap().len();
+            let request: SearchRequest = serde_json::from_value(serde_json::json!({
+                "query": query,
+                "time_range": {"start": start, "end": start + chrono::Duration::hours(4)},
+                "limit": 100,
+                "skip_histogram": true,
+            }))
+            .unwrap();
+            let rows = view.search(request, &ScopeSet::unrestricted()).await.unwrap_or_else(|error| panic!("{query}: {error}")).results;
+            let sent = server.received_requests().await.unwrap();
+            assert_eq!(sent.len() - before, 1, "{query}: one statement");
+            let body: serde_json::Value = serde_json::from_slice(&sent[before].body).unwrap();
+            let text = body["query"].as_str().unwrap();
+            assert!(body["request_id"].as_str().unwrap().ends_with("-dc-x"), "{body}");
+            assert!(text.contains("dc(actor.user.name)") && !text.contains("__nano_distinct"), "{query}: sent {text}");
+            assert!(text.contains("aws_cloudtrail"), "the gate and the base search are kept: {text}");
+            let got = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.get("actor.user.name").and_then(|value| value.as_str()),
+                        number(&row["users"]),
+                        row.get("count").map(number),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(got, expected, "{query}: {rows:?}");
+        }
+    }
+
+    /// NAN-4695 oracle: `dc()` through the production planner equals a
+    /// brute-force distinct count over the fixture, ungrouped and grouped by
+    /// a field other than the counted one, on both routes: the whole-range
+    /// `uniqExact` statement (budget admits the range) and the sliced
+    /// value-state merge (budget rejects it). Users repeat across slices and
+    /// across groups, so a double-counted or dropped slice changes the answer;
+    /// both routes return the same rows in the same order.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn dc_matches_a_brute_force_oracle_on_both_routes() {
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(dc_oracle_case())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "enterprise")]
+    async fn dc_oracle_case() {
+        let tenant = uuid::Uuid::from_u128(0x4695_0de);
+        let now = chrono::SubsecRound::trunc_subsecs(chrono::Utc::now(), 6);
+        let start = now - chrono::Duration::hours(4);
+        let users: Vec<&'static str> =
+            (0..37).map(|i| &*Box::leak(format!("user{i:02}").into_boxed_str())).collect();
+        let ports = [22_i64, 53, 443, 3389, 8080];
+        // Deterministic LCG; offsets stay off every bisect boundary (whole
+        // hours, half hours, ...) because each sits 7.3 s past a minute.
+        let mut seed = 0x4695_u64;
+        let mut next = |bound: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % bound
+        };
+        let events: Vec<SliceEvent> = (0..400)
+            .map(|_| {
+                let minute = next(240) as i64;
+                let at = start + chrono::Duration::minutes(minute) + chrono::Duration::milliseconds(7_300);
+                // Skewed so groups differ in size and distinct count.
+                let user = users[(next(37) * next(37) / 36) as usize];
+                (at, user, ports[next(ports.len() as u64) as usize])
+            })
+            .collect();
+        let oracle = |grouped: bool| {
+            let mut groups = BTreeMap::<Option<i64>, (BTreeSet<&str>, u64)>::new();
+            for (_, user, port) in &events {
+                let entry = groups.entry(grouped.then_some(*port)).or_default();
+                entry.0.insert(user);
+                entry.1 += 1;
+            }
+            groups
+                .into_iter()
+                .map(|(port, (users, count))| (port, users.len() as u64, count))
+                .collect::<BTreeSet<_>>()
+        };
+        let number = |value: &serde_json::Value| {
+            value.as_f64().or_else(|| value.as_str().and_then(|s| s.parse().ok())).unwrap_or_else(|| panic!("{value}"))
+        };
+        let mut answers = Vec::new();
+        for (max_width, sliced) in [(chrono::Duration::hours(5), false), (chrono::Duration::minutes(61), true)] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(SlicingAggregateWorker { tenant: tenant.to_string(), max_width, events: events.clone() })
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            let view = tenant_view(&server, tenant, dir.path()).await;
+            let mut route = Vec::new();
+            for (tail, grouped) in [("", false), (" by dst_endpoint.port", true)] {
+                let query = format!("metadata.log_source=aws_cloudtrail | stats dc(actor.user.name) as users, count{tail}");
+                let before = server.received_requests().await.unwrap().len();
+                let request: SearchRequest = serde_json::from_value(serde_json::json!({
+                    "query": query,
+                    "time_range": {"start": start, "end": start + chrono::Duration::hours(4)},
+                    "limit": 100,
+                    "skip_histogram": true,
+                }))
+                .unwrap();
+                let rows = view
+                    .search(request, &ScopeSet::unrestricted())
+                    .await
+                    .unwrap_or_else(|error| panic!("{query}: {error}"))
+                    .results;
+                let ids = server.received_requests().await.unwrap()[before..]
+                    .iter()
+                    .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["request_id"].to_string())
+                    .collect::<Vec<_>>();
+                if sliced {
+                    assert!(ids.iter().filter(|id| id.contains("-dc-0")).count() >= 4, "{query}: sliced {ids:?}");
+                } else {
+                    assert!(ids.len() == 1 && ids[0].ends_with("-dc-x\""), "{query}: one exact statement {ids:?}");
+                }
+                let got = rows
+                    .iter()
+                    .map(|row| {
+                        let port = row.get("dst_endpoint.port").map(|port| number(port) as i64);
+                        (port, number(&row["users"]) as u64, number(&row["count"]) as u64)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    got.iter().copied().collect::<BTreeSet<_>>(),
+                    oracle(grouped),
+                    "{query} (sliced={sliced}): {rows:?}"
+                );
+                assert_eq!(got.len(), oracle(grouped).len(), "{query}: duplicate groups {rows:?}");
+                route.push(got);
+            }
+            answers.push(route);
+        }
+        assert_eq!(answers[0], answers[1], "the exact and sliced routes return the same rows in the same order");
+    }
+
     #[cfg(feature = "enterprise")]
     async fn sliced_ungrouped_merge_case() {
         let tenant = uuid::Uuid::from_u128(0x4292);
@@ -12821,6 +13147,21 @@ mod nan3078_durable_post_processing_tests {
         assert_eq!(row["last_user"], "carol", "{row}");
         let row = search(distinct, start).await.remove(0);
         assert_eq!(number(&row["users"]), 3.0, "{row}");
+        // NAN-4695: a dc() alone tries one whole-range statement first; the
+        // budget rejects it here, so it is sliced and merged exactly.
+        let dc_only = "metadata.log_source=aws_cloudtrail | stats dc(actor.user.name) as users, count";
+        let before = server.received_requests().await.unwrap().len();
+        let dc_row = search(dc_only, start).await.remove(0);
+        let sent = server.received_requests().await.unwrap();
+        assert!(sent.len() - before >= 5, "rejected whole range, then sliced: {}", sent.len() - before);
+        let ids = sent[before..]
+            .iter()
+            .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["request_id"].to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.iter().filter(|id| id.contains("-dc-x")).count(), 1, "{ids:?}");
+        assert!(!ids.iter().any(|id| id.ends_with("-dc-0\"")), "the rejected whole range is not re-sent: {ids:?}");
+        assert!(ids.iter().filter(|id| id.contains("-dc-0")).count() >= 2, "sliced after the rejection: {ids:?}");
+        assert_eq!((number(&dc_row["users"]), number(&dc_row["count"])), (3.0, 4.0), "{dc_row}");
         let mut users = row["v"].as_str().unwrap_or_else(|| panic!("{row}")).split(", ").collect::<Vec<_>>();
         users.sort_unstable();
         assert_eq!(users, ["alice", "bob", "carol"], "{row}");

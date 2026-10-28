@@ -56,7 +56,17 @@ pub(super) struct FreshServingBackend {
     state: Mutex<State>,
     live: Mutex<(Vec<PartRef>, i64, MergePolicy)>,
     batch: crate::part_ingest::export::ExportBatchBounds,
+    /// FP-T101: recorded batches past which a resumed epoch stops planning
+    /// deltas and is retired instead (see [`EPOCH_RESUME_LIMIT`]).
+    resume_limit: usize,
+    vanished: Mutex<Option<super::super::lifecycle::Vanished>>,
 }
+/// FP-T101: every resume after the master moved records one more delta, and
+/// [`epoch_plans`] refuses more than 1024 batches (every batch is a retained
+/// snapshot until the epoch's expiry). An epoch that keeps failing would grow
+/// until that bound made every pass error. Past this count the epoch takes the
+/// retire-and-rebuild fallback, leaving room for one maximal delta below it.
+const EPOCH_RESUME_LIMIT: usize = 512;
 impl FreshServingBackend {
     pub fn new(factory: Arc<dyn ServingFactory>, work: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&work)?;
@@ -74,11 +84,18 @@ impl FreshServingBackend {
             state: Mutex::new(state),
             live: Mutex::new((vec![], 0, MergePolicy::default())),
             batch: crate::part_ingest::export::ExportBatchBounds::DEFAULT,
+            resume_limit: EPOCH_RESUME_LIMIT,
+            vanished: Mutex::new(None),
         })
     }
     #[cfg(test)]
     pub(super) fn with_batch(mut self, batch: crate::part_ingest::export::ExportBatchBounds) -> Self {
         self.batch = batch;
+        self
+    }
+    #[cfg(test)]
+    pub(super) fn with_resume_limit(mut self, limit: usize) -> Self {
+        self.resume_limit = limit;
         self
     }
     fn state(&self) -> State {
@@ -191,6 +208,9 @@ impl CatalogLifecycleBackend for FreshServingBackend {
     fn bucket(&self) -> &str {
         self.factory.bucket()
     }
+    fn set_vanished(&self, vanished: super::super::lifecycle::Vanished) {
+        *self.vanished.lock().expect("serving vanished") = Some(vanished);
+    }
     async fn prepare_sync(&self, parts: &[PartRef], now: i64, policy: &MergePolicy) -> Result<()> {
         *self.live.lock().expect("serving live set") = (parts.to_vec(), now, *policy);
         Ok(())
@@ -246,16 +266,64 @@ impl CatalogLifecycleBackend for FreshServingBackend {
             std::fs::create_dir_all(&directory)?;
             let mut plans = ExportState::load_durable(&directory)?;
             let started = std::time::Instant::now();
+            // Part GC never waits on this catalog. An uncommitted recorded
+            // batch that adds a part GC may have deleted can never commit
+            // (its data is gone) and the master never holds that part again:
+            // this unpublished epoch cannot converge. Retire it unexposed;
+            // the next attempt builds a fresh one from the live set.
+            if plans.last_plan_ms > 0 {
+                let vanished = self.vanished.lock().expect("serving vanished").clone();
+                if let Some(vanished) = vanished {
+                    // The newest batch adding such a part; only an
+                    // uncommitted one (past the epoch checkpoint) is fatal.
+                    let mut newest = None;
+                    for path in epoch_plans(&directory)? {
+                        let manifest: ExportManifest = serde_json::from_slice(&std::fs::read(path)?)?;
+                        if manifest.add.iter().any(|p| vanished(&p.part_id)) {
+                            newest = Some(manifest.planned_at_ms);
+                        }
+                    }
+                    // The local watermark lags a commit at most (a landed
+                    // commit without it): conservative, never a missed one.
+                    let committed = epoch_committed(&directory)?;
+                    if newest.is_some_and(|at| at > committed) {
+                        serving.retire().await?;
+                        state.pending = Some(format!("events_{}", uuid::Uuid::new_v4().simple()));
+                        self.save(state)?;
+                        anyhow::bail!("serving epoch names a part removed by part GC; rebuilding");
+                    }
+                }
+            }
             // NAN-4614: the fresh epoch registers the whole live set, in
             // bounded batches like the master. The chain ENDS at the master
             // checkpoint, so the master's next delta continues it. Batches
             // stay in this epoch's directory: a retry replays them all, each
             // already-committed one is a checkpoint skip (no target IO).
-            let paths = if plans.last_plan_ms > 0 {
+            let mut paths = if plans.last_plan_ms > 0 {
                 epoch_plans(&directory)?
             } else {
+                vec![]
+            };
+            // FP-T101: a build cut off by the sync's hard bound (or an error)
+            // resumes on a later pass, after the master has committed newer
+            // plans (hourly seals). Replaying only the batches recorded
+            // against the old live set can never match the master, so the
+            // epoch was retired and rebuilt from zero forever. Instead the
+            // epoch plans the delta from its OWN durable state to the current
+            // live set, chained after its recorded batches and again ENDING
+            // at the master checkpoint (an empty batch when only the
+            // checkpoint moved). A delta may remove parts (erasure, merges):
+            // the epoch is unpublished, so nothing reads it, and its expiry
+            // below drops every older snapshot before the reference check;
+            // any remaining difference still retires it unexposed. Planned
+            // only against a prepared live set (`now > 0`).
+            let end = state.last_plan_ms.max(1);
+            let resumable = paths.len() < self.resume_limit;
+            if !resumable && end > plans.last_plan_ms {
+                tracing::warn!(recorded = paths.len(), "serving epoch resumed too often; retiring it for a rebuild");
+            }
+            if plans.last_plan_ms == 0 || (now > 0 && resumable && end > plans.last_plan_ms) {
                 let pending = plan_export_reconciled(&parts, &plans, now, &policy);
-                let end = state.last_plan_ms.max(1);
                 let mut batches = plans.split_plan(self.tenant_id(), &pending, self.batch)?;
                 if end - (batches.len() as i64 - 1) <= plans.last_plan_ms {
                     batches = plans.split_plan(
@@ -265,19 +333,35 @@ impl CatalogLifecycleBackend for FreshServingBackend {
                     )?;
                 }
                 let first = end - (batches.len() as i64 - 1);
-                plans.record_durable_batches(&directory, batches, first)?
-            };
+                if !paths.is_empty() {
+                    tracing::info!(recorded = paths.len(), delta = batches.len(), hours = pending.len(),
+                        "serving epoch resumes with the live-set delta");
+                }
+                paths.extend(plans.record_durable_batches(&directory, batches, first)?);
+            }
+            // FP-T101: a resumed build skips batches this writer saw commit
+            // (a local watermark, written only after the commit returned)
+            // instead of one catalog load per already-committed batch. A
+            // commit that landed without the watermark is still a checkpoint
+            // skip; the reference check below verifies the result.
+            let mut committed = epoch_committed(&directory)?;
             for (index, path) in paths.iter().enumerate() {
                 let manifest: ExportManifest = serde_json::from_slice(&std::fs::read(path)?)?;
+                if manifest.planned_at_ms <= committed {
+                    continue;
+                }
                 serving.commit(&manifest).await?;
+                committed = manifest.planned_at_ms;
+                crate::part_ingest::export::atomic_write(&directory.join(COMMITTED), committed.to_string().as_bytes(), false)?;
                 tracing::info!(batch = index + 1, batches = paths.len(), parts = manifest.add.len(),
                     elapsed_ms = started.elapsed().as_millis() as u64, "serving epoch batch committed");
             }
             let references = serving.expire_and_inspect().await?;
             if references != master {
-                // A pending epoch survived a crash and the live set advanced.
-                // Never expose it, even briefly. Retire and build a new epoch
-                // on the next bounded writer attempt.
+                // Even after the delta the epoch differs from the master (a
+                // stale or unprepared live set, a master rebuilt from the
+                // catalog). Never expose it, even briefly. Retire and build
+                // a new epoch on the next bounded writer attempt.
                 serving.retire().await?;
                 state.pending = Some(format!("events_{}", uuid::Uuid::new_v4().simple()));
                 self.save(state)?;
@@ -331,6 +415,16 @@ impl CatalogLifecycleBackend for FreshServingBackend {
     }
     async fn reopen(&self) -> Result<()> {
         self.factory.reopen().await
+    }
+}
+
+/// The last batch this writer saw commit to one fresh epoch.
+const COMMITTED: &str = "committed";
+fn epoch_committed(directory: &std::path::Path) -> Result<i64> {
+    match std::fs::read_to_string(directory.join(COMMITTED)) {
+        Ok(text) => Ok(text.trim().parse()?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
     }
 }
 

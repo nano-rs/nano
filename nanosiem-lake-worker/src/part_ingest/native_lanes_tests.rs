@@ -150,13 +150,19 @@ struct Setup {
     /// concurrent writes to be exactly one batch.
     window: Duration,
     put_latency: Duration,
+    /// NAN-4713: extra PUT latency in [0, put_jitter), fixed per key (objects of
+    /// different sizes land at different times, as on R2).
+    put_jitter: Duration,
+    /// NAN-4713: the completion hold cap (production unless a test needs it
+    /// out of reach).
+    hold: Duration,
 }
-const CORRECTNESS: Setup = Setup { legacy: false, eps: 500.0, window: Duration::from_millis(50), put_latency: Duration::ZERO };
+const CORRECTNESS: Setup = Setup { legacy: false, eps: 500.0, window: Duration::from_millis(50), put_latency: Duration::ZERO, put_jitter: Duration::ZERO, hold: COMPLETION_HOLD_MAX };
 
 /// The production write path: `NativePartWriter::new` (paced from the
 /// tenant's EPS) bound into `R2PartStore::new_split`, exactly as `cell.rs`.
 async fn harness(owner: Owner, setup: Setup) -> Harness {
-    let Setup { legacy, eps, window, put_latency } = setup;
+    let Setup { legacy, eps, window, put_latency, put_jitter, hold } = setup;
     let owner = Arc::new(owner);
     let routes = Router::new()
         .route("/internal/v1/enterprise-shared/lake-writers:authorize", post(authorize))
@@ -169,7 +175,8 @@ async fn harness(owner: Owner, setup: Setup) -> Harness {
     let r2 = Router::new().route("/{*path}", put(move |axum::extract::Path(path): axum::extract::Path<String>| {
         let events = events.clone();
         async move {
-            tokio::time::sleep(put_latency).await;
+            let spread = u32::from(Sha256::digest(path.as_bytes())[0]) * 100 / 256;
+            tokio::time::sleep(put_latency + put_jitter * spread / 100).await;
             events.lock().unwrap().push(format!("put {}", path.trim_start_matches(&format!("{BUCKET}/"))));
             (axum::http::StatusCode::OK, [("etag", format!("\"{}\"", hex::encode(&Sha256::digest(path.as_bytes())[..16])))], "")
         }
@@ -183,7 +190,8 @@ async fn harness(owner: Owner, setup: Setup) -> Harness {
     let mut writer = NativePartWriter::new(&origin, None, T, "cell", BUCKET, permission, dir.path()).unwrap()
         .with_ingest_eps(eps).unwrap()
         .with_unavailable_retry_window(Duration::ZERO)
-        .with_coalesce_window(window);
+        .with_coalesce_window(window)
+        .with_completion_hold(hold);
     if legacy {
         writer = writer.with_synchronous_completion();
     }
@@ -311,19 +319,23 @@ async fn part_objects_written_together_share_batch_calls() {
     flush(&h.store, 0, 3).await;
     assert_eq!(h.owner.batch_authorize.load(Ordering::SeqCst), 1, "three data files: one authorize call");
     assert_eq!(h.owner.batch_complete.load(Ordering::SeqCst), 1, "and one completion call");
-    // The provenance (alone in its window) and the log entry use the singles.
+    // The provenance and the log entry authorize alone (each is written after
+    // the one before it). The provenance's completion is held until the
+    // entry's barrier and rides the data files' batch; only the entry, which
+    // the log waits on, completes alone.
     assert_eq!(h.owner.single_authorize.load(Ordering::SeqCst), 2);
-    assert_eq!(h.owner.single_complete.load(Ordering::SeqCst), 2);
+    assert_eq!(h.owner.single_complete.load(Ordering::SeqCst), 1);
     // A wide catch-up flush: 10 files go out as 4 + 4 + 2.
     let results = write_parts(&h.store, 1, 10).await;
     for written in results { assert!(written.unwrap()); }
     tokio::time::timeout(Duration::from_secs(5), h.writer().lane.idle()).await.unwrap();
     assert_eq!(h.owner.batch_authorize.load(Ordering::SeqCst), 4);
     assert_eq!(h.owner.batch_complete.load(Ordering::SeqCst), 4);
-    assert_eq!(h.owner.batch_objects.load(Ordering::SeqCst), 3 + 3 + 10 + 10);
+    // The first flush's completion batch carried the provenance too (3 + 1).
+    assert_eq!(h.owner.batch_objects.load(Ordering::SeqCst), 3 + 4 + 10 + 10);
     let diagnostics = h.writer().diagnostics();
     assert_eq!(diagnostics["authorize_batch_objects_total"], 13);
-    assert_eq!(diagnostics["complete_batch_objects_total"], 13);
+    assert_eq!(diagnostics["complete_batch_objects_total"], 14);
     assert_eq!(std::fs::read_dir(h._dir.path().join("native-writer-receipts/registered")).unwrap().count(), 15);
 }
 
@@ -394,7 +406,7 @@ fn large_tenant_p90_owner(serve_batch: bool) -> Owner {
 }
 /// The owner pacer scaled with time: `with_ingest_eps` of 12800 is the
 /// 12.5 ms interval that is the large tenant's 50 ms at 1/4.
-const LARGE: Setup = Setup { legacy: false, eps: 12_800.0, window: lanes_window(), put_latency: Duration::from_millis(300 / SCALE as u64) };
+const LARGE: Setup = Setup { legacy: false, eps: 12_800.0, window: lanes_window(), put_latency: Duration::from_millis(300 / SCALE as u64), put_jitter: Duration::ZERO, hold: COMPLETION_HOLD_MAX };
 const LEGACY_LARGE: Setup = Setup { legacy: true, ..LARGE };
 /// The production gathering window (unscaled: it costs the scaled flush
 /// 4x what it costs a real one, so the comparison is conservative).
@@ -432,12 +444,14 @@ async fn large_tenant_sized_flushes_commit_with_headroom_over_arrival() {
     assert!(rows_before < LARGE_ARRIVAL_ROWS_PER_S, "the legacy path is the observed bottleneck ({rows_before:.0} rows/s)");
     assert!(after < before * 0.8, "at least a fifth off every flush ({before:.1} -> {after:.1} s)");
     assert!(rows_after > rows_before * 1.25, "commit rate up at least a quarter ({rows_before:.0} -> {rows_after:.0} rows/s)");
-    // Six owner calls instead of ten per flush (3 data files in one batch each
-    // way; provenance and entry alone).
+    // Five owner calls instead of ten per flush: 3 data files authorize in one
+    // batch, provenance and entry authorize alone; the data files' and the
+    // provenance's completions drain as one batch at the entry's barrier, and
+    // the entry completes alone.
     let calls = |h: &Harness| ["authorize_started_total", "complete_started_total", "authorize_batch_started_total",
         "complete_batch_started_total"].iter().map(|k| h.writer().diagnostics()[*k].as_u64().unwrap()).sum::<u64>();
     assert_eq!(calls(&legacy), 3 * 10);
-    assert_eq!(calls(&current), 3 * 6);
+    assert_eq!(calls(&current), 3 * 5);
 }
 
 /// Backlog convergence: the large tenant's backlog (sealed flushes waiting to commit)
@@ -483,4 +497,114 @@ async fn a_large_tenant_backlog_drains_to_zero_on_the_current_path() {
     // Every committed flush's objects are registered; none left to replay.
     tokio::time::timeout(Duration::from_secs(5), current.writer().lane.idle()).await.unwrap();
     assert_eq!(std::fs::read_dir(current._dir.path().join("native-writer-receipts/pending")).unwrap().count(), 0);
+}
+
+/// NAN-4713: owner calls per object at FP's measured shape. Each flush is 3
+/// data files whose PUTs land at different times (size spread), then the
+/// signed provenance, then the log entry. Owner latencies are FP's p50
+/// (authorize 1.0 s, complete 1.4 s) and PUT 300 ms +0..400 ms, all at 1/SCALE.
+/// Prints the call counts so a before/after run can be compared; asserts the
+/// floor the tick-drained completion lane guarantees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_calls_per_object_at_fp_shape() {
+    let owner = Owner { serve_batch: true, authorize_latency: Duration::from_millis(1_000) / SCALE,
+        complete_latency: Duration::from_millis(1_400) / SCALE, ..Default::default() };
+    let setup = Setup { legacy: false, eps: 12_800.0, window: lanes_window(),
+        put_latency: Duration::from_millis(300) / SCALE, put_jitter: Duration::from_millis(400) / SCALE, hold: COMPLETION_HOLD_MAX };
+    let h = harness(owner, setup).await;
+    const FLUSHES: usize = 12;
+    let started = std::time::Instant::now();
+    for n in 0..FLUSHES { flush(&h.store, n, 3).await; }
+    let per_flush = started.elapsed().as_secs_f64() * f64::from(SCALE) / FLUSHES as f64;
+    let o = &h.owner;
+    let (sa, sc, ba, bc, bo) = (o.single_authorize.load(Ordering::SeqCst), o.single_complete.load(Ordering::SeqCst),
+        o.batch_authorize.load(Ordering::SeqCst), o.batch_complete.load(Ordering::SeqCst), o.batch_objects.load(Ordering::SeqCst));
+    let objects = FLUSHES * 5;
+    let calls = sa + sc + ba + bc;
+    eprintln!("NAN-4713 fp-shape {FLUSHES} flushes ({objects} objects, {} owner object-ops): authorize single={sa} batch={ba}; \
+complete single={sc} batch={bc}; batched objects={bo}; owner calls={calls} ({:.2} per object); {per_flush:.2} s/flush real",
+        objects * 2, calls as f64 / objects as f64);
+    assert_eq!(sa + sc + bo, objects * 2, "every object authorized and completed exactly once");
+    // Per flush: one authorize batch (data files), provenance + entry
+    // authorize singly (sequential by construction); the part completions of
+    // the flush register in one batch at the entry's barrier, the entry
+    // completes singly. 5 calls for 5 objects' 10 owner operations.
+    assert!(calls <= FLUSHES * 5 + 2, "owner calls {calls} > {} (tick-drained completions)", FLUSHES * 5 + 2);
+    assert!(bc >= FLUSHES - 1, "part completions batch per flush ({bc} batches)");
+}
+
+// ------------------------------------------------- NAN-4713 tick-drained lane
+
+fn completed(h: &Harness, key: &str) -> usize {
+    h.events().iter().filter(|event| *event == &format!("complete {key}")).count()
+}
+
+/// NAN-4713 (mutation guard): part completions held for their tick are
+/// drained by the next part-log entry's barrier. The entry is PUT only after
+/// the owner acked every one of them, each exactly once, and the barrier never
+/// waits out the hold cap. Batch routes served or not (the per-object
+/// fallback of an owner without them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_completions_are_acked_before_the_entry_lands_without_waiting_out_the_hold() {
+    // A hold far out of the test's reach: a barrier that did not drain the
+    // lane would wait it out.
+    const HOLD: Duration = Duration::from_secs(60);
+    for serve_batch in [true, false] {
+        let h = harness(Owner { serve_batch, complete_latency: Duration::from_millis(300), ..Default::default() },
+            Setup { hold: HOLD, ..CORRECTNESS }).await;
+        // Two data files and the provenance: below a full batch, so held.
+        let results = write_parts(&h.store, 0, 2).await;
+        for written in results { assert!(written.unwrap()); }
+        assert!(h.store.put_if_absent_with(&provenance_key(0), b"provenance", &part_hints()).await.unwrap());
+        assert_eq!(h.writer().lane.outstanding(), 3, "{serve_batch}: held for the tick");
+        assert!(!h.events().iter().any(|event| event.starts_with("complete ")), "{serve_batch}: nothing completed yet");
+        let started = std::time::Instant::now();
+        assert!(h.store.put_if_absent_with(&entry_key(1), b"entry", &log_hints()).await.unwrap());
+        assert!(started.elapsed() < Duration::from_secs(15),
+            "{serve_batch}: the barrier drains the held completions, never waits out the cap ({:?})", started.elapsed());
+        let events = h.events();
+        let entry_put = index_of(&events, &format!("put {}", entry_key(1)));
+        for key in [data_key(0, 0), data_key(0, 1), provenance_key(0)] {
+            assert!(index_of(&events, &format!("complete {key}")) < entry_put,
+                "{serve_batch}: the entry landed before {key} was acked: {events:#?}");
+            assert_eq!(completed(&h, &key), 1, "{serve_batch}: {key} registered exactly once");
+        }
+        assert_eq!(h.writer().lane.outstanding(), 0);
+        assert_eq!(std::fs::read_dir(h._dir.path().join("native-writer-receipts/pending")).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(h._dir.path().join("native-writer-receipts/registered")).unwrap().count(), 4);
+    }
+}
+
+/// NAN-4713: a batch the owner refuses partway (item 0 of 3) is re-asked per
+/// object; the entry still lands only after all three are acked, each once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partially_refused_held_batch_falls_back_before_the_entry_lands() {
+    let h = harness(Owner { serve_batch: true, refuse_completes: Mutex::new(1), ..Default::default() }, CORRECTNESS).await;
+    let results = write_parts(&h.store, 0, 3).await;
+    for written in results { assert!(written.unwrap()); }
+    assert!(h.store.put_if_absent_with(&entry_key(1), b"entry", &log_hints()).await.unwrap());
+    let events = h.events();
+    let entry_put = index_of(&events, &format!("put {}", entry_key(1)));
+    for file in 0..3 {
+        assert!(index_of(&events, &format!("complete {}", data_key(0, file))) < entry_put, "{events:#?}");
+        assert_eq!(completed(&h, &data_key(0, file)), 1);
+    }
+    assert!(h.writer().diagnostics()["batch_fallbacks_total"].as_u64().unwrap() >= 1);
+    assert_eq!(std::fs::read_dir(h._dir.path().join("native-writer-receipts/pending")).unwrap().count(), 0);
+}
+
+/// NAN-4713: a held completion that no tick follows is still sent by the
+/// hold cap alone (no waiter drives it), and not before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_completion_no_tick_follows_completes_at_the_hold_cap() {
+    let h = harness(Owner::default(), CORRECTNESS).await;
+    let started = std::time::Instant::now();
+    assert!(h.store.put_if_absent_with(&data_key(0, 0), b"data", &part_hints()).await.unwrap());
+    while h.writer().lane.outstanding() > 0 {
+        assert!(started.elapsed() < COMPLETION_HOLD_MAX + Duration::from_secs(3), "the hold cap never fired");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(started.elapsed() >= COMPLETION_HOLD_MAX - Duration::from_millis(100), "held until the cap ({:?})", started.elapsed());
+    assert_eq!(completed(&h, &data_key(0, 0)), 1);
+    assert_eq!(std::fs::read_dir(h._dir.path().join("native-writer-receipts/pending")).unwrap().count(), 0);
 }

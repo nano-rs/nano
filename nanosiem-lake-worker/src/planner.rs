@@ -2064,7 +2064,7 @@ fn plan_broad_log_query_with_candidates_tail_time_and_budget(
     }
     sql = harden_settings(sql, tenant)?;
     if native_event_rows && !compiled.table_view {
-        sql = bounded_payload_settings(sql, tenant.threads);
+        sql = bounded_payload_settings(sql, tenant.threads, tenant.max_memory_bytes);
     }
     if source_is_row_fenced && text_after_fence_enabled() && tests_wide_text(&compiled.sql) {
         sql = crate::executor::with_setting(&sql, TEXT_AFTER_FENCE_SETTING);
@@ -2134,10 +2134,25 @@ fn plan_broad_log_query_with_candidates_tail_time_and_budget(
     })
 }
 
-/// NAN-3411: the payload statement's default reader threads (NAN-3077).
+/// NAN-3411: the payload statement's floor reader threads (NAN-3077's
+/// value; what a role of three cores or less still gets, see
+/// [`payload_role_defaults`]).
 pub const PAYLOAD_DEFAULT_THREADS: u64 = 1;
-/// NAN-3411: the payload statement's default block rows (NAN-3077).
+/// NAN-3411: the payload statement's floor block rows (NAN-3077's value;
+/// a statement capped below [`PAYLOAD_ROLE_ROWS_MIN_MEMORY_BYTES`] keeps it).
 pub const PAYLOAD_DEFAULT_BLOCK_ROWS: u64 = 128;
+/// NAN-4694: the role-derived block rows of a payload statement with at
+/// least [`PAYLOAD_ROLE_ROWS_MIN_MEMORY_BYTES`]. Measured: 512 cut a broad
+/// regex payload scan 44% and left needle hunts flat; 1024 and 8192 cost
+/// needle hunts 27-32%.
+pub const PAYLOAD_ROLE_BLOCK_ROWS: u64 = 512;
+/// NAN-4694: the per-statement memory from which a payload statement takes
+/// [`PAYLOAD_ROLE_BLOCK_ROWS`] (query[T]'s small-lane statement cap).
+pub const PAYLOAD_ROLE_ROWS_MIN_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+/// NAN-4694: per-statement memory set aside per payload reader thread: two
+/// of its 32 MiB Parquet watermarks, so the threads a statement's cap can
+/// hold never outgrow it.
+pub const PAYLOAD_READER_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 /// NAN-3411: the most block rows a payload knob may ask for (the small
 /// lanes' bounded wide-text reader's block, `lanes::bounded_reader_sql`).
 pub const PAYLOAD_MAX_BLOCK_ROWS: u64 = 8_192;
@@ -2160,21 +2175,47 @@ pub(crate) fn payload_block_rows_env() -> Option<u64> {
     positive_env(PAYLOAD_BLOCK_ROWS_ENV)
 }
 
+/// NAN-4694: the payload statement's `(threads, block rows)` derived from
+/// the query role: half its thread budget (`tenant_threads`, the role's
+/// cores), at most the 4-thread interactive cap and one thread per
+/// [`PAYLOAD_READER_MEMORY_BYTES`] of the statement's memory cap; 512-row
+/// blocks from a 256 MiB cap. A role of three cores or less keeps NAN-3077's
+/// one reader thread, and a statement capped under 256 MiB its 128-row
+/// blocks.
+pub fn payload_role_defaults(tenant_threads: u64, max_memory_bytes: u64) -> (u64, u64) {
+    let by_memory = (max_memory_bytes / PAYLOAD_READER_MEMORY_BYTES).max(1);
+    let threads = (tenant_threads / 2)
+        .clamp(PAYLOAD_DEFAULT_THREADS, crate::part_query::lanes::INTERACTIVE_MAX_THREADS)
+        .min(by_memory);
+    let rows = if max_memory_bytes >= PAYLOAD_ROLE_ROWS_MIN_MEMORY_BYTES {
+        PAYLOAD_ROLE_BLOCK_ROWS
+    } else {
+        PAYLOAD_DEFAULT_BLOCK_ROWS
+    };
+    (threads, rows)
+}
+
 /// NAN-3411: the payload statement's effective `(threads, block rows)`
-/// from the requested values (override else env; `None`: the NAN-3077
-/// defaults 1 / 128). Threads are clamped to `1..=min(4, tenant_threads)`:
-/// the query role is guaranteed ~4 cores and routing v2 caps every
-/// interactive statement at [`crate::part_query::lanes::INTERACTIVE_MAX_THREADS`]
+/// from the requested values (override else env; `None`: the role-derived
+/// [`payload_role_defaults`], NAN-4694). Threads are clamped to
+/// `1..=min(4, tenant_threads)`: routing v2 caps every interactive
+/// statement at [`crate::part_query::lanes::INTERACTIVE_MAX_THREADS`]
 /// anyway (v1 does not, hence the clamp here), and a tenant's own thread
 /// budget is never exceeded. Rows are clamped to `128..=8192`. Neither
 /// touches a memory bound: the reader watermark (32 MiB per reader), the
 /// 1 MiB preferred block bytes, the 64 MiB sort spill and the statement's
 /// lane cap stay, and a memory refusal escalates lanes as before.
-pub fn payload_read_settings(threads: Option<u64>, block_rows: Option<u64>, tenant_threads: u64) -> (u64, u64) {
+pub fn payload_read_settings(
+    threads: Option<u64>,
+    block_rows: Option<u64>,
+    tenant_threads: u64,
+    max_memory_bytes: u64,
+) -> (u64, u64) {
     let max_threads = crate::part_query::lanes::INTERACTIVE_MAX_THREADS.min(tenant_threads.max(1));
+    let (role_threads, role_rows) = payload_role_defaults(tenant_threads, max_memory_bytes);
     (
-        threads.unwrap_or(PAYLOAD_DEFAULT_THREADS).clamp(1, max_threads),
-        block_rows.unwrap_or(PAYLOAD_DEFAULT_BLOCK_ROWS).clamp(PAYLOAD_DEFAULT_BLOCK_ROWS, PAYLOAD_MAX_BLOCK_ROWS),
+        threads.unwrap_or(role_threads).clamp(1, max_threads),
+        block_rows.unwrap_or(role_rows).clamp(PAYLOAD_DEFAULT_BLOCK_ROWS, PAYLOAD_MAX_BLOCK_ROWS),
     )
 }
 
@@ -2186,12 +2227,13 @@ pub fn payload_read_settings(threads: Option<u64>, block_rows: Option<u64>, tena
 /// NAN-3411: reader threads and block rows come from
 /// `NANO_LAKE_PAYLOAD_MAX_THREADS` / `NANO_LAKE_PAYLOAD_BLOCK_ROWS` or this
 /// request's `payload_threads` / `payload_block_rows` override, clamped by
-/// [`payload_read_settings`]; with neither, the statement is byte-identical
-/// to NAN-3077's (one thread, 128-row blocks).
-pub fn bounded_payload_settings(sql: String, threads: u64) -> String {
+/// [`payload_read_settings`]; with neither, from the role (`threads`, the
+/// tenant's thread budget, and `max_memory_bytes`, its statement cap; see
+/// [`payload_role_defaults`]).
+pub fn bounded_payload_settings(sql: String, threads: u64, max_memory_bytes: u64) -> String {
     let (requested_threads, requested_rows) =
         crate::perf_overrides::payload_read(payload_max_threads_env(), payload_block_rows_env());
-    let (threads, rows) = payload_read_settings(requested_threads, requested_rows, threads);
+    let (threads, rows) = payload_read_settings(requested_threads, requested_rows, threads, max_memory_bytes);
     bounded_payload_settings_with(sql, threads, rows)
 }
 
@@ -7503,8 +7545,8 @@ mod tests {
         query.table_view = false;
         let payload = plan_broad_log_query(&configured, &manifest(), &query).unwrap();
         for setting in [
-            "max_threads=1", "max_block_size=128", "preferred_block_size_bytes=1048576",
-            "input_format_parquet_max_block_size=128", "input_format_parquet_prefer_block_bytes=1048576",
+            "max_threads=4,", "max_block_size=512,", "preferred_block_size_bytes=1048576",
+            "input_format_parquet_max_block_size=512,", "input_format_parquet_prefer_block_bytes=1048576",
             "input_format_parquet_memory_high_watermark=33554432", "max_bytes_before_external_sort=67108864",
             "max_bytes_ratio_before_external_sort=0", "max_memory_usage=1610612736",
             "max_bytes_before_remerge_sort=1048576", "remerge_sort_lowered_memory_bytes_ratio=0",
@@ -7530,27 +7572,80 @@ mod tests {
         }
     }
 
-    /// NAN-3411 default-off: with no `NANO_LAKE_PAYLOAD_*` env and no
-    /// override, the payload settings are byte-identical to NAN-3077's.
+    /// NAN-4694: with no `NANO_LAKE_PAYLOAD_*` env and no override, the
+    /// payload reader's threads and rows come from the role; a role of three
+    /// cores or less under a 256 MiB statement cap is byte-identical to
+    /// NAN-3077's statement, and every memory bound is the same at any size.
     #[test]
-    fn payload_read_knobs_default_off_is_byte_identical() {
+    fn payload_defaults_derive_from_the_query_role() {
         assert!(payload_max_threads_env().is_none() && payload_block_rows_env().is_none(), "run without NANO_LAKE_PAYLOAD_* set");
+        const MIB: u64 = 1024 * 1024;
         let input = "SELECT * FROM t SETTINGS max_threads=8, max_block_size=8192, preferred_block_size_bytes=8388608";
-        let nan3077 = "SELECT * FROM t SETTINGS max_threads=1, max_block_size=128, preferred_block_size_bytes=1048576, \
-            input_format_parquet_max_block_size=128, input_format_parquet_prefer_block_bytes=1048576, \
+        let statement = |threads: u64, rows: u64| format!(
+            "SELECT * FROM t SETTINGS max_threads={threads}, max_block_size={rows}, preferred_block_size_bytes=1048576, \
+            input_format_parquet_max_block_size={rows}, input_format_parquet_prefer_block_bytes=1048576, \
             input_format_parquet_memory_high_watermark=33554432, max_bytes_before_external_sort=67108864, \
             max_bytes_before_remerge_sort=1048576, remerge_sort_lowered_memory_bytes_ratio=0, \
-            max_bytes_ratio_before_external_sort=0";
-        for tenant_threads in [1, 4, 8, 16] {
-            assert_eq!(bounded_payload_settings(input.into(), tenant_threads), nan3077);
+            max_bytes_ratio_before_external_sort=0");
+        for tenant_threads in [0, 1, 2, 3] {
+            assert_eq!(bounded_payload_settings(input.into(), tenant_threads, 128 * MIB), statement(1, 128), "{tenant_threads}");
+        }
+        // (role threads, statement cap) -> (reader threads, block rows).
+        for (threads, memory, expected) in [
+            (1, 256 * MIB, (1, 512)),
+            (2, 256 * MIB, (1, 512)),
+            (4, 256 * MIB, (2, 512)),
+            (6, 256 * MIB, (3, 512)),
+            (8, 256 * MIB, (4, 512)),
+            (16, DEFAULT_QUERY_MEMORY_BYTES, (4, 512)),
+            // The statement cap bounds the readers: one per 64 MiB.
+            (8, 128 * MIB, (2, 128)),
+            (8, 64 * MIB, (1, 128)),
+            (8, 0, (1, 128)),
+        ] {
+            assert_eq!(payload_role_defaults(threads, memory), expected, "{threads} threads, {memory} bytes");
+            assert_eq!(payload_read_settings(None, None, threads, memory), expected);
+            assert_eq!(bounded_payload_settings(input.into(), threads, memory), statement(expected.0, expected.1));
         }
         // A debug scope with other overrides only changes nothing here either.
         let scoped = crate::perf_overrides::sync_scoped(
             crate::perf_overrides::Overrides { flat_filter_leaves: Some(true), ..Default::default() },
-            || bounded_payload_settings(input.into(), 8),
+            || bounded_payload_settings(input.into(), 6, 256 * MIB),
         );
-        assert_eq!(scoped, nan3077);
-        assert_eq!(payload_read_settings(None, None, 8), (PAYLOAD_DEFAULT_THREADS, PAYLOAD_DEFAULT_BLOCK_ROWS));
+        assert_eq!(scoped, statement(3, 512));
+    }
+
+    /// NAN-4694 on the production path: query[T]'s statement limits as
+    /// `open_engine_timed` derives them (`role_statement_limits` over the
+    /// size-classed memory budget), through `limits_tenant`'s fields into
+    /// the planner. A 1-core role keeps one reader thread; a sized cell
+    /// gets more; no role's payload reader outgrows its statement cap.
+    #[test]
+    fn payload_defaults_follow_production_role_limits() {
+        use crate::part_query::memory_budget::{QueryMemoryBudget, GIB};
+        let mut query = compiled("SELECT * FROM __nano_lake_source__", vec![column("time", "timestamp")]);
+        query.table_view = false;
+        for (cpu_millis, role_bytes, expected_threads) in [
+            (1_000, GIB, 1),
+            (2_000, 2 * GIB, 1),
+            (4_000, 3 * GIB, 2),
+            (6_000, 8 * GIB, 3),
+            (8_000, 16 * GIB, 4),
+        ] {
+            let (budget, _) = QueryMemoryBudget::derive(role_bytes, None).with_classes();
+            let (threads, memory) = crate::part_query::server::role_statement_limits(cpu_millis, &budget);
+            let mut configured = tenant();
+            configured.threads = threads;
+            configured.max_memory_bytes = memory;
+            let plan = plan_broad_log_query(&configured, &manifest(), &query).unwrap();
+            let (reader_threads, rows) = payload_role_defaults(threads, memory);
+            assert_eq!(reader_threads, expected_threads, "{cpu_millis}m / {role_bytes}");
+            assert!(reader_threads * PAYLOAD_READER_MEMORY_BYTES <= memory.max(PAYLOAD_READER_MEMORY_BYTES), "{cpu_millis}m / {role_bytes}");
+            assert!(plan.sql.contains(&format!("max_threads={reader_threads},")), "{}", plan.sql);
+            assert!(plan.sql.contains(&format!(" max_block_size={rows},")), "{}", plan.sql);
+            assert!(plan.sql.contains("input_format_parquet_memory_high_watermark=33554432"), "{}", plan.sql);
+            assert!(plan.sql.contains("preferred_block_size_bytes=1048576"), "{}", plan.sql);
+        }
     }
 
     /// NAN-3411: a `payload_threads` / `payload_block_rows` override sets
@@ -7562,7 +7657,7 @@ mod tests {
         let input = "SELECT * FROM t SETTINGS max_threads=8, max_block_size=8192";
         let with = |threads: Option<u64>, rows: Option<u64>, tenant: u64| sync_scoped(
             Overrides { payload_threads: threads, payload_block_rows: rows, ..Overrides::default() },
-            || bounded_payload_settings(input.into(), tenant),
+            || bounded_payload_settings(input.into(), tenant, 268_435_456),
         );
         let four = with(Some(4), Some(1024), 8);
         assert_eq!(four, "SELECT * FROM t SETTINGS max_threads=4, max_block_size=1024, preferred_block_size_bytes=1048576, \
@@ -7570,18 +7665,20 @@ mod tests {
             input_format_parquet_memory_high_watermark=33554432, max_bytes_before_external_sort=67108864, \
             max_bytes_before_remerge_sort=1048576, remerge_sort_lowered_memory_bytes_ratio=0, \
             max_bytes_ratio_before_external_sort=0");
-        // Threads alone: rows keep 128.
+        // Threads alone: rows keep the role default (512 at a 256 MiB cap).
         let threads_only = with(Some(2), None, 8);
-        assert!(threads_only.contains("max_threads=2,") && threads_only.contains(" max_block_size=128,")
-            && threads_only.contains("input_format_parquet_max_block_size=128,"), "{threads_only}");
+        assert!(threads_only.contains("max_threads=2,") && threads_only.contains(" max_block_size=512,")
+            && threads_only.contains("input_format_parquet_max_block_size=512,"), "{threads_only}");
         // Clamps: never past the 4-thread interactive cap or the tenant's budget; rows 128..=8192.
         assert!(with(Some(64), None, 16).contains("max_threads=4,"));
         assert!(with(Some(4), None, 2).contains("max_threads=2,"));
         assert!(with(Some(4), None, 0).contains("max_threads=1,"));
         assert!(with(None, Some(10), 8).contains(" max_block_size=128,"));
         assert!(with(None, Some(1_000_000), 8).contains(" max_block_size=8192,"));
-        assert_eq!(payload_read_settings(Some(3), Some(512), 8), (3, 512));
-        assert_eq!(payload_read_settings(Some(0), Some(0), 8), (1, 128));
+        assert_eq!(payload_read_settings(Some(3), Some(512), 8, 268_435_456), (3, 512));
+        assert_eq!(payload_read_settings(Some(0), Some(0), 8, 268_435_456), (1, 128));
+        // An override wins over the role in both directions.
+        assert_eq!(payload_read_settings(Some(1), Some(128), 8, 268_435_456), (1, 128));
 
         // Through the planner: the payload statement takes it, table pages and aggregates do not.
         let mut configured = tenant();
@@ -7611,8 +7708,9 @@ mod tests {
         assert!(large.sql.contains("max_bytes_ratio_before_external_sort=0"));
         assert!(large.sql.contains("max_bytes_before_external_sort=67108864"));
         assert!(large.sql.contains("input_format_parquet_memory_high_watermark=33554432"));
-        assert!(large.sql.contains("max_block_size=128"));
-        assert!(large.sql.contains("max_threads=1"));
+        // NAN-4694: the 4-core role's payload readers (2 x 512 rows) survive too.
+        assert!(large.sql.contains(" max_block_size=512,"), "{}", large.sql);
+        assert!(large.sql.contains("max_threads=2,"), "{}", large.sql);
         assert!(large.sql.contains("remerge_sort_lowered_memory_bytes_ratio=0"));
         query.sql = "SELECT count() FROM __nano_lake_source__".into();
         let aggregate = plan_broad_log_query(&configured, &manifest(), &query).unwrap();
@@ -8202,7 +8300,8 @@ mod tests {
         let query = full_event_needle();
         let full = plan_broad_log_query(&tenant(), &source, &query).unwrap();
         assert!(full.native_event_rows);
-        assert!(full.sql.contains("max_threads=1") && full.sql.contains("max_block_size=128"));
+        // NAN-4694: the 4-core test role's payload reader: 2 threads x 512 rows.
+        assert!(full.sql.contains("max_threads=2,") && full.sql.contains(" max_block_size=512,"), "{}", full.sql);
         let locator =
             plan_broad_log_query(&tenant(), &source, &full_event_locator(&query).unwrap()).unwrap();
         assert!(!locator.native_event_rows);
@@ -8214,7 +8313,7 @@ mod tests {
             locator.sql
         );
         assert!(
-            !locator.sql.contains("max_block_size=128"),
+            !locator.sql.contains(" max_block_size=512,"),
             "{}",
             locator.sql
         );

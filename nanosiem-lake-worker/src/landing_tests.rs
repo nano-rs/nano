@@ -1417,3 +1417,6 @@ fn cell_feature_lean_landing_platform_audit_v1_is_backed() {
     assert_eq!(uids, [ids[0], ids[1]], "the audit event ids stay the uids (replays dedupe in ingest[T])");
 }
 
+
+#[path = "landing_throughput_tests.rs"]
+mod throughput;

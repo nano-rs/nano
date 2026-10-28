@@ -43,6 +43,7 @@
 //! is dropped exactly as Vector drops it.
 
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
 use vrl::compiler::runtime::{Runtime, Terminate};
 use vrl::compiler::state::RuntimeState;
 use vrl::compiler::{Program, TargetValue, TimeZone};
@@ -108,10 +109,29 @@ pub enum StageError {
 
 /// `ocsf_lake_storage_prepare`, compiled once and shared by every request,
 /// with the platform `audit` lane that precedes it for
-/// [`PLATFORM_AUDIT_ROUTE_KEY`] (NAN-4675).
+/// [`PLATFORM_AUDIT_ROUTE_KEY`] (NAN-4675). Cloning is cheap (the compiled
+/// programs are shared), so a converter can hand the stage to a blocking
+/// conversion task (NAN-4682).
+#[derive(Clone)]
 pub struct LandingOcsfStage {
-    program: Program,
-    audit_lane: Program,
+    program: Arc<Program>,
+    audit_lane: Arc<Program>,
+}
+
+/// NAN-4682: runs the stage over many rows with one VRL [`Runtime`], cleared
+/// after every row (as Vector's remap does), instead of a new runtime per
+/// row. Each row sees a fresh runtime state, so the output is identical to
+/// [`LandingOcsfStage::prepare`].
+pub struct StageRunner<'s> {
+    stage: &'s LandingOcsfStage,
+    runtime: Runtime,
+}
+
+impl StageRunner<'_> {
+    /// [`LandingOcsfStage::prepare`] on this runner's runtime.
+    pub fn prepare(&mut self, event: serde_json::Value, ctx: &StageContext<'_>) -> Result<BronzeRow, StageError> {
+        self.stage.prepare_in(&mut self.runtime, event, ctx)
+    }
 }
 
 impl std::fmt::Debug for LandingOcsfStage {
@@ -192,8 +212,8 @@ impl LandingOcsfStage {
         let audit_lane = super::vrl_guard::compile(AUDIT_LANE_VRL, &vrl::stdlib::all())
             .map_err(|e| e.render(AUDIT_LANE_VRL))?;
         Ok(Self {
-            program: compiled.program,
-            audit_lane: audit_lane.program,
+            program: Arc::new(compiled.program),
+            audit_lane: Arc::new(audit_lane.program),
         })
     }
 
@@ -201,7 +221,12 @@ impl LandingOcsfStage {
     /// line (`.message` holds the line, `%tenant_id` the cell's tenant). Its
     /// output is the `{event, timestamp, source_type}` row the storage stage
     /// receives from that lane.
-    fn run_audit_lane(&self, event: serde_json::Value, metadata: &ObjectMap) -> Result<VrlValue, StageError> {
+    fn run_audit_lane(
+        &self,
+        runtime: &mut Runtime,
+        event: serde_json::Value,
+        metadata: &ObjectMap,
+    ) -> Result<VrlValue, StageError> {
         let line = serde_json::to_string(&event).map_err(|_| StageError::Failed)?;
         let mut envelope = ObjectMap::new();
         envelope.insert("message".into(), VrlValue::from(line));
@@ -211,16 +236,32 @@ impl LandingOcsfStage {
             metadata: VrlValue::Object(metadata.clone()),
             secrets: Secrets::new(),
         };
-        match Runtime::new(RuntimeState::default()).resolve(&mut target, &self.audit_lane, &TimeZone::Local) {
+        let resolved = runtime.resolve(&mut target, &self.audit_lane, &TimeZone::Local);
+        runtime.clear();
+        match resolved {
             Ok(_) => Ok(target.value),
             Err(Terminate::Abort(_)) => Err(StageError::Aborted),
             Err(Terminate::Error(_) | Terminate::Interrupted) => Err(StageError::Failed),
         }
     }
 
+    /// A runner that reuses one VRL runtime across rows (NAN-4682).
+    pub fn runner(&self) -> StageRunner<'_> {
+        StageRunner { stage: self, runtime: Runtime::new(RuntimeState::default()) }
+    }
+
     /// Run the stage on one OCSF event (a JSON object) sent by `ctx`.
     pub fn prepare(
         &self,
+        event: serde_json::Value,
+        ctx: &StageContext<'_>,
+    ) -> Result<BronzeRow, StageError> {
+        self.runner().prepare(event, ctx)
+    }
+
+    fn prepare_in(
+        &self,
+        runtime: &mut Runtime,
         event: serde_json::Value,
         ctx: &StageContext<'_>,
     ) -> Result<BronzeRow, StageError> {
@@ -240,7 +281,7 @@ impl LandingOcsfStage {
         // folder's source wins over anything inside the event. The platform
         // audit source first crosses Vector's own `audit` lane (NAN-4675).
         let envelope = if ctx.source_type == PLATFORM_AUDIT_ROUTE_KEY {
-            self.run_audit_lane(event, &metadata)?
+            self.run_audit_lane(runtime, event, &metadata)?
         } else {
             let mut envelope = ObjectMap::new();
             envelope.insert("event".into(), VrlValue::from(event));
@@ -252,7 +293,10 @@ impl LandingOcsfStage {
             metadata: VrlValue::Object(metadata),
             secrets: Secrets::new(),
         };
-        match Runtime::new(RuntimeState::default()).resolve(&mut target, &self.program, &TimeZone::Local) {
+        let resolved = runtime.resolve(&mut target, &self.program, &TimeZone::Local);
+        // Every row starts from an empty runtime state, as with a new runtime.
+        runtime.clear();
+        match resolved {
             Ok(_) => {}
             Err(Terminate::Abort(_)) => return Err(StageError::Aborted),
             Err(Terminate::Error(_) | Terminate::Interrupted) => return Err(StageError::Failed),
@@ -381,6 +425,27 @@ mod tests {
         let a = stage.prepare(sysmon(None), &ctx(None)).unwrap();
         let b = stage.prepare(sysmon(None), &ctx(None)).unwrap();
         assert_ne!(a.uid, b.uid);
+    }
+
+    /// NAN-4682: one reused runtime (cleared per row) gives every row exactly
+    /// what a fresh runtime gives, across accepted and dropped rows.
+    #[test]
+    fn a_reused_runner_matches_a_fresh_runtime_per_row() {
+        let received = DateTime::<Utc>::from_timestamp_millis(1_792_843_200_123).unwrap();
+        let stage = LandingOcsfStage::new_at(4, received).unwrap();
+        let mut runner = stage.runner();
+        let mut empty_tenant = ctx(Some("k:1"));
+        empty_tenant.tenant_id = "";
+        for i in 0..24 {
+            let uid = (i % 3 == 0).then(|| format!("sysmon:wks-01:{i}"));
+            let key = format!("{}:{i}", "c".repeat(64));
+            let context = if i == 7 { empty_tenant.clone() } else { ctx(Some(&key)) };
+            let mut event = sysmon(uid.as_deref());
+            if i == 11 {
+                event = json!("not an object");
+            }
+            assert_eq!(runner.prepare(event.clone(), &context), stage.prepare(event, &context), "row {i}");
+        }
     }
 
     #[test]

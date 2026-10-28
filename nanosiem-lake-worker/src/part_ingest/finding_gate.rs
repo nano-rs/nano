@@ -26,7 +26,12 @@
 //! - every object of the finding parts is registered with the owner writer
 //!   authority (NAN-3499) without the lock, before the commit;
 //! - only the commit (schema, attempt markers, log `Add`) takes the lock, and
-//!   waiting for it is bounded by the same deadline.
+//!   waiting for it is bounded by the same deadline;
+//! - NAN-4700: once the parts are registered (an unbounded owner round trip
+//!   per object), the append commits even past the deadline: the lock wait
+//!   gets a fresh window and the commit no longer refuses a late requester.
+//!   Refusing threw the registration away every pass on FP ops (2026-10-27);
+//!   a lost acknowledgement is proven from the commit's floor next pass.
 //!
 //! A refused append leaves the outbox rows in place; detect's drain retries.
 
@@ -36,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::finding_append::{FindingAppendRequest, FindingAppendResponse};
-use super::ingest::{finding_replay_proof, register_finding_parts, validate_finding, FindingAppendContext, Ingestor};
+use super::ingest::{finding_replay_proof, register_finding_parts, requester_still_waiting, validate_finding, FindingAppendContext, Ingestor};
 use crate::parts::part_log::SourceRef;
 
 #[derive(Debug, Clone)]
@@ -142,12 +147,22 @@ impl FindingGate {
                 return Ok(committed);
             }
         }
+        // NAN-3067: a requester that already gave up is refused before any
+        // work for it is registered.
+        requester_still_waiting(&validated.request, now_ms())?;
         // NAN-3499: the drain stored these parts outside the writer
         // authority; register them before the commit. Not under the deadline
-        // (a native write must not be dropped midway); the commit refuses a
-        // request whose own deadline passed meanwhile.
+        // (a native write must not be dropped midway).
         register_finding_parts(context, &mut validated).await?;
-        let mut ingestor = tokio::time::timeout_at(deadline, ingestor.lock())
+        // NAN-4700: a registration that outlived the deadline still commits,
+        // so the wait for the ingest loop gets its own window from here.
+        // Refusing (the deadline had passed, so `timeout_at` refused at
+        // once) threw the registration away and the next pass registered
+        // new parts from scratch: on FP ops (2026-10-27) every pass, for
+        // hours. The acknowledgement may be lost; the next pass proves the
+        // replay from the floor the commit writes and acknowledges it.
+        let lock_deadline = deadline.max(tokio::time::Instant::now() + self.config.deadline);
+        let mut ingestor = tokio::time::timeout_at(lock_deadline, ingestor.lock())
             .await
             .map_err(|_| FindingRefused::Deadline("waiting for the ingest loop"))?;
         // From here the commit runs to completion (bounded by store timeouts):

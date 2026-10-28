@@ -329,7 +329,7 @@ async fn guarded_gc_never_planned_parts_get_local_receipts_before_worker_delete(
 }
 
 #[tokio::test]
-async fn guarded_gc_historical_parts_block_both_worker_deletes_until_cache_acknowledges() {
+async fn guarded_gc_historical_parts_reach_the_worker_with_the_agent_lane_degraded_when_the_cache_fails() {
     guarded_gc_catalog_case(true).await;
 }
 
@@ -369,11 +369,16 @@ async fn guarded_gc_catalog_case(ever_planned: bool) {
     backend.fail_cache.store(true, Ordering::SeqCst);
     let part = crate::lake_part_gc::request::tests::PART;
     if ever_planned {
+        // Part GC is never gated on the agent catalog: an unacknowledged
+        // result cache degrades the lane (reads closed) and the Worker is
+        // reached on both seams.
         for retired in [false, true] {
             let error = if retired { seams.retire(&permit).await.unwrap_err() } else { seams.prepare(&permit).await.unwrap_err() };
-            assert!(error.to_string().contains("cache still reachable"), "Worker must not be called: {error:#}");
+            assert!(error.to_string().contains("retention authority"), "the Worker is reached: {error:#}");
         }
-        assert!(catalog.require_removed(TENANT_UUID, part).is_err());
+        assert_eq!(catalog.require_removed(TENANT_UUID, part).unwrap().manifest_sha256,
+            crate::part_ingest::iceberg_export::lifecycle::degraded_receipt_sha256(TENANT_UUID, part));
+        assert!(backend.blocked.load(Ordering::SeqCst), "agent reads closed");
         backend.fail_cache.store(false, Ordering::SeqCst);
     }
     // A failed inspection stays cached for that pass. Recovery gets a new pass.

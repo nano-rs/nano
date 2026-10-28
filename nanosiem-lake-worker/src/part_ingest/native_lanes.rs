@@ -49,6 +49,13 @@ const BATCH_RESPONSE_CAP: usize = 256 * 1024;
 /// publication starts its object writes together; this is far below one
 /// owner round trip.
 pub(super) const COALESCE_WINDOW: Duration = Duration::from_millis(5);
+/// NAN-4713: the longest a write-behind part completion waits for its tick.
+/// A completion is gathered until the batch is full, the next part-log entry
+/// or checkpoint needs it (`barrier`), or a waiter asks for it (`settled`,
+/// `idle`); this cap only bounds a write that no tick follows. Arrival-window
+/// gathering (5 ms) batched ~5% of FP's completions: a flush's part objects
+/// land on their own PUT schedules, never within 5 ms of each other.
+pub(super) const COMPLETION_HOLD_MAX: Duration = Duration::from_secs(2);
 /// Re-ask an owner that did not serve the batch routes after this long.
 const UNSUPPORTED_REPROBE: Duration = Duration::from_secs(600);
 /// The only key family whose completion is write-behind: part objects.
@@ -216,6 +223,9 @@ struct LaneState {
     /// Every write-behind completion not yet settled, by enqueue order.
     outstanding: BTreeMap<u64, String>,
     gathering: Gathering<Queued>,
+    /// NAN-4713: a waiter needs the queued completions now: gather no longer.
+    /// Cleared once the queue is drained.
+    drain: bool,
     /// The first completion that failed since the last good replay.
     failure: Option<LaneFailure>,
 }
@@ -225,6 +235,8 @@ struct LaneState {
 pub(super) struct CompletionLane {
     state: Mutex<LaneState>,
     changed: tokio::sync::Notify,
+    /// NAN-4713: wakes a gatherer early (batch full, or a drain requested).
+    flush: tokio::sync::Notify,
 }
 
 impl CompletionLane {
@@ -235,16 +247,30 @@ impl CompletionLane {
     /// Start the owner completion of a journaled part-object PUT.
     pub(super) fn enqueue(&self, writer: &Arc<NativePartWriter>, path: PathBuf, intent: Intent) {
         let request_id = intent.request["request_id"].as_str().unwrap_or_default().to_string();
-        let start = {
+        let (start, full) = {
             let mut state = self.state.lock().expect("completion lane");
             let seq = state.next_seq;
             state.next_seq += 1;
             state.outstanding.insert(seq, request_id);
-            state.gathering.push(Queued { seq, path, intent })
+            let start = state.gathering.push(Queued { seq, path, intent });
+            (start, state.gathering.queued.len() >= NATIVE_BATCH_MAX_ITEMS)
         };
         if start {
             tokio::spawn(Self::gather(writer.clone()));
         }
+        if full {
+            self.flush.notify_waiters();
+        }
+    }
+
+    /// NAN-4713: a waiter needs every queued completion now.
+    fn request_drain(&self) {
+        {
+            let mut state = self.state.lock().expect("completion lane");
+            if state.gathering.queued.is_empty() { return; }
+            state.drain = true;
+        }
+        self.flush.notify_waiters();
     }
 
     async fn wait_until(&self, done: impl Fn(&LaneState) -> bool) {
@@ -263,6 +289,7 @@ impl CompletionLane {
     /// first failure since the last good replay (fail closed).
     pub(super) async fn barrier(&self) -> Result<()> {
         let target = self.state.lock().expect("completion lane").next_seq;
+        self.request_drain();
         self.wait_until(|state| state.failure.is_some() || state.outstanding.range(..target).next().is_none()).await;
         match self.state.lock().expect("completion lane").failure.clone() {
             None => Ok(()),
@@ -278,11 +305,17 @@ impl CompletionLane {
 
     /// No completion of `request_id` is running.
     pub(super) async fn settled(&self, request_id: &str) {
+        // Only a request that is actually outstanding drains the lane: every
+        // write calls this, and draining unconditionally would end batching.
+        if self.state.lock().expect("completion lane").outstanding.values().any(|id| id == request_id) {
+            self.request_drain();
+        }
         self.wait_until(|state| !state.outstanding.values().any(|id| id == request_id)).await;
     }
 
     /// No completion is running.
     pub(super) async fn idle(&self) {
+        self.request_drain();
         self.wait_until(|state| state.outstanding.is_empty()).await;
     }
 
@@ -307,8 +340,26 @@ impl CompletionLane {
     /// Boxed for the same reason as [`AuthorizeCoalescer::gather`].
     fn gather(writer: Arc<NativePartWriter>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         Box::pin(async move {
-            tokio::time::sleep(writer.coalesce_window).await;
-            let (batch, more) = writer.lane.state.lock().expect("completion lane").gathering.take();
+            // NAN-4713: gather until the batch is full, a drain is requested,
+            // or the hold cap; never by arrival window alone.
+            let hold = tokio::time::sleep(writer.completion_hold);
+            tokio::pin!(hold);
+            loop {
+                let woken = writer.lane.flush.notified();
+                tokio::pin!(woken);
+                woken.as_mut().enable();
+                {
+                    let state = writer.lane.state.lock().expect("completion lane");
+                    if state.drain || state.gathering.queued.len() >= NATIVE_BATCH_MAX_ITEMS { break; }
+                }
+                tokio::select! { () = &mut hold => break, () = &mut woken => {} }
+            }
+            let (batch, more) = {
+                let mut state = writer.lane.state.lock().expect("completion lane");
+                let taken = state.gathering.take();
+                if !taken.1 { state.drain = false; }
+                taken
+            };
             if more {
                 tokio::spawn(Self::gather(writer.clone()));
             }

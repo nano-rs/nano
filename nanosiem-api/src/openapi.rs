@@ -1207,7 +1207,8 @@ mod tests {
         // NAN-2942 adds provisioning-outbox:expedite;
         // NAN-2980 adds hec-sources:credentials.
         // SOAR owner status and signed delivery remain private-only.
-        assert_eq!(private["paths"].as_object().unwrap().len(), 31);
+        // NAN-4678 adds activation-invitations:reassign-owner.
+        assert_eq!(private["paths"].as_object().unwrap().len(), 32);
         assert!(private["paths"]["/internal/v1/enterprise-shared/hec-sources:credentials"]["post"].is_object());
         assert!(!build_openapi().paths.paths.contains_key("/internal/v1/enterprise-shared/hec-sources:credentials"),
             "hec-sources:credentials must stay off the public spec");
@@ -1276,7 +1277,8 @@ mod tests {
         // reject, are counted here too; so are NAN-2879's two lake-part
         // paths, which this count had missed, and NAN-2942's
         // provisioning-outbox:expedite, and NAN-2980's hec-sources:credentials).
-        assert_eq!(private["paths"].as_object().unwrap().len(), 31);
+        // NAN-4678 adds activation-invitations:reassign-owner.
+        assert_eq!(private["paths"].as_object().unwrap().len(), 32);
         let path = "/internal/v1/enterprise-shared/hec-sources:enroll";
         assert_eq!(private["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/HecSourceEnrollRequest");
@@ -1284,6 +1286,34 @@ mod tests {
         assert!(schemas["HecSourceEnrollRequest"]["properties"]["sources"].is_object());
         assert!(schemas["SourceProtocolEnrollment"]["properties"]["protocols"].is_object());
         assert!(!schemas["HecSourceEnrollRequest"]["required"].as_array().unwrap().iter().any(|v| v == "sources"));
+        assert!(!build_openapi().paths.paths.contains_key(path));
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn activation_owner_reassign_is_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_private_provisioning::EnterpriseSharedPrivateProvisioningApiDoc;
+        // NAN-4678: nano-main re-points a pending hosted-shared owner; never
+        // in the customer spec.
+        let private = serde_json::to_value(EnterpriseSharedPrivateProvisioningApiDoc::openapi()).unwrap();
+        let path = "/internal/v1/enterprise-shared/activation-invitations:reassign-owner";
+        let operation = &private["paths"][path]["post"];
+        assert_eq!(operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ActivationOwnerReassignRequest");
+        for status in ["200", "400", "401", "404", "409", "503"] {
+            assert!(operation["responses"][status].is_object(), "{status}");
+        }
+        let schemas = &private["components"]["schemas"];
+        let request = &schemas["ActivationOwnerReassignRequest"];
+        for field in ["request_id", "tenant_id", "invitation_id", "prior_secret_digest_hex",
+            "renewed_secret_digest_hex", "renewed_expires_at", "owner", "actor", "reason"] {
+            assert!(request["required"].as_array().unwrap().iter().any(|v| v == field), "{field}");
+        }
+        assert_eq!(request["additionalProperties"], false);
+        assert_eq!(schemas["ActivationOwnerReassignOwner"]["additionalProperties"], false);
+        for field in ["invitation_id", "tenant_id", "renewal_revision", "expires_at", "owner_user_id"] {
+            assert!(schemas["ActivationOwnerReassignReceipt"]["properties"][field].is_object(), "{field}");
+        }
         assert!(!build_openapi().paths.paths.contains_key(path));
     }
 

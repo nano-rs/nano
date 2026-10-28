@@ -42,6 +42,17 @@ pub fn launch_order(planned: &mut [PlannedMerge]) {
     });
 }
 
+/// NAN-4674: while ingest catches up (or rows are buffered) history merges
+/// wait, except a merge consolidating a fragmented hour
+/// ([`crate::parts::levels::is_fragmented_hour_merge`]) when no history
+/// merge is in flight: one at a time, beside the minute lane, so admission
+/// keeps the rest of the cell. A backfill whose objects span many hours adds
+/// a part to every hour it spans on every flush, and the catch-up lasts as
+/// long as the backfill: without this, nothing bounded those hours.
+pub fn fragmented_runs_beside_admission<'a>(merge: &PlannedMerge, mut in_flight: impl Iterator<Item = &'a PlannedMerge>) -> bool {
+    crate::parts::levels::is_fragmented_hour_merge(merge) && in_flight.all(|m| m.output_level == Level::Minute)
+}
+
 pub fn overlaps(left: &PlannedMerge, right: &PlannedMerge) -> bool {
     let range = |merge: &PlannedMerge| {
         let first = merge.event_hour;
@@ -220,6 +231,29 @@ mod tests {
             row_groups: 1,
             data_files: 1,
         }
+    }
+
+    /// NAN-4674: during catch-up exactly one fragmented-hour `h` merge may
+    /// run (beside minute merges only); an ordinary sealed-hour merge still
+    /// waits for the catch-up to end, and so does a second fragmented one.
+    #[test]
+    fn one_fragmented_hour_merge_runs_beside_admission() {
+        use crate::parts::levels::{PlannedMerge, FRAGMENTED_HOUR_PARTS};
+        let now = 600_000_i64 * 3_600_000;
+        let merge = |level: Level, hour: i32, inputs: usize| PlannedMerge {
+            output_level: level, event_hour: hour,
+            inputs: (0..inputs).map(|i| part(hour, i as i64, now)).collect(),
+        };
+        let fragmented = merge(Level::Hour, 10, FRAGMENTED_HOUR_PARTS);
+        let ordinary = merge(Level::Hour, 11, FRAGMENTED_HOUR_PARTS - 1);
+        let minute = merge(Level::Minute, 12, 24);
+        assert!(fragmented_runs_beside_admission(&fragmented, std::iter::empty()));
+        assert!(fragmented_runs_beside_admission(&fragmented, [&minute, &minute].into_iter()));
+        assert!(!fragmented_runs_beside_admission(&ordinary, std::iter::empty()));
+        assert!(!fragmented_runs_beside_admission(&minute, std::iter::empty()));
+        let other = merge(Level::Hour, 13, FRAGMENTED_HOUR_PARTS);
+        assert!(!fragmented_runs_beside_admission(&fragmented, [&minute, &other].into_iter()), "one at a time");
+        assert!(!fragmented_runs_beside_admission(&fragmented, [&ordinary].into_iter()), "never beside another history merge");
     }
 
     #[test]

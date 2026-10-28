@@ -67,7 +67,14 @@ pub trait CatalogLifecycleBackend: IcebergCommitter {
     async fn expire_and_inspect(&self) -> Result<BTreeSet<String>>;
     async fn invalidate_results(&self) -> Result<()>;
     async fn reopen(&self) -> Result<()>;
+    /// Part GC never waits on this catalog: `vanished(part)` is true once a
+    /// part holds a GC receipt (its files may be deleted). A backend with
+    /// its own durable pending work must never commit such a part.
+    fn set_vanished(&self, _vanished: Vanished) {}
 }
+
+/// See [`CatalogLifecycleBackend::set_vanished`].
+pub(crate) type Vanished = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Existing REST committer plus the provider's maintenance and reader controls.
 /// Construct one per tenant contract. A caller cannot substitute a foreign
@@ -440,6 +447,24 @@ struct CatalogPartUnproven(String);
 /// remote catalog references.
 const PLANNED_INDEX_READY: &str = "planned-index-ready";
 
+/// The strict catalog inspection a GC fence may run, inside its 120 s bound.
+const INSPECTION_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn degraded_evidence(tenant: &str, bucket: &str, part: &str) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&(tenant, bucket, part, "agent-lane-degraded"))?)
+}
+
+/// The receipt digest of a part GC receipted with the agent lane degraded.
+#[cfg(test)]
+pub(crate) fn degraded_receipt_sha256(tenant: &str, part: &str) -> String {
+    let bucket = crate::lake_part_gc::request::tenant_bucket(tenant);
+    crate::parts::sha256_hex(&degraded_evidence(tenant, &bucket, part).expect("evidence"))
+}
+
+/// Written when part GC receipted a part the strict proofs could not clear
+/// (the agent lane degraded). Reads stay closed until a converged sync.
+const GC_DEGRADED: &str = "gc-degraded";
+
 /// Owned by the single tenant writer; keep this directory with the existing
 /// durable export state. Pending manifests survive every failed provider step.
 /// The provider barrier survives loss of the writer's local state as well.
@@ -450,6 +475,10 @@ pub struct TenantCatalog {
     backend: Arc<dyn CatalogLifecycleBackend>,
     lock: tokio::sync::Mutex<CustodyState>,
     limits: SyncLimits,
+    /// The live set of the writer's latest sync (in memory). A degraded
+    /// receipt is never minted for a live part: that is a liveness check
+    /// (GC asking for live data is a bug elsewhere), not a catalog gate.
+    live: std::sync::Mutex<Option<BTreeSet<String>>>,
     _lease: std::fs::File,
 }
 
@@ -510,6 +539,8 @@ pub(crate) struct CatalogGcPass {
     uncommitted: std::sync::Mutex<Option<UncommittedRead>>,
     uncommitted_reads: std::sync::atomic::AtomicU32,
     uncommitted_inflight: std::sync::atomic::AtomicBool,
+    /// The degraded-lane read fence runs once per pass.
+    degraded_close: std::sync::atomic::AtomicBool,
 }
 /// Bound on commit-state reads per GC pass; past it the fence holds.
 const UNCOMMITTED_READS_PER_PASS: u32 = 64;
@@ -575,9 +606,14 @@ impl TenantCatalog {
             backend,
             lock: tokio::sync::Mutex::new(CustodyState::default()),
             limits: SyncLimits::DEFAULT,
+            live: std::sync::Mutex::new(None),
             _lease: lease,
         };
         service.recover_planned_index()?;
+        let receipts = service.work_dir.join("catalog-removed");
+        service.backend.set_vanished(Arc::new(move |part: &str| {
+            PartId::parse(part).is_err() || receipts.join(format!("{part}.json")).try_exists().unwrap_or(true)
+        }));
         Ok(service)
     }
 
@@ -631,6 +667,20 @@ impl TenantCatalog {
                 crate::parts::levels::Level::Hour | crate::parts::levels::Level::Day
             )
         });
+        // A receipted part may already be deleted by part GC (which never
+        // waits on this catalog): it must never (re)enter the catalog, and
+        // the plan below removes it wherever the catalog still holds it.
+        // Fail closed by error, never by dropping: an unreadable receipt
+        // store must not silently empty the agent catalog of live parts.
+        let mut kept = Vec::with_capacity(refs.len());
+        for part in refs {
+            if !self.receipt_path(part.part_id.as_str())?.try_exists()? {
+                kept.push(part);
+            }
+        }
+        let refs = kept;
+        *self.live.lock().map_err(|_| anyhow::anyhow!("catalog live set poisoned"))? =
+            Some(refs.iter().map(|p| p.part_id.to_string()).collect());
         let started = std::time::Instant::now();
         tokio::time::timeout(self.limits.hard_bound, async {
             let mut custody = self.lock.lock().await;
@@ -725,6 +775,13 @@ impl TenantCatalog {
                 self.reopen().await?;
             }
             self.write_marker(PLANNED_INDEX_READY, self.tenant.as_bytes())?;
+            if self.work_dir.join(GC_DEGRADED).try_exists()? {
+                // The lane degraded by part GC is whole again: this sync
+                // removed every receipted part and (privacy) published a
+                // fresh epoch before reopening reads.
+                std::fs::remove_file(self.work_dir.join(GC_DEGRADED))?;
+                tracing::info!("agent catalog converged after part GC degraded the lane");
+            }
             custody.last_success = Some(now_ms);
             tracing::info!(stage = "converged", elapsed_ms = started.elapsed().as_millis() as u64, "catalog sync stage");
             Ok(())
@@ -758,7 +815,15 @@ impl TenantCatalog {
             chain.push(manifest.planned_at_ms);
         }
         let remote = self.backend.export_head(false).await?.checkpoint.unwrap_or(0);
-        if remote == base || chain.contains(&remote) {
+        // A pending plan that adds a part part GC may already have deleted
+        // can never commit (its data is gone): set the plans aside and
+        // rebuild from the catalog like a wiped volume.
+        let mut vanished = false;
+        for path in plans {
+            let manifest: ExportManifest = serde_json::from_slice(&std::fs::read(path)?)?;
+            vanished |= manifest.add.iter().any(|p| self.receipted(&p.part_id));
+        }
+        if (remote == base || chain.contains(&remote)) && !vanished {
             return Ok(None);
         }
         // A restart after the supersede step but before the rebuilt state
@@ -1042,6 +1107,11 @@ impl TenantCatalog {
         Ok(())
     }
 
+    /// Receipted for part GC: its files may be gone. Unreadable means yes.
+    fn receipted(&self, part: &str) -> bool {
+        self.receipt_path(part).map_or(true, |path| path.try_exists().unwrap_or(true))
+    }
+
     fn receipt_path(&self, part: &str) -> Result<PathBuf> {
         ensure!(part.is_ascii(), "invalid catalog part ID");
         PartId::parse(part)?;
@@ -1150,6 +1220,15 @@ impl TenantCatalog {
         self.fence_in_pass(tenant, part, &CatalogGcPass::default())
             .await
     }
+    /// Part GC is NEVER gated on the agent catalog (decision 10-26). The
+    /// strict proofs below (never planned, no committed snapshot, a full
+    /// inspection that no longer references the part) receipt a part with
+    /// the lane intact. Whenever they cannot clear it (planned index absent,
+    /// still referenced, inspection failed, an uncommitted plan names it,
+    /// custody moved mid-pass), the agent lane degrades instead: reads close
+    /// through the privacy path (durable marker first), the part is
+    /// receipted, and the writer's next sync drops it from the catalog and
+    /// publishes a fresh epoch before reads reopen. See [`Self::degrade`].
     pub(crate) async fn fence_in_pass(
         &self,
         tenant: &str,
@@ -1164,97 +1243,21 @@ impl TenantCatalog {
                 return self.require_removed(tenant, part);
             }
             let planned = self.planned_path(part)?.try_exists()?;
+            // A foreign or unreadable marker is custody corruption, never
+            // "unconverged": it stays a refusal.
             let indexed = self.planned_index_ready()?;
-            // NAN-4662: the agent catalog is optional. When the existing
-            // proofs below cannot clear this part (it was planned, or the
-            // planned index is not rebuilt yet), a catalog that never
-            // committed a snapshot references nothing: GC proceeds instead of
-            // waiting on an export that may never converge.
-            if planned || !indexed {
-                if let Some(evidence) = self
-                    .uncommitted_evidence(tenant, part, pass, custody.generation)
-                    .await?
-                {
-                    let receipt = CatalogRemovedReceipt {
-                        tenant_id: self.tenant.clone(),
-                        bucket: self.bucket.clone(),
-                        part_id: part.into(),
-                        manifest_sha256: crate::parts::sha256_hex(&evidence),
-                    };
-                    self.record_receipt(&receipt)?;
-                    return Ok(receipt);
-                }
-            }
-            let evidence = if planned {
-                if pass.proof.get().is_none() {
-                    // A canceled/timed-out attempt must not start again for
-                    // the next physical file in this same GC pass.
-                    ensure!(
-                        !pass
-                            .attempted
-                            .swap(true, std::sync::atomic::Ordering::SeqCst),
-                        "catalog inspection canceled; retry next GC pass"
-                    );
-                    let inspected: Result<RetirementProof> = async {
-                        ensure!(self.pending()?.is_empty(), "catalog plan still pending");
-                        self.close().await?;
-                        self.backend.verify_maintenance().await?;
-                        // The pinned check for this part (and every later
-                        // one) runs below against the cached proof, so one
-                        // pinned part never poisons the whole pass (NAN-4612).
-                        let referenced = self.backend.expire_and_inspect().await?;
-                        Ok(RetirementProof {
-                            tenant: self.tenant.clone(),
-                            generation: custody.generation,
-                            referenced,
-                        })
+            let strict = self.strict_evidence(tenant, part, pass, planned, indexed, custody.generation).await;
+            let (evidence, reopen) = match strict {
+                Ok(proved) => proved,
+                Err(error) => {
+                    let live = self.live.lock().map_err(|_| anyhow::anyhow!("catalog live set poisoned"))?
+                        .as_ref().is_some_and(|live| live.contains(part));
+                    if live {
+                        // Per key, like any pinned part: the pass goes on.
+                        return Err(anyhow::Error::new(CatalogPinsPart));
                     }
-                    .await;
-                    pass.proof
-                        .set(inspected.map_err(|e| format!("{e:#}")))
-                        .map_err(|_| anyhow::anyhow!("catalog GC proof already set"))?;
+                    (self.degrade(tenant, part, pass, &error).await?, false)
                 }
-                // NAN-4662: a failed inspection holds the parts it could not
-                // clear, not the pass: never-planned parts still proceed.
-                let proof = pass
-                    .proof
-                    .get()
-                    .context("catalog GC proof missing")?
-                    .as_ref()
-                    .map_err(|e| anyhow::Error::new(CatalogPartUnproven(e.clone())))?;
-                ensure!(
-                    proof.tenant == tenant && proof.generation == custody.generation,
-                    "catalog changed during GC pass; retry next pass"
-                );
-                if proof.referenced.contains(part) {
-                    return Err(anyhow::Error::new(CatalogPinsPart));
-                }
-                // NAN-4636: invalidate only once a retirement can proceed,
-                // before its receipt; a pinned refusal keeps the cache.
-                if pass.invalidated.get().is_none() {
-                    ensure!(
-                        !pass
-                            .invalidate_attempted
-                            .swap(true, std::sync::atomic::Ordering::SeqCst),
-                        "catalog result invalidation canceled; retry next GC pass"
-                    );
-                    let outcome = self.backend.invalidate_results().await;
-                    pass.invalidated
-                        .set(outcome.map_err(|e| format!("{e:#}")))
-                        .map_err(|_| anyhow::anyhow!("catalog GC invalidation already set"))?;
-                }
-                pass.invalidated
-                    .get()
-                    .context("catalog GC invalidation missing")?
-                    .as_ref()
-                    .map_err(|e| anyhow::anyhow!(e.clone()))?;
-                serde_json::to_vec(&(tenant, &self.bucket, part, &proof.referenced))?
-            } else {
-                ensure!(
-                    indexed,
-                    "catalog planned index not initialized: waiting for the writer's first reconciled catalog sync"
-                );
-                serde_json::to_vec(&(tenant, &self.bucket, part, "never-planned"))?
             };
             let receipt = CatalogRemovedReceipt {
                 tenant_id: self.tenant.clone(),
@@ -1263,13 +1266,124 @@ impl TenantCatalog {
                 manifest_sha256: crate::parts::sha256_hex(&evidence),
             };
             self.record_receipt(&receipt)?;
-            if planned && self.work_dir.join("reads-closed").try_exists()? {
+            // A degraded lane stays closed until a converged sync reopens it.
+            if reopen && self.work_dir.join("reads-closed").try_exists()?
+                && !self.work_dir.join(GC_DEGRADED).try_exists()?
+            {
                 self.reopen().await?;
             }
             Ok(receipt)
         })
         .await
         .context("catalog retirement timed out; part retained")?
+    }
+
+    /// The pre-decoupling proofs that `part` is unreferenced. `Ok((evidence,
+    /// reopen))`; any error means "not proven", never "do not delete".
+    async fn strict_evidence(
+        &self,
+        tenant: &str,
+        part: &str,
+        pass: &CatalogGcPass,
+        planned: bool,
+        indexed: bool,
+        generation: u64,
+    ) -> Result<(Vec<u8>, bool)> {
+        // NAN-4662: a catalog that never committed a snapshot references
+        // nothing.
+        if planned || !indexed {
+            if let Some(evidence) = self.uncommitted_evidence(tenant, part, pass, generation).await? {
+                return Ok((evidence, false));
+            }
+        }
+        if !planned {
+            ensure!(
+                indexed,
+                "catalog planned index not initialized: waiting for the writer's first reconciled catalog sync"
+            );
+            return Ok((serde_json::to_vec(&(tenant, &self.bucket, part, "never-planned"))?, false));
+        }
+        if pass.proof.get().is_none() {
+            // A canceled/timed-out attempt must not start again for
+            // the next physical file in this same GC pass.
+            ensure!(
+                !pass.attempted.swap(true, std::sync::atomic::Ordering::SeqCst),
+                "catalog inspection canceled; retry next GC pass"
+            );
+            // Bounded inside the fence's own bound: a hung catalog degrades
+            // the lane instead of timing the whole fence out (GC never waits).
+            let inspected: Result<RetirementProof> = tokio::time::timeout(INSPECTION_BOUND, async {
+                ensure!(self.pending()?.is_empty(), "catalog plan still pending");
+                self.close().await?;
+                self.backend.verify_maintenance().await?;
+                // The pinned check for this part (and every later
+                // one) runs below against the cached proof (NAN-4612).
+                let referenced = self.backend.expire_and_inspect().await?;
+                Ok(RetirementProof { tenant: self.tenant.clone(), generation, referenced })
+            })
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("catalog inspection timed out")));
+            pass.proof
+                .set(inspected.map_err(|e| format!("{e:#}")))
+                .map_err(|_| anyhow::anyhow!("catalog GC proof already set"))?;
+        }
+        let proof = pass
+            .proof
+            .get()
+            .context("catalog GC proof missing")?
+            .as_ref()
+            .map_err(|e| anyhow::Error::new(CatalogPartUnproven(e.clone())))?;
+        ensure!(
+            proof.tenant == tenant && proof.generation == generation,
+            "catalog changed during GC pass; retry next pass"
+        );
+        if proof.referenced.contains(part) {
+            return Err(anyhow::Error::new(CatalogPinsPart));
+        }
+        // NAN-4636: invalidate only once a retirement can proceed,
+        // before its receipt; a pinned refusal keeps the cache.
+        if pass.invalidated.get().is_none() {
+            ensure!(
+                !pass.invalidate_attempted.swap(true, std::sync::atomic::Ordering::SeqCst),
+                "catalog result invalidation canceled; retry next GC pass"
+            );
+            let outcome = self.backend.invalidate_results().await;
+            pass.invalidated
+                .set(outcome.map_err(|e| format!("{e:#}")))
+                .map_err(|_| anyhow::anyhow!("catalog GC invalidation already set"))?;
+        }
+        pass.invalidated
+            .get()
+            .context("catalog GC invalidation missing")?
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!(e.clone()))?;
+        Ok((serde_json::to_vec(&(tenant, &self.bucket, part, &proof.referenced))?, true))
+    }
+
+    /// Part GC proceeds; the agent lane pays. Erasure safety for exposed
+    /// serving epochs, in order:
+    /// 1. `gc-degraded` and `reads-closed` reach disk BEFORE the receipt, so
+    ///    every later sync takes the privacy path and no GC pass or sync
+    ///    reopens reads until a sync converges without the part (that sync
+    ///    drops receipted parts from its live set, removes them from the
+    ///    master, and publishes a FRESH epoch name; the old one is retired).
+    /// 2. The gateway is closed and drained (the existing privacy fence,
+    ///    which also starts a fresh pending epoch) once per pass. A provider
+    ///    failure there is logged and does NOT hold the delete: the durable
+    ///    marker retries the close on every sync, and a deleted file can no
+    ///    longer serve rows through any epoch.
+    async fn degrade(&self, tenant: &str, part: &str, pass: &CatalogGcPass, why: &anyhow::Error) -> Result<Vec<u8>> {
+        self.write_marker(GC_DEGRADED, self.tenant.as_bytes())?;
+        self.write_marker("reads-closed", self.tenant.as_bytes())?;
+        if !pass.degraded_close.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if let Err(error) = self.backend.close_and_drain().await {
+                tracing::error!(error = %format!("{error:#}"),
+                    "agent catalog read fence unavailable; part GC proceeds, reads stay closed by marker");
+            }
+            tracing::warn!(reason = %format!("{why:#}"),
+                "part GC proceeds without agent catalog custody; agent lane degraded until the next converged catalog sync");
+        }
+        degraded_evidence(tenant, &self.bucket, part)
     }
 
     pub(crate) async fn guard_delete_in_pass(

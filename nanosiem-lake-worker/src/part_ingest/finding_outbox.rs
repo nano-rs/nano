@@ -23,7 +23,7 @@ use crate::part_query::risk::{finding_event, CompactFinding};
 
 use crate::parts::format::{validate_tenant_uuid, LogKeys, PartKeys, PARTS_ROOT};
 use crate::parts::levels::Level;
-use crate::parts::part_log::{catch_up, load_log, LiveSet, LogEntry, LogOp, ObjectStore, SourceRef, WriteHints, WriterClass, GENESIS_PREV};
+use crate::parts::part_log::{catch_up_schema, load_log_schema, LogEntry, LogOp, LogSchemaView, ObjectStore, SourceRef, WriteHints, WriterClass, GENESIS_PREV};
 use crate::parts::provenance::{canonical_json_bytes, Admission, PartInputs, PartSigner, PartialKind, SignedProvenance, SourceObject, TenantKeySet};
 use crate::parts::{event_hour_of, is_sha256_hex, sha256_hex, DedupWindow};
 
@@ -121,7 +121,13 @@ pub async fn committed_receipts_cached(
         .and_then(|bounds| bounds.into_iter().min_by_key(|(seq, _)| *seq));
     let wanted = wanted_refs.iter().map(|source| (source.key.as_str(), source.sha256.as_str())).collect::<Vec<_>>();
     let mut committed = BTreeMap::new();
-    let mut verified = LiveSet::default();
+    // NAN-4691: from genesis the chain, the epoch and every schema are
+    // verified with a head+schema view, not a folded LiveSet, so a proof
+    // that has to start at genesis (a receipt with no floor, e.g. after a
+    // SIGKILLed attempt) costs O(one fetch window) of memory, never the
+    // log's history. The receipts it looks for are proven by their signed
+    // provenance below, not by the fold.
+    let mut verified = LogSchemaView::default();
     let (mut next, mut prev, mut min_epoch) = match &resume {
         Some((seq, sha)) => {
             // Trusted like a checkpoint: the entry it names must exist with
@@ -159,8 +165,8 @@ pub async fn committed_receipts_cached(
         min_epoch = entry.writer_epoch;
         let sha = sha256_hex(&bytes);
         if resume.is_none() {
-            // From genesis the whole fold is checked too; a resumed scan has
-            // no live set to fold into (as after a checkpoint, the chain is).
+            // From genesis the genesis/schema rules are checked too; a resumed
+            // scan starts mid-chain (as after a checkpoint, the chain is).
             verified.apply(&entry, &sha)?;
         }
         if let LogOp::Add { consumed, parts, edge_log } = &entry.op {
@@ -234,6 +240,13 @@ pub const DRAIN_BATCH_BYTES: usize = 4 * 1024 * 1024;
 pub const OUTBOX_RETENTION_DAYS: i32 = 7;
 /// Rows removed per prune statement; a larger backlog drains over passes.
 const OUTBOX_PRUNE_BATCH: i64 = 1_000;
+/// NAN-4670: prune statements per scheduled prune. One 1,000-row statement
+/// every 10 minutes (144k rows/day) left a one-day backlog (46k rows on FP
+/// when 9015560 moved the window from 8 to 7 days) for most of a day. Up to
+/// five statements per prune, stopping at the first short batch, clear it in
+/// ~1.5 h while each statement stays a 1,000-row SKIP LOCKED delete and the
+/// WAL per prune stays bounded (<= 5,000 rows every 10 minutes).
+const OUTBOX_PRUNE_STATEMENTS: u32 = 5;
 /// How often a long-running drain loop prunes.
 pub const OUTBOX_PRUNE_EVERY_MS: i64 = 10 * 60 * 1_000;
 /// Bound on the failure text recorded on rows a failed pass had claimed.
@@ -392,16 +405,19 @@ pub async fn drain_pass(
 
 /// The drain's view of the tenant part log, kept across passes (NAN-3096).
 ///
-/// A pass that publishes findings needs the log's current schema. Loading it
-/// with [`load_log`] every pass cost one LIST of the checkpoints plus a GET of
-/// every entry since the newest checkpoint (up to [`CHECKPOINT_EVERY`]), on
-/// every pass with findings: tens of thousands of R2 reads an hour on a busy
-/// tenant. The cached set instead advances with [`catch_up`], which reads only
-/// the entries appended since the last pass and verifies each one against the
-/// hash chain exactly as `load_log`'s own catch-up does. Any catch-up failure,
-/// and any pass that fails after taking the set, falls back to a full
-/// `load_log` on the next pass. Tenant changes and every checkpoint interval
-/// also reload, bounding the historical metadata retained by this cache.
+/// A pass that publishes findings needs the log's current schema, and only
+/// that. NAN-4691: the view is a [`LogSchemaView`] (head + schema), never a
+/// folded `LiveSet`: folding every live part and the id-horizon metadata made
+/// the drain's memory grow with the log, in a detect[T] that runs at
+/// 256 MiB-1 GiB on pooled cells (NAN-4690). Loading
+/// the view every pass cost one LIST of the checkpoints plus a GET of every
+/// entry since the newest checkpoint (up to [`CHECKPOINT_EVERY`]), on every
+/// pass with findings: tens of thousands of R2 reads an hour on a busy
+/// tenant. The cached view instead advances with [`catch_up_schema`], which
+/// reads only the entries appended since the last pass and verifies each one
+/// against the hash chain. Any catch-up failure, and any pass that fails
+/// after taking the view, falls back to a full [`load_log_schema`] on the
+/// next pass. Tenant changes and every checkpoint interval also reload.
 ///
 /// [`CHECKPOINT_EVERY`]: crate::parts::part_log::CHECKPOINT_EVERY
 ///
@@ -409,7 +425,7 @@ pub async fn drain_pass(
 /// at most once per [`OUTBOX_PRUNE_EVERY_MS`] (a fresh cache prunes at once).
 #[derive(Debug, Default)]
 pub struct DrainLogCache {
-    live: Option<LiveSet>,
+    live: Option<LogSchemaView>,
     tenant_id: Option<String>,
     loaded_seq: u64,
     next_prune_ms: i64,
@@ -422,25 +438,25 @@ pub struct DrainLogCache {
 impl DrainLogCache {
     /// The live set at the current log head, owned by the caller until it is
     /// handed back with [`DrainLogCache::keep`].
-    async fn take_current(&mut self, store: &dyn ObjectStore, tenant_id: &str) -> Result<LiveSet> {
+    async fn take_current(&mut self, store: &dyn ObjectStore, tenant_id: &str) -> Result<LogSchemaView> {
         let same_tenant = self.tenant_id.as_deref() == Some(tenant_id);
         if let Some(mut live) = self.live.take().filter(|live| {
             same_tenant && live.head().map_or(0, |(seq, _, _)| seq)
                 .saturating_sub(self.loaded_seq) < crate::parts::part_log::CHECKPOINT_EVERY
         }) {
-            match catch_up(store, tenant_id, &mut live).await {
+            match catch_up_schema(store, tenant_id, &mut live).await {
                 Ok(_) => return Ok(live),
                 Err(error) => tracing::warn!(tenant_id, error = %format!("{error:#}"),
                     "finding drain log view could not catch up; reloading from the checkpoint"),
             }
         }
-        let live = load_log(store, tenant_id).await?;
+        let live = load_log_schema(store, tenant_id).await?;
         self.tenant_id = Some(tenant_id.to_owned());
         self.loaded_seq = live.head().map_or(0, |(seq, _, _)| seq);
         Ok(live)
     }
 
-    fn keep(&mut self, live: LiveSet) {
+    fn keep(&mut self, live: LogSchemaView) {
         self.live = Some(live);
     }
 
@@ -585,6 +601,19 @@ async fn drain_pass_authorized(
 /// effort: a failure (for example a hosted database without the retention
 /// grant yet) never blocks delivery; the next scheduled prune retries.
 async fn prune_delivered(pool: &sqlx::PgPool, tenant_uuid: uuid::Uuid, tenant_id: &str) -> u64 {
+    let mut total = 0;
+    for _ in 0..OUTBOX_PRUNE_STATEMENTS {
+        let pruned = prune_delivered_batch(pool, tenant_uuid, tenant_id).await;
+        total += pruned;
+        if pruned < OUTBOX_PRUNE_BATCH as u64 {
+            break;
+        }
+    }
+    total
+}
+
+/// One bounded prune statement ([`OUTBOX_PRUNE_BATCH`] rows at most).
+async fn prune_delivered_batch(pool: &sqlx::PgPool, tenant_uuid: uuid::Uuid, tenant_id: &str) -> u64 {
     let result = sqlx::query(
         "DELETE FROM detection_finding_lake_outbox \
          WHERE (security_tenant_id, tenant_id, finding_id) IN (\

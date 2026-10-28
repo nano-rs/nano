@@ -2,7 +2,7 @@
 
 //! NAN-3188, native: `class_uid = N` file pruning over a class-clustered hour
 //! part, end-to-end (real ingestor + hour merge under
-//! `NANO_LAKE_COMPACTION_LAYOUT` or NAN-3437 `NANO_LAKE_CLASS_FAMILIES`, real
+//! `NANO_LAKE_COMPACTION_LAYOUT` or the default NAN-3437 class families, real
 //! compiler, planner, chDB). The hinted
 //! query must prune whole source/class files and return exactly the rows of
 //! an unhinted form (`| eval c = class_uid + 0 | where c = N`), which prunes
@@ -371,19 +371,22 @@ fn sorted_rows(rows: &[Value]) -> Vec<String> {
 async fn class_uid_pruning_over_a_clustered_hour_matches_the_unhinted_where_form() {
     // Pre-r13c cells clustered hour merges by (source, class) under this
     // layout; it is process-global, and native tests run one at a time.
-    class_uid_pruning_over_a_clustered_hour("NANO_LAKE_COMPACTION_LAYOUT", "8192:67108864").await;
+    class_uid_pruning_over_a_clustered_hour(Some(("NANO_LAKE_COMPACTION_LAYOUT", "8192:67108864"))).await;
 }
 
-/// NAN-3437: the same reader contract over an hour clustered by the
-/// independent switch (default row groups, one merge pass).
+/// NAN-3437: the same reader contract over the default hour (class
+/// families, always on since NAN-4688: default row groups, one merge pass).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
 async fn class_uid_pruning_over_a_class_families_hour_matches_the_unhinted_where_form() {
-    class_uid_pruning_over_a_clustered_hour(crate::part_ingest::merge::CLASS_FAMILIES_ENV, "1").await;
+    // The default layout: no variable.
+    class_uid_pruning_over_a_clustered_hour(None).await;
 }
 
-async fn class_uid_pruning_over_a_clustered_hour(env: &str, value: &str) {
-    std::env::set_var(env, value);
+async fn class_uid_pruning_over_a_clustered_hour(layout: Option<(&str, &str)>) {
+    if let Some((env, value)) = layout {
+        std::env::set_var(env, value);
+    }
     let root = tempfile::tempdir().unwrap();
     let hour = (Utc::now() - Duration::hours(8))
         .duration_trunc(Duration::hours(1))
@@ -465,8 +468,10 @@ async fn class_uid_pruning_over_a_clustered_hour(env: &str, value: &str) {
             .filter(|&i| class(i) == 4001 && port(i) == 445 && i % 2 == 0)
             .count() as u64
     );
-    eprintln!("nan3188 class prune ({env}={value}): hinted funnel {hinted_funnel:?}");
-    std::env::remove_var(env);
+    eprintln!("nan3188 class prune ({layout:?}): hinted funnel {hinted_funnel:?}");
+    if let Some((env, _)) = layout {
+        std::env::remove_var(env);
+    }
 }
 
 /// NAN-4292: an event-id lookup over the class-families hour prunes files
@@ -475,7 +480,6 @@ async fn class_uid_pruning_over_a_clustered_hour(env: &str, value: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
 async fn uid_lookup_prunes_files_by_sidecar_and_returns_the_row() {
-    std::env::set_var(crate::part_ingest::merge::CLASS_FAMILIES_ENV, "1");
     std::env::set_var("NANO_LAKE_UID_SIDECAR_WRITE", "1");
     let root = tempfile::tempdir().unwrap();
     let hour = (Utc::now() - Duration::hours(8))
@@ -499,5 +503,4 @@ async fn uid_lookup_prunes_files_by_sidecar_and_returns_the_row() {
     assert!(rows.is_empty(), "{rows:?}");
     assert!(funnel.uid_pruned_files > 0, "{funnel:?}");
     std::env::remove_var("NANO_LAKE_UID_SIDECAR_WRITE");
-    std::env::remove_var(crate::part_ingest::merge::CLASS_FAMILIES_ENV);
 }

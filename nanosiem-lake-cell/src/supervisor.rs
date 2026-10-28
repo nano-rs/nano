@@ -88,9 +88,6 @@ pub(crate) const FEATURE_ENV: &[&str] = &[
     // part_ingest/host_sort.rs (NAN-3412 host-sorted endpoint hour files;
     // ingest role; default off)
     "NANO_LAKE_ENDPOINT_HOST_SORT",
-    // part_ingest/merge.rs (NAN-3437 (source, class) hour family files in
-    // the default layout, one merge pass; ingest role; default off)
-    "NANO_LAKE_CLASS_FAMILIES",
     // cloud_facet_summaries.rs (signed writer and exact summary reader)
     "NANO_LAKE_CLOUD_FACET_SUMMARIES",
     "NANO_LAKE_CLOUD_FACET_READS",
@@ -4801,6 +4798,7 @@ impl Supervisor {
                         hb.lag_seconds, 120.0, lag_page, hb.detail.clone()));
                     out.push(crate::signals::unmerged_l0_age(t.clone(), hb.oldest_unmerged_l0_age_seconds));
                     out.push(crate::signals::l0_merge_overdue(t.clone(), hb.l0_merge_overdue_seconds));
+                    out.push(crate::signals::parts_per_hour(t.clone(), hb.max_parts_per_hour));
                     out.push(crate::signals::prevalence_behind(t.clone(), hb.prevalence_behind_seconds,
                         hb.prevalence_behind_entries));
                     out.extend(crate::signals::prevalence_degraded_reported(t.clone(), hb.prevalence_degraded_seconds,

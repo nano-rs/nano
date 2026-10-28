@@ -4,7 +4,7 @@ use super::*;
 use crate::parts::{format::PartId, levels::Level};
 use std::{
     collections::HashMap,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 const T: &str = "3867aaaa-0000-4000-8000-000000000001";
 const BUCKET: &str = "nano-shared-r2-3867aaaa-0000-4000-8000-000000000001";
@@ -24,6 +24,10 @@ struct Provider {
     lose_response: Arc<AtomicBool>,
     /// NAN-4614: the next commit to a serving epoch (not the master) hangs.
     stall_epoch: Arc<AtomicBool>,
+    /// FP-T101: ...once that epoch already landed this many commits.
+    stall_epoch_after: Arc<AtomicUsize>,
+    /// FP-T101: each published epoch and the parts it held when published.
+    published: Mutex<Vec<(String, BTreeSet<String>)>>,
 }
 struct Table {
     name: String,
@@ -38,16 +42,22 @@ struct Table {
     /// NAN-4614: how often each part was registered (added) in this table.
     adds: Mutex<HashMap<String, usize>>,
     commits: std::sync::atomic::AtomicUsize,
+    /// FP-T101: every commit request, including checkpoint skips.
+    calls: AtomicUsize,
     stall: Arc<AtomicBool>,
     lose_response: Arc<AtomicBool>,
     stall_epoch: Arc<AtomicBool>,
+    stall_epoch_after: Arc<AtomicUsize>,
 }
 #[async_trait::async_trait]
 impl IcebergCommitter for Table {
     async fn commit(&self, m: &ExportManifest) -> Result<()> {
         ensure!(m.tenant_id == T, "foreign tenant");
+        self.calls.fetch_add(1, Ordering::SeqCst);
         if self.stall.swap(false, Ordering::SeqCst)
-            || self.name != "events" && self.stall_epoch.swap(false, Ordering::SeqCst)
+            || self.name != "events"
+                && self.commits.load(Ordering::SeqCst) >= self.stall_epoch_after.load(Ordering::SeqCst)
+                && self.stall_epoch.swap(false, Ordering::SeqCst)
         {
             std::future::pending::<()>().await;
         }
@@ -159,9 +169,11 @@ impl ServingFactory for Provider {
                     fail_retire: self.fail_retire.clone(),
                     adds: Mutex::new(HashMap::new()),
                     commits: Default::default(),
+                    calls: Default::default(),
                     stall: self.stall.clone(),
                     lose_response: self.lose_response.clone(),
                     stall_epoch: self.stall_epoch.clone(),
+                    stall_epoch_after: self.stall_epoch_after.clone(),
                 })
             })
             .clone())
@@ -198,6 +210,8 @@ impl ServingFactory for Provider {
                 "catalog_serving_epoch_not_fresh"
             );
         }
+        let held = self.tables.lock().unwrap()[epoch(&name).as_str()].parts.lock().unwrap().clone();
+        self.published.lock().unwrap().push((name.clone(), held));
         self.registry.lock().unwrap().replace(name.clone());
         self.trace.lock().unwrap().push(format!("publish:{name}"));
         Ok(())
@@ -417,8 +431,14 @@ async fn wiped_writer_retires_epochs_it_forgot_before_any_gc_receipt() {
     // No read barrier, unknown epochs: the proof itself fails closed.
     let error = backend.expire_and_inspect().await.unwrap_err();
     assert!(error.to_string().contains("unknown to this writer"), "{error:#}");
-    assert!(catalog.fence_retirement(T, &p).await.is_err());
-    assert!(catalog.require_removed(T, &p).is_err());
+    // Part GC never waits on the catalog: P is receipted with the agent
+    // lane degraded. The gateway is closed (E1 can no longer be read) and a
+    // fresh pending epoch exists BEFORE the receipt.
+    provider.trace.lock().unwrap().clear();
+    let receipt = catalog.fence_retirement(T, &p).await.unwrap();
+    assert_eq!(receipt.manifest_sha256, crate::part_ingest::iceberg_export::lifecycle::degraded_receipt_sha256(T, &p));
+    assert_eq!(provider.trace.lock().unwrap().first().map(String::as_str), Some("closed"));
+    assert!(backend.state().pending.is_some(), "a fresh epoch replaces every forgotten one");
     provider.trace.lock().unwrap().clear();
     // The lake kept ingesting: Q is live (a wiped writer also lost its probe
     // hour, so it needs a sealed live part to publish).
@@ -427,9 +447,10 @@ async fn wiped_writer_retires_epochs_it_forgot_before_any_gc_receipt() {
     provider.fail_retire.store(true, Ordering::SeqCst);
     let error = catalog.sync_parts(T, vec![q.clone()], 49 * 3600000 + 1, &MergePolicy::default()).await.unwrap_err();
     assert!(format!("{error:#}").contains("provider delete unavailable"), "{error:#}");
-    assert!(catalog.fence_retirement(T, &p).await.is_err());
-    assert!(catalog.require_removed(T, &p).is_err());
+    // E1 still names P, but the lane stays closed: nothing reopens it.
     assert!(provider.build(&e1).unwrap().expire_and_inspect().await.unwrap().contains(&p));
+    let trace = provider.trace.lock().unwrap().clone();
+    assert!(!trace.iter().any(|s| s == "open"), "{trace:?}");
     provider.fail_retire.store(false, Ordering::SeqCst);
     catalog.sync_parts(T, vec![q], 49 * 3600000 + 2, &MergePolicy::default()).await.unwrap();
     let live = epoch(&provider.registry.lock().unwrap().clone().unwrap());
@@ -470,8 +491,12 @@ async fn wiped_writer_rebuilds_the_export_chain_and_the_next_delta_commits() {
     std::fs::remove_dir_all(dir.path().join("custody")).unwrap();
     let backend = Arc::new(FreshServingBackend::new(provider.clone(), dir.path().join("serving")).unwrap());
     let catalog = TenantCatalog::new(T, dir.path().join("custody"), backend.clone()).unwrap();
-    // GC cannot act on the wiped volume before the rebuild.
-    assert!(catalog.fence_retirement(T, part().part_id.as_str()).await.is_err());
+    // GC acts on the wiped volume before the rebuild: a part the writer no
+    // longer holds is receipted with the lane degraded (closed) instead.
+    let gone = "0000000000009-aaaaaaaaaaaaaaaa";
+    let receipt = catalog.fence_retirement(T, gone).await.unwrap();
+    assert_eq!(receipt.manifest_sha256, crate::part_ingest::iceberg_export::lifecycle::degraded_receipt_sha256(T, gone));
+    assert!(provider.trace.lock().unwrap().iter().any(|s| s == "closed"));
     // Same live set: the rebuilt state needs no new plan; a fresh epoch is
     // published at the master checkpoint and the forgotten one retired.
     catalog.sync_parts(T, vec![part()], 49 * 3600000, &MergePolicy::default()).await.unwrap();
@@ -784,4 +809,262 @@ async fn a_replayed_removal_plan_behind_a_newer_delta_still_converges() {
     catalog.require_removed(T, parts[0].part_id.as_str()).unwrap();
     assert!(!dir.path().join("custody/export/unsettled").read_dir().unwrap().any(|_| true));
     catalog.fence_retirement(T, parts[0].part_id.as_str()).await.unwrap();
+}
+
+/// FP-T101: master batches done, then the fresh epoch build is cut off after
+/// its first batch landed (the sync's hard bound). Returns the pending epoch.
+async fn cut_epoch_build(provider: &Arc<Provider>, catalog: &Arc<TenantCatalog>, parts: &[PartRef]) -> String {
+    let error = catalog.sync_parts(T, parts.to_vec(), LIVE_NOW, &MergePolicy::default()).await.unwrap_err();
+    assert!(error.downcast_ref::<super::super::super::lifecycle::CatalogSyncIncomplete>().is_some(), "{error:#}");
+    provider.stall_epoch_after.store(1, Ordering::SeqCst);
+    provider.stall_epoch.store(true, Ordering::SeqCst);
+    let cut = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        catalog.sync_parts(T, parts.to_vec(), LIVE_NOW + 1, &MergePolicy::default()),
+    )
+    .await;
+    assert!(cut.is_err(), "the epoch build was cut off");
+    assert!(provider.registry.lock().unwrap().is_none(), "a cut-off epoch is never published");
+    let pending = provider.list_epochs().await.unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    let pending = pending.into_iter().next().unwrap();
+    assert_eq!(table(provider, &pending).commits.load(Ordering::SeqCst), 1, "the epoch was built partly");
+    pending
+}
+fn retired(provider: &Provider) -> Vec<String> {
+    provider.trace.lock().unwrap().iter().filter(|s| s.starts_with("retire:")).cloned().collect()
+}
+fn ids(parts: &[PartRef]) -> BTreeSet<String> {
+    parts.iter().map(|p| p.part_id.to_string()).collect()
+}
+
+/// FP-T101 (epoch-build livelock): an epoch build cut off part way resumes after
+/// the master committed a newly sealed hour. The resumed build replays its
+/// recorded batches, plans the live-set delta from its own durable state and
+/// publishes the SAME epoch; it is never retired and rebuilt from zero.
+#[tokio::test]
+async fn a_resumed_epoch_build_plans_the_live_set_delta_instead_of_rebuilding() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Provider::default());
+    let catalog = fresh_install(dir.path(), &provider);
+    catalog.fence_installation().await.unwrap();
+    let parts = live_set(8); // 2 master batches, 2 epoch batches
+    let pending = cut_epoch_build(&provider, &catalog, &parts).await;
+    let calls = table(&provider, &pending).calls.load(Ordering::SeqCst);
+    // The master advances by one sealed hour before the epoch resumes.
+    let moved = live_set(9);
+    converge(&catalog, &moved, 8).await;
+    // Resumes at the first uncommitted batch: the committed batch 1 is not
+    // even re-sent (no catalog load); only batch 2 and the delta.
+    assert_eq!(table(&provider, &pending).calls.load(Ordering::SeqCst), calls + 2);
+    assert!(retired(&provider).is_empty(), "{:?}", provider.trace.lock().unwrap());
+    assert_eq!(provider.registry.lock().unwrap().clone().unwrap(), format!("agent.{pending}_v1"));
+    let (master, epoch) = (table(&provider, "events"), table(&provider, &pending));
+    assert_eq!(*provider.published.lock().unwrap(), vec![(format!("agent.{pending}_v1"), ids(&moved))]);
+    assert_registered_once(&epoch, &moved);
+    assert_eq!(epoch.commits.load(Ordering::SeqCst), 3, "2 recorded batches + 1 delta");
+    // The chain still ENDS at the master checkpoint: the next delta
+    // continues both tables.
+    assert_eq!(epoch.head.lock().unwrap().as_ref().unwrap().0, master.head.lock().unwrap().as_ref().unwrap().0);
+    let more = live_set(10);
+    catalog.sync_parts(T, more.clone(), LIVE_NOW + 3_600_000, &MergePolicy::default()).await.unwrap();
+    assert_registered_once(&master, &more);
+    assert_registered_once(&epoch, &more);
+}
+
+/// FP-T101: the delta may REMOVE a part (here hour 0's part is replaced; an
+/// erasure is the same shape). Invariant: a removal is committed into the
+/// unpublished epoch (no reader can name it), its expiry drops older
+/// snapshots, and only an epoch whose references equal the master's is
+/// published, so the published epoch never holds the removed part and its
+/// GC receipt follows once the converged sync settles it.
+#[tokio::test]
+async fn a_resumed_epoch_delta_commits_removals_before_publish_and_never_exposes_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Provider::default());
+    let catalog = fresh_install(dir.path(), &provider);
+    catalog.fence_installation().await.unwrap();
+    let parts = live_set(8);
+    let pending = cut_epoch_build(&provider, &catalog, &parts).await;
+    let removed = parts[0].part_id.to_string();
+    assert!(table(&provider, &pending).parts.lock().unwrap().contains(&removed), "the cut epoch held it");
+    let mut replaced = parts.clone();
+    replaced[0].part_id = PartId::parse("0000000000100-aaaaaaaaaaaaaaaa").unwrap();
+    converge(&catalog, &replaced, 8).await;
+    assert!(retired(&provider).is_empty(), "{:?}", provider.trace.lock().unwrap());
+    let published = provider.published.lock().unwrap().clone();
+    assert_eq!(published, vec![(format!("agent.{pending}_v1"), ids(&replaced))]);
+    assert!(!published[0].1.contains(&removed), "the removed part is never published");
+    assert_eq!(*table(&provider, "events").parts.lock().unwrap(), ids(&replaced));
+    catalog.require_removed(T, &removed).unwrap();
+    catalog.fence_retirement(T, &removed).await.unwrap();
+}
+
+/// FP-T101: the fallback stays. An epoch that still differs from the master
+/// after the delta (here the master holds a part the live set cannot
+/// reproduce) is retired unexposed and a fresh epoch is built.
+#[tokio::test]
+async fn an_epoch_that_cannot_reach_the_master_is_still_retired_unpublished() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Provider::default());
+    let catalog = fresh_install(dir.path(), &provider);
+    catalog.fence_installation().await.unwrap();
+    let parts = live_set(8);
+    let pending = cut_epoch_build(&provider, &catalog, &parts).await;
+    let stray = "0000000000777-aaaaaaaaaaaaaaaa".to_string();
+    table(&provider, "events").parts.lock().unwrap().insert(stray.clone());
+    let error = catalog.sync_parts(T, parts.clone(), LIVE_NOW + 2, &MergePolicy::default()).await.unwrap_err();
+    assert!(format!("{error:#}").contains("serving epoch live set changed; replay required"), "{error:#}");
+    assert_eq!(retired(&provider), vec![format!("retire:{pending}")]);
+    assert!(provider.registry.lock().unwrap().is_none(), "never exposed");
+    assert!(!provider.list_epochs().await.unwrap().contains(&pending));
+    table(&provider, "events").parts.lock().unwrap().remove(&stray);
+    converge(&catalog, &parts, 8).await;
+    let name = provider.registry.lock().unwrap().clone().unwrap();
+    assert_ne!(name, format!("agent.{pending}_v1"), "a fresh epoch was built");
+    assert_eq!(provider.published.lock().unwrap().len(), 1);
+    assert_registered_once(&table(&provider, &epoch(&name)), &parts);
+}
+
+/// FP-T101: an epoch that keeps failing must not grow its recorded batches
+/// until `epoch_plans` refuses every pass. Past the resume limit it takes the
+/// retire-and-rebuild fallback, and the fresh epoch publishes.
+#[tokio::test]
+async fn an_epoch_past_the_resume_limit_is_retired_not_grown() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Provider::default());
+    let backend = Arc::new(
+        FreshServingBackend::new(provider.clone(), dir.path().join("serving"))
+            .unwrap()
+            .with_batch(BATCH)
+            .with_resume_limit(2),
+    );
+    let catalog = Arc::new(
+        TenantCatalog::new(T, dir.path().join("custody"), backend)
+            .unwrap()
+            .with_limits(ONE_BATCH_PER_SYNC),
+    );
+    catalog.fence_installation().await.unwrap();
+    let pending = cut_epoch_build(&provider, &catalog, &live_set(8)).await;
+    let moved = live_set(9);
+    // The master's own budget-cut batches first; then the resume refuses to
+    // grow the epoch past its limit and retires it unexposed.
+    let error = loop {
+        let error = catalog.sync_parts(T, moved.clone(), LIVE_NOW + 2, &MergePolicy::default()).await.unwrap_err();
+        if error.downcast_ref::<super::super::super::lifecycle::CatalogSyncIncomplete>().is_none() {
+            break error;
+        }
+    };
+    assert!(format!("{error:#}").contains("serving epoch live set changed; replay required"), "{error:#}");
+    assert_eq!(retired(&provider), vec![format!("retire:{pending}")]);
+    assert!(provider.registry.lock().unwrap().is_none(), "never exposed");
+    converge(&catalog, &moved, 8).await;
+    let name = provider.registry.lock().unwrap().clone().unwrap();
+    assert_ne!(name, format!("agent.{pending}_v1"), "a fresh epoch was built");
+    assert_registered_once(&table(&provider, &epoch(&name)), &moved);
+}
+
+fn degraded(part: &str) -> String {
+    super::super::super::lifecycle::degraded_receipt_sha256(T, part)
+}
+fn trace(provider: &Provider) -> Vec<String> {
+    provider.trace.lock().unwrap().clone()
+}
+
+/// Decision 10-26: part GC is NEVER gated on agent catalog custody.
+/// A cell roll lands mid epoch build (custody unconverged, no planned
+/// index) and the part log erases a part that the master's unacknowledged
+/// backlog batch AND the pending epoch's uncommitted batch both add. GC
+/// receipts it at once (agent lane degraded, reads closed); the next syncs
+/// tolerate the vanished part: the backlog is set aside and rebuilt from
+/// the catalog, the epoch naming it is retired unexposed, and the lane
+/// reopens only on a fresh epoch that does not hold it.
+#[tokio::test]
+async fn gc_proceeds_with_custody_unconverged_and_the_next_sync_tolerates_the_vanished_part() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Provider::default());
+    let catalog = fresh_install(dir.path(), &provider);
+    catalog.fence_installation().await.unwrap();
+    let parts = live_set(8); // master batches 0-3, 4-7; epoch the same
+    let pending = cut_epoch_build(&provider, &catalog, &parts).await;
+    assert!(!dir.path().join("custody/planned-index-ready").exists(), "custody never converged");
+    drop(catalog);
+    // The roll: a new writer process (no live set in memory).
+    let catalog = fresh_install(dir.path(), &provider);
+    let erased = parts[5].part_id.to_string();
+    provider.trace.lock().unwrap().clear();
+    let receipt = catalog.fence_retirement(T, &erased).await.unwrap();
+    assert_eq!(receipt.manifest_sha256, degraded(&erased), "never held on the catalog");
+    assert!(trace(&provider).contains(&"closed".to_string()), "reads closed before the receipt");
+    assert!(dir.path().join("custody/gc-degraded").exists());
+    // The writer's next syncs, with the part gone from the live set.
+    let live = parts.iter().filter(|p| p.part_id.to_string() != erased).cloned().collect::<Vec<_>>();
+    let mut converged = false;
+    for pass in 0..8 {
+        match catalog.sync_parts(T, live.clone(), LIVE_NOW + 10 + pass, &MergePolicy::default()).await {
+            Ok(()) => {
+                converged = true;
+                break;
+            }
+            Err(error) => {
+                let text = format!("{error:#}");
+                assert!(
+                    error.downcast_ref::<super::super::super::lifecycle::CatalogSyncIncomplete>().is_some()
+                        || text.contains("names a part removed by part GC"),
+                    "the vanished part never wedges the sync: {text}"
+                );
+            }
+        }
+    }
+    assert!(converged, "{:?}", trace(&provider));
+    let master = table(&provider, "events");
+    assert_eq!(*master.parts.lock().unwrap(), ids(&live));
+    assert!(retired(&provider).contains(&format!("retire:{pending}")), "the epoch naming it was retired");
+    let published = provider.published.lock().unwrap().clone();
+    assert_eq!(published.len(), 1, "{published:?}");
+    assert_ne!(published[0].0, format!("agent.{pending}_v1"));
+    assert_eq!(published[0].1, ids(&live), "the published epoch never holds the vanished part");
+    let trace = trace(&provider);
+    let publish = trace.iter().position(|s| s.starts_with("publish:")).unwrap();
+    let open = trace.iter().position(|s| s == "open").unwrap();
+    assert!(publish < open, "reads reopen only on the fresh epoch: {trace:?}");
+    assert!(!dir.path().join("custody/gc-degraded").exists());
+    catalog.require_removed(T, &erased).unwrap();
+}
+
+/// Decoupled GC, erasure safety: the ACTIVE (exposed) epoch references a
+/// part the writer no longer holds and the catalog cannot clear it. GC is
+/// not held; the gateway is closed before the receipt, nothing reopens it
+/// while that epoch is current, and reads come back only on a fresh epoch
+/// name without the part (the old one retired after the publish names it).
+#[tokio::test]
+async fn an_exposed_epoch_referencing_a_gc_deleted_part_is_never_served() {
+    let (dir, provider, catalog) = setup().await;
+    let e1 = epoch(&provider.registry.lock().unwrap().clone().unwrap());
+    let p = part().part_id.to_string();
+    assert!(table(&provider, &e1).parts.lock().unwrap().contains(&p));
+    drop(catalog);
+    let backend = Arc::new(FreshServingBackend::new(provider.clone(), dir.path().join("serving")).unwrap());
+    let catalog = TenantCatalog::new(T, dir.path().join("custody"), backend).unwrap();
+    provider.trace.lock().unwrap().clear();
+    let receipt = catalog.fence_retirement(T, &p).await.unwrap();
+    assert_eq!(receipt.manifest_sha256, degraded(&p));
+    let closed = trace(&provider);
+    assert_eq!(closed.first().map(String::as_str), Some("closed"), "{closed:?}");
+    assert!(!closed.iter().any(|s| s == "open" || s.starts_with("publish:")), "{closed:?}");
+    // Another GC part in the same state never reopens the degraded lane.
+    let other = "0000000000005-aaaaaaaaaaaaaaaa";
+    catalog.fence_retirement(T, other).await.unwrap();
+    assert!(!trace(&provider).iter().any(|s| s == "open"));
+    // The writer's next sync (P is gone from the part log).
+    catalog.sync_parts(T, vec![], 49 * 3600000, &MergePolicy::default()).await.unwrap();
+    let trace = trace(&provider);
+    let e2 = epoch(&provider.registry.lock().unwrap().clone().unwrap());
+    assert_ne!(e2, e1);
+    assert!(!table(&provider, &e2).parts.lock().unwrap().contains(&p));
+    let publish = trace.iter().position(|s| s == &format!("publish:agent.{e2}_v1")).unwrap();
+    let retire = trace.iter().position(|s| s == &format!("retire:{e1}")).unwrap();
+    let open = trace.iter().position(|s| s == "open").unwrap();
+    assert!(publish < retire && publish < open, "{trace:?}");
+    assert!(!table(&provider, "events").parts.lock().unwrap().contains(&p));
 }

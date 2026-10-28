@@ -252,13 +252,15 @@ const FAMILY_CANDIDATES: usize = 16;
 /// [`MAX_DEDICATED_FAMILIES`].
 const MAX_DEDICATED_CLASS_FAMILIES: usize = 15;
 
-/// NAN-3437 cell switch: hour merges write dedicated `(source, class_uid)`
-/// family files in the DEFAULT layout (row groups, file roll, one merge
-/// pass), independent of the experimental `NANO_LAKE_COMPACTION_LAYOUT` and
-/// its second pass / storage gate. Unset, `0`, or anything unrecognized:
-/// off (the source-family hour layout, byte-identical). `1`/`true`: on.
-pub const CLASS_FAMILIES_ENV: &str = "NANO_LAKE_CLASS_FAMILIES";
-/// Under [`CLASS_FAMILIES_ENV`], a `(source, class)` needs at least this many
+/// NAN-3437: hour merges write dedicated `(source, class_uid)` family files
+/// in the DEFAULT layout (row groups, file roll, one merge pass),
+/// independent of the experimental `NANO_LAKE_COMPACTION_LAYOUT` and its
+/// second pass / storage gate. NAN-4688: always on (it was the
+/// `NANO_LAKE_CLASS_FAMILIES=1` opt-in, already set on every live
+/// deployment); the planner prunes other-class files by their signed
+/// `class_id` (`prune::file_family_may_match`).
+///
+/// A `(source, class)` needs at least this many
 /// rows in the merge to get its own file; smaller classes stay in their
 /// source's rest file. With [`MAX_DEDICATED_CLASS_FAMILIES`] dedicated
 /// files, at most [`MAX_DEDICATED_FAMILIES`] source rest files and one
@@ -266,14 +268,10 @@ pub const CLASS_FAMILIES_ENV: &str = "NANO_LAKE_CLASS_FAMILIES";
 /// file size) however many classes it holds.
 const CLASS_FAMILY_MIN_ROWS: u64 = 8_192;
 
-pub fn class_families_from(value: Option<&str>) -> bool {
-    value.map(str::trim).is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-}
-
 #[cfg(test)]
 thread_local! {
-    /// Tests flip the switch per thread: the process env is shared by the
-    /// parallel test threads.
+    /// Tests may turn the class split off per thread, to compare against
+    /// (and re-merge) the source-family layout that older hours still have.
     static CLASS_FAMILIES_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
@@ -282,7 +280,7 @@ fn class_families_enabled() -> bool {
     if let Some(enabled) = CLASS_FAMILIES_OVERRIDE.with(std::cell::Cell::get) {
         return enabled;
     }
-    class_families_from(std::env::var(CLASS_FAMILIES_ENV).ok().as_deref())
+    true
 }
 
 /// `class_uid` of `row` as i64 (`None` when null or of an unexpected type).
@@ -715,18 +713,38 @@ fn merge_parts_with(
                     .map(|file| super::host_sort::is_host_sorted(&input.dir.join(&file.name)))
                     .collect::<Result<Vec<_>>>()?.contains(&true);
                 if tagged || signed.record.files.data.iter().any(|file| file.log_sources.is_some()) {
-                    force_row_partials = true;
+                    // NAN-4688: a class-sorted minute part is one data file,
+                    // so its virtual input holds exactly the part's rows and
+                    // its partials still merge as they are (no row rebuild).
+                    let whole_minute = input.part.level == Level::Minute && signed.record.files.data.len() == 1
+                        && input.dir.join(crate::parts::format::PARTIAL_ROLLUP_FILE).is_file();
+                    force_row_partials |= !whole_minute;
                     for file in &signed.record.files.data {
                         let dir = scratch.join(format!("virtual-{}", expanded.len()));
                         std::fs::create_dir_all(&dir)?;
                         let source = std::fs::canonicalize(input.dir.join(&file.name))?;
                         let target = dir.join(crate::parts::format::data_file_name(0));
-                        if super::host_sort::is_host_sorted(&source)? {
+                        if let Some(order) = super::host_sort::file_row_order(&source)? {
                             // NAN-3412: the k-way merge reads inputs in
                             // `(time, uid)` order; restore it locally first.
-                            super::host_sort::restore_time_order(&scratch, &source, &target, host_sort_bucket_rows())?;
+                            // NAN-4688: a class-sorted file merges its class
+                            // runs (no spill, no sort); anything else, or a
+                            // file that is not clean class runs, bucket-sorts.
+                            let runs = if order == super::class_sort::CLASS_ROW_ORDER {
+                                super::class_sort::restore_class_runs(&source, &target, host_sort_bucket_rows())?
+                            } else {
+                                None
+                            };
+                            if runs.is_none() {
+                                super::host_sort::restore_time_order(&scratch, &source, &target, host_sort_bucket_rows())?;
+                            }
                         } else {
                             std::os::unix::fs::symlink(source, target)?;
+                        }
+                        if whole_minute {
+                            let partials = std::fs::canonicalize(input.dir.join(crate::parts::format::PARTIAL_ROLLUP_FILE))?;
+                            std::os::unix::fs::symlink(partials.parent().context("partials directory")?, dir.join(
+                                Path::new(crate::parts::format::PARTIAL_ROLLUP_FILE).parent().context("partials directory")?))?;
                         }
                         let mut part = input.part.clone();
                         part.part_id = crate::parts::format::PartId::new(now_ms)?;
@@ -782,10 +800,15 @@ fn merge_parts_with(
         // NAN-4664: every sealed hour writes its multi-class families
         // class-sorted, so `class_uid` row-group statistics prune; endpoint
         // families are host-sorted instead when NAN-3412 is on.
+        // NAN-4688: a minute part (the open hour, which agents hunt most) is
+        // class-sorted too, in its one data file: no extra objects.
         let order = HourOrder {
             host_sort: (level == Level::Hour).then(super::host_sort::group_rows).flatten(),
-            class_sort: level == Level::Hour,
+            class_sort: matches!(level, Level::Hour | Level::Minute),
         };
+        // The minute class sort runs through the family spool as a single
+        // (overflow) family; its time-sorted fallback keeps today's layout.
+        let sorted_cluster_output = cluster_output || level == Level::Minute;
         // NAN-3412: the host/class-sorted layout is an optimization. It is
         // written under the scratch directory (removed below, so a failed
         // attempt leaves nothing) and moved into `work_dir` once finished;
@@ -797,7 +820,7 @@ fn merge_parts_with(
                 std::fs::create_dir_all(&dir)?;
                 match merge_streaming(
                     &dir, tenant_id, level, event_hour, &current, inputs, schema.clone(), schema_fingerprint, signer_key_id,
-                    build, now_ms, cluster_output, force_row_partials, false, order, filter.clone(),
+                    build, now_ms, sorted_cluster_output, force_row_partials, false, order, filter.clone(),
                 ).and_then(|merged| merged.context("hour-sorted filtered merge is empty")).and_then(|mut merged| {
                     let target = work_dir.join(merged.finished.dir.file_name().context("merge output has no directory name")?);
                     std::fs::rename(&merged.finished.dir, &target)?;
@@ -1013,7 +1036,9 @@ fn merge_pass(
     )?.for_compaction_rows(level, rows_in) };
     let class_clustering = !legacy_layout && std::env::var("NANO_LAKE_COMPACTION_LAYOUT").is_ok()
         && crate::parts::format::ParquetSettings::cluster_worthwhile(rows_in, settings.row_group_rows);
-    let cluster_output = cluster_output && (level == Level::Hour || class_clustering);
+    // NAN-4688: a final minute part may be class-sorted as one family.
+    let minute_class_sort = level == Level::Minute && order.class_sort && !intermediate && !legacy_layout;
+    let cluster_output = cluster_output && (level == Level::Hour || class_clustering || minute_class_sort);
     // NAN-3437: class families of a final hour output in the layout above
     // (the default one unless the experiment is set), in this one pass.
     let class_families = !class_clustering && cluster_output && level == Level::Hour && !intermediate
@@ -1022,7 +1047,9 @@ fn merge_pass(
     if intermediate {
         writer.without_row_digests();
     }
-    let mut spool = cluster_output.then(|| choose_families(recorded_inputs)
+    // A class-sorted minute part keeps its one data file: no source
+    // families, every row in the one overflow family.
+    let mut spool = cluster_output.then(|| if level == Level::Minute && !class_clustering { Ok(BTreeSet::new()) } else { choose_families(recorded_inputs) }
         .and_then(|chosen| FamilySpool::new(work_dir, schema.clone(), chosen))).transpose()?;
     if let Some(spool) = &mut spool {
         if class_clustering {
@@ -1049,7 +1076,7 @@ fn merge_pass(
         if let Some(group_rows) = order.host_sort.filter(|_| final_hour) {
             spool.set_host_sort(group_rows, host_sort_bucket_rows());
         }
-        if order.class_sort && final_hour {
+        if order.class_sort && (final_hour || minute_class_sort) {
             spool.set_class_sort(class_sort_max_rows(inputs));
         }
     }
@@ -1703,11 +1730,16 @@ mod tests {
     /// row-group statistics: a group survives unless every class lies
     /// outside its `[min, max]`.
     fn class_pruning(dir: &Path, classes: &[i64]) -> (usize, usize, u64, u64) {
+        class_pruning_files(&local_data_files(dir).unwrap(), classes)
+    }
+
+    /// [`class_pruning`] over the given data files.
+    fn class_pruning_files(paths: &[PathBuf], classes: &[i64]) -> (usize, usize, u64, u64) {
         use parquet::file::reader::{FileReader, SerializedFileReader};
         use parquet::file::statistics::Statistics;
         let (mut groups, mut kept, mut kept_rows, mut matching) = (0, 0, 0, 0);
-        for path in local_data_files(dir).unwrap() {
-            let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+        for path in paths {
+            let reader = SerializedFileReader::new(File::open(path).unwrap()).unwrap();
             let column = reader.metadata().file_metadata().schema_descr().columns().iter()
                 .position(|column| column.path().string() == "class_uid").unwrap();
             for metadata in reader.metadata().row_groups() {
@@ -1723,7 +1755,7 @@ mod tests {
                     kept_rows += metadata.num_rows() as u64;
                 }
             }
-            matching += class_file_rows(&path).iter().filter(|row| row.0.is_some_and(|class| classes.contains(&class))).count() as u64;
+            matching += class_file_rows(path).iter().filter(|row| row.0.is_some_and(|class| classes.contains(&class))).count() as u64;
         }
         (groups, kept, kept_rows, matching)
     }
@@ -1756,8 +1788,15 @@ mod tests {
         for file in &on.record.files.data {
             let path = on.dir.join(&file.name);
             let rows = class_file_rows(&path);
-            assert_eq!(file_row_order(&path).unwrap().as_deref(), Some(CLASS_ROW_ORDER), "{}: every family here is multi-class", file.name);
-            assert!(rows.windows(2).all(|w| w[0] < w[1]), "strict (class, time, uid) order in {}", file.name);
+            // NAN-4688: class families are on by default; a dedicated
+            // `(source, class)` file holds one class and stays time-sorted.
+            if rows.iter().map(|row| row.0).collect::<BTreeSet<_>>().len() == 1 {
+                assert_eq!(file_row_order(&path).unwrap(), None, "{}", file.name);
+                assert!(rows.windows(2).all(|w| (w[0].1, &w[0].2) < (w[1].1, &w[1].2)), "strict (time, uid) order in {}", file.name);
+            } else {
+                assert_eq!(file_row_order(&path).unwrap().as_deref(), Some(CLASS_ROW_ORDER), "{}: a multi-class family", file.name);
+                assert!(rows.windows(2).all(|w| w[0] < w[1]), "strict (class, time, uid) order in {}", file.name);
+            }
             assert_eq!(file.rows as usize, rows.len());
             assert_eq!(file.min_time_us, rows.iter().map(|r| r.1).min().unwrap());
             assert_eq!(file.max_time_us, rows.iter().map(|r| r.1).max().unwrap());
@@ -1797,7 +1836,12 @@ mod tests {
         // at most the groups its run touches in each family file.
         let (_, kept, kept_rows, matching) = class_pruning(&on.dir, &[1007]);
         assert!(kept_rows < matching * 2, "1007 reads {kept_rows} rows for {matching}");
-        assert!(kept < class_pruning(&off.dir, &[1007]).1, "1007 prunes groups");
+        // NAN-4688: with class families on by default the time-sorted hour
+        // already has the class's own file, so the strict comparison is
+        // against the pre-class-family layout (hours written before it).
+        let legacy = with_class_families(Some(false), || merge_streaming(dir.path(), TENANT, Level::Hour, 0, &inputs, &inputs,
+            schema.clone(), &fingerprint, SIGNER, "test", 6, true, false, false, HourOrder::TIME, None)).unwrap().unwrap().finished;
+        assert!(kept < class_pruning(&legacy.dir, &[1007]).1, "1007 prunes groups");
         let (_, _, kept_rows, matching) = class_pruning(&on.dir, &[6003]);
         assert!(kept_rows <= matching + 2 * 65_536, "6003 reads {kept_rows} rows for {matching}");
 
@@ -1896,9 +1940,231 @@ mod tests {
         let max = class_sort_max_rows(&inputs);
         let per_row = inputs[0].part.data_bytes as f64 / inputs[0].part.rows as f64;
         assert!(((max as f64 * per_row) - CLASS_SORT_MAX_FAMILY_BYTES as f64).abs() / (CLASS_SORT_MAX_FAMILY_BYTES as f64) < 0.01);
+        // NAN-4688: a multi-class minute part is one class-sorted file.
         let merged = merge_parts(dir.path(), TENANT, Level::Minute, 0, &inputs, schema, &fingerprint, SIGNER, "test", 9).unwrap();
+        assert_eq!(merged.finished.record.files.data.len(), 1);
         for file in &merged.finished.record.files.data {
-            assert_eq!(file_row_order(&merged.finished.dir.join(&file.name)).unwrap(), None, "minute parts stay time-sorted");
+            assert_eq!(file_row_order(&merged.finished.dir.join(&file.name)).unwrap().as_deref(),
+                Some(super::super::class_sort::CLASS_ROW_ORDER), "minute parts are class-sorted");
+        }
+    }
+
+    /// NAN-4688 acceptance on the production merge path (`merge_parts`, real
+    /// publish, real planner file stage): a `class_uid` hunt skips other-class
+    /// data in BOTH the open hour (its minute parts: class-sorted single
+    /// files, so other classes' row groups fall to chDB's min/max push-down)
+    /// and the sealed hour (class-family files the planner drops by their
+    /// signed `class_id`). Same rows, uids, logical Merkle roots and dedupe
+    /// as the time-sorted layout at every step, and the sealed hour merges
+    /// cleanly from class-sorted minute inputs.
+    #[tokio::test]
+    async fn class_uid_hunt_skips_other_classes_in_open_and_sealed_hours() {
+        use crate::part_query::prune::file_family_may_match;
+        use crate::parts::provenance::tests::{signer, TENANT, SIGNER};
+        use crate::planner::CandidateHint;
+        use super::super::class_sort::CLASS_ROW_ORDER;
+        use super::super::host_sort::file_row_order;
+        use super::super::writer::publish_parts;
+        const ROWS: usize = 120_000;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::parts::part_log::LocalObjectStore::new(dir.path().join("store")).unwrap();
+        let owner = signer(1);
+        let (schema, fingerprint, input) = class_sort_fixture(dir.path(), ROWS);
+        let all_input = class_file_rows(&local_data_files(&input.dir).unwrap()[0]);
+        let mut expected = all_input.clone();
+        expected.sort();
+        // The input again under other part ids: two copies of every row, so
+        // the merge must drop exactly ROWS duplicates (the same dedupe as the
+        // time-sorted layout).
+        let copy = |id: i64| {
+            let mut again = input.clone();
+            again.part.part_id = crate::parts::format::PartId::new(id).unwrap();
+            again
+        };
+        let inputs = [input.clone(), copy(77)];
+
+        // Open hour: the minute merge.
+        let minute_time = merge_streaming(dir.path(), TENANT, Level::Minute, 0, &inputs, &inputs, schema.clone(), &fingerprint,
+            SIGNER, "test", 3, false, false, false, HourOrder::TIME, None).unwrap().unwrap();
+        let minute = merge_parts(dir.path(), TENANT, Level::Minute, 0, &inputs, schema.clone(), &fingerprint, SIGNER, "test", 4).unwrap();
+        assert_eq!(minute.duplicates_dropped, minute_time.duplicates_dropped);
+        assert_eq!(minute.duplicates_dropped, ROWS as u64, "same dedupe");
+        let (minute, minute_time) = (minute.finished, minute_time.finished);
+        assert_eq!(minute.record.rows, ROWS as u64);
+        assert_eq!(minute.record.merkle_root, minute_time.record.merkle_root, "same logical rows");
+        assert_eq!(minute.record.hours[0].merkle_root, minute_time.record.hours[0].merkle_root);
+        assert_eq!(minute.record.files.data.len(), 1, "no extra objects: one data file");
+        assert_eq!(minute.record.files.all().len(), minute_time.record.files.all().len(), "no extra objects: same file set");
+        // The partials (rollup, prevalence, entity ranges, …) do not depend
+        // on the row order: byte-identical to the time-sorted minute's.
+        let partials = |record: &crate::parts::provenance::ProvenanceRecord| record.files.partials.iter()
+            .map(|p| (p.name.clone(), p.rows, p.sha256.clone())).collect::<Vec<_>>();
+        assert_eq!(partials(&minute.record), partials(&minute_time.record), "same minute partials");
+        let file = &minute.record.files.data[0];
+        let path = minute.dir.join(&file.name);
+        assert_eq!(file_row_order(&path).unwrap().as_deref(), Some(CLASS_ROW_ORDER));
+        let rows = class_file_rows(&path);
+        assert!(rows.windows(2).all(|w| w[0] < w[1]), "strict (class, time, uid) order");
+        assert_eq!((file.min_time_us, file.max_time_us), (minute_time.record.files.data[0].min_time_us, minute_time.record.files.data[0].max_time_us));
+        assert_eq!((minute.record.min_time_us, minute.record.max_time_us), (minute_time.record.min_time_us, minute_time.record.max_time_us));
+        let mut sorted = rows.clone();
+        sorted.sort();
+        assert_eq!(sorted, expected, "the same rows and uids, none lost or duplicated");
+        for classes in [&[1007][..], &[4001], &[3002], &[6003]] {
+            let (groups_time, kept_time, rows_time, matching) = class_pruning(&minute_time.dir, classes);
+            let (groups, kept, kept_rows, matching_sorted) = class_pruning(&minute.dir, classes);
+            assert_eq!(matching_sorted, matching);
+            eprintln!("NAN-4688 minute class_uid IN {classes:?}: time-sorted keeps {kept_time}/{groups_time} groups ({rows_time} rows), \
+                class-sorted keeps {kept}/{groups} ({kept_rows} rows); {matching} rows match");
+            assert_eq!(kept_time, groups_time, "{classes:?}: time order prunes nothing");
+            assert!(kept < groups, "{classes:?}: the class sort skips other classes' row groups");
+            assert!(kept_rows < matching + 2 * crate::parts::format::ROW_GROUP_ROWS as u64, "{classes:?}: {kept_rows} rows read for {matching}");
+        }
+
+        // Sealed hour: the hour merge of the published (class-sorted) minute
+        // part, against the hour merged from the time-sorted minute part.
+        let published = publish_parts(&store, &owner, &owner.trusted(), &[minute]).await.unwrap().remove(0);
+        let hour = merge_parts(dir.path(), TENANT, Level::Hour, 0,
+            &[MergeInput { dir: dir.path().join(published.part_id.as_str()), part: published }], schema.clone(), &fingerprint, SIGNER, "test", 5)
+            .unwrap();
+        let published_time = publish_parts(&store, &owner, &owner.trusted(), &[minute_time]).await.unwrap().remove(0);
+        let hour_time = merge_parts(dir.path(), TENANT, Level::Hour, 0,
+            &[MergeInput { dir: dir.path().join(published_time.part_id.as_str()), part: published_time }], schema, &fingerprint, SIGNER, "test", 6)
+            .unwrap();
+        assert_eq!(hour.duplicates_dropped, 0);
+        let (hour, hour_time) = (hour.finished, hour_time.finished);
+        assert_eq!(hour.record.rows, ROWS as u64);
+        assert_eq!(hour.record.merkle_root, hour_time.record.merkle_root);
+        // The class-sorted minute input merged its own partials forward (one
+        // data file = the whole part); the result equals the time-sorted
+        // minute input's hour partials exactly.
+        assert_eq!(partials(&hour.record), partials(&hour_time.record), "same hour partials");
+        let shape = |record: &crate::parts::provenance::ProvenanceRecord| record.files.data.iter()
+            .map(|file| (file.log_sources.clone(), file.class_id, file.rows, file.min_time_us, file.max_time_us)).collect::<Vec<_>>();
+        assert_eq!(shape(&hour.record), shape(&hour_time.record), "same families and time bounds from either minute layout");
+        let mut hour_rows = hour.record.files.data.iter().flat_map(|file| class_file_rows(&hour.dir.join(&file.name))).collect::<Vec<_>>();
+        hour_rows.sort();
+        assert_eq!(hour_rows, expected);
+        // The planner's signed file stage drops other-class files; it never
+        // drops a file that holds a row of the hunted class. In the files it
+        // keeps (the class's own file, and the class-sorted rest files of
+        // the other sources), row-group statistics skip the other classes.
+        for class in [1007_i64, 4001, 3002] {
+            let hints = [CandidateHint::Class { value: class }];
+            let (mut pruned, mut kept_rows, mut kept_files) = (0, 0_u64, Vec::new());
+            for file in &hour.record.files.data {
+                let holds = class_file_rows(&hour.dir.join(&file.name)).iter().any(|row| row.0 == Some(class));
+                if file_family_may_match(file.log_sources.as_deref(), file.class_id, &hints) {
+                    kept_rows += file.rows;
+                    kept_files.push(hour.dir.join(&file.name));
+                } else {
+                    assert!(!holds, "{class}: pruned {} holds its rows", file.name);
+                    pruned += 1;
+                }
+            }
+            let (groups, kept_groups, read_rows, matching) = class_pruning_files(&kept_files, &[class]);
+            let (all_groups, _, _, all_matching) = class_pruning(&hour.dir, &[class]);
+            assert_eq!(matching, all_matching, "{class}: every matching row is in a kept file");
+            eprintln!("NAN-4688 hour class_uid={class}: {pruned}/{} files pruned ({kept_rows}/{ROWS} rows kept); \
+                row groups read {kept_groups}/{groups} of the kept files ({all_groups} in the hour), {read_rows} rows read for {matching}",
+                hour.record.files.data.len());
+            assert!(pruned > 0, "{class}: the sealed hour prunes other-class files");
+            assert!(read_rows < matching + kept_files.len() as u64 * crate::parts::format::ROW_GROUP_ROWS as u64,
+                "{class}: {read_rows} rows read for {matching}");
+            assert!(read_rows < ROWS as u64 / 2, "{class}: {read_rows} rows read");
+        }
+    }
+
+    /// NAN-4688: the class-run restore of a class-sorted file gives exactly
+    /// the bucket-sort restore's rows in the same order (every column, as
+    /// JSON), with a tiny per-run batch so runs refill mid-merge; it declines
+    /// (writes nothing) for a file that is not clean class runs.
+    #[test]
+    fn class_run_restore_matches_the_bucket_sort_restore() {
+        use crate::parts::provenance::tests::{TENANT, SIGNER};
+        use super::super::class_sort::restore_class_runs;
+        use super::super::host_sort::restore_time_order;
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, fingerprint, input) = class_sort_fixture(dir.path(), 30_000);
+        let minute = merge_parts(dir.path(), TENANT, Level::Minute, 0, &[input.clone()], schema, &fingerprint, SIGNER, "test", 4)
+            .unwrap().finished;
+        let source = minute.dir.join(&minute.record.files.data[0].name);
+        let json_rows = |path: &Path| {
+            let mut out = Vec::new();
+            for batch in ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap()).unwrap().build().unwrap() {
+                let batch = batch.unwrap();
+                let mut writer = arrow_json::ArrayWriter::new(Vec::new());
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+                out.extend(serde_json::from_slice::<Vec<serde_json::Value>>(&writer.into_inner()).unwrap());
+            }
+            out
+        };
+        let (runs, buckets) = (dir.path().join("runs.parquet"), dir.path().join("buckets.parquet"));
+        assert_eq!(restore_class_runs(&source, &runs, 300).unwrap(), Some(30_000));
+        assert_eq!(restore_time_order(dir.path(), &source, &buckets, 1_000).unwrap(), 30_000);
+        let restored = json_rows(&runs);
+        assert_eq!(restored, json_rows(&buckets), "same rows in the same order");
+        // Both copies keep the source footer (the NAN-4664 indicator marker
+        // makes the merge strip `nano_ioc_*`; without it every batch takes
+        // `align`'s JSON round trip) and drop the row-order tag.
+        let footer = |path: &Path| ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap()).unwrap()
+            .metadata().file_metadata().clone();
+        assert!(crate::parts::indicators::has_any_marker(&footer(&source)), "fixture writes indicator columns");
+        for copy in [&runs, &buckets] {
+            assert!(crate::parts::indicators::has_any_marker(&footer(copy)), "restore keeps the indicator marker");
+            assert_eq!(super::super::host_sort::file_row_order(copy).unwrap(), None, "restore drops the row-order tag");
+        }
+        let keys = file_rows(&runs).into_iter().map(|(_, time, uid)| (time, uid)).collect::<Vec<_>>();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "strict (time, uid) order");
+        // A time-sorted file is not class runs: declined, nothing written.
+        let time_sorted = local_data_files(&input.dir).unwrap().remove(0);
+        let declined = dir.path().join("declined.parquet");
+        assert_eq!(restore_class_runs(&time_sorted, &declined, 300).unwrap(), None);
+        assert!(!declined.exists());
+    }
+
+    /// Merge CPU and wall time of the minute class sort against the
+    /// time-sorted minute layout, and of the hour merge from either minute
+    /// layout (NAN-4688). Local scale only.
+    /// `cargo test --release ... nan4688_merge_cost -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn nan4688_merge_cost() {
+        use crate::parts::provenance::tests::{signer, TENANT, SIGNER};
+        use super::super::writer::publish_parts;
+        fn cpu_s() -> f64 {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+            // SAFETY: getrusage writes the struct it is given.
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+            let usage = unsafe { usage.assume_init() };
+            let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+            tv(usage.ru_utime) + tv(usage.ru_stime)
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::parts::part_log::LocalObjectStore::new(dir.path().join("store")).unwrap();
+        let owner = signer(1);
+        let (schema, fingerprint, input) = class_sort_fixture(dir.path(), 240_000);
+        let inputs = [input];
+        for round in 0..3_i64 {
+            for sorted in [false, true] {
+                let (wall, cpu) = (std::time::Instant::now(), cpu_s());
+                let minute = if sorted {
+                    merge_parts(dir.path(), TENANT, Level::Minute, 0, &inputs, schema.clone(), &fingerprint, SIGNER, "test", 10 + round).unwrap().finished
+                } else {
+                    merge_streaming(dir.path(), TENANT, Level::Minute, 0, &inputs, &inputs, schema.clone(), &fingerprint,
+                        SIGNER, "test", 10 + round, false, false, false, HourOrder::TIME, None).unwrap().unwrap().finished
+                };
+                let (minute_wall, minute_cpu) = (wall.elapsed().as_secs_f64(), cpu_s() - cpu);
+                let bytes = minute.record.files.data_bytes();
+                let part = publish_parts(&store, &owner, &owner.trusted(), &[minute]).await.unwrap().remove(0);
+                let (wall, cpu) = (std::time::Instant::now(), cpu_s());
+                let hour = merge_parts(dir.path(), TENANT, Level::Hour, 0,
+                    &[MergeInput { dir: dir.path().join(part.part_id.as_str()), part }], schema.clone(), &fingerprint, SIGNER, "test", 20 + round)
+                    .unwrap().finished;
+                eprintln!("NAN-4688 round {round} minute_sorted={sorted}: minute merge {minute_wall:.2}s wall {minute_cpu:.2}s cpu {bytes} B; \
+                    hour merge {:.2}s wall {:.2}s cpu, {} files", wall.elapsed().as_secs_f64(), cpu_s() - cpu, hour.record.files.data.len());
+            }
         }
     }
 
@@ -2015,34 +2281,30 @@ mod tests {
         hex::encode(hash.finalize())
     }
 
-    /// NAN-3437 default-off proof. This digest was captured from the merge
+    /// NAN-3437 pre-switch layout. This digest was captured from the merge
     /// code BEFORE the switch existed (nanosiem ac91ab0b7, this fixture,
-    /// `NANO_LAKE_CLASS_FAMILIES` / `NANO_LAKE_COMPACTION_LAYOUT` /
-    /// `NANO_LAKE_ENDPOINT_HOST_SORT` unset): with the switch unset an hour
-    /// merge must still write exactly that layout (one source-family file
-    /// per source, no class labels).
+    /// `NANO_LAKE_COMPACTION_LAYOUT` / `NANO_LAKE_ENDPOINT_HOST_SORT` unset):
+    /// with the class split off (as for hours written before NAN-4688), an
+    /// hour merge must still write exactly that layout (one source-family
+    /// file per source, no class labels).
     const PRE_SWITCH_HOUR_LAYOUT: &str = "9373e0c14dec314f8f0a110da526310df6cd56f73451b55178c9ec7b9501fca6";
 
+    /// NAN-4688: class families are the default, with no switch: an hour
+    /// merge with nothing set writes exactly the class-split layout.
     #[test]
-    fn class_families_unset_keeps_the_pre_switch_hour_layout() {
+    fn class_families_are_the_default_hour_layout() {
         use crate::parts::provenance::tests::{TENANT, SIGNER};
-        for name in ["NANO_LAKE_CLASS_FAMILIES", "NANO_LAKE_COMPACTION_LAYOUT", "NANO_LAKE_ENDPOINT_HOST_SORT"] {
-            assert!(std::env::var(name).is_err(), "{name} must be unset for the default-off proof");
+        for name in ["NANO_LAKE_COMPACTION_LAYOUT", "NANO_LAKE_ENDPOINT_HOST_SORT"] {
+            assert!(std::env::var(name).is_err(), "{name} must be unset for the default-layout proof");
         }
         let dir = tempfile::tempdir().unwrap();
         let (schema, fingerprint, input) = class_family_fixture(dir.path());
         let inputs = [input];
-        // The time-sorted hour order (NAN-4664's fallback) is still exactly
-        // the pre-switch layout.
-        let time_sorted = merge_streaming(dir.path(), TENANT, Level::Hour, 0, &inputs, &inputs, schema.clone(), &fingerprint,
-            SIGNER, "test", 7, true, false, false, HourOrder::TIME, None).unwrap().unwrap().finished;
-        assert_eq!(layout_digest(&time_sorted), PRE_SWITCH_HOUR_LAYOUT);
-        let merged = merge_parts(dir.path(), TENANT, Level::Hour, 0, &inputs, schema, &fingerprint, SIGNER, "test", 7).unwrap();
-        let digest = layout_digest(&merged.finished);
-        eprintln!("nan3437 unset layout digest {digest} files={:?}", merged.finished.record.files.data.iter()
-            .map(|file| (file.log_sources.clone(), file.class_id, file.rows)).collect::<Vec<_>>());
-        assert!(merged.finished.record.files.data.iter().all(|file| file.class_id.is_none()));
-        assert_default_hour_order(&merged.finished, &time_sorted);
+        let default = merge_parts(dir.path(), TENANT, Level::Hour, 0, &inputs, schema.clone(), &fingerprint, SIGNER, "test", 7).unwrap();
+        let forced = with_class_families(Some(true), || merge_parts(dir.path(), TENANT, Level::Hour, 0, &inputs, schema,
+            &fingerprint, SIGNER, "test", 7)).unwrap();
+        assert_eq!(layout_digest(&default.finished), layout_digest(&forced.finished));
+        assert!(default.finished.record.files.data.iter().any(|file| file.class_id.is_some()), "dedicated class files by default");
     }
 
     /// NAN-4664: the default hour has the time-sorted hour's families, rows
@@ -2077,17 +2339,8 @@ mod tests {
         out
     }
 
-    #[test]
-    fn class_families_switch_is_explicit_opt_in() {
-        for value in [None, Some(""), Some("0"), Some("false"), Some("off"), Some("2"), Some("yes")] {
-            assert!(!class_families_from(value), "{value:?}");
-        }
-        for value in ["1", "true", "TRUE", " 1 "] {
-            assert!(class_families_from(Some(value)), "{value}");
-        }
-    }
-
-    /// The explicit off value writes the same layout as unset.
+    /// The class split off (hours written before NAN-4688) writes the
+    /// pre-switch layout.
     #[test]
     fn class_families_off_keeps_the_pre_switch_hour_layout() {
         use crate::parts::provenance::tests::{TENANT, SIGNER};

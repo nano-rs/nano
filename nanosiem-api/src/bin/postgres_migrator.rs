@@ -87,6 +87,14 @@ async fn run() -> Result<()> {
             receipt = %serde_json::to_string(&receipt).unwrap_or_default(),
             "writer JTI retention index prebuild"
         );
+        // NAN-4706: same phase for 9015680's writer-receipt recency index.
+        let receipt = nanosiem_core::enterprise_shared_writer_jti_prebuild::run_receipt_recency(&pool)
+            .await
+            .context("NAN-4706 writer receipt recency index prebuild")?;
+        tracing::info!(
+            receipt = %serde_json::to_string(&receipt).unwrap_or_default(),
+            "writer receipt recency index prebuild"
+        );
         nanosiem_enterprise::postgres_migrations::run(&pool)
             .await
             .context("running enterprise PostgreSQL overlay migrations")?;

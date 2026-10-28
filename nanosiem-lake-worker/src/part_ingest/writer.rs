@@ -432,7 +432,7 @@ impl PartWriter {
     /// order); a family past [`crate::parts::format::DATA_FILE_SPLIT_BYTES`]
     /// fails the write, and the merge then redoes the hour time-sorted.
     pub fn start_class_sorted_family(&mut self, source: Option<&str>, class_id: Option<i64>) -> Result<()> {
-        ensure!(self.draft.level == Level::Hour, "class-sorted families are only written by hour merges");
+        ensure!(matches!(self.draft.level, Level::Minute | Level::Hour), "class-sorted families are only written by minute/hour merges");
         self.start_source_class(source, class_id)?;
         self.class_sorted = true;
         Ok(())

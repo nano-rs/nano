@@ -40,8 +40,8 @@
 //!
 //! - `payload_threads=N` (`NANO_LAKE_PAYLOAD_MAX_THREADS`, NAN-3411) and
 //!   `payload_block_rows=N` (`NANO_LAKE_PAYLOAD_BLOCK_ROWS`): the full-event
-//!   payload statement's reader threads (default 1) and block rows (default
-//!   128), see `planner::bounded_payload_settings`. Numeric, clamped there
+//!   payload statement's reader threads and block rows (default: from the
+//!   query role, NAN-4694), see `planner::bounded_payload_settings`. Numeric, clamped there
 //!   (threads to the interactive 4-thread cap and the tenant's budget, rows
 //!   to 128..=8192); every other payload memory bound stays.
 //!
@@ -370,8 +370,10 @@ fn switch(env: bool, value: Option<bool>) -> Value {
     json!({"env": env, "override": value, "effective": value.unwrap_or(env)})
 }
 
-fn knob(env: Option<u64>, value: Option<u64>, effective: u64) -> Value {
-    json!({"env": env, "override": value, "effective": effective})
+/// A payload knob: `effective` is the requested value (override else env),
+/// null when the planner derives it from the query role (NAN-4694).
+fn knob(env: Option<u64>, value: Option<u64>) -> Value {
+    json!({"env": env, "override": value, "effective": value.or(env), "default": "role"})
 }
 
 /// The effective switches of this debug request (`None` outside one):
@@ -381,16 +383,14 @@ pub fn evidence() -> Option<Value> {
     let scope = capture()?;
     let overrides = scope.overrides;
     let (env_threads, env_rows) = (crate::planner::payload_max_threads_env(), crate::planner::payload_block_rows_env());
-    let (threads, rows) = crate::planner::payload_read_settings(
-        overrides.payload_threads.or(env_threads), overrides.payload_block_rows.or(env_rows), crate::part_query::lanes::INTERACTIVE_MAX_THREADS);
     Some(json!({
         "flat_filter_leaves": switch(crate::planner::flat_filter_leaves_env(), overrides.flat_filter_leaves),
         "lane_routing_v2": switch(crate::part_query::lanes::lane_routing_v2_enabled(), overrides.lane_routing_v2),
         "identity_merged_index": switch(crate::part_query::identity_merged::enabled(), overrides.identity_merged_index),
         "entity_index": switch(crate::part_query::entity_index::enabled(), overrides.entity_index),
-        // Effective before the tenant's thread budget (the plan may lower it).
-        "payload_threads": knob(env_threads, overrides.payload_threads, threads),
-        "payload_block_rows": knob(env_rows, overrides.payload_block_rows, rows),
+        // Requested values, unclamped (the plan clamps them to the role).
+        "payload_threads": knob(env_threads, overrides.payload_threads),
+        "payload_block_rows": knob(env_rows, overrides.payload_block_rows),
         "result_cache_bypassed": !overrides.is_empty(),
         "process_level_ignored": scope.process_level_ignored,
         "invalid_entries": scope.invalid,

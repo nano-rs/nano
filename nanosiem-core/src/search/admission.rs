@@ -284,6 +284,104 @@ fn principal_queue_limit(per_user_limit: u32, queue_share: u32) -> u32 {
 }
 
 // ============================================================================
+// Query class (NAN-4703)
+// ============================================================================
+
+/// Who a search is for (NAN-4703). A credential the server knows belongs to
+/// an agent ([`is_agent_api_key_name`]) is always the agent class; any other
+/// caller opts in with [`QUERY_CLASS_HEADER`] (see [`resolve_query_class`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum QueryClass {
+    /// An analyst at a screen (and every caller that names no class).
+    #[default]
+    Human,
+    /// An automated agent's leftover cell query (agent scans belong on the
+    /// agent lane, not the cell): a hard cap ([`agent_class_limit`]) so it
+    /// never takes the share reserved for humans, and the lowest priority
+    /// in its tenant's queue. No extra budget: deadlines and result caps
+    /// are the human ones.
+    Agent,
+}
+
+impl QueryClass {
+    pub const fn label(self) -> &'static str {
+        match self {
+            QueryClass::Human => "human",
+            QueryClass::Agent => "agent",
+        }
+    }
+}
+
+/// Request header naming a search's class: `agent` opts into the agent
+/// class. Declaring it only ever lowers the caller's share, so the header
+/// is trusted as sent; anything else is [`QueryClass::Human`].
+pub const QUERY_CLASS_HEADER: &str = "x-nano-query-class";
+
+/// The class a [`QUERY_CLASS_HEADER`] value names.
+pub fn parse_query_class_header(value: Option<&str>) -> QueryClass {
+    match value.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("agent") => QueryClass::Agent,
+        _ => QueryClass::Human,
+    }
+}
+
+/// NAN-4703: the name prefix nano Desktop gives every API key it mints for
+/// its agents (agent tools/MCP, recon, hunt runner, hunt sweep). Desktop
+/// mints no other keys; an analyst's desktop session is a JWT.
+pub const DESKTOP_AGENT_KEY_NAME_PREFIX: &str = "nano Desktop \u{2014} ";
+
+/// Whether an API key (dedicated) or tenant automation key (shared) is an
+/// agent's credential, from its server-stored name.
+pub fn is_agent_api_key_name(name: &str) -> bool {
+    name.trim_start().starts_with(DESKTOP_AGENT_KEY_NAME_PREFIX)
+}
+
+/// The class of a request: an agent credential is always [`QueryClass::Agent`]
+/// whatever the header says (a header never upgrades an agent to human);
+/// otherwise the [`QUERY_CLASS_HEADER`] value decides.
+pub fn resolve_query_class(agent_credential: bool, header: Option<&str>) -> QueryClass {
+    if agent_credential {
+        QueryClass::Agent
+    } else {
+        parse_query_class_header(header)
+    }
+}
+
+/// Slots of an admission scope (a shared tenant's limit, or a dedicated
+/// process's ceiling) that agent-class searches never take: a quarter, at
+/// least one. A scope of one slot cannot reserve any.
+pub const fn human_reserved_slots(scope_limit: u32) -> u32 {
+    if scope_limit <= 1 {
+        return 0;
+    }
+    let quarter = scope_limit / 4;
+    if quarter == 0 { 1 } else { quarter }
+}
+
+/// The most permits agent-class searches of one admission scope hold at
+/// once: the scope's limit less [`human_reserved_slots`] (at least one).
+pub const fn agent_class_limit(scope_limit: u32) -> u32 {
+    let limit = scope_limit.saturating_sub(human_reserved_slots(scope_limit));
+    if limit == 0 { 1 } else { limit }
+}
+
+tokio::task_local! {
+    /// The current request's query class (see [`with_query_class`]).
+    static ADMISSION_QUERY_CLASS: QueryClass;
+}
+
+/// Run `future` as a `class` search: every admission inside it is taken in
+/// that class.
+pub async fn with_query_class<F: std::future::Future>(class: QueryClass, future: F) -> F::Output {
+    ADMISSION_QUERY_CLASS.scope(class, future).await
+}
+
+/// The current request's query class ([`QueryClass::Human`] outside any scope).
+pub fn current_query_class() -> QueryClass {
+    ADMISSION_QUERY_CLASS.try_with(|class| *class).unwrap_or_default()
+}
+
+// ============================================================================
 // Per-request wait budget (NAN-4664)
 // ============================================================================
 
@@ -446,6 +544,7 @@ fn unix_millis_now() -> i64 {
 struct LocalLease {
     subject: AdmissionSubject,
     lane: AdmissionLane,
+    class: QueryClass,
     expires_at: Instant,
 }
 
@@ -460,6 +559,10 @@ struct LocalLedger {
     per_tenant: HashMap<uuid::Uuid, u32>,
     per_user: HashMap<AdmissionSubject, u32>,
     per_user_auxiliary: HashMap<AdmissionSubject, u32>,
+    /// NAN-4703: agent-class permits. `None` counts every agent permit of
+    /// the process (the cell-wide agent cap; for a dedicated process it is
+    /// also its scope), `Some(tenant)` a shared tenant's agent permits.
+    per_scope_agent: HashMap<Option<uuid::Uuid>, u32>,
 }
 
 fn increment<K: std::hash::Hash + Eq>(map: &mut HashMap<K, u32>, key: K) {
@@ -492,10 +595,15 @@ impl LocalLedger {
         self.per_tenant.get(tenant_id).copied().unwrap_or(0)
     }
 
+    fn agent_count(&self, tenant_id: &Option<uuid::Uuid>) -> u32 {
+        self.per_scope_agent.get(tenant_id).copied().unwrap_or(0)
+    }
+
     fn insert(
         &mut self,
         subject: AdmissionSubject,
         lane: AdmissionLane,
+        class: QueryClass,
         expires_at: Instant,
     ) -> u64 {
         self.next_id = self.next_id.wrapping_add(1);
@@ -505,9 +613,16 @@ impl LocalLedger {
             LocalLease {
                 subject,
                 lane,
+                class,
                 expires_at,
             },
         );
+        if class == QueryClass::Agent {
+            increment(&mut self.per_scope_agent, None);
+            if subject.tenant_id.is_some() {
+                increment(&mut self.per_scope_agent, subject.tenant_id);
+            }
+        }
         if let Some(tenant_id) = subject.tenant_id {
             increment(&mut self.per_tenant, tenant_id);
         }
@@ -529,6 +644,12 @@ impl LocalLedger {
         decrement(&mut self.per_user, &lease.subject);
         if lease.lane == AdmissionLane::Auxiliary {
             decrement(&mut self.per_user_auxiliary, &lease.subject);
+        }
+        if lease.class == QueryClass::Agent {
+            decrement(&mut self.per_scope_agent, &None);
+            if lease.subject.tenant_id.is_some() {
+                decrement(&mut self.per_scope_agent, &lease.subject.tenant_id);
+            }
         }
         true
     }
@@ -625,9 +746,20 @@ fn redis_tenant_key(tenant_id: uuid::Uuid) -> String {
     format!("search:admission:v2:tenant:{tenant_id}:active")
 }
 
+/// NAN-4703: the agent-class permits of one admission scope (`None`: every
+/// agent permit of the cell, which is a dedicated process's scope too).
+fn redis_agent_key(tenant_id: Option<uuid::Uuid>) -> String {
+    match tenant_id {
+        Some(tenant_id) => format!("search:admission:v2:tenant:{tenant_id}:agent"),
+        None => "search:admission:v2:agent".to_string(),
+    }
+}
+
 /// Every key one permit is recorded in, in the order `ACQUIRE_LUA` expects:
-/// cell, user, user-auxiliary, then the tenant key for shared subjects.
-fn redis_permit_keys(subject: AdmissionSubject) -> Vec<String> {
+/// cell, user, user-auxiliary, the tenant key for shared subjects, then for
+/// an agent-class permit the cell-wide agent key and, for a shared subject,
+/// its tenant's agent key.
+fn redis_permit_keys(subject: AdmissionSubject, class: QueryClass) -> Vec<String> {
     let mut keys = vec![
         REDIS_GLOBAL_KEY.to_string(),
         redis_user_key(subject),
@@ -635,6 +767,12 @@ fn redis_permit_keys(subject: AdmissionSubject) -> Vec<String> {
     ];
     if let Some(tenant_id) = subject.tenant_id {
         keys.push(redis_tenant_key(tenant_id));
+    }
+    if class == QueryClass::Agent {
+        keys.push(redis_agent_key(None));
+        if subject.tenant_id.is_some() {
+            keys.push(redis_agent_key(subject.tenant_id));
+        }
     }
     keys
 }
@@ -647,14 +785,20 @@ const REDIS_ADMISSION_KEY_TTL_SECS: i64 = 7800;
 /// Atomic prune + check + lease for one permit.
 ///
 /// KEYS[1] = cell, KEYS[2] = user, KEYS[3] = user auxiliary,
-/// KEYS[4] = tenant (enterprise-shared only)
+/// then KEYS[4] = tenant (enterprise-shared only), then for the agent class
+/// (NAN-4703) the cell-wide agent key and, with a tenant key, the tenant's
+/// agent key
 /// ARGV[1] = now (Unix ms), ARGV[2] = lease expiry (Unix ms), ARGV[3] = permit id,
 /// ARGV[4] = cell limit, ARGV[5] = user limit,
 /// ARGV[6] = auxiliary user limit, or -1 for a primary request,
-/// ARGV[7] = tenant limit (ignored without KEYS[4]), ARGV[8] = key TTL seconds
+/// ARGV[7] = tenant limit (ignored without a tenant key), ARGV[8] = key TTL seconds,
+/// ARGV[9] = 1 with a tenant key, else 0,
+/// ARGV[10] = cell-wide agent-class limit, or -1 for a human-class request,
+/// ARGV[11] = the tenant's agent-class limit, or -1 (human class or no tenant)
 ///
-/// Returns 1 admitted, -1 cell full, -2 user full, -3 tenant full. Every
-/// "full" answer is queueable; expired leases are pruned before counting.
+/// Returns 1 admitted, -1 cell full, -2 user full, -3 tenant full, -4 the
+/// cell's or the tenant's agent class full. Every "full" answer is queueable; expired
+/// leases are pruned before counting.
 const ACQUIRE_LUA: &str = r#"
 local now = tonumber(ARGV[1])
 local expires = tonumber(ARGV[2])
@@ -664,7 +808,21 @@ local user_limit = tonumber(ARGV[5])
 local auxiliary_limit = tonumber(ARGV[6])
 local tenant_limit = tonumber(ARGV[7])
 local key_ttl = tonumber(ARGV[8])
-local has_tenant = #KEYS == 4
+local has_tenant = ARGV[9] == '1'
+local agent_cell_limit = tonumber(ARGV[10])
+local agent_tenant_limit = tonumber(ARGV[11])
+local next_key = 4
+if has_tenant then
+    next_key = 5
+end
+local agent_cell_key = nil
+local agent_tenant_key = nil
+if agent_cell_limit >= 0 then
+    agent_cell_key = KEYS[next_key]
+    if has_tenant and agent_tenant_limit >= 0 then
+        agent_tenant_key = KEYS[next_key + 1]
+    end
+end
 
 for i = 1, #KEYS do
     redis.call('ZREMRANGEBYSCORE', KEYS[i], '-inf', now)
@@ -678,6 +836,12 @@ if auxiliary_limit >= 0 and redis.call('ZCARD', KEYS[3]) >= auxiliary_limit then
 end
 if has_tenant and redis.call('ZCARD', KEYS[4]) >= tenant_limit then
     return -3
+end
+if agent_tenant_key and redis.call('ZCARD', agent_tenant_key) >= agent_tenant_limit then
+    return -4
+end
+if agent_cell_key and redis.call('ZCARD', agent_cell_key) >= agent_cell_limit then
+    return -4
 end
 if redis.call('ZCARD', KEYS[1]) >= cell_limit then
     return -1
@@ -695,6 +859,12 @@ end
 if has_tenant then
     lease(KEYS[4])
 end
+if agent_cell_key then
+    lease(agent_cell_key)
+end
+if agent_tenant_key then
+    lease(agent_tenant_key)
+end
 return 1
 "#;
 
@@ -708,11 +878,22 @@ end
 return 1
 "#;
 
+/// NAN-4703: an agent-class permit's caps: the cell-wide agent cap, and a
+/// shared tenant's own.
+#[derive(Debug, Clone, Copy)]
+struct AgentLimits {
+    cell: u32,
+    tenant: Option<u32>,
+}
+
 enum AdmissionAttempt {
     Admitted(AdmissionPermit),
     CellFull,
     TenantFull,
     UserFull,
+    /// NAN-4703: the cell's or the tenant's agent class is at its cap
+    /// (humans may still admit).
+    AgentFull,
 }
 
 // ============================================================================
@@ -731,6 +912,7 @@ struct RedisLease {
 /// (local and Redis) recovers permits after process loss or a lost release.
 pub struct AdmissionPermit {
     subject: AdmissionSubject,
+    class: QueryClass,
     local_lease: Option<u64>,
     ledger: Arc<std::sync::Mutex<LocalLedger>>,
     slot_available: Arc<Notify>,
@@ -765,8 +947,9 @@ impl Drop for AdmissionPermit {
         }) = self.redis.take()
         {
             let subject = self.subject;
+            let class = self.class;
             tokio::spawn(async move {
-                let keys = redis_permit_keys(subject);
+                let keys = redis_permit_keys(subject, class);
                 let mut command = redis::cmd("EVAL");
                 command
                     .arg(RELEASE_LUA)
@@ -807,6 +990,29 @@ fn queue_rejection(
     (queued >= max_queue_depth as usize && tenant_queued >= reserved).then_some(max_queue_depth)
 }
 
+/// NAN-4703: whether a new agent-class waiter is refused, and at which depth.
+/// Agent waiters of one scope stop at [`agent_class_limit`] of its queue
+/// share (`queue_share`), and all agent waiters at that of the process
+/// queue, so agents never take the places in line kept for humans.
+fn agent_queue_rejection(
+    waiters: &[QueuedSearch],
+    subject: AdmissionSubject,
+    queue_share: u32,
+    max_queue_depth: u32,
+) -> Option<u32> {
+    let agents = waiters.iter().filter(|queued| queued.class == QueryClass::Agent);
+    let scope_agents = agents
+        .clone()
+        .filter(|queued| queued.subject.tenant_id == subject.tenant_id)
+        .count();
+    let scope_limit = agent_class_limit(queue_share);
+    if scope_agents >= scope_limit as usize {
+        return Some(scope_limit);
+    }
+    let process_limit = agent_class_limit(max_queue_depth);
+    (agents.count() >= process_limit as usize).then_some(process_limit)
+}
+
 /// A queued search waiting for admission
 struct QueuedSearch {
     /// Unique, monotonically increasing per controller: FIFO order and the
@@ -817,6 +1023,7 @@ struct QueuedSearch {
     require_distributed: bool,
     priority: QueryPriority,
     lane: AdmissionLane,
+    class: QueryClass,
     /// Fair-queue tag among the tenant's principals (see [`WaitQueue`]).
     principal_tag: u64,
     /// Fair-queue tag among tenants (see [`WaitQueue`]).
@@ -946,6 +1153,17 @@ fn reassign_tags<K: std::hash::Hash + Eq>(
     }
 }
 
+/// A waiter's rank inside its tenant's turn: every human-class search
+/// before any agent-class one (NAN-4703: agents are the lowest priority),
+/// then by priority.
+fn queue_rank(queued: &QueuedSearch) -> u8 {
+    let class = match queued.class {
+        QueryClass::Human => 0,
+        QueryClass::Agent => 1,
+    };
+    class * 16 + queued.priority.ordinal()
+}
+
 /// The waiters' service order, as indices into `queue`, first served first
 /// (see [`WaitQueue`]). Normalizes the tags in place. The queue is bounded
 /// (a few hundred entries at most), so this runs on every drain.
@@ -953,13 +1171,13 @@ fn service_order(queue: &mut [QueuedSearch]) -> Vec<usize> {
     reassign_tags(
         queue,
         |queued| queued.subject,
-        |queued| (queued.priority.ordinal(), queued.lane.ordinal(), queued.seq, 0),
+        |queued| (queue_rank(queued), queued.lane.ordinal(), queued.seq, 0),
         |queued| &mut queued.principal_tag,
     );
     reassign_tags(
         queue,
         |queued| queued.subject.tenant_id,
-        |queued| (queued.priority.ordinal(), queued.lane.ordinal(), queued.principal_tag, queued.seq),
+        |queued| (queue_rank(queued), queued.lane.ordinal(), queued.principal_tag, queued.seq),
         |queued| &mut queued.tenant_tag,
     );
     let mut order: Vec<usize> = (0..queue.len()).collect();
@@ -1032,6 +1250,10 @@ pub struct AdmissionController {
     slot_available: Arc<Notify>,
     // Optional Redis connection for cluster-wide counters
     redis_conn: Mutex<Option<crate::redis_transport::ReconnectingConnection>>,
+    /// NAN-4703: the deployment configured Redis admission (`REDIS_URL`),
+    /// even if the connection failed at boot. Agent-class searches then
+    /// never take the per-replica local fallback.
+    redis_expected: std::sync::atomic::AtomicBool,
 }
 
 impl AdmissionController {
@@ -1047,7 +1269,16 @@ impl AdmissionController {
             lease_override: None,
             slot_available: Arc::new(Notify::new()),
             redis_conn: Mutex::new(None),
+            redis_expected: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// NAN-4703: record that this deployment configured Redis admission.
+    /// Without a working connection, agent-class searches fail closed
+    /// instead of counting against this replica's local ledger only
+    /// (humans keep the local fallback).
+    pub fn expect_redis(&self) {
+        self.redis_expected.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Set the Redis connection for cluster-wide admission limits.
@@ -1162,6 +1393,7 @@ impl AdmissionController {
                 .increment(1);
             return Ok(AdmissionPermit {
                 subject,
+                class: QueryClass::Human,
                 local_lease: None,
                 ledger: self.ledger.clone(),
                 slot_available: self.slot_available.clone(),
@@ -1175,17 +1407,20 @@ impl AdmissionController {
         // barging let it re-take its own freed slot ahead of every waiter
         // (NAN-4664). The drain still admits it at once when the waiters
         // ahead are blocked on their own tenant or principal caps.
-        let queue_idle = {
+        let class = current_query_class();
+        let (queue_idle, human_waiting) = {
             let mut queue = lock_queue(&self.queue);
             queue.purge_abandoned();
-            queue.is_empty()
+            let human_waiting = queue.waiters.iter().any(|queued| queued.class == QueryClass::Human);
+            (queue.is_empty(), human_waiting)
         };
         // A fail-fast caller (budget 0) never waits, so it only ever takes a
-        // slot that is free right now.
+        // slot that is free right now. NAN-4703: a fail-fast agent never
+        // takes it past a waiting human (agents are the lowest priority).
         let fail_fast = current_wait_budget().is_some_and(|budget| budget.is_zero());
-        if queue_idle || fail_fast {
+        if queue_idle || (fail_fast && !(class == QueryClass::Agent && human_waiting)) {
             match self
-                .try_admit(subject, require_distributed, priority, lane)
+                .try_admit(subject, require_distributed, priority, lane, class)
                 .await?
             {
                 AdmissionAttempt::Admitted(permit) => {
@@ -1196,7 +1431,8 @@ impl AdmissionController {
                 }
                 AdmissionAttempt::CellFull
                 | AdmissionAttempt::TenantFull
-                | AdmissionAttempt::UserFull => {}
+                | AdmissionAttempt::UserFull
+                | AdmissionAttempt::AgentFull => {}
             }
         }
 
@@ -1260,6 +1496,16 @@ impl AdmissionController {
                     .increment(1);
                 return Err(AdmissionError::QueueFull { depth: rejected_at });
             }
+            // NAN-4703: agents never fill the queue either. Their waiters
+            // stop at the agent share of the tenant's queue and of the
+            // process queue, so a human always finds a free place in line.
+            if class == QueryClass::Agent {
+                if let Some(rejected_at) = agent_queue_rejection(&queue.waiters, subject, queue_share, max_queue_depth) {
+                    counter!("nanosiem_search_jobs_rejected_total", "reason" => "agent_queue_full")
+                        .increment(1);
+                    return Err(AdmissionError::QueueFull { depth: rejected_at });
+                }
+            }
             let seq = queue.push(QueuedSearch {
                 seq: 0,
                 job_id: job_id.to_string(),
@@ -1267,6 +1513,7 @@ impl AdmissionController {
                 require_distributed,
                 priority,
                 lane,
+                class,
                 principal_tag: 0,
                 tenant_tag: 0,
                 tx,
@@ -1336,12 +1583,14 @@ impl AdmissionController {
         ledger: &mut LocalLedger,
         subject: AdmissionSubject,
         lane: AdmissionLane,
+        class: QueryClass,
         lease: std::time::Duration,
         redis: Option<RedisLease>,
     ) -> AdmissionPermit {
-        let lease_id = ledger.insert(subject, lane, Instant::now() + lease);
+        let lease_id = ledger.insert(subject, lane, class, Instant::now() + lease);
         AdmissionPermit {
             subject,
+            class,
             local_lease: Some(lease_id),
             ledger: self.ledger.clone(),
             slot_available: self.slot_available.clone(),
@@ -1356,6 +1605,7 @@ impl AdmissionController {
         require_distributed: bool,
         priority: QueryPriority,
         lane: AdmissionLane,
+        class: QueryClass,
     ) -> Result<AdmissionAttempt, AdmissionError> {
         let config = self.config.lock().await;
         let global_limit = config.global_adhoc_limit;
@@ -1374,11 +1624,17 @@ impl AdmissionController {
             AdmissionLane::Primary => None,
             AdmissionLane::Auxiliary => Some(auxiliary_user_limit(user_limit)),
         };
+        // NAN-4703: agents share the cell's slots, and a shared tenant's,
+        // less the human reserve of each.
+        let agent_limit = (class == QueryClass::Agent).then(|| AgentLimits {
+            cell: agent_class_limit(global_limit),
+            tenant: subject.tenant_id.map(|_| agent_class_limit(tenant_limit)),
+        });
 
         // Try Redis first if available
         let redis_conn = self.redis_conn.lock().await.clone();
         if let Some(mut conn) = redis_conn {
-            let keys = redis_permit_keys(subject);
+            let keys = redis_permit_keys(subject, class);
             let permit_id = uuid::Uuid::now_v7().to_string();
             let now_ms = unix_millis_now();
             let expires_ms = now_ms.saturating_add(lease.as_millis() as i64);
@@ -1394,7 +1650,10 @@ impl AdmissionController {
                 .arg(user_limit)
                 .arg(auxiliary_limit.map_or(-1, i64::from))
                 .arg(tenant_limit)
-                .arg(REDIS_ADMISSION_KEY_TTL_SECS);
+                .arg(REDIS_ADMISSION_KEY_TTL_SECS)
+                .arg(i64::from(subject.tenant_id.is_some()))
+                .arg(agent_limit.map_or(-1, |limits| i64::from(limits.cell)))
+                .arg(agent_limit.and_then(|limits| limits.tenant).map_or(-1, i64::from));
             let result: Result<i64, _> = command.query_async(&mut conn).await;
 
             match result {
@@ -1406,12 +1665,14 @@ impl AdmissionController {
                         &mut ledger,
                         subject,
                         lane,
+                        class,
                         lease,
                         Some(RedisLease { conn, permit_id }),
                     );
                     return Ok(AdmissionAttempt::Admitted(permit));
                 }
                 Ok(-2) => return Ok(AdmissionAttempt::UserFull),
+                Ok(-4) if agent_limit.is_some() => return Ok(AdmissionAttempt::AgentFull),
                 Ok(-1) => return Ok(AdmissionAttempt::CellFull),
                 Ok(-3) if subject.tenant_id.is_some() => {
                     // This tenant is full, but another tenant may still use a
@@ -1420,7 +1681,7 @@ impl AdmissionController {
                     return Ok(AdmissionAttempt::TenantFull);
                 }
                 Ok(v) => {
-                    if require_distributed {
+                    if require_distributed || class == QueryClass::Agent {
                         tracing::error!(
                             value = v,
                             tenant_id = ?subject.tenant_id,
@@ -1435,7 +1696,10 @@ impl AdmissionController {
                     // Fall through to local admission
                 }
                 Err(e) => {
-                    if require_distributed {
+                    // NAN-4703: an agent-class search fails closed too. The
+                    // local fallback counts only this replica, so it could not
+                    // hold the cell's human reserve; humans keep the fallback.
+                    if require_distributed || class == QueryClass::Agent {
                         tracing::error!(
                             error = %e,
                             tenant_id = ?subject.tenant_id,
@@ -1456,16 +1720,25 @@ impl AdmissionController {
             );
             return Err(AdmissionError::Unavailable);
         }
+        if class == QueryClass::Agent && self.redis_expected.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                tenant_id = ?subject.tenant_id,
+                "Redis admission is configured but not connected; agent-class search fails closed"
+            );
+            return Err(AdmissionError::Unavailable);
+        }
 
         // Fallback: local ledger (single-instance or Redis unavailable)
         Ok(self.try_admit_local(
             subject,
             lane,
+            class,
             lease,
             global_limit,
             tenant_limit,
             user_limit,
             auxiliary_limit,
+            agent_limit,
         ))
     }
 
@@ -1475,11 +1748,13 @@ impl AdmissionController {
         &self,
         subject: AdmissionSubject,
         lane: AdmissionLane,
+        class: QueryClass,
         lease: std::time::Duration,
         global_limit: u32,
         tenant_limit: u32,
         user_limit: u32,
         auxiliary_limit: Option<u32>,
+        agent_limit: Option<AgentLimits>,
     ) -> AdmissionAttempt {
         let mut ledger = lock_ledger(&self.ledger);
         ledger.reclaim_expired(Instant::now());
@@ -1495,11 +1770,18 @@ impl AdmissionController {
                 return AdmissionAttempt::TenantFull;
             }
         }
+        if let Some(limits) = agent_limit {
+            let tenant_full = subject.tenant_id.is_some()
+                && limits.tenant.is_some_and(|limit| ledger.agent_count(&subject.tenant_id) >= limit);
+            if tenant_full || ledger.agent_count(&None) >= limits.cell {
+                return AdmissionAttempt::AgentFull;
+            }
+        }
         if ledger.active() >= global_limit {
             return AdmissionAttempt::CellFull;
         }
 
-        AdmissionAttempt::Admitted(self.admitted_permit(&mut ledger, subject, lane, lease, None))
+        AdmissionAttempt::Admitted(self.admitted_permit(&mut ledger, subject, lane, class, lease, None))
     }
 
     fn local_active(&self) -> u32 {
@@ -1664,15 +1946,16 @@ impl AdmissionController {
                         queued.require_distributed,
                         queued.priority,
                         queued.lane,
+                        queued.class,
                     )),
                 }
             };
-            let Some((subject, require_distributed, priority, lane)) = candidate else {
+            let Some((subject, require_distributed, priority, lane, class)) = candidate else {
                 continue;
             };
 
             match self
-                .try_admit(subject, require_distributed, priority, lane)
+                .try_admit(subject, require_distributed, priority, lane, class)
                 .await
             {
                 Ok(AdmissionAttempt::Admitted(permit)) => {
@@ -1699,9 +1982,15 @@ impl AdmissionController {
                     // keeps its seq and tags, so its place in line too.
                     break;
                 }
-                Ok(AdmissionAttempt::TenantFull | AdmissionAttempt::UserFull) => {
-                    // Do not let a saturated tenant or principal first in line
-                    // block other waiters from a free slot; it stays queued.
+                Ok(
+                    AdmissionAttempt::TenantFull
+                    | AdmissionAttempt::UserFull
+                    | AdmissionAttempt::AgentFull,
+                ) => {
+                    // Do not let a saturated tenant, principal or agent class
+                    // first in line block other waiters from a free slot (a
+                    // tenant's humans are served past its capped agents, its
+                    // reserved share, NAN-4703); it stays queued.
                 }
                 Err(error) => {
                     // A shared admission outage is terminal for this waiter,
@@ -2514,7 +2803,7 @@ mod tests {
             format!("search:admission:v2:user:{user}")
         );
         assert_eq!(
-            redis_permit_keys(a),
+            redis_permit_keys(a, QueryClass::Human),
             vec![
                 REDIS_GLOBAL_KEY.to_string(),
                 redis_user_key(a),
@@ -2523,9 +2812,19 @@ mod tests {
             ]
         );
         assert_eq!(
-            redis_permit_keys(AdmissionSubject::new(SearchTenantScope::Dedicated, user)).len(),
+            redis_permit_keys(AdmissionSubject::new(SearchTenantScope::Dedicated, user), QueryClass::Human).len(),
             3
         );
+        // NAN-4703: an agent-class permit is also recorded in the cell-wide
+        // agent key and, for a shared tenant, its tenant's agent key, in
+        // that order after the tenant key.
+        let agent_keys = redis_permit_keys(a, QueryClass::Agent);
+        assert_eq!(agent_keys.len(), 6);
+        assert_eq!(agent_keys[4], "search:admission:v2:agent");
+        assert_eq!(agent_keys[5], format!("search:admission:v2:tenant:{}:agent", Uuid::from_u128(0xa)));
+        let dedicated_agent = redis_permit_keys(AdmissionSubject::new(SearchTenantScope::Dedicated, user), QueryClass::Agent);
+        assert_eq!(dedicated_agent.len(), 4);
+        assert_eq!(dedicated_agent[3], "search:admission:v2:agent");
     }
 
     /// NAN-3299: the crash fence is each permit's own expiry score, pruned
@@ -2973,6 +3272,7 @@ mod tests {
             require_distributed: false,
             priority,
             lane: AdmissionLane::Primary,
+            class: QueryClass::Human,
             principal_tag: 0,
             tenant_tag: 0,
             tx: oneshot::channel().0,
@@ -3438,5 +3738,378 @@ mod tests {
         })
         .await
         .expect("atomic permit release should remove cell and tenant keys");
+    }
+
+    // ------------------------------------------------------------------
+    // NAN-4703: agent-class guard (hard cap, lowest priority)
+    // ------------------------------------------------------------------
+
+    /// NAN-4703 over a real Redis/Dragonfly, two replicas: a shared
+    /// tenant's agent permits stop at `agent_class_limit` (the script's -4),
+    /// a human still admits into the reserved slot, another tenant's agents
+    /// have their own key, and release removes the agent key too.
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    #[ignore = "requires NANOSIEM_ADMISSION_TEST_REDIS_URL for a disposable Redis/Dragonfly"]
+    async fn enterprise_shared_dragonfly_caps_agent_class_below_the_human_share() {
+        let url = std::env::var("NANOSIEM_ADMISSION_TEST_REDIS_URL")
+            .expect("NANOSIEM_ADMISSION_TEST_REDIS_URL must name a disposable database");
+        let client = redis::Client::open(url).expect("create Redis client");
+        let manager = client.get_connection_manager().await.expect("connect to disposable Redis/Dragonfly");
+        let mut cleanup = manager.clone();
+        redis::cmd("FLUSHDB").query_async::<()>(&mut cleanup).await.expect("clear disposable admission database");
+        let config = AdmissionConfig {
+            global_adhoc_limit: 30,
+            shared_tenant_adhoc_limit: 4,
+            per_user_limit: 10,
+            max_queue_depth: 0,
+            queue_timeout_ms: 100,
+        };
+        let first_replica = AdmissionController::new(config.clone());
+        let second_replica = AdmissionController::new(config);
+        first_replica.set_redis(manager.clone()).await;
+        second_replica.set_redis(manager.clone()).await;
+        let tenant_a = SearchTenantScope::EnterpriseShared(Uuid::from_u128(0xa4703));
+        let tenant_b = SearchTenantScope::EnterpriseShared(Uuid::from_u128(0xb4703));
+
+        let agents = with_query_class(QueryClass::Agent, async {
+            let mut agents = Vec::new();
+            for index in 0..agent_class_limit(4) {
+                let replica = if index % 2 == 0 { &first_replica } else { &second_replica };
+                agents.push(
+                    replica
+                        .acquire_for_scope(&format!("agent{index}"), tenant_a, Uuid::now_v7(), QueryPriority::Interactive)
+                        .await
+                        .expect("agent under its cap"),
+                );
+            }
+            let over = second_replica
+                .acquire_for_scope("agent-over", tenant_a, Uuid::now_v7(), QueryPriority::Interactive)
+                .await;
+            assert!(matches!(over, Err(AdmissionError::QueueFull { depth: 0 })), "agent over its cap is refused here (no queue)");
+            let other = first_replica
+                .acquire_for_scope("other-tenant", tenant_b, Uuid::now_v7(), QueryPriority::Interactive)
+                .await
+                .expect("tenant B's agents have their own cap");
+            (agents, other)
+        })
+        .await;
+        let human = second_replica
+            .acquire_for_scope("human", tenant_a, Uuid::now_v7(), QueryPriority::Interactive)
+            .await
+            .expect("a human admits into the reserved share");
+        let agent_count: i64 = redis::cmd("ZCARD")
+            .arg(redis_agent_key(Some(Uuid::from_u128(0xa4703))))
+            .query_async(&mut cleanup)
+            .await
+            .expect("read agent count");
+        let tenant_count: i64 = redis::cmd("ZCARD")
+            .arg(redis_tenant_key(Uuid::from_u128(0xa4703)))
+            .query_async(&mut cleanup)
+            .await
+            .expect("read tenant count");
+        assert_eq!((agent_count, tenant_count), (3, 4));
+
+        drop((agents, human));
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let remaining: i64 = redis::cmd("EXISTS")
+                    .arg(redis_agent_key(None))
+                    .arg(redis_agent_key(Some(Uuid::from_u128(0xa4703))))
+                    .arg(redis_agent_key(Some(Uuid::from_u128(0xb4703))))
+                    .arg(redis_tenant_key(Uuid::from_u128(0xa4703)))
+                    .query_async(&mut cleanup)
+                    .await
+                    .expect("read released keys");
+                if remaining == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("release removes the agent and tenant keys");
+    }
+
+    #[test]
+    fn agent_class_cap_leaves_the_human_reserve() {
+        for (limit, reserved, agents) in [
+            (1, 0, 1),
+            (2, 1, 1),
+            (4, 1, 3),
+            (5, 1, 4),
+            (8, 2, 6),
+            (10, 2, 8),
+            (30, 7, 23),
+        ] {
+            assert_eq!(human_reserved_slots(limit), reserved, "{limit}");
+            assert_eq!(agent_class_limit(limit), agents, "{limit}");
+            assert!(limit < 2 || agent_class_limit(limit) < limit, "{limit}: humans keep a slot");
+        }
+        assert_eq!(parse_query_class_header(Some(" Agent ")), QueryClass::Agent);
+        for other in [None, Some(""), Some("human"), Some("agents")] {
+            assert_eq!(parse_query_class_header(other), QueryClass::Human, "{other:?}");
+        }
+        // The script refuses an agent permit at its scope's cap and leases
+        // the agent key only for agent permits.
+        assert!(ACQUIRE_LUA.contains("redis.call('ZCARD', agent_tenant_key) >= agent_tenant_limit"));
+        assert!(ACQUIRE_LUA.contains("redis.call('ZCARD', agent_cell_key) >= agent_cell_limit"));
+        assert!(ACQUIRE_LUA.contains("return -4"));
+        assert!(ACQUIRE_LUA.contains("lease(agent_cell_key)"));
+        assert!(ACQUIRE_LUA.contains("lease(agent_tenant_key)"));
+        // An agent credential is the agent class whatever the header says.
+        for header in [None, Some("human"), Some("agent"), Some("")] {
+            assert_eq!(resolve_query_class(true, header), QueryClass::Agent, "{header:?}");
+        }
+        assert_eq!(resolve_query_class(false, None), QueryClass::Human);
+        assert_eq!(resolve_query_class(false, Some("agent")), QueryClass::Agent);
+        // Every key nano Desktop mints for its agents.
+        for name in ["nano Desktop \u{2014} agent tools (mbp)", "nano Desktop \u{2014} recon (mbp)", "nano Desktop \u{2014} hunt runner (mbp)", "nano Desktop \u{2014} hunt sweep (mbp)"] {
+            assert!(is_agent_api_key_name(name), "{name}");
+        }
+        for name in ["ci ingest", "nano Desktop", "my nano Desktop \u{2014} key"] {
+            assert!(!is_agent_api_key_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn service_order_serves_humans_before_agents_within_a_tenant() {
+        let tenant = SearchTenantScope::EnterpriseShared(Uuid::from_u128(0x4703));
+        let agent = AdmissionSubject::new(tenant, Uuid::now_v7());
+        let human = AdmissionSubject::new(tenant, Uuid::now_v7());
+        let mut queue = WaitQueue::default();
+        for _ in 0..3 {
+            let mut waiter = synthetic(0, agent, QueryPriority::Interactive);
+            waiter.class = QueryClass::Agent;
+            queue.push(waiter);
+        }
+        // An Analytics human still goes before Interactive agents.
+        queue.push(synthetic(0, human, QueryPriority::Analytics));
+        let order = service_order(&mut queue.waiters);
+        assert_eq!(queue.waiters[order[0]].subject, human);
+        assert!(order[1..].iter().all(|&index| queue.waiters[index].class == QueryClass::Agent));
+    }
+
+    /// Agents fill only their cap; a human arriving behind a queued agent is
+    /// admitted at once into the reserved slot; the queued agent runs when
+    /// an agent permit releases. Dedicated (process limit) and one shared
+    /// tenant (its own limit; another tenant's agents are not counted).
+    #[tokio::test]
+    async fn agents_never_take_the_human_share() {
+        let shared_a = SearchTenantScope::EnterpriseShared(Uuid::from_u128(0xa4703));
+        let shared_b = SearchTenantScope::EnterpriseShared(Uuid::from_u128(0xb4703));
+        for (config, scope) in [
+            (fleet_config(4, 10), SearchTenantScope::Dedicated),
+            (
+                AdmissionConfig { shared_tenant_adhoc_limit: 4, ..fleet_config(30, 10) },
+                shared_a,
+            ),
+        ] {
+            let controller = Arc::new(AdmissionController::new(config));
+            controller.start_drain_loop();
+            let agent = |controller: Arc<AdmissionController>, scope: SearchTenantScope, job: String| async move {
+                with_query_class(QueryClass::Agent, async move {
+                    controller
+                        .acquire_subject(&job, AdmissionSubject::new(scope, Uuid::now_v7()), false, QueryPriority::Interactive)
+                        .await
+                })
+                .await
+            };
+            let mut agents = Vec::new();
+            for index in 0..agent_class_limit(4) {
+                agents.push(agent(Arc::clone(&controller), scope, format!("agent{index}")).await.expect("agent under its cap"));
+            }
+            if scope == shared_a {
+                // Another tenant's agents have their own cap.
+                let other = agent(Arc::clone(&controller), shared_b, "other-tenant".into()).await;
+                assert!(other.is_ok(), "tenant B is not capped by tenant A's agents");
+            }
+            let queued_agent = tokio::spawn(agent(Arc::clone(&controller), scope, "agent-over-cap".into()));
+            wait_for_depth(&controller, 1).await;
+            assert!(!queued_agent.is_finished(), "the agent over its cap waits");
+
+            let human = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                controller.acquire_subject("human", AdmissionSubject::new(scope, Uuid::now_v7()), false, QueryPriority::Interactive),
+            )
+            .await
+            .expect("the human is never queued behind capped agents")
+            .expect("human admitted into the reserved share");
+            assert_eq!(current_query_class(), QueryClass::Human);
+            assert!(!queued_agent.is_finished());
+
+            drop(agents.pop());
+            let admitted = tokio::time::timeout(std::time::Duration::from_secs(5), queued_agent)
+                .await
+                .expect("the queued agent runs once an agent permit releases")
+                .expect("join")
+                .expect("admitted");
+            drop((admitted, human, agents));
+        }
+    }
+
+    /// NAN-4703: in a shared cell, agents of many tenants together never
+    /// take the cell's human reserve either: each tenant is under its own
+    /// agent cap, but the cell-wide agent cap stops them, and a human of any
+    /// tenant still admits.
+    #[tokio::test]
+    async fn agents_of_many_tenants_never_take_the_cells_human_share() {
+        let controller = Arc::new(AdmissionController::new(AdmissionConfig {
+            shared_tenant_adhoc_limit: 4,
+            ..fleet_config(8, 10)
+        }));
+        let mut agents = Vec::new();
+        for tenant in 0..agent_class_limit(8) {
+            let scope = SearchTenantScope::EnterpriseShared(Uuid::from_u128(0x4703_0000 + u128::from(tenant)));
+            agents.push(
+                with_query_class(QueryClass::Agent, controller.acquire_subject("agent", AdmissionSubject::new(scope, Uuid::now_v7()), false, QueryPriority::Interactive))
+                    .await
+                    .expect("under the cell's agent cap"),
+            );
+        }
+        let fresh_tenant = SearchTenantScope::EnterpriseShared(Uuid::from_u128(0x4703_ffff));
+        let over = with_query_class(
+            QueryClass::Agent,
+            with_wait_budget(std::time::Duration::ZERO, controller.acquire_subject("agent-over", AdmissionSubject::new(fresh_tenant, Uuid::now_v7()), false, QueryPriority::Interactive)),
+        )
+        .await;
+        assert!(over.is_err(), "the cell's agent cap holds across tenants");
+        for _ in 0..human_reserved_slots(8) {
+            let human = with_wait_budget(
+                std::time::Duration::ZERO,
+                controller.acquire_subject("human", AdmissionSubject::new(fresh_tenant, Uuid::now_v7()), false, QueryPriority::Interactive),
+            )
+            .await
+            .expect("humans keep the cell's reserve");
+            agents.push(human);
+        }
+    }
+
+    /// NAN-4703: agent waiters never fill a scope's queue (a human always
+    /// finds a place in line), and a fail-fast agent never takes a free
+    /// slot past a waiting human.
+    #[tokio::test]
+    async fn agents_never_fill_the_queue_or_barge_past_humans() {
+        let scope = SearchTenantScope::Dedicated;
+        let controller = Arc::new(AdmissionController::new(AdmissionConfig {
+            max_queue_depth: 4,
+            ..fleet_config(1, 10)
+        }));
+        let held = controller
+            .acquire_subject("holder", AdmissionSubject::new(scope, Uuid::now_v7()), false, QueryPriority::Interactive)
+            .await
+            .expect("first slot");
+        let mut waiting = Vec::new();
+        for index in 0..agent_class_limit(4) {
+            let spawned = Arc::clone(&controller);
+            waiting.push(tokio::spawn(with_query_class(QueryClass::Agent, async move {
+                spawned
+                    .acquire_subject(&format!("agent{index}"), AdmissionSubject::new(scope, Uuid::now_v7()), false, QueryPriority::Interactive)
+                    .await
+            })));
+            wait_for_depth(&controller, index + 1).await;
+        }
+        let over = with_query_class(
+            QueryClass::Agent,
+            controller.acquire_subject("agent-over", AdmissionSubject::new(scope, Uuid::now_v7()), false, QueryPriority::Interactive),
+        )
+        .await;
+        assert!(matches!(over, Err(AdmissionError::QueueFull { .. })), "agents stop at their share of the queue");
+        let human = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move {
+                controller
+                    .acquire_subject("human", AdmissionSubject::new(scope, Uuid::now_v7()), false, QueryPriority::Interactive)
+                    .await
+            })
+        };
+        wait_for_depth(&controller, agent_class_limit(4) + 1).await;
+
+        // Free the slot: a fail-fast agent must not take it past the human.
+        drop(held);
+        let barge = with_query_class(
+            QueryClass::Agent,
+            with_wait_budget(
+                std::time::Duration::ZERO,
+                controller.acquire_subject("agent-fail-fast", AdmissionSubject::new(scope, Uuid::now_v7()), false, QueryPriority::Interactive),
+            ),
+        )
+        .await;
+        assert!(barge.is_err(), "a fail-fast agent never barges past a waiting human");
+        controller.drain_queue().await;
+        let human = tokio::time::timeout(std::time::Duration::from_secs(5), human)
+            .await
+            .expect("the human is served first")
+            .expect("join")
+            .expect("human admitted");
+        drop(human);
+        for waiter in waiting {
+            waiter.abort();
+        }
+    }
+
+    /// NAN-4703: with Redis admission configured but not connected, an
+    /// agent-class search fails closed (the local ledger counts one replica
+    /// only), while a human search keeps the local fallback.
+    #[tokio::test]
+    async fn agents_fail_closed_without_configured_redis_humans_do_not() {
+        let controller = AdmissionController::new(fleet_config(4, 10));
+        controller.expect_redis();
+        let scope = SearchTenantScope::Dedicated;
+        let agent = with_query_class(
+            QueryClass::Agent,
+            controller.acquire_for_scope("agent", scope, Uuid::now_v7(), QueryPriority::Interactive),
+        )
+        .await;
+        assert!(matches!(agent, Err(AdmissionError::Unavailable)), "agent fails closed");
+        let human = controller
+            .acquire_for_scope("human", scope, Uuid::now_v7(), QueryPriority::Interactive)
+            .await;
+        assert!(human.is_ok(), "a human keeps the local fallback");
+    }
+
+    /// NAN-4703: an agent permit's ledger counts return to zero on every
+    /// exit: a normal drop, a cancelled holder task and a panicking one.
+    #[tokio::test]
+    async fn agent_ledger_counts_return_to_zero_on_every_exit() {
+        let controller = Arc::new(AdmissionController::new(AdmissionConfig {
+            shared_tenant_adhoc_limit: 4,
+            ..fleet_config(8, 10)
+        }));
+        let tenant = Uuid::from_u128(0x4703);
+        let scope = SearchTenantScope::EnterpriseShared(tenant);
+        let acquire = move |controller: Arc<AdmissionController>| async move {
+            with_query_class(QueryClass::Agent, controller.acquire_subject("agent", AdmissionSubject::new(scope, Uuid::now_v7()), false, QueryPriority::Interactive))
+                .await
+                .expect("agent admitted")
+        };
+        let dropped = acquire(Arc::clone(&controller)).await;
+        let cancelled = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move {
+                let _permit = acquire(controller).await;
+                std::future::pending::<()>().await;
+            })
+        };
+        let panicked = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move {
+                let _permit = acquire(controller).await;
+                panic!("search task panicked holding its permit");
+            })
+        };
+        assert!(panicked.await.is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while lock_ledger(&controller.ledger).agent_count(&None) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled holder still holds its permit");
+        cancelled.abort();
+        let _ = cancelled.await;
+        drop(dropped);
+        let ledger = lock_ledger(&controller.ledger);
+        assert_eq!((ledger.agent_count(&None), ledger.agent_count(&Some(tenant)), ledger.active()), (0, 0, 0));
     }
 }

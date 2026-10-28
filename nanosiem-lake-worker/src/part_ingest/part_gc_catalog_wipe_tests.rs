@@ -4,7 +4,9 @@
 //! The large tenant's first GC pass afterwards failed every Worker `prepare` with a bare
 //! `No such file or directory (os error 2)`: the guard read the absent
 //! `planned-index-ready` marker, and the executor reported it as
-//! `worker_unavailable`. Production constructors only: `new_guarded` via
+//! `worker_unavailable`. Since the 10-26 decision part GC is never gated on
+//! the agent catalog: the same wipe degrades the agent lane (reads closed)
+//! and GC proceeds. Production constructors only: `new_guarded` via
 //! `fixture`, `TenantCatalog::new`, and the `Seams` prepare/retire path.
 use super::*;
 use crate::lake_part_gc::{CatalogCustodyHeld, LakePartDeletePermit};
@@ -38,7 +40,7 @@ fn seams(f: &Fixture) -> Seams {
 }
 
 #[tokio::test]
-async fn wiped_custody_volume_fails_closed_with_a_custody_reason_until_a_reconciled_sync() {
+async fn wiped_custody_volume_never_holds_gc_and_degrades_the_agent_lane_until_a_reconciled_sync() {
     let f = fixture(1, Duration::ZERO, 200).await;
     let local = tempfile::tempdir().unwrap();
     let source = Arc::new(LocalObjectStore::new(local.path().join("parts")).unwrap());
@@ -63,27 +65,30 @@ async fn wiped_custody_volume_fails_closed_with_a_custody_reason_until_a_reconci
     // After the roll: the cell attaches custody on the empty volume.
     let catalog = Arc::new(TenantCatalog::new(TENANT_UUID, custody.clone(), backend.clone()).unwrap());
     f.gc.attach_catalog(catalog.clone()).unwrap();
-    let checks = backend.checks.load(Ordering::SeqCst);
     let permit = permit();
+    // Decision 10-26: part GC is never gated on the agent catalog. On the
+    // wiped volume (no planned index) the agent lane degrades instead: reads
+    // close, durably, and the request reaches the Worker on both seams.
     for retire in [false, true] {
         let seams = seams(&f);
         let error = if retire { seams.retire(&permit).await.unwrap_err() } else { seams.prepare(&permit).await.unwrap_err() };
         let text = format!("{error:#}");
-        assert!(error.downcast_ref::<CatalogCustodyHeld>().is_some(), "typed custody refusal: {text}");
-        assert!(text.contains("planned index not initialized"), "{text}");
-        assert!(!text.contains("os error"), "no bare local IO error: {text}");
-        assert!(!text.contains("retention authority"), "the Worker must not be called: {text}");
+        assert!(error.downcast_ref::<CatalogCustodyHeld>().is_none(), "no custody hold: {text}");
+        assert!(text.contains("retention authority"), "the Worker is reached: {text}");
     }
-    assert!(catalog.require_removed(TENANT_UUID, part).is_err(), "no receipt minted from a wiped index");
-    assert_eq!(backend.checks.load(Ordering::SeqCst), checks, "an empty local index is never trusted");
+    let receipt = catalog.require_removed(TENANT_UUID, part).unwrap();
+    assert_eq!(receipt.manifest_sha256,
+        crate::part_ingest::iceberg_export::lifecycle::degraded_receipt_sha256(TENANT_UUID, part));
+    assert!(backend.blocked.load(Ordering::SeqCst), "agent reads closed before the receipt");
+    assert!(custody.join("gc-degraded").exists() && custody.join("reads-closed").exists());
 
-    // The writer's next reconciled sync rebuilds the index from the catalog;
-    // only then does the guard pass and the request reach the Worker.
+    // The writer's next reconciled sync rebuilds the index from the catalog
+    // (tolerating the vanished part) and only then reopens the lane.
     catalog.sync_parts(TENANT_UUID, vec![], chrono::Utc::now().timestamp_millis(), &policy).await.unwrap();
+    assert!(!backend.blocked.load(Ordering::SeqCst));
+    assert!(!custody.join("gc-degraded").exists());
     let error = seams(&f).prepare(&permit).await.unwrap_err();
-    assert!(error.downcast_ref::<CatalogCustodyHeld>().is_none(), "{error:#}");
     assert!(error.to_string().contains("retention authority"), "{error:#}");
-    catalog.require_removed(TENANT_UUID, part).unwrap();
 }
 
 /// A committed export (an empty delta: the fixture source has no sealed
@@ -131,7 +136,8 @@ async fn a_catalog_that_never_committed_never_blocks_gc() {
     assert_eq!(backend.commits.load(Ordering::SeqCst), 0);
     assert!(backend.trace.lock().unwrap().is_empty(), "{:?}", backend.trace.lock().unwrap());
 
-    // Unreachable catalog, nothing proven: the NAN-4612 fence holds.
+    // Unreachable catalog, nothing proven: GC still proceeds; the agent
+    // lane degrades (reads closed) instead of holding the delete.
     let local = tempfile::tempdir().unwrap();
     let f = fixture(1, Duration::ZERO, 200).await;
     let backend = basin(local.path()).await;
@@ -139,9 +145,12 @@ async fn a_catalog_that_never_committed_never_blocks_gc() {
     let catalog = Arc::new(TenantCatalog::new(TENANT_UUID, local.path().join("custody"), backend.clone()).unwrap());
     f.gc.attach_catalog(catalog.clone()).unwrap();
     let error = seams(&f).prepare(&permit).await.unwrap_err();
-    assert!(error.downcast_ref::<CatalogCustodyHeld>().is_some_and(|held| !held.part_pinned), "{error:#}");
-    assert!(format!("{error:#}").contains("planned index not initialized"), "{error:#}");
-    assert!(catalog.require_removed(TENANT_UUID, crate::lake_part_gc::request::tests::PART).is_err());
+    assert!(error.downcast_ref::<CatalogCustodyHeld>().is_none(), "{error:#}");
+    assert!(error.to_string().contains("retention authority"), "the Worker is reached: {error:#}");
+    let part = crate::lake_part_gc::request::tests::PART;
+    assert_eq!(catalog.require_removed(TENANT_UUID, part).unwrap().manifest_sha256,
+        crate::part_ingest::iceberg_export::lifecycle::degraded_receipt_sha256(TENANT_UUID, part));
+    assert!(backend.blocked.load(Ordering::SeqCst));
 }
 
 /// A corrupt / foreign marker is not "not initialized": it stays a refusal.

@@ -152,6 +152,9 @@ path = "src/bin/nano_parser_bundle_build.rs"
 
 # Hosted-shared RLS activation helper (NAN-3861): enterprise builds only.
 
+# NAN-4669: operator-invoked registry REINDEX / heap reclaim (dry run by default).
+
+
 
 
 

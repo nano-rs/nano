@@ -94,6 +94,19 @@ fn history(dir: &std::path::Path) {
     )
     .unwrap();
 }
+const C: &str = "0000000000003-cccccccccccccccc";
+/// Part GC is never gated on the agent catalog: what used to be a custody
+/// hold is a receipt minted with the agent lane degraded (reads closed,
+/// durably marked, until a converged sync).
+fn assert_degraded(dir: &std::path::Path, backend: &Backend, receipt: Result<CatalogRemovedReceipt>, part: &str) {
+    let receipt = receipt.unwrap_or_else(|e| panic!("GC never waits on the catalog: {e:#}"));
+    assert_eq!(receipt.manifest_sha256, super::degraded_receipt_sha256(TENANT, part), "{part}: degraded receipt");
+    assert!(dir.join(GC_DEGRADED).exists() && dir.join("reads-closed").exists(), "marked before the receipt");
+    assert!(backend.blocked.load(Ordering::SeqCst), "agent reads closed");
+}
+fn assert_strict(receipt: &CatalogRemovedReceipt, part: &str) {
+    assert_ne!(receipt.manifest_sha256, super::degraded_receipt_sha256(TENANT, part), "{part}: strict proof");
+}
 async fn sync(catalog: &TenantCatalog, now: i64) {
     catalog
         .sync_parts(TENANT, vec![], now, &MergePolicy::default())
@@ -105,21 +118,18 @@ async fn never_planned_receipts_are_local_durable_and_tenant_bound() {
     let dir = tempfile::tempdir().unwrap();
     let backend = Arc::new(Backend::default());
     let catalog = TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap();
-    assert!(
-        catalog.fence_retirement(TENANT, A).await.is_err(),
-        "missing custody must fail closed"
-    );
+    // Missing custody no longer holds GC: the lane degrades instead.
+    assert_degraded(dir.path(), &backend, catalog.fence_retirement(TENANT, A).await, A);
     backend.fail_cache.store(true, Ordering::SeqCst);
     assert!(catalog
         .sync_parts(TENANT, vec![], 9, &MergePolicy::default())
         .await
         .is_err());
-    assert!(
-        catalog.fence_retirement(TENANT, A).await.is_err(),
-        "failed initialization cannot mint local receipts"
-    );
+    assert_degraded(dir.path(), &backend, catalog.fence_retirement(TENANT, C).await, C);
     backend.fail_cache.store(false, Ordering::SeqCst);
     sync(&catalog, 10).await;
+    assert!(!backend.blocked.load(Ordering::SeqCst), "a converged sync reopens the lane");
+    assert!(!dir.path().join(GC_DEGRADED).exists());
     backend.trace.lock().unwrap().clear();
     backend.fail_cache.store(true, Ordering::SeqCst);
     for i in 1..=128 {
@@ -168,7 +178,8 @@ async fn one_pinned_part_does_not_poison_the_pass() {
     history(dir.path());
     let backend = Arc::new(Backend::default());
     let catalog = TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap();
-    sync(&catalog, 10).await;
+    // A is LIVE (the writer's latest sync) and referenced: held per key.
+    sync_live(&catalog, A, 10).await;
     backend.pinned.lock().unwrap().insert(A.into());
     let pass = CatalogGcPass::default();
     for _ in 0..2 {
@@ -179,8 +190,29 @@ async fn one_pinned_part_does_not_poison_the_pass() {
         );
     }
     assert!(catalog.require_removed(TENANT, A).is_err());
-    catalog.fence_in_pass(TENANT, B, &pass).await.unwrap();
+    assert_strict(&catalog.fence_in_pass(TENANT, B, &pass).await.unwrap(), B);
     catalog.require_removed(TENANT, B).unwrap();
+}
+/// Decoupled GC: a part the catalog still references but the writer no
+/// longer holds live (merged away, erased) is receipted with the lane
+/// degraded; the pass's strict proof for the next part is untouched.
+#[tokio::test]
+async fn a_referenced_part_that_is_not_live_degrades_the_lane_and_never_holds_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    history(dir.path());
+    let backend = Arc::new(Backend::default());
+    let catalog = TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap();
+    sync(&catalog, 10).await;
+    backend.pinned.lock().unwrap().insert(A.into());
+    let pass = CatalogGcPass::default();
+    assert_degraded(dir.path(), &backend, catalog.fence_in_pass(TENANT, A, &pass).await, A);
+    // B's strict proof stands, but it never reopens a degraded lane.
+    assert_strict(&catalog.fence_in_pass(TENANT, B, &pass).await.unwrap(), B);
+    assert!(backend.blocked.load(Ordering::SeqCst), "the lane stays closed until a converged sync");
+    backend.pinned.lock().unwrap().clear(); // the next sync removed A
+    sync(&catalog, 11).await;
+    assert!(!backend.blocked.load(Ordering::SeqCst));
+    assert!(!dir.path().join(GC_DEGRADED).exists());
 }
 /// NAN-4636: a refused, pinned fence never drops the reader result cache;
 /// the first part that can actually be retired invalidates it, once per pass.
@@ -190,7 +222,7 @@ async fn pinned_refusals_keep_the_result_cache_until_a_part_retires() {
     history(dir.path());
     let backend = Arc::new(Backend::default());
     let catalog = TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap();
-    sync(&catalog, 10).await;
+    sync_live(&catalog, A, 10).await;
     backend.pinned.lock().unwrap().insert(A.into());
     backend.trace.lock().unwrap().clear();
     let pass = CatalogGcPass::default();
@@ -227,18 +259,13 @@ async fn batch_evidence_is_rejected_after_a_writer_sync() {
     let dir = tempfile::tempdir().unwrap();
     history(dir.path());
     let backend = Arc::new(Backend::default());
-    let catalog = TenantCatalog::new(TENANT, dir.path().into(), backend).unwrap();
+    let catalog = TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap();
     sync(&catalog, 10).await;
     let pass = CatalogGcPass::default();
-    catalog.fence_in_pass(TENANT, A, &pass).await.unwrap();
+    assert_strict(&catalog.fence_in_pass(TENANT, A, &pass).await.unwrap(), A);
     sync(&catalog, 3_600_010).await;
-    assert!(catalog
-        .fence_in_pass(TENANT, B, &pass)
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("changed during GC pass"));
-    assert!(catalog.require_removed(TENANT, B).is_err());
+    // The pass's proof is stale: never reused, and never a GC hold.
+    assert_degraded(dir.path(), &backend, catalog.fence_in_pass(TENANT, B, &pass).await, B);
     catalog
         .fence_in_pass(TENANT, B, &CatalogGcPass::default())
         .await
@@ -253,13 +280,13 @@ async fn closed_barrier_retries_immediately_and_hourly_sync_never_drains_readers
     sync(&catalog, 10).await;
     backend.fail_cache.store(true, Ordering::SeqCst);
     let pass = CatalogGcPass::default();
-    assert!(catalog.fence_in_pass(TENANT, A, &pass).await.is_err());
+    assert_degraded(dir.path(), &backend, catalog.fence_in_pass(TENANT, A, &pass).await, A);
     let calls = backend.trace.lock().unwrap().len();
-    assert!(catalog.fence_in_pass(TENANT, B, &pass).await.is_err());
+    assert_degraded(dir.path(), &backend, catalog.fence_in_pass(TENANT, B, &pass).await, B);
     assert_eq!(
         backend.trace.lock().unwrap().len(),
         calls,
-        "failed inspection is also once per pass"
+        "failed invalidation and the degraded close are once per pass"
     );
     assert!(backend.blocked.load(Ordering::SeqCst));
     backend.fail_cache.store(false, Ordering::SeqCst);
@@ -271,7 +298,7 @@ async fn closed_barrier_retries_immediately_and_hourly_sync_never_drains_readers
     );
     assert!(!backend.blocked.load(Ordering::SeqCst));
     backend.fail_cache.store(true, Ordering::SeqCst);
-    assert!(catalog.fence_retirement(TENANT, A).await.is_err());
+    catalog.fence_retirement(TENANT, A).await.unwrap(); // receipted: idempotent
     drop(catalog);
     backend.fail_cache.store(false, Ordering::SeqCst);
     let catalog = TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap();
@@ -291,20 +318,11 @@ async fn timed_out_inspection_is_not_restarted_for_each_part_in_a_pass() {
     sync(&catalog, 10).await;
     backend.stall_inspection.store(true, Ordering::SeqCst);
     let pass = CatalogGcPass::default();
-    assert!(catalog
-        .fence_in_pass(TENANT, A, &pass)
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("timed out"));
+    // A hung inspection is bounded inside the fence: the lane degrades.
+    assert_degraded(dir.path(), &backend, catalog.fence_in_pass(TENANT, A, &pass).await, A);
     let count = backend.trace.lock().unwrap().len();
-    assert!(catalog
-        .fence_in_pass(TENANT, B, &pass)
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("canceled"));
-    assert_eq!(backend.trace.lock().unwrap().len(), count);
+    assert_degraded(dir.path(), &backend, catalog.fence_in_pass(TENANT, B, &pass).await, B);
+    assert_eq!(backend.trace.lock().unwrap().len(), count, "never restarted in the pass");
     assert!(backend.blocked.load(Ordering::SeqCst));
     backend.stall_inspection.store(false, Ordering::SeqCst);
     sync(&catalog, 11).await;
@@ -313,6 +331,7 @@ async fn timed_out_inspection_is_not_restarted_for_each_part_in_a_pass() {
         .fence_in_pass(TENANT, B, &CatalogGcPass::default())
         .await
         .unwrap();
+    assert!(!dir.path().join(GC_DEGRADED).exists());
 }
 
 /// NAN-4662 fixtures: an hour part the writer plans (sealed long ago).
@@ -333,6 +352,37 @@ fn hour_part(id: &str) -> PartRef {
         row_groups: 1,
         data_files: 1,
     }
+}
+async fn sync_live(catalog: &TenantCatalog, part: &str, now: i64) {
+    catalog
+        .sync_parts(TENANT, vec![hour_part(part)], now, &MergePolicy::default())
+        .await
+        .unwrap();
+}
+/// Decoupled GC: a sync drops receipted parts from its live set. An
+/// unreadable receipt store is an error, never "receipted": it must not
+/// silently drop live parts from the agent catalog.
+#[tokio::test]
+async fn an_unreadable_receipt_store_fails_the_sync_instead_of_dropping_live_parts() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(Backend::default());
+    let catalog = TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap();
+    sync_live(&catalog, A, 10).await;
+    let receipts = dir.path().join("catalog-removed");
+    std::fs::create_dir_all(&receipts).unwrap();
+    std::fs::set_permissions(&receipts, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if receipts.join(format!("{A}.json")).try_exists().is_ok() {
+        // Privileged runner: permissions are not enforced.
+        std::fs::set_permissions(&receipts, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let result = catalog.sync_parts(TENANT, vec![hour_part(A)], 3_600_011, &MergePolicy::default()).await;
+    std::fs::set_permissions(&receipts, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Treating the unreadable store as "receipted" would sync an empty live
+    // set and succeed; the sync must fail on the store itself instead.
+    let error = result.expect_err("an unreadable receipt store never drops a live part");
+    assert!(format!("{error:#}").contains("ermission denied"), "{error:#}");
 }
 fn reads(backend: &Backend) -> usize {
     backend.commit_state_reads.load(Ordering::SeqCst)
@@ -358,11 +408,13 @@ async fn uncommitted_catalog_plan_holds_only_the_parts_it_names() {
     assert_eq!(catalog.pending().unwrap().len(), 1, "the plan stays pending");
     backend.trace.lock().unwrap().clear();
     let pass = CatalogGcPass::default();
+    // A is live (the failing sync's live set) and a pending plan names it:
+    // held per key as live, never receipted.
     for _ in 0..2 {
         let error = catalog.fence_in_pass(TENANT, A, &pass).await.unwrap_err();
-        assert!(error.downcast_ref::<CatalogPartUnproven>().is_some(), "{error:#}");
+        assert!(error.downcast_ref::<CatalogPinsPart>().is_some(), "{error:#}");
     }
-    assert!(catalog.require_removed(TENANT, A).is_err(), "a pending-plan part is never receipted");
+    assert!(catalog.require_removed(TENANT, A).is_err(), "a live part is never receipted");
     catalog.fence_in_pass(TENANT, B, &pass).await.unwrap();
     catalog.require_removed(TENANT, B).unwrap();
     assert_eq!(reads(&backend), 1, "one commit-state read per generation");
@@ -381,38 +433,34 @@ async fn uncommitted_catalog_plan_holds_only_the_parts_it_names() {
     catalog.fence_in_pass(TENANT, c, &pass).await.unwrap();
     catalog.require_removed(TENANT, c).unwrap();
     assert_eq!(reads(&backend), 2);
-    assert!(catalog.fence_in_pass(TENANT, A, &pass).await.unwrap_err().downcast_ref::<CatalogPartUnproven>().is_some());
+    assert!(catalog.fence_in_pass(TENANT, A, &pass).await.unwrap_err().downcast_ref::<CatalogPinsPart>().is_some());
 }
 
-/// NAN-4662: an unreadable catalog proves nothing; a committed table keeps
-/// the full NAN-4612 fence (no marker: held, pass-wide).
+/// NAN-4662: an unreadable catalog proves nothing; a committed table with
+/// no planned index cannot clear a part. Decoupled GC: the lane degrades.
 #[tokio::test]
 async fn committed_or_unreadable_catalog_keeps_the_fence() {
     let dir = tempfile::tempdir().unwrap();
     let backend = Arc::new(Backend::default());
     let catalog = TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap();
-    for (never_committed, unreadable) in [(false, false), (true, true)] {
+    // Nothing proven (committed, or unreadable) and no planned index: the
+    // lane degrades; GC is never held waiting for the first sync.
+    for (part, never_committed, unreadable) in [(A, false, false), (B, true, true)] {
         backend.never_committed.store(never_committed, Ordering::SeqCst);
         backend.fail_commit_state.store(unreadable, Ordering::SeqCst);
-        let error = catalog
-            .fence_in_pass(TENANT, B, &CatalogGcPass::default())
-            .await
-            .unwrap_err();
-        assert!(error.downcast_ref::<CatalogPartUnproven>().is_none(), "{error:#}");
-        assert!(format!("{error:#}").contains("planned index not initialized"), "{error:#}");
-        assert!(catalog.require_removed(TENANT, B).is_err());
+        assert_degraded(dir.path(), &backend, catalog.fence_in_pass(TENANT, part, &CatalogGcPass::default()).await, part);
     }
     assert_eq!(reads(&backend), 2);
     backend.fail_commit_state.store(false, Ordering::SeqCst);
-    catalog.fence_in_pass(TENANT, B, &CatalogGcPass::default()).await.unwrap();
+    // Proven uncommitted: a strict receipt.
+    assert_strict(&catalog.fence_in_pass(TENANT, C, &CatalogGcPass::default()).await.unwrap(), C);
     // An acknowledged plan on this volume: the catalog is not even asked.
     let dir = tempfile::tempdir().unwrap();
     history(dir.path());
     let backend = Arc::new(Backend::default());
     backend.never_committed.store(true, Ordering::SeqCst);
     let catalog = TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap();
-    let error = catalog.fence_in_pass(TENANT, "0000000000003-cccccccccccccccc", &CatalogGcPass::default()).await.unwrap_err();
-    assert!(format!("{error:#}").contains("planned index not initialized"), "{error:#}");
+    assert_degraded(dir.path(), &backend, catalog.fence_in_pass(TENANT, C, &CatalogGcPass::default()).await, C);
     assert_eq!(reads(&backend), 0);
 }
 
@@ -436,15 +484,15 @@ async fn a_plan_recorded_after_the_commit_state_read_holds_its_parts() {
         .is_err());
     assert_eq!(catalog.pending().unwrap().len(), 1, "the plan naming A is on disk");
     let error = catalog.fence_in_pass(TENANT, A, &pass).await.unwrap_err();
-    assert!(error.downcast_ref::<CatalogPartUnproven>().is_some(), "{error:#}");
-    assert!(catalog.require_removed(TENANT, A).is_err(), "a part a later plan names is never receipted");
+    assert!(error.downcast_ref::<CatalogPinsPart>().is_some(), "{error:#}");
+    assert!(catalog.require_removed(TENANT, A).is_err(), "a live part a later plan names is never receipted");
     assert_eq!(reads(&backend), 2, "the sync forced a fresh read");
     catalog.fence_in_pass(TENANT, "0000000000003-cccccccccccccccc", &pass).await.unwrap();
 }
 
-/// NAN-4662: on a committed table a failed inspection holds every planned
-/// part (per key, never receipted) and asks no commit-state question; only
-/// never-planned parts, cleared by the reconciled planned index, proceed.
+/// NAN-4662: on a committed table a failed inspection proves nothing for a
+/// planned part and asks no commit-state question. Decoupled GC: each such
+/// part degrades the lane; never-planned parts keep their strict receipt.
 #[tokio::test]
 async fn a_failed_inspection_on_a_committed_table_holds_every_planned_part() {
     let dir = tempfile::tempdir().unwrap();
@@ -455,11 +503,10 @@ async fn a_failed_inspection_on_a_committed_table_holds_every_planned_part() {
     sync(&catalog, 10).await;
     backend.fail_inspection.store(true, Ordering::SeqCst);
     let pass = CatalogGcPass::default();
+    // Decoupled GC: planned, not live, unprovable: the lane degrades.
     for part in [A, B] {
-        let error = catalog.fence_in_pass(TENANT, part, &pass).await.unwrap_err();
-        assert!(error.downcast_ref::<CatalogPartUnproven>().is_some(), "{error:#}");
-        assert!(catalog.require_removed(TENANT, part).is_err(), "a planned part is never receipted");
+        assert_degraded(dir.path(), &backend, catalog.fence_in_pass(TENANT, part, &pass).await, part);
     }
-    catalog.fence_in_pass(TENANT, "0000000000003-cccccccccccccccc", &pass).await.unwrap();
+    assert_strict(&catalog.fence_in_pass(TENANT, C, &pass).await.unwrap(), C);
     assert_eq!(reads(&backend), 0, "an acknowledged plan vetoes the commit-state read");
 }

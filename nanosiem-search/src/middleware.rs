@@ -165,6 +165,10 @@ pub struct AuthContext {
     /// Long-lived/result-delivery paths re-read and compare every dimension
     /// before releasing additional tenant data.
     pub shared_request_authority: Option<SharedSearchRequestAuthority>,
+    /// NAN-4703: the credential is an agent's (a desktop-minted agent key),
+    /// so every search it runs admits in the agent class whatever its
+    /// `x-nano-query-class` header says.
+    pub agent_credential: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +237,7 @@ impl AuthContext {
             shared_search_entitlement_revision: None,
             shared_prevalence_entitled: false,
             shared_request_authority: None,
+            agent_credential: false,
         }
     }
 
@@ -260,6 +265,7 @@ impl AuthContext {
             shared_search_entitlement_revision: None,
             shared_prevalence_entitled: false,
             shared_request_authority: None,
+            agent_credential: nanosiem_core::search::admission::is_agent_api_key_name(&info.name),
         }
     }
 
@@ -1075,7 +1081,8 @@ pub async fn product_view_memory_middleware(request: Request, next: Next) -> Res
 /// caller's `x-nano-admission-wait-ms` (agents and API callers opt into a
 /// longer wait, `0` fails fast), else
 /// [`nanosiem_core::search::admission::DEFAULT_ADMISSION_WAIT`]. Admission
-/// caps it at the configured `queue_timeout_ms`.
+/// caps it at the configured `queue_timeout_ms`. NAN-4703: it also sets the
+/// request's query class from `x-nano-query-class`.
 pub async fn admission_wait_budget_middleware(request: Request, next: Next) -> Response {
     let headers = request.headers();
     let header = headers
@@ -1093,7 +1100,25 @@ pub async fn admission_wait_budget_middleware(request: Request, next: Next) -> R
     } else {
         nanosiem_core::search::admission::request_wait_budget(header)
     };
-    nanosiem_core::search::admission::with_wait_budget(budget, next.run(request)).await
+    // NAN-4703: an agent's leftover cell query admits in the agent class:
+    // capped below its tenant's human share and served last. An agent
+    // credential (from auth, which runs first) is always the agent class;
+    // the header can only lower another caller's class, never raise one.
+    let agent_credential = request
+        .extensions()
+        .get::<AuthContext>()
+        .is_some_and(|auth| auth.agent_credential);
+    let class = nanosiem_core::search::admission::resolve_query_class(
+        agent_credential,
+        headers
+            .get(nanosiem_core::search::admission::QUERY_CLASS_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    );
+    nanosiem_core::search::admission::with_wait_budget(
+        budget,
+        nanosiem_core::search::admission::with_query_class(class, next.run(request)),
+    )
+    .await
 }
 
 // ============================================================================
@@ -1199,6 +1224,80 @@ mod tests {
         let peer = "203.0.113.5:1234".parse::<SocketAddr>().unwrap();
         let request = Request::builder().body(axum::body::Body::empty()).unwrap();
         assert_eq!(extract_ip_address(&request, Some(&peer)).as_deref(), Some("203.0.113.5"));
+    }
+
+    /// NAN-4703: the production admission middleware (as `lib.rs` layers
+    /// it) sets the request's query class from `x-nano-query-class`:
+    /// `agent` only, anything else is a human search.
+    #[tokio::test]
+    async fn admission_middleware_sets_the_query_class_from_the_header() {
+        use axum::{body::Body, middleware, routing::post, Router};
+        use tower::ServiceExt;
+
+        async fn report() -> &'static str {
+            nanosiem_core::search::admission::current_query_class().label()
+        }
+        let app = Router::new()
+            .route("/api/search", post(report))
+            .layer(middleware::from_fn(admission_wait_budget_middleware));
+        for (header, expected) in [(Some("agent"), "agent"), (Some("AGENT"), "agent"), (Some("human"), "human"), (Some("robot"), "human"), (None, "human")] {
+            let mut request = Request::builder().method("POST").uri("/api/search");
+            if let Some(value) = header {
+                request = request.header(nanosiem_core::search::admission::QUERY_CLASS_HEADER, value);
+            }
+            let response = app.clone().oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1 << 10).await.unwrap();
+            assert_eq!(std::str::from_utf8(&body).unwrap(), expected, "{header:?}");
+        }
+
+        // An agent credential (a desktop-minted key, as the production
+        // `AuthContext::from_api_key` builds it ahead of this middleware) is
+        // the agent class with no header and when its header claims human.
+        let key = |name: &str| ApiKeyInfo {
+            id: Uuid::now_v7(),
+            name: name.to_string(),
+            permissions: vec!["search:execute".to_string()],
+            user_id: Some(Uuid::now_v7()),
+        };
+        for (name, header, expected) in [
+            ("nano Desktop \u{2014} agent tools (mbp)", None, "agent"),
+            ("nano Desktop \u{2014} hunt sweep (mbp)", Some("human"), "agent"),
+            ("nano Desktop \u{2014} recon (mbp)", Some("agent"), "agent"),
+            ("ci export", None, "human"),
+            ("ci export", Some("agent"), "agent"),
+        ] {
+            let context = AuthContext::from_api_key(&key(name));
+            let app = Router::new()
+                .route("/api/search", post(report))
+                .layer(middleware::from_fn(admission_wait_budget_middleware))
+                .layer(middleware::from_fn(move |mut request: Request, next: Next| {
+                    let context = context.clone();
+                    async move {
+                        request.extensions_mut().insert(context);
+                        next.run(request).await
+                    }
+                }));
+            let mut request = Request::builder().method("POST").uri("/api/search");
+            if let Some(value) = header {
+                request = request.header(nanosiem_core::search::admission::QUERY_CLASS_HEADER, value);
+            }
+            let response = app.oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1 << 10).await.unwrap();
+            assert_eq!(std::str::from_utf8(&body).unwrap(), expected, "{name} {header:?}");
+        }
+        // A session (JWT) is never an agent credential.
+        assert!(!AuthContext::from_jwt(TokenClaims {
+            iss: "t".into(),
+            aud: "t".into(),
+            sub: Uuid::now_v7(),
+            roles: vec![],
+            permissions: vec![],
+            exp: i64::MAX,
+            iat: 0,
+            jti: Uuid::now_v7(),
+            purpose: "access".into(),
+        })
+        .agent_credential);
     }
 
     /// NAN-3282: product-view routes run under their own view-memory ledger

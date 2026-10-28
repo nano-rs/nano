@@ -19,7 +19,7 @@ use crate::parts::{event_hour_of, DedupWindow};
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const TENANT: &str = "00000000-0000-4000-8000-0000000000fa";
 /// 2026-09-26T18:00:00Z
@@ -31,6 +31,9 @@ struct GatedStore {
     pattern: std::sync::Mutex<Option<String>>,
     open: tokio::sync::watch::Sender<bool>,
     blocked_gets: AtomicUsize,
+    /// How long registering an object with the writer authority takes.
+    register_ms: AtomicU64,
+    registered: AtomicUsize,
 }
 
 impl GatedStore {
@@ -58,6 +61,11 @@ impl ObjectStore for GatedStore {
     }
     async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> anyhow::Result<bool> {
         self.inner.put_if_absent(key, bytes).await
+    }
+    async fn register_existing_with(&self, _key: &str, _sha256_hex: &str, _bytes: u64, _hints: &WriteHints) -> anyhow::Result<bool> {
+        tokio::time::sleep(Duration::from_millis(self.register_ms.load(Ordering::SeqCst))).await;
+        self.registered.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
     }
     async fn put_if_absent_with(&self, key: &str, bytes: &[u8], hints: &WriteHints) -> anyhow::Result<bool> {
         self.inner.put_if_absent_with(key, bytes, hints).await
@@ -98,6 +106,8 @@ async fn fixture() -> Fixture {
         pattern: std::sync::Mutex::new(None),
         open: tokio::sync::watch::channel(true).0,
         blocked_gets: AtomicUsize::new(0),
+        register_ms: AtomicU64::new(0),
+        registered: AtomicUsize::new(0),
     });
     std::fs::create_dir_all(root.join("sources/bronze")).unwrap();
     let sources = leak(LocalObjectStore::new(root.join("sources")).unwrap());
@@ -305,4 +315,113 @@ async fn a_slow_replay_proof_runs_without_the_lock_and_finishes_for_the_retry() 
     assert_eq!(live_parts(&fx).await, 1);
     let replay = gate.append(gate.admit().unwrap(), &fx.ingestor, &fx.context, copy(&fx.request), || T0_US / 1000).await.unwrap();
     assert_eq!(replay, response, "a later retry is a replay, not a second Add");
+}
+
+/// NAN-4700 (FP ops, 2026-10-27): registering the finding parts with the
+/// writer authority (a 503-ing owner, one round trip per object) outlived
+/// the gate deadline and detect's own. Ingest then refused the commit,
+/// threw the registration away, and the next pass registered new parts
+/// from scratch: no finding landed for hours. Once registered, the append
+/// commits; the requester's retry is a replay of that `Add`, never a second
+/// one. A requester already gone before the registration is still refused
+/// without a write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_slower_than_every_deadline_still_commits_once() {
+    let fx = fixture().await;
+    let gate = gate(4, 300);
+    // Fixture time (its part ids are dated T0) advancing with the wall clock.
+    let base = Instant::now();
+    let clock = move || T0_US / 1000 + base.elapsed().as_millis() as i64;
+
+    // Gone before the registration: refused, nothing registered or written.
+    let mut gone = copy(&fx.request);
+    gone.deadline_unix_ms = Some(clock() - 1);
+    let error = gate.append(gate.admit().unwrap(), &fx.ingestor, &fx.context, gone, clock).await
+        .expect_err("a requester that already gave up is refused");
+    assert!(matches!(error.downcast_ref::<FindingRefused>(), Some(FindingRefused::Deadline(_))), "{error:#}");
+    assert_eq!(fx.store.registered.load(Ordering::SeqCst), 0);
+    let marker = finding_attempt_key(TENANT, &fx.request.receipts[0]).unwrap();
+    assert!(fx.store.inner.get(&marker).await.unwrap().is_none());
+    let markers = crate::part_ingest::finding_attempts::batch_prefix(TENANT).unwrap();
+    assert!(fx.store.inner.list(&markers).await.unwrap().is_empty(), "no attempt marker for a refused requester");
+    assert_eq!(live_parts(&fx).await, 0);
+
+    // Waiting at the start, gone by the end of a registration that takes
+    // longer than both the gate deadline (300 ms) and the requester's.
+    fx.store.register_ms.store(500, Ordering::SeqCst);
+    let mut slow = copy(&fx.request);
+    slow.deadline_unix_ms = Some(clock() + 200);
+    let started = Instant::now();
+    // The ingest loop holds the ingestor from inside the registration to
+    // past its end (a tick phase), when the gate deadline is long gone.
+    let tick = async {
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let held = fx.ingestor.lock().await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        drop(held);
+    };
+    let append = gate.append(gate.admit().unwrap(), &fx.ingestor, &fx.context, slow, clock);
+    let (committed, ()) = tokio::join!(append, tick);
+    let committed = committed.expect("a registered append commits past every deadline");
+    assert!(started.elapsed() >= Duration::from_millis(700), "it waited for the tick phase");
+    assert!(fx.store.registered.load(Ordering::SeqCst) > 0);
+    assert_eq!(live_parts(&fx).await, 1);
+
+    // The requester never saw that ack: its retry (same receipts) is a
+    // replay of the one `Add`.
+    fx.store.register_ms.store(0, Ordering::SeqCst);
+    let mut retry = copy(&fx.request);
+    retry.deadline_unix_ms = Some(clock() + 45_000);
+    let replay = gate.append(gate.admit().unwrap(), &fx.ingestor, &fx.context, retry, clock).await.unwrap();
+    assert_eq!(replay, committed, "the retry acknowledges the landed Add");
+    assert_eq!(live_parts(&fx).await, 1, "no second Add");
+}
+
+/// NAN-4700 review: exactly once across the lost-ack paths a late commit
+/// opens. A retry that arrives WHILE the slow registration runs waits for
+/// it, is refused at its own gate deadline, and writes nothing; the append
+/// it waited on still commits once. A retry from a process with no warm
+/// caches (an ingest restart) proves the replay from the durable attempt
+/// marker and the floor the commit wrote, and appends no second `Add`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_during_or_after_a_late_commit_never_appends_twice() {
+    let fx = fixture().await;
+    let gate = gate(4, 300);
+    let base = Instant::now();
+    let clock = move || T0_US / 1000 + base.elapsed().as_millis() as i64;
+    let markers = crate::part_ingest::finding_attempts::batch_prefix(TENANT).unwrap();
+
+    fx.store.register_ms.store(700, Ordering::SeqCst);
+    let mut slow = copy(&fx.request);
+    slow.deadline_unix_ms = Some(clock() + 200);
+    let first = gate.append(gate.admit().unwrap(), &fx.ingestor, &fx.context, slow, clock);
+    let retry_during = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut retry = copy(&fx.request);
+        retry.deadline_unix_ms = Some(clock() + 45_000);
+        let refused = gate.append(gate.admit().unwrap(), &fx.ingestor, &fx.context, retry, clock).await;
+        // Refused while the first append still registers: nothing of its own.
+        assert!(fx.store.inner.list(&markers).await.unwrap().is_empty(), "no marker before the first commit");
+        assert_eq!(live_parts(&fx).await, 0);
+        refused
+    };
+    let (committed, refused) = tokio::join!(first, retry_during);
+    let committed = committed.expect("the registered append commits past every deadline");
+    let error = refused.expect_err("the retry is refused while the first append holds the gate");
+    assert!(matches!(error.downcast_ref::<FindingRefused>(), Some(FindingRefused::Deadline("waiting for the previous append"))), "{error:#}");
+    assert_eq!(live_parts(&fx).await, 1);
+    assert_eq!(fx.store.inner.list(&markers).await.unwrap().len(), 1, "one attempt marker for the one commit");
+
+    // An ingest restart: no warm attempt or floor caches, a new gate.
+    fx.store.register_ms.store(0, Ordering::SeqCst);
+    let cold = FindingAppendContext { attempts: Default::default(), floors: Default::default(), ..fx.context.clone() };
+    let restarted = FindingGate::new(FindingGateConfig { deadline: Duration::from_secs(45), ..FindingGateConfig::default() });
+    let mut retry = copy(&fx.request);
+    retry.deadline_unix_ms = Some(clock() + 45_000);
+    let registered = fx.store.registered.load(Ordering::SeqCst);
+    let replay = restarted.append(restarted.admit().unwrap(), &fx.ingestor, &cold, retry, clock).await.unwrap();
+    assert_eq!(replay, committed, "the cold retry acknowledges the landed Add from the log");
+    assert_eq!(live_parts(&fx).await, 1, "no second Add");
+    assert_eq!(fx.store.registered.load(Ordering::SeqCst), registered, "a replay registers nothing");
+    assert_eq!(fx.store.inner.list(&markers).await.unwrap().len(), 1, "a replay records no new intent");
 }

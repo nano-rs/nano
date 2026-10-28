@@ -88,6 +88,8 @@ harness() {
         # shellcheck disable=SC2034
         COMPOSE_FILE="docker-compose.opensource.yml"
         # shellcheck disable=SC2034
+        COMPOSE_ARGS=(-f "$COMPOSE_FILE")
+        # shellcheck disable=SC2034
         NANO_VERSION="${HARNESS_NANO_VERSION:-latest}"
         # shellcheck disable=SC2034
         NANO_REPO_URL="https://github.com/nano-rs/nano.git"

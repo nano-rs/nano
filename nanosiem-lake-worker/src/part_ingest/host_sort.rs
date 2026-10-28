@@ -91,6 +91,25 @@ pub fn host_strings(batch: &RecordBatch) -> Result<StringArray> {
     Ok((0..values.len()).map(|row| (!device.is_null(row) && !values.is_null(row)).then(|| values.value(row))).collect())
 }
 
+/// Writer properties of a local `(time, uid)` restore of `source`: cheap
+/// zstd, and the source footer's key-value metadata minus [`ROW_ORDER_KEY`]
+/// (the copy is time-ordered) and the Arrow schema (the writer adds its own).
+/// The rest must survive: NAN-4664's indicator marker is how a merge knows to
+/// drop the derived `nano_ioc_*` columns; without it every batch misses the
+/// merge schema and round-trips through JSON in `align` (NAN-4688).
+pub fn restore_properties(source: &parquet::file::metadata::FileMetaData) -> Result<parquet::file::properties::WriterProperties> {
+    let kept = source.key_value_metadata().map(|pairs| pairs.iter()
+        .filter(|pair| pair.key != ROW_ORDER_KEY && pair.key != "ARROW:schema").cloned().collect::<Vec<_>>())
+        .filter(|pairs| !pairs.is_empty());
+    Ok(parquet::file::properties::WriterProperties::builder()
+        // Local scratch only: the cheapest zstd keeps the copy near the
+        // signed file's size on disk.
+        .set_compression(parquet::basic::Compression::ZSTD(parquet::basic::ZstdLevel::try_new(1)?))
+        .set_max_row_group_row_count(Some(crate::parts::format::ROW_GROUP_ROWS))
+        .set_key_value_metadata(kept)
+        .build())
+}
+
 /// The value of `ROW_ORDER_KEY` in a Parquet file's footer, if any.
 pub fn file_row_order(path: &Path) -> Result<Option<String>> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -301,6 +320,7 @@ pub fn restore_time_order(work_dir: &Path, source: &Path, target: &Path, bucket_
     use parquet::arrow::{ArrowWriter, ProjectionMask};
     let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(source)?)?;
     let schema = builder.schema().clone();
+    let properties = restore_properties(builder.metadata().file_metadata())?;
     let time_leaf = (0..builder.parquet_schema().num_columns())
         .find(|i| builder.parquet_schema().column(*i).path().string() == "time")
         .context("host-sorted file has no time column")?;
@@ -323,12 +343,6 @@ pub fn restore_time_order(work_dir: &Path, source: &Path, target: &Path, bucket_
         }
     }
     drop(times);
-    let properties = parquet::file::properties::WriterProperties::builder()
-        // Local scratch only: the cheapest zstd keeps the copy near the
-        // signed file's size on disk.
-        .set_compression(parquet::basic::Compression::ZSTD(parquet::basic::ZstdLevel::try_new(1)?))
-        .set_max_row_group_row_count(Some(crate::parts::format::ROW_GROUP_ROWS))
-        .build();
     let mut writer = ArrowWriter::try_new(File::create(target)?, schema.clone(), Some(properties))?;
     let mut written = 0_u64;
     if !lower.is_empty() {

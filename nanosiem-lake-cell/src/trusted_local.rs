@@ -87,7 +87,11 @@ pub struct InitArgs {
     pub compiler: PathBuf,
     /// Memory for the cell's tenant processes; default half the host.
     pub memory_bytes: Option<u64>,
+    /// CPUs for the cell's tenant processes; default every online host CPU.
     pub cpus: Option<u32>,
+    /// NAN-4693: root that host facts are read from (`/proc/meminfo`,
+    /// `/sys/devices/system/cpu/online`); `/` in production, a fixture in tests.
+    pub host_root: PathBuf,
     /// `uid:gid` owning `app/` files (the app services' user).
     pub app_owner: Option<(u32, u32)>,
     pub require_landlock: bool,
@@ -115,6 +119,7 @@ impl Default for InitArgs {
             compiler: "/usr/local/bin/lake_query_compile".into(),
             memory_bytes: None,
             cpus: None,
+            host_root: "/".into(),
             app_owner: None,
             require_landlock: true,
         }
@@ -278,16 +283,46 @@ pub fn size(memory_bytes: u64, cpus: u32) -> Sizing {
     }
 }
 
-/// Memory the host (or the container's cgroup) offers.
-pub fn detect_memory() -> Result<u64> {
-    let cgroup = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()
-        .and_then(|v| v.trim().parse::<u64>().ok());
-    let meminfo = std::fs::read_to_string("/proc/meminfo")?;
-    let total = meminfo.lines()
+/// Host facts the cell is sized from (NAN-4693).
+///
+/// `init` runs in a one-shot container (`lean-init`), not in the lake-cell
+/// container it sizes, so its OWN cgroup (`memory.max`, `cpu.max`) says
+/// nothing about the cell's budget: a capped or small init container used to
+/// write a floor placement (2 GiB / 1 CPU -> eps 60, ~330 rows/s) for a cell
+/// on a large host. The cell's budget is the host's: `MemTotal` (the host,
+/// or the Docker Desktop VM) and the online CPU set. Neither honours the
+/// caller's cgroup limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostFacts {
+    pub memory_bytes: u64,
+    pub cpus: u32,
+}
+
+pub fn detect_host(root: &Path) -> Result<HostFacts> {
+    let meminfo_path = root.join("proc/meminfo");
+    let meminfo = std::fs::read_to_string(&meminfo_path).with_context(|| format!("read {}", meminfo_path.display()))?;
+    let memory_bytes = meminfo.lines()
         .find_map(|l| l.strip_prefix("MemTotal:"))
         .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
         .context("MemTotal missing from /proc/meminfo")? * 1024;
-    Ok(cgroup.map_or(total, |c| c.min(total)))
+    let cpus = std::fs::read_to_string(root.join("sys/devices/system/cpu/online")).ok()
+        .and_then(|v| count_cpu_list(v.trim()))
+        // No sysfs (unusual runtimes): fall back to the scheduler's view.
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1));
+    Ok(HostFacts { memory_bytes, cpus: cpus.clamp(1, 1024) })
+}
+
+/// Count a kernel CPU list such as `0-31` or `0,2-5,8`.
+fn count_cpu_list(list: &str) -> Option<u32> {
+    let mut n = 0_u32;
+    for part in list.split(',').filter(|p| !p.is_empty()) {
+        let span = match part.split_once('-') {
+            Some((a, b)) => b.parse::<u32>().ok()?.checked_sub(a.parse::<u32>().ok()?)?.checked_add(1)?,
+            None => { part.parse::<u32>().ok()?; 1 }
+        };
+        n = n.checked_add(span)?;
+    }
+    (n > 0).then_some(n)
 }
 
 fn random_bytes<const N: usize>() -> Result<[u8; N]> {
@@ -429,11 +464,14 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
         Some(sha) => sha.to_ascii_lowercase(),
         None => sha256_file(&args.chdb_library).context("hash the chDB library (pass --chdb-sha256 when it is not on this filesystem)")?,
     };
-    let memory = match args.memory_bytes { Some(m) => m, None => detect_memory()? / 2 };
-    let cpus = match args.cpus {
-        Some(c) => c,
-        None => std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1),
+    // NAN-4693: explicit flags win; otherwise host facts, never this
+    // (init) container's own cgroup limits.
+    let host = match (args.memory_bytes, args.cpus) {
+        (Some(_), Some(_)) => None,
+        _ => Some(detect_host(&args.host_root)?),
     };
+    let memory = args.memory_bytes.unwrap_or_else(|| host.map_or(0, |h| h.memory_bytes) / 2);
+    let cpus = args.cpus.unwrap_or_else(|| host.map_or(1, |h| h.cpus));
     let sizing = size(memory.max(2 * GIB), cpus);
 
     // Documents.
@@ -673,6 +711,64 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(init(&args(&dir.path().join("out")), &|_| None).is_err());
         assert!(!dir.path().join("out/tenant_id").exists());
+    }
+
+    /// A root that looks like a tiny one-shot init container (cgroup 1 GiB /
+    /// 1 CPU) on a large host (64 GiB, 68 online CPUs; deliberately not this
+    /// test host's CPU count, so a fallback to the caller's own scheduler view
+    /// cannot pass by accident).
+    fn tiny_container_on_big_host() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let put = |rel: &str, body: &str| {
+            let path = root.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        put("proc/meminfo", &format!("MemTotal:       {} kB\nMemFree:         1024 kB\n", 64 * GIB / 1024));
+        put("sys/devices/system/cpu/online", "0-1,4-69\n");
+        put("sys/fs/cgroup/memory.max", &format!("{}\n", GIB));
+        put("sys/fs/cgroup/cpu.max", "100000 100000\n");
+        root
+    }
+
+    /// NAN-4693 (production path): `init` with no sizing flags, run in a
+    /// capped init container, must place the tenant for the HOST the cell
+    /// runs on, not for the init container's own cgroup (which used to give
+    /// the 2 GiB / 1 CPU floor: eps 60, ingest 1 core / 512 MiB).
+    #[test]
+    fn tiny_init_container_still_places_a_host_sized_tenant() {
+        let host = tiny_container_on_big_host();
+        assert_eq!(detect_host(host.path()).unwrap(), HostFacts { memory_bytes: 64 * GIB, cpus: 68 });
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let a = InitArgs { memory_bytes: None, cpus: None, host_root: host.path().to_path_buf(), ..args(&out) };
+        let summary = init(&a, &env).unwrap();
+        let placement: Value = serde_json::from_slice(&std::fs::read(out.join("cell/placement.json")).unwrap()).unwrap();
+        let t = &placement["tenants"][0];
+        let want = size(32 * GIB, 68);
+        assert_eq!(summary["sizing"]["memory_bytes"], 32 * GIB, "half the host, not half the init cgroup");
+        assert_eq!(summary["sizing"]["cpus"], 68, "online host CPUs, not the init cpu.max");
+        assert_eq!(t["query_limit_memory_bytes"], want.query.3);
+        assert_eq!(t["ingest_limit_memory_bytes"], want.ingest.3);
+        assert_eq!(t["ingest_limit_millicores"], want.ingest.1);
+        assert_eq!(t["query_limit_millicores"], want.query.1);
+        assert_eq!(t["eps"], want.eps as f64);
+        assert!(t["ingest_limit_millicores"].as_u64().unwrap() >= 30_000 && t["eps"].as_f64().unwrap() > 1_000.0, "{t}");
+        // Explicit flags still win over host facts.
+        let flagged = init(&InitArgs { host_root: host.path().to_path_buf(), ..args(&out) }, &env).unwrap();
+        assert_eq!(flagged["sizing"]["memory_bytes"], 16 * GIB);
+        assert_eq!(flagged["sizing"]["cpus"], 8);
+    }
+
+    #[test]
+    fn cpu_lists_count_ranges_and_refuse_garbage() {
+        assert_eq!(count_cpu_list("0-31"), Some(32));
+        assert_eq!(count_cpu_list("0,2-5,8"), Some(6));
+        assert_eq!(count_cpu_list("0"), Some(1));
+        assert_eq!(count_cpu_list(""), None);
+        assert_eq!(count_cpu_list("5-2"), None);
+        assert_eq!(count_cpu_list("x"), None);
+        assert_eq!(count_cpu_list("0-4294967295"), None, "overflow is refused, not a panic");
     }
 
     #[test]

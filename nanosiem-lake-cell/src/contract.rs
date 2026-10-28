@@ -680,6 +680,12 @@ pub struct Heartbeat {
     /// overdue). Old children omit it (0: never fires).
     #[serde(default)]
     pub l0_merge_overdue_seconds: f64,
+    /// NAN-4674, ingest: the most live parts any one event hour holds (what
+    /// a query over that hour opens). A backfill of objects spanning many
+    /// hours used to add one tiny part per hour per flush. Omitted while 0,
+    /// so old children and other roles keep the exact frame (0: never fires).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub max_parts_per_hour: u64,
     /// NAN-3774, ingest: seconds the tenant's prevalence state has been
     /// behind the part-log head without a break (opening, rotating,
     /// catching up, or its store not responding). Ingest commits regardless;
@@ -786,6 +792,10 @@ pub struct FindingOutboxStatus {
     /// retention window; 0 while the scheduled prune keeps up.
     #[serde(default)]
     pub retention_overdue_seconds: f64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 impl Heartbeat {

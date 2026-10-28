@@ -144,6 +144,23 @@ pub fn l0_merge_overdue(tenant_id: Option<TenantId>, seconds: f64) -> Signal {
         seconds, L0_MERGE_OVERDUE_WARN_SECS, L0_MERGE_OVERDUE_PAGE_SECS, None)
 }
 
+/// NAN-4674: `parts_per_hour` warns at twice the merge bound
+/// (`FRAGMENTED_HOUR_PARTS` = 64 in the lake worker): a fragmented hour is
+/// merged first, even during catch-up, so one past 128 means the merges are
+/// not keeping up with a backfill. A healthy sealed hour holds ~30-35.
+pub const PARTS_PER_HOUR_WARN: f64 = 128.0;
+/// NAN-4674: pages at 512: every query over that hour opens 512+ parts
+/// (Dan's bakeoff 2026-10-27 reached ~131 per hour on 1.1M rows and a plain
+/// count took 27.7 s).
+pub const PARTS_PER_HOUR_PAGE: f64 = 512.0;
+
+/// NAN-4674: the most live parts any one event hour holds.
+pub fn parts_per_hour(tenant_id: Option<TenantId>, parts: u64) -> Signal {
+    Signal::evaluate(tenant_id, "ingest", "compaction", "parts_per_hour", "parts", parts as f64,
+        PARTS_PER_HOUR_WARN, PARTS_PER_HOUR_PAGE,
+        (parts as f64 >= PARTS_PER_HOUR_WARN).then(|| format!("an event hour holds {parts} live parts")))
+}
+
 /// `pooled_admission_refused` pages once a refusal has lasted this long,
 /// continuously (it warns from the first second). Short enough that tenants'
 /// queued data is noticed fast; long enough to ride out the boot race (5 s
@@ -479,6 +496,21 @@ mod tests {
         let mut want = want;
         want.as_object_mut().unwrap().remove("evaluated_at");
         assert_eq!(got, want, "regenerate both copies of the fixture together");
+    }
+
+    #[test]
+    fn parts_per_hour_warns_past_twice_the_merge_bound() {
+        assert_eq!(parts_per_hour(None, 0).severity, Severity::Ok, "old children omit it");
+        assert_eq!(parts_per_hour(None, 35).severity, Severity::Ok, "a healthy sealed hour");
+        assert_eq!(parts_per_hour(None, 127).severity, Severity::Ok);
+        assert_eq!(parts_per_hour(None, 128).severity, Severity::Warn);
+        assert_eq!(parts_per_hour(None, 512).severity, Severity::Page);
+        let old: crate::contract::Heartbeat = serde_json::from_str(r#"{"busy":false,"queue_depth":0}"#).unwrap();
+        assert_eq!(old.max_parts_per_hour, 0);
+        assert!(!serde_json::to_string(&crate::contract::Heartbeat::default()).unwrap().contains("max_parts_per_hour"));
+        let beat = crate::contract::Heartbeat { max_parts_per_hour: 131, ..Default::default() };
+        let back: crate::contract::Heartbeat = serde_json::from_str(&serde_json::to_string(&beat).unwrap()).unwrap();
+        assert_eq!(back.max_parts_per_hour, 131);
     }
 
     /// NAN-3701: the merge-deadline signal alerts even when ingestion is

@@ -103,3 +103,6 @@ lean-gate-evidence/
 # Trusted-local identity and bootstrap secrets.
 .nano-lean/
 .nano-tenzir/
+
+# NAN-4686 sovereign single-host install material (CA key, PG/app secrets)
+.nano-sovereign/

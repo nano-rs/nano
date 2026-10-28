@@ -21,8 +21,10 @@ pub struct FindingAppendRequest {
     pub parts: Vec<PartRef>,
     pub receipts: Vec<SourceRef>,
     /// Unix ms after which the requester no longer waits for the ack:
-    /// ingest refuses to START the commit past it (the rows stay in the
-    /// outbox) instead of committing an append nobody will acknowledge.
+    /// ingest refuses to START registering the parts past it (the rows stay
+    /// in the outbox). An append whose registration has begun commits even
+    /// past it (NAN-4700); the requester's next pass acknowledges it from
+    /// the log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_unix_ms: Option<i64>,
 }
