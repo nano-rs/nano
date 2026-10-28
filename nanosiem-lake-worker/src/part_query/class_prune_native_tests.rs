@@ -504,3 +504,107 @@ async fn uid_lookup_prunes_files_by_sidecar_and_returns_the_row() {
     assert!(funnel.uid_pruned_files > 0, "{funnel:?}");
     std::env::remove_var("NANO_LAKE_UID_SIDECAR_WRITE");
 }
+
+/// NAN-4768: absent sidecars are unknown evidence, including in a window
+/// containing both legacy and opted-in parts. Exercise the real ingestor,
+/// verified fetcher, selection, compiler and native SQL recheck.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn uid_lookup_keeps_matching_rows_without_sidecars() {
+    const ENV: &str = "NANO_LAKE_UID_SIDECAR_WRITE";
+    struct RestoreEnv(Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var(ENV, value),
+                None => std::env::remove_var(ENV),
+            }
+        }
+    }
+    let _restore = RestoreEnv(std::env::var_os(ENV));
+    let hour = (Utc::now() - Duration::hours(8))
+        .duration_trunc(Duration::hours(1))
+        .unwrap();
+    for sidecars in [[false, false], [true, true], [false, true]] {
+        let root = tempfile::tempdir().unwrap();
+        let parts = LocalObjectStore::new(root.path().join("parts")).unwrap();
+        let sources_dir = root.path().join("sources");
+        std::fs::create_dir_all(sources_dir.join("bronze")).unwrap();
+        let sources = LocalObjectStore::new(&sources_dir).unwrap();
+        let spool = SpoolQueue::new(root.path().join("spool"), TENANT).unwrap();
+        let signer = signer();
+        let config = IngestConfig::new(TENANT, root.path().join("work"));
+        let mut ingestor = Ingestor::open(
+            config, &parts, &sources, &spool, &signer, signer.trusted(),
+            BronzeIngestEnricher::disabled(), &seed_schema(), hour.timestamp_millis(),
+        ).await.unwrap();
+        for (n, enabled) in sidecars.iter().enumerate() {
+            if *enabled { std::env::set_var(ENV, "1"); } else { std::env::remove_var(ENV); }
+            let at = hour + Duration::seconds(10 + n as i64 * 20);
+            // One class/source per part; distinct event ids prevent ingest dedup.
+            let rows = (0..6).map(|i| event((n * 6 + i) * 3, &at.to_rfc3339())).collect::<Vec<_>>();
+            let key = format!("bronze/{n}.parquet");
+            write_bronze(&sources_dir.join(&key), &rows);
+            crate::bronze::admit_bronze_files(&[sources_dir.join(&key)], TENANT).unwrap();
+            spool.deliver(&SourceNotice {
+                tenant_id: TENANT.into(), key, version: "1".into(), bytes: 0,
+                sha256: None, edge_sha256: None, notified_at_ms: at.timestamp_millis(),
+            }).unwrap();
+            ingestor.tick_ingest(at.timestamp_millis()).await.unwrap();
+            ingestor.flush_now(at.timestamp_millis() + 1_000).await.unwrap();
+        }
+        drop(ingestor);
+        let live = crate::parts::part_log::load_log(&parts, TENANT).await.unwrap();
+        assert_eq!(live.parts().count(), 2);
+        let mut sidecar_files = 0;
+        for part in live.parts() {
+            let keys = crate::parts::format::PartKeys::new(TENANT, part.level, part.event_hour, &part.part_id).unwrap();
+            let bytes = parts.get(&keys.provenance()).await.unwrap().unwrap();
+            let signed = crate::parts::provenance::SignedProvenance::verify_bytes(&bytes, TENANT, &signer.trusted()).unwrap();
+            assert_eq!(signed.record.files.data.len(), 1);
+            assert_eq!(signed.record.files.data[0].rows, 6);
+            sidecar_files += usize::from(signed.record.files.data[0].uid_blooms.is_some());
+        }
+        assert_eq!(sidecar_files, sidecars.iter().filter(|enabled| **enabled).count());
+        let engine = engine(root.path()).await;
+        for (uid, owner) in [("uid-00000000", Some(0)), ("uid-00000018", Some(1)), ("uid-absent", None)] {
+            let query = format!("metadata.uid={uid}");
+            // Disable competing evidence only for this selection: without uid
+            // evidence, both files and all twelve rows must remain candidates.
+            let hints = [crate::planner::CandidateHint::Entity {
+                source_path: crate::parts::format::UID_PATH.into(), value: uid.into(),
+            }];
+            for prune_uid in [0, 1] {
+                let scope = Arc::new(crate::perf_overrides::Parsed {
+                    probe: Some(crate::perf_overrides::Probe {
+                        knobs: [("prune_uid", prune_uid), ("prune_entity_sidecars", 0), ("prune_blooms", 0), ("prune_tokens", 0)].into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+                let selection = crate::perf_overrides::scoped(Some(scope), engine.select(
+                    hour.timestamp_micros(), (hour + Duration::hours(1)).timestamp_micros(), &hints,
+                )).await.unwrap();
+                let pruned = if prune_uid == 0 { 0 } else {
+                    sidecar_files - usize::from(owner.is_some_and(|n| sidecars[n]))
+                };
+                assert_eq!(selection.evidence.uid_pruned_files, pruned, "{sidecars:?} {uid}");
+                assert_eq!(selection.evidence.kept_row_groups, 2 - pruned, "{sidecars:?} {uid}");
+                assert_eq!(selection.manifest.objects.len(), 2 - pruned, "{sidecars:?} {uid}");
+            }
+            // Normal production pruning, with real matching and absent ids,
+            // event rows (both payload shapes), counts and warmed evidence.
+            for _ in 0..2 {
+                for table_view in [false, true] {
+                    let (rows, _) = run(&engine, &query, hour, table_view).await;
+                    let expected = if owner.is_some() { vec![uid.to_string()] } else { vec![] };
+                    assert_eq!(sorted_uids(&rows), expected, "{sidecars:?} {query}");
+                }
+                let (rows, _) = run(&engine, &format!("{query} | stats count() as n"), hour, false).await;
+                assert_eq!(rows.len(), 1, "{sidecars:?} {query}: {rows:?}");
+                let count = rows[0]["n"].as_u64().or_else(|| rows[0]["n"].as_str().and_then(|n| n.parse().ok()));
+                assert_eq!(count, Some(u64::from(owner.is_some())), "{sidecars:?} {query}: {rows:?}");
+            }
+        }
+    }
+}

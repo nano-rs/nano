@@ -71,6 +71,9 @@ pub trait CatalogLifecycleBackend: IcebergCommitter {
     /// part holds a GC receipt (its files may be deleted). A backend with
     /// its own durable pending work must never commit such a part.
     fn set_vanished(&self, _vanished: Vanished) {}
+    /// NAN-4721: the tenant's ingest-lag signal. Agent-catalog work yields
+    /// to ingest while it is set (see [`crate::part_ingest::agent_lane`]).
+    fn set_ingest_pressure(&self, _pressure: Arc<crate::part_ingest::agent_lane::IngestPressure>) {}
 }
 
 /// See [`CatalogLifecycleBackend::set_vanished`].
@@ -447,6 +450,57 @@ struct CatalogPartUnproven(String);
 /// remote catalog references.
 const PLANNED_INDEX_READY: &str = "planned-index-ready";
 
+/// NAN-4715: how long `TenantCatalog::new` waits for a contended writer lease.
+const WRITER_LEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The writer lease is an `flock` on `writer.lock`, which belongs to the open
+/// file description. The fd is O_CLOEXEC, but a child forked by any other
+/// thread (a subprocess spawn) shares that description until its exec, so a
+/// lease dropped and re-taken inside that window still reads as held. Every
+/// production restart can race a dying writer the same way. A contended lease
+/// is retried within `wait`; a second live writer is still refused.
+fn acquire_writer_lease(lease: &std::fs::File, wait: std::time::Duration) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(lease) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.kind() == fs2::lock_contended_error().kind()
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_writer_lease_released_within_the_wait_is_acquired_and_a_live_one_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = || std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+        .open(dir.path().join("writer.lock")).unwrap();
+    // A shared open file description (what a forked, not yet exec'd child
+    // holds) that goes away shortly.
+    let holder = open();
+    fs2::FileExt::try_lock_exclusive(&holder).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(holder);
+    });
+    acquire_writer_lease(&open(), std::time::Duration::from_secs(5)).unwrap();
+    release.join().unwrap();
+    // A live second writer: refused once the wait is spent.
+    // Taken through the lease wait too: the lease just dropped above can be
+    // shared for a moment by another test's forked child (the NAN-4715 window).
+    let held = open();
+    acquire_writer_lease(&held, std::time::Duration::from_secs(5)).unwrap();
+    let started = std::time::Instant::now();
+    assert!(acquire_writer_lease(&open(), std::time::Duration::from_millis(100)).is_err());
+    assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+}
+
 /// The strict catalog inspection a GC fence may run, inside its 120 s bound.
 const INSPECTION_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -479,6 +533,9 @@ pub struct TenantCatalog {
     /// receipt is never minted for a live part: that is a liveness check
     /// (GC asking for live data is a bug elsewhere), not a catalog gate.
     live: std::sync::Mutex<Option<BTreeSet<String>>>,
+    /// NAN-4721: set by the ingest loop from its lag alert; the backend's
+    /// agent-catalog work yields while it is set.
+    pressure: Arc<crate::part_ingest::agent_lane::IngestPressure>,
     _lease: std::fs::File,
 }
 
@@ -598,7 +655,7 @@ impl TenantCatalog {
             .read(true)
             .write(true)
             .open(work_dir.join("writer.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&lease).context("catalog writer already held")?;
+        acquire_writer_lease(&lease, WRITER_LEASE_WAIT).context("catalog writer already held")?;
         let service = Self {
             tenant: tenant.into(),
             bucket,
@@ -607,14 +664,22 @@ impl TenantCatalog {
             lock: tokio::sync::Mutex::new(CustodyState::default()),
             limits: SyncLimits::DEFAULT,
             live: std::sync::Mutex::new(None),
+            pressure: Arc::default(),
             _lease: lease,
         };
+        service.backend.set_ingest_pressure(service.pressure.clone());
         service.recover_planned_index()?;
         let receipts = service.work_dir.join("catalog-removed");
         service.backend.set_vanished(Arc::new(move |part: &str| {
             PartId::parse(part).is_err() || receipts.join(format!("{part}.json")).try_exists().unwrap_or(true)
         }));
         Ok(service)
+    }
+
+    /// NAN-4721: the ingest loop reports its lag alert here every health
+    /// update; agent-catalog work yields while it is set.
+    pub fn ingest_pressure(&self) -> &crate::part_ingest::agent_lane::IngestPressure {
+        &self.pressure
     }
 
     /// Tests shrink the batch and budget to drive multi-pass convergence
@@ -764,6 +829,9 @@ impl TenantCatalog {
                 // Unsettled removals with no batch left to settle them (the
                 // chain was rebuilt from the catalog): settle here.
                 ensure!(removed.iter().all(|(part, _)| !remaining.contains(part)), "catalog still exposes removed part metadata");
+                // Unsettled removals force privacy above; never receipt one
+                // without the closed read fence and fresh serving name.
+                ensure!(privacy, "catalog removal requires read barrier");
                 self.backend.invalidate_results().await?;
                 self.settle_removed(&mut removed)?;
             }
@@ -1046,7 +1114,20 @@ impl TenantCatalog {
             removed.iter().all(|(part, _)| !referenced.contains(part)),
             "catalog still exposes removed part metadata"
         );
-        self.backend.invalidate_results().await?;
+        // NAN-4734: the result-cache fence belongs to the privacy path only.
+        // Under privacy the reads are closed and `expire_and_inspect` has
+        // just published a fresh serving name, so invalidation proves no old
+        // name can answer again. An add-only pass removes nothing: there is
+        // no removed row a cache could leak, and the platform refuses
+        // `invalidate_results` outside a closed privacy window (no fresh
+        // serving proof once `writer_reopen` ended it), which wedged every
+        // later sync. Removals always force privacy (see `sync_parts`), so
+        // no receipt can be issued here without the fence.
+        if privacy {
+            self.backend.invalidate_results().await?;
+        } else {
+            ensure!(removed.is_empty(), "catalog removal requires read barrier");
+        }
         self.settle_removed(removed)?;
         self.acknowledge(path)
     }

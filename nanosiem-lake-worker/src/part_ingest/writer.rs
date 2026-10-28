@@ -153,6 +153,9 @@ pub struct PartWriter {
     class_sorted: bool,
     /// The last row's class of a class-sorted family.
     last_class: Option<Option<i64>>,
+    /// NAN-4750: an L0 part labelled as one `(source, class)` family
+    /// ([`PartWriter::label_l0_class_family`]); every row is checked.
+    l0_class_family: bool,
     logical_merkle_root: Option<String>,
     min: i64,
     max: i64,
@@ -270,6 +273,7 @@ impl PartWriter {
             last_host: None,
             class_sorted: false,
             last_class: None,
+            l0_class_family: false,
             logical_merkle_root: None,
             min: i64::MAX,
             max: i64::MIN,
@@ -452,6 +456,24 @@ impl PartWriter {
         Ok(())
     }
 
+    /// NAN-4750: label a whole L0 part as one `(source, class)` family, so
+    /// its data files carry the signed `log_sources` / `class_id` that
+    /// `prune::file_family_may_match` prunes on (until now only hour merges
+    /// wrote them, and the open hour kept every L0 row group of a
+    /// class-filtered query). Unlike the merge families this is not family
+    /// mode: the part keeps its one `(time, uid)` order and its row digests
+    /// and Merkle roots, exactly as an unlabelled L0. Before any row; every
+    /// written row must be of that source and class (checked in
+    /// [`PartWriter::write`]), so the label is exact.
+    pub fn label_l0_class_family(&mut self, source: &str, class_id: i64) -> Result<()> {
+        ensure!(self.draft.level == Level::L0, "L0 class labels are only for L0 parts");
+        ensure!(self.rows == 0 && self.current.is_none() && self.closed.is_empty(), "an L0 class label precedes every row");
+        self.active_log_source = Some(source.to_string());
+        self.active_class_id = Some(class_id);
+        self.l0_class_family = true;
+        Ok(())
+    }
+
     /// Each source/class family retains its independent time/UID order.
     pub fn start_source_class(&mut self, source: Option<&str>, class_id: Option<i64>) -> Result<()> {
         self.start_log_source(source)?;
@@ -584,6 +606,21 @@ impl PartWriter {
         Ok(Some(FileDigest { name, bytes, sha256 }))
     }
 
+    /// NAN-4750: every row of `batch` is of the labelled L0 family.
+    fn check_l0_class_family(&self, batch: &RecordBatch) -> Result<()> {
+        let (Some(source), Some(class)) = (self.active_log_source.as_deref(), self.active_class_id) else {
+            bail!("L0 class family has no label");
+        };
+        let sources = log_source_strings(batch)?;
+        let classes = batch.column_by_name("class_uid");
+        for row in 0..batch.num_rows() {
+            ensure!(!sources.is_null(row) && sources.value(row) == source
+                && super::merge::class_at(classes, row) == Some(class),
+                "L0 class family row is not of its labelled source and class");
+        }
+        Ok(())
+    }
+
     /// A local, never-published intermediate (a merge pass over more than
     /// `MAX_OPEN_INPUTS` overlapping inputs): skip the per-row digests, the
     /// costliest per-row work. Its Merkle roots are placeholders; the final
@@ -612,6 +649,9 @@ impl PartWriter {
         let hosts = self.host_sorted_group_rows.map(|_| super::host_sort::host_strings(batch)).transpose()?;
         let host_at = |row: usize| hosts.as_ref().and_then(|hosts| (!hosts.is_null(row)).then(|| hosts.value(row)));
         let classes = self.class_sorted.then(|| super::class_sort::class_keys(batch)).transpose()?;
+        if self.l0_class_family {
+            self.check_l0_class_family(batch)?;
+        }
         let digests = match (self.family_mode, self.draft.level) {
             (true, _) => None,
             // Merge outputs digest on the bounded merge pool; L0 flushes

@@ -126,6 +126,15 @@ pub trait SanctionedPartGc: Send + Sync {
     fn available(&self) -> bool {
         true
     }
+
+    /// NAN-4726: the tenant's retention (`policy.retention_days`) as the
+    /// route in hand right now carries it, only while that route may delete
+    /// (grant enabled and unexpired, owner bearer valid). `None` retires
+    /// nothing for retention: no policy delivered, route withdrawn,
+    /// unreadable or refreshing (fail closed).
+    fn retention_days(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// What the gate allows right now.
@@ -157,6 +166,14 @@ pub trait PartGcAuthority: Send + Sync {
 
     fn blocked_detail(&self) -> &'static str {
         ""
+    }
+
+    /// NAN-4726: the retention to retire by, read through the same gate as
+    /// deletes: `Some` only while [`Self::decision`] is `Sanctioned` and that
+    /// pass's route carries a policy. Hosted cells retire expired parts with
+    /// it; `None` (the default, and every closed gate) retires nothing.
+    async fn retention_days(&self, _now_ms: i64) -> Result<Option<u64>> {
+        Ok(None)
     }
 }
 
@@ -230,6 +247,12 @@ impl PartGcAuthority for ExchangedGrantAuthority {
 
     fn deleted_total(&self) -> Option<u64> {
         self.sanctioned.as_ref().and_then(|pass| pass.deleted_total())
+    }
+    async fn retention_days(&self, now_ms: i64) -> Result<Option<u64>> {
+        Ok(match self.decision(now_ms).await? {
+            PartGcDecision::Sanctioned(pass) => pass.retention_days(),
+            PartGcDecision::Blocked(_) => None,
+        })
     }
     async fn decision(&self, now_ms: i64) -> Result<PartGcDecision> {
         let guard = self.grant.lock().map_err(|_| anyhow::anyhow!("lake_part delete grant lock poisoned"))?;

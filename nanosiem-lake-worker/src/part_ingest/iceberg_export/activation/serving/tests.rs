@@ -28,6 +28,20 @@ struct Provider {
     stall_epoch_after: Arc<AtomicUsize>,
     /// FP-T101: each published epoch and the parts it held when published.
     published: Mutex<Vec<(String, BTreeSet<String>)>>,
+    /// NAN-4734: platform control's privacy fence (`state.privacy`): the
+    /// serving names closed by `close_and_drain`, and whether
+    /// `publish_serving` has since recorded a fresh serving proof.
+    /// `writer_reopen` deletes it; `invalidate_results` and `writer_reopen`
+    /// are refused without the fresh proof, exactly like the platform.
+    fence: Mutex<Option<(BTreeSet<String>, bool)>>,
+    /// Every control call the platform model refused.
+    refused: Mutex<Vec<String>>,
+}
+impl Provider {
+    fn refuse(&self, op: &str, code: &str) -> Result<()> {
+        self.refused.lock().unwrap().push(format!("{op}:{code}"));
+        anyhow::bail!("catalog control refused: HTTP 403 ({code})")
+    }
 }
 struct Table {
     name: String,
@@ -179,6 +193,8 @@ impl ServingFactory for Provider {
             .clone())
     }
     async fn close(&self) -> Result<()> {
+        let names = self.registry.lock().unwrap().iter().cloned().collect();
+        self.fence.lock().unwrap().get_or_insert((names, false));
         self.trace.lock().unwrap().push("closed".into());
         Ok(())
     }
@@ -210,17 +226,34 @@ impl ServingFactory for Provider {
                 "catalog_serving_epoch_not_fresh"
             );
         }
+        // Like platform publish_serving: only inside a closed privacy window,
+        // and never under a name that window closed.
+        if self.fence.lock().unwrap().as_ref().is_none_or(|(closed, _)| closed.contains(&name)) {
+            return self.refuse("publish_serving", "catalog_serving_epoch_not_fresh");
+        }
         let held = self.tables.lock().unwrap()[epoch(&name).as_str()].parts.lock().unwrap().clone();
         self.published.lock().unwrap().push((name.clone(), held));
         self.registry.lock().unwrap().replace(name.clone());
+        self.fence.lock().unwrap().as_mut().expect("privacy fence").1 = true;
         self.trace.lock().unwrap().push(format!("publish:{name}"));
         Ok(())
     }
     async fn invalidate(&self) -> Result<()> {
+        let registered = self.registry.lock().unwrap().clone();
+        let fresh = self.fence.lock().unwrap().as_ref().is_some_and(|(closed, fresh)| {
+            *fresh && registered.as_ref().is_none_or(|name| !closed.contains(name))
+        });
+        if !fresh {
+            return self.refuse("invalidate_results", "catalog_fresh_serving_proof_missing");
+        }
         self.trace.lock().unwrap().push("fresh-cache-fence".into());
         Ok(())
     }
     async fn reopen(&self) -> Result<()> {
+        if !self.fence.lock().unwrap().as_ref().is_some_and(|(_, fresh)| *fresh) {
+            return self.refuse("writer_reopen", "catalog_fresh_serving_proof_missing");
+        }
+        *self.fence.lock().unwrap() = None;
         self.trace.lock().unwrap().push("open".into());
         Ok(())
     }
@@ -1067,4 +1100,171 @@ async fn an_exposed_epoch_referencing_a_gc_deleted_part_is_never_served() {
     let open = trace.iter().position(|s| s == "open").unwrap();
     assert!(publish < retire && publish < open, "{trace:?}");
     assert!(!table(&provider, "events").parts.lock().unwrap().contains(&p));
+}
+
+/// NAN-4721: agents never compete with analysts. Through the production
+/// TenantCatalog + FreshServingBackend (the signal reaches the backend via
+/// `TenantCatalog::new`), no serving-epoch batch starts while the ingest
+/// lag alert holds; the epoch builds as soon as it clears, and the master
+/// chain, publish and custody are unchanged.
+#[tokio::test(start_paused = true)]
+async fn serving_epoch_batches_yield_while_ingest_lags() {
+    use crate::part_ingest::agent_lane::{MAX_YIELD, PRESSURE_POLL};
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Provider::default());
+    let catalog = fresh_install(dir.path(), &provider);
+    catalog.fence_installation().await.unwrap();
+    let parts = live_set(8); // 2 master batches, then 2 epoch batches
+    let error = catalog.sync_parts(T, parts.clone(), LIVE_NOW, &MergePolicy::default()).await.unwrap_err();
+    assert!(error.downcast_ref::<super::super::super::lifecycle::CatalogSyncIncomplete>().is_some(), "{error:#}");
+    // Ingest lags past its alert threshold before the sync that builds the epoch.
+    catalog.ingest_pressure().set(true);
+    let sync = tokio::spawn({
+        let (catalog, parts) = (catalog.clone(), parts.clone());
+        async move { catalog.sync_parts(T, parts, LIVE_NOW + 1, &MergePolicy::default()).await }
+    });
+    let epoch = loop {
+        tokio::time::sleep(PRESSURE_POLL).await;
+        let found = provider.tables.lock().unwrap().values().find(|t| t.name != "events").cloned();
+        if let Some(epoch) = found { break epoch; }
+    };
+    let master = table(&provider, "events");
+    assert_eq!(master.commits.load(Ordering::SeqCst), 2, "the master chain is not held back");
+    // Lagging for most of the yield bound: not one epoch batch started.
+    let lagged = 20 * PRESSURE_POLL; // under the yield bound and the sync hard bound
+    assert!(lagged < MAX_YIELD);
+    tokio::time::sleep(lagged).await;
+    assert_eq!(epoch.calls.load(Ordering::SeqCst), 0, "an epoch batch competed with lagging ingest");
+    assert!(!sync.is_finished());
+    assert!(provider.registry.lock().unwrap().is_none(), "nothing published mid-yield");
+    // The lag clears: the epoch builds and publishes within one poll.
+    catalog.ingest_pressure().set(false);
+    tokio::time::timeout(2 * PRESSURE_POLL, sync).await.expect("epoch resumes once ingest recovers").unwrap().unwrap();
+    assert_eq!(epoch.commits.load(Ordering::SeqCst), 2);
+    assert_registered_once(&epoch, &parts);
+    assert!(catalog.ingest_pressure().yielded_ms() >= lagged.as_millis() as u64);
+    let name = provider.registry.lock().unwrap().clone().expect("epoch published");
+    assert_eq!(name, format!("agent.{}_v1", epoch.name));
+}
+
+/// NAN-4734: after a converged privacy pass, `writer_reopen` deletes the
+/// platform's privacy fence. A later add-only sync (a new sealed hour, no
+/// removal) must converge without asking the platform to invalidate (the
+/// platform refuses it with `catalog_fresh_serving_proof_missing`, which
+/// wedged a tenant's agent lane), and a later removal must still take the full
+/// fence: close, fresh name, invalidate, receipt, reopen.
+#[tokio::test]
+async fn add_only_sync_after_converged_reopen_needs_no_fence_and_removals_still_take_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Provider::default());
+    let catalog = fresh_install(dir.path(), &provider);
+    catalog.fence_installation().await.unwrap();
+    let parts = live_set(2);
+    converge(&catalog, &parts, 8).await;
+    assert!(provider.fence.lock().unwrap().is_none(), "converged pass reopened and ended the fence");
+    let published = provider.registry.lock().unwrap().clone().unwrap();
+    // Add-only: a new sealed hour, an hour later (past the debounce).
+    let more = live_set(3);
+    let at = LIVE_NOW + 3_600_000;
+    provider.trace.lock().unwrap().clear();
+    catalog.sync_parts(T, more.clone(), at, &MergePolicy::default()).await.unwrap();
+    assert!(provider.refused.lock().unwrap().is_empty(), "{:?}", provider.refused.lock().unwrap());
+    assert!(provider.trace.lock().unwrap().is_empty(), "add-only: no close, publish, invalidate or reopen");
+    assert_eq!(provider.registry.lock().unwrap().as_ref(), Some(&published), "same serving name");
+    assert_registered_once(&table(&provider, "events"), &more);
+    assert_registered_once(&table(&provider, &epoch(&published)), &more);
+    // Removal: the first part leaves the live set. Privacy takes the fence.
+    let removed = more[0].part_id.to_string();
+    catalog.sync_parts(T, more[1..].to_vec(), at + 3_600_000, &MergePolicy::default()).await.unwrap();
+    assert!(provider.refused.lock().unwrap().is_empty(), "{:?}", provider.refused.lock().unwrap());
+    let fresh = provider.registry.lock().unwrap().clone().unwrap();
+    assert_ne!(fresh, published, "a removal publishes a fresh serving name");
+    let trace = provider.trace.lock().unwrap().clone();
+    let at_ = |s: &str| trace.iter().position(|t| t == s).unwrap_or_else(|| panic!("{s} missing: {trace:?}"));
+    assert!(at_("closed") < at_(&format!("publish:{fresh}")));
+    assert!(at_(&format!("publish:{fresh}")) < at_("fresh-cache-fence"));
+    assert!(at_("fresh-cache-fence") < at_("open"));
+    assert!(provider.fence.lock().unwrap().is_none());
+    catalog.require_removed(T, &removed).unwrap();
+    assert!(!table(&provider, &epoch(&fresh)).parts.lock().unwrap().contains(&removed));
+}
+
+/// NAN-4734: the fence still binds a removal. If the fresh serving name
+/// cannot be published, the platform never proves the cache fence and the
+/// removed part gets no GC receipt; the next sync completes the fence.
+#[tokio::test]
+async fn a_removal_without_a_fresh_serving_name_is_never_receipted() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Provider::default());
+    let catalog = fresh_install(dir.path(), &provider);
+    catalog.fence_installation().await.unwrap();
+    let parts = live_set(2);
+    converge(&catalog, &parts, 8).await;
+    let removed = parts[0].part_id.to_string();
+    provider.trace.lock().unwrap().clear();
+    provider.fail_publish.store(true, Ordering::SeqCst);
+    assert!(catalog.sync_parts(T, parts[1..].to_vec(), LIVE_NOW + 3_600_000, &MergePolicy::default()).await.is_err());
+    assert!(catalog.require_removed(T, &removed).is_err(), "no receipt before a fresh name is published");
+    assert!(!provider.trace.lock().unwrap().iter().any(|t| t == "open"), "reads stay closed");
+    provider.fail_publish.store(false, Ordering::SeqCst);
+    catalog.sync_parts(T, parts[1..].to_vec(), LIVE_NOW + 3_600_001, &MergePolicy::default()).await.unwrap();
+    assert!(provider.refused.lock().unwrap().is_empty(), "{:?}", provider.refused.lock().unwrap());
+    catalog.require_removed(T, &removed).unwrap();
+}
+
+/// NAN-4734: a merge is a removal. One sync that both adds (a new sealed
+/// hour) and replaces hour parts with the day part merged from them must
+/// take the full privacy fence against the platform's rules: close, fresh
+/// name, invalidate, receipts for every replaced part, reopen. It is never
+/// classified as add-only.
+#[tokio::test]
+async fn a_merge_with_new_data_in_the_same_sync_takes_the_privacy_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Provider::default());
+    let catalog = fresh_install(dir.path(), &provider);
+    catalog.fence_installation().await.unwrap();
+    let parts = live_set(4);
+    converge(&catalog, &parts, 8).await;
+    let published = provider.registry.lock().unwrap().clone().unwrap();
+    // Hours 0..=2 merge into one day part; hour 3 stays; hour 4 is new.
+    let day = PartRef {
+        part_id: PartId::parse("0000000000200-aaaaaaaaaaaaaaaa").unwrap(),
+        level: Level::Day,
+        event_hour: 0,
+        event_day: Some(0),
+        min_time_us: 1,
+        max_time_us: 2 * 3_600_000_000 + 1,
+        ..parts[0].clone()
+    };
+    let mut merged = vec![day, parts[3].clone()];
+    merged.push(live_set(5).pop().unwrap());
+    provider.trace.lock().unwrap().clear();
+    let mut done = false;
+    for pass in 0..8 {
+        match catalog.sync_parts(T, merged.clone(), LIVE_NOW + 3_600_000 + pass, &MergePolicy::default()).await {
+            Ok(()) => {
+                done = true;
+                break;
+            }
+            Err(error) => assert!(
+                error.downcast_ref::<super::super::super::lifecycle::CatalogSyncIncomplete>().is_some(),
+                "only budget stops: {error:#}"
+            ),
+        }
+    }
+    assert!(done, "the merge converges");
+    assert!(provider.refused.lock().unwrap().is_empty(), "{:?}", provider.refused.lock().unwrap());
+    let fresh = provider.registry.lock().unwrap().clone().unwrap();
+    assert_ne!(fresh, published, "a merge publishes a fresh serving name");
+    let trace = provider.trace.lock().unwrap().clone();
+    let at_ = |s: &str| trace.iter().position(|t| t == s).unwrap_or_else(|| panic!("{s} missing: {trace:?}"));
+    assert!(at_("closed") < at_(&format!("publish:{fresh}")));
+    assert!(at_(&format!("publish:{fresh}")) < at_("fresh-cache-fence"));
+    assert!(at_("fresh-cache-fence") < at_("open"));
+    let expected = merged.iter().map(|p| p.part_id.to_string()).collect::<BTreeSet<_>>();
+    assert_eq!(*table(&provider, &epoch(&fresh)).parts.lock().unwrap(), expected);
+    for replaced in &parts[..3] {
+        catalog.require_removed(T, replaced.part_id.as_str()).unwrap();
+    }
+    assert!(catalog.require_removed(T, parts[3].part_id.as_str()).is_err(), "a kept part is never receipted");
 }

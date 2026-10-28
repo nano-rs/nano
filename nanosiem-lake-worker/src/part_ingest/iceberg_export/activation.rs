@@ -738,6 +738,9 @@ impl serving::ServingFactory for BackendFactory {
     fn retain_verified(&self, live: &[crate::parts::part_log::PartRef]) -> Result<()> {
         self.target.retain_verified(live)
     }
+    fn set_ingest_pressure(&self, pressure: Arc<crate::part_ingest::agent_lane::IngestPressure>) {
+        self.target.set_ingest_pressure(pressure);
+    }
     async fn close(&self) -> Result<()> {
         self.control.close_and_drain().await
     }

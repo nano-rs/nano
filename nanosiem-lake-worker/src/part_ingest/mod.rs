@@ -4,6 +4,7 @@
 //! `crate::parts` (the contract, `docs-internal/NAN-2865-part-contract.md`).
 
 pub mod admission_attempts;
+pub mod agent_lane;
 pub mod bronze_list;
 pub mod cell;
 pub mod count_record;

@@ -75,6 +75,7 @@ import { PlaybooksApi } from '@/enterprise/api/playbooks';
 import { ReportsApi } from './reports';
 import { browserTenantRuntime } from '../tenant-runtime';
 import { withLockContentionRetry } from './lock-contention-retry';
+import { normalizeErrorBody } from './http-error';
 
 // Re-export types
 export * from './types';
@@ -507,26 +508,18 @@ class ApiClient {
       }, () => browserTenantRuntime.assertCurrent(capturedRuntime), capturedRuntime.scope.kind === 'enterprise_shared'), signal);
 
       if (!response.ok) {
-        const errorBody = await response.json().catch(() => ({
-          error: {
-            code: 'UNKNOWN_ERROR',
-            message: response.statusText,
-          }
-        }));
-        // Flat `{ error: "<code>", message }` bodies (the shared auth-lifecycle
-        // and step-up admin APIs) carry the code as a string.
-        const error = typeof errorBody.error === 'string'
-          ? { code: errorBody.error, message: errorBody.message }
-          : (errorBody.error || errorBody);
+        // NAN-4753: an edge/proxy error page (Cloudflare 524, NGINX 502) is
+        // HTML, not our JSON. Never surface it — describe it instead.
+        const error = normalizeErrorBody(response.status, await response.text().catch(() => ''), response.headers);
 
         // Handle IP_DENIED — redirect to deny page instead of login
         if (error.code === 'IP_DENIED' && typeof window !== 'undefined') {
           window.location.href = '/denied';
           // Throw to halt further execution
-          throw new ApiClientError(error.message, 'IP_DENIED');
+          throw new ApiClientError(error.message ?? 'Access denied', 'IP_DENIED');
         }
 
-        throw new ApiClientError(error.message || 'Request failed', error.code, error.details, response.status);
+        throw new ApiClientError(error.message || 'Request failed', error.code ?? 'UNKNOWN_ERROR', error.details, response.status);
       }
 
       // NAN-1595: surface server cache status to the caller (badge driver).
@@ -571,13 +564,7 @@ class ApiClient {
         signal: options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal,
       }, () => browserTenantRuntime.assertCurrent(capturedRuntime), capturedRuntime.scope.kind === 'enterprise_shared');
       if (!response.ok) {
-        const errorBody = await response.clone().json().catch(async () => ({
-          error: {
-            code: 'UNKNOWN_ERROR',
-            message: (await response.text().catch(() => '')) || response.statusText,
-          },
-        }));
-        const error = errorBody.error || errorBody;
+        const error = normalizeErrorBody(response.status, await response.text().catch(() => ''), response.headers);
         throw new ApiClientError(
           error.message || 'Request failed',
           error.code || 'UNKNOWN_ERROR',

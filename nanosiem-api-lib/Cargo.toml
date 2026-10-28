@@ -23,8 +23,10 @@ uuid.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 utoipa.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 regex = "1.12"
+futures = "0.3.32"

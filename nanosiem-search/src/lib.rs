@@ -1504,6 +1504,8 @@ pub fn create_router(
         // M10: Catch panics to prevent search service crashes from taking down the process
         .layer(tower_http::catch_panic::CatchPanicLayer::new())
         .layer(axum_middleware::from_fn(sanitize_error_responses))
+        // NAN-4753: streamed search answers opt out of ingress buffering.
+        .layer(axum_middleware::from_fn(nanosiem_api_lib::sse::sse_unbuffered))
         .layer(CompressionLayer::new().gzip(true))
         // Security headers (match nanosiem-api)
         .layer(SetResponseHeaderLayer::overriding(

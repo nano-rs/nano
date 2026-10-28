@@ -237,6 +237,11 @@ pub struct IngestConfig {
     /// [`super::prevalence::object_cache_bytes`]). Production:
     /// `cell::prevalence_cache_bytes_for`.
     pub prevalence_cache_max_bytes: u64,
+    /// NAN-4723: how a prevalence state on the local filesystem (compacted
+    /// in-process) is sized: compaction jobs, L0 room and unflushed bytes.
+    /// Production: [`super::prevalence::LocalStateSizing::for_placement`]
+    /// from the role's CPU limit and memory cap (`cell`).
+    pub prevalence_local_sizing: super::prevalence::LocalStateSizing,
     /// Hard ceiling on one prevalence open running in the background
     /// (NAN-3554): past it the open is taken as hung, aborted, and a fresh
     /// one is retried with the normal backoff.
@@ -311,6 +316,7 @@ impl IngestConfig {
             prevalence_ingest_wait: PREVALENCE_INGEST_WAIT,
             prevalence_stamp_wait: PREVALENCE_STAMP_WAIT,
             prevalence_cache_max_bytes: super::prevalence::OBJECT_CACHE_FLOOR_BYTES,
+            prevalence_local_sizing: super::prevalence::LocalStateSizing::FLOOR,
             prevalence_open_hard_timeout: PREVALENCE_OPEN_HARD_TIMEOUT,
             #[cfg(test)]
             prevalence_main_read_policy: false,
@@ -719,8 +725,9 @@ struct FlushPlan {
     sources: Vec<SourceObject>,
     edge_log: Option<crate::parts::EdgeLogRange>,
     build: String,
-    /// (hour, its buffered batches, its duplicates).
-    hours: Vec<(i32, Vec<RecordBatch>, u64)>,
+    /// (hour, its buffered batches, its duplicates, its dedicated L0
+    /// `(source, class)` families: [`l0_class_families`]).
+    hours: Vec<(i32, Vec<RecordBatch>, u64, Vec<(String, i64)>)>,
     now_ms: i64,
     /// Parallel L0 part writers ([`super::memory::writers_for`]).
     writers: usize,
@@ -730,11 +737,24 @@ impl FlushPlan {
     /// Each hour's rows, sorted, cut into row ranges written as separate L0
     /// parts on parallel threads (the part write was ~0.4 ms/row on one
     /// thread, the catch-up bottleneck once a flush holds FLUSH_MAX_ROWS).
+    ///
+    /// NAN-4750: an hour's dedicated `(source, class)` families (planned in
+    /// `flush_plan`) are written as their own class-labelled L0 parts, the
+    /// rest as mixed parts; every group keeps its `(time, uid)` order and
+    /// the hour's part count stays within [`l0_group_parts`]' bound.
     fn build(self) -> Result<Vec<FinishedPart>> {
         let mut drafts = Vec::new();
-        for (hour, batches, duplicates) in &self.hours {
+        for (hour, batches, duplicates, families) in &self.hours {
             let batch = sorted_hour(batches, &self.schema)?;
-            for (index, (offset, len)) in l0_chunks(batch.num_rows()).into_iter().enumerate() {
+            let groups = split_l0_families(&batch, families)?;
+            drop(batch);
+            let parts = l0_group_parts(&groups.iter().map(|(_, rows)| rows.num_rows()).collect::<Vec<_>>());
+            let chunks = groups.into_iter().zip(parts)
+                .flat_map(|((family, rows), parts)| l0_chunks_into(rows.num_rows(), parts).into_iter()
+                    .map(move |(offset, len)| (family.clone(), rows.slice(offset, len))))
+                .collect::<Vec<_>>();
+            for (index, (family, rows)) in chunks.into_iter().enumerate() {
+                let len = rows.num_rows();
                 // The hour's duplicates are accounted once, on its first part.
                 let duplicates = if index == 0 { *duplicates } else { 0 };
                 let draft = PartDraft {
@@ -752,10 +772,10 @@ impl FlushPlan {
                     window: DedupWindow::Exact,
                     build: self.build.clone(),
                 };
-                drafts.push((draft, batch.slice(offset, len)));
+                drafts.push((draft, rows, family));
             }
         }
-        write_l0_parts_with(&self.dir, drafts, self.now_ms, self.writers)
+        write_l0_family_parts_with(&self.dir, drafts, self.now_ms, self.writers)
     }
 }
 
@@ -796,6 +816,7 @@ struct InFlightFlush {
 /// What [`Ingestor::commit_add`] needs of a finished part once it is
 /// published: owned, so the immutable output stays with its flush while the
 /// append and the prevalence apply await (NAN-4539 cancellation safety).
+#[derive(Clone)]
 struct AddPart {
     part_id: PartId,
     partial_prevalence: PathBuf,
@@ -808,6 +829,30 @@ fn add_parts(finished: &[FinishedPart]) -> Vec<AddPart> {
         partial_prevalence: part.dir.join(crate::parts::format::PARTIAL_PREVALENCE_FILE),
         max_time_us: part.record.max_time_us,
     }).collect()
+}
+
+/// NAN-4737: a committed `Add` whose prevalence apply was deferred off the
+/// serial commit, to run beside the next admission's parse. Only metadata:
+/// the partials stay on disk in the flight's part directories.
+struct DeferredApply {
+    seq: u64,
+    entry_sha256: String,
+    refs: Vec<PartRef>,
+    parts: Vec<AddPart>,
+    /// The state's complete cursor when it was deferred `(seq, digest)`:
+    /// the entry applies on its own only while the cursor is still there
+    /// (a reopen, rotation or lost WAL tail meanwhile goes through the
+    /// replay, which never skips an entry).
+    cursor: (u64, String),
+    /// The `tick_ingest` that deferred it; the next one applies it at the
+    /// latest.
+    tick: u64,
+}
+
+/// NAN-4737: the state's cursor if it is complete (no part half-applied).
+async fn complete_cursor(prevalence: Option<&IngestPrevalence>) -> Option<(u64, String)> {
+    let cursor = prevalence?.applied().await.ok()??;
+    cursor.is_complete().then_some((cursor.seq, cursor.entry_sha256))
 }
 
 /// Where the tenant prevalence state stands against the part log. Rows are
@@ -859,6 +904,7 @@ fn spawn_prevalence_open(cfg: &IngestConfig, access: Option<PrevalenceAccess>, p
     let work_dir = cfg.work_dir.clone();
     let reads = cfg.prevalence_read_store.clone();
     let cache_cap = cfg.prevalence_cache_max_bytes;
+    let local_sizing = cfg.prevalence_local_sizing;
     #[cfg(test)]
     let main_read_policy = cfg.prevalence_main_read_policy;
     let handle = tokio::spawn(async move {
@@ -868,7 +914,7 @@ fn spawn_prevalence_open(cfg: &IngestConfig, access: Option<PrevalenceAccess>, p
                     "closing the prevalence state opened on a superseded grant failed");
             }
         }
-        let opened = IngestPrevalence::open_sized(&tenant, &work_dir, access.as_ref(), reads, cache_cap);
+        let opened = IngestPrevalence::open_sized(&tenant, &work_dir, access.as_ref(), reads, cache_cap, local_sizing);
         #[cfg(test)]
         { return super::prevalence_io::MAIN_POLICY.scope(main_read_policy, opened).await; }
         #[cfg(not(test))]
@@ -979,10 +1025,16 @@ pub struct Ingestor<'a> {
     catalog_held_since_ms: Option<i64>,
     catalog_held_logged_ms: Option<i64>,
     local_gc: Option<Arc<crate::lake_part_gc::local::LocalDeleteAuthority>>,
+    /// NAN-4726: when the hosted retention retire step last scanned the live
+    /// set (at most once per [`HOSTED_RETENTION_SCAN_INTERVAL_MS`]).
+    last_retention_scan_ms: Option<i64>,
     last_sanctioned_pass_ms: Option<i64>,
     /// NAN-3818: the last sanctioned pass stopped after one bounded log-fold
     /// step; the next step is due after [`SANCTIONED_GC_CATCH_UP_INTERVAL_MS`].
     sanctioned_gc_catching_up: bool,
+    /// NAN-4728: wall time the last foreground sanctioned pass held the
+    /// ingestor; paces catch-up passes ([`sanctioned_pass_due_paced`]).
+    last_sanctioned_pass_busy_ms: i64,
     /// NAN-3852: receipted deletes from completed sanctioned-pass reports
     /// (process life). `health.part_gc_deleted_total` is the max of this and
     /// the pass's live counter, so neither double counts.
@@ -1050,6 +1102,13 @@ pub struct Ingestor<'a> {
     /// prevalence state. Merges wait for replay: merging an unapplied L0
     /// away would lose its observations.
     prevalence_pending: bool,
+    /// NAN-4737: at most one committed `Add` whose apply runs beside the
+    /// next admission's parse (`prevalence_pending` stays set until it
+    /// lands, so stamps, merges and restamps wait exactly as for any owed
+    /// apply, and a crash leaves it to the cursor replay).
+    prevalence_deferred: Option<DeferredApply>,
+    /// `tick_ingest` calls so far (bounds a deferred apply to one tick).
+    ingest_ticks: u64,
     prevalence_phase: PrevalencePhase,
     /// The saved rebuild part list while `Rebuilding`.
     prevalence_rebuild: Option<Arc<[PartRef]>>,
@@ -1761,6 +1820,7 @@ pub const SEAL_FIRST_MIN_ROWS: usize = L0_PARALLEL_MIN_ROWS;
 pub use super::memory::MAX_PARALLEL_L0_WRITES;
 
 /// L0 parts a flush of `buffer` writes: [`l0_chunks`] of every hour.
+#[cfg(test)]
 fn planned_l0_parts(buffer: &Buffered) -> usize {
     buffer.hours.values()
         .map(|batches| l0_chunks(batches.iter().map(|batch| batch.num_rows()).sum()).len())
@@ -1769,12 +1829,100 @@ fn planned_l0_parts(buffer: &Buffered) -> usize {
 
 /// `(offset, len)` row ranges an hour of `rows` sorted rows is written as.
 pub fn l0_chunks(rows: usize) -> Vec<(usize, usize)> {
+    l0_chunks_into(rows, (rows / L0_PARALLEL_MIN_ROWS).clamp(1, MAX_PARALLEL_L0_WRITES))
+}
+
+/// `(offset, len)` ranges cutting `rows` into at most `parts` equal ranges.
+fn l0_chunks_into(rows: usize, parts: usize) -> Vec<(usize, usize)> {
     if rows == 0 {
         return Vec::new();
     }
-    let parts = (rows / L0_PARALLEL_MIN_ROWS).clamp(1, MAX_PARALLEL_L0_WRITES);
-    let size = rows.div_ceil(parts);
+    let size = rows.div_ceil(parts.max(1));
     (0..rows).step_by(size).map(|offset| (offset, size.min(rows - offset))).collect()
+}
+
+/// NAN-4750: dedicated `(source, class)` L0 drafts one hour of one flush
+/// may get, beside its one mixed rest group. With the rest that is at most
+/// [`MAX_PARALLEL_L0_WRITES`] groups, so an hour of a flush writes at most
+/// `max(l0_chunks(rows).len(), groups)` <= `MAX_PARALLEL_L0_WRITES` L0
+/// parts: never more than a 64k-row flush hour already wrote before.
+pub const MAX_L0_CLASS_DRAFTS: usize = MAX_PARALLEL_L0_WRITES - 1;
+
+/// NAN-4750: the `(source, class)` families of one hour's buffered rows
+/// that get their own class-labelled L0 part: those of at least
+/// [`super::merge::CLASS_FAMILY_MIN_ROWS`] rows (the hour merge's floor for
+/// a dedicated file), largest first, at most [`MAX_L0_CLASS_DRAFTS`]. Rows
+/// without a source or class (and batches whose schema has neither yet) are
+/// not counted; they stay in the mixed rest. Only the choice depends on
+/// these counts: [`split_l0_families`] decides each row's group on the
+/// aligned rows themselves.
+fn l0_class_families(batches: &[RecordBatch]) -> Result<Vec<(String, i64)>> {
+    // A low-rate flush (the common case) skips the per-row count on the tick.
+    if (batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64) < super::merge::CLASS_FAMILY_MIN_ROWS {
+        return Ok(Vec::new());
+    }
+    let mut counts = super::merge::ClassCounts::new();
+    for batch in batches {
+        if batch.column_by_name("class_uid").is_none() || super::writer::log_source_strings(batch).is_err() {
+            continue;
+        }
+        super::merge::count_source_classes(batch, &mut counts)?;
+    }
+    Ok(super::merge::ranked_class_families(counts, super::merge::CLASS_FAMILY_MIN_ROWS, MAX_L0_CLASS_DRAFTS)
+        .into_iter().map(|(family, _)| family).collect())
+}
+
+/// NAN-4750: split one hour's `(time, uid)`-sorted rows into the
+/// dedicated `families` (in that order) and the mixed rest (last). Each
+/// group keeps the sorted order; empty groups are dropped. Every row lands
+/// in exactly one group.
+fn split_l0_families(batch: &RecordBatch, families: &[(String, i64)]) -> Result<Vec<(Option<(String, i64)>, RecordBatch)>> {
+    if families.is_empty() || batch.num_rows() == 0 {
+        return Ok(vec![(None, batch.clone())]);
+    }
+    let sources = super::writer::log_source_strings(batch)?;
+    let classes = batch.column_by_name("class_uid");
+    let mut rows: Vec<Vec<u32>> = vec![Vec::new(); families.len() + 1];
+    for row in 0..batch.num_rows() {
+        let group = if arrow_array::Array::is_null(&sources, row) { None } else {
+            super::merge::class_at(classes, row).and_then(|class| {
+                let source = sources.value(row);
+                families.iter().position(|(s, c)| *c == class && s == source)
+            })
+        };
+        rows[group.unwrap_or(families.len())].push(u32::try_from(row)?);
+    }
+    let mut groups = Vec::with_capacity(rows.len());
+    for (index, indices) in rows.into_iter().enumerate() {
+        if indices.is_empty() {
+            continue;
+        }
+        let indices = arrow_array::UInt32Array::from(indices);
+        let columns = batch.columns().iter().map(|column| arrow_select::take::take(column.as_ref(), &indices, None))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        groups.push((families.get(index).cloned(), RecordBatch::try_new(batch.schema(), columns)?));
+    }
+    ensure!(groups.iter().map(|(_, rows)| rows.num_rows()).sum::<usize>() == batch.num_rows(), "L0 family split lost rows");
+    Ok(groups)
+}
+
+/// NAN-4750: L0 parts per group of `rows` (an hour's family groups): each
+/// group as [`l0_chunks`] would cut it, then trimmed (fewest rows per part
+/// first) until the hour writes at most `max(l0_chunks(total).len(),
+/// groups)` parts. A class split therefore adds parts only to an hour of
+/// fewer than `MAX_PARALLEL_L0_WRITES * L0_PARALLEL_MIN_ROWS` rows, and at
+/// most [`MAX_L0_CLASS_DRAFTS`] of them.
+fn l0_group_parts(rows: &[usize]) -> Vec<usize> {
+    let total = rows.iter().sum::<usize>();
+    let budget = l0_chunks(total).len().max(rows.len());
+    let mut parts = rows.iter().map(|rows| (rows / L0_PARALLEL_MIN_ROWS).clamp(1, MAX_PARALLEL_L0_WRITES)).collect::<Vec<_>>();
+    while parts.iter().sum::<usize>() > budget {
+        // Some group has more than one part: the sum exceeds the group count.
+        let index = (0..parts.len()).filter(|i| parts[*i] > 1)
+            .min_by_key(|i| (rows[*i] / parts[*i], *i)).expect("a group with more than one part");
+        parts[index] -= 1;
+    }
+    parts
 }
 
 /// NAN-4674: a buffered batch below this many rows is tiny.
@@ -1839,9 +1987,20 @@ pub(crate) fn write_l0_parts(dir: &Path, drafts: Vec<(PartDraft, RecordBatch)>, 
 }
 
 /// [`write_l0_parts`] with at most `writers` part writers at once.
+#[cfg(test)]
 pub(crate) fn write_l0_parts_with(dir: &Path, drafts: Vec<(PartDraft, RecordBatch)>, now_ms: i64, writers: usize) -> Result<Vec<FinishedPart>> {
-    let write = |(draft, batch): (PartDraft, RecordBatch)| -> Result<FinishedPart> {
+    write_l0_family_parts_with(dir, drafts.into_iter().map(|(draft, batch)| (draft, batch, None)).collect(), now_ms, writers)
+}
+
+/// [`write_l0_parts_with`] where a draft may name the one `(source, class)`
+/// family all its rows belong to (NAN-4750: its files are class-labelled).
+pub(crate) fn write_l0_family_parts_with(dir: &Path, drafts: Vec<(PartDraft, RecordBatch, Option<(String, i64)>)>, now_ms: i64,
+    writers: usize) -> Result<Vec<FinishedPart>> {
+    let write = |(draft, batch, family): (PartDraft, RecordBatch, Option<(String, i64)>)| -> Result<FinishedPart> {
         let mut writer = PartWriter::create(dir, draft, PartialSource::FromRows, now_ms, batch.num_rows() as u64)?;
+        if let Some((source, class)) = family {
+            writer.label_l0_class_family(&source, class)?;
+        }
         writer.write(&batch)?;
         writer.finish()
     };
@@ -1918,6 +2077,27 @@ async fn initialize_finding_attempt_index(store: &dyn ObjectStore, tenant_id: &s
             "finding attempt index marker differs");
     }
     Ok(())
+}
+
+/// NAN-4749: `f` on every admission row, in
+/// [`super::schema::DECODE_CHUNK_ROWS`] chunks on the rayon pool like the
+/// decode (row order and results are the serial ones); one chunk runs inline.
+fn for_each_row_chunk<T: Send>(rows: &mut [T], f: impl Fn(&mut [T]) -> Result<()> + Sync + Send) -> Result<()> {
+    use rayon::prelude::*;
+    if rows.len() <= super::schema::DECODE_CHUNK_ROWS {
+        return f(rows);
+    }
+    rows.par_chunks_mut(super::schema::DECODE_CHUNK_ROWS).try_for_each(f)
+}
+
+/// NAN-4749: `f` of every admission row, row-aligned, chunked like
+/// [`for_each_row_chunk`].
+fn map_rows<T: Sync, U: Send>(rows: &[T], f: impl Fn(&T) -> U + Sync + Send) -> Vec<U> {
+    use rayon::prelude::*;
+    if rows.len() <= super::schema::DECODE_CHUNK_ROWS {
+        return rows.iter().map(f).collect();
+    }
+    rows.par_iter().with_min_len(super::schema::DECODE_CHUNK_ROWS).map(f).collect()
 }
 
 fn strip_untrusted_risk_fields(event: &mut Value) {
@@ -2077,8 +2257,10 @@ impl<'a> Ingestor<'a> {
             catalog_held_since_ms: None,
             catalog_held_logged_ms: None,
             local_gc: None,
+            last_retention_scan_ms: None,
             last_sanctioned_pass_ms: None,
             sanctioned_gc_catching_up: false,
+            last_sanctioned_pass_busy_ms: 0,
             gc_deleted_reported: 0,
             last_gc_block_reason: None,
             gc_blocked_since_ms: None,
@@ -2110,6 +2292,8 @@ impl<'a> Ingestor<'a> {
             background_signer: None,
             reindex_fetch: None,
             prevalence_pending: false,
+            prevalence_deferred: None,
+            ingest_ticks: 0,
             prevalence_phase: PrevalencePhase::Disabled,
             prevalence_rebuild: None,
             prevalence_partial: None,
@@ -3923,6 +4107,8 @@ impl<'a> Ingestor<'a> {
     /// there resumes next tick from the state's cursor), so a store hung on
     /// R2 costs a tick seconds, never `prevalence_op_timeout`.
     pub async fn tick_prevalence(&mut self, now_ms: i64) {
+        // NAN-4731: per-phase elapsed times (heartbeat `operation_timings`).
+        let _timing = self.diagnostics.operations.start("tick_prevalence");
         self.tick_prevalence_step(now_ms).await;
         // NAN-3864: keep the owed restamp hours saved in the tenant bucket.
         self.sync_restamp_owed(now_ms).await;
@@ -4022,7 +4208,9 @@ impl<'a> Ingestor<'a> {
         // Before admission, so a short catch-up (a restart) stamps this tick.
         let has_work = match self.prevalence_phase {
             PrevalencePhase::Disabled => false,
-            PrevalencePhase::Stamping => self.prevalence_pending,
+            // NAN-4737: a deferred apply is the next admission's, beside its
+            // parse; replaying it here would serialize it again.
+            PrevalencePhase::Stamping => self.prevalence_pending && self.prevalence_deferred.is_none(),
             PrevalencePhase::Rebuilding { .. } | PrevalencePhase::CatchingUp | PrevalencePhase::Resetting => true,
         };
         if has_work && self.prevalence_catch_up_reading() {
@@ -4200,7 +4388,7 @@ impl<'a> Ingestor<'a> {
         let left = wait.saturating_sub(started.elapsed());
         let prevalence = self.prevalence.as_mut()?;
         prevalence.advance_watermark(now_ms.saturating_mul(1_000));
-        let artifacts = match super::prevalence::stamp_artifacts(rows.iter().map(|row| &row.ocsf_event)) {
+        let artifacts = match super::prevalence::stamp_artifacts_of(rows) {
             Ok(artifacts) => artifacts,
             Err(error) => {
                 tracing::error!(error = %format!("{error:#}"),
@@ -4245,6 +4433,7 @@ impl<'a> Ingestor<'a> {
     /// Tick phase 2: edge points, admission and the due flush.
     pub async fn tick_ingest(&mut self, now_ms: i64) -> Result<(TickReport, Vec<(NoticeHandle, SourceNotice)>)> {
         self.restore_quarantine(now_ms).await;
+        self.ingest_ticks += 1;
         let mut report = TickReport::default();
         // Late-tier runs finished in the background since the last tick.
         self.late.poll(now_ms).await;
@@ -4286,8 +4475,11 @@ impl<'a> Ingestor<'a> {
         // room left for its peak (JSON values while they decode) plus the
         // Arrow rows it adds. With nothing else held, at least one object is
         // admitted so a huge object still makes progress.
-        let (mut predicted_heap, mut predicted_arrow) = (0.0, 0.0);
+        // NAN-4749: the room is per admission group (decoded one after
+        // another), not for the whole tick at once.
         let committed = self.committed_bytes();
+        let mut packing = super::memory::AdmissionGroups::new(self.cfg.buffer_budget_bytes, committed,
+            self.buffer.bytes, self.buffer.rows as u64);
         let idle = self.buffer.bytes == 0 && self.flush_in_flight.is_empty();
         let mut held_bytes = 0_u64;
         let hold_budget = self.admission_byte_budget;
@@ -4302,10 +4494,15 @@ impl<'a> Ingestor<'a> {
                 *index == 0 || hold_budget.is_none_or(|budget| held_bytes <= budget)
             })
             .take_while(|(index, (_, notice))| {
-                predicted_heap += notice.bytes as f64 * self.heap_per_source_byte;
-                predicted_arrow += notice.bytes as f64 * self.arrow_per_source_byte;
-                *index == 0 && idle
-                    || super::memory::admission_fits(self.cfg.buffer_budget_bytes, committed, predicted_heap, predicted_arrow)
+                let (heap, arrow) = (notice.bytes as f64 * self.heap_per_source_byte, notice.bytes as f64 * self.arrow_per_source_byte);
+                if packing.offer(heap, arrow, 0) != super::memory::Offer::Refused {
+                    return true;
+                }
+                if *index == 0 && idle {
+                    packing.force(heap, arrow, 0);
+                    return true;
+                }
+                false
             })
             .map(|(_, notice)| notice.clone())
             .collect::<Vec<_>>();
@@ -4329,7 +4526,9 @@ impl<'a> Ingestor<'a> {
             let fresh = self.crash_guard(fresh, now_ms).await?;
             if !fresh.is_empty() {
                 let started = cpu_now();
+                let admission_timing = self.diagnostics.operations.start("admission");
                 let (rows, dups) = self.admit(&fresh, now_ms).await?;
+                drop(admission_timing);
                 self.health.cpu_ms_admission += cpu_now().saturating_sub(started);
                 report.admitted_rows = rows;
                 report.admitted_bytes = fresh.iter().map(|(_, notice)| notice.bytes).sum();
@@ -4378,14 +4577,34 @@ impl<'a> Ingestor<'a> {
             // Behind, the flush pipelines: its build and upload overlap the
             // next admissions (the cell supplies the 'static handles).
             // A replay retry never pipelines (NAN-3643).
+            let pipelined_before = self.health.flushes_pipelined_total;
             report.flushed_parts += self.flush(now_ms, behind && self.buffer.replay.is_none()).await?;
             self.health.cpu_ms_parts += cpu_now().saturating_sub(started);
+            // NAN-4731: a pipelined seal while behind empties the buffer and
+            // notices are waiting. The admission wake above is skipped when
+            // the seal was forced by a deferred object (`admission_deferred`),
+            // and the flight wakes the loop only once it is published
+            // (~2 s), so the cell loop idled on its 1 s timer once per flush
+            // (the NAN-4689 soak: ~1 s of every ~8.6 s flush cycle). Admit the
+            // next round now; its room is the budget beside the new flight.
+            if behind && self.health.flushes_pipelined_total > pipelined_before {
+                if let Some(wake) = &self.flight_wake {
+                    wake.notify_one();
+                }
+            }
+        }
+        // NAN-4737: an apply deferred by an earlier tick whose admission
+        // never came (nothing fresh, paused, the buffer full) lands now: a
+        // deferral outlives at most one ingest phase.
+        if self.prevalence_deferred.as_ref().is_some_and(|deferred| deferred.tick < self.ingest_ticks) {
+            self.finish_deferred_prevalence(now_ms).await;
         }
         Ok((report, pending))
     }
 
     /// Tick phase 3: merges, GC, evictions, export plan, health.
     pub async fn tick_maintain(&mut self, now_ms: i64, pending: &[(NoticeHandle, SourceNotice)], report: &mut TickReport) -> Result<()> {
+        let _timing = self.diagnostics.operations.start("tick_maintain");
         // NAN-3619: commit flights that finished during the ingest phase
         // before merges and GC take their turn (ready ones only, in order).
         // A failure keeps the flight oldest; the next ingest phase retries
@@ -4423,6 +4642,8 @@ impl<'a> Ingestor<'a> {
             if let Err(error) = self.retire_local_expired(&authority, now_ms).await {
                 tracing::warn!(error = %error, "local retention retirement failed; keeping parts");
             }
+        } else if let Err(error) = self.retire_hosted_expired(now_ms).await {
+            tracing::warn!(error = %format!("{error:#}"), "hosted retention retirement failed; keeping parts");
         }
         self.evict_superseded_cache(now_ms);
         self.tick_catalog(now_ms).await;
@@ -4777,7 +4998,11 @@ impl<'a> Ingestor<'a> {
         let idle = self.buffer.bytes == 0 && self.flush_in_flight.is_empty();
         // NAN-4553: the first object from idle, recorded before its fetch.
         let mut recorded: Option<String> = None;
-        let mut decoded_total = 0_u64;
+        // NAN-4749: the tick's objects, packed into groups that decode one
+        // after another (`files` indices where a group starts).
+        let mut packing = super::memory::AdmissionGroups::new(self.cfg.buffer_budget_bytes, committed,
+            self.buffer.bytes, self.buffer.rows as u64);
+        let mut group_starts: Vec<usize> = Vec::new();
         // NAN-4553: rows per slice of a lone object too large to admit whole.
         let mut slice_rows: Option<u64> = None;
         for (handle, notice) in notices {
@@ -4848,9 +5073,15 @@ impl<'a> Ingestor<'a> {
             // role every 2-3 min, and the crash ledger then quarantined it
             // as "poison". An object that does not fit alone is admitted in
             // row slices, one slice's JSON values at a time.
+            //
+            // NAN-4749: a group's JSON values are freed once it decodes, so
+            // an object that does not fit the open group may start the next
+            // one ([`super::memory::AdmissionGroups`]).
             let decoded = crate::bronze::bronze_file_decoded_bytes(&target).unwrap_or(0);
-            let (heap, arrow) = decoded_admission_cost(decoded_total + decoded);
-            let fits = super::memory::admission_fits(self.cfg.buffer_budget_bytes, committed, heap, arrow);
+            let (heap, arrow) = decoded_admission_cost(decoded);
+            let rows = crate::bronze::bronze_file_row_count(&target).unwrap_or(0);
+            let offer = if slice_rows.is_some() { super::memory::Offer::Refused } else { packing.offer(heap, arrow, rows) };
+            let fits = offer != super::memory::Offer::Refused;
             if !(files.is_empty() && idle) && !fits {
                 let _ = std::fs::remove_file(&target);
                 // NAN-4539 step 3a: seal only when the buffer (with the
@@ -4863,16 +5094,17 @@ impl<'a> Ingestor<'a> {
                 if !super::memory::admission_fits(self.cfg.buffer_budget_bytes, committed, alone_heap, alone_arrow) {
                     self.admission_deferred = true;
                 }
-                tracing::info!(objects_admitted = files.len(), decoded_bytes = decoded_total + decoded,
+                tracing::info!(objects_admitted = files.len(), groups = packing.groups(), decoded_bytes = decoded,
                     "admission bounded by decoded size; the rest stays pending");
                 break;
             }
             if !fits {
-                let rows = crate::bronze::bronze_file_row_count(&target).unwrap_or(0);
-                let (heap, arrow) = decoded_admission_cost(decoded);
                 slice_rows = Some(super::memory::admission_slice_rows(self.cfg.buffer_budget_bytes, committed, heap, arrow, rows));
+                packing.force(heap, arrow, rows);
             }
-            decoded_total += decoded;
+            if offer == super::memory::Offer::NewGroup {
+                group_starts.push(files.len());
+            }
             let path = src_dir.join(format!("{sha}.parquet"));
             std::fs::rename(&target, &path)?;
             files.push((handle.clone(), notice.clone(), path, sha, bytes));
@@ -4948,7 +5180,11 @@ impl<'a> Ingestor<'a> {
             clamped: BTreeMap<String, i64>,
         }
         let mut queue: Vec<Vec<File>> = if slices.is_empty() {
-            vec![files.iter().collect()]
+            // A stack: the first group is admitted first (NAN-4749).
+            let mut bounds = vec![0];
+            bounds.extend(group_starts.iter().copied());
+            bounds.push(files.len());
+            bounds.windows(2).rev().map(|range| files[range[0]..range[1]].iter().collect()).collect()
         } else {
             // A stack: the first slice is admitted first.
             slices.iter().rev().map(|slice| vec![slice]).collect()
@@ -4970,7 +5206,27 @@ impl<'a> Ingestor<'a> {
                 received_ms: group.iter().map(|f| (f.2.clone(), f.1.notified_at_ms)).collect(),
                 now_ms,
             };
-            let admission_result = admit_bronze_files_received(&paths, &self.cfg.tenant_id, &self.enricher, &ingest_times);
+            // With a deferred apply this is the wall time of both (the apply
+            // is also timed on its own as `prevalence_apply`).
+            let parse_timing = self.diagnostics.operations.start("admission_parse");
+            let admission_result = if self.prevalence_deferred.is_some() {
+                // NAN-4737: the previous flush's prevalence apply runs on
+                // this task while the group parses on the blocking pool; the
+                // stamp below then reads a state holding that flush.
+                let (owned_paths, tenant, enricher, times) =
+                    (paths.clone(), self.cfg.tenant_id.clone(), self.enricher.clone(), ingest_times.clone());
+                let parse = tokio::task::spawn_blocking(move || admit_bronze_files_received(&owned_paths, &tenant, &enricher, &times));
+                self.finish_deferred_prevalence(now_ms).await;
+                match parse.await {
+                    Ok(result) => result,
+                    Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                    // Cancelled with the runtime: transient, never a refusal.
+                    Err(error) => Err(anyhow::Error::new(std::io::Error::other(format!("admission parse task: {error}")))),
+                }
+            } else {
+                admit_bronze_files_received(&paths, &self.cfg.tenant_id, &self.enricher, &ingest_times)
+            };
+            drop(parse_timing);
             #[cfg(test)]
             let admission_result = if self.refuse_admissions {
                 Err(anyhow::anyhow!("simulated admission bug"))
@@ -5058,15 +5314,20 @@ impl<'a> Ingestor<'a> {
             // This namespace belongs to the authenticated finding-outbox
             // drain. A raw event must not become a risk contribution after
             // its part is merged with a genuine finding part.
-            for row in &mut rows {
-                strip_untrusted_risk_fields(&mut row.ocsf_event);
-            }
+            for_each_row_chunk(&mut rows, |chunk| {
+                chunk.iter_mut().for_each(|row| strip_untrusted_risk_fields(&mut row.ocsf_event));
+                Ok(())
+            })?;
             // A failed or slow lookup never fails or holds the tick: this
             // batch goes unstamped (a partial stamp is stripped whole).
             // Unstamped (no grant, rebuilding, catching up, state busy): a
             // source-supplied value must not pose as ours.
-            let stamped = match self.stamp_lookup(&rows, now_ms).await {
-                Some(observed) => match observed.stamp(rows.iter_mut().map(|row| &mut row.ocsf_event)) {
+            let stamp_timing = self.diagnostics.operations.start("stamp_lookup");
+            let observed = self.stamp_lookup(&rows, now_ms).await;
+            drop(stamp_timing);
+            let stamped = match observed {
+                // NAN-4749: chunked; a failed chunk strips the batch whole below.
+                Some(observed) => match for_each_row_chunk(&mut rows, |chunk| observed.stamp(chunk.iter_mut().map(|row| &mut row.ocsf_event))) {
                     Ok(()) => true,
                     Err(error) => {
                         tracing::error!(error = %format!("{error:#}"),
@@ -5077,21 +5338,16 @@ impl<'a> Ingestor<'a> {
                 None => false,
             };
             if !stamped {
-                rows.iter_mut().for_each(|row| super::prevalence::strip_stamps(&mut row.ocsf_event));
+                for_each_row_chunk(&mut rows, |chunk| {
+                    chunk.iter_mut().for_each(|row| super::prevalence::strip_stamps(&mut row.ocsf_event));
+                    Ok(())
+                })?;
             }
             // Admission normalized `time`; a row whose time still does not
             // parse is refused alone (never a tick error).
-            let mut bad_time = BTreeSet::new();
-            let times = rows
-                .iter()
-                .enumerate()
-                .map(|(index, row)| {
-                    event_time_us(&row.ocsf_event).unwrap_or_else(|_| {
-                        bad_time.insert(index);
-                        0
-                    })
-                })
-                .collect::<Vec<_>>();
+            let parsed = map_rows(&rows, |row| event_time_us(&row.ocsf_event).ok());
+            let bad_time = parsed.iter().enumerate().filter(|(_, time)| time.is_none()).map(|(index, _)| index).collect::<BTreeSet<_>>();
+            let times = parsed.into_iter().map(|time| time.unwrap_or(0)).collect::<Vec<_>>();
             // NAN-3864: rows written unstamped while the tenant holds a grant
             // are owed a restamp once the state reaches the log head; never
             // left null for their retention.
@@ -5274,6 +5530,10 @@ impl<'a> Ingestor<'a> {
             // NAN-4573: the hours each clamped row is also checked against
             // and recorded under (see the preparation above).
             let original_hour = |index: usize, hour: i32| original_hour_of(&clamped, &uids, index, hour);
+            // NAN-4749: the window keys (a keyed hash per uid) off the
+            // serial window walk, chunked on the rayon pool.
+            let window = &self.window;
+            let keys = map_rows(&uids, |uid| window.key(uid));
             for (hour, rows) in by_hour {
                 let mut keep = Vec::with_capacity(rows.len());
                 // NAN-3703: an hour the late tier holds is checked against
@@ -5285,7 +5545,7 @@ impl<'a> Ingestor<'a> {
                     self.buffer.rows_in += 1;
                     rows_total += 1;
                     let payload = payloads[index];
-                    let key = self.window.key(uid);
+                    let key = keys[index];
                     let original = original_hour(index, hour);
                     let seen = if tiered && !self.window.contains_key(hour, &key) && self.late.contains(hour, &key) {
                         self.health.late_dedup_tier_duplicates_total += 1;
@@ -6306,7 +6566,10 @@ impl<'a> Ingestor<'a> {
             let parts = add_parts(front.built.as_ref().expect("published output is retained"));
             let (consumed, range) = (consumed_sources(&front.buffer), front.buffer.issued_range.clone());
             self.diagnostics.stage("append_part_log");
-            let count = self.commit_add(&parts, refs, consumed, range, now_ms).await?;
+            // NAN-4737: behind with a background pipeline, the next
+            // admission follows: its parse runs beside this add's apply.
+            let defer_apply = self.behind_last_tick && self.background_parts.is_some();
+            let count = self.commit_add(&parts, refs, consumed, range, now_ms, defer_apply).await?;
             let front = self.flush_in_flight.front_mut().expect("oldest flight");
             front.buffer.parts_committed = count;
             front.buffer.add_committed = true;
@@ -6504,6 +6767,18 @@ impl<'a> Ingestor<'a> {
         }
         let mut sources = buffer.sources.clone();
         sources.sort();
+        // NAN-4750: the open hour's L0 parts are class-pure where a class
+        // fills a dedicated part, so class-filtered queries prune them.
+        let hours = buffer.hours.iter()
+            .map(|(hour, batches)| Ok((*hour, batches.clone(), buffer.hour_duplicates.get(hour).copied().unwrap_or_default(),
+                l0_class_families(batches)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let planned_parts = hours.iter()
+            .map(|(_, batches, _, families)| {
+                let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                l0_chunks(rows).len().max(usize::from(rows > 0) + families.len())
+            })
+            .sum::<usize>();
         Ok(FlushPlan {
             dir: parts_dir(&self.cfg.work_dir),
             tenant_id: self.cfg.tenant_id.clone(),
@@ -6514,13 +6789,12 @@ impl<'a> Ingestor<'a> {
             sources,
             edge_log,
             build: self.cfg.build.clone(),
-            hours: buffer.hours.iter()
-                .map(|(hour, batches)| (*hour, batches.clone(), buffer.hour_duplicates.get(hour).copied().unwrap_or_default()))
-                .collect(),
+            hours,
             now_ms,
             // NAN-4539 step 3a: reserve only the writers the plan can use
-            // (`write_l0_parts_with` runs at most one per part).
-            writers: self.flush_writers(buffer.bytes).min(planned_l0_parts(buffer).max(1)),
+            // (`write_l0_parts_with` runs at most one per part; NAN-4750:
+            // at most this many with its class drafts).
+            writers: self.flush_writers(buffer.bytes).min(planned_parts.max(1)),
         })
     }
 
@@ -6563,7 +6837,7 @@ impl<'a> Ingestor<'a> {
         plan.admission = previous.record.admission.clone().context("L0 admission missing")?;
         plan.signer_key_id = previous.record.signer_key_id.clone();
         plan.build = previous.record.writer.build.clone();
-        plan.hours.retain(|(candidate, _, _)| *candidate == hour);
+        plan.hours.retain(|(candidate, _, _, _)| *candidate == hour);
         ensure!(!plan.hours.is_empty(), "unresolved publication has no buffered rows");
         let rebuilt = plan.build()?;
         let old_rows = finished.iter().filter(|part| part.record.event_hour == hour)
@@ -6592,7 +6866,7 @@ impl<'a> Ingestor<'a> {
             Ok(refs) => {
                 let parts = add_parts(finished_parts);
                 let consumed = consumed_sources(&self.buffer);
-                self.commit_add(&parts, refs, consumed, edge_log, now_ms).await
+                self.commit_add(&parts, refs, consumed, edge_log, now_ms, false).await
             }
             Err(error) => Err(error),
         };
@@ -6617,8 +6891,17 @@ impl<'a> Ingestor<'a> {
     /// already knows every one of its parts it is adopted, never appended
     /// again (that would double-consume its sources, a fatal error), and its
     /// prevalence apply is left to the exactly-once cursor replay.
+    /// `defer_apply` (NAN-4737, pipelined catch-up only): the prevalence
+    /// apply of this `Add` may run beside the next admission's parse
+    /// instead of on the serial commit. Ack ordering is unchanged: the
+    /// caller acks after this returns, i.e. after the append is durable; the
+    /// apply is replayable from the log and is not an ack precondition.
     async fn commit_add(&mut self, finished_parts: &[AddPart], refs: Vec<PartRef>, consumed: Vec<SourceRef>,
-        edge_log: Option<crate::parts::EdgeLogRange>, now_ms: i64) -> Result<usize> {
+        edge_log: Option<crate::parts::EdgeLogRange>, now_ms: i64, defer_apply: bool) -> Result<usize> {
+        // NAN-4737: at most one deferred apply. A second commit before the
+        // next admission applies the first now (backpressure), so the cursor
+        // is at the previous `Add` again before this one is appended.
+        self.finish_deferred_prevalence(now_ms).await;
         let count = refs.len();
         if !refs.is_empty() && refs.iter().all(|part| self.log.live().knows(&part.part_id)) {
             // Defense in depth: the landed add also consumed these sources.
@@ -6657,27 +6940,23 @@ impl<'a> Ingestor<'a> {
         // here waits at most the ingest wait: the commit is already done,
         // and the cursor makes the catch-up exactly-once (a cut apply's
         // chunks and cursor land together or not at all).
-        self.diagnostics.stage("apply_prevalence");
         if self.prevalence_phase == PrevalencePhase::Stamping && self.prevalence_ready() {
-            let _prevalence_timing = self.diagnostics.operations.start("prevalence_apply");
-            let wait = self.ingest_wait();
-            let applied = if already_pending {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(self.cfg.prevalence_rebuild_budget_ms);
-                tokio::time::timeout(wait, self.replay_prevalence(Some(deadline))).await
+            // NAN-4737: the state holds every earlier `Add` (nothing was
+            // pending), so this one is the next to apply. It stays pending
+            // until the next admission's parse runs beside it.
+            let cursor = if defer_apply && !already_pending && self.prevalence_pending {
+                complete_cursor(self.prevalence.as_ref()).await.filter(|(cursor, _)| *cursor < seq)
             } else {
-                tokio::time::timeout(wait, self.apply_committed_prevalence(seq, &entry_sha256, &refs, finished_parts)).await
-                    .map(|applied| applied.map(|()| true))
+                None
             };
-            match applied {
-                Ok(Ok(caught_up)) => {
-                    self.prevalence_progressed();
-                    if caught_up {
-                        self.prevalence_pending = false;
-                    }
-                }
-                Ok(Err(error)) => tracing::warn!(error = %format!("{error:#}"), seq,
-                    "prevalence apply failed after the add committed; replaying before the next merge"),
-                Err(_) => self.prevalence_overran(now_ms, "apply of a committed add"),
+            if let Some(cursor) = cursor {
+                self.diagnostics.stage("apply_prevalence_deferred");
+                self.prevalence_deferred = Some(DeferredApply {
+                    seq, entry_sha256, refs: refs.clone(), parts: finished_parts.to_vec(), cursor, tick: self.ingest_ticks,
+                });
+            } else {
+                self.diagnostics.stage("apply_prevalence");
+                self.apply_committed_add(seq, &entry_sha256, &refs, finished_parts, already_pending, now_ms).await;
             }
         }
         for part in &refs {
@@ -6685,6 +6964,63 @@ impl<'a> Ingestor<'a> {
             self.window.load_marker(part.event_hour, part.part_id.as_str(), now_ms);
         }
         Ok(count)
+    }
+
+    /// Apply a committed `Add` within the ingest wait: the entry itself
+    /// when the state holds every earlier one, else the replay from the
+    /// cursor. Never fails: a cut or failed apply stays pending and the
+    /// cursor replay (merges, the prevalence step) lands it exactly once.
+    async fn apply_committed_add(&mut self, seq: u64, entry_sha256: &str, refs: &[PartRef], finished_parts: &[AddPart],
+        replay: bool, now_ms: i64) {
+        let _prevalence_timing = self.diagnostics.operations.start("prevalence_apply");
+        let wait = self.ingest_wait();
+        let applied = if replay {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(self.cfg.prevalence_rebuild_budget_ms);
+            tokio::time::timeout(wait, self.replay_prevalence(Some(deadline))).await
+        } else {
+            tokio::time::timeout(wait, self.apply_committed_prevalence(seq, entry_sha256, refs, finished_parts)).await
+                .map(|applied| applied.map(|()| true))
+        };
+        match applied {
+            Ok(Ok(caught_up)) => {
+                self.prevalence_progressed();
+                if caught_up {
+                    self.prevalence_pending = false;
+                }
+            }
+            Ok(Err(error)) => tracing::warn!(error = %format!("{error:#}"), seq,
+                "prevalence apply failed after the add committed; replaying before the next merge"),
+            Err(_) => self.prevalence_overran(now_ms, "apply of a committed add"),
+        }
+    }
+
+    /// NAN-4737: land the deferred apply, if any. It runs only while the
+    /// state is still stamping with that `Add` owed; otherwise (closed,
+    /// rotated, rebuilding) it is dropped and the cursor replay owns it. A
+    /// cursor that moved since the deferral (a reopen or rotation that lost
+    /// a WAL tail) or a partial evicted from the local part cache meanwhile
+    /// goes through the replay (retained copy or store) instead.
+    async fn finish_deferred_prevalence(&mut self, now_ms: i64) {
+        let Some(deferred) = self.prevalence_deferred.take() else { return };
+        if !(self.prevalence_pending && self.prevalence_phase == PrevalencePhase::Stamping && self.prevalence_ready()) {
+            return;
+        }
+        let unmoved = complete_cursor(self.prevalence.as_ref()).await.is_some_and(|cursor| cursor == deferred.cursor);
+        // The fast path applies this one entry and then clears pending, so
+        // it is exact only while the deferred `Add` is still the log head. A
+        // finding `Add` (`commit_finding`) committed meanwhile is owed to the
+        // replay; clearing pending after the fast path would skip it, and the
+        // next `Add`'s apply would move the cursor past it for good.
+        let at_head = self.log.live().head().is_some_and(|(head, _, _)| head == deferred.seq);
+        let replay = !unmoved || !at_head || !deferred.parts.iter().all(|part| part.partial_prevalence.exists());
+        self.apply_committed_add(deferred.seq, &deferred.entry_sha256, &deferred.refs, &deferred.parts, replay, now_ms).await;
+    }
+
+    /// NAN-4737: whether a committed `Add`'s apply is waiting for the next
+    /// admission (tests and diagnostics).
+    #[doc(hidden)]
+    pub fn prevalence_apply_deferred(&self) -> bool {
+        self.prevalence_deferred.is_some()
     }
 
     async fn apply_committed_prevalence(&mut self, seq: u64, entry_sha256: &str, refs: &[PartRef],
@@ -6745,7 +7081,11 @@ impl<'a> Ingestor<'a> {
         // partial readable for the replay (local part cache, a retained copy
         // on eviction, or the store within GC grace).
         if self.prevalence_pending {
-            let caught_up = if self.prevalence_phase == PrevalencePhase::Stamping && self.prevalence_ready() {
+            // NAN-4737: a deferred apply lands beside the next admission
+            // (within one tick); merges wait for it like any owed apply.
+            let caught_up = if self.prevalence_deferred.is_none() && self.prevalence_phase == PrevalencePhase::Stamping
+                && self.prevalence_ready()
+            {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(self.cfg.prevalence_rebuild_budget_ms);
                 match tokio::time::timeout(self.ingest_wait(), self.replay_prevalence(Some(deadline))).await {
                     Ok(Ok(true)) => {
@@ -7020,13 +7360,20 @@ impl<'a> Ingestor<'a> {
         // Plans were computed before reaping. A committed job may have
         // superseded a candidate's inputs; never launch that stale plan.
         planned.retain(|merge| merge.inputs.iter().all(|p| self.log.live().get(&p.part_id).is_some()));
-        // Fresh hours first in the minute lane; history takes the most
-        // fragmented hour first, newest on ties (NAN-3400).
-        super::merge_lanes::launch_order(&mut planned);
+        // Fresh hours first in the minute lane; history takes the hour that
+        // just closed first (NAN-4750), then the most fragmented hour,
+        // newest on ties (NAN-3400).
+        super::merge_lanes::launch_order_at(&mut planned, now_ms);
         for merge in planned {
             let minute = merge.output_level == Level::Minute;
             if !minute && (self.catching_up(lag_ms) || self.buffer.rows > 0 || !self.buffer.handles.is_empty())
-                && !self.fragmented_merge_may_run_beside_admission(&merge) {
+                && !self.fragmented_merge_may_run_beside_admission(&merge)
+                && !(super::merge_lanes::fresh_runs_beside_admission(&merge, now_ms, self.catching_up(lag_ms),
+                    self.merge_in_flight.iter().map(|flight| &flight.merge),
+                    || super::merge_lanes::history_memory_admits(super::merge_lanes::MemorySnapshot::read()))
+                    // NAN-4750/NAN-4755: beside a live buffer even a first
+                    // merge must fit the working budget.
+                    && self.committed_bytes().saturating_add(super::merge::merge_reserve_bytes()) <= self.cfg.buffer_budget_bytes) {
                 continue;
             }
             // NAN-3795: count rewrites are bounded by their own lane, not the
@@ -7035,7 +7382,7 @@ impl<'a> Ingestor<'a> {
             let candidate_rewrite = self.is_count_rewrite(&merge);
             let active = self.merge_in_flight.iter().map(|f| &f.merge)
                 .filter(|m| candidate_rewrite || !self.is_count_rewrite(m)).collect::<Vec<_>>();
-            if !super::merge_lanes::available(&merge, &active) { continue; }
+            if !super::merge_lanes::available_at(&merge, &active, now_ms) { continue; }
             if !candidate_rewrite && !minute && active.iter().all(|m| m.output_level == Level::Minute)
                 && self.merge_in_flight.iter().any(|f| self.is_count_rewrite(&f.merge))
                 && !super::merge_lanes::history_memory_admits(super::merge_lanes::MemorySnapshot::read()) {
@@ -7465,18 +7812,51 @@ impl<'a> Ingestor<'a> {
     }
 
     async fn retire_local_expired(&mut self, authority: &crate::lake_part_gc::local::LocalDeleteAuthority, now_ms: i64) -> Result<()> {
-        let Some(days) = authority.refresh_policy().await?.retention_days else { return Ok(()); };
+        let days = authority.refresh_policy().await?.retention_days;
+        self.retire_expired(days, now_ms).await.map(|_| ())
+    }
+
+    /// NAN-4726: the hosted cell's retention step. The retention comes from
+    /// the delete gate (`policy.retention_days` on the exchanged
+    /// `lake_part_gc` route, only while the grant is open); no route, no
+    /// policy, a closed or unreadable gate, or a catalog hold (no
+    /// `gc_authority`) retires nothing. Retired parts are deleted later only
+    /// by the sanctioned pass (owner authorize, control attest, Worker
+    /// delete), once their whole day is past retention. One live-set scan
+    /// per [`HOSTED_RETENTION_SCAN_INTERVAL_MS`]; at most
+    /// [`RETENTION_RETIRE_BATCH`] parts, one log append, per scan.
+    async fn retire_hosted_expired(&mut self, now_ms: i64) -> Result<usize> {
+        let Some(authority) = self.gc_authority.clone() else { return Ok(0) };
+        if self.cfg.catalog_attachment_failure.is_some()
+            || !hosted_retention_scan_due(self.last_retention_scan_ms, now_ms)
+        {
+            return Ok(0);
+        }
+        self.last_retention_scan_ms = Some(now_ms);
+        let days = authority.retention_days(now_ms).await?;
+        self.retire_expired(days, now_ms).await
+    }
+
+    /// Retire (reason `Retention`) live parts whose WHOLE time range is older
+    /// than `now - days`; a part straddling the cutoff stays until its newest
+    /// row expires. `None` retires nothing. Shared by the local (sovereign)
+    /// and hosted steps.
+    async fn retire_expired(&mut self, days: Option<u64>, now_ms: i64) -> Result<usize> {
+        let Some(days) = days.filter(|days| *days > 0) else { return Ok(0); };
         let cutoff_us = now_ms.saturating_sub((days as i64).saturating_mul(86_400_000)).saturating_mul(1_000);
         let expired: Vec<_> = self.log.live().parts()
             .filter(|part| part.max_time_us < cutoff_us)
-            .take(512).map(|part| part.part_id.clone()).collect();
-        if !expired.is_empty() {
+            .take(RETENTION_RETIRE_BATCH).map(|part| part.part_id.clone()).collect();
+        let retired = expired.len();
+        if retired > 0 {
             self.log.append(LogOp::Retire { parts: expired,
                 reason: crate::parts::part_log::RetireReason::Retention,
                 deletion_unit: uuid::Uuid::new_v4().to_string(),
             }, now_ms).await?;
+            tracing::info!(tenant = %self.cfg.tenant_id, retention_days = days, parts = retired,
+                "lake parts past retention retired");
         }
-        Ok(())
+        Ok(retired)
     }
 
     /// Poll and schedule only sanctioned GC. Safe after a retryable ingest
@@ -7570,11 +7950,18 @@ impl<'a> Ingestor<'a> {
                 return Ok(());
             }
         };
-        if !sanctioned_pass_due(self.last_sanctioned_pass_ms, self.sanctioned_gc_catching_up, now_ms) {
+        if !sanctioned_pass_due_paced(self.last_sanctioned_pass_ms, self.sanctioned_gc_catching_up,
+            self.last_sanctioned_pass_busy_ms, now_ms) {
             return Ok(());
         }
         self.last_sanctioned_pass_ms = Some(now_ms);
-        if let Some(result) = pass.schedule_pass(now_ms).await {
+        // NAN-4728: a trusted-local pass runs inline under the ingestor; its
+        // wall time paces the next catch-up pass. A background (hosted) route
+        // returns at once, so its cadence is unchanged.
+        let started = std::time::Instant::now();
+        let result = pass.schedule_pass(now_ms).await;
+        self.last_sanctioned_pass_busy_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        if let Some(result) = result {
             self.record_sanctioned_gc_report(result, pending_parts, pending_bytes, now_ms);
         }
         Ok(())
@@ -7800,6 +8187,13 @@ impl<'a> Ingestor<'a> {
         h.lag_ms = oldest.map_or(0, |o| (now_ms - o).max(0));
         let was_stalled = h.stalled;
         h.stalled = h.lag_ms > self.cfg.lag_alert_ms;
+        // NAN-4721: agent-catalog work (cold serving-epoch prepares) yields
+        // to ingest, and is paced, from before the lag alert (or on cell
+        // strain). Agents never compete with analysts.
+        if let Some(catalog) = &self.cfg.catalog {
+            catalog.ingest_pressure().set(h.stalled
+                || super::agent_lane::agent_pressure(h.lag_ms, self.cfg.lag_alert_ms));
+        }
         h.buffered_rows = self.buffer.rows + self.flush_in_flight.iter().map(|flight| flight.buffer.rows).sum::<usize>();
         h.flushes_in_flight = self.flush_in_flight.len();
         h.window_uids = self.window.len();
@@ -7887,7 +8281,10 @@ impl<'a> Ingestor<'a> {
         // by design and never behind.
         let held = self.prevalence.is_some() || self.prevalence_reopening || self.prevalence_retry.is_some()
             || self.prevalence_opening.is_some();
-        let behind = held && (self.prevalence_pending || self.prevalence_phase != PrevalencePhase::Stamping
+        // NAN-4737: an apply deferred to the next admission (at most one
+        // tick) is the pipeline, not the state falling behind.
+        let owed = self.prevalence_pending && self.prevalence_deferred.is_none();
+        let behind = held && (owed || self.prevalence_phase != PrevalencePhase::Stamping
             || self.prevalence_unplaced || self.prevalence_blocked_since.is_some());
         let head = self.log.live().head().map(|(seq, _, _)| seq);
         h.prevalence_behind_entries = match (behind, head, self.prevalence_applied_seq) {
@@ -7980,11 +8377,41 @@ pub(crate) fn catalog_held_log_due(last_logged_ms: Option<i64>, now_ms: i64) -> 
 /// [`MAX_LOG_ENTRIES_PER_PASS`]: crate::lake_part_gc::executor::MAX_LOG_ENTRIES_PER_PASS
 pub const SANCTIONED_GC_CATCH_UP_INTERVAL_MS: i64 = 5_000;
 
+/// NAN-4726: most parts one retention retire appends (one log entry).
+pub(crate) const RETENTION_RETIRE_BATCH: usize = 512;
+/// NAN-4726: least time between hosted retention scans of the live set.
+pub(crate) const HOSTED_RETENTION_SCAN_INTERVAL_MS: i64 = 60_000;
+
+pub(crate) fn hosted_retention_scan_due(last_scan_ms: Option<i64>, now_ms: i64) -> bool {
+    last_scan_ms.is_none_or(|last| now_ms - last >= HOSTED_RETENTION_SCAN_INTERVAL_MS)
+}
+
 /// Whether ingest starts a sanctioned GC pass now: the first time, after the
 /// pass interval, or after the short catch-up interval while the previous
 /// pass only advanced its log view.
 pub(crate) fn sanctioned_pass_due(last_pass_ms: Option<i64>, catching_up: bool, now_ms: i64) -> bool {
-    let interval = if catching_up { SANCTIONED_GC_CATCH_UP_INTERVAL_MS } else { SANCTIONED_GC_INTERVAL_MS };
+    sanctioned_pass_due_paced(last_pass_ms, catching_up, 0, now_ms)
+}
+
+/// NAN-4728: a catch-up pass starts no sooner than this many times the last
+/// pass's busy time after that pass started, so a backlog drain (each
+/// trusted-local pass hashes, re-checks and fsyncs up to 512 files inline,
+/// holding the ingestor) takes at most 1/N of ingest's wall time. 512 files
+/// per 4 x busy still outruns the ~3 files/s a 12k eps tenant supersedes
+/// while a pass stays under ~40 s.
+pub const SANCTIONED_GC_CATCH_UP_PACE: i64 = 4;
+
+/// [`sanctioned_pass_due`] with the last pass's busy time: while catching
+/// up, the gap is the catch-up interval or [`SANCTIONED_GC_CATCH_UP_PACE`] x
+/// busy, whichever is longer, never longer than the ordinary pass interval.
+pub(crate) fn sanctioned_pass_due_paced(last_pass_ms: Option<i64>, catching_up: bool, last_busy_ms: i64, now_ms: i64) -> bool {
+    let interval = if catching_up {
+        SANCTIONED_GC_CATCH_UP_INTERVAL_MS
+            .max(last_busy_ms.max(0).saturating_mul(SANCTIONED_GC_CATCH_UP_PACE))
+            .min(SANCTIONED_GC_INTERVAL_MS)
+    } else {
+        SANCTIONED_GC_INTERVAL_MS
+    };
     last_pass_ms.is_none_or(|last| now_ms - last >= interval)
 }
 
@@ -8002,9 +8429,14 @@ mod nan4601_catalog_held_log_tests {
     }
 }
 
-/// A pass that stopped mid log-fold and asks for no back-off: progressing.
+/// A pass that stopped mid log-fold, or (NAN-4728, trusted-local) filled its
+/// delete bound with progress and more eligible files listed, and asks for no
+/// back-off: progressing. One bounded batch per 10-min interval reclaimed
+/// ~512 files while a 12k eps tenant superseded ~2,000: the store grew forever.
 pub(crate) fn pass_is_catching_up(report: &crate::lake_part_gc::PassReport) -> bool {
-    !report.backoff && report.paused_reason.as_deref() == Some(crate::lake_part_gc::executor::LOG_CATCHING_UP)
+    !report.backoff
+        && (report.more_eligible
+            || report.paused_reason.as_deref() == Some(crate::lake_part_gc::executor::LOG_CATCHING_UP))
 }
 
 /// Source objects (edge segments or bronze notices) one flush may take
@@ -8516,6 +8948,107 @@ pub(super) mod nan4336_ingest_tests;
 #[cfg(test)]
 #[path = "nan4553_ingest_tests.rs"]
 mod nan4553_ingest_tests;
+#[cfg(test)]
+#[path = "nan4731_ingest_tests.rs"]
+mod nan4731_ingest_tests;
+
+#[cfg(test)]
+#[path = "nan4737_ingest_tests.rs"]
+mod nan4737_ingest_tests;
+#[cfg(test)]
+#[path = "nan4749_ingest_tests.rs"]
+mod nan4749_ingest_tests;
+
+#[cfg(test)]
+#[path = "nan4750_ingest_tests.rs"]
+mod nan4750_ingest_tests;
+
+/// NAN-4750: the pure L0 family planning (part bound, split exactness).
+#[cfg(test)]
+mod l0_class_family_tests {
+    use super::*;
+    use arrow_array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
+    use arrow_schema::{DataType, Field, Fields, Schema};
+
+    /// An hour's parts with a class split never exceed
+    /// `max(l0_chunks(total).len(), groups)`, never exceed
+    /// MAX_PARALLEL_L0_WRITES with the draft cap, and keep the old cut
+    /// when there is nothing to split.
+    #[test]
+    fn group_parts_stay_within_the_hour_bound() {
+        let s = L0_PARALLEL_MIN_ROWS;
+        assert_eq!(l0_group_parts(&[20_000]), vec![1], "no split: unchanged");
+        assert_eq!(l0_group_parts(&[5 * s]), vec![l0_chunks(5 * s).len()]);
+        // 20k rows: one part before, three groups now (+2 parts).
+        assert_eq!(l0_group_parts(&[9_000, 9_000, 2_000]), vec![1, 1, 1]);
+        // A 64k+ hour already wrote four parts: the split re-cuts them.
+        let parts = l0_group_parts(&[3 * s, s / 2, 2 * s]);
+        assert_eq!(parts.iter().sum::<usize>(), MAX_PARALLEL_L0_WRITES);
+        assert!(parts.iter().all(|p| *p >= 1));
+        for rows in [vec![8_192, 8_192, 8_192, 1], vec![4 * s, 4 * s, 4 * s, 4 * s], vec![s, 9 * s, 8_192, 8_192], vec![1, 8_192]] {
+            let parts = l0_group_parts(&rows);
+            let total = rows.iter().sum::<usize>();
+            let bound = l0_chunks(total).len().max(rows.len());
+            assert!(parts.iter().sum::<usize>() <= bound, "{rows:?} -> {parts:?}");
+            assert!(parts.iter().sum::<usize>() <= MAX_PARALLEL_L0_WRITES, "{rows:?} -> {parts:?}");
+            assert!(parts.iter().all(|p| *p >= 1));
+        }
+        assert_eq!(l0_chunks_into(10, 4), vec![(0, 3), (3, 3), (6, 3), (9, 1)]);
+        assert_eq!(l0_chunks_into(9, 4).iter().map(|(_, len)| len).sum::<usize>(), 9);
+        assert!(l0_chunks_into(0, 2).is_empty());
+    }
+
+    fn batch(rows: &[(Option<&str>, Option<i64>)]) -> RecordBatch {
+        let sources: ArrayRef = Arc::new(StringArray::from(rows.iter().map(|(s, _)| *s).collect::<Vec<_>>()));
+        let metadata = StructArray::new(Fields::from(vec![Field::new("log_source", DataType::Utf8, true)]), vec![sources], None);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("class_uid", DataType::Int64, true),
+            Field::new("metadata", metadata.data_type().clone(), true),
+        ]));
+        RecordBatch::try_new(schema, vec![
+            Arc::new(Int64Array::from((0..rows.len() as i64).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(rows.iter().map(|(_, c)| *c).collect::<Vec<_>>())),
+            Arc::new(metadata),
+        ]).unwrap()
+    }
+
+    /// Every row lands in exactly one group, in its sorted order; nulls and
+    /// non-chosen families go to the rest.
+    #[test]
+    fn split_is_exact_and_keeps_order() {
+        let rows = [(Some("a"), Some(1)), (Some("b"), Some(1)), (None, Some(1)), (Some("a"), None), (Some("a"), Some(1)), (Some("a"), Some(2))];
+        let batch = batch(&rows);
+        let groups = split_l0_families(&batch, &[("a".to_string(), 1), ("c".to_string(), 9)]).unwrap();
+        let seqs = |b: &RecordBatch| b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec();
+        assert_eq!(groups.len(), 2, "an empty family group is dropped");
+        assert_eq!(groups[0].0, Some(("a".to_string(), 1)));
+        assert_eq!(seqs(&groups[0].1), vec![0, 4]);
+        assert_eq!(groups[1].0, None);
+        assert_eq!(seqs(&groups[1].1), vec![1, 2, 3, 5]);
+        let none = split_l0_families(&batch, &[]).unwrap();
+        assert_eq!((none.len(), none[0].1.num_rows()), (1, rows.len()));
+    }
+
+    /// The families chosen: at least CLASS_FAMILY_MIN_ROWS buffered rows
+    /// over every batch of the hour, largest first, at most
+    /// MAX_L0_CLASS_DRAFTS; batches without the columns are skipped.
+    #[test]
+    fn families_counted_over_the_hour_and_capped() {
+        let min = super::super::merge::CLASS_FAMILY_MIN_ROWS as usize;
+        let rows = |source: &'static str, class: i64, n: usize| vec![(Some(source), Some(class)); n];
+        let half = |source, class| batch(&rows(source, class, min / 2));
+        // Split over two batches, a family still reaches the floor.
+        let mut batches = vec![half("a", 1), half("a", 1), batch(&rows("b", 2, min - 1))];
+        assert_eq!(l0_class_families(&batches).unwrap(), vec![("a".to_string(), 1)]);
+        batches.push(RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1]))]).unwrap());
+        assert_eq!(l0_class_families(&batches).unwrap(), vec![("a".to_string(), 1)], "a batch without the columns counts nothing");
+        let many = (0..5).map(|class| batch(&rows("s", class, min + class as usize))).collect::<Vec<_>>();
+        assert_eq!(l0_class_families(&many).unwrap(), vec![("s".to_string(), 4), ("s".to_string(), 3), ("s".to_string(), 2)]);
+        assert_eq!(MAX_L0_CLASS_DRAFTS + 1, MAX_PARALLEL_L0_WRITES);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -8826,6 +9359,65 @@ mod tests {
         *gate.report.lock().unwrap() = Some(90);
         ingestor.gc(now + 4_000).await.unwrap();
         assert_eq!(ingestor.health().part_gc_deleted_total, 500);
+    }
+
+    /// NAN-4728 stand-in for the trusted-local pass: runs inline (foreground
+    /// `schedule_pass`), holds the ingestor `busy`, fills its batch with
+    /// progress (`more_eligible`) every time.
+    struct BusyBacklogPass {
+        busy: std::time::Duration,
+        passes: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::part_ingest::part_gc_gate::SanctionedPartGc for BusyBacklogPass {
+        async fn run_pass(&self, _now_ms: i64) -> Result<crate::lake_part_gc::PassReport> {
+            self.passes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.busy).await;
+            Ok(crate::lake_part_gc::PassReport { deleted: 512, more_eligible: true, ..Default::default() })
+        }
+    }
+
+    struct SanctionedGate(Arc<BusyBacklogPass>);
+
+    #[async_trait::async_trait]
+    impl PartGcAuthority for SanctionedGate {
+        async fn decision(&self, _now_ms: i64) -> Result<PartGcDecision> {
+            Ok(PartGcDecision::Sanctioned(self.0.clone()))
+        }
+    }
+
+    /// NAN-4728: through `Ingestor::gc` (the production scheduler), a backlog
+    /// drain continues on the catch-up cadence but paced by the pass's busy
+    /// time: a pass that held the ingestor 1.5 s is not re-run 5 s later
+    /// (GC would take ~1/4 of ingest's wall time at most), and it is re-run
+    /// well before the 10-min interval.
+    #[tokio::test]
+    async fn a_backlog_drain_is_paced_by_the_pass_busy_time() {
+        use crate::parts::{part_log::LocalObjectStore, provenance::LocalPartSigner};
+        use std::sync::atomic::Ordering;
+        let now = 1_800_000_000_000;
+        let root = tempfile::tempdir().unwrap();
+        let tenant = "00000000-0000-4000-8000-0000000000c2";
+        let store = LocalObjectStore::new(root.path().join("store")).unwrap();
+        let signer = LocalPartSigner::new("gc-pace-test", ed25519_dalek::SigningKey::from_bytes(&[9; 32])).unwrap();
+        let queue = super::super::discovery::SpoolQueue::new(root.path().join("spool"), tenant).unwrap();
+        let mut cfg = IngestConfig::new(tenant, root.path().join("ingest"));
+        cfg.prevalence_enabled = false;
+        let mut ingestor = Ingestor::open(cfg, &store, &store, &queue, &signer, signer.trusted(),
+            BronzeIngestEnricher::disabled(), &seed_schema(), now).await.unwrap();
+        let pass = Arc::new(BusyBacklogPass { busy: std::time::Duration::from_millis(1_500), passes: Default::default() });
+        ingestor.set_part_gc_authority(Arc::new(SanctionedGate(pass.clone())));
+        ingestor.gc(now).await.unwrap();
+        assert_eq!(pass.passes.load(Ordering::SeqCst), 1);
+        assert!(ingestor.sanctioned_gc_catching_up, "a full batch with progress continues soon");
+        assert!(ingestor.last_sanctioned_pass_busy_ms >= 1_500, "{}", ingestor.last_sanctioned_pass_busy_ms);
+        ingestor.gc(now + SANCTIONED_GC_CATCH_UP_INTERVAL_MS).await.unwrap();
+        assert_eq!(pass.passes.load(Ordering::SeqCst), 1, "a 1.5 s pass waits 4 x 1.5 s, not 5 s");
+        let paced = ingestor.last_sanctioned_pass_busy_ms * SANCTIONED_GC_CATCH_UP_PACE;
+        assert!(paced < 60_000, "{paced}");
+        ingestor.gc(now + paced).await.unwrap();
+        assert_eq!(pass.passes.load(Ordering::SeqCst), 2, "the drain continues long before the 10-min interval");
     }
 
     thread_local! {
@@ -9692,6 +10284,98 @@ mod tests {
         for flight in ingestor.merge_in_flight.drain(..) {
             flight.handle.abort();
         }
+    }
+
+    /// NAN-4749 (1.0.11 bakeoff wall #1): a 16 GiB / 8 CPU open-core cell
+    /// placed from the host gave ingest a 4 GiB cap, so a full catch-up flush
+    /// (65,536 rows, ~206 MiB of Arrow) beside two minute merges ran ONE L0
+    /// writer. `trusted-local init --target-eps 10000` must place a cap at
+    /// which all four run. Production path: the placement `init` renders, the
+    /// supervisor's ingest cap for it, `size_for_memory_cap` (as `cell.rs`
+    /// sizes a spawned ingest) and `Ingestor::open`.
+    #[tokio::test]
+    async fn a_target_eps_placement_runs_four_l0_writers() {
+        use crate::parts::part_log::LocalObjectStore;
+        use crate::parts::provenance::LocalPartSigner;
+        use nanosiem_lake_cell::budget::GIB;
+        use nanosiem_lake_cell::trusted_local::{init, InitArgs};
+        const MIB: u64 = 1024 * 1024;
+        const TENANT: &str = "00000000-0000-4000-8000-0000000004f9";
+        // `hosted` re-places the tenant as a hosted cell does (eps, ingest
+        // role limit from the hosted placement).
+        let placed_cap = |target_eps: Option<u32>, hosted: Option<(f64, u64)>| {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("out");
+            let args = InitArgs { out: out.clone(), chdb_sha256: Some("a".repeat(64)), memory_bytes: Some(16 * GIB),
+                cpus: Some(8), target_eps, ..Default::default() };
+            init(&args, &|name| name.starts_with("NANO_LAKE_").then(|| "k".to_string())).unwrap();
+            let mut placement: nanosiem_lake_cell::config::Placement =
+                serde_json::from_slice(&std::fs::read(out.join("cell/placement.json")).unwrap()).unwrap();
+            if let Some((eps, ingest_limit)) = hosted {
+                placement.tenants[0].eps = eps;
+                placement.tenants[0].ingest_limit_memory_bytes = Some(ingest_limit);
+            }
+            nanosiem_lake_cell::supervisor::ingest_memory_cap_bytes(&placement.tenants[0])
+        };
+        // A full catch-up flush of wide OCSF rows (memory.rs: 3.15 KB/row);
+        // a flush at `eps` holds its catch-up age of rows, up to the row cap.
+        let full = 206 * MIB;
+        let flush_rows = |eps: u32| ((eps as u64 * nanosiem_lake_cell::budget::CATCH_UP_FLUSH_AGE_SECS) as usize).min(FLUSH_MAX_ROWS);
+        let flush_bytes = |rows: usize| full * rows as u64 / FLUSH_MAX_ROWS as u64;
+        let writers_at = |cap: u64, bytes: u64| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let store: &'static LocalObjectStore = Box::leak(Box::new(LocalObjectStore::new(dir.path().join("store")).unwrap()));
+            let signer: &'static LocalPartSigner = Box::leak(Box::new(LocalPartSigner::new("lab-signer-4749", ed25519_dalek::SigningKey::from_bytes(&[49; 32])).unwrap()));
+            let queue = super::super::discovery::SpoolQueue::new(dir.path().join("spool"), TENANT).unwrap();
+            let mut cfg = IngestConfig::new(TENANT, dir.path().join("ingest"));
+            cfg.prevalence_enabled = false;
+            size_for_memory_cap(&mut cfg, cap);
+            let mut ingestor = Ingestor::open(cfg, store, store, &queue, signer, signer.trusted(),
+                BronzeIngestEnricher::disabled(), &seed_schema(), 1_800_000_000_000).await.unwrap();
+            // Two minute merges at the largest decode window (32,768 rows at
+            // MERGE_ROW_BYTES each; `cap` would set a window no larger). They
+            // are charged here as reserved working-budget bytes, exactly as
+            // `flush_writers` charges merges, so the process-wide window other
+            // tests set cannot change the answer.
+            let merges = 2 * 32_768 * super::super::merge::MERGE_ROW_BYTES;
+            ingestor.flush_in_flight.push_back(InFlightFlush {
+                buffer: Buffered::new(), reserved_bytes: merges, schema: ingestor.schema.clone(), sealed_ms: 0,
+                progress: ingestor.diagnostics.new_flush(0, 0), task: None, built: None, published: None, published_ok: Default::default(),
+            });
+            assert!(super::super::memory::buffer_cap(ingestor.cfg.buffer_budget_bytes) >= bytes || cap < 5 * GIB,
+                "a full-flush placement buffers the flush before its byte cap");
+            ingestor.flush_writers(bytes)
+        };
+        // The shared sizing's rates are this worker's row, part and age caps.
+        assert_eq!(nanosiem_lake_cell::budget::CATCH_UP_FLUSH_AGE_SECS * 1000, CATCH_UP_FLUSH_MAX_AGE_MS as u64);
+        assert_eq!(nanosiem_lake_cell::budget::FULL_FLUSH_EPS, FLUSH_MAX_ROWS as u64 / (CATCH_UP_FLUSH_MAX_AGE_MS as u64 / 1000));
+        assert_eq!(nanosiem_lake_cell::budget::L0_PART_MIN_ROWS, L0_PARALLEL_MIN_ROWS as u64);
+        let two_parts = nanosiem_lake_cell::budget::PARALLEL_FLUSH_EPS as u32;
+        assert_eq!((l0_chunks(flush_rows(two_parts - 1)).len(), l0_chunks(flush_rows(two_parts)).len()), (1, 2));
+        // Host sizing (the 1.0.11 bakeoff): one L0 writer for a full flush.
+        let host = placed_cap(None, None);
+        assert_eq!((host, writers_at(host, full).await), (4 * GIB, 1), "host sizing: the bakeoff's single L0 writer");
+        // The shared derivation, placed by trusted-local init: every rate
+        // from two parts up has a writer per L0 part, and a catch-up flush four.
+        for eps in [two_parts, 1_638, 2_000, 2_184, 10_000] {
+            let cap = placed_cap(Some(eps), None);
+            assert_eq!(cap, nanosiem_lake_cell::budget::INGEST_MEMORY_FOR_FULL_FLUSH, "{eps} eps");
+            let parts = l0_chunks(flush_rows(eps)).len();
+            // `flush_writers` is the memory bound; the flush uses min(it, parts).
+            assert!(writers_at(cap, flush_bytes(flush_rows(eps))).await >= parts, "{eps} eps: a writer per L0 part");
+            assert_eq!(writers_at(cap, full).await, MAX_PARALLEL_L0_WRITES, "{eps} eps: a catch-up flush, four writers");
+        }
+        // Hosted: a hosted 2,000-eps tenant whose ingest role limit is 4.5 GiB:
+        // the role limit binds the cap and its 3-part flushes run one writer;
+        // with the role limit at the shared need (NAN-4749) all three.
+        let steady = flush_bytes(flush_rows(2_000));
+        assert_eq!(l0_chunks(flush_rows(2_000)).len(), 3);
+        let live = placed_cap(None, Some((2_000.0, 4_831_838_208)));
+        assert_eq!((live, writers_at(live, steady).await), (4_831_838_208, 1));
+        let need = nanosiem_lake_cell::budget::ingest_memory_for_eps(2_000.0);
+        let shared = placed_cap(None, Some((2_000.0, need)));
+        assert_eq!(shared, need);
+        assert!(writers_at(shared, steady).await >= 3);
     }
 
     /// A budget whose room after the next buffer and one merge fits exactly a
@@ -10675,3 +11359,7 @@ mod oldest_flush_diagnostics_tests {
 #[cfg(test)]
 #[path = "prevalence_pipeline_tests.rs"]
 mod prevalence_pipeline_tests;
+
+#[cfg(test)]
+#[path = "ingest_retention_tests.rs"]
+mod nan4726_retention_tests;

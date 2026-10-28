@@ -19,6 +19,7 @@
 //! the open/enterprise boundary belong here. Anything that's only used by
 //! nanosiem-api stays in nanosiem-api.
 
+pub mod ai_request;
 pub mod api_error;
 pub mod audit_ext;
 pub mod auth_context;
@@ -27,6 +28,7 @@ pub mod grant_authz;
 pub mod headers;
 pub mod pagination;
 pub mod source_inventory;
+pub mod sse;
 pub mod tenant_path;
 
 pub use api_error::{error_chain, ApiError, ErrorDetail, ErrorResponse, ExpectedUnavailable};

@@ -82,8 +82,12 @@ zeroize = "1.8"
 default = []
 [dev-dependencies]
 proptest.workspace = true
+# NAN-4729: paused-clock leader-lease tests of the convergence worker.
+tokio = { workspace = true, features = ["test-util"] }
 libc = "0.2"
 tempfile = "3.25"
+
+
 
 
 

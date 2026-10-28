@@ -60,10 +60,10 @@ impl AppState {
             // NAN-2361: tenant scheduled reports run through the private
             // per-tenant runner (owner-signed transactions + tenant lake
             // search), never the deployment-global ReportService below.
-            if let Some(runtime) = self.tenant_identity_sync_runtime.as_ref() {
-                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
-                tracing::info!("Enterprise-shared tenant identity sync runtime started");
-            }
+            // NAN-4699 step 4: identity sync and the platform readiness attestor
+            // take no per-tenant claim (every pod would scan, sync and sign
+            // every tenant), so they run only on the PG leader:
+            // `start_leader_schedulers`.
             if let Some(runtime) = self.tenant_shadow_investigation_runtime.as_ref() {
                 handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
                 tracing::info!("Enterprise-shared shadow investigation runtime started");
@@ -105,10 +105,6 @@ impl AppState {
             if let Some(runtime) = self.tenant_siem_health_runtime.as_ref() {
                 handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
                 tracing::info!("Enterprise-shared tenant SIEM-health runner started");
-            }
-            if let Some(runtime) = self.tenant_platform_readiness_attestor.as_ref() {
-                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
-                tracing::info!("Enterprise-shared platform readiness attestor started");
             }
             if let Some(runtime) = self.tenant_erasure_runtime.as_ref() {
                 handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
@@ -581,10 +577,19 @@ impl AppState {
             let interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
             tokio::pin!(interval);
 
+            // NAN-4699 step 4: this loop is leader-only. A dropped JoinHandle
+            // detaches its task, so aborting this loop on step-down would leave
+            // every in-flight sync running on the demoted pod; abort them with it.
+            struct AbortOnDrop(tokio::task::JoinHandle<()>);
+            impl Drop for AbortOnDrop {
+                fn drop(&mut self) {
+                    self.0.abort();
+                }
+            }
             let mut running = std::collections::HashMap::new();
             loop {
                 interval.tick().await;
-                running.retain(|_, task: &mut tokio::task::JoinHandle<()>| !task.is_finished());
+                running.retain(|_, task: &mut AbortOnDrop| !task.0.is_finished());
                 let mut ids = std::collections::HashSet::new();
                 match sync_service.repository().list_repos_for_auto_sync().await {
                     Ok(repos) => ids.extend(repos.into_iter().map(|repo| repo.id)),
@@ -600,7 +605,7 @@ impl AppState {
                     if running.contains_key(&id) { continue; }
                     let pool = pool.clone();
                     let service = Arc::clone(&sync_service);
-                    running.insert(id, tokio::spawn(async move {
+                    running.insert(id, AbortOnDrop(tokio::spawn(async move {
                         let result = if platform {
                             service.sync_platform_repository(&pool, id).await
                         } else {
@@ -609,7 +614,7 @@ impl AppState {
                         if let Err(error) = result {
                             tracing::warn!(%id, %error, "Failed to sync marketplace repo");
                         }
-                    }));
+                    })));
                 }
             }
         })

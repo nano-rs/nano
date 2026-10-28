@@ -3471,6 +3471,10 @@ pub fn create_router(state: AppState) -> Router {
         .layer(axum_middleware::from_fn(
             crate::middleware::api_default_cache_control,
         ))
+        // NAN-4753: SSE answers opt out of ingress proxy buffering, or NGINX
+        // holds them (headers included) until Cloudflare 524s at 100 s.
+        .layer(axum_middleware::from_fn(nanosiem_api_lib::sse::sse_unbuffered))
+        .layer(axum_middleware::from_fn(nanosiem_api_lib::ai_request::wizard_request_deadline))
         // Add middleware
         .layer(CompressionLayer::new().gzip(true))
         .layer(SetResponseHeaderLayer::overriding(
@@ -3560,6 +3564,7 @@ fn build_cors_layer(config: &ApiConfig) -> CorsLayer {
             axum::http::header::AUTHORIZATION,
             axum::http::header::CONTENT_TYPE,
             axum::http::header::ACCEPT,
+            axum::http::header::HeaderName::from_static("prefer"),
             axum::http::header::HeaderName::from_static("x-api-key"),
             axum::http::header::HeaderName::from_static("x-request-id"),
             axum::http::header::HeaderName::from_static("x-ioc-list-options"),

@@ -126,6 +126,52 @@ impl TenantPlatformPolicy {
         Ok(policy)
     }
 
+    /// Default self-hosted policy for a verified portable feed bundle
+    /// (NAN-4759): every bundled feed is granted to `tenant` at the signed
+    /// revision until its signed hard expiry. The descriptor sequence is the
+    /// policy revision, so `validate_successor` stays monotonic across
+    /// bundle updates. A verified bundle is required so unverified descriptors
+    /// cannot authorize stamping.
+    ///
+    /// ```compile_fail
+    /// use nanosiem_core::platform_enrichment::portable::Descriptor;
+    /// use nanosiem_lake_worker::lean_platform_bundle::TenantPlatformPolicy;
+    /// fn unverified_policy(descriptor: &Descriptor) {
+    ///     TenantPlatformPolicy::from_portable(uuid::Uuid::new_v4(), descriptor).unwrap();
+    /// }
+    /// ```
+    pub fn from_portable(
+        tenant: Uuid,
+        verified: &nanosiem_core::platform_enrichment::portable::VerifiedBundle,
+    ) -> Result<Self> {
+        ensure!(!tenant.is_nil(), "platform policy tenant is nil");
+        let descriptor = verified.descriptor();
+        let policy = Self {
+            tenant_id: tenant,
+            revision: descriptor.sequence,
+            bundle_sha256: descriptor.payload.sha256.clone(),
+            grants: descriptor
+                .feeds
+                .iter()
+                .map(|(feed, entry)| {
+                    (
+                        feed.clone(),
+                        PlatformGrant {
+                            feed_revision: entry.revision,
+                            valid_until: entry.hard_expiry,
+                            premium: None,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        ensure!(
+            policy.revision > 0 && policy.revision <= i64::MAX as u64,
+            "portable bundle sequence out of range"
+        );
+        Ok(policy)
+    }
+
     fn grant(&self, feed: &str, now: DateTime<Utc>) -> Option<&PlatformGrant> {
         self.grants.get(feed).filter(|g| g.valid_until > now)
     }

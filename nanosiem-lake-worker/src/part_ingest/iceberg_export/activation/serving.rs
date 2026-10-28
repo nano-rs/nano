@@ -8,6 +8,7 @@ use crate::{
     parts::{levels::MergePolicy, part_log::PartRef},
 };
 use serde::{Deserialize, Serialize};
+use crate::part_ingest::agent_lane::IngestPressure;
 use std::{collections::BTreeSet, sync::Mutex};
 
 #[async_trait::async_trait]
@@ -38,6 +39,9 @@ pub(super) trait ServingFactory: Send + Sync {
     fn retain_verified(&self, _live: &[PartRef]) -> Result<()> {
         Ok(())
     }
+    /// NAN-4721: the tenant's ingest-lag signal, for the export target's
+    /// cold file reads.
+    fn set_ingest_pressure(&self, _pressure: Arc<IngestPressure>) {}
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +64,8 @@ pub(super) struct FreshServingBackend {
     /// deltas and is retired instead (see [`EPOCH_RESUME_LIMIT`]).
     resume_limit: usize,
     vanished: Mutex<Option<super::super::lifecycle::Vanished>>,
+    /// NAN-4721: an epoch build yields to ingest pressure (one bounded budget).
+    pressure: Mutex<Arc<IngestPressure>>,
 }
 /// FP-T101: every resume after the master moved records one more delta, and
 /// [`epoch_plans`] refuses more than 1024 batches (every batch is a retained
@@ -86,6 +92,7 @@ impl FreshServingBackend {
             batch: crate::part_ingest::export::ExportBatchBounds::DEFAULT,
             resume_limit: EPOCH_RESUME_LIMIT,
             vanished: Mutex::new(None),
+            pressure: Mutex::default(),
         })
     }
     #[cfg(test)]
@@ -210,6 +217,10 @@ impl CatalogLifecycleBackend for FreshServingBackend {
     }
     fn set_vanished(&self, vanished: super::super::lifecycle::Vanished) {
         *self.vanished.lock().expect("serving vanished") = Some(vanished);
+    }
+    fn set_ingest_pressure(&self, pressure: Arc<IngestPressure>) {
+        self.factory.set_ingest_pressure(pressure.clone());
+        *self.pressure.lock().expect("serving pressure") = pressure;
     }
     async fn prepare_sync(&self, parts: &[PartRef], now: i64, policy: &MergePolicy) -> Result<()> {
         *self.live.lock().expect("serving live set") = (parts.to_vec(), now, *policy);
@@ -345,11 +356,23 @@ impl CatalogLifecycleBackend for FreshServingBackend {
             // commit that landed without the watermark is still a checkpoint
             // skip; the reference check below verifies the result.
             let mut committed = epoch_committed(&directory)?;
+            let pressure = self.pressure.lock().expect("serving pressure").clone();
+            // One yield budget per epoch build, not per batch: this runs
+            // under custody and the sync's hard bound, and a batch whose
+            // files are already verified reads nothing. Cold reads inside a
+            // batch are paced by the export target while pressure holds.
+            let mut yield_left = crate::part_ingest::agent_lane::MAX_YIELD;
             for (index, path) in paths.iter().enumerate() {
                 let manifest: ExportManifest = serde_json::from_slice(&std::fs::read(path)?)?;
                 if manifest.planned_at_ms <= committed {
                     continue;
                 }
+                // NAN-4721: agents never compete with analysts. A cold epoch
+                // batch reads GBs of part files; none starts while ingest
+                // is under pressure (bounded, see agent_lane).
+                yield_left = yield_left.saturating_sub(
+                    pressure.yield_while_lagging_up_to("serving epoch batch", yield_left).await,
+                );
                 serving.commit(&manifest).await?;
                 committed = manifest.planned_at_ms;
                 crate::part_ingest::export::atomic_write(&directory.join(COMMITTED), committed.to_string().as_bytes(), false)?;

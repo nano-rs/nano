@@ -41,7 +41,7 @@ use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-use crate::budget::{TenantBudget, GIB, MIB};
+use crate::budget::{ingest_query_for_eps, TenantBudget, GIB, MIB};
 
 /// Exit code: existing state conflicts (no `--force`).
 pub const EXIT_CONFLICT: i32 = 3;
@@ -89,6 +89,10 @@ pub struct InitArgs {
     pub memory_bytes: Option<u64>,
     /// CPUs for the cell's tenant processes; default every online host CPU.
     pub cpus: Option<u32>,
+    /// NAN-4749: the sustained events per second the install must admit.
+    /// Sizes the ingest role for that rate ([`crate::budget::ingest_memory_for_eps`]) and
+    /// places the tenant at it; unset keeps the host-derived sizing.
+    pub target_eps: Option<u32>,
     /// NAN-4693: root that host facts are read from (`/proc/meminfo`,
     /// `/sys/devices/system/cpu/online`); `/` in production, a fixture in tests.
     pub host_root: PathBuf,
@@ -119,6 +123,7 @@ impl Default for InitArgs {
             compiler: "/usr/local/bin/lake_query_compile".into(),
             memory_bytes: None,
             cpus: None,
+            target_eps: None,
             host_root: "/".into(),
             app_owner: None,
             require_landlock: true,
@@ -130,7 +135,7 @@ const USAGE: &str = "usage: nanosiem-lake-cell trusted-local init --out <dir> [-
 [--cell-id <id>] [--cell-config-root <path>] [--cell-data-root <path>] [--app-config-root <path>] \
 [--listen <addr:port>] [--cell-origin <url>] [--bronze-endpoint <url>] [--bronze-region <r>] \
 [--bronze-bucket <b>] [--bronze-prefix <p>] [--bin-dir <path>] [--chdb-library <path>] [--chdb-sha256 <hex>] \
-[--compiler <path>] [--memory-bytes <n>] [--cpus <n>] [--app-owner <uid:gid>] [--no-require-landlock]";
+[--compiler <path>] [--memory-bytes <n>] [--cpus <n>] [--target-eps <n>] [--app-owner <uid:gid>] [--no-require-landlock]";
 
 pub fn usage() -> &'static str {
     USAGE
@@ -181,6 +186,10 @@ pub fn parse_args(args: &[String]) -> std::result::Result<InitArgs, Usage> {
                 let v = take(&mut i)?;
                 out.cpus = Some(v.parse().map_err(|_| bad(format!("--cpus {v:?} is not a number")))?);
             }
+            "--target-eps" => {
+                let v = take(&mut i)?;
+                out.target_eps = Some(v.parse().map_err(|_| bad(format!("--target-eps {v:?} is not a number")))?);
+            }
             "--app-owner" => {
                 let v = take(&mut i)?;
                 let parsed = v.split_once(':').and_then(|(u, g)| Some((u.parse().ok()?, g.parse().ok()?)));
@@ -220,6 +229,7 @@ impl InitArgs {
         }
         ensure!(self.memory_bytes.is_none_or(|m| m >= 2 * GIB), "--memory-bytes must be at least 2 GiB");
         ensure!(self.cpus.is_none_or(|c| (1..=1024).contains(&c)), "--cpus must be 1..1024");
+        ensure!(self.target_eps.is_none_or(|e| (1..=MAX_TARGET_EPS).contains(&e)), "--target-eps must be 1..{MAX_TARGET_EPS}");
         Ok(())
     }
 
@@ -241,8 +251,9 @@ impl InitArgs {
 pub struct Sizing {
     pub memory_bytes: u64,
     pub cpus: u32,
-    /// eps chosen only so the eps-derived ingest cap does not undercut the
-    /// placed ingest limit (the supervisor takes the smaller of the two).
+    /// eps chosen so the eps-derived ingest cap does not undercut the
+    /// placed ingest limit (the supervisor takes the smaller of the two),
+    /// or the `--target-eps` when that is higher (NAN-4749).
     pub eps: u32,
     pub ingest: (u32, u32, u64, u64),
     pub detect: (u32, u32, u64, u64),
@@ -254,24 +265,45 @@ fn round_mib(bytes: u64) -> u64 {
 }
 
 pub fn size(memory_bytes: u64, cpus: u32) -> Sizing {
+    size_for(memory_bytes, cpus, None)
+}
+
+/// Highest `--target-eps` accepted.
+pub const MAX_TARGET_EPS: u32 = 1_000_000;
+
+/// [`size`] for a target rate (NAN-4749). With `target_eps` the ingest role
+/// gets at least [`crate::budget::ingest_memory_for_eps`] (up to half the cell's memory,
+/// taken from query's share, never leaving query under 1 GiB) and the tenant
+/// is placed at `target_eps` (owner pacing, part cache), or the
+/// memory-derived eps when that is higher. Without it the sizing is
+/// [`size`]'s, unchanged.
+pub fn size_for(memory_bytes: u64, cpus: u32, target_eps: Option<u32>) -> Sizing {
     let cpus = cpus.max(1);
     // query 50 %, ingest 25 %, detect 15 %; the rest covers the fixed
     // product/maintenance budgets and the supervisor.
-    let query_mem = round_mib(memory_bytes / 2).max(GIB);
-    let ingest_mem = round_mib(memory_bytes / 4).max(512 * MIB);
+    let base_query = round_mib(memory_bytes / 2).max(GIB);
+    let base_ingest = round_mib(memory_bytes / 4).max(512 * MIB);
+    // NAN-4749: a target rate moves query memory to ingest through the
+    // shared sizing (`budget::ingest_query_for_eps`), at most half the cell.
+    let (ingest_mem, query_mem) = match target_eps {
+        Some(eps) => ingest_query_for_eps(base_ingest, base_query, eps, round_mib(memory_bytes / 2)),
+        None => (base_ingest, base_query),
+    };
     let detect_mem = round_mib(memory_bytes / 100 * 15).max(256 * MIB);
     let milli = cpus.saturating_mul(1000);
     let query_cpu = (milli / 4 * 3).max(1000);
     let ingest_cpu = (milli / 2).max(1000);
     let detect_cpu = (milli / 4).max(500);
-    // `eps` is only a sizing input here: the role budgets above are explicit,
+    // `eps` is a sizing input here: the role budgets above are explicit,
     // but the supervisor still caps ingest at the eps-derived
     // `ingest_memory_cap_bytes`, so pick the smallest eps whose cap covers
-    // the placed ingest limit (the curve extrapolates linearly).
-    let eps = (20..=1_000_000)
+    // the placed ingest limit (the curve extrapolates linearly). A target
+    // rate above that places the tenant at the target.
+    let covering = (20..=MAX_TARGET_EPS)
         .step_by(10)
         .find(|eps| TenantBudget::from_eps(*eps as f64).ingest_memory_cap_bytes >= ingest_mem)
-        .unwrap_or(1_000_000);
+        .unwrap_or(MAX_TARGET_EPS);
+    let eps = covering.max(target_eps.unwrap_or(0));
     let req = |mem: u64| round_mib(mem / 4).max(64 * MIB);
     Sizing {
         memory_bytes,
@@ -472,7 +504,7 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
     };
     let memory = args.memory_bytes.unwrap_or_else(|| host.map_or(0, |h| h.memory_bytes) / 2);
     let cpus = args.cpus.unwrap_or_else(|| host.map_or(1, |h| h.cpus));
-    let sizing = size(memory.max(2 * GIB), cpus);
+    let sizing = size_for(memory.max(2 * GIB), cpus, args.target_eps);
 
     // Documents.
     let ingest_token = json!({
@@ -582,6 +614,7 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
         "signer_public_key_hex": public_hex,
         "sizing": {
             "memory_bytes": sizing.memory_bytes, "cpus": sizing.cpus, "eps": sizing.eps,
+            "target_eps": args.target_eps,
             "query_limit_memory_bytes": q.3, "ingest_limit_memory_bytes": i.3, "detect_limit_memory_bytes": d.3,
         },
     }))
@@ -619,6 +652,7 @@ pub fn main(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::INGEST_MEMORY_FOR_FULL_FLUSH;
     use std::os::unix::fs::PermissionsExt;
 
     fn args(out: &Path) -> InitArgs {
@@ -788,11 +822,63 @@ mod tests {
         }
     }
 
+    /// NAN-4749: a target rate sizes ingest for full parallel L0 flushes
+    /// and places the tenant at that rate; no target keeps the host sizing.
+    #[test]
+    fn a_target_eps_sizes_ingest_for_the_rate() {
+        // The 1.0.11 bakeoff shape: 16 GiB for the cell, 8 CPUs.
+        let host = size(16 * GIB, 8);
+        assert_eq!(size_for(16 * GIB, 8, None), host, "no target: unchanged");
+        assert_eq!(host.ingest.3, 4 * GIB);
+        let target = size_for(16 * GIB, 8, Some(10_000));
+        assert_eq!(target.ingest.3, INGEST_MEMORY_FOR_FULL_FLUSH);
+        assert_eq!(target.eps, 10_000, "placed at the target rate");
+        // Ingest's extra 2 GiB comes out of query; the role total is unchanged.
+        assert_eq!(target.query.3, host.query.3 - 2 * GIB);
+        assert_eq!(target.ingest.3 + target.query.3 + target.detect.3, host.ingest.3 + host.query.3 + host.detect.3);
+        assert!(TenantBudget::from_eps(target.eps as f64).ingest_memory_cap_bytes >= target.ingest.3);
+        // A small box gives ingest at most half its memory and query >= 1 GiB.
+        let small = size_for(4 * GIB, 2, Some(10_000));
+        assert_eq!(small.ingest.3, 2 * GIB);
+        assert_eq!(small.query.3, GIB);
+        // A big box already covers the rate: the host sizing stands.
+        let big = size_for(64 * GIB, 32, Some(10_000));
+        assert_eq!(big.ingest.3, size(64 * GIB, 32).ingest.3);
+        assert!(big.eps >= 10_000);
+        // A low rate never shrinks ingest below the host share.
+        assert_eq!(size_for(16 * GIB, 8, Some(100)).ingest.3, host.ingest.3);
+        assert_eq!(size_for(16 * GIB, 8, Some(100)).eps, host.eps);
+        // A 2 GiB floor cell has no query memory to give: role memory
+        // unchanged (the tenant is still placed at the target rate).
+        let floor = size_for(2 * GIB, 1, Some(10_000));
+        assert_eq!((floor.ingest, floor.query), (size(2 * GIB, 1).ingest, size(2 * GIB, 1).query));
+        assert_eq!(floor.eps, 10_000);
+    }
+
+    #[test]
+    fn init_places_the_target_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let summary = init(&InitArgs { target_eps: Some(10_000), ..args(&out) }, &env).unwrap();
+        let placement: Value = serde_json::from_slice(&std::fs::read(out.join("cell/placement.json")).unwrap()).unwrap();
+        let t = &placement["tenants"][0];
+        assert_eq!(t["eps"], 10_000.0);
+        assert_eq!(t["ingest_limit_memory_bytes"], INGEST_MEMORY_FOR_FULL_FLUSH);
+        assert_eq!(summary["sizing"]["target_eps"], 10_000);
+        // A re-run without the target returns to the host sizing.
+        init(&args(&out), &env).unwrap();
+        let placement: Value = serde_json::from_slice(&std::fs::read(out.join("cell/placement.json")).unwrap()).unwrap();
+        assert_eq!(placement["tenants"][0]["ingest_limit_memory_bytes"], 4 * GIB);
+    }
+
     #[test]
     fn flags_parse_and_refuse_bad_values() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let parsed = parse_args(&s(&["--out", "/x", "--cpus", "4", "--app-owner", "1000:1000", "--no-require-landlock"])).unwrap();
         assert_eq!(parsed.cpus, Some(4));
+        assert_eq!(parse_args(&s(&["--out", "/x", "--target-eps", "10000"])).unwrap().target_eps, Some(10_000));
+        assert!(parse_args(&s(&["--out", "/x", "--target-eps", "0"])).is_err());
+        assert!(parse_args(&s(&["--out", "/x", "--target-eps", "ten"])).is_err());
         assert_eq!(parsed.app_owner, Some((1000, 1000)));
         assert!(!parsed.require_landlock);
         assert!(parse_args(&s(&[])).is_err(), "--out is required");

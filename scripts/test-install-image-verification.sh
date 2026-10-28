@@ -45,8 +45,9 @@ trap 'rm -rf "$WORK"' EXIT
     sed -n '/^repo_digest_of() {/,/^}/p'      "$INSTALL_SH"
     sed -n '/^verify_one_digest() {/,/^}/p'   "$INSTALL_SH"
     sed -n '/^verify_image_digests() {/,/^}/p' "$INSTALL_SH"
+    sed -n '/^image_sources() {/,/^}/p'       "$INSTALL_SH"
 } > "$WORK/under_test.sh"
-for fn in github_owner_repo github_lock_commit_shas fetch_release_lock repo_digest_of verify_one_digest verify_image_digests; do
+for fn in github_owner_repo github_lock_commit_shas fetch_release_lock repo_digest_of verify_one_digest verify_image_digests image_sources; do
     grep -q "^${fn}() {" "$WORK/under_test.sh" \
         || { echo "could not extract ${fn}() from $INSTALL_SH" >&2; exit 2; }
 done
@@ -175,6 +176,39 @@ ghcr.io/nano-rs/nano-lake-query:latest" "$D1"
 run_case "unpulled profile-gated third-party image is skipped, not fatal" 0 \
     "not pulled (optional/profile-gated image, not deployed)" \
     harness "tenzir/tenzir:v6.19.1 $D1" "nginx:alpine" ""
+
+# NAN-4743: first-party lock lines the compose does not deploy (the sovereign
+# overlay replaces all six) are one summary line, not a warning per image.
+SOV_LOCK="ghcr.io/nano-rs/nano-api $D1
+ghcr.io/nano-rs/nano-lake-cell $D1"
+SOV_ACTIVE="gar.example/nan2361/sovereign-api@$D1
+gar.example/nan2361/sovereign-cell@$D1
+nginx:alpine"
+run_case "first-party images replaced by an overlay: one summary line, not fatal" 0 \
+    "not verified against images.lock: nano-api, nano-lake-cell" harness "$SOV_LOCK" "$SOV_ACTIVE" ""
+out=$(harness "$SOV_LOCK" "$SOV_ACTIVE" "" 2>&1)
+if grep -q 'Skipping digest verify for ghcr.io/nano-rs' <<<"$out"; then
+    FAIL=$((FAIL + 1)); red "overlay-replaced first-party images still warn per image"
+else PASS=$((PASS + 1)); green "no per-image ghcr warnings for overlay-replaced images"; fi
+run_case "an ACTIVE first-party image with no registry digest is still fatal" 1 \
+    "No registry digest found for active image ghcr.io/nano-rs/nano-api:latest" \
+    harness "ghcr.io/nano-rs/nano-api $D1" "ghcr.io/nano-rs/nano-api:latest" ""
+
+# image_sources: the pull line names where the active images really come from.
+src_case() { # name want refs
+    local got; got=$(bash -c 'source "$1/under_test.sh"; image_sources "$2"' _ "$WORK" "$3")
+    if [[ "$got" == "$2" ]]; then PASS=$((PASS + 1)); green "$1"; else FAIL=$((FAIL + 1)); red "$1 — got '$got'"; fi
+}
+src_case "image_sources: sovereign refs + hub images, deduplicated, digests stripped" \
+    "us-central1-docker.pkg.dev/nano-rs/scale/nan2361, docker.io/library, ghcr.io/nano-rs, docker.io/timberio, localhost:5000/x" \
+    "us-central1-docker.pkg.dev/nano-rs/scale/nan2361/sovereign-api@$D1
+us-central1-docker.pkg.dev/nano-rs/scale/nan2361/sovereign-web@$D1
+nginx:alpine
+postgres:18@$D1
+ghcr.io/nano-rs/vector:0.59
+timberio/vector:0.50
+localhost:5000/x/y:1"
+src_case "image_sources: empty compose output" "the configured registries" ""
 
 run_case "NANO_SKIP_IMAGE_VERIFY=1 bypasses the whole check" 0 "skipping image digest verification" \
     env NANO_SKIP_IMAGE_VERIFY=1 bash -c '

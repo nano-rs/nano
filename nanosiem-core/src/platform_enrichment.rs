@@ -13,6 +13,7 @@ pub mod publisher;
 #[cfg(feature = "enterprise")]
 pub mod retention;
 mod stamp;
+pub mod portable;
 pub mod read;
 pub use admission::*;
 pub use stamp::*;

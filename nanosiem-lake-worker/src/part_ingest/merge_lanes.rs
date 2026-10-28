@@ -33,13 +33,55 @@ pub fn capacity(level: Level) -> usize {
 /// rewrite took ~18 min on two lanes, and every hour sealed since then stayed
 /// at ~50 parts behind that queue for 8+ hours: the 1d window read 349 files
 /// instead of ~25, and 1d search p50 went from 1.2 s to 3.0 s.
+#[cfg(test)]
 pub fn launch_order(planned: &mut [PlannedMerge]) {
+    launch_order_at(planned, i64::MIN);
+}
+
+/// [`launch_order`] at `now_ms`. NAN-4750: the `h` merge of a just-closed
+/// hour ([`is_fresh_hour_merge`]) goes first in the history lane, ahead of
+/// fragmented older hours: it is the hour agents hunt next, and until it
+/// merges its rows sit in unlabelled minute parts and mixed L0s that a
+/// class-filtered query cannot skip.
+pub fn launch_order_at(planned: &mut [PlannedMerge], now_ms: i64) {
     use std::cmp::Reverse;
     planned.sort_by_key(|merge| match merge.output_level {
         Level::Minute => (0_u8, Reverse(0_usize), Reverse(merge.event_hour)),
-        Level::Day => (2, Reverse(merge.inputs.len()), Reverse(merge.event_hour)),
-        _ => (1, Reverse(merge.inputs.len()), Reverse(merge.event_hour)),
+        Level::Day => (3, Reverse(merge.inputs.len()), Reverse(merge.event_hour)),
+        _ if is_fresh_hour_merge(merge, now_ms) => (1, Reverse(0), Reverse(merge.event_hour)),
+        _ => (2, Reverse(merge.inputs.len()), Reverse(merge.event_hour)),
     });
+}
+
+/// NAN-4750: an hour counts as just closed for this long after its end.
+/// It covers the seal (`hour_seal_ms`, 10 min) and the settle defer cap
+/// (`sealed_remerge_max_defer_ms`, 30 min) with room to spare, and is short
+/// enough that only the latest one or two hours ever qualify.
+pub const FRESH_HOUR_MERGE_WINDOW_MS: i64 = 60 * 60_000;
+
+/// NAN-4750: `merge` is the `h` merge of an hour that ended less than
+/// [`FRESH_HOUR_MERGE_WINDOW_MS`] before `now_ms`. Such a merge goes first
+/// in the history lane ([`launch_order_at`]), may run while rows are
+/// buffered (not during a catch-up), and has one lane slot of its own
+/// ([`available_at`]), so it never queues behind backfill rewrites.
+pub fn is_fresh_hour_merge(merge: &PlannedMerge, now_ms: i64) -> bool {
+    if merge.output_level != Level::Hour {
+        return false;
+    }
+    let end_ms = (i64::from(merge.event_hour) + 1) * 3_600_000;
+    now_ms >= end_ms && now_ms - end_ms < FRESH_HOUR_MERGE_WINDOW_MS
+}
+
+/// NAN-4750: a fresh hour merge may run beside admission (rows buffered)
+/// unless ingest is catching up, only while no other fresh hour merge is in
+/// flight, and only with the cgroup headroom of a further history merge
+/// (`memory_admits`, [`history_memory_admits`]) even when it is the first
+/// one: beside a live buffer it must not be the merge that tips the role
+/// into an OOM (NAN-4755). Lane and budget gates still apply.
+pub fn fresh_runs_beside_admission<'a>(merge: &PlannedMerge, now_ms: i64, catching_up: bool,
+    mut in_flight: impl Iterator<Item = &'a PlannedMerge>, memory_admits: impl FnOnce() -> bool) -> bool {
+    !catching_up && is_fresh_hour_merge(merge, now_ms) && in_flight.all(|m| !is_fresh_hour_merge(m, now_ms))
+        && memory_admits()
 }
 
 /// NAN-4674: while ingest catches up (or rows are buffered) history merges
@@ -72,8 +114,21 @@ pub fn overlaps(left: &PlannedMerge, right: &PlannedMerge) -> bool {
             .any(|a| right.inputs.iter().any(|b| a.part_id == b.part_id))
 }
 
+#[cfg(test)]
 pub fn available(merge: &PlannedMerge, active: &[&PlannedMerge]) -> bool {
     available_with(merge, active, capacity(merge.output_level), || {
+        history_memory_admits(MemorySnapshot::read())
+    })
+}
+
+/// [`available`] at `now_ms`. NAN-4750: one fresh hour merge
+/// ([`is_fresh_hour_merge`]) at a time gets a history slot beyond
+/// [`capacity`], so long backfill rewrites holding both lanes (~15-18 min
+/// each) do not delay it; as a further history merge it still needs the
+/// memory headroom, and a day merge still runs alone.
+pub fn available_at(merge: &PlannedMerge, active: &[&PlannedMerge], now_ms: i64) -> bool {
+    let reserved = is_fresh_hour_merge(merge, now_ms) && active.iter().all(|m| !is_fresh_hour_merge(m, now_ms));
+    available_with(merge, active, capacity(merge.output_level) + usize::from(reserved), || {
         history_memory_admits(MemorySnapshot::read())
     })
 }
@@ -478,6 +533,56 @@ mod tests {
                 (Level::Day, 499_968),
             ]
         );
+    }
+
+    /// NAN-4750: the just-closed hour's `h` merge goes first in the history
+    /// lane, gets one slot beyond the lanes' capacity, and may run beside
+    /// admission (not during a catch-up), one at a time.
+    #[test]
+    fn a_just_closed_hour_merges_first_with_its_own_slot() {
+        let hour = 500_100;
+        let end_ms = (i64::from(hour) + 1) * 3_600_000;
+        let now = end_ms + 15 * 60_000;
+        let fresh = due(Level::Hour, hour, 30);
+        let backfill = [due(Level::Hour, 500_001, 50), due(Level::Hour, 500_002, 60)];
+        assert!(is_fresh_hour_merge(&fresh, now));
+        assert!(!is_fresh_hour_merge(&fresh, end_ms - 1), "not before the hour ends");
+        assert!(!is_fresh_hour_merge(&fresh, end_ms + FRESH_HOUR_MERGE_WINDOW_MS), "only while just closed");
+        assert!(!is_fresh_hour_merge(&backfill[0], now));
+        assert!(!is_fresh_hour_merge(&due(Level::Minute, hour, 4), now));
+
+        let mut planned = vec![backfill[0].clone(), due(Level::Minute, hour + 1, 4), fresh.clone(), backfill[1].clone()];
+        launch_order_at(&mut planned, now);
+        assert_eq!(planned.iter().map(|m| (m.output_level, m.event_hour)).collect::<Vec<_>>(), vec![
+            (Level::Minute, hour + 1), (Level::Hour, hour), (Level::Hour, 500_002), (Level::Hour, 500_001),
+        ]);
+        // Without a clock (or an old hour) the order is the NAN-3400 one.
+        launch_order(&mut planned);
+        assert_eq!(planned[1].event_hour, 500_002);
+
+        // Both history lanes busy with backfill rewrites: the fresh hour
+        // still starts (memory permitting); a second fresh hour does not.
+        let running = [&backfill[0], &backfill[1]];
+        let capacity = capacity(Level::Hour);
+        let reserved = |merge: &PlannedMerge, active: &[&PlannedMerge]| {
+            let own = is_fresh_hour_merge(merge, now) && active.iter().all(|m| !is_fresh_hour_merge(m, now));
+            available_with(merge, active, capacity + usize::from(own), || true)
+        };
+        let full = (0..capacity).map(|i| due(Level::Hour, 500_010 + i as i32, 2)).collect::<Vec<_>>();
+        let full = full.iter().collect::<Vec<_>>();
+        assert!(!available_with(&fresh, &full, capacity, || true), "lanes full");
+        assert!(reserved(&fresh, &full), "its own slot");
+        // The window is one hour wide: only one hour is ever just closed.
+        assert!(!is_fresh_hour_merge(&due(Level::Hour, hour - 1, 3), now));
+        assert!(!available_with(&fresh, &full, capacity + 1, || false), "still needs memory headroom");
+
+        // Beside admission: not while catching up, one fresh at a time.
+        assert!(fresh_runs_beside_admission(&fresh, now, false, running.into_iter(), || true));
+        assert!(!fresh_runs_beside_admission(&fresh, now, false, std::iter::empty(), || false),
+            "beside admission it always needs the memory headroom (NAN-4755)");
+        assert!(!fresh_runs_beside_admission(&fresh, now, true, std::iter::empty(), || true));
+        assert!(!fresh_runs_beside_admission(&backfill[0], now, false, std::iter::empty(), || true));
+        assert!(!fresh_runs_beside_admission(&fresh, now, false, [&fresh].into_iter(), || true));
     }
 
     #[test]

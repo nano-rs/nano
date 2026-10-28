@@ -1,0 +1,10 @@
+NOTICE: nano enrichment feed bundle. Third-party data, redistributed under the terms below.
+
+[ipinfo_lite] CC-BY-SA-4.0
+IP geolocation and ASN data: IPinfo Lite by IPinfo (https://ipinfo.io), licensed under the Creative Commons Attribution-ShareAlike 4.0 International License (CC BY-SA 4.0, https://creativecommons.org/licenses/by-sa/4.0/). The IPinfo Lite MMDB is redistributed unmodified inside this bundle.
+
+[threatfox] CC0-1.0
+Threat indicators: ThreatFox by abuse.ch (https://threatfox.abuse.ch), released under CC0 1.0 Universal (https://creativecommons.org/publicdomain/zero/1.0/).
+
+[tor_exit_nodes] LicenseRef-tor-bulk-exit-list-public
+Tor exit addresses: The Tor Project bulk exit list (https://check.torproject.org/torbulkexitlist), public data.

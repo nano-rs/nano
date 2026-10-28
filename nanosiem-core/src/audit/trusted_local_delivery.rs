@@ -54,7 +54,21 @@ impl LocalAuditDelivery {
     /// set and the index would cover every audit row forever. Idempotent; run
     /// once at worker boot before [`Self::deliver_once`]. A plain (not
     /// CONCURRENTLY) build: the open ledger is small and it runs before delivery.
+    ///
+    /// NAN-4711: PostgreSQL checks table ownership before `IF NOT EXISTS`, so a
+    /// least-privilege login that does not own `platform_audit_events` cannot
+    /// even no-op the CREATE. When the index already exists (sovereign
+    /// single-host builds it at install), skip the CREATE entirely.
     pub async fn prepare(&self) -> Result<(), String> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT to_regclass('public.idx_platform_audit_open_lean_pending') IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| "local audit pending index lookup failed")?;
+        if exists {
+            return Ok(());
+        }
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_platform_audit_open_lean_pending \
              ON platform_audit_events (tenant_id, occurred_at, event_id) \

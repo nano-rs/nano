@@ -9,7 +9,7 @@
  * transport picker.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { TenantIngestEndpoint } from '@/lib/api/types';
@@ -26,6 +26,10 @@ const mocks = vi.hoisted(() => ({
   listSourceConfigs: vi.fn(),
   listParserRollouts: vi.fn(),
   getParserRollout: vi.fn(),
+  validateLogSourceVrl: vi.fn(),
+  createLogSource: vi.fn(),
+  updateLogSource: vi.fn(),
+  deployLogSource: vi.fn(),
 }));
 
 vi.mock('@/contexts/AuthContext', () => ({
@@ -37,7 +41,11 @@ vi.mock('@/contexts/AuthContext', () => ({
 vi.mock('@/hooks/use-capabilities', () => ({ useCapabilities: () => ({ capabilities: {} }) }));
 vi.mock('@/hooks/use-toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
 vi.mock('@/enterprise/hooks/use-melod-job', () => ({ useMelodJob: () => ({ start: vi.fn(), loading: false }) }));
-vi.mock('@/components/editor/VrlEditor', () => ({ VrlEditor: () => null }));
+vi.mock('@/components/editor/VrlEditor', () => ({
+  VrlEditor: ({ value, onChange }: { value: string; onChange: (v: string) => void }) => (
+    <textarea aria-label="VRL" value={value} onChange={(e) => onChange(e.target.value)} />
+  ),
+}));
 vi.mock('@/lib/api', () => ({
   ApiClientError: class extends Error {},
   api: {
@@ -47,6 +55,12 @@ vi.mock('@/lib/api', () => ({
     listSourceConfigs: mocks.listSourceConfigs,
     listParserRollouts: mocks.listParserRollouts,
     getParserRollout: mocks.getParserRollout,
+    validateLogSourceVrl: mocks.validateLogSourceVrl,
+    testLogSourceVrl: async () => ({ success: true, output: {} }),
+    validateNamespace: async () => ({ valid: true }),
+    createLogSource: mocks.createLogSource,
+    updateLogSource: mocks.updateLogSource,
+    deployLogSource: mocks.deployLogSource,
     listRoutingRules: async () => [],
     getSenderTemplates: async () => ({ version: 1, placeholders: [], templates: [] }),
     sourceScopes: { listRestricted: async () => ({ restricted: [] }) },
@@ -87,6 +101,10 @@ beforeEach(() => {
   ]);
   mocks.listParserRollouts.mockReset().mockResolvedValue([]);
   mocks.getParserRollout.mockReset();
+  mocks.validateLogSourceVrl.mockReset().mockResolvedValue({ valid: true, errors: [], diagnostics: [] });
+  mocks.createLogSource.mockReset().mockResolvedValue({ id: 'lsrc_vercel' });
+  mocks.updateLogSource.mockReset().mockResolvedValue({ id: 'lsrc_vercel' });
+  mocks.deployLogSource.mockReset().mockResolvedValue({ success: true, message: 'ok', rollout: null });
   mocks.listSourceConfigs.mockReset().mockResolvedValue([
     { id: 'sc_http', name: 'HTTP ingest', config_type: 'http', connection_config: {}, enabled: true },
   ]);
@@ -153,6 +171,80 @@ describe('AddFeed → Add data (NAN-2593)', () => {
     expect(screen.getByRole('button', { name: /continue · sample & parse/i })).toBeTruthy();
     expect(screen.getAllByText('Review & activate').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Issue a credential').length).toBe(1);
+  });
+
+  it('a custom source with an empty parser is blocked on the parser, not on a phantom acknowledgement (NAN-4754)', async () => {
+    renderAddFeed();
+    await screen.findByTestId('ingest-endpoint-card');
+    fireEvent.click(screen.getByRole('tab', { name: 'New custom source' }));
+    fireEvent.change(screen.getByPlaceholderText('aws_cloudtrail'), { target: { value: 'vercel' } });
+    fireEvent.click(screen.getAllByText('Review & activate')[0]);
+    const gate = await screen.findByTestId('deploy-gate');
+    expect(within(gate).getByTestId('gate-parser').getAttribute('data-status')).toBe('block');
+    expect(gate.textContent).toContain('Parser · empty · draft or write one in step 2');
+    expect(gate.textContent).not.toContain('VRL syntax · valid');
+    expect(gate.textContent).not.toMatch(/acknowledge/i);
+    expect(within(gate).queryByRole('checkbox')).toBeNull();
+    expect((screen.getByRole('button', { name: /activate source/i }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // NAN-4754, the AU report: a hosted custom source with a real parser and no
+  // samples yet must reach activation through one explicit acknowledgement.
+  async function customSourceWithParser(vrl = '. = parse_json!(.message)') {
+    renderAddFeed();
+    await screen.findByTestId('ingest-endpoint-card');
+    fireEvent.click(screen.getByRole('tab', { name: 'New custom source' }));
+    fireEvent.change(screen.getByPlaceholderText('aws_cloudtrail'), { target: { value: 'vercel' } });
+    fireEvent.click(screen.getAllByText('Sample & parse')[0]);
+    fireEvent.change(await screen.findByLabelText('VRL'), { target: { value: vrl } });
+    fireEvent.click(screen.getAllByText('Review & activate')[0]);
+    const gate = await screen.findByTestId('deploy-gate');
+    await waitFor(() => expect(within(gate).getByTestId('gate-parser').getAttribute('data-status')).toBe('ok'));
+    return gate;
+  }
+
+  it('a hosted custom source with no samples activates after the acknowledgement (NAN-4754)', async () => {
+    const gate = await customSourceWithParser();
+    expect(within(gate).getByTestId('gate-tests').getAttribute('data-status')).toBe('warn');
+    const activate = screen.getByRole('button', { name: /activate source/i }) as HTMLButtonElement;
+    await waitFor(() => expect(within(gate).getByTestId('gate-namespace').getAttribute('data-status')).toBe('ok'));
+    expect(activate.disabled).toBe(true);
+    fireEvent.click(within(gate).getByRole('checkbox'));
+    await waitFor(() => expect(activate.disabled).toBe(false));
+    fireEvent.click(activate);
+    await waitFor(() => expect(mocks.deployLogSource).toHaveBeenCalledWith('lsrc_vercel', [], []));
+    expect(await screen.findByTestId('issue-credential-panel')).toBeTruthy();
+  });
+
+  it('the acknowledgement resets when the warnings change (NAN-4754)', async () => {
+    mocks.validateLogSourceVrl.mockResolvedValue({
+      valid: true, errors: [], diagnostics: [{ severity: 'warn', message: 'unused variable a' }],
+    });
+    const gate = await customSourceWithParser();
+    await waitFor(() => expect(gate.textContent).toContain('unused variable a'));
+    fireEvent.click(within(gate).getByRole('checkbox'));
+    await waitFor(() => expect(within(gate).getByRole('checkbox').getAttribute('aria-checked')).toBe('true'));
+    mocks.validateLogSourceVrl.mockResolvedValue({
+      valid: true, errors: [], diagnostics: [{ severity: 'warn', message: 'unused variable b' }],
+    });
+    fireEvent.click(screen.getAllByText('Sample & parse')[0]);
+    fireEvent.change(await screen.findByLabelText('VRL'), { target: { value: '. = parse_json!(.message)\nb = 1' } });
+    fireEvent.click(screen.getAllByText('Review & activate')[0]);
+    await waitFor(() => expect(screen.getByTestId('deploy-gate').textContent).toContain('unused variable b'), { timeout: 3000 });
+    expect(within(screen.getByTestId('deploy-gate')).getByRole('checkbox').getAttribute('aria-checked')).toBe('false');
+  });
+
+  it('a server preflight refusal is not announced as activated (NAN-4754)', async () => {
+    mocks.deployLogSource.mockResolvedValue({ success: false, message: "'vercel' was not deployed: Sample 1 of 1 failed", rollout: null });
+    const gate = await customSourceWithParser();
+    await waitFor(() => expect(within(gate).getByTestId('gate-namespace').getAttribute('data-status')).toBe('ok'));
+    fireEvent.click(within(gate).getByRole('checkbox'));
+    const activate = screen.getByRole('button', { name: /activate source/i }) as HTMLButtonElement;
+    await waitFor(() => expect(activate.disabled).toBe(false));
+    fireEvent.click(activate);
+    await waitFor(() => expect(mocks.deployLogSource).toHaveBeenCalled());
+    await waitFor(() => expect(activate.disabled).toBe(false));
+    expect(screen.queryByTestId('issue-credential-panel')).toBeNull();
   });
 
   it('collector arrival (NAN-2597): one token for several sources, straight to the collector Issue step', async () => {

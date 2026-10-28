@@ -8,7 +8,7 @@ use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sqlx::Row;
@@ -28,6 +28,146 @@ use crate::parts::provenance::{canonical_json_bytes, Admission, PartInputs, Part
 use crate::parts::{event_hour_of, is_sha256_hex, sha256_hex, DedupWindow};
 
 pub const RECEIPT_FORMAT: &str = "nano.finding-outbox-receipt.v1";
+
+/// Prefix of one drain pass's scratch directory under the drain's
+/// `work_dir` (detect[T]'s `tmp_dir`, NAN-4718).
+pub const DRAIN_SCRATCH_PREFIX: &str = "finding-drain-";
+
+/// One pass's local part drafts. The finished parts are uploaded and signed
+/// (`publish_parts`) before the append is submitted, and ingest reads them
+/// from the object store, never from this directory, so it is removed when
+/// the pass ends, whether the pass succeeded, failed or was cancelled.
+/// NAN-4718: the drafts used to stay in `work_dir` forever. On FP a retrying
+/// drain leaked ~37 part directories (~70 MB) per pass, 16 GiB in nine
+/// hours, which put ops over its disk ceiling. Ingest was then refused, so
+/// the drain could never succeed and the tree never shrank.
+///
+/// The directory is held under an exclusive `flock` for the pass's life:
+/// [`sweep_stale_drain_drafts`] skips a locked one, so a sweep in another
+/// detect process (a replacement started while this one still stops) or a
+/// sweep running beside this pass never removes drafts in flight. The kernel
+/// drops the lock when the process dies, which is what makes a crashed
+/// pass's directory sweepable.
+struct PassScratch {
+    dir: PathBuf,
+    /// Dropped after `Drop::drop` has removed `dir`, so the removal itself
+    /// runs under the lock.
+    _lock: std::fs::File,
+}
+
+/// Opens `dir` itself (never a symlink in its place) for its `flock`.
+fn open_dir_no_follow(dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(dir)
+}
+
+impl PassScratch {
+    fn create(work_dir: &Path) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::create_dir_all(work_dir).with_context(|| format!("create finding drain work dir {}", work_dir.display()))?;
+        // A sweep can take the lock between `create_dir` and ours and remove
+        // the empty directory: retry under a new name. Once we hold the lock
+        // on a still-linked directory, no sweep removes it.
+        for _ in 0..3 {
+            let dir = work_dir.join(format!("{DRAIN_SCRATCH_PREFIX}{}", uuid::Uuid::now_v7().simple()));
+            std::fs::create_dir(&dir).with_context(|| format!("create finding drain scratch {}", dir.display()))?;
+            let lock = match open_dir_no_follow(&dir) {
+                Ok(lock) => lock,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).with_context(|| format!("open finding drain scratch {}", dir.display())),
+            };
+            if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+                continue;
+            }
+            if lock.metadata().context("stat finding drain scratch")?.nlink() == 0 {
+                continue;
+            }
+            return Ok(Self { dir, _lock: lock });
+        }
+        bail!("finding drain scratch in {} was removed while it was created", work_dir.display())
+    }
+
+    fn path(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl Drop for PassScratch {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(dir = %self.dir.display(), %error,
+                "finding drain scratch not removed; the next drain start sweeps it"),
+        }
+    }
+}
+
+/// Removes drain drafts an earlier detect[T] process left in `work_dir`
+/// (it crashed or was killed mid-pass, or it ran a build from before
+/// NAN-4718 that never removed them). Only direct children of `work_dir`
+/// that are real directories (never symlinks) are candidates, of two kinds:
+/// a [`DRAIN_SCRATCH_PREFIX`] directory no live pass holds (its `flock` is
+/// taken here, without waiting, and held while it is removed), and a legacy
+/// draft directory named by a part id (only builds before NAN-4718 wrote
+/// those; no current code does). Everything else stays, such as the rule
+/// engine's spill under the same `TMPDIR`, and `work_dir` itself. Returns
+/// the number of directories removed. Best effort: a failure is logged and
+/// the drain carries on.
+pub fn sweep_stale_drain_drafts(work_dir: &Path) -> usize {
+    let entries = match std::fs::read_dir(work_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => {
+            tracing::warn!(dir = %work_dir.display(), %error, "finding drain draft sweep could not list its work dir");
+            return 0;
+        }
+    };
+    let started = std::time::Instant::now();
+    let (mut removed, mut in_flight) = (0, 0);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let scratch = name.starts_with(DRAIN_SCRATCH_PREFIX);
+        let ours = scratch || crate::parts::format::PartId::parse(name).is_ok();
+        // `DirEntry::file_type` does not follow a symlink.
+        if !ours || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        // Held until the removal below has finished.
+        let _lock = if scratch {
+            let Ok(lock) = open_dir_no_follow(&path) else { continue };
+            if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+                in_flight += 1;
+                continue;
+            }
+            Some(lock)
+        } else {
+            None
+        };
+        // `remove_dir_all` never follows symlinks, at the top or inside.
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(dir = %path.display(), %error, "stale finding drain draft not removed"),
+        }
+    }
+    if removed > 0 || in_flight > 0 {
+        tracing::info!(dir = %work_dir.display(), removed, in_flight, elapsed_ms = started.elapsed().as_millis() as u64,
+            "finding drain removed stale local part drafts");
+    }
+    removed
+}
+
+/// Runs [`sweep_stale_drain_drafts`] on a blocking thread and does not wait
+/// for it: a pre-NAN-4718 backlog is thousands of directories (8.5k, 16 GiB
+/// on FP ops), and the drain's first pass, which is what frees the
+/// outbox, must not wait behind it. The pass-scratch lock keeps the two
+/// apart.
+pub fn spawn_stale_drain_draft_sweep(work_dir: PathBuf) -> tokio::task::JoinHandle<usize> {
+    tokio::task::spawn_blocking(move || sweep_stale_drain_drafts(&work_dir))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -808,6 +948,8 @@ async fn publish_claimed(
                 .parse::<chrono::DateTime<chrono::Utc>>()?.timestamp_micros();
             by_hour.entry(event_hour_of(time_us)).or_default().push(row);
         }
+        // NAN-4718: removed when this block ends (after the append), on every path.
+        let scratch = PassScratch::create(work_dir)?;
         let mut finished = Vec::new();
         for (hour, rows) in by_hour {
             let sources = rows.iter().map(|row| Ok(SourceObject {
@@ -835,7 +977,7 @@ async fn publish_claimed(
                 window: DedupWindow::Exact,
                 build: format!("nanosiem-lake-worker {}", env!("CARGO_PKG_VERSION")),
             };
-            let mut writer = PartWriter::create(work_dir, draft, PartialSource::FromFindings, now_ms, batch.num_rows() as u64)?;
+            let mut writer = PartWriter::create(scratch.path(), draft, PartialSource::FromFindings, now_ms, batch.num_rows() as u64)?;
             writer.write(&batch)?;
             finished.push(writer.finish()?);
         }
@@ -943,6 +1085,88 @@ mod tests {
         let marker = super::super::ingest::finding_attempt_key(TENANT_A, &source).unwrap();
         assert!(store.put_if_absent(&marker, &serde_json::to_vec(&source).unwrap()).await.unwrap());
         assert_eq!(receipts_needing_log_proof(&store, TENANT_A, &[source.clone()]).await.unwrap(), vec![source]);
+    }
+
+    /// NAN-4718: a pass's drafts live in one scratch dir that is gone when
+    /// the pass ends, on the error path too (here: the guard dropped while
+    /// a finished part is still on disk, as a refused append leaves it).
+    #[test]
+    fn pass_scratch_removes_its_finished_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = LocalPartSigner::new("lab-scratch", SigningKey::from_bytes(&[5; 32])).unwrap();
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2026-10-27T18:00:00Z").unwrap().timestamp_micros();
+        let compact: CompactFinding = serde_json::from_value(serde_json::json!({
+            "id":"f1", "timestamp_us":timestamp, "entity":"alice@example.com",
+            "stamped_entity_type":"email", "risk_score":75, "rule_id":"r1",
+            "rule_name":"test", "severity":"high", "origin_source_types":["auth"], "mitre_tactics":[]
+        })).unwrap();
+        let ocsf = serde_json::json!({"class_uid":2004, "time":timestamp / 1000,
+            "metadata":{"uid":"f1","tenant_uid":TENANT_A,"log_source":"detections"}, "unmapped":{}});
+        // The drain's own event shape (publish_claimed).
+        let mut event = finding_event(&ocsf, &compact).unwrap();
+        event["time"] = Value::String("2026-10-27T18:00:00.000000Z".into());
+        let schema = Arc::new(infer_schema(&[&event]).unwrap());
+        let draft = PartDraft {
+            tenant_id: TENANT_A.into(), signer_key_id: signer.key_id().into(), level: Level::L0,
+            event_hour: event_hour_of(timestamp), schema_fingerprint: crate::parts::format::schema_fingerprint(&schema).unwrap(),
+            schema: schema.clone(),
+            inputs: PartInputs::Sources { sources: vec![SourceObject {
+                key: "k".into(), version: "v".into(), sha256: "0".repeat(64), bytes: 1, rows: 1, edge_sha256: None,
+            }], edge_log: None },
+            admission: Some(Admission { ocsf_version: crate::iceberg::OCSF_VERSION.into(),
+                admission_contract: "finding-outbox-v1".into(), feed_pins: BTreeMap::new() }),
+            rows_in: 1, duplicates_dropped: 0, window: DedupWindow::Exact, build: "test".into(),
+        };
+        let scratch = PassScratch::create(dir.path()).unwrap();
+        let mut writer = PartWriter::create(scratch.path(), draft, PartialSource::FromFindings, timestamp / 1000, 1).unwrap();
+        writer.write(&decode(schema, &[&event]).unwrap()).unwrap();
+        let finished = writer.finish().unwrap();
+        assert!(finished.dir.starts_with(scratch.path()) && finished.dir.join("data-00000.parquet").exists());
+        let held = scratch.path().to_path_buf();
+        drop(scratch);
+        assert!(!held.exists() && !finished.dir.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// NAN-4718: the start-of-drain sweep removes scratch and legacy
+    /// part-id draft dirs an earlier process left, and nothing else that
+    /// shares detect[T]'s TMPDIR.
+    #[test]
+    fn stale_drain_drafts_are_swept_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("1793113218804-2187e574472e4c8d");
+        std::fs::create_dir_all(legacy.join("partials")).unwrap();
+        std::fs::write(legacy.join("data-00000.parquet"), b"x").unwrap();
+        let scratch = dir.path().join(format!("{DRAIN_SCRATCH_PREFIX}0192"));
+        std::fs::create_dir_all(scratch.join("1793113218804-59f1d92cc86847bb")).unwrap();
+        // The rule engine's spill, and a file that only looks like a part id.
+        std::fs::create_dir_all(dir.path().join("chdb-spill")).unwrap();
+        std::fs::write(dir.path().join("1793113218804-5cd33f205fe646d9"), b"not a dir").unwrap();
+        // Symlinks named like drafts, into a directory outside the work dir:
+        // neither the link's target nor anything in it is touched.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("1793113218804-0123456789abcdef")).unwrap();
+        std::fs::write(outside.path().join("keep"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(format!("{DRAIN_SCRATCH_PREFIX}link"))).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("1793113218804-fedcba9876543210")).unwrap();
+        // A live pass's scratch (in this process or another detect process):
+        // its lock keeps it, with its drafts, until the pass drops it.
+        let live = PassScratch::create(dir.path()).unwrap();
+        std::fs::create_dir_all(live.path().join("1793113218804-59f1d92cc86847bb")).unwrap();
+        std::fs::write(live.path().join("1793113218804-59f1d92cc86847bb").join("data-00000.parquet"), b"x").unwrap();
+        assert_eq!(sweep_stale_drain_drafts(dir.path()), 2);
+        assert!(!legacy.exists() && !scratch.exists());
+        assert!(dir.path().join("chdb-spill").is_dir() && dir.path().join("1793113218804-5cd33f205fe646d9").is_file());
+        assert!(live.path().join("1793113218804-59f1d92cc86847bb").join("data-00000.parquet").is_file(),
+            "an in-flight pass keeps its drafts");
+        assert!(outside.path().join("keep").is_file() && outside.path().join("1793113218804-0123456789abcdef").is_dir());
+        assert!(dir.path().join(format!("{DRAIN_SCRATCH_PREFIX}link")).symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(dir.path().is_dir(), "the work dir itself stays");
+        // The pass ends: its own removal takes the drafts.
+        let live_dir = live.path().to_path_buf();
+        drop(live);
+        assert!(!live_dir.exists());
+        assert_eq!(sweep_stale_drain_drafts(&dir.path().join("absent")), 0);
     }
 
     #[tokio::test]

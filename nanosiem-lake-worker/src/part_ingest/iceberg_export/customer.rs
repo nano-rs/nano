@@ -111,6 +111,61 @@ pub(super) async fn stage_bounded(
     Ok(())
 }
 
+/// NAN-4721: [`stage_bounded`] for agent-catalog work. Ranges are read on
+/// the caller's runtime (its connection pool is shared with ingest), but
+/// every chunk's sha256 and spool write run on the idle-class agent-lane
+/// thread, so a cold multi-GB prepare never occupies a runtime worker.
+/// While ingest is under pressure every chunk is paced to
+/// [`agent_lane::PRESSURED_BYTES_PER_SEC`](crate::part_ingest::agent_lane::PRESSURED_BYTES_PER_SEC).
+pub(super) async fn stage_on_agent_lane(
+    pressure: &crate::part_ingest::agent_lane::IngestPressure,
+    store: &dyn ObjectStore,
+    key: &str,
+    path: &Path,
+    size: u64,
+    expected: &str,
+    limit: u64,
+) -> Result<()> {
+    use crate::part_ingest::agent_lane;
+    ensure!(
+        size > 0 && size <= limit,
+        "export file exceeds copy bound"
+    );
+    ensure!(
+        store.object_size(key).await? == Some(size),
+        "export object size differs"
+    );
+    let created = path.to_path_buf();
+    let mut sink = agent_lane::run(move || std::fs::File::create(created)).await??;
+    let mut hash = Sha256::new();
+    let mut offset = 0;
+    while offset < size {
+        let started = tokio::time::Instant::now();
+        let end = (offset + CHUNK).min(size);
+        let bytes = store
+            .get_range(key, offset..end)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("export source missing"))?;
+        ensure!(
+            bytes.len() as u64 == end - offset,
+            "export source range differs"
+        );
+        (sink, hash) = agent_lane::run(move || -> std::io::Result<_> {
+            hash.update(&bytes);
+            sink.write_all(&bytes)?;
+            Ok((sink, hash))
+        })
+        .await??;
+        pressure.pace(end - offset, started).await;
+        offset = end;
+    }
+    ensure!(
+        hex::encode(hash.finalize()) == expected,
+        "export source checksum differs"
+    );
+    Ok(())
+}
+
 fn compatible(expected: &iceberg::spec::Type, actual: &iceberg::spec::Type) -> bool {
     use iceberg::spec::Type;
     match (expected, actual) {

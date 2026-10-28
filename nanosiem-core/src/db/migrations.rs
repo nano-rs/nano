@@ -455,9 +455,117 @@ pub async fn run_postgres_migrations(pool: &PgPool) -> Result<(), MigrationError
     Ok(())
 }
 
+/// Every version [`run_postgres_migrations`] records in `_sqlx_migrations`
+/// on a successful run, ascending (NAN-4711).
+///
+/// Both the snapshot path (backfill of `1..=`[`OPEN_INIT_BASELINE_VERSION`]
+/// with `success = TRUE`, then the migrator for the rest) and the legacy path
+/// (migrator for everything) end with one successful row per embedded up
+/// migration, so the expected set is the same in every `NANOSIEM_MIGRATION_MODE`.
+pub fn embedded_postgres_versions() -> Vec<i64> {
+    let migrator = sqlx::migrate!("../migrations/postgres");
+    up_versions(&migrator)
+}
+
+/// The up-migration versions of `migrator`, ascending. sqlx never records
+/// down migrations on `run`.
+pub fn up_versions(migrator: &Migrator) -> Vec<i64> {
+    let mut versions: Vec<i64> = migrator
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration())
+        .map(|m| m.version)
+        .collect();
+    versions.sort_unstable();
+    versions.dedup();
+    versions
+}
+
+/// Boot refusal for a runtime that does not own migrations (NAN-4711).
+#[derive(Debug, Error)]
+pub enum SchemaHeadError {
+    #[error("PostgreSQL schema history (_sqlx_migrations) is missing: postgres-migrate must complete before this service starts")]
+    HistoryMissing,
+    #[error("PostgreSQL migration {0} is not applied: postgres-migrate must complete before this service starts")]
+    MissingVersion(i64),
+    #[error("reading PostgreSQL schema history failed: {0}")]
+    Query(#[source] sqlx::Error),
+}
+
+/// Pure comparison: the first (lowest) expected version absent from the
+/// successfully applied set, if any.
+pub fn first_missing_version(
+    expected: &[i64],
+    applied: &std::collections::HashSet<i64>,
+) -> Option<i64> {
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    expected.into_iter().find(|version| !applied.contains(version))
+}
+
+/// Verify that every `expected` migration is recorded with `success = TRUE`.
+/// SELECT only, so a DML-only runtime role can run it. Extra applied versions
+/// (a newer migrator ran first) are fine.
+pub async fn verify_postgres_schema_head(
+    pool: &PgPool,
+    expected: &[i64],
+) -> Result<(), SchemaHeadError> {
+    let has_history: bool =
+        sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .map_err(SchemaHeadError::Query)?;
+    if !has_history {
+        return Err(SchemaHeadError::HistoryMissing);
+    }
+    let applied: std::collections::HashSet<i64> =
+        sqlx::query_scalar("SELECT version FROM public._sqlx_migrations WHERE success")
+            .fetch_all(pool)
+            .await
+            .map_err(SchemaHeadError::Query)?
+            .into_iter()
+            .collect();
+    match first_missing_version(expected, &applied) {
+        Some(version) => Err(SchemaHeadError::MissingVersion(version)),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_missing_version_reports_the_lowest_gap() {
+        let applied: std::collections::HashSet<i64> = [1, 2, 4, 9_000_001].into_iter().collect();
+        assert_eq!(first_missing_version(&[4, 3, 1, 5], &applied), Some(3));
+        assert_eq!(first_missing_version(&[1, 2, 4], &applied), None);
+        // A newer migrator's extra rows never fail an older binary.
+        assert_eq!(first_missing_version(&[1, 2], &applied), None);
+        assert_eq!(first_missing_version(&[], &applied), None);
+        assert_eq!(
+            first_missing_version(&[1], &std::collections::HashSet::new()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn embedded_versions_cover_the_snapshot_backfill_and_the_rest() {
+        let versions = embedded_postgres_versions();
+        let migrator = sqlx::migrate!("../migrations/postgres");
+        // Fresh path: the backfill rows plus the migrator rows are exactly the
+        // embedded set, so a fresh install satisfies the head check.
+        let mut recorded: Vec<i64> = migrations_to_backfill(&migrator).map(|m| m.version).collect();
+        recorded.extend(
+            migrator
+                .iter()
+                .filter(|m| m.version > OPEN_INIT_BASELINE_VERSION)
+                .map(|m| m.version),
+        );
+        recorded.sort_unstable();
+        recorded.dedup();
+        assert_eq!(versions, recorded);
+        assert!(versions.windows(2).all(|w| w[0] < w[1]));
+    }
 
     #[test]
     fn migration_mode_from_env_parses_known_values() {

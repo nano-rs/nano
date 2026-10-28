@@ -2733,6 +2733,8 @@ export interface GeneratedParser {
   vrl_code: string;
   description: string;
   output_fields: Record<string, string>;
+  /** VRL compile result of the final draft (NAN-4753: may still be invalid). */
+  validation_result?: { valid: boolean; errors: string[] };
   test_results?: {
     passed: number;
     failed: number;

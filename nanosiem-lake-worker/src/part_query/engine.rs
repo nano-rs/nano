@@ -1875,7 +1875,10 @@ impl PartQueryEngine {
             // layout (not a full JSON + hex decode through the metadata
             // cache), fanned out like the token probes.
             let items = candidates_files.iter().map(|(part, index)| {
-                let groups = uids.records[&part.part_id].files.data[*index].row_groups as usize;
+                // A file without a uid sidecar (written before, or without,
+                // NANO_LAKE_UID_SIDECAR_WRITE) has no record here: no uid
+                // evidence, so every group is kept.
+                let groups = uids.records.get(&part.part_id).and_then(|record| record.files.data.get(*index)).map_or(0, |data| data.row_groups as usize);
                 let local = uids.path(&part.part_id, PartFile::Uids(*index)).map(|local| (local.path.clone(), local.sha256.clone()));
                 (local, groups)
             }).collect::<Vec<_>>();

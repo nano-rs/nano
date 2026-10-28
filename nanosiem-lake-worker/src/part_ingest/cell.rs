@@ -1573,6 +1573,13 @@ impl IngestService {
         // state at open within this cap.
         cfg.prevalence_cache_max_bytes = prevalence_cache_bytes_for(assignment);
         super::ingest::size_for_memory_cap(&mut cfg, assignment.memory_cap_bytes);
+        // NAN-4723: a local prevalence state's compactor, L0 room and
+        // unflushed budget follow the role's placement.
+        // A placement limit can exceed the host, so the cores are capped at
+        // what this process can actually run on.
+        cfg.prevalence_local_sizing = super::prevalence::LocalStateSizing::for_placement(
+            super::prevalence::LocalStateSizing::usable_cpu_millis(assignment.cpu_millis),
+            assignment.memory_cap_bytes);
         // Constructor defaults enable bounded ordered overlap. The queue,
         // available memory and privacy/custody state determine actual depth.
         // NAN-3662: per-source refusal counts in `reject` details (default off).

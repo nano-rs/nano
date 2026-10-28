@@ -343,6 +343,10 @@ async fn trusted_local_drain_loop(
         .connect(bootstrap.database_url.as_str()).await
         .map_err(|_| anyhow::anyhow!("connect local finding drain failed"))?;
     let transport = SupervisorFindingTransport { service, control };
+    // NAN-4718: drafts an earlier process left behind. In the background:
+    // a legacy backlog is thousands of directories, and the first pass must
+    // not wait for it (a live pass's scratch is locked, so the sweep skips it).
+    drop(nanosiem_lake_worker::part_ingest::finding_outbox::spawn_stale_drain_draft_sweep(assignment.tmp_dir.clone()));
     let mut cache = DrainLogCache::default();
     let mut failures = 0u32;
     let mut idle = IdleLog::default();
@@ -403,6 +407,10 @@ async fn drain_loop(assignment: &Assignment, detect: DetectBootstrap, service: &
     *service.secrets.lock().expect("secrets lock") = Some(secret_tx);
     let (generation, epoch) = (detect.assignment_generation, detect.writer_epoch);
     tracing::info!(generation, epoch, expires_at = %refresher.expires_at(), "detect finding drain started");
+    // NAN-4718: drafts an earlier process left behind. In the background:
+    // a legacy backlog is thousands of directories, and the first pass must
+    // not wait for it (a live pass's scratch is locked, so the sweep skips it).
+    drop(nanosiem_lake_worker::part_ingest::finding_outbox::spawn_stale_drain_draft_sweep(assignment.tmp_dir.clone()));
     let transport = SupervisorFindingTransport { service, control };
 
     // The schedule, the exchange that answers it and the drain run
@@ -909,10 +917,11 @@ mod refresh_health_tests {
         let outbox = drain.finding_outbox.unwrap();
         assert_eq!(outbox.backlog, 1_000);
         assert!(outbox.oldest_age_seconds >= 700.0, "{outbox:?}");
-        assert!((2.0 * 86_400.0..2.0 * 86_400.0 + 60.0).contains(&outbox.retention_overdue_seconds), "{outbox:?}");
+        // 10 days published against the 7-day window (NAN-4668) = 3 days overdue.
+        assert!((3.0 * 86_400.0..3.0 * 86_400.0 + 60.0).contains(&outbox.retention_overdue_seconds), "{outbox:?}");
         // A pass without a retention check keeps the last reading.
         record_backlog(&service, &DrainPass::default());
-        assert!(service.heartbeat().finding_outbox.unwrap().retention_overdue_seconds >= 2.0 * 86_400.0);
+        assert!(service.heartbeat().finding_outbox.unwrap().retention_overdue_seconds >= 3.0 * 86_400.0);
         // Healthy: the oldest delivered row is inside the window.
         record_backlog(&service, &DrainPass { retention: Some(RetentionCheck { oldest_retained_published_ms: Some(now - 86_400_000) }),
             ..DrainPass::default() });

@@ -49,7 +49,28 @@ enum PostgresMigrationAuthority {
 }
 
 impl PostgresMigrationAuthority {
-    fn from_values(authority: Option<&str>, deployment_mode: Option<&str>) -> Result<Self, String> {
+    /// NAN-4711: a sovereign runtime connects as a DML-only role and the
+    /// separate `postgres-migrate` step owns every migration, so the
+    /// authority is always the external job there; an explicit `runtime`
+    /// is refused rather than failing later on a DDL permission error.
+    fn from_values(
+        authority: Option<&str>,
+        deployment_mode: Option<&str>,
+        sovereign: bool,
+    ) -> Result<Self, String> {
+        if sovereign {
+            return match authority {
+                None | Some("") | Some("external_job") => Ok(Self::ExternalJob),
+                Some("runtime") => Err(
+                    "NANOSIEM_POSTGRES_MIGRATION_AUTHORITY=runtime is not allowed in sovereign mode: \
+                     postgres-migrate owns PostgreSQL migrations and the runtime role cannot run DDL"
+                        .to_string(),
+                ),
+                Some(other) => Err(format!(
+                    "invalid NANOSIEM_POSTGRES_MIGRATION_AUTHORITY value: {other}"
+                )),
+            };
+        }
         match authority {
             None | Some("") | Some("runtime") => Ok(Self::Runtime),
             Some("external_job") if deployment_mode == Some("enterprise_shared") => {
@@ -65,11 +86,22 @@ impl PostgresMigrationAuthority {
         }
     }
 
-    fn from_env() -> Result<Self, String> {
+    fn from_env(sovereign: bool) -> Result<Self, String> {
         let authority = std::env::var("NANOSIEM_POSTGRES_MIGRATION_AUTHORITY").ok();
         let deployment_mode = std::env::var("DEPLOYMENT_MODE").ok();
-        Self::from_values(authority.as_deref(), deployment_mode.as_deref())
+        Self::from_values(authority.as_deref(), deployment_mode.as_deref(), sovereign)
     }
+}
+
+/// NAN-4711: the migrations a sovereign runtime requires before serving, i.e.
+/// what `postgres_migrator` records (open chain, plus the enterprise overlay
+/// on enterprise builds).
+fn sovereign_expected_postgres_versions() -> Vec<i64> {
+    #[allow(unused_mut)]
+    let mut versions = nanosiem_core::db::embedded_postgres_versions();
+    #[cfg(feature = "enterprise")]
+    versions.extend(nanosiem_enterprise::postgres_migrations::embedded_versions());
+    versions
 }
 
 #[cfg(test)]
@@ -82,13 +114,14 @@ mod postgres_migration_authority_tests {
         assert_eq!(
             PostgresMigrationAuthority::from_values(
                 Some("external_job"),
-                Some("enterprise_shared")
+                Some("enterprise_shared"),
+                false
             )
             .unwrap(),
             PostgresMigrationAuthority::ExternalJob
         );
         assert!(
-            PostgresMigrationAuthority::from_values(Some("external_job"), Some("enterprise"))
+            PostgresMigrationAuthority::from_values(Some("external_job"), Some("enterprise"), false)
                 .is_err()
         );
     }
@@ -96,10 +129,42 @@ mod postgres_migration_authority_tests {
     #[test]
     fn runtime_is_the_only_default_authority() {
         assert_eq!(
-            PostgresMigrationAuthority::from_values(None, None).unwrap(),
+            PostgresMigrationAuthority::from_values(None, None, false).unwrap(),
             PostgresMigrationAuthority::Runtime
         );
-        assert!(PostgresMigrationAuthority::from_values(Some("skip"), None).is_err());
+        assert!(PostgresMigrationAuthority::from_values(Some("skip"), None, false).is_err());
+        assert!(
+            PostgresMigrationAuthority::from_values(Some("external_job"), Some("selfhosted"), false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sovereign_authority_is_always_the_external_job() {
+        for authority in [None, Some(""), Some("external_job")] {
+            assert_eq!(
+                PostgresMigrationAuthority::from_values(authority, Some("selfhosted"), true)
+                    .unwrap(),
+                PostgresMigrationAuthority::ExternalJob
+            );
+        }
+        let refused =
+            PostgresMigrationAuthority::from_values(Some("runtime"), Some("selfhosted"), true)
+                .unwrap_err();
+        assert!(refused.contains("not allowed in sovereign mode"), "{refused}");
+        assert!(refused.contains("postgres-migrate"), "{refused}");
+        assert!(PostgresMigrationAuthority::from_values(Some("skip"), None, true).is_err());
+    }
+
+    #[test]
+    fn sovereign_head_covers_the_open_chain_and_overlay() {
+        let expected = super::sovereign_expected_postgres_versions();
+        let open = nanosiem_core::db::embedded_postgres_versions();
+        assert!(open.iter().all(|v| expected.contains(v)));
+        #[cfg(feature = "enterprise")]
+        assert!(expected.iter().any(|v| *v >= 9_000_000));
+        #[cfg(not(feature = "enterprise"))]
+        assert_eq!(expected, open);
     }
 }
 
@@ -1133,7 +1198,9 @@ impl AppState {
             DualPool::new_lake_control_plane_with_min_connections(&dual_config, 2).await?;
 
         let pg_pool: &sqlx::PgPool = dual_pool.postgres();
-        match PostgresMigrationAuthority::from_env().map_err(DualPoolError::ConfigError)? {
+        match PostgresMigrationAuthority::from_env(config.sovereign)
+            .map_err(DualPoolError::ConfigError)?
+        {
             PostgresMigrationAuthority::Runtime => {
                 // The helper handles fresh-init detection, snapshot apply, and
                 // legacy-history backfill (NAN-749) in addition to the
@@ -1164,6 +1231,17 @@ impl AppState {
                 // `CREATE TABLE IF NOT EXISTS _sqlx_migrations` would break the
                 // database isolation contract.
                 tracing::info!("PostgreSQL migrations are owned by the external pre-rollout Job");
+                // NAN-4711: sovereign single-host runs postgres-migrate as a
+                // separate step; refuse to serve a schema it has not finished.
+                if config.sovereign {
+                    nanosiem_core::db::verify_postgres_schema_head(
+                        pg_pool,
+                        &sovereign_expected_postgres_versions(),
+                    )
+                    .await
+                    .map_err(|error| DualPoolError::ConfigError(error.to_string()))?;
+                    tracing::info!("PostgreSQL schema head verified (sovereign)");
+                }
             }
         }
 

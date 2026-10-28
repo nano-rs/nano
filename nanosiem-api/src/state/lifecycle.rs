@@ -177,6 +177,20 @@ impl AppState {
             if let Some(runtime) = self.tenant_observability_eval_runtime.as_ref() {
                 handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
             }
+            // NAN-4699 step 4: these two take no per-tenant claim, so with
+            // two jobs pods they run only here, on the PG leader. Identity
+            // sync re-derives each due tenant's users from its lake (a
+            // duplicate pass doubles the scan and the audit row); the
+            // attestor signs every tenant's readiness receipts (a duplicate
+            // races the revision fence and logs N2322/N2323).
+            if let Some(runtime) = self.tenant_identity_sync_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared tenant identity sync runtime started (leader-only)");
+            }
+            if let Some(runtime) = self.tenant_platform_readiness_attestor.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared platform readiness attestor started (leader-only)");
+            }
             // NAN-3196: the legacy HealthScheduler stays off (global admins,
             // tenant-blind issue tracker, ClickHouse). Shared feed staleness
             // runs through signed tenant transactions over the lake counters

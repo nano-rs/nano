@@ -2375,6 +2375,13 @@ impl SanctionedPartGc for CellSanctionedPartGc {
             .map(|route| route.is_some())
             .unwrap_or(false)
     }
+
+    /// NAN-4726: the delivered `policy.retention_days` (validated to
+    /// 30/90/180/365 at parse), only while the route may delete; a withdrawn,
+    /// disabled, expired or refreshing route reads as no policy.
+    fn retention_days(&self) -> Option<u64> {
+        self.shared.current().ok().and_then(|route| route.policy.retention_days)
+    }
 }
 
 /// Owner + Worker seams for one pass. Every call re-reads the route, so a

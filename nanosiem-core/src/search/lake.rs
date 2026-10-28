@@ -2502,6 +2502,9 @@ impl LakeQueryClient {
         offset: usize,
         cursor: Option<(&str, &str)>,
     ) -> Result<LakeQueryEnvelope, SearchError> {
+        // NAN-4738: the id the cell classes this statement by.
+        let wire_id = crate::search::service::background_request::lake_wire_request_id(query_id);
+        let query_id: &str = &wire_id;
         let clear_boundaries: std::collections::BTreeMap<String, i64> = risk_config
             .map(|config| {
                 let cleared = config.lake_cleared.as_ref().unwrap_or(&config.cleared);
@@ -2734,6 +2737,9 @@ impl LakeQueryClient {
         F: FnMut(Vec<serde_json::Value>) -> Fut,
         Fut: std::future::Future<Output = bool>,
     {
+        // NAN-4738: the id the cell classes this statement by.
+        let wire_id = crate::search::service::background_request::lake_wire_request_id(query_id);
+        let query_id: &str = &wire_id;
         let payload = LakeQueryRequest {
             request_id: query_id,
             tenant_id: &self.tenant_id,
@@ -2858,6 +2864,9 @@ impl LakeQueryClient {
         request_id: &str,
         deny_source_types: &BTreeSet<String>,
     ) -> Result<String, SearchError> {
+        // NAN-4738: the id the cell classes this statement by.
+        let wire_id = crate::search::service::background_request::lake_wire_request_id(request_id);
+        let request_id: &str = &wire_id;
         let limit = request.limit.unwrap_or(DEFAULT_RESULT_LIMIT);
         if limit == 0 || limit > MAX_RESULT_LIMIT {
             return Err(SearchError::SqlValidationError(format!(
@@ -3005,6 +3014,9 @@ impl LakeQueryClient {
         deny_source_types: &BTreeSet<String>,
         max_groups: usize,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
+        // NAN-4738: the id the cell classes this statement by.
+        let wire_id = crate::search::service::background_request::lake_wire_request_id(request_id);
+        let request_id: &str = &wire_id;
         let payload = LakeCountAggregateRequest {
             request_id,
             tenant_id: &self.tenant_id,
@@ -3187,7 +3199,8 @@ impl LakeQueryClient {
     }
 
     pub(crate) async fn unmapped_field_names(&self) -> Result<Vec<String>, SearchError> {
-        let request_id = uuid::Uuid::now_v7().to_string();
+        // NAN-4738: an agent's field listing runs in the agent class.
+        let request_id = crate::search::service::background_request::lake_wire_request_id(&uuid::Uuid::now_v7().to_string()).into_owned();
         let payload = LakeFieldNamesRequest {
             request_id: &request_id,
             tenant_id: &self.tenant_id,
@@ -3268,7 +3281,8 @@ impl LakeQueryClient {
         source_type: Option<&str>,
         deny_source_types: &BTreeSet<String>,
     ) -> Result<Option<serde_json::Value>, SearchError> {
-        let request_id = uuid::Uuid::now_v7().to_string();
+        // NAN-4738: an agent's event fetch runs in the agent class.
+        let request_id = crate::search::service::background_request::lake_wire_request_id(&uuid::Uuid::now_v7().to_string()).into_owned();
         let payload = LakeFetchLogRequest {
             request_id: &request_id,
             tenant_id: &self.tenant_id,
@@ -7288,6 +7302,34 @@ mod cold_budget_transport_tests {
                     "page_has_more": cut || self.total > first + limit, "newest_first_event_rows": true,
                     "page_byte_cut": cut,
                     "continuation": cut.then(|| serde_json::json!({"cursor_time": time(end - 1), "cursor_event_uid": format!("e{:06}", end - 1)}))}}))
+        }
+    }
+
+    /// NAN-4738: the cell classes a statement by the id it carries, so an
+    /// agent-class search sends an `agent-` id even when the caller named its
+    /// own `request_id` (and on every continuation), the echoed binding still
+    /// checks, and a human's id is sent as is.
+    #[tokio::test]
+    async fn agent_class_searches_carry_agent_ids_to_the_cell() {
+        use crate::search::admission::{with_query_class, QueryClass};
+        for (class, expected) in [(QueryClass::Agent, "agent-run-1"), (QueryClass::Human, "run-1")] {
+            let server = MockServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+            let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            Mock::given(method("POST")).respond_with(ByteCutCell { total: 1_500, per_answer: 700, bodies: bodies.clone() }).mount(&server).await;
+            let client = cell_client(&server, &dir);
+            let mut request: SearchRequest = serde_json::from_value(serde_json::json!({
+                "query": "metadata.log_source=apache_access", "time_range": {"start": "2026-09-25T00:00:00Z", "end": "2026-09-25T01:00:00Z"}})).unwrap();
+            request.limit = Some(1_400);
+            let response = with_query_class(class, client.search(&request, "run-1", None, &BTreeSet::new()))
+                .await
+                .unwrap_or_else(|error| panic!("{class:?}: {error:?}"));
+            assert_eq!(response.results.len(), 1_400);
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 2, "a byte-cut page and its continuation");
+            for body in bodies.iter() {
+                assert_eq!(body["request_id"], expected, "{class:?}");
+            }
         }
     }
 

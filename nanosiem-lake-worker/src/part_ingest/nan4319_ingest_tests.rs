@@ -393,7 +393,14 @@ async fn admission_is_bounded_by_decoded_size_not_compressed_size() {
     let mut ingestor = Ingestor::open(config.clone(), &parts, &sources, &spool as &dyn NoticeQueue, &signer,
         signer.trusted(), BronzeIngestEnricher::disabled(), &seed_schema(), CLOCK).await.expect("ingest opens");
     let report = ingestor.tick(CLOCK).await.unwrap();
-    assert_eq!(report.admitted_rows, 10_000, "one landing object per admission on a 1.2 GB role");
+    // Each object's decoded cost fills an admission group on its own, so
+    // they decode one after another (NAN-4749: in the same tick, the first
+    // group's JSON values freed before the second decodes).
+    let (one_heap, one_arrow) = decoded_admission_cost(crate::bronze::bronze_file_decoded_bytes(
+        &root.join("sources").join("bronze/landing-0.parquet")).unwrap());
+    assert!(!super::super::memory::admission_fits(config.buffer_budget_bytes, 0, 2.0 * one_heap, 2.0 * one_arrow),
+        "one landing object per admission group on a 1.2 GB role");
+    assert_eq!(report.admitted_rows, 20_000);
     let mut now = CLOCK;
     while ingestor.health().rows_committed_total < 20_000 {
         now += 1_000;

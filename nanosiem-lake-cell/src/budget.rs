@@ -139,7 +139,9 @@ impl TenantBudget {
             // risk 4). Both are caps inside the tenant's memory.max, so their
             // sum may exceed it.
             query_memory_cap_bytes: round_up(limit_memory_bytes / 10 * 7, MIB),
-            ingest_memory_cap_bytes: round_up(limit_memory_bytes / 10 * 4, MIB),
+            // NAN-4749: never below the shared full-flush need at this rate
+            // (only 1,093..2,480 eps, where 40 % of the curve is less).
+            ingest_memory_cap_bytes: round_up(limit_memory_bytes / 10 * 4, MIB).max(ingest_memory_for_eps(eps)),
             cache_disk_bytes: round_up(disk as u64, MIB),
         }
     }
@@ -156,9 +158,118 @@ fn round_up(v: u64, to: u64) -> u64 {
     v.div_ceil(to) * to
 }
 
+// ------------------------------------------------- target-rate ingest sizing
+
+/// NAN-4749: ingest[T] memory at which one full catch-up flush
+/// ([`crate::contract::IngestFlush::MAX_TARGET_ROWS`] = 65,536 rows, ~206 MiB
+/// of wide OCSF Arrow) is written by all four parallel L0 writers beside two
+/// running minute merges and the next filling buffer (the worker's memory
+/// model: working budget 30 % of this, buffer cap a fifth of that). Below it
+/// the flush runs one writer and the buffer seals at its byte cap (17.5k-row
+/// parts on the 1.0.11 bakeoff). Pinned against the worker's own model by
+/// `part_ingest::ingest::tests::a_target_eps_placement_runs_four_l0_writers`.
+///
+/// Shared by every placement path (open-core trusted-local, sovereign,
+/// hosted): size ingest through [`ingest_memory_for_eps`] /
+/// [`ingest_query_for_eps`], never a local copy of the figure.
+pub const INGEST_MEMORY_FOR_FULL_FLUSH: u64 = 6 * GIB;
+/// Age cap of a catch-up flush, in seconds (the worker's
+/// `CATCH_UP_FLUSH_MAX_AGE_MS`, pinned by the same worker test).
+pub const CATCH_UP_FLUSH_AGE_SECS: u64 = 30;
+/// Rate at which a catch-up flush fills to its row cap before its age cap:
+/// at or above it every flush is a full one.
+pub const FULL_FLUSH_EPS: u64 = crate::contract::IngestFlush::MAX_TARGET_ROWS / CATCH_UP_FLUSH_AGE_SECS;
+/// Rows below which an hour of a flush stays one L0 part (the worker's
+/// `L0_PARALLEL_MIN_ROWS`, pinned by the same worker test).
+pub const L0_PART_MIN_ROWS: u64 = 16_384;
+/// Lowest rate whose catch-up-age flush spans two L0 parts: below it every
+/// flush is one part, which one writer writes, so memory buys no writer.
+pub const PARALLEL_FLUSH_EPS: u64 = (2 * L0_PART_MIN_ROWS).div_ceil(CATCH_UP_FLUSH_AGE_SECS);
+/// Query memory a target-rate shift never goes below.
+pub const QUERY_MEMORY_FLOOR_BYTES: u64 = GIB;
+
+/// NAN-4749: THE ingest[T] memory a sustained `eps` needs for parallel L0
+/// flushes: [`INGEST_MEMORY_FOR_FULL_FLUSH`] from [`PARALLEL_FLUSH_EPS`]
+/// (1,093 eps) up, 0 below it (a one-part flush needs nothing beyond each
+/// consumer's own floor). A step, not a ramp: the two merges and the next
+/// buffer the worker charges beside a flight are fixed, so a 2-3 part flush
+/// needs nearly the full figure (a linear ramp left 2,000 eps, 5.5 GiB, on
+/// one writer). One derivation for every product:
+/// - hosted and sovereign cells: [`TenantBudget::ingest_memory_cap_bytes`]
+///   (the supervisor's `ingest_memory_cap_bytes`) is never below it, and
+///   the hosted deployment's ingest role limit ports it;
+/// - open-core / sovereign trusted-local init: [`ingest_query_for_eps`].
+///
+/// Non-finite or negative input is treated as 0.
+pub fn ingest_memory_for_eps(eps: f64) -> u64 {
+    if eps.is_finite() && eps >= PARALLEL_FLUSH_EPS as f64 { INGEST_MEMORY_FOR_FULL_FLUSH } else { 0 }
+}
+
+/// NAN-4749: the (ingest, query) memory limits for a target `eps`, starting
+/// from a placement's `ingest` / `query` limits. Ingest grows toward
+/// [`ingest_memory_for_eps`] (at most `max_ingest`), and every byte it gains
+/// comes out of query, which never drops below [`QUERY_MEMORY_FLOOR_BYTES`]
+/// (or its starting value, if lower). The sum is unchanged, so the tenant's
+/// memory ceiling and the cell's container limit are too. Limits that
+/// already cover the rate come back as given.
+pub fn ingest_query_for_eps(ingest: u64, query: u64, eps: u32, max_ingest: u64) -> (u64, u64) {
+    let want = ingest_memory_for_eps(eps as f64).min(max_ingest);
+    let shift = want.saturating_sub(ingest).min(query.saturating_sub(QUERY_MEMORY_FLOOR_BYTES)) / MIB * MIB;
+    (ingest + shift, query - shift)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-4749: the shared target-rate ingest sizing.
+    #[test]
+    fn target_rate_ingest_sizing() {
+        assert_eq!(FULL_FLUSH_EPS, 2_184);
+        assert_eq!(PARALLEL_FLUSH_EPS, 1_093);
+        assert_eq!(ingest_memory_for_eps(1_093.0), INGEST_MEMORY_FOR_FULL_FLUSH);
+        assert_eq!(ingest_memory_for_eps(FULL_FLUSH_EPS as f64), INGEST_MEMORY_FOR_FULL_FLUSH);
+        assert_eq!(ingest_memory_for_eps(1_000_000.0), INGEST_MEMORY_FOR_FULL_FLUSH);
+        assert_eq!(ingest_memory_for_eps(1_092.0), 0);
+        assert_eq!(ingest_memory_for_eps(f64::NAN), 0);
+        assert_eq!(ingest_memory_for_eps(f64::INFINITY), 0);
+        assert_eq!(ingest_memory_for_eps(-5.0), 0);
+        // The 1.0.11 bakeoff cell (16 GiB): 4 GiB ingest / 8 GiB query -> 6 / 6.
+        assert_eq!(ingest_query_for_eps(4 * GIB, 8 * GIB, 10_000, 8 * GIB), (6 * GIB, 6 * GIB));
+        // Capped by max_ingest; query keeps its floor; the sum never changes.
+        assert_eq!(ingest_query_for_eps(GIB, 2 * GIB, 10_000, 2 * GIB), (2 * GIB, GIB));
+        assert_eq!(ingest_query_for_eps(768 * MIB, 1536 * MIB, 10_000, 1536 * MIB), (1280 * MIB, GIB));
+        assert_eq!(ingest_query_for_eps(512 * MIB, GIB, 10_000, GIB), (512 * MIB, GIB));
+        assert_eq!(ingest_query_for_eps(512 * MIB, 512 * MIB, 10_000, GIB), (512 * MIB, 512 * MIB));
+        // Already covered: unchanged.
+        assert_eq!(ingest_query_for_eps(16 * GIB, 32 * GIB, 10_000, 32 * GIB), (16 * GIB, 32 * GIB));
+        assert_eq!(ingest_query_for_eps(4 * GIB, 8 * GIB, 100, 8 * GIB), (4 * GIB, 8 * GIB));
+    }
+
+    /// NAN-4749: the eps budget's ingest cap (hosted + sovereign cells)
+    /// never below the shared need; only 1,093..2,480 eps is raised.
+    #[test]
+    fn the_ingest_cap_is_never_below_the_shared_need() {
+        let curve = |eps: f64| round_up(TenantBudget::from_eps(eps).limit_memory_bytes / 10 * 4, MIB);
+        let mut raised = Vec::new();
+        for eps in (0..=20_000u32).step_by(10) {
+            let b = TenantBudget::from_eps(eps as f64);
+            assert_eq!(b.ingest_memory_cap_bytes, curve(eps as f64).max(ingest_memory_for_eps(eps as f64)), "{eps} eps");
+            if b.ingest_memory_cap_bytes != curve(eps as f64) {
+                raised.push(eps);
+            }
+        }
+        assert_eq!((raised.first().copied(), raised.last().copied()), (Some(1_100), Some(2_480)));
+        // Every live hosted rate but the 2,000-eps one (2026-10-28: 6, 50, 145, 220 eps)
+        // keeps its 40 %-of-the-curve cap; the 1,200 anchor's 4 GiB -> 6 GiB.
+        for eps in [6.0, 20.0, 50.0, 145.0, 220.0, 300.0, 1_092.0] {
+            assert_eq!(TenantBudget::from_eps(eps).ingest_memory_cap_bytes, curve(eps), "{eps} eps");
+        }
+        assert_eq!(TenantBudget::from_eps(1_200.0).ingest_memory_cap_bytes, INGEST_MEMORY_FOR_FULL_FLUSH);
+        // 2,000 eps (a hosted 2,000-eps tenant whose ingest role limit is
+        // 4.5 GiB): 5.24 -> 6 GiB; that role limit binds the supervisor's cap.
+        assert_eq!(TenantBudget::from_eps(2_000.0).ingest_memory_cap_bytes, INGEST_MEMORY_FOR_FULL_FLUSH);
+    }
 
     #[test]
     fn anchors_match_design_section_4() {

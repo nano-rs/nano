@@ -955,6 +955,12 @@ pub async fn open_engine_timed(options: &OpenOptions, phases: &mut StartupPhases
     };
     // NAN-3077: event detail (one row by uid) gets its own lane, so it never
     // waits behind a scan; its statements read one row group.
+    // NAN-4747: the point lane is one lane, so its agent gate cannot reserve
+    // a lane (`agent_lane_limit(1)` is 1) and an agent's event-detail lookup
+    // may hold it. That is kept on purpose: a point statement is one event by
+    // uid (a short, bounded lookup), so an analyst waits at most one short
+    // lookup, whereas reserving the only lane would refuse agents event
+    // detail altogether. It never escalates (no large lane behind it).
     let point = NativeExecutor::start_with_server_memory_limit(runtime.clone(), 1, "parts-point", ExecutorMode::ReadOnly, Some(budget.server_bytes))?
         .with_result_limit(budget.result_bytes);
     // NAN-4290: query[T]'s small-job lane (its own read-write connection; a

@@ -9,6 +9,7 @@
 */
 
 import type { CredentialFieldDef } from './marketplace';
+import { resolveJobResult } from './job-result';
 
 // =============================================================================
 // Types
@@ -317,17 +318,21 @@ export class IntegrationsApi {
     );
   }
 
+  /** NAN-4753: the server answers with a job; this polls it to the code. */
   async generateCustomCollectorCode(
     request: GenerateCustomCollectorCodeRequest,
   ): Promise<GenerateCustomCollectorCodeResponse> {
-    return this.request<GenerateCustomCollectorCodeResponse>(
+    const started = await this.request<GenerateCustomCollectorCodeResponse | { job_id: string }>(
       '/api/integrations/custom/generate-code',
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', Prefer: 'respond-async' },
         body: JSON.stringify(request),
       },
     );
+    return resolveJobResult<GenerateCustomCollectorCodeResponse>(started, (path) => this.request(path), {
+      failure: 'pivt could not write the collector. Retry in a moment.',
+    });
   }
 
   async previewCustomCollector(

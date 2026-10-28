@@ -417,12 +417,17 @@ fn single_host_installer_renders_facts_the_runtime_loads() {
         r#"{"domain":"10-1-2-3.sslip.io","installation_id":"inst-0123456789abcdef","organization_id":"org-fedcba9876543210"}"#,
     )
     .unwrap();
-    // Password with URL-reserved bytes: the renderer must percent-encode it.
+    // NAN-4711: the runtime DSN is the least-privilege nano_product_runtime
+    // login from the roles directory, never the superuser in .env.
     std::fs::write(
         dir.join(".env"),
-        "POSTGRES_PASSWORD=p@ss/w:rd?#%\nJWT_SECRET=x\n",
+        "POSTGRES_USER=nanosiem\nPOSTGRES_PASSWORD=superuser-secret\nJWT_SECRET=x\n",
     )
     .unwrap();
+    let roles = dir.join("roles");
+    std::fs::create_dir(&roles).unwrap();
+    let runtime_password = "0123456789abcdef".repeat(4);
+    std::fs::write(roles.join("nano_product_runtime.password"), format!("{runtime_password}\n")).unwrap();
     std::fs::write(dir.join("ca.crt"), b"-----BEGIN CERTIFICATE-----\nsynthetic\n").unwrap();
     let out = dir.join("app");
     // SAFETY: geteuid/getegid have no preconditions.
@@ -435,6 +440,7 @@ fn single_host_installer_renders_facts_the_runtime_loads() {
         .args(["--ca-file".as_ref(), dir.join("ca.crt").as_os_str()])
         .args(["--release-digest", &format!("sha256:{}", "b".repeat(64))])
         .args(["--owner", &owner])
+        .args(["--roles-dir".as_ref(), roles.as_os_str()])
         .status()
         .expect("run python3");
     assert!(status.success());
@@ -453,8 +459,9 @@ fn single_host_installer_renders_facts_the_runtime_loads() {
     assert_eq!(runtime.organization_id(), "org-fedcba9876543210");
     let url = url::Url::parse(runtime.database_url()).unwrap();
     assert_eq!(url.host_str(), Some("postgres"));
-    assert_eq!(url.username(), "nanosiem");
-    assert_eq!(url.password(), Some("p%40ss%2Fw%3Ard%3F%23%25"));
+    assert_eq!(url.username(), "nano_product_runtime");
+    assert_eq!(url.password(), Some(runtime_password.as_str()));
+    assert!(!runtime.database_url().contains("superuser-secret"));
     assert_eq!(url.path(), "/nanosiem");
     let query: Vec<(String, String)> = url.query_pairs().into_owned().collect();
     assert_eq!(query[0], ("sslmode".into(), "verify-full".into()));
@@ -470,6 +477,7 @@ fn single_host_installer_renders_facts_the_runtime_loads() {
         .args(["--ca-file".as_ref(), dir.join("ca.crt").as_os_str()])
         .args(["--release-digest", &format!("sha256:{}", "c".repeat(64))])
         .args(["--owner", &owner])
+        .args(["--roles-dir".as_ref(), roles.as_os_str()])
         .status()
         .unwrap();
     assert!(status.success());

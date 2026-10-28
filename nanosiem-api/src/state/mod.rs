@@ -1183,6 +1183,9 @@ impl nanosiem_enterprise::handlers::custom_enrichment::CustomEnrichmentAppState 
     fn encryption_service(&self) -> &Arc<nanosiem_core::crypto::EncryptionService> {
         &self.encryption_service
     }
+    fn melod_job_repo(&self) -> &nanosiem_enterprise::melod::job_repository::MelodJobRepository {
+        &self.melod_job_repo
+    }
 }
 
 #[cfg(feature = "enterprise")]
@@ -1191,6 +1194,9 @@ impl nanosiem_enterprise::handlers::integration_generation::IntegrationGeneratio
 {
     fn pool(&self) -> &PgPool {
         &self.pool
+    }
+    fn melod_job_repo(&self) -> &nanosiem_enterprise::melod::job_repository::MelodJobRepository {
+        &self.melod_job_repo
     }
     fn agent_config_registry(&self) -> &Arc<RwLock<Option<Arc<AgentConfigRegistry>>>> {
         &self.agent_config_registry

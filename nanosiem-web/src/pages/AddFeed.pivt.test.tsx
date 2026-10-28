@@ -46,3 +46,22 @@ it('enterprise with AI: pivt tab, chat and regenerate are still offered', () => 
   expect(screen.getByText('Ask pivt')).toBeTruthy();
   expect(screen.getByText('Regenerate')).toBeTruthy();
 });
+
+it('NAN-4753: a failed draft shows one sanitized sentence and a Retry, never HTML', () => {
+  mocks.capabilities = { melod: true };
+  const onRegenerate = vi.fn();
+  render(
+    <VrlPanel
+      {...props}
+      vrl=""
+      genState="error"
+      genStatus="pivt could not draft the parser. Retry in a moment. Reference a51666239c020c02."
+      onRegenerate={onRegenerate}
+    />,
+  );
+  const alert = screen.getByRole('alert');
+  expect(alert.textContent).toContain('Reference a51666239c020c02');
+  expect(alert.querySelector('script, button#cf-footer-ip-reveal')).toBeNull();
+  screen.getByRole('button', { name: /Retry/ }).click();
+  expect(onRegenerate).toHaveBeenCalledTimes(1);
+});

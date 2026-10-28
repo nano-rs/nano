@@ -3,7 +3,7 @@
 //! publish these references; constructing a target does not enable exports.
 use super::super::export::ExportManifest;
 use super::{
-    customer::{footer, stage_bounded},
+    customer::{footer, stage_on_agent_lane},
     validate_manifest, ExportTarget,
 };
 use crate::parts::{
@@ -28,6 +28,9 @@ pub struct HostedExportTarget {
     keys: TenantKeySet,
     bucket: String,
     verified: Option<VerifiedFiles>,
+    /// NAN-4721: the tenant's ingest-lag signal; every cold file read yields
+    /// to it first.
+    pressure: std::sync::Mutex<Arc<crate::part_ingest::agent_lane::IngestPressure>>,
 }
 
 /// NAN-4614: data files whose bytes (signed SHA-256) and Parquet footer
@@ -126,7 +129,13 @@ impl HostedExportTarget {
             keys,
             bucket,
             verified: None,
+            pressure: Default::default(),
         })
+    }
+
+    /// NAN-4721: see [`crate::part_ingest::agent_lane`].
+    pub(crate) fn set_ingest_pressure(&self, pressure: Arc<crate::part_ingest::agent_lane::IngestPressure>) {
+        *self.pressure.lock().expect("export target pressure") = pressure;
     }
 
     /// NAN-4614: keep [`VerifiedFiles`] under `dir`, a directory private to
@@ -259,6 +268,10 @@ impl ExportTarget for HostedExportTarget {
         };
         let (mut read_files, mut read_bytes, mut reused_files) = (0usize, 0u64, 0usize);
         let mut prepared = BTreeMap::new();
+        // NAN-4721: one yield budget per prepare (not per file): this runs
+        // inside the commit attempt timeout, which budgets bytes, not files.
+        let pressure = self.pressure.lock().expect("export target pressure").clone();
+        let mut yield_left = crate::part_ingest::agent_lane::MAX_YIELD;
         for part in &manifest.add {
             let directory = part.keys[0]
                 .rsplit_once('/')
@@ -328,8 +341,17 @@ impl ExportTarget for HostedExportTarget {
                 if known {
                     reused_files += 1;
                 } else {
+                    // NAN-4721: agent-catalog reads are the lowest priority
+                    // on the cell: none starts while ingest is under
+                    // pressure (bounded per prepare), then bytes are paced
+                    // while it holds; hashing, spooling and the footer
+                    // check run on the idle-class agent lane.
+                    yield_left = yield_left.saturating_sub(
+                        pressure.yield_while_lagging_up_to("agent catalog file read", yield_left).await,
+                    );
                     let path = spool.path().join("data.parquet");
-                    stage_bounded(
+                    stage_on_agent_lane(
+                        &pressure,
                         self.source.as_ref(),
                         key,
                         &path,
@@ -338,7 +360,8 @@ impl ExportTarget for HostedExportTarget {
                         MAX_OBJECT_BYTES,
                     )
                     .await?;
-                    footer(&path, schema, digest.rows)?;
+                    let (checked, footer_schema, rows) = (path.clone(), schema.clone(), digest.rows);
+                    crate::part_ingest::agent_lane::run(move || footer(&checked, &footer_schema, rows)).await??;
                     read_files += 1;
                     read_bytes = read_bytes.saturating_add(digest.bytes);
                     if let Some((memo, entry)) = self.verified.as_ref().zip(entry.as_ref()) {

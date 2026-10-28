@@ -49,6 +49,15 @@
 #                  Vector). Same as NANO_INGEST_MODE=vector.
 #   A re-run without either flag keeps the mode the install already has.
 #
+# Lake cell sizing (NAN-4749), persisted in .env; a re-run keeps it:
+#   --target-eps N   NANO_LAKE_TARGET_EPS: the sustained events/s the cell
+#                    must admit. Sizes the ingest role for that rate (at
+#                    most half the cell's memory, taken from search) and
+#                    places the tenant at it. Unset: sized from the host.
+#   NANO_LAKE_MERGE_MINUTE_CONCURRENCY, NANO_LAKE_MERGE_HISTORY_CONCURRENCY,
+#   NANO_LAKE_COMPACTION_PACING: ingest merge tuning, set in .env to forward
+#                    them to the cell (unset keeps the defaults).
+#
 # Override defaults: NANO_INSTALL_DIR, NANO_REPO_URL, NANO_BRANCH, NANO_VERSION.
 # Set NANO_SKIP_IMAGE_VERIFY=1 to skip the image digest supply-chain check.
 # NANO_HEALTH_TIMEOUT_SECONDS bounds the wait for the API (default 1800 on the
@@ -150,7 +159,7 @@ require_cmd() {
 
 usage() {
     cat <<'EOF'
-Usage: install.sh [--non-interactive | --yes | -y] [--tenzir | --add-vector] [--help]
+Usage: install.sh [--non-interactive | --yes | -y] [--tenzir | --add-vector] [--target-eps N] [--help]
 
   --non-interactive, --yes, -y
       Never prompt. Every value comes from its env var or its default
@@ -163,6 +172,9 @@ Usage: install.sh [--non-interactive | --yes | -y] [--tenzir | --add-vector] [--
   --add-vector
       Add Vector to a --tenzir install (Vector ingest plus the bucket drop,
       the default). A re-run without either flag keeps the current mode.
+  --target-eps N
+      Size the lake cell to admit N events per second sustained (same as
+      NANO_LAKE_TARGET_EPS=N; kept in .env for re-runs).
 
 See the header of this script for every NANO_* environment variable.
 EOF
@@ -770,6 +782,20 @@ verify_one_digest() {
     fi
 }
 
+# NAN-4743: the distinct repository paths (registry/namespace) of the images the
+# active compose deploys, for the pull log line. `nginx:alpine` -> docker.io/library.
+image_sources() { # <newline-separated image refs>
+    local ref path srcs=""
+    while read -r ref; do
+        [[ -n "$ref" ]] || continue
+        ref="${ref%@*}"; path="${ref%/*}"
+        if [[ "$ref" != */* ]]; then path="docker.io/library"
+        elif [[ "${ref%%/*}" != *[.:]* && "${ref%%/*}" != localhost ]]; then path="docker.io/$path"; fi
+        [[ ",$srcs," == *",$path,"* ]] || srcs="${srcs:+$srcs,}$path"
+    done <<< "$1"
+    [[ -n "$srcs" ]] && printf '%s\n' "${srcs//,/, }" || echo "the configured registries"
+}
+
 verify_image_digests() {
     local lockfile="images.lock"
 
@@ -806,7 +832,7 @@ verify_image_digests() {
 
     log "Verifying pulled image digests against images.lock"
     local ref expected basename repo_notag inspect_ref result active_images
-    local mismatch=0 verified_fp=0 verified_tp=0
+    local mismatch=0 verified_fp=0 verified_tp=0 not_deployed_fp=""
     active_images=$(docker </dev/null compose "${COMPOSE_ARGS[@]}" config --images 2>/dev/null || true)
 
     # First-party lines (no tag): inspect repo:NANO_VERSION, from fp_lockfile.
@@ -822,11 +848,16 @@ verify_image_digests() {
                     if printf '%s\n' "$active_images" | grep -qxF "$inspect_ref"; then
                         fail "No registry digest found for active image ${inspect_ref} — cannot verify it against images.lock. Refusing to start with unverifiable images."
                     fi
-                    warn "Skipping digest verify for ${inspect_ref} — not pulled because its optional profile is inactive." ;;
+                    # NAN-4743: not deployed by this compose (profile off, or replaced by an
+                    # overlay such as docker-compose.sovereign.yml): one summary line below.
+                    not_deployed_fp="${not_deployed_fp:+$not_deployed_fp, }${ref##*/}" ;;
                 *) mismatch=1 ;;
             esac
         done < "$fp_lockfile"
     fi
+
+    [[ -z "$not_deployed_fp" ]] \
+        || log "Not deployed by this install (inactive profile or replaced by an overlay), so not verified against images.lock: ${not_deployed_fp}"
 
     # Third-party lines (tagged): self-contained, always from the local lock.
     while read -r ref expected; do
@@ -1230,11 +1261,19 @@ while (( $# > 0 )); do
         --non-interactive|--noninteractive|--yes|-y) NANO_NONINTERACTIVE=1 ;;
         --tenzir) NANO_INGEST_MODE=tenzir ;;
         --add-vector|--with-vector) NANO_INGEST_MODE=vector ;;
+        --target-eps)
+            [[ $# -ge 2 ]] || { usage >&2; fail "--target-eps needs a value"; }
+            NANO_LAKE_TARGET_EPS="$2"; shift ;;
+        --target-eps=*) NANO_LAKE_TARGET_EPS="${1#--target-eps=}" ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; fail "Unknown argument: $1" ;;
     esac
     shift
 done
+# NAN-4749: lake cell target rate (trusted-local init validates the range).
+if [[ -n "${NANO_LAKE_TARGET_EPS:-}" && ! "${NANO_LAKE_TARGET_EPS}" =~ ^[1-9][0-9]*$ ]]; then
+    fail "NANO_LAKE_TARGET_EPS must be a positive integer (got '${NANO_LAKE_TARGET_EPS}')."
+fi
 case "${NANO_INGEST_MODE:-}" in
     ""|tenzir|vector) ;;
     *) fail "NANO_INGEST_MODE must be 'tenzir' or 'vector' (got '${NANO_INGEST_MODE}')." ;;
@@ -1775,9 +1814,9 @@ if [[ "${NANO_SKIP_IMAGE_PULL:-0}" == "1" ]]; then
     # tagged ${NANO_VERSION}. Digest verification still runs unless
     # NANO_SKIP_IMAGE_VERIFY=1 is set too.
     warn "NANO_SKIP_IMAGE_PULL=1 — using images already present locally."
-elif log "Pulling images from ghcr.io/nano-rs (this may take a minute on first run)" \
+elif log "Pulling images from $(image_sources "$(docker </dev/null compose "${COMPOSE_ARGS[@]}" config --images 2>/dev/null || true)") (this may take a minute on first run)" \
     && ! docker </dev/null compose "${COMPOSE_ARGS[@]}" pull; then
-    fail "docker compose pull failed. A '403 Forbidden' on ghcr.io/token (or '401 Unauthorized') means that GHCR package is not public yet — the error names the repository. Run 'docker login ghcr.io' if you have access, or wait for nano-rs to publish it."
+    fail "docker compose pull failed; the error above names the image. For a ghcr.io/nano-rs image, a '403 Forbidden' on ghcr.io/token (or '401 Unauthorized') means that GHCR package is not public yet: run 'docker login ghcr.io' if you have access, or wait for nano-rs to publish it. For any other registry, check this host is logged in to it."
 fi
 
 verify_image_digests
@@ -1790,6 +1829,11 @@ if [[ "$USE_LEAN" == "1" ]]; then
         # are still defined, so not orphans, and would keep running beside
         # lean. Stop every profile; volumes are retained for rollback.
         docker </dev/null compose "${COMPOSE_ARGS[@]}" --profile '*' down --remove-orphans
+    fi
+    # NAN-4749: a target rate given to this run is kept for re-runs; lean-init
+    # reads it from .env (unset keeps what .env already has).
+    if [[ -n "${NANO_LAKE_TARGET_EPS:-}" ]]; then
+        upsert_env_file_value NANO_LAKE_TARGET_EPS "$NANO_LAKE_TARGET_EPS"
     fi
     log "Initializing the trusted-local UUID tenant using the cell initializer"
     docker </dev/null compose "${COMPOSE_ARGS[@]}" run --rm --no-deps -e NANO_LEAN_FRESH_TENANT="$FRESH_LEAN_CUTOVER" lean-init \

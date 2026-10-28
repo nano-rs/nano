@@ -56,9 +56,20 @@ def configure(root, environ):
     query = json.loads((secret / 'query.token').read_text())
     if ingest['tenant_id'] != tenant or query['tenant_id'] != tenant or 'bronze_list' not in ingest:
         raise ValueError('bootstrap scope does not match the listing tenant')
-    database = 'postgres://{}:{}@postgres:5432/{}'.format(quote(environ.get('POSTGRES_USER', 'nanosiem'), safe=''),
-        quote(environ['POSTGRES_PASSWORD'], safe=''), quote(environ.get('POSTGRES_DB', 'nanosiem'), safe=''))
-    ingest['local_gc'] = {'database_url': database}
+    dsn_dir = environ.get('NANO_LEAN_PG_DSN_DIR')
+    if dsn_dir:
+        # NAN-4711 sovereign single-host: each cell role gets its own least-privilege
+        # login over verify-full TLS (scripts/sovereign/single-host.sh renders them).
+        ingest_database = Path(dsn_dir, 'ingest.dsn').read_text().strip()
+        database = Path(dsn_dir, 'detect.dsn').read_text().strip()
+        for dsn in (ingest_database, database):
+            if not dsn.startswith('postgresql://') or 'sslmode=verify-full' not in dsn:
+                raise ValueError('NANO_LEAN_PG_DSN_DIR DSNs must be postgresql:// with sslmode=verify-full')
+    else:
+        database = 'postgres://{}:{}@postgres:5432/{}'.format(quote(environ.get('POSTGRES_USER', 'nanosiem'), safe=''),
+            quote(environ['POSTGRES_PASSWORD'], safe=''), quote(environ.get('POSTGRES_DB', 'nanosiem'), safe=''))
+        ingest_database = database
+    ingest['local_gc'] = {'database_url': ingest_database}
     location = dict(ingest['bronze'])
     location.update(bucket='nano-shared-r2-' + tenant, prefix=tenant + '/durable-query-result/v1/')
     query['trusted_local_job_results'] = location

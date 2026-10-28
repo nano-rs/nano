@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use nanosiem_api::{ApiConfig, AppMetrics, AppState};
-use nanosiem_core::leader::lock_ids;
+use nanosiem_core::leader::{lock_ids, LeaderHooks, LeaderTiming};
 #[cfg(feature = "enterprise")]
 use nanosiem_core::license::checker::LicenseCheckerConfig;
 use nanosiem_core::LeaderElection;
@@ -18,6 +18,44 @@ use nanosiem_core::LicenseChecker;
 use std::future::Future;
 #[cfg(feature = "enterprise")]
 use std::sync::Arc;
+
+/// NAN-4699 step 4: this jobs binary runs every singleton loop only under the
+/// PostgreSQL leader lease (`LeaderTiming::JOBS`), so two jobs pods never
+/// double-run one. A deployment renders the jobs Deployment at two pods only
+/// for an image whose receipt reports it (`--print-features`).
+const JOBS_LEADER_LEASE_FEATURE: &str = "jobs_leader_lease_v1";
+/// NAN-4730: the lease honours the coded one-node-loss drill switch
+/// (`LEADER_DRILL_FILE`, core leader.rs). A deployment mounts the switch (a
+/// downward-API projection of one pod annotation) only for an image reporting it.
+const JOBS_LEADER_DRILL_FEATURE: &str = "jobs_leader_drill_v1";
+
+fn jobs_app_features() -> Vec<&'static str> {
+    let mut features = nanosiem_api::APP_FEATURES.to_vec();
+    features.push(JOBS_LEADER_LEASE_FEATURE);
+    features.push(JOBS_LEADER_DRILL_FEATURE);
+    features
+}
+
+/// The leader-only schedulers, started on election and stopped (aborted and
+/// awaited) before the lease can pass to another pod.
+struct JobsLeaderTasks {
+    state: AppState,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl LeaderHooks for JobsLeaderTasks {
+    async fn elected(&mut self) {
+        // NAN-3080: supervised like every registered loop (a panicking leader
+        // scheduler exits the process); the abort on leadership loss aborts
+        // them without exiting.
+        let started = self.state.start_leader_schedulers().await;
+        self.handles = self.state.supervise_tasks("leader_scheduler", started);
+    }
+
+    async fn stepped_down(&mut self) {
+        abort_and_await_leader_tasks(&mut self.handles).await;
+    }
+}
 
 /// How often nano-jobs returns freed allocator pages (NAN-3492).
 const ALLOCATOR_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -56,13 +94,13 @@ where
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if nanosiem_core::app_features::print_if_requested(nanosiem_api::APP_FEATURES) {
+    if nanosiem_core::app_features::print_if_requested(&jobs_app_features()) {
         return Ok(());
     }
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("nanosiem-jobs");
     // NAN-4666: sovereign installation facts gate boot; missing or invalid
     // facts refuse to start.
-    nanosiem_core::sovereign_runtime::require_at_boot()
+    let sovereign = nanosiem_core::sovereign_runtime::require_at_boot()
         .map_err(|error| anyhow::anyhow!("Refusing to start: {error}"))?;
     nanosiem_core::crypto::EncryptionService::try_from_env()?;
 
@@ -272,53 +310,51 @@ async fn main() -> Result<()> {
 
     // === Leader-only tasks ===
     if leader_election_enabled {
-        tracing::info!("Leader election enabled — starting advisory lock election");
-        let election = LeaderElection::new(state.pool.clone(), lock_ids::API_SCHEDULER);
-        let leader_shutdown = state.shutdown_token();
-        let (mut rx, election_handle) = election.start(leader_shutdown.clone());
+        // NAN-4699 step 4: a PG lease (renew 2 s, self-fence within 5 s of a
+        // failed renew, stale holder evicted after 20 s; see core leader.rs).
+        let timing = LeaderTiming::JOBS.with_env_overrides();
+        tracing::info!(
+            heartbeat_secs = timing.heartbeat.as_secs(),
+            timeout_secs = timing.database_timeout.as_secs(),
+            retry_secs = timing.retry.as_secs(),
+            stale_secs = ?timing.stale_after.map(|stale| stale.as_secs()),
+            "Leader election enabled — PostgreSQL advisory-lock lease"
+        );
+        let election = LeaderElection::new(state.pool.clone(), lock_ids::API_SCHEDULER).with_timing(timing);
+        let election_handle = election.spawn_with(
+            state.shutdown_token(),
+            JobsLeaderTasks { state: state.clone(), handles: Vec::new() },
+        );
         state.add_task_handle(election_handle).await;
-
-        let leader_state = state.clone();
-        let leader_handle = tokio::spawn(async move {
-            let mut leader_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = leader_shutdown.cancelled() => {
-                        abort_and_await_leader_tasks(&mut leader_handles).await;
-                        return;
-                    }
-                    changed = rx.changed() => {
-                        if changed.is_err() {
-                            abort_and_await_leader_tasks(&mut leader_handles).await;
-                            if !leader_shutdown.is_cancelled() {
-                                tracing::error!("Leader election channel closed unexpectedly");
-                            }
-                            return;
-                        }
-                    }
-                }
-
-                abort_and_await_leader_tasks(&mut leader_handles).await;
-                if leader_shutdown.is_cancelled() {
-                    return;
-                }
-
-                if *rx.borrow() {
-                    // NAN-3080: supervised like every registered loop (a
-                    // panicking leader scheduler exits the process); the
-                    // abort on leadership loss aborts them without exiting.
-                    let started = leader_state.start_leader_schedulers().await;
-                    leader_handles = leader_state.supervise_tasks("leader_scheduler", started);
-                }
-            }
-        });
-        state.add_task_handle(leader_handle).await;
     } else {
         tracing::warn!("Leader election disabled for explicitly declared single-node jobs service");
         let handles = state.start_leader_schedulers().await;
         for handle in handles {
             state.add_task_handle(handle).await;
+        }
+    }
+
+    // NAN-4722: sovereign platform audit retention (400 d). Hosted prunes from
+    // the control plane's stamping GC loop, which single-host never runs; the
+    // purge definer is executable only by this login (single-host-grants.sql).
+    // Not under the leader lease on purpose: the definer claims rows FOR
+    // UPDATE SKIP LOCKED under a per-transaction marker, so two jobs pods
+    // prune disjoint rows, and each pass is bounded (BATCH x MAX_BATCHES).
+    if sovereign {
+        match nanosiem_core::audit::sovereign_retention::available(&state.pool).await {
+            Ok(true) => {
+                let pool = state.pool.clone();
+                let shutdown = state.shutdown_token();
+                let handle = tokio::spawn(async move {
+                    let _ = shutdown
+                        .run_until_cancelled(nanosiem_core::audit::sovereign_retention::run(pool))
+                        .await;
+                });
+                state.add_task_handle(handle).await;
+                tracing::info!("Sovereign platform audit retention task started (hourly)");
+            }
+            Ok(false) => tracing::info!("Sovereign platform audit retention not started: no purge definer (open schema)"),
+            Err(error) => tracing::warn!(%error, "Sovereign platform audit retention not started"),
         }
     }
 
@@ -548,6 +584,17 @@ mod tests {
         .await;
 
         assert!(claims_released.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn jobs_reports_the_leader_lease_capability() {
+        // A deployment renders two jobs pods only for an image reporting it.
+        let features = jobs_app_features();
+        assert!(features.contains(&"jobs_leader_lease_v1"));
+        assert!(nanosiem_api::APP_FEATURES.iter().all(|feature| features.contains(feature)));
+        assert!(!nanosiem_api::APP_FEATURES.contains(&"jobs_leader_lease_v1"));
+        assert!(features.contains(&"jobs_leader_drill_v1"));
+        assert!(!nanosiem_api::APP_FEATURES.contains(&"jobs_leader_drill_v1"));
     }
 
     #[test]

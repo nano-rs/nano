@@ -2616,9 +2616,36 @@ mod tests {
         }
     }
 
+    /// NAN-4763: the debug `search` poll frames measured ~1.9 MiB under gdb
+    /// on this path. `search` now boxes its inner future, so these tests fit
+    /// in about 1.5 MiB. The field-list join + timeout cases are the deepest
+    /// callers, so they also run on an explicit stack (not RUST_MIN_STACK)
+    /// and stay clear of the default 2 MiB test thread as the search future
+    /// grows.
     #[cfg(feature = "enterprise")]
-    #[tokio::test]
-    async fn exact_field_list_refuses_another_tenants_rollup() {
+    fn on_big_stack<F: std::future::Future<Output = ()> + Send + 'static>(case: F) {
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(case)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn exact_field_list_refuses_another_tenants_rollup() {
+        on_big_stack(exact_field_list_refuses_another_tenants_rollup_case());
+    }
+
+    #[cfg(feature = "enterprise")]
+    async fn exact_field_list_refuses_another_tenants_rollup_case() {
         let tenant = uuid::Uuid::from_u128(0x3568);
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -2641,8 +2668,13 @@ mod tests {
     }
 
     #[cfg(feature = "enterprise")]
-    #[tokio::test]
-    async fn exact_field_list_timeout_keeps_the_marked_sample() {
+    #[test]
+    fn exact_field_list_timeout_keeps_the_marked_sample() {
+        on_big_stack(exact_field_list_timeout_keeps_the_marked_sample_case());
+    }
+
+    #[cfg(feature = "enterprise")]
+    async fn exact_field_list_timeout_keeps_the_marked_sample_case() {
         let tenant = uuid::Uuid::from_u128(0x3569);
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))

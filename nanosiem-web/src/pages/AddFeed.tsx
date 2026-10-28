@@ -57,12 +57,12 @@ import {
 import { Button } from '@/components/ui/button';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useToast } from '@/hooks/use-toast';
-import { useMelodJob } from '@/enterprise/hooks/use-melod-job';
+import { pollMelodJob, useMelodJob } from '@/enterprise/hooks/use-melod-job';
 import { api, ApiClientError } from '@/lib/api';
+import { safeErrorMessage } from '@/lib/api/http-error';
 import type {
-  GeneratedParser,
+  MelodApiResponse,
   MelodEditParserResponse,
-  ParserProgressEvent,
   RoutingRule,
   SourceConfiguration,
   VrlDiagnostic,
@@ -86,7 +86,8 @@ import { describeIngestCredentialError } from '@/lib/ingest-credential-errors';
 import { IngestEndpointCard } from '@/components/add-data/IngestEndpointCard';
 import { IssueCredentialPanel } from '@/components/add-data/IssueCredentialPanel';
 import { INGEST_CREDENTIALS_PATH } from '@/components/add-data/LogSourcesTabs';
-import { Checkbox } from '@/components/ui/checkbox';
+import { DeployGatePanel } from '@/components/add-data/DeployGatePanel';
+import { computeDeployGate, isEmptyVrl, type DeployGate, type GateAction } from '@/components/add-data/deploy-gate';
 import { useCapabilities } from '@/hooks/use-capabilities';
 
 // ------------------------------------------------------------------
@@ -494,21 +495,48 @@ export function AddFeed() {
     [existingRules, feedId],
   );
 
-  const canDeploy =
-    !!feedId &&
-    (shared || !!sourceConfigId) &&
-    !!name &&
-    errors === 0 &&
-    (warnings === 0 || acceptWarnings) &&
-    // OCSF deployment requires at least one sample that passed both stages:
-    // VRL first, then the schema contract. Expert mode cannot bypass it.
-    (!strictOcsf || (sampleCount > 0 && testsRun)) &&
-    (failingTests === 0 || (entryPath === 'manual' && !strictOcsf)) &&
-    // Transport readiness can be soft-acknowledged like other warnings.
-    // (If user overrides, they can deploy then enable/deploy the source
-    // config separately — meloD concierge does the same defensive sequence.)
-    (shared || reachability?.transportReady !== false || acceptWarnings) &&
-    namespaceCheck?.valid !== false;
+  // NAN-4754: the gate is computed from real state (see deploy-gate.ts for the
+  // rule): a parser is required, pasted samples are the tests, no samples is
+  // an acknowledged warning (except dedicated OCSF, which the server refuses),
+  // and the acknowledgement exists only when there are warnings.
+  const deployGate = computeDeployGate({
+    shared,
+    strictOcsf,
+    feedId,
+    name,
+    sourceConfigId,
+    vrl,
+    syntaxValid: validation.syntaxValid,
+    isValidating,
+    errors,
+    warningMessages: validation.diagnostics.filter((d) => d.severity === 'warn').map((d) => d.message),
+    // Dedicated UDM expert mode hides the samples box (and its deploy sends
+    // none), so leftover pasted text must not gate it as invisible tests.
+    sampleCount: entryPath === 'manual' && !strictOcsf ? 0 : sampleCount,
+    testsRun,
+    isTesting,
+    passingTests,
+    failingTests,
+    transportReady: reachability?.checked ? reachability.transportReady : null,
+    transportLabel: reachability?.checked && !reachability.transportReady
+      ? !reachability.sourceConfigEnabled
+        ? 'Transport · source config disabled'
+        : !reachability.sourceConfigDeployed
+          ? 'Transport · source config not deployed'
+          : 'Transport · not ready'
+      : undefined,
+    namespaceValid: namespaceCheck?.checked ? namespaceCheck.valid : null,
+    namespaceError: namespaceCheck?.error,
+    acknowledged: acceptWarnings,
+  });
+  const canDeploy = deployGate.canDeploy;
+  // An acknowledgement covers the warnings it was given for; a new set needs a new one.
+  // The key carries each warning's messages too: the same count of different
+  // diagnostics is a different set.
+  const gateWarningsKey = deployGate.warnings.map((w) => [w.label, ...(w.details ?? [])].join('\u0001')).join('\0');
+  useEffect(() => {
+    setAcceptWarnings(false);
+  }, [gateWarningsKey]);
 
   // ------------ Validation runner ------------
   const runValidate = useCallback(
@@ -612,7 +640,10 @@ export function AddFeed() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vrl, sampleText, genState]);
 
-  // ------------ Streaming parser generation ------------
+  // ------------ Parser generation (async job) ------------
+  // NAN-4753: drafting runs as a meloD job that the page polls. A reasoning
+  // model takes minutes; a request held open that long hit Cloudflare's 100 s
+  // edge limit (524) and the wizard showed the edge's HTML error page.
   const handleRegenerate = useCallback(async () => {
     const samples = splitSamples(sampleText);
     if (samples.length === 0 && entryPath !== 'manual') {
@@ -627,86 +658,73 @@ export function AddFeed() {
       toast({ title: 'Feed identifier required', description: 'Set a feed identifier first.', variant: 'destructive' });
       return;
     }
-    if (genControllerRef.current) {
-      genControllerRef.current.abort();
-      genControllerRef.current = null;
-    }
+    genControllerRef.current?.abort();
+    const controller = new AbortController();
+    genControllerRef.current = controller;
     setGenState('streaming');
     setGenProgress(5);
-    setGenStatus('Parsing samples · detecting structure…');
+    setGenStatus('Starting pivt…');
 
     // NOTE: don't send `feed_id` — it must be a TypeID like `feed_<base32>` and
     // we don't have one yet (the log source isn't created). When `sample_logs`
     // is provided the backend doesn't need feed_id; it uses the inline samples.
-    genControllerRef.current = api.melodCreateParserStreaming(
-      {
-        ...(sessionIdRef.current ? { session_id: sessionIdRef.current } : {}),
-        log_source_type: feedId,
-        sample_logs: samples,
-        message: strictOcsf
-          ? `Generate a complete OCSF 1.9 VRL parser for "${feedId}" from these ${samples.length} sample event(s). Emit canonical OCSF fields at the event root, set metadata.log_source to "${feedId}", and place only source fields that have no OCSF mapping under unmapped.*. Do not emit .udm, .ext, source_type, or Nano serving aliases.`
-          : `Generate a VRL parser for "${feedId}" logs from these ${samples.length} sample event(s). The .source_type field is ALREADY SET — do NOT modify it. Extract all useful fields into the UDM schema.`,
-      },
-      (event: ParserProgressEvent) => {
-        switch (event.type) {
-          case 'started':
-            setGenProgress(10);
-            setGenStatus('Drafting parser · attempt 1…');
-            break;
-          case 'generating_parser':
-            setGenProgress(Math.min(35 + event.attempt * 5, 60));
-            setGenStatus(`Drafting parser · attempt ${event.attempt}/${event.max_attempts}…`);
-            break;
-          case 'validating_syntax':
-            setGenProgress(65);
-            setGenStatus('Validating VRL syntax…');
-            break;
-          case 'syntax_validation_result':
-            setGenProgress(70);
-            setGenStatus(event.valid ? 'Syntax valid · testing samples…' : 'Fixing syntax errors…');
-            break;
-          case 'testing_parser':
-            setGenProgress(75 + Math.floor((event.sample_index / Math.max(event.total_samples, 1)) * 10));
-            setGenStatus(`Testing against sample ${event.sample_index}/${event.total_samples}…`);
-            break;
-          case 'udm_validation_result':
-            setGenProgress(95);
-            setGenStatus(strictOcsf ? 'Finalizing · OCSF 1.9 validation…' : 'Finalizing · UDM validation…');
-            break;
-          case 'retrying_with_feedback':
-            setGenProgress(50);
-            setGenStatus(`Retrying · ${event.reason}`);
-            break;
-          case 'error':
-            setGenState('error');
-            setGenProgress(0);
-            setGenStatus(event.message);
-            toast({ title: 'Generation failed', description: event.message, variant: 'destructive' });
-            break;
-          default:
-            break;
-        }
-      },
-      (parser: GeneratedParser | null, error?: string) => {
-        genControllerRef.current = null;
-        if (error || !parser) {
-          setGenState('error');
-          setGenProgress(0);
-          setGenStatus(error ?? 'Generation failed');
-          if (error) {
-            toast({ title: 'Generation failed', description: error, variant: 'destructive' });
-          }
-          return;
-        }
-        setVrl(parser.vrl_code);
+    try {
+      const result = await pollMelodJob<MelodApiResponse>(
+        () =>
+          api.melodCreateParser({
+            ...(sessionIdRef.current ? { session_id: sessionIdRef.current } : {}),
+            log_source_type: feedId,
+            sample_logs: samples,
+            message: strictOcsf
+              ? `Generate a complete OCSF 1.9 VRL parser for "${feedId}" from these ${samples.length} sample event(s). Emit canonical OCSF fields at the event root, set metadata.log_source to "${feedId}", and place only source fields that have no OCSF mapping under unmapped.*. Do not emit .udm, .ext, source_type, or Nano serving aliases.`
+              : `Generate a VRL parser for "${feedId}" logs from these ${samples.length} sample event(s). The .source_type field is ALREADY SET — do NOT modify it. Extract all useful fields into the UDM schema.`,
+          }),
+        {
+          signal: controller.signal,
+          onProgress: (message) => {
+            if (controller.signal.aborted) return;
+            // Progress creeps toward 90 % while the job runs; the job reports
+            // its own stage text.
+            setGenProgress((p) => Math.min(90, p + 2));
+            setGenStatus(message && message !== 'Working...' ? message : 'Drafting parser…');
+          },
+        },
+      );
+      if (controller.signal.aborted) return;
+      const parser = result?.parser;
+      if (!parser?.vrl_code) {
+        throw new Error('pivt finished without a parser. Retry, or paste a different sample.');
+      }
+      setVrl(parser.vrl_code);
+      setGenProgress(100);
+      const remaining = parser.validation_result?.valid === false ? parser.validation_result.errors.length : 0;
+      if (remaining > 0) {
+        // NAN-4753: keep the draft for review, but never present a parser
+        // that does not compile as finished.
+        setGenState('error');
+        setGenStatus(
+          `Draft incomplete: ${remaining} VRL error${remaining === 1 ? '' : 's'} remain. Run Validate to see them, or retry.`,
+        );
+      } else {
         setGenState('done');
-        setGenProgress(100);
         setGenStatus('Done');
-      },
-    );
+      }
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      const message = safeErrorMessage(
+        err instanceof Error ? err.message : String(err),
+        'pivt could not draft the parser. Retry in a moment.',
+      );
+      setGenState('error');
+      setGenProgress(0);
+      setGenStatus(message);
+      toast({ title: 'pivt could not draft the parser', description: message, variant: 'destructive' });
+    } finally {
+      if (genControllerRef.current === controller) genControllerRef.current = null;
+    }
   }, [entryPath, feedId, sampleText, strictOcsf, toast]);
 
-  // Cancel any in-flight stream on unmount.
+  // Cancel any in-flight generation on unmount.
   useEffect(() => {
     return () => {
       if (genControllerRef.current) genControllerRef.current.abort();
@@ -743,7 +761,7 @@ export function AddFeed() {
       } catch (err) {
         toast({
           title: 'pivt edit failed',
-          description: err instanceof Error ? err.message : 'Unknown error',
+          description: safeErrorMessage(err instanceof Error ? err.message : null, 'pivt could not edit the parser. Retry in a moment.'),
           variant: 'destructive',
         });
       } finally {
@@ -957,6 +975,19 @@ export function AddFeed() {
     return () => window.removeEventListener('beforeunload', handler);
   }, [draftId, feedId, name, vrl, sampleText]);
 
+  // NAN-4754: a blocked gate row's fix link.
+  const handleGateAction = useCallback(
+    (action: GateAction) => {
+      if (action === 'step1') setActiveStep(1);
+      else if (action === 'step2') setActiveStep(2);
+      else {
+        void runValidate();
+        void runTests();
+      }
+    },
+    [runTests, runValidate],
+  );
+
   // ------------ Deploy (hosted-shared, NAN-2593) ------------
   // No routing rule and no source configuration: the registry entry is
   // created and activated, and the parser reaches the tenant's parser cell
@@ -995,6 +1026,12 @@ export function AddFeed() {
         // through `vector test` in the sandboxed bundle build (NAN-2607).
         const samples = splitSamples(sampleText);
         const result = await api.deployLogSource(createdId, strictOcsf ? samples : undefined, samples);
+        // A preflight refusal (e.g. a sample that fails as delivered over the
+        // source's protocol) answers 200 with success=false: nothing was
+        // activated, so do not announce it or move on to the Issue step.
+        if (result.success === false) {
+          throw new Error(result.message || 'The parser was refused at activation.');
+        }
         rollout = result.rollout ?? null;
       }
       setSharedRollout(rollout);
@@ -1288,15 +1325,10 @@ export function AddFeed() {
               product={product}
               description={description}
               vrl={vrl}
-              errors={errors}
-              warnings={warnings}
-              passingTests={passingTests}
-              failingTests={failingTests}
+              gate={deployGate}
+              onGateAction={handleGateAction}
               acceptWarnings={acceptWarnings}
               setAcceptWarnings={setAcceptWarnings}
-              canDeploy={canDeploy}
-              reachability={reachability}
-              namespaceCheck={namespaceCheck}
               onSaveDraft={handleSaveDraft}
               onDeploy={handleDeploy}
               savingDraft={savingDraft}
@@ -3062,6 +3094,20 @@ export function VrlPanel(props: VrlPanelProps) {
         </div>
       )}
 
+      {/* Generation failure — one sanitized sentence + retry (NAN-4753) */}
+      {genState === 'error' && aiAvailable && (
+        <div role="alert" className="shrink-0 border-b border-border bg-destructive/[0.06] px-3 py-1.5 flex items-center gap-2">
+          <AlertTriangle className="w-3 h-3 text-destructive shrink-0" />
+          <span className="text-[11px] text-foreground min-w-0 flex-1 truncate" title={genStatus}>
+            {genStatus || 'pivt could not draft the parser.'}
+          </span>
+          <Button variant="outline" size="sm" className="h-6 gap-1 text-[10.5px]" onClick={onRegenerate}>
+            <RefreshCw className="w-3 h-3" />
+            Retry
+          </Button>
+        </div>
+      )}
+
       {/* Body */}
       <div
         className={cn(
@@ -3489,20 +3535,11 @@ type Step3Props = {
   product: string;
   description: string;
   vrl: string;
-  errors: number;
-  warnings: number;
-  passingTests: number;
-  failingTests: number;
+  /** NAN-4754: the gate computed from real state. */
+  gate: DeployGate;
+  onGateAction: (action: GateAction) => void;
   acceptWarnings: boolean;
   setAcceptWarnings: (v: boolean) => void;
-  canDeploy: boolean;
-  reachability: {
-    transportReady: boolean;
-    sourceConfigEnabled: boolean;
-    sourceConfigDeployed: boolean;
-    checked: boolean;
-  } | null;
-  namespaceCheck: { valid: boolean; error?: string; checked: boolean } | null;
   onSaveDraft: () => void;
   onDeploy: () => void;
   savingDraft: boolean;
@@ -3527,15 +3564,10 @@ function Step3Deploy(props: Step3Props) {
     product,
     description,
     vrl,
-    errors,
-    warnings,
-    passingTests,
-    failingTests,
+    gate,
+    onGateAction,
     acceptWarnings,
     setAcceptWarnings,
-    canDeploy,
-    reachability,
-    namespaceCheck,
     onSaveDraft,
     onDeploy,
     savingDraft,
@@ -3553,8 +3585,8 @@ function Step3Deploy(props: Step3Props) {
     ? 'metadata.log_source'
     : 'source_type';
 
+  const canDeploy = gate.canDeploy;
   const ok = canDeploy;
-  const totalTests = passingTests + failingTests;
   const vrlLineCount = vrl.split('\n').length;
 
   const summary = (
@@ -3629,59 +3661,24 @@ function Step3Deploy(props: Step3Props) {
             kind="VRL parser"
             icon={Code}
             primary={`${feedId || 'parser'}.vrl`}
-            secondary={`${vrlLineCount} ${vrlLineCount === 1 ? 'line' : 'lines'}`}
+            secondary={isEmptyVrl(vrl) ? 'empty' : `${vrlLineCount} ${vrlLineCount === 1 ? 'line' : 'lines'}`}
             code={vrl}
           />
         </div>
 
         <div className="col-span-12 lg:col-span-5">
-          <div className="rounded-lg border border-border bg-background overflow-hidden">
-            <div className="px-3 py-2 border-b border-border bg-card/40">
-              <div className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-muted-foreground/60">Validation gate</div>
-            </div>
-            <div className="px-3 py-3 space-y-2.5">
-              <GateRow ok={errors === 0} label={`VRL syntax · ${errors === 0 ? 'valid' : `${errors} error${errors === 1 ? '' : 's'}`}`} />
-              <GateRow
-                ok={failingTests === 0}
-                label={`Tests · ${totalTests > 0 ? `${passingTests}/${totalTests} pass` : 'not run'}`}
-              />
-              <GateRow
-                ok={warnings === 0}
-                warn={warnings > 0 && acceptWarnings}
-                label={`Diagnostics · ${warnings === 0 ? 'no warnings' : `${warnings} warning${warnings === 1 ? '' : 's'}`}`}
-              />
-              {!shared && (
-              <GateRow
-                ok={reachability?.transportReady !== false}
-                warn={reachability?.transportReady === false && acceptWarnings}
-                label={
-                  !reachability?.checked
-                    ? 'Transport · checking…'
-                    : reachability.transportReady
-                      ? 'Transport ready'
-                      : !reachability.sourceConfigEnabled
-                        ? 'Transport · source config disabled'
-                        : !reachability.sourceConfigDeployed
-                          ? 'Transport · source config not deployed'
-                          : 'Transport · not ready'
-                }
-              />
-              )}
-              <GateRow
-                ok={namespaceCheck?.valid !== false}
-                label={
-                  namespaceCheck?.checked
-                    ? namespaceCheck.valid
-                      ? 'Namespace valid'
-                      : `Namespace · ${namespaceCheck.error ?? 'invalid'}`
-                    : 'Namespace · checking…'
-                }
-              />
-            </div>
+          <DeployGatePanel
+            gate={gate}
+            acknowledged={acceptWarnings}
+            setAcknowledged={setAcceptWarnings}
+            onAction={onGateAction}
+            shared={shared}
+          >
             {shared && (
               <div className="px-3 pb-3 -mt-1 text-[10.5px] text-muted-foreground leading-relaxed">
                 After activation the parser is built and validated against your parser cell&apos;s exact Vector
-                before it goes live; a failing build never reaches your cell.
+                before it goes live; a failing build never reaches your cell. No samples yet? Activate, send the
+                first logs, then iterate the parser from them; versions are tracked.
               </div>
             )}
             {shared && rollout && (
@@ -3689,58 +3686,7 @@ function Step3Deploy(props: Step3Props) {
                 <RolloutStatus rolloutId={rollout.id} initial={rollout} />
               </div>
             )}
-            {(warnings > 0 || (!shared && reachability?.transportReady === false)) && (
-              <div className="px-3 py-3 border-t border-border bg-amber-500/[0.04]">
-                <label className="flex items-start gap-2.5 cursor-pointer group">
-                  <Checkbox
-                    checked={acceptWarnings}
-                    onCheckedChange={(checked) => setAcceptWarnings(checked === true)}
-                    className="mt-0.5 h-3.5 w-3.5 cursor-pointer"
-                  />
-                  <div>
-                    <div className="text-[11.5px] text-foreground group-hover:text-foreground leading-snug">
-                      {warnings > 0 && reachability?.transportReady === false ? (
-                        <>
-                          Deploy anyway with{' '}
-                          <span className="text-amber-500 font-medium">
-                            {warnings} warning{warnings === 1 ? '' : 's'}
-                          </span>{' '}
-                          + transport not ready
-                        </>
-                      ) : warnings > 0 ? (
-                        <>
-                          Deploy anyway with{' '}
-                          <span className="text-amber-500 font-medium">
-                            {warnings} warning{warnings === 1 ? '' : 's'}
-                          </span>
-                        </>
-                      ) : (
-                        <>
-                          Deploy anyway —{' '}
-                          <span className="text-amber-500 font-medium">transport not ready</span>
-                        </>
-                      )}
-                    </div>
-                    <div className="text-[10.5px] text-muted-foreground mt-0.5 leading-relaxed">
-                      Parser warnings won't reject events but may produce nulls. If the transport
-                      isn't deployed, events won't arrive until you deploy it.
-                    </div>
-                  </div>
-                </label>
-              </div>
-            )}
-            <div className="px-3 py-2 border-t border-border bg-card/40 flex items-center gap-2">
-              <span
-                className={cn(
-                  'inline-flex items-center gap-1.5 text-[10.5px] font-mono',
-                  canDeploy ? 'text-emerald-500' : 'text-amber-500',
-                )}
-              >
-                <span className={cn('w-1.5 h-1.5 rounded-full', canDeploy ? 'bg-emerald-500' : 'bg-amber-500')} />
-                {canDeploy ? 'Cleared to deploy' : 'Acknowledge warnings to deploy'}
-              </span>
-            </div>
-          </div>
+          </DeployGatePanel>
 
           <div className="mt-3 rounded-lg border border-border bg-muted p-3">
             <div className="text-[10px] font-mono uppercase tracking-[0.14em] text-muted-foreground/60 mb-1.5">After deploy</div>
@@ -3923,18 +3869,3 @@ function FragmentRow({ k, v }: { k: string; v: string }) {
   );
 }
 
-function GateRow({ ok, warn, label }: { ok: boolean; warn?: boolean; label: string }) {
-  return (
-    <div className="flex items-center gap-2">
-      <span
-        className={cn(
-          'w-3.5 h-3.5 rounded-full flex items-center justify-center shrink-0',
-          ok ? 'bg-emerald-500/20 text-emerald-500' : warn ? 'bg-amber-500/20 text-amber-500' : 'bg-amber-500/20 text-amber-500',
-        )}
-      >
-        {ok ? <Check className="w-2 h-2" /> : <AlertTriangle className="w-2 h-2" />}
-      </span>
-      <span className="text-[11px] text-foreground/80">{label}</span>
-    </div>
-  );
-}

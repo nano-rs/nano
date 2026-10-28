@@ -49,7 +49,7 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
 /// NAN-4614: plus target preparation, which verifies every added byte (a
 /// full read for hosted references): budgeted at this floor rate, so a
 /// bounded batch is never cut off by a timeout sized for metadata alone.
-const ATTEMPT_PREPARE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
+pub(crate) const ATTEMPT_PREPARE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
 const ATTEMPT_TIMEOUT_MAX: Duration = Duration::from_secs(600);
 const ATTEMPTS: usize = 3;
 const STAGE_SESSION: usize = 0;

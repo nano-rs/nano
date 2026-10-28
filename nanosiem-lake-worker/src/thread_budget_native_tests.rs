@@ -139,6 +139,37 @@ async fn background_work_yields_to_interactive_statements() {
     assert_eq!(threads_of(&lanes, probe(0.0)).await, (POOL / 2, POOL / 2));
 }
 
+/// NAN-4738: agent-class statements (`agent-` request ids) never shrink an
+/// analyst: an analyst starting beside running agent statements gets the
+/// whole pool, an agent statement starting beside an analyst gets one thread,
+/// and agents alone share a quarter of the pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256"]
+async fn agent_statements_never_shrink_an_analyst() {
+    let budget = ThreadBudget::new(8);
+    let executor = pool(&runtime(), 4, "parts", &budget);
+    let (first_executor, second_executor) = (executor.clone(), executor.clone());
+    let first = tokio::spawn(async move { as_request("agent-1", threads_of(&first_executor, probe(2.0))).await });
+    for _ in 0..500 {
+        if budget.running_agents() == 1 { break; }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let second = tokio::spawn(async move { as_request("agent-2-hist", threads_of(&second_executor, probe(1.5))).await });
+    for _ in 0..500 {
+        if budget.running_agents() == 2 { break; }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(budget.running(), (0, 0, 0), "agent statements are not interactive");
+    let analyst_executor = executor.clone();
+    let analyst = tokio::spawn(async move { as_request("user-a", threads_of(&analyst_executor, probe(1.0))).await });
+    until_running(&budget, (1, 0, 0)).await;
+    let late_agent = as_request("agent-3", threads_of(&executor, probe(0.0))).await;
+    assert_eq!(late_agent, (1, 1), "an agent beside an analyst gets one thread");
+    assert_eq!(analyst.await.unwrap(), (8, 8), "an analyst beside agents keeps the whole pool");
+    assert_eq!(second.await.unwrap(), (1, 1), "agents share their quarter");
+    assert_eq!(first.await.unwrap(), (2, 2), "a lone agent: a quarter of the pool");
+}
+
 /// Through the lane router: with a budget the fixed 4-thread interactive
 /// cap gives way to the pool, and a predictable 7 d string aggregate starts
 /// on the large lane without a small-lane attempt.
@@ -163,4 +194,37 @@ async fn router_takes_threads_from_the_budget_and_routes_large_aggregates_large(
     assert_eq!((small.status().completed, small.status().failed, large.executor().status().completed), (1, 0, 1),
         "the predicted aggregate ran once, on the large lane");
     assert_eq!(memo.len(), 0, "a prediction is not an escalation");
+}
+
+/// NAN-4742, native: 16 concurrent agent statements on the production
+/// 6-lane executor hold at most five lanes, so an analyst statement started
+/// beside them runs at once (not after an agent's second-long statement),
+/// and every agent statement still completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256"]
+async fn sixteen_agent_statements_leave_an_analyst_a_lane() {
+    let budget = ThreadBudget::new(8);
+    let executor = pool(&runtime(), 6, "parts", &budget);
+    let agents = (0..16)
+        .map(|n| {
+            let executor = executor.clone();
+            tokio::spawn(async move { as_request(&format!("agent-{n}"), threads_of(&executor, probe(1.0))).await })
+        })
+        .collect::<Vec<_>>();
+    for _ in 0..500 {
+        if budget.running_agents() == 5 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(executor.agent_slots(), (5, 5));
+    assert_eq!(budget.running_agents(), 5, "five agent statements run; the rest wait for a slot");
+    let started = std::time::Instant::now();
+    let analyst = as_request("user-a", threads_of(&executor, probe(0.0))).await;
+    assert!(started.elapsed() < Duration::from_millis(500), "the analyst waited {:?}", started.elapsed());
+    assert_eq!(analyst, (8, 8), "and kept the whole pool");
+    for agent in agents {
+        agent.await.unwrap();
+    }
+    assert_eq!(executor.agent_slots(), (0, 5));
 }

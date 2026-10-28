@@ -117,6 +117,13 @@ impl LocalDeleteAuthority {
     }
 
     fn object(&self, key: &str) -> Result<ListedPartObject> {
+        self.listed(key, true)
+    }
+
+    /// The listing record of one part file. `hashed == false` reads metadata
+    /// only and carries a placeholder etag: a cheap eligibility pre-check
+    /// (planning never reads the etag) that is never authorized or deleted.
+    fn listed(&self, key: &str, hashed: bool) -> Result<ListedPartObject> {
         ensure!(
             parse_part_file_key(key).is_some_and(|parsed| parsed.tenant_uuid == self.tenant),
             "local GC key is not this tenant's part file"
@@ -125,18 +132,23 @@ impl LocalDeleteAuthority {
         let mut file = std::fs::File::open(&path)?;
         let metadata = file.metadata()?;
         ensure!(metadata.is_file(), "local GC object is not a regular file");
-        let mut hash = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
+        let digest = if hashed {
+            let mut hash = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hash.update(&buffer[..read]);
             }
-            hash.update(&buffer[..read]);
-        }
+            hex::encode(hash.finalize())
+        } else {
+            "unhashed".to_string()
+        };
         Ok(ListedPartObject {
             key: key.to_string(),
-            strong_etag: format!("\"{}\"", hex::encode(hash.finalize())),
+            strong_etag: format!("\"{digest}\""),
             content_length: metadata.len(),
             uploaded_at_ms: i64::try_from(
                 metadata
@@ -278,6 +290,19 @@ impl LocalDeleteAuthority {
         // Parts are immutable, and GC runs under the ingestor mutex. A
         // fresh log check is still performed for every permit and delete.
         let mut objects = Vec::new();
+        let mut more_eligible = false;
+        let eligible = |object: &ListedPartObject| -> Result<bool> {
+            Ok(!plan_local(
+                &self.tenant,
+                &view,
+                &live_keys,
+                std::slice::from_ref(object),
+                chrono::Utc::now().timestamp_millis(),
+                &policy,
+            )?
+            .requests
+            .is_empty())
+        };
         for key in self.store.list(&prefix).await? {
             let Some(parsed) = parse_part_file_key(&key) else {
                 continue;
@@ -285,22 +310,18 @@ impl LocalDeleteAuthority {
             if view.is_live(&parsed.part_id) || live_keys.contains(&key) {
                 continue;
             }
+            // NAN-4728: plan on metadata first; hash only eligible files (kept
+            // provenance and in-grace files are no longer read every pass).
+            if !eligible(&self.listed(&key, false)?)? {
+                continue;
+            }
+            if objects.len() >= policy.max_requests {
+                more_eligible = true;
+                break;
+            }
             let object = self.object(&key)?;
-            if !plan_local(
-                &self.tenant,
-                &view,
-                &live_keys,
-                std::slice::from_ref(&object),
-                chrono::Utc::now().timestamp_millis(),
-                &policy,
-            )?
-            .requests
-            .is_empty()
-            {
+            if eligible(&object)? {
                 objects.push(object);
-                if objects.len() >= policy.max_requests {
-                    break;
-                }
             }
         }
         let mut planned = plan_local(
@@ -336,6 +357,10 @@ impl LocalDeleteAuthority {
         }
         let mut report = execute_local(self, &planned.requests).await;
         report.plan_skipped = planned.skipped;
+        // NAN-4728: a full batch with progress continues soon (ingest's
+        // catch-up cadence); a batch that deleted nothing, or stopped early
+        // (a pause is not progress), waits the interval.
+        report.more_eligible = more_eligible && report.deleted > 0 && report.paused_reason.is_none();
         let bronze = self.bronze.lock().expect("bronze retention lock").take();
         if let Some(bronze) = bronze {
             let result = bronze
@@ -623,6 +648,145 @@ mod tests {
         assert!(sanctioned_pass_due(last, catching_up, finished_at + SANCTIONED_GC_INTERVAL_MS));
     }
 
+    /// NAN-4728 (NAN-4689 open-core soak, ~12k eps): one bounded pass
+    /// (`max_requests` = 512 files) per 10-min interval reclaimed ~3k files
+    /// an hour while L0 -> minute merges superseded ~10k+ (6 files a part):
+    /// the local store grew without bound. With the production policy, a
+    /// backlog above one batch now drains in bounded passes on the catch-up
+    /// cadence, well inside one pass interval; provenance (kept without a
+    /// retention policy) and the live merge output stay, and once drained
+    /// the scheduler is back on the ordinary interval.
+    #[tokio::test]
+    async fn a_merge_backlog_above_one_batch_drains_within_one_pass_interval() {
+        use crate::part_ingest::ingest::{
+            pass_is_catching_up, sanctioned_pass_due, SANCTIONED_GC_CATCH_UP_INTERVAL_MS,
+            SANCTIONED_GC_INTERVAL_MS,
+        };
+        const FILES: [&str; 5] = [
+            "data-00000.parquet",
+            "tokens-00000.nti",
+            "partials/rollup.parquet",
+            "partials/prevalence.parquet",
+            "partials/entity_ranges.parquet",
+        ];
+        let policy = GcPolicy::default();
+        // Two full batches and one more file: three passes.
+        let parts = (2 * policy.max_requests as u64) / FILES.len() as u64 + 1;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(dir.path()).unwrap());
+        let mut chain = Chain::new();
+        let mut superseded = Vec::new();
+        for n in 1..=parts {
+            chain.add(n, T0 + n as i64);
+            for file in FILES {
+                let key = key(n, Level::L0, file);
+                store.put(&key, b"superseded part bytes").await.unwrap();
+                superseded.push(key);
+            }
+            store.put(&key(n, Level::L0, "provenance.json"), b"{}").await.unwrap();
+        }
+        let output = parts + 1;
+        chain.push(
+            LogOp::Merge {
+                output: crate::lake_part_gc::planner::tests::part_ref(output, Level::Minute),
+                supersedes: (1..=parts).map(id).collect(),
+            },
+            T0 + 10_000,
+        );
+        persist(&store, &chain).await;
+        let live = key(output, Level::Minute, "data-00000.parquet");
+        store.put(&live, b"merged output").await.unwrap();
+        assert!(superseded.len() > 2 * policy.max_requests);
+        let authority =
+            LocalDeleteAuthority::new(store.clone(), TENANT_UUID, TenantKeySet::new(vec![]), policy, None)
+                .unwrap();
+
+        // Ingest's scheduler on a 1 s tick, as in production.
+        let started = 1_800_000_000_000_i64;
+        let (mut last, mut catching_up, mut passes, mut deleted) = (None, false, 0_u64, 0_u64);
+        let mut now = started;
+        let drained_at = loop {
+            assert!(
+                now - started < SANCTIONED_GC_INTERVAL_MS,
+                "the backlog waited a full pass interval ({passes} passes, {deleted} deleted)"
+            );
+            if sanctioned_pass_due(last, catching_up, now) {
+                last = Some(now);
+                let report = authority.collect().await.unwrap();
+                passes += 1;
+                deleted += report.deleted;
+                assert!(report.deleted <= policy.max_requests as u64, "{report:?}");
+                assert!(report.paused_reason.is_none(), "{report:?}");
+                catching_up = pass_is_catching_up(&report);
+                assert_eq!(catching_up, report.more_eligible, "{report:?}");
+                if !catching_up {
+                    break now;
+                }
+            }
+            now += 1_000;
+        };
+        assert_eq!(passes, 3, "two full batches, then the remainder");
+        assert_eq!(drained_at - started, 2 * SANCTIONED_GC_CATCH_UP_INTERVAL_MS);
+        assert_eq!(deleted, superseded.len() as u64);
+        for key in &superseded {
+            assert!(store.get(key).await.unwrap().is_none(), "{key} survived");
+        }
+        assert!(store.get(&live).await.unwrap().is_some(), "the live merge output is kept");
+        assert!(
+            store.get(&key(1, Level::L0, "provenance.json")).await.unwrap().is_some(),
+            "provenance stays without a retention policy"
+        );
+        // Drained: back on the ordinary pass interval.
+        assert!(!sanctioned_pass_due(last, catching_up, drained_at + SANCTIONED_GC_CATCH_UP_INTERVAL_MS));
+        assert!(sanctioned_pass_due(last, catching_up, drained_at + SANCTIONED_GC_INTERVAL_MS));
+    }
+
+    /// NAN-4728: `more_eligible` means another deletable file exists, not
+    /// another listed one. Exactly one full batch followed only by kept
+    /// files (provenance without a retention policy) ends the drain: no
+    /// extra pass on the catch-up cadence.
+    #[tokio::test]
+    async fn an_exactly_full_batch_followed_by_kept_files_is_not_more_eligible() {
+        const FILES: [&str; 5] = [
+            "data-00000.parquet",
+            "tokens-00000.nti",
+            "partials/rollup.parquet",
+            "partials/prevalence.parquet",
+            "partials/entity_ranges.parquet",
+        ];
+        let policy = GcPolicy { max_requests: 2 * FILES.len(), ..GcPolicy::default() };
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(dir.path()).unwrap());
+        let mut chain = Chain::new();
+        for n in 1..=3_u64 {
+            chain.add(n, T0 + n as i64);
+            // Parts 1 and 2 fill the batch; part 3 keeps only provenance,
+            // listed after every eligible file.
+            if n < 3 {
+                for file in FILES {
+                    store.put(&key(n, Level::L0, file), b"superseded").await.unwrap();
+                }
+            }
+            store.put(&key(n, Level::L0, "provenance.json"), b"{}").await.unwrap();
+        }
+        chain.push(
+            LogOp::Merge {
+                output: crate::lake_part_gc::planner::tests::part_ref(4, Level::Minute),
+                supersedes: (1..=3).map(id).collect(),
+            },
+            T0 + 10_000,
+        );
+        persist(&store, &chain).await;
+        store.put(&key(4, Level::Minute, "data-00000.parquet"), b"merged").await.unwrap();
+        let authority =
+            LocalDeleteAuthority::new(store.clone(), TENANT_UUID, TenantKeySet::new(vec![]), policy, None)
+                .unwrap();
+        let report = authority.collect().await.unwrap();
+        assert_eq!(report.deleted, policy.max_requests as u64, "{report:?}");
+        assert!(!report.more_eligible, "only kept files remain: {report:?}");
+        assert!(store.get(&key(3, Level::L0, "provenance.json")).await.unwrap().is_some());
+    }
+
     #[test]
     fn only_a_progressing_fold_shortens_the_pass_interval() {
         use crate::part_ingest::ingest::pass_is_catching_up;
@@ -636,6 +800,41 @@ mod tests {
         assert!(!pass_is_catching_up(&paused("log_unverifiable", true)));
         assert!(!pass_is_catching_up(&paused("index_route_not_served", false)));
         assert!(!pass_is_catching_up(&PassReport::default()));
+        // NAN-4728: a full trusted-local batch with progress continues soon,
+        // unless the pass asked for a back-off.
+        let more = |backoff| PassReport { more_eligible: true, backoff, ..PassReport::default() };
+        assert!(pass_is_catching_up(&more(false)));
+        assert!(!pass_is_catching_up(&more(true)));
+    }
+
+    /// NAN-4728: back-to-back catch-up passes must not starve ingest. A pass
+    /// that held the ingestor for 10 s waits 4 x that from its start (GC at
+    /// most a quarter of wall time); a cheap one keeps the 5 s catch-up
+    /// cadence, a very slow one never waits past the ordinary interval, and
+    /// outside catch-up the busy time changes nothing.
+    #[test]
+    fn catch_up_passes_are_paced_by_their_busy_time() {
+        use crate::part_ingest::ingest::{
+            sanctioned_pass_due_paced as due, SANCTIONED_GC_CATCH_UP_INTERVAL_MS as CATCH_UP,
+            SANCTIONED_GC_CATCH_UP_PACE as PACE, SANCTIONED_GC_INTERVAL_MS as INTERVAL,
+        };
+        let last = Some(1_000_000_i64);
+        let at = |gap| 1_000_000 + gap;
+        // Cheap step (log fold, small batch): the 5 s cadence.
+        assert!(!due(last, true, 200, at(CATCH_UP - 1)));
+        assert!(due(last, true, 200, at(CATCH_UP)));
+        // A 10 s pass: next start 40 s after it started, not 5 s.
+        assert_eq!(PACE, 4);
+        assert!(!due(last, true, 10_000, at(CATCH_UP)));
+        assert!(!due(last, true, 10_000, at(40_000 - 1)));
+        assert!(due(last, true, 10_000, at(40_000)));
+        // Never slower than the ordinary interval.
+        assert!(due(last, true, INTERVAL, at(INTERVAL)));
+        assert!(due(last, true, i64::MAX, at(INTERVAL)));
+        // Not catching up: the ordinary interval regardless of busy time.
+        assert!(!due(last, false, 0, at(INTERVAL - 1)));
+        assert!(due(last, false, 10_000, at(INTERVAL)));
+        assert!(due(None, true, i64::MAX, 0));
     }
 
     #[tokio::test]

@@ -255,15 +255,42 @@ pub async fn read(
 }
 /// Per-state bounded budget: foreground work takes priority immediately;
 /// already-running reads drain when the limit falls, without restarting them.
+///
+/// NAN-4723: the lanes follow their target AIMD-style instead of jumping to
+/// it. The NAN-4689 soak flipped 128 <-> 16 180 times an hour: the part-L0
+/// overdue signal toggles every few ticks under load, and each flip to 128
+/// launched a burst of restamp reads into a prevalence state already in
+/// write backpressure. Now pressure halves the lanes at once (never below
+/// the target), and the lanes grow back only after [`RESTAMP_RAISE_HOLD`]
+/// without any pressure signal (a target under the maximum), by
+/// [`RESTAMP_LANE_STEP`] at most every [`RESTAMP_RAISE_EVERY`].
 pub struct RestampBudget {
     lanes: AtomicUsize,
     foreground: AtomicUsize,
+    /// The last pressure signal, and the last raise.
+    changes: std::sync::Mutex<RestampChanges>,
 }
+#[derive(Default)]
+struct RestampChanges {
+    cut: Option<std::time::Instant>,
+    raised: Option<std::time::Instant>,
+}
+/// Fewest restamp lanes (pressure, L0 overdue, foreground work).
+pub const RESTAMP_MIN_LANES: usize = 16;
+/// Most restamp lanes (full headroom).
+pub const RESTAMP_MAX_LANES: usize = 128;
+/// Lanes added per raise.
+pub const RESTAMP_LANE_STEP: usize = 16;
+/// Quiet time after a pressure signal before the lanes may grow again.
+pub const RESTAMP_RAISE_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
+/// Shortest spacing between two raises.
+pub const RESTAMP_RAISE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 impl Default for RestampBudget {
     fn default() -> Self {
         Self {
             lanes: AtomicUsize::new(32),
             foreground: AtomicUsize::new(0),
+            changes: std::sync::Mutex::new(RestampChanges::default()),
         }
     }
 }
@@ -273,24 +300,54 @@ impl RestampBudget {
             super::merge_quota::catch_up_headroom(lag, bound),
             lag,
             l0_overdue,
+            std::time::Instant::now(),
         );
     }
-    fn adjust(&self, headroom: super::prevalence::CatchUpHeadroom, lag: i64, l0_overdue: i64) {
+    /// The lanes the headroom asks for.
+    fn target(headroom: super::prevalence::CatchUpHeadroom, l0_overdue: i64) -> usize {
         use super::prevalence::CatchUpHeadroom;
-        let target = if l0_overdue > 0 {
-            16
+        if l0_overdue > 0 {
+            RESTAMP_MIN_LANES
         } else {
             match headroom {
-                CatchUpHeadroom::Room => 128,
+                CatchUpHeadroom::Room => RESTAMP_MAX_LANES,
                 CatchUpHeadroom::Hold => 32,
-                CatchUpHeadroom::Pressured => 16,
+                CatchUpHeadroom::Pressured => RESTAMP_MIN_LANES,
             }
+        }
+    }
+    fn adjust(&self, headroom: super::prevalence::CatchUpHeadroom, lag: i64, l0_overdue: i64, now: std::time::Instant) {
+        let target = Self::target(headroom, l0_overdue);
+        let mut changes = self.changes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old = self.lanes.load(Relaxed);
+        if target < RESTAMP_MAX_LANES && target <= old {
+            // Pressure at or below the current lanes (even at the floor
+            // already) restarts the hold. A target above them (`Hold`'s 32
+            // over a floor of 16) is not pressure: the lanes climb to it
+            // after the hold, so every steady signal converges to its target.
+            changes.cut = Some(now);
+        }
+        let next = if target < old {
+            // Multiplicative decrease, at once.
+            (old / 2).max(target)
+        } else if target > old {
+            let held = changes.cut.is_none_or(|at| now.saturating_duration_since(at) >= RESTAMP_RAISE_HOLD);
+            let spaced = changes.raised.is_none_or(|at| now.saturating_duration_since(at) >= RESTAMP_RAISE_EVERY);
+            if held && spaced {
+                changes.raised = Some(now);
+                (old + RESTAMP_LANE_STEP).min(target)
+            } else {
+                old
+            }
+        } else {
+            old
         };
-        let old = self.lanes.swap(target, Relaxed);
-        if old != target {
+        if next != old {
+            self.lanes.store(next, Relaxed);
             tracing::info!(
-                lanes = target,
+                lanes = next,
                 previous = old,
+                target,
                 lag_ms = lag,
                 l0_overdue_ms = l0_overdue,
                 "prevalence restamp read budget adjusted"
@@ -299,7 +356,7 @@ impl RestampBudget {
     }
     pub fn lanes(&self) -> usize {
         if self.foreground.load(Relaxed) > 0 {
-            16
+            RESTAMP_MIN_LANES
         } else {
             self.lanes.load(Relaxed)
         }
@@ -626,20 +683,84 @@ mod tests {
         assert!(cache.lookup(b"entity-19").1.is_some());
         assert!(cache.lookup(b"entity-0").1.is_none());
     }
+    /// NAN-4723: the production budget (`RestampBudget::default`, the one
+    /// `open_store` builds) under pressure halves to the floor, holds there
+    /// through a flapping signal, and climbs back by steps only after a
+    /// quiet hold. Foreground work and an overdue L0 still yield at once.
     #[test]
-    fn restamp_budget_scales_with_headroom_and_yields_to_foreground_and_l0() {
+    fn restamp_budget_cuts_fast_and_grows_back_slowly() {
         use super::super::prevalence::CatchUpHeadroom::*;
+        use std::time::Duration;
         let budget = Arc::new(RestampBudget::default());
-        for (headroom, lanes) in [(Room, 128), (Hold, 32), (Pressured, 16)] {
-            budget.adjust(headroom, 80_000, 0);
-            assert_eq!(budget.lanes(), lanes);
+        let t0 = std::time::Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        assert_eq!(budget.lanes(), 32);
+        // Room from the start: one step per RAISE_EVERY, never a jump.
+        budget.adjust(Room, 0, 0, at(0));
+        assert_eq!(budget.lanes(), 48);
+        budget.adjust(Room, 0, 0, at(1));
+        assert_eq!(budget.lanes(), 48, "raises are spaced");
+        for (n, secs) in (5..=30).step_by(5).enumerate() {
+            budget.adjust(Room, 0, 0, at(secs));
+            assert_eq!(budget.lanes(), (64 + 16 * n).min(RESTAMP_MAX_LANES));
         }
-        budget.adjust(Room, 70_000, 0);
+        assert_eq!(budget.lanes(), RESTAMP_MAX_LANES);
+        // Pressure: halve at once on every update, never below the target.
+        budget.adjust(Pressured, 80_000, 0, at(31));
+        assert_eq!(budget.lanes(), 64);
+        budget.adjust(Room, 0, 1, at(32));
+        assert_eq!(budget.lanes(), 32, "an overdue L0 cuts as well");
+        budget.adjust(Hold, 50_000, 0, at(33));
+        assert_eq!(budget.lanes(), 32, "Hold's target is 32: no cut below it");
+        budget.adjust(Pressured, 80_000, 0, at(34));
+        assert_eq!(budget.lanes(), RESTAMP_MIN_LANES);
+        budget.adjust(Pressured, 80_000, 0, at(35));
+        assert_eq!(budget.lanes(), RESTAMP_MIN_LANES);
+        // The soak's flapping signal: room every other tick. No raise
+        // while cuts keep coming (the old budget flipped 16 -> 128 here).
+        for secs in 36..90 {
+            let overdue = if secs % 2 == 0 { 0 } else { 5_000 };
+            budget.adjust(Room, 1_000, overdue, at(secs));
+            assert!(budget.lanes() <= 2 * RESTAMP_MIN_LANES, "flapping signal raised to {} at {secs}s", budget.lanes());
+        }
+        // Quiet: nothing for the hold, then +16 per step.
+        let last_cut = 89;
+        budget.adjust(Room, 0, 0, at(last_cut + 29));
+        assert_eq!(budget.lanes(), RESTAMP_MIN_LANES, "still inside the hold");
+        budget.adjust(Room, 0, 0, at(last_cut + 30));
+        assert_eq!(budget.lanes(), RESTAMP_MIN_LANES + RESTAMP_LANE_STEP);
+        // Foreground ingest work still takes the floor at once.
         let guard = budget.foreground();
-        assert_eq!(budget.lanes(), 16);
+        assert_eq!(budget.lanes(), RESTAMP_MIN_LANES);
         drop(guard);
-        assert_eq!(budget.lanes(), 128);
-        budget.adjust(Room, 70_000, 1);
-        assert_eq!(budget.lanes(), 16);
+        assert_eq!(budget.lanes(), RESTAMP_MIN_LANES + RESTAMP_LANE_STEP);
+    }
+    /// NAN-4723: every steady signal converges to its own target, from
+    /// above or below, and stays there (bounded to 16..=128 throughout).
+    #[test]
+    fn restamp_budget_converges_to_a_steady_target() {
+        use super::super::prevalence::CatchUpHeadroom::{self, *};
+        use std::time::Duration;
+        let settle = |budget: &RestampBudget, headroom: CatchUpHeadroom, l0_overdue: i64, from: u64| -> u64 {
+            let t0 = std::time::Instant::now();
+            for secs in from..from + 300 {
+                budget.adjust(headroom, 0, l0_overdue, t0 + Duration::from_secs(secs));
+                assert!((RESTAMP_MIN_LANES..=RESTAMP_MAX_LANES).contains(&budget.lanes()));
+            }
+            from + 300
+        };
+        let budget = RestampBudget::default();
+        let mut t = settle(&budget, Pressured, 0, 0);
+        assert_eq!(budget.lanes(), RESTAMP_MIN_LANES);
+        // Steady Hold after pressure: climbs from the floor to 32 (it used
+        // to be stuck at 16: Hold restarted the hold it waited on).
+        t = settle(&budget, Hold, 0, t);
+        assert_eq!(budget.lanes(), 32, "steady Hold reaches its target");
+        t = settle(&budget, Room, 0, t);
+        assert_eq!(budget.lanes(), RESTAMP_MAX_LANES);
+        t = settle(&budget, Hold, 0, t);
+        assert_eq!(budget.lanes(), 32, "steady Hold from above cuts to its target");
+        settle(&budget, Room, 1, t);
+        assert_eq!(budget.lanes(), RESTAMP_MIN_LANES, "a steadily overdue L0 holds the floor");
     }
 }

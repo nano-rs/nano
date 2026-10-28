@@ -266,7 +266,7 @@ const MAX_DEDICATED_CLASS_FAMILIES: usize = 15;
 /// files, at most [`MAX_DEDICATED_FAMILIES`] source rest files and one
 /// overflow, an hour has at most 23 families (each rolling at the default
 /// file size) however many classes it holds.
-const CLASS_FAMILY_MIN_ROWS: u64 = 8_192;
+pub(super) const CLASS_FAMILY_MIN_ROWS: u64 = 8_192;
 
 #[cfg(test)]
 thread_local! {
@@ -284,7 +284,7 @@ fn class_families_enabled() -> bool {
 }
 
 /// `class_uid` of `row` as i64 (`None` when null or of an unexpected type).
-fn class_at(column: Option<&arrow_array::ArrayRef>, row: usize) -> Option<i64> {
+pub(super) fn class_at(column: Option<&arrow_array::ArrayRef>, row: usize) -> Option<i64> {
     let column = column?;
     if column.is_null(row) { return None; }
     match column.data_type() {
@@ -298,7 +298,7 @@ fn class_at(column: Option<&arrow_array::ArrayRef>, row: usize) -> Option<i64> {
 
 /// Add each row's `(metadata.log_source, class_uid)` to `counts`; rows
 /// missing either stay in the overflow stream and are not counted.
-fn count_source_classes(batch: &RecordBatch, counts: &mut ClassCounts) -> Result<()> {
+pub(super) fn count_source_classes(batch: &RecordBatch, counts: &mut ClassCounts) -> Result<()> {
     let Some(classes) = batch.column_by_name("class_uid") else { return Ok(()) };
     let sources = log_source_strings(batch)?;
     for row in 0..batch.num_rows() {
@@ -316,7 +316,7 @@ fn count_source_classes(batch: &RecordBatch, counts: &mut ClassCounts) -> Result
 }
 
 /// Rows per `metadata.log_source`, then per `class_uid`.
-type ClassCounts = BTreeMap<String, BTreeMap<i64, u64>>;
+pub(super) type ClassCounts = BTreeMap<String, BTreeMap<i64, u64>>;
 
 /// The largest `(source, class)` families, ties broken by key, so the
 /// selection is a pure function of the merged rows.
@@ -326,12 +326,20 @@ fn rank_class_families(counts: ClassCounts) -> BTreeSet<(String, i64)> {
 
 /// [`rank_class_families`] over the families of at least `min_rows` rows.
 fn rank_class_families_above(counts: ClassCounts, min_rows: u64) -> BTreeSet<(String, i64)> {
+    ranked_class_families(counts, min_rows, MAX_DEDICATED_CLASS_FAMILIES).into_iter().map(|(family, _)| family).collect()
+}
+
+/// The `limit` largest `(source, class)` families of at least `min_rows`
+/// rows with their counts, largest first (ties by key): a pure function of
+/// the counted rows. NAN-4750: the L0 flush picks its class drafts with it.
+pub(super) fn ranked_class_families(counts: ClassCounts, min_rows: u64, limit: usize) -> Vec<((String, i64), u64)> {
     let mut ranked = counts.into_iter()
         .flat_map(|(source, classes)| classes.into_iter().map(move |(class, rows)| ((source.clone(), class), rows)))
         .filter(|(_, rows)| *rows >= min_rows)
         .collect::<Vec<_>>();
     ranked.sort_by(|(left, left_count), (right, right_count)| right_count.cmp(left_count).then_with(|| left.cmp(right)));
-    ranked.into_iter().take(MAX_DEDICATED_CLASS_FAMILIES).map(|(family, _)| family).collect()
+    ranked.truncate(limit);
+    ranked
 }
 
 /// NAN-3188: exact row counts per `(source, class)` over every input data

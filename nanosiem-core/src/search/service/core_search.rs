@@ -2106,6 +2106,8 @@ struct LakeDistinctPipelinePlan {
     /// `dc()` without `values()`: one whole-range statement answers it
     /// exactly (`uniqExact` in the GROUP BY) without shipping value sets.
     exact_query: Option<Query>,
+    /// NAN-4751: the field `dc()` counts (for [`lake_distinct_folds_into_main`]).
+    distinct_field: String,
     post_commands: Vec<Command>,
 }
 
@@ -3628,7 +3630,7 @@ fn lake_distinct_pipeline_plan(query: &Query) -> Option<LakeDistinctPipelinePlan
                                     // encoding instead of special-casing types.
                                     args: vec![EvalExpression::FunctionCall {
                                         name: "tostring".to_string(),
-                                        args: vec![EvalExpression::Field(distinct_field)],
+                                        args: vec![EvalExpression::Field(distinct_field.clone())],
                                     }],
                                 },
                             }],
@@ -3661,6 +3663,7 @@ fn lake_distinct_pipeline_plan(query: &Query) -> Option<LakeDistinctPipelinePlan
                         values_alias,
                         aggregate_query,
                         exact_query,
+                        distinct_field,
                         post_commands: Vec::new(),
                     });
                 }
@@ -3694,6 +3697,51 @@ fn lake_distinct_pipeline_plan(query: &Query) -> Option<LakeDistinctPipelinePlan
     }
 
     recurse(query)
+}
+
+/// NAN-4751: whether `field` is a bounded identity by the profile's own
+/// field metadata (its entity role): a host, IP or user, or a process
+/// name. Its distinct values are bounded by the fleet / user population,
+/// so a `uniqExact` over it, per group, stays small. Hashes, URLs, files,
+/// per-instance uids (`process.uid`, `metadata.uid`), command lines, ports
+/// and any field without an entity role are not.
+fn lake_bounded_identity_field(profile: &dyn crate::schema::SchemaProfile, field: &str) -> bool {
+    use crate::schema::EntityType;
+    match profile.entity_type(field) {
+        Some(EntityType::Host | EntityType::Ip | EntityType::User) => true,
+        Some(EntityType::Process) => field.rsplit('.').next() == Some("name"),
+        _ => false,
+    }
+}
+
+/// NAN-4751 (bakeoff 1.0.11 wall #3): a distinct plan whose `dc()` the
+/// main statement answers itself. NAN-4695 already answered a `dc()`
+/// without `values()` in one whole-range `uniqExact` statement, but as a
+/// separate `-dc-x` request of the bare `stats`, whose every group came back
+/// for in-process `where` / `sort` / `head`. When the counted field is a
+/// bounded identity ([`lake_bounded_identity_field`]) and the whole query
+/// is one worker statement (no in-process suffix), the general path
+/// compiles the query as is (`uniqExact` beside its filters, order and
+/// limit) and the distinct pipeline is skipped. Both are exact.
+///
+/// The group-by is bounded by the plan itself (at most two fields), and it
+/// does not choose between the two: `-dc-x` runs the very same GROUP BY in
+/// one statement, so a wide group set costs the same either way (the main
+/// statement pages it; `-dc-x` refuses past the group bound). The pipeline
+/// stays the route for `values()`, for a high-cardinality counted field
+/// (its per-group state is what grows), and for a fold whose main statement
+/// the scan budget rejects (then it starts sliced, from the rejected range's
+/// halves, exactly as a rejected `-dc-x` does).
+fn lake_distinct_folds_into_main(
+    profile: &dyn crate::schema::SchemaProfile,
+    query: &Query,
+    plan: &LakeDistinctPipelinePlan,
+) -> bool {
+    if plan.exact_query.is_none() || !lake_bounded_identity_field(profile, &plan.distinct_field) {
+        return false;
+    }
+    let main = plan_lake_post_processing(query);
+    main.post_commands.is_empty() && main.tree_command.is_none() && main.funnel_command.is_none()
 }
 
 fn lake_eval_count_predicate(expression: &EvalExpression) -> Option<(String, LakeCountPredicate)> {
@@ -6077,6 +6125,7 @@ impl SearchService {
         max_groups: usize,
         start_time: Instant,
         parsed: &Query,
+        rejection: Option<SearchError>,
     ) -> Result<SearchResponse, SearchError> {
         use futures::StreamExt;
 
@@ -6093,7 +6142,12 @@ impl SearchService {
         // and starts from the rejected range's halves.
         let mut retries = LakeSliceRetries::new();
         let mut pending = vec![("0".to_string(), request.time_range.clone())];
-        if let Some(exact_query) = plan.exact_query.as_ref() {
+        // NAN-4751: the main statement of a folded `dc()` (the same exact
+        // whole-range answer) was already refused; never re-send the range.
+        if let Some(error) = rejection {
+            let (left, right) = retries.split("0", &request.time_range, error, &request.query)?;
+            pending = vec![("0l".to_string(), left), ("0r".to_string(), right)];
+        } else if let Some(exact_query) = plan.exact_query.as_ref() {
             let query_id = format!("{query_id}-dc-x");
             let mut exact_request = request.clone();
             exact_request.query = exact_query.pretty_print();
@@ -7061,6 +7115,18 @@ impl SearchService {
         let distributed_distinct_stats = lake_distinct_pipeline_plan(&parsed);
         let progressive_head_page = lake_head_page_plan(&parsed);
         let (mut parsed, _) = apply_auto_sort(parsed);
+        // NAN-4751: a bounded `dc()` runs as the main statement; the
+        // distinct pipeline is kept (with the request and query as they are
+        // here) only for a scan-budget rejection of that statement.
+        let (distributed_distinct_stats, folded_distinct) = match distributed_distinct_stats {
+            Some(plan)
+                if request_dataset == crate::query::Dataset::Logs
+                    && lake_distinct_folds_into_main(query_profile.as_ref(), &parsed, &plan) =>
+            {
+                (None, Some((plan, request.clone(), parsed.clone())))
+            }
+            plan => (plan, None),
+        };
         let display_type = determine_display_type(&parsed);
         if let Some(risk) = detect_oom_risk(&parsed) {
             return Err(SearchError::SqlValidationError(risk.message()));
@@ -7423,6 +7489,7 @@ impl SearchService {
                             max_post_processing_groups,
                             start_time,
                             &parsed,
+                            None,
                         ),
                     )
                     .await;
@@ -7619,6 +7686,29 @@ impl SearchService {
                     if request_dataset == crate::query::Dataset::Logs
                         && is_lake_scan_budget_rejection(&error) =>
                 {
+                    // NAN-4751: a folded `dc()` the budget refused is
+                    // answered by the distinct pipeline's exact sliced merge,
+                    // starting from the refused range's halves.
+                    if let Some((distinct, original, distinct_parsed)) = folded_distinct.as_ref() {
+                        let mut response = self
+                            .search_primary_lake_distinct_stats(
+                                original,
+                                query_id,
+                                scope,
+                                distinct,
+                                max_post_processing_groups,
+                                start_time,
+                                distinct_parsed,
+                                Some(error),
+                            )
+                            .await?;
+                        attach_lake_histogram_result(
+                            &mut response,
+                            histogram,
+                            super::lake_histogram_counts_result_rows(&parsed),
+                        );
+                        return Ok(response);
+                    }
                     let Some(plan) = super::lake_stats_merge::lake_mergeable_stats_plan(
                         &parsed,
                         &|field: &str| self.active_profile.is_numeric_field(field),
@@ -7777,9 +7867,13 @@ impl SearchService {
             .as_deref()
             .map(crate::inputlookup::shared::audit_search_id)
             .unwrap_or_else(uuid::Uuid::now_v7);
+        // NAN-4763: the search state machine is several hundred KiB in
+        // debug builds. Boxed, the task-local scope and this fn's own
+        // (instrumented) poll frames carry a pointer instead of inline
+        // copies, which kept every caller's stack ~1.2 MiB deeper.
         crate::inputlookup::shared::with_fetch_search_id(
             id,
-            self.search_with_fetch_audit(request, scope),
+            Box::pin(self.search_with_fetch_audit(request, scope)),
         )
         .await
     }
@@ -10690,6 +10784,52 @@ mod ext_remap_note_tests {
             .contains("values(__nano_distinct_token) as __nano_distinct_values"));
     }
 
+    /// NAN-4751: which distinct plans fold into the main statement, by the
+    /// lake profile's field metadata: a bounded identity (host, IP, user)
+    /// counted, no `values()`, no in-process suffix. The bakeoff's H2 and H8
+    /// fold; high-cardinality counted fields keep the pipeline.
+    #[test]
+    fn bounded_identity_dc_folds_into_the_main_statement() {
+        let profile = OcsfProfile::lake_1_9();
+        let folds = |query: &str| {
+            let (parsed, _) = apply_auto_sort(parse_query(query).unwrap());
+            let plan = lake_distinct_pipeline_plan(&parse_query(query).unwrap())
+                .unwrap_or_else(|| panic!("{query}: a distinct plan"));
+            lake_distinct_folds_into_main(&profile, &parsed, &plan)
+        };
+        for query in [
+            // Bakeoff H2 and H8.
+            "dst_endpoint.ip=10.0.0.5 | stats count as c, dc(device.hostname) as hosts",
+            "class_uid=1007 | stats dc(device.hostname) as h by process.name | where h < 50 | sort h | head 20",
+            "* | stats dc(actor.user.name) as users, count by src_endpoint.ip",
+            "* | stats dc(src_endpoint.ip) as peers by user.name, device.hostname | sort -peers | head 10",
+            "* | stats dc(dst_endpoint.hostname) as n",
+            "* | where src_endpoint.ip!=\"\" | stats dc(dst_endpoint.ip) as peers by src_endpoint.ip | where peers>1 | sort -peers | head 10",
+            // The group-by does not choose the route (see the fold's docs).
+            "* | stats dc(device.hostname) as n by dst_endpoint.port",
+            "* | stats dc(device.hostname) as n by process.uid",
+        ] {
+            assert!(folds(query), "{query} folds");
+        }
+        for query in [
+            // values() needs the value state.
+            "* | stats dc(user.name) as n, values(user.name) as v by src_endpoint.ip",
+            // High-cardinality counted fields.
+            "* | stats dc(process.uid) as n by device.hostname",
+            "* | stats dc(file.hashes.value) as n by device.hostname",
+            "* | stats dc(src_endpoint.port) as n by device.hostname",
+            "* | stats dc(actor.process.uid) as n",
+        ] {
+            assert!(!folds(query), "{query} keeps the pipeline");
+        }
+        for field in ["device.hostname", "src_endpoint.ip", "dst_endpoint.ip", "src_endpoint.hostname", "user.name", "actor.user.name", "user.uid"] {
+            assert!(lake_bounded_identity_field(&profile, field), "{field}");
+        }
+        for field in ["process.uid", "process.cmd_line", "metadata.uid", "file.hashes.value", "dst_endpoint.port", "message"] {
+            assert!(!lake_bounded_identity_field(&profile, field), "{field}");
+        }
+    }
+
     #[test]
     fn lake_distinct_pipeline_merges_count_dc_and_values_together() {
         let parsed = parse_query(
@@ -12934,18 +13074,38 @@ mod nan3078_durable_post_processing_tests {
         let number = |value: &serde_json::Value| {
             value.as_f64().or_else(|| value.as_str().and_then(|s| s.parse().ok())).unwrap_or_else(|| panic!("{value}"))
         };
-        for (query, expected) in [
-            ("metadata.log_source=aws_cloudtrail | stats dc(actor.user.name) as users, count", vec![(None, 3.0, Some(4.0))]),
-            ("metadata.log_source=aws_cloudtrail | stats dc(actor.user.name) as users", vec![(None, 3.0, None)]),
+        let port = |row: &serde_json::Value| row.get("dst_endpoint.port").map(|port| number(port) as i64);
+        // (query, folded into the main statement, expected rows as
+        // (user group, port group, users, count)).
+        type Expected = Vec<(Option<&'static str>, Option<i64>, f64, Option<f64>)>;
+        let cases: [(&str, bool, Expected); 5] = [
+            // NAN-4751: `actor.user.name` is a bounded identity (User): the
+            // dc() is the main statement itself.
+            ("metadata.log_source=aws_cloudtrail | stats dc(actor.user.name) as users, count", true, vec![(None, None, 3.0, Some(4.0))]),
+            ("metadata.log_source=aws_cloudtrail | stats dc(actor.user.name) as users", true, vec![(None, None, 3.0, None)]),
             (
                 "metadata.log_source=aws_cloudtrail | stats dc(actor.user.name) as users, count by actor.user.name",
-                vec![(Some("bob"), 1.0, Some(2.0)), (Some("alice"), 1.0, Some(1.0)), (Some("carol"), 1.0, Some(1.0))],
+                true,
+                vec![(Some("alice"), None, 1.0, Some(1.0)), (Some("bob"), None, 1.0, Some(2.0)), (Some("carol"), None, 1.0, Some(1.0))],
+            ),
+            // A per-process uid is not a bounded identity: NAN-4695's one
+            // exact `-dc-x` statement, ordered by count then group, with the
+            // post commands applied here. (The fixture answers `users` from
+            // the user names whatever field it names.)
+            (
+                "metadata.log_source=aws_cloudtrail | stats dc(actor.process.uid) as users, count by dst_endpoint.port",
+                false,
+                // Ties on count order by the encoded group key ("[22]" <
+                // "[3389]" < "[443]" < "[8080]").
+                vec![(None, Some(22), 1.0, Some(1.0)), (None, Some(3389), 1.0, Some(1.0)), (None, Some(443), 1.0, Some(1.0)), (None, Some(8080), 1.0, Some(1.0))],
             ),
             (
-                "metadata.log_source=aws_cloudtrail | stats dc(actor.user.name) as users, count by actor.user.name | where count < 2",
-                vec![(Some("alice"), 1.0, Some(1.0)), (Some("carol"), 1.0, Some(1.0))],
+                "metadata.log_source=aws_cloudtrail | stats dc(actor.process.uid) as users, count by dst_endpoint.port | where dst_endpoint.port > 1000",
+                false,
+                vec![(None, Some(3389), 1.0, Some(1.0)), (None, Some(8080), 1.0, Some(1.0))],
             ),
-        ] {
+        ];
+        for (query, folded, expected) in cases {
             let before = server.received_requests().await.unwrap().len();
             let request: SearchRequest = serde_json::from_value(serde_json::json!({
                 "query": query,
@@ -12959,19 +13119,33 @@ mod nan3078_durable_post_processing_tests {
             assert_eq!(sent.len() - before, 1, "{query}: one statement");
             let body: serde_json::Value = serde_json::from_slice(&sent[before].body).unwrap();
             let text = body["query"].as_str().unwrap();
-            assert!(body["request_id"].as_str().unwrap().ends_with("-dc-x"), "{body}");
-            assert!(text.contains("dc(actor.user.name)") && !text.contains("__nano_distinct"), "{query}: sent {text}");
+            let request_id = body["request_id"].as_str().unwrap();
+            if folded {
+                assert!(!request_id.contains("-dc-"), "{query}: the main statement, not a distinct companion: {body}");
+            } else {
+                assert!(request_id.ends_with("-dc-x"), "{body}");
+                assert!(!text.contains("where"), "{query}: the post commands run here: {text}");
+            }
+            let counted = if folded { "dc(actor.user.name)" } else { "dc(actor.process.uid)" };
+            assert!(text.contains(counted) && !text.contains("__nano_distinct"), "{query}: sent {text}");
             assert!(text.contains("aws_cloudtrail"), "the gate and the base search are kept: {text}");
-            let got = rows
+            let mut got = rows
                 .iter()
                 .map(|row| {
                     (
                         row.get("actor.user.name").and_then(|value| value.as_str()),
+                        port(row),
                         number(&row["users"]),
-                        row.get("count").map(number),
+                        // (This fixture answers every state any test names.)
+                        row.get("count").filter(|_| query.contains(", count")).map(number),
                     )
                 })
                 .collect::<Vec<_>>();
+            if folded {
+                // The worker orders a folded statement (this fixture ignores
+                // the compiled sort); compare the rows.
+                got.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            }
             assert_eq!(got, expected, "{query}: {rows:?}");
         }
     }
@@ -12982,7 +13156,10 @@ mod nan3078_durable_post_processing_tests {
     /// `uniqExact` statement (budget admits the range) and the sliced
     /// value-state merge (budget rejects it). Users repeat across slices and
     /// across groups, so a double-counted or dropped slice changes the answer;
-    /// both routes return the same rows in the same order.
+    /// both routes return the same rows in the same order. NAN-4751: the
+    /// whole-range route is now the folded main statement, against the
+    /// pipeline's sliced merge (budget rejects the fold), so the fold and
+    /// the pipeline are held to the same oracle and to each other.
     #[cfg(feature = "enterprise")]
     #[test]
     fn dc_matches_a_brute_force_oracle_on_both_routes() {
@@ -13068,10 +13245,14 @@ mod nan3078_durable_post_processing_tests {
                     .iter()
                     .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["request_id"].to_string())
                     .collect::<Vec<_>>();
+                // NAN-4751: `dc(actor.user.name)` folds into the main
+                // statement (ungrouped and by port); a rejection slices it.
+                assert!(!ids[0].contains("-dc-"), "{query}: the main statement first {ids:?}");
+                assert!(!ids.iter().any(|id| id.contains("-dc-x")), "{query}: {ids:?}");
                 if sliced {
                     assert!(ids.iter().filter(|id| id.contains("-dc-0")).count() >= 4, "{query}: sliced {ids:?}");
                 } else {
-                    assert!(ids.len() == 1 && ids[0].ends_with("-dc-x\""), "{query}: one exact statement {ids:?}");
+                    assert_eq!(ids.len(), 1, "{query}: one exact statement {ids:?}");
                 }
                 let got = rows
                     .iter()
@@ -13090,7 +13271,12 @@ mod nan3078_durable_post_processing_tests {
             }
             answers.push(route);
         }
-        assert_eq!(answers[0], answers[1], "the exact and sliced routes return the same rows in the same order");
+        // NAN-4751: the folded route's row order is the worker's (this
+        // fixture does not apply the compiled sort), so compare the rows.
+        let sorted = |routes: &Vec<Vec<(Option<i64>, u64, u64)>>| {
+            routes.iter().map(|rows| rows.iter().copied().collect::<BTreeSet<_>>()).collect::<Vec<_>>()
+        };
+        assert_eq!(sorted(&answers[0]), sorted(&answers[1]), "the folded and sliced routes return the same rows");
     }
 
     #[cfg(feature = "enterprise")]
@@ -13158,7 +13344,10 @@ mod nan3078_durable_post_processing_tests {
             .iter()
             .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["request_id"].to_string())
             .collect::<Vec<_>>();
-        assert_eq!(ids.iter().filter(|id| id.contains("-dc-x")).count(), 1, "{ids:?}");
+        // NAN-4751: `actor.user.name` is a bounded identity, so the dc()
+        // is the main statement (no `-dc-x`); its rejection starts slicing.
+        assert!(!ids[0].contains("-dc-"), "the main statement first: {ids:?}");
+        assert_eq!(ids.iter().filter(|id| id.contains("-dc-x")).count(), 0, "{ids:?}");
         assert!(!ids.iter().any(|id| id.ends_with("-dc-0\"")), "the rejected whole range is not re-sent: {ids:?}");
         assert!(ids.iter().filter(|id| id.contains("-dc-0")).count() >= 2, "sliced after the rejection: {ids:?}");
         assert_eq!((number(&dc_row["users"]), number(&dc_row["count"])), (3.0, 4.0), "{dc_row}");

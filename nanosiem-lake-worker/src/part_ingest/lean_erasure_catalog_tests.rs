@@ -974,3 +974,118 @@ async fn verified_files_skip_the_full_read_only_on_an_exact_signed_match() {
     let error = target.prepare(&manifest, &schema).await.unwrap_err();
     assert!(format!("{error:#}").contains("checksum differs"), "{error:#}");
 }
+
+/// NAN-4721: the production export target reads no cold part file while the
+/// tenant's ingest lag alert holds (the signal `TenantCatalog` hands its
+/// backend), and reads every file as soon as it clears; the verified bytes
+/// are unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_export_reads_yield_while_ingest_lags() {
+    use crate::part_ingest::export::{plan_export_reconciled, ExportState};
+    use crate::part_ingest::iceberg_export::{hosted::HostedExportTarget, ExportTarget};
+    let (_dir, lake, _basin, parts) = sealed_lake().await;
+    let store = Arc::new(CountingStore { inner: lake.parts(), data_reads: Default::default() });
+    let target = Arc::new(
+        HostedExportTarget::new(
+            TENANT.into(),
+            store.clone(),
+            signer().trusted(),
+            crate::lake_part_gc::request::tenant_bucket(TENANT),
+        )
+        .unwrap()
+        .with_verified_files(lake.root.join("verified-files")),
+    );
+    let pressure = Arc::new(crate::part_ingest::agent_lane::IngestPressure::default());
+    target.set_ingest_pressure(pressure.clone());
+    let live = load_log(&lake.parts(), TENANT).await.unwrap();
+    let schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&live.schema().unwrap().to_arrow().unwrap()).unwrap();
+    let mut state = ExportState::default();
+    let pending = plan_export_reconciled(&parts, &state, lake.clock, &Default::default());
+    let path = state.record_durable_plan(&lake.root, TENANT, &pending, lake.clock).unwrap();
+    let manifest: crate::part_ingest::export::ExportManifest = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    pressure.set(true);
+    let prepare = tokio::spawn({
+        let (target, manifest, schema) = (target.clone(), manifest.clone(), schema.clone());
+        async move { target.prepare(&manifest, &schema).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(store.data_reads.load(Ordering::SeqCst), 0, "a cold file read competed with lagging ingest");
+    assert!(!prepare.is_finished());
+    pressure.set(false);
+    let prepared = tokio::time::timeout(std::time::Duration::from_secs(30), prepare).await.unwrap().unwrap().unwrap();
+    assert!(store.data_reads.load(Ordering::SeqCst) > 0);
+    assert!(pressure.yielded_ms() >= 3_000);
+    let total = parts.iter().map(|p| p.data_files as usize).sum::<usize>();
+    assert_eq!(prepared.values().map(Vec::len).sum::<usize>(), total, "every file verified and registered");
+}
+
+/// NAN-4721: the ingest loop hands its lag alert (`health.stalled`, the
+/// "ingest lag exceeds its alert threshold" signal) to the tenant catalog on
+/// every health update; that is the signal agent-catalog work yields to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingest_health_drives_the_catalog_ingest_pressure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut lake = Lake {
+        root: dir.path().into(),
+        clock: i64::from(BASE_HOUR + HOURS + 1) * HOUR_MS,
+    };
+    lake.ingest(TENANT).await;
+    lake.seal_for_catalog(TENANT).await;
+    let (_basin, catalog) = lake.catalog(TENANT).await;
+    let parts = lake.parts();
+    let sources = LocalObjectStore::new(lake.root.join("pressure-sources")).unwrap();
+    let spool = SpoolQueue::new(lake.root.join("pressure-spool"), TENANT).unwrap();
+    let signer = signer();
+    let mut config = IngestConfig::new(TENANT, lake.root.join("pressure-work"));
+    config.catalog = Some(catalog.clone());
+    config.prevalence_enabled = false;
+    // Any lag (even none) is past this threshold: the alert holds.
+    config.lag_alert_ms = -1;
+    let mut ingestor = Ingestor::open(
+        config, &parts, &sources, &spool, &signer, signer.trusted(),
+        BronzeIngestEnricher::disabled(), &seed_schema(), lake.clock,
+    )
+    .await
+    .unwrap();
+    assert!(!catalog.ingest_pressure().lagging());
+    ingestor.tick(lake.clock).await.unwrap();
+    assert!(ingestor.health().stalled);
+    assert!(catalog.ingest_pressure().lagging(), "the lag alert reached the agent catalog");
+}
+
+/// NAN-4721: under SUSTAINED ingest pressure a production export prepare
+/// still completes inside one yield budget (the budget is per prepare, not
+/// per file: the prepare runs inside a commit attempt timeout that budgets
+/// bytes), and its cold reads are paced instead of bursting.
+#[tokio::test(start_paused = true)]
+async fn cold_export_prepare_under_sustained_pressure_spends_one_yield_budget() {
+    use crate::part_ingest::agent_lane::{IngestPressure, MAX_YIELD};
+    use crate::part_ingest::export::{plan_export_reconciled, ExportState};
+    use crate::part_ingest::iceberg_export::{hosted::HostedExportTarget, ExportTarget};
+    let (_dir, lake, _basin, parts) = sealed_lake().await;
+    let store = Arc::new(CountingStore { inner: lake.parts(), data_reads: Default::default() });
+    let target = HostedExportTarget::new(
+        TENANT.into(),
+        store.clone(),
+        signer().trusted(),
+        crate::lake_part_gc::request::tenant_bucket(TENANT),
+    )
+    .unwrap()
+    .with_verified_files(lake.root.join("verified-files"));
+    let pressure = Arc::new(IngestPressure::default());
+    target.set_ingest_pressure(pressure.clone());
+    let live = load_log(&lake.parts(), TENANT).await.unwrap();
+    let schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&live.schema().unwrap().to_arrow().unwrap()).unwrap();
+    let mut state = ExportState::default();
+    let pending = plan_export_reconciled(&parts, &state, lake.clock, &Default::default());
+    let path = state.record_durable_plan(&lake.root, TENANT, &pending, lake.clock).unwrap();
+    let manifest: crate::part_ingest::export::ExportManifest = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let total = parts.iter().map(|p| p.data_files as usize).sum::<usize>();
+    assert!(total > 1, "several cold files: a per-file yield would spend several budgets");
+    pressure.set(true); // never clears
+    let prepared = target.prepare(&manifest, &schema).await.unwrap();
+    assert_eq!(prepared.values().map(Vec::len).sum::<usize>(), total, "every file verified and registered");
+    assert!(store.data_reads.load(Ordering::SeqCst) >= total);
+    let yielded = std::time::Duration::from_millis(pressure.yielded_ms());
+    assert!(yielded >= MAX_YIELD && yielded < MAX_YIELD + std::time::Duration::from_secs(5), "{yielded:?}");
+}

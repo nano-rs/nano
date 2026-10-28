@@ -203,6 +203,10 @@ struct Job {
     started: oneshot::Sender<Instant>,
     /// NAN-4174: whom the statement serves (its thread grant's class).
     priority: crate::thread_budget::Priority,
+    /// NAN-4742: an agent statement's slot ([`AgentLaneGate`]), released
+    /// when the lane is done with the job (or skips it), not when the
+    /// caller stops waiting.
+    _agent_slot: Option<AgentSlot>,
 }
 
 /// One streamed statement's lane job (see [`NativeExecutor::execute_streaming`]).
@@ -219,6 +223,10 @@ struct StreamJob {
     started: oneshot::Sender<Instant>,
     /// NAN-4174: whom the statement serves (its thread grant's class).
     priority: crate::thread_budget::Priority,
+    /// NAN-4742: an agent statement's slot ([`AgentLaneGate`]), released
+    /// when the lane is done with the job (or skips it), not when the
+    /// caller stops waiting.
+    _agent_slot: Option<AgentSlot>,
 }
 
 enum StreamItem {
@@ -236,6 +244,114 @@ pub struct NativeRowStream {
     result_limit_bytes: Option<u64>,
     done: bool,
     query_id: u64,
+}
+
+/// NAN-4742: the most agent-class statements (`thread_budget::Priority::Agent`)
+/// an executor of `lanes` lanes holds at once, queued or running: one lane
+/// less than it has, so at least one lane of every executor (query[T]'s small
+/// and large pools) never carries agent work and an analyst statement always
+/// finds a lane free of it. Derived from the configured lane count; a
+/// one-lane executor cannot reserve a lane and admits one agent statement.
+pub const fn agent_lane_limit(lanes: usize) -> usize {
+    if lanes <= 1 { 1 } else { lanes - 1 }
+}
+
+/// NAN-4742: admission of agent statements to one executor's lanes (see
+/// [`agent_lane_limit`]). Every other class passes without waiting.
+#[derive(Debug)]
+pub(crate) struct AgentLaneGate {
+    slots: Arc<tokio::sync::Semaphore>,
+    limit: usize,
+    /// NAN-4747: time agent statements spent waiting for an agent slot
+    /// (this gate's or the large lane's), folded into `lane_wait_ms`.
+    wait_micros: AtomicU64,
+    /// NAN-4747: agent statements that found no agent slot in time, folded
+    /// into `lane_wait_timeouts`.
+    wait_timeouts: AtomicU64,
+    /// NAN-4747: agent statements refused instead of escalating to the
+    /// whole large lane ([`crate::part_query::lanes::admit_large`]).
+    escalations_refused: AtomicU64,
+}
+
+impl AgentLaneGate {
+    pub(crate) fn for_lanes(lanes: usize) -> Self {
+        let limit = agent_lane_limit(lanes);
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(limit)),
+            limit,
+            wait_micros: AtomicU64::new(0),
+            wait_timeouts: AtomicU64::new(0),
+            escalations_refused: AtomicU64::new(0),
+        }
+    }
+
+    /// NAN-4747: an agent statement waited `elapsed` for an agent slot and
+    /// got none when `timed_out`.
+    pub(crate) fn record_wait(&self, elapsed: Duration, timed_out: bool) {
+        StatementClock::add(&self.wait_micros, elapsed);
+        if timed_out {
+            self.wait_timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// NAN-4747: an agent statement was refused the whole large lane.
+    pub(crate) fn record_escalation_refused(&self) {
+        self.escalations_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// NAN-4747: agent statements refused the whole large lane so far.
+    pub(crate) fn escalations_refused(&self) -> u64 {
+        self.escalations_refused.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Agent statements holding a slot.
+    pub(crate) fn held(&self) -> usize {
+        self.limit - self.slots.available_permits()
+    }
+
+    /// A slot for a `priority` statement (`None`: not agent work, nothing
+    /// held), waiting at most until `deadline`.
+    pub(crate) async fn admit(
+        &self,
+        priority: crate::thread_budget::Priority,
+        deadline: Instant,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ExecutorError> {
+        if priority != crate::thread_budget::Priority::Agent {
+            return Ok(None);
+        }
+        match tokio::time::timeout_at(deadline.into(), self.slots.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(Some(permit)),
+            Ok(Err(_)) => Err(ExecutorError::Unavailable),
+            Err(_) => Err(ExecutorError::LaneWaitTimeout),
+        }
+    }
+}
+
+/// NAN-4742: an agent statement's slot on the lane it was sent to. Counted on
+/// the lane (so analysts prefer lanes without agent work, see
+/// [`NativeExecutor::least_loaded_lane`]) and given back when dropped: with
+/// the lane job once the lane finishes or skips it, or on any early return
+/// before the job is sent.
+struct AgentSlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    lane: Arc<LaneStatus>,
+}
+
+impl AgentSlot {
+    fn on_lane(permit: tokio::sync::OwnedSemaphorePermit, lane: &Arc<LaneStatus>) -> Self {
+        lane.agents.fetch_add(1, Ordering::Relaxed);
+        Self { _permit: permit, lane: lane.clone() }
+    }
+}
+
+impl Drop for AgentSlot {
+    fn drop(&mut self) {
+        self.lane.agents.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl NativeRowStream {
@@ -295,6 +411,8 @@ pub struct NativeExecutor {
     /// NAN-4174: the process thread budget every statement on this pool
     /// takes a grant from when its lane starts it (unset: threads as written).
     thread_budget: Arc<std::sync::OnceLock<Arc<crate::thread_budget::ThreadBudget>>>,
+    /// NAN-4742: agent statements never hold every lane.
+    agent_gate: Arc<AgentLaneGate>,
     /// NAN-3391: keeps the process-wide chDB DNS cache refresher running
     /// while this executor (or a clone) is alive.
     #[allow(dead_code)] // held for its Drop, never read
@@ -315,6 +433,9 @@ pub struct NativeExecutorStatus {
     /// Cumulative post-admission queue time (including cancelled/timed-out waits).
     pub lane_wait_ms: u64,
     pub lane_wait_timeouts: u64,
+    /// NAN-4747: agent statements refused (as lanes busy) instead of
+    /// escalating to the whole large lane.
+    pub agent_escalations_refused: u64,
     pub allocator_purges: u64,
     pub allocator_purge_failures: u64,
     pub allocator_purge_in_flight: usize,
@@ -347,6 +468,8 @@ struct LaneStatus {
     query: Mutex<Option<RunningQuery>>,
     last_finished: Mutex<Option<Instant>>,
     queued: AtomicUsize,
+    /// NAN-4742: agent statements queued or running on this lane.
+    agents: AtomicUsize,
     started: Mutex<Option<Instant>>,
     completed: AtomicU64,
     failed: AtomicU64,
@@ -456,6 +579,7 @@ impl NativeExecutor {
             result_limit_bytes: None,
             streaming,
             thread_budget,
+            agent_gate: Arc::new(AgentLaneGate::for_lanes(connection_count)),
             dns_refresher,
         })
     }
@@ -482,6 +606,46 @@ impl NativeExecutor {
     pub fn with_thread_budget(self, budget: Arc<crate::thread_budget::ThreadBudget>) -> Self {
         let _ = self.thread_budget.set(budget);
         self
+    }
+
+    /// NAN-4742: agent statements this executor holds (queued or running)
+    /// and the most it admits at once ([`agent_lane_limit`]).
+    pub fn agent_slots(&self) -> (usize, usize) {
+        (self.agent_gate.held(), self.agent_gate.limit())
+    }
+
+    /// NAN-4747: this executor's agent gate, whose wait and refusal counters
+    /// the large lane in front of it also feeds.
+    pub(crate) fn agent_gate(&self) -> &AgentLaneGate {
+        &self.agent_gate
+    }
+
+    /// NAN-4742: an agent slot for a `priority` statement (`None` for every
+    /// other class), shed as a lane wait timeout ("all query lanes are
+    /// busy") when none frees within the lane wait.
+    async fn admit_agent(
+        &self,
+        priority: crate::thread_budget::Priority,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, ExecutorError> {
+        let started = Instant::now();
+        let admitted = self.agent_gate.admit(priority, started + self.lane_wait_timeout).await;
+        if priority == crate::thread_budget::Priority::Agent {
+            // NAN-4747: the agent-slot wait is lane wait, for the executor,
+            // the statement's clock and its timing line alike.
+            let waited = started.elapsed();
+            let timed_out = matches!(admitted, Err(ExecutorError::LaneWaitTimeout));
+            self.agent_gate.record_wait(waited, timed_out);
+            if let Ok(clock) = STATEMENT_CLOCK.try_with(Arc::clone) {
+                StatementClock::add(&clock.wait_us, waited);
+            }
+            crate::query_timing::record(|p| p.lane_wait_ms += waited.as_secs_f64() * 1000.0);
+        }
+        if matches!(admitted, Err(ExecutorError::LaneWaitTimeout)) {
+            crate::query_timing::record(|p| p.outcome = Some("lane_wait_timeout"));
+            tracing::warn!(outcome = "lane_wait_timeout", lane = %self.lane_name,
+                "agent statement found no free agent slot; shedding it");
+        }
+        admitted
     }
 
     /// The thread budget set by [`Self::with_thread_budget`].
@@ -525,8 +689,10 @@ impl NativeExecutor {
             completed: 0,
             failed: 0,
             admission_timeouts: 0,
-            lane_wait_ms: 0,
-            lane_wait_timeouts: 0,
+            // NAN-4747: agent-slot waits and timeouts count as lane waits.
+            lane_wait_ms: self.agent_gate.wait_micros.load(Ordering::Relaxed) / 1000,
+            lane_wait_timeouts: self.agent_gate.wait_timeouts.load(Ordering::Relaxed),
+            agent_escalations_refused: self.agent_gate.escalations_refused(),
             allocator_purges: 0,
             allocator_purge_failures: 0,
             allocator_purge_in_flight: 0,
@@ -651,7 +817,12 @@ impl NativeExecutor {
         if crate::query_timing::current().is_some() {
             check_interactive_estimate(plan.budget.estimated_scan_bytes, plan.budget.max_query_bytes)?;
         }
-        let index = self.least_loaded_lane();
+        // NAN-4742: an agent statement first takes one of the executor's
+        // agent slots (one lane fewer than it has), then a lane.
+        let priority = crate::thread_budget::Priority::current();
+        let agent_permit = self.admit_agent(priority).await?;
+        let index = self.least_loaded_lane(priority);
+        let agent_slot = agent_permit.map(|permit| AgentSlot::on_lane(permit, &self.lanes[index]));
         let timing = crate::query_timing::current();
         let query_id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
         let request_id = timing.as_ref().map_or_else(|| format!("native-{query_id}"), |p| {
@@ -682,7 +853,8 @@ impl NativeExecutor {
         self.lanes[index].queued.fetch_add(1, Ordering::Relaxed);
         permit.send(Command::Stream(StreamJob {
             query_id, request_id, budget, sql, params: plan.params, chunks, timing, clock, deadline, started,
-            priority: crate::thread_budget::Priority::current(),
+            priority,
+            _agent_slot: agent_slot,
         }));
         match tokio::time::timeout_at(deadline.into(), start_receiver).await {
             Ok(Ok(started_at)) => wait.finished_at = Some(started_at),
@@ -704,7 +876,12 @@ impl NativeExecutor {
         sql: String,
         params: Vec<(String, String)>,
     ) -> Result<NativeQueryOutput, ExecutorError> {
-        let index = self.least_loaded_lane();
+        // NAN-4742: an agent statement first takes one of the executor's
+        // agent slots (one lane fewer than it has), then a lane.
+        let priority = crate::thread_budget::Priority::current();
+        let agent_permit = self.admit_agent(priority).await?;
+        let index = self.least_loaded_lane(priority);
+        let agent_slot = agent_permit.map(|permit| AgentSlot::on_lane(permit, &self.lanes[index]));
         let timing = crate::query_timing::current();
         let query_id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
         let request_id = timing.as_ref().map_or_else(|| format!("native-{query_id}"), |p| {
@@ -772,7 +949,8 @@ impl NativeExecutor {
             admitted_at,
             deadline,
             started,
-            priority: crate::thread_budget::Priority::current(),
+            priority,
+            _agent_slot: agent_slot,
         }));
         match tokio::time::timeout_at(deadline.into(), start_receiver).await {
             Ok(Ok(started_at)) => wait.finished_at = Some(started_at),
@@ -820,7 +998,13 @@ impl NativeExecutor {
     /// loads, prefer the lane whose current request has run for less time.
     /// This keeps unrelated interactive traffic off an old slow lane without
     /// increasing connection, CPU, or memory envelopes.
-    fn least_loaded_lane(&self) -> usize {
+    ///
+    /// NAN-4742: among equally loaded lanes, a statement that is not agent
+    /// work prefers a lane carrying no agent statement, so an analyst does
+    /// not queue behind a one-thread agent statement while a lane of equal
+    /// load serves only analysts.
+    fn least_loaded_lane(&self, priority: crate::thread_budget::Priority) -> usize {
+        let avoid_agents = priority != crate::thread_budget::Priority::Agent;
         let start = self.next.fetch_add(1, Ordering::Relaxed) % self.lanes.len();
         let now = Instant::now();
         (0..self.lanes.len())
@@ -838,7 +1022,8 @@ impl NativeExecutor {
                 });
                 let overdue = lane.query.lock().expect("executor query poisoned").as_ref()
                     .is_some_and(|q| q.budget.is_some_and(|budget| now.saturating_duration_since(q.started) > budget));
-                (overdue, load, running_for)
+                let agent_work = avoid_agents && lane.agents.load(Ordering::Relaxed) > 0;
+                (overdue, load, agent_work, running_for)
             })
             .expect("native executor has at least one lane")
     }
@@ -1091,7 +1276,7 @@ fn start_connection(
                             .lock()
                             .expect("executor lane status poisoned") = Some(Instant::now());
                         *status.query.lock().expect("executor query poisoned") = Some(RunningQuery {
-                            query_id: job.query_id, request_id: job.request_id,
+                            query_id: job.query_id, request_id: job.request_id.clone(),
                             budget: job.budget, started: started_at, cancel_requested: None,
                         });
                         let prepare_started = Instant::now();
@@ -1104,8 +1289,9 @@ fn start_connection(
                             ExecutorMode::ReadOnly => read_lane_sql(&job.sql),
                             ExecutorMode::ReadWrite => job.sql.clone(),
                         };
-                        // NAN-4174: threads by what runs now, held to the end.
-                        let grant = thread_budget.get().map(|budget| budget.grant(job.priority));
+                        // NAN-4174: threads by what runs now, held to the end;
+                        // NAN-4751: one share per request, not per statement.
+                        let grant = thread_budget.get().map(|budget| budget.grant_for_request(job.priority, &job.request_id));
                         let sql = grant_sql(grant.as_ref(), sql, job.timing.as_ref());
                         if let Some(timing) = &job.timing {
                             timing.lock().unwrap_or_else(|e| e.into_inner()).sql_prepare_ms += prepare_started.elapsed().as_secs_f64() * 1000.0;
@@ -1185,7 +1371,7 @@ fn start_connection(
                         }
                         *status.started.lock().expect("executor lane status poisoned") = Some(Instant::now());
                         *status.query.lock().expect("executor query poisoned") = Some(RunningQuery {
-                            query_id: job.query_id, request_id: job.request_id,
+                            query_id: job.query_id, request_id: job.request_id.clone(),
                             budget: job.budget, started: started_at, cancel_requested: None,
                         });
                         let prepare_started = Instant::now();
@@ -1194,8 +1380,9 @@ fn start_connection(
                             ExecutorMode::ReadOnly => read_lane_sql(&job.sql),
                             ExecutorMode::ReadWrite => job.sql.clone(),
                         };
-                        // NAN-4174: threads by what runs now, held to the end.
-                        let grant = thread_budget.get().map(|budget| budget.grant(job.priority));
+                        // NAN-4174: threads by what runs now, held to the end;
+                        // NAN-4751: one share per request, not per statement.
+                        let grant = thread_budget.get().map(|budget| budget.grant_for_request(job.priority, &job.request_id));
                         let sql = grant_sql(grant.as_ref(), sql, job.timing.as_ref());
                         if let Some(timing) = &job.timing {
                             timing.lock().unwrap_or_else(|e| e.into_inner()).sql_prepare_ms += prepare_started.elapsed().as_secs_f64() * 1000.0;
@@ -1419,6 +1606,44 @@ fn start_connection(
         .map_err(|_| ExecutorError::Unavailable)?
         .map_err(ExecutorError::Startup)?;
     Ok(sender)
+}
+
+/// NAN-4747: an executor whose lanes never run anything, for admission
+/// tests outside this module; [`TestLanes::jobs`] drains and counts the
+/// statements sent to its lanes. A sent statement is never started, so its
+/// caller ends in a lane wait timeout.
+#[cfg(test)]
+pub(crate) struct TestLanes {
+    receivers: Vec<mpsc::Receiver<Command>>,
+}
+
+#[cfg(test)]
+impl TestLanes {
+    pub(crate) fn jobs(&mut self) -> usize {
+        self.receivers.iter_mut().map(|receiver| std::iter::from_fn(|| receiver.try_recv().ok()).count()).sum()
+    }
+}
+
+#[cfg(test)]
+impl NativeExecutor {
+    pub(crate) fn test_lanes(count: usize, lane_wait_timeout: Duration) -> (Self, TestLanes) {
+        let (senders, receivers): (Vec<_>, Vec<_>) = (0..count).map(|_| mpsc::channel(EXECUTOR_QUEUE_DEPTH)).unzip();
+        let executor = Self {
+            lane_name: "test".into(),
+            senders: senders.into(),
+            lanes: (0..count).map(|_| Arc::new(LaneStatus::default())).collect::<Vec<_>>().into(),
+            next: Arc::new(AtomicUsize::new(0)),
+            identity: NEXT_EXECUTOR_ID.fetch_add(1, Ordering::Relaxed),
+            lane_wait_timeout,
+            server_memory_limit_bytes: None,
+            result_limit_bytes: None,
+            streaming: false,
+            thread_budget: Arc::default(),
+            agent_gate: Arc::new(AgentLaneGate::for_lanes(count)),
+            dns_refresher: None,
+        };
+        (executor, TestLanes { receivers })
+    }
 }
 
 #[cfg(test)]
@@ -1646,6 +1871,7 @@ mod tests {
                 sender
             })
             .collect::<Vec<_>>();
+        let lane_count = senders.len();
         NativeExecutor {
             lane_name: "test".into(),
             senders: senders.into(),
@@ -1657,6 +1883,7 @@ mod tests {
             result_limit_bytes: None,
             streaming: false,
             thread_budget: Arc::default(),
+            agent_gate: Arc::new(AgentLaneGate::for_lanes(lane_count)),
             dns_refresher: None,
         }
     }
@@ -1681,6 +1908,119 @@ mod tests {
         assert_eq!(executor.status().queued, 0);
         assert_eq!(executor.status().lane_wait_timeouts, 1);
         assert_eq!(executor.status().lane_wait_ms, 0);
+    }
+
+    #[test]
+    fn agent_lane_limit_reserves_one_lane() {
+        assert_eq!((agent_lane_limit(0), agent_lane_limit(1)), (1, 1), "a one-lane executor cannot reserve");
+        assert_eq!(agent_lane_limit(2), 1, "query[T] large pool: one of two lanes for agents");
+        assert_eq!(agent_lane_limit(6), 5, "query[T] small pool: five of six lanes for agents");
+    }
+
+    /// NAN-4747: an agent statement's wait for an agent slot is lane wait
+    /// (`lane_wait_ms`), and one that finds no slot in time is a lane wait
+    /// timeout (`lane_wait_timeouts`), on the executor and its timing line.
+    #[tokio::test]
+    async fn agent_slot_wait_and_timeout_count_as_lane_wait() {
+        let (executor, mut lanes) = NativeExecutor::test_lanes(2, Duration::from_millis(60));
+        let held = executor.agent_gate.slots.clone().try_acquire_owned().unwrap();
+        let shed = crate::query_timing::measure("agent-wait", async {
+            let result = executor.execute_sql("SELECT 1".into(), vec![]).await;
+            let waited = crate::query_timing::current().map(|p| p.lock().unwrap().lane_wait_ms);
+            result.map(|_| ()).map_err(|error| (error, waited))
+        })
+        .await;
+        let Err((ExecutorError::LaneWaitTimeout, Some(waited))) = shed else { panic!("{shed:?}") };
+        assert!(waited >= 50.0, "timing line lane_wait_ms {waited}");
+        assert_eq!(lanes.jobs(), 0, "a shed agent reaches no lane");
+        let status = executor.status();
+        assert_eq!(status.lane_wait_timeouts, 1);
+        assert!(status.lane_wait_ms >= 50, "{status:?}");
+        assert_eq!(executor.agent_slots(), (1, 1), "nothing leaked beyond the held slot");
+        drop(held);
+        assert_eq!(executor.agent_slots(), (0, 1));
+    }
+
+    /// NAN-4742: 16 concurrent agent statements on a 6-lane executor hold at
+    /// most 5 lanes; an analyst statement started beside them is sent to the
+    /// sixth lane at once, and the agents waiting for a slot run as soon as
+    /// a lane finishes an agent job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sixteen_agent_statements_leave_an_analyst_a_free_lane() {
+        let lanes = (0..6).map(|_| Arc::new(LaneStatus::default())).collect::<Vec<_>>();
+        let mut executor = scheduler(lanes.clone());
+        let mut receivers = Vec::new();
+        let mut senders = Vec::new();
+        for _ in 0..6 {
+            let (sender, receiver) = mpsc::channel(EXECUTOR_QUEUE_DEPTH);
+            senders.push(sender);
+            receivers.push(receiver);
+        }
+        executor.senders = senders.into();
+        executor.lane_wait_timeout = Duration::from_secs(10);
+        assert_eq!(executor.agent_slots(), (0, 5));
+
+        let agents = (0..16)
+            .map(|n| {
+                let executor = executor.clone();
+                tokio::spawn(async move {
+                    crate::query_timing::measure(&format!("agent-{n}"), executor.execute_sql("SELECT 1".into(), vec![])).await
+                })
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..500 {
+            if executor.agent_slots().0 == 5 && executor.status().queued == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(executor.agent_slots(), (5, 5), "agents hold one lane fewer than there are");
+        assert_eq!(executor.status().queued, 5, "the other 11 agent statements wait for a slot, not on a lane");
+        let free = (0..6).filter(|lane| lanes[*lane].queued.load(Ordering::Relaxed) == 0).collect::<Vec<_>>();
+        assert_eq!(free.len(), 1, "one lane carries no agent work");
+
+        let analyst_executor = executor.clone();
+        let started = Instant::now();
+        let analyst = tokio::spawn(async move {
+            crate::query_timing::measure("user-a", analyst_executor.execute_sql("SELECT 1".into(), vec![])).await
+        });
+        let Command::Query(job) = tokio::time::timeout(Duration::from_secs(1), receivers[free[0]].recv())
+            .await
+            .expect("the analyst statement reaches the free lane at once")
+            .unwrap()
+        else {
+            panic!("expected a query")
+        };
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(job.request_id, "user-a");
+        assert_eq!(job.priority, crate::thread_budget::Priority::Interactive);
+        drop(job);
+        let _ = analyst.await;
+
+        // Lanes finishing agent jobs admit the waiting agents: all 16 reach a
+        // lane, never more than five at once.
+        let mut delivered = 0;
+        while delivered < 16 {
+            let mut progressed = false;
+            for (lane, receiver) in receivers.iter_mut().enumerate() {
+                while let Ok(Command::Query(job)) = receiver.try_recv() {
+                    assert_eq!(job.priority, crate::thread_budget::Priority::Agent, "lane {lane}");
+                    assert!(executor.agent_slots().0 <= 5);
+                    delivered += 1;
+                    progressed = true;
+                    drop(job);
+                }
+            }
+            if !progressed {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "agents stalled at {delivered}");
+        }
+        for agent in agents {
+            let _ = agent.await.unwrap();
+        }
+        assert_eq!(executor.agent_slots(), (0, 5));
     }
 
     #[tokio::test]
@@ -1791,7 +2131,7 @@ mod tests {
             Some(Instant::now() - Duration::from_secs(1));
         lanes[2].queued.store(2, Ordering::Relaxed);
 
-        assert_eq!(scheduler(lanes).least_loaded_lane(), 1);
+        assert_eq!(scheduler(lanes).least_loaded_lane(crate::thread_budget::Priority::Interactive), 1);
     }
 
     #[test]
@@ -1878,14 +2218,37 @@ mod tests {
     }
 
     #[test]
+    fn analysts_prefer_an_equally_loaded_lane_without_agent_work() {
+        use crate::thread_budget::Priority;
+        let lanes = (0..3).map(|_| Arc::new(LaneStatus::default())).collect::<Vec<_>>();
+        // Every lane runs one statement; lanes 0 and 1 carry agent work and
+        // lane 0's statement is the freshest, so load and age alone pick it.
+        for (lane, age) in lanes.iter().zip([1, 5, 9]) {
+            *lane.started.lock().unwrap() = Some(Instant::now() - Duration::from_secs(age));
+        }
+        let gate = AgentLaneGate::for_lanes(3);
+        let permit = |gate: &AgentLaneGate| gate.slots.clone().try_acquire_owned().unwrap();
+        let first = AgentSlot::on_lane(permit(&gate), &lanes[0]);
+        let second = AgentSlot::on_lane(permit(&gate), &lanes[1]);
+        let executor = scheduler(lanes.clone());
+        assert_eq!(executor.least_loaded_lane(Priority::Interactive), 2, "the analyst skips agent lanes of equal load");
+        assert_eq!(executor.least_loaded_lane(Priority::Agent), 0, "agents keep the plain order");
+        lanes[2].queued.store(1, Ordering::Relaxed);
+        assert_eq!(executor.least_loaded_lane(Priority::Interactive), 0, "load still comes first");
+        drop((first, second));
+        assert_eq!(lanes.iter().map(|lane| lane.agents.load(Ordering::Relaxed)).sum::<usize>(), 0);
+        assert_eq!(gate.held(), 0, "dropping the slot gives the permit back");
+    }
+
+    #[test]
     fn least_loaded_lane_keeps_round_robin_tie_breaking() {
         let lanes = (0..3)
             .map(|_| Arc::new(LaneStatus::default()))
             .collect::<Vec<_>>();
         let scheduler = scheduler(lanes);
 
-        assert_eq!(scheduler.least_loaded_lane(), 0);
-        assert_eq!(scheduler.least_loaded_lane(), 1);
-        assert_eq!(scheduler.least_loaded_lane(), 2);
+        assert_eq!(scheduler.least_loaded_lane(crate::thread_budget::Priority::Interactive), 0);
+        assert_eq!(scheduler.least_loaded_lane(crate::thread_budget::Priority::Interactive), 1);
+        assert_eq!(scheduler.least_loaded_lane(crate::thread_budget::Priority::Interactive), 2);
     }
 }

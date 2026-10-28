@@ -33,12 +33,67 @@ const INTERNAL_COLUMNS: &[&str] = &["_row_id"];
 #[derive(Clone)]
 pub struct PostgresLookupRepository {
     pool: PgPool,
+    /// NAN-4712: run lookup DDL through the sovereign SECURITY DEFINER
+    /// functions (`scripts/sovereign/sql/single-host-grants.sql`) because the
+    /// runtime role is DML-only there. Defaults to the process's sovereign
+    /// mode; every other deployment keeps direct DDL.
+    definer_ddl: bool,
+}
+
+/// Whether this process is a sovereign runtime. Invalid facts count as
+/// sovereign (fail closed), as in `sovereign_runtime::airgap_equivalent`.
+fn sovereign_process() -> bool {
+    !matches!(crate::sovereign_runtime::process_runtime(), Ok(None))
+}
+
+/// The table-name grammar the definer functions enforce (they re-check it):
+/// `^lookup_[a-z0-9_]{1,48}$`.
+fn is_definer_lookup_name(name: &str) -> bool {
+    name.strip_prefix(LOOKUP_TABLE_PREFIX).is_some_and(|rest| {
+        (1..=48).contains(&rest.len())
+            && rest.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    })
 }
 
 impl PostgresLookupRepository {
     /// Create a new PostgreSQL-backed lookup repository
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            definer_ddl: sovereign_process(),
+        }
+    }
+
+    /// Override the DDL path (injected in tests; production derives it from
+    /// the process's sovereign facts).
+    pub fn with_definer_ddl(mut self, definer_ddl: bool) -> Self {
+        self.definer_ddl = definer_ddl;
+        self
+    }
+
+    fn definer_name(name: &str) -> Result<&str, LookupRepositoryError> {
+        if is_definer_lookup_name(name) {
+            Ok(name)
+        } else {
+            Err(LookupRepositoryError::InvalidTableName(name.to_string()))
+        }
+    }
+
+    /// The definer function's column contract: `[{name, type, nullable}]`
+    /// with `type` one of the Postgres types lookup columns map to.
+    fn definer_columns(columns: &[LookupColumn]) -> serde_json::Value {
+        serde_json::Value::Array(
+            columns
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "name": c.name,
+                        "type": c.data_type.to_postgres_type(),
+                        "nullable": c.nullable,
+                    })
+                })
+                .collect(),
+        )
     }
 
     // ========================================================================
@@ -319,6 +374,16 @@ impl PostgresLookupRepository {
             }
         }
 
+        if self.definer_ddl {
+            sqlx::query("SELECT public.nano_lookup_create_table($1, $2, $3)")
+                .bind(Self::definer_name(table_name)?)
+                .bind(Self::definer_columns(columns))
+                .bind(primary_key)
+                .execute(&self.pool)
+                .await?;
+            return Ok(());
+        }
+
         // Build CREATE TABLE statement (prepend hidden _row_id for stable row identification)
         let mut column_defs = vec!["\"_row_id\" BIGSERIAL PRIMARY KEY".to_string()];
         for col in columns {
@@ -361,6 +426,14 @@ impl PostgresLookupRepository {
             ));
         }
 
+        if self.definer_ddl {
+            sqlx::query("SELECT public.nano_lookup_drop_table($1)")
+                .bind(Self::definer_name(table_name)?)
+                .execute(&self.pool)
+                .await?;
+            return Ok(());
+        }
+
         let drop_sql = format!("DROP TABLE IF EXISTS \"{}\" CASCADE", table_name);
         sqlx::query(&drop_sql).execute(&self.pool).await?;
 
@@ -377,6 +450,14 @@ impl PostgresLookupRepository {
             return Err(LookupRepositoryError::InvalidTableName(
                 table_name.to_string(),
             ));
+        }
+
+        if self.definer_ddl {
+            sqlx::query("SELECT public.nano_lookup_truncate_table($1)")
+                .bind(Self::definer_name(table_name)?)
+                .execute(&self.pool)
+                .await?;
+            return Ok(());
         }
 
         let truncate_sql = format!("TRUNCATE TABLE \"{}\"", table_name);
@@ -418,19 +499,27 @@ impl PostgresLookupRepository {
 
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query(&format!(
-            "DROP TABLE IF EXISTS \"{}\" CASCADE",
-            old_physical
-        ))
-        .execute(&mut *tx)
-        .await?;
+        if self.definer_ddl {
+            sqlx::query("SELECT public.nano_lookup_swap_table($1, $2)")
+                .bind(Self::definer_name(old_physical)?)
+                .bind(Self::definer_name(staging_physical)?)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query(&format!(
+                "DROP TABLE IF EXISTS \"{}\" CASCADE",
+                old_physical
+            ))
+            .execute(&mut *tx)
+            .await?;
 
-        sqlx::query(&format!(
-            "ALTER TABLE \"{}\" RENAME TO \"{}\"",
-            staging_physical, old_physical
-        ))
-        .execute(&mut *tx)
-        .await?;
+            sqlx::query(&format!(
+                "ALTER TABLE \"{}\" RENAME TO \"{}\"",
+                staging_physical, old_physical
+            ))
+            .execute(&mut *tx)
+            .await?;
+        }
 
         sqlx::query(
             r#"
@@ -544,6 +633,13 @@ impl PostgresLookupRepository {
         .fetch_one(&self.pool)
         .await?;
         if already_unique {
+            return Ok(());
+        }
+        if self.definer_ddl {
+            sqlx::query("SELECT public.nano_lookup_ensure_row_id_index($1)")
+                .bind(Self::definer_name(table_name)?)
+                .execute(&self.pool)
+                .await?;
             return Ok(());
         }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1382,9 +1478,16 @@ impl LookupStore for PostgresLookupRepository {
         if deleted == 0 {
             return Err(LookupRepositoryError::TableNotFound(table.name.clone()));
         }
-        sqlx::query(&format!("DROP TABLE IF EXISTS \"{}\" CASCADE", table.table_name))
-            .execute(&mut *tx)
-            .await?;
+        if self.definer_ddl {
+            sqlx::query("SELECT public.nano_lookup_drop_table($1)")
+                .bind(Self::definer_name(&table.table_name)?)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query(&format!("DROP TABLE IF EXISTS \"{}\" CASCADE", table.table_name))
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -1582,6 +1685,83 @@ impl LookupStore for PostgresLookupRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-4712: the client-side mirror of the definer functions' grammar.
+    #[test]
+    fn definer_lookup_name_grammar() {
+        for ok in ["lookup_a", "lookup_bad_ips_2", &format!("lookup_{}", "a".repeat(48))] {
+            assert!(is_definer_lookup_name(ok), "{ok}");
+        }
+        for bad in [
+            "lookup_",
+            "lookup",
+            "users",
+            "public.users",
+            "pg_catalog.pg_class",
+            "lookup_Bad",
+            "lookup_x\"; DROP TABLE users; --",
+            "lookup_x-y",
+            "lookup_\u{e9}",
+            "lookup_a\n",
+            &format!("lookup_{}", "a".repeat(49)),
+        ] {
+            assert!(!is_definer_lookup_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn definer_columns_carry_only_name_type_and_nullability() {
+        let columns = vec![
+            LookupColumn::new("ip", ColumnType::Text, false),
+            LookupColumn::new("score", ColumnType::Float, true),
+        ];
+        assert_eq!(
+            PostgresLookupRepository::definer_columns(&columns),
+            serde_json::json!([
+                {"name": "ip", "type": "TEXT", "nullable": false},
+                {"name": "score", "type": "DOUBLE PRECISION", "nullable": true},
+            ])
+        );
+    }
+
+    /// A name outside the grammar is refused before any database call.
+    #[tokio::test]
+    async fn definer_ddl_refuses_bad_names_before_the_database() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .unwrap();
+        let repo = PostgresLookupRepository::new(pool).with_definer_ddl(true);
+        let columns = vec![LookupColumn::new("ip", ColumnType::Text, false)];
+        let long = format!("lookup_{}", "a".repeat(49));
+        for name in ["lookup_Bad", long.as_str()] {
+            assert!(matches!(
+                repo.create_dynamic_table(name, &columns, None).await,
+                Err(LookupRepositoryError::InvalidTableName(_))
+            ));
+            assert!(matches!(
+                repo.drop_dynamic_table(name).await,
+                Err(LookupRepositoryError::InvalidTableName(_))
+            ));
+            assert!(matches!(
+                repo.truncate_dynamic_table(name).await,
+                Err(LookupRepositoryError::InvalidTableName(_))
+            ));
+        }
+        // A valid name reaches the (unreachable) database.
+        assert!(matches!(
+            repo.create_dynamic_table("lookup_ok", &columns, None).await,
+            Err(LookupRepositoryError::DatabaseError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_sovereign_process_keeps_direct_ddl() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .unwrap();
+        assert!(!PostgresLookupRepository::new(pool).definer_ddl);
+    }
 
     #[test]
     fn test_is_valid_identifier() {

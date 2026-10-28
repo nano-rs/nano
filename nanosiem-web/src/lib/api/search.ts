@@ -6,6 +6,7 @@
  */
 
 import { abortableDelay } from '../abortable-delay';
+import { normalizeErrorBody, safeErrorMessage } from './http-error';
 import { authenticatedFetch } from '../authenticated-fetch';
 import { SessionExpiredError } from '../request-credentials';
 
@@ -614,12 +615,11 @@ export class SearchApi {
       }
       if (!response.ok) {
         const errorText = await response.text();
-        let errorMsg = errorText;
+        const errorMsg = normalizeErrorBody(response.status, errorText, response.headers).message || 'Search failed. Retry in a moment.';
         let errorCode = 'HTTP_ERROR';
         let coldScan: Partial<import('./types').SearchStreamError> = {};
         try {
           const errorJson = JSON.parse(errorText);
-          errorMsg = errorJson?.error?.message || errorJson?.message || errorText;
           // NAN-3644: the reader's cold-read ceiling; COLD_BUDGET_EXCEEDED is
           // the retired per-query refusal a mid-roll service may still send.
           if (errorJson?.error?.code === 'COLD_SCAN_TOO_LARGE' || errorJson?.error?.code === 'COLD_BUDGET_EXCEEDED') {
@@ -627,7 +627,10 @@ export class SearchApi {
             const { reason, needed_bytes, ceiling_bytes, background_ceiling_bytes, budget_bytes, retryable } = errorJson.error;
             coldScan = { reason, needed_bytes, ceiling_bytes, background_ceiling_bytes, budget_bytes, retryable };
           }
-        } catch { /* use raw text */ }
+        } catch {
+          // NAN-4753: never surface an edge/proxy HTML page.
+          // The normalized message above already covers malformed JSON.
+        }
         callbacks.onError?.({ ...coldScan, code: errorCode, message: errorMsg });
         return;
       }
@@ -720,7 +723,10 @@ export class SearchApi {
                   callbacks.onCompleted?.(parsed.data ?? parsed);
                   return;
                 case 'error':
-                  callbacks.onError?.(parsed.data ?? parsed);
+                  {
+                    const error = parsed.data ?? parsed;
+                    callbacks.onError?.({ ...error, message: safeErrorMessage(error.message, 'Search failed. Retry in a moment.') });
+                  }
                   return;
                 case 'done':
                   // NAN-3244: a follow stream that ends without `completed`
@@ -744,7 +750,7 @@ export class SearchApi {
       }
     }).catch((error) => {
       if (!(error instanceof SessionExpiredError) && error.name !== 'AbortError' && browserTenantRuntime.isCurrent(capturedRuntime)) {
-        callbacks.onError?.({ code: 'NETWORK_ERROR', message: error.message });
+        callbacks.onError?.({ code: 'NETWORK_ERROR', message: safeErrorMessage(error.message, 'Search failed. Retry in a moment.') });
       }
     });
 

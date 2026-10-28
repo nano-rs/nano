@@ -1355,11 +1355,18 @@ mod tests {
                 .unwrap_or_else(|e| panic!("generate {q}: {e}"))
         };
         for (alias, target) in UDM_ACCEPTED_ALIASES {
+            // NAN-4286: a comparison against the time column must carry a
+            // time literal, so the time alias is exercised with RFC3339 values.
+            let (x, y) = if *target == "timestamp" {
+                ("2024-01-01T06:00:00Z", "2024-01-01T07:00:00Z")
+            } else {
+                ("x", "y")
+            };
             for (alias_q, canonical_q) in [
-                (format!(r#"{alias}="x""#), format!(r#"{target}="x""#)),
+                (format!(r#"{alias}="{x}""#), format!(r#"{target}="{x}""#)),
                 (
-                    format!(r#"{alias} IN ("x", "y")"#),
-                    format!(r#"{target} IN ("x", "y")"#),
+                    format!(r#"{alias} IN ("{x}", "{y}")"#),
+                    format!(r#"{target} IN ("{x}", "{y}")"#),
                 ),
                 (
                     format!("* | stats count() by {alias}"),
@@ -1374,6 +1381,19 @@ mod tests {
                 );
             }
         }
+        // The alias is refused exactly like its canonical column: a non-time
+        // literal on `_time` gets the same NAN-4286 error as on `timestamp`.
+        let refusal = |q: &str| -> String {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            generator
+                .generate(&query, &time_range)
+                .expect_err("a non-time literal on the time column must be refused")
+                .to_string()
+        };
+        assert_eq!(
+            refusal(r#"_time="x""#).replace("_time", "timestamp"),
+            refusal(r#"timestamp="x""#),
+        );
     }
 
     #[test]

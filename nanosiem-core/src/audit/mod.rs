@@ -24,6 +24,7 @@
 
 pub mod actions;
 pub mod trusted_local_delivery;
+pub mod sovereign_retention;
 mod context;
 pub mod ocsf_mapping;
 mod emitter;

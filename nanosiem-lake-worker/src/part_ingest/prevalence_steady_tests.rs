@@ -439,7 +439,8 @@ async fn state_sized_disk_cache_cuts_r2_gets_per_stamped_batch() {
             object_cache_bytes(Some(state_bytes), cap),
             if cap == u64::MAX { (2 * state_bytes).max(OBJECT_CACHE_FLOOR_BYTES) } else { old_cap }
         );
-        let state = IngestPrevalence::open_sized(TENANT, &temp.path().join(name), None, Some(store.clone()), cap)
+        let state = IngestPrevalence::open_sized(TENANT, &temp.path().join(name), None, Some(store.clone()), cap,
+            LocalStateSizing::FLOOR)
             .await
             .unwrap();
         // The open measured this tenant's own SSTs (one LIST) and sized the

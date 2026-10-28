@@ -262,6 +262,11 @@ pub struct PassReport {
     pub index_head_seq: Option<u64>,
     /// `appended_at_ms` of the newest entry this pass pushed, if any.
     pub index_head_appended_ms: Option<i64>,
+    /// NAN-4728: a trusted-local pass filled its request bound, deleted at
+    /// least one file, and stopped with more eligible files listed. The
+    /// ingest scheduler runs the next bounded pass after the short catch-up
+    /// interval instead of the 10-min pass interval. Hosted passes never set it.
+    pub more_eligible: bool,
 }
 
 /// What a caller keeps for one tenant across passes.

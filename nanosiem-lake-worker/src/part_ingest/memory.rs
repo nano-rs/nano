@@ -68,6 +68,105 @@ pub fn admission_fits(working_budget: u64, committed: u64, predicted_heap: f64, 
     predicted_heap * ADMISSION_PEAK_PER_MODELLED_HEAP + predicted_arrow <= room
 }
 
+/// NAN-4749: packs one tick's objects into admission groups that decode one
+/// after another. A group's JSON values live only while it decodes; what it
+/// leaves is its Arrow rows. So a group must fit beside everything already
+/// charged plus the Arrow rows of the groups before it, and the tick is no
+/// longer capped by one group's transient JSON peak (the 1.0.11 bakeoff:
+/// a few thousand rows per tick, tick overhead dominating at 10k eps).
+///
+/// The first group is exactly the single-group bound of before. A further
+/// group only opens while the buffer, with every group's rows, stays within
+/// its byte cap ([`buffer_cap`]) and below the flush row cap: the flush keeps the
+/// size the memory model sized its build for.
+#[derive(Debug, Clone)]
+pub struct AdmissionGroups {
+    working_budget: u64,
+    committed: u64,
+    buffer_bytes: u64,
+    buffer_rows: u64,
+    /// Rows offered this tick (footer counts, before deduplication).
+    rows: u64,
+    /// Arrow rows of the closed groups.
+    closed_arrow: f64,
+    /// The open group's predicted JSON heap and Arrow rows.
+    heap: f64,
+    arrow: f64,
+    groups: usize,
+}
+
+/// What [`AdmissionGroups::offer`] decided for one object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Offer {
+    /// Joins the open group.
+    Joins,
+    /// Starts a new group (the open one closes).
+    NewGroup,
+    /// Does not fit this tick.
+    Refused,
+}
+
+impl AdmissionGroups {
+    /// `committed`: bytes already charged to the working budget (the
+    /// buffer, flights, merges); `buffer_bytes`: the filling buffer's share
+    /// of it; `buffer_rows`: rows already held in the filling buffer.
+    pub fn new(working_budget: u64, committed: u64, buffer_bytes: u64, buffer_rows: u64) -> Self {
+        Self { working_budget, committed, buffer_bytes, buffer_rows, rows: 0, closed_arrow: 0.0, heap: 0.0, arrow: 0.0, groups: 0 }
+    }
+
+    /// Offer the next object (its predicted modelled JSON heap and Arrow rows).
+    /// Preselection does not know footer row counts yet and passes 0;
+    /// admission repacks with the actual counts before decoding anything.
+    pub fn offer(&mut self, heap: f64, arrow: f64, rows: u64) -> Offer {
+        let buffered = self.buffer_bytes as f64 + self.closed_arrow + self.arrow + arrow;
+        let buffered_rows = self.buffer_rows.saturating_add(self.rows).saturating_add(rows);
+        let within_caps = buffered <= buffer_cap(self.working_budget) as f64
+            && buffered_rows <= crate::parts::levels::FLUSH_MAX_ROWS as u64;
+        // Preserve the old single-group admission bound. Extra groups
+        // must obey the buffer caps on EVERY offer, including joins: the
+        // next flush reserves its build beside a buffer of this size.
+        if self.groups > 1 && !within_caps {
+            return Offer::Refused;
+        }
+        let charged = self.committed.saturating_add(self.closed_arrow as u64);
+        if admission_fits(self.working_budget, charged, self.heap + heap, self.arrow + arrow) {
+            self.join(heap, arrow, rows);
+            return Offer::Joins;
+        }
+        let closed = self.closed_arrow + self.arrow;
+        if self.groups > 0 && within_caps
+            && self.buffer_rows.saturating_add(self.rows) < crate::parts::levels::FLUSH_MAX_ROWS as u64
+            && admission_fits(self.working_budget, self.committed.saturating_add(closed as u64), heap, arrow)
+        {
+            self.closed_arrow = closed;
+            self.heap = 0.0;
+            self.arrow = 0.0;
+            self.groups += 1;
+            self.join(heap, arrow, rows);
+            return Offer::NewGroup;
+        }
+        Offer::Refused
+    }
+
+    /// Add an object to the open group without the bound (the first object
+    /// from idle always makes progress).
+    pub fn force(&mut self, heap: f64, arrow: f64, rows: u64) {
+        self.join(heap, arrow, rows);
+    }
+
+    fn join(&mut self, heap: f64, arrow: f64, rows: u64) {
+        self.groups = self.groups.max(1);
+        self.heap += heap;
+        self.arrow += arrow;
+        self.rows = self.rows.saturating_add(rows);
+    }
+
+    /// Groups opened so far.
+    pub fn groups(&self) -> usize {
+        self.groups
+    }
+}
+
 /// Fewest rows in one admission slice (NAN-4553): below this the per-slice
 /// overhead (a Parquet file, one admission pass) outweighs the memory saved.
 pub const MIN_ADMISSION_SLICE_ROWS: u64 = 256;
@@ -167,6 +266,77 @@ mod tests {
         assert_eq!(admission_slice_rows(budget, budget, heap, arrow, 10_000), MIN_ADMISSION_SLICE_ROWS);
         // A tiny object is never cut below its own size.
         assert_eq!(admission_slice_rows(budget, budget, heap, arrow, 10), 10);
+    }
+
+    /// NAN-4749: a tick packs objects into groups decoded one after
+    /// another; each group fits beside the Arrow rows of the ones before it,
+    /// the first group is the old single-group bound, and no group opens
+    /// past the buffer's byte or row cap.
+    #[test]
+    fn a_tick_admits_several_groups_within_the_budget() {
+        let budget = 2048 * MIB;
+        // Objects of 10 MiB decoded: 160 MiB heap (240 MiB peak) + 10 MiB rows.
+        let (heap, arrow) = (160.0 * MIB as f64, 10.0 * MIB as f64);
+        let mut groups = AdmissionGroups::new(budget, 0, 0, 0);
+        let mut offers = Vec::new();
+        for _ in 0..30 {
+            offers.push(groups.offer(heap, arrow, 0));
+        }
+        // One group alone: 8 objects (8 x 250 MiB <= 2048 MiB), as before.
+        let first = offers.iter().take_while(|o| **o == Offer::Joins).count();
+        assert_eq!(first, 8);
+        let mut single = 0.0;
+        while admission_fits(budget, 0, (single + 1.0) * heap, (single + 1.0) * arrow) {
+            single += 1.0;
+        }
+        assert_eq!(first as f64, single, "the first group is the single-group bound");
+        // Further groups: every object admitted, each group fits beside the
+        // rows of the groups before it, and the buffer cap (409.6 MiB) is
+        // never passed by the rows.
+        assert!(groups.groups() > 1);
+        let admitted = offers.iter().filter(|o| **o != Offer::Refused).count();
+        assert_eq!(admitted, 30, "{offers:?}");
+        assert!(30.0 * arrow <= buffer_cap(budget) as f64);
+        // The buffer cap bounds the rows of a tick's further groups.
+        let mut capped = AdmissionGroups::new(budget, 400 * MIB, 400 * MIB, 0);
+        let offers = (0..30).map(|_| capped.offer(heap, arrow, 0)).collect::<Vec<_>>();
+        assert!(!offers.contains(&Offer::NewGroup), "{offers:?}");
+        // A buffer at its row cap takes one group only.
+        let mut full = AdmissionGroups::new(budget, 0, 0, crate::parts::levels::FLUSH_MAX_ROWS as u64);
+        let offers = (0..30).map(|_| full.offer(heap, arrow, 0)).collect::<Vec<_>>();
+        assert_eq!(offers.iter().filter(|o| **o == Offer::Joins).count(), 8);
+        assert!(!offers.contains(&Offer::NewGroup));
+        // Nothing fits: refused, never a new group from nothing.
+        let mut none = AdmissionGroups::new(64 * MIB, 64 * MIB, 0, 0);
+        assert_eq!(none.offer(heap, arrow, 0), Offer::Refused);
+        none.force(heap, arrow, 0);
+        assert_eq!(none.groups(), 1);
+    }
+
+    #[test]
+    fn later_group_joins_cannot_pass_the_buffer_byte_cap() {
+        let budget = 2048 * MIB;
+        let (heap, arrow) = (160.0 * MIB as f64, 10.0 * MIB as f64);
+        let mut groups = AdmissionGroups::new(budget, 0, 0, 0);
+        let admitted = (0..64).take_while(|_| groups.offer(heap, arrow, 0) != Offer::Refused).count();
+        assert!(groups.groups() > 1);
+        // The original packer admitted 42 objects: its final joins took
+        // the buffer past the 409.6 MiB cap after opening the last group.
+        assert_eq!(admitted, 40);
+        assert!(groups.closed_arrow + groups.arrow <= buffer_cap(budget) as f64);
+    }
+
+    #[test]
+    fn later_groups_charge_this_ticks_rows_beside_the_existing_buffer() {
+        let budget = 2048 * MIB;
+        let (heap, arrow) = (160.0 * MIB as f64, 10.0 * MIB as f64);
+        for buffered_rows in [0, 10_000] {
+            let mut groups = AdmissionGroups::new(budget, 0, 0, buffered_rows);
+            let admitted = (0..64).take_while(|_| groups.offer(heap, arrow, 5_000) != Offer::Refused).count();
+            assert!(groups.groups() > 1);
+            assert_eq!(admitted as u64, (crate::parts::levels::FLUSH_MAX_ROWS as u64 - buffered_rows) / 5_000);
+            assert!(buffered_rows + groups.rows <= crate::parts::levels::FLUSH_MAX_ROWS as u64);
+        }
     }
 
     #[test]

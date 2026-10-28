@@ -32,6 +32,13 @@
 //!   instead of answering MEMORY_LIMIT; if even that refuses, the error
 //!   names the cap ([`ExecutorError::MemoryExhausted`]).
 //!
+//! - NAN-4747: an agent statement (`x-nano-query-class: agent`) never
+//!   takes the whole large lane: one that would escalate to
+//!   [`LaneClass::LargeFull`] or [`LaneClass::Degraded`] is refused as lanes
+//!   busy ([`admit_large`]) instead of holding every large permit while
+//!   analysts queue behind it. Agents have their own query lane; the cell
+//!   only gives them a lowest-priority guard. Other classes are unchanged.
+//!
 //! - NAN-4174: threads come from the process thread budget
 //!   ([`crate::thread_budget`]) when the lanes have one: the fixed
 //!   [`INTERACTIVE_MAX_THREADS`] cap then gives way to the pool (a lone
@@ -144,6 +151,10 @@ pub struct LargeLane {
     bytes: u64,
     width: u32,
     permits: Arc<tokio::sync::Semaphore>,
+    /// NAN-4742: agent statements holding (or waiting for) large permits, at
+    /// most [`crate::executor::agent_lane_limit`] of the width. Taken before
+    /// any permit, so a queued agent never sits on a permit an analyst needs.
+    agent_permits: Arc<tokio::sync::Semaphore>,
     /// `false`: `NANO_LAKE_LANE_ROUTING_V2=0`, the NAN-3077 router.
     routing_v2: bool,
 }
@@ -159,7 +170,12 @@ impl LargeLane {
     /// statement at a time with all of `bytes`, whatever the executor's width.
     pub fn with_routing(executor: NativeExecutor, bytes: u64, routing_v2: bool) -> Self {
         let width = if routing_v2 { executor.connection_count().clamp(1, MAX_LARGE_LANES) as u32 } else { 1 };
-        Self { executor, bytes, width, permits: Arc::new(tokio::sync::Semaphore::new(width as usize)), routing_v2 }
+        Self {
+            executor, bytes, width,
+            permits: Arc::new(tokio::sync::Semaphore::new(width as usize)),
+            agent_permits: Arc::new(tokio::sync::Semaphore::new(crate::executor::agent_lane_limit(width as usize))),
+            routing_v2,
+        }
     }
 
     /// Whether this lane routes the NAN-3393 way (see [`lane_routing_v2_enabled`]).
@@ -195,16 +211,23 @@ impl LargeLane {
     }
 
     async fn run(&self, plan: NativeQueryPlan, class: LaneClass) -> Result<NativeQueryOutput, ExecutorError> {
-        let permits = if matches!(class, LaneClass::LargeFull | LaneClass::Degraded) { self.width } else { 1 };
         let started = Instant::now();
-        let permit = match tokio::time::timeout(self.executor.lane_wait_timeout(), self.permits.clone().acquire_many_owned(permits)).await {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return Err(ExecutorError::Unavailable),
-            Err(_) => {
+        let deadline = started + self.executor.lane_wait_timeout();
+        let lane = LargeGate { permits: &self.permits, agent_permits: &self.agent_permits, width: self.width, agent_gate: self.executor.agent_gate() };
+        let permit = match admit_large(&lane, class, crate::thread_budget::Priority::current(), deadline).await {
+            Ok(permit) => permit,
+            Err(Refused::Escalation) => {
+                crate::query_timing::record(|p| p.outcome = Some("agent_escalation_refused"));
+                tracing::warn!(outcome = "agent_escalation_refused", class = class.label(),
+                    "agent statement needs the whole large lane; shedding it as lanes busy");
+                return Err(ExecutorError::LaneWaitTimeout);
+            }
+            Err(Refused::Executor(ExecutorError::LaneWaitTimeout)) => {
                 crate::query_timing::record(|p| p.outcome = Some("lane_wait_timeout"));
                 tracing::warn!(outcome = "lane_wait_timeout", class = class.label(), "large lane permit wait timed out");
                 return Err(ExecutorError::LaneWaitTimeout);
             }
+            Err(Refused::Executor(error)) => return Err(error),
         };
         let gate_wait = started.elapsed();
         crate::query_timing::record(|p| p.lane_wait_ms += gate_wait.as_secs_f64() * 1000.0);
@@ -216,6 +239,75 @@ impl LargeLane {
         drop(permit);
         output
     }
+}
+
+/// What a statement holds on the large lane while it runs: its permits and,
+/// for an agent statement, its agent slot (NAN-4742).
+#[derive(Debug)]
+pub(crate) struct LargeAdmission {
+    _agent: Option<tokio::sync::OwnedSemaphorePermit>,
+    _permits: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// The large lane's admission state ([`admit_large`]).
+pub(crate) struct LargeGate<'a> {
+    pub permits: &'a Arc<tokio::sync::Semaphore>,
+    pub agent_permits: &'a Arc<tokio::sync::Semaphore>,
+    pub width: u32,
+    /// The large executor's agent gate: its wait and refusal counters.
+    pub agent_gate: &'a crate::executor::AgentLaneGate,
+}
+
+/// Why [`admit_large`] admitted nothing.
+#[derive(Debug)]
+pub(crate) enum Refused {
+    /// NAN-4747: an agent statement asked for the whole large lane.
+    Escalation,
+    Executor(ExecutorError),
+}
+
+/// Whether `class` takes every permit of the large lane (all of its memory).
+fn whole_lane(class: LaneClass) -> bool {
+    matches!(class, LaneClass::LargeFull | LaneClass::Degraded)
+}
+
+/// NAN-4742: large permits for a `class` statement of `priority` by
+/// `deadline` (one, or every permit for the whole lane). An agent statement
+/// first takes an agent slot, so agents waiting for the lane hold no permit
+/// and at least one permit of a two-wide lane is never held by agent work.
+///
+/// NAN-4747: an agent statement never takes the whole lane. One that asks
+/// for [`LaneClass::LargeFull`] (it outgrew half the lane's memory, or the
+/// memo says it will) or [`LaneClass::Degraded`] is refused at once, holding
+/// nothing; the caller sheds it as lanes busy. On a one-wide lane `Large`
+/// already is the whole lane: agents keep it there (NAN-4742's one-lane
+/// rule, nothing to reserve) and are refused only the degraded rung.
+pub(crate) async fn admit_large(
+    lane: &LargeGate<'_>,
+    class: LaneClass,
+    priority: crate::thread_budget::Priority,
+    deadline: Instant,
+) -> Result<LargeAdmission, Refused> {
+    let wait = |result: Result<Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>, tokio::time::error::Elapsed>| match result {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(Refused::Executor(ExecutorError::Unavailable)),
+        Err(_) => Err(Refused::Executor(ExecutorError::LaneWaitTimeout)),
+    };
+    let agent = if priority == crate::thread_budget::Priority::Agent {
+        if whole_lane(class) {
+            lane.agent_gate.record_escalation_refused();
+            return Err(Refused::Escalation);
+        }
+        let started = Instant::now();
+        let slot = wait(tokio::time::timeout_at(deadline.into(), lane.agent_permits.clone().acquire_owned()).await);
+        lane.agent_gate.record_wait(started.elapsed(), matches!(slot, Err(Refused::Executor(ExecutorError::LaneWaitTimeout))));
+        Some(slot?)
+    } else {
+        None
+    };
+    let count = if whole_lane(class) { lane.width } else { 1 };
+    let permits = wait(tokio::time::timeout_at(deadline.into(), lane.permits.clone().acquire_many_owned(count)).await)?;
+    Ok(LargeAdmission { _agent: agent, _permits: permits })
 }
 
 /// The class above `class` on a large lane `width` wide, if any. NAN-3650:
@@ -593,6 +685,118 @@ mod tests {
     use super::*;
     use super::super::memory_budget::GIB;
 
+    /// NAN-4742: on the two-wide large lane, a second agent statement waits
+    /// for the agent slot holding no permit, so an analyst's large statement
+    /// takes the other permit at once; the agent's permit and slot come back
+    /// when it finishes.
+    #[tokio::test]
+    async fn queued_agent_never_holds_the_analysts_large_permit() {
+        use crate::thread_budget::Priority;
+        use std::time::Duration;
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let agents = Arc::new(tokio::sync::Semaphore::new(crate::executor::agent_lane_limit(2)));
+        let gate = crate::executor::AgentLaneGate::for_lanes(2);
+        let lane = LargeGate { permits: &permits, agent_permits: &agents, width: 2, agent_gate: &gate };
+        let soon = || Instant::now() + Duration::from_secs(5);
+        let first = admit_large(&lane, LaneClass::Large, Priority::Agent, soon()).await.unwrap();
+        let (second, analyst) = tokio::join!(
+            admit_large(&lane, LaneClass::Large, Priority::Agent, Instant::now() + Duration::from_secs(5)),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(permits.available_permits(), 1, "the waiting agent holds no large permit");
+                let analyst = tokio::time::timeout(Duration::from_millis(100), admit_large(&lane, LaneClass::Large, Priority::Interactive, soon()))
+                    .await
+                    .expect("the analyst is not queued behind agents")
+                    .unwrap();
+                drop(analyst);
+                drop(first);
+            },
+        );
+        let () = analyst;
+        let second = second.unwrap();
+        assert_eq!((permits.available_permits(), agents.available_permits()), (1, 0));
+        drop(second);
+        assert_eq!((permits.available_permits(), agents.available_permits()), (2, 1), "nothing leaks");
+        // An agent that finds no slot by its deadline is shed as a lane wait
+        // ("all query lanes are busy"), holding nothing, and counted.
+        let held = admit_large(&lane, LaneClass::Large, Priority::Agent, soon()).await.unwrap();
+        let shed = admit_large(&lane, LaneClass::Large, Priority::Agent, Instant::now() + Duration::from_millis(20)).await;
+        assert!(matches!(shed, Err(Refused::Executor(ExecutorError::LaneWaitTimeout))), "{shed:?}");
+        assert_eq!(permits.available_permits(), 1);
+        drop(held);
+    }
+
+    /// NAN-4747: on the two-wide large lane an agent statement asking for the
+    /// whole lane (outgrew half, or the degraded rung) is refused at once,
+    /// holding nothing and counted, while an analyst's whole-lane statement
+    /// is admitted with every permit. Large (half the lane) stays open to
+    /// agents; a one-wide lane refuses agents only the degraded rung.
+    #[tokio::test]
+    async fn agent_never_takes_the_whole_large_lane() {
+        use crate::thread_budget::Priority;
+        use std::time::Duration;
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let agents = Arc::new(tokio::sync::Semaphore::new(crate::executor::agent_lane_limit(2)));
+        let gate = crate::executor::AgentLaneGate::for_lanes(2);
+        let lane = LargeGate { permits: &permits, agent_permits: &agents, width: 2, agent_gate: &gate };
+        let soon = || Instant::now() + Duration::from_secs(5);
+        for class in [LaneClass::LargeFull, LaneClass::Degraded] {
+            let refused = admit_large(&lane, class, Priority::Agent, soon()).await;
+            assert!(matches!(refused, Err(Refused::Escalation)), "{class:?}: {refused:?}");
+            assert_eq!((permits.available_permits(), agents.available_permits()), (2, 1), "{class:?} holds nothing");
+        }
+        for priority in [Priority::Interactive, Priority::Companion, Priority::Background] {
+            let whole = tokio::time::timeout(Duration::from_millis(100), admit_large(&lane, LaneClass::LargeFull, priority, soon()))
+                .await
+                .expect("an analyst's whole-lane statement is admitted at once")
+                .unwrap();
+            assert_eq!(permits.available_permits(), 0, "{priority:?} takes every permit");
+            drop(whole);
+        }
+        let half = admit_large(&lane, LaneClass::Large, Priority::Agent, soon()).await.unwrap();
+        assert_eq!((permits.available_permits(), agents.available_permits()), (1, 0));
+        drop(half);
+
+        let one = Arc::new(tokio::sync::Semaphore::new(1));
+        let one_agent = Arc::new(tokio::sync::Semaphore::new(crate::executor::agent_lane_limit(1)));
+        let narrow = LargeGate { permits: &one, agent_permits: &one_agent, width: 1, agent_gate: &gate };
+        drop(admit_large(&narrow, LaneClass::Large, Priority::Agent, soon()).await.unwrap());
+        assert!(matches!(admit_large(&narrow, LaneClass::Degraded, Priority::Agent, soon()).await, Err(Refused::Escalation)));
+        assert_eq!(one.available_permits(), 1);
+        assert_eq!(gate.escalations_refused(), 3);
+    }
+
+    /// NAN-4747, the production path: an agent statement that would escalate
+    /// to the whole large lane is shed as lanes busy before any lane sees it
+    /// (`PartQueryError::Unavailable` through `map_executor_error`) and
+    /// counted on the large executor; an analyst's escalation is sent to a
+    /// lane.
+    #[tokio::test]
+    async fn agent_escalation_is_shed_before_any_lane_while_an_analyst_runs() {
+        use std::time::Duration;
+        let (executor, mut jobs) = NativeExecutor::test_lanes(2, Duration::from_millis(200));
+        let large = LargeLane::new(executor, 4 * GIB);
+        let statement = || plan("SELECT 1", ReaderShape::default());
+        for class in [LaneClass::LargeFull, LaneClass::Degraded] {
+            let refused = crate::query_timing::measure("agent-escalation", large.run(statement(), class)).await;
+            assert!(matches!(refused, Err(ExecutorError::LaneWaitTimeout)), "{class:?}: {refused:?}");
+            assert!(matches!(
+                super::super::engine::map_executor_error(refused.unwrap_err()),
+                crate::part_query::PartQueryError::Unavailable(_)
+            ));
+            assert_eq!(jobs.jobs(), 0, "{class:?}: never sent to a lane");
+        }
+        assert_eq!(large.executor().status().agent_escalations_refused, 2);
+        // The analyst's whole-lane statement is admitted and sent to a lane
+        // (a test lane that never starts it, so it ends as a lane wait).
+        let analyst = crate::query_timing::measure("analyst-escalation", large.run(statement(), LaneClass::LargeFull)).await;
+        assert!(matches!(analyst, Err(ExecutorError::LaneWaitTimeout)), "{analyst:?}");
+        assert_eq!(jobs.jobs(), 1, "the analyst's statement reached a lane");
+        assert_eq!(large.executor().status().lane_wait_timeouts, 1);
+        assert_eq!(large.executor().status().agent_escalations_refused, 2);
+        assert_eq!(large.permits.available_permits(), 2, "nothing leaks");
+    }
+
     fn shape(wide_columns: u64, row_groups: u64) -> ReaderShape {
         ReaderShape { wide_columns, row_groups, window_class: 8, columns_key: 7, string_group_by: false }
     }
@@ -745,8 +949,8 @@ mod tests {
         assert_eq!(sync_scoped(payload(Some(1), Some(128)), || LaneMemo::key(&wide)).unwrap(), format!("{base}:p1x128"));
         let four = sync_scoped(payload(Some(4), None), || LaneMemo::key(&wide)).unwrap();
         assert_eq!(four, format!("{base}:p4x512"));
-        // Clamped like the planner: 64 threads is the 4-thread key.
-        assert_eq!(sync_scoped(payload(Some(64), None), || LaneMemo::key(&wide)).unwrap(), four);
+        // Clamped like the planner (NAN-4751: to the keyed 8-thread role, not 4).
+        assert_eq!(sync_scoped(payload(Some(64), None), || LaneMemo::key(&wide)).unwrap(), format!("{base}:p8x512"));
         let memo = LaneMemo::default();
         memo.remember(&four, LaneClass::LargeFull);
         assert_eq!(memo.needed(&base), LaneClass::Small);

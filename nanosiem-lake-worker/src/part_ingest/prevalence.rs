@@ -881,13 +881,154 @@ const LOCAL_GC_METADATA_MIN_AGE: std::time::Duration = std::time::Duration::from
 /// at most every 5 s while idle instead of 60 s. The 60 s ceiling saves remote
 /// metadata reads on hosted object storage (NAN-3747); a local manifest read
 /// is a file read, and a burst gets its L0 room back sooner.
-fn local_compactor_options() -> slatedb::config::CompactorOptions {
+///
+/// NAN-4723: the job, subcompaction and fetch counts come from the role's
+/// placement ([`LocalStateSizing`]); the floor is the bounded compactor above.
+fn local_compactor_options(sizing: LocalStateSizing) -> slatedb::config::CompactorOptions {
     let mut options = super::maintenance::compactor_options();
     options.idle_poll_interval = Some(LOCAL_COMPACTOR_IDLE_POLL);
+    options.max_concurrent_compactions = sizing.compactions;
     if let Some(worker) = options.worker.as_mut() {
         worker.idle_compactions_poll_interval = Some(LOCAL_COMPACTOR_IDLE_POLL);
+        worker.max_concurrent_compactions = sizing.compactions;
+        worker.max_subcompactions = sizing.subcompactions;
+        worker.max_fetch_tasks = sizing.fetch_tasks;
     }
     options
+}
+
+/// NAN-4723: how a state on the local filesystem (open core, the lab: the
+/// writer compacts it itself, NAN-3781) is sized from the ingest role's
+/// placement. No knob: the role's CPU limit and memory cap decide it.
+///
+/// The NAN-4689 soak (12.5k eps fed, a 16-core ingest placement) ran the
+/// hosted `maintenance[T]` shape: one compaction job. A sorted-run merge
+/// (`[3, 2, 1, 0] -> SR(0)`) then held the only slot while flushes filled
+/// L0 to `l0_max_ssts` (8); memtable flushes stopped, imm memtables and WAL
+/// passed `max_unflushed_bytes` (128 MiB) and every prevalence write waited
+/// (backpressure 36x/h), so applies and stamps overran and commit eps fell
+/// from ~13k to ~10k. CPU was not the limit (3.2 of 16 cores).
+///
+/// - one compaction job per 4 cores, 1..=4: an L0 compaction no longer
+///   waits behind a sorted-run merge. The cores are the role's CPU limit,
+///   capped by what the process can actually run on (`cell`): a placement
+///   limit can exceed the host (the soak placed 16 cores on a 7-core cell);
+/// - compaction memory is bounded like the unflushed budget (1/8 of the
+///   memory cap, 128..=512 MiB): every concurrent merge stream (a job, or
+///   one subcompaction of it) holds ~[`Self::STREAM_BYTES`] (input
+///   read-ahead of up to 8 sources x 2 fetches x 1 MiB, plus the output
+///   writer and its one pending close). Jobs and subcompactions shrink to fit
+///   it; read-ahead per input stays the bounded compactor's (2 fetches),
+///   since it is per input SST, not per job;
+/// - L0 room doubles once more than one job runs (8 -> 16, total and per
+///   key): a burst lands in L0 while a job is busy instead of stopping
+///   flushes. Point reads stay bloom-filtered per L0 SST;
+/// - the unflushed (WAL + memtable) budget is 1/8 of the process memory cap
+///   within 128..=512 MiB, beside the admission buffer (30%), the catch-up
+///   batch (10%) and the merge decode window (5%).
+///
+/// A granted (hosted) state is compacted by `maintenance[T]` under its fixed
+/// budget and keeps [`LocalStateSizing::FLOOR`]'s L0 and memory settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalStateSizing {
+    /// Concurrent compaction jobs (coordinator and embedded worker).
+    pub compactions: usize,
+    /// Key-range splits of one compaction job.
+    pub subcompactions: usize,
+    /// Input block fetches in flight per job.
+    pub fetch_tasks: usize,
+    /// `l0_max_ssts` and `l0_max_ssts_per_key`.
+    pub l0_max_ssts: usize,
+    /// `max_unflushed_bytes`.
+    pub max_unflushed_bytes: usize,
+}
+
+impl LocalStateSizing {
+    /// The pre-NAN-4723 shape, and an unknown placement's: one job, L0 cap
+    /// 8, 128 MiB unflushed. Also what a granted state keeps.
+    pub const FLOOR: Self = Self {
+        compactions: 1,
+        subcompactions: 1,
+        fetch_tasks: 2,
+        l0_max_ssts: 8,
+        max_unflushed_bytes: 128 * 1024 * 1024,
+    };
+    /// Most compaction jobs (and subcompactions) any placement gets.
+    pub const MAX_COMPACTIONS: usize = 4;
+    /// Cores per compaction job.
+    pub const CORES_PER_COMPACTION: u32 = 4;
+    /// Share of the process memory cap the unflushed WAL + memtables may hold.
+    pub const UNFLUSHED_MEMORY_SHARE: u64 = 8;
+    /// Most unflushed bytes any placement gets.
+    pub const MAX_UNFLUSHED_BYTES: usize = 512 * 1024 * 1024;
+    /// Memory one concurrent compaction merge stream may hold: input
+    /// read-ahead (at most `max_compaction_sources` = 8 inputs x
+    /// [`Self::FLOOR`]'s 2 fetches x 1 MiB = 16 MiB) plus the output SST
+    /// writer and its one pending close, rounded up.
+    pub const STREAM_BYTES: usize = 64 * 1024 * 1024;
+
+    /// The sizing for an ingest role placed with `cpu_millis` (its CPU
+    /// limit, already capped at the cores the process can use) and
+    /// `memory_cap_bytes` (0: unknown -> the floor's memory).
+    pub fn for_placement(cpu_millis: u32, memory_cap_bytes: u64) -> Self {
+        let cores = cpu_millis / 1_000;
+        let budget = usize::try_from(memory_cap_bytes / Self::UNFLUSHED_MEMORY_SHARE)
+            .unwrap_or(usize::MAX)
+            .clamp(Self::FLOOR.max_unflushed_bytes, Self::MAX_UNFLUSHED_BYTES);
+        // Concurrent merge streams the compaction memory budget holds.
+        let streams = (budget / Self::STREAM_BYTES).max(1);
+        let compactions = ((cores / Self::CORES_PER_COMPACTION) as usize)
+            .min(streams)
+            .clamp(1, Self::MAX_COMPACTIONS);
+        let subcompactions = (streams / compactions).clamp(1, compactions);
+        let l0_max_ssts = if compactions > 1 { 2 * Self::FLOOR.l0_max_ssts } else { Self::FLOOR.l0_max_ssts };
+        Self {
+            compactions,
+            subcompactions,
+            fetch_tasks: Self::FLOOR.fetch_tasks,
+            l0_max_ssts,
+            max_unflushed_bytes: budget,
+        }
+    }
+
+    /// The CPU the sizing may count on: the role's limit, capped at the
+    /// cores this process can actually run on (cgroup quota and affinity,
+    /// [`std::thread::available_parallelism`]). 0 stays unknown.
+    pub fn usable_cpu_millis(limit_millis: u32) -> u32 {
+        let usable = std::thread::available_parallelism()
+            .map_or(u32::MAX, |cores| u32::try_from(cores.get()).unwrap_or(u32::MAX).saturating_mul(1_000));
+        limit_millis.min(usable)
+    }
+}
+
+impl Default for LocalStateSizing {
+    fn default() -> Self {
+        Self::FLOOR
+    }
+}
+
+/// The SlateDB settings of a tenant prevalence state. `embedded`: the state
+/// is on this process's own disk and compacted here, sized by the placement
+/// (NAN-4723); `None`: a granted state, compacted by `maintenance[T]`.
+fn state_settings(embedded: Option<LocalStateSizing>) -> Settings {
+    let sizing = embedded.unwrap_or(LocalStateSizing::FLOOR);
+    Settings {
+        flush_interval: None,
+        // The compactor starts before the WAL replay, so a state that
+        // already stalled at `l0_max_ssts` drains on its next open.
+        compactor_options: embedded.map(local_compactor_options),
+        garbage_collector_options: embedded.map(|_| local_gc_options()),
+        manifest_poll_interval: std::time::Duration::from_secs(30),
+        idle_manifest_poll_interval: Some(std::time::Duration::from_secs(300)),
+        manifest_update_timeout: std::time::Duration::from_secs(30),
+        l0_sst_size_bytes: 32 * 1024 * 1024,
+        l0_max_ssts: sizing.l0_max_ssts,
+        l0_max_ssts_per_key: sizing.l0_max_ssts,
+        max_unflushed_bytes: sizing.max_unflushed_bytes,
+        compression_codec: Some(CompressionCodec::Zstd),
+        object_store_max_retries: Some(3),
+        ..Settings::default()
+    }
 }
 
 /// See [`local_compactor_options`].
@@ -904,6 +1045,22 @@ pub fn stamp_artifacts<'e>(events: impl IntoIterator<Item = &'e Value>) -> Resul
         artifacts.extend(stampable_artifacts(object).into_iter().map(|(_, artifact)| artifact));
     }
     Ok(artifacts)
+}
+
+/// NAN-4749: [`stamp_artifacts`] of admission rows, in
+/// [`super::schema::DECODE_CHUNK_ROWS`] chunks on the rayon pool (the same
+/// set: a union of the chunks' sets).
+pub fn stamp_artifacts_of(rows: &[crate::iceberg::EventRow]) -> Result<std::collections::BTreeSet<String>> {
+    use rayon::prelude::*;
+    if rows.len() <= super::schema::DECODE_CHUNK_ROWS {
+        return stamp_artifacts(rows.iter().map(|row| &row.ocsf_event));
+    }
+    rows.par_chunks(super::schema::DECODE_CHUNK_ROWS)
+        .map(|chunk| stamp_artifacts(chunk.iter().map(|row| &row.ocsf_event)))
+        .try_reduce(std::collections::BTreeSet::new, |mut all, chunk| {
+            all.extend(chunk);
+            Ok(all)
+        })
 }
 
 /// See [`IngestPrevalence::lookup`]. Read-only: a dropped or abandoned
@@ -1046,7 +1203,7 @@ impl Observed {
 impl IngestPrevalence {
     #[cfg(test)]
     pub async fn new(tenant_id: &str) -> Self {
-        Self::open_store(tenant_id, Arc::new(InMemory::new()), "db", None, false, None, false)
+        Self::open_store(tenant_id, Arc::new(InMemory::new()), "db", None, false, None, None)
             .await
             .unwrap()
     }
@@ -1055,7 +1212,7 @@ impl IngestPrevalence {
     /// between two writers to prove fencing).
     #[cfg(test)]
     pub async fn open_shared(tenant_id: &str, store: Arc<dyn ObjectStore>) -> Result<Self> {
-        Self::open_store(tenant_id, store, "db", None, false, None, false).await
+        Self::open_store(tenant_id, store, "db", None, false, None, None).await
     }
 
     /// Without a grant (open core's trusted-local cell, the lab) the state
@@ -1078,7 +1235,7 @@ impl IngestPrevalence {
         access: Option<&PrevalenceAccess>,
         reads: Option<Arc<dyn ObjectStore>>,
     ) -> Result<Self> {
-        Self::open_sized(tenant_id, work_dir, access, reads, OBJECT_CACHE_FLOOR_BYTES).await
+        Self::open_sized(tenant_id, work_dir, access, reads, OBJECT_CACHE_FLOOR_BYTES, LocalStateSizing::FLOOR).await
     }
 
     /// [`Self::open_with_reads`] with the tenant's disk-cache cap (NAN-4592,
@@ -1086,12 +1243,17 @@ impl IngestPrevalence {
     /// grant, or `reads`) sizes its disk cache from the state's measured
     /// SSTs within `cache_cap_bytes` ([`object_cache_bytes`]); a state on the
     /// local filesystem keeps the floor (it is already local).
+    ///
+    /// NAN-4723: a state on the local filesystem (compacted in-process) is
+    /// sized by `local_sizing`, the ingest role's placement
+    /// ([`LocalStateSizing::for_placement`]); a granted state ignores it.
     pub async fn open_sized(
         tenant_id: &str,
         work_dir: &Path,
         access: Option<&PrevalenceAccess>,
         reads: Option<Arc<dyn ObjectStore>>,
         cache_cap_bytes: u64,
+        local_sizing: LocalStateSizing,
     ) -> Result<Self> {
         ensure!(
             uuid::Uuid::parse_str(tenant_id).is_ok_and(|id| id.to_string() == tenant_id),
@@ -1106,7 +1268,7 @@ impl IngestPrevalence {
         // NAN-3781: only the state this process keeps on its own disk is
         // compacted in-process; a granted state is compacted by
         // `maintenance[T]` (the owner refuses `compactions/*` from ingest).
-        let mut embedded_compaction = false;
+        let mut embedded_compaction = None;
         let mut owner_store = None;
         let store: Arc<dyn ObjectStore> = match access {
             Some(access) => {
@@ -1131,7 +1293,7 @@ impl IngestPrevalence {
                 None => {
                     let directory = work_dir.join("prevalence").join(tenant_id);
                     std::fs::create_dir_all(&directory)?;
-                    embedded_compaction = true;
+                    embedded_compaction = Some(local_sizing);
                     Arc::new(LocalFileSystem::new_with_prefix(&directory)?)
                 }
             },
@@ -1139,7 +1301,7 @@ impl IngestPrevalence {
         // NAN-4592: only a remote state's reads cost R2 GETs. The cache
         // directory is this tenant's own (`prevalence/<tenant>/object-cache`)
         // and every SST path is under the tenant's prefix: nothing is shared.
-        let (measured, cache_bytes) = if embedded_compaction {
+        let (measured, cache_bytes) = if embedded_compaction.is_some() {
             (None, OBJECT_CACHE_FLOOR_BYTES.min(cache_cap_bytes))
         } else {
             let measured = match measure_state_bytes(&store).await {
@@ -1214,7 +1376,7 @@ impl IngestPrevalence {
     }
 
     /// `embedded_compaction` (NAN-3781): run SlateDB's compactor and garbage
-    /// collector inside this writer. Set only for a state on the local
+    /// collector inside this writer, sized as given (NAN-4723). Set only for a state on the local
     /// filesystem with no grant (open core): nothing else compacts it, and
     /// without a compactor L0 reaches `l0_max_ssts` (8), every memtable
     /// flush then waits forever, and writes stop at `max_unflushed_bytes`.
@@ -1229,7 +1391,7 @@ impl IngestPrevalence {
         cache_dir: Option<(&Path, u64)>,
         physical_ttl: bool,
         local_root: Option<PathBuf>,
-        embedded_compaction: bool,
+        embedded_compaction: Option<LocalStateSizing>,
     ) -> Result<Self> {
         let main_read_policy = super::prevalence_io::main_policy();
         let point_cache = Arc::new(super::prevalence_io::ValueCache::new(!main_read_policy));
@@ -1250,21 +1412,7 @@ impl IngestPrevalence {
                 .with_meta_cache(Some(metadata))
                 .build(),
         );
-        let mut settings = Settings {
-            flush_interval: None,
-            // The compactor starts before the WAL replay, so a state that
-            // already stalled at `l0_max_ssts` drains on its next open.
-            compactor_options: embedded_compaction.then(local_compactor_options),
-            garbage_collector_options: embedded_compaction.then(local_gc_options),
-            manifest_poll_interval: std::time::Duration::from_secs(30),
-            idle_manifest_poll_interval: Some(std::time::Duration::from_secs(300)),
-            manifest_update_timeout: std::time::Duration::from_secs(30),
-            l0_sst_size_bytes: 32 * 1024 * 1024,
-            max_unflushed_bytes: 128 * 1024 * 1024,
-            compression_codec: Some(CompressionCodec::Zstd),
-            object_store_max_retries: Some(3),
-            ..Settings::default()
-        };
+        let mut settings = state_settings(embedded_compaction);
         settings.object_store_cache_options = ObjectStoreCacheOptions {
             root_folder: cache_dir.map(|(dir, _)| dir.to_path_buf()),
             max_cache_size_bytes: cache_dir.map(|(_, bytes)| usize::try_from(bytes).unwrap_or(usize::MAX)),
@@ -3633,7 +3781,7 @@ mod tests {
     async fn a_rebuild_flushes_on_a_cadence_not_per_chunk() {
         let temp = tempfile::tempdir().unwrap();
         let store = Arc::new(WalCounter { inner: InMemory::new(), wal_puts: std::sync::atomic::AtomicUsize::new(0) });
-        let mut state = IngestPrevalence::open_store(TENANT_A, store.clone(), "db", None, false, None, false).await.unwrap();
+        let mut state = IngestPrevalence::open_store(TENANT_A, store.clone(), "db", None, false, None, None).await.unwrap();
         let parts = 12_u64;
         let head = "7".repeat(64);
         let entry = EntryRef { seq: 9, sha256: &head, rebuild: true, parts: parts as u32 };
@@ -3660,7 +3808,7 @@ mod tests {
         }
         // The rebuild ended durable: a reopen sees it complete.
         state.close().await.unwrap();
-        let reopened = IngestPrevalence::open_store(TENANT_A, store.clone(), "db", None, false, None, false).await.unwrap();
+        let reopened = IngestPrevalence::open_store(TENANT_A, store.clone(), "db", None, false, None, None).await.unwrap();
         assert!(reopened.applied().await.unwrap().unwrap().is_complete());
     }
 
@@ -4023,6 +4171,106 @@ mod tests {
         assert!(reopened.has_test_key(0).await);
     }
 
+    /// NAN-4723: the production sizing of a local state from the ingest
+    /// role's placement, and the settings `open_store` builds from it.
+    #[test]
+    fn a_local_state_is_sized_from_the_ingest_placement() {
+        const MIB: u64 = 1024 * 1024;
+        // Unknown placement and the smallest roles: the pre-NAN-4723 shape.
+        assert_eq!(LocalStateSizing::for_placement(0, 0), LocalStateSizing::FLOOR);
+        assert_eq!(LocalStateSizing::for_placement(250, 205 * MIB), LocalStateSizing::FLOOR);
+        assert_eq!(LocalStateSizing::for_placement(3_999, 1024 * MIB), LocalStateSizing::FLOOR);
+        // The NAN-4689 soak's ingest role: 16 cores, ~3.2 GB memory cap. The
+        // ~405 MiB compaction budget holds 6 streams: 4 jobs, no splits, and
+        // read-ahead per input stays the bounded compactor's.
+        let soak = LocalStateSizing::for_placement(16_000, 3_244 * MIB);
+        assert_eq!(soak, LocalStateSizing {
+            compactions: 4, subcompactions: 1, fetch_tasks: 2, l0_max_ssts: 16,
+            max_unflushed_bytes: (3_244 * MIB / 8) as usize,
+        });
+        // 8 cores: two jobs, L0 room doubled.
+        let eight = LocalStateSizing::for_placement(8_000, 2048 * MIB);
+        assert_eq!((eight.compactions, eight.subcompactions, eight.l0_max_ssts, eight.max_unflushed_bytes),
+            (2, 2, 16, 256 * MIB as usize));
+        // Many cores, unknown memory: the floor budget holds two streams.
+        let unknown = LocalStateSizing::for_placement(16_000, 0);
+        assert_eq!((unknown.compactions, unknown.subcompactions, unknown.max_unflushed_bytes),
+            (2, 1, 128 * MIB as usize));
+        // A 4-core sovereign host (16 GB): one job, as before; only the
+        // unflushed budget follows the cap (1/8 of it).
+        let small = LocalStateSizing::for_placement(4_000, 4 * 1024 * MIB);
+        assert_eq!((small.compactions, small.subcompactions, small.fetch_tasks, small.l0_max_ssts, small.max_unflushed_bytes),
+            (1, 1, 2, 8, 512 * MIB as usize));
+        // Caps: jobs and unflushed bytes never grow without bound.
+        let huge = LocalStateSizing::for_placement(128_000, 64 * 1024 * MIB);
+        assert_eq!((huge.compactions, huge.subcompactions, huge.max_unflushed_bytes), (4, 2, 512 * MIB as usize));
+        // Every placement's merge streams fit its compaction memory budget
+        // (the unflushed share), and read-ahead per input never grows.
+        for cpu in [0, 1_000, 4_000, 8_000, 12_000, 16_000, 64_000] {
+            for cap in [0, 256 * MIB, 1024 * MIB, 3_244 * MIB, 8 * 1024 * MIB, 64 * 1024 * MIB] {
+                let sizing = LocalStateSizing::for_placement(cpu, cap);
+                assert!(sizing.compactions * sizing.subcompactions * LocalStateSizing::STREAM_BYTES <= sizing.max_unflushed_bytes,
+                    "{cpu}m / {cap} B: {sizing:?}");
+                assert_eq!(sizing.fetch_tasks, LocalStateSizing::FLOOR.fetch_tasks);
+                assert!(sizing.subcompactions <= sizing.compactions);
+            }
+        }
+        // The usable CPU never exceeds the limit or the process's cores.
+        let cores = std::thread::available_parallelism().unwrap().get() as u32;
+        assert_eq!(LocalStateSizing::usable_cpu_millis(0), 0);
+        assert_eq!(LocalStateSizing::usable_cpu_millis(500), 500.min(cores * 1_000));
+        assert_eq!(LocalStateSizing::usable_cpu_millis(u32::MAX), cores * 1_000);
+
+        // The settings a local (embedded) state opens with.
+        let settings = state_settings(Some(soak));
+        assert_eq!((settings.l0_max_ssts, settings.l0_max_ssts_per_key, settings.max_unflushed_bytes),
+            (16, 16, soak.max_unflushed_bytes));
+        let compactor = settings.compactor_options.as_ref().expect("a local state compacts itself");
+        assert_eq!(compactor.max_concurrent_compactions, 4);
+        let worker = compactor.worker.as_ref().expect("the embedded worker runs");
+        assert_eq!((worker.max_concurrent_compactions, worker.max_subcompactions, worker.max_fetch_tasks), (4, 1, 2));
+        assert_eq!(worker.max_sst_size, super::super::maintenance::MAX_COMPACTED_SST_BYTES);
+        assert!(settings.garbage_collector_options.is_some());
+        // A granted state: maintenance[T] compacts; L0 and memory stay at the floor.
+        let granted = state_settings(None);
+        assert!(granted.compactor_options.is_none() && granted.garbage_collector_options.is_none());
+        assert_eq!((granted.l0_max_ssts, granted.l0_max_ssts_per_key, granted.max_unflushed_bytes), (8, 8, 128 * MIB as usize));
+        // The floor's local compactor is exactly maintenance[T]'s bounded one.
+        let floor = local_compactor_options(LocalStateSizing::FLOOR);
+        let bounded = super::super::maintenance::compactor_options();
+        assert_eq!(floor.max_concurrent_compactions, bounded.max_concurrent_compactions);
+        let (fw, bw) = (floor.worker.unwrap(), bounded.worker.unwrap());
+        assert_eq!((fw.max_concurrent_compactions, fw.max_subcompactions, fw.max_fetch_tasks),
+            (bw.max_concurrent_compactions, bw.max_subcompactions, bw.max_fetch_tasks));
+    }
+
+    /// NAN-4723, through the production open (`open_sized`, as
+    /// `spawn_prevalence_open` calls it): a local state sized for the soak
+    /// placement takes 24 memtable flushes (three times the old L0 cap)
+    /// without one stalling, settles L0 under its own cap, and loses no key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_placement_sized_local_state_takes_flush_bursts_past_the_old_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let sizing = LocalStateSizing::for_placement(16_000, 3 * 1024 * 1024 * 1024);
+        assert_eq!(sizing.l0_max_ssts, 16);
+        let mut state = IngestPrevalence::open_sized(TENANT_A, temp.path(), None, None, OBJECT_CACHE_FLOOR_BYTES, sizing)
+            .await.unwrap();
+        state.initialize_at(0, &"0".repeat(64)).await.unwrap();
+        for flush in 0..24 {
+            state.write_test_wals(2).await.unwrap();
+            let flushed = tokio::time::timeout(std::time::Duration::from_secs(60), state.flush_memtable()).await;
+            assert!(matches!(flushed, Ok(Ok(()))), "memtable flush {flush} stalled");
+        }
+        let local = || -> Arc<dyn ObjectStore> {
+            Arc::new(LocalFileSystem::new_with_prefix(temp.path().join("prevalence").join(TENANT_A)).unwrap())
+        };
+        let l0 = l0_settles_under_cap(local).await;
+        assert!(l0 < 8, "L0 settles (was {l0})");
+        assert!(state.has_test_key(0).await && state.has_test_key(1).await);
+        assert!(state.applied().await.unwrap().is_some(), "the cursor survived compaction");
+        tokio::time::timeout(std::time::Duration::from_secs(30), state.close()).await.unwrap().unwrap();
+    }
+
     /// L0 of the local state at `store`, polled until it is under the cap
     /// (at most 30 s: six idle polls of the embedded compactor).
     async fn l0_settles_under_cap(store: impl Fn() -> Arc<dyn ObjectStore>) -> usize {
@@ -4046,7 +4294,7 @@ mod tests {
         let directory = temp.path().join("prevalence").join(TENANT_A);
         std::fs::create_dir_all(&directory).unwrap();
         let local = || -> Arc<dyn ObjectStore> { Arc::new(LocalFileSystem::new_with_prefix(&directory).unwrap()) };
-        let mut stalled = IngestPrevalence::open_store(TENANT_A, local(), "db", None, false, None, false).await.unwrap();
+        let mut stalled = IngestPrevalence::open_store(TENANT_A, local(), "db", None, false, None, None).await.unwrap();
         stalled.initialize_at(0, &"0".repeat(64)).await.unwrap();
         let mut flushed = 0;
         for _ in 0..12 {

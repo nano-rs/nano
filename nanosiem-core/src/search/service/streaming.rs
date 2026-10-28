@@ -1683,6 +1683,9 @@ fn spawn_cold_progress_poller(
     query_id: String,
     event_tx: tokio::sync::mpsc::Sender<crate::search::streaming::SearchStreamEvent>,
 ) -> tokio::task::JoinHandle<()> {
+    // NAN-4738: the cell keys progress by the id the reads carry on the
+    // wire; resolve it here, in the request's query class.
+    let query_id = super::background_request::lake_wire_request_id(&query_id).into_owned();
     tokio::spawn(async move {
         let started = Instant::now();
         let mut interval = tokio::time::interval(COLD_PROGRESS_POLL);

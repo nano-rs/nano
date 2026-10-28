@@ -768,8 +768,14 @@ impl ProvenanceRecord {
             _ => None,
         };
         self.files.validate(self.rows, adopted_key)?;
-        if !matches!(self.level, Level::Minute | Level::Hour) && self.files.data.iter().any(|file| file.log_sources.is_some()) {
-            bail!("only minute/hour parts can attest per-file log sources");
+        // NAN-4750: an L0 part may label its files as ONE `(source, class)`
+        // family (the flush writes a class's rows as their own L0 part);
+        // anything wider is still minute/hour only.
+        let l0_class_family = |file: &DataFileDigest| self.level == Level::L0 && file.class_id.is_some()
+            && file.log_sources.as_ref().is_some_and(|sources| sources.len() == 1);
+        if !matches!(self.level, Level::Minute | Level::Hour)
+            && self.files.data.iter().any(|file| file.log_sources.is_some() && !l0_class_family(file)) {
+            bail!("only minute/hour parts can attest per-file log sources (an L0 part only one source/class family)");
         }
         match self.level {
             Level::Day => {
@@ -2167,6 +2173,27 @@ mod owner_vector_tests {
         let mut invalid = record;
         invalid.files.data[0].log_sources = Some(vec!["z".into(), "a".into()]);
         assert!(invalid.validate().is_err());
+    }
+
+    /// NAN-4750: an L0 part may attest exactly one `(source, class)` family
+    /// per file; a source without a class, or several sources, stay
+    /// minute/hour only.
+    #[test]
+    fn l0_attests_only_a_single_source_class_family() {
+        let mut record = super::tests::sample_record();
+        assert_eq!(record.level, Level::L0);
+        record.files.data[0].log_sources = Some(vec!["windows_event".into()]);
+        record.files.data[0].class_id = Some(3002);
+        record.validate().unwrap();
+        let mut no_class = record.clone();
+        no_class.files.data[0].class_id = None;
+        assert!(no_class.validate().is_err(), "an L0 source family without a class");
+        let mut two = record.clone();
+        two.files.data[0].log_sources = Some(vec!["a".into(), "b".into()]);
+        assert!(two.validate().is_err(), "an L0 file of two sources");
+        let mut day = record;
+        day.level = Level::Day;
+        assert!(day.validate().is_err());
     }
 
     /// Regenerate with `NANO_WRITE_ADMISSION_V2_VECTOR=1`; the signer uses a

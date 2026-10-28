@@ -6096,14 +6096,20 @@ async fn a_dropped_pipelined_commit_keeps_the_oldest_flight_and_resumes_exactly_
     assert_eq!(ingestor.health().flushes_in_flight, 2, "a dropped commit keeps the oldest flight");
     assert_eq!(queue.acked.load(Ordering::SeqCst), 0);
 
-    // 2. Dropped right after its add landed, while prevalence applies.
-    ingestor.stall_next_prevalence_ops(1);
+    // 2. Dropped right after its add landed, before its ack. NAN-4737: a
+    // pipelined catch-up commit no longer applies prevalence between the
+    // append and the ack (the apply runs beside the next admission), so the
+    // ack is what holds the commit here.
+    queue.stall_ack.store(true, Ordering::SeqCst);
     parts.armed.store(true, Ordering::SeqCst);
     let entries = parts.entries.load(Ordering::SeqCst);
     tokio::select! {
-        outcome = ingestor.flush_now(clock) => panic!("the stalled apply finished first: {outcome:?}"),
+        outcome = ingestor.flush_now(clock) => panic!("the stalled ack finished first: {outcome:?}"),
         _ = parts.landed.notified() => {}
     }
+    // The dropped call may have entered the stalled ack: spend that signal
+    // so step 3 waits for the retry's own ack.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(50), queue.ack_entered.notified()).await;
     assert_eq!(parts.entries.load(Ordering::SeqCst), entries + 1, "exactly the oldest add landed");
     assert_eq!(ingestor.health().flushes_in_flight, 2, "an add without its acks keeps the flight");
     assert_eq!(queue.acked.load(Ordering::SeqCst), 0, "nothing acked yet");

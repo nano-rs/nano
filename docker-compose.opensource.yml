@@ -517,6 +517,8 @@ services:
       timeout: 5s
       retries: 40
       start_period: 30s
+    # NAN-4724: swap off (swap ceiling = memory limit); latency-critical.
+    memswap_limit: ${CLICKHOUSE_MEM_LIMIT:-2G}
     deploy:
       resources:
         limits:
@@ -1243,6 +1245,8 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
+    # NAN-4724: swap off (swap ceiling = memory limit); latency-critical.
+    memswap_limit: 512M
     deploy:
       resources:
         limits:
@@ -1343,6 +1347,10 @@ services:
     command:
       - |
         if [ "$${NANO_LEAN_FRESH_TENANT:-0}" = "1" ]; then set -- --force; else set --; fi
+        # NAN-4749: optional sustained rate (.env or install.sh --target-eps)
+        # to size and place ingest for; the cell's CPUs and memory are read
+        # from the host.
+        if [ -n "$${NANO_LAKE_TARGET_EPS:-}" ]; then set -- "$${@}" --target-eps "$${NANO_LAKE_TARGET_EPS}"; fi
         nanosiem-lake-cell trusted-local init "$${@}" --out /bootstrap --app-owner 999:999 --no-require-landlock \
           --chdb-library /usr/local/lib/nano-chdb/libchdb.so --chdb-sha256 "$$(cat /usr/local/lib/nano-chdb/libchdb.sha256)"
         python3 /configure-open.py /bootstrap
@@ -1356,6 +1364,7 @@ services:
       NANO_OTEL_LAKE_QUERY_TOKEN: ${NANO_OTEL_LAKE_QUERY_TOKEN:-}
       NANO_LAKE_ENRICHMENT_TOKEN: ${NANO_LAKE_ENRICHMENT_TOKEN:-}
       NANO_LOCAL_AUDIT_TOKEN: ${NANO_LOCAL_AUDIT_TOKEN:-}
+      NANO_LAKE_TARGET_EPS: ${NANO_LAKE_TARGET_EPS:-}
     volumes:
       - ./.nano-lean:/bootstrap
       - ./scripts/lean/configure-open.py:/configure-open.py:ro
@@ -1398,9 +1407,18 @@ services:
     # The supervisor forwards both to ingest[T] through its FEATURE_ENV
     # allowlist. Set either to 0 in .env to turn that writer off. Count
     # backfill paces itself (NAN-3772), so it needs no compaction-pacing env.
+    #
+    # NAN-4749: the ingest tuning knobs hosted cells set through their
+    # featureEnv, forwarded the same way when set in .env (unset keeps the
+    # worker defaults; a bare name passes nothing when the variable is unset):
+    # NANO_LAKE_MERGE_MINUTE_CONCURRENCY / NANO_LAKE_MERGE_HISTORY_CONCURRENCY
+    # (1..=4 merges per lane, default 2) and NANO_LAKE_COMPACTION_PACING.
     environment:
       NANO_LAKE_ENTITY_COUNT_WRITE: ${NANO_LAKE_ENTITY_COUNT_WRITE:-1}
       NANO_LAKE_ENTITY_LOCATOR_WRITE: ${NANO_LAKE_ENTITY_LOCATOR_WRITE:-1}
+      NANO_LAKE_MERGE_MINUTE_CONCURRENCY:
+      NANO_LAKE_MERGE_HISTORY_CONCURRENCY:
+      NANO_LAKE_COMPACTION_PACING:
     read_only: true
     cap_drop: ["ALL"]
     # Per-tenant uid drop (SETUID/SETGID), tenant tree ownership (CHOWN/FOWNER)
@@ -1413,6 +1431,8 @@ services:
     security_opt: ["no-new-privileges:true"]
     # install.sh sizes this from the budget lean-init placed (0 = unlimited).
     mem_limit: ${NANO_LAKE_CELL_MEM_LIMIT:-0}
+    # NAN-4724: swap off (swap ceiling = memory limit); latency-critical.
+    memswap_limit: ${NANO_LAKE_CELL_MEM_LIMIT:-0}
     tmpfs: ["/run", "/tmp"]
     volumes:
       - ./.nano-lean/cell:/etc/nano-cell:ro
@@ -1560,6 +1580,8 @@ services:
     depends_on:
       lean-object-init: {condition: service_completed_successfully}
       postgres-migrate: {condition: service_completed_successfully}
+    # NAN-4724: swap off (swap ceiling = memory limit); latency-critical.
+    memswap_limit: ${NANO_LANDING_MEM_LIMIT:-2G}
     deploy:
       resources:
         limits:

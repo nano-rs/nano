@@ -299,9 +299,11 @@ impl LookupService {
         // The table must already exist for a replace; keep its physical name.
         let existing = self.repository.get_table(&new_table.name).await?;
 
-        // Fresh, uniquely-named staging table (bounded to Postgres' 63-byte
-        // identifier limit). The live table is never touched until the swap.
-        let base: String = existing.table_name.chars().take(48).collect();
+        // Fresh, uniquely-named staging table. The live table is never touched
+        // until the swap. 42 + "_stg_" + 8 = 55 characters: inside Postgres'
+        // 63-byte identifier limit and the sovereign definer DDL name grammar
+        // `^lookup_[a-z0-9_]{1,48}$` (NAN-4712).
+        let base: String = existing.table_name.chars().take(42).collect();
         let staging = format!(
             "{}_stg_{}",
             base,

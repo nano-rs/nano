@@ -33,10 +33,10 @@ const SHAPING_TRANSFORM: &str = "parse_content";
 
 static SHAPING_PROGRAM: LazyLock<Result<vrl::compiler::Program, String>> = LazyLock::new(|| {
     let source = transform_source(BASE_CONFIG, SHAPING_TRANSFORM)?;
-    vrl::compiler::compile(&source, &super::validator::safe_vrl_functions())
+    super::vrl_guard::compile(&source, &super::validator::safe_vrl_functions())
         .map(|compiled| compiled.program)
-        .map_err(|diagnostics| {
-            format!("{SHAPING_TRANSFORM} does not compile: {diagnostics:?}")
+        .map_err(|error| {
+            format!("{SHAPING_TRANSFORM} does not compile: {}", error.render(&source))
         })
 });
 
