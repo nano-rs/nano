@@ -316,7 +316,10 @@ pub async fn merge_once(engine: &PartQueryEngine, state_dir: &Path, now_us: i64)
     let Some(admission) = engine.try_admit_idle() else {
         return Ok(unchanged(&current));
     };
-    let sources = super::identity::index_sources(engine, state_dir, now_us.saturating_sub(LOOKBACK_US), now_us).await?;
+    // NAN-4799: classify without leasing memoized partials; only the tail a
+    // due build reads is leased (below).
+    let sources = super::identity::index_sources_leasing(engine, state_dir, now_us.saturating_sub(LOOKBACK_US), now_us,
+        super::identity::Leasing::Unscanned).await?;
     let mut files = sources.all();
     files.sort_by(|a, b| a.key.cmp(&b.key));
     files.dedup_by(|a, b| a.key == b.key);
@@ -329,7 +332,8 @@ pub async fn merge_once(engine: &PartQueryEngine, state_dir: &Path, now_us: i64)
     if !needs_rebuild(current.as_deref(), &files) {
         return Ok(unchanged(&current));
     }
-    let plan = scan(current, &files);
+    let mut plan = scan(current, &files);
+    let tail_lease = sources.lease_partials(engine, &mut plan.tail).await?;
     // New numbering: the previous file's live sources first, then the tail.
     let mut covered = BTreeMap::new();
     let mut renumber = (Vec::new(), Vec::new());
@@ -394,6 +398,7 @@ pub async fn merge_once(engine: &PartQueryEngine, state_dir: &Path, now_us: i64)
         "identity observation index merged");
     drop(plan);
     slot.replace(MergedIndex::new(target, covered));
+    drop(tail_lease);
     drop(sources);
     Ok(report)
 }

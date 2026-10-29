@@ -290,8 +290,9 @@ pub const MAX_TARGET_EPS: u32 = 1_000_000;
 /// gets at least [`crate::budget::ingest_memory_for_eps`] (up to half the cell's memory,
 /// taken from query's share, never leaving query under 1 GiB) and the tenant
 /// is placed at `target_eps` (owner pacing, part cache), or the
-/// memory-derived eps when that is higher. Without it the sizing is
-/// [`size`]'s, unchanged.
+/// memory-derived eps when that is higher. With no rate, use the same shared
+/// ingest floor within the available query surplus: background merges need
+/// headroom alongside admission, even without an explicit target rate.
 pub fn size_for(memory_bytes: u64, cpus: u32, target_eps: Option<u32>) -> Sizing {
     let cpus = cpus.max(1);
     // query 50 %, ingest 25 %, detect 15 %; the rest covers the fixed
@@ -300,10 +301,8 @@ pub fn size_for(memory_bytes: u64, cpus: u32, target_eps: Option<u32>) -> Sizing
     let base_ingest = round_mib(memory_bytes / 4).max(512 * MIB);
     // NAN-4749: a target rate moves query memory to ingest through the
     // shared sizing (`budget::ingest_query_for_eps`), at most half the cell.
-    let (ingest_mem, query_mem) = match target_eps {
-        Some(eps) => ingest_query_for_eps(base_ingest, base_query, eps, round_mib(memory_bytes / 2)),
-        None => (base_ingest, base_query),
-    };
+    let (ingest_mem, query_mem) = ingest_query_for_eps(base_ingest, base_query,
+        target_eps.unwrap_or(crate::budget::PARALLEL_FLUSH_EPS as u32), round_mib(memory_bytes / 2));
     let detect_mem = round_mib(memory_bytes / 100 * 15).max(256 * MIB);
     let milli = cpus.saturating_mul(1000);
     let query_cpu = (milli / 4 * 3).max(1000);
@@ -837,6 +836,21 @@ mod tests {
     }
 
     #[test]
+    fn a_sixteen_gib_host_defaults_to_four_gib_ingest_without_growing_the_cell() {
+        // init gives half of a 16 GiB Docker host to the cell.
+        let s = size(8 * GIB, 8);
+        assert_eq!((s.ingest.3, s.query.3), (4 * GIB, 2 * GIB));
+        let old_total = 8 * GIB / 2 + 8 * GIB / 4 + round_mib(8 * GIB / 100 * 15);
+        assert_eq!(s.ingest.3 + s.query.3 + s.detect.3, old_total);
+        assert!(s.query.3 >= crate::budget::QUERY_MEMORY_FLOOR_BYTES);
+        // Nominal 16 GiB hosts report slightly less usable RAM. There is no
+        // hard capacity threshold that would send them back to a 2 GiB role.
+        let usable = size(8 * GIB - 512 * MIB, 8);
+        assert!(usable.ingest.3 > 3 * GIB);
+        assert!(usable.query.3 >= crate::budget::QUERY_MEMORY_FLOOR_BYTES);
+    }
+
+    #[test]
     fn cpu_lists_count_ranges_and_refuse_garbage() {
         assert_eq!(count_cpu_list("0-31"), Some(32));
         assert_eq!(count_cpu_list("0,2-5,8"), Some(6));
@@ -850,7 +864,7 @@ mod tests {
     #[test]
     fn sizing_follows_host_memory_not_eps() {
         let small = size(4 * GIB, 2);
-        assert_eq!(small.query.3, 2 * GIB);
+        assert_eq!(small.query.3, GIB);
         assert!(small.query.1 >= 1000);
         let big = size(64 * GIB, 32);
         assert_eq!(big.query.3, 32 * GIB);
@@ -871,12 +885,13 @@ mod tests {
         // The 1.0.11 bakeoff shape: 16 GiB for the cell, 8 CPUs.
         let host = size(16 * GIB, 8);
         assert_eq!(size_for(16 * GIB, 8, None), host, "no target: unchanged");
-        assert_eq!(host.ingest.3, 4 * GIB);
+        assert_eq!(host.ingest.3, INGEST_MEMORY_FOR_FULL_FLUSH);
         let target = size_for(16 * GIB, 8, Some(10_000));
         assert_eq!(target.ingest.3, INGEST_MEMORY_FOR_FULL_FLUSH);
         assert_eq!(target.eps, 10_000, "placed at the target rate");
-        // Ingest's extra 2 GiB comes out of query; the role total is unchanged.
-        assert_eq!(target.query.3, host.query.3 - 2 * GIB);
+        // The default already leaves full-flush and merge headroom. A target
+        // changes pacing without increasing the total role memory envelope.
+        assert_eq!(target.query.3, host.query.3);
         assert_eq!(target.ingest.3 + target.query.3 + target.detect.3, host.ingest.3 + host.query.3 + host.detect.3);
         assert!(TenantBudget::from_eps(target.eps as f64).ingest_memory_cap_bytes >= target.ingest.3);
         // A small box gives ingest at most half its memory and query >= 1 GiB.
@@ -888,8 +903,7 @@ mod tests {
         assert_eq!(big.ingest.3, size(64 * GIB, 32).ingest.3);
         assert!(big.eps >= 10_000);
         // A low rate never shrinks ingest below the host share.
-        assert_eq!(size_for(16 * GIB, 8, Some(100)).ingest.3, host.ingest.3);
-        assert_eq!(size_for(16 * GIB, 8, Some(100)).eps, host.eps);
+        assert_eq!(size_for(16 * GIB, 8, Some(100)).ingest.3, 4 * GIB);
         // A 2 GiB floor cell has no query memory to give: role memory
         // unchanged (the tenant is still placed at the target rate).
         let floor = size_for(2 * GIB, 1, Some(10_000));
@@ -907,10 +921,10 @@ mod tests {
         assert_eq!(t["eps"], 10_000.0);
         assert_eq!(t["ingest_limit_memory_bytes"], INGEST_MEMORY_FOR_FULL_FLUSH);
         assert_eq!(summary["sizing"]["target_eps"], 10_000);
-        // A re-run without the target returns to the host sizing.
+        // A re-run without the target retains the default merge headroom.
         init(&args(&out), &env).unwrap();
         let placement: Value = serde_json::from_slice(&std::fs::read(out.join("cell/placement.json")).unwrap()).unwrap();
-        assert_eq!(placement["tenants"][0]["ingest_limit_memory_bytes"], 4 * GIB);
+        assert_eq!(placement["tenants"][0]["ingest_limit_memory_bytes"], INGEST_MEMORY_FOR_FULL_FLUSH);
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod admission_archive;
 pub mod bootstrap_generation;
 pub mod local_hot_window;
 pub mod cell_logging;
+pub mod cgroup_memory;
 pub mod cell_refresh;
 pub mod bounds;
 pub mod startup_bounds;

@@ -5305,6 +5305,7 @@ mod newest_first_cap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::fence_eval::{fence_matches, parse_fence};
 
     #[test]
     fn page_schema_keeps_whole_nested_types_and_authority_roots() {
@@ -6249,43 +6250,6 @@ mod tests {
         glob.snapshot_cache.as_mut().unwrap().objects.get_mut("s3://bucket/table/data/one.parquet").unwrap().path = "/cache/one*.bin".into();
         let (source, _, _) = candidate_source(&glob, &manifest, &[block("one", 0, 100)], BudgetEnforcement::ReportOnly, Some("time")).unwrap();
         assert!(source.contains("transform(_path, [{candidate_path_0:String}]"), "{source}");
-    }
-
-    /// NAN-3179: a [`row_fence`] parsed back, to evaluate it per row the way
-    /// chDB would.
-    enum FenceTerm {
-        Range(String, u64, u64),
-        /// path -> (granule, file id), key width, keys.
-        Set(BTreeMap<String, (u64, u64)>, u64, BTreeSet<u64>),
-    }
-
-    fn parse_fence(fence: &str, params: &[(String, String)]) -> Vec<FenceTerm> {
-        let set = Regex::new(r"^\(intDiv\(_row_number, transform\(_path, \[([^\]]*)\], \[([^\]]*)\], 1\)\) \* (\d+) \+ transform\(_path, \[([^\]]*)\], \[([^\]]*)\], 0\)\) IN \(([^)]*)\)$").unwrap();
-        let term = Regex::new(r"^\(_path = \{(\w+):String\} AND _row_number >= (\d+) AND _row_number < (\d+)\)$").unwrap();
-        let param = |name: &str| params.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()).unwrap();
-        let list = |text: &str| text.split(',').map(str::to_string).collect::<Vec<_>>();
-        let number = |text: &str| text.parse::<u64>().unwrap();
-        fence.split(" OR ").map(|part| {
-            if let Some(c) = term.captures(part) {
-                return FenceTerm::Range(param(&c[1]), number(&c[2]), number(&c[3]));
-            }
-            let c = set.captures(part).unwrap_or_else(|| panic!("unexpected fence term {part}"));
-            assert_eq!(list(&c[1]), list(&c[4]));
-            let files = list(&c[1]).iter().zip(list(&c[2])).zip(list(&c[5]))
-                .map(|((name, granule), id)| (param(name.trim_start_matches('{').trim_end_matches(":String}")), (number(&granule), number(&id))))
-                .collect();
-            FenceTerm::Set(files, number(&c[3]), list(&c[6]).iter().map(|k| number(k)).collect())
-        }).collect()
-    }
-
-    fn fence_matches(terms: &[FenceTerm], path: &str, row: u64) -> bool {
-        terms.iter().any(|term| match term {
-            FenceTerm::Range(p, start, end) => p == path && (*start..*end).contains(&row),
-            FenceTerm::Set(files, width, keys) => {
-                let (granule, id) = files.get(path).copied().unwrap_or((1, 0));
-                keys.contains(&(row / granule * width + id))
-            }
-        })
     }
 
     #[test]
@@ -9780,5 +9744,49 @@ mod flat_filter_leaf_tests {
         assert!(flat.contains("`device.hostname` AS `device.hostname`"));
         assert!(params[1].1.ends_with(", `device.hostname` Nullable(String)"));
         assert_eq!(params[2].1, "`time` DateTime64(6, 'UTC')");
+    }
+}
+
+/// NAN-3179: a [`super::row_fence`] parsed back and evaluated per row the way chDB
+/// would, shared by the planner and sidecar tests so a fence assertion checks
+/// the rows it admits rather than one SQL spelling.
+#[cfg(test)]
+pub(crate) mod fence_eval {
+    use regex::Regex;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    pub(crate) enum FenceTerm {
+        Range(String, u64, u64),
+        /// path -> (granule, file id), key width, keys.
+        Set(BTreeMap<String, (u64, u64)>, u64, BTreeSet<u64>),
+    }
+
+    pub(crate) fn parse_fence(fence: &str, params: &[(String, String)]) -> Vec<FenceTerm> {
+        let set = Regex::new(r"^\(intDiv\(_row_number, transform\(_path, \[([^\]]*)\], \[([^\]]*)\], 1\)\) \* (\d+) \+ transform\(_path, \[([^\]]*)\], \[([^\]]*)\], 0\)\) IN \(([^)]*)\)$").unwrap();
+        let term = Regex::new(r"^\(_path = \{(\w+):String\} AND _row_number >= (\d+) AND _row_number < (\d+)\)$").unwrap();
+        let param = |name: &str| params.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()).unwrap();
+        let list = |text: &str| text.split(',').map(str::to_string).collect::<Vec<_>>();
+        let number = |text: &str| text.parse::<u64>().unwrap();
+        fence.split(" OR ").map(|part| {
+            if let Some(c) = term.captures(part) {
+                return FenceTerm::Range(param(&c[1]), number(&c[2]), number(&c[3]));
+            }
+            let c = set.captures(part).unwrap_or_else(|| panic!("unexpected fence term {part}"));
+            assert_eq!(list(&c[1]), list(&c[4]));
+            let files = list(&c[1]).iter().zip(list(&c[2])).zip(list(&c[5]))
+                .map(|((name, granule), id)| (param(name.trim_start_matches('{').trim_end_matches(":String}")), (number(&granule), number(&id))))
+                .collect();
+            FenceTerm::Set(files, number(&c[3]), list(&c[6]).iter().map(|k| number(k)).collect())
+        }).collect()
+    }
+
+    pub(crate) fn fence_matches(terms: &[FenceTerm], path: &str, row: u64) -> bool {
+        terms.iter().any(|term| match term {
+            FenceTerm::Range(p, start, end) => p == path && (*start..*end).contains(&row),
+            FenceTerm::Set(files, width, keys) => {
+                let (granule, id) = files.get(path).copied().unwrap_or((1, 0));
+                keys.contains(&(row / granule * width + id))
+            }
+        })
     }
 }

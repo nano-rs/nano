@@ -4,9 +4,18 @@
 #
 # Open-core prevalence smoke for the lean runtime (NAN-3451, NAN-3492).
 # WRITES to the deployment: it creates (once) and deploys a
-# `nano_smoke_prevalence` log source and ingests a few synthetic OCSF File
-# System Activity events. Opt-in only; run it from
+# `nano_smoke_prevalence` log source, mints an ingest token bound to it, ingests
+# a few synthetic OCSF File System Activity events with that token and revokes
+# the token on exit. Opt-in only; run it from
 # `scripts/smoke-open-core.sh --prevalence` or directly.
+#
+# INGEST TOKEN (NAN-4790)
+# Since NAN-3806 a token decides the source: every event is routed to the log
+# source its token is bound to, whatever X-Source-Type says. The install token
+# (VECTOR_AUTH_TOKEN) is bound to the OTLP source, so events sent with it never
+# reach the smoke parser (host_count=0). The smoke therefore mints its own
+# token bound to the smoke source (POST /api/ingest-tokens) and revokes it
+# (POST /api/ingest-tokens/<id>/revoke) however the run ends.
 #
 # WHY THIS EXISTS
 # Open-core prevalence spans ingest stamping, the tenant's prevalence state,
@@ -41,10 +50,10 @@
 #   scripts/smoke-open-core-prevalence.sh [-u BASE_URL] [--env-file FILE]
 #
 # Credentials (environment, else read from the env file, default ./.env):
-#   VECTOR_AUTH_TOKEN                      ingest bearer (install.sh writes it)
 #   NANO_API_KEY                           X-API-Key with search:execute,
 #                                          prevalence:view, log_sources:view, log_sources:edit,
-#                                          log_sources:create, log_sources:deploy; or
+#                                          log_sources:create, log_sources:deploy and
+#                                          settings:system (ingest tokens); or
 #   NANO_ADMIN_EMAIL / NANO_ADMIN_PASSWORD a login (falls back to
 #                                          INITIAL_ADMIN_EMAIL / _PASSWORD)
 # Tunables (seconds): NANO_PREV_SMOKE_POLL_SECS (10),
@@ -63,6 +72,7 @@ POLL="${NANO_PREV_SMOKE_POLL_SECS:-10}"
 SEARCH_TIMEOUT="${NANO_PREV_SMOKE_SEARCH_TIMEOUT_SECS:-300}"
 JOB_TIMEOUT="${NANO_PREV_SMOKE_JOB_TIMEOUT_SECS:-600}"
 STAMP_ROUNDS="${NANO_PREV_SMOKE_STAMP_ROUNDS:-3}"
+INGEST_AUTH_TIMEOUT=60  # Allow a newly minted token to reach Vector.
 COMMON_HOSTS=4
 RARE_PAGES=20  # rare-list pages (100 rows each) searched for the rare hash
 
@@ -70,7 +80,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -u) BASE_URL="$2"; shift 2 ;;
         --env-file) ENV_FILE="$2"; shift 2 ;;
-        -h|--help) sed -n '4,55p' "$0"; exit 0 ;;
+        -h|--help) sed -n '4,65p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -86,6 +96,7 @@ ok()      { printf "  %bok%b   %s\n" "$c_green" "$c_reset" "$*"; }
 bad()     { printf "  %bFAIL%b %s\n" "$c_red" "$c_reset" "$*"; FAILURES=$((FAILURES + 1)); }
 die()     { bad "$*"; finish; }
 finish() {
+    revoke_ingest_token
     printf "\n"
     if (( FAILURES == 0 )); then
         printf "%bopen-core prevalence smoke passed.%b\n" "$c_green" "$c_reset"; exit 0
@@ -100,7 +111,35 @@ env_value() {
 }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/nano-prev-smoke.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+# The minted ingest token is revoked however the run ends (finish, a signal,
+# an unexpected exit); revoke_ingest_token is idempotent.
+trap 'revoke_ingest_token; rm -rf "$WORK"' EXIT
+trap 'exit 130' INT TERM
+
+INGEST_TOKEN=""
+INGEST_TOKEN_ID=""  # credential_id of the token this run minted
+# revoke_ingest_token: revoke this run's token once (no-op when none).
+revoke_ingest_token() {
+    [[ -n "$INGEST_TOKEN_ID" ]] || return 0
+    local id=$INGEST_TOKEN_ID
+    INGEST_TOKEN_ID=""
+    api POST "/api/ingest-tokens/$id/revoke"
+    case "$STATUS" in
+        200) ok "ingest token $id revoked" ;;
+        503)
+            # Publication can fail after revocation, but auth middleware can
+            # also return 503 before the handler runs. Confirm the row state.
+            api GET /api/ingest-tokens
+            if [[ "$STATUS" == "200" ]] && jq -e --arg id "$id" \
+                'any(.tokens[]?; .credential_id == $id and .state == "revoked")' \
+                "$WORK/body" >/dev/null 2>&1; then
+                ok "ingest token $id revoked (Vector tokens file update pending)"
+            else
+                bad "revoke ingest token $id -> HTTP 503; could not confirm revoked state (GET HTTP $STATUS)"
+            fi ;;
+        *) bad "revoke ingest token $id -> HTTP $STATUS $(head -c 200 "$WORK/body" 2>/dev/null)" ;;
+    esac
+}
 
 # http METHOD URL [BODY_FILE] [HEADER...] -> response body in $WORK/body,
 # status in $STATUS.
@@ -190,8 +229,6 @@ wait_for() {
 
 # --------------------------------------------------------------------------
 section "credentials"
-INGEST_TOKEN="${VECTOR_AUTH_TOKEN:-$(env_value VECTOR_AUTH_TOKEN)}"
-[[ -n "$INGEST_TOKEN" ]] || die "VECTOR_AUTH_TOKEN is not set and not in $ENV_FILE"
 if [[ -n "${NANO_API_KEY:-}" ]]; then
     AUTH_HEADER="X-API-Key: $NANO_API_KEY"
     ok "API key"
@@ -279,6 +316,33 @@ wait_for "deployment $DEPLOYMENT_ID recorded as success" "$SEARCH_TIMEOUT" deplo
 ok "parser deployed ($DEPLOYMENT_ID)"
 
 # --------------------------------------------------------------------------
+section "ingest token bound to the smoke source"
+# GET /api/ingest-tokens lists the sources a token can be bound to. A
+# bindable source carries the internal UUID (`source_id`), not the `lsrc_…`
+# id /api/log-sources returns, and its `route_key` is the smoke slug.
+BIND_ID=""
+source_bindable() {
+    api GET /api/ingest-tokens
+    LAST="HTTP $STATUS"
+    [[ "$STATUS" == "200" ]] || return 1
+    BIND_ID=$(jq -r --arg s "$SOURCE_TYPE" --arg id "$SOURCE_ID" \
+        '[.sources[]? | select(.route_key == $s or .source_id == $id) | .source_id] | first // empty' \
+        "$WORK/body" 2>/dev/null)
+    [[ -n "$BIND_ID" ]]
+}
+wait_for "log source $SOURCE_ID bindable by an ingest token" "$SEARCH_TIMEOUT" source_bindable || finish
+jq -n --arg n "nano-prevalence-smoke-$RUN" --arg s "$BIND_ID" '{name: $n, source_id: $s}' > "$WORK/token.json"
+api POST /api/ingest-tokens "$WORK/token.json"
+# IssuedIngestToken: {credential: {credential_id, ...}, token}. The value is
+# shown once and never printed here.
+INGEST_TOKEN_ID=$(jq -r '.credential.credential_id // empty' "$WORK/body" 2>/dev/null)
+INGEST_TOKEN=$(jq -r '.token // empty' "$WORK/body" 2>/dev/null)
+rm -f "$WORK/body"
+[[ "$STATUS" =~ ^20[01]$ && -n "$INGEST_TOKEN" && -n "$INGEST_TOKEN_ID" ]] \
+    || die "mint ingest token for $BIND_ID -> HTTP $STATUS"
+ok "minted ingest token $INGEST_TOKEN_ID bound to $SOURCE_ID ($BIND_ID)"
+
+# --------------------------------------------------------------------------
 # ingest MARKER HOST:HASH... : one NDJSON event per pair.
 ingest() {
     local marker=$1 pair
@@ -288,8 +352,16 @@ ingest() {
         jq -cn --arg h "${pair%%:*}" --arg x "${pair#*:}" --arg m "$marker" \
             '{smoke_host: $h, smoke_hash: $x, smoke_marker: $m}' >> "$WORK/events.ndjson"
     done
-    http POST "$BASE_URL/ingest" "$WORK/events.ndjson" \
-        "Authorization: Bearer $INGEST_TOKEN" "X-Source-Type: $SOURCE_TYPE" "Content-Type: application/x-ndjson"
+    # A freshly minted token is refused (401/403) until Vector reloads its
+    # tokens file; retry those, bounded.
+    local deadline=$(( $(now) + INGEST_AUTH_TIMEOUT ))
+    while true; do
+        http POST "$BASE_URL/ingest" "$WORK/events.ndjson" \
+            "Authorization: Bearer $INGEST_TOKEN" "X-Source-Type: $SOURCE_TYPE" "Content-Type: application/x-ndjson"
+        [[ "$STATUS" == "401" || "$STATUS" == "403" ]] || break
+        (( $(now) < deadline )) || break
+        sleep "$POLL"
+    done
     [[ "$STATUS" =~ ^20[0-4]$ ]] || die "ingest $marker -> HTTP $STATUS"
 }
 

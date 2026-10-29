@@ -830,8 +830,28 @@ mod tests {
         for (label,candidates) in [("scan",None),("indexed",Some(union.as_slice()))] {
             let plan = crate::planner::plan_broad_log_query_with_candidates_and_tail(&tenant, &manifest, &query, candidates, None).unwrap();
             if candidates.is_some() {
-                assert!(plan.sql.contains("_row_number >= 10 AND _row_number < 20"));
+                // Exact spelling: since NAN-3179 (#5368) the fence defaults to
+                // the set form. Both files are cut into 10-row granules, so
+                // keys 4/5 are granule 1 (rows 10..20) of file ids 1/2 (key
+                // width 3); `NANO_LAKE_FENCE_SET=0` restores the OR terms.
+                let exact = if crate::planner::fence_set_enabled() {
+                    "(intDiv(_row_number, transform(_path, [{candidate_path_0:String},{candidate_path_1:String}], [10,10], 1)) * 3 + transform(_path, [{candidate_path_0:String},{candidate_path_1:String}], [1,2], 0)) IN (4,5)".to_string()
+                } else {
+                    "(_path = {candidate_path_0:String} AND _row_number >= 10 AND _row_number < 20) OR (_path = {candidate_path_1:String} AND _row_number >= 10 AND _row_number < 20)".to_string()
+                };
+                assert!(plan.sql.contains(&exact), "{}", plan.sql);
                 assert!(!plan.params.iter().any(|(_,v)| v.contains("events-2")));
+                // Semantic: evaluate the fence per row the way chDB does. It
+                // admits exactly rows [10, 20) of events-0 and events-1 and
+                // nothing of events-2 or rows outside the candidate range.
+                let terms = crate::planner::fence_eval::parse_fence(&exact, &plan.params);
+                for id in 0..3 {
+                    let path = dir.path().join(format!("events-{id}.parquet")).display().to_string();
+                    for row in 0..sidecar.objects[&id].rows {
+                        let want = id < 2 && (10..20).contains(&row);
+                        assert_eq!(crate::planner::fence_eval::fence_matches(&terms, &path, row), want, "{path} row {row}: {exact}");
+                    }
+                }
             }
             let params = plan.params.iter().map(|(k,v)| (k.as_str(),v.as_str())).collect::<Vec<_>>();
             let start = std::time::Instant::now();

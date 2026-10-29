@@ -691,8 +691,8 @@ async fn open_query_service(assignment: &Assignment, mut bootstrap: QueryBootstr
     if assignment.identity_observations && !detect && !product {
         service.clone().spawn_identity_backfill();
     }
-    // NAN-4190: query[T] keeps the window entity index (switch on only).
-    if nanosiem_lake_worker::part_query::entity_index::enabled() && !detect && !product {
+    // NAN-4190: query[T] keeps the window entity index (NAN-4772: always).
+    if !detect && !product {
         service.clone().spawn_entity_index();
     }
     phases.lap("service_ready");
@@ -706,6 +706,7 @@ const QUERY_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 fn main() -> anyhow::Result<()> {
     // FIRST: before any runtime, thread, or tenant I/O.
     let boot = nanosiem_lake_cell::child::bootstrap_with_native_init(|assignment| {
+        nanosiem_lake_worker::cgroup_memory::prepare(assignment.jail.cgroup_dir.as_deref());
         if matches!(assignment.role, Role::Query | Role::Product) || (assignment.role == Role::Detect && assignment.detect_runs_rules) {
             nanosiem_lake_worker::native::initialize_cell_runtime()?;
         }
@@ -713,6 +714,7 @@ fn main() -> anyhow::Result<()> {
     })?;
     nanosiem_lake_worker::process_limits::initialize()?;
     nanosiem_lake_worker::cell_logging::init_child_tracing();
+    nanosiem_lake_worker::cgroup_memory::initialize(boot.assignment.jail.cgroup_dir.as_deref());
     let threads = usize::try_from((boot.assignment.cpu_millis / 1000).clamp(1, 4)).unwrap_or(1) + 1;
     tokio::runtime::Builder::new_multi_thread()
         .on_thread_start(|| {

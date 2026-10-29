@@ -10,7 +10,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { TenantIngestEndpoint } from '@/lib/api/types';
 import { addDataLink } from '@/lib/add-data-sources';
@@ -27,9 +27,11 @@ const mocks = vi.hoisted(() => ({
   listParserRollouts: vi.fn(),
   getParserRollout: vi.fn(),
   validateLogSourceVrl: vi.fn(),
+  testLogSourceVrl: vi.fn(),
   createLogSource: vi.fn(),
   updateLogSource: vi.fn(),
   deployLogSource: vi.fn(),
+  requestIngestCredential: vi.fn(),
 }));
 
 vi.mock('@/contexts/AuthContext', () => ({
@@ -53,10 +55,11 @@ vi.mock('@/lib/api', () => ({
     getIngestEndpoint: mocks.getIngestEndpoint,
     listLogSources: mocks.listLogSources,
     listSourceConfigs: mocks.listSourceConfigs,
+    requestIngestCredential: mocks.requestIngestCredential,
     listParserRollouts: mocks.listParserRollouts,
     getParserRollout: mocks.getParserRollout,
     validateLogSourceVrl: mocks.validateLogSourceVrl,
-    testLogSourceVrl: async () => ({ success: true, output: {} }),
+    testLogSourceVrl: mocks.testLogSourceVrl,
     validateNamespace: async () => ({ valid: true }),
     createLogSource: mocks.createLogSource,
     updateLogSource: mocks.updateLogSource,
@@ -82,19 +85,28 @@ const endpoint: TenantIngestEndpoint = {
   ingress_contract: { version: 1, credential_kinds: ['source'], collector_credentials: false, source_declarations: [] },
 };
 
-function renderAddFeed(entry = '/ingestion/log-sources/wizard') {
+function LocationProbe() {
+  const location = useLocation();
+  return <span data-testid="location">{`${location.pathname}${location.search}`}</span>;
+}
+
+function renderAddFeed(entry = '/ingestion/log-sources/wizard', basename?: string) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={[entry]}>
+      <MemoryRouter basename={basename} initialEntries={[basename ? `${basename}${entry}` : entry]}>
         <AddFeed />
+        <LocationProbe />
       </MemoryRouter>
     </QueryClientProvider>,
   );
 }
 
+const wizardLocation = () => screen.getByTestId('location').textContent ?? '';
+
 beforeEach(() => {
   mocks.mode = 'enterprise_shared';
+  mocks.requestIngestCredential.mockReset().mockRejectedValue(new Error('Stop after recording the request'));
   mocks.getIngestEndpoint.mockReset().mockResolvedValue(endpoint);
   mocks.listLogSources.mockReset().mockResolvedValue([
     { id: 'feed_pa', name: 'Palo Alto traffic', match_values: ['palo_alto_traffic'], deployed: true, enabled: true, lifecycle_status: 'active' },
@@ -102,6 +114,7 @@ beforeEach(() => {
   mocks.listParserRollouts.mockReset().mockResolvedValue([]);
   mocks.getParserRollout.mockReset();
   mocks.validateLogSourceVrl.mockReset().mockResolvedValue({ valid: true, errors: [], diagnostics: [] });
+  mocks.testLogSourceVrl.mockReset().mockResolvedValue({ success: true, output: {} });
   mocks.createLogSource.mockReset().mockResolvedValue({ id: 'lsrc_vercel' });
   mocks.updateLogSource.mockReset().mockResolvedValue({ id: 'lsrc_vercel' });
   mocks.deployLogSource.mockReset().mockResolvedValue({ success: true, message: 'ok', rollout: null });
@@ -171,6 +184,34 @@ describe('AddFeed → Add data (NAN-2593)', () => {
     expect(screen.getByRole('button', { name: /continue · sample & parse/i })).toBeTruthy();
     expect(screen.getAllByText('Review & activate').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Issue a credential').length).toBe(1);
+  });
+
+  it('NAN-4792: the real sample splitter sends 16 lines until Join is clicked, then sends 8', async () => {
+    const heads = Array.from({ length: 8 }, (_, i) => `<134>Oct 28 14:02:1${i} fw01 action=allow seq=${i}`);
+    const tail = 'bytes_out=1832 bytes_in=48211 user=alice';
+    const wrapped = heads.map((head) => `${head}\n  ${tail}`).join('\n');
+    const clean = heads.map((head) => `${head} ${tail}`).join('\n');
+    renderAddFeed();
+    await screen.findByTestId('ingest-endpoint-card');
+    fireEvent.click(screen.getByRole('tab', { name: 'New custom source' }));
+    fireEvent.change(screen.getByPlaceholderText('aws_cloudtrail'), { target: { value: 'firewall' } });
+    fireEvent.click(screen.getAllByText('Sample & parse')[0]);
+    const box = screen.getByPlaceholderText(/^\{"timestamp":/) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: wrapped } });
+    fireEvent.change(await screen.findByLabelText('VRL'), { target: { value: '.action = "allow"' } });
+    expect(screen.getByTestId('sample-split').textContent).toBe('16 sample lines · one event per line');
+    expect(screen.getByRole('status').textContent).toContain('8 of 16 lines');
+    await waitFor(() => expect(mocks.testLogSourceVrl).toHaveBeenCalledTimes(16));
+    expect(box.value).toBe(wrapped);
+    expect(mocks.testLogSourceVrl.mock.calls.map((call) => call[1])).toEqual(wrapped.split('\n'));
+
+    mocks.testLogSourceVrl.mockClear();
+    fireEvent.click(screen.getByRole('button', { name: 'Join wrapped lines' }));
+    expect(box.value).toBe(clean);
+    expect(screen.getByTestId('sample-split').textContent).toBe('8 sample lines · one event per line');
+    expect(screen.queryByRole('button', { name: 'Join wrapped lines' })).toBeNull();
+    await waitFor(() => expect(mocks.testLogSourceVrl).toHaveBeenCalledTimes(8));
+    expect(mocks.testLogSourceVrl.mock.calls.map((call) => call[1])).toEqual(clean.split('\n'));
   });
 
   it('a custom source with an empty parser is blocked on the parser, not on a phantom acknowledgement (NAN-4754)', async () => {
@@ -298,6 +339,112 @@ describe('AddFeed → Add data (NAN-2593)', () => {
     expect(within(strip).getByTestId('rollout-state').textContent).toBe('Building');
     const panel = await screen.findByTestId('issue-credential-panel');
     expect(panel.textContent).toContain('held at the edge');
+  });
+
+  // NAN-4800, the AU report: after issuing at Step 2 the user clicked "Log
+  // Sources → Credentials", a raw <a> that left /t/<tenant> (tenant_required →
+  // login), and then had to rebuild the source from Step 1.
+  describe('NAN-4800: tenant links and resuming the Issue step', () => {
+    const BASE = '/t/acme';
+
+    it('"Log Sources → Credentials" keeps the /t/<tenant> prefix and opens in a new tab', async () => {
+      renderAddFeed('/ingestion/log-sources/wizard', BASE);
+      const list = await screen.findByRole('radiogroup', { name: 'Existing source' });
+      fireEvent.click(within(list).getByText('palo_alto_traffic'));
+      fireEvent.click(screen.getByRole('button', { name: /continue · issue credential/i }));
+      await screen.findByTestId('issue-credential-panel');
+      const link = screen.getByRole('link', { name: 'Log Sources → Credentials' });
+      expect(link.getAttribute('href')).toBe('/t/acme/ingestion/log-sources/credentials');
+      expect(link.getAttribute('target')).toBe('_blank');
+    });
+
+    it('an existing source: the Issue step is addressable, so a reload resumes at Issue', async () => {
+      const first = renderAddFeed('/ingestion/log-sources/wizard', BASE);
+      const list = await screen.findByRole('radiogroup', { name: 'Existing source' });
+      fireEvent.click(within(list).getByText('palo_alto_traffic'));
+      fireEvent.click(screen.getByRole('button', { name: /continue · issue credential/i }));
+      await screen.findByTestId('issue-credential-panel');
+      await waitFor(() => expect(wizardLocation()).toBe('/ingestion/log-sources/wizard?source=palo_alto_traffic'));
+      const resumed = wizardLocation();
+      first.unmount();
+
+      renderAddFeed(resumed, BASE);
+      const panel = await screen.findByTestId('issue-credential-panel');
+      expect(panel.textContent).toContain('palo_alto_traffic');
+      expect(screen.queryByText('Sample & parse')).toBeNull();
+    });
+
+    it('an activated custom source resumes at Issue, never back through samples, VRL and activation', async () => {
+      const gate = await customSourceWithParser();
+      await waitFor(() => expect(within(gate).getByTestId('gate-namespace').getAttribute('data-status')).toBe('ok'));
+      fireEvent.click(within(gate).getByRole('checkbox'));
+      const activate = screen.getByRole('button', { name: /activate source/i }) as HTMLButtonElement;
+      await waitFor(() => expect(activate.disabled).toBe(false));
+      fireEvent.click(activate);
+      await screen.findByTestId('issue-credential-panel');
+      await waitFor(() => expect(wizardLocation()).toBe('/ingestion/log-sources/wizard?source=vercel'));
+      const resumed = wizardLocation();
+      cleanup();
+
+      // The activated source is in the registry now (rolling out).
+      mocks.listLogSources.mockResolvedValue([
+        { id: 'feed_pa', name: 'Palo Alto traffic', match_values: ['palo_alto_traffic'], deployed: true, enabled: true, lifecycle_status: 'active' },
+        { id: 'lsrc_vercel', name: 'vercel', match_values: ['vercel'], deployed: true, enabled: true, lifecycle_status: 'active' },
+      ]);
+      mocks.createLogSource.mockClear();
+      mocks.deployLogSource.mockClear();
+      renderAddFeed(resumed);
+      const panel = await screen.findByTestId('issue-credential-panel');
+      expect(panel.textContent).toContain('vercel');
+      expect(screen.queryByText('Sample & parse')).toBeNull();
+      expect(screen.queryByLabelText('VRL')).toBeNull();
+      expect(mocks.createLogSource).not.toHaveBeenCalled();
+      expect(mocks.deployLogSource).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['palo_alto_traffic', 'feed_pa'],
+      ['okta', undefined],
+    ])('resuming %s sends only that source and its own registry id to the issuance API', async (slug, id) => {
+      renderAddFeed(`/ingestion/log-sources/wizard?source=${slug}`, BASE);
+      const panel = await screen.findByTestId('issue-credential-panel');
+      expect(panel.textContent).toContain(slug);
+      fireEvent.click(within(panel).getByRole('button', { name: 'Issue credential' }));
+      await waitFor(() => expect(mocks.requestIngestCredential).toHaveBeenCalledTimes(1));
+      const input = mocks.requestIngestCredential.mock.calls[0][0];
+      expect(input.kind).toBe('source');
+      expect(input.source_slugs).toEqual([slug]);
+      expect(input.log_source_id).toBe(id);
+      expect(input.reveal_public_key).toBeTruthy();
+    });
+
+    it('an unknown source never falls back to issuing for a different source', async () => {
+      renderAddFeed('/ingestion/log-sources/wizard?source=missing', BASE);
+      await screen.findByRole('radiogroup', { name: 'Existing source' });
+      expect(screen.queryByTestId('issue-credential-panel')).toBeNull();
+      expect(mocks.requestIngestCredential).not.toHaveBeenCalled();
+    });
+
+    it('a collector credential resumes at Issue with the same sources', async () => {
+      mocks.getIngestEndpoint.mockResolvedValue({
+        ...endpoint,
+        ingress_contract: { version: 2, credential_kinds: ['source', 'collector'], collector_credentials: true, source_declarations: ['hec:event.sourcetype'] },
+      });
+      const first = renderAddFeed();
+      fireEvent.click(await screen.findByRole('radio', { name: 'Collector' }));
+      const group = await screen.findByRole('group', { name: 'Collector sources' });
+      fireEvent.click(within(group).getByRole('checkbox', { name: 'palo_alto_traffic' }));
+      fireEvent.click(within(group).getByRole('checkbox', { name: 'okta' }));
+      fireEvent.click(screen.getByRole('button', { name: /continue · issue collector/i }));
+      await screen.findByTestId('issue-credential-panel');
+      await waitFor(() => expect(wizardLocation()).toBe('/ingestion/log-sources/wizard?sources=palo_alto_traffic%2Cokta'));
+      const resumed = wizardLocation();
+      first.unmount();
+
+      renderAddFeed(resumed);
+      const panel = await screen.findByTestId('issue-credential-panel');
+      expect(within(panel).getByTestId('collector-source-count').textContent).toBe('2');
+    });
   });
 
   it('dedicated deployments keep the original transport picker', async () => {

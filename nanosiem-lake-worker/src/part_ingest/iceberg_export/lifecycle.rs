@@ -87,6 +87,20 @@ pub trait CatalogLifecycleBackend: IcebergCommitter {
     async fn adopt_serving(&self) -> Result<bool> {
         Ok(false)
     }
+    /// NAN-4798: `Some(checkpoint)` when this backend already published a
+    /// fresh serving epoch under the read fence that is still closed (reads
+    /// never reopened since), holding the master exactly at `checkpoint`.
+    /// Removals planned at or before it are already reflected in that epoch.
+    /// The default never claims one: every closed sync mints.
+    fn published_under_fence(&self) -> Option<i64> {
+        None
+    }
+    /// NAN-4798: re-close reads around the epoch [`Self::published_under_fence`]
+    /// names, WITHOUT minting a new one. A backend with no such epoch closes
+    /// (and mints) exactly like [`Self::close_and_drain`].
+    async fn resume_fence(&self) -> Result<()> {
+        self.close_and_drain().await
+    }
 }
 
 /// See [`CatalogLifecycleBackend::set_vanished`].
@@ -183,12 +197,12 @@ impl RestLifecycleBackend {
             .committer
             .load_catalog()
             .await
-            .map_err(|_| anyhow::anyhow!("catalog epoch listing session unavailable"))?;
+            .map_err(|e| super::control_retry::unavailable(e, "catalog epoch listing session unavailable"))?;
         let namespace = self.committer.table_id().namespace.clone();
         let tables = catalog
             .list_tables(&namespace)
             .await
-            .map_err(|_| anyhow::anyhow!("catalog epoch listing unavailable"))?;
+            .map_err(|e| super::control_retry::unavailable(e, "catalog epoch listing unavailable"))?;
         ensure!(tables.len() <= 4096, "catalog epoch listing exceeds bound");
         let mut epochs = BTreeSet::new();
         for table in tables {
@@ -198,6 +212,18 @@ impl RestLifecycleBackend {
             }
         }
         Ok(epochs)
+    }
+
+    /// NAN-4782: see [`super::RestIcebergCommitter::live_entries`].
+    pub(crate) async fn committed_entries(&self) -> Result<super::LiveEntries> {
+        self.committer.live_entries().await
+    }
+
+    /// NAN-4782: see [`super::RestIcebergCommitter::seed`]. Maintenance
+    /// controls are verified first, exactly like every commit.
+    pub(crate) async fn seed_from(&self, entries: &super::LiveEntries) -> Result<()> {
+        self.verify_maintenance().await?;
+        self.committer.seed(entries).await
     }
 
     /// Only the activation writer calls this, AFTER the coordinator has
@@ -235,26 +261,26 @@ impl CatalogLifecycleBackend for RestLifecycleBackend {
         self.policy
             .verify_manual_maintenance(self.committer.table_id())
             .await
-            .map_err(|_| anyhow::anyhow!("catalog automatic maintenance controls unavailable"))
+            .map_err(|e| super::control_retry::unavailable(e, "catalog automatic maintenance controls unavailable"))
     }
     async fn export_head(&self, with_parts: bool) -> Result<super::ExportHead> {
         let catalog = self
             .committer
             .load_catalog()
             .await
-            .map_err(|_| anyhow::anyhow!("catalog export head session unavailable"))?;
+            .map_err(|e| super::control_retry::unavailable(e, "catalog export head session unavailable"))?;
         let id = self.committer.table_id();
         if !catalog
             .table_exists(id)
             .await
-            .map_err(|_| anyhow::anyhow!("catalog export head lookup unavailable"))?
+            .map_err(|e| super::control_retry::unavailable(e, "catalog export head lookup unavailable"))?
         {
             return Ok(super::ExportHead::default());
         }
         let table = catalog
             .load_table(id)
             .await
-            .map_err(|_| anyhow::anyhow!("catalog export head table unavailable"))?;
+            .map_err(|e| super::control_retry::unavailable(e, "catalog export head table unavailable"))?;
         self.committer.table.contract.validate_table(
             &table,
             self.tenant_id(),
@@ -274,19 +300,19 @@ impl CatalogLifecycleBackend for RestLifecycleBackend {
             .committer
             .load_catalog()
             .await
-            .map_err(|_| anyhow::anyhow!("catalog commit-state session unavailable"))?;
+            .map_err(|e| super::control_retry::unavailable(e, "catalog commit-state session unavailable"))?;
         let id = self.committer.table_id();
         if !catalog
             .table_exists(id)
             .await
-            .map_err(|_| anyhow::anyhow!("catalog commit-state lookup unavailable"))?
+            .map_err(|e| super::control_retry::unavailable(e, "catalog commit-state lookup unavailable"))?
         {
             return Ok(true);
         }
         let table = catalog
             .load_table(id)
             .await
-            .map_err(|_| anyhow::anyhow!("catalog commit-state table unavailable"))?;
+            .map_err(|e| super::control_retry::unavailable(e, "catalog commit-state table unavailable"))?;
         self.committer.table.contract.validate_table(
             &table,
             self.tenant_id(),
@@ -309,12 +335,12 @@ impl CatalogLifecycleBackend for RestLifecycleBackend {
             .committer
             .load_catalog()
             .await
-            .map_err(|_| anyhow::anyhow!("catalog lifecycle session unavailable"))?;
+            .map_err(|e| super::control_retry::unavailable(e, "catalog lifecycle session unavailable"))?;
         let id = self.committer.table_id();
         let table = catalog
             .load_table(id)
             .await
-            .map_err(|_| anyhow::anyhow!("catalog lifecycle table unavailable"))?;
+            .map_err(|e| super::control_retry::unavailable(e, "catalog lifecycle table unavailable"))?;
         self.committer.table.contract.validate_table(
             &table,
             self.tenant_id(),
@@ -326,19 +352,21 @@ impl CatalogLifecycleBackend for RestLifecycleBackend {
                 .committer
                 .commit_client()
                 .await
-                .map_err(|_| anyhow::anyhow!("catalog expiry session unavailable"))?;
-            ensure!(
-                matches!(
-                    client.commit(requirements, updates).await,
-                    Ok(CommitOutcome::Committed(_))
-                ),
-                "catalog expiry unacknowledged"
-            );
+                .map_err(|e| super::control_retry::unavailable(e, "catalog expiry session unavailable"))?;
+            // NAN-4798: a lost response is retryable (expiry is idempotent:
+            // the reload below sees it landed, or the retry re-plans it).
+            match client.commit(requirements, updates).await {
+                Ok(CommitOutcome::Committed(_)) => {}
+                Ok(_) => anyhow::bail!("catalog expiry unacknowledged"),
+                Err(error) => {
+                    return Err(super::control_retry::unavailable(error, "catalog expiry unacknowledged"))
+                }
+            }
         }
         let reloaded = catalog
             .load_table(id)
             .await
-            .map_err(|_| anyhow::anyhow!("catalog expiry reload unavailable"))?;
+            .map_err(|e| super::control_retry::unavailable(e, "catalog expiry reload unavailable"))?;
         ensure!(
             reloaded.metadata().uuid() == table.metadata().uuid()
                 && reloaded.metadata().current_snapshot_id()
@@ -546,6 +574,17 @@ pub struct TenantCatalog {
     /// receipt is never minted for a live part: that is a liveness check
     /// (GC asking for live data is a bug elsewhere), not a catalog gate.
     live: std::sync::Mutex<Option<BTreeSet<String>>>,
+    /// NAN-4783: the live sets of the syncs running now (waiting on or
+    /// holding custody). A GC fence never waits behind one of them.
+    syncs: std::sync::Mutex<SyncsInFlight>,
+    /// NAN-4783: every part the remote catalog may reference, the master and
+    /// through it every published serving epoch (NAN-4662): the last
+    /// inspection under custody, plus every part a commit since may have
+    /// added (recorded BEFORE the commit), plus removals whose result-cache
+    /// invalidation has not settled. `None` until this volume's first
+    /// inspection. The same mutex orders a commit's admission against a GC
+    /// receipt minted beside a running sync (see [`Self::fence_beside_sync`]).
+    referenced: std::sync::Mutex<Option<BTreeSet<String>>>,
     /// NAN-4721: set by the ingest loop from its lag alert; the backend's
     /// agent-catalog work yields while it is set.
     pressure: Arc<crate::part_ingest::agent_lane::IngestPressure>,
@@ -566,8 +605,8 @@ pub(crate) struct SyncLimits {
 
 impl SyncLimits {
     pub(crate) const DEFAULT: Self = Self {
-        // The lock-hold profile of the old whole-sync bound: a GC pass that
-        // waits on custody (120 s) sees the same contention as before.
+        // The lock-hold profile of the old whole-sync bound. A GC fence no
+        // longer waits on a sync's custody at all (NAN-4783).
         batch_budget: std::time::Duration::from_secs(120),
         hard_bound: std::time::Duration::from_secs(30 * 60),
         batch: crate::part_ingest::export::ExportBatchBounds::DEFAULT,
@@ -584,6 +623,33 @@ pub struct CatalogSyncIncomplete {
     pub committed: usize,
     pub remaining: usize,
 }
+
+/// NAN-4783: see [`TenantCatalog::syncs`].
+#[derive(Default)]
+struct SyncsInFlight {
+    next: u64,
+    live: std::collections::BTreeMap<u64, BTreeSet<String>>,
+}
+
+/// Registered for a sync's whole run, including its wait for custody;
+/// dropped with the sync (success, error, hard bound or cancellation).
+struct SyncInFlight<'a> {
+    catalog: &'a TenantCatalog,
+    id: u64,
+}
+impl Drop for SyncInFlight<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut syncs) = self.catalog.syncs.lock() {
+            syncs.live.remove(&self.id);
+        }
+    }
+}
+
+/// NAN-4783: how long a GC fence waits for custody held by something other
+/// than a sync (another fence's bounded inspection, the installation fence)
+/// before it decides beside it. A running sync is never waited for.
+const CUSTODY_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+const CUSTODY_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 #[derive(Default)]
 struct CustodyState {
@@ -677,6 +743,8 @@ impl TenantCatalog {
             lock: tokio::sync::Mutex::new(CustodyState::default()),
             limits: SyncLimits::DEFAULT,
             live: std::sync::Mutex::new(None),
+            syncs: std::sync::Mutex::new(SyncsInFlight::default()),
+            referenced: std::sync::Mutex::new(None),
             pressure: Arc::default(),
             _lease: lease,
         };
@@ -745,6 +813,10 @@ impl TenantCatalog {
                 crate::parts::levels::Level::Hour | crate::parts::levels::Level::Day
             )
         });
+        // NAN-4783: registered before the receipt filter and before the
+        // custody wait, so a GC fence beside this sync never receipts a part
+        // this sync may plan.
+        let _in_flight = self.register_sync(&refs)?;
         // A receipted part may already be deleted by part GC (which never
         // waits on this catalog): it must never (re)enter the catalog, and
         // the plan below removes it wherever the catalog still holds it.
@@ -784,17 +856,32 @@ impl TenantCatalog {
             // Decide every removal fence before adoption can mark platform
             // custody converged. Equality with the master alone does not prove
             // that the master has already seen an erasure from this live set.
-            let mut privacy = closed || pending.iter().any(|(hour, _)| {
+            //
+            // NAN-4798: reads that are closed only because the previous sync
+            // failed AFTER publishing a fresh epoch under this fence (retire,
+            // purge, invalidate or reopen) are not a new privacy event: that
+            // epoch already reflects every removal committed up to its
+            // checkpoint and has never served a read. Finish it. Any removal
+            // planned after that checkpoint, any newly planned removal, a
+            // degraded lane or a wiped index still forces a fresh epoch.
+            let finishing = if closed && !self.work_dir.join(GC_DEGRADED).try_exists()? {
+                self.backend.published_under_fence()
+            } else {
+                None
+            };
+            let after_publish = |planned_at: i64| finishing.is_none_or(|checkpoint| planned_at > checkpoint);
+            let mut fresh = pending.iter().any(|(hour, _)| {
                 state.exported.get(&hour.event_hour).is_some_and(|old| old.iter().any(|p| !hour.parts.contains(p)))
             });
             for path in &plans {
                 let manifest: ExportManifest = serde_json::from_slice(&std::fs::read(path)?)?;
-                privacy |= !manifest.remove_parts.is_empty() || manifest.add.iter().any(|p| !desired.contains(p.part_id.as_str()));
+                fresh |= after_publish(manifest.planned_at_ms)
+                    && (!manifest.remove_parts.is_empty() || manifest.add.iter().any(|p| !desired.contains(p.part_id.as_str())));
             }
             // NAN-4614: removals committed by an earlier sync's non-final
             // batch and not yet settled; this sync's last batch settles them.
             let mut removed = self.unsettled()?;
-            privacy |= !removed.is_empty();
+            fresh |= self.unsettled_planned()?.into_iter().any(|at| at.is_none_or(after_publish));
             // NAN-4774: a wiped volume has no planned index, which alone
             // forced a privacy pass: close reads, mint a fresh epoch and build
             // it from the whole live set (hours of cold reads after every
@@ -803,7 +890,7 @@ impl TenantCatalog {
             // published epoch still equals the reconciled master, continue it.
             // A removal already implied by this live set refuses adoption.
             let indexed = self.work_dir.join(PLANNED_INDEX_READY).try_exists()?;
-            let adopted = !privacy && !indexed && plans.is_empty()
+            let adopted = !closed && !fresh && !indexed && plans.is_empty()
                 && match self.backend.adopt_serving().await {
                     Ok(adopted) => adopted,
                     Err(error) => {
@@ -814,8 +901,16 @@ impl TenantCatalog {
             if adopted {
                 tracing::info!("wiped writer adopted the published serving epoch; no rebuild");
             }
-            privacy |= !indexed && !adopted;
-            if privacy { self.close().await?; }
+            fresh |= !indexed && !adopted;
+            let privacy = closed || fresh;
+            if privacy {
+                if finishing.is_some() && !fresh {
+                    // The marker is already on disk; reads stay closed.
+                    self.backend.resume_fence().await?;
+                } else {
+                    self.close().await?;
+                }
+            }
             self.backend.verify_maintenance().await?;
             let plans = self.rebatch_backlog_head(plans).await?;
             tracing::info!(stage = "reconciled", backlog = plans.len(), hours = pending.len(), privacy,
@@ -857,6 +952,7 @@ impl TenantCatalog {
             tracing::info!(stage = "published", batches = published,
                 elapsed_ms = started.elapsed().as_millis() as u64, "catalog sync stage");
             let remaining = self.backend.expire_and_inspect().await?;
+            self.note_inspected(&remaining, &removed)?;
             if !remaining.iter().all(|p| desired.contains(p.as_str())) {
                 self.close().await?;
                 anyhow::bail!("catalog contains parts outside the committed live set; recover durable custody");
@@ -1117,16 +1213,11 @@ impl TenantCatalog {
         let manifest: ExportManifest = serde_json::from_slice(&std::fs::read(path)?)?;
         super::validate_manifest(&manifest, &self.tenant, 100_000)?;
         ensure!(
-            manifest.add.iter().all(|p| !self
-                .receipt_path(&p.part_id)
-                .is_ok_and(|path| path.exists())),
-            "catalog publication would resurrect a retired part"
-        );
-        ensure!(
             privacy || manifest.remove_parts.is_empty(),
             "catalog removal requires read barrier"
         );
         self.backend.verify_maintenance().await?;
+        self.admit_adds(&manifest)?;
         self.backend.commit(&manifest).await?;
         let digest = manifest_digest(&manifest)?;
         let batch = manifest.remove_parts.iter().map(|part| (part.clone(), digest.clone())).collect::<Vec<_>>();
@@ -1146,6 +1237,7 @@ impl TenantCatalog {
         }
         removed.extend(batch);
         let referenced = self.backend.expire_and_inspect().await?;
+        self.note_inspected(&referenced, removed)?;
         ensure!(
             removed.iter().all(|(part, _)| !referenced.contains(part)),
             "catalog still exposes removed part metadata"
@@ -1166,6 +1258,16 @@ impl TenantCatalog {
         }
         self.settle_removed(removed)?;
         self.acknowledge(path)
+    }
+
+    /// NAN-4798: the plan time of every unsettled removal batch (its record
+    /// is named by the manifest's `planned_at_ms`); `None` when unparseable.
+    fn unsettled_planned(&self) -> Result<Vec<Option<i64>>> {
+        Ok(self
+            .manifests("unsettled")?
+            .iter()
+            .map(|path| path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse().ok()))
+            .collect())
     }
 
     /// Removals committed by acknowledged non-final batches, not yet settled.
@@ -1346,6 +1448,8 @@ impl TenantCatalog {
     /// through the privacy path (durable marker first), the part is
     /// receipted, and the writer's next sync drops it from the catalog and
     /// publishes a fresh epoch before reads reopen. See [`Self::degrade`].
+    /// A fence never waits behind a running sync (NAN-4783): beside one it
+    /// decides without custody, see [`Self::fence_beside_sync`].
     pub(crate) async fn fence_in_pass(
         &self,
         tenant: &str,
@@ -1354,8 +1458,13 @@ impl TenantCatalog {
     ) -> Result<CatalogRemovedReceipt> {
         self.validate_tenant(tenant)?;
         self.receipt_path(part)?;
+        // NAN-4783: never wait behind a sync (it holds custody for its whole
+        // run, up to its 30 min hard bound). Beside one, decide from the
+        // inspected snapshot without custody; a wait is never a refusal.
+        let Some(custody) = self.custody_unless_syncing().await? else {
+            return self.fence_beside_sync(tenant, part);
+        };
         tokio::time::timeout(std::time::Duration::from_secs(120), async {
-            let custody = self.lock.lock().await;
             if self.receipt_path(part)?.exists() {
                 return self.require_removed(tenant, part);
             }
@@ -1393,6 +1502,117 @@ impl TenantCatalog {
         })
         .await
         .context("catalog retirement timed out; part retained")?
+    }
+
+    /// NAN-4783: custody, unless a sync is running (now or once it starts
+    /// waiting) or custody stays held past [`CUSTODY_WAIT`]: `None`, never a
+    /// timeout error. Polled, so a sync that queues behind another holder is
+    /// seen at once instead of being waited out.
+    async fn custody_unless_syncing(&self) -> Result<Option<tokio::sync::MutexGuard<'_, CustodyState>>> {
+        let started = tokio::time::Instant::now();
+        loop {
+            if self.sync_running()? {
+                return Ok(None);
+            }
+            if let Ok(custody) = self.lock.try_lock() {
+                return Ok(Some(custody));
+            }
+            if started.elapsed() >= CUSTODY_WAIT {
+                return Ok(None);
+            }
+            tokio::time::sleep(CUSTODY_POLL).await;
+        }
+    }
+
+    fn sync_running(&self) -> Result<bool> {
+        Ok(!self.syncs.lock().map_err(|_| anyhow::anyhow!("catalog sync registry poisoned"))?.live.is_empty())
+    }
+
+    fn register_sync(&self, refs: &[PartRef]) -> Result<SyncInFlight<'_>> {
+        let mut syncs = self.syncs.lock().map_err(|_| anyhow::anyhow!("catalog sync registry poisoned"))?;
+        let id = syncs.next;
+        syncs.next = id.checked_add(1).context("catalog sync id overflow")?;
+        syncs.live.insert(id, refs.iter().map(|p| p.part_id.to_string()).collect());
+        Ok(SyncInFlight { catalog: self, id })
+    }
+
+    /// NAN-4783: a commit may add only parts recorded in `referenced` first,
+    /// and never a receipted one; both under the `referenced` lock, which a
+    /// GC receipt beside a sync also holds. Either the receipt lands first
+    /// (this refuses) or the part is recorded first (that GC holds it).
+    fn admit_adds(&self, manifest: &ExportManifest) -> Result<()> {
+        let mut referenced = self.referenced.lock().map_err(|_| anyhow::anyhow!("catalog reference snapshot poisoned"))?;
+        if let Some(set) = referenced.as_mut() {
+            set.extend(manifest.add.iter().map(|p| p.part_id.clone()));
+        }
+        ensure!(
+            manifest.add.iter().all(|p| !self
+                .receipt_path(&p.part_id)
+                .is_ok_and(|path| path.exists())),
+            "catalog publication would resurrect a retired part"
+        );
+        Ok(())
+    }
+
+    /// NAN-4783: a completed inspection (under custody) replaces the
+    /// snapshot. Removals not yet settled stay in it: their result-cache
+    /// invalidation has not happened, so only their settling receipt (or the
+    /// custody path's own invalidation) may release them.
+    fn note_inspected(&self, inspected: &BTreeSet<String>, unsettled: &[(String, String)]) -> Result<()> {
+        let mut snapshot = inspected.clone();
+        snapshot.extend(unsettled.iter().map(|(part, _)| part.clone()));
+        *self.referenced.lock().map_err(|_| anyhow::anyhow!("catalog reference snapshot poisoned"))? = Some(snapshot);
+        Ok(())
+    }
+
+    /// NAN-4783: a GC fence beside a running sync. No custody, no provider
+    /// call, no wait. Receipts only what nothing in the catalog can
+    /// reference: a part never planned (complete planned index), or one the
+    /// inspected snapshot (with every add admitted since) does not hold.
+    /// Anything else is held for this key only (the pass goes on, no
+    /// back-off): a live part, a part the catalog still references (the
+    /// running sync removes and receipts it), or no inspection yet.
+    fn fence_beside_sync(&self, tenant: &str, part: &str) -> Result<CatalogRemovedReceipt> {
+        if self.receipt_path(part)?.exists() {
+            return self.require_removed(tenant, part);
+        }
+        let live = {
+            let latest = self.live.lock().map_err(|_| anyhow::anyhow!("catalog live set poisoned"))?
+                .as_ref().is_some_and(|live| live.contains(part));
+            latest || self.syncs.lock().map_err(|_| anyhow::anyhow!("catalog sync registry poisoned"))?
+                .live.values().any(|live| live.contains(part))
+        };
+        if live {
+            return Err(anyhow::Error::new(CatalogPinsPart));
+        }
+        #[cfg(test)]
+        custody_tests::before_beside_snapshot();
+        // Held across the receipt write: orders it against `admit_adds`.
+        let referenced = self.referenced.lock().map_err(|_| anyhow::anyhow!("catalog reference snapshot poisoned"))?;
+        // Check the index under that same lock: a sync may have remembered
+        // and admitted this part after the live check above. A stale absence
+        // must never bypass the admitted references.
+        let never_planned = self.planned_index_ready()? && !self.planned_path(part)?.try_exists()?;
+        let evidence = if never_planned {
+            serde_json::to_vec(&(tenant, &self.bucket, part, "never-planned"))?
+        } else {
+            match referenced.as_ref() {
+                None => return Err(anyhow::Error::new(CatalogPartUnproven(
+                    "catalog sync in flight and no inspected catalog snapshot yet; retry next pass".into(),
+                ))),
+                Some(set) if set.contains(part) => return Err(anyhow::Error::new(CatalogPinsPart)),
+                Some(_) => serde_json::to_vec(&(tenant, &self.bucket, part, "unreferenced-in-inspected-catalog"))?,
+            }
+        };
+        let receipt = CatalogRemovedReceipt {
+            tenant_id: self.tenant.clone(),
+            bucket: self.bucket.clone(),
+            part_id: part.into(),
+            manifest_sha256: crate::parts::sha256_hex(&evidence),
+        };
+        self.record_receipt(&receipt)?;
+        drop(referenced);
+        Ok(receipt)
     }
 
     /// The pre-decoupling proofs that `part` is unreferenced. `Ok((evidence,
@@ -1436,6 +1656,11 @@ impl TenantCatalog {
                 // The pinned check for this part (and every later
                 // one) runs below against the cached proof (NAN-4612).
                 let referenced = self.backend.expire_and_inspect().await?;
+                // Unreadable unsettled records: keep the older snapshot (a
+                // superset); the proof itself stands either way.
+                if let Ok(unsettled) = self.unsettled() {
+                    self.note_inspected(&referenced, &unsettled)?;
+                }
                 Ok(RetirementProof { tenant: self.tenant.clone(), generation, referenced })
             })
             .await

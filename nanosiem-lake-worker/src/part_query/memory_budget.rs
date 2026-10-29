@@ -133,7 +133,7 @@ impl QueryMemoryBudget {
 
     /// [`Self::derive`] against this process's own cgroup.
     pub fn for_process(assigned_bytes: u64) -> Self {
-        let cgroup = cgroup_memory_max(Path::new("/proc/self/cgroup"), Path::new("/sys/fs/cgroup"));
+        let cgroup = crate::cgroup_memory::for_process().limit().map(|limit| limit.bytes);
         let budget = Self::derive(assigned_bytes, cgroup);
         tracing::info!(
             assigned_bytes, cgroup_memory_max = ?cgroup, limit_bytes = budget.limit_bytes,
@@ -145,25 +145,13 @@ impl QueryMemoryBudget {
     }
 }
 
-/// The tightest `memory.max` on the process's cgroup v2 path (the cgroup
+/// The tightest memory limit on the process's cgroup path (the cgroup
 /// and every ancestor visible under `root`); `None` when unreadable or
 /// unlimited everywhere (e.g. the jail hides `/sys/fs/cgroup`).
 pub fn cgroup_memory_max(proc_cgroup: &Path, root: &Path) -> Option<u64> {
     let text = std::fs::read_to_string(proc_cgroup).ok()?;
-    let relative = text.lines().find_map(|line| line.strip_prefix("0::"))?.trim();
-    let mut dir = root.join(relative.trim_start_matches('/'));
-    let mut tightest: Option<u64> = None;
-    loop {
-        if let Ok(value) = std::fs::read_to_string(dir.join("memory.max")) {
-            if let Ok(bytes) = value.trim().parse::<u64>() {
-                tightest = Some(tightest.map_or(bytes, |t| t.min(bytes)));
-            }
-        }
-        if dir == root || !dir.pop() || !dir.starts_with(root) {
-            break;
-        }
-    }
-    tightest.filter(|bytes| *bytes > 0)
+    let mountinfo = std::fs::read_to_string(proc_cgroup.with_file_name("mountinfo")).unwrap_or_default();
+    crate::cgroup_memory::resolve(root, &text, &mountinfo, None).limit().map(|limit| limit.bytes)
 }
 
 /// Return freed Rust heap to the kernel (glibc keeps per-thread arenas

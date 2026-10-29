@@ -21,7 +21,13 @@ Use environment configuration for an operator-supplied admin password.
 Unattended output omits bootstrap passwords and ingestion tokens. Docker Compose
 2.24+ and Python 3 are required. `lean-init` calls lane A's `nanosiem-lake-cell
 trusted-local init`; shell code generates no tenant ID or cell keys. Reruns
-reuse identity. The initializer sizes cell budgets from host capacity. Back up
+reuse identity. The initializer sizes cell budgets from host capacity. By default
+it assigns half the host memory to the cell. Default ingest sizing reserves room
+for flushes and background compaction using the shared full-flush sizing curve,
+capped at half the cell. For example, a 16 GiB host
+gets a 4 GiB ingest role and a 2 GiB query role. The shift comes from query's
+share while query retains at least 1 GiB; the total cell allocation stays the
+same. An explicit target rate keeps using the existing rate-based sizing. Back up
 `.nano-lean` alongside PostgreSQL, RustFS, `nano-lean-cell`, and `nano-lean-otel`.
 
 The installer probes isolation with the runtime capability set, read-only root,

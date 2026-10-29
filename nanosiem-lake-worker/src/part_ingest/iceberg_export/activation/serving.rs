@@ -9,16 +9,30 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use crate::part_ingest::agent_lane::IngestPressure;
+use super::super::LiveEntries;
 use std::{collections::BTreeSet, sync::Mutex};
+use super::super::control_retry::{is_transient, retry, RetryPolicy};
 
 #[async_trait::async_trait]
 pub(super) trait ServingTable: CatalogLifecycleBackend {
     async fn retire(&self) -> Result<()>;
+    /// NAN-4782: the current snapshot as reusable catalog entries (the
+    /// master's live data files, checkpoint and digest). Metadata reads only.
+    async fn live_entries(&self) -> Result<LiveEntries>;
+    /// NAN-4782: hold exactly `entries` in one metadata-only commit; no part
+    /// file is read. Idempotent.
+    async fn seed(&self, entries: &LiveEntries) -> Result<()>;
 }
 #[async_trait::async_trait]
 impl ServingTable for RestLifecycleBackend {
     async fn retire(&self) -> Result<()> {
         self.retire_serving_table().await
+    }
+    async fn live_entries(&self) -> Result<LiveEntries> {
+        self.committed_entries().await
+    }
+    async fn seed(&self, entries: &LiveEntries) -> Result<()> {
+        self.seed_from(entries).await
     }
 }
 #[async_trait::async_trait]
@@ -57,6 +71,15 @@ struct State {
     last_plan_ms: i64,
     #[serde(default)]
     probe_hour: Option<i64>,
+    /// NAN-4798: `active` was published as a fresh epoch under the read
+    /// fence that is still closed (reads never reopened since), holding the
+    /// master exactly at this export checkpoint (`i64::MIN`: an empty
+    /// master). A later sync that finds the fence closed only because the
+    /// previous one failed after that publish (retire, purge, invalidate or
+    /// reopen) finishes it instead of minting another epoch. Cleared by a
+    /// successful reopen and by every mint.
+    #[serde(default)]
+    finishing: Option<i64>,
 }
 pub(super) struct FreshServingBackend {
     factory: Arc<dyn ServingFactory>,
@@ -64,20 +87,9 @@ pub(super) struct FreshServingBackend {
     work: PathBuf,
     state: Mutex<State>,
     live: Mutex<(Vec<PartRef>, i64, MergePolicy)>,
-    batch: crate::part_ingest::export::ExportBatchBounds,
-    /// FP-T101: recorded batches past which a resumed epoch stops planning
-    /// deltas and is retired instead (see [`EPOCH_RESUME_LIMIT`]).
-    resume_limit: usize,
     vanished: Mutex<Option<super::super::lifecycle::Vanished>>,
-    /// NAN-4721: an epoch build yields to ingest pressure (one bounded budget).
-    pressure: Mutex<Arc<IngestPressure>>,
+    retry: RetryPolicy,
 }
-/// FP-T101: every resume after the master moved records one more delta, and
-/// [`epoch_plans`] refuses more than 1024 batches (every batch is a retained
-/// snapshot until the epoch's expiry). An epoch that keeps failing would grow
-/// until that bound made every pass error. Past this count the epoch takes the
-/// retire-and-rebuild fallback, leaving room for one maximal delta below it.
-const EPOCH_RESUME_LIMIT: usize = 512;
 impl FreshServingBackend {
     pub fn new(factory: Arc<dyn ServingFactory>, work: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&work)?;
@@ -94,21 +106,9 @@ impl FreshServingBackend {
             work,
             state: Mutex::new(state),
             live: Mutex::new((vec![], 0, MergePolicy::default())),
-            batch: crate::part_ingest::export::ExportBatchBounds::DEFAULT,
-            resume_limit: EPOCH_RESUME_LIMIT,
             vanished: Mutex::new(None),
-            pressure: Mutex::default(),
+            retry: RetryPolicy::CONTROL,
         })
-    }
-    #[cfg(test)]
-    pub(super) fn with_batch(mut self, batch: crate::part_ingest::export::ExportBatchBounds) -> Self {
-        self.batch = batch;
-        self
-    }
-    #[cfg(test)]
-    pub(super) fn with_resume_limit(mut self, limit: usize) -> Self {
-        self.resume_limit = limit;
-        self
     }
     fn state(&self) -> State {
         self.state.lock().expect("serving state").clone()
@@ -193,17 +193,17 @@ impl FreshServingBackend {
         if state.active.is_some() || state.pending.is_some() || !state.retired.is_empty() {
             return Ok(false);
         }
-        let listed = self.factory.list_epochs().await?;
+        let listed = self.control("list_epochs", || self.factory.list_epochs()).await?;
         if listed.len() != 1 {
             return Ok(false);
         }
-        let Some(checkpoint) = self.master.export_head(false).await?.checkpoint else {
+        let Some(checkpoint) = self.control("export_head", || self.master.export_head(false)).await?.checkpoint else {
             return Ok(false);
         };
-        let master = self.master.expire_and_inspect().await?;
+        let master = self.control("expire_and_inspect", || self.master.expire_and_inspect()).await?;
         for name in &listed {
             let serving = self.factory.build(name)?;
-            let head = match serving.export_head(false).await {
+            let head = match self.control("export_head", || serving.export_head(false)).await {
                 Ok(head) => head,
                 Err(error) => {
                     tracing::info!(epoch = %name, error = %format!("{error:#}"), "serving epoch not adoptable (contract)");
@@ -215,11 +215,12 @@ impl FreshServingBackend {
                     "serving epoch not adoptable (watermark differs from the master)");
                 continue;
             }
-            if serving.expire_and_inspect().await? != master {
+            if self.control("expire_and_inspect", || serving.expire_and_inspect()).await? != master {
                 tracing::info!(epoch = %name, "serving epoch not adoptable (parts differ from the master)");
                 continue;
             }
-            if let Err(error) = self.factory.adopt(&format!("agent.{name}_v1")).await {
+            let table = format!("agent.{name}_v1");
+            if let Err(error) = self.control("writer_adopt", || self.factory.adopt(&table)).await {
                 tracing::info!(epoch = %name, error = %format!("{error:#}"), "serving epoch not adoptable (platform refused)");
                 continue;
             }
@@ -231,6 +232,7 @@ impl FreshServingBackend {
                 retired: listed.iter().filter(|n| *n != name).cloned().collect(),
                 last_plan_ms: checkpoint,
                 probe_hour: None,
+                finishing: None,
             })?;
             return Ok(true);
         }
@@ -242,16 +244,42 @@ impl FreshServingBackend {
     /// catalog-attested window. A master that never exported has no probe.
     async fn recovered_probe_hour(&self) -> Result<i64> {
         let checkpoint = self
-            .master
-            .export_head(false)
+            .control("export_head", || self.master.export_head(false))
             .await?
             .checkpoint
             .context("serving activation has no sealed hour")?;
         Ok(checkpoint.div_euclid(3_600_000) * 3_600_000 - 3_600_000)
     }
+    /// NAN-4798: every agent-catalog control call made by the writer rides
+    /// out network loss (see [`super::super::control_retry`]).
+    async fn control<T, F, Fut>(&self, op: &'static str, call: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        retry(op, self.retry, call).await
+    }
+    /// NAN-4798: a non-transient refusal of the fence's last steps means the
+    /// platform no longer holds this epoch's fresh-serving proof (e.g. a
+    /// `writer_reopen` that landed but whose response was lost). Finishing
+    /// can then never succeed: forget it, so the next sync mints.
+    fn abandon_finishing(&self, error: &anyhow::Error) {
+        if is_transient(error) {
+            return;
+        }
+        let mut state = self.state();
+        if state.finishing.take().is_some() {
+            tracing::warn!(error = %format!("{error:#}"),
+                "published serving epoch can no longer finish its privacy pass; the next sync mints a fresh epoch");
+            if let Err(error) = self.save(state) {
+                tracing::warn!(error = %format!("{error:#}"), "serving state not saved");
+            }
+        }
+    }
     async fn retire(&self) -> Result<()> {
         for name in self.state().retired {
-            self.factory.build(&name)?.retire().await?;
+            let table = self.factory.build(&name)?;
+            self.control("retire_epoch", || table.retire()).await?;
             let mut state = self.state();
             state.retired.retain(|n| n != &name);
             self.save(state)?;
@@ -262,14 +290,16 @@ impl FreshServingBackend {
 #[async_trait::async_trait]
 impl IcebergCommitter for FreshServingBackend {
     async fn commit(&self, manifest: &ExportManifest) -> Result<()> {
-        self.master.commit(manifest).await?;
+        // An ambiguous commit is idempotent: its replay is a checkpoint skip.
+        self.control("commit", || self.master.commit(manifest)).await?;
         let mut state = self.state();
         if state.pending.is_none() {
             let name = state
                 .active
                 .as_ref()
                 .context("serving table is not initialized")?;
-            self.factory.build(name)?.commit(manifest).await?;
+            let serving = self.factory.build(name)?;
+            self.control("commit", || serving.commit(manifest)).await?;
         }
         state.last_plan_ms = state.last_plan_ms.max(manifest.planned_at_ms);
         self.save(state)?;
@@ -288,22 +318,21 @@ impl CatalogLifecycleBackend for FreshServingBackend {
         *self.vanished.lock().expect("serving vanished") = Some(vanished);
     }
     fn set_ingest_pressure(&self, pressure: Arc<IngestPressure>) {
-        self.factory.set_ingest_pressure(pressure.clone());
-        *self.pressure.lock().expect("serving pressure") = pressure;
+        self.factory.set_ingest_pressure(pressure);
     }
     async fn prepare_sync(&self, parts: &[PartRef], now: i64, policy: &MergePolicy) -> Result<()> {
         *self.live.lock().expect("serving live set") = (parts.to_vec(), now, *policy);
         Ok(())
     }
     async fn verify_maintenance(&self) -> Result<()> {
-        self.master.verify_maintenance().await
+        self.control("verify_maintenance", || self.master.verify_maintenance()).await
     }
     /// NAN-4627: the master is the export chain. A wiped `serving/state.json`
     /// also forgot the master checkpoint, so a fresh epoch would be planned at
     /// 1 and every later delta (predecessor = the master checkpoint) would be
     /// refused by that epoch. Learn the checkpoint from the catalog itself.
     async fn export_head(&self, with_parts: bool) -> Result<super::super::ExportHead> {
-        let head = self.master.export_head(with_parts).await?;
+        let head = self.control("export_head", || self.master.export_head(with_parts)).await?;
         if let Some(at) = head.checkpoint {
             let mut state = self.state();
             if state.last_plan_ms < at {
@@ -321,145 +350,107 @@ impl CatalogLifecycleBackend for FreshServingBackend {
         if state.active.is_some() || !state.retired.is_empty() {
             return Ok(false);
         }
-        if !self.factory.list_epochs().await?.is_empty() {
+        if !self.control("list_epochs", || self.factory.list_epochs()).await?.is_empty() {
             return Ok(false);
         }
-        self.master.no_committed_snapshot().await
+        self.control("no_committed_snapshot", || self.master.no_committed_snapshot()).await
     }
     async fn close_and_drain(&self) -> Result<()> {
-        self.factory.close().await?;
+        // NAN-4798: the mint is durable BEFORE the gateway call. Every caller
+        // closes for a reason the next sync may not see again (installation
+        // rotation, part GC degrade, a foreign part): a failed close must
+        // never leave a `finishing` epoch to be resumed in its place.
         let mut state = self.state();
-        if state.pending.is_none() {
-            state.pending = Some(format!("events_{}", uuid::Uuid::new_v4().simple()));
+        if state.pending.is_none() || state.finishing.is_some() {
+            if state.pending.is_none() {
+                state.pending = Some(format!("events_{}", uuid::Uuid::new_v4().simple()));
+            }
+            state.finishing = None;
             self.save(state)?;
         }
-        Ok(())
+        self.control("close_and_drain", || self.factory.close()).await
+    }
+    fn published_under_fence(&self) -> Option<i64> {
+        let state = self.state();
+        state.finishing.filter(|_| state.pending.is_none() && state.active.is_some())
+    }
+    async fn resume_fence(&self) -> Result<()> {
+        let Some(checkpoint) = self.published_under_fence() else {
+            return self.close_and_drain().await;
+        };
+        tracing::info!(epoch = ?self.state().active, checkpoint,
+            "finishing the serving epoch published under the still-closed read fence; no new epoch");
+        // Re-assert the closed gateway. The platform keeps the open privacy
+        // fence (and its fresh-serving proof) when it is already closed.
+        self.control("close_and_drain", || self.factory.close()).await
     }
     async fn expire_and_inspect(&self) -> Result<BTreeSet<String>> {
-        let master = self.master.expire_and_inspect().await?;
-        let listed = self.factory.list_epochs().await?;
+        let master = self.control("expire_and_inspect", || self.master.expire_and_inspect()).await?;
+        let listed = self.control("list_epochs", || self.factory.list_epochs()).await?;
         let mut state = self.adopt_unknown_epochs(self.state(), listed)?;
         if let Some(next) = state.pending.clone() {
             let serving = self.factory.build(&next)?;
             let (parts, now, policy) = self.live.lock().expect("serving live set").clone();
-            let directory = self.work.join(&next);
-            std::fs::create_dir_all(&directory)?;
-            let mut plans = ExportState::load_durable(&directory)?;
-            let started = std::time::Instant::now();
-            // Part GC never waits on this catalog. An uncommitted recorded
-            // batch that adds a part GC may have deleted can never commit
-            // (its data is gone) and the master never holds that part again:
-            // this unpublished epoch cannot converge. Retire it unexposed;
-            // the next attempt builds a fresh one from the live set.
-            if plans.last_plan_ms > 0 {
-                let vanished = self.vanished.lock().expect("serving vanished").clone();
-                if let Some(vanished) = vanished {
-                    // The newest batch adding such a part; only an
-                    // uncommitted one (past the epoch checkpoint) is fatal.
-                    let mut newest = None;
-                    for path in epoch_plans(&directory)? {
-                        let manifest: ExportManifest = serde_json::from_slice(&std::fs::read(path)?)?;
-                        if manifest.add.iter().any(|p| vanished(&p.part_id)) {
-                            newest = Some(manifest.planned_at_ms);
-                        }
-                    }
-                    // The local watermark lags a commit at most (a landed
-                    // commit without it): conservative, never a missed one.
-                    let committed = epoch_committed(&directory)?;
-                    if newest.is_some_and(|at| at > committed) {
-                        serving.retire().await?;
-                        state.pending = Some(format!("events_{}", uuid::Uuid::new_v4().simple()));
-                        self.save(state)?;
-                        anyhow::bail!("serving epoch names a part removed by part GC; rebuilding");
-                    }
-                }
-            }
-            // NAN-4614: the fresh epoch registers the whole live set, in
-            // bounded batches like the master. The chain ENDS at the master
-            // checkpoint, so the master's next delta continues it. Batches
-            // stay in this epoch's directory: a retry replays them all, each
-            // already-committed one is a checkpoint skip (no target IO).
-            let mut paths = if plans.last_plan_ms > 0 {
-                epoch_plans(&directory)?
-            } else {
-                vec![]
-            };
-            // FP-T101: a build cut off by the sync's hard bound (or an error)
-            // resumes on a later pass, after the master has committed newer
-            // plans (hourly seals). Replaying only the batches recorded
-            // against the old live set can never match the master, so the
-            // epoch was retired and rebuilt from zero forever. Instead the
-            // epoch plans the delta from its OWN durable state to the current
-            // live set, chained after its recorded batches and again ENDING
-            // at the master checkpoint (an empty batch when only the
-            // checkpoint moved). A delta may remove parts (erasure, merges):
-            // the epoch is unpublished, so nothing reads it, and its expiry
-            // below drops every older snapshot before the reference check;
-            // any remaining difference still retires it unexposed. Planned
-            // only against a prepared live set (`now > 0`).
-            let end = state.last_plan_ms.max(1);
-            let resumable = paths.len() < self.resume_limit;
-            if !resumable && end > plans.last_plan_ms {
-                tracing::warn!(recorded = paths.len(), "serving epoch resumed too often; retiring it for a rebuild");
-            }
-            if plans.last_plan_ms == 0 || (now > 0 && resumable && end > plans.last_plan_ms) {
-                let pending = plan_export_reconciled(&parts, &plans, now, &policy);
-                let mut batches = plans.split_plan(self.tenant_id(), &pending, self.batch)?;
-                if end - (batches.len() as i64 - 1) <= plans.last_plan_ms {
-                    batches = plans.split_plan(
-                        self.tenant_id(),
-                        &pending,
-                        crate::part_ingest::export::ExportBatchBounds::UNBOUNDED,
-                    )?;
-                }
-                let first = end - (batches.len() as i64 - 1);
-                if !paths.is_empty() {
-                    tracing::info!(recorded = paths.len(), delta = batches.len(), hours = pending.len(),
-                        "serving epoch resumes with the live-set delta");
-                }
-                paths.extend(plans.record_durable_batches(&directory, batches, first)?);
-            }
-            // FP-T101: a resumed build skips batches this writer saw commit
-            // (a local watermark, written only after the commit returned)
-            // instead of one catalog load per already-committed batch. A
-            // commit that landed without the watermark is still a checkpoint
-            // skip; the reference check below verifies the result.
-            let mut committed = epoch_committed(&directory)?;
-            let pressure = self.pressure.lock().expect("serving pressure").clone();
-            // One yield budget per epoch build, not per batch: this runs
-            // under custody and the sync's hard bound, and a batch whose
-            // files are already verified reads nothing. Cold reads inside a
-            // batch are paced by the export target while pressure holds.
-            let mut yield_left = crate::part_ingest::agent_lane::MAX_YIELD;
-            for (index, path) in paths.iter().enumerate() {
-                let manifest: ExportManifest = serde_json::from_slice(&std::fs::read(path)?)?;
-                if manifest.planned_at_ms <= committed {
-                    continue;
-                }
-                // NAN-4721: agents never compete with analysts. A cold epoch
-                // batch reads GBs of part files; none starts while ingest
-                // is under pressure (bounded, see agent_lane).
-                yield_left = yield_left.saturating_sub(
-                    pressure.yield_while_lagging_up_to("serving epoch batch", yield_left).await,
+            // NAN-4782: the fresh epoch is a COPY of the master's catalog
+            // entries, never a replay of the live set through the export
+            // target (which read every live part file: 3.5-9 h on a large
+            // tenant, all over again after every roll or privacy pass).
+            // The new NAME is the privacy fence; its contents only need to
+            // equal the live set the master reached. So: publish only when
+            // the master's references are exactly what a fresh build of the
+            // prepared live set would hold (the planner's hours; an
+            // unprepared or stale live set, or a master holding a part the
+            // live set cannot reproduce, e.g. one part GC receipted, fails
+            // closed and the next writer sync repeats this cheaply).
+            let expected = plan_export_reconciled(&parts, &ExportState::default(), now, &policy)
+                .into_iter()
+                .flat_map(|(hour, _)| hour.parts)
+                .collect::<BTreeSet<_>>();
+            if let Some(vanished) = self.vanished.lock().expect("serving vanished").clone() {
+                ensure!(
+                    !master.iter().any(|part| vanished(part)),
+                    "serving epoch names a part removed by part GC; rebuilding"
                 );
-                serving.commit(&manifest).await?;
-                committed = manifest.planned_at_ms;
-                crate::part_ingest::export::atomic_write(&directory.join(COMMITTED), committed.to_string().as_bytes(), false)?;
-                tracing::info!(batch = index + 1, batches = paths.len(), parts = manifest.add.len(),
-                    elapsed_ms = started.elapsed().as_millis() as u64, "serving epoch batch committed");
             }
-            let references = serving.expire_and_inspect().await?;
+            if expected != master {
+                anyhow::bail!("serving epoch live set changed; replay required");
+            }
+            // Removals and erasures are already reflected: `master` (every
+            // part its retained metadata names, after expiry) equals the
+            // live entries copied below, so no erased or merged-away part
+            // and none of its bounds can reach the fresh name.
+            let entries = self.control("live_entries", || self.master.live_entries()).await?;
+            ensure!(
+                entries.parts == master && entries.all_parts == master,
+                "master metadata names parts outside its live files"
+            );
+            let started = std::time::Instant::now();
+            if let Err(error) = self.control("seed", || serving.seed(&entries)).await {
+                if error.downcast_ref::<super::super::SeedSchemaMismatch>().is_some() {
+                    // A pre-upgrade pending epoch may use independently assigned
+                    // field IDs. Replace its name, then retire it through the
+                    // ordinary publish-before-retire path (also safe if an
+                    // earlier publish landed but its response was lost).
+                    state.retired.push(next);
+                    state.pending = Some(format!("events_{}", uuid::Uuid::new_v4().simple()));
+                    self.save(state)?;
+                }
+                return Err(error);
+            }
+            let references = self.control("expire_and_inspect", || serving.expire_and_inspect()).await?;
             if references != master {
-                // Even after the delta the epoch differs from the master (a
-                // stale or unprepared live set, a master rebuilt from the
-                // catalog). Never expose it, even briefly. Retire and build
-                // a new epoch on the next bounded writer attempt.
-                serving.retire().await?;
+                // Never expose it, even briefly. Retire and seed a new epoch
+                // on the next bounded writer attempt.
+                self.control("retire_epoch", || serving.retire()).await?;
                 state.pending = Some(format!("events_{}", uuid::Uuid::new_v4().simple()));
                 self.save(state)?;
                 anyhow::bail!("serving epoch live set changed; replay required");
             }
+            tracing::info!(files = entries.files.len(), parts = master.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "serving epoch seeded from the master (metadata only)");
             let new_name = format!("agent.{next}_v1");
+            let legacy = self.work.join(&next);
             let hour = match parts
                 .iter()
                 .map(|p| p.max_time_us)
@@ -471,17 +462,28 @@ impl CatalogLifecycleBackend for FreshServingBackend {
                 None => self.recovered_probe_hour().await?,
             };
             state.probe_hour = Some(hour);
-            self.factory.publish(json!({"table":new_name,
+            let details = json!({"table":new_name,
                 "probe_window":{"start":chrono::DateTime::from_timestamp_millis(hour).context("invalid probe hour")?.to_rfc3339(),
                     "end":chrono::DateTime::from_timestamp_millis(hour+3_600_000).context("invalid probe hour")?.to_rfc3339()},
-                "retired":state.active.iter().chain(state.retired.iter()).map(|n|format!("agent.{n}_v1")).collect::<Vec<_>>() })).await?;
+                "retired":state.active.iter().chain(state.retired.iter()).map(|n|format!("agent.{n}_v1")).collect::<Vec<_>>() });
+            // Re-publishing the same fresh name and retired set is idempotent.
+            self.control("publish_serving", || self.factory.publish(details.clone())).await?;
             if let Some(old) = state.active.replace(next) {
                 state.retired.push(old);
             }
             state.pending = None;
+            // NAN-4798: durable together with the publish. Whatever fails
+            // from here to reopen, the next sync finishes THIS epoch.
+            state.finishing = Some(entries.checkpoint.unwrap_or(i64::MIN));
             self.save(state)?;
             if let Err(error) = self.factory.retain_verified(&parts) {
                 tracing::warn!(error = %format!("{error:#}"), "export verified-file records not pruned");
+            }
+            // A pre-NAN-4782 writer staged batch plans per epoch here.
+            if legacy.try_exists().unwrap_or(false) {
+                if let Err(error) = std::fs::remove_dir_all(&legacy) {
+                    tracing::warn!(error = %error, "legacy serving epoch staging not removed");
+                }
             }
         }
         // The gateway has durably retired every old name BEFORE drop/purge and
@@ -491,7 +493,7 @@ impl CatalogLifecycleBackend for FreshServingBackend {
         if let Some(active) = state.active {
             let serving = self.factory.build(&active)?;
             ensure!(
-                serving.expire_and_inspect().await? == master,
+                self.control("expire_and_inspect", || serving.expire_and_inspect()).await? == master,
                 "serving table and writer table differ"
             );
         }
@@ -502,36 +504,26 @@ impl CatalogLifecycleBackend for FreshServingBackend {
             self.state().pending.is_none() && self.state().retired.is_empty(),
             "serving retirement is incomplete"
         );
-        self.factory.invalidate().await?;
-        Ok(())
+        let invalidated = self.control("invalidate_results", || self.factory.invalidate()).await;
+        if let Err(error) = &invalidated {
+            self.abandon_finishing(error);
+        }
+        invalidated
     }
     async fn reopen(&self) -> Result<()> {
-        self.factory.reopen().await
+        if let Err(error) = self.control("writer_reopen", || self.factory.reopen()).await {
+            self.abandon_finishing(&error);
+            return Err(error);
+        }
+        let mut state = self.state();
+        if state.finishing.take().is_some() {
+            self.save(state)?;
+        }
+        Ok(())
     }
     async fn adopt_serving(&self) -> Result<bool> {
         self.adopt_serving_epoch().await
     }
-}
-
-/// The last batch this writer saw commit to one fresh epoch.
-const COMMITTED: &str = "committed";
-fn epoch_committed(directory: &std::path::Path) -> Result<i64> {
-    match std::fs::read_to_string(directory.join(COMMITTED)) {
-        Ok(text) => Ok(text.trim().parse()?),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Every batch planned for one fresh epoch, in chain order.
-fn epoch_plans(directory: &std::path::Path) -> Result<Vec<PathBuf>> {
-    let mut paths = std::fs::read_dir(directory.join("export/pending"))?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    paths.retain(|path| path.extension().is_some_and(|e| e == "json"));
-    paths.sort();
-    ensure!(!paths.is_empty() && paths.len() <= 1024, "serving epoch plan set out of bounds");
-    Ok(paths)
 }
 
 #[cfg(test)]

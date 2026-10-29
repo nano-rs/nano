@@ -173,3 +173,62 @@ async fn foreign_planned_index_marker_is_refused() {
     assert!(format!("{error:#}").contains("another tenant"), "{error:#}");
     assert!(catalog.require_removed(TENANT_UUID, crate::lake_part_gc::request::tests::PART).is_err());
 }
+
+/// NAN-4783: a hosted tenant's agent-catalog sync held custody for its
+/// whole run (up to 30 min); every GC prepare that met it waited 120 s, then
+/// read as a pass-wide custody hold and backed off to 6 h. Through the
+/// production seams (`new_guarded`, `TenantCatalog::new`, `Seams::prepare`/
+/// `retire`) a delete now reaches the Worker while a long sync is still in
+/// flight, without degrading the agent lane, and the sync then converges.
+#[tokio::test]
+async fn gc_reaches_the_worker_while_a_long_catalog_sync_is_in_flight() {
+    let f = fixture(1, Duration::ZERO, 200).await;
+    let local = tempfile::tempdir().unwrap();
+    let backend = basin(local.path()).await;
+    let custody = local.path().join("state/agent-catalog/custody");
+    // The part was planned (exported, then removed) long ago.
+    let history = custody.join("export/committed");
+    std::fs::create_dir_all(&history).unwrap();
+    let part = crate::lake_part_gc::request::tests::PART;
+    let manifest = crate::part_ingest::export::ExportManifest {
+        tenant_id: TENANT_UUID.into(), planned_at_ms: 1, previous_plan_ms: None,
+        add: vec![], remove_parts: vec![part.into()], hours: vec![],
+    };
+    std::fs::write(history.join("0000000000001.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+    commit_history(&backend).await;
+    let catalog = Arc::new(TenantCatalog::new(TENANT_UUID, custody.clone(), backend.clone()).unwrap());
+    f.gc.attach_catalog(catalog.clone()).unwrap();
+    let policy = crate::parts::levels::MergePolicy::default();
+    let now = chrono::Utc::now().timestamp_millis();
+    catalog.sync_parts(TENANT_UUID, vec![], now, &policy).await.unwrap();
+
+    // The next (hourly) sync stalls in its catalog inspection, custody held.
+    backend.hold_inspection.store(true, Ordering::SeqCst);
+    let held = backend.held.notified();
+    let running = {
+        let catalog = catalog.clone();
+        tokio::spawn(async move { catalog.sync_parts(TENANT_UUID, vec![], now + 3_600_001, &policy).await })
+    };
+    held.await;
+    let permit = permit();
+    let started = std::time::Instant::now();
+    for retire in [false, true] {
+        let seams = seams(&f);
+        let call = async { if retire { seams.retire(&permit).await.map(|_| ()) } else { seams.prepare(&permit).await.map(|_| ()) } };
+        let error = tokio::time::timeout(Duration::from_secs(10), call).await
+            .expect("GC never waits behind a catalog sync").unwrap_err();
+        assert!(error.downcast_ref::<CatalogCustodyHeld>().is_none(), "no custody hold: {error:#}");
+        assert!(error.to_string().contains("retention authority"), "the Worker is reached: {error:#}");
+    }
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    let receipt = catalog.require_removed(TENANT_UUID, part).unwrap();
+    assert_ne!(receipt.manifest_sha256,
+        crate::part_ingest::iceberg_export::lifecycle::degraded_receipt_sha256(TENANT_UUID, part),
+        "proved from the inspected catalog, not by degrading the lane");
+    assert!(!backend.blocked.load(Ordering::SeqCst), "agent reads stay open");
+    assert!(!custody.join("gc-degraded").exists());
+
+    backend.hold_inspection.store(false, Ordering::SeqCst);
+    backend.release.notify_one();
+    running.await.unwrap().unwrap();
+}

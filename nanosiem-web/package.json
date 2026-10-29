@@ -1,7 +1,7 @@
 {
   "name": "vite-react-typescript-starter",
   "private": true,
-  "version": "1.0.13",
+  "version": "1.0.14",
   "type": "module",
   "scripts": {
     "test:user-visible-text": "vitest run src/user-visible-text.test.ts",
@@ -20,6 +20,7 @@
     "test:log-source-pivt-context": "node --test src/lib/log-source-pivt-context.test.ts",
     "test:npl-quote": "node --test src/lib/npl-quote.test.ts",
     "test:cold-scan-progress": "node --test src/lib/cold-scan-progress.test.ts",
+    "test:sample-wrap": "node --test src/lib/sample-wrap.test.ts",
     "test:search-tail": "tsx --test src/pages/search-tail.test.ts",
     "test:search-ui": "vitest run src/components/ui/date-time-range-picker.test.tsx src/pages/Search.interactive.test.tsx src/pages/search-timeline.test.ts src/pages/interactive-search.test.ts src/pages/async-search-paging.test.ts src/pages/async-search-artifact.test.ts",
     "test:in-window-observation": "node --test src/lib/prevalence/inWindowObservation.test.ts",

@@ -8,6 +8,7 @@ import {
   useMarkdownTransform,
   type MarkdownTransform,
 } from '@/components/ui/markdown-transform-context';
+import { tenantAppHref } from '@/lib/tenant-auth-shell';
 
 interface MarkdownProps {
   children: string;
@@ -59,7 +60,7 @@ export function Markdown({ children, className, onRunQuery, transformChildren }:
           // inside the anchor body — EntityChip renders its own <a>, and
           // nesting anchors is an HTML validity error (React warns in dev).
           if (href && (href.startsWith('/') || href.startsWith('https://'))) {
-            return <a href={href} className="text-primary hover:underline">{children}</a>;
+            return <a href={tenantAppHref(href)} className="text-primary hover:underline">{children}</a>;
           }
           return <span>{wrap(children)}</span>;
         },

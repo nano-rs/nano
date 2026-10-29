@@ -33,10 +33,9 @@
 //!   lookup reads the merged identity file. The background build stays
 //!   process-level: `identity_merged_index=1` on a process with the index
 //!   off finds no merged file and reads every source, as off does.
-//! - `entity_index` (`NANO_LAKE_ENTITY_INDEX`, NAN-4190): whether a selection
-//!   reads the window entity index. The build is process-level, as for the
-//!   identity index: `entity_index=1` on a process without one changes
-//!   nothing.
+//! - `entity_index` (NAN-4190; on by default since NAN-4772, no env): whether
+//!   a selection reads the window entity index. The build is process-level:
+//!   `entity_index=1` on a process without one yet changes nothing.
 //!
 //! - `payload_threads=N` (`NANO_LAKE_PAYLOAD_MAX_THREADS`, NAN-3411) and
 //!   `payload_block_rows=N` (`NANO_LAKE_PAYLOAD_BLOCK_ROWS`): the full-event
@@ -155,7 +154,7 @@ pub const PROBE_KNOBS: &[Knob] = &[
     flag_knob("identity_merged_index", Some("NANO_LAKE_IDENTITY_MERGED_INDEX"), "read the merged identity index"),
     Knob { name: "payload_threads", env: Some("NANO_LAKE_PAYLOAD_MAX_THREADS"), kind: KnobKind::Count { min: 1, max: 64 }, what: "payload statement reader threads (planner clamps)" },
     Knob { name: "payload_block_rows", env: Some("NANO_LAKE_PAYLOAD_BLOCK_ROWS"), kind: KnobKind::Count { min: 1, max: 65_536 }, what: "payload statement block rows (planner clamps)" },
-    flag_knob("entity_index", Some("NANO_LAKE_ENTITY_INDEX"), "read the window entity index (exact entity row runs)"),
+    flag_knob("entity_index", None, "read the window entity index (exact entity row runs)"),
     flag_knob("range_fetch", Some("NANO_LAKE_SEARCH_RANGE_FETCH"), "sparse column-range fetch of data files"),
     Knob { name: "range_narrow_denominator", env: None, kind: KnobKind::Count { min: 1, max: 64 }, what: "a ranged read is used when its chunks are <= 1/N of the file (default 2)" },
     flag_knob("two_pass", Some("NANO_LAKE_TWO_PASS"), "two-pass row queries (narrow locate, then payload)"),
@@ -354,7 +353,8 @@ pub fn identity_merged_index(process: bool) -> bool {
     current().identity_merged_index.unwrap_or(process)
 }
 
-/// Effective `NANO_LAKE_ENTITY_INDEX` given the process value (NAN-4190).
+/// Whether this request reads the window entity index (NAN-4190): the
+/// override, else the process value (always on since NAN-4772).
 pub fn entity_index(process: bool) -> bool {
     current().entity_index.unwrap_or(process)
 }

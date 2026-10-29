@@ -36,8 +36,8 @@ pub struct HostedExportTarget {
 /// NAN-4614: data files whose bytes (signed SHA-256) and Parquet footer
 /// (against one exact schema) this writer already verified, one small record
 /// per data key on the writer's private custody volume. Preparing a file
-/// again (a retried or cut-off batch, the fresh serving epoch that registers
-/// the master's files a second time) re-checks the part's signed provenance,
+/// again (a retried or cut-off batch, the active serving epoch's delta that
+/// registers the master's new files a second time) re-checks the part's signed provenance,
 /// but skips the full-object read only when the signed digest, row count and
 /// schema are exactly the recorded ones AND the object still has the strong
 /// identity (ETag) it had across the verified read: a replaced object (same

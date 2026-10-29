@@ -32,6 +32,7 @@ import { api } from '@/lib/api';
 import type { RepositoryRule } from '@/lib/api/rule-repositories';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
+import { tenantAppHref } from '@/lib/tenant-auth-shell';
 
 const PAGE_SIZE = 10;
 
@@ -202,7 +203,7 @@ export function RulePickerPanel({ onLoadRule }: RulePickerPanelProps) {
           <p className="text-sm text-muted-foreground">No rule repositories synced</p>
           <p className="text-xs text-muted-foreground mt-1">
             Add and sync a repository in{' '}
-            <a href="/rules/repositories" className="text-primary hover:underline">
+            <a href={tenantAppHref('/rules/repositories')} className="text-primary hover:underline">
               Rules &gt; Repositories
             </a>
           </p>

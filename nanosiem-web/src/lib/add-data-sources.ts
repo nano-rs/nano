@@ -67,6 +67,42 @@ export function preselectedAddDataSource(
   return sources.find((s) => s.slug === slug) ?? null;
 }
 
+/** NAN-4800: a collector credential's sources, `?sources=a,b` (the Issue step, collector arrival). */
+export const ADD_DATA_COLLECTOR_PARAM = 'sources';
+
+/**
+ * The collector sources a `?sources=` link preselects: the known, issuable
+ * slugs in the order given (unknown and Unattributed slugs are dropped).
+ */
+export function preselectedCollectorSources(
+  sources: readonly AddDataSource[],
+  requested: string | null | undefined,
+): AddDataSource[] {
+  const picked: AddDataSource[] = [];
+  for (const raw of (requested ?? '').split(',')) {
+    const slug = raw.trim();
+    if (!slug || UNATTRIBUTED_SLUGS.has(slug) || picked.some((s) => s.slug === slug)) continue;
+    const match = sources.find((s) => s.slug === slug);
+    if (match) picked.push(match);
+  }
+  return picked;
+}
+
+/**
+ * NAN-4800: the wizard's address once it reaches the Issue step, so a reload,
+ * Back from another page or a re-login resumes at Issue for the same source(s)
+ * instead of restarting at Step 1 (a custom source would otherwise be rebuilt,
+ * VRL and all, though it is already activated). Null: nothing to resume yet.
+ */
+export function issueStepSearch(target: { collectorSlugs?: readonly string[] | null; sourceSlug?: string | null }): Record<string, string> | null {
+  if (target.collectorSlugs) {
+    const slugs = target.collectorSlugs.filter((s) => !!s && !UNATTRIBUTED_SLUGS.has(s));
+    return slugs.length > 0 ? { [ADD_DATA_COLLECTOR_PARAM]: slugs.join(',') } : null;
+  }
+  const slug = target.sourceSlug?.trim();
+  return slug && !UNATTRIBUTED_SLUGS.has(slug) ? { [ADD_DATA_SOURCE_PARAM]: slug } : null;
+}
+
 /** Unread sealed tokens expire 10 minutes after issuance (9001640). */
 const REVEAL_WINDOW_MS = 10 * 60 * 1000;
 

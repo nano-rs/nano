@@ -225,6 +225,115 @@ export function tenantBasename(pathname: string): string | undefined {
   return segment === undefined ? undefined : `/t/${segment}`;
 }
 
+/**
+ * NAN-4800: an in-app path as a browser href, under the current tenant
+ * prefix. A raw `<a href>`, `window.open` or `window.location` bypasses the
+ * router's basename, so on a pooled host `/ingestion/...` left the tenant and
+ * the next refresh answered `tenant_required` (user bounced to login). Prefer
+ * a router `<Link>` / `useHref`; use this where neither fits (non-component
+ * code, hrefs computed outside the router). Paths already under `/t/`, API
+ * and static paths, external URLs and fragments pass through unchanged; off a
+ * tenant prefix (dedicated deployments) every path is returned as-is.
+ */
+export function tenantAppHref(
+  path: string,
+  pathname: string = typeof window === 'undefined' ? '/' : window.location.pathname,
+): string {
+  if (!isTenantScopableAppPath(path)) return path;
+  const base = tenantBasename(pathname);
+  if (base === undefined) return path;
+  return path === '/' ? `${base}/` : `${base}${path}`;
+}
+
+/** Origin-level paths that never live under the tenant basename. */
+const ORIGIN_LEVEL_PREFIXES = ['/api/', '/auth/', '/swagger-ui', '/scripts/', '/assets/', '/t/'];
+
+function isTenantScopableAppPath(path: string): boolean {
+  if (!path.startsWith('/') || path.startsWith('//')) return false;
+  if (path === '/t') return false;
+  return !ORIGIN_LEVEL_PREFIXES.some((p) => path === p.replace(/\/$/, '') || path.startsWith(p));
+}
+
+/**
+ * NAN-4800: the last enterprise-shared tenant this browser was signed into.
+ * A HINT only (the server still decides every request): a tenant-less deep
+ * link on a pooled host (an old bookmark, a link built without the prefix)
+ * can recover to `/t/<tenant>/<path>` after the live session verifies that
+ * tenant, instead of sending a tenant-less refresh that fails `tenant_required`.
+ */
+const LAST_TENANT_KEY = 'nano.last-tenant-slug';
+
+export function rememberActiveTenant(slug: string): void {
+  try {
+    window.localStorage.setItem(LAST_TENANT_KEY, canonicalTenantSlug(slug));
+  } catch { /* storage unavailable: no deep-link recovery */ }
+}
+
+export function rememberedActiveTenant(): string | undefined {
+  try {
+    const value = window.localStorage.getItem(LAST_TENANT_KEY);
+    return value !== null && TENANT_SLUG_PATTERN.test(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Public, origin-level SPA routes that must render where they are (login,
+ * activation, OIDC, setup, demo claims). Everything else is product.
+ */
+const TENANTLESS_PUBLIC_PATHS = [
+  /^\/$/,
+  /^\/login\/?$/,
+  /^\/mfa-setup\/?$/,
+  /^\/demo\/?$/,
+  /^\/d\//,
+  /^\/denied\/?$/,
+  /^\/setup\/?$/,
+  /^\/auth\//,
+  /^\/api\//,
+  /^\/swagger-ui/,
+  /^\/t(\/|$)/,
+];
+
+/**
+ * Whether a browser location is a product deep link that can stay inside a
+ * tenant prefix after URL normalization. This performs no tenant selection.
+ */
+export function isTenantlessProductPath(
+  location: { pathname: string; search: string; hash: string },
+): boolean {
+  const { pathname } = location;
+  if (safeReturnPath(pathname, '') !== pathname || /[?#]/.test(pathname)) return false;
+  if (!isTenantScopableAppPath(pathname)) return false;
+  if (TENANTLESS_PUBLIC_PATHS.some((re) => re.test(pathname))) return false;
+  if (location.search && !location.search.startsWith('?')) return false;
+  if (location.hash && !location.hash.startsWith('#')) return false;
+  // Literal and encoded dot segments must not escape into a sibling tenant.
+  return new URL(`/t/tenant${pathname}`, 'https://tenant.invalid').pathname.startsWith('/t/tenant/');
+}
+
+/**
+ * Build a redirect only when the stored hint belongs to the server-verified
+ * session tenants. The current auth contract supplies a singleton active tenant.
+ * Storage and a route selector alone are never proof of membership.
+ */
+export function tenantlessDeepLinkRedirect(
+  location: { pathname: string; search: string; hash: string },
+  rememberedSlug: string | undefined = rememberedActiveTenant(),
+  sessionTenants: readonly ActiveTenant[] = [],
+): string | undefined {
+  if (rememberedSlug === undefined || !sessionTenants.some((tenant) => tenant.slug === rememberedSlug)) return undefined;
+  if (!isTenantlessProductPath(location)) return undefined;
+  let segment: string;
+  try {
+    segment = tenantPathSegment(rememberedSlug);
+  } catch {
+    return undefined;
+  }
+  return `/t/${segment}${location.pathname}${location.search}${location.hash}`;
+}
+
 /** API docs stay under the current tenant prefix on pooled hosts (the server routes the canonical slug). */
 export function swaggerUiPath(pathname: string): string {
   if (pathname.startsWith('/t/')) {

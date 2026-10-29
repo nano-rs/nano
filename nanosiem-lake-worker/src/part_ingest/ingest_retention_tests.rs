@@ -48,7 +48,7 @@ fn guarded_pass(dir: &Path) -> Arc<CellSanctionedPartGc> {
     let store = Arc::new(super::super::r2_put::R2PartStore::new_split(&location, &location, TENANT_UUID,
         &dir.join("spill")).unwrap());
     Arc::new(CellSanctionedPartGc::new_guarded(TENANT_UUID, "http://127.0.0.1:1/", None, store, fixture_keys(),
-        dir, None).unwrap())
+        dir, None, None).unwrap())
 }
 
 /// Feed one exchange to the pass and the gate, as `cell.rs` does on start

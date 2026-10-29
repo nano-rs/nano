@@ -36,10 +36,17 @@ pub const L0_WRITER_BYTES: u64 = 48 * 1024 * 1024;
 pub const ADMISSION_PEAK_PER_MODELLED_HEAP: f64 = 1.5;
 /// Threads writing one flush's L0 parts at most.
 pub const MAX_PARALLEL_L0_WRITES: usize = 4;
+/// Admission room kept when choosing flush writers, capped so a 6 GiB role
+/// still runs four L0 writers beside two maximum-window minute merges.
+/// Admission itself always checks the actual remaining working budget.
+pub const FLIGHT_ADMISSION_BYTES: u64 = 3 * L0_WRITER_BYTES;
 /// Share of the working budget the filling buffer may reach before it
 /// flushes: a sealed flight (1 + BUILD) plus the next buffer (1) plus
-/// admission and writers must fit the rest.
-pub const BUFFER_SHARE_OF_WORKING: f64 = 1.0 / (2.0 + BUILD_BYTES_PER_BUFFER_BYTE + 1.0);
+/// admission, writers and reserved merge room must fit the rest. At a
+/// 628 MB working budget, a fifth plus four writers monopolized the budget;
+/// an eighth leaves room for calibrated admission beside a flight.
+/// Large roles still reach the flush row cap before this byte cap.
+pub const BUFFER_SHARE_OF_WORKING: f64 = 1.0 / 8.0;
 
 /// Bytes a sealed flush holds until it commits: its rows, its build copies
 /// and its part writers.
@@ -75,10 +82,10 @@ pub fn admission_fits(working_budget: u64, committed: u64, predicted_heap: f64, 
 /// longer capped by one group's transient JSON peak (the 1.0.11 bakeoff:
 /// a few thousand rows per tick, tick overhead dominating at 10k eps).
 ///
-/// The first group is exactly the single-group bound of before. A further
-/// group only opens while the buffer, with every group's rows, stays within
-/// its byte cap ([`buffer_cap`]) and below the flush row cap: the flush keeps the
-/// size the memory model sized its build for.
+/// Every group's transient peak obeys the admission bound. Joins and new
+/// groups also obey the buffer's byte and row caps: the flush keeps the size
+/// its build was sized for. An oversized first object retains the existing
+/// progress path, which admission cuts into bounded slices.
 #[derive(Debug, Clone)]
 pub struct AdmissionGroups {
     working_budget: u64,
@@ -122,10 +129,11 @@ impl AdmissionGroups {
         let buffered_rows = self.buffer_rows.saturating_add(self.rows).saturating_add(rows);
         let within_caps = buffered <= buffer_cap(self.working_budget) as f64
             && buffered_rows <= crate::parts::levels::FLUSH_MAX_ROWS as u64;
-        // Preserve the old single-group admission bound. Extra groups
-        // must obey the buffer caps on EVERY offer, including joins: the
-        // next flush reserves its build beside a buffer of this size.
-        if self.groups > 1 && !within_caps {
+        // Joins in the first group obey the buffer caps too. Otherwise a
+        // calibrated group can fill the old one-fifth buffer in one offer
+        // sequence, leaving no admission room beside its flight. A lone
+        // oversized first object retains the existing progress/slicing path.
+        if self.groups > 0 && !within_caps {
             return Offer::Refused;
         }
         let charged = self.committed.saturating_add(self.closed_arrow as u64);
@@ -195,8 +203,8 @@ impl AdmissionGroups {
 ///   observed dropped: it falls back to the prior).
 ///
 /// History cannot bound the next object's shape, or an unsampled row.
-/// [`Self::reservation_cost`] therefore keeps the fixed model as its
-/// minimum reservation, independently of the learned estimate.
+/// Calibrated groups therefore also enforce their modelled heap allowance
+/// while reading bronze; an underestimate retries with the fixed model.
 #[derive(Debug, Clone, Default)]
 pub struct AdmissionCalibration {
     by_prefix: std::collections::BTreeMap<String, Learned>,
@@ -248,13 +256,10 @@ impl AdmissionCalibration {
         (decoded as f64 * heap, decoded as f64 * arrow)
     }
 
-    /// Memory authority must not shrink when a previous object was light.
-    /// Learning a heavier ratio after decoding it would be too late to
-    /// protect that admission (including groups selected in the same tick).
+    /// Reservation with the learned margin and floors. The bronze reader
+    /// checks actual heap before allowing a calibrated group to accumulate.
     pub fn reservation_cost(&self, prefix: &str, decoded: u64) -> (f64, f64) {
-        let (heap, arrow) = self.cost(prefix, decoded);
-        let (fixed_heap, fixed_arrow) = super::ingest::decoded_admission_cost(decoded);
-        (heap.max(fixed_heap), arrow.max(fixed_arrow))
+        self.cost(prefix, decoded)
     }
 
     /// Whether `prefix` has a learned ratio.
@@ -328,7 +333,7 @@ pub fn admission_slice_rows(working_budget: u64, committed: u64, predicted_heap:
 
 /// Fewest rows per slice of an object admitted beside flushes in flight
 /// (NAN-4770): smaller slices wait for the flights to commit instead.
-pub const MIN_PIPELINED_SLICE_ROWS: u64 = 4_096;
+pub const MIN_PIPELINED_SLICE_ROWS: u64 = MIN_ADMISSION_SLICE_ROWS;
 
 /// NAN-4770: rows per slice of the next buffer's first object, admitted
 /// beside the flushes still in flight (`committed`), or `None` when it must
@@ -457,7 +462,7 @@ mod tests {
         let (heap, arrow) = (160.0 * MIB as f64, 10.0 * MIB as f64);
         let mut groups = AdmissionGroups::new(budget, 0, 0, 0);
         let mut offers = Vec::new();
-        for _ in 0..30 {
+        for _ in 0..20 {
             offers.push(groups.offer(heap, arrow, 0));
         }
         // One group alone: 8 objects (8 x 250 MiB <= 2048 MiB), as before.
@@ -473,8 +478,8 @@ mod tests {
         // never passed by the rows.
         assert!(groups.groups() > 1);
         let admitted = offers.iter().filter(|o| **o != Offer::Refused).count();
-        assert_eq!(admitted, 30, "{offers:?}");
-        assert!(30.0 * arrow <= buffer_cap(budget) as f64);
+        assert_eq!(admitted, 20, "{offers:?}");
+        assert!(20.0 * arrow <= buffer_cap(budget) as f64);
         // The buffer cap bounds the rows of a tick's further groups.
         let mut capped = AdmissionGroups::new(budget, 400 * MIB, 400 * MIB, 0);
         let offers = (0..30).map(|_| capped.offer(heap, arrow, 0)).collect::<Vec<_>>();
@@ -499,8 +504,8 @@ mod tests {
         let admitted = (0..64).take_while(|_| groups.offer(heap, arrow, 0) != Offer::Refused).count();
         assert!(groups.groups() > 1);
         // The original packer admitted 42 objects: its final joins took
-        // the buffer past the 409.6 MiB cap after opening the last group.
-        assert_eq!(admitted, 40);
+        // the buffer past the old 409.6 MiB cap after opening the last group.
+        assert_eq!(admitted as u64, buffer_cap(budget) / (arrow as u64));
         assert!(groups.closed_arrow + groups.arrow <= buffer_cap(budget) as f64);
     }
 
@@ -544,8 +549,7 @@ mod tests {
         let mut tiny = AdmissionCalibration::default();
         tiny.observe(&["t"], 10_000, 1_000_000, 1.0, 1.0);
         assert_eq!(tiny.per_decoded_byte("t"), (HEAP * MIN_CALIBRATED_HEAP_SHARE, ARROW * MIN_CALIBRATED_ARROW_SHARE));
-        assert_eq!(tiny.reservation_cost("t", 1_000), (HEAP * 1_000.0, ARROW * 1_000.0),
-            "a learned estimate cannot lower the hard memory reservation");
+        assert_eq!(tiny.reservation_cost("t", 1_000), (HEAP * MIN_CALIBRATED_HEAP_SHARE * 1_000.0, ARROW * MIN_CALIBRATED_ARROW_SHARE * 1_000.0));
         // A mixed group: no first measure, and only raises.
         let mut m = AdmissionCalibration::default();
         m.observe(&["x"], 10_000, 1_000, 5_000.0, 500.0);

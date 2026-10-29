@@ -39,16 +39,37 @@
 //! runs, incrementally (still-live records of the previous file plus up to
 //! [`MAX_TAIL_FILES`] new sources per pass), and a failure backs off.
 //!
-//! `NANO_LAKE_ENTITY_INDEX=1` turns the build and lookups on (default off:
-//! a new worker-local format and a background build). The `entity_index`
-//! per-request override (`x-nano-perf-overrides`) turns lookups off or on
-//! for one request on a process that built the index (live A/B).
+//! NAN-4772: on by default on every query role (hosted, sovereign, open
+//! core), with no switch. It ran behind `NANO_LAKE_ENTITY_INDEX=1` on the
+//! hosted cells since NAN-4190/4211; open core and sovereign had it off, so
+//! a single-host pivot there decoded every bloom-kept 65,536-row group
+//! (Mythos 1.0.12 H9: ~33x ClickHouse). A process without an index (before
+//! its first build), and the files the index does not cover yet (the tail,
+//! a superseded source), take the per-file evidence path: same rows. The
+//! `entity_index` per-request override (`x-nano-perf-overrides`) still
+//! turns lookups off for one request (live A/B).
+//!
+//! Per-tenant resource envelope (no new tuning knobs): a generation is
+//! <= 1 GiB; a build/retiring reader can keep one other generation, so peak
+//! disk is <= 2 GiB. A reader retaining the retired generation prevents
+//! another build. Each generation has <= 8,192 sources / 65,536 groups and
+//! <= 3.6 MiB of sparse seek points. Extraction, the accumulated build tail,
+//! and each admitted lookup each have a separate 64 MiB record allowance
+//! (512 bytes per record, including vector/map overhead). Extraction also
+//! bounds each group's compressed and uncompressed projection to 16 MiB
+//! each, and its row/field value positions to 262,144. Values/maps, decoded
+//! Arrow buffers and matching times are additional bounded working sets;
+//! these allowances are not a process-RSS limit. Concurrent lookup cost
+//! scales with the existing per-tenant query admission limit. Reader-cache
+//! leases, signed-view metadata and the existing worker cgroup remain under
+//! their own budgets. Exceeding an index budget leaves sources uncovered
+//! or declines the lookup: the normal scan remains authoritative.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use super::engine::{PartQueryEngine, QueryResult};
@@ -56,8 +77,6 @@ use super::prune::{BlockRuns, FineBlocks};
 use crate::parts::format::PartId;
 use crate::planner::CandidateHint;
 
-/// Build + lookup switch (default off): `1` or `true` turns it on.
-pub const FLAG: &str = "NANO_LAKE_ENTITY_INDEX";
 /// Comma-separated indexed paths (a subset of the bloom paths, uid excluded).
 pub const FIELDS_FLAG: &str = "NANO_LAKE_ENTITY_INDEX_FIELDS";
 /// Host and user pivots: the single-entity hunts this index is for.
@@ -92,8 +111,22 @@ pub const FIRST_BUILD_FILES: usize = 8;
 const DROP_CACHE_EVERY: u64 = 32 << 20;
 /// After a failed build, passes skip it this long.
 pub const FAILURE_BACKOFF: Duration = Duration::from_secs(15 * 60);
-/// A build stops adding sources past this file size (disk bound).
+/// Each generation is at most this size. At most two generations (current
+/// plus a build or a retiring reader) exist: 2 GiB peak disk per tenant.
 pub const MAX_INDEX_BYTES: u64 = 1 << 30;
+/// Bound metadata even for sources containing no indexed values.
+pub const MAX_INDEX_SOURCES: usize = 8_192;
+pub const MAX_INDEX_GROUPS: usize = 65_536;
+/// Heap record allowance, separately for one extraction, the accumulated
+/// build tail, and one lookup. Includes Vec capacity and map-node overhead.
+pub const MAX_RECORD_MEMORY: usize = 64 << 20;
+const RECORD_MEMORY_BYTES: usize = 512;
+const MAX_RECORDS: usize = MAX_RECORD_MEMORY / RECORD_MEMORY_BYTES;
+/// Bound a group's decoder and normalized-value maps before decoding it.
+/// Oversized groups/files are simply not covered (queries scan them).
+pub const MAX_PROJECTED_GROUP_BYTES: i64 = 16 << 20;
+pub const MAX_GROUP_VALUES: usize = 262_144;
+const MAX_LOOKUP_LEAVES: usize = 32;
 /// Pass interval while the index is current, and while a backlog remains.
 pub const INTERVAL: Duration = Duration::from_secs(60);
 pub const BUSY_POLL: Duration = Duration::from_secs(5);
@@ -109,13 +142,10 @@ fn internal(error: impl std::fmt::Display) -> super::engine::PartQueryError {
     super::engine::internal_text(error.to_string())
 }
 
-/// Whether the build (and, by default, lookups) are on for this process.
-pub fn enabled() -> bool {
-    enabled_from(std::env::var(FLAG).ok().as_deref())
-}
-
-fn enabled_from(value: Option<&str>) -> bool {
-    value.map(str::trim).is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+/// Whether the build and lookups are on for this process: always, since
+/// NAN-4772 (the per-request override can still turn lookups off).
+pub const fn enabled() -> bool {
+    true
 }
 
 /// The indexed paths: [`FIELDS_FLAG`] or [`DEFAULT_FIELDS`], restricted to
@@ -199,10 +229,16 @@ fn write_record(out: &mut impl Write, record: &Record) -> std::io::Result<u64> {
 
 fn read_record(input: &mut impl Read) -> std::io::Result<Option<Record>> {
     let mut head = [0_u8; 18];
-    match input.read_exact(&mut head) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
+    // EOF is clean only between records. A partial header is corruption,
+    // never proof that a value is absent.
+    if input.read(&mut head[..1])? == 0 {
+        return Ok(None);
+    }
+    input.read_exact(&mut head[1..])?;
+    if head[16] > 1 || head[17] as usize > MAX_RUNS
+        || (head[16] == 1) != (head[17] == 0)
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid entity index record"));
     }
     let hash = u64::from_le_bytes(head[0..8].try_into().expect("8"));
     let src = u32::from_le_bytes(head[8..12].try_into().expect("4"));
@@ -389,15 +425,24 @@ impl EntityIndex {
 
     /// Every record of `hash` (sorted by source, then group); `None` when
     /// the file cannot be read (callers keep everything).
-    fn records_of(&self, hash: u64) -> Option<Vec<Record>> {
+    fn records_of(&self, hash: u64, remaining: &mut usize) -> Option<Vec<Record>> {
         let at = self.sparse.partition_point(|(key, _)| *key < hash);
         let offset = if at == 0 { 0 } else { self.sparse[at - 1].1 };
         let mut file = std::fs::File::open(&self.path).ok()?;
+        if file.metadata().ok()?.len() != self.bytes {
+            return None;
+        }
         file.seek(SeekFrom::Start(offset)).ok()?;
         let mut reader = BufReader::with_capacity(64 * 1024, file.take(self.bytes.saturating_sub(offset)));
         let mut out = Vec::new();
         let mut read = 0_usize;
-        while let Some(record) = read_record(&mut reader).ok()? {
+        loop {
+            let Some(record) = read_record(&mut reader).ok()? else {
+                if reader.get_ref().limit() != 0 {
+                    return None;
+                }
+                break;
+            };
             read += 1;
             if read > MAX_KEY_RECORDS {
                 return None;
@@ -406,6 +451,7 @@ impl EntityIndex {
                 break;
             }
             if record.hash == hash {
+                *remaining = remaining.checked_sub(1)?;
                 out.push(record);
             }
         }
@@ -427,12 +473,16 @@ impl EntityIndex {
         }
         let mut wanted = Vec::new();
         hints.iter().for_each(|hint| collect(&self.fields, hint, &mut wanted));
+        if wanted.len() > MAX_LOOKUP_LEAVES {
+            return None;
+        }
+        let mut remaining = MAX_RECORDS;
         for (path, value, _) in &wanted {
             let key = (path.to_string(), value.to_ascii_lowercase());
             if leaves.contains_key(&key) {
                 continue;
             }
-            let records = self.records_of(key_hash(path, &key.1))?;
+            let records = self.records_of(key_hash(path, &key.1), &mut remaining)?;
             leaves.insert(key, records.into_iter().map(|record| ((record.src, record.group), record)).collect());
         }
         let bits = wanted.iter().fold(0_u32, |bits, (_, _, bit)| bits | (1 << bit));
@@ -506,6 +556,8 @@ impl EntityIndex {
 #[derive(Debug, Default)]
 pub struct Slot {
     current: Mutex<Option<Arc<EntityIndex>>>,
+    // Do not build a third generation while a query retains the old one.
+    retired: Mutex<Weak<EntityIndex>>,
     swept: AtomicBool,
     build: tokio::sync::Mutex<()>,
     failed_at: Mutex<Option<Instant>>,
@@ -524,11 +576,15 @@ impl Slot {
 
     fn replace(&self, next: EntityIndex) {
         let previous = self.current.lock().expect("entity index slot").replace(Arc::new(next));
+        *self.retired.lock().expect("entity index retired") = previous.as_ref().map_or_else(Weak::new, Arc::downgrade);
         drop(previous);
     }
 
     fn clear(&self) {
         let previous = self.current.lock().expect("entity index slot").take();
+        if let Some(previous) = &previous {
+            *self.retired.lock().expect("entity index retired") = Arc::downgrade(previous);
+        }
         drop(previous);
     }
 
@@ -556,9 +612,22 @@ pub fn needs_rebuild(current: Option<&EntityIndex>, live: &BTreeSet<SourceKey>, 
 pub fn extract(path: &Path, fields: &[String], groups: usize) -> anyhow::Result<(Vec<Record>, Vec<GroupCoverage>)> {
     use crate::generation::{event_time_us_from_array, CompiledStringPath};
     use crate::parts::entity_locators::normalized;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
     let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?;
     let metadata = builder.metadata().clone();
+    // Utf8View retains dictionary/page buffers instead of expanding a
+    // repeated long value for every row. The projected Parquet byte cap
+    // alone cannot bound the size of an ordinary Utf8 batch.
+    fn viewed(field: &arrow_schema::Field) -> arrow_schema::Field {
+        use arrow_schema::DataType;
+        let data_type = match field.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => DataType::Utf8View,
+            DataType::Struct(fields) => DataType::Struct(fields.iter().map(|field| Arc::new(viewed(field))).collect()),
+            other => other.clone(),
+        };
+        field.clone().with_data_type(data_type)
+    }
+    let view_schema = Arc::new(arrow_schema::Schema::new(builder.schema().fields().iter().map(|field| viewed(field)).collect::<Vec<_>>()));
     anyhow::ensure!(metadata.num_row_groups() == groups, "data file row groups differ from its record");
     let schema = metadata.file_metadata().schema_descr();
     let scalar = |field: &str| schema.columns().iter().any(|column| {
@@ -576,12 +645,24 @@ pub fn extract(path: &Path, fields: &[String], groups: usize) -> anyhow::Result<
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let mut records = Vec::new();
+    anyhow::ensure!(groups <= MAX_INDEX_GROUPS, "entity index source exceeds group budget");
     let mut coverage = Vec::with_capacity(groups);
     for group in 0..groups {
         let group_rows = usize::try_from(metadata.row_group(group).num_rows())?;
-        anyhow::ensure!(group_rows > 0 && group_rows <= u32::MAX as usize, "row group size out of bounds");
+        anyhow::ensure!(group_rows > 0 && group_rows <= crate::parts::format::MAX_ROW_GROUP_ROWS
+            && group_rows.saturating_mul(indexed.len().max(1)) <= MAX_GROUP_VALUES,
+            "entity index group exceeds value budget");
+        let projected = leaves.iter().try_fold((0_i64, 0_i64), |(raw, compressed), &leaf| {
+            let column = metadata.row_group(group).column(leaf);
+            Some((raw.checked_add(column.uncompressed_size())?, compressed.checked_add(column.compressed_size())?))
+        });
+        anyhow::ensure!(projected.is_some_and(|(raw, compressed)|
+            (0..=MAX_PROJECTED_GROUP_BYTES).contains(&raw)
+                && (0..=MAX_PROJECTED_GROUP_BYTES).contains(&compressed)),
+            "entity index group exceeds decoder byte budget");
         let projection = parquet::arrow::ProjectionMask::leaves(schema, leaves.clone());
-        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?
+        let options = ArrowReaderOptions::new().with_schema(view_schema.clone());
+        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(std::fs::File::open(path)?, options)?
             .with_projection(projection)
             .with_row_groups(vec![group])
             .with_batch_size(8_192)
@@ -651,6 +732,7 @@ pub fn extract(path: &Path, fields: &[String], groups: usize) -> anyhow::Result<
                 }
                 let covered_blocks = runs.iter().map(|(start, end, _)| (end - start).div_ceil(BLOCK_ROWS)).sum::<u64>() as usize;
                 let whole = covered_blocks * DENSE_DIVISOR > blocks;
+                anyhow::ensure!(records.len() < MAX_RECORDS, "entity index source exceeds record memory budget");
                 records.push(Record {
                     hash,
                     src: 0,
@@ -707,6 +789,8 @@ fn write_sorted(path: &Path, records: impl Iterator<Item = anyhow::Result<Record
         if count.is_multiple_of(SPARSE_EVERY) {
             sparse.push((record.hash, offset));
         }
+        anyhow::ensure!(offset.saturating_add(18 + 24 * record.runs.len() as u64) <= MAX_INDEX_BYTES,
+            "entity index exceeds disk budget");
         offset += write_record(&mut out, &record)?;
         count += 1;
         if offset - dropped >= DROP_CACHE_EVERY {
@@ -726,24 +810,30 @@ fn write_sorted(path: &Path, records: impl Iterator<Item = anyhow::Result<Record
 /// Merge the previous file's still-live records (renumbered by `renumber`,
 /// which is monotone) with `tail` (sorted) into one sorted stream.
 fn merged_stream(
-    previous: Option<(&Path, BTreeMap<u32, u32>)>,
+    previous: Option<(&Path, BTreeMap<u32, u32>, u64)>,
     tail: Vec<Record>,
 ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Record>>> {
     let mut old = match previous {
-        Some((path, renumber)) => {
+        Some((path, renumber, expected_bytes)) => {
             let file = std::fs::File::open(path)?;
+            anyhow::ensure!(file.metadata()?.len() == expected_bytes, "entity index length changed before rebuild");
             let mut reader = BufReader::with_capacity(256 * 1024, UncachedReader { file, read: 0, dropped: 0 });
+            let mut consumed = 0_u64;
             Some(std::iter::from_fn(move || loop {
                 match read_record(&mut reader) {
+                    Ok(None) if consumed != expected_bytes => return Some(Err(anyhow::anyhow!("entity index truncated during rebuild"))),
                     Ok(None) => return None,
                     Err(error) => return Some(Err(anyhow::Error::from(error))),
-                    Ok(Some(mut record)) => match renumber.get(&record.src) {
-                        Some(new) => {
-                            record.src = *new;
-                            return Some(Ok(record));
+                    Ok(Some(mut record)) => {
+                        consumed += 18 + 24 * record.runs.len() as u64;
+                        match renumber.get(&record.src) {
+                            Some(new) => {
+                                record.src = *new;
+                                return Some(Ok(record));
+                            }
+                            None => continue,
                         }
-                        None => continue,
-                    },
+                    }
                 }
             }).peekable())
         }
@@ -779,8 +869,7 @@ fn path_text(path: &Path) -> QueryResult<String> {
 /// [`MAX_TAIL_FILES`] resident live data files outside the index (and drop
 /// the sources that left the window) when [`needs_rebuild`] says so.
 /// Single-flight; starts only while every query slot is free and no durable
-/// job runs; the extraction runs on the blocking pool. A no-op, beside a
-/// one-time sweep of an earlier process's files, while switched off.
+/// job runs; the extraction runs on the blocking pool.
 pub async fn merge_once(engine: &PartQueryEngine, state_dir: &Path, now_us: i64) -> QueryResult<MergeReport> {
     let slot = engine.entity_index();
     let Ok(_build) = slot.build.try_lock() else {
@@ -791,33 +880,37 @@ pub async fn merge_once(engine: &PartQueryEngine, state_dir: &Path, now_us: i64)
         // An earlier process's coverage lived in its memory: never read.
         let _ = std::fs::remove_dir_all(&dir);
     }
-    if !enabled() {
-        slot.clear();
-        return Ok(MergeReport::default());
-    }
     let current = slot.current();
     let unchanged = |current: &Option<Arc<EntityIndex>>| MergeReport {
         sources: current.as_ref().map_or(0, |index| index.sources.len()),
         bytes: current.as_ref().map_or(0, |index| index.bytes),
         ..MergeReport::default()
     };
-    if slot.backing_off(Instant::now()) || engine.job_running() {
+    if slot.backing_off(Instant::now()) || engine.job_running()
+        || slot.retired.lock().expect("entity index retired").strong_count() > 0
+    {
         return Ok(unchanged(&current));
     }
     let Some(admission) = engine.try_admit_idle() else {
         return Ok(unchanged(&current));
     };
     let (parts, _, _, _) = engine.snapshot(now_us.saturating_sub(WINDOW_US), now_us).await?;
+    // A larger window remains queryable; only this bounded prefix is
+    // considered for index coverage. The rest uses per-file evidence.
+    let parts = parts.into_iter().take(MAX_INDEX_SOURCES).collect::<Vec<_>>();
     let records = engine.fetcher().records(&parts).await.map_err(|error| internal(format!("{error:#}")))?;
     let mut live = BTreeSet::new();
     let mut files = Vec::new();
     let mut shapes = BTreeMap::new();
-    for (part, record) in parts.iter().zip(&records) {
+    'sources: for (part, record) in parts.iter().zip(&records) {
         for (index, data) in record.files.data.iter().enumerate() {
             let key = SourceKey { part: part.part_id.clone(), index, sha256: data.sha256.clone() };
             live.insert(key.clone());
             shapes.insert(key, (part.clone(), data.row_groups as usize, data.rows));
             files.push((part.clone(), index));
+            if live.len() >= MAX_INDEX_SOURCES {
+                break 'sources;
+            }
         }
     }
     if live.is_empty() {
@@ -843,7 +936,8 @@ pub async fn merge_once(engine: &PartQueryEngine, state_dir: &Path, now_us: i64)
             covered.insert(key.clone(), Coverage { src, groups: coverage.groups.clone() });
         }
     }
-    let tail_keys = resident.iter().filter(|key| !covered.contains_key(*key)).take(MAX_TAIL_FILES).cloned().collect::<Vec<_>>();
+    let remaining_sources = MAX_INDEX_SOURCES.saturating_sub(covered.len());
+    let tail_keys = resident.iter().filter(|key| !covered.contains_key(*key)).take(MAX_TAIL_FILES.min(remaining_sources)).cloned().collect::<Vec<_>>();
     let wanted = tail_keys.iter().map(|key| (shapes[key].0.clone(), super::fetch::PartFile::Data(key.index))).collect::<Vec<_>>();
     // Resident files: leasing them fetches nothing (an eviction race costs
     // one fetch, as for a query).
@@ -871,7 +965,7 @@ pub async fn merge_once(engine: &PartQueryEngine, state_dir: &Path, now_us: i64)
         return Ok(MergeReport::default());
     }
     let previous = match &current {
-        Some(index) if !renumber.is_empty() => Some((index.path.clone(), renumber)),
+        Some(index) if !renumber.is_empty() => Some((index.path.clone(), renumber, index.bytes)),
         _ => None,
     };
     std::fs::create_dir_all(&dir).map_err(internal)?;
@@ -880,14 +974,20 @@ pub async fn merge_once(engine: &PartQueryEngine, state_dir: &Path, now_us: i64)
     let target = dir.join(format!("{PREFIX}{id}.bin"));
     let started = Instant::now();
     let first_id = covered.len() as u32 + 1;
+    let covered_groups = covered.values().map(|coverage| coverage.groups.len()).sum::<usize>();
     let build_fields = fields.clone();
     let budget = MAX_INDEX_BYTES.saturating_sub(current.as_ref().map_or(0, |index| index.bytes));
     let temp = temporary.clone();
-    let built = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<(SourceKey, Coverage)>, Vec<(u64, u64)>, u64)> {
+    let removed_sources = current.as_ref().is_some_and(|index| index.sources.len() != covered.len());
+    let built = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<(Vec<(SourceKey, Coverage)>, Vec<(u64, u64)>, u64)>> {
         let mut tail = Vec::new();
         let mut added = Vec::new();
         let mut estimate = 0_u64;
+        let mut total_groups = covered_groups;
         for (offset, (key, path, groups, rows)) in tail_inputs.into_iter().enumerate() {
+            if total_groups.saturating_add(groups) > MAX_INDEX_GROUPS {
+                continue;
+            }
             let src = first_id + offset as u32;
             let (mut records, coverage) = match extract(&path, &build_fields, groups) {
                 Ok(extracted) => extracted,
@@ -900,24 +1000,37 @@ pub async fn merge_once(engine: &PartQueryEngine, state_dir: &Path, now_us: i64)
                 continue;
             }
             estimate += records.iter().map(|record| 18 + 24 * record.runs.len() as u64).sum::<u64>();
-            if estimate > budget {
+            if estimate > budget || tail.len().saturating_add(records.len()) > MAX_RECORDS {
                 break;
             }
+            total_groups += coverage.len();
             records.iter_mut().for_each(|record| record.src = src);
             tail.extend(records);
             added.push((key, Coverage { src, groups: coverage }));
         }
+        // A saturated or unindexable tail must not rewrite up to 1 GiB
+        // every minute without gaining coverage.
+        if added.is_empty() && !removed_sources {
+            return Ok(None);
+        }
         tail.sort_unstable_by_key(|record| (record.hash, record.src, record.group));
-        let (sparse, bytes) = write_sorted(&temp, merged_stream(previous.as_ref().map(|(path, map)| (path.as_path(), map.clone())), tail)?)?;
-        Ok((added, sparse, bytes))
+        let (sparse, bytes) = write_sorted(&temp, merged_stream(previous.as_ref().map(|(path, map, bytes)| (path.as_path(), map.clone(), *bytes)), tail)?)?;
+        Ok(Some((added, sparse, bytes)))
     })
     .await
     .map_err(internal)
     .and_then(|built| built.map_err(|error| internal(format!("{error:#}"))))
-    .and_then(|built| std::fs::rename(&temporary, &target).map_err(internal).map(|()| built));
+    .and_then(|built| match built {
+        Some(built) => std::fs::rename(&temporary, &target).map_err(internal).map(|()| Some(built)),
+        None => Ok(None),
+    });
     drop(leases);
     let (added, sparse, bytes) = match built {
-        Ok(built) => built,
+        Ok(Some(built)) => built,
+        Ok(None) => {
+            slot.record_failure(Some(Instant::now()));
+            return Ok(unchanged(&current));
+        }
         Err(error) => {
             let _ = std::fs::remove_file(&temporary);
             slot.record_failure(Some(Instant::now()));
@@ -971,12 +1084,10 @@ mod tests {
     }
 
     #[test]
-    fn switch_is_off_unless_one_or_true_and_fields_are_bloom_paths() {
-        assert!(!enabled_from(None));
-        assert!(!enabled_from(Some("0")));
-        assert!(!enabled_from(Some("")));
-        assert!(enabled_from(Some("1")));
-        assert!(enabled_from(Some(" TRUE ")));
+    fn on_by_default_and_fields_are_bloom_paths() {
+        // NAN-4772: no switch; a cell that still sets the old variable
+        // (hosted feature env) changes nothing.
+        assert!(enabled());
         assert_eq!(fields_from(None), DEFAULT_FIELDS.iter().map(|f| f.to_string()).collect::<Vec<_>>());
         assert_eq!(fields_from(Some("user.name, metadata.uid, bogus, device.hostname, user.name")), vec!["device.hostname", "user.name"]);
     }
@@ -1028,6 +1139,42 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_index_and_changed_source_fail_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = key("a");
+        let index = index_of(dir.path(), vec![
+            record("device.hostname", "host", 1, 0, vec![(0, 1_024, (1, 2))]),
+        ], vec![(source.clone(), cover(1, &[(8_192, 3)]))]);
+        let hint = [entity("device.hostname", "host")];
+        let mut changed = source.clone();
+        changed.sha256 = crate::parts::sha256_hex(b"replacement");
+        assert!(index.evidence(&hint, &[(changed, 1, 8_192)]).unwrap()[0].is_none());
+        for bytes in [0, 1, 17, 18, index.bytes - 1] {
+            std::fs::OpenOptions::new().write(true).open(index.path()).unwrap().set_len(bytes).unwrap();
+            assert!(index.evidence(&hint, &[(source.clone(), 1, 8_192)]).is_none(), "partial file {bytes}: scan");
+        }
+        assert!(merged_stream(Some((index.path(), BTreeMap::from([(1, 1)]), index.bytes)), Vec::new()).is_err(),
+            "a truncated generation cannot be copied into a supposedly complete rebuild");
+        std::fs::remove_file(index.path()).unwrap();
+        assert!(index.evidence(&hint, &[(source, 1, 8_192)]).is_none(), "missing file: scan");
+        assert!(read_record(&mut &[][..]).unwrap().is_none());
+        assert!(read_record(&mut &[0_u8; 17][..]).is_err(), "partial header is an error");
+    }
+
+    #[test]
+    fn lookup_budget_returns_unknown_instead_of_partial_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = index_of(dir.path(), vec![
+            record("user.name", "alice", 1, 0, vec![(0, 1_024, (1, 2))]),
+            record("user.name", "alice", 2, 0, vec![(0, 1_024, (1, 2))]),
+        ], Vec::new());
+        assert!(index.records_of(key_hash("user.name", "alice"), &mut 1).is_none());
+        assert_eq!(index.records_of(key_hash("user.name", "alice"), &mut 2).unwrap().len(), 2);
+        let hints = vec![entity("user.name", "alice"); MAX_LOOKUP_LEAVES + 1];
+        assert!(index.evidence(&hints, &[]).is_none());
+    }
+
+    #[test]
     fn many_keys_seek_through_the_sparse_index() {
         let dir = tempfile::tempdir().unwrap();
         let records = (0..5_000).map(|n| record("user.name", &format!("u{n}"), 1, 0, vec![(0, 1_024, (n, n))])).collect::<Vec<_>>();
@@ -1050,7 +1197,7 @@ mod tests {
         // Source 2 left the window: 1 -> 1, 3 -> 2; the tail is source 3.
         let tail = vec![record("user.name", "a", 3, 0, vec![(0, 1_024, (4, 4))])];
         let renumber = BTreeMap::from([(1, 1), (3, 2)]);
-        let merged = merged_stream(Some((previous.path(), renumber)), tail).unwrap().collect::<anyhow::Result<Vec<_>>>().unwrap();
+        let merged = merged_stream(Some((previous.path(), renumber, previous.bytes)), tail).unwrap().collect::<anyhow::Result<Vec<_>>>().unwrap();
         assert_eq!(merged.iter().map(|record| (record.src, record.runs[0].2 .0)).collect::<Vec<_>>(), vec![(1, 1), (2, 3), (3, 4)]);
         let out = dir.path().join("out.bin");
         assert!(write_sorted(&out, merged.into_iter().rev().map(Ok)).is_err(), "out-of-order records fail the build");
@@ -1094,10 +1241,50 @@ mod tests {
         let reader = slot.current().unwrap();
         slot.replace(index_of(dir.path(), Vec::new(), Vec::new()));
         assert!(first_path.is_file());
+        assert_eq!(slot.retired.lock().unwrap().strong_count(), 1, "a reader blocks the next rebuild");
         drop(reader);
+        assert_eq!(slot.retired.lock().unwrap().strong_count(), 0, "rebuild may resume");
         assert!(!first_path.exists());
         slot.clear();
         assert!(slot.current().is_none());
+    }
+
+    #[test]
+    fn oversized_decodes_and_source_records_are_not_covered() {
+        use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("time", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("host", DataType::Utf8, false),
+        ]));
+        for (name, rows, wide) in [("bytes", 2_000, true), ("records", MAX_RECORDS + 1, false)] {
+            let path = dir.path().join(format!("{name}.parquet"));
+            let hosts = StringArray::from((0..rows).map(|n| if wide { "x".repeat(10_000) } else { format!("host-{n}") }).collect::<Vec<_>>());
+            let batch = RecordBatch::try_new(schema.clone(), vec![
+                Arc::new(TimestampMicrosecondArray::from((0..rows as i64).collect::<Vec<_>>()).with_timezone("UTC")),
+                Arc::new(hosts),
+            ]).unwrap();
+            let props = parquet::file::properties::WriterProperties::builder()
+                .set_max_row_group_row_count(Some(65_536)).set_dictionary_enabled(!wide).build();
+            let mut writer = parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema.clone(), Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let error = extract(&path, &["host".into()], rows.div_ceil(65_536)).unwrap_err();
+            assert!(error.to_string().contains(if wide { "decoder byte budget" } else { "record memory budget" }), "{name}: {error}");
+            if wide {
+                // The same long value, dictionary encoded, is safe with
+                // the production Utf8View reader and still indexes exactly.
+                let path = dir.path().join("dictionary.parquet");
+                let mut writer = parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema.clone(), None).unwrap();
+                writer.write(&batch).unwrap();
+                writer.close().unwrap();
+                let (records, groups) = extract(&path, &["host".into()], 1).unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(groups, vec![GroupCoverage { rows: rows as u32, known: 1 }]);
+                assert!(records[0].whole);
+            }
+        }
     }
 
     #[test]
@@ -1134,5 +1321,7 @@ mod tests {
         let busy = records.iter().find(|record| record.hash == key_hash("device.hostname", "busy") && record.group == 0).unwrap();
         assert!(busy.whole && busy.runs.is_empty(), "dense value: whole group");
         assert!(extract(&path, &fields, 3).is_err(), "group count must match the signed record");
+        let wide_fields = vec!["device.hostname".to_string(); 9];
+        assert!(extract(&path, &wide_fields, 2).is_err(), "row/field working set is bounded before decoding");
     }
 }

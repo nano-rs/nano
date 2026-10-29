@@ -497,6 +497,12 @@ async fn a_merge_waits_for_a_durable_start_while_fresh_ingest_commits() {
 /// mixture of committed chunks and unmerged L0/M parts. A metadata row sum
 /// alone could hide a duplicated row replacing a missing one.
 async fn assert_backlog_readable(lab: &Lab) {
+    let actual = hour_uids(lab).await;
+    let expected = (0..OBJECTS * ROWS_PER_OBJECT).map(|i| format!("nan4755-{i:07}")).collect::<Vec<_>>();
+    assert_eq!(actual, expected, "every backlog uid is readable exactly once");
+}
+
+async fn hour_uids(lab: &Lab) -> Vec<String> {
     use crate::part_query::log_view::PartLogView;
     use crate::parts::format::PartKeys;
     use crate::parts::provenance::SignedProvenance;
@@ -517,8 +523,7 @@ async fn assert_backlog_readable(lab: &Lab) {
         }
     }
     actual.sort();
-    let expected = (0..OBJECTS * ROWS_PER_OBJECT).map(|i| format!("nan4755-{i:07}")).collect::<Vec<_>>();
-    assert_eq!(actual, expected, "every backlog uid is readable exactly once");
+    actual
 }
 
 /// Interrupt both sides of the part-log commit. Before append an uploaded
@@ -643,4 +648,63 @@ async fn a_left_unmerged_hour_retries_only_on_limit_growth_and_leaves_no_stale_g
     assert_eq!(ingestor.health().merges_left_unmerged, 0);
     assert!(ingestor.merge_attempts.entry(&id).is_none(), "retired data leaves no permanent policy behind");
     super::super::merge_quota::MEMORY_PROBE_FOR_TEST.set(None);
+}
+
+/// NAN-4806: the small role compacts a fragmented live hour while fresh
+/// objects keep committing. The probe includes real measured merge/admission
+/// heap above a 1.2 GB resident base inside the reported 2.09 GB role.
+#[test]
+fn nan4806_small_role_merges_while_ingesting_without_quarantine() {
+    const CAP: u64 = 2_090_000_000;
+    fn role_probe() -> Option<(u64, u64)> {
+        Some((1_200_000_000 + (crate::test_heap::live() - BASE.load(Ordering::SeqCst)).max(0) as u64, CAP))
+    }
+    let lab = Lab::new();
+    land(&lab);
+    let (_, peak) = super::nan4749_ingest_tests::measured(|runtime| runtime.block_on(async {
+        let mut cfg = lab.config();
+        size_for_memory_cap(&mut cfg, CAP);
+        cfg.merge_policy.minute_min_l0_parts = 4;
+        super::super::merge::set_memory_budget(CAP);
+        let mut ingestor = Ingestor::open(cfg, lab.parts, &lab.sources, &lab.spool as &dyn NoticeQueue, lab.signer,
+            lab.signer.trusted(), BronzeIngestEnricher::disabled(), &seed_schema(), INGEST_CLOCK).await.unwrap();
+        ingestor.set_background_store(lab.parts);
+        ingestor.set_background_signer(lab.signer);
+        assert_eq!(ingestor.cfg.buffer_budget_bytes, 627_000_000);
+        assert!(ingestor.merges_reserved_bytes() >= CAP / 21, "keep merge room before any merge starts");
+        let before_files = hour_parts(&ingestor).iter().map(|p| p.data_files).sum::<u32>();
+        BASE.store(crate::test_heap::reset_peak(), Ordering::SeqCst);
+        super::super::merge_quota::MEMORY_PROBE_FOR_TEST.set(Some(role_probe));
+        let mut fresh = 0;
+        for tick in 0..8 {
+            let now = INGEST_CLOCK + 30_000 + tick as i64 * 1_000;
+            let first = 1_000_000 + tick * 50;
+            lab.land(&format!("headroom-fresh-{tick}"), &(first..first + 50).map(event).collect::<Vec<_>>(), now - 500);
+            assert_eq!(ingestor.tick(now).await.unwrap().admitted_rows, 50);
+            ingestor.flush_now(now + 1).await.unwrap();
+            fresh += 50;
+            tokio::time::timeout(std::time::Duration::from_secs(60), settle_merges(&ingestor)).await.unwrap();
+            ingestor.tick(now + 2).await.unwrap();
+        }
+        for tick in 0..4 {
+            tokio::time::timeout(std::time::Duration::from_secs(60), settle_merges(&ingestor)).await.unwrap();
+            ingestor.tick(INGEST_CLOCK + 40_000 + tick).await.unwrap();
+        }
+        super::super::merge_quota::MEMORY_PROBE_FOR_TEST.set(None);
+        super::super::merge::set_memory_budget(0);
+        let parts = hour_parts(&ingestor);
+        let files = parts.iter().map(|p| p.data_files).sum::<u32>();
+        eprintln!("NAN-4806: selected-hour files {before_files} -> {files}, fresh rows {fresh}, guard stops {}, quarantines {}",
+            ingestor.health().merge_memory_stops_total, ingestor.merge_quarantine.len());
+        assert!(parts.iter().any(|p| p.level == Level::Minute), "a minute merge committed beside live ingest");
+        assert!(files <= 4 && files * 5 <= before_files, "file fan-out stayed high: {before_files} -> {files}");
+        assert_eq!(parts.iter().map(|p| p.rows).sum::<u64>(), (OBJECTS * ROWS_PER_OBJECT) as u64 + fresh);
+        assert_eq!(ingestor.health().rows_committed_total, fresh);
+        assert_eq!((ingestor.merge_quarantine.len(), ingestor.health().objects_quarantined_total, ingestor.health().merge_memory_stops_total), (0, 0, 0));
+        let mut expected = (0..OBJECTS * ROWS_PER_OBJECT).chain(1_000_000..1_000_000 + fresh as usize)
+            .map(|i| format!("nan4755-{i:07}")).collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(hour_uids(&lab).await, expected, "every backlog and fresh uid is readable exactly once");
+    }));
+    assert!(peak < CAP as isize - 1_200_000_000, "real measured heap must fit the role beside its resident base");
 }

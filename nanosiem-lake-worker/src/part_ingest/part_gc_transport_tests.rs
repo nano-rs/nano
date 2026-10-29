@@ -21,6 +21,9 @@ use std::sync::atomic::AtomicUsize;
 #[path = "part_gc_catalog_wipe_tests.rs"]
 mod catalog_wipe_tests;
 
+#[path = "part_gc_receipt_tests.rs"]
+pub(crate) mod receipt_tests;
+
 struct Bucket {
     entries: RwLock<BTreeMap<u64, Vec<u8>>>,
     objects: RwLock<BTreeMap<String, Vec<u8>>>,
@@ -135,7 +138,9 @@ async fn listing(
         .unwrap()
         .push(("LIST".into(), std::time::Instant::now()));
     let prefix = query.get("prefix").cloned().unwrap_or_default();
-    if prefix.contains("/bronze-quarantine-v1/") {
+    if prefix.contains("/bronze-quarantine-v1/")
+        || (prefix.ends_with("/parts/") && bucket.page_objects.load(Ordering::SeqCst) == 0)
+    {
         // NAN-4567: the stored objects under the prefix, one page.
         let modified = bucket.modified.read().unwrap();
         let mut keys: Vec<(String, usize)> = bucket.objects.read().unwrap().iter()
@@ -231,7 +236,7 @@ fn permission_with_owner_ttl(
     gc.update(
         Some(&access),
         Some(&serde_json::json!({
-            "schema_version":1, "tenant_id":TENANT_UUID, "tenant_slug":"fixture", "enabled":true,
+            "schema_version":1, "tenant_id":gc.shared.tenant_uuid, "tenant_slug":"fixture", "enabled":true,
             "expires_at":(chrono::Utc::now() + ttl).to_rfc3339()
         })),
     );
@@ -249,8 +254,25 @@ pub(crate) async fn fixture(entries: u64, delay: Duration, rate: u32) -> Fixture
 }
 
 async fn fixture_with_owner(entries: u64, delay: Duration, rate: u32, owner_url: &str) -> Fixture {
+    fixture_for_tenant(entries, delay, rate, owner_url, TENANT_UUID, None).await
+}
+
+async fn fixture_for_tenant(
+    entries: u64, delay: Duration, rate: u32, owner_url: &str, tenant: &str, worker_http: Option<reqwest::Client>,
+) -> Fixture {
+    let mut log = history(entries);
+    if tenant != TENANT_UUID {
+        let mut prev = crate::parts::part_log::GENESIS_PREV.to_string();
+        for raw in log.values_mut() {
+            let mut entry = crate::parts::part_log::LogEntry::parse_bytes(raw, TENANT_UUID).unwrap();
+            entry.tenant_id = tenant.into();
+            entry.prev_sha256 = prev;
+            *raw = entry.to_bytes().unwrap();
+            prev = crate::parts::sha256_hex(raw);
+        }
+    }
     let bucket = Arc::new(Bucket {
-        entries: RwLock::new(history(entries)),
+        entries: RwLock::new(log),
         objects: RwLock::new(BTreeMap::new()),
         delay,
         requests: Default::default(),
@@ -283,17 +305,18 @@ async fn fixture_with_owner(entries: u64, delay: Duration, rate: u32, owner_url:
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(
-        R2PartStore::new_split(&location, &location, TENANT_UUID, &dir.path().join("spill"))
+        R2PartStore::new_split(&location, &location, tenant, &dir.path().join("spill"))
             .unwrap(),
     );
     let gc = CellSanctionedPartGc::new_guarded(
-        TENANT_UUID,
+        tenant,
         owner_url,
         None,
         store.clone(),
         fixture_keys(),
         dir.path(),
         None,
+        worker_http,
     )
     .unwrap()
     // Every slice persists: these tests read the view back after folds.
@@ -906,6 +929,7 @@ async fn production_http_resume_and_background_backoff() {
         fixture_keys(),
         f.dir.path(),
         None,
+        None,
     )
     .unwrap();
     permission(&resumed, 200, chrono::Duration::minutes(10));
@@ -1069,6 +1093,7 @@ async fn guarded_constructor_resumes_the_view_from_the_hot_dir_on_a_fresh_pod() 
         fixture_keys(),
         fresh_pod.path(),
         Some(f.dir.path()),
+        None,
     )
     .unwrap()
     .with_view_save_interval(Duration::ZERO);

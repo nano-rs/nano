@@ -1866,8 +1866,8 @@ if [[ "$USE_LEAN" == "1" ]]; then
     export NANO_LAKE_TENANT_ID="$LEAN_TENANT_ID" NANO_TENANT_ID="$LEAN_TENANT_ID"
     export NANO_DRAGONFLY_DATA_VOLUME="$LEAN_DRAGONFLY_VOLUME" NANO_DRAGONFLY_VOLUME=nano-lean-dragonfly
     # Coarse container backstop for the watchdog-enforced role limits: the
-    # memory budget lean-init sized the roles from (query 50 %, ingest 25 %,
-    # detect 15 %; the rest is the supervisor and fixed product/maintenance).
+    # budget lean-init sized the roles from (base shares 50/25/15 for
+    # query/ingest/detect, rebalanced for ingest headroom; 10 % for the rest).
     LEAN_CELL_MEM_LIMIT=$(python3 - .nano-lean/cell/placement.json <<'PYMEM'
 import json, sys
 tenant = json.load(open(sys.argv[1]))['tenants'][0]
@@ -1979,7 +1979,7 @@ install_platform_feeds() {
         args=(--license-file "$platform_feeds_license")
     fi
     log "Installing the signed platform feed bundle"
-    scripts/nano feeds update "${args[@]}" >/dev/null \
+    scripts/nano feeds update ${args[@]+"${args[@]}"} >/dev/null \
         || warn "Platform feed install failed; run 'scripts/nano feeds update' (sovereign: --license-file <license>) or import with --file."
 }
 install_platform_feeds

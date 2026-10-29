@@ -479,6 +479,10 @@ pub struct IndexSources {
     pub parts: usize,
     /// Held while the partial files are read.
     pub leases: Option<super::fetch::LocalParts>,
+    /// NAN-4799: parts whose partial in `partials` was classified from the
+    /// coverage memo without a lease (see [`Leasing::Unscanned`]); their
+    /// `path` is empty until [`IndexSources::lease_partials`] leases them.
+    pub unleased: Vec<PartRef>,
 }
 
 impl IndexSources {
@@ -489,6 +493,37 @@ impl IndexSources {
     /// Every source, partials first.
     pub fn all(&self) -> Vec<Source> {
         self.partials.iter().chain(&self.backfilled).cloned().collect()
+    }
+
+    /// NAN-4799: lease the partials of `sources` this classification did
+    /// not lease ([`Leasing::Unscanned`]) and set their paths. The returned
+    /// lease must be held while those paths are read.
+    pub async fn lease_partials(&self, engine: &PartQueryEngine, sources: &mut [Source]) -> QueryResult<Option<super::fetch::LocalParts>> {
+        let wanted = sources
+            .iter()
+            .filter(|source| source.path.as_os_str().is_empty())
+            .filter_map(|source| match &source.key {
+                SourceKey::Partial { part, .. } => self.unleased.iter().find(|unleased| &unleased.part_id == part).cloned(),
+                SourceKey::Backfill(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if wanted.is_empty() {
+            return Ok(None);
+        }
+        let local = engine
+            .fetcher()
+            .ensure(&wanted, &[FileSet::Partial(PartialKind::EntityRanges)])
+            .await
+            .map_err(|error| internal(format!("{error:#}")))?;
+        for source in sources.iter_mut().filter(|source| source.path.as_os_str().is_empty()) {
+            let SourceKey::Partial { part, sha256 } = &source.key else { continue };
+            let file = local
+                .of(FileSet::Partial(PartialKind::EntityRanges))
+                .find(|file| &file.part_id == part && &file.sha256 == sha256)
+                .ok_or_else(|| internal(format!("identity partial of part {} was not leased", part.as_str())))?;
+            source.path = file.path.clone();
+        }
+        Ok(Some(local))
     }
 
     pub fn state(&self) -> Value {
@@ -514,20 +549,63 @@ pub fn unindexable_path(state_dir: &Path, part: &PartId) -> PathBuf {
 /// Niceness of the backfill derivation thread (lowest CPU priority).
 const BACKFILL_NICE: libc::c_int = 19;
 
-/// Classify the parts of `[from_us, to_us]`.
+/// Which entity-range partials [`index_sources_leasing`] leases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leasing {
+    /// Every indexed part's partial, including sources in the merged index.
+    All,
+    /// NAN-4799: only partials whose coverage this process has not scanned
+    /// yet. A memoized part is classified from its signed provenance digest
+    /// alone, so a background pass over the 30-day window re-reads no
+    /// partial (a hosted tenant: ~350-420k R2 GETs/day of partials evicted
+    /// outside the hot window, leased twice every 5 s pass). Its source's `path` stays
+    /// empty; [`IndexSources::lease_partials`] leases it when it is read.
+    Unscanned,
+}
+
+/// Classify the parts of `[from_us, to_us]`, leasing every indexed partial.
 pub async fn index_sources(engine: &PartQueryEngine, state_dir: &Path, from_us: i64, to_us: i64) -> QueryResult<IndexSources> {
+    index_sources_leasing(engine, state_dir, from_us, to_us, Leasing::All).await
+}
+
+/// Classify the parts of `[from_us, to_us]`, leasing per `leasing`.
+pub async fn index_sources_leasing(
+    engine: &PartQueryEngine, state_dir: &Path, from_us: i64, to_us: i64, leasing: Leasing,
+) -> QueryResult<IndexSources> {
     let (parts, _, _, _) = engine.snapshot(from_us, to_us).await?;
     let mut sources = IndexSources { parts: parts.len(), ..IndexSources::default() };
     if parts.is_empty() {
         return Ok(sources);
     }
-    let local = engine
-        .fetcher()
-        .ensure(&parts, &[FileSet::Partial(PartialKind::EntityRanges)])
-        .await
-        .map_err(|error| internal(format!("{error:#}")))?;
+    // Signed records are memoized by the fetcher (`ensure` reads them too).
+    let records = engine.fetcher().records(&parts).await.map_err(|error| internal(format!("{error:#}")))?;
+    let digests = parts
+        .iter()
+        .zip(&records)
+        .filter_map(|(part, record)| {
+            super::fetch::file_digest(record, super::fetch::PartFile::Partial(PartialKind::EntityRanges))
+                .map(|(_, sha256, _)| (part.part_id.clone(), sha256.to_string()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let leased = parts
+        .iter()
+        .filter(|part| leasing == Leasing::All || engine.identity_coverage(&part.part_id).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    let local = if leased.is_empty() {
+        None
+    } else {
+        Some(
+            engine
+                .fetcher()
+                .ensure(&leased, &[FileSet::Partial(PartialKind::EntityRanges)])
+                .await
+                .map_err(|error| internal(format!("{error:#}")))?,
+        )
+    };
     let files = local
-        .of(FileSet::Partial(PartialKind::EntityRanges))
+        .iter()
+        .flat_map(|local| local.of(FileSet::Partial(PartialKind::EntityRanges)))
         .map(|file| (file.path.clone(), file.part_id.clone(), file.sha256.clone()))
         .collect::<Vec<_>>();
     // NAN-3077: a part's partial is immutable, so its coverage is scanned
@@ -535,13 +613,20 @@ pub async fn index_sources(engine: &PartQueryEngine, state_dir: &Path, from_us: 
     // and every backfill pass.
     let mut covered = BTreeMap::new();
     let mut unscanned = Vec::new();
-    for (path, part, _) in &files {
-        match engine.identity_coverage(part) {
+    for part in &parts {
+        if !digests.contains_key(&part.part_id) {
+            continue;
+        }
+        match engine.identity_coverage(&part.part_id) {
             Some(Some(events)) => {
-                covered.insert(part.clone(), events);
+                covered.insert(part.part_id.clone(), events);
             }
             Some(None) => {}
-            None => unscanned.push((path.clone(), part.clone())),
+            None => {
+                if let Some((path, _, _)) = files.iter().find(|(_, id, _)| *id == part.part_id) {
+                    unscanned.push((path.clone(), part.part_id.clone()));
+                }
+            }
         }
     }
     if !unscanned.is_empty() {
@@ -558,10 +643,17 @@ pub async fn index_sources(engine: &PartQueryEngine, state_dir: &Path, from_us: 
         engine.remember_identity_coverage(scanned);
     }
     for part in parts {
-        let file = files.iter().find(|(_, id, _)| *id == part.part_id).map(|(path, _, sha256)| (path.clone(), sha256.clone()));
+        let file = match files.iter().find(|(_, id, _)| *id == part.part_id) {
+            Some((path, _, sha256)) => Some((path.clone(), sha256.clone(), true)),
+            // Memoized coverage, not leased: the signed digest names it.
+            None => digests.get(&part.part_id).map(|sha256| (PathBuf::new(), sha256.clone(), false)),
+        };
         match (file, covered.get(&part.part_id)) {
-            (Some((path, sha256)), Some(events)) if u64::try_from(*events).ok() == Some(part.rows) => {
+            (Some((path, sha256, leased)), Some(events)) if u64::try_from(*events).ok() == Some(part.rows) => {
                 sources.partials.push(Source { key: SourceKey::Partial { part: part.part_id.clone(), sha256 }, path });
+                if !leased {
+                    sources.unleased.push(part);
+                }
             }
             _ => {
                 let backfill = backfill_path(state_dir, &part.part_id);
@@ -573,7 +665,7 @@ pub async fn index_sources(engine: &PartQueryEngine, state_dir: &Path, from_us: 
             }
         }
     }
-    sources.leases = Some(local);
+    sources.leases = local;
     Ok(sources)
 }
 
@@ -603,7 +695,10 @@ pub async fn lookup_bounds(
     let from = items.iter().map(|i| i.reference_us).min().unwrap_or(0).saturating_sub(LOOKBACK_US).max(window.0);
     let to = items.iter().map(|i| i.reference_us).max().unwrap_or(0).min(window.1);
     let started = std::time::Instant::now();
-    let sources = index_sources(engine, state_dir, from, to).await?;
+    // Classify first: the merged index already holds most sources. Leasing
+    // all partials here re-fetches the cold 30-day window on every lookup,
+    // even when neither statement below reads a single original partial.
+    let sources = index_sources_leasing(engine, state_dir, from, to, Leasing::Unscanned).await?;
     let sources_s = started.elapsed().as_secs_f64();
     let files = sources.all();
     let mut state = sources.state();
@@ -613,6 +708,8 @@ pub async fn lookup_bounds(
         "identity_keys": items.iter().map(|item| item.key.as_str()).collect::<BTreeSet<_>>().len(),
         "identity_files": files.len(),
         "identity_sources_s": sources_s,
+        "identity_partial_leases": sources.leases.iter()
+            .map(|local| local.of(FileSet::Partial(PartialKind::EntityRanges)).count()).sum::<usize>(),
     });
     if files.is_empty() {
         state["timing"] = timing;
@@ -620,7 +717,11 @@ pub async fn lookup_bounds(
     }
     // NAN-3399: the merged index serves the live sources it covers; only
     // the rest (parts newer than its last build) are read one by one.
-    let scan = super::identity_merged::scan(engine.identity_merged().for_lookup(), &files);
+    let mut scan = super::identity_merged::scan(engine.identity_merged().for_lookup(), &files);
+    let tail_lease = sources.lease_partials(engine, &mut scan.tail).await?;
+    timing["identity_sources_s"] = json!(started.elapsed().as_secs_f64());
+    timing["identity_partial_leases"] = json!(sources.leases.iter().chain(tail_lease.iter())
+        .map(|local| local.of(FileSet::Partial(PartialKind::EntityRanges)).count()).sum::<usize>());
     let relation = Relation {
         files: if scan.tail.is_empty() { None } else {
             Some(super::partials::path_set(&scan.tail.iter().map(|source| source.path.clone()).collect::<Vec<_>>())?)
@@ -660,6 +761,7 @@ pub async fn lookup_bounds(
     state["timing"] = timing;
     // The merged file and the source leases outlive both statements.
     drop(scan);
+    drop(tail_lease);
     drop(sources);
     Ok((output_rows(kind, items, &found, &nat)?, state))
 }
@@ -726,7 +828,8 @@ pub async fn backfill_once(
     budget: usize,
     slot: Option<super::engine::AdmissionSlot>,
 ) -> QueryResult<BackfillReport> {
-    let sources = index_sources(engine, state_dir, now_us.saturating_sub(LOOKBACK_US), now_us).await?;
+    // NAN-4799: the pass reads only `missing`; memoized partials stay unleased.
+    let sources = index_sources_leasing(engine, state_dir, now_us.saturating_sub(LOOKBACK_US), now_us, Leasing::Unscanned).await?;
     drop(slot);
     let mut report = BackfillReport::default();
     let dir = state_dir.join(BACKFILL_DIR);

@@ -185,6 +185,13 @@ pub(super) async fn engine(root: &std::path::Path) -> PartQueryEngine {
 /// [`engine`] with the large lane (the job lane's memory cap) at `job_bytes`
 /// and statements at `threads`, as the cell builds them.
 pub(crate) async fn engine_with_job_cap(root: &std::path::Path, job_bytes: u64, threads: u64) -> PartQueryEngine {
+    engine_with_limits(root, job_bytes, threads, 256 << 20).await
+}
+
+/// [`engine_with_job_cap`] with the interactive lane's chDB server memory
+/// limit at `small_server_bytes` (a long test's process RSS grows into the
+/// 256 MiB default; the cell derives it from memory).
+pub(crate) async fn engine_with_limits(root: &std::path::Path, job_bytes: u64, threads: u64, small_server_bytes: u64) -> PartQueryEngine {
     let signer = signer();
     let state = root.join("state");
     std::fs::create_dir_all(&state).unwrap();
@@ -224,7 +231,7 @@ pub(crate) async fn engine_with_job_cap(root: &std::path::Path, job_bytes: u64, 
         1,
         "parts",
         ExecutorMode::ReadOnly,
-        Some(256 << 20),
+        Some(small_server_bytes),
     )
     .unwrap()
     .with_result_limit(64 << 20);

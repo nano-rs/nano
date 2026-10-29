@@ -40,6 +40,11 @@ pub(crate) struct Basin {
     pub checks: AtomicUsize,
     pub trace: Mutex<Vec<&'static str>>,
     cache: Mutex<Option<Vec<String>>>,
+    /// NAN-4783: a long sync. While set, `expire_and_inspect` (custody held)
+    /// signals `held` and waits for `release`.
+    pub hold_inspection: AtomicBool,
+    pub held: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
 }
 
 impl Basin {
@@ -130,6 +135,9 @@ impl Basin {
             checks: AtomicUsize::new(0),
             trace: Mutex::new(vec![]),
             cache: Mutex::new(None),
+            hold_inspection: AtomicBool::new(false),
+            held: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
         })
     }
 
@@ -389,6 +397,10 @@ impl CatalogLifecycleBackend for Basin {
         Ok(())
     }
     async fn expire_and_inspect(&self) -> Result<BTreeSet<String>> {
+        if self.hold_inspection.load(Ordering::SeqCst) {
+            self.held.notify_one();
+            self.release.notified().await;
+        }
         ensure!(
             !self.fail_expiry.load(Ordering::SeqCst),
             "expiry unavailable"

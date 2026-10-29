@@ -791,6 +791,9 @@ impl CellSanctionedPartGc {
     }
 
     /// The only unwrapped reader is built here over the exact guarded store.
+    /// A private-CA Worker client must be supplied before the store holds a
+    /// weak reference to Shared; the default client stays HTTPS-only.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_guarded(
         tenant_uuid: &str,
         owner_url: &str,
@@ -799,6 +802,7 @@ impl CellSanctionedPartGc {
         trusted: crate::parts::provenance::TenantKeySet,
         state_dir: &Path,
         view_dir: Option<&Path>,
+        worker_http: Option<reqwest::Client>,
     ) -> Result<Self> {
         let reader = crate::lake_part_gc::StorePartLogReader::new(store.clone(), tenant_uuid, trusted)?.gc_private();
         Self::new_inner(CellPartGcWiring {
@@ -808,7 +812,7 @@ impl CellSanctionedPartGc {
             reader: Arc::new(reader),
             lister: Arc::new(R2PartLister(store.clone())),
             state_dir: None,
-            worker_http: None,
+            worker_http,
         }, Some((&store, state_dir)), view_dir)
     }
 
@@ -1309,10 +1313,11 @@ const CATCHING_UP: [&str; 3] = ["log_catching_up", "index_catching_up", crate::l
 const LOG_CATCHING_UP: &str = "log_catching_up";
 /// NAN-3852: consecutive `index_settling` stops without indexing or deleting
 /// before the task ends as `index_catch_up_no_progress` (and backs off).
-/// With [`index_settling_retry_delay`] the jittered budget is >= ~84 s, past
-/// the 60 s settle gate, so a receipt still in flight (or a receipted run
-/// restarted after a gap) settles within one task.
-const MAX_INDEX_SETTLING_RETRIES: u32 = 24;
+/// Even minimum jitter must cover control's entire receipt acceptance window.
+/// Otherwise a valid delayed completion can still end the task in the long
+/// failure backoff before control's five-minute window has elapsed. Old
+/// missing receipts remain hard refusals in index publication.
+const MAX_INDEX_SETTLING_RETRIES: u32 = 80;
 const INDEX_SETTLING_RETRY_BASE: Duration = Duration::from_millis(500);
 const INDEX_SETTLING_RETRY_MAX: Duration = Duration::from_secs(8);
 
@@ -1836,12 +1841,16 @@ async fn run_index_only(shared: Arc<Shared>) -> Result<PassReport> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let receipted_through = shared.receipted_appends.receipted_through(now_ms);
     match crate::lake_part_gc::index::sync_index(&seams, &reader, &shared.tenant_uuid, now_ms, receipted_through).await {
-        Ok(IndexSyncOutcome::Synced { status, caught_up, pushed, head_appended_ms, .. }) => {
+        Ok(IndexSyncOutcome::Synced { status, caught_up, pushed, head_appended_ms, settling, .. }) => {
             report.indexed = pushed;
             report.index_head_seq = status.indexed_through_seq;
             report.index_head_appended_ms = head_appended_ms;
             if !caught_up {
-                report.paused_reason = Some("index_catching_up".into());
+                report.paused_reason = Some(if settling {
+                    crate::lake_part_gc::executor::INDEX_SETTLING
+                } else {
+                    "index_catching_up"
+                }.into());
             }
         }
         Ok(IndexSyncOutcome::RouteNotServed) => report.paused_reason = Some("index_route_not_served".into()),
@@ -3734,11 +3743,12 @@ mod tests {
         let mut retries = 0;
         assert!(settling_retry(&mut other, &mut retries).is_none());
         assert_eq!((retries, other.paused_reason.as_deref(), other.backoff), (0, Some("index_catching_up"), false));
-        // The worst-case jittered wait outlasts the 60 s settle gate.
+        // Even minimum jitter covers the full receipt acceptance window;
+        // the previous 24 retries exhausted it after only ~84 s.
         let floor: Duration = (1..=MAX_INDEX_SETTLING_RETRIES)
             .map(|n| (INDEX_SETTLING_RETRY_BASE.saturating_mul(1 << (n - 1).min(16)).min(INDEX_SETTLING_RETRY_MAX)) / 2)
             .sum();
-        assert!(floor.as_millis() as i64 > crate::lake_part_gc::index::INDEX_SETTLE_MS, "{floor:?}");
+        assert!(floor.as_millis() as i64 > crate::lake_part_gc::index::RECEIPT_WINDOW_MS, "{floor:?}");
     }
 
     fn progress_report(index_head: Option<u64>, appended_ms: Option<i64>, deleted: u64) -> PassReport {

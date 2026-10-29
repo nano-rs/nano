@@ -610,9 +610,10 @@ async fn attach_inner(
         vended_credentials: false,
     };
     progress.enter(AttachStage::ServingBackend);
-    // NAN-4614: verified data files survive a cut-off attempt and are not
-    // read again for the fresh serving epoch. Inside `work`: uninstall
-    // removes them with the planner checkpoints.
+    // NAN-4614: verified data files survive a cut-off attempt. (A fresh
+    // serving epoch reads no part file at all since NAN-4782: it copies the
+    // master's catalog entries.) Inside `work`: uninstall removes them with
+    // the planner checkpoints.
     let target = Arc::new(
         HostedExportTarget::new(tenant.into(), parts.clone(), keys, record.bucket.clone())?
             .with_verified_files(work.join("verified-files")),

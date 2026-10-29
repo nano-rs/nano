@@ -940,13 +940,38 @@ const MEMORY_GUARD_LOOKAHEAD: u64 = 2;
 pub struct MemoryPressure {
     pub used_bytes: u64,
     pub limit_bytes: u64,
+    /// NAN-4796: bytes in use when the merge's guard was armed (0 when
+    /// unknown): what the process held before this merge grew.
+    pub start_used_bytes: u64,
+}
+
+impl MemoryPressure {
+    /// NAN-4796: is the stop the merge's own? It is when the merge started
+    /// with the normal room: the process below [`MERGE_START_SHARE`] (the
+    /// history start gate), so the 15 % up to the guard is what the merge
+    /// used. Running it smaller (or splitting its fan-in) then helps. A
+    /// merge that started past that share (a minute merge beside a full
+    /// buffer, or a race with admission) was stopped by memory held
+    /// elsewhere: shrinking it cannot make it fit, so it waits briefly at
+    /// its shape instead of walking the ladder toward "left unmerged" (FP
+    /// cell-us-1: a smallest-shape 6-input chunk stopped at the same
+    /// ~1.18 GB as the 164-input hour).
+    pub fn charged_to_merge(&self) -> bool {
+        (self.start_used_bytes as f64) < self.limit_bytes as f64 * MERGE_START_SHARE
+    }
 }
 
 impl std::fmt::Display for MemoryPressure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "merge stopped under memory pressure: {} of {} bytes in use (guard at {:.0}%)",
-            self.used_bytes, self.limit_bytes, MEMORY_GUARD_SHARE * 100.0)
+        write!(f, "merge stopped under memory pressure: {} of {} bytes in use (guard at {:.0}%; {} in use at merge start)",
+            self.used_bytes, self.limit_bytes, MEMORY_GUARD_SHARE * 100.0, self.start_used_bytes)
     }
+}
+
+/// NAN-4796: the error is a guard stop that running the merge smaller
+/// would help ([`MemoryPressure::charged_to_merge`]).
+pub fn memory_pressure_of(error: &anyhow::Error) -> Option<MemoryPressure> {
+    error.chain().find_map(|cause| cause.downcast_ref::<MemoryPressure>().copied())
 }
 
 impl std::error::Error for MemoryPressure {}
@@ -961,6 +986,8 @@ thread_local! {
     static MEMORY_GUARD: std::cell::Cell<Option<Option<Instant>>> = const { std::cell::Cell::new(None) };
     /// Batch bytes charged on this thread since its last cgroup read.
     static MEMORY_GUARD_PENDING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// NAN-4796: bytes in use when the outermost guard scope was armed.
+    static MEMORY_GUARD_START: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Guards the merge running on this thread until dropped.
@@ -971,12 +998,20 @@ pub struct MemoryGuardScope {
 
 /// Arm the memory guard on this thread (the merge compute thread).
 pub fn memory_guard_scope() -> MemoryGuardScope {
-    MemoryGuardScope { previous: MEMORY_GUARD.replace(Some(None)), _thread_bound: std::marker::PhantomData }
+    let previous = MEMORY_GUARD.replace(Some(None));
+    if previous.is_none() {
+        // The merge's starting point: what it grows from (NAN-4796).
+        MEMORY_GUARD_START.set(memory_probe().map_or(0, |(used, _)| used));
+    }
+    MemoryGuardScope { previous, _thread_bound: std::marker::PhantomData }
 }
 
 impl Drop for MemoryGuardScope {
     fn drop(&mut self) {
         MEMORY_GUARD.set(self.previous);
+        if self.previous.is_none() {
+            MEMORY_GUARD_START.set(0);
+        }
     }
 }
 
@@ -1022,7 +1057,7 @@ fn memory_guard_after(bytes: u64) -> Result<()> {
     }
     let Some((used_bytes, limit_bytes)) = memory_probe() else { return Ok(()) };
     if memory_guard_stops(used_bytes, limit_bytes, bytes) {
-        return Err(MemoryPressure { used_bytes, limit_bytes }.into());
+        return Err(MemoryPressure { used_bytes, limit_bytes, start_used_bytes: MEMORY_GUARD_START.get() }.into());
     }
     Ok(())
 }
@@ -1096,6 +1131,41 @@ mod tests {
             assert!(is_memory_pressure(&error.context("merge pass")), "the stop survives added context");
         }
         assert!(memory_guard().is_ok(), "the scope ended");
+        MEMORY_PROBE_FOR_TEST.set(None);
+    }
+
+    /// NAN-4796: a stop is the merge's only when it grew into its own room.
+    #[test]
+    fn a_stop_is_charged_to_the_merge_only_when_it_used_its_room() {
+        let stop = |start, used| MemoryPressure { used_bytes: used, limit_bytes: 1_000, start_used_bytes: start };
+        // Started with the normal room (below the 70 % start share): its own.
+        assert!(stop(100, 850).charged_to_merge());
+        assert!(stop(699, 850).charged_to_merge());
+        // Started at 70 % or past it: memory held elsewhere left no room.
+        assert!(!stop(700, 850).charged_to_merge());
+        assert!(!stop(900, 950).charged_to_merge());
+        let error = anyhow::Error::from(stop(800, 810)).context("merge pass");
+        assert_eq!(memory_pressure_of(&error), Some(stop(800, 810)));
+        assert!(memory_pressure_of(&anyhow::anyhow!("io")).is_none());
+    }
+
+
+    #[test]
+    fn the_guard_scope_records_where_the_merge_started() {
+        fn at_600() -> Option<(u64, u64)> { Some((600, 1_000)) }
+        fn at_900() -> Option<(u64, u64)> { Some((900, 1_000)) }
+        MEMORY_PROBE_FOR_TEST.set(Some(at_600));
+        let outer = memory_guard_scope();
+        MEMORY_PROBE_FOR_TEST.set(Some(at_900));
+        {
+            // A nested scope (the write path) keeps the merge's start.
+            let _inner = memory_guard_scope();
+            let stop = memory_pressure_of(&memory_guard().unwrap_err()).unwrap();
+            assert_eq!((stop.start_used_bytes, stop.used_bytes), (600, 900));
+            assert!(stop.charged_to_merge());
+        }
+        drop(outer);
+        assert_eq!(MEMORY_GUARD_START.get(), 0);
         MEMORY_PROBE_FOR_TEST.set(None);
     }
 

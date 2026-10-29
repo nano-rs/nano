@@ -142,13 +142,14 @@ fn one_tick_admits_several_groups_within_the_budget() {
     // A 256 MiB ingest cap: a 76.8 MiB working budget.
     let lab = Lab::new(256 * 1024 * 1024);
     let budget = lab.config.buffer_budget_bytes;
-    // Rows per object so one group's JSON values hold about three objects.
+    // Several objects per group, with all 12 objects' Arrow rows fitting
+    // the smaller buffer cap beside reserved merge/admission headroom.
     let probe = lab.root.join("probe.parquet");
     write_bronze(&probe, &(0..400).map(event).collect::<Vec<_>>());
     let per_row = crate::bronze::bronze_file_decoded_bytes(&probe).unwrap() as f64 / 400.0;
     let (heap_row, arrow_row) = decoded_admission_cost(per_row as u64);
     let objects = 12;
-    let rows = (budget as f64 / (3.5 * (heap_row * 1.5 + arrow_row))) as usize;
+    let rows = (budget as f64 / (4.5 * (heap_row * 1.5 + arrow_row))) as usize;
     let mut decoded = 0;
     for object in 0..objects {
         decoded = lab.land(&format!("o{object:02}"), &(object * rows..(object + 1) * rows).map(event).collect::<Vec<_>>(), CLOCK - 5_000);

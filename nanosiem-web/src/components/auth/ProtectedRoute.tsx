@@ -17,6 +17,7 @@ import { ShieldX } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
+import { tenantAppHref } from '@/lib/tenant-auth-shell';
 
 interface ProtectedRouteProps {
   children: ReactNode;
@@ -115,7 +116,7 @@ function ForbiddenPage() {
             Go Back
           </Button>
           <Button
-            onClick={() => window.location.href = '/'}
+            onClick={() => { window.location.href = tenantAppHref('/'); }}
             className="bg-primary hover:bg-primary/90 text-foreground"
           >
             Go to Home

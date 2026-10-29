@@ -73,11 +73,15 @@ fn main() -> Result<()> {
     // Cell child: the handshake and the jail come FIRST, before any runtime
     // or thread (NAN-2871 contract).
     if std::env::args().any(|a| a == nanosiem_lake_cell::contract::CONTROL_FD_FLAG) {
-        let boot = nanosiem_lake_cell::child::bootstrap()?;
+        let boot = nanosiem_lake_cell::child::bootstrap_with_native_init(|assignment| {
+            nanosiem_lake_worker::cgroup_memory::prepare(assignment.jail.cgroup_dir.as_deref());
+            Ok(())
+        })?;
         nanosiem_lake_worker::process_limits::initialize()?;
         // INFO + JSON without RUST_LOG (production cells render none): the
         // old from_default_env() kept ERROR only (NAN-2964).
         nanosiem_lake_worker::cell_logging::init_child_tracing();
+        nanosiem_lake_worker::cgroup_memory::initialize(boot.assignment.jail.cgroup_dir.as_deref());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .on_thread_start(|| {
                 if let Err(error) = nanosiem_lake_cell::crash_capture::register_thread() {
@@ -164,6 +168,7 @@ fn main() -> Result<()> {
     }
     nanosiem_lake_worker::process_limits::initialize()?;
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
+    nanosiem_lake_worker::cgroup_memory::initialize(None);
     tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(lab_main())
 }
 

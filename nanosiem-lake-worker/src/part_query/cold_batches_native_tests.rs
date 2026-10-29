@@ -44,6 +44,7 @@ fn event(i: usize, time: &str) -> Value {
         "time": time, "message": format!("event {i} {}", "x".repeat(200)), "raw_data_size": raw.len(), "raw_data": raw,
         "status": "Success",
         "metadata": {"uid": format!("uid-{i:08}"), "version": "1.9.0", "log_source": source(i), "tenant_uid": TENANT,
+                     "processed_time": Utc::now().timestamp_millis(), "nano_parser_bundle_sha256": "b".repeat(64),
                      "product": {"name": source(i), "vendor_name": "fixture"}},
         "src_endpoint": {"ip": format!("10.0.{}.{}", i % 5, i % 17), "hostname": format!("host{}", i % 13)},
         // Skewed so `rare`/`top` have no ties: dst0..dst5 hold 20, 40, 76,
@@ -153,6 +154,46 @@ async fn answer(engine: &PartQueryEngine, query: &str, now: DateTime<Utc>, id: &
     let request = request(query, now, id);
     crate::query_timing::measure(id, Box::pin(engine.broad_npl(&request))).await
         .unwrap_or_else(|error| panic!("{query}: {error}"))
+}
+
+/// The router's fixed landing query over real admitted bronze, committed
+/// parts and the production compiler/executor. In particular, SUM is NULL
+/// when a newly added source has not produced a row yet (NAN-4816).
+#[tokio::test]
+#[ignore = "requires verified native chDB and the production lake query compiler"]
+async fn native_parser_landing_empty_and_pending_bundle_aggregates() {
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    ingest(root.path(), now).await;
+    let reader = engine(root.path(), "landing-reader", 128 << 20, 64 << 20).await;
+    let since = (now - Duration::minutes(5)).timestamp_millis();
+    for (source, bundle, floor, total, pending) in [
+        ("new_custom_source", "b", since, 0, None),
+        ("aws_cloudtrail", "b", since, 400, Some(400)),
+        ("aws_cloudtrail", "a", since, 400, Some(0)),
+        ("aws_cloudtrail", "b", now.timestamp_millis() + 86_400_000, 0, None),
+    ] {
+        let query = format!("source_type=\"{source}\" metadata.processed_time>={floor} | eval pending=if(metadata.nano_parser_bundle_sha256=\"{}\",1,0) | eval failed=if(pending=1 AND unmapped.parse_error!=\"\",1,0) | stats count() as rows, sum(pending) as n, sum(failed) as errors", bundle.repeat(64));
+        let result = answer(&reader, &query, now, &uuid::Uuid::new_v4().to_string()).await;
+        assert_eq!(result["ok"], true, "{result}");
+        assert!(result["completeness"].is_null(), "{result}");
+        let rows = result["result"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{result}");
+        // JSONEachRow may quote UInt64 aggregates.
+        let count = |v: &Value| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()));
+        assert_eq!(count(&rows[0]["rows"]), Some(total), "{result}");
+        assert_eq!(count(&rows[0]["n"]), pending, "{result}");
+        assert_eq!(count(&rows[0]["errors"]), pending.map(|_| 0), "{result}");
+        if total == 0 {
+            assert!(rows[0].get("n").unwrap().is_null());
+            assert!(rows[0].get("errors").unwrap().is_null());
+        } else {
+            assert!(result["log_head"]["seq"].as_u64().unwrap() > 0);
+        }
+    }
+    let mut foreign = request("* | stats count()", now, "foreign-landing");
+    foreign.tenant_id = uuid::Uuid::new_v4().to_string();
+    assert!(reader.broad_npl(&foreign).await.is_err());
 }
 
 /// Rows in a canonical order (unordered aggregates may come back in any).

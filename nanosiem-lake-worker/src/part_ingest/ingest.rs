@@ -37,7 +37,7 @@ use super::part_gc_gate::{
 };
 use super::schema::{additive_merge, align, coerce_to_schema, decode_parallel, infer_schema};
 use super::writer::{sort_by_time_uid, FinishedPart, PartDraft, PartWriter, PartialSource};
-use crate::bronze::{admit_bronze_files_received, ClampedSources, IngestTimes, NoCanonicalEvents, RowRefusal};
+use crate::bronze::{admit_bronze_files_received_bounded, AdmissionHeapExceeded, ClampedSources, IngestTimes, NoCanonicalEvents, RowRefusal};
 use crate::ingest_source_counters::{RefusedSources, SourceKey};
 use crate::parts::refusal_tally;
 use crate::enrichment::BronzeIngestEnricher;
@@ -166,6 +166,9 @@ pub struct IngestConfig {
     /// cap alone was ~2.2 GiB, plus its decode and sort copies (NAN-3056,
     /// the lab-tenant OOMs at 4.5 GiB). The cell derives it from memory.max.
     pub buffer_budget_bytes: u64,
+    /// Working-budget room kept for one merge even before it starts. Derived
+    /// from the role cap; admission and flights cannot borrow this headroom.
+    pub merge_headroom_bytes: u64,
     /// Constructor policy ceiling, capped by queue, background handles, memory
     /// and privacy barriers. Production uses two; one is the serial baseline.
     pub flush_depth: usize,
@@ -298,6 +301,7 @@ impl IngestConfig {
             max_merges_per_tick: 2,
             background_merges: false,
             buffer_budget_bytes: DEFAULT_BUFFER_BUDGET_BYTES,
+            merge_headroom_bytes: 0,
             flush_depth: MAX_FLUSH_DEPTH,
             commit_when_ready: true,
             writer_epoch: 1,
@@ -471,6 +475,10 @@ pub struct IngestHealth {
     /// NAN-4770: of those, objects sliced beside flushes still in flight
     /// (the next buffer's first object, admission pipelined with them).
     pub objects_sliced_beside_flights_total: u64,
+    /// Completed JSON/Arrow admission groups and the most objects decoded
+    /// together in one group (calibrated reservations enable parallel decode).
+    pub admission_groups_total: u64,
+    pub admission_group_objects_peak: usize,
     /// NAN-3643: operator replays of quarantined objects that committed.
     pub quarantine_replays_total: u64,
     /// NAN-4554: quarantine changes mirrored into the tenant bucket, the
@@ -1068,6 +1076,10 @@ pub struct Ingestor<'a> {
     calibration: super::memory::AdmissionCalibration,
     /// (level, hour) → (consecutive failures, retry not before ms).
     merge_quarantine: BTreeMap<(String, i32), (u32, i64)>,
+    /// NAN-4796: guard stops of a merge that started without the normal
+    /// room (process memory held elsewhere), since its last commit. Bounded
+    /// by [`MAX_UNCHARGED_MEMORY_STOPS`]: past it, stops shrink it again.
+    merge_memory_waits: BTreeMap<(String, i32), u32>,
     /// Background merges, bounded independently by minute/history lane.
     merge_in_flight: Vec<InFlightMerge>,
     /// Pipelined flushes still building/publishing, oldest (next to
@@ -1824,6 +1836,9 @@ fn write_pipelined_admission_slices(file: &AdmissionFile, mut rows: u64,
 pub fn size_for_memory_cap(cfg: &mut IngestConfig, memory_cap_bytes: u64) {
     cfg.max_window_uids = super::dedup::window_cap_for(memory_cap_bytes);
     cfg.buffer_budget_bytes = buffer_budget_for(memory_cap_bytes);
+    cfg.merge_headroom_bytes = if memory_cap_bytes == 0 { 0 } else {
+        super::merge::decode_window_rows_for(memory_cap_bytes) as u64 * super::merge::MERGE_ROW_BYTES
+    };
     cfg.prevalence_catch_up_max_rows = super::prevalence::catch_up_max_rows_for(memory_cap_bytes);
 }
 
@@ -2077,6 +2092,13 @@ pub(crate) fn write_l0_family_parts_with(dir: &Path, drafts: Vec<(PartDraft, Rec
 }
 
 pub const MERGE_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+/// NAN-4796: a merge stopped by memory the process held elsewhere (not
+/// its own growth) retries after this, at the same shape, uncounted.
+pub const MEMORY_STOP_RETRY_MS: i64 = 60_000;
+/// NAN-4796: such stops of one merge before they count against its shape
+/// again (the ledger's bounded ladder): a process that never gets back
+/// under the start share cannot hold an hour's merge waiting forever.
+pub const MAX_UNCHARGED_MEMORY_STOPS: u32 = 3;
 
 fn parts_dir(work_dir: &Path) -> PathBuf {
     work_dir.join("parts")
@@ -2336,6 +2358,7 @@ impl<'a> Ingestor<'a> {
             arrow_per_source_byte: INITIAL_ARROW_PER_SOURCE_BYTE,
             calibration: super::memory::AdmissionCalibration::default(),
             merge_quarantine: BTreeMap::new(),
+            merge_memory_waits: BTreeMap::new(),
             merge_in_flight: Vec::new(),
             flush_in_flight: VecDeque::new(),
             diagnostics: PipelineDiagnostics::default(),
@@ -5068,6 +5091,13 @@ impl<'a> Ingestor<'a> {
     }
 
     async fn admit(&mut self, notices: &[(NoticeHandle, SourceNotice)], now_ms: i64) -> Result<(u64, u64)> {
+        self.admit_with_calibration(notices, now_ms, true).await
+    }
+
+    async fn admit_with_calibration(&mut self, notices: &[(NoticeHandle, SourceNotice)], now_ms: i64,
+        calibrated: bool) -> Result<(u64, u64)> {
+        let sliced_before = (self.health.objects_admitted_in_slices_total, self.health.objects_sliced_beside_flights_total);
+        let deferred_before = self.admission_deferred;
         // NAN-3899: read each row's credential only when activity is kept.
         let track_credentials = self.credential_activity.is_some();
         let src_dir = self.cfg.work_dir.join("src");
@@ -5157,14 +5187,15 @@ impl<'a> Ingestor<'a> {
             // an object that does not fit the open group may start the next
             // one ([`super::memory::AdmissionGroups`]).
             //
-            // NAN-4770: learn per-prefix estimates, but retain the fixed
-            // memory reservation even after light objects. The next
-            // buffer's first object that does not fit whole is sliced beside
+            // NAN-4805: learned reservations carry margin and floors; the
+            // bronze reader checks actual heap and retries an underestimate
+            // with the cold model before it can accumulate a whole group.
+            // The next buffer's first object that does not fit whole is sliced beside
             // the flights in flight when its Arrow rows and a slice fit
             // there: admission no longer waits for every flight to commit.
             let decoded = crate::bronze::bronze_file_decoded_bytes(&target).unwrap_or(0);
             let prefix = super::memory::calibration_prefix(&notice.key);
-            let fixed_admission_model = self.fixed_admission_model();
+            let fixed_admission_model = self.fixed_admission_model() || !calibrated;
             let (heap, arrow) = if fixed_admission_model { decoded_admission_cost(decoded) } else { self.calibration.reservation_cost(prefix, decoded) };
             let rows = crate::bronze::bronze_file_row_count(&target).unwrap_or(0);
             if !idle && (decoded == 0 || rows == 0) {
@@ -5305,6 +5336,8 @@ impl<'a> Ingestor<'a> {
             slices.iter().rev().map(|slice| vec![slice]).collect()
         };
         let mut admitted: Vec<Admitted> = Vec::new();
+        let schema_before_admission = self.pending_schema.clone();
+        let coerced_before_admission = self.health.rows_coerced_total;
         // NAN-4553: a slice whose every row is refused (refused rows of the
         // object), and a slice admission refused outright (refuses the
         // whole object, as an unsliced admission would).
@@ -5315,6 +5348,20 @@ impl<'a> Ingestor<'a> {
         let mut value_heap = 0_f64;
         while let Some(group) = queue.pop() {
             let paths = group.iter().map(|f| f.2.clone()).collect::<Vec<_>>();
+            let (mut learned_heap, mut fixed_heap, mut fixed_arrow) = (0.0, 0.0, 0.0);
+            for file in &group {
+                let decoded = crate::bronze::bronze_file_decoded_bytes(&file.2).unwrap_or(0);
+                learned_heap += self.calibration.reservation_cost(super::memory::calibration_prefix(&file.1.key), decoded).0;
+                let fixed = decoded_admission_cost(decoded);
+                fixed_heap += fixed.0;
+                fixed_arrow += fixed.1;
+            }
+            let retained_arrow = admitted.iter().filter_map(|entry| entry.batch.as_ref())
+                .map(|batch| batch.get_array_memory_size() as u64).sum::<u64>();
+            let room = self.cfg.buffer_budget_bytes.saturating_sub(committed).saturating_sub(retained_arrow) as f64;
+            let heap_allowance = (calibrated && !self.fixed_admission_model() && learned_heap < fixed_heap).then(|| {
+                learned_heap.min((room - fixed_arrow).max(0.0) / super::memory::ADMISSION_PEAK_PER_MODELLED_HEAP) as u64
+            });
             // NAN-4336: each file's ingest time is when its object reached
             // the tenant (the notice); future-dated rows clamp against it.
             let ingest_times = IngestTimes {
@@ -5330,7 +5377,7 @@ impl<'a> Ingestor<'a> {
                 // stamp below then reads a state holding that flush.
                 let (owned_paths, tenant, enricher, times) =
                     (paths.clone(), self.cfg.tenant_id.clone(), self.enricher.clone(), ingest_times.clone());
-                let parse = tokio::task::spawn_blocking(move || admit_bronze_files_received(&owned_paths, &tenant, &enricher, &times));
+                let parse = tokio::task::spawn_blocking(move || admit_bronze_files_received_bounded(&owned_paths, &tenant, &enricher, &times, heap_allowance));
                 self.finish_deferred_prevalence(now_ms).await;
                 match parse.await {
                     Ok(result) => result,
@@ -5339,7 +5386,7 @@ impl<'a> Ingestor<'a> {
                     Err(error) => Err(anyhow::Error::new(std::io::Error::other(format!("admission parse task: {error}")))),
                 }
             } else {
-                admit_bronze_files_received(&paths, &self.cfg.tenant_id, &self.enricher, &ingest_times)
+                admit_bronze_files_received_bounded(&paths, &self.cfg.tenant_id, &self.enricher, &ingest_times, heap_allowance)
             };
             drop(parse_timing);
             #[cfg(test)]
@@ -5364,6 +5411,30 @@ impl<'a> Ingestor<'a> {
                     sources.log("part_ingest");
                     let by_path = refused.keys().next().filter(|_| refused.len() == 1).map(|path| (path.clone(), sources)).into_iter().collect::<BTreeMap<_, _>>();
                     (admission, refused, by_path)
+                }
+                Err(error) if error.downcast_ref::<AdmissionHeapExceeded>().is_some() => {
+                    // No decoded rows have entered the uid window or buffer.
+                    // Drop this tick's retained Arrow, forget stale estimates,
+                    // and repack/slice with the cold model. This never becomes
+                    // a poison-object refusal or a crash-ledger charge.
+                    tracing::info!(objects = group.len(), "admission shape changed; retrying with the cold memory model");
+                    self.calibration = super::memory::AdmissionCalibration::default();
+                    self.pending_schema = schema_before_admission;
+                    self.health.rows_coerced_total = coerced_before_admission;
+                    self.health.objects_admitted_in_slices_total = sliced_before.0;
+                    self.health.objects_sliced_beside_flights_total = sliced_before.1;
+                    self.admission_deferred = deferred_before;
+                    drop(admitted);
+                    drop(queue);
+                    for file in files.iter().chain(slices.iter()) {
+                        let _ = std::fs::remove_file(&file.2);
+                    }
+                    // Fetch-time refusals and earlier failed groups already
+                    // hold their handles in the buffer. Preserve those results
+                    // instead of reporting/refusing the same object twice.
+                    let retry = notices.iter().filter(|(handle, _)| !self.buffer.handle_names.contains(&handle.0))
+                        .cloned().collect::<Vec<_>>();
+                    return Box::pin(self.admit_with_calibration(&retry, now_ms, false)).await;
                 }
                 Err(error) if is_transient(&error) => {
                     // NAN-4553: the next admission cuts its own slices.
@@ -5528,6 +5599,8 @@ impl<'a> Ingestor<'a> {
                 admitted.push(Admitted { group, rows_by_path, uids, payloads, batch, times, refused, refused_sources, credentials, bronze_duplicates, conflicting_replays, time_clamped, row_bytes: None, clamped });
             }
             if let Some(entry) = admitted.get(calibrated_before) {
+                self.health.admission_groups_total += 1;
+                self.health.admission_group_objects_peak = self.health.admission_group_objects_peak.max(entry.group.len());
                 let kept = entry.uids.len().max(1) as f64;
                 let arrow = entry.batch.as_ref().map_or(0, |batch| batch.get_array_memory_size()) as f64 * source_rows as f64 / kept;
                 let prefixes = group_prefixes.iter().map(String::as_str).collect::<Vec<_>>();
@@ -6931,10 +7004,10 @@ impl<'a> Ingestor<'a> {
         })
     }
 
-    /// Bytes reserved for the running background merges (each at its decode
-    /// window of [`super::merge::MERGE_ROW_BYTES`] rows plus its writer).
+    /// Bytes reserved for running merges, with room for at least one merge
+    /// kept even before it starts. Admission and flush writers share the rest.
     fn merges_reserved_bytes(&self) -> u64 {
-        self.merge_in_flight.len() as u64 * super::merge::merge_reserve_bytes()
+        (self.merge_in_flight.len() as u64 * super::merge::merge_reserve_bytes()).max(self.cfg.merge_headroom_bytes)
     }
 
     /// Tests (NAN-4770 before/after): the fixed admission model, slicing
@@ -6954,13 +7027,24 @@ impl<'a> Ingestor<'a> {
             .saturating_add(self.merges_reserved_bytes())
     }
 
+    fn another_merge_fits(&self) -> bool {
+        let next = ((self.merge_in_flight.len() + 1) as u64 * super::merge::merge_reserve_bytes())
+            .max(self.cfg.merge_headroom_bytes);
+        self.committed_bytes().saturating_sub(self.merges_reserved_bytes()).saturating_add(next) <= self.cfg.buffer_budget_bytes
+    }
+
     /// Parallel writers for a flush of `buffer_bytes`: the most whose build
-    /// fits beside the merges and a full next buffer (NAN-3183 OOM).
+    /// fits beside merge room, a full next buffer and fresh admission.
     fn flush_writers(&self, buffer_bytes: u64) -> usize {
         let budget = self.cfg.buffer_budget_bytes;
         // Earlier flights still in flight (depth > 1) hold their build too.
         let flights = self.flush_in_flight.iter().map(|flight| flight.reserved_bytes).sum::<u64>();
-        let others = self.merges_reserved_bytes().saturating_add(super::memory::buffer_cap(budget)).saturating_add(flights);
+        // The next admission has a JSON peak as well as retained Arrow.
+        // Without this reserve, small-role flights spend all freed buffer
+        // room on extra writers and admission still cannot overlap them.
+        let admission = (budget / 3).min(super::memory::FLIGHT_ADMISSION_BYTES);
+        let others = self.merges_reserved_bytes().saturating_add(super::memory::buffer_cap(budget))
+            .saturating_add(admission).saturating_add(flights);
         super::memory::writers_for(buffer_bytes, budget.saturating_sub(others))
     }
 
@@ -7458,11 +7542,7 @@ impl<'a> Ingestor<'a> {
                 }
                 Err(error) => {
                     self.merge_attempt_ended(&key, inputs, Some(&error), now_ms);
-                    let failures = self.merge_quarantine.get(&key).map_or(0, |(n, _)| *n) + 1;
-                    let backoff_ms = (60_000_i64 << (failures - 1).min(6)).min(3_600_000);
-                    self.merge_quarantine.insert(key, (failures, now_ms + backoff_ms));
-                    self.health.merge_failures_total += 1;
-                    tracing::error!(error = %format!("{error:#}"), failures, backoff_ms, "merge failed; quarantined");
+                    self.quarantine_merge(key, now_ms, &error);
                 }
             }
         }
@@ -7531,7 +7611,7 @@ impl<'a> Ingestor<'a> {
                     || super::merge_lanes::history_memory_admits(super::merge_lanes::MemorySnapshot::read()))
                     // NAN-4750/NAN-4755: beside a live buffer even a first
                     // merge must fit the working budget.
-                    && self.committed_bytes().saturating_add(super::merge::merge_reserve_bytes()) <= self.cfg.buffer_budget_bytes) {
+                    && self.another_merge_fits()) {
                 continue;
             }
             // NAN-3795: count rewrites are bounded by their own lane, not the
@@ -7546,10 +7626,9 @@ impl<'a> Ingestor<'a> {
                 && !super::merge_lanes::history_memory_admits(super::merge_lanes::MemorySnapshot::read()) {
                 continue;
             }
-            // A merge is charged against the working budget too: beside a
-            // full catch-up cycle only the first lane runs (NAN-3183 OOM).
-            if !self.merge_in_flight.is_empty() && self.committed_bytes().saturating_add(super::merge::merge_reserve_bytes())
-                > self.cfg.buffer_budget_bytes {
+            // The first merge consumes the headroom already reserved for
+            // it; further lanes need additional room in the same budget.
+            if !self.another_merge_fits() {
                 continue;
             }
             let key = (merge.output_level.code().to_string(), merge.event_hour);
@@ -7831,9 +7910,30 @@ impl<'a> Ingestor<'a> {
     fn merge_attempt_ended(&mut self, key: &(String, i32), inputs: usize, error: Option<&anyhow::Error>, now_ms: i64) {
         let id = super::merge_attempts::merge_id(&key.0, key.1);
         let recorded = match error {
-            None => self.merge_attempts.committed(&id),
+            None => {
+                self.merge_memory_waits.remove(key);
+                self.merge_attempts.committed(&id)
+            }
+            Some(error) if super::merge_quota::memory_pressure_of(error).is_some_and(|stop| !stop.charged_to_merge())
+                && self.merge_memory_waits.get(key).copied().unwrap_or(0) < MAX_UNCHARGED_MEMORY_STOPS => {
+                // NAN-4796: the merge started with the process already
+                // past the start share: memory held elsewhere (admission,
+                // flushes) left it no room. Running it smaller would not
+                // fit better, so it keeps its shape and retries after
+                // MEMORY_STOP_RETRY_MS, a bounded number of times.
+                self.health.merge_memory_stops_total += 1;
+                *self.merge_memory_waits.entry(key.clone()).or_default() += 1;
+                self.merge_quarantine.insert(key.clone(), (self.merge_quarantine.get(key).map_or(0, |(n, _)| *n), now_ms + MEMORY_STOP_RETRY_MS));
+                tracing::info!(tenant = %self.cfg.tenant_id, merge = %id, error = %format!("{error:#}"),
+                    "merge stopped by memory held elsewhere, not its own growth; it keeps its shape and retries shortly");
+                self.merge_attempts.ended(&id)
+            }
             Some(error) if super::merge_quota::is_memory_pressure(error) => {
                 self.health.merge_memory_stops_total += 1;
+                // NAN-4796: no quarantine, but not again on this tick: its
+                // plan was made before this reap, at the old shape and
+                // fan-in. The next tick replans it smaller.
+                self.merge_quarantine.insert(key.clone(), (self.merge_quarantine.get(key).map_or(0, |(n, _)| *n), now_ms + 1));
                 let splittable = if key.0 == Level::Day.code() { 0 } else { inputs };
                 self.merge_attempts.shrink(&id, now_ms, splittable).map(|outcome| {
                     if outcome == super::merge_attempts::Shrunk::LeftUnmerged {
@@ -7878,7 +7978,18 @@ impl<'a> Ingestor<'a> {
         }).collect()
     }
 
+    /// A failed merge backs off. NAN-4796: a memory-guard stop is not a
+    /// failure of its input and is never quarantined: the attempt ledger's
+    /// bounded ladder (shape, split fan-in, park) is its backoff, so the
+    /// smaller rerun starts on the next tick instead of after a doubling
+    /// wait (FP cell-us-1: 1 -> 32 min per rung, no `h` commit in 47 min).
+    /// (A stop by memory held elsewhere waits [`MEMORY_STOP_RETRY_MS`],
+    /// set by `merge_attempt_ended`.) Quarantine is for errors: a
+    /// poisonous input, I/O, signing.
     fn quarantine_merge(&mut self, key: (String, i32), now_ms: i64, error: &anyhow::Error) {
+        if super::merge_quota::is_memory_pressure(error) {
+            return;
+        }
         let failures = self.merge_quarantine.get(&key).map_or(0, |(n, _)| *n) + 1;
         let backoff_ms = (60_000_i64 << (failures - 1).min(6)).min(3_600_000);
         self.merge_quarantine.insert(key, (failures, now_ms + backoff_ms));
@@ -9199,6 +9310,10 @@ mod nan4737_ingest_tests;
 mod nan4749_ingest_tests;
 
 #[cfg(test)]
+#[path = "nan4806_ingest_tests.rs"]
+mod nan4806_ingest_tests;
+
+#[cfg(test)]
 #[path = "nan4770_ingest_tests.rs"]
 mod nan4770_ingest_tests;
 
@@ -9299,6 +9414,10 @@ mod l0_class_family_tests {
 #[cfg(test)]
 #[path = "nan4755_ingest_tests.rs"]
 mod nan4755_ingest_tests;
+
+#[cfg(test)]
+#[path = "nan4796_ingest_tests.rs"]
+mod nan4796_ingest_tests;
 
 #[cfg(test)]
 mod tests {
@@ -10524,8 +10643,8 @@ mod tests {
             ingestor.flush_writers(rows)
         };
         let fits = |w: usize| {
-            // budget b with b - b/5 - merge == flight_bytes(rows, w)
-            ((flight_bytes(rows, w) + merge) as f64 / (1.0 - super::super::memory::BUFFER_SHARE_OF_WORKING)).ceil() as u64 + 1
+            // Budget after its buffer, merge and admission room fits this flight.
+            ((flight_bytes(rows, w) + merge + super::super::memory::FLIGHT_ADMISSION_BYTES) as f64 / (1.0 - super::super::memory::BUFFER_SHARE_OF_WORKING)).ceil() as u64 + 1
         };
         assert_eq!(writers_at(&mut ingestor, fits(4)), 4);
         assert_eq!(writers_at(&mut ingestor, fits(2)), 2);
@@ -10588,10 +10707,9 @@ mod tests {
             // `flush_writers` charges merges, so the process-wide window other
             // tests set cannot change the answer.
             let merges = 2 * 32_768 * super::super::merge::MERGE_ROW_BYTES;
-            ingestor.flush_in_flight.push_back(InFlightFlush {
-                buffer: Buffered::new(), reserved_bytes: merges, schema: ingestor.schema.clone(), sealed_ms: 0,
-                progress: ingestor.diagnostics.new_flush(0, 0), task: None, built: None, published: None, published_ok: Default::default(),
-            });
+            // Charge the two merge windows as merge room. Fabricating a
+            // flush flight here would also reserve a third future merge.
+            ingestor.cfg.merge_headroom_bytes = merges;
             assert!(super::super::memory::buffer_cap(ingestor.cfg.buffer_budget_bytes) >= bytes || cap < 5 * GIB,
                 "a full-flush placement buffers the flush before its byte cap");
             ingestor.flush_writers(bytes)
@@ -10604,7 +10722,7 @@ mod tests {
         assert_eq!((l0_chunks(flush_rows(two_parts - 1)).len(), l0_chunks(flush_rows(two_parts)).len()), (1, 2));
         // Host sizing (the 1.0.11 bakeoff): one L0 writer for a full flush.
         let host = placed_cap(None, None);
-        assert_eq!((host, writers_at(host, full).await), (4 * GIB, 1), "host sizing: the bakeoff's single L0 writer");
+        assert_eq!((host, writers_at(host, full).await), (6 * GIB, 4), "default sizing leaves parallel-flush and merge headroom");
         // The shared derivation, placed by trusted-local init: every rate
         // from two parts up has a writer per L0 part, and a catch-up flush four.
         for eps in [two_parts, 1_638, 2_000, 2_184, 10_000] {
@@ -10632,7 +10750,7 @@ mod tests {
     /// 4-writer build of `rows` (and nothing beside it).
     fn fits_beside_nothing(rows: u64) -> u64 {
         let merge = super::super::merge::merge_reserve_bytes();
-        ((super::super::memory::flight_bytes(rows, 4) + merge) as f64
+        ((super::super::memory::flight_bytes(rows, 4) + merge + super::super::memory::FLIGHT_ADMISSION_BYTES) as f64
             / (1.0 - super::super::memory::BUFFER_SHARE_OF_WORKING)).ceil() as u64 + 1
     }
 
@@ -10763,6 +10881,11 @@ mod tests {
             flight.handle.abort();
             let _ = flight.handle.await;
         }
+        // The first lane must fit too: it cannot borrow admission's budget
+        // merely because no other merge has started yet.
+        ingestor.cfg.buffer_budget_bytes = reserve / 2;
+        ingestor.run_background_merge(planned(), now, 3_600_000).await;
+        assert!(ingestor.merge_in_flight.is_empty());
         // With room, both lanes run.
         ingestor.cfg.buffer_budget_bytes = 4 * reserve;
         ingestor.run_background_merge(planned(), now, 3_600_000).await;

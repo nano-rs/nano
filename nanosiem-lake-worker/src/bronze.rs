@@ -356,7 +356,7 @@ pub fn admit_bronze_files_with_enrichment(
     tenant_id: &str,
     enricher: &BronzeIngestEnricher,
 ) -> Result<BronzeAdmission> {
-    admit_bronze_files_inner(paths, tenant_id, enricher, None, &IngestTimes::now(), None)
+    admit_bronze_files_inner(paths, tenant_id, enricher, None, &IngestTimes::now(), None, None)
 }
 
 /// NAN-4336: the ingest time ceiling of each admitted file: when its object
@@ -482,8 +482,28 @@ pub fn admit_bronze_files_received(
     enricher: &BronzeIngestEnricher,
     times: &IngestTimes,
 ) -> Result<(BronzeAdmission, RefusedRows, RefusedSources)> {
+    admit_bronze_files_received_bounded(paths, tenant_id, enricher, times, None)
+}
+
+/// A calibrated estimate underestimated the current rows. This is a retry
+/// with the cold model, never an invalid-object refusal or quarantine.
+#[derive(Debug, Error)]
+#[error("calibrated admission exceeded its modelled heap allowance")]
+pub(crate) struct AdmissionHeapExceeded;
+
+/// Part ingest may reserve less than the cold model after calibration.
+/// Check every normalized row, including tails a sample would miss, before
+/// retaining more JSON. The allowance already leaves room for the Arrow
+/// decode and admission's measured peak multiplier.
+pub(crate) fn admit_bronze_files_received_bounded(
+    paths: &[PathBuf],
+    tenant_id: &str,
+    enricher: &BronzeIngestEnricher,
+    times: &IngestTimes,
+    heap_allowance: Option<u64>,
+) -> Result<(BronzeAdmission, RefusedRows, RefusedSources)> {
     let mut salvage = Salvage::default();
-    let admission = admit_bronze_files_inner(paths, tenant_id, enricher, Some(&mut salvage), times, None)?;
+    let admission = admit_bronze_files_inner(paths, tenant_id, enricher, Some(&mut salvage), times, None, heap_allowance)?;
     Ok((admission, salvage.rows, salvage.sources))
 }
 
@@ -505,7 +525,7 @@ pub fn admit_bronze_bytes_received(
     }
     let paths: Vec<PathBuf> = sources.iter().map(|(path, _)| path.clone()).collect();
     let mut salvage = Salvage::default();
-    let admission = admit_bronze_files_inner(&paths, tenant_id, enricher, Some(&mut salvage), times, Some(&verified))?;
+    let admission = admit_bronze_files_inner(&paths, tenant_id, enricher, Some(&mut salvage), times, Some(&verified), None)?;
     Ok((admission, salvage.rows, salvage.sources))
 }
 
@@ -554,6 +574,7 @@ fn admit_bronze_files_inner(
     mut refused: Option<&mut Salvage>,
     times: &IngestTimes,
     verified: Option<&BTreeMap<PathBuf, bytes::Bytes>>,
+    heap_allowance: Option<u64>,
 ) -> Result<BronzeAdmission> {
     let source = SourceBytes(verified);
     if paths.is_empty() || paths.len() > MAX_BRONZE_FILES {
@@ -570,6 +591,7 @@ fn admit_bronze_files_inner(
     let mut files = Vec::with_capacity(paths.len());
     let mut enrichment = enricher.initial_metrics();
     let mut timings = AdmissionTimings::default();
+    let mut retained_heap = 0_u64;
     let mut identities = AdmittedIdentities::new();
     let mut time_clamped = ClampedSources::new();
     let mut clamped_original_ms = BTreeMap::new();
@@ -628,7 +650,9 @@ fn admit_bronze_files_inner(
         let group_rows = if enricher.platform.is_some() { crate::platform_stamping::CLAIM_GROUP_ROWS } else { 8_192 };
         #[cfg(not(all(feature = "enterprise", target_os = "linux")))]
         let group_rows = 8_192;
-        let reader = source.reader(path, group_rows)?;
+        // Bound the overshoot to one small reader batch when using learned
+        // reservations. Cold-model callers keep their existing batch size.
+        let reader = source.reader(path, if heap_allowance.is_some() { group_rows.min(1_024) } else { group_rows })?;
         let before = source_rows;
         let ceiling_ms = times.ceiling(path);
         for batch in reader {
@@ -717,6 +741,12 @@ fn admit_bronze_files_inner(
                     }
                     (Err(error), _) => return Err(error),
                 };
+                if let Some(allowance) = heap_allowance {
+                    retained_heap = retained_heap.saturating_add(crate::part_ingest::ingest::value_heap_bytes(&admitted.row.ocsf_event));
+                    if retained_heap > allowance {
+                        return Err(AdmissionHeapExceeded.into());
+                    }
+                }
                 if admitted.time_clamped {
                     *time_clamped.entry(SourceKey::of(&admitted.row.ocsf_event).source_slug).or_default() += 1;
                 }

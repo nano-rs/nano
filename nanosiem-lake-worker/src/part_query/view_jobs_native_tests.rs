@@ -326,6 +326,13 @@ async fn reopen_engine_at(root: &std::path::Path, state_name: &str) -> PartQuery
 }
 
 async fn reopen_engine_with_threads(root: &std::path::Path, state_name: &str, threads: u64) -> PartQueryEngine {
+    reopen_engine_with_source(root, state_name, threads, None).await
+}
+
+async fn reopen_engine_with_source(
+    root: &std::path::Path, state_name: &str, threads: u64,
+    source: Option<Arc<dyn crate::reader_object_cache::ReaderObjectSource>>,
+) -> PartQueryEngine {
     let signer = signer();
     let state = root.join(state_name);
     std::fs::create_dir_all(&state).unwrap();
@@ -337,7 +344,7 @@ async fn reopen_engine_with_threads(root: &std::path::Path, state_name: &str, th
         root: state.join("cache"), max_bytes: 1 << 30, query_max_bytes: 1 << 29,
         fetch_concurrency: 4, fetch_deadline: std::time::Duration::from_secs(60),
     }, TENANT, bucket, &parts_key_prefix(TENANT).unwrap(),
-    Arc::new(StoreObjectSource::local(bucket, store.clone(), root.join("parts")))).unwrap();
+    source.unwrap_or_else(|| Arc::new(StoreObjectSource::local(bucket, store.clone(), root.join("parts"))))).unwrap();
     let fetcher = PartFetcher::new(TENANT, bucket, store.clone(), trusted, cache).unwrap();
     let runtime = NativeChdb::load_verified(
         std::env::var("NANO_CHDB_LIBRARY_PATH").unwrap(),
@@ -1376,6 +1383,168 @@ async fn durable_lateral_matches_scoped_retained_auth_events() {
     let reader = super::ViewReader { engine: &engine, writer: engine.writer().unwrap(), spec: &bounded, pin: &pin,
         window: (contribution, now), cancelled: &cancelled, collect_bytes: 1, lane: tokio::sync::Mutex::new(Default::default()) };
     assert!(super::execute_view(&reader, &bounded).await.is_err());
+}
+
+/// NAN-4799: the background identity passes (backfill, then merge) never
+/// re-fetch an entity-range partial whose coverage this process already
+/// scanned. For a hosted tenant, every 5 s pass re-leased the whole 30-day
+/// window twice and the partials outside the hot window came back from R2 (~350-420k
+/// GETs/day). Real signed parts, real fetcher and reader cache: the cache is
+/// emptied between passes and lookups, as hot-window eviction does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: chDB artifact"]
+async fn identity_background_passes_never_refetch_scanned_partials() {
+    let _serial = serial();
+    use super::super::identity::{backfill_once, lookup, normalize_items, LookupKind};
+    use super::super::identity_merged::merge_once;
+    use crate::reader_object_cache::ReaderObjectSource;
+    let root = tempfile::tempdir().unwrap();
+    let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
+    // Exercise indexed signed partials, rather than only backfill files.
+    // Restore process state even if fixture construction panics.
+    struct IdentityWriting(bool);
+    impl Drop for IdentityWriting {
+        fn drop(&mut self) { crate::identity_observations::set_enabled(self.0); }
+    }
+    let writing = IdentityWriting(crate::identity_observations::enabled());
+    crate::identity_observations::set_enabled(true);
+    let fixture = engine_with_detail_fixture(root.path(), now, 16, false, false, false, true).await;
+    drop(writing);
+    drop(fixture);
+
+    // Transient R2 transport failures at the real cache fetch seam.
+    struct FailOncePartialSource {
+        inner: StoreObjectSource,
+        fail: AtomicBool,
+        fetched: Mutex<BTreeMap<String, usize>>,
+    }
+    #[async_trait::async_trait]
+    impl ReaderObjectSource for FailOncePartialSource {
+        async fn stream_object(
+            &self, object: &crate::reader_object_cache::ReaderObjectRef,
+            sink: &mut (dyn for<'b> FnMut(&'b [u8]) -> anyhow::Result<()> + Send),
+        ) -> anyhow::Result<()> {
+            if object.source_uri.ends_with(crate::parts::format::PARTIAL_ENTITY_RANGES_FILE)
+                && self.fail.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "injected R2 connection reset").into());
+            }
+            self.inner.stream_object(object, sink).await?;
+            if object.source_uri.ends_with(crate::parts::format::PARTIAL_ENTITY_RANGES_FILE) {
+                *self.fetched.lock().unwrap().entry(object.source_uri.clone()).or_default() += 1;
+            }
+            Ok(())
+        }
+    }
+    let source = Arc::new(FailOncePartialSource {
+        inner: StoreObjectSource::local("nan3078-local", Arc::new(LocalObjectStore::new(root.path().join("parts")).unwrap()), root.path().join("parts")),
+        fail: AtomicBool::new(true),
+        fetched: Mutex::new(BTreeMap::new()),
+    });
+    let engine = reopen_engine_with_source(root.path(), "state", 2, Some(source.clone())).await;
+    let state = root.path().join("state");
+    let raw = (0..6).map(|i| (format!("10.0.0.{}", i % 3), (now - Duration::hours(i * 20)).to_rfc3339())).collect::<Vec<_>>();
+    let items = normalize_items(LookupKind::Ip, &raw).unwrap();
+    let failed = backfill_once(&engine, &state, now.timestamp_micros(), 512, None).await.unwrap_err();
+    assert!(failed.to_string().contains("injected R2 connection reset"), "{failed}");
+    assert!(!source.fail.load(std::sync::atomic::Ordering::SeqCst), "the failure must reach a partial fetch");
+    let (parts, _, _, _) = engine.snapshot(now.timestamp_micros() - crate::identity_observations::LOOKBACK_US, now.timestamp_micros()).await.unwrap();
+    assert!(parts.iter().all(|part| engine.identity_coverage(&part.part_id).is_none()), "a failed fetch must not memoize scanned coverage");
+    assert!(parts.iter().all(|part| !super::super::identity::unindexable_path(&state, &part.part_id).exists()));
+    // Retry scans (and memoizes) every partial's coverage.
+    let first = backfill_once(&engine, &state, now.timestamp_micros(), 512, None).await.unwrap();
+    assert_eq!(first.remaining, 0);
+    assert_eq!(first.derived, 0, "the retry must use the signed partials, not backfill over a skipped scan");
+    assert!(parts.iter().all(|part| engine.identity_coverage(&part.part_id) == Some(Some(part.rows as i64))));
+    let (before, index) = lookup(&engine, &state, LookupKind::Ip, &items, &["azure_audit".into()]).await.unwrap();
+    let indexed = index["indexed"].as_u64().unwrap();
+    assert_eq!(indexed as usize, parts.len());
+    assert!(indexed > super::super::identity_merged::REBUILD_FILES as u64);
+    assert!(before.len() >= 2, "the fixture must exercise hits: {before:?}");
+    let cache = engine.fetcher().cache();
+    let evict = || async { cache.evict_unreferenced(Default::default()).await.unwrap() };
+    evict().await;
+    assert_eq!(cache.stats().objects, 0, "every partial evicted (outside the hot window)");
+    // Explicit All mode models the old lookup/background behavior:
+    // every window part's partial, scanned or not.
+    let misses = cache.stats().misses;
+    let all = super::super::identity::index_sources(&engine, &state, now.timestamp_micros() - crate::identity_observations::LOOKBACK_US,
+        now.timestamp_micros()).await.unwrap();
+    let partials = cache.stats().misses - misses;
+    assert!(partials > 0 && partials as usize <= all.parts, "the fixture's parts carry entity-range partials: {partials} of {}", all.parts);
+    drop(all);
+    evict().await;
+    let misses = cache.stats().misses;
+    // Background backfill passes: no partial fetched.
+    for _ in 0..3 {
+        let pass = backfill_once(&engine, &state, now.timestamp_micros(), 512, None).await.unwrap();
+        assert_eq!(pass.remaining, 0);
+    }
+    assert_eq!(cache.stats().misses, misses, "a backfill pass re-fetched scanned partials");
+    assert_eq!(cache.stats().objects, 0);
+    // Build a prefix, then extend it: each due merge leases exactly its
+    // tail, never the partials already covered by the merged file.
+    let prefix = merge_once(&engine, &state, (now - Duration::hours(80)).timestamp_micros()).await.unwrap();
+    assert!(prefix.built && prefix.tail > 0 && (prefix.tail as u64) < indexed, "{prefix:?}");
+    assert_eq!(cache.stats().misses - misses, prefix.tail as u64);
+    evict().await;
+    let misses = cache.stats().misses;
+    let (with_tail, index) = lookup(&engine, &state, LookupKind::Ip, &items, &["azure_audit".into()]).await.unwrap();
+    assert_eq!(with_tail, before, "a lookup combines the merged prefix with the unmerged tail");
+    assert_eq!(index["timing"]["identity_tail_files"], indexed - prefix.tail as u64);
+    assert_eq!(index["timing"]["identity_partial_leases"], indexed - prefix.tail as u64);
+    assert_eq!(cache.stats().misses - misses, indexed - prefix.tail as u64,
+        "a lookup leases only the uncovered tail, never the merged prefix");
+    evict().await;
+    source.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let failed = lookup(&engine, &state, LookupKind::Ip, &items, &["azure_audit".into()]).await.unwrap_err();
+    assert!(failed.to_string().contains("injected R2 connection reset"), "a failed tail lease must refuse the lookup: {failed}");
+    // A failed batch can leave shared fetches in flight. A successful retry
+    // waits for the entire tail before eviction and also proves recovery.
+    let (retried, _) = lookup(&engine, &state, LookupKind::Ip, &items, &["azure_audit".into()]).await.unwrap();
+    assert_eq!(retried, before);
+    evict().await;
+    let misses = cache.stats().misses;
+    let built = merge_once(&engine, &state, now.timestamp_micros()).await.unwrap();
+    assert!(built.built, "{built:?}");
+    assert_eq!(built.tail as u64, indexed - prefix.tail as u64);
+    assert_eq!(cache.stats().misses - misses, built.tail as u64, "a build leases only its tail partials, once each");
+    let (after, index) = lookup(&engine, &state, LookupKind::Ip, &items, &["azure_audit".into()]).await.unwrap();
+    assert_eq!(after, before, "the merged index answers exactly as the sources");
+    assert_eq!(index["timing"]["identity_tail_files"], 0, "{index}");
+    // A pass with nothing to build leases none.
+    evict().await;
+    let misses = cache.stats().misses;
+    let pass = backfill_once(&engine, &state, now.timestamp_micros(), 512, None).await.unwrap();
+    assert_eq!(pass.remaining, 0);
+    let unchanged = merge_once(&engine, &state, now.timestamp_micros()).await.unwrap();
+    assert!(!unchanged.built, "{unchanged:?}");
+    assert_eq!(cache.stats().misses, misses, "an idle merge pass re-fetched partials");
+    let fetched = source.fetched.lock().unwrap().clone();
+    assert_eq!(fetched.len(), indexed as usize, "count every signed partial at the object-store seam");
+    for pass in 0..5 {
+        let (answer, index) = lookup(&engine, &state, LookupKind::Ip, &items, &["azure_audit".into()]).await.unwrap();
+        assert_eq!(answer, before, "lookup {pass} must preserve time/NAT/source-deny results");
+        assert_eq!(index["timing"]["identity_tail_files"], 0);
+        assert_eq!(index["timing"]["identity_partial_leases"], 0);
+        assert_eq!(backfill_once(&engine, &state, now.timestamp_micros(), 512, None).await.unwrap().remaining, 0);
+        assert!(!merge_once(&engine, &state, now.timestamp_micros()).await.unwrap().built);
+        evict().await;
+        assert_eq!(*source.fetched.lock().unwrap(), fetched,
+            "lookup/pass {pass} re-fetched a partial after warm-up");
+        assert_eq!(cache.stats().misses, misses, "merged lookups must not lease covered partials");
+    }
+    // The existing request override still falls back to all signed sources.
+    let scope = crate::perf_overrides::Parsed {
+        overrides: crate::perf_overrides::Overrides { identity_merged_index: Some(false), ..Default::default() },
+        ..Default::default()
+    };
+    let (direct, index) = crate::perf_overrides::scoped(Some(Arc::new(scope)),
+        lookup(&engine, &state, LookupKind::Ip, &items, &["azure_audit".into()])).await.unwrap();
+    assert_eq!(direct, before);
+    assert_eq!(index["timing"]["identity_tail_files"], indexed);
+    assert_eq!(index["timing"]["identity_partial_leases"], indexed);
+    assert_eq!(cache.stats().misses - misses, indexed, "fallback must lease every source it reads");
 }
 
 /// NAN-3399: after a merge pass, a lookup reads one merged file instead of

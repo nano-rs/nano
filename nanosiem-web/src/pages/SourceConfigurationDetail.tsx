@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
@@ -1903,14 +1903,14 @@ function DispatchedSources({
           </span>
         ) : (
           dispatched.map((ls) => (
-            <a
+            <Link
               key={ls.id}
-              href={`/ingestion/log-sources/${ls.id}`}
+              to={`/ingestion/log-sources/${ls.id}`}
               className="font-mono text-[10.5px] text-foreground/80 bg-card border border-border rounded px-2 py-1 hover:border-primary/40 hover:text-primary transition-colors inline-flex items-center gap-1"
             >
               {ls.name}
               <ArrowUpRight className="w-[9px] h-[9px] opacity-60" />
-            </a>
+            </Link>
           ))
         )}
       </div>

@@ -98,8 +98,8 @@ pub(crate) const FEATURE_ENV: &[&str] = &[
     // part_query/identity_merged.rs (NAN-3399 merged identity index;
     // query role; "0" is the kill switch, default on)
     "NANO_LAKE_IDENTITY_MERGED_INDEX",
-    // NAN-4190: window entity index (build + lookups) and its fields.
-    "NANO_LAKE_ENTITY_INDEX",
+    // NAN-4190: window entity index fields (the index itself is always on
+    // since NAN-4772; `NANO_LAKE_ENTITY_INDEX` is no longer read).
     "NANO_LAKE_ENTITY_INDEX_FIELDS",
     "NANO_LAKE_DURABLE_LATERAL",
     // part_ingest/reindex.rs

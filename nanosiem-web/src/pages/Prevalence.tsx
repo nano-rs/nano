@@ -13,7 +13,7 @@
  */
 
 import { useState, useEffect, useCallback, useMemo, useRef, Fragment } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import {
@@ -1330,8 +1330,8 @@ export function ExpandedArtifactDetail({
         </div>
       )}
       {showMarketplacePromo && (
-        <a
-          href="/marketplace"
+        <Link
+          to="/marketplace"
           className="flex items-center gap-2 rounded-md border border-dashed border-border bg-card/40 px-3 py-2 text-[11.5px] text-muted-foreground transition-colors hover:border-border hover:bg-card/70 hover:text-foreground"
         >
           <Store className="h-3.5 w-3.5 text-muted-foreground/80" />
@@ -1339,7 +1339,7 @@ export function ExpandedArtifactDetail({
             Connect AbuseIPDB / GreyNoise / VirusTotal in the marketplace to see reputation for this artifact
           </span>
           <ChevronRight className="h-3 w-3 text-muted-foreground/70" />
-        </a>
+        </Link>
       )}
       <button
         type="button"

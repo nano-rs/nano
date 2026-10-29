@@ -9,7 +9,7 @@
 //!
 //! - Admission learns the modelled heap and Arrow bytes per decoded byte
 //!   of each object prefix (bounded estimate: prior, ceiling, margin,
-//!   floor), while retaining the fixed model's memory reservation.
+//!   floor), checking actual heap while reading calibrated groups.
 //! - The next buffer's first object that does not fit whole is sliced
 //!   beside the flights in flight when its Arrow rows and a slice fit the
 //!   room they leave; otherwise it waits for them, as before (it is always
@@ -109,18 +109,23 @@ fn long_raw(i: usize) -> Value {
 }
 
 /// A prefix describes its writer, not a bound on its next row shape. A
-/// light warm-up must not let a heavier object bypass the fixed reserve.
+/// light warm-up must not let a heavier object exceed the working budget.
 #[test]
-fn a_heavier_object_after_a_light_prefix_keeps_the_fixed_reservation() {
+fn a_heavier_object_after_a_light_prefix_retries_with_the_fixed_reservation() {
     let lab = Lab::new(256 * MIB);
     lab.land("warmup", &(0..512).map(long_raw).collect::<Vec<_>>(), CLOCK - 5_000);
     let rows = 8_000;
     let decoded = lab.land("heavier", &(512..512 + rows).map(event).collect::<Vec<_>>(), CLOCK - 4_000);
+    lab.spool.deliver(&super::super::discovery::SourceNotice {
+        tenant_id: super::nan4749_ingest_tests::TENANT.into(), key: "bronze/missing.parquet".into(),
+        version: "1".into(), bytes: 0, sha256: None, edge_sha256: None, notified_at_ms: CLOCK - 4_000,
+    }).unwrap();
     let (_, peak) = measured(|runtime| runtime.block_on(async {
         let mut ingestor = lab.open().await;
         let pending = lab.spool.pending(10).await.unwrap();
         let warmup = pending.iter().find(|(_, notice)| notice.key == "bronze/warmup.parquet").unwrap();
         let heavier = pending.iter().find(|(_, notice)| notice.key == "bronze/heavier.parquet").unwrap();
+        let missing = pending.iter().find(|(_, notice)| notice.key == "bronze/missing.parquet").unwrap();
         assert_eq!(ingestor.admit(std::slice::from_ref(warmup), CLOCK).await.unwrap().0, 512);
         ingestor.flush_now(CLOCK + 1).await.unwrap();
         let learned = ingestor.calibration.cost("bronze", decoded);
@@ -130,19 +135,60 @@ fn a_heavier_object_after_a_light_prefix_keeps_the_fixed_reservation() {
         assert!(!super::super::memory::admission_fits(budget, 0, fixed.0, fixed.1));
         let before = ingestor.health().objects_admitted_in_slices_total;
         let base = crate::test_heap::reset_peak();
-        assert_eq!(ingestor.admit(std::slice::from_ref(heavier), CLOCK + 2).await.unwrap().0, rows as u64);
+        assert_eq!(ingestor.admit(&[(*missing).clone(), (*heavier).clone()], CLOCK + 2).await.unwrap().0, rows as u64);
         let peak = crate::test_heap::peak() - base;
         eprintln!("NAN-4770 shape change: learned prediction {} MiB, actual admission peak {} MiB, budget {} MiB",
             (learned.0 * super::super::memory::ADMISSION_PEAK_PER_MODELLED_HEAP + learned.1) as u64 >> 20,
             peak >> 20, budget >> 20);
-        assert_eq!(ingestor.health().objects_admitted_in_slices_total, before + 1, "a heavier shape must keep the fixed reservation and slice");
+        assert_eq!(ingestor.health().objects_admitted_in_slices_total, before + 1, "a heavier shape must retry with the fixed reservation and slice");
         assert!(peak < budget as isize, "the changed shape exceeded its working budget");
+        assert_eq!((ingestor.health().objects_missing_total, ingestor.health().objects_rejected_total), (1, 1),
+            "a refusal held before the heap retry must be recorded exactly once");
         assert_eq!(ingestor.calibration.per_decoded_byte("bronze").0, HEAP_PER_DECODED_BYTE, "the heavier observation raises the estimate immediately");
         ingestor.flush_now(CLOCK + 3).await.unwrap();
         assert_eq!(ingestor.health().rows_committed_total, rows as u64 + 512);
         assert!(lab.spool.pending(10).await.unwrap().is_empty());
     }));
     assert!(peak > 0);
+}
+
+/// NAN-4805: Mythos's 2.09 GB ingest role has a 627 MB working
+/// budget. Cold estimates serialize 10k-row objects; measured rows share
+/// a group, so their Arrow decode runs together on the production path.
+#[test]
+fn calibrated_objects_share_a_group_on_the_mythos_role() {
+    let lab = Lab::new(2_090_000_000);
+    let make = |i: usize| serde_json::json!({
+        "time": chrono::DateTime::<chrono::Utc>::from_timestamp_millis(CLOCK - 5_000).unwrap().to_rfc3339(),
+        "class_uid": 3002, "category_uid": 3,
+        "activity_id": 1, "type_uid": 300201, "severity_id": 1,
+        "metadata": {"uid": format!("nan4805-{i:08}"), "tenant_uid": super::nan4749_ingest_tests::TENANT, "version": "1.9.0",
+            "log_source": "WINDOWS_EVENT", "product": {"name": "fixture"}},
+        "raw_data": format!("{i:08}").repeat(200), "raw_data_size": 1_600, "message": "authentication",
+        "user": {"name": "fixture-user"}, "dst_endpoint": {"ip": "192.0.2.1"}
+    });
+    lab.land("warmup", &(0..512).map(make).collect::<Vec<_>>(), CLOCK - 5_000);
+    let (_, peak) = measured(|runtime| runtime.block_on(async {
+        let mut ingestor = lab.open().await;
+        assert_eq!(ingestor.tick(CLOCK).await.unwrap().admitted_rows, 512);
+        ingestor.flush_now(CLOCK + 1).await.unwrap();
+        for object in 0..7 {
+            // Fixture creation is outside the measured ingest working set.
+            crate::test_heap::track_current_thread(false);
+            lab.land(&format!("m{object:02}"), &(512 + object * 10_000..512 + (object + 1) * 10_000).map(make).collect::<Vec<_>>(), CLOCK - 4_000);
+            crate::test_heap::track_current_thread(true);
+        }
+        ingestor.tick(CLOCK + 2).await.unwrap();
+        assert!(ingestor.health().admission_group_objects_peak >= 2,
+            "calibration still serialized the objects: {:?}", ingestor.health().admission_group_objects_peak);
+        eprintln!("NAN-4805: 2.09 GB role, {} byte working budget, {} objects in one decode group",
+            ingestor.cfg.buffer_budget_bytes, ingestor.health().admission_group_objects_peak);
+        drain(&mut ingestor, &lab, 70_512, 120.0).await;
+        let health = ingestor.health();
+        assert_eq!((health.objects_consumed_total, health.objects_rejected_total, health.objects_quarantined_total), (8, 0, 0));
+    }));
+    assert!(peak < lab.config.buffer_budget_bytes as isize,
+        "calibrated admission exceeded the working budget: {} MiB", peak >> 20);
 }
 
 /// A real local slice-write error must never turn a bounded pipelined

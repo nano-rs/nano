@@ -41,6 +41,19 @@ struct Provider {
     not_active: AtomicBool,
     /// NAN-4774: platform `custody.converged`, reset by `writer_attached`.
     converged: AtomicBool,
+    /// NAN-4798: every control call (and epoch retirement) fails with a
+    /// connection reset until this tokio instant (a network outage).
+    reset_until: Arc<Mutex<Option<tokio::time::Instant>>>,
+    /// NAN-4798: the next successful publish starts an outage this long.
+    reset_after_publish: Mutex<Option<std::time::Duration>>,
+    /// NAN-4798: the next `writer_reopen` lands but its response is lost.
+    lose_reopen_response: AtomicBool,
+}
+fn link(reset_until: &Mutex<Option<tokio::time::Instant>>) -> Result<()> {
+    if reset_until.lock().unwrap().is_some_and(|until| tokio::time::Instant::now() < until) {
+        return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset by peer").into());
+    }
+    Ok(())
 }
 impl Provider {
     fn refuse(&self, op: &str, code: &str) -> Result<()> {
@@ -69,6 +82,11 @@ struct Table {
     lose_response: Arc<AtomicBool>,
     stall_epoch: Arc<AtomicBool>,
     stall_epoch_after: Arc<AtomicUsize>,
+    /// NAN-4782: metadata-only seeds that landed (a copy of the master's
+    /// live entries; no part is prepared or read).
+    seeds: AtomicUsize,
+    reset_until: Arc<Mutex<Option<tokio::time::Instant>>>,
+    fail_seed_schema: AtomicBool,
 }
 #[async_trait::async_trait]
 impl IcebergCommitter for Table {
@@ -152,9 +170,54 @@ impl CatalogLifecycleBackend for Table {
 }
 #[async_trait::async_trait]
 impl ServingTable for Table {
+    async fn live_entries(&self) -> Result<crate::part_ingest::iceberg_export::LiveEntries> {
+        let head = self.head.lock().unwrap().clone();
+        let parts = self.parts.lock().unwrap().clone();
+        Ok(crate::part_ingest::iceberg_export::LiveEntries {
+            checkpoint: head.as_ref().map(|h| h.0),
+            digest: head.map(|h| h.1),
+            schema: None,
+            files: vec![],
+            all_parts: parts.clone(),
+            parts,
+        })
+    }
+    /// Like the REST seed: one commit replacing the current snapshot with
+    /// exactly the master's entries, at the master's checkpoint and digest;
+    /// a no-op when already equal. Counts as one registration per part.
+    async fn seed(&self, entries: &crate::part_ingest::iceberg_export::LiveEntries) -> Result<()> {
+        ensure!(self.name != "events", "the master is never seeded");
+        if self.fail_seed_schema.swap(false, Ordering::SeqCst) {
+            anyhow::bail!(super::super::super::SeedSchemaMismatch);
+        }
+        if self.stall_epoch.swap(false, Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        let wanted = entries.checkpoint.zip(entries.digest.clone());
+        let mut head = self.head.lock().unwrap();
+        ensure!(head.as_ref().map(|h| h.0) <= entries.checkpoint, "serving epoch is ahead of the master");
+        let mut parts = self.parts.lock().unwrap();
+        if *head == wanted && *parts == entries.parts {
+            return Ok(());
+        }
+        let mut hours = self.hours.lock().unwrap();
+        hours.clear();
+        let mut adds = self.adds.lock().unwrap();
+        for part in &entries.parts {
+            hours.insert(part.clone(), 0);
+            if !parts.contains(part) {
+                *adds.entry(part.clone()).or_default() += 1;
+            }
+        }
+        *parts = entries.parts.clone();
+        *head = wanted;
+        self.seeds.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
     async fn retire(&self) -> Result<()> {
         // The production broker requires an open privacy fence even for an
         // unpublished leftover, and refuses any still-registered serving name.
+        link(&self.reset_until)?;
         ensure!(self.fence.lock().unwrap().is_some(), "agent_catalog_table_still_serving");
         ensure!(self.registry.lock().unwrap().as_deref() != Some(&format!("agent.{}_v1", self.name)),
             "agent_catalog_table_still_serving");
@@ -202,11 +265,15 @@ impl ServingFactory for Provider {
                     lose_response: self.lose_response.clone(),
                     stall_epoch: self.stall_epoch.clone(),
                     stall_epoch_after: self.stall_epoch_after.clone(),
+                    seeds: Default::default(),
+                    reset_until: self.reset_until.clone(),
+                    fail_seed_schema: Default::default(),
                 })
             })
             .clone())
     }
     async fn close(&self) -> Result<()> {
+        link(&self.reset_until)?;
         let names = self.registry.lock().unwrap().iter().cloned().collect();
         self.fence.lock().unwrap().get_or_insert((names, false));
         self.trace.lock().unwrap().push("closed".into());
@@ -222,6 +289,7 @@ impl ServingFactory for Provider {
         Ok(())
     }
     async fn publish(&self, proof: Value) -> Result<()> {
+        link(&self.reset_until)?;
         ensure!(
             !self.fail_publish.load(Ordering::SeqCst),
             "registry unavailable"
@@ -250,9 +318,13 @@ impl ServingFactory for Provider {
         self.registry.lock().unwrap().replace(name.clone());
         self.fence.lock().unwrap().as_mut().expect("privacy fence").1 = true;
         self.trace.lock().unwrap().push(format!("publish:{name}"));
+        if let Some(outage) = self.reset_after_publish.lock().unwrap().take() {
+            *self.reset_until.lock().unwrap() = Some(tokio::time::Instant::now() + outage);
+        }
         Ok(())
     }
     async fn invalidate(&self) -> Result<()> {
+        link(&self.reset_until)?;
         let registered = self.registry.lock().unwrap().clone();
         let fresh = self.fence.lock().unwrap().as_ref().is_some_and(|(closed, fresh)| {
             *fresh && registered.as_ref().is_none_or(|name| !closed.contains(name))
@@ -264,12 +336,16 @@ impl ServingFactory for Provider {
         Ok(())
     }
     async fn reopen(&self) -> Result<()> {
+        link(&self.reset_until)?;
         if !self.fence.lock().unwrap().as_ref().is_some_and(|(_, fresh)| *fresh) {
             return self.refuse("writer_reopen", "catalog_fresh_serving_proof_missing");
         }
         *self.fence.lock().unwrap() = None;
         self.converged.store(true, Ordering::SeqCst);
         self.trace.lock().unwrap().push("open".into());
+        if self.lose_reopen_response.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset by peer").into());
+        }
         Ok(())
     }
     /// Like platform `writer_adopt`: only this activation's sole registered
@@ -289,6 +365,7 @@ impl ServingFactory for Provider {
         Ok(())
     }
     async fn list_epochs(&self) -> Result<BTreeSet<String>> {
+        link(&self.reset_until)?;
         ensure!(!self.fail_list.load(Ordering::SeqCst), "epoch listing unavailable");
         Ok(self
             .tables
@@ -405,11 +482,18 @@ async fn serving_metadata_delete_failure_keeps_gc_blocked_until_retirement_compl
         .await
         .is_err());
     assert!(catalog.require_removed(T, part().part_id.as_str()).is_err());
+    // NAN-4798: the fresh epoch was published before the retirement failed.
+    let published = provider.published.lock().unwrap().len();
+    let registered = provider.registry.lock().unwrap().clone();
     provider.fail_retire.store(false, Ordering::SeqCst);
     catalog
         .sync_parts(T, vec![], 49 * 3600000 + 1, &MergePolicy::default())
         .await
         .unwrap();
+    // ...and the retry finished THAT epoch: no new mint, no seed, no rebuild.
+    assert_eq!(provider.published.lock().unwrap().len(), published);
+    assert_eq!(*provider.registry.lock().unwrap(), registered);
+    assert!(provider.fence.lock().unwrap().is_none());
     catalog
         .fence_retirement(T, part().part_id.as_str())
         .await
@@ -696,8 +780,7 @@ const ONE_BATCH_PER_SYNC: super::super::super::lifecycle::SyncLimits = super::su
 fn fresh_install(dir: &std::path::Path, provider: &Arc<Provider>) -> Arc<TenantCatalog> {
     let backend = Arc::new(
         FreshServingBackend::new(provider.clone(), dir.join("serving"))
-            .unwrap()
-            .with_batch(BATCH),
+            .unwrap(),
     );
     Arc::new(
         TenantCatalog::new(T, dir.join("custody"), backend)
@@ -743,14 +826,16 @@ async fn first_export_larger_than_one_budget_converges_over_several_syncs() {
     let parts = live_set(22);
     let incomplete = converge(&catalog, &parts, 64).await;
     // 22 parts / 4 per batch = 6 master batches, one per sync; the last
-    // settles and builds the epoch (6 batches of its own) in that sync.
+    // settles and seeds the epoch from the master (NAN-4782: one metadata
+    // commit, no batch replay, nothing prepared) in that sync.
     assert_eq!(incomplete, 5, "one master batch per sync until the last");
     let master = table(&provider, "events");
     assert_eq!(master.commits.load(Ordering::SeqCst), 6);
     assert_registered_once(&master, &parts);
     let name = provider.registry.lock().unwrap().clone().expect("epoch published");
     let epoch = table(&provider, name.strip_prefix("agent.").unwrap().strip_suffix("_v1").unwrap());
-    assert_eq!(epoch.commits.load(Ordering::SeqCst), 6);
+    assert_eq!(epoch.seeds.load(Ordering::SeqCst), 1, "one metadata-only seed");
+    assert_eq!(epoch.calls.load(Ordering::SeqCst), 0, "no batch was replayed into the epoch");
     assert_registered_once(&epoch, &parts);
     // The epoch chain ends at the master checkpoint, so the next delta
     // continues both.
@@ -799,7 +884,7 @@ async fn cut_off_or_ambiguous_batches_resume_without_duplicate_registrations() {
     let cut = tokio::time::timeout(std::time::Duration::from_millis(200), sync(catalog.clone(), LIVE_NOW + 3)).await;
     assert!(cut.is_err(), "the stalled batch cut the sync off");
     assert_eq!(master.commits.load(Ordering::SeqCst), 2);
-    // Restart from durable state only; the fresh epoch's first batch hangs.
+    // Restart from durable state only; the fresh epoch's seed hangs.
     drop(catalog);
     let catalog = fresh_install(dir.path(), &provider);
     provider.stall_epoch.store(true, Ordering::SeqCst);
@@ -821,7 +906,8 @@ async fn cut_off_or_ambiguous_batches_resume_without_duplicate_registrations() {
     let name = provider.registry.lock().unwrap().clone().expect("epoch published");
     let epoch = table(&provider, name.strip_prefix("agent.").unwrap().strip_suffix("_v1").unwrap());
     assert_registered_once(&epoch, &parts);
-    assert_eq!(epoch.commits.load(Ordering::SeqCst), 4);
+    assert_eq!(epoch.seeds.load(Ordering::SeqCst), 1, "the cut seed never landed; one did");
+    assert_eq!(epoch.calls.load(Ordering::SeqCst), 0, "no batch was replayed into the epoch");
 }
 
 /// NAN-4614 review: a removal batch that is not the sync's last (a backlog
@@ -879,24 +965,22 @@ async fn a_replayed_removal_plan_behind_a_newer_delta_still_converges() {
     catalog.fence_retirement(T, parts[0].part_id.as_str()).await.unwrap();
 }
 
-/// FP-T101: master batches done, then the fresh epoch build is cut off after
-/// its first batch landed (the sync's hard bound). Returns the pending epoch.
+/// NAN-4782: master batches done, then the fresh epoch is seeded (from the
+/// master's catalog entries) but its publish fails: an interrupted fresh
+/// epoch that already holds the live set and was never exposed. Returns it.
 async fn cut_epoch_build(provider: &Arc<Provider>, catalog: &Arc<TenantCatalog>, parts: &[PartRef]) -> String {
     let error = catalog.sync_parts(T, parts.to_vec(), LIVE_NOW, &MergePolicy::default()).await.unwrap_err();
     assert!(error.downcast_ref::<super::super::super::lifecycle::CatalogSyncIncomplete>().is_some(), "{error:#}");
-    provider.stall_epoch_after.store(1, Ordering::SeqCst);
-    provider.stall_epoch.store(true, Ordering::SeqCst);
-    let cut = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        catalog.sync_parts(T, parts.to_vec(), LIVE_NOW + 1, &MergePolicy::default()),
-    )
-    .await;
-    assert!(cut.is_err(), "the epoch build was cut off");
-    assert!(provider.registry.lock().unwrap().is_none(), "a cut-off epoch is never published");
+    provider.fail_publish.store(true, Ordering::SeqCst);
+    let error = catalog.sync_parts(T, parts.to_vec(), LIVE_NOW + 1, &MergePolicy::default()).await.unwrap_err();
+    assert!(format!("{error:#}").contains("registry unavailable"), "{error:#}");
+    provider.fail_publish.store(false, Ordering::SeqCst);
+    assert!(provider.registry.lock().unwrap().is_none(), "an interrupted epoch is never published");
     let pending = provider.list_epochs().await.unwrap();
     assert_eq!(pending.len(), 1, "{pending:?}");
     let pending = pending.into_iter().next().unwrap();
-    assert_eq!(table(provider, &pending).commits.load(Ordering::SeqCst), 1, "the epoch was built partly");
+    assert_eq!(*table(provider, &pending).parts.lock().unwrap(), ids(parts), "the epoch was seeded");
+    assert_eq!(table(provider, &pending).seeds.load(Ordering::SeqCst), 1);
     pending
 }
 fn retired(provider: &Provider) -> Vec<String> {
@@ -906,48 +990,42 @@ fn ids(parts: &[PartRef]) -> BTreeSet<String> {
     parts.iter().map(|p| p.part_id.to_string()).collect()
 }
 
-/// FP-T101 (epoch-build livelock): an epoch build cut off part way resumes after
-/// the master committed a newly sealed hour. The resumed build replays its
-/// recorded batches, plans the live-set delta from its own durable state and
-/// publishes the SAME epoch; it is never retired and rebuilt from zero.
+/// FP-T101 / NAN-4782: an interrupted fresh epoch resumes after the master
+/// committed a newly sealed hour. It is re-seeded from the moved master in
+/// one metadata commit and the SAME epoch is published; it is never retired
+/// and rebuilt, and no batch is ever replayed into it.
 #[tokio::test]
-async fn a_resumed_epoch_build_plans_the_live_set_delta_instead_of_rebuilding() {
+async fn an_interrupted_epoch_is_reseeded_from_the_moved_master_not_rebuilt() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(Provider::default());
     let catalog = fresh_install(dir.path(), &provider);
     catalog.fence_installation().await.unwrap();
-    let parts = live_set(8); // 2 master batches, 2 epoch batches
+    let parts = live_set(8);
     let pending = cut_epoch_build(&provider, &catalog, &parts).await;
-    let calls = table(&provider, &pending).calls.load(Ordering::SeqCst);
-    // The master advances by one sealed hour before the epoch resumes.
     let moved = live_set(9);
     converge(&catalog, &moved, 8).await;
-    // Resumes at the first uncommitted batch: the committed batch 1 is not
-    // even re-sent (no catalog load); only batch 2 and the delta.
-    assert_eq!(table(&provider, &pending).calls.load(Ordering::SeqCst), calls + 2);
-    assert!(retired(&provider).is_empty(), "{:?}", provider.trace.lock().unwrap());
-    assert_eq!(provider.registry.lock().unwrap().clone().unwrap(), format!("agent.{pending}_v1"));
     let (master, epoch) = (table(&provider, "events"), table(&provider, &pending));
+    assert!(retired(&provider).is_empty(), "{:?}", provider.trace.lock().unwrap());
     assert_eq!(*provider.published.lock().unwrap(), vec![(format!("agent.{pending}_v1"), ids(&moved))]);
+    assert_eq!(epoch.seeds.load(Ordering::SeqCst), 2, "seeded again from the moved master");
+    assert_eq!(epoch.calls.load(Ordering::SeqCst), 0, "no batch replayed");
     assert_registered_once(&epoch, &moved);
-    assert_eq!(epoch.commits.load(Ordering::SeqCst), 3, "2 recorded batches + 1 delta");
-    // The chain still ENDS at the master checkpoint: the next delta
-    // continues both tables.
+    // The epoch carries the master checkpoint: the next delta continues both.
     assert_eq!(epoch.head.lock().unwrap().as_ref().unwrap().0, master.head.lock().unwrap().as_ref().unwrap().0);
     let more = live_set(10);
     catalog.sync_parts(T, more.clone(), LIVE_NOW + 3_600_000, &MergePolicy::default()).await.unwrap();
     assert_registered_once(&master, &more);
     assert_registered_once(&epoch, &more);
+    assert_eq!(epoch.calls.load(Ordering::SeqCst), 1, "the add-only delta commits to the active epoch");
 }
 
-/// FP-T101: the delta may REMOVE a part (here hour 0's part is replaced; an
-/// erasure is the same shape). Invariant: a removal is committed into the
-/// unpublished epoch (no reader can name it), its expiry drops older
-/// snapshots, and only an epoch whose references equal the master's is
-/// published, so the published epoch never holds the removed part and its
-/// GC receipt follows once the converged sync settles it.
+/// NAN-4782: removals and erasures are already reflected in the master's
+/// live set. The interrupted (unpublished) epoch held part P; P is replaced
+/// (a merge; an erasure is the same shape) before the epoch resumes. The
+/// re-seed copies the master's entries, so the published epoch never holds
+/// P, and P's GC receipt follows once the converged sync settles it.
 #[tokio::test]
-async fn a_resumed_epoch_delta_commits_removals_before_publish_and_never_exposes_them() {
+async fn a_reseeded_epoch_never_exposes_a_part_the_master_removed() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(Provider::default());
     let catalog = fresh_install(dir.path(), &provider);
@@ -955,7 +1033,7 @@ async fn a_resumed_epoch_delta_commits_removals_before_publish_and_never_exposes
     let parts = live_set(8);
     let pending = cut_epoch_build(&provider, &catalog, &parts).await;
     let removed = parts[0].part_id.to_string();
-    assert!(table(&provider, &pending).parts.lock().unwrap().contains(&removed), "the cut epoch held it");
+    assert!(table(&provider, &pending).parts.lock().unwrap().contains(&removed), "the interrupted epoch held it");
     let mut replaced = parts.clone();
     replaced[0].part_id = PartId::parse("0000000000100-aaaaaaaaaaaaaaaa").unwrap();
     converge(&catalog, &replaced, 8).await;
@@ -963,16 +1041,18 @@ async fn a_resumed_epoch_delta_commits_removals_before_publish_and_never_exposes
     let published = provider.published.lock().unwrap().clone();
     assert_eq!(published, vec![(format!("agent.{pending}_v1"), ids(&replaced))]);
     assert!(!published[0].1.contains(&removed), "the removed part is never published");
+    assert!(!table(&provider, &pending).parts.lock().unwrap().contains(&removed));
     assert_eq!(*table(&provider, "events").parts.lock().unwrap(), ids(&replaced));
+    assert_eq!(table(&provider, &pending).calls.load(Ordering::SeqCst), 0, "no batch replayed");
     catalog.require_removed(T, &removed).unwrap();
     catalog.fence_retirement(T, &removed).await.unwrap();
 }
 
-/// FP-T101: the fallback stays. An epoch that still differs from the master
-/// after the delta (here the master holds a part the live set cannot
-/// reproduce) is retired unexposed and a fresh epoch is built.
+/// The fallback stays fail-closed: a master that holds a part the live set
+/// cannot reproduce is never copied into a fresh name. Nothing is seeded or
+/// published until the master and the live set agree again.
 #[tokio::test]
-async fn an_epoch_that_cannot_reach_the_master_is_still_retired_unpublished() {
+async fn an_epoch_whose_master_differs_from_the_live_set_is_never_seeded_or_published() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(Provider::default());
     let catalog = fresh_install(dir.path(), &provider);
@@ -983,53 +1063,14 @@ async fn an_epoch_that_cannot_reach_the_master_is_still_retired_unpublished() {
     table(&provider, "events").parts.lock().unwrap().insert(stray.clone());
     let error = catalog.sync_parts(T, parts.clone(), LIVE_NOW + 2, &MergePolicy::default()).await.unwrap_err();
     assert!(format!("{error:#}").contains("serving epoch live set changed; replay required"), "{error:#}");
-    assert_eq!(retired(&provider), vec![format!("retire:{pending}")]);
     assert!(provider.registry.lock().unwrap().is_none(), "never exposed");
-    assert!(!provider.list_epochs().await.unwrap().contains(&pending));
+    assert!(!table(&provider, &pending).parts.lock().unwrap().contains(&stray), "never copied");
+    assert_eq!(table(&provider, &pending).seeds.load(Ordering::SeqCst), 1, "not re-seeded");
     table(&provider, "events").parts.lock().unwrap().remove(&stray);
     converge(&catalog, &parts, 8).await;
     let name = provider.registry.lock().unwrap().clone().unwrap();
-    assert_ne!(name, format!("agent.{pending}_v1"), "a fresh epoch was built");
-    assert_eq!(provider.published.lock().unwrap().len(), 1);
+    assert_eq!(provider.published.lock().unwrap().clone(), vec![(name.clone(), ids(&parts))]);
     assert_registered_once(&table(&provider, &epoch(&name)), &parts);
-}
-
-/// FP-T101: an epoch that keeps failing must not grow its recorded batches
-/// until `epoch_plans` refuses every pass. Past the resume limit it takes the
-/// retire-and-rebuild fallback, and the fresh epoch publishes.
-#[tokio::test]
-async fn an_epoch_past_the_resume_limit_is_retired_not_grown() {
-    let dir = tempfile::tempdir().unwrap();
-    let provider = Arc::new(Provider::default());
-    let backend = Arc::new(
-        FreshServingBackend::new(provider.clone(), dir.path().join("serving"))
-            .unwrap()
-            .with_batch(BATCH)
-            .with_resume_limit(2),
-    );
-    let catalog = Arc::new(
-        TenantCatalog::new(T, dir.path().join("custody"), backend)
-            .unwrap()
-            .with_limits(ONE_BATCH_PER_SYNC),
-    );
-    catalog.fence_installation().await.unwrap();
-    let pending = cut_epoch_build(&provider, &catalog, &live_set(8)).await;
-    let moved = live_set(9);
-    // The master's own budget-cut batches first; then the resume refuses to
-    // grow the epoch past its limit and retires it unexposed.
-    let error = loop {
-        let error = catalog.sync_parts(T, moved.clone(), LIVE_NOW + 2, &MergePolicy::default()).await.unwrap_err();
-        if error.downcast_ref::<super::super::super::lifecycle::CatalogSyncIncomplete>().is_none() {
-            break error;
-        }
-    };
-    assert!(format!("{error:#}").contains("serving epoch live set changed; replay required"), "{error:#}");
-    assert_eq!(retired(&provider), vec![format!("retire:{pending}")]);
-    assert!(provider.registry.lock().unwrap().is_none(), "never exposed");
-    converge(&catalog, &moved, 8).await;
-    let name = provider.registry.lock().unwrap().clone().unwrap();
-    assert_ne!(name, format!("agent.{pending}_v1"), "a fresh epoch was built");
-    assert_registered_once(&table(&provider, &epoch(&name)), &moved);
 }
 
 fn degraded(part: &str) -> String {
@@ -1053,7 +1094,7 @@ async fn gc_proceeds_with_custody_unconverged_and_the_next_sync_tolerates_the_va
     let provider = Arc::new(Provider::default());
     let catalog = fresh_install(dir.path(), &provider);
     catalog.fence_installation().await.unwrap();
-    let parts = live_set(8); // master batches 0-3, 4-7; epoch the same
+    let parts = live_set(8); // master batches 0-3, 4-7; then the epoch seed
     let pending = cut_epoch_build(&provider, &catalog, &parts).await;
     assert!(!dir.path().join("custody/planned-index-ready").exists(), "custody never converged");
     drop(catalog);
@@ -1087,11 +1128,13 @@ async fn gc_proceeds_with_custody_unconverged_and_the_next_sync_tolerates_the_va
     assert!(converged, "{:?}", trace(&provider));
     let master = table(&provider, "events");
     assert_eq!(*master.parts.lock().unwrap(), ids(&live));
-    assert!(retired(&provider).contains(&format!("retire:{pending}")), "the epoch naming it was retired");
+    // NAN-4782: the interrupted epoch that named it is re-seeded from the
+    // master (which no longer holds it) before it is ever published.
     let published = provider.published.lock().unwrap().clone();
     assert_eq!(published.len(), 1, "{published:?}");
-    assert_ne!(published[0].0, format!("agent.{pending}_v1"));
+    assert_eq!(published[0].0, format!("agent.{pending}_v1"));
     assert_eq!(published[0].1, ids(&live), "the published epoch never holds the vanished part");
+    assert!(!table(&provider, &pending).parts.lock().unwrap().contains(&erased));
     let trace = trace(&provider);
     let publish = trace.iter().position(|s| s.starts_with("publish:")).unwrap();
     let open = trace.iter().position(|s| s == "open").unwrap();
@@ -1137,49 +1180,31 @@ async fn an_exposed_epoch_referencing_a_gc_deleted_part_is_never_served() {
     assert!(!table(&provider, "events").parts.lock().unwrap().contains(&p));
 }
 
-/// NAN-4721: agents never compete with analysts. Through the production
-/// TenantCatalog + FreshServingBackend (the signal reaches the backend via
-/// `TenantCatalog::new`), no serving-epoch batch starts while the ingest
-/// lag alert holds; the epoch builds as soon as it clears, and the master
-/// chain, publish and custody are unchanged.
+/// NAN-4721 + NAN-4782: the fresh epoch reads no part file (it is a
+/// metadata copy of the master), so it has nothing to yield to ingest:
+/// with the ingest lag alert holding, the converging sync seeds and
+/// publishes at once, without spending any of the yield budget. (The
+/// master's own cold reads still yield inside the export target.)
 #[tokio::test(start_paused = true)]
-async fn serving_epoch_batches_yield_while_ingest_lags() {
-    use crate::part_ingest::agent_lane::{MAX_YIELD, PRESSURE_POLL};
+async fn a_serving_epoch_seed_reads_no_part_and_never_waits_on_ingest_lag() {
+    use crate::part_ingest::agent_lane::PRESSURE_POLL;
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(Provider::default());
     let catalog = fresh_install(dir.path(), &provider);
     catalog.fence_installation().await.unwrap();
-    let parts = live_set(8); // 2 master batches, then 2 epoch batches
+    let parts = live_set(8); // 2 master batches, then the seed
     let error = catalog.sync_parts(T, parts.clone(), LIVE_NOW, &MergePolicy::default()).await.unwrap_err();
     assert!(error.downcast_ref::<super::super::super::lifecycle::CatalogSyncIncomplete>().is_some(), "{error:#}");
-    // Ingest lags past its alert threshold before the sync that builds the epoch.
     catalog.ingest_pressure().set(true);
-    let sync = tokio::spawn({
-        let (catalog, parts) = (catalog.clone(), parts.clone());
-        async move { catalog.sync_parts(T, parts, LIVE_NOW + 1, &MergePolicy::default()).await }
-    });
-    let epoch = loop {
-        tokio::time::sleep(PRESSURE_POLL).await;
-        let found = provider.tables.lock().unwrap().values().find(|t| t.name != "events").cloned();
-        if let Some(epoch) = found { break epoch; }
-    };
-    let master = table(&provider, "events");
-    assert_eq!(master.commits.load(Ordering::SeqCst), 2, "the master chain is not held back");
-    // Lagging for most of the yield bound: not one epoch batch started.
-    let lagged = 20 * PRESSURE_POLL; // under the yield bound and the sync hard bound
-    assert!(lagged < MAX_YIELD);
-    tokio::time::sleep(lagged).await;
-    assert_eq!(epoch.calls.load(Ordering::SeqCst), 0, "an epoch batch competed with lagging ingest");
-    assert!(!sync.is_finished());
-    assert!(provider.registry.lock().unwrap().is_none(), "nothing published mid-yield");
-    // The lag clears: the epoch builds and publishes within one poll.
-    catalog.ingest_pressure().set(false);
-    tokio::time::timeout(2 * PRESSURE_POLL, sync).await.expect("epoch resumes once ingest recovers").unwrap().unwrap();
-    assert_eq!(epoch.commits.load(Ordering::SeqCst), 2);
-    assert_registered_once(&epoch, &parts);
-    assert!(catalog.ingest_pressure().yielded_ms() >= lagged.as_millis() as u64);
+    tokio::time::timeout(PRESSURE_POLL, catalog.sync_parts(T, parts.clone(), LIVE_NOW + 1, &MergePolicy::default()))
+        .await
+        .expect("the seed never waits on ingest")
+        .unwrap();
+    assert_eq!(catalog.ingest_pressure().yielded_ms(), 0);
     let name = provider.registry.lock().unwrap().clone().expect("epoch published");
-    assert_eq!(name, format!("agent.{}_v1", epoch.name));
+    let epoch = table(&provider, &epoch(&name));
+    assert_eq!((epoch.seeds.load(Ordering::SeqCst), epoch.calls.load(Ordering::SeqCst)), (1, 0));
+    assert_registered_once(&epoch, &parts);
 }
 
 /// NAN-4734: after a converged privacy pass, `writer_reopen` deletes the
@@ -1311,7 +1336,7 @@ struct Writer {
     catalog: Arc<TenantCatalog>,
 }
 async fn attach_writer(dir: &std::path::Path, provider: &Arc<Provider>, activation: uuid::Uuid) -> Writer {
-    let backend = Arc::new(FreshServingBackend::new(provider.clone(), dir.join("serving")).unwrap().with_batch(BATCH));
+    let backend = Arc::new(FreshServingBackend::new(provider.clone(), dir.join("serving")).unwrap());
     let catalog = Arc::new(TenantCatalog::new(T, dir.join("custody"), backend.clone()).unwrap().with_limits(ONE_BATCH_PER_SYNC));
     super::super::install_or_fence(&catalog, dir, activation, &super::super::AttachProgress::default()).await.unwrap();
     // `writer_attached` resets the platform's convergence on every attach.
@@ -1581,4 +1606,366 @@ fn assert_rebuilt(provider: &Provider, published: &str, refused: bool) {
         "{:?}",
         provider.refused.lock().unwrap()
     );
+}
+
+/// NAN-4782 goal 2: a roll lands MID-EPOCH. An erasure closed reads (the
+/// platform privacy fence is open on E1), the master committed the removal
+/// and a fresh epoch E2 was seeded, then publish failed and the A/B claim
+/// swap wiped `serving/state.json` and all custody. Everything the successor
+/// needs comes from the catalog and the platform: the master checkpoint
+/// (export head), every epoch it forgot (the catalog listing, retired through
+/// the verified path), the open fence (the platform refuses adoption). It
+/// re-exports nothing (no master commit), replays no batch into any epoch
+/// (a fresh name is one metadata-only seed), never exposes the erased part,
+/// and GC receipts it only after the forgotten epochs are retired.
+#[tokio::test]
+async fn a_roll_mid_epoch_recovers_from_catalog_and_platform_without_a_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("catalog");
+    let provider = Arc::new(Provider::default());
+    let parts = live_set(6);
+    let (writer, activation, published) = validated(&work, &provider, &parts).await;
+    let e1 = epoch(&published);
+    let erased = parts[0].part_id.to_string();
+    let live = parts[1..].to_vec();
+    provider.fail_publish.store(true, Ordering::SeqCst);
+    let error = loop {
+        match writer.catalog.sync_parts(T, live.clone(), LIVE_NOW + 3_600_000, &MergePolicy::default()).await {
+            Err(error) if error.downcast_ref::<super::super::super::lifecycle::CatalogSyncIncomplete>().is_some() => {}
+            other => break other.unwrap_err(),
+        }
+    };
+    assert!(format!("{error:#}").contains("registry unavailable"), "{error:#}");
+    provider.fail_publish.store(false, Ordering::SeqCst);
+    let master = table(&provider, "events");
+    assert_eq!(*master.parts.lock().unwrap(), ids(&live), "the master committed the erasure");
+    assert!(provider.fence.lock().unwrap().is_some(), "the platform privacy fence is open");
+    let e2 = provider.list_epochs().await.unwrap().into_iter().find(|n| n != &e1).unwrap();
+    let master_commits = master.commits.load(Ordering::SeqCst);
+    // The roll.
+    let writer = roll(&work, &provider, writer, activation).await;
+    assert!(writer.backend.state().active.is_none() && writer.backend.state().pending.is_none());
+    converge_at(&writer.catalog, &live, LIVE_NOW + 2 * 3_600_000).await;
+    assert_eq!(master.commits.load(Ordering::SeqCst), master_commits, "the master was not re-exported");
+    let fresh = epoch(&provider.registry.lock().unwrap().clone().unwrap());
+    assert!(fresh != e1 && fresh != e2, "a fresh name is the fence");
+    let state = writer.backend.state();
+    assert_eq!((state.active.as_deref(), state.pending.as_deref()), (Some(fresh.as_str()), None));
+    assert!(state.retired.is_empty());
+    assert_eq!(state.last_plan_ms, master.head.lock().unwrap().as_ref().unwrap().0, "checkpoint learned from the catalog");
+    for name in [&e1, &e2, &fresh] {
+        assert_eq!(table(&provider, name).calls.load(Ordering::SeqCst), 0, "{name}: no batch replayed into an epoch");
+    }
+    assert_eq!(table(&provider, &fresh).seeds.load(Ordering::SeqCst), 1);
+    assert_eq!(*table(&provider, &fresh).parts.lock().unwrap(), ids(&live));
+    // No privacy regression: publish before any old name is dropped, nothing
+    // published after the erasure holds the erased part, reads reopen last.
+    let trace = provider.trace.lock().unwrap().clone();
+    let publish = trace.iter().position(|s| s == &format!("publish:agent.{fresh}_v1")).unwrap();
+    for old in [&e1, &e2] {
+        let retired = trace.iter().position(|s| s == &format!("retire:{old}")).unwrap_or_else(|| panic!("{old} retired: {trace:?}"));
+        assert!(publish < retired, "{trace:?}");
+    }
+    let open = trace.iter().rposition(|s| s == "open").unwrap();
+    assert!(publish < open, "{trace:?}");
+    let published = provider.published.lock().unwrap().clone();
+    assert!(published[1..].iter().all(|(_, held)| !held.contains(&erased)), "{published:?}");
+    assert_eq!(provider.list_epochs().await.unwrap(), BTreeSet::from([fresh]));
+    assert!(provider.fence.lock().unwrap().is_none());
+    writer.catalog.fence_retirement(T, &erased).await.unwrap();
+}
+
+/// NAN-4782 goal 2, steady state: a roll after a converged epoch rebuilds
+/// nothing. The platform confirms the published epoch (`writer_adopt`), the
+/// catalog proves it equals the master, and the successor seeds nothing,
+/// commits nothing to the master and opens no fence. When the platform
+/// refuses instead (here: the activation is not active), the fallback is a
+/// fresh NAME seeded from the master: still no batch replay, no master
+/// re-export, and no part file read.
+#[tokio::test]
+async fn a_steady_state_roll_adopts_or_reseeds_but_never_replays() {
+    for refuse in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("catalog");
+        let provider = Arc::new(Provider::default());
+        let parts = live_set(6);
+        let (writer, activation, published) = validated(&work, &provider, &parts).await;
+        let e1 = epoch(&published);
+        let master = table(&provider, "events");
+        let master_commits = master.commits.load(Ordering::SeqCst);
+        let e1_seeds = table(&provider, &e1).seeds.load(Ordering::SeqCst);
+        provider.not_active.store(refuse, Ordering::SeqCst);
+        let writer = roll(&work, &provider, writer, activation).await;
+        converge_at(&writer.catalog, &parts, LIVE_NOW + 1_000).await;
+        assert_eq!(master.commits.load(Ordering::SeqCst), master_commits, "refuse={refuse}: no master re-export");
+        let active = writer.backend.state().active.unwrap();
+        if refuse {
+            assert_ne!(active, e1);
+            assert_eq!(table(&provider, &active).seeds.load(Ordering::SeqCst), 1);
+            assert!(provider.trace.lock().unwrap().iter().any(|s| s == &format!("retire:{e1}")));
+        } else {
+            assert_eq!(active, e1, "adopted");
+            assert_eq!(table(&provider, &e1).seeds.load(Ordering::SeqCst), e1_seeds, "nothing seeded");
+            assert!(!provider.trace.lock().unwrap().iter().any(|s| s == "closed"));
+        }
+        assert_eq!(table(&provider, &active).calls.load(Ordering::SeqCst), 0, "no batch replayed");
+        assert_eq!(*table(&provider, &active).parts.lock().unwrap(), ids(&parts));
+    }
+}
+
+/// NAN-4798 helpers: the published epochs and the serving tables seeded.
+fn published(provider: &Provider) -> Vec<String> {
+    provider.published.lock().unwrap().iter().map(|(name, _)| name.clone()).collect()
+}
+fn seeds(provider: &Provider) -> usize {
+    provider.tables.lock().unwrap().values().map(|t| t.seeds.load(Ordering::SeqCst)).sum()
+}
+
+#[tokio::test]
+async fn metadata_only_epoch_seed_preserves_gc_writer_receipt_settlement() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("catalog");
+    let provider = Arc::new(Provider::default());
+    let parts = live_set(3);
+    let (writer, activation, _) = validated(&work, &provider, &parts).await;
+    let before = seeds(&provider);
+    let master_calls = table(&provider, "events").calls.load(Ordering::SeqCst);
+    provider.not_active.store(true, Ordering::SeqCst); // gateway refuses adoption
+    let writer = roll(&work, &provider, writer, activation).await;
+    converge_at(&writer.catalog, &parts, LIVE_NOW + 3_600_000).await;
+    assert_eq!(seeds(&provider), before + 1);
+    assert_eq!(table(&provider, "events").calls.load(Ordering::SeqCst), master_calls, "no master rebuild");
+    let name = provider.registry.lock().unwrap().clone().unwrap();
+    assert_eq!(table(&provider, &epoch(&name)).calls.load(Ordering::SeqCst), 0, "metadata seed reads no part files");
+    crate::part_ingest::part_gc_cell::transport_tests::receipt_tests::assert_catalog_gc_settles(T, writer.catalog).await;
+}
+
+#[tokio::test]
+async fn full_catalog_rebuild_preserves_gc_writer_receipt_settlement() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Provider::default());
+    let (writer, _, _) = validated(dir.path(), &provider, &live_set(3)).await;
+    assert!(table(&provider, "events").calls.load(Ordering::SeqCst) > 0, "empty master rebuilt through export");
+    crate::part_ingest::part_gc_cell::transport_tests::receipt_tests::assert_catalog_gc_settles(T, writer.catalog).await;
+}
+fn q() -> PartRef {
+    PartRef { part_id: PartId::parse("0000000000002-bbbbbbbbbbbbbbbb").unwrap(), min_time_us: 2, max_time_us: 2, ..part() }
+}
+
+/// NAN-4798: a 5-minute run of connection resets right after
+/// `publish_serving` (retire, purge, invalidate and reopen all fail) is
+/// ridden out inside the sync: the SAME epoch reopens, with no new mint.
+#[tokio::test(start_paused = true)]
+async fn a_five_minute_reset_window_after_publish_reopens_the_same_epoch_without_a_new_mint() {
+    let (_dir, provider, catalog) = setup().await;
+    let before = published(&provider);
+    let seeded = seeds(&provider);
+    let tables = provider.tables.lock().unwrap().len();
+    *provider.reset_after_publish.lock().unwrap() = Some(std::time::Duration::from_secs(5 * 60));
+    let started = tokio::time::Instant::now();
+    catalog.sync_parts(T, vec![], 49 * 3600000, &MergePolicy::default()).await.unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_secs(5 * 60));
+    let after = published(&provider);
+    assert_eq!(after.len(), before.len() + 1, "exactly one fresh epoch for the erasure");
+    assert_eq!(seeds(&provider), seeded + 1, "the outage never rebuilds the epoch");
+    assert_eq!(provider.tables.lock().unwrap().len(), tables + 1, "no extra epoch minted");
+    assert_eq!(provider.registry.lock().unwrap().as_ref(), after.last());
+    assert!(provider.fence.lock().unwrap().is_none(), "reads reopened");
+    assert!(!catalog.recovery_required());
+    assert!(provider.refused.lock().unwrap().is_empty());
+    catalog.fence_retirement(T, part().part_id.as_str()).await.unwrap();
+}
+
+/// NAN-4798: an outage longer than the retry budget fails the sync CLOSED
+/// (reads closed, no receipt, the gateway never reopened); the next sync
+/// finishes the already-published epoch instead of minting a new one.
+#[tokio::test(start_paused = true)]
+async fn an_outage_past_the_retry_budget_stays_closed_and_the_next_sync_finishes_the_same_epoch() {
+    let (_dir, provider, catalog) = setup().await;
+    *provider.reset_after_publish.lock().unwrap() = Some(std::time::Duration::from_secs(25 * 60));
+    let error = catalog.sync_parts(T, vec![], 49 * 3600000, &MergePolicy::default()).await.unwrap_err();
+    assert!(format!("{error:#}").contains("connection reset"), "{error:#}");
+    // Fail closed: nothing leaks while the platform is unreachable.
+    assert!(catalog.recovery_required(), "reads-closed marker kept");
+    assert!(provider.fence.lock().unwrap().is_some(), "gateway fence still closed");
+    let trace = provider.trace.lock().unwrap().clone();
+    let publish = trace.iter().rposition(|s| s.starts_with("publish:")).unwrap();
+    assert!(!trace[publish..].iter().any(|s| s == "open"), "reads never reopened");
+    assert!(catalog.require_removed(T, part().part_id.as_str()).is_err(), "no GC receipt");
+    let epochs = published(&provider);
+    let seeded = seeds(&provider);
+    tokio::time::advance(std::time::Duration::from_secs(25 * 60)).await;
+    catalog.sync_parts(T, vec![], 49 * 3600000 + 1, &MergePolicy::default()).await.unwrap();
+    assert_eq!(published(&provider), epochs, "no new epoch minted or published");
+    assert_eq!(seeds(&provider), seeded, "no epoch seeded");
+    assert_eq!(provider.registry.lock().unwrap().as_ref(), epochs.last());
+    assert!(provider.fence.lock().unwrap().is_none());
+    assert!(!catalog.recovery_required());
+    catalog.fence_retirement(T, part().part_id.as_str()).await.unwrap();
+}
+
+/// The finishing checkpoint is durable across a process restart, including
+/// repeated retirement failures. No retry may seed or publish a new epoch.
+#[tokio::test]
+async fn a_restarted_writer_finishes_the_same_epoch_after_repeated_retirement_failures() {
+    let (dir, provider, catalog) = setup().await;
+    provider.fail_retire.store(true, Ordering::SeqCst);
+    assert!(catalog.sync_parts(T, vec![], 49 * 3600000, &MergePolicy::default()).await.is_err());
+    let epochs = published(&provider);
+    let seeded = seeds(&provider);
+    drop(catalog);
+    let backend = Arc::new(FreshServingBackend::new(provider.clone(), dir.path().join("serving")).unwrap());
+    assert!(backend.published_under_fence().is_some());
+    let catalog = TenantCatalog::new(T, dir.path().join("custody"), backend.clone()).unwrap();
+    for pass in 1..=3 {
+        assert!(catalog.sync_parts(T, vec![], 49 * 3600000 + pass, &MergePolicy::default()).await.is_err());
+        assert!(catalog.recovery_required());
+        assert!(provider.fence.lock().unwrap().is_some());
+        assert_eq!(published(&provider), epochs);
+        assert_eq!(seeds(&provider), seeded);
+        assert!(backend.state().pending.is_none());
+    }
+    provider.fail_retire.store(false, Ordering::SeqCst);
+    catalog.sync_parts(T, vec![], 49 * 3600000 + 4, &MergePolicy::default()).await.unwrap();
+    assert_eq!(published(&provider), epochs);
+    assert_eq!(seeds(&provider), seeded);
+    assert!(backend.published_under_fence().is_none());
+    assert!(!catalog.recovery_required());
+    assert!(provider.fence.lock().unwrap().is_none());
+}
+
+/// Both markers independently invalidate a finishing proof. This also
+/// checks the conservative path after restart, when only disk state exists.
+#[tokio::test]
+async fn gc_degraded_or_a_wiped_index_while_finishing_still_mints() {
+    for degraded in [false, true] {
+        let (dir, provider, catalog) = setup().await;
+        provider.fail_retire.store(true, Ordering::SeqCst);
+        assert!(catalog.sync_parts(T, vec![], 49 * 3600000, &MergePolicy::default()).await.is_err());
+        let epochs = published(&provider);
+        let seeded = seeds(&provider);
+        drop(catalog);
+        let custody = dir.path().join("custody");
+        if degraded {
+            std::fs::write(custody.join("gc-degraded"), T).unwrap();
+        } else {
+            std::fs::remove_file(custody.join("planned-index-ready")).unwrap();
+        }
+        let backend = Arc::new(FreshServingBackend::new(provider.clone(), dir.path().join("serving")).unwrap());
+        let catalog = TenantCatalog::new(T, custody, backend).unwrap();
+        provider.fail_retire.store(false, Ordering::SeqCst);
+        catalog.sync_parts(T, vec![], 49 * 3600000 + 1, &MergePolicy::default()).await.unwrap();
+        let after = published(&provider);
+        assert_eq!(after.len(), epochs.len() + 1, "degraded={degraded}");
+        assert_ne!(after.last(), epochs.last());
+        assert_eq!(seeds(&provider), seeded + 1);
+        assert!(provider.fence.lock().unwrap().is_none());
+        assert!(!catalog.recovery_required());
+    }
+}
+
+/// Persist the new pending epoch even when an explicit installation close
+/// fails to reach the gateway. A later sync must not resume the old proof.
+#[tokio::test(start_paused = true)]
+async fn a_failed_explicit_close_durably_discards_finishing_before_gateway_io() {
+    let (dir, provider, catalog) = setup().await;
+    provider.fail_retire.store(true, Ordering::SeqCst);
+    assert!(catalog.sync_parts(T, vec![], 49 * 3600000, &MergePolicy::default()).await.is_err());
+    let epochs = published(&provider);
+    *provider.reset_until.lock().unwrap() = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(25 * 60));
+    assert!(catalog.fence_installation().await.is_err());
+    drop(catalog);
+    let backend = Arc::new(FreshServingBackend::new(provider.clone(), dir.path().join("serving")).unwrap());
+    let state = backend.state();
+    assert!(state.finishing.is_none());
+    assert!(state.pending.is_some());
+    let catalog = TenantCatalog::new(T, dir.path().join("custody"), backend).unwrap();
+    *provider.reset_until.lock().unwrap() = None;
+    provider.fail_retire.store(false, Ordering::SeqCst);
+    catalog.sync_parts(T, vec![], 49 * 3600000 + 1, &MergePolicy::default()).await.unwrap();
+    assert_eq!(published(&provider).len(), epochs.len() + 1);
+    assert_ne!(published(&provider).last(), epochs.last());
+    assert!(provider.fence.lock().unwrap().is_none());
+    assert!(!catalog.recovery_required());
+}
+
+/// NAN-4798: the fence is load-bearing. A removal planned AFTER the epoch
+/// was published (here a second erasure while its retirement still fails)
+/// is a real privacy event: the next sync mints a fresh epoch.
+#[tokio::test]
+async fn an_erasure_after_the_publish_still_mints_a_fresh_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Provider::default());
+    let backend = Arc::new(FreshServingBackend::new(provider.clone(), dir.path().join("serving")).unwrap());
+    let catalog = TenantCatalog::new(T, dir.path().join("custody"), backend).unwrap();
+    catalog.sync_parts(T, vec![part(), q()], 48 * 3600000, &MergePolicy::default()).await.unwrap();
+    provider.fail_retire.store(true, Ordering::SeqCst);
+    assert!(catalog.sync_parts(T, vec![q()], 49 * 3600000, &MergePolicy::default()).await.is_err());
+    let finishing = published(&provider);
+    assert_eq!(provider.registry.lock().unwrap().as_ref(), finishing.last());
+    provider.fail_retire.store(false, Ordering::SeqCst);
+    catalog.sync_parts(T, vec![], 50 * 3600000, &MergePolicy::default()).await.unwrap();
+    let after = published(&provider);
+    assert_eq!(after.len(), finishing.len() + 1, "a fresh epoch for the new erasure");
+    assert_ne!(after.last(), finishing.last());
+    assert_eq!(provider.registry.lock().unwrap().as_ref(), after.last());
+    assert!(provider.published.lock().unwrap().last().unwrap().1.is_empty());
+    assert!(provider.fence.lock().unwrap().is_none());
+    catalog.fence_retirement(T, q().part_id.as_str()).await.unwrap();
+}
+
+/// NAN-4798: a GC degrade or an installation fence while an epoch is still
+/// finishing closes for a reason the sync cannot re-derive: it mints.
+#[tokio::test]
+async fn an_installation_fence_while_finishing_still_mints() {
+    let (_dir, provider, catalog) = setup().await;
+    provider.fail_retire.store(true, Ordering::SeqCst);
+    assert!(catalog.sync_parts(T, vec![], 49 * 3600000, &MergePolicy::default()).await.is_err());
+    let finishing = published(&provider);
+    provider.fail_retire.store(false, Ordering::SeqCst);
+    catalog.fence_installation().await.unwrap();
+    catalog.sync_parts(T, vec![], 49 * 3600000 + 1, &MergePolicy::default()).await.unwrap();
+    let after = published(&provider);
+    assert_eq!(after.len(), finishing.len() + 1);
+    assert_ne!(after.last(), finishing.last());
+}
+
+/// NAN-4798: `writer_reopen` landed but its response was lost, so its retry
+/// is refused (the platform ended the fence). The epoch can never finish:
+/// the next sync mints instead of wedging on a missing fresh proof.
+#[tokio::test]
+async fn a_lost_reopen_response_mints_on_the_next_sync_and_never_wedges() {
+    let (_dir, provider, catalog) = setup().await;
+    provider.lose_reopen_response.store(true, Ordering::SeqCst);
+    assert!(catalog.sync_parts(T, vec![], 49 * 3600000, &MergePolicy::default()).await.is_err());
+    assert!(catalog.recovery_required());
+    let before = published(&provider);
+    catalog.sync_parts(T, vec![], 49 * 3600000 + 1, &MergePolicy::default()).await.unwrap();
+    assert_eq!(published(&provider).len(), before.len() + 1);
+    assert!(provider.fence.lock().unwrap().is_none());
+    assert!(!catalog.recovery_required());
+}
+
+#[tokio::test]
+async fn an_epoch_with_incompatible_field_ids_is_replaced_before_retirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Provider::default());
+    let catalog = fresh_install(dir.path(), &provider);
+    catalog.fence_installation().await.unwrap();
+    let parts = live_set(8);
+    let pending = cut_epoch_build(&provider, &catalog, &parts).await;
+    table(&provider, &pending).fail_seed_schema.store(true, Ordering::SeqCst);
+    let error = catalog.sync_parts(T, parts.clone(), LIVE_NOW + 2, &MergePolicy::default()).await.unwrap_err();
+    assert!(error.downcast_ref::<super::super::super::SeedSchemaMismatch>().is_some(), "{error:#}");
+    assert!(provider.registry.lock().unwrap().is_none());
+    assert!(retired(&provider).is_empty(), "old metadata stays fenced until a replacement is published");
+    converge(&catalog, &parts, 8).await;
+    let fresh = provider.registry.lock().unwrap().clone().unwrap();
+    assert_ne!(fresh, format!("agent.{pending}_v1"));
+    let trace = trace(&provider);
+    let publish = trace.iter().position(|event| event == &format!("publish:{fresh}")).unwrap();
+    let retire = trace.iter().position(|event| event == &format!("retire:{pending}")).unwrap();
+    assert!(publish < retire, "{trace:?}");
+    assert_eq!(table(&provider, &epoch(&fresh)).calls.load(Ordering::SeqCst), 0, "no part replay");
+    assert_eq!(table(&provider, &epoch(&fresh)).seeds.load(Ordering::SeqCst), 1);
 }

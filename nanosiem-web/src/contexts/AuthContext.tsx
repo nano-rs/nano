@@ -46,6 +46,7 @@ import {
 import {
   canonicalTenantSlug,
   loginRequestBody,
+  rememberActiveTenant,
   safeReturnPath,
   tenantContinuationBody,
   tenantSlugForAuthContinuation,
@@ -334,6 +335,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const authenticatedState = useCallback((user: User, expectedTenantSlug?: string): AuthState => {
     const verified = verifyServerAuthIdentity(user, expectedTenantSlug);
+    // NAN-4800: remember the tenant so a tenant-less deep link on this
+    // pooled host can be sent back under `/t/<tenant>` (a hint, never authority).
+    if (verified.activeTenant) rememberActiveTenant(verified.activeTenant.slug);
     const scope = authenticatedRuntimeScope({
       userId: user.id,
       roles: user.roles,

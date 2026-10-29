@@ -620,3 +620,16 @@ async fn production_rest_commit_state_needs_an_absent_or_snapshotless_table() {
         assert!(backend.no_committed_snapshot().await.is_err(), "{status} is not absence");
     }
 }
+
+/// NAN-4798: classify real REST responses through the production client's
+/// value-free lifecycle errors, rather than a mocked ControlRefused marker.
+#[tokio::test]
+async fn production_rest_transport_statuses_remain_retryable_after_redaction() {
+    let (_dir, _server, backend, state) = setup().await;
+    for status in [403, 408, 429, 500, 502, 503, 504] {
+        state.lock().unwrap().table_status = Some(status);
+        let error = backend.no_committed_snapshot().await.unwrap_err();
+        assert_eq!(super::super::control_retry::is_transient(&error),
+            matches!(status, 408 | 429 | 502 | 503 | 504), "HTTP {status}: {error:#}");
+    }
+}

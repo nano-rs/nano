@@ -264,11 +264,23 @@ fn validate_token(token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Value-free HTTP status retained for callers that retry transport failures.
+#[derive(Debug, thiserror::Error)]
+#[error("{operation} failed with HTTP {status}")]
+pub(crate) struct RestHttpStatus {
+    pub(crate) status: u16,
+    operation: String,
+}
+
 async fn response_error(response: reqwest::Response, operation: &str) -> anyhow::Error {
     let status = response.status();
     // Catalog/OAuth error bodies can echo credentials and need not be bounded.
     // Preserve only operation/status; never buffer or log a remote error body.
-    anyhow::anyhow!("{operation} failed with HTTP {status}")
+    RestHttpStatus {
+        status: status.as_u16(),
+        operation: operation.to_owned(),
+    }
+    .into()
 }
 
 #[cfg(test)]
@@ -360,6 +372,36 @@ mod tests {
         assert_eq!(bodies.len(), 1);
         assert_eq!(bodies[0]["identifier"]["name"], "events");
         assert_eq!(bodies[0]["requirements"][0]["type"], "assert-table-uuid");
+    }
+
+    #[tokio::test]
+    async fn retryable_http_statuses_survive_value_free_errors() {
+        for status in [403, 408, 429, 500, 502, 503, 504] {
+            let app = Router::new().route(
+                "/",
+                get(move || async move {
+                    (
+                        StatusCode::from_u16(status).unwrap(),
+                        "fixture-only-sensitive-marker",
+                    )
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let response = Client::new()
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .unwrap();
+            let error = response_error(response, "commit table").await;
+            assert_eq!(
+                crate::part_ingest::iceberg_export::control_retry::is_transient(&error),
+                matches!(status, 408 | 429 | 502 | 503 | 504)
+            );
+            assert!(!format!("{error:#}").contains("fixture-only-sensitive-marker"));
+            server.abort();
+        }
     }
 
     #[tokio::test]

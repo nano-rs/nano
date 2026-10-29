@@ -24,7 +24,7 @@ import {
   type ChangeEvent,
   type ReactNode,
 } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
@@ -74,6 +74,7 @@ import type {
   VrlDiagnostic,
 } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { describeSampleSplit, detectWrappedLines, joinWrappedLines, parserDraftStage } from '@/lib/sample-wrap';
 import { VrlEditor } from '@/components/editor/VrlEditor';
 import { useSharedTenant } from '@/hooks/use-shared-tenant';
 import type { TenantIngestEndpoint, TenantParserRollout } from '@/lib/api/types';
@@ -83,9 +84,12 @@ import {
   INGEST_CREDENTIALS_QUERY_KEY,
   INGEST_ENDPOINT_QUERY_KEY,
   PROTOCOL_LABEL,
+  ADD_DATA_COLLECTOR_PARAM,
   ADD_DATA_SOURCE_PARAM,
   addDataSources,
+  issueStepSearch,
   preselectedAddDataSource,
+  preselectedCollectorSources,
   type AddDataSource,
 } from '@/lib/add-data-sources';
 import { describeIngestCredentialError } from '@/lib/ingest-credential-errors';
@@ -318,7 +322,6 @@ export function AddFeed() {
   const [sampleText, setSampleText] = useState('');
   const [vrl, setVrl] = useState('');
   const [genState, setGenState] = useState<'idle' | 'streaming' | 'done' | 'error'>('idle');
-  const [genProgress, setGenProgress] = useState(0);
   const [genStatus, setGenStatus] = useState<string>('');
   const genControllerRef = useRef<AbortController | null>(null);
   const [timezone, setTimezone] = useState('UTC');
@@ -382,20 +385,64 @@ export function AddFeed() {
   // Sources platform rows) preselects that source as a direct credential and
   // opens the Issue step. Applied once, after the source list has loaded; an
   // unknown slug leaves the wizard on Step 1.
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const requestedSource = shared ? searchParams.get(ADD_DATA_SOURCE_PARAM) : null;
+  // NAN-4800: `?sources=a,b` resumes a collector credential's Issue step.
+  const requestedCollector = shared ? searchParams.get(ADD_DATA_COLLECTOR_PARAM) : null;
   const deepLinkApplied = useRef(false);
   useEffect(() => {
-    if (deepLinkApplied.current || !requestedSource) return;
+    if (deepLinkApplied.current || (!requestedSource && !requestedCollector)) return;
     if (endpointQuery.isLoading || registryQuery.isLoading) return;
     deepLinkApplied.current = true;
+    if (requestedCollector && collectorsEnabled) {
+      const picked = preselectedCollectorSources(addSources, requestedCollector);
+      if (picked.length > 0) {
+        setArrival('collector');
+        setSelectedSlugs(picked.map((s) => s.slug));
+        setActiveStep(4);
+        return;
+      }
+    }
     const target = preselectedAddDataSource(addSources, requestedSource);
     if (!target) return;
     setArrival('direct');
     setSharedMode('existing');
     setSelectedSlug(target.slug);
     setActiveStep(4);
-  }, [requestedSource, addSources, endpointQuery.isLoading, registryQuery.isLoading]);
+  }, [requestedSource, requestedCollector, collectorsEnabled, addSources, endpointQuery.isLoading, registryQuery.isLoading]);
+
+  // NAN-4800: keep the Issue step addressable. Wizard state lives in memory,
+  // so a reload, Back from Log Sources → Credentials or a re-login restarted
+  // at Step 1 and a just-activated custom source looked like it had to be
+  // built again (samples, VRL, activation). Writing `?source=` / `?sources=`
+  // (replace, no history entry) lets the deep link above resume at Issue.
+  const issueResume = shared && activeStep === 4
+    ? issueStepSearch(collectorArrival ? { collectorSlugs: selectedSlugs } : { sourceSlug: issueTarget?.slug })
+    : null;
+  const resumeSource = issueResume?.[ADD_DATA_SOURCE_PARAM] ?? null;
+  const resumeCollector = issueResume?.[ADD_DATA_COLLECTOR_PARAM] ?? null;
+  useEffect(() => {
+    if (!shared) return;
+    if (activeStep === 4) {
+      if (!resumeSource && !resumeCollector) return;
+      // Once written, the address is ours: never re-apply it as a deep link.
+      deepLinkApplied.current = true;
+    } else if (!deepLinkApplied.current) {
+      // A pending deep link (still loading) must not be cleared from under it.
+      return;
+    }
+    const currentSource = searchParams.get(ADD_DATA_SOURCE_PARAM);
+    const currentCollector = searchParams.get(ADD_DATA_COLLECTOR_PARAM);
+    if (currentSource === resumeSource && currentCollector === resumeCollector) return;
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete(ADD_DATA_SOURCE_PARAM);
+      next.delete(ADD_DATA_COLLECTOR_PARAM);
+      if (resumeSource) next.set(ADD_DATA_SOURCE_PARAM, resumeSource);
+      if (resumeCollector) next.set(ADD_DATA_COLLECTOR_PARAM, resumeCollector);
+      return next;
+    }, { replace: true });
+  }, [shared, activeStep, resumeSource, resumeCollector, searchParams, setSearchParams]);
   const [railCollapsed, setRailCollapsed] = useState<boolean>(() => {
     try {
       return localStorage.getItem(RAIL_COLLAPSED_KEY) === '1';
@@ -668,7 +715,6 @@ export function AddFeed() {
     const controller = new AbortController();
     genControllerRef.current = controller;
     setGenState('streaming');
-    setGenProgress(5);
     setGenStatus('Starting pivt…');
 
     // NOTE: don't send `feed_id` — it must be a TypeID like `feed_<base32>` and
@@ -692,9 +738,9 @@ export function AddFeed() {
           maxWaitMs: PARSER_JOB_MAX_WAIT_MS,
           onProgress: (message, elapsedMs) => {
             if (controller.signal.aborted) return;
-            // Progress creeps toward 90 % while the job runs; the job reports
-            // its own stage text, plus how long it has been working.
-            setGenProgress((p) => Math.min(90, p + 1));
+            // NAN-4792: no percentage (the old one was a per-poll creep to
+            // 90 %, not a measure). Show the job's own stage text plus how
+            // long it has been working.
             const stage = message && message !== 'Working...' ? message : 'Drafting parser…';
             setGenStatus(`${stage} · ${formatElapsed(elapsedMs)}`);
           },
@@ -706,7 +752,6 @@ export function AddFeed() {
         throw new Error('pivt finished without a parser. Retry, or paste a different sample.');
       }
       setVrl(parser.vrl_code);
-      setGenProgress(100);
       const remaining = parser.validation_result?.valid === false ? parser.validation_result.errors.length : 0;
       if (remaining > 0) {
         // NAN-4753: keep the draft for review, but never present a parser
@@ -726,7 +771,6 @@ export function AddFeed() {
         'pivt could not draft the parser. Retry in a moment.',
       );
       setGenState('error');
-      setGenProgress(0);
       setGenStatus(message);
       toast({ title: 'pivt could not draft the parser', description: message, variant: 'destructive' });
     } finally {
@@ -1295,7 +1339,6 @@ export function AddFeed() {
               vrl={vrl}
               setVrl={setVrl}
               genState={genState}
-              genProgress={genProgress}
               genStatus={genStatus}
               onRegenerate={handleRegenerate}
               onValidate={() => runValidate(true)}
@@ -1955,12 +1998,12 @@ function Step1Identify({
               <div className="text-[11px] text-muted-foreground mt-1 leading-relaxed">
                 You need at least one ingestion transport (HTTP, Kafka, S3, …) before you can route logs to a feed.
               </div>
-              <a
-                href="/ingestion/source-configurations"
+              <Link
+                to="/ingestion/source-configurations"
                 className="inline-flex items-center gap-1 mt-2 text-[11.5px] text-primary hover:underline"
               >
                 Create a source configuration <ArrowRight className="w-3 h-3" />
-              </a>
+              </Link>
             </div>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
@@ -2445,7 +2488,6 @@ type Step2Props = {
   vrl: string;
   setVrl: (v: string) => void;
   genState: 'idle' | 'streaming' | 'done' | 'error';
-  genProgress: number;
   genStatus: string;
   onRegenerate: () => void;
   onValidate: () => Promise<boolean>;
@@ -2481,7 +2523,6 @@ function Step2Parse(props: Step2Props) {
     vrl,
     setVrl,
     genState,
-    genProgress,
     genStatus,
     onRegenerate,
     onValidate,
@@ -2612,7 +2653,6 @@ function Step2Parse(props: Step2Props) {
             vrl={vrl}
             setVrl={setVrl}
             genState={genState}
-            genProgress={genProgress}
             genStatus={genStatus}
             onRegenerate={onRegenerate}
             onValidate={onValidate}
@@ -2677,7 +2717,7 @@ function SegmentedPath({
 // ==================================================================
 // SamplesPaste
 // ==================================================================
-function SamplesPaste({
+export function SamplesPaste({
   sampleText,
   setSampleText,
   sampleCount,
@@ -2688,6 +2728,7 @@ function SamplesPaste({
 }) {
   const { toast } = useToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const wrap = useMemo(() => detectWrappedLines(sampleText), [sampleText]);
   const handleUpload = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -2737,6 +2778,36 @@ function SamplesPaste({
         placeholder={'{"timestamp":"2026-04-26T14:21:08Z","event_type":"login",...}\n<134>Apr 26 14:21:08 host sshd[1234]: Accepted password for ...'}
         className="flex-1 bg-transparent px-3 py-2 font-mono text-[11px] leading-[1.55] text-foreground placeholder:text-muted-foreground/60 focus:outline-none resize-none scrollbar-thin"
       />
+      {/* NAN-4792: say how the paste was split, and flag terminal-wrapped
+          lines (each line is sent as its own event). Suggest only. */}
+      <div className="shrink-0 flex items-center gap-2 px-3 py-1 border-t border-border">
+        <span className="text-[10.5px] font-mono text-muted-foreground tabular-nums" data-testid="sample-split">
+          {describeSampleSplit(sampleText, sampleCount)}
+        </span>
+      </div>
+      {wrap.continuations.length > 0 && (
+        <div
+          role="status"
+          className="shrink-0 border-t border-warning-border bg-warning-muted px-3 py-1.5 flex items-center gap-2"
+        >
+          <AlertTriangle className="w-3 h-3 text-warning shrink-0" strokeWidth={1.5} />
+          <span className="text-[11px] text-foreground/80 min-w-0 flex-1">
+            <span className="font-mono tabular-nums">
+              {wrap.continuations.length} of {wrap.lineCount}
+            </span>{' '}
+            lines look like wrapped continuations of the previous line.
+          </span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-6 text-[10.5px]"
+            onClick={() => setSampleText(joinWrappedLines(sampleText, wrap))}
+          >
+            Join wrapped lines
+          </Button>
+        </div>
+      )}
       <div className="shrink-0 flex items-center gap-2 px-3 py-1.5 border-t border-border text-[10px] font-mono text-muted-foreground/60">
         <Info className="w-2.5 h-2.5" />
         <span>Paste 5–10 representative events. JSON arrays auto-split.</span>
@@ -2973,7 +3044,6 @@ type VrlPanelProps = {
   vrl: string;
   setVrl: (v: string) => void;
   genState: 'idle' | 'streaming' | 'done' | 'error';
-  genProgress: number;
   genStatus: string;
   onRegenerate: () => void;
   onValidate: () => Promise<boolean>;
@@ -2997,7 +3067,6 @@ export function VrlPanel(props: VrlPanelProps) {
     vrl,
     setVrl,
     genState,
-    genProgress,
     genStatus,
     onRegenerate,
     onValidate,
@@ -3093,16 +3162,16 @@ export function VrlPanel(props: VrlPanelProps) {
       {/* Generation progress */}
       {genState === 'streaming' && (
         <div className="shrink-0 border-b border-border bg-primary/[0.04] px-3 py-2">
-          <div className="flex items-center gap-2 mb-1.5">
+          <div className="flex items-center gap-2">
             <Sparkles className="w-3 h-3 text-primary animate-pulse" />
             <span className="text-[11px] text-foreground">pivt is drafting VRL from your samples…</span>
             <div className="flex-1" />
-            <span className="text-[10.5px] font-mono text-muted-foreground tabular-nums">{Math.floor(genProgress)}%</span>
+            {/* NAN-4792: the stage, not a made-up percentage. */}
+            <span className="text-[10.5px] font-mono text-muted-foreground" data-testid="draft-stage">
+              {parserDraftStage(genStatus)}
+            </span>
           </div>
-          <div className="h-1 rounded-full bg-card overflow-hidden">
-            <div className="h-full bg-primary transition-all duration-150" style={{ width: `${genProgress}%` }} />
-          </div>
-          <div className="text-[10px] font-mono text-muted-foreground/60 mt-1.5">{genStatus}</div>
+          <div className="text-[10px] font-mono text-muted-foreground/60 mt-1">{genStatus}</div>
         </div>
       )}
 
@@ -3799,7 +3868,8 @@ function Step4Issue({
         <>
           <span className="text-[10.5px] text-muted-foreground/70">
             The token is sealed to this browser and shown once. Manage and revoke credentials under{' '}
-            <a href={INGEST_CREDENTIALS_PATH} className="text-primary hover:underline">Log Sources → Credentials</a>.
+            {/* NAN-4800: a router Link keeps the /t/<tenant> prefix; a new tab keeps this wizard (and its one-time token reveal) intact. */}
+            <Link to={INGEST_CREDENTIALS_PATH} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">Log Sources → Credentials</Link>.
           </span>
         </>
       }

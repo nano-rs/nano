@@ -27,7 +27,7 @@ pub const MAX_INDEX_ENTRIES: usize = 256;
 /// Leave time for the writer's completion receipt to reach control.
 pub const INDEX_SETTLE_MS: i64 = 60_000;
 /// Control's completion receipt acceptance window.
-const RECEIPT_WINDOW_MS: i64 = 5 * 60_000;
+pub(crate) const RECEIPT_WINDOW_MS: i64 = 5 * 60_000;
 
 /// NAN-3810: the `receipted_through` watermark [`sync_index`] admits young
 /// entries under, fed by the tenant's single part-log writer in the same
@@ -196,13 +196,13 @@ impl AdoptedClaim {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexEntry {
     pub seq: u64,
     pub entry_base64: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexRequest {
     pub request_id: String,
     pub tenant_uuid: String,
@@ -620,10 +620,25 @@ async fn sync_index_inner(
         let mut request = IndexRequest { entries, adopted, checkpoint: claim, ..status_read(tenant_uuid) };
         let mut answer = call_retrying(client, &request).await;
         if matches!(&answer, Call::Stop(IndexSyncOutcome::Refused(code)) if code == "lake_part_index_receipt_missing") {
+            // A young entry's completion may still be in flight. Keep the
+            // actual indexed prefix and use the executor's bounded settling
+            // retries, just like the age gate above. Treating this as BackOff
+            // ended the GC task and delayed retries by 20 min .. 6 h after a
+            // restart, even once the writer's receipt reached control.
+            // This is never caught-up success: no permit may be requested.
+            let pending = || {
+                tracing::debug!(first_seq = ?request.entries.first().map(|entry| entry.seq),
+                    last_seq = ?request.entries.last().map(|entry| entry.seq),
+                    "part-log writer receipt pending; retrying settlement");
+                IndexSyncOutcome::Synced {
+                    status: status.clone(), caught_up: false, pushed, gap_recoveries,
+                    head_appended_ms, settling: true,
+                }
+            };
             if let Some((seq, _, appended_ms, _)) = batch_meta.last() {
                 if now_ms.saturating_sub(*appended_ms) < RECEIPT_WINDOW_MS {
                     if request.entries.len() == 1 {
-                        return Ok(IndexSyncOutcome::BackOff("lake_part_index_receipt_pending".into()));
+                        return Ok(pending());
                     }
                     // Refused batches are atomic. Retry a strictly shorter prefix once,
                     // keeping adopt claims and the checkpoint within that prefix.
@@ -631,7 +646,7 @@ async fn sync_index_inner(
                         now_ms.saturating_sub(*ms) <= INDEX_SETTLE_MS)
                         .unwrap_or(request.entries.len() - 1);
                     if keep == 0 {
-                        return Ok(IndexSyncOutcome::BackOff("lake_part_index_receipt_pending".into()));
+                        return Ok(pending());
                     }
                     request.request_id = uuid::Uuid::new_v4().to_string();
                     request.entries.truncate(keep);
@@ -647,7 +662,9 @@ async fn sync_index_inner(
                     if matches!(&answer, Call::Stop(IndexSyncOutcome::Refused(code)) if code == "lake_part_index_receipt_missing")
                         && now_ms.saturating_sub(*ms) < RECEIPT_WINDOW_MS
                     {
-                        answer = Call::Stop(IndexSyncOutcome::BackOff("lake_part_index_receipt_pending".into()));
+                        return Ok(IndexSyncOutcome::Synced {
+                            status, caught_up: false, pushed, gap_recoveries, head_appended_ms, settling: true,
+                        });
                     }
                 } else {
                     tracing::error!(newest_seq = seq, "part-log batch still has a missing writer receipt beyond the receipt window");
@@ -998,7 +1015,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn receipt_missing_on_young_tail_publishes_prefix_and_backs_off() {
+    async fn receipt_missing_on_young_tail_keeps_prefix_progress_and_settles() {
         for age in [5_000, INDEX_SETTLE_MS + 1] {
             let (mut reader, now) = tail_reader(age);
             reader.checkpoint = Some(CheckpointClaim {
@@ -1013,7 +1030,10 @@ pub(crate) mod tests {
             assert_eq!(index.calls.lock().unwrap()[2], (vec![0, 1, 2, 3, 4], None));
             assert_eq!(*index.checkpoint_seq.lock().unwrap(), None);
             let single = sync_index(&index, &reader, TENANT_UUID, now, watermark).await.unwrap();
-            assert_eq!(single, IndexSyncOutcome::BackOff("lake_part_index_receipt_pending".into()));
+            assert!(matches!(single, IndexSyncOutcome::Synced {
+                status: IndexStatus { indexed_through_seq: Some(4), .. },
+                caught_up: false, pushed: 0, settling: true, ..
+            }));
         }
     }
 

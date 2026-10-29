@@ -15,6 +15,7 @@ import { SourceOnboardingApi } from './source-onboarding';
 import { getServiceUrl, API_BASE_URL } from './utils';
 import { sessionCredentials } from '../session-credentials';
 import { authenticatedFetch } from '../authenticated-fetch';
+import { tenantAppHref } from '../tenant-auth-shell';
 import { getAccessToken as getInMemoryToken } from '../auth-token';
 import { AuthApi } from './auth';
 import { SearchApi } from './search';
@@ -514,7 +515,7 @@ class ApiClient {
 
         // Handle IP_DENIED — redirect to deny page instead of login
         if (error.code === 'IP_DENIED' && typeof window !== 'undefined') {
-          window.location.href = '/denied';
+          window.location.href = tenantAppHref('/denied');
           // Throw to halt further execution
           throw new ApiClientError(error.message ?? 'Access denied', 'IP_DENIED');
         }

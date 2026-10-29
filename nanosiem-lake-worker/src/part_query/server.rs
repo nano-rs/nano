@@ -1810,7 +1810,9 @@ impl QueryService {
                 // NAN-4591: background maintenance; its reads yield to
                 // searches (a saturated cache fails the pass, retried later).
                 let pass = crate::reader_object_cache::background_maintenance(async {
-                    self.engine.refresh().await?;
+                    // NAN-4799: the background log refresher keeps the view
+                    // current; no forced part-log read every 5 s pass.
+                    self.engine.refresh_for_request().await?;
                     super::identity::backfill_once(&self.engine, &self.state_dir, chrono::Utc::now().timestamp_micros(),
                         super::identity::BACKFILL_PARTS_PER_TICK, Some(slot)).await
                 });
@@ -1858,7 +1860,7 @@ impl QueryService {
                     super::entity_index::merge_once(&self.engine, &self.state_dir, chrono::Utc::now().timestamp_micros()).await
                 };
                 wait = match pass.await {
-                    Ok(report) if report.built && report.tail >= super::entity_index::MAX_TAIL_FILES => super::entity_index::BUSY_POLL,
+                    Ok(report) if report.built && report.tail > 0 => super::entity_index::BUSY_POLL,
                     Ok(_) => super::entity_index::INTERVAL,
                     Err(error) => {
                         tracing::warn!(error = %error, "window entity index pass failed; selections use per-file evidence");

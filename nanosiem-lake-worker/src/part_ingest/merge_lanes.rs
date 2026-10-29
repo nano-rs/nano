@@ -178,6 +178,9 @@ pub const HISTORY_MEMORY_CEILING: f64 = 0.80;
 pub struct MemorySnapshot {
     pub working_set_bytes: Option<u64>,
     pub limit_bytes: Option<u64>,
+    /// NAN-4796: this process's own cgroup `memory.max` alone (the kernel's
+    /// OOM boundary), without the assignment's sizing cap.
+    pub cgroup_limit_bytes: Option<u64>,
 }
 
 impl MemorySnapshot {
@@ -186,19 +189,28 @@ impl MemorySnapshot {
     }
 
     fn read_for(guard: bool) -> Self {
-        Self::read_from(std::path::Path::new("/sys/fs/cgroup"),
-            &std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default(),
+        Self::read_cgroup(crate::cgroup_memory::for_process(),
             super::merge::memory_cap_bytes(), guard,
             || std::fs::read_to_string("/proc/self/status").ok())
     }
 
+    #[cfg(test)]
     fn read_from(root: &std::path::Path, membership: &str, assignment_cap: Option<u64>, guard: bool,
         status: impl FnOnce() -> Option<String>) -> Self {
-        let read = |path: &std::path::Path| std::fs::read_to_string(path).ok();
+        Self::read_cgroup(crate::cgroup_memory::resolve(root, membership, "", None),
+            assignment_cap, guard, status)
+    }
+
+    fn read_cgroup(cgroup: crate::cgroup_memory::MemoryCgroup, assignment_cap: Option<u64>, guard: bool,
+        status: impl FnOnce() -> Option<String>) -> Self {
+        let read = |path: &std::path::Path| cgroup.read(path);
         let number = |s: Option<String>| s.and_then(|s| s.trim().parse::<u64>().ok());
-        let (dir, v1) = own_cgroup_dir(root, membership);
-        let cgroup_limit = number(read(&dir.join(if v1 { "memory.limit_in_bytes" } else { "memory.max" })))
-            .filter(|limit| *limit > 0 && *limit < (1_u64 << 60));
+        let limit = cgroup.limit();
+        let cgroup_limit = limit.as_ref().map(|limit| limit.bytes);
+        // Pair an ancestor's ceiling with its usage, which includes sibling
+        // charges. Leaf usage against a parent's limit would undercount.
+        let dir = limit.as_ref().and_then(|limit| limit.path.parent()).unwrap_or(&cgroup.dir);
+        let v1 = cgroup.v1;
         let limit_bytes = match (cgroup_limit, assignment_cap) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -241,37 +253,41 @@ impl MemorySnapshot {
         Self {
             working_set_bytes,
             limit_bytes,
+            cgroup_limit_bytes: cgroup_limit,
         }
     }
-}
-
-/// This process's own cgroup directory. The cell puts each role in a leaf
-/// cgroup (ingest[T]); without a cgroup namespace /sys/fs/cgroup is the
-/// pod's, so resolve our own (read each time: the supervisor may move a
-/// stray process into its leaf).
-fn own_cgroup_dir(root: &std::path::Path, membership: &str) -> (std::path::PathBuf, bool) {
-    // A hybrid host can expose a unified hierarchy while memory is v1.
-    for line in membership.lines() {
-        let mut fields = line.splitn(3, ':');
-        let (_, Some(controllers), Some(path)) = (fields.next(), fields.next(), fields.next()) else { continue };
-        if controllers.split(',').any(|controller| controller == "memory") {
-            return (root.join("memory").join(path.trim().trim_start_matches('/')), true);
-        }
-    }
-    if let Some(path) = membership.lines().find_map(|line| line.strip_prefix("0::")) {
-        return (root.join(path.trim().trim_start_matches('/')), false);
-    }
-    (root.to_path_buf(), false)
 }
 
 /// NAN-4755: (unreclaimable bytes in use, `memory.max`) of this process's
 /// cgroup, for the merge memory guard: usage minus clean reclaimable file
 /// cache. Shmem, dirty/writeback and unevictable pages remain charged.
-/// `None` without a cgroup limit (lab, tests).
+/// `None` without any limit (lab, tests).
 pub fn cgroup_memory() -> Option<(u64, u64)> {
-    let memory = MemorySnapshot::read_for(true);
-    let limit = memory.limit_bytes?;
+    guard_view(MemorySnapshot::read_for(true))
+}
+
+/// NAN-4796: the guard's (in use, limit) view of a snapshot. The limit is
+/// the OOM boundary: the own cgroup's `memory.max`
+/// ([`guard_limit`]), not the lower of it and the assignment's sizing cap
+/// that the concurrency gate uses.
+pub fn guard_view(memory: MemorySnapshot) -> Option<(u64, u64)> {
+    let limit = guard_limit(memory.cgroup_limit_bytes, memory.limit_bytes)?;
     Some((memory.working_set_bytes.unwrap_or(limit), limit))
+}
+
+/// NAN-4796: the limit the merge memory guard and the history start gate
+/// measure against: the role cgroup's own `memory.max` (where the kernel
+/// OOM-kills), else the assignment's memory cap (no cgroup limit: lab,
+/// watchdog-only cells).
+///
+/// The assignment cap is a SIZING figure, not a limit: for a low-eps
+/// tenant it is 40 % of the eps curve's tenant limit (FP cell-us-1, ops
+/// tenant: 1.37 GB beside a 3.41 GB role `memory.max`). Ingest's steady
+/// unreclaimable memory alone sat at ~85 % of it, so the NAN-4755 guard
+/// stopped every merge regardless of its size, and no smaller shape or
+/// fan-in could ever fit: the hour backlog only grew.
+pub fn guard_limit(cgroup_limit: Option<u64>, assignment_cap: Option<u64>) -> Option<u64> {
+    cgroup_limit.or(assignment_cap)
 }
 
 /// Whether one more history merge fits. No cgroup limit (lab, tests): there
@@ -326,6 +342,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nan4810_namespaced_guard_reads_the_supervisors_assigned_leaf() {
+        let root = tempfile::tempdir().unwrap();
+        let role = std::path::Path::new("tenants/s7/ingest");
+        let leaf = root.path().join(role);
+        std::fs::create_dir_all(&leaf).unwrap();
+        // The inherited mount root is the cell's, not this role's. The
+        // namespace makes /proc/self/cgroup say / without remounting it.
+        std::fs::write(root.path().join("memory.max"), "16000000000\n").unwrap();
+        std::fs::write(leaf.join("memory.max"), "3413114880\n").unwrap();
+        std::fs::write(leaf.join("memory.current"), "1183709312\n").unwrap();
+        let cg = crate::cgroup_memory::resolve(root.path(), "0::/\n", "", Some(role));
+        let memory = MemorySnapshot::read_cgroup(cg, Some(1_365_245_952), true, || None);
+        let (used, limit) = guard_view(memory).unwrap();
+        assert_eq!((used, limit), (1_183_709_312, 3_413_114_880));
+        assert!((used as f64) < super::super::merge_quota::MERGE_START_SHARE * limit as f64);
+    }
+
+    #[test]
+    fn nan4810_memory_guard_inherits_a_finite_ancestor_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("tenants/s0");
+        let leaf = parent.join("ingest");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(leaf.join("memory.max"), "max\n").unwrap();
+        std::fs::write(leaf.join("memory.current"), "600000000\n").unwrap();
+        std::fs::write(parent.join("memory.max"), "3413114880\n").unwrap();
+        std::fs::write(parent.join("memory.current"), "1613709312\n").unwrap();
+        std::fs::write(parent.join("memory.stat"), "file 430000000\n").unwrap();
+        let memory = MemorySnapshot::read_from(root.path(), "0::/tenants/s0/ingest\n",
+            Some(1_365_245_952), true, || None);
+        assert_eq!(guard_view(memory), Some((1_183_709_312, 3_413_114_880)));
+    }
+
+    #[test]
     fn memory_reads_the_own_leaf_on_both_cgroup_versions() {
         for v1 in [false, true] {
             let root = tempfile::tempdir().unwrap();
@@ -358,6 +408,34 @@ mod tests {
             assert_eq!(unreadable.working_set_bytes, None);
             assert!(!history_memory_admits(unreadable));
         }
+    }
+
+    /// NAN-4796 (FP cell-us-1, ops tenant): the role's `memory.max` is
+    /// 3.41 GB, the assignment's sizing cap 1.37 GB (40 % of the eps
+    /// curve), and ingest's steady unreclaimable memory ~1.18 GB. The
+    /// guard must measure against the OOM boundary: 1.18 GB is 35 % of it,
+    /// not 86 % of the sizing cap (where every merge was stopped). The
+    /// NAN-3187 concurrency gate keeps the lower of the two.
+    #[test]
+    fn the_guard_measures_the_role_memory_max_not_the_sizing_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let leaf = root.path().join("tenant/ingest");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(leaf.join("memory.max"), "3413114880\n").unwrap();
+        std::fs::write(leaf.join("memory.current"), "1613709312\n").unwrap();
+        std::fs::write(leaf.join("memory.stat"), "file 430000000\nshmem 0\nfile_dirty 0\nfile_writeback 0\nunevictable 0\ninactive_file 300000000\n").unwrap();
+        let cap = Some(1_365_245_952);
+        let guarded = MemorySnapshot::read_from(root.path(), "0::/tenant/ingest\n", cap, true, || None);
+        assert_eq!(guarded.limit_bytes, cap, "concurrency sizing keeps the lower figure");
+        assert_eq!(guarded.cgroup_limit_bytes, Some(3_413_114_880));
+        let (used, limit) = guard_view(guarded).unwrap();
+        assert_eq!((used, limit), (1_183_709_312, 3_413_114_880));
+        assert!((used as f64) < limit as f64 * super::super::merge_quota::MERGE_START_SHARE, "a merge may start");
+        // Before NAN-4796 the guard read min(memory.max, cap): already past 85 %.
+        assert!(used as f64 >= cap.unwrap() as f64 * super::super::merge_quota::MEMORY_GUARD_SHARE);
+        // Without a cgroup limit the cap is all there is.
+        assert_eq!(guard_limit(None, cap), cap);
+        assert_eq!(guard_limit(None, None), None);
     }
 
     #[test]
@@ -702,6 +780,7 @@ mod tests {
         let at = |working_set| MemorySnapshot {
             working_set_bytes: Some(working_set),
             limit_bytes: Some(limit),
+            cgroup_limit_bytes: Some(limit),
         };
         // The catch-up peak (6.1 GB) leaves no room for another merge...
         assert!(!history_memory_admits(at(6_100_000_000)));
@@ -709,11 +788,13 @@ mod tests {
         assert!(history_memory_admits(at(4 * GIB)));
         assert!(!history_memory_admits(MemorySnapshot {
             working_set_bytes: None,
-            limit_bytes: Some(limit)
+            limit_bytes: Some(limit),
+            cgroup_limit_bytes: Some(limit),
         }));
         assert!(history_memory_admits(MemorySnapshot {
             working_set_bytes: None,
-            limit_bytes: None
+            limit_bytes: None,
+            cgroup_limit_bytes: None,
         }));
     }
 

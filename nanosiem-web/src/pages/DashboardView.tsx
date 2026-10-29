@@ -53,6 +53,7 @@ import { cn } from '@/lib/utils';
 import type { Dashboard, PanelConfig, LayoutItem, DashboardShareResult, UpdateDashboardRequest, TimeRange, SerializedTimeRange } from '@/lib/api';
 import { api } from '@/lib/api';
 import { isDashboardConflictError } from '@/lib/api/dashboards';
+import { tenantAppHref } from '@/lib/tenant-auth-shell';
 
 type AutoRefreshInterval = '30s' | '1m' | '5m' | '15m' | 'off';
 
@@ -226,7 +227,8 @@ export function DashboardView() {
 
   // Handle share - copy URL to clipboard
   const handleShare = useCallback(async () => {
-    const shareUrl = `${window.location.origin}/dashboards/${id}`;
+    // NAN-4800: a shared link keeps the /t/<tenant> prefix on pooled hosts.
+    const shareUrl = `${window.location.origin}${tenantAppHref(`/dashboards/${id}`)}`;
     try {
       await navigator.clipboard.writeText(shareUrl);
       toast({

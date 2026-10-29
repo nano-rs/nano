@@ -7,6 +7,17 @@ use std::sync::{
 const TENANT: &str = "3867aaaa-0000-4000-8000-000000000001";
 const A: &str = "0000000000001-aaaaaaaaaaaaaaaa";
 const B: &str = "0000000000002-bbbbbbbbbbbbbbbb";
+std::thread_local! {
+    // A per-thread scheduling seam; every operation still uses production custody.
+    static BEFORE_BESIDE_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+pub(super) fn before_beside_snapshot() {
+    BEFORE_BESIDE_SNAPSHOT.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
 #[derive(Default)]
 struct Backend {
     trace: Mutex<Vec<&'static str>>,
@@ -21,10 +32,22 @@ struct Backend {
     fail_commit_state: AtomicBool,
     fail_inspection: AtomicBool,
     commit_state_reads: std::sync::atomic::AtomicUsize,
+    /// NAN-4783: a long sync. While set, `expire_and_inspect` (custody
+    /// held) signals `held` and waits for `release`.
+    hold_inspection: AtomicBool,
+    held: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    hold_commit: AtomicBool,
+    commit_held: tokio::sync::Notify,
+    commit_release: tokio::sync::Notify,
 }
 #[async_trait::async_trait]
 impl IcebergCommitter for Backend {
     async fn commit(&self, _: &ExportManifest) -> Result<()> {
+        if self.hold_commit.load(Ordering::SeqCst) {
+            self.commit_held.notify_one();
+            self.commit_release.notified().await;
+        }
         ensure!(!self.fail_commit.load(Ordering::SeqCst), "create table refused: InvalidLocation");
         self.never_committed.store(false, Ordering::SeqCst);
         self.trace.lock().unwrap().push("commit");
@@ -58,6 +81,10 @@ impl CatalogLifecycleBackend for Backend {
         Ok(())
     }
     async fn expire_and_inspect(&self) -> Result<BTreeSet<String>> {
+        if self.hold_inspection.load(Ordering::SeqCst) {
+            self.held.notify_one();
+            self.release.notified().await;
+        }
         self.trace.lock().unwrap().push("inspect");
         ensure!(!self.fail_inspection.load(Ordering::SeqCst), "catalog inspection unavailable");
         if self.stall_inspection.load(Ordering::SeqCst) {
@@ -509,4 +536,233 @@ async fn a_failed_inspection_on_a_committed_table_holds_every_planned_part() {
     }
     assert_strict(&catalog.fence_in_pass(TENANT, C, &pass).await.unwrap(), C);
     assert_eq!(reads(&backend), 0, "an acknowledged plan vetoes the commit-state read");
+}
+
+/// NAN-4783: a sync holds custody for its whole run (up to
+/// the 30 min hard bound). A GC fence used to wait on it for 120 s, time out
+/// as a pass-wide custody hold and back off exponentially to 6 h. Beside a
+/// running sync the fence now decides at once, without custody or provider
+/// calls, and never receipts a part the catalog still references.
+#[tokio::test]
+async fn gc_never_waits_behind_a_long_sync_and_never_receipts_a_referenced_part() {
+    let dir = tempfile::tempdir().unwrap();
+    history(dir.path()); // A and B were planned (and removed) long ago.
+    let backend = Arc::new(Backend::default());
+    let catalog = Arc::new(TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap());
+    // The catalog references A (live at this sync).
+    backend.pinned.lock().unwrap().insert(A.into());
+    sync_live(&catalog, A, 10).await;
+    // A merges away. The next (hourly) sync stalls in its catalog
+    // inspection with custody held.
+    backend.hold_inspection.store(true, Ordering::SeqCst);
+    let held = backend.held.notified();
+    let running = {
+        let catalog = catalog.clone();
+        tokio::spawn(async move { catalog.sync_parts(TENANT, vec![], 3_600_020, &MergePolicy::default()).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), held).await.expect("the sync reaches its inspection");
+    assert!(catalog.lock.try_lock().is_err(), "the sync holds custody");
+    let calls = backend.trace.lock().unwrap().len();
+    let pass = CatalogGcPass::default();
+    let started = std::time::Instant::now();
+    let within = |f| tokio::time::timeout(std::time::Duration::from_secs(10), f);
+    // A: still referenced by the catalog (the running sync is removing it).
+    // Held for this key only (`part_pinned`: skip, no back-off), never
+    // receipted, never degraded.
+    let error = within(catalog.fence_in_pass(TENANT, A, &pass)).await.expect("never waits").unwrap_err();
+    assert!(error.downcast_ref::<CatalogPinsPart>().is_some(), "{error:#}");
+    assert!(catalog.require_removed(TENANT, A).is_err(), "a referenced part is never receipted");
+    // B: planned once, absent from the inspected catalog: receipted.
+    let b = within(catalog.fence_in_pass(TENANT, B, &pass)).await.expect("never waits").unwrap();
+    assert_strict(&b, B);
+    // C: never planned: receipted.
+    within(catalog.fence_in_pass(TENANT, C, &pass)).await.expect("never waits").unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    assert_eq!(backend.trace.lock().unwrap().len(), calls, "no provider call beside a sync");
+    assert!(!dir.path().join(GC_DEGRADED).exists(), "the agent lane is not degraded");
+    // The sync converges without A; with custody free again the next
+    // pass proves A unreferenced and receipts it.
+    backend.pinned.lock().unwrap().clear();
+    backend.hold_inspection.store(false, Ordering::SeqCst);
+    backend.release.notify_one();
+    running.await.unwrap().unwrap();
+    assert_strict(&catalog.fence_in_pass(TENANT, A, &CatalogGcPass::default()).await.unwrap(), A);
+}
+
+/// NAN-4783: a GC receipt beside a sync and a commit's admission are
+/// ordered by one lock: a part a commit admitted first is held; a part GC
+/// receipted first is never committed (no resurrection of deleted files).
+#[tokio::test]
+async fn a_commit_admitted_beside_gc_is_held_and_a_gc_receipt_refuses_the_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    history(dir.path());
+    let backend = Arc::new(Backend::default());
+    let catalog = TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap();
+    sync(&catalog, 10).await;
+    let manifest = |part: &str| ExportManifest {
+        tenant_id: TENANT.into(),
+        planned_at_ms: 11,
+        previous_plan_ms: None,
+        add: vec![crate::part_ingest::export::ExportFile {
+            keys: vec![], part_id: part.into(), rows: 1, bytes: 1, min_time_us: 1, max_time_us: 1,
+        }],
+        remove_parts: vec![],
+        hours: vec![],
+    };
+    // Admitted first (A is about to be committed): GC holds it.
+    catalog.admit_adds(&manifest(A)).unwrap();
+    let error = catalog.fence_beside_sync(TENANT, A).unwrap_err();
+    assert!(error.downcast_ref::<CatalogPinsPart>().is_some(), "{error:#}");
+    assert!(catalog.require_removed(TENANT, A).is_err());
+    // Receipted first: the commit is refused before any provider call.
+    catalog.fence_beside_sync(TENANT, B).unwrap();
+    let error = catalog.admit_adds(&manifest(B)).unwrap_err();
+    assert!(format!("{error:#}").contains("resurrect"), "{error:#}");
+}
+
+/// NAN-4783: custody held by something other than a sync (another fence,
+/// the installation fence) past the wait is decided beside it: never a
+/// timeout, never a pass-wide hold.
+#[tokio::test(start_paused = true)]
+async fn custody_held_past_the_wait_is_decided_beside_it_not_timed_out() {
+    let dir = tempfile::tempdir().unwrap();
+    history(dir.path());
+    let backend = Arc::new(Backend::default());
+    let catalog = TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap();
+    sync(&catalog, 10).await;
+    let _custody = catalog.lock.lock().await;
+    let started = tokio::time::Instant::now();
+    assert_strict(&catalog.fence_in_pass(TENANT, A, &CatalogGcPass::default()).await.unwrap(), A);
+    assert!(started.elapsed() >= CUSTODY_WAIT);
+    catalog.fence_in_pass(TENANT, C, &CatalogGcPass::default()).await.unwrap();
+}
+
+/// A fence can be descheduled after its live/index checks while the current
+/// sync finishes and another sync admits a previously unplanned part. The
+/// index absence must be rechecked under the admission/receipt mutex.
+#[tokio::test]
+async fn gc_rechecks_never_planned_after_commit_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(Backend::default());
+    let catalog = Arc::new(TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap());
+    sync(&catalog, 10).await;
+    assert!(!catalog.planned_path(C).unwrap().exists());
+
+    backend.hold_inspection.store(true, Ordering::SeqCst);
+    let held = backend.held.notified();
+    let first = {
+        let catalog = catalog.clone();
+        tokio::spawn(async move { catalog.sync_parts(TENANT, vec![], 3_600_020, &MergePolicy::default()).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), held).await.unwrap();
+    let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let gc = {
+        let catalog = catalog.clone();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            BEFORE_BESIDE_SNAPSHOT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                checked_tx.send(()).unwrap();
+                resume_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            })));
+            runtime.block_on(catalog.fence_in_pass(TENANT, C, &CatalogGcPass::default()))
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), checked_rx).await.unwrap().unwrap();
+    backend.hold_inspection.store(false, Ordering::SeqCst);
+    backend.release.notify_one();
+    first.await.unwrap().unwrap();
+
+    // The next sync remembers C and admits it before entering the provider.
+    backend.hold_commit.store(true, Ordering::SeqCst);
+    let admitted = backend.commit_held.notified();
+    let second = {
+        let catalog = catalog.clone();
+        tokio::spawn(async move {
+            catalog.sync_parts(TENANT, vec![hour_part(C)], 48 * 3_600_000, &MergePolicy::default()).await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), admitted).await.unwrap();
+    assert!(catalog.planned_path(C).unwrap().exists());
+    assert!(catalog.referenced.lock().unwrap().as_ref().unwrap().contains(C));
+    resume_tx.send(()).unwrap();
+    let decision = gc.await.unwrap();
+    let receipted = catalog.require_removed(TENANT, C).is_ok();
+
+    backend.pinned.lock().unwrap().insert(C.into());
+    backend.hold_commit.store(false, Ordering::SeqCst);
+    backend.commit_release.notify_one();
+    second.await.unwrap().unwrap();
+    assert!(!receipted, "an admitted in-flight commit must never be receipted");
+    let error = decision.unwrap_err();
+    assert!(error.downcast_ref::<CatalogPinsPart>().is_some(), "{error:#}");
+}
+
+/// A fresh volume has neither a complete index nor an inspected snapshot.
+/// Its first running sync cannot prove any non-live key safe for deletion.
+#[tokio::test]
+async fn gc_beside_the_first_inspection_holds_unproven_parts_without_provider_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(Backend::default());
+    backend.pinned.lock().unwrap().insert(A.into());
+    let catalog = Arc::new(TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap());
+    backend.hold_inspection.store(true, Ordering::SeqCst);
+    let held = backend.held.notified();
+    let running = {
+        let catalog = catalog.clone();
+        tokio::spawn(async move { catalog.sync_parts(TENANT, vec![], 10, &MergePolicy::default()).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), held).await.unwrap();
+    let calls = backend.trace.lock().unwrap().len();
+    for part in [A, B, C] {
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1),
+            catalog.fence_in_pass(TENANT, part, &CatalogGcPass::default())).await.unwrap().unwrap_err();
+        assert!(error.downcast_ref::<CatalogPartUnproven>().is_some(), "{error:#}");
+        assert!(catalog.require_removed(TENANT, part).is_err());
+    }
+    assert_eq!(backend.trace.lock().unwrap().len(), calls);
+    assert!(!dir.path().join(GC_DEGRADED).exists());
+    running.abort();
+    assert!(running.await.unwrap_err().is_cancelled());
+    assert!(!catalog.sync_running().unwrap(), "cancellation unregisters the sync");
+}
+
+/// A crash may leave acknowledged removals waiting for cache invalidation.
+/// Even an inspection that finds no metadata must keep those parts pinned
+/// beside a sync until invalidation succeeds and settling issues the receipt.
+#[tokio::test]
+async fn gc_beside_sync_keeps_unsettled_removals_until_cache_invalidation() {
+    let dir = tempfile::tempdir().unwrap();
+    history(dir.path());
+    let unsettled = dir.path().join("export/unsettled");
+    std::fs::create_dir_all(&unsettled).unwrap();
+    std::fs::write(unsettled.join("0000000000001.json"),
+        serde_json::to_vec(&vec![(A, crate::parts::sha256_hex(b"unsettled A"))]).unwrap()).unwrap();
+    let backend = Arc::new(Backend::default());
+    backend.fail_cache.store(true, Ordering::SeqCst);
+    let catalog = Arc::new(TenantCatalog::new(TENANT, dir.path().into(), backend.clone()).unwrap());
+    let error = catalog.sync_parts(TENANT, vec![], 10, &MergePolicy::default()).await.unwrap_err();
+    assert!(format!("{error:#}").contains("cache unavailable"), "{error:#}");
+    assert!(backend.pinned.lock().unwrap().is_empty());
+    assert!(catalog.require_removed(TENANT, A).is_err());
+
+    backend.hold_inspection.store(true, Ordering::SeqCst);
+    let held = backend.held.notified();
+    let running = {
+        let catalog = catalog.clone();
+        tokio::spawn(async move { catalog.sync_parts(TENANT, vec![], 11, &MergePolicy::default()).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), held).await.unwrap();
+    let calls = backend.trace.lock().unwrap().len();
+    let error = catalog.fence_in_pass(TENANT, A, &CatalogGcPass::default()).await.unwrap_err();
+    assert!(error.downcast_ref::<CatalogPinsPart>().is_some(), "{error:#}");
+    assert!(catalog.require_removed(TENANT, A).is_err());
+    assert_eq!(backend.trace.lock().unwrap().len(), calls);
+    assert!(!dir.path().join(GC_DEGRADED).exists());
+    backend.fail_cache.store(false, Ordering::SeqCst);
+    backend.hold_inspection.store(false, Ordering::SeqCst);
+    backend.release.notify_one();
+    running.await.unwrap().unwrap();
+    assert_strict(&catalog.require_removed(TENANT, A).unwrap(), A);
+    assert!(catalog.unsettled().unwrap().is_empty());
 }

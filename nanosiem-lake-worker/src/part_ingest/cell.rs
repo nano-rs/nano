@@ -1249,7 +1249,7 @@ fn sanctioned_part_gc(
             tracing::info!(dir = %dir.display(), "lake-part GC keeps its folded view on the persistent hot volume");
         }
         CellSanctionedPartGc::new_guarded(
-            tenant, &signing.url, signing.ca_file.clone(), store, trusted, state_dir, view_dir,
+            tenant, &signing.url, signing.ca_file.clone(), store, trusted, state_dir, view_dir, None,
         )
     })();
     match wired {
