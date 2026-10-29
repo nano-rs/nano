@@ -228,6 +228,15 @@ fn parse_cold_heavy_concurrency(value: Option<&str>) -> usize {
     }
 }
 
+/// Reader fetches reserve at most 1/4 of role memory in 16 MiB chunks;
+/// at most two I/O fetches per CPU (32 ceiling avoids connection storms).
+/// At the 2–3.4 GiB hosted shapes this retains today's 8-fetch query reader.
+pub fn resource_limits(memory: u64, cpu_millis: u32, cache_bytes: u64) -> (u64, usize) {
+    let fetches = ((cpu_millis.div_ceil(1000) as usize).saturating_mul(2))
+        .min((memory / (64 * 1024 * 1024)).max(1) as usize).clamp(1, 32);
+    ((memory / 4).min(cache_bytes / 4).max(1), fetches)
+}
+
 /// NAN-3147: hot-window volume grant granularity for downloads.
 const HOT_WINDOW_FENCE_SLAB_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -497,7 +506,22 @@ impl ReaderObjectCacheSettings {
     /// `Ok(None)` when the mode is unset or `full` (the flag defaults off).
     /// Any other mode, or `bounded` without a valid dir/budget, is an error.
     pub fn from_env() -> Result<Option<Self>, ReaderCacheError> {
-        Self::from_lookup(|name| std::env::var(name).ok())
+        let mut settings = Self::from_lookup(|name| std::env::var(name).ok())?;
+        if let Some(settings) = &mut settings {
+            let capacity = crate::cgroup_memory::process_capacity();
+            if let Some(volume) = nanosiem_lake_cell::disk_ceiling::containing_volume_bytes(&settings.root) {
+                settings.max_bytes = nanosiem_lake_cell::budget::cache_disk_budget(settings.max_bytes, volume);
+            }
+            let (query_bytes, fetches) = resource_limits(capacity.memory_bytes, capacity.cpu_millicores, settings.max_bytes);
+            let explicit = |name| std::env::var(name).ok().is_some_and(|v| !v.trim().is_empty());
+            settings.query_max_bytes = if explicit(READER_CACHE_QUERY_BYTES_ENV) {
+                settings.query_max_bytes.min(query_bytes)
+            } else { query_bytes };
+            settings.fetch_concurrency = if explicit(READER_CACHE_FETCH_CONCURRENCY_ENV) {
+                settings.fetch_concurrency.min(fetches)
+            } else { fetches };
+        }
+        Ok(settings)
     }
 
     /// [`Self::from_env`] over an arbitrary variable source (tests, renderers).

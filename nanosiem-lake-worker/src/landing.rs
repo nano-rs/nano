@@ -626,6 +626,8 @@ fn precheck_view(rows: &[&BronzeRow]) -> Result<Vec<Result<Value>>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Precheck {
     InMemory,
+    #[cfg(test)]
+    LegacyPrecheck,
     #[cfg_attr(not(test), allow(dead_code))]
     ParquetRoundTrip,
 }
@@ -811,6 +813,8 @@ pub(crate) fn convert_landed_with(
         // Pre-check exactly what admission will read ([`precheck_view`]).
         let all = prepared.iter().collect::<Vec<_>>();
         let decoded = match precheck {
+            #[cfg(test)]
+            Precheck::LegacyPrecheck => precheck_view(&all),
             Precheck::InMemory => precheck_view(&all),
             Precheck::ParquetRoundTrip => encode_bronze(&all).and_then(|encoded| decode_bronze(&encoded)),
         }
@@ -824,7 +828,13 @@ pub(crate) fn convert_landed_with(
         for (((row, event), class_uid), row_clamped) in prepared.into_iter().zip(decoded).zip(classes).zip(clamped) {
             let verdict = event
                 .map_err(|error| crate::bronze::classify_row_refusal(&error))
-                .and_then(|event| precheck_source_row(event, tenant_id));
+                .and_then(|event| {
+                    #[cfg(test)]
+                    if precheck == Precheck::LegacyPrecheck {
+                        return crate::nan4831_profile::reference_precheck(event, tenant_id);
+                    }
+                    precheck_source_row(event, tenant_id)
+                });
             if let Err(refusal) = verdict {
                 note(refusal, class_uid);
                 continue;
@@ -1305,17 +1315,32 @@ impl<L: Ledger, E: Emit> Converter<L, E> {
     }
 }
 
-/// NAN-4682: landed files one converter handles at once: the machine's
-/// cores, at least 4 (claims, reads and uploads overlap the conversions) and
-/// at most 8.
-pub fn landing_concurrency() -> usize {
-    std::thread::available_parallelism().map_or(4, usize::from).clamp(4, 8)
+/// Landing concurrency and aggregate wire bytes follow this role's cgroup.
+/// Keep the measured 2–3.4 GiB envelope (<= 256 MiB in flight), then let
+/// larger roles overlap more streaming converters. One oversized file may
+/// always run alone; the wire-byte budget never changes file admission.
+pub fn landing_limits(memory: u64, cpu_millis: u32) -> (usize, u64) {
+    let memory_lanes = (memory / (256 * 1024 * 1024)).max(1) as usize;
+    let cpu_lanes = cpu_millis.div_ceil(1000).max(1) as usize;
+    let concurrency = cpu_lanes.min(memory_lanes).max(1);
+    // 1/16 leaves room for decoded rows and each converter's native state.
+    let floor = if memory >= 2 * 1024 * 1024 * 1024 { MAX_LANDING_BYTES } else { 1024 * 1024 };
+    let bytes = (memory / 16).clamp(floor, 2 * 1024 * 1024 * 1024);
+    (concurrency, bytes)
 }
 
-/// NAN-4682: most landed bytes (listed object sizes) in flight at once. It is
-/// [`MAX_LANDING_BYTES`], the largest file the serial converter held, so
-/// concurrency never raises peak memory past the serial worst case.
-pub const MAX_IN_FLIGHT_LANDED_BYTES: u64 = MAX_LANDING_BYTES;
+/// The bucket-drop runner is open-core only. Its quota permits host-wide
+/// bursts; converter fan-out follows the burst ceiling in the same CPU
+/// plan that renders Compose weights, with the existing memory admission.
+pub fn bucket_drop_limits(memory: u64, cpu_millis: u32) -> (usize, u64) {
+    let (_request, burst) = nanosiem_lake_cell::trusted_local::landing_cpu_budget(cpu_millis);
+    landing_limits(memory, burst)
+}
+
+pub fn landing_concurrency() -> usize {
+    let capacity = crate::cgroup_memory::process_capacity();
+    bucket_drop_limits(capacity.memory_bytes, capacity.cpu_millicores).0
+}
 
 /// NAN-4682: bronze objects of one file written at once.
 pub const MAX_CONCURRENT_BRONZE_PUTS: usize = 8;
@@ -1343,15 +1368,16 @@ impl<D: Discover, E: Emit> Engine<'_, D, E> {
     /// not depend on the order files are handled in. Two candidates with
     /// the same key (an object overwritten between listings) never run at
     /// once; they keep their listed order. At most
-    /// [`MAX_IN_FLIGHT_LANDED_BYTES`] of landed objects are in flight (a
-    /// larger file runs alone), so peak memory stays the serial worst case.
+    /// the cgroup-derived wire-byte budget is in flight (a larger file runs
+    /// alone). The file-format admission limits remain unchanged.
     /// A held file (output backpressure) or a fenced lease stops new files
     /// from starting; files already started finish first.
     pub async fn tick(&self) -> Result<TickReport> {
         let mut report = TickReport::default();
         let (listed, candidates) = self.discover.discover(self.store, self.tenant_id, self.max_files_per_tick).await?;
         report.listed = listed;
-        let limit = landing_concurrency();
+        let capacity = crate::cgroup_memory::process_capacity();
+        let (limit, max_bytes) = bucket_drop_limits(capacity.memory_bytes, capacity.cpu_millicores);
         let mut queue: std::collections::VecDeque<Candidate> = candidates.into();
         let mut running = futures::stream::FuturesUnordered::new();
         let mut keys_running: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1363,8 +1389,8 @@ impl<D: Discover, E: Emit> Engine<'_, D, E> {
                 // The first queued file whose key is not running (same-key
                 // files keep their order: an earlier one is always running).
                 let Some(position) = queue.iter().position(|c| !keys_running.contains(&c.key)) else { break };
-                let size = queue[position].size.min(MAX_IN_FLIGHT_LANDED_BYTES);
-                if !running.is_empty() && bytes_running + size > MAX_IN_FLIGHT_LANDED_BYTES {
+                let size = queue[position].size.min(max_bytes);
+                if !running.is_empty() && bytes_running + size > max_bytes {
                     break;
                 }
                 let candidate = queue.remove(position).expect("position is in the queue");

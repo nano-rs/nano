@@ -25,10 +25,57 @@ reuse identity. The initializer sizes cell budgets from host capacity. By defaul
 it assigns half the host memory to the cell. Default ingest sizing reserves room
 for flushes and background compaction using the shared full-flush sizing curve,
 capped at half the cell. For example, a 16 GiB host
-gets a 4 GiB ingest role and a 2 GiB query role. The shift comes from query's
+gets about a 3.9 GiB ingest role and a 1 GiB query role after reserving the
+auxiliary native roles. The shift comes from query's
 share while query retains at least 1 GiB; the total cell allocation stays the
 same. An explicit target rate keeps using the existing rate-based sizing. Back up
 `.nano-lean` alongside PostgreSQL, RustFS, `nano-lean-cell`, and `nano-lean-otel`.
+
+The complete lean stack requires at least 8 GiB available to Docker. The
+initializer can render smaller shapes for diagnostics; the installer refuses
+them before updating the checkout or changing configuration. On an existing
+smaller install, an upgrade exits with the current release, budgets and running
+services preserved; resize the host before retrying. A 2–4 GiB hosted cell is a
+different deployment shape and retains its hosted placement budgets.
+
+`trusted-local init` renders `.nano-lean/compose.resources.json`; the installer
+copies it to `docker-compose.host-resources.yml` and records the complete file
+list in `.env`'s standard `COMPOSE_FILE` setting. Use `docker compose` without a
+single `-f` flag to retain those limits. Both the sovereign wrapper and
+`scripts/nano` include the generated file. Re-run the installer after resizing
+the host. Keep the initializer and service images on the same release.
+
+The cell receives half the host RAM. All other running containers share 45%,
+with 5% left for the OS. Product, landing and maintenance are included in the
+cell envelope. Container quotas allow CPU bursts up to the host's CPU count;
+all role quotas also permit the whole host. Contention is governed by CPU
+weights: the cell receives 60% of the planned shares and Compose siblings 40%.
+Within that host budget query receives 30%, ingest 15%, detect 5%, product 3%,
+native landing 6%, and maintenance 1%. The separate bucket-drop container gets
+10% and search's frontend 12%; remaining services share 18%. Shares sum to the
+host capacity and idle services lend their cores. Query outranks ingest;
+existing ingest admission absorbs lag until spare CPU becomes available.
+Watchdog-only installs apply the same role ordering through process nice
+priorities before any worker threads start (query +0, ingest +3 from the inherited nice value). Agent searches
+retain their lower lane/thread priority below analysts.
+Bucket-drop concurrency uses its burst CPU budget, bounded by one lane per
+256 MiB of container memory; it has no fixed eight/32-lane cap. Its CPU weight
+controls contention, so fan-out can still use spare cores while the box is idle.
+Dedicated query threads can grow to the host quota, while hosted thread limits
+retain their existing envelope. PostgreSQL shared buffers use a quarter of
+its container; Dragonfly data uses 60% of its container, leaving allocator
+headroom. Vector's lake buffer and batch each use 1/16 of its container.
+
+The generated overlay supersedes `NANO_LAKE_CELL_MEM_LIMIT`,
+`NANO_JOBS_MEM_LIMIT`, `NANO_VECTOR_MEM_LIMIT`, `NANO_TENZIR_MEM_LIMIT`,
+`NANO_LANDING_MEM_LIMIT`, `NANO_LAKE_OBJECT_STORE_MEM_LIMIT`,
+`CONNECTOR_MEM_LIMIT`, `NANO_DRAGONFLY_MAXMEMORY`, and the Vector lake
+buffer/batch overrides. It adds no sizing environment variables. The existing
+hot-tail byte setting still accepts an explicit disk-bounded ceiling; its
+compose default is now zero, selecting memory/disk sizing automatically.
+Reader caches are also bounded by the actual cache filesystem. Synchronous
+paged search answers divide memory across admitted searches and escalate to
+durable execution before retaining an oversized result.
 
 The installer probes isolation with the runtime capability set, read-only root,
 and writable `/run`. Missing Landlock warns only on dedicated trusted-local;
@@ -75,7 +122,7 @@ them. Without Vector:
 Next step after a `--tenzir` install (the installer prints it):
 
 ```sh
-docker compose -f docker-compose.opensource.yml run --rm lean-landing-admin add --name tenzir-sysmon
+docker compose run --rm lean-landing-admin add --name tenzir-sysmon
 ```
 
 It prints the source's write-only key and a ready-to-paste Tenzir `to_s3`

@@ -12,6 +12,9 @@
 
 #[path = "supervisor/guarded_work.rs"]
 mod guarded_work;
+#[cfg(test)]
+#[path = "supervisor/thread_limits_tests.rs"]
+mod thread_limits_tests;
 pub use guarded_work::{GuardedLandingWorker, GuardedNativeWorker};
 
 /// Explicit rollout knobs only. Never inherit arbitrary NANO_LAKE_* or credentials.
@@ -1511,7 +1514,9 @@ pub fn query_needs_respawn(spawned_cpu_millis: u32, cpu_millis: u32) -> bool {
 /// own memory ceiling.
 pub fn with_product_role(mut limits: TenantLimits, placement: &TenantPlacement) -> TenantLimits {
     let product = placement.effective_role_budget(Role::Product);
-    limits.cpu_ceiling_millicores = limits.cpu_ceiling_millicores.saturating_add(product.limit_millicores);
+    if placement.local_resources.is_none() {
+        limits.cpu_ceiling_millicores = limits.cpu_ceiling_millicores.saturating_add(product.limit_millicores);
+    }
     limits.memory_soft_bytes = limits.memory_soft_bytes.saturating_add(product.limit_memory_bytes);
     limits.memory_hard_bytes = limits.memory_hard_bytes.saturating_add(product.limit_memory_bytes);
     limits
@@ -1552,7 +1557,9 @@ pub fn role_mounts(root: &Path, role: Role, product_state_role: bool, product: &
 /// product[T]'s: a large landed file never squeezes ingest or query.
 pub fn with_landing_role(mut limits: TenantLimits, placement: &TenantPlacement) -> TenantLimits {
     let landing = placement.effective_role_budget(Role::Landing);
-    limits.cpu_ceiling_millicores = limits.cpu_ceiling_millicores.saturating_add(landing.limit_millicores);
+    if placement.local_resources.is_none() {
+        limits.cpu_ceiling_millicores = limits.cpu_ceiling_millicores.saturating_add(landing.limit_millicores);
+    }
     limits.memory_soft_bytes = limits.memory_soft_bytes.saturating_add(landing.limit_memory_bytes);
     limits.memory_hard_bytes = limits.memory_hard_bytes.saturating_add(landing.limit_memory_bytes);
     limits
@@ -2185,7 +2192,7 @@ impl Supervisor {
         for role in Role::ALL {
             let budget = placement.effective_role_budget(role);
             cg.set_role_cpu_max(tenant, role, budget.limit_millicores)?;
-            cg.set_role_cpu_weight(tenant, role, budget.request_millicores)?;
+            cg.set_role_cpu_weight(tenant, role, crate::resources::role_cpu_weight(placement, role))?;
             cg.set_role_memory_with_floor(tenant, role, budget.request_memory_bytes, budget.limit_memory_bytes,
                 self.shrink_floor(tenant, Some(role), true))?;
         }
@@ -2298,7 +2305,8 @@ impl Supervisor {
                 }
             }
             if let Some(p) = query.filter(|p| !p.exited.load(Ordering::SeqCst)) {
-                if query_needs_respawn(p.cpu_millis, tp.effective_role_budget(Role::Query).limit_millicores) {
+                if query_needs_respawn(p.cpu_millis, tp.effective_role_budget(Role::Query).limit_millicores)
+                    || (self.cfg.trusted_local && p.cpu_millis != tp.effective_role_budget(Role::Query).limit_millicores) {
                     self.stop(p, "query_cpu_budget_changed");
                 }
             }
@@ -2549,12 +2557,24 @@ impl Supervisor {
         // the OOM killer (raising needs no capability).
         let oom_adj = crate::oom::report(self.cfg.resources.tenant_oom_score_adj).tenant_adj;
         let pre_exec_adj = crate::oom::PreExecAdj::new(oom_adj);
-        // SAFETY: only async-signal-safe calls (dup2, fcntl, prctl, and
+        // Respect an operator's inherited nice value; lowering it would need
+        // CAP_SYS_NICE. Apply the offset before exec, not to just the main
+        // thread after the worker has already created its thread pools.
+        let role_nice = (self.cfg.trusted_local && self.cgroups.get().is_none()).then(|| {
+            let inherited = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }.max(0);
+            (inherited + crate::trusted_local::role_nice(role)).min(19)
+        });
+        // SAFETY: only async-signal-safe calls (dup2, fcntl, prctl, setpriority, and
         // open/write/close for oom_score_adj).
         unsafe {
             cmd.pre_exec(move || {
                 // Best effort; checked after spawn.
                 let _ = pre_exec_adj.apply();
+                if let Some(nice) = role_nice {
+                    if libc::setpriority(libc::PRIO_PROCESS, 0, nice) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 if theirs_raw == CONTROL_FD {
                     let f = libc::fcntl(CONTROL_FD, libc::F_GETFD);
                     if f < 0 || libc::fcntl(CONTROL_FD, libc::F_SETFD, f & !libc::FD_CLOEXEC) < 0 {
@@ -2883,7 +2903,7 @@ impl Supervisor {
                     Ok(Ok(Some((ToSupervisor::Ready, _)))) => {}
                     other => return Err(fail(&pidfd, format!("expected ready: {other:?}"))),
                 }
-                if self.cgroups.get().is_none() {
+                if self.cgroups.get().is_none() && !self.cfg.trusted_local {
                     // SAFETY: setpriority on a live child pid we own.
                     unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, 10) };
                 }
@@ -4078,7 +4098,7 @@ impl Supervisor {
         let dt = self.monitor.lock().unwrap().interval();
         // No pids cap on the pod in watchdog mode (podPidsLimit=-1): enforce
         // a cell-wide task ceiling across all tenant uids ourselves.
-        let pids_ceiling = self.cgroups.get().is_none().then(|| placement.tenants.len() as u64 * 1024 + 1024);
+        let pids_ceiling = crate::resources::watchdog_pids_ceiling(&placement.tenants, self.cgroups.get());
         let out = {
             let mut m = self.monitor.lock().unwrap();
             m.set_pids_ceiling(pids_ceiling);
@@ -4168,7 +4188,14 @@ impl Supervisor {
     /// only after the part-log commit, so uncommitted work is redelivered.
     fn enforce_disk_ceilings(&self, placement: &Placement, by_id: &HashMap<&TenantId, &Arc<TenantSlot>>, now: Instant) {
         let placed: Vec<(TenantId, u64)> = placement.tenants.iter()
-            .map(|t| (t.tenant_id.clone(), TenantBudget::from_eps(t.eps).cache_disk_bytes)).collect();
+            .map(|t| {
+                let requested = TenantBudget::from_eps(t.eps).cache_disk_bytes;
+                let cache = if self.cfg.trusted_local {
+                    crate::disk_ceiling::statvfs_bytes(&self.cfg.data_dir)
+                        .map_or(requested, |volume| crate::budget::cache_disk_budget(requested, volume))
+                } else { requested };
+                (t.tenant_id.clone(), cache)
+            }).collect();
         let tick = self.disk.evaluate(&placed, now);
         for e in tick.events {
             e.log();
@@ -5067,6 +5094,9 @@ impl Supervisor {
                             let age = now_ms().saturating_sub(p.heartbeat.last_progress_unix_ms) as f64 / 1000.0;
                             let _ = writeln!(m, "nano_cell_part_log_advance_age_seconds{{cell=\"{}\",tenant=\"{id}\"}} {:.3}", s.cell_id, age);
                         }
+                        if let Some(capacity) = &p.heartbeat.part_gc_capacity {
+                            m.push_str(&capacity.metric_lines(&s.cell_id, id));
+                        }
                         if let Some(blocked) = &p.heartbeat.part_gc_blocked {
                             m.push_str(&blocked.metric_lines(&s.cell_id, id));
                         }
@@ -5698,7 +5728,7 @@ cfg: &CellConfig,
     t: &TenantId,
     role: Role,
     ids: &TenantIds,
-    budget: &TenantBudget,
+    _budget: &TenantBudget,
     cgroups: Option<&CgroupTree>,
     placement: &TenantPlacement,
 ) -> JailSpec {
@@ -5754,8 +5784,13 @@ cfg: &CellConfig,
         // access to parts. Without Landlock, query would inherit that
         // local write permission through DAC even with read-only R2 keys.
         require_landlock: cfg.require_landlock || (!cfg.trusted_local && matches!(role, Role::Query | Role::Detect | Role::Product | Role::Landing)),
-        // RLIMIT_NPROC is per uid. Split the tenant cap across roles.
-        max_processes: Some((budget.max_pids / 3).max(64)),
+        // RLIMIT_NPROC counts every thread of a real uid, including sibling
+        // roles (query/product and ingest/maintenance). Each UID may use the
+        // full tenant allowance; the tenant cgroup bounds their aggregate.
+        // This hard limit also survives live cgroup adoption, so splitting
+        // it by a role/UID count leaves early children with a startup subquota.
+        max_processes: Some(crate::budget::tenant_task_allowance(placement)
+            .min(crate::resources::detect_pids_max(cgroups.map(CgroupTree::root)).unwrap_or(u64::MAX))),
         max_open_files: 65_536,
     }
 }
@@ -6673,8 +6708,11 @@ mod crash_backoff_tests {
         // 3 -> 8 threads: restart at the new size.
         assert!(query_needs_respawn(3_000, 8_000));
         assert!(query_needs_respawn(8_000, 3_000));
-        // Both clamp to 8 threads: keep running.
-        assert!(!query_needs_respawn(8_000, 9_000));
+        // Larger roles no longer stop at eight threads.
+        assert!(query_needs_respawn(8_000, 9_000));
+        assert!(query_needs_respawn(8_000, 16_000));
+        // Both hit the native-pool safety ceiling.
+        assert!(!query_needs_respawn(128_000, 256_000));
         // Unchanged, or a change within the same whole core.
         assert!(!query_needs_respawn(3_000, 3_000));
         assert!(!query_needs_respawn(3_000, 3_500));

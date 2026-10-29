@@ -39,6 +39,8 @@
 
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use crate::config::RoleBudget;
 use std::path::{Path, PathBuf};
 
 use crate::budget::{ingest_query_for_eps, TenantBudget, GIB, MIB};
@@ -242,7 +244,7 @@ impl InitArgs {
         if let Some(sha) = &self.chdb_sha256 {
             ensure!(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()), "--chdb-sha256 must be 64 hex");
         }
-        ensure!(self.memory_bytes.is_none_or(|m| m >= 2 * GIB), "--memory-bytes must be at least 2 GiB");
+        ensure!(self.memory_bytes.is_none_or(|m| m >= 512 * MIB), "--memory-bytes must be at least 512 MiB");
         ensure!(self.cpus.is_none_or(|c| (1..=1024).contains(&c)), "--cpus must be 1..1024");
         ensure!(self.target_eps.is_none_or(|e| (1..=MAX_TARGET_EPS).contains(&e)), "--target-eps must be 1..{MAX_TARGET_EPS}");
         Ok(())
@@ -273,6 +275,60 @@ pub struct Sizing {
     pub ingest: (u32, u32, u64, u64),
     pub detect: (u32, u32, u64, u64),
     pub query: (u32, u32, u64, u64),
+    pub local_resources: LocalResources,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalResources {
+    pub product: RoleBudget,
+    pub landing: RoleBudget,
+    pub maintenance: RoleBudget,
+}
+
+/// One host CPU plan, in shares out of 10,000. The cell receives 60%;
+/// Compose siblings receive 40%. These are contention weights, never quotas:
+/// unused capacity is lent to any runnable role. Query outranks ingestion;
+/// ingest admission owns the backlog rather than competing with analysts.
+pub const HOST_CPU_SHARES: u32 = 10_000;
+pub const CELL_CPU_SHARES: u32 = 6_000;
+pub const COMPOSE_CPU_SHARES: [(&str, u32); 19] = [
+    ("postgres", 150), ("lake-object-store", 300), ("dragonfly", 50),
+    ("nano-api", 200), ("nano-search", 1200), ("nano-jobs", 100),
+    ("vector", 250), ("tenzir", 250), ("lean-landing", 1000),
+    ("connector-runner", 100), ("nano-web", 30), ("nginx", 30),
+    ("lean-otel", 100), ("lean-enrichment", 50), ("lean-job-runner", 40),
+    ("lean-result-gc", 20), ("lean-audit", 40), ("lean-platform-feeds", 20),
+    ("lean-audit-vector", 70),
+];
+
+pub fn role_cpu_shares(role: crate::contract::Role) -> u32 {
+    use crate::contract::Role;
+    match role {
+        Role::Query => 3000, Role::Ingest => 1500, Role::Detect => 500,
+        Role::Product => 300, Role::Landing => 600, Role::Maintenance => 100,
+    }
+}
+
+/// Watchdog-only installs have no role cgroups. Linux nice weights provide
+/// the same ordering without CAP_SYS_NICE; set before exec so every runtime
+/// and native thread inherits it. Query stays at nice 0, ingest at nice 3.
+pub fn role_nice(role: crate::contract::Role) -> i32 {
+    const NICE_WEIGHTS: [u32; 20] = [1024, 820, 655, 526, 423, 335, 272, 215, 172, 137,
+        110, 87, 70, 56, 45, 36, 29, 23, 18, 15];
+    let target = role_cpu_shares(role) * 1024 / role_cpu_shares(crate::contract::Role::Query);
+    NICE_WEIGHTS.iter().enumerate().min_by_key(|(_, weight)| weight.abs_diff(target)).unwrap().0 as i32
+}
+
+pub fn cpu_share_millicores(capacity: u32, shares: u32) -> u32 {
+    (u64::from(capacity) * u64::from(shares) / u64::from(HOST_CPU_SHARES)) as u32
+}
+
+/// The open-core bucket-drop converter's (request, burst) CPU budget.
+/// Keep this with the renderer's plan so concurrency and weights cannot drift.
+pub fn landing_cpu_budget(capacity: u32) -> (u32, u32) {
+    let shares = COMPOSE_CPU_SHARES.iter().find(|(name, _)| *name == "lean-landing").unwrap().1;
+    (cpu_share_millicores(capacity, shares).max(1), capacity.max(1))
 }
 
 fn round_mib(bytes: u64) -> u64 {
@@ -288,26 +344,36 @@ pub const MAX_TARGET_EPS: u32 = 1_000_000;
 
 /// [`size`] for a target rate (NAN-4749). With `target_eps` the ingest role
 /// gets at least [`crate::budget::ingest_memory_for_eps`] (up to half the cell's memory,
-/// taken from query's share, never leaving query under 1 GiB) and the tenant
+/// taken from query's share, preserving the shared two-slot floor) and the tenant
 /// is placed at `target_eps` (owner pacing, part cache), or the
 /// memory-derived eps when that is higher. With no rate, use the same shared
 /// ingest floor within the available query surplus: background merges need
 /// headroom alongside admission, even without an explicit target rate.
 pub fn size_for(memory_bytes: u64, cpus: u32, target_eps: Option<u32>) -> Sizing {
     let cpus = cpus.max(1);
-    // query 50 %, ingest 25 %, detect 15 %; the rest covers the fixed
-    // product/maintenance budgets and the supervisor.
-    let base_query = round_mib(memory_bytes / 2).max(GIB);
-    let base_ingest = round_mib(memory_bytes / 4).max(512 * MIB);
-    // NAN-4749: a target rate moves query memory to ingest through the
-    // shared sizing (`budget::ingest_query_for_eps`), at most half the cell.
+    // Keep native overhead inside the cell before sharing the remainder.
+    // QueryMemoryBudget reserves 384 MiB outside a >=128 MiB engine;
+    // landing needs room for two 256 MiB wire buffers plus streaming state;
+    // maintenance retains its measured 512 MiB ceiling. Below the supported
+    // full-install shape, render proportional diagnostic budgets only.
+    let (product_mem, landing_mem, maintenance_mem, supervisor_mem) = if memory_bytes >= 4 * GIB {
+        (round_mib(memory_bytes / 25).max(512 * MIB),
+         round_mib(memory_bytes / 25).max(GIB),
+         round_mib(memory_bytes / 100).max(512 * MIB),
+         round_mib(memory_bytes / 100).max(64 * MIB))
+    } else {
+        (round_mib(memory_bytes / 25), round_mib(memory_bytes / 25),
+         round_mib(memory_bytes / 100), round_mib(memory_bytes / 100))
+    };
+    let core = memory_bytes.saturating_sub(product_mem + landing_mem + maintenance_mem + supervisor_mem);
+    let base_query = round_mib(core / 9 * 5);
+    let base_ingest = round_mib(core / 18 * 5);
     let (ingest_mem, query_mem) = ingest_query_for_eps(base_ingest, base_query,
         target_eps.unwrap_or(crate::budget::PARALLEL_FLUSH_EPS as u32), round_mib(memory_bytes / 2));
-    let detect_mem = round_mib(memory_bytes / 100 * 15).max(256 * MIB);
+    let detect_mem = round_mib(core.saturating_sub(base_query + base_ingest));
     let milli = cpus.saturating_mul(1000);
-    let query_cpu = (milli / 4 * 3).max(1000);
-    let ingest_cpu = (milli / 2).max(1000);
-    let detect_cpu = (milli / 4).max(500);
+    let cpu_request = |role| cpu_share_millicores(milli, role_cpu_shares(role));
+    use crate::contract::Role;
     // `eps` is a sizing input here: the role budgets above are explicit,
     // but the supervisor still caps ingest at the eps-derived
     // `ingest_memory_cap_bytes`, so pick the smallest eps whose cap covers
@@ -318,15 +384,99 @@ pub fn size_for(memory_bytes: u64, cpus: u32, target_eps: Option<u32>) -> Sizing
         .find(|eps| TenantBudget::from_eps(*eps as f64).ingest_memory_cap_bytes >= ingest_mem)
         .unwrap_or(MAX_TARGET_EPS);
     let eps = covering.max(target_eps.unwrap_or(0));
-    let req = |mem: u64| round_mib(mem / 4).max(64 * MIB);
+    let req = |mem: u64| round_mib(mem / 4).max(MIB).min(mem);
+    let auxiliary = |mem: u64, role| {
+        RoleBudget { request_millicores: cpu_request(role), limit_millicores: milli,
+            request_memory_bytes: req(mem), limit_memory_bytes: mem }
+    };
     Sizing {
         memory_bytes,
         cpus,
         eps,
-        ingest: (250.min(ingest_cpu), ingest_cpu, req(ingest_mem), ingest_mem),
-        detect: (100.min(detect_cpu), detect_cpu, req(detect_mem), detect_mem),
-        query: (250.min(query_cpu), query_cpu, req(query_mem), query_mem),
+        ingest: (cpu_request(Role::Ingest), milli, req(ingest_mem), ingest_mem),
+        detect: (cpu_request(Role::Detect), milli, req(detect_mem), detect_mem),
+        query: (cpu_request(Role::Query), milli, req(query_mem), query_mem),
+        local_resources: LocalResources {
+            product: auxiliary(product_mem, Role::Product),
+            landing: auxiliary(landing_mem, Role::Landing),
+            maintenance: auxiliary(maintenance_mem, Role::Maintenance),
+        },
     }
+}
+
+/// Compose's running services share 45% of host RAM, beside the cell's
+/// half-host allocation and 5% OS reserve. Weights express relative demand;
+/// they are not additional fixed-memory floors on small machines. CPU quotas
+/// permit each service to burst across the host, as the role quotas do.
+/// JSON is valid YAML and avoids introducing operator environment knobs.
+pub fn compose_resources(sizing: &Sizing, host: HostFacts, sovereign: bool) -> Value {
+    let weights = [
+        ("postgres", 8), ("lake-object-store", 16), ("dragonfly", 5),
+        ("nano-api", 10), ("nano-search", 8), ("nano-jobs", 12),
+        ("vector", 8), ("tenzir", 8), ("lean-landing", 8),
+        ("connector-runner", 4), ("nano-web", 1), ("nginx", 1),
+        ("lean-otel", 4), ("lean-enrichment", 2), ("lean-job-runner", 2),
+        ("lean-result-gc", 1), ("lean-audit", 1), ("lean-platform-feeds", 1),
+        ("lean-audit-vector", 4),
+    ];
+    let total: u64 = weights.iter().map(|(_, w)| w).sum();
+    let pool = host.memory_bytes / 100 * 45;
+    // A clean jobs startup OOMed at 512 MiB (NAN-3492). Preserve its 1 GiB
+    // floor by taking the difference from the other services' pool, never
+    // by increasing the total host envelope. Tiny-host output is diagnostic:
+    // install.sh refuses it before starting the stack.
+    let jobs = if host.memory_bytes >= 8 * GIB { (pool / total * 12).max(GIB) } else { pool / total * 12 };
+    let landing = if host.memory_bytes >= 8 * GIB { (pool / total * 8).max(GIB) } else { pool / total * 8 };
+    let otel = if host.memory_bytes >= 8 * GIB { (pool / total * 4).max(512 * MIB) } else { pool / total * 4 };
+    let mut services = serde_json::Map::new();
+    for (name, weight) in weights {
+        let cpu_shares = COMPOSE_CPU_SHARES.iter().find(|(service, _)| *service == name).unwrap().1;
+        let memory = round_mib(match name {
+            "nano-jobs" => jobs,
+            "lean-landing" => landing,
+            "lean-otel" => otel,
+            _ => (pool - jobs - landing - otel) / (total - 24) * weight,
+        }).max(MIB);
+        services.insert(name.into(), json!({
+            "mem_limit": memory, "memswap_limit": memory,
+            "cpus": host.cpus, "cpu_shares": cpu_shares,
+            "deploy": {"resources": {"limits": {"memory": memory.to_string(), "cpus": host.cpus}}},
+        }));
+    }
+    services.insert("lake-cell".into(), json!({
+        "mem_limit": sizing.memory_bytes, "memswap_limit": sizing.memory_bytes,
+        "cpus": sizing.cpus, "cpu_shares": CELL_CPU_SHARES,
+    }));
+    let pg_memory = services["postgres"]["mem_limit"].as_u64().unwrap();
+    let mut pg = vec!["-c".to_owned(), "max_connections=200".into(), "-c".into(),
+        format!("shared_buffers={}MB", (pg_memory / 4 / MIB).max(1)),
+        "-c".into(), "tcp_keepalives_idle=30".into(), "-c".into(), "tcp_keepalives_interval=10".into(),
+        "-c".into(), "tcp_keepalives_count=3".into(), "-c".into(), "tcp_user_timeout=45s".into()];
+    if sovereign {
+        for option in ["ssl=on", "ssl_cert_file=/etc/nano-sovereign-pg/server.crt",
+            "ssl_key_file=/etc/nano-sovereign-pg/server.key", "ssl_min_protocol_version=TLSv1.2",
+            "hba_file=/etc/nano-sovereign-pg/pg_hba.conf"] {
+            pg.extend(["-c".into(), option.into()]);
+        }
+    }
+    services["postgres"]["command"] = json!(pg);
+    let dragonfly = services["dragonfly"]["mem_limit"].as_u64().unwrap();
+    services["dragonfly"]["command"] = json!([
+        format!("--maxmemory={}mb", (dragonfly / 100 * 60 / MIB).max(1)),
+        format!("--proactor_threads={}", (host.cpus / 4).clamp(1, 32)),
+        "--cache_mode=false".to_owned(), "--dir=/data".to_owned(), "--dbfilename=nano-dragonfly".to_owned(),
+        "--snapshot_cron=${NANO_DRAGONFLY_SNAPSHOT_CRON:-* * * * *}".to_owned(),
+    ]);
+    let vector = services["vector"]["mem_limit"].as_u64().unwrap();
+    services["vector"]["environment"] = json!({
+        // The queue and its active batch together use <= 1/8 of the container.
+        "VECTOR_LAKE_BUFFER_MAX_BYTES": (vector / 16).to_string(),
+        "VECTOR_LAKE_BATCH_MAX_BYTES": (vector / 16).to_string(),
+    });
+    json!({"services": services, "x-nano-host-sizing": {
+        "memory_bytes": host.memory_bytes, "cpus": host.cpus,
+        "minimum_install_memory_bytes": 8 * GIB,
+    }})
 }
 
 /// Host facts the cell is sized from (NAN-4693).
@@ -518,7 +668,7 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
     };
     let memory = args.memory_bytes.unwrap_or_else(|| host.map_or(0, |h| h.memory_bytes) / 2);
     let cpus = args.cpus.unwrap_or_else(|| host.map_or(1, |h| h.cpus));
-    let sizing = size_for(memory.max(2 * GIB), cpus, args.target_eps);
+    let sizing = size_for(memory.max(512 * MIB), cpus, args.target_eps);
 
     // Documents.
     let ingest_token = json!({
@@ -533,6 +683,9 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
         "lab_signer_key_id": SIGNER_KEY_ID,
         "lab_signer_seed_hex": hex::encode(seed),
     });
+    // Bootstrap and data can be separate mounts. Carry the demand ceiling;
+    // the reader clamps it against its actual cache filesystem at startup.
+    let cache_bytes = TenantBudget::from_eps(sizing.eps as f64).cache_disk_bytes;
     let query_doc = json!({
         "format": QUERY_BOOTSTRAP_FORMAT,
         "tenant_id": tenant_s,
@@ -540,6 +693,8 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
         "trusted_signer_keys": [{"key_id": SIGNER_KEY_ID, "public_key_hex": public_hex}],
         "engine": {
             "chdb_library": args.chdb_library, "chdb_sha256": chdb_sha256, "compiler": args.compiler,
+            "cache_bytes": cache_bytes,
+            "cache_query_bytes": (sizing.query.3 / 4).min(cache_bytes / 4).max(1),
         },
     });
     let cfg_root = &args.cell_config_root;
@@ -586,6 +741,7 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
             "detect_request_memory_bytes": d.2, "detect_limit_memory_bytes": d.3,
             "query_request_millicores": q.0, "query_limit_millicores": q.1,
             "query_request_memory_bytes": q.2, "query_limit_memory_bytes": q.3,
+            "local_resources": sizing.local_resources,
             "platform_policy_file": args.policy_root.join(&tenant_s).join("policy.json"),
         }],
     });
@@ -623,6 +779,10 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
     write_file(&out.join("app/router-query.token"), query_token.as_bytes(), 0o400, args.app_owner)?;
     write_file(&out.join("cell/cell.json"), &serde_json::to_vec_pretty(&cell)?, 0o644, None)?;
     write_file(&out.join("cell/placement.json"), &serde_json::to_vec_pretty(&placement)?, 0o644, None)?;
+    let compose = compose_resources(&sizing,
+        host.unwrap_or(HostFacts { memory_bytes: memory.saturating_mul(2), cpus }),
+        env("NANO_LEAN_PG_DSN_DIR").is_some());
+    write_file(&out.join("compose.resources.json"), &serde_json::to_vec_pretty(&compose)?, 0o644, None)?;
     write_file(&out.join("app/routes.json"), &serde_json::to_vec_pretty(&routes)?, 0o644, args.app_owner)?;
     write_file(&out.join("app/lake-cell.env"), app_env.as_bytes(), 0o644, args.app_owner)?;
     // NAN-4759: the self-hosted default grant (every bundled feed, at the
@@ -703,6 +863,96 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    /// Exercise the production initializer, not a copy of its sizing math.
+    /// Render lines can also be fed to Docker Compose's daemon-free validator.
+    #[test]
+    fn nan4827_host_shapes_render_all_roles_and_containers() {
+        for (memory, cpus, ingest, query, detect, product, landing) in [
+            (2 * GIB, 4, 268435456, 537919488, 162529280, 41943040, 41943040),
+            (3413114880, 4, 426770432, 853540864, 255852544, 68157440, 68157440),
+            (8 * GIB, 8, 577765376, 1155530752, 347078656, 536870912, 1073741824),
+            (32 * GIB, 16, 6442450944, 5816451072, 2452619264, 686817280, 1073741824),
+            (64 * GIB, 32, 8536457216, 17072914432, 5123342336, 1373634560, 1373634560),
+            (64 * GIB, 64, 8536457216, 17072914432, 5123342336, 1373634560, 1373634560),
+        ] {
+            let host = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(host.path().join("proc")).unwrap();
+            std::fs::create_dir_all(host.path().join("sys/devices/system/cpu")).unwrap();
+            std::fs::write(host.path().join("proc/meminfo"), format!("MemTotal: {} kB\n", memory / 1024)).unwrap();
+            std::fs::write(host.path().join("sys/devices/system/cpu/online"), format!("0-{}", cpus - 1)).unwrap();
+            let out = host.path().join("out");
+            init(&InitArgs { host_root: host.path().into(), memory_bytes: None, cpus: None, ..args(&out) }, &env).unwrap();
+            let placement: crate::config::Placement = serde_json::from_slice(&std::fs::read(out.join("cell/placement.json")).unwrap()).unwrap();
+            let t = &placement.tenants[0];
+            use crate::contract::Role;
+            assert_eq!(t.effective_role_budget(Role::Ingest).limit_memory_bytes, ingest);
+            assert_eq!(t.effective_role_budget(Role::Query).limit_memory_bytes, query);
+            assert_eq!(t.effective_role_budget(Role::Detect).limit_memory_bytes, detect);
+            assert_eq!(t.effective_role_budget(Role::Product).limit_memory_bytes, product);
+            assert_eq!(t.effective_role_budget(Role::Landing).limit_memory_bytes, landing);
+            let requests: u32 = Role::ALL.into_iter().map(|r| t.effective_role_budget(r).request_millicores).sum();
+            let siblings: u32 = COMPOSE_CPU_SHARES.iter().map(|(_, w)| cpu_share_millicores(cpus * 1000, *w)).sum();
+            assert!(requests + siblings <= cpus * 1000, "all host guarantees fit");
+            assert_eq!(Role::ALL.into_iter().map(role_cpu_shares).sum::<u32>(), CELL_CPU_SHARES);
+            assert_eq!(COMPOSE_CPU_SHARES.iter().map(|(_, w)| w).sum::<u32>() + CELL_CPU_SHARES, HOST_CPU_SHARES);
+            let query_weight = crate::resources::role_cpu_weight(t, Role::Query);
+            assert!(query_weight > crate::resources::role_cpu_weight(t, Role::Ingest));
+            assert!(query_weight > crate::resources::role_cpu_weight(t, Role::Landing));
+            assert_eq!(role_nice(Role::Query), 0);
+            assert_eq!(role_nice(Role::Ingest), 3);
+            assert!(role_nice(Role::Query) < role_nice(Role::Landing));
+            let limits = crate::resources::TenantLimits::from_placement(t,
+                &crate::resources::CellCapacity { cpu_millicores: cpus * 1000, memory_bytes: memory / 2,
+                    cpu_source: "config", memory_source: "config" }, &crate::config::ResourceConfig::default());
+            assert_eq!(limits.cpu_guarantee_millicores, requests);
+            assert_eq!(limits.cpu_ceiling_millicores, cpus * 1000);
+            // Exercise the real cgroup writer as well as the placement weights.
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("cgroup.controllers"), "cpu memory pids io\n").unwrap();
+            std::fs::write(root.path().join("cgroup.procs"), "").unwrap();
+            let tree = crate::limits::CgroupTree::adopt_root(root.path().into(), "/".into(), vec![], false).unwrap();
+            tree.ensure_tenant(&t.tenant_id, 0, &limits).unwrap();
+            for role in Role::ALL {
+                tree.set_role_cpu_weight(&t.tenant_id, role, crate::resources::role_cpu_weight(t, role)).unwrap();
+                let actual: u32 = std::fs::read_to_string(tree.tenant_dir(&t.tenant_id).join(role.as_str()).join("cpu.weight")).unwrap().parse().unwrap();
+                assert_eq!(actual, crate::resources::role_cpu_weight(t, role));
+            }
+
+            for role in Role::ALL {
+                let budget = t.effective_role_budget(role);
+                assert_eq!(budget.limit_millicores, cpus * 1000, "idle host can lend all cores to {role:?}");
+                assert!(budget.limit_millicores >= budget.request_millicores);
+            }
+            let role_total: u64 = Role::ALL.into_iter().map(|r| t.effective_role_budget(r).limit_memory_bytes).sum();
+            assert!(role_total < memory / 2);
+            assert!(t.effective_role_budget(Role::Ingest).limit_millicores > 1000);
+            let rendered: Value = serde_json::from_slice(&std::fs::read(out.join("compose.resources.json")).unwrap()).unwrap();
+            let services = rendered["services"].as_object().unwrap();
+            let total: u64 = services.values().map(|v| v["mem_limit"].as_u64().unwrap()).sum();
+            assert!(total <= memory / 100 * 95);
+            assert_eq!(services["lake-cell"]["mem_limit"], memory / 2);
+            for service in services.values() {
+                assert_eq!(service["mem_limit"], service["memswap_limit"]);
+                assert!(service["mem_limit"].as_u64().unwrap() > 0);
+            }
+            assert_eq!(services["nano-search"]["cpus"], cpus);
+            if memory >= 8 * GIB {
+                assert!(services["nano-jobs"]["mem_limit"].as_u64().unwrap() >= GIB);
+            }
+            println!("NAN4827_RENDER {}", json!({"memory": memory, "cpus": cpus, "compose": rendered}));
+            // Sovereign output preserves the security flags even though compose
+            // replaces command lists rather than appending them.
+            let sovereign = compose_resources(&size(memory / 2, cpus), HostFacts { memory_bytes: memory, cpus }, true);
+            let command = sovereign["services"]["postgres"]["command"].as_array().unwrap();
+            assert!(command.contains(&json!("ssl=on")));
+            assert!(command.contains(&json!("hba_file=/etc/nano-sovereign-pg/pg_hba.conf")));
+            println!("NAN4827_SOVEREIGN {}", json!({"memory": memory, "cpus": cpus, "compose": sovereign}));
+        }
+        // Physical disk ceilings, including a volume smaller than old floors.
+        assert_eq!(crate::budget::cache_disk_budget(30 * GIB, 10 * GIB), 2 * GIB);
+        assert_eq!(crate::budget::cache_disk_budget(30 * GIB, 1000 * GIB), 30 * GIB);
+    }
+
     #[test]
     fn init_renders_a_valid_cell_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
@@ -755,7 +1005,7 @@ mod tests {
         assert_eq!(again["bronze"]["secret_access_key"], "secret");
         assert_eq!(std::fs::read_to_string(out.join("app/router-query.token")).unwrap(), token);
         let placement: Value = serde_json::from_slice(&std::fs::read(out.join("cell/placement.json")).unwrap()).unwrap();
-        assert_eq!(placement["tenants"][0]["query_limit_memory_bytes"], 16 * GIB, "re-render resizes");
+        assert_eq!(placement["tenants"][0]["query_limit_memory_bytes"], 17072914432_u64, "re-render resizes");
 
         // A different --tenant-id conflicts; --force re-mints.
         let mut other = args(&out);
@@ -836,17 +1086,19 @@ mod tests {
     }
 
     #[test]
-    fn a_sixteen_gib_host_defaults_to_four_gib_ingest_without_growing_the_cell() {
+    fn a_sixteen_gib_host_reserves_auxiliary_native_memory_without_growing_the_cell() {
         // init gives half of a 16 GiB Docker host to the cell.
         let s = size(8 * GIB, 8);
-        assert_eq!((s.ingest.3, s.query.3), (4 * GIB, 2 * GIB));
-        let old_total = 8 * GIB / 2 + 8 * GIB / 4 + round_mib(8 * GIB / 100 * 15);
-        assert_eq!(s.ingest.3 + s.query.3 + s.detect.3, old_total);
+        let base = size_for(8 * GIB, 8, Some(100));
+        assert_eq!(s.ingest.3 + s.query.3, base.ingest.3 + base.query.3);
+        let local = &s.local_resources;
+        assert!(s.ingest.3 + s.query.3 + s.detect.3 + local.product.limit_memory_bytes
+            + local.landing.limit_memory_bytes + local.maintenance.limit_memory_bytes < s.memory_bytes);
         assert!(s.query.3 >= crate::budget::QUERY_MEMORY_FLOOR_BYTES);
         // Nominal 16 GiB hosts report slightly less usable RAM. There is no
         // hard capacity threshold that would send them back to a 2 GiB role.
         let usable = size(8 * GIB - 512 * MIB, 8);
-        assert!(usable.ingest.3 > 3 * GIB);
+        assert!(usable.ingest.3 > 3 * GIB / 2);
         assert!(usable.query.3 >= crate::budget::QUERY_MEMORY_FLOOR_BYTES);
     }
 
@@ -864,11 +1116,12 @@ mod tests {
     #[test]
     fn sizing_follows_host_memory_not_eps() {
         let small = size(4 * GIB, 2);
-        assert_eq!(small.query.3, GIB);
+        assert!(small.query.3 > GIB);
+        assert_eq!(small.query.3, size_for(4 * GIB, 2, Some(100)).query.3);
         assert!(small.query.1 >= 1000);
         let big = size(64 * GIB, 32);
-        assert_eq!(big.query.3, 32 * GIB);
-        assert_eq!(big.ingest.3, 16 * GIB);
+        assert!(big.query.3.abs_diff(32 * GIB) < 8 * MIB);
+        assert!(big.ingest.3.abs_diff(16 * GIB) < 8 * MIB);
         assert!(big.detect.3 >= crate::budget::DETECT_RULES_MIN_MEMORY_BYTES);
         for s in [&small, &big] {
             assert!(TenantBudget::from_eps(s.eps as f64).ingest_memory_cap_bytes >= s.ingest.3);
@@ -896,14 +1149,14 @@ mod tests {
         assert!(TenantBudget::from_eps(target.eps as f64).ingest_memory_cap_bytes >= target.ingest.3);
         // A small box gives ingest at most half its memory and query >= 1 GiB.
         let small = size_for(4 * GIB, 2, Some(10_000));
-        assert_eq!(small.ingest.3, 2 * GIB);
-        assert_eq!(small.query.3, GIB);
+        assert!(small.ingest.3 >= 512 * MIB && small.ingest.3 <= 2 * GIB);
+        assert_eq!(small.query.3, size_for(4 * GIB, 2, Some(100)).query.3);
         // A big box already covers the rate: the host sizing stands.
         let big = size_for(64 * GIB, 32, Some(10_000));
         assert_eq!(big.ingest.3, size(64 * GIB, 32).ingest.3);
         assert!(big.eps >= 10_000);
         // A low rate never shrinks ingest below the host share.
-        assert_eq!(size_for(16 * GIB, 8, Some(100)).ingest.3, 4 * GIB);
+        assert!(size_for(16 * GIB, 8, Some(100)).ingest.3 >= 3 * GIB);
         // A 2 GiB floor cell has no query memory to give: role memory
         // unchanged (the tenant is still placed at the target rate).
         let floor = size_for(2 * GIB, 1, Some(10_000));

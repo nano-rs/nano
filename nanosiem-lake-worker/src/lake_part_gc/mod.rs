@@ -24,6 +24,7 @@ pub mod executor;
 #[cfg(feature = "enterprise")]
 pub mod http;
 pub mod index;
+pub(crate) mod history;
 pub mod local;
 pub mod local_bronze;
 pub mod planner;

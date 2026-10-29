@@ -15,6 +15,11 @@ mod types;
 mod validator;
 mod vector_config;
 pub mod vrl_guard;
+pub mod vrl_diagnostics;
+pub mod vrl_functions;
+
+/// Names and signatures from the pinned, security-filtered VRL stdlib.
+pub const VRL_FUNCTION_CATALOG: &str = include_str!(concat!(env!("OUT_DIR"), "/vrl-functions.txt"));
 
 pub use credential_repository::{CredentialRepository, CredentialRepositoryError};
 pub use ocsf_validation::{

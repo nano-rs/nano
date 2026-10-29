@@ -56,11 +56,12 @@ pub struct Removal {
 ///
 /// Unlike [`LiveSet`], the view never forgets an added id or a removal, so a
 /// caller keeps one view per tenant and extends it with [`Self::apply`]
-/// (O(new entries) per pass). Memory is one id per part ever added.
+/// (O(new entries) per pass). The guarded cell pages live membership and exact
+/// history through SQLite; inline callers retain one id per part ever added.
 ///
 /// Serializable: the lean cell persists it (with its head) so a restart
 /// resumes from the last verified entry instead of re-reading from seq 0.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LakePartLogView {
     live: LiveSet,
@@ -70,6 +71,10 @@ pub struct LakePartLogView {
     /// Adopted part id -> its original object key (contract 8.1), from the
     /// part's verified provenance. Cached; pruned to live parts.
     adopted_keys: BTreeMap<PartId, String>,
+    #[serde(default)]
+    paged: bool,
+    #[serde(skip)]
+    history: Option<std::sync::Arc<super::history::PagedHistory>>,
 }
 
 impl LakePartLogView {
@@ -85,11 +90,18 @@ impl LakePartLogView {
     pub fn from_checkpoint(checkpoint: &Checkpoint) -> Result<Self> {
         let live = LiveSet::from_checkpoint(checkpoint)?;
         let known = live.parts().map(|part| part.part_id.clone()).collect();
-        Ok(Self { live, known, removals: BTreeMap::new(), from_genesis: false, adopted_keys: BTreeMap::new() })
+        Ok(Self { live, known, removals: BTreeMap::new(), from_genesis: false, adopted_keys: BTreeMap::new(), paged: false, history: None })
     }
 
     /// Apply one verified entry; `entry_sha256` is SHA-256 of its bytes.
     pub fn apply(&mut self, entry: &LogEntry, entry_sha256: &str) -> Result<()> {
+        self.check_history()?;
+        if let Some(history) = &self.history {
+            // A failed write latches the backend closed. Never use the advanced
+            // live cursor with a history prefix that did not commit.
+            history.apply_live(&mut self.live, entry, entry_sha256)?;
+            return Ok(());
+        }
         self.live.apply(entry, entry_sha256)?;
         let (seq, at) = (entry.seq, entry.appended_at_ms);
         let mut remove = |ids: &[PartId], kind: RemovalKind| {
@@ -119,26 +131,62 @@ impl LakePartLogView {
     }
 
     /// Historical identities retained by the GC view (for cell memory budgets).
-    pub fn part_count(&self) -> usize { self.known.len().saturating_add(self.removals.len()) }
+    pub fn part_count(&self) -> usize {
+        self.history.as_ref().map_or_else(|| self.known.len().saturating_add(self.removals.len()), |h| h.refs())
+    }
+
+    pub(crate) fn resident_refs(&self) -> usize {
+        self.live.resident_refs().saturating_add(self.known.len()).saturating_add(self.removals.len())
+    }
+
+    pub(crate) fn check_history(&self) -> Result<()> {
+        if self.paged {
+            self.history.as_ref().context("GC paged history unavailable")?.check_head(self.live.head())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn attach_history(&mut self, history: std::sync::Arc<super::history::PagedHistory>) -> Result<()> {
+        anyhow::ensure!(self.known.is_empty() && self.removals.is_empty(), "GC paged view contains inline history");
+        self.paged = true;
+        self.history = Some(history);
+        Ok(())
+    }
+
+    pub(crate) fn history(&self) -> Result<&super::history::PagedHistory> {
+        self.check_history()?;
+        self.history.as_deref().context("GC view has no paged history")
+    }
 
     pub fn head_seq(&self) -> Option<u64> {
         self.live.head().map(|(seq, _, _)| seq)
     }
 
+    /// Inline callers can enumerate parts. The guarded paged view keeps only
+    /// chain/schema/edge metadata here; use is_live/live_part_keys for GC.
     pub fn live(&self) -> &LiveSet {
         &self.live
     }
 
     pub fn is_live(&self, id: &PartId) -> bool {
-        self.live.get(id).is_some()
+        // A storage failure protects the candidate and latches history shut.
+        self.history.as_ref().map_or_else(|| self.live.get(id).is_some(), |h| h.is_live(id).unwrap_or(true))
     }
 
-    pub fn is_known(&self, id: &PartId) -> bool {
-        self.known.contains(id)
+    pub fn is_known(&self, id: &PartId) -> Result<bool> {
+        self.check_history()?;
+        match &self.history {
+            Some(history) => history.known(id, self.live.head()),
+            None => Ok(self.known.contains(id)),
+        }
     }
 
-    pub fn removal(&self, id: &PartId) -> Option<&Removal> {
-        self.removals.get(id)
+    pub fn removal(&self, id: &PartId) -> Result<Option<Removal>> {
+        self.check_history()?;
+        match &self.history {
+            Some(history) => history.removal(id, self.live.head()),
+            None => Ok(self.removals.get(id).cloned()),
+        }
     }
 
     pub fn from_genesis(&self) -> bool {
@@ -156,6 +204,16 @@ pub async fn live_part_keys(
     reader: &dyn PartLogReader,
 ) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
+    if let Some(history) = &view.history {
+        view.check_history()?;
+        while let Some(part) = history.unresolved_adopted()? {
+            let part_keys = PartKeys::new(tenant_uuid, part.level, part.event_hour, &part.part_id)?;
+            let record = reader.verified_provenance(&part).await?;
+            let key = record.data_key(&part_keys, 0).context("adopted part has no data key")?;
+            history.protect_original(&part.part_id, &key)?;
+        }
+        return Ok(keys);
+    }
     let live: Vec<_> = view.live.parts().cloned().collect();
     // `live` is keyed by id: O(adopted log live), never adopted x live.
     let live_set = &view.live;
@@ -452,6 +510,9 @@ fn plan_one(
     if view.is_live(&key.part_id) {
         return Err("live");
     }
+    if let Some(history) = &view.history {
+        if history.protects_key(&object.key).map_err(|_| "history_unverifiable")? { return Err("live_key"); }
+    }
     let base = |reason| {
         LakePartDeleteRequest::base(
             tenant_id,
@@ -462,7 +523,7 @@ fn plan_one(
             reason,
         )
     };
-    if let Some(removal) = view.removal(&key.part_id) {
+    if let Some(removal) = view.removal(&key.part_id).map_err(|_| "history_unverifiable")? {
         if now_ms.saturating_sub(removal.committed_at_ms) < grace_ms {
             return Err("within_grace");
         }
@@ -487,7 +548,7 @@ fn plan_one(
         request.retention_days = Some(days);
         return Ok(request);
     }
-    if view.is_known(&key.part_id) {
+    if view.is_known(&key.part_id).map_err(|_| "history_unverifiable")? {
         return Err("known_not_removed");
     }
     if !view.from_genesis() {
@@ -925,6 +986,54 @@ pub(crate) mod tests {
         // Cached adopted keys survive a re-resolve without the provenance.
         let empty = ChainReader { chain: Chain::new(), checkpoint: None };
         assert!(live_part_keys(TENANT_UUID, &mut view, &empty).await.unwrap().contains(OBJECT));
+    }
+
+    #[tokio::test]
+    async fn paged_live_validation_and_adopted_keys_match_inline_planning() {
+        use crate::lake_part_gc::index::tests::ChainReader;
+        let dir = tempfile::tempdir().unwrap();
+        let history = std::sync::Arc::new(super::super::history::PagedHistory::open(
+            &dir.path().join("history.sqlite"), true, 1024 * 1024).unwrap());
+        let mut chain = fixture();
+        // Even if an adopted part names a removed part's file, protect it.
+        let original = key(1, Level::L0, "data-00000.parquet");
+        chain.adopt(20, &original, T0 + 700_000);
+        let mut inline = chain.view();
+        let mut paged = LakePartLogView::genesis();
+        paged.attach_history(history.clone()).unwrap();
+        for (entry, sha) in &chain.entries { paged.apply(entry, sha).unwrap(); }
+        assert_eq!(paged.resident_refs(), 0);
+        let reader = ChainReader { chain, checkpoint: None };
+        let inline_keys = live_part_keys(TENANT_UUID, &mut inline, &reader).await.unwrap();
+        let paged_keys = live_part_keys(TENANT_UUID, &mut paged, &reader).await.unwrap();
+        assert!(paged_keys.is_empty(), "no cardinality-dependent key set in RAM");
+        assert!(history.protects_key(&original).unwrap());
+        let objects: Vec<_> = [(1, Level::L0), (3, Level::Minute), (4, Level::L0), (20, Level::Hour), (99, Level::L0)]
+            .into_iter().flat_map(|(id, level)| files(id, level)).collect();
+        let policy = GcPolicy::default();
+        let expected = plan("tenant1", TENANT_UUID, &inline, &inline_keys, &objects, T0 + 4 * DAY_MS, &policy).unwrap();
+        let actual = plan("tenant1", TENANT_UUID, &paged, &paged_keys, &objects, T0 + 4 * DAY_MS, &policy).unwrap();
+        assert_eq!(actual, expected);
+        assert!(!actual.requests.iter().any(|r| r.key == original));
+        // No provenance GET is repeated after the first verified resolution.
+        let empty = ChainReader { chain: Chain::new(), checkpoint: None };
+        live_part_keys(TENANT_UUID, &mut paged, &empty).await.unwrap();
+        // The paged working-set validator still rejects duplicate IDs and
+        // nonexistent inputs, even when neither lives in resident maps.
+        let mut bad = reader.chain.entries.last().unwrap().0.clone();
+        bad.seq += 1;
+        bad.prev_sha256 = reader.chain.entries.last().unwrap().1.clone();
+        let mut duplicate = bad.clone();
+        duplicate.op = LogOp::Adopt { parts: vec![part_ref(20, Level::Hour)] };
+        assert!(paged.apply(&duplicate, &"e".repeat(64)).is_err());
+        let mut missing = bad.clone();
+        missing.op = LogOp::Merge { output: part_ref(21, Level::Minute), supersedes: vec![id(99_999)] };
+        assert!(paged.apply(&missing, &"e".repeat(64)).is_err());
+        assert_eq!(paged.head_seq(), inline.head_seq(), "invalid entries preserve the prefix");
+        paged.check_history().unwrap();
+        bad.op = LogOp::Adopt { parts: vec![part_ref(21, Level::Hour)] };
+        paged.apply(&bad, &"e".repeat(64)).unwrap();
+        assert!(paged.is_live(&id(21)), "a corrected entry can be retried");
     }
 
     #[tokio::test]

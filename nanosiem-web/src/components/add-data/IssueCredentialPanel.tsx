@@ -25,6 +25,7 @@ import {
   SENDER_TEMPLATES_QUERY_KEY,
   defaultCredentialLabel,
   protocolsFor,
+  isPlatformOnlySource,
   type AddDataSource,
   type DirectProtocol,
 } from '@/lib/add-data-sources';
@@ -191,6 +192,7 @@ export function IssueCredentialPanel({
   }, [slugsKey]);
   const [problem, setProblem] = useState<IngestCredentialProblem | null>(null);
   const [phase, setPhase] = useState<IssuancePhase | null>(null);
+  const [waitingCopy, setWaitingCopy] = useState<string | null>(null);
   const [pendingRequestId, setPendingRequestId] = useState<string | null>(null);
   const [cancelledRequestId, setCancelledRequestId] = useState<string | null>(null);
   const [shown, setShown] = useState<Shown[]>([]);
@@ -217,6 +219,7 @@ export function IssueCredentialPanel({
   const mixedRestrictions = verdict?.verdict === 'mixed_restrictions_require_manage';
   // Any other refusal the precheck already knows about (membership, permission, ...).
   const otherBlock =
+    slugs.some(isPlatformOnlySource) ? describeRefusal('source_platform_only') :
     verdict?.blocked === true && verdict.verdict !== null && !MANAGE_VERDICTS.has(verdict.verdict)
       ? describeRefusal(refusalCode(verdict.verdict), verdict.verdict)
       : null;
@@ -252,6 +255,7 @@ export function IssueCredentialPanel({
     const controller = new AbortController();
     abortRef.current = controller;
     setProblem(null);
+    setWaitingCopy(null);
     setCancelledRequestId(null);
     setStartedAt(Date.now());
     setNow(Date.now());
@@ -271,6 +275,13 @@ export function IssueCredentialPanel({
         },
         {
           signal: controller.signal,
+          onWaiting: (status) => {
+            setWaitingCopy(status.waiting_reason === 'awaiting_enrollment'
+              ? `Waiting for the ${(status.waiting_source_slugs?.length ? status.waiting_source_slugs : status.source_slugs).join(', ')} parser to finish rolling out`
+              : status.waiting_reason === 'source_platform_only'
+                ? describeRefusal('source_platform_only').detail
+                : null);
+          },
           onPhase: (p, request) => {
             setPhase(p);
             if (request) {
@@ -511,7 +522,7 @@ export function IssueCredentialPanel({
         {busy && (
           <>
             <span className="text-[11px] text-muted-foreground" role="status">
-              {PHASE_COPY[phase!]}
+              {phase === 'waiting' && waitingCopy ? waitingCopy : PHASE_COPY[phase!]}
             </span>
             {pendingRequestId && <span className="font-mono text-[10.5px] text-muted-foreground/70">{pendingRequestId}</span>}
             <span className="font-mono text-[10.5px] text-muted-foreground/70 tabular-nums">{elapsed}s</span>

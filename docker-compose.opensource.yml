@@ -61,7 +61,8 @@ x-lake-runtime-environment: &lake-runtime-environment
   # activator, interactive worker, and durable-job children all inherit these
   # exact values so one service cannot silently retain the former 1-GiB tail.
   NANO_LAKE_HOT_TAIL_CACHE_DIR: /var/lib/nano-lake/hot-tail-cache
-  NANO_LAKE_HOT_TAIL_CACHE_BYTES: ${NANO_LAKE_HOT_TAIL_MAX_BYTES:-1073741824}
+  # Zero selects a budget from the worker's memory and actual cache volume.
+  NANO_LAKE_HOT_TAIL_CACHE_BYTES: ${NANO_LAKE_HOT_TAIL_MAX_BYTES:-0}
   NANO_LAKE_HOT_TAIL_CACHE_SCHEMA_V4: ${NANO_LAKE_HOT_TAIL_CACHE_SCHEMA_V4:-false}
   RUST_LOG: ${RUST_LOG:-info}
 

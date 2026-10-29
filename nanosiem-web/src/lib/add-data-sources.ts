@@ -40,7 +40,12 @@ export const ADD_DATA_SOURCE_PARAM = 'source';
  */
 export function addDataLink(slug?: string | null): string {
   const s = slug?.trim();
-  return s ? `${ADD_DATA_PATH}?${ADD_DATA_SOURCE_PARAM}=${encodeURIComponent(s)}` : ADD_DATA_PATH;
+  return s && !isPlatformOnlySource(s) ? `${ADD_DATA_PATH}?${ADD_DATA_SOURCE_PARAM}=${encodeURIComponent(s)}` : ADD_DATA_PATH;
+}
+
+/** Platform delivery lanes cannot receive user-issued source or collector credentials. */
+export function isPlatformOnlySource(slug: string): boolean {
+  return slug === 'audit';
 }
 
 /**
@@ -51,7 +56,7 @@ const UNATTRIBUTED_SLUGS = new Set(['unknown', 'default']);
 
 /** The slugs of a registry entry a source credential can be issued for. */
 export function issuableSlugs(slugs: readonly string[] | undefined): string[] {
-  return (slugs ?? []).filter((s) => !!s && !UNATTRIBUTED_SLUGS.has(s));
+  return (slugs ?? []).filter((s) => !!s && !UNATTRIBUTED_SLUGS.has(s) && !isPlatformOnlySource(s));
 }
 
 /**
@@ -63,7 +68,7 @@ export function preselectedAddDataSource(
   requested: string | null | undefined,
 ): AddDataSource | null {
   const slug = requested?.trim();
-  if (!slug || UNATTRIBUTED_SLUGS.has(slug)) return null;
+  if (!slug || UNATTRIBUTED_SLUGS.has(slug) || isPlatformOnlySource(slug)) return null;
   return sources.find((s) => s.slug === slug) ?? null;
 }
 
@@ -81,7 +86,7 @@ export function preselectedCollectorSources(
   const picked: AddDataSource[] = [];
   for (const raw of (requested ?? '').split(',')) {
     const slug = raw.trim();
-    if (!slug || UNATTRIBUTED_SLUGS.has(slug) || picked.some((s) => s.slug === slug)) continue;
+    if (!slug || UNATTRIBUTED_SLUGS.has(slug) || isPlatformOnlySource(slug) || picked.some((s) => s.slug === slug)) continue;
     const match = sources.find((s) => s.slug === slug);
     if (match) picked.push(match);
   }
@@ -96,11 +101,11 @@ export function preselectedCollectorSources(
  */
 export function issueStepSearch(target: { collectorSlugs?: readonly string[] | null; sourceSlug?: string | null }): Record<string, string> | null {
   if (target.collectorSlugs) {
-    const slugs = target.collectorSlugs.filter((s) => !!s && !UNATTRIBUTED_SLUGS.has(s));
+    const slugs = issuableSlugs(target.collectorSlugs);
     return slugs.length > 0 ? { [ADD_DATA_COLLECTOR_PARAM]: slugs.join(',') } : null;
   }
   const slug = target.sourceSlug?.trim();
-  return slug && !UNATTRIBUTED_SLUGS.has(slug) ? { [ADD_DATA_SOURCE_PARAM]: slug } : null;
+  return slug && !UNATTRIBUTED_SLUGS.has(slug) && !isPlatformOnlySource(slug) ? { [ADD_DATA_SOURCE_PARAM]: slug } : null;
 }
 
 /** Unread sealed tokens expire 10 minutes after issuance (9001640). */
@@ -150,6 +155,7 @@ export function addDataSources(
 ): AddDataSource[] {
   const bySlug = new Map<string, AddDataSource>();
   for (const row of endpoint?.sources ?? []) {
+    if (isPlatformOnlySource(row.source_slug)) continue;
     if (!isRouteTemplate(row)) continue;
     if (row.route_state !== 'active' || !isDirectProtocol(row.protocol)) continue;
     const entry = bySlug.get(row.source_slug) ?? { slug: row.source_slug, protocols: [], enrolled: true };
@@ -159,6 +165,7 @@ export function addDataSources(
   for (const ls of logSources ?? []) {
     if (ls.lifecycle_status === 'draft') continue;
     for (const slug of registrySlugs(ls)) {
+      if (isPlatformOnlySource(slug)) continue;
       const entry = bySlug.get(slug) ?? { slug, protocols: [], enrolled: false };
       if (!entry.logSource) {
         entry.logSource = {

@@ -119,6 +119,13 @@ groups:
 
   - name: nanosiem_lake_part_gc
     rules:
+      - alert: LakePartGcHistoryCapacity
+        expr: max by (tenant, detail) (lake_part_gc_capacity_pressure) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Lake GC history capacity pressure for tenant {{ $labels.tenant }}"
+          description: "GC resident memory is at least 75% of its bound or the history volume has at most 25% free ({{ $labels.detail }}). The signal stays latched through retries and index-only progress; increase capacity before GC stalls."
       - alert: LakePartGcBlocked
         expr: max by (tenant, reason, detail) (lake_part_gc_blocked_seconds) >= 7200
         labels:

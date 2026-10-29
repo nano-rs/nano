@@ -3,7 +3,8 @@
 import { describe, expect, it } from 'vitest';
 import type { LogSource, TenantIngestSource } from '@/lib/api/types';
 import {
-  ADD_DATA_PATH, addDataLink, addDataSources, defaultCredentialLabel, issuableSlugs, preselectedAddDataSource, protocolsFor, tokenLost,
+  ADD_DATA_PATH, addDataLink, addDataSources, defaultCredentialLabel, issuableSlugs, preselectedAddDataSource,
+  preselectedCollectorSources, issueStepSearch, protocolsFor, tokenLost,
 } from './add-data-sources';
 import { describeRefusal, refusalCode } from './ingest-credential-errors';
 
@@ -21,6 +22,20 @@ function logSource(partial: Partial<LogSource>): LogSource {
 }
 
 describe('addDataSources (NAN-2593)', () => {
+  it('excludes platform-only audit from active templates, registry entries and credential deep links', () => {
+    const endpoint = { sources: [row({ source_slug: 'audit', label: 'route template: audit', protocol: 'nano_https' }),
+      row({ source_slug: 'okta', label: 'route template: okta' })] };
+    const sources = addDataSources(endpoint, [logSource({ match_values: ['audit'] })]);
+    expect(sources.map(s => s.slug)).toEqual(['okta']);
+    expect(issuableSlugs(['audit', 'okta'])).toEqual(['okta']);
+    const stale = [...sources, { ...sources[0]!, slug: 'audit' }];
+    expect(preselectedAddDataSource(stale, 'audit')).toBeNull();
+    expect(preselectedCollectorSources(stale, 'audit,okta').map(s => s.slug)).toEqual(['okta']);
+    expect(addDataLink('audit')).toBe(ADD_DATA_PATH);
+    expect(issueStepSearch({ sourceSlug: 'audit' })).toBeNull();
+    expect(issueStepSearch({ collectorSlugs: ['audit', 'okta'] })).toEqual({ sources: 'okta' });
+  });
+
   it('lists enrolled route templates joined to registry entries, then sources still rolling out', () => {
     const endpoint = {
       sources: [

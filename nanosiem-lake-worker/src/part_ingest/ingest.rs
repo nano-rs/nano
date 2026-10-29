@@ -620,6 +620,7 @@ pub struct IngestHealth {
     /// Superseded parts kept because the lake-part delete gate is closed
     /// (`part_gc_gate`); `None` while deletion is authorized.
     pub part_gc_blocked: Option<nanosiem_lake_cell::contract::PartGcBlocked>,
+    pub part_gc_capacity: Option<nanosiem_lake_cell::contract::PartGcCapacity>,
     /// Part files deleted through the sanctioned path (exact receipts).
     pub part_gc_deleted_total: u64,
     /// Why the last sanctioned pass stopped early, if it did.
@@ -1655,7 +1656,7 @@ pub const BUFFER_BUDGET_SHARE: f64 = 0.30;
 const INITIAL_HEAP_PER_SOURCE_BYTE: f64 = 120.0;
 /// Buffered Arrow bytes per compressed source byte before any admission
 /// was measured (decoded Arrow is several times leaner than JSON values).
-const INITIAL_ARROW_PER_SOURCE_BYTE: f64 = 40.0;
+pub(crate) const INITIAL_ARROW_PER_SOURCE_BYTE: f64 = 40.0;
 /// Modelled JSON-value heap ([`value_heap_bytes`]) per uncompressed bronze
 /// byte (NAN-4319). Measured 15.3 on Tenzir OCSF 3002 landing objects (10k
 /// and 50k rows; the 50k-row object was 911 KB compressed, 48 MB decoded,
@@ -7027,10 +7028,24 @@ impl<'a> Ingestor<'a> {
             .saturating_add(self.merges_reserved_bytes())
     }
 
-    fn another_merge_fits(&self) -> bool {
-        let next = ((self.merge_in_flight.len() + 1) as u64 * super::merge::merge_reserve_bytes())
+    fn another_merge_fits(&self, level: Level) -> bool {
+        let reserve = super::merge::merge_reserve_bytes();
+        let other = self.committed_bytes().saturating_sub(self.merges_reserved_bytes());
+        let mut slots = self.merge_in_flight.len() + 1;
+        if level != Level::Minute {
+            // The role pool is larger than the ingest working budget on big
+            // hosts (the latter caps at 4 GiB). History/rewrite jobs must not
+            // fill that budget and block every minute merge until they finish.
+            // Retain the original two-history service rate in smaller lab
+            // budgets that cannot hold a minute job beside both histories.
+            let affordable = (self.cfg.buffer_budget_bytes.saturating_sub(other) / reserve).saturating_sub(2) as usize;
+            let progress = super::merge_lanes::MergeCapacity::read().minute_progress_slots().min(affordable);
+            let minutes = self.merge_in_flight.iter().filter(|flight| flight.merge.output_level == Level::Minute).count();
+            slots += progress.saturating_sub(minutes);
+        }
+        let next = (slots as u64 * reserve)
             .max(self.cfg.merge_headroom_bytes);
-        self.committed_bytes().saturating_sub(self.merges_reserved_bytes()).saturating_add(next) <= self.cfg.buffer_budget_bytes
+        other.saturating_add(next) <= self.cfg.buffer_budget_bytes
     }
 
     /// Parallel writers for a flush of `buffer_bytes`: the most whose build
@@ -7611,12 +7626,18 @@ impl<'a> Ingestor<'a> {
                     || super::merge_lanes::history_memory_admits(super::merge_lanes::MemorySnapshot::read()))
                     // NAN-4750/NAN-4755: beside a live buffer even a first
                     // merge must fit the working budget.
-                    && self.another_merge_fits()) {
+                    && self.another_merge_fits(merge.output_level)) {
                 continue;
             }
             // NAN-3795: count rewrites are bounded by their own lane, not the
             // history lanes: a sealed-hour merge never waits behind them. It
             // still needs the memory headroom they use.
+            // NAN-4826: reserve peaks across BOTH lanes and count rewrites,
+            // including jobs launched this tick whose RSS has not grown yet.
+            if !super::merge_lanes::MergeCapacity::read().fits(merge.output_level,
+                self.merge_in_flight.iter().map(|flight| &flight.merge)) {
+                continue;
+            }
             let candidate_rewrite = self.is_count_rewrite(&merge);
             let active = self.merge_in_flight.iter().map(|f| &f.merge)
                 .filter(|m| candidate_rewrite || !self.is_count_rewrite(m)).collect::<Vec<_>>();
@@ -7628,7 +7649,7 @@ impl<'a> Ingestor<'a> {
             }
             // The first merge consumes the headroom already reserved for
             // it; further lanes need additional room in the same budget.
-            if !self.another_merge_fits() {
+            if !self.another_merge_fits(merge.output_level) {
                 continue;
             }
             let key = (merge.output_level.code().to_string(), merge.event_hour);
@@ -7890,6 +7911,14 @@ impl<'a> Ingestor<'a> {
     /// the rest of the cell. Lane, memory and budget gates still apply.
     fn fragmented_merge_may_run_beside_admission(&self, merge: &crate::parts::levels::PlannedMerge) -> bool {
         super::merge_lanes::fragmented_runs_beside_admission(merge, self.merge_in_flight.iter().map(|flight| &flight.merge))
+            // Splitting changes the candidate's fan-in, not the hour's
+            // fragmentation. Keep its one catch-up lane until the live
+            // hour is below the fragmentation threshold.
+            || (merge.output_level == Level::Hour
+                && self.merge_attempts.max_inputs(&super::merge_attempts::merge_id("h", merge.event_hour)).is_some()
+                && crate::parts::levels::hour_is_fragmented(self.log.live().parts()
+                    .filter(|part| part.event_hour == merge.event_hour).count())
+                && self.merge_in_flight.iter().all(|flight| flight.merge.output_level == Level::Minute))
     }
 
     /// Lag past the hour seal: the backlog is feeding sealed hours.
@@ -7971,6 +8000,38 @@ impl<'a> Ingestor<'a> {
             if self.merge_attempts.left_unmerged(&id) {
                 return Vec::new();
             }
+            // Model only work that can start: memory held by admission
+            // must not permanently shrink an otherwise healthy hour.
+            if merge.output_level == Level::Hour && super::merge_quota::history_merge_may_start()
+                && !self.merge_attempts.entry(&id).is_some_and(|entry| entry.in_flight) {
+                let headroom = super::merge_quota::merge_headroom();
+                let mut shift = self.merge_attempts.shift(&id);
+                let mut cap = self.merge_attempts.max_inputs(&id);
+                // Already committed h chunks are final. Their rows and
+                // metadata must not make the remaining chunks shrink again.
+                loop {
+                    let previous = (shift, cap);
+                    let candidates = match cap {
+                        Some(cap) => crate::parts::levels::split_merge(merge.clone(), cap),
+                        None => vec![merge.clone()],
+                    };
+                    for candidate in &candidates {
+                        let choice = super::merge::initial_shape(candidate, headroom, self.cfg.merge_headroom_bytes, shift);
+                        shift = shift.max(choice.shift);
+                        if let Some(smaller) = choice.max_inputs {
+                            cap = Some(cap.map_or(smaller, |old| old.min(smaller)));
+                        }
+                    }
+                    // A smaller global cap changes chunk boundaries. Recheck
+                    // those actual chunks before making the choice durable.
+                    if (shift, cap) == previous { break; }
+                }
+                if let Err(error) = self.merge_attempts.plan_at_least(&id, shift, cap) {
+                    self.health.merge_failures_total += 1;
+                    tracing::warn!(merge = %id, error = %format!("{error:#}"), "initial merge shape not persisted; compaction deferred");
+                    return Vec::new();
+                }
+            }
             match self.merge_attempts.max_inputs(&id) {
                 Some(cap) => crate::parts::levels::split_merge(merge, cap),
                 None => vec![merge],
@@ -8005,15 +8066,20 @@ impl<'a> Ingestor<'a> {
             self.signer.key_id().to_string(), self.cfg.build.clone(),
         );
         let (level, hour) = (merge.output_level, merge.event_hour);
-        // NAN-4755: recorded durably before it starts; its shape step says
-        // how much smaller than full size it runs after an OOM.
+        // Size hour merges before their first attempt. The durable floor
+        // also preserves the retry ladder after a guard stop or restart.
         let attempt = super::merge_attempts::merge_id(level.code(), hour);
         // Failure here defers only compaction; ingest keeps running. Never
         // start work whose death would leave no durable recovery record.
         let splittable = if level == Level::Day { 0 } else { merge.inputs.len() };
-        let shift = self.merge_attempts.begin(&attempt, splittable).context("record merge attempt before starting")?;
+        let headroom = if level == Level::Hour { super::merge_quota::merge_headroom() } else { None };
+        let initial_shift = super::merge::starting_shape(&merge, headroom, self.cfg.merge_headroom_bytes);
+        let shift = self.merge_attempts.begin_at_least(&attempt, splittable, initial_shift)
+            .context("record merge attempt before starting")?;
         tracing::info!(tenant = %tenant, level = level.code(), hour, inputs = merge.inputs.len(),
-            rows = merge.inputs.iter().map(|p| p.rows).sum::<u64>(), shape_shift = shift, "compaction merge starting");
+            rows = merge.inputs.iter().map(|p| p.rows).sum::<u64>(), shape_shift = shift,
+            guard_headroom_bytes = ?headroom, initial_shape_shift = initial_shift,
+            max_inputs = ?self.merge_attempts.max_inputs(&attempt), "compaction merge starting");
         let coverage_rewrite = self.is_count_rewrite(&merge);
         // NAN-3864: a merge of an owed hour restamps it once the state is at
         // the head (the lookups run in the task, never on the tick).
@@ -8248,6 +8314,12 @@ impl<'a> Ingestor<'a> {
     /// orphan planning once deletion is enabled. Local cache eviction belongs
     /// to successful ingest maintenance, never to the retry path.
     async fn gc(&mut self, now_ms: i64) -> Result<()> {
+        let result = self.gc_inner(now_ms).await;
+        self.health.part_gc_capacity = self.gc_authority.as_ref().and_then(|authority| authority.capacity_status());
+        result
+    }
+
+    async fn gc_inner(&mut self, now_ms: i64) -> Result<()> {
         let cutoff = now_ms - self.cfg.merge_policy.supersede_grace_ms;
         let (pending_parts, pending_bytes) = {
             let live = self.log.live();
@@ -9418,6 +9490,10 @@ mod nan4755_ingest_tests;
 #[cfg(test)]
 #[path = "nan4796_ingest_tests.rs"]
 mod nan4796_ingest_tests;
+
+#[cfg(test)]
+#[path = "nan4818_fanin_tests.rs"]
+mod nan4818_fanin_tests;
 
 #[cfg(test)]
 mod tests {

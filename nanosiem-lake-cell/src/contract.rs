@@ -741,6 +741,9 @@ pub struct Heartbeat {
     /// deletion is authorized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part_gc_blocked: Option<PartGcBlocked>,
+    /// Exact paged-history count and measured capacity/runway; absent until sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_gc_capacity: Option<PartGcCapacity>,
     /// ingest: lake part files deleted through the sanctioned GC pass (each
     /// with an exact Worker absence receipt) since process start
     /// (`lean_part_gc_sanctioned_v1`). Exported as `lake_part_gc_deleted_total`.
@@ -914,6 +917,63 @@ pub struct PartGcBlocked {
     pub blocked_seconds: u64,
 }
 
+/// NAN-4814: independent of index progress and recent removed-part counts.
+/// Runways are estimates from complete samples at least 60 seconds apart.
+/// `None` means insufficient observed growth, never infinite/safe capacity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartGcCapacity {
+    pub observed_at_ms: u64,
+    pub head_seq: Option<u64>,
+    pub history_refs: u64,
+    pub complete: bool,
+    pub resident_refs: u64,
+    pub resident_limit: u64,
+    pub history_bytes: u64,
+    pub disk_free_bytes: u64,
+    pub disk_total_bytes: u64,
+    pub history_max_bytes: u64,
+    pub growth_refs_per_day: Option<u64>,
+    /// Comparison with #8384's old lifetime policy, not a new lifetime cap.
+    pub legacy_limit_refs: u64,
+    pub legacy_remaining_refs: u64,
+    pub legacy_runway_seconds: Option<u64>,
+    pub disk_runway_seconds: Option<u64>,
+    pub pressure: bool,
+    pub pressure_detail: Option<String>,
+}
+
+impl PartGcCapacity {
+    pub fn metric_lines(&self, cell_id: &str, tenant: &str) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let labels = format!("cell=\"{cell_id}\",tenant=\"{tenant}\"");
+        for (name, value) in [
+            ("history_observed_at_ms", self.observed_at_ms),
+            ("history_refs", self.history_refs), ("history_complete", u64::from(self.complete)),
+            ("resident_refs", self.resident_refs), ("resident_limit_refs", self.resident_limit),
+            ("history_bytes", self.history_bytes), ("history_disk_free_bytes", self.disk_free_bytes),
+            ("history_disk_total_bytes", self.disk_total_bytes), ("history_max_bytes", self.history_max_bytes),
+            ("history_legacy_limit_refs", self.legacy_limit_refs),
+            ("history_legacy_remaining_refs", self.legacy_remaining_refs),
+        ] {
+            let _ = writeln!(out, "lake_part_gc_{name}{{{labels}}} {value}");
+        }
+        for (name, value) in [("history_head_seq", self.head_seq),
+            ("history_growth_refs_per_day", self.growth_refs_per_day),
+            ("history_legacy_runway_seconds", self.legacy_runway_seconds),
+            ("history_disk_runway_seconds", self.disk_runway_seconds)] {
+            // -1 explicitly means unknown, so a zero-growth/restart sample
+            // cannot masquerade as an unlimited runway.
+            let value = value.map_or_else(|| "-1".into(), |value| value.to_string());
+            let _ = writeln!(out, "lake_part_gc_{name}{{{labels}}} {value}");
+        }
+        let detail: String = self.pressure_detail.as_deref().unwrap_or("").chars()
+            .map(|c| if c.is_ascii_lowercase() || c == '_' { c } else { '_' }).take(64).collect();
+        let _ = writeln!(out, "lake_part_gc_capacity_pressure{{{labels},detail=\"{detail}\"}} {}", u64::from(self.pressure));
+        out
+    }
+}
+
 impl PartGcBlocked {
     /// Prometheus lines for one tenant's blocked lake-part GC. The reason is
     /// reduced to `[a-z0-9_]` so it can never break the exposition.
@@ -1003,6 +1063,21 @@ mod tests {
         let blocked = PartGcBlocked { detail: "missing\"\nroute".into(), blocked_seconds: 7201, ..old };
         let lines = blocked.metric_lines("c", "t");
         assert!(lines.contains("lake_part_gc_blocked_seconds{cell=\"c\",tenant=\"t\",reason=\"grant_disabled\",detail=\"missing__route\"} 7201\n"));
+    }
+
+    #[test]
+    fn part_gc_capacity_heartbeat_and_metrics_preserve_unknown_runway() {
+        let old: Heartbeat = serde_json::from_str(r#"{"busy":false,"queue_depth":7,"lag_seconds":42.0}"#).unwrap();
+        assert!(old.part_gc_capacity.is_none());
+        let capacity = PartGcCapacity { history_refs: 600_301, complete: true,
+            legacy_limit_refs: 589_824, legacy_runway_seconds: Some(0), ..Default::default() };
+        let heartbeat = Heartbeat { part_gc_capacity: Some(capacity.clone()), ..Default::default() };
+        let decoded: Heartbeat = serde_json::from_slice(&serde_json::to_vec(&heartbeat).unwrap()).unwrap();
+        assert_eq!(decoded.part_gc_capacity, Some(capacity.clone()));
+        let lines = capacity.metric_lines("c", "t");
+        assert!(lines.contains("lake_part_gc_history_refs{cell=\"c\",tenant=\"t\"} 600301\n"));
+        assert!(lines.contains("lake_part_gc_history_legacy_runway_seconds{cell=\"c\",tenant=\"t\"} 0\n"));
+        assert!(lines.contains("lake_part_gc_history_disk_runway_seconds{cell=\"c\",tenant=\"t\"} -1\n"));
     }
 
     #[test]

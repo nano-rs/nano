@@ -46,7 +46,7 @@ use crate::config::ResourceConfig;
 use crate::contract::TenantId;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ------------------------------------------------------------------ capacity
@@ -88,22 +88,211 @@ fn mem_total() -> u64 {
 /// the cell's cgroup directory; readable even when not delegated), then the
 /// host.
 pub fn detect_capacity(cfg: &ResourceConfig, cgroup_root: Option<&Path>) -> CellCapacity {
-    let read = |f: &str| cgroup_root.and_then(|r| std::fs::read_to_string(r.join(f)).ok());
+    let location = cgroup_root.map(|root| CgroupLocation { dir: root.into(), root: root.into(), v1: false })
+        .unwrap_or_else(|| resolve_cgroup(Path::new("/sys/fs/cgroup"),
+            &std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default(),
+            &std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default(), None));
+    let read_min = |name: &str, parse: fn(&str) -> Option<u64>| {
+        location.dir.ancestors().take_while(|dir| dir.starts_with(&location.root))
+            .filter_map(|dir| std::fs::read_to_string(dir.join(name)).ok().and_then(|value| parse(&value))).min()
+    };
     let (cpu_millicores, cpu_source) = match cfg.cell_cpu_millicores {
         Some(c) => (c, "config"),
-        None => match read("cpu.max").and_then(|s| parse_cpu_max(&s)) {
-            Some(c) => (c, "cgroup"),
+        None => match read_min("cpu.max", |s| parse_cpu_max(s).map(u64::from)) {
+            Some(c) => (c as u32, "cgroup"),
             None => (std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1) * 1000, "host"),
         },
     };
     let (memory_bytes, memory_source) = match cfg.cell_memory_bytes {
         Some(m) => (m, "config"),
-        None => match read("memory.max").and_then(|s| parse_memory_max(&s)) {
+        None => match read_min(if location.v1 { "memory.limit_in_bytes" } else { "memory.max" }, |s| parse_memory_max(s).filter(|b| *b > 0 && *b < (1_u64 << 60))) {
             Some(m) => (m, "cgroup"),
             None => (mem_total(), "host"),
         },
     };
     CellCapacity { cpu_millicores: cpu_millicores.max(1), memory_bytes: memory_bytes.max(MIB), cpu_source, memory_source }
+}
+
+/// Tightest visible parent task cap, including before cgroup delegation.
+/// A delegated scope is a child of the container cgroup: inspect its parents
+/// too, never tenant leaves whose previous limits may be smaller. `max` and
+/// absent files contribute no cap. No environment or placement input can
+/// override a finite kernel limit.
+pub fn detect_pids_max(scope: Option<&Path>) -> Option<u64> {
+    let location = resolve_cgroup(Path::new("/sys/fs/cgroup"),
+        &std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default(),
+        &std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default(), None);
+    pids_max_in(scope.unwrap_or(&location.dir), &location.root)
+}
+
+fn pids_max_in(dir: &Path, root: &Path) -> Option<u64> {
+    // Fixture trees (and externally mounted scopes) need not be inside the
+    // process's mount. In that case the supplied scope is the boundary.
+    let root = if dir.starts_with(root) { root } else { dir };
+    dir.ancestors().take_while(|p| p.starts_with(root))
+        .filter_map(|p| std::fs::read_to_string(p.join("pids.max")).ok()?.trim().parse().ok())
+        .min()
+}
+
+#[test]
+fn nan4834_pids_budget_reads_the_tightest_visible_ancestor() {
+    let root = tempfile::tempdir().unwrap();
+    let pod = root.path().join("pod");
+    let scope = pod.join("scope");
+    std::fs::create_dir_all(&scope).unwrap();
+    std::fs::write(root.path().join("pids.max"), "8192").unwrap();
+    std::fs::write(pod.join("pids.max"), "2048").unwrap();
+    std::fs::write(scope.join("pids.max"), "max").unwrap();
+    assert_eq!(pids_max_in(&scope, root.path()), Some(2048));
+    assert_eq!(pids_max_in(&pod, root.path()), Some(2048), "before delegation");
+    std::fs::write(scope.join("pids.max"), "1024").unwrap();
+    assert_eq!(pids_max_in(&scope, root.path()), Some(1024));
+    std::fs::write(pod.join("pids.max"), "max").unwrap();
+    std::fs::remove_file(scope.join("pids.max")).unwrap();
+    assert_eq!(pids_max_in(&scope, root.path()), Some(8192));
+    std::fs::write(root.path().join("pids.max"), "max").unwrap();
+    assert_eq!(pids_max_in(&scope, root.path()), None);
+}
+
+/// Keep the watchdog aggregate boundary whenever kernel pids enforcement
+/// is unavailable, including partial CPU/memory-only delegation.
+pub(crate) fn watchdog_pids_ceiling(placements: &[crate::config::TenantPlacement],
+    cgroups: Option<&crate::limits::CgroupTree>) -> Option<u64> {
+    if cgroups.is_some_and(|cg| cg.controllers().iter().any(|c| c == "pids")) {
+        return None;
+    }
+    // The existing 1024-task supervisor/warm-process reserve remains a floor.
+    Some(placements.iter().map(|p| crate::budget::tenant_task_allowance(p).max(1024))
+        .fold(1024u64, u64::saturating_add))
+}
+
+/// Visible cgroup filesystem boundary, resolved from kernel membership and
+/// mountinfo. Shared with worker metric pinning; no tenant input is accepted.
+#[derive(Debug, Clone)]
+pub struct CgroupLocation {
+    pub dir: std::path::PathBuf,
+    pub root: std::path::PathBuf,
+    pub v1: bool,
+}
+
+pub fn resolve_cgroup(
+    root: &Path,
+    membership: &str,
+    mountinfo: &str,
+    role: Option<&Path>,
+) -> CgroupLocation {
+    if let Some(relative) = role.and_then(relative_path) {
+        return CgroupLocation {
+            dir: root.join(relative),
+            root: root.into(),
+            v1: false,
+        };
+    }
+    let entries: Vec<_> = membership
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, ':');
+            let (Some(id), Some(controllers), Some(path)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                return None;
+            };
+            if controllers
+                .split(',')
+                .any(|controller| controller == "memory")
+            {
+                Some((path, true))
+            } else if id == "0" && controllers.is_empty() {
+                Some((path, false))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Hybrid hosts may have v2 present while memory still belongs to v1.
+    let (membership, v1) = entries
+        .iter()
+        .find(|(_, v1)| *v1)
+        .or_else(|| entries.first())
+        .copied()
+        .unwrap_or(("/", false));
+    let fallback_root = if v1 { root.join("memory") } else { root.into() };
+    let Some(relative) = relative_path(Path::new(membership)) else {
+        return CgroupLocation {
+            dir: fallback_root.clone(),
+            root: fallback_root,
+            v1,
+        };
+    };
+    let membership = Path::new("/").join(&relative);
+    for line in mountinfo.lines() {
+        let Some((before, after)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fields: Vec<_> = before.split_whitespace().collect();
+        let fs: Vec<_> = after.split_whitespace().collect();
+        if fields.len() < 5 || fs.len() < 3 {
+            continue;
+        }
+        let matches = if v1 {
+            fs[0] == "cgroup" && fs[2].split(',').any(|controller| controller == "memory")
+        } else {
+            fs[0] == "cgroup2"
+        };
+        if !matches {
+            continue;
+        }
+        let mount_root = unescape(fields[3]);
+        let mount = PathBuf::from(unescape(fields[4]));
+        // A mount of a subtree exposes /docker/<id> directly at its mount
+        // point. When membership is namespaced to `/`, the mount is our root.
+        let inside = membership
+            .strip_prefix(&mount_root)
+            .ok()
+            .or_else(|| (membership == Path::new("/")).then_some(Path::new("")));
+        if let Some(inside) = inside {
+            return CgroupLocation {
+                dir: mount.join(inside),
+                root: mount,
+                v1,
+            };
+        }
+    }
+    CgroupLocation {
+        dir: fallback_root.join(relative),
+        root: fallback_root,
+        v1,
+    }
+}
+
+#[doc(hidden)]
+pub fn relative_path(path: &Path) -> Option<PathBuf> {
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => relative.push(name),
+            Component::RootDir | Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(relative)
+}
+
+fn unescape(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+/// Measured worst-case JSON decode expansion, shared by native result
+/// sizing and the Rust search service's gathered-answer budget.
+pub const RESULT_DECODE_EXPANSION: u64 = 12;
+
+pub fn rust_paged_result_bytes(memory: u64, concurrency: u32) -> u64 {
+    (memory / (2 * RESULT_DECODE_EXPANSION * u64::from(concurrency.max(1))))
+        .min(256 * MIB).max(1)
 }
 
 // ------------------------------------------------------------------ limits
@@ -122,9 +311,21 @@ pub struct TenantLimits {
     pub io_weight: u32,
 }
 
+/// Preserve hosted placement weights. Trusted-local requests can exceed
+/// 10,000m on a large host: normalize together instead of clipping each role,
+/// which would otherwise erase query's priority over ingest at 64 cores.
+pub fn role_cpu_weight(p: &crate::config::TenantPlacement, role: crate::contract::Role) -> u32 {
+    let request = p.effective_role_budget(role).request_millicores;
+    if p.local_resources.is_none() { return request.clamp(1, 10_000); }
+    let total: u64 = crate::contract::Role::ALL.into_iter()
+        .map(|r| u64::from(p.effective_role_budget(r).request_millicores)).sum();
+    (u64::from(request) * 10_000 / total.max(1)).clamp(1, 10_000) as u32
+}
+
 impl TenantLimits {
     pub fn from_placement(p: &crate::config::TenantPlacement, cap: &CellCapacity, cfg: &ResourceConfig) -> Self {
         let mut limits = Self::derive(&TenantBudget::from_eps(p.eps), cap, cfg);
+        limits.max_pids = crate::budget::tenant_task_allowance(p);
         let ingest = p.effective_role_budget(crate::contract::Role::Ingest);
         let detect = p.effective_role_budget(crate::contract::Role::Detect);
         let query = p.effective_role_budget(crate::contract::Role::Query);
@@ -135,6 +336,13 @@ impl TenantLimits {
         limits.cpu_weight = request.clamp(1, 10_000);
         limits.memory_guarantee_bytes = ingest.request_memory_bytes.saturating_add(detect.request_memory_bytes);
         limits.memory_soft_bytes = ingest.limit_memory_bytes.saturating_add(detect.limit_memory_bytes).saturating_add(query.limit_memory_bytes);
+        if let Some(local) = &p.local_resources {
+            limits.cpu_guarantee_millicores = crate::contract::Role::ALL.into_iter()
+                .map(|r| p.effective_role_budget(r).request_millicores).fold(0u32, u32::saturating_add);
+            limits.cpu_ceiling_millicores = cap.cpu_millicores;
+            limits.cpu_weight = limits.cpu_guarantee_millicores.clamp(1, 10_000);
+            limits.memory_soft_bytes = limits.memory_soft_bytes.saturating_add(local.maintenance.limit_memory_bytes);
+        }
         limits.memory_hard_bytes = limits.memory_soft_bytes;
         limits
     }

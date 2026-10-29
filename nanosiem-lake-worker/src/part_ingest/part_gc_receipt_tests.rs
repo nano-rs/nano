@@ -16,6 +16,7 @@ struct Owner {
     refusals_left: AtomicUsize,
     authorizations: AtomicUsize,
     retired: AtomicUsize,
+    historical: bool,
 }
 
 async fn index(State(owner): State<Arc<Owner>>, body: axum::body::Bytes) -> Response {
@@ -49,7 +50,15 @@ async fn authorize(State(owner): State<Arc<Owner>>, axum::Json(request): axum::J
     request.validate().unwrap();
     assert_eq!(request.tenant_uuid, owner.tenant);
     assert_eq!(owner.shas.lock().unwrap().len(), owner.bucket.entries.read().unwrap().len(), "no permit on an incomplete index");
-    assert!(request.key.contains(&format!("/{}/", crate::lake_part_gc::planner::tests::id(ORPHAN))), "only the old orphan may be authorized");
+    let orphan = request.key.contains(&format!("/{}/", crate::lake_part_gc::planner::tests::id(ORPHAN)));
+    let superseded = owner.historical && request.key.contains(&format!("/{}/", crate::lake_part_gc::planner::tests::id(2)));
+    assert!(orphan || superseded, "only the orphan and verified superseded data may be authorized");
+    if superseded {
+        assert_eq!(request.reason, if request.key.ends_with("provenance.json") {
+            crate::lake_part_gc::LakePartDeleteReason::Retention
+        } else { crate::lake_part_gc::LakePartDeleteReason::Superseded });
+        assert!(request.removal_seq.is_some() && request.removal_entry_sha256.is_some());
+    }
     owner.authorizations.fetch_add(1, Ordering::SeqCst);
     let now = chrono::Utc::now();
     axum::Json(LakePartDeletePermit {
@@ -136,12 +145,49 @@ pub(crate) async fn assert_catalog_gc_settles(tenant: &str, catalog: Arc<TenantC
 }
 
 async fn exercise(tenant: &str, catalog: Option<Arc<TenantCatalog>>, entries: u64, refusals: usize, completes: bool) {
+    exercise_history(tenant, catalog, entries, refusals, completes, false).await;
+}
+
+async fn exercise_history(tenant: &str, catalog: Option<Arc<TenantCatalog>>, entries: u64, refusals: usize, completes: bool, historical: bool) {
     // The guarded constructor uses this exact owner origin. The I/O double
     // is wired after R2 exists, before a pass can start.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let owner_url = format!("http://{}/", listener.local_addr().unwrap());
     let (client, tls) = worker_tls();
-    let f = fixture_for_tenant(entries, Duration::ZERO, 200, &owner_url, tenant, Some(client)).await;
+    let mut f = fixture_for_tenant(entries, Duration::ZERO, 200, &owner_url, tenant, Some(client.clone())).await;
+    let entries = if historical {
+        use crate::lake_part_gc::planner::tests::part_ref;
+        use crate::parts::part_log::{LogOp, SourceRef};
+        let mut chain = Chain::new();
+        chain.add(1, T0 + 1);
+        // All 300k adds precede their merges, within ONE ID-memory window.
+        // The transient live prefix exceeds the resident limit; total exact
+        // history exceeds 3x the limit of a 1 GiB role. Aging metadata or
+        // merely compacting removed IDs cannot pass this.
+        let make_part = |n, level| part_ref(n, level);
+        for batch in 0..300_u64 {
+            let first = 2 + batch * 1000;
+            let parts = (first..first + 1000).map(|n| make_part(n, Level::L0)).collect();
+            chain.push(LogOp::Add { parts, consumed: vec![SourceRef {
+                key: format!("bronze/batch-{batch}"), version: "1".into(), sha256: "d".repeat(64),
+            }], edge_log: None }, T0 + 1_000_000);
+        }
+        for batch in 0..300_u64 {
+            let first = 2 + batch * 1000;
+            let supersedes = (first..first + 1000).map(|n| make_part(n, Level::L0).part_id).collect();
+            chain.push(LogOp::Merge { output: make_part(800_000 + batch, Level::Minute), supersedes }, T0 + 1_100_000);
+        }
+        let LogOp::Genesis { schema } = chain.entries[0].0.op.clone() else { unreachable!() };
+        chain.push(LogOp::Schema { schema }, T0 + 30 * 86_400_000);
+        let count = chain.entries.len() as u64;
+        *f.bucket.entries.write().unwrap() = chain.entries.into_iter()
+            .map(|(entry, _)| (entry.seq, entry.to_bytes().unwrap())).collect();
+        let views = f.gc.shared.views.as_ref().unwrap();
+        // Same budget function as production, with a 1 GiB role boundary.
+        views.test_memory_limit.store(1024 * 1024 * 1024, Ordering::Relaxed);
+        views.save_every_ms.store(VIEW_SAVE_EVERY.as_millis() as u64, Ordering::Relaxed);
+        count
+    } else { entries };
     let now = chrono::Utc::now().timestamp_millis();
     // A settled prefix and a young (but past the 60 s age gate) entry whose
     // writer completion is still reaching control, as immediately after roll.
@@ -160,13 +206,20 @@ async fn exercise(tenant: &str, catalog: Option<Arc<TenantCatalog>>, entries: u6
     let orphan = crate::lake_part_gc::planner::tests::key(ORPHAN, Level::L0, "data-00000.parquet").replace(TENANT_UUID, tenant);
     let live = crate::lake_part_gc::planner::tests::key(1, Level::L0, "data-00000.parquet").replace(TENANT_UUID, tenant);
     f.bucket.objects.write().unwrap().extend([(orphan.clone(), b"orphan".to_vec()), (live.clone(), b"live".to_vec())]);
+    let superseded = crate::lake_part_gc::planner::tests::key(2, Level::L0, "data-00000.parquet");
+    let provenance = crate::lake_part_gc::planner::tests::key(2, Level::L0, "provenance.json");
+    if historical {
+        f.bucket.objects.write().unwrap().extend([(superseded.clone(), b"superseded".to_vec()),
+            (provenance.clone(), b"provenance".to_vec())]);
+    }
     let owner = Arc::new(Owner {
         tenant: tenant.into(), bucket: f.bucket.clone(), shas: Default::default(), pending: entries - 1,
-        refusals_left: AtomicUsize::new(refusals), authorizations: AtomicUsize::new(0), retired: AtomicUsize::new(0),
+        refusals_left: AtomicUsize::new(refusals), authorizations: AtomicUsize::new(0), retired: AtomicUsize::new(0), historical,
     });
     let app = Router::new()
         .route(crate::lake_part_gc::INDEX_PATH, axum::routing::post(index))
         .route(crate::lake_part_gc::AUTHORIZE_PATH, axum::routing::post(authorize))
+        .layer(axum::extract::DefaultBodyLimit::max(INDEX_REQUEST_LIMIT))
         .with_state(owner.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let worker = worker(owner.clone(), tls).await;
@@ -187,10 +240,10 @@ async fn exercise(tenant: &str, catalog: Option<Arc<TenantCatalog>>, entries: u6
         assert_eq!(owner.authorizations.load(Ordering::SeqCst), 0);
     }
     if completes {
-        let report = tokio::time::timeout(Duration::from_secs(30), run_catch_up(f.gc.shared.clone(), f.gc.state.clone(), now))
+        let report = tokio::time::timeout(Duration::from_secs(if historical { 300 } else { 30 }), run_catch_up(f.gc.shared.clone(), f.gc.state.clone(), now))
             .await.expect("receipt settlement and bounded catch-up converge").unwrap();
         assert!(report.paused_reason.is_none(), "{report:?}");
-        assert_eq!(report.deleted, 1, "the same task deletes after the completion arrives");
+        assert_eq!(report.deleted, if historical { 2 } else { 1 }, "the same task deletes after verification");
         assert_eq!(report.indexed, entries, "accepted prefixes remain in the progress count");
         assert_eq!(owner.shas.lock().unwrap().len(), entries as usize);
         assert_eq!(f.gc.state.lock().await.view.head_seq(), Some(entries - 1));
@@ -214,6 +267,118 @@ async fn exercise(tenant: &str, catalog: Option<Arc<TenantCatalog>>, entries: u6
         assert_eq!(owner.retired.load(Ordering::SeqCst), 0);
         assert!(f.bucket.objects.read().unwrap().contains_key(&orphan));
     }
+    if historical {
+        assert!(!f.bucket.objects.read().unwrap().contains_key(&superseded));
+        assert!(f.bucket.objects.read().unwrap().contains_key(&provenance), "supersession keeps provenance");
+        let views = f.gc.shared.views.as_ref().unwrap();
+        let state = f.gc.state.lock().await;
+        assert!(state.view.part_count() > 589_824);
+        assert!(state.view.resident_refs() < 2_000, "resident state excludes lifetime history");
+        let cache_bytes = state.view.history().unwrap().cache_bytes().unwrap();
+        let cache_reservation = views.budget().sqlite_cache_bytes.saturating_mul(8);
+        assert!(cache_bytes as u64 <= cache_reservation, "role-bounded SQLite resident cache: {cache_bytes}");
+        let peak_cache = f.gc.shared.max_history_cache_bytes.load(Ordering::SeqCst);
+        let peak_refs = f.gc.shared.max_resident_refs.load(Ordering::SeqCst);
+        assert!(peak_cache <= cache_reservation, "paged cache stays within the role reservation during folding: {peak_cache}");
+        assert!(state.view.part_count() >= 3 * views.budget().parts);
+        assert!(peak_refs < views.budget().parts as u64, "replay stays within the resident limit: {peak_refs}");
+        assert!(peak_refs < 10_000, "entry-sized working set independent of the transient 300k live prefix: {peak_refs}");
+        assert!(state.view.is_live(&crate::lake_part_gc::planner::tests::id(1)));
+        eprintln!("GC_HISTORY_PEAK resident_refs={peak_refs} sqlite_cache_bytes={peak_cache} sqlite_reservation_bytes={cache_reservation}");
+        eprintln!("GC_HISTORY refs={} resident_refs={} sqlite_cache_bytes={cache_bytes} disk_bytes={}",
+            state.view.part_count(), state.view.resident_refs(), state.view.history().unwrap().disk_bytes().unwrap());
+        for output in 800_000..800_300 {
+            assert!(state.view.is_live(&crate::lake_part_gc::planner::tests::id(output)));
+        }
+        views.save(tenant, &state.view).unwrap();
+        let status = f.gc.capacity_status().unwrap();
+        assert!(status.complete);
+        assert_eq!(status.history_refs as usize, state.view.part_count());
+        assert_eq!(status.legacy_remaining_refs, 0);
+        assert_eq!(status.legacy_runway_seconds, Some(0), "#8384 would already be exhausted");
+        let loaded = views.load(tenant).unwrap().unwrap();
+        assert_eq!(loaded.part_count(), state.view.part_count());
+        assert_eq!(loaded.head_seq(), state.view.head_seq());
+        drop(loaded);
+        drop(state);
+        // A real guarded restart uses a fresh ephemeral state dir and the
+        // persistent view dir, under a downsized 1 GiB role boundary.
+        let restart_state = tempfile::tempdir().unwrap();
+        let restarted_store = Arc::new(R2PartStore::new_split(&f.location, &f.location,
+            tenant, &restart_state.path().join("spill")).unwrap());
+        let restarted = CellSanctionedPartGc::new_guarded(tenant, &owner_url, None,
+            restarted_store, fixture_keys(), restart_state.path(), Some(f.dir.path()), Some(client.clone())).unwrap();
+        restarted.shared.views.as_ref().unwrap().test_memory_limit.store(1024 * 1024 * 1024, Ordering::Relaxed);
+        restarted.update(Some(&access), Some(&serde_json::json!({
+            "schema_version":1,"tenant_id":tenant,"tenant_slug":"fixture","enabled":true,"expires_at":"2099-01-01T00:00:00Z",
+        })));
+        restarted.shared.pacer.set_rate(0);
+        let previous = std::mem::replace(&mut f.gc, restarted);
+        drop(previous);
+        let views = f.gc.shared.views.as_ref().unwrap();
+        let before_reads = f.bucket.requests.lock().unwrap().len();
+        f.bucket.objects.write().unwrap().insert(superseded.clone(), b"late-superseded".to_vec());
+        let late = f.gc.run_pass_now(now + 1).await.unwrap();
+        assert!(late.paused_reason.is_none(), "{late:?}");
+        assert_eq!(late.deleted, 1, "late old object retains its exact removal proof");
+        assert_eq!(f.gc.state.lock().await.view.part_count(), 600_301);
+        assert!(f.bucket.requests.lock().unwrap().len() - before_reads < 100,
+            "guarded restart resumes the saved cursor rather than replaying genesis");
+        // The same exact old proof also supports retention of provenance,
+        // never a reclassification as a never-added orphan.
+        let mut retention_access = access.clone();
+        retention_access.policy = Some(GcPolicyOverrides { retention_days: Some(30), ..GcPolicyOverrides::default() });
+        f.gc.update(Some(&retention_access), Some(&serde_json::json!({
+            "schema_version":1,"tenant_id":tenant,"tenant_slug":"fixture","enabled":true,"expires_at":"2099-01-01T00:00:00Z",
+        })));
+        f.gc.shared.pacer.set_rate(0);
+        let retention = f.gc.run_pass_now(now + 2).await.unwrap();
+        assert!(retention.paused_reason.is_none(), "{retention:?}");
+        assert_eq!(retention.deleted, 1);
+        assert!(!f.bucket.objects.read().unwrap().contains_key(&provenance));
+        let saved_path = views.path.with_extension("unavailable");
+        std::fs::rename(&views.path, &saved_path).unwrap();
+        let before = owner.authorizations.load(Ordering::SeqCst);
+        let unavailable = f.gc.run_pass_now(now + 3).await.unwrap();
+        assert_eq!(unavailable.paused_reason.as_deref(), Some("log_unverifiable"));
+        assert_eq!(owner.authorizations.load(Ordering::SeqCst), before);
+        std::fs::rename(&saved_path, &views.path).unwrap();
+        // A larger role budget changes no verification rule. A broken next
+        // hash link must still refuse the pass before another authorization.
+        let mut broken = crate::parts::part_log::LogEntry::parse_bytes(
+            &f.bucket.entries.read().unwrap()[&(entries - 1)], tenant).unwrap();
+        broken.seq = entries;
+        broken.prev_sha256 = "0".repeat(64);
+        f.bucket.entries.write().unwrap().insert(entries, broken.to_bytes().unwrap());
+        f.bucket.objects.write().unwrap().insert(superseded.clone(), b"superseded".to_vec());
+        let before = owner.authorizations.load(Ordering::SeqCst);
+        let report = f.gc.run_pass_now(now + 1).await.unwrap();
+        assert_eq!(report.paused_reason.as_deref(), Some("log_unverifiable"));
+        assert_eq!(report.deleted, 0);
+        assert_eq!(owner.authorizations.load(Ordering::SeqCst), before);
+        assert!(f.bucket.objects.read().unwrap().contains_key(&superseded));
+        // A fresh guarded process presented with corrupt persistent storage
+        // refuses before owner/Worker I/O; no checkpoint/absence shortcut.
+        let valid_path = views.path.with_extension("valid");
+        std::fs::rename(&views.path, &valid_path).unwrap();
+        std::fs::write(&views.path, b"not a SQLite database").unwrap();
+        let corrupt_state = tempfile::tempdir().unwrap();
+        let corrupt_store = Arc::new(R2PartStore::new_split(&f.location, &f.location,
+            tenant, &corrupt_state.path().join("spill")).unwrap());
+        let corrupt = CellSanctionedPartGc::new_guarded(tenant, &owner_url, None,
+            corrupt_store, fixture_keys(), corrupt_state.path(), Some(f.dir.path()), Some(client.clone())).unwrap();
+        corrupt.update(Some(&retention_access), Some(&serde_json::json!({
+            "schema_version":1,"tenant_id":tenant,"tenant_slug":"fixture","enabled":true,"expires_at":"2099-01-01T00:00:00Z",
+        })));
+        corrupt.shared.pacer.set_rate(0);
+        let before = owner.authorizations.load(Ordering::SeqCst);
+        let refused = corrupt.run_pass_now(now + 4).await.unwrap();
+        assert_eq!(refused.paused_reason.as_deref(), Some("log_unverifiable"));
+        assert_eq!(refused.deleted, 0);
+        assert_eq!(owner.authorizations.load(Ordering::SeqCst), before);
+        std::fs::remove_file(&views.path).unwrap();
+        std::fs::rename(valid_path, &views.path).unwrap();
+    }
     assert!(f.bucket.objects.read().unwrap().contains_key(&live), "live part remains protected");
     assert!(!f.bucket.requests.lock().unwrap().iter().any(|(key, _)| key.ends_with(".parquet")), "no part files read for receipt settlement");
     server.abort();
@@ -232,4 +397,9 @@ async fn guarded_incomplete_receipt_never_authorizes_or_deletes() {
 #[tokio::test]
 async fn guarded_catching_up_log_converges_and_then_settles_its_receipt() {
     exercise(TENANT_UUID, None, VIEW_PERSIST_EVERY + 9, 2, true).await;
+}
+
+#[tokio::test]
+async fn guarded_gc_view_budget_verifies_large_history_deletes_and_still_fails_closed() {
+    exercise_history(TENANT_UUID, None, 1, 0, true, true).await;
 }

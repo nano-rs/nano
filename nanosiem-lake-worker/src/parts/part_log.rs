@@ -483,6 +483,12 @@ pub struct DoubleConsume {
     pub key: String,
 }
 
+/// A rejected entry leaves the verified prefix usable for a bounded retry.
+/// This differs from a storage failure, which latches the GC cache closed.
+#[derive(Debug, thiserror::Error)]
+#[error("GC entry validation refused: {0}")]
+pub(crate) struct GcInvalidEntry(#[source] anyhow::Error);
+
 impl LiveSet {
     pub fn from_checkpoint(checkpoint: &Checkpoint) -> Result<Self> {
         let mut set = Self::default();
@@ -499,6 +505,54 @@ impl LiveSet {
         set.schema = Some(checkpoint.schema.clone());
         set.head = Some((checkpoint.seq, checkpoint.entry_sha256.clone(), checkpoint.writer_epoch));
         Ok(set)
+    }
+
+    /// GC's disk-backed replay uses the same validator, hydrated with only
+    /// the IDs touched by this entry. Source IDs are a writer-only guard;
+    /// readers do not call check_consumes. Removed refs are supplied by the
+    /// exact GC history instead. The returned working set is O(entry size).
+    pub(crate) fn gc_working_set(
+        &self,
+        entry: &LogEntry,
+        sha: &str,
+        mut load: impl FnMut(&PartId) -> Result<(Option<PartRef>, bool)>,
+    ) -> Result<Self> {
+        let mut next = Self {
+            schema: self.schema.clone(), head: self.head.clone(),
+            edge: self.edge.clone(), edge_ended: self.edge_ended.clone(),
+            ..Self::default()
+        };
+        let mut hydrate = |id: &PartId| -> Result<()> {
+            let (part, seen) = load(id)?;
+            if let Some(part) = part { next.live.insert(id.clone(), part); }
+            if seen { next.seen.insert(id.clone()); }
+            Ok(())
+        };
+        match &entry.op {
+            LogOp::Add { parts, .. } | LogOp::Adopt { parts } => {
+                for part in parts { hydrate(&part.part_id)?; }
+            }
+            LogOp::Merge { output, supersedes } | LogOp::Rewrite { output, supersedes, .. } => {
+                hydrate(&output.part_id)?;
+                for id in supersedes { hydrate(id)?; }
+            }
+            LogOp::Retire { parts, .. } => { for id in parts { hydrate(id)?; } }
+            _ => {}
+        }
+        next.apply(entry, sha).map_err(GcInvalidEntry)?;
+        Ok(next)
+    }
+
+    /// Keep the chain/schema/edge validator, with all part state on disk.
+    pub(crate) fn gc_clear_resident(&mut self) {
+        self.live.clear(); self.seen.clear(); self.removed.clear();
+        self.removed_refs.clear(); self.added_at.clear(); self.consumed.clear();
+    }
+
+    /// All retained identities, including consumed sources independent of part count.
+    pub(crate) fn resident_refs(&self) -> usize {
+        [self.live.len(), self.seen.len(), self.removed.len(), self.removed_refs.len(),
+            self.added_at.len(), self.consumed.len()].into_iter().sum()
     }
 
     pub fn parts(&self) -> impl Iterator<Item = &PartRef> {

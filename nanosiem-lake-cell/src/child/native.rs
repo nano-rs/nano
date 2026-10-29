@@ -655,6 +655,7 @@ mod tests {
             "landing",
             "identity_directory",
             "part_gc_blocked",
+            "part_gc_capacity",
         ] {
             assert!(body.get(hosted).is_none(), "{hosted} never native");
         }

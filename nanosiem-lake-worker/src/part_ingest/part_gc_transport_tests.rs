@@ -678,7 +678,7 @@ async fn production_http_large_history_arrivals_gap_chain_persistence() {
         assert_eq!(state.view.head_seq(), Some(4));
     }
     let save = fixture(40, Duration::ZERO, 200).await;
-    let path = save.dir.path().join("lake-part-gc/view.json");
+    let path = save.dir.path().join("lake-part-gc/view.sqlite");
     std::fs::create_dir_all(&path).unwrap();
     let mut state = save.gc.state.lock().await;
     assert!(
@@ -1040,6 +1040,31 @@ async fn production_http_refresh_fence_mid_fold_is_a_credential_refresh_pause() 
     assert_eq!(f.gc.state.lock().await.view.head_seq(), Some(31));
 }
 
+/// Both notifications can be coalesced before the pending R2 operation
+/// observes either. The new route is usable, but the old read must still be
+/// cancelled as a routine refresh and its verified prefix must survive.
+#[tokio::test]
+async fn production_http_completed_refresh_mid_fold_retries_without_integrity_warning() {
+    let f = fixture(32, Duration::ZERO, 100).await;
+    f.bucket.body_mode.store(3, Ordering::SeqCst);
+    let work = async {
+        let mut inventory = None;
+        run_one(f.gc.shared.clone(), f.gc.state.clone(), T0, &mut inventory).await
+    };
+    let refresh = async {
+        while f.bucket.active.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        f.gc.suspend_requests();
+        permission(&f.gc, 100, chrono::Duration::minutes(10));
+    };
+    let (report, ()) = tokio::join!(work, refresh);
+    assert_eq!(report.unwrap().paused_reason.as_deref(), Some(CREDENTIAL_REFRESH));
+    f.bucket.body_mode.store(0, Ordering::SeqCst);
+    fold(&f).await;
+    assert_eq!(f.gc.state.lock().await.view.head_seq(), Some(31));
+}
+
 #[test]
 fn only_the_refresh_fence_is_a_credential_refresh_pause() {
     let fenced = anyhow::Error::from(
@@ -1364,4 +1389,168 @@ async fn guarded_held_feed_publishes_the_index_and_never_starts_a_pass() {
     assert!(f.gc.runner.lock().await.index_task.is_none(), "no publication without the route");
     assert_eq!(owner.shas.lock().unwrap().len(), calls);
     server.abort();
+}
+
+#[tokio::test]
+async fn production_gc_capacity_warning_survives_index_only_and_no_pending_backlog() {
+    let f = fixture(3, Duration::ZERO, 200).await;
+    let views = f.gc.shared.views.as_ref().unwrap();
+    views.test_memory_limit.store(10 * 2048 * 4, Ordering::Relaxed);
+    let mut state = f.gc.state.lock().await;
+    advance_view(Some(views), &f.gc.shared, &mut state).await.unwrap();
+    // A pressured partial observation stays latched through index-only work.
+    observe_capacity(Some(views), &f.gc.shared, &state.view, views.budget(), false, 8).unwrap();
+    drop(state);
+    let warning = f.gc.capacity_pressure().expect("early capacity warning");
+    assert_eq!(warning.reason, "history_capacity");
+    assert_eq!(warning.blocked_seconds, 0, "no dependency on pending-part age");
+    assert!(f.gc.capacity_status().unwrap().metric_lines("fixture", TENANT_UUID).contains("lake_part_gc_capacity_pressure"));
+    let _ = run_index_only(f.gc.shared.clone()).await;
+    assert!(f.gc.capacity_pressure().is_some(), "index-only progress cannot clear the latch");
+    views.test_memory_limit.store(1024 * 1024 * 1024, Ordering::Relaxed);
+    let mut state = f.gc.state.lock().await;
+    assert!(advance_view(Some(views), &f.gc.shared, &mut state).await.unwrap());
+    assert!(f.gc.capacity_pressure().is_none(), "only verified healthy capacity clears it");
+}
+
+#[tokio::test]
+async fn production_gc_capacity_warns_on_transitions_and_one_periodic_summary() {
+    // tracing's process-wide callsite interest cache races parallel tests
+    // with no subscriber. Isolate actual event counting in this exact test.
+    const NAME: &str = "part_ingest::part_gc_cell::transport_tests::production_gc_capacity_warns_on_transitions_and_one_periodic_summary";
+    if !std::env::args().any(|arg| arg == NAME) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"]).output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    #[derive(Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let captured = Capture(Arc::default());
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+        .with_max_level(tracing::Level::WARN).with_writer(move || writer.clone()).finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let f = fixture(3, Duration::ZERO, 200).await;
+    let views = f.gc.shared.views.as_ref().unwrap();
+    // Real bounded fold: both Add entries reach the incoming reservation
+    // warning threshold; complete healthy evidence clears it only once.
+    views.test_memory_limit.store(8 * 2048 * 4, Ordering::Relaxed);
+    let mut state = f.gc.state.lock().await;
+    assert!(advance_view(Some(views), &f.gc.shared, &mut state).await.unwrap());
+    for _ in 0..1000 {
+        observe_capacity(Some(views), &f.gc.shared, &state.view, views.budget(), false, 6).unwrap();
+    }
+    assert!(f.gc.capacity_pressure().is_some());
+    // Changing the pressure detail updates telemetry, without a new entry
+    // transition or an extra log before the periodic deadline.
+    f.gc.shared.capacity_pressure.lock().unwrap().as_mut().unwrap().detail = "history_disk".into();
+    observe_capacity(Some(views), &f.gc.shared, &state.view, views.budget(), false, 6).unwrap();
+    assert_eq!(f.gc.capacity_pressure().unwrap().detail, "resident_memory");
+    *f.gc.shared.capacity_log.lock().unwrap() = Some(tokio::time::Instant::now() - PROGRESS_LOG_EVERY);
+    for _ in 0..1000 {
+        observe_capacity(Some(views), &f.gc.shared, &state.view, views.budget(), false, 6).unwrap();
+    }
+    observe_capacity(Some(views), &f.gc.shared, &state.view, views.budget(), false, 0).unwrap();
+    assert!(f.gc.capacity_pressure().is_some(), "partial healthy evidence cannot clear pressure");
+    observe_capacity(Some(views), &f.gc.shared, &state.view, views.budget(), true, 0).unwrap();
+    observe_capacity(Some(views), &f.gc.shared, &state.view, views.budget(), true, 0).unwrap();
+    observe_capacity(Some(views), &f.gc.shared, &state.view, views.budget(), false, 6).unwrap();
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(logs.matches("capacity pressure; action required").count(), 4, "{logs}");
+    assert_eq!(logs.matches("capacity pressure cleared").count(), 2, "{logs}");
+}
+
+#[tokio::test]
+async fn production_gc_history_total_and_runway_use_complete_measured_samples() {
+    let f = fixture(3, Duration::ZERO, 200).await;
+    let views = f.gc.shared.views.as_ref().unwrap();
+    let mut state = f.gc.state.lock().await;
+    assert!(advance_view(Some(views), &f.gc.shared, &mut state).await.unwrap());
+    let first = f.gc.capacity_status().unwrap();
+    assert_eq!(first.history_refs, 2);
+    assert!(first.complete);
+    assert_eq!(first.legacy_runway_seconds, None, "unknown growth must stay unknown");
+    f.gc.shared.capacity_baseline.lock().unwrap().as_mut().unwrap().0 -= Duration::from_secs(120);
+    *f.bucket.entries.write().unwrap() = history(5);
+    assert!(advance_view(Some(views), &f.gc.shared, &mut state).await.unwrap());
+    let second = f.gc.capacity_status().unwrap();
+    assert_eq!(second.history_refs, 4);
+    assert_eq!(second.head_seq, Some(4));
+    assert!(second.observed_at_ms > 0);
+    assert_eq!(second.growth_refs_per_day, Some(1440));
+    assert_eq!(second.legacy_remaining_refs, second.legacy_limit_refs - 4);
+    assert_eq!(second.legacy_runway_seconds, Some(second.legacy_remaining_refs * 60));
+    let lines = second.metric_lines("fixture", TENANT_UUID);
+    assert!(lines.contains("lake_part_gc_history_refs"));
+    assert!(lines.contains("lake_part_gc_history_legacy_runway_seconds"));
+}
+
+#[tokio::test]
+async fn production_gc_previous_snapshot_schema_rebuilds_live_membership() {
+    let f = fixture(5, Duration::ZERO, 200).await;
+    fold(&f).await;
+    let views = f.gc.shared.views.as_ref().unwrap();
+    // v2 has exact known/removal history but no disk-backed live table.
+    rusqlite::Connection::open(&views.path).unwrap().execute_batch("DROP TABLE live").unwrap();
+    let restart_state = tempfile::tempdir().unwrap();
+    let restarted = CellSanctionedPartGc::new_guarded(
+        TENANT_UUID, "http://127.0.0.1:1/", None, f.store.clone(), fixture_keys(),
+        restart_state.path(), Some(f.dir.path()), None).unwrap();
+    permission(&restarted, 200, chrono::Duration::minutes(10));
+    restarted.shared.pacer.set_rate(0);
+    let mut state = restarted.state.lock().await;
+    assert!(advance_view(restarted.shared.views.as_ref(), &restarted.shared, &mut state).await.unwrap());
+    assert_eq!(state.view.head_seq(), Some(4));
+    assert!(state.view.is_live(&crate::lake_part_gc::planner::tests::id(1)));
+    assert!(restarted.reads() >= 5, "old snapshots must replay the verified prefix");
+    let saved = restarted.shared.views.as_ref().unwrap().load(TENANT_UUID).unwrap().unwrap();
+    assert_eq!(saved.head_seq(), state.view.head_seq());
+    assert!(saved.is_live(&crate::lake_part_gc::planner::tests::id(1)));
+}
+
+#[tokio::test]
+async fn production_gc_corrupt_cache_cannot_resume_a_valid_head_over_a_broken_prefix() {
+    for mutation in [
+        "UPDATE snapshot SET body=CAST(' ' || CAST(body AS TEXT) AS BLOB)",
+        "UPDATE known SET id='1790330400099-0000000000000099' WHERE id=(SELECT min(id) FROM known)",
+        "DELETE FROM live",
+        "DROP TABLE live", // Previous snapshot schema must rebuild from genesis.
+        "UPDATE live SET adopted=1",
+        "UPDATE live SET original_key='wrong/key'",
+    ] {
+        let f = fixture(5, Duration::ZERO, 200).await;
+        f.gc.shared.pacer.set_rate(0);
+        let views = f.gc.shared.views.as_ref().unwrap();
+        let mut state = f.gc.state.lock().await;
+        assert!(advance_view(Some(views), &f.gc.shared, &mut state).await.unwrap());
+        assert_eq!(state.view.head_seq(), Some(4));
+        drop(state);
+        rusqlite::Connection::open(&views.path).unwrap().execute_batch(mutation).unwrap();
+        assert!(views.load(TENANT_UUID).is_err(), "valid SQLite is insufficient: {mutation}");
+        // The saved head is still byte-identical, but replay must detect this
+        // earlier broken link rather than trust the corrupt local state.
+        let mut entry = crate::parts::part_log::LogEntry::parse_bytes(
+            &f.bucket.entries.read().unwrap()[&1], TENANT_UUID).unwrap();
+        entry.prev_sha256 = "f".repeat(64);
+        f.bucket.entries.write().unwrap().insert(1, entry.to_bytes().unwrap());
+        let restart_state = tempfile::tempdir().unwrap();
+        let restarted = CellSanctionedPartGc::new_guarded(
+            TENANT_UUID, "http://127.0.0.1:1/", None, f.store.clone(), fixture_keys(),
+            restart_state.path(), Some(f.dir.path()), None).unwrap();
+        permission(&restarted, 200, chrono::Duration::minutes(10));
+        restarted.shared.pacer.set_rate(0);
+        let report = restarted.run_pass_now(T0).await.unwrap();
+        assert_eq!(report.paused_reason.as_deref(), Some("log_unverifiable"), "{report:?}");
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.planned, 0);
+        assert_eq!(restarted.state.lock().await.view.head_seq(), Some(0), "replayed genesis");
+    }
 }

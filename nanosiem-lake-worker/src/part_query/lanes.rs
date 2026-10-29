@@ -88,8 +88,6 @@ pub const BOUNDED_READER_THREADS: u64 = 2;
 /// Decoded bytes one row group of one wide column is assumed to hold
 /// (65,536 rows x ~1 KiB of `raw_data`).
 pub const WIDE_COLUMN_GROUP_BYTES: u64 = 64 * MIB;
-/// Statements on the large lane at once, when its memory affords it.
-pub const MAX_LARGE_LANES: usize = 2;
 /// Remembered lane outcomes per process (a full memo is rebuilt).
 const MEMO_ENTRIES: usize = 4_096;
 
@@ -121,7 +119,7 @@ impl LaneClass {
 /// How many statements a large lane of `large_bytes` runs at once: two at
 /// half each when half is still a large lane ([`MIN_LARGE_QUERY_BYTES`]).
 pub fn large_lane_width(large_bytes: u64) -> usize {
-    if large_bytes / MAX_LARGE_LANES as u64 >= MIN_LARGE_QUERY_BYTES { MAX_LARGE_LANES } else { 1 }
+    large_lane_connections_for_role(large_bytes, true, 4)
 }
 
 /// The kill switch's variable (see the module docs).
@@ -140,7 +138,14 @@ fn routing_v2(value: Option<&str>) -> bool {
 /// The large lane's connection count: [`large_lane_width`] with routing v2,
 /// else one (NAN-3077: a single statement with all of the large memory).
 pub fn large_lane_connections(large_bytes: u64, routing_v2: bool) -> usize {
-    if routing_v2 { large_lane_width(large_bytes) } else { 1 }
+    large_lane_connections_for_role(large_bytes, routing_v2, 4)
+}
+
+/// Four CPUs per large reader; retain the hosted two-lane floor when memory
+/// permits it. Every connection still gets at least 512 MiB.
+pub fn large_lane_connections_for_role(large_bytes: u64, routing_v2: bool, threads: usize) -> usize {
+    if !routing_v2 { return 1; }
+    ((large_bytes / MIN_LARGE_QUERY_BYTES).max(1) as usize).min((threads / 4).max(2))
 }
 
 /// The large lane: an executor of `width` connections, gated by `width`
@@ -161,7 +166,7 @@ pub struct LargeLane {
 
 impl LargeLane {
     /// `bytes` is the whole lane's memory; the width is the executor's
-    /// connection count (at most [`MAX_LARGE_LANES`]).
+    /// connection count, bounded by the memory available to each connection.
     pub fn new(executor: NativeExecutor, bytes: u64) -> Self {
         Self::with_routing(executor, bytes, true)
     }
@@ -169,7 +174,7 @@ impl LargeLane {
     /// [`Self::new`], or with `routing_v2` false the NAN-3077 lane: one
     /// statement at a time with all of `bytes`, whatever the executor's width.
     pub fn with_routing(executor: NativeExecutor, bytes: u64, routing_v2: bool) -> Self {
-        let width = if routing_v2 { executor.connection_count().clamp(1, MAX_LARGE_LANES) as u32 } else { 1 };
+        let width = if routing_v2 { executor.connection_count().max(1).min((bytes / MIN_LARGE_QUERY_BYTES).max(1) as usize) as u32 } else { 1 };
         Self {
             executor, bytes, width,
             permits: Arc::new(tokio::sync::Semaphore::new(width as usize)),
@@ -522,7 +527,8 @@ pub async fn run_sized(
     loop {
         let result = match class {
             LaneClass::Small => {
-                let bounded = needs_bounded_reader(&plan.reader, setting(&plan.sql, "max_threads").unwrap_or(thread_cap));
+                let bounded = needs_bounded_reader_for_cap(&plan.reader, setting(&plan.sql, "max_threads").unwrap_or(thread_cap),
+                    setting(&plan.sql, "max_memory_usage").unwrap_or(SMALL_QUERY_BYTES));
                 let mut small_plan = plan.clone();
                 if bounded {
                     small_plan.sql = bounded_reader_sql(&small_plan.sql, BOUNDED_READER_THREADS);
@@ -597,9 +603,13 @@ async fn run_sized_v1(small: &NativeExecutor, large: &LargeLane, plan: NativeQue
 /// Whether a statement's decoded wide text (row groups in flight x wide
 /// columns) would take more than half of a small lane at `threads`.
 pub fn needs_bounded_reader(shape: &ReaderShape, threads: u64) -> bool {
+    needs_bounded_reader_for_cap(shape, threads, SMALL_QUERY_BYTES)
+}
+
+fn needs_bounded_reader_for_cap(shape: &ReaderShape, threads: u64, small_bytes: u64) -> bool {
     shape.wide_columns > 0
         && shape.row_groups.min(threads.max(1)).saturating_mul(shape.wide_columns).saturating_mul(WIDE_COLUMN_GROUP_BYTES)
-            > SMALL_QUERY_BYTES / 2
+            > small_bytes / 2
 }
 
 /// `sql` with its `max_threads` at most `threads` (a statement without
@@ -658,7 +668,7 @@ pub fn degraded_sql(sql: &str) -> String {
 
 /// The numeric value of `name` in the statement's trailing settings.
 pub fn setting(sql: &str, name: &str) -> Option<u64> {
-    let pattern = regex::Regex::new(&format!(r"\b{name}\s*=\s*(\d+)\b")).expect("setting regex");
+    let pattern = setting_pattern(name);
     let clause = crate::executor::statement_settings(sql)?;
     pattern.captures(clause).and_then(|found| found[1].parse().ok())
 }
@@ -666,7 +676,7 @@ pub fn setting(sql: &str, name: &str) -> Option<u64> {
 /// `sql` with its trailing `SETTINGS name=value` at most `value`.
 pub fn lower_setting(sql: &str, name: &str, value: u64) -> String {
     let sql = sql.trim_end();
-    let pattern = regex::Regex::new(&format!(r"\b{name}\s*=\s*(\d+)\b")).expect("setting regex");
+    let pattern = setting_pattern(name);
     if let Some(clause) = crate::executor::statement_settings(sql) {
         if let Some(found) = pattern.captures(clause) {
             let current = found[1].parse::<u64>().unwrap_or(u64::MAX);
@@ -678,6 +688,22 @@ pub fn lower_setting(sql: &str, name: &str, value: u64) -> String {
         }
     }
     crate::executor::with_setting(sql, &format!("{name}={value}"))
+}
+
+/// The hot path checks these caps repeatedly per statement. Keep compiled
+/// patterns bounded to known settings rather than caching caller strings.
+fn setting_pattern(name: &str) -> std::borrow::Cow<'static, regex::Regex> {
+    use std::sync::OnceLock;
+    static THREADS: OnceLock<regex::Regex> = OnceLock::new();
+    static PARSING: OnceLock<regex::Regex> = OnceLock::new();
+    static MEMORY: OnceLock<regex::Regex> = OnceLock::new();
+    let compile = || regex::Regex::new(&format!(r"\b{}\s*=\s*(\d+)\b", regex::escape(name))).expect("setting regex");
+    match name {
+        "max_threads" => std::borrow::Cow::Borrowed(THREADS.get_or_init(compile)),
+        "max_parsing_threads" => std::borrow::Cow::Borrowed(PARSING.get_or_init(compile)),
+        "max_memory_usage" => std::borrow::Cow::Borrowed(MEMORY.get_or_init(compile)),
+        _ => std::borrow::Cow::Owned(compile()),
+    }
 }
 
 #[cfg(test)]
@@ -874,6 +900,9 @@ mod tests {
         assert!(!needs_bounded_reader(&shape(0, 10_000), 8));
         // Threads bound the groups in flight.
         assert!(!needs_bounded_reader(&shape(1, 387), 2));
+        // A capacity-sized small lane can afford more reader parallelism.
+        assert!(!needs_bounded_reader_for_cap(&shape(1, 387), 8, 1024 * MIB));
+        assert!(needs_bounded_reader_for_cap(&shape(2, 387), 8, 1024 * MIB));
     }
 
     #[test]
@@ -1031,6 +1060,10 @@ mod tests {
         // The 3 GiB role: 2.25 GiB chDB = 6 x 256 MiB + 768 MiB large.
         assert_eq!(large_lane_width(768 * MIB), 1);
         assert_eq!(large_lane_width(2 * MIN_LARGE_QUERY_BYTES - 1), 1);
+        assert_eq!(large_lane_connections_for_role(16 * GIB, true, 16), 4);
+        assert_eq!(large_lane_connections_for_role(16 * GIB, true, 32), 8);
+        assert_eq!(large_lane_connections_for_role(16 * GIB, false, 32), 1);
+        assert_eq!(large_lane_connections_for_role(768 * MIB, true, 32), 1);
     }
 
     /// The kill switch: only a literal `0` turns routing v2 off, and off is

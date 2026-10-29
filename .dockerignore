@@ -60,6 +60,9 @@ docs-internal/
 test-*.sh
 *_test.rs
 tests/
+# NAN-4551: the shared sovereign release build explicitly runs this gate.
+!nanosiem-sovereign-contract/tests/
+!nanosiem-sovereign-contract/tests/license_production_ceremony.rs
 
 # CI/CD
 .github/

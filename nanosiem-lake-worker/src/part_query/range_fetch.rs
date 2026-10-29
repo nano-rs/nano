@@ -49,6 +49,8 @@ use std::sync::Arc;
 use crate::parts::parquet_ranges::ParquetRangeDigest;
 use crate::planner::CompiledQuery;
 
+pub(super) const LATE_FALLBACK: &str = "late materialization needs the verified whole-file path";
+
 /// The runtime flag (default off).
 pub const FLAG: &str = "NANO_LAKE_SEARCH_RANGE_FETCH";
 
@@ -212,19 +214,22 @@ pub struct ColumnScope {
     /// `debit` (what the failed ranged attempt already fetched).
     whole_only: bool,
     debit: u64,
+    late_materialization: bool,
 }
 
 impl ColumnScope {
     pub fn new(roots: BTreeSet<String>, leaves: BTreeSet<String>) -> Self {
-        Self { roots, leaves, sparse_used: AtomicBool::new(false), cold_spent: AtomicU64::new(0), whole_only: false, debit: 0 }
+        Self { roots, leaves, sparse_used: AtomicBool::new(false), cold_spent: AtomicU64::new(0), whole_only: false, debit: 0, late_materialization: false }
     }
 
     /// The scope of a whole-file rerun of this request: no ranged reads,
     /// and the cold bytes this attempt fetched count against its budget.
     pub fn rerun(&self) -> Self {
         Self { roots: BTreeSet::new(), leaves: BTreeSet::new(), sparse_used: AtomicBool::new(false),
-            cold_spent: AtomicU64::new(0), whole_only: true, debit: self.cold_spent() }
+            cold_spent: AtomicU64::new(0), whole_only: true, debit: self.cold_spent(), late_materialization: false }
     }
+
+    pub fn late_materialization(&self) -> bool { self.late_materialization }
 
     pub fn whole_only(&self) -> bool {
         self.whole_only
@@ -284,10 +289,18 @@ pub fn current() -> Option<Arc<ColumnScope>> {
 
 /// The request's scope when the flag is on and the shape names its columns.
 pub fn scope_for(compiled: &CompiledQuery, field_types: &BTreeMap<String, String>) -> Option<Arc<ColumnScope>> {
-    if !enabled() {
-        return None;
-    }
     let schema_roots = field_types.keys().filter_map(|path| path.split('.').next()).map(str::to_owned).collect();
+    // Selective row pages always fetch predicate/order columns first. Other
+    // shapes retain their existing whole-file or opt-in column-range path.
+    if !compiled.candidate_hints.is_empty() {
+        if let Some(two) = super::two_pass::plan(compiled) {
+            if let Ok(mut scope) = derive_scope(&two.narrow_cursor, &schema_roots) {
+                scope.late_materialization = true;
+                return Some(Arc::new(scope));
+            }
+        }
+    }
+    if !enabled() { return None }
     match derive_scope(compiled, &schema_roots) {
         Ok(scope) => Some(Arc::new(scope)),
         Err(reason) => {
@@ -971,7 +984,7 @@ mod tests {
     }
 
     fn range(offset: u64, bytes: u64, column: Option<&str>) -> ParquetRangeDigest {
-        ParquetRangeDigest { offset, bytes, sha256: "b".repeat(64), row_group: column.map(|_| 0), column: column.map(str::to_owned) }
+        ParquetRangeDigest { offset, bytes, sha256: "b".repeat(64), row_group: column.map(|_| 0), column: column.map(str::to_owned), pages: Vec::new() }
     }
 
     #[test]

@@ -111,21 +111,7 @@ const SUSPICIOUS_PATTERNS: &[(&str, &str)] = &[
 /// - Host process info: `get_env_var` (secrets), `get_hostname` (recon).
 /// - Network egress: `http_request` (SSRF/exfil), `dns_lookup` /
 ///   `reverse_dns` (DNS-tunnel exfil).
-pub(crate) const BLOCKED_VRL_FUNCTIONS: &[&str] = &[
-    "get_env_var",
-    "get_hostname",
-    "http_request",
-    "dns_lookup",
-    "reverse_dns",
-];
-
-/// Returns the VRL stdlib function set with security-blocked functions removed.
-pub(crate) fn safe_vrl_functions() -> Vec<Box<dyn vrl::compiler::Function>> {
-    vrl::stdlib::all()
-        .into_iter()
-        .filter(|f| !BLOCKED_VRL_FUNCTIONS.contains(&f.identifier()))
-        .collect()
-}
+pub(crate) use super::vrl_functions::{safe_vrl_functions, BLOCKED_VRL_FUNCTIONS};
 
 /// Replace VRL's runtime byte spans (`at (START:END)`) with the 1-based line
 /// and column an analyst sees in the parser editor.
@@ -291,7 +277,7 @@ impl VrlValidator {
     /// reported line number — joining the diagnostics into one blob
     /// would mean only the first error's line gets a snippet.
     ///
-    /// Pre-compile gates (size, security patterns, balanced brackets,
+    /// Pre-compile gates (size, security patterns, nesting limits,
     /// etc.) still produce a single error; they don't go through the VRL
     /// compiler so there's nothing to split. The returned `Vec` will have
     /// one entry in that case.
@@ -461,10 +447,9 @@ impl VrlValidator {
             return Err(gate(e.to_string(), &warnings));
         }
 
-        // Step 6: Check balanced brackets
-        if let Err(e) = self.check_balanced_brackets(vrl_code) {
-            return Err(gate(e.to_string(), &warnings));
-        }
+        // Step 6: bracket syntax belongs to the guarded native compiler.
+        // Character counts treat regex/string contents and comments as code
+        // and hide the real compiler diagnostics (NAN-4808).
 
         // Step 7: Check for TOML injection attempts
         if let Err(e) = if processing_plan {
@@ -578,38 +563,6 @@ impl VrlValidator {
             return Err(VrlValidatorError::SyntaxError(format!(
                 "VRL code has excessive nesting depth ({} levels, max {})",
                 max_depth, MAX_NESTING_DEPTH
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// Check for balanced brackets
-    fn check_balanced_brackets(&self, vrl_code: &str) -> Result<(), VrlValidatorError> {
-        let open_braces = vrl_code.matches('{').count();
-        let close_braces = vrl_code.matches('}').count();
-        if open_braces != close_braces {
-            return Err(VrlValidatorError::SyntaxError(format!(
-                "Unbalanced braces: {} opening, {} closing",
-                open_braces, close_braces
-            )));
-        }
-
-        let open_parens = vrl_code.matches('(').count();
-        let close_parens = vrl_code.matches(')').count();
-        if open_parens != close_parens {
-            return Err(VrlValidatorError::SyntaxError(format!(
-                "Unbalanced parentheses: {} opening, {} closing",
-                open_parens, close_parens
-            )));
-        }
-
-        let open_brackets = vrl_code.matches('[').count();
-        let close_brackets = vrl_code.matches(']').count();
-        if open_brackets != close_brackets {
-            return Err(VrlValidatorError::SyntaxError(format!(
-                "Unbalanced square brackets: {} opening, {} closing",
-                open_brackets, close_brackets
             )));
         }
 
@@ -2065,11 +2018,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn literal_and_regex_delimiters_do_not_mask_native_diagnostics() {
+        let v = validator();
+        let code = r#"# a comment with ) ] }
+.literal = ") ] }"
+.hit = match("abc)", r'abc\)')
+"#;
+        let result = v.validate_vrl(code).await.unwrap();
+        assert!(result.valid, "{result:?}");
+        let executed = v.test_vrl(code, "{}").await.unwrap();
+        assert!(executed.success, "{executed:?}");
+        assert_eq!(executed.output.unwrap()["hit"], true);
+        let invalid = format!("{code}\n.x = parse_magic(.message)");
+        let (_, errors) = v.validate_vrl_collect_errors(&invalid).await.unwrap();
+        assert!(errors.iter().any(|e| e.contains("E105")), "{errors:?}");
+    }
+
+    #[tokio::test]
     async fn test_unbalanced_braces_rejected() {
         let v = validator();
         let result = v.validate_vrl(".foo = { bar").await.unwrap();
         assert!(!result.valid);
-        assert!(result.error.unwrap().contains("Unbalanced braces"));
+        assert!(result.error.as_deref().unwrap().contains("E204"), "{result:?}");
     }
 
     #[tokio::test]
@@ -2077,7 +2047,7 @@ mod tests {
         let v = validator();
         let result = v.validate_vrl(".foo = parse_json(bar").await.unwrap();
         assert!(!result.valid);
-        assert!(result.error.unwrap().contains("Unbalanced parentheses"));
+        assert!(result.error.as_deref().unwrap().contains("E204"), "{result:?}");
     }
 
     #[tokio::test]
@@ -2085,7 +2055,7 @@ mod tests {
         let v = validator();
         let result = v.validate_vrl(".foo = [1, 2, 3").await.unwrap();
         assert!(!result.valid);
-        assert!(result.error.unwrap().contains("Unbalanced square brackets"));
+        assert!(result.error.as_deref().unwrap().contains("E204"), "{result:?}");
     }
 
     #[tokio::test]

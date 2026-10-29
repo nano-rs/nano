@@ -189,6 +189,72 @@ pub fn merge_reserve_bytes() -> u64 {
     decode_window_rows() as u64 * MERGE_ROW_BYTES
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct InitialMergeShape {
+    pub shift: u8,
+    pub max_inputs: Option<usize>,
+}
+
+/// Shape and fan-in are one first-attempt decision. A full hour that does
+/// not fit even at the smallest shape uses the same halving ladder as a
+/// guard-stopped attempt, without first spending time on that attempt.
+pub(super) fn initial_shape(merge: &crate::parts::levels::PlannedMerge, headroom: Option<u64>, reserved: u64,
+    minimum_shift: u8) -> InitialMergeShape {
+    if merge.output_level != Level::Hour || headroom.is_none() {
+        return InitialMergeShape::default();
+    }
+    let room = headroom.unwrap().saturating_sub(reserved);
+    let smallest = super::merge_attempts::MAX_SHIFT;
+    for shift in minimum_shift.min(smallest)..=smallest {
+        if shape_estimate(&merge.inputs, shift) <= room {
+            return InitialMergeShape { shift, max_inputs: None };
+        }
+    }
+    let splittable = merge.inputs.iter().filter(|part| matches!(part.level, Level::L0 | Level::Minute)).count();
+    if splittable <= 2 {
+        return InitialMergeShape { shift: smallest, max_inputs: None };
+    }
+    let mut cap = (splittable / 2).max(2);
+    loop {
+        // Use actual time-ordered chunks, including the largest/skewed
+        // one. Averaging bytes or rows per input can admit an unsafe chunk.
+        let chunks = crate::parts::levels::split_merge(merge.clone(), cap);
+        if cap == 2 || chunks.iter().all(|chunk| shape_estimate(&chunk.inputs, smallest) <= room) {
+            return InitialMergeShape { shift: smallest, max_inputs: Some(cap) };
+        }
+        cap = (cap / 2).max(2);
+    }
+}
+
+pub(super) fn starting_shape(merge: &crate::parts::levels::PlannedMerge, headroom: Option<u64>, reserved: u64) -> u8 {
+    initial_shape(merge, headroom, reserved, 0).shift
+}
+
+/// Live 116k-row/5-input hours stopped at shift 1 and committed at 2;
+/// 124k/39 and 131k/53 stopped even at shift 3, then committed with fan-in
+/// 19 and 13. The old 10 KiB row allowance and capped-reader-only charge
+/// missed both: use twice the row allowance and two writer-sized buffer
+/// reservations per input, in addition to the currently open readers.
+/// Input/partial state survives reader rotation, so that term must not be
+/// capped by open_inputs_cap or halved with the decode window.
+/// These are estimates; the running guard and durable retry ladder remain.
+fn shape_estimate(inputs: &[PartRef], shift: u8) -> u64 {
+    let rows = inputs.iter().fold(0_u64, |sum, part| sum.saturating_add(part.rows));
+    let bytes = inputs.iter().fold(0_u64, |sum, part| sum.saturating_add(part.data_bytes));
+    let row_bytes = 2 * MERGE_ROW_BYTES;
+    let decoded = rows.saturating_mul(row_bytes)
+        .max((bytes as f64 * super::ingest::INITIAL_ARROW_PER_SOURCE_BYTE) as u64)
+        .min(crate::parts::format::ROW_GROUP_ROWS as u64 * MAX_OPEN_INPUTS as u64 * row_bytes);
+    let copies = (decoded as f64 * super::memory::BUILD_BYTES_PER_BUFFER_BYTE * super::memory::CALIBRATION_MARGIN) as u64;
+    let readers = inputs.len().min((MAX_OPEN_INPUTS >> shift).max(2)) as u64;
+    let input_buffers = (inputs.len() as u64).saturating_mul(2 * super::memory::L0_WRITER_BYTES);
+    (copies >> shift).saturating_add(input_buffers).saturating_add((readers + 1) * super::memory::L0_WRITER_BYTES)
+}
+
+#[cfg(test)]
+#[path = "merge_shape_tests.rs"]
+mod shape_tests;
+
 fn decode_window_rows() -> usize {
     (DECODE_WINDOW_ROWS.load(std::sync::atomic::Ordering::Relaxed) >> shape_shift()).max(512)
 }

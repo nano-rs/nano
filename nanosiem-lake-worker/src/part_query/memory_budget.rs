@@ -27,23 +27,25 @@ use std::path::Path;
 pub const MIB: u64 = 1024 * 1024;
 pub const GIB: u64 = 1024 * MIB;
 /// chDB's share of the role's memory limit.
-pub const SERVER_PERCENT: u64 = 75;
+pub const SERVER_PERCENT: u64 = nanosiem_lake_cell::budget::QUERY_SERVER_PERCENT;
 /// Memory always left outside chDB, whatever the limit (NAN-3046).
-pub const MIN_HEADROOM_BYTES: u64 = 384 * MIB;
-/// Native memory each concurrently admitted request is guaranteed.
+pub const MIN_HEADROOM_BYTES: u64 = nanosiem_lake_cell::budget::QUERY_MIN_HEADROOM_BYTES;
+/// Legacy auxiliary-role memory per slot. Query admission uses role cores.
 pub const MIN_QUERY_BYTES_PER_SLOT: u64 = GIB;
-pub const MAX_CONCURRENCY: usize = 4;
+/// Compatibility ceiling for the small-role runtime and auxiliary lanes.
+/// Query admission itself comes from the shared CPU/memory slot model.
+const BASE_CONCURRENCY: usize = 4;
 /// chDB's own floor for a statement (the planner refuses less).
-const MIN_QUERY_BYTES: u64 = 64 * MIB;
+const MIN_QUERY_BYTES: u64 = nanosiem_lake_cell::budget::QUERY_MIN_STATEMENT_BYTES;
 const MIN_RESULT_BYTES: u64 = 16 * MIB;
-const MAX_RESULT_BYTES: u64 = 256 * MIB;
 /// Raw result bytes per admitted request = headroom / (this x concurrency).
-const RESULT_HEADROOM_DIVISOR: u64 = 12;
+const RESULT_HEADROOM_DIVISOR: u64 = nanosiem_lake_cell::resources::RESULT_DECODE_EXPANSION;
+/// Native pool/stack safety floors; the remainder can decode responses.
+const MIN_HEADROOM_PER_CPU: u64 = 128 * MIB;
+const RUNTIME_HEADROOM_PER_CPU: u64 = 64 * MIB;
 
 /// NAN-3077 size classes (query role): a small lane's statement cap...
 pub const SMALL_QUERY_BYTES: u64 = 256 * MIB;
-/// ...at most this many small lanes...
-pub const MAX_SMALL_LANES: usize = 6;
 /// ...and the smallest large lane worth keeping beside them.
 pub const MIN_LARGE_QUERY_BYTES: u64 = 512 * MIB;
 
@@ -60,41 +62,40 @@ pub struct LaneClasses {
     pub large_bytes: u64,
 }
 
-impl LaneClasses {
-    /// The classes `server_bytes` of chDB memory affords, or `None` when it
-    /// cannot hold two small lanes beside a minimal large one (then the
-    /// equal-lane budget applies).
-    pub fn for_server(server_bytes: u64) -> Option<Self> {
-        let spare = server_bytes.checked_sub(MIN_LARGE_QUERY_BYTES)?;
-        let small_lanes = usize::try_from(spare / SMALL_QUERY_BYTES).ok()?.min(MAX_SMALL_LANES);
-        if small_lanes < 2 {
-            return None;
-        }
-        let large_bytes = server_bytes - small_lanes as u64 * SMALL_QUERY_BYTES;
-        Some(Self { small_lanes, small_bytes: SMALL_QUERY_BYTES, large_bytes })
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryMemoryBudget {
     /// The effective limit: the smaller of the assignment's cap and the
     /// process's cgroup `memory.max` (either may be unknown).
     pub limit_bytes: u64,
+    /// CPU quota, also bounded by memory for native pools and runtime stacks.
+    pub threads: usize,
     /// chDB `max_server_memory_usage`.
     pub server_bytes: u64,
     /// Requests admitted to native work at once (= read lanes).
     pub concurrency: usize,
-    /// chDB `max_memory_usage` per statement.
+    /// Equal share per slot; a small size class may apply a tighter cap.
     pub per_query_bytes: u64,
     /// Largest raw chDB result one statement may hand back for decoding.
     pub result_bytes: u64,
 }
 
 impl QueryMemoryBudget {
+    /// Rust-only paged search uses the same shared decode expansion.
+    pub fn rust_paged_result_bytes(memory: u64, concurrency: u32) -> u64 {
+        nanosiem_lake_cell::resources::rust_paged_result_bytes(memory, concurrency)
+    }
+
     /// Derive from the assignment's cap and the cgroup's `memory.max`
     /// (`None`/0 = unknown or unlimited). With neither known the assignment
     /// value (possibly 0) is treated as 3 GiB, the standard query role.
     pub fn derive(assigned_bytes: u64, cgroup_max_bytes: Option<u64>) -> Self {
+        Self::derive_for_role(assigned_bytes, cgroup_max_bytes, 4_000)
+    }
+
+    /// Production role sizing. The caller supplies the effective CPU quota
+    /// (assignment intersected with visible cgroup ancestors).
+    pub fn derive_for_role(assigned_bytes: u64, cgroup_max_bytes: Option<u64>, cpu_millis: u32) -> Self {
         let limit_bytes = [Some(assigned_bytes), cgroup_max_bytes]
             .into_iter()
             .flatten()
@@ -107,42 +108,105 @@ impl QueryMemoryBudget {
         let server_bytes = (limit_bytes / 100 * SERVER_PERCENT)
             .min(limit_bytes.saturating_sub(MIN_HEADROOM_BYTES))
             .max(2 * MIN_QUERY_BYTES);
-        let concurrency = usize::try_from(server_bytes / MIN_QUERY_BYTES_PER_SLOT)
-            .unwrap_or(MAX_CONCURRENCY)
-            .clamp(1, MAX_CONCURRENCY);
+        // CPU demand is independent of the memory ingest left behind. The
+        // role-derived thread cap stays usable after ingest shifts memory.
+        // Memory still bounds slot count and native/runtime stack overhead.
+        let threads = (nanosiem_lake_cell::budget::query_threads(cpu_millis) as usize)
+            .min((limit_bytes.saturating_sub(server_bytes) / MIN_HEADROOM_PER_CPU).max(1) as usize);
+        let concurrency = nanosiem_lake_cell::budget::query_slots(cpu_millis, server_bytes);
         let per_query_bytes = (server_bytes / concurrency as u64).max(MIN_QUERY_BYTES);
         // Decoded rows are ~8-10x their raw JSON (measured: a 64 MiB result
         // peaked ~600 MiB of Rust heap); keep every admitted request's decode
         // and response inside the headroom chDB does not use.
-        let headroom = limit_bytes.saturating_sub(server_bytes);
-        let result_bytes = (headroom / (RESULT_HEADROOM_DIVISOR * concurrency as u64)).clamp(MIN_RESULT_BYTES, MAX_RESULT_BYTES);
-        Self { limit_bytes, server_bytes, concurrency, per_query_bytes, result_bytes }
+        let headroom = result_headroom(limit_bytes, server_bytes, threads);
+        let decoders = concurrency + super::engine::POINT_PERMITS + 1;
+        let result_bytes = (headroom / (RESULT_HEADROOM_DIVISOR * decoders as u64)).max(1);
+        Self { limit_bytes, threads, server_bytes, concurrency, per_query_bytes, result_bytes }
     }
 
     /// [`Self::derive`] with size classes (the query role, NAN-3077): the
-    /// admission slots are the small lanes plus the large one, and a
-    /// statement's default cap is the small one. Falls back to the equal
-    /// lanes when the memory cannot hold the classes.
+    /// admission slots are the small lanes plus the large one. The equal
+    /// share stays `server_bytes / concurrency`; the planner separately
+    /// applies a small statement's tighter class cap. Falls back to equal
+    /// lanes when memory cannot hold the classes.
     pub fn with_classes(self) -> (Self, Option<LaneClasses>) {
-        let Some(classes) = LaneClasses::for_server(self.server_bytes) else { return (self, None) };
-        let concurrency = classes.small_lanes + 1;
-        let headroom = self.limit_bytes.saturating_sub(self.server_bytes);
-        let result_bytes = (headroom / (RESULT_HEADROOM_DIVISOR * concurrency as u64)).clamp(MIN_RESULT_BYTES, MAX_RESULT_BYTES);
-        (Self { concurrency, per_query_bytes: classes.small_bytes, result_bytes, ..self }, Some(classes))
+        // One small statement gets at least the historical 256 MiB, then
+        // 1/64 of role memory. Keep the planner's 64 GiB validation ceiling.
+        let small_bytes = (self.limit_bytes / 64 / MIB * MIB).clamp(SMALL_QUERY_BYTES, crate::planner::MAX_QUERY_MEMORY_BYTES);
+        // Classes divide the CPU-derived admission slots without creating
+        // extra slots. Every raw response shares the Rust headroom below.
+        let small_lanes = self.concurrency.saturating_sub(1);
+        if small_lanes < 2 { return (self, None); }
+        let small_bytes = small_bytes.min(self.per_query_bytes);
+        let large_bytes = self.server_bytes.saturating_sub(small_lanes as u64 * small_bytes);
+        if large_bytes < MIN_LARGE_QUERY_BYTES { return (self, None); }
+        let classes = LaneClasses { small_lanes, small_bytes, large_bytes };
+        let concurrency = self.concurrency;
+        let headroom = result_headroom(self.limit_bytes, self.server_bytes, self.threads);
+        // Small jobs already hold an interactive permit. Account for
+        // point responses and general jobs too; no result floor may consume
+        // more memory than the role can afford at its derived concurrency.
+        let decoders = concurrency + super::engine::POINT_PERMITS + self.job_slots(Some(classes)).0;
+        let result_bytes = (headroom / (RESULT_HEADROOM_DIVISOR * decoders as u64)).max(1);
+        (Self { result_bytes, ..self }, Some(classes))
+    }
+
+    /// Detect/product keep their measured equal-lane layout. The query
+    /// role opts into CPU-sized admission even when too small for classes.
+    pub fn auxiliary_role(self) -> Self {
+        let concurrency = (self.server_bytes / MIN_QUERY_BYTES_PER_SLOT).clamp(1, BASE_CONCURRENCY as u64) as usize;
+        let per_query_bytes = (self.server_bytes / concurrency as u64).max(MIN_QUERY_BYTES);
+        let result_bytes = (self.limit_bytes.saturating_sub(self.server_bytes) / (RESULT_HEADROOM_DIVISOR * concurrency as u64))
+            .clamp(MIN_RESULT_BYTES, 256 * MIB);
+        Self { concurrency, per_query_bytes, result_bytes, ..self }
     }
 
     /// [`Self::derive`] against this process's own cgroup.
     pub fn for_process(assigned_bytes: u64) -> Self {
-        let cgroup = crate::cgroup_memory::for_process().limit().map(|limit| limit.bytes);
-        let budget = Self::derive(assigned_bytes, cgroup);
+        Self::for_process_role(assigned_bytes, 4_000)
+    }
+
+    pub fn for_process_role(assigned_bytes: u64, cpu_millis: u32) -> Self {
+        Self::for_cgroup(assigned_bytes, cpu_millis, &crate::cgroup_memory::for_process())
+    }
+
+    /// Same production path for a role leaf, a Docker mount, or a fixture.
+    pub(crate) fn for_cgroup(assigned_bytes: u64, cpu_millis: u32, cgroup: &crate::cgroup_memory::MemoryCgroup) -> Self {
+        let cpu_millis = cgroup.role_cpu_millis(cpu_millis);
+        let cgroup = cgroup.limit().map(|limit| limit.bytes);
+        let budget = Self::derive_for_role(assigned_bytes, cgroup, cpu_millis);
         tracing::info!(
-            assigned_bytes, cgroup_memory_max = ?cgroup, limit_bytes = budget.limit_bytes,
+            assigned_bytes, cpu_millis, threads = budget.threads, cgroup_memory_max = ?cgroup, limit_bytes = budget.limit_bytes,
             server_bytes = budget.server_bytes, concurrency = budget.concurrency,
             per_query_bytes = budget.per_query_bytes, result_bytes = budget.result_bytes,
             "query memory budget"
         );
         budget
     }
+
+    /// One runtime worker per usable CPU, plus one for control/IO. These
+    /// futures have 16 MiB stacks; `threads` already charges their memory.
+    pub fn runtime_threads(&self) -> usize {
+        let workers = if self.limit_bytes <= 4 * GIB { self.threads.min(BASE_CONCURRENCY) } else { self.threads };
+        workers + 1
+    }
+
+    /// General jobs share the large-memory envelope; small jobs borrow
+    /// interactive slots. Eight CPUs per job preserves interactive priority.
+    pub fn job_slots(&self, classes: Option<LaneClasses>) -> (usize, usize) {
+        let Some(classes) = classes else { return (1, 1) };
+        if self.limit_bytes <= 4 * GIB { return (1, 1); }
+        let by_cpu = (self.threads / 8).max(1);
+        (by_cpu.min((classes.large_bytes / GIB).max(1) as usize), by_cpu.min((classes.small_lanes / 2).max(1)))
+    }
+}
+
+/// Larger runtimes need stack/cache room beside every decoded response.
+/// Small roles retain their established runtime ceiling and fixed reserve.
+fn result_headroom(limit: u64, server: u64, threads: usize) -> u64 {
+    let headroom = limit.saturating_sub(server);
+    if limit <= 4 * GIB { headroom }
+    else { headroom.saturating_sub(MIN_HEADROOM_BYTES + threads as u64 * RUNTIME_HEADROOM_PER_CPU) }
 }
 
 /// The tightest memory limit on the process's cgroup path (the cgroup
@@ -205,66 +269,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn size_classes_by_query_memory() {
-        // 3 GiB query role: 6 x 256 MiB small lanes + a 768 MiB large lane.
-        let (budget, classes) = QueryMemoryBudget::derive(3 * GIB, Some(3 * GIB)).with_classes();
+    fn nan4825_slots_follow_cores_before_ingest_memory_and_stay_bounded() {
+        for gib in [1, 2, 4, 8, 32, 64, 512] {
+            for cpu in [500, 4_000, 6_000, 8_000, 16_000, 32_000, 128_000, u32::MAX] {
+                let raw = QueryMemoryBudget::derive_for_role(gib * GIB, None, cpu);
+                assert!(raw.concurrency >= 2);
+                assert_eq!(raw.per_query_bytes, raw.server_bytes / raw.concurrency as u64);
+                assert!(raw.per_query_bytes >= MIN_QUERY_BYTES);
+                let (budget, classes) = raw.with_classes();
+                assert_eq!(budget.concurrency, raw.concurrency, "classes cannot change core-sized admission");
+                assert_eq!(budget.per_query_bytes, budget.server_bytes / budget.concurrency as u64);
+                assert!(budget.threads <= 128);
+                let general = budget.job_slots(classes).0;
+                let decoders = budget.concurrency + super::super::engine::POINT_PERMITS + general;
+                assert!(budget.result_bytes * RESULT_HEADROOM_DIVISOR * decoders as u64 <= budget.limit_bytes - budget.server_bytes);
+                if gib > 4 {
+                    let reserve = MIN_HEADROOM_BYTES + budget.threads as u64 * RUNTIME_HEADROOM_PER_CPU;
+                    assert!(reserve + budget.result_bytes * RESULT_HEADROOM_DIVISOR * decoders as u64 <= budget.limit_bytes - budget.server_bytes);
+                }
+                if let Some(classes) = classes {
+                    assert_eq!(classes.small_lanes + 1, budget.concurrency);
+                    assert_eq!(classes.small_bytes * classes.small_lanes as u64 + classes.large_bytes, budget.server_bytes);
+                }
+                if gib <= 4 { assert!(budget.runtime_threads() <= 5); }
+            }
+        }
+        // The 8-core host allocates 75% (6 cores) to query. 2 GiB left
+        // after ingest no longer turns that role into a single-slot reader.
+        for cpu in [6_000, 8_000] {
+            let budget = QueryMemoryBudget::derive_for_role(2 * GIB, None, cpu);
+            assert!(budget.concurrency >= 3);
+            assert_eq!(budget.threads, 4, "keep the memory-bounded thread cap; slots still follow host CPU");
+        }
+        let placed = nanosiem_lake_cell::trusted_local::size_for(8 * GIB, 8, Some(10_000));
+        let budget = QueryMemoryBudget::derive_for_role(placed.query.3, None, placed.query.1);
+        assert!(budget.concurrency >= 3);
+        assert!(placed.query.3 >= nanosiem_lake_cell::budget::QUERY_MEMORY_FLOOR_BYTES);
+    }
+
+    #[test]
+    fn size_classes_preserve_the_core_derived_slots() {
+        let raw = QueryMemoryBudget::derive_for_role(3 * GIB, None, 8_000);
+        let (budget, classes) = raw.with_classes();
         let classes = classes.unwrap();
-        assert_eq!((classes.small_lanes, classes.small_bytes / MIB), (6, 256));
-        assert_eq!(classes.large_bytes, budget.server_bytes - 6 * SMALL_QUERY_BYTES);
-        assert!(classes.large_bytes > 760 * MIB);
-        assert_eq!(budget.concurrency, 7);
-        assert_eq!(budget.per_query_bytes, SMALL_QUERY_BYTES);
+        assert_eq!((budget.concurrency, classes.small_lanes), (4, 3));
+        assert_eq!(classes.small_bytes, SMALL_QUERY_BYTES);
         assert_eq!(classes.small_lanes as u64 * classes.small_bytes + classes.large_bytes, budget.server_bytes);
-        assert!(budget.result_bytes >= MIN_RESULT_BYTES);
-        // 4 GiB: the same small lanes, a 1.5 GiB large lane.
-        let (_, four) = QueryMemoryBudget::derive(4 * GIB, None).with_classes();
-        assert!(four.unwrap().large_bytes > 1500 * MIB);
-        // 2 GiB: fewer small lanes, the minimal large lane.
-        let (two_budget, two) = QueryMemoryBudget::derive(2 * GIB, None).with_classes();
-        assert_eq!((two.unwrap().small_lanes, two_budget.concurrency), (3, 4));
-        assert!(two.unwrap().large_bytes >= MIN_LARGE_QUERY_BYTES);
-        // Too small for classes: the equal-lane budget, unchanged.
-        let (small, none) = QueryMemoryBudget::derive(GIB, None).with_classes();
-        assert!(none.is_none());
-        assert_eq!(small, QueryMemoryBudget::derive(GIB, None));
+        let raw = QueryMemoryBudget::derive_for_role(GIB, None, 4_000);
+        let (equal, classes) = raw.with_classes();
+        assert!(classes.is_none());
+        assert_eq!(equal, raw);
+        assert_eq!(equal.concurrency, 2);
     }
 
     #[test]
     fn three_gib_query_role() {
         let budget = QueryMemoryBudget::derive(3 * GIB, Some(3 * GIB));
-        assert_eq!(budget.limit_bytes, 3 * GIB);
-        assert_eq!(budget.server_bytes, 3 * GIB / 100 * 75);
         assert_eq!(budget.concurrency, 2);
-        assert_eq!(budget.per_query_bytes, budget.server_bytes / 2);
-        // Leaves ~768 MiB outside chDB; results decode inside it.
-        assert!(budget.limit_bytes - budget.server_bytes >= 700 * MIB);
-        assert_eq!(budget.result_bytes, (budget.limit_bytes - budget.server_bytes) / 24);
-        assert_eq!(budget.result_bytes / MIB, 32);
-        // Every admitted statement at its cap still fits under chDB's cap.
-        assert!(budget.per_query_bytes * budget.concurrency as u64 <= budget.server_bytes);
+        assert_eq!(budget.per_query_bytes * 2, budget.server_bytes);
+        assert!(budget.server_bytes < budget.limit_bytes);
     }
 
-    /// NAN-3047: detect[T] running rules derives its budget from its own
-    /// memory.max, 512 MiB below it. At the proposed 2 GiB: the measured
-    /// configuration (engine derived from 1.5 GiB: one lane, claims queue on
-    /// the admission semaphore with a 60 s deadline, ~1.1 GiB chDB) with
-    /// 2 GiB of kernel limit around it. At the 1.5 GiB floor: 1 GiB engine.
     #[test]
     fn detect_role_budgets() {
-        let proposed = QueryMemoryBudget::derive(detect_engine_cap(2 * GIB), Some(2 * GIB));
+        let proposed = QueryMemoryBudget::derive(detect_engine_cap(2 * GIB), Some(2 * GIB)).auxiliary_role();
         assert_eq!(proposed.limit_bytes, 3 * GIB / 2);
         assert_eq!(proposed.concurrency, 1);
-        assert_eq!(proposed.server_bytes, 3 * GIB / 2 / 100 * 75);
         assert_eq!(proposed.per_query_bytes, proposed.server_bytes);
-
-        assert_eq!((2 * GIB - proposed.server_bytes) / MIB, 896);
-        let floor = QueryMemoryBudget::derive(detect_engine_cap(3 * GIB / 2), Some(3 * GIB / 2));
+        let floor = QueryMemoryBudget::derive(detect_engine_cap(3 * GIB / 2), Some(3 * GIB / 2)).auxiliary_role();
         assert_eq!((floor.limit_bytes, floor.concurrency), (GIB, 1));
-        // The fixed 384 MiB headroom leaves 640 MiB for a 1 GiB engine.
         assert_eq!(floor.per_query_bytes, GIB - MIN_HEADROOM_BYTES);
         assert!(floor.result_bytes >= MIN_RESULT_BYTES);
-        // A tiny limit still gets a usable engine cap (the cell never assigns it).
         assert_eq!(detect_engine_cap(256 * MIB), 512 * MIB);
+        assert_eq!(QueryMemoryBudget::derive(128 * GIB, None).auxiliary_role().result_bytes, 256 * MIB);
     }
 
     #[test]
@@ -288,15 +365,15 @@ mod tests {
     #[test]
     fn scales_and_stays_bounded() {
         let hobby = QueryMemoryBudget::derive(358 * MIB, None);
-        assert_eq!(hobby.concurrency, 1);
+        assert_eq!(hobby.concurrency, 2);
         assert!(hobby.server_bytes < hobby.limit_bytes);
         assert!(hobby.per_query_bytes >= MIN_QUERY_BYTES);
         let big = QueryMemoryBudget::derive(7 * GIB, None);
-        assert_eq!(big.concurrency, 4);
-        assert!(big.per_query_bytes * 4 <= big.server_bytes);
-        let huge = QueryMemoryBudget::derive(64 * GIB, None);
-        assert_eq!(huge.concurrency, MAX_CONCURRENCY);
-        assert_eq!(huge.result_bytes, MAX_RESULT_BYTES);
+        assert_eq!(big.concurrency, 2);
+        assert!(big.per_query_bytes * 2 <= big.server_bytes);
+        let huge = QueryMemoryBudget::derive(128 * GIB, None);
+        assert_eq!(huge.concurrency, 2);
+        assert!(huge.result_bytes > 256 * MIB, "result memory scales with headroom");
         let mut previous = QueryMemoryBudget::derive(256 * MIB, None);
         for mib in (256..16_384).step_by(128) {
             let budget = QueryMemoryBudget::derive(mib * MIB, None);

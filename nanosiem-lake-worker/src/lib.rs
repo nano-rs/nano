@@ -141,6 +141,8 @@ pub mod r2_ops;
 
 pub mod query_timing;
 pub mod thread_budget;
+#[cfg(test)]
+mod query_capacity_native_tests;
 pub mod perf_overrides;
 
 
@@ -148,3 +150,6 @@ pub mod perf_overrides;
 pub mod writer_reclaim;
 
 pub mod tail_predicate;
+
+#[cfg(test)]
+mod nan4831_profile;

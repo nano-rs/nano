@@ -1333,6 +1333,17 @@ if LEGACY_CH_REASON=$(legacy_clickhouse_reason "$NANO_INSTALL_DIR"); then
     refuse_legacy_clickhouse_install "$NANO_INSTALL_DIR" "$LEGACY_CH_REASON"
 fi
 
+# Refuse before updating the checkout, .env, or live placement. In particular,
+# lean-init re-renders files an existing cell watches even without a restart.
+# A smaller existing install must keep its working release and budgets.
+LEAN_HOST_MEMORY_BYTES=$(memory_capacity_bytes)
+if (( LEAN_HOST_MEMORY_BYTES < 8 * 1073741824 )); then
+    if [[ -f "$NANO_INSTALL_DIR/.env" ]]; then
+        fail "This release needs at least 8 GiB available to Docker (detected ${LEAN_HOST_MEMORY_BYTES} bytes). Upgrade stopped before changing the existing install; its release, configuration and running services are preserved. Resize the host before retrying."
+    fi
+    fail "A fresh lean install needs at least 8 GiB available to Docker (detected ${LEAN_HOST_MEMORY_BYTES} bytes). Increase Docker memory or resize this host before installing."
+fi
+
 # ----------------------------------------------------------------------------
 # 2. Clone or update the repo
 # ----------------------------------------------------------------------------
@@ -1865,40 +1876,20 @@ if [[ "$USE_LEAN" == "1" ]]; then
     upsert_env_file_value NANO_DRAGONFLY_VOLUME nano-lean-dragonfly
     export NANO_LAKE_TENANT_ID="$LEAN_TENANT_ID" NANO_TENANT_ID="$LEAN_TENANT_ID"
     export NANO_DRAGONFLY_DATA_VOLUME="$LEAN_DRAGONFLY_VOLUME" NANO_DRAGONFLY_VOLUME=nano-lean-dragonfly
-    # Coarse container backstop for the watchdog-enforced role limits: the
-    # budget lean-init sized the roles from (base shares 50/25/15 for
-    # query/ingest/detect, rebalanced for ingest headroom; 10 % for the rest).
-    LEAN_CELL_MEM_LIMIT=$(python3 - .nano-lean/cell/placement.json <<'PYMEM'
-import json, sys
-tenant = json.load(open(sys.argv[1]))['tenants'][0]
-roles = sum(tenant[f'{role}_limit_memory_bytes'] for role in ('query', 'ingest', 'detect'))
-mib = 1 << 20
-print(-(-roles * 10 // 9 // mib) * mib)
-PYMEM
-) || fail "Could not size the lake cell memory limit from .nano-lean/cell/placement.json."
-    upsert_env_file_value NANO_LAKE_CELL_MEM_LIMIT "$LEAN_CELL_MEM_LIMIT"
-    export NANO_LAKE_CELL_MEM_LIMIT="$LEAN_CELL_MEM_LIMIT"
-    # NAN-3492: nano-jobs decodes each lake rule window in-process (budgeted
-    # to 40 % of its own limit), so it scales with the placed detect budget:
-    # a quarter of the detect role's limit, 1 GiB floor (512M OOM-killed a
-    # clean install), 4 GiB cap. An operator's NANO_JOBS_MEM_LIMIT wins.
-    if [[ -n "${NANO_JOBS_MEM_LIMIT:-}" ]]; then
-        [[ "$NANO_JOBS_MEM_LIMIT" =~ ^[0-9]+([.][0-9]+)?[KMGT]?[iI]?[bB]?$ ]] \
-            || fail "NANO_JOBS_MEM_LIMIT is not a Docker memory value."
-        LEAN_JOBS_MEM_LIMIT="$NANO_JOBS_MEM_LIMIT"
-    else
-        LEAN_JOBS_MEM_LIMIT=$(python3 - .nano-lean/cell/placement.json <<'PYJOBS'
-import json, sys
-tenant = json.load(open(sys.argv[1]))['tenants'][0]
-mib, gib = 1 << 20, 1 << 30
-detect = tenant.get('detect_limit_memory_bytes') or 0
-print(f'{min(max(detect // 4, gib), 4 * gib) // mib}M')
-PYJOBS
-) || fail "Could not size the nano-jobs memory limit from .nano-lean/cell/placement.json."
+    # One model owns roles AND containers; re-render after every host resize.
+    # The generated file supersedes fixed compose limits and historical sizing
+    # overrides (NANO_*_MEM_LIMIT, Dragonfly maxmemory, Vector batch/buffer).
+    [[ -f .nano-lean/compose.resources.json ]] || fail "lean-init did not render host resources; use matching cell images."
+    cp .nano-lean/compose.resources.json docker-compose.host-resources.yml
+    if [[ ! " ${COMPOSE_ARGS[*]} " == *" -f docker-compose.host-resources.yml "* ]]; then
+        COMPOSE_ARGS+=(-f docker-compose.host-resources.yml)
     fi
-    upsert_env_file_value NANO_JOBS_MEM_LIMIT "$LEAN_JOBS_MEM_LIMIT"
-    export NANO_JOBS_MEM_LIMIT="$LEAN_JOBS_MEM_LIMIT"
-    log "Sized nano-jobs memory limit to $LEAN_JOBS_MEM_LIMIT"
+    local host_compose_files="$COMPOSE_FILE"
+    for overlay in ${NANO_OVERLAY_LIST[@]+"${NANO_OVERLAY_LIST[@]}"}; do
+        host_compose_files+=":$overlay"
+    done
+    upsert_env_file_value COMPOSE_FILE "$host_compose_files:docker-compose.host-resources.yml"
+    log "Applied host-sized role and container resources"
     log "Probing cell isolation; missing Landlock warns on trusted-local only"
     LEAN_PROBE_LOG=$(mktemp "${TMPDIR:-/tmp}/nano-lean-probe.XXXXXX")
     if ! docker </dev/null compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint nanosiem-lake-cell lake-cell \
@@ -2009,10 +2000,10 @@ if [[ "${TENZIR_DIRECT:-0}" == "1" ]]; then
     echo
     printf "  Ingest:   Tenzir-direct (OCSF bucket drop; no Vector, so no HTTP /ingest, HEC, OTLP or pull connectors)\n"
     printf "  Next:     add a source; it prints a write-only key and a ready-to-paste Tenzir to_s3 sink once:\n"
-    printf "              docker compose -f %s/%s run --rm lean-landing-admin add --name <name>\n" "$NANO_INSTALL_DIR" "$COMPOSE_FILE"
+    printf "              (cd %q && docker compose run --rm lean-landing-admin add --name <name>)\n" "$NANO_INSTALL_DIR"
     printf "            Run Tenzir on this host's compose network (%s_default, endpoint lake-object-store:9000),\n" "${COMPOSE_PROJECT_NAME:-$(basename "$NANO_INSTALL_DIR")}"
     printf "            or use the bundled node: put the pipeline in %s/.nano-tenzir/pipeline.tql and run\n" "$NANO_INSTALL_DIR"
-    printf "              docker compose -f %s/%s --profile tenzir up -d tenzir\n" "$NANO_INSTALL_DIR" "$COMPOSE_FILE"
+    printf "              (cd %q && docker compose --profile tenzir up -d tenzir)\n" "$NANO_INSTALL_DIR"
     printf "            Put sysmon.ndjson in %s/.nano-tenzir/data (mounted at /data, read-only).\n" "$NANO_INSTALL_DIR"
     printf "            Example pipeline: %s/tenzir/lean/sysmon-bucket.tql   Guide: %s/tenzir/AGENTS.md\n" "$NANO_INSTALL_DIR" "$NANO_INSTALL_DIR"
     printf "            Status: Ingestion → Credentials → Bucket drop sources.   Add Vector later: install.sh --add-vector\n"
@@ -2053,7 +2044,7 @@ elif [[ "$NANO_NONINTERACTIVE" != "1" && -n "${VECTOR_AUTH_TOKEN:-}" ]]; then
     if [[ "${USE_LEAN:-0}" == "1" ]]; then
         echo
         printf "  Tenzir:   OCSF bucket drop beside Vector (tenzir/AGENTS.md); add a source with\n"
-        printf "              docker compose -f %s/%s run --rm lean-landing-admin add --name <name>\n" "$NANO_INSTALL_DIR" "$COMPOSE_FILE"
+        printf "              (cd %q && docker compose run --rm lean-landing-admin add --name <name>)\n" "$NANO_INSTALL_DIR"
     fi
     # NAN-1603 / NAN-1604: direct OCSF ingestion (Tenzir / Cribl / custom) writes
     # straight into ClickHouse, bypassing Vector. Only meaningful on the OCSF profile.

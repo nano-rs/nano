@@ -250,7 +250,13 @@ const LAKE_INTERACTIVE_WINDOW_HOURS: i64 = 24;
 pub(crate) const LAKE_PAGE_ROWS: usize = 2_000;
 /// Raw JSON a synchronous (non-streamed) paged answer may gather in this
 /// process; past it the request is escalated to a durable job.
-const LAKE_PAGED_SYNC_MAX_BYTES: usize = 256 * 1024 * 1024;
+fn lake_paged_sync_max_bytes(concurrency: u32) -> usize {
+    // Reuse query sizing's measured JSON expansion/headroom model. The
+    // search container may be much smaller than the cell it pages from.
+    let capacity = nanosiem_lake_cell::resources::detect_capacity(
+        &nanosiem_lake_cell::config::ResourceConfig::default(), None);
+    nanosiem_lake_cell::resources::rust_paged_result_bytes(capacity.memory_bytes, concurrency) as usize
+}
 
 tokio::task_local! {
     /// Installed by the SSE path: paged lean-cell rows are sent here as they
@@ -6464,6 +6470,11 @@ impl SearchService {
         scope: &ScopeSet,
     ) -> Result<Option<SearchResponse>, SearchError> {
         let sink = LAKE_ROW_SINK.try_with(Clone::clone).ok();
+        let concurrency = match &self.admission_controller {
+            Some(controller) => controller.global_adhoc_limit().await,
+            None => super::admission::AdmissionConfig::default().global_adhoc_limit,
+        };
+        let sync_max_bytes = lake_paged_sync_max_bytes(concurrency);
         let gathered = std::sync::Mutex::new((Vec::new(), 0_usize));
         let over_budget = std::sync::atomic::AtomicBool::new(false);
         let paged = client
@@ -6478,7 +6489,7 @@ impl SearchService {
                             let bytes: usize = rows.iter().map(|row| row.to_string().len()).sum();
                             let mut gathered = gathered.lock().expect("paged rows");
                             gathered.1 += bytes;
-                            if gathered.1 > LAKE_PAGED_SYNC_MAX_BYTES {
+                            if gathered.1 > sync_max_bytes {
                                 over_budget.store(true, std::sync::atomic::Ordering::Relaxed);
                                 return false;
                             }

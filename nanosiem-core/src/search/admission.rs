@@ -1855,6 +1855,11 @@ impl AdmissionController {
         }
     }
 
+    /// The process-wide concurrency used to divide gathered-result memory.
+    pub async fn global_adhoc_limit(&self) -> u32 {
+        self.config.lock().await.global_adhoc_limit
+    }
+
     /// Hot-reload configuration without restart
     pub async fn update_config(&self, new_config: AdmissionConfig) {
         let mut config = self.config.lock().await;

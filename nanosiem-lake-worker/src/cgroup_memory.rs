@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Process memory hierarchy discovery, shared by merge guards and query sizing.
-use std::path::{Component, Path, PathBuf};
+//! Process resource hierarchy discovery, shared by merge guards and query sizing.
+use std::path::{Path, PathBuf};
+use nanosiem_lake_cell::resources::relative_path;
 use std::sync::{Arc, Once, OnceLock};
 
 const ROOT: &str = "/sys/fs/cgroup";
 static ROLE: OnceLock<PathBuf> = OnceLock::new();
 static CONTAINER: OnceLock<MemoryCgroup> = OnceLock::new();
 
-/// Preserve only read-only memory metric descriptors before a watchdog-only
+/// Preserve only read-only resource metric descriptors before a watchdog-only
 /// child's jail. Docker has no assigned role leaf, and Landlock deliberately
 /// grants no cgroup path in that mode. Never retain a directory descriptor or
 /// use this fallback for a hosted role with its own cgroup.
@@ -59,14 +60,14 @@ pub(crate) struct MemoryLimit {
 
 impl MemoryCgroup {
     fn pin_memory_files(&mut self) {
-        let names = if self.v1 {
-            [
+        let names: &[&str] = if self.v1 {
+            &[
                 "memory.limit_in_bytes",
                 "memory.usage_in_bytes",
                 "memory.stat",
             ]
         } else {
-            ["memory.max", "memory.current", "memory.stat"]
+            &["memory.max", "memory.current", "memory.stat", "cpu.max", "cpu.stat"]
         };
         let mut files = std::collections::BTreeMap::new();
         for dir in self
@@ -98,6 +99,27 @@ impl MemoryCgroup {
         std::fs::read_to_string(path).ok()
     }
 
+    /// v2 CPU follows the same namespace, ancestor and jail rules as memory.
+    /// v1's separate CPU hierarchy is not granted by the jail; use the trusted
+    /// assignment there instead of probing a different controller mount.
+    fn cpu_millis(&self) -> Option<u32> {
+        if self.v1 { return None; }
+        self.dir.ancestors().take_while(|dir| dir.starts_with(&self.root))
+            .filter_map(|dir| self.read(&dir.join("cpu.max")))
+            .filter_map(|value| nanosiem_lake_cell::resources::parse_cpu_max(&value))
+            .min()
+    }
+
+    pub(crate) fn role_cpu_millis(&self, assigned: u32) -> u32 {
+        effective_cpu_millis(assigned, self.cpu_millis())
+    }
+
+    pub fn cpu_samples(&self) -> Vec<(String, Option<String>)> {
+        self.dir.ancestors().take(2).filter(|dir| dir.starts_with(&self.root))
+            .filter_map(|dir| Some((self.read(&dir.join("cpu.stat"))?, self.read(&dir.join("cpu.max")))))
+            .collect()
+    }
+
     /// Read every visible ancestor: a finite parent can constrain even a
     /// numeric leaf. Unreadable ancestors stay hidden by the existing jail.
     pub fn limit(&self) -> Option<MemoryLimit> {
@@ -125,6 +147,32 @@ impl MemoryCgroup {
         }
         tightest
     }
+}
+
+fn effective_cpu_millis(assigned: u32, cgroup: Option<u32>) -> u32 {
+    [Some(assigned), cgroup].into_iter().flatten().filter(|cpu| *cpu > 0).min()
+        .unwrap_or_else(|| nanosiem_lake_cell::resources::detect_capacity(&Default::default(), None).cpu_millicores)
+}
+
+/// The role/container capacity, using the shared cell detector for host
+/// fallbacks and this module's namespace-aware hierarchy for finite limits.
+/// Read every call so a resized role takes effect without a new env knob.
+pub fn process_capacity() -> nanosiem_lake_cell::resources::CellCapacity {
+    capacity_for(&for_process(), nanosiem_lake_cell::resources::detect_capacity(
+        &nanosiem_lake_cell::config::ResourceConfig::default(), None))
+}
+
+pub(crate) fn capacity_for(cg: &MemoryCgroup, mut capacity: nanosiem_lake_cell::resources::CellCapacity)
+    -> nanosiem_lake_cell::resources::CellCapacity {
+    if let Some(limit) = cg.limit() {
+        capacity.memory_bytes = limit.bytes;
+        capacity.memory_source = "cgroup";
+    }
+    if let Some(cpu) = cg.cpu_millis() {
+        capacity.cpu_millicores = capacity.cpu_millicores.min(cpu);
+        capacity.cpu_source = "cgroup";
+    }
+    capacity
 }
 
 pub(crate) fn for_process() -> MemoryCgroup {
@@ -155,123 +203,100 @@ fn discover() -> MemoryCgroup {
 
 /// Same resolver for real procfs/cgroupfs and filesystem fixtures. `role` is
 /// the original mount-relative JailSpec::cgroup_dir, never a tenant input.
-pub(crate) fn resolve(
-    root: &Path,
-    membership: &str,
-    mountinfo: &str,
-    role: Option<&Path>,
-) -> MemoryCgroup {
-    if let Some(relative) = role.and_then(relative_path) {
-        return MemoryCgroup {
-            dir: root.join(relative),
-            root: root.into(),
-            v1: false,
-            files: None,
-        };
-    }
-    let entries: Vec<_> = membership
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.splitn(3, ':');
-            let (Some(id), Some(controllers), Some(path)) =
-                (fields.next(), fields.next(), fields.next())
-            else {
-                return None;
-            };
-            if controllers
-                .split(',')
-                .any(|controller| controller == "memory")
-            {
-                Some((path, true))
-            } else if id == "0" && controllers.is_empty() {
-                Some((path, false))
-            } else {
-                None
-            }
-        })
-        .collect();
-    // Hybrid hosts may have v2 present while memory still belongs to v1.
-    let (membership, v1) = entries
-        .iter()
-        .find(|(_, v1)| *v1)
-        .or_else(|| entries.first())
-        .copied()
-        .unwrap_or(("/", false));
-    let fallback_root = if v1 { root.join("memory") } else { root.into() };
-    let Some(relative) = relative_path(Path::new(membership)) else {
-        return MemoryCgroup {
-            dir: fallback_root.clone(),
-            root: fallback_root,
-            v1,
-            files: None,
-        };
-    };
-    let membership = Path::new("/").join(&relative);
-    for line in mountinfo.lines() {
-        let Some((before, after)) = line.split_once(" - ") else {
-            continue;
-        };
-        let fields: Vec<_> = before.split_whitespace().collect();
-        let fs: Vec<_> = after.split_whitespace().collect();
-        if fields.len() < 5 || fs.len() < 3 {
-            continue;
-        }
-        let matches = if v1 {
-            fs[0] == "cgroup" && fs[2].split(',').any(|controller| controller == "memory")
-        } else {
-            fs[0] == "cgroup2"
-        };
-        if !matches {
-            continue;
-        }
-        let mount_root = unescape(fields[3]);
-        let mount = PathBuf::from(unescape(fields[4]));
-        // A mount of a subtree exposes /docker/<id> directly at its mount
-        // point. When membership is namespaced to `/`, the mount is our root.
-        let inside = membership
-            .strip_prefix(&mount_root)
-            .ok()
-            .or_else(|| (membership == Path::new("/")).then_some(Path::new("")));
-        if let Some(inside) = inside {
-            return MemoryCgroup {
-                dir: mount.join(inside),
-                root: mount,
-                v1,
-                files: None,
-            };
-        }
-    }
-    MemoryCgroup {
-        dir: fallback_root.join(relative),
-        root: fallback_root,
-        v1,
-        files: None,
-    }
-}
-
-fn relative_path(path: &Path) -> Option<PathBuf> {
-    let mut relative = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(name) => relative.push(name),
-            Component::RootDir | Component::CurDir => {}
-            _ => return None,
-        }
-    }
-    Some(relative)
-}
-
-fn unescape(value: &str) -> String {
-    value
-        .replace("\\040", " ")
-        .replace("\\011", "\t")
-        .replace("\\012", "\n")
-        .replace("\\134", "\\")
+pub(crate) fn resolve(root: &Path, membership: &str, mountinfo: &str, role: Option<&Path>) -> MemoryCgroup {
+    let location = nanosiem_lake_cell::resources::resolve_cgroup(root, membership, mountinfo, role);
+    MemoryCgroup { dir: location.dir, root: location.root, v1: location.v1, files: None }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nan4825_role_cpu_uses_visible_ancestors_and_live_resizes() {
+        let root = tempfile::tempdir().unwrap();
+        let role = Path::new("tenant/query");
+        let leaf = root.path().join(role);
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(root.path().join("cpu.max"), "1600000 100000").unwrap();
+        std::fs::write(leaf.join("cpu.max"), "max 100000").unwrap();
+        std::fs::write(leaf.join("cpu.stat"), "usage_usec 100\n").unwrap();
+        let mut cg = resolve(root.path(), "0::/", "", Some(role));
+        cg.pin_memory_files();
+        assert_eq!(cg.cpu_millis(), Some(16_000));
+        assert_eq!(effective_cpu_millis(32_000, cg.cpu_millis()), 16_000);
+        assert_eq!(effective_cpu_millis(4_000, cg.cpu_millis()), 4_000);
+        let host = nanosiem_lake_cell::resources::CellCapacity {
+            memory_bytes: 64 * 1024 * 1024 * 1024, cpu_millicores: 32_000,
+            memory_source: "host", cpu_source: "host",
+        };
+        assert_eq!(capacity_for(&cg, host.clone()).cpu_millicores, cg.role_cpu_millis(32_000));
+        assert_eq!(capacity_for(&cg, nanosiem_lake_cell::resources::CellCapacity {
+            cpu_millicores: 4_000, ..host.clone()
+        }).cpu_millicores, cg.role_cpu_millis(4_000));
+        assert_eq!(cg.cpu_samples(), vec![("usage_usec 100\n".into(), Some("max 100000".into()))]);
+        std::fs::write(leaf.join("cpu.max"), "350000 100000").unwrap();
+        assert_eq!(effective_cpu_millis(32_000, cg.cpu_millis()), 3_500);
+        assert_eq!(effective_cpu_millis(0, cg.cpu_millis()), 3_500);
+        assert_eq!(capacity_for(&cg, host).cpu_millicores, cg.role_cpu_millis(32_000));
+        assert_eq!(cg.cpu_samples(), vec![("usage_usec 100\n".into(), Some("350000 100000".into()))]);
+        assert_eq!(effective_cpu_millis(32_000, None), 32_000);
+        let from_shared_model = nanosiem_lake_cell::resources::detect_capacity(
+            &Default::default(), Some(&leaf));
+        assert_eq!(cg.cpu_millis(), Some(from_shared_model.cpu_millicores));
+    }
+
+    #[test]
+    fn nan4827_role_and_parent_limits_drive_runtime_sizing_after_resizes() {
+        use nanosiem_lake_cell::budget::{GIB, MIB};
+        assert_eq!(crate::landing::bucket_drop_limits(GIB, 8000).0, 4);
+        let lanes = crate::landing::bucket_drop_limits(2268 * MIB, 64000).0;
+        assert_eq!(lanes, 8);
+        let (request, burst) = nanosiem_lake_cell::trusted_local::landing_cpu_budget(64000);
+        assert!(lanes as u32 * 1000 >= request && burst >= request);
+        assert_eq!(nanosiem_lake_cell::budget::query_threads(64000), 64);
+        for (memory, cpu) in [(2 * GIB, 4000), (3413114880, 4000), (8 * GIB, 8000), (32 * GIB, 16000), (64 * GIB, 32000), (64 * GIB, 64000)] {
+            let root = tempfile::tempdir().unwrap();
+            let leaf = root.path().join("tenant/landing");
+            std::fs::create_dir_all(&leaf).unwrap();
+            std::fs::write(leaf.join("memory.max"), memory.to_string()).unwrap();
+            std::fs::write(leaf.join("cpu.max"), format!("{} 100000", cpu * 100)).unwrap();
+            let cg = resolve(root.path(), "0::/tenant/landing", "", None);
+            let host = nanosiem_lake_cell::resources::CellCapacity { memory_bytes: 128 * GIB, cpu_millicores: 64000,
+                memory_source: "host", cpu_source: "host" };
+            let capacity = capacity_for(&cg, host.clone());
+            assert_eq!((capacity.memory_bytes, capacity.cpu_millicores), (memory, cpu));
+            let (lanes, bytes) = crate::landing::landing_limits(capacity.memory_bytes, capacity.cpu_millicores);
+            assert_eq!(lanes, (cpu / 1000) as usize);
+            let (bucket_lanes, _) = crate::landing::bucket_drop_limits(capacity.memory_bytes, capacity.cpu_millicores);
+            assert_eq!(bucket_lanes, lanes);
+            // Dedicated query borrowing grows beyond the old eight-thread cap.
+            // Agent lanes still yield to analysts through the production pool.
+            let budget = crate::part_query::memory_budget::QueryMemoryBudget::derive_for_role(memory, None, cpu);
+            let (threads, _) = crate::part_query::server::role_statement_limits(&budget, None);
+            assert_eq!(threads, budget.threads as u64);
+            assert!(threads <= u64::from(cpu / 1000));
+            let pool = crate::thread_budget::ThreadBudget::new(threads);
+            let analyst = pool.grant(crate::thread_budget::Priority::Interactive);
+            let agent = pool.grant(crate::thread_budget::Priority::Agent);
+            assert_eq!(analyst.threads(), threads);
+            assert_eq!(agent.threads(), 1);
+            if cpu >= 8000 { assert!(analyst.threads() > agent.threads()); }
+
+            if memory <= 3413114880 { assert!(bytes <= 256 * MIB); }
+            else { assert!(bytes > 256 * MIB); }
+            let (query, fetches) = crate::reader_object_cache::resource_limits(memory, cpu, 16 * GIB);
+            assert!(query <= memory / 4 && fetches <= (memory / (64 * MIB)) as usize);
+            let result = crate::part_query::memory_budget::QueryMemoryBudget::rust_paged_result_bytes(memory, 30);
+            assert!(result * 30 * 12 <= memory / 2);
+            // A tighter parent wins over the numeric role leaf.
+            std::fs::write(root.path().join("tenant/memory.max"), (memory / 2).to_string()).unwrap();
+            std::fs::write(root.path().join("tenant/cpu.max"), "50000 100000").unwrap();
+            let shrunk = capacity_for(&cg, host);
+            assert_eq!((shrunk.memory_bytes, shrunk.cpu_millicores), (memory / 2, 500));
+            assert_eq!(crate::landing::landing_limits(shrunk.memory_bytes, shrunk.cpu_millicores).0, 1);
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -306,6 +331,10 @@ mod tests {
                 std::fs::write(leaf.join(limit), "2090000000\n").unwrap();
                 std::fs::write(leaf.join(current), "600000000\n").unwrap();
                 std::fs::write(leaf.join("memory.stat"), "file 1234\n").unwrap();
+                if !v1 {
+                    std::fs::write(leaf.join("cpu.max"), "1600000 100000\n").unwrap();
+                    std::fs::write(leaf.join("cpu.stat"), "usage_usec 100\n").unwrap();
+                }
                 let membership = if v1 {
                     "7:memory:/docker/container\n"
                 } else {
@@ -360,6 +389,16 @@ mod tests {
                 cg.read(&cg.dir.join("memory.stat")).as_deref(),
                 Some("file 1234\n")
             );
+            if !cg.v1 {
+                let host = nanosiem_lake_cell::resources::CellCapacity {
+                    cpu_millicores: 16000, memory_bytes: 4 * 1024 * 1024 * 1024,
+                    cpu_source: "host", memory_source: "host",
+                };
+                assert_eq!(capacity_for(&cg, host.clone()).cpu_millicores, 16000);
+                assert_eq!(cg.cpu_samples(), vec![("usage_usec 100\n".into(), Some("1600000 100000\n".into()))]);
+                std::fs::write(cg.dir.join("cpu.max"), "800000 100000\n").unwrap();
+                assert_eq!(capacity_for(&cg, host).cpu_millicores, 8000);
+            }
             // A kernel resize remains visible through the read-only descriptor.
             std::fs::write(&limit, "1900000000\n").unwrap();
             assert_eq!(cg.limit().unwrap().bytes, 1_900_000_000);

@@ -39,12 +39,29 @@ const EXECUTOR_MEMORY_ARGS: &[&str] = &[
 /// with the same value, which is why it is fixed per executor and resolved
 /// once at boot by the caller.
 pub fn executor_connection_args(server_memory_limit_bytes: Option<u64>) -> Vec<String> {
+    executor_connection_args_for_role(server_memory_limit_bytes, None)
+}
+
+/// The global pool also runs parsing, asynchronous IO and engine maintenance.
+/// It cannot be limited to just the query cores (the shipped library stalls
+/// during startup at six). Keep control/IO room plus four workers per core;
+/// CPU priority and statement caps remain the thread budget's responsibility.
+pub fn role_global_pool_threads(threads: u64) -> u64 {
+    64 + 4 * threads.clamp(1, nanosiem_lake_cell::budget::QUERY_MAX_THREADS as u64)
+}
+
+pub fn executor_connection_args_for_role(server_memory_limit_bytes: Option<u64>, role_threads: Option<u64>) -> Vec<String> {
     let mut arguments = EXECUTOR_MEMORY_ARGS
         .iter()
         .map(|argument| (*argument).to_string())
         .collect::<Vec<_>>();
     if let Some(bytes) = server_memory_limit_bytes {
         arguments.push(format!("--max_server_memory_usage={bytes}"));
+    }
+    if let Some(threads) = role_threads {
+        let pool = role_global_pool_threads(threads);
+        arguments.push(format!("--max_thread_pool_size={pool}"));
+        arguments.push(format!("--max_thread_pool_free_size={pool}"));
     }
     arguments
 }
@@ -64,6 +81,10 @@ pub enum ExecutorError {
     Startup(#[source] NativeChdbError),
     #[error("native chDB executor is unavailable")]
     Unavailable,
+    #[error("native chDB lane {lane} thread could not start after {attempts} attempts: {source}")]
+    ThreadSpawn { lane: String, attempts: usize, #[source] source: std::io::Error },
+    #[error("native chDB lane {lane} exited before reporting startup readiness")]
+    StartupLaneStopped { lane: String },
     #[error("native chDB executor requires at least one connection")]
     EmptyPool,
     #[error("native chDB server memory limit must be positive")]
@@ -528,6 +549,19 @@ impl NativeExecutor {
         mode: ExecutorMode,
         server_memory_limit_bytes: Option<u64>,
     ) -> Result<Self, ExecutorError> {
+        Self::start_with_role_limits(runtime, connection_count, lane_name, mode, server_memory_limit_bytes, None)
+    }
+
+    /// Apply the same immutable engine settings on every connection,
+    /// including read, point, job, maintenance and recycled connections.
+    pub fn start_with_role_limits(
+        runtime: NativeChdb,
+        connection_count: usize,
+        lane_name: &str,
+        mode: ExecutorMode,
+        server_memory_limit_bytes: Option<u64>,
+        role_threads: Option<u64>,
+    ) -> Result<Self, ExecutorError> {
         if server_memory_limit_bytes == Some(0) {
             return Err(ExecutorError::ZeroServerMemoryLimit);
         }
@@ -547,7 +581,7 @@ impl NativeExecutor {
             .map(|_| Arc::new(LaneStatus::default()))
             .collect::<Vec<_>>();
         let connection_args: Arc<[String]> =
-            executor_connection_args(server_memory_limit_bytes).into();
+            executor_connection_args_for_role(server_memory_limit_bytes, role_threads).into();
         let streaming = runtime.supports_streaming();
         let thread_budget: Arc<std::sync::OnceLock<Arc<crate::thread_budget::ThreadBudget>>> = Arc::default();
         for index in 0..connection_count {
@@ -1212,6 +1246,68 @@ fn drop_dns_cache_after_connection_error(
     }
 }
 
+// pthread_create reports EAGAIN while the host/uid/cgroup has no task room.
+// Query and product share a uid (and RLIMIT_NPROC), so hydration/startup bursts
+// can temporarily prevent even the next Rust lane from starting. Retain the
+// exact task across failed spawns: Builder::spawn consumes/drops its closure on
+// failure. Never retry native initialization or a panic after the thread starts.
+const LANE_SPAWN_ATTEMPTS: usize = 8;
+
+fn spawn_lane(lane: &str, task: impl FnOnce() + Send + 'static) -> Result<(), ExecutorError> {
+    spawn_lane_with(
+        lane,
+        task,
+        |name, task| {
+            std::thread::Builder::new()
+                .name(name)
+                .spawn(task)
+                .map(|_| ())
+        },
+        std::thread::sleep,
+    )
+}
+
+fn spawn_lane_with(
+    lane: &str,
+    task: impl FnOnce() + Send + 'static,
+    mut spawn: impl FnMut(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), ExecutorError> {
+    let task = Arc::new(Mutex::new(Some(task)));
+    for attempt in 1..=LANE_SPAWN_ATTEMPTS {
+        let retained = task.clone();
+        match spawn(
+            format!("nano-chdb-{lane}"),
+            Box::new(move || {
+                let task = retained
+                    .lock()
+                    .expect("native lane startup task poisoned")
+                    .take()
+                    .expect("native lane startup task already taken");
+                task();
+            }),
+        ) {
+            Ok(()) => return Ok(()),
+            Err(source) => {
+                if source.raw_os_error() != Some(libc::EAGAIN) || attempt == LANE_SPAWN_ATTEMPTS {
+                    return Err(ExecutorError::ThreadSpawn {
+                        lane: lane.into(),
+                        attempts: attempt,
+                        source,
+                    });
+                }
+                // Seven waits: 50..3200ms (6350ms total), no new threads or
+                // connections until the OS accepts this very same lane task.
+                let backoff = Duration::from_millis(50 << (attempt - 1));
+                tracing::warn!(lane, attempt, backoff_ms = backoff.as_millis() as u64,
+                    error = %source, "native chDB lane thread temporarily unavailable; retrying in process");
+                sleep(backoff);
+            }
+        }
+    }
+    unreachable!("bounded spawn loop always returns")
+}
+
 fn start_connection(
     runtime: NativeChdb,
     index: usize,
@@ -1224,9 +1320,7 @@ fn start_connection(
     let (sender, mut receiver) = mpsc::channel::<Command>(EXECUTOR_QUEUE_DEPTH);
     let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
     let lane_label = format!("{lane_name}-{index}");
-    std::thread::Builder::new()
-        .name(format!("nano-chdb-{lane_name}-{index}"))
-        .spawn(move || {
+    spawn_lane(&format!("{lane_name}-{index}"), move || {
             #[cfg(target_os = "linux")]
             if let Err(error) = nanosiem_lake_cell::crash_capture::register_thread() {
                 eprintln!("lake_native_crash alternate stack registration failed: {error}");
@@ -1604,11 +1698,10 @@ fn start_connection(
                     jobs_since_allocator_purge = 0;
                 }
             }
-        })
-        .map_err(|_| ExecutorError::Unavailable)?;
+        })?;
     ready_receiver
         .recv()
-        .map_err(|_| ExecutorError::Unavailable)?
+        .map_err(|_| ExecutorError::StartupLaneStopped { lane: format!("{lane_name}-{index}") })?
         .map_err(ExecutorError::Startup)?;
     Ok(sender)
 }
@@ -2257,3 +2350,7 @@ mod tests {
         assert_eq!(scheduler.least_loaded_lane(crate::thread_budget::Priority::Interactive), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "executor_startup_tests.rs"]
+mod startup_tests;

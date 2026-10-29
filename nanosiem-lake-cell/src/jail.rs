@@ -536,6 +536,87 @@ mod tests {
             cgroup_dir: None, require_landlock: false, max_processes: None, max_open_files: 1024 }
     }
 
+    /// Run the supervisor's real assignment through the kernel rlimit setter.
+    /// All irreversible credential/limit changes stay inside a subprocess.
+    #[test]
+    fn nan4834_startup_can_create_threads_past_the_old_uid_subquota() {
+        const CHILD: &str = "NAN4834_JAIL_THREAD_CHILD";
+        let mode = std::env::var(CHILD).ok();
+        if mode.is_none() {
+            for mode in ["old", "fixed"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "jail::tests::nan4834_startup_can_create_threads_past_the_old_uid_subquota",
+                        "--nocapture", "--test-threads=1"])
+                    .env(CHILD, mode).output().unwrap();
+                assert!(output.status.success(), "{mode}: {}{}", String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr));
+                println!("{mode}: {}", String::from_utf8_lossy(&output.stdout));
+            }
+            return;
+        }
+        use crate::contract::{NativeChildService::QueryPartsV1, Role, TenantId};
+        let cfg = serde_json::from_value(serde_json::json!({
+            "cell_id": "cell-a", "data_dir": "/cell/data", "state_dir": "/s",
+            "ingest_binary": "/b", "query_binary": "/b", "listen_unix": "/r.sock",
+            "router_token_file": "/t", "placement_file": "/p", "dev_key_dir": "/k",
+            "extra_ro_paths": ["/cell/release"]
+        })).unwrap();
+        let tenant = TenantId::new("tenant-a").unwrap();
+        let ids = crate::uidmap::ids_for_slot(20_000, 20, 0).unwrap();
+        let placement = crate::config::TenantPlacement::legacy(tenant.clone(), 20.0);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("cgroup.controllers"), "cpu memory pids\n").unwrap();
+        std::fs::write(root.path().join("cgroup.procs"), "").unwrap();
+        let cgroups = crate::limits::CgroupTree::adopt_root(root.path().into(), "/pod/cell".into(), vec![], false).unwrap();
+        cgroups.register(&tenant, ids.slot);
+        let mut assignment = crate::supervisor::native_role_preflight(&cfg, &tenant, Role::Query, &ids,
+            Some(&cgroups), &placement, QueryPartsV1).unwrap();
+        let old = mode.as_deref() == Some("old");
+        if old {
+            // Negative control: only restore the old production assignment's
+            // one-third quota; the kernel setter and thread burst are shared.
+            assignment.jail.max_processes = Some((crate::budget::TenantBudget::from_eps(placement.eps).max_pids / 3).max(64));
+        }
+        drop(cgroups);
+        drop(root);
+        set_rlimits(&assignment.jail).unwrap();
+        // RLIMIT_NPROC does not constrain privileged root. A root farm run
+        // uses an otherwise unused UID; unprivileged runs keep their UID.
+        if unsafe { libc::geteuid() } == 0 {
+            let uid = 100_000 + std::process::id();
+            drop_credentials(uid, uid).unwrap();
+        }
+        verify_no_capabilities().unwrap();
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut threads = Vec::new();
+        let mut refusal = None;
+        for i in 0..200 {
+            let gate = gate.clone();
+            match std::thread::Builder::new().stack_size(64 * 1024).spawn(move || {
+                let (lock, ready) = &*gate;
+                drop(ready.wait_while(lock.lock().unwrap(), |open| !*open).unwrap());
+            }) {
+                Ok(thread) => threads.push(thread),
+                Err(e) => { refusal = Some((i, e)); break; }
+            }
+        }
+        // Keep all 200 alive at once: the old 170 soft/hard limit fails in
+        // pthread_create, while the unchanged aggregate allowance is 512.
+        let admitted = threads.len();
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        for thread in threads { thread.join().unwrap(); }
+        if old {
+            let (i, e) = refusal.expect("old UID subquota must refuse a live 200-thread burst");
+            assert_eq!(e.raw_os_error(), Some(libc::EAGAIN), "thread {i}: {e}");
+            println!("old quota refused thread {i}: {e} (kernel EAGAIN)");
+        } else {
+            assert!(refusal.is_none(), "startup thread refused: {refusal:?}");
+            assert_eq!(admitted, 200);
+            println!("fixed quota admitted {admitted} simultaneous threads");
+        }
+    }
+
     /// NAN-3791 reproduction: a rule path beneath a directory the jailing
     /// credentials cannot search used to be skipped as if it were missing
     /// (`Path::exists` is false on EACCES), leaving query[T] without its

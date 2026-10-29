@@ -43,6 +43,9 @@ compose_files() {
     if [[ -d $root/.nano-sovereign ]]; then
         files+=(-f docker-compose.sovereign.yml -f docker-compose.tls.yml)
     fi
+    if [[ -f $root/docker-compose.host-resources.yml ]]; then
+        files+=(-f docker-compose.host-resources.yml)
+    fi
 }
 
 compose() {

@@ -9,7 +9,7 @@ const REQUEST = '0f6f5a1e-7c2b-4d1a-8e3f-2a9b8c7d6e5f';
 const TENANT = 'b464ceb9-28a6-4249-8e29-3489627ac5f6';
 const TOKEN = 'nano_tok_0123456789abcdefghijklmnopqrstuv';
 
-function fakeServer(opts: { pendingPolls?: number; reject?: string; tokenFor?: string } = {}) {
+function fakeServer(opts: { pendingPolls?: number; reject?: string; tokenFor?: string; waitingReason?: string } = {}) {
   let input: IngestCredentialRequestInput | null = null;
   let polls = 0;
   let sealed: string | null = null;
@@ -17,6 +17,7 @@ function fakeServer(opts: { pendingPolls?: number; reject?: string; tokenFor?: s
   const base = (): IngestCredentialReveal => ({
     request_id: REQUEST, tenant_id: TENANT, state: 'pending', kind: 'source', protocol: input!.protocol,
     label: input!.label, source_slugs: input!.source_slugs, sealed_token_ready: false, sealed_token: null,
+    waiting_reason: opts.waitingReason as IngestCredentialReveal['waiting_reason'], waiting_source_slugs: input!.source_slugs,
   });
   const client: IssuanceClient = {
     requestIngestCredential: vi.fn(async (i: IngestCredentialRequestInput) => {
@@ -106,4 +107,15 @@ describe('issueIngestCredential (NAN-2593)', () => {
     const err = await issueIngestCredential(server.client, { protocol: 'hec', label: 'l', source_slugs: ['s'] }, { sleep: noSleep }).catch((e) => e);
     expect((err as IssuanceError).problem.code).toBe('sealed_token_expired');
   });
+});
+
+
+it('passes pending parser reasons and slugs to the panel without revealing early', async () => {
+  const server = fakeServer({ pendingPolls: 2, waitingReason: 'awaiting_enrollment' });
+  const waiting = vi.fn();
+  await issueIngestCredential(server.client, { protocol: 'hec', label: 'l', source_slugs: ['okta_system'] },
+    { sleep: noSleep, onWaiting: waiting });
+  expect(waiting).toHaveBeenCalledTimes(2);
+  expect(waiting.mock.calls[0][0]).toMatchObject({ state: 'pending', waiting_reason: 'awaiting_enrollment',
+    waiting_source_slugs: ['okta_system'] });
 });

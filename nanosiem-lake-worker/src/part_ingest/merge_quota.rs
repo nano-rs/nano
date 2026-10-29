@@ -28,20 +28,23 @@ thread_local! {
 // 1.57M-row tenant-a hour was still pacing after 90 minutes.
 /// Input rows per second a rewrite may decode at full share (one core).
 const BACKFILL_ROWS_PER_SECOND_AT_FULL_SHARE: u64 = 160_000;
-/// CPU share of ALL running count rewrites together, in permille of one
-/// core: the bounds of the adaptive backfill pace. NAN-3795: an idle cell
-/// lends the backfill up to four cores (tenant-a measured ~1 ms of rewrite work
-/// per row live, so one core is ~38 h for a 7 d window); the same headroom
-/// signals take it back (halving) the moment ingest lag, CPU or R2 strain
-/// shows pressure.
+/// Floor of the aggregate adaptive CPU share, in permille of one core.
+/// The upper bound follows the role quota; lag, throttling, search activity
+/// and R2 strain still halve the borrowed share immediately.
 pub const BACKFILL_SHARE_MIN_PERMILLE: u64 = 100;
-pub const BACKFILL_SHARE_MAX_PERMILLE: u64 = 4_000;
+/// The role quota is the ceiling; AIMD still lends only observed idle CPU.
+pub fn backfill_share_max_permille() -> u64 {
+    u64::from(super::merge_lanes::MergeCapacity::read().cpu_millicores)
+        .max(BACKFILL_SHARE_MIN_PERMILLE)
+}
 pub const BACKFILL_SHARE_ONE_CORE_PERMILLE: u64 = 1_000;
 /// A second concurrent rewrite starts only once the cell has proven this much
 /// sustained headroom (the share climbed to two cores).
 pub const BACKFILL_SECOND_REWRITE_PERMILLE: u64 = 2_000;
 /// Count rewrites that may run at once (each paces at its split of the share).
-pub const BACKFILL_MAX_REWRITES: usize = 2;
+pub fn backfill_max_rewrites() -> usize {
+    super::merge_lanes::MergeCapacity::read().history_slots
+}
 const BACKFILL_SHARE_START_PERMILLE: u64 = 250;
 const BACKFILL_SHARE_STEP_PERMILLE: u64 = 100;
 /// Ingest lag (oldest pending notice) at which backfill backs off, and below
@@ -64,18 +67,21 @@ static BACKFILL_SHARE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(BACKFILL_SHARE_START_PERMILLE);
 static BACKFILL_ROWS_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BACKFILL_ROWS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static BACKFILL_LANE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(BACKFILL_MAX_REWRITES);
+fn backfill_lane() -> &'static tokio::sync::Semaphore {
+    static LANE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    LANE.get_or_init(|| tokio::sync::Semaphore::new(backfill_max_rewrites()))
+}
 /// Count rewrites currently holding a backfill pace (they split the share).
 static ACTIVE_REWRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How many count rewrites the scheduler may START now: none while the
-/// tenant is searching, two only while the adaptive share says the cell has
-/// had two cores to spare.
+/// tenant is searching; further slots require sustained idle CPU, up to
+/// the role-derived memory and CPU bound.
 pub fn backfill_rewrite_slots() -> usize {
     if backfill_yielding() {
         0
     } else if backfill_share_permille() >= BACKFILL_SECOND_REWRITE_PERMILLE {
-        BACKFILL_MAX_REWRITES
+        ((backfill_share_permille() / BACKFILL_SHARE_ONE_CORE_PERMILLE) as usize).min(backfill_max_rewrites())
     } else {
         1
     }
@@ -83,10 +89,12 @@ pub fn backfill_rewrite_slots() -> usize {
 
 /// This rewrite's split of the backfill share; the floor while searching.
 fn per_rewrite_share_permille() -> u64 {
-    if backfill_yielding() {
-        return BACKFILL_SHARE_MIN_PERMILLE;
-    }
-    backfill_share_permille() / ACTIVE_REWRITES.load(std::sync::atomic::Ordering::Relaxed).max(1)
+    let aggregate = if backfill_yielding() { BACKFILL_SHARE_MIN_PERMILLE } else {
+        backfill_share_permille().min(backfill_share_max_permille())
+    };
+    // The search floor is aggregate too: twelve rewrites must not turn the
+    // old 0.1-core yield into 1.2 cores of background work.
+    (aggregate / ACTIVE_REWRITES.load(std::sync::atomic::Ordering::Relaxed).max(1)).max(1)
 }
 
 /// NAN-3795 (r49b k6 B: 1d p95 +50% beside a running backfill): searches
@@ -188,7 +196,7 @@ pub fn set_searching_for_test(searching: bool) {
 }
 
 pub(super) async fn reserve_count_backfill() -> Result<tokio::sync::SemaphorePermit<'static>> {
-    BACKFILL_LANE
+    backfill_lane()
         .acquire()
         .await
         .context("count backfill lane closed")
@@ -258,7 +266,7 @@ pub fn next_backfill_share(current: u64, headroom: &Headroom) -> u64 {
     } else {
         current
     };
-    next.clamp(BACKFILL_SHARE_MIN_PERMILLE, BACKFILL_SHARE_MAX_PERMILLE)
+    next.clamp(BACKFILL_SHARE_MIN_PERMILLE, backfill_share_max_permille())
 }
 
 /// The share of one core a count rewrite currently paces at (permille).
@@ -416,15 +424,8 @@ impl CpuCounters {
     /// This role's leaf cgroup and its parent (the tenant slot, whose
     /// ceiling also covers the query role); either may be unreadable.
     fn read_own_and_parent() -> Vec<Self> {
-        let read = |path: &std::path::Path| std::fs::read_to_string(path).ok();
-        let Some(own) = read(std::path::Path::new("/proc/self/cgroup"))
-            .and_then(|s| s.lines().find_map(|l| l.strip_prefix("0::").map(|p| p.trim().to_owned())))
-            .map(|path| std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'))) else { return Vec::new() };
-        let parent = own.parent().filter(|p| p.starts_with("/sys/fs/cgroup") && *p != std::path::Path::new("/sys/fs/cgroup"))
-            .map(std::path::Path::to_path_buf);
-        [Some(own), parent].into_iter().flatten()
-            .filter_map(|dir| Self::parse(&read(&dir.join("cpu.stat"))?, read(&dir.join("cpu.max")).as_deref()))
-            .collect()
+        crate::cgroup_memory::for_process().cpu_samples().into_iter()
+            .filter_map(|(stat, max)| Self::parse(&stat, max.as_deref())).collect()
     }
 }
 
@@ -541,7 +542,7 @@ impl BackfillPace {
     /// `strict` (a search is running): this charge's own CPU is paced too,
     /// without spending slack banked earlier while the rewrite waited on I/O.
     fn charge(&mut self, input_rows: u64, cpu_ns: u64, share_permille: u64, elapsed: Duration, strict: bool) -> Duration {
-        let share = share_permille.clamp(BACKFILL_SHARE_MIN_PERMILLE, BACKFILL_SHARE_MAX_PERMILLE) as f64 / BACKFILL_SHARE_ONE_CORE_PERMILLE as f64;
+        let share = share_permille.max(1) as f64 / BACKFILL_SHARE_ONE_CORE_PERMILLE as f64;
         let rows = input_rows.min(self.row_cap.saturating_sub(self.rows));
         self.rows += rows;
         self.owed_rows += Duration::from_secs_f64(rows as f64 / (BACKFILL_ROWS_PER_SECOND_AT_FULL_SHARE as f64 * share));
@@ -766,18 +767,24 @@ impl Drop for Permit {
 /// ordinary ingestion and interactive readers never wait on it. Reserve signed
 /// object lengths before transfers, rather than charging a large GET afterward.
 ///
-/// NAN-3187: one permit per history lane (`merge_lanes::capacity(Hour)`,
-/// default 2), so two concurrent hour merges download side by side instead
-/// of strictly in turn. An explicit pacing quota stays process-wide: each
-/// permit holder paces at its share of the configured rate.
-fn remote_lane() -> &'static tokio::sync::Semaphore {
-    static REMOTE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    REMOTE.get_or_init(|| tokio::sync::Semaphore::new(remote_permits()))
+/// One permit per capacity-derived minute/history slot: a small role's
+/// hour upload must leave a transfer permit for its independent minute lane.
+/// An explicit pacing quota stays process-wide: each permit holder paces at
+/// its share of the configured rate.
+// Pin the transfer permit count with its semaphore. A later quota resize
+// must not make hold_remote_lane request more permits than can ever exist.
+fn remote_lane_state() -> &'static (usize, tokio::sync::Semaphore) {
+    static REMOTE: std::sync::OnceLock<(usize, tokio::sync::Semaphore)> = std::sync::OnceLock::new();
+    REMOTE.get_or_init(|| {
+        let permits = super::merge_lanes::capacity(Level::Hour)
+            + super::merge_lanes::capacity(Level::Minute);
+        (permits, tokio::sync::Semaphore::new(permits))
+    })
 }
 
-fn remote_permits() -> usize {
-    super::merge_lanes::capacity(Level::Hour)
-}
+fn remote_lane() -> &'static tokio::sync::Semaphore { &remote_lane_state().1 }
+
+fn remote_permits() -> usize { remote_lane_state().0 }
 
 pub async fn reserve_remote(bytes: u64) -> Result<tokio::sync::SemaphorePermit<'static>> {
     let paced = pacing_enabled()?;
@@ -800,12 +807,7 @@ pub async fn reserve_remote(bytes: u64) -> Result<tokio::sync::SemaphorePermit<'
         32 * 1024 * 1024,
     )?;
     let requests_per_sec = limit("NANO_LAKE_COMPACTION_REMOTE_REQUESTS_PER_SECOND", 4)?;
-    let duration = required_duration(
-        1,
-        bytes,
-        (requests_per_sec / permits).max(1),
-        (bytes_per_sec / permits).max(1),
-    );
+    let duration = remote_duration(bytes, permits, requests_per_sec, bytes_per_sec);
     if duration >= Duration::from_secs(10) {
         tracing::warn!(
             wait_seconds = duration.as_secs_f64(),
@@ -815,6 +817,12 @@ pub async fn reserve_remote(bytes: u64) -> Result<tokio::sync::SemaphorePermit<'
     }
     tokio::time::sleep(duration).await;
     Ok(guard)
+}
+
+/// Scale the work, not integer rates: at 25 permits a four-request/s
+/// quota gives each permit 0.16 requests/s, rather than rounding up to one.
+fn remote_duration(bytes: u64, permits: u64, requests_per_sec: u64, bytes_per_sec: u64) -> Duration {
+    required_duration(permits, bytes.saturating_mul(permits), requests_per_sec, bytes_per_sec)
 }
 
 /// Occupy the whole remote lane (tests: a stalled store).
@@ -1089,6 +1097,12 @@ pub fn memory_limit() -> Option<u64> {
     memory_probe().map(|(_, limit)| limit)
 }
 
+/// Room below the running merge guard, using the same unreclaimable usage
+/// and real cgroup limit as the guard (not the assignment's sizing cap).
+pub fn merge_headroom() -> Option<u64> {
+    memory_probe().map(|(used, limit)| ((limit as f64 * MEMORY_GUARD_SHARE) as u64).saturating_sub(used))
+}
+
 /// (unreclaimable bytes in use, `memory.max`) of this process's cgroup.
 fn memory_probe() -> Option<(u64, u64)> {
     #[cfg(test)]
@@ -1108,6 +1122,20 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn first_fit_headroom_uses_the_guard_boundary_and_never_wraps_under_pressure() {
+        fn idle() -> Option<(u64, u64)> { Some((300, 1_000)) }
+        fn pressured() -> Option<(u64, u64)> { Some((900, 1_000)) }
+        fn unknown() -> Option<(u64, u64)> { None }
+        super::MEMORY_PROBE_FOR_TEST.set(Some(idle));
+        assert_eq!(super::merge_headroom(), Some(550));
+        super::MEMORY_PROBE_FOR_TEST.set(Some(pressured));
+        assert_eq!(super::merge_headroom(), Some(0));
+        super::MEMORY_PROBE_FOR_TEST.set(Some(unknown));
+        assert_eq!(super::merge_headroom(), None);
+        super::MEMORY_PROBE_FOR_TEST.set(None);
+    }
+
     use super::*;
 
     #[test]
@@ -1277,12 +1305,14 @@ mod tests {
 
     #[test]
     fn backfill_share_backs_off_under_ingest_pressure_and_speeds_up_when_idle() {
+        let _capacity = super::super::merge_lanes::test_capacity(
+            super::super::merge_lanes::MergeCapacity::for_role(Some(16 * 1024 * 1024 * 1024), 4000));
         let idle = Headroom { lag_ms: 5_000, utilization: Some(0.2), throttled: Some(0.0), r2_strain: Some(0.0), transfer_failures: 0, searching: false, prevalence_behind_ms: 0, l0_merge_overdue_ms: 0 };
         let mut share = BACKFILL_SHARE_START_PERMILLE;
         for _ in 0..20 {
             share = next_backfill_share(share, &idle);
         }
-        assert_eq!(share, BACKFILL_SHARE_MAX_PERMILLE, "an idle cell lends the backfill up to four cores");
+        assert_eq!(share, backfill_share_max_permille(), "an idle cell lends the backfill up to the role CPU quota");
         let lagging = Headroom { lag_ms: 45_000, ..idle };
         share = next_backfill_share(share, &lagging);
         assert_eq!(share, 2_000, "one pressure sample halves it");
@@ -1292,7 +1322,7 @@ mod tests {
         assert_eq!(next_backfill_share(share, &busy), 1_000);
         // Above a core it grows by a quarter per idle sample.
         assert_eq!(next_backfill_share(2_000, &idle), 2_500);
-        assert_eq!(next_backfill_share(3_900, &idle), BACKFILL_SHARE_MAX_PERMILLE);
+        assert_eq!(next_backfill_share(3_900, &idle), backfill_share_max_permille());
         for _ in 0..20 {
             share = next_backfill_share(share, &lagging);
         }
@@ -1327,6 +1357,19 @@ mod tests {
     }
 
     #[test]
+    fn nan4826_large_backfill_pace_accepts_more_than_four_cores() {
+        let _capacity = super::super::merge_lanes::test_capacity(
+            super::super::merge_lanes::MergeCapacity::for_role(Some(32 * 1024 * 1024 * 1024), 16000));
+        let mut pace = BackfillPace::new(0, 0);
+        assert_eq!(pace.charge(0, 8_000_000_000, 8000, Duration::from_secs(1), false), Duration::ZERO);
+        let mut yielding = BackfillPace::new(0, 0);
+        assert_eq!(yielding.charge(0, 8_000_000, 16, Duration::ZERO, false), Duration::from_millis(500),
+            "a split aggregate search floor must not be clamped back to 100 per rewrite");
+        let mut old_cap = BackfillPace::new(0, 0);
+        assert_eq!(old_cap.charge(0, 8_000_000_000, 4000, Duration::from_secs(1), false), Duration::from_secs(1));
+    }
+
+    #[test]
     fn cgroup_cpu_counters_give_utilization_and_throttling() {
         let before = CpuCounters::parse("usage_usec 1000000\nuser_usec 1\nnr_periods 100\nnr_throttled 0\n", Some("200000 100000")).unwrap();
         let after = CpuCounters::parse("usage_usec 9000000\nnr_periods 150\nnr_throttled 20\n", Some("200000 100000")).unwrap();
@@ -1344,9 +1387,9 @@ mod tests {
     #[tokio::test]
     async fn count_backfill_lane_is_process_wide_and_released_on_cancel() {
         let first = reserve_count_backfill().await.unwrap();
-        // NAN-3795: two rewrites at most.
-        let second = reserve_count_backfill().await.unwrap();
-        assert!(BACKFILL_LANE.try_acquire().is_err());
+        let mut others = Vec::new();
+        while let Ok(permit) = backfill_lane().try_acquire() { others.push(permit); }
+        assert!(backfill_lane().try_acquire().is_err());
         let waiting = tokio::spawn(async { reserve_count_backfill().await.unwrap() });
         waiting.abort();
         let _ = waiting.await;
@@ -1363,7 +1406,7 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert!(
-            BACKFILL_LANE.try_acquire().is_err(),
+            backfill_lane().try_acquire().is_err(),
             "cancel cannot release a running compute's slot"
         );
         release.send(()).unwrap();
@@ -1371,16 +1414,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        drop(second);
+        drop(others);
     }
 
     #[test]
     fn a_second_rewrite_needs_two_cores_of_headroom() {
+        let _capacity = super::super::merge_lanes::test_capacity(
+            super::super::merge_lanes::MergeCapacity::for_role(Some(16 * 1024 * 1024 * 1024), 4000));
         let _share = lock_backfill_share_for_test();
         set_backfill_share_for_test(BACKFILL_SECOND_REWRITE_PERMILLE - 1);
         assert_eq!(backfill_rewrite_slots(), 1);
         set_backfill_share_for_test(BACKFILL_SECOND_REWRITE_PERMILLE);
-        assert_eq!(backfill_rewrite_slots(), BACKFILL_MAX_REWRITES);
+        assert_eq!(backfill_rewrite_slots(), backfill_max_rewrites());
         set_backfill_share_for_test(BACKFILL_SHARE_START_PERMILLE);
     }
 
@@ -1389,9 +1434,11 @@ mod tests {
     /// the floor without spending banked slack, and the share halves.
     #[test]
     fn backfill_yields_to_interactive_search() {
+        let _capacity = super::super::merge_lanes::test_capacity(
+            super::super::merge_lanes::MergeCapacity::for_role(Some(16 * 1024 * 1024 * 1024), 4000));
         let _share = lock_backfill_share_for_test();
-        set_backfill_share_for_test(BACKFILL_SHARE_MAX_PERMILLE);
-        assert_eq!(backfill_rewrite_slots(), BACKFILL_MAX_REWRITES);
+        set_backfill_share_for_test(backfill_share_max_permille());
+        assert_eq!(backfill_rewrite_slots(), backfill_max_rewrites());
         set_searching_for_test(true);
         assert_eq!(backfill_rewrite_slots(), 0, "no rewrite starts while searching");
         assert_eq!(per_rewrite_share_permille(), BACKFILL_SHARE_MIN_PERMILLE);
@@ -1405,7 +1452,7 @@ mod tests {
         let mut lax = BackfillPace::new(0, 0);
         assert_eq!(lax.charge(0, second, BACKFILL_SHARE_MIN_PERMILLE, Duration::from_secs(60), false), Duration::ZERO);
         set_searching_for_test(false);
-        assert_eq!(backfill_rewrite_slots(), BACKFILL_MAX_REWRITES);
+        assert_eq!(backfill_rewrite_slots(), backfill_max_rewrites());
         set_backfill_share_for_test(BACKFILL_SHARE_START_PERMILLE);
         // The relay window itself.
         assert!(!searched_within_quiet(0, 5));
@@ -1441,14 +1488,14 @@ mod tests {
         assert_eq!(next_backfill_share(400, &merge_due), 400);
 
         // While behind no rewrite starts and a running one paces at the floor.
-        set_backfill_share_for_test(BACKFILL_SHARE_MAX_PERMILLE);
-        assert_eq!(backfill_rewrite_slots(), BACKFILL_MAX_REWRITES);
+        set_backfill_share_for_test(backfill_share_max_permille());
+        assert_eq!(backfill_rewrite_slots(), backfill_max_rewrites());
         set_ingest_behind_for_test(true);
         assert!(backfill_yielding());
         assert_eq!(backfill_rewrite_slots(), 0, "no rewrite starts while ingest maintenance is behind");
         assert_eq!(per_rewrite_share_permille(), BACKFILL_SHARE_MIN_PERMILLE);
         set_ingest_behind_for_test(false);
-        assert_eq!(backfill_rewrite_slots(), BACKFILL_MAX_REWRITES);
+        assert_eq!(backfill_rewrite_slots(), backfill_max_rewrites());
         set_backfill_share_for_test(BACKFILL_SHARE_START_PERMILLE);
     }
 
@@ -1460,6 +1507,21 @@ mod tests {
         assert!(!pacing_enabled_from(Some("0"), true).unwrap());
         assert!(pacing_enabled_from(Some("true"), false).is_err());
     }
+    #[test]
+    fn nan4826_large_transfer_pool_preserves_the_process_quota() {
+        assert_eq!(remote_duration(0, 25, 4, 32 * 1024 * 1024), Duration::from_millis(6250));
+        assert_eq!(remote_duration(64, 8, 4, 32), Duration::from_secs(16));
+    }
+
+    #[tokio::test]
+    async fn nan4826_a_small_role_keeps_a_transfer_for_the_minute_lane() {
+        let _capacity = super::super::merge_lanes::test_capacity(
+            super::super::merge_lanes::MergeCapacity::for_role(Some(2 * 1024 * 1024 * 1024), 4000));
+        let _history = reserve_remote(0).await.unwrap();
+        let _minute = tokio::time::timeout(Duration::from_secs(1), reserve_remote(0))
+            .await.expect("a held hour upload must not block the minute lane").unwrap();
+    }
+
     #[tokio::test]
     async fn default_remote_admission_does_not_sleep() {
         assert!(std::env::var("NANO_LAKE_COMPACTION_PACING").is_err());

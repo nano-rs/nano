@@ -1140,8 +1140,8 @@ impl CgroupTree {
         write(&self.tenant_dir(t).join(role.as_str()).join("cpu.max"), &cpu_max_line(millicores))
     }
 
-    pub fn set_role_cpu_weight(&self, t: &TenantId, role: Role, request_millicores: u32) -> io::Result<()> {
-        write(&self.tenant_dir(t).join(role.as_str()).join("cpu.weight"), &request_millicores.clamp(1, 10_000).to_string())
+    pub fn set_role_cpu_weight(&self, t: &TenantId, role: Role, weight: u32) -> io::Result<()> {
+        write(&self.tenant_dir(t).join(role.as_str()).join("cpu.weight"), &weight.clamp(1, 10_000).to_string())
     }
     pub fn set_role_memory(&self, t: &TenantId, role: Role, request_bytes: u64, limit_bytes: u64) -> io::Result<()> {
         self.set_role_memory_with_floor(t, role, request_bytes, limit_bytes, ShrinkFloor::Usage)

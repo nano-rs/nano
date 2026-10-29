@@ -407,7 +407,12 @@ pub fn walk_tenant(tenants_dir: &Path, tenant: &TenantId, max_entries: u64) -> R
     }
 }
 
-fn statvfs_bytes(path: &Path) -> Option<u64> {
+/// Resolve a not-yet-created cache against its actual containing volume.
+pub fn containing_volume_bytes(path: &Path) -> Option<u64> {
+    path.ancestors().find_map(statvfs_bytes)
+}
+
+pub fn statvfs_bytes(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };

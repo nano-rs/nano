@@ -23,6 +23,9 @@ use crate::parts::provenance::{PartialKind, ProvenanceRecord, SignedProvenance, 
 use crate::parts::sha256_hex;
 use crate::reader_object_cache::{ReaderCacheLease, ReaderObjectCache, ReaderObjectRef, ReaderObjectSource};
 
+#[path = "late_materialization.rs"]
+pub(crate) mod late_materialization;
+
 /// Verified records kept in memory. A record is ~2 KB, so this bounds the
 /// memo at a few MB while covering a day of L0 parts plus merged levels.
 const RECORD_MEMO_ENTRIES: usize = 4_096;
@@ -662,7 +665,13 @@ impl PartFetcher {
                                 continue;
                             }
                         };
-                        let selected = range_fetch::select_ranges(&ranges, scope).into_iter().map(|at| ranges[at].clone()).collect::<Vec<_>>();
+                        let selected = range_fetch::select_ranges(&ranges, scope).into_iter().map(|at| {
+                            let range = &ranges[at];
+                            // Narrow reads authenticate whole predicate chunks;
+                            // retaining every payload page hash here wastes memory.
+                            crate::parts::parquet_ranges::ParquetRangeDigest { offset: range.offset, bytes: range.bytes,
+                                sha256: range.sha256.clone(), row_group: range.row_group, column: range.column.clone(), pages: Vec::new() }
+                        }).collect::<Vec<_>>();
                         if !range_fetch::is_narrow(selected.iter().map(|range| range.bytes).sum(), data.bytes) {
                             evidence.fallback(Fallback::NotNarrow);
                             whole.push((part, PartFile::Data(index)));

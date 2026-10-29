@@ -4,8 +4,8 @@ import { useEffect, useState } from 'react';
 
 /** Eleven minutes for other wizards, above their ten-minute server ceiling. */
 export const DEFAULT_JOB_MAX_WAIT_MS = 11 * 60_000;
-/** Parser create/edit run for 25 minutes; the browser allows five more. */
-export const PARSER_JOB_SERVER_TIMEOUT_MS = 25 * 60_000;
+/** Parser create/edit run for 40 minutes; the browser allows five more. */
+export const PARSER_JOB_SERVER_TIMEOUT_MS = 40 * 60_000;
 export const PARSER_JOB_MAX_WAIT_MS = PARSER_JOB_SERVER_TIMEOUT_MS + 5 * 60_000;
 
 export interface StartMelodJobOptions {

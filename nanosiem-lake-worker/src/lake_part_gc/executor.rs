@@ -270,7 +270,7 @@ pub struct PassReport {
 }
 
 /// What a caller keeps for one tenant across passes.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct LakePartGcState {
     /// The verified log view; extended with new entries each pass.
     pub view: LakePartLogView,

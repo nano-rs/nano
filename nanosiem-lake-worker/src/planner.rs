@@ -17,7 +17,7 @@ use crate::generation::HotTailManifest;
 const LOG_SOURCE_PLACEHOLDER: &str = "__nano_lake_source__";
 pub const DEFAULT_QUERY_MEMORY_BYTES: u64 = 4_294_967_296;
 const MIN_QUERY_MEMORY_BYTES: u64 = 67_108_864;
-const MAX_QUERY_MEMORY_BYTES: u64 = 68_719_476_736;
+pub(crate) const MAX_QUERY_MEMORY_BYTES: u64 = 68_719_476_736;
 pub const DASHBOARD_BREAKDOWN_FIELD: &str = "__nano.dashboard_breakdown";
 pub const DASHBOARD_BREAKDOWN_COMPONENTS: &[&str] =
     &["severity", "class_name", "metadata.log_source"];
@@ -7650,9 +7650,11 @@ mod tests {
             (4_000, 3 * GIB, 2),
             (6_000, 8 * GIB, 3),
             (8_000, 16 * GIB, 4),
+            (16_000, 32 * GIB, 4),
+            (32_000, 64 * GIB, 4),
         ] {
-            let (budget, _) = QueryMemoryBudget::derive(role_bytes, None).with_classes();
-            let (threads, memory) = crate::part_query::server::role_statement_limits(cpu_millis, &budget);
+            let (budget, classes) = QueryMemoryBudget::derive_for_role(role_bytes, None, cpu_millis).with_classes();
+            let (threads, memory) = crate::part_query::server::role_statement_limits(&budget, classes);
             let mut configured = tenant();
             configured.threads = threads;
             configured.max_memory_bytes = memory;

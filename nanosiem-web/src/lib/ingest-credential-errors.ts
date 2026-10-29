@@ -11,6 +11,9 @@
 import { ApiClientError } from '@/lib/api';
 
 export type IngestCredentialRefusal =
+  | 'template_unavailable'
+  | 'source_platform_only'
+  | 'requester_refused'
   | 'permission_missing'
   | 'source_restricted'
   | 'restricted_sources_unacknowledged'
@@ -40,6 +43,21 @@ export interface IngestCredentialProblem {
 }
 
 const COPY: Record<Exclude<IngestCredentialRefusal, 'unknown'>, Omit<IngestCredentialProblem, 'code'>> = {
+  template_unavailable: {
+    title: 'No active parser',
+    detail: 'This source has no active parser. Activate its parser, then issue a credential again.',
+    terminal: true,
+  },
+  source_platform_only: {
+    title: 'Platform-managed source',
+    detail: 'The audit source is managed by nano and cannot receive user-issued credentials. Choose another source for your data.',
+    terminal: true,
+  },
+  requester_refused: {
+    title: 'Credential request refused',
+    detail: 'This credential request is not permitted. Choose an allowed source or ask a tenant admin to review your access, then request a new credential.',
+    terminal: true,
+  },
   permission_missing: {
     title: 'Permission required',
     detail: 'Issuing and revoking ingest credentials needs the log_sources:deploy permission. Ask a tenant admin.',

@@ -416,10 +416,10 @@ fn evidence_prewarm_idle(admission: &Arc<tokio::sync::Semaphore>, slots: usize) 
 }
 
 fn evidence_lanes_idle(admission: &Arc<tokio::sync::Semaphore>, slots: usize,
-    point: &Arc<tokio::sync::Semaphore>, job: &Arc<tokio::sync::Semaphore>) -> bool {
+    point: &Arc<tokio::sync::Semaphore>, job: &Arc<tokio::sync::Semaphore>, job_slots: usize) -> bool {
     evidence_prewarm_idle(admission, slots)
         && evidence_prewarm_idle(point, POINT_PERMITS)
-        && evidence_prewarm_idle(job, 1)
+        && evidence_prewarm_idle(job, job_slots)
 }
 
 /// Only called on the disposable evidence thread, never a runtime worker.
@@ -969,10 +969,10 @@ pub struct PartQueryEngine {
     yielding_gate: Arc<tokio::sync::Semaphore>,
     /// Set once [`Self::serve_without_analysts`] gave the reserved slots back.
     analysts_absent: std::sync::atomic::AtomicBool,
-    /// NAN-3077: durable jobs (one at a time, on the read-write lane).
+    /// Durable jobs, one permit per capacity-sized read-write connection.
     job_admission: Arc<tokio::sync::Semaphore>,
-    /// NAN-4290: the small-job lane: its own read-write connection and one
-    /// permit (see [`JobLane::Small`]). `None`: every job takes the general lane.
+    /// The small-job lane: one permit per read-write connection, also
+    /// borrowing interactive admission. `None`: every job takes the general lane.
     small_job_writer: Option<NativeExecutor>,
     small_job_admission: Arc<tokio::sync::Semaphore>,
     /// Native-work slots (see [`super::memory_budget`]): one per read lane.
@@ -1294,15 +1294,15 @@ impl PartQueryEngine {
     /// classes are on (the default cap is then a small lane's), else the
     /// engine's.
     pub fn job_memory_bytes(&self) -> u64 {
-        self.large.as_ref().map_or(self.settings.max_memory_bytes, super::lanes::LargeLane::bytes)
+        self.large.as_ref().map_or(self.settings.max_memory_bytes, super::lanes::LargeLane::bytes) / self.job_slots() as u64
     }
 
-    /// Admit one durable job (NAN-3077): jobs have their own permit (one at a
-    /// time, like gen1's separate runner) and run on the read-write lane, so
+    /// Admit one durable job: jobs have one permit per writer connection
+    /// and split the large memory envelope across those connections, so
     /// a job never holds an interactive slot.
     pub async fn admit_job(&self, deadline: Duration) -> QueryResult<AdmissionSlot> {
         match tokio::time::timeout(deadline, self.job_admission.clone().acquire_owned()).await {
-            Ok(Ok(permit)) => Ok(AdmissionSlot { permit: Some(permit), slots: 1, gate: None }),
+            Ok(Ok(permit)) => Ok(AdmissionSlot { permit: Some(permit), slots: self.job_slots(), gate: None }),
             Ok(Err(_)) => Err(PartQueryError::Unavailable("query admission is closed".into())),
             Err(_) => Err(PartQueryError::ConcurrencyBudget(format!(
                 "a search job is already running; retry after {} s",
@@ -1328,7 +1328,7 @@ impl PartQueryEngine {
             Ok(gate) => gate,
             Err(_) => {
                 if let Ok(permit) = self.job_admission.clone().try_acquire_owned() {
-                    return Ok((JobLane::General, AdmissionSlot { permit: Some(permit), slots: 1, gate: None }));
+                    return Ok((JobLane::General, AdmissionSlot { permit: Some(permit), slots: self.job_slots(), gate: None }));
                 }
                 match tokio::time::timeout(deadline, self.small_job_admission.clone().acquire_owned()).await {
                     Ok(Ok(gate)) => gate,
@@ -1347,6 +1347,7 @@ impl PartQueryEngine {
 
     /// NAN-4290: attach the small-job lane's read-write connection.
     pub fn with_small_job_writer(mut self, writer: NativeExecutor) -> Self {
+        self.small_job_admission = Arc::new(tokio::sync::Semaphore::new(writer.connection_count().max(1)));
         self.small_job_writer = Some(writer);
         self
     }
@@ -1461,7 +1462,7 @@ impl PartQueryEngine {
     /// Whether a durable job holds its permit (NAN-3399: background work on
     /// the read-write lane never starts while one runs).
     pub(crate) fn job_running(&self) -> bool {
-        self.job_admission.available_permits() == 0
+        self.job_admission.available_permits() < self.job_slots()
     }
 
     /// NAN-3399: the merged identity observation index slot.
@@ -1549,8 +1550,13 @@ impl PartQueryEngine {
 
     /// Attach the read-write lane (jobs, risk materialization).
     pub fn with_writer(mut self, writer: NativeExecutor) -> Self {
+        self.job_admission = Arc::new(tokio::sync::Semaphore::new(writer.connection_count().max(1)));
         self.writer = Some(writer);
         self
+    }
+
+    fn job_slots(&self) -> usize {
+        self.writer.as_ref().map_or(1, |writer| writer.connection_count().max(1))
     }
 
     pub fn writer(&self) -> Option<&NativeExecutor> {
@@ -2244,7 +2250,7 @@ impl PartQueryEngine {
         // which no signed range covers: it keeps whole files (and that
         // pruning). A rerun scope reads whole files under its budget.
         let scope = super::range_fetch::current();
-        let pivot = scope.as_ref().is_some_and(|scope| !scope.whole_only()) && prune::uses_entities(hints);
+        let pivot = scope.as_ref().is_some_and(|scope| !scope.whole_only() && !scope.late_materialization()) && prune::uses_entities(hints);
         // Pivots still draw on the request's cold budget and debit.
         let data = match &scope {
             Some(scope) => self.fetcher.ensure_ranged(&wanted, scope, pivot).await,
@@ -2633,10 +2639,11 @@ impl PartQueryEngine {
                     let admission = self.admission.clone();
                     let point = self.point_admission.clone();
                     let job = self.job_admission.clone();
+                    let job_slots = self.job_slots();
                     let slots = self.admission_slots();
                     let (done, result) = tokio::sync::oneshot::channel();
                     std::thread::Builder::new().name("count-prewarm".into()).spawn(move || {
-                        let hint = if lower_evidence_priority().is_ok() && evidence_lanes_idle(&admission, slots, &point, &job) {
+                        let hint = if lower_evidence_priority().is_ok() && evidence_lanes_idle(&admission, slots, &point, &job, job_slots) {
                             warm()
                         } else { None };
                         let _ = done.send(hint);
@@ -2675,6 +2682,7 @@ impl PartQueryEngine {
                 let admission = self.admission.clone();
                 let point = self.point_admission.clone();
                 let job = self.job_admission.clone();
+                let job_slots = self.job_slots();
                 let slots = self.admission_slots();
                 let (done, result) = tokio::sync::oneshot::channel();
                 std::thread::Builder::new().name("evidence-prewarm".into()).spawn(move || {
@@ -2686,7 +2694,7 @@ impl PartQueryEngine {
                         return;
                     }
                     // Check at the actual parse boundary, after scheduling.
-                    let idle = evidence_lanes_idle(&admission, slots, &point, &job);
+                    let idle = evidence_lanes_idle(&admission, slots, &point, &job, job_slots);
                     let warmed = idle.then(|| metadata.prewarm_with_budget(&path, &digest, &mut remaining));
                     let _ = done.send((warmed, remaining));
                 }).map_err(|error| PartQueryError::Unavailable(format!("evidence thread: {error}")))?;
@@ -2706,7 +2714,7 @@ impl PartQueryEngine {
     }
 
     pub(super) fn evidence_idle(&self) -> bool {
-        evidence_lanes_idle(&self.admission, self.admission_slots(), &self.point_admission, &self.job_admission)
+        evidence_lanes_idle(&self.admission, self.admission_slots(), &self.point_admission, &self.job_admission, self.job_slots())
     }
 
     /// A background step's native-work slot (`None`: searches kept the
@@ -3098,7 +3106,7 @@ impl PartQueryEngine {
             let attempt = super::range_fetch::with_scope(scope.clone(),
                 Box::pin(self.run_compiled(request, &compiled, &field_types, cursor, compile_s))).await;
             let run = match (attempt, &scope) {
-                (Err(error), Some(scope)) if scope.sparse_used() && reruns_whole(&error) => {
+                (Err(error), Some(scope)) if (scope.sparse_used() || scope.late_materialization()) && reruns_whole(&error) => {
                     super::range_fetch::record_fallback(super::range_fetch::Fallback::NativeError, 1);
                     tracing::warn!(error = %error, "search read a hole of a sparse column-range file; rerunning on whole files");
                     // The rerun draws on what the ranged attempt left of its
@@ -3112,6 +3120,9 @@ impl PartQueryEngine {
                         }
                         Err(rerun_error) => {
                             tracing::warn!(error = %rerun_error, "whole-file rerun failed; returning the ranged attempt's error");
+                            if matches!(&error, PartQueryError::Internal(text) if text == super::range_fetch::LATE_FALLBACK) {
+                                return Err(rerun_error);
+                            }
                             return Err(error);
                         }
                     }
@@ -3283,11 +3294,18 @@ impl PartQueryEngine {
                     continuation: None,
                     planner: {
                         let mut planner = serde_json::to_value(&selection.evidence).map_err(internal)?;
-                        planner["two_pass"] = json!({"statements": two_run.statements, "narrow_rows": two_run.narrow_rows});
+                        planner["two_pass"] = json!({"statements": two_run.statements, "narrow_rows": two_run.narrow_rows,
+                            "late_fetched_bytes": two_run.late_fetched_bytes, "materialize_s": two_run.materialize_seconds});
+                        planner["range_fetched_bytes"] = json!(selection.evidence.range.range_fetched_bytes + two_run.late_fetched_bytes - two_run.late_whole_bytes);
+                        planner["whole_fetched_bytes"] = json!(selection.evidence.range.whole_fetched_bytes + two_run.late_whole_bytes);
+                        planner["cache_fetched_bytes"] = json!(selection.evidence.cache_fetched_bytes + two_run.late_fetched_bytes);
                         planner["phases_s"] = json!(phases.iter().map(|(name, seconds)| json!({"phase": name, "s": seconds})).collect::<Vec<_>>());
                         planner
                     },
                 });
+            }
+            if super::range_fetch::current().is_some_and(|scope| scope.late_materialization()) {
+                return Err(internal(super::range_fetch::LATE_FALLBACK));
             }
         }
         let mut plan = plan_logs(&selection, compiled, cursor)?;
@@ -4240,7 +4258,8 @@ impl PartQueryEngine {
         // the predicate/order columns to find the chunk's page instants, then
         // read full-width rows at exactly those instants. A rare value spread
         // over hours otherwise decodes every projected column of every row.
-        let locator = planner::page_locator(compiled);
+        let late = super::range_fetch::current().is_some_and(|scope| scope.late_materialization());
+        let locator = if late { None } else { planner::page_locator(compiled) };
         // NAN-3155: staged row shapes (`| sort -time | head N`) have no
         // single-select locator; each chunk runs as narrow + payload passes.
         let two_pass = if locator.is_none() { super::two_pass::plan(compiled) } else { None };
@@ -4312,7 +4331,7 @@ impl PartQueryEngine {
                 .then(|| planner::with_newest_first_row_cap(compiled, step_rows))
                 .flatten();
             let capped_plans = capped_query.as_ref().map(|query| {
-                let locator = planner::page_locator(query);
+                let locator = if late { None } else { planner::page_locator(query) };
                 let two_pass = if locator.is_none() { super::two_pass::plan(query) } else { None };
                 (locator, two_pass)
             });
@@ -4418,6 +4437,8 @@ impl PartQueryEngine {
                 let phase_start = Instant::now();
                 if let Some(two_run) = Box::pin(self.run_two_pass(&selection, two, Some(fence), chunk_cursor)).await? {
                     execute_s += phase_start.elapsed().as_secs_f64();
+                    range_fetch.range_fetched_bytes += two_run.late_fetched_bytes - two_run.late_whole_bytes;
+                    range_fetch.whole_fetched_bytes += two_run.late_whole_bytes;
                     decoded_bytes = decoded_bytes.saturating_add(two_run.payload_bytes);
                     let mut rows = two_run.rows;
                     // The payload's mean width per row (its rows are decoded
@@ -4903,6 +4924,9 @@ pub(crate) struct TwoPassRun {
     pub temporary_aliases: BTreeSet<String>,
     pub schema_defaults: Vec<String>,
     pub payload_bytes: u64,
+    pub late_fetched_bytes: u64,
+    pub materialize_seconds: f64,
+    pub late_whole_bytes: u64,
 }
 
 impl PartQueryEngine {
@@ -4949,7 +4973,7 @@ impl PartQueryEngine {
         };
         let mut run = TwoPassRun {
             rows: Vec::new(), statements: 0, narrow_rows: 0, engine_seconds: 0.0, storage_rows: 0, storage_bytes: 0,
-            budget: Some(plan.budget.clone()), temporary_aliases: BTreeSet::new(), schema_defaults: Vec::new(), payload_bytes: 0,
+            budget: Some(plan.budget.clone()), temporary_aliases: BTreeSet::new(), schema_defaults: Vec::new(), payload_bytes: 0, late_fetched_bytes: 0, materialize_seconds: 0., late_whole_bytes: 0,
         };
         let output = match self.run(plan).await {
             Ok(output) => output,
@@ -4986,6 +5010,31 @@ impl PartQueryEngine {
             tracing::warn!("narrow pass returned a row twice; running the one-pass statement");
             return Ok(None);
         }
+        let late_payload = if super::range_fetch::current().is_some_and(|scope| scope.late_materialization()) {
+            let roots = selection.field_types.keys().filter_map(|path| path.split('.').next()).map(str::to_owned).collect();
+            let scope = super::range_fetch::derive_scope(&two.payload, &roots).map_err(|_| internal(super::range_fetch::LATE_FALLBACK))?;
+            match self.fetcher.materialize_payload(selection, &ids, &scope, self.settings.max_memory_bytes, self.settings.threads as usize).await {
+                Ok(payload) => Some(payload),
+                Err(error) => {
+                    let error = map_fetch_error(error);
+                    // Keep credential refresh, vanished-part retry and cold
+                    // admission signals on their existing production paths.
+                    if matches!(error, PartQueryError::Unavailable(_) | PartQueryError::ColdScanTooLarge { .. }) {
+                        return Err(error);
+                    }
+                    tracing::warn!(error = %error, "late payload unavailable; rerunning the verified whole-file path");
+                    return Err(internal(super::range_fetch::LATE_FALLBACK));
+                }
+            }
+        } else { None };
+        let selection = if let Some(payload) = &late_payload {
+            ids = payload.ids.clone();
+            run.late_fetched_bytes = payload.fetched_bytes;
+            run.late_whole_bytes = payload.whole_fetched_bytes;
+            run.materialize_seconds = payload.materialize_seconds;
+            &payload.selection
+        } else { selection };
+        let known = ids.iter().cloned().collect::<BTreeSet<_>>();
         // Payload statements: the identities, plus an exact-instant fence
         // (Parquet statistics then skip every row group without a result
         // row). Past the fence's size bound, rows are fetched in batches of
@@ -5099,7 +5148,7 @@ pub fn plan_logs(
     compiled: &CompiledQuery,
     cursor: Option<(&str, &str)>,
 ) -> QueryResult<NativeQueryPlan> {
-    match cursor {
+    let mut plan = match cursor {
         Some((time, event_uid)) => planner::plan_broad_log_query_with_candidates_tail_time_and_cursor(
             &selection.tenant,
             &selection.manifest,
@@ -5117,7 +5166,11 @@ pub fn plan_logs(
             None,
         ),
     }
-    .map_err(map_plan_error)
+    .map_err(map_plan_error)?;
+    plan.sql = super::native_reader::inline_file_parsing(
+        plan.sql, plan.budget.candidate_objects, selection.tenant.threads,
+    );
+    Ok(plan)
 }
 
 /// NAN-3133: errors after which a request that read a sparse file reruns on
@@ -5126,7 +5179,7 @@ pub fn plan_logs(
 /// budget, memory and availability errors are answered as they are.
 fn reruns_whole(error: &PartQueryError) -> bool {
     match error {
-        PartQueryError::QueryFailed(text) | PartQueryError::Internal(text) => super::range_fetch::is_hole_read(text),
+        PartQueryError::QueryFailed(text) | PartQueryError::Internal(text) => text == super::range_fetch::LATE_FALLBACK || super::range_fetch::is_hole_read(text),
         _ => false,
     }
 }
@@ -5682,17 +5735,17 @@ mod prewarm_tests {
     async fn evidence_checks_every_query_lane_at_the_parse_boundary() {
         let primary = Arc::new(tokio::sync::Semaphore::new(2));
         let point = Arc::new(tokio::sync::Semaphore::new(POINT_PERMITS));
-        let job = Arc::new(tokio::sync::Semaphore::new(1));
+        let job = Arc::new(tokio::sync::Semaphore::new(4));
         for lane in [&primary, &point, &job] {
             let permit = lane.clone().acquire_owned().await.unwrap();
             let mut parses = 0;
-            if evidence_lanes_idle(&primary, 2, &point, &job) { parses += 1; }
+            if evidence_lanes_idle(&primary, 2, &point, &job, 4) { parses += 1; }
             assert_eq!(parses, 0, "a held query permit prevents a file parse");
             drop(permit);
-            assert!(evidence_lanes_idle(&primary, 2, &point, &job));
+            assert!(evidence_lanes_idle(&primary, 2, &point, &job, 4));
         }
         point.close();
-        assert!(!evidence_lanes_idle(&primary, 2, &point, &job));
+        assert!(!evidence_lanes_idle(&primary, 2, &point, &job, 4));
     }
 
     #[test]
@@ -6014,7 +6067,7 @@ mod native_debug_tests {
         }
         let scan_bytes = std::fs::metadata(&path).unwrap().len();
         assert!(scan_bytes > 16 * 1024 * 1024);
-        let (budget, classes) = QueryMemoryBudget::derive(3 * GIB, None).with_classes();
+        let (budget, classes) = QueryMemoryBudget::derive_for_role(3 * GIB, None, 8_000).with_classes();
         let classes = classes.unwrap();
         let pool = |count, name| NativeExecutor::start_with_server_memory_limit(
             runtime.clone(), count, name, ExecutorMode::ReadOnly, Some(budget.server_bytes),
@@ -6810,3 +6863,7 @@ mod no_schema_yet_tests {
         assert_eq!(read_schema(&mut view).unwrap().fields().len(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "late_materialization_bench.rs"]
+mod late_materialization_bench;

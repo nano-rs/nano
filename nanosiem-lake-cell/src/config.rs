@@ -676,7 +676,8 @@ impl ResourceConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoleBudget {
     pub request_millicores: u32,
     pub limit_millicores: u32,
@@ -770,6 +771,10 @@ pub struct TenantPlacement {
     /// false. Placement refuses unknown fields: render it only for that feature.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub landing: bool,
+    /// Trusted-local host sizing. Absent on hosted placements: legacy budgets
+    /// remain unchanged until the control plane negotiates a new contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_resources: Option<crate::trusted_local::LocalResources>,
 }
 
 /// product[T]'s fixed budget (NAN-3148): never placed, never shared with
@@ -841,11 +846,19 @@ impl TenantPlacement {
             detect_request_memory_bytes: None, detect_limit_memory_bytes: None,
             query_request_millicores: None, query_limit_millicores: None,
             query_request_memory_bytes: None, query_limit_memory_bytes: None, ingest_hold_eps: None,
-            ingest_hold_until: None, landing: false }
+            ingest_hold_until: None, landing: false, local_resources: None }
     }
 
     pub fn role_budget(&self, role: crate::contract::Role) -> Option<RoleBudget> {
         use crate::contract::Role;
+        if let Some(local) = &self.local_resources {
+            match role {
+                Role::Product => return Some(local.product),
+                Role::Landing => return Some(local.landing),
+                Role::Maintenance => return Some(local.maintenance),
+                _ => {}
+            }
+        }
         let values = match role {
             Role::Ingest => (self.ingest_request_millicores, self.ingest_limit_millicores, self.ingest_request_memory_bytes, self.ingest_limit_memory_bytes),
             Role::Detect => (self.detect_request_millicores, self.detect_limit_millicores, self.detect_request_memory_bytes, self.detect_limit_memory_bytes),
@@ -875,6 +888,7 @@ impl TenantPlacement {
             || self.detect_request_memory_bytes.is_some() || self.detect_limit_memory_bytes.is_some()
             || self.query_request_millicores.is_some() || self.query_limit_millicores.is_some()
             || self.query_request_memory_bytes.is_some() || self.query_limit_memory_bytes.is_some()
+            || self.local_resources.is_some()
     }
 }
 
@@ -942,6 +956,8 @@ impl Placement {
                 tracing::warn!(tenant = %t.tenant_id, "placement lacks role budgets; using legacy EPS-derived limits until the control plane updates placement.json");
             }
         }
+        anyhow::ensure!(cfg.trusted_local || self.tenants.iter().all(|t| t.local_resources.is_none()),
+            "local_resources requires trusted_local");
         if cfg.mode == CellMode::Dedicated {
             anyhow::ensure!(self.tenants.len() <= 1, "a dedicated cell holds exactly one tenant");
         }

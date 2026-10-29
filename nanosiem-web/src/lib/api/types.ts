@@ -6206,6 +6206,8 @@ export interface IngestCredentialReveal {
   source_slugs: string[];
   credential_id?: string | null;
   disposition?: string | null;
+  waiting_reason?: 'awaiting_enrollment' | 'awaiting_fulfilment' | 'source_platform_only' | null;
+  waiting_source_slugs?: string[];
   sealed_expires_at?: string | null;
   revealed_at?: string | null;
   /** True while POST .../reveal would return the token. */

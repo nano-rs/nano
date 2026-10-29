@@ -56,8 +56,33 @@ pub const LANDING_LIMIT_MEMORY_BYTES: u64 = 3 * GIB;
 pub const QUERY_PLACEMENT_REQUEST_MILLICORES: u32 = 250;
 /// The chDB thread count a query process opens with, from its role CPU
 /// limit (fixed for the life of the process; NAN-3177).
+pub const QUERY_MAX_THREADS: u32 = 128;
 pub fn query_threads(cpu_millis: u32) -> u32 {
-    (cpu_millis / 1000).clamp(1, 8)
+    // Bound native pools and stack reservations below the tenant's PID ceiling.
+    // This is a safety ceiling, not a deployment-size default.
+    (cpu_millis / 1000).clamp(1, QUERY_MAX_THREADS)
+}
+
+/// Finite task allowance for all of a tenant's UIDs together. EPS tiers are
+/// safety floors, not ceilings on a device-sized placement. Use the same
+/// thread model as the native statement planner (#8387). Reserve 32 tasks
+/// per role for runtime, DNS and executor lanes, plus 16 per statement CPU
+/// for native execution/parsing/I/O pools and concurrent hydration. This is
+/// startup headroom, not an assertion that every pool is simultaneously full.
+/// Including optional roles keeps a child's irreversible hard rlimit valid
+/// when those sibling roles start later.
+pub fn tenant_task_allowance(p: &crate::config::TenantPlacement) -> u64 {
+    let threads = crate::contract::Role::ALL.into_iter().map(|role| {
+        let cpu_millis = p.effective_role_budget(role).limit_millicores;
+        // Preserve local fractional-CPU task headroom when using the shared ceiling.
+        let cpu_millis = if p.local_resources.is_some() {
+            cpu_millis.saturating_add(999)
+        } else {
+            cpu_millis
+        };
+        u64::from(query_threads(cpu_millis))
+    }).sum::<u64>();
+    TenantBudget::from_eps(p.eps).max_pids.max(32 * crate::contract::Role::ALL.len() as u64 + 16 * threads)
 }
 /// The smallest detect[T] memory limit that runs rule searches itself
 /// (`detect_runs_rules`, NAN-3047): the engine is sized 512 MiB below the
@@ -88,6 +113,13 @@ pub struct TenantBudget {
     pub ingest_memory_cap_bytes: u64,
     /// Local verified-cache budget for the tenant (NAN-2853 cache).
     pub cache_disk_bytes: u64,
+}
+
+/// A verified cache gets at most one fifth of the data volume: parts,
+/// merge scratch, hot tail and durable state need the remaining space.
+/// EPS remains a demand ceiling; disk capacity is the physical ceiling.
+pub fn cache_disk_budget(requested: u64, volume_bytes: u64) -> u64 {
+    requested.min(volume_bytes / 5).max(1)
 }
 
 struct Anchor {
@@ -185,8 +217,30 @@ pub const L0_PART_MIN_ROWS: u64 = 16_384;
 /// Lowest rate whose catch-up-age flush spans two L0 parts: below it every
 /// flush is one part, which one writer writes, so memory buys no writer.
 pub const PARALLEL_FLUSH_EPS: u64 = (2 * L0_PART_MIN_ROWS).div_ceil(CATCH_UP_FLUSH_AGE_SECS);
-/// Query memory a target-rate shift never goes below.
-pub const QUERY_MEMORY_FLOOR_BYTES: u64 = GIB;
+/// Shared query admission model: CPU chooses demand; memory bounds each
+/// statement at the planner's minimum, rather than reserving 1 GiB per lane.
+pub const QUERY_SERVER_PERCENT: u64 = 75;
+pub const QUERY_MIN_HEADROOM_BYTES: u64 = 384 * MIB;
+pub const QUERY_MIN_STATEMENT_BYTES: u64 = 64 * MIB;
+pub const QUERY_MIN_SLOTS: usize = 2;
+/// Placement target per slot, not an admission requirement. Smaller existing
+/// roles can run more slots with a smaller per-query cap and disk spill.
+pub const QUERY_TARGET_SLOT_BYTES: u64 = GIB;
+
+pub fn query_slots(cpu_millis: u32, server_bytes: u64) -> usize {
+    let desired = (query_threads(cpu_millis) as usize / 2).max(QUERY_MIN_SLOTS);
+    desired.min((server_bytes / QUERY_MIN_STATEMENT_BYTES).max(1) as usize)
+}
+
+/// Reserve two comfortably sized queries before donating memory to ingest.
+/// Round to MiB so the 75% engine share still covers both slots.
+pub const QUERY_MEMORY_FLOOR_BYTES: u64 = {
+    let server = QUERY_MIN_SLOTS as u64 * QUERY_TARGET_SLOT_BYTES;
+    let percent_floor = (server * 100).div_ceil(QUERY_SERVER_PERCENT);
+    let fixed_floor = server + QUERY_MIN_HEADROOM_BYTES;
+    let bytes = if percent_floor > fixed_floor { percent_floor } else { fixed_floor };
+    bytes.div_ceil(MIB) * MIB
+};
 
 /// NAN-4749: THE ingest[T] memory a sustained `eps` needs for parallel L0
 /// flushes: [`INGEST_MEMORY_FOR_FULL_FLUSH`] from [`PARALLEL_FLUSH_EPS`]
@@ -222,6 +276,24 @@ pub fn ingest_query_for_eps(ingest: u64, query: u64, eps: u32, max_ingest: u64) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn query_slots_survive_ingest_shifts_and_follow_host_cpu() {
+        assert_eq!(query_slots(6_000, 2 * GIB / 100 * QUERY_SERVER_PERCENT), 3);
+        assert_eq!(query_slots(8_000, 2 * GIB / 100 * QUERY_SERVER_PERCENT), 4);
+        let floor_server = QUERY_MEMORY_FLOOR_BYTES / 100 * QUERY_SERVER_PERCENT;
+        assert!(floor_server >= QUERY_MIN_SLOTS as u64 * QUERY_TARGET_SLOT_BYTES);
+        for query in [512 * MIB, GIB, 2 * GIB, 4 * GIB, 8 * GIB, 32 * GIB] {
+            for cpu in [1_000, 4_000, 6_000, 8_000, 32_000, 128_000] {
+                let (ingest, remaining) = ingest_query_for_eps(GIB, query, 10_000, 32 * GIB);
+                assert_eq!(ingest + remaining, GIB + query);
+                assert!(remaining >= query.min(QUERY_MEMORY_FLOOR_BYTES));
+                let server = (remaining / 100 * QUERY_SERVER_PERCENT)
+                    .min(remaining.saturating_sub(QUERY_MIN_HEADROOM_BYTES));
+                assert!(query_slots(cpu, server) >= QUERY_MIN_SLOTS);
+            }
+        }
+    }
+
     /// NAN-4749: the shared target-rate ingest sizing.
     #[test]
     fn target_rate_ingest_sizing() {
@@ -237,8 +309,8 @@ mod tests {
         // The 1.0.11 bakeoff cell (16 GiB): 4 GiB ingest / 8 GiB query -> 6 / 6.
         assert_eq!(ingest_query_for_eps(4 * GIB, 8 * GIB, 10_000, 8 * GIB), (6 * GIB, 6 * GIB));
         // Capped by max_ingest; query keeps its floor; the sum never changes.
-        assert_eq!(ingest_query_for_eps(GIB, 2 * GIB, 10_000, 2 * GIB), (2 * GIB, GIB));
-        assert_eq!(ingest_query_for_eps(768 * MIB, 1536 * MIB, 10_000, 1536 * MIB), (1280 * MIB, GIB));
+        assert_eq!(ingest_query_for_eps(GIB, 2 * GIB, 10_000, 2 * GIB), (GIB, 2 * GIB));
+        assert_eq!(ingest_query_for_eps(768 * MIB, 1536 * MIB, 10_000, 1536 * MIB), (768 * MIB, 1536 * MIB));
         assert_eq!(ingest_query_for_eps(512 * MIB, GIB, 10_000, GIB), (512 * MIB, GIB));
         assert_eq!(ingest_query_for_eps(512 * MIB, 512 * MIB, 10_000, GIB), (512 * MIB, 512 * MIB));
         // Already covered: unchanged.

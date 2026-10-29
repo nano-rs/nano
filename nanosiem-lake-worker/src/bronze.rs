@@ -655,6 +655,8 @@ fn admit_bronze_files_inner(
         let reader = source.reader(path, if heap_allowance.is_some() { group_rows.min(1_024) } else { group_rows })?;
         let before = source_rows;
         let ceiling_ms = times.ceiling(path);
+        #[cfg(test)]
+        let reader = crate::nan4831_profile::timed_reader(reader);
         for batch in reader {
             let batch = batch?;
             source_rows = source_rows
@@ -664,10 +666,14 @@ fn admit_bronze_files_inner(
                 bail!("bronze admission exceeds its source-row bound");
             }
             let decode_start = std::time::Instant::now();
+            #[cfg(test)]
+            let json_cpu = crate::nan4831_profile::scope("json");
             let mut writer = LineDelimitedWriter::new(Vec::new());
             writer.write(&batch)?;
             writer.finish()?;
             let json = writer.into_inner();
+            #[cfg(test)]
+            drop(json_cpu);
             timings.decode_us += decode_start.elapsed().as_micros() as u64;
             let lines = json
                 .split(|byte| *byte == b'\n')
@@ -677,10 +683,14 @@ fn admit_bronze_files_inner(
             // normalization remain parallel; the serial identity merge keeps
             // deterministic conflict and replay behavior.
             let parse_start = std::time::Instant::now();
-            let parsed = lines.par_iter().map(|line| serde_json::from_slice::<Value>(line)
-                .map_err(anyhow::Error::from)
-                .and_then(decode_bronze_row)
-                .with_context(|| format!("decode Vector bronze row from {}", path.display())))
+            let parsed = lines.par_iter().map(|line| {
+                #[cfg(test)]
+                let _cpu = crate::nan4831_profile::scope("json");
+                serde_json::from_slice::<Value>(line)
+                    .map_err(anyhow::Error::from)
+                    .and_then(decode_bronze_row)
+                    .with_context(|| format!("decode Vector bronze row from {}", path.display()))
+            })
                 .collect::<Vec<Result<Value>>>();
             let mut events = Vec::with_capacity(parsed.len());
             for event in parsed {
@@ -999,8 +1009,11 @@ pub fn precheck_source_row(event: Value, tenant_id: &str) -> std::result::Result
             .filter(|value| !value.is_empty() && value.len() <= 4_096)
             .context("Vector bronze event has no bounded metadata.uid")?
             .to_string();
-        source_identity_digest(&event)?;
-        let row = EventRow { event_uid, event_kind: EventKind::Source, ocsf_event: event.clone() };
+        // The precheck has no replay set and does not retain an identity.
+        // Hashing a cloned JSON serialization here cannot reject a Value:
+        // its numbers and string keys are already representable JSON.
+        // Admission still computes and retains the digest before enrichment.
+        let row = EventRow { event_uid, event_kind: EventKind::Source, ocsf_event: event };
         normalize_event(&row, tenant_id).map(|_| ())
     };
     check().map_err(|error| classify_row_refusal(&error))
@@ -1162,6 +1175,8 @@ fn admit_event(
 }
 
 fn insert_admitted_event(identities: &mut AdmittedIdentities, admitted: AdmittedEvent) -> Result<()> {
+    #[cfg(test)]
+    let _cpu = crate::nan4831_profile::scope("dedup");
     let Some(existing) = identities.by_uid.get_mut(&admitted.event_uid) else {
         identities.by_uid.insert(
             admitted.event_uid,
@@ -1353,6 +1368,8 @@ pub fn decode_bronze_unmapped(event: &mut Value) {
 }
 
 pub(crate) fn source_identity_digest(event: &Value) -> Result<[u8; 32]> {
+    #[cfg(test)]
+    let _cpu = crate::nan4831_profile::scope("identity");
     let mut semantic = event.clone();
     if let Some(metadata) = semantic.get_mut("metadata").and_then(Value::as_object_mut) {
         metadata.remove("logged_time");

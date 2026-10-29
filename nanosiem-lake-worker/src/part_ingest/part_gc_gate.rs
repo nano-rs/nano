@@ -115,6 +115,10 @@ pub trait SanctionedPartGc: Send + Sync {
     /// a pass still in flight. `None` when only completed reports count.
     fn deleted_total(&self) -> Option<u64> { None }
 
+    /// Last capacity warning, independent of pass completion/index-only progress.
+    fn capacity_pressure(&self) -> Option<nanosiem_lake_cell::contract::PartGcBlocked> { None }
+    fn capacity_status(&self) -> Option<nanosiem_lake_cell::contract::PartGcCapacity> { None }
+
     /// Safe, bounded diagnostic; never includes a credential or endpoint.
     fn unavailable_detail(&self) -> &'static str {
         "sanctioned_route_unavailable"
@@ -163,6 +167,10 @@ pub trait PartGcAuthority: Send + Sync {
     /// NAN-3852: live receipted-delete count of the wired pass (see
     /// [`SanctionedPartGc::deleted_total`]).
     fn deleted_total(&self) -> Option<u64> { None }
+
+    /// Last capacity warning, independent of pass completion/index-only progress.
+    fn capacity_pressure(&self) -> Option<nanosiem_lake_cell::contract::PartGcBlocked> { None }
+    fn capacity_status(&self) -> Option<nanosiem_lake_cell::contract::PartGcCapacity> { None }
 
     fn blocked_detail(&self) -> &'static str {
         ""
@@ -243,6 +251,14 @@ impl PartGcAuthority for ExchangedGrantAuthority {
 
     fn blocked_detail(&self) -> &'static str {
         self.sanctioned.as_ref().map_or("sanctioned_route_not_wired", |pass| pass.unavailable_detail())
+    }
+
+    fn capacity_status(&self) -> Option<nanosiem_lake_cell::contract::PartGcCapacity> {
+        self.sanctioned.as_ref().and_then(|pass| pass.capacity_status())
+    }
+
+    fn capacity_pressure(&self) -> Option<nanosiem_lake_cell::contract::PartGcBlocked> {
+        self.sanctioned.as_ref().and_then(|pass| pass.capacity_pressure())
     }
 
     fn deleted_total(&self) -> Option<u64> {

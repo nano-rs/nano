@@ -26,3 +26,21 @@ tests:
       - eval_time: 3h
         alertname: LakePartGcBlocked
         exp_alerts: []
+  - interval: 1h
+    input_series:
+      - series: 'lake_part_gc_capacity_pressure{cell="c1",tenant="t",reason="history_capacity",detail="resident_memory"}'
+        values: '1 1 1 0'
+    alert_rule_test:
+      - eval_time: 0h
+        alertname: LakePartGcHistoryCapacity
+        exp_alerts:
+          - exp_labels:
+              tenant: t
+              detail: resident_memory
+              severity: warning
+            exp_annotations:
+              summary: "Lake GC history capacity pressure for tenant t"
+              description: "GC resident memory is at least 75% of its bound or the history volume has at most 25% free (resident_memory). The signal stays latched through retries and index-only progress; increase capacity before GC stalls."
+      - eval_time: 3h
+        alertname: LakePartGcHistoryCapacity
+        exp_alerts: []

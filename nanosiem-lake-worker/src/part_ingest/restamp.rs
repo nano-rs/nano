@@ -436,6 +436,8 @@ pub fn unstamped_artifacts(files: &[PathBuf]) -> Result<(u64, BTreeSet<String>)>
 /// the map lacks stays unstamped; stamped rows are never changed. Without
 /// the stamp columns in the schema the batch is returned as is.
 pub fn restamp_batch(batch: RecordBatch, map: &RestampMap) -> Result<RecordBatch> {
+    #[cfg(test)]
+    let _cpu = crate::nan4831_profile::scope("restamp");
     let schema = batch.schema();
     let Some(indices) = stamp_columns().iter().map(|name| schema.index_of(name).ok()).collect::<Option<Vec<_>>>() else {
         return Ok(batch);

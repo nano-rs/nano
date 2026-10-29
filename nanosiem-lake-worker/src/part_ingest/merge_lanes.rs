@@ -2,21 +2,101 @@
 //! Independent bounded merge lanes; overlapping event hours stay serialized.
 use crate::parts::levels::{Level, PlannedMerge};
 
-/// Concurrent merges per lane. History defaults to 2 (NAN-3187): after a
-/// backlog, sealed hours healed one at a time (~15 min each). Beyond the
-/// first, a history merge must be an `h` merge, run beside `h` merges only,
-/// and fit the memory headroom ([`history_memory_admits`]).
+/// Concurrency and reservations share the role boundary used by the running
+/// memory guard. Small roles keep one history operation, including rewrites;
+/// the remaining room belongs to minute compaction and admission.
+#[derive(Debug, Clone, Copy)]
+pub struct MergeCapacity {
+    pub cpu_millicores: u32,
+    pub memory_bytes: u64,
+    pub minute_bytes: u64,
+    pub history_bytes: u64,
+    pub minute_slots: usize,
+    pub history_slots: usize,
+}
+
+impl MergeCapacity {
+    pub fn read() -> Self {
+        #[cfg(test)]
+        if let Some(capacity) = CAPACITY_FOR_TEST.get() { return capacity; }
+        let memory = MemorySnapshot::read();
+        let role = crate::cgroup_memory::process_capacity();
+        Self::for_role(guard_limit(memory.cgroup_limit_bytes, memory.limit_bytes).or(Some(role.memory_bytes)),
+            role.cpu_millicores)
+    }
+
+    pub fn for_role(memory: Option<u64>, cpu_millicores: u32) -> Self {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // With no cgroup or assignment ceiling (unlimited labs), use the
+        // cell's existing host detector rather than inventing a small cap.
+        let memory_bytes = memory.unwrap_or_else(|| crate::cgroup_memory::process_capacity().memory_bytes);
+        // Reuse the existing merge-reserve decode window and add a writer.
+        // The measured 8-input minute merge peaked at 136 MiB with a
+        // 320 MiB window (merge::merge_reserve_bytes); triple-charging the
+        // window would cut small roles to one minute slot and fail catch-up.
+        let minute_bytes = (super::merge::decode_window_rows_for(memory_bytes) as u64)
+            .saturating_mul(super::merge::MERGE_ROW_BYTES)
+            .saturating_add(super::memory::L0_WRITER_BYTES);
+        // FP measured ~2.6 GB growth per hour merge. 3 GiB bounds the
+        // reservation on larger roles; small roles scale down and retain the
+        // existing shape/split planner and running guard. Keep 20% for minute
+        // compaction and 20% outside the merge pool for admission.
+        let history_pool = memory_bytes.saturating_mul(60) / 100;
+        let history_bytes = history_pool.min(3 * GIB).max(1);
+        let cpu_slots = (cpu_millicores / 2000).max(1) as usize;
+        let minute_slots = ((memory_bytes / 5 / minute_bytes).max(1) as usize).min(cpu_slots);
+        let history_slots = ((history_pool / history_bytes).max(1) as usize).min(cpu_slots);
+        Self { cpu_millicores, memory_bytes, minute_bytes, history_bytes, minute_slots, history_slots }
+    }
+
+    fn reservation(&self, level: Level) -> u64 {
+        if level == Level::Minute { self.minute_bytes } else { self.history_bytes }
+    }
+
+    /// Keep the two minute lanes required by the catch-up service-rate
+    /// regression available while long-running history jobs borrow capacity.
+    pub fn minute_progress_slots(&self) -> usize {
+        self.minute_slots.min(2)
+    }
+
+    /// Charge not-yet-resident peaks too: several jobs can be launched on
+    /// one tick before memory.current reflects any of their allocations.
+    pub fn fits<'a>(&self, level: Level, active: impl Iterator<Item = &'a PlannedMerge>) -> bool {
+        let (mut reserved, minutes) = active.fold((self.reservation(level), 0_usize), |(sum, minutes), merge|
+            (sum.saturating_add(self.reservation(merge.output_level)), minutes + usize::from(merge.output_level == Level::Minute)));
+        if level != Level::Minute {
+            reserved = reserved.saturating_add(self.minute_bytes.saturating_mul(
+                self.minute_progress_slots().saturating_sub(minutes) as u64));
+        }
+        reserved <= self.memory_bytes.saturating_mul(80) / 100
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAPACITY_FOR_TEST: std::cell::Cell<Option<MergeCapacity>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub struct TestCapacity(Option<MergeCapacity>);
+#[cfg(test)]
+impl Drop for TestCapacity {
+    fn drop(&mut self) { CAPACITY_FOR_TEST.set(self.0); }
+}
+#[cfg(test)]
+pub fn test_capacity(capacity: MergeCapacity) -> TestCapacity {
+    TestCapacity(CAPACITY_FOR_TEST.replace(Some(capacity)))
+}
+
+#[cfg(test)]
+#[path = "merge_capacity_tests.rs"]
+mod capacity_tests;
+
+/// Supersedes the minute/history concurrency environment overrides: a fixed
+/// override cannot safely reserve memory across lanes and count rewrites.
 pub fn capacity(level: Level) -> usize {
-    let (name, default) = if level == Level::Minute {
-        ("NANO_LAKE_MERGE_MINUTE_CONCURRENCY", 2)
-    } else {
-        ("NANO_LAKE_MERGE_HISTORY_CONCURRENCY", 2)
-    };
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| (1..=4).contains(v))
-        .unwrap_or(default)
+    let capacity = MergeCapacity::read();
+    if level == Level::Minute { capacity.minute_slots } else { capacity.history_slots }
 }
 
 /// The order one scheduling pass offers due merges to the lanes (NAN-3400).
@@ -127,7 +207,9 @@ pub fn available(merge: &PlannedMerge, active: &[&PlannedMerge]) -> bool {
 /// each) do not delay it; as a further history merge it still needs the
 /// memory headroom, and a day merge still runs alone.
 pub fn available_at(merge: &PlannedMerge, active: &[&PlannedMerge], now_ms: i64) -> bool {
-    let reserved = is_fresh_hour_merge(merge, now_ms) && active.iter().all(|m| !is_fresh_hour_merge(m, now_ms));
+    let sizing = MergeCapacity::read();
+    if !sizing.fits(merge.output_level, active.iter().copied()) { return false; }
+    let reserved = sizing.history_slots > 1 && is_fresh_hour_merge(merge, now_ms) && active.iter().all(|m| !is_fresh_hour_merge(m, now_ms));
     available_with(merge, active, capacity(merge.output_level) + usize::from(reserved), || {
         history_memory_admits(MemorySnapshot::read())
     })
@@ -159,15 +241,8 @@ pub fn available_with(
         && memory_admits()
 }
 
-/// Resident memory one more history merge may add. The merge streams
-/// (`merge::MAX_OPEN_INPUTS` readers over a decode window of at most
-/// 32,768 rows x 10 KiB = 320 MiB) and NAN-3056 measured a background hour
-/// merge plus a full admission-buffer flush under half of 4.5 GiB; 1 GiB
-/// covers the window, reader page/dictionary state, the output row group and
-/// token/partial building with margin.
-pub const HISTORY_MERGE_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
 /// A further history merge starts only while the cgroup working set plus
-/// [`HISTORY_MERGE_MEMORY_BYTES`] stays under this share of memory.max.
+/// the role-derived history reservation stays under this share of memory.max.
 pub const HISTORY_MEMORY_CEILING: f64 = 0.80;
 
 /// This process's memory: working set (its cgroup's usage minus inactive
@@ -294,13 +369,14 @@ pub fn guard_limit(cgroup_limit: Option<u64>, assignment_cap: Option<u64>) -> Op
 /// is no budget to protect, so it fits. A limit with an unreadable usage
 /// does not.
 pub fn history_memory_admits(memory: MemorySnapshot) -> bool {
-    let Some(limit) = memory.limit_bytes else {
+    let Some(limit) = guard_limit(memory.cgroup_limit_bytes, memory.limit_bytes) else {
         return true;
     };
     let Some(working_set) = memory.working_set_bytes else {
         return false;
     };
-    let admits = (working_set.saturating_add(HISTORY_MERGE_MEMORY_BYTES) as f64)
+    let reserve = MergeCapacity::for_role(Some(limit), 1000).history_bytes;
+    let admits = (working_set.saturating_add(reserve) as f64)
         <= limit as f64 * HISTORY_MEMORY_CEILING;
     if !admits {
         tracing::debug!(
@@ -618,7 +694,7 @@ mod tests {
             2,
             || false
         ));
-        // Setting the knob to 1 restores one history merge at a time.
+        // A one-slot capacity serializes history merges.
         assert!(!available_with(&planned[1], &[&planned[0]], 1, fits));
     }
 
@@ -785,7 +861,7 @@ mod tests {
         // The catch-up peak (6.1 GB) leaves no room for another merge...
         assert!(!history_memory_admits(at(6_100_000_000)));
         // ...steady ingest plus one running hour merge does.
-        assert!(history_memory_admits(at(4 * GIB)));
+        assert!(history_memory_admits(at(3 * GIB)));
         assert!(!history_memory_admits(MemorySnapshot {
             working_set_bytes: None,
             limit_bytes: Some(limit),

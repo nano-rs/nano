@@ -478,6 +478,23 @@ async fn hydrate_with(
     let target = capacity
         .min(fetcher.cache().stats().max_bytes)
         .saturating_sub(fetcher.cache().cold_read_reserve());
+    // The older planning partials share admission's hot-window limit with
+    // the selected data. Reserve their bytes first: otherwise a full data
+    // window evicts these oldest hot objects as soon as they are hydrated,
+    // and every unchanged pass downloads them again (NAN-4799).
+    // Use the existing volume/cache capacity, with no extra memory cache,
+    // fixed byte allowance or tuning knob. If metadata alone exceeds it,
+    // keep a contiguous newest-first prefix rather than cycling the set.
+    let plan_only = select(
+        plan_only.into_iter().map(|(end, (part, record))| {
+            let bytes = plan_files(&record).iter().map(|(_, _, bytes)| bytes).sum();
+            (end, bytes, (part, record))
+        }).collect(),
+        plan_cutoff,
+        target,
+    );
+    let plan_bytes = plan_only.iter().map(|(_, bytes, _)| bytes).sum::<u64>();
+    let plan_only = plan_only.into_iter().map(|(end, _, source)| (end, source)).collect::<Vec<_>>();
     let mut buckets = [
         Bucket {
             hours: 1,
@@ -506,7 +523,7 @@ async fn hydrate_with(
             }
         }
     }
-    let selected = select(candidates, cutoff, target);
+    let selected = select(candidates, cutoff, target.saturating_sub(plan_bytes));
     let previous = fetcher
         .hot_coverage
         .lock()
@@ -546,7 +563,7 @@ async fn hydrate_with(
     }
     let selected_ends = selected.iter().map(|(end, _, _)| *end).collect::<Vec<_>>();
     coverage.rate_cap_bytes_per_second =
-        crate::local_hot_window::hydrate_rate(settings.bytes_per_second, coverage.selected_bytes);
+        crate::local_hot_window::hydrate_rate(settings.bytes_per_second, coverage.selected_bytes.saturating_add(plan_bytes));
     fetcher.cache().set_hot(hot);
     let started = Instant::now();
     let rate_cap = coverage.rate_cap_bytes_per_second;
@@ -2708,6 +2725,80 @@ mod tests {
 
     async fn live_parts(store: &Arc<LocalObjectStore>, signer: &LocalPartSigner) -> Vec<PartRef> {
         PartLogView::open(store.as_ref(), TENANT, signer.trusted()).await.unwrap().live().parts().cloned().collect()
+    }
+
+    /// A full data window must leave room for the older planning partials.
+    /// Otherwise admission evicts the oldest partials and every pass fetches
+    /// them again, even though neither membership nor content changed.
+    #[tokio::test]
+    async fn repeated_hydration_and_lookups_fetch_each_plan_partial_once() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(&root.path().join("objects")).unwrap());
+        let (signer, _writer, parts, slow, mut fetcher) =
+            partials_fixture_ages(root.path(), &store, &[0, 1, 100, 200, 300, 400, 500, 600], false).await;
+        // Two hot parts fit without accounting for the older partials;
+        // with their bytes reserved, exactly one hot part fits.
+        let hot_bytes = resident_bytes(&parts[0].1);
+        let plan_bytes = parts[2..].iter().map(|(_, record)|
+            plan_files(record).iter().map(|(_, _, bytes)| bytes).sum::<u64>()).sum::<u64>();
+        let target = 2 * hot_bytes + plan_bytes - 1;
+        let cache = ReaderObjectCache::open(ReaderObjectCacheSettings {
+            root: root.path().join("bounded-cache"), max_bytes: 2 * target,
+            query_max_bytes: 1, fetch_concurrency: 1, fetch_deadline: Duration::from_secs(5),
+        }, TENANT, "lab", &parts_key_prefix(TENANT).unwrap(), slow.clone()).unwrap();
+        let mut settings = fetcher.hot_settings.take().unwrap();
+        settings.root = root.path().join("bounded-cache");
+        // Production admission applies the same capacity and cold reserve as
+        // selection. The large fixture's free filesystem space is irrelevant.
+        cache.set_hot_capacity(settings.clone());
+        fetcher = PartFetcher::new(TENANT, "lab", store.clone(), signer.trusted(), cache)
+            .unwrap().with_hot_window(Some(settings));
+        let live = live_parts(&store, &signer).await;
+        for pass in 0..5 {
+            hydrate(&fetcher, TENANT, live.clone(), &AtomicU64::new(0), Instant::now()).await.unwrap();
+            for (part, _) in &parts[2..] {
+                let local = fetcher.ensure(std::slice::from_ref(part), &[
+                    super::super::fetch::FileSet::Partial(PartialKind::EntityRanges),
+                ]).await.unwrap();
+                assert_eq!(local.files.len(), 1);
+            }
+            let order = slow.order.lock().unwrap();
+            for (part, record) in &parts[2..] {
+                for kind in [PartialKind::Rollup, PartialKind::EntityRanges] {
+                    let object = part_object(&fetcher, part, record, PartFile::Partial(kind));
+                    assert_eq!(order.iter().filter(|uri| **uri == object.source_uri).count(), 1,
+                        "pass {pass} refetched immutable {kind:?} for {}", part.part_id);
+                }
+            }
+        }
+        assert_eq!(fetcher.hot_coverage.lock().unwrap().selected_parts, 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_plan_inventory_keeps_a_stable_bounded_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(&root.path().join("objects")).unwrap());
+        let (signer, _writer, parts, slow, mut fetcher) =
+            partials_fixture_ages(root.path(), &store, &[100, 200, 300], false).await;
+        let plan_bytes = plan_files(&parts[0].1).iter().map(|(_, _, bytes)| bytes).sum::<u64>();
+        let cache = ReaderObjectCache::open(ReaderObjectCacheSettings {
+            root: root.path().join("bounded-cache"), max_bytes: 2 * plan_bytes,
+            query_max_bytes: 1, fetch_concurrency: 1, fetch_deadline: Duration::from_secs(5),
+        }, TENANT, "lab", &parts_key_prefix(TENANT).unwrap(), slow.clone()).unwrap();
+        let mut settings = fetcher.hot_settings.take().unwrap();
+        settings.root = root.path().join("bounded-cache");
+        cache.set_hot_capacity(settings.clone());
+        fetcher = PartFetcher::new(TENANT, "lab", store.clone(), signer.trusted(), cache)
+            .unwrap().with_hot_window(Some(settings));
+        for _ in 0..3 {
+            hydrate(&fetcher, TENANT, live_parts(&store, &signer).await,
+                &AtomicU64::new(0), Instant::now()).await.unwrap();
+        }
+        let order = slow.order.lock().unwrap();
+        assert_eq!(order.len(), 2, "only the newest part's two planning partials fit: {order:?}");
+        assert!(order.iter().all(|uri| uri.contains(parts[0].0.part_id.as_str())));
+        assert!(fetcher.cache().stats().stored_bytes <= plan_bytes);
+        assert_eq!(fetcher.hot_coverage.lock().unwrap().selected_parts, 0);
     }
 
     /// NAN-3690 acceptance: the gated warm-up fetches the

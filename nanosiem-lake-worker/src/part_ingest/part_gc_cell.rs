@@ -95,8 +95,43 @@ const CATCH_UP_BYTES: usize = 8 * 1024 * 1024;
 const CATCH_UP_YIELD: Duration = Duration::from_millis(10);
 const LOG_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CATCH_UP_RETRIES: u32 = 3;
-const MAX_VIEW_BYTES: u64 = 128 * 1024 * 1024;
+// Historical policy reference used by regression tests, never an admission cap.
+#[cfg(test)]
 const MAX_VIEW_PARTS: usize = 262_144;
+
+#[derive(Clone, Copy, Debug)]
+struct ViewBudget {
+    parts: usize,
+    bytes: u64,
+    sqlite_cache_bytes: u64,
+}
+
+impl ViewBudget {
+    fn for_limits(cgroup: Option<u64>, placement: Option<u64>) -> Self {
+        let limit = cgroup.into_iter().chain(placement).filter(|n| *n > 0).min()
+            .unwrap_or_else(|| crate::cgroup_memory::process_capacity().memory_bytes);
+        // One quarter of the role for the retained view. Charge 2 KiB per
+        // resident identity (part_gc_measured_resident_identity_charge).
+        // Lifetime proofs use a separate paged cache. Leave the other 3/4 for
+        // ingest, merge and the bounded read-ahead/parsed-entry scratch.
+        let retained = limit / 4;
+        Self {
+            parts: usize::try_from(retained / 2048).unwrap_or(usize::MAX),
+            // Reserve four bytes of heap per serialized snapshot byte.
+            bytes: retained / 4,
+            // A small share of the role, independent of tenant age.
+            // 64 KiB is SQLite's useful minimum (16 database pages).
+            sqlite_cache_bytes: (limit / 1024).max(64 * 1024),
+        }
+    }
+
+    fn current() -> Self {
+        Self::for_limits(
+            crate::cgroup_memory::for_process().limit().map(|limit| limit.bytes),
+            super::merge::memory_cap_bytes(),
+        )
+    }
+}
 const READ_AHEAD_WINDOW: usize = 8;
 // Per slot: a capped body, one transport chunk, and OpenDAL's final Vec copy.
 const RAW_SLOT_BYTES: usize = 3 * crate::parts::format::MAX_LOG_OBJECT_BYTES;
@@ -154,7 +189,7 @@ struct Inventory {
 pub const PASSES_PER_INVENTORY: usize = 4;
 
 /// Format tag of the persisted view.
-pub const VIEW_FORMAT: &str = "nano.lake-part-gc-view.v1";
+pub const VIEW_FORMAT: &str = "nano.lake-part-gc-view.v3";
 
 /// `lake_part_gc` in the ingest credential-exchange response (the platform
 /// renders it only for images reporting [`FEATURE`], and only together with
@@ -347,9 +382,12 @@ struct PersistedView {
     view: LakePartLogView,
 }
 
-/// Where the cell keeps [`PersistedView`] (`<state_dir>/lake-part-gc/view.json`).
+/// Where the cell keeps [`PersistedView`] (`<state_dir>/lake-part-gc/view.sqlite`).
 pub struct ViewStore {
     path: PathBuf,
+    memory: crate::cgroup_memory::MemoryCgroup,
+    #[cfg(test)]
+    test_memory_limit: AtomicU64,
     loaded: AtomicBool,
     dirty: AtomicBool,
     /// NAN-3495: the refused-key markers were loaded (or found absent).
@@ -384,7 +422,10 @@ struct PersistedRefused {
 impl ViewStore {
     pub fn new(state_dir: &Path) -> Self {
         Self {
-            path: state_dir.join("lake-part-gc").join("view.json"),
+            path: state_dir.join("lake-part-gc").join("view.sqlite"),
+            memory: crate::cgroup_memory::for_process(),
+            #[cfg(test)]
+            test_memory_limit: AtomicU64::new(0),
             loaded: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
             refused_loaded: AtomicBool::new(false),
@@ -392,6 +433,17 @@ impl ViewStore {
             last_saved: std::sync::Mutex::new(None),
             save_every_ms: AtomicU64::new(VIEW_SAVE_EVERY.as_millis() as u64),
         }
+    }
+
+    fn budget(&self) -> ViewBudget {
+        #[cfg(test)]
+        if self.test_memory_limit.load(Ordering::Relaxed) > 0 {
+            return ViewBudget::for_limits(Some(self.test_memory_limit.load(Ordering::Relaxed)), None);
+        }
+        ViewBudget::for_limits(
+            self.memory.limit().map(|limit| limit.bytes),
+            super::merge::memory_cap_bytes(),
+        )
     }
 
     /// Whether an extended (dirty) view is written now: its first write in
@@ -481,21 +533,13 @@ impl ViewStore {
     }
 
     fn load(&self, tenant_uuid: &str) -> Result<Option<LakePartLogView>> {
-        let file = match std::fs::File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error).context("read persisted lake-part GC view"),
-        };
-        ensure!(
-            file.metadata()?.len() <= MAX_VIEW_BYTES,
-            "persisted GC view exceeds byte budget"
-        );
-        let persisted: PersistedView = serde_json::from_reader(std::io::BufReader::new(file))
+        if !self.path.try_exists()? { return Ok(None); }
+        let history = Arc::new(crate::lake_part_gc::history::PagedHistory::open(&self.path, false, self.budget().sqlite_cache_bytes)?);
+        let Some(body) = history.load_snapshot(self.budget().bytes)? else { return Ok(None); };
+        let mut persisted: PersistedView = serde_json::from_slice(&body)
             .context("parse persisted lake-part GC view")?;
-        ensure!(
-            persisted.view.part_count() <= MAX_VIEW_PARTS,
-            "persisted GC view exceeds part budget"
-        );
+        persisted.view.attach_history(history)?;
+        ensure!(persisted.view.resident_refs() <= self.budget().parts, "persisted GC view exceeds part budget");
         ensure!(
             persisted.format == VIEW_FORMAT,
             "persisted view format {}",
@@ -509,57 +553,36 @@ impl ViewStore {
             persisted.view.from_genesis(),
             "persisted view was not folded from genesis"
         );
+        persisted.view.check_history()?;
         Ok(Some(persisted.view))
     }
 
     fn save(&self, tenant_uuid: &str, view: &LakePartLogView) -> Result<()> {
-        use std::io::Write;
-        let dir = self.path.parent().context("view path has no parent")?;
-        std::fs::create_dir_all(dir)?;
-        // Borrowed: no second copy of a large view while it is written.
+        ensure!(view.resident_refs() <= self.budget().parts, "GC view exceeds part budget");
         #[derive(Serialize)]
         struct Borrowed<'a> {
             format: &'a str,
             tenant_uuid: &'a str,
             view: &'a LakePartLogView,
         }
-        let persisted = Borrowed {
-            format: VIEW_FORMAT,
-            tenant_uuid,
-            view,
-        };
-        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-        // Limit writes too: a failed save leaves the previous atomic snapshot intact.
-        struct Limited<'a> {
-            file: &'a mut std::fs::File,
-            left: u64,
-        }
-        impl std::io::Write for Limited<'_> {
+        struct SnapshotBytes { body: Vec<u8>, limit: u64 }
+        impl std::io::Write for SnapshotBytes {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if bytes.len() as u64 > self.left {
+                if (self.body.len() as u64).saturating_add(bytes.len() as u64) > self.limit {
                     return Err(std::io::Error::other("GC view exceeds byte budget"));
                 }
-                let written = self.file.write(bytes)?;
-                self.left -= written as u64;
-                Ok(written)
+                self.body.extend_from_slice(bytes);
+                Ok(bytes.len())
             }
-            fn flush(&mut self) -> std::io::Result<()> {
-                self.file.flush()
-            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
         }
-        {
-            let mut writer = std::io::BufWriter::new(Limited {
-                file: temp.as_file_mut(), left: MAX_VIEW_BYTES,
-            });
-            serde_json::to_writer(&mut writer, &persisted)?;
-            writer.flush()?;
-        }
-        temp.as_file_mut().flush()?;
-        temp.as_file().sync_all()?;
-        temp.persist(&self.path).map_err(|error| error.error)?;
-        std::fs::File::open(dir)?.sync_all()?;
+        let mut bounded = SnapshotBytes { body: Vec::new(), limit: self.budget().bytes };
+        serde_json::to_writer(&mut bounded, &Borrowed { format: VIEW_FORMAT, tenant_uuid, view })?;
+        let body = bounded.body;
+        view.history()?.save_snapshot(&body, view.live().head())?;
         Ok(())
     }
+
 }
 
 /// The GC pass's own OS thread and current-thread runtime. Nothing the pass
@@ -690,6 +713,14 @@ struct Shared {
     enabled: AtomicBool,
     refreshing: AtomicBool,
     folded_prefix: std::sync::Mutex<Option<FoldedPrefix>>,
+    capacity_pressure: std::sync::Mutex<Option<nanosiem_lake_cell::contract::PartGcBlocked>>,
+    capacity_status: std::sync::Mutex<Option<nanosiem_lake_cell::contract::PartGcCapacity>>,
+    capacity_log: std::sync::Mutex<Option<tokio::time::Instant>>,
+    capacity_baseline: std::sync::Mutex<Option<(tokio::time::Instant, u64, u64)>>,
+    #[cfg(test)]
+    max_history_cache_bytes: AtomicU64,
+    #[cfg(test)]
+    max_resident_refs: AtomicU64,
     now: Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync>,
     generation: tokio::sync::watch::Sender<u64>,
     transport_observation: Arc<crate::r2_ops::GcHttpObservation>,
@@ -866,6 +897,14 @@ impl CellSanctionedPartGc {
             enabled: AtomicBool::new(false),
             refreshing: AtomicBool::new(false),
             folded_prefix: std::sync::Mutex::new(None),
+            capacity_pressure: std::sync::Mutex::new(None),
+            capacity_status: std::sync::Mutex::new(None),
+            capacity_log: std::sync::Mutex::new(None),
+            capacity_baseline: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            max_history_cache_bytes: AtomicU64::new(0),
+            #[cfg(test)]
+            max_resident_refs: AtomicU64::new(0),
             now: Arc::new(chrono::Utc::now),
             generation: tokio::sync::watch::channel(0).0,
             transport_observation: Arc::new(crate::r2_ops::GcHttpObservation::default()),
@@ -1562,10 +1601,94 @@ pub(crate) fn gc_parse_entry(raw: &[u8], tenant: &str) -> Result<crate::parts::p
     crate::parts::part_log::LogEntry::parse_bytes(raw, tenant)
 }
 
-/// Resume the view from its persisted copy (once per process), then fold new
-/// entries in one chunk of [`VIEW_PERSIST_EVERY`], then persist and yield to
-/// the next pass. False means the budget was exhausted: do not plan against
-/// a partial live set.
+/// Keep warnings latched through retry gaps and index-only successes. Only a
+/// complete verified fold below the warning thresholds clears the latch.
+fn observe_capacity(views: Option<&ViewStore>, shared: &Shared, view: &LakePartLogView,
+    budget: ViewBudget, complete: bool, incoming: usize) -> Result<()> {
+    let resident = view.resident_refs().saturating_add(incoming);
+    let disk = match views {
+        Some(views) => {
+            let dir = views.path.parent().context("GC capacity path")?;
+            Some((fs2::available_space(dir)?, fs2::total_space(dir)?, view.history()?.disk_bytes()?, view.history()?.max_disk_bytes()?))
+        }
+        None => None,
+    };
+    let detail = if resident >= budget.parts.saturating_mul(3) / 4 {
+        Some("resident_memory")
+    } else if disk.is_some_and(|(free, total, used, max)| free <= total / 4 || used >= max / 4 * 3) {
+        Some("history_disk")
+    } else { None };
+    let mut warning = shared.capacity_pressure.lock().map_err(|_| anyhow::anyhow!("GC capacity lock poisoned"))?;
+    let now = tokio::time::Instant::now();
+    let mut last_log = shared.capacity_log.lock().map_err(|_| anyhow::anyhow!("GC capacity log lock poisoned"))?;
+    if let Some(detail) = detail {
+        if warning.is_none() || last_log.is_none_or(|at| now.duration_since(at) >= PROGRESS_LOG_EVERY) {
+            tracing::warn!(resident_refs = resident, resident_limit = budget.parts,
+                history_refs = view.part_count(), disk_free = ?disk.map(|d| d.0),
+                history_bytes = ?disk.map(|d| d.2), detail,
+                "lake-part GC capacity pressure; action required before exhaustion");
+            *last_log = Some(now);
+        }
+        *warning = Some(nanosiem_lake_cell::contract::PartGcBlocked {
+            reason: "history_capacity".into(), detail: detail.into(), parts: resident as u64,
+            bytes: disk.map_or(0, |d| d.2), blocked_seconds: 0,
+        });
+    } else if complete && warning.take().is_some() {
+        tracing::warn!(resident_refs = resident, resident_limit = budget.parts,
+            history_refs = view.part_count(), "lake-part GC capacity pressure cleared");
+        *last_log = None;
+    }
+    let history_refs = view.part_count() as u64;
+    let legacy_limit_refs = budget.parts as u64;
+    let remaining = legacy_limit_refs.saturating_sub(history_refs);
+    let (mut growth, mut legacy_runway, mut disk_runway) = (None, if remaining == 0 { Some(0) } else { None }, None);
+    let now = tokio::time::Instant::now();
+    if complete {
+        let mut baseline = shared.capacity_baseline.lock().map_err(|_| anyhow::anyhow!("GC capacity baseline poisoned"))?;
+        if let Some((at, refs, used)) = *baseline {
+            let elapsed = now.duration_since(at).as_secs();
+            if elapsed >= 60 {
+                let delta = history_refs.saturating_sub(refs);
+                if delta > 0 {
+                    growth = Some(delta.saturating_mul(86_400) / elapsed);
+                    legacy_runway = Some(remaining.saturating_mul(elapsed) / delta);
+                }
+                if let Some((free, _, bytes, max)) = disk {
+                    let delta_bytes = bytes.saturating_sub(used);
+                    if delta_bytes > 0 {
+                        disk_runway = Some(free.min(max.saturating_sub(bytes)).saturating_mul(elapsed) / delta_bytes);
+                    }
+                }
+            }
+        } else { *baseline = Some((now, history_refs, disk.map_or(0, |d| d.2))); }
+    }
+    *shared.capacity_status.lock().map_err(|_| anyhow::anyhow!("GC capacity status poisoned"))? = Some(
+        nanosiem_lake_cell::contract::PartGcCapacity {
+            observed_at_ms: (shared.now)().timestamp_millis().max(0) as u64,
+            head_seq: view.head_seq(), history_refs, complete, resident_refs: resident as u64, resident_limit: budget.parts as u64,
+            history_bytes: disk.map_or(0, |d| d.2), disk_free_bytes: disk.map_or(0, |d| d.0),
+            disk_total_bytes: disk.map_or(0, |d| d.1), history_max_bytes: disk.map_or(0, |d| d.3),
+            growth_refs_per_day: growth, legacy_limit_refs, legacy_remaining_refs: remaining,
+            legacy_runway_seconds: legacy_runway, disk_runway_seconds: disk_runway,
+            pressure: warning.is_some(), pressure_detail: warning.as_ref().map(|warning| warning.detail.clone()),
+        });
+    if complete {
+        tracing::info!(history_refs = view.part_count(), resident_refs = resident,
+            resident_limit = budget.parts, history_bytes = ?disk.map(|d| d.2),
+            "lake-part GC history capacity");
+    }
+    Ok(())
+}
+
+fn incoming_resident_refs(op: &crate::parts::part_log::LogOp) -> usize {
+    use crate::parts::part_log::LogOp;
+    let sources = match op { LogOp::Add { consumed, .. } => consumed.len(), _ => 0 };
+    // Live/ref/seen/added_at/removed bookkeeping, plus independent source IDs.
+    crate::lake_part_gc::index::part_refs(op).saturating_mul(5).saturating_add(sources)
+}
+
+/// Resume the verified cursor and page exact history in bounded slices.
+/// False means catch-up is incomplete: never plan against that prefix.
 async fn advance_view(
     views: Option<&ViewStore>,
     shared: &Shared,
@@ -1602,6 +1725,12 @@ async fn advance_view(
                 }
             }
         }
+        if state.view.head_seq().is_none() && !views.loaded.load(Ordering::SeqCst) {
+            std::fs::create_dir_all(views.path.parent().context("GC view path")?)?;
+            let history = Arc::new(crate::lake_part_gc::history::PagedHistory::open(&views.path, true, views.budget().sqlite_cache_bytes)?);
+            history.reset()?;
+            state.view.attach_history(history)?;
+        }
         // A transient head verification failure returned above leaves this
         // false: retry the saved cursor rather than accidentally refolding.
         views.loaded.store(true, Ordering::SeqCst);
@@ -1612,6 +1741,7 @@ async fn advance_view(
             views.save_tracked(&shared.tenant_uuid, &state.view)?;
         }
     }
+    state.view.check_history()?;
     let started = tokio::time::Instant::now();
     let mut bytes = 0;
     let mut complete = false;
@@ -1637,6 +1767,11 @@ async fn advance_view(
     // stay within96 MiB including body/chunk/OpenDAL copies. Only the
     // next entry is parsed; never eight concurrent parsed object graphs.
     let mut pending = FuturesOrdered::new();
+    // Re-read a resize at every bounded slice, including in-memory callers.
+    let view_budget = views.map_or_else(ViewBudget::current, ViewStore::budget);
+    if views.is_some() { state.view.history()?.resize_cache(view_budget.sqlite_cache_bytes)?; }
+    observe_capacity(views, shared, &state.view, view_budget, false, 0)?;
+    ensure!(state.view.resident_refs() <= view_budget.parts, "GC view exceeds part budget");
     let mut admitted = 0_u64;
     let first = state.view.head_seq().map_or(0, |seq| seq + 1);
     let read = |seq| async move {
@@ -1674,15 +1809,27 @@ async fn advance_view(
         let entry = gc_parse_entry(&raw, &shared.tenant_uuid)?;
         let sha256 = crate::parts::sha256_hex(&raw);
         ensure!(entry.seq == seq, "GC log reader returned wrong sequence");
+        if state.view.resident_refs().saturating_add(incoming_resident_refs(&entry.op)) >= view_budget.parts.saturating_mul(3) / 4 {
+            observe_capacity(views, shared, &state.view, view_budget, false, incoming_resident_refs(&entry.op))?;
+        }
         ensure!(
             state
                 .view
-                .part_count()
-                .saturating_add(crate::lake_part_gc::index::part_refs(&entry.op))
-                <= MAX_VIEW_PARTS,
-            "GC view exceeds part budget"
+                .resident_refs()
+                .saturating_add(incoming_resident_refs(&entry.op))
+                <= view_budget.parts,
+            "GC view exceeds part budget ({} retained refs, {} incoming refs, limit {})",
+            state.view.resident_refs(), incoming_resident_refs(&entry.op), view_budget.parts
         );
         state.view.apply(&entry, &sha256)?;
+        #[cfg(test)]
+        {
+            shared.max_resident_refs.fetch_max(state.view.resident_refs() as u64, Ordering::SeqCst);
+            if let Ok(history) = state.view.history() {
+                shared.max_history_cache_bytes.fetch_max(history.cache_bytes()? as u64, Ordering::SeqCst);
+                shared.max_resident_refs.fetch_max(history.peak_resident_refs() as u64, Ordering::SeqCst);
+            }
+        }
         let appended_ms = entry.appended_at_ms;
         // Drop the parsed graph before retaining raw bytes; no parsed graph cache.
         drop(entry);
@@ -1714,6 +1861,7 @@ async fn advance_view(
             views.save_tracked(&shared.tenant_uuid, &state.view)?;
         }
     }
+    observe_capacity(views, shared, &state.view, view_budget, complete, 0)?;
     shared.view_complete.store(complete, Ordering::SeqCst);
     Ok(complete)
 }
@@ -2268,7 +2416,7 @@ impl CellSanctionedPartGc {
 
 #[derive(Debug, thiserror::Error)]
 #[error("GC successful exchange credentials are being replaced")]
-struct RefreshSuspended;
+pub(crate) struct RefreshSuspended;
 
 pub(crate) fn is_refresh_suspended(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<RefreshSuspended>())
@@ -2372,6 +2520,14 @@ impl SanctionedPartGc for CellSanctionedPartGc {
         runner.armed |= self.shared.current().is_ok();
         self.spawn_index_only_if_idle(&mut runner, now_ms);
         result
+    }
+
+    fn capacity_status(&self) -> Option<nanosiem_lake_cell::contract::PartGcCapacity> {
+        self.shared.capacity_status.lock().ok().and_then(|status| status.clone())
+    }
+
+    fn capacity_pressure(&self) -> Option<nanosiem_lake_cell::contract::PartGcBlocked> {
+        self.shared.capacity_pressure.lock().ok().and_then(|warning| warning.clone())
     }
 
     fn deleted_total(&self) -> Option<u64> {
@@ -2623,6 +2779,33 @@ mod tests {
             value[key] = field.clone();
         }
         value
+    }
+
+    #[test]
+    fn view_budget_tracks_the_tightest_role_boundary_and_scales_without_a_part_cap() {
+        let gib = 1024 * 1024 * 1024;
+        let small = ViewBudget::for_limits(Some(gib), Some(8 * gib));
+        let large = ViewBudget::for_limits(Some(8 * gib), Some(4 * gib));
+        assert_eq!(small.parts, 131_072);
+        assert_eq!(large.parts, 4 * small.parts);
+        assert_eq!(large.bytes, 4 * small.bytes);
+        assert!(large.parts > MAX_VIEW_PARTS);
+        assert_eq!(ViewBudget::for_limits(None, None).parts,
+            (crate::cgroup_memory::process_capacity().memory_bytes / 4 / 2048) as usize);
+        assert_eq!(ViewBudget::for_limits(Some(1), None).parts, 0);
+    }
+
+    #[test]
+    fn part_gc_cache_and_view_scale_across_small_cell_and_large_roles() {
+        let gib = 1024_u64 * 1024 * 1024;
+        for limit in [2 * gib, 34 * gib / 10, 32 * gib, 64 * gib] {
+            let budget = ViewBudget::for_limits(Some(limit), Some(128 * gib));
+            assert_eq!(budget.parts as u64, limit / 4 / 2048);
+            assert_eq!(budget.bytes, limit / 16);
+            assert_eq!(budget.sqlite_cache_bytes, limit / 1024);
+        }
+        let downsized = ViewBudget::for_limits(Some(32 * gib), Some(2 * gib));
+        assert_eq!(downsized.sqlite_cache_bytes, 2 * gib / 1024);
     }
 
     #[test]
@@ -3087,7 +3270,7 @@ mod tests {
             // The pass ended at the (absent) Worker, after the fold.
             gc.wait_idle().await;
             assert_eq!(gc.state.lock().await.view.head_seq(), Some(ENTRIES - 1));
-            assert!(dir.path().join("lake-part-gc/view.json").exists());
+            assert!(dir.path().join("lake-part-gc/view.sqlite").exists());
             drop(gc);
 
             // Restart: one read re-verifies the persisted head, one finds no
@@ -3120,8 +3303,8 @@ mod tests {
                 if first.state.lock().await.view.head_seq() == Some(entries - 1) { break; }
             }
             assert_eq!(first.state.lock().await.view.head_seq(), Some(entries - 1));
-            assert!(hot.path().join("lake-part-gc/view.json").exists(), "the view is on the hot volume");
-            assert!(!first_pod.path().join("lake-part-gc/view.json").exists(), "not in the ephemeral state dir");
+            assert!(hot.path().join("lake-part-gc/view.sqlite").exists(), "the view is on the hot volume");
+            assert!(!first_pod.path().join("lake-part-gc/view.sqlite").exists(), "not in the ephemeral state dir");
             drop(first);
             drop(first_pod);
 
@@ -3416,7 +3599,7 @@ mod tests {
             drop(gc);
             let gc = pass(chain(10), dir.path(), Duration::ZERO);
             gc.run_pass_now(T0).await.unwrap();
-            let path = dir.path().join("lake-part-gc/view.json");
+            let path = dir.path().join("lake-part-gc/view.sqlite");
             let before = std::fs::metadata(&path).unwrap().modified().unwrap();
             gc.run_pass_now(T0 + 1).await.unwrap();
             assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), before);
@@ -3644,7 +3827,7 @@ mod tests {
             gc.run_pass_now(T0 + 3).await.unwrap();
             assert_eq!(
                 gc.state.lock().await.view.head_seq(),
-                Some(VIEW_PERSIST_EVERY * 3 - 1)
+                before.map(|seq| seq + VIEW_PERSIST_EVERY)
             );
         }
 
@@ -3672,8 +3855,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ViewStore::new(dir.path());
         std::fs::create_dir_all(store.path().parent().unwrap()).unwrap();
-        let file = std::fs::File::create(store.path()).unwrap();
-        file.set_len(MAX_VIEW_BYTES + 1).unwrap();
+        let history = crate::lake_part_gc::history::PagedHistory::open(store.path(), true, store.budget().sqlite_cache_bytes).unwrap();
+        history.save_snapshot(&vec![b' '; 1025], None).unwrap();
+        store.test_memory_limit.store(16 * 1024, Ordering::Relaxed);
         assert!(store.load("unused").unwrap_err().to_string().contains("byte budget"));
     }
 

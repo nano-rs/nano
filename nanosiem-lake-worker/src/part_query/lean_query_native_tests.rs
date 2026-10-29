@@ -24,6 +24,9 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+#[path = "native_scan_native_tests.rs"]
+mod native_scan;
+
 pub(crate) const TENANT: &str = "7a3c1e5b-2d4f-4b6a-8c9e-0f1a2b3c4d5e";
 pub(crate) const ROWS: usize = 900;
 const HASH: &str = "14e0857b37f6c5e5e90bab786a4db8fceb4166afe75e617519d942656976481e";
@@ -113,6 +116,10 @@ async fn ingest_rows(root: &std::path::Path, now: DateTime<Utc>, rows: usize, sp
 
 /// Each batch is one bronze file and one part.
 async fn ingest_batches(root: &std::path::Path, now: DateTime<Utc>, batches: Vec<Vec<Value>>) {
+    ingest_batches_with_merges(root, now, batches, true).await
+}
+
+async fn ingest_batches_with_merges(root: &std::path::Path, now: DateTime<Utc>, batches: Vec<Vec<Value>>, merge: bool) {
     let parts = LocalObjectStore::new(root.join("parts")).unwrap();
     let sources_dir = root.join("sources");
     std::fs::create_dir_all(sources_dir.join("bronze")).unwrap();
@@ -121,6 +128,7 @@ async fn ingest_batches(root: &std::path::Path, now: DateTime<Utc>, batches: Vec
     let signer = signer();
     let mut config = IngestConfig::new(TENANT, root.join("work"));
     config.flush_interval_override_ms = Some(1_000);
+    if !merge { config.max_merges_per_tick = 0; }
     let now_ms = now.timestamp_millis();
     let mut ingestor = Ingestor::open(config, &parts, &sources, &spool as &dyn NoticeQueue, &signer, signer.trusted(),
         BronzeIngestEnricher::disabled(), &seed_schema(), now_ms).await.expect("ingest opens");

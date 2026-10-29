@@ -102,4 +102,13 @@ describe('SourceWritersCard (NAN-2597)', () => {
     await screen.findByText('No active credential can write this source.');
     expect(screen.queryByRole('link')).toBeNull();
   });
+
+  it('hides audit issuance while retaining revocation of an existing user credential', async () => {
+    mocks.bySlug.mockResolvedValue({ source_slugs: ['audit'], writers: [{ ...writers.writers[0],
+      source_slugs: ['audit'], writes: ['audit'] }] });
+    renderCard({ sourceSlug: 'audit', canRevoke: true, canIssue: true });
+    const table = await screen.findByTestId('source-writers-table');
+    expect(screen.queryByTestId('source-writers-issue')).toBeNull();
+    expect(within(table).getByRole('link', { name: /revoke/i }).getAttribute('href')).toBe(revokeLink('c-direct'));
+  });
 });

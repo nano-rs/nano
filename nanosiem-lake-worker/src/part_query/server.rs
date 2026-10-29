@@ -872,13 +872,22 @@ pub async fn open_engine_timed(options: &OpenOptions, phases: &mut StartupPhases
     // NAN-3647: a persistent (A/B) hot-window volume never blocks query[T]:
     // an unusable cache on it is discarded and rebuilt cold.
     let open_cache = if hot_settings.as_ref().is_some_and(|s| s.persistent) { ReaderObjectCache::open_or_reset } else { ReaderObjectCache::open };
+    let cache_root = hot_settings.as_ref().map_or_else(|| options.state_dir.join("cache"), |s| s.root.clone());
+    let requested_cache = boot.engine.cache_bytes.unwrap_or(8 * 1024 * 1024 * 1024);
+    let cache_bytes = hot_settings.as_ref().map(|s| s.max_bytes).unwrap_or_else(|| {
+        nanosiem_lake_cell::disk_ceiling::containing_volume_bytes(&cache_root)
+            .map_or(requested_cache, |volume| nanosiem_lake_cell::budget::cache_disk_budget(requested_cache, volume))
+    }).max(1);
+    let capacity = crate::cgroup_memory::process_capacity();
+    let role_memory = if options.memory_cap_bytes > 0 { capacity.memory_bytes.min(options.memory_cap_bytes) } else { capacity.memory_bytes };
+    let role_cpu = if options.cpu_millis > 0 { capacity.cpu_millicores.min(options.cpu_millis) } else { capacity.cpu_millicores };
+    let (query_bytes, fetches) = crate::reader_object_cache::resource_limits(role_memory, role_cpu, cache_bytes);
     let cache = open_cache(
         ReaderObjectCacheSettings {
-            root: hot_settings.as_ref().map_or_else(|| options.state_dir.join("cache"), |s| s.root.clone()),
-            max_bytes: hot_settings.as_ref().map(|s| s.max_bytes).unwrap_or_else(|| boot.engine.cache_bytes.unwrap_or(8 * 1024 * 1024 * 1024)).max(1),
-            query_max_bytes: boot.engine.cache_query_bytes.unwrap_or(2 * 1024 * 1024 * 1024),
-            // NAN-3647: room for the warm gate's warm-up fan-out (gate off: 8, as before).
-            fetch_concurrency: hot_settings.as_ref().filter(|s| s.schedule.warm_gate).map_or(8, |s| s.schedule.pass_concurrency(false).max(8)),
+            root: cache_root,
+            max_bytes: cache_bytes,
+            query_max_bytes: boot.engine.cache_query_bytes.unwrap_or(query_bytes).min(query_bytes),
+            fetch_concurrency: fetches,
             fetch_deadline: Duration::from_secs(60),
         },
         &tenant_id,
@@ -917,20 +926,21 @@ pub async fn open_engine_timed(options: &OpenOptions, phases: &mut StartupPhases
     // `memory_budget`): chDB's total and per-statement caps, the number of
     // requests admitted to native work (one per read lane) and the largest
     // result decoded in Rust.
-    let budget = super::memory_budget::QueryMemoryBudget::for_process(options.memory_cap_bytes);
-    let (budget, classes) = if options.size_classes { budget.with_classes() } else { (budget, None) };
+    let budget = super::memory_budget::QueryMemoryBudget::for_process_role(options.memory_cap_bytes, options.cpu_millis);
+    let (budget, classes) = if options.size_classes { budget.with_classes() } else { (budget.auxiliary_role(), None) };
     // NAN-3393 kill switch: `NANO_LAKE_LANE_ROUTING_V2=0` is NAN-3077's lanes.
     let routing_v2 = super::lanes::lane_routing_v2_enabled();
     if let Some(classes) = &classes {
         tracing::info!(small_lanes = classes.small_lanes, small_bytes = classes.small_bytes, large_bytes = classes.large_bytes,
-            large_lanes = super::lanes::large_lane_connections(classes.large_bytes, routing_v2), routing_v2, "query lanes by size");
+            large_lanes = super::lanes::large_lane_connections_for_role(classes.large_bytes, routing_v2, budget.threads), routing_v2, "query lanes by size");
     }
-    let (threads, statement_memory_bytes) = role_statement_limits(options.cpu_millis, &budget);
-    // NAN-4174: query[T]'s statements share one thread pool sized to the
-    // role quota (interactive first; see `thread_budget`). The point lane is
+    let (threads, statement_memory_bytes) = role_statement_limits(&budget, classes);
+    // NAN-4174: query[T]'s Rust thread grants are sized to the role quota
+    // (interactive first; see `thread_budget`). The point lane is
     // outside it (one row group per statement). Roles without size classes
     // (detect, product) keep their planned threads.
-    let thread_budget = classes.is_some().then(|| crate::thread_budget::ThreadBudget::new(threads));
+    let thread_budget = options.size_classes.then(|| crate::thread_budget::ThreadBudget::new(threads));
+    let role_threads = options.size_classes.then_some(threads);
     let budgeted = |executor: NativeExecutor| match &thread_budget {
         Some(pool) => executor.with_thread_budget(pool.clone()),
         None => executor,
@@ -938,16 +948,18 @@ pub async fn open_engine_timed(options: &OpenOptions, phases: &mut StartupPhases
     if let Some(pool) = &thread_budget {
         tracing::info!(threads = pool.total(), "query thread budget");
     }
+    let (job_slots, small_job_slots) = budget.job_slots(classes);
+    tracing::info!(job_slots, small_job_slots, runtime_threads = budget.runtime_threads(), "query role capacity");
     let read_lanes = classes.map_or(budget.concurrency, |classes| classes.small_lanes);
-    let executor = budgeted(NativeExecutor::start_with_server_memory_limit(runtime.clone(), read_lanes, "parts", ExecutorMode::ReadOnly, Some(budget.server_bytes))?
+    let executor = budgeted(NativeExecutor::start_with_role_limits(runtime.clone(), read_lanes, "parts", ExecutorMode::ReadOnly, Some(budget.server_bytes), role_threads)?
         .with_result_limit(budget.result_bytes));
     let large = match &classes {
         Some(classes) => Some((
-            // NAN-3393: two statements at half the large memory each when
-            // half is still a large lane (the 4 GiB role: 2 x 768 MiB); a
-            // statement that outgrows half takes both (see `lanes::LargeLane`).
-            budgeted(NativeExecutor::start_with_server_memory_limit(runtime.clone(), super::lanes::large_lane_connections(classes.large_bytes, routing_v2),
-                "parts-large", ExecutorMode::ReadOnly, Some(budget.server_bytes))?
+            // Capacity-sized connections split the large envelope. A
+            // statement that outgrows its share acquires the whole envelope
+            // (the hosted 4 GiB role retains two connections).
+            budgeted(NativeExecutor::start_with_role_limits(runtime.clone(), super::lanes::large_lane_connections_for_role(classes.large_bytes, routing_v2, budget.threads),
+                "parts-large", ExecutorMode::ReadOnly, Some(budget.server_bytes), role_threads)?
                 .with_result_limit(budget.result_bytes)),
             classes.large_bytes,
         )),
@@ -961,16 +973,18 @@ pub async fn open_engine_timed(options: &OpenOptions, phases: &mut StartupPhases
     // uid (a short, bounded lookup), so an analyst waits at most one short
     // lookup, whereas reserving the only lane would refuse agents event
     // detail altogether. It never escalates (no large lane behind it).
-    let point = NativeExecutor::start_with_server_memory_limit(runtime.clone(), 1, "parts-point", ExecutorMode::ReadOnly, Some(budget.server_bytes))?
+    let point = NativeExecutor::start_with_role_limits(runtime.clone(), 1, "parts-point", ExecutorMode::ReadOnly, Some(budget.server_bytes), role_threads)?
         .with_result_limit(budget.result_bytes);
     // NAN-4290: query[T]'s small-job lane (its own read-write connection; a
     // job on it runs at one interactive lane's memory and holds an
     // interactive slot). Roles without size classes run no jobs.
     let small_job_writer = match &classes {
-        Some(_) => Some(budgeted(NativeExecutor::start_with_server_memory_limit(runtime.clone(), 1, "parts-rw-small", ExecutorMode::ReadWrite, Some(budget.server_bytes))?)),
+        Some(_) => Some(budgeted(NativeExecutor::start_with_role_limits(runtime.clone(), small_job_slots, "parts-rw-small", ExecutorMode::ReadWrite, Some(budget.server_bytes), role_threads)?
+            .with_result_limit(budget.result_bytes))),
         None => None,
     };
-    let writer = budgeted(NativeExecutor::start_with_server_memory_limit(runtime, 1, "parts-rw", ExecutorMode::ReadWrite, Some(budget.server_bytes))?);
+    let writer = budgeted(NativeExecutor::start_with_role_limits(runtime, job_slots, "parts-rw", ExecutorMode::ReadWrite, Some(budget.server_bytes), role_threads)?
+        .with_result_limit(budget.result_bytes));
     phases.lap("executors_start");
     let settings = EngineSettings {
         tenant_id: tenant_id.clone(),
@@ -1004,11 +1018,53 @@ pub async fn open_engine_timed(options: &OpenOptions, phases: &mut StartupPhases
 /// query[T]'s per-statement `(threads, memory cap)` from the role: its CPU
 /// quota in whole cores and its (size-classed) memory budget. The planner
 /// derives the payload reader's defaults from these (NAN-4694).
-pub(crate) fn role_statement_limits(cpu_millis: u32, budget: &super::memory_budget::QueryMemoryBudget) -> (u64, u64) {
+pub(crate) fn role_statement_limits(budget: &super::memory_budget::QueryMemoryBudget, classes: Option<super::memory_budget::LaneClasses>) -> (u64, u64) {
     (
-        u64::from(nanosiem_lake_cell::budget::query_threads(cpu_millis)),
-        budget.per_query_bytes.min(crate::planner::DEFAULT_QUERY_MEMORY_BYTES),
+        budget.threads as u64,
+        classes.map_or(budget.per_query_bytes, |classes| classes.small_bytes).min(crate::planner::MAX_QUERY_MEMORY_BYTES),
     )
+}
+
+#[cfg(test)]
+mod role_sizing_tests {
+    use super::*;
+    use crate::part_query::memory_budget::{QueryMemoryBudget, GIB, MIB};
+
+    #[test]
+    fn nan4825_equal_lanes_use_the_role_memory_above_four_gib() {
+        let budget = QueryMemoryBudget::derive_for_role(64 * GIB, None, 4_000);
+        let (_, statement) = role_statement_limits(&budget, None);
+        assert_eq!(statement, budget.per_query_bytes);
+        assert!(statement > 4 * GIB);
+    }
+
+    #[test]
+    fn nan4825_query_role_shapes() {
+        for (memory, cpu) in [(2 * GIB, 4_000), (3_413_114_880, 4_000), (4 * GIB, 4_000), (32 * GIB, 16_000), (64 * GIB, 32_000)] {
+            let root = tempfile::tempdir().unwrap();
+            let leaf = root.path().join("tenant/query");
+            std::fs::create_dir_all(&leaf).unwrap();
+            std::fs::write(leaf.join("memory.max"), memory.to_string()).unwrap();
+            std::fs::write(leaf.join("cpu.max"), nanosiem_lake_cell::resources::cpu_max_line(cpu)).unwrap();
+            let cgroup = crate::cgroup_memory::resolve(root.path(), "0::/", "", Some(std::path::Path::new("tenant/query")));
+            let (budget, classes) = QueryMemoryBudget::for_cgroup(memory, cpu, &cgroup).with_classes();
+            let (threads, statement) = role_statement_limits(&budget, classes);
+            eprintln!("NAN4825 role_mib={} cpu={} threads={} server={} slots={} statement={} result={} classes={classes:?}",
+                memory / MIB, cpu, threads, budget.server_bytes, budget.concurrency, statement, budget.result_bytes);
+            assert_eq!(threads, (cpu / 1000) as u64);
+            assert_eq!(budget.concurrency, (cpu as usize / 2000).max(2));
+            if let Some(classes) = classes {
+                assert_eq!(classes.small_lanes + 1, budget.concurrency);
+                assert_eq!(classes.small_lanes as u64 * classes.small_bytes + classes.large_bytes, budget.server_bytes);
+            }
+            assert!(budget.limit_bytes - budget.server_bytes >= 384 * MIB);
+            let placed = nanosiem_lake_cell::trusted_local::size_for(memory, cpu / 1000, None);
+            eprintln!("NAN4825 cell_mib={} placed_query_cpu={} placed_query_memory={}", memory / MIB, placed.query.1, placed.query.3);
+            let (placed_budget, placed_classes) = QueryMemoryBudget::derive_for_role(placed.query.3, Some(placed.query.3), placed.query.1).with_classes();
+            let (placed_threads, _) = role_statement_limits(&placed_budget, placed_classes);
+            if memory >= 32 * GIB { assert!(placed_threads > 8); }
+        }
+    }
 }
 
 /// Query readiness vs. prewarm requests (NAN-2984). Only a gated request
@@ -3593,6 +3649,7 @@ impl nanosiem_lake_cell::child::TenantService for QueryService {
             retrying: false,
             detail: None,
             part_gc_blocked: None,
+            part_gc_capacity: None,
             part_gc_deleted_total: 0,
             rows_committed_total: 0,
             credential_refresh_at_risk: self.credentials.get().is_some_and(|credentials| credentials.refresher.at_risk()),

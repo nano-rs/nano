@@ -38,6 +38,7 @@ pub mod memo;
 pub mod membership;
 pub mod metadata_cache;
 pub mod memory_budget;
+mod native_reader;
 pub mod partials;
 pub mod prewarm_pacing;
 pub(crate) mod prevalence_rows;

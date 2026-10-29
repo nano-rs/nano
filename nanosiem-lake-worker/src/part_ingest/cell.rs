@@ -2253,6 +2253,7 @@ impl IngestService {
                     detail
                 }),
                 part_gc_blocked: health.part_gc_blocked.clone(),
+                part_gc_capacity: health.part_gc_capacity.clone(),
                 part_gc_deleted_total: health.part_gc_deleted_total,
                 rows_committed_total: health.rows_committed_total,
                 credential_refresh_at_risk: false,
@@ -2299,6 +2300,7 @@ pub fn prevalence_cache_bytes_for(assignment: &Assignment) -> u64 {
 fn update_gc_heartbeat(heartbeat: &mut Heartbeat, health: &super::ingest::IngestHealth) {
     heartbeat.agent_catalog_custody=health.agent_catalog.clone();
     heartbeat.part_gc_blocked = health.part_gc_blocked.clone();
+    heartbeat.part_gc_capacity = health.part_gc_capacity.clone();
     heartbeat.part_gc_deleted_total = health.part_gc_deleted_total;
 }
 
@@ -2893,10 +2895,13 @@ mod tests {
     }
 
     #[test]
-    fn retry_heartbeat_carries_polled_gc_health() {
+    fn part_gc_retry_heartbeat_carries_polled_gc_health() {
         let mut heartbeat = Heartbeat { retrying: true, ..Heartbeat::default() };
         let mut health = super::super::ingest::IngestHealth::default();
         health.part_gc_deleted_total = 7;
+        health.part_gc_capacity = Some(nanosiem_lake_cell::contract::PartGcCapacity {
+            history_refs: 600_301, complete: true, pressure: true, ..Default::default()
+        });
         health.part_gc_blocked = Some(nanosiem_lake_cell::contract::PartGcBlocked {
             reason: "sanctioned_pass_paused".into(), parts: 2, bytes: 10,
             detail: String::new(), blocked_seconds: 12,
@@ -2904,11 +2909,15 @@ mod tests {
         update_gc_heartbeat(&mut heartbeat, &health);
         assert!(heartbeat.retrying);
         assert_eq!(heartbeat.part_gc_deleted_total, 7);
+        assert_eq!(heartbeat.part_gc_capacity.as_ref().unwrap().history_refs, 600_301);
+        assert!(heartbeat.part_gc_capacity.as_ref().unwrap().pressure);
         assert_eq!(heartbeat.part_gc_blocked.as_ref().unwrap().reason, "sanctioned_pass_paused");
         health.part_gc_blocked = None;
+        health.part_gc_capacity = None;
         health.part_gc_deleted_total = 8;
         update_gc_heartbeat(&mut heartbeat, &health);
         assert!(heartbeat.part_gc_blocked.is_none());
+        assert!(heartbeat.part_gc_capacity.is_none());
         assert_eq!(heartbeat.part_gc_deleted_total, 8);
     }
 

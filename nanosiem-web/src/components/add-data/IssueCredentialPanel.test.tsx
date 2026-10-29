@@ -26,6 +26,7 @@ const state = vi.hoisted(() => ({
   revealed: new Set<string>(),
   tokens: [] as string[],
   refuseWith: null as string | null,
+  status: null as Record<string, unknown> | null,
   /** The issuance guard's verdict the precheck returns; 'fail' = the endpoint errors (older API). */
   verdict: null as string | null | 'fail',
   prechecks: [] as Array<{ kind: string; source_slugs: string[] }>,
@@ -86,7 +87,7 @@ vi.mock('@/lib/api', () => {
         return { id, protocol: input.protocol, label: input.label, state: 'pending', requested_by: 'user_me', requested_at: '',
           updated_at: '', kind: 'source', source_slugs: input.source_slugs, restricted_sources_acknowledged: false, sealed_token_ready: false };
       }),
-      getIngestCredentialRequest: vi.fn(async (id: string) => reveal(id)),
+      getIngestCredentialRequest: vi.fn(async (id: string) => reveal(id, state.status ?? {})),
       // NAN-2599: the first-event checklist after the token is copied.
       getIngestCredentialActivity: vi.fn(async (credentialId: string) => ({
         credential_id: credentialId, window_hours: 1, redacted: false,
@@ -139,6 +140,7 @@ beforeEach(() => {
   state.revealed.clear();
   state.tokens = [];
   state.refuseWith = null;
+  state.status = null;
   state.verdict = null;
   state.prechecks = [];
   writeText.mockClear();
@@ -287,6 +289,7 @@ describe('IssueCredentialPanel (NAN-2593)', () => {
     const box = await screen.findByTestId('restricted-ack');
     expect(screen.queryByRole('alert')).toBeNull();
     state.refuseWith = null;
+  state.status = null;
     fireEvent.click(within(box).getByRole('checkbox'));
     await issue();
     await screen.findByLabelText('Ingest token');
@@ -306,5 +309,57 @@ describe('IssueCredentialPanel (NAN-2593)', () => {
     renderPanel({ slug: 'my_app', protocols: [], enrolled: false } as unknown as typeof source);
     expect(screen.getByText(/still rolling out to your parser cell/)).toBeTruthy();
     expect(screen.getAllByRole('radio').map((r) => r.textContent)).toEqual(['HEC', 'HTTPS JSON']);
+  });
+});
+
+
+describe('NAN-4812 credential waiting and refusal reasons', () => {
+  it('shows the missing parser slug while rollout is pending', async () => {
+    state.status = { state: 'pending', sealed_token_ready: false, waiting_reason: 'awaiting_enrollment',
+      waiting_source_slugs: ['palo_alto_traffic'] };
+    renderPanel();
+    await issue();
+    expect(await screen.findByText('Waiting for the palo_alto_traffic parser to finish rolling out')).toBeTruthy();
+    expect(api.revealIngestCredential).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+  });
+
+  it('shows the action to take after a template_unavailable rejection', async () => {
+    state.status = { state: 'rejected', sealed_token_ready: false, disposition: 'template_unavailable: not enrolled' };
+    renderPanel();
+    await issue();
+    expect(await screen.findByText('This source has no active parser. Activate its parser, then issue a credential again.')).toBeTruthy();
+    expect(api.revealIngestCredential).not.toHaveBeenCalled();
+  });
+
+  it('explains the real audit refusal instead of showing an indefinite spinner', async () => {
+    state.status = { state: 'rejected', sealed_token_ready: false, disposition: 'source_platform_only: audit' };
+    renderPanel();
+    await issue();
+    expect(await screen.findByText('The audit source is managed by nano and cannot receive user-issued credentials. Choose another source for your data.')).toBeTruthy();
+    expect(api.revealIngestCredential).not.toHaveBeenCalled();
+  });
+
+  it('explains an issuer requester_refused rejection as terminal', async () => {
+    state.status = { state: 'rejected', sealed_token_ready: false, disposition: 'requester_refused: the requester can no longer be issued this credential' };
+    renderPanel();
+    await issue();
+    expect(await screen.findByText('This credential request is not permitted. Choose an allowed source or ask a tenant admin to review your access, then request a new credential.')).toBeTruthy();
+    expect(api.revealIngestCredential).not.toHaveBeenCalled();
+  });
+
+  it('blocks issuance when precheck identifies a platform-only source', async () => {
+    state.verdict = 'source_platform_only';
+    renderPanel();
+    await screen.findByText('The audit source is managed by nano and cannot receive user-issued credentials. Choose another source for your data.');
+    expect((screen.getByRole('button', { name: 'Issue credential' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(state.requests).toHaveLength(0);
+  });
+
+  it('blocks a stale audit selection even when the precheck does not report a refusal', async () => {
+    renderPanel({ ...source, slug: 'audit' });
+    await screen.findByText('The audit source is managed by nano and cannot receive user-issued credentials. Choose another source for your data.');
+    expect((screen.getByRole('button', { name: 'Issue credential' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(state.requests).toHaveLength(0);
   });
 });

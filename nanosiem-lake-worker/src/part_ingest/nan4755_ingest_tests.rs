@@ -143,17 +143,22 @@ impl Lab {
     /// The backlog: [`OBJECTS`] objects of the stalled hour, each committed
     /// as its own L0 part.
     async fn land_backlog(&self) {
+        self.land_backlog_with(OBJECTS, OBJECTS * ROWS_PER_OBJECT).await;
+    }
+
+    async fn land_backlog_with(&self, objects: usize, rows: usize) {
         let mut ingestor = self.open(INGEST_CLOCK).await;
-        for object in 0..OBJECTS {
+        for object in 0..objects {
             let at = INGEST_CLOCK + object as i64 * 1_000;
-            let first = object * ROWS_PER_OBJECT;
-            self.land(&format!("backlog-{object:03}"), &(first..first + ROWS_PER_OBJECT).map(event).collect::<Vec<_>>(), at - 500);
+            let first = object * rows / objects;
+            let end = (object + 1) * rows / objects;
+            self.land(&format!("backlog-{object:03}"), &(first..end).map(event).collect::<Vec<_>>(), at - 500);
             let report = ingestor.tick(at).await.unwrap();
-            assert_eq!(report.admitted_rows, ROWS_PER_OBJECT as u64, "object {object}: {report:?} {:?}", ingestor.quarantine_entries());
+            assert_eq!(report.admitted_rows, (end - first) as u64, "object {object}: {report:?} {:?}", ingestor.quarantine_entries());
             ingestor.flush_now(at + 1).await.unwrap();
         }
         let l0 = ingestor.live_parts().iter().filter(|part| part.level == Level::L0 && i64::from(part.event_hour) == HOUR).count();
-        assert_eq!(l0, OBJECTS, "the backlog hour is one part per object");
+        assert_eq!(l0, objects, "the backlog hour is one part per object");
     }
 }
 
@@ -204,9 +209,12 @@ fn merge_phase(lab: &Lab, shift: u8, limit: u64) -> Run {
         BASE.store(crate::test_heap::reset_peak(), Ordering::SeqCst);
         LIMIT.store(limit, Ordering::SeqCst);
         let (mut now, mut ticks, mut fresh) = (MERGE_CLOCK, 0, 0);
-        while hour_parts(&ingestor).len() > 1 {
+        loop {
+            let planned = plan_merges_with(&ingestor.live_parts(), now, &ingestor.cfg.merge_policy, true);
+            let pending = ingestor.converge_memory_bound_merges(planned).iter().any(|m| i64::from(m.event_hour) == HOUR);
+            if !pending && !ingestor.merge_in_flight.iter().any(|f| i64::from(f.merge.event_hour) == HOUR) { break; }
             ticks += 1;
-            assert!(ticks <= 12, "the backlog hour never merged: {:?}", ingestor.merge_attempts.entry(&id));
+            assert!(ticks <= OBJECTS * 2, "the backlog hour never merged: {:?}", ingestor.merge_attempts.entry(&id));
             // Live data keeps arriving beside the merge (the next hour).
             let first = 1_000_000 + ticks * 50;
             lab.land(&format!("fresh-{ticks:03}"), &(first..first + 50).map(|i| {
@@ -229,9 +237,10 @@ fn merge_phase(lab: &Lab, shift: u8, limit: u64) -> Run {
         super::super::merge_quota::MEMORY_PROBE_FOR_TEST.set(None);
         let peak = crate::test_heap::peak() - BASE.load(Ordering::SeqCst);
         let parts = hour_parts(&ingestor);
-        assert_eq!((parts.len(), parts[0].level), (1, Level::Hour), "the hour sealed into one `h` part");
-        assert_eq!(parts[0].rows, (OBJECTS * ROWS_PER_OBJECT) as u64, "every backlog row");
-        assert_eq!(ingestor.merge_attempts.entry(&id), None, "the commit cleared the ledger");
+        assert!(parts.iter().any(|p| p.level == Level::Hour), "the hour sealed into final h chunks");
+        assert!(parts.iter().filter(|p| p.level != Level::Hour).count() <= 1, "only an odd leftover remains");
+        assert_eq!(parts.iter().map(|p| p.rows).sum::<u64>(), (OBJECTS * ROWS_PER_OBJECT) as u64, "every backlog row");
+        assert!(!ingestor.merge_attempts.entry(&id).is_some_and(|e| e.in_flight), "all chunks finished");
         assert_eq!(ingestor.health().rows_committed_total, fresh, "every fresh row committed");
         Run { peak, stops: ingestor.health().merge_memory_stops_total, ticks, fresh_rows_committed: fresh }
     });
@@ -240,11 +249,10 @@ fn merge_phase(lab: &Lab, shift: u8, limit: u64) -> Run {
 }
 
 /// The incident, end to end: the backlog hour's merge at full size needs
-/// more than the limit; at its smallest shape it fits. Under that limit
-/// the guard stops the full-size attempt before the limit is reached, the
-/// merge reruns smaller in the same process, the hour seals with every
-/// row, and fresh data commits throughout. Before NAN-4755 nothing stopped
-/// the merge short of the cgroup OOM, and every restart ran it again.
+/// more than the limit; at its smallest shape it fits. The first-fit plan
+/// now skips that oversized attempt, the hour seals with every row, and
+/// fresh data commits throughout. The guard and bounded retry ladder remain
+/// the fallback when input statistics underestimate the working set.
 #[test]
 fn a_backlog_hour_under_a_small_memory_limit_merges_without_an_oom() {
     // The two shapes' working sets, unbounded.
@@ -263,7 +271,7 @@ fn a_backlog_hour_under_a_small_memory_limit_merges_without_an_oom() {
     land(&lab);
     let run = merge_phase(&lab, 0, limit);
     eprintln!("NAN-4755: under a {} KiB limit: peak {} KiB, {} guard stops, {} ticks", limit >> 10, run.peak >> 10, run.stops, run.ticks);
-    assert!(run.stops >= 1, "the full-size attempt was stopped by the guard");
+    assert_eq!(run.stops, 0, "the first attempt is sized to fit before starting");
     assert!((run.peak as u64) < limit, "never reached the limit (no OOM): peak {} KiB, limit {} KiB", run.peak >> 10, limit >> 10);
     assert_eq!(run.fresh_rows_committed, run.ticks as u64 * 50, "ingest kept committing fresh data beside the merge");
 }
@@ -690,13 +698,23 @@ fn nan4806_small_role_merges_while_ingesting_without_quarantine() {
             tokio::time::timeout(std::time::Duration::from_secs(60), settle_merges(&ingestor)).await.unwrap();
             ingestor.tick(INGEST_CLOCK + 40_000 + tick).await.unwrap();
         }
+        assert!(hour_parts(&ingestor).iter().any(|p| p.level == Level::Minute), "a minute merge committed beside live ingest");
+        let live_files = hour_parts(&ingestor).iter().map(|p| p.data_files).sum::<u32>();
+        assert!(live_files <= 4 && live_files * 5 <= before_files, "live query fan-out: {before_files} -> {live_files}");
+        // Seal the same hour through the production h planner as well.
+        // Final split chunks must keep query fan-out near the 1.0.12 baseline.
+        for tick in 0..OBJECTS {
+            ingestor.tick(MERGE_CLOCK + tick as i64 * 61_000).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(60), settle_merges(&ingestor)).await.unwrap();
+        }
+        ingestor.tick(MERGE_CLOCK + OBJECTS as i64 * 61_000).await.unwrap();
         super::super::merge_quota::MEMORY_PROBE_FOR_TEST.set(None);
         super::super::merge::set_memory_budget(0);
         let parts = hour_parts(&ingestor);
         let files = parts.iter().map(|p| p.data_files).sum::<u32>();
         eprintln!("NAN-4806: selected-hour files {before_files} -> {files}, fresh rows {fresh}, guard stops {}, quarantines {}",
             ingestor.health().merge_memory_stops_total, ingestor.merge_quarantine.len());
-        assert!(parts.iter().any(|p| p.level == Level::Minute), "a minute merge committed beside live ingest");
+        assert!(parts.iter().any(|p| p.level == Level::Hour), "the sealed hour also compacts");
         assert!(files <= 4 && files * 5 <= before_files, "file fan-out stayed high: {before_files} -> {files}");
         assert_eq!(parts.iter().map(|p| p.rows).sum::<u64>(), (OBJECTS * ROWS_PER_OBJECT) as u64 + fresh);
         assert_eq!(ingestor.health().rows_committed_total, fresh);
@@ -707,4 +725,208 @@ fn nan4806_small_role_merges_while_ingesting_without_quarantine() {
         assert_eq!(hour_uids(&lab).await, expected, "every backlog and fresh uid is readable exactly once");
     }));
     assert!(peak < CAP as isize - 1_200_000_000, "real measured heap must fit the role beside its resident base");
+}
+
+/// Hold only the final hour publication after real guarded compute. The
+/// hour still occupies its production lane while minute merges and ingest
+/// run, so cadence assertions cannot pass merely because the hour finished.
+struct HeldHourPublication {
+    inner: &'static LocalObjectStore,
+    waiting: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl crate::parts::part_log::ObjectStore for HeldHourPublication {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> { self.inner.get(key).await }
+    async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        if key.contains("/parts/h/") && key.contains("/data-") {
+            self.waiting.store(true, Ordering::SeqCst);
+            self.release.acquire().await.unwrap().forget();
+        }
+        self.inner.put_if_absent(key, bytes).await
+    }
+    async fn put(&self, key: &str, bytes: &[u8]) -> Result<()> { self.inner.put(key, bytes).await }
+    async fn delete(&self, key: &str) -> Result<()> { self.inner.delete(key).await }
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> { self.inner.list(prefix).await }
+}
+
+fn first_fit_probe() -> Option<(u64, u64)> {
+    Some((1_200_000_000 + (crate::test_heap::live() - BASE.load(Ordering::SeqCst)).max(0) as u64,
+        LIMIT.load(Ordering::SeqCst)))
+}
+
+#[tokio::test]
+async fn a_000_nan4826_large_role_history_preserves_minute_and_ingest_progress() {
+    use crate::parts::levels::PlannedMerge;
+    const CAP: u64 = 64 * 1024 * 1024 * 1024;
+    let lab = Lab::new();
+    let _capacity = super::super::merge_lanes::test_capacity(
+        super::super::merge_lanes::MergeCapacity::for_role(Some(CAP), 32000));
+    super::super::merge::set_memory_budget(CAP);
+    let mut cfg = lab.config();
+    size_for_memory_cap(&mut cfg, CAP);
+    let mut ingestor = Ingestor::open(cfg, lab.parts, &lab.sources, &lab.spool as &dyn NoticeQueue, lab.signer,
+        lab.signer.trusted(), BronzeIngestEnricher::disabled(), &seed_schema(), MERGE_CLOCK).await.unwrap();
+    ingestor.set_background_store(lab.parts);
+    ingestor.set_background_signer(lab.signer);
+    // Hold real scheduler flights without doing expensive merge compute.
+    // The reservation is identical for history merges and count rewrites.
+    for event_hour in 0..10 {
+        ingestor.merge_in_flight.push(InFlightMerge {
+            merge: PlannedMerge { output_level: Level::Hour, event_hour, inputs: vec![] },
+            key: ("h".into(), event_hour), started_ms: MERGE_CLOCK, last_warn_ms: MERGE_CLOCK,
+            restamp: None, handle: tokio::spawn(std::future::pending()),
+        });
+    }
+    let history = PlannedMerge { output_level: Level::Hour, event_hour: 20, inputs: vec![] };
+    ingestor.run_background_merge(vec![history], MERGE_CLOCK, 0).await;
+    assert_eq!(ingestor.merge_in_flight.len(), 10, "history cannot spend the minute working budget");
+    let minutes = [21, 22].into_iter().map(|event_hour|
+        PlannedMerge { output_level: Level::Minute, event_hour, inputs: vec![] }).collect();
+    ingestor.run_background_merge(minutes, MERGE_CLOCK, 0).await;
+    assert_eq!(ingestor.merge_in_flight.len(), 12, "both minute lanes still start");
+    // Empty candidate plans isolate scheduler admission; cancel before any
+    // compute runs. Keep all ten history reservations during real admission.
+    let minutes = ingestor.merge_in_flight.split_off(10);
+    for flight in &minutes { flight.handle.abort(); }
+    for flight in minutes {
+        let _ = flight.handle.await;
+    }
+    lab.land("large-role-fresh", &(0..50).map(event).collect::<Vec<_>>(), MERGE_CLOCK - 1);
+    assert_eq!(ingestor.tick(MERGE_CLOCK + 1).await.unwrap().admitted_rows, 50);
+    ingestor.flush_now(MERGE_CLOCK + 2).await.unwrap();
+    assert_eq!(ingestor.health().rows_committed_total, 50);
+    assert_eq!(ingestor.health().merge_memory_stops_total, 0);
+    assert_eq!(ingestor.health().objects_quarantined_total, 0);
+    for flight in ingestor.merge_in_flight.drain(..) {
+        flight.handle.abort();
+        let _ = flight.handle.await;
+    }
+    // An unknown-memory lab keeps the original two history jobs even when
+    // its default working budget cannot also fit a third decode window.
+    // Losing one of those jobs lets fresh hours continually outrank a backlog.
+    ingestor.cfg.buffer_budget_bytes = DEFAULT_BUFFER_BUDGET_BYTES;
+    let histories = [30, 31, 32].into_iter().map(|event_hour|
+        PlannedMerge { output_level: Level::Hour, event_hour, inputs: vec![] }).collect();
+    ingestor.run_background_merge(histories, MERGE_CLOCK, 0).await;
+    assert_eq!(ingestor.merge_in_flight.len(), 2, "retain the original constrained-budget history service rate");
+    for flight in &ingestor.merge_in_flight { flight.handle.abort(); }
+    for flight in ingestor.merge_in_flight.drain(..) {
+        let _ = flight.handle.await;
+    }
+    super::super::merge::set_memory_budget(0);
+}
+
+#[test]
+fn nan4818_first_hour_attempt_fits_real_role_limits_and_minute_lane_keeps_draining() {
+    const ROWS: usize = 115_000;
+    const INPUTS: usize = 164;
+    for cap in [2_090_000_000, 3_413_114_880] {
+        let lab = Lab::new();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(lab.land_backlog_with(INPUTS, ROWS));
+        super::nan4749_ingest_tests::measured(|runtime| runtime.block_on(async {
+            let _capacity = super::super::merge_lanes::test_capacity(
+                super::super::merge_lanes::MergeCapacity::for_role(Some(cap), 4000));
+            let mut cfg = lab.config();
+            // FP's assignment is a sizing figure below resident memory;
+            // the guard and first-fit planner must use the real role cap.
+            let assignment = cap * 2 / 5;
+            size_for_memory_cap(&mut cfg, assignment);
+            super::super::merge::set_memory_budget(assignment);
+            cfg.merge_policy.minute_min_l0_parts = 2;
+            let held = Box::leak(Box::new(HeldHourPublication { inner: lab.parts,
+                waiting: std::sync::atomic::AtomicBool::new(false), release: tokio::sync::Semaphore::new(0) }));
+            let mut ingestor = Ingestor::open(cfg, lab.parts, &lab.sources, &lab.spool as &dyn NoticeQueue, lab.signer,
+                lab.signer.trusted(), BronzeIngestEnricher::disabled(), &seed_schema(), MERGE_CLOCK).await.unwrap();
+            ingestor.set_background_store(held);
+            ingestor.set_background_signer(lab.signer);
+            let id = merge_id(Level::Hour.code(), HOUR as i32);
+            assert!(ingestor.merge_attempts.entry(&id).is_none());
+            LIMIT.store(cap, Ordering::SeqCst);
+            BASE.store(crate::test_heap::reset_peak(), Ordering::SeqCst);
+            super::super::merge_quota::MEMORY_PROBE_FOR_TEST.set(Some(first_fit_probe));
+            // A fragmented hour must retain its catch-up lane after the
+            // production planner replaces it with small upfront chunks.
+            let planned = plan_merges_with(&ingestor.live_parts(), MERGE_CLOCK, &ingestor.cfg.merge_policy, false);
+            let planned = ingestor.converge_memory_bound_merges(planned);
+            assert!(planned.iter().all(|chunk| chunk.inputs.len() < crate::parts::levels::FRAGMENTED_HOUR_PARTS));
+            let lag = ingestor.cfg.merge_policy.hour_seal_ms + 1;
+            ingestor.run_background_merge(planned, MERGE_CLOCK, lag).await;
+            assert!(ingestor.merge_in_flight.iter().any(|flight| i64::from(flight.merge.event_hour) == HOUR),
+                "an upfront chunk of a fragmented hour must run while ingest catches up");
+            assert!(!ingestor.fragmented_merge_may_run_beside_admission(&ingestor.merge_in_flight[0].merge),
+                "only one fragmented-hour chunk may run beside admission");
+            let first = ingestor.merge_attempts.entry(&id).unwrap();
+            let initial_cap = first.max_inputs.expect("the large fan-in is split before its first attempt");
+            assert!((2..INPUTS as u32).contains(&initial_cap));
+            assert_eq!((first.begun_inputs, first.failures), (initial_cap, 0));
+            assert_eq!(first.shift, super::super::merge_attempts::MAX_SHIFT);
+            let initial_shift = first.shift;
+            // Two independent minute merges must commit on their normal
+            // ticks beside hour compute. Hold the final hour publication
+            // so it occupies its lane throughout both cadence checks.
+            for round in 0..2 {
+                for object in 0..2 {
+                    let now = MERGE_CLOCK + (round * 2 + object + 1) * 61_000;
+                    let first = 1_000_000 + (round * 2 + object) as usize * 50;
+                    let events = (first..first + 50).map(|i| {
+                        let mut row = event(i);
+                        row["time"] = json!(chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now - 1_000).unwrap().to_rfc3339());
+                        row
+                    }).collect::<Vec<_>>();
+                    lab.land(&format!("cadence-{round}-{object}"), &events, now - 500);
+                    assert_eq!(ingestor.tick(now).await.unwrap().admitted_rows, 50);
+                    ingestor.flush_now(now + 1).await.unwrap();
+                    ingestor.tick(now + 2).await.unwrap();
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                    while ingestor.merge_in_flight.iter().any(|flight| flight.merge.output_level == Level::Minute && !flight.handle.is_finished()) {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                }).await.unwrap();
+                ingestor.tick(MERGE_CLOCK + (round + 1) * 122_000 + 3).await.unwrap();
+                let minute_rows = ingestor.live_parts().iter().filter(|p| p.level == Level::Minute).map(|p| p.rows).sum::<u64>();
+                assert_eq!(minute_rows, (round + 1) as u64 * 100, "minute/m lane missed its cadence");
+                assert!(ingestor.merge_in_flight.iter().any(|flight| flight.merge.output_level == Level::Hour));
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(240), async {
+                while !held.waiting.load(Ordering::SeqCst) {
+                    assert!(!ingestor.merge_in_flight[0].handle.is_finished(), "the first guarded merge failed before publication");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            held.release.add_permits(1_000);
+            // Drain every upfront chunk, without merging successful h
+            // outputs back together. Each tick uses the real scheduler.
+            for tick in 0..INPUTS {
+                settle_merges(&ingestor).await;
+                ingestor.tick(MERGE_CLOCK + 300_000 + tick as i64 * 61_000).await.unwrap();
+                let planned = plan_merges_with(&ingestor.live_parts(), MERGE_CLOCK + 300_000,
+                    &ingestor.cfg.merge_policy, true);
+                let pending = ingestor.converge_memory_bound_merges(planned).iter().any(|m| i64::from(m.event_hour) == HOUR);
+                if !pending && !ingestor.merge_in_flight.iter().any(|f| i64::from(f.merge.event_hour) == HOUR) { break; }
+            }
+            assert!(!ingestor.merge_in_flight.iter().any(|f| i64::from(f.merge.event_hour) == HOUR), "all chunks finished");
+            let peak = (crate::test_heap::peak() - BASE.load(Ordering::SeqCst)).max(0) as u64 + 1_200_000_000;
+            super::super::merge_quota::MEMORY_PROBE_FOR_TEST.set(None);
+            super::super::merge::set_memory_budget(0);
+            let parts = hour_parts(&ingestor);
+            assert!(parts.iter().any(|p| p.level == Level::Hour));
+            assert!(parts.iter().filter(|p| p.level != Level::Hour).count() <= 1);
+            assert_eq!(parts.iter().map(|p| p.rows).sum::<u64>(), ROWS as u64);
+            let completed = ingestor.merge_attempts.entry(&id).unwrap();
+            assert_eq!((completed.failures, completed.in_flight, completed.max_inputs), (0, false, Some(initial_cap)),
+                "successful chunks retain the upfront cap without charging failures");
+            assert_eq!((ingestor.merge_quarantine.len(), ingestor.health().objects_quarantined_total), (0, 0));
+            assert_eq!(ingestor.health().merge_memory_stops_total, 0);
+            assert_eq!(ingestor.health().rows_committed_total, 200);
+            assert!((peak as f64) < cap as f64 * super::super::merge_quota::MEMORY_GUARD_SHARE,
+                "peak {peak} crossed the guard for role {cap}");
+            assert_eq!(hour_uids(&lab).await, (0..ROWS).map(|i| format!("nan4755-{i:07}")).collect::<Vec<_>>(),
+                "every input uid remains readable exactly once after the first commit");
+            eprintln!("NAN-4818 role {cap}: h committed {ROWS} rows / {INPUTS} inputs in chunks <= {initial_cap} at shift {initial_shift}; peak {peak}; guard stops 0; minute rows 200");
+        }));
+    }
 }

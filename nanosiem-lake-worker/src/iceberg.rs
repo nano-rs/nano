@@ -945,7 +945,11 @@ fn normalize_event_with(
         event.insert("src_endpoint".to_string(), serde_json::json!({"ip": null}));
     }
     synthesize_audit_service_endpoint(row.event_kind, &mut event);
+    #[cfg(test)]
+    let validation_cpu = crate::nan4831_profile::ThreadCpu::start();
     let validation = nanosiem_core::parsers::validate_ocsf_event(&Value::Object(event.clone()));
+    #[cfg(test)]
+    crate::nan4831_profile::record_validation(validation_cpu.elapsed());
     if !validation.valid {
         let preview = validation
             .errors

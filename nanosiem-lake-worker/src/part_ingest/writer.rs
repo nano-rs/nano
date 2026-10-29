@@ -255,7 +255,10 @@ impl PartWriter {
             closed: Vec::new(),
             token_group: TokenGroupBuilder::for_writer(token_block_rows),
             token_block_rows,
-            parquet_range_write: uid_sidecar_write_enabled(std::env::var("NANO_LAKE_PARQUET_RANGE_WRITE").ok().as_deref()),
+            // New parts carry authenticated pages by default. Preserve the
+            // existing legacy-layout opt-out; no new configuration is required.
+            parquet_range_write: std::env::var("NANO_LAKE_PARQUET_RANGE_WRITE").ok()
+                .map_or(true, |value| uid_sidecar_write_enabled(Some(&value))),
             uid_sidecar_write: uid_sidecar_write_enabled(std::env::var("NANO_LAKE_UID_SIDECAR_WRITE").ok().as_deref()),
             entity_sidecar_fields: entity_sidecar_fields(std::env::var("NANO_LAKE_ENTITY_SIDECAR_FIELDS").ok().as_deref()),
             rows_in_group: 0,
@@ -877,12 +880,19 @@ impl PartWriter {
                 uid_blooms: file.uid_blooms.clone(),
                 entity_blooms: file.entity_blooms.clone(),
                 parquet_ranges: if self.parquet_range_write {
-                    let ranges = crate::parts::parquet_ranges::build(&self.dir.join(data_file_name(file.index)))?;
-                    let body = serde_json::to_vec(&ranges)?;
-                    ensure!(body.len() as u64 <= crate::parts::parquet_ranges::MAX_MANIFEST_BYTES, "range manifest exceeds size cap");
-                    let name = format!("ranges-{:05}.json", file.index);
-                    std::fs::write(self.dir.join(&name), &body)?;
-                    Some(FileDigest { name, bytes: body.len() as u64, sha256: sha256_hex(&body) })
+                    match crate::parts::parquet_ranges::build(&self.dir.join(data_file_name(file.index))) {
+                        Ok(ranges) => {
+                            let body = serde_json::to_vec(&ranges)?;
+                            let name = format!("ranges-{:05}.json", file.index);
+                            std::fs::write(self.dir.join(&name), &body)?;
+                            Some(FileDigest { name, bytes: body.len() as u64, sha256: sha256_hex(&body) })
+                        }
+                        Err(error) if error.is::<crate::parts::parquet_ranges::ManifestCapacity>() => {
+                            tracing::debug!(file = file.index, "part exceeds optional range manifest envelope; retaining whole-file reads");
+                            None
+                        }
+                        Err(error) => return Err(error),
+                    }
                 } else { None },
                 entity_locators: file.entity_locators.clone(),
                 class_id: file.class_id,
@@ -1727,6 +1737,8 @@ mod tests {
         let rows = batch(100, 0);
         for enabled in [false, true] {
             let mut writer = PartWriter::create(dir.path(), draft(rows.schema(), Level::L0, sources()), PartialSource::FromRows, 1, 100).unwrap();
+            // This fixture compares the pre-range-manifest wire shape.
+            writer.parquet_range_write = false;
             writer.uid_sidecar_write = enabled;
             writer.write(&rows).unwrap();
             let part = writer.finish().unwrap();
@@ -3228,4 +3240,46 @@ mod tests {
         }).collect::<Vec<_>>()).await.unwrap();
         assert_eq!(ordered, (0..12).collect::<Vec<_>>());
     }
+    /// Same production writer and merge, alternating legacy/page manifests.
+    /// Run alone: this uses the existing legacy-layout override for the control.
+    #[test]
+    #[ignore = "NAN-4829 production ingest/merge cost measurement"]
+    fn late_materialization_writer_cost() {
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore { fn drop(&mut self) { match &self.0 {
+            Some(value) => std::env::set_var("NANO_LAKE_PARQUET_RANGE_WRITE", value),
+            None => std::env::remove_var("NANO_LAKE_PARQUET_RANGE_WRITE"),
+        } } }
+        let _restore = Restore(std::env::var_os("NANO_LAKE_PARQUET_RANGE_WRITE"));
+        let events = wide_events(0..16_000, 3600);
+        let refs = events.iter().collect::<Vec<_>>();
+        let schema = Arc::new(infer_schema(&refs).unwrap());
+        let rows = sort_by_time_uid(&decode(schema.clone(), &refs).unwrap()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let fingerprint = crate::parts::format::schema_fingerprint(&schema).unwrap();
+        let mut times = [[Vec::new(), Vec::new()], [Vec::new(), Vec::new()]];
+        for (round, enabled) in [false, true, true, false].into_iter().enumerate() {
+            std::env::set_var("NANO_LAKE_PARQUET_RANGE_WRITE", if enabled { "1" } else { "0" });
+            let started = std::time::Instant::now();
+            let mut writer = PartWriter::create(dir.path(), draft(schema.clone(), Level::L0, sources()), PartialSource::FromRows, 10 + round as i64, rows.num_rows() as u64).unwrap();
+            writer.write(&rows).unwrap();
+            let part = writer.finish().unwrap();
+            let elapsed = started.elapsed().as_secs_f64();
+            times[0][usize::from(enabled)].push(elapsed);
+            let input = MergeInput { part: PartRef::from_record(&part.record, &"0".repeat(64), true), dir: part.dir.clone() };
+            let started = std::time::Instant::now();
+            let merged = merge_parts(dir.path(), TENANT, Level::Hour, HOUR, &[input], schema.clone(), &fingerprint,
+                crate::parts::provenance::tests::SIGNER, "nan4829-cost", 100 + round as i64).unwrap().finished;
+            times[1][usize::from(enabled)].push(started.elapsed().as_secs_f64());
+            assert_eq!(part.record.rows, merged.record.rows);
+            assert_eq!(part.record.merkle_root, merged.record.merkle_root);
+            let manifests = merged.record.files.data.iter().filter_map(|file| file.parquet_ranges.as_ref()).collect::<Vec<_>>();
+            println!("NAN4829 writer round={round} pages={enabled} rows={} ingest_ms={:.3} merge_ms={:.3} data_files={} manifests={} manifest_bytes={}", rows.num_rows(), elapsed*1000., times[1][usize::from(enabled)].last().unwrap()*1000., merged.record.files.data.len(), manifests.len(), manifests.iter().map(|m| m.bytes).sum::<u64>());
+        }
+        for (stage, samples) in ["ingest", "merge"].into_iter().zip(times) {
+            let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+            println!("NAN4829 writer stage={stage} legacy_ms={:.3} pages_ms={:.3} ratio={:.4}", mean(&samples[0])*1000., mean(&samples[1])*1000., mean(&samples[1])/mean(&samples[0]));
+        }
+    }
+
 }

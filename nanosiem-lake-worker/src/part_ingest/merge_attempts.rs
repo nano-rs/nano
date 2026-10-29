@@ -241,9 +241,47 @@ impl MergeAttempts {
         self.stored.merges.get(id)
     }
 
+    /// Record proactive shape/split floors without inventing a failed or
+    /// in-flight attempt. Committed chunks retain this cap across restarts.
+    pub fn plan_at_least(&mut self, id: &str, shift: u8, max_inputs: Option<usize>) -> Result<()> {
+        anyhow::ensure!(self.readable, "merge attempt ledger unreadable; compaction deferred");
+        anyhow::ensure!(!self.left_unmerged(id), "merge left unmerged until memory.max grows");
+        if self.entry(id).is_some_and(|entry| entry.in_flight) {
+            return Ok(());
+        }
+        let previous = self.entry(id).cloned();
+        let before = previous.clone().unwrap_or_default();
+        let mut planned = before.clone();
+        planned.shift = planned.shift.max(shift.min(MAX_SHIFT));
+        if let Some(cap) = max_inputs {
+            let cap = u32::try_from(cap).unwrap_or(u32::MAX).max(MIN_SPLIT_INPUTS);
+            planned.max_inputs = Some(planned.max_inputs.map_or(cap, |old| old.min(cap)));
+        }
+        if planned != before {
+            self.stored.merges.insert(id.to_owned(), planned);
+            if let Err(error) = self.persist() {
+                // A later planning pass must retry the write, rather than
+                // treating an unrecorded in-memory choice as durable.
+                match previous {
+                    Some(entry) => { self.stored.merges.insert(id.to_owned(), entry); }
+                    None => { self.stored.merges.remove(id); }
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     /// Record, durably, that `id` starts now with `inputs` input parts (0:
     /// a merge that cannot be split, a day merge); returns its shape step.
     pub fn begin(&mut self, id: &str, inputs: usize) -> Result<u8> {
+        self.begin_at_least(id, inputs, 0)
+    }
+
+    /// Persist the selected starting shape before launching compute. Keep
+    /// any smaller shape recovered from an earlier failed attempt, so a
+    /// restart or a new estimate cannot undo the bounded retry ladder.
+    pub fn begin_at_least(&mut self, id: &str, inputs: usize, shift: u8) -> Result<u8> {
         anyhow::ensure!(self.readable, "merge attempt ledger unreadable; compaction deferred");
         anyhow::ensure!(!self.left_unmerged(id), "merge left unmerged until memory.max grows");
         // Every live hour keeps its progress, including the steps before
@@ -251,6 +289,7 @@ impl MergeAttempts {
         // restart its ladder forever on a large catch-up. The scheduler
         // prunes entries only after their hour has no live data.
         let entry = self.stored.merges.entry(id.to_string()).or_default();
+        entry.shift = entry.shift.max(shift.min(MAX_SHIFT));
         entry.in_flight = true;
         entry.begun_inputs = u32::try_from(inputs).unwrap_or(u32::MAX);
         let shift = entry.shift;
@@ -349,6 +388,67 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_800_000_000_000;
+
+    #[test]
+    fn proactive_split_survives_reopen_and_commit_without_charging_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = merge_id("h", 7);
+        let mut ledger = MergeAttempts::open(dir.path(), NOW);
+        ledger.plan_at_least(&id, MAX_SHIFT, Some(13)).unwrap();
+        drop(ledger);
+        let mut ledger = MergeAttempts::open(dir.path(), NOW + 1);
+        let entry = ledger.entry(&id).unwrap();
+        assert_eq!((entry.shift, entry.max_inputs, entry.failures, entry.in_flight), (MAX_SHIFT, Some(13), 0, false));
+        assert!(!ledger.died_during_merge());
+        ledger.begin(&id, 13).unwrap();
+        let running = ledger.entry(&id).cloned();
+        ledger.plan_at_least(&id, MAX_SHIFT, Some(2)).unwrap();
+        assert_eq!(ledger.entry(&id), running.as_ref(), "planning cannot rewrite an active attempt's recorded shape");
+        ledger.committed(&id).unwrap();
+        ledger.plan_at_least(&id, 0, Some(26)).unwrap();
+        assert_eq!(ledger.max_inputs(&id), Some(13), "never expand a committed split");
+        assert_eq!(ledger.shift(&id), MAX_SHIFT);
+        ledger.plan_at_least(&id, MAX_SHIFT, Some(0)).unwrap();
+        assert_eq!(ledger.max_inputs(&id), Some(2), "the minimum is two inputs");
+    }
+
+    #[test]
+    fn a_killed_proactive_chunk_recovers_from_its_actual_fan_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = merge_id("h", 7);
+        let mut ledger = MergeAttempts::open(dir.path(), NOW);
+        ledger.plan_at_least(&id, MAX_SHIFT, Some(13)).unwrap();
+        ledger.begin(&id, 13).unwrap();
+        drop(ledger); // SIGKILL before ending or committing the chunk.
+        let mut ledger = MergeAttempts::open(dir.path(), NOW + 1);
+        assert!(ledger.died_during_merge());
+        let entry = ledger.entry(&id).unwrap();
+        assert_eq!((entry.shift, entry.max_inputs, entry.failures, entry.in_flight),
+            (MAX_SHIFT, Some(6), 1, false));
+        ledger.admission_forgiven().unwrap();
+        ledger.begin(&id, 6).unwrap();
+        ledger.committed(&id).unwrap();
+        drop(ledger);
+        let reopened = MergeAttempts::open(dir.path(), NOW + 2);
+        assert!(!reopened.died_during_merge());
+        assert_eq!(reopened.max_inputs(&id), Some(6));
+    }
+
+    #[test]
+    fn selected_shape_is_durable_and_recovery_shrinks_from_the_shape_that_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = merge_id("h", 7);
+        let mut ledger = MergeAttempts::open(dir.path(), NOW);
+        assert_eq!(ledger.begin_at_least(&id, 164, 2).unwrap(), 2);
+        assert_eq!(ledger.entry(&id).unwrap().failures, 0, "planning is not a failed attempt");
+        drop(ledger);
+        let mut ledger = MergeAttempts::open(dir.path(), NOW + 1);
+        assert_eq!(ledger.shift(&id), 3, "a killed shift-2 attempt recovers at shift 3");
+        assert_eq!(ledger.begin_at_least(&id, 164, 0).unwrap(), 3, "never undo recovery");
+        ledger.committed(&id).unwrap();
+        assert!(ledger.entry(&id).is_none());
+        assert_eq!(ledger.begin_at_least(&id, 164, u8::MAX).unwrap(), MAX_SHIFT);
+    }
 
     /// The incident: every restart planned the same merge at the same size.
     /// Each death now shrinks it; a death at the smallest shape parks it

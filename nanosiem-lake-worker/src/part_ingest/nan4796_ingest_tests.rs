@@ -234,11 +234,13 @@ fn drain(lab: &Lab, cgroup_max: u64, baseline: u64, sizing_cap: u64, max_ticks: 
             fresh += 50;
             // An empty buffer: the history lanes may start hour merges.
             ingestor.tick(now + 2).await.unwrap();
+            // Observe the selected shape before a first-attempt commit
+            // clears its durable entry.
+            shrunk |= (FIRST_HOUR..FIRST_HOUR + HOURS).any(|hour| ingestor.merge_attempts
+                .entry(&merge_id(Level::Hour.code(), hour as i32)).is_some_and(|entry| entry.shift > 0 || entry.max_inputs.is_some()));
             settle_merges(&ingestor).await;
             // Reap: commit, or record a guard stop.
             ingestor.tick(now + 3).await.unwrap();
-            shrunk |= (FIRST_HOUR..FIRST_HOUR + HOURS).any(|hour| ingestor.merge_attempts
-                .entry(&merge_id(Level::Hour.code(), hour as i32)).is_some_and(|entry| entry.shift > 0 || entry.max_inputs.is_some()));
             trace.push(backlog(&ingestor));
             let planned = plan_merges_with(&ingestor.live_parts(), now + 3, &ingestor.cfg.merge_policy, true);
             let pending = ingestor.converge_memory_bound_merges(planned).iter().filter(|merge| merge.inputs.iter().all(in_backlog)).count();
@@ -298,7 +300,7 @@ fn assert_converges(trace: &[usize]) {
 /// The incident, end to end. The ingest baseline alone is above 85 % of
 /// the sizing cap (where the pre-NAN-4796 guard stopped every merge). The
 /// role's `memory.max` leaves the merges 60 % of the full-shape hour
-/// merge's peak above that baseline, so the hours must shrink and split to
+/// merge's peak above that baseline, so the hours must start smaller to
 /// fit. Every hour converges into `h` parts with every row, on a realistic
 /// clock, with zero quarantined failures. Fresh data commits throughout,
 /// and memory never reaches `memory.max`.
@@ -327,7 +329,8 @@ fn a_multi_hour_backlog_under_a_small_limit_and_high_baseline_converges_without_
     eprintln!("NAN-4796: full-shape peak {} KiB; baseline {} KiB, memory.max {} KiB, sizing cap {} KiB: {} ticks, {} guard stops, \
         peak {} KiB, backlog {:?}", full_peak >> 10, baseline >> 10, cgroup_max >> 10, sizing_cap >> 10, run.trace.len() - 1,
         run.stops, run.peak >> 10, run.trace);
-    assert!(run.shrunk && run.stops >= 1, "the fixture must make the full shape not fit");
+    assert!(run.shrunk, "the planner selected smaller shapes before starting");
+    assert_eq!(run.stops, 0, "the first-fit shapes avoid the oversized attempts");
     assert_eq!(run.failures, 0, "no merge was quarantined: guard stops are the ledger's, not a failing input's");
     assert_converges(&run.trace);
     assert!(baseline + (run.peak.max(0) as u64) < cgroup_max, "never reached memory.max (no OOM)");

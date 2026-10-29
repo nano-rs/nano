@@ -61,6 +61,7 @@ export class IssuanceAborted extends Error {
 export interface IssuanceOptions {
   signal?: AbortSignal;
   onPhase?: (phase: IssuancePhase, request?: TenantIngestCredentialRequest) => void;
+  onWaiting?: (status: IngestCredentialReveal) => void;
   /** First poll delay; doubles up to `maxPollMs`. */
   pollMs?: number;
   maxPollMs?: number;
@@ -119,6 +120,7 @@ export async function issueIngestCredential(
     for (;;) {
       check(requestId);
       const status = await client.getIngestCredentialRequest(requestId);
+      if (status.state === 'pending') options.onWaiting?.(status);
       if (status.state === 'rejected' || status.state === 'revoked') throw rejection(status, requestId);
       if (status.revealed_at) throw new IssuanceError(describeRefusal('already_revealed'), requestId);
       if (status.state === 'issued' && !status.sealed_token_ready) {

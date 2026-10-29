@@ -494,6 +494,7 @@ mod tests {
                 },
                 sha256: "a".repeat(64),
                 row_group: Some(0),
+                pages: Vec::new(),
                 column: Some(column.into()),
             });
         }
@@ -502,6 +503,7 @@ mod tests {
             bytes: 8192,
             sha256: "b".repeat(64),
             row_group: None,
+            pages: Vec::new(),
             column: None,
         });
         assert!(ranges.iter().map(|r| r.bytes).sum::<u64>() > 2 * 1024 * 1024 * 1024);

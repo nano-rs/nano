@@ -333,6 +333,14 @@ async fn reopen_engine_with_source(
     root: &std::path::Path, state_name: &str, threads: u64,
     source: Option<Arc<dyn crate::reader_object_cache::ReaderObjectSource>>,
 ) -> PartQueryEngine {
+    reopen_engine_with_residency(root, state_name, threads, source, None).await
+}
+
+async fn reopen_engine_with_residency(
+    root: &std::path::Path, state_name: &str, threads: u64,
+    source: Option<Arc<dyn crate::reader_object_cache::ReaderObjectSource>>,
+    residency: Option<(u64, crate::local_hot_window::Settings)>,
+) -> PartQueryEngine {
     let signer = signer();
     let state = root.join(state_name);
     std::fs::create_dir_all(&state).unwrap();
@@ -341,11 +349,14 @@ async fn reopen_engine_with_source(
     let view = PartLogView::open(store.as_ref(), TENANT, trusted.clone()).await.unwrap();
     let bucket = "nan3078-local";
     let cache = ReaderObjectCache::open(ReaderObjectCacheSettings {
-        root: state.join("cache"), max_bytes: 1 << 30, query_max_bytes: 1 << 29,
+        root: state.join("cache"), max_bytes: residency.as_ref().map_or(1 << 30, |(bytes, _)| *bytes),
+        query_max_bytes: residency.as_ref().map_or(1 << 29, |_| 1),
         fetch_concurrency: 4, fetch_deadline: std::time::Duration::from_secs(60),
     }, TENANT, bucket, &parts_key_prefix(TENANT).unwrap(),
     source.unwrap_or_else(|| Arc::new(StoreObjectSource::local(bucket, store.clone(), root.join("parts"))))).unwrap();
-    let fetcher = PartFetcher::new(TENANT, bucket, store.clone(), trusted, cache).unwrap();
+    if let Some((_, settings)) = &residency { cache.set_hot_capacity(settings.clone()); }
+    let fetcher = PartFetcher::new(TENANT, bucket, store.clone(), trusted, cache).unwrap()
+        .with_hot_window(residency.map(|(_, settings)| settings));
     let runtime = NativeChdb::load_verified(
         std::env::var("NANO_CHDB_LIBRARY_PATH").unwrap(),
         &std::env::var("NANO_CHDB_LIBRARY_SHA256").unwrap(),
@@ -1383,6 +1394,89 @@ async fn durable_lateral_matches_scoped_retained_auth_events() {
     let reader = super::ViewReader { engine: &engine, writer: engine.writer().unwrap(), spec: &bounded, pin: &pin,
         window: (contribution, now), cancelled: &cancelled, collect_bytes: 1, lane: tokio::sync::Mutex::new(Default::default()) };
     assert!(super::execute_view(&reader, &bounded).await.is_err());
+}
+
+/// A native identity lookup shares the 30-day planning partials with the
+/// production hot-window hydrator. At capacity an unchanged pass must not
+/// evict those partials and make the next lookup fetch them all again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: chDB artifact"]
+async fn identity_lookups_after_full_window_hydration_fetch_partials_once() {
+    let _serial = serial();
+    use super::super::identity::{lookup, normalize_items, LookupKind};
+    use crate::reader_object_cache::{ReaderObjectRef, ReaderObjectSource};
+    let root = tempfile::tempdir().unwrap();
+    let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
+    struct IdentityWriting(bool);
+    impl Drop for IdentityWriting {
+        fn drop(&mut self) { crate::identity_observations::set_enabled(self.0); }
+    }
+    let writing = IdentityWriting(crate::identity_observations::enabled());
+    crate::identity_observations::set_enabled(true);
+    drop(engine_with_detail_fixture(root.path(), now, 16, false, false, false, true).await);
+    drop(writing);
+    struct CountingSource {
+        inner: StoreObjectSource,
+        gets: Mutex<BTreeMap<String, usize>>,
+    }
+    #[async_trait::async_trait]
+    impl ReaderObjectSource for CountingSource {
+        async fn stream_object(&self, object: &ReaderObjectRef,
+            sink: &mut (dyn for<'b> FnMut(&'b [u8]) -> anyhow::Result<()> + Send)) -> anyhow::Result<()> {
+            self.inner.stream_object(object, sink).await?;
+            if object.source_uri.ends_with(crate::parts::format::PARTIAL_ENTITY_RANGES_FILE) {
+                *self.gets.lock().unwrap().entry(object.source_uri.clone()).or_default() += 1;
+            }
+            Ok(())
+        }
+    }
+    let source = Arc::new(CountingSource {
+        inner: StoreObjectSource::local("nan3078-local",
+            Arc::new(LocalObjectStore::new(root.path().join("parts")).unwrap()), root.path().join("parts")),
+        gets: Default::default(),
+    });
+    // Measure signed sizes, then make the data window fill its whole share.
+    let sizing = reopen_engine(root.path()).await;
+    let (parts, ..) = sizing.snapshot(now.timestamp_micros() - crate::identity_observations::LOOKBACK_US,
+        now.timestamp_micros()).await.unwrap();
+    let records = sizing.fetcher().records(&parts).await.unwrap();
+    let hot_cutoff = now.timestamp_micros() - 24 * 3_600_000_000;
+    let hot_bytes = parts.iter().zip(&records).filter(|(part, _)| part.max_time_us >= hot_cutoff)
+        .map(|(_, record)| record.files.data.iter().map(|data| data.bytes + data.tokens.bytes
+            + data.entity_blooms.as_ref().map_or(0, |file| file.bytes)
+            + data.entity_locators.as_ref().map_or(0, |file| file.bytes)).sum::<u64>()
+            + record.files.partials.iter().filter(|p| matches!(p.kind,
+                crate::parts::provenance::PartialKind::Rollup | crate::parts::provenance::PartialKind::EntityRanges))
+                .map(|p| p.bytes).sum::<u64>()).sum::<u64>();
+    assert!(hot_bytes > 0 && parts.iter().any(|part| part.max_time_us < hot_cutoff));
+    drop(sizing);
+    let cache_bytes = 2 * hot_bytes;
+    let settings = crate::local_hot_window::Settings {
+        root: root.path().join("bounded/cache"), hours: 24, bytes_per_second: 1 << 30,
+        reserve_bytes: Some(0), max_bytes: 1 << 30, schedule: Default::default(), persistent: false,
+    };
+    let engine = reopen_engine_with_residency(root.path(), "bounded", 2, Some(source.clone()),
+        Some((cache_bytes, settings))).await;
+    let raw = (0..6).map(|i| (format!("10.0.0.{}", i % 3),
+        (now - Duration::hours(i * 20)).to_rfc3339())).collect::<Vec<_>>();
+    let items = normalize_items(LookupKind::Ip, &raw).unwrap();
+    let mut expected = None;
+    for pass in 0..5 {
+        engine.hydrate_hot_window(&std::sync::atomic::AtomicU64::new(0)).await.unwrap();
+        // Exercise the direct partial path, including all old sources,
+        // independently of the previous merged-identity fix.
+        let scope = crate::perf_overrides::Parsed {
+            overrides: crate::perf_overrides::Overrides { identity_merged_index: Some(false), ..Default::default() },
+            ..Default::default()
+        };
+        let (answer, _) = crate::perf_overrides::scoped(Some(Arc::new(scope)),
+            lookup(&engine, &root.path().join("bounded"), LookupKind::Ip, &items, &["azure_audit".into()])).await.unwrap();
+        assert!(!answer.is_empty());
+        if let Some(expected) = &expected { assert_eq!(&answer, expected); } else { expected = Some(answer); }
+        let gets = source.gets.lock().unwrap();
+        assert_eq!(gets.len(), parts.len(), "every signed partial is exercised");
+        assert!(gets.values().all(|count| *count == 1), "lookup {pass} refetched immutable partials: {gets:?}");
+    }
 }
 
 /// NAN-4799: the background identity passes (backfill, then merge) never

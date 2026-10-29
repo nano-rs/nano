@@ -1109,7 +1109,7 @@ mod tests {
             }, now);
             let view = chain.view();
             assert!(view.live().removed_ref(&id(1)).is_none());
-            assert!(view.removal(&id(1)).is_some());
+            assert!(view.removal(&id(1)).unwrap().is_some());
             persist(&store, &chain).await;
             let live = key(4, Level::Minute, "data-00000.parquet");
             store.put(&live, b"live output").await.unwrap();

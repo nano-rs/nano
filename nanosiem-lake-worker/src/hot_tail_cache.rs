@@ -80,8 +80,20 @@ impl HotTailCacheSettings {
                 let max_bytes = max_bytes
                     .parse::<u64>()
                     .ok()
-                    .filter(|bytes| *bytes > 0)
-                    .context("NANO_LAKE_HOT_TAIL_CACHE_BYTES must be positive")?;
+                    .context("NANO_LAKE_HOT_TAIL_CACHE_BYTES must be an integer")?;
+                let capacity = crate::cgroup_memory::process_capacity();
+                let volume = nanosiem_lake_cell::disk_ceiling::containing_volume_bytes(Path::new(&directory))
+                    .context("hot-tail cache volume capacity")?;
+                let max_bytes = if max_bytes == 0 {
+                    if non_empty_env("DEPLOYMENT_MODE").as_deref() == Some("enterprise_shared") {
+                        bail!("enterprise_shared requires an explicit positive hot-tail cache budget");
+                    }
+                    // On self-hosted installs, leave RAM for native work and
+                    // disk for parts, reader cache and durable job results.
+                    (capacity.memory_bytes / 4).min(volume / 100).max(1)
+                } else {
+                    nanosiem_lake_cell::budget::cache_disk_budget(max_bytes, volume)
+                };
                 Ok(Some(Self {
                     directory: PathBuf::from(directory),
                     max_bytes,

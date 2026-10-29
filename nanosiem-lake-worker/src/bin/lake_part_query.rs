@@ -715,7 +715,9 @@ fn main() -> anyhow::Result<()> {
     nanosiem_lake_worker::process_limits::initialize()?;
     nanosiem_lake_worker::cell_logging::init_child_tracing();
     nanosiem_lake_worker::cgroup_memory::initialize(boot.assignment.jail.cgroup_dir.as_deref());
-    let threads = usize::try_from((boot.assignment.cpu_millis / 1000).clamp(1, 4)).unwrap_or(1) + 1;
+    let threads = nanosiem_lake_worker::part_query::memory_budget::QueryMemoryBudget::for_process_role(
+        boot.assignment.memory_cap_bytes, boot.assignment.cpu_millis,
+    ).runtime_threads();
     tokio::runtime::Builder::new_multi_thread()
         .on_thread_start(|| {
             if let Err(error) = nanosiem_lake_cell::crash_capture::register_thread() {

@@ -107,7 +107,7 @@ async fn ingest(root: &std::path::Path, now: DateTime<Utc>, ranges: bool) {
     if ranges {
         std::env::set_var("NANO_LAKE_PARQUET_RANGE_WRITE", "1");
     } else {
-        std::env::remove_var("NANO_LAKE_PARQUET_RANGE_WRITE");
+        std::env::set_var("NANO_LAKE_PARQUET_RANGE_WRITE", "0");
     }
     let parts = LocalObjectStore::new(root.join("parts")).unwrap();
     let sources_dir = root.join("sources");

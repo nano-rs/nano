@@ -198,7 +198,9 @@ impl GcHttpGuard {
     }
 
     fn cancelled(&self, message: &str) -> opendal::Error {
-        (self.current)().err().unwrap_or_else(|| gc_refusal(message))
+        // The replacement can already be installed when this select runs.
+        // Preserve the refresh cause even after current() becomes usable.
+        (self.current)().err().unwrap_or_else(|| gc_generation_changed(message))
     }
 
     /// Also own the OpenDAL operation: invalidation drops RetryLayer's delay,
@@ -228,6 +230,10 @@ pub(crate) async fn bounded_gc_list<T>(future: impl std::future::Future<Output =
         .await
 }
 
+fn gc_generation_changed(message: &str) -> opendal::Error {
+    gc_refusal(message).set_source(anyhow::Error::from(crate::part_ingest::part_gc_cell::RefreshSuspended))
+}
+
 fn gc_refusal(message: &str) -> opendal::Error {
     opendal::Error::new(opendal::ErrorKind::PermissionDenied, message)
 }
@@ -246,7 +252,7 @@ impl HttpFetch for GcHttp {
         let mut generation = self.guard.generation.subscribe();
         let mut epoch = self.epoch.subscribe();
         if *epoch.borrow() != self.expected_epoch {
-            return Err(gc_refusal("GC operator credential generation changed"));
+            return Err(self.guard.cancelled("GC operator credential generation changed"));
         }
         let remaining = (self.guard.current)()?;
         let expiry = tokio::time::sleep(remaining);
@@ -276,7 +282,7 @@ impl HttpFetch for GcHttp {
             (self.guard.current)()?;
             if observed.has_changed().unwrap_or(true)
                 || *observed_epoch.borrow() != self.expected_epoch {
-                return Err(gc_refusal("GC transport generation changed"));
+                return Err(self.guard.cancelled("GC transport generation changed"));
             }
             // Immediately before CountingHttp, below OpenDAL's RetryLayer.
             (self.guard.current)()?;
@@ -372,7 +378,7 @@ impl HttpFetch for GcHttp {
         tokio::select! {
             biased;
             _ = generation.changed() => Err(self.guard.cancelled("GC transport generation changed")),
-            _ = epoch.changed() => Err(gc_refusal("GC operator credential generation changed")),
+            _ = epoch.changed() => Err(self.guard.cancelled("GC operator credential generation changed")),
             _ = &mut expiry => Err(gc_refusal("GC transport grant expired")),
             result = work => result,
         }

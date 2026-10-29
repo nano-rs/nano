@@ -21,7 +21,11 @@ struct FieldDef {
     data_type: String,
 }
 
+#[path = "src/parsers/vrl_functions.rs"]
+mod vrl_functions;
+
 fn main() {
+    generate_vrl_catalog();
     println!("cargo:rerun-if-env-changed=WORKER_REVISION");
     println!("cargo:rerun-if-changed=docs/udmfields.csv");
     // sqlx::migrate! embeds migrations at compile time. Watch the directories
@@ -547,4 +551,23 @@ fn generate_code(fields: &[FieldDef]) -> String {
     code.push_str("}\n");
 
     code
+}
+
+/// Build the prompt reference from the exact stdlib used by the compiler.
+fn generate_vrl_catalog() {
+    println!("cargo:rerun-if-changed=src/parsers/vrl_functions.rs");
+    let mut entries = vrl_functions::safe_vrl_functions().into_iter().map(|f| {
+        let args = f.parameters().iter().map(|p| {
+            format!("{}{}:{}", p.keyword, if p.required { "" } else { "?" }, p.kind())
+        }).collect::<Vec<_>>().join(",");
+        let closure = f.closure().and_then(|definition| definition.inputs.first().map(|input| {
+            let variables = (1..=input.variables.len()).map(|n| format!("arg{n}")).collect::<Vec<_>>().join(",");
+            format!(" -> |{variables}| {{ ... }}")
+        })).unwrap_or_default();
+        let result = vrl::compiler::Parameter::required("result", f.return_kind(), "").kind();
+        format!("{}({}){} : {}", f.identifier(), args, closure, result)
+    }).collect::<Vec<_>>();
+    entries.sort();
+    std::fs::write(Path::new(&env::var("OUT_DIR").unwrap()).join("vrl-functions.txt"), entries.join("\n"))
+        .expect("write pinned VRL function catalog");
 }
