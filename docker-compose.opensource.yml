@@ -1374,6 +1374,7 @@ services:
       NANO_LAKE_ENRICHMENT_TOKEN: ${NANO_LAKE_ENRICHMENT_TOKEN:-}
       NANO_LOCAL_AUDIT_TOKEN: ${NANO_LOCAL_AUDIT_TOKEN:-}
       NANO_LAKE_TARGET_EPS: ${NANO_LAKE_TARGET_EPS:-}
+      NANO_VECTOR_PROFILE: ${NANO_VECTOR_PROFILE:-lean}
     volumes:
       - ./.nano-lean:/bootstrap
       - ./scripts/lean/configure-open.py:/configure-open.py:ro

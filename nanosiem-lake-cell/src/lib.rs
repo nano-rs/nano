@@ -33,6 +33,7 @@ pub mod features;
 pub mod handover;
 pub mod identity;
 pub mod jail;
+pub mod landing_budget;
 pub mod limits;
 pub mod oom;
 pub mod part_channel;

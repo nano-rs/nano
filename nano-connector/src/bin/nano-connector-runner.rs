@@ -1059,6 +1059,39 @@ mod deployment_mode_tests {
     const MIB: u64 = 1 << 20;
 
     #[test]
+    fn nan4843_rendered_workers_use_the_production_memory_guard() {
+        use nanosiem_lake_cell::trusted_local::{compose_resources, host_cell_memory_bytes, size, HostFacts};
+        // Cover all supported host shapes from the initializer and Dragonfly
+        // suites, plus a host large enough to hit the four-worker ceiling.
+        for memory in [8 * 1024 * MIB, 12 * 1024 * MIB, 15_965 * MIB,
+            16 * 1024 * MIB, 24 * 1024 * MIB, 32 * 1024 * MIB,
+            64 * 1024 * MIB, 256 * 1024 * MIB] {
+            for cpus in 2..=64 {
+                for sovereign in [false, true] {
+                    let rendered = compose_resources(&size(host_cell_memory_bytes(memory).max(512 * MIB), cpus),
+                        HostFacts { memory_bytes: memory, cpus }, sovereign);
+                    let runner = &rendered["services"]["connector-runner"];
+                    let limit = runner["mem_limit"].as_u64().unwrap();
+                    let env = &runner["environment"];
+                    let workers = env["CONNECTOR_VRL_MAX_WORKERS"].as_str().unwrap().parse::<usize>().unwrap();
+                    let worker_as = env["CONNECTOR_VRL_WORKER_AS_BYTES"].as_str().unwrap().parse::<u64>().unwrap();
+                    assert!((1..=4).contains(&workers));
+                    assert_eq!(worker_as, 256 * MIB);
+                    check_vrl_memory(Some(limit), workers, worker_as, false)
+                        .unwrap_or_else(|e| panic!("host={memory} cpus={cpus} sovereign={sovereign}: {e}"));
+                    // The guard rejects one byte below the actual requirement.
+                    let need = workers as u64 * (worker_as + nano_connector::engine::default_ceilings().max_response_bytes * 3)
+                        + super::RUNNER_RESERVE_BYTES;
+                    assert!(check_vrl_memory(Some(need - 1), workers, worker_as, false).is_err());
+                    if workers < 4 {
+                        assert!(check_vrl_memory(Some(limit), workers + 1, worker_as, false).is_err());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn vrl_workers_must_fit_the_pod_memory_limit() {
         // 256 MiB AS + 192 MiB call I/O = 448 MiB per worker, + 256 MiB reserve.
         assert!(check_vrl_memory(Some(2047 * MIB), 4, 256 * MIB, true).is_err());
@@ -1070,6 +1103,8 @@ mod deployment_mode_tests {
         // No limit: refused on shared, allowed on dedicated / open core.
         assert!(check_vrl_memory(None, 32, 1 << 30, true).unwrap_err().contains("memory limit"));
         assert!(check_vrl_memory(None, 32, 1 << 30, false).is_ok());
+        assert!(check_vrl_memory(Some(703 * MIB), 1, 256 * MIB, false).is_err());
+        assert!(check_vrl_memory(Some(704 * MIB), 1, 256 * MIB, false).is_ok());
     }
 
     fn vars(v: &[&str]) -> Vec<String> {

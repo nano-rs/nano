@@ -100,6 +100,8 @@ cursor_alignment_test.html
 test_syntax_highlighting.html
 scripts/
 config/*
+# The host allocator embeds the same policy that the installer reads.
+!config/lean-startup-memory.json
 # NAN-1156: nanosiem-core embeds these base Vector templates at COMPILE time via
 # include_str! (vector_config/deploy.rs — backpressure guard + default lane), so
 # they MUST be in the Docker build context even though the rest of config/ stays

@@ -1455,6 +1455,9 @@ impl PartQueryEngine {
     /// is free: never queued, so it never delays an interactive or detect
     /// request, and `None` whenever anything else is running.
     pub fn try_admit_idle(&self) -> Option<AdmissionSlot> {
+        if self.warming_for_readiness() {
+            return None;
+        }
         let slots = self.admission_slots();
         idle_permit(&self.admission, slots).map(|permit| AdmissionSlot { permit: Some(permit), slots, gate: None })
     }
@@ -2713,8 +2716,16 @@ impl PartQueryEngine {
         Ok(())
     }
 
+    /// A gated startup is doing priority work even with no search admitted.
+    /// Otherwise identity backfill and entity-index rebuilds treat a cold pod
+    /// as idle and compete with hydration for its cache slots, IO and CPU.
+    fn warming_for_readiness(&self) -> bool {
+        self.fetcher.hot_settings.as_ref().is_some_and(|settings| settings.schedule.warm_gate)
+            && self.fetcher.hot_window_gate() == Some(crate::local_hot_window::WarmGate::Hydrating)
+    }
+
     pub(super) fn evidence_idle(&self) -> bool {
-        evidence_lanes_idle(&self.admission, self.admission_slots(), &self.point_admission, &self.job_admission, self.job_slots())
+        !self.warming_for_readiness() && evidence_lanes_idle(&self.admission, self.admission_slots(), &self.point_admission, &self.job_admission, self.job_slots())
     }
 
     /// A background step's native-work slot (`None`: searches kept the

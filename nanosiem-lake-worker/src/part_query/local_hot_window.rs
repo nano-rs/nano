@@ -79,8 +79,8 @@ fn resident_files(record: &ProvenanceRecord) -> Vec<(PartFile, &str, u64)> {
 /// order (newest first; the plan-only parts of [`PLAN_HOURS`] last).
 /// `partials_first` (NAN-3690): every part's [`RESIDENT_PARTIALS`] first,
 /// then (NAN-3714) the rest of the `edge` parts, then the rest part by part.
-/// The pass completes downloads in this order, so once any part counts as
-/// resident every part's partials and the window's oldest edge are local.
+/// The pass starts downloads in this order. Completion may be out of order;
+/// the warm latch separately checks all required partials and edge parts.
 fn hydration_jobs(
     resident: Vec<Vec<PartFile>>,
     edge: &std::collections::BTreeSet<usize>,
@@ -540,6 +540,7 @@ async fn hydrate_with(
     let mut coverage = Coverage {
         capacity_bytes: target,
         configured_hours: settings.hours,
+        planning_bytes: plan_bytes,
         buckets,
         discovery_seconds: pass_started.elapsed().as_secs_f64(),
         warm_hours: schedule.warm_hours,
@@ -572,18 +573,15 @@ async fn hydrate_with(
     if !previously_warm {
         coverage.log_progress();
     }
-    // NAN-3164: newest first, `concurrency` objects in flight, one token
-    // bucket for the pass. `buffered` keeps completions in selection order,
-    // so part/bucket accounting and the warm prefix stay exact.
+    // Newest first, bounded fan-out and one shared token bucket. Yield every
+    // completion immediately: one slow object must not hold the other slots
+    // or hide their progress. `remaining` below fences the contiguous prefix.
     // NAN-3647: with the warm gate on, the pass runs at the warm-up cap until
     // the warm hours are resident (the pod is not Ready, nothing competes).
     let cap_for = |warm: bool| if warm { rate_cap } else { schedule.cap_before_warm(rate_cap) };
     let bucket = crate::reader_object_cache::HydrateBucket::new(cap_for(coverage.warm_resident));
     let pass_concurrency = coverage.concurrency;
     let warm_flag = std::sync::atomic::AtomicBool::new(coverage.warm_resident);
-    let share = (rate_cap
-        / (schedule.concurrency.max(1) as u64).saturating_mul(schedule.query_backoff.max(1)))
-    .max(1);
     // Indexes [0, selected.len()) are the selected parts, newest first; the
     // NAN-3714 plan-only parts (partials only) follow.
     let targets = selected
@@ -597,6 +595,12 @@ async fn hydrate_with(
         .chain(plan_only.iter().map(|(_, (_, record))| plan_files(record).into_iter().map(|(file, _, _)| file).collect()))
         .collect::<Vec<_>>();
     let mut remaining = resident.iter().map(Vec::len).collect::<Vec<_>>();
+    // With unordered completion, data of the warm prefix can finish before
+    // an older selected part's partial. The gate promises all plan metadata,
+    // so track that barrier independently of both the prefix and plan-only parts.
+    let mut remaining_partials = resident.iter()
+        .map(|files| files.iter().filter(|file| matches!(file, PartFile::Partial(_))).count())
+        .collect::<Vec<_>>();
     // NAN-3714: the selected parts at the window's oldest edge (the 7 d
     // count's ragged start), and every part whose download must finish before
     // a gated pass latches warm: those, and all plan-only partials.
@@ -619,6 +623,7 @@ async fn hydrate_with(
     let jobs = hydration_jobs(resident, &edge, schedule.partials_first(coverage.warm_resident));
     struct Outcome {
         index: usize,
+        partial: bool,
         size: u64,
         hit: bool,
         lookup_seconds: f64,
@@ -638,48 +643,58 @@ async fn hydrate_with(
             sha256: digest.to_string(),
             size_bytes: size,
         };
-        let lookup_started = Instant::now();
-        let hit = fetcher
-            .cache()
-            .is_local(&object)
-            .await
-            .map_err(|e| map_fetch_error(e.into()))?;
-        let lookup_seconds = lookup_started.elapsed().as_secs_f64();
-        if hit {
-            return Ok::<_, super::engine::PartQueryError>(Outcome {
-                index, size, hit, lookup_seconds, fetch_seconds: 0.0, result: Ok(()),
-            });
-        }
         let warm = warm_ref.load(std::sync::atomic::Ordering::Relaxed);
-        bucket_ref.set_rate(crate::local_hot_window::effective_rate(
+        let cap = crate::local_hot_window::effective_rate(
             cap_for(warm),
             inflight.load(std::sync::atomic::Ordering::Relaxed) > 0,
             warm,
             schedule.query_backoff,
-        ));
-        let fetch_started = Instant::now();
-        // One signed object, bounded by total cache capacity, not the query budget.
-        let result = crate::reader_object_cache::background_hydrate_shared(
-            bucket_ref.clone(),
-            share,
-            fetcher.hydrate_object(&object),
-        )
-        .await
-        .map(drop)
-        .map_err(|error| Deferral {
+        );
+        // Include local lookup, producer copy, admission and shared-fetch/slot
+        // waits, not just the transfer. A timed-out caller leaves the cache's
+        // single-flight intact: the next pass joins it instead of another GET.
+        // An object started cold can cross the warm latch while siblings
+        // lower the shared bucket to the steady cap and query backoff. Size
+        // its deadline for that slowest rate, without slowing active warm-up.
+        let floor = rate_cap / schedule.query_backoff.max(1);
+        let share = (floor / pass_concurrency as u64).max(1);
+        let deadline = fetcher.cache().hydration_deadline(size, share);
+        let lookup_started = Instant::now();
+        let mut lookup_seconds = 0.0;
+        let mut fetch_started = None;
+        let mut hit = false;
+        let result = tokio::time::timeout(deadline, async {
+            hit = fetcher.cache().is_local(&object).await?;
+            lookup_seconds = lookup_started.elapsed().as_secs_f64();
+            if hit {
+                return Ok::<_, anyhow::Error>(());
+            }
+            bucket_ref.set_rate(cap);
+            fetch_started = Some(Instant::now());
+            crate::reader_object_cache::background_hydrate_shared(
+                bucket_ref.clone(), share, fetcher.hydrate_object(&object),
+            ).await.map(drop)
+        }).await.unwrap_or_else(|_| Err(anyhow::anyhow!(
+            "hot-window object deadline exceeded after {:.3}s during {}",
+            deadline.as_secs_f64(),
+            if fetch_started.is_some() { "hydration" } else { "local lookup" },
+        ))).map_err(|error| Deferral {
             saturated: error.chain().any(|cause| matches!(
                 cause.downcast_ref::<crate::reader_object_cache::ReaderCacheError>(),
                 Some(crate::reader_object_cache::ReaderCacheError::Saturated { .. })
             )),
             error: error.to_string(),
         });
-        Ok(Outcome {
-            index, size, hit, lookup_seconds,
-            fetch_seconds: fetch_started.elapsed().as_secs_f64(),
+        if fetch_started.is_none() {
+            lookup_seconds = lookup_started.elapsed().as_secs_f64();
+        }
+        Ok::<_, super::engine::PartQueryError>(Outcome {
+            index, partial: matches!(file, PartFile::Partial(_)), size, hit, lookup_seconds,
+            fetch_seconds: fetch_started.map_or(0.0, |started| started.elapsed().as_secs_f64()),
             result,
         })
     }))
-    .buffered(pass_concurrency);
+    .buffer_unordered(pass_concurrency);
     tokio::pin!(fetches);
     let mut completed_prefix = 0_usize;
     // NAN-4154: a pass that stops early (a deferred object, or a rerun before
@@ -717,6 +732,7 @@ async fn hydrate_with(
             && crate::local_hot_window::warm_window_resident(&selected_ends, completed_prefix, warm_cutoff)
             // NAN-3714: and the long-range plan metadata and the oldest edge.
             && before_latch.iter().all(|index| remaining[*index] == 0)
+            && (!schedule.warm_gate || remaining_partials.iter().all(|left| *left == 0))
         {
             // NAN-3690: this pass's catalog is as old as its discovery; the
             // writer kept committing (and merging) the newest hours while it
@@ -763,45 +779,39 @@ async fn hydrate_with(
         };
         let Some(outcome) = next else { break };
         let outcome = outcome?;
-        if outcome.index >= selected.len() {
-            // NAN-3714: a plan-only partial, outside the window's coverage.
-            if let Err(deferral) = outcome.result {
-                deferred_any = true;
-                tracing::warn!(error = %deferral.error, saturated = deferral.saturated, "plan partial deferred");
-                failed_in_a_row += 1;
-                if deferral.saturated || failed_in_a_row >= MAX_FAILED_IN_A_ROW {
-                    stopped_early = true;
-                    break;
-                }
-                continue;
-            }
-            failed_in_a_row = 0;
-            remaining[outcome.index] -= 1;
-            continue;
-        }
+        // Planning partials are real work too. Previously their outcomes
+        // skipped every counter: 431 older parts made progress look frozen
+        // for twelve minutes even while reader-cache fetches kept completing.
         coverage.lookup_seconds += outcome.lookup_seconds;
         if outcome.hit {
             coverage.cache_hit_objects += 1;
         } else {
             coverage.cache_miss_objects += 1;
             coverage.fetch_seconds += outcome.fetch_seconds;
-            if let Err(deferral) = outcome.result {
-                coverage.deferred_objects += 1;
-                deferred_any = true;
-                tracing::warn!(error = %deferral.error, saturated = deferral.saturated, "hot-window object deferred");
-                // NAN-4154: a saturated cache admits nothing more this pass
-                // (the next pass retries once leases end). Any other failure
-                // (a fetch past its deadline) skips this object only: the
-                // pass used to stop at it and restart from the newest hour,
-                // so under load it never reached the older hours again.
-                failed_in_a_row += 1;
-                if deferral.saturated || failed_in_a_row >= MAX_FAILED_IN_A_ROW {
-                    stopped_early = true;
-                    break;
-                }
-                continue;
+        }
+        if let Err(deferral) = outcome.result {
+            coverage.deferred_objects += 1;
+            deferred_any = true;
+            tracing::warn!(error = %deferral.error, saturated = deferral.saturated,
+                planning = outcome.index >= selected.len(), "hot-window object deferred");
+            failed_in_a_row += 1;
+            if deferral.saturated || failed_in_a_row >= MAX_FAILED_IN_A_ROW {
+                stopped_early = true;
+                break;
             }
+            continue;
+        }
+        if !outcome.hit {
             coverage.hydrate_bytes += outcome.size;
+        }
+        if outcome.partial {
+            remaining_partials[outcome.index] -= 1;
+        }
+        if outcome.index >= selected.len() {
+            failed_in_a_row = 0;
+            coverage.planning_local_bytes += outcome.size;
+            remaining[outcome.index] -= 1;
+            continue;
         }
         failed_in_a_row = 0;
         coverage.local_bytes += outcome.size;
@@ -1224,7 +1234,12 @@ mod tests {
                 assert_eq!(coverage.local_bytes, live_bytes, "bytes_resident includes rollups");
                 // Data, token index, rollup, entity ranges and (NAN-4154)
                 // the entity locator and bloom sidecars of every part.
-                assert_eq!(coverage.cache_miss_objects as usize, 6 * in_window.len());
+                let planning_objects = live.iter()
+                    .filter(|p| !p.overlaps(cutoff, now) && p.overlaps(plan_cutoff, now))
+                    .map(|p| plan_files(record_of(p)).len()).sum::<usize>();
+                assert_eq!(coverage.cache_miss_objects as usize, 6 * in_window.len() + planning_objects);
+                assert_eq!(coverage.planning_bytes, plan_bytes);
+                assert_eq!(coverage.planning_local_bytes, plan_bytes);
                 assert_eq!(coverage.buckets[2].total_bytes, live_bytes);
             }
             // NAN-3180 acceptance: the rollup read path of a stats step, and
@@ -2105,7 +2120,7 @@ mod tests {
                 let data = data.clone();
                 move |path: &std::path::Path| Some(if data_apart && path.starts_with(&data) { 2 } else { 1 })
             };
-            let _accountant = nanosiem_lake_cell::volume_usage::start_hot_window_accountant_with(
+            let accountant = nanosiem_lake_cell::volume_usage::start_hot_window_accountant_with(
                 hot.clone(),
                 vec![data.clone()],
                 nanosiem_lake_cell::volume_usage::AccountantConfig {
@@ -2147,12 +2162,25 @@ mod tests {
                 hydrate(&fetcher, TENANT, live.clone(), &AtomicU64::new(0), Instant::now()).await.unwrap();
                 fetcher.hot_coverage.lock().unwrap().clone()
             };
+            let settle = || async {
+                let walks = accountant.stats().walks;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while accountant.stats().walks <= walks + 1 {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }).await.expect("accountant observes the completed cache layout");
+            };
+            // The first pass creates directories and the membership ledger.
+            // Include their settled disk usage before comparing window sizes;
+            // a walk during concurrent admission can carry transient usage.
+            pass().await;
+            settle().await;
             let first = pass().await;
             let second = pass().await;
             // The data volume keeps growing (warm-on-write, merges, the
             // agent-catalog export): the walker sees it before the next pass.
             std::fs::File::create(&producer_tier).unwrap().set_len(volume).unwrap();
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            settle().await;
             let third = pass().await;
             (first, second, third)
         }
@@ -2725,6 +2753,370 @@ mod tests {
 
     async fn live_parts(store: &Arc<LocalObjectStore>, signer: &LocalPartSigner) -> Vec<PartRef> {
         PartLogView::open(store.as_ref(), TENANT, signer.trusted()).await.unwrap().live().parts().cloned().collect()
+    }
+
+    /// A fake GET that never returns. Cancellation leaves the cache's real
+    /// single-flight/permits/reservations in charge, as for an R2 stall.
+    struct HungSource {
+        inner: StoreObjectSource,
+        uri: String,
+        hang: std::sync::atomic::AtomicBool,
+        gets: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::reader_object_cache::ReaderObjectSource for HungSource {
+        async fn stream_object(
+            &self,
+            object: &crate::reader_object_cache::ReaderObjectRef,
+            sink: &mut (dyn for<'b> FnMut(&'b [u8]) -> anyhow::Result<()> + Send),
+        ) -> anyhow::Result<()> {
+            *self.gets.lock().unwrap().entry(object.source_uri.clone()).or_default() += 1;
+            if object.source_uri == self.uri && self.hang.load(std::sync::atomic::Ordering::Relaxed) {
+                return std::future::pending().await;
+            }
+            self.inner.stream_object(object, sink).await
+        }
+    }
+
+    /// Production storage pass, signed provenance, real cache admission and
+    /// single-flight. A middle part hangs forever: later parts must finish
+    /// before its deadline, with an exact prefix and no falsely warm gate.
+    #[tokio::test]
+    async fn hung_object_defers_without_hiding_out_of_order_or_planning_progress() {
+        hung_object_case(1, PartFile::Data(0), 24).await;
+    }
+
+    #[tokio::test]
+    async fn warm_gate_waits_for_out_of_order_partials_beyond_the_warm_prefix() {
+        hung_object_case(2, PartFile::Partial(PartialKind::Rollup), 1).await;
+    }
+
+    async fn hung_object_case(hung_index: usize, file: PartFile, warm_hours: u64) {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(&root.path().join("objects")).unwrap());
+        let (signer, _writer, parts, _slow, mut fetcher) =
+            partials_fixture_ages(root.path(), &store, &[0, 1, 2, 100], true).await;
+        let hung = part_object(&fetcher, &parts[hung_index].0, &parts[hung_index].1, file);
+        let source = Arc::new(HungSource {
+            inner: StoreObjectSource::local("lab", store.clone(), root.path().join("objects")),
+            uri: hung.source_uri.clone(),
+            hang: std::sync::atomic::AtomicBool::new(true),
+            gets: Default::default(),
+        });
+        let cache_root = root.path().join("stall-cache");
+        let cache = ReaderObjectCache::open(ReaderObjectCacheSettings {
+            root: cache_root.clone(), max_bytes: 64 << 20, query_max_bytes: 1 << 20,
+            fetch_concurrency: 8, fetch_deadline: Duration::from_secs(2),
+        }, TENANT, "lab", &parts_key_prefix(TENANT).unwrap(), source.clone()).unwrap();
+        let mut settings = fetcher.hot_settings.take().unwrap();
+        settings.root = cache_root;
+        settings.schedule.warm_hours = warm_hours;
+        settings.schedule.warmup_concurrency = 4;
+        fetcher = PartFetcher::new(TENANT, "lab", store.clone(), signer.trusted(), cache)
+            .unwrap().with_hot_window(Some(settings));
+        let expected_bytes: u64 = parts[..3].iter().map(|(_, record)| resident_bytes(record)).sum();
+        let plan_bytes: u64 = plan_files(&parts[3].1).iter().map(|(_, _, bytes)| bytes).sum();
+        let object_count: usize = parts[..3].iter().map(|(_, record)| resident_files(record).len()).sum::<usize>()
+            + plan_files(&parts[3].1).len();
+        let view = PartLogView::open(store.as_ref(), TENANT, signer.trusted()).await.unwrap();
+        // Only the native statement driver is fake. The production engine,
+        // discovery, hydration entry point and before-warm hook all run.
+        let (executor, _lanes) = crate::executor::NativeExecutor::test_lanes(1, Duration::from_millis(1));
+        let engine = PartQueryEngine::new(super::super::engine::EngineSettings {
+            tenant_id: TENANT.into(), bucket: "lab".into(), compiler: "unused-compiler".into(),
+            max_query_bytes: 64 << 20, max_memory_bytes: 64 << 20,
+            max_execution_seconds: 1, threads: 1,
+        }, store.clone(), view, fetcher, executor).unwrap();
+        let fetcher = engine.fetcher();
+        assert!(engine.try_admit_idle().is_none(), "startup hydration takes priority over idle rebuilds");
+        assert!(!engine.evidence_idle());
+        let inflight = AtomicU64::new(1); // Internal queries do not back off a cold window.
+        let pass = engine.hydrate_hot_window(&inflight);
+        let observe = async {
+            // Poll for all the other completions, strictly before the hung
+            // object's three-second budget. This fails with ordered buffering.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let coverage = fetcher.hot_coverage.lock().unwrap().clone();
+                    if coverage.local_bytes == expected_bytes - hung.size_bytes
+                        && coverage.planning_local_bytes == plan_bytes {
+                        assert_eq!(coverage.local_parts, hung_index, "only the contiguous prefix counts");
+                        let expected_hours = (pass_now_us() - parts[hung_index - 1].0.min_time_us) as f64 / 3_600_000_000.0;
+                        assert_eq!(coverage.effective_hours, expected_hours);
+                        assert_eq!(coverage.cache_miss_objects as usize, object_count - 1);
+                        assert_eq!(coverage.hydrate_bytes, expected_bytes - hung.size_bytes + plan_bytes);
+                        assert!(!coverage.warm_resident);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("all siblings hydrate while the middle GET is still hung");
+        };
+        let (result, ()) = tokio::join!(pass, observe);
+        result.unwrap();
+        let coverage = fetcher.hot_coverage.lock().unwrap().clone();
+        assert_eq!(coverage.deferred_objects, 1);
+        assert_eq!(coverage.cache_miss_objects as usize, object_count);
+        assert_eq!(coverage.local_bytes, expected_bytes - hung.size_bytes);
+        assert_eq!(coverage.planning_local_bytes, plan_bytes);
+        assert_eq!(fetcher.hot_window_gate(), Some(crate::local_hot_window::WarmGate::Hydrating));
+
+        // Let the detached cache transfer finish its own deadline; the next
+        // pass retries only the deferred object, never the successful GETs.
+        let wait_for_transfer = || async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while fetcher.cache().in_flight_bytes() > 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("the detached transfer releases its reservation on timeout");
+        };
+        wait_for_transfer().await;
+        engine.hydrate_hot_window(&inflight).await.unwrap();
+        assert_eq!(fetcher.hot_coverage.lock().unwrap().deferred_objects, 1);
+        let gets = source.gets.lock().unwrap().clone();
+        assert_eq!(gets.len(), object_count);
+        assert_eq!(gets[&hung.source_uri], 2, "one attempt per pass");
+        assert!(gets.iter().all(|(uri, count)| *count == if uri == &hung.source_uri { 2 } else { 1 }));
+
+        wait_for_transfer().await;
+        source.hang.store(false, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..2 { // Refill, rediscover, then latch through the production hook.
+            engine.hydrate_hot_window(&inflight).await.unwrap();
+        }
+        let coverage = fetcher.hot_coverage.lock().unwrap().clone();
+        assert_eq!(coverage.local_parts, 3);
+        assert_eq!(coverage.local_bytes, expected_bytes);
+        assert_eq!(coverage.planning_local_bytes, plan_bytes);
+        assert!(coverage.warm_resident);
+        assert!(engine.try_admit_idle().is_some(), "idle rebuilds resume once warm");
+        assert!(engine.evidence_idle());
+        assert_eq!(coverage.eta_seconds, 0.0);
+        assert_eq!(source.gets.lock().unwrap()[&hung.source_uri], 3);
+    }
+
+    /// Keep one older transfer alive across the warm latch, then start a
+    /// sibling at the backed-off steady rate. Its original deadline must
+    /// allow that rate change rather than throwing away a healthy GET.
+    struct WarmTransitionSource {
+        inner: StoreObjectSource,
+        token: String,
+        crossing: String,
+        after: String,
+        enabled: std::sync::atomic::AtomicBool,
+        started: tokio::sync::Notify,
+        backed_off: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        gets: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::reader_object_cache::ReaderObjectSource for WarmTransitionSource {
+        async fn stream_object(
+            &self,
+            object: &crate::reader_object_cache::ReaderObjectRef,
+            sink: &mut (dyn for<'b> FnMut(&'b [u8]) -> anyhow::Result<()> + Send),
+        ) -> anyhow::Result<()> {
+            *self.gets.lock().unwrap().entry(object.source_uri.clone()).or_default() += 1;
+            if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                return self.inner.stream_object(object, sink).await;
+            }
+            if object.source_uri == self.token {
+                self.started.notified().await;
+            }
+            if object.source_uri == self.after {
+                self.backed_off.notify_one();
+            }
+            if object.source_uri != self.crossing {
+                return self.inner.stream_object(object, sink).await;
+            }
+            self.started.notify_one();
+            self.release.notified().await;
+            let mut body = Vec::new();
+            self.inner.stream_object(object, &mut |chunk: &[u8]| {
+                body.extend_from_slice(chunk);
+                Ok(())
+            }).await?;
+            for chunk in body.chunks(1024) {
+                crate::reader_object_cache::pace_background(chunk.len()).await;
+                sink(chunk)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn healthy_object_crossing_warm_latch_keeps_one_get_at_the_slower_rate() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(&root.path().join("objects")).unwrap());
+        let (signer, _writer, parts, _slow, mut fetcher) =
+            partials_fixture_ages(root.path(), &store, &[0, 2, 4], true).await;
+        let token = part_object(&fetcher, &parts[0].0, &parts[0].1, PartFile::Tokens(0));
+        let crossing = part_object(&fetcher, &parts[1].0, &parts[1].1, PartFile::Data(0));
+        let after = part_object(&fetcher, &parts[2].0, &parts[2].1, PartFile::Data(0));
+        let source = Arc::new(WarmTransitionSource {
+            inner: StoreObjectSource::local("lab", store.clone(), root.path().join("objects")),
+            token: token.source_uri.clone(), crossing: crossing.source_uri.clone(),
+            after: after.source_uri.clone(), enabled: Default::default(),
+            started: Default::default(), backed_off: Default::default(), release: Default::default(),
+            gets: Default::default(),
+        });
+        let mut settings = fetcher.hot_settings.take().unwrap();
+        settings.root = root.path().join("transition-cache");
+        settings.bytes_per_second = 32 * 1024;
+        settings.schedule.concurrency = 2;
+        settings.schedule.warmup_concurrency = 2;
+        settings.schedule.query_backoff = 4;
+        let cache = ReaderObjectCache::open(ReaderObjectCacheSettings {
+            root: settings.root.clone(), max_bytes: 64 << 20, query_max_bytes: 1 << 20,
+            fetch_concurrency: 8, fetch_deadline: Duration::from_millis(500),
+        }, TENANT, "lab", &parts_key_prefix(TENANT).unwrap(), source.clone()).unwrap();
+        fetcher = PartFetcher::new(TENANT, "lab", store.clone(), signer.trusted(), cache)
+            .unwrap().with_hot_window(Some(settings));
+        let view = PartLogView::open(store.as_ref(), TENANT, signer.trusted()).await.unwrap();
+        let (executor, _lanes) = crate::executor::NativeExecutor::test_lanes(1, Duration::from_millis(1));
+        let engine = PartQueryEngine::new(super::super::engine::EngineSettings {
+            tenant_id: TENANT.into(), bucket: "lab".into(), compiler: "unused-compiler".into(),
+            max_query_bytes: 64 << 20, max_memory_bytes: 64 << 20,
+            max_execution_seconds: 1, threads: 1,
+        }, store, view, fetcher, executor).unwrap();
+        let inflight = AtomicU64::new(1);
+        engine.hydrate_hot_window(&inflight).await.unwrap();
+        assert!(engine.fetcher().take_hot_rerun(), "first pass requests rediscovery");
+        assert_eq!(engine.fetcher().hot_window_gate(), Some(crate::local_hot_window::WarmGate::Hydrating));
+        // Settle the first pass's detached siblings before arranging the
+        // second pass: only these three objects need GETs at rediscovery.
+        let fetcher = engine.fetcher();
+        let all = parts.iter().flat_map(|(part, record)| resident_files(record).into_iter()
+            .map(move |(file, _, _)| part_object(fetcher, part, record, file))).collect::<Vec<_>>();
+        drop(engine.fetcher().cache().ensure_local(&all).await.unwrap());
+        assert!(engine.fetcher().cache().evict_unleased(vec![token.sha256, crossing.sha256.clone(), after.sha256])
+            .await.unwrap().is_empty());
+        source.gets.lock().unwrap().clear();
+        source.enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+        let observe = async {
+            source.backed_off.notified().await;
+            assert_eq!(engine.fetcher().hot_window_gate(), Some(crate::local_hot_window::WarmGate::Resident));
+            assert!(engine.try_admit_idle().is_some(), "maintenance resumes while older hydration is still running");
+            source.release.notify_one();
+        };
+        tokio::time::timeout(Duration::from_secs(12), async {
+            let (result, ()) = tokio::join!(engine.hydrate_hot_window(&inflight), observe);
+            result.unwrap();
+        }).await.expect("healthy transfer completes at the steady backed-off rate");
+        let coverage = engine.fetcher().hot_coverage.lock().unwrap().clone();
+        assert_eq!(coverage.deferred_objects, 0, "a warm transition is not a stalled object");
+        assert_eq!(coverage.local_parts, 3);
+        assert_eq!(source.gets.lock().unwrap()[&crossing.source_uri], 1);
+        assert!(engine.fetcher().cache().is_local(&crossing).await.unwrap());
+    }
+
+    /// A query/maintenance transfer can hold the only cache slot longer
+    /// than a hydration pass. Deferral must leave queued single-flights
+    /// shared across passes rather than spawning replacement GETs.
+    #[tokio::test]
+    async fn hydration_defers_shared_slot_waits_without_multiplying_gets() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(&root.path().join("objects")).unwrap());
+        let (signer, _writer, parts, _slow, mut fetcher) =
+            partials_fixture_ages(root.path(), &store, &[0, 1], true).await;
+        let hung = part_object(&fetcher, &parts[0].0, &parts[0].1, PartFile::Data(0));
+        let source = Arc::new(HungSource {
+            inner: StoreObjectSource::local("lab", store.clone(), root.path().join("objects")),
+            uri: hung.source_uri.clone(),
+            hang: std::sync::atomic::AtomicBool::new(true),
+            gets: Default::default(),
+        });
+        let cache_root = root.path().join("queued-cache");
+        let cache = ReaderObjectCache::open(ReaderObjectCacheSettings {
+            root: cache_root.clone(), max_bytes: 64 << 20, query_max_bytes: 1 << 20,
+            fetch_concurrency: 1, fetch_deadline: Duration::from_millis(10),
+        }, TENANT, "lab", &parts_key_prefix(TENANT).unwrap(), source.clone()).unwrap();
+        let mut settings = fetcher.hot_settings.take().unwrap();
+        settings.root = cache_root;
+        settings.schedule.warmup_concurrency = 8;
+        let blocked_cache = cache.clone();
+        let blocker = tokio::spawn(async move {
+            // Long-lived transfer, sized at its own maintenance share. The
+            // production pass must not inherit this transfer's long wait.
+            crate::reader_object_cache::background_hydrate_shared(
+                crate::reader_object_cache::HydrateBucket::new(0), 1,
+                blocked_cache.ensure_local(&[hung]),
+            ).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while source.gets.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        fetcher = PartFetcher::new(TENANT, "lab", store.clone(), signer.trusted(), cache)
+            .unwrap().with_hot_window(Some(settings));
+        let view = PartLogView::open(store.as_ref(), TENANT, signer.trusted()).await.unwrap();
+        let (executor, _lanes) = crate::executor::NativeExecutor::test_lanes(1, Duration::from_millis(1));
+        let engine = PartQueryEngine::new(super::super::engine::EngineSettings {
+            tenant_id: TENANT.into(), bucket: "lab".into(), compiler: "unused-compiler".into(),
+            max_query_bytes: 64 << 20, max_memory_bytes: 64 << 20,
+            max_execution_seconds: 1, threads: 1,
+        }, store, view, fetcher, executor).unwrap();
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(3), engine.hydrate_hot_window(&AtomicU64::new(0)))
+                .await.expect("the pass defers queued objects").unwrap();
+            let coverage = engine.fetcher().hot_coverage.lock().unwrap().clone();
+            assert_eq!(coverage.deferred_objects, 8);
+            assert_eq!(coverage.local_bytes, 0);
+            assert_eq!(coverage.local_parts, 0);
+            assert!(!coverage.warm_resident);
+            let gets = source.gets.lock().unwrap();
+            assert_eq!(gets.len(), 1);
+            assert_eq!(gets.values().sum::<usize>(), 1, "next pass joins queued transfers");
+        }
+        blocker.abort(); // The test runtime also cancels the cache's detached transfer.
+    }
+
+    #[tokio::test]
+    async fn idle_rebuilds_remain_available_without_an_active_readiness_gate() {
+        for mode in ["off", "timed-out", "disabled", "no-window"] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Arc::new(LocalObjectStore::new(&root.path().join("objects")).unwrap());
+            let (signer, _writer, _parts, _slow, mut fetcher) =
+                partials_fixture_ages(root.path(), &store, &[0], true).await;
+            let settings = fetcher.hot_settings.as_mut().unwrap();
+            match mode {
+                "off" => settings.schedule.warm_gate = false,
+                "timed-out" => settings.schedule.warm_timeout = Duration::ZERO,
+                "disabled" => settings.schedule.warm_hours = 0,
+                _ => fetcher.hot_settings = None,
+            }
+            let view = PartLogView::open(store.as_ref(), TENANT, signer.trusted()).await.unwrap();
+            let (executor, _lanes) = crate::executor::NativeExecutor::test_lanes(1, Duration::from_millis(1));
+            let engine = PartQueryEngine::new(super::super::engine::EngineSettings {
+                tenant_id: TENANT.into(), bucket: "lab".into(), compiler: "unused-compiler".into(),
+                max_query_bytes: 64 << 20, max_memory_bytes: 64 << 20,
+                max_execution_seconds: 1, threads: 1,
+            }, store, view, fetcher, executor).unwrap();
+            assert!(engine.try_admit_idle().is_some(), "{mode}");
+            assert!(engine.evidence_idle(), "{mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn background_deadline_keeps_cross_tenant_objects_out_of_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(&root.path().join("objects")).unwrap());
+        let (_signer, _writer, parts, source, fetcher) =
+            partials_fixture_ages(root.path(), &store, &[0], true).await;
+        let mut foreign = part_object(&fetcher, &parts[0].0, &parts[0].1, PartFile::Data(0));
+        foreign.source_uri = foreign.source_uri.replace(TENANT, "00000000-0000-0000-0000-000000000002");
+        let deadline = fetcher.cache().hydration_deadline(foreign.size_bytes, 1 << 20);
+        let error = tokio::time::timeout(deadline, crate::reader_object_cache::background_hydrate_shared(
+            crate::reader_object_cache::HydrateBucket::new(1 << 20), 1 << 20,
+            fetcher.hydrate_object(&foreign),
+        )).await.unwrap().unwrap_err();
+        assert!(matches!(error.downcast_ref::<crate::reader_object_cache::ReaderCacheError>(),
+            Some(crate::reader_object_cache::ReaderCacheError::OutsideTenant(_))));
+        assert!(source.order.lock().unwrap().is_empty(), "foreign objects never issue a GET");
+        assert_eq!(fetcher.cache().stats().stored_bytes, 0);
+        assert!(!fetcher.hot_coverage.lock().unwrap().warm_resident);
     }
 
     /// A full data window must leave room for the older planning partials.

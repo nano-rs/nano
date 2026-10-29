@@ -1,0 +1,121 @@
+{
+  "minimum_host_gib": 8,
+  "measurement": {
+    "date": "2026-10-29",
+    "release": "v1.0.15",
+    "cpus": 4,
+    "hec_events": 12000,
+    "hec_seconds": 60.59062889602501,
+    "tenzir_events": 10600,
+    "peak_metric": "maximum cgroup v2 memory.peak across the full uncapped lab capture; includes charged file cache",
+    "rss_metric": "sum of process VmRSS; shared pages may be counted more than once",
+    "lab_log_sha256": "fdefc90dae90b72e806a55ebca3bc14b9b9ec7f69273fe1a5c63527b96d317ed",
+    "uncapped_start_utc": "2026-10-29T18:13:10.765457+00:00",
+    "uncapped_end_utc": "2026-10-29T18:32:00.569846+00:00"
+  },
+  "cell_mib": {
+    "query": 512,
+    "ingest": 205,
+    "detect": 256,
+    "product": 512,
+    "maintenance": 512,
+    "supervisor": 64
+  },
+  "services": {
+    "connector-runner": {
+      "guard_mib": 704,
+      "peak_bytes": 5840896,
+      "idle_rss_bytes": 12779520
+    },
+    "dragonfly": {
+      "guard_mib": 427,
+      "peak_bytes": 13914112,
+      "idle_rss_bytes": 24686592
+    },
+    "lake-object-store": {
+      "guard_mib": 0,
+      "peak_bytes": 124223488,
+      "idle_rss_bytes": 185110528
+    },
+    "lean-audit": {
+      "guard_mib": 0,
+      "peak_bytes": 4931584,
+      "idle_rss_bytes": 9404416
+    },
+    "lean-audit-vector": {
+      "guard_mib": 0,
+      "peak_bytes": 14249984,
+      "idle_rss_bytes": 67788800
+    },
+    "lean-enrichment": {
+      "guard_mib": 0,
+      "peak_bytes": 4743168,
+      "idle_rss_bytes": 14733312
+    },
+    "lean-job-runner": {
+      "guard_mib": 0,
+      "peak_bytes": 4935680,
+      "idle_rss_bytes": 14917632
+    },
+    "lean-landing": {
+      "guard_mib": 1152,
+      "peak_bytes": 6365184,
+      "idle_rss_bytes": 25927680
+    },
+    "lean-otel": {
+      "guard_mib": 512,
+      "peak_bytes": 64786432,
+      "idle_rss_bytes": 217444352
+    },
+    "lean-platform-feeds": {
+      "guard_mib": 0,
+      "peak_bytes": 55554048,
+      "idle_rss_bytes": 7811072
+    },
+    "lean-result-gc": {
+      "guard_mib": 0,
+      "peak_bytes": 4341760,
+      "idle_rss_bytes": 11964416
+    },
+    "nano-api": {
+      "guard_mib": 0,
+      "peak_bytes": 82608128,
+      "idle_rss_bytes": 129835008
+    },
+    "nano-jobs": {
+      "guard_mib": 1024,
+      "peak_bytes": 107094016,
+      "idle_rss_bytes": 84336640
+    },
+    "nano-search": {
+      "guard_mib": 0,
+      "peak_bytes": 16482304,
+      "idle_rss_bytes": 37568512
+    },
+    "nano-web": {
+      "guard_mib": 0,
+      "peak_bytes": 4583424,
+      "idle_rss_bytes": 9207808
+    },
+    "nginx": {
+      "guard_mib": 0,
+      "peak_bytes": 10711040,
+      "idle_rss_bytes": 22781952
+    },
+    "postgres": {
+      "guard_mib": 0,
+      "peak_bytes": 209960960,
+      "idle_rss_bytes": 572481536
+    },
+    "tenzir": {
+      "guard_mib": 0,
+      "peak_bytes": 160628736,
+      "peak_rss_bytes": 311619584
+    },
+    "vector": {
+      "guard_mib": 0,
+      "peak_bytes": 118988800,
+      "idle_rss_bytes": 166744064
+    }
+  }
+}

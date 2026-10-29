@@ -90,7 +90,7 @@ pub const REFUSED_PREFIX: &str = "landing-ocsf-v1-refused/";
 /// The bronze prefix part ingest lists.
 pub const BRONZE_PREFIX: &str = "bronze-v2/";
 /// Largest landed object read (compressed size on the store).
-pub const MAX_LANDING_BYTES: u64 = 256 * 1024 * 1024;
+pub use nanosiem_lake_cell::landing_budget::MAX_LANDING_BYTES;
 /// Largest decoded NDJSON body.
 pub const MAX_DECODED_BYTES: u64 = 1024 * 1024 * 1024;
 /// Most rows one landed file may carry. Conversion streams and cuts the
@@ -1315,18 +1315,11 @@ impl<L: Ledger, E: Emit> Converter<L, E> {
     }
 }
 
-/// Landing concurrency and aggregate wire bytes follow this role's cgroup.
-/// Keep the measured 2–3.4 GiB envelope (<= 256 MiB in flight), then let
-/// larger roles overlap more streaming converters. One oversized file may
-/// always run alone; the wire-byte budget never changes file admission.
+/// Landing concurrency and aggregate wire bytes share the renderer's memory
+/// model. Every advertised lane fits one maximum-size admitted object plus
+/// its measured conversion overhead; a tighter cgroup reduces both limits.
 pub fn landing_limits(memory: u64, cpu_millis: u32) -> (usize, u64) {
-    let memory_lanes = (memory / (256 * 1024 * 1024)).max(1) as usize;
-    let cpu_lanes = cpu_millis.div_ceil(1000).max(1) as usize;
-    let concurrency = cpu_lanes.min(memory_lanes).max(1);
-    // 1/16 leaves room for decoded rows and each converter's native state.
-    let floor = if memory >= 2 * 1024 * 1024 * 1024 { MAX_LANDING_BYTES } else { 1024 * 1024 };
-    let bytes = (memory / 16).clamp(floor, 2 * 1024 * 1024 * 1024);
-    (concurrency, bytes)
+    nanosiem_lake_cell::landing_budget::limits(memory, cpu_millis)
 }
 
 /// The bucket-drop runner is open-core only. Its quota permits host-wide
@@ -1368,16 +1361,21 @@ impl<D: Discover, E: Emit> Engine<'_, D, E> {
     /// not depend on the order files are handled in. Two candidates with
     /// the same key (an object overwritten between listings) never run at
     /// once; they keep their listed order. At most
-    /// the cgroup-derived wire-byte budget is in flight (a larger file runs
-    /// alone). The file-format admission limits remain unchanged.
+    /// the cgroup-derived wire-byte budget is in flight. The file-format
+    /// admission limits remain unchanged.
     /// A held file (output backpressure) or a fenced lease stops new files
     /// from starting; files already started finish first.
     pub async fn tick(&self) -> Result<TickReport> {
+        let capacity = crate::cgroup_memory::process_capacity();
+        let limits = bucket_drop_limits(capacity.memory_bytes, capacity.cpu_millicores);
+        self.tick_with_limits(limits).await
+    }
+
+    async fn tick_with_limits(&self, (limit, max_bytes): (usize, u64)) -> Result<TickReport> {
+        anyhow::ensure!(limit > 0, "landing memory cannot fit one maximum-size object and conversion overhead");
         let mut report = TickReport::default();
         let (listed, candidates) = self.discover.discover(self.store, self.tenant_id, self.max_files_per_tick).await?;
         report.listed = listed;
-        let capacity = crate::cgroup_memory::process_capacity();
-        let (limit, max_bytes) = bucket_drop_limits(capacity.memory_bytes, capacity.cpu_millicores);
         let mut queue: std::collections::VecDeque<Candidate> = candidates.into();
         let mut running = futures::stream::FuturesUnordered::new();
         let mut keys_running: std::collections::HashSet<String> = std::collections::HashSet::new();

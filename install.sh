@@ -68,6 +68,9 @@
 # created, the next run creates it (keyed on GET /api/setup/status, not on
 # whether .env exists) with the same credentials.
 
+# Disable inherited tracing before reading credentials (also safe for sh).
+{ set +x; } 2>/dev/null
+
 # Keep this guard POSIX-safe: piped scripts ignore the Bash shebang.
 if [ -z "${BASH_VERSION:-}" ]; then
     if [ "$#" -gt 0 ]; then
@@ -379,6 +382,42 @@ memory_capacity_gib() {
         # 15 GiB or the simultaneous interactive + durable lanes can overcommit.
         echo $((bytes / 1073741824))
     fi
+}
+
+# Shared with the compiled cell renderer. Read beside this installer when it
+# is a file; a piped installer fetches the policy from the same source branch.
+# This happens before updating an existing checkout or writing configuration.
+lean_minimum_install_memory_bytes() {
+    local script_path="${BASH_SOURCE[0]:-}" policy="" repo_path vector_profile="${1:-lean}"
+    if [[ -f "$script_path" && -f "$(dirname "$script_path")/config/lean-startup-memory.json" ]]; then
+        policy=$(cat "$(dirname "$script_path")/config/lean-startup-memory.json") || return 1
+    else
+        repo_path="${NANO_REPO_URL#https://github.com/}"
+        repo_path="${repo_path%.git}"
+        [[ "$repo_path" != "$NANO_REPO_URL" && "$repo_path" != *://* ]] || return 1
+        policy=$(curl -fsSL --max-time 30 "https://raw.githubusercontent.com/${repo_path}/${NANO_BRANCH}/config/lean-startup-memory.json") || return 1
+    fi
+    printf '%s' "$policy" | python3 -c '
+import json, sys
+p = json.load(sys.stdin)
+mib = 1 << 20
+assert p["cell_mib"] and p["services"]
+assert all(type(v) is int and v > 0 for v in p["cell_mib"].values())
+compose = 0
+for name, v in p["services"].items():
+    if (sys.argv[1] != "none" and name == "tenzir") or (sys.argv[1] == "none" and name in ("vector", "connector-runner")):
+        continue
+    guard, peak = v["guard_mib"], v["peak_bytes"]
+    assert type(guard) is int and guard >= 0
+    assert type(peak) is int and peak > 0
+    floor = max(guard * mib, (peak * 5 + 3) // 4)
+    compose += ((floor + mib - 1) // mib) * mib
+total = compose + sum(p["cell_mib"].values()) * mib
+gib = 1024 * mib
+supported = p["minimum_host_gib"]
+assert type(supported) is int and supported > 0
+print(max(supported * gib, ((total * 100 + 95 * gib - 1) // (95 * gib)) * gib))
+' "$vector_profile"
 }
 
 # NAN-2252: size the ClickHouse container memory limit from available Docker RAM
@@ -937,8 +976,8 @@ ensure_bind_mounts_readable() {
         [[ -n "$src" && -e "$src" ]] && sources+=("$src")
     done < <(sed -nE 's/^[[:space:]]*-[[:space:]]+\.\/([^:[:space:]]+):.*/\1/p' "$compose" | sort -u)
     (( ${#sources[@]} > 0 )) || return 0
-    git ls-files -z -- "${sources[@]}" | xargs -0 chmod go+rX 2>/dev/null || true
-    find "${sources[@]}" -type d -exec chmod go+rx {} + 2>/dev/null || true
+    git ls-files -z -- ${sources[@]+"${sources[@]}"} | xargs -0 chmod go+rX 2>/dev/null || true
+    find ${sources[@]+"${sources[@]}"} -type d -exec chmod go+rx {} + 2>/dev/null || true
 }
 
 # NAN-4408: a failed `up -d` (one container exited, a dependency wait timed
@@ -1012,7 +1051,7 @@ converge_services() {
     return 0
 }
 
-# Bring the stack up, then wait for the API through nginx.
+# Bring the stack up, wait for the API through nginx, and finish admin setup.
 #
 # On a fresh lake, `up -d` itself can fail: nano-api depends on
 # lake-query-worker being healthy, and the worker only turns healthy once its
@@ -1047,6 +1086,9 @@ start_and_wait_for_api() {
     if ! wait_for_api_health "${API_BASE}/api/health" "$timeout"; then
         fail "API did not become healthy within $((timeout / 60)) min. Check 'docker compose -f $COMPOSE_FILE logs nano-api nano-nginx' (compose up log: ${COMPOSE_UP_LOG:-none}). Re-running this installer is safe and will finish admin setup (raise NANO_HEALTH_TIMEOUT_SECONDS to wait longer)."
     fi
+    # NAN-4845: every successful health path (including retries and resumes)
+    # must finish admin setup before any later service check can fail.
+    bootstrap_admin
     # NAN-4408: a healthy API does not mean every service started (a re-run
     # whose first `up -d` failed partway leaves e.g. connector-runner Created).
     converge_services
@@ -1147,17 +1189,23 @@ wait_for_api_health() {
 }
 
 # GET /api/setup/status → {"initialized":bool,"has_users":bool}. Echoes
-# "initialized" when either is true (POST /api/setup/initialize answers 409 in
-# both cases), "pending" when the admin still has to be created. Retries a few
-# times; an unreachable endpoint is fatal rather than guessed.
+# "initialized" only when initialized:true, otherwise "pending". With $1=1,
+# retry pending states too, to confirm initialization after a POST. An
+# unreachable or unconfirmed endpoint is fatal rather than guessed.
 setup_state() {
-    local body attempt
+    local state attempt require_initialized="${1:-0}"
     for (( attempt = 0; attempt < 10; attempt++ )); do
-        if body=$(curl -fsS --max-time 10 "${API_BASE}/api/setup/status" 2>/dev/null); then
-            if grep -Eq '"(initialized|has_users)"[[:space:]]*:[[:space:]]*true' <<< "$body"; then
+        if state=$(curl --disable -fsS --max-time 10 "${API_BASE}/api/setup/status" 2>/dev/null | python3 -I -c '
+import json, sys
+value = json.load(sys.stdin)["initialized"]
+if type(value) is not bool:
+    sys.exit(1)
+print("initialized" if value else "pending")
+' 2>/dev/null); then
+            if [[ "$state" == initialized ]]; then
                 echo initialized; return 0
             fi
-            if grep -Eq '"initialized"[[:space:]]*:[[:space:]]*false' <<< "$body"; then
+            if [[ "$require_initialized" != 1 && "$state" == pending ]]; then
                 echo pending; return 0
             fi
         fi
@@ -1237,27 +1285,31 @@ bootstrap_admin() {
     body_file=$(mktemp "${TMPDIR:-/tmp}/nano-setup.XXXXXX") \
         || fail "Could not create a temporary file for the setup response."
     # The payload goes on stdin, not argv, so the password is not visible in ps.
-    code=$(curl -sS -o "$body_file" -w '%{http_code}' --max-time 60 -X POST \
+    code=$(curl --disable -sS -o "$body_file" -w '%{http_code}' --max-time 60 -X POST \
         -H "Content-Type: application/json" \
         --data-binary @- \
         "${API_BASE}/api/setup/initialize" <<< "$payload" 2>/dev/null) || code=000
     case "$code" in
         200)
             rm -f "$body_file"
-            ok "Admin user created"
-            ADMIN_CREATED=1
             ;;
         409)
             rm -f "$body_file"
             warn "System was initialized concurrently — skipping admin creation."
             ;;
         *)
-            # The response carries an error code and message, never the password.
-            warn "POST /api/setup/initialize returned HTTP $code: $(head -c 500 "$body_file" 2>/dev/null)"
+            # Do not print the response: a proxy or server may echo credentials.
+            warn "POST /api/setup/initialize returned HTTP $code."
             rm -f "$body_file"
             fail "Admin initialization failed. Fix the cause and re-run this installer; it will retry admin creation. Logs: 'docker compose -f $COMPOSE_FILE logs nano-api'."
             ;;
     esac
+    state=$(setup_state 1) \
+        || fail "Admin initialization could not be confirmed (expected initialized:true from ${API_BASE}/api/setup/status). Re-run this installer to retry admin setup. Logs: 'docker compose -f $COMPOSE_FILE logs nano-api'."
+    if [[ "$code" == 200 ]]; then
+        ADMIN_CREATED=1
+        ok "Admin user created and initialization confirmed"
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -1337,11 +1389,19 @@ fi
 # lean-init re-renders files an existing cell watches even without a restart.
 # A smaller existing install must keep its working release and budgets.
 LEAN_HOST_MEMORY_BYTES=$(memory_capacity_bytes)
-if (( LEAN_HOST_MEMORY_BYTES < 8 * 1073741824 )); then
+LEAN_PREFLIGHT_VECTOR_PROFILE=$(if [[ -d "$NANO_INSTALL_DIR" ]]; then
+    (cd "$NANO_INSTALL_DIR" && resolve_vector_profile)
+else
+    case "${NANO_INGEST_MODE:-}" in tenzir) echo none ;; *) echo lean ;; esac
+fi)
+LEAN_MINIMUM_MEMORY_BYTES=$(lean_minimum_install_memory_bytes "$LEAN_PREFLIGHT_VECTOR_PROFILE") \
+    || fail "Could not read the lean startup memory policy; upgrade stopped before changing this install."
+LEAN_MINIMUM_MEMORY_MIB=$((LEAN_MINIMUM_MEMORY_BYTES / 1048576))
+if (( LEAN_HOST_MEMORY_BYTES < LEAN_MINIMUM_MEMORY_BYTES )); then
     if [[ -f "$NANO_INSTALL_DIR/.env" ]]; then
-        fail "This release needs at least 8 GiB available to Docker (detected ${LEAN_HOST_MEMORY_BYTES} bytes). Upgrade stopped before changing the existing install; its release, configuration and running services are preserved. Resize the host before retrying."
+        fail "This release needs at least ${LEAN_MINIMUM_MEMORY_MIB} MiB available to Docker for the service and cell startup minimums (detected ${LEAN_HOST_MEMORY_BYTES} bytes). Upgrade stopped before changing the existing install; its release, configuration and running services are preserved. Resize the host before retrying."
     fi
-    fail "A fresh lean install needs at least 8 GiB available to Docker (detected ${LEAN_HOST_MEMORY_BYTES} bytes). Increase Docker memory or resize this host before installing."
+    fail "A fresh lean install needs at least ${LEAN_MINIMUM_MEMORY_MIB} MiB available to Docker for the service and cell startup minimums (detected ${LEAN_HOST_MEMORY_BYTES} bytes). Increase Docker memory or resize this host before installing."
 fi
 
 # ----------------------------------------------------------------------------
@@ -1890,6 +1950,11 @@ if [[ "$USE_LEAN" == "1" ]]; then
     done
     upsert_env_file_value COMPOSE_FILE "$host_compose_files:docker-compose.host-resources.yml"
     log "Applied host-sized role and container resources"
+    python3 - .nano-lean/compose.resources.json <<'PYEPS'
+import json, sys
+s = json.load(open(sys.argv[1]))["x-nano-host-sizing"]
+print(f"Host sizing: {s['ingest_agent']} ingest, supported rate {s['supported_eps']} EPS (memory curve), cell plus Compose within 95% of host RAM")
+PYEPS
     log "Probing cell isolation; missing Landlock warns on trusted-local only"
     LEAN_PROBE_LOG=$(mktemp "${TMPDIR:-/tmp}/nano-lean-probe.XXXXXX")
     if ! docker </dev/null compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint nanosiem-lake-cell lake-cell \
@@ -1930,14 +1995,20 @@ if [[ "${USE_LEAN:-0}" != "1" && "${REUSE_ENV:-0}" == "1" && "${ENABLE_LAKE_CONT
 fi
 
 # ----------------------------------------------------------------------------
-# 5. Start services and wait for API health (lake: tolerant of a slow first
-#    boot, see start_and_wait_for_api)
+# 5. Start services, wait for API health, and initialize admin. The lake
+#    tolerates a slow first boot (see start_and_wait_for_api).
 # ----------------------------------------------------------------------------
 if [[ "${TENZIR_DIRECT:-0}" == "1" ]]; then
     # Switching an existing install to Tenzir-direct: Vector and the connector
     # runner are no longer in the stack, so `up -d` would leave their old
     # containers running. Remove them; their volumes stay for --add-vector.
-    docker </dev/null compose "${COMPOSE_ARGS[@]}" --profile '*' rm -sf vector connector-runner >/dev/null 2>&1 || true
+    docker </dev/null compose "${COMPOSE_ARGS[@]}" --profile '*' rm -sf vector connector-runner >/dev/null 2>&1 \
+        || fail "Could not stop Vector and connector-runner; refusing to start a plan that excludes their memory."
+else
+    # The Vector plan excludes the optional local Tenzir node. It may still
+    # be running after an earlier Tenzir-direct install and --add-vector.
+    docker </dev/null compose "${COMPOSE_ARGS[@]}" --profile '*' rm -sf tenzir >/dev/null 2>&1 \
+        || fail "Could not stop Tenzir; refusing to start a plan that excludes its memory."
 fi
 # NAN-4686: a wrapper (scripts/sovereign/single-host.sh) renders material
 # that needs this run's .env and lean tenant (installation facts, product
@@ -1949,11 +2020,6 @@ if [[ -n "${NANO_PRE_START_HOOK:-}" ]]; then
     "$NANO_PRE_START_HOOK" pre-start || fail "Pre-start hook failed. No product services have started."
 fi
 start_and_wait_for_api
-
-# ----------------------------------------------------------------------------
-# 6. Initialize admin user — keyed on the live setup status, not on .env
-# ----------------------------------------------------------------------------
-bootstrap_admin
 
 # ----------------------------------------------------------------------------
 # 6b. NAN-4759: platform feeds (IPinfo Lite geo/ASN, ThreatFox, Tor). An online
@@ -1985,9 +2051,6 @@ printf "  Open:     %s\n" "$BASE_URL"
 [[ -z "$ADMIN_EMAIL" ]] && ADMIN_EMAIL=$(env_file_value INITIAL_ADMIN_EMAIL)
 printf "  Login:    %s\n" "${ADMIN_EMAIL:-(existing user)}"
 printf "  Schema:   %s\n" "$(printf '%s' "${SCHEMA_PROFILE:-ocsf}" | tr '[:lower:]' '[:upper:]')"
-if [[ "$NANO_NONINTERACTIVE" != "1" && "${GENERATED_PASSWORD:-0}" == "1" && "${ADMIN_CREATED:-0}" == "1" ]]; then
-    printf "  Password: %b%s%b  ← autogenerated, save this now (also in %s/.env as INITIAL_ADMIN_PASSWORD)\n" "$c_yellow$c_bold" "$ADMIN_PASSWORD" "$c_reset" "$NANO_INSTALL_DIR"
-fi
 if [[ "${ADMIN_CREATED:-0}" == "1" ]]; then
     printf "  Password saved in %s/.env as INITIAL_ADMIN_PASSWORD.\n" "$NANO_INSTALL_DIR"
 fi

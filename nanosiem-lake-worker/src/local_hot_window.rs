@@ -401,6 +401,9 @@ pub struct Coverage {
     pub configured_hours: u64,
     pub selected_bytes: u64,
     pub local_bytes: u64,
+    /// Older planning partials needed by the warm latch, outside the data window.
+    pub planning_bytes: u64,
+    pub planning_local_bytes: u64,
     pub selected_parts: usize,
     pub local_parts: usize,
     pub effective_hours: f64,
@@ -427,7 +430,8 @@ impl Coverage {
     pub fn update_progress(&mut self, elapsed: f64) {
         self.hydrate_seconds = elapsed;
         self.rate_bytes_per_second = self.hydrate_bytes as f64 / elapsed.max(0.001);
-        self.eta_seconds = (self.selected_bytes.saturating_sub(self.local_bytes)) as f64
+        self.eta_seconds = self.selected_bytes.saturating_sub(self.local_bytes)
+            .saturating_add(self.planning_bytes.saturating_sub(self.planning_local_bytes)) as f64
             / if self.hydrate_bytes > 0 {
                 self.rate_bytes_per_second.max(1.0)
             } else {
@@ -440,6 +444,8 @@ impl Coverage {
             covered_hours = self.effective_hours,
             bytes_resident = self.local_bytes,
             bytes_target = self.selected_bytes,
+            planning_bytes_resident = self.planning_local_bytes,
+            planning_bytes_target = self.planning_bytes,
             parts_resident = self.local_parts,
             parts_target = self.selected_parts,
             rate = self.rate_bytes_per_second,

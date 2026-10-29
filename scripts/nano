@@ -26,7 +26,7 @@ import_path=/run/nano-feed-import/bundle
 
 die() { printf 'nano: %s\n' "$*" >&2; exit 1; }
 cleanup=()
-trap 'rm -rf -- "${cleanup[@]}"' EXIT
+trap 'rm -rf -- ${cleanup[@]+"${cleanup[@]}"}' EXIT
 log() { printf '==> %s\n' "$*" >&2; }
 
 usage() {
@@ -90,7 +90,7 @@ PYHEADER
     metadata=${out}.json
     curl --disable --fail --silent --show-error --proto '=https' --tlsv1.2 \
         --max-filesize 131072 --connect-timeout 20 --max-time 60 \
-        "${auth[@]}" --output "$metadata" "$url" || die "descriptor fetch failed; retry, or use --file"
+        ${auth[@]+"${auth[@]}"} --output "$metadata" "$url" || die "descriptor fetch failed; retry, or use --file"
     # Public signed metadata; the verifier runs as UID 999 with no network.
     chmod 755 "$(dirname -- "$out")"
     chmod 444 "$metadata"

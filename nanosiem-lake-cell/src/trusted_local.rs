@@ -90,7 +90,7 @@ pub struct InitArgs {
     pub chdb_library: PathBuf,
     pub chdb_sha256: Option<String>,
     pub compiler: PathBuf,
-    /// Memory for the cell's tenant processes; default half the host.
+    /// Memory for the cell's tenant processes; default the host's cell pool.
     pub memory_bytes: Option<u64>,
     /// CPUs for the cell's tenant processes; default every online host CPU.
     pub cpus: Option<u32>,
@@ -282,6 +282,8 @@ pub struct Sizing {
 #[serde(deny_unknown_fields)]
 pub struct LocalResources {
     pub product: RoleBudget,
+    /// Valid native-role template, inactive in generated open-core plans.
+    /// Compose's lean-landing owns the funded landing memory instead.
     pub landing: RoleBudget,
     pub maintenance: RoleBudget,
 }
@@ -335,6 +337,91 @@ fn round_mib(bytes: u64) -> u64 {
     bytes / MIB * MIB
 }
 
+#[derive(Deserialize)]
+struct StartupFloor {
+    guard_mib: u64,
+    peak_bytes: u64,
+}
+
+impl StartupFloor {
+    fn bytes(&self) -> u64 {
+        // Round UP: a measured startup peak gets 25% headroom, and must
+        // never weaken a guard or an existing native-service floor.
+        (self.guard_mib * MIB).max((self.peak_bytes * 5).div_ceil(4)).div_ceil(MIB) * MIB
+    }
+}
+
+#[derive(Deserialize)]
+struct StartupMemory {
+    minimum_host_gib: u64,
+    cell_mib: std::collections::BTreeMap<String, u64>,
+    services: std::collections::BTreeMap<String, StartupFloor>,
+}
+
+fn startup_memory() -> &'static StartupMemory {
+    static POLICY: std::sync::OnceLock<StartupMemory> = std::sync::OnceLock::new();
+    POLICY.get_or_init(|| serde_json::from_str(include_str!("../../config/lean-startup-memory.json"))
+        .expect("compiled lean startup memory policy"))
+}
+
+pub fn minimum_install_memory_bytes() -> u64 {
+    minimum_install_memory_for_ingest(true)
+}
+
+fn selected_service(name: &str, vector: bool) -> bool {
+    if vector { name != "tenzir" } else { name != "vector" && name != "connector-runner" }
+}
+
+fn compose_startup_minimum(vector: bool) -> u64 {
+    startup_memory().services.iter().filter(|(name, _)| selected_service(name, vector))
+        .map(|(name, floor)| service_startup_minimum(name, floor)).sum()
+}
+
+fn service_startup_minimum(name: &str, floor: &StartupFloor) -> u64 {
+    if name == "lean-landing" {
+        floor.bytes().max(crate::landing_budget::memory_for_lanes(1))
+    } else {
+        floor.bytes()
+    }
+}
+
+fn small_cell_memory_for_eps(eps: u32) -> u64 {
+    let policy = startup_memory();
+    let budget = TenantBudget::from_eps(eps as f64);
+    let fixed = policy.cell_mib.iter().filter(|(name, _)| name.as_str() != "query" && name.as_str() != "ingest")
+        .map(|(_, mib)| mib * MIB).sum::<u64>();
+    fixed + budget.ingest_memory_cap_bytes
+        + budget.query_memory_cap_bytes.max(policy.cell_mib["query"] * MIB)
+}
+
+fn minimum_install_memory_for_ingest(vector: bool) -> u64 {
+    let minimum = compose_startup_minimum(vector) + small_cell_memory_for_eps(20);
+    // Keep the supported host minimum while deriving any higher threshold
+    // needed to pay startup floors and the hobby curve, including the OS.
+    ((minimum * 100).div_ceil(95).div_ceil(GIB) * GIB)
+        .max(startup_memory().minimum_host_gib * GIB)
+}
+
+fn small_cell_supported_eps(memory: u64) -> u32 {
+    (20..=MAX_TARGET_EPS).take_while(|eps| small_cell_memory_for_eps(*eps) <= memory).last().unwrap_or(0)
+}
+
+/// Startup minima are paid first. Compose shares surplus by weight, and the
+/// cell receives the remainder of the 95% envelope. Unsupported hosts still
+/// render diagnostic output; install.sh refuses them before any mutation.
+pub fn host_cell_memory_bytes(host_memory: u64) -> u64 {
+    host_cell_memory_for_ingest(host_memory, true)
+}
+
+fn host_cell_memory_for_ingest(host_memory: u64, vector: bool) -> u64 {
+    let minimum = compose_startup_minimum(vector);
+    round_mib(host_memory_share(host_memory, 95).saturating_sub(host_memory_share(host_memory, 45).max(minimum)))
+}
+
+fn host_memory_share(memory: u64, percent: u64) -> u64 {
+    memory / 100 * percent + memory % 100 * percent / 100
+}
+
 pub fn size(memory_bytes: u64, cpus: u32) -> Sizing {
     size_for(memory_bytes, cpus, None)
 }
@@ -353,10 +440,14 @@ pub fn size_for(memory_bytes: u64, cpus: u32, target_eps: Option<u32>) -> Sizing
     let cpus = cpus.max(1);
     // Keep native overhead inside the cell before sharing the remainder.
     // QueryMemoryBudget reserves 384 MiB outside a >=128 MiB engine;
-    // landing needs room for two 256 MiB wire buffers plus streaming state;
+    // Open core runs landing separately in Compose, so the disabled native
+    // landing role's budget template does not reserve any of the cell pool.
     // maintenance retains its measured 512 MiB ceiling. Below the supported
     // full-install shape, render proportional diagnostic budgets only.
-    let (product_mem, landing_mem, maintenance_mem, supervisor_mem) = if memory_bytes >= 4 * GIB {
+    let cell_floor = &startup_memory().cell_mib;
+    let full_install = memory_bytes >= small_cell_memory_for_eps(20);
+    let small_eps = if memory_bytes < 4 * GIB { small_cell_supported_eps(memory_bytes) } else { 0 };
+    let (product_mem, landing_mem, maintenance_mem, supervisor_mem) = if full_install {
         (round_mib(memory_bytes / 25).max(512 * MIB),
          round_mib(memory_bytes / 25).max(GIB),
          round_mib(memory_bytes / 100).max(512 * MIB),
@@ -365,12 +456,27 @@ pub fn size_for(memory_bytes: u64, cpus: u32, target_eps: Option<u32>) -> Sizing
         (round_mib(memory_bytes / 25), round_mib(memory_bytes / 25),
          round_mib(memory_bytes / 100), round_mib(memory_bytes / 100))
     };
-    let core = memory_bytes.saturating_sub(product_mem + landing_mem + maintenance_mem + supervisor_mem);
-    let base_query = round_mib(core / 9 * 5);
-    let base_ingest = round_mib(core / 18 * 5);
+    let core = memory_bytes.saturating_sub(product_mem + maintenance_mem + supervisor_mem);
+    let mut base_query = round_mib(core / 9 * 5);
+    let mut base_ingest = round_mib(core / 18 * 5);
+    let mut detect_mem = round_mib(core.saturating_sub(base_query + base_ingest));
+    if small_eps > 0 {
+        // The existing hobby/small-tenant curve budgets a bounded low-rate
+        // ingest worker, rather than reserving the larger-host role split.
+        // Query still keeps its native runtime headroom and two 64 MiB slots.
+        let budget = TenantBudget::from_eps(small_eps as f64);
+        base_ingest = budget.ingest_memory_cap_bytes;
+        base_query = budget.query_memory_cap_bytes.max(cell_floor["query"] * MIB);
+        detect_mem = cell_floor["detect"] * MIB;
+    } else if full_install {
+        // Below the old 4 GiB cell split, preserve the actual role floors
+        // instead of dropping the auxiliary roles into diagnostic sizing.
+        base_ingest = base_ingest.max(512 * MIB);
+        detect_mem = detect_mem.max(cell_floor["detect"] * MIB);
+        base_query = round_mib(core.saturating_sub(base_ingest + detect_mem));
+    }
     let (ingest_mem, query_mem) = ingest_query_for_eps(base_ingest, base_query,
         target_eps.unwrap_or(crate::budget::PARALLEL_FLUSH_EPS as u32), round_mib(memory_bytes / 2));
-    let detect_mem = round_mib(core.saturating_sub(base_query + base_ingest));
     let milli = cpus.saturating_mul(1000);
     let cpu_request = |role| cpu_share_millicores(milli, role_cpu_shares(role));
     use crate::contract::Role;
@@ -383,7 +489,7 @@ pub fn size_for(memory_bytes: u64, cpus: u32, target_eps: Option<u32>) -> Sizing
         .step_by(10)
         .find(|eps| TenantBudget::from_eps(*eps as f64).ingest_memory_cap_bytes >= ingest_mem)
         .unwrap_or(MAX_TARGET_EPS);
-    let eps = covering.max(target_eps.unwrap_or(0));
+    let eps = if small_eps > 0 { small_eps } else { covering.max(target_eps.unwrap_or(0)) };
     let req = |mem: u64| round_mib(mem / 4).max(MIB).min(mem);
     let auxiliary = |mem: u64, role| {
         RoleBudget { request_millicores: cpu_request(role), limit_millicores: milli,
@@ -404,12 +510,16 @@ pub fn size_for(memory_bytes: u64, cpus: u32, target_eps: Option<u32>) -> Sizing
     }
 }
 
-/// Compose's running services share 45% of host RAM, beside the cell's
-/// half-host allocation and 5% OS reserve. Weights express relative demand;
-/// they are not additional fixed-memory floors on small machines. CPU quotas
+/// Compose's running services share at least 45% of host RAM, with startup
+/// minima reserved before surplus is divided by weight. The cell takes the
+/// remainder of the 95% host envelope. CPU quotas
 /// permit each service to burst across the host, as the role quotas do.
 /// JSON is valid YAML and avoids introducing operator environment knobs.
 pub fn compose_resources(sizing: &Sizing, host: HostFacts, sovereign: bool) -> Value {
+    compose_resources_for_ingest(sizing, host, sovereign, true)
+}
+
+fn compose_resources_for_ingest(sizing: &Sizing, host: HostFacts, sovereign: bool, vector_ingest: bool) -> Value {
     let weights = [
         ("postgres", 8), ("lake-object-store", 16), ("dragonfly", 5),
         ("nano-api", 10), ("nano-search", 8), ("nano-jobs", 12),
@@ -419,24 +529,26 @@ pub fn compose_resources(sizing: &Sizing, host: HostFacts, sovereign: bool) -> V
         ("lean-result-gc", 1), ("lean-audit", 1), ("lean-platform-feeds", 1),
         ("lean-audit-vector", 4),
     ];
-    let total: u64 = weights.iter().map(|(_, w)| w).sum();
-    let pool = host.memory_bytes / 100 * 45;
-    // A clean jobs startup OOMed at 512 MiB (NAN-3492). Preserve its 1 GiB
-    // floor by taking the difference from the other services' pool, never
-    // by increasing the total host envelope. Tiny-host output is diagnostic:
-    // install.sh refuses it before starting the stack.
-    let jobs = if host.memory_bytes >= 8 * GIB { (pool / total * 12).max(GIB) } else { pool / total * 12 };
-    let landing = if host.memory_bytes >= 8 * GIB { (pool / total * 8).max(GIB) } else { pool / total * 8 };
-    let otel = if host.memory_bytes >= 8 * GIB { (pool / total * 4).max(512 * MIB) } else { pool / total * 4 };
+    let total: u64 = weights.iter().filter(|(name, _)| selected_service(name, vector_ingest) && *name != "lean-landing").map(|(_, w)| w).sum();
+    let policy = startup_memory();
+    let compose_minimum = compose_startup_minimum(vector_ingest);
+    let pool = host_memory_share(host.memory_bytes, 45).max(compose_minimum);
+    // Replace the single-lane minimum with whole fitted lanes, after paying
+    // every sibling's startup floor. Landing gets at most one third of the
+    // pool; unused lane demand returns to the other services by weight.
+    let landing_floor = service_startup_minimum("lean-landing", &policy.services["lean-landing"]);
+    let landing_budget = (pool / 3).max(landing_floor)
+        .min(pool - (compose_minimum - landing_floor));
+    let (lanes, _) = crate::landing_budget::limits(landing_budget, host.cpus.saturating_mul(1000));
+    let landing = crate::landing_budget::memory_for_lanes(lanes);
+    let surplus = pool - (compose_minimum - landing_floor) - landing;
     let mut services = serde_json::Map::new();
     for (name, weight) in weights {
+        if !selected_service(name, vector_ingest) { continue; }
         let cpu_shares = COMPOSE_CPU_SHARES.iter().find(|(service, _)| *service == name).unwrap().1;
-        let memory = round_mib(match name {
-            "nano-jobs" => jobs,
-            "lean-landing" => landing,
-            "lean-otel" => otel,
-            _ => (pool - jobs - landing - otel) / (total - 24) * weight,
-        }).max(MIB);
+        let memory = if name == "lean-landing" { landing } else {
+            service_startup_minimum(name, &policy.services[name]) + round_mib(surplus / total * weight)
+        };
         services.insert(name.into(), json!({
             "mem_limit": memory, "memswap_limit": memory,
             "cpus": host.cpus, "cpu_shares": cpu_shares,
@@ -461,21 +573,40 @@ pub fn compose_resources(sizing: &Sizing, host: HostFacts, sovereign: bool) -> V
     }
     services["postgres"]["command"] = json!(pg);
     let dragonfly = services["dragonfly"]["mem_limit"].as_u64().unwrap();
+    let dragonfly_maxmemory_mib = (dragonfly / 100 * 60 / MIB).max(1);
+    let dragonfly_threads = u64::from((host.cpus / 4).clamp(1, 32))
+        .min(dragonfly_maxmemory_mib / 256).max(1);
     services["dragonfly"]["command"] = json!([
-        format!("--maxmemory={}mb", (dragonfly / 100 * 60 / MIB).max(1)),
-        format!("--proactor_threads={}", (host.cpus / 4).clamp(1, 32)),
+        format!("--maxmemory={dragonfly_maxmemory_mib}mb"),
+        format!("--proactor_threads={dragonfly_threads}"),
         "--cache_mode=false".to_owned(), "--dir=/data".to_owned(), "--dbfilename=nano-dragonfly".to_owned(),
         "--snapshot_cron=${NANO_DRAGONFLY_SNAPSHOT_CRON:-* * * * *}".to_owned(),
     ]);
-    let vector = services["vector"]["mem_limit"].as_u64().unwrap();
-    services["vector"]["environment"] = json!({
-        // The queue and its active batch together use <= 1/8 of the container.
-        "VECTOR_LAKE_BUFFER_MAX_BYTES": (vector / 16).to_string(),
-        "VECTOR_LAKE_BATCH_MAX_BYTES": (vector / 16).to_string(),
-    });
+    if vector_ingest {
+        let runner_memory = services["connector-runner"]["mem_limit"].as_u64().unwrap();
+        // Match the runner's check_vrl_memory: 256 MiB address space plus
+        // 3 x 64 MiB call I/O per worker, and a 256 MiB daemon reserve.
+        // Emit both existing settings so the worker cap and its sizing stay paired.
+        let runner_workers = (runner_memory.saturating_sub(256 * MIB) / (448 * MIB)).clamp(1, 4);
+        services["connector-runner"]["environment"] = json!({
+            "CONNECTOR_VRL_MAX_WORKERS": runner_workers.to_string(),
+            "CONNECTOR_VRL_WORKER_AS_BYTES": (256 * MIB).to_string(),
+        });
+        let vector = services["vector"]["mem_limit"].as_u64().unwrap();
+        services["vector"]["environment"] = json!({
+            // The queue and its active batch together use <= 1/8 of the container.
+            "VECTOR_LAKE_BUFFER_MAX_BYTES": (vector / 16).to_string(),
+            "VECTOR_LAKE_BATCH_MAX_BYTES": (vector / 16).to_string(),
+        });
+    }
     json!({"services": services, "x-nano-host-sizing": {
         "memory_bytes": host.memory_bytes, "cpus": host.cpus,
-        "minimum_install_memory_bytes": 8 * GIB,
+        "minimum_install_memory_bytes": minimum_install_memory_for_ingest(vector_ingest),
+        "compose_minimum_memory_bytes": compose_minimum,
+        "cell_minimum_memory_bytes": small_cell_memory_for_eps(20),
+        "supported": host.memory_bytes >= minimum_install_memory_for_ingest(vector_ingest),
+        "ingest_agent": if vector_ingest { "vector" } else { "tenzir" },
+        "supported_eps": sizing.eps,
     }})
 }
 
@@ -666,9 +797,22 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
         (Some(_), Some(_)) => None,
         _ => Some(detect_host(&args.host_root)?),
     };
-    let memory = args.memory_bytes.unwrap_or_else(|| host.map_or(0, |h| h.memory_bytes) / 2);
+    let vector_ingest = env("NANO_VECTOR_PROFILE").as_deref() != Some("none");
+    let memory = args.memory_bytes.unwrap_or_else(|| host_cell_memory_for_ingest(host.map_or(0, |h| h.memory_bytes), vector_ingest));
     let cpus = args.cpus.unwrap_or_else(|| host.map_or(1, |h| h.cpus));
     let sizing = size_for(memory.max(512 * MIB), cpus, args.target_eps);
+    if let Some(target) = args.target_eps.filter(|_| memory < 4 * GIB && memory >= small_cell_memory_for_eps(20)) {
+        ensure!(target <= sizing.eps, "this small-host allocation supports {} EPS; requested --target-eps {target} needs a larger host", sizing.eps);
+    }
+    let compose_host = host.unwrap_or(HostFacts { memory_bytes: memory.saturating_mul(2), cpus });
+    let compose = compose_resources_for_ingest(&sizing, compose_host,
+        env("NANO_LEAN_PG_DSN_DIR").is_some(), vector_ingest);
+    if compose_host.memory_bytes >= minimum_install_memory_for_ingest(vector_ingest) {
+        let total: u64 = compose["services"].as_object().unwrap().values()
+            .map(|s| s["mem_limit"].as_u64().unwrap()).sum();
+        ensure!(total <= host_memory_share(compose_host.memory_bytes, 95),
+            "requested cell memory plus service startup minimums exceeds 95% of the host; omit --memory-bytes for host sizing");
+    }
 
     // Documents.
     let ingest_token = json!({
@@ -707,6 +851,8 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
         // The single-tenant open-core cell is trusted-local by construction;
         // init owns the flag (the open configure step no longer patches it).
         "trusted_local": true,
+        // Landing runs in the separately budgeted lean-landing container.
+        "tenzir_landing": false,
         "data_dir": args.cell_data_root.join("data"),
         "state_dir": args.cell_data_root.join("state"),
         "ingest_binary": args.bin_dir.join("nanosiem-lake-ingest"),
@@ -735,6 +881,7 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
             "tenant_id": tenant_s,
             "eps": sizing.eps as f64,
             "ingest": "resident",
+            "landing": false,
             "ingest_request_millicores": i.0, "ingest_limit_millicores": i.1,
             "ingest_request_memory_bytes": i.2, "ingest_limit_memory_bytes": i.3,
             "detect_request_millicores": d.0, "detect_limit_millicores": d.1,
@@ -779,9 +926,6 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
     write_file(&out.join("app/router-query.token"), query_token.as_bytes(), 0o400, args.app_owner)?;
     write_file(&out.join("cell/cell.json"), &serde_json::to_vec_pretty(&cell)?, 0o644, None)?;
     write_file(&out.join("cell/placement.json"), &serde_json::to_vec_pretty(&placement)?, 0o644, None)?;
-    let compose = compose_resources(&sizing,
-        host.unwrap_or(HostFacts { memory_bytes: memory.saturating_mul(2), cpus }),
-        env("NANO_LEAN_PG_DSN_DIR").is_some());
     write_file(&out.join("compose.resources.json"), &serde_json::to_vec_pretty(&compose)?, 0o644, None)?;
     write_file(&out.join("app/routes.json"), &serde_json::to_vec_pretty(&routes)?, 0o644, args.app_owner)?;
     write_file(&out.join("app/lake-cell.env"), app_env.as_bytes(), 0o644, args.app_owner)?;
@@ -863,17 +1007,220 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    #[test]
+    fn nan4843_all_startup_minima_fit_the_derived_host_threshold() {
+        let policy = startup_memory();
+        assert_eq!(policy.services.len(), COMPOSE_CPU_SHARES.len());
+        let minimum = minimum_install_memory_bytes();
+        let cell_minimum = small_cell_memory_for_eps(20);
+        assert_eq!(policy.cell_mib["ingest"] * MIB, TenantBudget::from_eps(20.0).ingest_memory_cap_bytes);
+        let compose_minimum = compose_startup_minimum(true);
+        assert!(host_cell_memory_bytes(minimum) >= cell_minimum);
+        assert!(compose_startup_minimum(true) + cell_minimum <= host_memory_share(minimum, 95));
+        assert_eq!(minimum, 8 * GIB);
+        // One selected agent plus the small-tenant curve fits 8 GiB.
+        assert!(!policy.cell_mib.contains_key("landing"));
+        assert_eq!(cell_minimum, 2061 * MIB);
+        assert_eq!(policy.services["lean-landing"].bytes(), crate::landing_budget::memory_for_lanes(1));
+        let small = size(host_cell_memory_bytes(8 * GIB), 8);
+        assert_eq!(small.eps, 72);
+        assert!(small_cell_memory_for_eps(small.eps) <= small.memory_bytes);
+        assert!(small_cell_memory_for_eps(small.eps + 1) > small.memory_bytes);
+        for memory in [minimum, 9 * GIB, 12 * GIB, 15_965 * MIB, 16 * GIB, 24 * GIB, 32 * GIB, 64 * GIB, 256 * GIB] {
+            for cpus in 2..=64 {
+                for sovereign in [false, true] {
+                    let sizing = size(host_cell_memory_bytes(memory), cpus);
+                    let rendered = compose_resources(&sizing, HostFacts { memory_bytes: memory, cpus }, sovereign);
+                    let services = rendered["services"].as_object().unwrap();
+                    let total: u64 = services.values().map(|v| v["mem_limit"].as_u64().unwrap()).sum();
+                    assert!(total <= memory / 100 * 95);
+                    for (name, floor) in policy.services.iter().filter(|(name, _)| selected_service(name, true)) {
+                        assert!(floor.peak_bytes > 0, "every service has measurement evidence: {name}");
+                        let limit = services[name]["mem_limit"].as_u64().unwrap();
+                        assert!(limit >= floor.bytes(), "{name}");
+                        assert_eq!(services[name]["memswap_limit"], limit);
+                        assert_eq!(services[name]["deploy"]["resources"]["limits"]["memory"], limit.to_string());
+                    }
+                    for (name, value) in [("ingest", sizing.ingest.3), ("query", sizing.query.3), ("detect", sizing.detect.3),
+                        ("product", sizing.local_resources.product.limit_memory_bytes),
+                        ("maintenance", sizing.local_resources.maintenance.limit_memory_bytes)] {
+                        assert!(value >= policy.cell_mib[name] * MIB, "{name}");
+                    }
+                    if memory == minimum || memory == 16 * GIB {
+                        if cpus == 8 && !sovereign {
+                            println!("NAN4843_RENDER {}", json!({"memory": memory, "cpus": cpus, "compose": rendered}));
+                        }
+                    }
+                    assert_eq!(rendered["x-nano-host-sizing"]["compose_minimum_memory_bytes"], compose_minimum);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nan4843_initializer_budgets_only_the_selected_ingest_agent() {
+        for vector in [false, true] {
+            let host = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(host.path().join("proc")).unwrap();
+            std::fs::create_dir_all(host.path().join("sys/devices/system/cpu")).unwrap();
+            std::fs::write(host.path().join("proc/meminfo"), format!("MemTotal: {} kB\n", 8 * GIB / 1024)).unwrap();
+            std::fs::write(host.path().join("sys/devices/system/cpu/online"), "0-7").unwrap();
+            let out = host.path().join("out");
+            let args = InitArgs { host_root: host.path().into(), memory_bytes: None, cpus: None, ..args(&out) };
+            let get_env = |name: &str| if name == "NANO_VECTOR_PROFILE" {
+                Some(if vector { "lean" } else { "none" }.to_owned())
+            } else { env(name) };
+            init(&args, &get_env).unwrap();
+            let rendered: Value = serde_json::from_slice(&std::fs::read(out.join("compose.resources.json")).unwrap()).unwrap();
+            let services = rendered["services"].as_object().unwrap();
+            assert_eq!(services.contains_key("vector"), vector);
+            assert_eq!(services.contains_key("connector-runner"), vector);
+            assert_eq!(services.contains_key("tenzir"), !vector);
+            assert_eq!(rendered["x-nano-host-sizing"]["minimum_install_memory_bytes"], 8 * GIB);
+            assert_eq!(rendered["x-nano-host-sizing"]["supported"], true);
+            let cell = services["lake-cell"]["mem_limit"].as_u64().unwrap();
+            let eps = rendered["x-nano-host-sizing"]["supported_eps"].as_u64().unwrap() as u32;
+            assert!(small_cell_memory_for_eps(eps) <= cell);
+            assert!(small_cell_memory_for_eps(eps + 1) > cell);
+            assert!(services.values().map(|s| s["mem_limit"].as_u64().unwrap()).sum::<u64>() <= 8 * GIB / 100 * 95);
+            let before = std::fs::read(out.join("cell/placement.json")).unwrap();
+            assert!(init(&InitArgs { target_eps: Some(eps + 1), ..args.clone() }, &get_env).is_err());
+            assert_eq!(std::fs::read(out.join("cell/placement.json")).unwrap(), before);
+            let placement: crate::config::Placement = serde_json::from_slice(&before).unwrap();
+            let cfg: crate::config::CellConfig = serde_json::from_slice(&std::fs::read(out.join("cell/cell.json")).unwrap()).unwrap();
+            let tenant = &placement.tenants[0];
+            assert!(!crate::supervisor::landing_wanted(cfg.tenzir_landing, Some(tenant)));
+            let limits = crate::supervisor::with_product_role(
+                crate::resources::TenantLimits::from_placement(tenant,
+                    &crate::resources::CellCapacity { cpu_millicores: 8000, memory_bytes: cell,
+                        cpu_source: "config", memory_source: "config" }, &cfg.resources), tenant);
+            // The real supervisor pays active native roles, leaving its own
+            // reserve; it does not add the dormant landing template.
+            assert!(limits.memory_hard_bytes + 64 * MIB <= cell);
+            assert!(crate::supervisor::with_landing_role(limits, tenant).memory_hard_bytes > cell);
+            // Re-run against a grown host, with no sizing overrides. Keep
+            // identity while replacing both placement and Compose budgets.
+            let token = std::fs::read(out.join("app/router-query.token")).unwrap();
+            std::fs::write(host.path().join("proc/meminfo"), format!("MemTotal: {} kB\n", 16 * GIB / 1024)).unwrap();
+            std::fs::write(host.path().join("sys/devices/system/cpu/online"), "0-15").unwrap();
+            assert_eq!(init(&args, &get_env).unwrap()["created"], false);
+            let grown: Value = serde_json::from_slice(&std::fs::read(out.join("compose.resources.json")).unwrap()).unwrap();
+            assert_eq!(grown["services"]["lake-cell"]["mem_limit"], 8 * GIB);
+            assert_eq!(grown["services"]["lake-cell"]["cpus"], 16);
+            assert!(grown["x-nano-host-sizing"]["supported_eps"].as_u64().unwrap() > u64::from(eps));
+            let grown_placement: crate::config::Placement = serde_json::from_slice(&std::fs::read(out.join("cell/placement.json")).unwrap()).unwrap();
+            assert_eq!(grown_placement.tenants[0].tenant_id, tenant.tenant_id);
+            assert!(grown_placement.tenants[0].effective_role_budget(crate::contract::Role::Ingest).limit_memory_bytes
+                > tenant.effective_role_budget(crate::contract::Role::Ingest).limit_memory_bytes);
+            assert_eq!(std::fs::read(out.join("app/router-query.token")).unwrap(), token);
+            println!("NAN4843_SELECTED {}", rendered["x-nano-host-sizing"]);
+        }
+    }
+
+    #[test]
+    fn nan4844_landing_lanes_preserve_all_selected_service_floors() {
+        for memory in [8 * GIB, 9 * GIB, 12 * GIB, 15_965 * MIB, 16 * GIB, 24 * GIB, 32 * GIB, 64 * GIB, 128 * GIB, 256 * GIB] {
+            for cpus in 1..=64 {
+                for vector in [true, false] {
+                    let sizing = size(host_cell_memory_for_ingest(memory, vector), cpus);
+                    let rendered = compose_resources_for_ingest(&sizing, HostFacts { memory_bytes: memory, cpus }, false, vector);
+                    let services = rendered["services"].as_object().unwrap();
+                    assert!(services.values().map(|s| s["mem_limit"].as_u64().unwrap()).sum::<u64>() <= host_memory_share(memory, 95));
+                    for (name, floor) in startup_memory().services.iter().filter(|(n, _)| selected_service(n, vector)) {
+                        assert!(services[name]["mem_limit"].as_u64().unwrap() >= service_startup_minimum(name, floor), "{name}");
+                    }
+                    let landing = services["lean-landing"]["mem_limit"].as_u64().unwrap();
+                    let (lanes, flight) = crate::landing_budget::limits(landing, cpus * 1000);
+                    assert!(lanes >= 1);
+                    assert_eq!(landing, crate::landing_budget::memory_for_lanes(lanes));
+                    assert_eq!(flight, lanes as u64 * crate::landing_budget::MAX_LANDING_BYTES);
+                    assert_eq!(crate::landing_budget::limits(landing - 1, cpus * 1000).0, lanes - 1);
+                    if memory == 8 * GIB { assert_eq!(lanes, 1); }
+                    if memory == 15_965 * MIB && cpus >= 2 { assert_eq!(lanes, 2); }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nan4843_capacity_table_uses_production_sizing() {
+        for (gib, cpus) in [(8, 4), (16, 8), (32, 16), (64, 32), (128, 64)] {
+            for vector in [true, false] {
+                let host = HostFacts { memory_bytes: gib * GIB, cpus };
+                let sizing = size(host_cell_memory_for_ingest(host.memory_bytes, vector), cpus);
+                let compose = compose_resources_for_ingest(&sizing, host, false, vector);
+                let total: u64 = compose["services"].as_object().unwrap().values()
+                    .map(|s| s["mem_limit"].as_u64().unwrap()).sum();
+                assert!(total <= host.memory_bytes / 100 * 95);
+                for (name, floor) in startup_memory().services.iter().filter(|(name, _)| selected_service(name, vector)) {
+                    assert!(compose["services"][name]["mem_limit"].as_u64().unwrap() >= floor.bytes());
+                }
+                println!("NAN4843_CAPACITY {}", json!({"memory": host.memory_bytes, "cpus": cpus,
+                    "vector": vector, "compose": compose}));
+            }
+        }
+    }
+
+    #[test]
+    fn nan4843_explicit_cell_override_cannot_overcommit_a_supported_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let error = init(&InitArgs { memory_bytes: Some(4 * GIB), ..args(&out) }, &env).unwrap_err();
+        assert!(error.to_string().contains("exceeds 95%"));
+        assert!(!out.join("cell/placement.json").exists());
+        assert!(!out.join("cell/secret").exists());
+    }
+
+    #[test]
+    fn nan4842_dragonfly_startup_fits_host_pool() {
+        // 15,965 MiB of usable RAM on a nominal 16 GiB host produced 173mb
+        // with the old allocator; cover it alongside every supported shape.
+        let old_pool = (15_965 * MIB) / 100 * 45;
+        let old_jobs = (old_pool / 104 * 12).max(GIB);
+        let old_limit = round_mib((old_pool - old_jobs - GIB - 512 * MIB) / 80 * 5);
+        assert_eq!(old_limit / 100 * 60 / MIB, 173);
+        for memory in [8 * GIB, 12 * GIB, 15_965 * MIB, 16 * GIB, 24 * GIB, 32 * GIB, 64 * GIB] {
+            for cpus in 2..=64 {
+                for sovereign in [false, true] {
+                    let rendered = compose_resources(&size(host_cell_memory_bytes(memory).max(512 * MIB), cpus), HostFacts { memory_bytes: memory, cpus }, sovereign);
+                    let services = rendered["services"].as_object().unwrap();
+                    let command = services["dragonfly"]["command"].as_array().unwrap();
+                    let maxmemory = command[0].as_str().unwrap().strip_prefix("--maxmemory=").unwrap()
+                        .strip_suffix("mb").unwrap().parse::<u64>().unwrap() * MIB;
+                    let threads = command[1].as_str().unwrap().strip_prefix("--proactor_threads=").unwrap()
+                        .parse::<u64>().unwrap();
+                    assert!(maxmemory >= 256 * MIB);
+                    assert!((1..=32).contains(&threads));
+                    assert!(threads <= u64::from((cpus / 4).max(1)));
+                    assert!(maxmemory >= 256 * MIB * threads, "memory={memory} cpus={cpus}");
+                    assert_eq!(threads, u64::from((cpus / 4).clamp(1, 32)).min(maxmemory / (256 * MIB)));
+                    if memory == 8 * GIB {
+                        assert_eq!(maxmemory, 256 * MIB);
+                        assert_eq!(threads, 1);
+                    }
+                    let limit = services["dragonfly"]["mem_limit"].as_u64().unwrap();
+                    assert!(limit * 60 >= maxmemory * 100);
+                    let siblings: u64 = services.iter().filter(|(name, _)| name.as_str() != "lake-cell")
+                        .map(|(_, service)| service["mem_limit"].as_u64().unwrap()).sum();
+                    assert!(siblings <= (memory / 100 * 45).max(rendered["x-nano-host-sizing"]["compose_minimum_memory_bytes"].as_u64().unwrap()));
+                    println!("NAN4842_RENDER {}", json!({"memory": memory, "cpus": cpus, "sovereign": sovereign,
+                        "dragonfly": services["dragonfly"], "siblings": siblings}));
+                }
+            }
+        }
+    }
+
     /// Exercise the production initializer, not a copy of its sizing math.
     /// Render lines can also be fed to Docker Compose's daemon-free validator.
     #[test]
     fn nan4827_host_shapes_render_all_roles_and_containers() {
         for (memory, cpus, ingest, query, detect, product, landing) in [
-            (2 * GIB, 4, 268435456, 537919488, 162529280, 41943040, 41943040),
-            (3413114880, 4, 426770432, 853540864, 255852544, 68157440, 68157440),
-            (8 * GIB, 8, 577765376, 1155530752, 347078656, 536870912, 1073741824),
-            (32 * GIB, 16, 6442450944, 5816451072, 2452619264, 686817280, 1073741824),
-            (64 * GIB, 32, 8536457216, 17072914432, 5123342336, 1373634560, 1373634560),
-            (64 * GIB, 64, 8536457216, 17072914432, 5123342336, 1373634560, 1373634560),
+            (2 * GIB, 4, 133 * MIB, 267 * MIB, 82 * MIB, 20 * MIB, 20 * MIB),
+            (3413114880, 4, 133 * MIB, 267 * MIB, 82 * MIB, 20 * MIB, 20 * MIB),
+            (8 * GIB, 8, 662 * MIB, 1158 * MIB, 256 * MIB, 512 * MIB, 1024 * MIB),
+            (32 * GIB, 16, 6144 * MIB, 6400 * MIB, 2510 * MIB, 655 * MIB, 1024 * MIB),
+            (64 * GIB, 32, 8505 * MIB, 17010 * MIB, 5104 * MIB, 1310 * MIB, 1310 * MIB),
+            (64 * GIB, 64, 8505 * MIB, 17010 * MIB, 5104 * MIB, 1310 * MIB, 1310 * MIB),
         ] {
             let host = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(host.path().join("proc")).unwrap();
@@ -902,7 +1249,7 @@ mod tests {
             assert_eq!(role_nice(Role::Ingest), 3);
             assert!(role_nice(Role::Query) < role_nice(Role::Landing));
             let limits = crate::resources::TenantLimits::from_placement(t,
-                &crate::resources::CellCapacity { cpu_millicores: cpus * 1000, memory_bytes: memory / 2,
+                &crate::resources::CellCapacity { cpu_millicores: cpus * 1000, memory_bytes: host_cell_memory_bytes(memory).max(512 * MIB),
                     cpu_source: "config", memory_source: "config" }, &crate::config::ResourceConfig::default());
             assert_eq!(limits.cpu_guarantee_millicores, requests);
             assert_eq!(limits.cpu_ceiling_millicores, cpus * 1000);
@@ -923,14 +1270,19 @@ mod tests {
                 assert_eq!(budget.limit_millicores, cpus * 1000, "idle host can lend all cores to {role:?}");
                 assert!(budget.limit_millicores >= budget.request_millicores);
             }
-            let role_total: u64 = Role::ALL.into_iter().map(|r| t.effective_role_budget(r).limit_memory_bytes).sum();
+            let role_total: u64 = Role::ALL.into_iter().filter(|r| *r != Role::Landing)
+                .map(|r| t.effective_role_budget(r).limit_memory_bytes).sum();
             assert!(role_total < memory / 2);
             assert!(t.effective_role_budget(Role::Ingest).limit_millicores > 1000);
             let rendered: Value = serde_json::from_slice(&std::fs::read(out.join("compose.resources.json")).unwrap()).unwrap();
             let services = rendered["services"].as_object().unwrap();
             let total: u64 = services.values().map(|v| v["mem_limit"].as_u64().unwrap()).sum();
-            assert!(total <= memory / 100 * 95);
-            assert_eq!(services["lake-cell"]["mem_limit"], memory / 2);
+            if memory >= minimum_install_memory_bytes() {
+                assert!(total <= memory / 100 * 95);
+            } else {
+                assert_eq!(rendered["x-nano-host-sizing"]["supported"], false);
+            }
+            assert_eq!(services["lake-cell"]["mem_limit"], host_cell_memory_bytes(memory).max(512 * MIB));
             for service in services.values() {
                 assert_eq!(service["mem_limit"], service["memswap_limit"]);
                 assert!(service["mem_limit"].as_u64().unwrap() > 0);
@@ -942,7 +1294,7 @@ mod tests {
             println!("NAN4827_RENDER {}", json!({"memory": memory, "cpus": cpus, "compose": rendered}));
             // Sovereign output preserves the security flags even though compose
             // replaces command lists rather than appending them.
-            let sovereign = compose_resources(&size(memory / 2, cpus), HostFacts { memory_bytes: memory, cpus }, true);
+            let sovereign = compose_resources(&size(host_cell_memory_bytes(memory).max(512 * MIB), cpus), HostFacts { memory_bytes: memory, cpus }, true);
             let command = sovereign["services"]["postgres"]["command"].as_array().unwrap();
             assert!(command.contains(&json!("ssl=on")));
             assert!(command.contains(&json!("hba_file=/etc/nano-sovereign-pg/pg_hba.conf")));
@@ -1005,7 +1357,7 @@ mod tests {
         assert_eq!(again["bronze"]["secret_access_key"], "secret");
         assert_eq!(std::fs::read_to_string(out.join("app/router-query.token")).unwrap(), token);
         let placement: Value = serde_json::from_slice(&std::fs::read(out.join("cell/placement.json")).unwrap()).unwrap();
-        assert_eq!(placement["tenants"][0]["query_limit_memory_bytes"], 17072914432_u64, "re-render resizes");
+        assert_eq!(placement["tenants"][0]["query_limit_memory_bytes"], 17010 * MIB, "re-render resizes");
 
         // A different --tenant-id conflicts; --force re-mints.
         let mut other = args(&out);
@@ -1093,7 +1445,7 @@ mod tests {
         assert_eq!(s.ingest.3 + s.query.3, base.ingest.3 + base.query.3);
         let local = &s.local_resources;
         assert!(s.ingest.3 + s.query.3 + s.detect.3 + local.product.limit_memory_bytes
-            + local.landing.limit_memory_bytes + local.maintenance.limit_memory_bytes < s.memory_bytes);
+            + local.maintenance.limit_memory_bytes < s.memory_bytes);
         assert!(s.query.3 >= crate::budget::QUERY_MEMORY_FLOOR_BYTES);
         // Nominal 16 GiB hosts report slightly less usable RAM. There is no
         // hard capacity threshold that would send them back to a 2 GiB role.
@@ -1120,8 +1472,8 @@ mod tests {
         assert_eq!(small.query.3, size_for(4 * GIB, 2, Some(100)).query.3);
         assert!(small.query.1 >= 1000);
         let big = size(64 * GIB, 32);
-        assert!(big.query.3.abs_diff(32 * GIB) < 8 * MIB);
-        assert!(big.ingest.3.abs_diff(16 * GIB) < 8 * MIB);
+        assert_eq!(big.query.3, 34225 * MIB);
+        assert_eq!(big.ingest.3, 17112 * MIB);
         assert!(big.detect.3 >= crate::budget::DETECT_RULES_MIN_MEMORY_BYTES);
         for s in [&small, &big] {
             assert!(TenantBudget::from_eps(s.eps as f64).ingest_memory_cap_bytes >= s.ingest.3);

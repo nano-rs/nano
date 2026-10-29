@@ -65,6 +65,7 @@ seccompiler = "0.5"
 zeroize = "1.8"
 
 [dev-dependencies]
+nanosiem-lake-cell = { path = "../nanosiem-lake-cell" }
 proptest = "1"
 rcgen = "0.14"
 # tests/pg_feed_store.rs (enterprise): a signed parser-bundle release for the

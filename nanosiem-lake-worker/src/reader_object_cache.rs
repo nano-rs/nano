@@ -1601,6 +1601,15 @@ impl ReaderObjectCache {
         self.inner.state().hot = objects;
     }
 
+    /// Total budget for one background object, including caller-side lookup
+    /// and queueing. Size it at the pass's guaranteed share, like the cache's
+    /// transfer deadline, without adding another timeout configuration.
+    pub(crate) fn hydration_deadline(&self, bytes: u64, share: u64) -> Duration {
+        self.inner.settings.fetch_deadline.saturating_add(
+            Duration::from_secs((bytes / share.max(1)).saturating_add(1)),
+        )
+    }
+
     pub async fn is_local(&self, object: &ReaderObjectRef) -> Result<bool, ReaderCacheError> {
         self.inner.authorize(object)?;
         let (inner, object) = (self.inner.clone(), object.clone());

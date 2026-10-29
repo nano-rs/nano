@@ -1420,3 +1420,6 @@ fn cell_feature_lean_landing_platform_audit_v1_is_backed() {
 
 #[path = "landing_throughput_tests.rs"]
 mod throughput;
+
+#[path = "landing_sizing_tests.rs"]
+mod sizing;

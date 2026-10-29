@@ -22,11 +22,9 @@ Unattended output omits bootstrap passwords and ingestion tokens. Docker Compose
 2.24+ and Python 3 are required. `lean-init` calls lane A's `nanosiem-lake-cell
 trusted-local init`; shell code generates no tenant ID or cell keys. Reruns
 reuse identity. The initializer sizes cell budgets from host capacity. By default
-it assigns half the host memory to the cell. Default ingest sizing reserves room
+it assigns the cell the remainder of the 95% host envelope after reserving the selected Compose services (half the host when their 45% pool covers their startup minima). Default ingest sizing reserves room
 for flushes and background compaction using the shared full-flush sizing curve,
-capped at half the cell. For example, a 16 GiB host
-gets about a 3.9 GiB ingest role and a 1 GiB query role after reserving the
-auxiliary native roles. The shift comes from query's
+capped at half the cell. The actual role limits and planned rate are re-derived from the host at each install/upgrade. The shift comes from query's
 share while query retains at least 1 GiB; the total cell allocation stays the
 same. An explicit target rate keeps using the existing rate-based sizing. Back up
 `.nano-lean` alongside PostgreSQL, RustFS, `nano-lean-cell`, and `nano-lean-otel`.
@@ -45,9 +43,9 @@ single `-f` flag to retain those limits. Both the sovereign wrapper and
 `scripts/nano` include the generated file. Re-run the installer after resizing
 the host. Keep the initializer and service images on the same release.
 
-The cell receives half the host RAM. All other running containers share 45%,
-with 5% left for the OS. Product, landing and maintenance are included in the
-cell envelope. Container quotas allow CPU bursts up to the host's CPU count;
+Startup minima are reserved before sharing surplus by weight. Compose receives at least 45% of host RAM, the cell receives the remainder of the 95% envelope, and 5% stays for the OS. Only the selected ingest agent is budgeted. On an 8 GiB Vector install this is 4,607 MiB Compose and 3,175 MiB cell, with a 72-EPS planning rate from the tenant memory curve; Tenzir-direct is 3,953 MiB Compose and 3,829 MiB cell at 99 EPS. No 1.15 measurement discount was needed. See [startup measurements and per-service limits](open-core-startup-memory.md). The generated `x-nano-host-sizing.supported_eps` and installer output report the planned rate. These figures size small tenants and are not a sustained throughput benchmark.
+
+Active product and maintenance roles are included in the cell envelope. Landing runs separately in its Compose container; the native cell landing role is disabled and reserves no cell memory. Container quotas allow CPU bursts up to the host's CPU count;
 all role quotas also permit the whole host. Contention is governed by CPU
 weights: the cell receives 60% of the planned shares and Compose siblings 40%.
 Within that host budget query receives 30%, ingest 15%, detect 5%, product 3%,
@@ -83,7 +81,9 @@ hosted checks stay strict. Other UID/capability/seccomp/isolation failures refus
 startup. SYS_ADMIN supports a private cgroup mount; no privileged container is
 requested.
 
-## Ingest modes: Vector, Tenzir-direct, or both
+## Ingest modes: Vector or Tenzir-direct
+
+The generated memory plan funds one local ingest agent. Select `--tenzir` before starting the bundled Tenzir node on a minimum-size host; a default Vector install can still receive bucket-drop data from external senders.
 
 | Run | Ingest | `.env` |
 |---|---|---|

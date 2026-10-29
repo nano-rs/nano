@@ -249,11 +249,11 @@ mod tests {
     #[test]
     fn nan4827_role_and_parent_limits_drive_runtime_sizing_after_resizes() {
         use nanosiem_lake_cell::budget::{GIB, MIB};
-        assert_eq!(crate::landing::bucket_drop_limits(GIB, 8000).0, 4);
+        assert_eq!(crate::landing::bucket_drop_limits(GIB, 8000).0, 0);
         let lanes = crate::landing::bucket_drop_limits(2268 * MIB, 64000).0;
-        assert_eq!(lanes, 8);
+        assert_eq!(lanes, 2);
         let (request, burst) = nanosiem_lake_cell::trusted_local::landing_cpu_budget(64000);
-        assert!(lanes as u32 * 1000 >= request && burst >= request);
+        assert!(burst >= request);
         assert_eq!(nanosiem_lake_cell::budget::query_threads(64000), 64);
         for (memory, cpu) in [(2 * GIB, 4000), (3413114880, 4000), (8 * GIB, 8000), (32 * GIB, 16000), (64 * GIB, 32000), (64 * GIB, 64000)] {
             let root = tempfile::tempdir().unwrap();
@@ -267,7 +267,8 @@ mod tests {
             let capacity = capacity_for(&cg, host.clone());
             assert_eq!((capacity.memory_bytes, capacity.cpu_millicores), (memory, cpu));
             let (lanes, bytes) = crate::landing::landing_limits(capacity.memory_bytes, capacity.cpu_millicores);
-            assert_eq!(lanes, (cpu / 1000) as usize);
+            assert_eq!(lanes, nanosiem_lake_cell::landing_budget::limits(memory, cpu).0);
+            assert!(lanes <= (cpu / 1000) as usize);
             let (bucket_lanes, _) = crate::landing::bucket_drop_limits(capacity.memory_bytes, capacity.cpu_millicores);
             assert_eq!(bucket_lanes, lanes);
             // Dedicated query borrowing grows beyond the old eight-thread cap.
@@ -283,8 +284,8 @@ mod tests {
             assert_eq!(agent.threads(), 1);
             if cpu >= 8000 { assert!(analyst.threads() > agent.threads()); }
 
-            if memory <= 3413114880 { assert!(bytes <= 256 * MIB); }
-            else { assert!(bytes > 256 * MIB); }
+            assert_eq!(bytes, lanes as u64 * crate::landing::MAX_LANDING_BYTES);
+            assert!(nanosiem_lake_cell::landing_budget::memory_for_lanes(lanes) <= memory);
             let (query, fetches) = crate::reader_object_cache::resource_limits(memory, cpu, 16 * GIB);
             assert!(query <= memory / 4 && fetches <= (memory / (64 * MIB)) as usize);
             let result = crate::part_query::memory_budget::QueryMemoryBudget::rust_paged_result_bytes(memory, 30);
@@ -294,7 +295,8 @@ mod tests {
             std::fs::write(root.path().join("tenant/cpu.max"), "50000 100000").unwrap();
             let shrunk = capacity_for(&cg, host);
             assert_eq!((shrunk.memory_bytes, shrunk.cpu_millicores), (memory / 2, 500));
-            assert_eq!(crate::landing::landing_limits(shrunk.memory_bytes, shrunk.cpu_millicores).0, 1);
+            let expected = usize::from(shrunk.memory_bytes >= nanosiem_lake_cell::landing_budget::memory_for_lanes(1));
+            assert_eq!(crate::landing::landing_limits(shrunk.memory_bytes, shrunk.cpu_millicores).0, expected);
         }
     }
 
