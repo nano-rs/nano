@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "profile": "ocsf",
+  "dataset": "logs",
+  "source_placeholder": "__nano_lake_source__",
+  "query_sha256": "60f70e46513d19729e3d79adf55aabd2b0339aeb0bf983b8ed0341e03757fa76",
+  "start": "2026-09-24T07:00:00Z",
+  "end": "2026-09-25T07:01:00Z",
+  "limit": 501,
+  "table_view": false,
+  "newest_first_event_rows": false,
+  "stats_page": true,
+  "candidate_hints": [
+    {
+      "kind": "class",
+      "value": 1007
+    },
+    {
+      "kind": "keyword",
+      "mode": "regex_guard",
+      "value": "executionpolicy"
+    }
+  ],
+  "required_columns": [
+    {
+      "name": "actor.user.name",
+      "field_type": "string"
+    },
+    {
+      "name": "class_uid",
+      "field_type": "long"
+    },
+    {
+      "name": "device.hostname",
+      "field_type": "string"
+    },
+    {
+      "name": "message",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.log_source",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.uid",
+      "field_type": "string"
+    },
+    {
+      "name": "process.cmd_line",
+      "field_type": "string"
+    },
+    {
+      "name": "time",
+      "field_type": "timestamp"
+    }
+  ],
+  "projected_scan_columns": [
+    "actor.user.name",
+    "class_uid",
+    "device.hostname",
+    "metadata.log_source",
+    "process.cmd_line",
+    "time"
+  ],
+  "sql": "WITH stage_0 AS (\n  SELECT \"actor.user.name\", class_uid, \"device.hostname\", message, \"metadata.log_source\", \"metadata.uid\", \"process.cmd_line\", time FROM __nano_lake_source__\n  WHERE time >= '2026-09-24 07:00:00.000000' AND time < '2026-09-25 07:01:00.000000'\n  AND ((class_uid = 1007 AND lower(\"process.cmd_line\") iLike '%executionpolicy bypass%' AND lower(\"process.cmd_line\") iLike '%executionpolicy%' AND lower(\"metadata.log_source\") != 'audit'))\n),\nstage_1 AS (\n  SELECT \"device.hostname\" AS \"device.hostname\", \"actor.user.name\" AS \"actor.user.name\", count() AS c\n  FROM stage_0\n  GROUP BY \"device.hostname\", \"actor.user.name\"\n),\nstage_2 AS (\n  SELECT * FROM stage_1\n  ORDER BY c DESC, \"device.hostname\" ASC, \"actor.user.name\" ASC\n),\nstage_3 AS (\n  SELECT * FROM stage_2\n  LIMIT 30\n),\n__nano_stats_ranked AS (\n  SELECT *, count() OVER () AS __nano_stats_total, row_number() OVER (ORDER BY c DESC, \"device.hostname\" ASC, \"actor.user.name\" ASC ) AS __nano_stats_ordinal FROM stage_3\n)\nSELECT * FROM __nano_stats_ranked WHERE __nano_stats_ordinal = 1 OR (__nano_stats_ordinal > 0 AND __nano_stats_ordinal <= 501) ORDER BY __nano_stats_ordinal LIMIT 501 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=0, optimize_aggregation_in_order=0"
+}

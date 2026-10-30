@@ -628,7 +628,7 @@ pub struct FetchLogRequest {
     pub deny_source_types: BTreeSet<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct CompilerRequest<'a> {
     stats_page: bool,
     stats_page_offset: usize,
@@ -901,6 +901,7 @@ impl Selection {
 
 pub struct PartQueryEngine {
     settings: EngineSettings,
+    compilations: compiler_cache::Cache,
     store: Arc<dyn ObjectStore>,
     view: tokio::sync::Mutex<PartLogView>,
     fetcher: PartFetcher,
@@ -1193,7 +1194,7 @@ impl PartQueryEngine {
         }
         let slots = executor.connection_count().max(1);
         let fragments = super::fragment_cache::FragmentCache::new(settings.max_memory_bytes);
-        Ok(Self { settings, fragments, store, view: tokio::sync::Mutex::new(view), fetcher, executor, writer: None, advances: Default::default(), state_dir: None, prewarming: Default::default(), evidence_prewarm: Default::default(), evidence_ready_at: Default::default(), prewarmed: Default::default(), file_metadata: Default::default(), token_cache: Default::default(), uid_layouts: Default::default(), evidence_cache: Default::default(), entity_cache: Default::default(), entity_count_memo: Default::default(), locator_cache: Default::default(), membership_memo: Default::default(), identity_coverage: Default::default(), identity_merged: Default::default(), entity_index: Default::default(), rollup_rows: Default::default(), prevalence_rows: Default::default(), caught_up_at: Default::default(), background_log_refresh: Default::default(),
+        Ok(Self { settings, compilations: Default::default(), fragments, store, view: tokio::sync::Mutex::new(view), fetcher, executor, writer: None, advances: Default::default(), state_dir: None, prewarming: Default::default(), evidence_prewarm: Default::default(), evidence_ready_at: Default::default(), prewarmed: Default::default(), file_metadata: Default::default(), token_cache: Default::default(), uid_layouts: Default::default(), evidence_cache: Default::default(), entity_cache: Default::default(), entity_count_memo: Default::default(), locator_cache: Default::default(), membership_memo: Default::default(), identity_coverage: Default::default(), identity_merged: Default::default(), entity_index: Default::default(), rollup_rows: Default::default(), prevalence_rows: Default::default(), caught_up_at: Default::default(), background_log_refresh: Default::default(),
             point: None, large: None, lane_memo: Default::default(), point_admission: Arc::new(tokio::sync::Semaphore::new(POINT_PERMITS)),
             companion_gate: Arc::new(tokio::sync::Semaphore::new(companion_permits(slots))),
             wide_gate: Arc::new(tokio::sync::Semaphore::new(wide_permits(slots))),
@@ -2253,6 +2254,39 @@ impl PartQueryEngine {
         // which no signed range covers: it keeps whole files (and that
         // pruning). A rerun scope reads whole files under its budget.
         let scope = super::range_fetch::current();
+        if let Some(scope) = &scope {
+            let verified = records.iter().map(|record| (&record.part_id, record)).collect::<BTreeMap<_, _>>();
+            scope.choose_two_pass_groups(survivors.iter().map(|(part, index)| {
+                verified.get(&part.part_id).and_then(|record| record.files.data.get(*index))
+                    .map_or((0, 0), |data| (data.rows, data.row_groups))
+            }));
+            if scope.should_choose_warm_path() {
+                // Once the reader has touched every surviving file, prefer
+                // native execution. Repeated payload rewrites lose to settled
+                // whole-file cache hits even on the 40k-row point fixture.
+                // Residency is only a planning hint; ordinary leases still
+                // verify the signed objects before returning rows.
+                let resident = self.fetcher.resident_data_files(&survivors).await;
+                let mut warm = !survivors.is_empty();
+                let mut missing_whole_bytes = 0_u64;
+                for (part, index) in &survivors {
+                    if !resident.contains(&(part.part_id.clone(), *index)) {
+                        let Some(record) = verified.get(&part.part_id) else { warm = false; break };
+                        missing_whole_bytes = missing_whole_bytes.saturating_add(
+                            record.files.data.get(*index).map_or(u64::MAX, |data| data.bytes));
+                        if !self.fetcher.file_is_local(part, record, PartFile::Ranges(*index)).await.unwrap_or(false) {
+                            warm = false;
+                            break;
+                        }
+                    }
+                }
+                if warm {
+                    let budget = self.fetcher.cache().query_cold_budget()
+                        .min(self.fetcher.cache().max_bytes()).min(self.settings.max_query_bytes);
+                    scope.prefer_warm_native(missing_whole_bytes, budget);
+                }
+            }
+        }
         let pivot = scope.as_ref().is_some_and(|scope| !scope.whole_only() && !scope.late_materialization()) && prune::uses_entities(hints);
         // Pivots still draw on the request's cold budget and debit.
         let data = match &scope {
@@ -2997,6 +3031,12 @@ impl PartQueryEngine {
     }
 
     async fn compile_with_stats_page(&self, request: &BroadNplRequest, field_types: BTreeMap<String, String>, stats_page: bool) -> QueryResult<CompiledQuery> {
+        // The cache's tenant partition is this immutable engine. Enforce that
+        // ownership here too: direct compile callers must not reuse its plans
+        // or consult its lowercase/host evidence for another tenant.
+        if request.tenant_id != self.settings.tenant_id {
+            return Err(PartQueryError::Invalid("request tenant is not this process's tenant".to_string()));
+        }
         let limit = request.offset.saturating_add(request.limit).saturating_add(1).min(MAX_RESULT_SENTINEL);
         let scoped_query = if request.dataset == "logs" {
             nanosiem_core::search::query_processing::enforce_source_scope_with_field(
@@ -3016,7 +3056,7 @@ impl PartQueryEngine {
         } else {
             (Vec::new(), Vec::new())
         };
-        let mut compiled = run_compiler(
+        let mut compiled = self.compilations.compile(
             &self.settings.compiler,
             &CompilerRequest {
                 stats_page,
@@ -3102,6 +3142,11 @@ impl PartQueryEngine {
             let field_types = self.field_types().await?;
             let compiled = self.compile_with_stats_page(request, field_types.clone(), true).await?;
             let compile_s = started.elapsed().as_secs_f64();
+            let two_pass_reason = match super::two_pass::explain(&compiled) {
+                Ok(_) => "eligible",
+                Err(reason) => reason,
+            };
+            crate::query_timing::record(|p| p.funnel.two_pass_reason = Some(two_pass_reason));
             let cursor = request.cursor_time.as_deref().zip(request.cursor_event_uid.as_deref());
             let (from_us, to_us) = compiled_window_us(&compiled)?;
             if let Some(run) = super::entity_count::run(self, request, &compiled).await? {
@@ -3116,7 +3161,7 @@ impl PartQueryEngine {
             let scope = super::range_fetch::scope_for(&compiled, &field_types);
             let attempt = super::range_fetch::with_scope(scope.clone(),
                 Box::pin(self.run_compiled(request, &compiled, &field_types, cursor, compile_s))).await;
-            let run = match (attempt, &scope) {
+            let mut run = match (attempt, &scope) {
                 (Err(error), Some(scope)) if (scope.sparse_used() || scope.late_materialization()) && reruns_whole(&error) => {
                     super::range_fetch::record_fallback(super::range_fetch::Fallback::NativeError, 1);
                     tracing::warn!(error = %error, "search read a hole of a sparse column-range file; rerunning on whole files");
@@ -3140,9 +3185,18 @@ impl PartQueryEngine {
                 }
                 (other, _) => other?,
             };
+            if let Some(reason) = scope.as_ref().and_then(|scope| scope.two_pass_refusal()) {
+                run.planner["two_pass_reason"] = json!(reason);
+            }
             Ok((compiled, run))
         };
         let (compiled, mut run) = work.await?;
+        if run.planner.get("two_pass_reason").is_none() {
+            run.planner["two_pass_reason"] = json!(match super::two_pass::explain(&compiled) {
+                Ok(_) => "eligible",
+                Err(reason) => reason,
+            });
+        }
         let continuation = run.continuation.take();
         let mut decoded = run.rows;
         let group_total = stats_page_total(compiled.stats_page, request.offset, &mut decoded)?;
@@ -4386,6 +4440,17 @@ impl PartQueryEngine {
                 continue;
             }
             fetched_files += selection.evidence.fetched_files;
+            // Selection can decline late materialization after the initial
+            // chunk plans were made. Restore the original locator path too:
+            // merely skipping run_two_pass leaves full-width chunk scans
+            // and misses the baseline's cached exact-instant payload fence.
+            let fallback_locator = if chunk_locator.is_none()
+                && super::range_fetch::current().is_some_and(|scope| scope.two_pass_refusal().is_some())
+            {
+                planner::page_locator(query)
+            } else { None };
+            let chunk_locator = chunk_locator.or(fallback_locator.as_ref());
+            let chunk_two_pass = if chunk_locator.is_none() { chunk_two_pass } else { None };
             let phase_start = Instant::now();
             let exact_times = match chunk_locator {
                 Some(locator) => {
@@ -4946,7 +5011,7 @@ impl PartQueryEngine {
     fn plan_fenced(
         selection: &Selection, compiled: &CompiledQuery, fence: Option<SourceTimeFence<'_>>, cursor: Option<(&str, &str)>,
     ) -> std::result::Result<NativeQueryPlan, planner::QueryPlanError> {
-        match (fence, cursor) {
+        let mut plan = match (fence, cursor) {
             (None, cursor) => match cursor {
                 Some((time, event_uid)) => planner::plan_broad_log_query_with_candidates_tail_time_and_cursor(
                     &selection.tenant, &selection.manifest, compiled, selection.candidates.as_deref(), None, None,
@@ -4959,7 +5024,11 @@ impl PartQueryEngine {
                 SourceCursorFence { time, event_uid }),
             (Some(fence), None) => planner::plan_broad_log_query_with_candidates_tail_and_time(
                 &selection.tenant, &selection.manifest, compiled, selection.candidates.as_deref(), None, Some(fence)),
-        }
+        }?;
+        plan.sql = super::native_reader::inline_file_parsing(
+            plan.sql, plan.budget.candidate_objects, selection.tenant.threads,
+        );
+        Ok(plan)
     }
 
     /// NAN-3155: run a row query as a narrow identity pass plus a payload
@@ -4975,6 +5044,12 @@ impl PartQueryEngine {
         cursor: Option<(&str, &str)>,
     ) -> QueryResult<Option<TwoPassRun>> {
         use super::two_pass::{self, RowId};
+        if two.guard_groups && !super::range_fetch::current().is_some_and(|scope| scope.late_materialization()) {
+            return Ok(None);
+        }
+        if super::range_fetch::current().is_some_and(|scope| scope.two_pass_refusal().is_some()) {
+            return Ok(None);
+        }
         let narrow = if cursor.is_some() { &two.narrow_cursor } else { &two.narrow };
         let planned = Self::plan_fenced(selection, narrow, fence, cursor);
         let plan = match planned {
@@ -5023,7 +5098,11 @@ impl PartQueryEngine {
         }
         let late_payload = if super::range_fetch::current().is_some_and(|scope| scope.late_materialization()) {
             let roots = selection.field_types.keys().filter_map(|path| path.split('.').next()).map(str::to_owned).collect();
-            let scope = super::range_fetch::derive_scope(&two.payload, &roots).map_err(|_| internal(super::range_fetch::LATE_FALLBACK))?;
+            let scope = if planner::preserves_full_event_shape(&two.payload.sql) && !two.payload.table_view {
+                super::range_fetch::ColumnScope::new(roots, BTreeSet::new())
+            } else {
+                super::range_fetch::derive_scope(&two.payload, &roots).map_err(|_| internal(super::range_fetch::LATE_FALLBACK))?
+            };
             match self.fetcher.materialize_payload(selection, &ids, &scope, self.settings.max_memory_bytes, self.settings.threads as usize).await {
                 Ok(payload) => Some(payload),
                 Err(error) => {
@@ -5114,7 +5193,9 @@ impl PartQueryEngine {
         if batches.len() > 1 {
             // Each batch is in event order; so is their merge (time, then
             // uid, descending; ClickHouse sorts NULL last either way).
-            let key = |row: &Value, field: &str| row.get(field).and_then(Value::as_str).map(str::to_string);
+            let key = |row: &Value, field: &str| row.get(field)
+                .or_else(|| (field == "metadata.uid").then(|| row.pointer("/metadata/uid")).flatten())
+                .and_then(Value::as_str).map(str::to_string);
             rows.sort_by(|left, right| {
                 let order = |a: Option<String>, b: Option<String>| match (a, b) {
                     (Some(a), Some(b)) => b.cmp(&a),
@@ -5159,29 +5240,7 @@ pub fn plan_logs(
     compiled: &CompiledQuery,
     cursor: Option<(&str, &str)>,
 ) -> QueryResult<NativeQueryPlan> {
-    let mut plan = match cursor {
-        Some((time, event_uid)) => planner::plan_broad_log_query_with_candidates_tail_time_and_cursor(
-            &selection.tenant,
-            &selection.manifest,
-            compiled,
-            selection.candidates.as_deref(),
-            None,
-            None,
-            SourceCursorFence { time, event_uid },
-        ),
-        None => planner::plan_broad_log_query_with_candidates_and_tail(
-            &selection.tenant,
-            &selection.manifest,
-            compiled,
-            selection.candidates.as_deref(),
-            None,
-        ),
-    }
-    .map_err(map_plan_error)?;
-    plan.sql = super::native_reader::inline_file_parsing(
-        plan.sql, plan.budget.candidate_objects, selection.tenant.threads,
-    );
-    Ok(plan)
+    PartQueryEngine::plan_fenced(selection, compiled, None, cursor).map_err(map_plan_error)
 }
 
 /// NAN-3133: errors after which a request that read a sparse file reruns on
@@ -5301,8 +5360,17 @@ fn common_lowercase_paths<'a>(named: BTreeSet<String>, records: impl IntoIterato
     if any { common.into_iter().collect() } else { Vec::new() }
 }
 
+#[cfg(test)]
 async fn run_compiler(path: &std::path::Path, request: &CompilerRequest<'_>, timeout_seconds: u64) -> QueryResult<CompiledQuery> {
     let input = serde_json::to_vec(request).map_err(internal)?;
+    let output = run_compiler_output(path, &input, timeout_seconds).await?;
+    serde_json::from_slice(&output).map_err(|error| internal(format!("compiler output failed: {error}")))
+}
+
+#[path = "compiler_cache.rs"]
+mod compiler_cache;
+
+async fn run_compiler_output(path: &std::path::Path, input: &[u8], timeout_seconds: u64) -> QueryResult<Vec<u8>> {
     // H02: retain the GNU compiler's bytes as the identity pin, while native
     // execution goes through its static, package-bound bundled-loader shim.
     let launch = nanosiem_lake_cell::worker_launch::compiler_launch_path(path)
@@ -5329,7 +5397,7 @@ async fn run_compiler(path: &std::path::Path, request: &CompilerRequest<'_>, tim
     if !output.status.success() {
         return Err(PartQueryError::Invalid(String::from_utf8_lossy(&output.stderr).trim().to_string()));
     }
-    serde_json::from_slice(&output.stdout).map_err(|error| internal(format!("compiler output failed: {error}")))
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
@@ -5895,6 +5963,7 @@ mod pinned_discovery_tests {
     use super::*;
     fn pin(seq: u64) -> PinnedDiscovery {
         let part = PartRef {
+            request_hours: None,
             part_id: crate::parts::format::PartId::new(1_790_000_000_000).unwrap(),
             level: crate::parts::levels::Level::L0, event_hour: 0, event_day: None,
             rows: 2, min_time_us: 100, max_time_us: 200,
@@ -6878,3 +6947,7 @@ mod no_schema_yet_tests {
 #[cfg(test)]
 #[path = "late_materialization_bench.rs"]
 mod late_materialization_bench;
+
+#[cfg(test)]
+#[path = "r2_wire_native_fixture.rs"]
+mod r2_wire_native_fixture;

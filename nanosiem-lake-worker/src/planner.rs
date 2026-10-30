@@ -98,6 +98,7 @@ pub enum ObjectStoreCredentials {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct CompiledQuery {
     pub schema_version: u64,
     pub profile: String,
@@ -122,6 +123,7 @@ pub struct CompiledQuery {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct RequiredColumn {
     pub name: String,
     pub field_type: String,
@@ -129,6 +131,7 @@ pub struct RequiredColumn {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(test, derive(Serialize))]
 pub enum CandidateHint {
     Entity { source_path: String, value: String },
     SourceFamily { value: String },
@@ -1766,6 +1769,11 @@ fn plan_broad_log_query_with_candidates_tail_time_and_budget(
         // Full-event output still needs every physical root it returns.
         if compiled.table_view {
             Some(required_root_projection(&required, &available_paths)?)
+        } else if required.keys().any(|name| is_row_identity_column(name)) {
+            // Full-event late payloads retain every physical root and carry
+            // the virtual identity through the source's fencing subqueries.
+            Some(format!("{}, {ROW_PATH_COLUMN}, {ROW_NUMBER_COLUMN}",
+                root_projection_for_paths(available_paths.iter().map(String::as_str))?))
         } else if tail.is_some_and(|tail| !tail.objects.is_empty() && tail.read_schema.is_some()) {
             Some(root_projection_for_paths(available_paths.iter().map(String::as_str))?)
         } else {
@@ -5121,13 +5129,14 @@ fn select_pattern() -> &'static Regex {
 }
 
 pub(crate) fn preserves_full_event_shape(sql: &str) -> bool {
-    if !sql.contains(&format!("SELECT * FROM {LOG_SOURCE_PLACEHOLDER}")) {
+    let blank = blank_quoted_regions(sql);
+    if !blank.contains(&format!("SELECT * FROM {LOG_SOURCE_PLACEHOLDER}")) {
         return false;
     }
-    let selects = select_pattern().find_iter(sql).count();
+    let selects = select_pattern().find_iter(&blank).count();
     static FULL_ROWS: OnceLock<Regex> = OnceLock::new();
     let full_rows = FULL_ROWS.get_or_init(|| Regex::new(r"(?i)\bSELECT\s+\*\s+FROM\b")
-        .expect("static regex")).find_iter(sql).count();
+        .expect("static regex")).find_iter(&blank).count();
     selects > 0 && selects == full_rows
 }
 

@@ -60,6 +60,13 @@ struct ReceiptedRun {
 }
 
 impl ReceiptedAppends {
+    /// Latest locally completed append, even before its run settles. This
+    /// may suppress stale delete attempts; only `receipted_through` may admit
+    /// young entries to index publication.
+    pub(crate) fn completed_head(&self) -> Option<u64> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).through
+    }
+
     /// The writer committed `seq` (appended at `appended_at_ms`) and the
     /// owner writer completion (control's receipt) returned.
     pub fn record(&self, seq: u64, appended_at_ms: i64) {

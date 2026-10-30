@@ -116,6 +116,7 @@ struct ClosedFile {
 }
 
 pub struct PartWriter {
+    request_hours: Option<crate::parts::request_dedup::RequestHours>,
     draft: PartDraft,
     part_id: PartId,
     created_ms: i64,
@@ -245,6 +246,7 @@ impl PartWriter {
             enabled.then(|| crate::parts::entity_counts::Builder::in_directory(&dir))
         };
         Ok(Self {
+            request_hours: None,
             draft,
             part_id,
             created_ms: now_ms,
@@ -680,6 +682,12 @@ impl PartWriter {
             let time_us = times[row];
             ensure!(!uids.is_null(row), "part row has no metadata.uid");
             let uid = uids.value(row);
+            if let Some(hour) = crate::parts::request_dedup::request_hour(uid) {
+                match &mut self.request_hours {
+                    Some(hours) => hours.include(hour),
+                    None => self.request_hours = Some(crate::parts::request_dedup::RequestHours { first: hour, last: hour }),
+                }
+            }
             if hosts.is_some() {
                 let host = host_at(row);
                 let ordered = if row == 0 {
@@ -911,6 +919,7 @@ impl PartWriter {
             crate::parts::provenance::LOWERCASED_AT_REST.iter().map(|path| (*path).to_string()).collect()
         });
         let record = ProvenanceRecord {
+            request_hours: self.request_hours,
             format: PROVENANCE_FORMAT.to_string(),
             signer_key_id: draft.signer_key_id,
             tenant_id: draft.tenant_id,

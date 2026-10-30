@@ -262,6 +262,7 @@ mod tests {
 
     fn part(n: u64) -> PartRef {
         PartRef {
+            request_hours: None,
             part_id: crate::parts::format::PartId::parse(&format!("{:013}-{:016x}", 1_000 + n, n)).unwrap(),
             level: crate::parts::levels::Level::L0,
             event_hour: 10,

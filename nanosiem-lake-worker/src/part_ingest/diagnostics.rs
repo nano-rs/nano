@@ -82,6 +82,11 @@ impl FlushStage {
         );
     }
 
+    #[cfg(test)]
+    pub(super) fn built_part_count(&self) -> Option<usize> {
+        self.parts
+    }
+
     fn snapshot(&self) -> Value {
         json!({"stage": self.stage, "stage_age_seconds": if self.stage == "complete" { 0.0 } else { self.since.elapsed().as_secs_f64() },
             "rows": self.rows, "arrow_bytes": self.bytes, "parts": self.parts, "part_rows": self.part_rows,

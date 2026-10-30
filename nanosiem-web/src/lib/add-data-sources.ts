@@ -31,8 +31,15 @@ export function revokeLink(credentialId: string): string {
 }
 
 /** The Add data wizard, and its `?source=<slug>` preselect (NAN-2946). */
-export const ADD_DATA_PATH = '/ingestion/log-sources/wizard';
+export const ADD_DATA_PATH = '/ingestion/log-sources/new';
 export const ADD_DATA_SOURCE_PARAM = 'source';
+
+/** Building the parser of an existing source edits it; other arrivals create a source. */
+export function sourceOnboardingPermission(search: string): 'log_sources:edit' | 'log_sources:create' {
+  const params = new URLSearchParams(search);
+  return params.get('stage') === 'parse' && !!params.get('source_id')
+    ? 'log_sources:edit' : 'log_sources:create';
+}
 
 /**
  * Add data, optionally with one source preselected: the wizard opens on the
@@ -155,7 +162,7 @@ export function addDataSources(
 ): AddDataSource[] {
   const bySlug = new Map<string, AddDataSource>();
   for (const row of endpoint?.sources ?? []) {
-    if (isPlatformOnlySource(row.source_slug)) continue;
+    if (isPlatformOnlySource(row.source_slug) || row.source_slug.startsWith('otlp_') || UNATTRIBUTED_SLUGS.has(row.source_slug)) continue;
     if (!isRouteTemplate(row)) continue;
     if (row.route_state !== 'active' || !isDirectProtocol(row.protocol)) continue;
     const entry = bySlug.get(row.source_slug) ?? { slug: row.source_slug, protocols: [], enrolled: true };
@@ -165,7 +172,7 @@ export function addDataSources(
   for (const ls of logSources ?? []) {
     if (ls.lifecycle_status === 'draft') continue;
     for (const slug of registrySlugs(ls)) {
-      if (isPlatformOnlySource(slug)) continue;
+      if (isPlatformOnlySource(slug) || slug.startsWith('otlp_') || UNATTRIBUTED_SLUGS.has(slug)) continue;
       const entry = bySlug.get(slug) ?? { slug, protocols: [], enrolled: false };
       if (!entry.logSource) {
         entry.logSource = {

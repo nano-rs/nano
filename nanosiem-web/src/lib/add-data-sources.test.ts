@@ -4,9 +4,16 @@ import { describe, expect, it } from 'vitest';
 import type { LogSource, TenantIngestSource } from '@/lib/api/types';
 import {
   ADD_DATA_PATH, addDataLink, addDataSources, defaultCredentialLabel, issuableSlugs, preselectedAddDataSource,
-  preselectedCollectorSources, issueStepSearch, protocolsFor, tokenLost,
+  preselectedCollectorSources, issueStepSearch, protocolsFor, tokenLost, sourceOnboardingPermission,
 } from './add-data-sources';
 import { describeRefusal, refusalCode } from './ingest-credential-errors';
+
+it('requires edit for an existing source parser and create for other onboarding routes', () => {
+  expect(sourceOnboardingPermission('?stage=parse&source_id=lsrc_existing')).toBe('log_sources:edit');
+  for (const search of ['', '?stage=parse', '?stage=parse&source_id=', '?source_id=lsrc_existing', '?stage=connect&source_id=lsrc_existing']) {
+    expect(sourceOnboardingPermission(search)).toBe('log_sources:create');
+  }
+});
 
 function row(partial: Partial<TenantIngestSource>): TenantIngestSource {
   return {
@@ -22,6 +29,12 @@ function logSource(partial: Partial<LogSource>): LogSource {
 }
 
 describe('addDataSources (NAN-2593)', () => {
+  it('never offers unknown or default templates or registry labels (NAN-4847)', () => {
+    const sources = addDataSources({ sources: ['unknown', 'default', 'okta'].map((slug) => row({ source_slug: slug, label: `route template: ${slug}` })) },
+      [logSource({ match_values: ['unknown', 'default'] })]);
+    expect(sources.map((s) => s.slug)).toEqual(['okta']);
+  });
+
   it('excludes platform-only audit from active templates, registry entries and credential deep links', () => {
     const endpoint = { sources: [row({ source_slug: 'audit', label: 'route template: audit', protocol: 'nano_https' }),
       row({ source_slug: 'okta', label: 'route template: okta' })] };
@@ -102,9 +115,9 @@ describe('ingest credential refusal copy (NAN-2593)', () => {
 
 describe('Add data deep link (NAN-2946)', () => {
   it('builds the wizard link with an encoded source, or the bare wizard', () => {
-    expect(ADD_DATA_PATH).toBe('/ingestion/log-sources/wizard');
-    expect(addDataLink('apache_access')).toBe('/ingestion/log-sources/wizard?source=apache_access');
-    expect(addDataLink('a b&c')).toBe('/ingestion/log-sources/wizard?source=a%20b%26c');
+    expect(ADD_DATA_PATH).toBe('/ingestion/log-sources/new');
+    expect(addDataLink('apache_access')).toBe('/ingestion/log-sources/new?source=apache_access');
+    expect(addDataLink('a b&c')).toBe('/ingestion/log-sources/new?source=a%20b%26c');
     expect(addDataLink('  ')).toBe(ADD_DATA_PATH);
     expect(addDataLink(null)).toBe(ADD_DATA_PATH);
   });

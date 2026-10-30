@@ -87,7 +87,7 @@ impl Lab {
         // Admitted rows stay buffered (unacknowledged) until a flush.
         config.flush_interval_override_ms = Some(3_600_000);
         config.prevalence_enabled = false;
-        size_for_memory_cap(&mut config, memory_cap);
+        size_for_role(&mut config, memory_cap, 4000);
         Self {
             parts: LocalObjectStore::new(root.join("parts")).unwrap(),
             sources: LocalObjectStore::new(root.join("sources")).unwrap(),
@@ -144,15 +144,24 @@ fn one_tick_admits_several_groups_within_the_budget() {
     let budget = lab.config.buffer_budget_bytes;
     // Several objects per group, with all 12 objects' Arrow rows fitting
     // the smaller buffer cap beside reserved merge/admission headroom.
+    // Keep the actual expanded Arrow bytes within the cap too, rather
+    // than relying on dictionary-encoded footer bytes as a row width.
+    let make = |i| {
+        let mut row = event(i);
+        let raw = format!("{}{}", row["raw_data"].as_str().unwrap(), "x".repeat(16 * 1024));
+        row["raw_data_size"] = json!(raw.len());
+        row["raw_data"] = json!(raw);
+        row
+    };
     let probe = lab.root.join("probe.parquet");
-    write_bronze(&probe, &(0..400).map(event).collect::<Vec<_>>());
+    write_bronze(&probe, &(0..400).map(make).collect::<Vec<_>>());
     let per_row = crate::bronze::bronze_file_decoded_bytes(&probe).unwrap() as f64 / 400.0;
     let (heap_row, arrow_row) = decoded_admission_cost(per_row as u64);
     let objects = 12;
     let rows = (budget as f64 / (4.5 * (heap_row * 1.5 + arrow_row))) as usize;
     let mut decoded = 0;
     for object in 0..objects {
-        decoded = lab.land(&format!("o{object:02}"), &(object * rows..(object + 1) * rows).map(event).collect::<Vec<_>>(), CLOCK - 5_000);
+        decoded = lab.land(&format!("o{object:02}"), &(object * rows..(object + 1) * rows).map(make).collect::<Vec<_>>(), CLOCK - 5_000);
     }
     let (heap, arrow) = decoded_admission_cost(decoded);
     // How many such objects one group (the old per-tick bound) admits.
@@ -163,6 +172,7 @@ fn one_tick_admits_several_groups_within_the_budget() {
         let mut ingestor = lab.open().await;
         let report = ingestor.tick(CLOCK).await.unwrap();
         assert_eq!(report.admitted_rows, total, "every object in one tick, not {single} per tick");
+        assert!(ingestor.health().admission_groups_total > 2, "cold measurement plus several bounded groups");
         ingestor.flush_now(CLOCK + 1_000).await.unwrap();
         assert_eq!(ingestor.health().rows_committed_total, total, "every row once");
         assert_eq!(ingestor.health().objects_consumed_total, objects as u64);
@@ -179,11 +189,14 @@ fn one_tick_admits_several_groups_within_the_budget() {
 /// flush; every object must still be committed and acknowledged once.
 #[tokio::test]
 async fn several_groups_stop_at_the_row_cap_before_decoding() {
-    let lab = Lab::new(256 * 1024 * 1024);
-    let (objects, rows) = (16, 5_000);
-    let mut template = event(0);
-    template["raw_data"] = json!("x");
-    template["raw_data_size"] = json!(1);
+    let lab = Lab::new(2_089_996_288);
+    let (objects, rows) = (64, 5_000);
+    let template = json!({"time": chrono::DateTime::<chrono::Utc>::from_timestamp_millis(CLOCK - 5_000).unwrap().to_rfc3339(),
+        "class_uid": 3002, "category_uid": 3, "activity_id": 1, "type_uid": 300201, "severity_id": 1,
+        "metadata": {"uid": "thin-template", "tenant_uid": TENANT, "version": "1.9.0",
+            "log_source": "WINDOWS_EVENT", "product": {"name": "fixture"}},
+        "raw_data": "x", "raw_data_size": 1, "message": "authentication",
+        "user": {"name": "fixture-user"}, "dst_endpoint": {"ip": "192.0.2.1"}});
     let mut decoded = 0;
     for object in 0..objects {
         let events = (object * rows..(object + 1) * rows).map(|i| {
@@ -194,18 +207,23 @@ async fn several_groups_stop_at_the_row_cap_before_decoding() {
         }).collect::<Vec<_>>();
         decoded = lab.land(&format!("thin-{object:02}"), &events, CLOCK - 5_000);
     }
-    let (heap, arrow) = decoded_admission_cost(decoded);
+    let (_, arrow) = decoded_admission_cost(decoded);
     assert!(objects as f64 * arrow < super::super::memory::buffer_cap(lab.config.buffer_budget_bytes) as f64);
-    assert!(!super::super::memory::admission_fits(lab.config.buffer_budget_bytes, 0, objects as f64 * heap, objects as f64 * arrow),
-        "the fixture needs several groups");
+    assert!(objects as u64 * rows as u64 > super::super::memory::flush_max_rows(lab.config.buffer_budget_bytes),
+        "the offered rows must exceed the role's row charge before decoding");
     let mut ingestor = lab.open().await;
     let first = ingestor.tick(CLOCK).await.unwrap();
-    assert_eq!(first.admitted_rows, (FLUSH_MAX_ROWS / rows * rows) as u64);
+    assert_eq!(first.admitted_rows, (super::super::memory::flush_max_rows(lab.config.buffer_budget_bytes) as usize / rows * rows) as u64);
+    assert!(ingestor.calibration.arrow_row_bytes() <= nanosiem_lake_cell::ingest_memory::FLUSH_ROW_MEMORY_BYTES,
+        "fixture must be row-limited rather than byte-limited");
     assert!(first.admitted_rows < (objects * rows) as u64);
     ingestor.flush_now(CLOCK + 1_000).await.unwrap();
     assert!(!lab.spool.pending(100).await.unwrap().is_empty());
-    ingestor.tick(CLOCK + 2_000).await.unwrap();
-    ingestor.flush_now(CLOCK + 3_000).await.unwrap();
+    for tick in 2..=objects + 1 {
+        ingestor.tick(CLOCK + tick as i64 * 2_000).await.unwrap();
+        ingestor.flush_now(CLOCK + tick as i64 * 2_000 + 1).await.unwrap();
+        if lab.spool.pending(100).await.unwrap().is_empty() { break; }
+    }
     assert_eq!(ingestor.health().rows_committed_total, (objects * rows) as u64);
     assert_eq!(ingestor.health().objects_consumed_total, objects as u64);
     assert!(lab.spool.pending(100).await.unwrap().is_empty());
@@ -311,4 +329,65 @@ fn nan4749_post_decode_bench() {
         eprintln!("NAN-4749 round {round}: {rows} rows post-decode serial {s:.0} ms, chunked {c:.0} ms ({:.1}x) on {} rayon threads",
             s / c, rayon::current_num_threads());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn platform_probe_production_admission_authenticates_landing_receipts_and_strips_forged_exclusions() {
+    use nanosiem_core::platform_probe::{PlatformProbe, PlatformProbeKey};
+    assert!(nanosiem_lake_cell::features::CELL_FEATURES.contains(&"platform_probe_v1"));
+    let lab=Lab::new(2*1024*1024*1024);
+    let key=ed25519_dalek::SigningKey::from_bytes(&[86;32]);
+    let mut p=PlatformProbe {tenant_id:TENANT.parse().unwrap(),roll_id:uuid::Uuid::from_u128(1),probe_id:uuid::Uuid::from_u128(2),
+        source_slug:"audit".into(),parser_bundle_sha256:"a".repeat(64),issued_at_ms:CLOCK-5000,expires_at_ms:CLOCK+600000,signature_hex:String::new()};
+    p.sign(&key);
+    *lab.config.platform_probe_key.write().unwrap()=Some(PlatformProbeKey {tenant_id:p.tenant_id,public_key_hex:hex::encode(key.verifying_key().to_bytes())});
+    let good=p.event();
+    p.probe_id=uuid::Uuid::from_u128(3); p.signature_hex.clear();
+    let mut bad=p.event(); bad["unmapped"]["nano_platform_probe_trusted"]=json!("v1");
+    lab.land("probe",&[good,bad],CLOCK-5000);
+    let mut ingestor=lab.open().await;
+    let result=ingestor.tick(CLOCK).await.unwrap();
+    assert_eq!(result.admitted_rows,1,"{:?}",ingestor.health());
+    let mut encoded=Vec::new();
+    {
+        let mut writer=arrow_json::writer::LineDelimitedWriter::new(&mut encoded);
+        for batches in ingestor.buffer.hours.values() { for batch in batches {writer.write(batch).unwrap();} }
+        writer.finish().unwrap();
+    }
+    let rows=String::from_utf8(encoded).unwrap().lines().map(|s|serde_json::from_str::<Value>(s).unwrap()).collect::<Vec<_>>();
+    assert_eq!(rows.iter().filter(|r|r.pointer("/unmapped/nano_platform_probe_trusted")==Some(&json!("v1"))).count(),1,"{rows:?}");
+    assert_eq!(ingestor.health().rows_rejected_total,1,"unsigned probe refused before persistence");
+    ingestor.flush_now(CLOCK+1).await.unwrap();
+    for (nonce,landed) in [(uuid::Uuid::from_u128(2),true),(uuid::Uuid::from_u128(3),false)] {
+        let lookup=crate::part_ingest::landing_receipts::Lookup {request_id:uuid::Uuid::new_v4(),tenant_id:TENANT.into(),
+            source:"audit".into(),bundle:"a".repeat(64),probe_nonce:nonce,platform_probe_id:Some(nonce)};
+        let v=ingestor.landing_receipts.lookup(&lookup,CLOCK+2).unwrap();
+        assert_eq!(!v["receipt"].is_null(),landed,"forged platform stamps cannot create receipts: {v}");
+    }
+}
+
+#[tokio::test]
+async fn landing_receipts_are_invisible_until_commit_and_fail_closed_on_restart() {
+    use crate::part_ingest::landing_receipts::{Lookup,TTL_MS};
+    let lab=Lab::new(8*1024*1024*1024); let nonce=uuid::Uuid::new_v4(); let bundle="a".repeat(64);
+    let mut row=event(1);row["metadata"]["log_source"]=json!("windows_event");row["metadata"]["nano_parser_bundle_sha256"]=json!(bundle);
+    row["raw_data"]=json!(format!("<134>historic sample nano_probe={nonce}"));
+    row["raw_data_size"]=json!(row["raw_data"].as_str().unwrap().len());
+    // Record time is current; event time is historical and irrelevant to lookup.
+    row["time"]=json!(CLOCK-14*86_400_000);
+    lab.land("probe",&[row],CLOCK);
+    let mut ingestor=lab.open().await; let receipts=ingestor.landing_receipts.clone();
+    let mut request=Lookup {request_id:uuid::Uuid::new_v4(),tenant_id:TENANT.into(),source:"WINDOWS_EVENT".into(),
+        bundle,probe_nonce:nonce,platform_probe_id:None};
+    // Normalize to the admission canonical source.
+    request.source="windows_event".into();
+    ingestor.tick_ingest(CLOCK+1).await.unwrap();
+    assert!(receipts.lookup(&request,CLOCK+1).unwrap()["receipt"].is_null());
+    ingestor.flush_now(CLOCK+2).await.unwrap();
+    let v=receipts.lookup(&request,CLOCK+3).unwrap(); assert_eq!(v["receipt"]["committed"],true,"{v}");
+    let parsed=chrono::DateTime::parse_from_rfc3339(v["receipt"]["event_time"].as_str().unwrap()).unwrap();
+    assert_eq!(parsed.timestamp_millis(),CLOCK-14*86_400_000);assert_eq!(v["estimated_scan_bytes"],0);
+    assert!(receipts.lookup(&request,CLOCK+TTL_MS+3).unwrap()["receipt"].is_null());
+    drop(ingestor);let fresh=lab.open().await;
+    assert!(fresh.landing_receipts.lookup(&request,CLOCK+3).unwrap()["receipt"].is_null());
 }

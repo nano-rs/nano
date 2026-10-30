@@ -80,8 +80,9 @@ async fn nan4806_two_objects_decode_together_beside_a_real_flight() {
 fn nan4806_mythos_room_takes_a_slice_below_the_old_4096_row_floor() {
     use super::super::memory::*;
     let budget = buffer_budget_for(2_090_000_000);
-    // The reported 568 MB flight beside a 628 MB budget.
-    let committed = 568_000_000;
+    // Retain the reported 60 MB of admission headroom while the role's
+    // total working envelope scales with its measured reservations.
+    let committed = budget - 60_000_000;
     let (heap, arrow) = decoded_admission_cost(16_700_000);
     let rows = pipelined_slice_rows(budget, committed, heap, arrow, 10_000).unwrap();
     assert!((MIN_ADMISSION_SLICE_ROWS..4_096).contains(&rows));

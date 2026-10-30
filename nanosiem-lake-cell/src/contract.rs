@@ -502,8 +502,9 @@ impl IngestFlush {
     /// visibility ceiling. Mirrors `FlushPolicy::validate` in the worker.
     pub const AGE_FLOOR_MS: u64 = 1_000;
     pub const AGE_CEILING_MS: u64 = 120_000;
-    /// The ingest per-flush row cap (`FLUSH_MAX_ROWS`).
-    pub const MAX_TARGET_ROWS: u64 = 65_536;
+    /// Safety ceiling for configured target_rows only. Runtime flush
+    /// capacity comes from the ingest role memory model.
+    pub const MAX_TARGET_ROWS: u64 = 16_777_216;
 
     pub fn validate(&self) -> anyhow::Result<()> {
         let ages = Self::AGE_FLOOR_MS..=Self::AGE_CEILING_MS;

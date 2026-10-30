@@ -100,8 +100,8 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/ingestion/pipelines/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Pipelines', href: '/ingestion/pipelines' }, { label: ':dynamic' }] },
   { path: '/ingestion/connector-feeds', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Pull feeds' }] },
   { path: '/ingestion/log-sources', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources' }] },
-  { path: '/ingestion/log-sources/new', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Add data' }] },
-  { path: '/ingestion/log-sources/wizard', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Add data' }] },
+  { path: '/ingestion/log-sources/new', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Add source' }] },
+  { path: '/ingestion/log-sources/wizard', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Add source' }] },
   { path: '/ingestion/log-sources/credentials', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Credentials' }] },
   { path: '/ingestion/log-sources/onboarding', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Source onboarding' }] },
   { path: '/ingestion/log-sources/cloud-pull', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Cloud pull' }] },
@@ -223,7 +223,8 @@ export function AppBreadcrumbs() {
   // (NAN-911 F-16/F-32). If only "Home" remains after the drop we still
   // render — that single breadcrumb gives the user a one-click back to the
   // landing surface from any leaf route.
-  const trail = segments?.slice(0, -1) ?? [];
+  const { pathname } = useLocation();
+  const trail = pathname.endsWith('/ingestion/log-sources/new') ? segments ?? [] : segments?.slice(0, -1) ?? [];
   if (trail.length === 0) return null;
 
   return (

@@ -1041,6 +1041,13 @@ mod tests {
         let set = cell(serde_json::json!({"ingest_flush": {"min_age_ms": 2000, "max_age_ms": 8000, "target_rows": 2000}})).unwrap();
         set.validate().unwrap();
         assert_eq!(set.ingest_flush, Some(crate::contract::IngestFlush { min_age_ms: 2_000, max_age_ms: 8_000, target_rows: 2_000 }));
+        let ceiling = crate::contract::IngestFlush::MAX_TARGET_ROWS;
+        for rows in [65_537, ceiling] {
+            cell(serde_json::json!({"ingest_flush": {"min_age_ms": 2000, "max_age_ms": 8000, "target_rows": rows}}))
+                .unwrap().validate().unwrap();
+        }
+        assert!(cell(serde_json::json!({"ingest_flush": {"min_age_ms": 2000, "max_age_ms": 8000, "target_rows": ceiling + 1}}))
+            .unwrap().validate().is_err());
         for bad in [
             serde_json::json!({"min_age_ms": 500, "max_age_ms": 8000, "target_rows": 2000}),
             serde_json::json!({"min_age_ms": 2000, "max_age_ms": 180000, "target_rows": 2000}),

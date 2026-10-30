@@ -583,6 +583,7 @@ pub(crate) mod tests {
 
     pub fn part_ref(n: u64, level: Level) -> PartRef {
         PartRef {
+            request_hours: None,
             part_id: id(n),
             level,
             event_hour: (T0 / HOUR) as i32,

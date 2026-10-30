@@ -431,6 +431,139 @@ fn coded_exits_are_classified_by_whether_the_object_can_cause_them() {
     assert!(!exit_keeps_charges(Some(&anyhow::anyhow!("ingest writer epoch changed; restart required"))), "epoch change");
     assert!(!exit_keeps_charges(Some(&anyhow::anyhow!("credentials expired and refresh gave up"))), "credentials");
     assert!(!exit_keeps_charges(Some(&anyhow::anyhow!("enrichment refresh: owner 503"))), "enrichment");
+    for status in [401, 403, 413, 422, 503] {
+        let error = anyhow::Error::new(super::super::cell::OwnerSignRefused { status })
+            .context("publish").context(RetryWindowExhausted(1_800));
+        assert!(!exit_keeps_charges(Some(&error)), "owner HTTP {status} is never poison evidence");
+    }
+}
+
+/// NAN-4873: real HTTP signer, part builder, pending ledger and restart path.
+/// The old owner refuses request_hours; an updated owner signs the SAME part
+/// in-process. Neither repeated window exits nor a kill during backoff may
+/// turn a contract skew into a quarantined/ACKed-away source object.
+#[tokio::test]
+async fn nan4873_owner_schema_skew_preserves_pending_rows_and_request_dedup() {
+    use super::super::cell::{HttpPartSigner, OwnerRecordRefused};
+    use crate::parts::provenance::{owner_check_part, Ed25519Signature, OwnerCaller, SignRequest, SignResponse, SignResult, TenantKeySet};
+    use axum::{routing::post, Json, Router};
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let key = SigningKey::from_bytes(&[73; 32]);
+    let key_id = "owner-nan4873";
+    let trusted = TenantKeySet::new([(key_id.into(), key.verifying_key())]);
+    let upgraded = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = Router::new().route("/sign", post({
+        let upgraded = upgraded.clone();
+        let seen = seen.clone();
+        move |headers: axum::http::HeaderMap, Json(request): Json<SignRequest>| {
+            let (upgraded, seen, key) = (upgraded.clone(), seen.clone(), key.clone());
+            async move {
+                assert_eq!(headers["X-Nano-Lake-Sign-Checks"], "1");
+                let results = request.parts.iter().map(|part| {
+                    let record = owner_check_part(&request.tenant_id, part, None, key_id, OwnerCaller::CellBearer).unwrap();
+                    assert_eq!(record.request_hours.unwrap().first, BASE_HOUR as i32);
+                    seen.lock().unwrap().push((part.part_id.clone(), part.record_sha256.clone()));
+                    let accepted = upgraded.load(Ordering::SeqCst);
+                    SignResult {
+                        part_id: part.part_id.clone(), record_sha256: part.record_sha256.clone(),
+                        signature: accepted.then(|| Ed25519Signature { alg: "ed25519".into(), key_id: key_id.into(),
+                            sig: base64::engine::general_purpose::STANDARD.encode(key.sign(&record.signing_message().unwrap()).to_bytes()) }),
+                        error: (!accepted).then(|| "record_invalid".into()),
+                        check: (!accepted).then(|| "schema:(root):unrecognized_keys:request_hours".into()),
+                    }
+                }).collect();
+                Json(SignResponse { schema_version: 1, request_id: request.request_id, results })
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let signer = HttpPartSigner::new(&format!("http://{addr}/sign"), "fixture", key_id, trusted.clone(), None).unwrap();
+    let parts = LocalObjectStore::new(root.join("parts")).unwrap();
+    let sources = LocalObjectStore::new(root.join("sources")).unwrap();
+    let spool = SpoolQueue::new(root.join("spool"), TENANT).unwrap();
+    std::fs::create_dir_all(root.join("sources/bronze")).unwrap();
+    let mut events = (0..6).map(event).collect::<Vec<_>>();
+    for (i, row) in events.iter_mut().enumerate() {
+        row["metadata"]["uid"] = json!(format!("nano-request-v1:{BASE_HOUR}:{i:064x}"));
+    }
+    write_bronze(&root.join("sources/bronze/pending.parquet"), &events);
+    spool.deliver(&notice("bronze/pending.parquet", CLOCK - 1_000)).unwrap();
+    let mut cfg = IngestConfig::new(TENANT, root.join("work"));
+    cfg.flush_interval_override_ms = Some(0);
+    cfg.prevalence_enabled = false;
+    let seed = seed_schema();
+    let open = || Ingestor::open(cfg.clone(), &parts, &sources, &spool as &dyn NoticeQueue, &signer,
+        trusted.clone(), BronzeIngestEnricher::disabled(), &seed, CLOCK);
+    let id = object_id("bronze/pending.parquet", "1");
+    for attempt in 0..MAX_ADMISSION_CRASHES + 2 {
+        let mut ingestor = open().await.unwrap();
+        let error = ingestor.tick(CLOCK + i64::from(attempt) * 1_000).await.unwrap_err();
+        assert!(error.downcast_ref::<OwnerRecordRefused>().is_some(), "{error:#}");
+        assert!(format!("{error:#}").contains("check=schema:(root):unrecognized_keys:request_hours"));
+        assert_eq!(ingestor.health().rows_committed_total, 0);
+        assert_eq!(ingestor.health().rows_rejected_total, 0);
+        assert!(ingestor.quarantine_entries().unwrap().is_empty());
+        assert_eq!(spool.pending(10).await.unwrap().len(), 1);
+        // Already durable BEFORE the orderly exit, protecting a kill in backoff.
+        assert_eq!(AdmissionAttempts::open(&root.join("work")).suspect(&id), Some(0));
+        let error = error.context(RetryWindowExhausted(1_800));
+        ingestor.note_coded_exit(Some(&error), "retry_window");
+    }
+    let mut ingestor = open().await.unwrap();
+    ingestor.tick(CLOCK + 10_000).await.unwrap_err();
+    let refused = seen.lock().unwrap().last().unwrap().clone();
+    upgraded.store(true, Ordering::SeqCst);
+    ingestor.flush_now(CLOCK + 10_001).await.unwrap();
+    assert_eq!(seen.lock().unwrap().last(), Some(&refused), "same part and canonical digest after owner recovery");
+    assert_eq!(ingestor.health().rows_committed_total, 6);
+    assert_eq!(ingestor.health().rows_rejected_total, 0);
+    assert_eq!(ingestor.live_parts().iter().map(|p| p.rows).sum::<u64>(), 6);
+    assert!(ingestor.live_parts().iter().all(|p| p.request_hours.is_some()));
+    assert!(spool.pending(10).await.unwrap().is_empty());
+    drop(ingestor);
+
+    // Restart, same request UIDs in a different event hour: recover the signed
+    // request-hour summary and drop only these confirmed stored duplicates.
+    let retry_time = chrono::DateTime::from_timestamp_millis(CLOCK + 3_600_000).unwrap().to_rfc3339();
+    for row in &mut events { row["time"] = json!(retry_time); }
+    write_bronze(&root.join("sources/bronze/retry.parquet"), &events);
+    spool.deliver(&notice("bronze/retry.parquet", CLOCK + 3_600_000)).unwrap();
+    let mut ingestor = open().await.unwrap();
+    ingestor.tick(CLOCK + 3_601_000).await.unwrap();
+    ingestor.flush_now(CLOCK + 3_601_001).await.unwrap();
+    assert_eq!(ingestor.health().duplicates_dropped_total, 6);
+    assert_eq!(ingestor.live_parts().iter().map(|p| p.rows).sum::<u64>(), 6);
+    assert!(spool.pending(10).await.unwrap().is_empty());
+    // Reconcile the actual stored rows, not just health or manifest counters.
+    let live_ids = ingestor.live_parts().iter().map(|p| p.part_id.to_string()).collect::<Vec<_>>();
+    let mut stored_uids = BTreeSet::new();
+    let mut stored_rows = 0;
+    for key in parts.list("").await.unwrap() {
+        if !key.contains("/data-") || !key.ends_with(".parquet") || !live_ids.iter().any(|id| key.contains(id.as_str())) { continue; }
+        let data = bytes::Bytes::from(parts.get(&key).await.unwrap().unwrap());
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(data).unwrap().build().unwrap();
+        for batch in reader {
+            let mut json = arrow_json::LineDelimitedWriter::new(Vec::new());
+            json.write(&batch.unwrap()).unwrap();
+            json.finish().unwrap();
+            for line in json.into_inner().split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                let row: Value = serde_json::from_slice(line).unwrap();
+                stored_uids.insert(row["metadata"]["uid"].as_str().unwrap().to_string());
+                stored_rows += 1;
+            }
+        }
+    }
+    assert_eq!(stored_rows, 6);
+    assert_eq!(stored_uids, events.iter().map(|row| row["metadata"]["uid"].as_str().unwrap().to_string()).collect());
+    server.abort();
 }
 
 /// NAN-4553 (review P1): an object that fails every tick WITHOUT crashing

@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "profile": "ocsf",
+  "dataset": "logs",
+  "source_placeholder": "__nano_lake_source__",
+  "query_sha256": "2aeea8f54391e4ef15cbceae34f7c090dfe5e42545bdc4ac1307c7e9284c1cac",
+  "start": "2026-09-24T07:00:00Z",
+  "end": "2026-09-25T07:01:00Z",
+  "limit": 501,
+  "table_view": false,
+  "newest_first_event_rows": true,
+  "stats_page": false,
+  "candidate_hints": [
+    {
+      "kind": "keyword",
+      "mode": "token",
+      "value": "14e0857b37f6c5e5e90bab786a4db8fceb4166afe75e617519d942656976481e"
+    }
+  ],
+  "required_columns": [
+    {
+      "name": "class_uid",
+      "field_type": "long"
+    },
+    {
+      "name": "device.hostname",
+      "field_type": "string"
+    },
+    {
+      "name": "message",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.log_source",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.uid",
+      "field_type": "string"
+    },
+    {
+      "name": "raw_data",
+      "field_type": "string"
+    },
+    {
+      "name": "time",
+      "field_type": "timestamp"
+    }
+  ],
+  "projected_scan_columns": [
+    "class_uid",
+    "device.hostname",
+    "message",
+    "metadata.log_source",
+    "raw_data",
+    "time"
+  ],
+  "sql": "WITH stage_0 AS (\n  SELECT * FROM __nano_lake_source__\n  WHERE time >= '2026-09-24 07:00:00.000000' AND time < '2026-09-25 07:01:00.000000'\n  AND ((((hasAllTokens(lower(message), '14e0857b37f6c5e5e90bab786a4db8fceb4166afe75e617519d942656976481e') OR hasAllTokens(lower(raw_data), '14e0857b37f6c5e5e90bab786a4db8fceb4166afe75e617519d942656976481e'))) AND lower(\"metadata.log_source\") != 'audit'))\n),\nstage_1 AS (\n  SELECT * FROM stage_0\n  ORDER BY time DESC, \"metadata.uid\" DESC\n  LIMIT 100\n)\nSELECT time, \"device.hostname\", class_uid FROM stage_1 ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 100 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=1, optimize_aggregation_in_order=1"
+}

@@ -285,6 +285,8 @@ pub struct Funnel {
     pub progressive: bool,
     pub counting: bool,
     pub two_pass: bool,
+    /// Compiler-shape decision, distinct from whether the route executed it.
+    pub two_pass_reason: Option<&'static str>,
     /// The aggregate was answered by the per-part fragment path.
     pub fragment_aggregate: bool,
     /// NAN-3644: the read was over the cold ceiling and ran in batches.
@@ -519,6 +521,7 @@ impl Drop for RequestGuard {
             funnel_keyword_hints = p.funnel.keyword_hints, funnel_entity_hints = p.funnel.entity_hints,
             funnel_uses_entities = p.funnel.uses_entities, funnel_token_seed_applies = p.funnel.token_seed_applies,
             funnel_progressive = p.funnel.progressive, funnel_counting = p.funnel.counting,
+            funnel_two_pass_reason = p.funnel.two_pass_reason,
             funnel_two_pass = p.funnel.two_pass, funnel_fragment_aggregate = p.funnel.fragment_aggregate,
             funnel_cold_batches = p.funnel.cold_batches,
             funnel_whole_window_preselected = p.funnel.whole_window_preselected,

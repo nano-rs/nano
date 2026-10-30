@@ -313,6 +313,7 @@ fn record_for(
         })
         .collect::<Result<Vec<_>>>()?;
     let record = ProvenanceRecord {
+        request_hours: None,
         format: PROVENANCE_FORMAT.to_string(),
         signer_key_id: signer_key_id.to_string(),
         tenant_id: plan.tenant_id.clone(),

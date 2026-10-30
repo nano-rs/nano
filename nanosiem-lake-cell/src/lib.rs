@@ -22,6 +22,7 @@
 //! - [`upstream`]: the egress watchdog behind `/readyz` (NAN-3440).
 
 pub mod budget;
+pub mod ingest_memory;
 pub mod child;
 pub mod config;
 pub mod contract;
@@ -31,6 +32,7 @@ pub mod disk_ceiling;
 pub mod fdpass;
 pub mod features;
 pub mod handover;
+pub mod hec_proxy;
 pub mod identity;
 pub mod jail;
 pub mod landing_budget;

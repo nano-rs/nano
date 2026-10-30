@@ -162,25 +162,34 @@ fn rss_bytes() -> u64 {
 }
 
 /// Samples RSS every 2 ms; `take` returns the max since the last take.
-struct RssSampler {
+pub(crate) struct RssSampler {
+    guard_max: Arc<std::sync::atomic::AtomicU64>,
     max: Arc<std::sync::atomic::AtomicU64>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RssSampler {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         let max = Arc::new(AtomicU64::new(rss_bytes()));
+        let guard_max = Arc::new(AtomicU64::new(0));
+        let guard_sample = guard_max.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let (m, s) = (max.clone(), stop.clone());
         let thread = std::thread::spawn(move || while !s.load(Ordering::Relaxed) {
             m.fetch_max(rss_bytes(), Ordering::Relaxed);
+            if let Some((used, _)) = super::merge_lanes::cgroup_memory() {
+                guard_sample.fetch_max(used, Ordering::Relaxed);
+            }
             std::thread::sleep(std::time::Duration::from_millis(2));
         });
-        Self { max, stop, thread: Some(thread) }
+        Self { guard_max, max, stop, thread: Some(thread) }
     }
-    fn take(&self) -> u64 {
+    pub(crate) fn guard_peak(&self) -> u64 {
+        self.guard_max.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub(crate) fn take(&self) -> u64 {
         self.max.swap(rss_bytes(), std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -214,7 +223,7 @@ fn mib(bytes: impl Into<f64>) -> f64 {
 }
 
 /// NAN-3183 OOM: every large allocation of one catch-up cycle (admission,
-/// the Arrow buffer, a FLUSH_MAX_ROWS flush build with parallel L0
+/// the Arrow buffer, a reference full flush build with parallel L0
 /// writers), measured as live heap (all threads) and RSS:
 /// NAN3183_SEGMENTS=/path cargo test --release -p nanosiem-lake-worker --lib catchup_memory_profile -- --ignored --nocapture
 #[test]
@@ -223,7 +232,7 @@ fn catchup_memory_profile() {
     use crate::test_heap::{live, peak, reset_peak, track_all_threads, MEASUREMENT};
     let _serial = MEASUREMENT.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::path::PathBuf::from(std::env::var("NAN3183_SEGMENTS").expect("NAN3183_SEGMENTS"));
-    let flush_rows: usize = std::env::var("NAN3183_FLUSH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(crate::parts::levels::FLUSH_MAX_ROWS);
+    let flush_rows: usize = std::env::var("NAN3183_FLUSH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4 * super::ingest::L0_PARALLEL_MIN_ROWS);
     crate::parts::block_index::set_enabled(true);
     crate::parts::token_counts::set_enabled(true);
     crate::identity_observations::set_enabled(true);

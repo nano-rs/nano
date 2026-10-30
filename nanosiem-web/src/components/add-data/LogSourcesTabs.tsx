@@ -13,13 +13,12 @@ export function LogSourcesTabs({ active }: { active: 'sources' | 'onboarding' | 
   const shared = user?.deployment_mode === 'enterprise_shared';
   const tabs = [
     { id: 'sources', label: 'Log sources', href: '/ingestion/log-sources' },
-    { id: 'onboarding', label: 'Onboarding', href: '/ingestion/log-sources/onboarding' },
     { id: 'credentials', label: 'Credentials', href: INGEST_CREDENTIALS_PATH },
     { id: 'cloud-pull', label: 'Cloud pull', href: CLOUD_PULL_PATH },
   ] as const;
   return (
     <nav className="shrink-0 flex items-end gap-1 px-4 border-b border-border bg-background" aria-label="Log sources">
-      {tabs.filter(t => shared || t.id === 'sources' || t.id === 'onboarding').map((t) => (
+      {tabs.filter(t => shared || t.id === 'sources').map((t) => (
         <Link
           key={t.id}
           to={t.href}

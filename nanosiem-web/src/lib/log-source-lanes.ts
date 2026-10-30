@@ -21,6 +21,12 @@ export function logSourceSlugs(source: Pick<LogSource, 'ingest'>): string[] | nu
   return slugs.length > 0 ? slugs : null;
 }
 
+/** Events can arrive before the tenant has activated a parser. */
+export function receivingWithoutParser(source: Pick<LogSource, 'deployed' | 'ingest'>,
+  activity: { events_last_hour?: number; events_last_24h?: number } | null | undefined = source.ingest): boolean {
+  return !source.deployed && ((activity?.events_last_hour ?? 0) > 0 || (activity?.events_last_24h ?? 0) > 0);
+}
+
 /** Subtitle for a log source row: its lake slugs when known, else the transport sentinel. */
 export function logSourceSlugLabel(source: Pick<LogSource, 'ingest' | 'source_type'>): string {
   return logSourceSlugs(source)?.join(', ') ?? source.source_type;

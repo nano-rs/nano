@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "profile": "ocsf",
+  "dataset": "logs",
+  "source_placeholder": "__nano_lake_source__",
+  "query_sha256": "ef89dd435d623fc025a3566bfddace6862e0a837712c6ef735a8280966ad7b71",
+  "start": "2026-09-24T07:00:00Z",
+  "end": "2026-09-25T07:01:00Z",
+  "limit": 501,
+  "table_view": false,
+  "newest_first_event_rows": false,
+  "stats_page": true,
+  "candidate_hints": [
+    {
+      "kind": "class",
+      "value": 1007
+    }
+  ],
+  "required_columns": [
+    {
+      "name": "class_uid",
+      "field_type": "long"
+    },
+    {
+      "name": "message",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.log_source",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.uid",
+      "field_type": "string"
+    },
+    {
+      "name": "process.name",
+      "field_type": "string"
+    },
+    {
+      "name": "time",
+      "field_type": "timestamp"
+    }
+  ],
+  "projected_scan_columns": [
+    "class_uid",
+    "metadata.log_source",
+    "process.name",
+    "time"
+  ],
+  "sql": "WITH stage_0 AS (\n  SELECT class_uid, message, \"metadata.log_source\", \"metadata.uid\", \"process.name\", time FROM __nano_lake_source__\n  WHERE time >= '2026-09-24 07:00:00.000000' AND time < '2026-09-25 07:01:00.000000'\n  AND (((class_uid = 1007) AND lower(\"metadata.log_source\") != 'audit'))\n),\nstage_1 AS (\n  SELECT \"process.name\" AS \"process.name\", count() AS c\n  FROM stage_0\n  GROUP BY \"process.name\"\n),\nstage_2 AS (\n  SELECT * FROM stage_1\n  ORDER BY c DESC, \"process.name\" ASC\n),\nstage_3 AS (\n  SELECT * FROM stage_2\n  LIMIT 20\n),\n__nano_stats_ranked AS (\n  SELECT *, count() OVER () AS __nano_stats_total, row_number() OVER (ORDER BY c DESC, \"process.name\" ASC ) AS __nano_stats_ordinal FROM stage_3\n)\nSELECT * FROM __nano_stats_ranked WHERE __nano_stats_ordinal = 1 OR (__nano_stats_ordinal > 0 AND __nano_stats_ordinal <= 501) ORDER BY __nano_stats_ordinal LIMIT 501 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=0, optimize_aggregation_in_order=0"
+}

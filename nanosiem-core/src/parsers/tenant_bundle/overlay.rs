@@ -44,6 +44,23 @@ pub const TENANT_PARSER_DIR: &str = "sources/parsers/";
 /// a base that does is refused, so a tenant name can never shadow a platform
 /// component.
 pub const TENANT_PREFIX: &str = "tenant__";
+/// Transport-only enrollments: no parser, route or sink is introduced.
+pub const UNPARSED_SOURCES_FILE: &str = "tenant__unparsed.manifest";
+
+pub fn unparsed_sources(tree: &BundleTree) -> Result<Vec<String>, String> {
+    let Some(bytes) = tree.file(UNPARSED_SOURCES_FILE) else { return Ok(Vec::new()) };
+    if bytes.len() > 32 * 1024 { return Err("unparsed source manifest exceeds its bound".into()) }
+    let slugs: Vec<String> = serde_json::from_slice(bytes).map_err(|_| "invalid unparsed source manifest")?;
+    if slugs.is_empty() || slugs.len() > super::model::MAX_SOURCES
+        || slugs.iter().any(|s| !SOURCE_SLUG_RE.is_match(s) || ["unknown", "default", "audit", "otlp_log", "otlp_metric", "otlp_trace"].contains(&s.as_str()))
+        || slugs.windows(2).any(|pair| pair[0] >= pair[1])
+        || serde_json::to_vec(&slugs).map_err(|e| e.to_string())? != bytes
+    {
+        return Err("unparsed sources must be canonical, sorted, unique tenant slugs".into());
+    }
+    Ok(slugs)
+}
+
 
 const HEC_TOKEN_PREFIX: &str = "${VECTOR_AUTH_TOKEN}:nano-source-v1:";
 /// Fixed `# Generated at:` value: the artifact is content-addressed, so it
@@ -666,12 +683,22 @@ pub fn apply_overlay_with(
     let mut candidate = base.clone();
     let mut generated = Vec::with_capacity(ordered.len());
     let mut names = BTreeMap::new();
+    let mut unparsed = Vec::new();
     for source in ordered {
         if let Err(message) = profile.slug_allowed(base, &platform, &source.slug) {
             return Err(TenantBundleError::Overlay {
                 slug: Some(source.slug.clone()),
                 message,
             });
+        }
+        if source.parser_vrl.trim().is_empty()
+            && !(source.extension_enabled && source.extension_vrl.as_deref().is_some_and(|v| !v.trim().is_empty()))
+        {
+            if ["default", "audit", "otlp_log", "otlp_metric", "otlp_trace"].contains(&source.slug.as_str()) {
+                return Err(TenantBundleError::Input("reserved source cannot enroll as unparsed".into()));
+            }
+            unparsed.push(source.slug.clone());
+            continue;
         }
         let sampled = source.sampling_ratio.is_some_and(|ratio| ratio < 1.0);
         let tenant = TenantName::new(&source.slug, sampled);
@@ -767,6 +794,17 @@ pub fn apply_overlay_with(
         let routed = insert_routes(&router, &tenants).map_err(wiring_error)?;
         candidate.put(ROUTER_FILE, routed.into_bytes());
     }
+    if !unparsed.is_empty() {
+        if profile != OverlayProfile::Full {
+            return Err(TenantBundleError::Input("unparsed sources have no pull lane".into()));
+        }
+        let enrollments: Vec<TenantName> = unparsed.iter().map(|slug| TenantName::new(slug, false)).collect();
+        for point in profile.points().filter(|point| point.file == HEC_FILE) {
+            let edited = insert_array(candidate.text(point.file)?, point, &enrollments).map_err(TenantBundleError::Base)?;
+            candidate.put(point.file, edited.into_bytes());
+        }
+        candidate.put(UNPARSED_SOURCES_FILE, serde_json::to_vec(&unparsed).map_err(|e| TenantBundleError::Input(e.to_string()))?);
+    }
     Ok((candidate, generated))
 }
 
@@ -778,6 +816,7 @@ pub fn apply_overlay_with(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedOverlay {
     pub tenants: Vec<TenantName>,
+    pub unparsed_sources: Vec<String>,
     /// Sorted platform + tenant slugs (the source authority's `hec_sources`).
     pub hec_sources: Vec<String>,
     pub hec_config_sha256: String,
@@ -846,7 +885,24 @@ pub fn strip_overlay_with(
         let ocsf_sampled = declared.contains(&sampled_probe.component("_ocsf_sample"));
         tenants.push(TenantName::new(&slug, sampled).with_ocsf_sampled(ocsf_sampled));
     }
+    let unparsed = unparsed_sources(candidate).map_err(|message| vec![finding(Some(UNPARSED_SOURCES_FILE), None, "wiring", message)])?;
+    if profile != OverlayProfile::Full && !unparsed.is_empty() {
+        return Err(vec![finding(Some(UNPARSED_SOURCES_FILE), None, "wiring", "unparsed sources have no pull lane".into())]);
+    }
+    if unparsed.iter().any(|slug| tenants.iter().any(|tenant| &tenant.slug == slug)) {
+        return Err(vec![finding(Some(UNPARSED_SOURCES_FILE), None, "wiring", "source is both parsed and unparsed".into())]);
+    }
     let mut platform = candidate.clone();
+    platform.files.remove(UNPARSED_SOURCES_FILE);
+    if !unparsed.is_empty() {
+        let enrollments: Vec<TenantName> = unparsed.iter().map(|slug| TenantName::new(slug, false)).collect();
+        for point in profile.points().filter(|point| point.file == HEC_FILE) {
+            match platform.text(point.file).map(str::to_string).map_err(|e| e.to_string()).and_then(|text| strip_array(&text, point, &enrollments)) {
+                Ok(text) => platform.put(point.file, text.into_bytes()),
+                Err(message) => findings.push(finding(Some(point.file), None, "wiring", message)),
+            }
+        }
+    }
     if !tenants.is_empty() {
         for point in profile.points() {
             let Ok(text) = platform.text(point.file).map(str::to_string) else {
@@ -1165,6 +1221,12 @@ pub fn verify_against_base_with(
         Ok(slugs) => slugs,
         Err(e) => return Err(vec![finding(Some(HEC_FILE), None, "base", e.to_string())]),
     };
+    let unparsed = unparsed_sources(candidate).map_err(|message| vec![finding(Some(UNPARSED_SOURCES_FILE), None, "wiring", message)])?;
+    for slug in &unparsed {
+        if let Err(message) = profile.slug_allowed(base, &platform_slugs, slug) {
+            findings.push(finding(None, Some(slug), "namespace", message));
+        }
+    }
     for tenant in &tenants {
         if let Err(message) = profile.slug_allowed(base, &platform_slugs, &tenant.slug) {
             findings.push(finding(
@@ -1228,14 +1290,17 @@ pub fn verify_against_base_with(
     let hec_sources: Vec<String> = platform_slugs
         .into_iter()
         .chain(tenants.iter().map(|t| t.slug.clone()))
+        .chain(unparsed.iter().cloned())
         .collect::<BTreeSet<String>>()
         .into_iter()
         .collect();
-    let overlay_files = tenants.iter().map(TenantName::file).collect();
+    let mut overlay_files: Vec<String> = tenants.iter().map(TenantName::file).collect();
+    if !unparsed.is_empty() { overlay_files.push(UNPARSED_SOURCES_FILE.into()); }
     Ok(VerifiedOverlay {
         hec_config_sha256: sha256_hex(candidate.file(HEC_FILE).unwrap_or_default()),
         output_guard_sha256: sha256_hex(candidate.file(OUTPUT_GUARD_FILE).unwrap_or_default()),
         tenants,
+        unparsed_sources: unparsed,
         hec_sources,
         overlay_files,
     })

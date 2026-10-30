@@ -90,6 +90,7 @@ async fn fixture() -> Fixture {
     let signature = signer.sign(TENANT, std::slice::from_ref(&record)).await.unwrap().remove(0);
     let provenance = SignedProvenance::assemble(record.clone(), signature, &signer.trusted()).unwrap().to_bytes().unwrap();
     let part = PartRef {
+        request_hours: None,
         part_id: record.part_id.clone(), level: record.level, event_hour: record.event_hour, event_day: None, rows: record.rows,
         min_time_us: record.min_time_us, max_time_us: record.max_time_us, schema_fingerprint: record.schema_fingerprint.clone(),
         provenance_sha256: sha256_hex(&provenance), merkle_root: record.merkle_root.clone(), sorted: true, data_bytes: 1,

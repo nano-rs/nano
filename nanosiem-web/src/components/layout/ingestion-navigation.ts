@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { FolderInput, KeyRound, Network, PlusCircle, Rss } from 'lucide-react';
+import { FolderInput, KeyRound, Network, Rss } from 'lucide-react';
 import type { NavItem } from './AppLayout';
 
 /** Whether a nav item belongs on this edition (hosted-shared vs open core / dedicated). */
@@ -18,10 +18,8 @@ export function visibleOnEdition(item: Pick<NavItem, 'hideOnShared' | 'sharedOnl
  * (Log Sources → Cloud pull). Open core and dedicated keep it.
  */
 export const ingestionNavigation: NavItem[] = [
-  { name: 'Pipelines', href: '/ingestion/pipelines', icon: Network, permissions: 'log_sources:view', sharedOnly: true },
-  { name: 'Add data', href: '/ingestion/log-sources/wizard', icon: PlusCircle, permissions: 'log_sources:create' },
   { name: 'Log Sources', href: '/ingestion/log-sources', icon: Rss, permissions: 'log_sources:view' },
-  { name: 'Source onboarding', href: '/ingestion/log-sources/onboarding', icon: FolderInput, permissions: 'log_sources:view' },
+  { name: 'Pipelines', href: '/ingestion/pipelines', icon: Network, permissions: 'log_sources:view', sharedOnly: true },
   { name: 'Repositories', href: '/ingestion/log-sources/repositories', icon: FolderInput, permissions: 'parsers:view' },
   { name: 'Pull feeds', href: '/ingestion/connector-feeds', icon: Rss, permissions: 'log_sources:view', hideOnShared: true },
   { name: 'Source Configs', href: '/ingestion/source-configurations', icon: Network, permissions: 'source_configs:view', hideOnShared: true },

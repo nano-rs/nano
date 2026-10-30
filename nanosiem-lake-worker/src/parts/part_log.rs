@@ -37,6 +37,8 @@ pub const GENESIS_PREV: &str = "000000000000000000000000000000000000000000000000
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_hours: Option<super::request_dedup::RequestHours>,
     pub part_id: PartId,
     pub level: Level,
     pub event_hour: i32,
@@ -58,6 +60,7 @@ pub struct PartRef {
 
 impl PartRef {
     fn validate(&self) -> Result<()> {
+        if self.request_hours.is_some_and(|hours| !hours.valid()) { bail!("invalid source request-hour summary"); }
         if self.rows == 0 || self.min_time_us > self.max_time_us || self.row_groups == 0 || self.data_files == 0 {
             bail!("part reference bounds are invalid");
         }
@@ -75,7 +78,8 @@ impl PartRef {
     /// Contract 4.5: the log's reference must equal the owner-signed record
     /// on every shared field.
     pub fn check_record(&self, record: &super::provenance::ProvenanceRecord, provenance_sha256: &str) -> Result<()> {
-        let same = self.part_id == record.part_id
+        let same = self.request_hours == record.request_hours
+            && self.part_id == record.part_id
             && self.level == record.level
             && self.event_hour == record.event_hour
             && self.event_day == record.event_day
@@ -97,6 +101,7 @@ impl PartRef {
     /// Build the reference for a signed record.
     pub fn from_record(record: &super::provenance::ProvenanceRecord, provenance_sha256: &str, sorted: bool) -> Self {
         Self {
+            request_hours: record.request_hours,
             part_id: record.part_id.clone(),
             level: record.level,
             event_hour: record.event_hour,
@@ -2063,6 +2068,7 @@ mod tests {
 
     fn part(n: u64, level: Level) -> PartRef {
         PartRef {
+            request_hours: None,
             part_id: PartId::parse(&format!("{:013}-{:016x}", 1_000 + n, n)).unwrap(),
             level,
             event_hour: 10,

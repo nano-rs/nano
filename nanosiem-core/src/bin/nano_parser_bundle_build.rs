@@ -134,6 +134,22 @@ fn run(args: &[String]) -> Result<(), String> {
             }));
             Ok(())
         }
+        Some("upgrade-source-ack") => {
+            use nanosiem_core::parsers::tenant_bundle::{archive, source_ack, overlay};
+            use sha2::{Digest, Sha256};
+            let base = std::fs::read(required(args, "--base")?).map_err(|e| e.to_string())?;
+            let tree = archive::unpack(&base).map_err(|e| e.to_string())?;
+            let with = source_ack::upgrade_source_ack(&tree).map_err(|e| e.to_string())?;
+            let packed = archive::pack(&with).map_err(|e| e.to_string())?;
+            std::fs::write(required(args, "--out")?, &packed).map_err(|e| e.to_string())?;
+            println!("{}", serde_json::json!({
+                "baseSha256": hex::encode(Sha256::digest(&base)),
+                "sha256": hex::encode(Sha256::digest(&packed)),
+                "bytes": packed.len(),
+                "hecSources": overlay::platform_slugs(&with).map_err(|e| e.to_string())?,
+            }));
+            Ok(())
+        }
         Some("upgrade-bronze-buffer-bytes") => {
             // NAN-3523: the byte-bounded bronze sink buffer.
             use nanosiem_core::parsers::tenant_bundle::{archive, bronze_buffer_bytes, overlay};
@@ -151,7 +167,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }));
             Ok(())
         }
-        _ => Err("usage: nano-parser-bundle-build generate|finalize|add-platform-audit-lane|upgrade-platform-audit-lane|add-bronze-row-contract|upgrade-bronze-buffer-bytes …".into()),
+        _ => Err("usage: nano-parser-bundle-build generate|finalize|add-platform-audit-lane|upgrade-platform-audit-lane|add-bronze-row-contract|upgrade-bronze-buffer-bytes|upgrade-source-ack …".into()),
     }
 }
 

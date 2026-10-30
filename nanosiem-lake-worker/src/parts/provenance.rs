@@ -707,6 +707,8 @@ pub struct WriterInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_hours: Option<super::request_dedup::RequestHours>,
     pub format: String,
     /// The owner release signer key id that signs this record.
     pub signer_key_id: String,
@@ -736,6 +738,7 @@ pub struct ProvenanceRecord {
 impl ProvenanceRecord {
     /// Structural checks every reader and writer applies.
     pub fn validate(&self) -> Result<()> {
+        if self.request_hours.is_some_and(|hours| !hours.valid()) { bail!("invalid source request-hour summary"); }
         super::format::validate_tenant_uuid(&self.tenant_id)?;
         if self.format != PROVENANCE_FORMAT {
             bail!("provenance format is unsupported");
@@ -1105,6 +1108,10 @@ pub struct SignResult {
     pub signature: Option<Ed25519Signature>,
     /// Present on refusal (stable, secret-free code).
     pub error: Option<String>,
+    /// Value-free owner validation check, requested by X-Nano-Lake-Sign-Checks.
+    /// Older owners omit it; older cells never request it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1498,6 +1505,7 @@ pub(crate) mod tests {
     pub fn sample_record() -> ProvenanceRecord {
         let zero = "0".repeat(64);
         ProvenanceRecord {
+            request_hours: None,
             format: PROVENANCE_FORMAT.to_string(),
             signer_key_id: SIGNER.to_string(),
             tenant_id: TENANT.to_string(),
@@ -2257,6 +2265,7 @@ mod owner_vector_tests {
         let object_sha = "67220120fd03fd77e88670f149835312cba52a6bc5e0d61990753960abd6ddba";
         let hour_start = 497_104_i64 * 3_600_000_000;
         ProvenanceRecord {
+            request_hours: None,
             format: PROVENANCE_FORMAT.into(),
             signer_key_id: VECTOR_KEY_ID.into(),
             tenant_id: TENANT1.into(),

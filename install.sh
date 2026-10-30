@@ -405,18 +405,21 @@ assert p["cell_mib"] and p["services"]
 assert all(type(v) is int and v > 0 for v in p["cell_mib"].values())
 compose = 0
 for name, v in p["services"].items():
-    if (sys.argv[1] != "none" and name == "tenzir") or (sys.argv[1] == "none" and name in ("vector", "connector-runner")):
+    if (sys.argv[1] != "none" and name == "tenzir") or (sys.argv[1] == "none" and name in ("vector", "connector-runner", "lean-hec-proxy")):
         continue
-    guard, peak = v["guard_mib"], v["peak_bytes"]
+    guard, peak, idle = v["guard_mib"], v["peak_bytes"], v.get("idle_rss_bytes", 0)
     assert type(guard) is int and guard >= 0
     assert type(peak) is int and peak > 0
-    floor = max(guard * mib, (peak * 5 + 3) // 4)
+    assert type(idle) is int and idle >= 0
+    floor = max(guard * mib, (peak * 5 + 3) // 4, (idle * 5 + 3) // 4)
     compose += ((floor + mib - 1) // mib) * mib
 total = compose + sum(p["cell_mib"].values()) * mib
 gib = 1024 * mib
 supported = p["minimum_host_gib"]
 assert type(supported) is int and supported > 0
-print(max(supported * gib, ((total * 100 + 95 * gib - 1) // (95 * gib)) * gib))
+reserve = p["kernel_reserve_mib"]
+assert type(reserve) is int and 0 <= reserve <= 512
+print(max(supported * gib - reserve * mib, ((total * 100 + 95 * mib - 1) // (95 * mib)) * mib))
 ' "$vector_profile"
 }
 
@@ -438,110 +441,6 @@ ch_mem_limit() {
     g=$((g - 4))
     (( g < 2 )) && g=2
     echo "${g}G"
-}
-
-# NAN-2361: derive a safe open-core lake memory envelope from Docker's actual
-# capacity. Only one durable child runs at once, but it overlaps the interactive
-# worker. The reserve covers Nano services, PostgreSQL, Dragonfly, RustFS, and
-# the catalog. The interactive container briefly holds both generations'
-# derivative/catalog state during an atomic cutover, while reusing the native
-# executor. Reserve twice the query ceiling plus one GiB so a generation swap
-# cannot wedge at the cgroup boundary. This is reload headroom, not additional
-# analyst-query memory.
-#
-# Operators may override the plan, but must provide the complete five-value set.
-# Accepting a partial override can put a 32 GiB chDB ceiling in a 16 GiB cgroup,
-# which turns a controlled query failure into a container OOM.
-#
-# NAN-3402 (auto-v3): the durable classes are derived FROM the runner container
-# with the job runner's own arithmetic, instead of guessing large = runner - 1.
-# lake_job_runner clamps the large class to 80% of its cgroup limit
-# (job_capacity::container_memory_budget) and, with retries on, refuses to start
-# unless large > medium. auto-v2 sized 12 GiB as runner 3G / large 2G /
-# medium 2G (crash loop), and on 32 GiB asked for 14G that the runner silently
-# clamped to 12G. scripts/test-install-lake-memory-plan.sh pins the invariants.
-LAKE_GIB=1073741824
-LAKE_MIB=1048576
-# Mirror of nanosiem-lake-worker job_capacity::container_memory_budget.
-lake_runner_budget_bytes() {
-    # shellcheck disable=SC2017 # the truncation order mirrors the Rust exactly
-    echo $(( ($1 / 5 * 4) / LAKE_MIB * LAKE_MIB ))
-}
-
-lake_memory_plan() {
-    local total_gib interactive_gib query_container_gib reserve_gib
-    local large_bytes medium_bytes runner_container_gib override_count
-
-    override_count=0
-    [[ -n "${NANO_LAKE_MAX_MEMORY_BYTES:-}" ]] && override_count=$((override_count + 1))
-    [[ -n "${NANO_LAKE_QUERY_CONTAINER_MEM_LIMIT:-}" ]] && override_count=$((override_count + 1))
-    [[ -n "${NANO_LAKE_DURABLE_MEDIUM_MEMORY_BYTES:-}" ]] && override_count=$((override_count + 1))
-    [[ -n "${NANO_LAKE_DURABLE_LARGE_MEMORY_BYTES:-}" ]] && override_count=$((override_count + 1))
-    [[ -n "${NANO_LAKE_DURABLE_RUNNER_MEM_LIMIT:-}" ]] && override_count=$((override_count + 1))
-
-    if (( override_count != 0 && override_count != 5 )); then
-        fail "Override all five NANO_LAKE_* memory settings together, or leave all five unset for automatic sizing."
-    fi
-
-    if (( override_count == 5 )); then
-        [[ "${NANO_LAKE_MAX_MEMORY_BYTES}" =~ ^[0-9]+$ ]] \
-            || fail "NANO_LAKE_MAX_MEMORY_BYTES must be an integer number of bytes."
-        [[ "${NANO_LAKE_DURABLE_MEDIUM_MEMORY_BYTES}" =~ ^[0-9]+$ ]] \
-            || fail "NANO_LAKE_DURABLE_MEDIUM_MEMORY_BYTES must be an integer number of bytes."
-        [[ "${NANO_LAKE_DURABLE_LARGE_MEMORY_BYTES}" =~ ^[0-9]+$ ]] \
-            || fail "NANO_LAKE_DURABLE_LARGE_MEMORY_BYTES must be an integer number of bytes."
-        [[ "${NANO_LAKE_QUERY_CONTAINER_MEM_LIMIT}" =~ ^[0-9]+([.][0-9]+)?[KMGT]?[iI]?[bB]?$ ]] \
-            || fail "NANO_LAKE_QUERY_CONTAINER_MEM_LIMIT is not a Docker memory value."
-        [[ "${NANO_LAKE_DURABLE_RUNNER_MEM_LIMIT}" =~ ^[0-9]+([.][0-9]+)?[KMGT]?[iI]?[bB]?$ ]] \
-            || fail "NANO_LAKE_DURABLE_RUNNER_MEM_LIMIT is not a Docker memory value."
-        LAKE_MAX_MEMORY_BYTES="$NANO_LAKE_MAX_MEMORY_BYTES"
-        LAKE_QUERY_CONTAINER_MEM_LIMIT="$NANO_LAKE_QUERY_CONTAINER_MEM_LIMIT"
-        LAKE_DURABLE_MEDIUM_MEMORY_BYTES="$NANO_LAKE_DURABLE_MEDIUM_MEMORY_BYTES"
-        LAKE_DURABLE_LARGE_MEMORY_BYTES="$NANO_LAKE_DURABLE_LARGE_MEMORY_BYTES"
-        LAKE_DURABLE_RUNNER_MEM_LIMIT="$NANO_LAKE_DURABLE_RUNNER_MEM_LIMIT"
-        LAKE_MEMORY_SIZING="manual"
-        LAKE_MEMORY_CAPACITY_GIB="operator-defined"
-        return
-    fi
-
-    total_gib=$(memory_capacity_gib)
-    (( total_gib >= 12 )) \
-        || fail "The lake profile needs at least 12 GiB available to Docker (detected ${total_gib} GiB). Increase the memory available to Docker (on Docker Desktop: Settings → Resources → Memory)."
-
-    interactive_gib=$((total_gib / 8))
-    (( interactive_gib < 1 )) && interactive_gib=1
-    (( interactive_gib > 4 )) && interactive_gib=4
-    query_container_gib=$((interactive_gib * 2 + 1))
-
-    # 12 GiB -> 6 GiB reserve; 16 GiB -> 6; 32+ GiB -> 8. This reserve
-    # deliberately grows before query classes do so normal ingestion and UI
-    # traffic remain healthy while a durable query spills/merges.
-    reserve_gib=$(((total_gib + 7) / 8 + 4))
-    (( reserve_gib < 5 )) && reserve_gib=5
-    (( reserve_gib > 8 )) && reserve_gib=8
-
-    # The durable runner gets everything left. 40 GiB is enough for the 32 GiB
-    # large-class cap (80% of 40) — more would only idle.
-    runner_container_gib=$((total_gib - reserve_gib - query_container_gib))
-    (( runner_container_gib > 40 )) && runner_container_gib=40
-    (( runner_container_gib >= 3 )) \
-        || fail "Internal error: lake memory plan left ${runner_container_gib} GiB for the durable runner (${total_gib} GiB detected)."
-
-    large_bytes=$(lake_runner_budget_bytes $((runner_container_gib * LAKE_GIB)))
-    (( large_bytes > 32 * LAKE_GIB )) && large_bytes=$((32 * LAKE_GIB))
-    medium_bytes=$((large_bytes / 2 / LAKE_MIB * LAKE_MIB))
-    (( medium_bytes > 16 * LAKE_GIB )) && medium_bytes=$((16 * LAKE_GIB))
-    # The runner rejects classes below 1 GiB. Runner >= 3 GiB gives large
-    # >= 2.4 GiB, so this floor still leaves medium strictly below large.
-    (( medium_bytes < LAKE_GIB )) && medium_bytes=$LAKE_GIB
-
-    LAKE_MAX_MEMORY_BYTES=$((interactive_gib * LAKE_GIB))
-    LAKE_QUERY_CONTAINER_MEM_LIMIT="${query_container_gib}G"
-    LAKE_DURABLE_MEDIUM_MEMORY_BYTES=$medium_bytes
-    LAKE_DURABLE_LARGE_MEMORY_BYTES=$large_bytes
-    LAKE_DURABLE_RUNNER_MEM_LIMIT="${runner_container_gib}G"
-    LAKE_MEMORY_SIZING="auto-v3"
-    LAKE_MEMORY_CAPACITY_GIB="$total_gib"
 }
 
 env_file_value() {
@@ -672,14 +571,7 @@ upsert_env_file_value() {
     mv "$tmp" .env
 }
 
-write_lake_memory_plan() {
-    upsert_env_file_value NANO_LAKE_MEMORY_SIZING "$LAKE_MEMORY_SIZING"
-    upsert_env_file_value NANO_LAKE_MAX_MEMORY_BYTES "$LAKE_MAX_MEMORY_BYTES"
-    upsert_env_file_value NANO_LAKE_QUERY_CONTAINER_MEM_LIMIT "$LAKE_QUERY_CONTAINER_MEM_LIMIT"
-    upsert_env_file_value NANO_LAKE_DURABLE_MEDIUM_MEMORY_BYTES "$LAKE_DURABLE_MEDIUM_MEMORY_BYTES"
-    upsert_env_file_value NANO_LAKE_DURABLE_LARGE_MEMORY_BYTES "$LAKE_DURABLE_LARGE_MEMORY_BYTES"
-    upsert_env_file_value NANO_LAKE_DURABLE_RUNNER_MEM_LIMIT "$LAKE_DURABLE_RUNNER_MEM_LIMIT"
-}
+
 
 # Encode a string as a JSON string literal (quotes included).
 # Handles backslash, double-quote, and the C0 controls that JSON forbids.
@@ -1576,31 +1468,8 @@ if [[ -f .env ]]; then
                 log "Generated missing $key for the upgraded lake profile"
             fi
         done
-        lake_memory_keys=(
-            NANO_LAKE_MAX_MEMORY_BYTES
-            NANO_LAKE_QUERY_CONTAINER_MEM_LIMIT
-            NANO_LAKE_DURABLE_MEDIUM_MEMORY_BYTES
-            NANO_LAKE_DURABLE_LARGE_MEMORY_BYTES
-            NANO_LAKE_DURABLE_RUNNER_MEM_LIMIT
-        )
-        lake_memory_count=0
-        for key in "${lake_memory_keys[@]}"; do
-            grep -qE "^${key}=" .env && lake_memory_count=$((lake_memory_count + 1))
-        done
-        lake_memory_mode=$(env_file_value NANO_LAKE_MEMORY_SIZING)
+        # Cell and Compose budgets are rendered together by lean-init.
 
-        if (( lake_memory_count != 0 && lake_memory_count != 5 )); then
-            fail "Existing .env has a partial lake memory plan. Define all five NANO_LAKE_* memory settings or remove them and rerun for automatic sizing."
-        elif [[ "$lake_memory_mode" == auto-v[123] || "$lake_memory_count" == "0" ]]; then
-            lake_memory_plan
-            write_lake_memory_plan
-            log "Lake memory plan: interactive ${LAKE_MAX_MEMORY_BYTES} bytes/${LAKE_QUERY_CONTAINER_MEM_LIMIT} container, durable ${LAKE_DURABLE_MEDIUM_MEMORY_BYTES} → ${LAKE_DURABLE_LARGE_MEMORY_BYTES} bytes/${LAKE_DURABLE_RUNNER_MEM_LIMIT} container (${LAKE_MEMORY_CAPACITY_GIB} GiB Docker capacity)"
-        elif [[ -z "$lake_memory_mode" ]]; then
-            # Pre-auto-sizing beta installs already have all five values. They
-            # may be operator-tuned, so do not silently replace them.
-            upsert_env_file_value NANO_LAKE_MEMORY_SIZING manual
-            warn "Preserving the existing lake memory limits as manual overrides. Remove the five values plus NANO_LAKE_MEMORY_SIZING to adopt automatic sizing."
-        fi
     fi
 else
     REUSE_ENV=0
@@ -1686,8 +1555,7 @@ else
     # surface it. (Other secrets stay inline — they aren't user-facing.)
     VECTOR_AUTH_TOKEN=$(gen_secret)
     if [[ "$ENABLE_LAKE_CONTROL_PLANE" == "1" ]]; then
-        lake_memory_plan
-        log "Lake memory plan: interactive ${LAKE_MAX_MEMORY_BYTES} bytes/${LAKE_QUERY_CONTAINER_MEM_LIMIT} container, durable ${LAKE_DURABLE_MEDIUM_MEMORY_BYTES} → ${LAKE_DURABLE_LARGE_MEMORY_BYTES} bytes/${LAKE_DURABLE_RUNNER_MEM_LIMIT} container (${LAKE_MEMORY_CAPACITY_GIB} GiB Docker capacity)"
+        log "Lake memory budgets will be derived from the shared startup policy by lean-init"
     else
         # NAN-1604: surface the native ClickHouse ingest credential only on the
         # maintenance-only legacy profile.
@@ -1729,12 +1597,6 @@ NANO_LOG_QUERY_BACKEND=lake
 NANO_LAKE_BRONZE_BUCKET=nano-lake
 NANO_LAKE_OBJECT_ENDPOINT=http://lake-object-store:9000
 NANO_LAKE_FORCE_PATH_STYLE=true
-NANO_LAKE_MEMORY_SIZING=$LAKE_MEMORY_SIZING
-NANO_LAKE_MAX_MEMORY_BYTES=$LAKE_MAX_MEMORY_BYTES
-NANO_LAKE_QUERY_CONTAINER_MEM_LIMIT=$LAKE_QUERY_CONTAINER_MEM_LIMIT
-NANO_LAKE_DURABLE_MEDIUM_MEMORY_BYTES=$LAKE_DURABLE_MEDIUM_MEMORY_BYTES
-NANO_LAKE_DURABLE_LARGE_MEMORY_BYTES=$LAKE_DURABLE_LARGE_MEMORY_BYTES
-NANO_LAKE_DURABLE_RUNNER_MEM_LIMIT=$LAKE_DURABLE_RUNNER_MEM_LIMIT
 NANO_LAKEKEEPER_DB_PASSWORD=$(gen_secret)
 NANO_LAKEKEEPER_OIDC_DB_PASSWORD=$(gen_secret)
 NANO_LAKEKEEPER_OPENFGA_DB_PASSWORD=$(gen_secret)
@@ -2002,7 +1864,7 @@ if [[ "${TENZIR_DIRECT:-0}" == "1" ]]; then
     # Switching an existing install to Tenzir-direct: Vector and the connector
     # runner are no longer in the stack, so `up -d` would leave their old
     # containers running. Remove them; their volumes stay for --add-vector.
-    docker </dev/null compose "${COMPOSE_ARGS[@]}" --profile '*' rm -sf vector connector-runner >/dev/null 2>&1 \
+    docker </dev/null compose "${COMPOSE_ARGS[@]}" --profile '*' rm -sf vector connector-runner lean-hec-proxy >/dev/null 2>&1 \
         || fail "Could not stop Vector and connector-runner; refusing to start a plan that excludes their memory."
 else
     # The Vector plan excludes the optional local Tenzir node. It may still

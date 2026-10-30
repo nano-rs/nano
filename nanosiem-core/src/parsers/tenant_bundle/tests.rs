@@ -1608,3 +1608,67 @@ fn source_test_configs_only_include_changed_sources_with_samples() {
     assert!(empty.ok(), "{:?}", empty.report.failure);
     assert!(empty.source_test_configs.is_empty());
 }
+
+
+#[test]
+fn connect_first_enrolls_only_authentication_and_preserves_the_generic_lane() {
+    let raw = source("vercel", "");
+    let sources = TenantSources { schema_version: 1, tenant_id: TENANT.into(), sources: vec![raw.clone()] };
+    sources.validate(TENANT).unwrap();
+    let platform = base();
+    let (connected, generated) = overlay::apply_overlay(&platform, &[raw.clone()]).unwrap();
+    assert!(generated.is_empty(), "no new parser lane");
+    assert_eq!(connected.file(overlay::ROUTER_FILE), platform.file(overlay::ROUTER_FILE));
+    assert_eq!(connected.file(overlay::LAKE_SINK_FILE), platform.file(overlay::LAKE_SINK_FILE));
+    let verified = overlay::verify_against_base(&platform, &connected).unwrap();
+    assert!(verified.hec_sources.contains(&"vercel".into()));
+    assert_eq!(verified.unparsed_sources, vec!["vercel"]);
+    assert!(connected.text(overlay::HEC_FILE).unwrap().contains(":nano-source-v1:vercel"));
+    // The only switch is the normal parser overlay. The transport identity
+    // and private delivery token stay byte-identical across publication.
+    let (parsed, generated) = overlay::apply_overlay(&platform, &[source("vercel", GOOD_VRL)]).unwrap();
+    let parsed_verified = overlay::verify_against_base(&platform, &parsed).unwrap();
+    assert_eq!(parsed_verified.hec_sources, verified.hec_sources);
+    assert_eq!(parsed.file(overlay::HEC_FILE), connected.file(overlay::HEC_FILE));
+    assert_eq!(generated.len(), 1);
+    assert!(parsed.file(overlay::UNPARSED_SOURCES_FILE).is_none());
+}
+
+#[test]
+fn connect_first_guard_refuses_reserved_duplicate_and_forged_enrollments() {
+    let platform = base();
+    for slug in ["unknown", "default", "audit", "otlp_log", "otlp_metric", "otlp_trace"] {
+        assert!(overlay::apply_overlay(&platform, &[source(slug, "")]).is_err(), "{slug}");
+    }
+    let (connected, _) = overlay::apply_overlay(&platform, &[source("vercel", "")]).unwrap();
+    for bytes in [br#"["unknown"]"#.as_slice(), br#"["vercel","vercel"]"#, br#"["vercel", "z"]"#, br#"["not-enrolled"]"#] {
+        let mut forged = connected.clone();
+        forged.put(overlay::UNPARSED_SOURCES_FILE, bytes.to_vec());
+        assert!(overlay::verify_against_base(&platform, &forged).is_err());
+    }
+    let mut forged = connected.clone();
+    forged.put(overlay::ROUTER_FILE, b"[transforms.evil]\ntype=\"remap\"".to_vec());
+    assert!(overlay::verify_against_base(&platform, &forged).is_err());
+}
+
+
+#[tokio::test]
+async fn connect_first_generic_lane_retains_feed_identity_and_raw_payload() {
+    let platform = base();
+    let (connected, _) = overlay::apply_overlay(&platform, &[source("vercel", "")]).unwrap();
+    let pipeline: toml::Table = connected.text("sources/parsers/_pipeline.toml").unwrap().parse().unwrap();
+    let generic = pipeline["transforms"]["generic_parser"]["source"].as_str().unwrap();
+    let prepare = pipeline["transforms"]["generic_ocsf_prepare"]["source"].as_str().unwrap();
+    let validator = crate::parsers::VrlValidator::new();
+    let raw = r#"{"deployment":"web-24","status":200}"#;
+    let input = serde_json::json!({"message": raw, "source_type":"vercel"}).to_string();
+    let result = validator.test_vrl_chain(&[generic, prepare], &input).await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    let output = result.output.unwrap();
+    assert_eq!(output["source_type"], "vercel");
+    assert_eq!(output["event"]["class_uid"], 0);
+    assert_eq!(output["event"]["metadata"]["log_name"], "vercel");
+    let retained: serde_json::Value = serde_json::from_str(output["event"]["raw_data"].as_str().unwrap()).unwrap();
+    assert_eq!(retained["message"], raw);
+    assert_eq!(retained["metadata"]["parser_type"], "generic");
+}

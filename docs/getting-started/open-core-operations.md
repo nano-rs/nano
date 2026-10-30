@@ -31,9 +31,10 @@ api/jobs/search/web services alongside the lake services. **PostgreSQL 18 is the
 compose pins it by digest and refuses to start on a data directory written by a
 different major (see §4).
 
-The lake profile needs **at least 12 GiB available to Docker**. `install.sh`
-refuses below that and sizes the query/durable memory envelope from what it
-finds.
+The lake profile supports an **8 GiB VM**, allowing up to 512 MiB of kernel
+reserve (at least 7,680 MiB visible to Docker). `install.sh` and the initializer
+share one startup policy and fit the service and cell budgets within 95% of
+actual host memory. See [startup memory sizing](../deployment/open-core-startup-memory.md).
 
 ---
 

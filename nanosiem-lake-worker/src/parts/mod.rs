@@ -25,6 +25,7 @@ pub mod part_log;
 pub mod provenance;
 pub mod parquet_ranges;
 pub mod refusal_tally;
+pub mod request_dedup;
 pub mod sidecar;
 pub mod token_counts;
 

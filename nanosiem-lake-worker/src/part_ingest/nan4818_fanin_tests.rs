@@ -15,6 +15,7 @@ fn roomy() -> Option<(u64, u64)> { Some((0, 64 * 1024 * 1024 * 1024)) }
 fn live_point(hour: i32, rows: u64, count: usize) -> PlannedMerge {
     let start = i64::from(hour) * 3_600_000_000;
     PlannedMerge { output_level: Level::Hour, event_hour: hour, inputs: (0..count).map(|i| PartRef {
+        request_hours: None,
         part_id: crate::parts::format::PartId::new(i as i64).unwrap(), level: Level::L0,
         event_hour: hour, event_day: None, rows: rows / count as u64 + u64::from((i as u64) < rows % count as u64),
         min_time_us: start, max_time_us: start + 3_599_999_999, schema_fingerprint: "0".repeat(64),

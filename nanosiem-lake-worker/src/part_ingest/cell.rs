@@ -95,6 +95,8 @@ pub struct ExchangedR2Credential {
 #[derive(Deserialize)]
 pub struct ExchangeResponse {
     #[serde(default)]
+    pub platform_probe_key: Option<nanosiem_core::platform_probe::PlatformProbeKey>,
+    #[serde(default)]
     pub agent_catalog: Option<super::iceberg_export::activation::CatalogActivation>,
     #[serde(default)]
     pub owner_write: Option<super::native_writer::WritePermission>,
@@ -180,6 +182,7 @@ pub struct PartCreds {
 }
 
 pub struct IngestCredentials {
+    pub platform_probe_key: Option<nanosiem_core::platform_probe::PlatformProbeKey>,
     pub agent_catalog: Option<super::iceberg_export::activation::CatalogActivation>,
     pub native_writer: Option<Arc<super::native_writer::NativePartWriter>>,
     pub writer_epoch: u64,
@@ -252,6 +255,7 @@ pub fn trusted_from(signing: &PartSigning) -> Result<TenantKeySet> {
 
 /// The fresh credentials one exchange yields (production path).
 pub struct Exchanged {
+    pub platform_probe_key: Option<nanosiem_core::platform_probe::PlatformProbeKey>,
     pub agent_catalog: Option<super::iceberg_export::activation::CatalogActivation>,
     pub write_permission: Option<super::native_writer::WritePermission>,
     pub writer_epoch: u64,
@@ -437,6 +441,20 @@ pub struct OwnerSignRefused {
     pub status: u16,
 }
 
+/// A bound, per-record refusal in an HTTP 200 sign response. This is an
+/// owner/producer contract failure, not evidence that a source is poison.
+#[derive(Debug, thiserror::Error)]
+#[error("owner refused part {part_id}: {code} (check={check})")]
+pub struct OwnerRecordRefused {
+    pub part_id: String,
+    pub code: String,
+    pub check: String,
+}
+
+pub(crate) fn owner_sign_refused(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<OwnerRecordRefused>() || cause.is::<OwnerSignRefused>())
+}
+
 impl OwnerSignRefused {
     /// 401: the bearer is expired or unknown (`cell_bearer_expired`); a
     /// fresh exchange mints a new one.
@@ -497,6 +515,11 @@ pub async fn exchange_received(token: &[u8], assignment: &Assignment, received: 
         exchange.schema_version == 1 && exchange.tenant_id == tenant && exchange.role == "ingest",
         "exchange response binding differs"
     );
+    if let Some(key) = &exchange.platform_probe_key {
+        ensure!(key.tenant_id.to_string() == tenant, "platform probe key crossed tenants");
+        let bytes: [u8; 32] = hex::decode(&key.public_key_hex)?.try_into().map_err(|_| anyhow::anyhow!("platform probe key malformed"))?;
+        VerifyingKey::from_bytes(&bytes)?;
+    }
     let writer_epoch = ingest_writer_epoch(
         exchange.writer_epoch,
         exchange.prevalence_owner.as_ref().map(|owner| owner.writer_epoch),
@@ -601,7 +624,7 @@ pub async fn exchange_received(token: &[u8], assignment: &Assignment, received: 
         expires_at = expires_at.min(at);
     }
     if let Some(record)=&exchange.agent_catalog {record.validate(tenant)?;}
-    Ok(Exchanged { agent_catalog:exchange.agent_catalog, write_permission, writer_epoch, input, parts, prevalence, enrichment, bearer, expires_at,
+    Ok(Exchanged { platform_probe_key: exchange.platform_probe_key, agent_catalog:exchange.agent_catalog, write_permission, writer_epoch, input, parts, prevalence, enrichment, bearer, expires_at,
         part_delete_grant: exchange.lake_part_delete_grant, part_gc, erasure_ledger })
 }
 
@@ -626,6 +649,7 @@ pub async fn credentials_from_secret(secret: &[u8], assignment: &Assignment) -> 
             None => input_from(lab.edge_log_consumer_endpoint, lab.edge_log_consumer_token, lab.bronze, lab.notices)?,
         };
         return Ok(IngestCredentials {
+            platform_probe_key: None,
             agent_catalog: None,
             native_writer: None,
             writer_epoch: lab.writer_epoch,
@@ -663,6 +687,7 @@ pub async fn credentials_from_secret(secret: &[u8], assignment: &Assignment) -> 
     // Recover completion evidence using the freshly exchanged owner permission.
     native_writer.replay_pending().await?;
     Ok(IngestCredentials {
+        platform_probe_key: fresh.platform_probe_key,
         agent_catalog: fresh.agent_catalog,
         native_writer: Some(native_writer),
         writer_epoch: fresh.writer_epoch,
@@ -860,6 +885,7 @@ impl HttpPartSigner {
         let response = client
             .post(&self.url)
             .bearer_auth(bearer)
+            .header("X-Nano-Lake-Sign-Checks", "1")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
             .send()
@@ -877,9 +903,18 @@ impl HttpPartSigner {
         let mut signatures = Vec::with_capacity(records.len());
         for ((part, result), record) in request.parts.iter().zip(body.results).zip(records) {
             ensure!(result.part_id == part.part_id && result.record_sha256 == part.record_sha256, "sign result order differs");
-            let signature = result
-                .signature
-                .with_context(|| format!("owner refused part {}: {}", part.part_id, result.error.unwrap_or_default()))?;
+            let signature = match result.signature {
+                Some(signature) => signature,
+                None => {
+                    let code = result.error.unwrap_or_else(|| "missing_signature".into());
+                    let check = result.check.unwrap_or_else(|| "unreported_by_owner".into());
+                    tracing::error!(tenant = %request.tenant_id, request_id = %request.request_id,
+                        part_id = %part.part_id, record_sha256 = %part.record_sha256,
+                        request_hours = ?record.request_hours, code = %code, check = %check,
+                        "owner refused part signing; sources remain pending");
+                    return Err(OwnerRecordRefused { part_id: part.part_id.to_string(), code, check }.into());
+                }
+            };
             // Verify before trusting: a bad signature must never be stored.
             SignedProvenance::assemble(record.clone(), signature.clone(), &self.trusted)?;
             signatures.push(signature);
@@ -974,6 +1009,7 @@ impl NoticeQueue for DoNoticeQueue {
 
 /// The cell-facing service.
 pub struct IngestService {
+    landing_receipts: super::landing_receipts::Receipts,
     ingestor: tokio::sync::Mutex<Ingestor<'static>>,
     /// Finding appends from detect[T]: bounded, deadline-limited, and never
     /// holding the ingestor beyond their commit (`finding_gate`).
@@ -982,6 +1018,7 @@ pub struct IngestService {
     /// A refreshed prevalence credential (or its withdrawal) waiting for the
     /// ingestor: the credential swap never waits for a tick to finish.
     pending_prevalence: std::sync::Mutex<Option<PrevalenceUpdate>>,
+    platform_probe_key: Arc<std::sync::RwLock<Option<nanosiem_core::platform_probe::PlatformProbeKey>>>,
     /// Set once the process must exit for a respawn (refresh gave up, edge
     /// stall); `run` watches it from outside the ingest loop.
     terminal: tokio::sync::watch::Sender<Option<String>>,
@@ -1541,6 +1578,8 @@ impl IngestService {
         };
         let mut cfg = IngestConfig::new(tenant, &assignment.state_dir)
             .with_owner_requires_checksum(assignment.owner_requires_checksum);
+        let platform_probe_key = cfg.platform_probe_key.clone();
+        *platform_probe_key.write().expect("probe key lock") = credentials.platform_probe_key.clone();
         let mut agent_catalog = if credentials.agent_catalog.is_some() {
             let source=credentials.parts.as_ref().context("activated catalog requires hosted part credentials")?;
             super::iceberg_export::activation::attach_for_ingest(&mut cfg, credentials.agent_catalog.as_ref(),
@@ -1572,7 +1611,7 @@ impl IngestService {
         // NAN-4592: the remote prevalence state's disk cache, sized from the
         // state at open within this cap.
         cfg.prevalence_cache_max_bytes = prevalence_cache_bytes_for(assignment);
-        super::ingest::size_for_memory_cap(&mut cfg, assignment.memory_cap_bytes);
+        super::ingest::size_for_role(&mut cfg, assignment.memory_cap_bytes, assignment.cpu_millis);
         // NAN-4723: a local prevalence state's compactor, L0 room and
         // unflushed budget follow the role's placement.
         // A placement limit can exceed the host, so the cores are capped at
@@ -1689,9 +1728,11 @@ impl IngestService {
         ensure_lease("setup done")?;
         let finding_context = ingestor.finding_context();
         Ok(Arc::new(Self {
+            landing_receipts: ingestor.landing_receipts.clone(),
             ingestor: tokio::sync::Mutex::new(ingestor),
             finding_gate: FindingGate::new(FindingGateConfig::default()),
             finding_context,
+            platform_probe_key,
             pending_prevalence: std::sync::Mutex::new(None),
             terminal: tokio::sync::watch::channel(None).0,
             edge_source,
@@ -2396,6 +2437,19 @@ pub fn flush_policy_for(assignment: &Assignment) -> Result<crate::parts::levels:
     Ok(policy)
 }
 
+#[utoipa::path(post, path = "/v1/tenants/{tenant}/landing", tag = "lake-admin",
+    params(("tenant" = String, Path)), request_body = super::landing_receipts::Lookup,
+    responses((status = 200, body = serde_json::Value), (status = 400, description = "Invalid receipt scope")),
+    security(("operator_bearer" = [])))]
+async fn landing_receipt(axum::extract::State(service): axum::extract::State<Arc<IngestService>>,
+    axum::Json(request): axum::Json<super::landing_receipts::Lookup>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match service.landing_receipts.lookup(&request, chrono::Utc::now().timestamp_millis()) {
+        Ok(value) => axum::Json(value).into_response(),
+        Err(_) => (axum::http::StatusCode::BAD_REQUEST, "landing_receipt_scope_invalid").into_response(),
+    }
+}
+
 #[utoipa::path(get, path = "/v1/tenants/{tenant}/admin/count-backfill", tag = "lake-admin",
     params(("tenant" = String, Path)), responses((status = 200, body = serde_json::Value)),
     security(("operator_bearer" = [])))]
@@ -2650,15 +2704,16 @@ async fn bronze_quarantine_import(axum::extract::State(service): axum::extract::
 }
 
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(count_backfill_status, start_count_backfill, prevalence_restamp_status, start_prevalence_restamp,
+#[openapi(paths(landing_receipt, count_backfill_status, start_count_backfill, prevalence_restamp_status, start_prevalence_restamp,
     bronze_quarantine_list, bronze_quarantine_replay, bronze_quarantine_import),
-    components(schemas(super::reindex::CountBackfill, BronzeQuarantineReplay, super::quarantine::QuarantineEntry)))]
+    components(schemas(super::landing_receipts::Lookup, super::reindex::CountBackfill, BronzeQuarantineReplay, super::quarantine::QuarantineEntry)))]
 pub struct CountBackfillApiDoc;
 
 #[async_trait]
 impl TenantService for IngestService {
     async fn handle_rpc(self: Arc<Self>, _request_id: u64, stream: tokio::net::UnixStream) {
         let app = axum::Router::new()
+            .route("/v1/landing-receipt", axum::routing::post(landing_receipt))
             .route("/v1/admin/count-backfill", axum::routing::get(count_backfill_status).post(start_count_backfill))
             .route("/v1/admin/prevalence-restamp", axum::routing::get(prevalence_restamp_status).post(start_prevalence_restamp))
             .route("/v1/admin/bronze-quarantine", axum::routing::get(bronze_quarantine_list))
@@ -2824,6 +2879,7 @@ impl TenantService for IngestService {
                         return;
                     }
                 }
+                *self.platform_probe_key.write().expect("probe key lock") = fresh.platform_probe_key.clone();
                 refresh.refresher.refreshed(fresh.expires_at);
                 tracing::info!(expires_at = %fresh.expires_at, "credentials refreshed");
                 self.wake.notify_one();
@@ -3967,6 +4023,7 @@ mod tests {
                                     sig: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, sig.to_bytes()),
                                 }),
                                 error: None,
+                                check: None,
                             }
                         })
                         .collect();
@@ -3999,6 +4056,32 @@ mod tests {
         let other = TenantKeySet::new([(key_id.to_string(), SigningKey::from_bytes(&[6; 32]).verifying_key())]);
         let wrong = HttpPartSigner::new(&format!("http://{addr}/sign"), "b", key_id, other, None).unwrap();
         assert!(wrong.sign(&record.tenant_id.clone(), std::slice::from_ref(&record)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn nan4873_legacy_owner_refusal_remains_typed_without_a_check() {
+        use crate::parts::provenance::SignResult;
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route("/sign", post(|Json(request): Json<SignRequest>| async move {
+            Json(SignResponse { schema_version: 1, request_id: request.request_id,
+                results: request.parts.into_iter().map(|part| SignResult {
+                    part_id: part.part_id, record_sha256: part.record_sha256,
+                    signature: None, error: Some("record_invalid".into()), check: None,
+                }).collect() })
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let key_id = "owner-nan4873";
+        let trusted = TenantKeySet::new([(key_id.into(), SigningKey::from_bytes(&[73; 32]).verifying_key())]);
+        let signer = HttpPartSigner::new(&format!("http://{addr}/sign"), "fixture", key_id, trusted, None).unwrap();
+        let record = signing_record(key_id);
+        let error = signer.sign(&record.tenant_id, &[record.clone()]).await.unwrap_err();
+        let refusal = error.downcast_ref::<OwnerRecordRefused>().unwrap();
+        assert_eq!(refusal.check, "unreported_by_owner");
+        assert_eq!(refusal.code, "record_invalid");
+        assert!(owner_sign_refused(&error.context("publish")));
+        server.abort();
     }
 
     /// NAN-3801: the count route beside the sign route (the platform's
@@ -4044,6 +4127,7 @@ mod tests {
         let trusted = TenantKeySet::new([(key_id.to_string(), key.verifying_key())]);
         let tenant = crate::parts::provenance::tests::TENANT;
         let part = crate::parts::part_log::PartRef {
+            request_hours: None,
             part_id: crate::parts::format::PartId::new(1_790_000_000_000).unwrap(), level: crate::parts::levels::Level::Hour,
             event_hour: 497_222, event_day: None, rows: 10, min_time_us: 1, max_time_us: 2, schema_fingerprint: String::new(),
             provenance_sha256: "ab".repeat(32), merkle_root: String::new(), sorted: true, data_bytes: 1, row_groups: 1, data_files: 1,
@@ -4251,6 +4335,7 @@ mod tests {
                                         ),
                                     }),
                                     error: None,
+                                    check: None,
                                 }
                             })
                             .collect();

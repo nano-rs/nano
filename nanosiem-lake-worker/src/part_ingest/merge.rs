@@ -2682,6 +2682,7 @@ mod tests {
     fn input(min: i64, max: i64) -> MergeInput {
         MergeInput {
             part: PartRef {
+                request_hours: None,
                 part_id: PartId::new(1).unwrap(),
                 level: Level::L0,
                 event_hour: 0,

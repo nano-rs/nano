@@ -27,6 +27,7 @@ pub mod overlay;
 pub mod platform_audit_lane;
 pub mod pull;
 pub mod scan;
+pub mod source_ack;
 pub mod vector_tests;
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ describe('ingestion navigation by edition', () => {
     const shared = visible(true);
     expect(shared).not.toContain('Credentials');
     expect(shared).not.toContain('Source Configs');
-    expect(shared).toEqual(['Pipelines', 'Add data', 'Log Sources', 'Source onboarding', 'Repositories']);
+    expect(shared).toEqual(['Log Sources', 'Pipelines', 'Repositories']);
   });
 
   it('keeps Credentials on open core and dedicated', () => {
@@ -32,12 +32,7 @@ describe('ingestion navigation by edition', () => {
     expect(visibleOnEdition({ sharedOnly: true }, true)).toBe(true);
   });
 
-  it('offers onboarding in the rail and flyout on both editions with view permission', () => {
-    for (const shared of [true, false]) {
-      expect(visible(shared)).toContain('Source onboarding');
-    }
-    expect(ingestionNavigation.find(item => item.name === 'Source onboarding')).toMatchObject({
-      href: '/ingestion/log-sources/onboarding', permissions: 'log_sources:view',
-    });
+  it('removes the old onboarding surface from navigation', () => {
+    for (const shared of [true, false]) expect(visible(shared)).not.toContain('Source onboarding');
   });
 });

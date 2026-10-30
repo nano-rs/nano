@@ -497,3 +497,24 @@ fn a_sampled_catalog_source_builds_on_the_zero_parser_base_in_the_pinned_image()
         assert!(sink.contains("\"tenant__apache_access_ocsf_sample\"]"), "{case}");
     }
 }
+
+#[test]
+fn connect_first_authentication_only_bundle_validates_and_keeps_its_token_on_publish() {
+    if !enabled() { return; }
+    const ZERO_V2: &[u8] = include_bytes!("../src/parsers/tenant_bundle/testdata/platform-base-zero-collector-v2.tar.gz");
+    let scratch = scratch();
+    let (raw_out, raw) = run_build_on(&scratch.path().join("raw"), ZERO_V2,
+        source("", &["{\"nano_ingress_probe\":true}"]), "none");
+    assert_eq!(raw.verdict, Verdict::Passed, "{:?}", raw.failure);
+    assert!(raw.sources[0].components.is_empty());
+    let raw_tree = archive::unpack(&std::fs::read(raw_out.join("bundle.tar.gz")).unwrap()).unwrap();
+    let base = archive::unpack(ZERO_V2).unwrap();
+    assert_eq!(raw_tree.file("sources/parsers/_router.toml"), base.file("sources/parsers/_router.toml"));
+    let (parsed_out, parsed) = run_build_on(&scratch.path().join("parsed"), ZERO_V2,
+        source(GOOD_VRL, &["GET /index.html"]), "none");
+    assert_eq!(parsed.verdict, Verdict::Passed, "{:?}", parsed.failure);
+    let parsed_tree = archive::unpack(&std::fs::read(parsed_out.join("bundle.tar.gz")).unwrap()).unwrap();
+    assert_eq!(raw.bundle.unwrap().hec_sources, parsed.bundle.unwrap().hec_sources);
+    assert_eq!(raw_tree.file("02-hec-source.toml"), parsed_tree.file("02-hec-source.toml"),
+        "the same transport token and source identity survive parser publication");
+}

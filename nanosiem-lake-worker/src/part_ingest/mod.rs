@@ -25,6 +25,7 @@ pub mod finding_append;
 pub mod finding_gate;
 pub mod hold;
 pub mod ingest;
+pub mod landing_receipts;
 pub mod maintenance;
 pub mod memory;
 pub mod merge;

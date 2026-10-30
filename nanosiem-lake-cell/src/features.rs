@@ -350,6 +350,9 @@ pub const CELL_FEATURES: &[&str] = &[
     // pinned by `landing` tests
     // (`cell_feature_lean_landing_platform_audit_v1_is_backed`).
     "lean_landing_platform_audit_v1",
+    // Signed per-tenant platform probes: verified ingestion and exact landing identity.
+    "platform_probe_v1",
+    "landing_receipt_v1",
 ];
 
 /// The label value: names joined with commas.
@@ -929,6 +932,8 @@ mod tests {
             // cell forwards nothing and renders no key for it.
             ("lean_job_small_lane_v1", || !CELL_FEATURES.is_empty()),
             ("lean_landing_platform_audit_v1", || !CELL_FEATURES.is_empty()),
+            ("platform_probe_v1", || !CELL_FEATURES.is_empty()),
+            ("landing_receipt_v1", || !CELL_FEATURES.is_empty()),
         ]
     }
 

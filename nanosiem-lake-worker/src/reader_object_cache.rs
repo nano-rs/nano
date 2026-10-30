@@ -102,16 +102,55 @@ impl HydratePacing {
         if self.rate.load(Ordering::Relaxed) > 0 {
             let delay = self.bucket.reserve(bytes as u64, pacing_now());
             if !delay.is_zero() {
+                let _ = FETCH_PROGRESS.try_with(|progress| progress.progress(delay));
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {},
                     _ = wake => {},
                 }
+                let _ = FETCH_PROGRESS.try_with(|progress| progress.progress(Duration::ZERO));
             }
         }
     }
 }
 
 tokio::task_local! { static HYDRATE_RATE: Arc<HydratePacing>; }
+
+// One attempt's network watchdog. Pacing explicitly extends it while asleep;
+// a low hydration share must never turn a silent GET into an hours-long wait.
+struct FetchProgress {
+    deadline: tokio::sync::watch::Sender<tokio::time::Instant>,
+    allowance: Duration,
+}
+impl FetchProgress {
+    fn progress(&self, pacing: Duration) {
+        self.deadline.send_replace(tokio::time::Instant::now() + self.allowance + pacing);
+    }
+}
+tokio::task_local! { static FETCH_PROGRESS: FetchProgress; }
+
+async fn watch_fetch<T>(
+    allowance: Duration,
+    work: impl std::future::Future<Output = Result<T, ReaderCacheError>>,
+) -> Result<T, ReaderCacheError> {
+    let (deadline, mut changes) = tokio::sync::watch::channel(tokio::time::Instant::now() + allowance);
+    let watchdog = async move {
+        loop {
+            let at = *changes.borrow_and_update();
+            tokio::select! {
+                biased;
+                changed = changes.changed() => { if changed.is_err() { return; } },
+                () = tokio::time::sleep_until(at) => return,
+            }
+        }
+    };
+    FETCH_PROGRESS.scope(FetchProgress { deadline, allowance }, async {
+        tokio::select! {
+            biased;
+            result = work => result,
+            () = watchdog => Err(ReaderCacheError::FetchTimeout),
+        }
+    }).await
+}
 
 tokio::task_local! {
     /// NAN-3272: the cold-byte budget of the durable job whose reads run in
@@ -2374,17 +2413,38 @@ impl Inner {
         object: &ReaderObjectRef,
         background: Option<Arc<tokio::sync::Notify>>,
     ) -> Result<(), ReaderCacheError> {
-        // NAN-3714: the deadline cuts a stalled transfer, not the wait for a
-        // download slot. Started before the permit, every object queued behind
-        // a large lease's first `fetch_concurrency` downloads timed out in the
-        // queue: after a roll, a 7 d entity pivot leasing ~1,200 objects
-        // failed its durable job twice with "cold object fetch exceeded its
-        // deadline" (HTTP 500) while every transfer was still progressing.
-        // A queued object waits on other transfers, each bounded by this same
-        // deadline once it holds its slot.
-        // NAN-4277: a background download first takes a background slot, so
-        // background work never holds every download slot. Promoted (a
-        // foreground read needs this object) it stops waiting for one.
+        let hydrating = hydrating();
+        for attempt in 1..=2 {
+            // Each attempt owns its permits/reservation. Backoff holds neither,
+            // so an unavailable object yields its slot to healthy siblings.
+            let result = self.fetch_attempt(object, background.clone()).await;
+            let retry = match &result {
+                Err(ReaderCacheError::Integrity(message)) => {
+                    self.counters.integrity_failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(tenant_id = %self.tenant_id, sha256 = %object.sha256,
+                        attempt, error = %message, "reader_cache_integrity: fetched object failed its signed fence");
+                    true
+                }
+                Err(ReaderCacheError::FetchTimeout | ReaderCacheError::Unavailable(_)) => hydrating,
+                _ => false,
+            };
+            if !retry || attempt == 2 { return result; }
+            let backoff = (self.settings.fetch_deadline / 4).min(Duration::from_secs(1));
+            tracing::warn!(tenant_id = %self.tenant_id, sha256 = %object.sha256, attempt,
+                backoff_ms = backoff.as_millis() as u64, error = %result.as_ref().unwrap_err(),
+                "reader cache object retry after bounded fetch failure");
+            tokio::time::sleep(backoff).await;
+        }
+        unreachable!("bounded fetch attempts return their final result")
+    }
+
+    async fn fetch_attempt(
+        self: &Arc<Self>,
+        object: &ReaderObjectRef,
+        background: Option<Arc<tokio::sync::Notify>>,
+    ) -> Result<(), ReaderCacheError> {
+        // Queuing is outside the transfer deadline; a large progressing lease
+        // must not time out its later objects before they get a slot.
         let _background = match background {
             Some(promoted) => tokio::select! {
                 biased;
@@ -2395,53 +2455,27 @@ impl Inner {
             },
             None => None,
         };
-        let _permit = self
-            .permits
-            .acquire()
-            .await
+        let _permit = self.permits.acquire().await
             .map_err(|_| ReaderCacheError::Unavailable("reader cache closed".to_string()))?;
         tokio::time::timeout(fetch_deadline(self.settings.fetch_deadline, object.size_bytes), async {
-            if self.object_path(&object.sha256).exists() {
-                // Admitted by another process meanwhile; link_present takes it.
-                return Ok(());
-            }
+            if self.object_path(&object.sha256).exists() { return Ok(()); }
             let inner = self.clone();
             let bytes = object.size_bytes;
-            // NAN-4591: hydration's limits, unless a foreground read joined
-            // (promoted) this download while it queued.
             let background = hydrating() && _background.is_some();
             let digest = object.sha256.clone();
             let reservation = blocking(move || inner.reserve_as(bytes, background, Some(&digest))).await?;
-            for attempt in 1..=2 {
-                match self.download(object).await {
-                    Ok(temporary) => {
-                        let inner = self.clone();
-                        let owned = object.clone();
-                        blocking(move || inner.admit(temporary, &owned)).await?;
-                        drop(reservation);
-                        return Ok(());
-                    }
-                    Err(ReaderCacheError::Integrity(message)) => {
-                        self.counters.integrity_failures.fetch_add(1, Ordering::Relaxed);
-                        tracing::error!(
-                            tenant_id = %self.tenant_id,
-                            sha256 = %object.sha256,
-                            source_uri = %object.source_uri,
-                            attempt,
-                            error = %message,
-                            "reader_cache_integrity: fetched object failed its signed fence"
-                        );
-                        if attempt == 2 {
-                            return Err(ReaderCacheError::Integrity(message));
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(ReaderCacheError::Integrity(object.sha256.clone()))
-        })
-        .await
-        .map_err(|_| ReaderCacheError::FetchTimeout)?
+            // Network time is sized at the cold-read throughput floor, never
+            // the much lower intentional hydration pacing share. The watchdog
+            // excludes actual pacing sleeps and renews only on received bytes.
+            let allowance = self.settings.fetch_deadline.saturating_add(
+                Duration::from_secs(object.size_bytes / FOREGROUND_FETCH_FLOOR_BYTES_PER_SECOND));
+            let temporary = watch_fetch(allowance, self.download(object)).await?;
+            let inner = self.clone();
+            let owned = object.clone();
+            blocking(move || inner.admit(temporary, &owned)).await?;
+            drop(reservation);
+            Ok(())
+        }).await.map_err(|_| ReaderCacheError::FetchTimeout)?
     }
 
     /// Stream into a flock-held temp in `objects/`, fenced by length + SHA-256.
@@ -2470,6 +2504,9 @@ impl Inner {
         let result = self
             .source
             .stream_object(object, &mut |chunk: &[u8]| {
+                if !chunk.is_empty() {
+                    let _ = FETCH_PROGRESS.try_with(|progress| progress.progress(Duration::ZERO));
+                }
                 received = received.saturating_add(chunk.len() as u64);
                 if received > expected {
                     sink_error = Some(ReaderCacheError::Integrity(format!(
@@ -4128,6 +4165,74 @@ pub(crate) mod tests {
         assert!(matches!(error, ReaderCacheError::FetchTimeout), "{error}");
         assert_eq!(error.reason(), "reader_cold_fetch_timeout");
         assert!(error.retryable());
+    }
+
+    /// Production cache admission and single-flight, one actual download slot.
+    /// A very low pacing share used to leave the detached silent GET alive for
+    /// 101 seconds. Its network watchdog must cancel it, yield the slot during
+    /// backoff, and retry without a test-only constructor or pacing override.
+    #[tokio::test]
+    async fn hydration_hanging_get_releases_slot_and_retries_with_backoff() {
+        struct HangingSource {
+            inner: Arc<FakeSource>,
+            hung_uri: String,
+            attempts: AtomicU64,
+            cancelled: AtomicU64,
+            permanent: bool,
+        }
+        struct Cancelled<'a>(&'a AtomicU64);
+        impl Drop for Cancelled<'_> {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        #[async_trait::async_trait]
+        impl ReaderObjectSource for HangingSource {
+            async fn stream_object(&self, object: &ReaderObjectRef,
+                sink: &mut (dyn for<'b> FnMut(&'b [u8]) -> anyhow::Result<()> + Send),
+            ) -> anyhow::Result<()> {
+                if object.source_uri == self.hung_uri {
+                    let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                    if self.permanent || attempt == 0 {
+                        let _cancelled = Cancelled(&self.cancelled);
+                        return std::future::pending().await;
+                    }
+                }
+                self.inner.stream_object(object, sink).await
+            }
+        }
+        for permanent in [false, true] {
+            let (root, source) = fixture();
+            let hung = source.put("hung", 100);
+            let healthy = source.put("healthy", 100);
+            let source = Arc::new(HangingSource { inner: source, hung_uri: hung.source_uri.clone(),
+                attempts: AtomicU64::new(0), cancelled: AtomicU64::new(0), permanent });
+            let mut settings = settings(root.path(), 10_000);
+            settings.fetch_concurrency = 1;
+            settings.fetch_deadline = Duration::from_millis(100);
+            let cache = ReaderObjectCache::open(settings, "t1", BUCKET, PREFIX, source.clone()).unwrap();
+            let stuck = background_hydrate_shared(HydrateBucket::new(0), 1,
+                cache.ensure_local(std::slice::from_ref(&hung)));
+            let sibling = async {
+                while source.attempts.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; }
+                let lease = background_hydrate_shared(HydrateBucket::new(0), 1,
+                    cache.ensure_local(std::slice::from_ref(&healthy))).await.unwrap();
+                assert_eq!(source.attempts.load(Ordering::SeqCst), 1,
+                    "healthy sibling uses the released slot before the retry");
+                lease
+            };
+            let (result, sibling) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(stuck, sibling)
+            }).await.expect("a silent GET cannot inherit the 101-second pacing budget");
+            assert_eq!(source.attempts.load(Ordering::SeqCst), 2);
+            assert_eq!(source.cancelled.load(Ordering::SeqCst), if permanent { 2 } else { 1 });
+            if permanent { assert!(matches!(result, Err(ReaderCacheError::FetchTimeout))); }
+            else { assert_eq!(result.unwrap().misses(), 1); }
+            assert_eq!(sibling.misses(), 1);
+            assert_eq!(cache.inner.permits.available_permits(), 1);
+            assert_eq!(cache.inner.background_permits.available_permits(), 1);
+            assert_eq!(cache.in_flight_bytes(), 0);
+            assert!(cache.inner.state().inflight.is_empty());
+            assert!(objects_dir_entries(root.path()).iter().all(|name| !name.starts_with(TEMP_PREFIX)));
+        }
     }
 
     /// NAN-3714: a lease larger than the download slots does not time out

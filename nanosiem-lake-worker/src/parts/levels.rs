@@ -166,7 +166,7 @@ impl FlushPolicy {
             "ingest flush ages must be within {FLUSH_AGE_FLOOR_MS}..={FLUSH_AGE_CEILING_MS} ms"
         );
         anyhow::ensure!(self.min_age_ms <= self.max_age_ms, "ingest flush min_age_ms exceeds max_age_ms");
-        anyhow::ensure!(self.target_rows > 0 && self.target_rows <= FLUSH_MAX_ROWS as u64, "ingest flush target_rows must be 1..={FLUSH_MAX_ROWS}");
+        anyhow::ensure!(self.target_rows > 0 && self.target_rows <= FLUSH_TARGET_ROWS_CEILING as u64, "ingest flush target_rows must be 1..={FLUSH_TARGET_ROWS_CEILING}");
         Ok(())
     }
 
@@ -186,8 +186,8 @@ pub fn flush_interval_ms(events_per_second: f64) -> i64 {
     FlushPolicy::default().interval_ms(events_per_second)
 }
 
-/// A flush also fires at this many buffered rows.
-pub const FLUSH_MAX_ROWS: usize = nanosiem_lake_cell::contract::IngestFlush::MAX_TARGET_ROWS as usize;
+/// Safety validator for policy target_rows; never a runtime flush cap.
+pub const FLUSH_TARGET_ROWS_CEILING: usize = nanosiem_lake_cell::contract::IngestFlush::MAX_TARGET_ROWS as usize;
 
 /// Maximum L0 inputs per minute job (72k rows at the default 300-eps flush).
 pub const MAX_MINUTE_MERGE_INPUTS: usize = 24;
@@ -505,6 +505,7 @@ mod tests {
     fn part(level: Level, hour: i32, created_ms: i64) -> PartRef {
         let id = PartId::parse(&format!("{created_ms:013}-{:016x}", (hour as u64) * 1000 + created_ms as u64 % 1000 + level as u64)).unwrap();
         PartRef {
+            request_hours: None,
             part_id: id,
             level,
             event_hour: hour,
@@ -555,7 +556,7 @@ mod tests {
             FlushPolicy { max_age_ms: 180_000, ..FlushPolicy::default() },
             FlushPolicy { min_age_ms: 20_000, max_age_ms: 10_000, target_rows: 3_000 },
             FlushPolicy { target_rows: 0, ..FlushPolicy::default() },
-            FlushPolicy { target_rows: FLUSH_MAX_ROWS as u64 + 1, ..FlushPolicy::default() },
+            FlushPolicy { target_rows: FLUSH_TARGET_ROWS_CEILING as u64 + 1, ..FlushPolicy::default() },
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");
         }
@@ -648,6 +649,7 @@ mod tests {
             seq += 1;
             let id = PartId::parse(&format!("{created:013}-{seq:016x}")).unwrap();
             PartRef {
+                request_hours: None,
                 part_id: id,
                 level,
                 event_hour: hour,

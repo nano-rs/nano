@@ -100,7 +100,7 @@ impl DurableJobRunnerStore for HostedCoordinatorClient {
             }
             command["phase"] = json!(phase);
         }
-        self.boolean(command).await
+        self.progress_command(command).await
     }
     async fn complete(
         &self,
@@ -311,6 +311,9 @@ impl std::fmt::Debug for PreparedHostedJob {
 pub struct HostedClaim {
     claim: DurableSearchJobClaim,
     key: String,
+    // This local conservative bound advances only after an acknowledged renew.
+    // Serialize renewals so overlapping callers cannot move it backwards.
+    renewal_deadline: tokio::sync::Mutex<tokio::time::Instant>,
 }
 impl HostedClaim {
     pub fn claim(&self) -> &DurableSearchJobClaim {
@@ -854,7 +857,13 @@ impl HostedCoordinatorClient {
                     .unwrap_or(DurableQueryResourceClass::Medium),
             },
         )?;
-        Ok(HostedClaim { claim, key })
+        let remaining = Duration::from_millis(
+            expires.saturating_sub(Utc::now().timestamp_millis()).max(0) as u64,
+        ).saturating_sub(Duration::from_millis(250));
+        Ok(HostedClaim {
+            claim, key,
+            renewal_deadline: tokio::sync::Mutex::new(tokio::time::Instant::now() + remaining),
+        })
     }
 
     pub async fn renew(
@@ -864,7 +873,36 @@ impl HostedCoordinatorClient {
     ) -> Result<bool, DurableJobStoreError> {
         let mut command = self.stamp(claim, "renew")?;
         command["lease_ms"] = json!(lease_millis(lease)?);
-        self.boolean(command).await
+        match &self.backend {
+            CoordinatorBackend::Hosted(transport) => {
+                let mut deadline = claim.renewal_deadline.lock().await;
+                let started = tokio::time::Instant::now();
+                if started >= *deadline {
+                    return Ok(false);
+                }
+                // A renewal may shorten the server lease even when its reply
+                // is lost. Bound recovery by that possible expiry as well as
+                // the last acknowledged one, before sending any request.
+                *deadline = (*deadline).min(
+                    started + lease.saturating_sub(Duration::from_millis(250)),
+                );
+                command["epoch"] = json!(self.epoch);
+                let (value, sent) = transport.renew_until(&command, *deadline).await
+                    .map_err(unavailable)?;
+                let renewed = value.as_bool().ok_or_else(rejected)?;
+                if renewed {
+                    // Server time is at least the request start. Never use
+                    // response arrival or an unacknowledged write as proof.
+                    let confirmed = sent + lease.saturating_sub(Duration::from_millis(250));
+                    if tokio::time::Instant::now() >= confirmed {
+                        return Ok(false);
+                    }
+                    *deadline = confirmed;
+                }
+                Ok(renewed)
+            }
+            CoordinatorBackend::Postgres(_) => self.boolean(command).await,
+        }
     }
 
     pub async fn progress(
@@ -877,7 +915,23 @@ impl HostedCoordinatorClient {
         }
         let mut command = self.stamp(claim, "progress")?;
         command["progress"] = json!(percent);
-        self.boolean(command).await
+        self.progress_command(command).await
+    }
+
+    // Publication may recover a lost advisory progress acknowledgement using
+    // renew, but must distinguish that from an explicit refusal or bad reply.
+    async fn progress_command(&self, mut command: Value) -> Result<bool, DurableJobStoreError> {
+        match &self.backend {
+            CoordinatorBackend::Hosted(transport) => {
+                command["epoch"] = json!(self.epoch);
+                match transport.execute_detailed(&command).await {
+                    Ok(value) => value.as_bool().ok_or_else(rejected),
+                    Err(failure) if failure.kind == CoordinatorTransportError::Unavailable => Err(unavailable(failure)),
+                    Err(failure) => Err(DurableJobStoreError::Invalid(failure.to_string())),
+                }
+            }
+            CoordinatorBackend::Postgres(_) => self.boolean(command).await,
+        }
     }
 
     pub async fn fail(
@@ -902,7 +956,19 @@ impl HostedCoordinatorClient {
         claim: &HostedClaim,
         result: &SearchJobResultRef,
     ) -> Result<bool, DurableJobStoreError> {
-        self.boolean(self.result_command(claim, result)?).await
+        let mut command = self.result_command(claim, result)?;
+        match &self.backend {
+            CoordinatorBackend::Hosted(transport) => {
+                // Serialize against renewals; neither ambiguous completion nor
+                // status reads may extend the last confirmed lease deadline.
+                let deadline = claim.renewal_deadline.lock().await;
+                command["epoch"] = json!(self.epoch);
+                let value = transport.complete_until(&command, *deadline).await
+                    .map_err(unavailable)?;
+                value.as_bool().ok_or_else(rejected)
+            }
+            CoordinatorBackend::Postgres(_) => self.boolean(command).await,
+        }
     }
 
     fn result_command(

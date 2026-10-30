@@ -42,7 +42,7 @@ use crate::ingest_source_counters::{RefusedSources, SourceKey};
 use crate::parts::refusal_tally;
 use crate::enrichment::BronzeIngestEnricher;
 use crate::parts::format::{LogKeys, PartId, PartKeys, PROVENANCE_FILE};
-use crate::parts::levels::{plan_merges_with, FlushPolicy, Level, MergePolicy, FLUSH_MAX_ROWS};
+use crate::parts::levels::{plan_merges_with, FlushPolicy, Level, MergePolicy};
 use crate::parts::part_log::{AppendOutcome, LogEntry, LogOp, LogSchema, ObjectStore, PartLogWriter, PartRef, Rejection, SourceRef, WriteHints, WriterClass};
 use super::finding_append::{FindingAppendRequest, FindingAppendResponse};
 use super::finding_outbox::{committed_receipts_cached, FindingReceipt};
@@ -111,9 +111,17 @@ pub(crate) struct RetryWindowExhausted(pub u64);
 /// else that reaches a coded exit: fencing, a double consume, a 401/403
 /// (credentials), the writer lease lost, the owner refusing a reservation
 /// (isolated by its own ledger mark), an epoch change, enrichment, and a
-/// clean end. A wedge (stall watchdog) and a crash never reach this.
+/// clean end. Owner signing refusals undo charges even after the retry
+/// window; a control contract mismatch is never poison evidence. A wedge
+/// (stall watchdog) and a crash never reach this.
 pub(crate) fn exit_keeps_charges(error: Option<&anyhow::Error>) -> bool {
     let Some(error) = error else { return false };
+    // An older owner may reject a new producer field (NAN-4873). Even a
+    // retry-window exit must not turn this contract failure into a source
+    // rejection. Inspect the full cause chain before the window marker.
+    if super::cell::owner_sign_refused(error) {
+        return false;
+    }
     if error.downcast_ref::<RetryWindowExhausted>().is_some() {
         return true;
     }
@@ -138,6 +146,7 @@ fn catalog_failure_health(reason: &'static str) -> serde_json::Value {
 
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
+    pub platform_probe_key: std::sync::Arc<std::sync::RwLock<Option<nanosiem_core::platform_probe::PlatformProbeKey>>>,
     pub tenant_id: String,
     /// Tenant-owned catalog custody, supplied by the provisioning runtime.
     /// No environment toggle: a provisioned catalog must participate in erasure.
@@ -151,6 +160,9 @@ pub struct IngestConfig {
     pub merge_policy: MergePolicy,
     pub dedup: DedupPolicy,
     pub max_objects_per_admission: usize,
+    /// Trusted role assignment; the live cgroup/host quota may reduce it.
+    /// Zero means discover the effective process quota.
+    pub cpu_millis: u32,
     pub max_merges_per_tick: usize,
     /// Run merges in bounded background lanes that `tick` polls without
     /// waiting (the cell sets this): an hour seal is minutes of CPU and must
@@ -291,6 +303,7 @@ impl IngestConfig {
     pub fn new(tenant_id: &str, work_dir: impl AsRef<Path>) -> Self {
         Self {
             tenant_id: tenant_id.to_string(),
+            platform_probe_key: Default::default(),
             catalog: None,
             catalog_attachment_failure: None,
             work_dir: work_dir.as_ref().to_path_buf(),
@@ -298,6 +311,7 @@ impl IngestConfig {
             merge_policy: MergePolicy::default(),
             dedup: DedupPolicy::default(),
             max_objects_per_admission: 64,
+            cpu_millis: 0,
             max_merges_per_tick: 2,
             background_merges: false,
             buffer_budget_bytes: DEFAULT_BUFFER_BUDGET_BYTES,
@@ -638,11 +652,13 @@ pub struct TickReport {
 }
 
 struct Buffered {
+    probe_receipts: Vec<super::landing_receipts::Receipt>,
     /// Admitted rows per event hour, already decoded to Arrow at admission
     /// (each batch under the pending schema of its admission; the flush
     /// aligns them). NAN-3183: buffered as JSON values a wide OCSF row cost
     /// ~50 KB of heap, which capped a catch-up flush at ~18k rows.
     hours: BTreeMap<i32, Vec<RecordBatch>>,
+    request_hours: BTreeSet<i64>,
     /// Arrow memory of `hours`.
     bytes: u64,
     hour_duplicates: BTreeMap<i32, u64>,
@@ -694,7 +710,9 @@ struct Buffered {
 impl Buffered {
     fn new() -> Self {
         Self {
+            probe_receipts: Vec::new(),
             hours: BTreeMap::new(),
+            request_hours: BTreeSet::new(),
             bytes: 0,
             hour_duplicates: BTreeMap::new(),
             rejections: Vec::new(),
@@ -732,6 +750,13 @@ impl Buffered {
     }
 }
 
+struct FlushCapacity {
+    rows: u64,
+    arrow_row_bytes: u64,
+    writer_room_bytes: u64,
+    writers: usize,
+}
+
 /// Everything one flush's L0 parts are built from, detached from the
 /// ingestor so the build can run off the tick (NAN-3183 pipelining).
 struct FlushPlan {
@@ -750,12 +775,14 @@ struct FlushPlan {
     now_ms: i64,
     /// Parallel L0 part writers ([`super::memory::writers_for`]).
     writers: usize,
+    /// CPU-bounded partition budget, independent of memory-limited active writers.
+    part_lanes: usize,
 }
 
 impl FlushPlan {
     /// Each hour's rows, sorted, cut into row ranges written as separate L0
     /// parts on parallel threads (the part write was ~0.4 ms/row on one
-    /// thread, the catch-up bottleneck once a flush holds FLUSH_MAX_ROWS).
+    /// thread, the catch-up bottleneck for large flushes).
     ///
     /// NAN-4750: an hour's dedicated `(source, class)` families (planned in
     /// `flush_plan`) are written as their own class-labelled L0 parts, the
@@ -767,7 +794,7 @@ impl FlushPlan {
             let batch = sorted_hour(batches, &self.schema)?;
             let groups = split_l0_families(&batch, families)?;
             drop(batch);
-            let parts = l0_group_parts(&groups.iter().map(|(_, rows)| rows.num_rows()).collect::<Vec<_>>());
+            let parts = l0_group_parts_for(&groups.iter().map(|(_, rows)| rows.num_rows()).collect::<Vec<_>>(), self.part_lanes);
             let chunks = groups.into_iter().zip(parts)
                 .flat_map(|((family, rows), parts)| l0_chunks_into(rows.num_rows(), parts).into_iter()
                     .map(move |(offset, len)| (family.clone(), rows.slice(offset, len))))
@@ -815,6 +842,8 @@ struct InFlightFlush {
     /// Working-budget bytes charged until it commits
     /// ([`super::memory::flight_bytes`]).
     reserved_bytes: u64,
+    /// Active writers selected by the production plan (not inferred from bytes).
+    writers: usize,
     /// The schema its parts are built under (already in the log).
     schema: SchemaRef,
     sealed_ms: i64,
@@ -1002,6 +1031,7 @@ pub struct PrevalenceReplayGap {
 }
 
 pub struct Ingestor<'a> {
+    pub landing_receipts: super::landing_receipts::Receipts,
     cfg: IngestConfig,
     parts: &'a dyn ObjectStore,
     /// NAN-4181: finding batch attempt markers known to this process.
@@ -1644,12 +1674,7 @@ fn restamp_applied(map: Option<&super::restamp::RestampMap>, outcome: Option<&su
 }
 
 /// Default [`IngestConfig::buffer_budget_bytes`] (lab, tests).
-pub const DEFAULT_BUFFER_BUDGET_BYTES: u64 = 768 * 1024 * 1024;
-/// Share of ingest[T]'s memory cap for its working set (NAN-3183 OOM): the
-/// admission group, the filling Arrow buffer, the flush in flight with its
-/// build copies and writers, and the merge lanes are all charged against it
-/// (`super::memory`). The uid window (30%) and the process base sit beside.
-pub const BUFFER_BUDGET_SHARE: f64 = 0.30;
+pub const DEFAULT_BUFFER_BUDGET_BYTES: u64 = nanosiem_lake_cell::ingest_memory::DEFAULT_WORKING_BUDGET_BYTES;
 /// Heap per compressed source byte before any admission was measured:
 /// Parquet bronze of wide OCSF rows inflates into JSON values (the load-test tenant edge
 /// segments model at 110 B/byte; NAN-3183 `catchup_memory_profile`).
@@ -1843,12 +1868,23 @@ pub fn size_for_memory_cap(cfg: &mut IngestConfig, memory_cap_bytes: u64) {
     cfg.prevalence_catch_up_max_rows = super::prevalence::catch_up_max_rows_for(memory_cap_bytes);
 }
 
+pub fn size_for_role(cfg: &mut IngestConfig, memory_cap_bytes: u64, cpu_millis: u32) {
+    size_for_memory_cap(cfg, memory_cap_bytes);
+    cfg.cpu_millis = cpu_millis;
+}
+
 /// The admission buffer budget for a process memory cap.
 pub fn buffer_budget_for(memory_cap_bytes: u64) -> u64 {
-    if memory_cap_bytes == 0 {
-        return DEFAULT_BUFFER_BUDGET_BYTES;
-    }
-    ((memory_cap_bytes as f64 * BUFFER_BUDGET_SHARE) as u64).clamp(64 * 1024 * 1024, 4 * 1024 * 1024 * 1024)
+    nanosiem_lake_cell::ingest_memory::working_budget(memory_cap_bytes)
+}
+
+/// A tighter live cgroup does not shrink the configured UID window. Charge
+/// its excess over the role model before lending room to ingest work.
+fn live_working_budget(memory_cap_bytes: u64, configured_uids: usize) -> u64 {
+    let model_uids = super::dedup::window_cap_for(memory_cap_bytes);
+    let excess = configured_uids.saturating_sub(model_uids) as u64;
+    buffer_budget_for(memory_cap_bytes)
+        .saturating_sub(excess.saturating_mul(super::dedup::WINDOW_BYTES_PER_UID))
 }
 
 /// Most sealed flushes in flight per tenant. No deployment switch.
@@ -1871,11 +1907,11 @@ pub fn edge_source_config(flush_depth: usize) -> crate::edge_log::EdgeLogSourceC
 
 /// Age cap of a flush while ingest is behind (notices waiting): flushes then
 /// close on their row/byte/object caps, this only bounds a slow trickle.
-pub const CATCH_UP_FLUSH_MAX_AGE_MS: i64 = 30_000;
+pub const CATCH_UP_FLUSH_MAX_AGE_MS: i64 = nanosiem_lake_cell::budget::CATCH_UP_FLUSH_AGE_SECS as i64 * 1000;
 
 /// Rows below which an hour of a flush stays one L0 part; above it the
 /// hour is cut into up to [`MAX_PARALLEL_L0_WRITES`] parts of equal rows.
-pub const L0_PARALLEL_MIN_ROWS: usize = 16_384;
+pub const L0_PARALLEL_MIN_ROWS: usize = nanosiem_lake_cell::budget::L0_PART_MIN_ROWS as usize;
 /// NAN-4539 step 3a: the smallest buffer that seals before a published
 /// flight's inline commit (one full L0 part's rows).
 pub const SEAL_FIRST_MIN_ROWS: usize = L0_PARALLEL_MIN_ROWS;
@@ -1883,15 +1919,20 @@ pub use super::memory::MAX_PARALLEL_L0_WRITES;
 
 /// L0 parts a flush of `buffer` writes: [`l0_chunks`] of every hour.
 #[cfg(test)]
-fn planned_l0_parts(buffer: &Buffered) -> usize {
+fn planned_l0_parts(buffer: &Buffered, lanes: usize) -> usize {
     buffer.hours.values()
-        .map(|batches| l0_chunks(batches.iter().map(|batch| batch.num_rows()).sum()).len())
+        .map(|batches| l0_chunks_for(batches.iter().map(|batch| batch.num_rows()).sum(), lanes).len())
         .sum()
 }
 
 /// `(offset, len)` row ranges an hour of `rows` sorted rows is written as.
+#[cfg(test)]
 pub fn l0_chunks(rows: usize) -> Vec<(usize, usize)> {
-    l0_chunks_into(rows, (rows / L0_PARALLEL_MIN_ROWS).clamp(1, MAX_PARALLEL_L0_WRITES))
+    l0_chunks_for(rows, nanosiem_lake_cell::ingest_memory::REFERENCE_L0_WRITERS)
+}
+
+fn l0_chunks_for(rows: usize, lanes: usize) -> Vec<(usize, usize)> {
+    l0_chunks_into(rows, (rows / L0_PARALLEL_MIN_ROWS).clamp(1, lanes.clamp(1, MAX_PARALLEL_L0_WRITES)))
 }
 
 /// `(offset, len)` ranges cutting `rows` into at most `parts` equal ranges.
@@ -1905,10 +1946,10 @@ fn l0_chunks_into(rows: usize, parts: usize) -> Vec<(usize, usize)> {
 
 /// NAN-4750: dedicated `(source, class)` L0 drafts one hour of one flush
 /// may get, beside its one mixed rest group. With the rest that is at most
-/// [`MAX_PARALLEL_L0_WRITES`] groups, so an hour of a flush writes at most
-/// `max(l0_chunks(rows).len(), groups)` <= `MAX_PARALLEL_L0_WRITES` L0
-/// parts: never more than a 64k-row flush hour already wrote before.
-pub const MAX_L0_CLASS_DRAFTS: usize = MAX_PARALLEL_L0_WRITES - 1;
+/// four class groups. The ordinary partition budget follows role CPU;
+/// class splitting adds files only when that budget does not cover the
+/// existing class groups. The class-group ceiling preserves low-rate layout.
+pub const MAX_L0_CLASS_DRAFTS: usize = 3;
 
 /// NAN-4750: the `(source, class)` families of one hour's buffered rows
 /// that get their own class-labelled L0 part: those of at least
@@ -1971,13 +2012,18 @@ fn split_l0_families(batch: &RecordBatch, families: &[(String, i64)]) -> Result<
 /// NAN-4750: L0 parts per group of `rows` (an hour's family groups): each
 /// group as [`l0_chunks`] would cut it, then trimmed (fewest rows per part
 /// first) until the hour writes at most `max(l0_chunks(total).len(),
-/// groups)` parts. A class split therefore adds parts only to an hour of
-/// fewer than `MAX_PARALLEL_L0_WRITES * L0_PARALLEL_MIN_ROWS` rows, and at
-/// most [`MAX_L0_CLASS_DRAFTS`] of them.
+/// groups)` parts using the role's CPU lane count. A class split adds at
+/// most [`MAX_L0_CLASS_DRAFTS`] parts when ordinary partitions do not already
+/// cover its groups.
+#[cfg(test)]
 fn l0_group_parts(rows: &[usize]) -> Vec<usize> {
+    l0_group_parts_for(rows, nanosiem_lake_cell::ingest_memory::REFERENCE_L0_WRITERS)
+}
+
+fn l0_group_parts_for(rows: &[usize], lanes: usize) -> Vec<usize> {
     let total = rows.iter().sum::<usize>();
-    let budget = l0_chunks(total).len().max(rows.len());
-    let mut parts = rows.iter().map(|rows| (rows / L0_PARALLEL_MIN_ROWS).clamp(1, MAX_PARALLEL_L0_WRITES)).collect::<Vec<_>>();
+    let budget = l0_chunks_for(total, lanes).len().max(rows.len());
+    let mut parts = rows.iter().map(|rows| (rows / L0_PARALLEL_MIN_ROWS).clamp(1, lanes.clamp(1, MAX_PARALLEL_L0_WRITES))).collect::<Vec<_>>();
     while parts.iter().sum::<usize>() > budget {
         // Some group has more than one part: the sum exceeds the group count.
         let index = (0..parts.len()).filter(|i| parts[*i] > 1)
@@ -2316,6 +2362,7 @@ impl<'a> Ingestor<'a> {
                 "ingest restarted with objects admitted and unacknowledged; admitting one object at a time until they commit");
         }
         let mut ingestor = Self {
+            landing_receipts: super::landing_receipts::Receipts::new(&cfg.tenant_id),
             health: IngestHealth { agent_catalog: cfg.catalog_attachment_failure.map(catalog_failure_health), tenant_id: cfg.tenant_id.clone(), count_backfill_window: count_backfill.clone(), ..IngestHealth::default() },
             cfg,
             parts,
@@ -2629,10 +2676,11 @@ impl<'a> Ingestor<'a> {
             "filling_arrow_bytes": self.buffer.bytes, "filling_objects": self.buffer.handles.len(),
             "flight_rows": self.flush_in_flight.iter().map(|f| f.buffer.rows).sum::<usize>(),
             "flight_reserved_bytes": self.flush_in_flight.iter().map(|f| f.reserved_bytes).sum::<u64>(),
+            "flight_writers": self.flush_in_flight.iter().map(|f| f.writers).sum::<usize>(),
             "merge_reserved_bytes": self.merges_reserved_bytes(), "working_reserved_bytes": self.committed_bytes(),
-            "working_budget_bytes": self.cfg.buffer_budget_bytes,
+            "working_budget_bytes": self.working_budget(),
             "background_publish_available": self.background_parts.is_some() && self.background_signer.is_some(),
-            "memory_budget_exhausted": self.committed_bytes() >= self.cfg.buffer_budget_bytes,
+            "memory_budget_exhausted": self.committed_bytes() >= self.working_budget(),
             "admission_paused": self.admission_paused, "partially_committed": self.buffer.partially_committed(),
             "pending_schema_change": self.pending_schema.fields() != self.schema.fields(),
             "rejections_or_skips": !self.buffer.rejections.is_empty() || !self.buffer.refused.is_empty() || !self.buffer.replayed.is_empty(),
@@ -4572,11 +4620,13 @@ impl<'a> Ingestor<'a> {
         // NAN-4749: the room is per admission group (decoded one after
         // another), not for the whole tick at once.
         let committed = self.committed_bytes();
-        let mut packing = super::memory::AdmissionGroups::new(self.cfg.buffer_budget_bytes, committed,
-            self.buffer.bytes, self.buffer.rows as u64);
+        let mut packing = super::memory::AdmissionGroups::new(self.working_budget(), committed,
+            self.buffer.bytes, self.buffer.rows as u64).with_row_cap(self.flush_row_cap());
         let idle = self.buffer.bytes == 0 && self.flush_in_flight.is_empty();
         let fixed_admission_model = self.fixed_admission_model();
         let mut held_bytes = 0_u64;
+        let mut preselection_cap_deferred = false;
+        let seal_cap_refusals = super::memory::memory_derived_flush_limits(self.working_budget()) && self.buffer.rows > 0;
         let hold_budget = self.admission_byte_budget;
         let fresh = pending
             .iter()
@@ -4601,10 +4651,11 @@ impl<'a> Ingestor<'a> {
                 // row slices beside the flights; admission decides on its
                 // footer (an unknown size is left to it).
                 if *index == 0 && self.buffer.handles.is_empty() && !fixed_admission_model
-                    && super::memory::admission_fits(self.cfg.buffer_budget_bytes, committed, 0.0, arrow) {
+                    && super::memory::admission_fits(self.working_budget(), committed, 0.0, arrow) {
                     packing.force(heap, arrow, 0);
                     return true;
                 }
+                preselection_cap_deferred |= seal_cap_refusals && !packing.within_caps(arrow, 0);
                 false
             })
             .map(|(_, notice)| notice.clone())
@@ -4616,7 +4667,9 @@ impl<'a> Ingestor<'a> {
         let more_fresh = pending.iter().filter(|(handle, _)| pending_fresh(handle)).count() > fresh.len();
         // NAN-4319: objects acknowledged since leave the crash ledger.
         self.forget_acknowledged(&pending);
-        self.admission_deferred = false;
+        // Known-size notices can hit a cap before footer packing runs.
+        // Preserve that refusal even when preselection admits no object.
+        self.admission_deferred = preselection_cap_deferred;
         // Never admit into a buffer that is partly in the log (B1): its
         // appends are skipped on retry, so new rows would be acked unwritten.
         // NAN-4674: behind, a wide (backfill) buffer keeps admitting up to
@@ -4755,7 +4808,10 @@ impl<'a> Ingestor<'a> {
         // window too, or a redelivered row of it would pass dedup.
         let buffered_hours = self.buffer.hours.keys()
             .chain(self.flush_in_flight.iter().flat_map(|flight| flight.buffer.hours.keys()))
-            .copied().collect::<BTreeSet<_>>();
+            .copied().map(i64::from)
+            .chain(self.buffer.request_hours.iter().copied())
+            .chain(self.flush_in_flight.iter().flat_map(|flight| flight.buffer.request_hours.iter().copied()))
+            .collect::<BTreeSet<_>>();
         let mut spilled = Vec::new();
         self.window.evict_into(now_ms, &buffered_hours, &mut spilled);
         for hour in spilled {
@@ -5069,8 +5125,16 @@ impl<'a> Ingestor<'a> {
     /// replay's request (it stays quarantined) and, when the flush held ONE
     /// object, mark it so the restarted ingest refuses it whole. A flush of
     /// several objects marks none: the restart admits each alone, and the
-    /// culprit's own flush is refused next. Every other failure: nothing.
+    /// culprit's own flush is refused next. Signing refusals instead undo
+    /// crash charges immediately and leave every source pending.
     fn note_flush_failure(&mut self, sources: &[SourceObject], replay: Option<&str>, error: &anyhow::Error, now_ms: i64) {
+        if super::cell::owner_sign_refused(error) {
+            // Persist forgiveness immediately, including if the supervisor
+            // kills this process during backoff. Keep the buffer, sources,
+            // dedup state and issued range intact for the owner's recovery.
+            self.note_orderly_exit("owner_sign_refused");
+            return;
+        }
         if !super::native_writer::reservation_refused(error) {
             return;
         }
@@ -5092,6 +5156,34 @@ impl<'a> Ingestor<'a> {
     }
 
     async fn admit(&mut self, notices: &[(NoticeHandle, SourceNotice)], now_ms: i64) -> Result<(u64, u64)> {
+        // Measure one real object before packing a cold backlog. Expanded
+        // Arrow columns can be wider than dictionary-encoded footer bytes.
+        // Continue in the SAME tick; warm-up must not add a per-object idle
+        // second or change the admission rate used by the age policy.
+        if notices.len() > 1 && self.calibration.arrow_row_bytes() == 0
+            && super::memory::memory_derived_flush_limits(self.working_budget()) {
+            let previous = (self.last_admit_ms, self.health.eps_ewma);
+            let (mut rows, mut duplicates, mut next) = (0, 0, 0);
+            while next < notices.len() && self.calibration.arrow_row_bytes() == 0 {
+                let admitted = self.admit_with_calibration(&notices[next..next + 1], now_ms, true).await?;
+                rows += admitted.0;
+                duplicates += admitted.1;
+                next += 1;
+                if self.admission_deferred || self.buffer.rows as u64 >= self.flush_row_cap() { break; }
+            }
+            // Refused/empty objects must not prevent a later valid object
+            // from supplying the cold measurement in this same bounded tick.
+            if next < notices.len() && !self.admission_deferred
+                && (self.buffer.rows as u64) < self.flush_row_cap() {
+                let admitted = self.admit_with_calibration(&notices[next..], now_ms, true).await?;
+                rows += admitted.0;
+                duplicates += admitted.1;
+            }
+            self.last_admit_ms = previous.0;
+            self.health.eps_ewma = previous.1;
+            self.record_admission_rate(rows, now_ms);
+            return Ok((rows, duplicates));
+        }
         self.admit_with_calibration(notices, now_ms, true).await
     }
 
@@ -5110,8 +5202,8 @@ impl<'a> Ingestor<'a> {
         let mut recorded: Option<String> = None;
         // NAN-4749: the tick's objects, packed into groups that decode one
         // after another (`files` indices where a group starts).
-        let mut packing = super::memory::AdmissionGroups::new(self.cfg.buffer_budget_bytes, committed,
-            self.buffer.bytes, self.buffer.rows as u64);
+        let mut packing = super::memory::AdmissionGroups::new(self.working_budget(), committed,
+            self.buffer.bytes, self.buffer.rows as u64).with_row_cap(self.flush_row_cap());
         let mut group_starts: Vec<usize> = Vec::new();
         // NAN-4553: rows per slice of a lone object too large to admit whole.
         let mut slice_rows: Option<u64> = None;
@@ -5207,7 +5299,7 @@ impl<'a> Ingestor<'a> {
             let offer = if slice_rows.is_some() { super::memory::Offer::Refused } else { packing.offer(heap, arrow, rows) };
             let fits = offer != super::memory::Offer::Refused;
             let beside = (files.is_empty() && !idle && !fits && self.buffer.handles.is_empty() && !fixed_admission_model)
-                .then(|| super::memory::pipelined_slice_rows(self.cfg.buffer_budget_bytes, committed, heap, arrow, rows))
+                .then(|| super::memory::pipelined_slice_rows(self.working_budget(), committed, heap, arrow, rows))
                 .flatten();
             if !(files.is_empty() && idle) && !fits && beside.is_none() {
                 let _ = std::fs::remove_file(&target);
@@ -5216,8 +5308,11 @@ impl<'a> Ingestor<'a> {
                 // it alone fits beside them, only this group's transient
                 // decode peak bounded it: the next tick admits it into the
                 // same buffer, so the flush grows to its caps instead of
-                // sealing at one admission group.
-                if !super::memory::admission_fits(self.cfg.buffer_budget_bytes, committed, heap, arrow) {
+                // sealing at one admission group. A cap refusal seals now:
+                // admitting a forced first object next tick would overshoot
+                // the planned byte/writer bound and lose its parallelism.
+                if !super::memory::admission_fits(self.working_budget(), committed, heap, arrow)
+                    || (super::memory::memory_derived_flush_limits(self.working_budget()) && !packing.within_caps(arrow, rows)) {
                     self.admission_deferred = true;
                 }
                 tracing::info!(objects_admitted = files.len(), groups = packing.groups(), decoded_bytes = decoded,
@@ -5225,7 +5320,7 @@ impl<'a> Ingestor<'a> {
                 break;
             }
             if !fits {
-                slice_rows = Some(beside.unwrap_or_else(|| super::memory::admission_slice_rows(self.cfg.buffer_budget_bytes, committed, heap, arrow, rows)));
+                slice_rows = Some(beside.unwrap_or_else(|| super::memory::admission_slice_rows(self.working_budget(), committed, heap, arrow, rows)));
                 packing.force(heap, arrow, rows);
             }
             if offer == super::memory::Offer::NewGroup {
@@ -5247,7 +5342,7 @@ impl<'a> Ingestor<'a> {
             Some(rows) if files.len() == 1 => match if idle {
                 write_admission_slices(&files[0], rows).map(Some)
             } else {
-                write_pipelined_admission_slices(&files[0], rows, self.cfg.buffer_budget_bytes, committed)
+                write_pipelined_admission_slices(&files[0], rows, self.working_budget(), committed)
             } {
                 Ok(Some(slices)) => slices,
                 Ok(None) => {
@@ -5281,7 +5376,7 @@ impl<'a> Ingestor<'a> {
         let _slice_files = RemoveOnDrop(slices.iter().map(|slice| slice.2.clone()).collect());
         if !slices.is_empty() {
             tracing::info!(tenant = %self.cfg.tenant_id, key = %files[0].1.key, slices = slices.len(), requested_rows_per_slice = slice_rows.unwrap_or(0),
-                budget_bytes = self.cfg.buffer_budget_bytes, "object larger than the admission budget; admitting it in row slices");
+                budget_bytes = self.working_budget(), "object larger than the admission budget; admitting it in row slices");
             self.health.objects_admitted_in_slices_total += 1;
             if !idle {
                 self.health.objects_sliced_beside_flights_total += 1;
@@ -5303,6 +5398,7 @@ impl<'a> Ingestor<'a> {
             /// Kept rows: their uids, payload hashes, times and the Arrow
             /// decode, row-aligned.
             uids: Vec<String>,
+            probe_receipts: BTreeMap<String, super::landing_receipts::Receipt>,
             payloads: Vec<u64>,
             batch: Option<RecordBatch>,
             times: Vec<i64>,
@@ -5359,7 +5455,7 @@ impl<'a> Ingestor<'a> {
             }
             let retained_arrow = admitted.iter().filter_map(|entry| entry.batch.as_ref())
                 .map(|batch| batch.get_array_memory_size() as u64).sum::<u64>();
-            let room = self.cfg.buffer_budget_bytes.saturating_sub(committed).saturating_sub(retained_arrow) as f64;
+            let room = self.working_budget().saturating_sub(committed).saturating_sub(retained_arrow) as f64;
             let heap_allowance = (calibrated && !self.fixed_admission_model() && learned_heap < fixed_heap).then(|| {
                 learned_heap.min((room - fixed_arrow).max(0.0) / super::memory::ADMISSION_PEAK_PER_MODELLED_HEAP) as u64
             });
@@ -5509,10 +5605,29 @@ impl<'a> Ingestor<'a> {
             // This namespace belongs to the authenticated finding-outbox
             // drain. A raw event must not become a risk contribution after
             // its part is merged with a genuine finding part.
+            let probe_receipts = std::sync::Mutex::new(BTreeMap::new());
+            let receipt_overflow = std::sync::atomic::AtomicBool::new(false);
+            let rejected_probes = std::sync::Mutex::new(BTreeSet::new());
             for_each_row_chunk(&mut rows, |chunk| {
-                chunk.iter_mut().for_each(|row| strip_untrusted_risk_fields(&mut row.ocsf_event));
+                let key = self.cfg.platform_probe_key.read().expect("probe key lock");
+                for row in chunk {
+                    strip_untrusted_risk_fields(&mut row.ocsf_event);
+                    if nanosiem_core::platform_probe::inspect(&mut row.ocsf_event, key.as_ref(), &self.cfg.tenant_id, now_ms)
+                        == nanosiem_core::platform_probe::ProbeAdmission::Refused {
+                        rejected_probes.lock().expect("probe refusal lock").insert(row.event_uid.clone());
+                    }
+                    if let Some(receipt) = super::landing_receipts::recognize(&row.ocsf_event, now_ms) {
+                        let mut receipts = probe_receipts.lock().expect("probe receipt collection");
+                        if receipts.len() < super::landing_receipts::MAX_RECEIPTS { receipts.insert(row.event_uid.clone(), receipt); }
+                        else { receipt_overflow.store(true, std::sync::atomic::Ordering::Relaxed); }
+                    }
+                }
                 Ok(())
             })?;
+            // Never let a partial receipt collection hide a later parse error.
+            if receipt_overflow.load(std::sync::atomic::Ordering::Relaxed) {
+                for receipt in probe_receipts.lock().expect("probe receipts").values_mut() { receipt.parse_error = true; }
+            }
             // A failed or slow lookup never fails or holds the tick: this
             // batch goes unstamped (a partial stamp is stripped whole).
             // Unstamped (no grant, rebuilding, catching up, state busy): a
@@ -5541,7 +5656,9 @@ impl<'a> Ingestor<'a> {
             // Admission normalized `time`; a row whose time still does not
             // parse is refused alone (never a tick error).
             let parsed = map_rows(&rows, |row| event_time_us(&row.ocsf_event).ok());
-            let bad_time = parsed.iter().enumerate().filter(|(_, time)| time.is_none()).map(|(index, _)| index).collect::<BTreeSet<_>>();
+            let rejected_probes = rejected_probes.into_inner().expect("probe refusal lock");
+            let bad_probe = rows.iter().enumerate().filter(|(_, row)| rejected_probes.contains(&row.event_uid)).map(|(i,_)|i).collect::<BTreeSet<_>>();
+            let bad_time = parsed.iter().enumerate().filter(|(index, time)| time.is_none() || bad_probe.contains(index)).map(|(index, _)| index).collect::<BTreeSet<_>>();
             let times = parsed.into_iter().map(|time| time.unwrap_or(0)).collect::<Vec<_>>();
             // NAN-3864: rows written unstamped while the tenant holds a grant
             // are owed a restamp once the state reaches the log head; never
@@ -5574,8 +5691,9 @@ impl<'a> Ingestor<'a> {
                 // NAN-3662: the dropped rows by source lane (value-free).
                 let sources = refused_sources.entry(group[0].2.clone()).or_default();
                 let (time, decode) = (RowRefusal::new("time_invalid", Some("time")), RowRefusal::new("schema_decode", None));
+                let probe_refusal = RowRefusal::new("platform_probe_signature_invalid", Some("unmapped.nano_platform_probe"));
                 for (index, row) in rows.iter().enumerate() {
-                    let refusal = if bad_time.contains(&index) { &time } else if undecodable.contains(&index) { &decode } else { continue };
+                    let refusal = if bad_probe.contains(&index) { &probe_refusal } else if bad_time.contains(&index) { &time } else if undecodable.contains(&index) { &decode } else { continue };
                     sources.note(SourceKey::of(&row.ocsf_event), refusal, None);
                 }
                 let keep = (0..rows.len()).filter(|i| !bad_time.contains(i) && !undecodable.contains(i)).collect::<BTreeSet<_>>();
@@ -5592,12 +5710,12 @@ impl<'a> Ingestor<'a> {
                 let credentials = row_credentials(&rows, track_credentials);
                 let (uids, batch) = decoded_rows(rows, decoded, &self.pending_schema)?;
                 let payloads = payload_hashes(&uids, &digests);
-                admitted.push(Admitted { group, rows_by_path, uids, payloads, batch, times: times_kept, refused, refused_sources, credentials, bronze_duplicates, conflicting_replays, time_clamped, row_bytes: None, clamped });
+                admitted.push(Admitted { probe_receipts: probe_receipts.into_inner().expect("probe receipts"), group, rows_by_path, uids, payloads, batch, times: times_kept, refused, refused_sources, credentials, bronze_duplicates, conflicting_replays, time_clamped, row_bytes: None, clamped });
             } else {
                 let credentials = row_credentials(&rows, track_credentials);
                 let (uids, batch) = decoded_rows(rows, decoded, &self.pending_schema)?;
                 let payloads = payload_hashes(&uids, &digests);
-                admitted.push(Admitted { group, rows_by_path, uids, payloads, batch, times, refused, refused_sources, credentials, bronze_duplicates, conflicting_replays, time_clamped, row_bytes: None, clamped });
+                admitted.push(Admitted { probe_receipts: probe_receipts.into_inner().expect("probe receipts"), group, rows_by_path, uids, payloads, batch, times, refused, refused_sources, credentials, bronze_duplicates, conflicting_replays, time_clamped, row_bytes: None, clamped });
             }
             if let Some(entry) = admitted.get(calibrated_before) {
                 self.health.admission_groups_total += 1;
@@ -5687,6 +5805,8 @@ impl<'a> Ingestor<'a> {
             for (index, time_us) in entry.times.iter().enumerate() {
                 by_hour.entry(event_hour_of(*time_us)).or_default().push(index);
             }
+            let request_hours = entry.uids.iter().filter_map(|uid| crate::parts::request_dedup::request_hour(uid)).collect::<BTreeSet<_>>();
+            for hour in request_hours { self.prepare_request_hour(hour, now_ms).await?; }
             let mut unverified = BTreeSet::new();
             for (hour, rows) in &by_hour {
                 if self.prepare_hour(*hour, rows.iter().map(|i| entry.uids[*i].as_str()), now_ms).await? {
@@ -5723,7 +5843,7 @@ impl<'a> Ingestor<'a> {
         // NAN-4765: the uid-window walk and buffer append, apart from the
         // parse and the stamp (heartbeat `operation_timings`).
         let dedupe_timing = self.diagnostics.operations.start("admission_dedupe");
-        for (Admitted { group, rows_by_path, uids, payloads, batch, times: _, refused, refused_sources, credentials, bronze_duplicates, conflicting_replays, time_clamped, row_bytes, clamped }, (by_hour, unverified)) in admitted.into_iter().zip(prepared) {
+        for (Admitted { mut probe_receipts, group, rows_by_path, uids, payloads, batch, times: _, refused, refused_sources, credentials, bronze_duplicates, conflicting_replays, time_clamped, row_bytes, clamped }, (by_hour, unverified)) in admitted.into_iter().zip(prepared) {
             self.note_time_clamped(&time_clamped, group.len().max(1));
             // NAN-3899: a kept row's share of its objects' stored bytes.
             let row_bytes = row_bytes.unwrap_or_else(|| group.iter().map(|file| file.4).sum::<u64>() / (uids.len().max(1) as u64));
@@ -5753,7 +5873,10 @@ impl<'a> Ingestor<'a> {
                     let payload = payloads[index];
                     let key = keys[index];
                     let original = original_hour(index, hour);
-                    let seen = if tiered && !self.window.contains_key(hour, &key) && self.late.contains(hour, &key) {
+                    let request_hour = crate::parts::request_dedup::request_hour(uid).map(crate::parts::request_dedup::window_hour);
+                    let seen = if let Some(request_hour) = request_hour {
+                        self.window.observe_key(request_hour, key, payload, now_ms)
+                    } else if tiered && !self.window.contains_key(hour, &key) && self.late.contains(hour, &key) {
                         self.health.late_dedup_tier_duplicates_total += 1;
                         Seen::Duplicate
                     } else if original.is_some_and(|original| self.window.contains_key(original, &key)
@@ -5782,6 +5905,14 @@ impl<'a> Ingestor<'a> {
                             self.log_payload_diff(hour, uid, first, payload, now_ms);
                         }
                         continue;
+                    }
+                    if let Some(request_hour) = request_hour { self.buffer.request_hours.insert(request_hour); }
+                    if let Some(receipt) = probe_receipts.remove(uid) {
+                        if let Some(first) = self.buffer.probe_receipts.iter_mut().find(|r| r.nonce == receipt.nonce) {
+                            first.parse_error |= receipt.parse_error || first.source != receipt.source || first.bundle != receipt.bundle;
+                        } else if self.buffer.probe_receipts.len() < super::landing_receipts::MAX_RECEIPTS {
+                            self.buffer.probe_receipts.push(receipt);
+                        }
                     }
                     keep.push(u32::try_from(index).context("admission row index")?);
                     if let Some(Some(credential)) = credentials.get(index) {
@@ -5842,13 +5973,16 @@ impl<'a> Ingestor<'a> {
             let observed = value_heap / source_bytes as f64;
             self.heap_per_source_byte = 0.5 * self.heap_per_source_byte + 0.5 * observed;
         }
-        // Rate estimate (events/s) for the flush interval.
+        self.record_admission_rate(rows_total, now_ms);
+        Ok((rows_total, dups_total))
+    }
+
+    fn record_admission_rate(&mut self, rows: u64, now_ms: i64) {
         if let Some(last) = self.last_admit_ms.replace(now_ms) {
             let seconds = ((now_ms - last).max(1) as f64) / 1_000.0;
-            let eps = rows_total as f64 / seconds;
+            let eps = rows as f64 / seconds;
             self.health.eps_ewma = if self.health.eps_ewma == 0.0 { eps } else { 0.8 * self.health.eps_ewma + 0.2 * eps };
         }
-        Ok((rows_total, dups_total))
     }
 
     /// NAN-4336: count rows admission clamped to their ingest time, per
@@ -6374,6 +6508,26 @@ impl<'a> Ingestor<'a> {
     /// Returns true when some live part of the hour could not be consulted
     /// (neither loaded, covered nor cached); for an hour inside the 72 h
     /// horizon such a part is queued for a background fold.
+    /// Request-hour summaries survive event-hour changes, restart, day
+    /// compaction and rewrites. Failure to hydrate is an ingest error: never
+    /// admit an unverified duplicate. No new objects or remote UID ledger.
+    async fn prepare_request_hour(&mut self, request_hour: i32, now_ms: i64) -> Result<()> {
+        let hour = crate::parts::request_dedup::window_hour(request_hour);
+        if self.window.is_complete(hour) { return Ok(()); }
+        let parts = self.log.live().parts()
+            .filter(|part| part.request_hours.is_some_and(|hours| hours.contains(request_hour)))
+            .cloned().collect::<Vec<_>>();
+        for part in parts {
+            if self.window.has_loaded(hour, part.part_id.as_str()) { continue; }
+            let dir = self.ensure_local(&part).await?;
+            self.window.load_request_part(request_hour, part.part_id.as_str(), &dir, now_ms)?;
+            super::stall_watchdog::note_progress();
+            tokio::task::yield_now().await;
+        }
+        self.window.set_complete(hour, true, now_ms);
+        Ok(())
+    }
+
     async fn prepare_hour<'u>(&mut self, hour: i32, uids: impl Iterator<Item = &'u str>, now_ms: i64) -> Result<bool> {
         if self.window.is_complete(hour) {
             return Ok(false);
@@ -6447,6 +6601,7 @@ impl<'a> Ingestor<'a> {
     /// seal-first tick) a seal that may sit beside every flight left seals
     /// before the ready oldest commits, so its build overlaps that commit.
     async fn flush_ordered(&mut self, now_ms: i64, pipeline: bool, commit_ready: bool) -> Result<usize> {
+        self.calibration.retain_buffer_width(self.buffer.bytes, self.buffer.rows as u64);
         // Commit what is ready, then wait until this seal may join the
         // flights left (NAN-3619): with depth 1, or whenever this seal would
         // log anything ahead of an earlier flight's `add` (rejections, skip
@@ -6476,6 +6631,15 @@ impl<'a> Ingestor<'a> {
         let reaped = if commit_ready || self.flush_in_flight.len() > keep { self.reap_in_flight(now_ms, keep).await? } else { 0 };
         if self.buffer.handles.is_empty() && self.buffer.rows == 0 {
             return Ok(reaped);
+        }
+        if self.buffer.rows > 0 {
+            let capacity = self.flush_capacity();
+            tracing::info!(target: "nano::ingest::capacity", tenant = %self.cfg.tenant_id,
+                working_budget_bytes = self.working_budget(), merge_reserve_bytes = self.merges_reserved_bytes(),
+                arrow_row_bytes = capacity.arrow_row_bytes, flush_row_cap = capacity.rows,
+                writer_room_bytes = capacity.writer_room_bytes, writers = capacity.writers,
+                buffered_rows = self.buffer.rows, buffered_arrow_bytes = self.buffer.bytes,
+                "ingest seal memory-derived capacity");
         }
         if let Some(since) = self.seal_deferred_since_ms.take() {
             self.health.seal_deferred_max_ms = self.health.seal_deferred_max_ms.max(now_ms.saturating_sub(since));
@@ -6540,7 +6704,8 @@ impl<'a> Ingestor<'a> {
                 self.diagnostics.stage("log_schema");
                 self.log_pending_schema(now_ms).await?;
                 let plan = self.flush_plan(&self.buffer, self.schema.clone(), range, now_ms)?;
-                let reserved_bytes = super::memory::flight_bytes(self.buffer.bytes, plan.writers);
+                let writers = plan.writers;
+                let reserved_bytes = super::memory::flight_bytes(self.buffer.bytes, writers);
                 let trusted = self.trusted.clone();
                 let wake = self.flight_wake.clone();
                 let progress = self.buffer.progress.clone().expect("sealed diagnostics");
@@ -6568,7 +6733,7 @@ impl<'a> Ingestor<'a> {
                 });
                 let buffer = std::mem::replace(&mut self.buffer, Buffered::new());
                 let sealed_ms = buffer.flush_started_ms.unwrap_or(now_ms);
-                self.flush_in_flight.push_back(InFlightFlush { buffer, reserved_bytes, schema: self.schema.clone(), sealed_ms, progress, task: Some(task), built: None, published: None, published_ok });
+                self.flush_in_flight.push_back(InFlightFlush { buffer, reserved_bytes, writers, schema: self.schema.clone(), sealed_ms, progress, task: Some(task), built: None, published: None, published_ok });
                 self.update_pipeline_diagnostics();
                 self.diagnostics.stage("build_and_publish");
                 self.health.flushes_pipelined_total += 1;
@@ -6605,6 +6770,11 @@ impl<'a> Ingestor<'a> {
         self.update_pipeline_diagnostics();
         self.diagnostics.stage(if self.flush_in_flight.is_empty() { "idle" } else { "build_and_publish" });
         let count = buffer.parts_committed;
+        if buffer.add_committed {
+            if let Some((seq, sha, _)) = self.log.live().head() {
+                self.landing_receipts.commit(std::mem::take(&mut buffer.probe_receipts), seq, sha, now_ms);
+            }
+        }
         // NAN-3643: a replay's flush is durable. Admitted (or already
         // consumed): drop it from the quarantine. Refused again: `keep`
         // already recorded the new refusal and it stays.
@@ -6833,11 +7003,11 @@ impl<'a> Ingestor<'a> {
             interval = interval.max(CATCH_UP_FLUSH_MAX_AGE_MS);
         }
         let due_by_age = self.buffer.since_ms.is_some_and(|since| now_ms - since >= interval);
-        let due_by_cap = self.buffer.rows >= FLUSH_MAX_ROWS
-            || self.buffer.bytes >= super::memory::buffer_cap(self.cfg.buffer_budget_bytes)
+        let due_by_cap = self.buffer.rows as u64 >= self.flush_row_cap()
+            || self.buffer.bytes >= super::memory::buffer_cap(self.working_budget())
             // The budget is spent (flight + merges + buffer): admission is
             // stalled, so seal what is buffered rather than wait out the age.
-            || (self.buffer.rows > 0 && self.committed_bytes() >= self.cfg.buffer_budget_bytes)
+            || (self.buffer.rows > 0 && self.committed_bytes() >= self.working_budget())
             || self.buffer.hours.len() >= flush_event_hour_cap(behind)
             || self.buffer.handles.len() >= MAX_FLUSH_OBJECTS
             || self.buffer.rejections.len() >= MAX_REJECTIONS_PER_ENTRY
@@ -6916,7 +7086,7 @@ impl<'a> Ingestor<'a> {
             && self.flush_in_flight.iter().map(|f| f.reserved_bytes).sum::<u64>()
                 .saturating_add(self.merges_reserved_bytes())
                 .saturating_add(super::memory::flight_bytes(self.buffer.bytes, 1))
-                <= self.cfg.buffer_budget_bytes
+                <= self.working_budget()
     }
 
     /// Append the floor/end op the queue asks for (edge sources), then tell
@@ -6949,6 +7119,11 @@ impl<'a> Ingestor<'a> {
 
     /// The parts plan of `buffer` under `schema` (logged).
     fn flush_plan(&self, buffer: &Buffered, schema: SchemaRef, edge_log: Option<crate::parts::EdgeLogRange>, now_ms: i64) -> Result<FlushPlan> {
+        // Preserve the baseline partition budget for small roles and bound
+        // larger layouts by useful memory-backed CPU lanes. Active writers
+        // remain CPU/memory limited independently of this file-layout floor.
+        let part_lanes = self.flush_capacity().writers
+            .max(nanosiem_lake_cell::ingest_memory::REFERENCE_L0_WRITERS);
         let fingerprint = crate::parts::format::schema_fingerprint(&schema)?;
         let feed = self.enricher.initial_metrics();
         let mut admission = Admission {
@@ -6983,7 +7158,7 @@ impl<'a> Ingestor<'a> {
         let planned_parts = hours.iter()
             .map(|(_, batches, _, families)| {
                 let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-                l0_chunks(rows).len().max(usize::from(rows > 0) + families.len())
+                l0_chunks_for(rows, part_lanes).len().max(usize::from(rows > 0) + families.len())
             })
             .sum::<usize>();
         Ok(FlushPlan {
@@ -7002,6 +7177,7 @@ impl<'a> Ingestor<'a> {
             // (`write_l0_parts_with` runs at most one per part; NAN-4750:
             // at most this many with its class drafts).
             writers: self.flush_writers(buffer.bytes).min(planned_parts.max(1)),
+            part_lanes,
         })
     }
 
@@ -7038,29 +7214,56 @@ impl<'a> Ingestor<'a> {
             // fill that budget and block every minute merge until they finish.
             // Retain the original two-history service rate in smaller lab
             // budgets that cannot hold a minute job beside both histories.
-            let affordable = (self.cfg.buffer_budget_bytes.saturating_sub(other) / reserve).saturating_sub(2) as usize;
+            let affordable = (self.working_budget().saturating_sub(other) / reserve).saturating_sub(2) as usize;
             let progress = super::merge_lanes::MergeCapacity::read().minute_progress_slots().min(affordable);
             let minutes = self.merge_in_flight.iter().filter(|flight| flight.merge.output_level == Level::Minute).count();
             slots += progress.saturating_sub(minutes);
         }
         let next = (slots as u64 * reserve)
             .max(self.cfg.merge_headroom_bytes);
-        other.saturating_add(next) <= self.cfg.buffer_budget_bytes
+        other.saturating_add(next) <= self.working_budget()
     }
+
+    /// Cgroup ancestors can tighten an assignment after startup. Never borrow
+    /// beyond the configured role share when a container has more memory.
+    fn working_budget(&self) -> u64 {
+        crate::cgroup_memory::for_process().limit().map_or(self.cfg.buffer_budget_bytes,
+            |limit| self.cfg.buffer_budget_bytes.min(live_working_budget(limit.bytes, self.cfg.max_window_uids)))
+    }
+
+    fn flush_parallelism(&self) -> usize {
+        #[cfg(test)]
+        if super::memory::LEGACY_FLUSH_CAP_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed) {
+            return nanosiem_lake_cell::ingest_memory::REFERENCE_L0_WRITERS;
+        }
+        let cpu = crate::cgroup_memory::for_process().role_cpu_millis(self.cfg.cpu_millis);
+        nanosiem_lake_cell::ingest_memory::writer_limit(cpu)
+    }
+
+    fn flush_capacity(&self) -> FlushCapacity {
+        let buffered_width = if self.buffer.rows == 0 { 0 } else {
+            self.buffer.bytes.div_ceil(self.buffer.rows as u64)
+        };
+        let measured = buffered_width.max(self.calibration.arrow_row_bytes());
+        let width = if measured == 0 { nanosiem_lake_cell::ingest_memory::FLUSH_ROW_MEMORY_BYTES } else { measured };
+        let working = self.working_budget();
+        let merges = self.merges_reserved_bytes();
+        let cpu = self.flush_parallelism();
+        let rows = super::memory::flush_row_cap(working, merges, width, cpu);
+        let room = super::memory::writer_room(working, merges, 0);
+        let writers = super::memory::writers_for(rows.saturating_mul(width), room, cpu)
+            .min((rows as usize / L0_PARALLEL_MIN_ROWS).clamp(1, cpu));
+        FlushCapacity { rows, arrow_row_bytes: width, writer_room_bytes: room, writers }
+    }
+
+    fn flush_row_cap(&self) -> u64 { self.flush_capacity().rows }
 
     /// Parallel writers for a flush of `buffer_bytes`: the most whose build
     /// fits beside merge room, a full next buffer and fresh admission.
     fn flush_writers(&self, buffer_bytes: u64) -> usize {
-        let budget = self.cfg.buffer_budget_bytes;
-        // Earlier flights still in flight (depth > 1) hold their build too.
         let flights = self.flush_in_flight.iter().map(|flight| flight.reserved_bytes).sum::<u64>();
-        // The next admission has a JSON peak as well as retained Arrow.
-        // Without this reserve, small-role flights spend all freed buffer
-        // room on extra writers and admission still cannot overlap them.
-        let admission = (budget / 3).min(super::memory::FLIGHT_ADMISSION_BYTES);
-        let others = self.merges_reserved_bytes().saturating_add(super::memory::buffer_cap(budget))
-            .saturating_add(admission).saturating_add(flights);
-        super::memory::writers_for(buffer_bytes, budget.saturating_sub(others))
+        let room = super::memory::writer_room(self.working_budget(), self.merges_reserved_bytes(), flights);
+        super::memory::writers_for(buffer_bytes, room, self.flush_parallelism())
     }
 
     /// Unknown native PUT outcomes must keep their original journal fenced.
@@ -9400,12 +9603,13 @@ mod nan4765_ingest_tests;
 #[cfg(test)]
 mod l0_class_family_tests {
     use super::*;
+    use nanosiem_lake_cell::ingest_memory::REFERENCE_L0_WRITERS;
     use arrow_array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Fields, Schema};
 
     /// An hour's parts with a class split never exceed
     /// `max(l0_chunks(total).len(), groups)`, never exceed
-    /// MAX_PARALLEL_L0_WRITES with the draft cap, and keep the old cut
+    /// REFERENCE_L0_WRITERS with the draft cap, and keep the old cut
     /// when there is nothing to split.
     #[test]
     fn group_parts_stay_within_the_hour_bound() {
@@ -9416,14 +9620,14 @@ mod l0_class_family_tests {
         assert_eq!(l0_group_parts(&[9_000, 9_000, 2_000]), vec![1, 1, 1]);
         // A 64k+ hour already wrote four parts: the split re-cuts them.
         let parts = l0_group_parts(&[3 * s, s / 2, 2 * s]);
-        assert_eq!(parts.iter().sum::<usize>(), MAX_PARALLEL_L0_WRITES);
+        assert_eq!(parts.iter().sum::<usize>(), REFERENCE_L0_WRITERS);
         assert!(parts.iter().all(|p| *p >= 1));
         for rows in [vec![8_192, 8_192, 8_192, 1], vec![4 * s, 4 * s, 4 * s, 4 * s], vec![s, 9 * s, 8_192, 8_192], vec![1, 8_192]] {
             let parts = l0_group_parts(&rows);
             let total = rows.iter().sum::<usize>();
             let bound = l0_chunks(total).len().max(rows.len());
             assert!(parts.iter().sum::<usize>() <= bound, "{rows:?} -> {parts:?}");
-            assert!(parts.iter().sum::<usize>() <= MAX_PARALLEL_L0_WRITES, "{rows:?} -> {parts:?}");
+            assert!(parts.iter().sum::<usize>() <= REFERENCE_L0_WRITERS, "{rows:?} -> {parts:?}");
             assert!(parts.iter().all(|p| *p >= 1));
         }
         assert_eq!(l0_chunks_into(10, 4), vec![(0, 3), (3, 3), (6, 3), (9, 1)]);
@@ -9479,7 +9683,7 @@ mod l0_class_family_tests {
         assert_eq!(l0_class_families(&batches).unwrap(), vec![("a".to_string(), 1)], "a batch without the columns counts nothing");
         let many = (0..5).map(|class| batch(&rows("s", class, min + class as usize))).collect::<Vec<_>>();
         assert_eq!(l0_class_families(&many).unwrap(), vec![("s".to_string(), 4), ("s".to_string(), 3), ("s".to_string(), 2)]);
-        assert_eq!(MAX_L0_CLASS_DRAFTS + 1, MAX_PARALLEL_L0_WRITES);
+        assert_eq!(MAX_L0_CLASS_DRAFTS + 1, REFERENCE_L0_WRITERS);
     }
 }
 
@@ -9694,6 +9898,7 @@ mod tests {
         assert_eq!(restored.start_ms, window.start_ms);
         ingestor.queue_count_backfill(window.clone(), now, true).await.unwrap();
         let part = PartRef {
+            request_hours: None,
             part_id: crate::parts::format::PartId::new(now).unwrap(), level: Level::Hour,
             event_hour: (window.start_ms / 3_600_000) as i32, event_day: None, rows: 1,
             min_time_us: window.start_ms * 1000, max_time_us: window.start_ms * 1000,
@@ -9724,6 +9929,7 @@ mod tests {
         // One sorted L0 flush every 22 s since the roll, none merged.
         let l0_since_roll = |now_ms: i64| (0..).map(|n| roll_ms + n * 22_000).take_while(|created| *created <= now_ms)
             .map(|created| PartRef {
+                request_hours: None,
                 part_id: crate::parts::format::PartId::new(created).unwrap(), level: Level::L0,
                 event_hour: hour, event_day: None, rows: 10_000,
                 min_time_us: created * 1_000, max_time_us: created * 1_000,
@@ -9873,6 +10079,7 @@ mod tests {
     fn sealed_hour_part(hour: i32, created_ms: i64) -> PartRef {
         let start_us = i64::from(hour) * crate::parts::HOUR_US;
         PartRef {
+            request_hours: None,
             part_id: crate::parts::format::PartId::new(created_ms).unwrap(), level: Level::Hour,
             event_hour: hour, event_day: None, rows: 1_000_000,
             min_time_us: start_us, max_time_us: start_us + crate::parts::HOUR_US - 1,
@@ -10284,6 +10491,7 @@ mod tests {
             BronzeIngestEnricher::disabled(), &seed_schema(), now).await.unwrap();
         let fingerprint = ingestor.log.live().schema().unwrap().fingerprint.clone();
         let part = |at: i64| PartRef {
+            request_hours: None,
             part_id: crate::parts::format::PartId::new(at).unwrap(), level: Level::L0,
             event_hour: (at / 3_600_000) as i32, event_day: None, rows: 1,
             min_time_us: at * 1000, max_time_us: at * 1000,
@@ -10319,6 +10527,7 @@ mod tests {
 
     fn nan3781_part(fingerprint: &str, at: i64) -> PartRef {
         PartRef {
+            request_hours: None,
             part_id: crate::parts::format::PartId::new(at).unwrap(), level: Level::L0,
             event_hour: (at / 3_600_000) as i32, event_day: None, rows: 1,
             min_time_us: at * 1000, max_time_us: at * 1000,
@@ -10572,6 +10781,7 @@ mod tests {
         let store: &'static LocalObjectStore = Box::leak(Box::new(LocalObjectStore::new(dir.path().join("store")).unwrap()));
         let signer = LocalPartSigner::new("lab-signer-reindex", ed25519_dalek::SigningKey::from_bytes(&[7; 32])).unwrap();
         let part = PartRef {
+            request_hours: None,
             part_id: crate::parts::format::PartId::new(1_790_000_000_000).unwrap(),
             level: Level::Hour,
             event_hour: 497_222,
@@ -10631,6 +10841,7 @@ mod tests {
         let mut cfg = IngestConfig::new(TENANT, dir.path().join("ingest"));
         cfg.prevalence_enabled = false;
         cfg.buffer_budget_bytes = 4096 * MIB;
+        cfg.cpu_millis = 4000;
         let mut ingestor = Ingestor::open(cfg, store, store, &queue, signer, signer.trusted(),
             BronzeIngestEnricher::disabled(), &seed_schema(), 1_800_000_000_000).await.unwrap();
         let rows = 100 * MIB;
@@ -10638,7 +10849,7 @@ mod tests {
             let mut buffer = Buffered::new();
             buffer.bytes = rows;
             InFlightFlush {
-                buffer, reserved_bytes: flight_bytes(rows, 4), schema: ingestor.schema.clone(), sealed_ms: 0,
+                buffer, reserved_bytes: flight_bytes(rows, 4), writers: 4, schema: ingestor.schema.clone(), sealed_ms: 0,
                 progress: ingestor.diagnostics.new_flush(0, 0), task: None, built: None, published: None,
                 published_ok: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(published)),
             }
@@ -10655,9 +10866,9 @@ mod tests {
         assert_eq!(ingestor.committed_bytes(), rows + flight_bytes(rows, 4));
         // An empty buffer plans no parts and reserves one writer at most.
         ingestor.flush_in_flight.clear();
-        assert_eq!(planned_l0_parts(&ingestor.buffer), 0);
+        assert_eq!(planned_l0_parts(&ingestor.buffer, 4), 0);
         assert_eq!(l0_chunks(L0_PARALLEL_MIN_ROWS - 1).len(), 1, "a sub-16k-row hour is one part, one writer");
-        assert_eq!(l0_chunks(4 * L0_PARALLEL_MIN_ROWS).len(), MAX_PARALLEL_L0_WRITES);
+        assert_eq!(l0_chunks(4 * L0_PARALLEL_MIN_ROWS).len(), nanosiem_lake_cell::ingest_memory::REFERENCE_L0_WRITERS);
     }
 
     /// NAN-3183 OOM: the working budget is charged with the flush in flight
@@ -10668,7 +10879,7 @@ mod tests {
     async fn in_flight_flush_and_merges_count_against_the_working_budget() {
         use crate::parts::part_log::LocalObjectStore;
         use crate::parts::provenance::LocalPartSigner;
-        use super::super::memory::{flight_bytes, L0_WRITER_BYTES};
+        use super::super::memory::flight_bytes;
         const TENANT: &str = "00000000-0000-4000-8000-0000000000f5";
         const MIB: u64 = 1024 * 1024;
         let dir = tempfile::tempdir().unwrap();
@@ -10678,17 +10889,18 @@ mod tests {
         let mut cfg = IngestConfig::new(TENANT, dir.path().join("ingest"));
         cfg.prevalence_enabled = false;
         cfg.buffer_budget_bytes = 4096 * MIB;
+        cfg.cpu_millis = 4000;
         let mut ingestor = Ingestor::open(cfg, store, store, &queue, signer, signer.trusted(),
             BronzeIngestEnricher::disabled(), &seed_schema(), 1_800_000_000_000).await.unwrap();
         let rows = 200 * MIB;
         ingestor.buffer.bytes = rows;
         assert_eq!(ingestor.committed_bytes(), rows);
         assert_eq!(ingestor.flush_writers(rows), 4, "a roomy budget writes 4 parts at once");
-        // Seal it: the flight is charged rows + 2x build + 4 writers.
+        // Seal it: retained rows plus the larger sort or writer phase.
         let reserved = flight_bytes(rows, 4);
-        assert_eq!(reserved, 3 * rows + 4 * L0_WRITER_BYTES);
+        assert_eq!(reserved, 6 * rows, "whole-build calibration dominates this wide flight");
         ingestor.flush_in_flight.push_back(InFlightFlush {
-            buffer: Buffered::new(), reserved_bytes: reserved, schema: ingestor.schema.clone(), sealed_ms: 0,
+            buffer: Buffered::new(), reserved_bytes: reserved, writers: 4, schema: ingestor.schema.clone(), sealed_ms: 0,
             progress: ingestor.diagnostics.new_flush(0, 0), task: None, built: None, published: None, published_ok: Default::default(),
         });
         ingestor.buffer.bytes = 0;
@@ -10712,7 +10924,8 @@ mod tests {
         ingestor.cfg.buffer_budget_bytes = fits_beside_nothing(rows);
         assert_eq!(ingestor.flush_writers(rows), 1, "a flight in flight leaves room for one writer");
         ingestor.flush_in_flight.clear();
-        // Tighter budgets: fewer parallel writers, never zero.
+        // Smaller inputs expose the distinct writer-scratch boundaries.
+        let rows = 16 * MIB;
         let merge = super::super::merge::merge_reserve_bytes();
         let writers_at = |ingestor: &mut Ingestor<'_>, budget: u64| {
             ingestor.cfg.buffer_budget_bytes = budget;
@@ -10731,20 +10944,28 @@ mod tests {
         }
     }
 
-    /// NAN-4749 (1.0.11 bakeoff wall #1): a 16 GiB / 8 CPU open-core cell
-    /// placed from the host gave ingest a 4 GiB cap, so a full catch-up flush
-    /// (65,536 rows, ~206 MiB of Arrow) beside two minute merges ran ONE L0
-    /// writer. `trusted-local init --target-eps 10000` must place a cap at
-    /// which all four run. Production path: the placement `init` renders, the
-    /// supervisor's ingest cap for it, `size_for_memory_cap` (as `cell.rs`
-    /// sizes a spawned ingest) and `Ingestor::open`.
+    #[test]
+    fn a_tighter_role_reserves_the_configured_uid_window() {
+        let role = 2_089_996_288;
+        let configured = super::super::dedup::window_cap_for(3_413_114_880);
+        let working = live_working_budget(role, configured);
+        assert!(working < buffer_budget_for(role));
+        let uid_bytes = configured as u64 * super::super::dedup::WINDOW_BYTES_PER_UID;
+        let base = nanosiem_lake_cell::ingest_memory::process_base_reserve(role);
+        assert!(working + uid_bytes + base <= role * 85 / 100);
+        assert_eq!(live_working_budget(role, super::super::dedup::window_cap_for(role)), buffer_budget_for(role));
+    }
+
+    /// The effective catch-up capacity keeps all four L0 writers beside
+    /// two maximum-window minute merges. Production path: trusted-local
+    /// placement -> supervisor role cap -> size_for_memory_cap -> open.
+    /// The shared model also sizes hosted and sovereign placements.
     #[tokio::test]
     async fn a_target_eps_placement_runs_four_l0_writers() {
         use crate::parts::part_log::LocalObjectStore;
         use crate::parts::provenance::LocalPartSigner;
         use nanosiem_lake_cell::budget::GIB;
         use nanosiem_lake_cell::trusted_local::{init, InitArgs};
-        const MIB: u64 = 1024 * 1024;
         const TENANT: &str = "00000000-0000-4000-8000-0000000004f9";
         // `hosted` re-places the tenant as a hosted cell does (eps, ingest
         // role limit from the hosted placement).
@@ -10752,7 +10973,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let out = dir.path().join("out");
             let args = InitArgs { out: out.clone(), chdb_sha256: Some("a".repeat(64)), memory_bytes: Some(16 * GIB),
-                cpus: Some(8), target_eps, ..Default::default() };
+                cpus: Some(4), target_eps, ..Default::default() };
             init(&args, &|name| name.starts_with("NANO_LAKE_").then(|| "k".to_string())).unwrap();
             let mut placement: nanosiem_lake_cell::config::Placement =
                 serde_json::from_slice(&std::fs::read(out.join("cell/placement.json")).unwrap()).unwrap();
@@ -10762,11 +10983,14 @@ mod tests {
             }
             nanosiem_lake_cell::supervisor::ingest_memory_cap_bytes(&placement.tenants[0])
         };
-        // A full catch-up flush of wide OCSF rows (memory.rs: 3.15 KB/row);
-        // a flush at `eps` holds its catch-up age of rows, up to the row cap.
-        let full = 206 * MIB;
-        let flush_rows = |eps: u32| ((eps as u64 * nanosiem_lake_cell::budget::CATCH_UP_FLUSH_AGE_SECS) as usize).min(FLUSH_MAX_ROWS);
-        let flush_bytes = |rows: usize| full * rows as u64 / FLUSH_MAX_ROWS as u64;
+        // Reference wide OCSF rows fill to the actual memory-derived byte
+        // cap at the full-flush placement, independently of validation.
+        let role = nanosiem_lake_cell::budget::INGEST_MEMORY_FOR_FULL_FLUSH;
+        let width = nanosiem_lake_cell::budget::INGEST_REFERENCE_ARROW_ROW_BYTES;
+        let reference_rows = nanosiem_lake_cell::ingest_memory::flush_rows_for_width(role, width);
+        let full = reference_rows * width;
+        let flush_rows = |eps: u32| (eps as u64 * nanosiem_lake_cell::budget::CATCH_UP_FLUSH_AGE_SECS).min(reference_rows) as usize;
+        let flush_bytes = |rows: usize| rows as u64 * width;
         let writers_at = |cap: u64, bytes: u64| async move {
             let dir = tempfile::tempdir().unwrap();
             let store: &'static LocalObjectStore = Box::leak(Box::new(LocalObjectStore::new(dir.path().join("store")).unwrap()));
@@ -10774,7 +10998,7 @@ mod tests {
             let queue = super::super::discovery::SpoolQueue::new(dir.path().join("spool"), TENANT).unwrap();
             let mut cfg = IngestConfig::new(TENANT, dir.path().join("ingest"));
             cfg.prevalence_enabled = false;
-            size_for_memory_cap(&mut cfg, cap);
+            size_for_role(&mut cfg, cap, 4000);
             let mut ingestor = Ingestor::open(cfg, store, store, &queue, signer, signer.trusted(),
                 BronzeIngestEnricher::disabled(), &seed_schema(), 1_800_000_000_000).await.unwrap();
             // Two minute merges at the largest decode window (32,768 rows at
@@ -10783,6 +11007,9 @@ mod tests {
             // `flush_writers` charges merges, so the process-wide window other
             // tests set cannot change the answer.
             let merges = 2 * 32_768 * super::super::merge::MERGE_ROW_BYTES;
+            assert_eq!(merges, nanosiem_lake_cell::budget::INGEST_FLUSH_MERGE_RESERVE_BYTES);
+            assert_eq!(super::super::merge_quota::MEMORY_GUARD_SHARE,
+                nanosiem_lake_cell::ingest_memory::ROLE_GUARD_PERCENT as f64 / 100.0);
             // Charge the two merge windows as merge room. Fabricating a
             // flush flight here would also reserve a third future merge.
             ingestor.cfg.merge_headroom_bytes = merges;
@@ -10792,30 +11019,30 @@ mod tests {
         };
         // The shared sizing's rates are this worker's row, part and age caps.
         assert_eq!(nanosiem_lake_cell::budget::CATCH_UP_FLUSH_AGE_SECS * 1000, CATCH_UP_FLUSH_MAX_AGE_MS as u64);
-        assert_eq!(nanosiem_lake_cell::budget::FULL_FLUSH_EPS, FLUSH_MAX_ROWS as u64 / (CATCH_UP_FLUSH_MAX_AGE_MS as u64 / 1000));
+        assert_eq!(nanosiem_lake_cell::budget::FULL_FLUSH_EPS, reference_rows / (CATCH_UP_FLUSH_MAX_AGE_MS as u64 / 1000));
         assert_eq!(nanosiem_lake_cell::budget::L0_PART_MIN_ROWS, L0_PARALLEL_MIN_ROWS as u64);
         let two_parts = nanosiem_lake_cell::budget::PARALLEL_FLUSH_EPS as u32;
         assert_eq!((l0_chunks(flush_rows(two_parts - 1)).len(), l0_chunks(flush_rows(two_parts)).len()), (1, 2));
-        // Host sizing (the 1.0.11 bakeoff): one L0 writer for a full flush.
+        // Default host sizing leaves four writers for its full buffer.
         let host = placed_cap(None, None);
-        assert_eq!((host, writers_at(host, full).await), (6 * GIB, 4), "default sizing leaves parallel-flush and merge headroom");
+        assert!(host >= role, "default sizing preserves the host share above the parallel-flush floor");
+        assert_eq!(writers_at(host, full).await, 4, "default sizing leaves parallel-flush and merge headroom");
         // The shared derivation, placed by trusted-local init: every rate
         // from two parts up has a writer per L0 part, and a catch-up flush four.
         for eps in [two_parts, 1_638, 2_000, 2_184, 10_000] {
             let cap = placed_cap(Some(eps), None);
-            assert_eq!(cap, nanosiem_lake_cell::budget::INGEST_MEMORY_FOR_FULL_FLUSH, "{eps} eps");
+            assert_eq!(cap, host, "{eps} eps: a target rate never shrinks the host share");
             let parts = l0_chunks(flush_rows(eps)).len();
             // `flush_writers` is the memory bound; the flush uses min(it, parts).
             assert!(writers_at(cap, flush_bytes(flush_rows(eps))).await >= parts, "{eps} eps: a writer per L0 part");
-            assert_eq!(writers_at(cap, full).await, MAX_PARALLEL_L0_WRITES, "{eps} eps: a catch-up flush, four writers");
+            assert_eq!(writers_at(cap, full).await, nanosiem_lake_cell::ingest_memory::REFERENCE_L0_WRITERS, "{eps} eps: a catch-up flush, four writers");
         }
-        // Hosted: a hosted 2,000-eps tenant whose ingest role limit is 4.5 GiB:
-        // the role limit binds the cap and its 3-part flushes run one writer;
-        // with the role limit at the shared need (NAN-4749) all three.
+        // Hosted 2,000-eps tenant: its explicit 4.5 GiB role limit binds
+        // placement and still gives the steady three-part flush its writers.
         let steady = flush_bytes(flush_rows(2_000));
         assert_eq!(l0_chunks(flush_rows(2_000)).len(), 3);
         let live = placed_cap(None, Some((2_000.0, 4_831_838_208)));
-        assert_eq!((live, writers_at(live, steady).await), (4_831_838_208, 1));
+        assert_eq!((live, writers_at(live, steady).await), (4_831_838_208, 4));
         let need = nanosiem_lake_cell::budget::ingest_memory_for_eps(2_000.0);
         let shared = placed_cap(None, Some((2_000.0, need)));
         assert_eq!(shared, need);
@@ -10847,6 +11074,7 @@ mod tests {
         ingestor.set_background_store(store);
         ingestor.set_background_signer(signer);
         let part = PartRef {
+            request_hours: None,
             part_id: crate::parts::format::PartId::new(1_790_000_000_000).unwrap(),
             level: Level::L0, event_hour: 497_222, event_day: None, rows: 1,
             min_time_us: 0, max_time_us: 0, schema_fingerprint: "0".repeat(64),
@@ -11812,3 +12040,7 @@ mod prevalence_pipeline_tests;
 #[cfg(test)]
 #[path = "ingest_retention_tests.rs"]
 mod nan4726_retention_tests;
+
+#[cfg(test)]
+#[path = "nan4823_flush_tests.rs"]
+mod nan4823_flush_tests;

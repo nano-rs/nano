@@ -43,6 +43,7 @@ function GateIcon({ check, acknowledged }: { check: GateCheck; acknowledged: boo
 
 export function DeployGatePanel({
   gate,
+  parserStep = 2,
   acknowledged,
   setAcknowledged,
   onAction,
@@ -50,6 +51,7 @@ export function DeployGatePanel({
   children,
 }: {
   gate: DeployGate;
+  parserStep?: number;
   acknowledged: boolean;
   setAcknowledged: (v: boolean) => void;
   onAction: (action: GateAction) => void;
@@ -75,7 +77,7 @@ export function DeployGatePanel({
                   onClick={() => onAction(check.action!)}
                   className="ml-auto text-[10.5px] font-mono text-primary hover:underline shrink-0"
                 >
-                  {ACTION_LABEL[check.action]}
+                  {check.action === 'step2' ? `Go to step ${parserStep}` : ACTION_LABEL[check.action]}
                 </button>
               )}
             </div>

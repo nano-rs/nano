@@ -256,6 +256,9 @@ path = "src/bin/nano_parser_bundle_build.rs"
 
 
 
+
+# Hosted collector fixture lives under workers/, which the public export strips.
+
 [build-dependencies]
 vrl = { version = "0.36", default-features = false, features = ["compiler", "stdlib", "datadog"] }
 

@@ -364,6 +364,7 @@ async fn timed_out_inspection_is_not_restarted_for_each_part_in_a_pass() {
 /// NAN-4662 fixtures: an hour part the writer plans (sealed long ago).
 fn hour_part(id: &str) -> PartRef {
     PartRef {
+        request_hours: None,
         part_id: PartId::parse(id).unwrap(),
         level: crate::parts::levels::Level::Hour,
         event_hour: 0,

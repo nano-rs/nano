@@ -69,7 +69,7 @@ fn land_objects(lab: &Lab, objects: usize, rows: usize) -> u64 {
 
 /// Read the published data, checking the ordering contract as well as
 /// identities and payloads. Health counters alone cannot detect lost rows.
-async fn committed_rows(ingestor: &Ingestor<'_>, lab: &Lab) -> BTreeMap<String, Value> {
+pub(super) async fn committed_rows(ingestor: &Ingestor<'_>, lab: &Lab) -> BTreeMap<String, Value> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let store = crate::parts::part_log::LocalObjectStore::new(lab.root.join("parts")).unwrap();
     let live = ingestor.live_parts().into_iter().map(|part| part.part_id.to_string()).collect::<Vec<_>>();

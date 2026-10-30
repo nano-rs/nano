@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "profile": "ocsf",
+  "dataset": "logs",
+  "source_placeholder": "__nano_lake_source__",
+  "query_sha256": "704679ea824afed157d7585d7cd483f42926185f1f193c3b2c1762bff8a4baf2",
+  "start": "2026-09-24T07:00:00Z",
+  "end": "2026-09-25T07:01:00Z",
+  "limit": 501,
+  "table_view": false,
+  "newest_first_event_rows": true,
+  "stats_page": false,
+  "candidate_hints": [
+    {
+      "kind": "entity",
+      "source_path": "device.hostname",
+      "value": "host-0007.corp.example"
+    }
+  ],
+  "required_columns": [
+    {
+      "name": "activity_id",
+      "field_type": "integer"
+    },
+    {
+      "name": "activity_name",
+      "field_type": "string"
+    },
+    {
+      "name": "class_uid",
+      "field_type": "long"
+    },
+    {
+      "name": "device.hostname",
+      "field_type": "string"
+    },
+    {
+      "name": "dst_endpoint.domain",
+      "field_type": "string"
+    },
+    {
+      "name": "dst_endpoint.ip",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.log_source",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.uid",
+      "field_type": "string"
+    },
+    {
+      "name": "process.name",
+      "field_type": "string"
+    },
+    {
+      "name": "time",
+      "field_type": "timestamp"
+    }
+  ],
+  "projected_scan_columns": [
+    "activity_id",
+    "class_uid",
+    "device.hostname",
+    "dst_endpoint.domain",
+    "dst_endpoint.ip",
+    "metadata.log_source",
+    "process.name",
+    "time"
+  ],
+  "sql": "WITH stage_0 AS (\n  SELECT * FROM __nano_lake_source__\n  WHERE time >= '2026-09-24 07:00:00.000000' AND time < '2026-09-25 07:01:00.000000'\n  AND (((\"device.hostname\" = 'host-0007.corp.example') AND lower(\"metadata.log_source\") != 'audit'))\n),\nstage_1 AS (\n  SELECT * FROM stage_0\n  ORDER BY time DESC, \"metadata.uid\" DESC\n  LIMIT 500\n)\nSELECT time, class_uid, activity_id, \"process.name\", \"dst_endpoint.ip\", \"dst_endpoint.domain\" FROM stage_1 ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 500 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=0, optimize_aggregation_in_order=1"
+}

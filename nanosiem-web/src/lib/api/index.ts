@@ -1719,6 +1719,10 @@ class ApiClient {
     return this._logSources.revealIngestCredential(requestId);
   }
 
+  async assignIngestSource(credentialId: string, sourceSlug: string, label: string) {
+    return this._logSources.assignIngestSource(credentialId, sourceSlug, label);
+  }
+
   async revokeIngestCredential(
     credentialId: string,
     reason: string,

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "profile": "ocsf",
+  "dataset": "logs",
+  "source_placeholder": "__nano_lake_source__",
+  "query_sha256": "53d4bf0331dba93cdb89d26191921a24a16856417f55f3158a2e1a98e70d63dc",
+  "start": "2026-09-24T07:00:00Z",
+  "end": "2026-09-25T07:01:00Z",
+  "limit": 501,
+  "table_view": false,
+  "newest_first_event_rows": false,
+  "stats_page": false,
+  "candidate_hints": [
+    {
+      "kind": "class",
+      "value": 4001
+    }
+  ],
+  "required_columns": [
+    {
+      "name": "class_uid",
+      "field_type": "long"
+    },
+    {
+      "name": "message",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.log_source",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.uid",
+      "field_type": "string"
+    },
+    {
+      "name": "time",
+      "field_type": "timestamp"
+    }
+  ],
+  "projected_scan_columns": [
+    "class_uid",
+    "metadata.log_source",
+    "time"
+  ],
+  "sql": "WITH stage_0 AS (\n  SELECT class_uid, message, \"metadata.log_source\", \"metadata.uid\", time FROM __nano_lake_source__\n  WHERE time >= '2026-09-24 07:00:00.000000' AND time < '2026-09-25 07:01:00.000000'\n  AND (((class_uid = 4001) AND lower(\"metadata.log_source\") != 'audit'))\n),\nstage_1 AS (\n  SELECT toStartOfMinute(time) AS time_bucket, count() AS count\n  FROM stage_0\n  GROUP BY time_bucket\n  ORDER BY time_bucket\n)\nSELECT * FROM stage_1 LIMIT 501 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=0, optimize_aggregation_in_order=1"
+}

@@ -531,6 +531,7 @@ mod tests {
         use crate::part_ingest::export::ExportHour;
         use crate::parts::{format::PartId, levels::Level};
         let part = PartRef {
+            request_hours: None,
             part_id: PartId::new(1).unwrap(),
             level: Level::Day,
             event_hour: 24,

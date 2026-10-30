@@ -388,7 +388,12 @@ impl DetectionService {
             dataset.as_deref(),
         );
         let enriched_query = match parse_query(query) {
-            Ok(parsed) => inject_time_bounds(&parsed, time_field).pretty_print(),
+            Ok(parsed) => {
+                let parsed = if self.search_service.serves_lake_cell() {
+                    crate::detection::query_enrichment::exclude_platform_probes_for_dataset(&parsed,crate::query::Dataset::from_selector(dataset.as_deref().unwrap_or("logs")))
+                } else { parsed };
+                inject_time_bounds(&parsed, time_field).pretty_print()
+            },
             Err(_) => query.to_string(),
         };
 
@@ -1159,5 +1164,147 @@ mod tests {
             DatasetProvenance::Unknowable,
             "risk aggregates findings that can carry restricted origins — must fail closed"
         );
+    }
+}
+
+#[cfg(test)]
+mod registry_outage_recheck {
+    use super::*;
+
+    // Exercise the production constructor and the real write-path annotation,
+    // rather than manufacturing the expected stamp in the fixture. Closing the
+    // lazy control pool simulates a cold process whose registry never loaded.
+    #[tokio::test]
+    async fn production_annotation_survives_cold_registry_outage() {
+        const TENANT: &str = "a0a02155-0000-4000-8000-000000000001";
+        if std::env::var("NANO_LAKE_TENANT_ID").as_deref() != Ok(TENANT) {
+            // Isolate process configuration from parallel unit tests. Use the
+            // existing production lake settings, never a bypass constructor.
+            let dir = tempfile::tempdir().unwrap();
+            let token = dir.path().join("fixture.token");
+            std::fs::write(&token, "registry-recheck-fixture-token-32-characters").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "detection::service::execution::registry_outage_recheck::production_annotation_survives_cold_registry_outage", "--nocapture"])
+                .env("NANO_LAKE_TENANT_ID", TENANT)
+                .env("NANO_LAKE_QUERY_URL", "http://127.0.0.1:1")
+                .env("NANO_LAKE_QUERY_TOKEN_FILE", token)
+                .env_remove("DEPLOYMENT_MODE").env_remove("NANO_LOG_QUERY_BACKEND")
+                .env_remove("NANO_LAKE_CELL_ROUTES_FILE").env_remove("NANO_LAKE_CELL_ROUTER_TOKEN_FILE")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use crate::{
+            db::{DualPool, DualPoolConfig},
+            lookup::{LookupService, PostgresLookupRepository},
+            prevalence::PrevalenceService,
+            schema::{OcsfProfile, SchemaProfile, UdmProfile},
+        };
+        let dual = DualPool::new_lake_control_plane(&DualPoolConfig::with_auth(
+            "postgres://fixture@127.0.0.1:1/unreachable",
+            "http://127.0.0.1:1",
+            "unused",
+            "unused",
+            "unused",
+        ))
+        .await
+        .unwrap();
+        dual.postgres().close().await;
+        let rule = DetectionRule {
+            id: uuid::Uuid::new_v4(),
+            name: "registry outage regression".into(),
+            description: None,
+            query: "* | stats count".into(),
+            severity: crate::models::Severity::High,
+            mitre_tactics: vec![],
+            mitre_techniques: vec![],
+            schedule_cron: None,
+            mode: Default::default(),
+            narrative: None,
+            reference_url: None,
+            author: None,
+            tags: vec![],
+            ai_generated: false,
+            realtime_enabled: false,
+            detection_mode: Default::default(),
+            materialized_view_name: None,
+            near_real_time_interval_seconds: None,
+            execution_mode: None,
+            risk_score: None,
+            risk_entity_field: None,
+            risk_modifiers: sqlx::types::Json(Default::default()),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_run_at: None,
+            last_match_at: None,
+            match_count: 0,
+            live_match_count: 0,
+            archived: false,
+            folder: None,
+            ai_triage_hints: sqlx::types::Json(Default::default()),
+            lookback_minutes: None,
+            dataset: None,
+            auto_tuning_enabled: false,
+            auto_tuning_min_confidence: 0.8,
+            auto_tuning_critical: false,
+            auto_tuning_disabled_until: None,
+            case_visibility: String::new(),
+            case_assigned_group: None,
+            alert_mode: Default::default(),
+            next_run_at: None,
+            claimed_by: None,
+            claimed_at: None,
+            playbook_selector_mode: String::new(),
+            playbook_id: None,
+            source_path: None,
+            source_repo_url: None,
+            kind: String::new(),
+            alert_cooldown_minutes: None,
+        };
+        for profile in [
+            std::sync::Arc::new(UdmProfile::new()) as std::sync::Arc<dyn SchemaProfile>,
+            std::sync::Arc::new(OcsfProfile::lake_1_9()) as std::sync::Arc<dyn SchemaProfile>,
+        ] {
+            let service = DetectionService::with_dual_pool_prevalence_and_profile(
+                &dual,
+                LookupService::new(PostgresLookupRepository::new(dual.postgres().clone())),
+                PrevalenceService::new(dual.clickhouse().clone(), dual.table_names()),
+                profile.clone(),
+            );
+            let known = if profile.uses_strict_canonical_fields() {
+                serde_json::json!({"metadata": {"log_source": "private_source"}})
+            } else {
+                serde_json::json!({"source_type": "private_source"})
+            };
+            let mut rows = vec![serde_json::json!({"count": 12}), known.clone()];
+            let end = chrono::Utc::now();
+            service
+                .annotate_source_types_for_scoping(
+                    &rule,
+                    &mut rows,
+                    &TimeRangeInput::new(end - chrono::Duration::minutes(5), end),
+                )
+                .await;
+            assert_eq!(rows[1], known, "known per-event provenance must survive");
+            let manifest = crate::db::repository::alerts::distinct_source_types(
+                &serde_json::Value::Array(rows),
+            );
+            assert!(
+                manifest
+                    .iter()
+                    .any(|s| s == crate::auth::UNRESOLVED_SOURCE_SENTINEL),
+                "registry outage published an aggregate with universal visibility"
+            );
+            for denied in ["private_source", "unrelated_source", "audit"] {
+                let deny =
+                    crate::auth::deny_bind_values(&[denied.to_owned()].into_iter().collect());
+                assert!(manifest.iter().any(|source| deny.contains(source)));
+            }
+        }
     }
 }

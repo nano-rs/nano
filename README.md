@@ -77,10 +77,10 @@ creating the first admin account. Open `http://localhost` when it finishes.
 **Prereqs:** Docker with Compose v2.24 or newer, git, openssl, curl, python3.
 Images are published for x86-64 and arm64.
 
-**Minimum host:** at least 12 GiB of memory available to Docker (on Docker
-Desktop that is the VM's memory setting, not the machine's RAM). The
-installer refuses below that and sizes the lake cell's memory from what it
-finds.
+**Minimum host:** an 8 GiB VM. The installer allows up to 512 MiB of kernel
+reserve (at least 7,680 MiB visible to Docker) and fits the service and cell
+budgets within 95% of the memory actually reported. On Docker Desktop, use the
+VM's memory setting. The supported event rate scales with available memory.
 
 **Ports:** 80 (web UI and API through nginx), 8080 (HTTP ingest), 8088 (HEC),
 and 8090 (enrichment ingress) listen on all interfaces. OTLP (4317/4318),

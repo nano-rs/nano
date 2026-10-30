@@ -46,6 +46,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 zeroize = "1"
 uuid.workspace = true
+utoipa.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

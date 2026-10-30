@@ -283,6 +283,7 @@ async fn start_ingest(dir: &std::path::Path, store: &'static RollStore, queue: &
 
 fn part(n: u64, created_ms: i64, level: Level) -> PartRef {
     PartRef {
+        request_hours: None,
         part_id: PartId::parse(&format!("{created_ms:013}-{n:016x}")).unwrap(),
         level, event_hour: 10, event_day: None, rows: 5, min_time_us: 1, max_time_us: 2,
         schema_fingerprint: "a".repeat(64), provenance_sha256: "b".repeat(64), merkle_root: "c".repeat(64),

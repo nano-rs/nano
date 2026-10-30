@@ -165,7 +165,7 @@ describe('IssueCredentialPanel, collector (NAN-2597)', () => {
     expect(state.requests[0].log_source_id).toBeUndefined();
 
     // Collector templates only, with the allowlist and the revealed token.
-    const tabs = within(screen.getByTestId('sender-snippets')).getAllByRole('tab').map((t) => t.textContent);
+    const tabs = within(await screen.findByTestId('sender-snippets')).getAllByRole('tab').map((t) => t.textContent);
     expect(tabs).toEqual(['curl', 'Vector', 'Fluent Bit', 'OpenTelemetry Collector', 'Cribl Stream']);
     fireEvent.click(screen.getByRole('tab', { name: 'Cribl Stream' }));
     const cribl = screen.getByTestId('sender-snippet-body').textContent ?? '';

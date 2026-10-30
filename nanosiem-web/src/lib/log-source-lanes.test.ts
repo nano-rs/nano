@@ -1,9 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { describe, expect, it } from 'vitest';
-import { logSourceSlugLabel, platformLaneRows } from './log-source-lanes';
+import { logSourceSlugLabel, platformLaneRows, receivingWithoutParser } from './log-source-lanes';
 import { failureErrorCode, failureOrigin, parserRollErrorMessage } from './parser-rollout';
 
 describe('log source lanes (NAN-3248)', () => {
+  it('uses separately loaded detail health for raw arrivals, then clears the badge when a parser deploys', () => {
+    const source = { deployed: false, ingest: null };
+    expect(receivingWithoutParser(source, { events_last_24h: 12 })).toBe(true);
+    expect(receivingWithoutParser(source, { events_last_hour: 1 })).toBe(true);
+    expect(receivingWithoutParser(source, { events_last_24h: 0 })).toBe(false);
+    expect(receivingWithoutParser(source)).toBe(false);
+    expect(receivingWithoutParser({ ...source, deployed: true }, { events_last_24h: 12 })).toBe(false);
+  });
   it('labels lean sources by their lake slugs and falls back to source_type', () => {
     expect(logSourceSlugLabel({ source_type: 'routed', ingest: { source_slugs: ['apache_access'] } as never })).toBe('apache_access');
     expect(logSourceSlugLabel({ source_type: 'routed', ingest: { source_slugs: ['a', 'b'] } as never })).toBe('a, b');

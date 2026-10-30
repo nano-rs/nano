@@ -370,10 +370,8 @@ impl TenantSources {
             if source.parser_vrl.len() > MAX_VRL_BYTES || extension.len() > MAX_VRL_BYTES {
                 return bad(format!("{slug}: VRL exceeds {MAX_VRL_BYTES} bytes"));
             }
-            let has_extension = source.extension_enabled && !extension.trim().is_empty();
-            if source.parser_vrl.trim().is_empty() && !has_extension {
-                return bad(format!("{slug}: no parser VRL and no enabled extension"));
-            }
+            // A published empty version enrolls transport identity only. It
+            // stays on the platform's generic Base Event lane until publish.
             if let Some(ratio) = source.sampling_ratio {
                 if !(ratio.is_finite() && ratio > 0.0 && ratio <= 1.0) {
                     return bad(format!("{slug}: sampling_ratio must be in (0, 1]"));

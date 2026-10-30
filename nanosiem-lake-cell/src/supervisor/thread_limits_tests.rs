@@ -157,6 +157,55 @@ fn local_placement(memory: u64, cpus: u32) -> TenantPlacement {
 }
 
 #[test]
+fn nan4850_enabled_templates_need_capacity_in_the_parent_cell() {
+    use crate::budget::{GIB, MIB};
+    // This is the production placement admission check, using the production
+    // sizer. Cover each enabled role and their combined cost on small/large hosts.
+    for host_memory in [7934 * MIB, 8 * GIB, 16 * GIB, 64 * GIB] {
+        let memory = crate::trusted_local::host_cell_memory_bytes(host_memory);
+        let tenant = local_placement(memory, 8);
+        let placement = Placement { cell_id: "cell-a".into(), revision: 1, tenants: vec![tenant.clone()] };
+        let cap = CellCapacity { cpu_millicores: 8000, memory_bytes: memory,
+            cpu_source: "test", memory_source: "test" };
+        let mut cfg = config();
+        cfg.trusted_local = true;
+        cfg.mode = crate::config::CellMode::Dedicated;
+        cfg.validate().unwrap();
+        placement.validate(&cfg).unwrap();
+        validate_local_role_capacity(&placement, &cap, &cfg).unwrap();
+        let active = placement_limits_for_cell(&tenant, &cap, &cfg).memory_hard_bytes;
+        for (product, maintenance, landing) in [
+            (true, false, false), (false, true, false), (false, false, true),
+            (true, true, false), (true, true, true),
+        ] {
+            cfg.product_state_role = product;
+            cfg.prevalence_maintenance = maintenance;
+            cfg.tenzir_landing = landing;
+            let mut enabled = placement.clone();
+            enabled.tenants[0].landing = landing;
+            enabled.validate(&cfg).unwrap();
+            let p = &enabled.tenants[0];
+            let limits = placement_limits_for_cell(p, &cap, &cfg);
+            let local = tenant.local_resources.as_ref().unwrap();
+            let extra = if product { local.product.limit_memory_bytes } else { 0 }
+                + if maintenance { local.maintenance.limit_memory_bytes } else { 0 }
+                + if landing { local.landing.limit_memory_bytes } else { 0 };
+            assert_eq!(limits.memory_hard_bytes, active + extra);
+            let error = validate_local_role_capacity(&enabled, &cap, &cfg).unwrap_err();
+            assert!(error.to_string().contains("resize the lake-cell container and placement"));
+            // Keep all active budgets unchanged; admit the roles only after
+            // their additional memory is actually funded by the parent.
+            let grown = CellCapacity { memory_bytes: memory + extra + 64 * MIB, ..cap.clone() };
+            validate_local_role_capacity(&enabled, &grown, &cfg).unwrap();
+            // Hosted admission retains its existing overcommit semantics.
+            cfg.trusted_local = false;
+            validate_local_role_capacity(&enabled, &cap, &cfg).unwrap();
+            cfg.trusted_local = true;
+        }
+    }
+}
+
+#[test]
 fn nan4834_device_sizing_survives_adoption_and_keeps_a_finite_aggregate_cap() {
     let mut cfg = config();
     cfg.trusted_local = true;
@@ -165,9 +214,9 @@ fn nan4834_device_sizing_survives_adoption_and_keeps_a_finite_aggregate_cap() {
     let cgroups = delegated(root.path(), "cpu memory pids\n");
     for (memory, cpus, expected) in [
         (2 * crate::budget::GIB, 4, 576),
-        // The query memory floor leaves this small placement below 100 EPS;
-        // six four-thread roles need 192 fixed + 384 native tasks.
-        (3_413_114_880, 4, 576),
+        // Unused auxiliary reservations no longer push this allocation below
+        // 100 EPS; retain the standard finite aggregate PID allowance.
+        (3_413_114_880, 4, 1024),
         (32 * crate::budget::GIB, 16, 1728),
         (256 * crate::budget::GIB, 64, 6336),
     ] {

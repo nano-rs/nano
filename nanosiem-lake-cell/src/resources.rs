@@ -347,6 +347,20 @@ impl TenantLimits {
         limits
     }
 
+    /// Local role templates do not reserve memory while their process is disabled.
+    /// Hosted placements keep the existing budget and accounting unchanged.
+    pub fn from_placement_for_cell(p: &crate::config::TenantPlacement, cap: &CellCapacity,
+        cfg: &crate::config::CellConfig) -> Self {
+        let mut limits = Self::from_placement(p, cap, &cfg.resources);
+        if cfg.trusted_local && !cfg.prevalence_maintenance {
+            if let Some(local) = &p.local_resources {
+                limits.memory_soft_bytes = limits.memory_soft_bytes.saturating_sub(local.maintenance.limit_memory_bytes);
+                limits.memory_hard_bytes = limits.memory_hard_bytes.saturating_sub(local.maintenance.limit_memory_bytes);
+            }
+        }
+        limits
+    }
+
     pub fn derive(b: &TenantBudget, cap: &CellCapacity, cfg: &ResourceConfig) -> Self {
         let ingest_guarantee = b.request_millicores.max(1);
         let ingest_ceiling = if cfg.cpu_burst_factor == 0.0 {

@@ -2866,7 +2866,8 @@ mod tests {
         // pass retries only the deferred object, never the successful GETs.
         let wait_for_transfer = || async {
             tokio::time::timeout(Duration::from_secs(5), async {
-                while fetcher.cache().in_flight_bytes() > 0 {
+                while fetcher.cache().in_flight_bytes() > 0
+                    || source.gets.lock().unwrap()[&hung.source_uri] % 2 != 0 {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             }).await.expect("the detached transfer releases its reservation on timeout");
@@ -2876,8 +2877,8 @@ mod tests {
         assert_eq!(fetcher.hot_coverage.lock().unwrap().deferred_objects, 1);
         let gets = source.gets.lock().unwrap().clone();
         assert_eq!(gets.len(), object_count);
-        assert_eq!(gets[&hung.source_uri], 2, "one attempt per pass");
-        assert!(gets.iter().all(|(uri, count)| *count == if uri == &hung.source_uri { 2 } else { 1 }));
+        assert_eq!(gets[&hung.source_uri], 4, "two bounded attempts per pass");
+        assert!(gets.iter().all(|(uri, count)| *count == if uri == &hung.source_uri { 4 } else { 1 }));
 
         wait_for_transfer().await;
         source.hang.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2892,7 +2893,7 @@ mod tests {
         assert!(engine.try_admit_idle().is_some(), "idle rebuilds resume once warm");
         assert!(engine.evidence_idle());
         assert_eq!(coverage.eta_seconds, 0.0);
-        assert_eq!(source.gets.lock().unwrap()[&hung.source_uri], 3);
+        assert_eq!(source.gets.lock().unwrap()[&hung.source_uri], 5);
     }
 
     /// Keep one older transfer alive across the warm latch, then start a
@@ -3011,11 +3012,11 @@ mod tests {
         assert!(engine.fetcher().cache().is_local(&crossing).await.unwrap());
     }
 
-    /// A query/maintenance transfer can hold the only cache slot longer
-    /// than a hydration pass. Deferral must leave queued single-flights
-    /// shared across passes rather than spawning replacement GETs.
+    /// A detached transfer sized at a tiny pacing share must still yield
+    /// its only cache slot when the GET is silent, allowing hydration to
+    /// continue through production single-flight and admission.
     #[tokio::test]
-    async fn hydration_defers_shared_slot_waits_without_multiplying_gets() {
+    async fn hydration_recovers_the_slot_from_a_detached_silent_get() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalObjectStore::new(&root.path().join("objects")).unwrap());
         let (signer, _writer, parts, _slow, mut fetcher) =
@@ -3058,19 +3059,17 @@ mod tests {
             max_query_bytes: 64 << 20, max_memory_bytes: 64 << 20,
             max_execution_seconds: 1, threads: 1,
         }, store, view, fetcher, executor).unwrap();
-        for _ in 0..2 {
-            tokio::time::timeout(Duration::from_secs(3), engine.hydrate_hot_window(&AtomicU64::new(0)))
-                .await.expect("the pass defers queued objects").unwrap();
-            let coverage = engine.fetcher().hot_coverage.lock().unwrap().clone();
-            assert_eq!(coverage.deferred_objects, 8);
-            assert_eq!(coverage.local_bytes, 0);
-            assert_eq!(coverage.local_parts, 0);
-            assert!(!coverage.warm_resident);
-            let gets = source.gets.lock().unwrap();
-            assert_eq!(gets.len(), 1);
-            assert_eq!(gets.values().sum::<usize>(), 1, "next pass joins queued transfers");
+        tokio::time::timeout(Duration::from_secs(3), engine.hydrate_hot_window(&AtomicU64::new(0)))
+            .await.expect("silent transfer yields the only cache slot").unwrap();
+        let coverage = engine.fetcher().hot_coverage.lock().unwrap().clone();
+        assert!(coverage.hydrate_bytes > 0, "healthy siblings hydrate after the hung GET is cancelled");
+        assert!(source.gets.lock().unwrap().len() > 1);
+        source.hang.store(false, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..3 {
+            engine.hydrate_hot_window(&AtomicU64::new(0)).await.unwrap();
         }
-        blocker.abort(); // The test runtime also cancels the cache's detached transfer.
+        assert!(engine.fetcher().hot_coverage.lock().unwrap().warm_resident);
+        let _ = blocker.await; // The shared attempt has ended, including any bounded retry.
     }
 
     #[tokio::test]

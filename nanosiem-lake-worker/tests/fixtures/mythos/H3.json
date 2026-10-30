@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "profile": "ocsf",
+  "dataset": "logs",
+  "source_placeholder": "__nano_lake_source__",
+  "query_sha256": "eeca1fcd3332f008431f08565a101a8ddbd69d75b93fe1ef542a36e297ea2959",
+  "start": "2026-09-24T07:00:00Z",
+  "end": "2026-09-25T07:01:00Z",
+  "limit": 501,
+  "table_view": false,
+  "newest_first_event_rows": false,
+  "stats_page": true,
+  "candidate_hints": [
+    {
+      "kind": "any",
+      "alternatives": [
+        {
+          "kind": "entity",
+          "source_path": "dst_endpoint.domain",
+          "value": "bad.example"
+        },
+        {
+          "kind": "entity",
+          "source_path": "query.hostname",
+          "value": "bad.example"
+        },
+        {
+          "kind": "entity",
+          "source_path": "http_request.url.hostname",
+          "value": "bad.example"
+        }
+      ]
+    }
+  ],
+  "required_columns": [
+    {
+      "name": "device.hostname",
+      "field_type": "string"
+    },
+    {
+      "name": "dst_endpoint.domain",
+      "field_type": "string"
+    },
+    {
+      "name": "http_request.url.hostname",
+      "field_type": "string"
+    },
+    {
+      "name": "message",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.log_source",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.uid",
+      "field_type": "string"
+    },
+    {
+      "name": "query.hostname",
+      "field_type": "string"
+    },
+    {
+      "name": "time",
+      "field_type": "timestamp"
+    }
+  ],
+  "projected_scan_columns": [
+    "device.hostname",
+    "dst_endpoint.domain",
+    "http_request.url.hostname",
+    "metadata.log_source",
+    "query.hostname",
+    "time"
+  ],
+  "sql": "WITH stage_0 AS (\n  SELECT \"device.hostname\", \"dst_endpoint.domain\", \"http_request.url.hostname\", message, \"metadata.log_source\", \"metadata.uid\", \"query.hostname\", time FROM __nano_lake_source__\n  WHERE time >= '2026-09-24 07:00:00.000000' AND time < '2026-09-25 07:01:00.000000'\n  AND (((((lower(\"dst_endpoint.domain\") = 'bad.example' OR lower(\"query.hostname\") = 'bad.example' OR lower(\"http_request.url.hostname\") = 'bad.example'))) AND lower(\"metadata.log_source\") != 'audit'))\n),\nstage_1 AS (\n  SELECT \"device.hostname\" AS \"device.hostname\", count() AS c\n  FROM stage_0\n  GROUP BY \"device.hostname\"\n),\nstage_2 AS (\n  SELECT * FROM stage_1\n  ORDER BY c DESC, \"device.hostname\" ASC\n),\nstage_3 AS (\n  SELECT * FROM stage_2\n  LIMIT 50\n),\n__nano_stats_ranked AS (\n  SELECT *, count() OVER () AS __nano_stats_total, row_number() OVER (ORDER BY c DESC, \"device.hostname\" ASC ) AS __nano_stats_ordinal FROM stage_3\n)\nSELECT * FROM __nano_stats_ranked WHERE __nano_stats_ordinal = 1 OR (__nano_stats_ordinal > 0 AND __nano_stats_ordinal <= 501) ORDER BY __nano_stats_ordinal LIMIT 501 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=0, optimize_aggregation_in_order=0"
+}

@@ -917,6 +917,74 @@ async fn production_http_valid_checkpoint_and_signed_provenance() {
     }
 }
 
+/// A real guarded R2 reader, fresh pod/store/GC runtime per roll, the same
+/// persistent A/B volume. Cover both a mid-rebuild roll and a completed tail
+/// reached inside the normal 60-second checkpoint throttle.
+#[tokio::test]
+async fn production_gc_roll_resumes_partial_and_commits_completed_history_on_hot_volume() {
+    fn boot(f: &Fixture, pod: &std::path::Path, hot: &std::path::Path) -> CellSanctionedPartGc {
+        let store = Arc::new(R2PartStore::new_split(&f.location, &f.location, TENANT_UUID,
+            &pod.join("spill")).unwrap());
+        let gc = CellSanctionedPartGc::new_guarded(TENANT_UUID, "http://127.0.0.1:1/", None,
+            store, fixture_keys(), pod, Some(hot), None).unwrap();
+        permission(&gc, 200, chrono::Duration::minutes(10));
+        gc.shared.pacer.set_rate(0);
+        gc
+    }
+    let entries = VIEW_PERSIST_EVERY * 2 + 10;
+    let f = fixture(entries, Duration::ZERO, 200).await;
+    let hot = tempfile::tempdir().unwrap();
+    let pod = tempfile::tempdir().unwrap();
+    let first = boot(&f, pod.path(), hot.path());
+    let saved_head = {
+        let mut state = first.state.lock().await;
+        assert!(!advance_view(first.shared.views.as_ref(), &first.shared, &mut state).await.unwrap());
+        let head = state.view.head_seq().unwrap();
+        assert!(head > 0 && head < entries - 1, "a bounded slice stops inside the rebuild");
+        head
+    };
+    assert!(hot.path().join("lake-part-gc/view.sqlite").is_file());
+    assert!(!pod.path().join("lake-part-gc").exists());
+    drop(first);
+    drop(pod);
+
+    let pod = tempfile::tempdir().unwrap();
+    let second = boot(&f, pod.path(), hot.path());
+    {
+        let mut state = second.state.lock().await;
+        assert!(!advance_view(second.shared.views.as_ref(), &second.shared, &mut state).await.unwrap());
+        let head = state.view.head_seq().unwrap();
+        assert!(head > saved_head);
+        assert!(second.reads() <= head - saved_head + 1 + READ_AHEAD_WINDOW as u64,
+            "verify saved head, new entries and bounded speculation, never genesis");
+        let checkpoint_at = tokio::time::Instant::now();
+        let mut complete = false;
+        for _ in 0..20 {
+            complete = advance_view(second.shared.views.as_ref(), &second.shared, &mut state).await.unwrap();
+            if complete { break; }
+        }
+        assert!(complete, "the resumed rebuild reaches its tail");
+        assert!(checkpoint_at.elapsed() < VIEW_SAVE_EVERY, "completion is inside the checkpoint throttle");
+        let views = second.shared.views.as_ref().unwrap();
+        assert!(!views.save_due());
+        assert_eq!(views.load(TENANT_UUID).unwrap().unwrap().head_seq(), Some(entries - 1),
+            "completed history must already be durable before a roll");
+        assert!(views.load("7f1c1e2a-5b8e-4d4c-9a3e-0e2b7c9d1f00").is_err(),
+            "a persisted volume never authorizes another tenant's history");
+    }
+    drop(second);
+    drop(pod);
+
+    *f.bucket.entries.write().unwrap() = history(entries + 5);
+    let pod = tempfile::tempdir().unwrap();
+    let third = boot(&f, pod.path(), hot.path());
+    let mut state = third.state.lock().await;
+    assert!(advance_view(third.shared.views.as_ref(), &third.shared, &mut state).await.unwrap());
+    assert_eq!(state.view.head_seq(), Some(entries + 4));
+    assert!(third.reads() <= 8, "roll verifies head + five new entries + tail, never genesis");
+    assert!(!pod.path().join("lake-part-gc").exists());
+}
+
 #[tokio::test]
 async fn production_http_resume_and_background_backoff() {
     let f = fixture(64, Duration::ZERO, 200).await;

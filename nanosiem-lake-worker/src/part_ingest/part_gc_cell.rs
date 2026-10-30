@@ -1774,6 +1774,12 @@ async fn advance_view(
     ensure!(state.view.resident_refs() <= view_budget.parts, "GC view exceeds part budget");
     let mut admitted = 0_u64;
     let first = state.view.head_seq().map_or(0, |seq| seq + 1);
+    // NAN-4851: snapshot before any reads. An absent entry through an
+    // already-completed append is an unverifiable gap, not a caught-up tail.
+    // Otherwise the writer-ahead guard would yield without progress until
+    // the task lifetime, repeatedly reading the same gap. Later completions
+    // remain ordinary arrivals and are folded on the next bounded pass.
+    let completed_before_reads = shared.receipted_appends.completed_head();
     let read = |seq| async move {
         tokio::time::timeout(LOG_READ_TIMEOUT, shared.reader.read_ahead_bytes(seq))
             .await
@@ -1798,6 +1804,8 @@ async fn advance_view(
         // Withdrawal/expiry during a slow read closes the route before applying.
         shared.wait_current().await?;
         let Some(raw) = raw else {
+            ensure!(completed_before_reads.is_none_or(|head| seq > head),
+                "GC log entry {seq} absent through locally completed head {completed_before_reads:?}");
             complete = true;
             break;
         };
@@ -1857,7 +1865,11 @@ async fn advance_view(
     // Never rewrite an unchanged large view, and an extended one at most every
     // VIEW_SAVE_EVERY (NAN-3495: per-slice rewrites made the fold quadratic).
     if let Some(views) = views {
-        if views.dirty.load(Ordering::SeqCst) && views.save_due() {
+        // Commit on reaching the tail of a rebuild. Otherwise a fast final
+        // slice stays in an open transaction and a roll discards its suffix.
+        // Ordinary caught-up passes retain the throttle (no fsync per append).
+        let caught_up = complete && !shared.view_complete.load(Ordering::SeqCst);
+        if views.dirty.load(Ordering::SeqCst) && (caught_up || views.save_due()) {
             views.save_tracked(&shared.tenant_uuid, &state.view)?;
         }
     }
@@ -2190,6 +2202,10 @@ async fn run_catch_up(
                 tokio::time::sleep(delay).await;
             }
             _ => {
+                if report.paused_reason.as_deref() == Some("lake_part_index_incomplete") {
+                    tracing::warn!(retries = index_incomplete, deleted,
+                        "lake-part GC index remains incomplete without delete progress; retry budget exhausted");
+                }
                 report.planned = planned;
                 report.deleted = deleted;
                 report.indexed = indexed;

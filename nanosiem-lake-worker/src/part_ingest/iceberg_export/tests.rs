@@ -557,6 +557,7 @@ fn export_plan_batches_chain_each_part_once_and_removals_last() {
     use super::super::export::{split_manifest, ExportBatchBounds};
     use crate::parts::{format::PartId, levels::Level, part_log::PartRef};
     let part = |i: usize, level: Level, hour: i32| PartRef {
+        request_hours: None,
         part_id: PartId::parse(&format!("{:013}-cccccccccccccccc", i)).unwrap(),
         level,
         event_hour: hour,

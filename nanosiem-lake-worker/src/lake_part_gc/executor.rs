@@ -618,10 +618,27 @@ pub(crate) async fn execute_quarantine(
     execute_requests(authority, requests, &mut Vec::new(), refused, pacer, now_ms, false, None).await
 }
 
+/// The index head this pass actually published and its re-sync inputs.
+/// A local writer watermark is only a reason to yield, never deletion evidence.
+struct PassIndex<'a> {
+    client: &'a dyn LakePartIndexClient,
+    reader: &'a dyn PartLogReader,
+    tenant_uuid: &'a str,
+    receipted: Option<&'a super::index::ReceiptedAppends>,
+    through: Option<u64>,
+}
+
+impl PassIndex<'_> {
+    fn writer_advanced(&self) -> bool {
+        self.receipted.and_then(|ledger| ledger.completed_head())
+            .is_some_and(|seq| self.through.is_none_or(|through| seq > through))
+    }
+}
+
 async fn execute_requests<I, R>(
     authority: &dyn LakePartDeleteAuthority, requests: I, deleted: &mut Vec<DeletedKey>,
     refused: &mut RefusedKeys, pacer: &mut AuthorizePacer, now_ms: i64, trusted_local: bool,
-    resync: Option<(&dyn LakePartIndexClient, &dyn PartLogReader, &str, Option<&super::index::ReceiptedAppends>)>,
+    mut resync: Option<PassIndex<'_>>,
 ) -> PassReport
 where I: IntoIterator<Item = R>, R: std::borrow::Borrow<LakePartDeleteRequest> {
     let mut report = PassReport::default();
@@ -640,18 +657,32 @@ where I: IntoIterator<Item = R>, R: std::borrow::Borrow<LakePartDeleteRequest> {
         if !trusted_local && request.validate().is_ok() {
             pacer.acquire().await;
         }
+        // NAN-4851: the pacer or earlier deletes can span several ingest
+        // commits. Do not ask control to reject an index we already know is
+        // stale, then spend an R2 tail probe on re-sync. The cell retains this
+        // candidate and folds/publishes before retrying. Check after pacing;
+        // an append can complete while it waits. No key is marked refused.
+        if resync.as_ref().is_some_and(PassIndex::writer_advanced) {
+            report.pause(LOG_CATCHING_UP, false);
+            break;
+        }
         let mut step = delete_one(authority, request, trusted_local).await;
         if matches!(&step, Step::Stop { reason, .. } if reason == "lake_part_index_incomplete") && !resynced {
-            if let Some((index, reader, tenant_uuid, receipted)) = resync {
+            if let Some(index) = resync.as_mut() {
                 resynced = true;
-                let receipted_through = receipted.and_then(|receipted| receipted.receipted_through(now_ms));
-                match sync_index(index, reader, tenant_uuid, now_ms, receipted_through).await {
+                let receipted_through = index.receipted.and_then(|receipted| receipted.receipted_through(now_ms));
+                match sync_index(index.client, index.reader, index.tenant_uuid, now_ms, receipted_through).await {
                     Ok(IndexSyncOutcome::Synced { caught_up: true, pushed, status, head_appended_ms, .. }) => {
                         report.indexed += pushed;
                         report.index_head_seq = status.indexed_through_seq;
                         report.index_head_appended_ms = head_appended_ms;
+                        index.through = status.indexed_through_seq;
                         pacer.acquire().await;
-                        step = delete_one(authority, request, trusted_local).await;
+                        step = if index.writer_advanced() {
+                            Step::Stop { reason: LOG_CATCHING_UP.into(), backoff: false }
+                        } else {
+                            delete_one(authority, request, trusted_local).await
+                        };
                     }
                     Ok(IndexSyncOutcome::BackOff(reason)) => step = Step::Stop { reason, backoff: true },
                     Ok(IndexSyncOutcome::Refused(reason)) => {
@@ -696,9 +727,11 @@ where I: IntoIterator<Item = R>, R: std::borrow::Borrow<LakePartDeleteRequest> {
                 if reason == "receipt_mismatch" || reason == "permit_mismatch" {
                     report.skip(&reason);
                 }
-                if reason == "log_catching_up" || reason == INDEX_SETTLING {
+                if reason == LOG_CATCHING_UP || reason == INDEX_SETTLING || reason == "lake_part_index_incomplete" {
                     // NAN-3852: routine under live ingest (a flush landed
-                    // mid-pass); the task folds / waits and continues.
+                    // mid-pass); the task folds / waits and continues. NL009
+                    // is tenant-wide, not a permanent defect in this key.
+                    // The cell warns if its bounded no-progress retries end.
                     tracing::debug!(key = %request.key, %reason, "lake part GC pass stopped");
                 } else {
                     tracing::warn!(key = %request.key, %reason, "lake part GC pass stopped");
@@ -930,7 +963,8 @@ async fn pass(
     }
     if bounded_fold_complete {
         let executed = execute_requests(
-            authority, &mut cursor, &mut state.pending_deleted, &mut state.refused_keys, &mut state.authorize_pacer, now_ms, false, Some((index, reader, tenant_uuid, receipted)),
+            authority, &mut cursor, &mut state.pending_deleted, &mut state.refused_keys, &mut state.authorize_pacer, now_ms, false,
+            Some(PassIndex { client: index, reader, tenant_uuid, receipted, through: report.index_head_seq }),
         ).await;
         PassReport {
             plan_skipped: cursor.skipped, indexed: report.indexed + executed.indexed, index_head_seq: executed.index_head_seq.or(report.index_head_seq),
@@ -940,7 +974,8 @@ async fn pass(
         // Preserve eager public executor reporting and error behavior.
         let requests = cursor.by_ref().collect::<Vec<_>>();
         let mut executed =
-            execute_requests(authority, &requests, &mut state.pending_deleted, &mut state.refused_keys, &mut state.authorize_pacer, now_ms, false, Some((index, reader, tenant_uuid, receipted))).await;
+            execute_requests(authority, &requests, &mut state.pending_deleted, &mut state.refused_keys, &mut state.authorize_pacer, now_ms, false,
+                Some(PassIndex { client: index, reader, tenant_uuid, receipted, through: report.index_head_seq })).await;
         executed.planned = requests.len() as u64;
         PassReport {
             plan_skipped: cursor.skipped, indexed: report.indexed + executed.indexed, index_head_seq: executed.index_head_seq.or(report.index_head_seq),

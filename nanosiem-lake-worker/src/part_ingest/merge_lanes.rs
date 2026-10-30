@@ -531,6 +531,7 @@ mod tests {
 
     fn part(hour: i32, seq: i64, now: i64) -> PartRef {
         PartRef {
+            request_hours: None,
             part_id: PartId::parse(&format!("{:013}-{:016x}", now - 120_000, seq)).unwrap(),
             level: Level::L0,
             event_hour: hour,

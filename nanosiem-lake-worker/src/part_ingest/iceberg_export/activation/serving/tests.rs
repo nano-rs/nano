@@ -379,6 +379,7 @@ impl ServingFactory for Provider {
 }
 fn part() -> PartRef {
     PartRef {
+        request_hours: None,
         part_id: PartId::parse("0000000000001-aaaaaaaaaaaaaaaa").unwrap(),
         level: Level::Hour,
         event_hour: 0,

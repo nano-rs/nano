@@ -704,6 +704,7 @@ async fn customer_signed_copy_survives_source_gc_and_erasure() {
         let body = parquet(&rows, false);
         let zero = "0".repeat(64);
         let record = ProvenanceRecord {
+            request_hours: None,
             format: PROVENANCE_FORMAT.into(),
             signer_key_id: "fixture-owner-key".into(),
             tenant_id: TENANT.into(),

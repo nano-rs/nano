@@ -1347,9 +1347,9 @@ mod tests {
         assert_eq!(product_view_memory_name("/api/search/asset-events"), Some("asset-events"));
         assert_eq!(product_view_memory_name("/api/search/asset-events/x"), None);
         // Every budgeted route is a real route on the search router.
-        let lib = include_str!("lib.rs");
         for (route, _) in PRODUCT_VIEW_MEMORY_ROUTES {
-            assert!(lib.contains(&format!("\"{route}\"")), "{route} is not routed");
+            assert!(crate::route_policy::manifest().iter().any(|entry| entry.path == *route),
+                "{route} is not routed");
         }
     }
 

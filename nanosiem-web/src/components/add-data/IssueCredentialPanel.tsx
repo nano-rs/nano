@@ -90,7 +90,10 @@ export function IssueCredentialPanel({
   collectorSources,
   logSourceId,
   initialProtocol,
+  linear = false,
+  onTokenSaved,
   onIssued,
+  onBusyChange,
 }: {
   endpoint: TenantIngestEndpoint;
   /** Direct: the one source the token is fixed to. */
@@ -99,6 +102,9 @@ export function IssueCredentialPanel({
   collectorSources?: AddDataSource[];
   logSourceId?: string;
   initialProtocol?: DirectProtocol;
+  linear?: boolean;
+  onTokenSaved?: () => void;
+  onBusyChange?: (busy: boolean) => void;
   /** Called after a token was revealed (e.g. to refresh the credential list). */
   onIssued?: (credential: Pick<IssuedCredential, 'requestId' | 'credentialId'>) => void;
 }) {
@@ -213,6 +219,7 @@ export function IssueCredentialPanel({
   const [now, setNow] = useState(() => Date.now());
 
   const busy = phase !== null;
+  useEffect(() => { onBusyChange?.(busy); return () => onBusyChange?.(false); }, [busy, onBusyChange]);
   const needsAck = verdict?.needs_acknowledgement === true || ackRequiredByServer;
   const manageBlocked = verdict?.blocked === true && verdict.verdict !== null && MANAGE_VERDICTS.has(verdict.verdict);
   const ackBlocked = manageBlocked || (ackRequiredByServer && !canManageScopes);
@@ -277,7 +284,7 @@ export function IssueCredentialPanel({
           signal: controller.signal,
           onWaiting: (status) => {
             setWaitingCopy(status.waiting_reason === 'awaiting_enrollment'
-              ? `Waiting for the ${(status.waiting_source_slugs?.length ? status.waiting_source_slugs : status.source_slugs).join(', ')} parser to finish rolling out`
+              ? `Preparing the ${(status.waiting_source_slugs?.length ? status.waiting_source_slugs : status.source_slugs).join(', ')} ingest path`
               : status.waiting_reason === 'source_platform_only'
                 ? describeRefusal('source_platform_only').detail
                 : null);
@@ -292,7 +299,9 @@ export function IssueCredentialPanel({
         },
       );
       // A new token never replaces one still on screen: they stack until each is dismissed.
-      setShown((prev) => [{ ...credential, copied: false, kind, aliases: issuedAliases, issuedAt: new Date().toISOString() }, ...prev]);
+      const shownCredential: Shown = { ...credential, copied: false, kind, aliases: issuedAliases, issuedAt: new Date().toISOString() };
+      setShown((prev) => [shownCredential, ...prev]);
+      if (linear) watch(shownCredential);
       setAcknowledged(false);
       labelTouched.current = false;
       onIssued?.({ requestId: credential.requestId, credentialId: credential.credentialId });
@@ -310,7 +319,7 @@ export function IssueCredentialPanel({
       setPendingRequestId(null);
       setStartedAt(null);
     }
-  }, [acknowledged, aliases, canIssue, collector, kind, logSourceId, needsAck, onIssued, protocol, slugs, trimmedLabel]);
+  }, [acknowledged, aliases, canIssue, collector, kind, logSourceId, needsAck, onIssued, protocol, slugs, trimmedLabel, linear, watch]);
 
   const elapsed = startedAt ? Math.max(0, Math.round((now - startedAt) / 1000)) : 0;
   const parserHref = logSourceId && !collector ? `/ingestion/log-sources/${logSourceId}` : '/ingestion/log-sources';
@@ -320,8 +329,9 @@ export function IssueCredentialPanel({
 
   return (
     <div className="space-y-3" data-testid="issue-credential-panel">
-      <div className="grid grid-cols-12 gap-3">
-        <div className="col-span-12 md:col-span-4">
+      {!(linear && (shown.length > 0 || watched.length > 0)) && <>
+      <div className={linear ? "space-y-3" : "grid grid-cols-12 gap-3"}>
+        <div className={linear ? "hidden" : "col-span-12 md:col-span-4"}>
           <div className="text-[10.5px] font-medium text-foreground/80 mb-1.5">{collector ? 'Sources' : 'Source'}</div>
           <div className="h-8 flex items-center gap-2 rounded-md border border-border bg-card px-2.5">
             {collector ? (
@@ -343,7 +353,7 @@ export function IssueCredentialPanel({
             )}
           </div>
         </div>
-        <div className="col-span-12 md:col-span-4">
+        <div className={linear ? "hidden" : "col-span-12 md:col-span-4"}>
           <div className="text-[10.5px] font-medium text-foreground/80 mb-1.5">Protocol</div>
           <div className="h-8 inline-flex items-center rounded-md border border-border bg-card p-0.5" role="radiogroup" aria-label="Protocol">
             {protocols.map((p) => (
@@ -411,10 +421,9 @@ export function IssueCredentialPanel({
           <AlertTriangle className="w-3.5 h-3.5 mt-px text-amber-500 shrink-0" strokeWidth={1.5} />
           <span>
             <span className="font-mono">{targets.filter((t) => !t.enrolled).map((t) => t.slug).join(', ')}</span>{' '}
-            {targets.filter((t) => !t.enrolled).length === 1 ? 'is' : 'are'} still rolling out to your parser cell. The
+            {targets.filter((t) => !t.enrolled).length === 1 ? 'is' : 'are'} being connected to your ingest endpoint. The
             token is issued once {collector ? 'every source is' : 'the source is'} enrolled; keep this page open until
-            it appears. Events sent before then are accepted and <span className="font-mono">held</span> at the edge,
-            then parsed through this source once it is live.
+            it appears.
           </span>
         </div>
       )}
@@ -515,7 +524,7 @@ export function IssueCredentialPanel({
       )}
 
       <div className="flex items-center gap-2">
-        <Button size="sm" className="h-8 gap-1.5 text-[11.5px]" disabled={!canIssue} onClick={() => void issue()}>
+        <Button size="sm" className={cn("h-8 gap-1.5 text-[11.5px]", linear && "shadow-none")} disabled={!canIssue} onClick={() => void issue()}>
           {busy ? <LoadingIcon className="w-3.5 h-3.5" /> : <KeyRound className="w-3.5 h-3.5" strokeWidth={1.5} />}
           {shown.length > 0 ? 'Issue another credential' : 'Issue credential'}
         </Button>
@@ -538,6 +547,7 @@ export function IssueCredentialPanel({
         )}
       </div>
 
+      </>}
       {shown.map((cred) => (
         <div key={cred.requestId} className="space-y-2">
           <OneTimeToken
@@ -546,10 +556,12 @@ export function IssueCredentialPanel({
             onCopied={() => {
               setShown((prev) => prev.map((s) => (s.requestId === cred.requestId ? { ...s, copied: true } : s)));
               watch(cred);
+              onTokenSaved?.();
             }}
-            onDismiss={() => setShown((prev) => prev.filter((s) => s.requestId !== cred.requestId))}
+            onDismiss={() => { setShown((prev) => prev.filter((s) => s.requestId !== cred.requestId)); onTokenSaved?.(); }}
           />
           <SenderSnippets
+            linear={linear}
             catalog={catalog}
             endpoint={endpoint}
             protocol={cred.protocol}

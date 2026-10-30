@@ -4,6 +4,7 @@ use crate::parts::levels::PlannedMerge;
 
 fn plan(rows: u64, bytes: u64, count: usize) -> PlannedMerge {
     PlannedMerge { output_level: Level::Hour, event_hour: 7, inputs: (0..count).map(|i| PartRef {
+        request_hours: None,
         part_id: crate::parts::format::PartId::new(i as i64).unwrap(), level: Level::L0,
         event_hour: 7, event_day: None, rows: rows / count as u64 + u64::from((i as u64) < rows % count as u64),
         min_time_us: 0, max_time_us: 1, schema_fingerprint: "0".repeat(64), provenance_sha256: "0".repeat(64),

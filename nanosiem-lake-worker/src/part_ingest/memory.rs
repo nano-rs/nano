@@ -25,47 +25,47 @@
 //! [`release_freed`] hands freed arena pages back after every flush and
 //! merge commit.
 
-/// Flush build working memory per byte of the sealed buffer (concat of its
-/// admission batches + the sorted copy, both alive while the sort runs).
-/// Measured 1.94.
-pub const BUILD_BYTES_PER_BUFFER_BYTE: f64 = 2.0;
-/// Resident bytes of one parallel L0 part writer beyond its rows (Parquet
-/// column buffers, token groups, partials). Measured ~21 MiB; doubled.
-pub const L0_WRITER_BYTES: u64 = 48 * 1024 * 1024;
+// One model for placement and every worker deployment. Keep admission,
+// sealing and writer reservations independent of target_rows validation.
+pub use nanosiem_lake_cell::ingest_memory::{
+    buffer_cap, flight_bytes, writer_room, writers_for, BUFFER_SHARE_OF_WORKING,
+    BUILD_BYTES_PER_BUFFER_BYTE, FLIGHT_ADMISSION_BYTES, L0_WRITER_BYTES, MAX_PARALLEL_L0_WRITES,
+};
+
+#[cfg(not(test))]
+pub use nanosiem_lake_cell::ingest_memory::flush_max_rows;
+
+// The ignored farm benchmark runs each control in its own process. Reproduce
+// the legacy flush limiter at BOTH production admission checks and sealing
+// (65,536 rows, prior first-object/cap-refusal behavior), with the current
+// writer/layout and all other reservations held identical. This
+// switch and its atomic load do not exist in production builds.
+#[cfg(test)]
+pub(super) static LEGACY_FLUSH_CAP_FOR_BENCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+pub fn flush_max_rows(working_budget: u64) -> u64 {
+    if LEGACY_FLUSH_CAP_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed) {
+        65_536
+    } else {
+        nanosiem_lake_cell::ingest_memory::flush_max_rows(working_budget)
+    }
+}
+
+pub fn flush_row_cap(working: u64, merges: u64, arrow_row_bytes: u64, writers: usize) -> u64 {
+    #[cfg(test)]
+    if LEGACY_FLUSH_CAP_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed) { return 65_536; }
+    nanosiem_lake_cell::ingest_memory::flush_rows_for_working(working, merges, arrow_row_bytes, writers)
+}
+
+pub fn memory_derived_flush_limits(working: u64) -> bool {
+    #[cfg(test)]
+    if LEGACY_FLUSH_CAP_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed) { return false; }
+    flush_max_rows(working) != nanosiem_lake_cell::ingest_memory::FLUSH_PROGRESS_ROWS
+}
+
 /// Admission peak per modelled JSON-value heap byte (measured 1.24).
 pub const ADMISSION_PEAK_PER_MODELLED_HEAP: f64 = 1.5;
-/// Threads writing one flush's L0 parts at most.
-pub const MAX_PARALLEL_L0_WRITES: usize = 4;
-/// Admission room kept when choosing flush writers, capped so a 6 GiB role
-/// still runs four L0 writers beside two maximum-window minute merges.
-/// Admission itself always checks the actual remaining working budget.
-pub const FLIGHT_ADMISSION_BYTES: u64 = 3 * L0_WRITER_BYTES;
-/// Share of the working budget the filling buffer may reach before it
-/// flushes: a sealed flight (1 + BUILD) plus the next buffer (1) plus
-/// admission, writers and reserved merge room must fit the rest. At a
-/// 628 MB working budget, a fifth plus four writers monopolized the budget;
-/// an eighth leaves room for calibrated admission beside a flight.
-/// Large roles still reach the flush row cap before this byte cap.
-pub const BUFFER_SHARE_OF_WORKING: f64 = 1.0 / 8.0;
-
-/// Bytes a sealed flush holds until it commits: its rows, its build copies
-/// and its part writers.
-pub fn flight_bytes(buffer_bytes: u64, writers: usize) -> u64 {
-    let build = (buffer_bytes as f64 * BUILD_BYTES_PER_BUFFER_BYTE) as u64;
-    buffer_bytes.saturating_add(build).saturating_add(writers as u64 * L0_WRITER_BYTES)
-}
-
-/// Parallel L0 writers a flush of `buffer_bytes` may use with `room` bytes
-/// of the working budget free (everything else already charged): the most
-/// that fit, at least one (a flush must always make progress).
-pub fn writers_for(buffer_bytes: u64, room: u64) -> usize {
-    (1..=MAX_PARALLEL_L0_WRITES).rev().find(|w| flight_bytes(buffer_bytes, *w) <= room).unwrap_or(1)
-}
-
-/// Bytes the filling buffer may reach before it is due.
-pub fn buffer_cap(working_budget: u64) -> u64 {
-    (working_budget as f64 * BUFFER_SHARE_OF_WORKING) as u64
-}
 
 /// What admission may add with `committed` bytes already charged (the
 /// buffer, the flight, the merges): the predicted admission peak (JSON
@@ -92,6 +92,7 @@ pub struct AdmissionGroups {
     committed: u64,
     buffer_bytes: u64,
     buffer_rows: u64,
+    row_cap: u64,
     /// Rows offered this tick (footer counts, before deduplication).
     rows: u64,
     /// Arrow rows of the closed groups.
@@ -118,22 +119,29 @@ impl AdmissionGroups {
     /// buffer, flights, merges); `buffer_bytes`: the filling buffer's share
     /// of it; `buffer_rows`: rows already held in the filling buffer.
     pub fn new(working_budget: u64, committed: u64, buffer_bytes: u64, buffer_rows: u64) -> Self {
-        Self { working_budget, committed, buffer_bytes, buffer_rows, rows: 0, closed_arrow: 0.0, heap: 0.0, arrow: 0.0, groups: 0 }
+        Self { working_budget, committed, buffer_bytes, buffer_rows, row_cap: flush_max_rows(working_budget), rows: 0, closed_arrow: 0.0, heap: 0.0, arrow: 0.0, groups: 0 }
+    }
+
+    pub fn with_row_cap(mut self, rows: u64) -> Self {
+        self.row_cap = rows.max(1);
+        self
+    }
+
+    pub fn within_caps(&self, arrow: f64, rows: u64) -> bool {
+        self.buffer_bytes as f64 + self.closed_arrow + self.arrow + arrow <= buffer_cap(self.working_budget) as f64
+            && self.buffer_rows.saturating_add(self.rows).saturating_add(rows) <= self.row_cap
     }
 
     /// Offer the next object (its predicted modelled JSON heap and Arrow rows).
     /// Preselection does not know footer row counts yet and passes 0;
     /// admission repacks with the actual counts before decoding anything.
     pub fn offer(&mut self, heap: f64, arrow: f64, rows: u64) -> Offer {
-        let buffered = self.buffer_bytes as f64 + self.closed_arrow + self.arrow + arrow;
-        let buffered_rows = self.buffer_rows.saturating_add(self.rows).saturating_add(rows);
-        let within_caps = buffered <= buffer_cap(self.working_budget) as f64
-            && buffered_rows <= crate::parts::levels::FLUSH_MAX_ROWS as u64;
+        let within_caps = self.within_caps(arrow, rows);
         // Joins in the first group obey the buffer caps too. Otherwise a
         // calibrated group can fill the old one-fifth buffer in one offer
         // sequence, leaving no admission room beside its flight. A lone
         // oversized first object retains the existing progress/slicing path.
-        if self.groups > 0 && !within_caps {
+        if !within_caps && (self.groups > 0 || (memory_derived_flush_limits(self.working_budget) && self.buffer_rows > 0)) {
             return Offer::Refused;
         }
         let charged = self.committed.saturating_add(self.closed_arrow as u64);
@@ -143,7 +151,7 @@ impl AdmissionGroups {
         }
         let closed = self.closed_arrow + self.arrow;
         if self.groups > 0 && within_caps
-            && self.buffer_rows.saturating_add(self.rows) < crate::parts::levels::FLUSH_MAX_ROWS as u64
+            && self.buffer_rows.saturating_add(self.rows) < self.row_cap
             && admission_fits(self.working_budget, self.committed.saturating_add(closed as u64), heap, arrow)
         {
             self.closed_arrow = closed;
@@ -209,6 +217,7 @@ impl AdmissionGroups {
 pub struct AdmissionCalibration {
     by_prefix: std::collections::BTreeMap<String, Learned>,
     observations: u64,
+    arrow_row_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -262,6 +271,15 @@ impl AdmissionCalibration {
         self.cost(prefix, decoded)
     }
 
+    /// Actual Arrow footprint survives a seal. Footer/dictionary bytes can
+    /// underestimate the expanded columns, so row capacity must use this
+    /// measurement independently of the prefix reservation's prior clamp.
+    pub fn arrow_row_bytes(&self) -> u64 { self.arrow_row_bytes }
+
+    pub fn retain_buffer_width(&mut self, bytes: u64, rows: u64) {
+        if rows > 0 { self.arrow_row_bytes = self.arrow_row_bytes.max(bytes.div_ceil(rows)); }
+    }
+
     /// Whether `prefix` has a learned ratio.
     pub fn measured(&self, prefix: &str) -> bool {
         self.by_prefix.contains_key(prefix)
@@ -270,6 +288,14 @@ impl AdmissionCalibration {
     /// Record one admitted group: its `prefixes` (one per object), `rows`
     /// kept, `decoded` bytes, sampled modelled `heap` and Arrow `arrow` bytes.
     pub fn observe(&mut self, prefixes: &[&str], rows: u64, decoded: u64, heap: f64, arrow: f64) {
+        if rows > 0 && arrow.is_finite() && arrow > 0.0 {
+            let row_bytes = (arrow / rows as f64).ceil() as u64;
+            self.arrow_row_bytes = if row_bytes >= self.arrow_row_bytes {
+                row_bytes
+            } else {
+                self.arrow_row_bytes - (self.arrow_row_bytes - row_bytes) / 4
+            };
+        }
         if rows < MIN_CALIBRATION_ROWS || decoded == 0 || !(heap.is_finite() && arrow.is_finite()) || heap <= 0.0 || arrow <= 0.0 {
             return;
         }
@@ -409,29 +435,32 @@ mod tests {
     #[test]
     fn the_flight_is_charged_its_build_and_writers_not_only_its_rows() {
         let rows = 206 * MIB;
-        assert_eq!(flight_bytes(rows, 4), rows + 2 * rows + 4 * L0_WRITER_BYTES);
-        assert!(flight_bytes(rows, 1) < flight_bytes(rows, 4));
+        assert_eq!(flight_bytes(rows, 4), 6 * rows);
+        assert_eq!(flight_bytes(rows, 1), flight_bytes(rows, 4), "sort dominates at this width");
+        assert!(flight_bytes(32 * MIB, 1) < flight_bytes(32 * MIB, 4));
     }
 
     #[test]
     fn writers_scale_down_with_the_room() {
-        let rows = 206 * MIB;
-        assert_eq!(writers_for(rows, 2048 * MIB), 4);
-        assert_eq!(writers_for(rows, flight_bytes(rows, 4)), 4);
-        assert_eq!(writers_for(rows, flight_bytes(rows, 4) - 1), 3);
-        assert_eq!(writers_for(rows, flight_bytes(rows, 2)), 2);
-        // Never below one: a flush always makes progress.
-        assert_eq!(writers_for(rows, 0), 1);
+        // Keep these boundaries in the writer phase; wide inputs instead
+        // share the calibrated whole-build high-water mark.
+        let rows = 32 * MIB;
+        assert_eq!(writers_for(rows, 2048 * MIB, 16), 16);
+        assert_eq!(writers_for(rows, flight_bytes(rows, 16), 16), 16);
+        assert_eq!(writers_for(rows, flight_bytes(rows, 16) - 1, 16), 15);
+        assert_eq!(writers_for(rows, flight_bytes(rows, 8), 16), 8);
+        assert_eq!(writers_for(rows, flight_bytes(rows, 4), 16), 4);
+        assert_eq!(writers_for(rows, 0, 16), 1);
     }
 
     #[test]
     fn admission_takes_only_the_room_left() {
         let budget = 2048 * MIB;
-        // 500 MiB modelled heap peaks at 750 MiB, plus 50 MiB of rows.
-        assert!(admission_fits(budget, 0, 500.0 * MIB as f64, 50.0 * MIB as f64));
-        // The same admission no longer fits beside a full flight (1,392 MiB).
-        let flight = flight_bytes(400 * MIB, 4);
-        assert!(!admission_fits(budget, flight, 500.0 * MIB as f64, 50.0 * MIB as f64));
+        // 600 MiB modelled heap peaks at 900 MiB, plus 50 MiB of rows.
+        assert!(admission_fits(budget, 0, 600.0 * MIB as f64, 50.0 * MIB as f64));
+        // The same admission no longer fits beside a full flight (1,440 MiB).
+        let flight = flight_bytes(240 * MIB, 4);
+        assert!(!admission_fits(budget, flight, 600.0 * MIB as f64, 50.0 * MIB as f64));
         assert!(admission_fits(budget, flight, 200.0 * MIB as f64, 50.0 * MIB as f64));
     }
 
@@ -474,7 +503,7 @@ mod tests {
         }
         assert_eq!(first as f64, single, "the first group is the single-group bound");
         // Further groups: every object admitted, each group fits beside the
-        // rows of the groups before it, and the buffer cap (409.6 MiB) is
+        // rows of the groups before it, and the buffer cap (256 MiB) is
         // never passed by the rows.
         assert!(groups.groups() > 1);
         let admitted = offers.iter().filter(|o| **o != Offer::Refused).count();
@@ -485,7 +514,7 @@ mod tests {
         let offers = (0..30).map(|_| capped.offer(heap, arrow, 0)).collect::<Vec<_>>();
         assert!(!offers.contains(&Offer::NewGroup), "{offers:?}");
         // A buffer at its row cap takes one group only.
-        let mut full = AdmissionGroups::new(budget, 0, 0, crate::parts::levels::FLUSH_MAX_ROWS as u64);
+        let mut full = AdmissionGroups::new(budget, 0, 0, flush_max_rows(budget));
         let offers = (0..30).map(|_| full.offer(heap, arrow, 0)).collect::<Vec<_>>();
         assert_eq!(offers.iter().filter(|o| **o == Offer::Joins).count(), 8);
         assert!(!offers.contains(&Offer::NewGroup));
@@ -494,6 +523,48 @@ mod tests {
         assert_eq!(none.offer(heap, arrow, 0), Offer::Refused);
         none.force(heap, arrow, 0);
         assert_eq!(none.groups(), 1);
+    }
+
+    #[test]
+    fn measured_row_width_survives_a_seal_without_lowering_reservation_priors() {
+        let mut calibration = AdmissionCalibration::default();
+        calibration.observe(&["source"], 1, 100, 200.0, 4_096.0);
+        assert_eq!(calibration.arrow_row_bytes(), 4_096);
+        assert!(!calibration.measured("source"), "one row does not calibrate heap reservations");
+        calibration.observe(&["source"], 1_000, 100_000, 200_000.0, 8_192_000.0);
+        assert_eq!(calibration.arrow_row_bytes(), 8_192, "heavier input raises the width at once");
+        calibration.observe(&["source"], 1_000, 100_000, 200_000.0, 4_096_000.0);
+        assert_eq!(calibration.arrow_row_bytes(), 7_168, "lighter input decays by a quarter");
+        calibration.retain_buffer_width(9_000_000, 1_000);
+        assert_eq!(calibration.arrow_row_bytes(), 9_000, "include actual conformed buffer storage before sealing");
+        let mut groups = AdmissionGroups::new(1024 * MIB, 0, 0, 0).with_row_cap(20_000);
+        assert_eq!(groups.offer(1.0, 1.0, 10_000), Offer::Joins);
+        assert_eq!(groups.offer(1.0, 1.0, 10_000), Offer::Joins);
+        assert_eq!(groups.offer(1.0, 1.0, 1), Offer::Refused);
+        let mut carried = AdmissionGroups::new(1024 * MIB, 0, 1, 15_000).with_row_cap(20_000);
+        assert_eq!(carried.offer(1.0, 1.0, 10_000), Offer::Refused,
+            "a later tick cannot force an object past the measured cap");
+        let mut idle = AdmissionGroups::new(1024 * MIB, 0, 0, 0).with_row_cap(20_000);
+        assert_eq!(idle.offer(1.0, 1.0, 30_000), Offer::Joins,
+            "one oversized first object still makes bounded progress");
+    }
+
+    #[test]
+    fn small_role_progress_preserves_whole_object_packing() {
+        let budget = 64 * MIB;
+        let mut carried = AdmissionGroups::new(budget, 6 * MIB, 6 * MIB, 10_000)
+            .with_row_cap(18_000);
+        assert!(!carried.within_caps(6.0 * MIB as f64, 10_000));
+        assert!(!memory_derived_flush_limits(budget));
+        assert_eq!(flush_row_cap(budget, 0, 4_096, 4), 65_536);
+        assert_eq!(carried.offer(MIB as f64, 6.0 * MIB as f64, 10_000), Offer::Joins);
+        carried.force(0.0, 0.0, 50_000);
+        assert_eq!(carried.offer(0.0, 0.0, 1), Offer::Refused,
+            "only the first object retains the whole-object progress step");
+        let large = 1024 * MIB;
+        let mut filling = AdmissionGroups::new(large, 0, buffer_cap(large) - MIB, 10_000);
+        assert!(memory_derived_flush_limits(large));
+        assert_eq!(filling.offer(MIB as f64, 2.0 * MIB as f64, 10_000), Offer::Refused);
     }
 
     #[test]
@@ -512,13 +583,15 @@ mod tests {
     #[test]
     fn later_groups_charge_this_ticks_rows_beside_the_existing_buffer() {
         let budget = 2048 * MIB;
-        let (heap, arrow) = (160.0 * MIB as f64, 10.0 * MIB as f64);
-        for buffered_rows in [0, 10_000] {
+        // The Arrow estimate can be small while row-oriented scratch is
+        // not: count footer rows across groups beside earlier ticks.
+        let (heap, arrow, rows) = (800.0 * MIB as f64, MIB as f64, 50_000);
+        for buffered_rows in [0, 100_000] {
             let mut groups = AdmissionGroups::new(budget, 0, 0, buffered_rows);
-            let admitted = (0..64).take_while(|_| groups.offer(heap, arrow, 5_000) != Offer::Refused).count();
+            let admitted = (0..64).take_while(|_| groups.offer(heap, arrow, rows) != Offer::Refused).count();
             assert!(groups.groups() > 1);
-            assert_eq!(admitted as u64, (crate::parts::levels::FLUSH_MAX_ROWS as u64 - buffered_rows) / 5_000);
-            assert!(buffered_rows + groups.rows <= crate::parts::levels::FLUSH_MAX_ROWS as u64);
+            assert_eq!(admitted as u64, (flush_max_rows(budget) - buffered_rows) / rows);
+            assert!(buffered_rows + groups.rows <= flush_max_rows(budget));
         }
     }
 

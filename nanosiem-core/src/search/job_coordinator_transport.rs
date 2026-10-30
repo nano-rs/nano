@@ -12,6 +12,11 @@ use url::{Host, Url};
 
 const MAX_BODY_BYTES: usize = 196_608;
 
+/// A deployment may interrupt a storage-using Durable Object request. Recovery
+/// is limited to the same fenced renewal or identical result completion,
+/// never a new execution.
+pub(super) const RENEW_RECOVERY_BUDGET: Duration = Duration::from_secs(30);
+
 // Keep diagnostics closed and non-secret even for malformed internal commands.
 fn diagnostic_operation(command: &Value) -> &'static str {
     match command.get("op").and_then(Value::as_str) {
@@ -146,7 +151,7 @@ impl HostedCoordinatorTransport {
         Self {
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(15))
                 .build()
                 .unwrap(),
             endpoint: Url::parse(&format!("http://{address}/v1/coordinate")).unwrap(),
@@ -189,6 +194,66 @@ impl HostedCoordinatorTransport {
             .build()
             .map_err(|_| CoordinatorTransportError::Configuration)?;
         Ok(Self { client, endpoint })
+    }
+
+    /// Replay only a lease renewal. The caller supplies the last confirmed
+    /// lease deadline; an ambiguous acknowledgement never extends that bound.
+    pub(super) async fn renew_until(
+        &self,
+        command: &Value,
+        lease_deadline: tokio::time::Instant,
+    ) -> Result<(Value, tokio::time::Instant), CoordinatorFailure> {
+        self.recover_until(command, lease_deadline, "renew").await
+    }
+
+    /// Completion already has a durable idempotency contract: the same
+    /// owner/attempt/fence and exact result return true after a lost reply;
+    /// a different result is refused. Do not use this for other mutations.
+    pub(super) async fn complete_until(
+        &self,
+        command: &Value,
+        lease_deadline: tokio::time::Instant,
+    ) -> Result<Value, CoordinatorFailure> {
+        self.recover_until(command, lease_deadline, "complete").await.map(|(value, _)| value)
+    }
+
+    async fn recover_until(
+        &self,
+        command: &Value,
+        lease_deadline: tokio::time::Instant,
+        operation: &'static str,
+    ) -> Result<(Value, tokio::time::Instant), CoordinatorFailure> {
+        let fail = || CoordinatorFailure::new(CoordinatorTransportError::Unavailable, operation);
+        if command.get("op").and_then(Value::as_str) != Some(operation) {
+            return Err(CoordinatorFailure::new(CoordinatorTransportError::Rejected, diagnostic_operation(command)));
+        }
+        let deadline = lease_deadline.min(tokio::time::Instant::now() + RENEW_RECOVERY_BUDGET);
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(fail());
+            }
+            let sent = tokio::time::Instant::now();
+            let result = tokio::time::timeout_at(deadline, self.execute_detailed(command))
+                .await.map_err(|_| fail())?;
+            // timeout_at polls a ready response before its timer. A delayed
+            // task must never accept that response after the lease/budget.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(fail());
+            }
+            match result {
+                Err(failure) if failure.kind == CoordinatorTransportError::Unavailable => {
+                    // HTTP refusals, protocol failures and false results never
+                    // enter recovery. Every replay retains the identical body.
+                    if tokio::time::Instant::now() + backoff >= deadline {
+                        return Err(failure);
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(2));
+                }
+                other => return other.map(|value| (value, sent)),
+            }
+        }
     }
 
     /// Low-level contract command. A successful response is still untrusted job
@@ -259,6 +324,11 @@ impl HostedCoordinatorTransport {
                 }
             }
             let code = error_code(&error_body);
+            // The Worker uses 503 for invalid principal configuration too.
+            // That is an authority refusal, not a deploy-window reset.
+            let kind = if matches!(code.as_deref(), Some("invalid_principal_routing" | "unconfigured")) {
+                CoordinatorTransportError::Rejected
+            } else { kind };
             tracing::warn!(operation, stage = "status", status,
                 code = code.as_deref().unwrap_or("-"),
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -322,6 +392,86 @@ impl HostedCoordinatorTransport {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn rollout_recovery_replays_an_interrupted_success_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let transport = HostedCoordinatorTransport::loopback_test_peer(listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for response in [
+                // A committed renewal is interrupted halfway through its body.
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"result\":",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"result\":true}",
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                socket.read(&mut request).await.unwrap();
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let (value, _) = transport.renew_until(&serde_json::json!({"op":"renew"}), tokio::time::Instant::now() + Duration::from_secs(2)).await.unwrap();
+        assert_eq!(value, true);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollout_recovery_cannot_outlive_the_confirmed_lease() {
+        let (transport, server) = peer(503, "Content-Type: application/json\r\n", r#"{"error":"do_reset"}"#).await;
+        let started = tokio::time::Instant::now();
+        let failure = transport.renew_until(&serde_json::json!({"op":"renew"}), started + Duration::from_millis(150)).await.unwrap_err();
+        assert_eq!(failure.kind, CoordinatorTransportError::Unavailable);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollout_recovery_bounds_the_entire_response_not_only_the_backoff() {
+        use std::sync::Arc;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let transport = HostedCoordinatorTransport::loopback_test_peer(listener.local_addr().unwrap());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let hang = notify.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"result\":").await.unwrap();
+            hang.notified().await;
+        });
+        let started = tokio::time::Instant::now();
+        let failure = transport.renew_until(&serde_json::json!({"op":"renew"}), started + Duration::from_millis(150)).await.unwrap_err();
+        assert_eq!(failure.kind, CoordinatorTransportError::Unavailable);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        notify.notify_one();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollout_recovery_has_a_thirty_second_total_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let transport = HostedCoordinatorTransport::loopback_test_peer(listener.local_addr().unwrap());
+        // Keep the endpoint unavailable without any real thirty-second wait.
+        drop(listener);
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let failure = transport.renew_until(&serde_json::json!({"op":"renew"}), started + Duration::from_secs(600)).await.unwrap_err();
+        assert_eq!(failure.kind, CoordinatorTransportError::Unavailable);
+        assert!(started.elapsed() <= RENEW_RECOVERY_BUDGET);
+        assert!(started.elapsed() >= Duration::from_secs(25));
+    }
+
+    #[tokio::test]
+    async fn rollout_recovery_refuses_mutation_commands() {
+        let transport = HostedCoordinatorTransport::loopback_test_peer("127.0.0.1:1".parse().unwrap());
+        for op in ["submit", "claim", "complete", "progress", "fail", "cancel", "release_claim", "cancel_claim", "agent_gateway"] {
+            let failure = transport.renew_until(&serde_json::json!({"op":op}), tokio::time::Instant::now() + RENEW_RECOVERY_BUDGET).await.unwrap_err();
+            assert_eq!(failure.kind, CoordinatorTransportError::Rejected);
+        }
+        for op in ["submit", "claim", "renew", "progress", "fail", "cancel", "release_claim", "cancel_claim", "agent_gateway"] {
+            let failure = transport.complete_until(&serde_json::json!({"op":op}), tokio::time::Instant::now() + RENEW_RECOVERY_BUDGET).await.unwrap_err();
+            assert_eq!(failure.kind, CoordinatorTransportError::Rejected);
+        }
+    }
 
     #[test]
     fn diagnostic_operations_never_echo_untrusted_values() {

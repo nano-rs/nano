@@ -6751,3 +6751,64 @@ async fn platform_stamps_return_through_the_query_service_route() {
     assert_eq!(stats["result"]["rows"][0]["src_endpoint.location.country"], "US", "{stats}");
     assert_eq!(stats["result"]["rows"][0]["count"], 1, "{stats}");
 }
+
+/// NAN-4846: the transport request identity must win even when a parser's
+/// fallback clock assigns different event hours to the two deliveries.
+/// Exercise actual admission, signed part/log publication, compaction and a
+/// cold reopen; an in-memory UID set or a fixed-time transport stub cannot
+/// establish this property.
+#[tokio::test(flavor = "current_thread")]
+async fn nan4846_source_ack_request_keys_dedup_across_event_hours_after_compaction_and_cold_restart() {
+    let fx = fixture(0, 0);
+    let request_hour = event_hour_of(DAY0_S * 1_000_000);
+    let uids = (0..3).map(|i| format!("nano-request-v1:{request_hour}:{}", sha256_hex(format!("request-{i}").as_bytes()))).collect::<Vec<_>>();
+    let mut clock = DAY0_S * 1_000;
+    let mut ingestor = open(&fx, &fx.spool, &fx.parts, clock).await.unwrap();
+    for (i, uid) in uids.iter().enumerate() {
+        let at = DAY0_S + i as i64 * 3_600 + 100;
+        let name = format!("bronze/nan4846-direct-{i}.parquet");
+        let mut rows = vec![event(uid, at, 1)];
+        if i < 2 { rows.push(event("legacy-shared-uid", at, 1)); }
+        write_bronze(&fx.root.join("sources").join(&name), &rows);
+        fx.spool.deliver(&notice(&name, at)).unwrap();
+        clock = at * 1_000;
+        ingestor.tick(clock).await.unwrap();
+        ingestor.flush_now(clock + 11_000).await.unwrap();
+    }
+    assert_eq!(live_rows(&fx).await.len(), 5);
+    // Seal the event hours and then the day using production maintenance.
+    clock = (DAY0_S + 26 * 3_600) * 1_000;
+    for _ in 0..80 { ingestor.tick(clock).await.unwrap(); clock += 1_000; }
+    let parts = live(&fx).await;
+    assert!(parts.parts().any(|part| part.level == Level::Day), "day compaction ran");
+    assert!(parts.parts().all(|part| part.request_hours.is_some_and(|hours| hours.contains(request_hour))));
+    drop(ingestor);
+    std::fs::remove_dir_all(fx.root.join("work")).unwrap();
+    // Reopen at the full 72-hour late-arrival horizon. The request-hour
+    // ledger must outlive the hot UID window even when event time changes.
+    clock = (DAY0_S + 72 * 3_600) * 1_000;
+    let mut ingestor = open(&fx, &fx.spool, &fx.parts, clock).await.unwrap();
+    for (i, uid) in uids.iter().enumerate() {
+        let at = clock / 1_000;
+        let name = format!("bronze/nan4846-spill-{i}.parquet");
+        write_bronze(&fx.root.join("sources").join(&name), &[event(uid, at, 1)]);
+        fx.spool.deliver(&notice(&name, at)).unwrap();
+        ingestor.tick(clock).await.unwrap();
+        ingestor.flush_now(clock + 11_000).await.unwrap();
+        clock += 12_000;
+    }
+    for (name, event_at) in [("legacy-retry", DAY0_S + 100), ("legacy-new-hour", clock / 1_000)] {
+        let name = format!("bronze/nan4846-{name}.parquet");
+        write_bronze(&fx.root.join("sources").join(&name), &[event("legacy-shared-uid", event_at, 1)]);
+        fx.spool.deliver(&notice(&name, clock / 1_000)).unwrap();
+        ingestor.tick(clock).await.unwrap();
+        ingestor.flush_now(clock + 11_000).await.unwrap();
+        clock += 12_000;
+    }
+    assert!(fx.spool.pending(1).await.unwrap().is_empty());
+    let rows = live_rows(&fx).await;
+    assert_eq!(rows.len(), 6, "three request identities plus the legacy UID in three event hours");
+    for uid in &uids { assert_eq!(rows.iter().filter(|(_, actual)| actual == uid).count(), 1); }
+    assert_eq!(rows.iter().filter(|(_, uid)| uid == "legacy-shared-uid").count(), 3);
+    assert_eq!(ingestor.health().duplicates_dropped_total, 4);
+}

@@ -788,33 +788,25 @@ impl Router {
                     Ok(b) => b.to_bytes(),
                     Err(_) => return Ok(error(StatusCode::BAD_REQUEST, "invalid landing request")),
                 };
-                let payload = match landing_query(&tenant, &bytes) {
+                let payload = match landing_receipt_payload(&tenant, &bytes) {
                     Ok(p) => p,
-                    Err(()) => {
-                        return Ok(error(StatusCode::BAD_REQUEST, "invalid landing request"))
-                    }
+                    Err(()) => return Ok(error(StatusCode::CONFLICT, "landing_receipt_v1_required")),
                 };
-                let req = Request::builder()
-                    .method(Method::POST)
-                    .uri("/v1/query")
+                let mut payload = payload;
+                let budget = payload.as_object_mut().unwrap().remove("read_budget_ms").unwrap().as_u64().unwrap();
+                let req = Request::builder().method(Method::POST).uri("/v1/landing-receipt")
                     .header(CONTENT_TYPE, "application/json")
-                    .body(
-                        Full::new(Bytes::from(payload.to_string()))
-                            .map_err(|never| match never {})
-                            .boxed(),
-                    )
-                    .expect("fixed landing request");
-                self.forward(
-                    tenant,
-                    Role::Query,
-                    "/v1/query".into(),
-                    req,
-                    None,
-                    None,
-                    false,
-                )
-                .await
+                    .body(Full::new(Bytes::from(payload.to_string())).map_err(|never| match never {}).boxed())
+                    .expect("fixed receipt request");
+                // This capability only reads the writer's bounded nonce index. It
+                // cannot execute a query or mint a writer/ingest credential.
+                match tokio::time::timeout(Duration::from_millis(budget),
+                    self.forward(tenant, Role::Ingest, "/v1/landing-receipt".into(), req, None, None, false)).await {
+                    Ok(response) => response,
+                    Err(_) => Ok(error(StatusCode::GATEWAY_TIMEOUT,"landing_receipt_budget_expired")),
+                }
             }
+
             (Method::POST | Method::GET, "admin/count-backfill") => {
                 if scope != Scope::Full {
                     return Ok(error(StatusCode::FORBIDDEN, "count backfill requires the full operator token"));
@@ -989,7 +981,16 @@ impl Router {
     async fn forward(&self, tenant: TenantId, role: Role, sub: String, req: Request<Body>, related_guard: Option<InflightGuard>,
         job_auth: Option<&'static str>, operator_debug: bool) -> Result<Response<Body>, hyper::Error> {
         let started = std::time::Instant::now();
-        let (guard, request_id, stream) = match self.sup.open_rpc(&tenant, role).await {
+        // Only these authenticated operator GETs are status reads. POSTs,
+        // including replay/import/backfill, still pass ingest admission.
+        let status_read = operator_debug && role == Role::Ingest && req.method() == Method::GET
+            && matches!(sub.as_str(), "/v1/admin/count-backfill" | "/v1/admin/prevalence-restamp" | "/v1/admin/bronze-quarantine");
+        let rpc = if status_read {
+            self.sup.open_ingest_status_rpc(&tenant).await
+        } else {
+            self.sup.open_rpc(&tenant, role).await
+        };
+        let (guard, request_id, stream) = match rpc {
             Ok(x) => x,
             Err(e) => return Ok(cell_error(e)),
         };
@@ -1915,219 +1916,70 @@ mod tests {
     }
 }
 
-/// Aggregate-only observation capability. No caller-supplied nPL, tenant, dataset,
-/// pagination, cache setting or arbitrary time range can reach query[T].
+/// Nonce-only observation contract. Old callers fail closed; no broad query
+/// or event-time compatibility path exists on a receipt-capable cell.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LandingBody {
     request_id: uuid::Uuid,
     source: String,
     bundle: String,
-    since: chrono::DateTime<chrono::Utc>,
-    /// NAN-4228: the probe's event time (the earliest timestamp the verifier
-    /// found in the sample it sent). Optional: callers without it keep the
-    /// wide window. It only bounds the event window; it never filters rows.
+    probe_nonce: uuid::Uuid,
+    read_budget_ms: u64,
     #[serde(default)]
-    probe_event_time: Option<chrono::DateTime<chrono::Utc>>,
+    platform_probe_id: Option<uuid::Uuid>,
 }
-
-fn landing_query(tenant: &TenantId, bytes: &[u8]) -> Result<serde_json::Value, ()> {
+fn landing_receipt_payload(tenant: &TenantId, bytes: &[u8]) -> Result<serde_json::Value, ()> {
     let r: LandingBody = serde_json::from_slice(bytes).map_err(|_| ())?;
-    let now = chrono::Utc::now();
-    if r.request_id.is_nil()
-        || r.source.is_empty()
-        || r.source.len() > 100
+    if r.read_budget_ms == 0 || r.read_budget_ms > 5000 || r.request_id.is_nil() || r.probe_nonce.is_nil() || r.source.is_empty() || r.source.len() > 100
         || !r.source.as_bytes()[0].is_ascii_alphanumeric()
-        || !r
-            .source
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
-        || r.bundle.len() != 64
-        || !r
-            .bundle
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        || r.since >= now
-        || r.since < now - chrono::Duration::days(30)
-    {
+        || !r.source.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        || r.bundle.len() != 64 || !r.bundle.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || r.platform_probe_id.is_some_and(|id| id != r.probe_nonce || !["audit", "otlp_log", "unknown"].contains(&r.source.as_str())) {
         return Err(());
     }
-    // class_uid=0 is a valid OCSF Base Event, not a parser failure. Native
-    // parts are OCSF-validated; parsers retain errors in unmapped.parse_error.
-    // Legacy metadata.parse_* counter markers are not canonical OCSF paths.
-    //
-    // NAN-4226: landing counts rows by RECORD time, not event time. The
-    // platform's probe is the parser's published sample, whose event time is
-    // whatever the sample says (a catalog syslog sample is dated 2026-08-05),
-    // so an event-time window starting at `since` never saw it and every
-    // catalog parser install rolled back. `metadata.processed_time` is stamped
-    // `now()` (ms) by the OCSF sink when the row is ingested, so the filter
-    // `>= since` is exactly "landed since"; the event window only has to
-    // contain the probe's event time, so it spans the retention horizon.
-    let query = format!("source_type=\"{}\" metadata.processed_time>={} | eval pending=if(metadata.nano_parser_bundle_sha256=\"{}\",1,0) | eval failed=if(pending=1 AND unmapped.parse_error!=\"\",1,0) | stats count() as rows, sum(pending) as n, sum(failed) as errors", r.source, r.since.timestamp_millis(), r.bundle);
-    let (start, end) = landing_event_window(now, r.since, r.probe_event_time);
-    Ok(
-        serde_json::json!({"request_id":r.request_id, "tenant_id":tenant.as_str(),
-        "route":"broad_npl", "dataset":"logs", "query":query,
-        "start":start.to_rfc3339(), "end":end.to_rfc3339(), "limit":2, "offset":0,
-        "table_view":false, "use_cache":false, "deny_source_types":[]}),
-    )
+    Ok(serde_json::json!({"request_id":r.request_id,"tenant_id":tenant.as_str(),"source":r.source,
+        "bundle":r.bundle,"probe_nonce":r.probe_nonce,"read_budget_ms":r.read_budget_ms,"platform_probe_id":r.platform_probe_id}))
 }
-
-/// NAN-4226: event-time bounds of the landing read. The record-time filter
-/// (`metadata.processed_time >= since`) decides what counts; this window only
-/// has to contain any row the probe can produce.
-///
-/// NAN-4228: with the probe's event time the window is
-/// `[min(probe_event_time, since) - 1d, now + 1d]`. Every poll of a parser
-/// install's verify then reads only the days that can hold the probe or live
-/// traffic, not a year of the source on a large tenant. The day of slack on
-/// each side covers zone offsets and a year-less sample a parser places a
-/// little later. Without a probe time the window stays wide. Past: longer than
-/// the longest lake retention (365 days). Future: a day, for year-less sample
-/// timestamps a parser places later this year.
-const LANDING_EVENT_LOOKBACK_DAYS: i64 = 400;
-const LANDING_EVENT_LOOKAHEAD_DAYS: i64 = 1;
-const LANDING_PROBE_SLACK_DAYS: i64 = 1;
-
-fn landing_event_window(
-    now: chrono::DateTime<chrono::Utc>,
-    since: chrono::DateTime<chrono::Utc>,
-    probe_event_time: Option<chrono::DateTime<chrono::Utc>>,
-) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
-    let widest = now - chrono::Duration::days(LANDING_EVENT_LOOKBACK_DAYS);
-    let start = match probe_event_time {
-        Some(probe) => (probe.min(since) - chrono::Duration::days(LANDING_PROBE_SLACK_DAYS)).max(widest),
-        None => widest,
-    };
-    (start, now + chrono::Duration::days(LANDING_EVENT_LOOKAHEAD_DAYS))
-}
-
 #[cfg(test)]
 mod native_landing_tests {
     use super::*;
     #[test]
-    fn native_landing_is_aggregate_only_even_with_legacy_queries_disabled() {
-        let route = classify(&Method::POST, "/v1/tenants/t/landing");
-        assert_eq!(route, RouteClass::Landing);
-        assert!(permits_with(Scope::Query, route, false));
-        assert!(!permits_with(Scope::Query, RouteClass::Query, false));
-        for scope in [
-            Scope::TenantQuery,
-            Scope::TenantDetect,
-            Scope::TenantStatus,
-            Scope::AlertsRead,
-        ] {
-            assert!(!permits_with(scope, route, false));
+    fn receipt_capability_has_no_query_or_clock_and_pins_the_route_tenant() {
+        let t = TenantId::new("11111111-1111-4111-8111-111111111111").unwrap();
+        let id = uuid::Uuid::now_v7();
+        let b = serde_json::json!({"request_id":id,"source":"ops_k8s_events","bundle":"a".repeat(64),"probe_nonce":id,"read_budget_ms":5000});
+        let value = landing_receipt_payload(&t, &serde_json::to_vec(&b).unwrap()).unwrap();
+        assert_eq!(value["tenant_id"],t.as_str());
+        assert!(value.get("query").is_none() && value.get("start").is_none());
+        for (key,v) in [("since",serde_json::json!("2026-10-30T00:00:00Z")), ("tenant_id",serde_json::json!("another")),
+            ("probe_event_time",serde_json::json!("yesterday")), ("query",serde_json::json!("*")),
+            ("probe_nonce",serde_json::json!(uuid::Uuid::nil()))] {
+            let mut bad=b.clone(); bad[key]=v;
+            assert!(landing_receipt_payload(&t,&serde_json::to_vec(&bad).unwrap()).is_err(),"{key}");
         }
-        assert_eq!(
-            classify(&Method::GET, "/v1/tenants/t/landing"),
-            RouteClass::Other
-        );
+        let mut old=b; old.as_object_mut().unwrap().remove("probe_nonce");
+        assert!(landing_receipt_payload(&t,&serde_json::to_vec(&old).unwrap()).is_err());
     }
-    /// NAN-4226: the probe is the parser's published sample; its event time
-    /// is the sample's own (Aug 5 for the catalog syslog sample), long before
-    /// `since`. Landing must count it by record time, so the event window has
-    /// to contain it and the record-time floor must be `since`.
     #[test]
-    fn native_landing_counts_an_old_event_time_probe_by_record_time() {
-        let tenant = TenantId::new("9b99ce5d-0000-4000-8000-000000000000").unwrap();
-        let since = chrono::Utc::now() - chrono::Duration::minutes(5);
-        let body = serde_json::json!({"request_id":uuid::Uuid::now_v7(), "source":"syslog", "bundle":"b".repeat(64),
-            "since":since});
-        let query = landing_query(&tenant, &serde_json::to_vec(&body).unwrap()).unwrap();
-        let start = chrono::DateTime::parse_from_rfc3339(query["start"].as_str().unwrap()).unwrap();
-        let end = chrono::DateTime::parse_from_rfc3339(query["end"].as_str().unwrap()).unwrap();
-        // The probe's event time, ingested now (after `since`).
-        let probe_event_time = chrono::DateTime::parse_from_rfc3339("2026-08-05T12:00:00Z").unwrap();
-        let probe_ingested = chrono::Utc::now();
-        assert!(probe_ingested.timestamp_millis() >= since.timestamp_millis());
-        assert!(start <= probe_event_time && probe_event_time <= end,
-            "an old-event-time probe must fall inside the landing event window ({start}..{end})");
-        assert!(start <= chrono::Utc::now() - chrono::Duration::days(365), "covers the longest retention");
-        assert!(end >= chrono::Utc::now(), "covers rows stamped just now");
-        let npl = query["query"].as_str().unwrap();
-        assert!(npl.starts_with(&format!("source_type=\"syslog\" metadata.processed_time>={} |", since.timestamp_millis())),
-            "landing counts by record time from `since`: {npl}");
-        assert!(npl.ends_with("stats count() as rows, sum(pending) as n, sum(failed) as errors"));
+    fn platform_receipt_requires_exact_non_nil_allowed_identity() {
+        let t=TenantId::new("t1").unwrap(); let id=uuid::Uuid::now_v7();
+        let mut b=serde_json::json!({"request_id":id,"source":"audit","bundle":"a".repeat(64),"probe_nonce":id,"read_budget_ms":5000,"platform_probe_id":id});
+        assert!(landing_receipt_payload(&t,&serde_json::to_vec(&b).unwrap()).is_ok());
+        for source in ["syslog","otlp_logs","ops_platform_audit"] {
+            b["source"]=serde_json::json!(source);
+            assert!(landing_receipt_payload(&t,&serde_json::to_vec(&b).unwrap()).is_err());
+        }
+        b["source"]=serde_json::json!("audit"); b["platform_probe_id"]=serde_json::json!(uuid::Uuid::now_v7());
+        assert!(landing_receipt_payload(&t,&serde_json::to_vec(&b).unwrap()).is_err());
     }
-
-    /// NAN-4228: with the probe's event time the window is
-    /// `[min(probe, since) - 1d, now + 1d]`: it still holds the old-dated
-    /// probe, and it is days wide instead of 400 days.
     #[test]
-    fn native_landing_window_is_tight_when_the_probe_time_is_supplied() {
-        let tenant = TenantId::new("9b99ce5d-0000-4000-8000-000000000000").unwrap();
-        let day = chrono::Duration::days(1);
-        let since = chrono::Utc::now() - chrono::Duration::minutes(5);
-        let window = |probe: serde_json::Value| {
-            let body = serde_json::json!({"request_id":uuid::Uuid::now_v7(), "source":"syslog", "bundle":"b".repeat(64),
-                "since":since, "probe_event_time":probe});
-            let query = landing_query(&tenant, &serde_json::to_vec(&body).unwrap()).unwrap();
-            let at = |key: &str| chrono::DateTime::parse_from_rfc3339(query[key].as_str().unwrap()).unwrap().with_timezone(&chrono::Utc);
-            assert!(query["query"].as_str().unwrap().starts_with(&format!("source_type=\"syslog\" metadata.processed_time>={} |",
-                since.timestamp_millis())), "the probe time never filters rows");
-            (at("start"), at("end"))
-        };
-        // An old-dated probe (the catalog syslog sample): its day, minus one.
-        let probe = chrono::DateTime::parse_from_rfc3339("2026-08-05T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
-        let (start, end) = window(serde_json::json!(probe));
-        assert_eq!(start, probe - day);
-        assert!(start <= probe && probe <= end);
-        assert!(end >= chrono::Utc::now() && end <= chrono::Utc::now() + day + chrono::Duration::minutes(1));
-        // A probe dated now (live clock): the window is since - 1d .. now + 1d.
-        let (start, end) = window(serde_json::json!(chrono::Utc::now()));
-        assert_eq!(start, since - day);
-        assert!(end - start < chrono::Duration::days(3), "{start}..{end} is not tight");
-        // A probe dated in the future still keeps `since` (live traffic) inside.
-        let (start, _) = window(serde_json::json!(chrono::Utc::now() + chrono::Duration::hours(6)));
-        assert_eq!(start, since - day);
-        // Older than retention: never wider than the old fixed window.
-        let (start, _) = window(serde_json::json!("2020-01-01T00:00:00Z"));
-        assert!(start >= chrono::Utc::now() - chrono::Duration::days(LANDING_EVENT_LOOKBACK_DAYS) - chrono::Duration::minutes(1));
-        // An explicit null is the old body: the wide window.
-        let (start, _) = window(serde_json::Value::Null);
-        assert!(start <= chrono::Utc::now() - chrono::Duration::days(365));
-        // A malformed time is refused like any other bad field.
-        let bad = serde_json::json!({"request_id":uuid::Uuid::now_v7(), "source":"syslog", "bundle":"b".repeat(64),
-            "since":since, "probe_event_time":"yesterday"});
-        assert!(landing_query(&tenant, &serde_json::to_vec(&bad).unwrap()).is_err());
-    }
-
-    #[test]
-    fn native_landing_pins_new_tenant_and_rejects_query_injection() {
-        let tenant = TenantId::new("22222222-2222-4222-8222-222222222222").unwrap();
-        let body = serde_json::json!({"request_id":uuid::Uuid::now_v7(), "source":"new_source", "bundle":"a".repeat(64),
-            "since":chrono::Utc::now() - chrono::Duration::minutes(5)});
-        let query = landing_query(&tenant, &serde_json::to_vec(&body).unwrap()).unwrap();
-        assert_eq!(query["tenant_id"], tenant.as_str());
-        assert_eq!(query["use_cache"], false);
-        assert_eq!(query["limit"], 2);
-        assert!(query["query"]
-            .as_str()
-            .unwrap()
-            .ends_with("stats count() as rows, sum(pending) as n, sum(failed) as errors"));
-        let npl = query["query"].as_str().unwrap();
-        assert!(!npl.contains("class_uid"), "valid Base Events must not fail landing");
-        assert!(npl.contains("pending=1 AND unmapped.parse_error!=\"\""));
-        assert!(npl.contains("metadata.nano_parser_bundle_sha256=\""));
-        assert!(!npl.contains("metadata.parse_failure"));
-        for (key, value) in [
-            ("query", serde_json::json!("*")),
-            ("tenant_id", serde_json::json!("other")),
-            ("source", serde_json::json!("x\" | head 1")),
-            ("bundle", serde_json::json!("bad")),
-            (
-                "since",
-                serde_json::json!(chrono::Utc::now() - chrono::Duration::days(31)),
-            ),
-        ] {
-            let mut bad = body.clone();
-            bad[key] = value;
-            assert!(
-                landing_query(&tenant, &serde_json::to_vec(&bad).unwrap()).is_err(),
-                "{key}"
-            );
+    fn receipt_route_retains_the_cluster_query_scope_only() {
+        let route=classify(&Method::POST,"/v1/tenants/t/landing");
+        assert_eq!(route,RouteClass::Landing);
+        assert!(permits_with(Scope::Query,route,false));
+        for scope in [Scope::TenantQuery,Scope::TenantDetect,Scope::TenantStatus,Scope::AlertsRead] {
+            assert!(!permits_with(scope,route,false));
         }
     }
 }

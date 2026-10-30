@@ -220,6 +220,12 @@ export class LogSourcesApi {
     });
   }
 
+  async assignIngestSource(credentialId: string, source_slug: string, label: string): Promise<{ credential_id: string; source_slug: string; label: string }> {
+    return this.request(`/api/log-sources/ingest-credentials/${encodeURIComponent(credentialId)}/assign-source`, {
+      method: 'POST', body: JSON.stringify({ source_slug, label }),
+    });
+  }
+
   async revokeIngestCredential(credentialId: string, reason: string): Promise<IngestCredentialRevocation> {
     return this.request(`/api/log-sources/ingest-credentials/${encodeURIComponent(credentialId)}/revoke`, {
       method: 'POST',

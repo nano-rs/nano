@@ -49,6 +49,9 @@
 /benchmarks/
 /benchmarks/results/
 /benchmarks/results/soc_ir_corpus.json
+# Synthetic hunts embedded by the public native two-pass query tests.
+/benchmarks/agent-query/
+/benchmarks/agent-query/hunts.fixture.json
 /docs/
 /docs/img/***
 /docs/getting-started/

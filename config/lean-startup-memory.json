@@ -17,105 +17,170 @@
     "query": 512,
     "ingest": 205,
     "detect": 256,
-    "product": 512,
-    "maintenance": 512,
     "supervisor": 64
   },
   "services": {
     "connector-runner": {
       "guard_mib": 704,
-      "peak_bytes": 5840896,
-      "idle_rss_bytes": 12779520
+      "peak_bytes": 14036992,
+      "idle_rss_bytes": 14020608
     },
     "dragonfly": {
       "guard_mib": 427,
-      "peak_bytes": 13914112,
-      "idle_rss_bytes": 24686592
+      "peak_bytes": 29216768,
+      "idle_rss_bytes": 29077504
     },
     "lake-object-store": {
       "guard_mib": 0,
-      "peak_bytes": 124223488,
-      "idle_rss_bytes": 185110528
+      "peak_bytes": 480444416,
+      "idle_rss_bytes": 216379392,
+      "measurement": {
+        "date": "2026-10-30",
+        "release": "v1.0.16",
+        "cpus": 8,
+        "host_memory_bytes": 8335413248,
+        "uploaded_rows": 9100000,
+        "observed_seconds": 328.69765639305115,
+        "peak_metric": "process VmHWM (RSS); charged cgroup file cache is reclaimable",
+        "diagnostic_memory_limit_bytes": 2147483648,
+        "evidence_sha256": "8eaa32a2bfa0c82efbf4e6d1c164d370276a761f457fe761503d242d67c3ef2b"
+      }
     },
     "lean-audit": {
-      "guard_mib": 0,
-      "peak_bytes": 4931584,
+      "guard_mib": 20,
+      "peak_bytes": 7499776,
       "idle_rss_bytes": 9404416
     },
     "lean-audit-vector": {
-      "guard_mib": 0,
-      "peak_bytes": 14249984,
-      "idle_rss_bytes": 67788800
+      "guard_mib": 20,
+      "peak_bytes": 118575104,
+      "idle_rss_bytes": 118149120
     },
     "lean-enrichment": {
-      "guard_mib": 0,
-      "peak_bytes": 4743168,
+      "guard_mib": 20,
+      "peak_bytes": 14508032,
       "idle_rss_bytes": 14733312
     },
     "lean-job-runner": {
-      "guard_mib": 0,
-      "peak_bytes": 4935680,
+      "guard_mib": 20,
+      "peak_bytes": 14553088,
       "idle_rss_bytes": 14917632
     },
     "lean-landing": {
       "guard_mib": 1152,
-      "peak_bytes": 6365184,
+      "peak_bytes": 26279936,
       "idle_rss_bytes": 25927680
     },
     "lean-otel": {
       "guard_mib": 512,
-      "peak_bytes": 64786432,
-      "idle_rss_bytes": 217444352
+      "peak_bytes": 241405952,
+      "idle_rss_bytes": 241360896
     },
     "lean-platform-feeds": {
       "guard_mib": 0,
-      "peak_bytes": 55554048,
-      "idle_rss_bytes": 7811072
+      "peak_bytes": 107974656,
+      "idle_rss_bytes": 15568896
     },
     "lean-result-gc": {
-      "guard_mib": 0,
-      "peak_bytes": 4341760,
+      "guard_mib": 20,
+      "peak_bytes": 10182656,
       "idle_rss_bytes": 11964416
     },
     "nano-api": {
       "guard_mib": 0,
-      "peak_bytes": 82608128,
+      "peak_bytes": 138825728,
       "idle_rss_bytes": 129835008
     },
     "nano-jobs": {
       "guard_mib": 1024,
-      "peak_bytes": 107094016,
-      "idle_rss_bytes": 84336640
+      "peak_bytes": 143327232,
+      "idle_rss_bytes": 85012480
     },
     "nano-search": {
       "guard_mib": 0,
-      "peak_bytes": 16482304,
-      "idle_rss_bytes": 37568512
+      "peak_bytes": 45420544,
+      "idle_rss_bytes": 37576704
     },
     "nano-web": {
-      "guard_mib": 0,
-      "peak_bytes": 4583424,
+      "guard_mib": 20,
+      "peak_bytes": 8941568,
       "idle_rss_bytes": 9207808
     },
     "nginx": {
-      "guard_mib": 0,
-      "peak_bytes": 10711040,
-      "idle_rss_bytes": 22781952
+      "guard_mib": 52,
+      "peak_bytes": 40153088,
+      "idle_rss_bytes": 37367808
     },
     "postgres": {
       "guard_mib": 0,
-      "peak_bytes": 209960960,
-      "idle_rss_bytes": 572481536
+      "peak_bytes": 600576000,
+      "idle_rss_bytes": 597073920,
+      "measurement": {
+        "date": "2026-10-30",
+        "metric": "maximum summed process VmRSS across the fresh 8 GiB 30-minute 150/300 EPS run",
+        "peak_rss_bytes": 600576000,
+        "idle_rss_bytes": 550338560,
+        "reference": "docs-internal/NAN-4850-idle-rss-calibration.json",
+        "settings": "trial PostgreSQL settings; final floor adds 3 MiB without changing buffers or connection settings"
+      }
     },
     "tenzir": {
       "guard_mib": 0,
-      "peak_bytes": 160628736,
-      "peak_rss_bytes": 311619584
+      "peak_bytes": 370569216,
+      "peak_rss_bytes": 370569216,
+      "measurement": {
+        "date": "2026-10-30",
+        "version": "Tenzir 6.19.1 (production digest pin)",
+        "metric": "process VmHWM",
+        "startup_hwm_kib": 361884,
+        "diagnostic_memory_limit_bytes": 1073741824,
+        "source": "coordinator-authorized 09:14 EDT FINDING in SOVEREIGN-QUEUE.md",
+        "pipeline": "accept_http -> to_s3(timeout 5s)/write_parquet -> production landing -> cell",
+        "qualification": "startup calibration only; 10/10 preflight rows searchable in about 15s; separate at-rate capture pending"
+      }
     },
     "vector": {
       "guard_mib": 0,
-      "peak_bytes": 118988800,
-      "idle_rss_bytes": 166744064
+      "peak_bytes": 319455232,
+      "idle_rss_bytes": 286605312,
+      "peak_rss_bytes": 253726720,
+      "burst_cgroup_peak_bytes": 196648960
+    },
+    "lean-hec-proxy": {
+      "guard_mib": 128,
+      "peak_bytes": 19492864,
+      "burst_cgroup_peak_bytes": 8105984,
+      "idle_rss_bytes": 12980224
     }
+  },
+  "kernel_reserve_mib": 512,
+  "burst_measurement": {
+    "date": "2026-10-29",
+    "release": "v1.0.16",
+    "host": "GCP e2-standard-4, Ubuntu 24.04",
+    "shape": "10000 HEC events, 500/batch, no pacing, plus 5 JSON events",
+    "metric": "max(cgroup memory.peak, process VmHWM); feed import measured after dropping cache on the disposable VM",
+    "baseline_ingest_seconds": 1.0,
+    "baseline_searchable_seconds": 10.8,
+    "feed_bundle_bytes": 101289793,
+    "feed_payload_sha256": "0055e0790714ac2f1e264348ed295f579ae03247cf0b1d18f3c4111377df025d"
+  },
+  "inactive_cell_mib": {
+    "product": 512,
+    "maintenance": 512
+  },
+  "idle_floor_measurement": {
+    "date": "2026-10-30",
+    "physical_host_bytes": 8335413248,
+    "cpus": 8,
+    "runtime_cell_source": "185c135eedff3498a9b01ef864bc2505baa98b5f",
+    "runtime_cell_sha256": "4ee0e59b88fc4fe48e6e8487b5cf08f381ca7947e742c81d3a14b05d65bcabcd",
+    "runtime_worker_source": "8c7bfe606994b2b3e23bb2edb29d8ca3ee419f8e",
+    "peak_metric": "max of summed process VmHWM and summed VmRSS; baseline capture with original eight-worker Vector configuration",
+    "idle_window_start_utc": "2026-10-30T12:18:15+00:00",
+    "idle_window_end_utc": "2026-10-30T12:19:55+00:00",
+    "capture_end_utc": "2026-10-30T12:26:40.054601+00:00",
+    "qualification": "diagnostic baseline only; cap overrides and prior worker build; no 8 GiB fit claim",
+    "evidence_file": "docs-internal/NAN-4850-idle-rss-calibration.json"
   }
 }

@@ -171,6 +171,7 @@ mod tests {
 
     fn part() -> PartRef {
         PartRef {
+            request_hours: None,
             part_id: PartId::new(1_790_000_000_000).unwrap(), level: Level::Hour, event_hour: 497_222, event_day: None,
             rows: 1_000, min_time_us: 1_790_000_000_000_000, max_time_us: 1_790_000_100_000_000,
             schema_fingerprint: String::new(), provenance_sha256: "ab".repeat(32), merkle_root: String::new(),

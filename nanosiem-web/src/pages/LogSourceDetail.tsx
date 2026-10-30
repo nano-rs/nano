@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { Badge } from '@/components/ui/badge';
+import { receivingWithoutParser } from '@/lib/log-source-lanes';
 import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
@@ -755,6 +757,14 @@ export function LogSourceDetail() {
         <div className="min-w-0">
           {activeTab === 'overview' && (
             <div className="flex flex-col gap-3">
+              {shared && (
+                  <SourceWritersCard
+                    logSourceId={logSource.id}
+                    onRenameSource={hasPermission('log_sources:edit') ? () => { setActiveTab('config'); setIsEditingConfig(true); } : undefined}
+                    canRevoke={hasPermission('log_sources:deploy')}
+                    canIssue={hasPermission('log_sources:deploy')}
+                  />
+              )}
               <OverviewTab
                 source={logSource}
                 health={health}
@@ -769,11 +779,6 @@ export function LogSourceDetail() {
                   <LogSourceDelivery logSourceId={logSource.id} health={health} />
                   {/* NAN-3207: volume vs expected band + segments; honours ?segment=<dim>:<value>. */}
                   <LogSourceHealthPanel logSourceId={logSource.id} />
-                  <SourceWritersCard
-                    logSourceId={logSource.id}
-                    canRevoke={hasPermission('log_sources:deploy')}
-                    canIssue={hasPermission('log_sources:deploy')}
-                  />
                   <ParserSamplesEditor logSourceId={logSource.id} />
                 </div>
               )}
@@ -1065,6 +1070,10 @@ function LogSourceHero({
   onViewLogs: () => void;
   onShowDetails: () => void;
 }) {
+  const navigate = useNavigate();
+  const {hasPermission} = useAuth();
+  // The detail API loads counters separately from the registry row.
+  const receivingRaw = receivingWithoutParser(source, health ?? source.ingest);
   const transportLabel = logSourceTransportLabel(source);
   // NAN-3298: when rollouts track this source, the pill follows the version that is NOT serving yet
   // (in flight / failed / rolled back); a newest rollout carried live by a later roll needs no pill.
@@ -1118,7 +1127,7 @@ function LogSourceHero({
           )}
 
           <div className="mt-0.5 flex flex-wrap gap-1.5">
-            {source.deployed && serving.tracked ? (
+            {receivingRaw ? <Badge variant="warning">Receiving · not parsed</Badge> : source.deployed && serving.tracked ? (
               serving.servingVersion != null ? (
                 <StatusPill tone="emerald">Deployed · v{serving.servingVersion}</StatusPill>
               ) : (
@@ -1159,6 +1168,7 @@ function LogSourceHero({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {receivingRaw && !deployBlocked && hasPermission('log_sources:edit') && <Button variant="outline" size="sm" onClick={() => navigate(`/ingestion/log-sources/new?source_id=${encodeURIComponent(source.id)}&stage=parse`)}>Build parser</Button>}
           <button
             type="button"
             onClick={onToggleEnabled}
@@ -1304,6 +1314,7 @@ function DraftBanner({
   onPublish: () => void;
   onDiscard: () => void;
 }) {
+  const shared = useSharedTenant();
   if (!show) return null;
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-500/[0.06] px-3.5 py-2">
@@ -1328,16 +1339,27 @@ function DraftBanner({
           {discarding ? <LoadingIcon className="h-3.5 w-3.5" /> : <RotateCcw className="h-3.5 w-3.5" strokeWidth={1.5} />}
           Discard draft
         </Button>
-        <Button
-          size="sm"
-          className="h-7 gap-1.5 bg-amber-600 px-3 text-[11.5px] font-semibold text-white hover:bg-amber-700"
-          disabled={publishing || !validated || publishBlocked}
-          title={publishBlocked ? TENZIR_ONLY_NOTE : undefined}
-          onClick={onPublish}
-        >
-          {publishing ? <LoadingIcon className="h-3.5 w-3.5" /> : <Rocket className="h-3.5 w-3.5" strokeWidth={1.5} />}
-          Publish
-        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="inline-flex" tabIndex={publishing || !validated || publishBlocked ? 0 : undefined}>
+              <Button
+                size="sm"
+                className="h-7 gap-1.5 bg-amber-600 px-3 text-[11.5px] font-semibold text-white hover:bg-amber-700"
+                disabled={publishing || !validated || publishBlocked}
+                title={publishBlocked ? TENZIR_ONLY_NOTE : undefined}
+                onClick={onPublish}
+              >
+                {publishing ? <LoadingIcon className="h-3.5 w-3.5" /> : <Rocket className="h-3.5 w-3.5" strokeWidth={1.5} />}
+                Publish
+              </Button>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>
+            {shared
+              ? 'Make this draft live for incoming events. The current version keeps serving until the rollout completes.'
+              : 'Make this draft live for incoming events. The previous version is kept in history.'}
+          </TooltipContent>
+        </Tooltip>
       </div>
     </div>
   );
@@ -1858,10 +1880,17 @@ function ConfigurationTab({
               <Button variant="outline" size="sm" className="h-7 text-[11.5px]" onClick={onCancel}>
                 Cancel
               </Button>
-              <Button size="sm" className="h-7 text-[11.5px] gap-1.5" onClick={onSave} disabled={updating}>
-                {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
-                Save changes
-              </Button>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="inline-flex" tabIndex={updating ? 0 : undefined}>
+                    <Button size="sm" className="h-7 text-[11.5px] gap-1.5" onClick={onSave} disabled={updating}>
+                      {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
+                      Save changes
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>Save this draft. Incoming events aren't affected until you publish.</TooltipContent>
+              </Tooltip>
             </div>
           ) : (
             <Button variant="outline" size="sm" className="h-7 text-[11.5px] gap-1.5" onClick={onStartEdit}>
@@ -2207,15 +2236,22 @@ function VrlEditorTab({
           </>
         ) : isEditing ? (
           <>
-            <Button
-              size="sm"
-              className="h-7 text-[11.5px] gap-1.5"
-              onClick={onSaveVrl}
-              disabled={updating || validating}
-            >
-              {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
-              Save VRL
-            </Button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex" tabIndex={updating || validating ? 0 : undefined}>
+                  <Button
+                    size="sm"
+                    className="h-7 text-[11.5px] gap-1.5"
+                    onClick={onSaveVrl}
+                    disabled={updating || validating}
+                  >
+                    {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
+                    Save VRL
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>Save this draft. Incoming events aren't affected until you publish.</TooltipContent>
+            </Tooltip>
             <Button
               variant="outline"
               size="sm"
@@ -2582,6 +2618,7 @@ function VersionsTab({
   onPublish: () => void;
   onRequestRevert: (v: LogSourceVersion) => void;
 }) {
+  const shared = useSharedTenant();
   if (!versions || versions.length === 0) {
     return (
       <div>
@@ -2609,15 +2646,26 @@ function VersionsTab({
               {versions.length} version{versions.length === 1 ? '' : 's'}
             </span>
             {hasDraft && (
-              <Button
-                size="sm"
-                className="h-7 text-[11.5px] gap-1.5"
-                disabled={publishing || !validated}
-                onClick={onPublish}
-              >
-                {publishing ? <LoadingIcon className="w-3 h-3" /> : <Rocket className="w-3 h-3" />}
-                Publish current draft
-              </Button>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="inline-flex" tabIndex={publishing || !validated ? 0 : undefined}>
+                    <Button
+                      size="sm"
+                      className="h-7 text-[11.5px] gap-1.5"
+                      disabled={publishing || !validated}
+                      onClick={onPublish}
+                    >
+                      {publishing ? <LoadingIcon className="w-3 h-3" /> : <Rocket className="w-3 h-3" />}
+                      Publish current draft
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {shared
+                    ? 'Make this draft live for incoming events. The current version keeps serving until the rollout completes.'
+                    : 'Make this draft live for incoming events. The previous version is kept in history.'}
+                </TooltipContent>
+              </Tooltip>
             )}
           </div>
         }
@@ -3538,15 +3586,22 @@ function ExtensionTab({
           {validating ? <LoadingIcon className="w-3 h-3" /> : <Check className="w-3 h-3" />}
           Validate
         </Button>
-        <Button
-          size="sm"
-          className="h-7 text-[11.5px] gap-1.5"
-          onClick={handleSave}
-          disabled={!dirty || updating}
-        >
-          {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
-          Save
-        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="inline-flex" tabIndex={!dirty || updating ? 0 : undefined}>
+              <Button
+                size="sm"
+                className="h-7 text-[11.5px] gap-1.5"
+                onClick={handleSave}
+                disabled={!dirty || updating}
+              >
+                {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
+                Save
+              </Button>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>Save this draft. Incoming events aren't affected until you publish.</TooltipContent>
+        </Tooltip>
         {validatedJustNow && !validating && validationResult?.valid && (
           <span className="text-[10px] font-mono text-muted-foreground whitespace-nowrap ml-1">
             <span className="text-emerald-500">✓</span> Validated

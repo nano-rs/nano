@@ -31,20 +31,19 @@ use crate::parts::{uid_hash, DedupPolicy};
 
 /// Most uid hashes held, covering a 300-eps tenant's 6 h window (≈6.5M)
 /// plus late-data hours.
-pub const MAX_WINDOW_UIDS: usize = 12_000_000;
+pub const MAX_WINDOW_UIDS: usize = nanosiem_lake_cell::ingest_memory::MAX_WINDOW_UIDS;
 /// Resident bytes per held uid (a 24 B entry: the 128-bit uid hash as two
 /// u64 words plus the 64-bit payload hash, one control byte, and hashbrown's
 /// worst-case load factor just after a resize: 25 × 16/7 ≈ 57), for sizing
 /// the cap from a memory budget. Was 40 (16 B entry) before NAN-3704.
-pub const WINDOW_BYTES_PER_UID: u64 = 58;
+pub const WINDOW_BYTES_PER_UID: u64 = nanosiem_lake_cell::ingest_memory::UID_BYTES_PER_ENTRY;
 /// A cap below this would thrash a 20-eps tenant's window.
-pub const MIN_WINDOW_UIDS: usize = 500_000;
+pub const MIN_WINDOW_UIDS: usize = nanosiem_lake_cell::ingest_memory::MIN_WINDOW_UIDS;
 
 /// The window cap for a process memory budget: 30% of it, within
 /// `[MIN_WINDOW_UIDS, MAX_WINDOW_UIDS]`.
 pub fn window_cap_for(memory_bytes: u64) -> usize {
-    let uids = (memory_bytes.saturating_mul(3) / 10) / WINDOW_BYTES_PER_UID;
-    (uids as usize).clamp(MIN_WINDOW_UIDS, MAX_WINDOW_UIDS)
+    nanosiem_lake_cell::ingest_memory::uid_window_cap(memory_bytes)
 }
 
 /// Payload hash of a uid whose first row's payload is not known (loaded from
@@ -113,7 +112,7 @@ struct HourSet {
 pub struct UidWindow {
     tenant_id: String,
     policy: DedupPolicy,
-    hours: HashMap<i32, HourSet>,
+    hours: HashMap<i64, HourSet>,
     max_uids: usize,
 }
 
@@ -127,21 +126,25 @@ impl UidWindow {
     }
 
     /// True when `hour` has an exact, complete in-memory set.
-    pub fn is_complete(&self, hour: i32) -> bool {
+    pub fn is_complete(&self, hour: impl Into<i64>) -> bool {
+        let hour = hour.into();
         self.hours.get(&hour).is_some_and(|set| set.complete)
     }
 
-    pub fn has_loaded(&self, hour: i32, part_id: &str) -> bool {
+    pub fn has_loaded(&self, hour: impl Into<i64>, part_id: &str) -> bool {
+        let hour = hour.into();
         self.hours.get(&hour).is_some_and(|set| set.loaded_parts.contains(part_id))
     }
 
     /// Was the uid already committed or buffered (as far as the set knows)?
-    pub fn contains(&self, hour: i32, uid: &str) -> bool {
+    pub fn contains(&self, hour: impl Into<i64>, uid: &str) -> bool {
+        let hour = hour.into();
         self.contains_key(hour, &UidKey::of(&self.tenant_id, uid))
     }
 
     /// [`Self::contains`] for a key already hashed with [`Self::key`].
-    pub fn contains_key(&self, hour: i32, key: &UidKey) -> bool {
+    pub fn contains_key(&self, hour: impl Into<i64>, key: &UidKey) -> bool {
+        let hour = hour.into();
         self.hours.get(&hour).is_some_and(|set| set.uids.contains_key(key))
     }
 
@@ -152,11 +155,13 @@ impl UidWindow {
 
     /// Insert with an unknown payload; returns false when the uid was already
     /// in the set (its held payload hash is then left as it was).
-    pub fn insert(&mut self, hour: i32, uid: &str, now_ms: i64) -> bool {
+    pub fn insert(&mut self, hour: impl Into<i64>, uid: &str, now_ms: i64) -> bool {
+        let hour = hour.into();
         self.insert_with_payload(hour, uid, PAYLOAD_UNKNOWN, now_ms)
     }
 
-    fn insert_with_payload(&mut self, hour: i32, uid: &str, payload: u64, now_ms: i64) -> bool {
+    fn insert_with_payload(&mut self, hour: impl Into<i64>, uid: &str, payload: u64, now_ms: i64) -> bool {
+        let hour = hour.into();
         let key = UidKey::of(&self.tenant_id, uid);
         let set = self.hours.entry(hour).or_default();
         set.touched_ms = set.touched_ms.max(now_ms);
@@ -173,12 +178,14 @@ impl UidWindow {
     /// a held uid is a duplicate, classified by comparing payload hashes.
     /// Exactly the old `contains` + `insert` sequence otherwise: a duplicate
     /// does not touch the hour.
-    pub fn observe(&mut self, hour: i32, uid: &str, payload: u64, now_ms: i64) -> Seen {
+    pub fn observe(&mut self, hour: impl Into<i64>, uid: &str, payload: u64, now_ms: i64) -> Seen {
+        let hour = hour.into();
         self.observe_key(hour, UidKey::of(&self.tenant_id, uid), payload, now_ms)
     }
 
     /// [`Self::observe`] for a key already hashed with [`Self::key`].
-    pub fn observe_key(&mut self, hour: i32, key: UidKey, payload: u64, now_ms: i64) -> Seen {
+    pub fn observe_key(&mut self, hour: impl Into<i64>, key: UidKey, payload: u64, now_ms: i64) -> Seen {
+        let hour = hour.into();
         if let Some(&first) = self.hours.get(&hour).and_then(|set| set.uids.get(&key)) {
             if first == PAYLOAD_UNKNOWN || payload == PAYLOAD_UNKNOWN || first == payload {
                 return Seen::Duplicate;
@@ -192,7 +199,8 @@ impl UidWindow {
     }
 
     /// Mark whether the hour's set now reflects every live part.
-    pub fn set_complete(&mut self, hour: i32, complete: bool, now_ms: i64) {
+    pub fn set_complete(&mut self, hour: impl Into<i64>, complete: bool, now_ms: i64) {
+        let hour = hour.into();
         let set = self.hours.entry(hour).or_default();
         set.touched_ms = set.touched_ms.max(now_ms);
         set.complete = complete;
@@ -205,11 +213,12 @@ impl UidWindow {
             rows.extend(read_time_uids_in_hour(&file, Some(hour))?);
         }
         let tenant = self.tenant_id.clone();
-        let set = self.hours.entry(hour).or_default();
+        let set = self.hours.entry(i64::from(hour)).or_default();
         set.touched_ms = set.touched_ms.max(now_ms);
         set.loaded_parts.insert(part_id.to_string());
         let mut loaded = 0;
         for (_, uid) in &rows {
+            if crate::parts::request_dedup::request_hour(uid).is_some() { continue; }
             // A uid already held keeps its known payload hash.
             set.uids.entry(UidKey::of(&tenant, uid)).or_insert(PAYLOAD_UNKNOWN);
             loaded += 1;
@@ -217,9 +226,26 @@ impl UidWindow {
         Ok(loaded)
     }
 
+    /// Load only transport identities for this request hour, regardless of
+    /// the event timestamp a parser assigned. The signed part summary is the
+    /// caller's index; normal per-event-hour dedup remains unchanged.
+    pub fn load_request_part(&mut self, request_hour: i32, part_id: &str, part_dir: &Path, now_ms: i64) -> Result<()> {
+        let hour = crate::parts::request_dedup::window_hour(request_hour);
+        for file in super::writer::local_data_files(part_dir)? {
+            for (_, uid) in read_time_uids(&file)? {
+                if crate::parts::request_dedup::request_hour(&uid) == Some(request_hour) {
+                    self.insert(hour, &uid, now_ms);
+                }
+            }
+        }
+        self.load_marker(hour, part_id, now_ms);
+        Ok(())
+    }
+
     /// Record that `part_id`'s uids for `hour` are already in the set (a part
     /// this process just wrote from buffered, already-inserted uids).
-    pub fn load_marker(&mut self, hour: i32, part_id: &str, now_ms: i64) {
+    pub fn load_marker(&mut self, hour: impl Into<i64>, part_id: &str, now_ms: i64) {
+        let hour = hour.into();
         let set = self.hours.entry(hour).or_default();
         set.touched_ms = set.touched_ms.max(now_ms);
         set.loaded_parts.insert(part_id.to_string());
@@ -231,13 +257,13 @@ impl UidWindow {
     /// complete: its next late row goes back to the part blooms. Hours in
     /// `protected` (holding buffered, uncommitted rows, whose uids exist
     /// nowhere else) are never evicted.
-    pub fn evict(&mut self, now_ms: i64, protected: &BTreeSet<i32>) -> usize {
+    pub fn evict(&mut self, now_ms: i64, protected: &BTreeSet<i64>) -> usize {
         self.evict_into(now_ms, protected, &mut Vec::new())
     }
 
     /// [`Self::evict`], handing every evicted hour that covers at least one
     /// committed part to `spilled` (NAN-3703: the late-hour tier keeps it).
-    pub fn evict_into(&mut self, now_ms: i64, protected: &BTreeSet<i32>, spilled: &mut Vec<EvictedHour>) -> usize {
+    pub fn evict_into(&mut self, now_ms: i64, protected: &BTreeSet<i64>, spilled: &mut Vec<EvictedHour>) -> usize {
         let cutoff = now_ms - self.policy.exact_window_ms;
         let before = self.hours.len();
         let expired = self.hours.iter()
@@ -283,7 +309,8 @@ impl UidWindow {
 
 /// Hand an evicted hour to the late tier when it covers a committed part
 /// (an hour with no loaded part holds no committed uid).
-fn spill(hour: i32, set: HourSet, spilled: &mut Vec<EvictedHour>) {
+fn spill(hour: i64, set: HourSet, spilled: &mut Vec<EvictedHour>) {
+    let Ok(hour) = i32::try_from(hour) else { return };
     if !set.loaded_parts.is_empty() {
         spilled.push(EvictedHour { hour, uids: set.uids, parts: set.loaded_parts });
     }

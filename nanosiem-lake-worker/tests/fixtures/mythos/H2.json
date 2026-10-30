@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "profile": "ocsf",
+  "dataset": "logs",
+  "source_placeholder": "__nano_lake_source__",
+  "query_sha256": "082a0c6e2b539399dfe6228044caef2650aa3cdc559d5a639cc98654c371756f",
+  "start": "2026-09-24T07:00:00Z",
+  "end": "2026-09-25T07:01:00Z",
+  "limit": 501,
+  "table_view": false,
+  "newest_first_event_rows": false,
+  "stats_page": false,
+  "candidate_hints": [
+    {
+      "kind": "entity",
+      "source_path": "dst_endpoint.ip",
+      "value": "198.51.100.7"
+    }
+  ],
+  "required_columns": [
+    {
+      "name": "device.hostname",
+      "field_type": "string"
+    },
+    {
+      "name": "dst_endpoint.ip",
+      "field_type": "string"
+    },
+    {
+      "name": "message",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.log_source",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.uid",
+      "field_type": "string"
+    },
+    {
+      "name": "time",
+      "field_type": "timestamp"
+    }
+  ],
+  "projected_scan_columns": [
+    "device.hostname",
+    "dst_endpoint.ip",
+    "metadata.log_source",
+    "time"
+  ],
+  "sql": "WITH stage_0 AS (\n  SELECT \"device.hostname\", \"dst_endpoint.ip\", message, \"metadata.log_source\", \"metadata.uid\", time FROM __nano_lake_source__\n  WHERE time >= '2026-09-24 07:00:00.000000' AND time < '2026-09-25 07:01:00.000000'\n  AND (((\"dst_endpoint.ip\" = '198.51.100.7') AND lower(\"metadata.log_source\") != 'audit'))\n),\nstage_1 AS (\n  SELECT count() AS c, uniqExact(\"device.hostname\") AS hosts\n  FROM stage_0\n)\nSELECT * FROM stage_1 LIMIT 501 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=0, optimize_aggregation_in_order=0"
+}

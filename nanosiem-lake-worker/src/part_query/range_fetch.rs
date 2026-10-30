@@ -215,24 +215,59 @@ pub struct ColumnScope {
     whole_only: bool,
     debit: u64,
     late_materialization: bool,
+    /// Newly enabled full-event/projection shapes stay within the measured
+    /// footprint until other row-group layouts demonstrate a setup-cost win.
+    guard_two_pass_groups: bool,
+    two_pass_groups_refused: AtomicBool,
+    two_pass_warm_refused: AtomicBool,
 }
 
 impl ColumnScope {
     pub fn new(roots: BTreeSet<String>, leaves: BTreeSet<String>) -> Self {
-        Self { roots, leaves, sparse_used: AtomicBool::new(false), cold_spent: AtomicU64::new(0), whole_only: false, debit: 0, late_materialization: false }
+        Self { roots, leaves, sparse_used: AtomicBool::new(false), cold_spent: AtomicU64::new(0), whole_only: false, debit: 0, late_materialization: false,
+            guard_two_pass_groups: false, two_pass_groups_refused: AtomicBool::new(false), two_pass_warm_refused: AtomicBool::new(false) }
     }
 
     /// The scope of a whole-file rerun of this request: no ranged reads,
     /// and the cold bytes this attempt fetched count against its budget.
     pub fn rerun(&self) -> Self {
         Self { roots: BTreeSet::new(), leaves: BTreeSet::new(), sparse_used: AtomicBool::new(false),
-            cold_spent: AtomicU64::new(0), whole_only: true, debit: self.cold_spent(), late_materialization: false }
+            cold_spent: AtomicU64::new(0), whole_only: true, debit: self.cold_spent(), late_materialization: false,
+            guard_two_pass_groups: false, two_pass_groups_refused: AtomicBool::new(false), two_pass_warm_refused: AtomicBool::new(false) }
     }
 
-    pub fn late_materialization(&self) -> bool { self.late_materialization }
+    pub fn late_materialization(&self) -> bool { self.late_materialization && self.two_pass_refusal().is_none() }
+
+    /// Called with verified survivor metadata before any narrow data fetch.
+    /// 1k groups regressed H1/H10 by 69%/50%; the measured winning layout has
+    /// one 40k group per selected file. Unknown layouts keep the prior reader.
+    pub fn choose_two_pass_groups(&self, groups: impl Iterator<Item = (u64, u32)>) {
+        if self.guard_two_pass_groups && groups.into_iter().any(|(rows, groups)| groups != 1 || rows < 40_000) {
+            self.two_pass_groups_refused.store(true, Ordering::Relaxed);
+            crate::query_timing::record(|p| p.funnel.two_pass_reason = self.two_pass_refusal());
+        }
+    }
+
+    pub fn two_pass_refusal(&self) -> Option<&'static str> {
+        if self.two_pass_groups_refused.load(Ordering::Relaxed) { Some("small_or_unmeasured_row_groups") }
+        else { self.two_pass_warm_refused.load(Ordering::Relaxed).then_some("warm_row_page") }
+    }
+
+    /// Only choose before this request has fetched its first narrow source.
+    /// Its own newly cached manifests must not change the route mid-query.
+    pub fn should_choose_warm_path(&self) -> bool {
+        self.guard_two_pass_groups && self.late_materialization()
+            && !self.sparse_used() && self.cold_spent() == 0
+    }
+
+    pub fn prefer_warm_native(&self, missing_whole_bytes: u64, whole_budget: u64) {
+        if missing_whole_bytes > self.budget(whole_budget).saturating_sub(self.cold_spent()) { return }
+        self.two_pass_warm_refused.store(true, Ordering::Relaxed);
+        crate::query_timing::record(|p| p.funnel.two_pass_reason = self.two_pass_refusal());
+    }
 
     pub fn whole_only(&self) -> bool {
-        self.whole_only
+        self.whole_only || self.two_pass_refusal().is_some()
     }
 
     /// A selection's cold-byte budget under this scope.
@@ -296,6 +331,7 @@ pub fn scope_for(compiled: &CompiledQuery, field_types: &BTreeMap<String, String
         if let Some(two) = super::two_pass::plan(compiled) {
             if let Ok(mut scope) = derive_scope(&two.narrow_cursor, &schema_roots) {
                 scope.late_materialization = true;
+                scope.guard_two_pass_groups = two.guard_groups;
                 return Some(Arc::new(scope));
             }
         }
@@ -900,6 +936,49 @@ mod native;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_two_pass_shapes_decline_small_and_unmeasured_groups_before_reading() {
+        let scope = || {
+            let mut scope = ColumnScope::new(BTreeSet::new(), BTreeSet::new());
+            scope.late_materialization = true;
+            scope.guard_two_pass_groups = true;
+            scope
+        };
+        let large = scope();
+        large.choose_two_pass_groups([(40_000, 1), (40_000, 1)].into_iter());
+        assert!(large.late_materialization());
+        assert!(!large.whole_only());
+        assert!(large.should_choose_warm_path());
+        large.mark_sparse_used();
+        assert!(!large.should_choose_warm_path(), "never switch after a narrow source is leased");
+        let warm = scope();
+        warm.prefer_warm_native(10, 10);
+        assert!(warm.whole_only());
+        assert!(!warm.late_materialization());
+        assert_eq!(warm.two_pass_refusal(), Some("warm_row_page"));
+        let bounded = scope();
+        bounded.add_cold_spent(1);
+        bounded.prefer_warm_native(10, 10);
+        assert!(bounded.late_materialization(), "promotion must not reject an affordable narrow query");
+        assert!(!bounded.whole_only());
+        for layout in [(1_000, 1), (0, 0), (80_000, 2)] {
+            let small = scope();
+            small.choose_two_pass_groups([(40_000, 1), layout].into_iter());
+            assert!(!small.late_materialization());
+            assert!(small.whole_only());
+            assert_eq!(small.two_pass_refusal(), Some("small_or_unmeasured_row_groups"));
+            assert_eq!(small.cold_spent(), 0);
+            assert!(!small.sparse_used());
+            // A later selection cannot re-enable a partially fetched request.
+            small.choose_two_pass_groups([(40_000, 1)].into_iter());
+            assert!(small.whole_only());
+        }
+        let mut existing = scope();
+        existing.guard_two_pass_groups = false;
+        existing.choose_two_pass_groups([(1_000, 1)].into_iter());
+        assert!(existing.late_materialization());
+    }
     use crate::part_query::fetch::{parts_key_prefix, PartFetcher, PartFile, StoreObjectSource};
     use crate::parts::format::PartKeys;
     use crate::parts::part_log::{LocalObjectStore, ObjectStore, PartRef};

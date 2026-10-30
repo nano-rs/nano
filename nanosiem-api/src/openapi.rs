@@ -1527,12 +1527,14 @@ mod tests {
         // leak into the customer spec.
         let private = serde_json::to_value(EnterpriseSharedParserRolloutObservationApiDoc::openapi()).unwrap();
         let paths = private["paths"].as_object().unwrap();
-        assert_eq!(paths.len(), 3);
+        assert_eq!(paths.len(), 5);
         let public = build_openapi();
         for path in paths.keys() {
             assert!(["/internal/v1/enterprise-shared/lake-generations:state",
                      "/internal/v1/enterprise-shared/parser-rollouts:landing",
-                     "/internal/v1/enterprise-shared/parser-rollouts:probe"].contains(&path.as_str()), "{path}");
+                     "/internal/v1/enterprise-shared/parser-rollouts:probe",
+                     "/internal/v1/enterprise-shared/parser-rollouts:probe-key",
+                     "/internal/v1/enterprise-shared/parser-rollouts:platform-probe"].contains(&path.as_str()), "{path}");
             assert!(!public.paths.paths.contains_key(path), "{path}");
         }
         let state = &private["components"]["schemas"]["EnterpriseSharedLakeGenerationState"];
@@ -1966,6 +1968,8 @@ mod tests {
         let min_paths = min_paths + 1; // NAN-4585: /api/soar/flows/validate-search (POST).
         #[cfg(feature = "enterprise")]
         let min_paths = min_paths + 1; // NAN-4653: /api/melod/edit/turn (POST).
+        #[cfg(feature = "enterprise")]
+        let min_paths = min_paths + 1; // NAN-4847: in-place source credential assignment.
         let min_paths = min_paths + 1; // NAN-4759: /api/enrichment/platform-feeds (GET).
 
         assert!(

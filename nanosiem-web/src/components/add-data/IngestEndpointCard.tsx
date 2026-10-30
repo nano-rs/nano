@@ -14,16 +14,21 @@ const STATE_TONE: Record<string, string> = {
 export function IngestEndpointCard({
   endpoint,
   highlight,
+  protocol,
+  signal = 'log',
 }: {
   endpoint: TenantIngestEndpoint;
   /** Emphasise the row for the chosen protocol. */
   highlight?: string;
+  /** A linear onboarding step shows only the selected transport. */
+  protocol?: string;
+  signal?: string;
 }) {
   const rows: Array<{ key: string; protocol?: string; label: string; value: string }> = [
     { key: 'host', label: 'host', value: endpoint.hostname },
     { key: 'hec', protocol: 'hec', label: 'HEC', value: endpoint.hec_url },
     { key: 'nano_https', protocol: 'nano_https', label: 'HTTPS JSON', value: endpoint.nano_https_url },
-    { key: 'otlp_http', protocol: 'otlp_http', label: 'OTLP logs', value: endpoint.otlp_logs_url },
+    { key: 'otlp_http', protocol: 'otlp_http', label: signal === 'metric' ? 'OTLP metrics' : signal === 'trace' ? 'OTLP traces' : 'OTLP logs', value: signal === 'metric' ? endpoint.otlp_metrics_url : signal === 'trace' ? endpoint.otlp_traces_url : endpoint.otlp_logs_url },
   ];
   return (
     <div className="rounded-md border border-border bg-card" data-testid="ingest-endpoint-card">
@@ -40,7 +45,7 @@ export function IngestEndpointCard({
         </span>
       </div>
       <div className="divide-y divide-border/60">
-        {rows.map((r) => (
+        {rows.filter((r) => !protocol || r.protocol === protocol).map((r) => (
           <div
             key={r.key}
             className={cn(

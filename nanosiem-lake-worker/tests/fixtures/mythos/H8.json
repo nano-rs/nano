@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "profile": "ocsf",
+  "dataset": "logs",
+  "source_placeholder": "__nano_lake_source__",
+  "query_sha256": "05e49986b90271f38f79efa384710af8eb3886bf81444eae91b151f6391b6536",
+  "start": "2026-09-24T07:00:00Z",
+  "end": "2026-09-25T07:01:00Z",
+  "limit": 501,
+  "table_view": false,
+  "newest_first_event_rows": false,
+  "stats_page": false,
+  "candidate_hints": [
+    {
+      "kind": "class",
+      "value": 1007
+    }
+  ],
+  "required_columns": [
+    {
+      "name": "class_uid",
+      "field_type": "long"
+    },
+    {
+      "name": "device.hostname",
+      "field_type": "string"
+    },
+    {
+      "name": "message",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.log_source",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.uid",
+      "field_type": "string"
+    },
+    {
+      "name": "process.name",
+      "field_type": "string"
+    },
+    {
+      "name": "time",
+      "field_type": "timestamp"
+    }
+  ],
+  "projected_scan_columns": [
+    "class_uid",
+    "device.hostname",
+    "metadata.log_source",
+    "process.name",
+    "time"
+  ],
+  "sql": "WITH stage_0 AS (\n  SELECT class_uid, \"device.hostname\", message, \"metadata.log_source\", \"metadata.uid\", \"process.name\", time FROM __nano_lake_source__\n  WHERE time >= '2026-09-24 07:00:00.000000' AND time < '2026-09-25 07:01:00.000000'\n  AND (((class_uid = 1007) AND lower(\"metadata.log_source\") != 'audit'))\n),\nstage_1 AS (\n  SELECT \"process.name\" AS \"process.name\", uniqExact(\"device.hostname\") AS h\n  FROM stage_0\n  GROUP BY \"process.name\"\n),\nstage_2 AS (\n  SELECT * FROM stage_1\n  WHERE h < 50\n),\nstage_3 AS (\n  SELECT * FROM stage_2\n  ORDER BY h ASC, \"process.name\" ASC\n),\nstage_4 AS (\n  SELECT * FROM stage_3\n  LIMIT 20\n)\nSELECT * FROM stage_4 LIMIT 501 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=0, optimize_aggregation_in_order=0"
+}

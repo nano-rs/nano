@@ -28,6 +28,15 @@ fn usage() -> ! {
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("hec-openapi") => {
+            use utoipa::OpenApi;
+            println!("{}", nanosiem_lake_cell::hec_proxy::HecProxyApiDoc::openapi().to_pretty_json()?);
+            Ok(())
+        }
+        Some("hec-proxy") => {
+            tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                .block_on(nanosiem_lake_cell::hec_proxy::serve())
+        }
         Some("features") => {
             // Read by the image build into the nanosiem.io/cell-features label.
             println!("{}", nanosiem_lake_cell::features::label());

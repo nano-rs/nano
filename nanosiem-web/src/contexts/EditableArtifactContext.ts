@@ -16,13 +16,61 @@
 //
 // pivt never saves or activates through this: `apply` changes the editor's
 // unsaved state only.
+import { diffArrays } from 'diff';
 import { useEffect, useRef, useSyncExternalStore } from 'react';
 
 /** Kinds with a server edit-session adapter (`EditArtifactKind`). */
-export type EditableArtifactKind = 'flow';
+export type EditableArtifactKind = 'flow' | 'parser';
+
+export interface EditableProposal {
+  document: unknown;
+  reply: string;
+  changed: string[];
+  facts: Array<{label:string;value:string}>;
+  carried_findings: string[];
+  repaired: boolean;
+}
+
+/** Conservative three-way merge: disjoint edits rebase; overlapping edits require review. */
+export function rebaseVrlPatch(before: string, current: string, proposed: string): string {
+  if (before === current) return proposed;
+  const base = before.split('\n');
+  const changes = (text: string) => {
+    const edits: Array<{start:number;end:number;insert:string[]}> = [];
+    let position = 0;
+    let pending: typeof edits[number] | null = null;
+    for (const change of diffArrays(base, text.split('\n'))) {
+      if (!change.added && !change.removed) { if (pending) edits.push(pending); pending=null; position+=change.count ?? change.value.length; continue; }
+      pending ??= {start:position,end:position,insert:[]};
+      if (change.removed) { position+=change.count ?? change.value.length; pending.end=position; }
+      else pending.insert.push(...change.value);
+    }
+    if (pending) edits.push(pending);
+    return edits;
+  };
+  const manual = changes(current);
+  const proposal = changes(proposed);
+  for (const patch of proposal) for (const edit of manual) {
+    const overlaps = patch.start === patch.end || edit.start === edit.end
+      ? Math.max(patch.start,edit.start) <= Math.min(patch.end,edit.end)
+      : Math.max(patch.start,edit.start) < Math.min(patch.end,edit.end);
+    if (overlaps) throw new Error('These VRL lines changed after the proposal. Ask pivt again to use your latest edits.');
+  }
+  const result = current.split('\n');
+  for (const patch of proposal.reverse()) {
+    const offset = manual.filter(edit=>edit.end<=patch.start).reduce((sum,edit)=>sum+edit.insert.length-(edit.end-edit.start),0);
+    result.splice(patch.start+offset,patch.end-patch.start,...patch.insert);
+  }
+  return result.join('\n');
+}
 
 export interface EditableArtifact<TDoc = unknown> {
   kind: EditableArtifactKind;
+  /** Refresh panel context and the single suggestion when the live buffer changes. */
+  revision?: string;
+  suggestion?: () => {label:string;run:string} | null;
+  propose?: (instruction:string, signal:AbortSignal, progress:(message:string)=>void) => Promise<EditableProposal>;
+  invoke?: (action:'get_more_samples' | 'run_tests', args:{n?:number;filter?:string}, signal:AbortSignal) => Promise<string>;
   id: string;
   /** Stored version the page loaded; the server refuses edits on a stale one. */
   version: number;
@@ -80,13 +128,17 @@ export function useRegisterEditableArtifact<TDoc>(artifact: EditableArtifact<TDo
   const latest = useRef(artifact);
   latest.current = artifact;
   const key = artifact
-    ? JSON.stringify([artifact.kind, artifact.id, artifact.version, artifact.name, artifact.noun])
+    ? JSON.stringify([artifact.kind, artifact.id, artifact.version, artifact.name, artifact.noun, artifact.revision])
     : null;
   useEffect(() => {
     const a = latest.current;
     if (!a || key === null) return;
     const registered: EditableArtifact = {
       kind: a.kind,
+      revision: a.revision,
+      suggestion: () => latest.current?.suggestion?.() ?? null,
+      propose: a.propose ? (instruction, signal, progress) => (latest.current ?? a).propose!(instruction, signal, progress) : undefined,
+      invoke: a.invoke ? (action, args, signal) => (latest.current ?? a).invoke!(action, args, signal) : undefined,
       id: a.id,
       version: a.version,
       name: a.name,

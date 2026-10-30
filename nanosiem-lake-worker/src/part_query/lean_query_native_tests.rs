@@ -27,6 +27,14 @@ use std::sync::Arc;
 #[path = "native_scan_native_tests.rs"]
 mod native_scan;
 
+#[path = "two_pass_ocsf_native_tests.rs"]
+mod two_pass_ocsf;
+
+// Historical hosted parser outputs and their fixture stay in the private edition.
+#[cfg(feature = "enterprise")]
+#[path = "landing_receipts_hosted_tests.rs"]
+mod landing_receipts_hosted;
+
 pub(crate) const TENANT: &str = "7a3c1e5b-2d4f-4b6a-8c9e-0f1a2b3c4d5e";
 pub(crate) const ROWS: usize = 900;
 const HASH: &str = "14e0857b37f6c5e5e90bab786a4db8fceb4166afe75e617519d942656976481e";
@@ -120,6 +128,10 @@ async fn ingest_batches(root: &std::path::Path, now: DateTime<Utc>, batches: Vec
 }
 
 async fn ingest_batches_with_merges(root: &std::path::Path, now: DateTime<Utc>, batches: Vec<Vec<Value>>, merge: bool) {
+    ingest_batches_with_probe_key(root, now, batches, merge, None).await;
+}
+async fn ingest_batches_with_probe_key(root: &std::path::Path, now: DateTime<Utc>, batches: Vec<Vec<Value>>, merge: bool,
+    key: Option<nanosiem_core::platform_probe::PlatformProbeKey>) -> crate::part_ingest::landing_receipts::Receipts {
     let parts = LocalObjectStore::new(root.join("parts")).unwrap();
     let sources_dir = root.join("sources");
     std::fs::create_dir_all(sources_dir.join("bronze")).unwrap();
@@ -128,6 +140,7 @@ async fn ingest_batches_with_merges(root: &std::path::Path, now: DateTime<Utc>, 
     let signer = signer();
     let mut config = IngestConfig::new(TENANT, root.join("work"));
     config.flush_interval_override_ms = Some(1_000);
+    *config.platform_probe_key.write().unwrap() = key;
     if !merge { config.max_merges_per_tick = 0; }
     let now_ms = now.timestamp_millis();
     let mut ingestor = Ingestor::open(config, &parts, &sources, &spool as &dyn NoticeQueue, &signer, signer.trusted(),
@@ -142,6 +155,7 @@ async fn ingest_batches_with_merges(root: &std::path::Path, now: DateTime<Utc>, 
         ingestor.tick(at + 1_000).await.expect("ingest admits");
         ingestor.flush_now(at + 5_000).await.expect("ingest flushes");
     }
+    ingestor.landing_receipts.clone()
 }
 
 pub(crate) async fn engine(root: &std::path::Path) -> PartQueryEngine {
@@ -997,6 +1011,9 @@ async fn raw_identity_equality_and_dotless_host_hint_match_where_and_truth() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
 async fn full_event_needle_locator_matches_one_pass_rows_order_and_cursor_pages() {
+    // Exercise the locator fallback explicitly; eligible full-event pages
+    // otherwise prefer authenticated two-pass materialization.
+    std::env::set_var("NANO_LAKE_TWO_PASS", "0");
     std::env::set_var("NANO_LAKE_PART_RESULT_CACHE", "1");
     let root = tempfile::tempdir().unwrap();
     let now = Utc::now();
@@ -1070,6 +1087,7 @@ async fn full_event_needle_locator_matches_one_pass_rows_order_and_cursor_pages(
     assert_eq!(located["result"]["rows"], one["result"]["rows"], "rows equal the one-pass read");
     assert_eq!(located["result"]["page_has_more"], one["result"]["page_has_more"]);
     assert!(ordered(located["result"]["rows"].as_array().unwrap()).is_empty(), "{located}");
+    std::env::remove_var("NANO_LAKE_TWO_PASS");
 }
 
 /// NAN-4295 (F22, second half): `stats count by <array leaf>` groups by
@@ -1159,4 +1177,46 @@ async fn stats_by_array_field_counts_each_element() {
     let got = rows(&engine, "* | stats count by metadata.log_source, privileges", now, false).await;
     let total: u64 = got.iter().map(|row| row["count"].as_u64().or_else(|| row["count"].as_str().and_then(|s| s.parse().ok())).unwrap()).sum();
     assert_eq!(total, privileges.values().sum::<u64>(), "{got:?}");
+}
+
+/// Real admission, signed parts, compiler and query engine: a sealed probe is
+/// searchable, while the production detection predicate excludes it before stats.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires native chDB and the nPL compiler artifacts"]
+async fn platform_probe_lands_but_cannot_contribute_to_detection_or_risk() {
+    use nanosiem_core::platform_probe::{PlatformProbe, PlatformProbeKey};
+    use nanosiem_core::query::{parse_query, PrettyPrint};
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let signing = ed25519_dalek::SigningKey::from_bytes(&[86;32]);
+    let mut probe = PlatformProbe { tenant_id: TENANT.parse().unwrap(), roll_id: uuid::Uuid::from_u128(20),
+        probe_id: uuid::Uuid::from_u128(21), source_slug:"audit".into(), parser_bundle_sha256:"a".repeat(64),
+        issued_at_ms:now.timestamp_millis(), expires_at_ms:now.timestamp_millis()+900_000, signature_hex:String::new() };
+    probe.sign(&signing);
+    let signed = probe.event();
+    let mut forged = signed.clone();
+    let mut unsigned = probe.clone(); unsigned.probe_id=uuid::Uuid::from_u128(22); unsigned.signature_hex.clear();
+    forged["metadata"]["uid"]=json!(unsigned.probe_id);
+    forged["unmapped"]["nano_platform_probe"]=json!(serde_json::to_string(&unsigned).unwrap());
+    forged["unmapped"]["nano_platform_probe_trusted"]=json!("v1");
+    let mut normal=event(42,&now.to_rfc3339(),false);
+    normal["metadata"]["log_source"]=json!("audit");
+    normal["time"]=json!(now.timestamp_millis());
+    let key=PlatformProbeKey {tenant_id:probe.tenant_id,public_key_hex:hex::encode(signing.verifying_key().to_bytes())};
+    ingest_batches_with_probe_key(root.path(),now,vec![vec![signed,forged,normal]],false,Some(key)).await;
+    let engine=engine(root.path()).await;
+    let mut raw=request("* | stats count() as n",now,false); raw.deny_source_types.clear();
+    let result=engine.broad_npl(&raw).await.unwrap();
+    assert_eq!(result["result"]["rows"][0]["n"].as_u64().or_else(||result["result"]["rows"][0]["n"].as_str().and_then(|s|s.parse().ok())),Some(2));
+    let rule=parse_query("* | stats count() as n").unwrap();
+    raw.query=nanosiem_core::detection::query_enrichment::exclude_platform_probes(&rule).pretty_print();
+    let result=engine.broad_npl(&raw).await.unwrap();
+    assert_eq!(result["result"]["rows"][0]["n"].as_u64().or_else(||result["result"]["rows"][0]["n"].as_str().and_then(|s|s.parse().ok())),Some(1));
+    let rule=parse_query(&format!("metadata.uid=\"{}\" | stats count() as n | where n>0",probe.probe_id)).unwrap();
+    raw.query=nanosiem_core::detection::query_enrichment::exclude_platform_probes(&rule).pretty_print();
+    let result=engine.broad_npl(&raw).await.unwrap();
+    assert!(result["result"]["rows"].as_array().unwrap().is_empty(),"no match can reach alert or risk finding creation");
+    raw.query=format!("metadata.uid=\"{}\"",probe.probe_id);
+    let result=engine.broad_npl(&raw).await.unwrap();
+    assert_eq!(result["result"]["rows"].as_array().unwrap().len(),1,"ordinary search retains the probe");
 }

@@ -1735,32 +1735,28 @@ async fn run_cell_claim(
             request = request.header(nanosiem_lake_cell::tenant_token::JOB_SIGNATURE_HEADER, signature);
         }
         let request = request.send();
-        tokio::pin!(request);
-        let response = loop {
-            tokio::select! {
-                response = &mut request => match response {
-                    Ok(response) => break response,
-                    Err(error) => {
-                        cancel_cell_attempt(&client, route, &spec).await;
-                        return Err(error.into());
-                    }
-                },
-                _ = heartbeat.tick() => {
-                    let renewed = store.renew(claim, arguments.lease).await;
-                    let authorized = if matches!(&renewed, Ok(true)) {
-                        validate_claim_authority(store, arguments, authority_validator, claim).await
-                    } else { Ok(false) };
-                    if !matches!((&renewed, &authorized), (Ok(true), Ok(true))) {
-                        cancel_cell_attempt(&client, route, &spec).await;
-                        renewed?;
-                        authorized?;
-                        return Ok(ClaimOutcome::Finished);
-                    }
+        use nanosiem_core::search::job_runner_store::{await_fenced_execution, FencedExecution};
+        let response = await_fenced_execution(
+            async { request.await.map_err(anyhow::Error::from) },
+            &mut heartbeat,
+            || async {
+                if !store.renew(claim, arguments.lease).await? {
+                    return Ok(false);
                 }
-                _ = control.signalled() => {
-                    cancel_cell_attempt(&client, route, &spec).await;
-                    return Ok(ClaimOutcome::DrainInterrupted);
-                }
+                validate_claim_authority(store, arguments, authority_validator, claim).await
+            },
+            async { control.signalled().await; },
+        ).await;
+        let response = match response {
+            Ok(FencedExecution::Completed(response)) => response,
+            outcome => {
+                cancel_cell_attempt(&client, route, &spec).await;
+                return match outcome {
+                    Ok(FencedExecution::LeaseLost) => Ok(ClaimOutcome::Finished),
+                    Ok(FencedExecution::Stopped) => Ok(ClaimOutcome::DrainInterrupted),
+                    Err(error) => Err(error),
+                    Ok(FencedExecution::Completed(_)) => unreachable!(),
+                };
             }
         };
         if response.status().is_success() {
@@ -1876,10 +1872,21 @@ async fn run_cell_claim(
         page_rows: artifact.page_rows,
         retention_proof,
     };
-    if !store.progress(claim, &SearchJobProgress {
+    let publishing = store.progress(claim, &SearchJobProgress {
         phase: Some("publishing_result".into()), attempt: Some(claim.attempt),
         rows_scanned: result.rows, rows_total: result.rows, percent: 100, elapsed_ms: 0,
-    }).await? {
+    }).await;
+    let publishing = match publishing {
+        // Progress is advisory and is never replayed. If its acknowledgement
+        // is lost, recover the fence with renew, then check current authority
+        // before publishing the already-produced result exactly once.
+        Err(DurableJobStoreError::Unavailable(_)) => {
+            store.renew(claim, arguments.lease).await?
+                && validate_claim_authority(store, arguments, authority_validator, claim).await?
+        }
+        other => other?,
+    };
+    if !publishing {
         cancel_cell_attempt(&client, route, &spec).await;
         return Ok(ClaimOutcome::Finished);
     }
@@ -3242,6 +3249,10 @@ mod rolling_drain_tests {
         inner: nanosiem_core::search::InMemoryJobStore,
         release: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
         fail: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
+        renew: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
+        progress: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
+        renewal_delay: Duration,
+        renewal_started: std::sync::Arc<tokio::sync::Notify>,
         /// "release" or "fail:<retryable>:<error>" per store call, in order.
         calls: std::sync::Mutex<Vec<String>>,
     }
@@ -3328,6 +3339,26 @@ mod rolling_drain_tests {
             self.calls.lock().unwrap().push(format!("fail:{retryable}:{promote}{error}"));
             self.fail.lock().unwrap().pop_front().unwrap_or(Scripted::Changed(true)).result()
         }
+        async fn renew_durable_lease(
+            &self, _job_id: &str, _owner: &str, _attempt: u32, _fence: u64, _lease: Duration,
+        ) -> std::result::Result<bool, DurableJobStoreError> {
+            self.calls.lock().unwrap().push("renew".into());
+            self.renewal_started.notify_one();
+            tokio::time::sleep(self.renewal_delay).await;
+            self.renew.lock().unwrap().pop_front().unwrap_or(Scripted::Changed(true)).result()
+        }
+        async fn update_durable_progress(
+            &self, _job_id: &str, _owner: &str, _attempt: u32, _fence: u64, progress: &SearchJobProgress,
+        ) -> std::result::Result<bool, DurableJobStoreError> {
+            self.calls.lock().unwrap().push(format!("progress:{}", progress.phase.as_deref().unwrap_or_default()));
+            self.progress.lock().unwrap().pop_front().unwrap_or(Scripted::Changed(true)).result()
+        }
+        async fn complete_durable(
+            &self, _job_id: &str, _owner: &str, _attempt: u32, _fence: u64, result: &SearchJobResultRef,
+        ) -> std::result::Result<bool, DurableJobStoreError> {
+            self.calls.lock().unwrap().push(format!("complete:{}", result.manifest_sha256));
+            Ok(true)
+        }
         async fn release_durable_claim(
             &self,
             _job_id: &str,
@@ -3390,6 +3421,97 @@ mod rolling_drain_tests {
 
     fn settle_arguments(directory: &tempfile::TempDir) -> Arguments {
         redis_arguments(directory, "redis://127.0.0.1:6379")
+    }
+
+    // Exercise run_cell_claim itself, including its real HTTP dispatch and
+    // cancellation, rather than just the shared wait-loop helper. The core
+    // tests separately exercise actual hosted HTTP reset/replay semantics.
+    async fn rollout_cell_attempt(store: &ScriptedStore, execution_delay: Duration) -> (Vec<String>, usize, usize) {
+        use axum::{routing::post, Json, Router};
+        let directory = tempfile::tempdir().unwrap();
+        let mut arguments = settle_arguments(&directory);
+        arguments.lease = Duration::from_secs(6);
+        store.small.store(true, Ordering::SeqCst);
+        let claim = store.runner_claim().await;
+        let manifest = nanosiem_lake_worker::job::expected_manifest_uri(
+            &arguments.result_root, &arguments.tenant_id, &claim.job_id, "attempt-1-fence-1",
+        );
+        let dispatched = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/tenants/{tenant}/query/v1/jobs/search", post({
+                let dispatched = dispatched.clone();
+                let renewal_started = store.renewal_started.clone();
+                move || {
+                    let dispatched = dispatched.clone();
+                    let manifest = manifest.clone();
+                    let renewal_started = renewal_started.clone();
+                    async move {
+                        dispatched.fetch_add(1, Ordering::SeqCst);
+                        if !execution_delay.is_zero() { renewal_started.notified().await; }
+                        tokio::time::sleep(execution_delay).await;
+                        Json(serde_json::json!({"ok":true,"result":{
+                            "manifest_uri":manifest,"manifest_sha256":"a".repeat(64),
+                            "rows":37,"parts":1,"has_more":false,"page_rows":100,
+                        }}))
+                    }
+                }
+            }))
+            .route("/v1/tenants/{tenant}/query/v1/jobs/search/cancel", post({
+                let cancelled = cancelled.clone();
+                move || { let cancelled = cancelled.clone(); async move {
+                    cancelled.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({"ok":true}))
+                }}
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let token = directory.path().join("router-token");
+        std::fs::write(&token, "r".repeat(48)).unwrap();
+        let route = LakeCellRoute {
+            tenant_id: Uuid::parse_str(&arguments.tenant_id).unwrap(),
+            assignment_generation: 1, part_log_writer_epoch: 1, worker_revision: 1,
+            assignment_fenced: false, query_base_url: format!("{origin}/v1/tenants/{}/query", arguments.tenant_id),
+            cell_origin: origin, router_token_file: token,
+        };
+        let control = RunnerControl::new(Duration::from_secs(45), Duration::from_secs(60));
+        let outcome = tokio::time::timeout(Duration::from_secs(10), run_cell_claim(
+            store, &arguments, &claim, None, &control, &route,
+        )).await.unwrap().unwrap();
+        assert!(matches!(outcome, ClaimOutcome::Finished));
+        server.abort();
+        (store.take_calls(), dispatched.load(Ordering::SeqCst), cancelled.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn coordinator_rollout_keeps_the_cell_attempt_during_recovery_and_cancels_real_loss() {
+        for valid in [true, false] {
+            let store = ScriptedStore { renewal_delay: Duration::from_millis(250), ..Default::default() };
+            store.renew.lock().unwrap().push_back(Scripted::Changed(valid));
+            let (calls, dispatched, cancelled) = rollout_cell_attempt(&store, Duration::from_millis(100)).await;
+            assert_eq!(dispatched, 1);
+            assert_eq!(cancelled, usize::from(!valid));
+            assert!(calls.contains(&"renew".into()));
+            assert_eq!(calls.iter().filter(|v| v.starts_with("complete:")).count(), usize::from(valid));
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_rollout_lost_publication_progress_recovers_fence_without_replaying_progress() {
+        for renewed in [true, false] {
+            let store = ScriptedStore::default();
+            store.progress.lock().unwrap().extend([Scripted::Changed(true), Scripted::Unavailable]);
+            store.renew.lock().unwrap().push_back(Scripted::Changed(renewed));
+            let (calls, dispatched, cancelled) = rollout_cell_attempt(&store, Duration::ZERO).await;
+            assert_eq!(dispatched, 1);
+            assert_eq!(cancelled, usize::from(!renewed));
+            assert_eq!(calls, if renewed {
+                vec!["progress:scanning".into(), "progress:publishing_result".into(), "renew".into(), format!("complete:{}", "a".repeat(64))]
+            } else {
+                vec!["progress:scanning".into(), "progress:publishing_result".into(), "renew".into()]
+            });
+        }
     }
 
     /// NAN-3911: a memory-limit or scan-capacity refusal fails the job once,

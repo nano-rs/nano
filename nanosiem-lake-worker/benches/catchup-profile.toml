@@ -1,0 +1,33 @@
+# Explicit benchmark-only overrides. Normal dev/test profiles are unchanged.
+# Optimize the hot ingest/Arrow/Parquet path while reusing the farm's other
+# warm test dependencies. Benchmark children have a four-core cgroup quota.
+[profile.test.package.nanosiem-core]
+opt-level = 2
+[profile.test.package.nanosiem-lake-worker]
+opt-level = 2
+[profile.test.package.serde_json]
+opt-level = 3
+[profile.test.package.parquet]
+opt-level = 3
+[profile.test.package.arrow-json]
+opt-level = 3
+[profile.test.package.arrow-array]
+opt-level = 3
+[profile.test.package.arrow-select]
+opt-level = 3
+[profile.test.package.arrow-buffer]
+opt-level = 3
+[profile.test.package.arrow-data]
+opt-level = 3
+[profile.test.package.arrow-schema]
+opt-level = 3
+[profile.test.package.arrow-ord]
+opt-level = 3
+[profile.test.package.arrow-cast]
+opt-level = 3
+[profile.test.package.arrow-string]
+opt-level = 3
+[profile.test.package.arrow-ipc]
+opt-level = 3
+[profile.test.package.regex-automata]
+opt-level = 3

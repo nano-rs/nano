@@ -728,8 +728,7 @@ services:
       # interface address) only on a network where unauthenticated ingest is
       # acceptable; authenticated senders use /ingest or HEC.
       - "${NANO_VECTOR_NATIVE_BIND_ADDRESS:-127.0.0.1}:6000:6000"
-      # Splunk HEC
-      - "8088:8088"
+      # HEC is published by lean-hec-proxy after durable acknowledgement.
       # OTLP HTTP/gRPC have no native credential gate. Do not publish either
       # port, even on loopback: remote OTLP uses the authenticated /otlp edge.
       # Fluent Forward (no source by default; unauthenticated if you add one):
@@ -938,7 +937,7 @@ services:
       NANO_OTEL_LAKE_QUERY_TOKEN_FILE: ${NANO_OTEL_LAKE_QUERY_TOKEN_FILE:-/var/lib/nano-lake/config/otel-query-token}
       NANO_LAKE_ENRICHMENT_COORDINATOR_URL: http://${NANO_LAKE_ENRICHMENT_HOST:-lake-enrichment-coordinator}:3016
       NANO_LAKE_ENRICHMENT_COORDINATOR_TOKEN_FILE: ${NANO_LAKE_ENRICHMENT_COORDINATOR_TOKEN_FILE:-/var/lib/nano-lake/config/enrichment-token}
-      CONNECTOR_INGEST_URL: http://vector:8088/services/collector/event
+      CONNECTOR_INGEST_URL: http://lean-hec-proxy:8088/services/collector/event
       VECTOR_ENRICHMENT_INGEST_URL: http://vector:8090/
       VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN}
       # NAN-3844: `none` (install.sh --tenzir) = no Vector. The API reports
@@ -1100,7 +1099,7 @@ services:
       NANO_IPINFO_MMDB_PATH: /var/lib/nano-enrichment/ipinfo_lite.mmdb
       PLATFORM_BUNDLE_DIR: /var/lib/nano-platform-feeds/bundles
       NANO_LAKE_SINK_STATIC_AUTH: ${NANO_LAKE_SINK_STATIC_AUTH:-true}
-      CONNECTOR_INGEST_URL: http://vector:8088/services/collector/event
+      CONNECTOR_INGEST_URL: http://lean-hec-proxy:8088/services/collector/event
       VECTOR_ENRICHMENT_INGEST_URL: http://vector:8090/
       VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN}
       # NAN-3844: same ingest mode as nano-api (shared AppState).
@@ -1506,6 +1505,20 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
+
+  lean-hec-proxy:
+    profiles: ["${NANO_VECTOR_PROFILE:-lean}"]
+    image: *cell-image
+    restart: unless-stopped
+    logging: *default-logging
+    entrypoint: ["nanosiem-lake-cell", "hec-proxy"]
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    user: "999:999"
+    ports: ["8088:8088"]
+    depends_on:
+      vector: {condition: service_healthy}
 
   lean-otel:
     profiles: ["lean"]

@@ -149,6 +149,7 @@ mod tests {
 
     fn part(level: Level, hour: i32, created_ms: i64) -> PartRef {
         PartRef {
+            request_hours: None,
             part_id: PartId::new(created_ms).unwrap(),
             level,
             event_hour: hour,

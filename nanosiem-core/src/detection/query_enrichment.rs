@@ -922,3 +922,83 @@ mod tests {
         );
     }
 }
+
+/// Apply the system exclusion at the raw search leaf, before stats, joins,
+/// projections or query-authored risk commands can turn probes into findings.
+/// Interactive search does not call this function: probes stay searchable.
+pub fn exclude_platform_probes(query: &Query) -> Query {
+    exclude_platform_probes_for_dataset(query,crate::query::Dataset::Logs)
+}
+
+pub fn exclude_platform_probes_for_dataset(query: &Query, dataset:crate::query::Dataset) -> Query {
+    match query {
+        Query::Search(expression) => {
+            let expression=exclude_probe_subsearches(expression,dataset);
+            if dataset!=crate::query::Dataset::Logs {return Query::Search(expression)}
+            let Query::Search(guard) = crate::query::parse_query(
+                "isnull(unmapped.nano_platform_probe_trusted) OR unmapped.nano_platform_probe_trusted!=\"v1\"")
+                .expect("fixed system probe predicate") else { unreachable!() };
+            Query::Search(crate::query::SearchExpr::And(Box::new(expression), Box::new(guard)))
+        }
+        Query::Piped { source, command } => {
+            let mut command = command.clone();
+            match &mut command {
+                Command::Append { subsearch, .. } => **subsearch = exclude_platform_probes_for_dataset(subsearch,dataset),
+                Command::Join { subsearch, subsearch_dataset, .. } =>
+                    **subsearch = exclude_platform_probes_for_dataset(subsearch,subsearch_dataset.unwrap_or(dataset)),
+                Command::Where { condition } => *condition = exclude_probe_subsearches(condition,dataset),
+                Command::Transaction { startswith, endswith, .. } => {
+                    if let Some(e)=startswith { *e=exclude_probe_subsearches(e,dataset); }
+                    if let Some(e)=endswith { *e=exclude_probe_subsearches(e,dataset); }
+                },
+                Command::Sequence { conditions, .. } => for e in conditions {*e=exclude_probe_subsearches(e,dataset);},
+                Command::Funnel { steps, .. } => for (_,e) in steps {*e=exclude_probe_subsearches(e,dataset);},
+                _ => {},
+            }
+            Query::Piped { source: Box::new(exclude_platform_probes_for_dataset(source,dataset)), command }
+        },
+    }
+}
+
+#[cfg(test)]
+mod platform_probe_tests {
+    use super::*;
+    use crate::query::{parse_query, PrettyPrint};
+    #[test]
+    fn cross_dataset_joins_guard_the_log_side_only() {
+        for text in ["* | join trace_id [dataset=logs search *]",
+            "trace_id IN [dataset=logs * | return trace_id]"] {
+            let query=parse_query(text).unwrap();
+            let output=exclude_platform_probes_for_dataset(&query,crate::query::Dataset::Spans).pretty_print();
+            assert_eq!(output.matches("isnull(unmapped.nano_platform_probe_trusted)").count(),1,"{output}");
+        }
+        let query=parse_query("trace_id IN [dataset=spans * | return trace_id]").unwrap();
+        let output=exclude_platform_probes_for_dataset(&query,crate::query::Dataset::Logs).pretty_print();
+        assert_eq!(output.matches("isnull(unmapped.nano_platform_probe_trusted)").count(),1,"{output}");
+        assert!(!exclude_platform_probes_for_dataset(&parse_query("*").unwrap(),crate::query::Dataset::Spans)
+            .pretty_print().contains("nano_platform_probe"));
+    }
+
+    #[test]
+    fn excludes_at_leaf_before_aggregate_and_risk() {
+        for text in ["*", "* | stats count by user", "* | eval x=1 | stats count"] {
+            let parsed = parse_query(text).unwrap();
+            let output = exclude_platform_probes(&parsed).pretty_print();
+            assert!(output.contains("nano_platform_probe_trusted"));
+            if output.contains('|') { assert!(output.find("nano_platform_probe_trusted").unwrap() < output.find('|').unwrap()); }
+        }
+    }
+}
+
+fn exclude_probe_subsearches(expression: &crate::query::SearchExpr, dataset:crate::query::Dataset) -> crate::query::SearchExpr {
+    use crate::query::SearchExpr;
+    let mut expression = expression.clone();
+    match &mut expression {
+        SearchExpr::InSubsearch { subsearch, subsearch_dataset, .. } =>
+            **subsearch = exclude_platform_probes_for_dataset(subsearch,subsearch_dataset.unwrap_or(dataset)),
+        SearchExpr::And(a,b) | SearchExpr::Or(a,b) => { **a=exclude_probe_subsearches(a,dataset); **b=exclude_probe_subsearches(b,dataset); },
+        SearchExpr::Not(e) | SearchExpr::Group(e) => **e=exclude_probe_subsearches(e,dataset),
+        _ => {},
+    }
+    expression
+}

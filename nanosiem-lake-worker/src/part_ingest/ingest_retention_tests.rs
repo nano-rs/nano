@@ -64,6 +64,7 @@ fn exchange(pass: &CellSanctionedPartGc, gate: &ExchangedGrantAuthority, route: 
 /// rows span `min_ms..=max_ms`.
 fn part(fingerprint: &str, created_ms: i64, min_ms: i64, max_ms: i64) -> PartRef {
     PartRef {
+        request_hours: None,
         part_id: PartId::new(created_ms).unwrap(), level: Level::L0,
         event_hour: (min_ms / 3_600_000) as i32, event_day: None, rows: 1,
         min_time_us: min_ms * 1000, max_time_us: max_ms * 1000,

@@ -307,7 +307,7 @@ describe('IssueCredentialPanel (NAN-2593)', () => {
 
   it('warns that a source still rolling out is issued once enrolled', async () => {
     renderPanel({ slug: 'my_app', protocols: [], enrolled: false } as unknown as typeof source);
-    expect(screen.getByText(/still rolling out to your parser cell/)).toBeTruthy();
+    expect(screen.getByText(/being connected to your ingest endpoint/)).toBeTruthy();
     expect(screen.getAllByRole('radio').map((r) => r.textContent)).toEqual(['HEC', 'HTTPS JSON']);
   });
 });
@@ -319,7 +319,7 @@ describe('NAN-4812 credential waiting and refusal reasons', () => {
       waiting_source_slugs: ['palo_alto_traffic'] };
     renderPanel();
     await issue();
-    expect(await screen.findByText('Waiting for the palo_alto_traffic parser to finish rolling out')).toBeTruthy();
+    expect(await screen.findByText('Preparing the palo_alto_traffic ingest path')).toBeTruthy();
     expect(api.revealIngestCredential).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
   });

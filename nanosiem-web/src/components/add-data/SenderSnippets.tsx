@@ -17,6 +17,7 @@ import { CopyButton } from './CopyButton';
  */
 export function SenderSnippets({
   catalog,
+  linear = false,
   endpoint,
   protocol,
   label,
@@ -24,6 +25,7 @@ export function SenderSnippets({
   kind = 'source',
   sources,
 }: {
+  linear?: boolean;
   catalog: SenderTemplateCatalog | undefined;
   endpoint: TenantIngestEndpoint;
   protocol: string;
@@ -57,7 +59,7 @@ export function SenderSnippets({
   }
   return (
     <div className="rounded-md border border-border bg-card" data-testid="sender-snippets">
-      <div className="flex items-center gap-0.5 px-1.5 h-8 border-b border-border overflow-x-auto" role="tablist" aria-label="Sender">
+      {!linear && <div className="flex items-center gap-0.5 px-1.5 h-8 border-b border-border overflow-x-auto" role="tablist" aria-label="Sender">
         {templates.map((t) => (
           <button
             key={t.id}
@@ -73,7 +75,7 @@ export function SenderSnippets({
             {t.sender_name}
           </button>
         ))}
-      </div>
+      </div>}
       <div className="flex items-center gap-2 px-3 h-7 border-b border-border/60">
         <span className="text-[11.5px] text-foreground">{active.title}</span>
         <span className="font-mono text-[10.5px] text-muted-foreground/70">{active.format}</span>

@@ -1,0 +1,42 @@
+[
+  {
+    "id": "H1",
+    "query": "14e0857b37f6c5e5e90bab786a4db8fceb4166afe75e617519d942656976481e | table time, device.hostname, class_uid | head 100"
+  },
+  {
+    "id": "H2",
+    "query": "dst_endpoint.ip=198.51.100.7 | stats count as c, dc(device.hostname) as hosts"
+  },
+  {
+    "id": "H3",
+    "query": "(dst_endpoint.domain=bad.example OR query.hostname=bad.example OR http_request.url.hostname=bad.example) | stats count as c by device.hostname | sort -c | head 50"
+  },
+  {
+    "id": "H4",
+    "query": "class_uid=1007 process.cmd_line=/ExecutionPolicy Bypass/i | stats count as c by device.hostname, actor.user.name | sort -c | head 30"
+  },
+  {
+    "id": "H5",
+    "query": "class_uid=1007 | stats count as c by process.name | sort -c | head 20"
+  },
+  {
+    "id": "H6",
+    "query": "class_uid=4001 | timechart span=1m count"
+  },
+  {
+    "id": "H7",
+    "query": "((class_uid=3002 status_id=2) OR class_uid=1007) | stats count(eval(class_uid=3002)) as fails, count(eval(class_uid=1007)) as procs by device.hostname | where fails > 0 AND procs > 0 | sort -fails | head 20"
+  },
+  {
+    "id": "H8",
+    "query": "class_uid=1007 | stats dc(device.hostname) as h by process.name | where h < 50 | sort h | head 20"
+  },
+  {
+    "id": "H9",
+    "query": "device.hostname=host-0007.corp.example | table time, class_uid, activity_id, process.name, dst_endpoint.ip, dst_endpoint.domain | sort -time | head 500"
+  },
+  {
+    "id": "H10",
+    "query": "14e0857b37f6c5e5e90bab786a4db8fceb4166afe75e617519d942656976481e | head 10"
+  }
+]

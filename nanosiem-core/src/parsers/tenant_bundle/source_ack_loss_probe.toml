@@ -1,0 +1,26 @@
+# NAN-3085: the edge's on-demand loss proof. The Worker's direct lane may
+# acknowledge a delivery only after a Vector scrape that post-dates the sink
+# ACK shows no lake-lane loss. The main exporter renders a 10 s scrape, which
+# put 5-11 s on every direct ACK. This separate source scrapes every 100 ms,
+# keeps ONLY the loss counters (and its own scrape marker), and serves them on
+# its own small exporter, so the proof costs about one scrape interval.
+[sources.nano_loss_probe]
+type = "internal_metrics"
+scrape_interval_secs = 0.1
+namespace = "nanosiem_loss"
+
+[transforms.nano_loss_probe_select]
+type = "filter"
+inputs = ["nano_loss_probe"]
+condition = '''
+component = to_string(.tags.component_id) ?? ""
+.name == "component_discarded_events_total" ||
+  (.name == "component_errors_total" && (component == "ocsf_parquet_bronze" || component == "ocsf_lake_storage_prepare")) ||
+  (.name == "component_sent_events_total" && component == "nano_loss_probe")
+'''
+
+[sinks.nano_loss_probe_exporter]
+type = "prometheus_exporter"
+inputs = ["nano_loss_probe_select"]
+address = "0.0.0.0:9599"
+

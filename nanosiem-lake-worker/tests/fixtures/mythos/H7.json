@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "profile": "ocsf",
+  "dataset": "logs",
+  "source_placeholder": "__nano_lake_source__",
+  "query_sha256": "3b71afd78c40f0614774d828a32987438a069f5d4c4a1e85ff7346840ea9b0d5",
+  "start": "2026-09-24T07:00:00Z",
+  "end": "2026-09-25T07:01:00Z",
+  "limit": 501,
+  "table_view": false,
+  "newest_first_event_rows": false,
+  "stats_page": false,
+  "candidate_hints": [],
+  "required_columns": [
+    {
+      "name": "class_uid",
+      "field_type": "long"
+    },
+    {
+      "name": "device.hostname",
+      "field_type": "string"
+    },
+    {
+      "name": "message",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.log_source",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.uid",
+      "field_type": "string"
+    },
+    {
+      "name": "status_id",
+      "field_type": "integer"
+    },
+    {
+      "name": "time",
+      "field_type": "timestamp"
+    }
+  ],
+  "projected_scan_columns": [
+    "class_uid",
+    "device.hostname",
+    "metadata.log_source",
+    "status_id",
+    "time"
+  ],
+  "sql": "WITH stage_0 AS (\n  SELECT class_uid, \"device.hostname\", message, \"metadata.log_source\", \"metadata.uid\", status_id, time FROM __nano_lake_source__\n  WHERE time >= '2026-09-24 07:00:00.000000' AND time < '2026-09-25 07:01:00.000000'\n  AND (((((((class_uid = 3002 AND status_id = 2)) OR class_uid = 1007))) AND lower(\"metadata.log_source\") != 'audit'))\n),\nstage_1 AS (\n  SELECT \"device.hostname\" AS \"device.hostname\", countIf((class_uid = 3002)) AS fails, countIf((class_uid = 1007)) AS procs\n  FROM stage_0\n  GROUP BY \"device.hostname\"\n),\nstage_2 AS (\n  SELECT * FROM stage_1\n  WHERE (fails > 0 AND procs > 0)\n),\nstage_3 AS (\n  SELECT * FROM stage_2\n  ORDER BY fails DESC, \"device.hostname\" ASC\n),\nstage_4 AS (\n  SELECT * FROM stage_3\n  LIMIT 20\n)\nSELECT * FROM stage_4 LIMIT 501 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=0, optimize_aggregation_in_order=0"
+}

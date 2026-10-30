@@ -1565,6 +1565,32 @@ pub fn with_landing_role(mut limits: TenantLimits, placement: &TenantPlacement) 
     limits
 }
 
+fn placement_limits_for_cell(p: &TenantPlacement, cap: &CellCapacity, cfg: &CellConfig) -> TenantLimits {
+    let limits = TenantLimits::from_placement_for_cell(p, cap, cfg);
+    let limits = if cfg.product_state_role { with_product_role(limits, p) } else { limits };
+    if landing_wanted(cfg.tenzir_landing, Some(p)) { with_landing_role(limits, p) } else { limits }
+}
+
+/// Enabling a local template must also fit the outer container. Increasing a
+/// tenant cgroup alone cannot make memory available through its parent cap.
+fn validate_local_role_capacity(p: &Placement, cap: &CellCapacity, cfg: &CellConfig) -> anyhow::Result<()> {
+    if !cfg.trusted_local || !p.tenants.iter().any(|t| t.local_resources.is_some()) {
+        return Ok(());
+    }
+    let enabled = cfg.product_state_role || cfg.prevalence_maintenance
+        || p.tenants.iter().any(|t| landing_wanted(cfg.tenzir_landing, Some(t)));
+    if enabled {
+        let roles = p.tenants.iter().map(|t| placement_limits_for_cell(t, cap, cfg).memory_hard_bytes)
+            .fold(0u64, u64::saturating_add);
+        let supervisor = (cap.memory_bytes / 100 / crate::budget::MIB * crate::budget::MIB)
+            .max(64 * crate::budget::MIB);
+        anyhow::ensure!(roles.saturating_add(supervisor) <= cap.memory_bytes,
+            "enabled trusted-local roles need {} bytes plus {} supervisor bytes, exceeding cell capacity {}; resize the lake-cell container and placement before enabling auxiliary roles",
+            roles, supervisor, cap.memory_bytes);
+    }
+    Ok(())
+}
+
 /// NAN-4137: does this cell run landing[T] for the tenant? Only on a
 /// `tenzir_landing` cell, for a tenant placed with `landing`.
 pub fn landing_wanted(cell_enabled: bool, placed: Option<&TenantPlacement>) -> bool {
@@ -2177,9 +2203,7 @@ impl Supervisor {
     }
 
     fn placement_limits(&self, p: &TenantPlacement) -> TenantLimits {
-        let limits = TenantLimits::from_placement(p, &self.capacity(), &self.cfg.resources);
-        let limits = if self.cfg.product_state_role { with_product_role(limits, p) } else { limits };
-        if landing_wanted(self.cfg.tenzir_landing, Some(p)) { with_landing_role(limits, p) } else { limits }
+        placement_limits_for_cell(p, &self.capacity(), &self.cfg)
     }
 
     /// Create or resize `tenant`'s cgroup for `placement`. NAN-4642: a
@@ -2232,6 +2256,7 @@ impl Supervisor {
             policy.placement(&self.cfg, &p).await?;
         }
         p.validate(&self.cfg)?;
+        validate_local_role_capacity(&p, &self.capacity(), &self.cfg)?;
         let placed: std::collections::HashSet<TenantId> = p.tenants.iter().map(|t| t.tenant_id.clone()).collect();
         {
             let _permit = self.secret_delivery.lock().unwrap();
@@ -3273,6 +3298,12 @@ impl Supervisor {
 
     /// Return the tenant's running `role` process, spawning it if needed.
     pub async fn ensure_running(self: &Arc<Self>, t: &TenantId, role: Role) -> Result<Arc<Proc>, CellError> {
+        self.ensure_running_for_rpc(t, role, false).await
+    }
+
+    // Status reads may use an existing ingest process under pressure. They
+    // never bypass admission to spawn a new process or admit write work.
+    async fn ensure_running_for_rpc(self: &Arc<Self>, t: &TenantId, role: Role, status_read: bool) -> Result<Arc<Proc>, CellError> {
         if role == Role::Maintenance && !self.cfg.prevalence_maintenance {
             return Err(CellError::Unavailable("prevalence maintenance is not enabled on this cell".into()));
         }
@@ -3295,8 +3326,9 @@ impl Supervisor {
         }
         // NAN-3523: over its soft disk ceiling a tenant gets no new ingest
         // work (wake or spawn): a retryable 503, the backlog stays upstream.
-        if role == Role::Ingest {
-            if let Err(r) = self.disk.admit_ingest(t) {
+        let disk_refusal = (role == Role::Ingest).then(|| self.disk.admit_ingest(t).err()).flatten();
+        if !status_read {
+            if let Some(r) = &disk_refusal {
                 return Err(CellError::DiskPressure { bytes: r.bytes, soft_bytes: r.soft_bytes, retry_after_secs: r.retry_after_secs });
             }
         }
@@ -3310,6 +3342,9 @@ impl Supervisor {
                     return Ok(p);
                 }
             }
+        }
+        if let Some(r) = disk_refusal {
+            return Err(CellError::DiskPressure { bytes: r.bytes, soft_bytes: r.soft_bytes, retry_after_secs: r.retry_after_secs });
         }
         // NAN-4128: the spawn runs detached under an overall deadline; this
         // caller joins it and waits a bounded time. A caller that gives up
@@ -3910,6 +3945,15 @@ impl Supervisor {
 
     /// Open one RPC stream to the tenant's read-only role process.
     pub async fn open_rpc(self: &Arc<Self>, t: &TenantId, role: Role) -> Result<(InflightGuard, u64, tokio::net::UnixStream), CellError> {
+        self.open_rpc_inner(t, role, false).await
+    }
+
+    /// Operator status only: use a running ingest process without admitting writes.
+    pub async fn open_ingest_status_rpc(self: &Arc<Self>, t: &TenantId) -> Result<(InflightGuard, u64, tokio::net::UnixStream), CellError> {
+        self.open_rpc_inner(t, Role::Ingest, true).await
+    }
+
+    async fn open_rpc_inner(self: &Arc<Self>, t: &TenantId, role: Role, status_read: bool) -> Result<(InflightGuard, u64, tokio::net::UnixStream), CellError> {
         if role == Role::Detect {
             self.wake(t, role, WakeReason::Detection).await?;
         }
@@ -3920,7 +3964,7 @@ impl Supervisor {
                 slot.record_search(Instant::now());
             }
         }
-        let p = self.ensure_running(t, role).await?;
+        let p = self.ensure_running_for_rpc(t, role, status_read).await?;
         if p.native.is_some() {
             // Native byte streams open only through the guarded landing worker.
             return Err(CellError::Unavailable("native process is not routable".into()));
@@ -7412,3 +7456,7 @@ mod finding_outbox_signal_tests {
         assert_eq!(crate::signals::Hysteresis::for_signal("finding_outbox_age"), crate::signals::Hysteresis::DEFAULT);
     }
 }
+
+#[cfg(test)]
+#[path = "nan4849_pressure_tests.rs"]
+mod nan4849_pressure_tests;

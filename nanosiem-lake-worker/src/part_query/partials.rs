@@ -2416,6 +2416,7 @@ mod nan3161_tests {
 
     fn part(level: crate::parts::levels::Level, event_hour: i32) -> PartRef {
         PartRef {
+            request_hours: None,
             part_id: crate::parts::format::PartId::parse(&format!("{:013}-{:016x}", 1_700_000_000_000_i64, event_hour as u64)).unwrap(),
             level,
             event_hour,

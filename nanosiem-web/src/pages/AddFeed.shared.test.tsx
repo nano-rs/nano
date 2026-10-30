@@ -9,18 +9,27 @@
  * transport picker.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { TenantIngestEndpoint } from '@/lib/api/types';
 import { addDataLink } from '@/lib/add-data-sources';
 import { AddFeed } from './AddFeed';
+import { getEditableArtifact, rebaseVrlPatch, resetEditableArtifact } from '@/contexts/EditableArtifactContext';
+import { startEditTurn, resetEditSessions } from '@/enterprise/components/pivt/drafts/edit-session';
+import { getPivtDraftRuns, resetPivtDraftStore } from '@/enterprise/components/pivt/drafts/draft-store';
+import { runCardAction, resetRunActions } from '@/enterprise/components/pivt/drafts/interactive';
+import { copyText } from '@/lib/clipboard';
+
+vi.mock('@/lib/clipboard', () => ({ copyText: vi.fn().mockResolvedValue(true) }));
 
 const TENANT = 'b464ceb9-28a6-4249-8e29-3489627ac5f6';
 const HOST = `${TENANT}.ingest.nano.rs`;
 
 const mocks = vi.hoisted(() => ({
   mode: 'enterprise_shared' as string,
+  schema: 'ocsf',
+  melod: false, getLogSource: vi.fn(), search: vi.fn(), melodEditParser: vi.fn(),
   getIngestEndpoint: vi.fn(),
   listLogSources: vi.fn(),
   listSourceConfigs: vi.fn(),
@@ -28,10 +37,12 @@ const mocks = vi.hoisted(() => ({
   getParserRollout: vi.fn(),
   validateLogSourceVrl: vi.fn(),
   testLogSourceVrl: vi.fn(),
+  importParser: vi.fn(),
   createLogSource: vi.fn(),
   updateLogSource: vi.fn(),
   deployLogSource: vi.fn(),
   requestIngestCredential: vi.fn(),
+  assignIngestSource: vi.fn(),
 }));
 
 vi.mock('@/contexts/AuthContext', () => ({
@@ -40,9 +51,9 @@ vi.mock('@/contexts/AuthContext', () => ({
     hasPermission: () => true,
   }),
 }));
-vi.mock('@/hooks/use-capabilities', () => ({ useCapabilities: () => ({ capabilities: {} }) }));
+vi.mock('@/hooks/use-capabilities', () => ({ useCapabilities: () => ({ capabilities: {melod:mocks.melod} }) }));
 vi.mock('@/hooks/use-toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
-vi.mock('@/enterprise/hooks/use-melod-job', () => ({ useMelodJob: () => ({ start: vi.fn(), loading: false }) }));
+vi.mock('@/enterprise/hooks/use-melod-job', async (original) => ({...(await original<typeof import('@/enterprise/hooks/use-melod-job')>()), useMelodJob: () => ({ start: vi.fn(), loading: false }) }));
 vi.mock('@/components/editor/VrlEditor', () => ({
   VrlEditor: ({ value, onChange }: { value: string; onChange: (v: string) => void }) => (
     <textarea aria-label="VRL" value={value} onChange={(e) => onChange(e.target.value)} />
@@ -51,11 +62,13 @@ vi.mock('@/components/editor/VrlEditor', () => ({
 vi.mock('@/lib/api', () => ({
   ApiClientError: class extends Error {},
   api: {
-    getSchemaFields: async () => ({ schema: 'ocsf', fields: [] }),
+    getSchemaFields: async () => ({ schema: mocks.schema, fields: [] }),
     getIngestEndpoint: mocks.getIngestEndpoint,
+    getLogSource:mocks.getLogSource, search:mocks.search, melodEditParser:mocks.melodEditParser,
     listLogSources: mocks.listLogSources,
     listSourceConfigs: mocks.listSourceConfigs,
     requestIngestCredential: mocks.requestIngestCredential,
+    assignIngestSource: mocks.assignIngestSource,
     listParserRollouts: mocks.listParserRollouts,
     getParserRollout: mocks.getParserRollout,
     validateLogSourceVrl: mocks.validateLogSourceVrl,
@@ -64,6 +77,7 @@ vi.mock('@/lib/api', () => ({
     createLogSource: mocks.createLogSource,
     updateLogSource: mocks.updateLogSource,
     deployLogSource: mocks.deployLogSource,
+    parserRepositories: { importParser: mocks.importParser, listRepositories: async () => ({repositories:[{id:'repo',name:'nano-rs/parsers',enabled:true},{id:'private',name:'acme/security-parsers',enabled:true}]}), listParsers: async (repositoryId:string) => repositoryId==='private'?[{id:'internal',name:'internal_sso',display_name:'Internal SSO',file_path:'sso.yaml',repository_id:'private',parser_vrl:'. = .'}]:['okta','unknown','default','otlp_log','otlp_metric','otlp_trace'].map(name=>({id:name,name,display_name:name,file_path:`${name}.yaml`,repository_id:'repo',parser_vrl:'. = .',vendor:'Okta',product:'System log',category:'identity'})) },
     listRoutingRules: async () => [],
     getSenderTemplates: async () => ({ version: 1, placeholders: [], templates: [] }),
     sourceScopes: { listRestricted: async () => ({ restricted: [] }) },
@@ -106,6 +120,12 @@ const wizardLocation = () => screen.getByTestId('location').textContent ?? '';
 
 beforeEach(() => {
   mocks.mode = 'enterprise_shared';
+  mocks.assignIngestSource.mockReset().mockResolvedValue({ credential_id: 'credential-existing', source_slug: 'okta', label: 'Converted' });
+  mocks.schema = 'ocsf';
+  mocks.melod = false; resetEditableArtifact(); resetPivtDraftStore(); resetEditSessions(); resetRunActions();
+  mocks.getLogSource.mockReset().mockResolvedValue({id:'feed_existing',name:'Vercel',match_values:['vercel'],parser_vrl:'.src_ip = string!(.src_ip)',vendor:'Vercel',ingest:{events_last_24h:1284}});
+  mocks.search.mockReset().mockResolvedValue({results:[{raw_data:'{"message":"request"}'}],total:1284});
+  mocks.melodEditParser.mockReset().mockImplementation(async(input)=>({updated_vrl:input.current_vrl.replace('string!(.src_ip)','string(.src_ip) ?? ""'),message:'Included your manual edits.'}));
   mocks.requestIngestCredential.mockReset().mockRejectedValue(new Error('Stop after recording the request'));
   mocks.getIngestEndpoint.mockReset().mockResolvedValue(endpoint);
   mocks.listLogSources.mockReset().mockResolvedValue([
@@ -115,6 +135,7 @@ beforeEach(() => {
   mocks.getParserRollout.mockReset();
   mocks.validateLogSourceVrl.mockReset().mockResolvedValue({ valid: true, errors: [], diagnostics: [] });
   mocks.testLogSourceVrl.mockReset().mockResolvedValue({ success: true, output: {} });
+  mocks.importParser.mockReset().mockResolvedValue({log_source_id:'lsrc_repo',import_type:'linked'});
   mocks.createLogSource.mockReset().mockResolvedValue({ id: 'lsrc_vercel' });
   mocks.updateLogSource.mockReset().mockResolvedValue({ id: 'lsrc_vercel' });
   mocks.deployLogSource.mockReset().mockResolvedValue({ success: true, message: 'ok', rollout: null });
@@ -123,67 +144,145 @@ beforeEach(() => {
   ]);
 });
 afterEach(cleanup);
+beforeEach(() => {
+  window.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+  Element.prototype.scrollIntoView = vi.fn();
+});
+async function continueTransport() {
+  fireEvent.click(screen.getByRole('button', { name: /continue · details/i }));
+  await screen.findByTestId('source-details');
+  fireEvent.click(screen.getByRole('button', { name: /continue · transport/i }));
+  await screen.findByRole('radio', { name: 'HTTPS JSON' });
+}
+async function continueConnect() {
+  fireEvent.click(screen.getByRole('button', { name: /continue · connect/i }));
+  return screen.findByTestId('issue-credential-panel');
+}
+async function customToParse(name='vercel') {
+  await screen.findByTestId('source-catalog');
+  fireEvent.change(screen.getByLabelText('Source name'), {target:{value:name}});
+  await continueTransport(); await continueConnect();
+  fireEvent.click(screen.getByRole('button',{name:/continue · sample & parse/i}));
+}
+async function openReview() {
+  fireEvent.click(screen.getByRole('button',{name:/continue · review/i}));
+  return screen.findByTestId('deploy-gate');
+}
+
 
 describe('AddFeed → Add data (NAN-2593)', () => {
-  it('shared Step 1 asks how data arrives, shows the real endpoint and lists enrolled sources', async () => {
-    renderAddFeed();
-    expect(screen.getByText('Add data')).toBeTruthy();
-    expect(screen.getByText('How will this data arrive?')).toBeTruthy();
-    const card = await screen.findByTestId('ingest-endpoint-card');
-    expect(card.textContent).toContain(HOST);
-    expect(card.textContent).not.toContain('{your-ingest-host}');
-    expect(screen.queryByText('Ingestion source')).toBeNull();
-    expect(mocks.listSourceConfigs).not.toHaveBeenCalled();
-
-    const list = await screen.findByRole('radiogroup', { name: 'Existing source' });
-    const rows = within(list).getAllByRole('radio');
-    expect(rows.map((r) => r.textContent)).toEqual([
-      expect.stringContaining('okta'),
-      expect.stringContaining('palo_alto_traffic'),
-    ]);
-    expect(rows[1].textContent).toContain('Palo Alto traffic');
-    // Collector stays hidden until the tenant's Worker accepts it (NAN-2597).
-    expect(screen.queryByRole('radio', { name: /collector/i })).toBeNull();
+  it('uses one catalog list with Custom visible, without system sources, endpoints or tabs in step 1', async () => {
+    renderAddFeed(); await screen.findByRole('option',{name:/okta/});
+    expect(screen.getByText('Add source')).toBeTruthy();
+    expect(screen.getByText('Source')).toBeTruthy();
+    expect(screen.getByRole('option',{name:/Custom source/})).toBeTruthy();
+    for(const name of ['unknown','default','otlp_log','otlp_metric','otlp_trace']) expect(screen.queryByRole('option',{name:new RegExp(name)})).toBeNull();
+    fireEvent.change(screen.getByLabelText('Search supported sources'),{target:{value:'no-match'}});
+    expect(screen.getByRole('option',{name:/Custom source/})).toBeTruthy();
+    expect(screen.queryByTestId('ingest-endpoint-card')).toBeNull();
+    expect(screen.queryByRole('tab')).toBeNull(); expect(mocks.listSourceConfigs).not.toHaveBeenCalled();
   });
-
-  it('an existing source goes straight to the Issue step', async () => {
-    renderAddFeed();
-    const list = await screen.findByRole('radiogroup', { name: 'Existing source' });
-    const next = screen.getByRole('button', { name: /continue · issue credential/i }) as HTMLButtonElement;
-    expect(next.disabled).toBe(true);
-    fireEvent.click(within(list).getByText('palo_alto_traffic'));
-    expect(next.disabled).toBe(false);
-    fireEvent.click(next);
-    const panel = await screen.findByTestId('issue-credential-panel');
-    expect(panel.textContent).toContain('palo_alto_traffic');
-    expect((within(panel).getByLabelText('Label') as HTMLInputElement).value).toBe('palo_alto_traffic-hec');
-    // The parser steps are not part of this path.
+  it('collapses source into transport and then shows only the selected endpoint in Connect', async () => {
+    renderAddFeed(); await screen.findByTestId('source-catalog');
+    fireEvent.change(screen.getByLabelText('Source name'),{target:{value:'Vercel'}});
+    await continueTransport();
+    expect(screen.queryByTestId('source-catalog')).toBeNull();
+    expect(screen.getByText('Source: Vercel (custom)')).toBeTruthy();
+    expect(screen.queryByRole('radio',{name:'Collector'})).toBeNull();
+    expect(screen.getByText('For HEC forwarders and security tools that speak HEC.')).toBeTruthy();
+    await continueConnect();
+    const card=screen.getByTestId('ingest-endpoint-card');
+    expect(card.textContent).toContain(`https://${HOST}/ingest`);
+    expect(card.textContent).not.toContain('/services/collector/event'); expect(card.textContent).not.toContain('/v1/logs');
+    expect(screen.queryByRole('radiogroup',{name:'Transport'})).toBeNull();
     expect(screen.queryByText('Sample & parse')).toBeNull();
+    expect(screen.queryByRole('tab')).toBeNull();
+    fireEvent.click(screen.getByRole('button',{name:/continue · sample & parse/i}));
+    expect(screen.getByRole('button',{name:'Connect · Edit'}).textContent).toContain('Connect: HTTPS JSON · waiting for first event');
   });
-
-  it('?source=<slug> preselects that source and opens the Issue step (NAN-2946)', async () => {
-    renderAddFeed(addDataLink('okta'));
-    const panel = await screen.findByTestId('issue-credential-panel');
-    expect(panel.textContent).toContain('okta');
-    expect((within(panel).getByLabelText('Label') as HTMLInputElement).value).toBe('okta-hec');
-    expect(screen.queryByText('Sample & parse')).toBeNull();
+  it('repository Details are prefilled and editable, then summarized; repositories finish at Connect', async () => {
+    renderAddFeed('/ingestion/log-sources/new?type=okta');
+    await waitFor(()=>expect((screen.getByLabelText('Source name') as HTMLInputElement).value).toBe('okta'));
+    fireEvent.click(screen.getByRole('button',{name:/continue · details/i}));
+    expect((screen.getByLabelText('Feed identifier') as HTMLInputElement).value).toBe('okta');
+    expect((screen.getByLabelText('Vendor') as HTMLInputElement).value).toBe('Okta');
+    expect((screen.getByLabelText('Product') as HTMLInputElement).value).toBe('System log');
+    fireEvent.change(screen.getByLabelText('Vendor'),{target:{value:'My vendor'}});
+    expect(screen.queryByText('Network namespace')).toBeNull();
+    fireEvent.click(screen.getByRole('button',{name:/continue · transport/i}));
+    expect(screen.getByRole('button',{name:'Details · Edit'}).textContent).toContain('Details: okta · My vendor · System log · identity');
+    await continueConnect();
+    expect(mocks.importParser).toHaveBeenCalledWith('repo','okta.yaml',{import_type:'linked',source_type:'okta',ingestion_method:'routed'});
+    expect(mocks.updateLogSource).toHaveBeenCalledWith('lsrc_repo',expect.objectContaining({vendor:'My vendor',match_values:['okta']}));
+    expect(mocks.deployLogSource).toHaveBeenCalledWith('lsrc_repo');
+    expect(mocks.createLogSource).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button',{name:/continue · sample & parse/i})).toBeNull();
   });
-
-  it('an unknown ?source= slug leaves the wizard on Step 1 (NAN-2946)', async () => {
+  it('Details keeps the mono identifier outside collapsed Advanced configuration and supports editing reserved names',async()=>{
+    renderAddFeed();await screen.findByTestId('source-catalog');
+    fireEvent.change(screen.getByLabelText('Source name'),{target:{value:'Vercel audit'}});
+    fireEvent.click(screen.getByRole('button',{name:/continue · details/i}));
+    expect(screen.getByTestId('feed-identifier').className).toContain('font-mono');
+    expect((screen.getByLabelText('Vendor') as HTMLInputElement).value).toBe('Vercel');
+    expect(screen.queryByRole('button',{name:'Edit feed identifier'})).toBeNull();
+    expect(screen.getByText('metadata.log_source =')).toBeTruthy();
+    const details = within(screen.getByTestId('source-details'));
+    for (const label of ['Credential','Transport route','Search query']) expect(details.queryByText(label)).toBeNull();
+    expect(details.getByText('Find these events with')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Feed identifier'),{target:{value:'unknown'}});
+    expect((screen.getByLabelText('Feed identifier') as HTMLInputElement).value).toBe('custom_unknown');
+    expect(screen.queryByText('Network namespace')).toBeNull();
+  });
+  it.each(['custom','okta'])('the %s identifier follows source-name edits until the identifier is manually edited',async(type)=>{
+    renderAddFeed(type === 'custom' ? '/ingestion/log-sources/new' : '/ingestion/log-sources/new?type=okta');
+    await screen.findByTestId('source-catalog');
+    if(type==='okta')await waitFor(()=>expect((screen.getByLabelText('Source name') as HTMLInputElement).value).toBe('okta'));
+    fireEvent.change(screen.getByLabelText('Source name'),{target:{value:'Jamez'}});
+    fireEvent.click(screen.getByRole('button',{name:/continue · details/i}));
+    expect((screen.getByLabelText('Feed identifier') as HTMLInputElement).value).toBe('jamez');
+    fireEvent.click(screen.getByRole('button',{name:'Source · Edit'}));
+    fireEvent.change(screen.getByLabelText('Source name'),{target:{value:'Jamez audit'}});
+    fireEvent.click(screen.getByRole('button',{name:/continue · details/i}));
+    expect((screen.getByLabelText('Feed identifier') as HTMLInputElement).value).toBe('jamez_audit');
+    fireEvent.change(screen.getByLabelText('Feed identifier'),{target:{value:'Keep this ID'}});
+    fireEvent.click(screen.getByRole('button',{name:'Source · Edit'}));
+    fireEvent.change(screen.getByLabelText('Source name'),{target:{value:'Another name'}});
+    fireEvent.click(screen.getByRole('button',{name:/continue · details/i}));
+    expect((screen.getByLabelText('Feed identifier') as HTMLInputElement).value).toBe('keep_this_id');
+    expect(screen.getByText('metadata.log_source=keep_this_id')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button',{name:'Copy search query'}));
+    await waitFor(()=>expect(copyText).toHaveBeenLastCalledWith('metadata.log_source=keep_this_id'));
+  });
+  it('uses the legacy search-field prefix only for legacy tenants',async()=>{
+    mocks.schema='udm';renderAddFeed();await screen.findByTestId('source-catalog');
+    fireEvent.change(screen.getByLabelText('Source name'),{target:{value:'Jamez'}});
+    fireEvent.click(screen.getByRole('button',{name:/continue · details/i}));
+    expect(screen.getByText('source_type =')).toBeTruthy();
+    expect(screen.getByText('source_type=jamez')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button',{name:'Copy search query'}));
+    await waitFor(()=>expect(copyText).toHaveBeenLastCalledWith('source_type=jamez'));
+    expect(screen.queryByText('metadata.log_source =')).toBeNull();
+  });
+  it('groups existing sources and repository entries and navigates to existing source credentials without creating a duplicate',async()=>{
+    renderAddFeed();await screen.findByRole('option',{name:/okta/});
+    expect(screen.getByText('Your sources')).toBeTruthy();expect(screen.getByText('From repositories')).toBeTruthy();expect(screen.getByText('nano-rs/parsers')).toBeTruthy();
+    fireEvent.click(screen.getByRole('option',{name:/Palo Alto traffic/}));
+    expect(wizardLocation()).toContain('/ingestion/log-sources/feed_pa?action=add-credential');
+    expect(mocks.createLogSource).not.toHaveBeenCalled();
+  });
+  it('shows Installed for active repository types and searches by repository name',async()=>{
+    mocks.listLogSources.mockResolvedValue([{id:'okta_active',name:'Okta installed',match_values:['okta'],deployed:true,source_parser_linked:true}]);
+    renderAddFeed();await screen.findByRole('option',{name:/okta Installed/});
+    expect(screen.getByText('acme/security-parsers')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Search supported sources'),{target:{value:'acme/security-parsers'}});
+    await waitFor(()=>expect(screen.queryByRole('option',{name:/okta Installed/})).toBeNull());
+    expect(screen.getByRole('option',{name:'Internal SSO'})).toBeTruthy();
+    expect(screen.getByRole('option',{name:/Custom source/})).toBeTruthy();
+  });
+  it('an unknown source deep link never falls back to another source', async () => {
     renderAddFeed(addDataLink('not_enrolled_anywhere'));
-    const list = await screen.findByRole('radiogroup', { name: 'Existing source' });
-    expect(within(list).getAllByRole('radio').every((r) => r.getAttribute('aria-checked') !== 'true')).toBe(true);
+    await screen.findByTestId('source-catalog');
     expect(screen.queryByTestId('issue-credential-panel')).toBeNull();
-  });
-
-  it('a custom source keeps the open-core parser steps and names it with a feed id', async () => {
-    renderAddFeed();
-    await screen.findByTestId('ingest-endpoint-card');
-    fireEvent.click(screen.getByRole('tab', { name: 'New custom source' }));
-    expect(screen.getByPlaceholderText('aws_cloudtrail')).toBeTruthy();
-    expect(screen.getByRole('button', { name: /continue · sample & parse/i })).toBeTruthy();
-    expect(screen.getAllByText('Review & activate').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('Issue a credential').length).toBe(1);
   });
 
   it('NAN-4792: the real sample splitter sends 16 lines until Join is clicked, then sends 8', async () => {
@@ -192,10 +291,7 @@ describe('AddFeed → Add data (NAN-2593)', () => {
     const wrapped = heads.map((head) => `${head}\n  ${tail}`).join('\n');
     const clean = heads.map((head) => `${head} ${tail}`).join('\n');
     renderAddFeed();
-    await screen.findByTestId('ingest-endpoint-card');
-    fireEvent.click(screen.getByRole('tab', { name: 'New custom source' }));
-    fireEvent.change(screen.getByPlaceholderText('aws_cloudtrail'), { target: { value: 'firewall' } });
-    fireEvent.click(screen.getAllByText('Sample & parse')[0]);
+    await customToParse('firewall');
     const box = screen.getByPlaceholderText(/^\{"timestamp":/) as HTMLTextAreaElement;
     fireEvent.change(box, { target: { value: wrapped } });
     fireEvent.change(await screen.findByLabelText('VRL'), { target: { value: '.action = "allow"' } });
@@ -216,13 +312,10 @@ describe('AddFeed → Add data (NAN-2593)', () => {
 
   it('a custom source with an empty parser is blocked on the parser, not on a phantom acknowledgement (NAN-4754)', async () => {
     renderAddFeed();
-    await screen.findByTestId('ingest-endpoint-card');
-    fireEvent.click(screen.getByRole('tab', { name: 'New custom source' }));
-    fireEvent.change(screen.getByPlaceholderText('aws_cloudtrail'), { target: { value: 'vercel' } });
-    fireEvent.click(screen.getAllByText('Review & activate')[0]);
+    await customToParse(); await openReview();
     const gate = await screen.findByTestId('deploy-gate');
     expect(within(gate).getByTestId('gate-parser').getAttribute('data-status')).toBe('block');
-    expect(gate.textContent).toContain('Parser · empty · draft or write one in step 2');
+    expect(gate.textContent).toContain('Parser · empty · draft or write one in step 5');
     expect(gate.textContent).not.toContain('VRL syntax · valid');
     expect(gate.textContent).not.toMatch(/acknowledge/i);
     expect(within(gate).queryByRole('checkbox')).toBeNull();
@@ -233,12 +326,9 @@ describe('AddFeed → Add data (NAN-2593)', () => {
   // samples yet must reach activation through one explicit acknowledgement.
   async function customSourceWithParser(vrl = '. = parse_json!(.message)') {
     renderAddFeed();
-    await screen.findByTestId('ingest-endpoint-card');
-    fireEvent.click(screen.getByRole('tab', { name: 'New custom source' }));
-    fireEvent.change(screen.getByPlaceholderText('aws_cloudtrail'), { target: { value: 'vercel' } });
-    fireEvent.click(screen.getAllByText('Sample & parse')[0]);
+    await customToParse();
     fireEvent.change(await screen.findByLabelText('VRL'), { target: { value: vrl } });
-    fireEvent.click(screen.getAllByText('Review & activate')[0]);
+    await openReview();
     const gate = await screen.findByTestId('deploy-gate');
     await waitFor(() => expect(within(gate).getByTestId('gate-parser').getAttribute('data-status')).toBe('ok'));
     return gate;
@@ -268,9 +358,9 @@ describe('AddFeed → Add data (NAN-2593)', () => {
     mocks.validateLogSourceVrl.mockResolvedValue({
       valid: true, errors: [], diagnostics: [{ severity: 'warn', message: 'unused variable b' }],
     });
-    fireEvent.click(screen.getAllByText('Sample & parse')[0]);
+    fireEvent.click(screen.getByRole('button', { name: 'Sample & parse · Edit' }));
     fireEvent.change(await screen.findByLabelText('VRL'), { target: { value: '. = parse_json!(.message)\nb = 1' } });
-    fireEvent.click(screen.getAllByText('Review & activate')[0]);
+    await openReview();
     await waitFor(() => expect(screen.getByTestId('deploy-gate').textContent).toContain('unused variable b'), { timeout: 3000 });
     await waitFor(() => expect(within(screen.getByTestId('deploy-gate')).getByRole('checkbox').getAttribute('aria-checked')).toBe('false'));
   });
@@ -285,37 +375,19 @@ describe('AddFeed → Add data (NAN-2593)', () => {
     fireEvent.click(activate);
     await waitFor(() => expect(mocks.deployLogSource).toHaveBeenCalled());
     await waitFor(() => expect(activate.disabled).toBe(false));
-    expect(screen.queryByTestId('issue-credential-panel')).toBeNull();
+    expect(screen.getByTestId('issue-credential-panel').closest('[hidden]')).toBeTruthy();
   });
 
-  it('collector arrival (NAN-2597): one token for several sources, straight to the collector Issue step', async () => {
-    mocks.getIngestEndpoint.mockResolvedValue({
-      ...endpoint,
-      ingress_contract: {
-        version: 2, credential_kinds: ['source', 'collector'], collector_credentials: true,
-        source_declarations: ['hec:event.sourcetype', 'otlp_http:resource.nano.source'],
-      },
-    });
-    renderAddFeed();
-    fireEvent.click(await screen.findByRole('radio', { name: 'Collector' }));
-    const group = await screen.findByRole('group', { name: 'Collector sources' });
-    expect(screen.queryByRole('tab', { name: 'New custom source' })).toBeNull();
-    const next = screen.getByRole('button', { name: /continue · issue collector/i }) as HTMLButtonElement;
-    expect(next.disabled).toBe(true);
-    fireEvent.click(within(group).getByRole('checkbox', { name: 'palo_alto_traffic' }));
-    fireEvent.click(within(group).getByRole('checkbox', { name: 'okta' }));
-    expect(screen.getByTestId('collector-selected-count').textContent).toBe('2 selected');
-    expect(next.disabled).toBe(false);
-    fireEvent.click(next);
-    const panel = await screen.findByTestId('issue-credential-panel');
-    expect(within(panel).getByTestId('collector-source-count').textContent).toBe('2');
-    expect((within(panel).getByLabelText('Label') as HTMLInputElement).value).toBe('collector-hec');
-    // Vendor sourcetype conventions are prefilled as removable aliases.
+  it('offers Collector only when enabled, retaining its multi-source allowlist', async () => {
+    mocks.getIngestEndpoint.mockResolvedValue({...endpoint,ingress_contract:{collector_credentials:true}});
+    renderAddFeed(); await screen.findByTestId('source-catalog');
+    fireEvent.change(screen.getByLabelText('Source name'),{target:{value:'Pipeline'}});
+    await continueTransport(); fireEvent.click(screen.getByRole('radio',{name:'Collector'}));
+    fireEvent.click(screen.getByRole('checkbox',{name:'Palo Alto traffic'}));
+    fireEvent.click(screen.getByRole('checkbox',{name:'okta'}));
+    const panel=await continueConnect();
     expect(within(panel).getByTestId('collector-source-palo_alto_traffic').textContent).toContain('pan:traffic');
     expect(within(panel).getByTestId('collector-source-okta').textContent).toContain('OktaIM2:log');
-    expect(within(panel).getByTestId('collector-unknown-note').textContent).toMatch(/land as unknown/);
-    expect(screen.getAllByText('Issue a collector credential').length).toBe(1);
-    expect(screen.queryByText('Sample & parse')).toBeNull();
   });
 
   it('a source still rolling out shows its rollout on the Issue step (NAN-2607)', async () => {
@@ -331,119 +403,39 @@ describe('AddFeed → Add data (NAN-2593)', () => {
     ]);
     mocks.listParserRollouts.mockResolvedValue([rollout]);
     mocks.getParserRollout.mockResolvedValue(rollout);
-    renderAddFeed();
-    const list = await screen.findByRole('radiogroup', { name: 'Existing source' });
-    fireEvent.click(within(list).getByText('acme_app'));
-    fireEvent.click(screen.getByRole('button', { name: /continue · issue credential/i }));
+    renderAddFeed('/ingestion/log-sources/new?source=acme_app&stage=connect');
     const strip = await screen.findByTestId('issue-rollout');
     expect(within(strip).getByTestId('rollout-state').textContent).toBe('Building');
     const panel = await screen.findByTestId('issue-credential-panel');
-    expect(panel.textContent).toContain('held at the edge');
+    expect(panel.textContent).toContain('being connected to your ingest endpoint');
   });
 
   // NAN-4800, the AU report: after issuing at Step 2 the user clicked "Log
   // Sources → Credentials", a raw <a> that left /t/<tenant> (tenant_required →
   // login), and then had to rebuild the source from Step 1.
   describe('NAN-4800: tenant links and resuming the Issue step', () => {
-    const BASE = '/t/acme';
-
-    it('"Log Sources → Credentials" keeps the /t/<tenant> prefix and opens in a new tab', async () => {
-      renderAddFeed('/ingestion/log-sources/wizard', BASE);
-      const list = await screen.findByRole('radiogroup', { name: 'Existing source' });
-      fireEvent.click(within(list).getByText('palo_alto_traffic'));
-      fireEvent.click(screen.getByRole('button', { name: /continue · issue credential/i }));
+    const BASE='/t/acme';
+    it('keeps the tenant prefix on credential-management links',async()=>{
+      renderAddFeed('/ingestion/log-sources/new?source=palo_alto_traffic&stage=connect&transport=hec',BASE);
       await screen.findByTestId('issue-credential-panel');
-      const link = screen.getByRole('link', { name: 'Log Sources → Credentials' });
-      expect(link.getAttribute('href')).toBe('/t/acme/ingestion/log-sources/credentials');
-      expect(link.getAttribute('target')).toBe('_blank');
+      const link=screen.getByRole('link',{name:'Log Sources → Credentials'});
+      expect(link.getAttribute('href')).toBe('/t/acme/ingestion/log-sources/credentials'); expect(link.getAttribute('target')).toBe('_blank');
     });
-
-    it('an existing source: the Issue step is addressable, so a reload resumes at Issue', async () => {
-      const first = renderAddFeed('/ingestion/log-sources/wizard', BASE);
-      const list = await screen.findByRole('radiogroup', { name: 'Existing source' });
-      fireEvent.click(within(list).getByText('palo_alto_traffic'));
-      fireEvent.click(screen.getByRole('button', { name: /continue · issue credential/i }));
-      await screen.findByTestId('issue-credential-panel');
-      await waitFor(() => expect(wizardLocation()).toBe('/ingestion/log-sources/wizard?source=palo_alto_traffic'));
-      const resumed = wizardLocation();
-      first.unmount();
-
-      renderAddFeed(resumed, BASE);
-      const panel = await screen.findByTestId('issue-credential-panel');
-      expect(panel.textContent).toContain('palo_alto_traffic');
-      expect(screen.queryByText('Sample & parse')).toBeNull();
+    it.each([['palo_alto_traffic','feed_pa'],['okta',undefined]])('resumes %s with the same source and own registry id',async(slug,id)=>{
+      renderAddFeed(`/ingestion/log-sources/new?source=${slug}&stage=connect&transport=hec`,BASE);
+      const panel=await screen.findByTestId('issue-credential-panel');
+      fireEvent.click(within(panel).getByRole('button',{name:'Issue credential'}));
+      await waitFor(()=>expect(mocks.requestIngestCredential).toHaveBeenCalledTimes(1));
+      const input=mocks.requestIngestCredential.mock.calls[0][0];
+      expect(input.source_slugs).toEqual([slug]);expect(input.log_source_id).toBe(id);expect(input.protocol).toBe('hec');expect(input.reveal_public_key).toBeTruthy();
+      expect(screen.queryByLabelText('VRL')).toBeNull();expect(mocks.deployLogSource).not.toHaveBeenCalled();
     });
-
-    it('an activated custom source resumes at Issue, never back through samples, VRL and activation', async () => {
-      const gate = await customSourceWithParser();
-      await waitFor(() => expect(within(gate).getByTestId('gate-namespace').getAttribute('data-status')).toBe('ok'));
-      fireEvent.click(within(gate).getByRole('checkbox'));
-      const activate = screen.getByRole('button', { name: /activate source/i }) as HTMLButtonElement;
-      await waitFor(() => expect(activate.disabled).toBe(false));
-      fireEvent.click(activate);
-      await screen.findByTestId('issue-credential-panel');
-      await waitFor(() => expect(wizardLocation()).toBe('/ingestion/log-sources/wizard?source=vercel'));
-      const resumed = wizardLocation();
-      cleanup();
-
-      // The activated source is in the registry now (rolling out).
-      mocks.listLogSources.mockResolvedValue([
-        { id: 'feed_pa', name: 'Palo Alto traffic', match_values: ['palo_alto_traffic'], deployed: true, enabled: true, lifecycle_status: 'active' },
-        { id: 'lsrc_vercel', name: 'vercel', match_values: ['vercel'], deployed: true, enabled: true, lifecycle_status: 'active' },
-      ]);
-      mocks.createLogSource.mockClear();
-      mocks.deployLogSource.mockClear();
-      renderAddFeed(resumed);
-      const panel = await screen.findByTestId('issue-credential-panel');
-      expect(panel.textContent).toContain('vercel');
-      expect(screen.queryByText('Sample & parse')).toBeNull();
-      expect(screen.queryByLabelText('VRL')).toBeNull();
-      expect(mocks.createLogSource).not.toHaveBeenCalled();
-      expect(mocks.deployLogSource).not.toHaveBeenCalled();
-    });
-
-    it.each([
-      ['palo_alto_traffic', 'feed_pa'],
-      ['okta', undefined],
-    ])('resuming %s sends only that source and its own registry id to the issuance API', async (slug, id) => {
-      renderAddFeed(`/ingestion/log-sources/wizard?source=${slug}`, BASE);
-      const panel = await screen.findByTestId('issue-credential-panel');
-      expect(panel.textContent).toContain(slug);
-      fireEvent.click(within(panel).getByRole('button', { name: 'Issue credential' }));
-      await waitFor(() => expect(mocks.requestIngestCredential).toHaveBeenCalledTimes(1));
-      const input = mocks.requestIngestCredential.mock.calls[0][0];
-      expect(input.kind).toBe('source');
-      expect(input.source_slugs).toEqual([slug]);
-      expect(input.log_source_id).toBe(id);
-      expect(input.reveal_public_key).toBeTruthy();
-    });
-
-    it('an unknown source never falls back to issuing for a different source', async () => {
-      renderAddFeed('/ingestion/log-sources/wizard?source=missing', BASE);
-      await screen.findByRole('radiogroup', { name: 'Existing source' });
-      expect(screen.queryByTestId('issue-credential-panel')).toBeNull();
-      expect(mocks.requestIngestCredential).not.toHaveBeenCalled();
-    });
-
-    it('a collector credential resumes at Issue with the same sources', async () => {
-      mocks.getIngestEndpoint.mockResolvedValue({
-        ...endpoint,
-        ingress_contract: { version: 2, credential_kinds: ['source', 'collector'], collector_credentials: true, source_declarations: ['hec:event.sourcetype'] },
-      });
-      const first = renderAddFeed();
-      fireEvent.click(await screen.findByRole('radio', { name: 'Collector' }));
-      const group = await screen.findByRole('group', { name: 'Collector sources' });
-      fireEvent.click(within(group).getByRole('checkbox', { name: 'palo_alto_traffic' }));
-      fireEvent.click(within(group).getByRole('checkbox', { name: 'okta' }));
-      fireEvent.click(screen.getByRole('button', { name: /continue · issue collector/i }));
-      await screen.findByTestId('issue-credential-panel');
-      await waitFor(() => expect(wizardLocation()).toBe('/ingestion/log-sources/wizard?sources=palo_alto_traffic%2Cokta'));
-      const resumed = wizardLocation();
-      first.unmount();
-
-      renderAddFeed(resumed);
-      const panel = await screen.findByTestId('issue-credential-panel');
-      expect(within(panel).getByTestId('collector-source-count').textContent).toBe('2');
+    it('keeps the selected transport in the address for reload',async()=>{
+      renderAddFeed('/ingestion/log-sources/new?source=okta');
+      await screen.findByRole('radio',{name:'HEC'}); fireEvent.click(screen.getByRole('radio',{name:'HEC'}));
+      await continueConnect();
+      await waitFor(()=>expect(wizardLocation()).toContain('transport=hec'));
+      expect(wizardLocation()).toContain('source=okta');expect(wizardLocation()).toContain('stage=connect');
     });
   });
 
@@ -458,4 +450,111 @@ describe('AddFeed → Add data (NAN-2593)', () => {
     expect(mocks.getIngestEndpoint).not.toHaveBeenCalled();
     expect(screen.queryByTestId('issue-credential-panel')).toBeNull();
   });
+});
+
+it('NAN-4847: unknown is never a pickable source; custom creation is inline', async () => {
+  mocks.getIngestEndpoint.mockResolvedValue({ ...endpoint, sources: [...endpoint.sources,
+    { ...endpoint.sources[0], source_slug: 'unknown', label: 'route template: unknown' }] });
+  renderAddFeed();
+  await screen.findByRole('option', { name: /okta/ });
+  expect(screen.queryByRole('option', { name: 'unknown' })).toBeNull();
+  fireEvent.click(screen.getByRole('option', { name: /Custom source/ }));
+  expect(screen.getByLabelText('Source name')).toBeTruthy();
+  expect(screen.queryByRole('tab')).toBeNull();
+});
+
+
+describe('NAN-4847 live parser page context',()=>{
+  async function openExistingParser(){
+    mocks.melod=true;renderAddFeed('/ingestion/log-sources/new?source_id=feed_existing&stage=parse');
+    await screen.findByLabelText('VRL');
+    await waitFor(()=>expect(getEditableArtifact()?.kind).toBe('parser'));
+    await waitFor(()=>expect((getEditableArtifact()?.getDoc() as {samples:string[]}).samples.length).toBe(1));
+  }
+  it('Build parser reuses the receiving source and includes manual edits on every turn, without auto-apply; Apply and one Undo retest',async()=>{
+    await openExistingParser();
+    expect(screen.getByRole('button',{name:'Connect · Edit'}).textContent).toContain('Connect: HTTPS JSON · receiving');
+    const manual='.src_ip = string!(.src_ip)\n# keep my manual edit';
+    fireEvent.change(screen.getByLabelText('VRL'),{target:{value:manual}});
+    await act(()=>startEditTurn('Fix the missing src_ip'));
+    expect(mocks.melodEditParser.mock.calls[0][0].current_vrl).toBe(manual);
+    const message=mocks.melodEditParser.mock.calls[0][0].message;
+    expect(message).toContain('manual_diff');expect(message).toContain('keep my manual edit');expect(message).toContain('feed_existing');
+    expect((screen.getByLabelText('VRL') as HTMLTextAreaElement).value).toBe(manual);
+    expect(mocks.createLogSource).not.toHaveBeenCalled();
+    const run=getPivtDraftRuns().at(-1)!;
+    expect(run.cards?.[0].actions.map(action=>action.label)).toEqual(['Apply','Dismiss']);
+    // A disjoint manual edit after the proposal is kept when its patch is applied.
+    fireEvent.change(screen.getByLabelText('VRL'),{target:{value:manual+'\n.extra = true'}});
+    await act(()=>runCardAction(run.id,'parser-patch','apply'));
+    expect((screen.getByLabelText('VRL') as HTMLTextAreaElement).value).toContain('string(.src_ip) ?? ""');
+    expect((screen.getByLabelText('VRL') as HTMLTextAreaElement).value).toContain('.extra = true');
+    await waitFor(()=>expect(mocks.testLogSourceVrl).toHaveBeenCalled());
+    act(()=>getEditableArtifact()!.history.undo());
+    expect((screen.getByLabelText('VRL') as HTMLTextAreaElement).value).toBe(manual+'\n.extra = true');
+    expect(getEditableArtifact()!.history.depth()).toBe(0);
+  });
+  it('get_more_samples appends recent events, including samples edited while the search was in flight',async()=>{
+    await openExistingParser();let resolve!:(value:unknown)=>void;
+    mocks.search.mockImplementationOnce(()=>new Promise(r=>{resolve=r;}));
+    const before=getEditableArtifact()!.getDoc() as {samples:string[]};
+    const pending=getEditableArtifact()!.invoke!('get_more_samples',{n:20},new AbortController().signal);
+    const box=screen.getByPlaceholderText(/^\{"timestamp":/);
+    fireEvent.change(box,{target:{value:[...before.samples,'{"message":"manually added"}'].join('\n')}});
+    await act(async()=>{resolve({results:Array.from({length:20},(_,i)=>({raw_data:JSON.stringify({message:'recent',i})}))});await pending;});
+    expect((getEditableArtifact()!.getDoc() as {samples:string[]}).samples).toHaveLength(22);
+    expect(mocks.search.mock.calls.at(-1)![0].limit).toBe(20);
+    await act(()=>startEditTurn('run tests on the current parser and samples'));
+    expect(getPivtDraftRuns().at(-1)?.cards?.[0].title).toBe('Ran tests');
+  });
+  it('reads resumed source activity from the list API when the detail row has no ingest counters', async () => {
+    const source = { id: 'feed_existing', name: 'Vercel', match_values: ['vercel'], parser_vrl: '.',
+      deployed: false, lifecycle_status: 'draft' };
+    mocks.getLogSource.mockResolvedValueOnce(source);
+    mocks.listLogSources.mockResolvedValueOnce([{ ...source, ingest: { source_slugs: ['vercel'], events_last_24h: 12 } }]);
+    await openExistingParser();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Connect · Edit' }).textContent).toContain('receiving'));
+    expect((getEditableArtifact()!.getDoc() as { recent_raw_event_count: number }).recent_raw_event_count).toBe(12);
+  });
+  it('loads and appends the original generic-lane payload with a bounded full-event search',async()=>{
+    const original='{"deployment":"web-24","status":200}';
+    const retained={raw_data:JSON.stringify({message:original,metadata:{parser_type:'generic'}})};
+    mocks.search.mockResolvedValue({results:[retained]});
+    await openExistingParser();
+    expect((getEditableArtifact()!.getDoc() as {samples:string[]}).samples).toEqual([original]);
+    const first=mocks.search.mock.calls[0][0];
+    expect(first).toMatchObject({query:'metadata.log_source="vercel"',limit:10,table_view:false,skip_field_stats:true,skip_histogram:true});
+    expect(new Date(first.time_range.end).getTime()-new Date(first.time_range.start).getTime()).toBe(24*60*60*1000);
+    await act(()=>getEditableArtifact()!.invoke!('get_more_samples',{n:500},new AbortController().signal));
+    expect(mocks.search.mock.calls.at(-1)![0].limit).toBe(200);
+    expect((getEditableArtifact()!.getDoc() as {samples:string[]}).samples).toEqual([original,original]);
+  });
+  it('natural requests can test the last 50 raw events and fetch a different event type through page actions',async()=>{
+    await openExistingParser();
+    mocks.search.mockResolvedValueOnce({results:Array.from({length:50},(_,i)=>({raw_data:JSON.stringify({event_type:'request',i})}))});
+    await act(()=>startEditTurn('test with the last 50 events'));
+    expect(mocks.search.mock.calls.at(-1)![0].limit).toBe(50);
+    expect((getEditableArtifact()!.getDoc() as {samples:string[]}).samples).toHaveLength(51);
+    expect(getPivtDraftRuns().at(-1)?.cards?.map(card=>card.title)).toEqual(['Pulled 50 samples','Ran tests']);
+    expect(mocks.testLogSourceVrl.mock.calls.some(call=>call[1].includes('\"i\":49'))).toBe(true);
+    mocks.search.mockResolvedValueOnce({results:[{raw_data:'{"event_type":"request"}'},{raw_data:'{"event_type":"audit"}'}]});
+    await act(()=>startEditTurn('pull samples with a different event type'));
+    expect((getEditableArtifact()!.getDoc() as {samples:string[]}).samples).toHaveLength(52);
+    expect(mocks.melodEditParser).not.toHaveBeenCalled();
+  });
+  it('overlapping patches are rejected and disjoint patches rebase without losing manual changes',()=>{
+    expect(rebaseVrlPatch('a\nb\nc','a\nb\nc\nmanual','fixed\nb\nc')).toBe('fixed\nb\nc\nmanual');
+    expect(()=>rebaseVrlPatch('a\nb','manual\nb','fixed\nb')).toThrow(/changed after the proposal/);
+  });
+});
+
+it('NAN-4847: resumed conversion assigns the original credential without issuing a token', async () => {
+  renderAddFeed('/ingestion/log-sources/wizard?convert=credential-existing&source=okta');
+  await screen.findByRole('button', { name: 'Assign source' });
+  fireEvent.change(screen.getByLabelText('Credential name'), { target: { value: 'Converted' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Assign source' }));
+  await waitFor(() => expect(mocks.assignIngestSource).toHaveBeenCalledWith('credential-existing', 'okta', 'Converted'));
+  expect(mocks.requestIngestCredential).not.toHaveBeenCalled();
+  await waitFor(() => expect((screen.getByRole('button', { name: 'Finish' }) as HTMLButtonElement).disabled).toBe(false));
+  expect(wizardLocation()).toContain('convert=credential-existing');
 });

@@ -303,6 +303,7 @@ mod tests {
     #[test]
     fn signed_content_shape_changes_invalidate_reuse() {
         let part = PartRef {
+            request_hours: None,
             part_id: crate::parts::format::PartId::new(1_790_000_000_000).unwrap(),
             level: crate::parts::levels::Level::L0,
             event_hour: 1,

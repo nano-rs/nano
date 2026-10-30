@@ -976,6 +976,7 @@ mod tests {
 
     fn sample_part() -> PartRef {
         PartRef {
+            request_hours: None,
             part_id: PartId::new(1_790_000_000_000).unwrap(),
             level: crate::parts::levels::Level::Hour,
             event_hour: 0,

@@ -45,6 +45,10 @@ benchmarks/*
 !benchmarks/results/
 benchmarks/results/*
 !benchmarks/results/soc_ir_corpus.json
+# #8435 two_pass_ocsf_native_tests embeds this tracked fixture (compile-time asset gate copies it).
+!benchmarks/agent-query/
+benchmarks/agent-query/*
+!benchmarks/agent-query/hunts.fixture.json
 .wrangler/
 nano-desktop/
 data/

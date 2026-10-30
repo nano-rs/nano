@@ -9,6 +9,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { LogSource } from '@/lib/api';
 import type { IngestionHistoryPoint } from '@/lib/api/types';
 import { LogSources } from './LogSources';
+import { INGEST_CREDENTIALS_QUERY_KEY } from '@/lib/add-data-sources';
+vi.mock('@/hooks/use-capabilities',()=>({useIngestGate:()=>({tenzirOnly:false}),useCapabilities:()=>({capabilities:{}})}));
 
 const mocks = vi.hoisted(() => ({
   sources: [] as unknown[],
@@ -36,6 +38,7 @@ vi.mock('@/lib/api', () => ({
     listParserBaseOffers: mocks.listParserBaseOffers,
     getParserRollout: mocks.getParserRollout,
     pipelines: { inputSummary: mocks.inputSummary },
+    listIngestCredentials:async()=>({credentials:[],requests:[]}),
   },
 }));
 
@@ -56,6 +59,7 @@ function leanSource(name: string, slug: string): LogSource {
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(INGEST_CREDENTIALS_QUERY_KEY,{credentials:[],requests:[]});
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter>
@@ -157,4 +161,15 @@ it('shows no delivery flag on an older backend without attention', async () => {
   renderPage();
   await waitFor(() => expect(mocks.inputSummary).toHaveBeenCalled());
   expect(screen.queryByTestId('delivery-attention-badge')).toBeNull();
+});
+
+
+it('a receiving source without a deployed parser shows the warning badge and Build parser link in its feed row',()=>{
+  mocks.sources=[{...leanSource('Vercel','vercel'),deployed:false,parser_vrl:''}];
+  renderPage();
+  const badge=screen.getByText('Receiving · not parsed');
+  expect(badge.className).toContain('text-amber-700');
+  const row=badge.closest('tr')!;
+  expect(within(row).getByText('Vercel')).toBeTruthy();
+  expect(within(row).getByRole('link',{name:'Build parser'}).getAttribute('href')).toBe('/ingestion/log-sources/new?source_id=lsrc_vercel&stage=parse');
 });

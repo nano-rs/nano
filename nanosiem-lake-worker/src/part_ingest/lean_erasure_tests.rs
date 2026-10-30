@@ -49,6 +49,7 @@ fn order(tenant: &str, phase: LeanPhase) -> LeanErasureOrder {
 
 fn part_ref(created_ms: i64, level: Level, hour: i32) -> PartRef {
     PartRef {
+        request_hours: None,
         part_id: PartId::new(created_ms).unwrap(),
         level,
         event_hour: hour,

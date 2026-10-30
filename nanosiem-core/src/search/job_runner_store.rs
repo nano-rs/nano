@@ -50,6 +50,41 @@ impl RunnerClaim {
     }
 }
 
+/// Outcome of waiting on one already-dispatched execution. A transient lease
+/// recovery stays inside the heartbeat future and never recreates the request.
+pub enum FencedExecution<T> {
+    Completed(T),
+    LeaseLost,
+    Stopped,
+}
+
+/// Shared by the cell runner and its hosted transport recovery tests. The
+/// heartbeat must confirm both the lease and current authority before returning
+/// true; the caller cancels the cell attempt on every other outcome/error.
+pub async fn await_fenced_execution<T, E, H, HF>(
+    request: impl std::future::Future<Output = Result<T, E>>,
+    interval: &mut tokio::time::Interval,
+    mut heartbeat: H,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<FencedExecution<T>, E>
+where
+    H: FnMut() -> HF,
+    HF: std::future::Future<Output = Result<bool, E>>,
+{
+    tokio::pin!(request, stop);
+    loop {
+        tokio::select! {
+            response = &mut request => return response.map(FencedExecution::Completed),
+            _ = interval.tick() => {
+                if !heartbeat().await? {
+                    return Ok(FencedExecution::LeaseLost);
+                }
+            }
+            _ = &mut stop => return Ok(FencedExecution::Stopped),
+        }
+    }
+}
+
 #[async_trait]
 pub trait DurableJobRunnerStore: Send + Sync + std::fmt::Debug {
     async fn reconcile(&self, max_attempts: u32) -> Result<usize, DurableJobStoreError>;

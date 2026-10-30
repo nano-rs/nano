@@ -9,6 +9,7 @@ import { BrowserRouter, Routes, Route, useLocation, Navigate, useParams, useSear
 import { useTier, TierProvider } from '@/hooks/use-tier';
 import { useState, useEffect, lazy, Suspense, ComponentType } from 'react';
 import { ThemeProvider } from '@/components/theme-provider';
+import { sourceOnboardingPermission } from '@/lib/add-data-sources';
 
 // Variant for named exports
 // NAN-998: throw loudly if the named export is missing (e.g. caller mismatched
@@ -16,6 +17,12 @@ import { ThemeProvider } from '@/components/theme-provider';
 // Previously this silently resolved to `{ default: undefined }`, which paints
 // a blank page with React error #306 at render time — hard to trace.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
+function LegacyAddDataRedirect() {
+  const { search } = useLocation();
+  const params = new URLSearchParams(search);
+  return <Navigate replace to={(params.has('source') || params.has('sources') || params.has('convert') ? '/ingestion/log-sources/new' : '/ingestion/log-sources') + search} />;
+}
+
 function lazyWithRetryNamed<T extends ComponentType<any>>(
   importFn: () => Promise<{ [key: string]: T }>,
   namedExport: string
@@ -140,7 +147,6 @@ const Rules = lazyWithRetryNamed(() => import('@/pages/Rules'), 'Rules');
 const Matches = lazyWithRetryNamed(() => import('@/pages/Matches'), 'Matches');
 // NAN-1791: auto retro-hunt rules (new + config/run-history).
 const RetroHunt = lazyWithRetryNamed(() => import('@/pages/RetroHunt'), 'RetroHunt');
-const SourceOnboarding = lazyWithRetryNamed(() => import('@/pages/SourceOnboarding'), 'SourceOnboarding');
 const LogSources = lazyWithRetryNamed(() => import('@/pages/LogSources'), 'LogSources');
 const Pipelines = lazyWithRetryNamed(() => import('@/pages/Pipelines'), 'Pipelines');
 const IngestCredentials = lazyWithRetryNamed(() => import('@/pages/IngestCredentials'), 'IngestCredentials');
@@ -962,30 +968,18 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
-          <Route path="/ingestion/log-sources/onboarding" element={
-            <PermissionRoute permission="log_sources:view" element={
-              <Suspense fallback={<ListPageLoadingFallback />}><SourceOnboarding key={resetKey} /></Suspense>
-            } />
-          } />
+          <Route path="/ingestion/log-sources/onboarding" element={<Navigate to="/ingestion/log-sources" replace />} />
           {/* NAN-3844: the Add data wizard creates Vector-delivered sources. */}
           <Route path="/ingestion/log-sources/new" element={
-            <VectorRequiredRoute title="Add data">
-              <PermissionRoute permission="log_sources:create" element={
+            <VectorRequiredRoute title="Add source">
+              <PermissionRoute permission={sourceOnboardingPermission(location.search)} element={
                 <Suspense fallback={<WizardLoadingFallback />}>
                   <AddFeed key={resetKey} />
                 </Suspense>
               } />
             </VectorRequiredRoute>
           } />
-          <Route path="/ingestion/log-sources/wizard" element={
-            <VectorRequiredRoute title="Add data">
-              <PermissionRoute permission="log_sources:create" element={
-                <Suspense fallback={<WizardLoadingFallback />}>
-                  <AddFeed key={resetKey} />
-                </Suspense>
-              } />
-            </VectorRequiredRoute>
-          } />
+          <Route path="/ingestion/log-sources/wizard" element={<LegacyAddDataRedirect />} />
           {/* NAN-2593: hosted-shared ingest credentials (Log Sources → Credentials). */}
           <Route path="/ingestion/log-sources/credentials" element={
             <PermissionRoute permission="log_sources:view" element={

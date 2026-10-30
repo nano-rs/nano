@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "profile": "ocsf",
+  "dataset": "logs",
+  "source_placeholder": "__nano_lake_source__",
+  "query_sha256": "bb423143ddd20e3c7db831886b30f75b095c7d9f64224d0581429b0bc69a43af",
+  "start": "2026-09-24T07:00:00Z",
+  "end": "2026-09-25T07:01:00Z",
+  "limit": 501,
+  "table_view": false,
+  "newest_first_event_rows": true,
+  "stats_page": false,
+  "candidate_hints": [
+    {
+      "kind": "keyword",
+      "mode": "token",
+      "value": "14e0857b37f6c5e5e90bab786a4db8fceb4166afe75e617519d942656976481e"
+    }
+  ],
+  "required_columns": [
+    {
+      "name": "message",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.log_source",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.uid",
+      "field_type": "string"
+    },
+    {
+      "name": "raw_data",
+      "field_type": "string"
+    },
+    {
+      "name": "time",
+      "field_type": "timestamp"
+    }
+  ],
+  "projected_scan_columns": [],
+  "sql": "SELECT * FROM __nano_lake_source__ WHERE time >= '2026-09-24 07:00:00.000000' AND time < '2026-09-25 07:01:00.000000' AND ((((hasAllTokens(lower(message), '14e0857b37f6c5e5e90bab786a4db8fceb4166afe75e617519d942656976481e') OR hasAllTokens(lower(raw_data), '14e0857b37f6c5e5e90bab786a4db8fceb4166afe75e617519d942656976481e'))) AND lower(\"metadata.log_source\") != 'audit')) ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 10 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=1, optimize_aggregation_in_order=1"
+}

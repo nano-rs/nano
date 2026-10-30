@@ -385,6 +385,17 @@ fn generate_into(
         })
         .collect();
 
+    for source in sources.sources.iter().filter(|source| source.parser_vrl.trim().is_empty()
+        && !(source.extension_enabled && source.extension_vrl.as_deref().is_some_and(|v| !v.trim().is_empty()))) {
+        report.sources.push(SourceReport {
+            slug: source.slug.clone(), log_source_id: source.log_source_id,
+            version_id: source.version_id, version_number: source.version_number,
+            file: overlay::UNPARSED_SOURCES_FILE.into(), components: Vec::new(),
+            changed: is_changed(&source.slug), samples: source.samples.len(), forked_from: None,
+        });
+    }
+    report.sources.sort_by(|a, b| a.slug.cmp(&b.slug));
+
     // -- structural guard ---------------------------------------------------
     let guard_started = Instant::now();
     let verified = overlay::verify_against_base(&base, &candidate);
@@ -415,7 +426,7 @@ fn generate_into(
         }
     };
     if request.require_samples {
-        if let Some(missing) = report.sources.iter().find(|s| s.changed && s.samples == 0) {
+        if let Some(missing) = report.sources.iter().find(|s| s.changed && !s.components.is_empty() && s.samples == 0) {
             let slug = missing.slug.clone();
             fail(
                 report,
@@ -448,7 +459,7 @@ fn generate_into(
         hec_sources: verified.hec_sources.clone(),
         hec_config_sha256: verified.hec_config_sha256.clone(),
         output_guard_sha256: verified.output_guard_sha256.clone(),
-        tenant_sources: verified.tenants.iter().map(|t| t.slug.clone()).collect(),
+        tenant_sources: verified.tenants.iter().map(|t| t.slug.clone()).chain(verified.unparsed_sources.iter().cloned()).collect::<BTreeSet<_>>().into_iter().collect(),
     });
 
     // -- vector test cases ------------------------------------------------------
@@ -1218,7 +1229,7 @@ pub fn finalize_report_with_pull(
             .collect();
         // Every tenant case must have run and passed.
         let mut missing_case = None;
-        for source in report.sources.iter().filter(|s| s.changed) {
+        for source in report.sources.iter().filter(|s| s.changed && !s.components.is_empty()) {
             for index in 0..source.samples {
                 let name = vector_tests::case_name(&source.slug, index);
                 if !seen.iter().any(|(seen, ok)| *seen == name && *ok) {

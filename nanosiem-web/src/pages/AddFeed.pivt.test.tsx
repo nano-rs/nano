@@ -42,12 +42,12 @@ it('open core (no melod): no pivt tab, chat or generate button', () => {
   expect(screen.getByRole('button', { name: /Diagnostics/ })).toBeTruthy();
 });
 
-it('enterprise with AI: pivt tab, chat and regenerate are still offered', () => {
-  mocks.capabilities = { melod: true };
-  render(<VrlPanel {...props} />);
-  expect(screen.getByRole('button', { name: 'pivt' })).toBeTruthy();
-  expect(screen.getByText('Ask pivt')).toBeTruthy();
-  expect(screen.getByText('Regenerate')).toBeTruthy();
+it('enterprise AI uses the global panel button and keeps only Diagnostics and Tests in the editor', () => {
+  mocks.capabilities={melod:true};const onOpenAssistant=vi.fn();
+  render(<VrlPanel {...props} onOpenAssistant={onOpenAssistant}/>);
+  expect(screen.queryByRole('button',{name:'pivt'})).toBeNull();expect(screen.queryByText('Ask pivt')).toBeNull();
+  fireEvent.click(screen.getByRole('button',{name:'Generate with pivt'}));
+  expect(onOpenAssistant).toHaveBeenCalledTimes(1);expect(screen.getByRole('button',{name:/Diagnostics/})).toBeTruthy();
 });
 
 it('NAN-4753: a failed draft shows one sanitized sentence and a Retry, never HTML', () => {

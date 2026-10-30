@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useMemo, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useMemo, useState, type ReactNode } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
@@ -23,6 +23,7 @@ import {
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -54,6 +55,7 @@ import {
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
+import { INGEST_CREDENTIALS_QUERY_KEY } from '@/lib/add-data-sources';
 import type { LogSource } from '@/lib/api';
 import { logSourceTransportLabel } from '@/lib/log-source-transports';
 import { formatCompactNumber, formatRelativeCompact } from '@/lib/date-utils';
@@ -64,10 +66,12 @@ import { TenzirOnlyNote } from '@/components/add-data/TenzirOnlyNote';
 import { useIngestGate } from '@/hooks/use-capabilities';
 import { IngestionActivityChart } from '@/components/log-sources/IngestionActivityChart';
 import { PlatformUpdateBanner } from '@/components/parser-rollout/PlatformUpdateBanner';
-import { logSourceSlugLabel, logSourceSlugs, platformLaneRows, type PlatformLaneRow } from '@/lib/log-source-lanes';
+import { receivingWithoutParser, logSourceSlugLabel, logSourceSlugs, platformLaneRows, type PlatformLaneRow } from '@/lib/log-source-lanes';
 import { usePipeInputSummary } from '@/hooks/use-pipe-inputs';
 import type { PipeInputAttention } from '@/lib/api/pipelines';
 import { DeliveryAttentionBadge } from '@/components/log-sources/DeliveryAttentionBadge';
+import { UnassignedSources, unassignedCredentials } from '@/components/log-sources/UnassignedSources';
+import { AddFeed } from './AddFeed';
 import { RefusedEventsBadge } from '@/components/log-sources/RefusedEventsBadge';
 
 type DerivedStatus = 'deployed' | 'ready' | 'paused' | 'draft';
@@ -148,6 +152,7 @@ export function LogSources() {
 
   const [searchQuery, setSearchQuery] = useState('');
   const [filter, setFilter] = useState<FilterId>('all');
+  const credentials = useQuery({ queryKey: INGEST_CREDENTIALS_QUERY_KEY, queryFn: () => api.listIngestCredentials(), enabled: sharedTenant, refetchInterval: 30_000 });
 
   // Confirmation dialog state — preserved from prior implementation. Toggling a feed
   // is treated as a meaningful operational change (a disabled feed is a real outage
@@ -166,6 +171,8 @@ export function LogSources() {
   const [checkingAssociatedRules, setCheckingAssociatedRules] = useState(false);
 
   const sources = useMemo(() => logSources ?? [], [logSources]);
+  const extraSourceCount = sharedTenant ? unassignedCredentials(credentials.data?.credentials ?? [], sources).length : 0;
+  const visibleExtraCount = filter === 'all' && sharedTenant ? unassignedCredentials(credentials.data?.credentials ?? [], sources, searchQuery).length : 0;
 
   const stats = useMemo(() => {
     let deployed = 0;
@@ -363,13 +370,13 @@ export function LogSources() {
           height left over by the banner and chart, often ~0, and nothing scrolled. */}
       <LogSourcesPageShell active="sources" testId="log-sources-page">
         {tenzirOnly && <TenzirBucketDropLead />}
-        <HeroStrip stats={stats} />
+        <HeroStrip stats={{ ...stats, total: stats.total + extraSourceCount }} />
 
         <div className="shrink-0 border-b border-border bg-background px-4 pt-3 pb-3 flex flex-col gap-3">
           {tenzirOnly && <TenzirOnlyNote />}
           {/* NAN-2607 decision (a): a platform release never overwrites a custom parser; offer the merge. */}
           {sharedTenant && <PlatformUpdateBanner />}
-          <IngestionActivityChart history={ingestionHistory ?? []} />
+          {(!sharedTenant || sources.length > 0 || extraSourceCount > 0) && <IngestionActivityChart history={ingestionHistory ?? []} />}
         </div>
 
         <Toolbar
@@ -377,18 +384,18 @@ export function LogSources() {
           onQueryChange={setSearchQuery}
           filter={filter}
           onFilterChange={setFilter}
-          stats={stats}
+          stats={{ ...stats, total: stats.total + extraSourceCount }}
           onRefresh={refetch}
           canCreate={canCreate}
           onNew={() => navigate('/ingestion/log-sources/new')}
         />
 
         <div className="overflow-x-auto" data-testid="log-sources-table-region">
-          {loading ? (
+          {loading || (sharedTenant && credentials.isPending) ? (
             <div className="flex items-center justify-center py-16">
               <LoadingIcon className="w-6 h-6 text-muted-foreground" />
             </div>
-          ) : filtered.length === 0 && platformRows.length === 0 ? (
+          ) : sharedTenant && sources.length === 0 && extraSourceCount === 0 && canCreate && !searchQuery && filter === 'all' && !credentials.isError ? <div className="p-4"><AddFeed inline /></div> : visibleExtraCount === 0 && !credentials.isError && filtered.length === 0 && platformRows.length === 0 ? (
             <EmptyState
               hasQuery={!!searchQuery || filter !== 'all'}
               canCreate={canCreate}
@@ -398,6 +405,8 @@ export function LogSources() {
           ) : (
             <LogSourceTable
               rows={filtered}
+              hasAdditionalRows={visibleExtraCount > 0 || credentials.isError}
+              additionalRows={sharedTenant && filter === 'all' ? <UnassignedSources sources={sources} canAssign={canDeploy} query={searchQuery} /> : undefined}
               platformRows={platformRows}
               restrictedSet={restrictedSet}
               attentionBySource={attentionBySource}
@@ -494,8 +503,7 @@ function HeroStrip({ stats }: { stats: { total: number; deployed: number; ready:
           </span>
         </div>
         <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed max-w-[740px]">
-          Parsers that normalize incoming events into a structured source type and route them to a repository. Each log
-          source owns its VRL code, validation tests, deploy history, and version log.
+          Review your sources, check their status, and add a source or another sender.
         </div>
       </div>
       <div className="hidden md:flex items-center gap-4 shrink-0">
@@ -598,7 +606,7 @@ function Toolbar({
       {canCreate && (
         <Button size="sm" className="h-8 gap-1.5" onClick={onNew}>
           <Plus className="w-3.5 h-3.5" />
-          New log source
+          Add source
         </Button>
       )}
     </div>
@@ -609,6 +617,8 @@ function Toolbar({
 
 function LogSourceTable({
   rows,
+  additionalRows,
+  hasAdditionalRows = false,
   platformRows = [],
   restrictedSet,
   attentionBySource,
@@ -621,6 +631,8 @@ function LogSourceTable({
   onDelete,
 }: {
   rows: LogSource[];
+  additionalRows?: ReactNode;
+  hasAdditionalRows?: boolean;
   platformRows?: PlatformLaneRow[];
   restrictedSet: Set<string>;
   attentionBySource?: Map<string, PipeInputAttention[]>;
@@ -634,7 +646,7 @@ function LogSourceTable({
 }) {
   // NAN-2361 hosted-shared tenants: the list carries a per-source 24h lake
   // ingestion summary; dedicated deployments do not (column hidden).
-  const showIngest = rows.some((ls) => ls.ingest != null) || platformRows.length > 0;
+  const showIngest = rows.some((ls) => ls.ingest != null) || platformRows.length > 0 || hasAdditionalRows;
   return (
     <div className="@container/table">
       <table className="w-full text-[12px]">
@@ -660,10 +672,11 @@ function LogSourceTable({
             <th className="text-left font-medium text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground py-2 w-[130px] @max-[640px]/table:w-[60px]">
               Enabled
             </th>
-            <th className="w-[44px] py-2"></th>
+            <th className={hasAdditionalRows ? "w-40 py-2" : "w-[44px] py-2"}></th>
           </tr>
         </thead>
         <tbody>
+          {additionalRows}
           {rows.map((ls) => (
             <LogSourceRow
               key={ls.id}
@@ -726,7 +739,7 @@ function IngestSummaryCell({ summary }: { summary: LogSource['ingest'] | null })
         <RefusedEventsBadge count={summary.refused_events_24h} sample={summary.last_refusal} compact />
       </div>
       <div className="text-[10.5px] font-mono text-muted-foreground">
-        {summary.last_event_at ? `last ${formatRelativeCompact(summary.last_event_at)}` : 'no events'}
+        {summary.last_event_at ? `Receiving · last ${formatRelativeCompact(summary.last_event_at)}` : 'Waiting for first event'}
       </div>
     </div>
   );
@@ -758,6 +771,8 @@ function LogSourceRow({
   onDelete: (ls: LogSource) => void;
 }) {
   const navigate = useNavigate();
+  const [params] = useSearchParams();
+  const highlighted = params.get("highlight") === source.id;
   const status = deriveStatus(source);
   const pending = derivePendingDeploy(source);
   const warn = pending; // single warn signal until backend ships richer health data
@@ -765,7 +780,8 @@ function LogSourceRow({
 
   return (
     <tr
-      className="border-b border-border cursor-pointer group hover:bg-foreground/[0.03]"
+      data-highlighted={highlighted || undefined}
+      className={cn("border-b border-border cursor-pointer group hover:bg-foreground/[0.03]", highlighted && "bg-accent outline outline-1 outline-primary -outline-offset-1")}
       onClick={() => navigate(`/ingestion/log-sources/${source.id}`)}
     >
       {/* Feed */}
@@ -879,7 +895,7 @@ function LogSourceRow({
 
       {/* Status */}
       <td className="py-3 align-top">
-        <StatusBadge status={status} validated={source.validated} validationError={source.validation_error} />
+        <StatusBadge notParsed={receivingWithoutParser(source)} status={status} validated={source.validated} validationError={source.validation_error} />
       </td>
 
       {/* Enabled */}
@@ -908,7 +924,10 @@ function LogSourceRow({
 
       {/* Overflow */}
       <td className="pr-3 py-3 align-top">
-        <div onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+          {canEdit && receivingWithoutParser(source) && <Button variant="outline" size="sm" asChild>
+            <Link to={`/ingestion/log-sources/new?source_id=${encodeURIComponent(source.id)}&stage=parse`}>Build parser</Link>
+          </Button>}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
@@ -1045,11 +1064,14 @@ function StatusBadge({
   status,
   validated,
   validationError,
+  notParsed,
 }: {
+  notParsed?: boolean;
   status: DerivedStatus;
   validated: boolean;
   validationError?: string;
 }) {
+  if (notParsed) return <Badge variant="warning" className="whitespace-nowrap text-[10.5px] font-medium px-1.5">Receiving · not parsed</Badge>;
   // NAN-1920: a wizard draft (onboarded, not yet deployed) is its own first-
   // class state and wins over every other badge — a draft is typically also
   // unvalidated, but we surface the more meaningful "in progress" signal.
@@ -1175,7 +1197,7 @@ function EmptyState({
         {canCreate && (
           <Button size="sm" className="h-8 gap-1.5" onClick={onNew}>
             <Plus className="w-3.5 h-3.5" />
-            New log source
+            Add source
           </Button>
         )}
       </div>

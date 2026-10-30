@@ -1,0 +1,16 @@
+# NAN-4846: authenticated request identity, never a content fingerprint.
+nano_key_verified = false
+nano_key_parts = split(nano_event_key, ".")
+if length(nano_key_parts) == 5 && (string(nano_key_parts[0]) ?? "") == "nek2" {
+    nano_key_received = string(nano_key_parts[1]) ?? ""
+    nano_key_receipt = string(nano_key_parts[2]) ?? ""
+    nano_key_ordinal = string(nano_key_parts[4]) ?? ""
+    nano_key_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
+    nano_key_mac = slice(encode_base16(hmac("nanosiem.event-key.v1:" + nano_key_received + ":" + nano_key_receipt, nano_key_token)), 0, 32) ?? ""
+    nano_key_received_ms = to_int(nano_key_received) ?? -1
+    if nano_key_token != "" && nano_key_received_ms >= 0 && nano_key_received_ms < 360000000000000 && match(nano_key_received, r'^[0-9]{1,15}$') && match(nano_key_receipt, r'^[0-9a-f]{64}$') && match(nano_key_ordinal, r'^[0-9]{1,9}$') && (string(nano_key_parts[3]) ?? "") == nano_key_mac {
+        %nano_event_key = nano_key_receipt + ":" + nano_key_ordinal
+        %nano_request_hour = to_int(floor(nano_key_received_ms / 3600000))
+        nano_key_verified = true
+    }
+}

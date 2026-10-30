@@ -85,10 +85,10 @@ describe('SourceWritersCard (NAN-2597)', () => {
     expect(empty.getAttribute('href')).toBe(addDataLink('apache_access'));
   });
 
-  it('opens the source picker for several labels and hides the action without permission (NAN-2946)', async () => {
+  it('opens the collector connection for several labels and hides the action without permission (NAN-2946)', async () => {
     mocks.byLogSource.mockResolvedValue({ source_slugs: ['a', 'b'], writers: [] });
     renderCard({ logSourceId: 'lsrc_2', canRevoke: true, canIssue: true });
-    expect((await screen.findByTestId('source-writers-issue')).getAttribute('href')).toBe(addDataLink());
+    expect((await screen.findByTestId('source-writers-issue')).getAttribute('href')).toBe(`${addDataLink()}?sources=a%2Cb`);
     cleanup();
     mocks.byLogSource.mockResolvedValue({ source_slugs: ['a'], writers: [] });
     renderCard({ logSourceId: 'lsrc_3', canRevoke: true });
