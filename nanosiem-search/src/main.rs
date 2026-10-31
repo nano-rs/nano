@@ -395,6 +395,7 @@ async fn main() -> Result<()> {
     let (search_metrics, prometheus_layer) = SearchMetrics::new();
 
     // Create router
+    let private_app = nanosiem_search::create_internal_router(state.clone(), &search_metrics);
     let app = create_router(state, search_metrics, prometheus_layer, &config);
 
     // Start server with ConnectInfo support for capturing client IP addresses
@@ -402,6 +403,10 @@ async fn main() -> Result<()> {
     tracing::info!("Starting server on {}", bind_address);
 
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
+    if config.port == nanosiem_search::INTERNAL_SEARCH_PORT {
+        anyhow::bail!("public Search port conflicts with the reserved private service port");
+    }
+    let private_listener = tokio::net::TcpListener::bind(("0.0.0.0", nanosiem_search::INTERNAL_SEARCH_PORT)).await?;
     let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
     let allocator_trim_shutdown = nanosiem_core::shutdown::ShutdownToken::new();
     let allocator_trim_handle =
@@ -422,6 +427,19 @@ async fn main() -> Result<()> {
     let server = axum::serve(listener, make_service).with_graceful_shutdown(async move {
         graceful_shutdown.cancelled().await;
     });
+    let private_shutdown = server_shutdown.clone();
+    let private_server = axum::serve(
+        private_listener,
+        private_app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        private_shutdown.cancelled().await;
+    });
+    let server = async move {
+        use std::future::IntoFuture;
+        tokio::try_join!(server.into_future(), private_server.into_future())?;
+        Ok::<(), std::io::Error>(())
+    };
     let cleanup = async move {
         election_shutdown.cancel();
         allocator_trim_shutdown.cancel();

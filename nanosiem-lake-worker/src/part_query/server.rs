@@ -3630,6 +3630,7 @@ impl nanosiem_lake_cell::child::TenantService for QueryService {
     fn heartbeat(&self) -> nanosiem_lake_cell::contract::Heartbeat {
         let inflight = self.inflight.load(Ordering::Relaxed);
         nanosiem_lake_cell::contract::Heartbeat {
+            ingest_pending_input: None,
             agent_catalog_custody: None,
             startup_progress: None,
             busy: inflight > 0,

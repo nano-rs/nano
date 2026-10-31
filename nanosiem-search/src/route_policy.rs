@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Authoritative registration and capability policy for the Search product router.
-//! Public probes are explicit. Internal transport/metrics routers retain their
-//! independent bearer boundaries and are outside this product manifest.
+//! Public probes are explicit. Internal transport/metrics have a separate
+//! service-identity registry and private listener in the production composition.
 use crate::{handlers, middleware::AuthContext, SearchState};
 use axum::{
     extract::{MatchedPath, Request},
@@ -191,6 +191,11 @@ mod tests {
                 .env("NANO_LAKE_SCHEMA_MANIFEST", manifest)
                 .env("NANO_SCHEMA_PROFILE", "ocsf")
                 .env("NANO_IP_ALLOWLIST_DISABLED", "true")
+                .env("METRICS_AUTH_TOKEN", "fixture-search-metrics-service")
+                .env(
+                    "NANOSIEM_INPUTLOOKUP_EGRESS_CHECK_TOKEN",
+                    "fixture-search-egress-service",
+                )
                 .env_remove("DEPLOYMENT_MODE")
                 .env_remove("NANO_LOG_QUERY_BACKEND")
                 .env_remove("NANO_LAKE_CELL_ROUTES_FILE")
@@ -434,10 +439,12 @@ mod tests {
         }
 
         // Exercise the complete production composition, including CORS,
-        // sanitization, internal merges and the tenant-alias redispatcher. Only
+        // sanitization, private-listener absence and tenant-alias redispatcher. Only
         // credential resolution is replaced by already-authenticated extensions.
         state.auth_state.auth_enabled = false;
         let (metrics, layer) = crate::SearchMetrics::new();
+        let private_rows = crate::internal_route_manifest(state.clone(), &metrics);
+        let private_app = crate::create_internal_router(state.clone(), &metrics);
         let app = crate::create_router(
             state,
             metrics,
@@ -450,6 +457,7 @@ mod tests {
         .layer(Extension(axum::extract::ConnectInfo(
             "203.0.113.5:1234".parse::<std::net::SocketAddr>().unwrap(),
         )));
+        private_service_http_matrix(&app, &private_app, &private_rows).await;
         let scoped = nanosiem_api_lib::tenant_path::scoped_api_router(app.clone()).layer(
             Extension(nanosiem_core::auth::TrustedTenantContext {
                 tenant_id: uuid::Uuid::from_u128(1),
@@ -554,21 +562,21 @@ mod tests {
             }
         }
 
-        // Merged infrastructure routers retain Axum's empty 404 fallback.
-        // An unmatched path reaches no handler; an unsupported method on a
-        // registered product path is denied by its missing method policy.
+        // Infrastructure is no longer merged into this listener. Its actual
+        // product policy guard now also owns the fallback: unknown paths and
+        // unsupported methods deny with missing-policy evidence, before handlers.
         for (method, path, expected) in [
-            ("GET", "/not-a-route", StatusCode::NOT_FOUND),
-            ("POST", "/api/search/", StatusCode::NOT_FOUND),
-            ("POST", "/api/search//", StatusCode::NOT_FOUND),
-            ("POST", "/api/search/unknown/nested", StatusCode::NOT_FOUND),
-            ("POST", "/api/search%2fstream", StatusCode::NOT_FOUND),
+            ("GET", "/not-a-route", StatusCode::FORBIDDEN),
+            ("POST", "/api/search/", StatusCode::FORBIDDEN),
+            ("POST", "/api/search//", StatusCode::FORBIDDEN),
+            ("POST", "/api/search/unknown/nested", StatusCode::FORBIDDEN),
+            ("POST", "/api/search%2fstream", StatusCode::FORBIDDEN),
             ("PATCH", "/api/search", StatusCode::FORBIDDEN),
             ("HEAD", "/api/search", StatusCode::FORBIDDEN),
             ("HEAD", "/api/search/sql", StatusCode::FORBIDDEN),
-            ("GET", "/livez/", StatusCode::NOT_FOUND),
+            ("GET", "/livez/", StatusCode::FORBIDDEN),
             ("POST", "/livez", StatusCode::FORBIDDEN),
-            ("POST", "/t/acme/api/search/", StatusCode::NOT_FOUND),
+            ("POST", "/t/acme/api/search/", StatusCode::FORBIDDEN),
         ] {
             let response = with_principal(scoped.clone(), principal(true, vec![]))
                 .oneshot(
@@ -582,11 +590,15 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), expected, "{method} {path}");
-            if expected == StatusCode::NOT_FOUND {
-                assert!(axum::body::to_bytes(response.into_body(), 1024)
-                    .await
-                    .unwrap()
-                    .is_empty());
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            if method != "HEAD" {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+                    "route_policy_missing",
+                    "unclassified path/method: {method} {path}"
+                );
             }
         }
         for path in ["/api/search", "/api/search/sql", "/api/search/stream"] {
@@ -729,5 +741,152 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+    /// Extends this one production-app matrix to every private transport and
+    /// metrics row. No replacement handler/state constructor is introduced.
+    async fn private_service_http_matrix(
+        public: &Router,
+        private: &Router,
+        rows: &[nanosiem_api_lib::route_policy::Entry],
+    ) {
+        use nanosiem_core::auth::route_policy::AuthMode;
+        assert_eq!(rows.len(), if cfg!(feature = "enterprise") { 3 } else { 2 });
+        let mut probes = 0;
+        for row in rows {
+            assert!(matches!(
+                row.policy.auth_mode(),
+                AuthMode::ServiceIdentity(_)
+            ));
+            let (header, credential) = match row.policy.auth_mode() {
+                AuthMode::ServiceIdentity("operations-collector") => {
+                    ("authorization", "Bearer fixture-search-metrics-service")
+                }
+                AuthMode::ServiceIdentity("hosted-config-reader") => (
+                    "x-nano-service-authorization",
+                    "Bearer fixture-search-metrics-service",
+                ),
+                AuthMode::ServiceIdentity("inputlookup-egress-proxy") => {
+                    ("authorization", "Bearer fixture-search-egress-service")
+                }
+                _ => panic!("review the new service fixture"),
+            };
+            for credential in [
+                None,
+                Some("Bearer customer-jwt"),
+                Some("Bearer unrelated-service"),
+            ] {
+                let mut request = Request::builder()
+                    .method(row.method)
+                    .uri(&row.path)
+                    .header("content-type", "application/json");
+                if let Some(value) = credential {
+                    request = request.header(header, value);
+                }
+                let response = private
+                    .clone()
+                    .oneshot(request.body(Body::from("{malformed")).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{} {}",
+                    row.method,
+                    row.path
+                );
+                probes += 1;
+            }
+            let request = |method: &str| {
+                Request::builder()
+                    .method(method)
+                    .uri(&row.path)
+                    .header(header, credential)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{malformed"))
+                    .unwrap()
+            };
+            let response = private.clone().oneshot(request(row.method)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                if row.method == "GET" {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                "private {}",
+                row.path
+            );
+            let public_response = public.clone().oneshot(request(row.method)).await.unwrap();
+            assert_eq!(
+                public_response.status(),
+                StatusCode::FORBIDDEN,
+                "service must be absent from public registration: {}",
+                row.path
+            );
+            let body = axum::body::to_bytes(public_response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+                "route_policy_missing",
+                "public listener must have no private registration: {}",
+                row.path
+            );
+            probes += 2;
+            if row.method == "GET" {
+                assert_eq!(
+                    private
+                        .clone()
+                        .oneshot(request("HEAD"))
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::OK
+                );
+                probes += 1;
+            }
+            let response = private.clone().oneshot(request("DELETE")).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "undeclared private verb"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
+                "route_policy_missing"
+            );
+            probes += 1;
+            let duplicate = Request::builder()
+                .method(row.method)
+                .uri(&row.path)
+                .header(header, credential)
+                .header(header, credential)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                private.clone().oneshot(duplicate).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+            probes += 1;
+        }
+        assert_eq!(
+            private
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/internal/unclassified")
+                        .header("authorization", "Bearer fixture-search-metrics-service")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        eprintln!("Search private production RoutePolicy matrix: {probes} HTTP probes");
     }
 }

@@ -5002,10 +5002,11 @@ impl<'a> Ingestor<'a> {
     /// its source GET, digest and footer read: an object that kills ingest
     /// there must be charged like one that kills it in decode (it used to
     /// loop forever, uncounted). Charged now when it is the only object
-    /// offered (it can only be admitted alone).
-    fn record_before_fetch(&mut self, notice: &SourceNotice, offered: usize) -> String {
+    /// offered (it can only be admitted alone). A cold-calibration probe
+    /// records only the object it touches, without charging a poison trial.
+    fn record_before_fetch(&mut self, notice: &SourceNotice, offered: usize, charge_singleton: bool) -> String {
         let id = object_id(&notice.key, &notice.version);
-        if let Err(error) = self.admission_attempts.begin_group([id.as_str()], offered == 1, offered) {
+        if let Err(error) = self.admission_attempts.begin_group([id.as_str()], offered == 1 && charge_singleton, offered) {
             tracing::warn!(error = %format!("{error:#}"), "admission attempt ledger not written");
         }
         id
@@ -5160,12 +5161,15 @@ impl<'a> Ingestor<'a> {
         // Arrow columns can be wider than dictionary-encoded footer bytes.
         // Continue in the SAME tick; warm-up must not add a per-object idle
         // second or change the admission rate used by the age policy.
+        // Recovery owns its group boundary: splitting that group for a
+        // measurement would change bisection and spend singleton trials.
         if notices.len() > 1 && self.calibration.arrow_row_bytes() == 0
+            && !self.admission_attempts.has_suspects() && !self.admission_attempts.has_isolating()
             && super::memory::memory_derived_flush_limits(self.working_budget()) {
             let previous = (self.last_admit_ms, self.health.eps_ewma);
             let (mut rows, mut duplicates, mut next) = (0, 0, 0);
             while next < notices.len() && self.calibration.arrow_row_bytes() == 0 {
-                let admitted = self.admit_with_calibration(&notices[next..next + 1], now_ms, true).await?;
+                let admitted = self.admit_with_calibration(&notices[next..next + 1], now_ms, true, false).await?;
                 rows += admitted.0;
                 duplicates += admitted.1;
                 next += 1;
@@ -5175,7 +5179,7 @@ impl<'a> Ingestor<'a> {
             // from supplying the cold measurement in this same bounded tick.
             if next < notices.len() && !self.admission_deferred
                 && (self.buffer.rows as u64) < self.flush_row_cap() {
-                let admitted = self.admit_with_calibration(&notices[next..], now_ms, true).await?;
+                let admitted = self.admit_with_calibration(&notices[next..], now_ms, true, true).await?;
                 rows += admitted.0;
                 duplicates += admitted.1;
             }
@@ -5184,11 +5188,14 @@ impl<'a> Ingestor<'a> {
             self.record_admission_rate(rows, now_ms);
             return Ok((rows, duplicates));
         }
-        self.admit_with_calibration(notices, now_ms, true).await
+        self.admit_with_calibration(notices, now_ms, true, true).await
     }
 
+    /// `charge_singleton` is false only for a cold-calibration probe split
+    /// out of a larger offer. Record its real in-flight identity, but never
+    /// treat the measurement as an isolated poison trial, even on fallback.
     async fn admit_with_calibration(&mut self, notices: &[(NoticeHandle, SourceNotice)], now_ms: i64,
-        calibrated: bool) -> Result<(u64, u64)> {
+        calibrated: bool, charge_singleton: bool) -> Result<(u64, u64)> {
         let sliced_before = (self.health.objects_admitted_in_slices_total, self.health.objects_sliced_beside_flights_total);
         let deferred_before = self.admission_deferred;
         // NAN-3899: read each row's credential only when activity is kept.
@@ -5222,7 +5229,7 @@ impl<'a> Ingestor<'a> {
                 }
             }
             if files.is_empty() && recorded.is_none() && idle && self.buffer.handles.is_empty() {
-                recorded = Some(self.record_before_fetch(notice, notices.len()));
+                recorded = Some(self.record_before_fetch(notice, notices.len(), charge_singleton));
             }
             let target = src_dir.join(format!("fetch-{}.parquet", uuid::Uuid::new_v4().simple()));
             let fetched = match (&replay, &self.quarantine) {
@@ -5334,7 +5341,7 @@ impl<'a> Ingestor<'a> {
             self.mark_since(now_ms);
             return Ok((0, 0));
         }
-        self.begin_admission(&files, idle && self.buffer.handles.is_empty(), recorded.as_deref());
+        self.begin_admission(&files, idle && self.buffer.handles.is_empty() && charge_singleton, recorded.as_deref());
         // NAN-4553: the lone oversized object, cut into slice files that
         // carry its identity (handle, notice, sha, bytes) and are admitted
         // one after another; only their Arrow rows accumulate.
@@ -5531,7 +5538,7 @@ impl<'a> Ingestor<'a> {
                     // instead of reporting/refusing the same object twice.
                     let retry = notices.iter().filter(|(handle, _)| !self.buffer.handle_names.contains(&handle.0))
                         .cloned().collect::<Vec<_>>();
-                    return Box::pin(self.admit_with_calibration(&retry, now_ms, false)).await;
+                    return Box::pin(self.admit_with_calibration(&retry, now_ms, false, charge_singleton)).await;
                 }
                 Err(error) if is_transient(&error) => {
                     // NAN-4553: the next admission cuts its own slices.

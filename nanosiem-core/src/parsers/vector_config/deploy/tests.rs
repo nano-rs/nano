@@ -726,13 +726,10 @@ fn lake_ocsf_sink_writes_only_canonical_parquet_roots() {
     }
 }
 
-/// NAN-3492: the bronze sink acks end to end, so `/ingest` answers a POST
-/// only after its batch's PUT. The compose files pinned the batch timeout at
-/// 5 s after the generated sink moved to 1 s (NAN-2432), which held one
-/// sequential sender to one bronze object (one POST) per 5 s on every
-/// self-hosted lean install. Their default must match the generated sink.
+/// Durable HEC/HTTP receipts include the sink batch timer. Open core bounds
+/// group commit to 50 ms; the hosted generator retains its object-size policy.
 #[test]
-fn compose_vector_lake_batch_timeout_matches_generated_sink_default() {
+fn compose_vector_lake_batch_timeout_bounds_durable_ack_latency() {
     let sink = VectorConfigManager::lake_ocsf_sink_content(&["\"x\"".to_string()], true);
     assert!(
         sink.contains("timeout_secs = ${VECTOR_LAKE_BATCH_TIMEOUT_SECS:-1}"),
@@ -763,10 +760,15 @@ fn compose_vector_lake_batch_timeout_matches_generated_sink_default() {
             !pins.is_empty(),
             "{name} no longer sets VECTOR_LAKE_BATCH_TIMEOUT_SECS"
         );
+        let expected = if *name == "docker-compose.opensource.yml" {
+            "0.05"
+        } else {
+            "1"
+        };
         for pin in pins {
             assert_eq!(
-                pin, "VECTOR_LAKE_BATCH_TIMEOUT_SECS: ${VECTOR_LAKE_BATCH_TIMEOUT_SECS:-1}",
-                "{name}: a longer bronze batch timeout delays every acked /ingest POST"
+                pin, format!("VECTOR_LAKE_BATCH_TIMEOUT_SECS: ${{VECTOR_LAKE_BATCH_TIMEOUT_SECS:-{expected}}}"),
+                "{name}: the bronze batch timer delays every durable HEC/HTTP receipt"
             );
         }
     }

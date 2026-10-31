@@ -28,35 +28,24 @@ impl AppMetrics {
         )
     }
 
-    /// Create the metrics endpoint router.
-    /// If `METRICS_AUTH_TOKEN` is set, requires `Authorization: Bearer <token>`.
-    /// The comparison is constant-time (NAN-2361): `/metrics` is mounted
-    /// outside the auth layer and the IP allowlist, so the bearer check is
-    /// the only fence and must not leak the token through timing.
-    pub fn metrics_router(&self) -> Router {
+    /// Service-only metrics registration, merged only by a private listener.
+    pub fn registered_routes(&self) -> nanosiem_api_lib::route_policy::Router {
+        use nanosiem_api_lib::route_policy::{Router, routing::get};
+        use nanosiem_core::auth::route_policy::RoutePolicy;
         let handle = self.prometheus_handle.clone();
-        let required_token = configured_metrics_auth_token();
-        Router::new().route(
-            "/metrics",
-            get(move |headers: HeaderMap| {
-                let handle = handle.clone();
-                let required_token = required_token.clone();
-                async move {
-                    if let Some(expected) = &required_token {
-                        let provided = headers
-                            .get("authorization")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|v| v.strip_prefix("Bearer "));
-                        match provided {
-                            Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {}
-                            _ => return Err(StatusCode::UNAUTHORIZED),
-                        }
-                    }
-                    Ok(handle.render())
-                }
-            }),
-        )
+        Router::new().route("/metrics", get(move || {
+            let handle = handle.clone();
+            async move { handle.render() }
+        }, RoutePolicy::service("operations-collector", "telemetry:read")))
     }
+
+    /// Standalone private telemetry app; missing configuration always denies.
+    pub fn metrics_router(&self) -> Router {
+        self.registered_routes().into_private_router(
+            nanosiem_api_lib::route_policy::ServiceAuthenticators::default()
+                .bearer("operations-collector", configured_metrics_auth_token(), "authorization"))
+    }
+
 }
 
 /// `METRICS_AUTH_TOKEN` when set to a non-empty value.
@@ -115,10 +104,12 @@ mod tests {
         metrics::gauge!("nano_lake_detection_in_flight", "tenant" => tenant.to_string()).set(2.0);
         let summary = nanosiem_core::detection::schedule_lag::summarize_schedule_lag(&[], chrono::Utc::now());
         nanosiem_core::detection::schedule_lag::record_schedule_lag(&summary, Some(tenant));
-        let router = app_metrics.metrics_router().layer(layer);
+        let router = app_metrics.registered_routes().into_private_router(
+            nanosiem_api_lib::route_policy::ServiceAuthenticators::default()
+                .bearer("operations-collector",Some("fixture-metrics".into()),"authorization")).layer(layer);
         let scrape = |router: Router| async move {
             let response = router
-                .oneshot(axum::http::Request::builder().uri("/metrics").body(axum::body::Body::empty()).unwrap())
+                .oneshot(axum::http::Request::builder().uri("/metrics").header("authorization","Bearer fixture-metrics").body(axum::body::Body::empty()).unwrap())
                 .await
                 .unwrap();
             let status = response.status();
@@ -126,7 +117,7 @@ mod tests {
             (status, String::from_utf8_lossy(&body).to_string())
         };
         let (status, body) = scrape(router).await;
-        // METRICS_AUTH_TOKEN unset in the test process: the endpoint is open.
+        // The production metrics registration requires the telemetry service credential.
         assert_eq!(status, StatusCode::OK);
         for series in [
             "nano_lake_detection_claim_slots",

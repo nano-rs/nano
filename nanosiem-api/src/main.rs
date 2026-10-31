@@ -504,12 +504,8 @@ async fn server_main() -> Result<()> {
     tracing::info!("Prometheus metrics initialized");
 
     // Create router with metrics layer
-    let app = create_router(state.clone())
-        .layer(prometheus_layer)
-        .merge(app_metrics.metrics_router())
-        .merge(nanosiem_api::hosted_config_router())
-        .merge(nanosiem_api::soar_egress_router(&state))
-        .merge(nanosiem_api::handlers::egress::runtime_router(&state, std::path::Path::new(nanosiem_api::handlers::egress::RUNTIME_ADMISSION_PATH)));
+    let private_app = nanosiem_api::create_internal_router(&state, &app_metrics);
+    let app = create_router(state.clone()).layer(prometheus_layer);
 
     let wait_for_shutdown = async {
         match nanosiem_core::shutdown::wait_for_shutdown_signal().await {
@@ -523,12 +519,29 @@ async fn server_main() -> Result<()> {
     tracing::info!("Starting server on {}", bind_address);
 
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
+    if config.port == nanosiem_api::INTERNAL_API_PORT {
+        anyhow::bail!("public API port conflicts with the reserved private service port");
+    }
+    let private_listener = tokio::net::TcpListener::bind((config.host.as_str(), nanosiem_api::INTERNAL_API_PORT)).await?;
     let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
     let server_shutdown = nanosiem_core::shutdown::ShutdownToken::new();
     let graceful_shutdown = server_shutdown.clone();
     let server = axum::serve(listener, make_service).with_graceful_shutdown(async move {
         graceful_shutdown.cancelled().await;
     });
+    let private_shutdown = server_shutdown.clone();
+    let private_server = axum::serve(
+        private_listener,
+        private_app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        private_shutdown.cancelled().await;
+    });
+    let server = async move {
+        use std::future::IntoFuture;
+        tokio::try_join!(server.into_future(), private_server.into_future())?;
+        Ok::<(), std::io::Error>(())
+    };
     let cleanup_state = state.clone();
     let cleanup = async move {
         tracing::info!("Stopping background tasks...");

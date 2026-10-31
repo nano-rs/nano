@@ -224,6 +224,128 @@ impl Lab {
     }
 }
 
+/// NAN-4876: even a death inside the sample's fetch records only that
+/// object, uncharged. Later notices have never been in flight.
+#[tokio::test(flavor = "current_thread")]
+async fn nan4876_failed_cold_fetch_records_only_the_sample_without_charging_it() {
+    let root = tempfile::tempdir().unwrap();
+    let lab = Lab::new(root.path());
+    std::fs::create_dir_all(lab.root.join("sources/bronze/sample.parquet")).unwrap();
+    lab.spool.deliver(&notice("bronze/sample.parquet", CLOCK - 3_000)).unwrap();
+    lab.object("after-a", &(0..2).map(event).collect::<Vec<_>>(), CLOCK - 2_000);
+    lab.object("after-b", &(100..104).map(event).collect::<Vec<_>>(), CLOCK - 1_000);
+    let mut ingestor = lab.open().await.unwrap();
+    for retry in 0..2 {
+        assert!(ingestor.tick(CLOCK + retry).await.is_err());
+        assert!(ingestor.quarantine_entries().unwrap().is_empty());
+    }
+    drop(ingestor);
+    let ledger = AdmissionAttempts::open(&lab.root.join("work"));
+    assert_eq!(ledger.suspect(&object_id("bronze/sample.parquet", "1")), Some(0));
+    for name in ["after-a", "after-b"] {
+        assert_eq!(ledger.suspect(&object_id(&format!("bronze/{name}.parquet"), "1")), None);
+    }
+    assert_eq!(lab.spool.pending(10).await.unwrap().len(), 3, "nothing acknowledged");
+}
+
+/// NAN-4876: a calibration sample is a memory measurement, not an isolated
+/// poison trial. Die in the NEXT object's fetch: the healthy sample must
+/// remain uncharged, and objects never reached must stay out of the ledger.
+/// Recovery then names the failing object on its own, exhausts exactly its
+/// own crash budget, and commits every healthy row through the real writer.
+#[tokio::test(flavor = "current_thread")]
+async fn nan4876_cold_sample_cannot_spend_another_objects_quarantine_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let lab = Lab::new(root.path());
+    let before = (0..2).map(event).collect::<Vec<_>>();
+    let after = (100..104).map(event).collect::<Vec<_>>();
+    lab.object("sample", &before, CLOCK - 3_000);
+    let poison_path = lab.root.join("sources/bronze/poison.parquet");
+    std::fs::create_dir_all(&poison_path).unwrap(); // deterministic fetch failure
+    lab.spool.deliver(&notice("bronze/poison.parquet", CLOCK - 2_000)).unwrap();
+    lab.object("after", &after, CLOCK - 1_000);
+    let id = |name: &str| object_id(&format!("bronze/{name}.parquet"), "1");
+    let ledger = || AdmissionAttempts::open(&lab.root.join("work"));
+
+    let mut ingestor = lab.open().await.unwrap();
+    assert!(ingestor.tick(CLOCK).await.is_err(), "dies fetching poison after measuring sample");
+    assert!(ingestor.calibration.arrow_row_bytes() > 0, "exercised cold calibration");
+    assert_eq!(ingestor.buffer.rows, 2, "sample really was admitted before the failure");
+    assert!(ingestor.quarantine_entries().unwrap().is_empty());
+    drop(ingestor); // abnormal exit: no forgiveness
+    assert_eq!(ledger().suspect(&id("sample")), Some(0), "calibration never charges the healthy sample");
+    assert_eq!(ledger().suspect(&id("poison")), None, "not admitted from idle yet");
+    assert_eq!(ledger().suspect(&id("after")), None, "never in flight");
+    assert_eq!(lab.spool.pending(10).await.unwrap().len(), 3);
+
+    // The healthy sample recovers and commits. The subsequent fetch death
+    // offered poison beside after, so it records a suspect without a charge.
+    let mut ingestor = lab.open().await.unwrap();
+    assert_eq!(ingestor.tick(CLOCK + 1).await.unwrap().admitted_rows, 2);
+    assert!(ingestor.tick(CLOCK + 2).await.unwrap().flushed_parts > 0);
+    assert_eq!(ingestor.health().rows_committed_total, 2);
+    assert!(ingestor.tick(CLOCK + 3).await.is_err());
+    drop(ingestor);
+    assert_eq!(ledger().suspect(&id("sample")), None, "acknowledged sample forgotten");
+    assert_eq!(ledger().suspect(&id("poison")), Some(0), "a group fetch death does not name a culprit");
+    assert_eq!(ledger().suspect(&id("after")), None);
+
+    // Only poison's isolated admissions spend its budget. Retrying within
+    // one process also must not count as another death or quarantine early.
+    for crashes in 1..=MAX_ADMISSION_CRASHES {
+        let mut ingestor = lab.open().await.unwrap();
+        for retry in 0..2 {
+            assert!(ingestor.tick(CLOCK + 10 + crashes as i64 * 2 + retry).await.is_err());
+            assert!(ingestor.quarantine_entries().unwrap().is_empty(), "before crash {crashes}");
+            assert_eq!(ingestor.health().objects_admission_crashed_total, 0);
+            assert_eq!(lab.spool.pending(10).await.unwrap().len(), 2, "neither object ACKed");
+        }
+        drop(ingestor);
+        assert_eq!(ledger().suspect(&id("poison")), Some(crashes));
+        assert_eq!(ledger().suspect(&id("after")), None, "later data never charged");
+    }
+
+    // Make the bytes readable for the quarantine copy; do not change its
+    // source identity or ledger. The next process refuses it BEFORE decode.
+    std::fs::remove_dir(&poison_path).unwrap();
+    write_bronze(&poison_path, &(200..206).map(event).collect::<Vec<_>>());
+    let mut ingestor = lab.open().await.unwrap();
+    assert_eq!(ingestor.tick(CLOCK + 100).await.unwrap().admitted_rows, 0);
+    let entries = ingestor.quarantine_entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].source_key, "bronze/poison.parquet");
+    assert_eq!(entries[0].rows_rejected, 6);
+    assert!(entries[0].detail.contains(&format!("ingest died {MAX_ADMISSION_CRASHES} times")));
+    assert_eq!(ingestor.health().objects_admission_crashed_total, 1);
+    assert_eq!(ingestor.tick(CLOCK + 101).await.unwrap().admitted_rows, 4);
+    ingestor.flush_now(CLOCK + 102).await.unwrap();
+    ingestor.tick(CLOCK + 103).await.unwrap();
+    assert!(lab.spool.pending(10).await.unwrap().is_empty());
+    assert!(ledger().is_empty());
+
+    // Reconcile actual published UIDs across both processes' commits.
+    let live_ids = ingestor.live_parts().iter().map(|p| p.part_id.to_string()).collect::<Vec<_>>();
+    let mut stored_uids = BTreeSet::new();
+    let mut stored_rows = 0;
+    for key in lab.parts.list("").await.unwrap() {
+        if !key.contains("/data-") || !key.ends_with(".parquet") || !live_ids.iter().any(|id| key.contains(id.as_str())) { continue; }
+        let data = bytes::Bytes::from(lab.parts.get(&key).await.unwrap().unwrap());
+        for batch in parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(data).unwrap().build().unwrap() {
+            let mut json = arrow_json::LineDelimitedWriter::new(Vec::new());
+            json.write(&batch.unwrap()).unwrap();
+            json.finish().unwrap();
+            for line in json.into_inner().split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                let row: Value = serde_json::from_slice(line).unwrap();
+                stored_uids.insert(row["metadata"]["uid"].as_str().unwrap().to_string());
+                stored_rows += 1;
+            }
+        }
+    }
+    assert_eq!(stored_rows, 6, "every healthy row stored once; poison never stored");
+    assert_eq!(stored_uids, before.iter().chain(after.iter())
+        .map(|row| row["metadata"]["uid"].as_str().unwrap().to_string()).collect());
+}
+
 /// NAN-4553 (review P2): recovery bisects. 16 objects in flight, one of
 /// them kills ingest whenever it is admitted. Recovery used to flush every
 /// suspect alone (15 healthy flushes; up to ~512 on a full buffer); now
@@ -352,10 +474,10 @@ async fn a_coded_exit_is_not_charged_as_a_crash() {
     assert_eq!(AdmissionAttempts::open(&lab.root.join("work")).suspect(&id), Some(1), "a crash is charged");
 }
 
-/// Landing objects are Vector-shaped (10k rows) but compress ~50x: the
-/// compressed-size estimate (120 heap bytes per source byte) admitted 50k
-/// rows into a 1.2 GB role at once. The decoded-size bound admits one such
-/// object from idle on that role and leaves the next pending.
+/// Landing objects are Vector-shaped (10k rows) but compress ~50x. The
+/// guard-safe shared budget now fits two of these decoded objects, versus
+/// one under the old 30% working share, but still bounds decoded admission
+/// where the compressed-size estimate would allow another whole object.
 #[tokio::test(flavor = "current_thread")]
 async fn admission_is_bounded_by_decoded_size_not_compressed_size() {
     let root = tempfile::tempdir().unwrap();
@@ -369,7 +491,15 @@ async fn admission_is_bounded_by_decoded_size_not_compressed_size() {
     config.flush_interval_override_ms = Some(3_600_000);
     config.prevalence_enabled = false;
     // The FP tenant's ingest role: memory_max ~1.2 GB.
-    config.buffer_budget_bytes = buffer_budget_for(1_207_787_520);
+    let role = 1_207_787_520;
+    config.buffer_budget_bytes = buffer_budget_for(role);
+    // Prove the larger budget comes from the shared guard envelope, with
+    // BOTH the UID window and process headroom reserved before admission.
+    use nanosiem_lake_cell::ingest_memory::{process_base_reserve, uid_window_cap, ROLE_GUARD_PERCENT, UID_BYTES_PER_ENTRY};
+    let guard = role * ROLE_GUARD_PERCENT / 100;
+    assert_eq!(config.buffer_budget_bytes + uid_window_cap(role) as u64 * UID_BYTES_PER_ENTRY
+        + process_base_reserve(role), guard);
+    assert_eq!(config.buffer_budget_bytes, 496_511_024);
 
     let file = crate::landing_fixture::tenzir_auth_parquet("decoded", 20_000, CLOCK - 3_600_000);
     let source = crate::landing::LandingSource {
@@ -393,13 +523,16 @@ async fn admission_is_bounded_by_decoded_size_not_compressed_size() {
     let mut ingestor = Ingestor::open(config.clone(), &parts, &sources, &spool as &dyn NoticeQueue, &signer,
         signer.trusted(), BronzeIngestEnricher::disabled(), &seed_schema(), CLOCK).await.expect("ingest opens");
     let report = ingestor.tick(CLOCK).await.unwrap();
-    // Each object's decoded cost fills an admission group on its own, so
-    // they decode one after another (NAN-4749: in the same tick, the first
-    // group's JSON values freed before the second decodes).
+    // The old budget fits one decoded object, the shared budget fits two,
+    // and a third crosses the decoded bound despite fitting compressed.
     let (one_heap, one_arrow) = decoded_admission_cost(crate::bronze::bronze_file_decoded_bytes(
         &root.join("sources").join("bronze/landing-0.parquet")).unwrap());
-    assert!(!super::super::memory::admission_fits(config.buffer_budget_bytes, 0, 2.0 * one_heap, 2.0 * one_arrow),
-        "one landing object per admission group on a 1.2 GB role");
+    let fits = super::super::memory::admission_fits;
+    assert!(fits(role * 3 / 10, 0, one_heap, one_arrow));
+    assert!(!fits(role * 3 / 10, 0, 2.0 * one_heap, 2.0 * one_arrow), "old 30% working share");
+    assert!(fits(config.buffer_budget_bytes, 0, 2.0 * one_heap, 2.0 * one_arrow), "shared working budget");
+    assert!(!fits(config.buffer_budget_bytes, 0, 3.0 * one_heap, 3.0 * one_arrow), "decoded bound still holds");
+    assert!(fits(config.buffer_budget_bytes, 0, 1.5 * heap, 1.5 * arrow), "compressed estimate would take three");
     assert_eq!(report.admitted_rows, 20_000);
     let mut now = CLOCK;
     while ingestor.health().rows_committed_total < 20_000 {

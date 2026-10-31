@@ -27,6 +27,7 @@ pub mod cookies;
 pub mod grant_authz;
 pub mod headers;
 pub mod pagination;
+pub mod route_policy;
 pub mod source_inventory;
 pub mod sse;
 pub mod tenant_path;

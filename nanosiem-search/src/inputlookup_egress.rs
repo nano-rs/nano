@@ -465,12 +465,21 @@ async fn audit_denial(
 }
 
 pub fn router() -> Router<SearchState> {
-    Router::new()
-        .route("/internal/inputlookup/egress-check", post(check))
+    registered_router().into_private_router(
+        nanosiem_api_lib::route_policy::ServiceAuthenticators::default()
+            .bearer("inputlookup-egress-proxy",std::env::var("NANOSIEM_INPUTLOOKUP_EGRESS_CHECK_TOKEN").ok(),"authorization"))
+}
+
+pub fn registered_router() -> nanosiem_api_lib::route_policy::Router<SearchState> {
+    use nanosiem_core::auth::route_policy::RoutePolicy;
+    nanosiem_api_lib::route_policy::Router::new()
+        .route("/internal/inputlookup/egress-check", nanosiem_api_lib::route_policy::routing::post(check,
+            RoutePolicy::service("inputlookup-egress-proxy", "egress:check")))
         .layer(Extension(Arc::new(PolicyCache::default())))
         .layer(axum::extract::DefaultBodyLimit::max(4096))
         .layer(axum::middleware::from_fn(admit))
 }
+
 #[derive(utoipa::OpenApi)]
 #[openapi(
     paths(check),

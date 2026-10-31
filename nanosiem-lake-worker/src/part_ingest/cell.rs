@@ -1035,6 +1035,7 @@ pub struct IngestService {
     wake: Arc<tokio::sync::Notify>,
     heartbeat: std::sync::Mutex<Heartbeat>,
     pipeline_diagnostics: super::ingest::PipelineDiagnostics,
+    bronze_queue: Option<&'static super::bronze_list::BronzeListQueue<&'static S3ObjectStore>>,
     native_writer_diagnostics: Option<Arc<super::native_writer::NativePartWriter>>,
     assignment: Assignment,
     /// Exit after IDLE_EXIT with nothing to do (see `Assignment::ingest_idle_exit`).
@@ -1418,6 +1419,7 @@ impl IngestService {
             };
         let r2_parts = r2_handle.as_ref().map(|(store, _)| *store);
         type EdgeHandle = (Arc<crate::edge_log::EdgeLogSource<crate::edge_log::HttpEdgeLogClient>>, String);
+        let mut bronze_queue = None;
         let (sources, queue, s3_sources, notice_queue, edge): (
             &'static dyn ObjectStore,
             &'static dyn NoticeQueue,
@@ -1436,6 +1438,7 @@ impl IngestService {
                     super::bronze_list::BronzeListQueue::open(s3, tenant, &assignment.state_dir, settings)?,
                 ));
                 tracing::info!(watermark = ?queue.watermark(), settle_s = settings.settle().as_secs(), "trusted-local bronze listing input");
+                bronze_queue = Some(queue);
                 (s3, queue, None, None, None)
             }
             InputCreds::Edge { endpoint, token } => {
@@ -1745,6 +1748,7 @@ impl IngestService {
             // NAN-4445: no prevalence verdict before the first health update.
             heartbeat: std::sync::Mutex::new(Heartbeat { prevalence_degraded_known: Some(false), ..Heartbeat::default() }),
             pipeline_diagnostics,
+            bronze_queue,
             native_writer_diagnostics: credentials.native_writer.clone(),
             assignment: assignment.clone(),
             idle_exit,
@@ -1878,6 +1882,14 @@ impl IngestService {
             async move { this.run_loop(&control).await }
         });
         let result = tokio::select! {
+            // Separate from the ingest task and its lock. This future is
+            // cancelled with run(), so no observer outlives the service loop.
+            _ = async {
+                if let Some(queue) = self.bronze_queue {
+                    queue.discover_input().await;
+                }
+                std::future::pending::<()>().await;
+            } => unreachable!("bronze input discovery runs until cancelled"),
             joined = &mut work => match joined {
                 // NAN-4553: every return of the loop is a coded exit. Those
                 // the object in flight may cause (the retry window, a 400 on
@@ -2262,6 +2274,7 @@ impl IngestService {
                 last_work = Instant::now();
             }
             *self.heartbeat.lock().expect("heartbeat lock") = Heartbeat {
+                ingest_pending_input: None, // sampled live by heartbeat(), not this completed tick
                 agent_catalog_custody: health.agent_catalog.clone(),
                 ingest_diagnostics: None,
                 startup_progress: None,
@@ -2751,6 +2764,7 @@ impl TenantService for IngestService {
 
     fn heartbeat(&self) -> Heartbeat {
         let mut heartbeat = self.heartbeat.lock().expect("heartbeat lock").clone();
+        heartbeat.ingest_pending_input = self.bronze_queue.map(|queue| queue.pending_input());
         let mut diagnostics = self.pipeline_diagnostics.snapshot();
         if let Some(writer) = &self.native_writer_diagnostics {
             diagnostics["native_writer"] = writer.diagnostics();
@@ -3996,6 +4010,112 @@ mod tests {
         assert!(credentials_from_secret(bad_settle.as_bytes(), &assignment("t1", None)).await.is_err());
         // Never with a release-pinned control plane.
         assert!(credentials_from_secret(lab(serde_json::json!({})).as_bytes(), &assignment("t1", Some("https://control"))).await.is_err());
+    }
+
+    /// Production constructor + run loop: discovery and heartbeat keep seeing
+    /// input while the very first tick cannot even acquire the ingestor lock,
+    /// then while its first object fetch hangs. No completed health is needed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_input_survives_a_first_hung_tick_and_drains_after_real_commit() {
+        use axum::{body::Body, http::{Request, Response}, Router};
+        use super::super::ingest::nan4336_ingest_tests::{bronze_bytes, fixture_event};
+        use nanosiem_lake_cell::fdpass::seqpacket_pair;
+        const TENANT: &str = "00000000-0000-4000-8000-000000004879";
+        let visible = Arc::new(AtomicBool::new(false));
+        let fetch_started = Arc::new(tokio::sync::Notify::new());
+        let (release_fetch, fetch_released) = tokio::sync::watch::channel(false);
+        let received_ms = now_ms() - 31_000;
+        let object = format!("bronze-v2/tenant_id={TENANT}/{}-first.parquet", received_ms / 1000);
+        let data = bronze_bytes(&[fixture_event(TENANT, "first-hung-input", 0, received_ms)]);
+        let xml = format!("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>bronze</Name><IsTruncated>false</IsTruncated><Contents><Key>{object}</Key><LastModified>{}</LastModified><ETag>\"first\"</ETag><Size>{}</Size></Contents></ListBucketResult>",
+            chrono::DateTime::from_timestamp_millis(received_ms).unwrap().to_rfc3339(), data.len());
+        let app = Router::new().fallback({
+            let visible = visible.clone();
+            let fetch_started = fetch_started.clone();
+            let fetch_released = fetch_released.clone();
+            move |request: Request<Body>| {
+                let visible = visible.clone();
+                let fetch_started = fetch_started.clone();
+                let mut fetch_released = fetch_released.clone();
+                let data = data.clone();
+                let xml = xml.clone();
+                async move {
+                    if request.uri().query().is_some_and(|q| q.contains("list-type=2")) {
+                        let body = if visible.load(Ordering::SeqCst) { xml } else {
+                            "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>".into()
+                        };
+                        Response::builder().header("content-type", "application/xml").body(Body::from(body)).unwrap()
+                    } else {
+                        fetch_started.notify_one();
+                        fetch_released.wait_for(|released| *released).await.unwrap();
+                        Response::builder().header("etag", "\"first\"")
+                            .header("content-length", data.len()).body(Body::from(data)).unwrap()
+                    }
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = tempfile::tempdir().unwrap();
+        let mut assignment = assignment(TENANT, None);
+        for (path, name) in [(&mut assignment.tenant_dir, "tenant"), (&mut assignment.parts_dir, "parts"),
+            (&mut assignment.state_dir, "state"), (&mut assignment.tmp_dir, "tmp")] {
+            *path = root.path().join(name);
+            std::fs::create_dir_all(&*path).unwrap();
+        }
+        assignment.memory_cap_bytes = 0;
+        let secret = serde_json::json!({
+            "kind": LAB_CREDENTIALS_KIND, "tenant_id": TENANT, "writer_epoch": 1,
+            "bronze": {"endpoint": endpoint, "region": "us-east-1", "bucket": "bronze", "prefix": "bronze-v2",
+                "access_key_id": "test", "secret_access_key": "test"},
+            "bronze_list": {"poll_ms": 60_000}, "lab_signer_key_id": "lab-signer-4879", "lab_signer_seed_hex": hex::encode([79_u8; 32])
+        }).to_string();
+        let service = IngestService::start(&assignment, Zeroizing::new(secret.into_bytes())).await.unwrap();
+        let held = service.ingestor.lock().await;
+        let (child, _supervisor) = seqpacket_pair().unwrap();
+        let running = service.clone().run(ControlChannel::from_fd(child).unwrap());
+        tokio::pin!(running);
+        tokio::time::timeout(Duration::from_secs(45), async {
+            tokio::select! {
+                result = &mut running => panic!("production ingest stopped: {result:?}"),
+                _ = async {
+                    loop {
+                        let input = service.heartbeat().ingest_pending_input.unwrap();
+                        if input.discovery_age_seconds.is_some() { break; }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    visible.store(true, Ordering::SeqCst);
+                    loop {
+                        let hb = service.heartbeat();
+                        let input = hb.ingest_pending_input.unwrap();
+                        if input.objects == 1 {
+                            assert!(input.oldest_age_seconds >= 31.0);
+                            assert!(!hb.busy);
+                            assert_eq!(hb.lag_seconds, 0.0);
+                            assert_eq!(hb.last_progress_unix_ms, 0);
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    drop(held);
+                    fetch_started.notified().await;
+                    let hb = service.heartbeat();
+                    assert!(!hb.busy);
+                    assert_eq!(hb.lag_seconds, 0.0);
+                    assert_eq!(hb.ingest_pending_input.unwrap().objects, 1);
+                    release_fetch.send(true).unwrap();
+                    loop {
+                        if service.heartbeat().ingest_pending_input.unwrap().objects == 0 { break; }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    let parts = LocalObjectStore::new(&assignment.parts_dir).unwrap();
+                    let committed = crate::parts::part_log::load_log(&parts, TENANT).await.unwrap();
+                    assert_eq!(committed.parts().map(|p| p.rows).sum::<u64>(), 1);
+                } => {}
+            }
+        }).await.expect("independent input observation and durable drain");
+        server.abort();
     }
 
     /// A stand-in owner `lake-parts:sign` route that signs with `key`.

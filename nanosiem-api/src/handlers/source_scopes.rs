@@ -24,11 +24,12 @@
 //! Reads require `source_scopes:view`; mutations require `source_scopes:manage`
 //! (both admin-only, granted to the Admin role in migration 244).
 
+use nanosiem_api_lib::route_policy::{Router, routing::{delete, get, patch, post, put}};
+use nanosiem_core::auth::route_policy::RoutePolicy;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::{delete, get, post},
-    Extension, Json, Router,
+    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -477,20 +478,20 @@ pub fn source_scopes_routes() -> Router<AppState> {
     Router::new()
         .route(
             "/api/source-scopes/restricted",
-            get(list_restricted).post(add_restricted),
+            get(list_restricted, RoutePolicy::all_of(&["source_scopes:view"])).post(add_restricted, RoutePolicy::all_of(&["source_scopes:manage"])),
         )
         .route(
             "/api/source-scopes/restricted/{source_type}",
-            delete(remove_restricted),
+            delete(remove_restricted, RoutePolicy::all_of(&["source_scopes:manage"])),
         )
         .route(
             "/api/source-scopes/restricted/{source_type}/grants",
-            get(list_grants),
+            get(list_grants, RoutePolicy::all_of(&["source_scopes:view"])),
         )
-        .route("/api/source-scopes/grants", post(add_grant))
+        .route("/api/source-scopes/grants", post(add_grant, RoutePolicy::all_of(&["source_scopes:manage"])))
         .route(
             "/api/source-scopes/grants/{source_type}/{group_id}",
-            delete(remove_grant),
+            delete(remove_grant, RoutePolicy::all_of(&["source_scopes:manage"])),
         )
 }
 

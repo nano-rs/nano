@@ -77,10 +77,19 @@ creating the first admin account. Open `http://localhost` when it finishes.
 **Prereqs:** Docker with Compose v2.24 or newer, git, openssl, curl, python3.
 Images are published for x86-64 and arm64.
 
-**Minimum host:** an 8 GiB VM. The installer allows up to 512 MiB of kernel
-reserve (at least 7,680 MiB visible to Docker) and fits the service and cell
-budgets within 95% of the memory actually reported. On Docker Desktop, use the
-VM's memory setting. The supported event rate scales with available memory.
+**Minimum host:** an 8 GiB VM. The installer derives its visible-memory minimum
+from measured service peaks and fits the service and cell budgets within 95%
+of the memory actually reported, including on a nominal 8 GiB VM reporting
+7,934 MiB. On Docker Desktop, use the VM's memory setting. The supported event
+rate scales with available memory. The 8 GiB size is a trial tier for personal
+or test data, with a reference load of 150 events/second sustained and bursts
+to 300 events/second. Use a dedicated VM with at least 16 GiB for higher rates
+and bulk replays. The release visibility target for the trial tier is that
+every acknowledged marker becomes searchable within five minutes at the
+reference load. The HEC gateway returns retryable 503 responses when native
+commit lag or a busy writer's commit stall reaches 30 seconds, or fresh commit
+status is unavailable. A successful HEC response still requires durable Bronze
+delivery; senders must retry 503 responses.
 
 **Ports:** 80 (web UI and API through nginx), 8080 (HTTP ingest), 8088 (HEC),
 and 8090 (enrichment ingress) listen on all interfaces. OTLP (4317/4318),

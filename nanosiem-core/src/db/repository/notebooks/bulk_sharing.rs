@@ -70,7 +70,7 @@ impl NotebookRepository {
         user_id: Uuid,
     ) -> Result<NotebookShareResult, NotebookRepositoryError> {
         // Get the notebook and verify ownership
-        let notebook = self.find_by_id(id).await?;
+        let notebook = self.find_by_id_for_user(id, user_id).await?;
 
         if notebook.owner_id != user_id {
             return Err(NotebookRepositoryError::AccessDenied(id));

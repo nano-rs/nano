@@ -4,8 +4,7 @@
 //!
 //! Provides HTTP request metrics and search query latency tracking.
 
-use axum::http::{HeaderMap, StatusCode};
-use axum::{routing::get, Router};
+use axum::Router;
 use axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
 use axum_prometheus::PrometheusMetricLayer;
 use metrics::histogram;
@@ -29,32 +28,29 @@ impl SearchMetrics {
         )
     }
 
-    /// Create the metrics endpoint router.
-    /// If `METRICS_AUTH_TOKEN` is set, requires `Authorization: Bearer <token>`.
-    pub fn metrics_router(&self) -> Router {
+    pub fn registered_routes(&self) -> nanosiem_api_lib::route_policy::Router {
+        use nanosiem_api_lib::route_policy::{routing::get, Router};
+        use nanosiem_core::auth::route_policy::RoutePolicy;
         let handle = self.prometheus_handle.clone();
-        let required_token = std::env::var("METRICS_AUTH_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty());
         Router::new().route(
             "/metrics",
-            get(move |headers: HeaderMap| {
-                let handle = handle.clone();
-                let required_token = required_token.clone();
-                async move {
-                    if let Some(expected) = &required_token {
-                        let provided = headers
-                            .get("authorization")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|v| v.strip_prefix("Bearer "));
-                        match provided {
-                            Some(token) if token == expected => {}
-                            _ => return Err(StatusCode::UNAUTHORIZED),
-                        }
-                    }
-                    Ok(handle.render())
-                }
-            }),
+            get(
+                move || {
+                    let handle = handle.clone();
+                    async move { handle.render() }
+                },
+                RoutePolicy::service("operations-collector", "telemetry:read"),
+            ),
+        )
+    }
+    /// Standalone private telemetry app. Missing credentials always deny.
+    pub fn metrics_router(&self) -> Router {
+        self.registered_routes().into_private_router(
+            nanosiem_api_lib::route_policy::ServiceAuthenticators::default().bearer(
+                "operations-collector",
+                std::env::var("METRICS_AUTH_TOKEN").ok(),
+                "authorization",
+            ),
         )
     }
 }

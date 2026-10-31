@@ -44,7 +44,9 @@
         "peak_metric": "process VmHWM (RSS); charged cgroup file cache is reclaimable",
         "diagnostic_memory_limit_bytes": 2147483648,
         "evidence_sha256": "8eaa32a2bfa0c82efbf4e6d1c164d370276a761f457fe761503d242d67c3ef2b"
-      }
+      },
+      "sustained_peak_rss_bytes": 432877568,
+      "sustained_cgroup_peak_bytes": 782012416
     },
     "lean-audit": {
       "guard_mib": 20,
@@ -58,8 +60,10 @@
     },
     "lean-enrichment": {
       "guard_mib": 20,
-      "peak_bytes": 14508032,
-      "idle_rss_bytes": 14733312
+      "peak_bytes": 15249408,
+      "idle_rss_bytes": 14733312,
+      "sustained_peak_rss_bytes": 15249408,
+      "sustained_cgroup_peak_bytes": 4636672
     },
     "lean-job-runner": {
       "guard_mib": 20,
@@ -144,7 +148,9 @@
       "peak_bytes": 319455232,
       "idle_rss_bytes": 286605312,
       "peak_rss_bytes": 253726720,
-      "burst_cgroup_peak_bytes": 196648960
+      "burst_cgroup_peak_bytes": 196648960,
+      "sustained_peak_rss_bytes": 279113728,
+      "sustained_cgroup_peak_bytes": 219107328
     },
     "lean-hec-proxy": {
       "guard_mib": 128,
@@ -182,5 +188,33 @@
     "capture_end_utc": "2026-10-30T12:26:40.054601+00:00",
     "qualification": "diagnostic baseline only; cap overrides and prior worker build; no 8 GiB fit claim",
     "evidence_file": "docs-internal/NAN-4850-idle-rss-calibration.json"
+  },
+  "sustained_measurement": {
+    "date": "2026-10-30",
+    "host": "GCP e2-custom-4-8192, Ubuntu 24.04, MemTotal 8124016 KiB",
+    "shape": "10000 offered HEC EPS, 16 senders, 500 events/batch, 900 seconds; independent search markers every 5 seconds",
+    "gateway_source_sha256": "d0692a28e5c1210b6c48c86d8924ae4c37b208091f47535db2b72811bd4976e7",
+    "runtime_binary_sha256": "4662ad3cdf692579d2542e3193e7b2026624d001bd4c159a01575895b9647dc0",
+    "diagnostic_batch_timeout_secs": 0.005,
+    "vector_chunk_events": 64,
+    "temporary_limits": "Vector and RustFS 1 GiB; enrichment 64 MiB; final limits require a separate complete sustained sweep",
+    "floor_metric": "max(previous peak_bytes, process VmHWM across 5 ms and 50 ms sustained canaries); charged file cache is reclaimable and reported separately as sustained_cgroup_peak_bytes",
+    "archive_sha256": "03aef1fb042493d37c3f502dc8f2ae0ff8df6130a6a43184fdb13acbc730fd4a",
+    "accepted_eps": 6335.0,
+    "markers_visible": 32,
+    "markers_offered": 180,
+    "oom_or_restarts": 0
+  },
+  "sustained_group_commit_measurement": {
+    "date": "2026-10-30",
+    "host": "same real 8 GiB fixture and temporary measurement limits as sustained_measurement",
+    "shape": "10000 offered HEC EPS, 16 senders, 500 events/batch, 900 seconds; 50 ms sink timer, 64-event processing chunks",
+    "archive_sha256": "46573420eb114e5442876d29491b25b2fc863b3bad2965b7c2d77fe1f87cce96",
+    "accepted_eps": 6201.666666666667,
+    "markers_visible": 39,
+    "markers_offered": 180,
+    "bronze_put_requests": 9015,
+    "bronze_bytes": 189430540,
+    "oom_or_restarts": 0
   }
 }

@@ -1262,7 +1262,7 @@ impl SearchState {
 /// Create the Axum router for the Search Service
 pub fn create_router(
     state: SearchState,
-    search_metrics: SearchMetrics,
+    _search_metrics: SearchMetrics,
     prometheus_layer: axum_prometheus::PrometheusMetricLayer<'static>,
     config: &SearchConfig,
 ) -> Router {
@@ -1412,15 +1412,9 @@ pub fn create_router(
         ))
     };
     let app = app
-        .merge(inputlookup_egress::router())
         // Add request ID middleware (outermost - runs first)
         .layer(axum_middleware::from_fn(request_id_middleware))
-        .with_state(state)
-        // Merge the prometheus metrics endpoint
-        .merge(search_metrics.metrics_router())
-        // NAN-3531 N2a: outside auth like /metrics. The platform reads it
-        // through the API-server pod proxy; it carries no secrets.
-        .merge(hosted_config_router());
+        .with_state(state);
     if shared_profile {
         nanosiem_api_lib::tenant_path::scoped_api_router(app)
     } else {
@@ -1428,22 +1422,43 @@ pub fn create_router(
     }
 }
 
-/// `GET /internal/hosted-config`: the hosted producer set this process has
-/// loaded (revision, tenants, failed tenants, last scan time). Enterprise
-/// only; open builds never load hosted producers (NAN-3861).
-#[cfg(not(feature = "enterprise"))]
-pub fn hosted_config_router() -> Router {
-    Router::new()
-}
+/// Fixed private service port; it is never published through a public ingress.
+pub const INTERNAL_SEARCH_PORT: u16 = 13002;
 
-#[cfg(feature = "enterprise")]
-pub fn hosted_config_router() -> Router {
-    Router::new().route(
-        "/internal/hosted-config",
-        get(|| async {
+fn registered_hosted_config_routes() -> nanosiem_api_lib::route_policy::Router {
+    #[cfg(feature="enterprise")]
+    {
+        use nanosiem_api_lib::route_policy::{Router, routing::get};
+        use nanosiem_core::auth::route_policy::RoutePolicy;
+        Router::new().route("/internal/hosted-config",get(|| async {
             axum::Json(nanosiem_core::search::hosted_producer_reload::process_hosted_config_status())
-        }),
-    )
+        }, RoutePolicy::service("hosted-config-reader","telemetry:read")))
+    }
+    #[cfg(not(feature="enterprise"))]
+    { nanosiem_api_lib::route_policy::Router::new() }
+}
+fn registered_internal_routes(state: SearchState, metrics: &SearchMetrics) -> nanosiem_api_lib::route_policy::Router {
+    inputlookup_egress::registered_router().with_inner_state(state)
+        .merge(metrics.registered_routes()).merge(registered_hosted_config_routes())
+}
+pub fn internal_route_manifest(state: SearchState, metrics: &SearchMetrics) -> Vec<nanosiem_api_lib::route_policy::Entry> {
+    registered_internal_routes(state, metrics).manifest().to_vec()
+}
+/// Complete private Search app. Credential resolution precedes the shared
+/// exact method/template policy guard and every handler/body extractor.
+pub fn create_internal_router(state: SearchState, metrics: &SearchMetrics) -> Router {
+    use nanosiem_api_lib::route_policy::ServiceAuthenticators;
+    let auth = ServiceAuthenticators::default()
+        .bearer("operations-collector",std::env::var("METRICS_AUTH_TOKEN").ok(),"authorization")
+        .bearer("hosted-config-reader",std::env::var("METRICS_AUTH_TOKEN").ok(),"x-nano-service-authorization")
+        .bearer("inputlookup-egress-proxy",std::env::var("NANOSIEM_INPUTLOOKUP_EGRESS_CHECK_TOKEN").ok(),"authorization");
+    registered_internal_routes(state, metrics).into_private_router(auth)
+}
+/// Private diagnostics constructor retained for embedded private callers.
+pub fn hosted_config_router() -> Router {
+    registered_hosted_config_routes().into_private_router(
+        nanosiem_api_lib::route_policy::ServiceAuthenticators::default()
+            .bearer("hosted-config-reader",std::env::var("METRICS_AUTH_TOKEN").ok(),"x-nano-service-authorization"))
 }
 
 /// Whether a cached view's hosted control is exactly `expected` (by pointer).

@@ -9,7 +9,10 @@ use crate::models::notebook::{
     NewNotebook, Notebook, NotebookSummary, NotebookWithOwner, UpdateNotebook,
 };
 
-use super::{NotebookRepository, NotebookRepositoryError};
+use super::{
+    notebook_case_visible_to_user, notebook_visible_to_user_at, NotebookRepository,
+    NotebookRepositoryError,
+};
 
 impl NotebookRepository {
     /// Create a new notebook
@@ -72,59 +75,24 @@ impl NotebookRepository {
         Ok(result)
     }
 
-    /// Find a notebook by ID, checking access for a specific user.
-    /// User has access if: owner, public, shared with them, or — for a
-    /// case-linked notebook — they can see the underlying case.
-    ///
-    /// NAN-1739: case notebooks previously granted access to ANY analyst
-    /// whenever `case_id IS NOT NULL`, ignoring case visibility. A notebook
-    /// must never expose more than its underlying case: the case-linked
-    /// disjunct now requires that the caller passes the SAME visibility rules
-    /// enforced by `CaseRepository::check_user_access`
-    /// (created_by / assigned_to / public / group-membership).
+    /// Find a notebook using current visibility. Linked case visibility is
+    /// mandatory; ownership and stored shares apply only to standalone notebooks.
     pub async fn find_by_id_for_user(
         &self,
         id: Uuid,
         user_id: Uuid,
     ) -> Result<NotebookWithOwner, NotebookRepositoryError> {
-        let result = sqlx::query_as::<_, NotebookWithOwner>(
+        let result = sqlx::query_as::<_, NotebookWithOwner>(&format!(
             r#"
             SELECT DISTINCT n.*, u.name as owner_name
             FROM notebooks n
             LEFT JOIN users u ON n.owner_id = u.id
             LEFT JOIN notebook_shares ns ON ns.notebook_id = n.id
             LEFT JOIN user_groups ug ON ug.group_id = ns.shared_with_group_id AND ug.user_id = $2
-            WHERE n.id = $1
-              AND (
-                  n.owner_id = $2
-                  -- NAN-1739: `public` only frees NON-case notebooks. Case
-                  -- notebooks are stamped visibility='public' at creation
-                  -- (notebooks/cases.rs), so an unconditional public disjunct
-                  -- would make the case-access EXISTS below dead code and
-                  -- re-open the bypass. Gate it on case_id IS NULL.
-                  OR (n.case_id IS NULL AND n.visibility = 'public')
-                  OR ns.shared_with_user_id = $2
-                  OR ug.user_id IS NOT NULL
-                  OR (
-                      n.case_id IS NOT NULL
-                      AND EXISTS (
-                          SELECT 1 FROM cases c
-                          WHERE c.id = n.case_id
-                            AND (
-                                c.created_by = $2
-                                OR c.assigned_to = $2
-                                OR c.visibility = 'public'
-                                OR (c.visibility = 'group' AND EXISTS (
-                                    SELECT 1 FROM case_groups cg
-                                    JOIN user_groups cug ON cug.group_id = cg.group_id
-                                    WHERE cg.case_id = c.id AND cug.user_id = $2
-                                ))
-                            )
-                      )
-                  )
-              )
+            WHERE n.id = $1 AND {visible}
             "#,
-        )
+            visible = notebook_visible_to_user_at(2),
+        ))
         .bind(id)
         .bind(user_id)
         .fetch_optional(&self.pool)
@@ -179,13 +147,13 @@ impl NotebookRepository {
         notebook_id: Uuid,
         user_id: Uuid,
     ) -> Result<bool, NotebookRepositoryError> {
-        let result = sqlx::query_scalar::<_, bool>(
+        let result = sqlx::query_scalar::<_, bool>(&format!(
             r#"
             SELECT EXISTS(
                 SELECT 1 FROM notebooks n
                 LEFT JOIN notebook_shares ns ON ns.notebook_id = n.id
                 LEFT JOIN user_groups ug ON ug.group_id = ns.shared_with_group_id AND ug.user_id = $2
-                WHERE n.id = $1
+                WHERE n.id = $1 AND {case_visible}
                   AND (
                       n.owner_id = $2
                       OR (ns.shared_with_user_id = $2 AND ns.permission = 'edit')
@@ -193,7 +161,8 @@ impl NotebookRepository {
                   )
             )
             "#,
-        )
+            case_visible = notebook_case_visible_to_user(2),
+        ))
         .bind(notebook_id)
         .bind(user_id)
         .fetch_one(&self.pool)
@@ -207,7 +176,7 @@ impl NotebookRepository {
         &self,
         user_id: Uuid,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(
+        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
             r#"
             SELECT DISTINCT
                 n.*,
@@ -222,33 +191,11 @@ impl NotebookRepository {
                 FROM notebook_entries
                 GROUP BY notebook_id
             ) ec ON ec.notebook_id = n.id
-            WHERE n.owner_id = $1
-               -- NAN-1739: case notebooks are visibility='public'; gate the
-               -- public disjunct on case_id IS NULL and govern case notebooks
-               -- by case visibility so they don't leak into every user's list.
-               OR (n.case_id IS NULL AND n.visibility = 'public')
-               OR ns.shared_with_user_id = $1
-               OR ug.user_id IS NOT NULL
-               OR (
-                   n.case_id IS NOT NULL
-                   AND EXISTS (
-                       SELECT 1 FROM cases c
-                       WHERE c.id = n.case_id
-                         AND (
-                             c.created_by = $1
-                             OR c.assigned_to = $1
-                             OR c.visibility = 'public'
-                             OR (c.visibility = 'group' AND EXISTS (
-                                 SELECT 1 FROM case_groups cg
-                                 JOIN user_groups cug ON cug.group_id = cg.group_id
-                                 WHERE cg.case_id = c.id AND cug.user_id = $1
-                             ))
-                         )
-                   )
-               )
+            WHERE {visible}
             ORDER BY n.updated_at DESC
             "#,
-        )
+            visible = notebook_visible_to_user_at(1),
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -264,7 +211,7 @@ impl NotebookRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(
+        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
             r#"
             SELECT DISTINCT
                 n.*,
@@ -279,34 +226,13 @@ impl NotebookRepository {
                 FROM notebook_entries
                 GROUP BY notebook_id
             ) ec ON ec.notebook_id = n.id
-            WHERE (
-                   n.owner_id = $1
-                OR (n.case_id IS NULL AND n.visibility = 'public')
-                OR ns.shared_with_user_id = $1
-                OR ug.user_id IS NOT NULL
-                OR (
-                    n.case_id IS NOT NULL
-                    AND EXISTS (
-                        SELECT 1 FROM cases c
-                        WHERE c.id = n.case_id
-                          AND (
-                              c.created_by = $1
-                              OR c.assigned_to = $1
-                              OR c.visibility = 'public'
-                              OR (c.visibility = 'group' AND EXISTS (
-                                  SELECT 1 FROM case_groups cg
-                                  JOIN user_groups cug ON cug.group_id = cg.group_id
-                                  WHERE cg.case_id = c.id AND cug.user_id = $1
-                              ))
-                          )
-                    )
-                )
-            )
+            WHERE {visible}
               AND ($2 = 'all' OR n.status = $2)
             ORDER BY n.updated_at DESC, n.id DESC
             LIMIT $3 OFFSET $4
             "#,
-        )
+            visible = notebook_visible_to_user_at(1),
+        ))
         .bind(user_id)
         .bind(status)
         .bind(limit)
@@ -322,7 +248,7 @@ impl NotebookRepository {
         &self,
         user_id: Uuid,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(
+        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
             r#"
             SELECT
                 n.*,
@@ -335,10 +261,11 @@ impl NotebookRepository {
                 FROM notebook_entries
                 GROUP BY notebook_id
             ) ec ON ec.notebook_id = n.id
-            WHERE n.owner_id = $1
+            WHERE {case_visible} AND n.owner_id = $1
             ORDER BY n.updated_at DESC
             "#,
-        )
+            case_visible = notebook_case_visible_to_user(1),
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -354,7 +281,7 @@ impl NotebookRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(
+        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
             r#"
             SELECT
                 n.*,
@@ -367,12 +294,13 @@ impl NotebookRepository {
                 FROM notebook_entries
                 GROUP BY notebook_id
             ) ec ON ec.notebook_id = n.id
-            WHERE n.owner_id = $1
+            WHERE {case_visible} AND n.owner_id = $1
               AND ($2 = 'all' OR n.status = $2)
             ORDER BY n.updated_at DESC, n.id DESC
             LIMIT $3 OFFSET $4
             "#,
-        )
+            case_visible = notebook_case_visible_to_user(1),
+        ))
         .bind(user_id)
         .bind(status)
         .bind(limit)
@@ -388,7 +316,7 @@ impl NotebookRepository {
         &self,
         user_id: Uuid,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(
+        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
             r#"
             SELECT DISTINCT
                 n.*,
@@ -403,11 +331,12 @@ impl NotebookRepository {
                 FROM notebook_entries
                 GROUP BY notebook_id
             ) ec ON ec.notebook_id = n.id
-            WHERE n.owner_id != $1
+            WHERE {case_visible} AND n.owner_id != $1
               AND (ns.shared_with_user_id = $1 OR ug.user_id IS NOT NULL)
             ORDER BY n.updated_at DESC
             "#,
-        )
+            case_visible = notebook_case_visible_to_user(1),
+        ))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
@@ -423,7 +352,7 @@ impl NotebookRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(
+        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
             r#"
             SELECT DISTINCT
                 n.*,
@@ -438,13 +367,14 @@ impl NotebookRepository {
                 FROM notebook_entries
                 GROUP BY notebook_id
             ) ec ON ec.notebook_id = n.id
-            WHERE n.owner_id != $1
+            WHERE {case_visible} AND n.owner_id != $1
               AND (ns.shared_with_user_id = $1 OR ug.user_id IS NOT NULL)
               AND ($2 = 'all' OR n.status = $2)
             ORDER BY n.updated_at DESC, n.id DESC
             LIMIT $3 OFFSET $4
             "#,
-        )
+            case_visible = notebook_case_visible_to_user(1),
+        ))
         .bind(user_id)
         .bind(status)
         .bind(limit)
@@ -460,16 +390,17 @@ impl NotebookRepository {
         &self,
         user_id: Uuid,
     ) -> Result<Option<NotebookWithOwner>, NotebookRepositoryError> {
-        let result = sqlx::query_as::<_, NotebookWithOwner>(
+        let result = sqlx::query_as::<_, NotebookWithOwner>(&format!(
             r#"
             SELECT n.*, u.name as owner_name
             FROM notebooks n
             LEFT JOIN users u ON n.owner_id = u.id
-            WHERE n.owner_id = $1 AND n.status = 'active'
+            WHERE {case_visible} AND n.owner_id = $1 AND n.status = 'active'
             ORDER BY n.updated_at DESC
             LIMIT 1
             "#,
-        )
+            case_visible = notebook_case_visible_to_user(1),
+        ))
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -543,27 +474,34 @@ impl NotebookRepository {
         user_id: Uuid,
         update: &UpdateNotebook,
     ) -> Result<Notebook, NotebookRepositoryError> {
-        let notebook = self.find_by_id(id).await?;
-
-        // Owner always has access
-        let is_owner = notebook.owner_id == user_id;
-        // Case-linked notebooks: caller must be able to see the underlying case.
-        let has_case_access = match notebook.case_id {
-            Some(case_id) if !is_owner => self.user_can_access_case(case_id, user_id).await?,
-            _ => false,
-        };
-        // Explicit share grants access (only relevant for non-case notebooks).
-        let has_edit_share = if !is_owner && notebook.case_id.is_none() {
-            self.can_user_edit(id, user_id).await?
-        } else {
-            false
-        };
-
-        if !is_owner && !has_case_access && !has_edit_share {
-            return Err(NotebookRepositoryError::AccessDenied(id));
-        }
-
-        self.update(id, update).await
+        let visibility = update.visibility.as_ref().map(|v| match v {
+            crate::models::notebook::NotebookVisibility::Private => "private",
+            crate::models::notebook::NotebookVisibility::Shared => "shared",
+            crate::models::notebook::NotebookVisibility::Public => "public",
+        });
+        let status = update.status.as_ref().map(|s| match s {
+            crate::models::notebook::NotebookStatus::Active => "active",
+            crate::models::notebook::NotebookStatus::Paused => "paused",
+            crate::models::notebook::NotebookStatus::Closed => "closed",
+            crate::models::notebook::NotebookStatus::Merged => "merged",
+        });
+        sqlx::query_as::<_, Notebook>(&format!(r#"
+            UPDATE notebooks n SET title = COALESCE($3, title),
+                visibility = COALESCE($4, visibility), status = COALESCE($5, status),
+                summary = COALESCE($6, summary),
+                closed_at = CASE WHEN $5 = 'closed' AND closed_at IS NULL THEN NOW() ELSE closed_at END,
+                updated_at = NOW()
+            WHERE n.id = $1 AND {visible}
+              AND (n.case_id IS NOT NULL OR n.owner_id = $2 OR EXISTS (
+                  SELECT 1 FROM notebook_shares ns
+                  LEFT JOIN user_groups ug ON ug.group_id = ns.shared_with_group_id AND ug.user_id = $2
+                  WHERE ns.notebook_id = n.id AND ns.permission = 'edit'
+                    AND (ns.shared_with_user_id = $2 OR ug.user_id IS NOT NULL)
+              )) RETURNING n.*
+        "#, visible = notebook_visible_to_user_at(2)))
+        .bind(id).bind(user_id).bind(&update.title).bind(visibility).bind(status).bind(&update.summary)
+        .fetch_optional(&self.pool).await?
+        .ok_or(NotebookRepositoryError::AccessDenied(id))
     }
 
     /// Delete a notebook
@@ -586,11 +524,14 @@ impl NotebookRepository {
         id: Uuid,
         user_id: Uuid,
     ) -> Result<(), NotebookRepositoryError> {
-        let result = sqlx::query(r#"DELETE FROM notebooks WHERE id = $1 AND owner_id = $2"#)
-            .bind(id)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(&format!(
+            "DELETE FROM notebooks n WHERE id = $1 AND owner_id = $2 AND {}",
+            notebook_case_visible_to_user(2)
+        ))
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
 
         if result.rows_affected() == 0 {
             return Err(NotebookRepositoryError::AccessDenied(id));

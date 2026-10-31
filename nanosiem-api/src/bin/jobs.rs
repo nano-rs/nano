@@ -454,10 +454,7 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3001);
 
-    let health_router = axum::Router::new()
-        .route("/health", axum::routing::get(|| async { "ok" }))
-        .merge(app_metrics.metrics_router())
-        .merge(nanosiem_api::hosted_config_router())
+    let health_router = nanosiem_api::jobs_listener::create_jobs_router(&app_metrics)
         .layer(prometheus_layer);
 
     let wait_for_shutdown = async {

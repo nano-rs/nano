@@ -592,6 +592,14 @@ fn compose_resources_for_ingest(sizing: &Sizing, host: HostFacts, sovereign: boo
         "--snapshot_cron=${NANO_DRAGONFLY_SNAPSHOT_CRON:-* * * * *}".to_owned(),
     ]);
     if vector_ingest {
+        // The shared HEC template permits 250k retained channels for hosted
+        // workers. Open core must also bound completed/timed-out delivery
+        // channels inside its smallest Vector container, not only active bodies.
+        services["vector"]["volumes"] = json!([{
+            "type": "bind", "source": "./.nano-lean/app/vector-hec.toml",
+            "target": "/etc/vector/02-hec-source.toml", "read_only": true,
+            "bind": {"create_host_path": false},
+        }]);
         let runner_memory = services["connector-runner"]["mem_limit"].as_u64().unwrap();
         // Match the runner's check_vrl_memory: 256 MiB address space plus
         // 3 x 64 MiB call I/O per worker, and a 256 MiB daemon reserve.
@@ -950,6 +958,8 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
         app_root.join("router-query.token").display(),
     );
 
+    let hec_source = open_core_hec_source()?;
+
     // Write: secrets first, tenant_id last (its presence marks a complete run).
     let out = &args.out;
     let secret = out.join("cell/secret");
@@ -964,6 +974,7 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
     write_file(&out.join("app/router-query.token"), query_token.as_bytes(), 0o400, args.app_owner)?;
     write_file(&out.join("cell/cell.json"), &serde_json::to_vec_pretty(&cell)?, 0o644, None)?;
     write_file(&out.join("cell/placement.json"), &serde_json::to_vec_pretty(&placement)?, 0o644, None)?;
+    write_file(&out.join("app/vector-hec.toml"), hec_source.as_bytes(), 0o644, args.app_owner)?;
     write_file(&out.join("compose.resources.json"), &serde_json::to_vec_pretty(&compose)?, 0o644, None)?;
     write_file(&out.join("app/routes.json"), &serde_json::to_vec_pretty(&routes)?, 0o644, args.app_owner)?;
     write_file(&out.join("app/lake-cell.env"), app_env.as_bytes(), 0o644, args.app_owner)?;
@@ -992,6 +1003,22 @@ pub fn init(args: &InitArgs, env: &dyn Fn(&str) -> Option<String>) -> Result<Val
             "query_limit_memory_bytes": q.3, "ingest_limit_memory_bytes": i.3, "detect_limit_memory_bytes": d.3,
         },
     }))
+}
+
+fn open_core_hec_source() -> Result<String> {
+    let mut source = include_str!("../../config/vector/02-hec-source.toml").to_owned();
+    for (before, after) in [
+        ("acknowledgements.max_idle_time = 600", "acknowledgements.max_idle_time = 10"),
+        ("acknowledgements.max_number_of_ack_channels = 250000", "acknowledgements.max_number_of_ack_channels = 8192"),
+    ] {
+        ensure!(source.lines().filter(|line| *line == before).count() == 1,
+            "shared HEC acknowledgement policy changed; review the open-core bounds");
+        source = source.replace(before, after);
+    }
+    Ok(format!("# Open-core policy: 8192 channels (~32 MiB), 10 s idle cleanup.\n\
+        # The hosted retention rationale below describes the shared template.\n\
+        # The gateway polls active deliveries at most 50 ms apart and fails\n\
+        # closed after 25 s. Swept/unknown channels never acknowledge a retry.\n{source}"))
 }
 
 /// CLI entry: `trusted-local <subcommand> ...`. Returns the exit code.
@@ -1054,6 +1081,8 @@ mod tests {
         let compose_minimum = compose_startup_minimum(true);
         assert!(host_cell_memory_bytes(minimum) >= cell_minimum);
         assert!(compose_startup_minimum(true) + cell_minimum <= host_memory_share(minimum, 95));
+        let measured_eight_gib_host = 8_124_016 * 1024;
+        assert!(minimum <= measured_eight_gib_host);
         assert_eq!(minimum, 7683 * MIB);
         // Idle RSS is paid even when that exposes an unsupported host.
         assert!(!policy.cell_mib.contains_key("landing"));
@@ -1063,7 +1092,7 @@ mod tests {
         assert!(small.eps >= 20);
         assert!(small_cell_memory_for_eps(small.eps) <= small.memory_bytes);
         assert!(small_cell_memory_for_eps(small.eps + 1) > small.memory_bytes);
-        for memory in [minimum, 9 * GIB, 12 * GIB, 15_965 * MIB, 16 * GIB, 24 * GIB, 32 * GIB, 64 * GIB, 256 * GIB] {
+        for memory in [minimum, measured_eight_gib_host, 7934 * MIB, 8 * GIB, 9 * GIB, 12 * GIB, 15_965 * MIB, 16 * GIB, 24 * GIB, 32 * GIB, 64 * GIB, 256 * GIB] {
             for cpus in 2..=64 {
                 for sovereign in [false, true] {
                     let sizing = size(host_cell_memory_bytes(memory), cpus);
@@ -1111,6 +1140,22 @@ mod tests {
             assert_eq!(services.contains_key("vector"), vector);
             assert_eq!(services.contains_key("connector-runner"), vector);
             assert_eq!(services.contains_key("tenzir"), !vector);
+            let hec = std::fs::read_to_string(out.join("app/vector-hec.toml")).unwrap();
+            // Exercise the real initializer and preserve every authentication,
+            // payload-normalization and durable-ACK setting in the template.
+            let shared = include_str!("../../config/vector/02-hec-source.toml");
+            let restored = hec.lines().filter(|line| !line.starts_with("# Open-core policy:")
+                && !line.starts_with("# The hosted retention rationale")
+                && !line.starts_with("# The gateway polls")
+                && !line.starts_with("# closed after"))
+                .collect::<Vec<_>>().join("\n")
+                .replace("acknowledgements.max_idle_time = 10\n", "acknowledgements.max_idle_time = 600\n")
+                .replace("acknowledgements.max_number_of_ack_channels = 8192\n", "acknowledgements.max_number_of_ack_channels = 250000\n");
+            assert_eq!(restored, shared.trim_end());
+            if vector {
+                assert_eq!(services["vector"]["volumes"][0]["target"], "/etc/vector/02-hec-source.toml");
+                assert_eq!(services["vector"]["volumes"][0]["bind"]["create_host_path"], false);
+            }
             assert_eq!(rendered["x-nano-host-sizing"]["minimum_install_memory_bytes"], if vector { 7683 * MIB } else { 7680 * MIB });
             assert_eq!(rendered["x-nano-host-sizing"]["supported"], true);
             // The 9.1M storage probe reached 458 MiB process RSS. Both agents

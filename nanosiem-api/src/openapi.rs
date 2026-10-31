@@ -529,11 +529,14 @@ fn tenant_openapi(slug: &str) -> serde_json::Value {
 /// Tenant docs are auth-independent static assets; only explicit API
 /// credentials can execute requests, through the tenant path/auth fence.
 pub fn tenant_swagger_router() -> axum::Router {
+    registered_tenant_swagger_router().into_router()
+}
+
+pub(crate) fn registered_tenant_swagger_router() -> nanosiem_api_lib::route_policy::Router {
     use axum::{
         extract::Path,
         http::{header, StatusCode},
         response::{IntoResponse, Redirect, Response},
-        routing::get,
     };
     use nanosiem_api_lib::tenant_path::canonical_slug;
     async fn spec(Path(slug): Path<String>) -> Response {
@@ -572,11 +575,13 @@ pub fn tenant_swagger_router() -> axum::Router {
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
     }
-    axum::Router::new()
-        .route("/t/{slug}/api-docs/openapi.json", get(spec))
-        .route("/t/{slug}/swagger-ui", get(redirect))
-        .route("/t/{slug}/swagger-ui/", get(|Path(slug): Path<String>| asset(slug, String::new())))
-        .route("/t/{slug}/swagger-ui/{*asset}", get(|Path((slug, file)): Path<(String, String)>| asset(slug, file)))
+    use nanosiem_api_lib::route_policy::{Router, routing::get};
+    use nanosiem_core::auth::route_policy::RoutePolicy;
+    Router::new()
+        .route("/t/{slug}/api-docs/openapi.json", get(spec, RoutePolicy::public()))
+        .route("/t/{slug}/swagger-ui", get(redirect, RoutePolicy::public()))
+        .route("/t/{slug}/swagger-ui/", get(|Path(slug): Path<String>| asset(slug, String::new()), RoutePolicy::public()))
+        .route("/t/{slug}/swagger-ui/{*asset}", get(|Path((slug, file)): Path<(String, String)>| asset(slug, file), RoutePolicy::public()))
         .layer(axum::middleware::map_response(|mut response: Response| async move {
             response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
             response.headers_mut().insert(header::CONTENT_SECURITY_POLICY,

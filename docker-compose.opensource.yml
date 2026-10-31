@@ -657,6 +657,7 @@ services:
       - >
         mkdir -p /etc/vector/dynamic/sources/parsers /etc/vector/dynamic/sources/configs &&
         exec /usr/bin/vector
+        --chunk-size-events 64
         --dangerously-allow-env-var-interpolation
         --config-dir /etc/vector
         --config-dir /etc/vector/dynamic/sources/parsers
@@ -707,10 +708,10 @@ services:
       NANO_LAKE_ENRICHMENT_TOKEN: ${NANO_LAKE_ENRICHMENT_TOKEN:-}
       NANO_LAKE_TENANT_ID: ${NANO_LAKE_TENANT_ID:-default}
       VECTOR_LAKE_BATCH_MAX_EVENTS: ${NANO_LAKE_BRONZE_PUBLISH_MAX_ROWS:-65536}
-      # The bronze sink acks end to end, so a sequential /ingest sender waits
-      # this long per POST; keep it at the generated sink's 1 s default
-      # (NAN-2432). 5 s capped one sender at one bronze object per 5 s.
-      VECTOR_LAKE_BATCH_TIMEOUT_SECS: ${VECTOR_LAKE_BATCH_TIMEOUT_SECS:-1}
+      # HEC and HTTP success wait for the Bronze PUT. Collect concurrent
+      # requests for at most 50 ms so sequential senders do not pay a 1 s
+      # batch timer per POST. Byte/event caps still seal a full batch sooner.
+      VECTOR_LAKE_BATCH_TIMEOUT_SECS: ${VECTOR_LAKE_BATCH_TIMEOUT_SECS:-0.05}
       # NAN-3523: the lake sink memory buffer's byte bound (was a 10 GiB disk size).
       VECTOR_LAKE_BUFFER_MAX_BYTES: ${VECTOR_LAKE_BUFFER_MAX_BYTES:-67108864}
       VECTOR_RATE_LIMIT_PER_CLIENT_EPS: ${VECTOR_RATE_LIMIT_PER_CLIENT_EPS:-500000}
@@ -1512,6 +1513,10 @@ services:
     restart: unless-stopped
     logging: *default-logging
     entrypoint: ["nanosiem-lake-cell", "hec-proxy"]
+    # Query-only status credential and the installed single-tenant route.
+    # Missing/stale native commit status backpressures HEC with 503.
+    volumes:
+      - ./.nano-lean/app:/etc/nano-lake-cell:ro
     read_only: true
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]

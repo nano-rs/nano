@@ -1,10 +1,12 @@
 //! Private, bounded Squid authorization. Uses the existing egress credential
 //! names; no enable flag and no direct fallback. Origins only leave the service.
+use nanosiem_api_lib::route_policy::{Router, routing::{get, post}};
+use nanosiem_core::auth::route_policy::RoutePolicy;
 use axum::{
-    Json, Router,
+    Json,
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
+
 };
 use nanosiem_core::egress::{Grant, Grants, LOCAL_TENANT, Origin, Principal, Purpose, Source};
 use serde::{Deserialize, Serialize};
@@ -30,12 +32,21 @@ impl EgressState {
         })
     }
     fn principal(&self, headers: &HeaderMap) -> Result<(Uuid, Purpose), StatusCode> {
-        let raw = headers
-            .get("authorization")
-            .and_then(|h| h.to_str().ok())
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-        Principal::verify(&self.key, raw).ok_or(StatusCode::UNAUTHORIZED)
+        verify_private_principal(&self.key, headers)
     }
+}
+
+/// Kubernetes service proxy keeps its own Authorization header. A separately
+/// signed proxy principal may arrive in the dedicated service header instead.
+/// Exact single-value selection prevents duplicate/ambiguous credential fallback.
+pub(crate) fn verify_private_principal(key: &[u8], headers: &HeaderMap) -> Result<(Uuid, Purpose), StatusCode> {
+    let name = if headers.contains_key("x-nano-service-authorization") {
+        "x-nano-service-authorization"
+    } else { "authorization" };
+    let mut values = headers.get_all(name).iter();
+    let raw = values.next().and_then(|h| h.to_str().ok()).ok_or(StatusCode::UNAUTHORIZED)?;
+    if values.next().is_some() {return Err(StatusCode::UNAUTHORIZED)}
+    Principal::verify(key, raw).ok_or(StatusCode::UNAUTHORIZED)
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -189,14 +200,22 @@ pub async fn tenants(
     Ok(Json(ids))
 }
 
-pub fn router(state: EgressState) -> Router {
+pub fn router(state: EgressState) -> axum::Router {
+    let verifier = state.clone();
+    registered_router(state).into_private_router(
+        nanosiem_api_lib::route_policy::ServiceAuthenticators::default()
+            .register("egress-proxy", move |headers| verifier.principal(headers).is_ok()))
+}
+
+pub fn registered_router(state: EgressState) -> Router {
+
     Router::new()
-        .route("/internal/egress/check", post(check))
-        .route("/internal/egress/acl", get(acl))
-        .route("/internal/egress/tenants", get(tenants))
-        .route("/internal/egress/requirements", get(requirements))
+        .route("/internal/egress/check", post(check, RoutePolicy::service("egress-proxy", "egress:authorize")))
+        .route("/internal/egress/acl", get(acl, RoutePolicy::service("egress-proxy", "egress:authorize")))
+        .route("/internal/egress/tenants", get(tenants, RoutePolicy::service("egress-proxy", "egress:authorize")))
+        .route("/internal/egress/requirements", get(requirements, RoutePolicy::service("egress-proxy", "egress:authorize")))
         .layer(DefaultBodyLimit::max(2048))
-        .with_state(state)
+        .with_inner_state(state)
 }
 
 /// Projected by the hosted control plane from a recorded control DB authority admission and
@@ -536,7 +555,16 @@ impl Source for RuntimeSource {
     }
 }
 
-pub fn runtime_router(app: &crate::state::AppState, admission_file: &std::path::Path) -> Router {
+pub fn runtime_router(app: &crate::state::AppState, admission_file: &std::path::Path) -> axum::Router {
+    let key = nanosiem_core::egress::key_from_env().ok();
+    runtime_registered_router(app, admission_file).into_private_router(
+        nanosiem_api_lib::route_policy::ServiceAuthenticators::default().register("egress-proxy", move |headers| {
+            let Some(key) = &key else {return false};
+            verify_private_principal(key, headers).is_ok()
+        }))
+}
+
+pub fn runtime_registered_router(app: &crate::state::AppState, admission_file: &std::path::Path) -> Router {
     let Some(admission) = RuntimeAdmission::read(admission_file, app.config.deployment_id.as_deref()) else {
         return Router::new();
     };
@@ -548,7 +576,7 @@ pub fn runtime_router(app: &crate::state::AppState, admission_file: &std::path::
         return Router::new();
     };
     let state = EgressState::new(key, Arc::new(source)).expect("validated key");
-    router(state)
+    registered_router(state)
 }
 
 struct Security;

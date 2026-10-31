@@ -1,2 +1,5 @@
-# OTLP authentication uses nginx auth_request to nano-api (NAN-3933).
-# Kept as an empty template for image/compose compatibility; no static secrets.
+# The sender Authorization remains bound to its source in the API. This
+# independently authenticates the ingress service on the private API listener.
+map "" $nano_ingress_service_authorization {
+    default "Bearer ${VECTOR_AUTH_TOKEN}";
+}

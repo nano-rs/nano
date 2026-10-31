@@ -26,16 +26,22 @@ scrape_configs:
   # NanoSIEM API metrics
   - job_name: 'nanosiem-api'
     static_configs:
-      - targets: ['nanosiem-api:3000']
+      - targets: ['nanosiem-api:13000']
     metrics_path: /metrics
     scrape_interval: 10s
+    authorization:
+      type: Bearer
+      credentials_file: /tmp/nano-metrics-auth-token
 
   # NanoSIEM Search Service metrics
   - job_name: 'nanosiem-search'
     static_configs:
-      - targets: ['nanosiem-search:3002']
+      - targets: ['nanosiem-search:13002']
     metrics_path: /metrics
     scrape_interval: 10s
+    authorization:
+      type: Bearer
+      credentials_file: /tmp/nano-metrics-auth-token
 
   # Vector metrics (already exposed on 9598)
   - job_name: 'vector'

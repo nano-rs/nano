@@ -44,11 +44,12 @@
 
 use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
+use nanosiem_lake_cell::contract::IngestPendingInput;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::discovery::{NoticeHandle, NoticeQueue, SourceNotice};
 
@@ -186,6 +187,7 @@ struct PersistedState {
 
 #[derive(Debug, Default)]
 struct Inner {
+    consumed_objects_total: u64,
     watermark: Option<String>,
     acked: BTreeMap<String, i64>,
     /// Listed and not yet acked, by key.
@@ -194,6 +196,7 @@ struct Inner {
     last_list: Option<ListPass>,
     /// The last pass found nothing new (idle polls are throttled).
     last_list_empty: bool,
+    last_list_observed: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +218,7 @@ pub struct BronzeListQueue<L: BronzeLister> {
     page: usize,
     clock: Box<dyn Fn() -> i64 + Send + Sync>,
     inner: Mutex<Inner>,
+    discovery: tokio::sync::Mutex<()>,
 }
 
 impl<L: BronzeLister> BronzeListQueue<L> {
@@ -297,7 +301,78 @@ impl<L: BronzeLister> BronzeListQueue<L> {
             page: 1_000,
             clock,
             inner: Mutex::new(inner),
+            discovery: tokio::sync::Mutex::new(()),
         })
+    }
+
+    async fn pending_with_poll(
+        &self,
+        max: usize,
+        poll_ms: i64,
+    ) -> Result<Vec<(NoticeHandle, SourceNotice)>> {
+        // The independent observer and ingest share delivery/cursor accounting.
+        // Serialize listing passes, while ack and heartbeat reads stay available.
+        let _discovery = self.discovery.lock().await;
+        let now = (self.clock)();
+        let due = {
+            let inner = self.inner.lock().expect("bronze list lock");
+            let throttled = inner.last_list_empty
+                && inner
+                    .last_list
+                    .as_ref()
+                    .is_some_and(|pass| now - pass.started_ms < poll_ms);
+            !throttled && inner.delivered.len() < max.max(1)
+        };
+        if due {
+            self.list_pass(max.max(1)).await?;
+        }
+        let mut inner = self.inner.lock().expect("bronze list lock");
+        // A pass with nothing new can still settle acked keys.
+        if Self::advance(&mut inner, self.settle_ms) {
+            self.persist(&inner)?;
+        }
+        Ok(inner
+            .delivered
+            .iter()
+            .take(max)
+            .map(|(key, notice)| (NoticeHandle(key.clone()), notice.clone()))
+            .collect())
+    }
+
+    /// Read without the ingestor lock or store IO, including during a first
+    /// failed/hung tick whose completed health still says idle and zero lag.
+    pub fn pending_input(&self) -> IngestPendingInput {
+        let inner = self.inner.lock().expect("bronze list lock");
+        IngestPendingInput {
+            objects: inner.delivered.len() as u64,
+            consumed_objects_total: inner.consumed_objects_total,
+            oldest_age_seconds: inner
+                .delivered
+                .values()
+                .map(|n| n.notified_at_ms)
+                .min()
+                .map_or(0.0, |oldest| {
+                    (self.clock)().saturating_sub(oldest).max(0) as f64 / 1000.0
+                }),
+            discovery_age_seconds: inner
+                .last_list_observed
+                .map(|at| at.elapsed().as_secs_f64()),
+        }
+    }
+
+    /// Keep discovering even if the ingest task blocks before its first pull.
+    /// One known pending object suffices; no extra listing while it is unacked.
+    /// Failed/hung discovery leaves an empty observation stale (fail closed).
+    pub async fn discover_input(&self) {
+        // Admission needs a fresh empty observation even when ordinary idle
+        // ingestion was configured to poll less often than its freshness bound.
+        let poll_ms = self.poll_ms.min(DEFAULT_POLL.as_millis() as i64);
+        loop {
+            if let Err(error) = self.pending_with_poll(1, poll_ms).await {
+                tracing::warn!(error = %error, "bronze input discovery failed");
+            }
+            tokio::time::sleep(Duration::from_millis(poll_ms as u64)).await;
+        }
     }
 
     /// The current watermark (every key at or below it is consumed and
@@ -334,6 +409,7 @@ impl<L: BronzeLister> BronzeListQueue<L> {
     /// objects are delivered (or the end). Returns whether it found anything.
     async fn list_pass(&self, want: usize) -> Result<bool> {
         let now = (self.clock)();
+        let observed = Instant::now();
         let (mut cursor, room) = {
             let inner = self.inner.lock().expect("bronze list lock");
             (
@@ -372,7 +448,10 @@ impl<L: BronzeLister> BronzeListQueue<L> {
                 {
                     continue;
                 }
-                if inner.acked.contains_key(&object.key)
+                // A durable ack can advance the watermark while the observer's
+                // LIST is in flight. Its response may still contain that key.
+                if inner.watermark.as_ref().is_some_and(|w| object.key <= *w)
+                    || inner.acked.contains_key(&object.key)
                     || inner.delivered.contains_key(&object.key)
                 {
                     continue;
@@ -396,6 +475,8 @@ impl<L: BronzeLister> BronzeListQueue<L> {
                     frontier: frontier.clone(),
                 });
                 inner.last_list_empty = !found;
+                // An old response to a slow LIST cannot renew an empty proof.
+                inner.last_list_observed = Some(observed);
                 return Ok(found);
             }
         }
@@ -467,30 +548,7 @@ impl<L: BronzeLister> BronzeListQueue<L> {
 #[async_trait]
 impl<L: BronzeLister> NoticeQueue for BronzeListQueue<L> {
     async fn pending(&self, max: usize) -> Result<Vec<(NoticeHandle, SourceNotice)>> {
-        let now = (self.clock)();
-        let due = {
-            let inner = self.inner.lock().expect("bronze list lock");
-            let throttled = inner.last_list_empty
-                && inner
-                    .last_list
-                    .as_ref()
-                    .is_some_and(|pass| now - pass.started_ms < self.poll_ms);
-            !throttled && inner.delivered.len() < max.max(1)
-        };
-        if due {
-            self.list_pass(max.max(1)).await?;
-        }
-        let mut inner = self.inner.lock().expect("bronze list lock");
-        // A pass with nothing new can still settle acked keys.
-        if Self::advance(&mut inner, self.settle_ms) {
-            self.persist(&inner)?;
-        }
-        Ok(inner
-            .delivered
-            .iter()
-            .take(max)
-            .map(|(key, notice)| (NoticeHandle(key.clone()), notice.clone()))
-            .collect())
+        self.pending_with_poll(max, self.poll_ms).await
     }
 
     async fn ack(&self, handles: &[NoticeHandle]) -> Result<()> {
@@ -506,7 +564,10 @@ impl<L: BronzeLister> NoticeQueue for BronzeListQueue<L> {
                 continue;
             }
             let created = match inner.delivered.remove(&handle.0) {
-                Some(notice) => notice.notified_at_ms,
+                Some(notice) => {
+                    inner.consumed_objects_total = inner.consumed_objects_total.saturating_add(1);
+                    notice.notified_at_ms
+                }
                 None => key_time_ms(&handle.0).unwrap_or_else(|| (self.clock)()),
             };
             inner.acked.insert(handle.0.clone(), created);
@@ -591,6 +652,100 @@ mod tests {
 
     fn keys(pending: &[(NoticeHandle, SourceNotice)]) -> Vec<String> {
         pending.iter().map(|(h, _)| h.0.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn input_observation_ages_without_ticks_and_drains_only_on_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::default();
+        let clock = Arc::new(AtomicI64::new(1_728_560_000_000));
+        let q = queue(&fake, dir.path(), clock.clone());
+        assert_eq!(q.pending_input().discovery_age_seconds, None);
+        assert!(q.pending(10).await.unwrap().is_empty());
+        assert_eq!(q.pending_input().objects, 0);
+        assert!(q.pending_input().discovery_age_seconds.unwrap() < 1.0);
+        let key = fake.put(1_728_560_000, "first");
+        clock.fetch_add(100, Ordering::SeqCst);
+        q.pending(10).await.unwrap();
+        assert_eq!(q.pending_input().objects, 1);
+        clock.fetch_add(31_000, Ordering::SeqCst);
+        assert!(q.pending_input().oldest_age_seconds >= 31.0);
+        assert_eq!(
+            fake.lists.load(Ordering::SeqCst),
+            2,
+            "observation performs no IO"
+        );
+        q.ack(&[NoticeHandle(key)]).await.unwrap();
+        assert_eq!(q.pending_input().consumed_objects_total, 1);
+        assert_eq!(q.pending_input().objects, 0);
+        assert_eq!(q.pending_input().oldest_age_seconds, 0.0);
+        let next = fake.put(1_728_560_031, "next");
+        assert_eq!(keys(&q.pending(10).await.unwrap()), vec![next]);
+        assert!(
+            q.pending_input().oldest_age_seconds < 1.0,
+            "new input inherits no idle age"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_discovery_cannot_redeliver_an_acknowledged_watermark() {
+        struct Delayed {
+            fake: Fake,
+            block: std::sync::atomic::AtomicBool,
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl BronzeLister for Arc<Delayed> {
+            async fn list_after(
+                &self,
+                prefix: &str,
+                after: Option<&str>,
+                limit: usize,
+            ) -> Result<Vec<ListedBronze>> {
+                let page = self.fake.list_after(prefix, after, limit).await?;
+                if self.block.load(Ordering::SeqCst) {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(page)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lister = Arc::new(Delayed {
+            fake: Fake::default(),
+            block: false.into(),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let key = lister.fake.put(1_728_560_000, "settled");
+        let q = Arc::new(
+            BronzeListQueue::open_with_clock(
+                lister.clone(),
+                T,
+                dir.path(),
+                &BronzeListSettings::default(),
+                Box::new(|| 1_728_562_000_000),
+            )
+            .unwrap(),
+        );
+        q.pending(1).await.unwrap();
+        lister.block.store(true, Ordering::SeqCst);
+        let listing = tokio::spawn({
+            let q = q.clone();
+            async move { q.pending(2).await.unwrap() }
+        });
+        lister.started.notified().await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        q.ack(&[NoticeHandle(key.clone())]).await.unwrap();
+        assert_eq!(q.watermark(), Some(key));
+        lister.release.notify_one();
+        assert!(listing.await.unwrap().is_empty());
+        assert_eq!(q.pending_input().objects, 0);
+        assert!(
+            q.pending_input().discovery_age_seconds.unwrap() >= 0.03,
+            "freshness starts before LIST IO, not when a delayed response finishes"
+        );
     }
 
     #[test]

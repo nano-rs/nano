@@ -647,9 +647,24 @@ pub enum ToSupervisor {
     FindingAppendComplete { request_id: u64 },
 }
 
+/// Open-core Bronze input, sampled independently of the ingest tick. Entries
+/// remain pending until their durable consumption is acknowledged. An empty
+/// sample is authoritative only while its successful discovery remains fresh.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngestPendingInput {
+    pub objects: u64,
+    /// Process-local durable consumption counter, including refusals/replays.
+    /// Lets admission observe a drain even when new input arrives between reads.
+    pub consumed_objects_total: u64,
+    pub oldest_age_seconds: f64,
+    pub discovery_age_seconds: Option<f64>,
+}
+
 /// Liveness plus the progress facts the stall/lag signals are built on.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Heartbeat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_pending_input: Option<IngestPendingInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_catalog_custody: Option<serde_json::Value>,
     /// Live ingest pipeline diagnostics; readable independently of the ingest lock.

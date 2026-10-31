@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::models::notebook::{NewNotebookReference, NotebookReference, NotebookSummary};
 
-use super::{NotebookRepository, NotebookRepositoryError};
+use super::{notebook_visible_to_user_at, NotebookRepository, NotebookRepositoryError};
 
 impl NotebookRepository {
     /// Add a reference to a notebook
@@ -130,7 +130,7 @@ impl NotebookRepository {
         reference_id: Uuid,
         user_id: Uuid,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(
+        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
             r#"
             SELECT DISTINCT
                 n.*,
@@ -147,36 +147,11 @@ impl NotebookRepository {
                 GROUP BY notebook_id
             ) ec ON ec.notebook_id = n.id
             WHERE nr.reference_type = $1 AND nr.reference_id = $2
-              AND (
-                  n.owner_id = $3
-                  -- NAN-1739: case notebooks are visibility='public'; the
-                  -- public disjunct only frees non-case notebooks, case
-                  -- notebooks are governed by case visibility so this lookup
-                  -- can't hand a case notebook to a user who can't see the case.
-                  OR (n.case_id IS NULL AND n.visibility = 'public')
-                  OR ns.shared_with_user_id = $3
-                  OR ug.user_id IS NOT NULL
-                  OR (
-                      n.case_id IS NOT NULL
-                      AND EXISTS (
-                          SELECT 1 FROM cases c
-                          WHERE c.id = n.case_id
-                            AND (
-                                c.created_by = $3
-                                OR c.assigned_to = $3
-                                OR c.visibility = 'public'
-                                OR (c.visibility = 'group' AND EXISTS (
-                                    SELECT 1 FROM case_groups cg
-                                    JOIN user_groups cug ON cug.group_id = cg.group_id
-                                    WHERE cg.case_id = c.id AND cug.user_id = $3
-                                ))
-                            )
-                      )
-                  )
-              )
+              AND {visible}
             ORDER BY n.updated_at DESC
             "#,
-        )
+            visible = notebook_visible_to_user_at(3),
+        ))
         .bind(reference_type)
         .bind(reference_id)
         .bind(user_id)
