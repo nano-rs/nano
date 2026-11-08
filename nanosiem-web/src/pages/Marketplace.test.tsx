@@ -118,12 +118,13 @@ describe('Marketplace inventory', () => {
     expect(card('tor-exit-nodes')).toBeTruthy();
   });
 
-  it('opens an item deep link in the inventory drawer', async () => {
+  it('opens a bundle-owned deep link without direct catalog actions', async () => {
     mount('/marketplace?slug=tor-exit-nodes');
     const details = await screen.findByTestId('inventory-details');
     expect(within(details).getByText('tor-exit-nodes')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Disable' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Uninstall' })).toBeTruthy();
+    expect(screen.getByTestId('inventory-bundle').textContent).toContain('tor_exit_nodes');
+    expect(screen.queryByRole('button', { name: 'Disable' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Uninstall' })).toBeNull();
   });
 
   it('open edition: enterprise backends carry an entitlement panel and no install action', async () => {

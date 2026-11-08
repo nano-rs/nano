@@ -548,6 +548,7 @@ pub(super) async fn run_sync(
             record_count: existing.as_ref().map(|e| e.record_count).unwrap_or(0),
             is_syncing: false, // derived per-query in repository; not stored
             requires_network: false, // derived in repository hydrate; not stored
+            platform_feed_id: None, // derived in repository hydrate; not stored
             changelog: manifest.changelog.clone(),
             created_at: existing
                 .as_ref()

@@ -142,6 +142,7 @@ impl ParserRepositoryService {
     /// | aws_s3 / s3   | aws_s3           | yes                  |
     /// | gcp_pubsub    | gcp_pubsub       | yes                  |
     /// | splunk_hec    | splunk_hec       | yes                  |
+    /// | otlp          | otlp             | yes                  |
     /// | http          | routed           | no (always-on)       |
     /// | vector        | vector           | no (always-on)       |
     ///
@@ -158,15 +159,21 @@ impl ParserRepositoryService {
             "s3" => "aws_s3",
             "pubsub" => "gcp_pubsub",
             "splunk" | "hec" => "splunk_hec",
+            "opentelemetry" | "otel" => "otlp",
+            other => other,
+        };
+        let normalized_method = match ingestion_method {
+            "opentelemetry" | "otel" => "otlp",
             other => other,
         };
         matches!(
-            (normalized_ct, ingestion_method),
+            (normalized_ct, normalized_method),
             ("kafka", "kafka")
                 | ("aws_s3", "aws_s3")
                 | ("gcp_pubsub", "gcp_pubsub")
                 | ("azure_event_hubs", "azure_event_hubs")
                 | ("splunk_hec", "splunk_hec")
+                | ("otlp", "otlp")
                 | ("http", "routed")
                 | ("vector", "vector")
         )
@@ -1272,6 +1279,7 @@ impl ParserRepositoryService {
     fn config_type_for_ingestion_method(ingestion_method: &str) -> &str {
         match ingestion_method {
             "routed" => "http",
+            "opentelemetry" | "otel" => "otlp",
             other => other, // kafka/aws_s3/gcp_pubsub/splunk_hec/vector are identity
         }
     }
@@ -2071,6 +2079,10 @@ impl ParserRepositoryService {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dispatch_compatibility_tests.rs"]
+mod dispatch_compatibility_tests;
 
 #[cfg(test)]
 mod tests {

@@ -270,73 +270,18 @@ if contains(content_type, "application/json") {
     .content_format = "json"
     parsed, err = parse_json(raw)
     if err == null {
-        # Merge parsed JSON fields to top-level (parsers can access .referrer directly)
-        # Skip 'message' which we handle specially below
-        parsed_keys, key_err = keys(parsed)
-        if key_err == null {
-            for_each(parsed_keys) -> |_idx, key| {
-                if key != "message" {
-                    val, get_err = get(parsed, [key])
-                    if get_err == null && val != null {
-                        . = set!(., [key], val)
-                    }
-                }
-            }
-        }
-        # Extract the actual log message if present
-        if exists(parsed.message) && is_string(parsed.message) {
-            .message = to_string!(parsed.message)
-        } else {
-            .message = raw
-        }
-        if .source_type == "unknown" {
-            body_source_type = to_string(parsed.source_type) ?? null
-            if body_source_type != null {
-                .source_type = body_source_type
-            }
-        }
-    } else {
-        .message = raw
-    }
-} else if contains(content_type, "application/x-ndjson") || contains(content_type, "ndjson") {
-    .content_format = "ndjson"
-    parsed, err = parse_json(raw)
-    if err == null {
-        # Merge parsed JSON fields to top-level
-        parsed_keys, key_err = keys(parsed)
-        if key_err == null {
-            for_each(parsed_keys) -> |_idx, key| {
-                if key != "message" {
-                    val, get_err = get(parsed, [key])
-                    if get_err == null && val != null {
-                        . = set!(., [key], val)
-                    }
-                }
-            }
-        }
-        if exists(parsed.message) && is_string(parsed.message) {
-            .message = to_string!(parsed.message)
-        } else {
-            .message = raw
-        }
-        if .source_type == "unknown" {
-            body_source_type = to_string(parsed.source_type) ?? null
-            if body_source_type != null {
-                .source_type = body_source_type
-            }
-        }
-    } else {
-        .message = raw
-    }
-} else if contains(content_type, "text/plain") || contains(content_type, "text/") {
-    .content_format = "raw"
-    .message = raw
-} else {
-    if starts_with(raw, "{") || starts_with(raw, "[") {
-        parsed, err = parse_json(raw)
-        if err == null {
-            .content_format = "json"
-            # Merge parsed JSON fields to top-level
+        if is_array(parsed) {
+            # A top-level JSON array is a transport batch. The following remap
+            # expands it before source routing; nested arrays remain untouched.
+            %nano_json_batch = parsed
+        } else if is_object(parsed) {
+            # Retain the already-parsed record in protected event metadata for
+            # credential redaction below. A sender cannot forge this control.
+            %nano_json_record = parsed
+            # Merge parsed JSON fields to top-level so format-aware parsers can
+            # access them directly. `message` is ordinary source data, not an
+            # HTTP envelope: `.message` must remain the complete JSON record for
+            # source-specific parsers such as Generic JSON.
             parsed_keys, key_err = keys(parsed)
             if key_err == null {
                 for_each(parsed_keys) -> |_idx, key| {
@@ -348,10 +293,38 @@ if contains(content_type, "application/json") {
                     }
                 }
             }
-            if exists(parsed.message) && is_string(parsed.message) {
-                .message = to_string!(parsed.message)
-            } else {
-                .message = raw
+            if .source_type == "unknown" {
+                body_source_type = to_string(parsed.source_type) ?? null
+                if body_source_type != null {
+                    .source_type = body_source_type
+                }
+            }
+        }
+        .message = raw
+    } else {
+        .message = raw
+    }
+} else if contains(content_type, "application/x-ndjson") || contains(content_type, "ndjson") {
+    .content_format = "ndjson"
+    parsed, err = parse_json(raw)
+    if err == null {
+        if is_array(parsed) {
+            %nano_json_batch = parsed
+        } else if is_object(parsed) {
+            %nano_json_record = parsed
+            # Newline framing already emits one event per NDJSON record. Keep
+            # the full record in `.message` even when it contains a field with
+            # that name; the configured parser owns any envelope semantics.
+            parsed_keys, key_err = keys(parsed)
+            if key_err == null {
+                for_each(parsed_keys) -> |_idx, key| {
+                    if key != "message" {
+                        val, get_err = get(parsed, [key])
+                        if get_err == null && val != null {
+                            . = set!(., [key], val)
+                        }
+                    }
+                }
             }
             if .source_type == "unknown" {
                 body_source_type = to_string(parsed.source_type) ?? null
@@ -359,6 +332,44 @@ if contains(content_type, "application/json") {
                     .source_type = body_source_type
                 }
             }
+        }
+        .message = raw
+    } else {
+        .message = raw
+    }
+} else if contains(content_type, "text/plain") || contains(content_type, "text/") {
+    .content_format = "raw"
+    .message = raw
+} else {
+    if starts_with(raw, "{") || starts_with(raw, "[") {
+        parsed, err = parse_json(raw)
+        if err == null {
+            .content_format = "json"
+            if is_array(parsed) {
+                %nano_json_batch = parsed
+            } else if is_object(parsed) {
+                %nano_json_record = parsed
+                # Headerless clients receive the same JSON semantics as an
+                # explicit application/json request.
+                parsed_keys, key_err = keys(parsed)
+                if key_err == null {
+                    for_each(parsed_keys) -> |_idx, key| {
+                        if key != "message" {
+                            val, get_err = get(parsed, [key])
+                            if get_err == null && val != null {
+                                . = set!(., [key], val)
+                            }
+                        }
+                    }
+                }
+                if .source_type == "unknown" {
+                    body_source_type = to_string(parsed.source_type) ?? null
+                    if body_source_type != null {
+                        .source_type = body_source_type
+                    }
+                }
+            }
+            .message = raw
         } else {
             .content_format = "raw"
             .message = raw
@@ -369,9 +380,63 @@ if contains(content_type, "application/json") {
     }
 }
 
+# Parser-facing `.message` preserves the complete JSON record, but the storage
+# security boundary also forbids credential-shaped body fields at any depth.
+# Sanitize only when such a field exists so ordinary records retain their exact
+# original bytes (including whitespace and key order). Reuse the protected
+# parsed value above instead of parsing this hot path twice.
+if exists(%nano_json_record) {
+    parser_record = del(%nano_json_record)
+    nano_message_cred_names = ["authorization", "proxy-authorization", "x-api-key", "x-webhook-secret", "cookie", "set-cookie"]
+    nano_message_cred_paths = []
+    for_each(keys(flatten(object!(parser_record), "\u{1f}"))) -> |_idx, nano_flat_key| {
+        nano_segments = split(nano_flat_key, "\u{1f}")
+        nano_hit = -1
+        for_each(nano_segments) -> |nano_i, nano_seg| {
+            if nano_hit < 0 && includes(nano_message_cred_names, downcase(nano_seg)) {
+                nano_hit = nano_i
+            }
+        }
+        if nano_hit >= 0 {
+            nano_message_cred_paths = push(nano_message_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+        }
+    }
+    for_each(nano_message_cred_paths) -> |_idx, nano_path| {
+        parser_record = object!(remove!(parser_record, array!(nano_path)))
+    }
+    if length(nano_message_cred_paths) > 0 {
+        .message = encode_json(parser_record)
+    }
+}
+
+# Remove the same fields from the merged root before any source parser runs.
+# The storage-boundary redactor remains defense in depth for every transport.
+nano_cred_names = ["authorization", "proxy-authorization", "x-api-key", "x-webhook-secret", "cookie", "set-cookie"]
+nano_cred_paths = []
+for_each(keys(flatten(., "\u{1f}"))) -> |_idx, nano_flat_key| {
+    nano_segments = split(nano_flat_key, "\u{1f}")
+    nano_hit = -1
+    for_each(nano_segments) -> |nano_i, nano_seg| {
+        if nano_hit < 0 && includes(nano_cred_names, downcase(nano_seg)) {
+            nano_hit = nano_i
+        }
+    }
+    if nano_hit >= 0 {
+        nano_cred_paths = push(nano_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+    }
+}
+for_each(nano_cred_paths) -> |_idx, nano_path| {
+    . = object!(remove!(., array!(nano_path)))
+}
+
 if contains(to_string(.request_path) ?? "", "/webhook") {
     .is_webhook = true
 }
+
+# A body may contain its own `metadata` object. Preserve it, but restore the
+# transport marker used by the durable-delivery route after the merge.
+if !is_object(.metadata) { .metadata = {} }
+.metadata.forwarded_via = "http"
 
 # NAN-4945: the trusted client address and the TCP peer, restored after the
 # body merge so a sender cannot overwrite them.
@@ -382,11 +447,89 @@ if ingest_peer != "" { .ingest_peer = ingest_peer }
 '''
 
 # =============================================================================
+# JSON batch expansion
+# =============================================================================
+# `http_server` newline framing handles NDJSON records, but a JSON array is one
+# decoded source event. `unnest!` returns cloned log objects and Vector's remap
+# transform emits one event per array member. Event metadata (including the
+# authenticated source binding and the request batch notifier) is retained on
+# every clone, so one HTTP 2xx still waits for every member's disk handoff.
+[transforms.json_batch_expand]
+type = "remap"
+inputs = ["parse_content"]
+source = '''
+if is_array(%nano_json_batch) {
+    .nano_json_batch = del(%nano_json_batch)
+    %nano_json_batch_member = true
+    . = unnest!(.nano_json_batch)
+}
+'''
+
+[transforms.json_batch_normalize]
+type = "remap"
+inputs = ["json_batch_expand"]
+source = '''
+if to_bool(%nano_json_batch_member) ?? false {
+    del(%nano_json_batch_member)
+    parsed = del(.nano_json_batch)
+
+    # Match the single-object contract: parser-facing `.message` is the whole
+    # member, while native object/array values are also available at the root.
+    if is_object(parsed) {
+        # Apply the same recursive credential-field boundary as single-object
+        # JSON before the member becomes either `.message` or merged fields.
+        nano_cred_names = ["authorization", "proxy-authorization", "x-api-key", "x-webhook-secret", "cookie", "set-cookie"]
+        nano_cred_paths = []
+        for_each(keys(flatten(object!(parsed), "\u{1f}"))) -> |_idx, nano_flat_key| {
+            nano_segments = split(nano_flat_key, "\u{1f}")
+            nano_hit = -1
+            for_each(nano_segments) -> |nano_i, nano_seg| {
+                if nano_hit < 0 && includes(nano_cred_names, downcase(nano_seg)) {
+                    nano_hit = nano_i
+                }
+            }
+            if nano_hit >= 0 {
+                nano_cred_paths = push(nano_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+            }
+        }
+        for_each(nano_cred_paths) -> |_idx, nano_path| {
+            parsed = object!(remove!(parsed, array!(nano_path)))
+        }
+
+        parsed_keys = keys!(parsed)
+        for_each(parsed_keys) -> |_idx, key| {
+            if key != "message" {
+                val = get!(parsed, [key])
+                if val != null { . = set!(., [key], val) }
+            }
+        }
+        if (to_string(.source_type) ?? "unknown") == "unknown" {
+            body_source_type = to_string(parsed.source_type) ?? ""
+            if body_source_type != "" { .source_type = body_source_type }
+        }
+    }
+
+    raw = encode_json(parsed)
+    .message = raw
+    .content_format = "json"
+    if !is_object(.metadata) { .metadata = {} }
+    .metadata.forwarded_via = "http"
+
+    # The array member is untrusted body data; restore the edge-derived values
+    # after merging it so it cannot forge transport identity.
+    ingest_client_ip = to_string(%nano_ingest_client_ip) ?? ""
+    if ingest_client_ip != "" { .ingest_client_ip = ingest_client_ip }
+    ingest_peer = to_string(%nano_ingest_peer) ?? ""
+    if ingest_peer != "" { .ingest_peer = ingest_peer }
+}
+'''
+
+# =============================================================================
 # Source Type Extraction and Normalization
 # =============================================================================
 [transforms.source_type_extract]
 type = "remap"
-inputs = ["parse_content"]
+inputs = ["json_batch_normalize"]
 source = '''
 source_type = "unknown"
 if exists(.source_type) && is_string(.source_type) {

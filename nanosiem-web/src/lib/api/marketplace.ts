@@ -55,6 +55,9 @@ export interface MarketplaceCatalogEntry {
    *  instead of live sync; offline-capable entries (custom transforms with no
    *  allowed_domains) are false. (NAN-1212) */
   requires_network?: boolean;
+  /** Signed platform-feed bundle ownership. Direct catalog install is not
+   * available when this is present. */
+  platform_feed_id?: string;
   changelog?: string;
   created_at: string;
   updated_at: string;

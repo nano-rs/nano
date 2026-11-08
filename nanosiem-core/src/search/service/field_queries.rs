@@ -602,9 +602,37 @@ impl SearchService {
                 None => where_predicate,
             };
 
-        ch_executor
+        let names = ch_executor
             .get_ext_field_names(&table, json_col, is_ocsf, &where_predicate)
-            .await
+            .await?;
+
+        Ok(names
+            .into_iter()
+            .map(|name| canonical_dynamic_field_name(json_col, is_ocsf, &name))
+            .collect())
+    }
+
+    /// Get top values for any field the active search profile can resolve.
+    ///
+    /// Unlike [`Self::get_udm_field_values`], this accepts native OCSF names
+    /// (`class_uid`) and dynamic spill names (`unmapped.vendor.key`) exactly as
+    /// the field catalog and nPL search expose them.
+    #[instrument(skip(self, scope))]
+    pub async fn get_named_field_values(
+        &self,
+        field: &str,
+        time_range: &TimeRangeInput,
+        limit: Option<usize>,
+        scope: &ScopeSet,
+    ) -> Result<Vec<(String, u64)>, SearchError> {
+        time_range.validate()?;
+        let limit = limit.unwrap_or(self.config.top_values_count);
+
+        let values = self
+            .get_field_values(field, "*", time_range, limit, None, scope)
+            .await?;
+
+        Ok(values.into_iter().map(|v| (v.value, v.count)).collect())
     }
 
     /// Get top values for a specific UDM field
@@ -629,14 +657,8 @@ impl SearchService {
         limit: Option<usize>,
         scope: &ScopeSet,
     ) -> Result<Vec<(String, u64)>, SearchError> {
-        time_range.validate()?;
-        let limit = limit.unwrap_or(self.config.top_values_count);
-
-        let values = self
-            .get_field_values(field.column_name(), "*", time_range, limit, None, scope)
-            .await?;
-
-        Ok(values.into_iter().map(|v| (v.value, v.count)).collect())
+        self.get_named_field_values(field.column_name(), time_range, limit, scope)
+            .await
     }
 
     /// Validate a regex pattern for safety and correctness
@@ -748,6 +770,22 @@ impl SearchService {
         Ok(sql)
     }
 }
+
+/// Convert a discovered dynamic JSON path into the field spelling nPL accepts.
+/// UDM's `ext` inventory intentionally stays bare for backwards compatibility;
+/// OCSF paths must name their stored spill (`unmapped`) or a bare name may be
+/// interpreted as an unrelated schema field.
+fn canonical_dynamic_field_name(json_col: &str, nested: bool, name: &str) -> String {
+    if nested {
+        format!("{json_col}.{name}")
+    } else {
+        name.to_string()
+    }
+}
+
+#[cfg(test)]
+#[path = "field_values_acceptance_tests.rs"]
+mod field_values_acceptance_tests;
 
 /// Select the column set for a field-stats query (NAN-1427).
 ///

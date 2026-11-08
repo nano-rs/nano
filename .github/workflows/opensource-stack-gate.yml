@@ -80,10 +80,10 @@ jobs:
             echo "install-edition test not in this tree (public mirror); skipping"
           fi
 
-      # NAN-5006: the public v2.0.0 installer passed definition-only checks but
-      # failed on fresh Linux hosts because caller umask 077 privatized bind
-      # sources. DinD isolates fixed compose names from every runner stack.
-      - name: install.sh hostile-umask live root and non-root scenarios
+      # NAN-5006: prove the documented streamed installer cannot lose its
+      # remaining source to Compose stdin, while retaining hostile-umask mode
+      # coverage. DinD isolates fixed compose names from every runner stack.
+      - name: install.sh streamed hostile-umask fresh and resume scenarios
         run: |
           if [ -f scripts/tests/install-umask.live.sh ]; then
             bash scripts/tests/install-umask.live.sh

@@ -3268,3 +3268,5 @@ mod hec_ack_contract_tests;
 mod http_durability_contract_tests;
 #[cfg(test)]
 mod buffer_budget_contract_tests;
+#[cfg(test)]
+mod json_ingest_contract_tests;

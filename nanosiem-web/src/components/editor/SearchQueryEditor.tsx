@@ -80,7 +80,7 @@ export interface SearchQueryEditorProps {
   onCursorChange?: (position: number, coords: CursorCoords | null) => void;
   onFocus?: () => void;
   onBlur?: () => void;
-  /** Called when Enter is pressed (without modifiers) */
+  /** Called when Enter or Cmd/Ctrl+Enter submits the search */
   onSubmit?: () => void;
   /** Called when Tab is pressed */
   onTabPress?: () => void;
@@ -88,6 +88,15 @@ export interface SearchQueryEditorProps {
   autocomplete?: 'auto' | 'manual' | false;
   /** Extra caller extensions (e.g. decorations); reconfigured when the array identity changes. */
   extensions?: Extension[];
+}
+
+/** CodeMirror's cross-platform search-submit shortcut. */
+export const SEARCH_SUBMIT_KEY = 'Mod-Enter';
+
+/** Shared by the key binding and its regression test. */
+export function runSearchSubmit(onSubmit?: () => void): true {
+  onSubmit?.();
+  return true;
 }
 
 /**
@@ -222,9 +231,13 @@ export function SearchQueryEditor({
             if (completionStatus(view.state) === 'active') return false; // let CM accept completion
             const event = new KeyboardEvent('keydown', { key: 'Enter', shiftKey: false, metaKey: false });
             if (callbacksRef.current.onKeyDown?.(event, view)) return true;
-            callbacksRef.current.onSubmit?.();
-            return true;
+            return runSearchSubmit(callbacksRef.current.onSubmit);
           },
+        },
+        // Cmd/Ctrl+Enter - explicit shortcut advertised by the search UI.
+        {
+          key: SEARCH_SUBMIT_KEY,
+          run: () => runSearchSubmit(callbacksRef.current.onSubmit),
         },
         // Shift+Enter - insert newline
         {

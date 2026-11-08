@@ -3,7 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Capabilities } from '@/hooks/use-capabilities';
 import type { EnrichmentMarketplaceRepo, MarketplaceCatalogEntry } from './marketplace';
-import { applyFeedBundle, buildInventory, bundleFeedForSlug, bundleProvisions, catalogItem, inventoryAction, inventoryReason, isFirstPartyRepo, syncPollInterval, SYNC_POLL_MAX_MS, SYNC_POLL_MS } from './marketplace-inventory';
+import { applyFeedBundle, buildInventory, bundleFeedForSlug, bundleProvisions, catalogItem, inventoryAction, inventoryReason, isFirstPartyRepo, platformFeedForEntry, syncPollInterval, SYNC_POLL_MAX_MS, SYNC_POLL_MS } from './marketplace-inventory';
 import { executionStageLabel, humanizeEnum } from '../marketplace-labels';
 
 const OPEN = { customEnrichment: false, agentEnrichment: false } as Capabilities;
@@ -63,7 +63,8 @@ describe('marketplace inventory projection', () => {
     const missing = catalogItem(entry({ installed: true, enabled: true }), [official], ENT);
     expect(missing.reason).toBe('missing_credentials');
     const feed = catalogItem(entry({ slug: 'tor', category: 'data', execution_backend: 'native', installed: true, enabled: true, requires_credential: 'none', last_sync_status: 'failed' }), [official], OPEN);
-    expect(feed.reason).toBe('sync_failed');
+    expect(feed.reason).toBe('bundle_inactive');
+    expect(inventoryAction(feed)).toBe('Feed bundle');
     expect(executionStageLabel(feed.execution_stage)).toBe('Built in · at ingest');
     expect(executionStageLabel(catalogItem(entry({ category: 'identity', execution_backend: 'identity' }), [], OPEN).execution_stage)).toBe('Directory sync');
   });
@@ -184,5 +185,19 @@ describe('bundle feed slugs (NAN-4959)', () => {
     expect(bundleFeedForSlug('tor')).toBe('tor_exit_nodes');
     expect(bundleFeedForSlug('tor-exit-nodes')).toBe('tor_exit_nodes');
     expect(bundleFeedForSlug('urlhaus')).toBeNull();
+  });
+
+  it('honors explicit API ownership before feed status is available', () => {
+    const owned = catalogItem(entry({
+      slug: 'catalog-tor',
+      platform_feed_id: 'tor_exit_nodes',
+      category: 'data',
+    }), [official], OPEN);
+
+    expect(platformFeedForEntry(owned.entry!)).toBe('tor_exit_nodes');
+    expect(owned.provided_by_bundle).toMatchObject({ feed_id: 'tor_exit_nodes' });
+    expect(owned.requirement).toBeNull();
+    expect(owned.can_toggle).toBe(false);
+    expect(inventoryAction(owned)).toBe('Feed bundle');
   });
 });

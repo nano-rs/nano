@@ -5186,6 +5186,10 @@ impl<'a> GeneratorContext<'a> {
 mod tests;
 
 #[cfg(test)]
+#[path = "clickhouse_sql_gen/field_values_acceptance_tests.rs"]
+mod field_values_acceptance_tests;
+
+#[cfg(test)]
 #[path = "clickhouse_sql_gen/join_narrowing_tests.rs"]
 mod join_narrowing_tests;
 

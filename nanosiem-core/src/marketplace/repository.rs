@@ -32,8 +32,8 @@ impl MarketplaceRepository {
         Self { pool }
     }
 
-    /// Populate cheap row-local computed fields (only `has_credentials`
-    /// today) that don't depend on other tables.
+    /// Populate cheap row-local computed fields that don't depend on other
+    /// tables.
     ///
     /// All public methods that return a [`MarketplaceCatalogEntry`] (reads
     /// AND mutator returns) additionally call
@@ -49,6 +49,8 @@ impl MarketplaceRepository {
         // not a stored column — compute it here so every entry-returning path carries
         // it (the air-gap marketplace badges + egress-gating depend on it).
         entry.requires_network = entry.compute_requires_network();
+        entry.platform_feed_id =
+            super::platform_feed::bundle_feed_for_slug(&entry.slug).map(str::to_owned);
         entry
     }
 
@@ -1168,3 +1170,7 @@ fn map_custom_collector_write_error(error: sqlx::Error, slug: &str) -> Marketpla
     }
     MarketplaceError::Database(error)
 }
+
+#[cfg(test)]
+#[path = "repository_platform_feed_tests.rs"]
+mod repository_platform_feed_tests;

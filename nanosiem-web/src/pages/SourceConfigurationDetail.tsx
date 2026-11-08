@@ -1329,7 +1329,7 @@ function ConnectionField({
   );
 }
 
-interface ConnectionSummary {
+export interface ConnectionSummary {
   method?: string;
   display: string;
   full?: string;
@@ -1340,7 +1340,7 @@ interface ConnectionSummary {
   usesPlaceholderHost: boolean;
 }
 
-function buildConnectionSummary(config: SourceConfigurationWithRules): ConnectionSummary {
+export function buildConnectionSummary(config: SourceConfigurationWithRules): ConnectionSummary {
   const cc = config.connection_config ?? {};
   const HOST = '{your-ingest-host}';
   const usesPlaceholderHost = true;
@@ -1454,13 +1454,21 @@ function buildConnectionSummary(config: SourceConfigurationWithRules): Connectio
       return {
         method: 'POST',
         full,
-        display: `Splunk HEC :${port}`,
+        display: `HEC :${port}`,
         authLabel: 'Auth',
-        auth: 'Splunk HEC token (rotate via credentials)',
-        headers: [{ key: 'Authorization', value: 'Splunk <token>' }],
+        auth: 'HEC token (rotate via credentials)',
+        headers: [
+          { key: 'Authorization', value: 'Splunk <token>' },
+          {
+            key: 'X-Splunk-Request-Channel',
+            value: '<stable-uuid>',
+            hint: 'required while indexer acknowledgement is enabled',
+          },
+        ],
         snippet: [
           `curl -X POST ${full} \\`,
           `  -H 'Authorization: Splunk $HEC_TOKEN' \\`,
+          `  -H 'X-Splunk-Request-Channel: <stable-uuid>' \\`,
           `  -d '{"event":{…},"sourcetype":"okta:log"}'`,
         ].join('\n'),
         usesPlaceholderHost,

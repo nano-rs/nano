@@ -86,11 +86,6 @@ pub async fn get_field_values(
     // See `get_source_types` below for the full rationale and blast radius.
     ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
 
-    // Parse the field name
-    let field: UdmField = field_name
-        .parse()
-        .map_err(|_| ApiError::NotFound(format!("Unknown field: {}", field_name)))?;
-
     // NAN-1799: apply the effective deny-set (per-source RBAC + audit gate); an
     // unrestricted `audit:view` caller yields byte-identical SQL.
     let scope = auth.effective_viewer_scope();
@@ -98,7 +93,7 @@ pub async fn get_field_values(
     let time_range = query.time_range();
     let values = state
         .search_service
-        .get_udm_field_values(field, &time_range, query.limit, &scope)
+        .get_named_field_values(&field_name, &time_range, query.limit, &scope)
         .await?;
 
     let values = values
@@ -111,6 +106,10 @@ pub async fn get_field_values(
         values,
     }))
 }
+
+#[cfg(test)]
+#[path = "fields_acceptance_tests.rs"]
+mod fields_acceptance_tests;
 
 /// Build the source-inventory SQL for `GET /api/source-types`.
 ///
@@ -598,11 +597,11 @@ mod authz_parity_tests {
         }
     }
 
-    /// NAN-2149: the UDM convenience endpoint must stay on the canonical
-    /// profile-aware field-values service path. A handler-local query would
+    /// NAN-2149: the field-values endpoint must stay on the canonical
+    /// profile-aware named-field service path. A handler-local query would
     /// bypass the shared OCSF class-split/enum display expression.
     #[test]
-    fn udm_field_values_endpoint_delegates_to_shared_service_path() {
+    fn field_values_endpoint_delegates_to_shared_service_path() {
         let src = include_str!("fields.rs");
         const MARKER: &str = "pub async fn ";
         let scan_end = src.find("mod authz_parity_tests").unwrap_or(src.len());
@@ -618,7 +617,7 @@ mod authz_parity_tests {
         let body = &src[start..end];
 
         assert!(
-            body.contains(".get_udm_field_values("),
+            body.contains(".get_named_field_values("),
             "GET /api/fields/{{name}}/values must delegate to the shared \
              profile-aware field-values service"
         );

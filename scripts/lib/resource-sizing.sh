@@ -323,6 +323,24 @@ elif has_role keeper; then keeper_mib=$(( keeper_mib + memory_remainder ))
 else tenzir_mib=$(( tenzir_mib + memory_remainder ))
 fi
 
+# The 12 GiB single-node class is documented to run nano's signed platform
+# feeds, whose ClickHouse dictionaries need 6 GiB. The weighted split lands
+# 60 MiB short (6084M), so transfer that small amount from the co-located app
+# share while preserving every role floor. Larger hosts already clear 6 GiB;
+# dedicated-role sizing still receives its full host allocation above.
+if [[ "$topology" == "single" ]] && has_role clickhouse \
+    && (( memory_mib >= 12288 && ch_mib < 6144 )); then
+    enrichment_shortfall=$(( 6144 - ch_mib ))
+    memory_excess=$enrichment_shortfall
+    reduce_memory_budget app_mib 800
+    reduce_memory_budget ingest_mib 312
+    reduce_memory_budget pg_mib 312
+    reduce_memory_budget keeper_mib 384
+    reduce_memory_budget tenzir_mib 512
+    (( memory_excess == 0 )) || fail "host RAM cannot satisfy the 6 GiB ClickHouse platform-feed floor"
+    ch_mib=$(( ch_mib + enrichment_shortfall ))
+fi
+
 total_mcpu=$(( cpu_cores * 1000 ))
 ch_mcpu=$(( total_mcpu * ch_weight / weight_total ))
 pg_mcpu=$(( total_mcpu * pg_weight / weight_total ))

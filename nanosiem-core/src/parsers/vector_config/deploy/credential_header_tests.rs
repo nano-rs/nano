@@ -19,7 +19,7 @@
 
 use vrl::compiler::runtime::Runtime;
 use vrl::compiler::state::RuntimeState;
-use vrl::compiler::{compile, TargetValue, TimeZone};
+use vrl::compiler::{TargetValue, TimeZone, compile};
 use vrl::value::{ObjectMap, Secrets, Value};
 
 use super::VectorConfigManager;
@@ -82,9 +82,19 @@ fn pipeline(name: &str) -> String {
 
 /// Run VRL programs in order on `event`, as Vector would along a chain.
 pub(super) fn run_chain(event: Value, programs: &[(&str, String)]) -> Value {
+    run_chain_with_metadata(event, Value::Object(ObjectMap::new()), programs)
+}
+
+/// Run VRL programs with explicit Vector event metadata. This models protected
+/// transport controls that cannot be supplied as ordinary log fields.
+pub(super) fn run_chain_with_metadata(
+    event: Value,
+    metadata: Value,
+    programs: &[(&str, String)],
+) -> Value {
     let mut target = TargetValue {
         value: event,
-        metadata: Value::Object(ObjectMap::new()),
+        metadata,
         secrets: Secrets::new(),
     };
     let fns = vrl::stdlib::all();
@@ -93,8 +103,14 @@ pub(super) fn run_chain(event: Value, programs: &[(&str, String)]) -> Value {
         // NAN-4907: no credential stamp here, so model the explicit static
         // install-token fallback (otherwise auth_check fails closed).
         let src = src
-            .replace(r#"get_env_var("VECTOR_AUTH_TOKEN") ?? """#, &format!("{TOKEN:?}"))
-            .replace(r#"get_env_var("NANO_INGEST_STATIC_FALLBACK") ?? """#, r#""true""#);
+            .replace(
+                r#"get_env_var("VECTOR_AUTH_TOKEN") ?? """#,
+                &format!("{TOKEN:?}"),
+            )
+            .replace(
+                r#"get_env_var("NANO_INGEST_STATIC_FALLBACK") ?? """#,
+                r#""true""#,
+            );
         let program = match compile(&src, &fns) {
             Ok(compiled) => compiled.program,
             Err(diagnostics) => panic!(
@@ -207,8 +223,14 @@ fn credential_headers_do_not_reach_the_stored_event() {
         // NAN-4907: no credential stamp here, so model the explicit static
         // install-token fallback (otherwise auth_check fails closed).
         let src = transform_source(name)
-            .replace(r#"get_env_var("VECTOR_AUTH_TOKEN") ?? """#, &format!("{TOKEN:?}"))
-            .replace(r#"get_env_var("NANO_INGEST_STATIC_FALLBACK") ?? """#, r#""true""#);
+            .replace(
+                r#"get_env_var("VECTOR_AUTH_TOKEN") ?? """#,
+                &format!("{TOKEN:?}"),
+            )
+            .replace(
+                r#"get_env_var("NANO_INGEST_STATIC_FALLBACK") ?? """#,
+                r#""true""#,
+            );
         let program = compile(&src, &fns)
             .unwrap_or_else(|_| panic!("{name} compiles"))
             .program;
@@ -286,7 +308,10 @@ fn credential_fields_in_any_payload_never_reach_clickhouse() {
         ("auth_check", transform_source("auth_check")),
         ("rate_limit_prep", transform_source("rate_limit_prep")),
         ("parse_content", transform_source("parse_content")),
-        ("source_type_extract", transform_source("source_type_extract")),
+        (
+            "source_type_extract",
+            transform_source("source_type_extract"),
+        ),
     ];
 
     // HEC: the `splunk_hec` source puts the envelope's `event` on `.event`.
@@ -312,7 +337,10 @@ fn credential_fields_in_any_payload_never_reach_clickhouse() {
     let native_chain = vec![
         ("vector_auth", transform_in(NATIVE, "vector_auth")),
         ("vector_merge", transform_in(NATIVE, "vector_merge")),
-        ("source_type_extract", transform_source("source_type_extract")),
+        (
+            "source_type_extract",
+            transform_source("source_type_extract"),
+        ),
     ];
 
     let generic_tail = vec![
@@ -337,12 +365,18 @@ fn credential_fields_in_any_payload_never_reach_clickhouse() {
             if lane == "parser" {
                 // Redaction removes only credential fields: neighbours stay.
                 assert_eq!(
-                    stored.get(vrl::path!("ext", "user")).and_then(|v| v.as_str()).as_deref(),
+                    stored
+                        .get(vrl::path!("ext", "user"))
+                        .and_then(|v| v.as_str())
+                        .as_deref(),
                     None,
                     "{context}: `user` is a column, not ext"
                 );
                 assert_eq!(
-                    stored.get(vrl::path!("user")).and_then(|v| v.as_str()).as_deref(),
+                    stored
+                        .get(vrl::path!("user"))
+                        .and_then(|v| v.as_str())
+                        .as_deref(),
                     Some(user),
                     "{context}: non-credential fields must survive"
                 );
@@ -365,7 +399,10 @@ fn credential_fields_never_reach_ocsf_logs() {
     for (name, src) in [
         (
             "generic_ocsf_prepare",
-            transform_in(VectorConfigManager::GENERIC_OCSF_PREPARE_BLOCK, "generic_ocsf_prepare"),
+            transform_in(
+                VectorConfigManager::GENERIC_OCSF_PREPARE_BLOCK,
+                "generic_ocsf_prepare",
+            ),
         ),
         (
             "ocsf_prepare",
@@ -378,7 +415,13 @@ fn credential_fields_never_reach_ocsf_logs() {
         // `event.unmapped` (vendor data, not OCSF); the OCSF prepare stage keeps
         // the parser's OCSF object as `event` itself.
         let accept = if name == "generic_ocsf_prepare" {
-            stored.get(vrl::path!("event", "unmapped", "http_request", "headers", "Accept"))
+            stored.get(vrl::path!(
+                "event",
+                "unmapped",
+                "http_request",
+                "headers",
+                "Accept"
+            ))
         } else {
             stored.get(vrl::path!("event", "http_request", "headers", "Accept"))
         };

@@ -28,7 +28,7 @@ import { MonoSwatch, getCategoryTone } from './MonoSwatch';
 import { humanizeEnum } from '@/lib/marketplace-labels';
 import { StateBadge, getIntegrationState, IpInfoCredit } from './IntegrationCard';
 import { BundleFeedStatus } from './BundleFeedStatus';
-import { bundleFeedForSlug, bundleProvisions, type BundleProvision } from '@/lib/api/marketplace-inventory';
+import { bundleProvisions, platformFeedForEntry, type BundleProvision } from '@/lib/api/marketplace-inventory';
 
 const TABS = [
   { id: 'about',  label: 'About',       icon: Info },
@@ -429,7 +429,7 @@ export function MarketplaceDrawer({
               savingCreds={savingCreds}
               canPreview={canPreview}
               onOpenPreview={() => setPreviewOpen(true)}
-              bundleProvision={bundleFeedForSlug(entry.slug) ? bundleProvisions(feedBundle.data).get(entry.slug) ?? null : null}
+              bundleProvision={platformFeedForEntry(entry) ? bundleProvisions(feedBundle.data).get(platformFeedForEntry(entry) ?? entry.slug) ?? null : null}
             />
           )}
         </SheetContent>
@@ -576,10 +576,10 @@ function DrawerInner(props: DrawerInnerProps) {
       {/* Body */}
       <div className="flex-1 overflow-y-auto scrollbar-thin">
         {tab === 'about' && <AboutTab entry={entry} />}
-        {tab === 'config' && bundleFeedForSlug(entry.slug) && (
+        {tab === 'config' && platformFeedForEntry(entry) && (
           <BundleOnlyConfig provision={bundleProvision} ipinfo={isIpInfoEntry(entry)} />
         )}
-        {tab === 'config' && !bundleFeedForSlug(entry.slug) && (
+        {tab === 'config' && !platformFeedForEntry(entry) && (
           <ConfigTab
             entry={entry}
             airGap={airGap}

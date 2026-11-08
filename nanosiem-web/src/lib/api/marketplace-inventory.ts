@@ -105,6 +105,11 @@ export function bundleFeedForSlug(slug: string): string | null {
   return null;
 }
 
+/** Prefer the API's explicit ownership contract; retain aliases for older APIs. */
+export function platformFeedForEntry(entry: Pick<MarketplaceCatalogEntry, 'slug' | 'platform_feed_id'>): string | null {
+  return entry.platform_feed_id ?? bundleFeedForSlug(entry.slug);
+}
+
 /**
  * NAN-4948 / NAN-4959: catalog slug -> how the bundle provides that feed, from
  * the platform feed status. Bundle-only feeds (IPinfo Lite) are present even
@@ -126,6 +131,7 @@ export function bundleProvisions(status: PlatformFeedsStatus | null | undefined)
         ...common, feed_id: feed.feed_id, revision: feed.revision, state: feed.state, active,
         detail: feed.detail ?? null, produced_at: feed.produced_at ?? null,
       };
+      bySlug.set(feed.feed_id, provision);
       for (const slug of BUNDLE_FEED_SLUGS[feed.feed_id] ?? []) bySlug.set(slug, provision);
     }
   }
@@ -151,7 +157,8 @@ export function applyFeedBundle(items: InventoryItem[], status: PlatformFeedsSta
   if (bySlug.size === 0) return items;
   let changed = false;
   const next = items.map(item => {
-    const provision = item.source === 'catalog' ? bySlug.get(item.id) : undefined;
+    const feedId = item.entry ? platformFeedForEntry(item.entry) : null;
+    const provision = item.source === 'catalog' ? bySlug.get(feedId ?? item.id) : undefined;
     if (!provision) return item;
     changed = true;
     const reason = !provision.active ? 'bundle_inactive' : provision.state === 'stale' ? 'bundle_stale' : null;
@@ -238,8 +245,9 @@ export function healthFor(reason: string | null, syncing = false): string {
 
 export function catalogItem(entry: MarketplaceCatalogEntry, repos: EnrichmentMarketplaceRepo[], caps: Capabilities): InventoryItem {
   const repo = entry.repository_id ? repos.find(r => r.id === entry.repository_id) ?? null : null;
-  const requirement = entryRequirement(entry, caps);
-  const reason = entryReason(entry, requirement);
+  const platformFeedId = platformFeedForEntry(entry);
+  const requirement = platformFeedId ? null : entryRequirement(entry, caps);
+  const reason = platformFeedId ? 'bundle_inactive' : entryReason(entry, requirement);
   // Unknown provenance (repository metadata missing or failed to load) is untrusted.
   const firstParty = entry.source_type === 'system' || (entry.source_type === 'repository' && isFirstPartyRepo(repo));
   return {
@@ -253,8 +261,8 @@ export function catalogItem(entry: MarketplaceCatalogEntry, repos: EnrichmentMar
     enabled: entry.installed && entry.enabled,
     effective_health: healthFor(reason, !!entry.is_syncing),
     reason,
-    last_sync: entry.last_sync_at ?? null,
-    execution_stage: entryStage(entry),
+    last_sync: platformFeedId ? null : entry.last_sync_at ?? null,
+    execution_stage: platformFeedId ? 'bronze_ingest' : entryStage(entry),
     capabilities: entry.tags,
     author: entry.author || (firstParty ? 'nano' : 'unknown'),
     connector: entry.slug,
@@ -262,12 +270,19 @@ export function catalogItem(entry: MarketplaceCatalogEntry, repos: EnrichmentMar
     repository_name: repo?.name ?? null,
     repo_commit: repo?.last_sync_commit ?? null,
     version: entry.installed_version ?? entry.manifest_version ?? null,
-    record_count: entry.installed && entry.category !== 'agent' ? entry.record_count : null,
+    record_count: platformFeedId ? null : entry.installed && entry.category !== 'agent' ? entry.record_count : null,
     requires_network: entry.requires_network ?? true,
     requirement,
-    can_toggle: entry.installed && !requirement,
+    can_toggle: !platformFeedId && entry.installed && !requirement,
     can_edit: false,
     entry,
+    provided_by_bundle: platformFeedId ? {
+      feed_id: platformFeedId,
+      revision: null,
+      state: 'not_installed',
+      active: false,
+      detail: 'Platform feed status is unavailable.',
+    } : undefined,
   };
 }
 

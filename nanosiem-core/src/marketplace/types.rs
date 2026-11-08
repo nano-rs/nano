@@ -301,6 +301,13 @@ pub struct MarketplaceCatalogEntry {
     #[sqlx(default)]
     pub requires_network: bool,
 
+    /// Signed platform-feed bundle ownership. When present, this catalog entry
+    /// is descriptive inventory only: direct install/sync/enable actions are
+    /// rejected and the feed is managed through Platform feeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[sqlx(skip)]
+    pub platform_feed_id: Option<String>,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

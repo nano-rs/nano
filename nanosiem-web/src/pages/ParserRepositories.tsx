@@ -84,6 +84,7 @@ import {
 const SOURCE_TYPE_MAP: Record<string, { sourceType: string; label: string }> = {
   http: { sourceType: 'routed', label: 'HTTP (Routed)' },
   vector: { sourceType: 'vector', label: 'Vector' },
+  otlp: { sourceType: 'otlp', label: 'OpenTelemetry (OTLP)' },
   splunk_hec: { sourceType: 'splunk_hec', label: 'Splunk HEC' },
   kafka: { sourceType: 'kafka', label: 'Kafka' },
   aws_s3: { sourceType: 'aws_s3', label: 'AWS S3' },

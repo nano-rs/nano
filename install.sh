@@ -50,6 +50,7 @@
 # with NANO_VECTOR_NATIVE_BIND_ADDRESS / NANO_OTLP_BIND_ADDRESS /
 # NANO_FLUENT_BIND_ADDRESS / NANO_TENZIR_BIND_ADDRESS (persisted to .env).
 
+main() {
 set -euo pipefail
 # The checkout and generated runtime configuration are bind-mounted into
 # containers that intentionally run as non-root.  Keep those non-secret paths
@@ -58,9 +59,12 @@ set -euo pipefail
 # below and in generated-secrets.sh / render-inventory.py.
 umask 022
 
+# NANO_INSTALLER_SCRIPT_PATH is captured at top level, beside the final `main`
+# call: inside a function a streamed script reports BASH_SOURCE[0] as "main",
+# which would resolve against a same-named file in the caller's directory.
 INSTALLER_SOURCE_DIR=""
-if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-    INSTALLER_SOURCE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+if [[ -n "${NANO_INSTALLER_SCRIPT_PATH:-}" && -f "$NANO_INSTALLER_SCRIPT_PATH" ]]; then
+    INSTALLER_SOURCE_DIR=$(cd "$(dirname "$NANO_INSTALLER_SCRIPT_PATH")" && pwd -P)
 fi
 if [[ -z "${NANO_INSTALL_DIR:-}" ]]; then
     if [[ -n "$INSTALLER_SOURCE_DIR" \
@@ -232,7 +236,7 @@ have_controlling_tty() {
     (exec 9<>/dev/tty) 2>/dev/null
 }
 
-gen_secret() { openssl rand -hex 32; }
+gen_secret() { openssl rand -hex 32 </dev/null; }
 
 # Keep first-run validation identical to nanosiem-core's authoritative policy.
 # This runs before .env is written or any image is pulled/started, so a weak
@@ -293,8 +297,8 @@ ch_mem_feeds_note() {
 # Escape a string for safe embedding inside a JSON string literal.
 # Handles backslash, double-quote, and the C0 controls that JSON forbids.
 json_escape() {
-    python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.argv[1]))' "$1" 2>/dev/null \
-        || node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' -- "$1" 2>/dev/null \
+    python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.argv[1]))' "$1" </dev/null 2>/dev/null \
+        || node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' -- "$1" </dev/null 2>/dev/null \
         || fail "Neither python3 nor node is available to JSON-escape the admin password. Install one and retry."
 }
 
@@ -383,7 +387,7 @@ github_lock_commit_shas() {
     local owner_repo json
     owner_repo=$(github_owner_repo) || return 1
     json=$(curl -fsSL -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/${owner_repo}/commits?path=images.lock&per_page=100" 2>/dev/null) \
+        "https://api.github.com/repos/${owner_repo}/commits?path=images.lock&per_page=100" </dev/null 2>/dev/null) \
         || return 1
     printf '%s' "$json" | python3 -c '
 import json,sys
@@ -409,7 +413,7 @@ fetch_release_lock() {
         [[ -z "$sha" ]] && continue
         tried=$((tried + 1)); [[ "$tried" -gt 40 ]] && break
         tmp=$(mktemp) || return 1
-        if curl -fsSL "https://raw.githubusercontent.com/${owner_repo}/${sha}/images.lock" -o "$tmp" 2>/dev/null \
+        if curl -fsSL "https://raw.githubusercontent.com/${owner_repo}/${sha}/images.lock" -o "$tmp" </dev/null 2>/dev/null \
            && grep -qE "^# Release: v?${want_re}([^0-9]|\$)" "$tmp"; then
             printf '%s' "$tmp"; return 0
         fi
@@ -424,7 +428,7 @@ fetch_release_lock() {
 repo_digest_of() {
     local line
     line=$(docker image inspect "$1" \
-        --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+        --format '{{range .RepoDigests}}{{println .}}{{end}}' </dev/null 2>/dev/null \
         | grep -F "${2}@" | head -1)
     printf '%s' "${line##*@}"
 }
@@ -563,13 +567,13 @@ require_cmd git      "Install git (most package managers)."
 require_cmd openssl  "Install openssl (most distros ship it by default)."
 require_cmd curl     "Install curl."
 
-if ! docker compose version >/dev/null 2>&1; then
+if ! docker compose version </dev/null >/dev/null 2>&1; then
     fail "docker compose v2 is required. Update Docker or install the compose plugin."
 fi
 
 if [[ -n "$INVENTORY_ARG" ]]; then
     require_cmd python3 "Install Python 3 (used only to validate and render the sovereign host inventory)."
-    compose_version=$(docker compose version --short 2>/dev/null | sed 's/^v//' | cut -d- -f1)
+    compose_version=$(docker compose version --short </dev/null 2>/dev/null | sed 's/^v//' | cut -d- -f1)
     IFS=. read -r compose_major compose_minor compose_patch <<< "$compose_version"
     compose_major=${compose_major:-0}; compose_minor=${compose_minor:-0}; compose_patch=${compose_patch:-0}
     if (( compose_major < 2 || (compose_major == 2 && compose_minor < 24) || (compose_major == 2 && compose_minor == 24 && compose_patch < 4) )); then
@@ -580,7 +584,7 @@ if [[ -n "$INVENTORY_ARG" ]]; then
 fi
 
 if [[ "${NANO_PREPARE_ONLY:-0}" != "1" && "${NANO_CHECK_ONLY:-0}" != "1" ]] \
-    && ! docker info >/dev/null 2>&1; then
+    && ! docker info </dev/null >/dev/null 2>&1; then
     fail "Docker daemon is not running or this user can't talk to it. Start Docker and retry."
 fi
 
@@ -636,13 +640,13 @@ if [[ -e "$NANO_INSTALL_DIR/.git" ]]; then
         # Older checkouts predate the shipped ignore rule for the helper's stable
         # flock identity. Ignore only that generated, untracked root path; any
         # tracked change or other untracked customer file still blocks the reset.
-        GIT_DIRTY_STATUS=$(git -C "$NANO_INSTALL_DIR" status --porcelain 2>/dev/null \
+        GIT_DIRTY_STATUS=$(git -C "$NANO_INSTALL_DIR" status --porcelain </dev/null 2>/dev/null \
             | awk '$0 != "?? .env.nano-generated-secrets.lock"')
         if [[ -n "$GIT_DIRTY_STATUS" ]]; then
             warn "$NANO_INSTALL_DIR has local changes — skipping git update so your edits stay intact."
         else
             log "Updating existing checkout at $NANO_INSTALL_DIR"
-            git -C "$NANO_INSTALL_DIR" fetch --depth 1 origin "$NANO_BRANCH"
+            git -C "$NANO_INSTALL_DIR" fetch --depth 1 origin "$NANO_BRANCH" </dev/null
             # The nano-rs/nano mirror is force-regenerated on every sync, so its
             # history diverges from any prior checkout and can never fast-forward.
             # Hard-reset to the fetched remote HEAD instead. Safe: the clean-tree
@@ -651,7 +655,7 @@ if [[ -e "$NANO_INSTALL_DIR/.git" ]]; then
             # authoritative state is always the mirror. (NAN-1929: an ff-only merge
             # left a stale images.lock and then failed digest verification against
             # the freshly-pulled images.)
-            git -C "$NANO_INSTALL_DIR" reset --hard FETCH_HEAD \
+            git -C "$NANO_INSTALL_DIR" reset --hard FETCH_HEAD </dev/null \
                 || fail "Could not update $NANO_INSTALL_DIR to the current release. Remove it and re-run to reclone."
         fi
     fi
@@ -661,7 +665,7 @@ elif [[ -e "$NANO_INSTALL_DIR" ]]; then
     fail "$NANO_INSTALL_DIR exists but is not a git checkout. Move/remove it or set NANO_INSTALL_DIR to a different path."
 else
     log "Cloning $NANO_REPO_URL → $NANO_INSTALL_DIR"
-    git clone --depth 1 --branch "$NANO_BRANCH" "$NANO_REPO_URL" "$NANO_INSTALL_DIR"
+    git clone --depth 1 --branch "$NANO_BRANCH" "$NANO_REPO_URL" "$NANO_INSTALL_DIR" </dev/null
 fi
 ok "Sources ready at $NANO_INSTALL_DIR"
 if [[ -f "$NANO_INSTALL_DIR/.nano-test-upgrade-root" ]]; then
@@ -1138,7 +1142,7 @@ if [[ "$MULTI_NODE" != "1" ]]; then
         sizing_compose_args+=(-f "$overlay")
     done
     if ! NANO_VECTOR_DATA_STORAGE_MODE=$(
-        docker compose "${sizing_compose_args[@]}" config --format json \
+        docker compose "${sizing_compose_args[@]}" config --format json </dev/null \
             | vector_data_storage_mode_from_json
     ); then
         fail "Could not determine whether Vector data uses Docker-root or bind/external storage."
@@ -1151,7 +1155,7 @@ if [[ "$MULTI_NODE" != "1" ]]; then
         --topology single \
         --roles "$sizing_roles" \
         --shards 1 \
-        --format env > "$sizing_defaults"
+        --format env </dev/null > "$sizing_defaults"
 
     old_sizing_env="" old_sizing_server="" old_sizing_users=""
     if [[ "$REUSE_ENV" == "1" ]]; then
@@ -1176,7 +1180,7 @@ if [[ "$MULTI_NODE" != "1" ]]; then
         --override-env .env \
         --server-output .nano-generated/sizing/clickhouse-config.xml \
         --users-output .nano-generated/sizing/clickhouse-users.xml \
-        --format env > "$new_sizing_env"
+        --format env </dev/null > "$new_sizing_env"
     mv "$new_sizing_env" .nano-generated/sizing/host.env
     if [[ "$REUSE_ENV" == "1" ]]; then
         report_sizing_changes \
@@ -1217,11 +1221,11 @@ if [[ "$MULTI_NODE" == "1" ]]; then
         --inventory "$INVENTORY_PATH" \
         --roles "$ROLE_ARG" \
         --identity-only \
-        --override-env .env) \
+        --override-env .env </dev/null) \
         || fail "Inventory identity validation failed. Published role configuration was not changed."
     IFS=$'\t' read -r candidate_identity candidate_deployment candidate_host candidate_plaintext < <(
         python3 -I -c 'import json,sys; value=json.loads(sys.argv[1]); print(value["sha256"], value["deployment_id"], value["host_id"], "1" if value["allow_plaintext_private_network"] else "0", sep="\t")' \
-            "$candidate_identity_json"
+            "$candidate_identity_json" </dev/null
     )
     if [[ "$candidate_plaintext" == "1" ]]; then
         if [[ "${NANO_LAB_ONLY_PLAINTEXT:-0}" != "1" ]]; then
@@ -1298,6 +1302,7 @@ PY
         --output-dir .nano-generated \
         --env-output .nano-role.env \
         --override-env .env \
+        </dev/null \
         || fail "Inventory validation/rendering failed. No services have started."
     while IFS= read -r -d '' role_key && IFS= read -r -d '' role_value; do
         printf -v "$role_key" '%s' "$role_value"
@@ -1399,14 +1404,14 @@ if [[ "${NANO_PREPARE_ONLY:-0}" == "1" ]]; then
 fi
 
 log "Pulling images from ${NANO_IMAGE_PREFIX%/*} (this may take a minute on first run)"
-if ! docker compose "${COMPOSE_ARGS[@]}" pull; then
+if ! docker compose "${COMPOSE_ARGS[@]}" pull </dev/null; then
     if [[ "$NANO_EDITION" == "enterprise" ]]; then
         fail "docker compose pull failed. Enterprise images are in a private registry: log in to ${NANO_IMAGE_PREFIX%%/*} with the pull credential nano issued you, then re-run."
     fi
     fail "docker compose pull failed. If you see '401 Unauthorized', the GHCR packages may still be private — run 'docker login ghcr.io' or wait for nano-rs to flip them public."
 fi
 
-ACTIVE_IMAGES=$(docker compose "${COMPOSE_ARGS[@]}" config --images)
+ACTIVE_IMAGES=$(docker compose "${COMPOSE_ARGS[@]}" config --images </dev/null)
 
 verify_image_digests
 
@@ -1414,7 +1419,7 @@ if [[ -n "${NANO_PRE_START_HOOK:-}" ]]; then
     [[ "$NANO_PRE_START_HOOK" == /* && -x "$NANO_PRE_START_HOOK" ]] \
         || fail "NANO_PRE_START_HOOK must be an absolute path to an executable."
     log "Running the pre-start hook"
-    "$NANO_PRE_START_HOOK" pre-start \
+    "$NANO_PRE_START_HOOK" pre-start </dev/null \
         || fail "Pre-start hook failed. No product services have started."
 fi
 
@@ -1429,7 +1434,7 @@ if [[ "$MULTI_NODE" == "1" && "${candidate_plaintext:-0}" == "1" \
         || fail "scripts/nano-keeper-root-guard not found in $NANO_INSTALL_DIR. The release bundle is incomplete."
     if [[ ",${ROLE_ARG}," == *,keeper,* ]]; then
         log "Starting co-located lab Keeper before protecting its root namespace"
-        docker compose "${COMPOSE_ARGS[@]}" up -d keeper
+        docker compose "${COMPOSE_ARGS[@]}" up -d keeper </dev/null
     fi
     keeper_password=$(env_value NANO_KEEPER_PASSWORD)
     [[ -n "$keeper_password" ]] \
@@ -1461,13 +1466,13 @@ if [[ "$MULTI_NODE" == "1" && "${ROLE_CONFIG_WAS_PUBLISHED:-0}" == "1" ]]; then
     compose_up_args+=(--force-recreate)
     log "Recreating selected role services to attach the newly published configuration"
 fi
-docker compose "${COMPOSE_ARGS[@]}" "${compose_up_args[@]}"
+docker compose "${COMPOSE_ARGS[@]}" "${compose_up_args[@]}" </dev/null
 
 # On a re-run/upgrade, `up -d` recreates the app containers (new IPs) but leaves
 # nginx as-is — and it won't have loaded an updated nginx.conf either. Reload
 # nginx so it picks up any config change and re-resolves upstream IPs, otherwise
 # it proxies dead old IPs and 502s until restarted (NAN-1237). Best-effort.
-docker compose "${COMPOSE_ARGS[@]}" exec -T nginx nginx -s reload >/dev/null 2>&1 || true
+docker compose "${COMPOSE_ARGS[@]}" exec -T nginx nginx -s reload </dev/null >/dev/null 2>&1 || true
 
 # ----------------------------------------------------------------------------
 # 5. Wait for API health
@@ -1485,13 +1490,13 @@ if [[ "$HAS_APP" == "1" ]]; then
     HEALTH_URL="${API_BASE}/api/health"
     deadline=$(( $(date +%s) + 300 ))
     while (( $(date +%s) < deadline )); do
-        if curl -fsS -o /dev/null "$HEALTH_URL"; then
+        if curl -fsS -o /dev/null "$HEALTH_URL" </dev/null; then
             ok "API healthy"
             break
         fi
         sleep 3
     done
-    if ! curl -fsS -o /dev/null "$HEALTH_URL"; then
+    if ! curl -fsS -o /dev/null "$HEALTH_URL" </dev/null; then
         fail "API did not become healthy within 5 min. Check 'docker compose ${COMPOSE_ARGS[*]} logs nano-api nginx clickhouse-migrate'."
     fi
     if [[ "$MULTI_NODE" == "1" ]]; then
@@ -1505,10 +1510,10 @@ elif [[ "$HAS_INGEST" == "1" ]]; then
     log "Waiting for the ingest edge at $INGEST_HEALTH_URL"
     deadline=$(( $(date +%s) + 120 ))
     while (( $(date +%s) < deadline )); do
-        curl -fsS -o /dev/null "$INGEST_HEALTH_URL" && break
+        curl -fsS -o /dev/null "$INGEST_HEALTH_URL" </dev/null && break
         sleep 2
     done
-    curl -fsS -o /dev/null "$INGEST_HEALTH_URL" \
+    curl -fsS -o /dev/null "$INGEST_HEALTH_URL" </dev/null \
         || fail "Ingest edge did not become healthy. Check 'docker compose ${COMPOSE_ARGS[*]} logs vector vector-config-consumer ingest-edge'."
     ok "Ingest edge healthy"
 else
@@ -1517,7 +1522,7 @@ else
     for role_service in ${ROLE_ARG//,/ }; do
         case "$role_service" in
             postgres|clickhouse|keeper)
-                docker compose "${COMPOSE_ARGS[@]}" ps --status running --services | grep -qx "$role_service" \
+                docker compose "${COMPOSE_ARGS[@]}" ps --status running --services </dev/null | grep -qx "$role_service" \
                     || fail "$role_service did not stay running. Check 'docker compose ${COMPOSE_ARGS[*]} logs $role_service'." ;;
         esac
     done
@@ -1530,7 +1535,7 @@ fi
 if [[ "$HAS_APP" != "1" ]]; then
     ok "Admin initialization belongs to the app role; skipped on this host"
 else
-    STATUS_JSON=$(curl -fsS "${API_BASE}/api/setup/status" || echo '{}')
+    STATUS_JSON=$(curl -fsS "${API_BASE}/api/setup/status" </dev/null || echo '{}')
     if echo "$STATUS_JSON" | grep -q '"initialized":true'; then
         warn "System is already initialized — skipping admin creation."
     else
@@ -1551,7 +1556,7 @@ else
         if ! curl -fsS -X POST \
             -H "Content-Type: application/json" \
             -d "$payload" \
-            "${API_BASE}/api/setup/initialize" > /dev/null; then
+            "${API_BASE}/api/setup/initialize" </dev/null > /dev/null; then
             fail "Admin initialization failed. Check 'docker compose -f $COMPOSE_FILE logs nano-api'."
         fi
         ok "Admin user created"
@@ -1653,3 +1658,12 @@ echo "  Logs:     cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} logs
 echo "  Stop:     cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} down"
 echo "  Reset:    cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} down -v   (DELETES ALL DATA)"
 echo
+}
+
+# Keep this invocation as the final parsed command. When install.sh arrives via
+# `curl ... | bash`, Bash must read the complete function body before any child
+# can inherit stdin, so Docker or another CLI cannot consume unparsed source.
+# The top-level BASH_SOURCE is empty for a streamed script and the file path
+# for direct execution; read it here, never from inside main().
+NANO_INSTALLER_SCRIPT_PATH="${BASH_SOURCE[0]:-}"
+main "$@"

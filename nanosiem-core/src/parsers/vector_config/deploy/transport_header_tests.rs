@@ -106,8 +106,9 @@ fn unmapped(stored: &Value, key: &str) -> Option<String> {
 
 #[test]
 fn transport_headers_are_read_then_dropped() {
+    let body = r#"{"message":"hello","user":"alice"}"#;
     let stored = store_generic(http_request(
-        r#"{"message":"hello","user":"alice"}"#,
+        body,
         Some("application/json"),
         EDGE_PEER,
         Some("203.0.113.9"),
@@ -136,7 +137,7 @@ fn transport_headers_are_read_then_dropped() {
     assert_eq!(unmapped(&stored, "content_format").as_deref(), Some("json"));
     // And the sender's payload is untouched.
     assert_eq!(unmapped(&stored, "user").as_deref(), Some("alice"));
-    assert_eq!(s(&stored, &["event", "message"]).as_deref(), Some("hello"));
+    assert_eq!(s(&stored, &["event", "message"]).as_deref(), Some(body));
 }
 
 /// The edge replaces the forwarding chain after resolving only trusted proxy
