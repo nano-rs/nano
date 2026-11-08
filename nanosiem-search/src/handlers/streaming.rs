@@ -5,24 +5,16 @@
 use axum::{
     extract::{Extension, State},
     response::sse::{Event, Sse},
-    Json,
 };
 use futures::stream::Stream;
 use nanosiem_core::{
-    search::{QueryPriority, SearchStreamEvent},
     SearchRequest, SearchResponse,
+    search::{QueryPriority, SearchStreamEvent},
 };
-use std::convert::Infallible;
+use std::{convert::Infallible, time::Instant};
 
 use crate::error::ErrorResponse;
-use crate::{error::SearchError, metrics::record_search_query, SearchState};
-
-/// Dropping the HTTP body must drop the executing future, releasing admission
-/// and the lake client's cancel-on-drop guards even during a slow hop.
-struct StreamSearchTask(tokio::task::JoinHandle<()>);
-impl StreamSearchTask { fn abort(&self) { self.0.abort(); } }
-impl Drop for StreamSearchTask { fn drop(&mut self) { self.0.abort(); } }
-
+use crate::{SearchState, error::SearchError, metrics::record_search_query};
 
 /// Execute a streaming search via Server-Sent Events
 ///
@@ -34,34 +26,29 @@ impl Drop for StreamSearchTask { fn drop(&mut self) { self.0.abort(); } }
 ///
 /// SSE event types:
 /// - `started`: Search execution started (includes job_id, query_id, is_streaming flag)
-/// - `progress`: Rows scanned progress update; on a lake cell, `phase: "cold_scan"`
-///   with `cold_bytes_read` / `cold_bytes_total` / `queued` while it fetches
-///   uncached data or waits for the reader's heavy cold-read slot
+/// - `progress`: Rows scanned progress update
 /// - `rows`: A batch of result rows
-/// - `view_update`: Cumulative Lateral graph after each hop, before hostname enrichment
 /// - `metadata`: Query metadata (total_count, execution_time, fields, histogram, etc.)
-/// - `heartbeat`: Follow-stream liveness from the follow loop itself (no tenant data)
 /// - `completed`: Search finished successfully
 /// - `error`: Search failed
-///
-/// `x-nano-follow: true` keeps a lake cell log event stream open and emits
-/// events committed in later part-log heads. Disconnect or DELETE by request ID
-/// ends it. Follow streams bypass the result cache. The first head delivers one
-/// page (the request's limit, at most 500); later heads re-read only a short
-/// window behind the newest delivered event in shallow time-fenced
-/// pages, retrying smaller after a transient refusal. A `heartbeat`
-/// event is sent whenever the follow has sent nothing for 10 s. The stream
-/// ends with `completed` after 30 minutes; clients reconnect.
+/// - `job` (NAN-4915, only with `x-nano-accept-async: 1`): the search outran
+///   the interactive budget and was handed off to a durable background job.
+///   Data is the job answer (`job_id`, `status`, `attached`, `origin`). It is
+///   terminal: any rows streamed before it are superseded — attach to the job
+///   and page its results instead.
 #[utoipa::path(
     post,
     path = "/api/search/stream",
     tag = "search",
     request_body = SearchRequest,
+    params(
+        ("x-nano-accept-async" = Option<String>, Header, description = "Set to 1 to accept a `job` event when the search outruns the interactive budget"),
+        ("x-nano-progressive-views" = Option<String>, Header, description = "1: a terminal `| tree` / `| lateral` streams only its pending dispatcher row (see POST /api/search); the view pages /api/search/tree-page or streams its hops (view_update events) from a plain stream"), // NAN-3077
+    ),
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
         (status = 200, description = "SSE stream of search results"),
         (status = 400, description = "Invalid query", body = ErrorResponse),
-        (status = 422, description = "Too large to run interactively (COLD_SCAN_TOO_LARGE): one pass would stage more uncached data than the tenant reader's cold-read ceiling (derived from its cache size). Body carries needed_bytes and ceiling_bytes, plus background_ceiling_bytes when an async search could run it. A cold read under the ceiling is never refused: it queues for the reader's heavy cold-read slot and the stream reports progress events with phase cold_scan.", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Missing search:execute permission", body = ErrorResponse),
     )
@@ -70,20 +57,21 @@ pub async fn search_stream(
     State(state): State<SearchState>,
     Extension(auth): Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
-    headers: axum::http::HeaderMap,
-    Json(mut request): Json<SearchRequest>,
-) -> Result<
-    (
-        axum::http::HeaderMap,
-        Sse<impl Stream<Item = Result<Event, Infallible>>>,
-    ),
-    SearchError,
-> {
+    super::background_jobs::AcceptAsync(accept_async): super::background_jobs::AcceptAsync,
+    request_headers: axum::http::HeaderMap,
+    super::search::SearchBody { mut request, explicit_use_cache }: super::search::SearchBody,
+) -> Result<(axum::http::HeaderMap, Sse<impl Stream<Item = Result<Event, Infallible>>>), SearchError>
+{
+    let handler_started = Instant::now();
+    // NAN-3077: a progressive terminal `| tree` / `| lateral` streams only its
+    // pending dispatcher; the view then pages (tree) or streams its hops
+    // (lateral) itself. Never read from or written to the result cache.
+    let progressive = super::search::wants_progressive_view(&request_headers, &request.query);
+    let bypass = bypass || progressive;
     // NAN-2030: authN (a valid token) is not authZ — gate the SSE search path on
     // search:execute before any work, exactly like POST /api/search. This path
     // was authenticated but UNAUTHORIZED (a parity gap vs. the batch `search`).
     super::require_search_execute(&auth)?;
-    let follow = headers.get("x-nano-follow").is_some_and(|value| value == "true");
 
     // NAN-1799: compose the effective deny-set (per-user source scope ∪ audit
     // gate) ONCE, before the cache lookup below — the scope is folded into
@@ -91,30 +79,26 @@ pub async fn search_stream(
     // SQL. This replaces the old `enforce_non_audit_query` rewrite of
     // request.query.
     let scope = super::search::effective_scope(&auth);
-    let tenant_search = state.search_with_ai_for_auth(&auth)?;
-    // NAN-3018: same tenant-bound `dataset=risk` view as POST /api/search.
-    let tenant_search = state
-        .bind_shared_risk_dataset(&auth, request.dataset.as_deref(), tenant_search)
-        .await?;
-    // Live clear state: shared risk results never use the result cache.
-    let risk_uncached = tenant_search.tenant_risk_dataset_bound();
-    let bypass = bypass || risk_uncached;
-    // NAN-2922: the shared nPL contract is checked against the resolved view,
-    // so `| ai` is admitted only when it is tenant-billed.
-    super::require_shared_npl_contract_for_view(
-        &auth,
-        &request.query,
-        request.dataset.as_deref(),
-        &tenant_search,
-    )?;
+
+    // NAN-4915: a hand-off KILLs the interactive query by id, so a
+    // hand-off-eligible stream always has one.
+    if accept_async && request.request_id.is_none() {
+        request.request_id = Some(uuid::Uuid::now_v7().to_string());
+    }
+    // NAN-4915 (Codex P1-2): freeze relative time modifiers once so the
+    // interactive stream and a hand-off job scan the identical window.
+    if accept_async {
+        request = nanosiem_core::search::background::freeze_time_window(&request, chrono::Utc::now())
+            .map_err(SearchError::from)?;
+    }
 
     if let Some(request_id) = request.request_id.clone() {
         // NAN-2100: reserve under the CREDENTIAL (api-key id, or user id for
         // an interactive session) — `cancel_search` compares the same
         // principal. Shares the batch path's helper so the two entry points
         // cannot drift on the identity they record.
-        request.request_id =
-            Some(super::search::reserve_query_owner(&state, request_id, &auth).await?);
+        super::search::reserve_query_owner(&state, request_id, auth.credential_principal_id())
+            .await?;
     }
 
     // NAN-2039: admission keys on the USER, not the credential principal
@@ -125,6 +109,9 @@ pub async fn search_stream(
     // compares, while the admission caps are per-user, so an analyst holding
     // several API keys shares one budget rather than one per credential.
     let user_id = auth.claims.sub;
+    // NAN-4928 review P1: the comment above is the intent; `claims.sub` is the
+    // KEY id for API keys here, so admission now uses the owning user.
+    let admission_user = super::admission_user(&auth)?;
 
     // Create event channel
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<SearchStreamEvent>(64);
@@ -137,66 +124,81 @@ pub async fn search_stream(
     // (composed above, BEFORE the cache read) so differently-scoped users
     // never share a cache entry.
     let mut cache_age: Option<u64> = None;
-    // NAN-2361 wave 6: shared tenants key the cache on the serving generation.
-    let serving_generation = if !follow && crate::is_shared_scope(auth.tenant_scope) && state.result_cache.is_some() {
-        tenant_search.serving_generation_key().await
-    } else {
-        None
-    };
-    let cache_hit = if !bypass && !follow {
+    let mut search_task: Option<StreamSearchTask> = None;
+
+    // NAN-3809 on the stream path: a settled absolute window this caller
+    // already ran as a durable job (same attach identity: query, window,
+    // flags, owner and both halves of the effective scope) is answered with
+    // that job (`job` event, as a hand-off would be) instead of re-running.
+    // Only for callers that accept a job answer, never for an explicit
+    // `use_cache: false`, a bypass or a progressive dispatcher.
+    let mut reused_job: Option<nanosiem_core::search::AsyncSearchResponse> = None;
+    // NAN-4928 review P2: a probe of a hidden source must reach the audited
+    // source gate, so it never takes the reuse or cache fast paths.
+    let probes_hidden_source = crate::inflight::names_denied_source(&request.query, scope.deny_set());
+    if accept_async && !progressive && !probes_hidden_source && crate::cache::reads_result_cache(bypass, explicit_use_cache) {
+        let now = chrono::Utc::now();
+        if let Some(job) = state
+            .background_jobs
+            .settled_reuse(&request, user_id, &scope, now)
+            .await
+            .map_err(SearchError::from)?
+        {
+            record_search_query("stream_settled_reuse", 0.0, true);
+            cache_age = job
+                .finished_at
+                .map(|finished| (now - finished).num_seconds().max(0) as u64);
+            let outcome = nanosiem_core::search::background::SubmitOutcome { job, attached: true };
+            tracing::info!(job_id = %outcome.job.public_id(), "Settled stream re-served from a finished background job");
+            reused_job = Some(super::background_jobs::async_response(&outcome));
+        }
+    }
+
+    let cache_hit = reused_job.is_some() || if !bypass && !probes_hidden_source {
         if let Some(ref cache) = state.result_cache {
-            if let Some(cached) = cache
-                .get_for(auth.tenant_scope, &request, &scope, serving_generation.as_ref())
-                .await
-            {
+            if let Some(cached) = cache.get(&request, &scope).await {
                 record_search_query("stream_cached", 0.0, true);
                 cache_age = cache
-                    .age_secs(&crate::cache::SearchResultCache::cache_key_for(
-                        auth.tenant_scope,
-                        &request,
-                        &scope,
-                        serving_generation.as_ref(),
-                    ))
+                    .age_secs(&crate::cache::SearchResultCache::cache_key(&request, &scope))
                     .await;
                 let tx = event_tx.clone();
-                let total_row_count = cached.results.len() as u64;
-                tokio::spawn(async move {
-                    const REPLAY_BATCH_SIZE: usize = 1000;
-                    let mut cumulative: u64 = 0;
-                    for (batch_index, chunk) in cached.results.chunks(REPLAY_BATCH_SIZE).enumerate()
-                    {
-                        cumulative += chunk.len() as u64;
-                        let _ = tx
-                            .send(SearchStreamEvent::Rows {
-                                rows: chunk.to_vec(),
-                                batch_index: batch_index as u32,
-                                cumulative_count: cumulative,
-                            })
-                            .await;
-                    }
+            let total_row_count = cached.results.len() as u64;
+            tokio::spawn(async move {
+                const REPLAY_BATCH_SIZE: usize = 1000;
+                let mut cumulative: u64 = 0;
+                for (batch_index, chunk) in cached.results.chunks(REPLAY_BATCH_SIZE).enumerate() {
+                    cumulative += chunk.len() as u64;
                     let _ = tx
-                        .send(SearchStreamEvent::Metadata {
-                            completeness: cached.completeness,
-                            total_count: cached.total_count,
-                            total_count_exact: cached.total_count_exact,
-                            // NAN-1597: replay the original query's time so a cached
-                            // view shows e.g. "230ms" (paired with the cache-age
-                            // badge), not a misleading "0ms".
-                            execution_time_ms: cached.execution_time_ms,
-                            fields: cached.fields,
-                            histogram: cached.histogram,
-                            warnings: cached.warnings,
-                            cost_score: None,
-                            display_type: cached.display_type,
-                            column_order: cached.column_order,
-                            generated_sql: cached.generated_sql,
+                        .send(SearchStreamEvent::Rows {
+                            rows: chunk.to_vec(),
+                            batch_index: batch_index as u32,
+                            cumulative_count: cumulative,
                         })
                         .await;
-                    let _ = tx
-                        .send(SearchStreamEvent::Completed {
-                            total_rows_delivered: total_row_count,
-                        })
-                        .await;
+                }
+                let _ = tx
+                    .send(SearchStreamEvent::Metadata {
+                        total_count: cached.total_count,
+                        // NAN-1597: replay the original query's time so a cached
+                        // view shows e.g. "230ms" (paired with the cache-age
+                        // badge), not a misleading "0ms".
+                        execution_time_ms: cached.execution_time_ms,
+                        server_wall_ms: None,
+                        queue_wait_ms: Some(0),
+                        fields: cached.fields,
+                        histogram: cached.histogram,
+                        warnings: None,
+                        cost_score: None,
+                        display_type: cached.display_type,
+                        column_order: cached.column_order,
+                        generated_sql: cached.generated_sql,
+                    })
+                    .await;
+                let _ = tx
+                    .send(SearchStreamEvent::Completed {
+                        total_rows_delivered: total_row_count,
+                    })
+                    .await;
                 });
                 true
             } else {
@@ -210,17 +212,23 @@ pub async fn search_stream(
     };
 
     // On cache miss, spawn the actual search
-    let cache_for_task = if cache_hit || follow || risk_uncached {
+    let cache_for_task = if cache_hit {
         None
     } else {
         state.result_cache.clone()
     };
     let request_for_cache = request.clone();
     let scope_for_cache = scope.clone();
-    let tenant_for_cache = auth.tenant_scope;
-    let generation_for_cache = serving_generation.clone();
-    let mut search_task = if !cache_hit {
-        let search_service = tenant_search.clone();
+    // NAN-4915: hand-off state. Armed only for a live (non-cached) search from a
+    // client that accepts a job answer.
+    let handoff_armed_initially = accept_async && !cache_hit;
+    let handoff_after = state.background_jobs.config().interactive_handoff;
+    let handoff_jobs = state.background_jobs.clone();
+    let handoff_search = state.search.clone();
+    let handoff_request = request.clone();
+    let handoff_scope = scope.clone();
+    if !cache_hit {
+        let search_service = state.search.clone();
         let event_tx_clone = event_tx.clone();
         let scope_for_search = scope.clone();
         // NAN-2039: route the live stream through admission control (the same
@@ -233,48 +241,86 @@ pub async fn search_stream(
             Some("analytics") => QueryPriority::Analytics,
             _ => QueryPriority::Interactive,
         };
-        Some(StreamSearchTask(tokio::spawn(nanosiem_core::search::request_actor::inherit(async move {
-            search_service
-                .search_streaming_with_admission(
-                    request,
-                    event_tx_clone,
-                    user_id,
-                    priority,
-                    &scope_for_search,
-                    follow,
-                )
-                .await;
-        }))))
-    } else {
-        None
-    };
+        // NAN-3077: the search task lives only as long as the SSE body. A
+        // client that leaves (a superseded progressive view) drops the body,
+        // which aborts the task and with it any hop still running.
+        let tree_marker = if progressive && request.dataset.as_deref().unwrap_or("logs") == "logs" {
+            super::search::deferred_tree_marker(&request)?
+        } else {
+            None
+        };
+        search_task = Some(StreamSearchTask(tokio::spawn(
+            nanosiem_core::search::request_actor::inherit(async move {
+                if let Some(marker) = tree_marker {
+                    let rows = marker.results;
+                    let count = rows.len() as u64;
+                    let _ = event_tx_clone
+                        .send(SearchStreamEvent::Rows { rows, batch_index: 0, cumulative_count: count })
+                        .await;
+                    let _ = event_tx_clone
+                        .send(SearchStreamEvent::Metadata {
+                            total_count: count,
+                            execution_time_ms: 0,
+                            server_wall_ms: None,
+                            queue_wait_ms: Some(0),
+                            fields: Vec::new(),
+                            histogram: None,
+                            warnings: None,
+                            cost_score: None,
+                            display_type: marker.display_type,
+                            column_order: None,
+                            generated_sql: None,
+                        })
+                        .await;
+                    let _ = event_tx_clone
+                        .send(SearchStreamEvent::Completed { total_rows_delivered: count })
+                        .await;
+                    return;
+                }
+                nanosiem_core::search::streaming::DEFER_LATERAL_VIEW
+                    .scope(
+                        progressive,
+                        search_service.search_streaming_with_admission(
+                            request,
+                            event_tx_clone,
+                            admission_user,
+                            priority,
+                            &scope_for_search,
+                        ),
+                    )
+                    .await;
+            }),
+        )));
+    }
     // Drop our sender so the channel closes when the spawned task finishes
     drop(event_tx);
 
     // Read streaming cache cap from hot-reloadable query safety settings
-    let max_cache_rows: usize = if follow {
-        0
-    } else {
-        tenant_search
-            .query_limits()
-            .read()
-            .await
-            .max_streaming_cache_rows as usize
-    };
+    let max_cache_rows: usize = state
+        .search
+        .query_limits()
+        .read()
+        .await
+        .max_streaming_cache_rows as usize;
 
     // Build SSE stream from event channel with keepalive
     // Also collect rows + metadata for caching after completion
     let keepalive_interval = std::time::Duration::from_secs(15);
-    let stream_auth = auth.clone();
-    let stream_auth_state = state.auth_state.clone();
     let stream = async_stream::stream! {
+        // Owned by the stream: dropping the SSE body aborts the search task.
+        let _search_task = search_task;
+        if let Some(answer) = reused_job {
+            yield Ok(Event::default()
+                .event("job")
+                .data(serde_json::to_string(&answer).unwrap_or_default()));
+            yield Ok(Event::default().event("done").data(""));
+            return;
+        }
         let mut interval = tokio::time::interval(keepalive_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut all_rows: Vec<serde_json::Value> = Vec::new();
         let mut cache_overflow = false;
         let mut meta_total_count: u64 = 0;
-        // NAN-2550: conservative until the metadata event says otherwise.
-        let mut meta_total_count_exact = false;
         // NAN-1597: capture the live query's execution time from the Metadata
         // event so it can be persisted into the cached payload (and replayed on
         // a later cache hit) instead of being dropped and stored as 0.
@@ -284,54 +330,89 @@ pub async fn search_stream(
         let mut meta_display_type: Option<nanosiem_core::search::DisplayType> = None;
         let mut meta_column_order: Option<Vec<String>> = None;
         let mut meta_generated_sql: Option<String> = None;
-        let mut meta_completeness = None;
-        let mut meta_warnings = None;
         let mut completed_ok = false;
+        // The branch always ends the stream, so it fires at most once.
+        let handoff_armed = handoff_armed_initially;
+        let handoff_timer = tokio::time::sleep(handoff_after);
+        tokio::pin!(handoff_timer);
 
         loop {
             tokio::select! {
-                Some(event) = event_rx.recv() => {
-                    let releases_tenant_data = matches!(
-                        &event,
-                        SearchStreamEvent::Rows { .. }
-                            | SearchStreamEvent::ViewUpdate { .. }
-                            | SearchStreamEvent::Metadata { .. }
-                            | SearchStreamEvent::Completed { .. }
-                    );
-                    let authority = if releases_tenant_data {
-                        crate::middleware::revalidate_shared_context(
-                            &stream_auth_state,
-                            &stream_auth,
-                        )
-                        .await.into_result()
-                    } else {
-                        Ok(())
-                    };
-                    if let Err(error) = authority {
-                        if let Some(task) = search_task.take() {
-                            task.abort();
+                _ = &mut handoff_timer, if handoff_armed => {
+                    // Kill the interactive query (releasing its admission slot
+                    // when the streaming task unwinds), then continue the search
+                    // as a durable job. Rows already streamed are superseded.
+                    if let Some(request_id) = handoff_request.request_id.as_deref() {
+                        if let Err(e) = handoff_search.cancel_query(request_id).await {
+                            tracing::warn!(error = %e, %request_id, "Could not KILL the interactive stream being handed off");
                         }
-                        let denied = SearchStreamEvent::Error {
-                            code: if error.status_code() == axum::http::StatusCode::FORBIDDEN {
-                                "AUTHORITY_REVOKED"
-                            } else {
-                                error.code()
-                            }.to_string(),
-                            message: if error.status_code() == axum::http::StatusCode::FORBIDDEN {
-                                "Search authority is no longer current".to_string()
-                            } else {
-                                error.public_message()
-                            },
-                        };
-                        yield Ok(Event::default()
-                            .event("error")
-                            .data(serde_json::to_string(&denied).unwrap_or_default()));
-                        break;
                     }
+                    let submitted = handoff_jobs
+                        .submit(
+                            &handoff_request,
+                            user_id,
+                            &handoff_scope,
+                            nanosiem_core::search::background::JobOrigin::Escalated,
+                        )
+                        .await;
+                    match submitted {
+                        Ok(outcome) => {
+                            tracing::info!(
+                                job_id = %outcome.job.public_id(),
+                                attached = outcome.attached,
+                                "Interactive stream handed off to a background job"
+                            );
+                            let answer = super::background_jobs::async_response(&outcome);
+                            yield Ok(Event::default()
+                                .event("job")
+                                .data(serde_json::to_string(&answer).unwrap_or_default()));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Handing off the interactive stream failed");
+                            let err = SearchStreamEvent::Error {
+                                code: "JOB_HANDOFF_FAILED".to_string(),
+                                message: "The search outran the interactive budget and could not be moved to a background job".to_string(),
+                            };
+                            yield Ok(Event::default()
+                                .event("error")
+                                .data(serde_json::to_string(&err).unwrap_or_default()));
+                        }
+                    }
+                    break;
+                }
+                Some(event) = event_rx.recv() => {
+                    let event = match event {
+                        SearchStreamEvent::Metadata {
+                            total_count,
+                            execution_time_ms,
+                            queue_wait_ms,
+                            fields,
+                            histogram,
+                            warnings,
+                            cost_score,
+                            display_type,
+                            column_order,
+                            generated_sql,
+                            ..
+                        } => SearchStreamEvent::Metadata {
+                            total_count,
+                            execution_time_ms,
+                            server_wall_ms: Some(handler_started.elapsed().as_millis() as u64),
+                            queue_wait_ms,
+                            fields,
+                            histogram,
+                            warnings,
+                            cost_score,
+                            display_type,
+                            column_order,
+                            generated_sql,
+                        },
+                        other => other,
+                    };
                     let (event_type, is_terminal) = match &event {
                         SearchStreamEvent::Queued { .. } => ("queued", false),
                         SearchStreamEvent::Started { .. } => ("started", false),
-                        SearchStreamEvent::Progress { .. } | SearchStreamEvent::ColdScanProgress { .. } => ("progress", false),
+                        SearchStreamEvent::Progress { .. } => ("progress", false),
                         SearchStreamEvent::Rows { ref rows, .. } => {
                             if !cache_overflow {
                                 if all_rows.len() + rows.len() > max_cache_rows {
@@ -343,26 +424,23 @@ pub async fn search_stream(
                             }
                             ("rows", false)
                         }
-                        SearchStreamEvent::ViewUpdate { .. } => ("view_update", false),
-                        SearchStreamEvent::Heartbeat { .. } => ("heartbeat", false),
-                        SearchStreamEvent::Metadata { total_count, total_count_exact, execution_time_ms, ref fields, ref histogram, ref display_type, ref column_order, ref generated_sql, ref completeness, ref warnings, .. } => {
+                        SearchStreamEvent::Metadata { total_count, execution_time_ms, ref fields, ref histogram, ref display_type, ref column_order, ref generated_sql, .. } => {
                             meta_total_count = *total_count;
-                            meta_total_count_exact = *total_count_exact;
                             meta_execution_time_ms = *execution_time_ms;
                             meta_fields = fields.clone();
                             meta_histogram = histogram.clone();
                             meta_display_type = display_type.clone();
                             meta_column_order = column_order.clone();
                             meta_generated_sql = generated_sql.clone();
-                            meta_completeness = completeness.clone();
-                            meta_warnings = warnings.clone();
                             ("metadata", false)
                         }
                         SearchStreamEvent::Completed { .. } => {
                             completed_ok = true;
                             ("completed", true)
                         }
-                        SearchStreamEvent::Error { .. } | SearchStreamEvent::ColdScanError { .. } => ("error", true),
+                        SearchStreamEvent::Error { .. } => ("error", true),
+                        // NAN-3077: a cumulative `| lateral` graph after a hop.
+                        SearchStreamEvent::ViewUpdate { .. } => ("view_update", false),
                     };
 
                     let event_json = serde_json::to_string(&event).unwrap_or_default();
@@ -375,32 +453,6 @@ pub async fn search_stream(
                     }
                 }
                 _ = interval.tick() => {
-                    if let Err(error) = crate::middleware::revalidate_shared_context(
-                        &stream_auth_state,
-                        &stream_auth,
-                    )
-                    .await.into_result()
-                    {
-                        if let Some(task) = search_task.take() {
-                            task.abort();
-                        }
-                        let denied = SearchStreamEvent::Error {
-                            code: if error.status_code() == axum::http::StatusCode::FORBIDDEN {
-                                "AUTHORITY_REVOKED"
-                            } else {
-                                error.code()
-                            }.to_string(),
-                            message: if error.status_code() == axum::http::StatusCode::FORBIDDEN {
-                                "Search authority is no longer current".to_string()
-                            } else {
-                                error.public_message()
-                            },
-                        };
-                        yield Ok(Event::default()
-                            .event("error")
-                            .data(serde_json::to_string(&denied).unwrap_or_default()));
-                        break;
-                    }
                     yield Ok(Event::default().comment("keepalive"));
                 }
                 else => {
@@ -411,40 +463,29 @@ pub async fn search_stream(
         }
 
         // Cache the result in the background on successful completion (skip if too large)
-        if completed_ok && !cache_overflow && !follow {
-            if crate::middleware::revalidate_shared_context(
-                &stream_auth_state,
-                &stream_auth,
-            )
-            .await.into_result().is_ok()
-            {
-              if let Some(cache) = cache_for_task {
+        if completed_ok && !cache_overflow && !progressive {
+            if let Some(cache) = cache_for_task {
                 let response = SearchResponse {
-                    server_wall_ms: None,
                     results: all_rows,
                     total_count: meta_total_count,
-                    total_count_exact: meta_total_count_exact,
                     // NAN-1597: persist the real query time so a later cache hit
                     // replays it instead of "0ms".
                     execution_time_ms: meta_execution_time_ms,
+                    server_wall_ms: None,
+                    queue_wait_ms: None,
                     fields: meta_fields,
                     generated_sql: meta_generated_sql,
                     histogram: meta_histogram,
-                    warnings: meta_warnings,
+                    warnings: None,
                     cost_score: None,
                     display_type: meta_display_type,
                     column_order: meta_column_order,
-                    completeness: meta_completeness,
                 };
                 let req = request_for_cache;
                 let scope = scope_for_cache;
-                let generation = generation_for_cache.clone();
                 tokio::spawn(async move {
-                    cache
-                        .set_for(tenant_for_cache, &req, &response, &scope, generation.as_ref())
-                        .await;
+                    cache.set(&req, &response, &scope).await;
                 });
-              }
             }
         }
 
@@ -463,20 +504,12 @@ pub async fn search_stream(
     ))
 }
 
-#[cfg(test)]
-mod stream_drop_tests {
-    use super::*;
-    #[tokio::test]
-    async fn dropping_stream_task_releases_its_running_future() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        struct Released(Option<tokio::sync::oneshot::Sender<()>>);
-        impl Drop for Released { fn drop(&mut self) { if let Some(tx) = self.0.take() { let _ = tx.send(()); } } }
-        let task = StreamSearchTask(tokio::spawn(async move {
-            let _release = Released(Some(tx));
-            std::future::pending::<()>().await;
-        }));
-        tokio::task::yield_now().await;
-        drop(task);
-        tokio::time::timeout(std::time::Duration::from_secs(1), rx).await.unwrap().unwrap();
+/// NAN-3077: a streaming search task that is aborted when its SSE body is
+/// dropped (the client left), so no hop keeps running for nobody.
+struct StreamSearchTask(tokio::task::JoinHandle<()>);
+
+impl Drop for StreamSearchTask {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }

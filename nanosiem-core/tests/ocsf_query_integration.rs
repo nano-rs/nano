@@ -147,18 +147,12 @@ fn spath_input_ext_targets_ocsf_event_tail() {
         r#"* | spath input=ext path="request.method" output=method | stats count() by method"#,
         "nanosiem",
     );
-    // NAN-1426 moved tail access from JSONExtractString to native subcolumn
-    // access (it re-serialized the whole event per row). The sibling test
-    // `ext_prefix_remaps_to_unmapped_under_ocsf` was updated then; this one was
-    // missed and has been asserting the pre-1426 spelling since. The intent of
-    // the test is unchanged and is what matters: spath must target the profile's
-    // JSON tail column, never the nonexistent OCSF `ext`.
     assert!(
-        sql.contains(r#"multiIf(isNotNull(unmapped."request"."method")"#),
-        "spath must extract from the OCSF tail column `unmapped` via subcolumn access (NAN-1343/1443, NAN-1426); SQL:\n{sql}"
+        sql.contains("JSONExtractString(unmapped, 'request.method')"),
+        "spath must extract from the OCSF tail column `unmapped` (NAN-1343/1443); SQL:\n{sql}"
     );
     assert!(
-        !sql.contains("JSONExtractString(ext,") && !sql.contains(r#"ext."request""#),
+        !sql.contains("JSONExtractString(ext,"),
         "spath must not reference the nonexistent OCSF `ext` column (NAN-1343); SQL:\n{sql}"
     );
 }
@@ -182,14 +176,13 @@ fn ext_prefix_remaps_to_unmapped_under_ocsf() {
         !sql.contains("'ext'"),
         "no top-level 'ext' key exists in an OCSF event (NAN-1388); SQL:\n{sql}"
     );
-    // Numeric compare → coalesced subcolumn cast, same remap (NAN-1426; the
-    // coalesce preserves JSONExtractFloat's missing-key→0 semantics).
+    // Numeric compare → nullable subcolumn cast, same remap (NAN-1426;
+    // NAN-4918: a missing or non-numeric key is NULL and never matches).
     let sql = ocsf_sql("ext.sysmon_event_id=7", "nanosiem");
     assert!(
-        sql.contains(
-            r#"coalesce(accurateCastOrNull(unmapped."sysmon_event_id", 'Float64'), 0.) = 7"#
-        ),
-        "numeric ext.* compare must remap + use the coalesced subcolumn cast; SQL:\n{sql}"
+        sql.contains(r#"(accurateCastOrNull(unmapped."sysmon_event_id", 'Float64') = 7)"#)
+            && !sql.contains(r#"coalesce(accurateCastOrNull(unmapped."sysmon_event_id""#),
+        "numeric ext.* compare must remap + use the nullable subcolumn cast; SQL:\n{sql}"
     );
     // NEGATED compare: the multiIf subcolumn form returns '' (not NULL) for
     // rows missing the key, so `!= 'hit'` keeps them — negation must not
@@ -209,16 +202,18 @@ fn ext_prefix_remaps_to_unmapped_under_ocsf() {
 /// the fix it JSONExtract'd a top-level `event` key that never exists.
 #[test]
 fn event_prefix_strips_to_event_tail_under_ocsf() {
-    // Unpromoted tail attribute → stripped JsonPath into the `unmapped` spill.
+    // Unpromoted OCSF attribute → stripped JsonPath into the stored `event`
+    // JSON (NAN-4903: the registry knows every OCSF attribute, so it reads the
+    // `event` subcolumn, not the vendor `unmapped` spill).
     let sql = ocsf_sql(
         r#"event.actor.process.parent_process.name="userinit.exe""#,
         "nanosiem",
     );
     assert!(
         sql.contains(
-            r#"multiIf(isNotNull(unmapped."actor"."process"."parent_process"."name")"#
+            r#"multiIf(isNotNull(event."actor"."process"."parent_process"."name")"#
         ),
-        "event.* must strip to the `unmapped` spill tail (NAN-1388/1443) via subcolumn access (NAN-1426); SQL:\n{sql}"
+        "event.<OCSF attribute> must strip to the `event` JSON subcolumn (NAN-4903, NAN-1426); SQL:\n{sql}"
     );
     assert!(
         !sql.contains("'event'"),
@@ -424,11 +419,10 @@ fn enum_verb_predicates_leave_udm_sql_unchanged() {
 fn numeric_tail_comparison_emits_real_extractor_under_ocsf() {
     let sql = ocsf_sql("unmapped.some_num>3", "nanosiem");
     assert!(
-        sql.contains(
-            r#"coalesce(accurateCastOrNull(unmapped."some_num", 'Float64'), 0.) > 3"#
-        ),
-        "numeric tail comparison must use the coalesced subcolumn cast (NAN-1426; \
-         the coalesce keeps JSONExtractFloat's missing-key→0 semantics); SQL:\n{sql}"
+        sql.contains(r#"(accurateCastOrNull(unmapped."some_num", 'Float64') > 3)"#)
+            && !sql.contains(r#"coalesce(accurateCastOrNull(unmapped."some_num""#),
+        "numeric tail comparison must use the nullable subcolumn cast (NAN-1426; \
+         NAN-4918: a missing key is NULL and never matches); SQL:\n{sql}"
     );
     assert!(
         !sql.contains("JSONExtractFloat64"),
@@ -1051,21 +1045,18 @@ async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String
         ));
     }
 
-    // 5) Unpromoted TAIL field. actor.process.parent_process.name is NOT a
-    //    promoted column (only its .cmd_line sibling is) AND it is a top-level
-    //    *standard* OCSF attribute — not under `unmapped`. NAN-1443's lean
-    //    storage stores only promoted columns + `message` + the `unmapped` spill,
-    //    so this field is dropped (promote-to-query). It resolves to the
-    //    `unmapped` spill column via native subcolumn access, and since the value
-    //    was never written to the spill it matches nothing (the process fixture
-    //    carries it at event.actor.process… top-level, which is no longer stored).
+    // 5) Unpromoted OCSF attribute. actor.process.parent_process.name is NOT a
+    //    promoted column (only its .cmd_line sibling is) but it IS a standard
+    //    OCSF attribute. NAN-4903 stores the whole object in `event JSON`, so it
+    //    resolves to the `event` subcolumn and the process fixture (which carries
+    //    it) matches — the NAN-1443 lean-storage drop is gone.
     let tail_sql = ocsf_sql(
         "actor.process.parent_process.name=\"userinit.exe\" | stats count",
         db,
     );
-    if !tail_sql.contains("unmapped.\"actor\".\"process\".\"parent_process\".\"name\"") {
+    if !tail_sql.contains("event.\"actor\".\"process\".\"parent_process\".\"name\"") {
         return Err(format!(
-            "tail field did not resolve to the unmapped spill subcolumn; SQL:\n{tail_sql}"
+            "OCSF attribute did not resolve to the event JSON subcolumn; SQL:\n{tail_sql}"
         ));
     }
     let tail = count(
@@ -1074,10 +1065,10 @@ async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String
         "actor.process.parent_process.name=\"userinit.exe\" | stats count",
     )
     .await;
-    if tail != 0 {
+    if tail != 1 {
         return Err(format!(
-            "tail actor.process.parent_process.name=userinit.exe count = {tail}, expected 0 \
-             (top-level standard field not stored by the lean-storage chop, NAN-1443)"
+            "tail actor.process.parent_process.name=userinit.exe count = {tail}, expected 1 \
+             (the process fixture; every OCSF leaf is stored in `event`, NAN-4903)"
         ));
     }
     // A tail value that exists in no event matches nothing (guards the
@@ -1193,4 +1184,340 @@ fn dest_user_resolves_to_promoted_target_account_column() {
         !sql.contains("event, 'dest_user'"),
         "dest_user must not fall through to the event tail (NAN-1339); SQL:\n{sql}"
     );
+}
+
+/// NAN-4903 (pure codegen): a case-preserving promoted array matches on the
+/// lowered-array expression the DDL indexes; an ingest-lowered array matches raw;
+/// an unpromoted path that crosses an OCSF array reads `event."a"[]."b"`.
+#[test]
+fn ocsf_array_fields_compile_to_membership() {
+    let sql = ocsf_sql("observables.value=\"Needle-C2.Example.org\"", "nanosiem");
+    assert!(
+        sql.contains("has(arrayMap(x -> lower(x), ") && sql.contains("'needle-c2.example.org')"),
+        "{sql}"
+    );
+    let sql = ocsf_sql("process.file.hashes.value=\"ABCDEF\"", "nanosiem");
+    assert!(sql.contains("has(`process.file.hashes.value`, 'abcdef')") || sql.contains("has(\"process.file.hashes.value\", 'abcdef')"), "{sql}");
+    let sql = ocsf_sql("answers.rdata=\"10.0.0.1\"", "nanosiem");
+    assert!(sql.contains("has(arrayMap(x -> lower(x), "), "{sql}");
+    let sql = ocsf_sql("module.file.signatures.state=\"Valid\"", "nanosiem");
+    assert!(sql.contains("event.\"module\".\"file\".\"signatures\"[].\"state\""), "{sql}");
+    let sql = ocsf_sql("observables.type_id=1", "nanosiem");
+    assert!(sql.contains("arrayExists(x -> x = 1, "), "{sql}");
+}
+
+/// NAN-4903 (pure SQL-gen): a `| where` stage reads the CTE of the previous
+/// stage, so a field that the profile reads from somewhere other than a
+/// same-named column must use the resolved expression. Upstream rules filter
+/// `| where metadata.log_source="windows_sysmon"` — a bare `"metadata.log_source"`
+/// was CH Code 47 (it reads the `source_type` routing column).
+#[test]
+fn where_stage_resolves_aliases_json_paths_and_arrays_under_ocsf() {
+    let sql = ocsf_sql(
+        r#"class_uid=1007 | where metadata.log_source="windows_sysmon""#,
+        "nanosiem",
+    );
+    assert!(
+        !sql.contains(r#""metadata.log_source""#) && sql.contains("source_type"),
+        "metadata.log_source in a where stage must read source_type; SQL:\n{sql}"
+    );
+    let sql = ocsf_sql(
+        r#"class_uid=1005 | where module.file.signatures.state="Valid""#,
+        "nanosiem",
+    );
+    assert!(
+        sql.contains(r#"event."module"."file"."signatures"[]."state""#),
+        "an unpromoted OCSF attribute in a where stage must read the event JSON; SQL:\n{sql}"
+    );
+    let sql = ocsf_sql(
+        r#"class_uid=1007 | where observables.value="Needle.Example""#,
+        "nanosiem",
+    );
+    assert!(
+        sql.contains("has(arrayMap(x -> lower(x), ") && sql.contains("'needle.example')"),
+        "a promoted array in a where stage keeps membership semantics; SQL:\n{sql}"
+    );
+    let sql = ocsf_sql(
+        r#"class_uid=1007 | where actual_permissions IN (2035711, 5136)"#,
+        "nanosiem",
+    );
+    assert!(
+        sql.contains(r#"accurateCastOrNull(event."actual_permissions", 'Float64')"#),
+        "a numeric OCSF attribute IN-list in a where stage must read the event JSON numerically; SQL:\n{sql}"
+    );
+    // After a projection the stage carries only the projected names (no
+    // `event`), so the where keeps the bare projected reference.
+    let sql = ocsf_sql(
+        r#"class_uid=1007 | table timestamp, actor.process.file.name | where actor.process.file.name="x""#,
+        "nanosiem",
+    );
+    let where_stage = sql.rsplit("stage_2 AS (").next().unwrap_or("");
+    assert!(
+        where_stage.contains(r#""actor.process.file.name""#) && !where_stage.contains("event."),
+        "after `table` the where must use the projected alias; SQL:\n{sql}"
+    );
+    // `observables.type_id=*` is an existence test on the array, not match-all.
+    let sql = ocsf_sql("observables.type_id=*", "nanosiem");
+    assert!(sql.contains(r#"notEmpty("observables.type_id")"#), "{sql}");
+    // A pipeline-computed name shadows the schema and stays a bare reference.
+    let sql = ocsf_sql(
+        r#"class_uid=1007 | stats count by metadata.log_source | where count > 1"#,
+        "nanosiem",
+    );
+    assert!(sql.contains("count > 1") || sql.contains("`count` > 1") || sql.contains("\"count\" > 1"), "{sql}");
+}
+
+/// NAN-4903 (pure SQL-gen): OCSF 1.9 defines `risk_score` / `risk_level` on 87
+/// classes, but the bare names are owned by risk-based alerting and keep
+/// reading the `unmapped` spill the finding writer populates; the producer's
+/// native value is reachable explicitly as `event.risk_score`.
+#[test]
+fn rba_names_read_unmapped_and_event_prefix_reads_native_ocsf() {
+    let sql = ocsf_sql(r#"risk_level="high""#, "nanosiem");
+    assert!(sql.contains(r#"unmapped."risk_level""#), "{sql}");
+    // Same for a UDM-era alias that collides with an OCSF attribute name.
+    let sql = ocsf_sql(r#"event.auth_type="publickey""#, "nanosiem");
+    assert!(sql.contains(r#"event."auth_type""#) && !sql.contains("auth_protocol_id"), "{sql}");
+    let sql = ocsf_sql(r#"event.risk_level="high""#, "nanosiem");
+    assert!(
+        sql.contains(r#"event."risk_level""#) && !sql.contains(r#"unmapped."risk_level""#),
+        "{sql}"
+    );
+}
+
+/// Queries of the codex review fixes (NAN-4903), shared by the SQL-shape test
+/// and the live-execution test below.
+const REVIEW_QUERIES: &[&str] = &[
+    r#"observables.value IN ("Needle.Example", "b")"#,
+    r#"observables.type_id IN (1, 2)"#,
+    r#"observables.value NOT IN ("x")"#,
+    r#"class_uid=1007 | where observables.value IN ("Needle.Example")"#,
+    r#"class_uid=1007 | where observables.type_id IN (1, 2)"#,
+    r#"class_uid=1005 | table timestamp, module.file.signatures.state | where module.file.signatures.state="valid""#,
+    r#"class_uid=1005 | table timestamp, module.file.signatures.state | where module.file.signatures.state IN ("valid")"#,
+    r#"class_uid=1007 | where actual_permissions > 0"#,
+    r#"class_uid=1007 | fields - message | where metadata.log_source="windows_sysmon""#,
+    r#"class_uid=1007 | rename process.name as pname | where metadata.log_source="windows_sysmon""#,
+    r#"class_uid=1007 | join type=left device.hostname [search class_uid=3002 | fields device.hostname, src_endpoint.ip] | where metadata.log_source="windows_sysmon""#,
+];
+
+/// NAN-4903 codex P1s (pure SQL-gen): array IN/NOT IN is element membership,
+/// projected JSON arrays keep membership after `| table`, numeric JSON
+/// attributes compare numerically in `| where`, and wildcard-preserving stages
+/// (`fields -`, `rename`, `join`) keep alias resolution alive.
+#[test]
+fn review_fixes_array_in_numeric_where_and_wide_stages() {
+    let sql = ocsf_sql(REVIEW_QUERIES[0], "nanosiem");
+    assert!(
+        sql.contains(r#"arrayExists(x -> x IN ('needle.example', 'b'), arrayMap(x -> lower(x), "observables.value"))"#),
+        "{sql}"
+    );
+    let sql = ocsf_sql(REVIEW_QUERIES[1], "nanosiem");
+    assert!(sql.contains(r#"arrayExists(x -> x IN (1, 2), "observables.type_id")"#), "{sql}");
+    let sql = ocsf_sql(REVIEW_QUERIES[2], "nanosiem");
+    assert!(sql.contains(r#"NOT arrayExists(x -> x IN ('x'), arrayMap(x -> lower(x), "observables.value"))"#), "{sql}");
+    let sql = ocsf_sql(REVIEW_QUERIES[3], "nanosiem");
+    assert!(sql.contains(r#"arrayExists(x -> x IN ('needle.example'), arrayMap(x -> lower(x), "observables.value"))"#), "{sql}");
+    let sql = ocsf_sql(REVIEW_QUERIES[4], "nanosiem");
+    assert!(sql.contains(r#"arrayExists(x -> x IN (1, 2), "observables.type_id")"#), "{sql}");
+
+    for q in [REVIEW_QUERIES[5], REVIEW_QUERIES[6]] {
+        let sql = ocsf_sql(q, "nanosiem");
+        let last = sql.rsplit("stage_2 AS (").next().unwrap_or("");
+        assert!(
+            last.contains(r#"arrayMap(x -> lower(x), "module.file.signatures.state")"#)
+                && !last.contains("event."),
+            "after `table` the projected array keeps membership semantics; SQL:\n{sql}"
+        );
+    }
+
+    let sql = ocsf_sql(REVIEW_QUERIES[7], "nanosiem");
+    assert!(
+        sql.contains(r#"accurateCastOrNull(event."actual_permissions", 'Float64')"#),
+        "numeric attribute must use the numeric extractor; SQL:\n{sql}"
+    );
+
+    for q in &REVIEW_QUERIES[8..] {
+        let sql = ocsf_sql(q, "nanosiem");
+        let last = sql.rsplit("WHERE").next().unwrap_or("");
+        assert!(
+            !last.contains(r#""metadata.log_source""#) && last.contains("source_type"),
+            "`{q}`: wide stage must keep alias resolution; SQL:\n{sql}"
+        );
+    }
+}
+
+/// NAN-4903: the review queries execute without ClickHouse errors against a
+/// migrated `nanosiem.ocsf_logs` (skips when none is reachable).
+#[tokio::test]
+async fn review_fix_queries_execute_against_migrated_store() {
+    if std::env::var("SKIP_DB_TESTS").is_ok() {
+        return;
+    }
+    let client = reqwest::Client::new();
+    if !reachable(&client).await {
+        eprintln!("Skipping: ClickHouse not reachable");
+        return;
+    }
+    let has_store = exec(
+        &client,
+        "SELECT count() FROM system.columns WHERE database = 'nanosiem' AND table = 'ocsf_logs' AND name = 'event'",
+    )
+    .await
+    .unwrap_or_default();
+    if has_store.trim() != "1" {
+        eprintln!("Skipping: nanosiem.ocsf_logs (NAN-4903 shape) not present");
+        return;
+    }
+    let mut errors = Vec::new();
+    for q in REVIEW_QUERIES {
+        let sql = format!("{} FORMAT Null", ocsf_sql(q, "nanosiem"));
+        if let Err(e) = exec(&client, &sql).await {
+            errors.push(format!("{q}\n{e}\n{sql}"));
+        }
+    }
+    assert!(errors.is_empty(), "{}", errors.join("\n\n"));
+}
+
+/// NAN-4903 codex P2: `metadata.log_source` reads `source_type`, and the
+/// predicate is emitted as exactly `lower(source_type) = '…'` — the expression
+/// `idx_source_type_lower_set` indexes (skip indexes match by expression), so
+/// the 129 upstream rule references prune by source.
+///
+/// The live half EXPLAINs it against a throwaway database built from the
+/// generated DDL (TTL stripped) and seeded with one fixture row: EXPLAIN only
+/// lists a skip index when the table has a part to apply it to, so it must not
+/// depend on whatever `nanosiem.ocsf_logs` happens to hold (NAN-4903 follow-up).
+#[tokio::test]
+async fn log_source_predicate_matches_the_lower_source_type_index() {
+    let npl = r#"class_uid=1007 metadata.log_source="windows_sysmon" | stats count"#;
+    let sql = ocsf_sql(npl, "nanosiem");
+    assert!(sql.contains("lower(source_type) = 'windows_sysmon'"), "{sql}");
+    assert!(DDL.contains("INDEX idx_source_type_lower_set lower(source_type) TYPE set"), "index must be on lower(source_type)");
+
+    let client = reqwest::Client::new();
+    if std::env::var("SKIP_DB_TESTS").is_ok() || !reachable(&client).await {
+        return;
+    }
+    if !enrichment_dicts_present(&client).await {
+        eprintln!("Skipping EXPLAIN: the OCSF derivation MV needs the migrated nanosiem enrichment dictionaries");
+        return;
+    }
+    let db = format!("ocsf_explain_{}", uuid::Uuid::now_v7().simple());
+    exec(&client, &format!("CREATE DATABASE {db}")).await.expect("create throwaway db");
+    let result = explain_log_source_index(&client, &db, npl).await;
+    let _ = exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    result.unwrap();
+}
+
+/// The throwaway `ocsf_logs_raw_mv` reads `nanosiem.*` enrichment
+/// dictionaries cross-database, so seeding needs a migrated ClickHouse.
+async fn enrichment_dicts_present(client: &reqwest::Client) -> bool {
+    exec(
+        client,
+        "SELECT count() FROM system.dictionaries WHERE database = 'nanosiem' \
+         AND name IN ('ip_enrichment_dict', 'ioc_enrichment_dict', 'custom_enrichment_dict')",
+    )
+    .await
+    .is_ok_and(|n| n.trim() == "3")
+}
+
+async fn explain_log_source_index(client: &reqwest::Client, db: &str, npl: &str) -> Result<(), String> {
+    for stmt in test_table_ddl(db) {
+        exec(client, &stmt).await?;
+    }
+    let process = FIXTURES.iter().find(|(name, _)| *name == "process").unwrap().1;
+    insert_event(client, db, process).await?;
+    let rows = exec(client, &format!("SELECT count() FROM {db}.ocsf_logs")).await?;
+    if rows.trim() != "1" {
+        return Err(format!("seed row did not land in {db}.ocsf_logs (count = {})", rows.trim()));
+    }
+    let plan = exec(client, &format!("EXPLAIN indexes = 1 {}", ocsf_sql(npl, db))).await?;
+    if plan.contains("idx_source_type_lower_set") {
+        Ok(())
+    } else {
+        Err(format!("index not used:\n{plan}"))
+    }
+}
+
+/// NAN-4902: `sort` on a name the profile reads from a differently named
+/// column (`action` → `activity`) orders by that column while the base scan is
+/// in scope (the bare `action` was Code 47), and keeps the projected alias
+/// after a stats stage. `stats by <field>_expanded` after `mvexpand` groups by
+/// the expanded column, not an `unmapped` JSON path (every key was '').
+#[test]
+fn sort_alias_and_mvexpand_output_resolve_under_ocsf() {
+    let sql = ocsf_sql("* | sort action | head 5", "nanosiem");
+    assert!(sql.contains("ORDER BY activity ASC"), "{sql}");
+    let sql = ocsf_sql("* | stats count by action | sort -action", "nanosiem");
+    assert!(sql.contains("ORDER BY action DESC"), "{sql}");
+    // The physical column kept by a projection answers for its alias.
+    let sql = ocsf_sql("* | stats count by activity | sort action", "nanosiem");
+    assert!(sql.contains("ORDER BY activity ASC"), "{sql}");
+    let sql = ocsf_sql("* | table activity | sort -action", "nanosiem");
+    assert!(sql.contains("ORDER BY activity DESC"), "{sql}");
+    let sql = ocsf_sql("* | mvexpand resources.type | stats count by resources.type_expanded", "nanosiem");
+    assert!(sql.contains(r#"GROUP BY "resources.type_expanded""#), "{sql}");
+    assert!(!sql.contains("type_expanded\")"), "must not read a JSON path: {sql}");
+}
+
+/// NAN-4902: the two queries above execute and answer correctly on a
+/// throwaway store seeded with fixture rows plus one multi-resource event.
+#[tokio::test]
+async fn sort_alias_and_mvexpand_execute_against_seeded_store() {
+    let client = reqwest::Client::new();
+    if std::env::var("SKIP_DB_TESTS").is_ok() || !reachable(&client).await {
+        return;
+    }
+    if !enrichment_dicts_present(&client).await {
+        eprintln!("Skipping: the OCSF derivation MV needs the migrated nanosiem enrichment dictionaries");
+        return;
+    }
+    let db = format!("ocsf_lanei_{}", uuid::Uuid::now_v7().simple());
+    exec(&client, &format!("CREATE DATABASE {db}")).await.expect("create throwaway db");
+    let result = sort_and_mvexpand_assertions(&client, &db).await;
+    let _ = exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    result.unwrap();
+}
+
+async fn sort_and_mvexpand_assertions(client: &reqwest::Client, db: &str) -> Result<(), String> {
+    for stmt in test_table_ddl(db) {
+        exec(client, &stmt).await?;
+    }
+    for name in ["process", "auth", "file"] {
+        let event = FIXTURES.iter().find(|(n, _)| *n == name).unwrap().1;
+        insert_event(client, db, event).await?;
+    }
+    let api = serde_json::json!({
+        "class_uid": 6003, "category_uid": 6, "activity_id": 1, "type_uid": 600301,
+        "time": 1749081722345_i64,
+        "metadata": {"version": "1.9.0", "log_source": "aws_cloudtrail", "product": {"name": "CloudTrail"}},
+        "resources": [{"type": "AWS::S3::Bucket", "uid": "u1"}, {"type": "AWS::IAM::Role", "uid": "u2"}]
+    });
+    insert_event(client, db, &api.to_string()).await?;
+
+    let rows = exec(client, &format!("{} FORMAT TSV", ocsf_sql("* | sort action | table action", db))).await?;
+    let actions: Vec<&str> = rows.lines().collect();
+    let mut sorted = actions.clone();
+    sorted.sort();
+    if actions.len() != 4 || actions != sorted {
+        return Err(format!("sort action: {actions:?}"));
+    }
+
+    for npl in ["* | stats count by activity | sort action", "* | table activity | sort action"] {
+        let rows = exec(client, &format!("{} FORMAT TSV", ocsf_sql(npl, db))).await?;
+        let keys: Vec<&str> = rows.lines().map(|l| l.split('\t').next().unwrap_or("")).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        if keys.is_empty() || keys != sorted {
+            return Err(format!("{npl}: {keys:?}"));
+        }
+    }
+
+    let npl = "* | mvexpand resources.type | stats count by resources.type_expanded | sort resources.type_expanded";
+    let rows = exec(client, &format!("{} FORMAT TSV", ocsf_sql(npl, db))).await?;
+    if rows.trim() != "AWS::IAM::Role\t1\nAWS::S3::Bucket\t1" {
+        return Err(format!("mvexpand stats: {rows:?}"));
+    }
+    Ok(())
 }

@@ -1,0 +1,9 @@
+timestamp,src_ip,dst_ip,user,action,status,bytes
+2025-12-22T10:15:30Z,192.168.1.100,10.0.0.5,admin,login,success,1024
+2025-12-22T10:16:45Z,192.168.1.101,10.0.0.5,jsmith,login,failed,512
+2025-12-22T10:17:00Z,192.168.1.100,10.0.0.10,admin,file_access,success,2048
+2025-12-22T10:18:22Z,10.20.30.40,10.0.0.5,guest,login,failed,256
+2025-12-22T10:19:15Z,192.168.1.102,10.0.0.15,mwilson,logout,success,128
+2025-12-22T10:20:00Z,192.168.1.100,10.0.0.5,admin,config_change,success,4096
+2025-12-22T10:21:30Z,172.16.0.50,10.0.0.5,unknown,login,failed,512
+2025-12-22T10:22:45Z,192.168.1.103,10.0.0.20,dbrown,file_download,success,102400

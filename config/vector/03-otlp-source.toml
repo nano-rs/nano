@@ -1,7 +1,7 @@
 # OpenTelemetry (OTLP) Source — NAN-1528
 # =============================================================================
 # SYNC: the managed product generates its own copy of the traces/metrics
-# event-type conversion + OTLP/JSON reshape (NAN-1576) in the platform
+# event-type conversion + OTLP/JSON reshape (NAN-1576) in the nano-main repo
 # (apps/api/src/services/vector-otlp.ts, which adds TLS + a token gate). The two
 # repos can't share a literal — KEEP THEM IN SYNC. This copy is pinned by the
 # `otlp_traces_metrics_ingest_is_wired` test in deploy.rs.
@@ -30,24 +30,32 @@
 # `otel_spans_raw` / `otel_metrics_raw` tables reuses this exact lane — no
 # Vector required. The MV mapping is shared by both paths.
 #
-# Auth: raw ports are internal only in open core. nginx authenticates remote
-# HTTP requests against current source-bound credentials, then replaces reserved
-# identity headers captured below. Do not publish raw HTTP or gRPC ports.
+# Auth (NAN-4907, port of main NAN-3933): the OTLP source has no credential
+# gate of its own. Remote OTLP/HTTP goes through the nginx `/otlp` edge, which
+# authenticates a source-bound ingest token against nano-api on every request
+# and REPLACES the reserved identity headers captured below with the verified
+# values plus a short-lived assertion signed with NANO_OTLP_EDGE_KEY, so OTLP
+# logs land in the token's source. A direct sender cannot forge the assertion;
+# still keep the raw ports off untrusted networks (the open-core compose binds
+# 4317/4318 to loopback by default).
 # =============================================================================
 
 [sources.otlp_ingest]
 type = "opentelemetry"
-# Fixed legacy decoding confines sender body/attributes to message/attributes;
-# reserved edge headers cannot be forged by OTLP payload fields.
-log_namespace = false
-use_otlp_decoding = false
 
 [sources.otlp_ingest.grpc]
 address = "0.0.0.0:4317"
 
 [sources.otlp_ingest.http]
 address = "0.0.0.0:4318"
-headers = ["x-nano-credential-id", "x-nano-source-route"]
+headers = ["x-nano-credential-id", "x-nano-source-route", "x-nano-identity-assertion"]
+
+# NAN-5004: make the success contract explicit at the source. Logs, spans, and
+# metrics all finalize when their blocking disk event buffer accepts them, not
+# after a ClickHouse insert or batch timeout. A failed downstream finalizer
+# produces a retryable OTLP error.
+[sources.otlp_ingest.acknowledgements]
+enabled = true
 
 # =============================================================================
 # Traces -> spans raw table (NAN-1576)
@@ -72,8 +80,6 @@ inputs = ["otlp_ingest.traces"]
 type = "remap"
 inputs = ["otlp_traces_to_log"]
 source = '''
-%nano_credential_id = %opentelemetry.headers."x-nano-credential-id"
-%nano_credential_name = %opentelemetry.headers."x-nano-source-route"
 ts = .timestamp
 if !is_timestamp(ts) { ts = .start_time_unix_nano }
 if !is_timestamp(ts) { ts = now() }
@@ -88,7 +94,8 @@ fallback_nanos = to_string(to_unix_timestamp(ts, unit: "nanoseconds") ?? 0)
 start_nanos = fallback_nanos
 st = .start_time_unix_nano
 if is_timestamp(st) {
-    start_nanos = to_string(to_unix_timestamp(st, unit: "nanoseconds") ?? 0)
+    sn, sn_err = to_unix_timestamp(st, unit: "nanoseconds")
+    if sn_err == null { start_nanos = to_string(sn) }
 } else if is_integer(st) {
     start_nanos = to_string(st) ?? fallback_nanos
 } else if is_string(st) {
@@ -96,19 +103,27 @@ if is_timestamp(st) {
     # form; on parse failure keep the ingest-timestamp fallback (never "0").
     pt, err = parse_timestamp(st, "%+")
     if err != null { pt, err = parse_timestamp(st, "%Y-%m-%dT%H:%M:%S%.fZ") }
-    if err == null { start_nanos = to_string(to_unix_timestamp(pt, unit: "nanoseconds")) }
+    # VRL 0.38: nanoseconds is fallible (out of i64 range past 2262); keep the fallback.
+    if err == null {
+        pn, pn_err = to_unix_timestamp(pt, unit: "nanoseconds")
+        if pn_err == null { start_nanos = to_string(pn) }
+    }
 }
 
 end_nanos = fallback_nanos
 et = .end_time_unix_nano
 if is_timestamp(et) {
-    end_nanos = to_string(to_unix_timestamp(et, unit: "nanoseconds") ?? 0)
+    en, en_err = to_unix_timestamp(et, unit: "nanoseconds")
+    if en_err == null { end_nanos = to_string(en) }
 } else if is_integer(et) {
     end_nanos = to_string(et) ?? fallback_nanos
 } else if is_string(et) {
     pt2, err2 = parse_timestamp(et, "%+")
     if err2 != null { pt2, err2 = parse_timestamp(et, "%Y-%m-%dT%H:%M:%S%.fZ") }
-    if err2 == null { end_nanos = to_string(to_unix_timestamp(pt2, unit: "nanoseconds")) }
+    if err2 == null {
+        pn2, pn2_err = to_unix_timestamp(pt2, unit: "nanoseconds")
+        if pn2_err == null { end_nanos = to_string(pn2) }
+    }
 }
 
 # Flat attribute maps -> OTLP KeyValue arrays the MV's arrayFirst()/JSONExtract
@@ -158,7 +173,6 @@ for_each(array(.links) ?? []) -> |_il, ln| {
 }
 
 otlp = {
-    "metadata": { "nano_credential_id": %nano_credential_id },
     "traceId": to_string(.trace_id) ?? "",
     "spanId": to_string(.span_id) ?? "",
     "parentSpanId": to_string(.parent_span_id) ?? "",
@@ -197,27 +211,9 @@ otlp = {
 type = "metric_to_log"
 inputs = ["otlp_ingest.metrics"]
 
-# Route native telemetry exactly once. The legacy sink and the lake sink are
-# both present in the static topology so profile switches remain an install-time
-# environment choice, but only the selected backend receives events.
-[transforms.otlp_metrics_identity]
-type = "remap"
-inputs = ["otlp_metrics_to_log"]
-source = '''
-%nano_credential_id = %opentelemetry.headers."x-nano-credential-id"
-%nano_credential_name = %opentelemetry.headers."x-nano-source-route"
-'''
-
-[transforms.otlp_metrics_backend]
-type = "route"
-inputs = ["otlp_metrics_identity"]
-reroute_unmatched = false
-route.lake = 'get_env_var!("NANO_LOG_QUERY_BACKEND") == "lake"'
-route.legacy = 'get_env_var!("NANO_LOG_QUERY_BACKEND") != "lake"'
-
 [transforms.otlp_metrics_prep]
 type = "remap"
-inputs = ["otlp_metrics_backend.legacy"]
+inputs = ["otlp_metrics_to_log"]
 source = '''
 ts = .timestamp
 if !is_timestamp(ts) { ts = now() }
@@ -239,7 +235,6 @@ for_each(tags) -> |k, v| {
 }
 
 otlp = {
-    "metadata": { "nano_credential_id": %nano_credential_id },
     "name": to_string(.name) ?? "",
     "timeUnixNano": nanos,
     "attributes": attrs,
@@ -313,14 +308,33 @@ type = "remap"
 inputs = ["otlp_ingest.logs"]
 source = '''
 .source_type = "otlp_log"
-# The edge overwrites these headers after credential authentication. Direct
-# internal traffic has no credential stamp and cannot impersonate a sender.
-credential_id = del(."x-nano-credential-id")
-source_route = del(."x-nano-source-route")
-if is_string(credential_id) && credential_id != "" {
+# NAN-4907 (port of main NAN-3933): the nginx edge overwrites these headers
+# after authenticating the sender's ingest token, so an OTLP log lands in the
+# token's source. The identity counts only with a fresh assertion nano-api
+# signed with the edge-only NANO_OTLP_EDGE_KEY (audience, credential, route,
+# expiry), so a sender on the raw port cannot forge one and a captured one
+# expires within minutes. The MACs are compared as HMACs of the MACs, which
+# leaks no timing about the expected value. Without a verified identity the
+# lane keeps its honest provenance: `auth_status = "otlp"` (O37).
+credential_id = to_string(del(."x-nano-credential-id")) ?? ""
+source_route = to_string(del(."x-nano-source-route")) ?? ""
+assertion = to_string(del(."x-nano-identity-assertion")) ?? ""
+identity_key = get_env_var("NANO_OTLP_EDGE_KEY") ?? ""
+identity_ok = false
+assertion_parts = split(assertion, ".", limit: 2)
+if identity_key != "" && credential_id != "" && source_route != "" && source_route != "*" && length(assertion_parts) == 2 {
+    expires = to_int(assertion_parts[0]) ?? 0
+    now_secs = to_unix_timestamp(now())
+    if expires >= now_secs && expires <= now_secs + 300 {
+        expected_mac = encode_base16(hmac("nanosiem.otlp-identity.v2|vector-otlp-logs|" + credential_id + "|" + source_route + "|" + to_string(expires), identity_key))
+        given_mac = to_string(assertion_parts[1])
+        identity_ok = hmac(given_mac, identity_key) == hmac(expected_mac, identity_key)
+    }
+}
+if identity_ok {
     %nano_credential_id = credential_id
     %nano_credential_name = source_route
-    .source_type = to_string(source_route) ?? "otlp_log"
+    .source_type = source_route
     .auth_status = "authenticated"
 } else {
     .auth_status = "otlp"
@@ -370,45 +384,17 @@ if is_object(.attributes) { tail = merge(tail, object!(.attributes)) }
 .span_id = downcase(to_string(.span_id) ?? "")
 
 .metadata.forwarded_via = "otlp"
-
-# NAN-2370: stash the routing key into Vector EVENT METADATA, exactly as
-# `source_type_extract` does in 00-base.toml. The OCSF parsers replace the event
-# root (`. = {OCSF object}`), which wipes `.source_type`, and the generated
-# `_ocsf_prepare` reads `%source_type` back to stamp `metadata.log_source`.
-#
-# This lane feeds `source_router` DIRECTLY and never passes through
-# `source_type_extract`, so `%source_type` was never set for OTLP events and
-# every OTLP row landed with `metadata.log_source = "unknown"` — unsearchable by
-# source and indistinguishable from genuinely unattributed data. The HEC lane
-# (`hec_normalize`, 02-hec-source.toml) bypasses the same transform and needs
-# the same treatment.
-# `.source_type` is set to a literal string at the top of this transform, so
-# `to_string` here is infallible — coalescing it is an E651 compile error that
-# fails the whole reload (Vector restores the old topology, so the edit looks
-# like a no-op rather than a syntax error).
-%source_type = downcase(to_string!(.source_type))
-# NAN-2361 wave 8: ingress lane for the lake sink's `metadata.ingress_transport`
-# (see 00-base.toml `source_type_extract`). The hosted edge serves OTLP/HTTP
-# only; the open-core gRPC listener shares the label.
-%ingress_transport = "otlp"
+%nano_durable_ingest = true
 '''
-
-[transforms.otlp_traces_backend]
-type = "route"
-inputs = ["otlp_traces_prep"]
-reroute_unmatched = false
-route.lake = 'get_env_var!("NANO_LOG_QUERY_BACKEND") == "lake"'
-route.legacy = 'get_env_var!("NANO_LOG_QUERY_BACKEND") != "lake"'
 
 # =============================================================================
 # ClickHouse Sink — spans raw (ENGINE=Null; MV derives otel_spans)
 # COPIED from the `clickhouse_logs` sink (sources/parsers/_pipeline.toml):
-# basic auth, gzip, memory buffer, batch, adaptive concurrency. Table is
+# basic auth, gzip, disk buffer, batch, fixed concurrency. Table is
 # env-overridable.
-# O3: end-to-end acknowledgements are ON, so the OTLP source only 200-acks an
-# exporter once the CH insert is confirmed — a down/overloaded CH now returns a
-# retryable error to the exporter instead of silently acking-then-dropping.
-# buffer.when_full = "drop_newest" is kept ONLY as the last-resort shed.
+# O3/NAN-5004: source acknowledgements resolve after the blocking disk buffer
+# accepts the event, not after a ClickHouse insert or the 10-second batch timer.
+# A saturated buffer cannot be reported as success.
 # O24: batch idempotency (dedup of a batch re-POSTed after a client-side request
 # timeout) is NOT achievable from the Vector clickhouse sink — it exposes no
 # per-batch, content-derived insert_deduplication_token, and the staging tables
@@ -419,15 +405,15 @@ route.legacy = 'get_env_var!("NANO_LOG_QUERY_BACKEND") != "lake"'
 # =============================================================================
 [sinks.clickhouse_otel_spans]
 type = "clickhouse"
-inputs = ["otlp_traces_backend.legacy"]
+inputs = ["otlp_traces_prep"]
 
-endpoint = "${CLICKHOUSE_URL}"
-database = "${CLICKHOUSE_DATABASE}"
-table = "${CLICKHOUSE_OTEL_SPANS_TABLE}"
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "${CLICKHOUSE_OTEL_SPANS_TABLE:-otel_spans_raw}"
 
 auth.strategy = "basic"
-auth.user = "${CLICKHOUSE_USER}"
-auth.password = "${CLICKHOUSE_PASSWORD}"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
 
 compression = "gzip"
 date_time_best_effort = true
@@ -448,53 +434,44 @@ skip_unknown_fields = true
 deduplicate = true
 
 [sinks.clickhouse_otel_spans.buffer]
-type = "memory"
-max_events = 100000
-# O3: last-resort shed only — with acknowledgements on, drops happen solely when
-# this in-memory buffer is saturated, and the exporter still sees a retryable
-# error for anything not accepted.
-when_full = "drop_newest"
+type = "disk"
+max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+# NAN-5004: source success means this durable spool accepted the record. Block
+# at capacity instead of finalizing Dropped (which Vector folds into Delivered).
+when_full = "block"
 
-# O3: end-to-end acknowledgements — the OTLP source withholds its 200/OK until
-# this CH insert is confirmed, so exporters retry on failure instead of the
-# source acking success while the batch is dropped.
+# The source waits for the disk-buffer write, not ClickHouse or the batch timer.
 [sinks.clickhouse_otel_spans.acknowledgements]
-enabled = true
+enabled = false
 
 [sinks.clickhouse_otel_spans.batch]
-# Vector 0.57 disables interpolation unless the process opts in explicitly.
-# Nano's deployment and validation commands use that guarded flag, preserving
-# typed tenant overrides instead of silently hard-coding one deployment size.
 max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
 max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
 timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
 
 [sinks.clickhouse_otel_spans.request]
-concurrency = "adaptive"
+concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
 timeout_secs = 120
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 300
 
-[sinks.clickhouse_otel_spans.healthcheck]
-enabled = false
-
 # =============================================================================
 # ClickHouse Sink — metrics raw (ENGINE=Null; MV derives otel_metrics)
-# O3: end-to-end acknowledgements ON (see the spans sink note above); drop_newest
-# stays only as the last-resort shed. O24: same insert_deduplication_token
+# O3/NAN-5004: disk-buffer handoff (see the spans sink note above); the buffer
+# blocks rather than silently shedding. O24: same insert_deduplication_token
 # limitation — the durable dedup fix is a ReplacingMergeTree in clickhouse/140.
 # =============================================================================
 [sinks.clickhouse_otel_metrics]
 type = "clickhouse"
 inputs = ["otlp_metrics_prep"]
 
-endpoint = "${CLICKHOUSE_URL}"
-database = "${CLICKHOUSE_DATABASE}"
-table = "${CLICKHOUSE_OTEL_METRICS_TABLE}"
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "${CLICKHOUSE_OTEL_METRICS_TABLE:-otel_metrics_raw}"
 
 auth.strategy = "basic"
-auth.user = "${CLICKHOUSE_USER}"
-auth.password = "${CLICKHOUSE_PASSWORD}"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
 
 compression = "gzip"
 date_time_best_effort = true
@@ -510,15 +487,14 @@ skip_unknown_fields = true
 deduplicate = true
 
 [sinks.clickhouse_otel_metrics.buffer]
-type = "memory"
-max_events = 100000
-# O3: last-resort shed only — see the spans sink buffer note above.
-when_full = "drop_newest"
+type = "disk"
+max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+# NAN-5004: see the spans sink buffer note above.
+when_full = "block"
 
-# O3: end-to-end acknowledgements — exporters get a retryable error on CH
-# failure instead of a silent ack-then-drop.
+# The source waits for the disk-buffer write, not ClickHouse or the batch timer.
 [sinks.clickhouse_otel_metrics.acknowledgements]
-enabled = true
+enabled = false
 
 [sinks.clickhouse_otel_metrics.batch]
 max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
@@ -526,10 +502,7 @@ max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
 timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
 
 [sinks.clickhouse_otel_metrics.request]
-concurrency = "adaptive"
+concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
 timeout_secs = 120
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 300
-
-[sinks.clickhouse_otel_metrics.healthcheck]
-enabled = false

@@ -62,14 +62,10 @@ pub struct TieringService {
 impl TieringService {
     /// Create a new tiering service
     pub fn new(pg_pool: PgPool, ch_client: ClickHouseClient, config_dir: PathBuf) -> Self {
-        Self::with_crypto(pg_pool, ch_client, config_dir, EncryptionService::from_env())
-    }
-
-    pub fn with_crypto(pg_pool: PgPool, ch_client: ClickHouseClient, config_dir: PathBuf, crypto: EncryptionService) -> Self {
         Self {
             pg_pool,
             ch_client,
-            crypto,
+            crypto: EncryptionService::from_env(),
             config_dir,
         }
     }
@@ -240,8 +236,7 @@ impl TieringService {
 
                 let creds: S3Credentials = self
                     .crypto
-                    .with_context(crate::crypto::CredentialScope::Deployment, "tiering.s3", "default")
-            .decrypt_json(&encrypted)
+                    .decrypt_json(&encrypted)
                     .map_err(|e| TieringError::Encryption(e.to_string()))?;
 
                 Ok(Some(creds))
@@ -586,6 +581,10 @@ impl TieringService {
         // Ensure endpoint doesn't have trailing slash
         let endpoint = endpoint.trim_end_matches('/');
 
+        // NAN-4906: no <cache_enabled>/<data_cache_enabled>/<cache_path> on the s3
+        // disk. Nothing has read them since CH 22.8, and CH 26.10 validates disk
+        // definitions: unknown elements abort server start (Code 137,
+        // UNKNOWN_ELEMENT_IN_CONFIG). A read cache needs a separate `type=cache` disk.
         // XML-escape ALL interpolated values to prevent XML injection
         let xml = format!(
             r#"<?xml version="1.0"?>
@@ -603,9 +602,6 @@ impl TieringService {
                 <region>{region}</region>
                 <use_environment_credentials>false</use_environment_credentials>
                 <metadata_path>/var/lib/clickhouse/disks/s3_warm/</metadata_path>
-                <cache_enabled>true</cache_enabled>
-                <data_cache_enabled>true</data_cache_enabled>
-                <cache_path>/var/lib/clickhouse/disks/s3_warm_cache/</cache_path>
             </s3_warm>
         </disks>
         <policies>
@@ -754,7 +750,10 @@ impl TieringService {
             .await
             .map_err(|e| TieringError::ClickHouse(format!("Failed to set TTL rules: {}", e)))?;
 
-        tracing::info!(retention_days = config.retention_days, "TTL rules applied");
+        tracing::info!(
+            retention_days = config.retention_days,
+            "TTL rules applied"
+        );
 
         Ok(())
     }

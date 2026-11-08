@@ -141,8 +141,8 @@ export function ThemeSwatches({ className }: { className?: string }) {
           type="button"
           aria-label="Scroll themes right"
           onClick={() => containerRef.current?.scrollBy({ left: 120, behavior: 'smooth' })}
-          className="absolute inset-y-0 -right-2 flex w-7 items-center justify-end pr-1 text-muted-foreground hover:text-foreground"
-          style={{ background: 'linear-gradient(90deg, transparent, var(--popover) 60%)' }}
+          // Solid, bordered affordance (no fade — CLAUDE.md: no gradients).
+          className="absolute inset-y-0 -right-2 flex w-6 items-center justify-center border-l border-border bg-card text-muted-foreground hover:text-foreground"
         >
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="m9 6 6 6-6 6" />
@@ -150,6 +150,46 @@ export function ThemeSwatches({ className }: { className?: string }) {
         </button>
       )}
     </div>
+  );
+}
+
+/**
+ * A theme's two-tone dot: its surface on the top-left diagonal half, its accent
+ * on the other. Two clipped SOLID fills, not a gradient (CLAUDE.md), so it can
+ * also sit inside a menu item where a button cannot.
+ */
+export function SwatchDot({
+  surface,
+  accent,
+  className,
+}: {
+  surface: string;
+  accent: string;
+  className?: string;
+}) {
+  return (
+    <span
+      aria-hidden="true"
+      className={cn('block overflow-hidden rounded-full', className)}
+      style={{ backgroundColor: accent }}
+    >
+      <span
+        className="absolute inset-0 block"
+        style={{ backgroundColor: surface, clipPath: 'polygon(0 0, 100% 0, 0 100%)' }}
+      />
+    </span>
+  );
+}
+
+/** Menu-sized swatch for a theme id (the user menu's radio items). */
+export function ThemeDot({ theme, className }: { theme: Theme; className?: string }) {
+  const { surface, accent } = THEME_SWATCH[theme];
+  return (
+    <SwatchDot
+      surface={surface}
+      accent={accent}
+      className={cn('relative size-3 shrink-0 border border-border', className)}
+    />
   );
 }
 
@@ -183,8 +223,8 @@ export function ThemeSwatch({
         'hover:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-[5px] focus-visible:outline-primary',
         selected ? 'opacity-100' : 'opacity-60',
       )}
-      style={{ background: `linear-gradient(135deg, ${surface} 0 50%, ${accent} 50% 100%)` }}
     >
+      <SwatchDot surface={surface} accent={accent} className="absolute inset-0" />
       <span
         aria-hidden="true"
         className={cn(

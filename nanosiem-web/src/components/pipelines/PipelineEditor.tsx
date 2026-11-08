@@ -15,17 +15,16 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { DetailSheet } from '@/components/ui/detail-sheet';
 import { PipelineNotice, PipelinePageHeader } from './PipelineCommon';
 import { PipelineStepList, PipelineStepSettings } from './PipelineSteps';
-import { PipelineCapturePanel } from './PipelineCapture';
+import { PipelineTapPanel } from './PipelineTap';
 import { PipelinePreviewPanel } from './PipelinePreview';
-import { PipelineInputsPanel } from './PipelineInputs';
-import { pipeInputCount } from '@/lib/api/pipelines';
 import type { PipelineEditorProps } from './types';
 import type {
   PipelineConflict,
   PipelineDraft,
   PipelineOperation,
 } from '@/lib/pipeline-types';
-import { compilePipeline, serializePipeline, stepPreviewStatus } from '@/lib/pipeline-model';
+import { planJson, stepPreviewStatus } from '@/lib/pipeline-model';
+import { previewOnlyInUse } from '@/hooks/use-pipeline-workspace-core';
 import { cn } from '@/lib/utils';
 
 /** Editor-surface operations; publish and rollback report in their own sheets. */
@@ -33,21 +32,12 @@ const EDITOR_ERROR_TITLES: Partial<Record<PipelineOperation, string>> = {
   save: 'Draft could not be saved',
   validate: 'Validation could not run',
   review: 'Release review blocked',
-  capture: 'Capture request failed',
-  stop: 'Capture could not be stopped',
-  sample: 'Sample could not be saved',
+  publish: 'Release was not published',
   reload: 'Latest draft could not be loaded',
   discard: 'Draft could not be discarded',
 };
 
-function localVrl(draft: PipelineDraft): string {
-  try {
-    return draft.steps.some(step => step.enabled && ['dedupe', 'combine', 'route', 'lookup'].includes(step.kind)) ? serializePipeline(draft) : compilePipeline(draft);
-  } catch {
-    // An unfinished step cannot compile yet; keep the step configuration.
-    return JSON.stringify(draft.steps, null, 2);
-  }
-}
+
 
 function PipelineConflictNotice({
   conflict,
@@ -74,7 +64,7 @@ function PipelineConflictNotice({
   const [copied, setCopied] = useState<'copied' | 'failed' | null>(null);
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(localVrl(draft));
+      await navigator.clipboard.writeText(planJson(draft));
       setCopied('copied');
     } catch {
       setCopied('failed');
@@ -118,7 +108,7 @@ function PipelineConflictNotice({
               ? 'Copied'
               : copied === 'failed'
                 ? 'Copy failed'
-                : draft.steps.some(step => step.enabled && ['dedupe', 'combine', 'route', 'lookup'].includes(step.kind)) ? 'Copy my processing plan' : 'Copy my VRL'}
+                : 'Copy my plan JSON'}
           </Button>
         )}
         {canEdit && onDiscardDraft && (
@@ -136,7 +126,7 @@ function PipelineConflictNotice({
         open={confirm === 'reload'}
         onOpenChange={(open) => !open && setConfirm(null)}
         title="Discard your unsaved edits?"
-        description="Reload latest replaces this editor with the draft currently saved on the server. Copy your VRL first if you want to keep it."
+        description="Reload latest replaces this editor with the draft currently saved on the server. Copy your plan JSON first if you want to keep it."
         confirmLabel="Discard and reload"
         variant="warning"
         onConfirm={() => {
@@ -260,8 +250,7 @@ export function PipelineEditor(props: PipelineEditorProps) {
     capabilitiesError,
     previewError,
     validation,
-    capture,
-    samples,
+    tap,
     sample,
     preview,
     previewPending,
@@ -270,17 +259,14 @@ export function PipelineEditor(props: PipelineEditorProps) {
     onValidate,
     onReview,
     onHistory,
-    onCaptureStart,
-    onCaptureStop,
-    onFreeze,
-    onSampleSelect,
+    onTapStart,
+    onTapCancel,
+    onTapPreview,
     onPreview,
-    onSaveSample,
-    canSaveSample,
     onLoadRecent,
     onPasteSample,
     sampleNotice,
-    inputs,
+    imported = false,
     onAssistant,
     onSelectedStepChange,
     onReloadLatest,
@@ -295,17 +281,8 @@ export function PipelineEditor(props: PipelineEditorProps) {
   const [selectedId, setSelectedId] = useState<string | null>(
     draft.steps[0]?.id ?? null
   );
-  // Without a capture runner the preview tab (load recent / paste) is the way
-  // in. Decided once, when capabilities first resolve, so it never flips later.
-  const [mode, setMode] = useState<'capture' | 'preview'>('capture');
-  const modeDecided = useRef(false);
-  const captureAvailable = capabilities.capture.available;
-  const runtimeResolved = capabilities.runtime !== 'loading';
-  useEffect(() => {
-    if (modeDecided.current || !runtimeResolved) return;
-    modeDecided.current = true;
-    if (!captureAvailable) setMode('preview');
-  }, [runtimeResolved, captureAvailable]);
+  // Preview (load recent / paste) is the default way in; the live tap is one tab away.
+  const [mode, setMode] = useState<'capture' | 'preview'>('preview');
   const [stepsWidth, setStepsWidth] = useState(() =>
     Math.min(STEPS_MAX, storedWidth(STEPS_WIDTH_KEY, 220, STEPS_MIN))
   );
@@ -326,7 +303,6 @@ export function PipelineEditor(props: PipelineEditorProps) {
   );
   const [width, setWidth] = useState(1100);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [inputsOpen, setInputsOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!root.current || typeof ResizeObserver === 'undefined') return;
@@ -364,7 +340,11 @@ export function PipelineEditor(props: PipelineEditorProps) {
   const conflictDetail = conflict
     ? (errors.save ?? errors.review ?? undefined)
     : undefined;
+  const previewOnlySteps = previewOnlyInUse(draft.steps, capabilities.previewOnly);
+  const previewOnlyReason = selected ? capabilities.previewOnly.find((entry) => entry.kind === selected.kind)?.reason : undefined;
   const banners =
+    imported ||
+    previewOnlySteps.length > 0 ||
     !!conflict ||
     editorErrors.length > 0 ||
     !!capabilitiesError ||
@@ -378,7 +358,7 @@ export function PipelineEditor(props: PipelineEditorProps) {
       supported={
         !!selected && capabilities.supportedSteps.includes(selected.kind)
       }
-      mixedInputs={!!inputs?.inputs?.mixed_processes}
+      previewOnlyReason={previewOnlyReason}
       onChange={(step) =>
         onDraftChange({
           ...draft,
@@ -400,10 +380,9 @@ export function PipelineEditor(props: PipelineEditorProps) {
         meta={
           <>
             <span>
-              Active{' '}
               {pipeline.activeRevision === null
-                ? 'version unknown'
-                : `version ${pipeline.activeRevision}`}
+                ? 'no active version'
+                : `active v${pipeline.activeRevision}`}
             </span>
             <span>
               Draft edit {draft.revision} ·{' '}
@@ -413,7 +392,8 @@ export function PipelineEditor(props: PipelineEditorProps) {
                   ? 'saved'
                   : 'no changes'}
             </span>
-            <span>Source {pipeline.sourceName}</span>
+            <span>{pipeline.sourceType}</span>
+            <span>{draft.steps.length}/{capabilities.maxSteps} steps</span>
             <span>Saving does not publish</span>
           </>
         }
@@ -478,49 +458,32 @@ export function PipelineEditor(props: PipelineEditorProps) {
           </>
         }
       />
-      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border bg-panel/50 px-4 py-2 font-mono text-[10.5px]">
-        {inputs ? (
-          <button
-            type="button"
-            aria-expanded={inputsOpen}
-            aria-controls="pipeline-inputs-panel"
-            onClick={() => setInputsOpen((open) => !open)}
-            className={cn(
-              'rounded-sm border px-2 py-1 hover:bg-accent',
-              inputsOpen ? 'border-primary/30 bg-primary/5' : 'border-border'
-            )}
-          >
-            Inputs ·{' '}
-            {inputs.loading ? '…' : inputs.error ? '!' : pipeInputCount(inputs.inputs)}
-          </button>
-        ) : (
-          <span className="rounded-sm border border-border px-2 py-1">
-            {pipeline.sourceName}
-          </span>
-        )}
+      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-4 py-1.5 font-mono text-[10.5px]">
+        <span className="rounded-sm border border-border px-2 py-0.5">Source router · {pipeline.sourceType}</span>
         <span className="text-muted-foreground">→</span>
-        <span className="rounded-sm border border-primary/30 bg-primary/5 px-2 py-1">
-          Steps · {draft.steps.length}
-        </span>
+        <span className="rounded-sm border border-primary/30 bg-primary/5 px-2 py-0.5">Steps · {draft.steps.length}</span>
         <span className="text-muted-foreground">→</span>
-        <span className="rounded-sm border border-border px-2 py-1 text-muted-foreground">
-          Platform output guards · managed
-        </span>
+        <span className="rounded-sm border border-border px-2 py-0.5 text-muted-foreground">Extension · if enabled</span>
         <span className="text-muted-foreground">→</span>
-        <span>Nano Lake</span>
+        <span>ClickHouse</span>
       </div>
-      {inputs && inputsOpen && (
-        <div
-          id="pipeline-inputs-panel"
-          aria-label="Pipeline inputs"
-          role="region"
-          className="max-h-[35%] shrink-0 overflow-y-auto border-b border-border py-1"
-        >
-          <PipelineInputsPanel {...inputs} />
-        </div>
-      )}
       {banners && (
         <div className="max-h-[35%] shrink-0 space-y-2 overflow-y-auto border-b border-border px-4 py-2">
+          {imported && (
+            <PipelineNotice title="Imported from plain VRL">
+              This source&apos;s parser is plain VRL, shown as one Advanced VRL
+              step. Add steps around it; saving stores the parser as a step
+              plan. Nothing changes until you save.
+            </PipelineNotice>
+          )}
+          {previewOnlySteps.length > 0 && (
+            <PipelineNotice title="Preview-only steps" tone="warning">
+              {previewOnlySteps.map((entry) => (
+                <p key={entry.kind}><span className="font-mono">{entry.kind}</span>: {entry.reason}</p>
+              ))}
+              <p>These steps preview, but publishing is refused while they are enabled.</p>
+            </PipelineNotice>
+          )}
           {conflict && (
             <PipelineConflictNotice
               conflict={conflict}
@@ -545,12 +508,12 @@ export function PipelineEditor(props: PipelineEditorProps) {
           ))}
           {capabilitiesError && (
             <PipelineNotice
-              title="Runtime capabilities unavailable"
+              title="Pipeline capabilities unavailable"
               tone="warning"
             >
               <p>{capabilitiesError}</p>
               <p>
-                Preview and capture stay off until they load. Editing, saving,
+                Preview and live tap stay off until they load. Editing, saving,
                 and publishing still work.
               </p>
               {onRetryCapabilities && (
@@ -625,6 +588,8 @@ export function PipelineEditor(props: PipelineEditorProps) {
             >
               <PipelineStepList
                 steps={draft.steps}
+                previewOnly={capabilities.previewOnly}
+                maxSteps={capabilities.maxSteps}
                 selectedId={selected?.id ?? null}
                 supportedSteps={capabilities.supportedSteps}
                 readOnly={readOnly || !!busy}
@@ -676,10 +641,7 @@ export function PipelineEditor(props: PipelineEditorProps) {
                   aria-controls={`pipeline-${value}-panel`}
                   id={`pipeline-${value}-tab`}
                   type="button"
-                  onClick={() => {
-                    modeDecided.current = true;
-                    setMode(value);
-                  }}
+                  onClick={() => setMode(value)}
                   onKeyDown={(event) => {
                     if (
                       event.key === 'ArrowLeft' ||
@@ -687,7 +649,6 @@ export function PipelineEditor(props: PipelineEditorProps) {
                     ) {
                       event.preventDefault();
                       const next = value === 'capture' ? 'preview' : 'capture';
-                      modeDecided.current = true;
                       setMode(next);
                       document.getElementById(`pipeline-${next}-tab`)?.focus();
                     }
@@ -699,7 +660,7 @@ export function PipelineEditor(props: PipelineEditorProps) {
                       : 'border-transparent text-muted-foreground hover:text-foreground'
                   )}
                 >
-                  {value === 'capture' ? 'Live capture' : 'Draft preview'}
+                  {value === 'capture' ? 'Live tap' : 'Draft preview'}
                   <span className="hidden font-mono text-[9.5px] text-muted-foreground xl:inline">
                     {value === 'capture' ? 'observed' : 'computed'}
                   </span>
@@ -724,37 +685,31 @@ export function PipelineEditor(props: PipelineEditorProps) {
             className="min-h-0 flex-1 overflow-auto"
           >
             {mode === 'capture' ? (
-              <PipelineCapturePanel
-                sourceId={pipeline.sourceId}
+              <PipelineTapPanel
                 sourceName={pipeline.sourceName}
-                activeRevision={pipeline.activeRevision}
-                capture={capture}
+                tap={tap}
                 capabilities={capabilities}
-                canCapture={permissions.capture}
-                busy={!!busy}
-                onStart={onCaptureStart}
-                onStop={onCaptureStop}
-                onFreeze={() => {
-                  onFreeze();
-                  modeDecided.current = true;
+                canTap={permissions.events}
+                onStart={onTapStart}
+                onCancel={onTapCancel}
+                onPreview={() => {
+                  onTapPreview();
                   setMode('preview');
                 }}
-                onSaveSample={onSaveSample}
-                canSaveSample={canSaveSample}
               />
             ) : (
               <PipelinePreviewPanel
                 sample={sample}
-                samples={samples}
                 preview={preview}
                 revision={draft.revision}
                 pending={!!previewPending}
-                canViewEvents={permissions.capture}
+                canPreview={permissions.edit}
+                canReadEvents={permissions.events}
+                degraded={capabilities.previewDegraded}
                 available={capabilities.preview}
                 unavailableReason={capabilities.previewReason}
                 error={previewError}
                 selectedStepId={selected?.id ?? null}
-                onSampleSelect={onSampleSelect}
                 onPreview={onPreview}
                 onLoadRecent={onLoadRecent}
                 onPasteSample={onPasteSample}

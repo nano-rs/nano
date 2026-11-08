@@ -47,14 +47,6 @@ use crate::hunts::report::{reconcile_outcome, BudgetLimits, BudgetUsage, TrailSt
 use crate::hunts::scoring::{score, Contribution, ScoreInputs};
 use crate::hunts::spec::HuntSpecDraft;
 use crate::playbooks::models::{CreatePlaybookRequest, Playbook, PlaybookScope, PlaybookStatus};
-
-// NAN-2361: the tenant-leading unique index exists only under the enterprise
-// overlay migrations (9000361); the open edition keeps its original key.
-// Selected at compile time by the feature.
-#[cfg(feature = "enterprise")]
-const RULE_IDEA_CONFLICT_TARGET: &str = "ON CONFLICT (tenant_id, playbook_id, fingerprint)";
-#[cfg(not(feature = "enterprise"))]
-const RULE_IDEA_CONFLICT_TARGET: &str = "ON CONFLICT (playbook_id, fingerprint)";
 use serde_json::Value;
 
 /// Column pairs the artifact-provenance predicate must be applied to, keyed by
@@ -89,11 +81,11 @@ pub const DEFAULT_LEASE_SECONDS: i64 = 1800;
 /// Cap on the trail we persist, mirroring `hunt_sweeps_trail_bounded`. Trimmed
 /// where the value is produced so the CHECK is never what rejects a report —
 /// a 400 on the last step of a 15-minute sweep loses the whole sweep.
-pub const MAX_TRAIL_STEPS: usize = 500;
+const MAX_TRAIL_STEPS: usize = 500;
 
 /// Cap on stored narrative / outcome detail, mirroring the CHECKs. Same reason.
-pub const MAX_NARRATIVE_CHARS: usize = 16_384;
-pub const MAX_OUTCOME_DETAIL_CHARS: usize = 4_000;
+const MAX_NARRATIVE_CHARS: usize = 16_384;
+const MAX_OUTCOME_DETAIL_CHARS: usize = 4_000;
 
 #[derive(Clone)]
 pub struct HuntRepository {
@@ -164,7 +156,7 @@ impl HuntRepository {
     /// The projection every hunt read shares. `kind = 'hunt'` is not optional:
     /// `playbooks` is a shared definition table and a response playbook joined
     /// to nothing would render as a malformed hunt.
-    pub const HUNT_SELECT: &'static str = r#"
+    const HUNT_SELECT: &'static str = r#"
         SELECT p.id AS playbook_id, p.title, p.subtitle, p.category, p.status, p.tags,
                h.sweep_query, h.schedule_cron, h.schedule_timezone, h.required_source_types,
                h.telemetry_requirements,
@@ -206,7 +198,7 @@ impl HuntRepository {
     /// every hunt has no business carrying either, which is exactly why they
     /// were left out — and then never added back anywhere, so the detail view
     /// never received them.
-    pub const HUNT_DETAIL_SELECT: &'static str = r#"
+    const HUNT_DETAIL_SELECT: &'static str = r#"
         SELECT p.id AS playbook_id, p.title, p.subtitle, p.category, p.status, p.tags,
                p.doc, p.parsed_steps AS steps,
                h.sweep_query, h.schedule_cron, h.schedule_timezone, h.required_source_types,
@@ -309,7 +301,7 @@ impl HuntRepository {
                 source_type, capability, state, origin, confidence, basis,
                 evidence, updated_by
             ) VALUES ($1, $2, $3, 'analyst', 1.0, 'analyst_override', $4, $5)
-            ON CONFLICT ON CONSTRAINT hunt_source_capability_bindings_pkey DO UPDATE
+            ON CONFLICT (source_type, capability, origin) DO UPDATE
                SET state = EXCLUDED.state,
                    confidence = 1.0,
                    basis = 'analyst_override',
@@ -1310,7 +1302,7 @@ impl HuntRepository {
                         canonical_event_id, summary, position
                     )
                     VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    ON CONFLICT (tenant_id, lead_id, canonical_event_id) DO NOTHING
+                    ON CONFLICT (lead_id, canonical_event_id) DO NOTHING
                     "#,
                 )
                 .bind(lead_id)
@@ -1487,16 +1479,16 @@ impl HuntRepository {
         // On conflict the manifest is UNIONED and completeness is ANDed: an
         // idea derived from several leads is only as attributed as its least
         // attributed contributor.
-        let idea_id: Uuid = sqlx::query_scalar(&format!(
+        let idea_id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO hunt_rule_ideas (
                 playbook_id, fingerprint, name, proposed_npl, mitre_technique,
                 state, source_types, source_types_complete
             )
             VALUES ($1, $2, $3, $4, $5, 'keep_hunting', $6, $7)
-            {RULE_IDEA_CONFLICT_TARGET} DO UPDATE
+            ON CONFLICT (playbook_id, fingerprint) DO UPDATE
                SET source_types = (
-                       SELECT COALESCE(array_agg(DISTINCT st ORDER BY st), '{{}}'::text[])
+                       SELECT COALESCE(array_agg(DISTINCT st ORDER BY st), '{}'::text[])
                          FROM unnest(hunt_rule_ideas.source_types || EXCLUDED.source_types) AS st
                    ),
                    source_types_complete =
@@ -1504,7 +1496,7 @@ impl HuntRepository {
                    updated_at = NOW()
             RETURNING id
             "#,
-        ))
+        )
         .bind(playbook_id)
         .bind(fingerprint)
         .bind(truncate_chars(&name, 200))
@@ -1519,7 +1511,7 @@ impl HuntRepository {
         // the gate is stable if a lead is later re-triaged.
         sqlx::query(
             "INSERT INTO hunt_rule_idea_basis (idea_id, lead_id, sweep_id, promoted) \
-             VALUES ($1, $2, $3, FALSE) ON CONFLICT (tenant_id, idea_id, lead_id) DO NOTHING",
+             VALUES ($1, $2, $3, FALSE) ON CONFLICT (idea_id, lead_id) DO NOTHING",
         )
         .bind(idea_id)
         .bind(lead_id)
@@ -1817,7 +1809,7 @@ impl HuntRepository {
         sqlx::query(
             "INSERT INTO case_entities (case_id, entity_type, entity_value, is_primary, provenance_recorded) \
              VALUES ($1, $2, $3, TRUE, FALSE) \
-             ON CONFLICT (tenant_id, case_id, entity_type, entity_value) DO NOTHING",
+             ON CONFLICT (case_id, entity_type, entity_value) DO NOTHING",
         )
         .bind(case_id)
         .bind(&entity_type)
@@ -2772,7 +2764,7 @@ const WITHHELD_DETAIL_FALLBACK: &str = "detail withheld";
 /// [`ContributionBasis::references_nothing`]. That is what makes a MISSING
 /// basis unambiguous: it can only mean a row written before this contract, and
 /// those fail closed.
-pub fn stamp_contribution_bases(
+fn stamp_contribution_bases(
     contributions: Vec<Contribution>,
     suppression: &ContributionBasis,
     recurrence: &ContributionBasis,
@@ -2797,7 +2789,7 @@ pub fn stamp_contribution_bases(
 ///
 /// The lead itself has already passed its own provenance gate by the time this
 /// runs — this is only about the factors that speak for OTHER artifacts.
-pub fn redact_contributions(lead: &mut HuntLead, scope: &ArtifactScope) {
+fn redact_contributions(lead: &mut HuntLead, scope: &ArtifactScope) {
     if scope.is_unrestricted() {
         return;
     }
@@ -2865,7 +2857,7 @@ pub fn redact_contributions(lead: &mut HuntLead, scope: &ArtifactScope) {
 /// nothing consumes. A breakdown that cannot be parsed lands as the same
 /// single withheld line `redact_contributions` uses, never as an empty list:
 /// an empty "why" block is indistinguishable from "no factors ran".
-pub fn wire_contributions(stored: &Value) -> Vec<Contribution> {
+fn wire_contributions(stored: &Value) -> Vec<Contribution> {
     match serde_json::from_value::<Vec<StoredContribution>>(stored.clone()) {
         Ok(entries) => entries.into_iter().map(|e| e.contribution).collect(),
         Err(_) => vec![Contribution {
@@ -2915,7 +2907,7 @@ pub struct SweepReportContext {
 /// Shared lead projection. `score` is cast to `float8` because the column is
 /// `NUMERIC(4,3)`; reading it as a Rust `f64` without the cast is a decode
 /// error at runtime, not a compile error.
-pub const LEAD_SELECT: &str = r#"
+const LEAD_SELECT: &str = r#"
     SELECT l.id, l.sweep_id, l.playbook_id, l.playbook_version, p.title AS hunt_title,
            l.entity_type, l.entity_value, l.mitre_technique,
            l.window_start, l.window_end, l.narrative,
@@ -3050,7 +3042,7 @@ fn build_leads_count_sql(query: &ListLeadsQuery, scope: &ArtifactScope) -> (Stri
 // Row mapping
 // =============================================================================
 
-pub fn hunt_from_row(row: &sqlx::postgres::PgRow) -> Result<Hunt, HuntError> {
+fn hunt_from_row(row: &sqlx::postgres::PgRow) -> Result<Hunt, HuntError> {
     Ok(Hunt {
         playbook_id: row.try_get("playbook_id")?,
         title: row.try_get("title")?,
@@ -3097,7 +3089,7 @@ pub fn hunt_from_row(row: &sqlx::postgres::PgRow) -> Result<Hunt, HuntError> {
     })
 }
 
-pub fn source_capability_binding_from_row(
+fn source_capability_binding_from_row(
     row: &sqlx::postgres::PgRow,
 ) -> Result<SourceCapabilityBinding, HuntError> {
     Ok(SourceCapabilityBinding {
@@ -3115,7 +3107,7 @@ pub fn source_capability_binding_from_row(
     })
 }
 
-pub fn runner_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntRunner, HuntError> {
+fn runner_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntRunner, HuntError> {
     let agy_waiver_granted_at: Option<chrono::DateTime<chrono::Utc>> =
         row.try_get("agy_waiver_granted_at")?;
     let agy_waiver_revoked_at: Option<chrono::DateTime<chrono::Utc>> =
@@ -3149,7 +3141,7 @@ pub fn runner_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntRunner, HuntEr
 /// leads_produced`) — the `try_get` below fails loudly on a query that
 /// forgot, rather than defaulting to a fabricated zero the ledger would
 /// present as a measurement (NAN-2243).
-pub fn sweep_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntSweep, HuntError> {
+fn sweep_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntSweep, HuntError> {
     Ok(HuntSweep {
         id: row.try_get("id")?,
         playbook_id: row.try_get("playbook_id")?,
@@ -3180,7 +3172,7 @@ pub fn sweep_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntSweep, HuntErro
     })
 }
 
-pub fn lead_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntLead, HuntError> {
+fn lead_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntLead, HuntError> {
     Ok(HuntLead {
         id: row.try_get("id")?,
         sweep_id: row.try_get("sweep_id")?,
@@ -3209,7 +3201,7 @@ pub fn lead_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntLead, HuntError>
     })
 }
 
-pub fn evidence_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntLeadEvidence, HuntError> {
+fn evidence_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntLeadEvidence, HuntError> {
     Ok(HuntLeadEvidence {
         id: row.try_get("id")?,
         lead_id: row.try_get("lead_id")?,
@@ -3223,7 +3215,7 @@ pub fn evidence_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntLeadEvidence
     })
 }
 
-pub fn suppression_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntSuppression, HuntError> {
+fn suppression_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntSuppression, HuntError> {
     Ok(HuntSuppression {
         id: row.try_get("id")?,
         fingerprint: row.try_get("fingerprint")?,
@@ -3244,7 +3236,7 @@ pub fn suppression_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntSuppressi
     })
 }
 
-pub fn profile_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntProfile, HuntError> {
+fn profile_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntProfile, HuntError> {
     Ok(HuntProfile {
         id: row.try_get("id")?,
         census: row.try_get("census")?,
@@ -3262,7 +3254,7 @@ pub fn profile_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntProfile, Hunt
     })
 }
 
-pub fn rule_idea_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntRuleIdea, HuntError> {
+fn rule_idea_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntRuleIdea, HuntError> {
     Ok(HuntRuleIdea {
         id: row.try_get("id")?,
         playbook_id: row.try_get("playbook_id")?,
@@ -3290,11 +3282,11 @@ pub fn rule_idea_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntRuleIdea, H
 // Small helpers
 // =============================================================================
 
-pub fn normalize_sources(values: &[String]) -> Vec<String> {
+fn normalize_sources(values: &[String]) -> Vec<String> {
     crate::auth::normalize_source_manifest(values)
 }
 
-pub fn validate_hunt_text(title: &str, category: &str, sweep_query: &str) -> Result<(), HuntError> {
+fn validate_hunt_text(title: &str, category: &str, sweep_query: &str) -> Result<(), HuntError> {
     if title.trim().is_empty() {
         return Err(HuntError::Validation("title must not be empty".into()));
     }
@@ -3322,7 +3314,7 @@ pub fn validate_hunt_text(title: &str, category: &str, sweep_query: &str) -> Res
 /// guess. Require both a successful parse and explicit query structure; a
 /// conservative false negative here merely keeps hunting, while a false
 /// positive puts prose into the rule editor under an executable label.
-pub fn rule_idea_seed_npl(opening: &str) -> Option<&str> {
+fn rule_idea_seed_npl(opening: &str) -> Option<&str> {
     let opening = opening.trim();
     let lower = opening.to_ascii_lowercase();
     let has_query_structure = opening
@@ -3342,7 +3334,7 @@ pub fn rule_idea_seed_npl(opening: &str) -> Option<&str> {
 /// Only ever the DERIVED score decides — an agent has no field to propose a
 /// severity, and mapping one from its narrative would reintroduce the same
 /// self-assessment the scorer exists to replace.
-pub fn normalize_case_severity(requested: Option<&str>, score: f64) -> String {
+fn normalize_case_severity(requested: Option<&str>, score: f64) -> String {
     const ALLOWED: &[&str] = &["critical", "high", "medium", "low", "informational"];
     if let Some(requested) = requested.map(str::trim).map(str::to_lowercase) {
         if ALLOWED.contains(&requested.as_str()) {
@@ -3361,7 +3353,7 @@ pub fn normalize_case_severity(requested: Option<&str>, score: f64) -> String {
 /// Truncate by CHARACTERS, not bytes. The Postgres CHECKs are `length()`, which
 /// counts characters; truncating by bytes would both mis-measure and be able to
 /// split a UTF-8 sequence.
-pub fn truncate_chars(value: &str, max: usize) -> String {
+fn truncate_chars(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         value.to_string()
     } else {
@@ -3369,14 +3361,14 @@ pub fn truncate_chars(value: &str, max: usize) -> String {
     }
 }
 
-pub fn truncate_chars_fn(max: usize) -> impl Fn(&str) -> String {
+fn truncate_chars_fn(max: usize) -> impl Fn(&str) -> String {
     move |value: &str| truncate_chars(value, max)
 }
 
 /// Saturate rather than wrap. A runner reporting an absurd count should skew a
 /// dashboard, not overflow into a negative and trip
 /// `hunt_rule_ideas_counters_nonneg`.
-pub fn clamp_i32(value: i64) -> i32 {
+fn clamp_i32(value: i64) -> i32 {
     value.clamp(0, i32::MAX as i64) as i32
 }
 

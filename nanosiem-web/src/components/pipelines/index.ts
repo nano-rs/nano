@@ -2,10 +2,7 @@
 
 export { PipelineList } from './PipelineList';
 export { PipelineEditor } from './PipelineEditor';
-export {
-  PipelineReleaseReview,
-  PipelineReleaseHistory,
-} from './PipelineReleases';
+export { PipelineReleaseReview, PipelineReleaseHistory } from './PipelineReleases';
 export type {
   PipelineListProps,
   PipelineEditorProps,

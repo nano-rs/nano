@@ -4,7 +4,7 @@
 //!
 //! `ParsedLog` is the structured row written into the ClickHouse `logs` table.
 //! It is constructed directly by the audit writers (`nanosiem-core::audit` and
-//! `enterprise::cases::audit`) and mapped to columns by
+//! `nanosiem-enterprise::cases::audit`) and mapped to columns by
 //! `ingestion::row::ClickHouseLogRow`. The in-process log-format parser was
 //! removed when ingestion moved to Vector → ClickHouse direct writes.
 

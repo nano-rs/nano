@@ -7,7 +7,7 @@
 // Stays in the redesign — no redirect-to-legacy escape hatch.
 //
 // NAN-3023: timeline rows (marker · version + message · time/author) with the
-// diff + revert expanding inline under the selected row, per the "Rules pivt
+// diff + revert expanding inline under the selected row, per the "Rules Pivt
 // Panel" handoff mapped onto the app type scale.
 
 import { useEffect, useMemo, useState } from 'react';

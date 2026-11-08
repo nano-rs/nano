@@ -1,9 +1,10 @@
 //! Outbound policy: which URLs a run may reach, and which IPs it may connect to.
 //!
 //! Two independent checks. The host/path allowlist comes from the spec (with
-//! per-tenant hosts resolved from config at run start). Public runs admit only
-//! globally routable unicast addresses. A trusted caller may select the
-//! SelfManaged scope for signed on-prem SOAR packs; explicit denies still win.
+//! per-tenant hosts resolved from config at run start). Only globally
+//! routable unicast addresses are admitted: there is no private-network
+//! scope in this crate (NAN-4914; the hosted SOAR self-managed scope is not
+//! part of the open engine).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -153,47 +154,49 @@ impl EgressDeny {
 /// platform and tenant deny lists.
 #[derive(Debug, Clone, Default)]
 pub struct HostPolicy {
-    network: NetworkScope,
     rules: Vec<HostRule>,
     deny: EgressDeny,
+    /// A trusted caller's name authority (never deserialized from a spec or
+    /// config): host names it admits skip the reserved-suffix check. Name
+    /// level only; every resolved address still goes through
+    /// [`HostPolicy::check_ip`] and the broker's address checks.
+    reserved_name_authority: Option<ReservedNameAuthority>,
 }
 
-/// Trusted caller authority, never deserialized from connector/customer config.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum NetworkScope {
-    #[default]
-    Public,
-    SelfManaged,
-}
-impl NetworkScope {
-    fn check_name(self, host: &str) -> Result<(), PolicyError> {
-        if self == Self::SelfManaged {
-            // Corporate DNS is permitted, infrastructure service/metadata names are not.
-            let h = format!(".{host}");
-            if [".internal", ".local", ".lan", ".intranet", ".corp", ".private"].iter().any(|s| h.ends_with(s))
-                && !h.ends_with(".cluster.local") && !h.ends_with(".localhost")
-                && !host.split('.').any(|label| matches!(label, "metadata" | "localhost" | "svc")) {
-                return Ok(());
-            }
-        }
-        check_reserved_name(host)
-    }
-    fn permits_private(self, ip: IpAddr) -> bool {
-        self == Self::SelfManaged && match canonical(ip) {
-            IpAddr::V4(ip) => ip.is_private(),
-            IpAddr::V6(ip) => ip.is_unique_local()
-                // AWS IPv6 instance metadata is inside ULA; always refuse it.
-                && !Cidr::parse("fd00:ec2::/32").expect("constant CIDR").contains(IpAddr::V6(ip)),
-        }
-    }
-}
+/// Decides whether a host name under a reserved suffix (for example a
+/// customer's `*.internal` DNS) may be named by this run. The open engine
+/// never sets one; it exists so an embedding product can scope it to its own
+/// signed packs (NAN-4979).
+pub type ReservedNameAuthority = fn(&str) -> bool;
+
 impl HostPolicy {
     /// Resolve spec rules against config. A templated host must resolve to a
     /// plain host name ending in one of the rule's suffixes.
     pub fn compile(rules: &[AllowRule], scope: &Scope) -> Result<Self, PolicyError> {
-        Self::compile_for_network(rules, scope, NetworkScope::Public)
+        Self::compile_with(rules, scope, None)
     }
-    pub fn compile_for_network(rules: &[AllowRule], scope: &Scope, network: NetworkScope) -> Result<Self, PolicyError> {
+
+    /// [`HostPolicy::compile`] with a caller's [`ReservedNameAuthority`].
+    pub fn compile_with_reserved_name_authority(
+        rules: &[AllowRule],
+        scope: &Scope,
+        authority: ReservedNameAuthority,
+    ) -> Result<Self, PolicyError> {
+        Self::compile_with(rules, scope, Some(authority))
+    }
+
+    fn check_name(authority: Option<ReservedNameAuthority>, host: &str) -> Result<(), PolicyError> {
+        if authority.is_some_and(|admit| admit(host)) {
+            return Ok(());
+        }
+        check_reserved_name(host)
+    }
+
+    fn compile_with(
+        rules: &[AllowRule],
+        scope: &Scope,
+        reserved_name_authority: Option<ReservedNameAuthority>,
+    ) -> Result<Self, PolicyError> {
         let mut out = Vec::new();
         for r in rules {
             let raw = r
@@ -232,7 +235,7 @@ impl HostPolicy {
             if !is_plain_hostname(&host) {
                 return Err(PolicyError::BadRule(format!("{host:?} is not a host name")));
             }
-            network.check_name(&host)?;
+            Self::check_name(reserved_name_authority, &host)?;
             let mut prefixes = r.path_prefixes.clone();
             if prefixes.is_empty() {
                 prefixes.push("/".into());
@@ -247,7 +250,7 @@ impl HostPolicy {
                 path_prefixes: prefixes,
             });
         }
-        Ok(Self { rules: out, deny: EgressDeny::default(), network })
+        Ok(Self { rules: out, deny: EgressDeny::default(), reserved_name_authority })
     }
 
     /// Apply a deny list. Fails if it removes every allowed host, so a
@@ -298,7 +301,7 @@ impl HostPolicy {
         if !is_plain_hostname(&host) {
             return Err(PolicyError::HostNotAllowed(host));
         }
-        self.network.check_name(&host)?;
+        Self::check_name(self.reserved_name_authority, &host)?;
         if self.deny.denies_host(&host) {
             return Err(PolicyError::HostDenied(host));
         }
@@ -337,9 +340,7 @@ impl HostPolicy {
     /// The selected network scope plus deny CIDRs. Run on every resolved
     /// address before a connection is made.
     pub fn check_ip(&self, ip: IpAddr) -> Result<(), PolicyError> {
-        if !self.network.permits_private(ip) {
-            check_ip(ip)?;
-        }
+        check_ip(ip)?;
         if self.deny.denies_ip(ip) {
             return Err(PolicyError::IpDenied(ip));
         }
@@ -401,17 +402,36 @@ fn check_reserved_name(host: &str) -> Result<(), PolicyError> {
     Ok(())
 }
 
-/// Only globally routable unicast addresses pass.
+/// Only globally routable unicast addresses pass: the connector's own
+/// reserved-range list below, and then the platform's shared SSRF validator
+/// (`nanosiem_core::inputlookup::SsrfValidator`), so a range either list
+/// refuses is refused. The connector list is the stricter of the two (IANA
+/// special registry, NAT64/6to4 embeddings); the shared one keeps the
+/// connector aligned with every other outbound path when it grows.
 pub fn check_ip(ip: IpAddr) -> Result<(), PolicyError> {
     let blocked = match ip {
         IpAddr::V4(v4) => v4_blocked(v4),
         IpAddr::V6(v6) => v6_blocked(v6),
     };
     if blocked {
-        Err(PolicyError::IpBlocked(ip))
-    } else {
-        Ok(())
+        return Err(PolicyError::IpBlocked(ip));
     }
+    shared_ssrf_check(ip)
+}
+
+/// The shared SSRF validator (secure defaults) on one resolved address,
+/// both the raw and the IPv4-mapped-canonical form.
+fn shared_ssrf_check(ip: IpAddr) -> Result<(), PolicyError> {
+    use nanosiem_core::inputlookup::SsrfValidator;
+    use std::sync::LazyLock;
+    static PUBLIC: LazyLock<SsrfValidator> = LazyLock::new(SsrfValidator::default_secure);
+    let v = &*PUBLIC;
+    for a in [ip, canonical(ip)] {
+        if v.validate_ip_address(a).is_err() {
+            return Err(PolicyError::IpBlocked(ip));
+        }
+    }
+    Ok(())
 }
 
 /// IPv4 ranges that are never a vendor API. The list is the IANA special

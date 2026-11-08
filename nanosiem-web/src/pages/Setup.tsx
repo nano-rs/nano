@@ -1,30 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
- * First-run setup: create the instance's first administrator. Rendered on the
- * guided-form shell in `auth-shell.tsx`; the password policy comes from
- * `@/lib/password` and is never restated here.
+ * First-Run Setup Page
+ * 
+ * Provides a setup wizard for initial system configuration.
+ * Creates the first admin account and optionally configures OIDC.
+ * 
+ * Requirements: 13.1, 13.2, 13.3
+ * - 13.1: Display setup wizard when no users exist
+ * - 13.2: Require creating an admin account with email and password
+ * - 13.3: Optionally allow configuring an OIDC provider
  */
 
-import { useState, FormEvent, useEffect, useRef } from 'react';
+import { useState, FormEvent, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { authenticatedFetch } from '@/lib/authenticated-fetch';
-import {
-  PASSWORD_MAX_BYTES,
-  PASSWORD_MIN_BYTES,
-  passwordChecklist,
-  unmetPasswordRequirements,
-} from '@/lib/password';
-import {
-  AuthError,
-  AuthFootnote,
-  AuthHeading,
-  AuthShell,
-  Field,
-  PolicyChecklist,
-  PrimaryButton,
-  StepRail,
-} from './auth-shell';
+import { Mail, Lock, User, CircleAlert, CircleCheck, ChevronRight } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Logo } from '@/components/ui/logo';
+import { PASSWORD_MAX_BYTES, PASSWORD_MIN_BYTES, unmetPasswordRequirements } from '@/lib/password';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
 
@@ -35,29 +32,27 @@ interface SetupStatus {
 
 export function Setup() {
   const navigate = useNavigate();
-
+  
   // Form state
   const [email, setEmail] = useState('');
   const [name, setName] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
-
+  
   // UI state
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isCheckingStatus, setIsCheckingStatus] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
-
+  
   // Password validation state
   const [passwordErrors, setPasswordErrors] = useState<string[]>([]);
-
-  const nameInput = useRef<HTMLInputElement>(null);
 
   // Check setup status on mount
   useEffect(() => {
     const checkStatus = async () => {
       try {
-        const response = await authenticatedFetch('/api/setup/status', `${API_BASE_URL}/api/setup/status`);
+        const response = await fetch(`${API_BASE_URL}/api/setup/status`);
         if (response.ok) {
           const status: SetupStatus = await response.json();
           if (status.initialized || status.has_users) {
@@ -75,15 +70,9 @@ export function Setup() {
     checkStatus();
   }, [navigate]);
 
-  // The form only mounts once the status probe resolves, so `autoFocus` on the
-  // first field would not fire — focus it explicitly instead.
-  useEffect(() => {
-    if (!isCheckingStatus && !success) nameInput.current?.focus();
-  }, [isCheckingStatus, success]);
-
-  // Validate password on change against the shared policy mirror. Do NOT
-  // re-derive the rules here: this form used to carry its own, narrower
-  // special-character class and rejected passwords the server accepts.
+  // Validate password on change. NAN-2361 / NAN-4902: the shared mirror of
+  // the server policy (auth/password.rs). The old hand-rolled checks used a
+  // narrower special-character class than the server accepts.
   useEffect(() => {
     setPasswordErrors(password.length > 0 ? unmetPasswordRequirements(password) : []);
   }, [password]);
@@ -126,7 +115,7 @@ export function Setup() {
     setIsSubmitting(true);
 
     try {
-      const response = await authenticatedFetch('/api/setup/initialize', `${API_BASE_URL}/api/setup/initialize`, {
+      const response = await fetch(`${API_BASE_URL}/api/setup/initialize`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -144,7 +133,7 @@ export function Setup() {
       }
 
       setSuccess(true);
-
+      
       // Redirect to login after a short delay
       setTimeout(() => {
         navigate('/login', { replace: true });
@@ -156,111 +145,194 @@ export function Setup() {
     }
   };
 
-  const version = __APP_VERSION__;
+  // Show loading while checking status
+  if (isCheckingStatus) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <LoadingIcon className="w-8 h-8 text-primary" />
+      </div>
+    );
+  }
 
-  const passwordInvalid = password.length > 0 && passwordErrors.length > 0;
-  const confirmMismatch = confirmPassword.length > 0 && password !== confirmPassword;
-  const confirmMatches = confirmPassword.length > 0 && password.length > 0 && !confirmMismatch;
-  const checks = passwordChecklist(password);
-  const ready = name.trim().length > 0 && email.trim().length > 0 && checks.every((c) => c.ok) && confirmMatches;
-
-  const statusText = isCheckingStatus
-    ? 'checking instance state…'
-    : success
-    ? 'administrator created — redirecting to sign-in'
-    : error
-    ? 'setup failed'
-    : isSubmitting ? 'creating administrator account…' : ready ? 'ready to create the account' : 'awaiting admin details';
+  // Show success message
+  if (success) {
+    return (
+      <div className="min-h-screen bg-background flex flex-col items-center justify-center p-4">
+        <div className="w-full max-w-md text-center">
+          <div className="inline-flex items-center justify-center w-16 h-16 bg-green-600 rounded-2xl mb-4">
+            <CircleCheck className="w-10 h-10 text-foreground" />
+          </div>
+          <h1 className="text-2xl font-bold text-foreground mb-2">Setup Complete!</h1>
+          <p className="text-muted-foreground mb-4">
+            Your admin account has been created. Redirecting to login...
+          </p>
+          <LoadingIcon className="w-6 h-6 text-primary mx-auto" />
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <AuthShell crumb="auth / setup" version={version} status={{ text: statusText, good: success || (ready && !error) }}>
-      <StepRail steps={['Create administrator', 'Sign in']} current={success ? 2 : 1} />
-
-      {isCheckingStatus ? (
-        <div className="h-[200px] flex items-center justify-center font-mono text-[11px] text-muted-foreground">
-          checking whether this instance is already initialised…
+    <div className="min-h-screen bg-background flex flex-col items-center justify-center p-4">
+      <div className="w-full max-w-md">
+        {/* Logo and Title */}
+        <div className="text-center mb-8">
+          <Logo className="w-16 h-16 mx-auto mb-4" size="small" />
+          <h1 className="text-2xl text-foreground">Welcome to <span className="font-light" style={{ fontFamily: 'Comfortaa, sans-serif' }}>nano</span></h1>
+          <p className="text-muted-foreground mt-2">Let's set up your admin account</p>
         </div>
-      ) : success ? (
-        <>
-          <AuthHeading title="Administrator created">
-            The first account now exists and holds full administrative access. Redirecting you to sign in; invite everyone else from there.
-          </AuthHeading>
-        </>
-      ) : (
-        <>
-          <AuthHeading title="Create the first administrator">
-            This instance has no accounts yet. This account gets full administrative access; every other user is invited from it afterwards.
-          </AuthHeading>
 
-          {error && <AuthError>{error}</AuthError>}
+        {/* Error Alert */}
+        {error && (
+          <Alert className="mb-6 bg-red-500/10 border-red-500/20">
+            <CircleAlert className="h-4 w-4 text-red-500" />
+            <AlertDescription className="text-red-200">
+              {error}
+            </AlertDescription>
+          </Alert>
+        )}
 
-          <form onSubmit={handleSubmit} noValidate>
-            <Field
-              id="name"
-              ref={nameInput}
-              label="Name"
-              type="text"
-              placeholder="Admin User"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              disabled={isSubmitting}
-              autoComplete="name"
-              autoFocus
-            />
-            <Field
-              id="email"
-              label="Email"
-              type="email"
-              placeholder="admin@example.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              disabled={isSubmitting}
-              // The email is the sign-in identifier: `username` lets a password
-              // manager pair it with the `new-password` below (NAN-3146).
-              autoComplete="username"
-              autoCapitalize="off"
-              spellCheck={false}
-            />
-            <Field
-              id="password"
-              label="Password"
-              password
-              placeholder="••••••••••••"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              disabled={isSubmitting}
-              autoComplete="new-password"
-              autoCapitalize="off"
-              spellCheck={false}
-              minLength={PASSWORD_MIN_BYTES}
-              maxLength={PASSWORD_MAX_BYTES}
-              aria-invalid={passwordInvalid}
-              aria-describedby="setup-password-policy"
-            />
-            <PolicyChecklist id="setup-password-policy" checks={checks} />
-            <Field
-              id="confirmPassword"
-              label="Confirm password"
-              password
-              placeholder="••••••••••••"
-              value={confirmPassword}
-              onChange={(e) => setConfirmPassword(e.target.value)}
-              disabled={isSubmitting}
-              autoComplete="new-password"
-              autoCapitalize="off"
-              spellCheck={false}
-              aria-invalid={confirmMismatch}
-              tone={confirmMismatch ? 'bad' : confirmMatches ? 'good' : 'neutral'}
-              note={confirmMismatch ? "passwords don't match" : undefined}
-              noteTone="bad"
-            />
-            <PrimaryButton type="submit" busy={isSubmitting} disabled={!ready}>
-              Create administrator account →
-            </PrimaryButton>
+        {/* Setup Card */}
+        <div className="bg-card rounded-2xl border border-border p-8">
+          <form onSubmit={handleSubmit} className="space-y-6">
+            {/* Name Field */}
+            <div className="space-y-2">
+              <Label htmlFor="name" className="text-foreground">
+                Full Name
+              </Label>
+              <div className="relative">
+                <User className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
+                <Input
+                  id="name"
+                  type="text"
+                  placeholder="Admin User"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  className="pl-10 bg-background border-border text-foreground placeholder:text-muted-foreground focus:border-blue-500"
+                  disabled={isSubmitting}
+                  autoComplete="name"
+                  autoFocus
+                />
+              </div>
+            </div>
+
+            {/* Email Field */}
+            <div className="space-y-2">
+              <Label htmlFor="email" className="text-foreground">
+                Email Address
+              </Label>
+              <div className="relative">
+                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
+                <Input
+                  id="email"
+                  type="email"
+                  placeholder="admin@example.com"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className="pl-10 bg-background border-border text-foreground placeholder:text-muted-foreground focus:border-blue-500"
+                  disabled={isSubmitting}
+                  autoComplete="email"
+                />
+              </div>
+            </div>
+
+            {/* Password Field */}
+            <div className="space-y-2">
+              <Label htmlFor="password" className="text-foreground">
+                Password
+              </Label>
+              <div className="relative">
+                <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
+                <Input
+                  id="password"
+                  type="password"
+                  placeholder="••••••••••••"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="pl-10 bg-background border-border text-foreground placeholder:text-muted-foreground focus:border-blue-500"
+                  disabled={isSubmitting}
+                  autoComplete="new-password"
+                  minLength={PASSWORD_MIN_BYTES}
+                  maxLength={PASSWORD_MAX_BYTES}
+                />
+              </div>
+              {/* Password Requirements */}
+              {password.length > 0 && passwordErrors.length > 0 && (
+                <div className="mt-2 space-y-1">
+                  <p className="text-xs text-muted-foreground">Password requirements:</p>
+                  {passwordErrors.map((err, i) => (
+                    <p key={i} className="text-xs text-red-400 flex items-center gap-1">
+                      <span className="w-1 h-1 bg-red-400 rounded-full" />
+                      {err}
+                    </p>
+                  ))}
+                </div>
+              )}
+              {password.length > 0 && passwordErrors.length === 0 && (
+                <p className="text-xs text-green-400 flex items-center gap-1 mt-2">
+                  <CircleCheck className="w-3 h-3" />
+                  Password meets all requirements
+                </p>
+              )}
+            </div>
+
+            {/* Confirm Password Field */}
+            <div className="space-y-2">
+              <Label htmlFor="confirmPassword" className="text-foreground">
+                Confirm Password
+              </Label>
+              <div className="relative">
+                <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
+                <Input
+                  id="confirmPassword"
+                  type="password"
+                  placeholder="••••••••••••"
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  className="pl-10 bg-background border-border text-foreground placeholder:text-muted-foreground focus:border-blue-500"
+                  disabled={isSubmitting}
+                  autoComplete="new-password"
+                />
+              </div>
+              {confirmPassword.length > 0 && password !== confirmPassword && (
+                <p className="text-xs text-red-400 flex items-center gap-1 mt-1">
+                  <span className="w-1 h-1 bg-red-400 rounded-full" />
+                  Passwords do not match
+                </p>
+              )}
+              {confirmPassword.length > 0 && password === confirmPassword && password.length > 0 && (
+                <p className="text-xs text-green-400 flex items-center gap-1 mt-1">
+                  <CircleCheck className="w-3 h-3" />
+                  Passwords match
+                </p>
+              )}
+            </div>
+
+            <Button
+              type="submit"
+              className="w-full bg-primary hover:bg-primary/90 text-foreground"
+              disabled={isSubmitting || passwordErrors.length > 0 || password !== confirmPassword}
+            >
+              {isSubmitting ? (
+                <>
+                  <LoadingIcon className="w-4 h-4" />
+                  Creating Account...
+                </>
+              ) : (
+                <>
+                  Create Admin Account
+                  <ChevronRight className="w-4 h-4 ml-2" />
+                </>
+              )}
+            </Button>
           </form>
-          <AuthFootnote>Created once, on first run. You&apos;ll sign in with these credentials next.</AuthFootnote>
-        </>
-      )}
-    </AuthShell>
+        </div>
+
+        {/* Footer */}
+        <p className="text-center text-muted-foreground text-sm mt-6">
+          This account will have full administrative access to nano
+        </p>
+      </div>
+    </div>
   );
 }

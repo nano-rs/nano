@@ -1,0 +1,9 @@
+# Pinned Rust toolchain (rustup honors this file for every cargo/rustc call in
+# the repo). vrl 0.38 needs rustc >= 1.95, and an older compiler fails deep in
+# the dependency build. A non-rustup cargo (e.g. Homebrew `rust`) ignores this
+# file: keep the rustup proxies first on PATH (~/.cargo/bin, or
+# $(brew --prefix rustup)/bin for Homebrew's keg-only rustup).
+[toolchain]
+channel = "1.95"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

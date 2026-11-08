@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { authenticatedFetch } from '../authenticated-fetch';
 import type {
   LookupTable,
   LookupUsage,
@@ -18,12 +19,11 @@ import type {
   JobExecution,
 } from './types';
 import { getServiceUrl } from './utils';
-import { requestCredentials } from '@/lib/request-credentials';
 
 export class LookupTablesApi {
   constructor(
     private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>,
-    private getAccessToken?: () => string | null
+    _getAccessToken?: () => string | null
   ) {}
 
   async listLookupTables(): Promise<LookupTable[]> {
@@ -45,19 +45,8 @@ export class LookupTablesApi {
     const serviceUrl = getServiceUrl(endpoint);
     const url = `${serviceUrl}${endpoint}`;
 
-    const headers: HeadersInit = {};
-    // Add Authorization header if we have a token
-    if (this.getAccessToken) {
-      const token = this.getAccessToken();
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
-      }
-    }
-
-    const response = await fetch(url, {
+    const response = await authenticatedFetch(endpoint, url, {
       method: 'POST',
-      headers,
-      credentials: requestCredentials(endpoint, headers),
       body: formData,
     });
 

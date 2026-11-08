@@ -3,7 +3,6 @@
 //! Source Configuration service for business logic
 
 use sqlx::PgPool;
-use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -11,8 +10,9 @@ use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use super::creds_backend::{CredsBackend, CredsBackendError};
+use super::{azure_event_hubs, point_forward};
 use super::repository::{
-    RouteClaim, SourceConfigIdentity, SourceConfigRepository, SourceConfigRepositoryError,
+    SourceConfigIdentity, SourceConfigRepository, SourceConfigRepositoryError,
 };
 use super::types::{
     DeploymentResult, ListParams, NewRoutingRule, NewSourceConfiguration, RoutingRule,
@@ -21,12 +21,9 @@ use super::types::{
 };
 use crate::auth::CredentialUseGrant;
 use crate::log_telemetry::repository::is_safe_source_type;
-use crate::parsers::tenant_bundle::pull::{
-    PullEnvelope, AZURE_CHECKPOINT_INTERVAL_SECS, AZURE_START_POSITION,
-};
 use crate::parsers::{
-    apply_hec_route_fallback, base_router_inputs, hec_normalize_present, redact_config_snapshot,
-    CredentialRepository, HEC_ROUTE,
+    ReloadWatch,
+    redact_config_snapshot, CredentialRepository,
 };
 
 /// SQS poll interval emitted when a source config does not override it.
@@ -55,6 +52,7 @@ pub(crate) const MAX_CLIENT_CONCURRENCY: u32 = 1_024;
 /// Anything above this is rejected by AWS, so reject it here where the error
 /// can name the field rather than surfacing as a Vector runtime failure.
 pub(crate) const MAX_SQS_VISIBILITY_SECS: u32 = 43_200;
+
 
 /// Build an `sts:AssumeRole` session name from a nano source name (NAN-2194).
 ///
@@ -102,64 +100,73 @@ pub(crate) fn normalize_pubsub_subscription(raw: &str) -> &str {
         .trim_matches('/')
 }
 
-/// NAN-3764: the consumer group an Event Hubs source reads with when none is
-/// given (the hosted default too).
-pub(crate) const AZURE_DEFAULT_CONSUMER_GROUP: &str = "$Default";
-
-/// DNS suffix of a public-cloud Event Hubs namespace.
-const AZURE_EVENT_HUBS_SUFFIX: &str = "servicebus.windows.net";
-
-/// Event Hub / consumer-group name grammar (the hosted validator's): letters,
-/// digits, `.`, `_`, `-`; alphanumeric first and last; at most `max` bytes.
-fn azure_entity_name(value: &str, max: usize) -> bool {
-    let b = value.as_bytes();
-    !b.is_empty()
-        && b.len() <= max
-        && b[0].is_ascii_alphanumeric()
-        && b[b.len() - 1].is_ascii_alphanumeric()
-        && b.iter()
-            .all(|&c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-')
+/// NAN-4914: what a credential rotation did to one bound source config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialRefreshOutcome {
+    /// Redeployed with the new secret (nothing else changed).
+    Redeployed,
+    /// The saved config has undeployed edits; it keeps running with the
+    /// previous secret until someone with deploy authority deploys it.
+    PendingEdits,
+    /// No successful deployment snapshot to compare with; not redeployed.
+    NoDeployedSnapshot,
+    Failed(String),
 }
 
-/// Blob container name: 3-63 lowercase letters, digits or single hyphens,
-/// letter/digit first and last.
-fn azure_blob_container_name(container: &str) -> bool {
-    let b = container.as_bytes();
-    let alnum = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
-    (3..=63).contains(&b.len())
-        && alnum(b[0])
-        && alnum(b[b.len() - 1])
-        && b.iter().all(|&c| alnum(c) || c == b'-')
-        && !container.contains("--")
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialRefresh {
+    pub source_configuration_id: Uuid,
+    pub name: String,
+    pub outcome: CredentialRefreshOutcome,
 }
 
-/// The namespace host Vector connects to. A bare namespace name (`acme-logs`)
-/// becomes `acme-logs.servicebus.windows.net` like the hosted renderer derives
-/// it; a full host (sovereign clouds, private DNS) is kept. `sb://` and a
-/// trailing `/` are tolerated because the Azure portal shows them. `None` for
-/// anything that is not a DNS name.
-fn azure_namespace_host(raw: &str) -> Option<String> {
-    let host = raw
-        .trim()
-        .trim_start_matches("sb://")
-        .trim_end_matches('/')
-        .to_ascii_lowercase();
-    let label_ok = |l: &str| {
-        !l.is_empty()
-            && l.len() <= 63
-            && !l.starts_with('-')
-            && !l.ends_with('-')
-            && l.bytes()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
-    };
-    if host.is_empty() || host.len() > 253 || !host.split('.').all(label_ok) {
-        return None;
+enum SecretOnly {
+    Yes,
+    PendingEdits,
+    NoSnapshot,
+}
+
+/// A rendered (redacted) config with everything a credential contributes
+/// masked and comment lines dropped, so two renders compare equal exactly
+/// when they differ only in credential material.
+pub(crate) fn normalize_for_secret_compare(redacted: &str, credential: Option<&serde_json::Value>) -> String {
+    fn strings(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) if s.trim().len() >= 4 => {
+                out.push(s.clone());
+                out.push(s.trim().to_string());
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| strings(x, out)),
+            serde_json::Value::Object(m) => m.values().for_each(|x| strings(x, out)),
+            _ => {}
+        }
     }
-    if host.contains('.') {
-        Some(host)
-    } else {
-        Some(format!("{host}.{AZURE_EVENT_HUBS_SUFFIX}"))
+    let mut values = Vec::new();
+    if let Some(c) = credential {
+        strings(c, &mut values);
     }
+    // Longest first so a value containing another is masked whole; both the
+    // raw and the TOML-escaped spelling (PEM newlines, quotes).
+    let mut needles: Vec<String> = values
+        .iter()
+        .flat_map(|v| {
+            let escaped = toml::Value::String(v.clone()).to_string();
+            let escaped = escaped.trim_matches('"').to_string();
+            [v.clone(), escaped]
+        })
+        .filter(|n| !n.is_empty())
+        .collect();
+    needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    needles.dedup();
+    let mut text: String = redacted
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for n in &needles {
+        text = text.replace(n.as_str(), "<credential>");
+    }
+    text
 }
 
 #[derive(Error, Debug)]
@@ -238,11 +245,16 @@ impl SourceConfigService {
     /// mutable Secret volume can lag the object-store completion marker and
     /// make Vector reload new TOML with an old credential. The normal live
     /// deployment constructor keeps its auto-detected backend.
-    pub fn with_publication_vector_config_dir(pool: PgPool, config_dir: impl AsRef<Path>) -> Self {
+    pub fn with_publication_vector_config_dir(
+        pool: PgPool,
+        config_dir: impl AsRef<Path>,
+    ) -> Self {
         let config_dir = config_dir.as_ref().to_path_buf();
         let runtime_path = Self::resolve_runtime_path();
-        let creds_backend =
-            Self::publication_creds_backend(config_dir.clone(), runtime_path.clone());
+        let creds_backend = Self::publication_creds_backend(
+            config_dir.clone(),
+            runtime_path.clone(),
+        );
         Self {
             repository: SourceConfigRepository::new(pool.clone()),
             credential_repo: CredentialRepository::new(pool),
@@ -311,18 +323,38 @@ impl SourceConfigService {
         &self,
         params: Option<ListParams>,
     ) -> Result<Vec<SourceConfiguration>, SourceConfigServiceError> {
-        Ok(self
+        let mut configs: Vec<SourceConfiguration> = self
             .repository
             .list(params)
             .await?
             .into_iter()
             .map(SourceConfiguration::redacted)
-            .collect())
+            .collect();
+        let ids: Vec<Uuid> = configs.iter().map(|c| c.id).collect();
+        let mut statuses = self.repository.latest_deployment_status(&ids).await?;
+        for config in &mut configs {
+            config.last_deployment = statuses.remove(&config.id);
+            if let Some(startup) = self
+                .startup_quarantine_status(config, config.last_deployment.as_ref())
+                .await
+            {
+                config.last_deployment = Some(startup);
+            }
+        }
+        Ok(configs)
     }
 
     /// Get a source configuration by ID, with `connection_config` secrets masked.
     pub async fn get(&self, id: Uuid) -> Result<SourceConfiguration, SourceConfigServiceError> {
-        Ok(self.repository.get(id).await?.redacted())
+        let mut config = self.repository.get(id).await?.redacted();
+        config.last_deployment = self.repository.latest_deployment_status(&[id]).await?.remove(&id);
+        if let Some(startup) = self
+            .startup_quarantine_status(&config, config.last_deployment.as_ref())
+            .await
+        {
+            config.last_deployment = Some(startup);
+        }
+        Ok(config)
     }
 
     /// Get a source configuration with its routing rules, with
@@ -331,7 +363,16 @@ impl SourceConfigService {
         &self,
         id: Uuid,
     ) -> Result<SourceConfigurationWithRules, SourceConfigServiceError> {
-        Ok(self.repository.get_with_rules(id).await?.redacted())
+        let mut config = self.repository.get_with_rules(id).await?.redacted();
+        config.config.last_deployment =
+            self.repository.latest_deployment_status(&[id]).await?.remove(&id);
+        if let Some(startup) = self
+            .startup_quarantine_status(&config.config, config.config.last_deployment.as_ref())
+            .await
+        {
+            config.config.last_deployment = Some(startup);
+        }
+        Ok(config)
     }
 
     /// Create a new source configuration
@@ -372,7 +413,14 @@ impl SourceConfigService {
         // reject scalars carrying control chars / newlines that could close
         // a TOML or VRL string if a future generator change reintroduces
         // unescaped interpolation.
-        Self::validate_connection_config(&request.config_type, &request.connection_config)?;
+        // NAN-4937: the UI creates every pull source unconfigured (`{}`) and
+        // configures it on the next page, as aws_* / gcp_pubsub already allow.
+        // An EMPTY Event Hubs config is accepted at CREATE only ("not
+        // configured yet"); update validates the merged config in full, and
+        // deploy still requires the hub.
+        if !(request.config_type == "azure_event_hubs" && Self::is_unconfigured(&request.connection_config)) {
+            Self::validate_connection_config(&request.config_type, &request.connection_config)?;
+        }
 
         // NAN-1919: a caller-supplied default_source_type is interpolated into
         // the generated routing VRL — validate it before persistence.
@@ -459,12 +507,10 @@ impl SourceConfigService {
         let generated = Self::config_safe_stem(config_type, name);
         let holder = crate::vector_naming::find_identity_holder(
             &generated,
-            existing.iter().filter(|c| Some(c.id) != exclude).map(|c| {
-                (
-                    Self::config_safe_stem(&c.config_type, &c.name),
-                    c.name.clone(),
-                )
-            }),
+            existing
+                .iter()
+                .filter(|c| Some(c.id) != exclude)
+                .map(|c| (Self::config_safe_stem(&c.config_type, &c.name), c.name.clone())),
         )?;
         Some(SourceConfigServiceError::InvalidConfig(
             crate::vector_naming::describe_identity_conflict(
@@ -600,18 +646,18 @@ impl SourceConfigService {
         // stem is pinned, so old_path == new_path and this is a no-op.
         // For Kafka / S3 / GCP / HTTP / Vector configs the stem follows
         // safe_name(name) and the path changes on rename.
-        let pre_update_snapshot: Option<(String, String, PathBuf, bool)> = if request.name.is_some()
-        {
-            let old_path = self.get_config_file_path(&existing.config_type, &existing.name);
-            Some((
-                existing.config_type,
-                existing.name,
-                old_path,
-                existing.deployed,
-            ))
-        } else {
-            None
-        };
+        let pre_update_snapshot: Option<(String, String, PathBuf, bool)> =
+            if request.name.is_some() {
+                let old_path = self.get_config_file_path(&existing.config_type, &existing.name);
+                Some((
+                    existing.config_type,
+                    existing.name,
+                    old_path,
+                    existing.deployed,
+                ))
+            } else {
+                None
+            };
 
         let updated = match self
             .repository
@@ -725,13 +771,26 @@ impl SourceConfigService {
             "aws_s3" => Self::validate_aws_s3_conn(conn)?,
             "aws_sqs" => Self::validate_aws_sqs_conn(conn)?,
             "gcp_pubsub" => Self::validate_gcp_pubsub_conn(conn)?,
-            "azure_event_hubs" => Self::validate_azure_event_hubs_conn(conn)?,
+            "azure_event_hubs" => azure_event_hubs::validate_conn(conn)?,
             "splunk_hec" => Self::validate_splunk_hec_conn(conn)?,
             _ => {}
         }
+        if point_forward::applies_to(config_type) {
+            point_forward::validate_conn(config_type, conn)?;
+        }
+
+        // NAN-4936: no Vector environment-interpolation syntax in tenant values
+        // (the live Vector expands `${...}` against its secret environment).
+        super::isolation::reject_env_interpolation(conn, "connection_config")
+            .map_err(SourceConfigServiceError::InvalidConfig)?;
 
         // Universal char-safety pass over every string scalar in the payload.
         Self::validate_safe_strings(conn, "connection_config")
+    }
+
+    /// `null` or `{}`: a source created before its connection is configured.
+    pub(crate) fn is_unconfigured(conn: &serde_json::Value) -> bool {
+        conn.is_null() || conn.as_object().is_some_and(|o| o.is_empty())
     }
 
     fn validate_kafka_conn(conn: &serde_json::Value) -> Result<(), SourceConfigServiceError> {
@@ -767,6 +826,8 @@ impl SourceConfigService {
         // in the deployed config says otherwise.
         Self::expect_bounded_int_if_present(conn, "poll_secs", MAX_POLL_SECS)?;
         Self::expect_bounded_int_if_present(conn, "client_concurrency", MAX_CLIENT_CONCURRENCY)?;
+        // NAN-4936: bounded by SQS's own 12-hour maximum.
+        Self::expect_bounded_int_if_present(conn, "visibility_timeout_secs", MAX_SQS_VISIBILITY_SECS)?;
         Ok(())
     }
 
@@ -790,9 +851,7 @@ impl SourceConfigService {
         if ok {
             return Ok(());
         }
-        Err(SourceConfigServiceError::InvalidConfig(format!(
-            "aws_s3 connection_config.{key} must be an integer between 1 and {max}"
-        )))
+        Err(SourceConfigServiceError::InvalidConfig(format!("aws_s3 connection_config.{key} must be an integer between 1 and {max}")))
     }
 
     fn validate_aws_sqs_conn(conn: &serde_json::Value) -> Result<(), SourceConfigServiceError> {
@@ -804,11 +863,7 @@ impl SourceConfigService {
         // Vector's visibility timeout must exceed the time it takes to process
         // a batch, or SQS redelivers messages that are still in flight and the
         // pipeline duplicates them. Bounded by SQS's own 12-hour maximum.
-        Self::expect_bounded_int_if_present(
-            conn,
-            "visibility_timeout_secs",
-            MAX_SQS_VISIBILITY_SECS,
-        )?;
+        Self::expect_bounded_int_if_present(conn, "visibility_timeout_secs", MAX_SQS_VISIBILITY_SECS)?;
         Ok(())
     }
 
@@ -821,99 +876,6 @@ impl SourceConfigService {
                     "gcp_pubsub connection_config.ack_deadline_secs must be a non-negative integer"
                         .to_string(),
                 ));
-            }
-        }
-        Ok(())
-    }
-
-    /// NAN-3764: Event Hubs coordinates. Secrets (SAS / storage connection
-    /// strings, the Entra client secret) never live here: they are in the
-    /// sealed `azure_event_hubs` credential. Point-forward only, so a
-    /// `start_position` other than `latest` is refused rather than ignored —
-    /// there is deliberately no backfill option.
-    fn validate_azure_event_hubs_conn(
-        conn: &serde_json::Value,
-    ) -> Result<(), SourceConfigServiceError> {
-        let invalid = |msg: String| SourceConfigServiceError::InvalidConfig(msg);
-        for key in [
-            "namespace",
-            "event_hub_name",
-            "consumer_group",
-            "checkpoint_account",
-            "checkpoint_container",
-            "start_position",
-        ] {
-            Self::expect_string_if_present(conn, key)?;
-        }
-        let field = |key: &str| {
-            conn.get(key)
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-        };
-
-        let hub = field("event_hub_name").ok_or_else(|| {
-            invalid("azure_event_hubs connection_config.event_hub_name is required".into())
-        })?;
-        if !azure_entity_name(hub, 256) {
-            return Err(invalid(
-                "azure_event_hubs connection_config.event_hub_name must be 1-256 letters, digits, \
-                 '.', '_' or '-', starting and ending with a letter or digit"
-                    .into(),
-            ));
-        }
-        if let Some(group) = field("consumer_group") {
-            if group != AZURE_DEFAULT_CONSUMER_GROUP && !azure_entity_name(group, 50) {
-                return Err(invalid(
-                    "azure_event_hubs connection_config.consumer_group must be $Default or 1-50 \
-                     letters, digits, '.', '_' or '-'"
-                        .into(),
-                ));
-            }
-        }
-        if let Some(namespace) = field("namespace") {
-            if azure_namespace_host(namespace).is_none() {
-                return Err(invalid(
-                    "azure_event_hubs connection_config.namespace must be a namespace name \
-                     (e.g. acme-logs) or its host (acme-logs.servicebus.windows.net)"
-                        .into(),
-                ));
-            }
-        }
-        if let Some(account) = field("checkpoint_account") {
-            let ok = (3..=24).contains(&account.len())
-                && account
-                    .bytes()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-            if !ok {
-                return Err(invalid(
-                    "azure_event_hubs connection_config.checkpoint_account must be 3-24 \
-                     lowercase letters or digits"
-                        .into(),
-                ));
-            }
-        }
-        let container = field("checkpoint_container").ok_or_else(|| {
-            invalid(
-                "azure_event_hubs connection_config.checkpoint_container is required: \
-                 checkpoints are what let a restart resume without loss or duplicates"
-                    .into(),
-            )
-        })?;
-        if !azure_blob_container_name(container) {
-            return Err(invalid(
-                "azure_event_hubs connection_config.checkpoint_container must be 3-63 lowercase \
-                 letters, digits or single hyphens, starting and ending with a letter or digit"
-                    .into(),
-            ));
-        }
-        if let Some(start) = field("start_position") {
-            if start != AZURE_START_POSITION {
-                return Err(invalid(format!(
-                    "azure_event_hubs connection_config.start_position must be \
-                     \"{AZURE_START_POSITION}\": pull sources start at the newest events and \
-                     have no backfill option"
-                )));
             }
         }
         Ok(())
@@ -941,9 +903,7 @@ impl SourceConfigService {
         conn: &serde_json::Value,
         key: &str,
     ) -> Result<(), SourceConfigServiceError> {
-        let Some(v) = conn.get(key) else {
-            return Ok(());
-        };
+        let Some(v) = conn.get(key) else { return Ok(()) };
         let is_empty = match v {
             serde_json::Value::Null => true,
             serde_json::Value::String(s) => s.is_empty(),
@@ -1023,11 +983,7 @@ impl SourceConfigService {
         id: Uuid,
         enabled: bool,
     ) -> Result<SourceConfiguration, SourceConfigServiceError> {
-        Ok(self
-            .repository
-            .toggle_enabled(id, enabled)
-            .await?
-            .redacted())
+        Ok(self.repository.toggle_enabled(id, enabled).await?.redacted())
     }
 
     // ========================================================================
@@ -1121,10 +1077,7 @@ impl SourceConfigService {
         // of those fields (otherwise the existing rule is already valid).
         if request.match_type.is_some() || request.match_field.is_some() {
             let existing = self.repository.get_rule(rule_id).await?;
-            let parent = self
-                .repository
-                .get(existing.source_configuration_id)
-                .await?;
+            let parent = self.repository.get(existing.source_configuration_id).await?;
             let effective_field = request
                 .match_field
                 .as_deref()
@@ -1208,7 +1161,9 @@ impl SourceConfigService {
     /// could break the generated VRL. `None` / whitespace-only is allowed
     /// (falls back to "unknown" as before); validation runs on the trimmed
     /// value to mirror what the generator emits.
-    fn validate_default_source_type(value: Option<&str>) -> Result<(), SourceConfigServiceError> {
+    fn validate_default_source_type(
+        value: Option<&str>,
+    ) -> Result<(), SourceConfigServiceError> {
         let Some(value) = value else {
             return Ok(());
         };
@@ -1256,6 +1211,13 @@ impl SourceConfigService {
                     "match_value contains disallowed control character (U+{code:04X})",
                     code = c as u32,
                 )));
+            }
+            if super::isolation::contains_env_interpolation(value) {
+                return Err(SourceConfigServiceError::InvalidConfig(
+                    "match_value must not contain environment-variable syntax (`${...}` or \
+                     `$NAME`); Vector would expand it against its own environment"
+                        .to_string(),
+                ));
             }
             if match_type == "regex" && value.contains('\'') {
                 return Err(SourceConfigServiceError::InvalidConfig(
@@ -1502,12 +1464,38 @@ impl SourceConfigService {
         !has_default && !has_coalesced && !has_config_default
     }
 
-    /// Deploy a source configuration to Vector
+    /// Deploy a source configuration to Vector and report whether Vector
+    /// actually activated it (NAN-4936).
     pub async fn deploy(
         &self,
         id: Uuid,
         credential_use: CredentialUseGrant,
     ) -> Result<DeploymentResult, SourceConfigServiceError> {
+        self.deploy_with(id, credential_use, true).await
+    }
+
+    /// `confirm_activation = false` skips the per-source wait on Vector's
+    /// reload acknowledgement. Only the boot-time `deploy_all` passes it: it
+    /// renders every source back-to-back (often before Vector is up), and a
+    /// 10-45s wait per source would stall API startup. Isolation and
+    /// quarantine still apply.
+    async fn deploy_with(
+        &self,
+        id: Uuid,
+        credential_use: CredentialUseGrant,
+        confirm_activation: bool,
+    ) -> Result<DeploymentResult, SourceConfigServiceError> {
+        // NAN-4936 (codex P1): one critical section from the isolation check to
+        // Vector's acknowledgement, shared with parser deploys. Without it a
+        // concurrent deploy's reload could acknowledge this one, or interleave
+        // its writes with ours. The lock is not reentrant: everything below
+        // uses the `_locked` router helper.
+        let _deploy_guard = self.lock_deploys().await;
+
+        // NAN-4937 (codex P1): the snapshot this deploy renders. `deployed_at`
+        // advances only after Vector activates it, and only if neither the
+        // row nor its rules changed after this point (`stamp_deployed`).
+        let rendered_at = self.repository.db_now().await?;
         let config_with_rules = self.repository.get_with_rules(id).await?;
         let config = &config_with_rules.config;
 
@@ -1522,8 +1510,10 @@ impl SourceConfigService {
         // intermediary (source_type_extract or hec_normalize).
         if let Some(intermediary_source) = Self::system_intermediary_source(&config.config_type) {
             let has_meaningful_rules = Self::has_meaningful_routing_rules(&config_with_rules);
-            let vector_config =
-                Self::render_system_source_config(&config_with_rules, intermediary_source);
+            let vector_config = Self::render_system_source_config(
+                &config_with_rules,
+                intermediary_source,
+            );
             if let Some(config_content) = &vector_config {
                 // NAN-689 acceptance criterion #3: validate before
                 // mark_deployed / router-update / file write. Failure path
@@ -1557,20 +1547,49 @@ impl SourceConfigService {
                     );
                     return Err(e);
                 }
+            }
 
+            let watch = if confirm_activation {
+                Some(ReloadWatch::begin(&self.vector_config_dir).await)
+            } else {
+                None
+            };
+
+            if let Some(config_content) = &vector_config {
                 // Write config file so Vector picks up the routing transform
                 let config_file = self.get_config_file_path(&config.config_type, &config.name);
                 let configs_dir = config_file.parent().unwrap();
                 tokio::fs::create_dir_all(configs_dir).await?;
                 tokio::fs::write(&config_file, config_content).await?;
+            } else if config.config_type == "splunk_hec" {
+                // NAN-4902: `splunk_hec_route` is permanent (HEC parsers read
+                // it). With only default rules there is nothing to route, so
+                // replace any previous rules file with the passthrough rather
+                // than leaving stale rules or no route at all.
+                self.write_hec_passthrough_route().await?;
             }
 
-            if !config.deployed {
-                self.repository.mark_deployed(id).await?;
-            }
+            let rendered = self.flag_deployed(config).await?;
 
             // Update dynamic router — include this config's route transform in inputs
-            self.update_dynamic_router().await?;
+            self.update_dynamic_router_locked().await?;
+
+            if let Some(watch) = watch {
+                // A system listener's routing file is nano-rendered and VRL-checked;
+                // a refusal is reported, never quarantined (`vector_built: true`).
+                if let Some(result) = self
+                    .settle_activation(
+                        &config_with_rules,
+                        watch,
+                        vector_config.as_deref().unwrap_or_default(),
+                        true,
+                    )
+                    .await?
+                {
+                    return Ok(result);
+                }
+                self.stamp_activated(id, rendered, rendered_at).await?;
+            }
 
             let snapshot = vector_config.as_deref().map(redact_config_snapshot);
             let deployment = self
@@ -1606,6 +1625,17 @@ impl SourceConfigService {
                 deployment_id: Some(deployment.id),
             });
         }
+
+        // NAN-4936: a pull source must build ON ITS OWN before it may touch
+        // the live topology. One that does not is quarantined (kept out,
+        // recorded with Vector's reason) and the rest of the config stays live.
+        // Before the live render, which overwrites the credential file in place.
+        let vector_built = match self.isolate_pull_source(&config_with_rules).await? {
+            activation::Isolation::Broken(reason) => {
+                return self.quarantine(&config_with_rules, &reason, None).await;
+            }
+            activation::Isolation::Clean { vector_built } => vector_built,
+        };
 
         // Generate Vector config
         let vector_config = self.generate_vector_config(&config_with_rules).await?;
@@ -1648,19 +1678,37 @@ impl SourceConfigService {
             return Err(e);
         }
 
+        // NAN-4936: baseline Vector's reload counters BEFORE the first write;
+        // a `--watch-config` Vector reloads on its own.
+        let watch = if confirm_activation {
+            Some(ReloadWatch::begin(&self.vector_config_dir).await)
+        } else {
+            None
+        };
+
         // Write config file
         let config_file = self.get_config_file_path(&config.config_type, &config.name);
         let configs_dir = config_file.parent().unwrap();
         tokio::fs::create_dir_all(configs_dir).await?;
         tokio::fs::write(&config_file, &vector_config).await?;
+        self.clear_startup_quarantine(config).await;
 
-        // Mark as deployed BEFORE updating router, so the router query includes this config
-        if !config.deployed {
-            self.repository.mark_deployed(id).await?;
-        }
+        // `deployed = true` BEFORE updating the router, so the router query
+        // includes this config; `deployed_at` waits for activation.
+        let rendered = self.flag_deployed(config).await?;
 
         // Update dynamic router to include this source
-        self.update_dynamic_router().await?;
+        self.update_dynamic_router_locked().await?;
+
+        if let Some(watch) = watch {
+            if let Some(result) = self
+                .settle_activation(&config_with_rules, watch, &vector_config, vector_built)
+                .await?
+            {
+                return Ok(result);
+            }
+            self.stamp_activated(id, rendered, rendered_at).await?;
+        }
 
         // Record deployment — snapshot the redacted view so deployment history
         // never leaks SASL passwords / AWS secret keys / HEC tokens to users
@@ -1713,40 +1761,41 @@ impl SourceConfigService {
 
     /// Undeploy a source configuration from Vector
     pub async fn undeploy(&self, id: Uuid) -> Result<DeploymentResult, SourceConfigServiceError> {
+        // NAN-4936: one critical section from the first removal to Vector's
+        // acknowledgement (see `deploy_with`).
+        let _deploy_guard = self.lock_deploys().await;
         let config = self.repository.get(id).await?;
+        let watch = ReloadWatch::begin(&self.vector_config_dir).await;
 
         // System-level sources (http, vector, splunk_hec) — remove the
         // routing config file if it was deployed; the OOTB source itself
         // keeps running. See `system_intermediary_source` for rationale.
         if Self::system_intermediary_source(&config.config_type).is_some() {
-            let config_file = self.get_config_file_path(&config.config_type, &config.name);
-            if config_file.exists() {
-                tokio::fs::remove_file(&config_file).await?;
+            if config.config_type == "splunk_hec" {
+                // NAN-4902: never delete `splunk_hec_route` — deployed HEC
+                // parsers read it, and a missing route makes a cold-started
+                // Vector reject the whole config. Undeploying drops the routing
+                // rules: the passthrough keeps `.source_type` as is, exactly
+                // like `hec_normalize` feeding `source_router` directly.
+                self.write_hec_passthrough_route().await?;
+            } else {
+                let config_file = self.get_config_file_path(&config.config_type, &config.name);
+                if config_file.exists() {
+                    tokio::fs::remove_file(&config_file).await?;
+                }
             }
             self.repository.mark_undeployed(id).await?;
 
             // Update dynamic router (system-level types are filtered out, but ensures
             // other deployed configs have correct inputs)
-            self.update_dynamic_router().await?;
-
-            let deployment = self
-                .repository
-                .add_deployment(id, "undeploy", "success", None, None)
-                .await?;
+            self.update_dynamic_router_locked().await?;
 
             tracing::info!(
                 "Undeployed {} source configuration '{}' (system-level)",
                 config.config_type,
                 config.name
             );
-
-            return Ok(DeploymentResult {
-                success: true,
-                source_configuration_id: id,
-                action: "undeploy".to_string(),
-                message: format!("Undeployed '{}' successfully", config.name),
-                deployment_id: Some(deployment.id),
-            });
+            return self.finish_removal(id, &config.name, watch).await;
         }
 
         // Remove config file
@@ -1791,30 +1840,44 @@ impl SourceConfigService {
         // Mark as undeployed BEFORE updating router, so the router query excludes this config
         self.repository.mark_undeployed(id).await?;
 
-        // Update dynamic router to remove this source's route
-        self.update_dynamic_router().await?;
+        self.clear_startup_quarantine(&config).await;
 
-        // Record deployment
-        let deployment = self
-            .repository
-            .add_deployment(id, "undeploy", "success", None, None)
-            .await?;
+        // Update dynamic router to remove this source's route
+        self.update_dynamic_router_locked().await?;
 
         tracing::info!("Undeployed source configuration '{}'", config.name);
-
-        Ok(DeploymentResult {
-            success: true,
-            source_configuration_id: id,
-            action: "undeploy".to_string(),
-            message: format!("Undeployed '{}' successfully", config.name),
-            deployment_id: Some(deployment.id),
-        })
+        // NAN-4936 (codex P1): success only once Vector has loaded a topology
+        // without this source; otherwise an explicit unconfirmed result.
+        self.finish_removal(id, &config.name, watch).await
     }
 
     /// Deploy all enabled source configurations
+    /// `POST /api/source-configurations/deploy-all`: deploys every enabled
+    /// config and reports, per source, whether Vector actually activated it
+    /// (NAN-4936, codex P1: this used to skip the acknowledgement).
     pub async fn deploy_all(
         &self,
         credential_use: CredentialUseGrant,
+    ) -> Result<Vec<DeploymentResult>, SourceConfigServiceError> {
+        self.deploy_all_with(credential_use, true).await
+    }
+
+    /// API boot reconciliation only: re-render every enabled config without
+    /// waiting for Vector per source (Vector is often not up yet at api boot,
+    /// and a 10-45s wait per source would stall startup). Isolation and
+    /// quarantine still apply; the publication reconciler and the Vector
+    /// container's cold-start guard cover activation.
+    pub async fn reconcile_on_boot(
+        &self,
+        credential_use: CredentialUseGrant,
+    ) -> Result<Vec<DeploymentResult>, SourceConfigServiceError> {
+        self.deploy_all_with(credential_use, false).await
+    }
+
+    async fn deploy_all_with(
+        &self,
+        credential_use: CredentialUseGrant,
+        confirm_activation: bool,
     ) -> Result<Vec<DeploymentResult>, SourceConfigServiceError> {
         let configs = self.repository.list_enabled().await?;
 
@@ -1828,7 +1891,7 @@ impl SourceConfigService {
         let mut results = Vec::new();
 
         for config in configs {
-            match self.deploy(config.id, credential_use).await {
+            match self.deploy_with(config.id, credential_use, confirm_activation).await {
                 Ok(result) => results.push(result),
                 Err(e) => {
                     tracing::error!(
@@ -1848,6 +1911,91 @@ impl SourceConfigService {
         }
 
         Ok(results)
+    }
+
+    /// NAN-4914: secret-only refresh of every deployed source configuration
+    /// bound to `credential_id`, after the credential was rotated or rolled
+    /// back, so the new secret reaches Vector now instead of on the next
+    /// manual deploy.
+    ///
+    /// It never publishes anything but the credential change: each config is
+    /// re-rendered from its saved row with the new secret and compared with
+    /// its last successful deployment snapshot, both normalized so that only
+    /// credential-derived values (and the generated-at comment) are ignored.
+    /// A config whose saved row has pending, undeployed edits renders
+    /// differently and is left alone ([`CredentialRefreshOutcome::PendingEdits`]),
+    /// so rotating a credential can never activate a source-config change the
+    /// caller had no authority to deploy. Only an identical-but-for-secrets
+    /// config is redeployed (trusted system follow-up of the rotation,
+    /// [`CredentialUseGrant::system`]). One config failing does not stop the
+    /// others; an enumeration failure is an `Err` the caller must surface.
+    pub async fn refresh_secrets_for_credential(
+        &self,
+        credential_id: Uuid,
+        previous_payload: Option<&serde_json::Value>,
+    ) -> Result<Vec<CredentialRefresh>, SourceConfigServiceError> {
+        let bound: Vec<SourceConfiguration> = self
+            .repository
+            .list_deployed()
+            .await?
+            .into_iter()
+            .filter(|c| c.credential_id == Some(credential_id))
+            .collect();
+        if bound.is_empty() {
+            return Ok(Vec::new());
+        }
+        let new_payload = self
+            .credential_repo
+            .get_decrypted(credential_id)
+            .await
+            .map_err(|e| SourceConfigServiceError::CredentialError(e.to_string()))?;
+
+        let mut out = Vec::with_capacity(bound.len());
+        for config in bound {
+            let outcome = match self.secret_only_change(&config, previous_payload, &new_payload).await {
+                Ok(SecretOnly::Yes) => match self.deploy(config.id, CredentialUseGrant::system()).await {
+                    Ok(r) if r.success => CredentialRefreshOutcome::Redeployed,
+                    Ok(r) => CredentialRefreshOutcome::Failed(r.message),
+                    Err(e) => CredentialRefreshOutcome::Failed(e.to_string()),
+                },
+                Ok(SecretOnly::PendingEdits) => CredentialRefreshOutcome::PendingEdits,
+                Ok(SecretOnly::NoSnapshot) => CredentialRefreshOutcome::NoDeployedSnapshot,
+                Err(e) => CredentialRefreshOutcome::Failed(e.to_string()),
+            };
+            if let CredentialRefreshOutcome::Failed(error) = &outcome {
+                tracing::error!(source_config = %config.name, %credential_id, %error, "secret refresh after credential rotation failed");
+            }
+            out.push(CredentialRefresh { source_configuration_id: config.id, name: config.name, outcome });
+        }
+        Ok(out)
+    }
+
+    /// Whether re-rendering `config` with the new credential differs from its
+    /// last successful deployment only in credential-derived values.
+    async fn secret_only_change(
+        &self,
+        config: &SourceConfiguration,
+        previous: Option<&serde_json::Value>,
+        new: &serde_json::Value,
+    ) -> Result<SecretOnly, SourceConfigServiceError> {
+        let Some(snapshot) = self
+            .repository
+            .get_deployments(config.id, Some(50))
+            .await?
+            .into_iter()
+            .find(|d| d.action == "deploy" && d.status == "success" && d.config_snapshot.is_some())
+            .and_then(|d| d.config_snapshot)
+        else {
+            return Ok(SecretOnly::NoSnapshot);
+        };
+        let with_rules = self.repository.get_with_rules(config.id).await?;
+        let rendered = match Self::system_intermediary_source(&config.config_type) {
+            Some(intermediary) => Self::render_system_source_config(&with_rules, intermediary).unwrap_or_default(),
+            None => self.generate_vector_config(&with_rules).await?,
+        };
+        let now = normalize_for_secret_compare(&redact_config_snapshot(&rendered), Some(new));
+        let then = normalize_for_secret_compare(&snapshot, previous);
+        Ok(if now == then { SecretOnly::Yes } else { SecretOnly::PendingEdits })
     }
 
     /// Require explicit credential-use authorization only when a source
@@ -1870,7 +2018,9 @@ impl SourceConfigService {
     /// and does not implicitly undeploy an already-running source.
     /// The publication reconciler uses a fresh directory, so deletion is
     /// represented by absence and snapshots never inherit another pod's files.
-    pub async fn render_deployed_to_vector_config(&self) -> Result<(), SourceConfigServiceError> {
+    pub async fn render_deployed_to_vector_config(
+        &self,
+    ) -> Result<(), SourceConfigServiceError> {
         Self::require_canonical_router(&self.vector_config_dir)?;
 
         let sources = self.repository.list_deployed().await?;
@@ -1886,12 +2036,33 @@ impl SourceConfigService {
                 routing_rules,
             };
             let config = &config_with_rules.config;
-            let rendered =
-                if let Some(intermediary) = Self::system_intermediary_source(&config.config_type) {
-                    Self::render_system_source_config(&config_with_rules, intermediary)
-                } else {
-                    Some(self.generate_vector_config(&config_with_rules).await?)
-                };
+            let rendered = if let Some(intermediary) =
+                Self::system_intermediary_source(&config.config_type)
+            {
+                Self::render_system_source_config(&config_with_rules, intermediary)
+            } else {
+                // NAN-4936 (codex P1): one source Vector cannot build must not
+                // poison the generation (consumers would refuse it on reload and
+                // crash-loop on cold start). Run the same per-source isolation a
+                // deploy runs: the pinned Vector builds it on its own where the
+                // validation responder is reachable (a revoked token fails its
+                // build-time token request), the in-process preflight elsewhere.
+                // A failing source is left out and recorded as quarantined; it
+                // stays `deployed`, so a later generation includes it again as
+                // soon as it builds.
+                if let activation::Isolation::Broken(reason) =
+                    self.isolate_pull_source(&config_with_rules).await?
+                {
+                    tracing::warn!(
+                        source_config = %config.name,
+                        %reason,
+                        "leaving a pull source out of the published Vector generation: it cannot build"
+                    );
+                    self.record_generation_quarantine(config.id, &reason).await;
+                    continue;
+                }
+                Some(self.generate_vector_config(&config_with_rules).await?)
+            };
 
             if let Some(rendered) = rendered {
                 Self::validate_generated_config(&rendered)?;
@@ -1954,6 +2125,18 @@ impl SourceConfigService {
         &self,
         config: &SourceConfigurationWithRules,
     ) -> Result<String, SourceConfigServiceError> {
+        self.render_pull_source(config, &activation::CredsTarget::Live).await
+    }
+
+    /// Render a pull source's config, materializing its credential files at
+    /// `creds_target`. The NAN-4936 isolation check renders a CANDIDATE into
+    /// its validation request instead of overwriting a working source's key
+    /// material before the candidate has been proven.
+    async fn render_pull_source(
+        &self,
+        config: &SourceConfigurationWithRules,
+        creds_target: &activation::CredsTarget,
+    ) -> Result<String, SourceConfigServiceError> {
         let safe_name = Self::safe_name(&config.config.name);
         let source_name = format!("{}_source", safe_name);
         let route_name = format!("{}_route", safe_name);
@@ -1967,16 +2150,37 @@ impl SourceConfigService {
         );
 
         // Generate source block
-        let source_block = self.generate_source_block(config).await?;
+        let source_block = self.generate_source_block(config, creds_target).await?;
         toml.push_str(&source_block);
         toml.push_str("\n");
 
+        // NAN-4914: queue / subscription sources start at current activity.
+        // The point-forward filter sits between the source and its routing
+        // transform, so the route reads from the filter.
+        let route_input = match point_forward::cutoff_unix_ms(config) {
+            Some(cutoff) => {
+                let filter_name = format!("{safe_name}{}", point_forward::POINT_FORWARD_SUFFIX);
+                toml.push_str(&point_forward::render_filter(
+                    &filter_name,
+                    &source_name,
+                    &config.config.config_type,
+                    cutoff,
+                ));
+                toml.push('\n');
+                filter_name
+            }
+            None => source_name.clone(),
+        };
+
         // Generate routing transform
         let routing_block =
-            Self::generate_routing_transform(config, &source_name, &route_name, false);
+            Self::generate_routing_transform(config, &route_input, &route_name, false);
         toml.push_str(&routing_block);
 
-        Ok(toml)
+        // NAN-4936: tenant values (credential values included, which cannot be
+        // rejected) must never expand against the live Vector's secret
+        // environment; `$$` reads back as a literal `$` (Azure's `$Default`).
+        Ok(super::isolation::escape_env_interpolation(&toml))
     }
 
     /// Render only the routing transform for a system-owned listener. Default
@@ -1990,9 +2194,13 @@ impl SourceConfigService {
         }
 
         let route_name = Self::config_route_name(&config.config.config_type, &config.config.name);
-        let routing_block =
-            Self::generate_routing_transform(config, intermediary_source, &route_name, true);
-        Some(format!(
+        let routing_block = Self::generate_routing_transform(
+            config,
+            intermediary_source,
+            &route_name,
+            true,
+        );
+        Some(super::isolation::escape_env_interpolation(&format!(
             "# Auto-generated routing rules for system-level source: {}\n\
              # DO NOT EDIT - changes will be overwritten\n\
              # Generated at: {}\n\n\
@@ -2000,13 +2208,14 @@ impl SourceConfigService {
             config.config.name,
             chrono::Utc::now().to_rfc3339(),
             routing_block
-        ))
+        )))
     }
 
     /// Generate the Vector source block based on config type
     async fn generate_source_block(
         &self,
         config: &SourceConfigurationWithRules,
+        creds_target: &activation::CredsTarget,
     ) -> Result<String, SourceConfigServiceError> {
         let safe_name = Self::safe_name(&config.config.name);
         let source_name = format!("{}_source", safe_name);
@@ -2034,20 +2243,26 @@ impl SourceConfigService {
         // (NAN-664 layout). The backend returns the absolute path Vector should
         // embed in the generated TOML.
         let gcp_creds_path = if config.config.config_type == "gcp_pubsub" {
-            if let Some(ref c) = creds {
-                if let Some(creds_json) = c["credentials_json"].as_str() {
-                    if !creds_json.is_empty() {
-                        let key = Self::gcp_creds_key(&config.config.id);
-                        let backend = self.creds_backend().await?;
-                        Some(backend.write_creds(&key, creds_json.as_bytes()).await?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+            match creds.as_ref() {
+                // No credential attached: the operator chose ambient
+                // credentials (GCE/GKE metadata server) explicitly.
+                None => None,
+                // A credential IS attached: it must yield a valid credentials
+                // file, or generation fails closed. Silently omitting
+                // `credentials_path` would switch the source to the node's
+                // ambient identity (NAN-4935 review).
+                Some(c) => {
+                    let creds_json = crate::parsers::gcp_credentials::credentials_file_contents(c)
+                        .map_err(|reason| {
+                            SourceConfigServiceError::CredentialError(format!(
+                                "the credential attached to GCP Pub/Sub source '{}' cannot \
+                                 produce a credentials file: {reason}",
+                                config.config.name
+                            ))
+                        })?;
+                    let key = Self::gcp_creds_key(&config.config.id);
+                    Some(self.write_source_creds(creds_target, &key, creds_json.as_bytes()).await?)
                 }
-            } else {
-                None
             }
         } else {
             None
@@ -2062,8 +2277,7 @@ impl SourceConfigService {
                 if let Some(ca_cert) = c["tls_ca_cert"].as_str() {
                     if !ca_cert.is_empty() {
                         let key = Self::kafka_ca_key(&config.config.id);
-                        let backend = self.creds_backend().await?;
-                        Some(backend.write_creds(&key, ca_cert.as_bytes()).await?)
+                        Some(self.write_source_creds(creds_target, &key, ca_cert.as_bytes()).await?)
                     } else {
                         None
                     }
@@ -2096,9 +2310,10 @@ impl SourceConfigService {
             "gcp_pubsub" => {
                 Self::generate_gcp_pubsub_source(&source_name, conn, gcp_creds_path.as_deref())
             }
-            "azure_event_hubs" => {
-                Self::generate_azure_event_hubs_source(&source_name, conn, creds.as_ref())?
-            }
+            "azure_event_hubs" => Self::wrap_source_table(
+                &source_name,
+                azure_event_hubs::source_table(conn, creds.as_ref())?,
+            ),
             _ => {
                 return Err(SourceConfigServiceError::InvalidConfig(format!(
                     "Unknown config type: {}",
@@ -2143,18 +2358,15 @@ impl SourceConfigService {
             .unwrap_or("localhost:9092");
         let topics: Vec<String> = conn["topics"]
             .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_else(|| vec!["logs".to_string()]);
         let auto_offset_reset = conn["auto_offset_reset"].as_str().unwrap_or("latest");
         let group_id_owned: String;
         let group_id: &str = match conn["group_id"].as_str() {
             Some(explicit) => explicit,
             None => {
-                group_id_owned = format!("nanosiem-{}", crate::typeid::encode_suffix(config_id));
+                group_id_owned =
+                    format!("nanosiem-{}", crate::typeid::encode_suffix(config_id));
                 &group_id_owned
             }
         };
@@ -2280,10 +2492,23 @@ impl SourceConfigService {
         sqs.insert(
             "poll_secs".into(),
             toml::Value::Integer(i64::from(
-                Self::positive_u32(conn, "poll_secs", MAX_POLL_SECS)
-                    .unwrap_or(DEFAULT_SQS_POLL_SECS),
+                Self::positive_u32(conn, "poll_secs", MAX_POLL_SECS).unwrap_or(DEFAULT_SQS_POLL_SECS),
             )),
         );
+        // NAN-4936: lives in the `sqs` table (Vector's aws_s3 `sqs::Config`),
+        // like `client_concurrency`. Emitted only when set (codex P2): an
+        // existing source keeps Vector's 300s, because a shorter timeout than
+        // one object takes to process redelivers it and duplicates its events.
+        // New sources get 60 from the UI form (a notification in flight across
+        // a Vector restart then comes back after 60s instead of ~300s).
+        if let Some(visibility) =
+            Self::positive_u32(conn, "visibility_timeout_secs", MAX_SQS_VISIBILITY_SECS)
+        {
+            sqs.insert(
+                "visibility_timeout_secs".into(),
+                toml::Value::Integer(i64::from(visibility)),
+            );
+        }
         sqs.insert("delete_message".into(), true.into());
         source.insert("sqs".into(), toml::Value::Table(sqs));
 
@@ -2477,171 +2702,6 @@ impl SourceConfigService {
         Self::wrap_source_table(source_name, source)
     }
 
-    /// Build the `[sources.<name>]` block for an Azure Event Hubs source
-    /// (NAN-3764), on the Vector fork's `azure_event_hubs` source.
-    ///
-    /// Mirrors the hosted pull renderer (`parsers::tenant_bundle::pull`,
-    /// NAN-3604) so both editions behave the same: point-forward
-    /// (`start_position = "latest"`, which with a checkpoint store writes each
-    /// partition's current end as its first checkpoint at connect), the same
-    /// checkpoint interval, end-to-end acknowledgements (a position is
-    /// checkpointed only once its events are delivered), and the message body
-    /// as raw bytes. Only authentication differs: hosted federates through
-    /// nano's broker, while a dedicated deployment brings its own credential.
-    ///
-    /// Event Hub authentication, from the sealed credential:
-    ///
-    /// | credential                         | result                                   |
-    /// |------------------------------------|------------------------------------------|
-    /// | `connection_string`                | SAS connection string (`namespace` unused) |
-    /// | tenant + client id + client secret | Entra service principal on `namespace`   |
-    /// | none                               | managed identity on `namespace`          |
-    ///
-    /// The checkpoint store (Azure Blob Storage) uses the credential's
-    /// `checkpoint_connection_string` when set, else `checkpoint_account` with
-    /// the same Entra service principal or managed identity. A checkpoint store
-    /// is mandatory: without one every restart would start at the newest
-    /// events and drop whatever arrived while Vector was down.
-    fn generate_azure_event_hubs_source(
-        source_name: &str,
-        conn: &serde_json::Value,
-        creds: Option<&serde_json::Value>,
-    ) -> Result<String, SourceConfigServiceError> {
-        let invalid =
-            |msg: &str| SourceConfigServiceError::InvalidConfig(format!("azure_event_hubs: {msg}"));
-        let conn_field = |key: &str| {
-            conn.get(key)
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-        };
-        let cred_field = |key: &str| {
-            creds
-                .and_then(|c| c.get(key))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-        };
-
-        let event_hub = conn_field("event_hub_name")
-            .ok_or_else(|| invalid("connection_config.event_hub_name is required"))?;
-        let container = conn_field("checkpoint_container")
-            .ok_or_else(|| invalid("connection_config.checkpoint_container is required"))?;
-        let consumer_group = conn_field("consumer_group").unwrap_or(AZURE_DEFAULT_CONSUMER_GROUP);
-
-        // Entra service principal when all three parts are present; a partial
-        // one is a misconfiguration, not a credential (same rule as AWS keys).
-        let entra = match (
-            cred_field("azure_tenant_id"),
-            cred_field("azure_client_id"),
-            cred_field("azure_client_secret"),
-        ) {
-            (Some(tenant), Some(client), Some(secret)) => {
-                let mut auth = toml::Table::new();
-                auth.insert(
-                    "azure_credential_kind".into(),
-                    "client_secret_credential".into(),
-                );
-                auth.insert("azure_tenant_id".into(), tenant.into());
-                auth.insert("azure_client_id".into(), client.into());
-                auth.insert("azure_client_secret".into(), secret.into());
-                auth
-            }
-            _ => {
-                let mut auth = toml::Table::new();
-                auth.insert("azure_credential_kind".into(), "managed_identity".into());
-                auth
-            }
-        };
-
-        let mut source = toml::Table::new();
-        source.insert("type".into(), "azure_event_hubs".into());
-        if let Some(connection_string) = cred_field("connection_string") {
-            source.insert("connection_string".into(), connection_string.into());
-        } else {
-            let namespace = conn_field("namespace")
-                .and_then(azure_namespace_host)
-                .ok_or_else(|| {
-                    invalid(
-                        "connection_config.namespace is required unless the credential \
-                         carries an Event Hubs connection string",
-                    )
-                })?;
-            source.insert("namespace".into(), namespace.into());
-            source.insert("auth".into(), toml::Value::Table(entra.clone()));
-        }
-        source.insert("event_hub_name".into(), event_hub.into());
-        source.insert("consumer_group".into(), consumer_group.into());
-        // Only for a partition with no checkpoint yet: point-forward.
-        source.insert("start_position".into(), AZURE_START_POSITION.into());
-        source.insert(
-            "checkpoint_interval_secs".into(),
-            toml::Value::Integer(i64::from(AZURE_CHECKPOINT_INTERVAL_SECS)),
-        );
-
-        let store = match cred_field("checkpoint_connection_string") {
-            Some(connection_string) => {
-                Self::azure_blob_checkpoint_store(container, connection_string, None)
-            }
-            None => {
-                let account = conn_field("checkpoint_account").ok_or_else(|| {
-                    invalid(
-                        "connection_config.checkpoint_account is required unless the credential \
-                         carries a storage connection string",
-                    )
-                })?;
-                Self::azure_blob_checkpoint_store(container, account, Some(entra))
-            }
-        };
-        source.insert("checkpoint_store".into(), toml::Value::Table(store));
-
-        let mut acknowledgements = toml::Table::new();
-        acknowledgements.insert("enabled".into(), true.into());
-        source.insert(
-            "acknowledgements".into(),
-            toml::Value::Table(acknowledgements),
-        );
-        let mut decoding = toml::Table::new();
-        decoding.insert("codec".into(), "bytes".into());
-        source.insert("decoding".into(), toml::Value::Table(decoding));
-        let mut framing = toml::Table::new();
-        framing.insert("method".into(), "bytes".into());
-        source.insert("framing".into(), toml::Value::Table(framing));
-
-        Ok(Self::wrap_source_table(source_name, source))
-    }
-
-    /// The `checkpoint_store` table of an `azure_event_hubs` source (NAN-3764):
-    /// Azure Blob Storage, addressed by a storage connection string (`auth`
-    /// `None`; the fork refuses a credential-bearing connection string next to
-    /// `auth`) or by an account name with Entra `auth`. Kept out of
-    /// [`Self::generate_azure_event_hubs_source`] because its `type` is a
-    /// checkpoint-store kind, not a Vector component type, and the fork's
-    /// component scanner reads every `type` inserted in a `generate_*_source`
-    /// body as a shipped source.
-    fn azure_blob_checkpoint_store(
-        container: &str,
-        connection_string_or_account: &str,
-        auth: Option<toml::Table>,
-    ) -> toml::Table {
-        let mut store = toml::Table::new();
-        store.insert("type".into(), "azure_blob".into());
-        match auth {
-            None => {
-                store.insert(
-                    "connection_string".into(),
-                    connection_string_or_account.into(),
-                );
-            }
-            Some(auth) => {
-                store.insert("account_name".into(), connection_string_or_account.into());
-                store.insert("auth".into(), toml::Value::Table(auth));
-            }
-        }
-        store.insert("container_name".into(), container.into());
-        store
-    }
-
     /// Pre-deploy validation gate (NAN-689 acceptance criterion #3).
     ///
     /// Runs entirely in-process — no Docker / `vector validate` subprocess
@@ -2663,7 +2723,7 @@ impl SourceConfigService {
     /// On failure, returns `InvalidConfig` with the diagnostic. Callers
     /// are responsible for not writing the live config and for recording
     /// `add_deployment("failure", reason)`.
-    fn validate_generated_config(toml_str: &str) -> Result<(), SourceConfigServiceError> {
+    pub(crate) fn validate_generated_config(toml_str: &str) -> Result<(), SourceConfigServiceError> {
         // 1. Structural TOML validity.
         let parsed: toml::Value = toml::from_str(toml_str).map_err(|e| {
             SourceConfigServiceError::InvalidConfig(format!(
@@ -2676,23 +2736,25 @@ impl SourceConfigService {
             Some(t) => t,
             None => return Ok(()),
         };
-        let fns = vrl::stdlib::all();
+        // NAN-4912 P3: generated remaps compile against the event-parser
+        // allowlist, like every other parser path.
+        let fns = crate::parsers::vrl_functions::parser_vrl_functions();
         for (name, transform) in transforms {
             // Only `remap` transforms carry user-controlled VRL via the
             // `source` attribute. Other transform types (`route`, `filter`,
             // …) take static config we don't generate from user input.
-            let is_remap = transform
-                .get("type")
-                .and_then(|v| v.as_str())
-                .map(|t| t == "remap")
-                .unwrap_or(false);
-            if !is_remap {
-                continue;
-            }
-            let source = match transform.get("source").and_then(|s| s.as_str()) {
+            // NAN-4914: the generated point-forward `filter` carries a VRL
+            // `condition` string; compile it too.
+            let source_key = match transform.get("type").and_then(|v| v.as_str()) {
+                Some("remap") => "source",
+                Some("filter") => "condition",
+                _ => continue,
+            };
+            let source = match transform.get(source_key).and_then(|s| s.as_str()) {
                 Some(s) => s,
                 None => continue,
             };
+            // NAN-3494: guarded compile (size/nesting cap, large stack).
             if let Err(error) = crate::parsers::vrl_guard::compile(source, &fns) {
                 let formatted = error.render(source);
                 return Err(SourceConfigServiceError::InvalidConfig(format!(
@@ -2766,6 +2828,7 @@ impl SourceConfigService {
         }
 
         vrl.push_str("# Apply routing rules to set source_type\n");
+        let header_len = vrl.len();
 
         // Sort rules by priority
         let mut rules: Vec<_> = config.routing_rules.iter().collect();
@@ -2799,18 +2862,16 @@ impl SourceConfigService {
             // shipped (NAN-884 K-7). Coerce header values to string for
             // every comparison; `?? ""` keeps the rule falsy when the
             // header is missing instead of aborting the VRL program.
-            let field =
-                Self::routing_field_expression(&config.config.config_type, &rule.match_field);
+            let field = Self::routing_field_expression(
+                &config.config.config_type,
+                &rule.match_field,
+            );
             let raw_value = rule.match_value.as_deref().unwrap_or("");
 
             let condition = match rule.match_type.as_str() {
                 "exact" => format!("{} == \"{}\"", field, Self::vrl_escape(raw_value)),
                 "prefix" => {
-                    format!(
-                        "starts_with({}, \"{}\")",
-                        field,
-                        Self::vrl_escape(raw_value)
-                    )
+                    format!("starts_with({}, \"{}\")", field, Self::vrl_escape(raw_value))
                 }
                 "suffix" => {
                     format!("ends_with({}, \"{}\")", field, Self::vrl_escape(raw_value))
@@ -2819,11 +2880,7 @@ impl SourceConfigService {
                     format!("contains({}, \"{}\")", field, Self::vrl_escape(raw_value))
                 }
                 "regex" => {
-                    let pattern = if raw_value.is_empty() {
-                        ".*"
-                    } else {
-                        raw_value
-                    };
+                    let pattern = if raw_value.is_empty() { ".*" } else { raw_value };
                     if pattern.contains('\'') {
                         tracing::warn!(
                             rule_id = %rule.id,
@@ -2905,26 +2962,43 @@ impl SourceConfigService {
             vrl.push_str(&format!(".source_type = \"{}\"\n", default_source_type));
         }
 
+        // NAN-4907: on the shared HTTP / HEC listeners a source-bound ingest
+        // token decides the source (`source_type_extract` / `hec_normalize`
+        // set it from the token's route key). Routing rules match on event
+        // fields a sender controls, so they apply only to events without a
+        // source-bound credential: multiplex credentials (route `*`) and the
+        // static install-token fallback.
+        if system_level && !first {
+            let rules_vrl = vrl.split_off(header_len);
+            vrl.push_str(
+                "# NAN-4907: a source-bound ingest token already decided the source.\n\
+                 nano_token_route = to_string(%nano_credential_name) ?? \"\"\n\
+                 if nano_token_route == \"\" || nano_token_route == \"*\" {\n",
+            );
+            vrl.push_str(&rules_vrl);
+            if !vrl.ends_with('\n') {
+                vrl.push('\n');
+            }
+            vrl.push_str("}\n");
+        }
+
         // NAN-3764: stash the routed source type in event metadata like the
-        // system ingress (`00-base.toml`) and the hosted pull stamp do. An
-        // OCSF parser replaces the event root (`. = {...}`), wiping
-        // `.source_type`; its `_ocsf_prepare` reads `%source_type` back, so
-        // without this every dispatch-bound pull source's OCSF rows were
-        // stored as `unknown`. System-level sources feed the router, which
-        // sets it itself.
+        // system ingress (`00-base.toml`) does. An OCSF parser replaces the
+        // event root (`. = {...}`), wiping `.source_type`; `ocsf_prepare`
+        // reads `%source_type` back, so without this every dispatch-bound
+        // pull source's OCSF rows were stored as `unknown`. System-level
+        // sources feed the router, which sets it itself.
         if !system_level {
             vrl.push_str("%source_type = .source_type\n");
         }
 
         // NAN-3764: an Event Hubs message is usually an Azure Monitor batch,
-        // `{"records": [...]}`. Split it into one event per record exactly as
-        // the hosted pull stamp does (same VRL), so the lane — and any parser
-        // shared between editions — sees one record in `.message`. Runs LAST:
-        // the rules above routed the whole message, and every record inherits
-        // that `.source_type`.
+        // `{"records": [...]}`. Split it into one event per record so the lane
+        // sees one record in `.message`. Runs LAST: the rules above routed the
+        // whole message, and every record inherits that `.source_type`.
         if !system_level && config.config.config_type == "azure_event_hubs" {
             vrl.push('\n');
-            vrl.push_str(PullEnvelope::AzureRecords.vrl());
+            vrl.push_str(azure_event_hubs::AZURE_RECORDS_SPLIT_VRL);
         }
 
         let mut transform = toml::Table::new();
@@ -2957,82 +3031,6 @@ impl SourceConfigService {
         out
     }
 
-    /// Build the ordered `inputs = [...]` list for the source_router transform.
-    ///
-    /// Pure function over deployed source configs; takes a closure for the
-    /// filesystem check and an explicit `hec_normalize_present` bool so it
-    /// stays testable without touching disk or env vars.
-    /// `is_system_route_deployed_on_disk` returns true when a system-level
-    /// (http/vector/splunk_hec) config has its routing TOML present — only
-    /// then does it contribute a route and suppress its corresponding
-    /// always-on channel from base inputs.
-    fn compute_router_inputs<F>(
-        deployed_configs: &[SourceConfiguration],
-        is_system_route_deployed_on_disk: F,
-        hec_normalize_present: bool,
-    ) -> Vec<String>
-    where
-        F: Fn(&SourceConfiguration) -> bool,
-    {
-        let mut source_type_extract_covered = false;
-        let mut hec_normalize_covered = false;
-        let mut otlp_logs_prep_covered = false;
-        let mut source_config_routes: Vec<String> = Vec::new();
-        // NAN-1442: at most ONE route per shared always-on channel may feed
-        // `source_router`. `http` and `vector` BOTH intermediate
-        // `source_type_extract` (see `system_intermediary_source`), so wiring a
-        // route for each duplicates the entire post-extract stream into
-        // `source_router` — every event then lands in ClickHouse twice (the
-        // Saturn 2× bug). These system routes are passthrough source_type
-        // normalizers; the authoritative routing is `source_router`'s
-        // match_values, so collapsing duplicate-channel routes to a single
-        // carrier drops no events.
-        let mut covered_channels: std::collections::HashSet<&'static str> =
-            std::collections::HashSet::new();
-
-        for config in deployed_configs {
-            // System-level configs only contribute a route to source_router
-            // inputs when their routing TOML actually exists on disk. Without
-            // this guard, a `mark_deployed` row whose file got skipped would
-            // reference a transform that doesn't exist and abort Vector reload.
-            if let Some(intermediary) = Self::system_intermediary_source(&config.config_type) {
-                if !is_system_route_deployed_on_disk(config) {
-                    continue;
-                }
-                // A route for this always-on channel is already wired — skip
-                // this duplicate so the channel reaches `source_router` exactly
-                // once (NAN-1442). Without this, two system configs sharing a
-                // channel (e.g. http + vector) each feed source_router → 2×.
-                if !covered_channels.insert(intermediary) {
-                    continue;
-                }
-                // The per-config route intermediates this always-on channel
-                // (consumes from it, feeds source_router). Suppress the
-                // channel from base inputs so events don't reach source_router
-                // twice — once via the direct base input, once via the route.
-                match intermediary {
-                    "source_type_extract" => source_type_extract_covered = true,
-                    "hec_normalize" => hec_normalize_covered = true,
-                    "otlp_logs_prep" => otlp_logs_prep_covered = true,
-                    _ => {}
-                }
-            }
-            source_config_routes.push(Self::config_route_name(&config.config_type, &config.name));
-        }
-
-        let mut router_inputs: Vec<String> = base_router_inputs(
-            source_type_extract_covered,
-            hec_normalize_covered,
-            hec_normalize_present,
-            otlp_logs_prep_covered,
-        )
-        .into_iter()
-        .map(String::from)
-        .collect();
-        router_inputs.extend(source_config_routes);
-        router_inputs
-    }
-
     /// Update the dynamic router to include all source configuration routes
     async fn update_dynamic_router(&self) -> Result<(), SourceConfigServiceError> {
         // NAN-948: serialize against parser deploys that mutate the same
@@ -3040,281 +3038,96 @@ impl SourceConfigService {
         // (handed in via `with_deploy_lock`). When not wired (unit tests,
         // legacy callers), proceed without locking — those paths don't
         // collide with parser deploys.
-        let _deploy_guard = match &self.deploy_lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
+        let _deploy_guard = self.lock_deploys().await;
+        self.update_dynamic_router_locked().await
+    }
+
+    /// The shared deploy lock (`None` when not wired: unit tests). Owned, so a
+    /// caller can hold it across a whole deploy. NOT reentrant: while holding
+    /// it, use only `_locked` helpers.
+    /// NAN-4937: set `deployed = true` (first deploy only) without touching
+    /// `deployed_at`. Returns the `updated_at` the later stamp must still
+    /// find, or `None` when the row changed after it was rendered (then the
+    /// stamp is skipped and the UI keeps showing pending changes).
+    async fn flag_deployed(
+        &self,
+        config: &SourceConfiguration,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, SourceConfigServiceError> {
+        if config.deployed {
+            return Ok(Some(config.updated_at));
+        }
+        Ok(self.repository.set_deployed_flag(config.id, config.updated_at).await?)
+    }
+
+    /// NAN-4937: Vector activated the deploy: advance `deployed_at`, unless the
+    /// row or its rules changed after `rendered_at` (a concurrent save is
+    /// still pending, so the UI must keep saying so). A failed router write or
+    /// a refused/unconfirmed activation never reaches here.
+    async fn stamp_activated(
+        &self,
+        id: Uuid,
+        rendered: Option<chrono::DateTime<chrono::Utc>>,
+        rendered_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), SourceConfigServiceError> {
+        let stamped = match rendered {
+            Some(updated_at) => self.repository.stamp_deployed(id, updated_at, rendered_at).await?,
+            None => false,
         };
-
-        // Get all deployed source configs
-        let deployed_configs = self.repository.list_deployed().await?;
-
-        // NAN-930: load parser-route claims so the substitution stays correct
-        // across source-config redeploys. Without this, the surgical inputs
-        // rewrite would put back raw route names that double-feed events into
-        // both `source_router` and the per-parser filter.
-        let claims = self.repository.load_route_claims().await?;
-
-        let router_inputs = Self::compute_router_inputs(
-            &deployed_configs,
-            |cfg| {
-                self.get_config_file_path(&cfg.config_type, &cfg.name)
-                    .exists()
-            },
-            hec_normalize_present(),
-        );
-        // NAN-3765: same reference closure as the parser-side writer
-        // (`build_router_inputs_with_claim_dedupe`): HEC claims with no
-        // rendered HEC route get the passthrough route, and only claims on
-        // routes that actually feed source_router get an `_unclaimed` filter.
-        let (router_inputs, hec_fallback_block, claims) =
-            Self::close_router_references(router_inputs, claims);
-        let claim_substitutions = Self::build_claim_substitutions(&claims);
-        // Apply claim substitution AFTER compute_router_inputs so the
-        // pure function (and its 8 unit tests) stay focused on the base-input
-        // logic; this layer adds dedupe-safety on top.
-        let substituted_inputs: Vec<String> = router_inputs
-            .iter()
-            .map(|name| {
-                claim_substitutions
-                    .get(name.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| name.clone())
-            })
-            .collect();
-
-        let new_inputs_line = format!(
-            "inputs = [{}]",
-            substituted_inputs
-                .iter()
-                .map(|s| format!("\"{}\"", s))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-
-        // Read the current dynamic router config (in parsers dir for S3/GCS sync)
-        let router_path = self
-            .vector_config_dir
-            .join("sources")
-            .join("parsers")
-            .join("_router.toml");
-        if !router_path.exists() {
-            tracing::warn!(
-                "Dynamic router config not found at {}, skipping update",
-                router_path.display()
-            );
-            return Ok(());
-        }
-
-        let raw_content = tokio::fs::read_to_string(&router_path).await?;
-
-        // NAN-930: strip then rewrite all `<route>_unclaimed` filter blocks.
-        // Adding-only (the previous behavior) left stale conditions for
-        // edited `match_values` and orphan blocks for renamed/deleted
-        // source-configs. The clean rewrite handles both:
-        //   - match_values changes propagate via build_unclaimed_blocks
-        //     emitting the current condition
-        //   - removed claims simply don't get re-emitted; their blocks
-        //     stripped above don't return
-        // Filter blocks are injected just above `[transforms.source_router]`
-        // (placement is cosmetic — Vector resolves inputs file-wide).
-        let current_content = Self::strip_existing_unclaimed_blocks(&raw_content);
-        let claim_blocks = format!(
-            "{}{}",
-            hec_fallback_block,
-            Self::build_unclaimed_blocks(&claims)
-        );
-
-        // Source-config reconciliation owns only the ordinary log transport
-        // fan-in. The enrichment router is fed by the dedicated, authenticated
-        // `enrichment_prepare` source on :8090 and must not be rewritten to the
-        // log inputs here.
-        let (updated, found, enrichment_preserved) =
-            Self::rewrite_router_inputs(&current_content, &new_inputs_line, &claim_blocks);
-
-        if found {
-            tokio::fs::write(&router_path, &updated).await?;
+        if !stamped {
             tracing::info!(
-                enrichment_router_preserved = enrichment_preserved,
-                "Updated dynamic router inputs: {}",
-                new_inputs_line
+                source_configuration_id = %id,
+                "activated, but the configuration changed after it was rendered: deployed_at kept, changes stay pending"
             );
-        } else {
-            tracing::warn!("Could not find source_router inputs line in _router.toml");
         }
-
         Ok(())
     }
 
-    fn rewrite_router_inputs(
-        content: &str,
-        new_inputs_line: &str,
-        claim_blocks: &str,
-    ) -> (String, bool, bool) {
-        let mut updated = String::new();
-        let mut in_source_router = false;
-        let mut found_source = false;
-        let mut found_enrichment = false;
-        let mut filter_block_emitted = false;
-
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed == "[transforms.source_router]" {
-                if !filter_block_emitted && !claim_blocks.is_empty() {
-                    updated.push_str(claim_blocks);
-                    filter_block_emitted = true;
-                }
-                in_source_router = true;
-                updated.push_str(line);
-                updated.push('\n');
-            } else if trimmed == "[transforms.enrichment_router]" {
-                in_source_router = false;
-                found_enrichment = true;
-                updated.push_str(line);
-                updated.push('\n');
-            } else if in_source_router && trimmed.starts_with("inputs = [") {
-                let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
-                updated.push_str(&format!("{}{}\n", leading_ws, new_inputs_line));
-                found_source = true;
-                in_source_router = false;
-            } else {
-                if trimmed.starts_with('[') {
-                    in_source_router = false;
-                }
-                updated.push_str(line);
-                updated.push('\n');
-            }
+    pub(super) async fn lock_deploys(&self) -> Option<crate::parsers::VectorDeployGuard> {
+        // NAN-4953: with the cross-process config-dir lock the Vector
+        // entrypoint's migration takes.
+        match &self.deploy_lock {
+            Some(lock) => Some(
+                crate::parsers::VectorDeployGuard::acquire(Arc::clone(lock), &self.vector_config_dir)
+                    .await,
+            ),
+            None => None,
         }
-
-        (updated, found_source, found_enrichment)
     }
 
-    /// NAN-3765: make the router's references self-consistent with what this
-    /// render actually declares. Adds the passthrough `splunk_hec_route` when
-    /// HEC parsers claim it but no HEC source config route is rendered, and
-    /// drops claims on routes that do not feed `source_router` (disabled,
-    /// undeployed, or unrendered source configs) so no `<route>_unclaimed`
-    /// filter consumes a missing component.
-    fn close_router_references(
-        router_inputs: Vec<String>,
-        claims: Vec<RouteClaim>,
-    ) -> (Vec<String>, String, Vec<RouteClaim>) {
-        let hec_claimed = claims.iter().any(|claim| claim.route == HEC_ROUTE);
-        let (router_inputs, hec_fallback_block) =
-            apply_hec_route_fallback(router_inputs, hec_claimed);
-        let claims = claims
-            .into_iter()
-            .filter(|claim| router_inputs.iter().any(|input| *input == claim.route))
-            .collect();
-        (router_inputs, hec_fallback_block, claims)
-    }
-
-    /// NAN-930: build the route→substituted-route map. Any route that one or
-    /// more enabled parsers claim is rewritten to `<route>_unclaimed` so the
-    /// surgical inputs update keeps `source_router` consuming only the
-    /// leftover stream (events no parser-filter matched).
-    fn build_claim_substitutions(claims: &[RouteClaim]) -> HashMap<&str, String> {
-        let mut subs: HashMap<&str, String> = HashMap::new();
-        for claim in claims {
-            subs.entry(claim.route.as_str())
-                .or_insert_with(|| format!("{}_unclaimed", claim.route));
-        }
-        subs
-    }
-
-    /// NAN-930: strip all `[transforms.*_unclaimed]` filter blocks from the
-    /// router file content. Pairs with `build_unclaimed_blocks` to give
-    /// `update_dynamic_router` a clean rewrite (no stale conditions for
-    /// changed `match_values`, no orphan blocks for renamed/deleted
-    /// source-configs).
+    /// [`Self::update_dynamic_router`] for a caller that already holds the
+    /// deploy lock (NAN-4936).
     ///
-    /// Line-by-line state machine: enter "skip" mode when we see a
-    /// `[transforms.<name>_unclaimed]` header, exit on the next `[` (next
-    /// TOML section starts) or EOF. Comment lines that happen to mention
-    /// `_unclaimed` don't trigger skip — we only match section headers
-    /// (line starts with `[`, ignoring whitespace).
-    pub(super) fn strip_existing_unclaimed_blocks(content: &str) -> String {
-        let mut out = String::new();
-        let mut in_unclaimed = false;
-        for line in content.lines() {
-            let trimmed = line.trim_start();
-            // Section-header start. Decide whether to enter or exit skip mode.
-            if trimmed.starts_with('[') {
-                // NAN-3765: the passthrough HEC route is router-owned and
-                // re-derived on every rewrite, exactly like `_unclaimed`.
-                in_unclaimed = (trimmed.starts_with("[transforms.")
-                    && trimmed.contains("_unclaimed]"))
-                    || trimmed.trim_end() == format!("[transforms.{HEC_ROUTE}]");
-                if in_unclaimed {
-                    continue;
-                }
-            }
-            if in_unclaimed {
-                continue;
-            }
-            out.push_str(line);
-            out.push('\n');
-        }
-        out
-    }
-
-    /// NAN-930: format `[transforms.<route>_unclaimed]` filter blocks for
-    /// every current claim. Pair with `strip_existing_unclaimed_blocks` so
-    /// `update_dynamic_router` does a clean rewrite — both renamed/deleted
-    /// claims (block disappears) and changed `match_values` (condition
-    /// regenerates) propagate without needing a parser redeploy. Earlier
-    /// "add missing only" version left stale blocks behind and was the
-    /// root cause of the NAN-930 gotchas #2 + #3.
-    fn build_unclaimed_blocks(claims: &[RouteClaim]) -> String {
-        // Group claimants by route so the union match_values list comes out stable.
-        let mut by_route: BTreeMap<&str, Vec<&RouteClaim>> = BTreeMap::new();
-        for claim in claims {
-            by_route
-                .entry(claim.route.as_str())
-                .or_default()
-                .push(claim);
-        }
-
-        let mut out = String::new();
-        for (route, claimants) in by_route {
-            let filter_name = format!("{}_unclaimed", route);
-            let mut values: Vec<String> = Vec::new();
-            for claim in claimants {
-                if claim.match_values.is_empty() {
-                    values.push(claim.parser_name.clone());
-                } else {
-                    values.extend(claim.match_values.iter().cloned());
-                }
-            }
-            values.sort();
-            values.dedup();
-            let list = values
-                .iter()
-                .map(|v| {
-                    // Same minimal escape rule as the parser-config generator —
-                    // backslashes, quotes, and embedded newlines.
-                    let mut esc = String::with_capacity(v.len());
-                    for ch in v.chars() {
-                        match ch {
-                            '\\' => esc.push_str("\\\\"),
-                            '"' => esc.push_str("\\\""),
-                            '\n' => esc.push_str("\\n"),
-                            '\r' => esc.push_str("\\r"),
-                            _ => esc.push(ch),
-                        }
-                    }
-                    format!("\"{}\"", esc)
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push_str(&format!(
-                "[transforms.{}]\n\
-                 type = \"filter\"\n\
-                 inputs = [\"{}\"]\n\
-                 condition = '!includes([{}], to_string(.source_type) ?? \"\")'\n\n",
-                filter_name, route, list,
-            ));
-        }
-        out
+    /// NAN-4956: a source-config change now re-renders the WHOLE parser tree
+    /// (router, claims, parser filters) from the database and the files on
+    /// disk, through the same writer every parser deploy uses. It used to be
+    /// a surgical rewrite of the first `inputs = [...]` line after
+    /// `[transforms.source_router]` plus the `<route>_unclaimed` blocks, so:
+    /// * `enrichment_router`, which carries the SAME inputs, kept naming a
+    ///   removed `<config>_route`;
+    /// * claims came from every enabled parser bound to an existing config,
+    ///   deployed or not, so a parser bound to the removed route kept its
+    ///   `<route>_unclaimed` block and its own `_filter` on the route.
+    /// Either way Vector refused every reload until something rewrote the tree
+    /// (~5 min in the NAN-4937 runs). The full render prunes routes that no
+    /// longer exist (`VectorConfigManager::without_unroutable_parsers`), and a
+    /// config that deploys again brings its bound parsers back.
+    pub(super) async fn update_dynamic_router_locked(&self) -> Result<(), SourceConfigServiceError> {
+        let pool = self.repository.pool();
+        let mut parsers = crate::parsers::list_effective_deployed_parsers(pool)
+            .await
+            .map_err(SourceConfigRepositoryError::from)?;
+        crate::parsers::resolve_parser_dispatch_routes_lenient(pool, &mut parsers)
+            .await
+            .map_err(SourceConfigRepositoryError::from)?;
+        crate::parsers::VectorConfigManager::new(&self.vector_config_dir)
+            .deploy_parsers(&parsers)
+            .await
+            .map_err(|e| {
+                SourceConfigServiceError::DeploymentFailed(format!(
+                    "could not re-render the parser tree for the source-configuration change: {e}"
+                ))
+            })?;
+        Ok(())
     }
 
     /// Build the VRL access expression for a routing-rule `match_field`.
@@ -3385,6 +3198,21 @@ impl SourceConfigService {
     /// stem (`splunk_hec.toml`) regardless of the user-facing `name`, so
     /// renaming the OOTB row can't strand the deployed file on disk and
     /// can't break parsers that consume from a fixed transform name. NAN-940.
+    fn configs_dir(&self) -> PathBuf {
+        self.vector_config_dir.join("sources").join("configs")
+    }
+
+    /// NAN-4902: write the permanent `splunk_hec_route` passthrough (atomic).
+    async fn write_hec_passthrough_route(&self) -> Result<(), SourceConfigServiceError> {
+        let dir = self.configs_dir();
+        tokio::task::spawn_blocking(move || {
+            crate::parsers::vector_hec_route::write_passthrough_route(&dir)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))??;
+        Ok(())
+    }
+
     fn get_config_file_path(&self, config_type: &str, name: &str) -> PathBuf {
         let stem = Self::config_safe_stem(config_type, name);
         self.vector_config_dir
@@ -3474,5 +3302,12 @@ impl SourceConfigService {
     }
 }
 
+mod activation;
+pub use activation::{QUARANTINED_STATUS, QUARANTINE_UNCONFIRMED_STATUS, UNCONFIRMED_STATUS};
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "service/pull_start_tests.rs"]
+mod pull_start_tests;

@@ -363,14 +363,17 @@ pub fn worker_exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_nano-connector"))
 }
 
-/// The suites run every VRL worker with seccomp REQUIRED, so a host where
-/// the filter silently fails to install fails the tests instead of quietly
-/// testing a degraded sandbox. `NANO_CONNECTOR_TEST_SECCOMP=prefer` opts out
-/// on hosts without seccomp (the sandbox tests then say what is missing).
+/// On Linux the suites run every VRL worker with seccomp REQUIRED, so a host
+/// where the filter silently fails to install fails the tests instead of
+/// quietly testing a degraded sandbox. `NANO_CONNECTOR_TEST_SECCOMP=prefer`
+/// opts out on Linux hosts without seccomp (the sandbox tests then say what
+/// is missing). seccomp does not exist off Linux (macOS dev hosts), so there
+/// the default is `prefer` and the seccomp-specific suites are compiled out.
 pub fn require_seccomp() -> SandboxPolicy {
     let seccomp = match std::env::var("NANO_CONNECTOR_TEST_SECCOMP").ok().as_deref().and_then(Enforce::parse) {
         Some(e) => e,
-        None => Enforce::Require,
+        None if cfg!(target_os = "linux") => Enforce::Require,
+        None => Enforce::Prefer,
     };
     SandboxPolicy { seccomp, ..Default::default() }
 }
@@ -453,4 +456,39 @@ pub fn normalize(v: &Value) -> Value {
         Value::Number(n) => serde_json::json!(n.as_f64().unwrap_or_default()),
         other => other.clone(),
     }
+}
+
+/// Answers 200 and splices to `upstream` for authorities in `allow`; 403
+/// otherwise. Records every CONNECT head.
+pub async fn fake_proxy(upstream: u16, allow: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let heads = Arc::new(Mutex::new(Vec::new()));
+    let seen = heads.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else { break };
+            let (seen, allow) = (seen.clone(), allow.clone());
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let Ok(b) = tokio::io::AsyncReadExt::read_u8(&mut client).await else { return };
+                    head.push(b);
+                }
+                let head = String::from_utf8(head).unwrap();
+                let authority = head.split_whitespace().nth(1).unwrap().to_string();
+                seen.lock().unwrap().push(head);
+                if !allow.contains(&authority) {
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut client, b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
+                    return;
+                }
+                let Ok(mut vendor) = tokio::net::TcpStream::connect(("127.0.0.1", upstream)).await else { return };
+                if tokio::io::AsyncWriteExt::write_all(&mut client, b"HTTP/1.1 200 Connection established\r\n\r\n").await.is_err() {
+                    return;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut vendor).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), heads)
 }

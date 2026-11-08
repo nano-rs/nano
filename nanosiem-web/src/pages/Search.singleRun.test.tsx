@@ -1,34 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // @vitest-environment jsdom
-// NAN-3883: one user action reaches /api/search exactly once. A production tenant showed two
-// or three /api/search per run (three 30d scans on the cell per click). This
-// drives the real query editor (Enter), the real time picker and the real
-// Run button, with the real results/stats/timeline components mounted.
+// NAN-3299 / NAN-3883: one user action reaches the search endpoint exactly
+// once. Before the fix every run fired two or three searches: the run's own
+// relative -> absolute URL rewrite was read as back/forward navigation by the
+// URL-sync effect (which re-ran the search), and router location lag made the
+// effect restore and re-run the PREVIOUS query. Drives the real query editor
+// (Enter), the real time picker and the real Run button.
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter, Router, UNSAFE_createMemoryHistory } from 'react-router-dom';
+import { useLayoutEffect, useState, type ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Search } from './Search';
 import { EditorView } from '@codemirror/view';
 import userEvent from '@testing-library/user-event';
 
 const mocks = vi.hoisted(() => ({
-  interactive: vi.fn(), async: vi.fn(), fields: vi.fn(), legacy: vi.fn(), poll: vi.fn(), page: vi.fn(),
-  histogram: vi.fn(), panel: vi.fn(),
+  stream: vi.fn(), async: vi.fn(), fields: vi.fn(), legacy: vi.fn(),
   cancel: vi.fn().mockResolvedValue({}), cancelJob: vi.fn().mockResolvedValue({}),
-  stream: vi.fn(), tenantPlan: undefined as object | undefined,
   noop: vi.fn(), mutation: vi.fn().mockResolvedValue({}), history: vi.fn(),
-  schema: { schema: 'ocsf', fields: [{ name: 'enrichments.data.host_count' }] },
 }));
 vi.mock('@/lib/api', () => ({
   ApiClientError: class extends Error {},
   api: {
-    searchInteractive: mocks.interactive, searchAsync: mocks.async, searchHistogram: mocks.histogram,
-    getSearchJob: mocks.poll, getSearchJobResultPage: mocks.page,
+    searchStreamSSE: mocks.stream, searchAsync: mocks.async,
     cancelSearch: mocks.cancel, cancelSearchJob: mocks.cancelJob,
-    searchStreamSSE: mocks.stream,
-    getExtFieldNames: async () => [], getSchemaFields: async () => mocks.schema, listSearchJobs: async () => [],
+    getExtFieldNames: async () => [], getSchemaFields: async () => ({ schema: 'udm', fields: [] }),
+    listSearchJobs: async () => [],
   },
 }));
 vi.mock('@/hooks/use-api', async importOriginal => {
@@ -36,9 +35,11 @@ vi.mock('@/hooks/use-api', async importOriginal => {
   const hooks = Object.fromEntries(Object.keys(original).filter(key => key.startsWith('use')).map(key => [key, () => ({
     mutate: mocks.mutation, data: undefined, loading: false, refetch: mocks.noop,
   })]));
-  return { ...original, ...hooks, useSearch: () => ({ mutate: mocks.legacy }), useFieldStats: () => ({ mutate: mocks.fields }) };
+  // useSearch binds a fresh mutate each render in production, so handleSearch
+  // (and the URL-sync effect that depends on it) changes identity every render.
+  return { ...original, ...hooks, useSearch: () => ({ mutate: (...args: unknown[]) => mocks.legacy(...args) }), useFieldStats: () => ({ mutate: mocks.fields }) };
 });
-vi.mock('@/hooks/use-capabilities', async importOriginal => ({ ...(await importOriginal<object>()), useCapabilities: () => ({ capabilities: {}, tenantPlan: mocks.tenantPlan }) }));
+vi.mock('@/hooks/use-capabilities', async importOriginal => ({ ...(await importOriginal<object>()), useCapabilities: () => ({ capabilities: {} }) }));
 vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ user: {}, hasPermission: () => true, isAuthenticated: true }) }));
 vi.mock('@/contexts/UserPreferencesContext', () => ({ useUserPreferences: () => ({ defaultTimeRange: '1h', queryMode: 'piped' }) }));
 vi.mock('@/contexts/PageContext', () => ({ useHereCardOverride: () => {} }));
@@ -46,8 +47,6 @@ vi.mock('@/enterprise/contexts/NotebookContext', () => ({ useNotebookCapture: ()
 vi.mock('@/enterprise/hooks/use-melod-job', () => ({ useMelodJob: () => ({ loading: false }) }));
 vi.mock('@/hooks/useSearchHistory', () => ({ useSearchHistory: () => ({ searchHistory: [], addToSearchHistory: mocks.history, refreshHistory: mocks.noop }) }));
 vi.mock('@/hooks/use-mobile', () => ({ useIsMobile: () => false }));
-
-vi.mock('@/components/search/retro/useRetro', () => ({ primeDurableRetroResult: () => {} }));
 vi.mock('@/components/reports/ScheduleReportDialog', () => ({ ScheduleReportDialog: () => null }));
 vi.mock('@/components/dashboard', () => ({ AddToDashboardDialog: () => null }));
 vi.mock('@/components/DemoHints', () => ({ SearchDemoHint: () => null }));
@@ -57,36 +56,40 @@ beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   sessionStorage.clear();
-  mocks.tenantPlan = { identity: { permissions: [] }, components: {} };
   mocks.fields.mockResolvedValue({ fields: [] });
-  mocks.histogram.mockResolvedValue({ histogram: [] });
+  // The SSE transport is unavailable → the page falls back to the async
+  // endpoint, which answers synchronously with rows.
   mocks.stream.mockImplementation((_request, callbacks) => {
-    queueMicrotask(() => callbacks.onError?.({ code: 'VALIDATION_ERROR', message: 'gen1 tenant' }));
+    queueMicrotask(() => callbacks.onError?.({ code: 'NETWORK_ERROR', message: 'no sse' }));
     return new AbortController();
   });
-  mocks.interactive.mockImplementation(async () => ({
+  mocks.async.mockImplementation(async () => ({
     results: [{ source_type: 'windows_sysmon', count: 2 }], total_count: 1, fields: [], execution_time_ms: 1, display_type: 'table',
   }));
 });
 afterEach(cleanup);
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 400));
+const searches = () => mocks.stream.mock.calls.length;
+const queries = () => mocks.stream.mock.calls.map(call => (call[0] as { query?: string }).query?.trim());
 
-async function mountWithQuery(query: string) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  client.setQueryData(['schema-fields'], mocks.schema);
-  const { container } = render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/search']}><Search /></MemoryRouter></QueryClientProvider>);
+async function mountEditor(container: HTMLElement, query: string) {
   const content = await waitFor(() => {
     const element = container.querySelector('.cm-content') as HTMLElement | null;
     expect(element).toBeTruthy();
     return element!;
   });
-  EditorView.findFromDOM(content)!.dispatch({ changes: { from: 0, insert: query } });
+  const view = EditorView.findFromDOM(content)!;
+  view.dispatch({ changes: { from: 0, insert: query } });
   await settle();
-  return { container, content };
+  return { content, view };
 }
 
-const searches = () => mocks.interactive.mock.calls.length;
+async function mountWithQuery(query: string) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const { container } = render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/search']}><Search /></MemoryRouter></QueryClientProvider>);
+  return { container, ...(await mountEditor(container, query)) };
+}
 
 it('Enter, a time-range pick and the Run button each run the search exactly once', async () => {
   const { container, content } = await mountWithQuery('* | stats count by source_type');
@@ -108,72 +111,83 @@ it('Enter, a time-range pick and the Run button each run the search exactly once
   await waitFor(() => expect(searches()).toBe(3));
   await settle();
   expect(searches()).toBe(3);
-  // One history entry per run, no superseded request to cancel.
   expect(mocks.history).toHaveBeenCalledTimes(3);
   expect(mocks.cancel).not.toHaveBeenCalled();
 }, 20_000);
 
-it('a repeated trigger of the same run moments later joins it instead of starting the scan again', async () => {
-  const { container, content } = await mountWithQuery('* | stats count by source_type');
+it('two deliberate Enters both run, even while the first is still in flight', async () => {
+  // Hold the run in flight: the second Enter is a new user action, not an echo.
+  mocks.stream.mockImplementation(() => new AbortController());
+  const { content } = await mountWithQuery('* | stats count by source_type');
   fireEvent.keyDown(content, { key: 'Enter', code: 'Enter', keyCode: 13 });
-  fireEvent.keyDown(content, { key: 'Enter', code: 'Enter', keyCode: 13 });
-  fireEvent.click(container.querySelector('button.search-console-action')!);
   await waitFor(() => expect(searches()).toBe(1));
+  fireEvent.keyDown(content, { key: 'Enter', code: 'Enter', keyCode: 13 });
+  await waitFor(() => expect(searches()).toBe(2));
   await settle();
-  expect(searches()).toBe(1);
-  expect(mocks.history).toHaveBeenCalledTimes(1);
-  expect(mocks.cancel).not.toHaveBeenCalled();
-  // A different search right away is a new run.
-  EditorView.findFromDOM(content)!.dispatch({ changes: { from: 0, insert: 'actor.user.name="x" ' } });
+  expect(searches()).toBe(2);
+  expect(mocks.history).toHaveBeenCalledTimes(2);
+}, 20_000);
+
+it('an explicit Enter after a passive URL load runs live (bypassing the cache)', async () => {
+  // Hold the passive run in flight so the explicit run overlaps it.
+  mocks.stream.mockImplementation(() => new AbortController());
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const { container } = render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={['/search?q=source_type%3D%22okta%22&run=true']}><Search /></MemoryRouter>
+    </QueryClientProvider>,
+  );
+  await waitFor(() => expect(searches()).toBe(1));
+  // The URL auto-run is passive: it may read the server cache. Every
+  // interactive stream opts in to the NAN-4915 background-job hand-off
+  // (`x-nano-accept-async: 1`), so acceptAsync rides along on both runs.
+  expect(mocks.stream.mock.calls[0][2]).toEqual({ bypass: false, acceptAsync: true });
+  const content = await waitFor(() => {
+    const element = container.querySelector('.cm-content') as HTMLElement | null;
+    expect(element).toBeTruthy();
+    return element!;
+  });
   await settle();
   fireEvent.keyDown(content, { key: 'Enter', code: 'Enter', keyCode: 13 });
   await waitFor(() => expect(searches()).toBe(2));
-}, 20_000);
-
-// NAN-3809: exercise the actual pasted-URL admission and deliberate rerun.
-it('an absolute pasted URL reads cache, while Run of that same query stays live', async () => {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  client.setQueryData(['schema-fields'], mocks.schema);
-  const entry = '/search?q=metadata.log_source%3D%22conduit_proxy%22&start=2026-10-06T11%3A53%3A42.000Z&end=2026-10-06T12%3A53%3A42.999Z';
-  const { container } = render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[entry]}><Search /></MemoryRouter></QueryClientProvider>);
-  await waitFor(() => expect(mocks.interactive).toHaveBeenCalledTimes(1));
-  expect(mocks.interactive.mock.calls[0][0]).toMatchObject({ use_cache: true, query: 'metadata.log_source="conduit_proxy"' });
+  expect((mocks.stream.mock.calls[1][0] as { query?: string }).query?.trim()).toBe('source_type="okta"');
+  expect(mocks.stream.mock.calls[1][2]).toEqual({ bypass: true, acceptAsync: true });
   await settle();
-  await new Promise(resolve => setTimeout(resolve, 1_600));
-  fireEvent.click(container.querySelector('button.search-console-action')!);
-  await waitFor(() => expect(mocks.interactive).toHaveBeenCalledTimes(2));
-  expect(mocks.interactive.mock.calls[1][0]).toMatchObject({ use_cache: false });
+  expect(searches()).toBe(2);
 }, 20_000);
 
-it('a relative pasted URL never opts into cache', async () => {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  client.setQueryData(['schema-fields'], mocks.schema);
-  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/search?q=error&time=Last+hour']}><Search /></MemoryRouter></QueryClientProvider>);
-  await waitFor(() => expect(mocks.interactive).toHaveBeenCalledTimes(1));
-  expect(mocks.interactive.mock.calls[0][0]).toMatchObject({ use_cache: false });
-}, 20_000);
+// A router whose location lags the URL the page wrote, like a transition
+// that has not rendered yet. history (and so window.location) moves at once.
+const lag = { deliver: () => {} };
+function LaggingRouter({ children }: { children: ReactNode }) {
+  const [history] = useState(() => UNSAFE_createMemoryHistory({ initialEntries: ['/search'], v5Compat: true }));
+  const [state, setState] = useState({ action: history.action, location: history.location });
+  useLayoutEffect(() => {
+    let pending = state;
+    lag.deliver = () => setState(pending);
+    return history.listen(({ action, location }) => { pending = { action, location }; });
+  }, [history]); // eslint-disable-line react-hooks/exhaustive-deps
+  return <Router location={state.location} navigationType={state.action} navigator={history}>{children}</Router>;
+}
 
-it('a cached pasted URL shows its age and Refresh bypasses cache', async () => {
-  mocks.interactive.mockImplementationOnce(async (_request, _retry, onMeta) => {
-    onMeta?.({ hit: true, ageSecs: 120 });
-    return { results: [{ message: 'cached event' }], total_count: 1, fields: [], execution_time_ms: 0 };
-  });
+it('a new query runs once while the location lags: never the previous query again, never twice', async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  client.setQueryData(['schema-fields'], mocks.schema);
-  const entry = '/search?q=error&start=2026-10-06T11:53:42.000Z&end=2026-10-06T12:53:42.999Z';
-  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[entry]}><Search /></MemoryRouter></QueryClientProvider>);
-  const refresh = await screen.findByRole('button', { name: /cached .* ago · refresh/i });
-  await new Promise(resolve => setTimeout(resolve, 1_600));
-  fireEvent.click(refresh);
-  await waitFor(() => expect(mocks.interactive).toHaveBeenCalledTimes(2));
-  expect(mocks.interactive.mock.calls[1][0]).toMatchObject({ use_cache: false });
-}, 20_000);
+  const { container } = render(<QueryClientProvider client={client}><LaggingRouter><Search /></LaggingRouter></QueryClientProvider>);
+  const { content, view } = await mountEditor(container, 'source_type="apache_access" | stats count');
+  const runWhileTheLocationLags = async () => {
+    fireEvent.keyDown(content, { key: 'Enter', code: 'Enter', keyCode: 13 });
+    await settle();
+    await act(async () => { lag.deliver(); });
+    await settle();
+  };
+  await runWhileTheLocationLags();
+  expect(queries()).toEqual(['source_type="apache_access" | stats count']);
 
-it('a fresh fired-rule deep link honors absolute bounds over a relative preset and preferences', async () => {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  client.setQueryData(['schema-fields'], mocks.schema);
-  const entry = '/search?q=error&time=Last+hour&start=2026-10-06T11%3A53%3A42.000Z&end=2026-10-06T12%3A53%3A42.999Z';
-  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[entry]}><Search /></MemoryRouter></QueryClientProvider>);
-  await waitFor(() => expect(mocks.interactive).toHaveBeenCalledTimes(1));
-  expect(mocks.interactive.mock.calls[0][0].time_range).toEqual({ start: '2026-10-06T11:53:42.000Z', end: '2026-10-06T12:53:42.999Z' });
-});
+  view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: 'source_type="apache_error"' } });
+  await settle();
+  await runWhileTheLocationLags();
+  expect(queries()).toEqual(['source_type="apache_access" | stats count', 'source_type="apache_error"']);
+  expect(mocks.history).toHaveBeenCalledTimes(2);
+  // The editor keeps what the analyst ran, not the restored previous query.
+  expect(view.state.doc.toString()).toBe('source_type="apache_error"');
+}, 20_000);

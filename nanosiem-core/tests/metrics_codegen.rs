@@ -145,11 +145,12 @@ fn metrics_timechart_gap_fills_full_window() {
 
 #[test]
 fn metrics_rate_is_counter_reset_aware() {
-    // rate() on metrics sums positive deltas of the time-ordered values (drops
-    // reset spikes), NOT the naive (max-min).
+    // rate() on metrics sums the deltas of the time-ordered values; a decrease
+    // is a reset and adds the post-reset value (NAN-4902), NOT the naive (max-min).
     let sql = m(r#"metric_name="x" | timechart span=1h rate(value)"#);
     assert!(sql.contains("arrayDifference(arrayMap(p -> p.2, arraySort(p -> p.1, groupArray((timestamp, value"), "{sql}");
-    assert!(sql.contains("if(d > 0, d, 0)"), "{sql}");
+    assert!(sql.contains("if(d >= 0, d, v)"), "{sql}");
+    assert!(!sql.contains("if(d > 0, d, 0)"), "{sql}");
     assert!(!sql.contains("(max(value) - min(value))"), "metrics rate must be reset-aware: {sql}");
 }
 

@@ -49,25 +49,17 @@ fn top_rare_bounds_collision(field: &str, by_fields: &[String]) -> bool {
 }
 
 pub fn inject_timestamp_bounds(query: &Query) -> Query {
-    inject_time_bounds(query, "timestamp")
-}
-
-/// Enrich detection aggregations using the active schema profile's canonical
-/// event-time field. The legacy wrapper above deliberately remains stable for
-/// UDM callers and tests; strict OCSF lake execution passes `time` here.
-pub fn inject_time_bounds(query: &Query, time_field: &str) -> Query {
-    inject_bounds_tracked(query, time_field).0
+    inject_bounds_tracked(query).0
 }
 
 /// Recurse bottom-up, returning the (possibly enriched) query, whether its
 /// **output** stream still carries the raw `timestamp` column, and whether it
 /// carries the canonical `_first_seen`/`_last_seen` bounds (audit D14).
-fn inject_bounds_tracked(query: &Query, time_field: &str) -> (Query, bool, bool) {
+fn inject_bounds_tracked(query: &Query) -> (Query, bool, bool) {
     match query {
         Query::Search(expr) => (Query::Search(expr.clone()), true, false),
         Query::Piped { source, command } => {
-            let (enriched_source, source_ts, source_bounds) =
-                inject_bounds_tracked(source, time_field);
+            let (enriched_source, source_ts, source_bounds) = inject_bounds_tracked(source);
 
             let (new_command, output_ts, output_bounds) = match command {
                 // First aggregation over the raw stream: inject the canonical
@@ -78,7 +70,7 @@ fn inject_bounds_tracked(query: &Query, time_field: &str) -> (Query, bool, bool)
                     group_by,
                 } if source_ts => (
                     Command::Stats {
-                        aggregations: enrich_aggregations(aggregations, time_field),
+                        aggregations: enrich_aggregations(aggregations),
                         group_by: group_by.clone(),
                     },
                     false,
@@ -89,7 +81,7 @@ fn inject_bounds_tracked(query: &Query, time_field: &str) -> (Query, bool, bool)
                     group_by,
                 } if source_ts => (
                     Command::Chart {
-                        aggregations: enrich_aggregations(aggregations, time_field),
+                        aggregations: enrich_aggregations(aggregations),
                         group_by: group_by.clone(),
                     },
                     false,
@@ -108,17 +100,17 @@ fn inject_bounds_tracked(query: &Query, time_field: &str) -> (Query, bool, bool)
                     aggregations,
                     split_by,
                     limit,
-                    cont,
                     useother,
+                    cont,
                 } if source_ts => (
                     Command::Timechart {
                         span: *span,
                         bins: *bins,
-                        aggregations: enrich_aggregations(aggregations, time_field),
+                        aggregations: enrich_aggregations(aggregations),
                         split_by: split_by.clone(),
                         limit: *limit,
-                        cont: *cont,
                         useother: *useother,
+                        cont: *cont,
                     },
                     false,
                     true,
@@ -181,24 +173,15 @@ fn inject_bounds_tracked(query: &Query, time_field: &str) -> (Query, bool, bool)
                 // cycle (the NAN-1308/1309 flood). Carry the canonical bounds
                 // through the projection so dedup keeps keying on the stable
                 // window.
-                Command::Table { fields } if source_bounds => (
-                    Command::Table {
-                        fields: with_canonical_table_fields(fields),
-                    },
-                    false,
-                    true,
-                ),
-                Command::Fields { fields, keep } if source_bounds && *keep => (
-                    Command::Fields {
-                        fields: with_canonical_fields(fields),
-                        keep: true,
-                    },
-                    false,
-                    true,
-                ),
+                Command::Table { fields } if source_bounds => {
+                    (Command::Table { fields: with_canonical_table_fields(fields) }, false, true)
+                }
+                Command::Fields { fields, keep } if source_bounds && *keep => {
+                    (Command::Fields { fields: with_canonical_fields(fields), keep: true }, false, true)
+                }
                 other => (
                     other.clone(),
-                    source_ts && command_preserves_raw_time(other, time_field),
+                    source_ts && command_preserves_raw_timestamp(other),
                     source_bounds && command_keeps_bounds(other),
                 ),
             };
@@ -292,7 +275,7 @@ fn with_canonical_table_fields(fields: &[TableField]) -> Vec<TableField> {
 /// whole query (audit D3). So only commands *known* to preserve raw `timestamp`
 /// return `true`; everything else (aggregations, `table`, unknown/future
 /// commands) takes the `false` default.
-fn command_preserves_raw_time(command: &Command, time_field: &str) -> bool {
+fn command_preserves_raw_timestamp(command: &Command) -> bool {
     match command {
         // Row-preserving / field-adding: raw `timestamp` untouched. `rename`
         // emits `SELECT *, <col> AS <new>`, so the raw column also survives.
@@ -315,9 +298,9 @@ fn command_preserves_raw_time(command: &Command, time_field: &str) -> bool {
         // (or `*`); `fields - …` keeps it unless it is removed.
         Command::Fields { fields, keep } => {
             if *keep {
-                fields.iter().any(|f| f == time_field || f == "*")
+                fields.iter().any(|f| f == "timestamp" || f == "*")
             } else {
-                !fields.iter().any(|f| f == time_field)
+                !fields.iter().any(|f| f == "timestamp")
             }
         }
         // `bin` keeps the raw `timestamp` column except when a hop window or an
@@ -327,13 +310,7 @@ fn command_preserves_raw_time(command: &Command, time_field: &str) -> bool {
             field,
             alias,
             window_type,
-        } => bin_keeps_raw_time(
-            span,
-            field.as_deref(),
-            alias.as_deref(),
-            window_type,
-            time_field,
-        ),
+        } => bin_keeps_raw_timestamp(span, field.as_deref(), alias.as_deref(), window_type),
         _ => false,
     }
 }
@@ -346,21 +323,20 @@ fn command_preserves_raw_time(command: &Command, time_field: &str) -> bool {
 ///   (`SELECT *, … AS time_bucket`) keeps `timestamp`;
 /// - a **hop** window or an **in-place** tumbling bin (`alias == "timestamp"`)
 ///   emits `SELECT * EXCEPT (timestamp), …` and drops the raw column.
-fn bin_keeps_raw_time(
+fn bin_keeps_raw_timestamp(
     span: &BinSpan,
     field: Option<&str>,
     alias: Option<&str>,
     window_type: &WindowType,
-    time_field: &str,
 ) -> bool {
     if matches!(span, BinSpan::Numeric(_)) {
         return true; // numeric bin never touches `timestamp`
     }
     let field_name = match field {
-        Some("_time") | None => time_field,
+        Some("_time") | None => "timestamp",
         Some(f) => f,
     };
-    if field_name != time_field {
+    if field_name != "timestamp" {
         return true;
     }
     // Default alias matches the SQL generator: an explicit field bins in place
@@ -370,17 +346,7 @@ fn bin_keeps_raw_time(
     } else {
         "time_bucket"
     });
-    matches!(window_type, WindowType::Tumbling) && alias_name != time_field
-}
-
-#[cfg(test)]
-fn bin_keeps_raw_timestamp(
-    span: &BinSpan,
-    field: Option<&str>,
-    alias: Option<&str>,
-    window_type: &WindowType,
-) -> bool {
-    bin_keeps_raw_time(span, field, alias, window_type, "timestamp")
+    matches!(window_type, WindowType::Tumbling) && alias_name != "timestamp"
 }
 
 /// Append the canonical `min(timestamp) as _first_seen` /
@@ -394,13 +360,13 @@ fn bin_keeps_raw_timestamp(
 /// aggregation left findings without a canonical window and re-hashed every
 /// cycle (flood). The only skip is idempotency: don't add a `_first_seen` /
 /// `_last_seen` that is already present (e.g. on a second enrichment pass).
-fn enrich_aggregations(aggregations: &[Aggregation], time_field: &str) -> Vec<Aggregation> {
+fn enrich_aggregations(aggregations: &[Aggregation]) -> Vec<Aggregation> {
     let mut new_aggs = aggregations.to_vec();
 
     if !alias_in_use(&new_aggs, "_first_seen") {
         new_aggs.push(Aggregation::with_alias(
             AggFunc::Min,
-            Some(time_field.to_string()),
+            Some("timestamp".to_string()),
             "_first_seen".to_string(),
         ));
     }
@@ -408,7 +374,7 @@ fn enrich_aggregations(aggregations: &[Aggregation], time_field: &str) -> Vec<Ag
     if !alias_in_use(&new_aggs, "_last_seen") {
         new_aggs.push(Aggregation::with_alias(
             AggFunc::Max,
-            Some(time_field.to_string()),
+            Some("timestamp".to_string()),
             "_last_seen".to_string(),
         ));
     }
@@ -428,7 +394,7 @@ fn alias_in_use(aggregations: &[Aggregation], alias: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::{parse_query, PrettyPrint};
+    use crate::query::parse_query;
 
     #[test]
     fn test_injects_timestamp_bounds_into_stats() {
@@ -451,16 +417,6 @@ mod tests {
         } else {
             panic!("Expected Piped query");
         }
-    }
-
-    #[test]
-    fn strict_ocsf_injects_canonical_time_bounds() {
-        let query =
-            parse_query("metadata.log_source=windows_event | stats count by user.name").unwrap();
-        let rendered = inject_time_bounds(&query, "time").pretty_print();
-        assert!(rendered.contains("min(time) as _first_seen"), "{rendered}");
-        assert!(rendered.contains("max(time) as _last_seen"), "{rendered}");
-        assert!(!rendered.contains("timestamp"), "{rendered}");
     }
 
     #[test]
@@ -649,7 +605,8 @@ mod tests {
         // Audit D3 (codex): a hop window emits `SELECT * EXCEPT (timestamp)`, so
         // the raw column is gone — the stats over it must NOT be enriched or the
         // query errors every cycle.
-        let query = parse_query("error | bin span=1h hop=5m | stats count by time_bucket").unwrap();
+        let query =
+            parse_query("error | bin span=1h hop=5m | stats count by time_bucket").unwrap();
         let enriched = inject_timestamp_bounds(&query);
         let Query::Piped {
             command: Command::Stats { aggregations, .. },
@@ -690,12 +647,7 @@ mod tests {
         };
 
         // `bin span=1h` (default timestamp field → `time_bucket` alias): keeps it.
-        assert!(bin_keeps_raw_timestamp(
-            &hour,
-            None,
-            None,
-            &WindowType::Tumbling
-        ));
+        assert!(bin_keeps_raw_timestamp(&hour, None, None, &WindowType::Tumbling));
         // Hop window on timestamp: drops it.
         assert!(!bin_keeps_raw_timestamp(&hour, None, None, &hop));
         // In-place bin on timestamp (`bin timestamp span=1h`): drops it.
@@ -737,10 +689,7 @@ mod tests {
         };
         assert!(fields.iter().any(|f| f.name == "_first_seen"));
         assert!(fields.iter().any(|f| f.name == "_last_seen"));
-        assert!(
-            fields.iter().any(|f| f.name == "src_ip"),
-            "original field kept"
-        );
+        assert!(fields.iter().any(|f| f.name == "src_ip"), "original field kept");
     }
 
     #[test]
@@ -844,10 +793,7 @@ mod tests {
         else {
             panic!("expected outer Top");
         };
-        assert!(
-            !*inject_bounds,
-            "top after timestamp drop must stay unflagged"
-        );
+        assert!(!*inject_bounds, "top after timestamp drop must stay unflagged");
     }
 
     #[test]
@@ -910,7 +856,10 @@ mod tests {
         );
         // The inner top must have `inject_bounds = false`.
         let Query::Piped {
-            command: Command::Top { inject_bounds, .. },
+            command:
+                Command::Top {
+                    inject_bounds, ..
+                },
             ..
         } = source.as_ref()
         else {
@@ -921,84 +870,4 @@ mod tests {
             "collision must skip bounds injection on the top"
         );
     }
-}
-
-/// Apply the system exclusion at the raw search leaf, before stats, joins,
-/// projections or query-authored risk commands can turn probes into findings.
-/// Interactive search does not call this function: probes stay searchable.
-pub fn exclude_platform_probes(query: &Query) -> Query {
-    exclude_platform_probes_for_dataset(query,crate::query::Dataset::Logs)
-}
-
-pub fn exclude_platform_probes_for_dataset(query: &Query, dataset:crate::query::Dataset) -> Query {
-    match query {
-        Query::Search(expression) => {
-            let expression=exclude_probe_subsearches(expression,dataset);
-            if dataset!=crate::query::Dataset::Logs {return Query::Search(expression)}
-            let Query::Search(guard) = crate::query::parse_query(
-                "isnull(unmapped.nano_platform_probe_trusted) OR unmapped.nano_platform_probe_trusted!=\"v1\"")
-                .expect("fixed system probe predicate") else { unreachable!() };
-            Query::Search(crate::query::SearchExpr::And(Box::new(expression), Box::new(guard)))
-        }
-        Query::Piped { source, command } => {
-            let mut command = command.clone();
-            match &mut command {
-                Command::Append { subsearch, .. } => **subsearch = exclude_platform_probes_for_dataset(subsearch,dataset),
-                Command::Join { subsearch, subsearch_dataset, .. } =>
-                    **subsearch = exclude_platform_probes_for_dataset(subsearch,subsearch_dataset.unwrap_or(dataset)),
-                Command::Where { condition } => *condition = exclude_probe_subsearches(condition,dataset),
-                Command::Transaction { startswith, endswith, .. } => {
-                    if let Some(e)=startswith { *e=exclude_probe_subsearches(e,dataset); }
-                    if let Some(e)=endswith { *e=exclude_probe_subsearches(e,dataset); }
-                },
-                Command::Sequence { conditions, .. } => for e in conditions {*e=exclude_probe_subsearches(e,dataset);},
-                Command::Funnel { steps, .. } => for (_,e) in steps {*e=exclude_probe_subsearches(e,dataset);},
-                _ => {},
-            }
-            Query::Piped { source: Box::new(exclude_platform_probes_for_dataset(source,dataset)), command }
-        },
-    }
-}
-
-#[cfg(test)]
-mod platform_probe_tests {
-    use super::*;
-    use crate::query::{parse_query, PrettyPrint};
-    #[test]
-    fn cross_dataset_joins_guard_the_log_side_only() {
-        for text in ["* | join trace_id [dataset=logs search *]",
-            "trace_id IN [dataset=logs * | return trace_id]"] {
-            let query=parse_query(text).unwrap();
-            let output=exclude_platform_probes_for_dataset(&query,crate::query::Dataset::Spans).pretty_print();
-            assert_eq!(output.matches("isnull(unmapped.nano_platform_probe_trusted)").count(),1,"{output}");
-        }
-        let query=parse_query("trace_id IN [dataset=spans * | return trace_id]").unwrap();
-        let output=exclude_platform_probes_for_dataset(&query,crate::query::Dataset::Logs).pretty_print();
-        assert_eq!(output.matches("isnull(unmapped.nano_platform_probe_trusted)").count(),1,"{output}");
-        assert!(!exclude_platform_probes_for_dataset(&parse_query("*").unwrap(),crate::query::Dataset::Spans)
-            .pretty_print().contains("nano_platform_probe"));
-    }
-
-    #[test]
-    fn excludes_at_leaf_before_aggregate_and_risk() {
-        for text in ["*", "* | stats count by user", "* | eval x=1 | stats count"] {
-            let parsed = parse_query(text).unwrap();
-            let output = exclude_platform_probes(&parsed).pretty_print();
-            assert!(output.contains("nano_platform_probe_trusted"));
-            if output.contains('|') { assert!(output.find("nano_platform_probe_trusted").unwrap() < output.find('|').unwrap()); }
-        }
-    }
-}
-
-fn exclude_probe_subsearches(expression: &crate::query::SearchExpr, dataset:crate::query::Dataset) -> crate::query::SearchExpr {
-    use crate::query::SearchExpr;
-    let mut expression = expression.clone();
-    match &mut expression {
-        SearchExpr::InSubsearch { subsearch, subsearch_dataset, .. } =>
-            **subsearch = exclude_platform_probes_for_dataset(subsearch,subsearch_dataset.unwrap_or(dataset)),
-        SearchExpr::And(a,b) | SearchExpr::Or(a,b) => { **a=exclude_probe_subsearches(a,dataset); **b=exclude_probe_subsearches(b,dataset); },
-        SearchExpr::Not(e) | SearchExpr::Group(e) => **e=exclude_probe_subsearches(e,dataset),
-        _ => {},
-    }
-    expression
 }

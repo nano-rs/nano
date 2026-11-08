@@ -2,17 +2,15 @@
 
 import { FileText } from 'lucide-react';
 import type { AssetDossierFiles } from '@/lib/api/types';
-import { SectionCard, EmptyCell, PendingCell } from './_shared';
-import { formatBytes, formatCompact, formatEventTimeFull, formatEventTimeShort } from '../helpers';
+import { SectionCard, EmptyCell } from './_shared';
+import { formatBytes, formatCompact } from '../helpers';
 
 interface FilesCardProps {
-  /** NAN-3291: the dossier is still reading; an empty section is not yet known to be empty. */
-  pending?: boolean;
   files: AssetDossierFiles;
   onOpenAll?: () => void;
 }
 
-export function FilesCard({ files, onOpenAll, pending = false }: FilesCardProps) {
+export function FilesCard({ files, onOpenAll }: FilesCardProps) {
   const { writes, sensitive, exec, recent } = files;
 
   if (writes === 0 && recent.length === 0) {
@@ -23,7 +21,7 @@ export function FilesCard({ files, onOpenAll, pending = false }: FilesCardProps)
         onActionClick={onOpenAll}
         icon={<FileText className="w-[13px] h-[13px] text-muted-foreground/70" />}
       >
-        {pending ? <PendingCell /> : <EmptyCell>No file events for this entity in range</EmptyCell>}
+        <EmptyCell>No file events for this entity in range</EmptyCell>
       </SectionCard>
     );
   }
@@ -57,11 +55,8 @@ export function FilesCard({ files, onOpenAll, pending = false }: FilesCardProps)
             {recent.slice(0, 5).map((r, i) => (
               <li key={`${r.ts}-${i}`} className="text-[11.5px]">
                 <div className="flex items-baseline gap-2">
-                  <span
-                    className="font-mono text-muted-foreground/70 tabular-nums whitespace-nowrap shrink-0"
-                    title={formatEventTimeFull(r.ts)}
-                  >
-                    {formatEventTimeShort(r.ts)}
+                  <span className="font-mono text-muted-foreground/70 tabular-nums shrink-0">
+                    {r.ts}
                   </span>
                   <span className="text-[9.5px] font-mono uppercase tracking-[0.08em] px-1 py-0.5 rounded bg-foreground/5 text-muted-foreground/70 shrink-0">
                     {r.action.toUpperCase()}

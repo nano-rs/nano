@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Bounded provisional roots and exact, authorized job root/child pages.
+//! Bounded provisional roots and exact, authorized job root/child pages
+//! (NAN-3077). A `| tree` search sent with `x-nano-progressive-views: 1`
+//! answers a pending marker at once; the client then paints a bounded
+//! 200-row preview from here and pages the exact tree out of a durable
+//! background job (NAN-4915) by `job_id`.
 use crate::{
     error::{ErrorResponse, SearchError},
     SearchState,
 };
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     Json,
 };
 use nanosiem_core::{
@@ -55,7 +59,7 @@ pub struct TreePageResponse {
     pub note: Option<String>,
 }
 
-pub(super) fn supports_paged_tree(query: &nanosiem_core::query::Query) -> bool {
+pub(crate) fn supports_paged_tree(query: &nanosiem_core::query::Query) -> bool {
     fn prefix(query: &nanosiem_core::query::Query) -> bool {
         match query {
             nanosiem_core::query::Query::Search(_) => true,
@@ -178,7 +182,7 @@ pub fn page_tree(
     let next = request.offset.saturating_add(nodes.len());
     let mut stack = roots.iter().collect::<Vec<_>>();
     let mut total_nodes = 0;
-    let mut source_truncated = marker["_tree_truncated"] == true || !response.total_count_exact;
+    let mut source_truncated = marker["_tree_truncated"] == true;
     while let Some(node) = stack.pop() {
         total_nodes += 1;
         source_truncated |= node["_truncated"] == true;
@@ -197,7 +201,9 @@ pub fn page_tree(
         total_nodes,
         source_truncated,
         total_count: response.total_count,
-        total_count_exact: !preview && response.total_count_exact,
+        // A stored job's tree is the complete materialized view; a preview
+        // never claims exact counts.
+        total_count_exact: !preview,
         note: marker["_tree_note"].as_str().map(str::to_string),
     })
 }
@@ -228,9 +234,14 @@ pub async fn get_tree_page(
         }
         // Reuse the full search capability, ownership, tenant, source scope,
         // retention, signed-manifest and current-authority delivery fences.
-        let Json(status) =
-            super::search_jobs::get_search_job(State(state), Extension(auth), Path(job_id.clone()))
-                .await?;
+        // The job's first stored row is the tree marker.
+        let Json(status) = super::search_jobs::get_search_job(
+            State(state),
+            Extension(auth),
+            Path(job_id.clone()),
+            Query(super::search_jobs::JobStatusQuery { limit: Some(1) }),
+        )
+        .await?;
         if let Some(response) = &status.result {
             return Ok(Json(page_tree(response, &request, false)?));
         }
@@ -240,7 +251,7 @@ pub async fn get_tree_page(
                 .as_str()
                 .unwrap_or("failed")
                 .into(),
-            error: status.error.map(|error| nanosiem_core::branding::without_internal_code_name(&error).into_owned()),
+            error: status.error,
             preview: false,
             nodes: vec![],
             config: Value::Null,
@@ -268,9 +279,8 @@ pub async fn get_tree_page(
         .time_range
         .clone()
         .ok_or_else(|| SearchError::BadRequest("Missing preview time_range".into()))?;
-    let search = state.search_with_ai_for_auth(&auth)?;
-    super::require_shared_npl_contract_for_view(&auth, &query, Some("logs"), &search)?;
-    let response = search
+    let response = state
+        .search
         .search_with_admission(
             SearchRequest {
                 query,
@@ -287,12 +297,11 @@ pub async fn get_tree_page(
                 priority: None,
                 dataset: Some("logs".into()),
             },
-            auth.claims.sub,
+            super::admission_user(&auth)?,
             nanosiem_core::search::QueryPriority::Interactive,
             &super::search::effective_scope(&auth),
         )
         .await?;
-    super::require_current_shared_authority(&state, &auth).await?;
     Ok(Json(page_tree(&response, &request, true)?))
 }
 
@@ -304,105 +313,5 @@ pub async fn get_tree_page(
 pub struct TreePageApiDoc;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    fn request(path: Vec<usize>, offset: usize, limit: usize) -> TreePageRequest {
-        TreePageRequest {
-            job_id: Some("owned-job".into()),
-            query: None,
-            time_range: None,
-            parent_path: path,
-            offset,
-            limit,
-        }
-    }
-    fn forest() -> SearchResponse {
-        let mut response = SearchResponse::empty();
-        response.total_count = 1;
-        response.total_count_exact = true;
-        response.results = vec![
-            json!({"_display_type": "tree", "_tree_config": {"child_field": "process.uid"}, "_tree_nodes": [
-            {"id": "root", "label": "root", "_synthesized": true, "occurrences": 0, "children": [
-                {"id": "a", "label": "a", "_ancestors": [{"id": "ancestor"}], "occurrences": 4, "children": []},
-                {"id": "b", "label": "b", "_truncated": true, "children": []}]},
-            {"id": "second-root", "label": "second", "children": []}]}),
-        ];
-        response
-    }
-    #[test]
-    fn roots_and_children_are_server_pages_without_losing_tree_metadata() {
-        let response = forest();
-        let first = page_tree(&response, &request(vec![], 0, 1), false).unwrap();
-        assert_eq!(first.nodes.len(), 1);
-        assert_eq!(first.nodes[0]["children"], json!([]));
-        assert_eq!(first.nodes[0]["_children_count"], 2);
-        assert_eq!(first.nodes[0]["_page_path"], json!([0]));
-        assert_eq!(first.nodes[0]["_synthesized"], true);
-        assert_eq!(first.next_offset, Some(1));
-        assert!(first.source_truncated);
-        assert_eq!(first.total_roots, 2);
-        assert_eq!(first.total_nodes, 4);
-        let children = page_tree(&response, &request(vec![0], 0, 1), false).unwrap();
-        assert_eq!(children.nodes[0]["id"], "a");
-        assert_eq!(children.nodes[0]["occurrences"], 4);
-        assert_eq!(children.nodes[0]["_ancestors"], json!([{"id": "ancestor"}]));
-        assert_eq!(children.nodes[0]["_page_path"], json!([0, 0]));
-        assert_eq!(children.next_offset, Some(1));
-        let tail = page_tree(&response, &request(vec![0], 1, 1), false).unwrap();
-        assert_eq!(tail.nodes[0]["_truncated"], true);
-        assert_eq!(tail.next_offset, None);
-        let root_tail = page_tree(&response, &request(vec![], 1, 1), false).unwrap();
-        assert_eq!(root_tail.nodes[0]["id"], "second-root");
-        assert_eq!(root_tail.next_offset, None);
-        assert_eq!(first.total_count, response.total_count);
-    }
-    #[test]
-    fn preview_is_bounded_and_cannot_claim_complete_ancestry_or_counts() {
-        let query = preview_query("device.hostname=\"host\" | tree parent=actor.process.uid child=process.uid label=process.name").unwrap();
-        let parsed = nanosiem_core::query::parse_query(&query).unwrap();
-        let nanosiem_core::query::Query::Piped {
-            source,
-            command: Command::Tree { .. },
-        } = parsed
-        else {
-            panic!("missing tree");
-        };
-        assert!(matches!(
-            *source,
-            nanosiem_core::query::Query::Piped {
-                command: Command::Head { count: 200 },
-                ..
-            }
-        ));
-        let mutable = "* | lookup assets host OUTPUT owner | tree parent=parent child=child label=label";
-        let parsed = nanosiem_core::query::parse_query(mutable).unwrap();
-        assert!(!supports_paged_tree(&parsed));
-        assert!(preview_query(mutable).is_err());
-        let page = page_tree(&forest(), &request(vec![], 0, 25), true).unwrap();
-        assert!(page.preview);
-        assert!(!page.total_count_exact);
-        assert!(preview_query("* | tree parent=parent child=child label=label | head 1").is_err());
-        assert!(preview_query(
-            "device.hostname=\"host\" | lateral | tree parent=parent child=child label=label"
-        )
-        .is_err());
-    }
-    #[test]
-    fn empty_tree_note_reaches_the_page() {
-        let mut response = SearchResponse::empty();
-        response.results = vec![json!({"_display_type": "tree", "_tree_config": {}, "_tree_nodes": [],
-            "_tree_note": "No events in range carry http_request.referrer."})];
-        let page = page_tree(&response, &request(vec![], 0, 25), false).unwrap();
-        assert!(page.nodes.is_empty());
-        assert_eq!(page.note.as_deref(), Some("No events in range carry http_request.referrer."));
-        assert_eq!(page_tree(&forest(), &request(vec![], 0, 25), false).unwrap().note, None);
-    }
-    #[test]
-    fn page_bounds_and_missing_paths_fail_closed() {
-        assert!(page_tree(&forest(), &request(vec![10], 0, 25), false).is_err());
-        assert!(page_tree(&forest(), &request(vec![], 0, 0), false).is_err());
-        assert!(page_tree(&forest(), &request(vec![], 0, 101), false).is_err());
-        assert!(page_tree(&forest(), &request(vec![0; 17], 0, 25), false).is_err());
-        assert!(page_tree(&SearchResponse::empty(), &request(vec![], 0, 25), false).is_err());
-    }
-}
+#[path = "tree_page_tests.rs"]
+mod tests;

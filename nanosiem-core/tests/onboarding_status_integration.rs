@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! NAN-4779: the Getting Started checklist on a dedicated deployment (open
-//! core, sovereign single-host) against the production schema.
+//! NAN-4779 (ported to the ClickHouse product by NAN-4912): the Getting
+//! Started checklist against the production schema.
 //!
 //! Runs every migration through the boot runner, so the seeded rows a fresh
-//! install carries (the `system-ai` service account, the OpenTelemetry log
-//! source from migration 315) are present. Then it performs each step through
+//! install carries (the `system-ai` service account) are present. Then it performs each step through
 //! the repository the matching page or wizard calls, and checks that exactly
 //! that step clears:
 //!
@@ -78,8 +77,6 @@ fn wizard_feed(name: &str, vrl: &str, lifecycle: Option<&str>) -> NewLogSource {
         sampling_ratio: None,
         sampling_exclude_condition: None,
         lifecycle_status: lifecycle.map(str::to_string),
-        extension_vrl: None,
-        extension_enabled: None,
     }
 }
 
@@ -88,16 +85,19 @@ fn wizard_feed(name: &str, vrl: &str, lifecycle: Option<&str>) -> NewLogSource {
 async fn each_getting_started_step_clears_from_the_row_its_page_writes() {
     let pool = migrated_pool().await;
 
-    // The seeded rows a fresh install carries are present...
+    // The seeded rows a fresh install carries are present (no log source is
+    // seeded on this product; the exclusion list is empty but still applied)...
     let seeded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM log_sources WHERE name = ANY($1)")
         .bind(PLATFORM_SEEDED_LOG_SOURCES)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(
-        seeded, 1,
-        "migration 315 seeds the OpenTelemetry log source"
-    );
+    assert_eq!(seeded, 0);
+    let user_sources: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM log_sources")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user_sources, 0, "a fresh install has no log source");
     let system_users: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE status = 'system'")
             .fetch_one(&pool)
@@ -114,11 +114,11 @@ async fn each_getting_started_step_clears_from_the_row_its_page_writes() {
     );
     assert!(
         !fresh.has_log_sources,
-        "the seeded OTLP source must not clear Log Source: {fresh:?}"
+        "a fresh install must not clear Log Source: {fresh:?}"
     );
     assert!(
         !fresh.has_parsers,
-        "the seeded OTLP parser must not clear Log Parser: {fresh:?}"
+        "a fresh install must not clear Log Parser: {fresh:?}"
     );
     assert!(!fresh.has_org_context, "{fresh:?}");
     assert!(!fresh.has_search_history, "{fresh:?}");

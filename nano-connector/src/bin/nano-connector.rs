@@ -3,7 +3,8 @@
 //!   nano-connector schema                       JSON schema for specs
 //!   nano-connector validate <spec.yaml>...      compile-check spec + VRL
 //!   nano-connector preview <spec.yaml> <recording.json>
-//!       [--config K=V]... [--cred K=V]... [--artifact V --type T]
+//!       [--config K=V]... [--cred-file K=PATH]... [--creds-stdin]
+//!       [--artifact V --type T]
 //!       [--now RFC3339] [--show N]    run once, offline
 //!       [--checkpoints FILE] [--all-batches]
 //!   nano-connector shadow <spec.yaml> --mock-url http://127.0.0.1:PORT [opts]
@@ -40,6 +41,13 @@ fn usage() -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // Before arguments, credentials or any child: the host process holds
+    // credentials, so it must not be dumpable or ptrace-able by a same-uid
+    // worker that escaped a degraded sandbox, nor write a core file.
+    if let Err(e) = nano_connector::sandbox::harden_host_process() {
+        eprintln!("nano-connector: refusing to start: host process hardening failed: {e}");
+        return ExitCode::from(3);
+    }
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("vrl-worker") => match nano_connector::vrl_exec::worker_main(&args[2..]) {
@@ -92,6 +100,16 @@ fn report(r: Result<Value, String>) -> ExitCode {
     }
 }
 
+/// A credential file must be private to its owner (no group/other bits).
+fn protected(path: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(format!("{path}: credential file is accessible by group or others (mode {:o}); chmod 600 it", mode & 0o777));
+    }
+    Ok(())
+}
+
 fn read(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))
 }
@@ -121,9 +139,23 @@ fn run_preview(spec_path: &str, rec_path: Option<&str>, rest: &[String]) -> Resu
                 let (k, v) = kv(&val()?)?;
                 config.insert(k, Value::String(v));
             }
+            // Credential values never ride on argv (process listings, shell
+            // history): use --cred-file or --creds-stdin.
             "--cred" => {
-                let (k, v) = kv(&val()?)?;
-                creds.insert(k, v);
+                return Err("--cred K=V is refused: credentials on the command line leak into process listings and shell history; use --cred-file K=PATH (mode 0600) or --creds-stdin".into());
+            }
+            "--creds-stdin" => {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).map_err(|e| format!("--creds-stdin: {e}"))?;
+                for (n, line) in text.lines().enumerate() {
+                    let line = line.trim_end_matches('\r');
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    // Never echo the line: it holds a secret.
+                    let (k, v) = line.split_once('=').ok_or_else(|| format!("--creds-stdin: line {} is not K=V", n + 1))?;
+                    creds.insert(k.trim().to_string(), v.to_string());
+                }
             }
             "--artifact" => artifact = Some(val()?),
             "--type" => typ = Some(val()?),
@@ -132,9 +164,11 @@ fn run_preview(spec_path: &str, rec_path: Option<&str>, rest: &[String]) -> Resu
                 now = Some(chrono::DateTime::parse_from_rfc3339(&v).map_err(|e| format!("--now: {e}"))?.with_timezone(&chrono::Utc));
             }
             "--show" => show = val()?.parse().map_err(|e| format!("--show: {e}"))?,
-            // K=PATH: the credential is the file's content (PEM keys).
+            // K=PATH: the credential is the file's content (PEM keys). The
+            // file must not be readable by group or others.
             "--cred-file" => {
                 let (k, p) = kv(&val()?)?;
+                protected(&p)?;
                 creds.insert(k, read(&p)?);
             }
             "--mock-url" => mock_url = Some(val()?),

@@ -5,7 +5,6 @@
 //   • SyncHistoryDrawer — single "last sync" entry until backend history lands.
 //   • BulkImportDrawer  — per-rule severity/mode/source-merge with bulk-apply
 //                         toolbar, folder grouping, and live progress.
-//   • AddRepoDrawer     — wired to createRepository.
 //   • FolderSelectionDrawer — sync scope picker (lists folders + rule counts,
 //                         persists selected_paths, kicks a sync).
 
@@ -19,7 +18,6 @@ import {
   ChevronRight,
   CircleAlert,
   CircleCheck,
-  Clock,
   Download,
   Folder,
   FolderTree,
@@ -126,11 +124,7 @@ export function SyncHistoryDrawer({
       footer={
         <div className="flex items-center gap-2">
           <div className="flex-1 text-[10.5px] text-muted-foreground font-mono">
-            {repo.autoSync !== 'off' && repo.nextSync.overdue ? (
-              <span className={repo.lastSync.result === 'failed' ? 'text-destructive' : 'text-warning'}>
-                auto-sync overdue · {repo.nextSync.cadence}
-              </span>
-            ) : repo.autoSync !== 'off' ? (
+            {repo.autoSync !== 'off' ? (
               <>
                 next auto-sync in{' '}
                 <span className="text-foreground/70">{repo.nextSync.in}</span> ·{' '}
@@ -709,177 +703,7 @@ function BulkModeMenu({ onApply }: { onApply: (m: ImportMode) => void }) {
   );
 }
 
-// ------------------------------------------------------------------
-// Add repo drawer — wired to createRepository
-// ------------------------------------------------------------------
-
-type RuleFormat = 'sigma' | 'nanosiem';
-
-interface AddRepoProps {
-  open: boolean;
-  onClose: () => void;
-  onSubmit: (req: {
-    name: string;
-    url: string;
-    // Omitted when blank so the server applies its default content branch.
-    branch?: string;
-    rules_path: string;
-    rule_format: RuleFormat;
-    auto_sync_enabled: boolean;
-    sync_interval_hours: number;
-  }) => Promise<void> | void;
-  submitting?: boolean;
-}
-
-export function AddRepoDrawer({ open, onClose, onSubmit, submitting }: AddRepoProps) {
-  const [name, setName] = useState('');
-  const [url, setUrl] = useState('');
-  const [branch, setBranch] = useState('');
-  const [rulesPath, setRulesPath] = useState('');
-  const [format, setFormat] = useState<RuleFormat>('nanosiem');
-  const [cadence, setCadence] = useState<'off' | 'hourly' | '4h' | 'daily'>('hourly');
-
-  useEffect(() => {
-    if (open) {
-      setName('');
-      setUrl('');
-      setBranch('');
-      setRulesPath('');
-      setFormat('nanosiem');
-      setCadence('hourly');
-    }
-  }, [open]);
-
-  const cadenceHours =
-    cadence === 'hourly' ? 1 : cadence === '4h' ? 4 : cadence === 'daily' ? 24 : 0;
-  const valid = name.trim().length > 0 && url.trim().length > 0;
-
-  const submit = () => {
-    if (!valid) return;
-    onSubmit({
-      name: name.trim(),
-      url: url.trim(),
-      branch: branch.trim() || undefined,
-      rules_path: rulesPath.trim(),
-      rule_format: format,
-      auto_sync_enabled: cadence !== 'off',
-      sync_interval_hours: cadenceHours || 1,
-    });
-  };
-
-  return (
-    <SideDrawer
-      open={open}
-      onClose={onClose}
-      title="Connect a rule repo"
-      subtitle="GitHub, GitLab, or a public Git URL"
-      width={460}
-      footer={
-        <div className="flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={onClose}
-            className="h-[28px] px-3 rounded-md text-muted-foreground hover:text-foreground hover:bg-foreground/5 text-[11.5px]"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={submit}
-            disabled={!valid || submitting}
-            className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium disabled:opacity-60"
-          >
-            {submitting ? 'Connecting…' : 'Connect & sync'}
-          </button>
-        </div>
-      }
-    >
-      <div className="p-4 space-y-3">
-        <Field label="Display name">
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="acme rules (internal)"
-            className="w-full h-[30px] px-2.5 rounded-md border border-border bg-card text-[12px] focus:outline-none focus:border-primary"
-          />
-        </Field>
-        <Field label="Repository URL">
-          <input
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://github.com/acme-corp/nano-rules"
-            className="w-full h-[30px] px-2.5 rounded-md border border-border bg-card text-[12px] font-mono placeholder:text-muted-foreground focus:outline-none focus:border-primary"
-          />
-        </Field>
-        <div className="grid grid-cols-2 gap-2">
-          <Field label="Branch">
-            <input
-              value={branch}
-              placeholder="Automatic"
-              onChange={(e) => setBranch(e.target.value)}
-              className="w-full h-[30px] px-2.5 rounded-md border border-border bg-card text-[12px] font-mono focus:outline-none focus:border-primary"
-            />
-          </Field>
-          <Field label="Rules path">
-            <input
-              value={rulesPath}
-              onChange={(e) => setRulesPath(e.target.value)}
-              placeholder="rules/"
-              className="w-full h-[30px] px-2.5 rounded-md border border-border bg-card text-[12px] font-mono focus:outline-none focus:border-primary"
-            />
-          </Field>
-        </div>
-        <Field label="Rule format">
-          <div className="flex items-center gap-1">
-            {(['nanosiem', 'sigma'] as RuleFormat[]).map((f) => (
-              <button
-                key={f}
-                type="button"
-                onClick={() => setFormat(f)}
-                className={cn(
-                  'h-[26px] px-2.5 rounded-md text-[11.5px] border transition',
-                  format === f
-                    ? 'border-primary/40 bg-primary/10 text-primary'
-                    : 'border-border bg-card text-foreground/70 hover:bg-muted',
-                )}
-              >
-                {f === 'nanosiem' ? 'nPL (native)' : 'Sigma'}
-              </button>
-            ))}
-          </div>
-        </Field>
-        <Field label="Auto-sync cadence">
-          <div className="flex items-center gap-1">
-            {(['off', 'hourly', '4h', 'daily'] as const).map((c) => (
-              <button
-                key={c}
-                type="button"
-                onClick={() => setCadence(c)}
-                className={cn(
-                  'h-[26px] px-2.5 rounded-md text-[11.5px] border transition',
-                  cadence === c
-                    ? 'border-primary/40 bg-primary/10 text-primary'
-                    : 'border-border bg-card text-foreground/70 hover:bg-muted',
-                )}
-              >
-                {c}
-              </button>
-            ))}
-          </div>
-        </Field>
-        <div className="rounded-md border border-border bg-card/30 px-3 py-2 flex items-start gap-2">
-          <Clock className="w-[12px] h-[12px] text-muted-foreground mt-0.5" strokeWidth={1.5} />
-          <div className="text-[10.5px] text-muted-foreground leading-relaxed">
-            After connecting, use the <span className="text-foreground/70">Configure folders</span>{' '}
-            button on the repo card to scope which folders sync (especially for large upstream
-            repos like SigmaHQ).
-          </div>
-        </div>
-      </div>
-    </SideDrawer>
-  );
-}
-
+// Shared labelled form field (also used by DetectionCodeTargetsDrawer).
 export function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>

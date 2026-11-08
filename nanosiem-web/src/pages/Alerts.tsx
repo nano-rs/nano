@@ -197,7 +197,6 @@ function timeRangeWindowTitle(range: TimeRangeFilter): string | undefined {
 export function Alerts() {
   const navigate = useNavigate();
   const { hasPermission } = useAuth();
-  const alertPath = (id: string) => `/alerts/${id}`;
   const { capabilities } = useCapabilities();
   const { toast } = useToast();
 
@@ -726,7 +725,7 @@ export function Alerts() {
                         'group h-9 cursor-pointer border-border transition-colors',
                         isSelected ? 'bg-primary/10 hover:bg-primary/12' : 'hover:bg-muted/50',
                       )}
-                      onClick={() => navigate(alertPath(alert.id))}
+                      onClick={() => navigate(`/alerts/${alert.id}`)}
                     >
                       {showSelection && (
                         <TableCell className="pl-3" onClick={(e) => e.stopPropagation()}>
@@ -768,7 +767,7 @@ export function Alerts() {
                       </TableCell>
                       <TableCell>
                         <Link
-                          to={alertPath(alert.id)}
+                          to={`/alerts/${alert.id}`}
                           onClick={(e) => e.stopPropagation()}
                           className="font-mono text-[11.5px] text-foreground hover:text-primary truncate inline-block max-w-[420px] align-middle"
                           title={ruleName}
@@ -842,7 +841,7 @@ export function Alerts() {
                           )}
                           <button
                             type="button"
-                            onClick={() => navigate(alertPath(alert.id))}
+                            onClick={() => navigate(`/alerts/${alert.id}`)}
                             title="Open"
                             className="inline-flex h-6 w-6 items-center justify-center rounded-sm border border-border bg-card text-muted-foreground hover:text-foreground"
                           >

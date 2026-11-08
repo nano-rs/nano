@@ -43,7 +43,6 @@ use std::time::{Duration, Instant};
 /// so having the closure return `Pin<Box<dyn Future>` directly is the path of least resistance from
 /// the perspectives of both API designer and consumer.
 pub struct PoolOptions<DB: Database> {
-    pub(crate) on_connect_error: Option<Arc<dyn for<'a> Fn(&'a Pool<DB>, &'a Error) -> BoxFuture<'a, ()> + Send + Sync>>,
     pub(crate) test_before_acquire: bool,
     pub(crate) after_connect: Option<
         Arc<
@@ -95,7 +94,6 @@ impl<DB: Database> Clone for PoolOptions<DB> {
     fn clone(&self) -> Self {
         PoolOptions {
             test_before_acquire: self.test_before_acquire,
-            on_connect_error: self.on_connect_error.clone(),
             after_connect: self.after_connect.clone(),
             before_acquire: self.before_acquire.clone(),
             after_release: self.after_release.clone(),
@@ -146,7 +144,6 @@ impl<DB: Database> PoolOptions<DB> {
         Self {
             // User-specifiable routines
             after_connect: None,
-            on_connect_error: None,
             before_acquire: None,
             after_release: None,
             test_before_acquire: true,
@@ -390,16 +387,6 @@ impl<DB: Database> PoolOptions<DB> {
             + Sync,
     {
         self.after_connect = Some(Arc::new(callback));
-        self
-    }
-
-    /// Observe failed connection attempts before transient errors are retried.
-    /// The callback must not acquire a new connection from this pool.
-    pub fn on_connect_error<F>(mut self, callback: F) -> Self
-    where
-        F: for<'a> Fn(&'a Pool<DB>, &'a Error) -> BoxFuture<'a, ()> + Send + Sync + 'static,
-    {
-        self.on_connect_error = Some(Arc::new(callback));
         self
     }
 

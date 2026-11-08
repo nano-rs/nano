@@ -1,0 +1,46 @@
+#!/bin/sh
+# Stage a root-readable host TLS key for the unprivileged ClickHouse image user,
+# then delegate to the image's unmodified entrypoint. The source is a read-only
+# bind mount whose inode Docker pins before this process starts.
+set -eu
+
+fail() {
+  printf 'nano-tls-runtime-entrypoint: %s\n' "$*" >&2
+  exit 1
+}
+
+upstream_entrypoint=${1:-}
+test -n "$upstream_entrypoint" || fail "the upstream image entrypoint is required"
+shift
+test -x "$upstream_entrypoint" || fail "upstream entrypoint is not executable"
+
+if [ "${NANO_PRIVATE_TLS:-false}" = true ]; then
+  test "$(id -u)" = 0 \
+    || fail "TLS key staging must run as container root before dropping privileges"
+
+  source_key=/etc/nano/tls-source/server.key
+  runtime_dir=/run/nano-tls
+  runtime_key=$runtime_dir/server.key
+  test -f "$source_key" && test ! -L "$source_key" \
+    || fail "TLS source key must be a regular non-symlink bind mount"
+
+  runtime_uid=$(id -u clickhouse) \
+    || fail "the image has no clickhouse runtime user"
+  runtime_gid=$(id -g clickhouse) \
+    || fail "the image has no clickhouse runtime group"
+  test "$runtime_uid" -gt 0 && test "$runtime_gid" -gt 0 \
+    || fail "refusing to stage a service key for UID or GID 0"
+
+  test ! -L "$runtime_dir" || fail "TLS runtime directory must not be a symlink"
+  install -d -o "$runtime_uid" -g "$runtime_gid" -m 0700 "$runtime_dir"
+  temporary=$(mktemp "$runtime_dir/.server.key.XXXXXX") \
+    || fail "could not create the runtime key"
+  install -o "$runtime_uid" -g "$runtime_gid" -m 0400 "$source_key" "$temporary"
+  cmp -s "$source_key" "$temporary" \
+    || fail "runtime TLS key differs from the pinned source"
+  test "$(stat -c '%u:%g:%a' "$temporary")" = "$runtime_uid:$runtime_gid:400" \
+    || fail "runtime TLS key ownership or mode is unsafe"
+  mv -f "$temporary" "$runtime_key"
+fi
+
+exec "$upstream_entrypoint" "$@"

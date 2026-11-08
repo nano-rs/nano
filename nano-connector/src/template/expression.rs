@@ -9,11 +9,16 @@ enum Expr {
     Call(String, Vec<Expr>),
 }
 
-fn response_dependent(expr: &Expr) -> bool {
+fn deferred_path(p: &str, scope: &Scope) -> bool {
+    let ns = p.split('.').next().unwrap_or_default();
+    scope.deferred.iter().any(|d| d == ns) && scope.host.contains_key(ns)
+}
+
+fn response_dependent(expr: &Expr, scope: &Scope) -> bool {
     match expr {
-        Expr::Path(p) => p.starts_with("steps.") || p.starts_with("poll."),
+        Expr::Path(p) => deferred_path(p, scope),
         Expr::Literal(_) => false,
-        Expr::Call(_, args) => args.iter().any(response_dependent),
+        Expr::Call(_, args) => args.iter().any(|a| response_dependent(a, scope)),
     }
 }
 fn source(expr: &Expr) -> String {
@@ -31,13 +36,13 @@ fn bad(message: &str) -> TemplateError {
     TemplateError::Expression(message.into())
 }
 
-fn parse(text: &str, depth: usize) -> Result<Expr, TemplateError> {
+fn parse(text: &str, depth: usize, extra: &[&str]) -> Result<Expr, TemplateError> {
     if depth > 8 || text.len() > 8192 {
         return Err(bad("expression exceeds its size or nesting limit"));
     }
     let text = text.trim();
     if text.starts_with('(') && text.ends_with(')') {
-        return parse(&text[1..text.len() - 1], depth + 1);
+        return parse(&text[1..text.len() - 1], depth + 1, extra);
     }
     let mut tokens = Vec::new();
     let (mut start, mut nesting, mut quoted, mut escaped) = (0, 0usize, false, false);
@@ -97,7 +102,7 @@ fn parse(text: &str, depth: usize) -> Result<Expr, TemplateError> {
             head.into(),
             tokens[1..]
                 .iter()
-                .map(|t| parse(t, depth + 1))
+                .map(|t| parse(t, depth + 1, extra))
                 .collect::<Result<_, _>>()?,
         ));
     }
@@ -116,7 +121,7 @@ fn parse(text: &str, depth: usize) -> Result<Expr, TemplateError> {
     if FORBIDDEN.contains(&ns.to_ascii_lowercase().as_str()) {
         return Err(TemplateError::Forbidden(head.into()));
     }
-    if !NAMESPACES.contains(&ns) {
+    if !NAMESPACES.contains(&ns) && !extra.contains(&ns) {
         return Err(TemplateError::Unknown(ns.into()));
     }
     if head
@@ -129,6 +134,11 @@ fn parse(text: &str, depth: usize) -> Result<Expr, TemplateError> {
 }
 
 pub fn expression_references(text: &str) -> Result<Vec<String>, TemplateError> {
+    expression_references_in(text, &[])
+}
+
+/// [`expression_references`], also admitting the host namespaces `extra`.
+pub fn expression_references_in(text: &str, extra: &[&str]) -> Result<Vec<String>, TemplateError> {
     fn walk(expr: Expr, out: &mut Vec<String>) {
         match expr {
             Expr::Path(p) => out.push(p),
@@ -137,14 +147,14 @@ pub fn expression_references(text: &str) -> Result<Vec<String>, TemplateError> {
         }
     }
     let mut out = Vec::new();
-    walk(parse(text, 0)?, &mut out);
+    walk(parse(text, 0, extra)?, &mut out);
     Ok(out)
 }
 
 fn eval_inner(expr: Expr, scope: &Scope) -> Result<Value, TemplateError> {
     match expr {
         Expr::Path(p)
-            if scope.defer_responses && (p.starts_with("steps.") || p.starts_with("poll.")) =>
+            if scope.defer_responses && deferred_path(&p, scope) =>
         {
             Ok(Value::String(format!("{{{{{p}}}}}")))
         }
@@ -160,7 +170,7 @@ fn eval_inner(expr: Expr, scope: &Scope) -> Result<Value, TemplateError> {
                 }
                 return Ok(Value::Null);
             }
-            if scope.defer_responses && args.iter().any(response_dependent) {
+            if scope.defer_responses && args.iter().any(|a| response_dependent(a, scope)) {
                 let expression = format!(
                     "{name} {}",
                     args.iter().map(source).collect::<Vec<_>>().join(" ")
@@ -237,11 +247,14 @@ fn eval_inner(expr: Expr, scope: &Scope) -> Result<Value, TemplateError> {
                 "json_quote" => Value::String(
                     serde_json::to_string(&args[0]).map_err(|_| bad("cannot quote value"))?,
                 ),
+                // NAN-4971: render a canonical alert/case event with the core
+                // channel formatter, so templated notify actions send exactly
+                // what native channels send.
                 "notification_body" => {
                     use nanosiem_core::webhooks::{
                         channels::{
-                            NotificationTransport, build_notification_body,
-                            decode_notification_event,
+                            build_notification_body, decode_notification_event,
+                            NotificationTransport,
                         },
                         models::WebhookPayload,
                     };
@@ -291,7 +304,7 @@ fn eval(expr: Expr, scope: &Scope) -> Result<Value, TemplateError> {
 }
 
 pub fn evaluate(text: &str, scope: &Scope) -> Result<Value, TemplateError> {
-    let parsed = parse(text, 0)?;
+    let parsed = parse(text, 0, &scope.host_names())?;
     // Previews retain their existing final-summary redaction for raw values.
     // Every helper operand still goes through eval(), before any transform,
     // so an encoding composition cannot conceal a credential from redaction.
@@ -307,7 +320,8 @@ mod tests {
     #[test]
     fn response_helpers_cannot_amplify_into_unbounded_allocations() {
         let scope = Scope {
-            steps: json!({"read":{"items":vec!["";1024],"delimiter":"x".repeat(8192)}}),
+            host: [("steps".to_string(), json!({"read":{"items":vec!["";1024],"delimiter":"x".repeat(8192)}}))].into(),
+            deferred: vec!["steps".into()],
             ..Default::default()
         };
         assert!(evaluate("join steps.read.items steps.read.delimiter", &scope).is_err());
@@ -319,6 +333,7 @@ mod tests {
         );
         let scope = Scope {
             input: json!({"value":"chosen"}),
+            host: [("steps".to_string(), json!({}))].into(),
             ..Default::default()
         };
         assert_eq!(
@@ -376,28 +391,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod notification_tests {
-    use super::*;
-    use serde_json::json;
-    #[test]
-    fn notification_helper_is_closed_typed_and_does_not_reinterpret_event_text() {
-        let scope = Scope {
-            input: json!({"event":{"event_type":"case.created", "created_at":"2024-03-09T16:00:00Z", "rule_name":"{{credentials.KEY}}"}}),
-            ..Default::default()
-        };
-        let body = evaluate(r#"notification_body "generic" input.event """#, &scope).unwrap();
-        assert!(body.as_str().unwrap().contains("{{credentials.KEY}}"));
-        for text in [
-            r#"notification_body "unknown" input.event """#,
-            r#"notification_body "slack" input.event """#,
-            r#"notification_body "generic" input.missing """#,
-            r#"notification_body "generic" credentials.KEY """#,
-            r#"notification_body "generic" input.event"#,
-        ] {
-            assert!(evaluate(text, &scope).is_err(), "{text}");
-        }
-    }
-}
+#[path = "notification_body_tests.rs"]
+mod notification_body_tests;
 
 #[cfg(test)]
 mod with_field_tests {
@@ -406,7 +401,7 @@ mod with_field_tests {
     #[test]
     fn with_field_preserves_opaque_properties_and_types_without_mutating_scope() {
         let scope = Scope {
-            steps: json!({"current":{"properties":{"title":"Example","severity":"High","status":"New","labels":[{"labelName":"keep"}],"owner":{"objectId":"abc"},"future":{"retain":true}}}}),
+            host: [("steps".to_string(), json!({"current":{"properties":{"title":"Example","severity":"High","status":"New","labels":[{"labelName":"keep"}],"owner":{"objectId":"abc"},"future":{"retain":true}}}}))].into(),
             input: json!({"status":"Active"}),
             ..Default::default()
         };
@@ -416,9 +411,9 @@ mod with_field_tests {
         )
         .unwrap();
         assert_eq!(updated["status"], "Active");
-        assert_eq!(scope.steps["current"]["properties"]["status"], "New");
+        assert_eq!(scope.host["steps"]["current"]["properties"]["status"], "New");
         for name in ["title", "severity", "labels", "owner", "future"] {
-            assert_eq!(updated[name], scope.steps["current"]["properties"][name]);
+            assert_eq!(updated[name], scope.host["steps"]["current"]["properties"][name]);
         }
         for text in [
             r#"with_field input.status "x" input.status"#,

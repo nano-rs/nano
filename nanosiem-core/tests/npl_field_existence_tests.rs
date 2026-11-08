@@ -107,3 +107,79 @@ fn bare_star_still_matches_all_rows() {
         "bare `*` is match-all, not an existence test, got:\n{sql}"
     );
 }
+
+/// Numeric zero is a present value. Comparing its typed column to '' makes
+/// ClickHouse try to parse an empty number and fail the entire query.
+#[test]
+fn typed_scalar_existence_uses_a_string_safe_empty_check() {
+    for field in ["src_port", "dest_port", "bytes_in", "bytes_out"] {
+        for prefix in ["", "* | where "] {
+            for op in ["=", "!="] {
+                let sql = npl(&format!("{prefix}{field}{op}*"));
+                assert!(sql.contains("toString("), "{field}: {sql}");
+                assert!(sql.contains("IS NOT NULL"), "{field}: {sql}");
+            }
+        }
+    }
+}
+
+/// The pipeline must use array cardinality, rather than the nonempty string
+/// representation '[]' of an empty array.
+#[test]
+fn array_existence_agrees_before_and_after_a_pipe() {
+    for prefix in ["", "* | where "] {
+        let present = npl(&format!("{prefix}tags=*"));
+        let absent = npl(&format!("{prefix}tags!=*"));
+        assert!(
+            present.contains("notEmpty(tags)") || present.contains("notEmpty(\"tags\")"),
+            "{present}"
+        );
+        assert!(
+            absent.contains("empty(tags)") || absent.contains("empty(\"tags\")"),
+            "{absent}"
+        );
+    }
+}
+
+/// JSONExtractString returns '' for numbers and booleans too. Existence must
+/// inspect the actual JSON type so zero/false count, while null and [] do not.
+#[test]
+fn metadata_existence_is_not_a_string_only_extraction() {
+    for op in ["=", "!="] {
+        let sql = npl(&format!("metadata.answer{op}*"));
+        assert!(sql.contains("JSONType(metadata, 'answer')"), "{sql}");
+        assert!(sql.contains("JSONLength(metadata, 'answer')"), "{sql}");
+    }
+}
+
+/// OCSF metadata follows its native JSON-tail resolution, not UDM's column.
+#[test]
+fn metadata_existence_respects_the_active_schema() {
+    use nanosiem_core::schema::{FieldResolution, OcsfProfile, SchemaProfile};
+    let profile = std::sync::Arc::new(OcsfProfile::new());
+    let FieldResolution::JsonPath { col, .. } = profile.resolve("metadata.answer") else {
+        panic!("expected a native JSON tail");
+    };
+    let generator = ClickHouseSqlGenerator::new().with_profile(profile);
+    let query = parse_query("metadata.answer=*").unwrap();
+    let sql = generator.generate(&query, &test_time_range()).unwrap();
+    assert!(sql.contains(&format!("{col}.\"metadata\".\"answer\"")), "{sql}");
+    assert!(sql.contains("NOT IN ('\"\"', '[]')"), "{sql}");
+    assert!(!sql.contains("JSONType(metadata,"), "{sql}");
+}
+
+#[test]
+fn dynamic_and_computed_arrays_keep_typed_existence_semantics() {
+    // Dynamic JSON can hold strings or arrays; '[]' and [] are different.
+    let dynamic = npl("extra_values=*");
+    assert!(dynamic.contains("toJSONString(ext.extra_values)"), "{dynamic}");
+    assert!(dynamic.contains("NOT IN ('\"\"', '[]')"), "{dynamic}");
+    for query in [
+        r#"* | eval tags=split(user, ",") | where tags=*"#,
+        "* | stats values(user) as people | where people=*",
+    ] {
+        let sql = npl(query);
+        assert!(sql.contains("toJSONString("), "{query}: {sql}");
+        assert!(sql.contains("NOT IN ('\"\"', '[]')"), "{query}: {sql}");
+    }
+}

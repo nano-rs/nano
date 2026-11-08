@@ -83,8 +83,7 @@ export interface ParserRepoView {
   };
   lastCommit: { sha: string };
   lastSync: { ts: string | null; relative: string; result: 'ok' | 'warn' | 'failed' | 'pending' };
-  /** `overdue`: auto-sync is past due (NAN-3199) — never rendered as "next in 0m". */
-  nextSync: { in: string; cadence: string; overdue: boolean };
+  nextSync: { in: string; cadence: string };
   autoSync: 'off' | 'hourly' | '4h' | 'daily';
   raw: ParserRepository;
 }
@@ -139,8 +138,7 @@ function nextSyncIn(repo: ParserRepository, nowMs = Date.now()): string {
   const last = Date.parse(repo.last_synced_at);
   if (Number.isNaN(last)) return '—';
   const next = last + (repo.sync_interval_hours || 1) * 3600 * 1000;
-  const diff = next - nowMs;
-  if (diff <= 0) return 'overdue';
+  const diff = Math.max(0, next - nowMs);
   const min = Math.floor(diff / 60000);
   if (min < 60) return `${min}m`;
   const hr = Math.floor(min / 60);
@@ -194,7 +192,6 @@ export function buildRepoView(
     },
     nextSync: {
       in: nextSyncIn(repo, nowMs),
-      overdue: nextSyncIn(repo, nowMs) === 'overdue',
       cadence: cadenceFromHours(repo.sync_interval_hours),
     },
     autoSync: cadenceFromHours(repo.sync_interval_hours),

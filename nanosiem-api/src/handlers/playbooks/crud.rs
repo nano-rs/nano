@@ -186,7 +186,7 @@ pub async fn archive_playbook(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// hard delete a playbook (permanent removal, not archive).
+/// NAN-456: hard delete a playbook (permanent removal, not archive).
 /// FK CASCADE removes versions/runs/approvals/permissions. Detection-rules
 /// FK is RESTRICT — returns 409 if any rule still references this playbook.
 #[utoipa::path(

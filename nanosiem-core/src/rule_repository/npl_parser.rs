@@ -149,11 +149,7 @@ pub fn parse_npl(content: &str) -> Result<NplRule, NplParseError> {
 pub fn extract_source_types(query: &str) -> Vec<String> {
     let mut source_types = Vec::new();
     let mut push = |value: &str| {
-        let value = value
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_lowercase();
+        let value = value.trim().trim_matches('"').trim_matches('\'').to_lowercase();
         if !value.is_empty() && !source_types.contains(&value) {
             source_types.push(value);
         }

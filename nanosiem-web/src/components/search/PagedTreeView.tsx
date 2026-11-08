@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api';
-import { browserTenantRuntime } from '@/lib/tenant-runtime';
 import type { TreePageResponse, TimeRange } from '@/lib/api/types';
 import { abortableDelay } from '@/lib/abortable-delay';
 import { useReportPhase2Status } from './footer-reporter';
@@ -30,8 +29,9 @@ export function PagedTreeView({ marker, nodes, config, ...props }: Props) {
   const pending = marker._tree_pending === true;
   const query = typeof marker._tree_query === 'string' ? marker._tree_query : '';
   const range = marker._tree_time_range as TimeRange | undefined;
-  const scopeKey = browserTenantRuntime.current().key;
-  const key = JSON.stringify([scopeKey, query, range, marker._tree_run_id]);
+  // Ownership key: a new query, window or run id (every progressive answer
+  // mints a fresh `_tree_run_id`) supersedes the previous tree.
+  const key = JSON.stringify([query, range, marker._tree_run_id]);
   const [state, setState] = useState<PageState | null>(null);
   const owner = useRef<{ key: string; controller: AbortController } | null>(null);
   const requests = useRef(new Set<string>());
@@ -40,7 +40,7 @@ export function PagedTreeView({ marker, nodes, config, ...props }: Props) {
     const controller = new AbortController();
     const signal = controller.signal;
     owner.current = { key, controller }; requests.current = new Set();
-    const current = () => owner.current?.controller === controller && !signal.aborted && browserTenantRuntime.current().key === scopeKey;
+    const current = () => owner.current?.controller === controller && !signal.aborted;
     setState({ key, nodes: [], loading: true, pageLoading: false });
     void (async () => {
       try {
@@ -49,7 +49,7 @@ export function PagedTreeView({ marker, nodes, config, ...props }: Props) {
           if (!current()) return;
           setState({ key, nodes: page.nodes as unknown as TreeNode[], page, loading: true, pageLoading: false });
         } catch { if (!current()) return; }
-        const job = await api.searchAsync({ query, time_range: range, limit: 1, skip_histogram: true, skip_field_stats: true, priority: 'analytics' }, undefined, signal);
+        const job = await api.searchAsync({ query, time_range: range, limit: 1, skip_histogram: true, skip_field_stats: true, priority: 'analytics' }, signal);
         if (!current()) return;
         setState(previous => previous?.key === key ? { ...previous, jobId: job.job_id } : previous);
         while (current()) {
@@ -67,6 +67,7 @@ export function PagedTreeView({ marker, nodes, config, ...props }: Props) {
       }
     })();
     return () => { controller.abort(); if (owner.current?.controller === controller) owner.current = null; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `key` carries query, range (by value) and run id
   }, [pending, key, query]);
   const active = state?.key === key ? state : null;
   useReportPhase2Status({ loading: pending && (!active || active.loading), settled: !pending || !!active && !active.loading, error: active?.error, totalCount: active?.page && !active.page.preview ? active.page.total_count : undefined });

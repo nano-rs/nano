@@ -10,12 +10,14 @@
 //! its target enrichment table, so the field mapping lives in the parsers repo
 //! rather than hard-coded in this binary.
 //!
-//! Wire contract (see `config/vector/00-base.toml`): POST NDJSON to Vector's
-//! dedicated enrichment source (`:8090`) with `X-Source-Type: nano_enrich` and
-//! `Authorization: Bearer <VECTOR_AUTH_TOKEN>`. The `auth_check` transform
-//! validates the bearer token and the `enrichment_router` claims
-//! `source_type == "nano_enrich"`, routing by `.source` to the per-source
-//! normalize transforms.
+//! Wire contract (see `config/vector/04-enrichment-source.toml`): POST NDJSON
+//! to the dedicated Vector enrichment source (`:8090`) with
+//! `X-Source-Type: nano_enrich` and
+//! `Authorization: Bearer <VECTOR_AUTH_TOKEN>`. The source validates the
+//! bearer token and stamps every decoded object as `nano_enrich`; the
+//! `enrichment_router` routes by `.source` to the per-source normalize
+//! transforms. Public edges reject this source type on generic `/ingest` so
+//! callers cannot receive a log-lane acknowledgement for enrichment data.
 
 use serde::Serialize;
 use thiserror::Error;
@@ -25,6 +27,8 @@ use crate::ingestion::{VectorIngestClient, VectorIngestError};
 /// `.source_type` value the enrichment lane router claims — keeps these records
 /// out of the logs pipeline (`source_router.generic` excludes `nano_enrich`).
 pub const ENRICH_SOURCE_TYPE: &str = "nano_enrich";
+
+const DEFAULT_ENRICH_URL: &str = "http://vector:8090/";
 
 #[derive(Debug, Error)]
 pub enum EnrichmentLaneError {
@@ -62,23 +66,17 @@ impl EnrichmentLaneClient {
         }
     }
 
-    /// Build from the environment: `VECTOR_ENRICHMENT_INGEST_URL` (default
-    /// `http://vector:8090/`, with `VECTOR_INGEST_URL` as an upgrade fallback)
-    /// and `VECTOR_AUTH_TOKEN`. NAN-1151 provisions both
-    /// to `nanosiem-api` (where the identity-sync scheduler runs); without the
-    /// token, pushes to a token-protected Vector will 401 — callers should gate
-    /// on [`is_configured`](Self::is_configured) and surface that rather than
-    /// drop enrichment data silently.
+    /// Build from the environment: `VECTOR_ENRICH_URL` (default
+    /// `http://vector:8090/`) and `VECTOR_AUTH_TOKEN`. NAN-1151 provisions both
+    /// to `nanosiem-jobs` (which schedules identity sync) and `nanosiem-api`
+    /// (which can run it on demand). Without the token, protected Vector returns
+    /// 401; callers should gate on [`is_configured`](Self::is_configured).
     pub fn from_env() -> Self {
-        let ingest_url = std::env::var("VECTOR_ENRICHMENT_INGEST_URL")
+        let url = std::env::var("VECTOR_ENRICH_URL")
             .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| std::env::var("VECTOR_INGEST_URL").ok())
-            .unwrap_or_else(|| "http://vector:8090/".to_string());
-        let auth_token = std::env::var("VECTOR_AUTH_TOKEN")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        Self::new(ingest_url, auth_token)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_ENRICH_URL.to_string());
+        Self::new(url, std::env::var("VECTOR_AUTH_TOKEN").ok())
     }
 
     /// Whether a bearer token is present. A token-protected Vector rejects
@@ -98,8 +96,21 @@ impl EnrichmentLaneClient {
         &self,
         records: &[T],
     ) -> Result<(), EnrichmentLaneError> {
-        self.inner.push(ENRICH_SOURCE_TYPE, records).await?;
-        Ok(())
+        let result = self.inner.push(ENRICH_SOURCE_TYPE, records).await;
+        if let Err(VectorIngestError::Http(error)) = &result {
+            if error.status() == Some(reqwest::StatusCode::UNAUTHORIZED) {
+                tracing::error!(
+                    error = %error,
+                    "ENRICHMENT DELIVERY REFUSED: Vector returned 401; verify VECTOR_AUTH_TOKEN on nano-jobs/api and the Vector enrichment source"
+                );
+            } else if error.is_connect() {
+                tracing::error!(
+                    error = %error,
+                    "ENRICHMENT DELIVERY UNREACHABLE: cannot connect to the dedicated Vector listener; verify VECTOR_ENRICH_URL and port 8090 exposure"
+                );
+            }
+        }
+        result.map_err(EnrichmentLaneError::from)
     }
 }
 

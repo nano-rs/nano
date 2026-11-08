@@ -200,8 +200,8 @@
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 
-  /* pivt (ambient AI assistant) accent tokens. Violet is deliberately off the
-     cyan brand so pivt's voice reads as distinct. Hue 300° approximates the
+  /* PIVT (ambient AI assistant) accent tokens. Violet is deliberately off the
+     cyan brand so PIVT's voice reads as distinct. Hue 300° approximates the
      mockup's #A78BFA. */
   --pivt-accent: oklch(74% 0.16 300);
   --pivt-accent-dim: oklch(58% 0.12 300);
@@ -1118,26 +1118,24 @@ body {
     --shadow-xl: 0 20px 40px -8px rgba(0, 0, 0, 0.70);
     --shadow-2xl: 0 28px 60px -12px rgba(0, 0, 0, 0.80);
 
-    /* Syntax highlighting — grayscale by design, so token classes are told
-       apart by LUMINANCE steps (plus the weights in codemirror-theme.ts), and
-       regex keeps the one red accent. NAN-3195: keyword, string, field and
-       number used to share #BEBEBE, which read as no highlighting at all. */
-    --syntax-comment: #5C5C5C;
-    --syntax-string: #9E9E9E;
+    /* Syntax highlighting — near-monochrome with amber carrying the emphasis;
+       pipe stays the loud structural token, as in dark. */
+    --syntax-comment: #555555;
+    --syntax-string: #BEBEBE;
     --syntax-regex: #D35F5F;
     --syntax-regex-delim: #C63D3D;
     --syntax-regex-bg: rgba(211, 95, 95, 0.08);
-    --syntax-wildcard: #D4D4D4;
+    --syntax-wildcard: #BEBEBE;
     --syntax-wildcard-bg: rgba(190, 190, 190, 0.08);
-    --syntax-keyword: #FFFFFF;
+    --syntax-keyword: #BEBEBE;
     --syntax-function: var(--primary);
-    --syntax-eval-function: #D4D4D4;
+    --syntax-eval-function: #BEBEBE;
     --syntax-udm-field: var(--foreground);
-    --syntax-field: #C2C2C2;
-    --syntax-operator: #7A7A7D;
+    --syntax-field: #BEBEBE;
+    --syntax-operator: #8A8A8D;
     --syntax-pipe: #8A8A8D;
-    --syntax-arithmetic: #7A7A7D;
-    --syntax-number: #D9D9D9;
+    --syntax-arithmetic: #8A8A8D;
+    --syntax-number: #BEBEBE;
 
     /* AI/MeloD purple is a cross-theme brand identity ("preserved across
        redesign"), NOT a palette colour — it stays purple here on purpose. */

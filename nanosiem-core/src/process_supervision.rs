@@ -32,23 +32,6 @@ pub const RETURN_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// How the process leaves when a supervised task dies. Injectable for tests.
 pub type ExitFn = Arc<dyn Fn(i32) + Send + Sync>;
 
-/// Park a long-running task that has nothing to do in this deployment (its
-/// feature is disabled, its tables are absent) until process shutdown.
-///
-/// NAN-3376: supervised loops run under [`TaskPolicy::Loop`], where a clean
-/// return outside shutdown is fatal. A loop that decides at startup it has no
-/// work must therefore wait for shutdown rather than return, or the process
-/// exits with [`BACKGROUND_TASK_EXIT_CODE`] every few seconds. Genuine exits
-/// still return and still trip the supervisor.
-pub async fn park_until_shutdown(task: &'static str, reason: &str, shutdown: &ShutdownToken) {
-    tracing::info!(
-        task,
-        reason,
-        "background task disabled; parked until shutdown"
-    );
-    shutdown.cancelled().await;
-}
-
 /// The production exit: `std::process::exit` (k8s restarts the pod).
 pub fn process_exit() -> ExitFn {
     Arc::new(|code| std::process::exit(code))
@@ -62,6 +45,12 @@ pub enum TaskPolicy {
     /// A task that may legitimately finish (a one-shot sync, a loop that
     /// returns when its feature is disabled): only a panic is fatal.
     MayComplete,
+    /// A long-running loop whose clean return is NOT audited as impossible on
+    /// this branch (clickhouse/dev, NAN-4902): a panic is fatal, a return
+    /// outside shutdown is logged and counted but does not exit. This keeps a
+    /// loop that returns when its feature is unconfigured from crash-looping
+    /// a single-box deployment.
+    LoopWarnOnReturn,
 }
 
 /// How a supervised task ended.
@@ -103,6 +92,8 @@ pub enum Verdict {
     Ignore,
     /// A clean return of a loop: fatal unless shutdown starts within the grace.
     ExitUnlessShuttingDown,
+    /// A clean return of a `LoopWarnOnReturn` loop: log + count, keep running.
+    Warn,
     /// A panic outside shutdown: fatal now.
     Exit,
 }
@@ -115,6 +106,7 @@ pub fn verdict(end: &TaskEnd, policy: TaskPolicy, shutting_down: bool) -> Verdic
         (TaskEnd::Panicked(_), _) => Verdict::Exit,
         (TaskEnd::Returned | TaskEnd::Cancelled, TaskPolicy::Loop) => Verdict::ExitUnlessShuttingDown,
         (TaskEnd::Returned | TaskEnd::Cancelled, TaskPolicy::MayComplete) => Verdict::Ignore,
+        (TaskEnd::Returned | TaskEnd::Cancelled, TaskPolicy::LoopWarnOnReturn) => Verdict::Warn,
     }
 }
 
@@ -157,9 +149,16 @@ async fn on_task_end(
         tracing::debug!(task = name, outcome = end.outcome(), "background task finished");
         return;
     }
-    if verdict == Verdict::ExitUnlessShuttingDown
+    if matches!(verdict, Verdict::ExitUnlessShuttingDown | Verdict::Warn)
         && tokio::time::timeout(grace, shutdown.cancelled()).await.is_ok()
     {
+        return;
+    }
+    if verdict == Verdict::Warn {
+        metrics::counter!("nano_background_task_deaths_total", "task" => name, "outcome" => end.outcome())
+            .increment(1);
+        tracing::warn!(task = name, outcome = end.outcome(),
+            "long-running background task stopped outside shutdown");
         return;
     }
     metrics::counter!("nano_background_task_deaths_total", "task" => name, "outcome" => end.outcome())
@@ -242,6 +241,9 @@ mod tests {
         assert_eq!(verdict(&TaskEnd::Returned, TaskPolicy::Loop, false), Verdict::ExitUnlessShuttingDown);
         assert_eq!(verdict(&TaskEnd::Returned, TaskPolicy::MayComplete, false), Verdict::Ignore);
         assert_eq!(verdict(&TaskEnd::Returned, TaskPolicy::Loop, true), Verdict::Ignore);
+        assert_eq!(verdict(&panic, TaskPolicy::LoopWarnOnReturn, false), Verdict::Exit);
+        assert_eq!(verdict(&TaskEnd::Returned, TaskPolicy::LoopWarnOnReturn, false), Verdict::Warn);
+        assert_eq!(verdict(&TaskEnd::Returned, TaskPolicy::LoopWarnOnReturn, true), Verdict::Ignore);
     }
 
     #[tokio::test]
@@ -290,6 +292,14 @@ mod tests {
         assert_eq!(code.load(Ordering::SeqCst), -1, "shutdown within the grace is not fatal");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_warn_on_return_loop_returning_does_not_exit() {
+        let (exit, code) = recording_exit();
+        let shutdown = ShutdownToken::new();
+        on_task_end("loop", TaskEnd::Returned, TaskPolicy::LoopWarnOnReturn, &shutdown, &exit, Duration::from_secs(5)).await;
+        assert_eq!(code.load(Ordering::SeqCst), -1);
+    }
+
     #[tokio::test]
     async fn completion_and_shutdown_are_not_fatal() {
         let (exit, code) = recording_exit();
@@ -322,36 +332,6 @@ mod tests {
         assert!(supervisor.await.unwrap_err().is_cancelled());
         assert!(rx.await.is_err(), "the supervised task was aborted too");
         assert_eq!(code.load(Ordering::SeqCst), -1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_parked_disabled_loop_never_takes_the_exit_path() {
-        // NAN-3376: a disabled loop parks instead of returning, so a Loop
-        // supervisor stays quiet well past the return grace and the task ends
-        // only with shutdown.
-        let (exit, code) = recording_exit();
-        let shutdown = ShutdownToken::new();
-        let parked = shutdown.clone();
-        let task = tokio::spawn(async move {
-            park_until_shutdown("test_disabled", "feature off", &parked).await;
-        });
-        let supervisor = supervise(
-            "test_disabled",
-            task,
-            TaskPolicy::Loop,
-            shutdown.clone(),
-            exit,
-        );
-        tokio::time::sleep(RETURN_SHUTDOWN_GRACE * 4).await;
-        assert!(!supervisor.is_finished(), "a parked task must stay running");
-        assert_eq!(code.load(Ordering::SeqCst), -1);
-        shutdown.cancel();
-        supervisor.await.unwrap();
-        assert_eq!(
-            code.load(Ordering::SeqCst),
-            -1,
-            "ending on shutdown is not fatal"
-        );
     }
 
     #[test]

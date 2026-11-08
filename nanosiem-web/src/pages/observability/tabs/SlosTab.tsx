@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { TelemetrySetupHint } from '@/components/observability/TelemetryUnavailable';
+import { TelemetrySetupHint } from '@/components/observability/TelemetrySetupHint';
 
 // SlosTab (NAN-1536) — service-level objectives with error-budget cards.
 //
@@ -25,6 +25,7 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { BudgetBar } from '@/components/observability/charts';
 import { SloEditorDialog } from '@/components/observability/SloEditorDialog';
 import { cn } from '@/lib/utils';
+import { fmtAgo } from '@/components/observability/format';
 import type { ObservabilityTabProps } from '../types';
 
 // O17 (NAN-1721): the backend now returns a distinct "no_data" status when a
@@ -206,6 +207,12 @@ export function SlosTab({ onOpenService }: ObservabilityTabProps) {
                         <>
                           <span>·</span>
                           <span>&lt;{s.latency_threshold_ms}ms</span>
+                        </>
+                      )}
+                      {s.evaluated_at && (
+                        <>
+                          <span>·</span>
+                          <span title={`Last scheduled evaluation ${s.evaluated_at}`}>eval {fmtAgo(s.evaluated_at)}</span>
                         </>
                       )}
                     </div>

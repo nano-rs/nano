@@ -116,6 +116,9 @@ impl AuthPlugin for DuoHmacAuth {
             self.params.secret_key_credential.clone(),
         ]
     }
+    fn identifier_fields(&self) -> Vec<String> {
+        vec![self.params.integration_key_credential.clone()]
+    }
     fn set_request_limit(&mut self, limit: u32) {
         self.max_requests = limit as usize;
     }
@@ -227,7 +230,6 @@ mod tests {
             fetch: &NoToken,
             scope: &scope,
             now: chrono::Utc::now(),
-            feed_id: None,
         };
         let mut request = OutboundRequest {
             method: http::Method::GET,

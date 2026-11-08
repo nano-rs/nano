@@ -14,6 +14,7 @@
 //! ```
 
 mod commands_core;
+pub(crate) use commands_core::search_wildcards_to_like;
 mod commands_enrichment;
 mod commands_extended;
 mod commands_security;
@@ -65,8 +66,37 @@ const MAX_CHAIN_LEN: usize = 1024;
 /// above any legitimate query (large IN/IOC lists included). NAN-2010.
 const MAX_QUERY_LEN: usize = 1_048_576;
 
+/// Maximum operator-chain fold steps in one parse attempt (NAN-4917). Every
+/// fold adds one level to a left-nested spine, so this bounds the depth of any
+/// tree the parser can MATERIALIZE — including one that is later rejected or
+/// abandoned on backtrack, whose compiler-generated (recursive) `Drop` would
+/// otherwise overflow: 50 parenthesis levels × 1024-term chains at each of the
+/// six eval precedence levels is a ~300k-deep spine. Generous for real queries
+/// (sixteen full 1024-term chains); the post-parse `MAX_AST_DEPTH` budget is
+/// the tighter admission limit.
+const MAX_FOLD_STEPS: usize = 16 * 1024;
+
 thread_local! {
     static NESTING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Fold steps consumed by the current parse attempt (see MAX_FOLD_STEPS).
+    static FOLD_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Human-readable reason for the last limit `Failure` raised by the parser
+    /// (pipe-stage / fold budget). Consumed by `parse_query` so the error says
+    /// which limit tripped instead of the generic nesting message.
+    static LIMIT_MESSAGE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Reset the per-attempt parser budgets.
+fn reset_parse_budgets() {
+    NESTING_DEPTH.with(|d| d.set(0));
+    FOLD_STEPS.with(|d| d.set(0));
+    LIMIT_MESSAGE.with(|m| *m.borrow_mut() = None);
+}
+
+/// Raise a non-backtracking limit failure carrying `message`.
+fn limit_failure(input: &str, message: String) -> nom::Err<nom::error::Error<&str>> {
+    LIMIT_MESSAGE.with(|m| *m.borrow_mut() = Some(message));
+    nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::TooLarge))
 }
 
 /// Increment nesting depth and return error if exceeded.
@@ -100,6 +130,20 @@ impl Drop for NestingGuard {
 /// that a later recursive walk would stack-overflow on. Returns a nom `Failure`
 /// (halts backtracking) so the query is rejected with a clean parse error.
 fn check_chain_len(input: &str, len: usize) -> Result<(), nom::Err<nom::error::Error<&str>>> {
+    let steps = FOLD_STEPS.with(|d| {
+        let next = d.get().saturating_add(len);
+        d.set(next);
+        next
+    });
+    if steps > MAX_FOLD_STEPS {
+        return Err(limit_failure(
+            input,
+            format!(
+                "Query too complex: more than {MAX_FOLD_STEPS} chained operators in total. \
+                 Use `field IN (...)` for long value lists or split the query."
+            ),
+        ));
+    }
     if len > MAX_CHAIN_LEN {
         return Err(nom::Err::Failure(nom::error::Error::new(
             input,
@@ -109,32 +153,26 @@ fn check_chain_len(input: &str, len: usize) -> Result<(), nom::Err<nom::error::E
     Ok(())
 }
 
-/// NAN-4283: whether a `//` or `/*` whose first slash follows `prev` starts a
-/// comment. Only a slash pair at a token boundary does: start of input,
-/// whitespace, or a pipeline/grouping delimiter. Inside an unquoted value
-/// (`url=https://host/path`, `path=/var/*`) the pair is part of the value. Treating
-/// it as a comment silently dropped the rest of the query, including every
-/// `| command`. Every nPL comment stripper must share this rule.
-pub fn comment_may_start_after(prev: Option<char>) -> bool {
-    match prev {
-        None => true,
-        Some(c) => c.is_whitespace() || matches!(c, '|' | '(' | ')' | '[' | ']' | ','),
-    }
-}
-
 /// Strip comments from query input
 /// Handles:
 /// - Single-line comments: // comment (to end of line)
 /// - Block comments: /* comment */
 ///
-/// Both forms start only at a token boundary ([`comment_may_start_after`]).
-pub(crate) fn strip_comments(input: &str) -> String {
+/// A comment opener counts only at a token boundary: the start of the input
+/// or after whitespace, outside quotes. So a bare URL (`http://x/y`, the
+/// `//` follows `:`), a URL glob (`/path/*`) and an escaped-slash regex
+/// literal (`/a\//`) are query text, not comments (lane A review, P2-6).
+pub fn strip_comments(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     let mut in_string = false;
     let mut string_char = '"';
+    // Last source character seen (None at the start of the input).
+    let mut prev: Option<char> = None;
 
     while let Some(c) = chars.next() {
+        let at_boundary = prev.is_none_or(char::is_whitespace);
+        prev = Some(c);
         // Track string state to avoid stripping "comments" inside strings
         if !in_string && (c == '"' || c == '\'') {
             in_string = true;
@@ -155,7 +193,7 @@ pub(crate) fn strip_comments(input: &str) -> String {
         }
 
         // Check for comments
-        if c == '/' && comment_may_start_after(result.chars().next_back()) {
+        if c == '/' && at_boundary {
             match chars.peek() {
                 Some(&'/') => {
                     // Single-line comment: skip to end of line
@@ -325,7 +363,9 @@ pub(crate) fn split_time_modifiers(input: &str) -> (String, Vec<String>, Vec<Str
         }
 
         // Check for earliest= or latest= (case-insensitive), only at a word
-        // boundary: `is_latest=true` / `x.earliest=1` are ordinary filters.
+        // boundary: `is_latest=true` / `x.earliest=1` are ordinary filters
+        // (NAN-3340: the whole token is now validated, so a mid-word match
+        // would turn a field filter into an "invalid time modifier" error).
         let at_boundary = result
             .chars()
             .next_back()
@@ -368,26 +408,13 @@ pub(crate) fn split_time_modifiers(input: &str) -> (String, Vec<String>, Vec<Str
 
 /// Parse a piped query string into an AST
 pub fn parse_query(input: &str) -> Result<Query, ParseError> {
-    parse_query_inner(input).map_err(|mut error| {
-        if input.len() > MAX_QUERY_LEN { return error; }
-        let safe = crate::inputlookup::storage_policy::redact_url_credentials(input);
-        if safe != input {
-            // Error snippets can start inside a signature without its URL prefix.
-            // Suppress all derived fragments, retaining only redacted full text.
-            error.message = "Invalid query containing a redacted URL".into();
-            error.full_query = Some(safe);
-            error.token = None;
-            error.context_before = None;
-            error.suggestions.clear();
-            error.expected.clear();
-        }
-        error
-    })
+    // NAN-4917: guaranteed stack budget for the parse + post-parse validation.
+    super::complexity::with_query_stack(|| parse_query_unguarded(input))
 }
 
-fn parse_query_inner(input: &str) -> Result<Query, ParseError> {
-    // Reset nesting depth counter at the start of each parse
-    NESTING_DEPTH.with(|d| d.set(0));
+fn parse_query_unguarded(input: &str) -> Result<Query, ParseError> {
+    // Reset nesting depth / fold / limit-message state at the start of each parse
+    reset_parse_budgets();
 
     // NAN-2010: reject an absurdly long query before doing any work — a cheap
     // DoS backstop that bounds total AST size regardless of shape.
@@ -437,11 +464,20 @@ fn parse_query_inner(input: &str) -> Result<Query, ParseError> {
             full_query: Some(input.to_string()),
         });
     }
+    // NAN-3340: validate each WHOLE modifier token. The search layer used to
+    // read only a `-7d` prefix and leave `@d` behind as a search term, so a
+    // snapped or malformed modifier silently searched the wrong window.
     for token in extract_time_modifier_tokens(&normalized) {
         if let Err(message) = super::time_modifiers::resolve(&token, chrono::Utc::now()) {
             return Err(ParseError {
-                message, position: 0, line: 1, column: 1, token: Some(token),
-                context_before: None, expected: vec![], suggestions: vec![],
+                message,
+                position: 0,
+                line: 1,
+                column: 1,
+                token: Some(token),
+                context_before: None,
+                expected: vec![],
+                suggestions: vec![],
                 full_query: Some(input.to_string()),
             });
         }
@@ -483,6 +519,9 @@ fn parse_query_inner(input: &str) -> Result<Query, ParseError> {
             // containing two `rex` stages: the first pattern was repaired, the
             // second failed, and the whole original query was rejected.
             let original_error = error;
+            // NAN-4917: keep the primary attempt's limit reason (a retry may
+            // overwrite the thread-local).
+            let limit_message = LIMIT_MESSAGE.with(|m| m.borrow_mut().take());
             let mut recovery_input = normalized.to_string();
             let mut position = normalized.len().saturating_sub(original_error.input.len());
             for _ in 0..MAX_PIPE_COMMANDS {
@@ -494,7 +533,7 @@ fn parse_query_inner(input: &str) -> Result<Query, ParseError> {
                 if rewritten == recovery_input {
                     break;
                 }
-                NESTING_DEPTH.with(|depth| depth.set(0));
+                reset_parse_budgets();
                 let attempt = {
                     let mut recovery_parser = all_consuming(query);
                     recovery_parser.parse(rewritten.as_str()).finish()
@@ -511,6 +550,21 @@ fn parse_query_inner(input: &str) -> Result<Query, ParseError> {
             // Recovery is invisible unless the complete query succeeds. If an
             // unrelated syntax problem remains, keep the original query and
             // its original SPL-quote guidance in the diagnostic.
+            if original_error.code == nom::error::ErrorKind::TooLarge {
+                if let Some(message) = limit_message {
+                    return Err(ParseError {
+                        message,
+                        position: 0,
+                        line: 1,
+                        column: 1,
+                        token: None,
+                        context_before: None,
+                        expected: vec![],
+                        suggestions: vec![],
+                        full_query: Some(input.to_string()),
+                    });
+                }
+            }
             Err(convert_error(normalized, original_error))
         }
     };
@@ -537,6 +591,23 @@ fn validate_pipe_depth(parsed_query: Query, input: &str) -> Result<Query, ParseE
             full_query: Some(input.to_string()),
         });
     }
+    // NAN-4917: whole-query depth + alias-inlined size budget. Lives here so the
+    // primary parse and the SPL-compat retry — and therefore every consumer of
+    // `parse_query` (batch + stream search, explain, detection compilation) —
+    // share one guard.
+    if let Err(message) = super::complexity::check_query_complexity(&parsed_query) {
+        return Err(ParseError {
+            message,
+            position: 0,
+            line: 1,
+            column: 1,
+            token: None,
+            context_before: None,
+            expected: vec![],
+            suggestions: vec![],
+            full_query: Some(input.to_string()),
+        });
+    }
     Ok(parsed_query)
 }
 
@@ -551,8 +622,7 @@ fn validate_pipe_depth(parsed_query: Query, input: &str) -> Result<Query, ParseE
 fn query(input: &str) -> ParseResult<'_, Query> {
     // Optionally consume leading "search" keyword (common in subsearches)
     // e.g., [search status=500] or just [status=500]
-    let (input, explicit_search) =
-        opt(terminated(tag_no_case("search"), multispace1)).parse(input)?;
+    let (input, explicit_search) = opt(terminated(tag_no_case("search"), multispace1)).parse(input)?;
 
     // Three entry shapes:
     //   | stats ...   generating command, explicit leading pipe
@@ -584,6 +654,21 @@ fn query(input: &str) -> ParseResult<'_, Query> {
     ))
     .parse(input)?;
     commands.extend(piped);
+
+    // NAN-4917: enforce the stage cap HERE, on the flat vector, so it applies
+    // to the root pipeline and to every `append`/`join`/`IN [subsearch]`
+    // pipeline (they call `query` directly) before a deep `Query::Piped`
+    // spine is ever folded.
+    if commands.len() > MAX_PIPE_COMMANDS {
+        return Err(limit_failure(
+            input,
+            format!(
+                "Query too complex: maximum {} pipe commands allowed (found {})",
+                MAX_PIPE_COMMANDS,
+                commands.len()
+            ),
+        ));
+    }
 
     let query = commands
         .into_iter()
@@ -628,7 +713,12 @@ fn query(input: &str) -> ParseResult<'_, Query> {
 /// Two escapes force the search reading: quote it (`"top user"`) or say so
 /// (`search top user`).
 fn leading_command(input: &str) -> ParseResult<'_, Command> {
-    let reject = || nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Verify));
+    let reject = || {
+        nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        ))
+    };
 
     let (rest, cmd) = command(input)?;
 
@@ -681,8 +771,12 @@ fn opens_a_query(cmd: &Command) -> bool {
 
 /// Count the number of pipe commands in a parsed query tree.
 fn count_pipe_commands(query: &Query) -> usize {
-    match query {
-        Query::Search(_) => 0,
-        Query::Piped { source, .. } => 1 + count_pipe_commands(source),
+    // Iterative (NAN-4917): never recurse on a spine length.
+    let mut count = 0;
+    let mut cur = query;
+    while let Query::Piped { source, .. } = cur {
+        count += 1;
+        cur = source;
     }
+    count
 }

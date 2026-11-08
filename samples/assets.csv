@@ -1,0 +1,11 @@
+ip,hostname,department,criticality,owner
+192.168.1.100,workstation-001,IT,high,admin
+192.168.1.101,workstation-002,Sales,medium,jsmith
+192.168.1.102,workstation-003,HR,low,mwilson
+192.168.1.103,workstation-004,Finance,high,dbrown
+10.0.0.5,auth-server,IT,critical,sysadmin
+10.0.0.10,file-server,IT,high,sysadmin
+10.0.0.15,web-server,IT,medium,webteam
+10.0.0.20,db-server,IT,critical,dba
+172.16.0.50,external-host,External,unknown,unknown
+10.20.30.40,suspicious-host,External,unknown,unknown

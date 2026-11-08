@@ -3,8 +3,11 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'fs';
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
+/// <reference types="vitest/config" />
 import { defineConfig, loadEnv, Plugin } from 'vite';
+import { configDefaults } from 'vitest/config';
 import { applyCsp, assertInlineScriptsAllowed } from './csp';
+import { nodeTestFiles } from './scripts/node-test-files.mjs';
 
 // Stamp the package.json version into the bundle as `__APP_VERSION__` so
 // pre-auth surfaces (Login terminal banner) can display a real release
@@ -135,6 +138,13 @@ export default defineConfig(({ mode }) => {
   },
   optimizeDeps: {
     exclude: ['lucide-react'],
+  },
+  test: {
+    // `node:test` files run under `npm run test:node`, not vitest. Without this
+    // exclude vitest collects them and reports each as "No test suite found"
+    // (NAN-4980). The list is discovered, so it cannot drift; the walk only runs
+    // under vitest, never on `vite build` / `vite dev`.
+    exclude: [...configDefaults.exclude, ...(process.env.VITEST ? nodeTestFiles() : [])],
   },
   server: {
     allowedHosts: true, // Allow all hosts (nginx handles external access)

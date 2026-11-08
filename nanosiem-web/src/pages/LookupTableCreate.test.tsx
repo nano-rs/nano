@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 // @vitest-environment jsdom
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { afterEach, expect, it, vi } from 'vitest';
@@ -29,7 +27,7 @@ afterEach(() => { cleanup(); vi.clearAllMocks(); mocks.tables = []; });
 it('pre-fills the existing name before the lookup fetch and sends replace on upload', async () => {
   mocks.preview.mockResolvedValue({ columns: [], rows: [], total_rows_estimate: 1 });
   mocks.create.mockResolvedValue({ table: { name: 'original' }, records_inserted: 1, renamed_columns: [] });
-  render(<MemoryRouter initialEntries={['/rules/lookup-tables/new?update=original']}><LookupTableCreate onSaved={vi.fn()} /></MemoryRouter>);
+  render(<MemoryRouter initialEntries={['/rules/lookup-tables/new?update=original']}><LookupTableCreate /></MemoryRouter>);
   expect(screen.getByText('Replace data in original')).toBeTruthy();
 
   const file = new File(['id\n2\n'], 'replacement.csv', { type: 'text/csv' });
@@ -45,7 +43,7 @@ it('sends replace from the name-collision dialog in the same click', async () =>
   mocks.tables = [{ name: 'original', row_count: 2 }];
   mocks.preview.mockResolvedValue({ columns: [], rows: [], total_rows_estimate: 1 });
   mocks.create.mockResolvedValue({ table: { name: 'original' }, records_inserted: 1, renamed_columns: [] });
-  render(<MemoryRouter><LookupTableCreate onSaved={vi.fn()} /></MemoryRouter>);
+  render(<MemoryRouter><LookupTableCreate /></MemoryRouter>);
   fireEvent.click(screen.getByText('Upload a file'));
   fireEvent.change(document.querySelector('input[type="file"]')!, {
     target: { files: [new File(['id\n2\n'], 'original.csv', { type: 'text/csv' })] },

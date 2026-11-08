@@ -148,9 +148,13 @@ fn body(value: Value) -> Result<FormattedBody, String> {
     })
 }
 
-/// Catalog actions reuse the channel definitions, with only the envelope their
-/// authenticated API requires. No catalog spec, destination or secret is loaded
-/// here. Existing incoming-webhook channel bodies remain unchanged.
+/// External callers reuse the channel definitions, with only the envelope their
+/// authenticated API requires. No destination or secret is loaded here.
+/// Existing incoming-webhook channel bodies remain unchanged.
+///
+/// NAN-4971: external callers render through the same channel definitions via
+/// the `notification_body` template helper, so they send exactly what native
+/// channels send.
 pub enum NotificationTransport<'a> {
     Generic,
     SlackChat {

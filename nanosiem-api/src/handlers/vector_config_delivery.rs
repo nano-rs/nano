@@ -178,8 +178,49 @@ pub async fn get_generation_file(
         .into_response())
 }
 
+/// Get Vector's hashed ingest tokens file (NAN-4973).
+///
+/// The `http` token delivery (`NANO_INGEST_TOKENS_DELIVERY=http`, the Helm
+/// chart): Vector runs as its own scaled Deployment with no volume shared with
+/// nano-api, so each Vector pod's config consumer pulls this file and installs
+/// it where `valid_tokens_file` reads it. Rendered from the database per
+/// request, so every API replica returns the same bytes. The body holds
+/// SHA-256 hashes only, never token values. 404 unless the delivery is `http`.
+#[utoipa::path(
+    get,
+    path = "/api/internal/vector-config/ingest-tokens",
+    tag = "vector-config-delivery",
+    responses(
+        (status = 200, description = "Vector valid_tokens_file content (hashes only)", body = String, content_type = "application/json"),
+        (status = 401, description = "Missing or invalid VECTOR_AUTH_TOKEN bearer"),
+        (status = 404, description = "Token delivery is not `http`, or delivery disabled (no VECTOR_AUTH_TOKEN configured)"),
+        (status = 503, description = "The database could not be read; the consumer keeps its current file"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_ingest_tokens_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    authorize(&headers)?;
+    match state.ingest_token_service.render_current().await {
+        Ok(content) => Ok((
+            [(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+            content,
+        )
+            .into_response()),
+        Err(nanosiem_core::ingest_tokens::IngestTokenServiceError::DeliveryNotConfigured) => {
+            Err(StatusCode::NOT_FOUND)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "ingest tokens file render failed");
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
+}
+
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(get_current_manifest, get_generation_file))]
+#[openapi(paths(get_current_manifest, get_generation_file, get_ingest_tokens_file))]
 pub struct VectorConfigDeliveryApiDoc;
 
 #[cfg(test)]

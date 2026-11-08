@@ -62,9 +62,10 @@ test('length bounds stay in lockstep with the Rust policy', async () => {
 });
 
 test('the max-length cap is not re-declared outside auth/password.rs', async () => {
+  // clickhouse/dev (NAN-4902): the enterprise_shared activation paths do not
+  // exist on this edition; the repository is the remaining consumer.
   for (const relative of [
-    '../../../nanosiem-core/src/enterprise_shared_activation.rs',
-    '../../../nanosiem-core/src/enterprise_shared_member_activation.rs',
+    '../../../nanosiem-core/src/auth/repository/users.rs',
   ]) {
     const source = await readFile(fileURLToPath(new URL(relative, import.meta.url)), 'utf8');
     assert.doesNotMatch(

@@ -37,6 +37,26 @@
 //!   with `--features enterprise`. Today the directory is empty and the
 //!   migrator is a no-op there; future enterprise-only ClickHouse
 //!   overlays land in this directory (NAN-747 Phase 6).
+//!
+//! Operator subcommand (never run by a deploy):
+//!
+//! - `clickhouse_migrator drop-ocsf-legacy [--confirm]` — compares per-day row
+//!   counts between `ocsf_logs_legacy_v179` and `ocsf_logs` after
+//!   `scripts/ocsf-legacy-backfill.py`, refuses on any mismatch or missing day,
+//!   and drops the legacy table (cluster-aware) only with `--confirm`. Dry run
+//!   by default. Needs only the ClickHouse variables above (`CLICKHOUSE_URL`,
+//!   `CLICKHOUSE_DATABASE`, admin or runtime credentials). See
+//!   docs/design/OCSF-CLICKHOUSE.md §9.1 (NAN-4918).
+//! - `clickhouse_migrator repair-future-timestamps [--skew-seconds N] [--confirm]`
+//!   previews far-future rows and, only with confirmation, copies them at the
+//!   current time, verifies every id, then removes the originals. Pause ingest
+//!   first. See `docs/operations/future-timestamp-repair.md` (NAN-4939).
+//! - `clickhouse_migrator purge-future-timestamp-repair --repair-id UUID [--confirm]`
+//!   previews or removes metadata for one completed repair id and may release
+//!   that id's expired confirmed-run lock. It never changes tenant rows.
+//! - `clickhouse_migrator activate-migration-refreshes [--retry-exhausted]` runs one durable
+//!   post-migration refresh pass. The API jobs leader normally owns this; the
+//!   command exists for upgrade validation and operator diagnostics (NAN-4977).
 
 use anyhow::{Context, Result};
 use nanosiem_core::db::{ClickHouseMigrator, Database, DualPoolConfig};
@@ -47,6 +67,23 @@ use std::process::ExitCode;
 async fn main() -> ExitCode {
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("clickhouse-migrator");
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("drop-ocsf-legacy") => return drop_ocsf_legacy(&args[1..]).await,
+        Some("repair-future-timestamps") => return repair_future_timestamps(&args[1..]).await,
+        Some("purge-future-timestamp-repair") => {
+            return purge_future_timestamp_repair(&args[1..]).await;
+        }
+        Some("activate-migration-refreshes") => {
+            return activate_migration_refreshes(&args[1..]).await;
+        }
+        Some(other) => {
+            eprintln!("unknown argument {other:?}; usage: clickhouse_migrator [drop-ocsf-legacy [--confirm] | repair-future-timestamps [--skew-seconds N] [--confirm] | purge-future-timestamp-repair --repair-id UUID [--confirm] | activate-migration-refreshes [--retry-exhausted]]");
+            return ExitCode::from(2);
+        }
+    }
+
     match run().await {
         Ok(()) => {
             tracing::info!("ClickHouse schema migration complete");
@@ -55,6 +92,395 @@ async fn main() -> ExitCode {
         Err(e) => {
             tracing::error!("ClickHouse schema migration failed: {:#}", e);
             ExitCode::FAILURE
+        }
+    }
+}
+
+async fn activate_migration_refreshes(args: &[String]) -> ExitCode {
+    let retry_exhausted = match args {
+        [] => false,
+        [flag] if flag == "--retry-exhausted" => true,
+        _ => {
+            eprintln!(
+                "usage: clickhouse_migrator activate-migration-refreshes [--retry-exhausted]"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let result = async {
+        let (client, database) = clickhouse_admin_from_env()?;
+        let reset = if retry_exhausted {
+            nanosiem_core::db::migration_refresh::retry_exhausted(&client, &database).await?
+        } else {
+            0
+        };
+        if retry_exhausted {
+            println!("Re-armed {reset} exhausted migration refresh activation(s).");
+        }
+        nanosiem_core::db::migration_refresh::process_pending(&client, &client, &database).await
+    }
+    .await;
+    match result {
+        Ok(summary) => {
+            println!(
+                "Migration refresh activation: {} attempted, {} succeeded, {} failed, {} exhausted",
+                summary.attempted, summary.succeeded, summary.failed, summary.exhausted
+            );
+            if summary.failed == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(error) => {
+            eprintln!("activate-migration-refreshes failed: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `repair-future-timestamps` (NAN-4939). Dry-run unless `--confirm` is
+/// explicit. Exit 0 for a successful preview/no-op/repair; non-zero on refusal.
+async fn repair_future_timestamps(args: &[String]) -> ExitCode {
+    let mut confirm = false;
+    let mut skew_seconds = 86_400_u64;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--confirm" => confirm = true,
+            "--dry-run" => {}
+            "--skew-seconds" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    eprintln!("--skew-seconds requires a non-negative integer");
+                    return ExitCode::from(2);
+                };
+                match value.parse::<u64>() {
+                    Ok(parsed) => skew_seconds = parsed,
+                    Err(_) => {
+                        eprintln!("invalid --skew-seconds value {value:?}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            other => {
+                eprintln!("unknown flag {other:?}; usage: clickhouse_migrator repair-future-timestamps [--skew-seconds N] [--confirm]");
+                return ExitCode::from(2);
+            }
+        }
+        index += 1;
+    }
+
+    match run_repair_future_timestamps(skew_seconds, confirm).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("repair-future-timestamps failed: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn purge_future_timestamp_repair(args: &[String]) -> ExitCode {
+    let mut confirm = false;
+    let mut repair_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--confirm" => confirm = true,
+            "--repair-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    eprintln!("--repair-id requires a UUID");
+                    return ExitCode::from(2);
+                };
+                match uuid::Uuid::parse_str(value) {
+                    Ok(value) => repair_id = Some(value),
+                    Err(_) => {
+                        eprintln!("invalid --repair-id UUID {value:?}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            other => {
+                eprintln!("unknown flag {other:?}; usage: clickhouse_migrator purge-future-timestamp-repair --repair-id UUID [--confirm]");
+                return ExitCode::from(2);
+            }
+        }
+        index += 1;
+    }
+    let Some(repair_id) = repair_id else {
+        eprintln!("--repair-id is required");
+        return ExitCode::from(2);
+    };
+    match run_purge_future_timestamp_repair(repair_id, confirm).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("purge-future-timestamp-repair failed: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_purge_future_timestamp_repair(repair_id: uuid::Uuid, confirm: bool) -> Result<()> {
+    use nanosiem_core::db::future_timestamp_repair::FutureTimestampRepair;
+
+    let (client, database) = clickhouse_admin_from_env()?;
+    let schema_raw = std::env::var(nanosiem_core::schema::SCHEMA_PROFILE_ENV).unwrap_or_default();
+    let schema =
+        nanosiem_core::schema::SchemaId::from_env_str(&schema_raw).map_err(anyhow::Error::msg)?;
+    let repair = FutureTimestampRepair::new(&client, &database, schema, 86_400).await?;
+    let preview = repair.preview_purge(repair_id).await?;
+    println!(
+        "repair {}: {} staged row(s), {} staged bad original(s) remaining, {} buffered IP row(s), {}/{} buffered fingerprints verified",
+        preview.repair_id,
+        preview.staged_rows,
+        preview.staged_originals_remaining,
+        preview.buffered_rows,
+        preview.buffered_verified_rows,
+        preview.buffered_distinct_rows
+    );
+    if preview.owns_lock {
+        println!(
+            "repair lock: {} until {}",
+            if preview.owns_expired_lock {
+                "expired"
+            } else {
+                "active"
+            },
+            preview.lock_lease_until
+        );
+    }
+    if !confirm {
+        println!("DRY RUN: no metadata or lock changed. Rerun with --confirm after verifying this repair completed.");
+        return Ok(());
+    }
+    repair.purge_completed_repair(&preview).await?;
+    println!("Purged completed repair metadata for {repair_id}.");
+    Ok(())
+}
+
+async fn run_repair_future_timestamps(skew_seconds: u64, confirm: bool) -> Result<()> {
+    use nanosiem_core::db::future_timestamp_repair::FutureTimestampRepair;
+
+    let (client, database) = clickhouse_admin_from_env()?;
+    let schema_raw = std::env::var(nanosiem_core::schema::SCHEMA_PROFILE_ENV).unwrap_or_default();
+    let schema =
+        nanosiem_core::schema::SchemaId::from_env_str(&schema_raw).map_err(anyhow::Error::msg)?;
+    let repair = FutureTimestampRepair::new(&client, &database, schema, skew_seconds).await?;
+    let preview = repair.preview().await?;
+    println!(
+        "{}: {} future row(s), {} distinct id(s), {} recoverable NAN-4938 epoch-ms row(s), cutoff {}, range {} .. {}",
+        preview.table,
+        preview.future_rows,
+        preview.distinct_ids,
+        preview.recoverable_epoch_millis_rows,
+        preview.cutoff.to_rfc3339(),
+        if preview.oldest_future.is_empty() {
+            "n/a"
+        } else {
+            &preview.oldest_future
+        },
+        if preview.newest_future.is_empty() {
+            "n/a"
+        } else {
+            &preview.newest_future
+        },
+    );
+    let epoch_millis_previews = repair.preview_epoch_millis_tables().await?;
+    for table in &epoch_millis_previews {
+        println!(
+            "{}: {} recoverable NAN-4938 row(s), {} distinct semantic row(s), {} pending buffered row(s), recovered range {} .. {}",
+            table.table,
+            table.affected_rows,
+            table.distinct_rows,
+            table.pending_buffer_rows,
+            if table.oldest_recovered.is_empty() {
+                "n/a"
+            } else {
+                &table.oldest_recovered
+            },
+            if table.newest_recovered.is_empty() {
+                "n/a"
+            } else {
+                &table.newest_recovered
+            },
+        );
+    }
+    if preview.existing_id_collisions > 0 {
+        anyhow::bail!(
+            "{} future id(s) collide with an existing non-future row; no data changed",
+            preview.existing_id_collisions
+        );
+    }
+    let epoch_millis_rows: u64 = epoch_millis_previews
+        .iter()
+        .map(|table| table.affected_rows + table.pending_buffer_rows)
+        .sum();
+    if preview.future_rows == 0 && epoch_millis_rows == 0 {
+        println!("No future timestamps need repair.");
+        return Ok(());
+    }
+    if !confirm {
+        println!(
+            "DRY RUN: pause all ingest writers, then repeat with --confirm to copy, verify, and delete these originals."
+        );
+        return Ok(());
+    }
+
+    let lock = repair.acquire_confirm_lock().await?;
+    println!("Acquired confirmed repair lock {}.", lock.owner());
+    // Preview again after serialization. The first preview remains the operator
+    // contract; this second snapshot prevents a queued confirmed command from
+    // acting on another run's now-stale pending-buffer count.
+    let result = async {
+        let locked_preview = repair.preview().await?;
+        if locked_preview.existing_id_collisions > 0 {
+            anyhow::bail!(
+                "{} future id(s) collide with an existing non-future row; no data changed",
+                locked_preview.existing_id_collisions
+            );
+        }
+        let locked_epoch_previews = repair.preview_epoch_millis_tables().await?;
+        if locked_preview.future_rows > 0 {
+            let outcome = repair.execute(&locked_preview).await?;
+            println!(
+                "{} repair complete: verified {} corrected id(s), removed {} future original row(s).",
+                locked_preview.table, outcome.copied_ids, outcome.deleted_rows
+            );
+        }
+        for table in &locked_epoch_previews {
+            if table.affected_rows == 0 && table.pending_buffer_rows == 0 {
+                continue;
+            }
+            let outcome = repair.execute_epoch_millis_table(table).await?;
+            println!(
+                "{} repair complete: verified {} corrected row(s), removed {} future original row(s).",
+                outcome.table, outcome.repaired_rows, outcome.deleted_originals
+            );
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let release = lock.release().await;
+    match (result, release) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(release)) => Err(release),
+        (Err(error), Err(release)) => Err(error.context(format!(
+            "repair also failed to release its cluster-global lock: {release:#}"
+        ))),
+    }
+}
+
+/// `drop-ocsf-legacy [--confirm]` (NAN-4918). Exit 0: dropped, dry run, or
+/// nothing to drop. Exit 1: refused (mismatch / missing day) or error.
+async fn drop_ocsf_legacy(args: &[String]) -> ExitCode {
+    let mut confirm = false;
+    for a in args {
+        match a.as_str() {
+            "--confirm" => confirm = true,
+            "--dry-run" => {}
+            other => {
+                eprintln!("unknown flag {other:?}; usage: clickhouse_migrator drop-ocsf-legacy [--confirm]");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    match run_drop_ocsf_legacy(confirm).await {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("drop-ocsf-legacy failed: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// ClickHouse admin client from the environment, without the PostgreSQL
+/// settings `DualPoolConfig` requires (this subcommand touches only ClickHouse).
+fn clickhouse_admin_from_env() -> Result<(clickhouse::Client, String)> {
+    let url = std::env::var("CLICKHOUSE_URL").context("CLICKHOUSE_URL is required")?;
+    let database = std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "nanosiem".to_string());
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let (user, password) = match (
+        var("CLICKHOUSE_ADMIN_USER"),
+        var("CLICKHOUSE_ADMIN_PASSWORD"),
+    ) {
+        (Some(u), Some(p)) => (u, p),
+        _ => (
+            var("CLICKHOUSE_USER").unwrap_or_else(|| "default".to_string()),
+            var("CLICKHOUSE_PASSWORD").unwrap_or_default(),
+        ),
+    };
+    let mut client = nanosiem_core::db::clickhouse_transport::client()
+        .with_url(url)
+        .with_database(&database)
+        .with_user(user);
+    if !password.is_empty() {
+        client = client.with_password(password);
+    }
+    Ok((client, database))
+}
+
+async fn run_drop_ocsf_legacy(confirm: bool) -> Result<bool> {
+    use nanosiem_core::db::clickhouse_migrate::{
+        LegacyDayStatus, OcsfLegacyDropOutcome, OcsfLegacyDropPlan, OCSF_LEGACY_TABLE,
+    };
+
+    let (client, database) = clickhouse_admin_from_env()?;
+    let mut migrator = ClickHouseMigrator::new(client, database.clone());
+    let print_plan = |plan: &OcsfLegacyDropPlan| {
+        println!(
+            "{database}.{OCSF_LEGACY_TABLE}: {} rows over {} day(s); cluster: {}",
+            plan.legacy_rows(),
+            plan.days.len(),
+            plan.cluster.as_deref().unwrap_or("none (single node)")
+        );
+        println!(
+            "{:<12} {:>14} {:>12} {:>12}  status",
+            "day (UTC)", "legacy rows", "missing ids", "dup ids"
+        );
+        for d in &plan.days {
+            let status = match d.status() {
+                LegacyDayStatus::Match => "ok",
+                LegacyDayStatus::Mismatch => "MISMATCH",
+                LegacyDayStatus::Missing => "MISSING",
+            };
+            println!(
+                "{:<12} {:>14} {:>12} {:>12}  {status}",
+                d.day.to_string(),
+                d.legacy_rows,
+                d.missing_ids,
+                d.duplicate_ids
+            );
+        }
+    };
+    match migrator.drop_ocsf_legacy(confirm).await? {
+        OcsfLegacyDropOutcome::Absent => {
+            println!("{database}.{OCSF_LEGACY_TABLE} does not exist: nothing to drop");
+            Ok(true)
+        }
+        OcsfLegacyDropOutcome::Refused(plan) => {
+            print_plan(&plan);
+            eprintln!(
+                "REFUSED: {} day(s) are missing or mismatched. Run scripts/ocsf-legacy-backfill.py \
+                 for them (or wait for the legacy 365-day TTL); nothing was dropped.",
+                plan.blocking_days().len()
+            );
+            Ok(false)
+        }
+        OcsfLegacyDropOutcome::DryRun(plan) => {
+            print_plan(&plan);
+            println!(
+                "every day matches. Dry run: rerun with --confirm to execute:\n  {}",
+                plan.drop_sql
+            );
+            Ok(true)
+        }
+        OcsfLegacyDropOutcome::Dropped(plan) => {
+            print_plan(&plan);
+            println!("dropped: {}", plan.drop_sql);
+            Ok(true)
         }
     }
 }
@@ -73,10 +499,9 @@ async fn run() -> Result<()> {
     // missing PG schema, api/jobs depend on the migrator to complete, and
     // PG migrations (which live in those binaries) never run.
     //
-    // api/jobs still call `run_postgres_migrations` themselves on startup —
-    // sqlx checks `_sqlx_migrations` and skips already-applied work, so the
-    // canonical-and-redundant ordering is safe and keeps those binaries
-    // resilient when run without this one-shot (e.g., local dev).
+    // Serving processes only validate this embedded set and refuse to start
+    // when it is behind. Keeping DDL here makes deploy ordering explicit and
+    // prevents a runtime request from being the first observer of drift.
     tracing::info!("Applying PostgreSQL migrations before ClickHouse work");
     let pg_db = Database::connect(&config.postgres_url)
         .await
@@ -88,7 +513,13 @@ async fn run() -> Result<()> {
     #[cfg(feature = "enterprise")]
     {
         tracing::info!("Applying enterprise PostgreSQL overlay migrations");
-        nanosiem_enterprise::postgres_migrations::run(pg_pool)
+        let mut overlay_migrator = sqlx::migrate!("../migrations/postgres-enterprise");
+        // ignore_missing(true) so the overlay's validator tolerates the
+        // open history's applied rows that already sit in _sqlx_migrations.
+        // Matches the same call in nanosiem-api/src/state/constructors.rs.
+        overlay_migrator.set_ignore_missing(true);
+        overlay_migrator
+            .run(pg_pool)
             .await
             .context("running enterprise PostgreSQL overlay migrations")?;
     }
@@ -142,8 +573,9 @@ async fn run() -> Result<()> {
     // hash-tracked under its own `__ocsf_init_sql` key so it never clobbers the
     // primary `__init_sql` hash. UDM deployments skip this entirely.
     let schema_raw = std::env::var(nanosiem_core::schema::SCHEMA_PROFILE_ENV).unwrap_or_default();
-    let schema_id = nanosiem_core::schema::SchemaId::from_env_str(&schema_raw)
-        .map_err(|e| anyhow::anyhow!("invalid {}: {e}", nanosiem_core::schema::SCHEMA_PROFILE_ENV))?;
+    let schema_id = nanosiem_core::schema::SchemaId::from_env_str(&schema_raw).map_err(|e| {
+        anyhow::anyhow!("invalid {}: {e}", nanosiem_core::schema::SCHEMA_PROFILE_ENV)
+    })?;
     if matches!(schema_id, nanosiem_core::schema::SchemaId::Ocsf) {
         let ocsf_init_path = migrations_dir.join("ocsf").join("init.sql");
         tracing::info!(
@@ -156,37 +588,47 @@ async fn run() -> Result<()> {
             .run_overlay_init_sql(&ocsf_init_sql, "__ocsf_init_sql", "ocsf/init.sql")
             .await
             .context("running OCSF overlay init.sql")?;
+
+        // Profile-only numbered migrations run after the overlay so fresh and
+        // upgraded OCSF installs follow the same path. Their `_migrations`
+        // versions are namespaced (`ocsf/NNN`) to avoid colliding with the
+        // shared ledger number.
+        let ocsf_migrations_dir = migrations_dir.join("ocsf").join("migrations");
+        let ocsf_count = migrator
+            .run_migrations_with_prefix(&ocsf_migrations_dir, "ocsf/")
+            .await
+            .context("running OCSF incremental migrations")?;
+        tracing::info!(
+            count = ocsf_count,
+            "OCSF profile-specific migrations complete"
+        );
     }
 
-    // NAN-747 Phase 6: enterprise overlay only on enterprise builds. The
-    // directory is currently empty (the entire ClickHouse schema is
-    // open-tier today), but wiring it now means future enterprise-only
-    // ClickHouse migrations don't need a Rust change to this binary —
-    // drop a `001_*.sql` into clickhouse-enterprise/ and rebuild.
+    // Enterprise overlay is mandatory in enterprise builds. A missing image
+    // payload must stop migration instead of silently booting without the
+    // licence witness (or any future enterprise-only schema).
     #[cfg(feature = "enterprise")]
     {
         let enterprise_dir: PathBuf = std::env::var("CLICKHOUSE_ENTERPRISE_MIGRATIONS_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("./clickhouse-enterprise"));
-        if enterprise_dir.exists() {
-            tracing::info!(
-                "Applying enterprise ClickHouse overlay from {}",
-                enterprise_dir.display()
-            );
-            let ent_count = migrator
-                .run_migrations(&enterprise_dir)
-                .await
-                .context("running enterprise overlay migrations")?;
-            if ent_count > 0 {
-                tracing::info!("Applied {} enterprise ClickHouse migration(s)", ent_count);
-            } else {
-                tracing::info!("Enterprise ClickHouse overlay up to date");
-            }
+        anyhow::ensure!(
+            enterprise_dir.is_dir(),
+            "enterprise ClickHouse overlay directory is missing: {}",
+            enterprise_dir.display()
+        );
+        tracing::info!(
+            "Applying enterprise ClickHouse overlay from {}",
+            enterprise_dir.display()
+        );
+        let ent_count = migrator
+            .run_migrations(&enterprise_dir)
+            .await
+            .context("running enterprise overlay migrations")?;
+        if ent_count > 0 {
+            tracing::info!("Applied {} enterprise ClickHouse migration(s)", ent_count);
         } else {
-            tracing::debug!(
-                "Enterprise ClickHouse overlay directory not present at {} — skipping",
-                enterprise_dir.display()
-            );
+            tracing::info!("Enterprise ClickHouse overlay up to date");
         }
     }
 
@@ -237,10 +679,10 @@ async fn run() -> Result<()> {
             config.clickhouse_rawsql_noaudit_password.as_deref(),
         )
         .await
-        .context("ensuring raw-SQL feature users")?;
+        .context("ensuring raw-SQL feature users (NAN-2003)")?;
     if rawsql_users_created > 0 {
         tracing::info!(
-            "bootstrapped {} raw-SQL feature user(s)",
+            "NAN-2003: bootstrapped {} raw-SQL feature user(s)",
             rawsql_users_created
         );
     }
@@ -253,9 +695,9 @@ async fn run() -> Result<()> {
     let policy_count = migrator
         .ensure_rawsql_row_policies()
         .await
-        .context("ensuring raw-SQL audit row policies")?;
+        .context("ensuring raw-SQL audit row policies (NAN-2001)")?;
     tracing::info!(
-        "ensured raw-SQL audit row policies on {} table(s)",
+        "NAN-2001: ensured raw-SQL audit row policies on {} table(s)",
         policy_count
     );
 

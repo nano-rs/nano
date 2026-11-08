@@ -23,31 +23,20 @@ pub enum DetectionError {
     #[error("Query execution error: {0}")]
     QueryExecutionError(String),
 
-    /// A bounded detection batch was durably committed, but the same fixed
-    /// window still contains unprocessed matches. Schedulers must retry the
-    /// window without advancing its watermark or consuming a failure attempt.
-    #[error(
-        "detection window drain pending: committed {processed} events; at least {remaining_at_least} remain"
-    )]
-    WindowDrainPending {
-        processed: usize,
-        remaining_at_least: usize,
-    },
-
     #[error("Invalid cron expression: {0}")]
     InvalidCronExpression(String),
 
     #[error("Rule is paused: {0}")]
     RulePaused(Uuid),
 
-    #[error("Rule is still executing: {0}")]
-    RuleExecuting(Uuid),
-
     #[error("Alert not found: {0}")]
     AlertNotFound(Uuid),
 
     #[error("Invalid state transition: {0}")]
     InvalidStateTransition(String),
+
+    #[error("Rule is still executing: {0}")]
+    RuleExecuting(Uuid),
 
     #[error("Search error: {0}")]
     SearchError(String),
@@ -72,9 +61,71 @@ pub enum DetectionError {
 }
 
 impl DetectionError {
-    pub fn is_window_drain_pending(&self) -> bool {
-        matches!(self, Self::WindowDrainPending { .. })
+    /// NAN-4910: whether the failure was caused by the SIZE of the evaluated
+    /// window — a smaller window can succeed where re-running the same one
+    /// cannot. The scheduler shrinks a catch-up slice on these and, once the
+    /// minimum slice keeps failing, records a coverage gap instead of pinning
+    /// the rule on that window forever.
+    ///
+    /// Only explicit ClickHouse size-limit refusals qualify, because a gap
+    /// advances the high-water mark past events that were never evaluated:
+    /// - memory limit (MEMORY_LIMIT_EXCEEDED, 241);
+    /// - result / read limits (TOO_MANY_ROWS 158, TOO_MANY_BYTES 307,
+    ///   TOO_MANY_ROWS_OR_BYTES 396) and an oversized response;
+    /// - a SERVER-SIDE `max_execution_time` timeout that reports the time the
+    ///   query actually ran (`TIMEOUT_EXCEEDED ... elapsed N ms`, surfaced as
+    ///   `Query timeout after Nms` with N > 0) — ClickHouse was executing it.
+    ///
+    /// Everything else keeps the high-water mark and is retried as-is: in
+    /// particular the scheduler's own outer timeout (`Rule execution timed
+    /// out`), which also fires on a stalled connection, an outage or a lock,
+    /// a timeout with no elapsed time, connection errors, bad queries.
+    ///
+    /// ClickHouse errors reach the detection engine as text (see
+    /// `search::types::parse_clickhouse_error`), so this matches both the raw
+    /// ClickHouse error names and the friendly messages they are mapped to.
+    pub fn is_window_size_dependent(&self) -> bool {
+        let message = match self {
+            Self::QueryExecutionError(message) | Self::SearchError(message) => message,
+            _ => return false,
+        };
+        if message.contains("Rule execution timed out") {
+            return false;
+        }
+        const SIZE_LIMIT_MARKERS: &[&str] = &[
+            "MEMORY_LIMIT_EXCEEDED",
+            "exceeded memory limit",
+            "TOO_MANY_ROWS",
+            "TOO_MANY_BYTES",
+            "too many rows",
+            "Response too large",
+        ];
+        if SIZE_LIMIT_MARKERS.iter().any(|marker| message.contains(marker)) {
+            return true;
+        }
+        server_side_timeout_with_progress(message)
     }
+}
+
+/// A ClickHouse `max_execution_time` refusal that proves the server ran the
+/// query: raw `TIMEOUT_EXCEEDED` carrying `elapsed`, or the mapped
+/// `Query timeout after Nms` with a parsed, non-zero N (N is 0 when no
+/// elapsed time could be read).
+fn server_side_timeout_with_progress(message: &str) -> bool {
+    if message.contains("TIMEOUT_EXCEEDED") && message.contains("elapsed") {
+        return true;
+    }
+    const MAPPED: &str = "Query timeout after ";
+    message
+        .find(MAPPED)
+        .map(|at| {
+            let digits: String = message[at + MAPPED.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            digits.parse::<u64>().map(|ms| ms > 0).unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 impl From<crate::db::repository::detection_rules::DetectionRuleRepositoryError> for DetectionError {

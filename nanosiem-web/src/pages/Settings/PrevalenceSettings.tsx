@@ -16,8 +16,6 @@ import {
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { usePrevalenceSettings, useUpdatePrevalenceSettings } from '@/hooks/use-api';
 import { useToast } from '@/hooks/use-toast';
-import { PlatformManagedNotice } from '@/components/settings/PlatformManagedNotice';
-import { platformManaged } from '@/lib/platform-managed';
 
 const DEFAULTS = {
   rarity_threshold: 3,
@@ -161,10 +159,6 @@ export function PrevalenceSettings() {
     ip: [enableIpTracking, setEnableIpTracking],
   };
 
-  // Hosted-shared tenant (NAN-2361): rarity thresholds are set by the platform
-  // for the shared lake; the values shown are its defaults, read-only.
-  const managed = platformManaged(settings);
-
   return (
     <div className="px-6 py-5 space-y-7">
       <div>
@@ -173,8 +167,6 @@ export function PrevalenceSettings() {
           Artifact prevalence, rarity policy, tracking scope
         </p>
       </div>
-
-      {managed && <PlatformManagedNotice verdict={managed} title="Rarity thresholds" />}
 
       <section>
         <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1">
@@ -317,7 +309,7 @@ export function PrevalenceSettings() {
         </Button>
         <Button
           onClick={handleSave}
-          disabled={!!managed || saving || !hasChanges}
+          disabled={saving || !hasChanges}
           size="sm"
           className="h-7 text-[11.5px] px-2.5"
         >

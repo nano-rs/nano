@@ -43,7 +43,7 @@ pub struct ConnectorSpec {
     pub streams: Vec<Stream>,
 }
 
-/// `kind: identity` settings (NAN-3503).
+/// `kind: identity` settings (NAN-3503, ported to ClickHouse dev in G22).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityConfig {
@@ -70,7 +70,7 @@ pub enum IdentityRole {
     /// Canonical user rows (`external_id`, `upn`, `email`, ...).
     Users,
     /// `{member, group, privileged?}` pairs, aggregated by the engine into
-    /// one row per member on the `<feed>:groups` sub-feed. Always full.
+    /// each member's `groups`. Always full.
     Memberships,
 }
 
@@ -78,7 +78,7 @@ pub enum IdentityRole {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityMode {
-    /// Every run is a complete snapshot that replaces the feed.
+    /// Every run is a complete snapshot that replaces the feed's users.
     #[default]
     Full,
     /// Runs after the first full one send only changes (adds, updates,
@@ -118,8 +118,8 @@ pub enum Kind {
     DataEnrichment,
     /// Streaming pull into the tenant's ingest, checkpointed per stream.
     Collector,
-    /// Directory sync (users, group memberships) into the tenant's identity
-    /// directory through its enrichment coordinator. No ingest, no parser.
+    /// Directory sync (users, group memberships) into the user directory
+    /// (`user_registry`). No ingest, no parser.
     Identity,
 }
 

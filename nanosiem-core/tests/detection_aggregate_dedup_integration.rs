@@ -38,6 +38,15 @@ fn pg_url() -> String {
 fn ch_url() -> String {
     std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into())
 }
+fn ch_user() -> String {
+    std::env::var("CLICKHOUSE_TEST_USER").unwrap_or_else(|_| "nanosiem".into())
+}
+fn ch_pass() -> String {
+    std::env::var("CLICKHOUSE_TEST_PASSWORD").unwrap_or_else(|_| "nanosiem".into())
+}
+fn ch_db() -> String {
+    std::env::var("CLICKHOUSE_TEST_DB").unwrap_or_else(|_| "nanosiem".into())
+}
 
 /// Insert one probe event into `nanosiem.logs` via the CH HTTP interface
 /// (async_insert off + wait_end_of_query so the row is queryable on return).
@@ -63,7 +72,7 @@ async fn insert_event(
     .to_string();
     let resp = client
         .post(url)
-        .basic_auth("nanosiem", Some("nanosiem"))
+        .basic_auth(ch_user(), Some(ch_pass()))
         .body(row)
         .send()
         .await
@@ -86,7 +95,7 @@ async fn cleanup_probe_rows(client: &reqwest::Client, source_types: &[String]) {
         .join(",");
     let _ = client
         .post(ch_url())
-        .basic_auth("nanosiem", Some("nanosiem"))
+        .basic_auth(ch_user(), Some(ch_pass()))
         .body(format!(
             "DELETE FROM nanosiem.logs WHERE source_type IN ({list})"
         ))
@@ -153,7 +162,16 @@ impl Harness {
             println!("Skipping (SKIP_DB_TESTS set)");
             return None;
         }
-        let config = DualPoolConfig::with_auth(pg_url(), ch_url(), "nanosiem", "nanosiem", "nanosiem");
+        let config = DualPoolConfig::from_env().unwrap_or_else(|_| {
+            let mut config =
+                DualPoolConfig::with_auth(pg_url(), ch_url(), ch_db(), ch_user(), ch_pass());
+            config.clickhouse_admin_user = std::env::var("CLICKHOUSE_ADMIN_USER").ok();
+            config.clickhouse_admin_password = std::env::var("CLICKHOUSE_ADMIN_PASSWORD").ok();
+            config.clickhouse_rawsql_password = std::env::var("CLICKHOUSE_RAWSQL_PASSWORD").ok();
+            config.clickhouse_rawsql_noaudit_password =
+                std::env::var("CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD").ok();
+            config
+        });
         let dual_pool = match DualPool::new(&config).await {
             Ok(p) => p,
             Err(e) => {
@@ -372,6 +390,75 @@ async fn aggregate_rules_dedup_across_cycles_without_over_suppressing() {
         "rare cycle 2: emissions flat under drift"
     );
     assert_eq!(alerts(&h.pg, rule_rare.id).await, 1, "rare: single alert across cycles");
+
+    h.teardown().await;
+}
+
+#[tokio::test]
+async fn detection_timechart_keeps_per_entity_rows_and_canonical_bounds() {
+    let Some(mut h) = Harness::connect().await else {
+        return;
+    };
+    let source_type = format!("nan4944detection{}", h.run_tag);
+    let grid = {
+        let timestamp = (Utc::now() - Duration::minutes(10)).timestamp();
+        chrono::DateTime::<Utc>::from_timestamp(timestamp - timestamp.rem_euclid(300), 0).unwrap()
+    };
+    for (src_ip, offset) in [
+        ("10.49.44.1", 10),
+        ("10.49.44.1", 170),
+        ("10.49.44.2", 40),
+        ("10.49.44.2", 220),
+    ] {
+        insert_event(
+            &h.http,
+            &source_type,
+            src_ip,
+            grid + Duration::seconds(offset),
+        )
+        .await;
+    }
+    h.source_types.push(source_type.clone());
+
+    let rows = h
+        .svc
+        .evaluate_window(
+            &format!("source_type={source_type} | timechart span=5m count by src_ip"),
+            TimeRangeInput::new(grid, grid + Duration::minutes(5)),
+            None,
+            &nanosiem_core::auth::ScopeSet::unrestricted(),
+        )
+        .await
+        .expect("detection timechart window");
+
+    assert_eq!(rows.len(), 2, "one canonical long row per src_ip: {rows:?}");
+    for row in &rows {
+        let src_ip = row["src_ip"]
+            .as_str()
+            .expect("split field remains top-level");
+        assert!(matches!(src_ip, "10.49.44.1" | "10.49.44.2"));
+        assert_eq!(row["count"], 2);
+        assert!(row
+            .get("time_bucket")
+            .and_then(serde_json::Value::as_str)
+            .is_some());
+        assert!(row
+            .get("_first_seen")
+            .and_then(serde_json::Value::as_str)
+            .is_some());
+        assert!(row
+            .get("_last_seen")
+            .and_then(serde_json::Value::as_str)
+            .is_some());
+        assert!(
+            row.get("_timechart").is_none(),
+            "internal rows are not presentation-pivoted"
+        );
+        assert!(
+            row.get(src_ip).is_none(),
+            "split value must not become a column name"
+        );
+    }
 
     h.teardown().await;
 }

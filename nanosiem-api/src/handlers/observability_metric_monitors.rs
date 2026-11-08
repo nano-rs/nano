@@ -5,10 +5,11 @@
 //! A metric monitor is a saved metrics-v2 query (`metric_name` + `agg` +
 //! optional `group_by` + tag `filters`) plus a `comparator`/`threshold` and an
 //! evaluation cadence. Definitions are PostgreSQL-backed
-//! (`observability_metric_monitors`, migration 211); their breach *state* is
-//! NOT stored — the panic-safe jobs runner ([`crate::bin::jobs`]) evaluates due
-//! enabled monitors over the trailing `window_secs` window and raises through
-//! the existing alert store on breach (mirrors the SLO definition store).
+//! (`observability_metric_monitors`, migration 211). The panic-safe jobs runner
+//! evaluates due enabled monitors over the trailing `window_secs` window,
+//! records the latest per-series result (`observability_metric_monitor_state`,
+//! migration 292) and keeps one incident per breaching series. The list
+//! endpoint returns that state as `evaluations` (NAN-3894).
 //!
 //! Read endpoints require `search:view` (the console is search-adjacent);
 //! mutations require `settings:system` (monitors are configuration).
@@ -21,12 +22,15 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorResponse};
-use crate::middleware::{AuthContext, ensure_permission};
+use crate::middleware::{AuthContext, check_permission, ensure_permission};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
 use nanosiem_core::observability::{
     MetricMonitor, MetricMonitorRepository, MetricMonitorRepositoryError, MonitorComparator,
     MonitorTagFilter,
+};
+use nanosiem_core::observability::evaluation_state::{
+    MetricMonitorEvaluation, MetricMonitorEvaluationSummary, list_current_metric_monitor_state,
 };
 use nanosiem_core::query::{MetricAgg, valid_tag_key};
 use nanosiem_core::typeid::TypeIdParam;
@@ -41,6 +45,18 @@ const MAX_FILTERS: usize = 32;
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ListMetricMonitorsResponse {
     pub monitors: Vec<MetricMonitor>,
+    /// Complete status of each enabled monitor's current evaluation
+    /// (NAN-3894): series / breaching / no-data counts. The console derives
+    /// monitor status from this, never from the bounded `evaluations` sample.
+    /// Omitted when the caller lacks `search:execute` (the values are metric
+    /// data) or the evaluation state could not be read; an empty list means no
+    /// monitor has a recent evaluation for its current definition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluation_summaries: Option<Vec<MetricMonitorEvaluationSummary>>,
+    /// A per-monitor sample of current series results (breaching first, at
+    /// most 100 per monitor; `truncated` on the summary says when more exist).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluations: Option<Vec<MetricMonitorEvaluation>>,
 }
 
 /// Request body for creating / updating a metric monitor.
@@ -53,7 +69,7 @@ pub struct MetricMonitorRequest {
     /// Aggregate: `avg`|`sum`|`min`|`max`|`count`|`rate`|`p50`|`p95`|`p99`.
     pub agg: String,
     /// Optional service scope; NULL evaluates the metric fleet-wide. The
-    /// promoted `otel_metrics.service_name` column, NOT a tag filter.
+    /// promoted `otel_metrics.service_name` column (NAN-1564), NOT a tag filter.
     #[serde(default)]
     pub service_name: Option<String>,
     /// Optional tag/attribute key to split into per-series evaluation.
@@ -226,7 +242,21 @@ pub async fn list_metric_monitors(
 
     let repo = MetricMonitorRepository::new(state.pool.clone());
     let monitors = repo.list().await.map_err(map_repo_err)?;
-    Ok(Json(ListMetricMonitorsResponse { monitors }))
+    // Evaluation values are metric data: only for principals allowed to run
+    // searches (NAN-2083), and a state-read failure never fails the list.
+    let (evaluation_summaries, evaluations) =
+        if check_permission(&auth, permissions::SEARCH_EXECUTE).is_ok() {
+            match list_current_metric_monitor_state(&state.pool).await {
+                Ok((summaries, sample)) => (Some(summaries), Some(sample)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Metric-monitor evaluation state unavailable");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+    Ok(Json(ListMetricMonitorsResponse { monitors, evaluation_summaries, evaluations }))
 }
 
 /// Create a new metric monitor.
@@ -373,6 +403,8 @@ pub async fn delete_metric_monitor(
     ),
     components(schemas(
         ListMetricMonitorsResponse,
+        MetricMonitorEvaluation,
+        MetricMonitorEvaluationSummary,
         MetricMonitorRequest,
         MetricMonitor,
         MonitorComparator,

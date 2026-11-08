@@ -27,6 +27,23 @@ export interface StaleDictRefresh {
   last_success_age_secs: number;
 }
 
+export interface IngestWatchdogHealth {
+  node: string;
+  action: string;
+  mode: 'auto' | 'manual' | string;
+  reason: string;
+  event_age_secs: number;
+  disabled_views: string[];
+  replicas?: Array<{
+    replica: string;
+    endpoint: string;
+    reachable: boolean;
+    error: string;
+    hot: boolean;
+    sample_age_secs: number;
+  }>;
+}
+
 /** Insert-path integrity signals (NAN-1405) — NAN-1404 silent-loss probes.
  * Optional: reports stored before NAN-1405 lack the block entirely. */
 export interface InsertIntegrityMetrics {
@@ -40,6 +57,26 @@ export interface InsertIntegrityMetrics {
   last_async_insert_error: string | null;
   /** Optional: reports stored before NAN-1407 lack this field. */
   stale_dict_refreshes?: StaleDictRefresh[];
+  /** NAN-4957: resident memory per dictionary, largest first. Optional:
+   * reports stored before NAN-4957 lack these fields. */
+  dictionary_memory?: DictionaryMemory[];
+  dictionary_bytes_total?: number;
+  /** Effective ClickHouse server memory limit; 0 = unknown. */
+  server_memory_limit_bytes?: number;
+  /** False when system.dictionaries could not be read (grant missing). */
+  dictionary_memory_probe_ok?: boolean;
+  /** NAN-4988: latest durable watchdog transition on each ClickHouse shard. */
+  ingest_watchdog?: IngestWatchdogHealth[];
+}
+
+/** One ClickHouse dictionary's resident memory (NAN-4957). */
+export interface DictionaryMemory {
+  name: string;
+  /** Layout as ClickHouse reports it: Trie, Hashed, ComplexKeyCache, … */
+  layout: string;
+  status: string;
+  element_count: number;
+  bytes_allocated: number;
 }
 
 export interface IngestionMetrics {
@@ -133,36 +170,26 @@ export interface AlertingMetrics {
   active_routing_rules: number;
 }
 
-/**
- * Hosted-shared tenant reports (NAN-2361) carry what the lake recorded for
- * the tenant instead of event counts: objects/bytes from writer completion
- * receipts over the last 24 h and the prior 24 h.
- */
-export interface TenantIngestionMetrics {
-  objects_24h: number;
-  bytes_24h: number;
-  objects_prior_24h: number;
-  bytes_prior_24h: number;
-  lifetime_objects: number;
-  lifetime_bytes: number;
-  last_written_at: string | null;
-  writer_classes_24h: string[];
-}
-
 export interface CollectedMetrics {
-  /** Absent on hosted-shared tenant reports (event counts are not observable). */
-  ingestion?: IngestionMetrics;
-  /** Absent on hosted-shared tenant reports (measured by the platform parser cell). */
-  parsing?: ParsingMetrics;
-  /** Absent on hosted-shared tenant reports. */
-  enrichment?: EnrichmentMetrics;
+  ingestion: IngestionMetrics;
+  parsing: ParsingMetrics;
+  enrichment: EnrichmentMetrics;
   detection: DetectionMetrics;
   alerting: AlertingMetrics;
+  /** NAN-4954: security-critical audit outbox (PostgreSQL → ClickHouse). Absent on older reports / failed probe. */
+  audit_durability?: AuditDurabilityMetrics | null;
   collected_at: string;
-  /** Hosted-shared tenant reports only. */
-  tenant_ingestion?: TenantIngestionMetrics;
-  /** `"shared_lake"` on hosted-shared tenant reports. */
-  collector_backend?: string;
+}
+
+export interface AuditDurabilityMetrics {
+  pending: number;
+  overdue: number;
+  oldest_pending_age_secs: number | null;
+  max_attempts: number;
+  last_error: string | null;
+  last_error_at: string | null;
+  recorded_24h: number;
+  deferred_24h: number;
 }
 
 export interface SiemHealthReport {
@@ -190,7 +217,7 @@ export interface SiemHealthReportSummary {
   overall_score: number;
   overall_status: string;
   ingestion_score: number;
-  parsing_score: number | null;
+  parsing_score: number;
   detection_score: number;
   enrichment_score: number | null;
   alerting_score: number | null;

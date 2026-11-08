@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use super::lateral::source_scope_sql_predicate;
 use super::*;
+use super::lateral::source_scope_sql_predicate;
 use crate::auth::ScopeSet;
 
 impl SearchService {
@@ -31,7 +31,13 @@ impl SearchService {
         if let Some(ref vs) = vals {
             if !vs.is_empty() {
                 let placeholders = vec!["?"; vs.len()].join(",");
-                conditions.push(format!("{} IN ({})", column, placeholders));
+                // OCSF `resources.type` is Array(String): match any element
+                // (`IN` against an array is a type error).
+                if column.contains("resources.") {
+                    conditions.push(format!("hasAny({column}, [{placeholders}])"));
+                } else {
+                    conditions.push(format!("{} IN ({})", column, placeholders));
+                }
                 bind_values.extend(vs.iter().cloned());
             }
         }
@@ -43,11 +49,22 @@ impl SearchService {
     /// (caller drops the term). The alias is omitted when the physical column is
     /// already the UDM name (UDM schema) so the emitted SQL stays byte-identical to
     /// the pre-seam literal projection.
+    /// A cloud field's physical column; OCSF's Array(String) `resources.*`
+    /// collapse to a string (see `scalar_resource_column`).
+    fn cloud_column(profile: &dyn crate::schema::SchemaProfile, udm_field: &str) -> Option<String> {
+        let col = profile.udm_column_sql(udm_field)?;
+        Some(if udm_field.starts_with("resource_") && col != udm_field {
+            super::cloud_overview::scalar_resource_column(col)
+        } else {
+            col
+        })
+    }
+
     fn cloud_select_term(
         profile: &dyn crate::schema::SchemaProfile,
         udm_field: &str,
     ) -> Option<String> {
-        profile.udm_column_sql(udm_field).map(|col| {
+        Self::cloud_column(profile, udm_field).map(|col| {
             if col == udm_field {
                 col
             } else {
@@ -177,10 +194,7 @@ impl SearchService {
     /// (byte-identical). OCSF maps `change_type` onto the numeric `activity_id`
     /// enum (NAN-1248): decode the literal to its code and compare numerically;
     /// literals with no OCSF code (`permission_change`) match nothing (`0`).
-    pub(crate) fn change_type_equals(
-        profile: &dyn crate::schema::SchemaProfile,
-        literal: &str,
-    ) -> String {
+    pub(crate) fn change_type_equals(profile: &dyn crate::schema::SchemaProfile, literal: &str) -> String {
         match profile.udm_column_sql("change_type") {
             Some(col) if col == "change_type" => format!("change_type = '{literal}'"),
             Some(col) => match Self::change_type_activity_id(literal) {
@@ -195,10 +209,7 @@ impl SearchService {
     /// verbatim; OCSF decodes each literal to its `activity_id` code, dropping
     /// unrepresentable ones (`permission_change`), and emits a numeric IN-list.
     /// `0` (match nothing) when no literal maps under OCSF (NAN-1248).
-    pub(crate) fn change_type_in(
-        profile: &dyn crate::schema::SchemaProfile,
-        literals: &[&str],
-    ) -> String {
+    pub(crate) fn change_type_in(profile: &dyn crate::schema::SchemaProfile, literals: &[&str]) -> String {
         match profile.udm_column_sql("change_type") {
             Some(col) if col == "change_type" => {
                 let list = literals
@@ -248,9 +259,7 @@ impl SearchService {
     /// is usually empty for cloud events — so under OCSF we prefer
     /// `actor.user.name` and fall back to `user.name`. UDM byte-identical (returns
     /// the bare `user` column). `None` only if the schema maps neither. (NAN-1248)
-    pub(crate) fn cloud_principal_col(
-        profile: &dyn crate::schema::SchemaProfile,
-    ) -> Option<String> {
+    pub(crate) fn cloud_principal_col(profile: &dyn crate::schema::SchemaProfile) -> Option<String> {
         match profile.id() {
             crate::schema::SchemaId::Ocsf => {
                 let actor = crate::query::escape_identifier("actor.user.name");
@@ -448,7 +457,7 @@ impl SearchService {
         ];
         let facet_unions: Vec<String> = facet_dimensions
             .iter()
-            .filter_map(|dim_name| profile.udm_column_sql(dim_name).and_then(|col| {
+            .filter_map(|dim_name| Self::cloud_column(profile, dim_name).and_then(|col| {
                 // change_type maps to the numeric `activity_id` (UInt32) under OCSF.
                 // `WHERE activity_id != ''` is a Code 32 type error and the facet
                 // strings would be meaningless enum codes, so emit the change_type
@@ -456,6 +465,14 @@ impl SearchService {
                 // (Same UDM-only discriminator as `change_type_equals`.)
                 if *dim_name == "change_type" && col != "change_type" {
                     return None;
+                }
+                // NAN-4928 review P2: count resource types per resource element.
+                if *dim_name == "resource_type" {
+                    if let Some(raw) = profile.udm_column_sql("resource_type").filter(|raw| raw != "resource_type" && raw.contains("resources.")) {
+                        return Some(format!(
+                            "SELECT 'resource_type' AS dimension, toString(__rt) AS value, count() AS cnt FROM cloud_base ARRAY JOIN {raw} AS __rt WHERE __rt != '' GROUP BY __rt ORDER BY cnt DESC LIMIT 20"
+                        ));
+                    }
                 }
                 Some(format!(
                     "SELECT '{}' AS dimension, toString({}) AS value, count() AS cnt FROM cloud_base WHERE {} != '' GROUP BY {} ORDER BY cnt DESC LIMIT 20",
@@ -491,15 +508,14 @@ impl SearchService {
         // Resolve the resource/cloud columns once. `resource_id/name/type` and
         // `change_type` map in both schemas; fall back to the UDM name if a schema
         // ever lacks one so the aggregate still builds (rows just come back empty).
-        let resource_id_col = profile
-            .udm_column_sql("resource_id")
-            .unwrap_or_else(|| "resource_id".to_string());
-        let resource_name_col = profile
-            .udm_column_sql("resource_name")
-            .unwrap_or_else(|| "resource_name".to_string());
-        let resource_type_col = profile
-            .udm_column_sql("resource_type")
-            .unwrap_or_else(|| "resource_type".to_string());
+        // NAN-4928 review P2: one row per resource element (OCSF arrays are
+        // ARRAY JOINed as (uid, name, type) tuples; UDM is unchanged).
+        let super::cloud_overview::ResourceRows {
+            array_join: resource_join,
+            id: resource_id_col,
+            name: resource_name_col,
+            ty: resource_type_col,
+        } = super::cloud_overview::resource_rows(profile);
         // Display-decode for the change_types[] rollup: UDM emits `change_type`
         // bare (byte-identical), OCSF decodes activity_id -> the UDM label so the
         // resource panel shows create/read/update/delete, not 1/2/3/4 (gap #24).
@@ -519,7 +535,7 @@ impl SearchService {
                    toString(min(timestamp)) AS first_seen,
                    toString(max(timestamp)) AS last_seen,
                    groupUniqArray({change_type_label_expr}) AS change_types
-            FROM cloud_base
+            FROM cloud_base{resource_join}
             WHERE {resource_id_col} != ''
             GROUP BY {resource_id_col}
             ORDER BY event_count DESC
@@ -714,7 +730,11 @@ impl SearchService {
                 mfa_count: u64,
                 no_mfa_count: u64,
             }
-            match clickhouse.query(sql).fetch_all::<UserActivityRow>().await {
+            match clickhouse
+                .query(sql)
+                .fetch_all::<UserActivityRow>()
+                .await
+            {
                 Ok(rows) => {
                     let activity = rows
                         .into_iter()
@@ -855,20 +875,6 @@ impl SearchService {
         ),
         SearchError,
     > {
-        let Some(retention_time_range) =
-            self.retention_bound_query_range(time_range, chrono::Utc::now())?
-        else {
-            return Ok((Vec::new(), 0, CloudFacets::default(), None, None));
-        };
-        let time_range = &retention_time_range;
-
-        if self.lake_query.mode == super::LakeQueryMode::Primary {
-            return self
-                .query_lake_cloud_events_paginated(
-                    query_str, time_range, offset, limit, filters, scope,
-                )
-                .await;
-        }
         // NAN-2022: match build_cloud_view — clamp an over-wide window end-anchored to
         // the cap instead of rejecting, so the timeline "load more" stays consistent
         // with the (already clamped) primary cloud view rather than 400-ing on offset 0.
@@ -970,6 +976,7 @@ impl SearchService {
                     // to dotted columns — so each term is emitted ONLY when its column
                     // resolves under the active schema, pushing exactly one bind per
                     // emitted term so placeholder/bind counts stay aligned.
+                    // Raw columns: the match is element-wise on OCSF arrays.
                     let resource_id_col = profile
                         .udm_column_sql("resource_id")
                         .unwrap_or_else(|| "resource_id".to_string());
@@ -989,12 +996,8 @@ impl SearchService {
                     if let Some(col) = profile.udm_column_sql("src_ip") {
                         or_terms.push(format!("position(lower({col}), ?) > 0"));
                     }
-                    or_terms.push(format!(
-                        "({resource_id_col} != '' AND position(lower({resource_id_col}), ?) > 0)"
-                    ));
-                    or_terms.push(format!(
-                        "({resource_name_col} != '' AND position(lower({resource_name_col}), ?) > 0)"
-                    ));
+                    or_terms.push(super::cloud_overview::resource_contains_lower(&resource_id_col));
+                    or_terms.push(super::cloud_overview::resource_contains_lower(&resource_name_col));
                     if let Some(col) = profile.udm_column_sql("http_user_agent") {
                         or_terms.push(format!("({col} != '' AND position(lower({col}), ?) > 0)"));
                     }
@@ -1092,15 +1095,14 @@ impl SearchService {
         let include_panels = offset == 0;
 
         // Resolve resource/cloud columns once for the panel queries below.
-        let resource_id_col = profile
-            .udm_column_sql("resource_id")
-            .unwrap_or_else(|| "resource_id".to_string());
-        let resource_name_col = profile
-            .udm_column_sql("resource_name")
-            .unwrap_or_else(|| "resource_name".to_string());
-        let resource_type_col = profile
-            .udm_column_sql("resource_type")
-            .unwrap_or_else(|| "resource_type".to_string());
+        // NAN-4928 review P2: one row per resource element (OCSF arrays are
+        // ARRAY JOINed as (uid, name, type) tuples; UDM is unchanged).
+        let super::cloud_overview::ResourceRows {
+            array_join: resource_join,
+            id: resource_id_col,
+            name: resource_name_col,
+            ty: resource_type_col,
+        } = super::cloud_overview::resource_rows(profile);
         // Display-decode for the change_types[] rollup (gap #24): UDM bare =
         // byte-identical; OCSF decodes activity_id -> create/read/update/delete.
         let change_type_label_expr = Self::change_type_label_expr(profile);
@@ -1113,7 +1115,7 @@ impl SearchService {
                        toString(min(timestamp)) AS first_seen,
                        toString(max(timestamp)) AS last_seen,
                        groupUniqArray({change_type_label_expr}) AS change_types
-                FROM {}
+                FROM {}{resource_join}
                 WHERE {resource_id_col} != ''
                 GROUP BY {resource_id_col}
                 ORDER BY event_count DESC
@@ -1180,7 +1182,10 @@ impl SearchService {
                     Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
                     Ok(None) => break,
                     Err(e) => {
-                        tracing::warn!("Cloud paginated events query failed mid-stream: {}", e);
+                        tracing::warn!(
+                            "Cloud paginated events query failed mid-stream: {}",
+                            e
+                        );
                         return Err(parse_clickhouse_error(&e.to_string()));
                     }
                 }
@@ -1352,92 +1357,10 @@ impl SearchService {
 
         tracing::info!(
             "Cloud paginated query: {} events (offset={}, limit={}), total={}, {} facet rows, panels={}",
-            events.len(),
-            offset,
-            limit,
-            total_count,
-            facet_rows.len(),
-            include_panels
+            events.len(), offset, limit, total_count, facet_rows.len(), include_panels
         );
 
         Ok((events, total_count, facets, resources, user_activity))
-    }
-
-    /// Fetch only the paintable Cloud event page. Canonical lake callers use
-    /// this before starting exact facets and panel aggregates, preventing those
-    /// companions from delaying visible rows. Legacy ClickHouse deployments
-    /// retain the established combined query path.
-    pub async fn query_cloud_events_page(
-        &self,
-        query_str: &str,
-        time_range: &TimeRange,
-        offset: usize,
-        limit: usize,
-        cursor: Option<&ProductViewCursor>,
-        filters: Option<&CloudEventFilters>,
-        scope: &ScopeSet,
-    ) -> Result<(Vec<serde_json::Value>, bool, Option<ProductViewCursor>), SearchError> {
-        let Some(retention_time_range) =
-            self.retention_bound_query_range(time_range, chrono::Utc::now())?
-        else {
-            return Ok((Vec::new(), false, None));
-        };
-        let time_range = &retention_time_range;
-
-        if self.lake_query.mode == super::LakeQueryMode::Primary {
-            return self
-                .query_lake_cloud_events_page(
-                    query_str, time_range, offset, limit, cursor, filters, scope,
-                )
-                .await;
-        }
-        let (events, total_count, _, _, _) = self
-            .query_cloud_events_paginated(query_str, time_range, offset, limit, filters, scope)
-            .await?;
-        let has_more = offset.saturating_add(events.len()) < total_count as usize;
-        Ok((events, has_more, None))
-    }
-
-    /// Fetch exact Cloud totals/facets and optionally the resources/users
-    /// panels without materializing the event page.
-    pub async fn query_cloud_events_summary(
-        &self,
-        query_str: &str,
-        time_range: &TimeRange,
-        filters: Option<&CloudEventFilters>,
-        scope: &ScopeSet,
-        include_panels: bool,
-    ) -> Result<
-        (
-            u64,
-            CloudFacets,
-            Option<Vec<serde_json::Value>>,
-            Option<Vec<CloudUserActivity>>,
-        ),
-        SearchError,
-    > {
-        let Some(retention_time_range) =
-            self.retention_bound_query_range(time_range, chrono::Utc::now())?
-        else {
-            return Ok((0, CloudFacets::default(), None, None));
-        };
-        let time_range = &retention_time_range;
-
-        if self.lake_query.mode == super::LakeQueryMode::Primary {
-            return self
-                .query_lake_cloud_events_summary(
-                    query_str,
-                    time_range,
-                    filters,
-                    scope,
-                    include_panels,
-                )
-                .await;
-        }
-        let (_, total_count, facets, resources, user_activity) = self
-            .query_cloud_events_paginated(query_str, time_range, 0, 1, filters, scope)
-            .await?;
-        Ok((total_count, facets, resources, user_activity))
     }
 
     /// Query a single user's cloud activity timeline.
@@ -1451,18 +1374,6 @@ impl SearchService {
         user: &str,
         scope: &ScopeSet,
     ) -> Result<(Vec<serde_json::Value>, CloudUserSessionSummary), SearchError> {
-        let Some(retention_time_range) =
-            self.retention_bound_query_range(time_range, chrono::Utc::now())?
-        else {
-            return Ok((Vec::new(), CloudUserSessionSummary::default()));
-        };
-        let time_range = &retention_time_range;
-
-        if self.lake_query.mode == super::LakeQueryMode::Primary {
-            return self
-                .query_lake_cloud_user_timeline(query_str, time_range, user, scope)
-                .await;
-        }
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => {
@@ -1479,7 +1390,7 @@ impl SearchService {
                         has_no_mfa: false,
                         risk_indicators: vec![],
                     },
-                ));
+                ))
             }
         };
 
@@ -1579,7 +1490,10 @@ impl SearchService {
                     Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
                     Ok(None) => break,
                     Err(e) => {
-                        tracing::warn!("Cloud user timeline events query failed mid-stream: {}", e);
+                        tracing::warn!(
+                            "Cloud user timeline events query failed mid-stream: {}",
+                            e
+                        );
                         return Err(parse_clickhouse_error(&e.to_string()));
                     }
                 }
@@ -1698,24 +1612,6 @@ impl SearchService {
         ),
         SearchError,
     > {
-        let Some(retention_time_range) =
-            self.retention_bound_query_range(time_range, chrono::Utc::now())?
-        else {
-            return Ok((Vec::new(), Vec::new(), serde_json::json!({})));
-        };
-        let time_range = &retention_time_range;
-
-        if self.lake_query.mode == super::LakeQueryMode::Primary {
-            return self
-                .query_lake_cloud_entity_pivot(
-                    query_str,
-                    time_range,
-                    entity_type,
-                    entity_value,
-                    scope,
-                )
-                .await;
-        }
         use serde_json::json;
 
         let clickhouse = match &self.ch_client {
@@ -1749,12 +1645,12 @@ impl SearchService {
 
         // Cloud columns resolved through the active schema. `resource_id`/
         // `resource_name` map in both schemas; fall back to the UDM name otherwise.
-        let resource_id_col = profile
-            .udm_column_sql("resource_id")
-            .unwrap_or_else(|| "resource_id".to_string());
-        let resource_name_col = profile
-            .udm_column_sql("resource_name")
-            .unwrap_or_else(|| "resource_name".to_string());
+        // NAN-4928 review P2: the resource cross-reference counts per element.
+        let super::cloud_overview::ResourceRows {
+            array_join: resource_join,
+            id: resource_id_col,
+            ..
+        } = super::cloud_overview::resource_rows(profile);
         let cloud_service_col = profile
             .udm_column_sql("cloud_service")
             .unwrap_or_else(|| "cloud_service".to_string());
@@ -1782,9 +1678,17 @@ impl SearchService {
                 Some(col) => (format!("{col} = ?"), vec![entity_val.clone()]),
                 None => ("0".to_string(), Vec::new()),
             },
+            // Element-wise `has()` on OCSF arrays keeps the resources.uid
+            // bloom index usable; byte-identical on UDM strings.
             "resource" => (
                 format!(
-                    "(lower({resource_id_col}) = lower(?) OR lower({resource_name_col}) = lower(?))"
+                    "({} OR {})",
+                    super::cloud_overview::resource_eq_ci(
+                        &profile.udm_column_sql("resource_id").unwrap_or_else(|| "resource_id".to_string())
+                    ),
+                    super::cloud_overview::resource_eq_ci(
+                        &profile.udm_column_sql("resource_name").unwrap_or_else(|| "resource_name".to_string())
+                    ),
                 ),
                 vec![entity_val.clone(), entity_val.clone()],
             ),
@@ -1812,23 +1716,19 @@ impl SearchService {
         // UDM name). We build branches as a Vec so the per-branch `entity_binds`
         // copy is appended only for branches that are actually emitted — keeping
         // placeholder/bind counts aligned regardless of which dimensions map.
-        let ip_xref_branch = src_ip_col.as_ref().map(|col| {
-            format!(
-                "SELECT 'ip' AS entity_type, {col} AS entity_value, count() AS event_count \
+        let ip_xref_branch = src_ip_col.as_ref().map(|col| format!(
+            "SELECT 'ip' AS entity_type, {col} AS entity_value, count() AS event_count \
              FROM cloud_base WHERE {entity_filter} AND {col} != '' \
              GROUP BY {col} ORDER BY event_count DESC LIMIT 50"
-            )
-        });
-        let user_xref_branch = user_col.as_ref().map(|col| {
-            format!(
-                "SELECT 'user' AS entity_type, {col} AS entity_value, count() AS event_count \
+        ));
+        let user_xref_branch = user_col.as_ref().map(|col| format!(
+            "SELECT 'user' AS entity_type, {col} AS entity_value, count() AS event_count \
              FROM cloud_base WHERE {entity_filter} AND {col} != '' \
              GROUP BY {col} ORDER BY event_count DESC LIMIT 50"
-            )
-        });
+        ));
         let resource_xref_branch = format!(
             "SELECT 'resource' AS entity_type, {resource_id_col} AS entity_value, count() AS event_count \
-             FROM cloud_base WHERE {entity_filter} AND {resource_id_col} != '' \
+             FROM cloud_base{resource_join} WHERE {entity_filter} AND {resource_id_col} != '' \
              GROUP BY {resource_id_col} ORDER BY event_count DESC LIMIT 50"
         );
         // Branch order per entity_type (mirrors the original cross-ref dimensions).
@@ -1887,7 +1787,10 @@ impl SearchService {
                     Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
                     Ok(None) => break,
                     Err(e) => {
-                        tracing::warn!("Cloud entity pivot events query failed mid-stream: {}", e);
+                        tracing::warn!(
+                            "Cloud entity pivot events query failed mid-stream: {}",
+                            e
+                        );
                         return Err(parse_clickhouse_error(&e.to_string()));
                     }
                 }

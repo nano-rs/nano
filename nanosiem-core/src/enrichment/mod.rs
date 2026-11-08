@@ -3,26 +3,21 @@
 //! Enrichment module for IP geolocation, ASN, and threat intelligence data
 //!
 //! This module provides:
-//! - Enrichment source management (IPinfo Lite, ThreatFox, etc.)
-//! - IP enrichment data storage and lookup
+//! - Enrichment source metadata (`enrichment_sources`)
+//! - IP enrichment lookups against the ingest-time dictionary
 //! - IOC (Indicators of Compromise) enrichment from threat intel feeds
-//! - Sync service for downloading and updating enrichment data
-//! - Auto-sync scheduler for automatic updates
+//!
+//! IPinfo Lite geo/ASN comes only from nano's signed platform feed bundle
+//! (`platform_enrichment`); NAN-4959 removed the native IPinfo download job.
 
 pub mod ioc;
-pub mod ipinfo_mmdb;
-pub mod lake_ip_context;
-pub mod lean_assignments;
+pub mod ip_geo;
 pub mod lane_client;
 pub mod repository;
-pub mod scheduler;
 pub mod service;
 pub mod types;
 
-pub use ipinfo_mmdb::{IpinfoMmdbError, IpinfoMmdbSnapshot};
-pub use lake_ip_context::{LakeIpContextClient, LakeIpContextCounts, LakeIpContextError};
 pub use lane_client::{EnrichmentLaneClient, EnrichmentLaneError, ENRICH_SOURCE_TYPE};
 pub use repository::{EnrichmentRepository, EnrichmentRepositoryError};
-pub use scheduler::{EnrichmentScheduler, EnrichmentSchedulerConfig};
-pub use service::{EnrichmentError, EnrichmentService, EnrichmentSyncResult, LogEnrichment};
+pub use service::{EnrichmentError, EnrichmentService, LogEnrichment};
 pub use types::*;

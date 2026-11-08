@@ -736,11 +736,7 @@ mod tests {
         let svc = preview_service();
         let content = csv_with_rows(MAX_PREVIEW_ROWS * 3);
         let result = svc
-            .preview(
-                &content,
-                &ParserConfig::default(),
-                Some(MAX_PREVIEW_ROWS * 3),
-            )
+            .preview(&content, &ParserConfig::default(), Some(MAX_PREVIEW_ROWS * 3))
             .await
             .expect("preview");
         assert_eq!(

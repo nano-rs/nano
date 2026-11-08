@@ -10,14 +10,14 @@ import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import type { Capabilities } from '@/hooks/use-capabilities';
 
-const mock = vi.hoisted(() => ({ sso: false, hasSso: true }));
+const mock = vi.hoisted(() => ({ sso: false, hasSso: true, tierLoading: false, tierLoaded: true }));
 
 function caps(sso: boolean): Capabilities {
   return {
-    search: true, cases: false, notebooks: false, risk: false, melod: false,
-    queryCorrection: false, customEnrichment: false, agentEnrichment: false,
+    cases: false, notebooks: false, risk: false, melod: false,
+    customEnrichment: false, agentEnrichment: false,
     aiTuning: false, playbooks: false, incidents: false, siemHealth: true,
-    sso, observabilityConvergence: false, iocLists: false, soar: false,
+    sso, observabilityConvergence: false, iocLists: false, soar: false, threatIntel: false,
   };
 }
 
@@ -32,7 +32,13 @@ vi.mock('@/contexts/AuthContext', () => ({
     user: { deployment_mode: 'standard' },
   }),
 }));
-vi.mock('@/hooks/use-tier', () => ({ useTierContext: () => ({ hasSso: mock.hasSso }) }));
+vi.mock('@/hooks/use-tier', () => ({
+  useTierContext: () => ({
+    hasSso: mock.hasSso,
+    loading: mock.tierLoading,
+    status: mock.tierLoaded ? { limits: { sso_enabled: mock.hasSso } } : null,
+  }),
+}));
 vi.mock('@/hooks/use-shared-tenant', () => ({ useSharedTenant: () => false }));
 vi.mock('@/hooks/useDocumentTitle', () => ({ useDocumentTitle: vi.fn() }));
 vi.mock('@/hooks/use-api', () => ({
@@ -69,6 +75,8 @@ function renderAt(node: React.ReactNode) {
 beforeEach(() => {
   mock.sso = false;
   mock.hasSso = true;
+  mock.tierLoading = false;
+  mock.tierLoaded = true;
 });
 afterEach(cleanup);
 
@@ -112,4 +120,29 @@ test('SSO provider route renders the page when sso is available', () => {
   mock.sso = true;
   renderAt(<SsoRouteGate><div>providers page</div></SsoRouteGate>);
   expect(screen.getByText('providers page')).toBeTruthy();
+});
+
+test('SSO provider route is refused on a plan without SSO even in an SSO build', () => {
+  mock.sso = true;
+  mock.hasSso = false;
+  renderAt(<SsoRouteGate><div>providers page</div></SsoRouteGate>);
+  expect(screen.queryByText('providers page')).toBeNull();
+  expect(screen.getByText('Single sign-on is not available')).toBeTruthy();
+  expect(screen.getByText(/Your plan does not include/)).toBeTruthy();
+});
+
+test('SSO provider route does not mount while the plan is still loading', () => {
+  mock.sso = true;
+  mock.tierLoading = true;
+  mock.tierLoaded = false;
+  renderAt(<SsoRouteGate><div>providers page</div></SsoRouteGate>);
+  expect(screen.queryByText('providers page')).toBeNull();
+});
+
+test('SSO provider route fails closed when the plan could not be read', () => {
+  mock.sso = true;
+  mock.tierLoaded = false;
+  renderAt(<SsoRouteGate><div>providers page</div></SsoRouteGate>);
+  expect(screen.queryByText('providers page')).toBeNull();
+  expect(screen.getByText('Single sign-on is not available')).toBeTruthy();
 });

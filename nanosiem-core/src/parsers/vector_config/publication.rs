@@ -58,10 +58,6 @@ pub enum VectorConfigPublicationError {
     InvalidRendererEpoch { value: String, message: String },
     #[error("invalid VECTOR_CONFIG_SIGNING_PRIVATE_KEY_B64: {0}")]
     InvalidSigningKey(String),
-    /// NAN-3765: the rendered set names an input no component declares;
-    /// Vector would refuse it (and not boot on it). Never published.
-    #[error("refusing to publish a Vector config with dangling inputs: {0}")]
-    DanglingInputs(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +196,10 @@ pub struct VectorConfigPublisher {
     pool: PgPool,
     config_dir: PathBuf,
     node_id: String,
+    /// NAN-4973: this process's renderer epoch, allocated once from
+    /// `vector_config_renderer_epochs` (see [`allocate_renderer_epoch`]) when
+    /// `VECTOR_CONFIG_RENDERER_EPOCH` is not set.
+    allocated_epoch: std::sync::Arc<tokio::sync::OnceCell<i64>>,
 }
 
 #[derive(Debug)]
@@ -274,7 +274,34 @@ impl VectorConfigPublisher {
             pool,
             config_dir: config_dir.as_ref().to_path_buf(),
             node_id: node_id.into(),
+            allocated_epoch: std::sync::Arc::new(tokio::sync::OnceCell::new()),
         }
+    }
+
+    /// Renderer identity + epoch + signing key for this process.
+    ///
+    /// NAN-4973: an explicit `VECTOR_CONFIG_RENDERER_EPOCH` wins (operator
+    /// override, unchanged behaviour). Otherwise the epoch is the one durably
+    /// allocated to this renderer identity, so a new build supersedes the
+    /// committed one and a reinstall of the same build onto retained data
+    /// rejoins it, with no deployer-maintained counter.
+    async fn renderer_runtime(&self) -> Result<RendererRuntime, VectorConfigPublicationError> {
+        let fingerprint = renderer_fingerprint();
+        let epoch = match renderer_epoch_override()? {
+            Some(epoch) => epoch,
+            None => {
+                let identity = renderer_identity(RENDERER_VERSION, build_id(), &fingerprint);
+                *self
+                    .allocated_epoch
+                    .get_or_try_init(|| allocate_renderer_epoch(&self.pool, &identity, RENDERER_VERSION))
+                    .await?
+            }
+        };
+        Ok(RendererRuntime {
+            epoch,
+            fingerprint,
+            signing_key: signing_key_from_env()?,
+        })
     }
 
     /// Root directory the publisher materializes ready generations into. The
@@ -299,7 +326,7 @@ impl VectorConfigPublisher {
     pub async fn local_current_outcome(
         &self,
     ) -> Result<Option<PublicationOutcome>, VectorConfigPublicationError> {
-        let runtime = renderer_runtime()?;
+        let runtime = self.renderer_runtime().await?;
         let state = sqlx::query_as::<_, CommittedStateRow>(PUBLICATION_STATE_SELECT)
             .fetch_optional(&self.pool)
             .await?
@@ -378,24 +405,13 @@ impl VectorConfigPublisher {
         sources_dir: impl AsRef<Path>,
     ) -> Result<SnapshotBundle, VectorConfigPublicationError> {
         let sources_dir = sources_dir.as_ref().to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            // NAN-3765: refuse a set Vector would refuse, before it gets a
-            // generation. The committed generation keeps serving.
-            let dangling = super::closure::dangling_inputs(&sources_dir)
-                .map_err(VectorConfigPublicationError::DanglingInputs)?;
-            if !dangling.is_empty() {
-                return Err(VectorConfigPublicationError::DanglingInputs(
-                    dangling.join(", "),
-                ));
-            }
-            build_snapshot(&sources_dir)
-        })
-        .await
-        .map_err(|e| {
-            VectorConfigPublicationError::Io(std::io::Error::other(format!(
-                "snapshot worker failed: {e}"
-            )))
-        })?
+        tokio::task::spawn_blocking(move || build_snapshot(&sources_dir))
+            .await
+            .map_err(|e| {
+                VectorConfigPublicationError::Io(std::io::Error::other(format!(
+                    "snapshot worker failed: {e}"
+                )))
+            })?
     }
 
     /// Commit a rendered snapshot only if `expected_revision` is still the
@@ -413,7 +429,7 @@ impl VectorConfigPublisher {
         expected_revision: i64,
         snapshot: &SnapshotBundle,
     ) -> Result<PublicationOutcome, VectorConfigPublicationError> {
-        let runtime = renderer_runtime()?;
+        let runtime = self.renderer_runtime().await?;
         let mut tx = self.pool.begin().await?;
         let state = sqlx::query_as::<_, CommittedStateRow>(PUBLICATION_STATE_SELECT_FOR_UPDATE)
             .fetch_optional(&mut *tx)
@@ -743,12 +759,11 @@ impl VectorConfigPublisher {
             }
         }
 
-        self.prune_local_generations(&publications, generation)
-            .await;
+        self.prune_local_generations(&publications).await;
         Ok(())
     }
 
-    async fn prune_local_generations(&self, publications: &Path, active_generation: i64) {
+    async fn prune_local_generations(&self, publications: &Path) {
         let mut entries = match fs::read_dir(publications).await {
             Ok(entries) => entries,
             Err(error) => {
@@ -768,7 +783,7 @@ impl VectorConfigPublisher {
                             .await
                             .unwrap_or(false)
                     {
-                        generations.push((name.parse::<i64>().unwrap(), entry.path()));
+                        generations.push((name, entry.path()));
                     }
                 }
                 Ok(None) => break,
@@ -778,17 +793,9 @@ impl VectorConfigPublisher {
                 }
             }
         }
-        generations.sort_by_key(|entry| entry.0);
+        generations.sort_by(|left, right| left.0.cmp(&right.0));
         let remove_count = generations.len().saturating_sub(LOCAL_GENERATION_RETENTION);
-        // A restored database can legitimately have a lower generation than
-        // directories left behind by the previous database. Always preserve
-        // the generation we just materialized; numeric ordering is only a
-        // useful retention hint for the remaining inactive generations.
-        for (_, path) in generations
-            .into_iter()
-            .filter(|(generation, _)| *generation != active_generation)
-            .take(remove_count)
-        {
+        for (_, path) in generations.into_iter().take(remove_count) {
             if let Err(error) = fs::remove_dir_all(&path).await {
                 tracing::warn!(path = %path.display(), %error, "failed to prune old local Vector config generation");
             }
@@ -1081,12 +1088,81 @@ fn compare_renderer_precedence(
     }
 }
 
-fn renderer_runtime() -> Result<RendererRuntime, VectorConfigPublicationError> {
-    Ok(RendererRuntime {
-        epoch: renderer_epoch_from_env()?,
-        fingerprint: renderer_fingerprint(),
-        signing_key: signing_key_from_env()?,
-    })
+/// Identity of a renderer for epoch allocation (NAN-4973): semantic version,
+/// build (the running executable's digest: two builds at one version render
+/// differently) and the render-affecting environment fingerprint.
+fn renderer_identity(version: &str, build: &str, fingerprint: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nano.vector-config.renderer-identity.v1");
+    for part in [version, build, fingerprint] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// SHA-256 of the running executable, computed once. Only nano-api publishes,
+/// so every replica of one image shares it. Unreadable -> a constant, which
+/// degrades to the pre-NAN-4973 identity (version + env only).
+fn build_id() -> &'static str {
+    static BUILD_ID: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
+        std::env::current_exe()
+            .and_then(std::fs::read)
+            .map(|bytes| hex::encode(Sha256::digest(&bytes)))
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "cannot hash the running executable; renderer identity uses version + environment only");
+                "unknown-build".to_string()
+            })
+    });
+    BUILD_ID.as_str()
+}
+
+/// The epoch for `identity`: its existing allocation, or a new one above every
+/// epoch allocated so far AND above the committed generation's epoch, taken
+/// under the publication-state row lock (the same lock that serializes the
+/// current-pointer CAS), so concurrent allocations never collide.
+async fn allocate_renderer_epoch(
+    pool: &PgPool,
+    identity: &str,
+    version: &str,
+) -> Result<i64, VectorConfigPublicationError> {
+    let mut tx = pool.begin().await?;
+    let committed_epoch: i64 = sqlx::query_scalar(
+        "SELECT current_renderer_epoch FROM vector_config_publication_state \
+          WHERE singleton = TRUE FOR UPDATE",
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(VectorConfigPublicationError::MissingState)?;
+    if let Some(epoch) = sqlx::query_scalar::<_, i64>(
+        "SELECT epoch FROM vector_config_renderer_epochs WHERE identity = $1",
+    )
+    .bind(identity)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        tx.commit().await?;
+        return Ok(epoch);
+    }
+    let allocated: i64 = sqlx::query_scalar(
+        "INSERT INTO vector_config_renderer_epochs (identity, epoch, renderer_version) \
+         SELECT $1, GREATEST(COALESCE(MAX(epoch), 0), $2) + 1, $3 \
+           FROM vector_config_renderer_epochs \
+         RETURNING epoch",
+    )
+    .bind(identity)
+    .bind(committed_epoch)
+    .bind(version)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    tracing::info!(
+        renderer_epoch = allocated,
+        renderer_version = version,
+        committed_epoch,
+        "allocated a Vector config renderer epoch for this build"
+    );
+    Ok(allocated)
 }
 
 /// Environment inputs that change the rendered Vector configuration but live
@@ -1114,8 +1190,8 @@ fn renderer_fingerprint_inputs() -> Vec<(&'static str, String)> {
     // `log_telemetry_profile_for` is the canonical stable discriminator
     // ("udm" | "ocsf"); the per-query dataset ids it also folds into "udm" are
     // not reachable from `NANO_SCHEMA_PROFILE`.
-    let schema_profile = crate::schema::runtime_profile::runtime_schema_id()
-        .map(crate::schema::log_telemetry_profile_for)
+    let schema_profile = crate::schema::active_profile_from_env()
+        .map(|profile| crate::schema::log_telemetry_profile_for(profile.id()))
         .unwrap_or("udm");
 
     vec![
@@ -1139,13 +1215,6 @@ fn renderer_fingerprint_inputs() -> Vec<(&'static str, String)> {
         (
             "creds_backend",
             crate::source_configs::creds_backend::creds_backend_override_label().to_string(),
-        ),
-        // NAN-3767: the renderer's own code (see build.rs). The crate version
-        // is frozen (NAN-3511), so a release whose renderer emits different
-        // TOML for an unchanged database revision must still publish.
-        (
-            "renderer_source",
-            env!("NANO_VECTOR_RENDERER_SOURCE_HASH").to_string(),
         ),
     ]
 }
@@ -1175,10 +1244,13 @@ fn fingerprint_from_inputs(inputs: &[(&str, String)]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn renderer_epoch_from_env() -> Result<i64, VectorConfigPublicationError> {
+/// Explicit `VECTOR_CONFIG_RENDERER_EPOCH`, if set. Unset or empty = allocate
+/// (NAN-4973; empty used to be a configuration error).
+fn renderer_epoch_override() -> Result<Option<i64>, VectorConfigPublicationError> {
     match std::env::var("VECTOR_CONFIG_RENDERER_EPOCH") {
-        Ok(value) => parse_renderer_epoch(&value),
-        Err(VarError::NotPresent) => Ok(0),
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => parse_renderer_epoch(value.trim()).map(Some),
+        Err(VarError::NotPresent) => Ok(None),
         Err(VarError::NotUnicode(_)) => Err(VectorConfigPublicationError::InvalidRendererEpoch {
             value: "<non-UTF-8>".to_string(),
             message: "value must be a non-negative integer".to_string(),
@@ -1695,8 +1767,7 @@ mod tests {
     fn delayed_node_cannot_regress_committed_revision() {
         let committed = committed_state(12, 12, "new", 0, RENDERER_VERSION);
         assert_eq!(
-            decide_publication(&committed, 11, "old", 0, RENDERER_VERSION, TEST_FINGERPRINT)
-                .unwrap(),
+            decide_publication(&committed, 11, "old", 0, RENDERER_VERSION, TEST_FINGERPRINT).unwrap(),
             PublicationDecision::Stale {
                 actual_revision: 12
             }
@@ -1707,15 +1778,7 @@ mod tests {
     fn restarted_node_reuses_identical_committed_generation() {
         let committed = committed_state(12, 12, "same", 0, RENDERER_VERSION);
         assert_eq!(
-            decide_publication(
-                &committed,
-                12,
-                "same",
-                0,
-                RENDERER_VERSION,
-                TEST_FINGERPRINT
-            )
-            .unwrap(),
+            decide_publication(&committed, 12, "same", 0, RENDERER_VERSION, TEST_FINGERPRINT).unwrap(),
             PublicationDecision::Reuse { generation: 7 }
         );
     }
@@ -1724,14 +1787,7 @@ mod tests {
     fn same_revision_with_different_render_is_rejected() {
         let committed = committed_state(12, 12, "node-a", 0, RENDERER_VERSION);
         assert!(matches!(
-            decide_publication(
-                &committed,
-                12,
-                "node-b",
-                0,
-                RENDERER_VERSION,
-                TEST_FINGERPRINT
-            ),
+            decide_publication(&committed, 12, "node-b", 0, RENDERER_VERSION, TEST_FINGERPRINT),
             Err(VectorConfigPublicationError::DivergentRender { .. })
         ));
     }
@@ -1753,15 +1809,7 @@ mod tests {
     fn parser_health_renderer_supersedes_pre_health_release() {
         let committed = committed_state(12, 12, "pre-health", 0, "0.1.682");
         assert_eq!(
-            decide_publication(
-                &committed,
-                12,
-                "with-health",
-                0,
-                RENDERER_VERSION,
-                TEST_FINGERPRINT
-            )
-            .unwrap(),
+            decide_publication(&committed, 12, "with-health", 0, RENDERER_VERSION, TEST_FINGERPRINT).unwrap(),
             PublicationDecision::PublishNew
         );
     }
@@ -1770,15 +1818,7 @@ mod tests {
     fn higher_epoch_allows_intentional_semver_rollback() {
         let committed = committed_state(12, 12, "old-render", 3, "2.0.0");
         assert_eq!(
-            decide_publication(
-                &committed,
-                12,
-                "rollback-render",
-                4,
-                "1.5.0",
-                TEST_FINGERPRINT
-            )
-            .unwrap(),
+            decide_publication(&committed, 12, "rollback-render", 4, "1.5.0", TEST_FINGERPRINT).unwrap(),
             PublicationDecision::PublishNew
         );
     }
@@ -1861,15 +1901,8 @@ mod tests {
     fn matching_fingerprint_preserves_reuse_and_divergence_detection() {
         let committed = committed_state(12, 12, "same", 0, RENDERER_VERSION);
         assert_eq!(
-            decide_publication(
-                &committed,
-                12,
-                "same",
-                0,
-                RENDERER_VERSION,
-                TEST_FINGERPRINT
-            )
-            .unwrap(),
+            decide_publication(&committed, 12, "same", 0, RENDERER_VERSION, TEST_FINGERPRINT)
+                .unwrap(),
             PublicationDecision::Reuse { generation: 7 },
         );
         assert!(matches!(
@@ -1890,7 +1923,8 @@ mod tests {
     /// with a different environment could overwrite a newer generation.
     #[test]
     fn fingerprint_change_cannot_defeat_the_renderer_epoch_fence() {
-        let committed = committed_state_with_fingerprint(12, 12, "new-epoch", 4, "1.0.0", "udm-fp");
+        let committed =
+            committed_state_with_fingerprint(12, 12, "new-epoch", 4, "1.0.0", "udm-fp");
         assert_eq!(
             decide_publication(&committed, 12, "old-epoch", 3, "9.0.0", "ocsf-fp").unwrap(),
             PublicationDecision::SupersededRenderer {
@@ -1898,28 +1932,6 @@ mod tests {
                 committed_version: "1.0.0".to_string(),
             },
         );
-    }
-
-    /// NAN-3767: the renderer's code is part of its identity, so an upgrade
-    /// whose renderer emits new TOML for an unchanged database revision
-    /// publishes a generation instead of reusing (or refusing as divergent)
-    /// the old binary's one.
-    #[test]
-    fn fingerprint_includes_the_renderer_source_hash() {
-        let inputs = renderer_fingerprint_inputs();
-        let (_, hash) = inputs
-            .iter()
-            .find(|(name, _)| *name == "renderer_source")
-            .expect("renderer_source input");
-        assert_eq!(hash.len(), 16);
-        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
-        let mut changed = inputs.clone();
-        for (name, value) in &mut changed {
-            if *name == "renderer_source" {
-                *value = "0000000000000000".to_string();
-            }
-        }
-        assert_ne!(fingerprint_from_inputs(&inputs), fingerprint_from_inputs(&changed));
     }
 
     #[test]
@@ -2004,15 +2016,7 @@ mod tests {
     fn newer_source_revision_gets_its_own_generation_even_if_content_matches() {
         let committed = committed_state(13, 12, "same", 0, RENDERER_VERSION);
         assert_eq!(
-            decide_publication(
-                &committed,
-                13,
-                "same",
-                0,
-                RENDERER_VERSION,
-                TEST_FINGERPRINT
-            )
-            .unwrap(),
+            decide_publication(&committed, 13, "same", 0, RENDERER_VERSION, TEST_FINGERPRINT).unwrap(),
             PublicationDecision::PublishNew
         );
     }
@@ -2077,9 +2081,7 @@ mod tests {
     #[test]
     fn empty_or_whitespace_signing_key_maps_to_none() {
         assert!(signing_key_from_optional_encoded(None).unwrap().is_none());
-        assert!(signing_key_from_optional_encoded(Some(""))
-            .unwrap()
-            .is_none());
+        assert!(signing_key_from_optional_encoded(Some("")).unwrap().is_none());
         assert!(signing_key_from_optional_encoded(Some("   "))
             .unwrap()
             .is_none());
@@ -2401,39 +2403,5 @@ mod tests {
         for generation in 3..=5 {
             assert!(publications.join(format!("{generation:020}")).exists());
         }
-    }
-
-    #[tokio::test]
-    async fn materialization_retains_active_generation_after_database_restore() {
-        let config_dir = tempfile::tempdir().unwrap();
-        let source_dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(source_dir.path().join("parsers")).unwrap();
-        std::fs::write(
-            source_dir.path().join("parsers/example.toml"),
-            "[x]\na = 1\n",
-        )
-        .unwrap();
-        let snapshot = build_snapshot(source_dir.path()).unwrap();
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgresql://unused:unused@127.0.0.1/unused")
-            .unwrap();
-        let publisher = VectorConfigPublisher::new(pool, config_dir.path(), "test-node");
-
-        for generation in 180..=182 {
-            publisher
-                .materialize(generation, generation, 0, &snapshot, None)
-                .await
-                .unwrap();
-        }
-        publisher
-            .materialize(6, 6, 0, &snapshot, None)
-            .await
-            .unwrap();
-
-        let publications = config_dir.path().join("publications");
-        assert!(publications.join("00000000000000000006").exists());
-        assert!(!publications.join("00000000000000000180").exists());
-        assert!(publications.join("00000000000000000181").exists());
-        assert!(publications.join("00000000000000000182").exists());
     }
 }

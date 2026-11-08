@@ -154,6 +154,37 @@ const MVS_REDEFINED_BY_161: &[&str] = &[
     "nanosiem.ioc_enrichment_dict_refresh",
 ];
 
+/// NAN-4902 lane G: migration 182 re-issues the custom IOC refresh MV body
+/// (commit-marker visibility for code-free IOC lists) via MODIFY QUERY, so for
+/// that MV 182 — not 161 — is canonical, and init.sql must match it.
+const MIGRATION_182: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/182_ioc_list_commits.sql"
+));
+
+/// Refresh MVs whose canonical body moved on to migration 182.
+const MVS_REDEFINED_BY_182: &[&str] = &["nanosiem.custom_ioc_enrichment_dict_refresh"];
+
+/// NAN-4948: migration 184 re-issues the IP and marketplace-IOC refresh MV
+/// bodies (platform feed bundle commit-marker visibility) via MODIFY QUERY.
+/// Unlike 161/182, init.sql deliberately keeps the PRE-184 bodies: the new
+/// bodies reference the `platform_feed` column that 184 itself adds, and
+/// ClickHouse analyzes a `CREATE MATERIALIZED VIEW IF NOT EXISTS` SELECT
+/// against the live schema before the existence short-circuit, so an init.sql
+/// body that names the column aborts init.sql on every upgraded install (184
+/// would then never run). Fresh installs reach the same body via init.sql +
+/// 184 (scripts/tests/platform-feed-ch-upgrade.sh asserts both paths).
+const MIGRATION_184: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/184_platform_feed_commits.sql"
+));
+
+/// Refresh MVs whose canonical body moved on to migration 184.
+const MVS_REDEFINED_BY_184: &[&str] = &[
+    "nanosiem.ioc_enrichment_dict_refresh",
+    "nanosiem.ip_enrichment_dict_refresh",
+];
+
 /// The SELECT half of an MV body. A CREATE-extracted body reads
 /// `<name> TO <target> AS SELECT …` while `MODIFY QUERY` yields the bare
 /// SELECT, so only this part is comparable across the two forms.
@@ -737,7 +768,20 @@ fn migration_133_matches_init_definitions() {
         let udm_mv = udm_mvs
             .get(&refresh)
             .expect("refresh MV in clickhouse/init.sql");
-        if MVS_REDEFINED_BY_161.contains(&refresh.as_str()) {
+        if MVS_REDEFINED_BY_182.contains(&refresh.as_str()) {
+            let mig182 = modify_query_statements(MIGRATION_182);
+            assert_eq!(
+                mig182.keys().cloned().collect::<Vec<_>>(),
+                MVS_REDEFINED_BY_182.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "migration 182 must MODIFY QUERY exactly MVS_REDEFINED_BY_182"
+            );
+            let canonical = mig182.get(&refresh).expect("listed MV in migration 182");
+            assert_eq!(
+                select_body(canonical),
+                select_body(&strip_refresh(udm_mv)),
+                "{refresh} body differs between migration 182 and clickhouse/init.sql"
+            );
+        } else if MVS_REDEFINED_BY_161.contains(&refresh.as_str()) {
             // NAN-2197: the dedup rewrite landed in init.sql first and reached
             // existing installs via migration 161's ALTER … MODIFY QUERY, so
             // 133 is no longer canonical for these three. Compare the SELECT
@@ -844,4 +888,37 @@ fn staging_tables_keep_local_engine() {
              STAGED_DICTS/PUSHDOWN_DICTS"
         );
     }
+}
+
+/// NAN-4948: init.sql body edits are fresh-only, so nothing that migration 184
+/// introduces may appear in init.sql; 184 adds the column BEFORE it modifies
+/// the two refreshable MVs, and modifies exactly those.
+#[test]
+fn migration_184_owns_the_platform_feed_schema_and_init_sql_stays_pre_184() {
+    assert!(
+        !UDM_INIT.contains("platform_feed"),
+        "clickhouse/init.sql must not reference platform_feed (breaks the upgrade path; put it in 184)"
+    );
+    let mig184 = modify_query_statements(MIGRATION_184);
+    assert_eq!(
+        mig184.keys().cloned().collect::<Vec<_>>(),
+        MVS_REDEFINED_BY_184.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "migration 184 must MODIFY QUERY exactly MVS_REDEFINED_BY_184"
+    );
+    for (mv, body) in &mig184 {
+        assert!(body.contains("platform_feed = 0 OR"), "{mv}: {body}");
+        assert!(!body.starts_with("AS "), "{mv}: MODIFY QUERY takes the SELECT without AS");
+    }
+    // Statement form ("ALTER TABLE …\nMODIFY QUERY"), not the header comment.
+    let first_modify = MIGRATION_184.find("\nMODIFY QUERY").unwrap();
+    for table in ["custom_enrichment_results", "ip_enrichments"] {
+        let add = MIGRATION_184
+            .find(&format!("ALTER TABLE nanosiem.{table} ADD COLUMN IF NOT EXISTS platform_feed"))
+            .unwrap_or_else(|| panic!("184 must add platform_feed to {table}"));
+        assert!(add < first_modify, "184 must add the column on {table} before modifying the MVs");
+    }
+    assert!(
+        MIGRATION_184.find("CREATE TABLE IF NOT EXISTS nanosiem.platform_feed_commits").unwrap() < first_modify,
+        "the commits table must exist before the MVs reference it"
+    );
 }

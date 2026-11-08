@@ -83,3 +83,42 @@ export function nplQuoted(value: string): string {
 export function nplFieldEquals(field: string, value: string): string {
   return `${field}=${nplQuoted(value)}`;
 }
+
+/**
+ * A COMPLETE nPL string literal that keeps the value byte-for-byte whenever
+ * the grammar can express it. Mirrors the Rust
+ * `query::pretty_print::helpers::npl_quoted_literal` (NAN-2241): `"…"` unless
+ * the value contains a `"`, then `'…'` (nPL has both delimiters and neither
+ * honours a backslash escape). Backslashes are doubled; newlines dropped.
+ *
+ * A value containing BOTH quote kinds cannot be represented; `lossy` is then
+ * true and the `"` characters are dropped (the historical shape). Callers that
+ * persist the result (a detection) must surface `lossy`, not ignore it.
+ */
+export function nplLiteral(value: string): { literal: string; lossy: boolean } {
+  const hasDouble = value.includes('"');
+  const hasSingle = value.includes("'");
+  const delimiter = !hasDouble ? '"' : !hasSingle ? "'" : '"';
+  let out = delimiter;
+  for (const ch of value) {
+    if (ch === delimiter || ch === '\n' || ch === '\r') continue;
+    out += ch === '\\' ? '\\\\' : ch;
+  }
+  out += delimiter;
+  return { literal: out, lossy: hasDouble && hasSingle };
+}
+
+/**
+ * Exact (literal) equality on a field, for pivots built from log values
+ * (NAN-4903). `field="v"` treats `*` and `?` inside the quotes as wildcards
+ * (and `field="*"` is an existence test), so a value carrying either would
+ * broaden the pivot. nPL's IN-list compiles to plain membership with no
+ * wildcard expansion (search arm: `generate_in_list_filter`; pipeline arm:
+ * `SearchExpr::InList`), so such values use `field IN ("v")`. Values without
+ * wildcard metacharacters keep the familiar `field="v"` form, which is already
+ * exact. The value itself goes through `nplLiteral` (quote-preserving).
+ */
+export function nplExactEquals(field: string, value: string): string {
+  const { literal } = nplLiteral(value);
+  return /[*?]/.test(value) ? `${field} IN (${literal})` : `${field}=${literal}`;
+}

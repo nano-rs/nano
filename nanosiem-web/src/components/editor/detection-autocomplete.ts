@@ -23,6 +23,60 @@ import {
   type AutocompleteOption as QueryOption,
 } from '@/lib/query-autocomplete';
 import { COMPLETION_TOKEN_BEFORE, COMPLETION_VALID_FOR } from './search-autocomplete';
+import { api } from '@/lib/api';
+import {
+  schemaField,
+  toSchemaProfile,
+  type SchemaProfileId,
+} from '@/lib/schema-fields';
+
+// Active schema profile for profile-dependent suggestions (risk_entity).
+// Primed once from `/api/schema/fields` when the extension is created. Until
+// that answers it stays null and only profile-neutral choices are offered: a
+// risk_entity value is persisted into the rule, so it must never be a guess.
+let activeSchemaProfile: SchemaProfileId | null = null;
+let schemaProfilePrimed = false;
+
+function primeSchemaProfile(): void {
+  if (schemaProfilePrimed) return;
+  schemaProfilePrimed = true;
+  api
+    .getSchemaFields()
+    .then((resp) => {
+      activeSchemaProfile = toSchemaProfile(resp?.schema);
+    })
+    .catch(() => {
+      schemaProfilePrimed = false;
+    });
+}
+
+/** Test seam: pin the profile without a network round trip. */
+export function setDetectionAutocompleteProfile(profile: SchemaProfileId): void {
+  activeSchemaProfile = profile;
+  schemaProfilePrimed = true;
+}
+
+/** `risk_entity` choices for a profile (NAN-4903: profile-aware field map).
+ *  An unresolved profile gets only the profile-neutral `auto-detect`. */
+export function riskEntityOptions(profile: SchemaProfileId | null): YamlOption[] {
+  if (profile === null) {
+    return [{ value: 'auto-detect', label: 'Auto-detect', description: 'Entity field picked per event' }];
+  }
+  const srcIp = schemaField(profile, 'srcIp');
+  const user = schemaField(profile, 'user');
+  // UDM keeps its flat `hostname` alias; OCSF names the device column.
+  const host = profile === 'udm' ? 'hostname' : schemaField(profile, 'host');
+  const destIp = schemaField(profile, 'destIp');
+  const processName = schemaField(profile, 'processName');
+  return [
+    { value: 'auto-detect', label: 'Auto-detect', description: `${srcIp} → ${user} → ${host}` },
+    { value: srcIp, label: srcIp, description: 'Source IP address' },
+    { value: user, label: user, description: 'Username' },
+    { value: host, label: host, description: 'Host name' },
+    { value: destIp, label: destIp, description: 'Destination IP' },
+    { value: processName, label: processName, description: 'Process name' },
+  ];
+}
 
 // YAML field value options (static fields)
 export const YAML_FIELD_OPTIONS: Record<string, YamlOption[]> = {
@@ -60,14 +114,10 @@ export const YAML_FIELD_OPTIONS: Record<string, YamlOption[]> = {
     { value: '50', label: '50', description: 'Medium risk' },
     { value: '30', label: '30', description: 'Low risk' },
   ],
-  risk_entity: [
-    { value: 'auto-detect', label: 'Auto-detect', description: 'src_ip → user → hostname' },
-    { value: 'src_ip', label: 'src_ip', description: 'Source IP address' },
-    { value: 'user', label: 'user', description: 'Username' },
-    { value: 'hostname', label: 'hostname', description: 'Host name' },
-    { value: 'dest_ip', label: 'dest_ip', description: 'Destination IP' },
-    { value: 'process_name', label: 'process_name', description: 'Process name' },
-  ],
+  // NAN-4903: the entity columns follow the deployment's schema profile.
+  get risk_entity() {
+    return riskEntityOptions(activeSchemaProfile);
+  },
   schedule: [
     { value: '*/30 * * * * *', label: 'Every 30 seconds', description: '6-field cron (with seconds)' },
     { value: '*/1 * * * *', label: 'Every 1 minute', description: 'Default schedule' },
@@ -297,8 +347,15 @@ const yamlFieldSnippets: Completion[] = [
   snippetCompletion('mitre_tactics: ${tactics}', { label: 'mitre_tactics', info: 'MITRE ATT&CK tactics' }),
   snippetCompletion('mitre_techniques: ${techniques}', { label: 'mitre_techniques', info: 'MITRE ATT&CK techniques' }),
   snippetCompletion('risk_score: ${1|auto,90,75,50,25|}', { label: 'risk_score', info: 'Risk score' }),
-  snippetCompletion('risk_entity: ${1|auto-detect,src_ip,user,hostname|}', { label: 'risk_entity', info: 'Risk entity field' }),
 ];
+
+function riskEntitySnippet(profile: SchemaProfileId | null): Completion {
+  const choices = riskEntityOptions(profile)
+    .slice(0, 4)
+    .map((o) => o.value)
+    .join(',');
+  return snippetCompletion(`risk_entity: \${1|${choices}|}`, { label: 'risk_entity', info: 'Risk entity field' });
+}
 
 /**
  * YAML field name autocomplete for new lines
@@ -320,7 +377,7 @@ async function yamlFieldAutocomplete(context: CompletionContext): Promise<Comple
   if (/^\w*$/.test(lineText)) {
     return {
       from: line.from,
-      options: yamlFieldSnippets,
+      options: [...yamlFieldSnippets, riskEntitySnippet(activeSchemaProfile)],
       validFor: /^\w*$/,
     };
   }
@@ -332,6 +389,7 @@ async function yamlFieldAutocomplete(context: CompletionContext): Promise<Comple
  * Combined autocomplete extension
  */
 export function detectionAutocomplete(): Extension {
+  primeSchemaProfile();
   return autocompletion({
     override: [yamlAutocomplete, queryAutocomplete, yamlFieldAutocomplete],
     activateOnTyping: true,

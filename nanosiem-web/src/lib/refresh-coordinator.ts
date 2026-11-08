@@ -1,7 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { TenantRuntimeScope } from './tenant-runtime.ts';
-import { safeRandomUUID } from './uuid.ts';
+/**
+ * Cross-tab coordination of the rotating refresh cookie (NAN-2453).
+ *
+ * `POST /api/auth/refresh` rotates a single-use refresh token held in an
+ * origin-wide HttpOnly cookie. When two tabs refresh at the same moment they
+ * both present the same cookie: the server's compare-and-swap lets exactly one
+ * win and answers the other with 401 plus cookie-clearing headers. The loser
+ * then logs out, and its clear can even wipe the winner's new cookie — the
+ * "spurious multi-tab logout".
+ *
+ * Here exactly one tab (the lock winner) calls the endpoint; every other tab
+ * registers for the winner's result BEFORE contending, and consumes the
+ * access token it broadcasts. Only the access token and its TTL cross tabs
+ * (never the refresh token), transiently over a same-origin BroadcastChannel;
+ * nothing is persisted. If the winner disappears (suspended or closed mid
+ * refresh) a follower takes over after `timeoutMs` instead of waiting forever.
+ *
+ * Primitives: Web Locks when available. Web Locks (like crypto.randomUUID)
+ * exist only in secure contexts, and open-core installs are often served over
+ * plain http on a LAN address, so a BroadcastChannel lease election is the
+ * fallback. Without either primitive the refresh runs uncoordinated, which is
+ * the pre-NAN-2453 behaviour.
+ */
 
 export type RefreshOutcome<T> =
   | { ok: true; value: T }
@@ -19,11 +40,17 @@ export interface RefreshOutcomeBus<T> {
 
 export interface RefreshTryLock {
   takeOver?<T>(operation: () => Promise<T>): Promise<{ acquired: true; value: T } | { acquired: false }>;
-  tryRun<T>(operation: () => Promise<T>): Promise<
-    { acquired: true; value: T } | { acquired: false }
-  >;
+  tryRun<T>(operation: () => Promise<T>): Promise<{ acquired: true; value: T } | { acquired: false }>;
 }
 
+export class RefreshWaitTimeout extends Error {
+  constructor() {
+    super('Timed out waiting for the active refresh tab');
+    this.name = 'RefreshWaitTimeout';
+  }
+}
+
+/** Strip the refresh token from a refresh response before it can be shared. */
 export function accessOnlyRefreshResult(response: {
   access_token: string;
   expires_in: number;
@@ -32,52 +59,11 @@ export function accessOnlyRefreshResult(response: {
   return { access_token: response.access_token, expires_in: response.expires_in };
 }
 
-export async function uncoordinatedRefreshFallback<T>(
-  operation: () => Promise<T>,
-  requireCoordination: boolean,
-): Promise<T> {
-  if (requireCoordination) {
-    throw new Error('Cross-tab refresh coordination is required but unavailable');
-  }
-  return operation();
-}
-
 /**
- * Serialize every endpoint that can replace the origin-wide authentication
- * cookies, not only refresh. The caller must publish its credential-free
- * session-replacement signal before returning so a refresh contender cannot
- * acquire the lock in the gap between Set-Cookie and notification.
- */
-export async function withBrowserCookieMutationLock<T>(
-  operation: () => Promise<T>,
-  options: {
-    requireCoordination?: boolean;
-    /** Which HttpOnly session-cookie pair the operation may replace. */
-    cookieSlot?: string;
-    /** Test seam; production callers always use the browser lock manager. */
-    lockManager?: Pick<LockManager, 'request'> | null;
-  } = {},
-): Promise<T> {
-  const lockManager = options.lockManager === undefined
-    ? (typeof navigator === 'undefined' ? null : navigator.locks)
-    : options.lockManager;
-  if (!lockManager) {
-    return uncoordinatedRefreshFallback(
-      operation,
-      options.requireCoordination === true,
-    );
-  }
-  return lockManager.request(
-    cookieMutationLockName(options.cookieSlot),
-    { mode: 'exclusive' },
-    operation,
-  );
-}
-
-/**
- * Registers for the winner's result before attempting the lock, eliminating
- * the publish-before-listen race. Exactly the lock winner invokes the rotating
- * refresh endpoint; contenders consume its in-memory broadcast result.
+ * Exactly the lock winner invokes `operation`; contenders consume its
+ * broadcast result. Contenders listen before they contend, which closes the
+ * publish-before-listen race. On a winner timeout the next attempt takes the
+ * lock over (when the lock supports it).
  */
 export async function coordinateSingleWinnerRefresh<T>(
   lock: RefreshTryLock,
@@ -127,213 +113,13 @@ export async function coordinateSingleWinnerRefresh<T>(
   throw new RefreshWaitTimeout();
 }
 
-export class RefreshWaitTimeout extends Error {
-  constructor() {
-    super('Timed out waiting for the active refresh tab');
-    this.name = 'RefreshWaitTimeout';
-  }
-}
+export const REFRESH_CHANNEL_NAME = 'nanosiem-auth-refresh';
+export const REFRESH_LOCK_NAME = 'nanosiem-auth-refresh-cookie';
 
-const REFRESH_CHANNEL_NAME = 'nanosiem-auth-refresh';
-const REFRESH_LOCK_NAME = 'nanosiem-auth-refresh-cookie';
-export const REFRESH_SESSION_CHANNEL_NAME = 'nanosiem-auth-session';
-
-// ---------------------------------------------------------------------------
-// Cookie slots (NAN-3548)
-//
-// A cookie slot names one HttpOnly session-cookie pair in the browser jar.
-// Dedicated / open-core / self-hosted deployments have exactly one pair per
-// origin (`access_token` + `refresh_token`): every tab shares ORIGIN_COOKIE_SLOT.
-// On the hosted-shared pooled host the server issues one pair per tenant
-// (`refresh_token__<sha256(tenant)>`, #6068), so each tenant is its own slot.
-// A session replacement or invalidation can only end tabs whose credential
-// lives in the same slot; a sign-in or refusal for tenant B never ends tenant
-// A. ALL_COOKIE_SLOTS is the fail-closed wildcard for a mutation whose tenant
-// is unknown (and the meaning of a message from a pre-slot tab).
-// ---------------------------------------------------------------------------
-
-export const ORIGIN_COOKIE_SLOT = 'origin';
-export const ALL_COOKIE_SLOTS = '*';
-
-export function tenantCookieSlot(tenantSlug: string): string {
-  const slug = tenantSlug.trim();
-  if (!slug) throw new Error('Tenant cookie slot requires a tenant slug');
-  return `tenant:${slug}`;
-}
-
-/**
- * The cookie pair a tab's credential lives in. On the pooled host the server
- * selects the pair by the slug the SPA sends on refresh (the route slug first,
- * then the active tenant), so the slot follows the same precedence.
- */
-export function cookieSlotForScope(
-  scope: TenantRuntimeScope,
-  routeTenantSlug?: string,
-): string {
-  if (routeTenantSlug) return tenantCookieSlot(routeTenantSlug);
-  if (scope.kind === 'enterprise_shared') return tenantCookieSlot(scope.tenant.slug);
-  return ORIGIN_COOKIE_SLOT;
-}
-
-/** AUTH channel `{ type: 'logout' }` signal. Only tabs sharing the logged-out
- * cookie pair react; a message without a slot (pre-slot tab) is origin-wide. */
-export function logoutMessageAffectsSlot(data: unknown, currentSlot: string): boolean {
-  if (!data || typeof data !== 'object' || (data as { type?: unknown }).type !== 'logout') {
-    return false;
-  }
-  const slot = (data as { cookieSlot?: unknown }).cookieSlot;
-  return typeof slot !== 'string' || sharesCookieSlot(slot, currentSlot);
-}
-
-function sharesCookieSlot(messageSlot: string, currentSlot: string): boolean {
-  return messageSlot === ALL_COOKIE_SLOTS
-    || currentSlot === ALL_COOKIE_SLOTS
-    || messageSlot === currentSlot;
-}
-
-/** Web Lock serializing physical mutation of one cookie slot. The origin slot
- * keeps the historical lock name so single-cookie deployments are unchanged. */
-function cookieMutationLockName(cookieSlot: string | undefined): string {
-  return cookieSlot === undefined
-    || cookieSlot === ORIGIN_COOKIE_SLOT
-    || cookieSlot === ALL_COOKIE_SLOTS
-    ? REFRESH_LOCK_NAME
-    : `${REFRESH_LOCK_NAME}:${cookieSlot}`;
-}
-
-export type RefreshSessionMessage =
-  | { kind: 'session-replaced'; scopeKey: string; cookieSlot?: string }
-  | { kind: 'session-invalidated'; scopeKey: string; cookieSlot?: string }
-  | { kind: 'tenant-session-revoked'; scopeKey: string; cookieSlot?: string };
-
-export function isRefreshSessionMessage(value: unknown): value is RefreshSessionMessage {
-  if (!value || typeof value !== 'object') return false;
-  const message = value as Record<string, unknown>;
-  return (
-    (message.kind === 'session-replaced' || message.kind === 'session-invalidated'
-      || message.kind === 'tenant-session-revoked')
-    && typeof message.scopeKey === 'string'
-    && message.scopeKey.length > 0
-    && (message.cookieSlot === undefined
-      || (typeof message.cookieSlot === 'string' && message.cookieSlot.length > 0))
-  );
-}
-
-/**
- * Does `message` end the session of a tab whose identity is `currentScopeKey`
- * and whose credential lives in `currentCookieSlot`?
- *
- * - tenant-session-revoked: only the exact tenant/user scope.
- * - session-invalidated: every tab in the same cookie slot.
- * - session-replaced: a different identity in the same cookie slot (the one
- *   pair the two tabs share was overwritten). A sign-in to another tenant on
- *   the pooled host wrote a different pair and leaves this tab alone.
- *
- * A message without `cookieSlot` came from a pre-slot sender and is treated
- * as ALL_COOKIE_SLOTS (fail closed, the historical behaviour).
- */
-export function refreshSessionMessageReplacesScope(
-  message: RefreshSessionMessage,
-  currentScopeKey: string,
-  currentCookieSlot: string = ORIGIN_COOKIE_SLOT,
-): boolean {
-  if (message.kind === 'tenant-session-revoked') return message.scopeKey === currentScopeKey;
-  if (!sharesCookieSlot(message.cookieSlot ?? ALL_COOKIE_SLOTS, currentCookieSlot)) return false;
-  return message.kind === 'session-invalidated' || message.scopeKey !== currentScopeKey;
-}
-
-function withCookieSlot<M extends RefreshSessionMessage>(message: M, cookieSlot?: string): M {
-  return cookieSlot === undefined ? message : { ...message, cookieSlot };
-}
-
-/** A bearer-only tenant logout did not rotate or clear the origin cookie.
- * Invalidate only the revoked tenant/user, not an independent sibling session.
- */
-export function broadcastTenantSessionRevocation(scopeKey: string): void {
-  if (!scopeKey.startsWith('enterprise_shared:') || typeof BroadcastChannel === 'undefined') return;
-  const channel = new BroadcastChannel(REFRESH_SESSION_CHANNEL_NAME);
-  channel.postMessage({ kind: 'tenant-session-revoked', scopeKey } satisfies RefreshSessionMessage);
-  channel.close();
-}
-
-/** A refresh result is not yet a verified identity. In particular the initial
- * reload scope may be only a route slug. AuthContext announces successful
- * replacement after /auth/me verifies the canonical tenant/user binding.
- */
-export function refreshOutcomeSessionMessage(
-  outcome: { ok: boolean },
-  scopeKey: string,
-  cookieSlot?: string,
-): RefreshSessionMessage | undefined {
-  return outcome.ok
-    ? undefined
-    : withCookieSlot({ kind: 'session-invalidated', scopeKey }, cookieSlot);
-}
-
-/**
- * Recheck a queued cookie mutation after it acquires the origin-global lock.
- * A different tenant login may have replaced both the runtime identity and
- * in-memory bearer while this operation was waiting.
- */
-export function cookieMutationStillOwnsSession(
-  expectedScopeKey: string,
-  expectedAccessToken: string | null,
-  currentScopeKey: string,
-  currentAccessToken: string | null,
-): boolean {
-  return (
-    expectedScopeKey === currentScopeKey
-    && expectedAccessToken === currentAccessToken
-  );
-}
-
-export function sessionReplacementMessage(
-  scopeKey: string,
-  cookieSlot?: string,
-): RefreshSessionMessage {
-  if (!scopeKey.trim()) throw new Error('Session replacement scope may not be empty');
-  return withCookieSlot({ kind: 'session-replaced', scopeKey }, cookieSlot);
-}
-
-export function sessionInvalidationMessage(
-  scopeKey: string,
-  cookieSlot?: string,
-): RefreshSessionMessage {
-  if (!scopeKey.trim()) throw new Error('Session invalidation scope may not be empty');
-  return withCookieSlot({ kind: 'session-invalidated', scopeKey }, cookieSlot);
-}
-
-export function broadcastSessionReplacement(scopeKey: string, cookieSlot?: string): void {
-  if (!scopeKey.trim() || typeof BroadcastChannel === 'undefined') return;
-  const channel = new BroadcastChannel(REFRESH_SESSION_CHANNEL_NAME);
-  channel.postMessage(sessionReplacementMessage(scopeKey, cookieSlot));
-  channel.close();
-}
-
-export function broadcastSessionInvalidation(scopeKey: string, cookieSlot?: string): void {
-  if (!scopeKey.trim() || typeof BroadcastChannel === 'undefined') return;
-  const channel = new BroadcastChannel(REFRESH_SESSION_CHANNEL_NAME);
-  channel.postMessage(sessionInvalidationMessage(scopeKey, cookieSlot));
-  channel.close();
-}
-
-export function refreshCoordinationNames(
-  scopeKey: string,
-  cookieSlot: string = ORIGIN_COOKIE_SLOT,
-): {
-  channelName: string;
-  lockName: string;
-} {
-  // The lock guards physical rotation of one HttpOnly cookie pair, so it is
-  // scoped to the cookie slot: origin-global in single-cookie deployments,
-  // per tenant on the pooled host (NAN-3548). Bearer results are scoped to the
-  // exact tenant/user identity so no credential reaches a different tenant tab.
-  const normalizedScope = scopeKey.trim();
-  if (!normalizedScope) throw new Error('Refresh coordination scope may not be empty');
-  return {
-    channelName: `${REFRESH_CHANNEL_NAME}:${normalizedScope}`,
-    lockName: cookieMutationLockName(cookieSlot),
-  };
+/** Non-secret, non-crypto identifier: crypto.randomUUID is undefined on http
+ * origins (NAN-3768), and these ids only order lease claims. */
+function contenderId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
 }
 
 type RefreshChannelMessage<T> =
@@ -402,7 +188,6 @@ class BroadcastRefreshBus<T> implements RefreshOutcomeBus<T> {
 
 class BrowserRefreshLock implements RefreshTryLock {
   private readonly lockName: string;
-
   private readonly leaseMs: number;
 
   constructor(lockName: string, leaseMs: number) {
@@ -414,18 +199,17 @@ class BrowserRefreshLock implements RefreshTryLock {
     { acquired: true; value: T } | { acquired: false }
   > {
     // The election lock guards only a synchronous metadata update, never a
-    // network request. Even a replacement leader can disappear: its lease
+    // network request. A replacement leader can disappear too: its lease
     // expires and the next contender can steal the cookie lock again.
     const leaseKey = `${this.lockName}:takeover-lease`;
-    const owner = safeRandomUUID();
+    const owner = contenderId();
     let attempt: Promise<{ acquired: true; value: T }> | undefined;
     await navigator.locks.request(`${this.lockName}:takeover`, { ifAvailable: true }, lock => {
       if (!lock) return;
-      const raw = localStorage.getItem(leaseKey);
-      const lease = raw ? JSON.parse(raw) as { expiresAt: number } : null;
+      const lease = readLease(leaseKey);
       if (lease && lease.expiresAt > Date.now()) return;
-      // Metadata only: bearer/refresh tokens are never persisted.
-      localStorage.setItem(leaseKey, JSON.stringify({ owner, expiresAt: Date.now() + this.leaseMs }));
+      // Metadata only: bearer / refresh tokens are never persisted.
+      writeLease(leaseKey, { owner, expiresAt: Date.now() + this.leaseMs });
       attempt = navigator.locks.request(this.lockName, { steal: true }, async () => ({
         acquired: true as const, value: await operation(),
       }));
@@ -436,10 +220,7 @@ class BrowserRefreshLock implements RefreshTryLock {
     try {
       return await attempt;
     } finally {
-      const raw = localStorage.getItem(leaseKey);
-      if (raw && (JSON.parse(raw) as { owner: string }).owner === owner) {
-        localStorage.removeItem(leaseKey);
-      }
+      if (readLease(leaseKey)?.owner === owner) removeLease(leaseKey);
     }
   }
 
@@ -456,27 +237,36 @@ class BrowserRefreshLock implements RefreshTryLock {
   }
 }
 
-/** Credential-free election for browsers without Web Locks. Claims are
- * origin-wide; the lexicographically first simultaneous contender wins. A
- * suspended/closed leader's claim expires without needing an unload handler.
- *
- * This is the path every insecure context takes (open core over plain
- * http://<lan-ip>: no navigator.locks), where crypto.randomUUID is also
- * undefined. The election id is a tie-breaker, not a credential, so it uses
- * safeRandomUUID (NAN-3768; same trap as NAN-1235). */
+function readLease(key: string): { owner: string; expiresAt: number } | null {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) as { owner: string; expiresAt: number } : null;
+  } catch {
+    return null;
+  }
+}
+function writeLease(key: string, value: { owner: string; expiresAt: number }): void {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* storage unavailable */ }
+}
+function removeLease(key: string): void {
+  try { localStorage.removeItem(key); } catch { /* storage unavailable */ }
+}
+
+/** Credential-free election for browsers without Web Locks (http origins).
+ * The lexicographically first simultaneous contender wins; an existing
+ * holder always wins over a new contender. A suspended or closed leader's
+ * claim expires without needing an unload handler. */
 class BroadcastRefreshLock implements RefreshTryLock {
-  private readonly channel: BroadcastChannel;
-  private readonly id = safeRandomUUID();
+  private readonly channel = new BroadcastChannel(`${REFRESH_LOCK_NAME}:lease`);
+  private readonly id = contenderId();
   private readonly claims = new Map<string, number>();
   private expiresAt = 0;
   private held = false;
   private holderExpiry = 0;
-
   private readonly leaseMs: number;
 
-  constructor(lockName: string, leaseMs: number) {
+  constructor(leaseMs: number) {
     this.leaseMs = leaseMs;
-    this.channel = new BroadcastChannel(`${lockName}:lease`);
     this.channel.onmessage = event => {
       const message = event.data;
       if (!message || typeof message.id !== 'string') return;
@@ -505,13 +295,13 @@ class BroadcastRefreshLock implements RefreshTryLock {
     this.expiresAt = Date.now() + this.leaseMs;
     this.publish('claim');
     await new Promise(resolve => setTimeout(resolve, 50));
-    if (this.holderExpiry > Date.now() || [...this.claims].some(([id, expiry]) => expiry > Date.now() && id < this.id)) {
+    if (this.holderExpiry > Date.now()
+      || [...this.claims].some(([id, expiry]) => expiry > Date.now() && id < this.id)) {
       this.expiresAt = 0;
       this.publish('release');
       return { acquired: false };
     }
     if (this.expiresAt <= Date.now()) return { acquired: false };
-    // An existing holder always wins over a new contender, regardless of ID.
     this.expiresAt = Date.now() + this.leaseMs;
     this.held = true;
     this.publish('held');
@@ -528,148 +318,27 @@ class BroadcastRefreshLock implements RefreshTryLock {
 }
 
 /**
- * Same-scope tabs exchange only the access-token result. The origin-global
- * channel contains identity/change signals only, allowing a different-tenant
- * contender to stop immediately without ever receiving the winning bearer.
- */
-class ScopedBrowserRefreshBus<T> implements RefreshOutcomeBus<T> {
-  private readonly resultBus: BroadcastRefreshBus<T>;
-  private readonly sessionChannel: BroadcastChannel;
-  private readonly scopeKey: string;
-  private readonly cookieSlot: string | undefined;
-
-  constructor(
-    scopeKey: string,
-    resultChannel: BroadcastChannel,
-    sessionChannel: BroadcastChannel,
-    cookieSlot?: string,
-  ) {
-    this.scopeKey = scopeKey;
-    this.cookieSlot = cookieSlot;
-    this.resultBus = new BroadcastRefreshBus<T>(resultChannel);
-    this.sessionChannel = sessionChannel;
-  }
-
-  wait(timeoutMs: number): PendingRefreshOutcome<T> {
-    const local = this.resultBus.wait(timeoutMs);
-    let active = true;
-    let listener: ((event: MessageEvent<unknown>) => void) | undefined;
-    const promise = new Promise<RefreshOutcome<T>>((resolve, reject) => {
-      const finish = (
-        callback: (value: RefreshOutcome<T> | Error) => void,
-        value: RefreshOutcome<T> | Error,
-      ) => {
-        if (!active) return;
-        active = false;
-        local.cancel();
-        if (listener) this.sessionChannel.removeEventListener('message', listener);
-        callback(value);
-      };
-      local.promise.then(
-        (outcome) => finish((value) => resolve(value as RefreshOutcome<T>), outcome),
-        (error) => finish((value) => reject(value), error instanceof Error ? error : new Error('Refresh failed')),
-      );
-      listener = (event) => {
-        if (!active || !isRefreshSessionMessage(event.data)) return;
-        if (!refreshSessionMessageReplacesScope(
-          event.data,
-          this.scopeKey,
-          this.cookieSlot ?? ORIGIN_COOKIE_SLOT,
-        )) {
-          return;
-        }
-        finish(
-          (value) => resolve(value as RefreshOutcome<T>),
-          {
-            ok: false,
-            message: event.data.kind === 'session-invalidated'
-              ? 'The browser session was invalidated by another tab'
-              : 'A different tenant session replaced this browser session',
-          },
-        );
-      };
-      this.sessionChannel.addEventListener('message', listener);
-    });
-    return {
-      promise,
-      cancel: () => {
-        if (!active) return;
-        active = false;
-        local.cancel();
-        if (listener) this.sessionChannel.removeEventListener('message', listener);
-      },
-    };
-  }
-
-  publish(outcome: RefreshOutcome<T>): void {
-    // Bearer-bearing results stay scoped. Success is announced by AuthContext
-    // only after the returned identity has been independently verified.
-    this.resultBus.publish(outcome);
-    const message = refreshOutcomeSessionMessage(outcome, this.scopeKey, this.cookieSlot);
-    if (message) this.sessionChannel.postMessage(message);
-  }
-
-  close(): void {
-    this.resultBus.close();
-  }
-}
-
-/**
- * Coordinates the HttpOnly-cookie refresh endpoint across tabs. The access
- * token is broadcast only transiently to same-tenant/user tabs; it is never
- * sent on the origin-global session channel and is never stored.
- * Demo refresh remains on its existing per-tab path.
+ * Coordinate the HttpOnly-cookie refresh across this origin's tabs. Demo
+ * sessions (refresh token in the request body, per tab) do not use this.
  */
 export async function coordinateBrowserRefresh<T>(
   operation: () => Promise<T>,
-  options: {
-    requireCoordination?: boolean;
-    scopeKey?: string;
-    /** Cookie pair this refresh rotates; see ORIGIN_COOKIE_SLOT / tenantCookieSlot. */
-    cookieSlot?: string;
-    timeoutMs?: number;
-  } = {},
+  options: { timeoutMs?: number } = {},
 ): Promise<T> {
-  const primitivesAvailable = !(
-    typeof navigator === 'undefined'
-    || typeof BroadcastChannel === 'undefined'
-  );
-  if (!primitivesAvailable) {
-    // Shared mode fails closed if no cross-tab channel is available.
-    return uncoordinatedRefreshFallback(operation, options.requireCoordination === true);
+  if (typeof navigator === 'undefined' || typeof BroadcastChannel === 'undefined') {
+    return operation();
   }
-
-  if (options.requireCoordination && !options.scopeKey?.trim()) {
-    throw new Error('Tenant-scoped refresh coordination requires a scope key');
-  }
-  const names = refreshCoordinationNames(
-    options.scopeKey ?? 'dedicated',
-    options.cookieSlot ?? ORIGIN_COOKIE_SLOT,
-  );
-  // Construct the lock before opening the result/session channels so a
-  // throwing constructor cannot leak open BroadcastChannels.
+  const timeoutMs = options.timeoutMs ?? 15_000;
+  const channel = new BroadcastChannel(REFRESH_CHANNEL_NAME);
+  const bus = new BroadcastRefreshBus<T>(channel);
   const lock = navigator.locks
-    ? new BrowserRefreshLock(names.lockName, options.timeoutMs ?? 15_000)
-    : new BroadcastRefreshLock(names.lockName, options.timeoutMs ?? 15_000);
-  const resultChannel = new BroadcastChannel(names.channelName);
-  const sessionChannel = new BroadcastChannel(REFRESH_SESSION_CHANNEL_NAME);
-  const bus = new ScopedBrowserRefreshBus<T>(
-    options.scopeKey ?? 'dedicated',
-    resultChannel,
-    sessionChannel,
-    options.cookieSlot,
-  );
+    ? new BrowserRefreshLock(REFRESH_LOCK_NAME, timeoutMs)
+    : new BroadcastRefreshLock(timeoutMs);
   try {
-    return await coordinateSingleWinnerRefresh(
-      lock,
-      bus,
-      operation,
-      options.timeoutMs,
-    );
+    return await coordinateSingleWinnerRefresh(lock, bus, operation, timeoutMs);
   } finally {
     if (lock instanceof BroadcastRefreshLock) lock.close();
     bus.close();
-    resultChannel.close();
-    sessionChannel.close();
+    channel.close();
   }
 }

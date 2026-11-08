@@ -22,16 +22,10 @@
 //   • Sidebar stats grid (total / used / upd / drift)
 
 import { useEffect, useMemo, useState } from 'react';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import { contentBranchFor } from '@/lib/schema-fields';
 import { useNavigate } from 'react-router-dom';
 import { useSyncCompleteEffect } from '@/hooks/use-sync-complete';
-import {
-  PLATFORM_CATALOG_SETUP_POLL_MS,
-  platformCatalogSettingUp,
-  platformCatalogSetupBlocksPage,
-  repositorySyncPollInterval,
-} from '@/hooks/repository-sync-state';
-import { useSharedTenant } from '@/hooks/use-shared-tenant';
-import { PlatformCatalogSettingUp } from '@/components/repositories/PlatformCatalogSettingUp';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, ArrowUpRight, ChevronDown, Eye, Rocket } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
@@ -90,7 +84,7 @@ import {
 const SOURCE_TYPE_MAP: Record<string, { sourceType: string; label: string }> = {
   http: { sourceType: 'routed', label: 'HTTP (Routed)' },
   vector: { sourceType: 'vector', label: 'Vector' },
-  splunk_hec: { sourceType: 'splunk_hec', label: 'HEC' },
+  splunk_hec: { sourceType: 'splunk_hec', label: 'Splunk HEC' },
   kafka: { sourceType: 'kafka', label: 'Kafka' },
   aws_s3: { sourceType: 'aws_s3', label: 'AWS S3' },
   gcp_pubsub: { sourceType: 'gcp_pubsub', label: 'GCP Pub/Sub' },
@@ -158,18 +152,12 @@ export function ParserRepositories() {
   // Queries
   // ----------------------------------------------------------------
 
-  const [syncAcceptedAt, setSyncAcceptedAt] = useState<number | null>(null);
-  const sharedTenant = useSharedTenant();
-
   const { data: reposData, isLoading: reposLoading } = useQuery({
     queryKey: ['parser-repositories'],
     queryFn: () => api.parserRepositories.listRepositories(),
     refetchInterval: (q) => {
       const repos = q.state.data?.repositories ?? [];
-      if (syncAcceptedAt && Date.now() - syncAcceptedAt < 65 * 60_000) return 1500;
-      // NAN-3436: keep checking while the platform catalog is being set up.
-      if (platformCatalogSettingUp(sharedTenant, repos, 'nano-rs/parsers')) return PLATFORM_CATALOG_SETUP_POLL_MS;
-      return repositorySyncPollInterval(repos);
+      return repos.some((r) => r.last_sync_status === 'syncing') ? 1500 : false;
     },
   });
 
@@ -228,8 +216,7 @@ export function ParserRepositories() {
 
   // When the active repo finishes syncing, refresh parser list + upstream
   // updates and show a result toast (count of pending upstream changes if any).
-  const markSyncAccepted = useSyncCompleteEffect(repositories, activeRepoId, (repo) => {
-    setSyncAcceptedAt(null);
+  useSyncCompleteEffect(repositories, activeRepoId, (repo) => {
     refetchParsers();
     refetchUpstream().then((result) => {
       const count = result.data?.updates?.length ?? 0;
@@ -419,6 +406,7 @@ export function ParserRepositories() {
   // Mutations
   // ----------------------------------------------------------------
 
+  const schemaMap = useSchemaFieldMap();
   const createMutation = useMutation({
     mutationFn: (req: CreateParserRepositoryRequest) =>
       api.parserRepositories.createRepository(req),
@@ -426,7 +414,11 @@ export function ParserRepositories() {
       queryClient.invalidateQueries({ queryKey: ['parser-repositories'] });
       setActiveRepoId(repo.id);
       toast({ title: `${repo.name} added — syncing…` });
-      syncMutation.mutate(repo.id);
+      // Kick off the first sync immediately so the parser list populates.
+      api.parserRepositories
+        .syncRepository(repo.id)
+        .then(() => queryClient.invalidateQueries({ queryKey: ['parser-repositories'] }))
+        .catch(() => {});
     },
     onError: (err: Error) => {
       toast({
@@ -439,23 +431,8 @@ export function ParserRepositories() {
 
   const syncMutation = useMutation({
     mutationFn: (id: string) => api.parserRepositories.syncRepository(id),
-    onSuccess: (result, repoId) => {
-      if (result.status === 'syncing') {
-        markSyncAccepted(repoId, result.sync_started_at ?? undefined);
-        setSyncAcceptedAt(Date.now());
-      }
+    onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: ['parser-repositories'] });
-      if (result.status !== 'syncing') {
-        // Refresh immediately when a deployment returns a terminal result.
-        queryClient.invalidateQueries({ queryKey: ['parser-repository-parsers', result.repository_id] });
-        queryClient.invalidateQueries({ queryKey: ['parser-upstream-updates', result.repository_id] });
-        toast({
-          title: result.status === 'success' ? 'Sync complete' : 'Sync failed',
-          description: result.message,
-          variant: result.status === 'success' ? 'default' : 'destructive',
-        });
-        return;
-      }
       toast({ title: 'Sync started', description: result.message });
     },
     onError: (err: Error) => {
@@ -684,21 +661,6 @@ export function ParserRepositories() {
     );
   }
 
-  // NAN-3436: a new hosted-shared workspace's parser catalog is still being
-  // copied in the background; not "no repositories".
-  if (platformCatalogSetupBlocksPage(sharedTenant, repositories, 'nano-rs/parsers')) {
-    return (
-      <div className="-m-3 flex h-[calc(100%+1.5rem)] min-h-0 flex-col overflow-hidden">
-        <div className="border-b border-border bg-card/30 px-5 py-3.5">
-          <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground">Parser repositories</div>
-        </div>
-        <div className="flex-1 flex items-center justify-center">
-          <PlatformCatalogSettingUp content="parsers" catalog="nano-rs/parsers" />
-        </div>
-      </div>
-    );
-  }
-
   // Empty state — first-run with no repos.
   if (!activeRepo) {
     return (
@@ -747,7 +709,7 @@ export function ParserRepositories() {
                 <>
                   <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
                     Sync the official{' '}
-                    <code className="font-mono text-foreground/80">nano-rs/parsers</code> library to
+                    <code className="font-mono text-foreground/80">nano-sh/parsers</code> library to
                     pull in pre-built parsers for common log sources.
                   </div>
                   <button
@@ -757,12 +719,16 @@ export function ParserRepositories() {
                         name: 'nano parsers',
                         url: 'https://github.com/nano-rs/parsers',
                         description: 'Official nano parsers for common log sources',
-                        branch: 'main',
+                        // NAN-4903: OCSF installs follow `main`; UDM installs
+                        // stay on the frozen `legacy/clickhouse` channel.
+                        branch: contentBranchFor(schemaMap.profile),
                         parsers_path: 'parsers/',
+                        // NAN-4940: the first-party catalogs follow upstream hourly.
                         auto_sync_enabled: true,
+                        sync_interval_hours: 1,
                       })
                     }
-                    disabled={createMutation.isPending}
+                    disabled={createMutation.isPending || !schemaMap.ready}
                     className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium"
                   >
                     {createMutation.isPending ? 'Adding…' : 'Add nano parsers'}

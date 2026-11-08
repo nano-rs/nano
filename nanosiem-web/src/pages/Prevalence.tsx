@@ -12,8 +12,10 @@
  * shipped in Wave 20 as NAN-554 / #833).
  */
 
-import { useState, useEffect, useCallback, useMemo, useRef, Fragment } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useState, useEffect, useCallback, useMemo, Fragment } from 'react';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import type { SemanticField } from '@/lib/schema-fields';
+import { useNavigate } from 'react-router-dom';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import {
@@ -53,16 +55,18 @@ import {
   FileText,
   ShieldCheck,
   Store,
-  ScanSearch,
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useArtifactExplorer, useArtifactDetail, useArtifactLookup } from '@/hooks/use-api';
-import { explorerStatusLabel } from '@/lib/prevalence/explorerStatus';
-import { DETAIL_WARMING_MAX_POLLS, detailWarmingDelay } from '@/lib/prevalence/detailWarming';
-import { detailCoverageLabel, detailCoverageTitle, isPartialCoverage } from '@/lib/prevalence/detailCoverage';
 import { formatUTCCompact, formatRelativeCompact, buildHeatmapDays, expandPackedDaily } from '@/lib/date-utils';
 import { trailingWindowTitle } from '@/lib/time-range';
 import { PrevalenceExplorerHeatmap } from '@/components/prevalence';
+import {
+  PREVALENCE_STATUS_POLL_MS,
+  UNKNOWN_HOSTS_LABEL,
+  prevalenceStatusLabel,
+  shouldPollPrevalence,
+} from '@/lib/prevalence/coverageStatus';
 import {
   detectArtifact,
   detectBulkArtifacts,
@@ -76,16 +80,8 @@ import type {
   ArtifactExplorerItem,
   ArtifactInlineContext,
   ArtifactProcessEntry,
-  PrevalenceExplorerCursor,
 } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
-import { enrichTypeFor, openEnrich } from '@/components/threat-intel/enrich-event';
-import { useEnrichEnabled } from '@/components/threat-intel/use-threat-intel';
-import { api } from '@/lib/api';
-import {
-  DurableJobNotice,
-  type DurableProductJobState,
-} from '@/components/search/DurableJobNotice';
 
 type TimeWindow = '1h' | '24h' | '7d' | '30d';
 type ArtifactTypeFilter = 'all' | 'hash' | 'domain' | 'ip';
@@ -121,17 +117,6 @@ const RISK_LABELS: Record<RiskFilter, string> = {
   rare: 'Rare',
   new: 'New',
 };
-
-function saveExport(blob: Blob, filename: string): void {
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement('a');
-  anchor.href = url;
-  anchor.download = filename;
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
-}
 
 function getArtifactTypeDisplay(type: string): { label: string; icon: typeof Hash } {
   switch (type) {
@@ -306,9 +291,8 @@ function truncate(s: string, max = 80): string {
 function formatHostsUsersSummary(
   hosts: number,
   users: number | undefined,
-  hostsSaturated = false,
 ): string {
-  const hostStr = `${hosts.toLocaleString()}${hostsSaturated ? '+' : ''} ${hosts === 1 && !hostsSaturated ? 'host' : 'hosts'}`;
+  const hostStr = `${hosts.toLocaleString()} ${hosts === 1 ? 'host' : 'hosts'}`;
   if (users == null || users === 0) return hostStr;
   return `${hostStr} · ${users.toLocaleString()} ${users === 1 ? 'user' : 'users'}`;
 }
@@ -327,10 +311,10 @@ function buildSubtitle(artifact: ArtifactExplorerItem): string | null {
   if (artifact.artifact_type.startsWith('hash')) {
     if (ctx?.top_process_is_wrapper && ctx.top_process_name) {
       const cmd = ctx.top_command_line ? ` (${truncate(ctx.top_command_line, 48)})` : '';
-      return `${ctx.top_process_name}${cmd} · ${formatHostsUsersSummary(hostCount, ctx.user_count, artifact.host_count_saturated)}`;
+      return `${ctx.top_process_name}${cmd} · ${formatHostsUsersSummary(hostCount, ctx.user_count)}`;
     }
     if (ctx?.top_file_name) {
-      return `${ctx.top_file_name} · ${formatHostsUsersSummary(hostCount, ctx.user_count, artifact.host_count_saturated)}`;
+      return `${ctx.top_file_name} · ${formatHostsUsersSummary(hostCount, ctx.user_count)}`;
     }
     return null;
   }
@@ -346,21 +330,21 @@ function buildSubtitle(artifact: ArtifactExplorerItem): string | null {
     }
     if (parts.length === 0) {
       // Private IPs commonly have no geo — at least surface host/user counts.
-      return formatHostsUsersSummary(hostCount, ctx?.user_count, artifact.host_count_saturated);
+      return formatHostsUsersSummary(hostCount, ctx?.user_count);
     }
     return parts.join(' · ');
   }
 
   // Domain / subdomain.
   if (artifact.artifact_type === 'domain' || artifact.artifact_type === 'subdomain') {
-    const left = formatHostsUsersSummary(hostCount, ctx?.user_count, artifact.host_count_saturated);
+    const left = formatHostsUsersSummary(hostCount, ctx?.user_count);
     return ctx?.top_source_type ? `${left} · ${ctx.top_source_type}` : left;
   }
 
   // User / host / asset (fallthrough) — count + top source_type.
   return ctx?.top_source_type
-    ? `${formatHostsUsersSummary(hostCount, ctx?.user_count, artifact.host_count_saturated)} · ${ctx.top_source_type}`
-    : formatHostsUsersSummary(hostCount, ctx?.user_count, artifact.host_count_saturated);
+    ? `${formatHostsUsersSummary(hostCount, ctx?.user_count)} · ${ctx.top_source_type}`
+    : formatHostsUsersSummary(hostCount, ctx?.user_count);
 }
 
 export function Prevalence() {
@@ -376,16 +360,7 @@ export function Prevalence() {
   const [searchQuery, setSearchQuery] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [page, setPage] = useState(0);
-  const [pageCursors, setPageCursors] = useState<Array<PrevalenceExplorerCursor | null>>([null]);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
-  const [exportJob, setExportJob] = useState<DurableProductJobState | null>(null);
-  const [exportError, setExportError] = useState<string | null>(null);
-  const [exporting, setExporting] = useState(false);
-  const exportRunRef = useRef(0);
-
-  useEffect(() => () => {
-    exportRunRef.current += 1;
-  }, []);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedSearch(searchQuery), 300);
@@ -394,7 +369,6 @@ export function Prevalence() {
 
   useEffect(() => {
     setPage(0);
-    setPageCursors([null]);
   }, [timeWindow, artifactTypeFilter, riskFilter, debouncedSearch]);
 
   // NAN-871: derive page mode from the debounced input so the same bar serves
@@ -419,7 +393,6 @@ export function Prevalence() {
     setDebouncedSearch('');
   }, []);
 
-  const pageCursor = pageCursors[page] ?? null;
   const { data, loading, error, refetch } = useArtifactExplorer({
     window: timeWindow,
     type: artifactTypeFilter === 'all' ? undefined : artifactTypeFilter,
@@ -428,30 +401,8 @@ export function Prevalence() {
     // results from the point-lookup endpoints below.
     search: mode === 'browse' ? (debouncedSearch || undefined) : undefined,
     limit: PAGE_SIZE,
-    offset: pageCursor ? 0 : page * PAGE_SIZE,
-    cursor_last_seen: pageCursor?.last_seen,
-    cursor_kind: pageCursor?.kind,
-    cursor_artifact: pageCursor?.artifact,
+    offset: page * PAGE_SIZE,
   });
-
-  const snapshotStatus = explorerStatusLabel(data?.product_state);
-  useEffect(() => {
-    if (!data?.product_state?.warming && !data?.product_state?.stale) return;
-    const timer = window.setTimeout(() => void refetch(), 60_000);
-    return () => window.clearTimeout(timer);
-  }, [data, refetch]);
-
-  const nextPage = useCallback(() => {
-    if (!data?.has_more) return;
-    if (data.next_cursor) {
-      setPageCursors((current) => {
-        const next = current.slice(0, page + 1);
-        next[page + 1] = data.next_cursor ?? null;
-        return next;
-      });
-    }
-    setPage(page + 1);
-  }, [data?.has_more, data?.next_cursor, page]);
 
   // Header stats for lookup/bulk modes. `useArtifactLookup` resolves to null
   // when artifacts is null/empty so the request short-circuits in browse mode.
@@ -466,15 +417,20 @@ export function Prevalence() {
     undefined,
   );
 
+  const schemaMap = useSchemaFieldMap();
   const handleDrilldown = useCallback(
     (artifact: ArtifactExplorerItem) => {
-      let field: string;
-      if (artifact.artifact_type.startsWith('hash')) field = 'file_hash';
-      else if (artifact.artifact_type.startsWith('ip_address')) field = 'dest_ip';
-      else field = 'dest_host';
-      navigate(`/search#q=${encodeURIComponent(`${field}="${artifact.artifact}"`)}`);
+      // NAN-4903: none until the schema profile is known (error toast instead).
+      if (!schemaMap.ready) return schemaMap.guard(() => {})();
+      // NAN-4903: the active profile's column (`dest_ip` / `dst_endpoint.ip`, …).
+      const key: SemanticField = artifact.artifact_type.startsWith('hash')
+        ? 'fileHash'
+        : artifact.artifact_type.startsWith('ip_address')
+          ? 'destIp'
+          : 'destHost';
+      navigate(`/search#q=${encodeURIComponent(schemaMap.filter(key, artifact.artifact))}`);
     },
-    [navigate],
+    [navigate, schemaMap],
   );
 
   const toggleRow = useCallback((key: string) => {
@@ -492,85 +448,24 @@ export function Prevalence() {
   // P6: headline counts are floors when the fleet exceeds the fetch buffer.
   const countsApproximate = data?.counts_approximate ?? false;
   const artifacts = data?.artifacts ?? [];
+  // Warming / stale / partial snapshot (NAN-4902 lane E): an empty list while
+  // warming is "not yet", not "nothing rare".
+  const snapshotStatus = prevalenceStatusLabel(data?.product_state);
+  const pollSnapshot = shouldPollPrevalence(data?.product_state);
+  useEffect(() => {
+    if (!pollSnapshot) return;
+    const timer = window.setTimeout(() => void refetch(), PREVALENCE_STATUS_POLL_MS);
+    return () => window.clearTimeout(timer);
+  }, [data, pollSnapshot, refetch]);
   const total = data?.total ?? 0;
   const totalPages = total > 0 ? Math.max(1, Math.ceil(total / PAGE_SIZE)) : 1;
   const heatmapArtifacts = artifacts.slice(0, 20);
 
-  const onExport = useCallback(async () => {
-    const run = ++exportRunRef.current;
-    setExporting(true);
-    setExportError(null);
-    setExportJob(null);
-    try {
-      const started = await api.startPrevalenceExport({
-        window: timeWindow,
-        type: artifactTypeFilter === 'all' ? undefined : artifactTypeFilter,
-        format: 'csv',
-      });
-      if (run !== exportRunRef.current) return;
-      if (started.kind === 'completed') {
-        saveExport(started.blob, started.filename);
-        return;
-      }
-
-      const jobId = started.job.job_id;
-      // NAN-2361 hosted-shared tenants: the queued export is a tenant export
-      // job polled at `status_url`, not a search job.
-      if (started.job.status_url && started.job.download_url) {
-        const statusUrl = started.job.status_url;
-        const downloadUrl = started.job.download_url;
-        const deadline = Date.now() + 40 * 60 * 1000;
-        for (;;) {
-          if (Date.now() > deadline) throw new Error('Prevalence export did not complete in time');
-          const job = await api.getExportJob(statusUrl);
-          if (run !== exportRunRef.current) return;
-          setExportJob({ jobId, status: job.status === 'expired' ? 'failed' : job.status });
-          if (job.status === 'completed') {
-            const download = await api.downloadExportJob(downloadUrl, job.filename ?? 'prevalence_export.csv');
-            if (run !== exportRunRef.current) return;
-            saveExport(download.blob, download.filename);
-            setExportJob(null);
-            return;
-          }
-          if (job.status === 'failed' || job.status === 'expired') {
-            throw new Error(job.error || `Prevalence export ${job.status}`);
-          }
-          await new Promise((resolve) => window.setTimeout(resolve, 1500));
-        }
-      }
-      for (;;) {
-        const status = await api.getSearchJob(jobId);
-        if (run !== exportRunRef.current) return;
-        if (status.task_kind && status.task_kind !== 'prevalence_export_v1') {
-          throw new Error('Prevalence export job changed type unexpectedly');
-        }
-        setExportJob({
-          jobId,
-          status: status.status,
-          queuePosition: status.queue_position,
-          estimatedWaitSeconds: status.estimated_wait_seconds,
-          progress: status.progress,
-        });
-        if (status.status === 'completed') {
-          const download = await api.downloadSearchJob(jobId);
-          if (run !== exportRunRef.current) return;
-          saveExport(download.blob, download.filename);
-          setExportJob(null);
-          return;
-        }
-        if (status.status === 'failed' || status.status === 'cancelled') {
-          throw new Error(status.error || `Prevalence export ${status.status}`);
-        }
-        await new Promise((resolve) => window.setTimeout(resolve, 750));
-      }
-    } catch (caught) {
-      if (run === exportRunRef.current) {
-        setExportJob(null);
-        setExportError(caught instanceof Error ? caught.message : 'Prevalence export failed');
-      }
-    } finally {
-      if (run === exportRunRef.current) setExporting(false);
-    }
+  const onExport = useCallback(() => {
+    const params = new URLSearchParams();
+    params.set('window', timeWindow);
+    if (artifactTypeFilter !== 'all') params.set('type', artifactTypeFilter);
+    window.open(`/api/prevalence/export?${params.toString()}`, '_blank');
   }, [timeWindow, artifactTypeFilter]);
 
   return (
@@ -720,11 +615,10 @@ export function Prevalence() {
             <button
               type="button"
               onClick={onExport}
-              disabled={exporting}
-              className="flex h-9 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-card/70 hover:text-foreground disabled:opacity-50"
+              className="flex h-9 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-card/70 hover:text-foreground"
             >
-              {exporting ? <LoadingIcon className="h-3.5 w-3.5" /> : <Download className="h-3.5 w-3.5" />}
-              {exporting ? 'Exporting' : 'Export'}
+              <Download className="h-3.5 w-3.5" />
+              Export
             </button>
           </>
         ) : (
@@ -739,24 +633,13 @@ export function Prevalence() {
         )}
       </div>
 
-      {exportJob && (
-        <DurableJobNotice
-          job={exportJob}
-          detail="A complete prevalence export runs as a background job bound to your retention window."
-        />
-      )}
-      {exportError && (
-        <div className="mx-4 mt-4 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-[12px] text-destructive">
-          {exportError}
-        </div>
-      )}
-
       {/* NAN-871: lookup / bulk modes replace the browse experience entirely
           (heatmap + KPI table). `Clear search` returns to browse. */}
       {mode === 'lookup' && singleDetected && (
         <ArtifactLookupCard
           detected={singleDetected}
           lookupData={lookupData?.data?.[0]}
+          lookupStatus={prevalenceStatusLabel(lookupData?.product_state)}
           lookupLoading={lookupLoading}
           timeWindow={timeWindow}
           onDrilldown={handleDrilldown}
@@ -851,7 +734,7 @@ export function Prevalence() {
             </button>
             <button
               type="button"
-              onClick={nextPage}
+              onClick={() => setPage(page + 1)}
               disabled={!data?.has_more || loading}
               aria-label="Next page"
               className="flex h-6 w-6 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
@@ -861,11 +744,6 @@ export function Prevalence() {
           </div>
         </div>
 
-        {snapshotStatus && artifacts.length > 0 && (
-          <p role="status" className="border-b border-border px-3 py-2 font-mono text-[11px] text-muted-foreground">
-            {snapshotStatus}
-          </p>
-        )}
         {/* Column header strip */}
         <div
           className="grid items-center border-b border-border bg-card/40 font-mono text-[9.5px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/80"
@@ -895,13 +773,15 @@ export function Prevalence() {
         ) : artifacts.length === 0 ? (
           <div className="px-4 py-12 text-center text-[12px] text-muted-foreground">
             <Search className="mx-auto mb-2 h-5 w-5 opacity-50" />
-            <p>{snapshotStatus ?? (data?.availability?.available === false ? 'Prevalence not computed yet' : 'No artifacts found')}</p>
-            {data?.availability?.available === false && data.availability.detail && (
-              <p className="mt-1 text-muted-foreground/60">{data.availability.detail}</p>
-            )}
+            <p role={snapshotStatus ? 'status' : undefined}>{snapshotStatus ?? 'No artifacts found'}</p>
           </div>
         ) : (
           <div className="divide-y divide-border">
+            {snapshotStatus && (
+              <p role="status" className="px-3 py-2 font-mono text-[11px] text-muted-foreground">
+                {snapshotStatus}
+              </p>
+            )}
             {artifacts.map((artifact, idx) => {
               const key = `${artifact.artifact}|${artifact.artifact_type}`;
               const isExpanded = expandedRows.has(key);
@@ -956,8 +836,6 @@ function ArtifactRow({
   // NAN-849: single-line scannable subtitle. Built from the bulk `context`
   // shipped with each list row — no per-row fetch.
   const subtitle = useMemo(() => buildSubtitle(artifact), [artifact]);
-  const threatIntel = useEnrichEnabled();
-  const enrichType = threatIntel ? enrichTypeFor(artifact.artifact_type, artifact.artifact) : null;
 
   return (
     <div
@@ -999,20 +877,6 @@ function ArtifactRow({
           >
             <Search className="h-3 w-3 text-muted-foreground hover:text-foreground" />
           </button>
-          {enrichType && (
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                openEnrich({ artifact: artifact.artifact, artifactType: enrichType, origin: 'analyst' });
-              }}
-              aria-label="Enrich"
-              title="Enrich with threat intel"
-              className="rounded-sm opacity-0 transition-opacity focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary group-hover:opacity-100"
-            >
-              <ScanSearch className="h-3 w-3 text-muted-foreground hover:text-foreground" />
-            </button>
-          )}
         </div>
         {subtitle && (
           <div className="truncate text-[10.5px] text-muted-foreground/80" title={subtitle}>
@@ -1024,7 +888,7 @@ function ArtifactRow({
         <TypePill artifactType={artifact.artifact_type} />
       </div>
       <div className="px-2 py-2 text-right font-mono tabular-nums text-foreground">
-        {artifact.host_count.toLocaleString()}{artifact.host_count_saturated ? '+' : ''}
+        {artifact.host_count.toLocaleString()}
       </div>
       <div className="px-2 py-2 text-right font-mono tabular-nums text-foreground">
         {artifact.total_occurrences.toLocaleString()}
@@ -1103,7 +967,7 @@ function FacetCard({
   );
 }
 
-export function ExpandedArtifactDetail({
+function ExpandedArtifactDetail({
   artifact,
   timeWindow,
   onDrilldown,
@@ -1112,50 +976,9 @@ export function ExpandedArtifactDetail({
   timeWindow: string;
   onDrilldown: (artifact: ArtifactExplorerItem) => void;
 }) {
-  const { data: detail, loading, error, refetch } = useArtifactDetail(artifact.artifact, timeWindow);
-  // On-demand threat-intel lookup (hosted-shared tenants with agent enrichment).
-  const threatIntel = useEnrichEnabled();
-  const enrichType = threatIntel ? enrichTypeFor(artifact.artifact_type, artifact.artifact) : null;
-  // NAN-3210: lean (enterprise-shared) tenants build artifact detail in
-  // product state on demand. A miss answers 200 with empty facets and
-  // `availability: {available: false, reason: 'warming'}`; rendering that as
-  // "no data" made every first expand look empty. Poll while it warms.
-  const availability = detail?.availability;
-  const warming = availability?.available === false && availability.reason === 'warming';
-  // NAN-3766: a common artifact first answers with its newest slice
-  // (`coverage.refining`) while the publisher keeps counting; poll for the
-  // wider answer on the same bounded schedule, keeping the partial facets.
-  const coverage = detail?.coverage;
-  const refining = coverage?.refining === true;
-  const [polls, setPolls] = useState(0);
-  useEffect(() => {
-    setPolls(0);
-  }, [artifact.artifact, timeWindow]);
-  useEffect(() => {
-    if (!(warming || refining) || loading || polls >= DETAIL_WARMING_MAX_POLLS) return;
-    const timer = setTimeout(() => {
-      setPolls((n) => n + 1);
-      void refetch();
-    }, detailWarmingDelay(polls));
-    return () => clearTimeout(timer);
-  }, [warming, refining, loading, polls, refetch]);
+  const { data: detail, loading } = useArtifactDetail(artifact.artifact, timeWindow);
 
-  if (warming) {
-    const gaveUp = polls >= DETAIL_WARMING_MAX_POLLS;
-    return (
-      <div className="px-2 py-4" role="status">
-        <div className="mb-2 font-mono text-[11px] text-muted-foreground">
-          {artifact.total_occurrences.toLocaleString()} occurrences · {artifact.host_count_saturated ? '≥' : ''}{artifact.host_count.toLocaleString()} hosts · first {artifact.first_seen} · last {artifact.last_seen}
-        </div>
-        {!gaveUp && <LoadingIcon className="h-4 w-4 text-primary" />}
-        <span className="ml-2 font-mono text-[11px] text-muted-foreground">
-          {gaveUp ? 'Context is still being prepared; collapse and expand to retry' : 'Building detail…'}
-        </span>
-      </div>
-    );
-  }
-
-  if (loading && !(refining && detail)) {
+  if (loading) {
     return (
       <div className="flex items-center justify-center py-6">
         <LoadingIcon className="h-4 w-4 text-primary" />
@@ -1164,20 +987,8 @@ export function ExpandedArtifactDetail({
     );
   }
 
-  if (availability?.available === false) {
-    return (
-      <div className="px-2 py-4 text-[11.5px] text-muted-foreground" role="alert">
-        {availability.detail || 'Artifact context could not be read'}
-      </div>
-    );
-  }
-
   if (!detail) {
-    return (
-      <div className="px-2 py-4 text-[11.5px] text-muted-foreground">
-        {error ? `Artifact context could not be read: ${error.message}` : 'No detail data available'}
-      </div>
-    );
+    return <div className="px-2 py-4 text-[11.5px] text-muted-foreground">No detail data available</div>;
   }
 
   const isHash = artifact.artifact_type.startsWith('hash');
@@ -1303,15 +1114,12 @@ export function ExpandedArtifactDetail({
   // attached. The data-path is wired — empty just means "no feed matched"
   // or "no relevant feed is configured for this artifact_type". The link
   // to /marketplace is the actionable next step.
-  const showMarketplacePromo = !hasThreatIntel && !enrichType;
-  const coverageLabel = detailCoverageLabel(coverage, timeWindow);
+  const showMarketplacePromo = !hasThreatIntel;
 
   return (
     <div className="space-y-3">
       {cards.length === 0 ? (
-        <p className="px-1 py-2 text-[11.5px] text-muted-foreground">
-          {isPartialCoverage(coverage) ? 'No detail data found in the counted range' : 'No detail data found for this artifact'}
-        </p>
+        <p className="px-1 py-2 text-[11.5px] text-muted-foreground">No detail data found for this artifact</p>
       ) : (
         <div
           className="grid gap-3"
@@ -1320,18 +1128,9 @@ export function ExpandedArtifactDetail({
           {cards}
         </div>
       )}
-      {coverageLabel && coverage && (
-        <div
-          className="px-1.5 font-mono text-[10.5px] text-muted-foreground"
-          title={detailCoverageTitle(coverage, timeWindow)}
-          data-testid="detail-coverage"
-        >
-          {coverageLabel}
-        </div>
-      )}
       {showMarketplacePromo && (
-        <Link
-          to="/marketplace"
+        <a
+          href="/marketplace"
           className="flex items-center gap-2 rounded-md border border-dashed border-border bg-card/40 px-3 py-2 text-[11.5px] text-muted-foreground transition-colors hover:border-border hover:bg-card/70 hover:text-foreground"
         >
           <Store className="h-3.5 w-3.5 text-muted-foreground/80" />
@@ -1339,7 +1138,7 @@ export function ExpandedArtifactDetail({
             Connect AbuseIPDB / GreyNoise / VirusTotal in the marketplace to see reputation for this artifact
           </span>
           <ChevronRight className="h-3 w-3 text-muted-foreground/70" />
-        </Link>
+        </a>
       )}
       <button
         type="button"
@@ -1352,19 +1151,6 @@ export function ExpandedArtifactDetail({
         <Search className="h-3 w-3" />
         Search events
       </button>
-      {enrichType && (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            openEnrich({ artifact: artifact.artifact, artifactType: enrichType, origin: 'analyst' });
-          }}
-          className="ml-1.5 inline-flex h-7 items-center gap-1.5 rounded-md border border-border bg-card px-2.5 text-[11.5px] text-muted-foreground transition-colors hover:bg-card/70 hover:text-foreground"
-        >
-          <ScanSearch className="h-3 w-3" />
-          Enrich
-        </button>
-      )}
     </div>
   );
 }
@@ -1463,7 +1249,6 @@ function explorerItemFromLookup(
     artifact: detected.value,
     artifact_type: data?.artifact_type ?? detected.kind,
     host_count: data?.host_count ?? 0,
-    host_count_saturated: data?.host_count_saturated ?? false,
     total_occurrences: data?.total_occurrences ?? 0,
     first_seen: data?.first_seen ?? '',
     last_seen: data?.last_seen ?? '',
@@ -1485,12 +1270,14 @@ function TypeChip({ kind }: { kind: PrevalenceArtifactType }) {
 function ArtifactLookupCard({
   detected,
   lookupData,
+  lookupStatus,
   lookupLoading,
   timeWindow,
   onDrilldown,
 }: {
   detected: DetectedArtifact;
   lookupData: PrevalenceData | undefined;
+  lookupStatus: string | null;
   lookupLoading: boolean;
   timeWindow: string;
   onDrilldown: (artifact: ArtifactExplorerItem) => void;
@@ -1500,6 +1287,8 @@ function ArtifactLookupCard({
     [detected, lookupData],
   );
   const seen = (lookupData?.host_count ?? 0) > 0;
+  // `host_count: null`: not found while prevalence does not cover the window.
+  const unknown = lookupData != null && lookupData.host_count == null;
 
   return (
     <div className="mt-4 overflow-hidden rounded-lg border border-border bg-card">
@@ -1513,7 +1302,7 @@ function ArtifactLookupCard({
               'Looking up…'
             ) : seen ? (
               <>
-                <span className="tabular-nums text-foreground">{(lookupData?.host_count ?? 0).toLocaleString()}{lookupData?.host_count_saturated ? '+' : ''}</span>{' '}
+                <span className="tabular-nums text-foreground">{(lookupData?.host_count ?? 0).toLocaleString()}</span>{' '}
                 {lookupData?.host_count === 1 ? 'host' : 'hosts'} ·{' '}
                 <span className="tabular-nums text-foreground">{(lookupData?.total_occurrences ?? 0).toLocaleString()}</span>{' '}
                 {lookupData?.total_occurrences === 1 ? 'event' : 'events'}
@@ -1530,6 +1319,10 @@ function ArtifactLookupCard({
                   </>
                 )}
               </>
+            ) : unknown ? (
+              <span className="text-muted-foreground/70" title={lookupStatus ?? undefined}>
+                {UNKNOWN_HOSTS_LABEL}
+              </span>
             ) : (
               <span className="text-muted-foreground/70">Not seen in this environment</span>
             )}
@@ -1633,6 +1426,8 @@ function BulkLookupTable({
           {detected.map((d, i) => {
             const row = byArtifact.get(d.value.toLowerCase());
             const seen = (row?.host_count ?? 0) > 0;
+            // `host_count: null` = unknown (prevalence still warming / partial).
+            const unknown = row != null && row.host_count == null;
             return (
               <button
                 key={`${d.value}-${i}`}
@@ -1648,16 +1443,24 @@ function BulkLookupTable({
                   <TypeChip kind={row?.artifact_type ?? d.kind} />
                 </div>
                 <div className="px-2 py-2 text-right font-mono text-[11.5px] tabular-nums text-foreground">
-                  {seen ? <>{(row?.host_count ?? 0).toLocaleString()}{row?.host_count_saturated ? '+' : ''}</> : <span className="text-muted-foreground/60">—</span>}
+                  {seen ? (
+                    (row?.host_count ?? 0).toLocaleString()
+                  ) : unknown ? (
+                    <span className="text-muted-foreground/60" title={UNKNOWN_HOSTS_LABEL}>
+                      ?
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground/60">—</span>
+                  )}
                 </div>
                 <div className="px-2 py-2 text-right font-mono text-[11.5px] tabular-nums text-muted-foreground">
                   {seen ? (row?.total_occurrences ?? 0).toLocaleString() : <span className="text-muted-foreground/60">—</span>}
                 </div>
                 <div className="px-2 py-2 font-mono text-[11px] text-muted-foreground">
-                  {row?.first_seen ? formatUTCCompact(row.first_seen) : <span className="text-muted-foreground/60">—</span>}
+                  {seen && row?.first_seen ? formatUTCCompact(row.first_seen) : <span className="text-muted-foreground/60">—</span>}
                 </div>
                 <div className="px-2 py-2 font-mono text-[11px] text-muted-foreground">
-                  {row?.last_seen ? formatRelativeCompact(row.last_seen) : <span className="text-muted-foreground/60">—</span>}
+                  {seen && row?.last_seen ? formatRelativeCompact(row.last_seen) : <span className="text-muted-foreground/60">—</span>}
                 </div>
                 <div className="px-2 py-2 text-right">
                   {row?.is_rare ? (

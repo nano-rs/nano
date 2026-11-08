@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '@/lib/api';
-import { loadOverviewSections, mergeOverviewSection, type OverviewSection, type SectionStatus } from './progressive';
-import { Stream } from '../cloud-dossier/Stream';
+import { retryOnAdmissionDenied } from '@/lib/admission-retry';
+import { allSections, loadOverviewSections, mergeOverviewSection, type OverviewSection, type SectionStatus } from './progressive';
 import type { CacheMeta } from '@/lib/api';
 import type {
   CloudOverviewAccount,
@@ -13,8 +13,6 @@ import type {
   TimeRange,
 } from '@/lib/api/types';
 import { CachedNotice } from '@/components/search/CachedNotice';
-import { DurableJobNotice, type DurableProductJobState } from '../DurableJobNotice';
-import { waitForDurableProductArtifact } from '../durable-product-job';
 import { useReportPhase2Status } from '@/components/search/footer-reporter';
 import { useIsLiveRun } from '@/components/search/live-run-context';
 import { CloudOverviewTopStrip } from './CloudOverviewTopStrip';
@@ -45,11 +43,6 @@ interface CloudOverviewViewProps {
    * picks fall back to `onAddToQuery('user', ...)`.
    */
   onSetQuery?: (query: string) => void;
-  /** Account scope carried by the typed `| cloud` marker. */
-  account?: string | null;
-  /** Completed durable result restored through Search Jobs. */
-  initialOverview?: CloudOverviewResponse | null;
-  onOpenJobs?: () => void;
 }
 
 export function CloudOverviewView({
@@ -59,36 +52,33 @@ export function CloudOverviewView({
   onExpandFields,
   onAddToQuery,
   onSetQuery,
-  account,
-  initialOverview,
-  onOpenJobs,
 }: CloudOverviewViewProps) {
   const request = useMemo(() => {
     if (!timeRange) return null;
     return {
       provider: null,
-      account: account ?? null,
+      account: null,
       time_range: timeRange,
     };
-  }, [account, timeRange]);
+  }, [timeRange]);
 
   // Primary overview fetch (NAN-1595). Owned locally (rather than via the
   // useCloudOverview hook) so we can capture the server cache status via
   // `onMeta` and force a live re-fetch with `bypass` from the header notice.
-  const [overview, setOverview] = useState<CloudOverviewResponse | null>(initialOverview ?? null);
-  const [sections, setSections] = useState<Record<OverviewSection, SectionStatus>>({ identities: initialOverview ? 'ready' : 'loading', services: initialOverview ? 'ready' : 'loading', changes: initialOverview ? 'ready' : 'loading', denied: initialOverview ? 'ready' : 'loading' });
-  const [loading, setLoading] = useState(!!request && !initialOverview);
+  const [overview, setOverview] = useState<CloudOverviewResponse | null>(null);
+  // NAN-3077: each card loads independently after the cheap `page` answer.
+  const [sections, setSections] = useState<Record<OverviewSection, SectionStatus>>(() => allSections('loading'));
+  const [loading, setLoading] = useState(!!request);
   const [error, setError] = useState<Error | null>(null);
   const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [durableJob, setDurableJob] = useState<DurableProductJobState | null>(null);
-  const initialOverviewRef = useRef(initialOverview ?? null);
 
   // NAN-1595: sequence guard so a slow older request can't overwrite newer
   // data / badge / loading state (or setState after unmount).
+  const reqSeq = useRef(0);
+  // NAN-3077: a superseded window (or unmount) aborts every in-flight card.
   const requestAbort = useRef<AbortController | null>(null);
   useEffect(() => () => { requestAbort.current?.abort(); ++reqSeq.current; }, []);
-  const reqSeq = useRef(0);
   const fetchOverview = useCallback(
     // NAN-1602: `bypass` controls the cache; `asRefresh` controls the UI. They
     // usually match (the refresh button), but a live INITIAL load bypasses the
@@ -110,57 +100,23 @@ export function CloudOverviewView({
       else {
         setLoading(true);
         setOverview(null);
-        setDurableJob(null);
         setCacheMeta(null); // clear stale badge while a fresh load runs
       }
       setError(null);
-      setCacheMeta(null);
-      setSections({ identities: 'loading', services: 'loading', changes: 'loading', denied: 'loading' });
+      setSections(allSections('loading'));
       try {
         const outcome = await loadOverviewSections(
-          fetch => api.getCloudOverview({ ...request, fetch }, { bypass, signal }), signal,
-          part => { if (seq === reqSeq.current) setOverview(previous => mergeOverviewSection(previous, part)); },
-          (section, status) => { if (seq === reqSeq.current) setSections(previous => ({ ...previous, [section]: status })); },
-        );
-        if (seq !== reqSeq.current || signal.aborted) return;
-        if (outcome.full) setSections({ identities: 'ready', services: 'ready', changes: 'ready', denied: 'ready' });
-        if (!outcome.needsDurable) return;
-        const result = await api.getCloudOverview({ ...request, fetch: 'full' }, {
-          onMeta: (m) => { if (seq === reqSeq.current) setCacheMeta(m); },
-          bypass,
-          signal,
-        });
-        if (result.durable_job) {
-          const handle = result.durable_job;
-          if (seq === reqSeq.current) {
-            setDurableJob({ jobId: handle.job_id, status: 'queued' });
-          }
-          const artifact = await waitForDurableProductArtifact(
-            handle.job_id,
-            'cloud_overview_v1',
-            (job) => { if (seq === reqSeq.current) setDurableJob(job); },
-            () => seq === reqSeq.current && !signal.aborted,
+          (fetch) => retryOnAdmissionDenied(() => api.getCloudOverview({ ...request, fetch }, {
+            // The page answer defines the header's cache badge.
+            onMeta: fetch === 'page' ? (m) => { if (seq === reqSeq.current) setCacheMeta(m); } : undefined,
+            bypass,
             signal,
-          );
-          const response = artifact.row.response;
-          if (
-            artifact.row.operation !== 'cloud_overview'
-            || !response
-            || typeof response !== 'object'
-            || !('header' in response)
-          ) {
-            throw new Error('Durable Cloud job returned an invalid typed result artifact');
-          }
-          if (seq === reqSeq.current) {
-            setOverview(response as CloudOverviewResponse);
-            setSections({ identities: 'ready', services: 'ready', changes: 'ready', denied: 'ready' });
-            setDurableJob(null);
-          }
-        } else if (seq === reqSeq.current) {
-          setDurableJob(null);
-          setOverview(result);
-          setSections({ identities: 'ready', services: 'ready', changes: 'ready', denied: 'ready' });
-        }
+          }), signal),
+          signal,
+          (part) => { if (seq === reqSeq.current) setOverview((previous) => mergeOverviewSection(previous, part)); },
+          (section, status) => { if (seq === reqSeq.current) setSections((previous) => ({ ...previous, [section]: status })); },
+        );
+        if (seq === reqSeq.current && !signal.aborted && outcome.full) setSections(allSections('ready'));
       } catch (err) {
         if (seq === reqSeq.current) setError(err instanceof Error ? err : new Error(String(err)));
       } finally {
@@ -179,12 +135,6 @@ export function CloudOverviewView({
 
   // Re-run on a fresh (non-refresh) load whenever the request changes.
   useEffect(() => {
-    if (initialOverviewRef.current) {
-      setOverview(initialOverviewRef.current);
-      initialOverviewRef.current = null;
-      setLoading(false);
-      return;
-    }
     const bypass = liveOnceRef.current;
     liveOnceRef.current = false;
     void fetchOverview(bypass, false);
@@ -255,8 +205,6 @@ export function CloudOverviewView({
         onExpandFields={onExpandFields}
       />
 
-      {durableJob && <DurableJobNotice job={durableJob} onOpenJobs={onOpenJobs} />}
-
       <div className="flex-1 min-w-0 overflow-y-auto overflow-x-hidden">
         <div className="px-4 py-4 space-y-4 min-w-0">
           {error && (
@@ -271,46 +219,61 @@ export function CloudOverviewView({
             </div>
           )}
 
-          {overview?.preview_events && overview.preview_events.length > 0 && (
-            <><div className="font-mono text-[10.5px] text-muted-foreground">Newest 200 events in the requested window; summaries load independently.</div><Stream events={overview.preview_events} /></>
-          )}
           {overview && (
             <>
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0 flex-1">
-                  {sections.identities === 'ready' ? <CloudOverviewHeader data={overview.header} query={headerQuery} deniedStatus={sections.denied} /> : <SectionPending name="Identity and risk" status={sections.identities} />}
+                  {sections.identities === 'ready' ? (
+                    <CloudOverviewHeader data={overview.header} query={headerQuery} deniedStatus={sections.denied} />
+                  ) : (
+                    <SectionPending name="Identity and risk" status={sections.identities} />
+                  )}
                 </div>
                 <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
               </div>
 
-              {sections.identities === 'ready' && <><div className="grid grid-cols-[1.1fr_1fr] gap-3">
-                <AccountsGrid accounts={overview.accounts} onPickAccount={handlePickAccount} />
-                <RiskyPrincipals
-                  principals={overview.risky_principals}
-                  onPick={handlePickPrincipal}
-                />
-              </div>
+              {sections.identities === 'ready' && (
+                <>
+                  <div className="grid grid-cols-[1.1fr_1fr] gap-3">
+                    <AccountsGrid accounts={overview.accounts} onPickAccount={handlePickAccount} />
+                    <RiskyPrincipals
+                      principals={overview.risky_principals}
+                      onPick={handlePickPrincipal}
+                    />
+                  </div>
 
-              <CrossAccountTimeline timeline={overview.timeline} /></>}
+                  <CrossAccountTimeline timeline={overview.timeline} />
+                </>
+              )}
 
               <div className="grid grid-cols-[1fr_1.1fr] gap-3">
-                {sections.changes === 'ready' ? <AnomalyFeed
-                  anomalies={overview.anomalies}
-                  windowLabel={overview.header.window_label}
-                  onOpen={handleOpenAnomaly}
-                /> : <SectionPending name="Recent changes" status={sections.changes} />}
-                {sections.services === 'ready' ? <ServiceHealth
-                  services={overview.service_health}
-                  onPivotService={(id) => handleAddFilterLeavingCloud('cloud_service', id)}
-                /> : <SectionPending name="Service health" status={sections.services} />}
+                {sections.changes === 'ready' ? (
+                  <AnomalyFeed
+                    anomalies={overview.anomalies}
+                    windowLabel={overview.header.window_label}
+                    onOpen={handleOpenAnomaly}
+                  />
+                ) : (
+                  <SectionPending name="Recent changes" status={sections.changes} />
+                )}
+                {sections.services === 'ready' ? (
+                  <ServiceHealth
+                    services={overview.service_health}
+                    onPivotService={(id) => handleAddFilterLeavingCloud('cloud_service', id)}
+                  />
+                ) : (
+                  <SectionPending name="Service health" status={sections.services} />
+                )}
               </div>
 
-              {sections.changes === 'ready' && <TopChanges
-                changes={overview.changes}
-                onPivotActor={(actor) => handleAddFilterLeavingCloud('user', actor)}
-                onPivotTarget={(target) => handleAddFilterLeavingCloud('resource_name', target)}
-                onPivotAccount={(acct) => handleAddFilterLeavingCloud('cloud_account_id', acct)}
-              />}
+              {sections.changes === 'ready' && (
+                <TopChanges
+                  changes={overview.changes}
+                  onPivotActor={(actor) => handleAddFilterLeavingCloud('user', actor)}
+                  onPivotTarget={(target) => handleAddFilterLeavingCloud('resource_name', target)}
+                  onPivotAccount={(acct) => handleAddFilterLeavingCloud('cloud_account_id', acct)}
+                />
+              )}
             </>
           )}
 
@@ -321,8 +284,13 @@ export function CloudOverviewView({
   );
 }
 
+/** Per-card placeholder while a card loads, or the reason it is unavailable. */
 function SectionPending({ name, status }: { name: string; status: SectionStatus }) {
-  return <div role="status" className="border border-border p-3 font-mono text-[10.5px] text-muted-foreground">{name}: {status === 'loading' ? 'loading for the requested window…' : `unavailable for the requested window: ${status}`}</div>;
+  return (
+    <div role="status" className="bg-card border border-border rounded-lg p-3 font-mono text-[10.5px] text-muted-foreground">
+      {name}: {status === 'loading' ? 'loading for the requested window…' : `unavailable for the requested window: ${status}`}
+    </div>
+  );
 }
 
 /**

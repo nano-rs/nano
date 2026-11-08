@@ -282,14 +282,14 @@ pub async fn terminate_session(
             (status, Json(err))
         })?;
 
-    state.emit_audit(
+    state.emit_audit_durable(
         AuditEvent::builder(AuditSource::Session, SESSION_TERMINATED)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("session", Some(*id), None)
             .client_context(&client)
             .build(),
-    );
+    ).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -361,7 +361,7 @@ pub async fn terminate_user_sessions(
         );
     }
 
-    state.emit_audit(
+    state.emit_audit_durable(
         AuditEvent::builder(AuditSource::Session, USER_SESSIONS_TERMINATED)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
@@ -369,7 +369,7 @@ pub async fn terminate_user_sessions(
             .client_context(&client)
             .details(serde_json::json!({ "user_id": user_id, "terminated_count": count }))
             .build(),
-    );
+    ).await;
 
     Ok(Json(TerminateSessionsResponse {
         terminated_count: count,

@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use nanosiem_api::{ApiConfig, AppMetrics, AppState};
-use nanosiem_core::leader::{lock_ids, LeaderHooks, LeaderTiming};
+use nanosiem_core::leader::{lock_ids, LeaderFence, LeaderHooks, LeaderTiming};
 #[cfg(feature = "enterprise")]
 use nanosiem_core::license::checker::LicenseCheckerConfig;
 use nanosiem_core::LeaderElection;
@@ -19,32 +19,16 @@ use std::future::Future;
 #[cfg(feature = "enterprise")]
 use std::sync::Arc;
 
-/// NAN-4699 step 4: this jobs binary runs every singleton loop only under the
-/// PostgreSQL leader lease (`LeaderTiming::JOBS`), so two jobs pods never
-/// double-run one. A deployment renders the jobs Deployment at two pods only
-/// for an image whose receipt reports it (`--print-features`).
-const JOBS_LEADER_LEASE_FEATURE: &str = "jobs_leader_lease_v1";
-/// NAN-4730: the lease honours the coded one-node-loss drill switch
-/// (`LEADER_DRILL_FILE`, core leader.rs). A deployment mounts the switch (a
-/// downward-API projection of one pod annotation) only for an image reporting it.
-const JOBS_LEADER_DRILL_FEATURE: &str = "jobs_leader_drill_v1";
-
-fn jobs_app_features() -> Vec<&'static str> {
-    let mut features = nanosiem_api::APP_FEATURES.to_vec();
-    features.push(JOBS_LEADER_LEASE_FEATURE);
-    features.push(JOBS_LEADER_DRILL_FEATURE);
-    features
-}
-
 /// The leader-only schedulers, started on election and stopped (aborted and
-/// awaited) before the lease can pass to another pod.
+/// awaited) before the lease can pass to another instance.
 struct JobsLeaderTasks {
     state: AppState,
     handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl LeaderHooks for JobsLeaderTasks {
-    async fn elected(&mut self) {
+    async fn elected(&mut self, epoch: i64) {
+        tracing::info!(epoch, node_id = %self.state.node_id, "Jobs leader elected; starting leader-only schedulers");
         // NAN-3080: supervised like every registered loop (a panicking leader
         // scheduler exits the process); the abort on leadership loss aborts
         // them without exiting.
@@ -56,11 +40,6 @@ impl LeaderHooks for JobsLeaderTasks {
         abort_and_await_leader_tasks(&mut self.handles).await;
     }
 }
-
-/// How often nano-jobs returns freed allocator pages (NAN-3492).
-const ALLOCATOR_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-/// Below this RSS (idle jobs sits near 100 MiB) a trim is not worth a syscall.
-const ALLOCATOR_TRIM_MINIMUM_RSS_BYTES: u64 = 192 * 1024 * 1024;
 
 async fn abort_and_await_leader_tasks(handles: &mut Vec<tokio::task::JoinHandle<()>>) {
     if handles.is_empty() {
@@ -92,65 +71,44 @@ where
     release_claims.await;
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    if nanosiem_core::app_features::print_if_requested(&jobs_app_features()) {
-        return Ok(());
+fn main() -> Result<()> {
+    // NAN-4917: query parsing/compilation/evaluation walk the nPL AST
+    // recursively on runtime threads. Size worker + blocking stacks for the
+    // depth the query complexity budget admits, so a hostile query can never
+    // abort the process with a (uncatchable) stack overflow.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(nanosiem_core::query::complexity::RUNTIME_THREAD_STACK_SIZE)
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
+    // NAN-4933: `nanosiem-jobs credential-keys <status|rewrap|retire ID>` is
+    // the operator CLI for the credential key ring (same env as the service).
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("credential-keys") {
+        return credential_keys_cli(&args[1..]).await;
+    }
+    if args.first().map(String::as_str) == Some("ingest-watchdog") {
+        return ingest_watchdog_cli(&args[1..]).await;
     }
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("nanosiem-jobs");
-    // NAN-4666: sovereign installation facts gate boot; missing or invalid
-    // facts refuse to start.
-    let sovereign = nanosiem_core::sovereign_runtime::require_at_boot()
-        .map_err(|error| anyhow::anyhow!("Refusing to start: {error}"))?;
-    nanosiem_core::crypto::EncryptionService::try_from_env()?;
 
     tracing::info!("Starting NanoSIEM Jobs Service");
-
-    // NAN-3492: charge rule windows to this process's view memory budget
-    // before any scheduler starts, so an oversized window fails its run
-    // instead of OOM-killing jobs. nano-api never enables it (its
-    // interactive rule triggers stay unbudgeted).
-    nanosiem_core::detection::DetectionService::enable_rule_memory_ledger();
 
     // Load configuration (reuses API config — same env vars)
     let config = ApiConfig::from_env();
     tracing::info!("Configuration loaded");
     let leader_election_enabled = leader_election_configuration()?;
 
-    // Jobs validates rules and scheduled searches against the same canonical
-    // field inventory as API/Search. Hosted/shared jobs cannot read a query
-    // worker's local generation volume, so install its authenticated schema
-    // before AppState performs the fail-closed profile build.
-    // NAN-2718: shared mode refuses a process-global schema URL outright
-    // (`install_from_env` errors on it) and loads each tenant's schema from its
-    // own registry-assigned worker, cached by tenant UUID.
-    #[cfg(feature = "enterprise")]
-    if config.deployment_mode.is_enterprise_shared() {
-        nanosiem_core::schema::worker_schema::refuse_global_schema_in_shared_mode(&|name: &str| {
-            std::env::var(name).ok()
-        })
-        .map_err(|error| anyhow::anyhow!("Refusing to start: {error}"))?;
-    }
-    let worker_schema_source = if config.canonical_lake_ocsf {
-        nanosiem_core::schema::worker_schema::WorkerSchemaSource::install_from_env()
-            .await
-            .map_err(|error| anyhow::anyhow!("lake schema source unavailable: {error}"))?
-    } else {
-        None
-    };
-    #[cfg(feature = "enterprise")]
-    if config.canonical_lake_ocsf && config.deployment_mode.is_enterprise_shared() {
-        nanosiem_core::schema::tenant_lake_schema::start_for_shared_process().await;
-    }
-
-    // Initialize AppState. PostgreSQL is always required; legacy mode also
-    // requires ClickHouse, while canonical lake mode connects to no ClickHouse
-    // process.
-    // SchemaBehind is a hard failure — refuse to start rather than risking
-    // corruption against an out-of-date schema. (NAN-607)
+    // Initialize AppState with DualPool. Both ClickHouse and PostgreSQL are
+    // required; the historical PG-only fallback was removed in NAN-800.
+    // A schema-behind error for either store is a hard boot failure. (NAN-607)
     let mut state = match AppState::try_with_dual_pool(config.clone()).await {
         Ok(state) => state,
-        Err(nanosiem_core::db::DualPoolError::SchemaBehind(msg)) => {
+        Err(nanosiem_core::db::DualPoolError::SchemaBehind(msg))
+        | Err(nanosiem_core::db::DualPoolError::PostgresSchemaBehind(msg)) => {
             tracing::error!("Refusing to start: {}", msg);
             return Err(anyhow::anyhow!("{}", msg));
         }
@@ -160,52 +118,9 @@ async fn main() -> Result<()> {
         }
     };
 
-    // NAN-3492: a trusted-local install's lake tenant must exist in
-    // `tenants` before any finding is stamped with it.
-    if let Some(tenant) = nanosiem_core::search::lake_cell::ensure_trusted_local_tenant(&state.pool)
-        .await
-        .map_err(|error| anyhow::anyhow!("Refusing to start: {error}"))?
-    {
-        tracing::info!(%tenant, "trusted-local tenant registered");
-    }
-
-    // Jobs owns tenant-scoped schedulers and mutation paths independently of
-    // the HTTP API. Attest the exact live RLS catalog before any task starts;
-    // another pod's readiness cannot vouch for this process or connection
-    // pool.
-    #[cfg(feature = "enterprise")]
-    if config.deployment_mode.is_enterprise_shared() {
-        // Jobs mounts the same unauthenticated-by-default /metrics router as
-        // the API; refuse to expose it token-less in the shared deployment.
-        nanosiem_api::metrics::require_metrics_auth_token_for_enterprise_shared(true)?;
-        let runtime_role = std::env::var("NANOSIEM_SHARED_RLS_RUNTIME_ROLE")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "NANOSIEM_SHARED_RLS_RUNTIME_ROLE is required in enterprise_shared mode"
-                )
-            })?;
-        let owner_role = std::env::var("NANOSIEM_SHARED_RLS_OWNER_ROLE")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "NANOSIEM_SHARED_RLS_OWNER_ROLE is required in enterprise_shared mode"
-                )
-            })?;
-        nanosiem_core::tenant_db::require_tenant_rls_catalog(
-            &state.pool,
-            &runtime_role,
-            &owner_role,
-        )
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "enterprise-shared RLS catalog verification failed; refusing jobs startup: {error}"
-            )
-        })?;
-        tracing::info!("Enterprise-shared jobs RLS catalog verification is green");
+    // NAN-4933: leader-only writes are fenced by the jobs lease epoch.
+    if leader_election_enabled {
+        state.leader_fence = LeaderFence::armed(lock_ids::API_SCHEDULER);
     }
 
     // Initialize demo service if DEPLOYMENT_MODE=demo
@@ -251,44 +166,37 @@ async fn main() -> Result<()> {
         let lc_handle = license_checker.start();
         state.add_task_handle(lc_handle).await;
         tracing::info!("License checker started (24h interval)");
+    } else if state.config.airgap {
+        match nanosiem_api::license_admission::refresh_offline_snapshot(&state, false).await {
+            Ok(snapshot) if snapshot.legacy_grace().is_some() => tracing::warn!(
+                "Legacy offline licence upgrade grace active in jobs; import a C05 licence"
+            ),
+            Ok(_) => tracing::info!("Loaded read-only C05 component admission for jobs"),
+            Err(error) => {
+                tracing::error!(%error, "C05 admission unavailable in jobs; workers fail closed");
+                let snapshot = nanosiem_api::license_admission::unavailable_snapshot(&error);
+                *state.license_status.write().await = snapshot.cached_status();
+                *state.offline_license_snapshot.write().await = snapshot;
+            }
+        }
+        let refresh_state = state.clone();
+        let refresh_handle = tokio::spawn(async move {
+            run_read_only_sovereign_license_refresh(refresh_state).await;
+        });
+        state.add_task_handle(refresh_handle).await;
+        tracing::info!("Read-only C05 jobs admission refresh started (30s interval)");
     } else {
         tracing::info!("License enforcement not configured (LICENSE_URL not set)");
     }
 
+    // NAN-4933: credential key ring registration + membership (every node).
+    state.register_credential_key_ring("jobs").await?;
+    let credential_membership = state.start_credential_key_membership("jobs");
+    state.add_task_handle(credential_membership).await;
+
     // === Per-instance tasks ===
 
-    if let Some(source) = worker_schema_source {
-        // NAN-3492: republish each new worker-served field set into the
-        // state's profile; installing it alone changes nothing state reads.
-        let adopt = state.schema_profile.clone();
-        let worker_schema_handle = tokio::spawn(source.run_refresh_loop_with(move || {
-            if adopt.adopt_installed_lake_profile() {
-                tracing::info!("lake schema profile republished from the worker-served schema");
-            }
-        }));
-        state.add_task_handle(worker_schema_handle).await;
-        tracing::info!("Worker-served lake schema refresher started");
-    }
-
     tracing::info!(node_id = %state.node_id, "Node ID for distributed scheduling");
-
-    // AI usage recorder (NAN-1519) — the jobs node runs shadow investigations,
-    // closure summaries and other background AI work, so its calls must land in
-    // the ai_usage_events ledger too. Per-instance init (enterprise-only).
-    #[cfg(feature = "enterprise")]
-    {
-        nanosiem_enterprise::melod::usage_recorder::init(
-            state.pool.clone(),
-            state.tenant_ai_rls_runtime.clone(),
-        );
-        tracing::info!("AI usage recorder started");
-    }
-
-    // NAN-3080: install the Prometheus recorder BEFORE any scheduler starts.
-    // `metrics` macros bind to whatever recorder is global at call time; the
-    // tenant detection runtime's gauges and counters emitted before this
-    // point went to the no-op recorder and never reached /metrics.
-    let (app_metrics, prometheus_layer) = AppMetrics::new();
 
     // Distributed schedulers: detection rules + scheduled jobs via SKIP LOCKED
     tracing::info!("Starting distributed schedulers (detection rules + scheduled jobs)...");
@@ -301,17 +209,44 @@ async fn main() -> Result<()> {
     // Enterprise only — open tuning runs without AI proposal generation.
     #[cfg(feature = "enterprise")]
     {
-        tracing::info!("Starting meloD config poller...");
-        let melod_handle = state.start_melod_config_poller();
-        state.add_task_handle(melod_handle).await;
+        let supervisor = state.start_component_worker_supervisor(
+            nanosiem_api::license_admission::WorkerCapability::Melod,
+            "jobs_melod",
+            |state| {
+                nanosiem_enterprise::melod::usage_recorder::init(state.pool.clone());
+                vec![state.start_melod_config_poller()]
+            },
+        );
+        state.add_task_handle(supervisor).await;
     }
 
-    // Case SSE clients periodically refetch through authorized endpoints.
+    // Enterprise extension workers (generic seam; nothing named here).
+    #[cfg(feature = "enterprise")]
+    {
+        let supervisor = state.start_component_worker_supervisor(
+            nanosiem_api::license_admission::WorkerCapability::Soar,
+            "jobs_soar",
+            |state| nanosiem_enterprise::handlers::extension_jobs(state, state.shutdown_token()),
+        );
+        state.add_task_handle(supervisor).await;
+    }
+
+    // Case change listener (SSE broadcast via pg_notify).
+    // Phase 3.2 (NAN-744): cases moved to enterprise; only register when
+    // the enterprise feature is enabled.
+    #[cfg(feature = "enterprise")]
+    {
+        let case_listener_handle = state.start_case_change_listener();
+        state.add_task_handle(case_listener_handle).await;
+    }
 
     // === Leader-only tasks ===
     if leader_election_enabled {
-        // NAN-4699 step 4: a PG lease (renew 2 s, self-fence within 5 s of a
-        // failed renew, stale holder evicted after 20 s; see core leader.rs).
+        // NAN-4933 (port of main NAN-4699 step 4): a PG lease. Renew 2 s,
+        // self-fence within 5 s of a failed renew, a stale holder evicted
+        // after 20 s, so a warm standby takes over within ~28 s of a hard
+        // leader death (2 s after a graceful stop). Each acquisition bumps the
+        // lease epoch that leader-only writes check (core leader.rs).
         let timing = LeaderTiming::JOBS.with_env_overrides();
         tracing::info!(
             heartbeat_secs = timing.heartbeat.as_secs(),
@@ -320,41 +255,24 @@ async fn main() -> Result<()> {
             stale_secs = ?timing.stale_after.map(|stale| stale.as_secs()),
             "Leader election enabled — PostgreSQL advisory-lock lease"
         );
-        let election = LeaderElection::new(state.pool.clone(), lock_ids::API_SCHEDULER).with_timing(timing);
+        let election = LeaderElection::new(state.pool.clone(), lock_ids::API_SCHEDULER)
+            .with_timing(timing)
+            .with_fence(state.leader_fence.clone(), state.node_id.clone());
         let election_handle = election.spawn_with(
             state.shutdown_token(),
-            JobsLeaderTasks { state: state.clone(), handles: Vec::new() },
+            JobsLeaderTasks {
+                state: state.clone(),
+                handles: Vec::new(),
+            },
         );
         state.add_task_handle(election_handle).await;
     } else {
         tracing::warn!("Leader election disabled for explicitly declared single-node jobs service");
-        let handles = state.start_leader_schedulers().await;
-        for handle in handles {
+        // Same fatal-on-return policy as the elected path (NAN-4902 review);
+        // registering the supervisors keeps them under shutdown's abort.
+        let started = state.start_leader_schedulers().await;
+        for handle in state.supervise_tasks("leader_scheduler", started) {
             state.add_task_handle(handle).await;
-        }
-    }
-
-    // NAN-4722: sovereign platform audit retention (400 d). Hosted prunes from
-    // the control plane's stamping GC loop, which single-host never runs; the
-    // purge definer is executable only by this login (single-host-grants.sql).
-    // Not under the leader lease on purpose: the definer claims rows FOR
-    // UPDATE SKIP LOCKED under a per-transaction marker, so two jobs pods
-    // prune disjoint rows, and each pass is bounded (BATCH x MAX_BATCHES).
-    if sovereign {
-        match nanosiem_core::audit::sovereign_retention::available(&state.pool).await {
-            Ok(true) => {
-                let pool = state.pool.clone();
-                let shutdown = state.shutdown_token();
-                let handle = tokio::spawn(async move {
-                    let _ = shutdown
-                        .run_until_cancelled(nanosiem_core::audit::sovereign_retention::run(pool))
-                        .await;
-                });
-                state.add_task_handle(handle).await;
-                tracing::info!("Sovereign platform audit retention task started (hourly)");
-            }
-            Ok(false) => tracing::info!("Sovereign platform audit retention not started: no purge definer (open schema)"),
-            Err(error) => tracing::warn!(%error, "Sovereign platform audit retention not started"),
         }
     }
 
@@ -363,26 +281,17 @@ async fn main() -> Result<()> {
     // accumulate forever.
     {
         let oidc_repo = state.oidc_repo.clone();
-        let shutdown = state.shutdown_token();
         let oidc_handle = tokio::spawn(async move {
-            let cleanup = async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
-                interval.tick().await; // skip the immediate tick
-                loop {
-                    interval.tick().await;
-                    match oidc_repo.delete_expired_auth_transactions().await {
-                        Ok(0) => {}
-                        Ok(n) => {
-                            tracing::info!(cleaned = n, "OIDC auth-transaction cleanup completed")
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "OIDC auth-transaction cleanup failed")
-                        }
-                    }
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
+            interval.tick().await; // skip the immediate tick
+            loop {
+                interval.tick().await;
+                match oidc_repo.delete_expired_auth_transactions().await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(cleaned = n, "OIDC auth-transaction cleanup completed"),
+                    Err(e) => tracing::warn!(error = %e, "OIDC auth-transaction cleanup failed"),
                 }
-            };
-
-            let _ = shutdown.run_until_cancelled(cleanup).await;
+            }
         });
         state.add_task_handle(oidc_handle).await;
         tracing::info!("OIDC auth-transaction cleanup task started (15m interval)");
@@ -391,62 +300,20 @@ async fn main() -> Result<()> {
     // Demo cleanup task
     if let Some(ref demo_service) = state.demo_service {
         let demo_svc = demo_service.clone();
-        let shutdown = state.shutdown_token();
         let demo_handle = tokio::spawn(async move {
-            let cleanup = async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
-                loop {
-                    interval.tick().await;
-                    match demo_svc.cleanup_expired_sessions().await {
-                        Ok(0) => {}
-                        Ok(n) => tracing::info!(cleaned = n, "Demo session cleanup completed"),
-                        Err(e) => tracing::warn!(error = %e, "Demo session cleanup failed"),
-                    }
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
+            loop {
+                interval.tick().await;
+                match demo_svc.cleanup_expired_sessions().await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(cleaned = n, "Demo session cleanup completed"),
+                    Err(e) => tracing::warn!(error = %e, "Demo session cleanup failed"),
                 }
-            };
-
-            let _ = shutdown.run_until_cancelled(cleanup).await;
+            }
         });
         state.add_task_handle(demo_handle).await;
         tracing::info!("Demo session cleanup task started (15m interval)");
     }
-
-    // NAN-4152: per-tenant demo sessions on the shared stack. Every replica
-    // may run it: each session is retired in its own signed tenant
-    // transaction that claims the row with SKIP LOCKED.
-    #[cfg(feature = "enterprise")]
-    if config.deployment_mode.is_enterprise_shared() {
-        if let Some(runtime) = state.tenant_ai_rls_runtime.as_ref() {
-            let demo = runtime.demo_runtime();
-            let control = state.pool.clone();
-            let shutdown = state.shutdown_token();
-            let shared_demo_handle = tokio::spawn(async move {
-                let cleanup = async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
-                    loop {
-                        interval.tick().await;
-                        nanosiem_enterprise::handlers::shared_demo_sessions::run_demo_cleanup_tick(&demo, &control).await;
-                    }
-                };
-                let _ = shutdown.run_until_cancelled(cleanup).await;
-            });
-            state.add_task_handle(shared_demo_handle).await;
-            tracing::info!("Shared demo session cleanup task started (15m interval)");
-        } else {
-            tracing::warn!("Shared demo session cleanup not started: no signed tenant runtime");
-        }
-    }
-
-    // NAN-3492: rule windows, lake pages and finding reads free large JSON trees
-    // back to glibc, not to the kernel; without a trim the cgroup keeps the
-    // peak charged and the next burst stacks on it (nano-search does the same).
-    let trim_handle = tokio::spawn(nanosiem_core::allocator_trim::run_allocator_trim_loop(
-        "nanosiem-jobs",
-        ALLOCATOR_TRIM_INTERVAL,
-        ALLOCATOR_TRIM_MINIMUM_RSS_BYTES,
-        state.shutdown_token(),
-    ));
-    state.add_task_handle(trim_handle).await;
 
     // === Health + metrics endpoint ===
     let jobs_port: u16 = std::env::var("JOBS_PORT")
@@ -454,7 +321,13 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3001);
 
-    let health_router = nanosiem_api::jobs_listener::create_jobs_router(&app_metrics)
+    let (app_metrics, prometheus_layer) = AppMetrics::new();
+
+    let health_router = axum::Router::new()
+        .route("/health", axum::routing::get(|| async { "ok" }))
+        .merge(app_metrics.metrics_router(
+            nanosiem_core::auth::service_credential::LoopbackPolicy::AllowWhenUnconfigured,
+        ))
         .layer(prometheus_layer);
 
     let wait_for_shutdown = async {
@@ -464,13 +337,34 @@ async fn main() -> Result<()> {
         }
     };
 
-    let bind_address = format!("0.0.0.0:{}", jobs_port);
+    // NAN-2042: the jobs listener is private. It binds loopback unless the
+    // operator widens it with JOBS_BIND_ADDR (e.g. a Prometheus scrape on the
+    // pod network, which must then also present NANO_SERVICE_TOKEN).
+    let bind_address = nanosiem_core::auth::service_credential::private_bind_addr(
+        std::env::var(nanosiem_core::auth::service_credential::JOBS_BIND_ADDR_ENV)
+            .ok()
+            .as_deref(),
+        jobs_port,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    if !bind_address.ip().is_loopback()
+        && !nanosiem_core::auth::service_credential::ServiceCredential::from_env().is_configured()
+    {
+        tracing::warn!(
+            %bind_address,
+            "jobs listener is on a non-loopback address without NANO_SERVICE_TOKEN; /metrics will refuse every remote caller"
+        );
+    }
     tracing::info!("Starting health + metrics endpoint on {}", bind_address);
 
-    let listener = tokio::net::TcpListener::bind(&bind_address).await?;
+    let listener = tokio::net::TcpListener::bind(bind_address).await?;
     let server_shutdown = nanosiem_core::shutdown::ShutdownToken::new();
     let graceful_shutdown = server_shutdown.clone();
-    let server = axum::serve(listener, health_router).with_graceful_shutdown(async move {
+    let server = axum::serve(
+        listener,
+        health_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
         graceful_shutdown.cancelled().await;
     });
     let cleanup_state = state.clone();
@@ -496,6 +390,94 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    Ok(())
+}
+
+#[cfg(feature = "enterprise")]
+async fn run_read_only_sovereign_license_refresh(state: AppState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        if let Err(error) =
+            nanosiem_api::license_admission::refresh_offline_snapshot(&state, false).await
+        {
+            tracing::error!(%error, "C05 jobs admission refresh failed; workers fail closed");
+            let snapshot = nanosiem_api::license_admission::unavailable_snapshot(&error);
+            *state.license_status.write().await = snapshot.cached_status();
+            *state.offline_license_snapshot.write().await = snapshot;
+        }
+    }
+}
+
+/// Credential key ring CLI. Prints JSON (ids, fingerprints, counts; never key
+/// material) and exits non-zero on a refused retirement.
+async fn credential_keys_cli(args: &[String]) -> Result<()> {
+    use nanosiem_core::crypto::rotation::{self, CredentialKeyRepository};
+    let usage = "usage: nanosiem-jobs credential-keys <status | rewrap | retire KEY_ID | enforce>";
+    let config = ApiConfig::from_env();
+    let cipher = nanosiem_core::crypto::EncryptionService::try_from_env()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The CLI's re-wrap writes secrets: declare its write key like every pool.
+    let pool = rotation::declare_write_key(
+        sqlx::postgres::PgPoolOptions::new().max_connections(2),
+        cipher.active_key_id().to_owned(),
+    )
+    .connect(&config.database_url)
+    .await
+    .map_err(|e| anyhow::anyhow!("connect to PostgreSQL: {e}"))?;
+    let repo = CredentialKeyRepository::new(pool.clone());
+    let node_id = format!("cli-{}", std::process::id());
+    // Codex fence review P1: the CLI never registered its ring, so prove its
+    // key bytes are the registered ones before touching any secret.
+    repo.verify_ring(&cipher).await?;
+    let output = match args.first().map(String::as_str) {
+        Some("status") => serde_json::json!({
+            "active_key_id": cipher.active_key_id(),
+            "warnings": nanosiem_api::handlers::credential_keys::ring_warnings(&cipher.ring_keys()),
+            "write_fence_enforced": repo.fence_enforced().await?,
+            "ring": cipher.ring_keys(),
+            "known_keys": repo.known_keys().await?,
+            "usage": rotation::scan(&pool, &cipher).await?,
+            "members": repo.members().await?,
+            "recent_runs": repo.recent_runs(10).await?,
+        }),
+        Some("rewrap") => {
+            let (outcome, usage) = rotation::run_pass(&repo, &cipher, "manual", &node_id).await?;
+            serde_json::json!({ "outcome": outcome, "usage": usage })
+        }
+        Some("retire") => {
+            let key_id = args.get(1).ok_or_else(|| anyhow::anyhow!(usage))?;
+            let report = repo.retire(&cipher, key_id, None).await?;
+            serde_json::json!({ "key_id": key_id, "retired": true, "usage": report })
+        }
+        Some("enforce") => {
+            let flipped = repo.enforce_fence("cli").await?;
+            serde_json::json!({ "write_fence_enforced": true, "changed": flipped })
+        }
+        _ => anyhow::bail!(usage),
+    };
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+/// Operator control for the leader-owned ClickHouse ingest watchdog. Manual
+/// start intentionally retains manual mode; only `auto` returns ownership to
+/// the watchdog.
+async fn ingest_watchdog_cli(args: &[String]) -> Result<()> {
+    use nanosiem_core::ingest_watchdog::{IngestWatchdog, WatchdogOperatorAction};
+
+    let usage = "usage: nanosiem-jobs ingest-watchdog <status|manual-stop|manual-start|auto>";
+    let action = match args.first().map(String::as_str) {
+        Some("status") => WatchdogOperatorAction::Status,
+        Some("manual-stop") => WatchdogOperatorAction::ManualStop,
+        Some("manual-start") => WatchdogOperatorAction::ManualStart,
+        Some("auto") => WatchdogOperatorAction::Auto,
+        _ => anyhow::bail!(usage),
+    };
+    let watchdog = IngestWatchdog::from_env().await?;
+    let output = watchdog.operator(action).await?;
+    println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
 }
 
@@ -581,17 +563,6 @@ mod tests {
         .await;
 
         assert!(claims_released.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn jobs_reports_the_leader_lease_capability() {
-        // A deployment renders two jobs pods only for an image reporting it.
-        let features = jobs_app_features();
-        assert!(features.contains(&"jobs_leader_lease_v1"));
-        assert!(nanosiem_api::APP_FEATURES.iter().all(|feature| features.contains(feature)));
-        assert!(!nanosiem_api::APP_FEATURES.contains(&"jobs_leader_lease_v1"));
-        assert!(features.contains(&"jobs_leader_drill_v1"));
-        assert!(!nanosiem_api::APP_FEATURES.contains(&"jobs_leader_drill_v1"));
     }
 
     #[test]

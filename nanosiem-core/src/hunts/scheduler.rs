@@ -172,13 +172,9 @@ impl HuntSchedulerConfig {
         let defaults = Self::default();
         Self {
             enabled: env_flag("HUNT_SCHEDULER_ENABLED", defaults.enabled),
-            poll_interval_secs: env_parse(
-                "HUNT_SCHEDULER_POLL_INTERVAL_SECS",
-                defaults.poll_interval_secs,
-            )
-            .clamp(5, 3_600),
-            batch_size: env_parse("HUNT_SCHEDULER_BATCH_SIZE", defaults.batch_size)
-                .clamp(1, 10_000),
+            poll_interval_secs: env_parse("HUNT_SCHEDULER_POLL_INTERVAL_SECS", defaults.poll_interval_secs)
+                .clamp(5, 3_600),
+            batch_size: env_parse("HUNT_SCHEDULER_BATCH_SIZE", defaults.batch_size).clamp(1, 10_000),
             reclaim_grace_secs: env_parse(
                 "HUNT_SCHEDULER_RECLAIM_GRACE_SECS",
                 defaults.reclaim_grace_secs,
@@ -206,12 +202,7 @@ pub fn env_flag(key: &str, default: bool) -> bool {
             "1" | "true" | "yes" | "on" => true,
             "0" | "false" | "no" | "off" => false,
             other => {
-                warn!(
-                    key,
-                    value = other,
-                    default,
-                    "Unrecognised boolean; keeping default"
-                );
+                warn!(key, value = other, default, "Unrecognised boolean; keeping default");
                 default
             }
         },
@@ -550,18 +541,29 @@ pub struct HuntSchedulerTick {
 pub struct HuntScheduler {
     pool: PgPool,
     config: HuntSchedulerConfig,
+    /// NAN-4933: jobs lease epoch; issue and reclaim run only under it.
+    fence: crate::leader::LeaderFence,
 }
 
 impl HuntScheduler {
     pub fn new(pool: PgPool) -> Self {
-        Self {
-            pool,
-            config: HuntSchedulerConfig::default(),
-        }
+        Self::with_config(pool, HuntSchedulerConfig::default())
     }
 
     pub fn with_config(pool: PgPool, config: HuntSchedulerConfig) -> Self {
-        Self { pool, config }
+        Self {
+            pool,
+            config,
+            fence: crate::leader::LeaderFence::disabled(),
+        }
+    }
+
+    /// Issue and reclaim only while holding the current jobs lease epoch
+    /// (NAN-4933): a superseded leader's transaction is refused before it
+    /// inserts a sweep or advances a watermark.
+    pub fn with_fence(mut self, fence: crate::leader::LeaderFence) -> Self {
+        self.fence = fence;
+        self
     }
 
     pub fn from_env(pool: PgPool) -> Self {
@@ -574,7 +576,7 @@ impl HuntScheduler {
 
     /// Whether the hunt tables exist in this database.
     ///
-    /// Migration 9000054 lives in the enterprise migrations, so an open
+    /// Migration 9000054 lives in `migrations/postgres-enterprise/`, so an open
     /// deployment has no `hunt_specs` at all. Probing once at start and parking
     /// quietly beats logging a relation-does-not-exist error every minute
     /// forever — the loop has nothing to schedule either way, and a noisy
@@ -673,7 +675,12 @@ impl HuntScheduler {
             }
             SlotPlan::Seed { next_due } => {
                 let updated = self
-                    .write_watermark(hunt.playbook_id, Some(next_due), None, hunt.next_due_slot)
+                    .write_watermark(
+                        hunt.playbook_id,
+                        Some(next_due),
+                        None,
+                        hunt.next_due_slot,
+                    )
                     .await?;
                 if updated {
                     tick.seeded += 1;
@@ -787,6 +794,10 @@ impl HuntScheduler {
         window: &SweepWindow,
     ) -> Result<IssueOutcome, HuntError> {
         let mut tx = self.pool.begin().await?;
+        self.fence
+            .guard(&mut tx)
+            .await
+            .map_err(|error| HuntError::Conflict(error.to_string()))?;
 
         // `ON CONFLICT DO NOTHING` rather than catching the unique violation:
         // a constraint error ABORTS the transaction, and the whole point of
@@ -1029,6 +1040,11 @@ impl HuntScheduler {
     /// `LeaseLost` instead of appending to work that was already written off.
     pub async fn reclaim_expired_leases(&self, now: DateTime<Utc>) -> Result<usize, HuntError> {
         let cutoff = now - Duration::seconds(self.config.reclaim_grace_secs.max(0));
+        let mut tx = self.pool.begin().await?;
+        self.fence
+            .guard(&mut tx)
+            .await
+            .map_err(|error| HuntError::Conflict(error.to_string()))?;
 
         let rows = sqlx::query(
             r#"
@@ -1074,8 +1090,9 @@ impl HuntScheduler {
         .bind(cutoff)
         .bind(self.config.reclaim_batch)
         .bind(RECLAIM_OUTCOME)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         for row in &rows {
             let sweep_id: Uuid = row.try_get("id")?;
@@ -1107,20 +1124,19 @@ impl HuntScheduler {
     /// [`Self::run`] after the hunt-table probe, split out so the
     /// tables-absent path is testable without a database.
     ///
-    /// NAN-3376: with the tables absent (every open-core install) the loop
-    /// PARKS until shutdown rather than returning. The jobs binary supervises
-    /// every leader scheduler as a loop, so a clean return here exited the
-    /// process with code 70 every minute.
+    /// NAN-3376: with the tables absent the loop PARKS until shutdown rather
+    /// than returning. The jobs binary supervises every leader scheduler as a
+    /// loop, where a clean return outside shutdown is fatal (exit 70), so
+    /// returning here would crash-loop the process.
     async fn run_after_probe(&self, shutdown: &ShutdownToken, probe: Result<bool, HuntError>) {
         match probe {
             Ok(true) => {}
             Ok(false) => {
-                crate::process_supervision::park_until_shutdown(
-                    "hunt_scheduler",
-                    "hunt tables are not present (enterprise migration 9000054)",
-                    shutdown,
-                )
-                .await;
+                info!(
+                    "Hunt tables are not present (enterprise migration 9000054); \
+                     hunt scheduler parked until shutdown"
+                );
+                shutdown.cancelled().await;
                 return;
             }
             Err(error) => {

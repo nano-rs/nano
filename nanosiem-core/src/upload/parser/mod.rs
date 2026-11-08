@@ -79,16 +79,37 @@ impl FileParser {
                 .is_some_and(|tld| tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic()))
     }
 
+    /// Comment marker for indicator feeds (`# updated 2026-11-02`, licence
+    /// banners). Only honoured when the payload OPENS with a comment block;
+    /// see [`Self::starts_with_comment`].
+    pub const COMMENT_PREFIX: char = '#';
+
+    /// Whether the first non-blank line is a `#` comment. When it is, CSV
+    /// parsing skips `#` lines, so detection (which skips them too, through
+    /// [`Self::first_data_line`]) and parsing agree on where the data starts.
+    pub fn starts_with_comment(text: &str) -> bool {
+        text.trim_start_matches('\u{feff}')
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            // Untrimmed, like the csv reader's comment check (first byte).
+            .is_some_and(|line| line.starts_with(Self::COMMENT_PREFIX))
+    }
+
+    /// First line that carries data: not blank, and not a `#` comment when the
+    /// payload opens with comments (the same rule the CSV reader applies).
+    pub fn first_data_line(text: &str) -> Option<&str> {
+        let skip_comments = Self::starts_with_comment(text);
+        text.trim_start_matches('\u{feff}').lines().find(|line| {
+            !line.trim().is_empty() && !(skip_comments && line.starts_with(Self::COMMENT_PREFIX))
+        })
+    }
+
     /// Auto-detect headerless single-column indicator feeds; otherwise keep CSV headers.
     pub fn detect_has_header(content: &[u8], delimiter: char) -> bool {
         let Ok(text) = std::str::from_utf8(content) else {
             return true;
         };
-        let first = text
-            .trim_start_matches('\u{feff}')
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("");
+        let first = Self::first_data_line(text).unwrap_or("");
         !(!first.contains(delimiter) && Self::indicator_column(first).is_some())
     }
 
@@ -116,7 +137,7 @@ impl FileParser {
             && column != "_placeholder"
             && std::str::from_utf8(content)
                 .ok()
-                .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
+                .and_then(Self::first_data_line)
                 .and_then(Self::indicator_column)
                 .is_some()
         {

@@ -3,41 +3,20 @@
 //! Search endpoints: execute, cancel, explain, fetch log, prevalence, field stats.
 
 use axum::{
-    extract::{Path, State},
     Json,
+    extract::{Path, State},
 };
 use nanosiem_core::{
-    auth::permissions, search::FieldValueInfo, PrevalenceScatterData, RawSqlRequest, SearchRequest,
-    SearchResponse, TimeRangeInput,
+    PrevalenceScatterData, RawSqlRequest, SearchRequest, SearchResponse, TimeRangeInput,
+    auth::permissions,
+    search::FieldValueInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-use super::{
-    reject_shared_raw_sql, require_current_shared_authority, require_search_execute,
-    require_shared_npl_base_search_contract, require_shared_npl_contract,
-    require_shared_npl_contract_for_view,
-    require_shared_prevalence_component, SearchResultResponse,
-};
+use super::{SearchResultResponse, require_search_execute};
 use crate::error::ErrorResponse;
-use crate::{error::SearchError, metrics::record_search_query, SearchState};
-use nanosiem_core::search::settled_reuse::AttachPoint;
-
-fn deferred_tree_marker(request: &SearchRequest) -> Result<Option<SearchResponse>, SearchError> {
-    if request.offset.unwrap_or(0) != 0 || request.limit == Some(0) { return Ok(None); }
-    let parsed = nanosiem_core::query::parse_query(&request.query).map_err(|_| SearchError::BadRequest("Invalid query".into()))?;
-    if !super::tree_page::supports_paged_tree(&parsed) { return Ok(None); }
-    let Some(tree) = nanosiem_core::search::query_processing::extract_tree_command(&parsed) else { return Ok(None); };
-    let mut response = SearchResponse::empty();
-    response.results = vec![serde_json::json!({"_display_type": "tree", "_tree_pending": true,
-        "_tree_query": request.query, "_tree_time_range": request.time_range, "_tree_run_id": uuid::Uuid::now_v7(),
-        "_tree_config": {"parent_field": tree.parent_field, "child_field": tree.child_field, "label_field": tree.label_field,
-            "detail_field": tree.detail_field, "prevalence_field": tree.prevalence_field, "root_filter": tree.root_filter},
-        "_tree_nodes": []})];
-    response.total_count_exact = false;
-    response.display_type = Some(nanosiem_core::search::DisplayType::Tree);
-    Ok(Some(response))
-}
+use crate::{SearchState, error::SearchError, metrics::record_search_query};
 
 /// Reserve `request_id` for the CREDENTIAL that is starting the query.
 ///
@@ -53,28 +32,22 @@ fn deferred_tree_marker(request: &SearchRequest) -> Result<Option<SearchResponse
 pub(crate) async fn reserve_query_owner(
     state: &SearchState,
     request_id: String,
-    auth: &crate::AuthContext,
-) -> Result<String, SearchError> {
+    principal_id: uuid::Uuid,
+) -> Result<(), SearchError> {
     let in_use = || SearchError::BadRequest("request_id is already in use".to_string());
-    let tenant = auth.tenant_scope;
-    let principal_id = auth.credential_principal_id();
-    let execution_id = tenant.execution_request_id(&request_id);
-    let search = state.search_for_auth(auth)?;
-    match state
-        .reserve_query_owner_for(tenant, &request_id, principal_id)
-        .await
-    {
+    match state.reserve_query_owner(&request_id, principal_id).await {
         // NAN-2100: the LOCAL reservation is authoritative on its own in a
         // single-instance deployment (no shared registry) and whenever the
         // shared one is degraded, so its conflict verdict must be honored in
         // both arms — not just Redis's. Reserving over another credential's
         // in-flight id would let that credential cancel this query.
         Ok(true) => {
-            if search
+            if state
+                .search
                 .query_tracker()
-                .reserve_request(execution_id.clone(), principal_id)
+                .reserve_request(request_id, principal_id)
             {
-                Ok(execution_id)
+                Ok(())
             } else {
                 Err(in_use())
             }
@@ -82,11 +55,12 @@ pub(crate) async fn reserve_query_owner(
         Ok(false) => Err(in_use()),
         Err(error) => {
             tracing::warn!(%error, %request_id, "Shared query ownership unavailable; using local ownership");
-            if search
+            if state
+                .search
                 .query_tracker()
-                .reserve_request(execution_id.clone(), principal_id)
+                .reserve_request(request_id, principal_id)
             {
-                Ok(execution_id)
+                Ok(())
             } else {
                 Err(in_use())
             }
@@ -127,258 +101,16 @@ pub(crate) fn effective_scope(auth: &crate::AuthContext) -> nanosiem_core::auth:
 ///
 /// POST /api/search
 ///
-/// If async_mode=true, returns a job_id immediately for polling.
-/// Otherwise, executes synchronously and returns results.
-/// NAN-3071: the interactive lane ran out of budget on a query the durable
-/// lane still refuses. Since NAN-3078 prevalence, lookup, inputlookup and
-/// identity stages run as durable post-processed jobs; what remains refused is
-/// `| ai`, a source-replacing inputlookup, and a candidate page over the
-/// 50,000-row post-processing envelope. Keep the real failure and say how to
-/// make the query fit.
-fn unescalatable_exhaustion(kind: &str) -> SearchError {
-    let cause = SearchError::ResourceExhausted(kind.to_string()).public_message();
-    SearchError::ResourceExhausted(format!(
-        "{cause}. The query has a Nano-side stage that cannot move to a background job (`| ai`, a source-replacing inputlookup, or more than 50,000 rows to post-process). Aggregate before that stage (for example `| stats ... by <field>` before `| ai`), narrow the time range, or lower the result limit."
-    ))
-}
-
-/// NAN-3883: the id of a queued or running durable job of this caller that is
-/// computing exactly `request` and that the caller may still read, after the
-/// caller's current authority is re-checked. `None` when there is none.
-/// NAN-4277: `point` decides whether a still-queued job is followed.
-#[allow(clippy::too_many_arguments)]
-async fn attachable_in_flight_job(
-    state: &SearchState,
-    auth: &crate::AuthContext,
-    search_service: &nanosiem_core::SearchService,
-    request: &SearchRequest,
-    user_id: uuid::Uuid,
-    scope: &nanosiem_core::auth::ScopeSet,
-    durable_authority: Option<&nanosiem_core::search::DurableSearchJobAuthority>,
-    point: AttachPoint,
-) -> Result<Option<String>, SearchError> {
-    let Some(job) = search_service.in_flight_durable_job_for_attach(request, user_id, scope, durable_authority, point).await else {
-        return Ok(None);
-    };
-    let visible = job.result_visible_under(scope.deny_set())
-        && super::search_jobs::require_job_retention_visible(auth, &job).is_ok()
-        && super::search_jobs::require_job_task_read_authority(auth, &job).is_ok();
-    if !visible {
-        return Ok(None);
-    }
-    require_current_shared_authority(state, auth).await?;
-    Ok(Some(job.id))
-}
-
-/// Request header by which a client states whether it follows an
-/// asynchronous answer (an `AsyncSearchResponse` whose job it polls).
+/// If async_mode=true, starts (or attaches to) a durable background job and
+/// returns its job_id immediately for polling.
 ///
-/// NAN-3474: the interactive wall cap applies to every caller unless it sends
-/// `0`. A caller without the header already had to accept a job id: a query
-/// that exhausts the lake's scan/memory budget is escalated for everyone. A
-/// cold 7d search ran ~57 s into the cell's 55 s statement deadline before
-/// that escalation, so atomic callers (k6, scripts, the API) got the edge's
-/// 502 at 60 s instead of the job id. `0` keeps the strictly synchronous
-/// contract (run to completion, however long) for in-cluster callers that
-/// have no proxy in front of them, and for the web's atomic `search()` whose
-/// callers render rows only. Deliberately separate from
-/// `x-nano-progressive-views`, which also changes the response shape of
-/// Lateral and tree queries.
-const ASYNC_CAPABLE_HEADER: &str = "x-nano-accept-async";
-
-/// NAN-3229: how long an interactive `/api/search` may hold its HTTP request
-/// before it is moved to a durable job (NAN-3474: measured from the start of
-/// the request, for every caller that did not opt out with
-/// `x-nano-accept-async: 0`).
-///
-/// A lean-cell query may take up to 130 s (`DEFAULT_LAKE_CELL_TIMEOUT_SECS`),
-/// but every proxy in front of search has a shorter idle limit: Cloudflare
-/// answers 524 at 100 s, nginx's default is 60 s, and forward proxies are
-/// commonly 60 s. A query that ran 60-130 s therefore reached the browser as
-/// a 502/504 while search was still working on it (NAN-3229: nginx 504 and a
-/// forward proxy's 502, both at 60 s; the web client itself aborts at 60 s).
-/// 45 s keeps a 15 s margin under all of them, so a slow query comes back as
-/// a job id the UI already polls. The admission
-/// estimate still escalates resource-bound queries immediately; this is the
-/// wall-clock backstop for a query the estimate admitted that is simply slow.
-const INTERACTIVE_ESCALATION_DEADLINE_SECS: u64 = 45;
-
-/// Operator override for [`INTERACTIVE_ESCALATION_DEADLINE_SECS`]; `0`
-/// disables deadline escalation.
-const INTERACTIVE_ESCALATION_DEADLINE_ENV: &str = "NANO_SEARCH_INTERACTIVE_ESCALATE_AFTER_SECS";
-
-fn parse_escalation_deadline(raw: Option<&str>) -> Option<std::time::Duration> {
-    let secs = match raw.map(str::trim) {
-        None | Some("") => INTERACTIVE_ESCALATION_DEADLINE_SECS,
-        Some(value) => match value.parse::<u64>() {
-            Ok(secs) => secs,
-            Err(_) => {
-                tracing::warn!(value, "{INTERACTIVE_ESCALATION_DEADLINE_ENV} is not an integer; using the default");
-                INTERACTIVE_ESCALATION_DEADLINE_SECS
-            }
-        },
-    };
-    (secs > 0).then(|| std::time::Duration::from_secs(secs))
-}
-
-fn configured_escalation_deadline() -> Option<std::time::Duration> {
-    static DEADLINE: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
-    *DEADLINE.get_or_init(|| {
-        parse_escalation_deadline(std::env::var(INTERACTIVE_ESCALATION_DEADLINE_ENV).ok().as_deref())
-    })
-}
-
-/// The deadline for this request, or `None` when it must run to completion
-/// in the request: a client that opted out (`x-nano-accept-async: 0`) cannot
-/// follow a job id, and a debug run's evidence must describe the execution.
-fn interactive_escalation_deadline(
-    headers: &axum::http::HeaderMap,
-    debug: bool,
-) -> Option<std::time::Duration> {
-    if debug || opted_out_of_async(headers) {
-        return None;
-    }
-    configured_escalation_deadline()
-}
-
-/// NAN-3474: only an explicit `0` opts out; absent or any other value means
-/// the caller takes a job id rather than an edge 502.
-fn opted_out_of_async(headers: &axum::http::HeaderMap) -> bool {
-    headers
-        .get(ASYNC_CAPABLE_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.trim() == "0")
-}
-
-/// NAN-4593: whether a resource-bound (shed) query may be answered with a
-/// durable job id. `x-nano-accept-async: 0` means the caller cannot follow a
-/// job, so `{job_id, status}` (no `results`) would read as "no matches"; it
-/// gets the explicit `RESOURCE_EXHAUSTED` refusal instead.
-fn shed_may_answer_with_job(headers: &axum::http::HeaderMap) -> bool {
-    !opted_out_of_async(headers)
-}
-
-/// NAN-3474: the part of `deadline` left after `elapsed` of request setup
-/// (auth, scope, cache lookup), so the cap is measured from when the proxy
-/// started waiting, never restarted at execution.
-fn remaining_deadline(deadline: std::time::Duration, elapsed: std::time::Duration) -> std::time::Duration {
-    deadline.saturating_sub(elapsed)
-}
-
-/// NAN-3229: the user-actionable refusal for a timeline past the deadline.
-fn histogram_deadline_error(deadline: std::time::Duration) -> SearchError {
-    SearchError::QueryError(format!(
-        "The timeline did not finish within {} s; narrow the time range to see it",
-        deadline.as_secs()
-    ))
-}
-
-enum DeadlineOutcome<T> {
-    Finished(T),
-    Escalated(String),
-}
-
-/// Run `execution`; if it has not finished by `deadline`, ask `escalate` to
-/// queue the same search as a durable job. `Ok(Some(job_id))` abandons the
-/// interactive execution (dropping it cancels its lake read, exactly as a
-/// client disconnect does); `Ok(None)` means the durable lane cannot take this
-/// query, so the interactive execution (paused, not restarted) is awaited to
-/// its own end.
-async fn finish_or_escalate<T, Exec, Escalate, EscalateFut>(
-    execution: Exec,
-    deadline: std::time::Duration,
-    escalate: Escalate,
-) -> Result<DeadlineOutcome<T>, SearchError>
-where
-    Exec: std::future::Future<Output = T>,
-    Escalate: FnOnce() -> EscalateFut,
-    EscalateFut: std::future::Future<Output = Result<Option<String>, SearchError>>,
-{
-    tokio::pin!(execution);
-    match tokio::time::timeout(deadline, &mut execution).await {
-        Ok(result) => Ok(DeadlineOutcome::Finished(result)),
-        Err(_) => match escalate().await? {
-            Some(job_id) => Ok(DeadlineOutcome::Escalated(job_id)),
-            None => Ok(DeadlineOutcome::Finished(execution.await)),
-        },
-    }
-}
-
-/// NAN-4163: the escalation marker of a bare `*` search routed up front.
-const BARE_STAR_ESCALATED_HEADER: (&str, &str) = ("x-nano-query-escalated", "bare-star-window");
-
-/// NAN-4163: whether this request is routed straight to a durable job, see
-/// [`nanosiem_core::search::lake_candidate_hints::bare_star_routes_to_background_job`].
-/// Only a lean cell with its durable job lane routes, and only the logs dataset.
-fn wants_bare_star_background_job(has_durable_lane: bool, request: &SearchRequest) -> bool {
-    has_durable_lane
-        && request.dataset.as_deref().unwrap_or("logs").eq_ignore_ascii_case("logs")
-        && nanosiem_core::search::lake_candidate_hints::bare_star_routes_to_background_job(
-            &request.query,
-            request.time_range.end - request.time_range.start,
-        )
-}
-
-/// NAN-4163: queue a bare `*` search over more than four hours as its durable
-/// job before any interactive work. `Ok(None)`: not routed (not bare, short
-/// window, no durable lane, or the durable lane cannot take this query), so
-/// the request runs interactively as before.
-#[allow(clippy::too_many_arguments)]
-async fn route_bare_star_to_background_job(
-    state: &SearchState,
-    auth: &crate::AuthContext,
-    search_service: &nanosiem_core::SearchService,
-    request: &SearchRequest,
-    user_id: uuid::Uuid,
-    priority: nanosiem_core::search::QueryPriority,
-    scope: &nanosiem_core::auth::ScopeSet,
-    durable_authority: Option<&nanosiem_core::search::DurableSearchJobAuthority>,
-) -> Result<Option<String>, SearchError> {
-    if !wants_bare_star_background_job(search_service.has_durable_view_lane(), request) {
-        return Ok(None);
-    }
-    match require_current_shared_authority(state, auth).await {
-        Ok(()) => {}
-        // A dependency blip must not refuse the search; run it interactively.
-        Err(SearchError::SearchAuthorityUnavailable) => return Ok(None),
-        Err(error) => return Err(error),
-    }
-    if let Some(job_id) = attachable_in_flight_job(state, auth, search_service, request, user_id, scope, durable_authority, AttachPoint::Submission).await? {
-        return Ok(Some(job_id));
-    }
-    let job_id = match search_service
-        .search_async_with_task(
-            request.clone(),
-            user_id,
-            priority,
-            scope,
-            durable_authority,
-            nanosiem_core::search::DurableLakeTask::SearchNplV1,
-        )
-        .await
-    {
-        Ok(job_id) => job_id,
-        Err(error) => {
-            tracing::info!(error = %error, "bare * search cannot move to a durable job; running it interactively");
-            return Ok(None);
-        }
-    };
-    if let Err(error) = require_current_shared_authority(state, auth).await {
-        // The runner revalidates this immutable stamp independently.
-        // An outage after submission is not evidence of revocation.
-        if !matches!(error, SearchError::SearchAuthorityUnavailable) {
-            if let Err(cancel_error) = search_service.cancel_job(&job_id).await {
-                tracing::warn!(job_id = %job_id, error = %cancel_error,
-                    "failed to cancel bare * background job after authority revocation");
-            }
-        }
-        return Err(error);
-    }
-    tracing::info!(job_id = %job_id, window_secs = (request.time_range.end - request.time_range.start).num_seconds(),
-        "routed bare * search over more than 4 h straight to a durable job");
-    Ok(Some(job_id))
-}
-
+/// Otherwise executes synchronously and returns results. A client that sends
+/// `x-nano-accept-async: 1` also accepts a hand-off: if the search is still
+/// running at the interactive budget (`SEARCH_INTERACTIVE_HANDOFF_SECS`,
+/// default 45 s) it is moved to a background job and the response is a job
+/// answer (`job_id`, `origin: "escalated"`, `x-nano-search-job` header) — never
+/// an empty result set. Clients that do not send the header never receive a
+/// job answer from this route.
 /// NAN-4664: the `/api/search` body, plus whether `use_cache` was sent at
 /// all (`SearchRequest::use_cache` reads an absent field as `false`, which
 /// the result cache must not treat as an explicit opt-out).
@@ -407,50 +139,101 @@ impl<S: Send + Sync> axum::extract::FromRequest<S> for SearchBody {
     }
 }
 
+/// NAN-4664: the server-resolved authority dimension beyond the deny sets
+/// that could shape a shared search's result: the admission priority (its
+/// ClickHouse budgets). Folded into the in-flight identity so a follower only
+/// ever receives a run computed under the same authority as its own.
+pub(crate) fn inflight_authority_fingerprint(priority: nanosiem_core::search::QueryPriority) -> Vec<u8> {
+    format!("pri={priority:?}").into_bytes()
+}
+
+/// NAN-3077: a terminal `| tree` asked for progressively answers this pending
+/// marker at once; the client paints a bounded preview and pages the exact
+/// tree from a background job through `/api/search/tree-page`.
+pub(crate) fn deferred_tree_marker(request: &SearchRequest) -> Result<Option<SearchResponse>, SearchError> {
+    if request.offset.unwrap_or(0) != 0 || request.limit == Some(0) {
+        return Ok(None);
+    }
+    let parsed = nanosiem_core::query::parse_query(&request.query)
+        .map_err(|_| SearchError::BadRequest("Invalid query".into()))?;
+    if !super::tree_page::supports_paged_tree(&parsed) {
+        return Ok(None);
+    }
+    let Some(tree) = nanosiem_core::search::query_processing::extract_tree_command(&parsed) else {
+        return Ok(None);
+    };
+    let mut response = SearchResponse::empty();
+    response.results = vec![serde_json::json!({"_display_type": "tree", "_tree_pending": true,
+        "_tree_query": request.query, "_tree_time_range": request.time_range, "_tree_run_id": uuid::Uuid::now_v7(),
+        "_tree_config": {"parent_field": tree.parent_field, "child_field": tree.child_field, "label_field": tree.label_field,
+            "detail_field": tree.detail_field, "prevalence_field": tree.prevalence_field, "root_filter": tree.root_filter},
+        "_tree_nodes": []})];
+    response.display_type = Some(nanosiem_core::search::DisplayType::Tree);
+    Ok(Some(response))
+}
+
+/// NAN-3077: whether a request asked for a progressive product view
+/// (`x-nano-progressive-views: 1`) of a terminal `| lateral` or `| tree`.
+pub(crate) fn wants_progressive_view(headers: &axum::http::HeaderMap, query: &str) -> bool {
+    headers
+        .get("x-nano-progressive-views")
+        .is_some_and(|value| value == "1")
+        && nanosiem_core::query::parse_query(query).ok().is_some_and(|query| {
+            nanosiem_core::search::query_processing::extract_lateral_command(&query).is_some()
+                && nanosiem_core::search::query_processing::extract_post_lateral_commands(&query).is_empty()
+                || matches!(
+                    query,
+                    nanosiem_core::query::Query::Piped {
+                        command: nanosiem_core::query::Command::Tree { .. },
+                        ..
+                    }
+                )
+        })
+}
+
+/// Response header naming how an `/api/search` answer was produced
+/// (NAN-4664): `leader` ran the search, `follower` received an identical
+/// in-flight run's result without running it.
+pub const INFLIGHT_HEADER: &str = "x-nano-inflight";
+
 #[utoipa::path(
     post,
     path = "/api/search",
     tag = "search",
     request_body = SearchRequest,
     params(
-        ("x-nano-progressive-views" = Option<String>, Header, description = "1 returns a minimal Lateral or native-tree dispatcher; use /api/search/stream for Lateral and /api/search/tree-page for tree roots/children"),
-        ("x-nano-accept-async" = Option<String>, Header, description = "A search still running 45 s after the request arrived (NANO_SEARCH_INTERACTIVE_ESCALATE_AFTER_SECS) is moved to a durable job (body {job_id, status}, header x-nano-query-escalated: deadline), so it never outlives the 60 s edge. On a lake cell a bare `*` search (no search term, source/class scope or entity term, after the where-hoist) over more than 4 h goes straight to that job with no interactive attempt, unless it only lists events (head, table, fields, rename, sort -time) or the 5-minute count rollups answer it without a scan (`* | stats count by metadata.log_source`) (header x-nano-query-escalated: bare-star-window). 0 opts out: the request runs to completion and never answers with a job id (a resource-bound query answers 422 RESOURCE_EXHAUSTED instead). Unless 0, a `use_cache: true` search of a settled absolute window (ending at least 5 min ago) that the caller already ran as a durable job, with the same deny set, authority and unchanged data, answers {job_id, status: completed} with x-nano-cache: hit and x-nano-cache-age; its rows are read through the job result pages."), // NAN-3809
-        ("x-nano-query-class" = Option<String>, Header, description = "`agent` marks an automated agent's search (pivt, the desktop agent, MCP/agent API callers). Agent-class searches share at most their tenant's and their cell's search slots less a reserved human share (a quarter, at least one), hold at most that share of the admission queue, and are served after every human search waiting in the tenant's queue; deadlines and result caps are unchanged. A key nano Desktop mints for its agents is always the agent class, whatever this header says. Anything else, or no header, is a human search."), // NAN-4703
-        ("x-nano-admission-wait-ms" = Option<u64>, Header, description = "How long this search may wait in the tenant's fair admission queue for a slot, in ms (default 60000, or the full queue timeout for x-nano-accept-async: 0; always capped at the configured search queue timeout, 300 s by default). Agents running many hunts at once set it so they slow down instead of failing; 0 fails fast. A 429 ADMISSION_DENIED with Retry-After: 2 comes only when this budget ends or the queue is full."), // NAN-4664
+        ("x-nano-accept-async" = Option<String>, Header, description = "Set to 1 to accept a background-job answer when the search outruns the interactive budget"),
+        ("x-nano-progressive-views" = Option<String>, Header, description = "1 returns a minimal Lateral or tree dispatcher for a terminal `| lateral` / `| tree`; use /api/search/stream for Lateral (view_update events after each hop) and /api/search/tree-page for tree roots/children"), // NAN-3077
+        ("x-nano-admission-wait-ms" = Option<u64>, Header, description = "How long this search may wait in the fair admission queue for a slot, in ms (default 60000, or the full queue timeout for x-nano-accept-async: 0; always capped at the configured search queue timeout, 300 s by default). Agents running many hunts at once set it so they slow down instead of failing; 0 fails fast. A 429 ADMISSION_DENIED with Retry-After: 2 comes only when this budget ends or the queue is full."), // NAN-4664
+        ("x-nano-query-class" = Option<String>, Header, description = "`agent` marks an automated agent's search (pivt, the desktop agent, MCP/agent API callers). Agent-class searches share at most the search slots less a reserved human share (a quarter, at least one), hold at most that share of the admission queue, and are served after every waiting human search; deadlines and result caps are unchanged. A key nano Desktop mints for its agents is always the agent class, whatever this header says. Anything else, or no header, is a human search."), // NAN-4703
     ),
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Search results (sync or async job id)", body = SearchResultResponse),
         (status = 400, description = "Invalid query", body = ErrorResponse),
-        (status = 422, description = "Too large to run interactively (COLD_SCAN_TOO_LARGE): one pass would stage more uncached data than the tenant reader's cold-read ceiling (derived from its cache size). Body carries needed_bytes and ceiling_bytes, plus background_ceiling_bytes when an async search could run it. A cold read under the ceiling is never refused: it queues for the reader's heavy cold-read slot and the stream reports progress events with phase cold_scan.", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 429, description = "Admission denied (the x-nano-admission-wait-ms budget ended or the admission queue is full), Retry-After: 2; ADMISSION_BACKEND_UNAVAILABLE also carries a retryable dependency marker", body = ErrorResponse),
+        (status = 429, description = "Admission denied (the x-nano-admission-wait-ms budget ended or the admission queue is full); carries Retry-After: 2", body = ErrorResponse),
         (status = 409, description = "Query was cancelled (request_id was killed via DELETE /api/search/{request_id} or an admin cancel)", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
-        (status = 503, description = "Search authority temporarily unavailable; retry after two seconds", body = ErrorResponse),
     )
 )]
 pub async fn search(
     State(state): State<SearchState>,
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
+    super::background_jobs::AcceptAsync(accept_async): super::background_jobs::AcceptAsync,
     request_headers: axum::http::HeaderMap,
     SearchBody { mut request, explicit_use_cache }: SearchBody,
 ) -> Result<(axum::http::HeaderMap, Json<SearchResultResponse>), SearchError> {
     use crate::cache::cache_status_headers;
-    use nanosiem_core::search::QueryPriority;
-    // NAN-3008: total server wall time, reported as `server_wall_ms`.
+    // Total analyst-visible server time, including admission and orchestration.
     let handler_started = Instant::now();
-    // NAN-3077: opt-in per-phase evidence. A debug run is always a real run
-    // (never a result-cache read), so its evidence describes the execution.
-    let debug = wants_search_debug(&request_headers, &auth);
-    let progressive_views = request_headers.get("x-nano-progressive-views").is_some_and(|value| value == "1")
-        && nanosiem_core::query::parse_query(&request.query).ok().is_some_and(|query|
-            nanosiem_core::search::query_processing::extract_lateral_command(&query).is_some()
-            && nanosiem_core::search::query_processing::extract_post_lateral_commands(&query).is_empty()
-            || matches!(query, nanosiem_core::query::Query::Piped { command: nanosiem_core::query::Command::Tree { .. }, .. }));
-    let bypass = bypass || debug || progressive_views;
+    // NAN-3077: a progressive product view never reads or writes the result
+    // cache (its first answer is a dispatcher, not the result).
+    let progressive_views = wants_progressive_view(&request_headers, &request.query);
+    let bypass = bypass || progressive_views;
+    use nanosiem_core::search::QueryPriority;
+    use nanosiem_core::search::background::JobOrigin;
 
     // NAN-2028: gate on search:execute (matching every sibling handler) before
     // any work — an under-scoped API key must not run piped searches.
@@ -461,100 +244,93 @@ pub async fn search(
     // key, and the service injects the exclusion into the executed SQL. This
     // replaces the old H1 `enforce_non_audit_query` rewrite of request.query.
     let scope = effective_scope(&auth);
-    // Resolving the tenant view touches no data. The shared nPL contract is
-    // checked against it so `| ai` is admitted only on a tenant-billed view.
-    let search_service = state.search_with_ai_for_auth(&auth)?;
-    // NAN-3018: a shared `dataset=risk` request binds its tenant's own decay /
-    // clear state onto a request-local view (lean-lake cell tenants only).
-    let search_service = state
-        .bind_shared_risk_dataset(&auth, request.dataset.as_deref(), search_service)
-        .await?;
-    // A shared risk result depends on the tenant's live clear state, so a
-    // cached copy would hide an analyst's clear. Such results are never read
-    // from or written to the result cache.
-    let risk_uncached = search_service.tenant_risk_dataset_bound();
-    let bypass = bypass || risk_uncached;
-    require_shared_npl_contract_for_view(
-        &auth,
-        &request.query,
-        request.dataset.as_deref(),
-        &search_service,
-    )?;
 
-    // NAN-3883: `DELETE /api/search/{request_id}` stops this request at any
-    // point, including one that arrived before it (a superseded UI run): that
-    // request is refused before it reserves its id.
-    let mut cancel_signal = match request.request_id.as_deref() {
-        Some(request_id) => Some(
-            search_service
-                .query_tracker()
-                .cancel_signal(&auth.tenant_scope.execution_request_id(request_id), auth.credential_principal_id())
-                .ok_or(SearchError::Cancelled)?,
-        ),
-        None => None,
-    };
-    if let Some(request_id) = request.request_id.clone() {
-        // NAN-2100: reserve under the CREDENTIAL (see `reserve_query_owner`).
-        request.request_id = Some(reserve_query_owner(&state, request_id, &auth).await?);
+    // NAN-4915: a hand-off must be able to KILL the interactive query it
+    // replaces, which needs a known query id. Assign one when the client did
+    // not (only for hand-off-eligible requests — other paths are unchanged).
+    // Only a FIRST page may be handed off: a job stores the whole result from
+    // row 0, so a later page (`offset > 0`) of an interactive result must stay
+    // interactive rather than become a job whose first page is the wrong rows.
+    let accept_async = accept_async && request.offset.unwrap_or(0) == 0;
+    if accept_async && !request.async_mode && request.request_id.is_none() {
+        request.request_id = Some(uuid::Uuid::now_v7().to_string());
+    }
+    // NAN-4915 (Codex P1-2): a hand-off must continue the SAME search. Freeze
+    // relative `earliest=`/`latest=` once, at arrival, and run the interactive
+    // attempt on the frozen request too — otherwise the job would re-resolve
+    // `-1h` against its own, later clock.
+    if accept_async && !request.async_mode {
+        request = nanosiem_core::search::background::freeze_time_window(&request, chrono::Utc::now())
+            .map_err(SearchError::from)?;
     }
 
+    if let Some(request_id) = request.request_id.clone() {
+        // NAN-2100: reserve under the CREDENTIAL (see `reserve_query_owner`).
+        reserve_query_owner(&state, request_id, auth.credential_principal_id()).await?;
+    }
+
+    // The job owner (durable jobs, settled reuse) stays the credential subject;
+    // admission counts against the owning user (NAN-4928 review P1).
     let user_id = auth.claims.sub;
-    let durable_authority = auth.durable_search_authority();
+    let admission_user = super::admission_user(&auth)?;
     let priority = match request.priority.as_deref() {
         Some("analytics") => QueryPriority::Analytics,
         _ => QueryPriority::Interactive,
     };
 
-    // Check for async mode — returns a job_id immediately for polling.
+    // Async mode — NAN-4915: a durable background job (PG lease + CH rows),
+    // attaching to the caller's identical live job if there is one. Returns
+    // the job id immediately for polling.
     if request.async_mode {
-        require_current_shared_authority(&state, &auth).await?;
-        let job_id = search_service
-            .search_async_with_admission(
-                request,
-                user_id,
-                priority,
-                &scope,
-                durable_authority.as_ref(),
-            )
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "Failed to start async search");
-                SearchError::from(e)
-            })?;
-
-        if let Err(error) = require_current_shared_authority(&state, &auth).await {
-            // The runner revalidates this immutable stamp independently.
-            // An outage after submission is not evidence of revocation.
-            if !matches!(error, SearchError::SearchAuthorityUnavailable) {
-                if let Err(cancel_error) = search_service.cancel_job(&job_id).await {
-                    tracing::warn!(
-                        job_id = %job_id,
-                        error = %cancel_error,
-                        "failed to cancel async search after authority revocation"
-                    );
-                }
-            }
-            return Err(error);
-        }
-
+        let outcome =
+            super::background_jobs::submit_job(&state, &auth, &request, &scope, JobOrigin::Submitted)
+                .await?;
         return Ok((
-            cache_status_headers(false, None),
+            super::background_jobs::job_headers(cache_status_headers(false, None), &outcome),
             Json(SearchResultResponse::Async(
-                nanosiem_core::search::AsyncSearchResponse {
-                    job_id,
-                    status: "queued".to_string(),
-                },
+                super::background_jobs::async_response(&outcome),
             )),
         ));
     }
 
-    // The native tree preview and exact job pages own the expensive work.
-    // Atomic clients and deployments without a hosted job lane retain the existing tree path.
-    if progressive_views && search_service.has_durable_view_lane() && request.dataset.as_deref().unwrap_or("logs") == "logs" {
+    // NAN-3077: the tree preview and the exact job pages own the expensive
+    // work; the progressive answer is a pending marker.
+    if progressive_views && request.dataset.as_deref().unwrap_or("logs") == "logs" {
         if let Some(mut response) = deferred_tree_marker(&request)? {
-            require_current_shared_authority(&state, &auth).await?;
             response.server_wall_ms = Some(handler_started.elapsed().as_millis() as u64);
-            return Ok((cache_status_headers(false, None), Json(SearchResultResponse::Sync(super::SearchPageResponse::new(response, &request)))));
+            response.queue_wait_ms = Some(0);
+            return Ok((cache_status_headers(false, None), Json(SearchResultResponse::Sync(response))));
+        }
+    }
+
+    // NAN-3809: a settled absolute window this caller already ran as a
+    // durable job (same attach identity: query, window, flags, owner and both
+    // halves of the effective scope) is re-served through that job's result
+    // pages instead of re-running the search. Only for callers that accept a
+    // job answer, and not for an explicit `use_cache: false` or a bypass.
+    // NAN-4928 review P2: a probe of a hidden source must reach the audited
+    // source gate, so it never takes the reuse or cache fast paths.
+    let probes_hidden_source = crate::inflight::names_denied_source(&request.query, scope.deny_set());
+    if accept_async && !probes_hidden_source && crate::cache::reads_result_cache(bypass, explicit_use_cache) {
+        let now = chrono::Utc::now();
+        if let Some(job) = state
+            .background_jobs
+            .settled_reuse(&request, user_id, &scope, now)
+            .await
+            .map_err(SearchError::from)?
+        {
+            record_search_query("piped_settled_reuse", 0.0, true);
+            let age = job
+                .finished_at
+                .map(|finished| (now - finished).num_seconds().max(0) as u64);
+            let outcome = nanosiem_core::search::background::SubmitOutcome { job, attached: true };
+            tracing::info!(job_id = %outcome.job.public_id(), "Settled search re-served from a finished background job");
+            return Ok((
+                super::background_jobs::job_headers(cache_status_headers(true, age), &outcome),
+                Json(SearchResultResponse::Async(
+                    super::background_jobs::async_response(&outcome),
+                )),
+            ));
         }
     }
 
@@ -562,113 +338,22 @@ pub async fn search(
     // bypass; stamp x-nano-cache hit/age so the UI can show the cached notice.
     // NAN-1799: the effective deny-set is folded into the cache key (computed
     // above, BEFORE this lookup) so differently-scoped users never share an
-    // entry.
-    // NAN-2361 wave 6: a shared tenant's cache identity carries the serving
-    // generation (erasure / retention swaps invalidate at once); dedicated
-    // deployments have none. Resolved once per request, before the lookup.
-    // NAN-4664: also the in-flight sharing identity, so resolved for every
-    // shared request (not only with a result cache).
-    let serving_generation = if crate::is_shared_scope(auth.tenant_scope) {
-        search_service.serving_generation_key().await
-    } else {
-        None
-    };
-    // NAN-4664: `use_cache` is tri-state; an explicit `false` skips this read.
-    if crate::cache::reads_result_cache(bypass, explicit_use_cache) {
+    // entry. NAN-4664: `use_cache` is tri-state; an explicit `false` skips
+    // this read (a fresh run that still writes and still shares).
+    if !probes_hidden_source && crate::cache::reads_result_cache(bypass, explicit_use_cache) {
         if let Some(ref cache) = state.result_cache {
-            if let Some(mut cached) = cache
-                .get_for(auth.tenant_scope, &request, &scope, serving_generation.as_ref())
-                .await
-            {
-                let age = cache
-                    .age_secs(&crate::cache::SearchResultCache::cache_key_for(
-                        auth.tenant_scope,
-                        &request,
-                        &scope,
-                        serving_generation.as_ref(),
-                    ))
-                    .await;
-                require_current_shared_authority(&state, &auth).await?;
+            if let Some(mut cached) = cache.get(&request, &scope).await {
                 record_search_query("piped_cached", 0.0, true);
+                let age = cache
+                    .age_secs(&crate::cache::SearchResultCache::cache_key(&request, &scope))
+                    .await;
                 cached.server_wall_ms = Some(handler_started.elapsed().as_millis() as u64);
+                cached.queue_wait_ms = Some(0);
                 return Ok((
                     cache_status_headers(true, age),
-                    Json(SearchResultResponse::Sync(super::SearchPageResponse::new(cached, &request))),
+                    Json(SearchResultResponse::Sync(cached)),
                 ));
             }
-        }
-    }
-
-    // NAN-3809: an identical settled search this caller already ran as a
-    // durable job is re-served through that job's result pages (the client
-    // follows the job id exactly as after a deadline escalation). Only a
-    // cache-reading load (a pasted or shared URL; a user run and the refresh
-    // badge send `use_cache: false`) of a caller that accepts a job id.
-    if !bypass && request.use_cache && !opted_out_of_async(&request_headers) {
-        if let Some(job) = search_service
-            .settled_durable_job_for_reuse(&request, user_id, &scope, durable_authority.as_ref())
-            .await
-        {
-            let visible = job.result_visible_under(scope.deny_set())
-                && super::search_jobs::require_job_retention_visible(&auth, &job).is_ok()
-                && super::search_jobs::require_job_task_read_authority(&auth, &job).is_ok();
-            if visible {
-                // Every hit re-checks the caller's CURRENT authority.
-                require_current_shared_authority(&state, &auth).await?;
-                record_search_query("piped_settled_job", 0.0, true);
-                let age = job
-                    .completed_at
-                    .map(|at| (chrono::Utc::now() - at).num_seconds().max(0) as u64);
-                return Ok((
-                    cache_status_headers(true, age),
-                    Json(SearchResultResponse::Async(
-                        nanosiem_core::search::AsyncSearchResponse {
-                            job_id: job.id,
-                            status: "completed".to_string(),
-                        },
-                    )),
-                ));
-            }
-        }
-    }
-
-    // NAN-3883: the same search is already running as this caller's durable
-    // job (a reload, a reopened tab or history entry, or a re-click of an
-    // absolute range while it escalated): follow that job instead of starting
-    // the same long scan a second time. NAN-4277: only a job a runner has
-    // claimed; a still-queued twin gets an interactive attempt first (its
-    // deadline escalation, or the bare `*` route below, still follows it).
-    if !bypass && !opted_out_of_async(&request_headers) {
-        if let Some(job_id) = attachable_in_flight_job(&state, &auth, &search_service, &request, user_id, &scope, durable_authority.as_ref(), AttachPoint::NewRequest).await? {
-            record_search_query("piped_attached_job", 0.0, true);
-            return Ok((
-                cache_status_headers(false, None),
-                Json(SearchResultResponse::Async(nanosiem_core::search::AsyncSearchResponse {
-                    job_id,
-                    status: "running".to_string(),
-                })),
-            ));
-        }
-    }
-
-    // NAN-4163 (Dan's rule): on a lean cell a bare `*` search over more than
-    // four hours goes straight to the durable background job, with no
-    // interactive attempt (a pure listing, `* | head N`, stays interactive:
-    // the newest-first paged head path serves it). It answers exactly like a deadline escalation, so
-    // the client follows the job it already knows how to poll. A query the
-    // durable lane cannot take still runs interactively: never refused here.
-    if !debug && !opted_out_of_async(&request_headers) {
-        if let Some(job_id) = route_bare_star_to_background_job(&state, &auth, &search_service, &request, user_id, priority, &scope, durable_authority.as_ref()).await? {
-            record_search_query("piped_escalated", 0.0, true);
-            let mut headers = cache_status_headers(false, None);
-            headers.insert(BARE_STAR_ESCALATED_HEADER.0, axum::http::HeaderValue::from_static(BARE_STAR_ESCALATED_HEADER.1));
-            return Ok((
-                headers,
-                Json(SearchResultResponse::Async(nanosiem_core::search::AsyncSearchResponse {
-                    job_id,
-                    status: "queued".to_string(),
-                })),
-            ));
         }
     }
 
@@ -680,369 +365,117 @@ pub async fn search(
     // NAN-4664: identical searches already running share one run (the
     // leader holds the admission slot; followers take none). Fresh, not
     // cached, so it applies to `use_cache: false` and bypass refreshes too.
-    let share_key = crate::inflight::share_eligible(
-        &request.query,
-        scope.deny_set(),
-        crate::is_shared_scope(auth.tenant_scope),
-        serving_generation.is_some(),
-        debug,
-        progressive_views,
-        risk_uncached,
-    )
+    // The identity folds the caller's effective deny sets, so a caller never
+    // follows a run computed under a wider (or different) scope.
+    let share_key = (!progressive_views
+        && crate::inflight::share_eligible(&request.query, scope.deny_set()))
     .then(|| {
         crate::cache::SearchResultCache::inflight_key_for(
-            auth.tenant_scope,
             &request,
             &scope,
-            serving_generation.as_ref(),
-            &inflight_authority_fingerprint(&auth, priority),
+            &inflight_authority_fingerprint(priority),
         )
     });
     // Set when this request followed another's run (an atomic: the handler
     // future must stay Send).
     let followed = std::sync::atomic::AtomicBool::new(false);
     let run_search = || {
-        nanosiem_core::search::streaming::DEFER_LATERAL_VIEW.scope(progressive_views,
-            search_service.search_with_admission(request.clone(), user_id, priority, &scope))
+        nanosiem_core::search::streaming::DEFER_LATERAL_VIEW.scope(
+            progressive_views,
+            state
+                .search
+                .search_with_admission(request.clone(), admission_user, priority, &scope),
+        )
     };
-    let execution = async {
+    let interactive = async {
         match share_key.as_deref() {
             Some(key) => {
                 let (result, role) = crate::inflight::searches()
                     .run(key, run_search, crate::inflight::query_determined_failure)
                     .await;
-                followed.store(role == crate::inflight::Role::Follower, std::sync::atomic::Ordering::Relaxed);
+                followed.store(
+                    role == crate::inflight::Role::Follower,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 result
             }
             None => run_search().await,
         }
     };
-    // NAN-3883: a cancel drops the execution (and with it the lake read).
-    let execution = async {
-        match cancel_signal.as_mut() {
-            Some(signal) => tokio::select! {
-                result = execution => result,
-                () = signal.cancelled() => Err(nanosiem_core::SearchError::Cancelled),
-            },
-            None => execution.await,
-        }
-    };
-    let (result, debug_evidence) = if debug {
-        let (result, evidence) = nanosiem_core::search::lake_debug::collect(execution).await;
-        (result, Some(evidence))
-    } else if let Some(cap) = interactive_escalation_deadline(&request_headers, debug) {
-        let deadline = remaining_deadline(cap, handler_started.elapsed());
-        // NAN-3229: never hold a browser's request past the proxies in front
-        // of search; a slow query becomes the job the UI already polls.
-        let escalate = || async {
-            match require_current_shared_authority(&state, &auth).await {
-                Ok(()) => {}
-                // A dependency blip must not end a query that is still running.
-                Err(SearchError::SearchAuthorityUnavailable) => return Ok(None),
-                Err(error) => return Err(error),
-            }
-            // NAN-3883: an identical request (a double-fired run) that
-            // escalated first already owns the durable job; share it.
-            if let Some(job_id) = attachable_in_flight_job(&state, &auth, &search_service, &request, user_id, &scope, durable_authority.as_ref(), AttachPoint::Submission).await? {
-                return Ok(Some(job_id));
-            }
-            let job_id = match search_service
-                .search_async_with_task(
-                    request.clone(),
-                    user_id,
-                    priority,
-                    &scope,
-                    durable_authority.as_ref(),
-                    nanosiem_core::search::DurableLakeTask::SearchNplV1,
-                )
-                .await
-            {
-                Ok(job_id) => job_id,
-                Err(error) => {
-                    tracing::info!(error = %error, deadline_secs = cap.as_secs(),
-                        "slow interactive query cannot move to a durable job; keeping the interactive request");
-                    return Ok(None);
-                }
-            };
-            if let Err(error) = require_current_shared_authority(&state, &auth).await {
-                // The runner revalidates this immutable stamp independently.
-                // An outage after submission is not evidence of revocation.
-                if !matches!(error, SearchError::SearchAuthorityUnavailable) {
-                    if let Err(cancel_error) = search_service.cancel_job(&job_id).await {
-                        tracing::warn!(job_id = %job_id, error = %cancel_error,
-                            "failed to cancel deadline-escalated search after authority revocation");
+    let result = if accept_async {
+        // NAN-4915 hand-off: the interactive budget bounds how long this
+        // request may hold an interactive admission slot. Past it, the query is
+        // KILLed (its permit is released when the future drops) and the search
+        // continues as a durable background job on the background permit pool.
+        let handoff = state.background_jobs.config().interactive_handoff;
+        match tokio::time::timeout(handoff, interactive).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                if let Some(request_id) = request.request_id.as_deref() {
+                    if let Err(e) = state.search.cancel_query(request_id).await {
+                        tracing::warn!(error = %e, %request_id, "Could not KILL the interactive query being handed off");
                     }
                 }
-                return Err(error);
-            }
-            Ok(Some(job_id))
-        };
-        match finish_or_escalate(execution, deadline, escalate).await? {
-            DeadlineOutcome::Finished(result) => (result, None),
-            DeadlineOutcome::Escalated(job_id) => {
-                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-                tracing::info!(job_id = %job_id, duration_ms, deadline_secs = cap.as_secs(),
-                    "escalated slow interactive query to a durable job at the request deadline");
-                record_search_query("piped_escalated", duration_ms, true);
-                let mut headers = cache_status_headers(false, None);
-                headers.insert(
-                    "x-nano-query-escalated",
-                    axum::http::HeaderValue::from_static("deadline"),
+                let outcome = super::background_jobs::submit_job(
+                    &state,
+                    &auth,
+                    &request,
+                    &scope,
+                    JobOrigin::Escalated,
+                )
+                .await?;
+                record_search_query("piped_escalated", start.elapsed().as_secs_f64() * 1000.0, true);
+                tracing::info!(
+                    job_id = %outcome.job.public_id(),
+                    attached = outcome.attached,
+                    handoff_secs = handoff.as_secs(),
+                    "Interactive search handed off to a background job"
                 );
                 return Ok((
-                    headers,
+                    super::background_jobs::job_headers(cache_status_headers(false, None), &outcome),
                     Json(SearchResultResponse::Async(
-                        nanosiem_core::search::AsyncSearchResponse {
-                            job_id,
-                            status: "queued".to_string(),
-                        },
+                        super::background_jobs::async_response(&outcome),
                     )),
                 ));
             }
         }
     } else {
-        (execution.await, None)
+        interactive.await
     };
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    if let Err(nanosiem_core::SearchError::ResourceExhausted(kind)) = &result {
-        // NAN-4593: a caller that opted out (`x-nano-accept-async: 0`) reads
-        // `results` only; a job id would reach it as a silent empty answer.
-        // It gets the explicit budget refusal, and no job is queued for it.
-        if !shed_may_answer_with_job(&request_headers) {
-            record_search_query("piped", duration_ms, false);
-            return Err(SearchError::ResourceExhausted(kind.clone()));
-        }
-        // Revalidate before stamping durable work after a long interactive
-        // attempt. A dependency outage must not create then cancel a job.
-        require_current_shared_authority(&state, &auth).await?;
-        // NAN-4277: a new request no longer follows a still-queued twin up
-        // front, so the shed path follows it here instead of queueing a copy.
-        let attached = if opted_out_of_async(&request_headers) {
-            None
-        } else {
-            attachable_in_flight_job(&state, &auth, &search_service, &request, user_id, &scope, durable_authority.as_ref(), AttachPoint::Submission).await?
-        };
-        let job_id = match attached {
-            Some(job_id) => Ok(job_id),
-            None => search_service
-            .search_async_with_task(
-                request.clone(),
-                user_id,
-                priority,
-                &scope,
-                durable_authority.as_ref(),
-                nanosiem_core::search::DurableLakeTask::shed_from_resource_error(kind),
-            )
-            .await,
-        };
-        let job_id = match job_id {
-            Ok(job_id) => job_id,
-            // No durable lane for this tenant (e.g. a lean tenant without its
-            // job runner yet): answer with the budget refusal itself, not an
-            // opaque dependency outage.
-            Err(nanosiem_core::SearchError::ServiceUnavailable(detail)) => {
-                tracing::warn!(error = %detail, exhausted_budget = %kind,
-                    "resource-bound query has no durable lane; returning the budget refusal");
-                return Err(SearchError::ResourceExhausted(kind.clone()));
-            }
-            // NAN-3071: the durable lane still refuses `| ai`, a
-            // source-replacing inputlookup and oversized post-processing pages
-            // (NAN-3078 runs every other Nano-side stage durably). Answer with
-            // the interactive lane's real failure and how to fix the query,
-            // not the refusal text.
-            Err(error) if nanosiem_core::search::service::is_durable_lane_post_processing_refusal(&error) => {
-                tracing::info!(exhausted_budget = %kind,
-                    "resource-bound query has Nano-side stages the durable lane cannot run; returning the budget refusal");
-                return Err(unescalatable_exhaustion(kind));
-            }
-            Err(error) => {
-                tracing::error!(error = %error, "failed to escalate resource-bound query");
-                return Err(SearchError::from(error));
-            }
-        };
-        if let Err(error) = require_current_shared_authority(&state, &auth).await {
-            // The runner revalidates this immutable stamp independently.
-            // An outage after submission is not evidence of revocation.
-            if !matches!(error, SearchError::SearchAuthorityUnavailable) {
-                if let Err(cancel_error) = search_service.cancel_job(&job_id).await {
-                    tracing::warn!(
-                        job_id = %job_id,
-                        error = %cancel_error,
-                        "failed to cancel escalated search after authority revocation"
-                    );
-                }
-            }
-            return Err(error);
-        }
-        tracing::info!(
-            job_id = %job_id,
-            exhausted_budget = %kind,
-            duration_ms,
-            "automatically escalated interactive query to durable lake job"
-        );
-        record_search_query("piped_escalated", duration_ms, true);
-        let mut headers = cache_status_headers(false, None);
-        headers.insert(
-            "x-nano-query-escalated",
-            axum::http::HeaderValue::from_static("durable-job"),
-        );
-        return Ok((
-            headers,
-            Json(SearchResultResponse::Async(
-                nanosiem_core::search::AsyncSearchResponse {
-                    job_id,
-                    status: "queued".to_string(),
-                },
-            )),
-        ));
-    }
-
     record_search_query("piped", duration_ms, result.is_ok());
 
-    if result.is_ok() {
-        require_current_shared_authority(&state, &auth).await?;
-    }
-
     // Cache successful results in the background, keyed under the scope the
-    // query executed with. NAN-3406: never a run under per-request perf
-    // overrides (the key is computed inside the spawned write, outside this
-    // request's override scope, so it would land under the ordinary key).
-    let perf_overrides = nanosiem_core::search::lake_debug::perf_overrides().is_some();
-    // NAN-4664: a follower's result is the leader's, which the leader writes.
+    // query executed with. NAN-4664: a follower's result is the leader's,
+    // which the leader writes.
     let follower = followed.load(std::sync::atomic::Ordering::Relaxed);
-    if let (Ok(response), false) = (&result, risk_uncached || progressive_views || perf_overrides || follower) {
+    if let (Ok(response), false) = (&result, follower || progressive_views) {
         if let Some(ref cache) = state.result_cache {
             let cache = cache.clone();
             let req = request.clone();
             let scope_for_cache = scope.clone();
             let resp = response.clone();
-            let tenant = auth.tenant_scope;
-            let generation = serving_generation.clone();
             tokio::spawn(async move {
-                cache
-                    .set_for(tenant, &req, &resp, &scope_for_cache, generation.as_ref())
-                    .await;
+                cache.set(&req, &resp, &scope_for_cache).await;
             });
         }
     }
 
-    let mut response = result?;
-    response.server_wall_ms = Some(handler_started.elapsed().as_millis() as u64);
-    let headers = cache_status_headers(nanosiem_core::request_timing::lake_result_cache_hit(), None);
-    if let Some(mut evidence) = debug_evidence {
-        evidence["service_ms"] = serde_json::json!(duration_ms);
-        evidence["handler_ms"] = serde_json::json!(handler_started.elapsed().as_secs_f64() * 1000.0);
-        return Ok((
-            headers,
-            Json(SearchResultResponse::SyncWithDebug(super::SearchResponseWithDebug {
-                response: super::SearchPageResponse::new(response, &request),
-                debug: evidence,
-            })),
-        ));
-    }
-    Ok((headers, Json(SearchResultResponse::Sync(super::SearchPageResponse::new(response, &request)))))
-}
-
-/// NAN-4664: every server-resolved authority dimension beyond the tenant,
-/// serving generation and deny sets that could shape a shared search's
-/// result: the shared plan/entitlement revisions, the prevalence component,
-/// the tenant's query-retention policy and the admission priority (its
-/// ClickHouse budgets). Folded into the in-flight identity so a follower only
-/// ever receives a run computed under the same authority as its own.
-pub(crate) fn inflight_authority_fingerprint(
-    auth: &crate::AuthContext,
-    priority: nanosiem_core::search::QueryPriority,
-) -> Vec<u8> {
-    let retention = auth.shared_request_authority.as_ref().map(|authority| {
-        let r = &authority.retention;
-        (
-            authority.entitlement_assignment_revision,
-            r.assignment_revision,
-            r.retention_revision,
-            r.retention_entitlement_revision,
-            r.retention_option_revision,
-            r.retention_days,
-            r.irreversible_event_time_floor.timestamp_micros(),
-        )
-    });
-    format!(
-        "ent={:?};prev={};ret={:?};pri={:?}",
-        auth.shared_search_entitlement_revision, auth.shared_prevalence_entitled, retention, priority,
-    )
-    .into_bytes()
-}
-
-/// Header that asks `/api/search` for per-phase lake evidence (NAN-3077).
-pub(crate) const SEARCH_DEBUG_HEADER: &str = "x-nano-search-debug";
-
-/// Response header carrying the route-wide evidence (every search route).
-pub(crate) const SEARCH_DEBUG_EVIDENCE_HEADER: &str = "x-nano-search-debug-evidence";
-
-/// NAN-3077: route-wide opt-in evidence. For a caller allowed debug evidence
-/// (see [`wants_search_debug`]) every lake call a request makes (asset
-/// dossier/events/artifacts, event detail, identity, field values, ...) is
-/// recorded and returned, compact, in [`SEARCH_DEBUG_EVIDENCE_HEADER`]
-/// (`/api/search` also keeps its body `debug` document). Runs after auth.
-///
-/// NAN-3406: the same request may carry
-/// [`nanosiem_core::search::lake_debug::PERF_OVERRIDES_HEADER`] (per-request
-/// A/B values of query[T]'s speed switches). It is honoured only here, for a
-/// caller [`wants_search_debug`] already admits; anyone else's is ignored
-/// silently (it is never read, and lake calls are built from scratch, so it
-/// is never forwarded). An honoured override also bypasses this service's
-/// result caches, so a cached answer of one mode never stands in for the
-/// other.
-pub(crate) async fn lake_debug_middleware(
-    mut request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let wants = request
-        .extensions()
-        .get::<crate::AuthContext>()
-        .is_some_and(|auth| wants_search_debug(request.headers(), auth));
-    if !wants {
-        return next.run(request).await;
-    }
-    let perf_overrides = authorized_perf_overrides(request.headers());
-    if perf_overrides.is_some() {
-        request.headers_mut().insert(
-            axum::http::HeaderName::from_static(crate::cache::HEADER_CACHE_BYPASS),
-            axum::http::HeaderValue::from_static("1"),
+    let mut headers = cache_status_headers(false, None);
+    if share_key.is_some() {
+        headers.insert(
+            INFLIGHT_HEADER,
+            axum::http::HeaderValue::from_static(if follower { "follower" } else { "leader" }),
         );
     }
-    let started = Instant::now();
-    let (mut response, mut evidence) =
-        nanosiem_core::search::lake_debug::collect_with_perf_overrides(perf_overrides, next.run(request)).await;
-    evidence["handler_ms"] = serde_json::json!(started.elapsed().as_secs_f64() * 1000.0);
-    let text = nanosiem_core::search::lake_debug::header_value(evidence, 16 * 1024);
-    if let Ok(value) = axum::http::HeaderValue::from_str(&text) {
-        response
-            .headers_mut()
-            .insert(axum::http::HeaderName::from_static(SEARCH_DEBUG_EVIDENCE_HEADER), value);
+    let mut response = result?;
+    response.server_wall_ms = Some(handler_started.elapsed().as_millis() as u64);
+    if follower {
+        // A follower waits on the in-flight leader, not the admission queue.
+        response.queue_wait_ms = Some(0);
     }
-    response
-}
-
-/// NAN-3406: the canonical per-request switch overrides of a request whose
-/// caller [`wants_search_debug`] already admitted (call it only then).
-fn authorized_perf_overrides(headers: &axum::http::HeaderMap) -> Option<String> {
-    headers
-        .get(nanosiem_core::search::lake_debug::PERF_OVERRIDES_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(nanosiem_core::search::lake_debug::canonical_perf_overrides)
-}
-
-/// Debug evidence is returned only when asked for AND the caller may already
-/// see generated SQL (`search:sql`): the evidence is counts and timings, but
-/// it describes the tenant's storage layout, so it stays with the privileged
-/// role. Anyone else gets the ordinary response, never an error.
-pub(crate) fn wants_search_debug(headers: &axum::http::HeaderMap, auth: &crate::AuthContext) -> bool {
-    headers
-        .get(SEARCH_DEBUG_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.trim() == "1")
-        && auth.claims.has_permission(permissions::SEARCH_SQL)
+    Ok((headers, Json(SearchResultResponse::Sync(response))))
 }
 
 /// Response for cancel_search endpoint
@@ -1065,7 +498,6 @@ pub struct CancelSearchResponse {
     ),
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Cancellation result", body = CancelSearchResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -1084,7 +516,6 @@ pub async fn cancel_search(
     require_search_execute(&auth)?;
 
     tracing::info!("Received cancel request for request_id: {}", request_id);
-    let search_service = state.search_for_auth(&auth)?;
 
     let can_admin_cancel = auth.claims.has_permission(permissions::SETTINGS_SYSTEM);
     if !can_admin_cancel {
@@ -1097,18 +528,15 @@ pub async fn cancel_search(
         // principal — the authorization subject is the user, and per-session
         // isolation is not part of this boundary.
         let principal = auth.credential_principal_id();
-        let execution_id = auth.tenant_scope.execution_request_id(&request_id);
-        let local_owner = search_service
+        let local_owner = state
+            .search
             .query_tracker()
-            .get(&execution_id)
+            .get(&request_id)
             .and_then(|info| info.owner_principal_id);
         let owner = if local_owner.is_some() {
             local_owner
         } else {
-            match state
-                .shared_query_owner_for(auth.tenant_scope, &request_id)
-                .await
-            {
+            match state.shared_query_owner(&request_id).await {
                 Ok(owner) => owner,
                 // Fail closed: an unavailable ownership registry is not
                 // permission to cancel. `None` never matches a principal.
@@ -1118,49 +546,15 @@ pub async fn cancel_search(
                 }
             }
         };
-        if owner.is_none() {
-            // NAN-3883: nobody runs this id yet. The UI cancels a superseded
-            // run as it starts the next one, often before that run's POST is
-            // admitted; remember the cancel (for this principal only) so the
-            // request is refused when it arrives instead of running beside
-            // the current search.
-            search_service
-                .query_tracker()
-                .request_cancel(&auth.tenant_scope.execution_request_id(&request_id), principal);
-            return Ok(Json(CancelSearchResponse { cancelled: false }));
-        }
         if owner != Some(principal) {
             return Ok(Json(CancelSearchResponse { cancelled: false }));
         }
     }
 
-    let execution_id = auth.tenant_scope.execution_request_id(&request_id);
-    // Membership and feature authority may have been revoked while the owner
-    // lookup above awaited the shared registry. Revalidate at the destructive
-    // boundary so a stale request cannot kill work after that revocation.
-    require_current_shared_authority(&state, &auth).await?;
-    let cancelled = search_service
-        .cancel_query(&execution_id)
-        .await
-        .map_err(|e| {
-            // Keep the request-scoped log line: the helper logs the error without
-            // the request_id an operator needs to correlate the failed kill.
-            tracing::error!(error = %e, request_id = %request_id, "Failed to cancel query");
-            // This error is a FAILED cancel (the lake worker was unreachable, so the
-            // kill never landed), not "the query was cancelled" — `cancel_query`
-            // never yields `Cancelled`, so the deliberate 409/QUERY_CANCELLED
-            // contract is untouched. What it does yield is `ServiceUnavailable` from
-            // the lake worker transport, and answering 400 there tells the caller
-            // their DELETE was malformed instead of "retry".
-            crate::error::mask_query_failure(e, "Failed to cancel query")
-        })?;
-
-    // NAN-3883: a request still in admission, planning or the cache lookup
-    // has no engine query to kill yet; its handler stops on this signal.
-    let signalled = search_service
-        .query_tracker()
-        .request_cancel(&execution_id, auth.credential_principal_id());
-    let cancelled = cancelled || signalled;
+    let cancelled = state.search.cancel_query(&request_id).await.map_err(|e| {
+        tracing::error!(error = %e, request_id = %request_id, "Failed to cancel query");
+        SearchError::QueryError("Failed to cancel query".to_string())
+    })?;
 
     if cancelled {
         tracing::info!("Successfully cancelled query: {}", request_id);
@@ -1182,7 +576,6 @@ pub async fn cancel_search(
         (status = 200, description = "SQL search results", body = SearchResponse),
         (status = 400, description = "Invalid SQL or query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Endpoint unavailable for hosted tenants (route_not_available)"),
         (status = 500, description = "Internal server error", body = ErrorResponse),
     )
 )]
@@ -1197,7 +590,6 @@ pub async fn search_sql(
             "Raw SQL queries require the search:sql permission".to_string(),
         ));
     }
-    reject_shared_raw_sql(&auth)?;
 
     // NAN-2001: the audit-view gate now lives in ClickHouse. Derive the raw-SQL
     // identity EXPLICITLY from audit:view (fail-closed default `Hidden` →
@@ -1216,8 +608,8 @@ pub async fn search_sql(
     // when the caller has ANY restricted source. Pass the SOURCE deny-set only —
     // audit is handled by the RawSqlAuditAccess identity, NOT folded into scope.
     let start = Instant::now();
-    let search_service = state.search_for_auth(&auth)?;
-    let result = search_service
+    let result = state
+        .search
         .search_sql(request, &auth.denied_sources, audit_access)
         .await;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1239,7 +631,7 @@ pub struct ExplainRequest {
     pub table_view: bool,
     /// Per-query dataset (`logs`/`spans`/`metrics`/`risk`) so the explained SQL
     /// matches the executed source — without it, Inspect SQL shows `FROM logs`
-    /// for a spans/metrics/risk query.
+    /// for a spans/metrics/risk query (NAN-1569, NAN-1798).
     #[serde(default)]
     pub dataset: Option<String>,
 }
@@ -1261,7 +653,6 @@ pub struct ExplainResponse {
     request_body = ExplainRequest,
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Generated SQL for the query", body = ExplainResponse),
         (status = 400, description = "Invalid query", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -1275,13 +666,12 @@ pub async fn explain(
     // NAN-2028: explain() returns the generated ClickHouse SQL, so it takes the
     // same search:execute gate as search().
     require_search_execute(&auth)?;
-    require_shared_npl_contract(&auth, &request.query, request.dataset.as_deref())?;
     // NAN-1799: pass the composed scope so "Inspect SQL" renders the exact
     // gated SQL the executed path runs for this caller.
     let scope = effective_scope(&auth);
-    let search_service = state.search_for_auth(&auth)?;
     let start = Instant::now();
-    let result = search_service
+    let result = state
+        .search
         .explain(
             &request.query,
             &request.time_range,
@@ -1319,17 +709,14 @@ pub async fn explain(
             return e.into();
         }
         if let nanosiem_core::SearchError::SqlGenError(ref msg) = e {
-            if msg.starts_with("Invalid query:") || msg.starts_with("Unsupported operation:") {
+            if msg.starts_with("Invalid query:")
+                || msg.starts_with("Unsupported operation:")
+            {
                 return SearchError::QueryError(msg.clone());
             }
         }
-        // explain resolves the lake worker client and round-trips it for lake
-        // datasets, so ServiceUnavailable is reachable here — masking it as 400
-        // would tell someone iterating in Inspect SQL that their query is
-        // broken while the backend is simply down.
-        crate::error::mask_query_failure(e, "Query processing failed")
+        SearchError::QueryError("Query processing failed".to_string())
     })?;
-    require_current_shared_authority(&state, &auth).await?;
     Ok(Json(ExplainResponse {
         sql,
         table_view: request.table_view,
@@ -1343,7 +730,7 @@ pub struct FetchLogRequest {
     pub id: String,
     /// Time range hint (for partition pruning)
     pub time_range: Option<TimeRangeInput>,
-    /// Source type hint. When provided, the query can use the
+    /// Source type hint (NAN-1032). When provided, the query can use the
     /// `(source_type, timestamp, ...)` PK index for a tight range read instead
     /// of scanning every source_type's marks within the time window. Without
     /// this hint, S3-backed historical lookups take 12–60s vs <1s with it.
@@ -1368,7 +755,6 @@ pub struct FetchLogResponse {
     request_body = FetchLogRequest,
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Full log event data", body = FetchLogResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -1388,10 +774,10 @@ pub async fn fetch_log(
     // composed ScopeSet is applied at the SQL layer to match the rest of the
     // search surface.
     let scope = effective_scope(&auth);
-    let search_service = state.search_for_auth(&auth)?;
 
     let start = Instant::now();
-    let result = search_service
+    let result = state
+        .search
         .fetch_log_by_id(
             &request.id,
             request.time_range.as_ref(),
@@ -1404,14 +790,13 @@ pub async fn fetch_log(
     record_search_query("fetch_log", duration_ms, result.is_ok());
 
     match result {
-        Ok(event) => {
-            require_current_shared_authority(&state, &auth).await?;
-            Ok(Json(FetchLogResponse { event }))
+        Ok(event) => Ok(Json(FetchLogResponse { event })),
+        Err(e) => {
+            tracing::error!(error = %e, log_id = %request.id, "Failed to fetch log");
+            Err(SearchError::QueryError(
+                "Failed to fetch log event".to_string(),
+            ))
         }
-        Err(e) => Err(crate::error::mask_query_failure(
-            e,
-            "Failed to fetch log event",
-        )),
     }
 }
 
@@ -1427,7 +812,6 @@ pub async fn fetch_log(
     request_body = SearchRequest,
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Prevalence scatter data for matched artifacts", body = PrevalenceScatterData),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -1442,8 +826,6 @@ pub async fn prevalence_artifacts(
 ) -> Result<(axum::http::HeaderMap, Json<PrevalenceScatterData>), SearchError> {
     // NAN-2028: runs a query over the log store — same search:execute gate.
     require_search_execute(&auth)?;
-    require_shared_prevalence_component(&auth)?;
-    require_shared_npl_contract(&auth, &request.query, request.dataset.as_deref())?;
     // NAN-1799: the service injects the composed deny-set into the nPL path
     // itself — no more pre-rewrite of request.query here.
     let scope = effective_scope(&auth);
@@ -1456,23 +838,12 @@ pub async fn prevalence_artifacts(
     // by `companion_key` (NAN-1799 — the scope changes the executed SQL, so
     // it is part of result identity); `request_id` is excluded since it's a
     // per-request cancellation handle, not part of result identity.
-    let cache_key = crate::cache::SearchResultCache::companion_key_for(
-        auth.tenant_scope,
+    let cache_key = crate::cache::SearchResultCache::companion_key(
         "prevart",
         &[
             request.query.as_bytes(),
-            request
-                .time_range
-                .start
-                .timestamp_micros()
-                .to_string()
-                .as_bytes(),
-            request
-                .time_range
-                .end
-                .timestamp_micros()
-                .to_string()
-                .as_bytes(),
+            request.time_range.start.timestamp_micros().to_string().as_bytes(),
+            request.time_range.end.timestamp_micros().to_string().as_bytes(),
             request.dataset.as_deref().unwrap_or("logs").as_bytes(),
         ],
         &scope,
@@ -1480,19 +851,15 @@ pub async fn prevalence_artifacts(
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
             if let Some(cached) = cache.get_cached::<PrevalenceScatterData>(&cache_key).await {
-                let age = cache.age_secs(&cache_key).await;
-                require_current_shared_authority(&state, &auth).await?;
                 record_search_query("prevalence_artifacts_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
                 return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
             }
         }
     }
 
-    let search_service = state.search_for_auth(&auth)?;
     let start = Instant::now();
-    let result = search_service
-        .get_prevalence_artifacts(&request, &scope)
-        .await;
+    let result = state.search.get_prevalence_artifacts(&request, &scope).await;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     record_search_query("prevalence_artifacts", duration_ms, result.is_ok());
@@ -1503,7 +870,6 @@ pub async fn prevalence_artifacts(
     }
 
     let response = result?;
-    require_current_shared_authority(&state, &auth).await?;
     if let Some(cache) = state.result_cache.as_ref() {
         let cache = cache.clone();
         let resp = response.clone();
@@ -1512,10 +878,7 @@ pub async fn prevalence_artifacts(
         });
     }
 
-    Ok((
-        crate::cache::cache_status_headers(false, None),
-        Json(response),
-    ))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 /// Get field statistics for a search query (async, separate from main search)
@@ -1529,7 +892,6 @@ pub async fn prevalence_artifacts(
     request_body = FieldStatsRequest,
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Field statistics with cardinality", body = FieldStatsResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -1539,15 +901,12 @@ pub async fn field_stats_for_query(
     State(state): State<SearchState>,
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
-    Json(mut request): Json<FieldStatsRequest>,
+    Json(request): Json<FieldStatsRequest>,
 ) -> Result<(axum::http::HeaderMap, Json<FieldStatsResponse>), SearchError> {
     use nanosiem_core::search::QueryPriority;
 
     // NAN-2028: runs a query over the log store — same search:execute gate.
     require_search_execute(&auth)?;
-    // NAN-3093: field stats run only the base search (pipes stripped), so
-    // only the base search is held to the shared contract.
-    require_shared_npl_base_search_contract(&auth, &request.query, request.dataset.as_deref())?;
     // NAN-1799: the service injects the composed deny-set into the nPL path
     // itself — no more pre-rewrite of the query here.
     let scope = effective_scope(&auth);
@@ -1565,21 +924,15 @@ pub async fn field_stats_for_query(
     // the caller's effective deny-set folded in by `companion_key` (NAN-1799);
     // `request_id` is excluded since it's a per-request cancellation handle,
     // not part of result identity.
-    let cache_key = crate::cache::SearchResultCache::companion_key_for(
-        auth.tenant_scope,
-        // NAN-3216: the lake used to cache an EMPTY answer for every `columns`
-        // request without the (now retired) `sample_columns` opt-in. A new
-        // prefix keeps those stale empties from being served after the roll.
-        "fstats-v2",
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "fstats",
         &[
             query.as_bytes(),
             request.start.timestamp_micros().to_string().as_bytes(),
             request.end.timestamp_micros().to_string().as_bytes(),
             // JSON-encode (not join) so a comma in a column name can't shift the
             // boundary — ["a,b"] must not collide with ["a","b"] (NAN-1593 review).
-            serde_json::to_string(&request.columns)
-                .unwrap_or_default()
-                .as_bytes(),
+            serde_json::to_string(&request.columns).unwrap_or_default().as_bytes(),
             request.dataset.as_deref().unwrap_or("logs").as_bytes(),
         ],
         &scope,
@@ -1587,9 +940,8 @@ pub async fn field_stats_for_query(
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
             if let Some(cached) = cache.get_cached::<FieldStatsResponse>(&cache_key).await {
-                let age = cache.age_secs(&cache_key).await;
-                require_current_shared_authority(&state, &auth).await?;
                 record_search_query("field_stats_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
                 return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
             }
         }
@@ -1600,37 +952,31 @@ pub async fn field_stats_for_query(
     // after the main search has completed and unregistered the id.
     if let Some(rid) = request.request_id.clone() {
         // NAN-2100: reserve under the CREDENTIAL (see `reserve_query_owner`).
-        request.request_id = Some(reserve_query_owner(&state, rid, &auth).await?);
+        reserve_query_owner(&state, rid, auth.credential_principal_id()).await?;
     }
 
     // NAN-1427: admission-gated, with the derived companion query_id and
     // per-priority CH settings. `columns` (when sent by the UI) reduces the
     // stat'd column set to what the field panel actually renders.
-    let search_service = state.search_for_auth(&auth)?;
-    let stats = search_service
+    let fields = state
+        .search
         .get_field_stats_with_admission(
             &query,
             &time_range,
             request.columns.as_deref(),
             request.request_id.as_deref(),
-            auth.claims.sub,
+            super::admission_user(&auth)?,
             QueryPriority::Interactive,
             request.dataset.as_deref(),
             &scope,
         )
         .await?;
-    // NAN-2771: a lake sample reports its row count, which does not depend on
-    // the requested columns; ClickHouse keeps the widest field's count.
-    let fields = stats.fields;
-    let total_events = stats
-        .sampled_rows
-        .unwrap_or_else(|| fields.iter().map(|f| f.count).max().unwrap_or(0));
+    let total_events = fields.iter().map(|f| f.count).max().unwrap_or(0);
 
     let response = FieldStatsResponse {
         fields,
         total_events,
     };
-    require_current_shared_authority(&state, &auth).await?;
     if let Some(cache) = state.result_cache.as_ref() {
         let cache = cache.clone();
         let resp = response.clone();
@@ -1639,10 +985,7 @@ pub async fn field_stats_for_query(
         });
     }
 
-    Ok((
-        crate::cache::cache_status_headers(false, None),
-        Json(response),
-    ))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 /// Get top values for a SINGLE field (on-demand, Kibana-style)
@@ -1655,7 +998,6 @@ pub async fn field_stats_for_query(
     request_body = FieldValuesRequest,
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Top field values with counts", body = FieldValuesResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -1671,8 +1013,6 @@ pub async fn field_values(
 
     // NAN-2028: returns log-derived field values — same search:execute gate.
     require_search_execute(&auth)?;
-    // NAN-3093: field values run only the base search (pipes stripped).
-    require_shared_npl_base_search_contract(&auth, &request.query, request.dataset.as_deref())?;
     validate_field_values_limit(request.limit)?;
     // NAN-1799: the service injects the composed deny-set into the nPL path
     // itself — no more pre-rewrite of the query here.
@@ -1689,15 +1029,12 @@ pub async fn field_values(
     // through the same Dragonfly layer. Keyed on the raw `query` plus the
     // field, time range, limit, and dataset, with the caller's effective
     // deny-set folded in by `companion_key` (NAN-1799).
-    let cache_key = crate::cache::SearchResultCache::companion_key_for(
-        auth.tenant_scope,
+    let cache_key = crate::cache::SearchResultCache::companion_key(
         // NAN-2344: response metadata now distinguishes returned top-N
         // coverage from the full population. Version the cache namespace so a
         // rolling deploy never asks the new response type to deserialize the
         // older, ambiguous shape.
-        // v3 expands repeated OCSF leaves before grouping, so stale v2 entries
-        // containing JSON array combinations must never repaint the field rail.
-        "fvalues-v3",
+        "fvalues-v2",
         &[
             request.field.as_bytes(),
             query.as_bytes(),
@@ -1711,17 +1048,16 @@ pub async fn field_values(
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
             if let Some(cached) = cache.get_cached::<FieldValuesResponse>(&cache_key).await {
-                let age = cache.age_secs(&cache_key).await;
-                require_current_shared_authority(&state, &auth).await?;
                 record_search_query("field_values_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
                 return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
             }
         }
     }
 
-    let search_service = state.search_for_auth(&auth)?;
-    let result = search_service
-        .get_field_values_for_panel(
+    let result = state
+        .search
+        .get_field_values(
             &request.field,
             &query,
             &time_range,
@@ -1734,14 +1070,8 @@ pub async fn field_values(
 
     record_search_query("field_values", duration_ms, result.is_ok());
 
-    let result = result?;
-    let mut response = field_values_response(request.field, result.values, request.limit);
-    if let Some(window) = result.sampled_window {
-        response.approximate = true;
-        response.sampled_start = Some(window.start);
-        response.sampled_end = Some(window.end);
-    }
-    require_current_shared_authority(&state, &auth).await?;
+    let values = result?;
+    let response = field_values_response(request.field, values, request.limit);
     if let Some(cache) = state.result_cache.as_ref() {
         let cache = cache.clone();
         let resp = response.clone();
@@ -1750,156 +1080,6 @@ pub async fn field_values(
         });
     }
 
-    Ok((
-        crate::cache::cache_status_headers(false, None),
-        Json(response),
-    ))
-}
-
-/// Request for a search's timeline alone.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct SearchHistogramRequest {
-    /// The piped query string, exactly as sent to `POST /api/search`.
-    pub query: String,
-    /// Time range of the search.
-    pub time_range: TimeRangeInput,
-    /// Per-query dataset selector, as on `POST /api/search`.
-    #[serde(default)]
-    pub dataset: Option<String>,
-}
-
-/// A search's timeline, answered on its own.
-#[derive(Debug, Clone, Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct SearchHistogramResponse {
-    /// The buckets `POST /api/search` would return in `histogram`. Empty when
-    /// the search renders no timeline (aggregates, product views).
-    pub histogram: Vec<nanosiem_core::search::HistogramBucket>,
-    /// The search's exact total when the timeline proves it: every base
-    /// event is exactly one result row. Absent otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_count: Option<u64>,
-    /// Per-phase lake evidence (`x-nano-search-debug: 1` with `search:sql`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<Object>)]
-    pub debug: Option<serde_json::Value>,
-}
-
-/// Get the timeline (histogram) of a search without its rows
-///
-/// The Search page sends its rows request with `skip_histogram: true` and
-/// asks for the timeline here at the same time, so rows paint as soon as
-/// they are ready instead of waiting for the histogram companion.
-#[utoipa::path(
-    post,
-    path = "/api/search/histogram",
-    tag = "search",
-    request_body = SearchHistogramRequest,
-    security(("bearer_auth" = []), ("api_key" = [])),
-    responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
-        (status = 200, description = "The search's histogram buckets and, when provable, its exact total", body = SearchHistogramResponse),
-        (status = 400, description = "Query error, or the timeline did not finish within the interactive deadline", body = ErrorResponse),
-        (status = 401, description = "Unauthorized"),
-    )
-)]
-pub async fn search_histogram(
-    State(state): State<SearchState>,
-    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
-    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
-    request_headers: axum::http::HeaderMap,
-    Json(request): Json<SearchHistogramRequest>,
-) -> Result<(axum::http::HeaderMap, Json<SearchHistogramResponse>), SearchError> {
-    use nanosiem_core::search::QueryPriority;
-
-    require_search_execute(&auth)?;
-    let debug = wants_search_debug(&request_headers, &auth);
-    let bypass = bypass || debug;
-    let empty = || SearchHistogramResponse { histogram: Vec::new(), total_count: None, debug: None };
-    // The risk grain has no time axis (the search itself answers an empty
-    // timeline for it), so there is nothing to compute or authorize here.
-    if nanosiem_core::query::Dataset::from_selector(request.dataset.as_deref().unwrap_or("logs"))
-        == nanosiem_core::query::Dataset::Risk
-    {
-        return Ok((crate::cache::cache_status_headers(false, None), Json(empty())));
-    }
-    let scope = effective_scope(&auth);
-    // The same view and shared contract as `/api/search`: the histogram-only
-    // view runs the search's full preparation, then only the timeline.
-    let search_service = state.search_with_ai_for_auth(&auth)?;
-    require_shared_npl_contract_for_view(
-        &auth,
-        &request.query,
-        request.dataset.as_deref(),
-        &search_service,
-    )?;
-    let time_range = request.time_range.clone();
-    let cache_key = crate::cache::SearchResultCache::companion_key_for(
-        auth.tenant_scope,
-        "histogram-v1",
-        &[
-            request.query.as_bytes(),
-            time_range.start.timestamp_micros().to_string().as_bytes(),
-            time_range.end.timestamp_micros().to_string().as_bytes(),
-            request.dataset.as_deref().unwrap_or("logs").as_bytes(),
-        ],
-        &scope,
-    );
-    if !bypass {
-        if let Some(cache) = state.result_cache.as_ref() {
-            if let Some(cached) = cache.get_cached::<SearchHistogramResponse>(&cache_key).await {
-                let age = cache.age_secs(&cache_key).await;
-                require_current_shared_authority(&state, &auth).await?;
-                record_search_query("search_histogram_cached", 0.0, true);
-                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
-            }
-        }
-    }
-
-    let start = Instant::now();
-    let execution = search_service.search_histogram_with_admission(
-        &request.query,
-        &time_range,
-        request.dataset.as_deref(),
-        auth.claims.sub,
-        QueryPriority::Interactive,
-        &scope,
-    );
-    let (result, debug_evidence) = if debug {
-        let (result, evidence) = nanosiem_core::search::lake_debug::collect(execution).await;
-        (result, Some(evidence))
-    } else if let Some(deadline) = configured_escalation_deadline() {
-        // NAN-3229: the timeline has no durable lane. Bound it under the 60 s
-        // edge so a slow timeline ends as a typed timeout (the page keeps its
-        // rows and drops the chart) instead of a proxy 502 that held a slot.
-        match tokio::time::timeout(deadline, execution).await {
-            Ok(result) => (result, None),
-            Err(_) => {
-                record_search_query("search_histogram", start.elapsed().as_secs_f64() * 1000.0, false);
-                return Err(histogram_deadline_error(deadline));
-            }
-        }
-    } else {
-        (execution.await, None)
-    };
-    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-    record_search_query("search_histogram", duration_ms, result.is_ok());
-    let result = result?;
-    let mut response = SearchHistogramResponse {
-        histogram: result.histogram,
-        total_count: result.total_count,
-        debug: None,
-    };
-    require_current_shared_authority(&state, &auth).await?;
-    if let Some(mut evidence) = debug_evidence {
-        evidence["service_ms"] = serde_json::json!(duration_ms);
-        response.debug = Some(evidence);
-    } else if let Some(cache) = state.result_cache.as_ref() {
-        let cache = cache.clone();
-        let resp = response.clone();
-        tokio::spawn(async move {
-            cache.set_cached(&cache_key, &resp).await;
-        });
-    }
     Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
@@ -1918,7 +1098,7 @@ pub struct FieldValuesRequest {
     #[serde(default = "default_field_values_limit")]
     #[schema(minimum = 1, maximum = 1000)]
     pub limit: usize,
-    /// Per-query dataset selector: `logs` (default), `spans`,
+    /// Per-query dataset selector (NAN-1559): `logs` (default), `spans`,
     /// `metrics`, or `risk`. Drill-in must resolve the field and base source
     /// against the same dataset the search targeted, else a spans/metrics/risk
     /// field reads the UDM `logs` table and returns nothing.
@@ -1966,17 +1146,6 @@ pub struct FieldValuesResponse {
     /// though it only summed the returned top values. New clients should use
     /// the explicit fields above.
     pub total_count: u64,
-    /// true when the values (and their percentages) were counted
-    /// over the newest slice `[sampled_start, sampled_end]` of a wide window
-    /// that the count rollups cannot answer, not over the whole window.
-    #[serde(default)]
-    pub approximate: bool,
-    /// Start of the sampled slice (only when `approximate`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampled_start: Option<chrono::DateTime<chrono::Utc>>,
-    /// End of the sampled slice (only when `approximate`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sampled_end: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn field_values_response(
@@ -1993,9 +1162,6 @@ fn field_values_response(
         covered_event_count,
         may_have_more_values: requested_limit > 0 && returned_value_count >= requested_limit,
         total_count: covered_event_count,
-        approximate: false,
-        sampled_start: None,
-        sampled_end: None,
     }
 }
 
@@ -2008,28 +1174,20 @@ pub struct FieldStatsRequest {
     pub start: chrono::DateTime<chrono::Utc>,
     /// End of time range
     pub end: chrono::DateTime<chrono::Utc>,
-    /// Client request id of the originating search. When set, the
+    /// Client request id of the originating search (NAN-1428). When set, the
     /// field-stats query runs under the derived ClickHouse query_id
     /// `{request_id}-fstats`, so `DELETE /api/search/{request_id}` cancels it
     /// together with the data query.
     #[serde(default)]
     pub request_id: Option<String>,
-    /// Optional column subset to compute stats for. The stats
+    /// Optional column subset to compute stats for (NAN-1427). The stats
     /// query's I/O scales with the number of columns aggregated, so callers
     /// should send only the columns they render. Names are intersected with
     /// the live table inventory (unknown names dropped; an empty intersection
     /// falls back to the full set). Omit for the full column inventory.
     #[serde(default)]
     pub columns: Option<Vec<String>>,
-    /// Deprecated, ignored. Accepted for older clients (desktop
-    /// sends it with every `columns` request). The primary lake now always
-    /// computes `columns` stats from a bounded row sample (projected to the
-    /// requested canonical fields when they are all known); `total_events` is
-    /// then the sample's row count (at most 1,000), not the window total.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub sample_columns: bool,
-    /// Per-query dataset selector: `logs` (default), `spans`,
+    /// Per-query dataset selector (NAN-1559): `logs` (default), `spans`,
     /// `metrics`, or `risk`. The companion enumerates the dataset's columns and
     /// wraps the dataset's base SQL — without it a spans/metrics search's field
     /// panel runs the UDM column list against `otel_spans` and ClickHouse 47's.
@@ -2073,7 +1231,7 @@ mod field_values_endpoint_tests {
         let body = &src[start..end];
 
         assert!(
-            body.contains(".get_field_values_for_panel("),
+            body.contains(".get_field_values("),
             "POST /api/search/field-values must delegate to SearchService"
         );
         assert!(
@@ -2186,124 +1344,12 @@ mod effective_scope_split_tests {
         items.iter().map(|item| item.to_string()).collect()
     }
 
-    /// NAN-4664 review: the in-flight identity of two callers of one tenant
-    /// differs whenever their effective visibility or authority does (audit
-    /// gate, plan/entitlement, prevalence, admission priority), and matches
-    /// only when nothing result-shaping differs (a search-only and an admin
-    /// key with the same scope legitimately share).
-    #[test]
-    fn inflight_identity_separates_every_authority_dimension() {
-        use nanosiem_core::search::QueryPriority;
-        let request: nanosiem_core::SearchRequest = serde_json::from_value(serde_json::json!({
-            "query": "* | stats count by metadata.log_source",
-            "time_range": {"start": "2026-10-26T00:00:00Z", "end": "2026-10-27T00:00:00Z"},
-        }))
-        .unwrap();
-        let key = |auth: &crate::AuthContext, priority: QueryPriority| {
-            crate::cache::SearchResultCache::inflight_key_for(
-                auth.tenant_scope,
-                &request,
-                &super::effective_scope(auth),
-                None,
-                &super::inflight_authority_fingerprint(auth, priority),
-            )
-        };
-        let interactive = QueryPriority::Interactive;
-        let search_only = api_key_auth(&[SEARCH_EXECUTE_ID]);
-        let admin = api_key_auth(&[SEARCH_EXECUTE_ID, nanosiem_core::auth::permissions::SEARCH_SQL]);
-        assert_eq!(key(&search_only, interactive), key(&admin, interactive), "same visibility shares");
-        let auditor = api_key_auth(&[SEARCH_EXECUTE_ID, AUDIT_VIEW_ID]);
-        assert_ne!(key(&search_only, interactive), key(&auditor, interactive), "audit:view sees audit rows");
-        let mut scoped = search_only.clone();
-        scoped.denied_sources = ScopeSet::from_denied(set(&["insider_threat"]));
-        assert_ne!(key(&search_only, interactive), key(&scoped, interactive), "source scope");
-        let mut entitled = search_only.clone();
-        entitled.shared_search_entitlement_revision = Some(7);
-        let mut next_plan = entitled.clone();
-        next_plan.shared_search_entitlement_revision = Some(8);
-        assert_ne!(key(&entitled, interactive), key(&next_plan, interactive), "plan revision");
-        let mut prevalence = search_only.clone();
-        prevalence.shared_prevalence_entitled = true;
-        assert_ne!(key(&search_only, interactive), key(&prevalence, interactive), "prevalence component");
-        assert_ne!(key(&search_only, interactive), key(&search_only, QueryPriority::Analytics), "priority budgets");
-    }
-
-    /// NAN-3077: debug evidence needs the header AND `search:sql`.
-    #[test]
-    fn search_debug_needs_the_header_and_search_sql() {
-        let mut asked = axum::http::HeaderMap::new();
-        asked.insert(super::SEARCH_DEBUG_HEADER, axum::http::HeaderValue::from_static("1"));
-        let sql = nanosiem_core::auth::permissions::SEARCH_SQL;
-        assert!(super::wants_search_debug(&asked, &api_key_auth(&[SEARCH_EXECUTE_ID, sql])));
-        assert!(super::wants_search_debug(&asked, &jwt_auth(&[SEARCH_EXECUTE_ID, sql])));
-        assert!(!super::wants_search_debug(&asked, &api_key_auth(&[SEARCH_EXECUTE_ID])));
-        assert!(!super::wants_search_debug(&axum::http::HeaderMap::new(), &api_key_auth(&[SEARCH_EXECUTE_ID, sql])));
-        let mut other = axum::http::HeaderMap::new();
-        other.insert(super::SEARCH_DEBUG_HEADER, axum::http::HeaderValue::from_static("true"));
-        assert!(!super::wants_search_debug(&other, &api_key_auth(&[SEARCH_EXECUTE_ID, sql])));
-    }
-
-    /// NAN-3406: what the route-wide middleware lets a handler see for a
-    /// request carrying `x-nano-perf-overrides` (the overrides its lake
-    /// calls forward, and whether its caches are bypassed).
-    async fn perf_overrides_seen(auth: Option<crate::AuthContext>, headers: &[(&'static str, &'static str)]) -> (Option<String>, bool) {
-        use tower::ServiceExt;
-        let app = axum::Router::new()
-            .route("/probe", axum::routing::get(|request_headers: axum::http::HeaderMap| async move {
-                let bypass = request_headers.get(crate::cache::HEADER_CACHE_BYPASS).is_some();
-                let overrides = nanosiem_core::search::lake_debug::perf_overrides();
-                axum::Json(serde_json::json!({"overrides": overrides, "bypass": bypass}))
-            }))
-            .layer(axum::middleware::from_fn(super::lake_debug_middleware));
-        let mut request = axum::http::Request::builder().uri("/probe");
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
-        let mut request = request.body(axum::body::Body::empty()).unwrap();
-        if let Some(auth) = auth {
-            request.extensions_mut().insert(auth);
-        }
-        let response = app.oneshot(request).await.unwrap();
-        let body = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        (body["overrides"].as_str().map(str::to_owned), body["bypass"].as_bool().unwrap())
-    }
-
-    /// NAN-3406: overrides are honoured only for a caller already admitted
-    /// to debug evidence (the header AND `search:sql`); anyone else's are
-    /// ignored silently and never reach a lake call.
-    #[tokio::test]
-    async fn perf_overrides_need_search_debug_authorization() {
-        let sql = nanosiem_core::auth::permissions::SEARCH_SQL;
-        let overrides = ("x-nano-perf-overrides", "flat_filter_leaves=1,lane_routing_v2=0");
-        let debug = (super::SEARCH_DEBUG_HEADER, "1");
-        // Authorized: forwarded (canonical) and caches bypassed.
-        assert_eq!(
-            perf_overrides_seen(Some(api_key_auth(&[SEARCH_EXECUTE_ID, sql])), &[overrides, debug]).await,
-            (Some("flat_filter_leaves=1,lane_routing_v2=0".to_string()), true)
-        );
-        // No search:sql, no debug header, a bad debug value, or no auth at all: ignored.
-        assert_eq!(perf_overrides_seen(Some(api_key_auth(&[SEARCH_EXECUTE_ID])), &[overrides, debug]).await, (None, false));
-        assert_eq!(perf_overrides_seen(Some(jwt_auth(&[SEARCH_EXECUTE_ID, sql])), &[overrides]).await, (None, false));
-        assert_eq!(perf_overrides_seen(Some(jwt_auth(&[SEARCH_EXECUTE_ID, sql])), &[overrides, (super::SEARCH_DEBUG_HEADER, "true")]).await, (None, false));
-        assert_eq!(perf_overrides_seen(None, &[overrides, debug]).await, (None, false));
-        // Authorized debug without overrides (or with only junk): nothing changes.
-        assert_eq!(perf_overrides_seen(Some(api_key_auth(&[SEARCH_EXECUTE_ID, sql])), &[debug]).await, (None, false));
-        assert_eq!(
-            perf_overrides_seen(Some(api_key_auth(&[SEARCH_EXECUTE_ID, sql])), &[("x-nano-perf-overrides", "evil=1"), debug]).await,
-            (None, false)
-        );
-    }
-
     /// The NAN-2219 case: an ordinary analyst on a tenant whose
     /// `restricted_source_types` registry is empty. `audit:view` is Admin-only,
     /// so its absence must NOT be read as a per-source boundary.
     #[test]
     fn unscoped_caller_without_audit_view_is_row_restricted_but_not_artifact_restricted() {
-        for auth in [
-            jwt_auth(&[SEARCH_EXECUTE_ID]),
-            api_key_auth(&[SEARCH_EXECUTE_ID]),
-        ] {
+        for auth in [jwt_auth(&[SEARCH_EXECUTE_ID]), api_key_auth(&[SEARCH_EXECUTE_ID])] {
             let scope = super::effective_scope(&auth);
 
             // Row filter: audit event rows stay denied (NAN-1801 unchanged).
@@ -2322,10 +1368,7 @@ mod effective_scope_split_tests {
     /// BOTH halves; only the `audit:view` gate is split off.
     #[test]
     fn a_source_scoped_caller_keeps_its_real_denies_in_both_halves() {
-        for mut auth in [
-            jwt_auth(&[SEARCH_EXECUTE_ID]),
-            api_key_auth(&[SEARCH_EXECUTE_ID]),
-        ] {
+        for mut auth in [jwt_auth(&[SEARCH_EXECUTE_ID]), api_key_auth(&[SEARCH_EXECUTE_ID])] {
             auth.denied_sources = ScopeSet::from_denied(set(&["insider_threat"]));
             let scope = super::effective_scope(&auth);
 
@@ -2367,334 +1410,5 @@ mod effective_scope_split_tests {
         ] {
             assert_eq!(super::effective_scope(&auth), ScopeSet::unrestricted());
         }
-    }
-}
-
-#[cfg(test)]
-mod nan3229_deadline_escalation {
-    use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-
-    fn headers(value: Option<&'static str>) -> axum::http::HeaderMap {
-        let mut headers = axum::http::HeaderMap::new();
-        if let Some(value) = value {
-            headers.insert(ASYNC_CAPABLE_HEADER, axum::http::HeaderValue::from_static(value));
-        }
-        headers
-    }
-
-    #[test]
-    fn the_default_deadline_sits_under_every_proxy_in_front_of_search() {
-        let deadline = parse_escalation_deadline(None).expect("enabled by default");
-        // nginx / forward-proxy / web-client 60 s, Cloudflare 100 s.
-        assert_eq!(deadline, Duration::from_secs(45));
-        assert!(deadline <= Duration::from_secs(50), "keep a margin under the 60 s edge: {deadline:?}");
-        assert_eq!(parse_escalation_deadline(Some("")), Some(deadline));
-        assert_eq!(parse_escalation_deadline(Some("not-a-number")), Some(deadline));
-        assert_eq!(parse_escalation_deadline(Some(" 30 ")), Some(Duration::from_secs(30)));
-        assert_eq!(parse_escalation_deadline(Some("0")), None, "0 disables escalation");
-    }
-
-    /// NAN-3474: an atomic caller (k6, scripts, the API) without the header
-    /// ran ~57 s into the cell's statement deadline and got the edge's 502;
-    /// it now gets the same wall cap. Only an explicit `0` opts out.
-    #[test]
-    fn every_non_debug_caller_gets_the_wall_cap_unless_it_opts_out() {
-        assert!(interactive_escalation_deadline(&headers(Some("1")), false).is_some());
-        assert!(interactive_escalation_deadline(&headers(None), false).is_some());
-        assert!(interactive_escalation_deadline(&headers(Some("true")), false).is_some());
-        assert!(interactive_escalation_deadline(&headers(Some("0")), false).is_none());
-        assert!(interactive_escalation_deadline(&headers(Some(" 0 ")), false).is_none());
-        // A debug run always describes the execution.
-        assert!(interactive_escalation_deadline(&headers(Some("1")), true).is_none());
-        assert!(interactive_escalation_deadline(&headers(None), true).is_none());
-        // Progressive views alone changes nothing.
-        let mut progressive = axum::http::HeaderMap::new();
-        progressive.insert("x-nano-progressive-views", axum::http::HeaderValue::from_static("1"));
-        assert!(interactive_escalation_deadline(&progressive, false).is_some());
-    }
-
-    /// NAN-4593: an opted-out caller reads `results` only, so a shed query
-    /// must not answer it with a job id (a silent empty 200); every other
-    /// caller still follows the job.
-    #[test]
-    fn a_shed_query_answers_an_opted_out_caller_with_the_refusal_not_a_job() {
-        assert!(!shed_may_answer_with_job(&headers(Some("0"))));
-        assert!(!shed_may_answer_with_job(&headers(Some(" 0 "))));
-        assert!(shed_may_answer_with_job(&headers(Some("1"))));
-        assert!(shed_may_answer_with_job(&headers(None)));
-        let refusal = SearchError::ResourceExhausted("scan".into());
-        assert_eq!(refusal.status_code(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(refusal.code(), "RESOURCE_EXHAUSTED");
-    }
-
-    #[test]
-    fn the_cap_is_measured_from_the_request_not_from_execution() {
-        let cap = Duration::from_secs(45);
-        assert_eq!(remaining_deadline(cap, Duration::from_millis(300)), Duration::from_millis(44_700));
-        assert_eq!(remaining_deadline(cap, Duration::from_secs(50)), Duration::ZERO);
-    }
-
-    /// NAN-3474 acceptance shape: a query that would run into the cell's
-    /// 55 s statement deadline is answered with a job id at the cap, measured
-    /// from the request's arrival.
-    #[tokio::test]
-    async fn a_slow_query_escalates_at_the_wall_cap_after_request_setup() {
-        let arrived = Instant::now();
-        tokio::time::sleep(Duration::from_millis(30)).await; // auth, scope, cache lookup
-        let cap = Duration::from_millis(120);
-        let execution = async {
-            // Far past the cap: the cell's 55 s statement deadline.
-            tokio::time::sleep(Duration::from_secs(55)).await;
-            Err::<u32, SearchError>(SearchError::ResourceExhausted("scan".into()))
-        };
-        let outcome = finish_or_escalate(execution, remaining_deadline(cap, arrived.elapsed()), || async {
-            Ok(Some("job-cap".to_string()))
-        })
-        .await
-        .unwrap();
-        let answered = arrived.elapsed();
-        assert!(matches!(outcome, DeadlineOutcome::Escalated(ref id) if id == "job-cap"));
-        assert!(answered >= cap, "escalated before the cap: {answered:?}");
-        assert!(answered < cap + Duration::from_millis(100), "the cap restarted at execution: {answered:?}");
-    }
-
-    #[tokio::test]
-    async fn a_fast_query_under_the_cap_keeps_its_interactive_answer() {
-        let asked = AtomicBool::new(false);
-        let execution = async {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            Ok::<_, SearchError>("rows")
-        };
-        let outcome = finish_or_escalate(execution, Duration::from_secs(45), || async {
-            asked.store(true, Ordering::SeqCst);
-            Ok(Some("job".to_string()))
-        })
-        .await
-        .unwrap();
-        assert!(matches!(outcome, DeadlineOutcome::Finished(Ok("rows"))));
-        assert!(!asked.load(Ordering::SeqCst), "a fast query must never submit a durable job");
-    }
-
-    #[test]
-    fn a_timeline_past_the_deadline_is_a_user_actionable_refusal() {
-        let error = histogram_deadline_error(Duration::from_secs(45));
-        assert_eq!(error.status_code(), axum::http::StatusCode::BAD_REQUEST);
-        assert!(error.public_message().contains("within 45 s"), "{}", error.public_message());
-    }
-
-    #[tokio::test]
-    async fn a_query_that_finishes_in_time_never_asks_to_escalate() {
-        let asked = AtomicBool::new(false);
-        let outcome = finish_or_escalate(async { 7 }, Duration::from_secs(5), || async {
-            asked.store(true, Ordering::SeqCst);
-            Ok(Some("job".to_string()))
-        })
-        .await
-        .unwrap();
-        assert!(matches!(outcome, DeadlineOutcome::Finished(7)));
-        assert!(!asked.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn a_slow_query_becomes_a_job_and_its_interactive_run_is_dropped() {
-        struct DropFlag<'a>(&'a AtomicBool);
-        impl Drop for DropFlag<'_> {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-        let dropped = AtomicBool::new(false);
-        let flag = DropFlag(&dropped);
-        let execution = async move {
-            let _flag = flag;
-            std::future::pending::<u32>().await
-        };
-        let outcome = finish_or_escalate(execution, Duration::from_millis(20), || async {
-            Ok(Some("job-1".to_string()))
-        })
-        .await
-        .unwrap();
-        assert!(matches!(outcome, DeadlineOutcome::Escalated(ref id) if id == "job-1"));
-        assert!(dropped.load(Ordering::SeqCst), "the interactive execution must be cancelled");
-    }
-
-    #[tokio::test]
-    async fn a_query_the_durable_lane_refuses_keeps_running_to_its_own_end() {
-        let execution = async {
-            tokio::time::sleep(Duration::from_millis(60)).await;
-            "rows"
-        };
-        let outcome = finish_or_escalate(execution, Duration::from_millis(10), || async { Ok(None) })
-            .await
-            .unwrap();
-        assert!(matches!(outcome, DeadlineOutcome::Finished("rows")));
-    }
-
-    #[tokio::test]
-    async fn a_revoked_authority_at_the_deadline_is_returned() {
-        let outcome = finish_or_escalate(
-            std::future::pending::<u32>(),
-            Duration::from_millis(10),
-            || async { Err(SearchError::Forbidden("revoked".into())) },
-        )
-        .await;
-        assert!(matches!(outcome, Err(SearchError::Forbidden(_))));
-    }
-}
-
-#[cfg(test)]
-mod nan3071_unescalatable_exhaustion {
-    use super::*;
-
-    #[test]
-    fn a_refused_escalation_keeps_the_interactive_failure_and_says_how_to_fix_it() {
-        let refusal = nanosiem_core::SearchError::SqlValidationError(
-            nanosiem_core::search::service::DURABLE_LANE_POST_PROCESSING_REFUSAL.to_string(),
-        );
-        assert!(nanosiem_core::search::service::is_durable_lane_post_processing_refusal(&refusal));
-        assert!(!nanosiem_core::search::service::is_durable_lane_post_processing_refusal(
-            &nanosiem_core::SearchError::SqlValidationError("something else".into())
-        ));
-
-        let error = unescalatable_exhaustion("memory");
-        assert_eq!(error.code(), "RESOURCE_EXHAUSTED");
-        assert_eq!(error.status_code(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
-        let message = error.public_message();
-        assert!(message.starts_with("Interactive query exhausted its memory budget."), "{message}");
-        assert!(message.contains("before `| ai`"), "{message}");
-        assert!(!message.contains("durable SQL-only lane"), "the refusal text must not reach the user: {message}");
-
-        // A lake producer's full sentence is kept as the cause.
-        let sentence = unescalatable_exhaustion("scan slice needs 812.00 MB, budget 512.00 MB");
-        assert!(sentence.public_message().starts_with("scan slice needs 812.00 MB, budget 512.00 MB."));
-    }
-}
-
-#[cfg(test)]
-mod deferred_tree_tests {
-    use super::*;
-    #[test]
-    fn terminal_tree_dispatcher_contains_no_event_rows_and_keeps_the_requested_window() {
-        let request: SearchRequest = serde_json::from_value(serde_json::json!({
-            "query": "device.hostname=\"host\" | tree parent=actor.process.uid child=process.uid label=process.name",
-            "time_range": {"start": "2026-09-30T00:00:00Z", "end": "2026-09-30T01:00:00Z"}
-        })).unwrap();
-        let response = deferred_tree_marker(&request).unwrap().unwrap();
-        assert_eq!(response.results.len(), 1);
-        assert_eq!(response.results[0]["_tree_pending"], true);
-        assert_eq!(response.results[0]["_tree_nodes"], serde_json::json!([]));
-        assert_eq!(response.results[0]["_tree_time_range"], serde_json::to_value(&request.time_range).unwrap());
-        assert!(!response.total_count_exact);
-        let mut atomic = request; atomic.query.push_str(" | head 1");
-        assert!(deferred_tree_marker(&atomic).unwrap().is_none());
-        atomic.query = "device.hostname=\"host\" | lateral | tree parent=actor.process.uid child=process.uid label=process.name".into();
-        assert!(deferred_tree_marker(&atomic).unwrap().is_none());
-    }
-}
-
-#[cfg(test)]
-mod nan4163_bare_star_route {
-    use super::*;
-
-    fn request(query: &str, window: chrono::Duration, dataset: Option<&str>) -> SearchRequest {
-        let end = chrono::DateTime::parse_from_rfc3339("2026-10-19T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
-        let mut value = serde_json::json!({
-            "query": query,
-            "time_range": { "start": (end - window).to_rfc3339(), "end": end.to_rfc3339() },
-        });
-        if let Some(dataset) = dataset {
-            value["dataset"] = serde_json::json!(dataset);
-        }
-        serde_json::from_value(value).expect("search request")
-    }
-
-    #[test]
-    fn a_bare_star_over_four_hours_routes_to_the_job_on_a_lean_cell_only() {
-        let four = chrono::Duration::hours(4);
-        let over = four + chrono::Duration::seconds(1);
-        let corpus = r#"* | eval corpus_process_name=coalesce(nullif(process.name,""),actor.process.name) | where corpus_process_name="svchost.exe""#;
-        let stats = "* | stats dc(device.hostname)";
-        assert!(!wants_bare_star_background_job(true, &request(stats, four, None)), "exactly 4h stays interactive");
-        assert!(wants_bare_star_background_job(true, &request(stats, over, None)), "4h + 1s goes to the job");
-        assert!(wants_bare_star_background_job(true, &request(corpus, chrono::Duration::days(7), None)));
-        assert!(wants_bare_star_background_job(true, &request("* | stats dc(device.hostname) by metadata.log_source", over, Some("logs"))));
-        assert!(!wants_bare_star_background_job(false, &request(stats, over, None)), "no durable lane: interactive");
-        assert!(!wants_bare_star_background_job(true, &request(stats, over, Some("risk"))), "risk dataset is not routed");
-        assert!(!wants_bare_star_background_job(true, &request("device.hostname=h", over, None)));
-        assert!(!wants_bare_star_background_job(true, &request("* | where metadata.log_source=x", over, None)));
-    }
-
-    /// The web search page opens with an empty box (nanosiem-web
-    /// `pages/Search.tsx` `useState(urlQuery || '')`, and an empty query is
-    /// refused client-side) over the user's default window, `last_hour`
-    /// unless changed (`contexts/UserPreferencesContext.tsx`). The default
-    /// view an analyst runs is therefore `*` over 1 h; it and every listing
-    /// (`*`, `* | head N`, `* | table ...`) stay interactive at any window.
-    #[test]
-    fn the_web_default_star_and_listings_stay_interactive() {
-        assert!(!wants_bare_star_background_job(true, &request("*", chrono::Duration::hours(1), None)));
-        for window in [chrono::Duration::hours(24), chrono::Duration::days(7), chrono::Duration::days(30)] {
-            for query in ["*", "* | head 50", "* | table time, message"] {
-                assert!(!wants_bare_star_background_job(true, &request(query, window, None)), "{query}");
-            }
-            assert!(wants_bare_star_background_job(true, &request("* | timechart span=1m count", window, None)));
-        }
-    }
-
-    /// NAN-4184: rollup-answered source inventories stay interactive.
-    #[test]
-    fn rollup_answered_source_inventory_stays_interactive() {
-        let week = chrono::Duration::days(7);
-        assert!(!wants_bare_star_background_job(true, &request("* | stats count by metadata.log_source", week, None)));
-        assert!(!wants_bare_star_background_job(true, &request("* | stats count() as count by metadata.log_source | sort -count", week, None)));
-        assert!(wants_bare_star_background_job(true, &request("* | stats dc(device.hostname) by metadata.log_source", week, None)));
-    }
-}
-
-#[cfg(test)]
-mod nan4664_search_body_tests {
-    use super::SearchBody;
-    use axum::body::Body;
-    use tower::ServiceExt;
-
-    async fn explicit(body: serde_json::Value) -> (axum::http::StatusCode, String) {
-        let app = axum::Router::new().route(
-            "/api/search",
-            axum::routing::post(|SearchBody { request, explicit_use_cache }: SearchBody| async move {
-                format!("{explicit_use_cache:?} {}", request.use_cache)
-            }),
-        );
-        let response = app
-            .oneshot(
-                axum::http::Request::post("/api/search")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-        (status, String::from_utf8_lossy(&bytes).into_owned())
-    }
-
-    /// The production extractor tells an omitted `use_cache` from an
-    /// explicit `false`, and keeps the request's own field as before.
-    #[tokio::test]
-    async fn use_cache_is_tri_state_on_the_wire() {
-        let base = serde_json::json!({"query": "*", "time_range": {"start": "2026-10-26T00:00:00Z", "end": "2026-10-27T00:00:00Z"}});
-        assert_eq!(explicit(base.clone()).await, (axum::http::StatusCode::OK, "None false".into()));
-        let mut off = base.clone();
-        off["use_cache"] = false.into();
-        assert_eq!(explicit(off).await.1, "Some(false) false");
-        let mut on = base.clone();
-        on["use_cache"] = true.into();
-        assert_eq!(explicit(on).await.1, "Some(true) true");
-        let mut null = base.clone();
-        null["use_cache"] = serde_json::Value::Null;
-        assert_eq!(explicit(null).await.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY, "a null bool is still rejected");
-        assert_eq!(explicit(serde_json::json!({"query": 1})).await.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

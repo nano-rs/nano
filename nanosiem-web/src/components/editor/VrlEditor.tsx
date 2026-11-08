@@ -15,7 +15,6 @@ import { highlightSelectionMatches, searchKeymap, search } from '@codemirror/sea
 import { editorTheme, syntaxTheme } from './codemirror-theme';
 import { vrlLanguage } from './vrl-language';
 import { syntaxHighlighting } from '@codemirror/language';
-import { cn } from '@/lib/utils';
 
 export interface VrlEditorRef {
   focus: () => void;
@@ -29,8 +28,6 @@ export interface VrlEditorProps {
   readOnly?: boolean;
   className?: string;
   placeholder?: string;
-  /** Accessible name for the editable region (CodeMirror's contenteditable is not a labelable element). */
-  ariaLabel?: string;
 }
 
 /**
@@ -43,7 +40,6 @@ export function VrlEditor({
   readOnly = false,
   className = '',
   placeholder,
-  ariaLabel,
   ref,
 }: VrlEditorProps & { ref?: React.Ref<VrlEditorRef> }) {
     const containerRef = useRef<HTMLDivElement>(null);
@@ -103,13 +99,10 @@ export function VrlEditor({
         // Placeholder
         placeholder ? EditorView.contentAttributes.of({ 'aria-placeholder': placeholder }) : [],
 
-        // Accessible name
-        ariaLabel ? EditorView.contentAttributes.of({ 'aria-label': ariaLabel }) : [],
-
         // Read-only mode
         readOnlyCompartment.current.of(EditorState.readOnly.of(readOnly)),
       ];
-    }, [readOnly, placeholder, ariaLabel, createUpdateListener]);
+    }, [readOnly, placeholder, createUpdateListener]);
 
     // Initialize editor
     useEffect(() => {
@@ -189,7 +182,7 @@ export function VrlEditor({
   return (
     <div
       ref={containerRef}
-      className={cn('cm-editor-container h-full w-full overflow-hidden rounded-lg bg-background', className)}
+      className={`cm-editor-container h-full w-full overflow-hidden rounded-lg bg-background ${className}`}
     />
   );
 }

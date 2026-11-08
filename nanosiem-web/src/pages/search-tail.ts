@@ -17,26 +17,22 @@
  *
  * ## Gaps and duplicates
  *
- * The shared cell follow stream deduplicates by logical event identity as
- * part-log heads advance. This client-side window applies to the polling
- * fallback. `/api/search` has no event cursor. `cursor_time` / `cursor_event_uid` exist
- * only inside the lake worker's `BroadNplRequest` (`nanosiem-lake-worker`) and
- * the lake view pager; `SearchRequest` (`nanosiem-core/src/search/types.rs`,
- * `nanosiem-web/src/lib/api/types.ts`) exposes nothing equivalent. So the tail
- * is a *time window plus a client-side dedupe*, which is what gives it both
- * properties at once:
+ * `/api/search` has no event cursor (`SearchRequest` in
+ * `nanosiem-core/src/search/types.rs` and `lib/api/types.ts` exposes nothing
+ * like one), so the tail is a *time window plus a client-side dedupe*, which
+ * is what gives it both properties at once:
  *
  * - **No gaps**: each tick re-asks for `[watermark - lookback, now]`, not
  *   `(watermark, now]`. The lookback (≥ `TAIL_LOOKBACK_MS`, and never less
- *   than two tick intervals) has to cover the lake's arrival→searchable lag,
- *   which is budgeted at ≤ 2 min. An event that was not yet visible when its
- *   own timestamp passed the watermark is still inside the re-asked window on
- *   a later tick. Out-of-order arrival within that lag is covered by the same
- *   overlap.
+ *   than two tick intervals) covers the arrival→searchable lag (Vector batch
+ *   flush plus ClickHouse async inserts). An event that was not yet visible
+ *   when its own timestamp passed the watermark is still inside the re-asked
+ *   window on a later tick. Out-of-order arrival within that lag is covered by
+ *   the same overlap.
  * - **No duplicates**: the overlap is deliberate, so every tick re-returns
  *   rows already on screen. `selectTailRows` filters them against the keys of
- *   everything displayed, keyed on the event's own `metadata.uid` via the
- *   shared `rowKey` (positional `result-N` ids cannot be compared across
+ *   everything displayed, keyed on the event's own identity (`metadata.uid`,
+ *   else the ClickHouse event `id`) via `rowKey` (positional `result-N` ids cannot be compared across
  *   requests).
  * - **No runaway watermark**: the watermark only ever advances to the newest
  *   event time actually seen, clamped to wall-clock now. A single event with a
@@ -44,11 +40,11 @@
  *   real and open a permanent hole.
  */
 
-import { rowKey, type ResultRow } from './async-search-paging';
+import { rowKey, type ResultRow } from './search-row-key';
 
 /**
- * Minimum overlap re-asked on every tick. Sized against the lake's
- * arrival→searchable budget (≤ 2 min); below it, slow shards drop rows.
+ * Minimum overlap re-asked on every tick. Sized against the arrival→
+ * searchable budget (≤ 2 min); below it, late inserts would drop rows.
  */
 export const TAIL_LOOKBACK_MS = 120_000;
 
@@ -470,6 +466,14 @@ export const TAIL_POLL_MAX_PAGES = 8;
 export interface TailPageFetch<T> {
   /** One newest-first page in `[startMs, endMs]`, or `null` when the read did not return rows (escalated job). */
   fetchPage: (window: TailWindow) => Promise<T[] | null>;
+  /**
+   * One page of the rows at exactly `instantMs`, in a stable order (event id),
+   * starting at `offset` within that instant; `null` when the read did not
+   * return rows. Used to drain a burst whose rows share one millisecond and so
+   * cannot be paged by moving the time fence. Without it such a burst reports
+   * the catch-up incomplete instead of silently dropping rows.
+   */
+  fetchTied?: (instantMs: number, offset: number) => Promise<T[] | null>;
   /** Event time of a row (epoch ms), or NaN when it has none. */
   rowTimeMs: (row: T) => number;
   window: TailWindow;
@@ -489,8 +493,14 @@ export interface TailPagedPoll<T> {
   capped: boolean;
 }
 
+/**
+ * Event times are millisecond precision (`timestamp DateTime64(3)`) and the
+ * window bounds are inclusive, so `[t, t]` is exactly one instant and
+ * `[start, t - 1]` is everything strictly older than it.
+ */
 export async function collectTailPages<T>({
   fetchPage,
+  fetchTied,
   rowTimeMs,
   window,
   cursorMs,
@@ -498,27 +508,48 @@ export async function collectTailPages<T>({
   maxPages = TAIL_POLL_MAX_PAGES,
 }: TailPageFetch<T>): Promise<TailPagedPoll<T>> {
   const rows: T[] = [];
+  let pages = 0;
+  const done = (complete: boolean, capped = false): TailPagedPoll<T> => ({ rows, pages, complete, capped });
   let endMs = window.endMs;
-  for (let page = 0; page < maxPages; page++) {
+  while (pages < maxPages) {
     const batch = await fetchPage({ startMs: window.startMs, endMs });
-    if (batch === null) return { rows, pages: page, complete: false, capped: false };
+    if (batch === null) return done(false);
+    pages += 1;
     rows.push(...batch);
-    if (batch.length < pageSize) return { rows, pages: page + 1, complete: true, capped: false };
+    if (batch.length < pageSize) return done(true);
     let oldest = Number.POSITIVE_INFINITY;
+    let tied = 0;
     for (const row of batch) {
       const ms = rowTimeMs(row);
-      if (Number.isFinite(ms) && ms < oldest) oldest = ms;
+      if (!Number.isFinite(ms)) continue;
+      if (ms < oldest) { oldest = ms; tied = 1; } else if (ms === oldest) tied += 1;
     }
-    // Reached the cursor: everything older was seen before (the overlap below
-    // it is re-read by the window's lookback on every tick anyway).
-    if (oldest <= cursorMs) return { rows, pages: page + 1, complete: true, capped: false };
-    // The fence must move down, or a page of one instant would repeat. It
-    // keeps the oldest instant itself (+1 ms) whether `end` is read
-    // inclusively or not; rows re-read there are dropped by the dedupe.
-    if (!Number.isFinite(oldest) || oldest + 1 >= endMs || oldest <= window.startMs) {
-      return { rows, pages: page + 1, complete: true, capped: false };
+    if (!Number.isFinite(oldest)) return done(false);
+    // The page holds rows strictly older than the cursor, so every row at or
+    // after the cursor instant is in it (pages are newest first): caught up.
+    // The overlap below the cursor is re-read by the lookback on every tick.
+    if (oldest < cursorMs) return done(true);
+    // The page also holds newer rows, so the oldest instant did not fill it:
+    // move the fence down, keeping that instant (its re-read rows dedupe).
+    if (tied < batch.length && oldest > cursorMs && oldest + 1 < endMs) {
+      endMs = oldest + 1;
+      continue;
     }
-    endMs = oldest + 1;
+    // The oldest instant filled the page, or it is the cursor's own instant
+    // (its rows may continue past this page). A time fence cannot split one
+    // millisecond, so drain the instant by offset in a stable order before
+    // going older; never report caught up with part of it unread.
+    if (!fetchTied) return done(false);
+    for (let offset = 0; ; offset += pageSize) {
+      if (pages >= maxPages) return done(false, true);
+      const tiedRows = await fetchTied(oldest, offset);
+      if (tiedRows === null) return done(false);
+      pages += 1;
+      rows.push(...tiedRows);
+      if (tiedRows.length < pageSize) break;
+    }
+    if (oldest <= cursorMs || oldest - 1 < window.startMs) return done(true);
+    endMs = oldest - 1;
   }
-  return { rows, pages: maxPages, complete: false, capped: true };
+  return done(false, true);
 }

@@ -20,20 +20,20 @@
 use super::ast::{AnomalyMethod, BinSpan, Command, WindowType};
 
 /// Columns the anomaly scoring wrapper projects for `method`
-/// (`zscore_outer_sql_with_alias` / `mad_outer_sql_with_alias`).
+/// (`zscore_outer_sql_with_alias` / `mad_outer_sql_with_alias`). clickhouse/dev
+/// projects no `expected` column (main's anomaly wrapper does), so it is not
+/// registered here.
 fn anomaly_columns(method: &AnomalyMethod) -> &'static [&'static str] {
     match method {
         AnomalyMethod::ZScore => &[
             "anomaly_score",
             "is_anomaly",
-            "expected",
             "avg_val",
             "stddev_val",
         ],
         AnomalyMethod::Mad => &[
             "anomaly_score",
             "is_anomaly",
-            "expected",
             "median_val",
             "mad_val",
         ],
@@ -122,7 +122,8 @@ pub(crate) fn command_created_columns(command: &Command) -> Vec<String> {
                 out.push(output.clone());
             }
             // Hop and sliding time windows also project `<output>_end`.
-            if matches!(span, BinSpan::Time(_))
+            // `bins=N` resolves to a time span in the generator (NAN-4933).
+            if matches!(span, BinSpan::Time(_) | BinSpan::Bins(_))
                 && matches!(window_type, WindowType::Hop { .. } | WindowType::Sliding)
             {
                 out.push(format!("{output}_end"));
@@ -177,7 +178,6 @@ mod tests {
     fn anomaly_field_form_registers_helper_columns() {
         let cols = command_created_columns(&last_command("* | anomaly field=traffic.bytes_out"));
         for c in [
-            "expected",
             "avg_val",
             "stddev_val",
             "anomaly_score",
@@ -185,6 +185,14 @@ mod tests {
         ] {
             assert!(cols.iter().any(|x| x == c), "missing {c}: {cols:?}");
         }
+    }
+
+    #[test]
+    fn bin_bins_hop_registers_the_end_column() {
+        assert_eq!(
+            command_created_columns(&last_command("* | bin bins=10 hop=5m")),
+            vec!["time_bucket", "time_bucket_end"]
+        );
     }
 
     #[test]

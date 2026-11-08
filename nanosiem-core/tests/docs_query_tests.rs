@@ -1483,7 +1483,8 @@ fn doc_stats_count_by_user() {
 
 #[test]
 fn doc_stats_count_by_user_2() {
-    npl("* | stats count() by user | append [search earliest=-30d latest=-7d | stats count() as baseline by user]");
+    // NAN-3337: a subsearch runs over the search's own time range; bound it with `where`.
+    npl("* earliest=-30d | where time >= now() - INTERVAL 7 DAY | stats count() by user | append [search * | where time < now() - INTERVAL 7 DAY | stats count() as baseline by user]");
 }
 
 #[test]
@@ -2060,7 +2061,8 @@ fn doc_action_login_11() {
 
 #[test]
 fn doc_action_login_earliest_1d() {
-    npl("action=login earliest=-1d | stats count() as today | append [search action=login earliest=-2d latest=-1d | stats count() as yesterday]");
+    // NAN-3337: a subsearch runs over the search's own time range; bound it with `where`.
+    npl("action=login earliest=-2d | where time >= now() - INTERVAL 1 DAY | stats count() as today | append [search action=login | where time < now() - INTERVAL 1 DAY | stats count() as yesterday]");
 }
 
 #[test]
@@ -2924,7 +2926,8 @@ fn doc_status_401_or_status_403() {
 
 #[test]
 fn doc_status_500() {
-    npl("status=500 | append [search status=500 earliest=-7d latest=-1d]");
+    // NAN-3337: a subsearch runs over the search's own time range; bound it with `where`.
+    npl("status=500 earliest=-7d | where time >= now() - INTERVAL 1 DAY | append [search status=500 | where time < now() - INTERVAL 1 DAY]");
 }
 
 #[test]

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { TelemetrySetupHint } from '@/components/observability/TelemetryUnavailable';
+import { TelemetrySetupHint } from '@/components/observability/TelemetrySetupHint';
 
 // TracesTab (NAN-1536) — the Observability console's Traces surface. Ported from
 // the design handoff's obs-traces.jsx (TracesExplorer) and wired to REAL data:

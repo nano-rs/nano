@@ -44,8 +44,6 @@ const NOTIFICATION_ICONS: Record<NotificationType, typeof Bell> = {
   alert_assigned: AlertTriangle,
   ai_provider_down: ServerCrash,
   data_feed_stale: Database,
-  // NAN-3207: one segment (class / region / account …) of a source stopped.
-  data_feed_segment_drop: Database,
   search_access_removed: Info,
   case_access_removed: Info,
   system: Info,
@@ -72,8 +70,6 @@ const NOTIFICATION_TONE: Partial<Record<NotificationType, Tone>> = {
   alert_assigned: 'danger',
   ai_provider_down: 'danger',
   data_feed_stale: 'warn',
-  data_feed_segment_drop: 'warn',
-  internal_domains_changed: 'warn',
   tuning_validation_complete: 'good',
   tuning_promoted: 'good',
   tuning_reverted: 'warn',
@@ -83,6 +79,7 @@ const NOTIFICATION_TONE: Partial<Record<NotificationType, Tone>> = {
   case_access_removed: 'warn',
   report_ready: 'good',
   model_deprecated: 'warn',
+  internal_domains_changed: 'warn',
 };
 
 const TONE_TILE: Record<Tone, string> = {

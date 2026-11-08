@@ -1,8 +1,6 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 //! Shared pagination resolution.
 //!
-//! Many list endpoints across `nanosiem-api` and the enterprise crate accept a
+//! Many list endpoints across `nanosiem-api` and `nanosiem-enterprise` accept a
 //! `limit` + `offset` pair on the query string. Historically each handler
 //! re-declared its own `ListXxxQuery { limit, offset }` and re-implemented the
 //! clamp/default inline — and those clamps **drifted**: different defaults,

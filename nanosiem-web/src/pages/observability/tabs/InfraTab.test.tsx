@@ -5,6 +5,11 @@ import { MemoryRouter } from 'react-router-dom';
 import { InfraTab } from './InfraTab';
 const mocks = vi.hoisted(() => ({ get: vi.fn() }));
 vi.mock('@/lib/api', () => ({ api: { observability: { getInfraHosts: mocks.get } } }));
+// NAN-4903: the host pivot reads the active schema profile; pin it to UDM.
+vi.mock('@/hooks/useSchemaFieldMap', async () => {
+  const { schemaFieldMap } = await import('@/lib/schema-fields');
+  return { useSchemaFieldMap: () => ({ ...schemaFieldMap('udm'), ready: true, unresolved: false, error: false, unresolvedReason: null, retry: () => {}, guard: <A extends unknown[]>(fn: (...a: A) => void) => fn }) };
+});
 const range = { type: 'preset' as const, preset: '15m' as const };
 const node = { host: 'cluster/node-a', node_name: 'node-a', kind: 'node', group: 'cluster/region/lake-cells', instance_type: 'compute1-30', cpu_pct: null, mem_pct: null, load: null, net_bytes_per_sec: null, status: 'unknown' };
 const pod = { host: 'cluster/runtime/api-abc', kind: 'pod', pod_name: 'api-abc', namespace: 'runtime', workload: 'api', node_name: 'node-a', cluster: 'cluster', region: 'region', group: 'cluster/region/runtime/api', phase: 'Running', status: 'warn', cpu_cores: 0, mem_bytes: 10485760, restarts: 3, cpu_pct: null, mem_pct: null, load: null, net_bytes_per_sec: null };

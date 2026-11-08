@@ -13,33 +13,6 @@ use crate::models::{DetectionRule, NewDetectionRule, RuleMode, Severity, UpdateD
 use super::DetectionError;
 use super::DetectionService;
 
-const LAKE_REALTIME_SCHEDULE_CRON: &str = "*/5 * * * * *";
-
-use super::super::scheduler::DEFAULT_SCHEDULE_CRON;
-
-/// Treat a blank cron as absent, so `""` from a form takes the default
-/// instead of failing cron validation or being stored.
-fn blank_cron_to_none(cron: &mut Option<String>) {
-    if cron.as_deref().is_some_and(|c| c.trim().is_empty()) {
-        *cron = None;
-    }
-}
-
-/// The cron a scheduled rule must carry after a create or update.
-///
-/// `requested` is the cron in the request (already blank-normalized) and
-/// `existing` the stored one (`None` on create). Returns the default only when
-/// the rule is scheduled and would otherwise be left with no cron.
-fn scheduled_cron_default(
-    detection_mode: crate::models::detection_rule::DetectionMode,
-    requested: Option<&str>,
-    existing: Option<&str>,
-) -> Option<String> {
-    use crate::models::detection_rule::DetectionMode;
-    (detection_mode == DetectionMode::Scheduled && requested.is_none() && existing.is_none())
-        .then(|| DEFAULT_SCHEDULE_CRON.to_string())
-}
-
 const RUNTIME_DDL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl DetectionService {
@@ -49,7 +22,8 @@ impl DetectionService {
 
     /// Whether a rule targets the derived `risk` dataset (NAN-1805).
     pub(crate) fn is_risk_dataset_rule(rule: &DetectionRule) -> bool {
-        crate::detection::entity_risk::is_risk_dataset_rule(rule)
+        crate::query::Dataset::from_selector(rule.dataset.as_deref().unwrap_or("logs"))
+            == crate::query::Dataset::Risk
     }
 
     /// Feedback-loop guard for `dataset=risk` rules (NAN-1805), enforced at
@@ -114,20 +88,10 @@ impl DetectionService {
     #[instrument(skip(self, rule), fields(rule_name = %rule.name))]
     pub async fn create_rule(
         &self,
-        mut rule: NewDetectionRule,
+        rule: NewDetectionRule,
     ) -> Result<DetectionRule, DetectionError> {
         // Validate the query syntax
         self.validate_query(&rule.query)?;
-
-        blank_cron_to_none(&mut rule.schedule_cron);
-        if let Some(cron) = scheduled_cron_default(
-            rule.detection_mode
-                .unwrap_or(crate::models::detection_rule::DetectionMode::Scheduled),
-            rule.schedule_cron.as_deref(),
-            None,
-        ) {
-            rule.schedule_cron = Some(cron);
-        }
 
         // Validate cron expression if provided
         if let Some(ref cron) = rule.schedule_cron {
@@ -187,15 +151,15 @@ impl DetectionService {
     ///
     /// This method validates the rule based on its detection mode and routes it to the
     /// appropriate execution tier:
-    /// - Real-Time: Creates a ClickHouse materialized view in the legacy profile
-    /// - Real-Time (lake): Registers a five-second durable micro-batch
+    /// - Real-Time: Creates a ClickHouse materialized view for instant detection
+    /// - Near Real-Time: Registers with the NRT engine for micro-batch processing
     /// - Scheduled: Uses the existing scheduler for cron-based execution
     ///
     /// Requirements: 2.2, 2.3, 2.4, 5.3
     #[instrument(skip(self, rule, materialized_view_generator), fields(rule_name = %rule.name, detection_mode = ?rule.detection_mode))]
     pub async fn create_rule_with_mode(
         &self,
-        mut rule: NewDetectionRule,
+        rule: NewDetectionRule,
         materialized_view_generator: &super::super::materialized_view::MaterializedViewGenerator,
     ) -> Result<DetectionRule, DetectionError> {
         use crate::models::detection_rule::DetectionMode;
@@ -203,24 +167,13 @@ impl DetectionService {
         // Validate the query syntax
         self.validate_query(&rule.query)?;
 
-        // Get detection mode (default to Scheduled)
-        let detection_mode = rule.detection_mode.unwrap_or(DetectionMode::Scheduled);
-        let lake_realtime = detection_mode == DetectionMode::RealTime
-            && self.search_service.backend() == crate::search::SearchBackend::Lake;
-        blank_cron_to_none(&mut rule.schedule_cron);
-        if lake_realtime && rule.schedule_cron.is_none() {
-            rule.schedule_cron = Some(LAKE_REALTIME_SCHEDULE_CRON.to_string());
-        }
-        if let Some(cron) =
-            scheduled_cron_default(detection_mode, rule.schedule_cron.as_deref(), None)
-        {
-            rule.schedule_cron = Some(cron);
-        }
-
         // Validate cron expression if provided
         if let Some(ref cron) = rule.schedule_cron {
             self.validate_cron(cron)?;
         }
+
+        // Get detection mode (default to Scheduled)
+        let detection_mode = rule.detection_mode.unwrap_or(DetectionMode::Scheduled);
 
         // NAN-1805: feedback-loop guard for dataset=risk rules.
         Self::validate_risk_dataset_rule(
@@ -255,17 +208,6 @@ impl DetectionService {
                 // Real-time rules must be simple filters (no aggregations, no joins)
                 // risk_entity_field is optional (auto-detects or defaults to src_ip)
                 self.validate_realtime_rule(&rule)?;
-
-                // The lake has no resident server-side materialized views.
-                // Keep the user-facing real-time mode and execute the exact
-                // same rule through the durable five-second scheduler lane.
-                if lake_realtime {
-                    info!(
-                        "Registered lake real-time rule {} for durable micro-batch execution",
-                        rule.name
-                    );
-                    return Ok(self.rule_repo.create(&rule).await?);
-                }
 
                 // Create the rule in the database first
                 let created_rule = self.rule_repo.create(&rule).await?;
@@ -368,19 +310,10 @@ impl DetectionService {
     pub async fn update_rule(
         &self,
         id: Uuid,
-        mut update: UpdateDetectionRule,
+        update: UpdateDetectionRule,
     ) -> Result<DetectionRule, DetectionError> {
         // Get the existing rule to check if it's archived
         let existing_rule = self.get_rule(id).await?;
-
-        blank_cron_to_none(&mut update.schedule_cron);
-        if let Some(cron) = scheduled_cron_default(
-            update.detection_mode.unwrap_or(existing_rule.detection_mode),
-            update.schedule_cron.as_deref(),
-            existing_rule.schedule_cron.as_deref(),
-        ) {
-            update.schedule_cron = Some(cron);
-        }
 
         // Prevent changing mode of archived rules (except to staging)
         if existing_rule.archived {
@@ -463,7 +396,7 @@ impl DetectionService {
     pub async fn update_rule_with_mode(
         &self,
         id: Uuid,
-        mut update: UpdateDetectionRule,
+        update: UpdateDetectionRule,
         materialized_view_generator: &super::super::materialized_view::MaterializedViewGenerator,
         created_by: Option<Uuid>,
     ) -> Result<DetectionRule, DetectionError> {
@@ -476,8 +409,6 @@ impl DetectionService {
             self.validate_query(query)?;
         }
 
-        blank_cron_to_none(&mut update.schedule_cron);
-
         // Validate cron expression if it's being updated
         if let Some(ref cron) = update.schedule_cron {
             self.validate_cron(cron)?;
@@ -487,24 +418,6 @@ impl DetectionService {
         let existing_rule = self.get_rule(id).await?;
         let old_mode = existing_rule.detection_mode;
         let new_mode = update.detection_mode.unwrap_or(old_mode);
-        let lake_realtime_runtime =
-            self.search_service.backend() == crate::search::SearchBackend::Lake;
-        if lake_realtime_runtime
-            && new_mode == DetectionMode::RealTime
-            && update.schedule_cron.is_none()
-            && existing_rule.schedule_cron.is_none()
-        {
-            update.schedule_cron = Some(LAKE_REALTIME_SCHEDULE_CRON.to_string());
-        }
-        // NAN-3468: also repairs a rule saved before the default existed, the
-        // next time it is updated (for example `PUT {"mode":"live"}`).
-        if let Some(cron) = scheduled_cron_default(
-            new_mode,
-            update.schedule_cron.as_deref(),
-            existing_rule.schedule_cron.as_deref(),
-        ) {
-            update.schedule_cron = Some(cron);
-        }
 
         info!(
             "Updating detection rule: {} (mode: {:?} → {:?})",
@@ -618,24 +531,6 @@ impl DetectionService {
                     .or(existing_rule.alert_cooldown_minutes),
             };
             self.validate_realtime_rule(&validation_rule)?;
-        }
-
-        // Lake real-time rules are ordinary durable rule rows claimed by the
-        // short-window scheduler. No ClickHouse DDL or reconciliation tombstone
-        // belongs in this profile, including mode changes and query edits.
-        if lake_realtime_runtime {
-            update.materialized_view_name = Some(None);
-            let updated_rule = self.rule_repo.update(id, &update).await?;
-            let reason = match (old_mode, new_mode) {
-                (DetectionMode::Scheduled, DetectionMode::RealTime) => {
-                    "mode_change_to_realtime_microbatch"
-                }
-                (DetectionMode::RealTime, DetectionMode::Scheduled) => "mode_change_to_scheduled",
-                _ => "manual_edit",
-            };
-            self.create_version_entry(&updated_rule, created_by, reason, None)
-                .await;
-            return Ok(updated_rule);
         }
 
         // Handle mode transitions
@@ -891,9 +786,7 @@ impl DetectionService {
             return Err(DetectionError::RuleExecuting(id));
         }
 
-        if rule.detection_mode == DetectionMode::RealTime
-            && self.search_service.backend() != crate::search::SearchBackend::Lake
-        {
+        if rule.detection_mode == DetectionMode::RealTime {
             let view_name = rule.materialized_view_name.clone().unwrap_or_else(|| {
                 super::super::materialized_view::MaterializedViewGenerator::view_name_for_rule_id(
                     rule.id,
@@ -959,38 +852,98 @@ impl DetectionService {
             })
     }
 
-    /// Pause a detection rule (set mode to paused)
+    /// Pause a detection rule and remember the exact active mode to restore.
     #[instrument(skip(self))]
-    pub async fn pause_rule(&self, id: Uuid) -> Result<DetectionRule, DetectionError> {
-        info!("Pausing detection rule: {}", id);
-        let rule = self.rule_repo.pause(id).await?;
-        Ok(rule)
+    pub async fn pause_rule(
+        &self,
+        id: Uuid,
+        expected_mode: Option<RuleMode>,
+    ) -> Result<(Option<RuleMode>, DetectionRule), DetectionError> {
+        let Some(expected_mode) = expected_mode else {
+            return self.rule_repo.pause_legacy(id).await.map_err(Into::into);
+        };
+        if !matches!(expected_mode, RuleMode::Live | RuleMode::Alerting) {
+            return Err(DetectionError::InvalidStateTransition(format!(
+                "Rule {id} cannot be paused from '{expected_mode}' mode"
+            )));
+        }
+        info!("Pausing detection rule {} from {} mode", id, expected_mode);
+        let rule = self.rule_repo.pause(id, expected_mode).await?;
+        Ok((Some(expected_mode), rule))
     }
 
-    /// Resume a paused detection rule (set mode back to alerting)
+    /// Resume a paused detection rule to its persisted pre-pause mode.
     #[instrument(skip(self))]
-    pub async fn resume_rule(&self, id: Uuid) -> Result<DetectionRule, DetectionError> {
+    pub async fn resume_rule(
+        &self,
+        id: Uuid,
+        expected_mode: Option<RuleMode>,
+    ) -> Result<(Option<RuleMode>, DetectionRule), DetectionError> {
+        let Some(expected_mode) = expected_mode else {
+            return self.rule_repo.resume_legacy(id).await.map_err(Into::into);
+        };
+        if expected_mode != RuleMode::Paused {
+            return Err(DetectionError::InvalidStateTransition(format!(
+                "Rule {id} cannot be resumed from '{expected_mode}' mode"
+            )));
+        }
         info!("Resuming detection rule: {}", id);
-        let rule = self.rule_repo.resume(id).await?;
-        Ok(rule)
+        let rule = self.rule_repo.resume(id, expected_mode).await?;
+        Ok((Some(expected_mode), rule))
     }
 
-    /// Promote a rule from live to alerting mode
-    /// Call this after bake-in period when you're confident the rule has low false positives
+    /// Promote a rule by one lifecycle step: staging -> live -> alerting.
+    ///
+    /// Guarded callers provide `expected_mode`, which is enforced by the
+    /// repository's conditional update. Legacy callers may omit it; the
+    /// repository serializes that compatibility path and suppresses another
+    /// unguarded transition inside a short dwell.
     #[instrument(skip(self))]
-    pub async fn promote_to_alerting(&self, id: Uuid) -> Result<DetectionRule, DetectionError> {
-        info!("Promoting rule {} to alerting mode", id);
-        let rule = self.rule_repo.promote_to_alerting(id).await?;
-        Ok(rule)
+    pub async fn promote_rule(
+        &self,
+        id: Uuid,
+        expected_mode: Option<RuleMode>,
+    ) -> Result<(Option<RuleMode>, DetectionRule), DetectionError> {
+        let Some(source_mode) = expected_mode else {
+            return self.rule_repo.promote_legacy(id).await.map_err(Into::into);
+        };
+        info!("Promoting rule {} from source {} mode", id, source_mode);
+        let rule = match source_mode {
+            RuleMode::Staging => self.rule_repo.promote_to_live(id).await?,
+            RuleMode::Live => self.rule_repo.promote_to_alerting(id).await?,
+            mode => {
+                return Err(DetectionError::InvalidStateTransition(format!(
+                    "Rule {id} cannot be promoted from '{mode}' mode"
+                )))
+            }
+        };
+        Ok((Some(source_mode), rule))
     }
 
-    /// Demote a rule from alerting to live mode for tuning
-    /// Use this if a production rule starts generating too many false positives
+    /// Demote a rule by one lifecycle step: alerting -> live -> staging.
+    ///
+    /// See [`Self::promote_rule`] for the guarded and legacy compatibility
+    /// semantics shared by both lifecycle directions.
     #[instrument(skip(self))]
-    pub async fn demote_to_live(&self, id: Uuid) -> Result<DetectionRule, DetectionError> {
-        info!("Demoting rule {} to live mode for tuning", id);
-        let rule = self.rule_repo.demote_to_live(id).await?;
-        Ok(rule)
+    pub async fn demote_rule(
+        &self,
+        id: Uuid,
+        expected_mode: Option<RuleMode>,
+    ) -> Result<(Option<RuleMode>, DetectionRule), DetectionError> {
+        let Some(source_mode) = expected_mode else {
+            return self.rule_repo.demote_legacy(id).await.map_err(Into::into);
+        };
+        info!("Demoting rule {} from source {} mode", id, source_mode);
+        let rule = match source_mode {
+            RuleMode::Alerting => self.rule_repo.demote_to_live(id).await?,
+            RuleMode::Live => self.rule_repo.demote_to_staging(id).await?,
+            mode => {
+                return Err(DetectionError::InvalidStateTransition(format!(
+                    "Rule {id} cannot be demoted from '{mode}' mode"
+                )))
+            }
+        };
+        Ok((Some(source_mode), rule))
     }
 
     /// Set a rule's mode directly (used by bulk operations)
@@ -1017,16 +970,12 @@ impl DetectionService {
 
     /// Sync `next_run_at` for distributed scheduling based on the rule's current state.
     ///
-    /// Sets next_run_at if the rule is active and has a cron. Legacy real-time
-    /// rules remain materialized views; lake real-time rules use the durable
-    /// five-second micro-batch scheduler.
+    /// Sets next_run_at if the rule is active (not staging/paused), scheduled, and has a cron.
+    /// Clears next_run_at otherwise (paused, staging, real-time, or no cron).
     pub async fn sync_next_run_at(&self, rule: &DetectionRule) {
         use crate::models::detection_rule::{DetectionMode, RuleMode};
 
-        let schedulable_mode = rule.detection_mode == DetectionMode::Scheduled
-            || (rule.detection_mode == DetectionMode::RealTime
-                && self.search_service.backend() == crate::search::SearchBackend::Lake);
-        let should_schedule = schedulable_mode
+        let should_schedule = rule.detection_mode == DetectionMode::Scheduled
             && rule.mode != RuleMode::Staging
             && rule.mode != RuleMode::Paused
             && rule.schedule_cron.is_some();
@@ -1050,7 +999,7 @@ impl DetectionService {
 
         // Audit D27: a scheduled, runnable rule with NO cron is excluded from
         // both claiming and startup backfill — it silently never runs. Surface it.
-        if schedulable_mode
+        if rule.detection_mode == DetectionMode::Scheduled
             && rule.mode != RuleMode::Staging
             && rule.mode != RuleMode::Paused
             && rule.schedule_cron.is_none()

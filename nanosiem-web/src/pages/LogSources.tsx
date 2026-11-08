@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useMemo, useState, type ReactNode } from 'react';
+import { useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -43,6 +43,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { DeliveryAttentionBadge } from '@/components/log-sources/DeliveryAttentionBadge';
+import { deliveryAttentionBySource, type DeliveryAttention } from '@/lib/delivery-attention';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import {
   useDeleteLogSource,
@@ -55,27 +57,24 @@ import {
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
-import { INGEST_CREDENTIALS_QUERY_KEY } from '@/lib/add-data-sources';
 import type { LogSource } from '@/lib/api';
-import { logSourceTransportLabel } from '@/lib/log-source-transports';
-import { formatCompactNumber, formatRelativeCompact } from '@/lib/date-utils';
-import { cn } from '@/lib/utils';
 import { LogSourcesPageShell } from '@/components/add-data/LogSourcesPageShell';
-import { TenzirBucketDropLead } from '@/components/add-data/TenzirBucketDropLead';
-import { TenzirOnlyNote } from '@/components/add-data/TenzirOnlyNote';
-import { useIngestGate } from '@/hooks/use-capabilities';
 import { IngestionActivityChart } from '@/components/log-sources/IngestionActivityChart';
-import { PlatformUpdateBanner } from '@/components/parser-rollout/PlatformUpdateBanner';
-import { receivingWithoutParser, logSourceSlugLabel, logSourceSlugs, platformLaneRows, type PlatformLaneRow } from '@/lib/log-source-lanes';
-import { usePipeInputSummary } from '@/hooks/use-pipe-inputs';
-import type { PipeInputAttention } from '@/lib/api/pipelines';
-import { DeliveryAttentionBadge } from '@/components/log-sources/DeliveryAttentionBadge';
-import { UnassignedSources, unassignedCredentials } from '@/components/log-sources/UnassignedSources';
-import { AddFeed } from './AddFeed';
-import { RefusedEventsBadge } from '@/components/log-sources/RefusedEventsBadge';
+import { ADD_DATA_PATH } from '@/lib/add-data-sources';
+import { formatCompactNumber, formatRelativeCompact } from '@/lib/date-utils';
+import { logSourceSlugLabel, receivingWithoutParser } from '@/lib/log-source-lanes';
+import { UnassignedSources } from '@/components/log-sources/UnassignedSources';
+import {
+  CONNECT_STATE_LABEL,
+  CONNECT_STATUS_QUERY_KEY,
+  type LogSourceConnectStatus,
+} from '@/lib/api/log-source-connect';
+import { logSourceTransportLabel } from '@/lib/log-source-transports';
+import { cn } from '@/lib/utils';
 
 type DerivedStatus = 'deployed' | 'ready' | 'paused' | 'draft';
 type FilterId = 'all' | 'deployed' | 'ready' | 'warn' | 'draft';
+
 
 function deriveStatus(ls: LogSource): DerivedStatus {
   // NAN-1920: a wizard draft (never deployed, still being built) is the most
@@ -93,16 +92,13 @@ function derivePendingDeploy(ls: LogSource): boolean {
 
 const TRANSPORT_COLOR = 'oklch(72% 0.15 200)';
 
+
 export function LogSources() {
   useDocumentTitle('Log Sources');
   const { toast } = useToast();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const { hasPermission, user } = useAuth();
-  // NAN-2361: on the hosted-shared lake data reaches the tenant's own ingest
-  // endpoint and is parsed by the platform parser cell; "deploy" activates the
-  // registry entry instead of rendering a Vector configuration.
-  const sharedTenant = user?.deployment_mode === 'enterprise_shared';
+  const { hasPermission } = useAuth();
 
   const { data: logSources, loading, refetch } = useLogSources();
   const { data: ingestionHistory } = useIngestionHistory(24);
@@ -111,33 +107,14 @@ export function LogSources() {
   const { mutate: deployLogSource } = useDeployLogSource();
   const { mutate: undeployLogSource } = useUndeployLogSource();
 
-  // NAN-3844: an `install.sh --tenzir` install has no Vector. New sources
-  // (push / pull) and parser deploys are off; the page leads with the
-  // Tenzir bucket drop instead.
-  const { tenzirOnly, blocked } = useIngestGate();
-  const canCreate = hasPermission('log_sources:create') && !blocked;
+  const canCreate = hasPermission('log_sources:create');
   const canEdit = hasPermission('log_sources:edit');
   const canDelete = hasPermission('log_sources:delete');
-  const canDeploy = hasPermission('log_sources:deploy') && !blocked;
-
-  // NAN-3661: a failed, blocked or paused pull source / connector feed into a
-  // source's lane is flagged on its row (the reason is on hover; the detail
-  // page's Delivery panel has the fix).
-  const inputSummary = usePipeInputSummary({ enabled: sharedTenant && hasPermission('log_sources:view') });
-  const attentionBySource = useMemo(() => {
-    const map = new Map<string, PipeInputAttention[]>();
-    for (const lane of inputSummary.data?.sources ?? []) {
-      if (lane.attention?.length) map.set(lane.log_source_id, lane.attention);
-    }
-    return map;
-  }, [inputSummary.data]);
+  const canDeploy = hasPermission('log_sources:deploy');
 
   // Per-source RBAC scoping (NAN-1802): mark feeds whose `source_type` is in the
   // restricted registry. Only fetched for admins who can view scopes — others
   // never see the badge (and don't fire a 403). An empty registry = allow-all.
-  // Hosted-shared (NAN-2361 wave 8): the registry is the read-only view of the
-  // group-based model and its values are lake source slugs, matched against
-  // the entry's `ingest.source_slugs`.
   const canViewScopes = hasPermission('source_scopes:view');
   const { data: restrictedResp } = useQuery({
     queryKey: ['source-scopes-restricted'],
@@ -150,9 +127,42 @@ export function LogSources() {
     [restrictedResp],
   );
 
+  // NAN-4912: per-source connect state ("receiving · not parsed", ...). A read
+  // failure only hides the column's extra line; the list still renders.
+  const { data: connectStatuses } = useQuery({
+    queryKey: CONNECT_STATUS_QUERY_KEY,
+    queryFn: () => api.logSourceConnect.listStatus(),
+    refetchInterval: 30_000,
+    retry: 1,
+  });
+  const connectById = useMemo(
+    () => new Map((connectStatuses ?? []).map((c) => [c.source_id, c])),
+    [connectStatuses],
+  );
+
+  // NAN-4941 (main's NAN-3661): flag rows whose pull config or connector feed
+  // needs attention. Each list is read only with its own permission; a missing
+  // list just means no flag of that kind.
+  const { data: sourceConfigs } = useQuery({
+    queryKey: ['sourceConfigs'],
+    queryFn: () => api.listSourceConfigs(),
+    enabled: hasPermission('source_configs:view'),
+    staleTime: 30_000,
+  });
+  const { data: connectorFeeds } = useQuery({
+    queryKey: ['connectorFeeds'],
+    queryFn: () => api.connectorFeeds.list(),
+    enabled: hasPermission('log_sources:view'),
+    staleTime: 30_000,
+    retry: 1,
+  });
+  const attentionBySource = useMemo(
+    () => deliveryAttentionBySource(logSources ?? [], sourceConfigs, connectorFeeds),
+    [logSources, sourceConfigs, connectorFeeds],
+  );
+
   const [searchQuery, setSearchQuery] = useState('');
   const [filter, setFilter] = useState<FilterId>('all');
-  const credentials = useQuery({ queryKey: INGEST_CREDENTIALS_QUERY_KEY, queryFn: () => api.listIngestCredentials(), enabled: sharedTenant, refetchInterval: 30_000 });
 
   // Confirmation dialog state — preserved from prior implementation. Toggling a feed
   // is treated as a meaningful operational change (a disabled feed is a real outage
@@ -170,9 +180,7 @@ export function LogSources() {
   >([]);
   const [checkingAssociatedRules, setCheckingAssociatedRules] = useState(false);
 
-  const sources = useMemo(() => logSources ?? [], [logSources]);
-  const extraSourceCount = sharedTenant ? unassignedCredentials(credentials.data?.credentials ?? [], sources).length : 0;
-  const visibleExtraCount = filter === 'all' && sharedTenant ? unassignedCredentials(credentials.data?.credentials ?? [], sources, searchQuery).length : 0;
+  const sources = logSources ?? [];
 
   const stats = useMemo(() => {
     let deployed = 0;
@@ -198,23 +206,13 @@ export function LogSources() {
       if (filter === 'draft' && status !== 'draft') return false;
       if (filter === 'warn' && !derivePendingDeploy(ls)) return false;
       if (!q) return true;
-      const hay = [ls.name, ls.description, ls.vendor, ls.product, ls.source_type, ls.namespace, ls.origin?.label, ...(ls.origin?.deliveries ?? []).map((d) => d.name), ...(logSourceSlugs(ls) ?? [])]
+      const hay = [ls.name, ls.description, ls.vendor, ls.product, ls.source_type, ls.namespace]
         .filter(Boolean)
         .join(' ')
         .toLowerCase();
       return hay.includes(q);
     });
   }, [sources, searchQuery, filter]);
-
-  // NAN-3248: platform-managed lanes (OTLP logs, audit) with data but no
-  // log-source entry get read-only rows from the ingestion history.
-  const platformRows = useMemo(() => {
-    if (!sharedTenant || (filter !== 'all' && filter !== 'deployed')) return [];
-    const q = searchQuery.trim().toLowerCase();
-    return platformLaneRows(ingestionHistory, sources).filter(
-      (r) => !q || `${r.name} ${r.slug} ${r.description}`.toLowerCase().includes(q),
-    );
-  }, [sharedTenant, filter, searchQuery, ingestionHistory, sources]);
 
   // ----- mutations -----
 
@@ -256,9 +254,7 @@ export function LogSources() {
       await deployLogSource(logSourceToAction.id);
       toast({
         title: 'Deployed',
-        description: sharedTenant
-          ? `"${logSourceToAction.name}" is active in your source registry; your parser cell handles its events.`
-          : `"${logSourceToAction.name}" has been deployed to Vector.`,
+        description: `"${logSourceToAction.name}" has been deployed to Vector.`,
       });
       setDeployDialogOpen(false);
       setLogSourceToAction(null);
@@ -365,18 +361,14 @@ export function LogSources() {
 
   return (
     <TooltipProvider delayDuration={200}>
-      {/* NAN-3248: normal document flow inside the app scroller. A fill-height
-          column (h-full + an inner min-h-0 scroll box) gave the table only the
-          height left over by the banner and chart, often ~0, and nothing scrolled. */}
+      {/* NAN-3248 (main; NAN-4922 port): normal document flow inside the app
+          scroller. A fill-height column gave the table only the height left
+          over by the chart, often ~0, and nothing scrolled. */}
       <LogSourcesPageShell active="sources" testId="log-sources-page">
-        {tenzirOnly && <TenzirBucketDropLead />}
-        <HeroStrip stats={{ ...stats, total: stats.total + extraSourceCount }} />
+        <HeroStrip stats={stats} />
 
         <div className="shrink-0 border-b border-border bg-background px-4 pt-3 pb-3 flex flex-col gap-3">
-          {tenzirOnly && <TenzirOnlyNote />}
-          {/* NAN-2607 decision (a): a platform release never overwrites a custom parser; offer the merge. */}
-          {sharedTenant && <PlatformUpdateBanner />}
-          {(!sharedTenant || sources.length > 0 || extraSourceCount > 0) && <IngestionActivityChart history={ingestionHistory ?? []} />}
+          <IngestionActivityChart history={ingestionHistory ?? []} />
         </div>
 
         <Toolbar
@@ -384,32 +376,31 @@ export function LogSources() {
           onQueryChange={setSearchQuery}
           filter={filter}
           onFilterChange={setFilter}
-          stats={{ ...stats, total: stats.total + extraSourceCount }}
+          stats={stats}
           onRefresh={refetch}
           canCreate={canCreate}
-          onNew={() => navigate('/ingestion/log-sources/new')}
+          onNew={() => navigate(ADD_DATA_PATH)}
         />
 
         <div className="overflow-x-auto" data-testid="log-sources-table-region">
-          {loading || (sharedTenant && credentials.isPending) ? (
+          <UnassignedSources />
+          {loading ? (
             <div className="flex items-center justify-center py-16">
               <LoadingIcon className="w-6 h-6 text-muted-foreground" />
             </div>
-          ) : sharedTenant && sources.length === 0 && extraSourceCount === 0 && canCreate && !searchQuery && filter === 'all' && !credentials.isError ? <div className="p-4"><AddFeed inline /></div> : visibleExtraCount === 0 && !credentials.isError && filtered.length === 0 && platformRows.length === 0 ? (
+          ) : filtered.length === 0 ? (
             <EmptyState
               hasQuery={!!searchQuery || filter !== 'all'}
               canCreate={canCreate}
-              onNew={() => navigate('/ingestion/log-sources/new')}
+              onNew={() => navigate(ADD_DATA_PATH)}
               onBrowse={() => navigate('/ingestion/log-sources/repositories')}
             />
           ) : (
             <LogSourceTable
               rows={filtered}
-              hasAdditionalRows={visibleExtraCount > 0 || credentials.isError}
-              additionalRows={sharedTenant && filter === 'all' ? <UnassignedSources sources={sources} canAssign={canDeploy} query={searchQuery} /> : undefined}
-              platformRows={platformRows}
-              restrictedSet={restrictedSet}
+              connectById={connectById}
               attentionBySource={attentionBySource}
+              restrictedSet={restrictedSet}
               canEdit={canEdit}
               canDeploy={canDeploy}
               canDelete={canDelete}
@@ -617,11 +608,9 @@ function Toolbar({
 
 function LogSourceTable({
   rows,
-  additionalRows,
-  hasAdditionalRows = false,
-  platformRows = [],
-  restrictedSet,
+  connectById,
   attentionBySource,
+  restrictedSet,
   canEdit,
   canDeploy,
   canDelete,
@@ -631,11 +620,9 @@ function LogSourceTable({
   onDelete,
 }: {
   rows: LogSource[];
-  additionalRows?: ReactNode;
-  hasAdditionalRows?: boolean;
-  platformRows?: PlatformLaneRow[];
+  connectById: Map<string, LogSourceConnectStatus>;
+  attentionBySource?: Map<string, DeliveryAttention[]>;
   restrictedSet: Set<string>;
-  attentionBySource?: Map<string, PipeInputAttention[]>;
   canEdit: boolean;
   canDeploy: boolean;
   canDelete: boolean;
@@ -644,9 +631,6 @@ function LogSourceTable({
   onUndeploy: (ls: LogSource) => void;
   onDelete: (ls: LogSource) => void;
 }) {
-  // NAN-2361 hosted-shared tenants: the list carries a per-source 24h lake
-  // ingestion summary; dedicated deployments do not (column hidden).
-  const showIngest = rows.some((ls) => ls.ingest != null) || platformRows.length > 0 || hasAdditionalRows;
   return (
     <div className="@container/table">
       <table className="w-full text-[12px]">
@@ -661,32 +645,26 @@ function LogSourceTable({
             <th className="text-left font-medium text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground py-2 w-[200px] @max-[1100px]/table:hidden">
               Vendor / Product
             </th>
-            {showIngest && (
-              <th className="text-left font-medium text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground py-2 w-[170px] @max-[760px]/table:hidden">
-                Ingest 24h
-              </th>
-            )}
+            <th className="text-left font-medium text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground py-2 w-[170px] @max-[760px]/table:hidden">
+              Ingest 24h
+            </th>
             <th className="text-left font-medium text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground py-2 w-[140px]">
               Status
             </th>
             <th className="text-left font-medium text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground py-2 w-[130px] @max-[640px]/table:w-[60px]">
               Enabled
             </th>
-            <th className={hasAdditionalRows ? "w-40 py-2" : "w-[44px] py-2"}></th>
+            <th className="w-[44px] py-2"></th>
           </tr>
         </thead>
         <tbody>
-          {additionalRows}
           {rows.map((ls) => (
             <LogSourceRow
               key={ls.id}
               source={ls}
-              restricted={
-                restrictedSet.has(ls.source_type) ||
-                (ls.ingest?.source_slugs ?? []).some((slug) => restrictedSet.has(slug))
-              }
-              showIngest={showIngest}
+              connect={connectById.get(ls.id)}
               attention={attentionBySource?.get(ls.id)}
+              restricted={restrictedSet.has(ls.source_type)}
               canEdit={canEdit}
               canDeploy={canDeploy}
               canDelete={canDelete}
@@ -696,60 +674,17 @@ function LogSourceTable({
               onDelete={onDelete}
             />
           ))}
-          {platformRows.map((lane) => (
-            <PlatformLaneTableRow
-              key={lane.slug}
-              lane={lane}
-              showIngest={showIngest}
-              restricted={restrictedSet.has(lane.slug)}
-            />
-          ))}
         </tbody>
       </table>
     </div>
   );
 }
 
-const INGEST_HEALTH_DOT: Record<string, string> = {
-  healthy: 'bg-emerald-500',
-  stale: 'bg-amber-500',
-  no_data: 'bg-muted-foreground/40',
-  disabled: 'bg-muted-foreground/40',
-  error: 'bg-red-500',
-};
-
-function IngestSummaryCell({ summary }: { summary: LogSource['ingest'] | null }) {
-  if (!summary) {
-    return <div className="text-[10.5px] text-muted-foreground/70">—</div>;
-  }
-  const failures = summary.parse_failures_24h;
-  return (
-    <div className="min-w-0">
-      <div className="flex items-center gap-1.5">
-        <span className={cn('w-1.5 h-1.5 rounded-full shrink-0', INGEST_HEALTH_DOT[summary.health_status] ?? 'bg-muted-foreground/40')} />
-        <span className="text-[11.5px] font-mono text-foreground tabular-nums">
-          {formatCompactNumber(summary.events_last_24h)}
-        </span>
-        <span className="text-[10px] font-mono text-muted-foreground">ev</span>
-        {failures > 0 && (
-          <span className="text-[10px] font-mono text-red-500 tabular-nums" title={`${failures} parse failures in 24h`}>
-            {formatCompactNumber(failures)} fail
-          </span>
-        )}
-        <RefusedEventsBadge count={summary.refused_events_24h} sample={summary.last_refusal} compact />
-      </div>
-      <div className="text-[10.5px] font-mono text-muted-foreground">
-        {summary.last_event_at ? `Receiving · last ${formatRelativeCompact(summary.last_event_at)}` : 'Waiting for first event'}
-      </div>
-    </div>
-  );
-}
-
 function LogSourceRow({
   source,
-  restricted,
-  showIngest,
+  connect,
   attention,
+  restricted,
   canEdit,
   canDeploy,
   canDelete,
@@ -759,9 +694,9 @@ function LogSourceRow({
   onDelete,
 }: {
   source: LogSource;
+  connect?: LogSourceConnectStatus;
+  attention?: DeliveryAttention[];
   restricted: boolean;
-  showIngest: boolean;
-  attention?: PipeInputAttention[];
   canEdit: boolean;
   canDeploy: boolean;
   canDelete: boolean;
@@ -772,16 +707,17 @@ function LogSourceRow({
 }) {
   const navigate = useNavigate();
   const [params] = useSearchParams();
-  const highlighted = params.get("highlight") === source.id;
+  const highlighted = params.get('highlight') === source.id;
   const status = deriveStatus(source);
   const pending = derivePendingDeploy(source);
   const warn = pending; // single warn signal until backend ships richer health data
   const transportLabel = logSourceTransportLabel(source);
+  const notParsed = receivingWithoutParser(source, connect);
 
   return (
     <tr
       data-highlighted={highlighted || undefined}
-      className={cn("border-b border-border cursor-pointer group hover:bg-foreground/[0.03]", highlighted && "bg-accent outline outline-1 outline-primary -outline-offset-1")}
+      className={cn('border-b border-border cursor-pointer group hover:bg-foreground/[0.03]', highlighted && 'bg-accent outline outline-1 outline-primary -outline-offset-1')}
       onClick={() => navigate(`/ingestion/log-sources/${source.id}`)}
     >
       {/* Feed */}
@@ -795,6 +731,7 @@ function LogSourceRow({
               <span className="text-[12.5px] font-medium text-foreground truncate group-hover:text-primary transition-colors">
                 {source.name}
               </span>
+              {attention && attention.length > 0 && <DeliveryAttentionBadge items={attention} />}
               {warn && (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -811,7 +748,6 @@ function LogSourceRow({
                   </TooltipContent>
                 </Tooltip>
               )}
-              {attention && attention.length > 0 && <DeliveryAttentionBadge items={attention} />}
               {/* Inline transport surfaces when Type col hidden */}
               <span className="hidden @max-[900px]/table:inline-flex items-center gap-1 h-[15px] px-1 rounded-[3px] border border-border bg-foreground/[0.03]">
                 <Globe className="w-[8px] h-[8px]" style={{ color: TRANSPORT_COLOR }} />
@@ -825,8 +761,9 @@ function LogSourceRow({
             )}
             <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
               <span className="text-[10px] font-mono text-muted-foreground" data-testid="log-source-slugs">
-                {logSourceSlugLabel(source)}
+                {logSourceSlugLabel(source, connect)}
               </span>
+              <span className="text-[10px] font-mono text-muted-foreground">{source.source_type}</span>
               {restricted && (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -886,16 +823,25 @@ function LogSourceRow({
         )}
       </td>
 
-      {/* Ingest 24h (hosted-shared tenants) */}
-      {showIngest && (
-        <td className="py-3 align-top @max-[760px]/table:hidden">
-          <IngestSummaryCell summary={source.ingest ?? null} />
-        </td>
-      )}
+      {/* Ingest 24h (from the per-source connect status) */}
+      <td className="py-3 align-top @max-[760px]/table:hidden">
+        <IngestSummaryCell connect={connect ?? null} />
+      </td>
 
       {/* Status */}
       <td className="py-3 align-top">
-        <StatusBadge notParsed={receivingWithoutParser(source)} status={status} validated={source.validated} validationError={source.validation_error} />
+        <StatusBadge notParsed={notParsed} status={status} validated={source.validated} validationError={source.validation_error} />
+        {connect && <ConnectLine connect={connect} />}
+        {status === 'draft' && (
+          <Link
+            to={`/ingestion/log-sources/new?source_id=${encodeURIComponent(source.id)}&stage=${connect && connect.events_24h > 0 ? 'parse' : 'connect'}`}
+            onClick={(e) => e.stopPropagation()}
+            className="block mt-1 text-[10.5px] text-primary hover:underline"
+            data-testid="continue-setup"
+          >
+            Continue setup →
+          </Link>
+        )}
       </td>
 
       {/* Enabled */}
@@ -925,9 +871,11 @@ function LogSourceRow({
       {/* Overflow */}
       <td className="pr-3 py-3 align-top">
         <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-          {canEdit && receivingWithoutParser(source) && <Button variant="outline" size="sm" asChild>
-            <Link to={`/ingestion/log-sources/new?source_id=${encodeURIComponent(source.id)}&stage=parse`}>Build parser</Link>
-          </Button>}
+          {canEdit && notParsed && status !== 'draft' && (
+            <Button variant="outline" size="sm" className="h-7 text-[11px]" asChild>
+              <Link to={`${ADD_DATA_PATH}?source_id=${encodeURIComponent(source.id)}&stage=parse`}>Build parser</Link>
+            </Button>
+          )}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
@@ -995,68 +943,48 @@ function LogSourceRow({
   );
 }
 
-/** NAN-3248: a platform-managed lane (no tenant parser): read-only, not clickable. */
-function PlatformLaneTableRow({
-  lane,
-  showIngest,
-  restricted,
-}: {
-  lane: PlatformLaneRow;
-  showIngest: boolean;
-  restricted: boolean;
-}) {
+const INGEST_HEALTH_DOT: Record<string, string> = {
+  receiving: 'bg-emerald-500',
+  receiving_unparsed: 'bg-amber-500',
+  no_recent_data: 'bg-amber-500',
+  awaiting_data: 'bg-muted-foreground/40',
+  disabled: 'bg-muted-foreground/40',
+};
+
+/** Main's "Ingest 24h" column, from the connect status (rollup counts, any token). */
+function IngestSummaryCell({ connect }: { connect: LogSourceConnectStatus | null }) {
+  if (!connect) {
+    return <div className="text-[10.5px] text-muted-foreground/70">—</div>;
+  }
   return (
-    <tr className="border-b border-border" data-testid={`platform-lane-row-${lane.slug}`}>
-      <td className="pl-4 py-3 align-top">
-        <div className="flex items-start gap-3">
-          <div className="w-[30px] h-[30px] rounded-md border border-border bg-foreground/[0.03] flex items-center justify-center shrink-0 mt-0.5">
-            <Network className="w-[13px] h-[13px] text-muted-foreground" />
-          </div>
-          <div className="min-w-0">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-[12.5px] font-medium text-foreground truncate">{lane.name}</span>
-              <span className="inline-flex items-center h-[15px] px-1 rounded-[3px] border border-border font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
-                Platform managed
-              </span>
-            </div>
-            <div className="text-[11px] text-muted-foreground truncate mt-0.5 leading-relaxed max-w-[620px]">{lane.description}</div>
-            <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
-              <span className="text-[10px] font-mono text-muted-foreground">{lane.slug}</span>
-              {restricted && (
-                <span className="inline-flex items-center gap-1 h-[15px] px-1 rounded-[3px] bg-amber-500/12 text-amber-500 font-mono text-[9px] uppercase tracking-wider">
-                  <EyeOff className="w-[9px] h-[9px]" />
-                  Restricted
-                </span>
-              )}
-            </div>
-          </div>
-        </div>
-      </td>
-      <td className="py-3 align-top @max-[900px]/table:hidden">
-        <div className="inline-flex items-center gap-1.5 h-[22px] px-1.5 rounded-[4px] border border-border bg-foreground/[0.03]">
-          <Globe className="w-3 h-3" style={{ color: TRANSPORT_COLOR }} />
-          <span className="text-[10.5px] font-mono text-foreground/80">{lane.transport}</span>
-        </div>
-      </td>
-      <td className="py-3 align-top @max-[1100px]/table:hidden">
-        <div className="text-[11.5px] text-foreground">nano</div>
-        <div className="text-[10.5px] text-muted-foreground">Platform</div>
-      </td>
-      {showIngest && (
-        <td className="py-3 align-top @max-[760px]/table:hidden">
-          <IngestSummaryCell summary={lane.ingest} />
-        </td>
-      )}
-      <td className="py-3 align-top">
-        <span className="inline-flex items-center gap-1.5 h-[22px] px-2 rounded-[4px] border border-border text-[10.5px] font-mono uppercase tracking-wider text-muted-foreground">
-          Platform
-        </span>
-      </td>
-      <td className="py-3 align-top">
-        <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground">Always on</span>
-      </td>
-      <td className="pr-3 py-3 align-top" />
-    </tr>
+    <div className="min-w-0" data-testid="ingest-summary">
+      <div className="flex items-center gap-1.5">
+        <span className={cn('w-1.5 h-1.5 rounded-full shrink-0', INGEST_HEALTH_DOT[connect.state] ?? 'bg-muted-foreground/40')} />
+        <span className="text-[11.5px] font-mono text-foreground tabular-nums">{formatCompactNumber(connect.events_24h)}</span>
+        <span className="text-[10px] font-mono text-muted-foreground">ev</span>
+      </div>
+      <div className="text-[10.5px] font-mono text-muted-foreground">
+        {connect.last_seen ? `Receiving · last ${formatRelativeCompact(connect.last_seen)}` : 'Waiting for first event'}
+      </div>
+    </div>
+  );
+}
+
+/** NAN-4912: the source's connect state under its status badge. */
+function ConnectLine({ connect }: { connect: LogSourceConnectStatus }) {
+  const tone =
+    connect.state === 'receiving_unparsed'
+      ? 'text-amber-500'
+      : connect.state === 'receiving'
+        ? 'text-foreground/80'
+        : 'text-muted-foreground';
+  const count =
+    connect.events_24h >= 1000 ? `${(connect.events_24h / 1000).toFixed(1)}k` : String(connect.events_24h);
+  return (
+    <div className={cn('mt-1 font-mono text-[10.5px] tabular-nums', tone)} data-testid="connect-line" data-state={connect.state}>
+      {CONNECT_STATE_LABEL[connect.state]}
+      {connect.events_24h > 0 && <span className="text-muted-foreground"> · {count}/24h</span>}
+    </div>
   );
 }
 
@@ -1071,7 +999,7 @@ function StatusBadge({
   validated: boolean;
   validationError?: string;
 }) {
-  if (notParsed) return <Badge variant="warning" className="whitespace-nowrap text-[10.5px] font-medium px-1.5">Receiving · not parsed</Badge>;
+  if (notParsed && status !== 'draft') return <Badge variant="warning" className="whitespace-nowrap text-[10.5px] font-medium px-1.5">Receiving · not parsed</Badge>;
   // NAN-1920: a wizard draft (onboarded, not yet deployed) is its own first-
   // class state and wins over every other badge — a draft is typically also
   // unvalidated, but we surface the more meaningful "in progress" signal.

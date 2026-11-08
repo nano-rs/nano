@@ -85,7 +85,7 @@ impl OidcRepository {
     }
 
     /// Decrypt client secret using AES-256-GCM
-    fn decrypt_secret(&self, id: Uuid, purpose: &'static str, encrypted: &[u8]) -> Result<String, OidcRepositoryError> {
+    fn decrypt_secret(&self, encrypted: &[u8]) -> Result<String, OidcRepositoryError> {
         // Parse the stored JSON format
         let stored: serde_json::Value = serde_json::from_slice(encrypted).map_err(|e| {
             OidcRepositoryError::EncryptionError(format!("Failed to parse encrypted data: {}", e))
@@ -105,28 +105,11 @@ impl OidcRepository {
 
         let decrypted = self
             .encryption_service
-            .with_context(crate::crypto::CredentialScope::Deployment, purpose, id)
             .decrypt(&encrypted_data)
             .map_err(|e| OidcRepositoryError::EncryptionError(e.to_string()))?;
 
         String::from_utf8(decrypted)
             .map_err(|e| OidcRepositoryError::EncryptionError(e.to_string()))
-    }
-
-    pub async fn google_service_account(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<String>, OidcRepositoryError> {
-        let value: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT google_service_account_encrypted FROM oidc_providers WHERE id=$1",
-        )
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await?;
-        value
-            .as_deref()
-            .map(|bytes| self.decrypt_secret(id, "oidc.google-service-account", bytes))
-            .transpose()
     }
 
     /// List all OIDC providers
@@ -175,7 +158,35 @@ impl OidcRepository {
     /// Get decrypted client secret for a provider
     pub async fn get_client_secret(&self, id: Uuid) -> Result<String, OidcRepositoryError> {
         let provider = self.get_provider(id).await?;
-        self.decrypt_secret(id, "oidc.client-secret", &provider.client_secret_encrypted)
+        self.decrypt_secret(&provider.client_secret_encrypted)
+    }
+
+    /// NAN-3935: decrypted Google Workspace service-account key, if stored.
+    pub async fn google_service_account(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<String>, OidcRepositoryError> {
+        let value: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT google_service_account_encrypted FROM oidc_providers WHERE id=$1",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        value
+            .as_deref()
+            .map(|bytes| self.decrypt_secret(bytes))
+            .transpose()
+    }
+
+    /// The IdP group names this provider maps (Google Directory lookups ask
+    /// only about these).
+    pub async fn mapped_idp_groups(&self, id: Uuid) -> Result<Vec<String>, OidcRepositoryError> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT oidc_group FROM oidc_group_mappings WHERE provider_id=$1 ORDER BY oidc_group",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// Create a new OIDC provider
@@ -222,7 +233,13 @@ impl OidcRepository {
         .bind(&scopes)
         .bind(&request.group_claim)
         .bind(sqlx::types::Json(request.access_policy.clone().unwrap_or_default()))
-        .bind(request.google_service_account.as_deref().map(|k| self.encrypt_secret(k)).transpose()?)
+        .bind(
+            request
+                .google_service_account
+                .as_deref()
+                .map(|k| self.encrypt_secret(k))
+                .transpose()?,
+        )
         .fetch_one(&self.pool)
         .await?;
 
@@ -251,7 +268,8 @@ impl OidcRepository {
         let provider = sqlx::query_as::<_, OidcProvider>(
             r#"
             INSERT INTO oidc_providers
-                (name, slug, issuer, client_id, client_secret_encrypted, scopes, group_claim, enabled, access_policy, google_service_account_encrypted)
+                (name, slug, issuer, client_id, client_secret_encrypted, scopes, group_claim, enabled,
+                 access_policy, google_service_account_encrypted)
             VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8, $9)
             RETURNING *
             "#,
@@ -264,7 +282,13 @@ impl OidcRepository {
         .bind(&scopes)
         .bind(&request.group_claim)
         .bind(sqlx::types::Json(request.access_policy.clone().unwrap_or_default()))
-        .bind(request.google_service_account.as_deref().map(|k| self.encrypt_secret(k)).transpose()?)
+        .bind(
+            request
+                .google_service_account
+                .as_deref()
+                .map(|k| self.encrypt_secret(k))
+                .transpose()?,
+        )
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
@@ -313,7 +337,8 @@ impl OidcRepository {
                 group_claim = $7,
                 enabled = $8,
                 access_policy = COALESCE($9, access_policy),
-                google_service_account_encrypted = CASE WHEN $11 THEN NULL ELSE COALESCE($10,google_service_account_encrypted) END,
+                google_service_account_encrypted = CASE WHEN $11 THEN NULL
+                    ELSE COALESCE($10, google_service_account_encrypted) END,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -328,7 +353,13 @@ impl OidcRepository {
         .bind(&group_claim)
         .bind(enabled)
         .bind(request.access_policy.as_ref().map(sqlx::types::Json))
-        .bind(request.google_service_account.as_deref().map(|k| self.encrypt_secret(k)).transpose()?)
+        .bind(
+            request
+                .google_service_account
+                .as_deref()
+                .map(|k| self.encrypt_secret(k))
+                .transpose()?,
+        )
         .bind(request.clear_google_service_account)
         .fetch_one(&self.pool)
         .await?;
@@ -371,7 +402,11 @@ impl OidcRepository {
             UPDATE oidc_providers SET
                 name = $2, issuer = $3, client_id = $4,
                 client_secret_encrypted = $5, scopes = $6,
-                group_claim = $7, enabled = $8, updated_at = NOW()
+                group_claim = $7, enabled = $8,
+                access_policy = COALESCE($9, access_policy),
+                google_service_account_encrypted = CASE WHEN $11 THEN NULL
+                    ELSE COALESCE($10, google_service_account_encrypted) END,
+                updated_at = NOW()
             WHERE id = $1
             RETURNING *
             "#,
@@ -475,40 +510,17 @@ impl OidcRepository {
         Ok(mappings)
     }
 
-    /// Set group mappings for a provider (replaces existing)
-    /// Requirements: 3.4, 11.4
+    /// Set group mappings for a provider (replaces existing). Unfenced variant
+    /// (tests / tooling); production uses [`Self::set_group_mappings_authorized`].
     pub async fn set_group_mappings(
         &self,
         provider_id: Uuid,
         mappings: &[(String, Uuid)], // (oidc_group, local_group_id)
     ) -> Result<Vec<OidcGroupMapping>, OidcRepositoryError> {
-        // Verify provider exists
-        self.get_provider(provider_id).await?;
-
-        // Delete existing mappings
-        sqlx::query("DELETE FROM oidc_group_mappings WHERE provider_id = $1")
-            .bind(provider_id)
-            .execute(&self.pool)
-            .await?;
-
-        // Insert new mappings
-        for (oidc_group, local_group_id) in mappings {
-            sqlx::query(
-                r#"
-                INSERT INTO oidc_group_mappings (provider_id, oidc_group, local_group_id)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (provider_id, oidc_group) DO UPDATE SET local_group_id = $3
-                "#,
-            )
-            .bind(provider_id)
-            .bind(oidc_group)
-            .bind(local_group_id)
-            .execute(&self.pool)
-            .await?;
-        }
-
-        // Return the new mappings
-        self.get_group_mappings(provider_id).await
+        let mut tx = self.pool.begin().await?;
+        let rows = replace_group_mappings_in_tx(&mut tx, provider_id, mappings).await?;
+        tx.commit().await?;
+        Ok(rows)
     }
 
     /// Replace mappings under the grant generation that authorized every
@@ -523,104 +535,9 @@ impl OidcRepository {
         if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
             return Err(OidcRepositoryError::GrantAuthorityChanged);
         }
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM oidc_providers WHERE id = $1)")
-                .bind(provider_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if !exists {
-            return Err(OidcRepositoryError::NotFound(provider_id));
-        }
-        sqlx::query("DELETE FROM oidc_group_mappings WHERE provider_id = $1")
-            .bind(provider_id)
-            .execute(&mut *tx)
-            .await?;
-        for (oidc_group, local_group_id) in mappings {
-            sqlx::query(
-                r#"
-                INSERT INTO oidc_group_mappings (provider_id, oidc_group, local_group_id)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (provider_id, oidc_group)
-                DO UPDATE SET local_group_id = EXCLUDED.local_group_id
-                "#,
-            )
-            .bind(provider_id)
-            .bind(oidc_group)
-            .bind(local_group_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        let mut policy: sqlx::types::Json<crate::auth::SsoAccessPolicy> =
-            sqlx::query_scalar("SELECT access_policy FROM oidc_providers WHERE id=$1 FOR UPDATE")
-                .bind(provider_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        policy.mappings = mappings
-            .iter()
-            .map(|(idp, id)| crate::auth::SsoGroupMapping {
-                idp_group: idp.clone(),
-                group_ids: vec![*id],
-                role_ids: vec![],
-            })
-            .collect();
-        policy.mapped_groups_only = true;
-        policy.validate(false).map_err(|_| {
-            OidcRepositoryError::EncryptionError("Invalid SSO group mapping".into())
-        })?;
-        sqlx::query("UPDATE oidc_providers SET access_policy=$2,updated_at=NOW() WHERE id=$1")
-            .bind(provider_id)
-            .bind(policy)
-            .execute(&mut *tx)
-            .await?;
-        let rows = sqlx::query_as::<_, OidcGroupMapping>(
-            "SELECT * FROM oidc_group_mappings WHERE provider_id = $1 ORDER BY oidc_group ASC",
-        )
-        .bind(provider_id)
-        .fetch_all(&mut *tx)
-        .await?;
+        let rows = replace_group_mappings_in_tx(&mut tx, provider_id, mappings).await?;
         tx.commit().await?;
         Ok(rows)
-    }
-
-    /// Add a single group mapping
-    pub async fn add_group_mapping(
-        &self,
-        provider_id: Uuid,
-        oidc_group: &str,
-        local_group_id: Uuid,
-    ) -> Result<OidcGroupMapping, OidcRepositoryError> {
-        // Verify provider exists
-        self.get_provider(provider_id).await?;
-
-        let mapping = sqlx::query_as::<_, OidcGroupMapping>(
-            r#"
-            INSERT INTO oidc_group_mappings (provider_id, oidc_group, local_group_id)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (provider_id, oidc_group) DO UPDATE SET local_group_id = $3
-            RETURNING *
-            "#,
-        )
-        .bind(provider_id)
-        .bind(oidc_group)
-        .bind(local_group_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(mapping)
-    }
-
-    /// Remove a group mapping
-    pub async fn remove_group_mapping(&self, mapping_id: Uuid) -> Result<(), OidcRepositoryError> {
-        let result = sqlx::query("DELETE FROM oidc_group_mappings WHERE id = $1")
-            .bind(mapping_id)
-            .execute(&self.pool)
-            .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(OidcRepositoryError::MappingNotFound(mapping_id));
-        }
-
-        Ok(())
     }
 
     /// Get local group IDs for OIDC groups
@@ -762,4 +679,52 @@ impl From<OidcAuthTransactionRow> for OidcAuthTransaction {
             created_at: row.created_at,
         }
     }
+}
+
+/// NAN-3904: replace a provider's IdP-group mappings, serialized with sign-in
+/// reconciliation. The provider row is taken FOR UPDATE (conflicting with the
+/// callback's FOR SHARE), `mapping_revision` is bumped, and every SSO grant
+/// the new mappings no longer explain is revoked — with the affected users'
+/// tokens and sessions — before the change commits.
+async fn replace_group_mappings_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    provider_id: Uuid,
+    mappings: &[(String, Uuid)],
+) -> Result<Vec<OidcGroupMapping>, OidcRepositoryError> {
+    let locked: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE oidc_providers SET mapping_revision = mapping_revision + 1, updated_at = NOW() \
+         WHERE id = $1 RETURNING id",
+    )
+    .bind(provider_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if locked.is_none() {
+        return Err(OidcRepositoryError::NotFound(provider_id));
+    }
+    sqlx::query("DELETE FROM oidc_group_mappings WHERE provider_id = $1")
+        .bind(provider_id)
+        .execute(&mut **tx)
+        .await?;
+    for (oidc_group, local_group_id) in mappings {
+        sqlx::query(
+            r#"
+            INSERT INTO oidc_group_mappings (provider_id, oidc_group, local_group_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (provider_id, oidc_group)
+            DO UPDATE SET local_group_id = EXCLUDED.local_group_id
+            "#,
+        )
+        .bind(provider_id)
+        .bind(oidc_group)
+        .bind(local_group_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    crate::auth::oidc::revoke_unmapped_sso_grants(tx, provider_id).await?;
+    Ok(sqlx::query_as::<_, OidcGroupMapping>(
+        "SELECT * FROM oidc_group_mappings WHERE provider_id = $1 ORDER BY oidc_group ASC",
+    )
+    .bind(provider_id)
+    .fetch_all(&mut **tx)
+    .await?)
 }

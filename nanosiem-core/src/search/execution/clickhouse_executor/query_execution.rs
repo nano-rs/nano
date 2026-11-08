@@ -16,7 +16,6 @@ use crate::search::{parse_clickhouse_error, SearchError};
 
 impl ClickHouseExecutor {
     /// Execute a ClickHouse query using the typed ClickHouseLogReadRow struct
-    #[tracing::instrument(name = "db.clickhouse.execute", skip_all, fields(db.response.rows = tracing::field::Empty))]
     pub(crate) async fn execute_typed_query(
         &self,
         sql: &str,
@@ -50,14 +49,12 @@ impl ClickHouseExecutor {
         let results: Vec<serde_json::Value> =
             rows.iter().map(|row| clickhouse_row_to_json(row)).collect();
 
-        tracing::Span::current().record("db.response.rows", results.len() as u64);
         Ok(results)
     }
 
     /// Execute a ClickHouse query with dynamic schema using JSONEachRow format
     ///
     /// This is used for aggregation queries where the result schema varies
-    #[tracing::instrument(name = "db.clickhouse.execute", skip_all, fields(db.response.rows = tracing::field::Empty, db.response.bytes = tracing::field::Empty))]
     pub(crate) async fn execute_dynamic_query(
         &self,
         sql: &str,
@@ -85,6 +82,9 @@ impl ClickHouseExecutor {
         loop {
             match cursor.next().await {
                 Ok(Some(chunk)) => {
+                    // NAN-3282: inside a product view, charge the view's memory
+                    // ledger as bytes arrive (a no-op outside a view scope).
+                    crate::search::view_memory::charge_wire_bytes(chunk.len() as u64).await?;
                     if response_bytes.len() + chunk.len() > MAX_RESPONSE_SIZE {
                         return Err(SearchError::ResponseTooLarge(
                             response_bytes.len() + chunk.len(),
@@ -111,7 +111,6 @@ impl ClickHouseExecutor {
         );
 
         // Parse JSONEachRow format (one JSON object per line)
-        tracing::Span::current().record("db.response.bytes", response_bytes.len() as u64);
         let response_str = String::from_utf8(response_bytes).map_err(|e| {
             SearchError::DatabaseError(sqlx::Error::Protocol(format!(
                 "Invalid UTF-8 in ClickHouse response: {}",
@@ -160,7 +159,6 @@ impl ClickHouseExecutor {
             })
             .collect();
 
-        tracing::Span::current().record("db.response.rows", results.len() as u64);
         Ok(results)
     }
 
@@ -174,7 +172,6 @@ impl ClickHouseExecutor {
     /// per-priority settings (NAN-1428). The id makes the companion killable
     /// by `KILL QUERY` alongside the data query; the settings bound it by the
     /// same per-priority limits. Neither changes the returned count.
-    #[tracing::instrument(name = "db.clickhouse.count", skip_all, fields(db.response.rows = tracing::field::Empty, db.response.bytes = tracing::field::Empty))]
     pub(crate) async fn execute_count_query_with_options(
         &self,
         sql: &str,
@@ -202,6 +199,9 @@ impl ClickHouseExecutor {
         loop {
             match cursor.next().await {
                 Ok(Some(chunk)) => {
+                    // NAN-3282: inside a product view, charge the view's memory
+                    // ledger as bytes arrive (a no-op outside a view scope).
+                    crate::search::view_memory::charge_wire_bytes(chunk.len() as u64).await?;
                     if response_bytes.len() + chunk.len() > MAX_COUNT_RESPONSE_SIZE {
                         return Err(SearchError::ResponseTooLarge(
                             response_bytes.len() + chunk.len(),
@@ -215,7 +215,6 @@ impl ClickHouseExecutor {
             }
         }
 
-        tracing::Span::current().record("db.response.bytes", response_bytes.len() as u64);
         let response_str = String::from_utf8(response_bytes).map_err(|e| {
             SearchError::DatabaseError(sqlx::Error::Protocol(format!(
                 "Invalid UTF-8 in count response: {}",
@@ -228,7 +227,6 @@ impl ClickHouseExecutor {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
                 // Count might be named "cnt" or "count(*)"
                 if let Some(cnt) = json.get("cnt").or_else(|| json.get("count(*)")) {
-                    tracing::Span::current().record("db.response.rows", 1_u64);
                     return Ok(cnt.as_u64().unwrap_or(0));
                 }
             }
@@ -244,7 +242,6 @@ impl ClickHouseExecutor {
     }
 
     /// Execute a dynamic query with a custom query_id
-    #[tracing::instrument(name = "db.clickhouse.execute", skip_all, fields(db.response.rows = tracing::field::Empty, db.response.bytes = tracing::field::Empty))]
     pub(crate) async fn execute_dynamic_query_with_query_id(
         &self,
         sql: &str,
@@ -269,6 +266,9 @@ impl ClickHouseExecutor {
         loop {
             match cursor.next().await {
                 Ok(Some(chunk)) => {
+                    // NAN-3282: inside a product view, charge the view's memory
+                    // ledger as bytes arrive (a no-op outside a view scope).
+                    crate::search::view_memory::charge_wire_bytes(chunk.len() as u64).await?;
                     response_bytes.extend_from_slice(&chunk);
                 }
                 Ok(None) => break,
@@ -280,7 +280,6 @@ impl ClickHouseExecutor {
             }
         }
 
-        tracing::Span::current().record("db.response.bytes", response_bytes.len() as u64);
         let response_str = String::from_utf8(response_bytes).map_err(|e| {
             SearchError::DatabaseError(sqlx::Error::Protocol(format!(
                 "Invalid UTF-8 in ClickHouse response: {}",
@@ -325,7 +324,6 @@ impl ClickHouseExecutor {
             })
             .collect();
 
-        tracing::Span::current().record("db.response.rows", results.len() as u64);
         Ok(results)
     }
 
@@ -333,7 +331,6 @@ impl ClickHouseExecutor {
     ///
     /// Settings are applied via `.with_option()` which maps to HTTP query params
     /// on the clickhouse-rs client. Works on both self-hosted and Cloud.
-    #[tracing::instrument(name = "db.clickhouse.execute", skip_all, fields(db.response.rows = tracing::field::Empty, db.response.bytes = tracing::field::Empty))]
     pub(crate) async fn execute_dynamic_query_with_settings(
         &self,
         sql: &str,
@@ -361,7 +358,10 @@ impl ClickHouseExecutor {
             .with_option("priority", &settings.priority.to_string())
             .with_option("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
         if let Some(max_memory_usage_bytes) = settings.max_memory_usage_bytes {
-            query = query.with_option("max_memory_usage", &max_memory_usage_bytes.to_string());
+            query = query.with_option(
+                "max_memory_usage",
+                &max_memory_usage_bytes.to_string(),
+            );
         }
         let mut cursor = query
             .fetch_bytes("JSONEachRow")
@@ -371,6 +371,9 @@ impl ClickHouseExecutor {
         loop {
             match cursor.next().await {
                 Ok(Some(chunk)) => {
+                    // NAN-3282: inside a product view, charge the view's memory
+                    // ledger as bytes arrive (a no-op outside a view scope).
+                    crate::search::view_memory::charge_wire_bytes(chunk.len() as u64).await?;
                     response_bytes.extend_from_slice(&chunk);
                 }
                 Ok(None) => break,
@@ -382,7 +385,6 @@ impl ClickHouseExecutor {
             }
         }
 
-        tracing::Span::current().record("db.response.bytes", response_bytes.len() as u64);
         let response_str = String::from_utf8(response_bytes).map_err(|e| {
             SearchError::DatabaseError(sqlx::Error::Protocol(format!(
                 "Invalid UTF-8 in ClickHouse response: {}",
@@ -425,14 +427,12 @@ impl ClickHouseExecutor {
             })
             .collect();
 
-        tracing::Span::current().record("db.response.rows", results.len() as u64);
         Ok(results)
     }
 
     /// Execute one unattended query with server-side result overflow settings
     /// and a matching client-side byte guard. The caller owns `query_id` and can
     /// therefore issue an explicit distributed KILL on timeout or early exit.
-    #[tracing::instrument(name = "db.clickhouse.execute", skip_all, fields(db.response.rows = tracing::field::Empty, db.response.bytes = tracing::field::Empty))]
     pub(crate) async fn execute_dynamic_query_with_execution_limits(
         &self,
         sql: &str,
@@ -459,7 +459,10 @@ impl ClickHouseExecutor {
                 .with_option("priority", &settings.priority.to_string())
                 .with_option("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
             if let Some(max_memory_usage_bytes) = settings.max_memory_usage_bytes {
-                query = query.with_option("max_memory_usage", &max_memory_usage_bytes.to_string());
+                query = query.with_option(
+                    "max_memory_usage",
+                    &max_memory_usage_bytes.to_string(),
+                );
             }
         }
 
@@ -471,6 +474,9 @@ impl ClickHouseExecutor {
         loop {
             match cursor.next().await {
                 Ok(Some(chunk)) => {
+                    // NAN-3282: inside a product view, charge the view's memory
+                    // ledger as bytes arrive (a no-op outside a view scope).
+                    crate::search::view_memory::charge_wire_bytes(chunk.len() as u64).await?;
                     let next_size = response_bytes
                         .len()
                         .checked_add(chunk.len())
@@ -485,7 +491,6 @@ impl ClickHouseExecutor {
             }
         }
 
-        tracing::Span::current().record("db.response.bytes", response_bytes.len() as u64);
         let response = String::from_utf8(response_bytes).map_err(|error| {
             SearchError::DatabaseError(sqlx::Error::Protocol(format!(
                 "Invalid UTF-8 in bounded ClickHouse response: {error}"
@@ -493,12 +498,11 @@ impl ClickHouseExecutor {
         })?;
         let mut results = Vec::new();
         for line in response.lines().filter(|line| !line.is_empty()) {
-            let row =
-                Self::parse_and_postprocess_row(line, !preserve_columns).ok_or_else(|| {
-                    SearchError::DatabaseError(sqlx::Error::Protocol(
-                        "Invalid JSONEachRow value in bounded ClickHouse response".to_string(),
-                    ))
-                })?;
+            let row = Self::parse_and_postprocess_row(line, !preserve_columns).ok_or_else(|| {
+                SearchError::DatabaseError(sqlx::Error::Protocol(
+                    "Invalid JSONEachRow value in bounded ClickHouse response".to_string(),
+                ))
+            })?;
             results.push(row);
         }
         if u64::try_from(results.len()).unwrap_or(u64::MAX) > limits.max_result_rows {
@@ -508,7 +512,6 @@ impl ClickHouseExecutor {
                 limits.max_result_rows
             )));
         }
-        tracing::Span::current().record("db.response.rows", results.len() as u64);
         Ok(results)
     }
 

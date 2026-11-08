@@ -8,59 +8,45 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ArrowRight, Check, ListFilter, Search, FileText } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { absTime, extractAction, extractEventTime, extractLogSource, eventEntityLabel, entityNoun, relTime, topActions, meanTimeToDetect, type MatchView } from './helpers';
+import { absTime, extractAction, extractEventTime, eventEntityLabel, entityNoun, relTime, topActions, meanTimeToDetect, type MatchView } from './helpers';
 import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip';
 import { LatencyPill } from './LatencyPill';
 import { EventViewer } from './EventViewer';
 import { useIdentityUserLookup, useRulePredicates } from '@/hooks/use-api';
-import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import { buildMultiFieldFilter, type SchemaProfileId, type SemanticField } from '@/lib/schema-fields';
 import { api } from '@/lib/api';
 import type { MatchEntity } from './helpers';
 import { nplQuotedBody } from '@/lib/npl-quote';
 
-// Build a nano-ql query that filters on a specific entity. We pick a UDM
-// field by entity type so we hit the indexed columns (case-insensitive
-// `_search` columns are already wired into the query path) rather than
-// scanning the full message body.
-function entitySearchQuery(entity: MatchEntity, schema: string | undefined): string | null {
+// Build an nPL query that filters on a specific entity, on the indexed entity
+// columns rather than the message body.
+//
+// NAN-1656: emit ONLY the ACTIVE schema profile's real columns — OR-ing the
+// inactive profile's names resolves them to unindexed `ext` JSON lookups and
+// defeats the bloom index (a 7-day full scan on Saturn). NAN-4903: the columns
+// come from the profile-aware field map.
+const ENTITY_QUERY_CONCEPTS: Partial<Record<MatchEntity['type'], readonly SemanticField[]>> = {
+  user: ['user'],
+  role: ['user'],
+  service: ['user'],
+  host: ['host', 'destHost'],
+  ip: ['srcIp', 'destIp'],
+};
+
+function entitySearchQuery(entity: MatchEntity, profile: SchemaProfileId): string | null {
   const raw = (entity.raw || entity.label || '').trim();
   if (!raw) return null;
   // NAN-2184: double backslashes and strip `"` — nPL has no `\"` escape.
   const escaped = nplQuotedBody(raw);
-  // NAN-1656: emit ONLY the ACTIVE schema profile's real columns. Previously we
-  // OR'd the UDM names with their OCSF-dotted equivalents to work under either
-  // profile (NAN-1287), but on the inactive profile those extra clauses resolve
-  // to `lower(toString(ext.<name>))` JSON lookups with no index — they can never
-  // match AND OR-ing them in defeats the bloom index on the real columns, so an
-  // entity search full-scans 7 days (151M rows on Saturn). Branch on the profile
-  // so the WHERE only carries indexed columns that actually exist.
-  const isOcsf = schema === 'ocsf';
-  switch (entity.type) {
-    case 'user':
-    case 'role':
-    case 'service':
-      // ARN-style identifiers (CloudTrail) round-trip through user_identity.arn.
-      if (raw.startsWith('arn:')) {
-        return isOcsf
-          ? `(actor.user.uid="${escaped}" OR actor.user.name="${escaped}")`
-          : `user_identity.arn="${escaped}"`;
-      }
-      // OCSF Sysmon users live under actor.user.name / user.name; UDM uses `user`.
-      return isOcsf
-        ? `(actor.user.name="${escaped}" OR actor.user.uid="${escaped}" OR user.name="${escaped}" OR user.uid="${escaped}")`
-        : `user="${escaped}"`;
-    case 'host':
-      return isOcsf
-        ? `device.hostname="${escaped}" OR src_endpoint.hostname="${escaped}" OR dst_endpoint.hostname="${escaped}"`
-        : `src_host="${escaped}" OR dest_host="${escaped}"`;
-    case 'ip':
-      return isOcsf
-        ? `src_endpoint.ip="${escaped}" OR dst_endpoint.ip="${escaped}"`
-        : `src_ip="${escaped}" OR dest_ip="${escaped}"`;
-    default:
-      // Fall back to a free-text search on the raw value.
-      return `"${escaped}"`;
+  // ARN-style identifiers (CloudTrail) round-trip through user_identity.arn.
+  if ((entity.type === 'user' || entity.type === 'role' || entity.type === 'service') && raw.startsWith('arn:')) {
+    return `user_identity.arn="${escaped}"`;
   }
+  const concepts = ENTITY_QUERY_CONCEPTS[entity.type];
+  // Fall back to a free-text search on the raw value.
+  if (!concepts) return `"${escaped}"`;
+  return buildMultiFieldFilter(profile, concepts, raw);
 }
 
 // Lightweight hook — fires one /api/search call per entity for the entity
@@ -72,8 +58,13 @@ function useEntityActivity7d(entity: MatchEntity | null): {
 } {
   const [count, setCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
-  const { schema } = useSchemaEntityMap();
-  const queryStr = useMemo(() => (entity ? entitySearchQuery(entity, schema) : null), [entity, schema]);
+  // NAN-4903: no query until the tenant's schema profile is known (the card
+  // stays empty / loading rather than counting a guessed schema's columns).
+  const { profile, ready } = useSchemaFieldMap();
+  const queryStr = useMemo(
+    () => (entity && ready ? entitySearchQuery(entity, profile) : null),
+    [entity, profile, ready],
+  );
   useEffect(() => {
     if (!queryStr) {
       setCount(null);
@@ -120,8 +111,13 @@ function useEntityRecentActivity(entity: MatchEntity | null): {
 } {
   const [events, setEvents] = useState<Array<Record<string, unknown>>>([]);
   const [loading, setLoading] = useState(false);
-  const { schema } = useSchemaEntityMap();
-  const queryStr = useMemo(() => (entity ? entitySearchQuery(entity, schema) : null), [entity, schema]);
+  // NAN-4903: no query until the tenant's schema profile is known (the card
+  // stays empty / loading rather than counting a guessed schema's columns).
+  const { profile, ready } = useSchemaFieldMap();
+  const queryStr = useMemo(
+    () => (entity && ready ? entitySearchQuery(entity, profile) : null),
+    [entity, profile, ready],
+  );
   useEffect(() => {
     if (!queryStr) {
       setEvents([]);
@@ -134,7 +130,7 @@ function useEntityRecentActivity(entity: MatchEntity | null): {
     const start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
     api
       .search({
-        query: `${queryStr} | sort -${schema === 'ocsf' ? 'time' : 'timestamp'} | head 10`,
+        query: `${queryStr} | sort -timestamp | head 10`,
         time_range: { start: start.toISOString(), end: end.toISOString() },
         limit: 10,
         skip_field_stats: true,
@@ -156,7 +152,7 @@ function useEntityRecentActivity(entity: MatchEntity | null): {
     return () => {
       cancelled = true;
     };
-  }, [queryStr, schema]);
+  }, [queryStr]);
   return { events, loading };
 }
 
@@ -201,7 +197,7 @@ function RecentActivityCard({ view }: { view: MatchView }) {
         <ul className="p-1 flex flex-col">
           {events.map((e, i) => {
             const t = extractEventTime(e);
-            const action = extractAction(e) || extractLogSource(e) || 'event';
+            const action = extractAction(e) || (typeof e['source_type'] === 'string' ? (e['source_type'] as string) : 'event');
             const sev = typeof e['severity'] === 'string' ? (e['severity'] as string) : undefined;
             const id = typeof e['id'] === 'string' ? (e['id'] as string) : `re_${i}`;
             return (

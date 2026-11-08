@@ -100,7 +100,9 @@ pub(crate) fn raw_sql_needs_skip_index_guard(sql: &str) -> bool {
     let sql = sql.to_ascii_lowercase();
     // NAN-4296: generated group lookups are folded `(keys, values)` arrays
     // now, not a map; a copied generated query must keep the guard too.
-    sql.contains("mapfromarrays(") || sql.contains("grouparrayif(__nano_k")
+    sql.contains("mapfromarrays(")
+        || sql.contains("grouparrayif(__nano_k")
+        || sql.contains("grouparray(__nano_k)")
 }
 
 /// Bounded input for the paginated count companion (NAN-1635, finding 2.3).
@@ -209,6 +211,9 @@ mod tests {
         // NAN-4296: the generated per-group lookup scalar.
         assert!(raw_sql_needs_skip_index_guard(
             "WITH (SELECT tuple(groupArrayIf(__nano_k, isNotNull(__nano_v)), groupArrayIf(__nano_v, isNotNull(__nano_v))) FROM t) AS m SELECT 1"
+        ));
+        assert!(raw_sql_needs_skip_index_guard(
+            "WITH (SELECT tuple(groupArray(__nano_k), groupArray(tuple(__nano_v))) FROM t) AS m SELECT 1"
         ));
         assert!(!raw_sql_needs_skip_index_guard(
             "SELECT count() FROM logs WHERE src_ip = '10.0.0.1'"
@@ -379,8 +384,7 @@ mod tests {
     /// extraction), so literal-safe counting applies uniformly.
     #[test]
     fn count_query_wraps_simple_single_from() {
-        let simple =
-            "SELECT * FROM logs PREWHERE timestamp >= '2026-01-01' WHERE source_type = 'x'";
+        let simple = "SELECT * FROM logs PREWHERE timestamp >= '2026-01-01' WHERE source_type = 'x'";
         let count = build_count_query(simple, None);
         assert!(
             count.starts_with("SELECT count(*) AS cnt FROM (SELECT * FROM logs"),
@@ -609,15 +613,11 @@ mod tests {
 
         // The payload optimization must survive for raw events: a wide row with
         // mostly-empty UDM columns still comes back trimmed.
-        let line =
-            r#"{"id":"1","message":"hello","src_ip":"","dest_ip":"","user":"","bytes_in":0}"#;
+        let line = r#"{"id":"1","message":"hello","src_ip":"","dest_ip":"","user":"","bytes_in":0}"#;
         let row = ClickHouseExecutor::parse_and_postprocess_row(line, true).unwrap();
 
         let obj = row.as_object().unwrap();
-        assert!(
-            !obj.contains_key("src_ip"),
-            "empty columns should still be pruned"
-        );
+        assert!(!obj.contains_key("src_ip"), "empty columns should still be pruned");
         assert!(!obj.contains_key("user"));
         assert_eq!(obj.get("message").unwrap(), "hello");
     }

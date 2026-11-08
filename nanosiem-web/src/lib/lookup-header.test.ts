@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 import { describe, expect, it } from 'vitest';
 import { firstRowIsHeader, urlFirstRowIsHeader } from './lookup-header';
 
@@ -10,6 +8,8 @@ describe('lookup first-row toggle defaults', () => {
     expect(firstRowIsHeader('d41d8cd98f00b204e9800998ecf8427e\n900150983cd24fb0d6963f7d28e17f72')).toBe(false);
     expect(firstRowIsHeader('ip\n1.0.164.165')).toBe(true);
     expect(firstRowIsHeader('name,age\nAlice,30')).toBe(true);
+    expect(firstRowIsHeader('# updated 2026-11-02\n\n198.51.100.4\n203.0.113.9')).toBe(false);
+    expect(firstRowIsHeader('tag,count\n#ops,3')).toBe(true);
     expect(urlFirstRowIsHeader('https://example.com/ips.txt?key=x')).toBe(false);
     expect(urlFirstRowIsHeader('https://example.com/indicators.csv')).toBe(true);
   });

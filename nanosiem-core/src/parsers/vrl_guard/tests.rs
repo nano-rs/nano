@@ -44,6 +44,12 @@ const SHAPES: &[&str] = &[
     "multiline_plus",
     "multiline_else_if",
     "closure",
+    // NAN-4912 P3: prefix keyword productions.
+    "return",
+    "abort",
+    "return_group",
+    "abort_in_block",
+    "not_spaced",
 ];
 
 fn shape(kind: &str, n: usize) -> String {
@@ -88,12 +94,17 @@ fn shape(kind: &str, n: usize) -> String {
             "!!!!!!!! map_values(.a) -> |k, v| { ".repeat(n),
             " }".repeat(n)
         ),
+        "return" => format!("{}.", "return ".repeat(n)),
+        "abort" => format!("{}\"x\"", "abort ".repeat(n)),
+        "return_group" => format!("{}.{}", "return (".repeat(n), ")".repeat(n)),
+        "abort_in_block" => format!("{}\"x\"{}", "if .a == 1 { abort ".repeat(n), " }".repeat(n)),
+        "not_spaced" => format!(".x = {}true", "! ".repeat(n)),
         other => panic!("unknown shape {other}"),
     }
 }
 
 fn fns() -> Vec<Box<dyn Function>> {
-    crate::parsers::validator::safe_vrl_functions()
+    crate::parsers::vrl_functions::parser_vrl_functions()
 }
 
 fn assert_refused(kind: &str, n: usize) {
@@ -149,6 +160,26 @@ fn refused_exponential_nested_calls() {
             assert!(started.elapsed() < std::time::Duration::from_secs(1));
         }
     }
+}
+
+/// The review's attack: a `return` / `abort` chain that fills the 1 MiB
+/// source cap (well over 100k nested nodes) is refused by the scan before
+/// the parser recurses — run on a small worker stack, it must return.
+#[test]
+fn refused_max_size_return_and_abort_chains_on_a_small_stack() {
+    for (kind, unit) in [("return", 7usize), ("abort", 6)] {
+        let n = (MAX_VRL_SOURCE_BYTES - 16) / unit;
+        assert_refused(kind, n);
+    }
+}
+
+/// `return` / `abort` are keywords only where they can be: a path segment
+/// or a key named `return` stays a leaf.
+#[test]
+fn keyword_named_fields_are_not_prefix_productions() {
+    let src = format!(".x = .a{}", ".return".repeat(20));
+    assert_eq!(nesting_depth(&src, usize::MAX), nesting_depth(&format!(".x = .a{}", ".b".repeat(20)), usize::MAX));
+    assert!(check("if .error != null { abort }\n.x = 1\nreturn .").is_ok());
 }
 
 #[test]
@@ -266,7 +297,7 @@ if err != null {
 /// returns an error for each deep shape and the process survives.
 #[tokio::test]
 async fn entry_points_refuse_deep_vrl() {
-    use crate::parsers::{pipe, CompiledNormalizer, VrlValidator};
+    use crate::parsers::VrlValidator;
     let validator = VrlValidator::new();
     for kind in SHAPES {
         let src = shape(kind, 3_000);
@@ -290,27 +321,25 @@ async fn entry_points_refuse_deep_vrl() {
             "{kind}: test_vrl ran it"
         );
 
-        // Enrichment normalize programs.
-        assert!(
-            CompiledNormalizer::compile(&src).is_err(),
-            "{kind}: normalizer"
-        );
-    }
-    // Pipe conditions are single-line and <= 4 KiB; the parser recurses too.
-    for kind in ["not", "paren", "plus", "coalesce", "and"] {
-        let src = shape(kind, 1_000);
-        let expr = src.trim_start_matches(".x = ");
-        assert!(pipe::condition(expr).is_err(), "{kind}: pipe condition");
     }
 }
 
 /// Every production compile in nanosiem-core goes through this module. A new
 /// direct `vrl::compiler::compile` outside tests must route through
-/// [`compile`] (or be added here with a reason it is not tenant-reachable).
+/// [`compile`] (or be added here with a reason: fixed platform source, or
+/// an explicit [`check`] before a parser-only call).
 #[test]
 fn no_unguarded_compile_in_production_code() {
-    // Fixed platform programs, not tenant input.
-    const ALLOWED: &[&str] = &["parsers/vrl_guard.rs"];
+    const ALLOWED: &[&str] = &[
+        "parsers/vrl_guard.rs",
+        // safe_set_abort calls vrl_guard::check on the compiler-selected
+        // expression before parsing it to prove a literal set() path safe.
+        "parsers/vrl_diagnostics.rs",
+        // NAN-4919: pipe::condition runs vrl_guard::check before parsing a
+        // pipeline condition to prove it is one read-only expression; the
+        // program itself is compiled through vrl_guard::compile.
+        "parsers/pipe.rs",
+    ];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();
     let mut stack = vec![root.clone()];
@@ -356,9 +385,6 @@ fn no_unguarded_compile_in_production_code() {
             }
         }
     }
-    // lake_bronze_row's own test module is past the split; the fixed contract
-    // program is compiled only there. `pipe::condition` checks before parsing.
-    offenders.retain(|o| !o.starts_with("parsers/pipe.rs") || !o.contains("vrl::parser::parse("));
     assert!(
         offenders.is_empty(),
         "unguarded VRL compile:\n{}",

@@ -24,12 +24,11 @@
 //! Reads require `source_scopes:view`; mutations require `source_scopes:manage`
 //! (both admin-only, granted to the Admin role in migration 244).
 
-use nanosiem_api_lib::route_policy::{Router, routing::{delete, get, patch, post, put}};
-use nanosiem_core::auth::route_policy::RoutePolicy;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    Extension, Json,
+    routing::{delete, get, post},
+    Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -228,7 +227,7 @@ pub async fn add_restricted(
     // Registry changed — force every user's deny-set to be re-derived.
     state.source_scope_resolver.invalidate();
 
-    state.emit_audit(
+    state.emit_audit_durable(
         AuditEvent::builder(AuditSource::SourceScope, SOURCE_SCOPE_RESTRICTED)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
@@ -236,7 +235,7 @@ pub async fn add_restricted(
             .details(serde_json::json!({ "source_type": source_type }))
             .client_context(&client)
             .build(),
-    );
+    ).await;
 
     Ok(Json(created))
 }
@@ -282,7 +281,7 @@ pub async fn remove_restricted(
 
     state.source_scope_resolver.invalidate();
 
-    state.emit_audit(
+    state.emit_audit_durable(
         AuditEvent::builder(AuditSource::SourceScope, SOURCE_SCOPE_UNRESTRICTED)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
@@ -290,7 +289,7 @@ pub async fn remove_restricted(
             .details(serde_json::json!({ "source_type": source_type }))
             .client_context(&client)
             .build(),
-    );
+    ).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -378,7 +377,7 @@ pub async fn add_grant(
 
     state.source_scope_resolver.invalidate();
 
-    state.emit_audit(
+    state.emit_audit_durable(
         AuditEvent::builder(AuditSource::SourceScope, SOURCE_SCOPE_GRANTED)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
@@ -393,7 +392,7 @@ pub async fn add_grant(
             }))
             .client_context(&client)
             .build(),
-    );
+    ).await;
 
     Ok(Json(grant))
 }
@@ -452,7 +451,7 @@ pub async fn remove_grant(
     // is deferred. See `SourceScopeResolver::VERSION_CHECK_SECS`.
     state.source_scope_resolver.invalidate();
 
-    state.emit_audit(
+    state.emit_audit_durable(
         AuditEvent::builder(AuditSource::SourceScope, SOURCE_SCOPE_REVOKED)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
@@ -463,35 +462,31 @@ pub async fn remove_grant(
             }))
             .client_context(&client)
             .build(),
-    );
+    ).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Router for the per-source RBAC scope admin endpoints. Merged into the main
 /// app router before `.with_state`, so it shares [`AppState`].
-///
-/// route-overlap-contract: not-mounted-in-shared — routes.rs merges this only
-/// when `!shared_product`; the hosted-shared settings port serves these
-/// paths for hosted-shared tenants.
 pub fn source_scopes_routes() -> Router<AppState> {
     Router::new()
         .route(
             "/api/source-scopes/restricted",
-            get(list_restricted, RoutePolicy::all_of(&["source_scopes:view"])).post(add_restricted, RoutePolicy::all_of(&["source_scopes:manage"])),
+            get(list_restricted).post(add_restricted),
         )
         .route(
             "/api/source-scopes/restricted/{source_type}",
-            delete(remove_restricted, RoutePolicy::all_of(&["source_scopes:manage"])),
+            delete(remove_restricted),
         )
         .route(
             "/api/source-scopes/restricted/{source_type}/grants",
-            get(list_grants, RoutePolicy::all_of(&["source_scopes:view"])),
+            get(list_grants),
         )
-        .route("/api/source-scopes/grants", post(add_grant, RoutePolicy::all_of(&["source_scopes:manage"])))
+        .route("/api/source-scopes/grants", post(add_grant))
         .route(
             "/api/source-scopes/grants/{source_type}/{group_id}",
-            delete(remove_grant, RoutePolicy::all_of(&["source_scopes:manage"])),
+            delete(remove_grant),
         )
 }
 

@@ -133,7 +133,7 @@ impl BaselineMonitor {
 
         // Insert baseline into database
         sqlx::query(
-            concat!(r#"
+            r#"
             INSERT INTO detection_rule_baselines (
                 rule_id,
                 established_at,
@@ -148,7 +148,7 @@ impl BaselineMonitor {
                 source_types,
                 source_types_complete
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            ON CONFLICT ("#, crate::tenant_key!(), r#"rule_id) DO UPDATE SET
+            ON CONFLICT (rule_id) DO UPDATE SET
                 last_updated = EXCLUDED.last_updated,
                 mean_alerts_per_hour = EXCLUDED.mean_alerts_per_hour,
                 std_dev_alerts_per_hour = EXCLUDED.std_dev_alerts_per_hour,
@@ -159,7 +159,7 @@ impl BaselineMonitor {
                 baseline_data = EXCLUDED.baseline_data,
                 source_types = EXCLUDED.source_types,
                 source_types_complete = EXCLUDED.source_types_complete
-            "#),
+            "#,
         )
         .bind(value.rule_id)
         .bind(value.established_at)

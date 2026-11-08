@@ -76,9 +76,36 @@ fn sql_generation_uses_search_tree() {
     let sql = ClickHouseSqlGenerator::new()
         .generate_search_expr(source(&parsed))
         .unwrap();
-    assert!(sql.contains(" AND ") && sql.contains(" OR "), "{sql}");
-    assert!(
-        sql.find(" AND ").unwrap() < sql.find(" OR ").unwrap(),
-        "{sql}"
-    );
+    let generator = ClickHouseSqlGenerator::new();
+    let atom = |text: &str| {
+        generator
+            .generate_search_expr(source(&parse_query(text).unwrap()))
+            .unwrap()
+    };
+    assert_eq!(sql, format!("({} AND ({} OR {}))", atom("a"), atom("b"), atom("c")));
+
+    // Literal comparisons exercise the production parser and SQL generator
+    // without depending on a log schema. Pin the FULL parenthesized predicate,
+    // since SQL's AND-before-OR default is the opposite of search semantics.
+    for a in [false, true] {
+        for b in [false, true] {
+            for c in [false, true] {
+                let predicate = |value| if value { "\"yes\"=\"yes\"" } else { "\"yes\"=\"no\"" };
+                let (a, b, c) = (predicate(a), predicate(b), predicate(c));
+                let query = parse_query(&format!("{a} AND {b} OR {c}")).unwrap();
+                assert_eq!(
+                    generator.generate_search_expr(source(&query)).unwrap(),
+                    format!("({} AND ({} OR {}))", atom(a), atom(b), atom(c))
+                );
+                let query = roundtrip(&format!("* | where {a} AND {b} OR {c}"));
+                let Query::Piped { command: Command::Where { condition }, .. } = query else {
+                    panic!("expected where");
+                };
+                assert_eq!(
+                    generator.generate_search_expr(&condition).unwrap(),
+                    format!("(({} AND {}) OR {})", atom(a), atom(b), atom(c))
+                );
+            }
+        }
+    }
 }

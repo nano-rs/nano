@@ -6,8 +6,10 @@ checkpoints and caps. You describe the API. Add an optional VRL `program` only
 when the API needs logic that the declarative fields can't express.
 
 Check your work with `nano-connector validate spec.yaml`. Then dry-run it with
-`nano-connector preview spec.yaml recording.json --config K=V --cred K=V`,
-which runs offline against recorded responses.
+`nano-connector preview spec.yaml recording.json --config K=V --creds-stdin`
+(credentials as `K=V` lines on stdin, or `--cred-file K=PATH` for a mode-0600
+file; values are never accepted on the command line), which runs offline
+against recorded responses.
 
 ## Where specs live
 
@@ -41,7 +43,7 @@ connector against the same vendor mock and diffs what each one ships:
 
 ```
 nano-connector shadow connector.yaml --mock-url http://127.0.0.1:PORT \
-    --cred K=V --cred-file K=PATH --config K=V \
+    --creds-stdin --cred-file K=PATH --config K=V \
     [--checkpoints state.json] [--all-batches]
 ```
 
@@ -60,7 +62,7 @@ or when two different events share one.
 ```yaml
 version: 1
 name: vendor_thing                 # snake_case
-kind: collector                    # collector | agent_enrichment | data_enrichment | identity
+kind: collector                    # collector | agent_enrichment | data_enrichment
 allow:                             # egress allowlist; every request, Link URL and redirect is checked
   - host: api.vendor.com           # exact host, or "{{config.TENANT_HOST}}" with host_suffixes: [".vendor.com"] (dot-prefixed)
     path_prefixes: ["/v2/events"]  # segment-aligned; keep them narrow
@@ -97,45 +99,12 @@ Auth parameters name credential fields; they never hold the secrets themselves.
   of `client_id_credential` (a credential field) or `client_id` (a
   `config.*` template such as `{{config.CLIENT_ID}}`; it is not a secret).
 - `google_service_account {token_url, private_key_credential, client_email_credential, scope, subject?}`
-- `google_dwd_broker {token_url, scope, subject}`: keyless Google
-  domain-wide delegation for hosted collectors. No credential fields: the
-  runner asks the platform pull broker for an assertion signed by the
-  tenant's own Google service account, then exchanges it at `token_url`
-  (which must be in `allow`). The tenant authorizes that service account's
-  client ID for `scope` in the Google Admin console. A runner without a
-  platform broker (open core, local preview) fails the run with
-  `google_dwd_broker_unconfigured`. The broker host is never reachable from
-  a spec, even if listed in `allow`. The runner authenticates to the broker
-  with a per-tenant caller token (`npc<v>.<tenant>.<hmac>`) that has no
-  expiry by design: it is a stateless HMAC, revocable per tenant at the
-  broker (`NANO_PULL_BROKER_REVOKED_TENANTS`) and rotated by key version.
-  `scope` may list several scopes separated by spaces (for example
-  `admin.directory.user.readonly admin.directory.group.readonly`); each must
-  be on the broker's allowlist.
-- `entra_fic_broker {directory_id, client_id}`: keyless Microsoft Entra
-  (Graph) for hosted collectors. No credential fields: the runner asks the
-  platform pull broker (`/v1/azure/graph-token`) for a Graph access token
-  for the tenant's app registration, which trusts nano's federated identity
-  credential. Both parameters are templates that must render to GUIDs
-  (usually `{{config.DIRECTORY_ID}}` and `{{config.CLIENT_ID}}`). The engine
-  refuses a token whose `resource`, `tid`, `appid`/`azp` or `aud` do not
-  match, caches it until 60 s before `expires_on`, and refreshes it once on
-  a Graph 401. Allow `graph.microsoft.com` only; the broker host is never
-  reachable from a spec. Without a broker the run fails with
-  `google_dwd_broker_unconfigured`.
-- `okta_broker_jwt {okta_domain, client_id, scope}`: keyless Okta for hosted
-  collectors, for an Okta API Services app using `private_key_jwt` (no
-  client secret). The runner asks the platform pull broker
-  (`/v1/okta/client-assertion`, body `{feed_id, okta_domain, client_id}`)
-  for a client assertion signed with the tenant's broker-held key, checks
-  it (`iss` = `sub` = the client id, `aud` =
-  `https://<okta_domain>/oauth2/v1/token`, expiry within 300 s), trades it
-  there (client credentials, `scope` space-separated, for example
-  `okta.users.read okta.groups.read okta.roles.read`) and sends
-  `Authorization: Bearer <token>`. `okta_domain` and `client_id` are
-  `config.*` templates; the token endpoint path `/oauth2/v1/token` must be in
-  `allow`. DPoP must be off on the app: `invalid_dpop_proof`,
-  `use_dpop_nonce` or a DPoP-bound token fail with `okta_dpop_required`.
+- The hosted platform's keyless broker plugins (`google_dwd_broker`,
+  `entra_fic_broker`, `okta_broker_jwt`) are not part of this engine
+  (NAN-4914). Single-tenant equivalents: Google Workspace domain-wide
+  delegation with `google_service_account` + `subject` (the customer's own
+  service-account key), Entra with `oauth2_client_credentials`, Okta with
+  `okta_ssws`. A spec naming a broker plugin fails to compile.
 - `session_login {login_url, credential_fields, fields?, encoding?, response, expires_in_secs?}`:
   POST named credential fields as JSON (default) or form data. `login_url` and
   optional non-secret `fields` may template only `config.*`; credential values
@@ -300,101 +269,18 @@ Use `{{item}}` or `{{item.field}}` in the url, query and `source_type`.
 toggles in the marketplace: the connector service fills `STREAMS` with the ids
 of the manifest streams the operator enabled.
 
-## Enrichment-lane collectors (`source_type: nano_enrich`)
+## Identity directory sync
 
-A collector that pulls reference data rather than logs (users, assets) ships
-with `source_type: nano_enrich` and stamps each record with
-`kind` (e.g. `identity`), `source` and `provider_id`. Vector routes these to
-the enrichment normalizers instead of a log parser, so the stream names no
-parser in its manifest. `okta_users` is the example.
+Do not author an ordinary collector with `source_type: nano_enrich`: generic
+ingest rejects that contract with 409. Directory connectors use `kind:
+identity` plus per-stream `identity.role` and bypass Vector entirely. The
+runner writes through its fenced ClickHouse directory target; bundled
+`okta_users` and `entra_directory` are the examples. Log collectors such as
+`okta_system_log` continue to deliver through HEC and a parser.
 
-## Identity directory sync (`kind: identity`)
-
-An identity connector syncs a directory (users, group memberships) into the
-tenant's identity directory through its enrichment coordinator. It has no
-ingest, no `source_type`, no parser and no ingest token.
-
-```yaml
-kind: identity
-identity: { full_every_secs: 86400 }     # force a full snapshot at least this often
-streams:
-  - id: users
-    identity: { role: users, mode: delta }   # mode: full (default) | delta
-    request: ...
-    program: |                            # vendor user -> canonical row
-  - id: groups_members
-    identity: { role: memberships }       # always full
-    fanout: { discover: { from: request, request: ..., response: { events_path: groups } }, item_key: id }
-    request: { url: "https://.../groups/{{item.id}}/members" }
-    program: |                            # emits {"member": <user id>, "group": "<name>", "privileged": bool?}
-```
-
-- Users rows use the directory's field names: `external_id` (required, the
-  vendor's immutable id), `username`, `upn`, `email`, `display_name`,
-  `first_name`, `last_name`, `department`, `title`, `manager_upn`,
-  `manager_display_name`, `manager_external_id` (resolved to
-  `manager_upn`: by the engine from the same run, else by the coordinator
-  from the directory), `company`, `office_location`, `city`,
-  `country`, `account_enabled`, `account_status`
-  (`active|suspended|disabled|deprovisioned|locked|staged|unknown`; until
-  the runner sets `CONNECTOR_IDENTITY_V2_FIELDS`, `deprovisioned`, `locked`
-  and `staged` are sent as `disabled`, `suspended` and `unknown`),
-  `mfa_enabled`, `last_sign_in_at`, `created_in_directory_at` (RFC 3339 or
-  epoch), `phone`, `employee_id`, `employee_type`, `is_admin`, `deleted`
-  (delta tombstone) and `version`. Other fields are dropped. The engine
-  stamps the provenance (`feed_id` = `<feed>:<stream id>`, `source_kind`,
-  `snapshot_id`, `observed_at`).
-- A full run starts from `initial_state` (the saved cursor is ignored),
-  stages every page with the coordinator and commits the snapshot at the
-  end: users absent from it disappear. Its checkpoint (cursor and
-  `identity_last_full_at`, `identity_last_full_rows`) is saved only after
-  that commit. A full run that returns no users fails rather than empty the
-  directory, and one that finds fewer than half the users of the previous
-  full run fails before the commit (`identity_shrink_refused`; the counts
-  are logged) unless the feed config sets `identity_allow_shrink: true`
-  (with it, an empty run commits an empty snapshot; the coordinator also
-  refuses zero rows without that explicit `allow_empty`).
-- A delta run sends each page as a patch delta and saves the cursor after
-  the coordinator acknowledged it. `deleted: true` rows are tombstones.
-  Delta runs need the runner's `CONNECTOR_IDENTITY_V2_FIELDS` (the v2
-  coordinator contract); without it every users stream runs full.
-- The engine runs full when there is no checkpoint, the last full run is
-  older than `identity.full_every_secs`, or the program returns
-  `{"restart_full": true}` (Graph 410 Gone / `syncStateNotFound`). The VRL
-  input carries `.identity.mode` (`"full"` or `"delta"`) so the program can
-  pick its first request.
-- Memberships streams run after the users streams on every run. The engine
-  aggregates their pairs into one row per member on the `<feed>:groups`
-  sub-feed (`groups` sorted, `is_admin` = any `privileged`, sent only with
-  `CONNECTOR_IDENTITY_V2_FIELDS`), bounded by
-  `limits.max_identity_memberships`.
-- Memberships streams never checkpoint (no per-group `state.items`): they
-  are always full. Their fan-out may discover up to 100,000 items (an unset
-  `max_items` means that); discovering more fails the run instead of
-  committing a partial groups snapshot. If a memberships walk finds no
-  memberships at all, the previous groups snapshot is kept (the coordinator
-  cannot commit an empty snapshot and the writer token cannot delete).
-- Users streams may omit `request`: the program is then called first with
-  `.response == null` (and `.identity.mode` set) and returns the first
-  `next_request`.
-- Limits: identity runs get higher defaults (3,600 s, 20,000 pages, 100,000
-  requests, 10M events, 8 GiB) when the spec leaves a limit at the
-  collector default, and higher ceilings (10x pages and requests, 2x events,
-  8x event bytes of the platform ceilings). The runner's run-time cap still
-  applies.
-- A full run replaces the sub-feed (highest `version` wins). A delta row is
-  a patch: a field it omits (or sends empty) keeps the directory's value,
-  so a vendor delta that resends only changed properties (Graph) is safe.
-  A patch cannot clear a field; the next full run does. A delta row whose
-  manager is not in the same run is sent with `manager_external_id` as a
-  reference the coordinator resolves against the directory, so unchanged
-  managers are kept.
-- A feed has one users stream and its id is `users`: the feed's directory
-  rows are exactly `<feed>:users` and `<feed>:groups`, which is what an
-  uninstall removes (the runner deletes both at the tenant coordinator,
-  retrying with backoff, before the feed row goes).
-- Users streams cannot fan out; no identity stream may use `window`,
-  `write_ahead_state` or `restart_window_on`.
+The separate native provider scheduler in `nanosiem-core/src/identity/sync`
+uses Vector's dedicated `/enrichment`/`:8090` lane. That internal transport is
+not a connector-authoring surface.
 
 ## Templates
 
@@ -474,24 +360,11 @@ risk_score?, tags?, data}`. `data_enrichment` returns records the same way.
 - Respect the vendor's documented page size, rate tier and error shapes. Put
   the vendor's error text in `error`.
 
-## Native request sequences and value helpers
-
-Hosts can use `sequence::compile` / `sequence::run` for bounded chained HTTP
-requests without a script or VRL program. Requests use the existing auth
-registry, broker, HTTPS host/path policy, public-address guards and platform
-deny rules. The caller supplies request usage accounting. Sequences do not retry transport errors or follow redirects. Session login
-may refresh once and resend after an explicit 401 refusal; other statuses
-and ambiguous writes do not enable this exception. Polling is read-only and
-bounded by time, request count and aggregate bytes. Once a write is accepted,
-an unverified completion returns an ambiguous outcome.
-
-Sequence scope adds `steps.<id>`, `poll`, `run`, `alert` and `case` to the existing
-template namespaces. A host controls which namespaces its format admits.
-Credentials, auth, secret and environment namespaces remain forbidden.
+## Template value helpers
 
 The closed helpers are `coalesce a b`, `first array`, `join array delimiter`,
-`lower string`, `json_quote value`, `base64url string`,
-`notification_body format event target`, and `with_field object key value`. JSON double-quoted literals and parenthesized
+`lower string`, `json_quote value`, `base64url string` and
+`with_field object key value`. JSON double-quoted literals and parenthesized
 nested calls are supported. Examples: `{{coalesce input.id steps.resolve.ids.0}}`
 and `{{join input.ids ","}}`. `coalesce` evaluates lazily. There is no general
 expression evaluation, scripting, filtering or access to host functions.
@@ -508,40 +381,13 @@ dry runs also refuse credential-bearing helper operands while preserving
 redaction of raw preview values. Diagnostics never include the refused value.
 Unselected lazy `coalesce` branches remain unevaluated.
 
-Sequence response expectations can require multiple exact JSON values with
-`expect.fields`, a map of at most 16 dotted paths (256 bytes each) to literal
-values. Every field must exist and match its value and type. For example,
-`fields: {attempted: 1, succeeded: 1, "results.0.error": null}` combined with
-`path: results, items: 1` rejects zero, partial and multi-result receipts.
-An explicit null requires a present JSON null; missing fields fail. Paths use
-alphanumeric/underscore segments and array indexes. Values are not templates.
-Empty `fields` is omitted from serialization, preserving existing sequence bytes.
-An explicitly empty `expect.path` selects the complete JSON body. Combine
-`path: ""`, `items: 1` and exact `fields` checks for root-array batch receipts;
-for example, HTTP 207 alone does not prove that its individual items were accepted.
-Form fields whose entire value is a missing `input.*` reference are omitted,
-matching optional query parameters. Literal empty strings and explicit helpers
-remain present. This supports bounded optional AWS Query group parameters
-without sending empty group IDs or discarding supplied restoration state.
-
 A URL may start with a single `{{config.base_url}}` containing an HTTPS origin,
 or retain the existing `https://{{config.host}}/path` form with a bare host.
 Origins cannot contain userinfo, query, fragment, a path prefix or a non-443
 port. Dynamic origins still need constrained allow rules. Path substitutions
 are encoded as single segments, and dot-segment substitutions are refused.
 
-SOAR action packs may explicitly type a non-secret connection field as
-`format: https_endpoint`. A request URL consisting of exactly
-`{{config.<field>}}` then selects that complete configured HTTPS URL, including
-its non-secret path. It requires a DNS hostname on port 443 and refuses
-userinfo, query, fragment, reserved names, IP literals and embedded templates.
-It is resolved before native request compilation into one exact host; private
-or mixed DNS answers and platform denials remain blocked by the broker. The
-existing tenant/connection/revision-bound egress helper and inventory publish
-that same exact host. Optional vendor suffixes, enumerated values and path
-constraints still apply. A flow input cannot select or append to the endpoint.
-This opt-in belongs to the signed pack definition, not to an environment flag
-or to ordinary untyped config. Token/login endpoints do not use this format.
+## Replay transport
 
 `preview::ReplayTransport::strict` consumes expected exchanges in order and
 checks the exact method, URL, query and JSON/form body. Unexpected duplicate
@@ -549,6 +395,11 @@ query parameters, incorrect bodies and extra/missing exchanges are refused.
 Use `assert_complete()` after execution. Independent recordings have distinct
 identities so a host can isolate authentication caches from live execution.
 
+Independent replay request contracts may declare non-secret `headers` alongside
+method, URL, query and body. Header names match case-insensitively; values match
+exactly, and a missing or duplicate matching header fails replay. Auth-bearing
+headers can stay omitted so fixtures never need credentials. Use this for
+vendor API-version, media-type and required client-identification headers.
 
 ## Session auth example (synthetic protocol only)
 
@@ -587,74 +438,7 @@ OAuth client credentials additionally accepts `client_auth: basic` (default:
 in the grant form. `scope` may reference connection `config.*`, never flow inputs;
 the rendered scope is bounded to 4096 characters and cannot contain controls.
 
-A response expectation can use `path: findingIds, json_type: array` to accept
-an empty documented result while refusing missing/wrong-type fields. Supported
-`json_type` values are `array`, `object`, `string`, `number`, `boolean` and `null`;
-`null` requires an explicitly present field. `path: ""` selects the JSON root.
-
-Independent replay request contracts may declare non-secret `headers` alongside
-method, URL, query and body. Header names match case-insensitively; values match
-exactly, and a missing or duplicate matching header fails replay. Auth-bearing
-headers can stay omitted so fixtures never need credentials. Use this for
-vendor API-version, media-type and required client-identification headers.
-
-SOAR input `type: text` accepts multiline ticket/alert content with a hard 16 KiB
-UTF-8 byte ceiling. Optional `max_bytes` can lower it (1–16384); tabs, CR and LF
-are allowed as JSON payload data, while other control characters are refused.
-`max_bytes` is valid only on text inputs. Identifier `string` keeps its existing
-2 KiB/no-control grammar. Regex patterns stay identifier-only; use the text byte
-ceiling for long descriptions. URL/header policy and encoded-secret outbound
-checks still run before any transport call. No text value becomes a template or
-host program.
-
-SOAR `deployment_scope: self_hosted_sovereign` is a signed publisher restriction. Only the trusted `SelfHosted` startup profile (including sovereign customer installations) may install, connect or execute it; hosted/shared/demo profiles refuse it. Customer config, action inputs and run metadata cannot select deployment authority. `config.format: https_origin` is available only with that scope and accepts one certificate-valid HTTPS FQDN origin on port 443; action paths append to it, while the exact configured host and reviewed API path prefixes remain mandatory. `https_endpoint` keeps its complete-URL/public-only behavior.
-
-For scoped packs the native broker permits RFC1918/ULA corporate DNS answers, pins and checks every answer, and keeps explicit platform/tenant denies. Loopback, link-local, CGNAT, cloud metadata (including `fd00:ec2::/32`), reserved addresses, Kubernetes service/cluster DNS and IP literals stay refused. A trusted self-managed startup saves its original dialer for scoped packs inside the existing authority-guarded transports; public packs retain the proxy route and public-only IP policy. Private pack hosts never become hosted proxy grants. There is no direct fallback from a failed public proxy request, or customer/network environment knob enabling this authority.
-
 SigV4 retains each issued Authorization value and isolated signature as derived secrets, so reflected response bodies, summaries and downstream action outputs are scrubbed like raw credentials. Retention is bounded by the compiled request cap; signing refuses before send at the cap rather than evicting an early signature that a later response could reflect. The closed auth registry reflection suite must cover every registered plugin.
-
-## SOAR action output contracts
-
-Native action packs may declare `output_types` alongside `outputs`. The keys
-must cover exactly the extracted output names. Supported JSON types are
-`string`, `integer`, `number`, `boolean`, `array`, and `object`. Values are
-validated after native execution and secret redaction, without coercion:
-
-```yaml
-outputs:
-  score: steps.lookup.score
-  matches: steps.lookup.matches
-output_types:
-  score: integer
-  matches: array
-```
-
-Missing or null output paths already fail native extraction. A Read action with
-a wrong output type fails with `invalid_outputs`; after an accepted mutation,
-the result is ambiguous so a flow cannot retry it as a known failure. Dry runs
-render requests without requiring vendor response values. Declared scalar
-outputs may be used as compile-time-validated Judge entity references. Object
-and array outputs remain usable as evidence but cannot serve as scalar entities.
-Omitting the map preserves existing pack behavior and canonical bytes. These
-fields belong to the native ActionPack schema, rather than the collector
-ConnectorSpec schema linked above.
-
-A native action output may reference an entire preceding response with `steps.<step_id>` (including a top-level JSON array). It has the same prior-step visibility and secret-redaction rules as field extraction; declare `array` or `object` in `output_types` to enforce the required shape.
-
-## SOAR deployment eligibility
-
-Action packs restricted to self-hosted/sovereign installations declare the
-signed top-level field `deployment_scope: self_hosted_sovereign`. Omitting it
-preserves the unrestricted legacy default and canonical bytes. A `self_hosted` category
-requires this field; a category alone grants no deployment permission.
-
-The trusted startup deployment policy used by private SMTP also gates pack
-installation/upgrades, connection creation/update/use, and action execution.
-Managed, shared-enterprise, and demo deployments cannot admit these packs;
-tenant configuration cannot override the gate. Offline converter replay
-selects the self-hosted profile only for scoped artifacts. This field
-does not relax artifact validation or hosted egress. Private-network admission
-requires the trusted self-hosted scope and native DNS/deny rules documented above.
 
 ## Scoped JSON credentials with existing OAuth
 
@@ -666,38 +450,4 @@ native credential and a single bounded JSON mutation discriminator. Pointers
 are literal object identifier paths (1–8 segments); JSON Pointer escapes and
 array traversal are refused. The selected field must be absent from the initial
 request. Other discriminator values and reads use OAuth without injection.
-All plugin credential fields remain required by sequence admission.
-
-For example, Jamf `DEVICE_LOCK` uses `/commandData/commandType` as discriminator,
-`/commandData/pin` as destination and `six_digit_pin` as `format`. The PIN stays
-in the connection credential store, never in flow inputs/config/templates.
-`opaque` is the default format, with the engine minimum secret length and a
-16 KiB ceiling. Mutation bodies require application/json, an object and a
-1 MiB limit. Fields cannot alias OAuth credentials. Retained summaries and
-response echoes use existing secret redaction. Exact already-decorated request
-fingerprints allow auth reapplication without allowing initial field overrides;
-retention is bounded by the native request limit (max 4096), never evicted.
-
-`{{with_field steps.current.properties "status" input.status}}` creates a copy
-of a JSON object with one field replaced. The key must be a 1–64 byte ASCII
-alphanumeric/underscore identifier; this is a field name, not a path or program.
-Existing expression depth/size, deferred-response and secret-namespace guards
-apply. Sentinel uses it to preserve every fetched incident property during its
-etag-protected status PUT, avoiding silent resets of owner/labels/description.
-
-### Bind mutation targets to an identity Read
-
-Sequence `expect.input_equals` maps at most 16 response JSON paths to literal
-required string input names, for example `input_equals: {id: device_id}`. Paths
-use the same bounded dotted grammar as `expect.fields`; input names cannot be
-templates, namespaces or helpers. Both values must exist as nonempty strings and
-match exactly, without coercion. Missing/null/wrong-type/mismatched identities
-refuse before the next step. SOAR admission requires each named input to be a
-required string. Empty maps are omitted from serialized definitions.
-
-Device mutations perform the Read inside the same approved native sequence and
-connection/auth context, then derive their command target from `steps.identity`.
-For Jamf, bind both the inventory `id` and `general.managementId` to the selected
-`computer_id` and `management_id`; dispatch only the returned management UUID.
-This avoids trusting an independent flow input as the command target. No external
-identity receipt, cross-tenant cache or credential/egress change is introduced.
+Every secret credential field a plugin reads must be present and at least six bytes (see the engine credential check).

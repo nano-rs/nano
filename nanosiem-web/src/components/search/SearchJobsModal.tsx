@@ -10,7 +10,7 @@
  */
 import { useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { X, CircleCheck, XCircle, Clock, Play, Download } from 'lucide-react';
+import { X, CircleCheck, XCircle, Clock, Play } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api } from '@/lib/api';
 import type { SearchJobSummary } from '@/lib/api';
@@ -42,24 +42,6 @@ function formatElapsed(ms: number): string {
   return `${mins}m ${seconds % 60}s`;
 }
 
-function jobKindLabel(kind?: string): string | null {
-  switch (kind) {
-    case 'retro_v1': return 'Retro hunt';
-    case 'asset_v1': return 'Asset analysis';
-    case 'asset_dossier_v1': return 'Asset dossier';
-    case 'cloud_overview_v1': return 'Cloud overview';
-    case 'cloud_events_summary_v1': return 'Cloud event summary';
-    case 'cloud_dossier_v1': return 'Cloud dossier';
-    case 'cloud_user_timeline_v1': return 'Cloud user timeline';
-    case 'cloud_entity_pivot_v1': return 'Cloud entity pivot';
-    case 'lateral_v1': return 'Lateral trace';
-    case 'baseline_v1': return 'Baseline';
-    case 'prevalence_export_v1': return 'Prevalence export';
-    case 'search_npl_v1': return 'Search';
-    default: return kind ? kind.replace(/_v\d+$/, '').replaceAll('_', ' ') : null;
-  }
-}
-
 function JobRow({
   job,
   onLoadJob,
@@ -72,8 +54,6 @@ function JobRow({
   const meta = STATUS_META[job.status] ?? STATUS_META.queued;
   const Icon = meta.icon;
   const isActive = job.status === 'queued' || job.status === 'running';
-  const kindLabel = jobKindLabel(job.task_kind);
-  const isDownload = job.task_kind === 'prevalence_export_v1';
 
   return (
     <div className="group px-3 py-2 rounded-sm border border-transparent hover:border-border hover:bg-foreground/[0.03] transition-colors">
@@ -82,14 +62,17 @@ function JobRow({
         <span className={cn('font-mono text-[10.5px] uppercase tracking-[0.1em] font-semibold', meta.color)}>
           {meta.label}
         </span>
-        {kindLabel && (
-          <span className="rounded-sm border border-border bg-foreground/[0.03] px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.08em] text-muted-foreground">
-            {kindLabel}
-          </span>
-        )}
         {job.queue_position !== undefined && job.status === 'queued' && (
           <span className="font-mono text-[10px] text-muted-foreground">
             position {job.queue_position}
+          </span>
+        )}
+        {/* NAN-4915: durable background job detail */}
+        {job.durable && (
+          <span className="font-mono text-[10px] text-muted-foreground tabular-nums">
+            {job.durable.origin === 'escalated' ? 'handed off' : 'background'}
+            {job.durable.attempt > 1 && <> · attempt {job.durable.attempt}</>}
+            {job.durable.row_count != null && <> · {job.durable.row_count.toLocaleString()} rows{job.durable.result_truncated ? '+' : ''}</>}
           </span>
         )}
         <span className="ml-auto font-mono text-[10px] text-muted-foreground tabular-nums">
@@ -102,15 +85,15 @@ function JobRow({
           {job.job_id}
         </span>
         <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-          {onLoadJob && job.status === 'completed' && (
+          {onLoadJob && (job.status === 'completed' || (job.durable && isActive)) && (
             <button
               type="button"
               onClick={() => onLoadJob(job.job_id)}
               className="p-1 rounded hover:bg-foreground/10 text-muted-foreground hover:text-foreground"
-              title={isDownload ? 'Download export' : 'Load results'}
-              aria-label={isDownload ? 'Download job export' : 'Load job results'}
+              title={job.status === 'completed' ? 'Load results' : 'Attach to running search'}
+              aria-label={job.status === 'completed' ? 'Load job results' : 'Attach to running search'}
             >
-              {isDownload ? <Download className="w-[11px] h-[11px]" /> : <Play className="w-[11px] h-[11px]" />}
+              <Play className="w-[11px] h-[11px]" />
             </button>
           )}
           {onCancelJob && isActive && (
@@ -154,14 +137,8 @@ export function SearchJobsModal({ open, onOpenChange, onLoadJob, onCancelJob }: 
 
   if (!open) return null;
 
-  // Redis keeps durable results longer than the old inline-search TTL. Do not
-  // trust store iteration order here or a just-finished product job can land
-  // behind yesterday's retained jobs and disappear from the ten-row view.
-  const orderedJobs = [...jobs].sort((left, right) => right.created_at_ms - left.created_at_ms);
-  const active = orderedJobs.filter(j => j.status === 'queued' || j.status === 'running');
-  const recent = orderedJobs
-    .filter(j => j.status !== 'queued' && j.status !== 'running')
-    .slice(0, 10);
+  const active = jobs.filter(j => j.status === 'queued' || j.status === 'running');
+  const recent = jobs.filter(j => j.status !== 'queued' && j.status !== 'running').slice(0, 10);
 
   return (
     <div
@@ -175,7 +152,7 @@ export function SearchJobsModal({ open, onOpenChange, onLoadJob, onCancelJob }: 
         {/* Header */}
         <div className="px-4 py-3 border-b border-border flex items-center gap-2">
           <div className="font-mono text-[10px] tracking-[0.16em] uppercase text-muted-foreground font-semibold">
-            Query jobs
+            Search jobs
           </div>
           {active.length > 0 && (
             <span className="rounded-sm bg-primary/15 text-primary text-[9.5px] px-1 font-semibold tabular-nums">
@@ -199,7 +176,7 @@ export function SearchJobsModal({ open, onOpenChange, onLoadJob, onCancelJob }: 
               <Clock className="w-5 h-5 opacity-40" />
               <div className="text-[12px] font-medium text-foreground/70">No recent jobs</div>
               <div className="text-[10.5px] text-muted-foreground/70">
-                Long-running searches and product analyses show up here so you can monitor or cancel them.
+                Long-running searches show up here so you can monitor or cancel them.
               </div>
             </div>
           ) : (

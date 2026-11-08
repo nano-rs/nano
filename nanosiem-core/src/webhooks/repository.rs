@@ -50,13 +50,6 @@ impl WebhookRepository {
         self.pool.clone()
     }
 
-    /// The cipher this repository stores secrets with. The hosted-shared
-    /// tenant webhook substrate (NAN-2361) encrypts/decrypts with the SAME
-    /// envelope through the free `*_envelope_*` helpers below.
-    pub fn encryption(&self) -> &EncryptionService {
-        &self.encryption
-    }
-
     // ========================================================================
     // Webhook CRUD
     // ========================================================================
@@ -346,11 +339,10 @@ impl WebhookRepository {
     /// `NANOSIEM_HOSTNAME` env var). Blank values are normalized to `None`.
     #[instrument(skip(self))]
     pub async fn notification_base_url(&self) -> Result<Option<String>, WebhookRepositoryError> {
-        let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT notification_base_url FROM system_settings WHERE id = 'default'",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT notification_base_url FROM system_settings WHERE id = 'default'")
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row
             .and_then(|(v,)| v)
             .map(|s| s.trim().to_string())
@@ -384,21 +376,36 @@ impl WebhookRepository {
         &self,
         value: &T,
     ) -> Result<Vec<u8>, WebhookRepositoryError> {
-        encrypt_envelope_json(&self.encryption, value)
+        let json_bytes = serde_json::to_vec(value)
+            .map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))?;
+        let encrypted = self.encryption.encrypt(&json_bytes)?;
+        let storage = serde_json::json!({
+            "ciphertext": encrypted.ciphertext,
+            "nonce": encrypted.nonce
+        });
+        serde_json::to_vec(&storage)
+            .map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))
     }
 
     /// Encrypt a string into the `{ciphertext, nonce}` envelope stored in the
     /// `*_encrypted` BYTEA columns. `pub(crate)` (mirroring the public
     /// `decrypt_string`) so the encrypt→decrypt round-trip is unit-testable.
     pub(crate) fn encrypt_string(&self, value: &str) -> Result<Vec<u8>, WebhookRepositoryError> {
-        encrypt_envelope_string(&self.encryption, value)
+        let encrypted = self.encryption.encrypt(value.as_bytes())?;
+        let storage = serde_json::json!({
+            "ciphertext": encrypted.ciphertext,
+            "nonce": encrypted.nonce
+        });
+        serde_json::to_vec(&storage)
+            .map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))
     }
 
     /// F-39: populate a loaded webhook's internal delivery `url` from the
     /// encrypted column, lazy-encrypting legacy plaintext rows on read.
     ///
     /// - `url_encrypted` present → decrypt into `Webhook.url` (authoritative
-    ///   delivery URL). A decrypt failure clears the destination and fails delivery closed.
+    ///   delivery URL). A decrypt failure is logged and leaves the plaintext
+    ///   fallback in place rather than sending to a wrong/empty target.
     /// - `url_encrypted` NULL but plaintext `url` present (a pre-migration-254
     ///   row) → encrypt-and-persist it so the next read uses the encrypted
     ///   column, and keep using the plaintext meanwhile.
@@ -410,12 +417,12 @@ impl WebhookRepository {
         // small envelope first so the immutable borrow is released before we
         // mutate `webhook.url`.
         if let Some(enc) = webhook.url_encrypted.clone().filter(|e| !e.is_empty()) {
-            match decrypt_envelope_string(&self.encryption.with_context(crate::crypto::CredentialScope::Deployment, "webhook.url", webhook.id), &enc) {
+            match self.decrypt_string(&enc) {
                 Ok(url) => webhook.url = url,
-                Err(e) => {
-                    webhook.url.clear();
-                    tracing::error!(webhook_id = %webhook.id, "encrypted webhook destination unavailable: {e}");
-                }
+                Err(e) => tracing::error!(
+                    webhook_id = %webhook.id,
+                    "F-39: url_encrypted could not be decrypted, falling back to stored plaintext: {e}"
+                ),
             }
             return;
         }
@@ -474,11 +481,47 @@ impl WebhookRepository {
         &self,
         encrypted_bytes: &[u8],
     ) -> Result<T, WebhookRepositoryError> {
-        decrypt_envelope_json(&self.encryption, encrypted_bytes)
+        let json: serde_json::Value = serde_json::from_slice(encrypted_bytes)
+            .map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))?;
+        let encrypted = EncryptedData {
+            ciphertext: json["ciphertext"]
+                .as_str()
+                .ok_or_else(|| {
+                    WebhookRepositoryError::SerializationError("Missing ciphertext".to_string())
+                })?
+                .to_string(),
+            nonce: json["nonce"]
+                .as_str()
+                .ok_or_else(|| {
+                    WebhookRepositoryError::SerializationError("Missing nonce".to_string())
+                })?
+                .to_string(),
+        };
+        let decrypted = self.encryption.decrypt(&encrypted)?;
+        serde_json::from_slice(&decrypted)
+            .map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))
     }
 
     pub fn decrypt_string(&self, encrypted_bytes: &[u8]) -> Result<String, WebhookRepositoryError> {
-        decrypt_envelope_string(&self.encryption, encrypted_bytes)
+        let json: serde_json::Value = serde_json::from_slice(encrypted_bytes)
+            .map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))?;
+        let encrypted = EncryptedData {
+            ciphertext: json["ciphertext"]
+                .as_str()
+                .ok_or_else(|| {
+                    WebhookRepositoryError::SerializationError("Missing ciphertext".to_string())
+                })?
+                .to_string(),
+            nonce: json["nonce"]
+                .as_str()
+                .ok_or_else(|| {
+                    WebhookRepositoryError::SerializationError("Missing nonce".to_string())
+                })?
+                .to_string(),
+        };
+        let decrypted = self.encryption.decrypt(&encrypted)?;
+        String::from_utf8(decrypted)
+            .map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))
     }
 
     // ========================================================================
@@ -551,122 +594,5 @@ impl WebhookRepository {
         .await?;
 
         Ok(logs)
-    }
-}
-
-// ============================================================================
-// Envelope helpers — the `{"ciphertext","nonce"}` JSON bytes stored in every
-// `*_encrypted` BYTEA column. Free functions so the hosted-shared tenant
-// webhook substrate (NAN-2361, `shared_webhooks`) can store and
-// read secrets with exactly the cipher and envelope the dedicated repository
-// uses, without a `PgPool`.
-// ============================================================================
-
-fn envelope_to_bytes(encrypted: EncryptedData) -> Result<Vec<u8>, WebhookRepositoryError> {
-    let storage = serde_json::json!({
-        "ciphertext": encrypted.ciphertext,
-        "nonce": encrypted.nonce
-    });
-    serde_json::to_vec(&storage).map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))
-}
-
-fn envelope_from_bytes(encrypted_bytes: &[u8]) -> Result<EncryptedData, WebhookRepositoryError> {
-    let json: serde_json::Value = serde_json::from_slice(encrypted_bytes)
-        .map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))?;
-    Ok(EncryptedData {
-        ciphertext: json["ciphertext"]
-            .as_str()
-            .ok_or_else(|| WebhookRepositoryError::SerializationError("Missing ciphertext".to_string()))?
-            .to_string(),
-        nonce: json["nonce"]
-            .as_str()
-            .ok_or_else(|| WebhookRepositoryError::SerializationError("Missing nonce".to_string()))?
-            .to_string(),
-    })
-}
-
-/// Encrypt a UTF-8 string into the stored envelope.
-pub fn encrypt_envelope_string(
-    encryption: &EncryptionService,
-    value: &str,
-) -> Result<Vec<u8>, WebhookRepositoryError> {
-    envelope_to_bytes(encryption.encrypt(value.as_bytes())?)
-}
-
-/// Encrypt a JSON-serialisable value into the stored envelope.
-pub fn encrypt_envelope_json<T: serde::Serialize>(
-    encryption: &EncryptionService,
-    value: &T,
-) -> Result<Vec<u8>, WebhookRepositoryError> {
-    let json_bytes =
-        serde_json::to_vec(value).map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))?;
-    envelope_to_bytes(encryption.encrypt(&json_bytes)?)
-}
-
-/// Decrypt a stored envelope back to the UTF-8 string.
-pub fn decrypt_envelope_string(
-    encryption: &EncryptionService,
-    encrypted_bytes: &[u8],
-) -> Result<String, WebhookRepositoryError> {
-    let decrypted = encryption.decrypt(&envelope_from_bytes(encrypted_bytes)?)?;
-    String::from_utf8(decrypted).map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))
-}
-
-/// Decrypt a stored envelope back to a JSON value.
-pub fn decrypt_envelope_json<T: serde::de::DeserializeOwned>(
-    encryption: &EncryptionService,
-    encrypted_bytes: &[u8],
-) -> Result<T, WebhookRepositoryError> {
-    let decrypted = encryption.decrypt(&envelope_from_bytes(encrypted_bytes)?)?;
-    serde_json::from_slice(&decrypted).map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))
-}
-
-#[cfg(test)]
-mod credential_reader_tests {
-    use super::*;
-    #[tokio::test]
-    async fn v2_destination_wrong_row_never_falls_back_to_plaintext() {
-        let id = Uuid::from_u128(1);
-        let cipher = EncryptionService::from_config("0123456789abcdef0123456789abcdef").unwrap();
-        let encrypted = cipher
-            .with_context(
-                crate::crypto::CredentialScope::Deployment,
-                "webhook.url",
-                id,
-            )
-            .seal_v2(b"https://example.test/credential")
-            .unwrap()
-            .to_json_bytes()
-            .unwrap();
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://fixture@127.0.0.1:1/never-connect")
-            .unwrap();
-        let repo = WebhookRepository::with_encryption(pool, cipher);
-        let now = chrono::Utc::now();
-        let mut hook = Webhook {
-            id,
-            name: "fixture".into(),
-            url: "https://fallback.invalid/unsafe".into(),
-            url_encrypted: Some(encrypted),
-            url_host: None,
-            headers_encrypted: None,
-            secret_encrypted: None,
-            severity_filter: None,
-            event_types: vec![],
-            channel_type: "generic".into(),
-            channel_config: serde_json::json!({}),
-            rule_filter: None,
-            health_category_filter: None,
-            health_resource_filter: None,
-            enabled: true,
-            created_at: now,
-            updated_at: now,
-        };
-        repo.hydrate_delivery_url(&mut hook).await;
-        assert_eq!(hook.url, "https://example.test/credential");
-        hook.id = Uuid::from_u128(2);
-        hook.url = "https://fallback.invalid/unsafe".into();
-        repo.hydrate_delivery_url(&mut hook).await;
-        assert!(hook.url.is_empty());
     }
 }

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { Badge } from '@/components/ui/badge';
-import { receivingWithoutParser } from '@/lib/log-source-lanes';
 import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
@@ -52,15 +50,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { useToast } from '@/hooks/use-toast';
-import { useSharedTenant } from '@/hooks/use-shared-tenant';
-import { useIngestGate } from '@/hooks/use-capabilities';
-import { TenzirOnlyNote, TENZIR_ONLY_NOTE } from '@/components/add-data/TenzirOnlyNote';
 import { useAuth } from '@/contexts/AuthContext';
-import { SourceWritersCard } from '@/components/add-data/SourceWritersCard';
-import { LogSourceDetailShell } from '@/components/log-sources/LogSourceDetailShell';
-import { IngestActivitySparkline } from '@/components/add-data/IngestActivitySparkline';
-import { LogSourceHealthPanel } from '@/components/log-sources/LogSourceHealthChart';
-import { LogSourceDelivery } from '@/components/log-sources/LogSourceDelivery';
 import {
   useDiscardLogSourceDraft,
   useDeployLogSource,
@@ -86,47 +76,32 @@ import { useDefaultLayout } from 'react-resizable-panels';
 import { computeDiff, type DiffLine, type VrlUpdateInfo } from '@/lib/parser-diff';
 import { ParserTestLab } from '@/components/parser/ParserTestLab';
 import { Markdown } from '@/components/ui/markdown';
-import {
-  formatElapsed,
-  PARSER_JOB_MAX_WAIT_MS,
-  useElapsedWhile,
-  useMelodJob,
-} from '@/enterprise/hooks/use-melod-job';
+import { PARSER_JOB_MAX_WAIT_MS, useMelodJob } from '@/enterprise/hooks/use-melod-job';
 import { useMelodStatus } from '@/hooks/use-api';
-import { useCapabilities } from '@/hooks/use-capabilities';
-import { useParserSidePanelTabs, type SidePanelTabId } from '@/components/log-sources/parserSidePanelTabs';
 import type { CollectorError, MelodEditParserResponse } from '@/lib/api';
 import { Send } from 'lucide-react';
 import { PivtIcon } from '@/components/icons/PivtIcon';
+import { useParserSidePanelTabs } from '@/components/log-sources/parserSidePanelTabs';
 
 import { api } from '@/lib/api';
 import type {
   LogSource,
   LogSourceDeployment,
   LogSourceVersion,
-  TenantParserRollout,
   SourceConfiguration,
   UpdateLogSource,
 } from '@/lib/api';
-import { formatRelativeCompact, formatUTCCompact } from '@/lib/date-utils';
+import { formatUTCCompact } from '@/lib/date-utils';
 import {
   SOURCE_TYPE_LABELS,
   logSourceTransportLabel,
 } from '@/lib/log-source-transports';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import { SourceWritersCard } from '@/components/add-data/SourceWritersCard';
+import { LogSourceDelivery } from '@/components/log-sources/LogSourceDelivery';
+import { LogSourceHealthPanel } from '@/components/log-sources/LogSourceHealthChart';
+import type { LogSourceHealth } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
-import { LogSourceRolloutPanel } from '@/components/parser-rollout/LogSourceRolloutPanel';
-import { useLatestLiveRollout, useLogSourceRollouts } from '@/components/parser-rollout/use-log-source-rollouts';
-import { PlatformUpdateBanner } from '@/components/parser-rollout/PlatformUpdateBanner';
-import { ParserSamplesEditor } from '@/components/parser-rollout/ParserSamplesEditor';
-import {
-  LOG_SOURCE_ROLLOUTS_QUERY_KEY,
-  PARSER_ROLLOUTS_QUERY_KEY,
-  parserServingState,
-  rolloutFailureText,
-  rolloutStateLabel,
-  rolloutVersion,
-  type ParserServingState,
-} from '@/lib/parser-rollout';
 import { nplFieldEquals } from '@/lib/npl-quote';
 import {
   buildLogSourceParserPrompt,
@@ -177,15 +152,12 @@ export function LogSourceDetail() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { toast } = useToast();
-  const [searchParams, setSearchParams] = useSearchParams();
-  // NAN-2597: hosted-shared tenants see which ingest credentials can write this source.
-  const shared = useSharedTenant();
-  // NAN-3844: no Vector on an `install.sh --tenzir` install, so deploy and
-  // publish (which renders into Vector) are off; drafting and testing stay.
-  const { tenzirOnly, blocked: vectorBlocked } = useIngestGate();
   const { hasPermission } = useAuth();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const { data: logSource, loading, refetch } = useLogSource(id);
+  // NAN-4903: Search scopes a source by `metadata.log_source` on OCSF, `source_type` on UDM.
+  const searchSourceField = useSchemaFieldMap().field('logSource');
   useDocumentTitle(logSource?.name || 'Log Source', [logSource?.id]);
   useBreadcrumbTitle(logSource?.name);
 
@@ -194,17 +166,11 @@ export function LogSourceDetail() {
   const { data: draftStatus, refetch: refetchDraftStatus } = useLogSourceDraftStatus(id);
   const { data: versions, refetch: refetchVersions } = useLogSourceVersions(id);
   const { data: ingestionHistory } = useIngestionHistory(24);
-  // NAN-2983: the header shows the latest parser rollout (same query/poll as the rollout panel).
-  const rolloutsQuery = useLogSourceRollouts(id ?? '', shared && !!id);
-  // NAN-3298: the tenant's newest promoted roll (any source), to tell which version serves.
-  const latestLiveQuery = useLatestLiveRollout(rolloutsQuery.data?.[0], shared && !!id);
 
   const { mutate: updateLogSource, loading: updating } = useUpdateLogSource();
   const { mutate: toggleLogSource } = useToggleLogSource();
   const { mutate: validateLogSource, loading: validating } = useValidateLogSource();
   const { mutate: validateVrl } = useValidateLogSourceVrl();
-  // NAN-2607: on hosted-shared (`shared`, above), deploy / publish / revert roll
-  // the parser out to the tenant's parser cell (a parser-bundle rollout), not to Vector.
   const { mutate: deployLogSource, loading: deploying } = useDeployLogSource();
   const { mutate: undeployLogSource, loading: undeploying } = useUndeployLogSource();
   const { mutate: publishLogSource, loading: publishing } = usePublishLogSource();
@@ -216,15 +182,6 @@ export function LogSourceDetail() {
     queryFn: () => api.listSourceConfigs({ deployed: true }),
     staleTime: 60_000,
   });
-  const { data: activeSchema } = useQuery({
-    queryKey: ['schema-fields'],
-    queryFn: () => api.getSchemaFields(),
-    staleTime: Infinity,
-    gcTime: Infinity,
-  });
-  const searchSourceField = activeSchema?.schema === 'ocsf'
-    ? 'metadata.log_source'
-    : 'source_type';
 
   const availableSourceTypes = useMemo(() => {
     if (!deployedConfigs?.length) return [];
@@ -320,26 +277,6 @@ export function LogSourceDetail() {
   const currentVrl = isEditingVrl ? editedVrl : logSource.parser_vrl;
   const vrlDirty = isEditingVrl && editedVrl !== logSource.parser_vrl;
   const hasDraft = draftStatus?.has_draft_changes ?? false;
-  const activeVersion = versions?.find((v) => v.is_active);
-  const latestRollout = rolloutsQuery.data?.[0];
-  const activeVersionNumber = draftStatus?.active_version_number ?? activeVersion?.version_number;
-  // NAN-3298: an active version serves only once a parser-bundle roll carrying it is promoted.
-  const serving = parserServingState(
-    shared ? rolloutsQuery.data : undefined,
-    latestLiveQuery.data,
-    activeVersionNumber,
-  );
-
-  // "Full description" in the header: jump to the Feed details card.
-  const showFeedDetails = () => {
-    if (activeTab !== 'overview') setActiveTab('overview');
-    // The tab switch goes through the URL and an effect, so wait a frame pair for the card to mount.
-    requestAnimationFrame(() =>
-      requestAnimationFrame(() =>
-        document.getElementById('feed-details')?.scrollIntoView({ behavior: 'smooth', block: 'start' }),
-      ),
-    );
-  };
 
   // ----- mutation handlers -----
 
@@ -360,17 +297,8 @@ export function LogSourceDetail() {
 
   const handleDeploy = async () => {
     try {
-      const result = await deployLogSource(logSource.id);
-      if (shared) {
-        const rollout = (result as { rollout?: unknown } | undefined)?.rollout;
-        toast({
-          title: 'Activated',
-          description: rollout ? `"${logSource.name}" is rolling out to your parser cell.` : `"${logSource.name}" is active.`,
-        });
-        invalidateRollouts();
-      } else {
-        toast({ title: 'Deployed', description: `"${logSource.name}" has been deployed to Vector.` });
-      }
+      await deployLogSource(logSource.id);
+      toast({ title: 'Deployed', description: `"${logSource.name}" has been deployed to Vector.` });
       setDeployDialogOpen(false);
       refetch();
       refetchHealth();
@@ -388,12 +316,7 @@ export function LogSourceDetail() {
   const handleUndeploy = async () => {
     try {
       await undeployLogSource(logSource.id);
-      toast({
-        title: 'Undeployed',
-        description: shared
-          ? `"${logSource.name}" is deactivated; it leaves your parser cell with the next rollout.`
-          : `"${logSource.name}" has been removed from Vector.`,
-      });
+      toast({ title: 'Undeployed', description: `"${logSource.name}" has been removed from Vector.` });
       setUndeployDialogOpen(false);
       refetch();
       refetchHealth();
@@ -411,15 +334,7 @@ export function LogSourceDetail() {
   const handlePublish = async () => {
     try {
       const result = await publishLogSource(logSource.id);
-      if (result.success && shared) {
-        toast({
-          title: 'Published',
-          description: (result as { rollout?: unknown }).rollout
-            ? `Version created; "${logSource.name}" is rolling out to your parser cell.`
-            : `Version created and "${logSource.name}" activated.`,
-        });
-        invalidateRollouts();
-      } else if (result.success) {
+      if (result.success) {
         toast({
           title: 'Published & deployed',
           description: `Version created and "${logSource.name}" deployed.`,
@@ -459,11 +374,6 @@ export function LogSourceDetail() {
       });
     }
   };
-
-  function invalidateRollouts() {
-    if (id) void queryClient.invalidateQueries({ queryKey: LOG_SOURCE_ROLLOUTS_QUERY_KEY(id) });
-    void queryClient.invalidateQueries({ queryKey: PARSER_ROLLOUTS_QUERY_KEY });
-  }
 
   const handleDiscardDraft = async () => {
     try {
@@ -703,19 +613,13 @@ export function LogSourceDetail() {
 
   return (
     <TooltipProvider delayDuration={200}>
-      {/* NAN-3011/3014: full-width app page shell; scrolls in AppLayout, never its own box. */}
-      <LogSourceDetailShell>
+      <div className="flex flex-col min-h-0 -m-3 bg-background h-[calc(100%+1.5rem)]">
         <LogSourceHero
           source={logSource}
           dirty={vrlDirty}
           health={health}
-          activeVersion={activeVersionNumber}
-          rollout={shared ? latestRollout : undefined}
-          serving={serving}
-          onShowDetails={showFeedDetails}
           deploying={deploying}
           undeploying={undeploying}
-          deployBlocked={vectorBlocked}
           onToggleEnabled={handleToggle}
           onDeploy={() => setDeployDialogOpen(true)}
           onUndeploy={() => setUndeployDialogOpen(true)}
@@ -732,57 +636,20 @@ export function LogSourceDetail() {
           publishing={publishing}
           discarding={discarding}
           validated={logSource.validated}
-          publishBlocked={vectorBlocked}
           onPublish={() => setPublishDialogOpen(true)}
           onDiscard={() => setDiscardDraftDialogOpen(true)}
         />
-        {tenzirOnly && <TenzirOnlyNote />}
-        {shared && (
-          <div className="flex flex-col gap-3" data-testid="shared-rollout-section">
-            <PlatformUpdateBanner />
-            <LogSourceRolloutPanel
-              logSourceId={logSource.id}
-              versions={versions ?? undefined}
-              onReverted={() => {
-                refetch();
-                refetchDraftStatus();
-                refetchVersions();
-                refetchDeployments();
-              }}
-            />
-          </div>
-        )}
         <TabNav active={activeTab} onChange={setActiveTab} />
 
-        <div className="min-w-0">
+        <div className="flex-1 min-h-0 overflow-auto">
           {activeTab === 'overview' && (
-            <div className="flex flex-col gap-3">
-              {shared && (
-                  <SourceWritersCard
-                    logSourceId={logSource.id}
-                    onRenameSource={hasPermission('log_sources:edit') ? () => { setActiveTab('config'); setIsEditingConfig(true); } : undefined}
-                    canRevoke={hasPermission('log_sources:deploy')}
-                    canIssue={hasPermission('log_sources:deploy')}
-                  />
-              )}
-              <OverviewTab
-                source={logSource}
-                health={health}
-                activeVersion={activeVersion}
-                serving={serving}
-                sparklinePoints={sparklinePoints}
-                volume={shared ? <IngestActivitySparkline logSourceId={logSource.id} embedded /> : undefined}
-              />
-              {shared && (
-                <div className="flex flex-col gap-3">
-                  {/* NAN-3661: pull sources + connector feeds into this lane, with state, last error and the fix. */}
-                  <LogSourceDelivery logSourceId={logSource.id} health={health} />
-                  {/* NAN-3207: volume vs expected band + segments; honours ?segment=<dim>:<value>. */}
-                  <LogSourceHealthPanel logSourceId={logSource.id} />
-                  <ParserSamplesEditor logSourceId={logSource.id} />
-                </div>
-              )}
-            </div>
+            <OverviewTab
+              source={logSource}
+              health={health}
+              sparklinePoints={sparklinePoints}
+              canIssueToken={hasPermission('settings:system')}
+              searchField={searchSourceField}
+            />
           )}
           {activeTab === 'config' && (
             <ConfigurationTab
@@ -801,7 +668,6 @@ export function LogSourceDetail() {
             />
           )}
           {activeTab === 'vrl' && (
-            <EditorFrame>
             <VrlEditorTab
               source={logSource}
               currentVrl={currentVrl}
@@ -825,10 +691,8 @@ export function LogSourceDetail() {
               onUndo={handleAiUndo}
               onAiVrlUpdate={handleAiVrlUpdate}
             />
-            </EditorFrame>
           )}
           {activeTab === 'extension' && (
-            <EditorFrame>
             <ExtensionTab
               source={logSource}
               updating={updating}
@@ -845,15 +709,8 @@ export function LogSourceDetail() {
                 refetchDraftStatus();
               }}
             />
-            </EditorFrame>
           )}
-          {activeTab === 'deployments' && (
-            <DeploymentsTab
-              deployments={deployments ?? null}
-              rollouts={shared ? rolloutsQuery.data : undefined}
-              serving={serving}
-            />
-          )}
+          {activeTab === 'deployments' && <DeploymentsTab deployments={deployments ?? null} />}
           {activeTab === 'versions' && (
             <VersionsTab
               versions={versions ?? null}
@@ -873,25 +730,17 @@ export function LogSourceDetail() {
           open={deployDialogOpen}
           onOpenChange={setDeployDialogOpen}
           title="Deploy log source"
-          description={
-            shared
-              ? `Activate "${logSource.name}". A custom parser is built, validated and rolled out to your parser cell; the current parser keeps serving until it is live.`
-              : `Deploy "${logSource.name}" to Vector. Incoming logs matching this source type will be parsed using the current VRL.`
-          }
+          description={`Deploy "${logSource.name}" to Vector. Incoming logs matching this source type will be parsed using the current VRL.`}
           confirmLabel={deploying ? 'Deploying…' : 'Deploy'}
           confirmIcon={deploying ? <LoadingIcon className="w-3.5 h-3.5" /> : <Rocket className="w-3.5 h-3.5" />}
           onConfirm={handleDeploy}
-          disabled={deploying || vectorBlocked}
+          disabled={deploying}
         />
         <ConfirmDialog
           open={undeployDialogOpen}
           onOpenChange={setUndeployDialogOpen}
           title="Undeploy log source"
-          description={
-            shared
-              ? `Deactivate "${logSource.name}" in your source registry. It leaves your parser cell with the next rollout.`
-              : `Remove "${logSource.name}" from Vector. Incoming logs for this source type will no longer be parsed until you redeploy.`
-          }
+          description={`Remove "${logSource.name}" from Vector. Incoming logs for this source type will no longer be parsed until you redeploy.`}
           confirmLabel={undeploying ? 'Undeploying…' : 'Undeploy'}
           confirmIcon={undeploying ? <LoadingIcon className="w-3.5 h-3.5" /> : <Power className="w-3.5 h-3.5" />}
           confirmTone="warn"
@@ -912,17 +761,11 @@ export function LogSourceDetail() {
           open={publishDialogOpen}
           onOpenChange={setPublishDialogOpen}
           title="Publish log source?"
-          description={
-            shared
-              ? 'Create a new version from your current draft and roll it out to your parser cell. The previous active version is preserved in history and keeps serving until the rollout is live.'
-              : tenzirOnly
-                ? TENZIR_ONLY_NOTE
-                : 'Create a new version from your current draft and deploy it to Vector. The previous active version is preserved in history.'
-          }
+          description="Create a new version from your current draft and deploy it to Vector. The previous active version is preserved in history."
           confirmLabel={publishing ? 'Publishing…' : 'Publish'}
           confirmIcon={publishing ? <LoadingIcon className="w-3.5 h-3.5" /> : <Rocket className="w-3.5 h-3.5" />}
           onConfirm={handlePublish}
-          disabled={publishing || vectorBlocked}
+          disabled={publishing}
         />
         <ConfirmDialog
           open={discardDraftDialogOpen}
@@ -964,7 +807,7 @@ export function LogSourceDetail() {
           }}
           disabled={updating}
         />
-      </LogSourceDetailShell>
+      </div>
     </TooltipProvider>
   );
 }
@@ -973,190 +816,88 @@ export function LogSourceDetail() {
 // Hero
 // ============================================================================
 
-const EYEBROW = 'font-mono text-[10.5px] font-semibold uppercase tracking-[0.12em] text-muted-foreground';
-
-type PillTone = 'emerald' | 'amber' | 'red' | 'primary' | 'neutral';
-const PILL_TONE: Record<PillTone, string> = {
-  emerald: 'bg-emerald-500/10 text-emerald-500',
-  amber: 'bg-amber-500/10 text-amber-500',
-  red: 'bg-red-500/10 text-red-500',
-  primary: 'bg-primary/10 text-primary',
-  neutral: 'bg-foreground/[0.05] text-foreground/80',
-};
-
-function StatusPill({
-  tone,
-  children,
-  className,
-  title,
-}: {
-  tone: PillTone;
-  children: ReactNode;
-  className?: string;
-  title?: string;
-}) {
-  return (
-    <span
-      title={title}
-      className={cn(
-        'inline-flex items-center gap-1.5 rounded-[3px] px-[7px] py-[3px] font-mono text-[10.5px] font-semibold uppercase tracking-[0.08em] whitespace-nowrap',
-        PILL_TONE[tone],
-        className,
-      )}
-    >
-      <span className="h-1.5 w-1.5 rounded-full bg-current" />
-      {children}
-    </span>
-  );
-}
-
-function rolloutPill(
-  rollout: TenantParserRollout | undefined,
-): { tone: PillTone; label: string; title?: string } | null {
-  if (!rollout) return null;
-  const version = rolloutVersion(rollout);
-  const subject = version != null ? `v${version} rollout` : 'Rollout';
-  const title = rolloutFailureText(rollout) ?? undefined;
-  if (rollout.state === 'failed') return { tone: 'red', label: `${subject} failed`, title };
-  if (rollout.state === 'rolled_back') return { tone: 'red', label: `${subject} rolled back`, title };
-  if (rollout.state === 'live') return null;
-  return { tone: 'amber', label: `${subject} ${rolloutStateLabel(rollout.state).toLowerCase()}` };
-}
-
-function fmtFull(n: number | null | undefined): string {
-  return n == null ? '—' : n.toLocaleString();
-}
-
 function LogSourceHero({
   source,
   dirty,
   health,
-  activeVersion,
-  rollout,
-  serving,
   deploying,
   undeploying,
-  deployBlocked = false,
   onToggleEnabled,
   onDeploy,
   onUndeploy,
   onClone,
   onViewLogs,
-  onShowDetails,
 }: {
   source: LogSource;
   dirty: boolean;
-  health:
-    | {
-        events_last_24h?: number;
-        events_last_hour?: number;
-        last_event_at?: string | null;
-        parse_success_rate_24h?: number | null;
-      }
-    | null
-    | undefined;
-  activeVersion: number | undefined;
-  rollout: TenantParserRollout | undefined;
-  /** NAN-3298: which version actually serves; `tracked` false = registry fields are the truth. */
-  serving: ParserServingState;
+  health: { events_last_24h?: number; events_last_hour?: number; last_event_at?: string } | null | undefined;
   deploying: boolean;
   undeploying: boolean;
-  /** NAN-3844: Tenzir-only install, no Vector to deploy into. */
-  deployBlocked?: boolean;
   onToggleEnabled: () => void;
   onDeploy: () => void;
   onUndeploy: () => void;
   onClone: () => void;
   onViewLogs: () => void;
-  onShowDetails: () => void;
 }) {
-  const navigate = useNavigate();
-  const {hasPermission} = useAuth();
-  // The detail API loads counters separately from the registry row.
-  const receivingRaw = receivingWithoutParser(source, health ?? source.ingest);
   const transportLabel = logSourceTransportLabel(source);
-  // NAN-3298: when rollouts track this source, the pill follows the version that is NOT serving yet
-  // (in flight / failed / rolled back); a newest rollout carried live by a later roll needs no pill.
-  const pill = rolloutPill(serving.tracked ? (serving.failed ?? serving.inFlight ?? undefined) : rollout);
-  const successRate = health?.parse_success_rate_24h;
-  const stats: Array<{ label: string; value: string; title?: string }> = [
-    { label: 'Events · 24h', value: fmtFull(health?.events_last_24h) },
-    { label: 'Events · 1h', value: fmtFull(health?.events_last_hour) },
-    { label: 'Parse success', value: successRate == null ? '—' : `${(successRate * 100).toFixed(1)}%` },
-    {
-      label: 'Last event',
-      value: health?.last_event_at ? formatRelativeCompact(health.last_event_at) : '—',
-      title: health?.last_event_at ? formatUTCCompact(health.last_event_at) : undefined,
-    },
-  ];
-  const longDescription = (source.description?.length ?? 0) > 160;
-
   return (
-    <section className="rounded-md border border-border bg-card">
-      <div className="flex flex-wrap items-start gap-4 px-4 py-3">
-        <div className="flex h-10 w-10 flex-none items-center justify-center rounded-md border border-border bg-foreground/[0.03] text-muted-foreground">
-          <Rss className="h-[18px] w-[18px]" strokeWidth={1.5} />
+    <div className="shrink-0 border-b border-border bg-card/40">
+      {/* Top band */}
+      <div className="px-5 pt-4 pb-3 flex items-start gap-4">
+        <div className="w-[38px] h-[38px] rounded-lg border border-border bg-card flex items-center justify-center shrink-0 mt-0.5">
+          <Rss className="w-[18px] h-[18px] text-muted-foreground" />
         </div>
-
-        <div className="flex min-w-0 flex-[1_1_420px] flex-col gap-2">
-          <div className="flex flex-wrap items-center gap-2.5">
-            <h1 className="m-0 min-w-0 break-words text-[18px] font-semibold tracking-[-0.01em] text-foreground">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <div className="text-[17px] font-semibold tracking-[-0.01em] text-foreground whitespace-nowrap truncate">
               {source.name}
-            </h1>
-            <div className="flex flex-wrap gap-1.5">
-              {['Feed workspace', transportLabel, 'Parser'].map((tag) => (
-                <span
-                  key={tag}
-                  className="rounded-[3px] border border-border px-1.5 py-0.5 font-mono text-[10.5px] uppercase tracking-[0.06em] text-muted-foreground whitespace-nowrap"
-                >
-                  {tag}
-                </span>
-              ))}
             </div>
+            <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground border border-border rounded px-1.5 py-px whitespace-nowrap">
+              Feed workspace
+            </span>
+            <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground whitespace-nowrap">
+              {transportLabel} · Parser
+            </span>
           </div>
-
           {source.description && (
-            <p className="m-0 max-w-[760px] text-[12px] leading-[18px] text-muted-foreground">
-              <span className={cn(longDescription && 'line-clamp-2')}>{source.description}</span>
-              {longDescription && (
-                <button type="button" onClick={onShowDetails} className="mt-0.5 text-primary hover:underline">
-                  Full description
-                </button>
-              )}
-            </p>
+            <div className="text-[11.5px] text-muted-foreground mt-1 leading-relaxed max-w-[820px]">
+              {source.description}
+            </div>
           )}
-
-          <div className="mt-0.5 flex flex-wrap gap-1.5">
-            {receivingRaw ? <Badge variant="warning">Receiving · not parsed</Badge> : source.deployed && serving.tracked ? (
-              serving.servingVersion != null ? (
-                <StatusPill tone="emerald">Deployed · v{serving.servingVersion}</StatusPill>
-              ) : (
-                <StatusPill tone="neutral">Not live yet</StatusPill>
-              )
-            ) : source.deployed ? (
-              <StatusPill tone="emerald">Deployed{activeVersion ? ` · v${activeVersion}` : ''}</StatusPill>
+          <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+            {source.deployed ? (
+              <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-emerald-500 bg-emerald-500/15 rounded px-1.5 py-0.5">
+                <Check className="w-3 h-3" /> DEPLOYED
+              </span>
             ) : (
-              <StatusPill tone="neutral">Ready</StatusPill>
-            )}
-            {pill && (
-              <StatusPill tone={pill.tone} title={pill.title}>
-                {pill.label}
-              </StatusPill>
-            )}
-            {source.validated ? (
-              <StatusPill tone="primary">Validated</StatusPill>
-            ) : (
-              <StatusPill tone="amber">Not validated</StatusPill>
+              <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-foreground/80 bg-foreground/[0.05] border border-border rounded px-1.5 py-0.5">
+                READY
+              </span>
             )}
             {source.namespace && source.namespace !== 'default' && (
-              <StatusPill tone="neutral">{source.namespace}</StatusPill>
+              <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-foreground/80 bg-foreground/[0.03] border border-border rounded px-1.5 py-0.5">
+                {source.namespace}
+              </span>
             )}
-            {dirty && <StatusPill tone="amber">Unsaved VRL changes</StatusPill>}
+            {source.validated ? (
+              <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-primary bg-primary/15 rounded px-1.5 py-0.5">
+                <Check className="w-3 h-3" /> Validated
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-amber-500 bg-amber-500/15 rounded px-1.5 py-0.5">
+                <AlertTriangle className="w-3 h-3" /> Not validated
+              </span>
+            )}
+            {dirty && (
+              <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-amber-500 bg-amber-500/15 rounded px-1.5 py-0.5">
+                <Edit className="w-3 h-3" /> Unsaved VRL changes
+              </span>
+            )}
             {source.validation_error && (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <span className="cursor-help">
-                    <StatusPill tone="red">Validation failed</StatusPill>
+                  <span className="inline-flex items-center gap-1 text-[10.5px] font-mono text-red-500 bg-red-500/15 rounded px-1.5 py-0.5 cursor-help">
+                    <AlertTriangle className="w-3 h-3" /> Validation failed
                   </span>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" className="max-w-[420px] text-[11px]">
@@ -1167,93 +908,102 @@ function LogSourceHero({
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          {receivingRaw && !deployBlocked && hasPermission('log_sources:edit') && <Button variant="outline" size="sm" onClick={() => navigate(`/ingestion/log-sources/new?source_id=${encodeURIComponent(source.id)}&stage=parse`)}>Build parser</Button>}
-          <button
-            type="button"
-            onClick={onToggleEnabled}
-            aria-pressed={source.enabled}
-            className="inline-flex h-7 items-center gap-2 rounded-md border border-border pl-1.5 pr-2.5 font-mono text-[11px] uppercase tracking-[0.06em] text-foreground hover:bg-muted/50"
-          >
-            <SwitchGlyph checked={source.enabled} />
-            {source.enabled ? 'Enabled' : 'Disabled'}
-          </button>
-          <Button variant="outline" size="sm" className="h-7 gap-1.5 px-2.5 text-[11.5px] font-medium" onClick={onViewLogs}>
-            <Terminal className="h-3.5 w-3.5" strokeWidth={1.5} />
-            View logs
-          </Button>
-          <Button variant="outline" size="sm" className="h-7 gap-1.5 px-2.5 text-[11.5px] font-medium" onClick={onClone}>
-            <Copy className="h-3.5 w-3.5" strokeWidth={1.5} />
-            Clone
-          </Button>
-          <span className="mx-0.5 h-5 w-px bg-border" aria-hidden="true" />
-          {source.deployed && (
-            <Button
-              variant="ghost"
-              size="sm"
-              disabled={undeploying}
-              onClick={onUndeploy}
-              className="h-7 gap-1.5 px-2.5 text-[11.5px] font-medium text-red-500 hover:bg-red-500/10 hover:text-red-500"
-            >
-              {undeploying ? <LoadingIcon className="h-3.5 w-3.5" /> : <X className="h-3.5 w-3.5" strokeWidth={1.5} />}
-              Undeploy
-            </Button>
-          )}
-          <Button
-            variant="default"
-            size="sm"
-            disabled={!source.validated || deploying || deployBlocked}
-            title={deployBlocked ? TENZIR_ONLY_NOTE : undefined}
-            onClick={onDeploy}
-            className="h-7 gap-1.5 px-3 text-[11.5px] font-semibold"
-          >
-            {deploying ? <LoadingIcon className="h-3.5 w-3.5" /> : <Upload className="h-3.5 w-3.5" strokeWidth={1.5} />}
-            {source.deployed ? 'Redeploy' : 'Deploy'}
-          </Button>
+        {/* Live telemetry */}
+        <div className="hidden md:flex items-stretch gap-5 shrink-0">
+          <HeroStat value={fmtCount(health?.events_last_24h)} label="Events / 24h" />
+          <div className="w-px bg-border" />
+          <HeroStat value={fmtCount(health?.events_last_hour)} label="Events / 1h" />
+          <div className="w-px bg-border" />
+          <HeroStat
+            value={health?.last_event_at ? formatUTCCompact(health.last_event_at) : '—'}
+            label="Last event"
+          />
         </div>
       </div>
 
-      {/* Live telemetry strip. The negative margins hide the trailing cell borders. */}
-      <div className="overflow-hidden rounded-b-md border-t border-border">
-        <div className="-mb-px -mr-px grid grid-cols-2 sm:grid-cols-4">
-          {stats.map((s) => (
-            <div key={s.label} className="flex min-w-0 flex-col gap-0.5 border-b border-r border-border px-4 py-2">
-              <span className={EYEBROW}>{s.label}</span>
-              <span
-                className="truncate font-mono text-[14px] font-medium text-foreground tabular-nums"
-                title={s.title}
-              >
-                {s.value}
-              </span>
-            </div>
-          ))}
+      {/* Bottom action bar */}
+      <div className="flex items-center gap-2 px-5 py-2 border-t border-border">
+        <div className="flex items-center gap-2">
+          <EnabledToggle checked={source.enabled} onClick={onToggleEnabled} />
+          <span
+            className={cn(
+              'text-[10.5px] font-mono uppercase tracking-wider',
+              source.enabled ? 'text-foreground/80' : 'text-muted-foreground',
+            )}
+          >
+            {source.enabled ? 'Enabled' : 'Disabled'}
+          </span>
         </div>
+        <div className="w-px h-4 bg-border mx-2" />
+        <Button variant="ghost" size="sm" className="h-7 gap-1.5 text-foreground/80" onClick={onViewLogs}>
+          <Terminal className="w-3.5 h-3.5" />
+          View logs
+        </Button>
+        <Button variant="ghost" size="sm" className="h-7 gap-1.5 text-foreground/80" onClick={onClone}>
+          <Copy className="w-3.5 h-3.5" />
+          Clone
+        </Button>
+        <div className="flex-1" />
+        {source.deployed && (
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={undeploying}
+            onClick={onUndeploy}
+            className="h-7 gap-1.5 text-amber-500 hover:text-amber-500 hover:bg-amber-500/10"
+          >
+            {undeploying ? <LoadingIcon className="w-3.5 h-3.5" /> : <X className="w-3.5 h-3.5" />}
+            Undeploy
+          </Button>
+        )}
+        <Button
+          variant="default"
+          size="sm"
+          disabled={!source.validated || deploying}
+          onClick={onDeploy}
+          className="h-7 gap-1.5"
+        >
+          {deploying ? <LoadingIcon className="w-3.5 h-3.5" /> : <Upload className="w-3.5 h-3.5" />}
+          {source.deployed ? 'Redeploy' : 'Deploy'}
+        </Button>
       </div>
-    </section>
+    </div>
   );
 }
 
-/** Visual switch inside the header's Enabled button (the button carries the semantics). */
-function SwitchGlyph({ checked }: { checked: boolean }) {
+function HeroStat({ value, label }: { value: string; label: string }) {
   return (
-    <span
-      aria-hidden="true"
+    <div className="flex flex-col items-end justify-center">
+      <div className="font-mono text-[14px] text-foreground tabular-nums whitespace-nowrap">{value}</div>
+      <div className="text-[9.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground whitespace-nowrap">
+        {label}
+      </div>
+    </div>
+  );
+}
+
+function EnabledToggle({ checked, onClick }: { checked: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={checked}
       className={cn(
-        'relative block h-4 w-[26px] flex-none rounded-full transition-colors',
-        checked ? 'bg-primary' : 'bg-foreground/[0.08]',
+        'w-[30px] h-[17px] rounded-full flex items-center transition-colors relative shrink-0',
+        checked ? 'bg-primary' : 'bg-foreground/[0.05] border border-border',
       )}
     >
       <span
         className={cn(
-          'absolute top-0.5 h-3 w-3 rounded-full transition-all',
-          checked ? 'left-3 bg-primary-foreground' : 'left-0.5 bg-muted-foreground',
+          'absolute w-[13px] h-[13px] rounded-full bg-white shadow transition-all',
+          checked ? 'left-[15px]' : 'left-[2px]',
         )}
       />
-    </span>
+    </button>
   );
 }
 
-// Visual-only switch for read-only contexts. Avoids the focusable
+// Visual-only sibling of EnabledToggle for read-only contexts. Avoids the focusable
 // no-op button that visually looks interactive but does nothing.
 function ReadOnlyToggle({ checked }: { checked: boolean }) {
   return (
@@ -1266,7 +1016,7 @@ function ReadOnlyToggle({ checked }: { checked: boolean }) {
     >
       <span
         className={cn(
-          'absolute w-[13px] h-[13px] rounded-full bg-white/80',
+          'absolute w-[13px] h-[13px] rounded-full bg-white/80 shadow',
           checked ? 'left-[15px]' : 'left-[2px]',
         )}
       />
@@ -1281,15 +1031,6 @@ function fmtCount(n: number | null | undefined): string {
   return n.toLocaleString();
 }
 
-/** VRL / extension editors need a bounded height inside the scrolling page. */
-function EditorFrame({ children }: { children: ReactNode }) {
-  return (
-    <div className="h-[max(560px,calc(100vh-8rem))] overflow-hidden rounded-md border border-border bg-card">
-      {children}
-    </div>
-  );
-}
-
 // ============================================================================
 // Draft banner
 // ============================================================================
@@ -1300,7 +1041,6 @@ function DraftBanner({
   publishing,
   discarding,
   validated,
-  publishBlocked = false,
   onPublish,
   onDiscard,
 }: {
@@ -1309,57 +1049,42 @@ function DraftBanner({
   publishing: boolean;
   discarding: boolean;
   validated: boolean;
-  /** NAN-3844: Tenzir-only install, publishing deploys into Vector. */
-  publishBlocked?: boolean;
   onPublish: () => void;
   onDiscard: () => void;
 }) {
-  const shared = useSharedTenant();
   if (!show) return null;
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-500/[0.06] px-3.5 py-2">
-      <div className="flex min-w-0 items-start gap-2.5">
-        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" strokeWidth={1.5} />
-        <div className="text-[11.5px] leading-[17px] text-amber-600 dark:text-amber-400">
-          <span className="font-semibold">Unpublished changes</span>
-          <span className="ml-2 text-amber-600/80 dark:text-amber-400/80">
+    <div className="shrink-0 flex items-center justify-between gap-3 px-5 py-2 border-b border-border bg-amber-500/10">
+      <div className="flex items-start gap-2 min-w-0">
+        <AlertTriangle className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />
+        <div className="text-[11.5px] text-amber-600 dark:text-amber-400 leading-snug">
+          <span className="font-medium">Unpublished changes</span>
+          <span className="text-amber-600/80 dark:text-amber-400/80 ml-2">
             Working copy differs from deployed version
             {activeVersion ? ` (v${activeVersion})` : ''}. Changes won't affect live parsing until published.
           </span>
         </div>
       </div>
-      <div className="flex shrink-0 items-center gap-2">
+      <div className="flex items-center gap-2 shrink-0">
         <Button
           variant="outline"
           size="sm"
-          className="h-7 gap-1.5 px-2.5 text-[11.5px] font-medium"
+          className="h-7 text-[11.5px]"
           disabled={discarding}
           onClick={onDiscard}
         >
-          {discarding ? <LoadingIcon className="h-3.5 w-3.5" /> : <RotateCcw className="h-3.5 w-3.5" strokeWidth={1.5} />}
+          {discarding ? <LoadingIcon className="w-3 h-3" /> : <RotateCcw className="w-3 h-3" />}
           Discard draft
         </Button>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="inline-flex" tabIndex={publishing || !validated || publishBlocked ? 0 : undefined}>
-              <Button
-                size="sm"
-                className="h-7 gap-1.5 bg-amber-600 px-3 text-[11.5px] font-semibold text-white hover:bg-amber-700"
-                disabled={publishing || !validated || publishBlocked}
-                title={publishBlocked ? TENZIR_ONLY_NOTE : undefined}
-                onClick={onPublish}
-              >
-                {publishing ? <LoadingIcon className="h-3.5 w-3.5" /> : <Rocket className="h-3.5 w-3.5" strokeWidth={1.5} />}
-                Publish
-              </Button>
-            </span>
-          </TooltipTrigger>
-          <TooltipContent>
-            {shared
-              ? 'Make this draft live for incoming events. The current version keeps serving until the rollout completes.'
-              : 'Make this draft live for incoming events. The previous version is kept in history.'}
-          </TooltipContent>
-        </Tooltip>
+        <Button
+          size="sm"
+          className="h-7 text-[11.5px] bg-amber-600 hover:bg-amber-700 text-white"
+          disabled={publishing || !validated}
+          onClick={onPublish}
+        >
+          {publishing ? <LoadingIcon className="w-3 h-3" /> : <Rocket className="w-3 h-3" />}
+          Publish
+        </Button>
       </div>
     </div>
   );
@@ -1379,22 +1104,19 @@ function TabNav({ active, onChange }: { active: TabId; onChange: (id: TabId) => 
     { id: 'versions', label: 'Versions' },
   ];
   return (
-    <div className="flex gap-1 overflow-x-auto overflow-y-hidden border-b border-border" role="tablist">
+    <div className="shrink-0 flex items-center gap-0 px-4 border-b border-border bg-card/40">
       {tabs.map((t) => (
         <button
           key={t.id}
           type="button"
-          role="tab"
-          aria-selected={active === t.id}
           onClick={() => onChange(t.id)}
           className={cn(
-            '-mb-px whitespace-nowrap border-b-2 px-3 py-2.5 font-mono text-[11px] font-semibold uppercase tracking-[0.1em] transition-colors',
-            active === t.id
-              ? 'border-primary text-foreground'
-              : 'border-transparent text-muted-foreground hover:text-foreground/80',
+            'relative h-9 px-3 text-[10px] font-medium uppercase tracking-[0.12em] transition-colors',
+            active === t.id ? 'text-foreground' : 'text-muted-foreground hover:text-foreground/80',
           )}
         >
           {t.label}
+          {active === t.id && <span className="absolute left-0 right-0 -bottom-px h-[2px] bg-primary rounded-full" />}
         </button>
       ))}
     </div>
@@ -1406,14 +1128,12 @@ function TabNav({ active, onChange }: { active: TabId; onChange: (id: TabId) => 
 // ============================================================================
 
 function LSCard({
-  id,
   title,
   eyebrow,
   action,
   children,
   className,
 }: {
-  id?: string;
   title: string;
   eyebrow?: string;
   action?: ReactNode;
@@ -1421,10 +1141,12 @@ function LSCard({
   className?: string;
 }) {
   return (
-    <div id={id} className={cn('min-w-0 overflow-hidden rounded-md border border-border bg-card', className)}>
-      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 border-b border-border px-4 py-2">
-        {eyebrow && <span className={EYEBROW}>{eyebrow}</span>}
-        <div className="text-[12px] font-semibold text-foreground">{title}</div>
+    <div className={cn('rounded-lg border border-border bg-card overflow-hidden', className)}>
+      <div className="flex items-center gap-2 px-4 py-2.5 border-b border-border">
+        {eyebrow && (
+          <span className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-muted-foreground/70">{eyebrow}</span>
+        )}
+        <div className="text-[11.5px] font-medium text-foreground">{title}</div>
         <div className="flex-1" />
         {action}
       </div>
@@ -1435,11 +1157,11 @@ function LSCard({
 
 function LSRow({ label, children, mono }: { label: string; children: ReactNode; mono?: boolean }) {
   return (
-    <div className="grid grid-cols-[110px_minmax(0,1fr)] items-baseline gap-3 border-b border-border px-4 py-1.5 last:border-b-0 sm:grid-cols-[140px_minmax(0,1fr)]">
-      <div className={EYEBROW}>{label}</div>
-      <div className={cn('min-w-0 text-[11.5px] [overflow-wrap:anywhere]', mono ? 'font-mono text-foreground' : 'text-foreground')}>
-        {children}
+    <div className="flex items-start gap-4 px-4 py-2.5 border-b border-border last:border-b-0">
+      <div className="w-[140px] text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground shrink-0 pt-[1px]">
+        {label}
       </div>
+      <div className={cn('flex-1 text-[12px]', mono ? 'font-mono text-foreground' : 'text-foreground')}>{children}</div>
     </div>
   );
 }
@@ -1448,23 +1170,17 @@ function LSRow({ label, children, mono }: { label: string; children: ReactNode; 
 // Overview tab
 // ============================================================================
 
-type HealthTone = 'red' | 'amber' | 'emerald' | 'muted';
-const HEALTH_TONE: Record<HealthTone, string> = {
-  red: 'text-red-500',
-  amber: 'text-amber-500',
-  emerald: 'text-emerald-500',
-  muted: 'text-muted-foreground',
-};
-
 function OverviewTab({
   source,
   health,
-  activeVersion,
-  serving,
   sparklinePoints,
-  volume,
+  canIssueToken,
+  searchField,
 }: {
   source: LogSource;
+  canIssueToken: boolean;
+  /** The field Search scopes a source by (`metadata.log_source` on OCSF). */
+  searchField: string;
   health:
     | {
         health_status?: string;
@@ -1478,33 +1194,15 @@ function OverviewTab({
         collector_errors?: CollectorError[];
         collector_errors_24h?: number;
         collector_error_hint?: string | null;
-        pending_reason?: string | null;
       }
     | null
     | undefined;
-  activeVersion: LogSourceVersion | undefined;
-  /** NAN-3298: the version actually serving ingest (hosted-shared parser rollouts). */
-  serving: ParserServingState;
   sparklinePoints: number[];
-  /**
-   * NAN-2599: hosted-shared replaces the history sparkline with hourly events + parse failures.
-   * NAN-3297: rendered inside the About panel's right column, so pass the embedded variant.
-   */
-  volume?: ReactNode;
 }) {
   const isLive = source.deployed && (sparklinePoints.length > 0 || (health?.events_last_24h ?? 0) > 0);
   const parseErrors = health?.parse_errors_24h ?? 0;
   const parseAttempts = health?.parse_attempts_24h ?? 0;
   const parseSuccessRate = health?.parse_success_rate_24h;
-  // NAN-3298: with rollouts tracking the parser, "Deployed" / "Version" are the promoted
-  // roll's, not the registry activation's (publish activates before the roll lands).
-  const deployedAt = serving.tracked ? serving.servingSince : source.deployed_at;
-  const servingVersion = serving.tracked ? serving.servingVersion : (activeVersion?.version_number ?? null);
-  const notServing = serving.failed ?? serving.inFlight;
-  const notServingVersion = notServing ? rolloutVersion(notServing) : null;
-  const notServingFailure = serving.failed ? rolloutFailureText(serving.failed) : null;
-  const activeNotServing =
-    serving.tracked && activeVersion != null && serving.servingVersion !== activeVersion.version_number;
   // NAN-2196. A failing collector produces no events, so every volume-derived
   // status reads it as "quiet" — the state this outranks below.
   const collectorErrors = health?.collector_errors ?? [];
@@ -1518,196 +1216,164 @@ function OverviewTab({
     Boolean(health?.last_event_at) &&
     new Date(health!.last_event_at!).getTime() > new Date(newestErrorAt!).getTime();
   const collectorFailing = collectorErrors.length > 0 && !collectorRecovered;
-
-  /*
-    NAN-2196: collector failure outranks everything below it. The statuses
-    that follow are all derived from event volume, and a collector that
-    cannot reach its queue produces no volume — so without this branch a hard
-    failure renders as "No data yet" or "Stale", which is exactly how the
-    original bug stayed invisible.
-  */
-  const status: { label: string; tone: HealthTone } = collectorFailing
-    ? { label: 'Collector failing — not receiving data', tone: 'red' }
-    : health?.health_status === 'error'
-      ? { label: 'Errors detected', tone: 'red' }
-      : source.deployed && parseErrors > 0
-        ? { label: 'Parsing degraded', tone: 'amber' }
-        : health?.health_status === 'healthy'
-          ? { label: 'Healthy', tone: 'emerald' }
-          : health?.health_status === 'stale'
-            ? { label: 'Stale — no recent events', tone: 'amber' }
-            : !source.deployed
-              ? { label: 'Ready to deploy', tone: 'muted' }
-              : { label: 'No data yet', tone: 'muted' };
-
   return (
-    <div className="flex flex-col gap-3">
-      <LSCard id="feed-details" eyebrow="About" title="Feed details" className="scroll-mt-4">
-        <div className="grid grid-cols-1 lg:grid-cols-2">
-          <div className="flex min-w-0 flex-col gap-3 border-b border-border p-4 lg:border-b-0 lg:border-r">
-            <span className={EYEBROW}>Description</span>
-            <p className="m-0 whitespace-pre-line text-[12px] leading-[18px] text-foreground/80">
-              {source.description || '—'}
-            </p>
-            {activeVersion && (
-              <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 rounded-md border border-border bg-background/60 px-3 py-2">
-                <span className="font-mono text-[11px] font-semibold text-primary">v{activeVersion.version_number}</span>
-                {activeVersion.change_reason && (
-                  <span className="min-w-0 text-[11.5px] text-muted-foreground">{activeVersion.change_reason}</span>
-                )}
-                {activeNotServing && (
-                  <span
-                    className={cn('font-mono text-[10.5px]', serving.failed ? 'text-red-500' : 'text-amber-500')}
-                    data-testid="active-version-not-serving"
-                  >
-                    {serving.failed
-                      ? `not serving · ${rolloutStateLabel(serving.failed.state).toLowerCase()}`
-                      : serving.inFlight
-                        ? 'not serving yet · rolling out'
-                        : 'not serving'}
-                  </span>
-                )}
-                <span className="flex-1" />
-                <span className="font-mono text-[11px] text-muted-foreground">{formatUTCCompact(activeVersion.created_at)}</span>
-              </div>
+    <div className="p-4 space-y-4">
+      {/* NAN-4922 (main's NAN-2597): the tokens that can write this source, with inline issuance. */}
+      <SourceWritersCard logSourceId={source.id} canRevoke={canIssueToken} canIssue={canIssueToken} searchField={searchField} />
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <LSCard eyebrow="About" title="Feed details">
+          <LSRow label="Description">
+            <div className="text-foreground/80 leading-relaxed">{source.description || '—'}</div>
+          </LSRow>
+          <LSRow label="Category" mono>
+            <span className="text-foreground">{source.category || '—'}</span>
+          </LSRow>
+          <LSRow label="Source type" mono>
+            <span className="text-primary">{effectiveSourceType(source)}</span>
+          </LSRow>
+          <LSRow label="Vendor">
+            <span className="text-foreground">{source.vendor || '—'}</span>
+            {source.product && (
+              <>
+                <span className="text-muted-foreground/70 mx-2">·</span>
+                <span className="text-foreground/80">{source.product}</span>
+              </>
             )}
-          </div>
-          <div className="min-w-0">
-            <div>
-              <LSRow label="Category" mono>
-                <span className="text-foreground">{source.category || '—'}</span>
-              </LSRow>
-              <LSRow label="Source type" mono>
-                <span className="text-primary">{effectiveSourceType(source)}</span>
-              </LSRow>
-              <LSRow label="Vendor">
-                <span className="text-foreground">{source.vendor || '—'}</span>
-              </LSRow>
-              <LSRow label="Product">
-                <span className="text-foreground">{source.product || '—'}</span>
-              </LSRow>
-              <LSRow label="Namespace" mono>
-                <span className="text-foreground">{source.namespace || 'default'}</span>
-              </LSRow>
-              <LSRow label="Created" mono>
-                <span className="text-muted-foreground">{formatUTCCompact(source.created_at)}</span>
-              </LSRow>
-              <LSRow label="Updated" mono>
-                <span className="text-muted-foreground">{formatUTCCompact(source.updated_at)}</span>
-              </LSRow>
-            </div>
+          </LSRow>
+          <LSRow label="Namespace" mono>
+            <span className="text-foreground/80">{source.namespace || 'default'}</span>
+          </LSRow>
+          <LSRow label="Created" mono>
+            <span className="text-foreground/80">{formatUTCCompact(source.created_at)}</span>
+          </LSRow>
+          <LSRow label="Updated" mono>
+            <span className="text-foreground/80">{formatUTCCompact(source.updated_at)}</span>
+          </LSRow>
+        </LSCard>
 
-            {/*
-              NAN-3297: feed health and hourly ingest live under the metadata
-              rows instead of as two stranded cards below the panel.
-            */}
-            <section aria-label="Feed health" data-testid="feed-health-section">
-              <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 border-y border-border px-4 py-1.5">
-                <span className={EYEBROW}>Health</span>
-                <span className="text-[12px] font-semibold text-foreground">Feed health</span>
-                <span className="flex-1" />
-                <span
-                  className={cn('inline-flex items-center gap-1.5 font-mono text-[11px]', HEALTH_TONE[status.tone])}
-                  data-testid="feed-health-status"
-                >
-                  <span
-                    className={cn('h-1.5 w-1.5 rounded-full bg-current', isLive && status.tone === 'emerald' && 'animate-pulse')}
-                  />
-                  {status.label}
-                </span>
-              </div>
-              <div>
-                <LSRow label="Parse success" mono>
-                  {parseSuccessRate == null ? (
-                    <span className="text-muted-foreground">—</span>
-                  ) : (
-                    <span
-                      className={cn(
-                        parseSuccessRate < 0.99 ? 'text-red-500' : parseSuccessRate < 1 ? 'text-amber-500' : 'text-emerald-500',
-                      )}
-                    >
-                      {(parseSuccessRate * 100).toFixed(2)}%
-                    </span>
-                  )}
-                </LSRow>
-                <LSRow label="Failures · 24h" mono>
-                  <span className={parseErrors > 0 ? 'text-amber-500' : 'text-foreground'}>{fmtFull(parseErrors)}</span>
-                  {parseAttempts > 0 && (
-                    <span className="ml-2 font-sans text-[12px] text-muted-foreground">of {fmtFull(parseAttempts)} production events</span>
-                  )}
-                </LSRow>
-                <LSRow label="Deployed" mono>
-                  <span className="text-foreground" data-testid="feed-deployed-at">
-                    {deployedAt ? formatUTCCompact(deployedAt) : '—'}
-                  </span>
-                </LSRow>
-                <LSRow label="Version" mono>
-                  <span className="text-foreground" data-testid="feed-serving-version">
-                    {servingVersion != null ? `v${servingVersion}` : '—'}
-                  </span>
-                  {notServing && notServingVersion != null && (
-                    <span
-                      className={cn('ml-2 font-mono text-[11px]', serving.failed ? 'text-red-500' : 'text-amber-500')}
-                      data-testid="feed-version-not-serving"
-                    >
-                      {serving.failed
-                        ? `v${notServingVersion} ${rolloutStateLabel(serving.failed.state).toLowerCase()}`
-                        : `v${notServingVersion} ${rolloutStateLabel(notServing.state).toLowerCase()}…`}
-                    </span>
-                  )}
-                  {notServingFailure && (
-                    <div
-                      className="mt-0.5 line-clamp-2 break-words font-sans text-[11px] leading-[16px] text-red-500/90"
-                      title={notServingFailure}
-                    >
-                      {notServingFailure}
-                    </div>
-                  )}
-                </LSRow>
-              </div>
-              <p className="m-0 border-t border-border px-4 py-2 text-[11.5px] leading-[17px] text-muted-foreground">
-                Runtime failures are preserved as searchable events in{' '}
-                <code className="font-mono text-foreground/70">metadata.parse_error</code>. Static VRL validation is not
-                included.
-              </p>
-            </section>
-            {volume}
-          </div>
-        </div>
-      </LSCard>
-
-      {/*
-        NAN-3765: an enabled source the Vector configuration does not include
-        yet (e.g. its source configuration is not deployed). It deploys on its
-        own once the reason clears; until then nothing can arrive.
-      */}
-      {health?.pending_reason && (
-        <div
-          className="border border-amber-500/40 px-4 py-2.5 text-[11.5px] leading-[17px] text-amber-600 dark:text-amber-500"
-          data-testid="log-source-pending-reason"
+        <LSCard
+          eyebrow="Health"
+          title="Feed health"
+          action={
+            isLive && (
+              <span className="inline-flex items-center gap-1.5 text-[10px] font-mono text-emerald-500">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                LIVE
+              </span>
+            )
+          }
         >
-          <span className="mr-2 font-mono text-[10.5px] uppercase tracking-[0.1em]">Not deployed</span>
-          {health.pending_reason}
-        </div>
-      )}
+          <LSRow label="Status">
+            {/*
+              NAN-2196: collector failure outranks everything below it. The
+              statuses that follow are all derived from event volume, and a
+              collector that cannot reach its queue produces no volume — so
+              without this branch a hard failure renders as "No data yet" or
+              "Stale", which is exactly how the original bug stayed invisible.
+            */}
+            {collectorFailing ? (
+              <span className="inline-flex items-center gap-1.5 text-red-500">
+                <XCircle className="w-3.5 h-3.5" />
+                <span className="text-[12px]">Collector failing — not receiving data</span>
+              </span>
+            ) : health?.health_status === 'error' ? (
+              <span className="inline-flex items-center gap-1.5 text-red-500">
+                <XCircle className="w-3.5 h-3.5" />
+                <span className="text-[12px]">Errors detected</span>
+              </span>
+            ) : source.deployed && parseErrors > 0 ? (
+              <span className="inline-flex items-center gap-1.5 text-amber-500">
+                <AlertTriangle className="w-3.5 h-3.5" />
+                <span className="text-[12px]">Parsing degraded</span>
+              </span>
+            ) : health?.health_status === 'healthy' ? (
+              <span className="inline-flex items-center gap-1.5 text-emerald-500">
+                <Check className="w-3.5 h-3.5" />
+                <span className="text-[12px]">Healthy</span>
+              </span>
+            ) : health?.health_status === 'stale' ? (
+              <span className="inline-flex items-center gap-1.5 text-amber-500">
+                <AlertTriangle className="w-3.5 h-3.5" />
+                <span className="text-[12px]">Stale — no recent events</span>
+              </span>
+            ) : !source.deployed ? (
+              <span className="text-foreground/80 text-[12px]">Ready to deploy</span>
+            ) : (
+              <span className="text-muted-foreground text-[12px]">No data yet</span>
+            )}
+          </LSRow>
+          <LSRow label="Parse success" mono>
+            {parseSuccessRate == null ? (
+              <span className="text-muted-foreground">—</span>
+            ) : (
+              <span
+                className={cn(
+                  parseSuccessRate < 0.99
+                    ? 'text-red-500'
+                    : parseSuccessRate < 1
+                      ? 'text-amber-500'
+                      : 'text-emerald-500',
+                )}
+              >
+                {(parseSuccessRate * 100).toFixed(2)}%
+              </span>
+            )}
+          </LSRow>
+          <LSRow label="Failures (24h)" mono>
+            <div>
+              <span className={parseErrors > 0 ? 'text-amber-500' : 'text-foreground'}>
+                {fmtCount(parseErrors)}
+              </span>
+              {parseAttempts > 0 && (
+                <div className="mt-0.5 text-[10.5px] font-sans text-muted-foreground">
+                  of {fmtCount(parseAttempts)} production events
+                </div>
+              )}
+            </div>
+          </LSRow>
+          <LSRow label="Events (24h)" mono>
+            <span className="text-foreground">{fmtCount(health?.events_last_24h)}</span>
+          </LSRow>
+          <LSRow label="Events (1h)" mono>
+            <span className="text-foreground">{fmtCount(health?.events_last_hour)}</span>
+          </LSRow>
+          <LSRow label="Last event" mono>
+            <span className="text-foreground/80">
+              {health?.last_event_at ? formatUTCCompact(health.last_event_at) : '—'}
+            </span>
+          </LSRow>
+          <LSRow label="Deployed" mono>
+            <span className="text-foreground/80">{source.deployed_at ? formatUTCCompact(source.deployed_at) : '—'}</span>
+          </LSRow>
+          <div className="px-4 py-2.5 text-[10.5px] leading-relaxed text-muted-foreground">
+            Runtime failures are preserved as searchable events in{' '}
+            <code className="font-mono text-foreground/70">metadata.parse_error</code>. Static VRL validation is not
+            included.
+          </div>
+        </LSCard>
+      </div>
 
       {/*
         NAN-2196. Rendered only when the collector has actually reported a
-        failure, so a healthy source gains no empty panel. Placed directly under
-        the About panel (which carries feed health and hourly volume, NAN-3297):
-        when a source is broken, "why" sits next to "how much".
+        failure, so a healthy source gains no empty panel. Placed above the
+        sparkline: when a source is broken, "why" outranks "how much".
       */}
       {collectorErrors.length > 0 && (
         <LSCard
           eyebrow="Collector"
           title="Recent collector errors"
           action={
-            <span className={cn('font-mono text-[10.5px]', collectorFailing ? 'text-red-500' : 'text-muted-foreground')}>
+            <span
+              className={cn(
+                'text-[10px] font-mono',
+                collectorFailing ? 'text-red-500' : 'text-muted-foreground',
+              )}
+            >
               {fmtCount(health?.collector_errors_24h ?? collectorErrors.length)} in 24h
             </span>
           }
         >
-          <div className="border-b border-border px-4 py-3 text-[11.5px] leading-[17px] text-foreground/80">
+          <div className="px-4 py-3 text-[11.5px] leading-relaxed text-foreground/80 border-b border-border">
             {collectorRecovered ? (
               <>
                 The collector reported these errors, then resumed — data has arrived since the
@@ -1723,34 +1389,38 @@ function OverviewTab({
 
           {/* A diagnosis for a feed that has since recovered would misdirect. */}
           {collectorFailing && health?.collector_error_hint && (
-            <div className="border-b border-border px-4 py-3 text-[11.5px] leading-[17px] text-amber-600 dark:text-amber-500">
+            <div className="px-4 py-3 text-[11.5px] leading-relaxed text-amber-600 dark:text-amber-500 border-b border-border">
               {health.collector_error_hint}
             </div>
           )}
 
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[640px] text-left text-[11.5px]">
+            <table className="w-full text-[11.5px]">
               <thead>
-                <tr className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
-                  <th className="px-4 py-2 font-semibold">Time</th>
-                  <th className="px-4 py-2 font-semibold">Level</th>
-                  <th className="px-4 py-2 font-semibold">Message</th>
-                  <th className="px-4 py-2 font-semibold">Code</th>
+                <tr className="text-[10px] font-mono uppercase tracking-wide text-muted-foreground">
+                  <th className="text-left font-medium px-4 py-1.5">Time</th>
+                  <th className="text-left font-medium px-4 py-1.5">Level</th>
+                  <th className="text-left font-medium px-4 py-1.5">Message</th>
+                  <th className="text-left font-medium px-4 py-1.5">Code</th>
                 </tr>
               </thead>
               <tbody>
                 {collectorErrors.map((e, i) => (
                   <tr key={`${e.timestamp}-${i}`} className="border-t border-border align-top">
-                    <td className="whitespace-nowrap px-4 py-1.5 font-mono text-[11px] text-muted-foreground">
+                    <td className="px-4 py-1.5 font-mono text-[10.5px] text-foreground/70 whitespace-nowrap">
                       {formatUTCCompact(e.timestamp)}
                     </td>
-                    <td className="whitespace-nowrap px-4 py-1.5 font-mono text-[11px]">
-                      <span className={e.level === 'ERROR' ? 'text-red-500' : 'text-amber-500'}>{e.level || '—'}</span>
+                    <td className="px-4 py-1.5 font-mono text-[10.5px] whitespace-nowrap">
+                      <span className={e.level === 'ERROR' ? 'text-red-500' : 'text-amber-500'}>
+                        {e.level || '—'}
+                      </span>
                     </td>
                     <td className="px-4 py-1.5 text-foreground/90">{e.message || '—'}</td>
-                    <td className="whitespace-nowrap px-4 py-1.5 font-mono text-[11px] text-muted-foreground">
+                    <td className="px-4 py-1.5 font-mono text-[10.5px] text-muted-foreground whitespace-nowrap">
                       {e.error_code || '—'}
-                      {e.stage && <div className="mt-0.5 text-foreground/50">{e.stage}</div>}
+                      {e.stage && (
+                        <div className="mt-0.5 text-foreground/50">{e.stage}</div>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -1759,7 +1429,7 @@ function OverviewTab({
           </div>
 
           {(health?.collector_errors_24h ?? 0) > collectorErrors.length && (
-            <div className="border-t border-border px-4 py-2.5 text-[12px] text-muted-foreground">
+            <div className="px-4 py-2 text-[10.5px] text-muted-foreground border-t border-border">
               Showing the {collectorErrors.length} most recent of{' '}
               {fmtCount(health?.collector_errors_24h)} in the last 24 hours.
             </div>
@@ -1767,7 +1437,10 @@ function OverviewTab({
         </LSCard>
       )}
 
-      {!volume && <Sparkline points={sparklinePoints} isLive={isLive} sourceDeployed={source.deployed} />}
+      <Sparkline points={sparklinePoints} isLive={isLive} sourceDeployed={source.deployed} />
+      {/* NAN-4922 (main's NAN-3661 / NAN-3207): delivery paths, then volume vs the expected band. */}
+      <LogSourceDelivery logSourceId={source.id} dispatchSourceConfigId={source.dispatch_source_config_id} matchValues={source.match_values} health={health as LogSourceHealth | null | undefined} />
+      <LogSourceHealthPanel logSourceId={source.id} />
     </div>
   );
 }
@@ -1784,10 +1457,11 @@ function Sparkline({
   // Empty state when there's no data — the chart slot still renders so the page doesn't reflow.
   if (points.length < 2) {
     return (
-      <LSCard eyebrow="Ingest" title="Event volume">
-        <div className="flex flex-col items-center justify-center gap-1.5 px-4 py-10 text-center text-muted-foreground">
-          <div className="text-[12px] font-semibold text-foreground">No event volume recorded yet</div>
-          <div className="max-w-[380px] text-[12px] leading-[17px]">
+      <LSCard eyebrow="Live" title="Event volume">
+        <div className="flex flex-col items-center justify-center py-10 gap-2 text-muted-foreground">
+          <Rss className="w-5 h-5 opacity-40" />
+          <div className="text-[11.5px]">No event volume recorded yet.</div>
+          <div className="text-[10.5px] text-muted-foreground/70">
             {sourceDeployed
               ? 'Event volume chart will appear once ingestion resumes.'
               : 'Deploy this feed to start receiving events.'}
@@ -1799,35 +1473,49 @@ function Sparkline({
 
   const max = Math.max(1, ...points);
   const W = 1360;
-  const H = 96;
-  const PAD_T = 4;
-  const innerH = H - PAD_T;
-  const xAt = (i: number) => (i / (points.length - 1)) * W;
+  const H = 110;
+  const PAD_L = 44;
+  const PAD_R = 12;
+  const PAD_T = 6;
+  const PAD_B = 22;
+  const innerW = W - PAD_L - PAD_R;
+  const innerH = H - PAD_T - PAD_B;
+  const xAt = (i: number) => PAD_L + (i / (points.length - 1)) * innerW;
   const yAt = (v: number) => PAD_T + innerH - (v / max) * innerH;
   const d = points.map((v, i) => `${i === 0 ? 'M' : 'L'}${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`).join(' ');
-  const dFill = `${d} L${xAt(points.length - 1).toFixed(1)},${H} L0,${H} Z`;
+  const dFill = `${d} L${xAt(points.length - 1).toFixed(1)},${yAt(0).toFixed(1)} L${xAt(0).toFixed(1)},${yAt(0).toFixed(1)} Z`;
 
   return (
     <LSCard
-      eyebrow={isLive ? 'Live' : 'Ingest'}
+      eyebrow={isLive ? 'Live' : 'Recent'}
       title="Event volume"
       action={
-        <span className="font-mono text-[10.5px] text-muted-foreground">
-          peak <span className="text-foreground">{max.toLocaleString()}</span> / bucket
+        <span className="text-[10.5px] font-mono text-muted-foreground">
+          Peak <span className="text-foreground">{max.toLocaleString()}</span>{' '}
+          <span className="text-muted-foreground/70">/ bucket</span>
         </span>
       }
     >
-      <div>
-        <svg viewBox={`0 0 ${W} ${H}`} className="h-[96px] w-full border-b border-border" preserveAspectRatio="none">
-          <line x1={0} x2={W} y1={PAD_T + innerH / 2} y2={PAD_T + innerH / 2} stroke="var(--border)" strokeWidth="1" strokeDasharray="2,3" />
+      <div className="p-2">
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-[110px]" preserveAspectRatio="none">
+          {[0, 0.5, 1].map((f, i) => {
+            const y = PAD_T + innerH - f * innerH;
+            return (
+              <line
+                key={i}
+                x1={PAD_L}
+                x2={W - PAD_R}
+                y1={y}
+                y2={y}
+                stroke="var(--border)"
+                strokeWidth="1"
+                strokeDasharray={i === 0 ? '' : '2,3'}
+              />
+            );
+          })}
           <path d={dFill} fill="var(--primary)" fillOpacity="0.18" />
-          <path d={d} fill="none" stroke="var(--primary)" strokeWidth="1.5" strokeOpacity="0.9" vectorEffect="non-scaling-stroke" />
+          <path d={d} fill="none" stroke="var(--primary)" strokeWidth="1.5" strokeOpacity="0.9" />
         </svg>
-        <div className="mt-1.5 flex justify-between font-mono text-[10.5px] text-muted-foreground/70">
-          <span>−24h</span>
-          <span>−12h</span>
-          <span>now</span>
-        </div>
       </div>
     </LSCard>
   );
@@ -1870,7 +1558,7 @@ function ConfigurationTab({
     : source.stale_threshold_minutes ?? 15;
 
   return (
-    <div className="space-y-4">
+    <div className="p-4 space-y-4">
       <LSCard
         eyebrow="Identity"
         title="Source configuration"
@@ -1880,17 +1568,10 @@ function ConfigurationTab({
               <Button variant="outline" size="sm" className="h-7 text-[11.5px]" onClick={onCancel}>
                 Cancel
               </Button>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="inline-flex" tabIndex={updating ? 0 : undefined}>
-                    <Button size="sm" className="h-7 text-[11.5px] gap-1.5" onClick={onSave} disabled={updating}>
-                      {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
-                      Save changes
-                    </Button>
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent>Save this draft. Incoming events aren't affected until you publish.</TooltipContent>
-              </Tooltip>
+              <Button size="sm" className="h-7 text-[11.5px] gap-1.5" onClick={onSave} disabled={updating}>
+                {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
+                Save changes
+              </Button>
             </div>
           ) : (
             <Button variant="outline" size="sm" className="h-7 text-[11.5px] gap-1.5" onClick={onStartEdit}>
@@ -2201,11 +1882,12 @@ function VrlEditorTab({
   onUndo: () => void;
   onAiVrlUpdate: (info: VrlUpdateInfo) => void;
 }) {
+  // NAN-4132: no pivt tab without AI (open core); a stale 'ai' falls back to Test events.
   const sidePanel = useParserSidePanelTabs(sidePanelTab);
   return (
     <div className="flex flex-col h-full min-h-0">
       {/* Toolbar */}
-      <div className="shrink-0 flex flex-wrap items-center gap-2 px-4 py-2 border-b border-border bg-card/40">
+      <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b border-border bg-card/40">
         <div className="flex items-center gap-2 min-w-0">
           <PivtIcon className="w-3.5 h-3.5 text-muted-foreground" />
           <span className="text-[11.5px] font-mono text-foreground truncate">{effectiveSourceType(source)}.vrl</span>
@@ -2236,22 +1918,15 @@ function VrlEditorTab({
           </>
         ) : isEditing ? (
           <>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="inline-flex" tabIndex={updating || validating ? 0 : undefined}>
-                  <Button
-                    size="sm"
-                    className="h-7 text-[11.5px] gap-1.5"
-                    onClick={onSaveVrl}
-                    disabled={updating || validating}
-                  >
-                    {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
-                    Save VRL
-                  </Button>
-                </span>
-              </TooltipTrigger>
-              <TooltipContent>Save this draft. Incoming events aren't affected until you publish.</TooltipContent>
-            </Tooltip>
+            <Button
+              size="sm"
+              className="h-7 text-[11.5px] gap-1.5"
+              onClick={onSaveVrl}
+              disabled={updating || validating}
+            >
+              {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
+              Save VRL
+            </Button>
             <Button
               variant="outline"
               size="sm"
@@ -2293,7 +1968,7 @@ function VrlEditorTab({
       </div>
 
       {/* 60/40 split */}
-      <div className="flex-1 min-h-0 grid grid-rows-[minmax(0,3fr)_minmax(0,2fr)] divide-y divide-border lg:grid-rows-1 lg:grid-cols-[minmax(0,1fr)_480px] lg:divide-y-0 lg:divide-x">
+      <div className="flex-1 min-h-0 grid grid-cols-[minmax(0,1fr)_480px] divide-x divide-border">
         {/* Editor */}
         <div className="flex flex-col min-h-0 bg-background">
           {currentDiff ? (
@@ -2334,22 +2009,19 @@ function VrlEditorTab({
             {/* Each panel mounts unconditionally so chat history and test-event state
                 survive tab switches; we toggle visibility via `hidden` instead of
                 conditional rendering to avoid losing scroll/typing state. */}
-            {sidePanel.aiAvailable && (
-              <div className={cn('h-full', sidePanel.active === 'ai' ? 'block' : 'hidden')}>
-                <LogSourceAiPanel
-                  parserId={source.id}
-                  sourceName={source.name}
-                  sourceType={effectiveSourceType(source)}
-                  currentVrl={currentVrl}
-                  onVrlUpdate={onAiVrlUpdate}
-                  onUndo={onUndo}
-                  canUndo={vrlHistory.length > 0}
-                />
-              </div>
-            )}
+            <div className={cn('h-full', sidePanel.active === 'ai' ? 'block' : 'hidden')}>
+              <LogSourceAiPanel
+                parserId={source.id}
+                sourceName={source.name}
+                sourceType={effectiveSourceType(source)}
+                currentVrl={currentVrl}
+                onVrlUpdate={onAiVrlUpdate}
+                onUndo={onUndo}
+                canUndo={vrlHistory.length > 0}
+              />
+            </div>
             <div className={cn('h-full overflow-auto', sidePanel.active === 'test' ? 'block' : 'hidden')}>
               <ParserTestLab
-                logSourceId={source.id}
                 vrlCode={editedVrl || source.parser_vrl}
                 sourceType={source.match_values?.[0] || source.source_type}
                 currentDeployedVrl={source.parser_vrl}
@@ -2420,91 +2092,11 @@ function DiagnosticsPanel({ result }: { result: ValidationResult }) {
 // Deployments tab
 // ============================================================================
 
-const ROLLOUT_TONE: Record<string, string> = {
-  live: 'text-emerald-500 bg-emerald-500/15',
-  failed: 'text-red-500 bg-red-500/15',
-  rolled_back: 'text-red-500 bg-red-500/15',
-};
-
-/**
- * NAN-3298: on hosted-shared, deploy / publish only activate the registry entry;
- * the parser reaches ingest through a parser-bundle rollout. Show the rollouts
- * (with failures and roll-backs) first, then the registry history.
- */
-function DeploymentsTab({
-  deployments,
-  rollouts,
-  serving,
-}: {
-  deployments: LogSourceDeployment[] | null;
-  /** Hosted-shared only: this source's parser rollouts, newest first. */
-  rollouts?: TenantParserRollout[];
-  serving: ParserServingState;
-}) {
-  const shared = rollouts !== undefined;
-  return (
-    <div className="flex flex-col gap-3">
-      {shared && rollouts.length > 0 && <ParserRolloutHistory rollouts={rollouts} serving={serving} />}
-      <RegistryDeploymentHistory deployments={deployments} shared={shared} />
-    </div>
-  );
-}
-
-function ParserRolloutHistory({ rollouts, serving }: { rollouts: TenantParserRollout[]; serving: ParserServingState }) {
-  return (
-    <LSCard
-      eyebrow="Ingest"
-      title="Parser rollouts"
-      action={
-        <span className="font-mono text-[10.5px] text-muted-foreground" data-testid="rollout-serving-version">
-          serving {serving.servingVersion != null ? `v${serving.servingVersion}` : '—'}
-        </span>
-      }
-    >
-      <div data-testid="deployments-rollouts">
-        {rollouts.map((r) => {
-          const version = rolloutVersion(r);
-          const failure = rolloutFailureText(r);
-          return (
-            <div key={r.id} className="flex items-start gap-3 border-b border-border px-4 py-2 last:border-b-0">
-              <span className="w-10 shrink-0 font-mono text-[11.5px] text-foreground">{version != null ? `v${version}` : '—'}</span>
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span
-                    className={cn(
-                      'rounded px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider',
-                      ROLLOUT_TONE[r.state] ?? 'text-amber-500 bg-amber-500/15',
-                    )}
-                  >
-                    {rolloutStateLabel(r.state)}
-                  </span>
-                  <span className="font-mono text-[10.5px] text-muted-foreground">{r.kind.replace(/_/g, ' ')}</span>
-                  <span className="font-mono text-[10.5px] text-muted-foreground">{formatUTCCompact(r.requested_at)}</span>
-                  {r.completed_at && (
-                    <span className="font-mono text-[10.5px] text-muted-foreground">→ {formatUTCCompact(r.completed_at)}</span>
-                  )}
-                  {version != null && version === serving.servingVersion && r.state === 'live' && (
-                    <span className="rounded bg-primary/15 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider text-primary">
-                      Serving
-                    </span>
-                  )}
-                </div>
-                {failure && <div className="mt-1 break-words text-[11px] leading-relaxed text-red-500/90">{failure}</div>}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </LSCard>
-  );
-}
-
-function RegistryDeploymentHistory({ deployments, shared }: { deployments: LogSourceDeployment[] | null; shared: boolean }) {
-  const title = shared ? 'Registry activations' : 'Deployment history';
+function DeploymentsTab({ deployments }: { deployments: LogSourceDeployment[] | null }) {
   if (!deployments || deployments.length === 0) {
     return (
-      <div>
-        <LSCard eyebrow="History" title={title}>
+      <div className="p-4">
+        <LSCard eyebrow="History" title="Deployment history">
           <div className="flex flex-col items-center justify-center py-12 gap-2 text-muted-foreground">
             <Upload className="w-5 h-5 opacity-40" />
             <div className="text-[11.5px]">No deployments yet.</div>
@@ -2518,10 +2110,10 @@ function RegistryDeploymentHistory({ deployments, shared }: { deployments: LogSo
   }
 
   return (
-    <div>
+    <div className="p-4">
       <LSCard
         eyebrow="History"
-        title={title}
+        title="Deployment history"
         action={
           <span className="text-[10.5px] font-mono text-muted-foreground">
             {deployments.length} event{deployments.length === 1 ? '' : 's'}
@@ -2557,9 +2149,7 @@ function RegistryDeploymentHistory({ deployments, shared }: { deployments: LogSo
                     >
                       {d.action === 'deploy'
                         ? ok
-                          ? shared
-                            ? 'Activated in registry'
-                            : 'Deployed successfully'
+                          ? 'Deployed successfully'
                           : 'Deployment failed'
                         : ok
                         ? 'Undeployed successfully'
@@ -2618,10 +2208,9 @@ function VersionsTab({
   onPublish: () => void;
   onRequestRevert: (v: LogSourceVersion) => void;
 }) {
-  const shared = useSharedTenant();
   if (!versions || versions.length === 0) {
     return (
-      <div>
+      <div className="p-4">
         <LSCard eyebrow="Audit" title="Version history">
           <div className="flex flex-col items-center justify-center py-12 gap-2 text-muted-foreground">
             <GitCommit className="w-5 h-5 opacity-40" />
@@ -2636,7 +2225,7 @@ function VersionsTab({
   }
 
   return (
-    <div>
+    <div className="p-4">
       <LSCard
         eyebrow="Audit"
         title="Version history"
@@ -2646,26 +2235,15 @@ function VersionsTab({
               {versions.length} version{versions.length === 1 ? '' : 's'}
             </span>
             {hasDraft && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="inline-flex" tabIndex={publishing || !validated ? 0 : undefined}>
-                    <Button
-                      size="sm"
-                      className="h-7 text-[11.5px] gap-1.5"
-                      disabled={publishing || !validated}
-                      onClick={onPublish}
-                    >
-                      {publishing ? <LoadingIcon className="w-3 h-3" /> : <Rocket className="w-3 h-3" />}
-                      Publish current draft
-                    </Button>
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent>
-                  {shared
-                    ? 'Make this draft live for incoming events. The current version keeps serving until the rollout completes.'
-                    : 'Make this draft live for incoming events. The previous version is kept in history.'}
-                </TooltipContent>
-              </Tooltip>
+              <Button
+                size="sm"
+                className="h-7 text-[11.5px] gap-1.5"
+                disabled={publishing || !validated}
+                onClick={onPublish}
+              >
+                {publishing ? <LoadingIcon className="w-3 h-3" /> : <Rocket className="w-3 h-3" />}
+                Publish current draft
+              </Button>
             )}
           </div>
         }
@@ -3030,7 +2608,7 @@ const AI_QUICK_ACTIONS = [
 // rounded-md cards). Uses the same useMelodJob + api.melodEditParser plumbing as the
 // shared ParserEditChat, but renders without the Card chrome and at the smaller text
 // scale called for in design-ref/shadcn/log-source-vrl.jsx (AIAssistPanel, lines 294+).
-export function LogSourceAiPanel({
+function LogSourceAiPanel({
   parserId,
   sourceName,
   sourceType,
@@ -3057,21 +2635,9 @@ export function LogSourceAiPanel({
   baseParserVrl?: string;
 }) {
   const { toast } = useToast();
-  const { data: activeSchema } = useQuery({
-    queryKey: ['schema-fields'],
-    queryFn: () => api.getSchemaFields(),
-    staleTime: Infinity,
-    gcTime: Infinity,
-  });
-  const searchSourceField = activeSchema?.schema === 'ocsf'
-    ? 'metadata.log_source'
-    : 'source_type';
-  // NAN-4132: no AI capability → no ai-availability probe (fail closed).
-  const melodCapable = useCapabilities().capabilities.melod === true;
-  const { data: melodStatus, loading: melodStatusLoading } = useMelodStatus({ skip: !melodCapable });
+  const { data: melodStatus, loading: melodStatusLoading } = useMelodStatus();
   const editParserJob = useMelodJob<MelodEditParserResponse>();
   const loading = editParserJob.loading;
-  const elapsedMs = useElapsedWhile(loading);
   const rawPassThrough = mode === 'parser' && isRawPassThroughVrl(currentVrl);
 
   const [messages, setMessages] = useState<AiChatMessage[]>([]);
@@ -3126,14 +2692,14 @@ export function LogSourceAiPanel({
           const now = new Date();
           const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
           const response = await api.search({
-            query: nplFieldEquals(searchSourceField, sourceType),
+            query: nplFieldEquals('source_type', sourceType),
             time_range: { start: yesterday.toISOString(), end: now.toISOString() },
             limit: 5,
             skip_field_stats: true,
           });
           sampleLogsArray = extractRecentParserSamples(response.results ?? []);
           if (sampleLogsArray.length === 0) {
-            throw new Error(`No recent events found for ${searchSourceField}="${sourceType}". Wait for the collector to run or paste a sample with the play button.`);
+            throw new Error(`No recent events found for source_type="${sourceType}". Wait for the collector to run or paste a sample with the play button.`);
           }
           autoSamplesRef.current = { parserId, sourceType, samples: sampleLogsArray };
           setAutoSampleCount(sampleLogsArray.length);
@@ -3166,8 +2732,7 @@ export function LogSourceAiPanel({
             ? { base_parser_vrl: baseParserVrl }
             : {}),
         }),
-        // NAN-4778: parser edits can run many minutes; wait for the job.
-        { maxWaitMs: PARSER_JOB_MAX_WAIT_MS },
+        { maxWaitMs: PARSER_JOB_MAX_WAIT_MS }, // NAN-4778: 25-min edit jobs
       );
       if (response.session_id) {
         setSessionId(response.session_id);
@@ -3209,7 +2774,7 @@ export function LogSourceAiPanel({
       </div>
     );
   }
-  if (!melodCapable || !melodStatus?.connected) {
+  if (!melodStatus?.connected) {
     return (
       <div className="flex flex-col items-center justify-center h-full p-4 text-center">
         <PivtIcon className="w-6 h-6 text-muted-foreground mb-2" />
@@ -3265,10 +2830,9 @@ export function LogSourceAiPanel({
         ))}
 
         {loading && (
-          <div className="flex items-center gap-2 text-[11px] text-muted-foreground" role="status">
+          <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
             <PivtIcon className="w-3.5 h-3.5 animate-spin text-primary" />
-            <span>{editParserJob.progress && editParserJob.progress !== 'Working...' ? editParserJob.progress : 'pivt is thinking…'}</span>
-            <span className="font-mono text-[10.5px]">{formatElapsed(elapsedMs)}</span>
+            <span>pivt is thinking…</span>
           </div>
         )}
         {fetchingSamples && (
@@ -3476,12 +3040,12 @@ function ExtensionTab({
   updating: boolean;
   onSave: (data: { extension_vrl: string; extension_enabled: boolean }) => Promise<void>;
 }) {
-  const shared = useSharedTenant();
   const { toast } = useToast();
   const initialExt = source.extension_vrl ?? '';
   const [editedExt, setEditedExt] = useState(initialExt);
   const [enabled, setEnabled] = useState<boolean>(source.extension_enabled ?? false);
-  const [sidePanelTab, setSidePanelTab] = useState<SidePanelTabId>('test');
+  const [sidePanelTab, setSidePanelTab] = useState<'ai' | 'test' | 'diag'>('test');
+  // NAN-4132: no pivt tab without AI (open core); a stale 'ai' falls back to Test events.
   const sidePanel = useParserSidePanelTabs(sidePanelTab);
   const [validationResult, setValidationResult] = useState<ValidationResult>(null);
   const [validating, setValidating] = useState(false);
@@ -3534,9 +3098,8 @@ function ExtensionTab({
       await onSave({ extension_vrl: editedExt, extension_enabled: enabled });
       toast({
         title: 'Extension saved',
-        description: shared
-          ? 'Draft updated. Publish a new version to roll the extension out to your parser cell.'
-          : 'Draft updated. Publish a new version and redeploy to push the extension to Vector.',
+        description:
+          'Draft updated. Publish a new version and redeploy to push the extension to Vector.',
       });
     } catch (err) {
       toast({
@@ -3550,7 +3113,7 @@ function ExtensionTab({
   return (
     <div className="flex flex-col h-full min-h-0">
       {/* Toolbar — same shape as VrlEditorTab */}
-      <div className="shrink-0 flex flex-wrap items-center gap-2 px-4 py-2 border-b border-border bg-card/40">
+      <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b border-border bg-card/40">
         <div className="flex items-center gap-2 min-w-0">
           <PivtIcon className="w-3.5 h-3.5 text-muted-foreground" />
           <span className="text-[11.5px] font-mono text-foreground truncate">
@@ -3586,22 +3149,15 @@ function ExtensionTab({
           {validating ? <LoadingIcon className="w-3 h-3" /> : <Check className="w-3 h-3" />}
           Validate
         </Button>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="inline-flex" tabIndex={!dirty || updating ? 0 : undefined}>
-              <Button
-                size="sm"
-                className="h-7 text-[11.5px] gap-1.5"
-                onClick={handleSave}
-                disabled={!dirty || updating}
-              >
-                {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
-                Save
-              </Button>
-            </span>
-          </TooltipTrigger>
-          <TooltipContent>Save this draft. Incoming events aren't affected until you publish.</TooltipContent>
-        </Tooltip>
+        <Button
+          size="sm"
+          className="h-7 text-[11.5px] gap-1.5"
+          onClick={handleSave}
+          disabled={!dirty || updating}
+        >
+          {updating ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
+          Save
+        </Button>
         {validatedJustNow && !validating && validationResult?.valid && (
           <span className="text-[10px] font-mono text-muted-foreground whitespace-nowrap ml-1">
             <span className="text-emerald-500">✓</span> Validated
@@ -3649,22 +3205,19 @@ function ExtensionTab({
               </div>
               <div className="flex-1 min-h-0 overflow-hidden">
                 {/* Each panel mounts unconditionally so chat/test state survives tab switches. */}
-                {sidePanel.aiAvailable && (
-                  <div className={cn('h-full', sidePanel.active === 'ai' ? 'block' : 'hidden')}>
-                    <LogSourceAiPanel
-                      parserId={source.id}
-                      sourceName={source.name}
-                      sourceType={effectiveSourceType(source)}
-                      currentVrl={editedExt}
-                      mode="extension"
-                      baseParserVrl={source.parser_vrl}
-                      onVrlUpdate={(info) => setEditedExt(info.newVrl)}
-                    />
-                  </div>
-                )}
+                <div className={cn('h-full', sidePanel.active === 'ai' ? 'block' : 'hidden')}>
+                  <LogSourceAiPanel
+                    parserId={source.id}
+                    sourceName={source.name}
+                    sourceType={effectiveSourceType(source)}
+                    currentVrl={editedExt}
+                    mode="extension"
+                    baseParserVrl={source.parser_vrl}
+                    onVrlUpdate={(info) => setEditedExt(info.newVrl)}
+                  />
+                </div>
                 <div className={cn('h-full overflow-auto', sidePanel.active === 'test' ? 'block' : 'hidden')}>
                   <ParserTestLab
-                    logSourceId={source.id}
                     vrlCode={source.parser_vrl}
                     sourceType={effectiveSourceType(source)}
                     extensionVrl={editedExt}

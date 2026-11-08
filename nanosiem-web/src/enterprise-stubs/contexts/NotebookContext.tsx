@@ -5,20 +5,20 @@
 // file replaces the real implementation via the `@/enterprise` alias swap.
 //
 // Open consumers (`AlertDetail`, `Search`, `AppLayout`, plus pivt files until
-// they're lifted in the pivt phase) call `useNotebookOptional` /
+// they're lifted in the PIVT phase) call `useNotebookOptional` /
 // `useNotebookCapture` and already null-check for missing notebook state, so
 // those return benign no-op values.
 //
 // `useNotebook` (non-optional) is reachable from `pivt/PivtCloseDialog.tsx`,
 // which is mounted whenever the pivt shell renders — and the shell is still
-// mounted unconditionally in `AppLayout` until the pivt phase. Returning a
+// mounted unconditionally in `AppLayout` until the PIVT phase. Returning a
 // permissive empty object lets that path execute harmlessly in open instead
 // of crashing on Ctrl+. or other accidental pivt activation.
 
 import { type ReactNode } from 'react';
 
-const NOOP = (..._args: unknown[]) => {};
-const NOOP_ASYNC = async (..._args: unknown[]) => {};
+const NOOP = (..._args: unknown[]): void => {};
+const NOOP_ASYNC = async (..._args: unknown[]): Promise<void> => {};
 
 export interface InitialSearchData {
   query: string;
@@ -90,7 +90,17 @@ export function useNotebook() {
   return STUB_NOTEBOOK_VALUE;
 }
 
-export function useNotebookOptional(): typeof STUB_NOTEBOOK_VALUE | undefined {
+/**
+ * The visibility fields core callers read off the optional notebook
+ * (AppLayout's smart sidebar). Typed so `notebook?.isOpen` type-checks in the
+ * open build; the value is always `undefined` here.
+ */
+export interface OptionalNotebookStub {
+  isOpen: boolean;
+  isMinimized: boolean;
+}
+
+export function useNotebookOptional(): OptionalNotebookStub | undefined {
   return undefined;
 }
 

@@ -6,8 +6,7 @@
 //! binary so it never shares the `NANOSIEM_WEBHOOK_ALLOW_PRIVATE` process env
 //! with the happy-path suite.
 //!
-//! Set nondefault fixture JWT_SECRET and NANOSIEM_ENCRYPTION_KEY (32+ bytes), then run:
-//!
+//!   NANOSIEM_ALLOW_DEFAULT_KEYS=true \
 //!   cargo test -p nanosiem-core --test webhook_ssrf_block_integration \
 //!     -- --ignored --test-threads=1
 

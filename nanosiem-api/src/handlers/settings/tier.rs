@@ -65,7 +65,7 @@ pub struct AiUsageQuery {
 }
 
 /// Detailed AI usage: billed credits plus per-agent / daily / recent breakdowns
-/// from the `ai_usage_events` ledger.
+/// from the `ai_usage_events` ledger (NAN-1519).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AiUsageDetailResponse {
     /// Billed AI credits this month — authoritative, sourced from
@@ -97,7 +97,7 @@ pub struct AiUsageDetailResponse {
 /// binary does not contain. Open-core builds have no OIDC/SAML handlers, so
 /// reporting `sso_enabled: true` there contradicts `/api/capabilities` and the
 /// 404s from `/api/settings/oidc` (NAN-3378).
-fn clamp_to_build(mut limits: nanosiem_core::TierLimits) -> nanosiem_core::TierLimits {
+pub(crate) fn clamp_to_build(mut limits: nanosiem_core::TierLimits) -> nanosiem_core::TierLimits {
     limits.sso_enabled &= crate::handlers::capabilities::SSO_AVAILABLE;
     limits
 }
@@ -293,7 +293,7 @@ pub async fn get_usage_history(
 }
 
 /// Get detailed AI usage: billed credits + per-agent, daily, and recent-call
-/// breakdowns from the AI usage ledger.
+/// breakdowns from the AI usage ledger (NAN-1519).
 #[utoipa::path(
     get,
     path = "/api/settings/ai-usage",
@@ -341,9 +341,7 @@ pub async fn get_ai_usage_detail(
     // Headline billed-credit figure degrades to 0 rather than failing the whole
     // request — the ledger breakdowns below are the primary payload here.
     let credits_used = tier_settings.get_ai_credits_used().await.unwrap_or(0);
-    let by_agent = tier_settings
-        .get_ai_usage_by_agent(from_ts, to_excl)
-        .await?;
+    let by_agent = tier_settings.get_ai_usage_by_agent(from_ts, to_excl).await?;
     let daily = tier_settings.get_ai_usage_daily(from_ts, to_excl).await?;
     let recent = tier_settings.get_recent_ai_events(limit).await?;
 
@@ -360,50 +358,5 @@ pub async fn get_ai_usage_detail(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use nanosiem_core::{OrganizationTier, TierLimits};
-
-    /// NAN-3378: the tier row grants SSO on `unrestricted`, but an open build
-    /// has no OIDC handlers. `/api/settings/tier` must agree with
-    /// `/api/capabilities` instead of advertising a surface that 404s.
-    #[test]
-    fn tier_sso_enabled_follows_build_availability() {
-        let stored = TierLimits::for_tier_unoverridden(OrganizationTier::Unrestricted);
-        assert!(stored.sso_enabled, "precondition: unrestricted grants SSO");
-
-        let reported = clamp_to_build(stored);
-        assert_eq!(
-            reported.sso_enabled,
-            crate::handlers::capabilities::SSO_AVAILABLE
-        );
-        #[cfg(not(feature = "enterprise"))]
-        assert!(
-            !reported.sso_enabled,
-            "open build must report sso_enabled=false"
-        );
-        #[cfg(feature = "enterprise")]
-        assert!(
-            reported.sso_enabled,
-            "enterprise build keeps the plan grant"
-        );
-    }
-
-    #[test]
-    fn clamp_never_grants_sso_the_plan_withheld() {
-        let mut stored = TierLimits::for_tier_unoverridden(OrganizationTier::Unrestricted);
-        stored.sso_enabled = false;
-        assert!(!clamp_to_build(stored).sso_enabled);
-    }
-
-    #[test]
-    fn capabilities_and_tier_agree_on_sso() {
-        let caps = crate::handlers::capabilities::build_capabilities(
-            crate::config::IngestMode::Vector,
-        );
-        let tier = clamp_to_build(TierLimits::for_tier_unoverridden(
-            OrganizationTier::Unrestricted,
-        ));
-        assert_eq!(caps.capabilities.sso, tier.sso_enabled);
-    }
-}
+#[path = "tier_tests.rs"]
+mod tests;

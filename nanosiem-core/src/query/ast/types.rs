@@ -136,12 +136,6 @@ pub enum SearchExpr {
         field: String,
         op: Comparator,
         value: Value,
-        /// How the right-hand side was WRITTEN in the source text (NAN-2380).
-        /// Defaults to [`RhsSyntax::Literal`], so nodes built in code — and
-        /// ASTs deserialized from before this field existed — keep the
-        /// literal-value semantics they have always had.
-        #[serde(default)]
-        rhs: RhsSyntax,
     },
     /// Function filter: function(args) op value
     FunctionFilter {
@@ -218,16 +212,24 @@ pub enum SearchExpr {
 
 /// Enrichment-feed source for an IOC observable match (NAN-1580).
 ///
-/// Built from the `ioc in <feed>("<arg>")` surface form. Named providers
-/// (threatfox, misp, otx, feodo, abuse) interpret `arg` as a provider-specific
-/// selector such as an actor/campaign. The generic `feed("source")` form
-/// addresses a tenant-defined enrichment source by exact ID or display name.
+/// Built from the `ioc in <feed>("<arg>")` surface form, where `feed` is one of
+/// the recognized threat-intel feeds (threatfox, misp, otx, feodo, abuse) and
+/// `arg` is the feed-specific query argument (e.g. an actor/campaign name).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IocFeed {
-    /// Feed selector (feed | threatfox | misp | otx | feodo | abuse).
+    /// Selector: `feed` (exact feed / IOC list name in `arg`), or a provider
+    /// (threatfox | misp | otx | feodo | abuse) with a campaign/name argument.
     pub name: String,
-    /// Feed-specific query argument (e.g. "apt29").
+    /// Feed-specific query argument (e.g. "apt29", or the exact feed name).
     pub arg: String,
+}
+
+impl IocFeed {
+    /// `feed("name")`: an exact feed / IOC list name rather than a provider
+    /// campaign match (NAN-4902 lane G).
+    pub fn is_exact_feed(&self) -> bool {
+        self.name.eq_ignore_ascii_case("feed")
+    }
 }
 
 /// Internal lookup-table source for an IOC observable match (NAN-1581 Phase 6).
@@ -244,65 +246,6 @@ pub struct IocLookup {
     /// Optional column to read indicator values from. `None` ⇒ the table's
     /// registry primary-key column.
     pub column: Option<String>,
-}
-
-/// How the right-hand side of a [`SearchExpr::FieldFilter`] was WRITTEN (NAN-2380).
-///
-/// `nano` has always parsed `a = b` and `a = "b"` into the identical AST, so a
-/// field REFERENCE and a string LITERAL were indistinguishable downstream. That
-/// is why `| where src_ip != dest_ip` compiled to `src_ip != 'dest_ip'` — true
-/// for every row — instead of a column-to-column comparison: the exact inverse
-/// of the intended predicate, returned with a plausible row count and no error.
-///
-/// Carrying the surface form on the node lets the SQL generator — the one place
-/// that also knows the active schema profile — tell the two readings apart. The
-/// marker is inert everywhere else: consumers that ignore it behave exactly as
-/// they did before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum RhsSyntax {
-    /// The RHS is unambiguously a VALUE: it was quoted in the source text
-    /// (`user="dest_ip"`), it is a typed literal (number / bool / IP / regex /
-    /// interval), or the node was constructed in code. Default, so nothing that
-    /// does not opt in changes meaning.
-    #[default]
-    Literal,
-    /// The RHS was an unquoted, identifier-shaped bare token in the source text
-    /// (`| where src_ip != dest_ip`). Ambiguous by construction: it may be a
-    /// value that happens to spell a column name (`target_type=user`) or a
-    /// reference to that column.
-    Bareword,
-}
-
-/// True when `s` is an unquoted, identifier-shaped token — the only RHS text
-/// that is AMBIGUOUS between a value and a column reference (NAN-2380).
-///
-/// Single source of truth for three places that must agree exactly:
-///   * the parser, which stamps [`RhsSyntax::Bareword`] on such an RHS,
-///   * the pretty-printer, which must re-emit those values BARE so the marker
-///     survives the AST -> text -> AST round-trip the source-scope gate does,
-///   * the SQL generator, which decides what the token means.
-///
-/// Deliberately narrow: dotted identifier segments only. Wildcards, IPs, paths,
-/// emails, hyphens, digits-first tokens and the reserved words are excluded, so
-/// anything that could not re-tokenize verbatim as a bare value is never marked.
-pub fn is_bareword_identifier(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    if matches!(
-        s.to_ascii_uppercase().as_str(),
-        "AND" | "OR" | "NOT" | "TRUE" | "FALSE"
-    ) {
-        return false;
-    }
-    s.split('.').all(|segment| {
-        let mut chars = segment.chars();
-        match chars.next() {
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-            _ => return false,
-        }
-        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
 }
 
 /// Comparison operators for field filters
@@ -403,20 +346,7 @@ impl std::fmt::Display for Value {
             }
             Value::Bool(b) => write!(f, "{}", b),
             Value::Ip(ip) => write!(f, "{}", ip),
-            Value::Regex(pattern) => {
-                // Escape only delimiters that are not already escaped. The parser
-                // preserves regex escapes, so blindly replacing `/` breaks `/\\/`.
-                write!(f, "/")?;
-                let mut escaped = false;
-                for ch in pattern.chars() {
-                    if ch == '/' && !escaped {
-                        write!(f, "\\")?;
-                    }
-                    write!(f, "{ch}")?;
-                    escaped = ch == '\\' && !escaped;
-                }
-                write!(f, "/")
-            }
+            Value::Regex(pattern) => write!(f, "/{}/", pattern.replace('/', "\\/")),
             Value::Interval(duration, unit) => {
                 // NAN-3080: print the value IN ITS UNIT. Printing the seconds
                 // count with the unit multiplied the interval on every

@@ -3,7 +3,7 @@
 //! Extension hooks for plugging enterprise features into the open core.
 //!
 //! Each hook trait has a `Noop*` default implementation that the open-core
-//! build wires in. The enterprise crate (the enterprise crate) provides real
+//! build wires in. The enterprise crate (`nanosiem-enterprise`) provides real
 //! implementations that get injected at AppState construction time when the
 //! `enterprise` Cargo feature is enabled.
 //!
@@ -18,6 +18,7 @@ use thiserror::Error;
 pub mod ai_client;
 pub mod case_grouping;
 pub mod cloud_risk;
+pub mod risk_score_weights;
 pub mod shadow_investigation;
 pub mod siem_health_analyzer;
 pub mod tuning_proposal_generator;
@@ -30,6 +31,7 @@ pub use case_grouping::{
     AlertCasePermissions, AlertGrouped, CaseGroupingHook, NoopCaseGroupingHook,
 };
 pub use cloud_risk::{CloudRiskProvider, NoopCloudRiskProvider};
+pub use risk_score_weights::{NoopRiskScoreWeightsSource, RiskScoreWeightsSource};
 pub use shadow_investigation::{NoopShadowInvestigationHook, ShadowInvestigationHook};
 pub use siem_health_analyzer::{NoopSiemHealthAiAnalyzer, SiemHealthAiAnalyzer};
 pub use tuning_proposal_generator::TuningProposalGenerator;

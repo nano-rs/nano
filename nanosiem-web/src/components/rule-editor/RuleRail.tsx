@@ -66,6 +66,7 @@ export interface RuleRailRowActions {
   onDemote?: (ruleId: string) => void;
   onSetMode?: (ruleId: string, mode: 'staging' | 'live' | 'alerting') => void;
   onViewMatches?: (ruleId: string) => void;
+  lifecyclePending?: boolean;
 }
 
 interface RuleRailProps {
@@ -226,19 +227,28 @@ function RuleRowWithContext({
         )}
         {(actions.onPromote || actions.onDemote || actions.onTogglePause || showSetMode) && <ContextMenuSeparator />}
         {actions.onPromote && promotable && (
-          <ContextMenuItem onClick={() => actions.onPromote?.(rule.id)}>
+          <ContextMenuItem
+            onClick={() => actions.onPromote?.(rule.id)}
+            disabled={actions.lifecyclePending}
+          >
             <ArrowUp className="w-3.5 h-3.5 mr-2" strokeWidth={1.75} />
             Promote
           </ContextMenuItem>
         )}
         {actions.onDemote && demotable && (
-          <ContextMenuItem onClick={() => actions.onDemote?.(rule.id)}>
+          <ContextMenuItem
+            onClick={() => actions.onDemote?.(rule.id)}
+            disabled={actions.lifecyclePending}
+          >
             <ArrowDown className="w-3.5 h-3.5 mr-2" strokeWidth={1.75} />
             Demote
           </ContextMenuItem>
         )}
         {actions.onTogglePause && !rule.archived && (
-          <ContextMenuItem onClick={() => actions.onTogglePause?.(rule.id)}>
+          <ContextMenuItem
+            onClick={() => actions.onTogglePause?.(rule.id)}
+            disabled={actions.lifecyclePending}
+          >
             {paused ? (
               <>
                 <Play className="w-3.5 h-3.5 mr-2" strokeWidth={1.75} />
@@ -468,7 +478,10 @@ export function RuleRail({ rules, selectedId, draft, draftSelected, onSelect, on
   };
 
   return (
-    <aside className="flex flex-col h-full bg-[var(--panel)] border-r border-border min-w-0">
+    <aside
+      className="flex flex-col h-full bg-[var(--panel)] border-r border-border min-w-0"
+      data-testid="rule-editor-rail"
+    >
       <div className="px-3 pt-3 pb-2 border-b border-border">
         {/* Active / Archived segmented control — matches the rule-editor
             mock: chunky outer container with subtle border, the active

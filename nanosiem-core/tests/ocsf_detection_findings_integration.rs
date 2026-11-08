@@ -145,7 +145,20 @@ fn sample_metadata() -> serde_json::Value {
         "risk_score": 75,
         "risk_entity": "10.0.0.5",
         "risk_entity_field": "src_ip",
-        "risk_factors": ["off-hours"]
+        "risk_factors": ["off-hours"],
+        // NAN-4902 evidence, in the shape `FindingEvent::to_log_json` emits.
+        "attacks": [{
+            "technique": {"uid": "T1078", "name": "Valid Accounts"},
+            "tactic": {"uid": "TA0001", "name": "Initial Access"},
+            "version": "19.1"
+        }],
+        "observables": [{"name": "src_ip", "type": "IP Address", "type_id": 2, "value": "10.0.0.5"}],
+        "related_events": [{"uid": "evt-1"}],
+        "first_seen_time": "2026-11-01T10:00:00+00:00",
+        "last_seen_time": "2026-11-01T10:05:00+00:00",
+        "is_alert": false,
+        "analytic_state_id": 3,
+        "analytic_state": "Experimental"
     })
 }
 
@@ -233,6 +246,41 @@ async fn run_round_trip(client: &reqwest::Client, db: &str) -> Result<(), String
         select1(client, db, "lower(severity)").await,
         "high",
         "read-path severity (lowercased to match UDM)"
+    );
+
+    // 3) NAN-4902 evidence survives the write into `unmapped`.
+    let unmapped = |path: &str| format!("JSONExtractRaw(toString(unmapped), {path})");
+    assert_eq!(
+        select1(client, db, &unmapped("'attacks', 1, 'technique', 'uid'")).await,
+        "\"T1078\"",
+        "attacks[0].technique.uid"
+    );
+    assert_eq!(
+        select1(client, db, &unmapped("'observables', 1, 'value'")).await,
+        "\"10.0.0.5\"",
+        "observables[0].value"
+    );
+    assert_eq!(
+        select1(client, db, &unmapped("'related_events', 1, 'uid'")).await,
+        "\"evt-1\"",
+        "related_events[0].uid"
+    );
+    // The JSON column infers the RFC 3339 string as a DateTime and renders it
+    // normalized; compare instants.
+    assert_eq!(
+        select1(
+            client,
+            db,
+            "parseDateTime64BestEffort(JSONExtractString(toString(unmapped), 'first_seen_time'), 0, 'UTC')",
+        )
+        .await,
+        "2026-11-01 10:00:00",
+        "first_seen_time"
+    );
+    assert_eq!(
+        select1(client, db, "JSONExtractString(toString(unmapped), 'analytic_state')").await,
+        "Experimental",
+        "analytic_state"
     );
 
     Ok(())

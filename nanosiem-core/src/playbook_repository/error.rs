@@ -22,6 +22,11 @@ pub enum PlaybookRepositoryError {
     #[error("Repository not in allowlist: {0}")]
     RepositoryNotAllowed(String),
 
+    /// NAN-4947: this process no longer holds the leader epoch; nothing was
+    /// written.
+    #[error("sync superseded: {0}")]
+    Fenced(String),
+
     #[error("GitHub API error: {0}")]
     GitHubApi(String),
 
@@ -93,6 +98,7 @@ impl PlaybookRepositoryError {
             PlaybookRepositoryError::SyncInProgress(_) => 409,
             PlaybookRepositoryError::RepositoryDisabled => 403,
             PlaybookRepositoryError::Forbidden(_) => 403,
+            PlaybookRepositoryError::Fenced(_) => 409,
             _ => 500,
         }
     }

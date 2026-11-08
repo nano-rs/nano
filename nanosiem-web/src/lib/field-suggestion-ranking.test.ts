@@ -23,6 +23,44 @@ const OCSF = universe(
   'zeta.field',
 );
 
+const UDM = universe('src_ip', 'dest_ip', 'user', 'hostname', 'process_name', 'source_type', 'auth_result', 'zeta');
+const UDM_COMMON: RankableField[] = [
+  { value: 'source_type' },
+  { value: 'src_ip' },
+  { value: 'user' },
+];
+
+describe('rankFieldSuggestions on the UDM schema', () => {
+  it('cold start: the UDM common list leads, then the rest A-Z', () => {
+    const ranked = rankFieldSuggestions({ partial: '', universe: UDM, usage: null, curated: curatedFieldsFor(UDM, UDM_COMMON) });
+    expect(ranked.slice(0, 3).map((r) => [r.value, r.section])).toEqual([
+      ['source_type', 'common'],
+      ['src_ip', 'common'],
+      ['user', 'common'],
+    ]);
+    expect(ranked.slice(3).map((r) => r.value)).toEqual(['auth_result', 'dest_ip', 'hostname', 'process_name', 'zeta']);
+  });
+
+  it('recent, then popular, then common, then A-Z; each field once', () => {
+    const ranked = rankFieldSuggestions({
+      partial: '',
+      universe: UDM,
+      usage: { recent: ['process_name', 'user'], popular: ['user', 'dest_ip', 'src_ip'] },
+      curated: curatedFieldsFor(UDM, UDM_COMMON),
+    });
+    expect(ranked.map((r) => [r.value, r.section])).toEqual([
+      ['process_name', 'recent'],
+      ['user', 'recent'],
+      ['dest_ip', 'popular'],
+      ['src_ip', 'popular'],
+      ['source_type', 'common'],
+      ['auth_result', 'other'],
+      ['hostname', 'other'],
+      ['zeta', 'other'],
+    ]);
+  });
+});
+
 describe('rankFieldSuggestions (NAN-3812)', () => {
   it('cold start: metadata.log_source leads, before metadata.event_code', () => {
     const ranked = rankFieldSuggestions({ partial: '', universe: OCSF, usage: null, curated: curatedFieldsFor(OCSF, []) });
@@ -97,16 +135,16 @@ describe('rankFieldSuggestions (NAN-3812)', () => {
 });
 
 describe('curatedFieldsFor', () => {
-  it('starts with metadata.log_source and filters to the tenant schema', () => {
+  it('starts with metadata.log_source and filters to an OCSF schema', () => {
     expect(CURATED_OCSF_FIELDS[0].value).toBe('metadata.log_source');
-    expect(curatedFieldsFor(new Map(), [])).toBe(CURATED_OCSF_FIELDS);
     const curated = curatedFieldsFor(universe('metadata.log_source', 'src_endpoint.ip'), []).map((f) => f.value);
     expect(curated).toEqual(['metadata.log_source', 'src_endpoint.ip']);
   });
 
-  it('keeps the legacy list on a UDM schema and honors an override', () => {
+  it('keeps the UDM list on a UDM schema or before the schema loads, and honors an override', () => {
     const legacy = [{ value: 'src_ip' }];
     expect(curatedFieldsFor(universe('src_ip', 'user'), legacy)).toBe(legacy);
+    expect(curatedFieldsFor(new Map(), legacy)).toBe(legacy);
     const override = [{ value: 'time' }];
     expect(curatedFieldsFor(OCSF, legacy, override)).toBe(override);
   });

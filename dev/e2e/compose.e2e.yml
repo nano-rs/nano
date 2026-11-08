@@ -1,0 +1,234 @@
+# nano-e2e: throwaway scenario stack overlay (NAN-4920)
+#
+# Overlay on docker-compose.opensource.yml (the shipped single-host template),
+# so the e2e stack is the stack customers run. Never use this file by hand:
+# scripts/e2e.sh passes both -f files, the project name (nanoe2e-<runid>) and
+# the per-run environment (generated secrets, run dir, start epoch).
+#
+# Isolation rules (all enforced here, see scripts/e2e.sh for the rest):
+#   * every container is named ${E2E_PROJECT}-<svc>; E2E_PROJECT is required
+#     (`:?`), so a bare `docker compose` cannot fall back to nano-* names;
+#   * every published port binds 127.0.0.1 only, on a free host port the
+#     runner picks per run (E2E_*_PORT). Not compose's ephemeral `::<port>`:
+#     that re-rolls the host port on every container restart, and scenarios
+#     restart Vector mid-stream;
+#   * no named volume is shared with another project (compose prefixes them
+#     with the project), and config/state the stack writes lives in the run
+#     dir (${E2E_RUN_DIR}), not in the checkout;
+#   * every container carries nano.e2e.* labels, which `scripts/e2e.sh gc`
+#     uses to find stale stacks it owns (nano.e2e.owner = the checkout). Nothing here can match nanoch-*.
+#
+# App modes: in `native` mode (macOS default) the app runs as host processes
+# and only the infra services below start. In `docker` mode (Linux default)
+# the docker-app profile adds migrator/api/search/jobs built from this tree.
+
+x-e2e-labels: &e2e-labels
+  nano.e2e.project: ${E2E_PROJECT:?E2E_PROJECT must be set (use scripts/e2e.sh)}
+  nano.e2e.started: ${E2E_STARTED:?E2E_STARTED must be set (use scripts/e2e.sh)}
+  # The checkout that started the stack: `gc` only removes its own (NAN-4937).
+  nano.e2e.owner: ${E2E_OWNER:-}
+
+services:
+  postgres:
+    container_name: ${E2E_PROJECT}-postgres
+    labels: *e2e-labels
+    restart: "no"
+    ports: !override
+      - "127.0.0.1:${E2E_PG_PORT:?}:5432"
+
+  clickhouse-preflight:
+    container_name: ${E2E_PROJECT}-clickhouse-preflight
+    labels: *e2e-labels
+    volumes: !override
+      # A per-run copy: the preflight rewrites storage files in place, and the
+      # checkout must stay untouched.
+      - ${E2E_RUN_DIR:?E2E_RUN_DIR must be set}/clickhouse/config.d:/config.d
+      - ./clickhouse/preflight:/preflight:ro
+
+  clickhouse:
+    container_name: ${E2E_PROJECT}-clickhouse
+    labels: *e2e-labels
+    restart: "no"
+    ports: !override
+      - "127.0.0.1:${E2E_CH_HTTP_PORT:?}:8123"
+      - "127.0.0.1:${E2E_CH_NATIVE_PORT:?}:9000"
+    volumes: !override
+      - nano-clickhouse-data:/var/lib/clickhouse
+      - nano-clickhouse-logs:/var/log/clickhouse-server
+      - ${E2E_RUN_DIR}/clickhouse/config.d:/etc/clickhouse-server/config.d:ro
+      - ${E2E_RUN_DIR}/clickhouse/users.d:/etc/clickhouse-server/users.d:ro
+    deploy:
+      resources:
+        limits:
+          memory: ${CLICKHOUSE_MEM_LIMIT:-4G}
+
+  dragonfly:
+    container_name: ${E2E_PROJECT}-dragonfly
+    labels: *e2e-labels
+    restart: "no"
+    ports: !override
+      - "127.0.0.1:${E2E_REDIS_PORT:?}:6379"
+
+  # Deterministic provider-boundary fake used only by the persona suite.  It
+  # receives the same OpenAI-compatible requests an on-prem provider would.
+  ai-stub:
+    profiles: ["ai-stub"]
+    image: python:3.12-alpine@sha256:e6dae589c1c05976188fd3bd019afd091445fc533ed2ea29001beddc7368a9c8
+    container_name: ${E2E_PROJECT}-ai-stub
+    labels: *e2e-labels
+    restart: "no"
+    command: ["python", "-I", "/stub/ai_stub.py", "--host", "0.0.0.0", "--port", "8080", "--journal", "/artifacts/ai-stub.jsonl"]
+    volumes:
+      - ./e2e/nano_e2e/ai_stub.py:/stub/ai_stub.py:ro
+      - ${E2E_RUN_DIR}/artifacts:/artifacts
+    ports:
+      - "127.0.0.1:${E2E_AI_STUB_PORT:?}:8080"
+
+  # Real TLS SMTP sink for the enterprise SOAR closeout lane. The leaf and
+  # private CA are generated inside this owned run directory and removed at
+  # teardown; no listener is published off loopback.
+  soar-mailpit:
+    profiles: ["soar-lab"]
+    image: axllent/mailpit:v1.27@sha256:e22dce5b36f93c77082e204a3942fb6b283b7896e057458400a4c88344c3df68
+    container_name: ${E2E_PROJECT}-soar-mailpit
+    labels: *e2e-labels
+    restart: "no"
+    command:
+      - --smtp-tls-cert
+      - /certs/cert.pem
+      - --smtp-tls-key
+      - /certs/key.pem
+      - --smtp-require-starttls
+    volumes:
+      - ${E2E_RUN_DIR}/soar-lab:/certs:ro
+    ports:
+      - "127.0.0.1:${E2E_SOAR_SMTP_PORT:?}:1025"
+      - "127.0.0.1:${E2E_SOAR_MAILPIT_API_PORT:?}:8025"
+
+  vector-netns:
+    container_name: ${E2E_PROJECT}-vector-netns
+    labels: *e2e-labels
+    restart: "no"
+    ports: !override
+      - "127.0.0.1:${E2E_VECTOR_HTTP_PORT:?}:8080"
+      - "127.0.0.1:${E2E_HEC_PORT:?}:8088"
+      - "127.0.0.1:${E2E_OTLP_HTTP_PORT:?}:4318"
+      - "127.0.0.1:${E2E_VECTOR_METRICS_PORT:?}:9598"
+
+  vector:
+    container_name: ${E2E_PROJECT}-vector
+    labels: *e2e-labels
+    restart: "no"
+    # The runner starts Vector after the migrator (native or docker), so the
+    # base template's dependency on clickhouse-migrate is dropped.
+    depends_on: !override
+      vector-netns:
+        condition: service_started
+      clickhouse:
+        condition: service_healthy
+    environment:
+      # Small batches: scenarios assert on single events within seconds.
+      VECTOR_BATCH_TIMEOUT_SECS: "1"
+    volumes: !override
+      - ./config/vector:/etc/vector:ro
+      # The api (native or container) writes parser/source configs and the
+      # hashed ingest tokens file here; bind-mounted so artifacts can capture
+      # the rendered config.
+      - ${E2E_RUN_DIR}/vector-dynamic:/etc/vector/dynamic
+      - nano-vector-data:/var/lib/vector
+      # NAN-4936: source-isolation requests (the api writes, the responder in
+      # this container answers).
+      - ${E2E_RUN_DIR}/vector-validation:/var/lib/nano-validation
+
+  # ---- docker app mode only -------------------------------------------------
+  clickhouse-migrate:
+    profiles: ["docker-app"]
+    container_name: ${E2E_PROJECT}-clickhouse-migrate
+    labels: *e2e-labels
+    image: ${E2E_IMAGE_API:-${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-api:${NANO_VERSION:?NANO_VERSION is required}}
+
+  nano-api:
+    profiles: ["docker-app"]
+    container_name: ${E2E_PROJECT}-api
+    labels: *e2e-labels
+    restart: "no"
+    image: ${E2E_IMAGE_API:-${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-api:${NANO_VERSION:?NANO_VERSION is required}}
+    environment:
+      VECTOR_CONTAINER_NAME: ${E2E_PROJECT}-vector
+      NANOSIEM_DEV_MODE: "true"
+      NANO_TIER: unrestricted
+      DEPLOYMENT_MODE: selfhosted
+      NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS: "${E2E_ALLOW_PRIVATE_AI_ENDPOINTS:-false}"
+      SEARCH_SERVICE_URL: http://nano-search:3002/health
+    ports:
+      - "127.0.0.1:${E2E_API_PORT:?}:3000"
+    volumes: !override
+      - nano-api-data:/app/data
+      - ${E2E_RUN_DIR}/vector-dynamic:/etc/vector/dynamic
+      - ${E2E_RUN_DIR}/vector-dynamic:/app/config/vector
+      - ${E2E_RUN_DIR}/vector-validation:/app/vector-validation
+
+  nano-jobs:
+    profiles: ["docker-app"]
+    container_name: ${E2E_PROJECT}-jobs
+    labels: *e2e-labels
+    restart: "no"
+    image: ${E2E_IMAGE_JOBS:-${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-jobs:${NANO_VERSION:?NANO_VERSION is required}}
+    environment:
+      VECTOR_CONTAINER_NAME: ${E2E_PROJECT}-vector
+      VECTOR_INGEST_URL: http://vector:8080/
+      VECTOR_ENRICH_URL: http://vector:8090/
+      VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN}
+      NANOSIEM_DEV_MODE: "true"
+      NANO_TIER: unrestricted
+      DEPLOYMENT_MODE: selfhosted
+      # NAN-2042: the jobs listener binds container loopback by default, which
+      # the published port below cannot reach (the runner's health wait and
+      # test_base hit it from the host). The host side is still 127.0.0.1 only.
+      JOBS_BIND_ADDR: "0.0.0.0"
+    ports:
+      - "127.0.0.1:${E2E_JOBS_PORT:?}:3003"
+    volumes: !override
+      - nano-api-data:/app/data
+      - ${E2E_RUN_DIR}/vector-dynamic:/etc/vector/dynamic
+      - ${E2E_RUN_DIR}/vector-dynamic:/app/config/vector
+
+  nano-search:
+    profiles: ["docker-app"]
+    container_name: ${E2E_PROJECT}-search
+    labels: *e2e-labels
+    restart: "no"
+    image: ${E2E_IMAGE_SEARCH:-${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-search:${NANO_VERSION:?NANO_VERSION is required}}
+    environment:
+      NANOSIEM_DEV_MODE: "true"
+    ports:
+      - "127.0.0.1:${E2E_SEARCH_PORT:?}:3002"
+
+  # The shipped nginx is replaced by `edge` below (same config, upstreams
+  # rewritten for the e2e stack), so the base service stays off.
+  nano-web:
+    profiles: ["never"]
+  nginx:
+    profiles: ["never"]
+
+  # NAN-4937: the customer-facing edge for the UI suite. Its nginx.conf is
+  # rendered by scripts/e2e.sh from config/nginx/nginx.opensource.conf with
+  # only the upstreams rewritten (native app: host.docker.internal:<port>) and
+  # the SPA served from the run dir (`run ui` fills ${E2E_RUN_DIR}/edge/web).
+  # The browser, the Add-source snippets and the OTel Collector all go
+  # through it: /api, /api/search, /ingest (Vector HTTP), /otlp (auth_request
+  # to nano-api, then Vector :4318).
+  edge:
+    image: nginx:alpine@sha256:8b1e78743a03dbb2c95171cc58639fef29abc8816598e27fb910ed2e621e589a
+    container_name: ${E2E_PROJECT}-edge
+    labels: *e2e-labels
+    restart: "no"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${E2E_RUN_DIR}/edge/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${E2E_RUN_DIR}/edge/web:/srv/web:ro
+    ports:
+      - "127.0.0.1:${E2E_EDGE_PORT:?}:80"
+  tenzir:
+    profiles: ["never"]

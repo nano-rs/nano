@@ -4,11 +4,11 @@
 
 use uuid::Uuid;
 
-use crate::mitre::mapping::{
-    canonicalize_mitre_mappings, canonicalize_tactic_ids, canonicalize_technique_ids,
-};
 use crate::models::{
     AlertMode, DetectionMode, DetectionRule, NewDetectionRule, RuleMode, UpdateDetectionRule,
+};
+use crate::mitre::mapping::{
+    canonicalize_mitre_mappings, canonicalize_tactic_ids, canonicalize_technique_ids,
 };
 
 use super::types::{DetectionRuleRepository, DetectionRuleRepositoryError};
@@ -19,44 +19,19 @@ impl DetectionRuleRepository {
         &self,
         rule: &NewDetectionRule,
     ) -> Result<DetectionRule, DetectionRuleRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        let result = Self::create_in_transaction_impl(&mut transaction, None, rule).await?;
-        transaction.commit().await?;
-        Ok(result)
-    }
-
-    /// Persist canonical rule fields in a caller-owned transaction.
-    ///
-    /// Shared callers must install a signed tenant context and revalidate
-    /// authority before calling this primitive. They can then write source
-    /// assignments, the schedule and audit before committing the same
-    /// transaction. This method performs no authorization or commit itself.
-    pub async fn create_in_transaction(
-        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        tenant: &crate::auth::TrustedTenantContext,
-        rule: &NewDetectionRule,
-    ) -> Result<DetectionRule, DetectionRuleRepositoryError> {
-        Self::create_in_transaction_impl(transaction, Some(tenant.tenant_id), rule).await
-    }
-
-    async fn create_in_transaction_impl(
-        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        tenant_id: Option<Uuid>,
-        rule: &NewDetectionRule,
-    ) -> Result<DetectionRule, DetectionRuleRepositoryError> {
         let mappings = canonicalize_mitre_mappings(
             rule.mitre_tactics.as_deref().unwrap_or_default(),
             rule.mitre_techniques.as_deref().unwrap_or_default(),
         )
         .map_err(|error| DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string()))?;
-        let tenant_column = if tenant_id.is_some() { "tenant_id, " } else { "" };
-        let tenant_value = if tenant_id.is_some() { "$34, " } else { "" };
-        let statement = format!(r#"
-            INSERT INTO detection_rules ({tenant_column}name, description, query, severity, mitre_tactics, mitre_techniques, schedule_cron, mode, narrative, reference_url, author, tags, ai_generated, realtime_enabled, risk_score, risk_entity_field, risk_modifiers, detection_mode, lookback_minutes, auto_tuning_enabled, auto_tuning_min_confidence, auto_tuning_critical, ai_triage_hints, folder, case_visibility, alert_mode, case_assigned_group, playbook_selector_mode, playbook_id, dataset, source_path, source_repo_url, alert_cooldown_minutes)
-            VALUES ({tenant_value}$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)
+        let initial_mode = rule.mode.unwrap_or(RuleMode::Staging);
+        let result = sqlx::query_as::<_, DetectionRule>(
+            r#"
+            INSERT INTO detection_rules (name, description, query, severity, mitre_tactics, mitre_techniques, schedule_cron, mode, narrative, reference_url, author, tags, ai_generated, realtime_enabled, risk_score, risk_entity_field, risk_modifiers, detection_mode, lookback_minutes, auto_tuning_enabled, auto_tuning_min_confidence, auto_tuning_critical, ai_triage_hints, folder, case_visibility, alert_mode, case_assigned_group, playbook_selector_mode, playbook_id, dataset, source_path, source_repo_url, alert_cooldown_minutes, paused_from_mode)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34)
             RETURNING *
-            "#);
-        let query = sqlx::query_as::<_, DetectionRule>(&statement)
+            "#,
+        )
         .bind(&rule.name)
         .bind(&rule.description)
         .bind(&rule.query)
@@ -64,16 +39,16 @@ impl DetectionRuleRepository {
         .bind(&mappings.tactics)
         .bind(&mappings.techniques)
         .bind(&rule.schedule_cron)
-        .bind(rule.mode.unwrap_or(RuleMode::Staging))
+        .bind(initial_mode)
         .bind(&rule.narrative)
         .bind(&rule.reference_url)
         .bind(&rule.author)
-        .bind(rule.tags.as_deref().unwrap_or(&[]))
+        .bind(rule.tags.as_ref().unwrap_or(&vec![]))
         .bind(rule.ai_generated.unwrap_or(false))
         .bind(rule.realtime_enabled.unwrap_or(false))
         .bind(&rule.risk_score)
         .bind(&rule.risk_entity_field)
-        .bind(sqlx::types::Json(rule.risk_modifiers.as_deref().unwrap_or(&[])))
+        .bind(sqlx::types::Json(rule.risk_modifiers.as_ref().unwrap_or(&vec![])))
         // detection_mode is NOT NULL with a DB default of 'scheduled'; binding the
         // raw Option would send an explicit NULL (overriding the default) and 500 on
         // a create that omits it. Default it here like alert_mode/realtime_enabled (NAN-1665).
@@ -95,27 +70,29 @@ impl DetectionRuleRepository {
         .bind(&rule.source_path)
         .bind(&rule.source_repo_url)
         // NAN-1805: per-(rule, entity) alert cooldown; NULL/0 = off.
-        .bind(&rule.alert_cooldown_minutes);
-        let query = if let Some(tenant_id) = tenant_id { query.bind(tenant_id) } else { query };
-        let result = query.fetch_one(&mut **transaction)
+        .bind(&rule.alert_cooldown_minutes)
+        // A directly-created paused rule has no observable source mode. Keep
+        // the historical resume-to-alerting behavior for that compatibility
+        // case while all real pause transitions persist their exact origin.
+        .bind((initial_mode == RuleMode::Paused).then_some("alerting"))
+        .fetch_one(&self.pool)
         .await
         .map_err(map_rule_write_error)?;
 
-        // If case_visibility is 'group', add the group associations (batch insert).
-        // `detection_rule_case_groups` belongs to Cases and exists only under
-        // the enterprise overlay (NAN-3463).
-        #[cfg(feature = "enterprise")]
+        // If case_visibility is 'group', add the group associations (batch insert)
         if rule.case_visibility.as_deref() == Some("group") {
             if let Some(ref group_ids) = rule.case_group_ids {
                 if !group_ids.is_empty() {
-                    let statement = if tenant_id.is_some() {
-                        "INSERT INTO detection_rule_case_groups (tenant_id,rule_id,group_id) SELECT $3,$1,unnest($2::uuid[]) ON CONFLICT DO NOTHING"
-                    } else {
-                        "INSERT INTO detection_rule_case_groups (rule_id,group_id) SELECT $1,unnest($2::uuid[]) ON CONFLICT DO NOTHING"
-                    };
-                    let query = sqlx::query(statement).bind(result.id).bind(group_ids);
-                    let query = if let Some(tenant_id) = tenant_id { query.bind(tenant_id) } else { query };
-                    query.execute(&mut **transaction)
+                    sqlx::query(
+                        r#"
+                        INSERT INTO detection_rule_case_groups (rule_id, group_id)
+                        SELECT $1, unnest($2::uuid[])
+                        ON CONFLICT DO NOTHING
+                        "#,
+                    )
+                    .bind(result.id)
+                    .bind(group_ids)
+                    .execute(&self.pool)
                     .await?;
                 }
             }
@@ -154,17 +131,13 @@ impl DetectionRuleRepository {
             .as_deref()
             .map(canonicalize_tactic_ids)
             .transpose()
-            .map_err(|error| {
-                DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string())
-            })?;
+            .map_err(|error| DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string()))?;
         let canonical_techniques = update
             .mitre_techniques
             .as_deref()
             .map(canonicalize_technique_ids)
             .transpose()
-            .map_err(|error| {
-                DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string())
-            })?;
+            .map_err(|error| DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string()))?;
 
         // First fetch the rule to get its current updated_at for optimistic locking
         let existing = self.find_by_id(id).await?;
@@ -181,6 +154,11 @@ impl DetectionRuleRepository {
                 mitre_tactics = COALESCE($6, mitre_tactics),
                 mitre_techniques = COALESCE($7, mitre_techniques),
                 schedule_cron = COALESCE($8, schedule_cron),
+                paused_from_mode = CASE
+                    WHEN $9 = 'paused' AND mode IN ('staging', 'live', 'alerting') THEN mode
+                    WHEN $9 IS NOT NULL AND $9 <> 'paused' THEN NULL
+                    ELSE paused_from_mode
+                END,
                 mode = COALESCE($9, mode),
                 narrative = COALESCE($10, narrative),
                 reference_url = COALESCE($11, reference_url),
@@ -271,11 +249,7 @@ impl DetectionRuleRepository {
         .ok_or(DetectionRuleRepositoryError::ConcurrentModification(id))?;
 
         // If case_group_ids is provided, update the group associations atomically
-        // Uses a CTE to delete and insert in a single atomic operation (race-condition safe).
-        // NAN-3463: Cases-only table, absent from the open schema. The rule
-        // editor sends `case_group_ids: []` on every save, so in the open
-        // edition this DELETE turned every rule save into a 500.
-        #[cfg(feature = "enterprise")]
+        // Uses a CTE to delete and insert in a single atomic operation (race-condition safe)
         if let Some(ref group_ids) = update.case_group_ids {
             let visibility = update
                 .case_visibility
@@ -328,6 +302,7 @@ impl DetectionRuleRepository {
             UPDATE detection_rules
             SET archived = TRUE,
                 mode = 'staging',
+                paused_from_mode = NULL,
                 next_run_at = NULL,
                 updated_at = NOW()
             WHERE id = $1

@@ -11,6 +11,8 @@ const EXECUTION_STAGE_LABELS: Record<string, string> = {
   bronze_ingest: 'Built in · at ingest',
   agent_on_demand: 'On demand · pivt',
   tenant_scheduled_publication: 'Scheduled refresh',
+  identity_directory_sync: 'Directory sync',
+  scheduled_pull: 'Scheduled pull',
 };
 
 export function executionStageLabel(stage: string | null | undefined): string {
@@ -26,7 +28,7 @@ export function collectorDeliveryLabel(entry: { slug: string; name: string; orig
   return `Pull · ${named(entry.origin) || named(entry.name) || 'vendor API'}`;
 }
 
-/** Hosted feed ingest-credential state (`credential`). */
+/** Ingest-credential state of a pull feed (`credential`). */
 const FEED_CREDENTIAL_LABELS: Record<string, string> = {
   ready: 'ready',
   pending: 'pending',
@@ -50,7 +52,7 @@ export function rolloutStateLabel(state: string | null | undefined): string {
   return state ? own(ROLLOUT_STATE_LABELS, state) ?? humanizeEnum(state) : 'pending';
 }
 
-/** Last run status of a hosted feed (`last_status`). */
+/** Last run status of a pull feed (`last_status`). */
 export function feedRunStatusLabel(status: string | null | undefined): string {
   return status ? humanizeEnum(status) : 'pending';
 }

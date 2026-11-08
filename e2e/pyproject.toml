@@ -1,0 +1,65 @@
+# nano-e2e: black-box scenario tests for the nano ClickHouse product (NAN-4920).
+#
+# Test code only: it drives a throwaway stack over HTTP (and real cloud
+# test resources for pull scenarios). No product code lives here. Run it via
+# scripts/e2e.sh, which builds the stack and the pinned venv (e2e/.venv).
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-e2e"
+version = "0.1.0"
+description = "nano end-to-end scenario harness (black-box, pytest)"
+requires-python = ">=3.11"
+# Exact versions (and every transitive dependency) are pinned in
+# requirements.lock; these ranges only document what the harness needs.
+dependencies = [
+    "pytest>=9.0,<10",
+    "pytest-timeout>=2.4,<3",
+    "httpx>=0.28,<0.29",
+    "boto3>=1.40,<2",
+    "google-auth>=2.40,<3",
+    "requests>=2.32,<3",
+    # selftest: the vendor mock's routes are checked against nano-connector/specs.
+    "PyYAML>=6.0,<7",
+    "cryptography>=44",
+]
+
+[project.optional-dependencies]
+dev = ["ruff", "pyright"]
+
+[tool.setuptools.packages.find]
+include = ["nano_e2e*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers -p no:cacheprovider"
+timeout = 900
+markers = [
+    "enterprise: needs the enterprise edition (dropped from the open-core mirror; skipped on EDITION=open)",
+    "cloud: hits a real cloud provider (AWS/GCP/Azure); skipped without credentials",
+    "slow: takes more than a minute",
+    "config_type(name, where=...): pull scenario needs this source-config type; SKIPs when the build lacks it",
+    "ui: drives the real web UI in a browser (puppeteer-core driver)",
+    "mock_vendor: needs the mock-vendor profile (connector runner + vendor mock)",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "PT"]
+ignore = ["S101", "S603", "S607", "PT018"]
+
+[tool.ruff.lint.per-file-ignores]
+# Selftests use obviously fake credentials as fixtures.
+"selftest/*" = ["S105", "S106"]
+
+[tool.pyright]
+include = ["nano_e2e", "tests", "selftest"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"

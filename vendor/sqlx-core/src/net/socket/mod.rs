@@ -198,6 +198,23 @@ pub async fn connect_tcp<Ws: WithSocket>(
 
         let stream = TcpStream::connect((host, port)).await?;
         stream.set_nodelay(true)?;
+        // nano NAN-4949 (ported to clickhouse/dev by NAN-4955): opt-in
+        // client-side TCP keepalive. Off unless NANO_SQLX_TCP_KEEPALIVE_SECS is
+        // set, so no other service changes. The platform feed publisher's GKE
+        // Deployment sets it to protect its leader session.
+        if let Some(secs) = std::env::var("NANO_SQLX_TCP_KEEPALIVE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+        {
+            let time = std::time::Duration::from_secs(secs);
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(time)
+                .with_interval(std::time::Duration::from_secs(10));
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let keepalive = keepalive.with_retries(3);
+            socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive)?;
+        }
 
         return Ok(with_socket.with_socket(stream).await);
     }

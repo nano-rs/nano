@@ -1,5 +1,11 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+use std::path::Path;
+
 fn main() {
-    // sqlx::migrate! embeds files known at expansion time. Track directories too
-    // so adding an additive migration cannot leave a stale migrator binary.
-    println!("cargo:rerun-if-changed=../migrations/postgres");
+    // The enterprise API and one-shot migrator both embed this overlay.
+    // It is intentionally absent from the stripped open-core mirror.
+    if Path::new("../migrations/postgres-enterprise").is_dir() {
+        println!("cargo:rerun-if-changed=../migrations/postgres-enterprise");
+    }
 }

@@ -10,6 +10,7 @@
 
 mod detection;
 mod distributed;
+mod ocsf_legacy_drop;
 mod runner;
 mod sql_transform;
 mod tracking;
@@ -17,5 +18,11 @@ mod types;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod soft_fail_tests;
 
+pub(crate) use detection::configured_or_detected_cluster;
+pub use ocsf_legacy_drop::{
+    LegacyDayCheck, LegacyDayStatus, OcsfLegacyDropOutcome, OcsfLegacyDropPlan, OCSF_LEGACY_TABLE,
+};
 pub use types::{ClickHouseMigrateError, ClickHouseMigrator, Migration};

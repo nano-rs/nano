@@ -2,9 +2,10 @@
 
 // @vitest-environment jsdom
 /**
- * NAN-3770: open-core named ingest tokens on Ingestion → Credentials.
- * NAN-3806: every token is bound to one source; unbound tokens are refused
- * until an admin binds them; per-source snippets and the Vector aggregator.
+ * NAN-4907 (ported from main's NAN-3770 / NAN-3806 tests): named ingest tokens
+ * on Log Sources → Credentials (NAN-4922; formerly Ingestion → Ingest tokens). Every token is bound to one source; unbound
+ * tokens are refused until an admin binds them; rotate shows the new value
+ * once; the install token's deprecated legacy multiplex mode is flagged.
  */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
@@ -17,6 +18,8 @@ const calls = vi.hoisted(() => ({
   create: vi.fn(),
   bind: vi.fn(),
   revoke: vi.fn(),
+  rotate: vi.fn(),
+  setInstallTokenStrict: vi.fn(),
   setInstallTokenEnabled: vi.fn(),
   bindInstallToken: vi.fn(),
 }));
@@ -28,7 +31,6 @@ beforeEach(() => {
   Element.prototype.scrollIntoView ??= () => {};
 });
 
-vi.mock('@/hooks/use-shared-tenant', () => ({ useSharedTenant: () => false }));
 vi.mock('@/contexts/AuthContext', () => ({
   useAuth: () => ({
     user: { id: 'u' },
@@ -38,15 +40,12 @@ vi.mock('@/contexts/AuthContext', () => ({
 vi.mock('@/hooks/use-toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
 vi.mock('@/lib/api', () => ({
   api: {
-    listIngestCredentials: () => Promise.reject(new Error('hosted only')),
-    getIngestEndpoint: () => Promise.reject(new Error('hosted only')),
     ingestTokens: calls,
-    landingSources: { list: () => Promise.resolve({ sources: [] }), files: () => Promise.resolve({ files: [] }) },
+    getIngestEndpoint: () => Promise.reject(new Error('not under test')),
   },
 }));
 
 import { IngestCredentials } from '@/pages/IngestCredentials';
-import { CapabilitiesContext, type CapabilitiesContextValue } from '@/hooks/use-capabilities';
 
 const APACHE = {
   source_id: '5a0c0000-0000-4000-8000-0000000000a1',
@@ -114,6 +113,8 @@ beforeEach(() => {
     install_token: {
       name: 'Install token (legacy)',
       enabled: true,
+      mode: 'strict',
+      deprecated: false,
       state: 'active',
       source_id: APACHE.source_id,
       source_name: APACHE.name,
@@ -128,6 +129,12 @@ beforeEach(() => {
   calls.revoke.mockResolvedValue({ ...ACTIVE, state: 'revoked' });
   calls.bind.mockResolvedValue({ ...UNBOUND, state: 'active', source_id: FIREWALL.source_id, route_key: 'pan_traffic' });
   calls.bindInstallToken.mockResolvedValue({ name: 'Install token (legacy)', enabled: true, state: 'active' });
+  calls.rotate.mockResolvedValue({
+    credential: { ...ACTIVE, credential_id: '0b8f6a52-6f1e-4c55-9a3e-2f1d7c9b1a09', rotated_from: ACTIVE.credential_id },
+    token: 'nit_ROTATEDrotatedROTATEDrotatedROTATED12',
+    replaced: { ...ACTIVE, state: 'revoked' },
+  });
+  calls.setInstallTokenStrict.mockResolvedValue({ name: 'Install token (legacy)', enabled: true, state: 'unbound' });
   calls.setInstallTokenEnabled.mockResolvedValue({ name: 'Install token (legacy)', enabled: false });
 });
 
@@ -153,8 +160,10 @@ it('lists named tokens by prefix and the install token as legacy, never a value'
   // Only the active row can be revoked.
   expect(within(rows[0]).getByRole('button', { name: 'Revoke' })).toBeTruthy();
   expect(within(rows[1]).queryByRole('button', { name: 'Revoke' })).toBeNull();
-  // Hosted-only controls are absent on open core.
-  expect(screen.queryByRole('button', { name: /Add data/ })).toBeNull();
+  // Only the active row can be rotated.
+  expect(within(rows[0]).getByRole('button', { name: 'Rotate' })).toBeTruthy();
+  expect(within(rows[1]).queryByRole('button', { name: 'Rotate' })).toBeNull();
+  expect(screen.queryByTestId('legacy-multiplex-alert')).toBeNull();
 });
 
 /** Opens a shared (Radix) Select by its label and picks an option. */
@@ -187,6 +196,8 @@ it('shows per-source snippets and a Vector aggregator with one sink and token pe
   const hec = within(section).getByTestId('snippet-hec').textContent ?? '';
   expect(hec).toContain(':8088/services/collector/event');
   expect(hec).toContain('Authorization: Splunk $NANO_TOKEN_APACHE_ACCESS');
+  // The HEC listener has acknowledgements on: a request without a channel is refused (code 10).
+  expect(hec).toContain('X-Splunk-Request-Channel:');
   // The token decides the source: no snippet declares a sourcetype.
   expect(hec).not.toContain('"sourcetype"');
   const http = within(section).getByTestId('snippet-http').textContent ?? '';
@@ -198,7 +209,7 @@ it('shows per-source snippets and a Vector aggregator with one sink and token pe
   expect(vector).toContain('default_token = "${NANO_TOKEN_PAN_TRAFFIC}"');
   expect(vector).not.toMatch(/^\s*sourcetype\s*=/m);
   // User-facing text says HEC, never the vendor name (the sink type is a wire literal).
-  expect(section.textContent?.replace(/splunk_hec_logs|Authorization: Splunk/g, '')).not.toMatch(/splunk/i);
+  expect(section.textContent?.replace(/splunk_hec_logs|Authorization: Splunk|X-Splunk-Request-Channel/g, '')).not.toMatch(/splunk/i);
   // Admins can issue a token for the picked source straight from here.
   fireEvent.click(within(section).getByRole('button', { name: /Token for apache_access/ }));
   const dialog = await screen.findByTestId('issue-ingest-token-dialog');
@@ -252,7 +263,7 @@ it('hides create, revoke and install toggles from non-admins', async () => {
 it('flags unbound tokens as refused and binds them to a source', async () => {
   calls.list.mockResolvedValue({
     tokens: [UNBOUND, ACTIVE],
-    install_token: { name: 'Install token (legacy)', enabled: true, state: 'unbound' },
+    install_token: { name: 'Install token (legacy)', enabled: true, mode: 'strict', deprecated: false, state: 'unbound' },
     sources: [APACHE, FIREWALL],
   });
   renderPage();
@@ -280,23 +291,67 @@ it('flags unbound tokens as refused and binds them to a source', async () => {
   await waitFor(() => expect(calls.bindInstallToken).toHaveBeenCalledWith(APACHE.source_id));
 });
 
-it('NAN-3844: a Tenzir-only install shows the bucket drop and a note instead of tokens', async () => {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(
-    <QueryClientProvider client={client}>
-      <CapabilitiesContext.Provider
-        value={{ edition: 'open', version: 'test', ingestMode: 'tenzir_only', capabilities: {} as CapabilitiesContextValue['capabilities'] }}
-      >
-        <MemoryRouter>
-          <IngestCredentials />
-        </MemoryRouter>
-      </CapabilitiesContext.Provider>
-    </QueryClientProvider>,
+it('rotates after confirmation and shows the new value once', async () => {
+  renderPage();
+  const rows = await screen.findAllByTestId('ingest-token-row');
+  fireEvent.click(within(rows[0]).getByRole('button', { name: 'Rotate' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Rotate' }));
+  await waitFor(() => expect(calls.rotate).toHaveBeenCalledWith(ACTIVE.credential_id));
+  expect((await screen.findByTestId('rotated-ingest-token')).textContent).toBe(
+    'nit_ROTATEDrotatedROTATEDrotatedROTATED12',
   );
-  expect(await screen.findByTestId('landing-sources-panel')).toBeTruthy();
-  expect(within(screen.getByTestId('ingest-tokens-disabled')).getByTestId('tenzir-only-note').textContent).toBe(
-    'This install ingests via Tenzir; re-run install.sh --add-vector to enable',
-  );
-  expect(screen.queryByText('lab-steady-blaster')).toBeNull();
-  expect(calls.list).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+  await waitFor(() => expect(screen.queryByTestId('rotated-ingest-token')).toBeNull());
+  expect(document.body.textContent).not.toContain('nit_ROTATED');
+});
+
+it('flags the deprecated legacy multiplex install token and can end it', async () => {
+  calls.list.mockResolvedValue({
+    tokens: [ACTIVE],
+    install_token: {
+      name: 'Install token (legacy)',
+      enabled: true,
+      mode: 'legacy_multiplex',
+      deprecated: true,
+      state: 'legacy_multiplex',
+    },
+    sources: [APACHE, FIREWALL],
+  });
+  renderPage();
+  const alert = await screen.findByTestId('legacy-multiplex-alert');
+  expect(alert.textContent).toContain('Deprecated');
+  expect(alert.textContent).toContain('X-Source-Type');
+  expect(within(screen.getByTestId('install-token-row')).getByText('X-Source-Type (multiplex)')).toBeTruthy();
+  // Legacy multiplex is not "unbound": it is accepted, so no 401 alert.
+  expect(screen.queryByTestId('unbound-tokens-alert')).toBeNull();
+  fireEvent.click(within(alert).getByRole('button', { name: 'Stop multiplexing' }));
+  const confirms = await screen.findAllByRole('button', { name: 'Stop multiplexing' });
+  fireEvent.click(confirms[confirms.length - 1]);
+  await waitFor(() => expect(calls.setInstallTokenStrict).toHaveBeenCalled());
+});
+
+it('refuses to offer token issuing when delivery to Vector is not configured', async () => {
+  calls.list.mockResolvedValue({
+    tokens: [ACTIVE],
+    install_token: { name: 'Install token (legacy)', enabled: true, mode: 'strict', deprecated: false, state: 'unbound' },
+    sources: [APACHE],
+    delivery: 'none',
+  });
+  renderPage();
+  const alert = await screen.findByTestId('token-delivery-alert');
+  expect(alert.textContent).toContain('NANO_INGEST_TOKENS_DELIVERY');
+  expect(screen.queryByRole('button', { name: /New token/ })).toBeNull();
+});
+
+it('discards the rotated value from mutation state when the dialog closes', async () => {
+  renderPage();
+  const rows = await screen.findAllByTestId('ingest-token-row');
+  fireEvent.click(within(rows[0]).getByRole('button', { name: 'Rotate' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Rotate' }));
+  await screen.findByTestId('rotated-ingest-token');
+  fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+  await waitFor(() => expect(screen.queryByTestId('rotated-ingest-token')).toBeNull());
+  // Re-opening the confirm never resurfaces the previous value.
+  fireEvent.click(within(screen.getAllByTestId('ingest-token-row')[0]).getByRole('button', { name: 'Rotate' }));
+  expect(document.body.textContent).not.toContain('nit_ROTATED');
 });

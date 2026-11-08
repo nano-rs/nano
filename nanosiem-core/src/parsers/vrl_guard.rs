@@ -17,8 +17,13 @@
 //! 2. a cheap, lexer-aware scan ([`nesting_depth`]) that bounds how deep the
 //!    program's syntax tree can be, capped at [`MAX_VRL_NESTING_DEPTH`]. It
 //!    skips strings, single-quoted literals and comments, and counts bracket
-//!    levels plus every operator, `else`, path segment, call and index on the
-//!    current expression chain — each of which adds one level to the tree;
+//!    levels plus every operator, prefix keyword (`return`, `abort`), `else`,
+//!    path segment, call and index on the current expression chain — each of
+//!    which adds one level to the tree. The productions it models are the
+//!    complete recursive grammar of VRL 0.38: brackets (groups, arrays,
+//!    objects, blocks, call arguments, closures), `if`/`else`, the unary and
+//!    binary operators, assignment, `return` / `abort`, and query postfixes
+//!    (`.field`, `[index]`, `(args)`, `!(`); everything else is a leaf;
 //! 3. a type-check work budget ([`MAX_VRL_TYPE_WORK`]). The compiler
 //!    re-derives an argument's type once per enclosing function call level,
 //!    so its time doubles with every nested call: 22 nested `to_string!(…)`
@@ -152,13 +157,44 @@ pub fn check(source: &str) -> Result<(), VrlGuardError> {
 /// large-stack thread. The only sanctioned way to compile VRL that a tenant
 /// (or an AI acting for one) can influence.
 pub fn compile(source: &str, fns: &[Box<dyn Function>]) -> Result<Compiled, VrlCompileError> {
+    compile_inner(source, fns, false)
+}
+
+/// [`compile`] with Vector event METADATA (`%…`) read-only: any assignment
+/// to a metadata path — single or two-target (`%x, err = …`) — and any
+/// `del(%x)` is a compile error (VRL's own read-only-path check, so every
+/// spelling is covered, not a source-text pattern). Nano Pipe programs
+/// compile this way: the input identity and routing key they may read are
+/// platform-stamped (NAN-4919).
+pub fn compile_metadata_read_only(
+    source: &str,
+    fns: &[Box<dyn Function>],
+) -> Result<Compiled, VrlCompileError> {
+    compile_inner(source, fns, true)
+}
+
+fn compile_inner(
+    source: &str,
+    fns: &[Box<dyn Function>],
+    metadata_read_only: bool,
+) -> Result<Compiled, VrlCompileError> {
     check(source)?;
     std::thread::scope(|scope| {
         let handle = std::thread::Builder::new()
             .name("vrl-compile".into())
             .stack_size(COMPILE_STACK_BYTES)
             .spawn_scoped(scope, || {
-                vrl::compiler::compile(source, fns).map(|result| Compiled {
+                let mut config = vrl::compiler::CompileConfig::default();
+                if metadata_read_only {
+                    config.set_read_only_path(vrl::path::OwnedTargetPath::metadata_root(), true);
+                }
+                vrl::compiler::compile_with_external(
+                    source,
+                    fns,
+                    &vrl::compiler::state::ExternalEnv::default(),
+                    config,
+                )
+                .map(|result| Compiled {
                     program: result.program,
                     warnings: result.warnings,
                 })
@@ -443,7 +479,19 @@ pub fn scan(source: &str, stop_depth: usize, stop_work: u64) -> Shape {
                     }
                 }
                 let word = &b[start..i];
-                if word == b"else" {
+                // A keyword only where it can be one: not a `.return` path
+                // segment or a `return:` argument/object key.
+                let after_dot = start > 0 && b[start - 1] == b'.';
+                if (word == b"return" || word == b"abort") && !after_dot {
+                    // NAN-4912 P3: `return <expr>` / `abort <expr>` are prefix
+                    // productions: each one nests its operand a level deeper
+                    // (`return return … 1` is a recursive chain), exactly like
+                    // unary `!`. They used to be scanned as leaf values.
+                    token!(false);
+                    bump!();
+                    prev = Prev::Operator;
+                    glued = false;
+                } else if word == b"else" {
                     token!(true);
                     bump!();
                     prev = Prev::Operator;

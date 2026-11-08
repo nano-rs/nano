@@ -1,10 +1,8 @@
-# nano-connector identity spec (NAN-3503): Microsoft Entra ID users, group
-# memberships and directory-role memberships from Microsoft Graph v1.0, synced
-# into nano's identity snapshot (kind: identity; no HEC, no parser).
-# Self-hosted / open core variant: an app registration's client secret
-# (oauth2_client_credentials). The hosted runner reads connector.hosted.yaml,
-# which differs ONLY in its auth block (keyless federated credential through
-# nano's pull broker; no secret anywhere).
+# nano-connector identity spec (NAN-3503, G22 on the ClickHouse product):
+# Microsoft Entra ID users, group memberships and directory-role memberships
+# from Microsoft Graph v1.0, synced into nano's user directory (`user_registry`;
+# kind: identity, no HEC, no parser). Auth: an app registration's client secret
+# (oauth2_client_credentials) held in the credentials store.
 #
 # users (mode delta):
 #   full  - first takes a "sync from now" baseline, users/delta?$deltatoken=latest
@@ -33,9 +31,7 @@ kind: identity
 allow:
   - host: graph.microsoft.com
     path_prefixes: ["/v1.0/users", "/v1.0/groups", "/v1.0/directoryRoles"]
-  # Self-hosted token endpoint (oauth2_client_credentials). The hosted spec
-  # never calls it (the pull broker mints the Graph token), but keeps the rule
-  # so the two specs stay identical outside auth.
+  # Token endpoint (oauth2_client_credentials).
   - host: login.microsoftonline.com
 auth:
   type: oauth2_client_credentials
@@ -102,7 +98,10 @@ streams:
               if mid == "" && is_array(md) && md[0]."@removed" == null { mid = string(md[0].id) ?? "" }
               if mid == "" && is_object(md) && md."@removed" == null { mid = string(md.id) ?? "" }
               enabled = u.accountEnabled
-              acct = "unknown"
+              # A delta row carries only changed properties: no
+              # accountEnabled means "unchanged", so no status is sent
+              # (compact drops the null) rather than overwriting it.
+              acct = null
               if enabled == true { acct = "active" }
               if enabled == false { acct = "disabled" }
               etype = string(u.employeeType) ?? ""

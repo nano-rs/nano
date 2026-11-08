@@ -1,169 +1,1661 @@
 #!/usr/bin/env bash
-# nano operator commands for a self-hosted lean install (open core, or the
-# sovereign single-host install). Run from the install directory.
-#
-#   scripts/nano feeds update               fetch the current signed feed bundle and install it
-#   scripts/nano feeds update --file FILE   install a bundle file you copied here (offline drop)
-#   scripts/nano feeds update --license-file LICENSE  sovereign authenticated online fetch
-#   scripts/nano feeds update --url URL     metadata endpoint on an https mirror
-#   scripts/nano feeds status               installed feeds, revision, age and hard expiry
-#
-# NAN-4759: IPinfo Lite geo/ASN, ThreatFox and Tor are stamped at ingest from
-# one signed feed bundle kept on this host (the lean-platform-feeds service).
-# The runtime never fetches anything. This command is the only online step:
-# it downloads the bundle on the host, then the lean-platform-feeds image
-# verifies its signature and swaps it in atomically, with no network. New
-# events are stamped from it within about a minute, without a restart. A feed
-# past its hard expiry stops stamping new events; stamped values are kept.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Customer backup/restore CLI for compose installs (NAN-4989).
 { set +x; } 2>/dev/null
 set -euo pipefail
 umask 077
 
-root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-max_bytes=$((512 * 1024 * 1024 + 16 + 65536))
-# The bundle path inside the one-shot import container.
-import_path=/run/nano-feed-import/bundle
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+case "${1:-}" in
+    bundle)
+        shift
+        exec python3 -I "$SCRIPT_DIR/lib/nano_bundle.py" "$@"
+        ;;
+    backup-set|upgrade|rollback|_upgrade-worker)
+        exec python3 -I "$SCRIPT_DIR/nano-upgrade.py" "$@"
+        ;;
+    feeds)
+        shift
+        exec "$SCRIPT_DIR/nano-feeds" "$@"
+        ;;
+esac
 
-die() { printf 'nano: %s\n' "$*" >&2; exit 1; }
-cleanup=()
-trap 'rm -rf -- ${cleanup[@]+"${cleanup[@]}"}' EXIT
+if ((BASH_VERSINFO[0] < 4)); then
+    printf 'nano: bash 4 or newer is required\n' >&2
+    exit 1
+fi
+
+MANIFEST_TOOL="$SCRIPT_DIR/nano-manifest.py"
+GENERATED_SECRETS_LIB="$SCRIPT_DIR/lib/generated-secrets.sh"
+[[ -f "$GENERATED_SECRETS_LIB" ]] || {
+    printf 'nano: metadata helper is missing: %s\n' "$GENERATED_SECRETS_LIB" >&2
+    exit 1
+}
+# shellcheck source=scripts/lib/generated-secrets.sh
+source "$GENERATED_SECRETS_LIB"
+INSTALL_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+COMMAND="${1:-}"
+[[ $# -gt 0 ]] && shift
+
+WORK_DIR=""
+BUNDLE_TMP=""
+CH_CONTAINER=""
+CH_ADMIN_PASSWORD=""
+PG_CONTAINER=""
+PG_USER=""
+PG_DB=""
+PG_STAGE_DB=""
+PG_ROLLBACK_DB=""
+PG_PUBLIC_CONNECT=t
+PG_FENCED=0
+PG_CUTOVER=0
+PG_TARGET_COUNTS=""
+MUTATION_STARTED=0
+RECOVERY_MARKER=""
+RESTORE_SOURCE_LABEL=""
+CH_HOST=localhost
+CH_PORT=9000
+CH_TRANSPORT=native
+CH_TLS_CA_HOST=""
+CH_TLS_CA_CONTAINER=/etc/nano/tls/ca.crt
+CH_TLS_SERVER_NAME=""
+STOPPED_SERVICES=()
+PG_SNAPSHOT_INPUT_FD=-1
+PG_SNAPSHOT_OUTPUT_FD=-1
+PG_SNAPSHOT_PID=0
+PG_BACKUP_SNAPSHOT=""
+PG_BACKUP_MIGRATION=0
+PG_BACKUP_BYTES=0
+CH_LOCAL_FILES=()
+CH_VERIFY_DB=""
+CH_MERGES_STOPPED=0
+CH_REFRESH_VIEWS_STOPPED=()
+CH_TARGET_SCHEMA_PRESENT=0
+COMPOSE_ARGS=()
+COMPOSE_FILE=""
+COMPOSE_PROJECT_DIR=""
+DOCKER_BIN=""
+TOPOLOGY_MODE=single
+ROLE_LIST="app,ingest,clickhouse,keeper,postgres"
+HOST_ID=single
+DEPLOYMENT_ID=single
+DEPLOYMENT_IDENTITY=""
+CURRENT_SHARD=1
+CURRENT_REPLICA=1
+SHARD_COUNT=1
+CURRENT_VERSION=""
+CURRENT_EDITION=""
+CURRENT_SCHEMA_PROFILE=""
+
 log() { printf '==> %s\n' "$*" >&2; }
+ok() { printf 'ok: %s\n' "$*" >&2; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() { printf 'nano: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-    sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    cat >&2 <<'EOF'
+Usage:
+  scripts/nano bundle verify <nano-<version>-<edition>.tar> [--json]
+  scripts/nano bundle load <nano-<version>-<edition>.tar>
+  scripts/nano backup-keygen --output KEY.pem
+  scripts/nano backup --key-file KEY.pem [--output DIR] [--base FULL_BACKUP]
+                      [--keep N] [--clickhouse-disk DISK]
+                      [--recovery-set-id ID --quiesce-epoch UTC]
+                      [--snapshot-gate 0700_DIR]
+                      [--component postgres|clickhouse] [--install-dir DIR]
+  scripts/nano backup-set --inventory FILE --backup-key-file KEY.pem
+                          [--backup-output DIR] [--clickhouse-disk DISK]
+                          [--remote-install-dir DIR]
+  scripts/nano recovery-set-create --key-file KEY.pem --output DIR
+                      --bundle PG_BACKUP --bundle SHARD_BACKUP [...]
+  scripts/nano restore --key-file KEY.pem --from BACKUP [--base FULL_BACKUP]
+                       [--recovery-set SET_DIR] [--force]
+                       [--clickhouse-disk DISK] [--install-dir DIR]
+  scripts/nano upgrade [--bundle FILE | --version VERSION] [--dry-run]
+                       [--skip-backup-I-understand] [--resume]
+                       [--allow-siem-health-regression REASON]
+  scripts/nano upgrade --abandon-incomplete RUN_ID --abandon-reason REASON
+  scripts/nano rollback [--inventory FILE]
+  scripts/nano feeds <status | update [--file FILE]>
+
+Local ClickHouse archives are inside the AES-256-GCM encrypted payload.
+External disks are accepted only when ClickHouse reports disk type `encrypted`;
+their encryption key must be protected independently from the backup store.
+Role-split backups require a common recovery-set ID/quiesce epoch and restore
+requires the signed recovery-set manifest created after all components finish.
+EOF
     exit 2
 }
 
-env_value() { awk -F= -v k="$1" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$root/.env" 2>/dev/null || true; }
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "$1 is required ($2)"; }
+dc() { "$DOCKER_BIN" compose --project-directory "$COMPOSE_PROJECT_DIR" "${COMPOSE_ARGS[@]}" "$@"; }
+has_role() { [[ ",$ROLE_LIST," == *",$1,"* ]]; }
 
-# The compose files this install runs with: a sovereign single-host install
-# (scripts/sovereign/single-host.sh) adds its overlay and TLS.
-compose_files() {
-    files=(-f docker-compose.opensource.yml)
-    if [[ -d $root/.nano-sovereign ]]; then
-        files+=(-f docker-compose.sovereign.yml -f docker-compose.tls.yml)
+compose_command_text() {
+    local value arg
+    printf -v value '%q compose --project-directory %q' "$DOCKER_BIN" "$COMPOSE_PROJECT_DIR"
+    for arg in "${COMPOSE_ARGS[@]}"; do printf -v value '%s %q' "$value" "$arg"; done
+    printf '%s' "$value"
+}
+
+write_recovery_marker() {
+    [[ -n "$RECOVERY_MARKER" ]] || return 0
+    local compose_text tmp services
+    compose_text="$(compose_command_text)"
+    services="${STOPPED_SERVICES[*]:-none}"
+    tmp="$RECOVERY_MARKER.tmp"
+    cat > "$tmp" <<EOF
+NANO RESTORE RECOVERY REQUIRED
+status: restore failed after target mutation began
+source: ${RESTORE_SOURCE_LABEL:-unknown}
+postgres_target: ${PG_DB:-none}
+postgres_stage: ${PG_STAGE_DB:-none}
+postgres_rollback: ${PG_ROLLBACK_DB:-none}
+postgres_fenced: $PG_FENCED
+postgres_cutover_started: $PG_CUTOVER
+writers_stopped: $services
+clickhouse_refresh_views_stopped: ${CH_REFRESH_VIEWS_STOPPED[*]:-none}
+
+Do not start API, jobs, search, Vector, or connector writers until PostgreSQL
+and ClickHouse have been inspected as one recovery set.
+
+Inspect PostgreSQL database names and connection fences:
+  $compose_text exec -T postgres psql -X -U ${PG_USER:-nanosiem} -d postgres -c "SELECT datname, datallowconn FROM pg_database WHERE datname IN ('${PG_DB:-nanosiem}','${PG_STAGE_DB:-none}','${PG_ROLLBACK_DB:-none}') ORDER BY 1"
+
+After choosing the database that should remain at ${PG_DB:-nanosiem}, re-enable
+that database only (replace the name below if recovery selected another one):
+  $compose_text exec -T postgres psql -X -U ${PG_USER:-nanosiem} -d postgres -c "ALTER DATABASE \"${PG_DB:-nanosiem}\" WITH ALLOW_CONNECTIONS true; GRANT CONNECT ON DATABASE \"${PG_DB:-nanosiem}\" TO PUBLIC"
+
+Re-run the restore from the original signed bundle after correcting the cause,
+or complete a manual rollback using ${PG_ROLLBACK_DB:-the recorded rollback DB}.
+Remove this marker only after cross-store validation succeeds:
+  rm -- '$RECOVERY_MARKER'
+
+If clickhouse_refresh_views_stopped is not "none", keep those refreshable views
+disabled during recovery. After cross-store validation, run SYSTEM START VIEW
+nanosiem.<view> for each recorded view before removing this marker.
+EOF
+    chmod 600 "$tmp"
+    mv "$tmp" "$RECOVERY_MARKER"
+}
+
+pg_admin_query() {
+    "$DOCKER_BIN" exec -i "$PG_CONTAINER" psql -X --set ON_ERROR_STOP=1 --username="$PG_USER" --dbname=postgres --tuples-only --no-align
+}
+
+pg_unfence_target() {
+    [[ -n "$PG_CONTAINER" && -n "$PG_DB" ]] || return 0
+    local grant='REVOKE CONNECT'
+    [[ "$PG_PUBLIC_CONNECT" == t ]] && grant='GRANT CONNECT'
+    pg_admin_query >/dev/null <<SQL
+ALTER DATABASE "$PG_DB" WITH ALLOW_CONNECTIONS true;
+$grant ON DATABASE "$PG_DB" TO PUBLIC;
+SQL
+    PG_FENCED=0
+}
+
+cleanup() {
+    local rc=$? path
+    trap - EXIT INT TERM
+    set +e
+    if ((PG_SNAPSHOT_INPUT_FD >= 0)); then
+        printf 'ROLLBACK;\n\\q\n' >&"$PG_SNAPSHOT_INPUT_FD"
+        exec {PG_SNAPSHOT_INPUT_FD}>&-
     fi
-    if [[ -f $root/docker-compose.host-resources.yml ]]; then
-        files+=(-f docker-compose.host-resources.yml)
+    if ((PG_SNAPSHOT_OUTPUT_FD >= 0)); then exec {PG_SNAPSHOT_OUTPUT_FD}<&-; fi
+    if ((PG_SNAPSHOT_PID > 0)); then wait "$PG_SNAPSHOT_PID" >/dev/null 2>&1; fi
+    if ((rc != 0 && MUTATION_STARTED)); then
+        if [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then
+            dc stop "${STOPPED_SERVICES[@]}" >/dev/null 2>&1
+        fi
+        write_recovery_marker
+        warn "restore stopped after mutation; writers remain stopped"
+        warn "recovery instructions: $RECOVERY_MARKER"
+    elif ((rc != 0 && PG_FENCED)); then
+        pg_unfence_target >/dev/null 2>&1
     fi
+    if [[ -n "$CH_CONTAINER" ]]; then
+        if ((${#CH_REFRESH_VIEWS_STOPPED[@]} > 0)) && ((!(rc != 0 && MUTATION_STARTED))); then
+            start_ch_refreshable_views >/dev/null 2>&1
+        fi
+        if ((CH_MERGES_STOPPED)); then
+            printf 'SYSTEM START MERGES\n' | ch_query >/dev/null 2>&1
+        fi
+        if [[ "$CH_VERIFY_DB" =~ ^nano_archive_check_[0-9a-f]{12}$ ]]; then
+            printf 'DROP DATABASE IF EXISTS %s SYNC\n' "$CH_VERIFY_DB" | ch_query >/dev/null 2>&1
+        fi
+        for path in "${CH_LOCAL_FILES[@]}"; do
+            [[ "$path" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.zip$ ]] || continue
+            "$DOCKER_BIN" exec "$CH_CONTAINER" rm -f -- "/var/lib/clickhouse/backups/$path" >/dev/null 2>&1
+        done
+    fi
+    if ((!(rc != 0 && MUTATION_STARTED))) && [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then
+        dc start "${STOPPED_SERVICES[@]}" >/dev/null 2>&1
+    fi
+    [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
+    [[ -z "$BUNDLE_TMP" ]] || rm -rf -- "$BUNDLE_TMP"
+    exit "$rc"
+}
+trap cleanup EXIT INT TERM
+
+validate_regular_0600() {
+    local path="$1" label="$2" metadata owner mode
+    [[ ! -L "$path" && -f "$path" ]] || die "$label must be a regular file (symbolic links are refused): $path"
+    metadata="$(nano_secret_metadata "$path")" || die "cannot inspect $path"
+    read -r owner _ mode <<< "$metadata"
+    [[ "$owner" == "$(id -u)" ]] || die "$label is owned by uid $owner, not current uid $(id -u): $path"
+    [[ "$mode" == 600 ]] || die "$label must have mode 600 (found $mode): $path"
 }
 
-compose() {
-    local files
-    compose_files
-    (cd "$root" && docker </dev/null compose "${files[@]}" "$@")
+env_value() {
+    python3 -I - "$1" "$2" <<'PY'
+import sys
+try: lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+except FileNotFoundError: raise SystemExit(0)
+key = sys.argv[2]
+for line in lines:
+    if line.startswith(key + "="):
+        value = line.split("=", 1)[1].rstrip("\r")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'": value = value[1:-1]
+        sys.stdout.write(value); break
+PY
 }
 
-require_lean() {
-    [[ -f $root/.env ]] || die "no install in $root (.env missing)"
-    [[ $(env_value COMPOSE_PROFILES) == *lean* ]] || die "platform feeds need the lean lake profile (COMPOSE_PROFILES=lean)"
-    [[ -d $root/.nano-lean/platform-grants ]] || die "this install predates platform feeds: re-run the installer once to render them"
+role_env_value() {
+    python3 -I - "$INSTALL_DIR/.nano-role.env" "$1" <<'PY'
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    if line.startswith(sys.argv[2] + "="):
+        value = json.loads(line.split("=", 1)[1])
+        if not isinstance(value, str): raise SystemExit("role env value is not a string")
+        sys.stdout.write(value); break
+PY
 }
 
-# The distribution route returns a descriptor plus a short-lived presigned
-# bundle URL. Only an operator-run fetch makes either request. A mirror may
-# expose the same response contract via --url; signatures remain authoritative.
-fetch() { # <out file> <metadata URL override> <license file>
-    local out=$1 url=$2 license=$3 metadata header bundle_url
-    local auth=()
-    if [[ -d $root/.nano-sovereign ]]; then
-        [[ -n $license ]] || die "sovereign online update needs --license-file <signed license>; offline updates use --file"
-        [[ -f $license && ! -L $license ]] || die "license must be a regular file"
-        [[ $(stat -c %a "$license") == 600 ]] || die "license file must have mode 0600"
-        (( $(stat -c %s "$license") <= 9216 )) || die "license is oversized"
-        [[ -n $url ]] || url=https://api.nano.rs/api/feeds/v1/sovereign/current
-        header=${out}.header
-        # Keep the license out of argv, logs, and the bundle request. Curl
-        # does not follow redirects on this authenticated metadata request.
-        python3 - "$license" "$header" <<'PYHEADER'
-import base64, pathlib, sys
-artifact = pathlib.Path(sys.argv[1]).read_bytes()
-pathlib.Path(sys.argv[2]).write_text("X-Nano-License: " + base64.urlsafe_b64encode(artifact).decode().rstrip("=") + "\n")
-PYHEADER
-        auth=(--header "@$header")
+sha256_file() { openssl dgst -sha256 -r "$1" | awk '{print $1}'; }
+file_size() {
+    nano_file_size "$1" || die "cannot determine file size: $1"
+}
+
+ensure_host_space() {
+    local path="$1" needed="$2" available
+    available="$(df -Pk "$path" | awk 'NR==2 {print $4 * 1024}')"
+    [[ "$available" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "cannot determine free space for $path"
+    awk -v available="$available" -v needed="$needed" 'BEGIN { exit !(available >= needed) }' \
+        || die "insufficient private restore workspace: need $needed bytes, have ${available%.*}"
+}
+
+version_ge() {
+    python3 -I - "$1" "$2" <<'PY'
+import re, sys
+def v(s):
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", s)
+    if not m: raise SystemExit(2)
+    return tuple(map(int, m.groups()))
+raise SystemExit(0 if v(sys.argv[1]) >= v(sys.argv[2]) else 1)
+PY
+}
+
+init_context() {
+    require_cmd docker "install Docker with Compose v2"
+    require_cmd python3 "install Python 3"
+    require_cmd openssl "install OpenSSL"
+    require_cmd awk "install awk"
+    require_cmd cmp "install cmp"
+    require_cmd cp "install cp"
+    require_cmd chmod "install chmod"
+    require_cmd diff "install diff"
+    require_cmd install "install install"
+    require_cmd mv "install mv"
+    require_cmd rm "install rm"
+    require_cmd sort "install sort"
+    DOCKER_BIN="$(type -P docker)" || die "cannot resolve docker executable"
+    [[ -f "$MANIFEST_TOOL" ]] || die "manifest helper is missing: $MANIFEST_TOOL"
+    "$DOCKER_BIN" compose version >/dev/null 2>&1 || die "docker compose v2 is required"
+    [[ -d "$INSTALL_DIR" ]] || die "install directory not found: $INSTALL_DIR"
+    INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd -P)"
+    [[ -f "$INSTALL_DIR/.env" ]] || die "$INSTALL_DIR/.env is missing; run install.sh first"
+    validate_regular_0600 "$INSTALL_DIR/.env" ".env"
+    if [[ -f "$INSTALL_DIR/.nano-role.env" ]]; then
+        validate_regular_0600 "$INSTALL_DIR/.nano-role.env" ".nano-role.env"
+        COMPOSE_FILE="$INSTALL_DIR/deploy/compose/docker-compose.enterprise.yml"
+        [[ -f "$COMPOSE_FILE" && ! -L "$COMPOSE_FILE" ]] || die "enterprise role compose file is missing"
+        COMPOSE_PROJECT_DIR="$(cd "$(dirname "$COMPOSE_FILE")" && pwd -P)"
+        TOPOLOGY_MODE=role-split
+        ROLE_LIST="$(role_env_value NANO_ROLE_PROFILES)"
+        HOST_ID="$(role_env_value NANO_HOST_ID)"
+        DEPLOYMENT_ID="$(role_env_value NANO_DEPLOYMENT_ID)"
+        DEPLOYMENT_IDENTITY="$(role_env_value NANO_DEPLOYMENT_IDENTITY_SHA256)"
+        COMPOSE_ARGS=(--env-file "$INSTALL_DIR/.env" --env-file "$INSTALL_DIR/.nano-role.env" -f "$COMPOSE_FILE")
+        if has_role clickhouse; then
+            CH_HOST="$(role_env_value NANO_CLICKHOUSE_REMOTE_ADDRESS)"
+            CH_TRANSPORT=native
+            [[ "$CH_HOST" =~ ^[A-Za-z0-9._:-]+$ ]] || die "invalid role ClickHouse address"
+            case "$(role_env_value NANO_PRIVATE_TLS)" in
+                true)
+                    CH_TRANSPORT=native-secure
+                    CH_PORT="$(role_env_value NANO_CLICKHOUSE_PUBLISH_NATIVE_PORT)"
+                    CH_TLS_CA_HOST="$(role_env_value NANO_TLS_CA)"
+                    CH_TLS_SERVER_NAME="$(role_env_value NANO_TLS_SERVER_NAME)"
+                    [[ "$CH_TLS_CA_HOST" = /* && -f "$CH_TLS_CA_HOST" && -r "$CH_TLS_CA_HOST" ]] \
+                        || die "inventory ClickHouse TLS CA is not a readable absolute file: $CH_TLS_CA_HOST"
+                    [[ "$CH_TLS_SERVER_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] \
+                        || die "invalid inventory ClickHouse TLS server name"
+                    ;;
+                false) CH_PORT="$(role_env_value NANO_CLICKHOUSE_PUBLISH_NATIVE_PORT)" ;;
+                *) die "invalid NANO_PRIVATE_TLS value in role inventory" ;;
+            esac
+            if [[ ! "$CH_PORT" =~ ^[0-9]+$ ]] || ((CH_PORT < 1 || CH_PORT > 65535)); then
+                die "invalid role ClickHouse port"
+            fi
+        fi
+        local cluster_xml="$INSTALL_DIR/.nano-generated/clickhouse/config.d/zz-sovereign-cluster.xml"
+        if [[ -f "$cluster_xml" ]]; then
+            read -r CURRENT_SHARD CURRENT_REPLICA SHARD_COUNT < <(python3 -I - "$cluster_xml" "$(role_env_value NANO_CLICKHOUSE_REMOTE_ADDRESS)" <<'PY'
+import sys, xml.etree.ElementTree as ET
+r = ET.parse(sys.argv[1]).getroot(); address = sys.argv[2]
+shard = int((r.findtext("./macros/shard", "1").lstrip("0") or "0")); replica = 1
+shards = r.findall("./remote_servers/default/shard")
+if 1 <= shard <= len(shards):
+    for i, node in enumerate(shards[shard-1].findall("replica"), 1):
+        if node.findtext("host") == address: replica = i; break
+print(shard, replica, max(1, len(shards)))
+PY
+            )
+        fi
     else
-        [[ -z $license ]] || die "--license-file is only used by sovereign installs"
-        [[ -n $url ]] || url=https://api.nano.rs/api/feeds/v1/open/current
+        COMPOSE_FILE="$INSTALL_DIR/docker-compose.opensource.yml"
+        [[ -f "$COMPOSE_FILE" && ! -L "$COMPOSE_FILE" ]] || die "docker-compose.opensource.yml is missing"
+        COMPOSE_PROJECT_DIR="$(cd "$(dirname "$COMPOSE_FILE")" && pwd -P)"
+        COMPOSE_ARGS=(--env-file "$INSTALL_DIR/.env" -f "$COMPOSE_FILE")
     fi
-    [[ $url =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] || die "--url must be a plain https metadata URL"
-    log "Fetching the current feed descriptor"
-    metadata=${out}.json
-    curl --disable --fail --silent --show-error --proto '=https' --tlsv1.2 \
-        --max-filesize 131072 --connect-timeout 20 --max-time 60 \
-        ${auth[@]+"${auth[@]}"} --output "$metadata" "$url" || die "descriptor fetch failed; retry, or use --file"
-    # Public signed metadata; the verifier runs as UID 999 with no network.
-    chmod 755 "$(dirname -- "$out")"
-    chmod 444 "$metadata"
-    bundle_url=$(compose run --rm --no-deps -T -v "$metadata:$import_path:ro" lean-platform-feeds check-current --file "$import_path") \
-        || die "the feed source descriptor was refused; nothing was changed"
-    if [[ -z $bundle_url ]]; then
-        log "The installed signed descriptor is current."
+    "$DOCKER_BIN" compose --project-directory "$COMPOSE_PROJECT_DIR" "${COMPOSE_ARGS[@]}" config --quiet >/dev/null \
+        || die "Compose configuration preflight failed for $COMPOSE_FILE"
+    CURRENT_VERSION="$(env_value "$INSTALL_DIR/.env" NANO_VERSION)"
+    if [[ -z "$CURRENT_VERSION" && -f "$INSTALL_DIR/images.lock" ]]; then
+        CURRENT_VERSION="$(sed -n 's/^# Release: v\{0,1\}//p' "$INSTALL_DIR/images.lock" | head -1)"
+    fi
+    [[ "$CURRENT_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "cannot determine semantic NANO_VERSION"
+    CURRENT_VERSION="${CURRENT_VERSION#v}"
+    CURRENT_EDITION="$(env_value "$INSTALL_DIR/.env" NANO_EDITION)"
+    [[ -n "$CURRENT_EDITION" || ! -f "$INSTALL_DIR/.nano-edition" ]] || CURRENT_EDITION="$(tr -d '[:space:]' < "$INSTALL_DIR/.nano-edition")"
+    [[ "$CURRENT_EDITION" == open || "$CURRENT_EDITION" == enterprise ]] || die "cannot determine NANO_EDITION=open|enterprise"
+    CURRENT_SCHEMA_PROFILE="$(env_value "$INSTALL_DIR/.env" NANO_SCHEMA_PROFILE)"
+    CURRENT_SCHEMA_PROFILE="${CURRENT_SCHEMA_PROFILE:-udm}"
+    [[ "$CURRENT_SCHEMA_PROFILE" == udm || "$CURRENT_SCHEMA_PROFILE" == ocsf ]] || die "cannot determine NANO_SCHEMA_PROFILE=udm|ocsf"
+    [[ "$HOST_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || die "invalid host identity"
+    [[ "$DEPLOYMENT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ ]] || die "invalid deployment id"
+    if [[ "$TOPOLOGY_MODE" == role-split ]]; then
+        [[ "$DEPLOYMENT_IDENTITY" =~ ^[0-9a-f]{64}$ ]] || die "invalid deployment identity"
+    fi
+    RECOVERY_MARKER="$INSTALL_DIR/.nano-restore-recovery"
+}
+
+service_container() {
+    local cid state
+    cid="$(dc ps -q "$1" 2>/dev/null || true)"
+    [[ -n "$cid" && "$cid" != *$'\n'* ]] || die "compose service $1 is not uniquely running"
+    state="$("$DOCKER_BIN" inspect --format '{{.State.Running}}' "$cid" 2>/dev/null || true)"
+    [[ "$state" == true ]] || die "compose service $1 is not running"
+    printf '%s' "$cid"
+}
+
+prepare_pg() {
+    PG_CONTAINER="$(service_container postgres)"
+    PG_USER="$(env_value "$INSTALL_DIR/.env" POSTGRES_USER)"; PG_USER="${PG_USER:-nanosiem}"
+    PG_DB="$(env_value "$INSTALL_DIR/.env" POSTGRES_DB)"; PG_DB="${PG_DB:-nanosiem}"
+    [[ "$PG_USER" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || die "unsafe PostgreSQL role"
+    [[ "$PG_DB" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || die "unsafe PostgreSQL database"
+    "$DOCKER_BIN" exec "$PG_CONTAINER" pg_isready --username="$PG_USER" --dbname="$PG_DB" >/dev/null || die "PostgreSQL did not pass pg_isready"
+}
+
+prepare_ch() {
+    CH_CONTAINER="$(service_container clickhouse)"
+    CH_ADMIN_PASSWORD="$(env_value "$INSTALL_DIR/.env" CLICKHOUSE_ADMIN_PASSWORD)"
+    [[ -n "$CH_ADMIN_PASSWORD" ]] || die "CLICKHOUSE_ADMIN_PASSWORD is missing from .env"
+    if [[ "$CH_TRANSPORT" == native-secure ]]; then
+        local mounted_ca="$WORK_DIR/inventory-clickhouse-ca.crt"
+        "$DOCKER_BIN" exec "$CH_CONTAINER" test -r "$CH_TLS_CA_CONTAINER" \
+            || die "inventory TLS CA is not readable inside the ClickHouse container"
+        "$DOCKER_BIN" cp "$CH_CONTAINER:$CH_TLS_CA_CONTAINER" "$mounted_ca" >/dev/null
+        [[ "$(sha256_file "$CH_TLS_CA_HOST")" == "$(sha256_file "$mounted_ca")" ]] \
+            || die "ClickHouse container TLS CA does not match the inventory CA"
+    fi
+    "$DOCKER_BIN" exec "$CH_CONTAINER" /bin/sh -ec 'command -v clickhouse-client >/dev/null' \
+        || die "ClickHouse container lacks clickhouse-client"
+    printf 'SELECT 1\n' | ch_query | grep -qx 1 || die "ClickHouse did not answer SELECT 1 over $CH_TRANSPORT"
+}
+
+pg_query_db() {
+    local database="$1"; shift
+    "$DOCKER_BIN" exec -i "$PG_CONTAINER" psql -X --set ON_ERROR_STOP=1 --username="$PG_USER" --dbname="$database" --tuples-only --no-align "$@"
+}
+pg_query() { pg_query_db "$PG_DB"; }
+
+ch_query_params() {
+    local arg args=("$@") secure=false
+    for arg in "${args[@]}"; do
+        [[ "$arg" =~ ^--param_[A-Za-z][A-Za-z0-9_]*=[A-Za-z0-9._-]+$ ]] \
+            || die "unsafe ClickHouse query parameter"
+    done
+    [[ "$CH_TRANSPORT" == native-secure ]] && secure=true
+    # Password and TLS policy live only in a mode-0600 client config. The
+    # docker exec argv contains the endpoint and config-building program, never
+    # authentication material; the config is removed after every client exit.
+    # shellcheck disable=SC2016
+    { printf '%s\n' "$CH_ADMIN_PASSWORD"; cat; } | "$DOCKER_BIN" exec -i "$CH_CONTAINER" \
+        env -u CLICKHOUSE_PASSWORD -u CLICKHOUSE_ADMIN_PASSWORD \
+        -u CLICKHOUSE_NANOSIEM_PASSWORD -u CLICKHOUSE_INGEST_PASSWORD \
+        -u CLICKHOUSE_VECTOR_PASSWORD -u CLICKHOUSE_RAWSQL_PASSWORD \
+        -u CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD -u CLICKHOUSE_SELF_PASSWORD \
+        /bin/sh -ec '
+            IFS= read -r password
+            [ -n "$password" ] || { echo "ClickHouse admin credential is empty" >&2; exit 1; }
+            host=$1; port=$2; secure=$3; ca=$4; server_name=$5; shift 5
+            escaped=$(printf "%s" "$password" | sed \
+                -e "s/&/\\&amp;/g" -e "s/</\\&lt;/g" -e "s/>/\\&gt;/g")
+            umask 077
+            config=$(mktemp /tmp/nano-clickhouse-client.XXXXXX.xml)
+            cleanup_config() { rm -f -- "$config"; }
+            trap cleanup_config EXIT
+            trap "exit 129" HUP
+            trap "exit 130" INT
+            trap "exit 143" TERM
+            if [ "$secure" = true ]; then
+                [ -r "$ca" ] && [ -s "$ca" ] || {
+                    echo "inventory TLS CA is unavailable inside ClickHouse" >&2
+                    exit 1
+                }
+                cat > "$config" <<EOF
+<clickhouse>
+  <password>$escaped</password>
+  <openSSL>
+    <client>
+      <caConfig>$ca</caConfig>
+      <verificationMode>strict</verificationMode>
+      <loadDefaultCAFile>false</loadDefaultCAFile>
+      <invalidCertificateHandler><name>RejectCertificateHandler</name></invalidCertificateHandler>
+    </client>
+  </openSSL>
+</clickhouse>
+EOF
+                chmod 600 "$config"
+                clickhouse-client --config-file "$config" --secure \
+                    --tls-sni-override "$server_name" --host "$host" --port "$port" \
+                    --user nanosiem_admin --format=TSVRaw --multiquery "$@"
+                exit $?
+            fi
+            printf "<clickhouse><password>%s</password></clickhouse>\n" "$escaped" > "$config"
+            chmod 600 "$config"
+            clickhouse-client --config-file "$config" --host "$host" --port "$port" \
+                --user nanosiem_admin --format=TSVRaw --multiquery "$@"
+        ' sh "$CH_HOST" "$CH_PORT" "$secure" "$CH_TLS_CA_CONTAINER" "$CH_TLS_SERVER_NAME" "${args[@]}"
+}
+ch_query() { ch_query_params; }
+
+dc_with_env() {
+    local env_file="$1"; shift
+    if [[ "$TOPOLOGY_MODE" == role-split ]]; then
+        "$DOCKER_BIN" compose --project-directory "$COMPOSE_PROJECT_DIR" \
+            --env-file "$env_file" --env-file "$INSTALL_DIR/.nano-role.env" -f "$COMPOSE_FILE" "$@"
+    else
+        "$DOCKER_BIN" compose --project-directory "$COMPOSE_PROJECT_DIR" \
+            --env-file "$env_file" -f "$COMPOSE_FILE" "$@"
+    fi
+}
+
+preflight_restore_runtime() {
+    local restored_env="$1" services service probe
+    [[ -f "$restored_env" && ! -L "$restored_env" ]] || die "restored environment preflight file is invalid"
+    [[ -w "$INSTALL_DIR" && -w "$INSTALL_DIR/.env" ]] || die "install environment cannot be atomically replaced"
+    [[ ! -e "$INSTALL_DIR/.env.restore" && ! -L "$INSTALL_DIR/.env.restore" ]] \
+        || die "stale .env.restore blocks restore preflight"
+    dc_with_env "$restored_env" config --quiet >/dev/null \
+        || die "Compose preflight with restored environment failed before target mutation"
+    services="$(dc_with_env "$restored_env" config --services)" \
+        || die "cannot enumerate Compose services before target mutation"
+    for service in postgres clickhouse; do
+        case "$service" in
+            postgres) [[ "$M_PG" == true ]] || continue ;;
+            clickhouse) [[ "$M_CH" == true ]] || continue ;;
+        esac
+        grep -qx "$service" <<< "$services" || die "Compose preflight lacks required service: $service"
+    done
+    if [[ "$M_PG" == true ]]; then
+        "$DOCKER_BIN" exec "$PG_CONTAINER" /bin/sh -ec \
+            'command -v psql >/dev/null; command -v pg_restore >/dev/null; command -v pg_isready >/dev/null; command -v df >/dev/null' \
+            || die "PostgreSQL container lacks restore commands"
+    fi
+    probe="$INSTALL_DIR/.nano-restore-preflight.$$"
+    [[ ! -e "$probe" && ! -L "$probe" ]] || die "restore preflight probe already exists"
+    install -m 0600 "$restored_env" "$probe" || die "cannot stage restored environment in install directory"
+    cmp -s "$restored_env" "$probe" || die "staged restored environment changed during preflight"
+    rm -f -- "$probe" || die "cannot remove restore preflight probe"
+}
+
+assert_ch_locator() {
+    [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,63}$ ]] || die "unsafe ClickHouse disk at SQL boundary"
+    [[ "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.zip$ ]] || die "unsafe ClickHouse archive at SQL boundary"
+}
+
+validate_clickhouse_disk() {
+    local disk="$1" type
+    [[ "$disk" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,63}$ ]] || die "invalid ClickHouse disk"
+    type="$(printf 'SELECT lower(type) FROM system.disks WHERE name={disk:String} FORMAT TSVRaw\n' \
+        | ch_query_params "--param_disk=$disk" | tr -d '[:space:]')"
+    [[ -n "$type" ]] || die "ClickHouse disk is not configured: $disk"
+    if [[ "$disk" != backups && "$type" != encrypted ]]; then
+        die "external ClickHouse disk $disk has type $type; only explicitly encrypted disks are allowed"
+    fi
+}
+
+quiesce_local_writers() {
+    local running service candidates=()
+    running="$(dc ps --status running --services 2>/dev/null || true)"
+    for service in vector connector-runner nano-api nano-jobs nano-search; do
+        grep -qx "$service" <<<"$running" && candidates+=("$service")
+    done
+    if [[ ${#candidates[@]} -gt 0 ]]; then
+        log "quiescing local writers: ${candidates[*]}"
+        dc stop "${candidates[@]}" >/dev/null
+        STOPPED_SERVICES=("${candidates[@]}")
+    fi
+}
+
+resume_local_writers() {
+    if [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then
+        log "restarting local writers: ${STOPPED_SERVICES[*]}"
+        dc start "${STOPPED_SERVICES[@]}" >/dev/null
+        STOPPED_SERVICES=()
+    fi
+}
+
+monotonic_ms() {
+    python3 -I - <<'PY'
+import time
+print(time.monotonic_ns() // 1_000_000)
+PY
+}
+
+validate_snapshot_gate() {
+    local gate="$1" metadata owner mode
+    [[ "$gate" = /* && -d "$gate" && ! -L "$gate" ]] \
+        || die "--snapshot-gate must be an existing absolute directory"
+    metadata="$(nano_secret_metadata "$gate")" || die "cannot inspect snapshot gate: $gate"
+    read -r owner _ mode <<< "$metadata"
+    [[ "$owner" == "$(id -u)" && "$mode" == 700 ]] \
+        || die "snapshot gate must be owned by the current uid with mode 0700: $gate"
+    [[ ! -e "$gate/preflight-ready" && ! -L "$gate/preflight-ready" \
+        && ! -e "$gate/start" && ! -L "$gate/start" \
+        && ! -e "$gate/snapshot-ready" && ! -L "$gate/snapshot-ready" \
+        && ! -e "$gate/abort" && ! -L "$gate/abort" ]] \
+        || die "snapshot gate contains stale coordination files: $gate"
+}
+
+wait_snapshot_gate_start() {
+    local gate="$1" deadline=$((SECONDS + 900))
+    install -m 0600 /dev/null "$gate/preflight-ready"
+    log "snapshot preflight ready; waiting for coordinator: $gate/start"
+    while [[ ! -f "$gate/start" || -L "$gate/start" ]]; do
+        [[ ! -f "$gate/abort" || -L "$gate/abort" ]] \
+            || die "snapshot coordinator aborted the backup fence"
+        ((SECONDS < deadline)) || die "snapshot coordinator did not release $gate/start within 900 seconds"
+        sleep 0.1
+    done
+}
+
+mark_snapshot_ready() {
+    local gate="$1"
+    [[ -z "$gate" ]] || install -m 0600 /dev/null "$gate/snapshot-ready"
+}
+
+validate_key_file() {
+    validate_regular_0600 "$1" "backup key"
+    openssl x509 -in "$1" -noout >/dev/null 2>&1 || die "backup key has no PEM certificate"
+    openssl pkey -in "$1" -noout >/dev/null 2>&1 || die "backup key has no usable PEM private key"
+}
+
+snapshot_bundle() {
+    local source="$1" label="$2" destination item size
+    destination="$WORK_DIR/bundles/$label"
+    [[ -d "$source" && ! -L "$source" ]] || return 1
+    for item in manifest.json manifest.sig payload.cms; do
+        [[ -f "$source/$item" && ! -L "$source/$item" ]] || return 1
+    done
+    size="$(file_size "$source/payload.cms")"
+    ensure_host_space "$WORK_DIR" "$((size + 67108864))"
+    mkdir -p "$destination"; chmod 700 "$destination"
+    for item in manifest.json manifest.sig payload.cms; do install -m 0600 "$source/$item" "$destination/$item"; done
+    printf '%s' "$destination"
+}
+
+verify_signature() {
+    local manifest="$1" signature="$2" key="$3"
+    openssl x509 -in "$key" -pubkey -noout 2>/dev/null \
+        | openssl dgst -sha256 -verify /dev/stdin -signature "$signature" "$manifest" >/dev/null 2>&1
+}
+
+load_snapshot() {
+    local snapshot="$1" key="$2" label="$3" fields_file checksums
+    fields_file="$snapshot/fields.bin"; checksums="$snapshot/checksums.json"
+    local fields=()
+    verify_signature "$snapshot/manifest.json" "$snapshot/manifest.sig" "$key" || return 1
+    python3 -I "$MANIFEST_TOOL" parse-bundle "$snapshot/manifest.json" "$checksums" > "$fields_file" || return 1
+    mapfile -d '' -t fields < "$fields_file"
+    [[ ${#fields[@]} -eq 31 ]] || return 1
+    L_BACKUP_ID=${fields[0]}; L_VERSION=${fields[2]}; L_EDITION=${fields[3]}; L_SCHEMA=${fields[4]}
+    L_MODE=${fields[5]}; L_DEPLOYMENT=${fields[6]}; L_IDENTITY=${fields[7]}; L_HOST=${fields[8]}
+    L_SHARD=${fields[10]}; L_REPLICA=${fields[11]}; L_SHARD_COUNT=${fields[12]}; L_PG=${fields[13]}; L_PG_MIG=${fields[14]}
+    L_PG_BYTES=${fields[15]}; L_CH=${fields[16]}; L_CH_MIG=${fields[17]}; L_CH_BYTES=${fields[18]}; L_DISK=${fields[19]}
+    L_ARCHIVE=${fields[20]}; L_EXTERNAL=${fields[21]}; L_EXTERNAL_ENCRYPTED=${fields[22]}; L_SCOPE=${fields[23]}
+    L_BASE_ID=${fields[24]}; L_BASE_SHA=${fields[25]}; L_SET_ID=${fields[26]}; L_QUIESCE_EPOCH=${fields[27]}
+    L_PAYLOAD_SHA=${fields[28]}; L_MANIFEST_SHA=${fields[30]}; L_CHECKSUMS=$checksums
+    [[ "$(sha256_file "$snapshot/payload.cms")" == "$L_PAYLOAD_SHA" ]] || return 1
+    printf '%s' "$label" >/dev/null
+}
+
+save_primary_fields() {
+    M_BACKUP_ID=$L_BACKUP_ID; M_VERSION=$L_VERSION; M_EDITION=$L_EDITION; M_SCHEMA=$L_SCHEMA
+    M_MODE=$L_MODE; M_DEPLOYMENT=$L_DEPLOYMENT; M_IDENTITY=$L_IDENTITY; M_HOST=$L_HOST
+    M_SHARD=$L_SHARD; M_REPLICA=$L_REPLICA; M_SHARD_COUNT=$L_SHARD_COUNT; M_PG=$L_PG; M_PG_MIG=$L_PG_MIG
+    M_PG_BYTES=$L_PG_BYTES; M_CH=$L_CH; M_CH_MIG=$L_CH_MIG; M_CH_BYTES=$L_CH_BYTES; M_DISK=$L_DISK
+    M_ARCHIVE=$L_ARCHIVE; M_EXTERNAL=$L_EXTERNAL; M_EXTERNAL_ENCRYPTED=$L_EXTERNAL_ENCRYPTED; M_SCOPE=$L_SCOPE
+    M_BASE_ID=$L_BASE_ID; M_BASE_SHA=$L_BASE_SHA; M_SET_ID=$L_SET_ID; M_QUIESCE_EPOCH=$L_QUIESCE_EPOCH
+    M_PAYLOAD_SHA=$L_PAYLOAD_SHA; M_MANIFEST_SHA=$L_MANIFEST_SHA; M_CHECKSUMS=$L_CHECKSUMS
+}
+
+save_base_fields() {
+    B_BACKUP_ID=$L_BACKUP_ID; B_EDITION=$L_EDITION; B_SCHEMA=$L_SCHEMA; B_MODE=$L_MODE
+    B_DEPLOYMENT=$L_DEPLOYMENT; B_IDENTITY=$L_IDENTITY; B_DISK=$L_DISK; B_ARCHIVE=$L_ARCHIVE
+    B_BASE_ID=$L_BASE_ID; B_PAYLOAD_SHA=$L_PAYLOAD_SHA
+    B_SET_ID=$L_SET_ID; B_QUIESCE_EPOCH=$L_QUIESCE_EPOCH; B_CHECKSUMS=$L_CHECKSUMS
+}
+
+decrypt_snapshot() {
+    local snapshot="$1" key="$2" output="$3" checksums="$4" tar_file
+    tar_file="$WORK_DIR/decrypted-$(openssl rand -hex 8).tar"
+    openssl cms -decrypt -binary -inform DER -in "$snapshot/payload.cms" -recip "$key" -inkey "$key" -out "$tar_file" \
+        || die "cannot decrypt signed backup with supplied key"
+    mkdir -p "$output"; chmod 700 "$output"
+    python3 -I - "$tar_file" "$output" <<'PY'
+import pathlib, sys, tarfile
+root = pathlib.Path(sys.argv[2]).resolve()
+with tarfile.open(sys.argv[1], "r:") as source:
+    for member in source.getmembers():
+        target = (root / member.name).resolve()
+        if target != root and root not in target.parents: raise SystemExit(f"unsafe payload path: {member.name}")
+        if member.issym() or member.islnk() or member.isdev(): raise SystemExit(f"unsupported payload entry: {member.name}")
+    source.extractall(root)
+PY
+    python3 -I "$MANIFEST_TOOL" verify-payload "$checksums" "$output" || die "decrypted payload validation failed"
+}
+
+snapshot_recovery_set() {
+    local source="$1" destination="$WORK_DIR/recovery-set"
+    [[ -d "$source" && ! -L "$source" ]] || die "recovery set directory is missing"
+    [[ -f "$source/recovery-set.json" && ! -L "$source/recovery-set.json" ]] || die "recovery-set.json is missing"
+    [[ -f "$source/recovery-set.sig" && ! -L "$source/recovery-set.sig" ]] || die "recovery-set.sig is missing"
+    mkdir -p "$destination"; chmod 700 "$destination"
+    install -m 0600 "$source/recovery-set.json" "$destination/recovery-set.json"
+    install -m 0600 "$source/recovery-set.sig" "$destination/recovery-set.sig"
+    printf '%s' "$destination"
+}
+
+validate_recovery_set_membership() {
+    local source="$1" key="$2" snapshot args
+    snapshot="$(snapshot_recovery_set "$source")"
+    verify_signature "$snapshot/recovery-set.json" "$snapshot/recovery-set.sig" "$key" || die "recovery set signature verification failed"
+    args=(validate-set "$snapshot/recovery-set.json" --set-id "$M_SET_ID" --quiesce-epoch "$M_QUIESCE_EPOCH"
+        --deployment "$M_DEPLOYMENT" --identity "$M_IDENTITY" --version "$M_VERSION" --edition "$M_EDITION"
+        --schema "$M_SCHEMA" --shard-count "$M_SHARD_COUNT" --backup-id "$M_BACKUP_ID" --payload-sha "$M_PAYLOAD_SHA"
+        --manifest-sha "$M_MANIFEST_SHA" --host "$M_HOST")
+    [[ "$M_PG" != true ]] || args+=(--pg)
+    [[ "$M_CH" != true ]] || args+=(--ch --shard "$M_SHARD")
+    python3 -I "$MANIFEST_TOOL" "${args[@]}" || die "bundle is not a valid member of the signed recovery set"
+}
+
+encrypt_payload() {
+    local source="$1" output="$2" key="$3" tar_file="$WORK_DIR/payload.tar"
+    COPYFILE_DISABLE=1 tar -C "$source" -cf "$tar_file" .
+    openssl cms -encrypt -binary -aes-256-gcm -in "$tar_file" -outform DER -out "$output" "$key" >/dev/null
+    chmod 600 "$output"
+}
+
+start_pg_exported_snapshot() {
+    local line extra
+    coproc PG_SNAPSHOT_EXPORTER {
+        "$DOCKER_BIN" exec -i "$PG_CONTAINER" psql -X --set ON_ERROR_STOP=1 \
+            --username="$PG_USER" --dbname="$PG_DB" --tuples-only --no-align
+    }
+    PG_SNAPSHOT_PID=$PG_SNAPSHOT_EXPORTER_PID
+    PG_SNAPSHOT_OUTPUT_FD=${PG_SNAPSHOT_EXPORTER[0]}
+    PG_SNAPSHOT_INPUT_FD=${PG_SNAPSHOT_EXPORTER[1]}
+    cat >&"$PG_SNAPSHOT_INPUT_FD" <<'SQL'
+BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT '__NANO_SNAPSHOT__|' || pg_export_snapshot() || '|' ||
+       COALESCE((SELECT MAX(version) FROM public._sqlx_migrations), 0) || '|' ||
+       pg_database_size(current_database());
+SQL
+    while IFS= read -r line <&"$PG_SNAPSHOT_OUTPUT_FD"; do
+        [[ "$line" == __NANO_SNAPSHOT__\|* ]] || continue
+        IFS='|' read -r PG_BACKUP_SNAPSHOT PG_BACKUP_MIGRATION PG_BACKUP_BYTES extra \
+            <<< "${line#__NANO_SNAPSHOT__|}"
+        [[ -z "$extra" && "$PG_BACKUP_SNAPSHOT" =~ ^[0-9A-F]{8}-[0-9A-F]{8}-[0-9]+$ \
+            && "$PG_BACKUP_MIGRATION" =~ ^[0-9]+$ && "$PG_BACKUP_BYTES" =~ ^[0-9]+$ ]] \
+            || die "PostgreSQL returned invalid snapshot metadata"
+        return 0
+    done
+    die "PostgreSQL snapshot exporter exited before returning a snapshot"
+}
+
+finish_pg_exported_snapshot() {
+    local rc=0
+    ((PG_SNAPSHOT_INPUT_FD >= 0 && PG_SNAPSHOT_OUTPUT_FD >= 0 && PG_SNAPSHOT_PID > 0)) \
+        || die "PostgreSQL snapshot exporter is not running"
+    printf 'COMMIT;\n\\q\n' >&"$PG_SNAPSHOT_INPUT_FD"
+    exec {PG_SNAPSHOT_INPUT_FD}>&-
+    while IFS= read -r _line <&"$PG_SNAPSHOT_OUTPUT_FD"; do :; done
+    exec {PG_SNAPSHOT_OUTPUT_FD}<&-
+    wait "$PG_SNAPSHOT_PID" || rc=$?
+    PG_SNAPSHOT_INPUT_FD=-1
+    PG_SNAPSHOT_OUTPUT_FD=-1
+    PG_SNAPSHOT_PID=0
+    ((rc == 0)) || die "PostgreSQL snapshot exporter failed"
+}
+
+ch_backup_state() {
+    local backup_operation_id="$1"
+    printf "SELECT status, num_entries, replaceAll(error, '\\t', ' ') FROM system.backups WHERE id={backup_id:String} FORMAT TSVRaw\n" \
+        | ch_query_params "--param_backup_id=$backup_operation_id"
+}
+
+wait_ch_backup_snapshot() {
+    local backup_operation_id="$1" deadline=$((SECONDS + 900)) state status entries error
+    while ((SECONDS < deadline)); do
+        state="$(ch_backup_state "$backup_operation_id")"
+        if [[ -n "$state" ]]; then
+            IFS=$'\t' read -r status entries error <<< "$state"
+            [[ "$entries" =~ ^[0-9]+$ ]] || entries=0
+            case "$status" in
+                BACKUP_CREATED) return 0 ;;
+                BACKUP_FAILED) die "ClickHouse backup failed before snapshot boundary: ${error:-unknown error}" ;;
+                CREATING_BACKUP) ((entries > 0)) && return 0 ;;
+            esac
+        fi
+        sleep 0.1
+    done
+    die "ClickHouse did not establish an immutable backup snapshot within 900 seconds"
+}
+
+wait_ch_backup_complete() {
+    local backup_operation_id="$1" deadline=$((SECONDS + 86400)) state status _entries error
+    while ((SECONDS < deadline)); do
+        state="$(ch_backup_state "$backup_operation_id")"
+        if [[ -n "$state" ]]; then
+            IFS=$'\t' read -r status _entries error <<< "$state"
+            case "$status" in
+                BACKUP_CREATED) return 0 ;;
+                BACKUP_FAILED) die "ClickHouse backup failed: ${error:-unknown error}" ;;
+            esac
+        fi
+        sleep 1
+    done
+    die "ClickHouse backup did not finish within 24 hours"
+}
+
+pg_table_counts() {
+    local database="$1" snapshot="${2:-}"
+    if [[ -n "$snapshot" ]]; then
+        [[ "$snapshot" =~ ^[0-9A-F]{8}-[0-9A-F]{8}-[0-9]+$ ]] || die "invalid PostgreSQL snapshot identifier"
+        pg_query_db "$database" --quiet --set="nano_snapshot=$snapshot" <<'SQL' | LC_ALL=C sort
+BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET TRANSACTION SNAPSHOT :'nano_snapshot';
+SELECT format('SELECT %L || ''|'' || count(*) FROM %I.%I;', schemaname || '.' || tablename, schemaname, tablename)
+FROM pg_tables
+WHERE schemaname <> 'information_schema' AND schemaname NOT LIKE 'pg\_%' ESCAPE '\'
+ORDER BY 1;
+\gexec
+COMMIT;
+SQL
+        return
+    fi
+    pg_query_db "$database" <<'SQL' | LC_ALL=C sort
+SELECT format('SELECT %L || ''|'' || count(*) FROM %I.%I;', schemaname || '.' || tablename, schemaname, tablename)
+FROM pg_tables
+WHERE schemaname <> 'information_schema' AND schemaname NOT LIKE 'pg\_%' ESCAPE '\'
+ORDER BY 1;
+\gexec
+SQL
+}
+
+write_manifest() {
+    python3 -I - "$1" "$2" "$3" "$4" "$CURRENT_VERSION" "$CURRENT_EDITION" "$CURRENT_SCHEMA_PROFILE" "$TOPOLOGY_MODE" \
+        "$DEPLOYMENT_ID" "$DEPLOYMENT_IDENTITY" "$HOST_ID" "$ROLE_LIST" "$CURRENT_SHARD" "$CURRENT_REPLICA" "$SHARD_COUNT" \
+        "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" "${18}" "${19}" "${20}" "${21}" <<'PY'
+import hashlib, json, pathlib, sys
+(out, payload_dir, payload_sha, bid, version, edition, schema, topology, deployment, identity, host, roles, shard, replica, shard_count,
+ pg_in, pg_mig, pg_bytes, ch_in, ch_mig, ch_bytes, disk, archive, external, external_encrypted, scope, base_id, base_sha,
+ created, fingerprint, set_id, quiesce_epoch) = sys.argv[1:]
+root = pathlib.Path(payload_dir)
+def digest_file(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+checksums = {str(p.relative_to(root)): digest_file(p) for p in sorted(root.rglob('*')) if p.is_file()}
+recovery = {"id": set_id, "quiesce_epoch": quiesce_epoch} if topology == "role-split" else None
+document = {
+ "format":"nano-backup-v2", "backup_id":bid, "created_at":created, "nano_version":version, "edition":edition,
+ "schema_profile":schema, "recovery_set":recovery,
+ "topology":{"mode":topology,"deployment_id":deployment,"deployment_identity_sha256":identity or None,"host_id":host,
+             "roles":[r for r in roles.split(',') if r],"clickhouse_shard":int(shard),"clickhouse_replica":int(replica),
+             "clickhouse_shard_count":int(shard_count)},
+ "components":{"postgres":{"included":pg_in=="true","migration_version":int(pg_mig or 0),"source_bytes":int(pg_bytes or 0)},
+               "clickhouse":{"included":ch_in=="true","migration_version":int(ch_mig or 0),"source_bytes":int(ch_bytes or 0),
+                 "disk":disk or None,"archive":archive or None,"external":external=="true",
+                 "external_disk_encrypted":external_encrypted=="true","scope":scope,
+                 "base_backup_id":base_id or None,"base_payload_sha256":base_sha or None},
+               "configuration":{"included":True}},
+ "encryption":{"format":"CMS AuthEnvelopedData","cipher":"AES-256-GCM","recipient_certificate_sha256":fingerprint},
+ "payload":{"file":"payload.cms","sha256":payload_sha,"plaintext_sha256":checksums}}
+pathlib.Path(out).write_text(json.dumps(document, sort_keys=True, indent=2)+'\n', encoding='utf-8')
+PY
+    chmod 600 "$1"
+}
+
+available_pg_migration() {
+    python3 -I - "$INSTALL_DIR" "$CURRENT_EDITION" <<'PY'
+import pathlib,re,sys
+p=list((pathlib.Path(sys.argv[1])/"migrations/postgres").glob("*.sql"))
+if sys.argv[2]=="enterprise": p+=list((pathlib.Path(sys.argv[1])/"migrations/postgres-enterprise").glob("*.sql"))
+v=[int(m.group(1)) for x in p if (m:=re.match(r"(\d+)_",x.name))]; print(max(v,default=0))
+PY
+}
+
+available_ch_migration() {
+    python3 -I - "$INSTALL_DIR" "$CURRENT_EDITION" <<'PY'
+import pathlib,re,sys
+root=pathlib.Path(sys.argv[1]); p=list((root/"clickhouse").glob("*.sql"))
+if sys.argv[2]=="enterprise": p+=list((root/"clickhouse-enterprise").glob("*.sql"))
+v=[int(m.group(1)) for x in p if (m:=re.match(r"(\d+)_",x.name))]; print(max(v,default=0))
+PY
+}
+
+backup_keygen() {
+    local output="" tmp key cert
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --output) [[ $# -ge 2 ]] || usage; output="$2"; shift 2 ;;
+        *) usage ;;
+    esac; done
+    [[ -n "$output" ]] || usage
+    require_cmd openssl "install OpenSSL"
+    [[ ! -e "$output" && ! -L "$output" ]] || die "refusing to overwrite $output"
+    mkdir -p "$(dirname "$output")"
+    tmp="$(mktemp -d "$(dirname "$output")/.nano-key.XXXXXX")"; WORK_DIR="$tmp"
+    key="$tmp/key.pem"; cert="$tmp/cert.pem"
+    log "generating operator backup key"
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$key" >/dev/null 2>&1
+    openssl req -x509 -new -sha256 -days 36500 -key "$key" -subj /CN=nano-backup -out "$cert" >/dev/null 2>&1
+    { cat "$cert"; cat "$key"; } > "$tmp/combined.pem"
+    chmod 600 "$tmp/combined.pem"; mv "$tmp/combined.pem" "$output"
+    WORK_DIR=""; rm -rf -- "$tmp"
+    ok "wrote $output (mode 600); keep it separate from every backup"
+}
+
+copy_local_archive() {
+    local source="$1" archive="$2"
+    assert_ch_locator backups "$archive"
+    [[ -f "$source/$archive" && ! -L "$source/$archive" ]] || die "encrypted payload lacks $archive"
+    "$DOCKER_BIN" exec "$CH_CONTAINER" test ! -e "/var/lib/clickhouse/backups/$archive" \
+        || die "ClickHouse scratch archive already exists: $archive"
+    "$DOCKER_BIN" cp "$source/$archive" "$CH_CONTAINER:/var/lib/clickhouse/backups/$archive"
+    "$DOCKER_BIN" exec "$CH_CONTAINER" chown clickhouse:clickhouse "/var/lib/clickhouse/backups/$archive"
+    "$DOCKER_BIN" exec "$CH_CONTAINER" chmod 600 "/var/lib/clickhouse/backups/$archive"
+    CH_LOCAL_FILES+=("$archive")
+}
+
+validate_ch_counts_file() {
+    local file="$1" table engine rows extra count=0
+    local -A seen=()
+    [[ -f "$file" && ! -L "$file" ]] || die "signed ClickHouse table counts are missing"
+    while IFS=$'\t' read -r table engine rows extra; do
+        if [[ -z "$table" || -n "$extra" || ! "$table" =~ ^[A-Za-z0-9_.-]{1,200}$ \
+            || ! "$engine" =~ ^[A-Za-z]*MergeTree$ || ! "$rows" =~ ^[0-9]+$ ]]; then
+            printf 'nano: invalid signed ClickHouse table count: table=%q engine=%q rows=%q extra=%q\n' \
+                "$table" "$engine" "$rows" "$extra" >&2
+            exit 1
+        fi
+        [[ -z "${seen[$table]+x}" ]] || die "duplicate signed ClickHouse table count: $table"
+        seen[$table]=1; count=$((count + 1))
+    done < "$file"
+    ((count > 0)) || die "signed ClickHouse table counts are empty"
+}
+
+ch_final_clause() {
+    case "$1" in
+        *ReplacingMergeTree|*SummingMergeTree|*AggregatingMergeTree|*CollapsingMergeTree)
+            printf ' FINAL' ;;
+        *MergeTree) : ;;
+        *) die "unsupported signed ClickHouse engine: $1" ;;
+    esac
+}
+
+stop_ch_merges() {
+    ((CH_MERGES_STOPPED == 0)) || return 0
+    printf 'SYSTEM STOP MERGES\n' | ch_query >/dev/null
+    CH_MERGES_STOPPED=1
+}
+
+start_ch_merges() {
+    ((CH_MERGES_STOPPED == 1)) || return 0
+    printf 'SYSTEM START MERGES\n' | ch_query >/dev/null
+    CH_MERGES_STOPPED=0
+}
+
+stop_ch_refreshable_views() {
+    local view extra enabled
+    ((${#CH_REFRESH_VIEWS_STOPPED[@]} == 0)) \
+        || die "ClickHouse refreshable views are already stopped by this restore"
+    enabled="$(
+        printf "SELECT view FROM system.view_refreshes WHERE database='nanosiem' AND status != 'Disabled' ORDER BY view FORMAT TSVRaw\n" \
+            | ch_query
+    )" || die "cannot enumerate ClickHouse refreshable views"
+    [[ -n "$enabled" ]] || return 0
+    while IFS=$'\t' read -r view extra; do
+        [[ -n "$view" && -z "$extra" ]] \
+            || die "cannot enumerate ClickHouse refreshable views safely"
+        printf 'SYSTEM STOP VIEW {database:Identifier}.{view:Identifier}\n' \
+            | ch_query_params --param_database=nanosiem "--param_view=$view" >/dev/null
+        CH_REFRESH_VIEWS_STOPPED+=("$view")
+    done <<< "$enabled"
+}
+
+start_ch_refreshable_views() {
+    local view
+    for view in "${CH_REFRESH_VIEWS_STOPPED[@]}"; do
+        printf 'SYSTEM START VIEW {database:Identifier}.{view:Identifier}\n' \
+            | ch_query_params --param_database=nanosiem "--param_view=$view" >/dev/null
+    done
+    CH_REFRESH_VIEWS_STOPPED=()
+}
+
+write_ch_schema_inventory() {
+    local output="$1" validation_db
+    validation_db="nano_schema_check_$(openssl rand -hex 6)"
+    printf "SELECT toJSONString(map('name',t.name,'engine',t.engine,'engine_full',t.engine_full,'sorting_key',t.sorting_key,'column_name',c.name,'column_type',c.type)) FROM system.tables AS t INNER JOIN system.columns AS c ON c.database=t.database AND c.table=t.name WHERE t.database='nanosiem' AND t.engine LIKE '%%MergeTree' ORDER BY t.name,c.position FORMAT TSVRaw\n" \
+        | ch_query > "$output" || die "cannot capture ClickHouse table schema"
+    [[ -s "$output" ]] || die "ClickHouse table schema inventory is empty"
+    chmod 600 "$output"
+    python3 -I "$MANIFEST_TOOL" verification-ddl "$output" --database "$validation_db" >/dev/null \
+        || die "ClickHouse table schema inventory is unsafe"
+}
+
+verify_ch_archive_contents() {
+    local disk="$1" archive="$2" counts="$3" expected="${4:-}" schema="${5:-}" migration table engine extra rows final
+    local schema_inventory restored_tables
+    schema_inventory="$WORK_DIR/clickhouse-schema-inventory-$(openssl rand -hex 6).tsv"
+    restored_tables="$WORK_DIR/clickhouse-restored-tables-$(openssl rand -hex 6).tsv"
+    assert_ch_locator "$disk" "$archive"
+    [[ -f "$schema" && ! -L "$schema" ]] || die "signed ClickHouse schema inventory is missing"
+    stop_ch_merges
+    CH_VERIFY_DB="nano_archive_check_$(openssl rand -hex 6)"
+    [[ "$CH_VERIFY_DB" =~ ^nano_archive_check_[0-9a-f]{12}$ ]] || die "unsafe archive verification database"
+    printf 'CREATE DATABASE %s\n' "$CH_VERIFY_DB" | ch_query >/dev/null \
+        || die "cannot create isolated ClickHouse verification database"
+    local schema_fields=() index ddl
+    mapfile -d '' -t schema_fields < <(python3 -I "$MANIFEST_TOOL" verification-ddl "$schema" --database "$CH_VERIFY_DB")
+    (( ${#schema_fields[@]} > 0 && ${#schema_fields[@]} % 3 == 0 )) || die "invalid signed ClickHouse schema inventory"
+    : > "$schema_inventory"
+    for ((index=0; index<${#schema_fields[@]}; index+=3)); do
+        table=${schema_fields[index]}; engine=${schema_fields[index+1]}; ddl=${schema_fields[index+2]}
+        printf '%s\n' "$ddl" | ch_query >/dev/null \
+            || die "cannot create isolated ClickHouse verification table: $table"
+        printf '%s\t%s\n' "$table" "$engine" >> "$schema_inventory"
+    done
+    printf 'RESTORE DATABASE nanosiem AS %s FROM Disk({disk:String}, {archive:String}) SETTINGS allow_different_table_def=1, restore_replace_external_dictionary_source_to_null=1, restore_replace_external_engines_to_null=1, restore_replace_external_table_functions_to_null=1\n' "$CH_VERIFY_DB" \
+        | ch_query_params "--param_disk=$disk" "--param_archive=$archive" >/dev/null \
+        || die "ClickHouse archive data verification failed for $disk/$archive"
+    printf "SELECT name,engine FROM system.tables WHERE database={database:String} AND engine LIKE '%%MergeTree' ORDER BY name FORMAT TSVRaw\n" \
+        | ch_query_params "--param_database=$CH_VERIFY_DB" > "$restored_tables" \
+        || die "cannot enumerate verified ClickHouse archive"
+    : > "$counts"
+    if [[ -n "$expected" ]]; then
+        validate_ch_counts_file "$expected"
+        while IFS=$'\t' read -r table engine rows extra; do
+            awk -F '\t' -v table="$table" '$1 == table { found=1 } END { exit !found }' "$restored_tables" \
+                || die "verified ClickHouse archive lacks signed table: $table"
+            final="$(ch_final_clause "$engine")"
+            rows="$(printf 'SELECT count() FROM {database:Identifier}.{table:Identifier}%s FORMAT TSVRaw\n' "$final" \
+                | ch_query_params "--param_database=$CH_VERIFY_DB" "--param_table=$table" | tr -d '[:space:]')"
+            [[ "$rows" =~ ^[0-9]+$ ]] || die "cannot count verified ClickHouse archive table: $table"
+            printf '%s\t%s\t%s\n' "$table" "$engine" "$rows" >> "$counts"
+        done < "$expected"
+    else
+        while IFS=$'\t' read -r table engine extra; do
+            [[ "$table" != _migrations && "$table" != .* && "$table" != *_staging ]] || continue
+            final="$(ch_final_clause "$engine")"
+            rows="$(printf 'SELECT count() FROM {database:Identifier}.{table:Identifier}%s FORMAT TSVRaw\n' "$final" \
+                | ch_query_params "--param_database=$CH_VERIFY_DB" "--param_table=$table" | tr -d '[:space:]')"
+            [[ "$rows" =~ ^[0-9]+$ ]] || die "cannot count verified ClickHouse archive table: $table"
+            printf '%s\t%s\t%s\n' "$table" "$engine" "$rows" >> "$counts"
+        done < "$schema_inventory"
+    fi
+    validate_ch_counts_file "$counts"
+    migration="$(printf "SELECT coalesce(max(toUInt64OrZero(version)),0) FROM {database:Identifier}._migrations FORMAT TSVRaw\n" \
+        | ch_query_params "--param_database=$CH_VERIFY_DB" | tr -d '[:space:]')"
+    [[ "$migration" =~ ^[0-9]+$ ]] || die "cannot read verified ClickHouse migration version"
+    printf 'DROP DATABASE %s SYNC\n' "$CH_VERIFY_DB" | ch_query >/dev/null
+    CH_VERIFY_DB=""
+    start_ch_merges
+    MEASURED_CH_MIG="$migration"
+}
+
+preflight_ch_target_tables() {
+    local counts="$1" table engine rows extra actual_engine present
+    validate_ch_counts_file "$counts"
+    present="$(printf "SELECT count() FROM system.tables WHERE database='nanosiem' AND engine LIKE '%%MergeTree' AND name != '_migrations' FORMAT TSVRaw\n" \
+        | ch_query | tr -d '[:space:]')"
+    [[ "$present" =~ ^[0-9]+$ ]] || die "cannot inspect target ClickHouse schema"
+    if ((present == 0)); then
+        CH_TARGET_SCHEMA_PRESENT=0
         return 0
     fi
-    log "Fetching the signed feed bundle"
-    curl --disable --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-        --max-filesize "$max_bytes" --connect-timeout 20 --max-time 900 \
-        --output "$out" "$bundle_url" || die "bundle fetch failed; retry, or use --file"
+    CH_TARGET_SCHEMA_PRESENT=1
+    while IFS=$'\t' read -r table engine rows extra; do
+        actual_engine="$(printf 'SELECT engine FROM system.tables WHERE database='\''nanosiem'\'' AND name={table:String} FORMAT TSVRaw\n' \
+            | ch_query_params "--param_table=$table" | tr -d '[:space:]')"
+        [[ "$actual_engine" == "$engine" ]] || die "target ClickHouse table engine mismatch: $table"
+    done < "$counts"
 }
 
-install_file() { # <bundle file>
-    local src=$1 work staged
-    [[ -f $src && ! -L $src ]] || die "$src is not a regular file"
-    (( $(stat -c %s "$src") <= max_bytes )) || die "$src exceeds the signed container size bound"
-    work=$(mktemp -d "$root/.nano-feeds-import.XXXXXX")
-    cleanup+=("$work")
-    staged=$work/bundle
-    cp -- "$src" "$staged"
-    # Public, signed feed data (no secret); the service runs as UID 999.
-    chmod 755 "$work"
-    chmod 444 "$staged"
-    log "Verifying and installing $(sha256sum "$staged" | cut -d' ' -f1)"
-    compose run --rm --no-deps -T -v "$staged:$import_path:ro" lean-platform-feeds import --file "$import_path" \
-        || die "the bundle was refused; nothing was changed"
-    log "Installed. New events are stamped from it within about a minute (no restart)."
+truncate_ch_signed_tables() {
+    local counts="$1" table engine rows extra
+    ((CH_TARGET_SCHEMA_PRESENT)) || return 0
+    while IFS=$'\t' read -r table engine rows extra; do
+        printf 'TRUNCATE TABLE nanosiem.{table:Identifier}\n' | ch_query_params "--param_table=$table" >/dev/null
+    done < "$counts"
 }
 
-feeds_update() {
-    local file="" url="" license=""
-    while (($#)); do
-        case $1 in
-            --file) file=${2:-}; [[ -n $file ]] || die "--file needs a path"; shift 2 ;;
-            --url) url=${2:-}; [[ -n $url ]] || die "--url needs a URL"; shift 2 ;;
-            --license-file) license=${2:-}; [[ -n $license ]] || die "--license-file needs a path"; shift 2 ;;
-            *) usage ;;
-        esac
+actual_ch_signed_counts() {
+    local counts="$1" output="$2" table engine rows extra actual final
+    : > "$output"
+    while IFS=$'\t' read -r table engine rows extra; do
+        final="$(ch_final_clause "$engine")"
+        actual="$(printf 'SELECT count() FROM {database:Identifier}.{table:Identifier}%s FORMAT TSVRaw\n' "$final" \
+            | ch_query_params --param_database=nanosiem "--param_table=$table" | tr -d '[:space:]')"
+        [[ "$actual" =~ ^[0-9]+$ ]] || die "cannot measure restored ClickHouse table: $table"
+        printf '%s\t%s\t%s\n' "$table" "$engine" "$actual" >> "$output"
+    done < "$counts"
+}
+
+prune_backups() {
+    local parent="$1" keep="$2" key="$3" public_key="$WORK_DIR/operator.pub" plan="$WORK_DIR/retention-plan.bin" candidate
+    ((keep > 0)) || return 0
+    openssl x509 -in "$key" -pubkey -noout > "$public_key"
+    chmod 600 "$public_key"
+    python3 -I "$MANIFEST_TOOL" retention --parent "$parent" --keep "$keep" --edition "$CURRENT_EDITION" \
+        --identity "$DEPLOYMENT_IDENTITY" --host "$HOST_ID" --public-key "$public_key" > "$plan" \
+        || die "retention verification failed; no bundle was pruned"
+    while IFS= read -r -d '' candidate; do
+        [[ "$(dirname "$candidate")" == "$parent" && -d "$candidate" && ! -L "$candidate" ]] || die "unsafe retention target"
+        rm -rf -- "$candidate"
+        warn "pruned verified backup: $candidate"
+    done < "$plan"
+}
+
+backup_command() {
+    local key_file="" output="" base_bundle="" keep=0 ch_disk=backups on_cluster=0 set_id="" quiesce_epoch="" snapshot_gate="" component=auto
+    local backup_id created payload pg_in=false pg_mig=0 pg_bytes=0 ch_in=false ch_mig=0 ch_bytes=0 archive=""
+    local external=false external_encrypted=false scope=host base_id="" base_sha="" result fingerprint base_snapshot="" base_payload=""
+    local manifest_disk="" backup_started_ms writer_down_started_ms writer_down_ms=0 total_ms
+    local ch_backup_id="" ch_backup_status="" cluster_clause="" cluster="" query=""
+    local params=()
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --key-file) key_file="$2"; shift 2 ;; --output) output="$2"; shift 2 ;; --base) base_bundle="$2"; shift 2 ;;
+        --keep) keep="$2"; shift 2 ;; --clickhouse-disk) ch_disk="$2"; shift 2 ;; --on-cluster) on_cluster=1; shift ;;
+        --recovery-set-id) set_id="$2"; shift 2 ;; --quiesce-epoch) quiesce_epoch="$2"; shift 2 ;;
+        --snapshot-gate) snapshot_gate="$2"; shift 2 ;;
+        --component) component="$2"; shift 2 ;;
+        --install-dir) INSTALL_DIR="$2"; shift 2 ;; *) usage ;;
+    esac; done
+    [[ -n "$key_file" ]] || usage
+    [[ "$keep" =~ ^[0-9]+$ ]] || die "--keep must be a non-negative integer"
+    [[ "$ch_disk" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,63}$ ]] || die "invalid ClickHouse disk"
+    [[ "$component" =~ ^(auto|postgres|clickhouse)$ ]] || die "--component must be postgres or clickhouse"
+    init_context; validate_key_file "$key_file"
+    backup_started_ms="$(monotonic_ms)"
+    ((!on_cluster)) || die "--on-cluster cannot produce per-shard signed recovery components; run on replica 1 of each shard"
+    if [[ "$TOPOLOGY_MODE" == role-split ]]; then
+        [[ "$set_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ ]] || die "role-split backup requires --recovery-set-id"
+        [[ "$quiesce_epoch" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die "role-split backup requires --quiesce-epoch UTC"
+        [[ -z "$base_bundle" ]] || die "role-split incremental backups are unsupported; create a new full recovery set"
+        [[ -z "$snapshot_gate" || "$component" != auto ]] \
+            || die "externally gated role-split backup requires --component"
+    else
+        [[ -z "$set_id$quiesce_epoch" ]] || die "recovery-set options require role-split topology"
+        [[ -z "$snapshot_gate" ]] || die "--snapshot-gate requires role-split topology"
+    fi
+    [[ -z "$snapshot_gate" ]] || validate_snapshot_gate "$snapshot_gate"
+    if ((on_cluster)); then
+        [[ "$TOPOLOGY_MODE" == role-split && "$ch_disk" != backups ]] || die "--on-cluster requires role-split plus a shared external disk"
+        has_role clickhouse || die "run --on-cluster on a ClickHouse host"
+        scope=cluster
+    elif [[ "$TOPOLOGY_MODE" == role-split ]] && has_role clickhouse && ((CURRENT_REPLICA != 1)); then
+        die "local backup runs only on replica 1 of each shard"
+    fi
+    backup_id="nano-$(date -u '+%Y%m%dT%H%M%SZ')-$(openssl rand -hex 4)-$HOST_ID"
+    output="${output:-$INSTALL_DIR/backups/$backup_id}"
+    [[ ! -e "$output" && ! -L "$output" ]] || die "backup output exists: $output"
+    mkdir -p "$(dirname "$output")"
+    BUNDLE_TMP="$(mktemp -d "$(dirname "$output")/.nano-backup.XXXXXX")"
+    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nano-backup.XXXXXX")"; chmod 700 "$WORK_DIR"
+    payload="$WORK_DIR/payload"; mkdir -p "$payload"; chmod 700 "$payload"
+    cp "$INSTALL_DIR/.env" "$payload/.env"
+    [[ ! -f "$INSTALL_DIR/.nano-host-identity" ]] || cp "$INSTALL_DIR/.nano-host-identity" "$payload/.nano-host-identity"
+    [[ ! -f "$INSTALL_DIR/.nano-role.env" ]] || cp "$INSTALL_DIR/.nano-role.env" "$payload/.nano-role.env"
+    if [[ "$component" == postgres || "$component" == auto ]] && has_role postgres; then
+        prepare_pg; pg_in=true
+    fi
+    if [[ "$component" == clickhouse || "$component" == auto ]] && has_role clickhouse; then
+        prepare_ch; ch_in=true; validate_clickhouse_disk "$ch_disk"
+    fi
+    [[ "$component" != postgres || "$pg_in" == true ]] \
+        || die "PostgreSQL backup component requested on a host without the postgres role"
+    [[ "$component" != clickhouse || "$ch_in" == true ]] \
+        || die "ClickHouse backup component requested on a host without the clickhouse role"
+    if [[ -n "$base_bundle" ]]; then
+        base_snapshot="$(snapshot_bundle "$base_bundle" base)" || die "base backup is incomplete"
+        load_snapshot "$base_snapshot" "$key_file" base || die "base backup signature/schema/digest verification failed"
+        save_base_fields
+        [[ -z "$B_BASE_ID" ]] || die "incremental-on-incremental is unsupported; provide a full base"
+        [[ "$B_EDITION" == "$CURRENT_EDITION" && "$B_SCHEMA" == "$CURRENT_SCHEMA_PROFILE" && "$B_MODE" == "$TOPOLOGY_MODE" ]] || die "base backup is incompatible"
+        [[ "$B_DEPLOYMENT" == "$DEPLOYMENT_ID" && "$B_IDENTITY" == "$DEPLOYMENT_IDENTITY" && "$B_DISK" == "$ch_disk" ]] || die "base deployment or disk mismatch"
+        if [[ "$TOPOLOGY_MODE" == role-split ]]; then
+            [[ "$B_SET_ID" == "$set_id" && "$B_QUIESCE_EPOCH" == "$quiesce_epoch" ]] || die "base recovery-set metadata mismatch"
+        fi
+        base_payload="$WORK_DIR/base-payload"
+        decrypt_snapshot "$base_snapshot" "$key_file" "$base_payload" "$B_CHECKSUMS"
+        base_id="$B_BACKUP_ID"; base_sha="$B_PAYLOAD_SHA"
+    fi
+    if [[ "$ch_in" == true ]]; then
+        manifest_disk="$ch_disk"
+        archive="$backup_id.zip"; assert_ch_locator "$ch_disk" "$archive"
+        if [[ -n "$base_bundle" && "$ch_disk" == backups ]]; then copy_local_archive "$base_payload" "$B_ARCHIVE"; fi
+        if ((on_cluster)); then
+            cluster="$(role_env_value CLICKHOUSE_CLUSTER)"
+            [[ "$cluster" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,63}$ ]] || die "invalid cluster"
+            cluster_clause=" ON CLUSTER '$cluster'"
+        fi
+        query="BACKUP DATABASE nanosiem${cluster_clause} TO Disk({disk:String}, {archive:String}) SETTINGS fsync_backup_files=1"
+        params=("--param_disk=$ch_disk" "--param_archive=$archive")
+        if [[ -n "$base_bundle" ]]; then
+            assert_ch_locator "$B_DISK" "$B_ARCHIVE"
+            query+=", base_backup = Disk({base_disk:String}, {base_archive:String})"
+            params+=("--param_base_disk=$B_DISK" "--param_base_archive=$B_ARCHIVE")
+        fi
+        query+=" ASYNC"
+    fi
+    [[ -z "$snapshot_gate" ]] || wait_snapshot_gate_start "$snapshot_gate"
+    writer_down_started_ms="$(monotonic_ms)"
+    # An external coordinator owns the cluster-wide mutation fence and exact
+    # writer plan. Component workers must not stop co-located API or ingest
+    # services behind its back.
+    [[ -n "$snapshot_gate" ]] || quiesce_local_writers
+    if [[ "$pg_in" == true ]]; then
+        start_pg_exported_snapshot
+        pg_mig="$PG_BACKUP_MIGRATION"
+        pg_bytes="$PG_BACKUP_BYTES"
+    fi
+    if [[ "$ch_in" == true ]]; then
+        ch_bytes="$(printf "SELECT coalesce(sum(bytes_on_disk),0) FROM system.parts WHERE active AND database='nanosiem' FORMAT TSVRaw\n" | ch_query | tr -d '[:space:]')"
+        [[ "$ch_bytes" =~ ^[0-9]+$ ]] || die "cannot read ClickHouse backup metadata"
+        log "establishing ClickHouse native backup snapshot on $ch_disk"
+        write_ch_schema_inventory "$payload/clickhouse-table-schema.jsonl"
+        result="$(printf '%s\n' "$query" | ch_query_params "${params[@]}")"
+        IFS=$'\t' read -r ch_backup_id ch_backup_status <<< "${result%%$'\n'*}"
+        [[ "$ch_backup_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ \
+            && "$ch_backup_status" =~ ^(CREATING_BACKUP|BACKUP_CREATED)$ ]] \
+            || die "ClickHouse did not return a valid asynchronous backup operation"
+        [[ "$ch_backup_status" == BACKUP_CREATED ]] || wait_ch_backup_snapshot "$ch_backup_id"
+    fi
+    created="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    [[ -n "$snapshot_gate" ]] || resume_local_writers
+    writer_down_ms=$(( $(monotonic_ms) - writer_down_started_ms ))
+    mark_snapshot_ready "$snapshot_gate"
+    if [[ "$pg_in" == true ]]; then
+        log "creating PostgreSQL custom-format dump from exported snapshot"
+        "$DOCKER_BIN" exec "$PG_CONTAINER" pg_dump --username="$PG_USER" --dbname="$PG_DB" \
+            --snapshot="$PG_BACKUP_SNAPSHOT" -Fc --no-owner --no-privileges > "$payload/postgres.dump"
+        pg_table_counts "$PG_DB" "$PG_BACKUP_SNAPSHOT" > "$payload/postgres-row-counts.tsv"
+        finish_pg_exported_snapshot
+    fi
+    if [[ "$ch_in" == true ]]; then
+        [[ "$ch_backup_status" == BACKUP_CREATED ]] || wait_ch_backup_complete "$ch_backup_id"
+        verify_ch_archive_contents "$ch_disk" "$archive" "$payload/clickhouse-row-counts.tsv" "" \
+            "$payload/clickhouse-table-schema.jsonl"
+        ch_mig="$MEASURED_CH_MIG"
+        if [[ "$ch_disk" == backups ]]; then
+            "$DOCKER_BIN" cp "$CH_CONTAINER:/var/lib/clickhouse/backups/$archive" "$payload/$archive"
+            CH_LOCAL_FILES+=("$archive")
+        else
+            external=true; external_encrypted=true
+        fi
+    fi
+    log "encrypting payload with AES-256-GCM"
+    encrypt_payload "$payload" "$BUNDLE_TMP/payload.cms" "$key_file"
+    fingerprint="$(openssl x509 -in "$key_file" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':')"
+    write_manifest "$BUNDLE_TMP/manifest.json" "$payload" "$(sha256_file "$BUNDLE_TMP/payload.cms")" "$backup_id" \
+        "$pg_in" "$pg_mig" "$pg_bytes" "$ch_in" "$ch_mig" "$ch_bytes" "$manifest_disk" "$archive" "$external" \
+        "$external_encrypted" "$scope" "$base_id" "$base_sha" "$created" "$fingerprint" "$set_id" "$quiesce_epoch"
+    openssl dgst -sha256 -sign "$key_file" -out "$BUNDLE_TMP/manifest.sig" "$BUNDLE_TMP/manifest.json"
+    chmod 600 "$BUNDLE_TMP/manifest.sig"; chmod 700 "$BUNDLE_TMP"
+    mv "$BUNDLE_TMP" "$output"; BUNDLE_TMP=""
+    ok "backup complete: $output"
+    prune_backups "$(cd "$(dirname "$output")" && pwd -P)" "$keep" "$key_file"
+    total_ms=$(( $(monotonic_ms) - backup_started_ms ))
+    ok "backup timing: writers_down_ms=$writer_down_ms total_ms=$total_ms"
+}
+
+recovery_set_create_command() {
+    local key="" output="" max_skew=300 bundle set_id="" epoch="" snapshot temp
+    local bundles=() manifests=()
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --key-file) key="$2"; shift 2 ;; --output) output="$2"; shift 2 ;; --bundle) bundles+=("$2"); shift 2 ;;
+        --max-skew) max_skew="$2"; shift 2 ;; *) usage ;;
+    esac; done
+    [[ -n "$key" && -n "$output" && ${#bundles[@]} -ge 2 ]] || usage
+    [[ "$max_skew" =~ ^[0-9]+$ ]] || die "--max-skew must be a non-negative integer"
+    require_cmd python3 "install Python 3"; require_cmd openssl "install OpenSSL"; validate_key_file "$key"
+    [[ -f "$MANIFEST_TOOL" ]] || die "manifest helper is missing: $MANIFEST_TOOL"
+    [[ ! -e "$output" && ! -L "$output" ]] || die "recovery set output exists: $output"
+    mkdir -p "$(dirname "$output")"
+    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nano-recovery-set.XXXXXX")"; chmod 700 "$WORK_DIR"
+    local index=0
+    for bundle in "${bundles[@]}"; do
+        snapshot="$(snapshot_bundle "$bundle" "component-$index")" || die "component bundle is incomplete: $bundle"
+        load_snapshot "$snapshot" "$key" "component-$index" || die "component bundle failed signature/schema/digest verification: $bundle"
+        [[ -n "$L_SET_ID" && -n "$L_QUIESCE_EPOCH" ]] || die "component lacks recovery-set metadata: $bundle"
+        if [[ -z "$set_id" ]]; then set_id=$L_SET_ID; epoch=$L_QUIESCE_EPOCH; fi
+        [[ "$L_SET_ID" == "$set_id" && "$L_QUIESCE_EPOCH" == "$epoch" ]] || die "component recovery-set metadata mismatch"
+        manifests+=("$snapshot/manifest.json"); index=$((index + 1))
     done
-    [[ -z $file || ( -z $url && -z $license ) ]] || die "--file cannot be combined with online options"
-    require_lean
-    if [[ -n $file ]]; then
-        install_file "$(realpath -- "$file")"
-    else
-        local tmp
-        tmp=$(mktemp -d "$root/.nano-feeds-fetch.XXXXXX")
-        cleanup+=("$tmp")
-        fetch "$tmp/bundle" "$url" "$license"
-        [[ ! -f $tmp/bundle ]] || install_file "$tmp/bundle"
-    fi
-    feeds_status
+    temp="$(mktemp -d "$(dirname "$output")/.nano-recovery-set.XXXXXX")"; BUNDLE_TMP="$temp"
+    python3 -I "$MANIFEST_TOOL" create-set --set-id "$set_id" --quiesce-epoch "$epoch" --max-skew "$max_skew" \
+        --output "$temp/recovery-set.json" "${manifests[@]}" >/dev/null
+    openssl dgst -sha256 -sign "$key" -out "$temp/recovery-set.sig" "$temp/recovery-set.json"
+    chmod 600 "$temp/recovery-set.json" "$temp/recovery-set.sig"; chmod 700 "$temp"
+    mv "$temp" "$output"; BUNDLE_TMP=""
+    ok "signed recovery set complete: $output"
 }
 
-feeds_status() {
-    require_lean
-    if [[ -n $(compose ps -q lean-platform-feeds 2>/dev/null) ]]; then
-        compose exec -T lean-platform-feeds lake_platform_feeds status
-    else
-        compose run --rm --no-deps -T lean-platform-feeds status
+ensure_target_compatible() {
+    [[ "$M_EDITION" == "$CURRENT_EDITION" ]] || die "edition mismatch"
+    [[ "$M_SCHEMA" == "$CURRENT_SCHEMA_PROFILE" ]] || die "schema profile mismatch ($M_SCHEMA backup, $CURRENT_SCHEMA_PROFILE target)"
+    [[ "$M_MODE" == "$TOPOLOGY_MODE" ]] || die "backup topology $M_MODE cannot restore onto $TOPOLOGY_MODE"
+    version_ge "$CURRENT_VERSION" "$M_VERSION" || die "refusing backup from nano $M_VERSION on older nano $CURRENT_VERSION"
+    (( $(available_pg_migration) >= M_PG_MIG )) || die "current PostgreSQL migrations are older than backup migration $M_PG_MIG"
+    (( $(available_ch_migration) >= M_CH_MIG )) || die "current ClickHouse migrations are older than backup migration $M_CH_MIG"
+    if [[ "$M_MODE" == role-split ]]; then
+        [[ "$M_DEPLOYMENT" == "$DEPLOYMENT_ID" && "$M_IDENTITY" == "$DEPLOYMENT_IDENTITY" ]] || die "deployment identity mismatch"
+        [[ "$M_SCOPE" == cluster || "$M_HOST" == "$HOST_ID" ]] || die "backup host mismatch"
+        if [[ "$M_CH" == true ]]; then
+            [[ "$M_SHARD" == "$CURRENT_SHARD" && "$M_REPLICA" == "$CURRENT_REPLICA" ]] || die "ClickHouse shard/replica mismatch"
+        fi
     fi
 }
 
-case ${1:-} in
-    feeds)
-        shift
-        case ${1:-} in
-            update) shift; feeds_update "$@" ;;
-            status) shift; (($# == 0)) || usage; feeds_status ;;
-            *) usage ;;
-        esac
-        ;;
+clickhouse_nonempty() {
+    local rows
+    rows="$(printf "SELECT coalesce(sum(rows),0) FROM system.parts WHERE active AND database='nanosiem' AND table != '_migrations' FORMAT TSVRaw\n" | ch_query | tr -d '[:space:]')"
+    [[ "$rows" =~ ^[0-9]+$ ]] || die "cannot read ClickHouse row count"
+    ((rows > 0))
+}
+
+pg_fence_and_counts() {
+    local line locker_pid="" read_fd write_fd coproc_read coproc_write coproc_pid counts="$WORK_DIR/postgres-target-counts.tsv"
+    PG_PUBLIC_CONNECT="$(pg_admin_query <<SQL | tr -d '[:space:]'
+SELECT EXISTS (SELECT 1 FROM pg_database d, LATERAL aclexplode(COALESCE(d.datacl, acldefault('d', d.datdba))) a WHERE d.datname='$PG_DB' AND a.grantee=0 AND a.privilege_type='CONNECT');
+SQL
+    )"
+    coproc NANO_PG_FENCE {
+        "$DOCKER_BIN" exec -i "$PG_CONTAINER" psql -X -qAt --set ON_ERROR_STOP=1 --username="$PG_USER" --dbname="$PG_DB"
+    }
+    coproc_read=${NANO_PG_FENCE[0]}; coproc_write=${NANO_PG_FENCE[1]}
+    exec {read_fd}<&"$coproc_read"
+    exec {write_fd}>&"$coproc_write"
+    exec {coproc_read}<&-
+    exec {coproc_write}>&-
+    coproc_pid=$NANO_PG_FENCE_PID
+    cat >&"$write_fd" <<'SQL'
+BEGIN;
+SET lock_timeout='120s';
+SELECT format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE;', schemaname, tablename)
+FROM pg_tables
+WHERE schemaname <> 'information_schema' AND schemaname NOT LIKE 'pg\_%' ESCAPE '\'
+ORDER BY 1;
+\gexec
+SELECT '__NANO_READY__|' || pg_backend_pid();
+SQL
+    while IFS= read -r line <&"$read_fd"; do
+        if [[ "$line" == __NANO_READY__\|* ]]; then locker_pid=${line#*|}; break; fi
+    done
+    [[ "$locker_pid" =~ ^[0-9]+$ ]] || die "PostgreSQL fence session failed"
+    PG_FENCED=1
+    pg_admin_query >/dev/null <<SQL
+REVOKE CONNECT ON DATABASE "$PG_DB" FROM PUBLIC;
+ALTER DATABASE "$PG_DB" WITH ALLOW_CONNECTIONS false;
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$PG_DB' AND pid <> $locker_pid;
+SQL
+    cat >&"$write_fd" <<'SQL'
+SELECT format('SELECT %L || ''|'' || count(*) FROM %I.%I;', schemaname || '.' || tablename, schemaname, tablename)
+FROM pg_tables
+WHERE schemaname <> 'information_schema' AND schemaname NOT LIKE 'pg\_%' ESCAPE '\' AND tablename <> '_sqlx_migrations'
+ORDER BY 1;
+\gexec
+COMMIT;
+\q
+SQL
+    exec {write_fd}>&-
+    : > "$counts"
+    while IFS= read -r line <&"$read_fd"; do [[ -z "$line" ]] || printf '%s\n' "$line" >> "$counts"; done
+    exec {read_fd}>&-
+    wait "$coproc_pid" || die "PostgreSQL fence/count session failed"
+    LC_ALL=C sort -o "$counts" "$counts"
+    PG_TARGET_COUNTS="$counts"
+}
+
+counts_nonempty() { awk -F '|' '$NF + 0 > 0 { found=1 } END { exit !found }' "$1"; }
+
+ensure_database_space() {
+    local required=$((M_PG_BYTES * 2 + 134217728)) available_kb
+    available_kb="$("$DOCKER_BIN" exec "$PG_CONTAINER" df -Pk /var/lib/postgresql/data | awk 'NR==2 {print $4}')"
+    [[ "$available_kb" =~ ^[0-9]+$ ]] || die "cannot determine PostgreSQL free space"
+    ((available_kb * 1024 >= required)) || die "insufficient PostgreSQL space for staging restore"
+}
+
+ensure_clickhouse_space() {
+    local free required=$((M_CH_BYTES + 134217728))
+    free="$(printf "SELECT free_space FROM system.disks WHERE name='default' FORMAT TSVRaw\n" | ch_query | head -1 | tr -d '[:space:]')"
+    [[ "$free" =~ ^[0-9]+$ ]] || die "cannot determine ClickHouse free space"
+    ((free >= required)) || die "insufficient ClickHouse space for restore"
+}
+
+clear_restored_mutation_fence() {
+    local database="$1"
+    # The recovery set is captured while this cluster-visible flag is active.
+    # It is transient coordination state, not application data: carrying it
+    # into the restored database would reject every API mutation indefinitely.
+    "$DOCKER_BIN" exec -i "$PG_CONTAINER" psql -X -q --set ON_ERROR_STOP=1 \
+        --username="$PG_USER" --dbname="$database" >/dev/null <<'SQL'
+SELECT 'UPDATE public.backup_mutation_fence'
+       ' SET active=false, owner=NULL, activated_at=NULL'
+       ' WHERE singleton=true'
+WHERE to_regclass('public.backup_mutation_fence') IS NOT NULL;
+\gexec
+SQL
+}
+
+restore_postgres_stage() {
+    local payload="$1" expected actual="$WORK_DIR/postgres-restored-counts.tsv"
+    expected="$payload/postgres-row-counts.tsv"
+    [[ -f "$payload/postgres.dump" && -f "$expected" ]] || die "payload lacks PostgreSQL dump/counts"
+    PG_STAGE_DB="nano_restore_$(openssl rand -hex 6)"; PG_ROLLBACK_DB="nano_before_$(openssl rand -hex 6)"
+    [[ "$PG_STAGE_DB" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ && "$PG_ROLLBACK_DB" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || die "unsafe staging database name"
+    pg_admin_query >/dev/null <<SQL
+CREATE DATABASE "$PG_STAGE_DB" OWNER "$PG_USER" TEMPLATE template0;
+SQL
+    log "restoring PostgreSQL into fenced staging database"
+    "$DOCKER_BIN" exec -i "$PG_CONTAINER" pg_restore --username="$PG_USER" --dbname="$PG_STAGE_DB" --no-owner --no-privileges \
+        --exit-on-error --single-transaction < "$payload/postgres.dump"
+    clear_restored_mutation_fence "$PG_STAGE_DB"
+    pg_table_counts "$PG_STAGE_DB" > "$actual"
+    cmp -s "$expected" "$actual" || die "PostgreSQL restored row counts do not match signed backup"
+}
+
+rotate_postgres_password() {
+    local restored_env="$1" database="$2" sql="$WORK_DIR/alter-role.sql"
+    python3 -I - "$restored_env" "$PG_USER" "$sql" <<'PY'
+import pathlib,sys
+p=None
+for line in open(sys.argv[1]):
+ if line.startswith("POSTGRES_PASSWORD="):
+  p=line.split("=",1)[1].rstrip("\r\n")
+  if len(p)>=2 and p[0]==p[-1] and p[0] in "\"'":p=p[1:-1]
+  break
+if p is None:raise SystemExit("missing restored PostgreSQL password")
+pathlib.Path(sys.argv[3]).write_text(f'ALTER ROLE "{sys.argv[2]}" PASSWORD \'{p.replace(chr(39),chr(39)*2)}\';\n')
+PY
+    chmod 600 "$sql"
+    "$DOCKER_BIN" exec -i "$PG_CONTAINER" psql -X --set ON_ERROR_STOP=1 --username="$PG_USER" --dbname="$database" < "$sql" >/dev/null
+}
+
+pg_cutover() {
+    PG_CUTOVER=1
+    pg_admin_query >/dev/null <<SQL
+ALTER DATABASE "$PG_STAGE_DB" WITH ALLOW_CONNECTIONS false;
+BEGIN;
+ALTER DATABASE "$PG_DB" RENAME TO "$PG_ROLLBACK_DB";
+ALTER DATABASE "$PG_STAGE_DB" RENAME TO "$PG_DB";
+COMMIT;
+SQL
+}
+
+wait_pg_admin() {
+    local deadline=$(( $(date +%s) + 120 ))
+    until "$DOCKER_BIN" exec "$PG_CONTAINER" pg_isready --username="$PG_USER" --dbname=postgres >/dev/null 2>&1; do
+        (( $(date +%s) < deadline )) || die "recreated PostgreSQL did not become ready"
+        sleep 2
+    done
+}
+
+drop_pg_rollback() {
+    [[ -n "$PG_ROLLBACK_DB" ]] || return 0
+    pg_admin_query >/dev/null <<SQL
+DROP DATABASE IF EXISTS "$PG_ROLLBACK_DB" WITH (FORCE);
+SQL
+    PG_ROLLBACK_DB=""
+}
+
+merge_restored_env() {
+    python3 -I - "$INSTALL_DIR/.env" "$1" "$2" <<'PY'
+import pathlib,re,sys
+cur,bak,out=map(pathlib.Path,sys.argv[1:])
+def vals(lines):
+ r={}
+ for line in lines:
+  m=re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$",line)
+  if m:r[m.group(1)]=m.group(2)
+ return r
+cl=cur.read_text().splitlines();bl=bak.read_text().splitlines();c=vals(cl);b=vals(bl)
+required={"POSTGRES_PASSWORD","CLICKHOUSE_PASSWORD","CLICKHOUSE_ADMIN_PASSWORD","JWT_SECRET","NANOSIEM_ENCRYPTION_KEY"};missing=sorted(required-b.keys())
+if missing:raise SystemExit("backup .env lacks: "+", ".join(missing))
+protected={"NANO_VERSION","NANO_IMAGE_PREFIX","NANO_EDITION","NANO_DEPLOYMENT_IDENTITY_SHA256","NANO_SCHEMA_PROFILE","BASE_URL","NANOSIEM_DEV_MODE","COMPOSE_PROJECT_NAME","COMPOSE_PROFILES","POSTGRES_USER","POSTGRES_DB","CLICKHOUSE_MEM_LIMIT","NANO_VECTOR_NATIVE_BIND_ADDRESS","NANO_OTLP_BIND_ADDRESS","NANO_FLUENT_BIND_ADDRESS","NANO_TENZIR_BIND_ADDRESS"}
+for k in protected:
+ if k in c:b[k]=c[k]
+ else:b.pop(k,None)
+seen=set();lines=[]
+for line in bl:
+ m=re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$",line)
+ if m:
+  k=m.group(1)
+  if k in b:lines.append(f"{k}={b[k]}");seen.add(k)
+ else:lines.append(line)
+for k in sorted(b.keys()-seen):lines.append(f"{k}={b[k]}")
+out.write_text("\n".join(lines)+"\n")
+PY
+    chmod 600 "$2"
+}
+
+clickhouse_passwords_match() {
+    python3 -I - "$1" "$2" <<'PY'
+import re, sys
+def values(path):
+ result={}
+ for line in open(path,encoding="utf-8"):
+  match=re.match(r"^(CLICKHOUSE_[A-Z0-9_]*PASSWORD)=(.*)$",line.rstrip("\r\n"))
+  if match:
+   value=match.group(2)
+   if len(value)>=2 and value[0]==value[-1] and value[0] in "\"'":value=value[1:-1]
+   result[match.group(1)]=value
+ return result
+raise SystemExit(0 if values(sys.argv[1])==values(sys.argv[2]) else 1)
+PY
+}
+
+start_mutation() {
+    MUTATION_STARTED=1
+    write_recovery_marker
+}
+
+restore_command() {
+    local key="" bundle="" base="" recovery_set="" force=0 override="" on_cluster=0
+    while [[ $# -gt 0 ]]; do case "$1" in
+        --key-file) key="$2"; shift 2 ;; --from) bundle="$2"; shift 2 ;; --base) base="$2"; shift 2 ;;
+        --recovery-set) recovery_set="$2"; shift 2 ;; --force) force=1; shift ;; --clickhouse-disk) override="$2"; shift 2 ;;
+        --on-cluster) on_cluster=1; shift ;; --install-dir) INSTALL_DIR="$2"; shift 2 ;; *) usage ;;
+    esac; done
+    [[ -n "$key" && -n "$bundle" ]] || usage
+    init_context; validate_key_file "$key"
+    ((!on_cluster)) || die "--on-cluster cannot validate a per-shard signed recovery component; restore each shard separately"
+    [[ ! -e "$RECOVERY_MARKER" && ! -L "$RECOVERY_MARKER" ]] || die "unresolved restore marker exists: $RECOVERY_MARKER"
+    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nano-restore.XXXXXX")"; chmod 700 "$WORK_DIR"
+    RESTORE_SOURCE_LABEL="$bundle"
+    local primary_snapshot base_snapshot="" payload="$WORK_DIR/payload" base_payload="$WORK_DIR/base-payload" restored="$WORK_DIR/restored.env"
+    primary_snapshot="$(snapshot_bundle "$bundle" primary)" || die "backup bundle is incomplete"
+    load_snapshot "$primary_snapshot" "$key" primary || die "backup signature/schema/payload digest verification failed"
+    save_primary_fields; ensure_target_compatible
+    if [[ -n "$M_BASE_ID" ]]; then
+        [[ -n "$base" ]] || die "incremental requires --base before any target write"
+        base_snapshot="$(snapshot_bundle "$base" base)" || die "base bundle is incomplete"
+        load_snapshot "$base_snapshot" "$key" base || die "base signature/schema/payload digest verification failed"
+        save_base_fields
+        [[ -z "$B_BASE_ID" ]] || die "incremental base is not full; complete base chain is required"
+        [[ "$B_BACKUP_ID" == "$M_BASE_ID" && "$B_PAYLOAD_SHA" == "$M_BASE_SHA" ]] || die "wrong base id or digest"
+        [[ "$B_DISK" == "$M_DISK" && "$B_EDITION" == "$M_EDITION" && "$B_SCHEMA" == "$M_SCHEMA" && "$B_MODE" == "$M_MODE" ]] || die "base is incompatible"
+        [[ "$B_DEPLOYMENT" == "$M_DEPLOYMENT" && "$B_IDENTITY" == "$M_IDENTITY" ]] || die "base deployment mismatch"
+        if [[ "$M_MODE" == role-split ]]; then
+            [[ "$B_SET_ID" == "$M_SET_ID" && "$B_QUIESCE_EPOCH" == "$M_QUIESCE_EPOCH" ]] || die "base recovery-set mismatch"
+        fi
+    else
+        [[ -z "$base" ]] || die "full backup does not accept --base"
+    fi
+    if [[ "$M_MODE" == role-split ]]; then
+        [[ -n "$recovery_set" ]] || die "role-split restore requires --recovery-set"
+        validate_recovery_set_membership "$recovery_set" "$key"
+    else
+        [[ -z "$recovery_set" ]] || die "single-node restore does not accept --recovery-set"
+    fi
+    local snapshot_bytes
+    snapshot_bytes="$(file_size "$primary_snapshot/payload.cms")"
+    [[ -z "$base_snapshot" ]] || snapshot_bytes=$((snapshot_bytes + $(file_size "$base_snapshot/payload.cms")))
+    ensure_host_space "$WORK_DIR" "$((snapshot_bytes * 3 + 134217728))"
+    decrypt_snapshot "$primary_snapshot" "$key" "$payload" "$M_CHECKSUMS"
+    [[ -z "$base_snapshot" ]] || decrypt_snapshot "$base_snapshot" "$key" "$base_payload" "$B_CHECKSUMS"
+    [[ -f "$payload/.env" ]] || die "encrypted payload lacks .env"
+    merge_restored_env "$payload/.env" "$restored"
+    [[ "$M_PG" != true ]] || prepare_pg
+    [[ "$M_CH" != true ]] || prepare_ch
+    preflight_restore_runtime "$restored"
+    if [[ "$M_CH" == true ]]; then
+        [[ -z "$override" || "$override" == "$M_DISK" ]] || die "ClickHouse disk override does not match signed manifest"
+        if ((on_cluster)); then [[ "$M_SCOPE" == cluster ]] || die "host backup cannot use --on-cluster"; else [[ "$M_SCOPE" != cluster ]] || die "cluster backup requires --on-cluster"; fi
+        validate_clickhouse_disk "$M_DISK"
+        [[ "$M_EXTERNAL" != true || "$M_EXTERNAL_ENCRYPTED" == true ]] || die "external backup lacks encrypted-disk attestation"
+        ensure_clickhouse_space
+        if [[ "$M_EXTERNAL" != true ]]; then
+            [[ -z "$base_snapshot" ]] || copy_local_archive "$base_payload" "$B_ARCHIVE"
+            copy_local_archive "$payload" "$M_ARCHIVE"
+        fi
+        if [[ -n "$base_snapshot" ]]; then
+            verify_ch_archive_contents "$B_DISK" "$B_ARCHIVE" "$WORK_DIR/clickhouse-base-preflight-counts.tsv" \
+                "$base_payload/clickhouse-row-counts.tsv" "$base_payload/clickhouse-table-schema.jsonl"
+            cmp -s "$base_payload/clickhouse-row-counts.tsv" "$WORK_DIR/clickhouse-base-preflight-counts.tsv" \
+                || die "base ClickHouse archive does not match its signed table counts"
+        fi
+        verify_ch_archive_contents "$M_DISK" "$M_ARCHIVE" "$WORK_DIR/clickhouse-preflight-counts.tsv" \
+            "$payload/clickhouse-row-counts.tsv" "$payload/clickhouse-table-schema.jsonl"
+        [[ "$MEASURED_CH_MIG" == "$M_CH_MIG" ]] || die "ClickHouse archive migration version does not match signed manifest"
+        if ! cmp -s "$payload/clickhouse-row-counts.tsv" "$WORK_DIR/clickhouse-preflight-counts.tsv"; then
+            warn "ClickHouse signed/archive row-count difference:"
+            diff -u "$payload/clickhouse-row-counts.tsv" "$WORK_DIR/clickhouse-preflight-counts.tsv" >&2 || true
+            die "ClickHouse archive does not match its signed table counts"
+        fi
+        preflight_ch_target_tables "$payload/clickhouse-row-counts.tsv"
+        if ((!force)) && clickhouse_nonempty; then die "refusing non-empty ClickHouse; use --force"; fi
+    fi
+    [[ "$M_PG" != true ]] || ensure_database_space
+    quiesce_local_writers
+    if [[ "$M_PG" == true ]]; then
+        pg_fence_and_counts
+        if ((!force)) && counts_nonempty "$PG_TARGET_COUNTS"; then
+            pg_unfence_target
+            die "refusing non-empty PostgreSQL; use --force"
+        fi
+    fi
+    start_mutation
+    [[ "$M_PG" != true ]] || restore_postgres_stage "$payload"
+    if [[ "$M_CH" == true ]]; then
+        local allow=0 cluster="" cluster_clause="" except_clause="" result query
+        ((force)) && allow=1
+        if ((on_cluster)); then
+            cluster="$(role_env_value CLICKHOUSE_CLUSTER)"
+            [[ "$cluster" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,63}$ ]] || die "invalid cluster"
+            cluster_clause=" ON CLUSTER '$cluster'"
+        fi
+        assert_ch_locator "$M_DISK" "$M_ARCHIVE"
+        stop_ch_merges
+        # Refreshable materialized views can append derived rows while base
+        # tables are restored, making the signed recovery image impossible to
+        # validate exactly. Pause only views that were enabled before the
+        # restore and preserve that plan in the recovery marker on failure.
+        stop_ch_refreshable_views
+        truncate_ch_signed_tables "$payload/clickhouse-row-counts.tsv"
+        ((CH_TARGET_SCHEMA_PRESENT)) && except_clause=" EXCEPT TABLES nanosiem._migrations"
+        query="RESTORE DATABASE nanosiem${cluster_clause}${except_clause} FROM Disk({disk:String}, {archive:String}) SETTINGS allow_non_empty_tables=$allow"
+        log "restoring ClickHouse (allow_non_empty_tables=$allow)"
+        result="$(printf '%s\n' "$query" | ch_query_params "--param_disk=$M_DISK" "--param_archive=$M_ARCHIVE")" \
+            || die "ClickHouse restore command failed"
+        grep -q RESTORED <<<"$result" || die "ClickHouse did not report RESTORED"
+        local actual_ch="$WORK_DIR/clickhouse-restored-counts.tsv"
+        actual_ch_signed_counts "$payload/clickhouse-row-counts.tsv" "$actual_ch"
+        if ! cmp -s "$payload/clickhouse-row-counts.tsv" "$actual_ch"; then
+            warn "ClickHouse signed/actual row-count difference:"
+            diff -u "$payload/clickhouse-row-counts.tsv" "$actual_ch" >&2 || true
+            die "ClickHouse restored row counts do not match signed backup"
+        fi
+        start_ch_merges
+        start_ch_refreshable_views
+    fi
+    local recreate_ch=0
+    if [[ "$M_CH" == true ]] && ! clickhouse_passwords_match "$INSTALL_DIR/.env" "$restored"; then recreate_ch=1; fi
+    if [[ "$M_PG" == true ]]; then
+        rotate_postgres_password "$restored" "$PG_STAGE_DB"
+        pg_cutover
+    fi
+    log "cutting over validated databases and encrypted secrets"
+    cp "$restored" "$INSTALL_DIR/.env.restore"; chmod 600 "$INSTALL_DIR/.env.restore"; mv "$INSTALL_DIR/.env.restore" "$INSTALL_DIR/.env"
+    local recreate=()
+    [[ "$M_PG" != true ]] || recreate+=(postgres)
+    (( ! recreate_ch )) || recreate+=(clickhouse)
+    [[ ${#recreate[@]} -eq 0 ]] || dc up -d --force-recreate "${recreate[@]}" >/dev/null
+    if [[ "$M_PG" == true ]]; then
+        PG_CONTAINER="$(service_container postgres)"
+        wait_pg_admin
+        pg_unfence_target
+    fi
+    if [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then dc up -d "${STOPPED_SERVICES[@]}" >/dev/null; fi
+    [[ "$M_PG" != true ]] || drop_pg_rollback || warn "validated restore succeeded but old PostgreSQL database remains: $PG_ROLLBACK_DB"
+    STOPPED_SERVICES=(); MUTATION_STARTED=0
+    [[ ! -f "$RECOVERY_MARKER" ]] || rm -f -- "$RECOVERY_MARKER"
+    ok "restore complete from immutable snapshot of $bundle"
+}
+
+case "$COMMAND" in
+    backup-keygen) backup_keygen "$@" ;;
+    backup) backup_command "$@" ;;
+    recovery-set-create) recovery_set_create_command "$@" ;;
+    restore) restore_command "$@" ;;
+    help|-h|--help) usage ;;
     *) usage ;;
 esac

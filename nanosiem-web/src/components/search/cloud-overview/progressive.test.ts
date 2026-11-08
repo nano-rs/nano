@@ -3,7 +3,7 @@ import { expect, it, vi } from 'vitest';
 import { loadOverviewSections, mergeOverviewSection } from './progressive';
 import type { CloudOverviewResponse } from '@/lib/api/types';
 function part(section: CloudOverviewResponse['section']): CloudOverviewResponse {
-  return { section, header: { events_total: 42, events_denied: section === 'denied' ? 3 : 0 }, timeline: { markers: section === 'changes' ? ['change'] : [], lanes: section === 'identities' ? ['identity'] : [], points: [] }, accounts: [], risky_principals: [], service_health: [], anomalies: [], changes: [], preview_events: [] } as unknown as CloudOverviewResponse;
+  return { section, header: { events_total: 42, events_denied: section === 'denied' ? 3 : 0 }, timeline: { markers: section === 'changes' ? ['change'] : [], lanes: section === 'identities' ? ['identity'] : [], points: [] }, accounts: [], risky_principals: [], service_health: [], anomalies: [], changes: [], } as unknown as CloudOverviewResponse;
 }
 it('paints a bounded page and fast cards while identity remains pending, with at most two requests', async () => {
   let release!: (value: CloudOverviewResponse) => void;
@@ -42,9 +42,11 @@ it('merges card results identically regardless of completion order', () => {
   expect(merged[0].timeline.markers).toEqual(['change']);
   expect(merged[0].timeline.lanes).toEqual(['identity']);
 });
-it('coalesces oversized card results into a single durable fallback decision', async () => {
-  const outcome = await loadOverviewSections(async section => ({ ...part(section as CloudOverviewResponse['section']), requires_durable: section === 'identities' || section === 'services' }), new AbortController().signal, vi.fn(), vi.fn());
-  expect(outcome.needsDurable).toBe(true);
+it('treats an unsectioned page answer as the complete overview', async () => {
+  const fetch = vi.fn(async () => part(undefined));
+  const outcome = await loadOverviewSections(fetch, new AbortController().signal, vi.fn(), vi.fn());
+  expect(outcome.full).toBe(true);
+  expect(fetch).toHaveBeenCalledTimes(1);
 });
 
 it('reports an error if neither the preview nor any card can load', async () => {

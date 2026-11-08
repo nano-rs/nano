@@ -16,6 +16,9 @@ pub enum ClickHouseMigrateError {
     #[error("Migration file name invalid: {0}")]
     InvalidFileName(String),
 
+    #[error("invalid post-migration refresh declaration in {filename}: {detail}")]
+    InvalidRefreshDirective { filename: String, detail: String },
+
     #[error(
         "missing migration(s) not yet applied: {missing:?}. Run the clickhouse_migrator \
          binary (or the pre-deploy migration Job) before starting nanosiem-api."
@@ -51,6 +54,9 @@ pub struct ClickHouseMigrator {
     pub(super) is_cloud: Option<bool>,
     /// Cluster name if running against a sharded cluster (detected on first run)
     pub(super) cluster: Option<Option<String>>,
+    /// Server `(major, minor)` from `version()`, detected on first run. The
+    /// inner `None` means the probe failed (treated as a current server).
+    pub(super) server_version: Option<Option<(u32, u32)>>,
 }
 
 /// NAN-1029: default distributed DDL coordination timeout for every query the
@@ -86,12 +92,18 @@ impl ClickHouseMigrator {
                 "distributed_ddl_task_timeout",
                 MIGRATOR_DISTRIBUTED_DDL_TIMEOUT_SECS,
             )
-            .with_option("max_execution_time", MIGRATOR_MAX_EXECUTION_TIME_SECS);
+            .with_option("max_execution_time", MIGRATOR_MAX_EXECUTION_TIME_SECS)
+            // NAN-4906: CH 26.9+ answers `compress=1` with ZSTD unless told
+            // otherwise; clickhouse-rs 0.14 decodes LZ4 only. Production
+            // clients already carry this (`db::clickhouse_transport::client`);
+            // repeating it covers callers that pass a bare client.
+            .with_option("network_compression_method", "LZ4");
         Self {
             client,
             database: database.into(),
             is_cloud: None,
             cluster: None,
+            server_version: None,
         }
     }
 }
@@ -119,10 +131,7 @@ mod tests {
             max_exec > ddl_timeout,
             "max_execution_time={max_exec}s must exceed distributed_ddl_task_timeout={ddl_timeout}s"
         );
-        assert!(
-            max_exec >= 900,
-            "max_execution_time={max_exec}s too short for real DDL"
-        );
+        assert!(max_exec >= 900, "max_execution_time={max_exec}s too short for real DDL");
     }
 
     #[test]

@@ -1,39 +1,42 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+// Nano Pipe model (NAN-4919; ported from main NAN-3418). A pipeline is stored
+// in the log source's existing `parser_vrl` as one header line carrying the
+// step plan plus a fixed marker body that the server compiles at publication:
+//
+//   # nano-pipe-v2 {"version":2,"revision":N,"steps":[...]}
+//   # Processing plan compiled by Nano at publication.
+//   nano_pipe_plan_v2()
+//
+// The server compiler (`nanosiem-core/src/parsers/pipe.rs`) is authoritative.
+// The client compile below is an authoring guard and an inspection aid only.
+
 import { groupBoundSource, PIPE_MAX_DEDUPE_EVENTS, PIPE_MAX_EXPIRE_SECONDS } from './pipe-group-bounds';
-import type { LogSource, TenantParserRollout } from './api/types';
-import type { CapturedEvent, PipelineDraft, PipelinePreview, PipelineStep, PipelineStepKind, PipelineRelease, PipelineSummary } from './pipeline-types';
+import type { LogSource, LogSourceVersion } from './api/types';
+import type { PipelineDraft, PipelinePreview, PipelineRelease, PipelineStep, PipelineStepKind, PipelineSummary, CapturedEvent } from './pipeline-types';
 
-const HEADER = '# nano-pipe-v2 ';
+export const PIPE_HEADER = '# nano-pipe-v2 ';
 const LEGACY_HEADER = '# nano-pipe-v1 ';
-const PLAN_BODY = '# Processing plan compiled by Nano at publication.\nnano_pipe_plan_v2()';
+export const PIPE_PLAN_BODY = '# Processing plan compiled by Nano at publication.\nnano_pipe_plan_v2()';
+export const MAX_PIPE_STEPS = 50;
+/** Step kinds the server emits as native Vector transforms. */
+export const NATIVE_STEP_KINDS: readonly PipelineStepKind[] = ['dedupe', 'combine', 'route', 'lookup'];
 
-/** NAN-3452: the one line the preview shows about what it does not run. */
-export const PREVIEW_SCOPE_NOTE = 'Preview runs a frozen batch of draft processing. No normalization or sinks. Times in UTC.';
+/** The one line the preview shows about what it does not run. */
+export const PREVIEW_SCOPE_NOTE = 'Preview runs the draft over a frozen batch in an isolated worker. No normalization or sinks. Times in UTC.';
 /** Detail behind the scope note's info icon. */
 export const PREVIEW_SCOPE_DETAILS = [
-  'Platform normalization, buffering, existing production sampling and sinks are excluded. Native Vector stateful steps use isolated batch simulation.',
-  'Dedupe starts with an empty cache. Partial groups flush at the end of the sample; production uses its event limit and idle timeout per Vector instance.',
-  'Step traces replay cumulative draft prefixes independently, so time and random functions can differ between stages.',
+  'Platform normalization, sink encoding, existing production sampling and live Vector state are excluded.',
+  'Dedupe, combine, route and lookup are simulated with fresh state per run; partial groups flush at the end of the sample.',
+  'The source extension (when enabled) runs after the pipeline as a separate program, as in production.',
   'Implicit timezones use UTC; specify a timezone in VRL when you need another.',
 ] as const;
-/**
- * Standing runtime caveats the scope note already covers. The server repeats
- * them on capabilities, validation, and every preview response; showing them
- * verbatim stacked four paragraphs (two duplicates) above the preview.
- */
-const PREVIEW_BOILERPLATE = [
-  'Draft preview runs stateless VRL',
-  'Draft preview executes native VRL only.',
-  'Step traces replay cumulative draft prefixes independently',
-  'Implicit preview timezones use UTC',
-];
-export function isPreviewBoilerplate(warning: string): boolean {
-  return PREVIEW_BOILERPLATE.some((prefix) => warning.startsWith(prefix));
-}
+/** Standing caveats the scope note already covers; the server repeats them on every preview. */
+const PREVIEW_BOILERPLATE = ['Preview simulates the pipeline in isolation'];
 export function withoutPreviewBoilerplate(warnings: readonly string[] | undefined): string[] {
-  return (warnings ?? []).filter((warning) => !isPreviewBoilerplate(warning));
+  return (warnings ?? []).filter((warning) => !PREVIEW_BOILERPLATE.some((prefix) => warning.startsWith(prefix)));
 }
+
 export const EXECUTABLE_STEP_KINDS = ['parse', 'rename', 'remove', 'set', 'redact', 'fields', 'mask', 'filter', 'sample', 'split', 'dedupe', 'combine', 'route', 'lookup', 'vrl'] as const;
 const STEP_KINDS = new Set(['parse', 'rename', 'remove', 'set', 'redact', 'filter', 'sample', 'split', 'fields', 'mask', 'combine', 'lookup', 'dedupe', 'route', 'vrl']);
 const LEGACY_STEP_ALIASES: Record<string, PipelineStepKind> = { rename: 'fields', remove: 'fields', set: 'fields', redact: 'mask' };
@@ -418,130 +421,121 @@ export function nativeStepConfig(step: PipelineStep): string {
   pieces.push(`# Next processing step consumes ${JSON.stringify(output)}. Remap error ports use the existing parser-failure path.`);
   return pieces.join('\n\n');
 }
-export function executableSteps(draft: PipelineDraft) {
-  return draft.steps.map((step, index) => ({ id: step.id, name: step.name, enabled: step.enabled, vrl: step.enabled ? serializePipeline({ ...draft, steps: draft.steps.slice(0, index + 1) }) : '' }));
-}
 export function compilePipeline(draft: PipelineDraft): string {
   return compileSequence(draft.steps.filter(step => step.enabled));
 }
+/** The exact stored form (`parser_vrl`). Fails locally before submitting an invalid plan. */
 export function serializePipeline(draft: PipelineDraft): string {
-  compilePipeline(draft); // Fail locally before submitting an invalid plan.
-  return HEADER + JSON.stringify({ version: 2, revision: draft.revision, steps: draft.steps }) + '\n' + PLAN_BODY;
+  if (draft.steps.length > MAX_PIPE_STEPS) throw new Error(`A pipeline has at most ${MAX_PIPE_STEPS} steps.`);
+  if (!validStoredSteps(draft.steps)) throw new Error('Step identifiers must be unique and every step needs a name and settings.');
+  compilePipeline(draft);
+  return storedPlan(draft);
+}
+/** The stored form without the local compile guard (conflict copy, pivt context). */
+export function storedPlan(draft: Pick<PipelineDraft, 'revision' | 'steps'>): string {
+  return PIPE_HEADER + JSON.stringify({ version: 2, revision: draft.revision, steps: draft.steps.map(storedStep) }) + '\n' + PIPE_PLAN_BODY;
+}
+/** Field order and optional `condition` match the server's serde form. */
+function storedStep(step: PipelineStep): PipelineStep {
+  return {
+    id: step.id, name: step.name, kind: step.kind, enabled: step.enabled,
+    ...(step.condition !== undefined ? { condition: step.condition } : {}),
+    config: step.config,
+  };
 }
 
-export function draftFromSource(source: LogSource, revision = 1): PipelineDraft {
-  const firstNewline = source.parser_vrl.indexOf('\n');
-  const header = source.parser_vrl.startsWith(HEADER) ? HEADER : LEGACY_HEADER;
-  if (source.parser_vrl.startsWith(header) && firstNewline !== -1) {
-    try {
-      const meta = JSON.parse(source.parser_vrl.slice(header.length, firstNewline));
-      if ((meta.version === 1 || meta.version === 2) && Number.isSafeInteger(meta.revision) && meta.revision > 0 && validStoredSteps(meta.steps)) {
-        const draft = { name: source.name, description: source.description ?? '', revision: meta.revision, steps: meta.steps };
-        if (meta.version === 2 && header === HEADER && source.parser_vrl.slice(firstNewline + 1) === PLAN_BODY) { compilePipeline(draft); return draft; }
-        if (meta.version === 1 && compilePipeline(draft) === source.parser_vrl.slice(firstNewline + 1)) return draft;
-      }
-    } catch { /* Hand-edited metadata is treated as imported VRL. */ }
-  }
-  return { name: source.name, description: source.description ?? '', revision, steps: [{ id: 'imported-parser', name: 'Existing parser', kind: 'vrl', enabled: true, config: { code: source.parser_vrl || '.' } }] };
+/** The step plan stored in `parser_vrl`, or null for plain VRL (and edited/invalid plans). */
+export function parsePipelinePlan(parserVrl: string): { revision: number; steps: PipelineStep[] } | null {
+  const firstNewline = parserVrl.indexOf('\n');
+  const header = parserVrl.startsWith(PIPE_HEADER) ? PIPE_HEADER : parserVrl.startsWith(LEGACY_HEADER) ? LEGACY_HEADER : null;
+  if (!header || firstNewline === -1) return null;
+  try {
+    const meta = JSON.parse(parserVrl.slice(header.length, firstNewline));
+    if (!(meta.version === 1 || meta.version === 2) || !Number.isSafeInteger(meta.revision) || meta.revision <= 0 || !validStoredSteps(meta.steps)) return null;
+    const plan = { revision: meta.revision as number, steps: meta.steps as PipelineStep[] };
+    if (meta.version === 2 && header === PIPE_HEADER && parserVrl.slice(firstNewline + 1) === PIPE_PLAN_BODY) return plan;
+    if (meta.version === 1 && compilePipeline({ name: '', description: '', ...plan }) === parserVrl.slice(firstNewline + 1)) return plan;
+  } catch { /* Hand-edited metadata is treated as plain VRL. */ }
+  return null;
+}
+export const IMPORTED_STEP_ID = 'imported-parser';
+/** A source's working copy as a draft. Plain VRL imports as one Advanced VRL step. */
+export function draftFromSource(source: Pick<LogSource, 'name' | 'description' | 'parser_vrl'>, revision = 1): PipelineDraft {
+  const plan = parsePipelinePlan(source.parser_vrl);
+  if (plan) return { name: source.name, description: source.description ?? '', revision: plan.revision, steps: plan.steps };
+  return { name: source.name, description: source.description ?? '', revision, steps: [{ id: IMPORTED_STEP_ID, name: 'Existing parser', kind: 'vrl', enabled: true, config: { code: source.parser_vrl.trim() ? source.parser_vrl : '.' } }] };
+}
+export function isStepPlan(parserVrl: string): boolean {
+  return parsePipelinePlan(parserVrl) !== null;
+}
+/** The plan JSON the stored parser carries; copied so a conflict never loses work. */
+export function planJson(draft: Pick<PipelineDraft, 'revision' | 'steps'>): string {
+  return JSON.stringify({ version: 2, revision: draft.revision, steps: draft.steps }, null, 2);
 }
 export function draftFingerprint(draft: PipelineDraft): string {
   return JSON.stringify(draft);
 }
-export function releaseFromRollout(rollout: TenantParserRollout): PipelineRelease {
-  return {
-    id: rollout.id, revision: rollout.version_numbers?.at(-1) ?? null, state: rollout.state,
-    createdAt: rollout.requested_at, actor: rollout.requested_by,
-    error: [rollout.failure_stage, rollout.failure_reason].filter(Boolean).join(': ') || undefined,
-  };
-}
-export function summaryFromSource(source: LogSource, releases: PipelineRelease[] = []): PipelineSummary {
-  const draft = draftFromSource(source);
+/** Inventory row for one log source. `activeRevision` comes from draft-status when known. */
+export function summaryFromSource(source: LogSource, activeRevision: number | null = null, hasDraft?: boolean): PipelineSummary {
+  const plan = parsePipelinePlan(source.parser_vrl);
   return {
     id: source.id, sourceId: source.id, name: source.name, description: source.description ?? '',
     sourceName: source.name, sourceType: source.source_type,
-    activeRevision: releases.find((release) => release.state === 'live')?.revision ?? null,
-    draftRevision: draft.revision, hasDraft: !source.deployed || !!source.deployed_at && source.updated_at > source.deployed_at,
-    health: source.ingest?.health_status === 'healthy' ? 'healthy' : source.ingest ? 'warning' : 'unknown',
-    latestRelease: releases[0] ?? null,
+    activeRevision,
+    draftRevision: plan?.revision ?? 1,
+    hasDraft: hasDraft ?? (!source.deployed || (!!source.deployed_at && Date.parse(source.updated_at) > Date.parse(source.deployed_at))),
+    stepPlan: !!plan,
+    stepCount: plan ? plan.steps.length : 1,
+    enabled: source.enabled,
+    deployed: source.deployed,
+    deployedAt: source.deployed_at,
+    updatedAt: source.updated_at,
   };
 }
-
-/** Legacy release-test samples are raw message strings, not serialized events. */
-export function rawMessageSamples(events: Array<{ input: unknown }>): string[] {
-  return events.map(({ input }) => {
-    if (input && typeof input === 'object' && 'message' in input && typeof input.message === 'string') return input.message;
-    throw new Error('This event has no raw message string. Preview is available, but saving it as a legacy release-test sample would change its input shape.');
-  });
+/** Published versions, newest first. */
+export function releasesFromVersions(versions: readonly LogSourceVersion[] | undefined): PipelineRelease[] {
+  return [...(versions ?? [])].sort((a, b) => b.version_number - a.version_number).map((version) => ({
+    id: String(version.id), versionId: version.id, revision: version.version_number, active: version.is_active,
+    createdAt: version.created_at, actor: version.created_by, reason: version.change_reason || undefined,
+  }));
+}
+/** Enabled kinds in a draft, in step order, without duplicates. */
+export function enabledKinds(steps: readonly PipelineStep[]): PipelineStepKind[] {
+  return [...new Set(steps.filter((step) => step.enabled).map((step) => step.kind))];
 }
 
-/** In-memory editor recovery contains configuration only, never capture/sample state. */
-export interface PipelineDraftRecovery {
-  draft: PipelineDraft;
-  savedFingerprint: string;
-  sourceSnapshot: import('./api/pipelines').PipePublicationSnapshot;
-}
-export const pipelineDraftRecoveryKey = (runtimeKey: string, sourceId: string) => ['pipe-editor-draft', runtimeKey, sourceId] as const;
-export function pipelineDraftRecovery(draft: PipelineDraft, savedFingerprint: string, sourceSnapshot: import('./api/pipelines').PipePublicationSnapshot): PipelineDraftRecovery {
-  return {
-    draft: structuredClone({ name: draft.name, description: draft.description, revision: draft.revision, steps: draft.steps }),
-    savedFingerprint,
-    sourceSnapshot: Object.freeze({ ...sourceSnapshot }),
-  };
-}
-
-// NAN-3447: preview input loaded from stored events or pasted. Both build the
-// same pre-parse shape a saved sample uses ({ message: <raw text>, source_type }),
-// and both stay in browser memory only.
+// Preview input loaded from stored events, a live tap, or pasted. All stay in
+// browser memory only: never saved and never attached to a release.
 export const PASTE_MAX_EVENTS = 100;
-const ROW_SOURCE_FIELD = 'metadata.log_source';
 
-function rowField(row: Record<string, unknown>, path: string): unknown {
-  if (path in row) return row[path];
-  let value: unknown = row;
-  for (const part of path.split('.')) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-    value = (value as Record<string, unknown>)[part];
+/** `POST /pipe-samples` events (`{message}` per row) → preview inputs. */
+export function recentSampleEvents(events: readonly unknown[], limit = PASTE_MAX_EVENTS): CapturedEvent[] {
+  const out: CapturedEvent[] = [];
+  for (const event of events) {
+    if (out.length >= Math.min(limit, PASTE_MAX_EVENTS)) break;
+    if (!event || typeof event !== 'object' || Array.isArray(event)) continue;
+    out.push({ id: `recent-${out.length + 1}`, input: event });
   }
-  return value;
+  return out;
 }
 
-/**
- * Search rows → preview inputs. Only rows that carry the original raw text are
- * kept (a row without it cannot reproduce pre-parse input); at most `plan.limit`
- * events and never more than one preview's 100-event bound.
- */
-export function recentEventSamples(
-  rows: Array<Record<string, unknown>>,
-  plan: Pick<import('./api/pipelines').PipeRecentEventsPlan, 'limit' | 'raw_field' | 'source_labels'>,
-): CapturedEvent[] {
-  const limit = Math.max(0, Math.min(plan.limit, 100));
-  const events: CapturedEvent[] = [];
-  for (const row of rows) {
-    if (events.length >= limit) break;
-    const raw = rowField(row, plan.raw_field);
-    if (typeof raw !== 'string' || raw.trim() === '') continue;
-    const label = rowField(row, ROW_SOURCE_FIELD);
-    const time = rowField(row, 'time') ?? rowField(row, 'timestamp');
-    // NAN-3625: the stored, platform-stamped input identity of this row.
-    const nanoInput = inputOfStamp(rowField(row, `metadata.${INPUT_METADATA}`));
-    events.push({
-      id: `recent-${events.length + 1}`,
-      input: { message: raw, source_type: typeof label === 'string' && label ? label : plan.source_labels[0] },
-      ...(typeof time === 'string' || typeof time === 'number' ? { capturedAt: String(time) } : {}),
-      ...(nanoInput ? { nanoInput } : {}),
-    });
-  }
-  return events;
+/** `POST /pipe-tap` events → preview inputs, keeping each event's input identity. */
+export function tapEvents(events: ReadonlyArray<{ event: unknown; input?: string | null }>): CapturedEvent[] {
+  return events.flatMap((row, index) => {
+    if (!row.event || typeof row.event !== 'object' || Array.isArray(row.event)) return [];
+    let nanoInput: string | undefined;
+    if (typeof row.input === 'string') { try { nanoInput = canonicalInput(row.input); } catch { nanoInput = undefined; } }
+    return [{ id: `tap-${index + 1}`, input: row.event, ...(nanoInput ? { nanoInput } : {}) }];
+  });
 }
 
 /**
  * Pasted text → preview inputs. A JSON array yields one event per element
  * (strings verbatim, anything else as its JSON text); a single JSON object
  * (even pretty-printed) is one event; otherwise each non-empty line is one raw
- * event. A raw event that is itself a JSON array must be pasted with others,
- * one per line, or wrapped in an outer array.
+ * event.
  */
-export function pastedSampleEvents(text: string, sourceType?: string): CapturedEvent[] {
+export function pastedSampleEvents(text: string): CapturedEvent[] {
   const trimmed = text.trim();
   if (!trimmed) throw new Error('Paste at least one raw event.');
   let raws: string[];
@@ -558,12 +552,7 @@ export function pastedSampleEvents(text: string, sourceType?: string): CapturedE
   }
   if (!raws.length) throw new Error('Paste at least one raw event.');
   if (raws.length > PASTE_MAX_EVENTS) throw new Error(`Paste at most ${PASTE_MAX_EVENTS} events; preview evaluates up to ${PASTE_MAX_EVENTS} inputs.`);
-  return raws.map((message, index) => ({ id: `pasted-${index + 1}`, input: { message, ...(sourceType ? { source_type: sourceType } : {}) } }));
-}
-
-/** Loaded and pasted samples are browser-only: never saved or attached to a release. */
-export function ephemeralSample(sample: { origin?: string } | null | undefined): boolean {
-  return sample?.origin === 'recent' || sample?.origin === 'pasted';
+  return raws.map((message, index) => ({ id: `pasted-${index + 1}`, input: { message } }));
 }
 
 /** Per-step outcome of the last preview, for the collapsed step header. */
@@ -582,27 +571,36 @@ function sameJson(left: unknown, right: unknown): boolean {
   }
 }
 
-/**
- * NAN-3452: summarize a preview's per-step traces. Returns an empty map when
- * the preview is stale or carries no traces (large drafts run as one
- * program), so the step list shows nothing rather than a wrong count.
- */
-export function stepPreviewStatus(
-  preview: PipelinePreview | null | undefined,
-): Record<string, PipelineStepStatus> {
+/** Summarize a preview's per-step traces. Empty when the preview is stale or has no traces. */
+export function stepPreviewStatus(preview: PipelinePreview | null | undefined): Record<string, PipelineStepStatus> {
   const status: Record<string, PipelineStepStatus> = Object.create(null);
   if (!preview || preview.stale) return status;
   for (const event of preview.events) {
     event.trace?.forEach((item, index) => {
+      if (item.bypassed) return;
       const entry = (status[item.stepId] ??= { errors: 0, changed: 0 });
       if (item.error) {
         entry.errors++;
         return;
       }
-      const before =
-        index === 0 ? [event.input] : event.trace![index - 1].outputs;
+      const before = index === 0 ? [event.input] : event.trace![index - 1].outputs;
       if (!sameJson(before, item.outputs)) entry.changed++;
     });
   }
   return status;
+}
+
+/** In-memory editor recovery contains configuration only, never event payloads. */
+export interface PipelineDraftRecovery {
+  draft: PipelineDraft;
+  savedFingerprint: string;
+  sourceSnapshot: import('./api/pipelines').PipePublicationSnapshot;
+}
+export const pipelineDraftRecoveryKey = (scope: string, sourceId: string) => ['pipe-editor-draft', scope, sourceId] as const;
+export function pipelineDraftRecovery(draft: PipelineDraft, savedFingerprint: string, sourceSnapshot: import('./api/pipelines').PipePublicationSnapshot): PipelineDraftRecovery {
+  return {
+    draft: structuredClone({ name: draft.name, description: draft.description, revision: draft.revision, steps: draft.steps }),
+    savedFingerprint,
+    sourceSnapshot: Object.freeze({ ...sourceSnapshot }),
+  };
 }

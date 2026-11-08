@@ -16,7 +16,7 @@ use super::{MAX_BULK_ARTIFACTS, effective_artifact_scope, parse_time_window};
 use crate::middleware::{AuthContext, check_permission};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
-use nanosiem_core::prevalence::PrevalenceLookup;
+use nanosiem_core::prevalence::coverage::{ArtifactKind, CoverageSource};
 
 /// GET /api/prevalence/hash/{hash}
 ///
@@ -51,28 +51,9 @@ pub async fn get_hash_prevalence(
         )
     })?;
 
-    let time_window = parse_time_window(params.window.as_deref());
-    let scope = effective_artifact_scope(&auth);
-
-    if let Some(client) = super::primary_lake_prevalence_client(&state).await? {
-        let artifact_type = nanosiem_core::prevalence::ArtifactType::detect(&hash);
-        return match client.lookup(std::slice::from_ref(&hash), time_window, &scope).await {
-            Ok(mut data) => Ok(Json(PrevalenceResponse {
-                data: data.pop().unwrap_or_else(|| {
-                    nanosiem_core::prevalence::PrevalenceData::empty(
-                        hash,
-                        artifact_type,
-                    )
-                }),
-            })),
-            Err(error) => {
-                error!("Lake hash prevalence lookup failed: {}", error);
-                Err((StatusCode::BAD_GATEWAY, error.to_string()))
-            }
-        };
-    }
-
     let dual_pool = state.dual_pool();
+
+    // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
         dual_pool.clickhouse().clone(),
         dual_pool.table_names(),
@@ -80,11 +61,26 @@ pub async fn get_hash_prevalence(
     )
     .await;
 
+    let time_window = parse_time_window(params.window.as_deref());
+    let scope = effective_artifact_scope(&auth);
+
     match prevalence_service
         .get_hash_prevalence(&hash, time_window, &scope)
         .await
     {
-        Ok(data) => Ok(Json(PrevalenceResponse { data })),
+        Ok(mut data) => {
+            // A miss outside prevalence coverage (for THIS artifact's kind and
+            // the caller's sources) is unknown, not zero hosts.
+            let report = prevalence_service
+                .coverage_report(time_window, CoverageSource::Live, &scope)
+                .await;
+            report.apply(&mut data);
+            let product_state = report.kind(ArtifactKind::of(data.artifact_type)).clone();
+            Ok(Json(PrevalenceResponse {
+                data,
+                product_state: Some(product_state),
+            }))
+        }
         Err(e) => {
             error!("Failed to get hash prevalence: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -125,30 +121,9 @@ pub async fn get_domain_prevalence(
         )
     })?;
 
-    let time_window = parse_time_window(params.window.as_deref());
-    let scope = effective_artifact_scope(&auth);
-
-    if let Some(client) = super::primary_lake_prevalence_client(&state).await? {
-        return match client
-            .lookup(std::slice::from_ref(&domain), time_window, &scope)
-            .await
-        {
-            Ok(mut data) => Ok(Json(PrevalenceResponse {
-                data: data.pop().unwrap_or_else(|| {
-                    nanosiem_core::prevalence::PrevalenceData::empty(
-                        domain.clone(),
-                        nanosiem_core::prevalence::ArtifactType::detect(&domain),
-                    )
-                }),
-            })),
-            Err(error) => {
-                error!("Lake domain prevalence lookup failed: {}", error);
-                Err((StatusCode::BAD_GATEWAY, error.to_string()))
-            }
-        };
-    }
-
     let dual_pool = state.dual_pool();
+
+    // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
         dual_pool.clickhouse().clone(),
         dual_pool.table_names(),
@@ -156,11 +131,26 @@ pub async fn get_domain_prevalence(
     )
     .await;
 
+    let time_window = parse_time_window(params.window.as_deref());
+    let scope = effective_artifact_scope(&auth);
+
     match prevalence_service
         .get_domain_prevalence(&domain, time_window, &scope)
         .await
     {
-        Ok(data) => Ok(Json(PrevalenceResponse { data })),
+        Ok(mut data) => {
+            // A miss outside prevalence coverage (for THIS artifact's kind and
+            // the caller's sources) is unknown, not zero hosts.
+            let report = prevalence_service
+                .coverage_report(time_window, CoverageSource::Live, &scope)
+                .await;
+            report.apply(&mut data);
+            let product_state = report.kind(ArtifactKind::of(data.artifact_type)).clone();
+            Ok(Json(PrevalenceResponse {
+                data,
+                product_state: Some(product_state),
+            }))
+        }
         Err(e) => {
             error!("Failed to get domain prevalence: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -173,10 +163,6 @@ pub async fn get_domain_prevalence(
 /// Get prevalence data for multiple artifacts in a single request.
 /// Limited to 100 artifacts per request.
 /// Requirements: 4.3
-/// Optional paired RFC3339 start/end select a half-open analysis window (maximum 30 days).
-/// Counts use whole covering parts, with requested and effective bounds echoed separately.
-/// A legacy preset window cannot be combined with absolute bounds.
-/// Older readers fail closed rather than silently serving a rolling lookback.
 #[utoipa::path(
     post,
     path = "/api/prevalence/bulk",
@@ -215,35 +201,8 @@ pub async fn get_bulk_prevalence(
         ));
     }
 
-    let bounds = nanosiem_core::prevalence::ExactPrevalenceWindow::parse(request.start.as_deref(), request.end.as_deref())
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    if bounds.is_some() && request.window.is_some() {
-        return Err((StatusCode::BAD_REQUEST, "use absolute bounds or a preset window".into()));
-    }
-    let time_window = parse_time_window(request.window.as_deref());
-    let scope = effective_artifact_scope(&auth);
-
-    if let Some(client) = super::primary_lake_prevalence_client(&state).await? {
-        let result = match &bounds {
-            Some(bounds) => client.lookup_between(&request.artifacts, bounds, &scope).await,
-            None => client.lookup(&request.artifacts, time_window, &scope).await.map(|data| nanosiem_core::prevalence::lookup::LakePrevalenceRead { data, requested_window: None, effective_window: None, note: None }),
-        };
-        return match result {
-            Ok(read) => {
-                let total = read.data.len();
-                Ok(Json(BulkPrevalenceResponse { data: read.data, total, requested_window: read.requested_window, effective_window: read.effective_window, note: read.note }))
-            }
-            Err(error) => {
-                error!("Lake bulk prevalence lookup failed: {}", error);
-                Err((StatusCode::BAD_GATEWAY, error.to_string()))
-            }
-        };
-    }
-
-    if bounds.is_some() {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "absolute prevalence requires a tenant cell".into()));
-    }
     let dual_pool = state.dual_pool();
+
     // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
         dual_pool.clickhouse().clone(),
@@ -252,13 +211,32 @@ pub async fn get_bulk_prevalence(
     )
     .await;
 
+    let time_window = parse_time_window(request.window.as_deref());
+    let scope = effective_artifact_scope(&auth);
+
     match prevalence_service
         .get_bulk_prevalence(&request.artifacts, time_window, &scope)
         .await
     {
-        Ok(data) => {
+        Ok(mut data) => {
+            // A miss outside prevalence coverage is unknown, not zero hosts.
+            let report = prevalence_service
+                .coverage_report(time_window, CoverageSource::Live, &scope)
+                .await;
+            let mut kinds: Vec<ArtifactKind> =
+                data.iter().map(|row| ArtifactKind::of(row.artifact_type)).collect();
+            kinds.sort();
+            kinds.dedup();
+            for row in &mut data {
+                report.apply(row);
+            }
+            let product_state = report.combined(&kinds);
             let total = data.len();
-            Ok(Json(BulkPrevalenceResponse { data, total, requested_window: None, effective_window: None, note: None }))
+            Ok(Json(BulkPrevalenceResponse {
+                data,
+                total,
+                product_state: Some(product_state),
+            }))
         }
         Err(e) => {
             error!("Failed to get bulk prevalence: {}", e);

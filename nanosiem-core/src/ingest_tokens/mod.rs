@@ -1,57 +1,64 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! NAN-3770: named, revocable per-sender ingest tokens (open core / dedicated).
+//! NAN-4907: named, revocable per-source ingest tokens (ported from main's
+//! open-core NAN-3770 / NAN-3806 / NAN-3933, single-tenant).
 //!
-//! OTLP/HTTP authenticates current database state through nginx auth_request;
-//! its verified identity headers are captured by the internal Vector listener.
-//! Raw OTLP ports have no host publication.
-//!
-//! An admin issues one token per sender. The value is returned once and never
-//! stored: PostgreSQL keeps its SHA-256 and a display prefix
-//! (`migrations/postgres/358_ingest_tokens.sql`). [`IngestTokenService`]
+//! An admin issues one token per sender, bound to one log source. The value is
+//! returned once and never stored: PostgreSQL keeps its SHA-256 and a display
+//! prefix (`migrations/postgres/290_ingest_tokens.sql`). [`IngestTokenService`]
 //! renders the active hashes into Vector's hashed tokens file, which the HEC
 //! (`02-hec-source.toml`) and HTTP (`00-base.toml`) ingest sources re-read
-//! within seconds (`valid_tokens_file`, nano-rs/vector fork). A revoke
-//! therefore takes effect with no Vector reload and no listener restart.
+//! every 2 s (`valid_tokens_file`, nano-rs/vector fork). Shared-volume revoke
+//! and rotate responses wait out that request-path cache interval after the
+//! atomic file update, so a returned destructive operation cannot be followed
+//! by a request authenticated from the pre-update snapshot. No Vector reload
+//! or listener restart is required.
 //!
-//! Vector stamps `%nano_credential_id` / `%nano_credential_name` on every event
-//! a named token sent; the lake sink stores the id as
-//! `metadata.nano_credential_id` (the same stamp hosted collector-v2 bases
-//! write). The install-wide `VECTOR_AUTH_TOKEN` stays accepted through the
-//! sources' static fallback unless an admin disables it
-//! ([`IngestTokenSettings::install_token_enabled`]); its events carry no stamp.
+//! **The token decides the source.** A file entry's `name`, which the fork
+//! stamps as `%nano_credential_name`, is the bound source's route key
+//! ([`route_key`]). The HEC / HTTP lanes set `.source_type` from it; a
+//! `sourcetype` / `X-Source-Type` the sender declares never selects the parser
+//! (it survives only as the raw `claimed_source_type` field). A token with no
+//! bound source is left out of the file, so Vector refuses it (HTTP 401).
 //!
-//! Secrets: the token value exists only in the create response. The file holds
-//! hashes only and is written 0600; nothing here logs its content.
+//! **Multiplex credentials.** Two credentials keep the source type the sender
+//! declares; both are listed with the route [`MULTIPLEX_ROUTE`]:
+//! * the platform credential ([`PLATFORM_TOKEN_ENV`], a random secret only
+//!   nano-api / nano-jobs hold), which this API's in-process senders
+//!   (collector integrations, enrichment lane) use: each stream declares its
+//!   type from a reviewed manifest;
+//! * the install token (`VECTOR_AUTH_TOKEN`) in the deprecated
+//!   [`InstallTokenMode::LegacyMultiplex`] mode, so an upgraded deployment's
+//!   existing senders keep working unchanged.
 //!
-//! NAN-3806: a token decides the source, 100% token based. Every token is
-//! bound to exactly one push-capable log source ([`BindableSource`]). The file
-//! entry's `name` (stamped by the fork as `%nano_credential_name`) carries the
-//! bound source's route key ([`route_key`]), and the HEC / HTTP lanes set
-//! `.source_type` from it; a `sourcetype` / `X-Source-Type` the sender declares
-//! never selects the parser (it survives only as the raw `claimed_source_type`
-//! field). A token with no bound source is left out of the file, so Vector
-//! refuses it (HTTP 401) until an admin binds it. The install token is listed
-//! the same way (under [`INSTALL_CREDENTIAL_ID`]) only while it is enabled and
-//! bound; the sources' static install-token fallback is off whenever an
-//! install token is configured. Platform pullers in this API (the collector
-//! scheduler) authenticate with [`platform_pull_token`], the one credential
-//! whose events keep the source type they declare: they are the platform's
-//! own integrations, each stream declaring its type from a reviewed manifest.
+//! In [`InstallTokenMode::Strict`] the install token is accepted only once an
+//! admin binds it to a source (then it behaves like a named token), and the
+//! sources' static install-token fallback is off (`fallback_enabled = false`).
+//!
+//! **Delivery is explicit** ([`TOKENS_DELIVERY_ENV`]). Without a configured
+//! delivery path, issuing / rotating / binding is refused. On the Vector side
+//! a missing file fails closed: the static install-token fallback applies only
+//! when the deployment sets `NANO_INGEST_STATIC_FALLBACK=true` on Vector.
+//!
+//! Secrets: the token value exists only in the create / rotate response. The
+//! file holds hashes only and is written 0600; nothing here logs its content.
 
 mod file;
 mod repository;
 mod service;
 mod usage;
 #[cfg(test)]
+mod mod_tests;
+#[cfg(test)]
+mod repository_tests;
+#[cfg(test)]
 mod vector_lane_tests;
 
 pub use file::{
-    render_tokens_file, write_tokens_file, TokenFileEntry, DEFAULT_TOKENS_FILE,
-    PLATFORM_PULL_ROUTE,
+    render_tokens_file, write_tokens_file, TokenFileEntry, DEFAULT_TOKENS_FILE, MULTIPLEX_ROUTE,
 };
 pub use repository::{BindableSourceCredential, IngestTokenRepository, IngestTokenRepositoryError};
-pub use service::{IngestTokenService, IngestTokenServiceError};
+pub use service::{file_extra_entries, IngestTokenService, IngestTokenServiceError, ROTATION_PENDING_TTL};
 pub use usage::{parse_credential_request_counts, CREDENTIAL_REQUESTS_METRIC};
 
 use chrono::{DateTime, Utc};
@@ -71,22 +78,97 @@ const PREFIX_RANDOM_LEN: usize = 8;
 pub const MAX_NAME_LEN: usize = 100;
 
 /// Credential id the install token (`VECTOR_AUTH_TOKEN`) is listed under in
-/// Vector's file once it is bound (`metadata.nano_credential_id` of its events).
+/// Vector's file (`%nano_credential_id` of its events). Same value as main.
 pub const INSTALL_CREDENTIAL_ID: Uuid = Uuid::from_u128(0x6e61_6e6f_0000_4000_8000_0000_0000_0001);
-/// Credential id of the platform pull credential ([`platform_pull_token`]).
-/// The Vector lanes key on it (`config/vector/00-base.toml`,
-/// `02-hec-source.toml`), so it never changes.
+/// Credential id of the platform credential (`NANO_PLATFORM_INGEST_TOKEN`).
 pub const PLATFORM_PULL_CREDENTIAL_ID: Uuid =
     Uuid::from_u128(0x6e61_6e6f_0000_4000_8000_0000_0000_0002);
-/// HMAC domain of [`platform_pull_token`].
-const PLATFORM_PULL_DOMAIN: &str = "nanosiem.platform-pull-ingest.v1";
-/// Marker of the derived platform pull credential.
-pub const PLATFORM_PULL_MARKER: &str = "npp_";
+/// Environment variable holding the platform credential: a random secret that
+/// only nano-api / nano-jobs hold (generated by install.sh / local-stack, a
+/// k8s secret elsewhere). It is never derived from, or shared like, the
+/// install token, so a legacy sender that knows `VECTOR_AUTH_TOKEN` cannot
+/// compute it. Rotate it by changing the value and restarting the services:
+/// the reconcile republishes its hash.
+pub const PLATFORM_TOKEN_ENV: &str = "NANO_PLATFORM_INGEST_TOKEN";
+/// Environment variable holding the OTLP edge signing key: shared by nano-api
+/// (signs) and Vector (verifies) only, never by senders.
+pub const OTLP_EDGE_KEY_ENV: &str = "NANO_OTLP_EDGE_KEY";
+/// Environment variable selecting how the tokens file reaches Vector:
+/// `shared_volume` (compose / local-stack: nano-api writes the file Vector
+/// reads), `http` (Kubernetes: each Vector pod's config consumer pulls the
+/// rendered file from `GET /api/internal/vector-config/ingest-tokens`, NAN-4973)
+/// or `none` (default: no delivery configured, so issuing, rotating or
+/// binding a token is refused instead of reporting a success Vector never sees).
+pub const TOKENS_DELIVERY_ENV: &str = "NANO_INGEST_TOKENS_DELIVERY";
+/// Seconds an OTLP identity assertion stays valid.
+pub const OTLP_ASSERTION_TTL_SECS: i64 = 120;
 
-/// Log source transports a token can be bound to: the push lanes (HTTP ingest,
-/// HEC, OTLP, Vector-native, and every routed label). The fetch transports
-/// (Kafka, S3/SQS, Pub/Sub, Event Hubs) never receive pushed events.
-/// Mirrors `parsers::vector_config::router::transport_of`.
+/// How the hashed tokens file is delivered to Vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenDelivery {
+    /// nano-api writes the file onto a volume Vector mounts.
+    SharedVolume,
+    /// Vector pods pull the file from nano-api over the internal delivery
+    /// endpoint (Helm chart: Vector is a separately scaled Deployment with no
+    /// volume shared with nano-api). Rendered from the database per request,
+    /// so every API replica serves the same content.
+    Http,
+    /// No delivery path for this deployment: tokens cannot be issued.
+    None,
+}
+
+impl TokenDelivery {
+    /// Parses `NANO_INGEST_TOKENS_DELIVERY`. Unset or unknown = `None` (an
+    /// explicit deployment choice, never inferred).
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("shared_volume") => Self::SharedVolume,
+            Some("http") => Self::Http,
+            _ => Self::None,
+        }
+    }
+}
+
+/// A non-blank secret from the environment.
+pub fn secret_from_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// How the install token (`VECTOR_AUTH_TOKEN`) is treated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallTokenMode {
+    /// Accepted only while bound to a source; every event lands there.
+    Strict,
+    /// Deprecated: accepted and routed by the sender's declared source type,
+    /// as before per-source tokens. Existing installs start here.
+    LegacyMultiplex,
+}
+
+impl InstallTokenMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::LegacyMultiplex => "legacy_multiplex",
+        }
+    }
+
+    /// Parses the stored value. Anything unknown is treated as strict.
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "legacy_multiplex" => Self::LegacyMultiplex,
+            _ => Self::Strict,
+        }
+    }
+}
+
+/// Log source transports a token can be bound to: the token-authenticated push
+/// lanes (HTTP ingest, HEC, OTLP through the edge, and every routed label).
+/// The fetch transports (Kafka, S3/SQS, Pub/Sub, Event Hubs) never receive
+/// pushed events, and the Vector-native listener (`vector`, :6000) has no
+/// credential check, so a token bound to it would promise a binding nothing
+/// enforces. Mirrors `parsers::vector_config::router::transport_of`.
 pub fn is_push_capable(source_type: &str) -> bool {
     !matches!(
         source_type,
@@ -97,13 +179,16 @@ pub fn is_push_capable(source_type: &str) -> bool {
             | "gcp_pubsub"
             | "pubsub"
             | "azure_event_hubs"
+            | "vector"
     )
 }
 
 /// The `.source_type` value a log source's parser is routed on: its first
 /// match value, else its safe name. Exactly the router's first claim
 /// (`VectorConfigManager::parser_source_types`), so an event stamped with it
-/// reaches that source's parser and no other.
+/// reaches that source's parser and no other. Before the source's parser is
+/// published, no route claims it and the event lands in `logs` through the
+/// router's `generic` catch-all, still searchable as `source_type=<key>`.
 pub fn route_key(match_values: Option<&[String]>, name: &str) -> String {
     match match_values {
         Some([first, ..]) => first.clone(),
@@ -111,30 +196,38 @@ pub fn route_key(match_values: Option<&[String]>, name: &str) -> String {
     }
 }
 
-/// The platform pull credential: HMAC-SHA256 of [`PLATFORM_PULL_DOMAIN`] keyed
-/// by the install token, as `npp_<hex>`. Only holders of `VECTOR_AUTH_TOKEN`
-/// (this API's in-process pullers) can derive it; nano-api lists its hash in
-/// Vector's file under [`PLATFORM_PULL_CREDENTIAL_ID`]. `None` for a blank
-/// install token.
-pub fn platform_pull_token(install_token: &str) -> Option<String> {
-    if install_token.trim().is_empty() {
-        return None;
-    }
-    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(install_token.as_bytes())
+/// Audience of an OTLP identity assertion: only Vector's OTLP lane accepts it.
+const OTLP_ASSERTION_AUDIENCE: &str = "vector-otlp-logs";
+
+fn otlp_assertion_mac(key: &str, credential_id: &str, route: &str, expires: i64) -> String {
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key.as_bytes())
         .expect("HMAC accepts any key length");
-    mac.update(PLATFORM_PULL_DOMAIN.as_bytes());
-    Some(format!(
-        "{PLATFORM_PULL_MARKER}{}",
-        hex::encode(mac.finalize().into_bytes())
-    ))
+    mac.update(
+        format!("nanosiem.otlp-identity.v2|{OTLP_ASSERTION_AUDIENCE}|{credential_id}|{route}|{expires}")
+            .as_bytes(),
+    );
+    hex::encode(mac.finalize().into_bytes())
 }
 
-/// The ingest token the in-process platform pullers send to Vector's HTTP
-/// ingest: [`platform_pull_token`] of `VECTOR_AUTH_TOKEN`.
-pub fn platform_pull_token_from_env() -> Option<String> {
-    std::env::var("VECTOR_AUTH_TOKEN")
-        .ok()
-        .and_then(|token| platform_pull_token(&token))
+/// The signed identity assertion the nginx OTLP edge forwards to Vector:
+/// `<expires unix seconds>.<hex HMAC-SHA256>` over audience, credential id,
+/// route and expiry, keyed by the edge-only `NANO_OTLP_EDGE_KEY`.
+/// `otlp_logs_prep` (03-otlp-source.toml) checks the expiry and the MAC
+/// (compared as HMACs of the MACs, so the comparison leaks no timing) and
+/// otherwise keeps the event as unauthenticated `otlp_log`. A raw-port sender
+/// cannot forge one, and a captured one expires within
+/// [`OTLP_ASSERTION_TTL_SECS`]. `None` for a blank key.
+pub fn otlp_identity_assertion(
+    edge_key: &str,
+    credential_id: &Uuid,
+    route: &str,
+    expires: i64,
+) -> Option<String> {
+    if edge_key.trim().is_empty() {
+        return None;
+    }
+    let mac = otlp_assertion_mac(edge_key, &credential_id.to_string(), route, expires);
+    Some(format!("{expires}.{mac}"))
 }
 
 /// A log source a token can be bound to.
@@ -147,26 +240,31 @@ pub struct BindableSource {
     /// The `.source_type` every event of a bound token is routed on.
     pub route_key: String,
     pub enabled: bool,
+    /// Whether the source's parser is deployed. Events for an undeployed
+    /// source still arrive (unparsed, in `logs` as `source_type=<route_key>`).
+    pub deployed: bool,
 }
 
 /// One issued token, as listed. Never carries the value or its hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct IngestToken {
-    /// Credential id: the `metadata.nano_credential_id` its events carry.
+    /// Credential id: the `%nano_credential_id` its events carry (stored in
+    /// `ext.nano_credential_id`).
     pub credential_id: Uuid,
     pub name: String,
     /// `nit_` plus the first 8 characters, to recognise a token in a sender config.
     pub token_prefix: String,
-    /// `active`, `unbound` (no source yet: refused until bound) or `revoked`.
+    /// `active`, `unbound` (no source: refused until bound) or `revoked`.
     pub state: String,
-    /// The log source every event sent with this token lands in. `None` =
-    /// unbound: Vector refuses the token until an admin binds it.
+    /// The log source every event sent with this token lands in.
     pub source_id: Option<Uuid>,
-    /// Name of the bound source (`None` when unbound or the source was deleted).
+    /// Name of the bound source (`None` when unbound).
     pub source_name: Option<String>,
     /// The `.source_type` its events are routed on.
     pub route_key: Option<String>,
     pub source_bound_at: Option<DateTime<Utc>>,
+    /// The token this one replaced, when it was issued by a rotation.
+    pub rotated_from: Option<Uuid>,
     /// Requests Vector accepted with this token (sampled, approximate).
     pub request_count: i64,
     pub created_at: DateTime<Utc>,
@@ -175,17 +273,17 @@ pub struct IngestToken {
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub revoked_by: Option<Uuid>,
-    /// Whether `POST /api/ingest-tokens/{credential_id}/revoke` applies.
+    /// Whether revoke / rotate apply.
     pub revocable: bool,
 }
 
-/// Per-tenant ingest token settings.
+/// Install-token settings (singleton row).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct IngestTokenSettings {
-    /// Whether the install-wide `VECTOR_AUTH_TOKEN` ("Install token (legacy)")
-    /// is still accepted (only while it is also bound). Enabled by default.
+    /// The admin switch. Disabled = refused in every mode.
     pub install_token_enabled: bool,
-    /// The log source the install token is bound to. `None` = refused.
+    pub install_token_mode: InstallTokenMode,
+    /// The log source the install token is bound to (strict mode).
     pub install_token_source_id: Option<Uuid>,
     pub install_token_source_bound_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
@@ -193,9 +291,11 @@ pub struct IngestTokenSettings {
 }
 
 impl Default for IngestTokenSettings {
+    /// No settings row: strict and unbound (a fresh install's default).
     fn default() -> Self {
         Self {
             install_token_enabled: true,
+            install_token_mode: InstallTokenMode::Strict,
             install_token_source_id: None,
             install_token_source_bound_at: None,
             updated_at: None,
@@ -249,86 +349,4 @@ pub fn normalize_name(name: &str) -> Result<String, String> {
         return Err("Name must not contain control characters".into());
     }
     Ok(name.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generated_tokens_are_unique_and_shaped() {
-        let a = generate_token();
-        let b = generate_token();
-        assert_ne!(a.value, b.value);
-        assert!(a.value.starts_with(TOKEN_MARKER));
-        assert_eq!(a.value.len(), TOKEN_MARKER.len() + TOKEN_RANDOM_LEN);
-        assert!(a.value[TOKEN_MARKER.len()..]
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric()));
-        assert!(a.value.starts_with(&a.prefix));
-        assert_eq!(a.prefix.len(), TOKEN_MARKER.len() + PREFIX_RANDOM_LEN);
-        assert_eq!(a.sha256_hex, sha256_hex(&a.value));
-        assert_eq!(a.sha256_hex.len(), 64);
-        // The prefix check in migration 358.
-        let re = regex::Regex::new("^nit_[A-Za-z0-9]{8}$").unwrap();
-        assert!(re.is_match(&a.prefix));
-    }
-
-    #[test]
-    fn debug_never_prints_the_value() {
-        let token = generate_token();
-        let printed = format!("{token:?}");
-        assert!(!printed.contains(&token.value));
-        assert!(!printed.contains(&token.sha256_hex));
-    }
-
-    #[test]
-    fn sha256_hex_matches_known_vector() {
-        assert_eq!(
-            sha256_hex("abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn route_key_is_the_routers_first_claim() {
-        let values = vec!["apache_access".to_string(), "apache".to_string()];
-        assert_eq!(route_key(Some(&values), "Apache HTTP"), "apache_access");
-        assert_eq!(route_key(Some(&[]), "Apache HTTP"), "apache_http");
-        assert_eq!(route_key(None, "Apache HTTP"), "apache_http");
-    }
-
-    #[test]
-    fn push_capable_transports() {
-        for st in [
-            "routed", "splunk_hec", "vector", "apache_access", "http", "otlp", "opentelemetry",
-        ] {
-            assert!(is_push_capable(st), "{st}");
-        }
-        for st in ["kafka", "aws_s3", "s3", "gcp_pubsub", "azure_event_hubs"] {
-            assert!(!is_push_capable(st), "{st}");
-        }
-    }
-
-    #[test]
-    fn platform_pull_token_is_derived_and_distinct() {
-        assert_eq!(platform_pull_token(""), None);
-        assert_eq!(platform_pull_token("  "), None);
-        let a = platform_pull_token("install-token-a").unwrap();
-        assert!(a.starts_with(PLATFORM_PULL_MARKER));
-        assert_eq!(a.len(), PLATFORM_PULL_MARKER.len() + 64);
-        assert_eq!(platform_pull_token("install-token-a").unwrap(), a);
-        assert_ne!(platform_pull_token("install-token-b").unwrap(), a);
-        assert_ne!(a, "install-token-a");
-        assert_ne!(INSTALL_CREDENTIAL_ID, PLATFORM_PULL_CREDENTIAL_ID);
-    }
-
-    #[test]
-    fn names_are_validated() {
-        assert_eq!(normalize_name("  firewall-01 ").unwrap(), "firewall-01");
-        assert!(normalize_name("").is_err());
-        assert!(normalize_name("   ").is_err());
-        assert!(normalize_name(&"x".repeat(MAX_NAME_LEN + 1)).is_err());
-        assert!(normalize_name("bad\nname").is_err());
-    }
 }

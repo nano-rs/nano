@@ -112,6 +112,9 @@ impl AuthPlugin for OAuth2JsonCredentialAuth {
         fields.push(self.p.credential.clone());
         fields
     }
+    fn identifier_fields(&self) -> Vec<String> {
+        self.oauth2.identifier_fields()
+    }
     fn token_endpoints(&self) -> Vec<String> {
         self.oauth2.token_endpoints()
     }
@@ -297,7 +300,6 @@ mod tests {
             fetch: &fetch,
             scope: &scope,
             now: chrono::Utc::now(),
-            feed_id: None,
         };
         let mut req = request(json!({"command":{"type":"LOCK"}}));
         p.apply(&mut req, &cx).await.unwrap();
@@ -332,7 +334,6 @@ mod tests {
                 fetch: &fetch,
                 scope: &scope,
                 now: chrono::Utc::now(),
-                feed_id: None,
             };
             assert!(
                 plugin()
@@ -347,7 +348,6 @@ mod tests {
             fetch: &fetch,
             scope: &scope,
             now: chrono::Utc::now(),
-            feed_id: None,
         };
         for body in [
             json!([]),

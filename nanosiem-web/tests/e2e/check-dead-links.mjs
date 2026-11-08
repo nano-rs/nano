@@ -37,12 +37,7 @@ const BASELINE = path.join(HERE, 'dead-links-baseline.json');
 const UPDATE = process.argv.includes('--update-baseline');
 
 const FE_ROOTS = ['nanosiem-web/src'];
-// Backend crates that register routes; edition crates (`*-enterprise`) only
-// where present.
-const BE_ROOTS = ['nanosiem-core/src', 'nanosiem-api/src', 'nanosiem-search/src', ...fs
-  .readdirSync(REPO)
-  .filter((dir) => dir.endsWith('-enterprise'))
-  .map((dir) => `${dir}/src`)];
+const BE_ROOTS = ['nanosiem-core/src', 'nanosiem-api/src', 'nanosiem-enterprise/src', 'nanosiem-search/src'];
 const SKIP_DIRS = new Set(['node_modules', 'target', '.git', 'dist', 'build', '.next']);
 
 // Valid non-SPA destinations that intentionally leave the router (served by the
@@ -96,6 +91,13 @@ function extractRoutes(src) {
     const p = m[1];
     if (p === '*' || p === '/*') continue; // catch-all == 404, never a valid dest
     routes.add(p);
+  }
+  // Route tables mapped to <Route> elements: `['/path', Component]` tuples
+  // (NAN-4925's Automation routes). Same exclusions as above.
+  const tuple = /\[\s*["'](\/[^"']*)["']\s*,\s*[A-Z]\w*\s*\]/g;
+  while ((m = tuple.exec(src))) {
+    if (m[1] === '/*') continue;
+    routes.add(m[1]);
   }
   return [...routes].map((r) => ({ raw: r, segs: toSegs(r) }));
 }

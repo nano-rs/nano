@@ -57,6 +57,78 @@ async fn shutdown_task_handles(
 }
 
 impl AppState {
+    /// Keep a licensed worker group aligned with the current signed component
+    /// set. C05 renewals are hot, so a one-time startup check is insufficient:
+    /// workers must stop when their component is removed and start when it is
+    /// subsequently granted.
+    #[cfg(feature = "enterprise")]
+    pub fn start_component_worker_supervisor<F>(
+        &self,
+        capability: crate::license_admission::WorkerCapability,
+        name: &'static str,
+        start: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: Fn(&AppState) -> Vec<tokio::task::JoinHandle<()>> + Send + Sync + 'static,
+    {
+        let state = self.clone();
+        let shutdown = self.shutdown_token();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut workers = ComponentWorkers::default();
+
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        abort_component_workers(&mut workers).await;
+                        return;
+                    }
+                    _ = interval.tick() => {}
+                }
+
+                let allowed = state
+                    .offline_license_snapshot
+                    .read()
+                    .await
+                    .allows_worker(capability);
+                if !allowed {
+                    if !workers.is_empty() {
+                        tracing::warn!(
+                            worker_group = name,
+                            ?capability,
+                            "Stopping workers removed by signed licence components"
+                        );
+                        abort_component_workers(&mut workers).await;
+                    }
+                    continue;
+                }
+
+                if workers
+                    .handles
+                    .iter()
+                    .any(tokio::task::JoinHandle::is_finished)
+                {
+                    abort_component_workers(&mut workers).await;
+                    panic!("licensed worker group {name} stopped unexpectedly");
+                }
+                if workers.is_empty() {
+                    workers.handles = start(&state);
+                    assert!(
+                        !workers.is_empty(),
+                        "licensed worker group {name} started no tasks"
+                    );
+                    tracing::info!(
+                        worker_group = name,
+                        ?capability,
+                        tasks = workers.len(),
+                        "Licensed worker group started"
+                    );
+                }
+            }
+        })
+    }
+
     /// Initialize and start the signal processor
     ///
     /// The signal processor polls ClickHouse for new signals (from materialized views)
@@ -65,14 +137,6 @@ impl AppState {
         let handle = self.signal_processor.start().await?;
         self.add_task_handle(handle).await;
         Ok(())
-    }
-
-    /// Configure the enrichment service with IPinfo URL
-    pub async fn configure_enrichment(&self, ipinfo_url: Option<String>) {
-        let mut enrichment = self.enrichment.write().await;
-        if let Some(url) = ipinfo_url {
-            enrichment.set_ipinfo_url(url);
-        }
     }
 
     /// Release all distributed claims (detection rules + scheduled jobs).
@@ -123,21 +187,15 @@ impl AppState {
         #[cfg(not(feature = "enterprise"))]
         let ai_checker: Option<Arc<dyn AiProviderConnectivityChecker>> = None;
 
-        let mut scheduler = HealthScheduler::with_dual_pool(
+        let scheduler = Arc::new(HealthScheduler::with_dual_pool(
             self.pool.clone(),
             self.dual_pool.clone(),
             config,
             ai_checker,
             self.config.airgap,
-        );
-        // NAN-3464: a lake deployment has no ClickHouse/PostgreSQL `logs`
-        // table; feed staleness reads the lake's last event per source (the
-        // same read `/api/log-sources/{id}/health` serves).
-        if self.search_service.backend() == nanosiem_core::SearchBackend::Lake {
-            scheduler = scheduler.with_lake_feed_freshness(Arc::new(self.search_service.clone()));
-        }
+        ));
 
-        Arc::new(scheduler).start()
+        scheduler.start()
     }
 
     /// Drain the durable system-health outbox through the existing notification
@@ -154,6 +212,102 @@ impl AppState {
         dispatcher.start(std::time::Duration::from_secs(2))
     }
 
+    /// Start the case change listener for real-time SSE notifications.
+    ///
+    /// Listens on the PostgreSQL `case_changes` channel. When a case is created
+    /// or updated on any node, the event is broadcast to all SSE subscribers.
+    /// Runs on ALL nodes (not leader-only) so every API instance serves SSE.
+    ///
+    /// Phase 3.2 (NAN-744): cases SSE moved to enterprise; the listener +
+    /// broadcast channel only ship in enterprise builds.
+    #[cfg(feature = "enterprise")]
+    pub fn start_case_change_listener(&self) -> tokio::task::JoinHandle<()> {
+        let pool = self.pool.clone();
+        let tx = self.case_events_tx.clone();
+
+        tokio::spawn(async move {
+            let mut backoff_secs = 1u64;
+
+            loop {
+                let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+                    Ok(l) => {
+                        backoff_secs = 1;
+                        l
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to create PgListener for case_changes: {}, retrying in {}s",
+                            e,
+                            backoff_secs
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(60);
+                        continue;
+                    }
+                };
+
+                if let Err(e) = listener.listen("case_changes").await {
+                    tracing::error!(
+                        "Failed to listen on case_changes channel: {}, retrying in {}s",
+                        e,
+                        backoff_secs
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(60);
+                    continue;
+                }
+
+                tracing::info!("Listening for case_changes notifications");
+
+                loop {
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_secs(300),
+                        listener.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(notification)) => {
+                            match serde_json::from_str::<super::CaseChangeEvent>(
+                                notification.payload(),
+                            ) {
+                                Ok(event) => {
+                                    tracing::debug!(
+                                        case_id = %event.case_id,
+                                        event = %event.event,
+                                        "Broadcasting case change event"
+                                    );
+                                    // Ignore send errors — means no active subscribers
+                                    let _ = tx.send(event);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        payload = %notification.payload(),
+                                        error = %e,
+                                        "Failed to parse case_changes payload"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                "PgListener error on case_changes: {}, reconnecting...",
+                                e
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                "PgListener case_changes keepalive timeout, reconnecting"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     /// Start leader-only schedulers (signal processor, enrichment, tuning, disk pressure).
     ///
     /// Detection rules and scheduled jobs are now distributed (SKIP LOCKED) and
@@ -164,88 +318,14 @@ impl AppState {
     pub async fn start_leader_schedulers(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let mut handles = Vec::new();
 
-        #[cfg(feature = "enterprise")]
-        if self.config.deployment_mode.is_enterprise_shared() {
-            // None of the legacy leader loops below has a complete signed
-            // tenant authority/data-plane contract. Shared starts only private
-            // tenant runtimes from their explicit startup owners; the platform
-            // catalog allowlist here leaves dedicated/open behavior
-            // byte-compatible.
-            tracing::info!("Enterprise-shared legacy/global leader schedulers remain disabled");
-            // Tenant-authored URLs must never be probed from shared jobs.
-            tracing::info!(refused = "synthetics_runner", "Hosted synthetics runner refused (SSRF)");
-            if let Some(runtime) = self.tenant_observability_eval_runtime.as_ref() {
-                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+        // Signal processor (bridges ClickHouse signals to PostgreSQL alerts)
+        // Must be single-leader: serial watermark processing
+        match self.signal_processor.start().await {
+            Ok(handle) => {
+                handles.push(handle);
+                tracing::info!("Signal processor started (leader-only)");
             }
-            // NAN-4699 step 4: these two take no per-tenant claim, so with
-            // two jobs pods they run only here, on the PG leader. Identity
-            // sync re-derives each due tenant's users from its lake (a
-            // duplicate pass doubles the scan and the audit row); the
-            // attestor signs every tenant's readiness receipts (a duplicate
-            // races the revision fence and logs N2322/N2323).
-            if let Some(runtime) = self.tenant_identity_sync_runtime.as_ref() {
-                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
-                tracing::info!("Enterprise-shared tenant identity sync runtime started (leader-only)");
-            }
-            if let Some(runtime) = self.tenant_platform_readiness_attestor.as_ref() {
-                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
-                tracing::info!("Enterprise-shared platform readiness attestor started (leader-only)");
-            }
-            // NAN-3196: the legacy HealthScheduler stays off (global admins,
-            // tenant-blind issue tracker, ClickHouse). Shared feed staleness
-            // runs through signed tenant transactions over the lake counters
-            // and writes tenant-scoped inbox rows; internal, so not egress-gated.
-            if let Some(runtime) = self.tenant_feed_staleness_runtime.as_ref() {
-                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
-                tracing::info!("Enterprise-shared feed-staleness monitor started (leader-only)");
-            } else {
-                tracing::warn!("Enterprise-shared feed-staleness monitor unavailable; stale-source notifications are off");
-            }
-            // NAN-2361 wave 3: the MITRE ATT&CK catalog is tenant-blind
-            // PLATFORM data (9000262 reads it on the control connection for
-            // every tenant), so its sync is a platform-only leader loop the
-            // shared API does run — catalog only, no tenant-rule reconcile
-            // (`MitreSync::platform_catalog_only`), writes granted to the
-            // control login by 9000462. Without it the live catalog stayed
-            // empty and every tenant's Coverage page spun forever.
-            if self.config.egress_jobs_enabled() {
-                handles.push(self.start_rule_repo_sync_scheduler());
-                tracing::info!("Hosted rule repository sync scheduler started (leader-only, signed tenant transactions)");
-                // NAN-2975: the platform catalog mirror every tenant follows.
-                handles.push(self.start_parser_repo_sync_scheduler());
-                tracing::info!("Platform catalog follow scheduler started (leader-only mirror refresh + tenant fan-out)");
-                handles.push(self.start_mitre_sync_scheduler());
-                #[cfg(feature = "enterprise")]
-                handles.push(self.start_model_catalog_sync_scheduler());
-                handles.push(self.start_marketplace_sync_scheduler());
-                tracing::info!("Marketplace platform catalog sync scheduler started (leader-only, enterprise-shared)");
-                tracing::info!(
-                    "MITRE catalog platform sync scheduler started (leader-only, enterprise-shared, catalog only)"
-                );
-            } else {
-                tracing::info!("AIRGAP_MODE: MITRE catalog platform sync not started");
-            }
-            // NAN-3211: per-tenant auto-tuning (signed tenant transactions).
-            handles.extend(self.start_shared_auto_tuning_scheduler());
-            return handles;
-        }
-
-        // The signal processor is the legacy ClickHouse materialized-view
-        // bridge. Lake detections emit alerts/findings directly through the
-        // scheduled engine and durable PostgreSQL outbox, so polling the inert
-        // compatibility client would only create an error loop.
-        if self.dual_pool.clickhouse_required() {
-            match self.signal_processor.start().await {
-                Ok(handle) => {
-                    handles.push(handle);
-                    tracing::info!("Signal processor started (leader-only)");
-                }
-                Err(e) => tracing::error!("Failed to start signal processor: {}", e),
-            }
-        } else {
-            tracing::info!(
-                "Legacy ClickHouse signal processor disabled; lake detections use the durable finding outbox"
-            );
+            Err(e) => tracing::error!("Failed to start signal processor: {}", e),
         }
 
         // Health monitoring can create notifications and perform paid AI
@@ -256,24 +336,43 @@ impl AppState {
         tracing::info!("System health outbox dispatcher started (leader-only)");
         tracing::info!("Health monitoring scheduler started (leader-only)");
 
+        // Enterprise hosted/BYOC deployments may opt into a compact OTLP
+        // health snapshot for the managed monitoring plane. Jobs leadership
+        // owns the singleton; the exporter applies its own air-gap hard gate.
+        #[cfg(feature = "enterprise")]
+        {
+            let exporter_handles = self.start_tenant_health_exporter();
+            if !exporter_handles.is_empty() {
+                tracing::info!(
+                    tasks = exporter_handles.len(),
+                    "Tenant health exporter started (leader-only)"
+                );
+                handles.extend(exporter_handles);
+            }
+        }
+
+        // NAN-4977: migrations commit durable refresh invalidations rather than
+        // assuming a one-shot SYSTEM REFRESH/RELOAD can survive deploy races.
+        handles.push(self.start_migration_refresh_scheduler());
+        tracing::info!("Post-migration refresh activation started (leader-only, 60s tick)");
+
         // === Egress schedulers — skipped in air-gap mode ===
         // Air-gapped installs have no outbound internet, so any job that fetches
-        // from the internet (IPinfo enrichment, GitHub repo sync, model/MITRE catalogs)
+        // from the internet (GitHub repo sync, model/MITRE catalogs)
         // must NOT start — bundles arrive via the air-gap import surface instead.
         // Internal jobs (signal processor above; tuning / disk-pressure /
         // siem-health / cleanups below) are unaffected.
         if !self.config.egress_jobs_enabled() {
             tracing::info!(
-                "AIRGAP_MODE: skipping egress background jobs (enrichment, identity, repo auto-sync, marketplace, model-catalog, MITRE catalog, docs-rag)"
+                "AIRGAP_MODE: skipping egress background jobs (identity, repo auto-sync, marketplace, model-catalog, MITRE catalog, docs-rag)"
             );
         } else {
-            // Enrichment auto-sync scheduler (low-frequency singleton)
-            handles.push(self.start_enrichment_scheduler());
-            tracing::info!("Enrichment auto-sync scheduler started (leader-only)");
+            // NAN-4959: no native IPinfo download job. IPinfo Lite comes only
+            // from the signed platform feed bundle (consumer started below).
 
             // Custom enrichment scheduler — runs Deno data enrichments on their
             // cron schedules. Enterprise only after Phase 3.3 of NAN-744 (the
-            // sandbox runtime + scheduler live in the enterprise crate).
+            // sandbox runtime + scheduler live in nanosiem-enterprise).
             #[cfg(feature = "enterprise")]
             {
                 handles.push(self.start_custom_enrichment_scheduler());
@@ -283,26 +382,21 @@ impl AppState {
                 // ingest lane. Sits under the egress gate deliberately: a
                 // collector's whole job is reaching a vendor API, so it has no
                 // meaning in an air-gapped install.
-                // NAN-2361 wave 5: the collector loop selects integration_instances
-                // over the control pool; it is not a tenant runner on the shared lake.
-                if self.config.deployment_mode.is_enterprise_shared() {
-                    tracing::info!("Collector scheduler skipped on the shared lake");
-                } else {
-                    handles.push(self.start_collector_scheduler());
-                    tracing::info!("Collector scheduler started (leader-only)");
-                }
+                handles.push(self.start_component_worker_supervisor(
+                    crate::license_admission::WorkerCapability::Ingest,
+                    "leader_ingest",
+                    |state| vec![state.start_collector_scheduler()],
+                ));
             }
 
             // Identity provider sync scheduler
             handles.push(self.start_identity_sync_scheduler());
             tracing::info!("Identity sync scheduler started (leader-only)");
 
-            // Repository auto-sync schedulers. Both first reconcile the
-            // first-party nano-rs catalogs (NAN-3758); staggered so the first
-            // GitHub pulls do not overlap:
-            //   Parsers: immediately (needed first for rule evaluation)
-            //   Rules: 30 s
-            //   Marketplace: 30 min delay
+            // Repository auto-sync schedulers. Both reconcile the first-party
+            // nano-rs catalogs (NAN-4940) and sync at once; rules are staggered
+            // 30 s after parsers so the first GitHub pulls don't overlap.
+            //   Marketplace: 60 s delay (NAN-4946)
             handles.push(self.start_parser_repo_sync_scheduler());
             tracing::info!(
                 "Parser repo auto-sync scheduler started (leader-only, first-party catalogs reconciled)"
@@ -310,12 +404,29 @@ impl AppState {
 
             handles.push(self.start_rule_repo_sync_scheduler());
             tracing::info!(
-                "Rule repo auto-sync scheduler started (leader-only)"
+                "Rule repo auto-sync scheduler started (leader-only, 30s initial delay)"
             );
+
+            // Enterprise first-party content follow (NAN-4947), leader-only and
+            // egress-gated like the repository schedulers above. One generic
+            // seam; the workers are named in the enterprise crate.
+            #[cfg(feature = "enterprise")]
+            {
+                handles.push(self.start_component_worker_supervisor(
+                    crate::license_admission::WorkerCapability::Soar,
+                    "leader_soar",
+                    |state| {
+                        nanosiem_enterprise::handlers::extension_leader_egress_jobs(
+                            state,
+                            state.leader_fence.clone(),
+                        )
+                    },
+                ));
+            }
 
             handles.push(self.start_marketplace_sync_scheduler());
             tracing::info!(
-                "Marketplace repo auto-sync scheduler started (leader-only, 30m initial delay)"
+                "Marketplace repo auto-sync scheduler started (leader-only, 60s initial delay)"
             );
 
             handles.push(self.start_mitre_sync_scheduler());
@@ -324,8 +435,11 @@ impl AppState {
             // Model catalog auto-sync (daily by default) — enterprise only.
             #[cfg(feature = "enterprise")]
             {
-                handles.push(self.start_model_catalog_sync_scheduler());
-                tracing::info!("Model catalog auto-sync scheduler started (leader-only)");
+                handles.push(self.start_component_worker_supervisor(
+                    crate::license_admission::WorkerCapability::Melod,
+                    "leader_melod",
+                    |state| vec![state.start_model_catalog_sync_scheduler()],
+                ));
             }
 
             // Synthetic-check runner (NAN-1538) — outbound HTTP probes, so it is
@@ -344,23 +458,75 @@ impl AppState {
         // per-(rule, entity) alert_cooldown_minutes throttle carrying the
         // scheduler's durable hysteresis, so no dedicated scheduler starts here.
 
-        // Tuning scheduler (low-frequency singleton)
-        handles.extend(self.start_tuning_scheduler());
-        tracing::info!("Tuning scheduler started (leader-only)");
+        // NAN-4948: nano's signed platform feed bundle (IPinfo Lite, ThreatFox,
+        // Tor). Leader-only so one node fetches and loads. NOT under the egress
+        // gate: the loop skips the online check itself in air-gap mode but
+        // still withdraws feeds that pass their hard expiry.
+        handles.push(
+            std::sync::Arc::new(
+                crate::handlers::enrichment::consumer(self).with_fence(self.leader_fence.clone()),
+            )
+            .start(self.shutdown_token()),
+        );
+        tracing::info!("Platform feed bundle consumer started (leader-only)");
 
-        // This scheduler manages ClickHouse partitions and TTLs. Object-store
-        // retention/capacity is a separate lake maintenance concern; never run
-        // CH mutations against the inert compatibility client.
-        if self.dual_pool.clickhouse_required() {
-            handles.push(Arc::clone(&self.disk_pressure_service).start());
-            tracing::info!("Disk pressure scheduler started (leader-only)");
-        } else {
-            tracing::info!("ClickHouse disk-pressure scheduler disabled in canonical lake mode");
+        // NAN-4955: nano content channels (parsers, rules, playbooks,
+        // marketplace / model catalogs, extension channels) from the app
+        // as signed bundles; never GitHub. Leader-only; the loop returns at
+        // once in air-gap mode (offline import still works through the API).
+        handles.push(
+            std::sync::Arc::new(
+                crate::handlers::content_channels::consumer(self)
+                    .with_fence(self.leader_fence.clone()),
+            )
+            .start(self.shutdown_token()),
+        );
+        tracing::info!("Content channel consumer started (leader-only)");
+
+        // Tuning scheduler (low-frequency singleton). Enterprise C05
+        // renewals can change components without a restart, so its workers
+        // are supervised against the live admission snapshot.
+        #[cfg(feature = "enterprise")]
+        handles.push(self.start_component_worker_supervisor(
+            crate::license_admission::WorkerCapability::Pivt,
+            "leader_pivt",
+            AppState::start_tuning_scheduler,
+        ));
+        #[cfg(not(feature = "enterprise"))]
+        {
+            handles.extend(self.start_tuning_scheduler());
+            tracing::info!("Tuning scheduler started (leader-only)");
         }
+
+        // Disk pressure scheduler
+        handles.push(Arc::clone(&self.disk_pressure_service).start(self.leader_fence.clone()));
+        tracing::info!("Disk pressure scheduler started (leader-only)");
 
         // SIEM health check (AI-driven data quality analysis, every 12 hours)
         handles.push(self.start_siem_health_check_scheduler());
         tracing::info!("SIEM health check scheduler started (leader-only, 12h interval)");
+
+        // Disabled means not constructed at all. When enabled, discovery and
+        // replica failures are a degraded-coverage signal, never grounds for
+        // terminating jobs. The leader-owned retry task is aborted with the
+        // rest of this handle set when the lease is lost.
+        if nanosiem_core::ingest_watchdog::enabled_from_env() {
+            handles.push(tokio::spawn(async move {
+                loop {
+                    match nanosiem_core::ingest_watchdog::IngestWatchdog::from_env().await {
+                        Ok(watchdog) => watchdog.run().await,
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "Ingest watchdog initialization failed; jobs remain up and discovery will retry"
+                        ),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+            }));
+            tracing::info!("Ingest watchdog supervisor started (leader-only)");
+        } else {
+            tracing::info!("Ingest watchdog disabled; no watchdog client constructed");
+        }
 
         // Metric-monitor evaluator (NAN-1540) — threshold alerts on OTLP metric
         // aggregates. Leader-only so a breach raises exactly one alert per due
@@ -385,7 +551,7 @@ impl AppState {
 
         // Cleanup tasks (leader-only to avoid duplicate work across nodes).
         // Job store / wizard session / melod session cleanups are enterprise-only —
-        // the underlying repos live in enterprise::melod.
+        // the underlying repos live in nanosiem-enterprise::melod.
         #[cfg(feature = "enterprise")]
         {
             handles.push(self.start_job_store_cleanup());
@@ -407,8 +573,13 @@ impl AppState {
         handles.push(self.start_query_tracker_cleanup());
         handles.push(self.start_search_job_cleanup());
         handles.push(self.start_detection_dedup_cleanup());
+        handles.push(self.start_lookup_generation_cleanup());
         handles.push(self.start_prevalence_dict_health_monitor());
         tracing::info!("Cleanup tasks started (leader-only)");
+
+        // NAN-4933: move stored secrets onto the active credential key.
+        handles.push(self.start_credential_key_rewrap_scheduler());
+        tracing::info!("Credential key re-wrap scheduler started (leader-only)");
 
         handles
     }
@@ -438,6 +609,46 @@ impl AppState {
             failed = summary.failed,
             "All tracked background tasks stopped"
         );
+    }
+}
+
+#[cfg(feature = "enterprise")]
+#[derive(Default)]
+struct ComponentWorkers {
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(feature = "enterprise")]
+impl ComponentWorkers {
+    fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.handles.len()
+    }
+}
+
+#[cfg(feature = "enterprise")]
+impl Drop for ComponentWorkers {
+    fn drop(&mut self) {
+        for worker in &self.handles {
+            worker.abort();
+        }
+    }
+}
+
+#[cfg(feature = "enterprise")]
+async fn abort_component_workers(workers: &mut ComponentWorkers) {
+    for worker in workers.handles.iter() {
+        worker.abort();
+    }
+    while let Some(worker) = workers.handles.pop() {
+        match worker.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => tracing::warn!(?error, "Licensed worker stopped with an error"),
+        }
     }
 }
 

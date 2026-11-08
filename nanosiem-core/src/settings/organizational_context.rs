@@ -28,7 +28,6 @@ pub enum AgentType {
 
 /// Organizational context configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
 pub struct OrganizationalContext {
     /// Organization or team name
     pub organization_name: Option<String>,

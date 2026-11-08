@@ -43,17 +43,21 @@ const draft: PipelineDraft = {
 };
 const capabilities: PipelineCapabilities = {
   supportedSteps: ['vrl', 'parse'],
-  capture: { available: false },
+  previewOnly: [],
   preview: true,
+  previewDegraded: false,
+  tap: { available: false, maxEvents: 100, maxSeconds: 60 },
+  runtime: 'ready',
+  maxSteps: 50,
   ai: false,
 };
 
 describe('Pipe editor pivt button', () => {
   const props = (overrides: Partial<PipelineEditorProps> = {}): PipelineEditorProps => ({
-    pipeline: { id: 's1', name: 'Firewall', description: '', sourceId: 's1', sourceName: 'Firewall', sourceType: 'fw', activeRevision: 3, draftRevision: 4, hasDraft: true, health: 'healthy', latestRelease: null },
-    draft, capabilities, permissions: { view: true, edit: true, capture: true, release: true }, dirty: false, samples: [],
-    onDraftChange: vi.fn(), onSave: vi.fn(), onValidate: vi.fn(), onReview: vi.fn(), onHistory: vi.fn(), onCaptureStart: vi.fn(), onCaptureStop: vi.fn(),
-    onFreeze: vi.fn(), onSampleSelect: vi.fn(), onPreview: vi.fn(), ...overrides,
+    pipeline: { id: 's1', name: 'Firewall', description: '', sourceId: 's1', sourceName: 'Firewall', sourceType: 'fw', activeRevision: 3, draftRevision: 4, hasDraft: true, stepPlan: true, stepCount: 2, enabled: true, deployed: true, updatedAt: '2026-11-03T00:00:00Z' },
+    draft, capabilities, permissions: { view: true, edit: true, events: true, release: true }, dirty: false, tap: { state: 'ready', events: [] }, sample: null,
+    onDraftChange: vi.fn(), onSave: vi.fn(), onValidate: vi.fn(), onReview: vi.fn(), onHistory: vi.fn(), onTapStart: vi.fn(), onTapCancel: vi.fn(),
+    onTapPreview: vi.fn(), onPreview: vi.fn(), ...overrides,
   });
 
   it('is disabled with the reason when pivt is unavailable', () => {

@@ -50,6 +50,30 @@ impl ClickHouseMigrator {
         sql.contains("nano:skip-if-unknown-table")
     }
 
+    /// Whether a failed numbered-migration statement is logged and skipped
+    /// instead of failing the migration.
+    ///
+    /// - `CREATE [OR REPLACE] DICTIONARY`: only on ClickHouse Cloud, which can't
+    ///   reach Docker-internal sources (NAN-4957: on every other deployment a
+    ///   failed dictionary DDL — a distributed-DDL timeout, an unreachable
+    ///   replica — used to be skipped too, and the migration was recorded
+    ///   anyway, so it was never retried).
+    /// - `GRANT` / `REVOKE`: everywhere. Users defined in users.d XML live in a
+    ///   read-only access storage (ACCESS_STORAGE_READONLY) and CH Cloud has its
+    ///   own permission model; the XML files carry those grants instead.
+    /// - A statement carrying the `nano:fatal` block-comment marker is never
+    ///   skipped, whatever its kind.
+    pub(super) fn migration_statement_soft_fails(sql: &str, is_cloud: bool) -> bool {
+        if sql.contains("nano:fatal") {
+            return false;
+        }
+        let upper = sql.trim_start().to_uppercase();
+        if upper.starts_with("CREATE DICTIONARY") || upper.starts_with("CREATE OR REPLACE DICTIONARY") {
+            return is_cloud;
+        }
+        upper.starts_with("GRANT ") || upper.starts_with("REVOKE ")
+    }
+
     /// NAN-1384: does this ClickHouse error message indicate the target table
     /// does not exist? Matches the stable `UNKNOWN_TABLE` error-code name that
     /// CH embeds in the exception text (e.g. `Code: 60. DB::Exception: Table
@@ -75,6 +99,41 @@ impl ClickHouseMigrator {
     /// `--` line comments are stripped before statement splitting.
     pub(super) fn has_keep_local_engine_marker(sql: &str) -> bool {
         sql.contains("nano:keep-local-engine")
+    }
+
+    /// Cluster-global replicated tables use one Keeper group across every
+    /// shard, matching `_migrations`. This is reserved for coordination state
+    /// that must be identical no matter which shard an API connection reaches.
+    pub(super) fn has_global_replication_marker(sql: &str) -> bool {
+        sql.contains("nano:global-replication")
+    }
+
+    /// NAN-4903: `/* nano:zk-path-name=<name> */` overrides the table name used
+    /// in the explicit-cluster ZooKeeper path (`/clickhouse/tables/{shard}/<db>/<name>`).
+    /// A table that replaces a RENAMEd predecessor needs it: the renamed table
+    /// keeps its replicas registered under the old name's path, so recreating
+    /// the name with the derived path fails with REPLICA_ALREADY_EXISTS.
+    pub(super) fn zk_path_name_override(sql: &str) -> Option<String> {
+        let re = Regex::new(r"nano:zk-path-name=([A-Za-z0-9_]+)").unwrap();
+        re.captures(sql).map(|c| c[1].to_string())
+    }
+
+
+    /// Insert `clause` before a trailing `SETTINGS …` clause, else at the end
+    /// (keeping a trailing `;` and any trailing block comment after it).
+    fn insert_before_settings(sql: &str, clause: &str) -> String {
+        let had_semi = sql.trim_end().ends_with(';');
+        let core = sql.trim_end().trim_end_matches(';').trim_end();
+        let re = Regex::new(r"(?i)\sSETTINGS\s").unwrap();
+        let out = match re.find_iter(core).last() {
+            Some(m) => format!("{}{}{}", &core[..m.start()], clause, &core[m.start()..]),
+            None => format!("{}{}", core, clause),
+        };
+        if had_semi {
+            format!("{out};")
+        } else {
+            out
+        }
     }
 
     /// Escape a value for use inside a single-quoted ClickHouse string literal.
@@ -106,19 +165,30 @@ impl ClickHouseMigrator {
     pub(super) fn substitute_clickhouse_self_vars(sql: &str) -> String {
         let ch_self_host =
             std::env::var("CLICKHOUSE_SELF_HOST").unwrap_or_else(|_| "localhost".into());
-        let ch_self_port = std::env::var("CLICKHOUSE_SELF_PORT").unwrap_or_else(|_| "9000".into());
+        let ch_self_port =
+            std::env::var("CLICKHOUSE_SELF_PORT").unwrap_or_else(|_| "9000".into());
         let ch_self_user = std::env::var("CLICKHOUSE_SELF_USER")
             .or_else(|_| std::env::var("CLICKHOUSE_USER"))
             .unwrap_or_else(|_| "default".into());
         let ch_self_password = std::env::var("CLICKHOUSE_SELF_PASSWORD")
             .or_else(|_| std::env::var("CLICKHOUSE_PASSWORD"))
             .unwrap_or_default();
-        Self::substitute_clickhouse_self_vars_with(
+        let ch_self_secure = match std::env::var("CLICKHOUSE_SELF_SECURE") {
+            Err(_) => false,
+            Ok(value) if value == "1" || value.eq_ignore_ascii_case("true") => true,
+            Ok(value) if value == "0" || value.eq_ignore_ascii_case("false") => false,
+            Ok(value) => panic!(
+                "CLICKHOUSE_SELF_SECURE must be true/false or 1/0, got {:?}",
+                value
+            ),
+        };
+        Self::substitute_clickhouse_self_vars_with_secure(
             sql,
             &ch_self_host,
             &ch_self_port,
             &ch_self_user,
             &ch_self_password,
+            ch_self_secure,
         )
     }
 
@@ -130,6 +200,7 @@ impl ClickHouseMigrator {
     /// produce a confusing CH parse error far from the configuration site;
     /// panicking here surfaces the misconfiguration at migrator startup with
     /// a clear message.
+    #[cfg(test)]
     pub(super) fn substitute_clickhouse_self_vars_with(
         sql: &str,
         host: &str,
@@ -137,17 +208,35 @@ impl ClickHouseMigrator {
         user: &str,
         password: &str,
     ) -> String {
+        Self::substitute_clickhouse_self_vars_with_secure(sql, host, port, user, password, false)
+    }
+
+    /// TLS-aware variant for sovereign clusters. The default helper above is
+    /// deliberately byte-identical to the historical plaintext substitution.
+    pub(super) fn substitute_clickhouse_self_vars_with_secure(
+        sql: &str,
+        host: &str,
+        port: &str,
+        user: &str,
+        password: &str,
+        secure: bool,
+    ) -> String {
         if port.parse::<u16>().is_err() {
             panic!(
                 "CLICKHOUSE_SELF_PORT must be a valid u16 (1-65535), got {:?}",
                 port
             );
         }
+        let port_clause = if secure {
+            format!("{}\n    SECURE 1", port)
+        } else {
+            port.to_owned()
+        };
         sql.replace(
             "{clickhouse_self_host}",
             &Self::escape_for_string_literal(host),
         )
-        .replace("{clickhouse_self_port}", port)
+        .replace("{clickhouse_self_port}", &port_clause)
         .replace(
             "{clickhouse_self_user}",
             &Self::escape_for_string_literal(user),
@@ -221,7 +310,12 @@ impl ClickHouseMigrator {
             .map(str::trim)
             .filter(|cluster| !cluster.is_empty())
             .filter(|cluster| !is_cloud && *cluster != default_db)
-            .map(|cluster| format!(" ON CLUSTER '{}'", Self::escape_for_string_literal(cluster)))
+            .map(|cluster| {
+                format!(
+                    " ON CLUSTER '{}'",
+                    Self::escape_for_string_literal(cluster)
+                )
+            })
             .unwrap_or_default();
         sql.replace("{grant_on_cluster}", &clause)
     }
@@ -316,23 +410,63 @@ impl ClickHouseMigrator {
             .replace("{prevalence_cache_cells}", cells)
     }
 
+    /// Drop MergeTree DDL settings the connected server predates (NAN-4906).
+    ///
+    /// Our DDL targets the pinned release, so it may carry settings that did not
+    /// exist on older servers. An older server rejects them with UNKNOWN_SETTING
+    /// even though the behavior they opt into is that server's default. Today
+    /// that is only `allow_dimensions_outside_sorting_key` (CH 26.7, PR #108087).
+    /// From 26.7 on, an AggregatingMergeTree whose plain columns sit outside the
+    /// sorting key is rejected at CREATE unless the setting is on. Our prevalence
+    /// `*_agg` tables rely on that, because their dimensions are functions of the
+    /// key. `None` (version unknown) leaves the SQL untouched.
+    pub(super) fn strip_settings_unsupported_by(sql: &str, server: Option<(u32, u32)>) -> String {
+        const GATED: &[(&str, (u32, u32))] = &[("allow_dimensions_outside_sorting_key", (26, 7))];
+        let Some(server) = server else {
+            return sql.to_string();
+        };
+        let mut out = sql.to_string();
+        for (name, since) in GATED {
+            if server >= *since {
+                continue;
+            }
+            // Only the comma-joined form `, name = 1` is emitted by our SQL files;
+            // match it with flexible whitespace so a reformat does not defeat it.
+            let re = regex::Regex::new(&format!(r"\s*,\s*{}\s*=\s*[01]\b", regex::escape(name)))
+                .expect("static setting regex");
+            out = re.replace_all(&out, "").into_owned();
+        }
+        out
+    }
+
     /// Substitute PostgreSQL connection details in dictionary SOURCE blocks.
     ///
-    /// Replaces hardcoded Docker Compose defaults (`host 'postgres'`, `password 'nanosiem'`)
+    /// Replaces hardcoded Docker Compose defaults (`host 'postgres'`, `port 5432`,
+    /// `password 'nanosiem'`)
     /// with values from environment variables so dictionaries work in cloud deployments
     /// where Postgres runs at a different hostname with a generated password.
     pub(super) fn substitute_postgres_vars(sql: &str) -> String {
         let pg_host = std::env::var("POSTGRES_DICT_HOST")
             .or_else(|_| std::env::var("POSTGRES_HOST"))
             .unwrap_or_else(|_| "postgres".into());
+        let pg_port = std::env::var("POSTGRES_DICT_PORT")
+            .or_else(|_| std::env::var("POSTGRES_PORT"))
+            .unwrap_or_else(|_| "5432".into());
         let pg_password = std::env::var("POSTGRES_DICT_PASSWORD")
             .or_else(|_| std::env::var("POSTGRES_PASSWORD"))
             .unwrap_or_else(|_| "nanosiem".into());
-        Self::substitute_postgres_vars_with(sql, &pg_host, &pg_password)
+        Self::substitute_postgres_vars_with(sql, &pg_host, &pg_port, &pg_password)
     }
 
     /// Env-free variant exposed for tests. See `substitute_postgres_vars`.
-    pub(super) fn substitute_postgres_vars_with(sql: &str, host: &str, password: &str) -> String {
+    pub(super) fn substitute_postgres_vars_with(
+        sql: &str,
+        host: &str,
+        port: &str,
+        password: &str,
+    ) -> String {
+        port.parse::<u16>()
+            .unwrap_or_else(|_| panic!("POSTGRES_DICT_PORT must be a valid u16, got {port:?}"));
         // NAN-788: pg_host/pg_password are spliced into `'...'` literals;
         // SQL-escape `'` and `\` so a generated password can't break the literal.
         let pg_host = Self::escape_for_string_literal(host);
@@ -344,6 +478,14 @@ impl ClickHouseMigrator {
         let result = re_host
             .replace_all(sql, |caps: &regex::Captures| {
                 format!("{}host '{}'", &caps[1], pg_host)
+            })
+            .to_string();
+
+        let re_port =
+            Regex::new(r"(?i)(SOURCE\s*\(\s*POSTGRESQL\s*\([^)]*?)port\s+5432\b").unwrap();
+        let result = re_port
+            .replace_all(&result, |caps: &regex::Captures| {
+                format!("{}port {}", &caps[1], port)
             })
             .to_string();
 
@@ -459,7 +601,8 @@ impl ClickHouseMigrator {
         }
 
         // AggregatingMergeTree (with or without empty parens)
-        let re_amt = Regex::new(r"(?i)\bENGINE\s*=\s*AggregatingMergeTree(?:\s*\(\s*\))?").unwrap();
+        let re_amt =
+            Regex::new(r"(?i)\bENGINE\s*=\s*AggregatingMergeTree(?:\s*\(\s*\))?").unwrap();
         if re_amt.is_match(&s) {
             s = re_amt
                 .replace(
@@ -508,7 +651,7 @@ impl ClickHouseMigrator {
     /// - Converts AggregatingMergeTree -> ReplicatedAggregatingMergeTree
     /// - Converts ReplacingMergeTree -> ReplicatedReplacingMergeTree
     /// - Adds `storage_policy = 'tiered'` to main data tables (logs, signals)
-    /// - Fixes ClickHouse dictionary source ports (9000 -> 9001 for operator)
+    /// - Preserves the configured ClickHouse dictionary self port/TLS clauses
     ///
     /// Statements that already contain ON CLUSTER are returned unchanged.
     ///
@@ -573,6 +716,33 @@ impl ClickHouseMigrator {
         } else {
             format!(" ON CLUSTER '{}'", cluster_name)
         };
+        let server_object_on_cluster_clause = format!(" ON CLUSTER '{}'", cluster_name);
+
+        // Workload scheduling objects are server-scoped rather than database
+        // metadata. A Replicated database therefore does NOT propagate them;
+        // they always need explicit cluster fan-out (NAN-4988).
+        if upper.starts_with("CREATE WORKLOAD") {
+            let re = Regex::new(
+                r"(?i)(CREATE\s+WORKLOAD\s+(?:IF\s+NOT\s+EXISTS\s+)?)(`[^`]+`|'[^']+'|\w+)",
+            )
+            .unwrap();
+            return re
+                .replace(&s, |caps: &regex::Captures| {
+                    format!("{}{}{}", &caps[1], &caps[2], server_object_on_cluster_clause)
+                })
+                .to_string();
+        }
+        if upper.starts_with("CREATE RESOURCE") {
+            let re = Regex::new(
+                r"(?i)(CREATE\s+RESOURCE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(`[^`]+`|'[^']+'|\w+)",
+            )
+            .unwrap();
+            return re
+                .replace(&s, |caps: &regex::Captures| {
+                    format!("{}{}{}", &caps[1], &caps[2], server_object_on_cluster_clause)
+                })
+                .to_string();
+        }
 
         // Helper: split "db.table" into (db, table), defaulting db if unqualified
         let split_name = |name: &str| -> (String, String) {
@@ -637,7 +807,12 @@ impl ClickHouseMigrator {
             // (operator-managed nanosiem_cluster) → supply zoo path + replica
             // macro. NAN-1092.
             let replicated_db = is_cloud || cluster_name == default_db;
-            let zoo_path = format!("/clickhouse/tables/{{shard}}/{}/{}", db_name, table_name);
+            let zk_name = Self::zk_path_name_override(&s).unwrap_or_else(|| table_name.clone());
+            let zoo_path = if Self::has_global_replication_marker(&s) {
+                format!("/clickhouse/tables/{}/{}", db_name, zk_name)
+            } else {
+                format!("/clickhouse/tables/{{shard}}/{}/{}", db_name, zk_name)
+            };
             s = Self::replicate_engine(s, &zoo_path, replicated_db);
 
             // Add storage_policy = 'tiered' for main data tables (skip if already present).
@@ -690,7 +865,8 @@ impl ClickHouseMigrator {
             // MVs have no `ENGINE =`, so `replicate_engine` is a no-op for them.
             let re_engine = Regex::new(r"(?i)\bENGINE\s*=\s*\w*MergeTree").unwrap();
             if re_engine.is_match(&s) && !view_name.is_empty() {
-                let zoo_path = format!("/clickhouse/tables/{{shard}}/{}/{}", db_name, view_name);
+                let zoo_path =
+                    format!("/clickhouse/tables/{{shard}}/{}/{}", db_name, view_name);
                 s = Self::replicate_engine(s, &zoo_path, replicated_db);
             }
             return s;
@@ -710,12 +886,11 @@ impl ClickHouseMigrator {
                 })
                 .to_string();
 
-            // Fix ClickHouse self-referencing dictionary port (operator uses 9001, not 9000)
-            // Skip for Replicated DB — dictionaries connect to localhost:9000 inside the pod
-            if !replicated_db {
-                let re_port = Regex::new(r"(?i)\bPORT\s+9000\b").unwrap();
-                s = re_port.replace_all(&s, "PORT 9001").to_string();
-            }
+            // `substitute_clickhouse_self_vars` runs before this cluster pass
+            // and has already rendered the deployment's configured native port
+            // plus `SECURE 1` when private TLS is enabled. Do not infer a port
+            // from the topology here: compose uses localhost:9000 with TLS,
+            // while legacy operator installs legitimately configure 9001.
 
             return s;
         }
@@ -808,20 +983,23 @@ impl ClickHouseMigrator {
             // Scoped to DROP TABLE (SYNC is a table-drop modifier); only when we
             // actually emitted ON CLUSTER (explicit cluster).
             if is_drop_table && !on_cluster_clause.is_empty() {
-                let already_sync = {
-                    let u = s.to_uppercase();
-                    let t = u.trim_end();
-                    t.ends_with("SYNC") || t.ends_with("SYNC;")
-                };
+                // `SYNC` may already be present, also before a trailing
+                // `SETTINGS …` clause (`… SYNC SETTINGS check_table_dependencies = 0`);
+                // appending a second one there is a syntax error (NAN-4903).
+                let already_sync = Regex::new(r"(?i)\bSYNC\b").unwrap().is_match(&s);
                 if !already_sync {
-                    let had_semi = s.trim_end().ends_with(';');
-                    let core = s.trim_end().trim_end_matches(';').trim_end();
-                    s = if had_semi {
-                        format!("{} SYNC;", core)
-                    } else {
-                        format!("{} SYNC", core)
-                    };
+                    s = Self::insert_before_settings(&s, " SYNC");
                 }
+            }
+            return s;
+        }
+
+        // 8. RENAME TABLE — `ON CLUSTER` goes after the last `a TO b` pair
+        // (before any SETTINGS); without it an explicit cluster renames on one
+        // node only (NAN-4903, migration 180).
+        if upper.starts_with("RENAME TABLE") || upper.starts_with("RENAME DICTIONARY") {
+            if !on_cluster_clause.is_empty() {
+                s = Self::insert_before_settings(&s, &on_cluster_clause);
             }
             return s;
         }

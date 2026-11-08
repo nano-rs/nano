@@ -1,0 +1,312 @@
+# nano-e2e legacy lanes (NAN-4920): existing end-to-end scripts and env-gated
+# `#[ignore]` suites, wrapped (not rewritten). Run with:
+#
+#   scripts/e2e.sh legacy list
+#   scripts/e2e.sh legacy <lane...|all> [--run <id>] [--keep]
+#
+# Lanes with `stack = true` get the e2e stack's stack.env (every legacy test
+# env var spelling: NANOSIEM_TEST_CLICKHOUSE_URL, CLICKHOUSE_TEST_URL,
+# DATABASE_URL, NANOSIEM_TEST_DATABASE_URL, ...). Without --run the runner
+# brings up a fresh stack for them and tears it down afterwards; lanes run
+# SEQUENTIALLY because several suites TRUNCATE shared tables
+# (NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 is set only inside the throwaway stack).
+# Never point `legacy` at a stack you are also running scenarios against.
+#
+# Self-contained lanes (`stack = false`) start their own containers; the
+# runner only hands them free ports (free_ports) and an artifact dir.
+#
+# Fields:
+#   kind        "script" (cmd, run from the repo root) | "cargo" (package/test)
+#   stack       needs the e2e stack env
+#   needs       prerequisites checked before running: docker | cargo
+#   requires_env  env vars that must be set, else the lane SKIPS with a reason
+#   free_ports  env vars the runner fills with free 127.0.0.1 ports
+#   platforms   subset of ["darwin", "linux"]; elsewhere the lane SKIPS
+#   enterprise  needs the closed nanosiem-enterprise crate (absent in the
+#               open-core mirror: the lane SKIPS there)
+#   timeout_min hard timeout
+
+# ---- wrapped end-to-end scripts ---------------------------------------------
+
+[[lane]]
+name = "ingest-tokens"
+issue = "NAN-4907"
+kind = "script"
+cmd = ["scripts/tests/ingest-tokens-vector-e2e.sh"]
+stack = false
+needs = ["docker", "cargo"]
+free_ports = ["NAN4907_PG_PORT", "NAN4907_HTTP_PORT", "NAN4907_HEC_PORT", "NAN4907_METRICS_PORT"]
+timeout_min = 45
+
+[[lane]]
+name = "onboarding"
+issue = "NAN-4912"
+kind = "script"
+cmd = ["scripts/tests/onboarding-connect-e2e.sh"]
+stack = false
+needs = ["docker", "cargo"]
+free_ports = ["NAN4912_PG_PORT", "NAN4912_CH_PORT", "NAN4912_HTTP_PORT", "NAN4912_HEC_PORT", "NAN4912_METRICS_PORT"]
+timeout_min = 45
+
+[[lane]]
+name = "upgrade-180"
+issue = "NAN-4903"
+# Brings up its own infra-only nanoe2e stack (ocsf profile), prepares
+# OLD_CH_DIR (git archive of the pre-180 tree) and ROWS_FILE, then runs
+# scripts/ocsf-bench/upgrade_check.sh. Single node here; the 2-shard variant
+# is phase 3 (ch-2shard profile).
+kind = "script"
+cmd = ["scripts/e2e/lanes/upgrade-180.sh"]
+stack = false
+needs = ["docker", "cargo"]
+timeout_min = 45
+
+[[lane]]
+name = "upgrade-185"
+issue = "NAN-4957"
+# Migration 185 (IP geo dictionary split): drives the real migrator on its own
+# infra-only nanoe2e stack (ocsf profile), base tree -> this checkout and fresh
+# (twice); asserts identical lookups vs ip_enrichment_dict, metadata-only
+# column ALTER, old dictionary unloaded, and converged column / view SQL.
+kind = "script"
+cmd = ["scripts/e2e/lanes/upgrade-185.sh"]
+stack = false
+needs = ["docker", "cargo"]
+timeout_min = 30
+
+[[lane]]
+name = "upgrade-188"
+issue = "NAN-4982"
+# Migration 188 (OCSF IOC stamping parity): drives the real migrator on its own
+# infra-only nanoe2e stack (ocsf profile), base tree -> this checkout and fresh
+# (twice); seeds every IOC source (bundle ThreatFox / Tor, IOC list, user IOC
+# enrichment) and asserts each (source, ip/domain/url/md5/sha1/sha256) OCSF
+# event written by nanosiem_ingest is stamped, equals the UDM stamp, the ADDs
+# are metadata-only, and upgrade/fresh converge.
+kind = "script"
+cmd = ["scripts/e2e/lanes/upgrade-188.sh"]
+stack = false
+needs = ["docker", "cargo"]
+timeout_min = 30
+
+[[lane]]
+name = "upgrade-from-v01"
+issue = "NAN-4972"
+# v2.0.0 gate: the real customer path. Installs the last shipped ClickHouse
+# release (v0.1.703: its compose file, install.sh .env keys and RELEASED images;
+# enterprise images come from GAR, so `gcloud auth configure-docker` first),
+# seeds state through its API, upgrades the same volumes to this checkout
+# (images built locally from HEAD, never pushed) and asserts migrations,
+# row counts, logins/keys, credential decryption, searches, rules and ingest,
+# then `scripts/e2e.sh run fast`. Open core and enterprise, sequentially.
+kind = "script"
+cmd = ["scripts/e2e/lanes/upgrade-from-v01.sh", "--edition", "both"]
+stack = false
+needs = ["docker"]
+enterprise = true
+timeout_min = 180
+
+[[lane]]
+name = "backup-restore"
+issue = "NAN-4989"
+# Customer disaster-recovery drill: for open and enterprise, seeds events,
+# rules, alerts, users, sessions, API keys, and encrypted credentials through
+# the API; runs scripts/nano backup; verifies refusal guards; deletes only its
+# ownership-labelled nanoe2e-* volumes; restores into fresh database volumes;
+# and proves searches, objects, logins, JWT sessions, and key-ring decryption.
+kind = "script"
+cmd = ["scripts/e2e/lanes/backup-restore.sh", "--edition", "both"]
+stack = false
+needs = ["docker"]
+enterprise = true
+timeout_min = 180
+
+[[lane]]
+name = "backup-restore-2shard"
+issue = "NAN-4989"
+# Transitional integration with the pending NAN-4986 role installer. Creates
+# a detached throwaway worktree of that branch, runs its real two-shard/three-
+# Keeper layout with this lane's customer CLI overlaid, destroys all role
+# volumes, restores PG plus each shard, and verifies API state, searches,
+# credential decryption, per-shard counts, and post-restore ingestion.
+kind = "script"
+cmd = ["scripts/e2e/lanes/backup-restore-2shard.sh"]
+stack = false
+needs = ["docker", "cargo"]
+enterprise = true
+timeout_min = 180
+
+# ---- ClickHouse-backed #[ignore] suites ---------------------------------------
+
+[[lane]]
+name = "ch-npl-wrong-answer"
+kind = "cargo"
+package = "nanosiem-core"
+test = "npl_wrong_answer_ch"
+stack = true
+threads = 1
+needs = ["cargo"]
+timeout_min = 60
+
+[[lane]]
+name = "ch-search-background-jobs"
+issue = "NAN-4915"
+kind = "cargo"
+package = "nanosiem-core"
+test = "search_background_jobs_integration"
+stack = true
+threads = 1
+needs = ["cargo"]
+timeout_min = 30
+
+[[lane]]
+name = "ch-ocsf-content-rules"
+kind = "cargo"
+package = "nanosiem-core"
+test = "ocsf_content_rules_live"
+stack = true
+threads = 1
+needs = ["cargo"]
+requires_env = ["NANO_CONTENT_RULES_DIR"]
+timeout_min = 45
+
+[[lane]]
+name = "ch-ocsf-query"
+kind = "cargo"
+package = "nanosiem-core"
+test = "ocsf_query_integration"
+stack = true
+threads = 1
+needs = ["cargo"]
+timeout_min = 30
+
+[[lane]]
+name = "ch-ocsf-search"
+kind = "cargo"
+package = "nanosiem-core"
+test = "ocsf_search_integration"
+stack = true
+threads = 1
+needs = ["cargo"]
+timeout_min = 30
+
+[[lane]]
+name = "ch-logs-ddl-consistency"
+kind = "cargo"
+package = "nanosiem-core"
+test = "logs_ddl_column_consistency"
+stack = true
+threads = 1
+needs = ["cargo"]
+timeout_min = 20
+
+[[lane]]
+name = "ch-aggregation-mv-guard"
+kind = "cargo"
+package = "nanosiem-core"
+test = "aggregation_mv_schema_guard"
+stack = true
+threads = 1
+needs = ["cargo"]
+timeout_min = 20
+
+[[lane]]
+name = "ch-detection-alert-cooldown"
+kind = "cargo"
+package = "nanosiem-core"
+test = "detection_alert_cooldown_integration"
+stack = true
+threads = 1
+needs = ["cargo"]
+timeout_min = 30
+
+[[lane]]
+name = "ch-detection-aggregate-dedup"
+kind = "cargo"
+package = "nanosiem-core"
+test = "detection_aggregate_dedup_integration"
+stack = true
+threads = 1
+needs = ["cargo"]
+timeout_min = 30
+
+# ---- PostgreSQL-backed #[ignore] suites ----------------------------------------
+
+[[lane]]
+name = "pg-migration-fresh-init"
+kind = "cargo"
+package = "nanosiem-core"
+test = "migration_fresh_init"
+stack = true
+threads = 1
+needs = ["cargo"]
+timeout_min = 20
+
+[[lane]]
+name = "pg-migration-seed-parity"
+kind = "cargo"
+package = "nanosiem-core"
+test = "migration_seed_parity"
+stack = true
+threads = 1
+needs = ["cargo"]
+timeout_min = 20
+
+[[lane]]
+name = "pg-vector-config-publication"
+kind = "cargo"
+package = "nanosiem-core"
+test = "vector_config_publication_integration"
+stack = true
+threads = 1
+needs = ["cargo"]
+timeout_min = 20
+
+[[lane]]
+name = "pg-effective-deployed-parsers"
+kind = "cargo"
+package = "nanosiem-core"
+test = "effective_deployed_parsers_integration"
+stack = true
+threads = 1
+needs = ["cargo"]
+timeout_min = 20
+
+[[lane]]
+name = "pg-onboarding-status"
+kind = "cargo"
+package = "nanosiem-core"
+test = "onboarding_status_integration"
+stack = true
+threads = 1
+needs = ["cargo"]
+timeout_min = 20
+
+[[lane]]
+name = "pg-source-scope"
+kind = "cargo"
+package = "nanosiem-core"
+test = "source_scope_integration"
+stack = true
+needs = ["cargo"]
+timeout_min = 20
+
+[[lane]]
+name = "pg-detection-delete-quiesce"
+kind = "cargo"
+package = "nanosiem-core"
+test = "detection_delete_quiesce_integration"
+stack = true
+needs = ["cargo"]
+timeout_min = 20
+
+[[lane]]
+name = "pg-playbook-acl"
+kind = "cargo"
+package = "nanosiem-enterprise"
+test = "playbook_acl_integration"
+stack = true
+threads = 1
+enterprise = true
+needs = ["cargo"]
+timeout_min = 30

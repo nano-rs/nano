@@ -226,7 +226,9 @@ pub async fn get_onboarding_status(
     ensure_onboarding_settings_access(&auth)?;
 
     // NAN-4779: every probe reads a row the matching settings page or wizard
-    // writes, and ignores rows migrations seed on a fresh install. See
+    // writes, and ignores rows migrations seed on a fresh install (the
+    // `system` service account). A connect-first draft counts as a connected
+    // source; its saved VRL counts as a parser. See
     // `nanosiem_core::onboarding::probe_dedicated_onboarding_status`.
     #[cfg(feature = "enterprise")]
     let (ai_available, ai_service_loaded) = (true, state.melod_service.read().await.is_some());
@@ -238,9 +240,8 @@ pub async fn get_onboarding_status(
         DedicatedProbeInputs {
             ai_available,
             ai_service_loaded,
-            // SSO is enterprise-only and `oidc_providers` exists only under the
-            // enterprise overlay (NAN-3463).
-            sso_available: crate::handlers::capabilities::SSO_AVAILABLE,
+            // `oidc_providers` ships in the base schema on this product.
+            sso_available: true,
         },
     )
     .await;

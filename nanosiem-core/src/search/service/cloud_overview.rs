@@ -29,14 +29,6 @@ use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CloudOverview {
-    /// The independently fetched section; absent for an exact full overview.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub section: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub preview_events: Vec<super::cloud_dossier::CloudDossierStreamEvent>,
-    /// A section exceeded the interactive envelope; fetch full once to admit a job.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub requires_durable: bool,
     pub header: CloudOverviewHeader,
     pub accounts: Vec<CloudOverviewAccount>,
     pub risky_principals: Vec<CloudOverviewPrincipal>,
@@ -44,10 +36,116 @@ pub struct CloudOverview {
     pub anomalies: Vec<CloudOverviewAnomaly>,
     pub service_health: Vec<CloudOverviewServiceHealth>,
     pub changes: Vec<CloudOverviewChange>,
-    /// Present when the exact overview exceeded the interactive resource
-    /// envelope and was admitted to the isolated durable query lane.
+    /// NAN-3077: the independently fetched card group this answer carries
+    /// (`page`, `identities`, `services`, `changes`, `denied`); absent for a
+    /// full overview.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub durable_job: Option<crate::search::AsyncSearchResponse>,
+    pub section: Option<String>,
+}
+
+/// OCSF stores `resources.uid` / `resources.name` / `resources.type` as
+/// Array(String), while the cloud views compare, group and display them as
+/// strings (`col != ''`, `GROUP BY col`): on OCSF every such query failed with
+/// "Array does not start with '['". Collapse either shape to one comma-joined
+/// string; a scalar String column passes through unchanged.
+pub(crate) fn scalar_resource_column(col: String) -> String {
+    format!("arrayStringConcat(arrayFlatten(array({col})), ',')")
+}
+
+/// NAN-4928 review P2: per-resource aggregation. On OCSF one event carries
+/// `resources[]`, stored as parallel `resources.uid/name/type` arrays (one
+/// Nested group, equal lengths). Aggregates (resource cards, counts, dossier
+/// top resources, pivots) must count each resource element on its own and
+/// keep a uid's own name and type, so they `ARRAY JOIN` the zipped tuple.
+/// UDM's scalar columns need no join (byte-identical SQL).
+pub(crate) struct ResourceRows {
+    /// ` ARRAY JOIN ...` to append after `FROM <table>` (empty on UDM).
+    pub array_join: String,
+    pub id: String,
+    pub name: String,
+    pub ty: String,
+}
+
+pub(crate) fn resource_rows(profile: &dyn crate::schema::SchemaProfile) -> ResourceRows {
+    let id = profile.udm_column_sql("resource_id");
+    let name = profile.udm_column_sql("resource_name");
+    let ty = profile.udm_column_sql("resource_type");
+    match (&id, &name, &ty) {
+        (Some(id), Some(name), Some(ty))
+            if is_array_resource(id) && is_array_resource(name) && is_array_resource(ty) =>
+        {
+            ResourceRows {
+                array_join: format!(" ARRAY JOIN arrayZip({id}, {name}, {ty}) AS __resource"),
+                id: "__resource.1".to_string(),
+                name: "__resource.2".to_string(),
+                ty: "__resource.3".to_string(),
+            }
+        }
+        _ => ResourceRows {
+            array_join: String::new(),
+            id: id.unwrap_or_else(|| "resource_id".to_string()),
+            name: name.unwrap_or_else(|| "resource_name".to_string()),
+            ty: ty.unwrap_or_else(|| "resource_type".to_string()),
+        },
+    }
+}
+
+/// Whether a resolved resource column is OCSF's `Array(String)` form.
+fn is_array_resource(col: &str) -> bool {
+    col.contains("resources.")
+}
+
+/// Case-insensitive equality of a resource column to one bound value (`?`).
+/// On OCSF's array column this is `has()` over the lowered elements, the exact
+/// expression of `idx_resources_uid_lower_bloom`, so the bloom filter still
+/// prunes granules (a joined string never could).
+pub(crate) fn resource_eq_ci(col: &str) -> String {
+    if is_array_resource(col) {
+        format!("has(arrayMap(x -> lower(x), {col}), lower(?))")
+    } else {
+        format!("lower({col}) = lower(?)")
+    }
+}
+
+/// Case-insensitive substring match of a non-empty resource column against
+/// one bound, already-lowered needle (`?`). Element-wise on OCSF's array.
+pub(crate) fn resource_contains_lower(col: &str) -> String {
+    if is_array_resource(col) {
+        format!("arrayExists(x -> x != '' AND position(lower(x), ?) > 0, {col})")
+    } else {
+        format!("({col} != '' AND position(lower({col}), ?) > 0)")
+    }
+}
+
+/// NAN-3077: the card groups the Cloud overview loads independently after a
+/// fast first paint (`page`: header and provider mix).
+pub const CLOUD_OVERVIEW_SECTIONS: &[&str] = &["page", "identities", "services", "changes", "denied"];
+
+/// Whether a `section` request needs the named overview subquery (`None`:
+/// the full overview needs all of them).
+fn section_needs(section: Option<&str>, subquery: &str) -> bool {
+    let Some(section) = section else { return true };
+    let needed: &[&str] = match section {
+        "page" => &["header", "provider"],
+        "identities" => &["header", "provider", "accounts", "principals", "timeline"],
+        "services" => &["service_health", "service_trend"],
+        "changes" => &["changes", "anomalies", "timeline"],
+        "denied" => &["header"],
+        _ => return true,
+    };
+    needed.contains(&subquery)
+}
+
+/// A subquery future that runs only when its section needs it.
+async fn gated<F>(on: bool, future: F) -> Result<Vec<serde_json::Value>, SearchError>
+where
+    F: std::future::Future<Output = Result<Vec<serde_json::Value>, SearchError>>,
+{
+    if on {
+        future.await
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
@@ -279,18 +377,22 @@ impl SearchService {
         time_range: &TimeRange,
         scope: &ScopeSet,
     ) -> Result<CloudOverview, SearchError> {
-        let Some(retention_time_range) =
-            self.retention_bound_query_range(time_range, chrono::Utc::now())?
-        else {
-            return Ok(CloudOverview::default());
-        };
-        let time_range = &retention_time_range;
+        self.query_cloud_overview_section(None, provider_filter, account_filter, time_range, scope)
+            .await
+    }
 
-        if self.backend() == crate::search::config::SearchBackend::Lake {
-            return self
-                .query_lake_cloud_overview(provider_filter, account_filter, time_range, scope)
-                .await;
-        }
+    /// NAN-3077: one card group of the Cloud overview (see
+    /// [`CLOUD_OVERVIEW_SECTIONS`]), running only the subqueries that group
+    /// needs, so the cards load independently and a slow one never holds up
+    /// the others. `None` is the full overview.
+    pub async fn query_cloud_overview_section(
+        &self,
+        section: Option<&str>,
+        provider_filter: Option<&str>,
+        account_filter: Option<&str>,
+        time_range: &TimeRange,
+        scope: &ScopeSet,
+    ) -> Result<CloudOverview, SearchError> {
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return Ok(CloudOverview::default()),
@@ -312,7 +414,9 @@ impl SearchService {
         // does not map (`udm_column_sql` → None) are SKIPPED — we never emit a
         // dead `ext.` reference (that 500s on OCSF) nor the bare literal name.
         let profile = self.active_profile.as_ref();
-        let logs_table = self.table_names.read(Self::logs_table_key(profile));
+        let logs_table = self
+            .table_names
+            .read(Self::logs_table_key(profile));
         let signals_table = self.table_names.read("signals");
 
         // Resolve the cloud-context columns once. `cloud_provider` /
@@ -330,15 +434,28 @@ impl SearchService {
         let http_status_col = profile.udm_column_sql("http_status_code");
         let action_col = profile.udm_column_sql("action");
         let change_type_col = profile.udm_column_sql("change_type");
-        let resource_name_col = profile.udm_column_sql("resource_name");
-        let resource_type_col = profile.udm_column_sql("resource_type");
+        // OCSF stores `resources.name` / `resources.type` as Array(String), so
+        // `col != ''` failed the changes card (and with it the whole overview)
+        // with "Array does not start with '['". Collapse either shape to one
+        // comma-joined string: a scalar String passes through unchanged.
+        // NAN-4928 review P2: the changes card lists one row per resource
+        // element (OCSF arrays ARRAY JOINed as (uid, name, type) tuples), so a
+        // multi-resource event never becomes a synthetic joined resource.
+        let resource_tuple = resource_rows(profile);
+        let resource_join = resource_tuple.array_join.clone();
+        let resource_name_col = profile.udm_column_sql("resource_name").map(|_| resource_tuple.name.clone());
+        let resource_type_col = profile.udm_column_sql("resource_type").map(|_| resource_tuple.ty.clone());
 
         // The provider/account filters can only apply when the schema actually
         // has the gating column; otherwise drop the clause (and its bind).
-        let provider_filter_active =
-            provider_filter.filter(|p| !p.is_empty()).is_some() && cloud_provider_col.is_some();
-        let account_filter_active =
-            account_filter.filter(|a| !a.is_empty()).is_some() && cloud_account_id_col.is_some();
+        let provider_filter_active = provider_filter
+            .filter(|p| !p.is_empty())
+            .is_some()
+            && cloud_provider_col.is_some();
+        let account_filter_active = account_filter
+            .filter(|a| !a.is_empty())
+            .is_some()
+            && cloud_account_id_col.is_some();
         let provider_clause = match (&cloud_provider_col, provider_filter_active) {
             (Some(col), true) => format!(" AND lower({col}) = lower(?)"),
             _ => String::new(),
@@ -388,14 +505,10 @@ impl SearchService {
         // across whichever of provider/service/account the schema maps; if none
         // map there is no cloud context to scope on and we omit the predicate.
         let cloud_scope_predicate = {
-            let terms: Vec<String> = [
-                &cloud_provider_col,
-                &cloud_service_col,
-                &cloud_account_id_col,
-            ]
-            .into_iter()
-            .filter_map(|c| c.as_ref().map(|col| format!("{col} != ''")))
-            .collect();
+            let terms: Vec<String> = [&cloud_provider_col, &cloud_service_col, &cloud_account_id_col]
+                .into_iter()
+                .filter_map(|c| c.as_ref().map(|col| format!("{col} != ''")))
+                .collect();
             if terms.is_empty() {
                 String::new()
             } else {
@@ -808,7 +921,7 @@ impl SearchService {
                 {action_outer},
                 {target_outer},
                 {target_type_outer}
-            FROM {logs_table}
+            FROM {logs_table}{resource_join}
             PREWHERE timestamp BETWEEN ? AND ?{change_kind_filter}
               AND {svc} != ''
               {provider_clause}
@@ -849,14 +962,11 @@ impl SearchService {
             None => "'' AS service".to_string(),
         };
         let anomaly_cloud_predicate = {
-            let terms: Vec<String> = [
-                &cloud_service_col,
-                &cloud_provider_col,
-                &cloud_account_id_col,
-            ]
-            .into_iter()
-            .filter_map(|c| c.as_ref().map(|col| format!("l.{col} != ''")))
-            .collect();
+            let terms: Vec<String> =
+                [&cloud_service_col, &cloud_provider_col, &cloud_account_id_col]
+                    .into_iter()
+                    .filter_map(|c| c.as_ref().map(|col| format!("l.{col} != ''")))
+                    .collect();
             if terms.is_empty() {
                 // No cloud context to gate on — keep the feed empty rather than
                 // surfacing every (non-cloud) signal.
@@ -994,15 +1104,15 @@ impl SearchService {
             changes_rows,
             anomaly_rows,
         ) = tokio::join!(
-            header_fut,
-            provider_fut,
-            accounts_fut,
-            principals_fut,
-            timeline_fut,
-            service_health_fut,
-            service_trend_fut,
-            changes_fut,
-            anomalies_fut,
+            gated(section_needs(section, "header"), header_fut),
+            gated(section_needs(section, "provider"), provider_fut),
+            gated(section_needs(section, "accounts"), accounts_fut),
+            gated(section_needs(section, "principals"), principals_fut),
+            gated(section_needs(section, "timeline"), timeline_fut),
+            gated(section_needs(section, "service_health"), service_health_fut),
+            gated(section_needs(section, "service_trend"), service_trend_fut),
+            gated(section_needs(section, "changes"), changes_fut),
+            gated(section_needs(section, "anomalies"), anomalies_fut),
         );
 
         // Propagate any transient ClickHouse failure so an upstream cache never
@@ -1037,10 +1147,7 @@ impl SearchService {
             .into_iter()
             .next()
             .map(|row| HeaderRow {
-                events_total: row
-                    .get("events_total")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0),
+                events_total: row.get("events_total").and_then(|v| v.as_u64()).unwrap_or(0),
                 events_failed: row
                     .get("events_failed")
                     .and_then(|v| v.as_u64())
@@ -1091,7 +1198,12 @@ impl SearchService {
             .first()
             .map(|a| a.name.clone())
             .filter(|n| !n.is_empty());
-        let posture_score = accounts.iter().take(5).map(|a| a.risk).max().unwrap_or(0);
+        let posture_score = accounts
+            .iter()
+            .take(5)
+            .map(|a| a.risk)
+            .max()
+            .unwrap_or(0);
         let posture_reason = top_account_label
             .as_ref()
             .map(|name| format!("driven by {name}"));
@@ -1112,11 +1224,8 @@ impl SearchService {
             &window_label(time_range),
         );
 
-        let service_health = build_service_health(
-            &service_health_rows,
-            &service_trend_rows,
-            SERVICE_TREND_BUCKETS,
-        );
+        let service_health =
+            build_service_health(&service_health_rows, &service_trend_rows, SERVICE_TREND_BUCKETS);
 
         let anomalies = build_anomalies(&anomaly_rows);
 
@@ -1142,7 +1251,6 @@ impl SearchService {
         };
 
         Ok(CloudOverview {
-            section: None, preview_events: Vec::new(), requires_durable: false,
             header,
             accounts,
             risky_principals,
@@ -1150,7 +1258,7 @@ impl SearchService {
             anomalies,
             service_health,
             changes,
-            durable_job: None,
+            section: section.map(str::to_string),
         })
     }
 }
@@ -1189,7 +1297,11 @@ async fn fetch_rows(
     let mut bytes = Vec::new();
     loop {
         match cursor.next().await {
-            Ok(Some(chunk)) => bytes.extend_from_slice(&chunk),
+            Ok(Some(chunk)) => {
+                // NAN-3282: charge the view's memory ledger as bytes arrive.
+                crate::search::view_memory::charge_wire_bytes(chunk.len() as u64).await?;
+                bytes.extend_from_slice(&chunk)
+            }
             Ok(None) => break,
             Err(e) => {
                 tracing::error!(subquery, error = %e, "Cloud overview subquery stream error");
@@ -1403,13 +1515,17 @@ fn build_timeline(
             accent: lane_accent(i).into(),
         })
         .collect();
-    let lane_ids: std::collections::HashSet<String> = lanes.iter().map(|l| l.id.clone()).collect();
+    let lane_ids: std::collections::HashSet<String> =
+        lanes.iter().map(|l| l.id.clone()).collect();
 
     // Normalize bucket weights to {1, 2, 3} per lane so the heatmap reads
     // consistently regardless of absolute event volume.
     let mut per_lane_max: BTreeMap<String, u64> = BTreeMap::new();
     for row in rows {
-        let lane_id = row.get("account_id").and_then(|v| v.as_str()).unwrap_or("");
+        let lane_id = row
+            .get("account_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if lane_id.is_empty() || !lane_ids.contains(lane_id) {
             continue;
         }
@@ -1514,9 +1630,7 @@ fn build_service_health(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
-            let trend = trends
-                .remove(&id)
-                .unwrap_or_else(|| vec![0u64; trend_buckets as usize]);
+            let trend = trends.remove(&id).unwrap_or_else(|| vec![0u64; trend_buckets as usize]);
             Some(CloudOverviewServiceHealth {
                 label: id.to_uppercase(),
                 accent: service_accent(&id).into(),
@@ -1580,7 +1694,10 @@ fn build_anomalies(rows: &[serde_json::Value]) -> Vec<CloudOverviewAnomaly> {
                     None
                 })
                 .unwrap_or_default();
-            let at_raw = row.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+            let at_raw = row
+                .get("ts")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let at = format_hhmm(at_raw);
             let principal = row
                 .get("principal")
@@ -1621,10 +1738,8 @@ fn build_changes(
     rows: &[serde_json::Value],
     accounts: &[CloudOverviewAccount],
 ) -> Vec<CloudOverviewChange> {
-    let account_name: HashMap<String, String> = accounts
-        .iter()
-        .map(|a| (a.id.clone(), a.name.clone()))
-        .collect();
+    let account_name: HashMap<String, String> =
+        accounts.iter().map(|a| (a.id.clone(), a.name.clone())).collect();
     rows.iter()
         .filter_map(|row| {
             let ts = row.get("ts").and_then(|v| v.as_str()).unwrap_or("");

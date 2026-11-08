@@ -201,10 +201,7 @@ fn trailing_backslash_value_is_literal() {
     fn first_str(q: &Query) -> Option<String> {
         fn walk(e: &SearchExpr) -> Option<String> {
             match e {
-                SearchExpr::FieldFilter {
-                    value: Value::String(s),
-                    ..
-                } => Some(s.clone()),
+                SearchExpr::FieldFilter { value: Value::String(s), .. } => Some(s.clone()),
                 SearchExpr::And(a, b) | SearchExpr::Or(a, b) => walk(a).or_else(|| walk(b)),
                 SearchExpr::Not(x) | SearchExpr::Group(x) => walk(x),
                 _ => None,

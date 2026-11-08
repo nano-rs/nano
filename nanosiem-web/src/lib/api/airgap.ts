@@ -7,9 +7,8 @@
 // multipart boundary the browser sets), so this mirrors the same
 // FormData + manual-fetch pattern used by `UploadApi.previewUpload`.
 
+import { authenticatedFetch } from '../authenticated-fetch';
 import { getServiceUrl } from './utils';
-import { requestCredentials } from '@/lib/request-credentials';
-import { getAccessToken } from '../auth-token';
 
 /**
  * Response from syncing an air-gapped parser bundle (NAN-1226).
@@ -31,17 +30,9 @@ async function postBundle<T>(endpoint: string, file: File): Promise<T> {
   formData.append('file', file);
 
   const url = `${getServiceUrl(endpoint)}${endpoint}`;
-  const headers: Record<string, string> = {};
-  const token = getAccessToken();
-  if (token) headers['Authorization'] = `Bearer ${token}`;
-
-  const response = await fetch(url, {
+  const response = await authenticatedFetch(endpoint, url, {
     method: 'POST',
-    headers,
     body: formData,
-    // Bearer and cookie must not travel together (shared auth refuses two
-    // credentials with 401); mirror the JSON transport's rule.
-    credentials: requestCredentials(endpoint, headers),
   });
 
   if (!response.ok) {
@@ -64,41 +55,10 @@ export function importParserBundle(file: File): Promise<AirgapParserImportRespon
   return postBundle<AirgapParserImportResponse>('/api/airgap/parsers/import', file);
 }
 
-/** Response from importing an offline license token bundle. */
-export interface AirgapLicenseImportResponse {
-  mode: string;
-  state: string;
-  valid: boolean;
-  tier: string;
-  expires_at: string;
-  content_version: string;
-  license_id?: string;
-  customer?: string;
-}
-
-/** Upload + apply a signed, air-gapped (offline) license token bundle. */
-export function importLicenseBundle(file: File): Promise<AirgapLicenseImportResponse> {
-  return postBundle<AirgapLicenseImportResponse>('/api/airgap/license/import', file);
-}
-
-/** Response from importing an offline enrichment bundle (IP geo/ASN or IOC). */
-export interface AirgapEnrichmentImportResponse {
-  /** `ip_enrichment` | `ioc` — the bundle type that was imported. */
-  bundle_type: string;
-  content_version: string;
-  records_imported: number;
-  dictionary_reloaded: boolean;
-}
-
-/**
- * Upload + import a signed, air-gapped enrichment data bundle. The backend
- * reads the bundle manifest's `bundle_type` to discriminate IP geo/ASN vs IOC,
- * so the same call handles both shapes. Used by the air-gap import surface that
- * the marketplace routes connectivity-required items to (NAN-1212).
- */
-export function importEnrichmentBundle(file: File): Promise<AirgapEnrichmentImportResponse> {
-  return postBundle<AirgapEnrichmentImportResponse>('/api/airgap/enrichment/import', file);
-}
+// NAN-4959: the signed IP geo/ASN + IOC enrichment bundle import
+// (`/api/airgap/enrichment/import`) is removed. IPinfo Lite, ThreatFox and Tor
+// ship only in nano's signed platform feed bundle (`.nanfeed`), imported with
+// its rollback fence through `importPlatformFeedBundle` (lib/api/enrichment.ts).
 
 /**
  * Response from syncing an air-gapped rule bundle (NAN-1226).

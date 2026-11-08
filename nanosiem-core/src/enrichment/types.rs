@@ -40,9 +40,9 @@ pub struct EnrichmentSourceConfig {
 }
 
 // NAN-1117: the PG-shaped `IpEnrichment` row struct (id/extra/created_at) was
-// removed when the IP enrichment payload moved to ClickHouse. The CSV-shaped
-// `IpInfoLiteRecord` (sync input) and `IpEnrichmentResult` (lookup output)
-// remain.
+// removed when the IP enrichment payload moved to ClickHouse. NAN-4959 removed
+// the CSV-shaped `IpInfoLiteRecord` with the native sync and the air-gap IP
+// import; `IpEnrichmentResult` (lookup output) remains.
 
 /// IP enrichment lookup result (for query-time enrichment)
 #[derive(Debug, Clone, Serialize, Deserialize, Default, utoipa::ToSchema)]
@@ -58,19 +58,6 @@ pub struct IpEnrichmentResult {
     pub as_domain: Option<String>,
 }
 
-/// IPinfo Lite CSV record format
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
-pub struct IpInfoLiteRecord {
-    pub network: String,
-    pub country: String,
-    pub country_code: String,
-    pub continent: String,
-    pub continent_code: String,
-    pub asn: String,
-    pub as_name: String,
-    pub as_domain: String,
-}
-
 /// Sync status for enrichment sources
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -78,11 +65,9 @@ pub enum SyncStatus {
     Success,
     Failed,
     InProgress,
-    /// Queued for an immediate (re)sync. The scheduler's `needs_sync` honors
-    /// this unconditionally — no interval wait, no failure cooldown. Used to
-    /// recover a sync orphaned by a restart (NAN-1280): the prior process was
-    /// killed mid-sync, so we re-queue rather than mark it `Failed` (a restart
-    /// is not a feed failure, and the anti-hammer cooldown would be wrong).
+    /// Queued for an immediate (re)sync. Used to recover a sync orphaned by a
+    /// restart (NAN-1280): the prior process was killed mid-sync, so we
+    /// re-queue rather than mark it `Failed`.
     Pending,
 }
 

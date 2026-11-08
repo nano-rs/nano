@@ -24,6 +24,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { useSystemConfig } from '@/hooks/use-api';
 import { useRecentAuditChanges } from '@/hooks/use-api';
+import { auditActorLabel } from '@/lib/audit-feed';
 import {
   SETTINGS_GROUPS,
   SETTINGS_SECTIONS,
@@ -302,7 +303,7 @@ function RecentChangesPreview() {
               )} />
               <span className="font-mono text-[10px] text-muted-foreground/70 tabular-nums w-[34px] shrink-0">{relativeAge(ev.timestamp)}</span>
               <span className="font-mono text-[10.5px] text-foreground/80 shrink-0 truncate max-w-[80px]">
-                {ev.user_name || 'system'}
+                {auditActorLabel(ev)}
               </span>
               <span className="text-[10.5px] text-muted-foreground min-w-0 truncate">{ev.action}</span>
               <span className="text-[10.5px] text-foreground/90 flex-1 min-w-0 truncate">{ev.message || ev.resource_name}</span>
@@ -321,7 +322,7 @@ function RecentChangesPreview() {
 
 export function SettingsLanding() {
   useDocumentTitle('Settings');
-  const { hasPermission, hasAnyPermission, isDemoUser, user } = useAuth();
+  const { hasPermission, hasAnyPermission, isDemoUser } = useAuth();
   const { capabilities } = useCapabilities();
   const { data: systemConfig } = useSystemConfig();
   const isAirGap = systemConfig?.air_gap === true;
@@ -331,7 +332,6 @@ export function SettingsLanding() {
       .map(s => {
         if (s.capability && !capabilities[s.capability]) return null;
         if (s.demoHidden && isDemoUser) return null;
-        if (s.sharedOnly && user?.deployment_mode !== 'enterprise_shared') return null;
         if (s.airgapOnly && !isAirGap) return null;
         const ok = !s.permissions
           || (Array.isArray(s.permissions) ? hasAnyPermission(s.permissions) : hasPermission(s.permissions));
@@ -340,7 +340,7 @@ export function SettingsLanding() {
       })
       .filter((s): s is SettingsSection => s !== null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities, isAirGap, user?.deployment_mode]);
+  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities, isAirGap]);
 
   const attention = useAttentionItems(visibleSections);
 

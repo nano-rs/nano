@@ -16,12 +16,88 @@
 //! - [`staging`] - Staging directory for validation before deployment
 //! - [`validation`] - Vector validate integration via Docker
 
+/// NAN-4038: VRL that removes credential-named fields from the event at any
+/// depth before it is stored.
+///
+/// Header names are case-insensitive, and a credential can arrive as a JSON
+/// body key (`parse_content` merges body keys onto the event), inside a header
+/// map (`.headers`, `.http.request.headers`), from a HEC `event` object, or
+/// from an upstream Vector. Every path into storage passes one of the blocks
+/// that splice this in (`prepare_output`, `clickhouse_mapping`, and the two
+/// OCSF prepare blocks), so it is applied there rather than at each source.
+///
+/// A field is removed when ANY segment of its path names a credential, so an
+/// object-valued `Authorization` goes too. Arrays are not descended into
+/// (`flatten` keeps them whole). A macro, not a `const`, so it can be
+/// `concat!`-ed into the static config literals.
+macro_rules! credential_field_redaction_vrl {
+    () => {
+        r#"# NAN-4038: credential-named fields never reach storage (any depth,
+# case-insensitive). See credential_field_redaction_vrl! in vector_config/mod.rs.
+nano_cred_names = ["authorization", "proxy-authorization", "x-api-key", "x-webhook-secret", "cookie", "set-cookie"]
+nano_cred_paths = []
+for_each(keys(flatten(., "\u{1f}"))) -> |_idx, nano_flat_key| {
+    nano_segments = split(nano_flat_key, "\u{1f}")
+    nano_hit = -1
+    for_each(nano_segments) -> |nano_i, nano_seg| {
+        if nano_hit < 0 && includes(nano_cred_names, downcase(nano_seg)) {
+            nano_hit = nano_i
+        }
+    }
+    if nano_hit >= 0 {
+        nano_cred_paths = push(nano_cred_paths, slice!(nano_segments, 0, nano_hit + 1))
+    }
+}
+for_each(nano_cred_paths) -> |_idx, nano_path| {
+    . = object!(remove!(., array!(nano_path)))
+}
+"#
+    };
+}
+
+/// NAN-4945: storage-boundary strip of the HTTP request's `Content-Type`.
+///
+/// `parse_content` (00-base.toml) leaves the header on the event so parsers can
+/// pick a decoder from it, and records its value in `%nano_content_type`. At
+/// every block that shapes a stored row the root field is dropped when it still
+/// holds that header value. A body field of the same name with its own value
+/// is sender data and stays.
+macro_rules! ingest_transport_strip_vrl {
+    () => {
+        r#"# NAN-4945: the request Content-Type is transport metadata; see
+# ingest_transport_strip_vrl! in vector_config/mod.rs.
+nano_transport_ct = to_string(%nano_content_type) ?? ""
+if nano_transport_ct != "" {
+    if (to_string(."Content-Type") ?? "") == nano_transport_ct { del(."Content-Type") }
+    if (to_string(."content-type") ?? "") == nano_transport_ct { del(."content-type") }
+}
+"#
+    };
+}
+
+#[cfg(test)]
+pub(crate) const INGEST_TRANSPORT_STRIP_VRL: &str = ingest_transport_strip_vrl!();
+
+/// The credential-field redaction program (NAN-4038); the live tap's own
+/// recursive redactor is checked against its name list (NAN-4919).
+#[cfg(test)]
+pub(crate) const CREDENTIAL_FIELD_REDACTION_VRL: &str = credential_field_redaction_vrl!();
+
 mod backup;
-mod closure;
+pub(crate) mod config_lock;
+#[cfg(test)]
+#[path = "claim_metadata_tests.rs"]
+mod claim_metadata_tests;
+#[cfg(test)]
+#[path = "hec_route_tests.rs"]
+mod hec_route_tests;
+#[cfg(test)]
+#[path = "ocsf_lane_stamp_tests.rs"]
+mod ocsf_lane_stamp_tests;
 mod credentials;
 pub mod delivery;
 mod deploy;
-pub(crate) use deploy::lake_ocsf_sink_text;
+pub mod hec_route;
 mod parser_config;
 mod publication;
 pub mod redaction;
@@ -30,13 +106,18 @@ mod sources;
 mod staging;
 mod validation;
 
-pub use parser_config::ParserConfigOptions;
 pub use publication::{
     PublicationOutcome, SnapshotBundle, VectorConfigPublicationError, VectorConfigPublisher,
 };
 pub use redaction::redact_config_snapshot;
-pub use router::{apply_hec_route_fallback, base_router_inputs, hec_normalize_present, HEC_ROUTE};
-pub(crate) use router::{otlp_source_present, transport_of, Transport};
+pub use deploy::{ActivationOutcome, ReloadWatch};
+
+/// NAN-4936: hooks for tests elsewhere in the crate (the entrypoint tests).
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    pub(crate) use super::deploy::request_reload_in;
+}
+pub use router::{base_router_inputs, hec_normalize_present};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -146,18 +227,64 @@ impl VectorConfigManager {
     /// Build a VRL route condition for a parser.
     /// Uses match_values when available (the actual source_type values the parser handles),
     /// falling back to safe_name for backward compatibility.
+    ///
+    /// NAN-4953 audit: `match_values` are tenant input. Each one is escaped as a
+    /// VRL string literal here, and callers emit the condition as a TOML basic
+    /// string ([`Self::source_router_route_lines`]), so a `"` or `'` in a value
+    /// can neither end the VRL literal nor the TOML one.
     fn build_route_condition(parser: &Parser) -> String {
         let values = Self::parser_source_types(parser);
         if values.len() == 1 {
-            format!(".source_type == \"{}\"", values[0])
+            format!(
+                ".source_type == \"{}\"",
+                sources::escape_vrl_string(&values[0])
+            )
         } else {
             let list = values
                 .iter()
-                .map(|v| format!("\"{}\"", v))
+                .map(|v| format!("\"{}\"", sources::escape_vrl_string(v)))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("includes([{}], .source_type)", list)
         }
+    }
+
+    /// NAN-4952: the `[transforms.source_router.route]` entries for the given
+    /// routed parsers plus the `generic` catch-all, shared by the active and the
+    /// staged router writers so the two files cannot drift. `routed` must come
+    /// from [`Self::source_router_parsers`].
+    pub(super) fn source_router_route_lines(routed: &[&Parser]) -> String {
+        let mut lines = String::new();
+        for parser in routed {
+            lines.push_str(&format!(
+                "{} = {}\n",
+                Self::safe_name(&parser.name),
+                parser_config::toml_basic_string(&Self::build_route_condition(parser))
+            ));
+        }
+        let mut known: Vec<String> = Vec::new();
+        for value in routed.iter().flat_map(|p| Self::parser_source_types(p)) {
+            if !known.contains(&value) {
+                known.push(value);
+            }
+        }
+        let exclusion_list = known
+            .iter()
+            .map(|s| format!("\"{}\"", sources::escape_vrl_string(s)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // NAN-1124: also exclude `nano_enrich` so push-enrichment records never
+        // fall through to the generic log parser (they're claimed by
+        // enrichment_router). Matches the downcased source_type so a mixed-case
+        // body value can't leak into the logs pipeline.
+        let generic = format!(
+            "!includes([{exclusion_list}], .source_type) && !starts_with(downcase(to_string(.source_type) ?? \"\"), \"nano_enrich\")"
+        );
+        lines.push_str(&format!(
+            "generic = {}\n\n",
+            parser_config::toml_basic_string(&generic)
+        ));
+        lines
     }
 
     /// Get the source_type values a parser handles.

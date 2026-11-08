@@ -87,11 +87,28 @@ export function useReportPhase2Status(opts: {
  */
 export const PHASE2_REPORTING_MODES: ReadonlySet<DisplayType> = new Set<DisplayType>([
   'trace',
-  'lateral',
-  'tree',
   'retro',
   'cloud',
   'service',
   'services',
   'metric',
 ]);
+
+/**
+ * NAN-3077: `| tree` and `| lateral` are phase-2 ONLY when the answer is a
+ * progressive pending marker (`_tree_pending` / `_lateral_pending`, sent for
+ * `x-nano-progressive-views: 1`). An atomic tree or lateral result already
+ * carries its count in the search metadata, so it must not be gated — gating
+ * it would replace the real hit count with the view's (unknown) one. They are
+ * therefore not in `PHASE2_REPORTING_MODES`; the footer gate uses this.
+ */
+export function isPhase2Reporting(
+  displayType: DisplayType | null | undefined,
+  markerFields?: Record<string, unknown> | null,
+): boolean {
+  if (displayType == null) return false;
+  if (PHASE2_REPORTING_MODES.has(displayType)) return true;
+  if (displayType === 'tree') return markerFields?._tree_pending === true;
+  if (displayType === 'lateral') return markerFields?._lateral_pending === true;
+  return false;
+}

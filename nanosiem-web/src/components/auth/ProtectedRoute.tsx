@@ -17,12 +17,9 @@ import { ShieldX } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
-import { tenantAppHref } from '@/lib/tenant-auth-shell';
 
 interface ProtectedRouteProps {
   children: ReactNode;
-  /** Tenant-aware login route for exact shared product paths. */
-  loginPath?: string;
   /** Single permission required to access this route */
   permission?: string;
   /** Multiple permissions - user needs ANY of these */
@@ -35,7 +32,6 @@ interface ProtectedRouteProps {
 
 export function ProtectedRoute({
   children,
-  loginPath = '/login',
   permission,
   anyPermission,
   allPermissions,
@@ -55,7 +51,7 @@ export function ProtectedRoute({
 
   // Redirect to login if not authenticated
   if (!isAuthenticated) {
-    return <Navigate to={loginPath} state={{ from: location.pathname + location.search + location.hash }} replace />;
+    return <Navigate to="/login" state={{ from: location.pathname + location.search + location.hash }} replace />;
   }
 
   // Check permissions
@@ -116,7 +112,7 @@ function ForbiddenPage() {
             Go Back
           </Button>
           <Button
-            onClick={() => { window.location.href = tenantAppHref('/'); }}
+            onClick={() => window.location.href = '/'}
             className="bg-primary hover:bg-primary/90 text-foreground"
           >
             Go to Home

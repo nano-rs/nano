@@ -21,13 +21,36 @@
              Standard SIEM analyst queries: searches, dashboards, investigations
              ================================================================= -->
         <default>
+            <!-- NAN-4906: CH 26.9 switched network compression to ZSTD, and the
+                 HTTP compress=1 framing follows it (CH #119825). The clickhouse-rs
+                 0.14 client only decodes LZ4, so keep the pre-26.9 wire format for
+                 every profile. The services also pin it per client (dual_pool.rs). -->
+            <network_compression_method>LZ4</network_compression_method>
+            <!-- NAN-4903: never infer Date/DateTime from JSON strings. Inference is per
+                 insert block, so one date-like vendor value retyped the whole path and
+                 coerced the other rows ("1" became 2026-01-01) in event/unmapped/ext. -->
+            <input_format_try_infer_dates>0</input_format_try_infer_dates>
+            <input_format_try_infer_datetimes>0</input_format_try_infer_datetimes>
             <!-- Memory Limits -->
             <max_memory_usage>20000000000</max_memory_usage> <!-- 20GB per query -->
             <max_memory_usage_for_user>40000000000</max_memory_usage_for_user> <!-- 40GB per user session -->
 
-            <!-- External processing when memory exceeded -->
-            <max_bytes_before_external_group_by>10000000000</max_bytes_before_external_group_by> <!-- 10GB -->
-            <max_bytes_before_external_sort>10000000000</max_bytes_before_external_sort> <!-- 10GB -->
+            <!-- External processing when memory exceeded. NAN-4957: relative to the
+                 box, not absolute. A 10 GB absolute threshold never triggers on a
+                 4-8G compose box, so one heavy GROUP BY / ORDER BY grew until the
+                 server limit and inserts failed with 241. 0 disables the absolute
+                 threshold; the ratio spills once the query holds 30% of the memory
+                 still available to the server at query start (measured on
+                 26.10.3.7 at a 3.6 GiB limit, 40M-group groupArray GROUP BY:
+                 1.75 GiB with the 10 GB absolute, 1.25 GiB at ratio 0.5, 772 MiB
+                 at 0.25). Searches are also capped at 40% of the server limit by
+                 the app (nanosiem-core db::clickhouse_transport::
+                 query_memory_ceiling), which bounds aggregations that cannot
+                 spill. -->
+            <max_bytes_before_external_group_by>0</max_bytes_before_external_group_by>
+            <max_bytes_ratio_before_external_group_by>0.3</max_bytes_ratio_before_external_group_by>
+            <max_bytes_before_external_sort>0</max_bytes_before_external_sort>
+            <max_bytes_ratio_before_external_sort>0.3</max_bytes_ratio_before_external_sort>
 
             <!-- Execution Time Limits -->
             <max_execution_time>300</max_execution_time> <!-- 5 minutes -->
@@ -42,6 +65,7 @@
             <!-- Thread Settings -->
             <max_threads>16</max_threads>
             <max_insert_threads>8</max_insert_threads>
+            <workload>interactive</workload>
 
             <!-- Queue Settings -->
             <queue_max_wait_ms>60000</queue_max_wait_ms> <!-- 60s wait in queue -->
@@ -95,8 +119,8 @@
                  to ~14 prevalence/aggregation MV parts, so a sub-second flush is a
                  part storm that saturates the BackgroundSchedulePool and stalls
                  merge-selection (the failure mode behind the Saturn part-backlog
-                 incident; managed tenants run the same window via the platform
-                 ClickHouse manifest). Adaptive 2s–10s shrinks toward the
+                 incident; managed tenants run the same window via nano-main
+                 k8s-manifests/clickhouse.ts). Adaptive 2s–10s shrinks toward the
                  2s floor under sustained insert pressure (bounding the part rate)
                  and only grows toward 10s when ingest is light. The in-flight
                  buffer is still capped by async_insert_max_data_size above, so a
@@ -112,7 +136,7 @@
             <!-- Security -->
             <readonly>0</readonly>
             <!-- allow_ddl=1 matches the managed-SaaS nanosiem profile
-                 (platform ClickHouse manifest). The `nanosiem` user is
+                 (nano-main k8s-manifests/clickhouse.ts). The `nanosiem` user is
                  BOTH the analyst-query user and the app/sync user; system
                  operations like the IPinfo Lite sync's generational cleanup
                  (`ALTER TABLE ip_enrichments DELETE …`, a mutation = DDL) require
@@ -146,6 +170,12 @@
              Long-running threat hunting, reports, and forensic analysis
              ================================================================= -->
         <analytics>
+            <network_compression_method>LZ4</network_compression_method>
+            <!-- NAN-4903: never infer Date/DateTime from JSON strings. Inference is per
+                 insert block, so one date-like vendor value retyped the whole path and
+                 coerced the other rows ("1" became 2026-01-01) in event/unmapped/ext. -->
+            <input_format_try_infer_dates>0</input_format_try_infer_dates>
+            <input_format_try_infer_datetimes>0</input_format_try_infer_datetimes>
             <!-- Extended limits for deep analysis -->
             <max_execution_time>3600</max_execution_time> <!-- 1 hour -->
             <max_memory_usage>50000000000</max_memory_usage> <!-- 50GB -->
@@ -158,6 +188,7 @@
 
             <!-- More threads for parallel processing -->
             <max_threads>32</max_threads>
+            <workload>background</workload>
 
             <!-- Lower priority than realtime queries -->
             <priority>5</priority>
@@ -181,6 +212,12 @@
              NRT detection rules - must be fast and predictable
              ================================================================= -->
         <realtime>
+            <network_compression_method>LZ4</network_compression_method>
+            <!-- NAN-4903: never infer Date/DateTime from JSON strings. Inference is per
+                 insert block, so one date-like vendor value retyped the whole path and
+                 coerced the other rows ("1" became 2026-01-01) in event/unmapped/ext. -->
+            <input_format_try_infer_dates>0</input_format_try_infer_dates>
+            <input_format_try_infer_datetimes>0</input_format_try_infer_datetimes>
             <!-- Strict time limits for detection latency -->
             <max_execution_time>30</max_execution_time> <!-- 30 seconds max -->
             <timeout_before_checking_execution_speed>5</timeout_before_checking_execution_speed>
@@ -196,6 +233,7 @@
 
             <!-- Fewer threads to leave resources for other queries -->
             <max_threads>8</max_threads>
+            <workload>interactive</workload>
 
             <!-- Highest priority in queue -->
             <priority>1</priority>
@@ -224,6 +262,12 @@
              Optimized for Vector and bulk data loading
              ================================================================= -->
         <ingestion>
+            <network_compression_method>LZ4</network_compression_method>
+            <!-- NAN-4903: never infer Date/DateTime from JSON strings. Inference is per
+                 insert block, so one date-like vendor value retyped the whole path and
+                 coerced the other rows ("1" became 2026-01-01) in event/unmapped/ext. -->
+            <input_format_try_infer_dates>0</input_format_try_infer_dates>
+            <input_format_try_infer_datetimes>0</input_format_try_infer_datetimes>
             <!-- No time limit for ingestion -->
             <max_execution_time>0</max_execution_time>
 
@@ -231,7 +275,9 @@
             <max_memory_usage>10000000000</max_memory_usage> <!-- 10GB -->
 
             <!-- Insert-specific settings -->
-            <max_insert_threads>16</max_insert_threads>
+            <max_threads>4</max_threads>
+            <max_insert_threads>4</max_insert_threads>
+            <workload>ingest</workload>
             <max_insert_block_size>1048576</max_insert_block_size> <!-- 1M rows -->
 
             <!-- Async insert optimization — durability ACK (NAN-1406), see the
@@ -273,6 +319,12 @@
              For schema changes and maintenance operations
              ================================================================= -->
         <admin>
+            <network_compression_method>LZ4</network_compression_method>
+            <!-- NAN-4903: never infer Date/DateTime from JSON strings. Inference is per
+                 insert block, so one date-like vendor value retyped the whole path and
+                 coerced the other rows ("1" became 2026-01-01) in event/unmapped/ext. -->
+            <input_format_try_infer_dates>0</input_format_try_infer_dates>
+            <input_format_try_infer_datetimes>0</input_format_try_infer_datetimes>
             <!-- No limits for admin operations -->
             <max_execution_time>0</max_execution_time>
             <max_memory_usage>0</max_memory_usage>
@@ -322,6 +374,12 @@
              reject in validate_sql_query is MANDATORY, not optional UX.
              ================================================================= -->
         <rawsql>
+            <network_compression_method>LZ4</network_compression_method>
+            <!-- NAN-4903: never infer Date/DateTime from JSON strings. Inference is per
+                 insert block, so one date-like vendor value retyped the whole path and
+                 coerced the other rows ("1" became 2026-01-01) in event/unmapped/ext. -->
+            <input_format_try_infer_dates>0</input_format_try_infer_dates>
+            <input_format_try_infer_datetimes>0</input_format_try_infer_datetimes>
             <!-- Security hardening -->
             <readonly>2</readonly>
             <allow_ddl>0</allow_ddl>
@@ -339,6 +397,7 @@
             <max_result_rows>1000000</max_result_rows>
             <max_result_bytes>1000000000</max_result_bytes>
             <max_threads>16</max_threads>
+            <workload>interactive</workload>
             <queue_max_wait_ms>60000</queue_max_wait_ms>
             <result_overflow_mode>throw</result_overflow_mode>
 

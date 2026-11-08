@@ -1,8 +1,9 @@
-//! The scheduler/runner: claims due feeds per tenant inside a per-tenant and
-//! a global concurrency budget, runs each through the engine with the HEC
-//! sink and fenced checkpoints, and records the outcome.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::collections::HashMap;
+//! The scheduler/runner: claims due feeds inside a concurrency budget, runs
+//! each through the engine with the HEC sink and fenced checkpoints, and
+//! records the outcome.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -15,13 +16,15 @@ use tokio::task::JoinSet;
 use super::feed::{
     ClaimedFeed, DEFAULT_SCHEDULE, RunRecord, RunStatus, effective_schedule, failure_delay, next_scheduled, spec_sha256,
 };
+use super::directory::{IDENTITY_UNCONFIGURED, IdentityDirectories};
 use super::hec::{HecConfig, HecSink};
-use super::store::{CredentialPass, FeedStore, PendingDelete, StoreError};
+use super::ingest::IngestRoute;
+use super::store::{FeedStore, StoreError};
 use crate::auth::Credentials;
-use crate::engine::{self, CheckpointStore, EngineConfig, EngineError, RunInput, Sink};
-use crate::identity::{CoordinatorClient, IdentitySink, IdentitySinkOptions};
+use crate::engine::{self, CheckpointStore, EngineConfig, EngineError, RunInput, RunOutput, Sink};
+use crate::identity::IdentitySink;
 use crate::policy::EgressDeny;
-use crate::spec::ConnectorSpec;
+use crate::spec::{ConnectorSpec, Kind};
 use crate::vrl_exec::VrlError;
 
 #[derive(Clone)]
@@ -29,10 +32,8 @@ pub struct RunnerConfig {
     /// Recorded on leases and run records.
     pub node_id: String,
     pub poll_interval: Duration,
-    /// Runs in flight across all tenants.
+    /// Runs in flight at once.
     pub max_concurrent: usize,
-    /// Runs in flight per tenant.
-    pub max_per_tenant: usize,
     /// Run wall clock when the feed sets none (the spec's own limit is
     /// clamped to it as well).
     pub default_max_run_secs: u64,
@@ -46,32 +47,21 @@ pub struct RunnerConfig {
     /// `max_run_secs` ceiling is set per feed.
     pub engine: EngineConfig,
     pub hec: HecConfig,
-    /// Feeds per tenant per tick whose ingest credential issuance is advanced.
-    pub credential_batch: usize,
-    /// `kind: identity` feeds: the server-owned lean coordinator
-    /// assignments (`NANO_LAKE_LEAN_ENRICHMENT_ASSIGNMENTS_FILE`). `None`:
-    /// identity feeds fail with `identity_coordinator_unconfigured`.
-    pub identity_assignments: Option<Arc<nanosiem_core::enrichment::lean_assignments::LeanAssignmentSource>>,
-    /// Dedicated / open core (NAN-3767): the deployment's own coordinator
-    /// and Vector enrichment ingress. Takes precedence over
-    /// `identity_assignments`; refused on hosted-shared.
-    pub identity_local: Option<Arc<crate::identity::LocalIdentity>>,
-    /// Identity sink switches (`is_admin` emission, spill dir, chunking).
-    pub identity: IdentitySinkOptions,
-    /// Uninstalled feeds per tenant per tick whose delete is attempted.
-    pub delete_batch: usize,
-    /// Lease on one delete attempt (the coordinator's feed delete rewrites
-    /// the directory snapshot).
-    pub delete_lease_secs: u64,
+    /// Where events go and with which token (the NAN-4907 seam).
+    pub ingest: Arc<dyn IngestRoute>,
+    /// Written after every successful tick (container health check).
+    pub health_file: Option<std::path::PathBuf>,
+    /// G22: the user directory `kind: identity` feeds write into. `None`:
+    /// identity feeds fail with [`IDENTITY_UNCONFIGURED`].
+    pub identity: Option<Arc<dyn IdentityDirectories>>,
 }
 
 impl RunnerConfig {
-    pub fn new(node_id: impl Into<String>, engine: EngineConfig) -> Self {
+    pub fn new(node_id: impl Into<String>, engine: EngineConfig, ingest: Arc<dyn IngestRoute>) -> Self {
         Self {
             node_id: node_id.into(),
             poll_interval: Duration::from_secs(30),
-            max_concurrent: 8,
-            max_per_tenant: 2,
+            max_concurrent: 4,
             default_max_run_secs: 600,
             max_run_secs_ceiling: 3600,
             lease_grace_secs: 60,
@@ -79,12 +69,9 @@ impl RunnerConfig {
             backoff_max: Duration::from_secs(3600),
             engine,
             hec: HecConfig::default(),
-            credential_batch: 8,
-            identity_assignments: None,
-            identity_local: None,
-            identity: IdentitySinkOptions::default(),
-            delete_batch: 4,
-            delete_lease_secs: 900,
+            ingest,
+            health_file: None,
+            identity: None,
         }
     }
 
@@ -95,135 +82,61 @@ impl RunnerConfig {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TickSummary {
-    pub tenants: usize,
     pub claimed: usize,
-    pub skipped_tenant_budget: usize,
-    pub claim_errors: usize,
-    /// Per-feed ingest credential issuance progress, summed over tenants.
-    pub credentials: CredentialPass,
-    pub credential_errors: usize,
-    /// Uninstalled feeds whose delete attempt started this tick.
-    pub deletes: usize,
-    pub delete_errors: usize,
+    pub budget_full: bool,
 }
 
 pub struct Runner {
     store: Arc<dyn FeedStore>,
     cfg: RunnerConfig,
-    global: Arc<Semaphore>,
-    tenants: Mutex<HashMap<uuid::Uuid, Arc<Semaphore>>>,
+    budget: Arc<Semaphore>,
     tasks: Mutex<JoinSet<RunRecord>>,
-    /// Delete attempts of uninstalled feeds (outside the run budgets).
-    deletes: Mutex<JoinSet<()>>,
 }
 
 impl Runner {
     pub fn new(store: Arc<dyn FeedStore>, cfg: RunnerConfig) -> Arc<Self> {
         Arc::new(Self {
-            global: Arc::new(Semaphore::new(cfg.max_concurrent.max(1))),
+            budget: Arc::new(Semaphore::new(cfg.max_concurrent.max(1))),
             store,
             cfg,
-            tenants: Mutex::new(HashMap::new()),
             tasks: Mutex::new(JoinSet::new()),
-            deletes: Mutex::new(JoinSet::new()),
         })
     }
 
-    async fn tenant_budget(&self, tenant: uuid::Uuid) -> Arc<Semaphore> {
-        self.tenants
-            .lock()
-            .await
-            .entry(tenant)
-            .or_insert_with(|| Arc::new(Semaphore::new(self.cfg.max_per_tenant.max(1))))
-            .clone()
-    }
-
-    /// One scheduling pass: claim what the budgets allow and start it. Runs
+    /// One scheduling pass: claim what the budget allows and start it. Runs
     /// continue in the background ([`Runner::drain`] waits for them).
     pub async fn tick(self: &Arc<Self>) -> Result<TickSummary, StoreError> {
-        // Reap finished runs so the set does not grow.
         {
             let mut tasks = self.tasks.lock().await;
             while tasks.try_join_next().is_some() {}
         }
-        {
-            let mut deletes = self.deletes.lock().await;
-            while deletes.try_join_next().is_some() {}
+        let mut permits: Vec<OwnedSemaphorePermit> = Vec::new();
+        while let Ok(p) = self.budget.clone().try_acquire_owned() {
+            permits.push(p);
         }
-        let slots = self.store.tenants().await?;
-        let mut summary = TickSummary { tenants: slots.len(), ..Default::default() };
-        for slot in slots {
-            // Credential issuance first, so a feed whose token was just
-            // revealed can be claimed in this same tick.
-            match self.store.provision_credentials(&slot, self.cfg.credential_batch).await {
-                Ok(pass) => {
-                    summary.credentials.requested += pass.requested;
-                    summary.credentials.waiting += pass.waiting;
-                    summary.credentials.issued += pass.issued;
-                    summary.credentials.failed += pass.failed;
-                }
-                Err(e) => {
-                    summary.credential_errors += 1;
-                    tracing::warn!(tenant_id = %slot.tenant_id, error = %e, "connector feed credential pass failed for tenant");
-                }
-            }
-            // Uninstalled feeds: remove their external state, then the row.
-            match self.store.claim_deletes(&slot, &self.cfg.node_id, self.cfg.delete_batch, self.cfg.delete_lease_secs).await {
-                Ok(claims) => {
-                    for claim in claims {
-                        summary.deletes += 1;
-                        let me = Arc::clone(self);
-                        self.deletes.lock().await.spawn(async move { me.delete_feed(claim).await });
-                    }
-                }
-                Err(e) => {
-                    summary.delete_errors += 1;
-                    tracing::warn!(tenant_id = %slot.tenant_id, error = %e, "connector feed delete claim failed for tenant");
-                }
-            }
-            let budget = self.tenant_budget(slot.tenant_id).await;
-            let mut permits: Vec<(OwnedSemaphorePermit, OwnedSemaphorePermit)> = Vec::new();
-            while let Ok(t) = budget.clone().try_acquire_owned() {
-                match self.global.clone().try_acquire_owned() {
-                    Ok(g) => permits.push((t, g)),
-                    Err(_) => break,
-                }
-            }
-            if permits.is_empty() {
-                summary.skipped_tenant_budget += 1;
-                continue;
-            }
-            let lease = {
-                let cfg = self.cfg.clone();
-                move |feed_max: Option<u64>| cfg.run_secs(feed_max) + cfg.lease_grace_secs
-            };
-            let claims = match self.store.claim_due(&slot, &self.cfg.node_id, permits.len(), &lease).await {
-                Ok(c) => c,
-                Err(e) => {
-                    summary.claim_errors += 1;
-                    tracing::warn!(tenant_id = %slot.tenant_id, error = %e, "connector feed claim failed for tenant");
-                    continue;
-                }
-            };
-            for claim in claims {
-                let Some(p) = permits.pop() else { break };
-                summary.claimed += 1;
-                let me = Arc::clone(self);
-                self.tasks.lock().await.spawn(async move {
-                    let _p = p;
-                    me.run_and_finish(claim).await
-                });
-            }
+        if permits.is_empty() {
+            return Ok(TickSummary { claimed: 0, budget_full: true });
+        }
+        let lease = {
+            let cfg = self.cfg.clone();
+            move |feed_max: Option<u64>| cfg.run_secs(feed_max) + cfg.lease_grace_secs
+        };
+        let claims = self.store.claim_due(&self.cfg.node_id, permits.len(), &lease).await?;
+        let mut summary = TickSummary::default();
+        for claim in claims {
+            let Some(p) = permits.pop() else { break };
+            summary.claimed += 1;
+            let me = Arc::clone(self);
+            self.tasks.lock().await.spawn(async move {
+                let _p = p;
+                me.run_and_finish(claim).await
+            });
         }
         Ok(summary)
     }
 
     /// Wait for every started run (tests, shutdown).
     pub async fn drain(&self) -> Vec<RunRecord> {
-        {
-            let mut deletes = self.deletes.lock().await;
-            while deletes.join_next().await.is_some() {}
-        }
         let mut out = Vec::new();
         let mut tasks = self.tasks.lock().await;
         while let Some(r) = tasks.join_next().await {
@@ -249,8 +162,10 @@ impl Runner {
         loop {
             match self.tick().await {
                 Ok(s) => {
-                    if s.claimed > 0 { tracing::debug!(?s, "connector runner tick"); }
-                    if let Ok(path) = std::env::var("CONNECTOR_HEALTH_FILE") {
+                    if s.claimed > 0 {
+                        tracing::debug!(?s, "connector runner tick");
+                    }
+                    if let Some(path) = &self.cfg.health_file {
                         if let Err(e) = std::fs::write(path, "ready\n") {
                             tracing::warn!(error = %e, "connector health heartbeat failed");
                         }
@@ -267,44 +182,12 @@ impl Runner {
         self.drain().await;
     }
 
-    /// One uninstalled feed: an identity feed's `<feed>:users` and
-    /// `<feed>:groups` are removed at the claimed tenant's coordinator
-    /// (2xx or 404 each), then the row is hard-deleted. Any failure is
-    /// recorded with a backoff and retried by a later tick; nothing is
-    /// dropped silently.
-    async fn delete_feed(&self, claim: PendingDelete) {
-        let outcome = if claim.identity { self.delete_identity_subfeeds(&claim).await } else { Ok(()) };
-        let feed = claim.feed_id;
-        match &outcome {
-            Ok(()) => tracing::info!(target: "nano_connector::audit", tenant_id = %claim.slot.tenant_id, feed_id = %feed, identity = claim.identity, "uninstalled connector feed removed"),
-            Err(e) => tracing::warn!(
-                target: "nano_connector::audit",
-                tenant_id = %claim.slot.tenant_id, feed_id = %feed, attempts = claim.attempts + 1, error = %e,
-                "uninstalled connector feed could not be removed yet; retrying with backoff"
-            ),
-        }
-        if let Err(e) = self.store.finish_delete(&claim, outcome).await {
-            tracing::warn!(tenant_id = %claim.slot.tenant_id, feed_id = %feed, error = %e, "connector feed delete could not be recorded");
-        }
-    }
-
-    async fn delete_identity_subfeeds(&self, claim: &PendingDelete) -> Result<(), String> {
-        // The tenant is the claim's (the store's inventory), never a spec's.
-        let client = self.identity_client(claim.slot.tenant_id)?;
-        let feed = claim.feed_id.hyphenated().to_string();
-        for sub in [crate::identity::USERS_SUBFEED, crate::identity::GROUPS_SUBFEED] {
-            client.delete_feed(&format!("{feed}:{sub}")).await?;
-        }
-        Ok(())
-    }
-
     async fn run_and_finish(&self, claim: ClaimedFeed) -> RunRecord {
         let record = self.run_claimed(&claim).await;
         emit_metrics(&claim, &record);
         audit(&claim, &record);
         if let Err(e) = self.store.finish(&claim, &record).await {
-            tracing::error!(tenant_id = %claim.slot.tenant_id, feed_id = %claim.feed.feed_id, error = %e,
-                "connector run outcome was not recorded");
+            tracing::error!(feed_id = %claim.feed.feed_id, error = %e, "connector run outcome was not recorded");
         }
         record
     }
@@ -312,72 +195,39 @@ impl Runner {
     /// Execute one claimed feed. Never panics into the scheduler; every
     /// failure becomes a `failed` record.
     pub async fn run_claimed(&self, claim: &ClaimedFeed) -> RunRecord {
-        let started = Utc::now();
+        let mut rec = RunRecord::started(Utc::now());
         let feed = &claim.feed;
-        let mut rec = RunRecord {
-            status: RunStatus::Failed,
-            started_at: started,
-            finished_at: started,
-            events: 0,
-            bytes: 0,
-            batches: 0,
-            pages: 0,
-            requests: 0,
-            ingest_retries: 0,
-            rejected_events: 0,
-            dropped_duplicates: 0,
-            checkpoints_committed: 0,
-            errors: 0,
-            error: None,
-            last_receipt: None,
-            next_run_at: started,
-            deferred: false,
-        };
-        let spec = match self.prepare(claim) {
+        let spec = match prepare(claim) {
             Ok(s) => s,
             Err(e) => return self.close(claim, rec, None, Some(e)),
         };
-        let run_sink = match self.sink_for(claim, &spec) {
-            Ok(s) => s,
+        if spec.kind == Kind::Identity {
+            return self.run_identity(claim, rec, spec).await;
+        }
+        let (ingest_url, token) = match self.cfg.ingest.route(feed) {
+            Ok(r) => r,
             Err(e) => return self.close(claim, rec, Some(&spec), Some(e)),
+        };
+        let sink = match HecSink::new(&ingest_url, token, feed.feed_id, &feed.connector, self.cfg.hec.clone()) {
+            Ok(s) => Arc::new(s),
+            Err(e) => return self.close(claim, rec, Some(&spec), Some(e.to_string())),
         };
         let checkpoints = match self.store.load_checkpoints(claim).await {
             Ok(c) => c,
             Err(e) => return self.close(claim, rec, Some(&spec), Some(e.to_string())),
         };
-        let fenced = Arc::new(FencedCheckpoints { store: Arc::clone(&self.store), claim: claim.clone(), commits: AtomicU64::new(0), lost: AtomicU64::new(0) });
-        let run_secs = self.cfg.run_secs(feed.max_run_secs);
-        let mut ecfg = self.cfg.engine.clone();
-        let egress_tenant = if claim.slot.actor_id.is_nil() { nanosiem_core::egress::LOCAL_TENANT } else { claim.slot.tenant_id };
-        crate::egress_proxy::configure_purpose_broker(&mut ecfg.broker, egress_tenant, crate::broker::GrantPurpose::Connector);
-        ecfg.ceilings.max_run_secs = run_secs;
-        let input = RunInput {
-            config: feed.config.clone(),
-            credentials: Credentials::new(feed.vendor_credentials.iter().map(|(k, v)| (k.clone(), v.expose().to_string())).collect()),
-            checkpoints,
-            artifact: None,
-            artifact_extra: Default::default(),
-            enabled_streams: None,
-            // VRL worker fairness is per tenant. A per-tenant egress deny
-            // list has no column yet; the platform deny lives in
-            // `EngineConfig.platform_deny`. The feed's own ingest host is
-            // never a vendor.
-            tenant: Some(claim.slot.tenant_id.to_string()),
-            egress_deny: run_sink.egress_deny(&feed.ingest_url),
-            feed_id: Some(feed.feed_id.to_string()),
-        };
-        // The engine enforces `run_secs`; this backstop covers a stuck sink
-        // or store call the engine cannot interrupt.
-        let backstop = Duration::from_secs(run_secs + self.cfg.lease_grace_secs / 2);
-        let result = tokio::time::timeout(backstop, engine::run(&ecfg, &spec, input, run_sink.as_sink(), fenced.clone())).await;
-        if result.is_err() {
-            if let RunSink::Identity(s) = &run_sink {
-                use crate::identity::IdentityTarget;
-                let _ = tokio::time::timeout(Duration::from_secs(15), s.abort()).await;
-            }
-        }
+        // VRL worker fairness is per feed. The feed's own ingest host is
+        // never a vendor. The engine enforces the run wall clock; the
+        // backstop covers a stuck sink or store call it cannot interrupt.
+        let (result, fenced, backstop) =
+            self.run_engine(claim, &spec, checkpoints, sink.clone(), ingest_deny(&ingest_url)).await;
         rec.checkpoints_committed = fenced.commits.load(Ordering::SeqCst);
-        run_sink.record(&mut rec);
+        rec.batches = sink.stats.batches.load(Ordering::SeqCst);
+        rec.bytes = sink.stats.bytes.load(Ordering::SeqCst);
+        rec.events = sink.stats.events.load(Ordering::SeqCst);
+        rec.ingest_retries = sink.stats.retries.load(Ordering::SeqCst);
+        rec.rejected_events = sink.stats.rejected_events.load(Ordering::SeqCst);
+        rec.last_receipt = sink.stats.last_receipt.lock().expect("receipt").clone();
         let lease_lost = fenced.lost.load(Ordering::SeqCst) > 0;
         match result {
             Ok(Ok(out)) => {
@@ -388,17 +238,7 @@ impl Runner {
                 self.close(claim, rec, Some(&spec), None)
             }
             Ok(Err(e)) => {
-                rec.status = match &e {
-                    _ if lease_lost => RunStatus::LeaseLost,
-                    EngineError::WallClock(_) => RunStatus::Timeout,
-                    // No VRL worker slot: this node is busy, the feed is
-                    // fine. Retry soon without counting a failure.
-                    EngineError::Vrl(VrlError::PoolExhausted(..)) => {
-                        rec.deferred = true;
-                        RunStatus::Timeout
-                    }
-                    _ => RunStatus::Failed,
-                };
+                rec.status = failure_status(&mut rec, &e, lease_lost);
                 self.close(claim, rec, Some(&spec), Some(e.to_string()))
             }
             Err(_) => {
@@ -408,70 +248,126 @@ impl Runner {
         }
     }
 
-    /// The run's sink: the feed's HEC ingress for a collector, the claimed
-    /// tenant's identity directory for `kind: identity`. The tenant is the
-    /// claim's (the store's inventory), never the spec's, config's or an
-    /// event's.
-    fn sink_for(&self, claim: &ClaimedFeed, spec: &ConnectorSpec) -> Result<RunSink, String> {
+    /// G22: a `kind: identity` feed. Same lease, fencing, checkpoints and
+    /// run record as a collector; the rows go to the user directory instead
+    /// of Vector, and the feed's identity provider row records the outcome.
+    async fn run_identity(&self, claim: &ClaimedFeed, mut rec: RunRecord, spec: ConnectorSpec) -> RunRecord {
         let feed = &claim.feed;
-        if spec.kind == crate::spec::Kind::Identity {
-            let client = self.identity_client(claim.slot.tenant_id)?;
-            let mut opts = self.cfg.identity.clone();
-            opts.max_memberships = opts
-                .max_memberships
-                .min(spec.limits.max_identity_memberships)
-                .min(self.cfg.engine.ceilings.max_identity_memberships);
-            let mut sink = IdentitySink::new(client, feed.feed_id, Utc::now(), opts);
-            if let Some(local) = &self.cfg.identity_local {
-                sink = sink.with_vector(Arc::clone(&local.vector));
+        let Some(directories) = &self.cfg.identity else {
+            return self.close(claim, rec, Some(&spec), Some(IDENTITY_UNCONFIGURED.to_string()));
+        };
+        let directory = match directories.open(feed).await {
+            Ok(d) => d,
+            Err(e) => return self.close(claim, rec, Some(&spec), Some(e)),
+        };
+        if let Err(e) = directory.started().await {
+            return self.close(claim, rec, Some(&spec), Some(e));
+        }
+        let checkpoints = match self.store.load_checkpoints(claim).await {
+            Ok(c) => c,
+            Err(e) => {
+                directory.finished(false, Some(&e.to_string()), 0, 0).await;
+                return self.close(claim, rec, Some(&spec), Some(e.to_string()));
             }
-            return Ok(RunSink::Identity(Arc::new(sink)));
+        };
+        let max_memberships = engine::compile(&spec, &self.cfg.engine.ceilings)
+            .map(|c| c.limits.max_identity_memberships)
+            .unwrap_or(5_000_000);
+        // NAN-4931: every directory write is fenced by this claim's lease.
+        let fence = Arc::new(super::store::ClaimFence { store: self.store.clone(), claim: claim.clone() });
+        let sink = Arc::new(IdentitySink::new(directory.clone(), max_memberships).with_fence(fence));
+        let (result, fenced, backstop) = self.run_engine(claim, &spec, checkpoints, sink.clone(), EgressDeny::default()).await;
+        rec.checkpoints_committed = fenced.commits.load(Ordering::SeqCst);
+        let rows = sink.stats.rows.load(Ordering::SeqCst);
+        rec.events = rows;
+        rec.batches = 0;
+        let duration_ms = (Utc::now() - rec.started_at).num_milliseconds();
+        let lease_lost = fenced.lost.load(Ordering::SeqCst) > 0;
+        let s = &sink.stats;
+        tracing::info!(
+            target: "nano_connector::audit",
+            feed_id = %feed.feed_id,
+            rows,
+            tombstones = s.tombstones.load(Ordering::SeqCst),
+            retired = s.retired.load(Ordering::SeqCst),
+            managers_resolved = s.managers_resolved.load(Ordering::SeqCst),
+            managers_unresolved = s.managers_unresolved.load(Ordering::SeqCst),
+            members = s.members.load(Ordering::SeqCst),
+            groups = s.groups.load(Ordering::SeqCst),
+            groups_applied = s.groups_applied.load(Ordering::SeqCst),
+            members_unmatched = s.members_unmatched.load(Ordering::SeqCst),
+            "identity feed run delivered"
+        );
+        match result {
+            Ok(Ok(out)) => {
+                directory.finished(true, None, duration_ms, rows).await;
+                rec.pages = out.pages;
+                rec.requests = out.requests;
+                rec.status = RunStatus::Success;
+                self.close(claim, rec, Some(&spec), None)
+            }
+            Ok(Err(e)) => {
+                let message = e.to_string();
+                directory.finished(false, Some(&truncate(&message, 1000)), duration_ms, rows).await;
+                rec.status = failure_status(&mut rec, &e, lease_lost);
+                self.close(claim, rec, Some(&spec), Some(message))
+            }
+            Err(_) => {
+                let message = format!("run exceeded its {} s backstop", backstop.as_secs());
+                directory.finished(false, Some(&message), duration_ms, rows).await;
+                rec.status = RunStatus::Timeout;
+                self.close(claim, rec, Some(&spec), Some(message))
+            }
         }
-        HecSink::for_tenant(if claim.slot.actor_id.is_nil() { nanosiem_core::egress::LOCAL_TENANT } else { claim.slot.tenant_id }, &feed.ingest_url, feed.ingest_token.clone(), feed.feed_id, &feed.connector, self.cfg.hec.clone())
-            .map(|s| RunSink::Hec(Arc::new(s)))
-            .map_err(|e| e.to_string())
     }
 
-    /// The claimed tenant's identity coordinator: the dedicated deployment's
-    /// own (NAN-3767), else the hosted assignments map. Neither: the feed
-    /// fails with `identity_coordinator_unconfigured`.
-    fn identity_client(&self, tenant: uuid::Uuid) -> Result<CoordinatorClient, String> {
-        if let Some(local) = &self.cfg.identity_local {
-            return local.client(tenant);
-        }
-        let source = self.cfg.identity_assignments.as_ref().ok_or(
-            "identity_coordinator_unconfigured: this runner has no identity directory path (open core: CONNECTOR_IDENTITY_COORDINATOR_URL, CONNECTOR_IDENTITY_VECTOR_URL and NANO_LAKE_TENANT_ID; hosted: NANO_LAKE_LEAN_ENRICHMENT_ASSIGNMENTS_FILE)",
-        )?;
-        CoordinatorClient::for_tenant(source, tenant)
-    }
-
-    /// Parse the pinned spec and check its digest.
-    fn prepare(&self, claim: &ClaimedFeed) -> Result<ConnectorSpec, String> {
+    /// The engine run of a claimed feed with fenced checkpoints, under the
+    /// run wall clock and the runner's backstop.
+    async fn run_engine(
+        &self,
+        claim: &ClaimedFeed,
+        spec: &ConnectorSpec,
+        checkpoints: std::collections::HashMap<String, Value>,
+        sink: Arc<dyn Sink>,
+        egress_deny: EgressDeny,
+    ) -> (Result<Result<RunOutput, EngineError>, tokio::time::error::Elapsed>, Arc<FencedCheckpoints>, Duration) {
         let feed = &claim.feed;
-        let digest = spec_sha256(&feed.spec_yaml);
-        if !digest.eq_ignore_ascii_case(&feed.spec_sha256) {
-            return Err(format!("pinned spec digest mismatch (feed pins {}, spec is {digest})", feed.spec_sha256));
-        }
-        let spec = ConnectorSpec::from_yaml(&feed.spec_yaml).map_err(|e| format!("spec: {e}"))?;
-        if !matches!(spec.kind, crate::spec::Kind::Collector | crate::spec::Kind::Identity) {
-            return Err("only collector and identity specs run as feeds".into());
-        }
-        Ok(spec)
+        let fenced = Arc::new(FencedCheckpoints {
+            store: Arc::clone(&self.store),
+            claim: claim.clone(),
+            commits: AtomicU64::new(0),
+            lost: AtomicU64::new(0),
+        });
+        let run_secs = self.cfg.run_secs(feed.max_run_secs);
+        let mut ecfg = self.cfg.engine.clone();
+        ecfg.ceilings.max_run_secs = run_secs;
+        let input = RunInput {
+            config: feed.config.clone(),
+            credentials: Credentials::new(
+                feed.vendor_credentials.iter().map(|(k, v)| (k.clone(), v.expose().to_string())).collect(),
+            ),
+            checkpoints,
+            artifact: None,
+            artifact_extra: Default::default(),
+            enabled_streams: None,
+            tenant: Some(feed.feed_id.to_string()),
+            egress_deny,
+        };
+        let backstop = Duration::from_secs(run_secs + self.cfg.lease_grace_secs / 2);
+        let result = tokio::time::timeout(backstop, engine::run(&ecfg, spec, input, sink, fenced.clone())).await;
+        (result, fenced, backstop)
     }
 
     fn close(&self, claim: &ClaimedFeed, mut rec: RunRecord, spec: Option<&ConnectorSpec>, error: Option<String>) -> RunRecord {
         let now = Utc::now();
         rec.finished_at = now;
-        // NAN-3660: the ingress refused the feed's credential. Record the
-        // refusal itself (not the engine's wrapper) so the operator sees
-        // "credential_revoked: ... rotate the feed credential".
         let mut credential_refused = false;
         if let Some(e) = error {
             if rec.status == RunStatus::Success {
                 rec.status = RunStatus::Failed;
             }
             rec.errors = 1;
-            let e = match crate::service::hec::credential_refusal_in(&e) {
+            let e = match super::hec::credential_refusal_in(&e) {
                 Some(refusal) if rec.status == RunStatus::Failed => {
                     credential_refused = true;
                     refusal.to_string()
@@ -489,9 +385,8 @@ impl Runner {
             regular
         } else if credential_refused {
             // Not a transient failure: retrying each batch cannot help until
-            // the credential is rotated (which makes the feed due at once).
-            // Never re-enroll here: a tenant's revoke stays in force.
-            (now + ChronoDuration::seconds(crate::service::hec::CREDENTIAL_REFUSED_RETRY_SECS)).max(regular)
+            // the ingest token is fixed.
+            (now + ChronoDuration::seconds(super::hec::CREDENTIAL_REFUSED_RETRY_SECS)).max(regular)
         } else if rec.deferred {
             let jitter = 1.0 + rand::random::<f64>();
             let d = self.cfg.poll_interval.mul_f64(jitter);
@@ -507,47 +402,33 @@ impl Runner {
     }
 }
 
-/// Where a run's rows go.
-enum RunSink {
-    Hec(Arc<HecSink>),
-    Identity(Arc<IdentitySink>),
+/// The status of a run the engine failed.
+fn failure_status(rec: &mut RunRecord, e: &EngineError, lease_lost: bool) -> RunStatus {
+    match e {
+        _ if lease_lost => RunStatus::LeaseLost,
+        EngineError::WallClock(_) => RunStatus::Timeout,
+        // No VRL worker slot: this node is busy, the feed is fine. Retry
+        // soon without counting a failure.
+        EngineError::Vrl(VrlError::PoolExhausted(..)) => {
+            rec.deferred = true;
+            RunStatus::Timeout
+        }
+        _ => RunStatus::Failed,
+    }
 }
 
-impl RunSink {
-    fn as_sink(&self) -> Arc<dyn Sink> {
-        match self {
-            Self::Hec(s) => s.clone(),
-            Self::Identity(s) => s.clone(),
-        }
+/// Parse the pinned spec and check its digest.
+fn prepare(claim: &ClaimedFeed) -> Result<ConnectorSpec, String> {
+    let feed = &claim.feed;
+    let digest = spec_sha256(&feed.spec_yaml);
+    if !digest.eq_ignore_ascii_case(&feed.spec_sha256) {
+        return Err(format!("pinned spec digest mismatch (feed pins {}, spec is {digest})", feed.spec_sha256));
     }
-
-    /// The vendor side of a run may reach neither the feed's ingress nor
-    /// the tenant's coordinator.
-    fn egress_deny(&self, ingest_url: &str) -> EgressDeny {
-        match self {
-            Self::Hec(_) => ingest_deny(ingest_url),
-            Self::Identity(s) => EgressDeny { hosts: s.coordinator_host().into_iter().chain(s.vector_host()).collect(), cidrs: vec![] },
-        }
+    let spec = ConnectorSpec::from_yaml(&feed.spec_yaml).map_err(|e| format!("spec: {e}"))?;
+    if !matches!(spec.kind, Kind::Collector | Kind::Identity) {
+        return Err("only collector and identity specs run as pull feeds".into());
     }
-
-    fn record(&self, rec: &mut RunRecord) {
-        match self {
-            Self::Hec(sink) => {
-                rec.batches = sink.stats.batches.load(Ordering::SeqCst);
-                rec.bytes = sink.stats.bytes.load(Ordering::SeqCst);
-                rec.events = sink.stats.events.load(Ordering::SeqCst);
-                rec.ingest_retries = sink.stats.retries.load(Ordering::SeqCst);
-                rec.rejected_events = sink.stats.rejected_events.load(Ordering::SeqCst);
-                rec.last_receipt = sink.stats.last_receipt.lock().expect("receipt").clone();
-            }
-            Self::Identity(sink) => {
-                rec.batches = sink.stats.requests.load(Ordering::SeqCst);
-                rec.bytes = sink.stats.bytes.load(Ordering::SeqCst);
-                rec.events = sink.stats.rows.load(Ordering::SeqCst);
-                rec.last_receipt = Some(format!("identity-run:{}", sink.run_id()));
-            }
-        }
-    }
+    Ok(spec)
 }
 
 /// Engine checkpoints → the store, fenced on the claim's lease.
@@ -577,28 +458,21 @@ impl CheckpointStore for FencedCheckpoints {
 }
 
 /// Deny the feed's ingest host to the vendor side of the run.
-fn ingest_deny(ingest_url: &str) -> EgressDeny {
+pub fn ingest_deny(ingest_url: &str) -> EgressDeny {
     let host = url::Url::parse(ingest_url).ok().and_then(|u| u.host_str().map(str::to_string));
     EgressDeny { hosts: host.into_iter().map(|h| h.trim_end_matches('.').to_ascii_lowercase()).collect(), cidrs: vec![] }
 }
 
-/// The platform egress deny for a runner, from `CONNECTOR_EGRESS_DENY_CIDRS`
-/// and `CONNECTOR_EGRESS_DENY_HOSTS` (comma-separated) plus the ingest host
-/// suffix. On a shared deployment the CIDR list is mandatory: it must name
-/// the cluster's pod / service / node ranges that are not already
-/// non-public (e.g. GUA IPv6 pod ranges, node public IPs).
-pub fn platform_egress_deny(cidrs: Option<&str>, hosts: Option<&str>, ingest_suffix: Option<&str>, shared: bool) -> Result<EgressDeny, String> {
+/// The operator egress deny for a runner, from `CONNECTOR_EGRESS_DENY_CIDRS`
+/// and `CONNECTOR_EGRESS_DENY_HOSTS` (comma-separated). The broker already
+/// refuses private, loopback and link-local addresses; this adds the
+/// deployment's own public ranges and names.
+pub fn platform_egress_deny(cidrs: Option<&str>, hosts: Option<&str>) -> Result<EgressDeny, String> {
     let split = |v: Option<&str>| -> Vec<String> {
         v.unwrap_or_default().split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
     };
     let cidrs = split(cidrs);
-    let mut hosts = split(hosts);
-    if let Some(sfx) = ingest_suffix.map(|s| s.trim().trim_matches('.').to_ascii_lowercase()).filter(|s| !s.is_empty()) {
-        hosts.push(format!(".{sfx}"));
-    }
-    if shared && cidrs.is_empty() {
-        return Err("CONNECTOR_EGRESS_DENY_CIDRS is required on enterprise_shared (cluster pod/service/node ranges)".into());
-    }
+    let hosts = split(hosts);
     for h in &hosts {
         let name = h.strip_prefix('.').unwrap_or(h);
         if !crate::policy::is_plain_hostname(&name.to_ascii_lowercase()) {
@@ -655,11 +529,10 @@ fn audit(claim: &ClaimedFeed, rec: &RunRecord) {
 pub fn audit_fields(claim: &ClaimedFeed, rec: &RunRecord) -> Value {
     let iso = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     json!({
-        "tenant_id": claim.slot.tenant_id,
         "feed_id": claim.feed.feed_id,
         "run_id": claim.run_id,
         "connector": claim.feed.connector,
-        "source_slug": claim.feed.source_slug,
+        "source_type": claim.feed.source_type,
         "spec_sha256": claim.feed.spec_sha256,
         "node": claim.node,
         "lease_generation": claim.lease_generation,
@@ -681,22 +554,4 @@ pub fn audit_fields(claim: &ClaimedFeed, rec: &RunRecord) -> Value {
         "next_run_at": iso(rec.next_run_at),
         "deferred": rec.deferred,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn platform_deny_is_required_on_shared_and_covers_ingest() {
-        assert!(platform_egress_deny(None, None, Some("ingest.example.net"), true).unwrap_err().contains("CONNECTOR_EGRESS_DENY_CIDRS"));
-        let d = platform_egress_deny(Some("10.0.0.0/8, 2600:1900::/28,"), Some("kube.internal.example.net"), Some(".ingest.example.net"), true).unwrap();
-        assert!(d.denies_host("tenant-a.ingest.example.net") && d.denies_host("ingest.example.net"));
-        assert!(d.denies_host("kube.internal.example.net") && !d.denies_host("api.vendor.com"));
-        assert!(d.denies_ip("2600:1900::1".parse().unwrap()) && d.denies_ip("10.2.3.4".parse().unwrap()));
-        assert!(platform_egress_deny(Some("10.0.0.0/33"), None, None, false).is_err());
-        assert!(platform_egress_deny(None, Some("http://x"), None, false).is_err());
-        assert!(platform_egress_deny(None, None, None, false).unwrap().hosts.is_empty());
-        assert_eq!(ingest_deny("https://Tenant.Ingest.example.net:443/services/collector").hosts, vec!["tenant.ingest.example.net".to_string()]);
-    }
 }

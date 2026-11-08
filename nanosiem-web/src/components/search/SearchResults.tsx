@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { CompletenessWatermark } from './CompletenessWatermark';
-import type { EventCompleteness } from '@/lib/api/types';
 import React, { useRef, useCallback, useEffect, useState, lazy, Suspense } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
@@ -10,6 +8,9 @@ import { api } from '@/lib/api';
 import { useScrollContainer } from '@/contexts/ScrollContainerContext';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import { keyChipSpecs, readKeyChip } from './key-chips';
+import { SEMANTIC_FIELDS, isSchemaField, semanticFieldsFor, type SemanticField } from '@/lib/schema-fields';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -34,11 +35,10 @@ import {
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { PivtIcon } from '@/components/icons/PivtIcon';
+import { enrichTypeFor, openEnrich } from '@/enterprise/components/threat-intel/enrich-event';
+import { useEnrichEnabled } from '@/enterprise/components/threat-intel/use-threat-intel';
+import { useCapabilitiesOptional } from '@/hooks/use-capabilities';
 import { cn } from '@/lib/utils';
-import { enrichTypeFor, openEnrich } from '@/components/threat-intel/enrich-event';
-import { useEnrichEnabled } from '@/components/threat-intel/use-threat-intel';
-import { formatCellValue } from '@/lib/format-cell-value';
-import { searchCsvCell as escapeCSV } from '@/lib/search-csv';
 import { EventInspectorPanel } from './EventInspectorPanel';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -114,33 +114,14 @@ interface SearchResult {
   timestamp: Date;
   source: string;
   fields: Record<string, unknown>;
-  fullEvent?: boolean;
-}
-
-function eventField(fields: Record<string, unknown> | undefined, path: string): unknown {
-  if (!fields) return undefined;
-  if (Object.prototype.hasOwnProperty.call(fields, path)) return fields[path];
-  return path.split('.').reduce<unknown>((value, segment) => {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-    return (value as Record<string, unknown>)[segment];
-  }, fields);
-}
-
-function eventFetchIdentity(event: SearchResult): { id?: string; source?: string } {
-  return {
-    id: (eventField(event.fields, 'metadata.uid') as string | undefined)
-      ?? (event.fields?.id as string | undefined),
-    source: (eventField(event.fields, 'metadata.log_source') as string | undefined)
-      ?? (event.fields?.source_type as string | undefined),
-  };
 }
 
 import type { DisplayType } from '@/lib/api/types';
 import { nplQuotedBody } from '@/lib/npl-quote';
-import { backgroundJobPhaseLabel, coldScanLabel, formatJobElapsed, hasMeasuredProgress, isColdScanProgress } from '@/lib/cold-scan-progress';
 // NAN-2209: the single regex-aware base-search extractor. SearchResults
 // previously carried a quote-only copy that split inside `field=/re|gex/`.
 import { getBaseSearch, buildGroupByQuery } from '@/lib/npl-pipeline';
+import { csvCell } from '@/lib/csv-safe';
 
 function formatCacheAge(timestamp: number): string {
   const seconds = Math.floor((Date.now() - timestamp) / 1000);
@@ -149,23 +130,8 @@ function formatCacheAge(timestamp: number): string {
 }
 
 interface SearchResultsProps {
-  completeness?: EventCompleteness;
   results: SearchResult[];
   totalCount: number;
-  /**
-   * NAN-2550: false when `totalCount` is a proven lower bound rather than a
-   * total. Infinite scroll must keep loading in that case — the count no longer
-   * over-reports by one to signal "more exists". Defaults to `true`.
-   */
-  totalCountExact?: boolean;
-  /**
-   * NAN-2550 x NAN-2551: how many of `results` are live-tail arrivals prepended
-   * in front of the paged set. `totalCount` is summed the same way, so the
-   * `results.length < totalCount` bound is unaffected — but "the count is only
-   * a lower bound" is a statement about the PAGED set, so it must be evaluated
-   * against `results.length - prependedRowCount`.
-   */
-  prependedRowCount?: number;
   isSearching: boolean;
   hasSearched: boolean;
   /** @deprecated Use displayType instead */
@@ -180,14 +146,10 @@ interface SearchResultsProps {
   /** Replace the running query AND jump the time window in one search (retro entity drill-down). */
   onSetQueryWithTime?: (query: string, startIso: string, endIso: string) => void;
   onLoadMore: () => void;
-  onVisibleRowsChange?: (visibleEnd: number, visibleStart?: number) => void;
-  pagingComplete?: boolean;
   onDrilldown?: (filters: Record<string, unknown>) => void;
   // Pagination for tabular views
   currentPage?: number;
   pageSize?: number;
-  /** Absolute row offset represented by results[0] for durable artifact pages. */
-  resultRowOffset?: number;
   onPageChange?: (page: number) => void;
   onPageSizeChange?: (size: number) => void;
   // Notebook integration
@@ -212,12 +174,12 @@ interface SearchResultsProps {
   // Async job state
   asyncJobId?: string | null;
   asyncJobStatus?: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | null;
-  asyncJobProgress?: import('@/lib/api/types').SearchJobProgress | null;
+  asyncJobProgress?: { rows_scanned: number; rows_total: number; percent: number; elapsed_ms: number } | null;
+  /** NAN-4915: durable background-job detail for the attached job */
+  asyncJobInfo?: import('@/lib/api/types').DurableJobInfo | null;
   queuePosition?: number | null;
   estimatedWait?: number | null;
   onCancelAsyncJob?: () => void;
-  /** Open the existing Search Jobs manager for product-view escalations. */
-  onOpenJobs?: () => void;
   // SSE streaming state (results arriving incrementally)
   isStreamingResults?: boolean;
   // Cached results indicator
@@ -240,15 +202,19 @@ function flattenForCSV(obj: Record<string, unknown>, prefix = ''): Record<string
     } else if (typeof value === 'object' && !Array.isArray(value)) {
       Object.assign(result, flattenForCSV(value as Record<string, unknown>, fullKey));
     } else if (Array.isArray(value)) {
-      // NAN-1466: comma-join a scalar array (a hash is `["abc123"]` on the
-      // wire) rather than emit a JSON blob that then needs its own quotes
-      // escaped inside the CSV cell's quotes.
-      result[fullKey] = formatCellValue(value);
+      result[fullKey] = JSON.stringify(value);
     } else {
       result[fullKey] = String(value);
     }
   }
   return result;
+}
+
+// Escape CSV value (handle commas, quotes, newlines)
+// NAN-3793: neutralize spreadsheet formulas (=, +, -, @, leading tab/CR/LF),
+// then RFC 4180-quote. Search rows carry attacker-controlled log text.
+function escapeCSV(value: string): string {
+  return csvCell(value);
 }
 
 // Export results to CSV
@@ -315,33 +281,70 @@ const FIELD_TO_ENTITY_TYPE: Record<string, string> = {
   url: 'url', http_referrer: 'url',
 };
 
+/** Every column (both profiles) of the given concepts, lowercased. */
+function conceptColumns(keys: SemanticField[]): string[] {
+  const out: string[] = [];
+  for (const k of keys) {
+    for (const col of [...SEMANTIC_FIELDS[k].udm, ...SEMANTIC_FIELDS[k].ocsf]) {
+      const c = col.toLowerCase();
+      if (!out.includes(c)) out.push(c);
+    }
+  }
+  return out;
+}
+
+// Query fields that scope a tree to one machine / one session. Time and source
+// scoping is kept as well. `hostname` / `dvc` are legacy UDM host aliases.
+const HOST_SCOPE_FIELDS = [
+  ...conceptColumns(['host', 'srcHost', 'logSource']),
+  'hostname', 'dvc', 'sourcetype', 'earliest', 'latest',
+];
+const SESSION_SCOPE_FIELDS = [
+  ...conceptColumns(['user', 'srcUser', 'srcIp', 'srcHost', 'host', 'logSource']),
+  'sourcetype', 'earliest', 'latest',
+];
+
+/** Field names used as `field<op>value` filters in a query's base search. */
+function queryFilterFields(q: string): string[] {
+  const out: string[] = [];
+  const re = /(?:^|[\s(])([\w.]+)\s*!?=/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(q.toLowerCase())) !== null) out.push(m[1]);
+  return out;
+}
+
 // ============================================================================
 // Field Value Menu - Click-to-open dropdown with contextual actions
 // ============================================================================
 
 type FieldType = 'ip' | 'hostname' | 'user' | 'hash' | 'domain' | 'process' | 'url' | 'generic';
 
+// NAN-4903: concepts → field type, resolved through the profile-aware map so
+// OCSF dotted columns (`dst_endpoint.hostname`, `actor.user.name`, …) classify
+// like their UDM counterparts instead of falling through the name heuristics.
+const CONCEPT_FIELD_TYPE: Partial<Record<SemanticField, FieldType>> = {
+  srcIp: 'ip', destIp: 'ip', deviceIp: 'ip',
+  host: 'hostname', srcHost: 'hostname', destHost: 'hostname',
+  user: 'user', srcUser: 'user', destUser: 'user',
+  fileHash: 'hash', processHash: 'hash',
+  domain: 'domain',
+  processName: 'process', processPath: 'process',
+  parentProcessName: 'process', parentProcessPath: 'process',
+  url: 'url',
+  // A command line is not a tree root; identifiers carry no entity actions
+  // (mirrors the UDM `command_line` / `_id` / `_guid` behavior).
+  commandLine: 'generic', parentCommandLine: 'generic', processId: 'generic', processGuid: 'generic', parentProcessId: 'generic',
+  parentProcessGuid: 'generic', userId: 'generic', sessionId: 'generic',
+};
+
 // Detect field type based on field name
 function getFieldType(fieldName: string): FieldType {
   const lower = fieldName.toLowerCase();
-  // NAN-2361: these rules were written for FLAT UDM names, but OCSF fields are
-  // dotted paths. `src_endpoint.hostname` contains no `_host`, so it fell all
-  // the way through to `generic` and lost every host action; likewise
-  // `actor.process.name` for process actions. `useSchemaEntityMap` only rescues
-  // ENTITY resolution (asset view / notebook), not the action gating below, so
-  // an OCSF tenant simply saw fewer actions than a UDM one.
-  //
-  // Classify the LEAF segment first and fall back to the whole name. Additive:
-  // a flat UDM name is its own leaf, so every existing verdict is unchanged.
-  const leaf = lower.includes('.') ? lower.slice(lower.lastIndexOf('.') + 1) : lower;
-  if (leaf !== lower) {
-    const leafType = classifyFieldName(leaf);
-    if (leafType !== 'generic') return leafType;
-  }
-  return classifyFieldName(lower);
-}
 
-function classifyFieldName(lower: string): FieldType {
+  for (const concept of semanticFieldsFor(lower)) {
+    const t = CONCEPT_FIELD_TYPE[concept];
+    if (t) return t;
+  }
 
   // IDs are generic - no special actions (process_id, parent_process_id, session_id, etc.)
   if (lower.endsWith('_id') || lower === 'id' || lower.endsWith('_guid')) return 'generic';
@@ -405,15 +408,10 @@ const ASSET_VIEW_ENTITY_TYPES = new Set(['ip', 'host', 'user']);
 // entity type to its canonical field and pass `field=<canonical>` so the backend
 // fast-path resolves identity via the profile-aware `udm_column_sql` (works in
 // OCSF). Matches `| lateral` and the retired EntityPage. NAN-1452.
-const UDM_ENTITY_TYPE_TO_ASSET_FIELD: Record<string, string> = {
+const ENTITY_TYPE_TO_ASSET_FIELD: Record<string, string> = {
   ip: 'src_ip',
   host: 'src_host',
   user: 'user',
-};
-const OCSF_ENTITY_TYPE_TO_ASSET_FIELD: Record<string, string> = {
-  ip: 'src_endpoint.ip',
-  host: 'src_endpoint.hostname',
-  user: 'actor.user.name',
 };
 
 // Fallback window for the asset-view drilldown when there's no event timestamp
@@ -471,7 +469,8 @@ export function FieldValueMenu({
   eventTimestamp,
 }: FieldValueMenuProps) {
   const navigate = useNavigate();
-  const { resolveEntityType, schemaFields } = useSchemaEntityMap({ fallback: FIELD_TO_ENTITY_TYPE });
+  const { resolveEntityType } = useSchemaEntityMap({ fallback: FIELD_TO_ENTITY_TYPE });
+  const schemaMap = useSchemaFieldMap();
   // NAN-1466: Array(String) columns (url.categories, tags, *_tags) must filter
   // on an ELEMENT — the backend compiles `field="x"` to has(col,'x'). Using the
   // JSON-stringified whole array (`["x"]`) matches nothing. Single-element is the
@@ -484,8 +483,12 @@ export function FieldValueMenu({
       ? JSON.stringify(value)
       : String(value);
   const fieldType = getFieldType(fieldName);
-  // On-demand threat-intel enrichment for external IPs, hashes, domains and URLs.
-  const threatIntel = useEnrichEnabled();
+  // On-demand threat-intel enrichment for external IPs, hashes, domains and
+  // URLs: the enterprise Enrich flyout, gated on the `threatIntel` capability
+  // so an open build never renders an inert Enrich item (NAN-2356 rule).
+  const threatIntelCapability = !!useCapabilitiesOptional()?.capabilities.threatIntel;
+  const enrichAllowed = useEnrichEnabled();
+  const threatIntel = threatIntelCapability && enrichAllowed;
   const enrichType = threatIntel ? enrichTypeFor(fieldType === 'generic' ? null : fieldType, stringValue) : null;
   const entityType = resolveEntityType(fieldName);
   const canOpenAssetView =
@@ -504,19 +507,14 @@ export function FieldValueMenu({
     return `${prefix}${field}="${escapeValue(val)}" | prevalence enrich=true window=24h`;
   };
 
-  // Check if query has host-level scoping (for process trees)
-  const hasHostScope = (q: string | undefined): boolean => {
-    if (!q) return false;
-    const lower = q.toLowerCase();
-    return /\bsrc_host\s*=/.test(lower) || /\bhostname\s*=/.test(lower) || /\bdvc\s*=/.test(lower);
-  };
+  // Check if query has host-level scoping (for process trees). Either profile's
+  // spelling counts (NAN-4903: OCSF queries scope on `device.hostname=` etc.).
+  const hasHostScope = (q: string | undefined): boolean =>
+    !!q && queryFilterFields(q).some((f) => HOST_SCOPE_FIELDS.includes(f));
 
   // Check if query has session-level scoping (for web trees)
-  const hasSessionScope = (q: string | undefined): boolean => {
-    if (!q) return false;
-    const lower = q.toLowerCase();
-    return /\buser\s*=/.test(lower) || /\bsrc_user\s*=/.test(lower) || /\bsrc_ip\s*=/.test(lower) || /\bsrc_host\s*=/.test(lower);
-  };
+  const hasSessionScope = (q: string | undefined): boolean =>
+    !!q && queryFilterFields(q).some((f) => SESSION_SCOPE_FIELDS.includes(f));
 
   // Extract only scope-relevant filters for tree queries
   // This prevents filtering out parent/child events needed for tree context
@@ -525,31 +523,13 @@ export function FieldValueMenu({
     const base = getBaseSearch(q);
     if (!base || base === '*') return '*';
 
-    // Fields to keep for each tree type. Under OCSF the UDM identity column names
-    // never appear in the query, so we also keep the active schema's host/user/ip
-    // promoted columns (NAN-1241). UDM rows never carry those names, so appending
-    // them leaves UDM scope extraction byte-identical.
-    const processScope = ['src_host', 'hostname', 'dvc', 'source_type', 'sourcetype', 'earliest', 'latest'];
-    const webScope = ['user', 'src_user', 'src_ip', 'src_host', 'source_type', 'sourcetype', 'earliest', 'latest'];
-    const schemaHostFields: string[] = [];
-    const schemaSessionFields: string[] = [];
-    if (schemaFields && schemaFields.schema !== 'udm') {
-      for (const f of schemaFields.fields) {
-        const name = f.name.toLowerCase();
-        if (f.entity_type === 'host') schemaHostFields.push(name);
-        if (f.entity_type === 'host' || f.entity_type === 'user' || f.entity_type === 'ip') {
-          schemaSessionFields.push(name);
-        }
-      }
-    }
-    const keepFields =
-      treeType === 'process'
-        ? [...processScope, ...schemaHostFields]
-        : [...webScope, ...schemaSessionFields];
+    // Fields to keep for each tree type, in either profile's spelling
+    // (NAN-4903 profile-aware field map; was UDM names + an entity_type scan).
+    const keepFields = treeType === 'process' ? HOST_SCOPE_FIELDS : SESSION_SCOPE_FIELDS;
 
     // Extract field=value patterns from query
     // Match: field="value", field='value', field=value, field=/regex/
-    const filterRegex = /(\w+)\s*([!=<>]+)\s*(?:"[^"]*"|'[^']*'|\/[^/]*\/|\S+)/g;
+    const filterRegex = /([\w.]+)\s*([!=<>]+)\s*(?:"[^"]*"|'[^']*'|\/[^/]*\/|\S+)/g;
     const filters: string[] = [];
     let match;
 
@@ -586,8 +566,8 @@ export function FieldValueMenu({
         break;
 
       case 'hostname':
-        // dest_host/url_domain are remote servers - show web tree
-        if (fieldName === 'dest_host' || fieldName === 'url_domain') {
+        // Destination hosts / URL domains are remote servers - show web tree
+        if (isSchemaField(fieldName, 'destHost') || isSchemaField(fieldName, 'domain')) {
           if (hasSessionScope(query)) {
             actions.push({
               label: 'Open as web tree',
@@ -630,11 +610,12 @@ export function FieldValueMenu({
         actions.push({
           label: 'Find all events',
           icon: <SearchIcon className="w-4 h-4" />,
-          onClick: () => {
+          // NAN-4903: refused with an error toast until the profile is known.
+          onClick: schemaMap.guard(() => {
             if (onSetQuery) {
-              onSetQuery(`user="${escapeValue(stringValue)}"`);
+              onSetQuery(schemaMap.filter('user', stringValue));
             }
-          },
+          }),
         });
         break;
 
@@ -711,6 +692,7 @@ export function FieldValueMenu({
   const contextualActions = getContextualActions();
   const showContextualActions = contextualActions.length > 0 && onSetQuery;
   const [menuOpen, setMenuOpen] = React.useState(false);
+  const valueRef = useRef<HTMLSpanElement>(null);
 
   return (
     <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
@@ -719,11 +701,21 @@ export function FieldValueMenu({
           positions the menu; the visible value opens it on a plain click, so a
           drag or double-click selects the text instead. */}
       <DropdownMenuTrigger asChild>
-        <span tabIndex={-1} className="inline-block w-0 overflow-hidden align-baseline" />
+        <span aria-hidden="true" tabIndex={-1} className="inline-block w-0 overflow-hidden align-baseline" />
       </DropdownMenuTrigger>
       <span
+        ref={valueRef}
+        role="button"
+        tabIndex={0}
         aria-haspopup="menu"
         aria-expanded={menuOpen}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            e.stopPropagation();
+            setMenuOpen(true);
+          }
+        }}
         data-stop-row-toggle
         className={`cursor-pointer hover:underline ${className}`}
         onMouseDown={recordPointerDown}
@@ -738,7 +730,10 @@ export function FieldValueMenu({
       >
         {highlightKeywords.length > 0 ? highlightText(displayValue, highlightKeywords) : displayValue}
       </span>
-      <DropdownMenuContent align="start" className="min-w-[200px] p-1">
+      <DropdownMenuContent align="start" className="min-w-[200px] p-1" onCloseAutoFocus={(e) => {
+        e.preventDefault();
+        valueRef.current?.focus();
+      }}>
         <DropdownMenuLabel className="px-2 py-1 text-[11px] tracking-normal normal-case text-muted-foreground font-normal break-all">
           {fieldName} ={' '}
           <span className="text-primary font-medium">{stringValue}</span>
@@ -793,10 +788,7 @@ export function FieldValueMenu({
             onClick={() => {
               // Filter on the canonical identifier field, not the clicked OCSF
               // field, so `| asset` can resolve the identifier (NAN-1452).
-              const fieldMap = schemaFields?.schema === 'ocsf'
-                ? OCSF_ENTITY_TYPE_TO_ASSET_FIELD
-                : UDM_ENTITY_TYPE_TO_ASSET_FIELD;
-              const assetField = fieldMap[entityType ?? ''] ?? fieldName;
+              const assetField = ENTITY_TYPE_TO_ASSET_FIELD[entityType ?? ''] ?? fieldName;
               const params = new URLSearchParams({
                 q: `${assetField}="${escapeValue(stringValue)}" | asset field=${assetField}`,
                 run: 'true',
@@ -811,6 +803,8 @@ export function FieldValueMenu({
               } else {
                 params.set('time', ASSET_VIEW_TIME_PRESET);
               }
+              // Hunt queries ride the URL fragment so they never reach server
+              // or proxy logs (Search reads it via readSearchFragment).
               navigate(`/search#${params.toString()}`);
             }}
             className="gap-1.5 px-2 py-1 text-[12px]"
@@ -894,11 +888,8 @@ function extractEntitiesFromResults(
 }
 
 export function SearchResults({
-  completeness,
   results,
   totalCount,
-  totalCountExact = true,
-  prependedRowCount = 0,
   isSearching,
   hasSearched,
   isAggregateQuery,
@@ -910,12 +901,9 @@ export function SearchResults({
   onSetQuery,
   onSetQueryWithTime,
   onLoadMore,
-  onVisibleRowsChange,
-  pagingComplete,
   onDrilldown,
   currentPage,
   pageSize,
-  resultRowOffset,
   onPageChange,
   onPageSizeChange,
   notebookActive,
@@ -930,10 +918,10 @@ export function SearchResults({
   asyncJobId,
   asyncJobStatus,
   asyncJobProgress,
+  asyncJobInfo,
   queuePosition,
   estimatedWait,
   onCancelAsyncJob,
-  onOpenJobs,
   isStreamingResults: _isStreamingResults,
   cachedAt,
   onRefreshCache,
@@ -1006,11 +994,6 @@ export function SearchResults({
   // sourceType (NAN-1032) lets the backend use the (source_type, timestamp, ...) PK
   // for a tight range read on S3-backed historical partitions.
   const sharedPrefetchLog = React.useCallback((id: string, logId?: string, timestamp?: Date, sourceType?: string) => {
-    const event = results.find(event => event.id === id);
-    if (event?.fullEvent) {
-      setSharedFullLogData(prev => prev.has(id) ? prev : new Map(prev).set(id, event.fields));
-      return;
-    }
     if (!onFetchLog || !logId || !timestamp || sharedFullLogDataRef.current.has(id) || sharedLoadingLogsRef.current.has(id)) return;
     setSharedLoadingLogs(prev => new Set(prev).add(id));
     onFetchLog(logId, timestamp, sourceType)
@@ -1029,14 +1012,13 @@ export function SearchResults({
           return next;
         });
       });
-  }, [onFetchLog, results]);
+  }, [onFetchLog]);
 
   const handleSelectEvent = React.useCallback((event: SearchResult, index: number) => {
     setSelectedEvent(event);
     setSelectedEventIndex(index);
     // Trigger full data fetch for the selected event
-    const fetchIdentity = eventFetchIdentity(event);
-    sharedPrefetchLog(event.id, fetchIdentity.id, event.timestamp, fetchIdentity.source);
+    sharedPrefetchLog(event.id, event.fields?.id as string, event.timestamp, event.fields?.source_type as string | undefined);
   }, [sharedPrefetchLog]);
 
   const handleCloseInspector = React.useCallback(() => {
@@ -1051,8 +1033,7 @@ export function SearchResults({
       const event = results[newIndex];
       setSelectedEvent(event);
       setSelectedEventIndex(newIndex);
-      const fetchIdentity = eventFetchIdentity(event);
-      sharedPrefetchLog(event.id, fetchIdentity.id, event.timestamp, fetchIdentity.source);
+      sharedPrefetchLog(event.id, event.fields?.id as string, event.timestamp, event.fields?.source_type as string | undefined);
     }
   }, [selectedEventIndex, results, sharedPrefetchLog]);
 
@@ -1139,7 +1120,6 @@ export function SearchResults({
         {!embeddedHeaderView && (
         <div className="py-2 px-3 border-b border-border flex flex-wrap items-center gap-1.5 font-mono text-[10.5px] tracking-[0.12em] uppercase text-foreground/70 font-semibold">
           <span className="mr-1">Results</span>
-          <CompletenessWatermark completeness={completeness} />
           {fieldsCollapsed && onExpandFields && (
             <button
               onClick={onExpandFields}
@@ -1184,7 +1164,7 @@ export function SearchResults({
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent side="bottom" className="bg-card border-border text-xs">
-                    <p>Analyze these results with pivt</p>
+                    <p>Generate AI analysis of these results</p>
                   </TooltipContent>
                 </Tooltip>
               </TooltipProvider>
@@ -1214,7 +1194,6 @@ export function SearchResults({
                 </Tooltip>
               </TooltipProvider>
             )}
-            {/* Client-side display toggles (localStorage) — no backend, every profile. */}
             {effectiveDisplayType === 'events' && (
               <Popover>
                 <PopoverTrigger asChild>
@@ -1355,7 +1334,7 @@ export function SearchResults({
             ? 'flex flex-col min-h-0 overflow-hidden'
             : 'p-3 space-y-0 overflow-x-auto md:overflow-x-hidden',
         )}>
-          {((isSearching || (asyncJobId && asyncJobStatus !== 'failed' && asyncJobStatus !== 'cancelled')) && results.length === 0) ? (
+          {((isSearching || asyncJobId) && results.length === 0) ? (
             // Loading state while searching (includes async job progress and queue status)
             <div className="text-center py-16 bg-muted/50 rounded-xl border border-border">
               {asyncJobStatus === 'queued' ? (
@@ -1378,14 +1357,26 @@ export function SearchResults({
               ) : (
                 <>
                   <LoadingIcon className="w-12 h-12 text-primary/50 mx-auto mb-3" />
-                  <p className="text-foreground text-base font-medium">Processing query...</p>
+                  <p className="text-foreground text-base font-medium">
+                    {asyncJobInfo ? 'Running as a background search' : 'Processing query...'}
+                  </p>
+                  {asyncJobInfo && (
+                    <p className="text-[11px] text-muted-foreground mt-1 max-w-md mx-auto leading-relaxed">
+                      {asyncJobInfo.origin === 'escalated'
+                        ? 'This search outran the interactive time budget, so it continues in the background. '
+                        : ''}
+                      You can leave this page and reopen it from Search jobs; results are kept for 24 hours.
+                      <span className="block font-mono text-[10.5px] mt-1">
+                        {asyncJobId}
+                        {asyncJobInfo.attempt > 1 && (
+                          <> · attempt {asyncJobInfo.attempt}/{asyncJobInfo.max_attempts} (resumed after a service restart)</>
+                        )}
+                      </span>
+                    </p>
+                  )}
                   <p className="text-muted-foreground text-sm mt-2">
-                    {asyncJobId && !hasMeasuredProgress(asyncJobProgress) && !isColdScanProgress(asyncJobProgress) ? (
-                      <>{backgroundJobPhaseLabel(asyncJobProgress)}</>
-                    ) : asyncJobProgress ? (
-                      isColdScanProgress(asyncJobProgress) ? (
-                        <span className="font-mono tabular-nums">{coldScanLabel(asyncJobProgress)}</span>
-                      ) : asyncJobProgress.rows_total > 0 ? (
+                    {asyncJobProgress ? (
+                      asyncJobProgress.rows_total > 0 ? (
                         <>{formatCompactNumber(asyncJobProgress.rows_scanned)} of {formatCompactNumber(asyncJobProgress.rows_total)} rows scanned</>
                       ) : (
                         <>Scanning rows...</>
@@ -1396,23 +1387,7 @@ export function SearchResults({
                       <>Starting search...</>
                     )}
                   </p>
-                  {asyncJobId && asyncJobProgress && !hasMeasuredProgress(asyncJobProgress) && (
-                    <p className="mt-3 text-xs text-muted-foreground font-mono tabular-nums" data-testid="async-job-elapsed">
-                      {formatJobElapsed(asyncJobProgress.elapsed_ms)} elapsed
-                    </p>
-                  )}
-                  {/* NAN-3883: a long search keeps running as a job; nothing to re-run. */}
-                  {asyncJobId && (
-                    <p className="text-xs text-muted-foreground/80 mt-3 max-w-sm mx-auto leading-relaxed" data-testid="async-job-background-note">
-                      Running as a background job. Results appear here when it finishes. You can leave this page; reopen it from{' '}
-                      {onOpenJobs ? (
-                        <button type="button" onClick={onOpenJobs} className="underline underline-offset-2 hover:text-foreground">Running jobs</button>
-                      ) : (
-                        <>Running jobs</>
-                      )}.
-                    </p>
-                  )}
-                  {asyncJobProgress && (!asyncJobId || hasMeasuredProgress(asyncJobProgress)) && (
+                  {asyncJobProgress && (
                     <div className="mt-4 flex flex-col items-center gap-2">
                       <div className="w-64 h-2 bg-muted rounded-full overflow-hidden">
                         <div
@@ -1541,7 +1516,6 @@ export function SearchResults({
               prevalenceFilter={assetPrevalenceFilter}
               timeRange={timeRange}
               onFetchLog={onFetchLog}
-              onOpenJobs={onOpenJobs}
             />
           ) : effectiveDisplayType === 'cloud' || results[0]?.fields?._display_type === 'cloud' ? (
             // Cloud: overview (NAN-394) when no principal is scoped, otherwise
@@ -1559,20 +1533,15 @@ export function SearchResults({
                 onExpandFields={onExpandFields}
                 onAddToQuery={onAddToQuery}
                 onSetQuery={onSetQuery}
-                initialDossier={(results[0]?.fields?._cloud_durable_dossier as import('@/lib/api/types').CloudDossierResponse | null) ?? null}
-                onOpenJobs={onOpenJobs}
               />
             ) : (
               <CloudOverviewView
                 timeRange={timeRange}
                 query={executedQuery ?? query}
-                account={(results[0]?.fields?._cloud_account as string | null) ?? null}
-                initialOverview={(results[0]?.fields?._cloud_durable_overview as import('@/lib/api/types').CloudOverviewResponse | null) ?? null}
                 fieldsCount={fieldsCollapsed ? fieldsCount : undefined}
                 onExpandFields={onExpandFields}
                 onAddToQuery={onAddToQuery}
                 onSetQuery={onSetQuery}
-                onOpenJobs={onOpenJobs}
               />
             )
           ) : effectiveDisplayType === 'lateral' || results[0]?.fields?._display_type === 'lateral' ? (
@@ -1599,7 +1568,6 @@ export function SearchResults({
               onSetQuery={onSetQuery}
               onSetQueryWithTime={onSetQueryWithTime}
               onAddToQuery={onAddToQuery}
-              onOpenJobs={onOpenJobs}
             />
           ) : effectiveDisplayType === 'baseline' || results[0]?.fields?._display_type === 'baseline' ? (
             // Entity baseline for `… | baseline` (NAN-1868/1873). Unlike the marker
@@ -1670,7 +1638,6 @@ export function SearchResults({
               totalCount={totalCount}
               currentPage={currentPage ?? 0}
               pageSize={pageSize ?? 50}
-              resultRowOffset={resultRowOffset}
               onPageChange={onPageChange}
               onPageSizeChange={onPageSizeChange}
               onDrilldown={onDrilldown}
@@ -1691,12 +1658,8 @@ export function SearchResults({
               notebookActive={notebookActive}
               onAddToNotebook={onAddToNotebook}
               totalCount={totalCount}
-              totalCountExact={totalCountExact}
-              prependedRowCount={prependedRowCount}
               isSearching={isSearching}
               onLoadMore={onLoadMore}
-              onVisibleRowsChange={onVisibleRowsChange}
-              pagingComplete={pagingComplete}
               onFetchLog={onFetchLog}
               selectedEventId={selectedEvent?.id}
               onSelectEvent={handleSelectEvent}
@@ -1838,12 +1801,8 @@ function RawView({
   notebookActive,
   onAddToNotebook,
   totalCount,
-  totalCountExact = true,
-  prependedRowCount = 0,
   isSearching,
   onLoadMore,
-  onVisibleRowsChange,
-  pagingComplete,
   onFetchLog: _onFetchLog,
   selectedEventId,
   onSelectEvent,
@@ -1861,12 +1820,8 @@ function RawView({
   notebookActive?: boolean;
   onAddToNotebook?: (entityType: string, value: string) => void;
   totalCount?: number;
-  totalCountExact?: boolean;
-  prependedRowCount?: number;
   isSearching?: boolean;
   onLoadMore?: () => void;
-  onVisibleRowsChange?: (visibleEnd: number, visibleStart?: number) => void;
-  pagingComplete?: boolean;
   onFetchLog?: (id: string, timestamp: Date, sourceType?: string) => Promise<Record<string, unknown> | null>;
   /** Currently selected event ID (for inspector panel highlighting) */
   selectedEventId?: string;
@@ -1892,40 +1847,17 @@ function RawView({
   const isInlineMode = detailViewMode === 'inline';
 
   // Active schema profile drives the per-event "key fields" summary chips
-  // (OCSF Phase 7, NAN-1241). Under UDM the chips are src_ip/src_host/user/…;
-  // under OCSF the same row carries src_endpoint.ip/user.name/activity/… so the
-  // chip spec must follow the active schema or only `source_type` survives.
+  // (OCSF Phase 7, NAN-1241; NAN-4903 profile-aware field map). `label` is the
+  // chip's display tag; `apiField` is the real column key the value came from,
+  // used to filter on click (FieldValueMenu).
   const { data: schemaFields } = useQuery({
     queryKey: ['schema-fields'],
     queryFn: () => api.getSchemaFields(),
     staleTime: Infinity,
     gcTime: Infinity,
   });
-  // `label` is the chip's display tag; `field` is the real column key used both
-  // to read the value off the row and to filter on click (FieldValueMenu).
-  const keyChipSpecs: Array<{ label: string; field: string; accent?: boolean }> =
-    schemaFields?.schema === 'ocsf'
-      ? [
-          { label: 'log source', field: 'metadata.log_source' },
-          { label: 'host', field: 'device.hostname' },
-          { label: 'src_ip', field: 'src_endpoint.ip' },
-          { label: 'src_host', field: 'src_endpoint.hostname' },
-          { label: 'dest_ip', field: 'dst_endpoint.ip' },
-          { label: 'dest_host', field: 'dst_endpoint.hostname' },
-          { label: 'user', field: 'user.name' },
-          { label: 'status', field: 'status' },
-          { label: 'activity', field: 'activity_name', accent: true },
-        ]
-      : [
-          { label: 'sourcetype', field: 'source_type' },
-          { label: 'src_ip', field: 'src_ip' },
-          { label: 'src_host', field: 'src_host' },
-          { label: 'dest_ip', field: 'dest_ip' },
-          { label: 'dest_host', field: 'dest_host' },
-          { label: 'user', field: 'user' },
-          { label: 'dest_user', field: 'dest_user' },
-          { label: 'event_type', field: 'event_type', accent: true },
-        ];
+  const keyChipSchemaMap = useSchemaFieldMap();
+  const chipSpecs = React.useMemo(() => keyChipSpecs(keyChipSchemaMap), [keyChipSchemaMap]);
 
   // Use shared data from parent, or fallback empty collections
   const fullLogDataMap = fullLogData ?? new Map<string, Record<string, unknown>>();
@@ -1994,12 +1926,12 @@ function RawView({
 
   // Handle row click - select event for inspector panel or toggle inline expand
   const handleRowClick = useCallback((result: SearchResult, index: number) => {
-    const fetchIdentity = eventFetchIdentity(result);
+    const sourceType = result.fields?.source_type as string | undefined;
     if (isInlineMode) {
-      toggleFields(result.id, fetchIdentity.id, result.timestamp, fetchIdentity.source);
+      toggleFields(result.id, result.fields?.id as string, result.timestamp, sourceType);
     } else if (onSelectEvent) {
       onSelectEvent(result, index);
-      prefetchLog(result.id, fetchIdentity.id, result.timestamp, fetchIdentity.source);
+      prefetchLog(result.id, result.fields?.id as string, result.timestamp, sourceType);
     }
   }, [isInlineMode, toggleFields, onSelectEvent, prefetchLog]);
 
@@ -2052,19 +1984,9 @@ function RawView({
   });
 
   const virtualItems = virtualizer.getVirtualItems();
-  const visibleEnd = (virtualizer.range?.endIndex ?? -1) + 1;
-  // NAN-2551: the range start tells the page whether the analyst is still at
-  // the top, which is what decides between prepending live-tail arrivals and
-  // holding them behind an "N new" chip.
-  const visibleStart = virtualizer.range?.startIndex ?? 0;
-  useEffect(() => {
-    onVisibleRowsChange?.(visibleEnd, visibleStart);
-  }, [visibleEnd, visibleStart, results.length, onVisibleRowsChange]);
 
-  // Explicit page exhaustion takes precedence over the independent count companion.
-  const pagedRowCount = Math.max(0, results.length - prependedRowCount);
-  const hasMore = pagingComplete !== undefined ? !pagingComplete : totalCount !== undefined
-    && (results.length < totalCount || (!totalCountExact && pagedRowCount > 0));
+  // Infinite scroll - load more when near bottom
+  const hasMore = totalCount !== undefined && results.length < totalCount;
   useEffect(() => {
     if (!hasMore || isSearching || !onLoadMore) return;
 
@@ -2104,16 +2026,12 @@ function RawView({
               ? { ...result.fields, ...fullData }
               : result.fields;
         // Extract the active schema's key fields for the summary chip row.
-        // `event_type` falls back to the legacy `action` column (UDM only).
-        const keyChips = keyChipSpecs.map((spec) => {
-          const raw =
-            spec.field === 'event_type'
-              ? (displayFields?.event_type ?? displayFields?.action)
-              : eventField(displayFields, spec.field);
+        const keyChips = chipSpecs.map((spec) => {
+          const chip = readKeyChip(spec, displayFields);
           return {
-            label: spec.label,
-            apiField: spec.field,
-            value: raw as string | undefined,
+            label: chip.label,
+            apiField: chip.field,
+            value: chip.value as string | undefined,
             accent: spec.accent,
           };
         });
@@ -2139,10 +2057,7 @@ function RawView({
                   ? 'border-l-2 border-l-primary'
                   : 'hover:bg-muted/20'
               }`}
-              onMouseEnter={() => {
-                const fetchIdentity = eventFetchIdentity(result);
-                handleRowMouseEnter(result.id, fetchIdentity.id, result.timestamp, fetchIdentity.source);
-              }}
+              onMouseEnter={() => handleRowMouseEnter(result.id, result.fields?.id as string, result.timestamp, result.fields?.source_type as string | undefined)}
               onMouseLeave={handleRowMouseLeave}
               onMouseDown={recordPointerDown}
               onClick={(e) => {
@@ -2412,13 +2327,13 @@ function RawView({
                 Loading more...
               </>
             ) : (
-              <span>Scroll for more ({results.length} of {totalCount}{totalCountExact ? '' : '+'})</span>
+              <span>Scroll for more ({results.length} of {totalCount})</span>
             )}
           </div>
         )}
         {!hasMore && results.length > 0 && totalCount !== undefined && (
           <div className="flex items-center justify-center py-4 text-sm text-muted-foreground">
-            All {pagedRowCount} results loaded
+            All {totalCount} results loaded
           </div>
         )}
       </div>

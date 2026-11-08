@@ -38,7 +38,17 @@ impl Database {
             pool_options = pool_options.max_lifetime(Duration::from_secs(config.max_lifetime_secs));
         }
 
-        let pool = pool_options.connect_with(super::pooler::options(&config.url)?).await?;
+        // NAN-4933: declare this process's credential write key (the write
+        // fence refuses undeclared secret writes once enforced). The
+        // clickhouse_migrator and any other Database user declare it too.
+        if let Ok(cipher) = crate::crypto::EncryptionService::process_ring() {
+            pool_options = crate::crypto::rotation::declare_write_key(
+                pool_options,
+                cipher.active_key_id().to_owned(),
+            );
+        }
+
+        let pool = pool_options.connect(&config.url).await?;
 
         Ok(Self { pool })
     }

@@ -64,10 +64,10 @@ pub struct SiemHealthReport {
     pub ingestion_score: i32,
     pub parsing_score: i32,
     pub detection_score: i32,
-    /// nullable for backward compat with reports generated before
+    /// NAN-569: nullable for backward compat with reports generated before
     /// enrichment scoring landed.
     pub enrichment_score: Option<i32>,
-    /// nullable for backward compat with reports generated before
+    /// NAN-569: nullable for backward compat with reports generated before
     /// alerting scoring landed.
     pub alerting_score: Option<i32>,
     pub summary: String,
@@ -192,6 +192,11 @@ pub struct CollectedMetrics {
     pub enrichment: EnrichmentMetrics,
     pub detection: DetectionMetrics,
     pub alerting: AlertingMetrics,
+    /// NAN-4954: security-critical audit delivery (PostgreSQL outbox →
+    /// ClickHouse). `None` when the probe failed or on reports written before
+    /// this field existed.
+    #[serde(default)]
+    pub audit_durability: Option<crate::audit::AuditOutboxStats>,
     pub collected_at: DateTime<Utc>,
 }
 
@@ -343,24 +348,6 @@ pub struct IngestionMetrics {
     /// before this field existed still deserialize.
     #[serde(default)]
     pub insert_integrity: InsertIntegrityMetrics,
-    /// Publication-liveness evidence for the primary object-lake freshness
-    /// lane. `None` on the retiring ClickHouse backend and on reports written
-    /// before the lake health ledger existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lake_publication: Option<LakePublicationHealth>,
-}
-
-/// Metadata-only health for the signed staged-tail publisher. Event payloads
-/// remain exact-version Parquet objects in the tenant's object store.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LakePublicationHealth {
-    pub last_reconciled_age_seconds: Option<u64>,
-    pub unpublished_revisions: u64,
-    pub oldest_unpublished_age_seconds: Option<u64>,
-    pub visible_objects: u64,
-    pub visible_bytes: u64,
-    pub manifest_sha256: Option<String>,
-    pub newest_visible_event_time: Option<DateTime<Utc>>,
 }
 
 /// Insert-path integrity signals (NAN-1405) — the NAN-1404 silent-loss kill
@@ -415,12 +402,69 @@ pub struct InsertIntegrityMetrics {
     /// Most recent flush exception (truncated), if any.
     pub last_async_insert_error: Option<String>,
     /// Dictionary-staging refresh MVs (`*_dict_refresh`, NAN-1407) that are
-    /// failing or stale. Stale enrichment, NOT data loss — that distinction
-    /// is the whole point of the staging indirection: rows keep landing with
-    /// the last good snapshot while the refresh is broken. `serde(default)`
-    /// so reports stored before NAN-1407 still deserialize.
+    /// failing or stale, plus failed/stuck post-migration activation work
+    /// (NAN-4977). Stale enrichment, NOT data loss — rows keep landing with
+    /// the last good snapshot while activation is broken. `serde(default)` so
+    /// reports stored before NAN-1407 still deserialize.
     #[serde(default)]
     pub stale_dict_refreshes: Vec<StaleDictRefresh>,
+    /// Resident memory of every nanosiem dictionary on the probed node
+    /// (`system.dictionaries.bytes_allocated`), largest first (NAN-4957).
+    /// Dictionaries live inside ClickHouse's server memory limit, and a reload
+    /// builds the new copy next to the old one, so a large dictionary on a
+    /// small box starves inserts and searches (241). `serde(default)` so
+    /// reports stored before NAN-4957 still deserialize.
+    #[serde(default)]
+    pub dictionary_memory: Vec<DictionaryMemory>,
+    /// Sum of `dictionary_memory` bytes.
+    #[serde(default)]
+    pub dictionary_bytes_total: u64,
+    /// The node's effective `max_server_memory_usage` (bytes); 0 = unknown.
+    #[serde(default)]
+    pub server_memory_limit_bytes: u64,
+    /// Whether the dictionary-memory probe ran (grant present). Without it an
+    /// empty `dictionary_memory` would read as "no dictionaries".
+    #[serde(default)]
+    pub dictionary_memory_probe_ok: bool,
+    /// Latest ingest-watchdog transition for each ClickHouse shard/node.
+    /// Stored reports predating NAN-4988 deserialize with an empty list.
+    #[serde(default)]
+    pub ingest_watchdog: Vec<IngestWatchdogHealth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IngestWatchdogHealth {
+    pub node: String,
+    pub action: String,
+    pub mode: String,
+    pub reason: String,
+    pub event_age_secs: u64,
+    pub disabled_views: Vec<String>,
+    #[serde(default)]
+    pub replicas: Vec<IngestWatchdogReplicaHealth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IngestWatchdogReplicaHealth {
+    pub replica: String,
+    pub endpoint: String,
+    pub reachable: bool,
+    pub error: String,
+    pub hot: bool,
+    pub sample_age_secs: u64,
+}
+
+/// One dictionary's resident memory (NAN-4957).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DictionaryMemory {
+    /// Fully qualified name (`nanosiem.ip_geo_trie_dict`).
+    pub name: String,
+    /// Layout as ClickHouse reports it (`Trie`, `Hashed`, `ComplexKeyCache`).
+    pub layout: String,
+    /// `LOADED`, `NOT_LOADED`, `FAILED`, …
+    pub status: String,
+    pub element_count: u64,
+    pub bytes_allocated: u64,
 }
 
 /// An unhealthy ClickHouse dictionary referenced by the logs table DDL — either
@@ -434,8 +478,9 @@ pub struct FailedDictionary {
     pub last_exception: String,
 }
 
-/// A failing/stale dictionary-staging refresh MV from system.view_refreshes
-/// (NAN-1407). Flagged when `exception != ''` (the refresher keeps retrying
+/// A failing/stale dictionary-staging refresh from system.view_refreshes or
+/// the durable post-migration activation queue. Flagged when `exception != ''`
+/// (the refresher keeps retrying
 /// on schedule and keeps last good data — visible failure, no loss) or when
 /// the last successful refresh is over an hour old (covers a silently
 /// stuck/disabled refresher; the longest refresh cadence is 10 minutes, so
@@ -591,20 +636,23 @@ pub struct DetectionMetrics {
     pub noisy_rules: Vec<NoisyRule>,
     /// Total alerts by severity in last 24h
     pub alerts_24h_by_severity: Vec<AlertsBySeverity>,
-    /// Durable repair-lane backlog for events that arrived behind a scheduled
-    /// rule's normal event-time watermark.
+    /// NAN-4910: detection windows the scheduler could not evaluate in the
+    /// last 7 days (most recent first, capped) — recorded coverage gaps.
     #[serde(default)]
-    pub late_replay: LateReplayHealth,
+    pub coverage_gaps_7d: Vec<DetectionCoverageGapSummary>,
+    /// NAN-4910: total recorded coverage gaps in the last 7 days (uncapped).
+    #[serde(default)]
+    pub coverage_gaps_7d_total: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LateReplayHealth {
-    pub unplanned_publications: u64,
-    pub oldest_unplanned_age_seconds: Option<u64>,
-    pub pending_jobs: u64,
-    pub running_jobs: u64,
-    pub dead_letter_jobs: u64,
-    pub oldest_outstanding_job_age_seconds: Option<u64>,
+/// A detection window recorded as not evaluated (NAN-4910).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectionCoverageGapSummary {
+    pub rule_name: String,
+    pub window_start: DateTime<Utc>,
+    pub window_end: DateTime<Utc>,
+    pub recorded_at: DateTime<Utc>,
+    pub error_message: String,
 }
 
 /// Rule count by mode

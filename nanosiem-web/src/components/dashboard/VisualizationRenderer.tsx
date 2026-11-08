@@ -288,10 +288,25 @@ export function pivotSplitByData(
     return { data: [], labelKey: '', valueKeys: [], wasPivoted: false, isTimeSeries: false };
   }
 
-  if (data[0]._timechart) {
-    const metadata = data[0]._timechart as { span_seconds: number };
-    return { data, labelKey: 'time_bucket', valueKeys: Object.keys(data[0]).filter(k => k !== 'time_bucket' && typeof data[0][k] === 'number'), wasPivoted: false, isTimeSeries: true, timeKey: 'time_bucket', spanMs: metadata.span_seconds * 1000 };
+  // NAN-4944: the server already returned a complete wide timechart. Preserve
+  // every selected/OTHER column and its effective span instead of treating the
+  // metadata object as a dimension and pivoting the rows a second time.
+  const serverMetadata = data.find(row => row._timechart)?._timechart as
+    | { span_seconds: number }
+    | undefined;
+  if (serverMetadata) {
+    const responseKeys = Array.from(new Set(data.flatMap(row => Object.keys(row))));
+    return {
+      data,
+      labelKey: 'time_bucket',
+      valueKeys: responseKeys.filter(key => key !== 'time_bucket' && key !== '_timechart'),
+      wasPivoted: false,
+      isTimeSeries: true,
+      timeKey: 'time_bucket',
+      spanMs: serverMetadata.span_seconds * 1000,
+    };
   }
+
   const { keys, labelKey, timeKey, isTimeSeries, spanMs } = classifyColumns(data, columnOrder);
   const sample = data[0];
   const isNum = (k: string) => typeof sample[k] === 'number';

@@ -394,7 +394,7 @@ async fn okta_append(mock: &Mock, n: usize) {
 }
 
 #[tokio::test]
-async fn g1_okta_system_log_and_users() {
+async fn g1_okta_system_log() {
     let Some(e) = env() else { return };
     // The mock publishes its history ~60 s behind the wall clock, inside the
     // point-forward window (NAN-3697).
@@ -449,17 +449,6 @@ async fn g1_okta_system_log_and_users() {
     assert_eq!(uids.len(), total, "no uid shipped twice across three runs");
     eprintln!("G1 okta_system_log: 2500 + 0 + 300 events over 3 runs, {} overlap rows dropped", o2.dropped_duplicates + o3.dropped_duplicates);
 
-    // Okta users (directory): engine-only (no Deno original), link paging.
-    let users = content_spec(&e, "integrations/okta_users");
-    let ru = run(&h, &users, input(HashMap::new())).await;
-    let ou = ru.out.expect("okta users");
-    assert_eq!(ou.events, 450);
-    assert_eq!(ou.pages, 3);
-    let shipped = ru.sink.events();
-    assert_ingest_ids("okta_users", &shipped);
-    assert!(shipped.iter().all(|u| u["kind"] == "identity" && u["source"] == "okta" && u["id"].is_string()), "identity-lane records");
-    assert!(ru.sink.batches.lock().unwrap().iter().all(|(st, _)| st == "nano_enrich"));
-    eprintln!("G1 okta_users: 450 users in 3 pages, as nano_enrich identity records");
 }
 
 // ------------------------------------------------------ G1: Google Workspace --
@@ -728,7 +717,15 @@ async fn every_shipped_spec_validates() {
         }
     }
     for p in &found {
-        let spec = spec(&std::fs::read_to_string(p).unwrap());
+        let yaml = std::fs::read_to_string(p).unwrap();
+        // `kind: identity` (directory sync into the hosted lake coordinator)
+        // is not part of the ClickHouse product's engine (NAN-4914): native
+        // identity/sync covers those vendors. Such specs must be refused.
+        if yaml.lines().any(|l| l.trim() == "kind: identity") {
+            assert!(nano_connector::spec::ConnectorSpec::from_yaml(&yaml).is_err(), "{}: identity spec must be refused", p.display());
+            continue;
+        }
+        let spec = spec(&yaml);
         // VRL programs compile in sandboxed workers, as in production.
         nano_connector::preview::validate(worker_exe(), &spec).await.unwrap_or_else(|err| panic!("{}: {err}", p.display()));
     }

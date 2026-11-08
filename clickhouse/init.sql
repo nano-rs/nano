@@ -249,6 +249,10 @@ LIFETIME(MIN 60 MAX 300)
 LAYOUT(HASHED());
 
 -- Prevalence aggregation tables (must exist before dictionaries that source from them)
+-- NAN-4906: CH 26.7+ rejects AggregatingMergeTree plain columns outside the
+-- sorting key unless allow_dimensions_outside_sorting_key = 1. Ours (is_subdomain,
+-- parent_domain, hash_type, is_private) are functions of the key, so collapsing
+-- them on merge is correct. The migrator strips the setting on pre-26.7 servers.
 
 -- Table: domain_prevalence_agg
 CREATE TABLE IF NOT EXISTS nanosiem.domain_prevalence_agg
@@ -268,7 +272,7 @@ ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(time_bucket)
 ORDER BY (domain, time_bucket)
 TTL time_bucket + toIntervalDay(90)
-SETTINGS index_granularity = 8192
+SETTINGS index_granularity = 8192, allow_dimensions_outside_sorting_key = 1
 ;
 
 -- Table: hash_prevalence_agg
@@ -287,7 +291,7 @@ ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(time_bucket)
 ORDER BY (file_hash, time_bucket)
 TTL time_bucket + toIntervalDay(90)
-SETTINGS index_granularity = 8192
+SETTINGS index_granularity = 8192, allow_dimensions_outside_sorting_key = 1
 ;
 
 -- Table: ip_prevalence_agg
@@ -307,7 +311,7 @@ ENGINE = AggregatingMergeTree()
 PARTITION BY toYYYYMM(time_bucket)
 ORDER BY (ip, direction, time_bucket)
 TTL time_bucket + toIntervalDay(90)
-SETTINGS index_granularity = 8192;
+SETTINGS index_granularity = 8192, allow_dimensions_outside_sorting_key = 1;
 
 -- =============================================================================
 -- Prevalence Summary Tables (NAN-365)
@@ -515,6 +519,23 @@ SOURCE(CLICKHOUSE(
 LAYOUT(COMPLEX_KEY_HASHED())
 LIFETIME(MIN 60 MAX 300);
 
+-- Code-free IOC list publication commit markers (NAN-4902 lane G, migration
+-- 182). An IOC list row (namespace `ioc_list/<version>`) in
+-- custom_enrichment_results is visible to readers only when its version is its
+-- list's highest committed version here, so a publication is all-or-nothing.
+-- Created BEFORE the refresh MV below, which reads it (refreshable MVs validate
+-- their sources eagerly).
+CREATE TABLE IF NOT EXISTS nanosiem.ioc_list_commits
+(
+    version UInt32,
+    list_id UUID,
+    list_name String,
+    action LowCardinality(String),
+    committed_at DateTime64(3) DEFAULT now64(3)
+)
+ENGINE = MergeTree
+ORDER BY version;
+
 -- Custom IOC enrichment staging + refresh (NAN-1407 — see
 -- ip_enrichment_dict_staging for the full rationale; migration 133).
 CREATE TABLE IF NOT EXISTS nanosiem.custom_ioc_enrichment_dict_staging
@@ -556,6 +577,7 @@ FROM (
                argMax(is_marketplace, version) AS is_marketplace,
                argMax(expires_at, version) AS expires_at
         FROM nanosiem.custom_enrichment_results
+        WHERE NOT startsWith(namespace, 'ioc_list/') OR version GLOBAL IN (SELECT max(version) FROM nanosiem.ioc_list_commits GROUP BY list_id)
         GROUP BY namespace, enrichment_name, key_type, key_value
     )
     WHERE expires_at > now() AND is_ioc = 1 AND is_marketplace = 0

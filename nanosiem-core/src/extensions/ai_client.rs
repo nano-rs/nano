@@ -239,7 +239,8 @@ pub trait AiClient: Send + Sync {
                     Err(e) => last_err = e,
                 },
                 None => {
-                    last_err = format!("response was not parseable JSON (got {} chars)", raw.len())
+                    last_err =
+                        format!("response was not parseable JSON (got {} chars)", raw.len())
                 }
             }
             // Feed the bad turn + a corrective instruction into the retry.
@@ -727,8 +728,7 @@ mod tests {
 
     #[test]
     fn extract_json_object_handles_bare_object() {
-        let v =
-            extract_json_object(r#"{"disposition":"false_positive","confidence":0.9}"#).unwrap();
+        let v = extract_json_object(r#"{"disposition":"false_positive","confidence":0.9}"#).unwrap();
         assert_eq!(v["disposition"], "false_positive");
     }
 
@@ -800,10 +800,7 @@ mod tests {
         let schema = serde_json::json!({ "type": "object", "required": ["queries"] });
         let value = serde_json::json!({ "other": 1 });
         let err = validate_structured(&value, &schema).unwrap_err();
-        assert!(
-            err.contains("missing required field 'queries'"),
-            "got: {err}"
-        );
+        assert!(err.contains("missing required field 'queries'"), "got: {err}");
     }
 
     #[test]
@@ -836,10 +833,7 @@ mod tests {
         // Second element is missing `query`.
         let bad = serde_json::json!({ "queries": [{ "query": "a" }, { "reason": "no query" }] });
         let err = validate_structured(&bad, &schema).unwrap_err();
-        assert!(
-            err.contains("[1]"),
-            "expected the offending index in: {err}"
-        );
+        assert!(err.contains("[1]"), "expected the offending index in: {err}");
         assert!(err.contains("missing required field 'query'"), "got: {err}");
     }
 
@@ -856,7 +850,9 @@ mod tests {
     impl ScriptedClient {
         fn new(responses: Vec<&str>) -> Self {
             Self {
-                responses: std::sync::Mutex::new(responses.into_iter().map(String::from).collect()),
+                responses: std::sync::Mutex::new(
+                    responses.into_iter().map(String::from).collect(),
+                ),
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 last_message_count: std::sync::atomic::AtomicUsize::new(0),
             }

@@ -28,11 +28,11 @@ use tokio::sync::Mutex;
 
 use crate::auth::{self, AuthContext, AuthError, AuthPlugin, Credentials, TokenFetch};
 use crate::broker::{BodyCaps, Broker, BrokerConfig, BrokerError, InboundResponse, OutboundRequest};
+use crate::identity::IdentityTarget;
 use crate::paging::{self, PageCtx, PageState, Step, Stepper};
 use crate::policy::{EgressDeny, HostPolicy, PolicyError};
 use crate::sandbox::{SandboxPolicy, SandboxReport};
 use crate::secrets::SecretSet;
-use crate::identity::IdentityTarget;
 use crate::spec::{
     Body, ConnectorSpec, CursorReduce, Discover, Format, IdentityMode, IdentityRole, Kind, Limits, Method,
     NextRequest, ProgramOutput, RequestTemplate, RetryRewrite, Stream, TimeFormat, WindowSpec,
@@ -84,7 +84,7 @@ pub enum EngineError {
 #[async_trait::async_trait]
 pub trait Sink: Send + Sync {
     async fn push(&self, source_type: &str, events: &[Value]) -> Result<(), String>;
-    /// `kind: identity` runs deliver through this target (staged snapshots,
+    /// `kind: identity` runs deliver through this target (directory upserts,
     /// deltas, membership aggregation). `None` (preview, tests): identity
     /// streams' program events go to [`Sink::push`] under the stream id.
     fn identity(&self) -> Option<&dyn IdentityTarget> {
@@ -112,6 +112,12 @@ pub enum RequestPurpose {
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
     async fn send_once(&self, req: &OutboundRequest, hosts: &HostPolicy, caps: BodyCaps) -> Result<InboundResponse, BrokerError>;
+    /// A redirect hop to a host other than the request's authentication
+    /// origin: no TLS client identity may be presented. Transports without
+    /// one (recordings, mocks) send it like any other exchange.
+    async fn send_once_without_client_auth(&self, req: &OutboundRequest, hosts: &HostPolicy, caps: BodyCaps) -> Result<InboundResponse, BrokerError> {
+        self.send_once(req, hosts, caps).await
+    }
     /// Existing transports keep their behavior; authority wrappers can retain
     /// the purpose through admission until actual IO starts.
     async fn send_once_with_purpose(
@@ -129,6 +135,9 @@ pub trait Transport: Send + Sync {
 impl Transport for Broker {
     async fn send_once(&self, req: &OutboundRequest, hosts: &HostPolicy, caps: BodyCaps) -> Result<InboundResponse, BrokerError> {
         Broker::send_once(self, req, hosts, caps).await
+    }
+    async fn send_once_without_client_auth(&self, req: &OutboundRequest, hosts: &HostPolicy, caps: BodyCaps) -> Result<InboundResponse, BrokerError> {
+        Broker::send_once_without_client_auth(self, req, hosts, caps).await
     }
 }
 
@@ -149,10 +158,6 @@ pub struct EngineConfig {
     pub clock: Clock,
     /// Engine ceilings; spec limits are clamped to these.
     pub ceilings: Limits,
-    /// The platform pull broker (hosted runner only; from the runner's
-    /// environment, never from a spec). `None`: `google_dwd_broker` fails
-    /// with `google_dwd_broker_unconfigured`.
-    pub pull_broker: Option<Arc<crate::pull_broker::PlatformBroker>>,
 }
 
 impl EngineConfig {
@@ -160,17 +165,40 @@ impl EngineConfig {
     /// ([`SandboxPolicy::from_env`]). An invalid setting fails closed: the
     /// strict policy is used and the error is logged. Services should call
     /// [`EngineConfig::try_new`] and refuse to start instead.
+    ///
+    /// The broker dials through the operator's egress proxy when
+    /// `CONNECTOR_EGRESS_PROXY_URL` is set, in the CONNECT mode of
+    /// `CONNECTOR_EGRESS_PROXY_MODE` ([`crate::egress`]); an invalid value of
+    /// either refuses every connection (logged), never dials direct.
     pub fn new(vrl_worker_exe: PathBuf) -> Self {
         let policy = SandboxPolicy::from_env().unwrap_or_else(|e| {
             tracing::error!(target: "nano_connector::sandbox", error = %e, "invalid sandbox setting; requiring every isolation layer");
             SandboxPolicy::strict()
         });
-        Self::with_sandbox(vrl_worker_exe, policy, PoolConfig::default())
+        let mut cfg = Self::with_sandbox(vrl_worker_exe, policy, PoolConfig::default());
+        if let Err(e) = crate::egress::configure_from_env_with_mode(
+            &mut cfg.broker,
+            crate::egress::CONNECTOR_PROXY_ENV,
+            crate::egress::CONNECTOR_PROXY_MODE_ENV,
+        ) {
+            tracing::error!(target: "nano_connector::audit", error = %e, "invalid {} / {}; refusing all vendor connections",
+                crate::egress::CONNECTOR_PROXY_ENV, crate::egress::CONNECTOR_PROXY_MODE_ENV);
+            cfg.broker.dialer = Arc::new(crate::egress::RefusingDialer);
+        }
+        cfg
     }
 
-    /// Like [`EngineConfig::new`], but an invalid sandbox setting is an error.
+    /// Like [`EngineConfig::new`], but an invalid sandbox or egress proxy
+    /// setting is an error.
     pub fn try_new(vrl_worker_exe: PathBuf) -> Result<Self, String> {
-        Ok(Self::with_sandbox(vrl_worker_exe, SandboxPolicy::from_env()?, PoolConfig::default()))
+        let mut cfg = Self::with_sandbox(vrl_worker_exe, SandboxPolicy::from_env()?, PoolConfig::default());
+        crate::egress::configure_from_env_with_mode(
+            &mut cfg.broker,
+            crate::egress::CONNECTOR_PROXY_ENV,
+            crate::egress::CONNECTOR_PROXY_MODE_ENV,
+        )
+        .map_err(|e| format!("{} / {}: {e}", crate::egress::CONNECTOR_PROXY_ENV, crate::egress::CONNECTOR_PROXY_MODE_ENV))?;
+        Ok(cfg)
     }
 
     pub fn with_sandbox(vrl_worker_exe: PathBuf, policy: SandboxPolicy, pool: PoolConfig) -> Self {
@@ -183,7 +211,6 @@ impl EngineConfig {
             worker_address_space: 1024 * 1024 * 1024,
             clock: Arc::new(Utc::now),
             ceilings: default_ceilings(),
-            pull_broker: None,
         }
     }
 }
@@ -240,13 +267,12 @@ pub struct RunInput {
     pub artifact_extra: Map<String, Value>,
     /// Collectors: the enabled stream ids (default: all).
     pub enabled_streams: Option<Vec<String>>,
-    /// The tenant this run belongs to (VRL worker fairness and audit).
+    /// Fairness key for the shared VRL worker pool (a feed or connection
+    /// id): one owner cannot hold more than its share of workers. `None`
+    /// pools the run under `default`.
     pub tenant: Option<String>,
-    /// The tenant's egress deny list, on top of the spec allowlist.
+    /// The operator's egress deny list, on top of the spec allowlist.
     pub egress_deny: EgressDeny,
-    /// The feed this run belongs to (hosted runner), for platform-brokered
-    /// auth.
-    pub feed_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -282,6 +308,14 @@ const FORBIDDEN_HEADERS: &[&str] = &[
 /// Compile-time checks: plugins exist, templates only read allowed
 /// namespaces, programs compile, headers carry no auth.
 pub fn compile(spec: &ConnectorSpec, ceilings: &Limits) -> Result<Compiled, EngineError> {
+    compile_with_namespaces(spec, ceilings, &[])
+}
+
+/// [`compile`], also admitting the host template namespaces `extra` (see
+/// [`crate::template::Scope::host`]). For embedding hosts that render the
+/// same request templates outside the collector loop; collectors and
+/// lookups compile with none.
+pub fn compile_with_namespaces(spec: &ConnectorSpec, ceilings: &Limits, extra: &[&str]) -> Result<Compiled, EngineError> {
     let bad = |m: String| EngineError::Spec(m);
     if spec.version != crate::spec::SPEC_VERSION {
         return Err(bad(format!("version must be {}", crate::spec::SPEC_VERSION)));
@@ -298,24 +332,24 @@ pub fn compile(spec: &ConnectorSpec, ceilings: &Limits) -> Result<Compiled, Engi
     check_identity(spec)?;
     let mut auth = auth::build(&spec.auth.kind, &spec.auth.params)?;
     let check_req = |r: &RequestTemplate| -> Result<(), EngineError> {
-        template::references(&r.url)?;
+        template::references_in(&r.url, extra)?;
         for (k, v) in &r.query {
-            template::references(k)?;
-            template::references(v)?;
+            template::references_in(k, extra)?;
+            template::references_in(v, extra)?;
         }
         for (k, v) in &r.headers {
             if FORBIDDEN_HEADERS.contains(&k.to_ascii_lowercase().as_str()) {
                 return Err(bad(format!("header `{k}` is reserved; use `auth`")));
             }
-            for p in template::references(v)? {
+            for p in template::references_in(v, extra)? {
                 if !p.starts_with("config.") {
                     return Err(bad(format!("header `{k}` may only template config.*")));
                 }
             }
         }
         match &r.body {
-            Some(Body { form: Some(m), json: None }) => m.values().try_for_each(|v| template::references(v).map(|_| ()))?,
-            Some(Body { form: None, json: Some(v) }) => check_json_templates(v)?,
+            Some(Body { form: Some(m), json: None }) => m.values().try_for_each(|v| template::references_in(v, extra).map(|_| ()))?,
+            Some(Body { form: None, json: Some(v) }) => check_json_templates(v, extra)?,
             Some(_) => return Err(bad("body needs exactly one of `form` or `json`".into())),
             None => {}
         }
@@ -350,7 +384,7 @@ pub fn compile(spec: &ConnectorSpec, ceilings: &Limits) -> Result<Compiled, Engi
             }
         }
         for v in s.initial_state.values() {
-            check_json_templates(v)?;
+            check_json_templates(v, extra)?;
         }
     }
     let (l, c) = if spec.kind == Kind::Identity {
@@ -408,15 +442,14 @@ fn identity_limits(l: &Limits) -> Limits {
 
 /// Fan-out item ceiling: collectors 10k; identity memberships (one item per
 /// group) 100k, and a memberships discovery over the cap fails the run
-/// instead of committing a partial snapshot.
+/// instead of applying a partial membership snapshot.
 pub const MAX_FANOUT_ITEMS: u32 = 10_000;
 pub const MAX_IDENTITY_FANOUT_ITEMS: u32 = 100_000;
 
 /// `kind: identity` shape rules: identity streams only under that kind and
 /// every stream of it has a role; users streams are plain walks (no fan-out,
 /// window or write-ahead), memberships are always full; stream ids are
-/// coordinator feed-id tokens and the users stream is `users` (the
-/// memberships sub-feed is `groups`).
+/// tokens and the users stream is `users`.
 fn check_identity(spec: &ConnectorSpec) -> Result<(), EngineError> {
     let bad = |m: String| EngineError::Spec(m);
     if spec.kind != Kind::Identity {
@@ -453,9 +486,6 @@ fn check_identity(spec: &ConnectorSpec) -> Result<(), EngineError> {
         }
         match id.role {
             IdentityRole::Users => {
-                // The feed's sub-feeds are exactly `<feed>:users` and
-                // `<feed>:groups`: what an uninstall removes, and all the
-                // runner's token may delete (NAN-3503).
                 if s.id != crate::identity::USERS_SUBFEED {
                     return Err(bad(format!(
                         "the identity users stream must have id `{}` (got `{}`): one users stream per feed",
@@ -516,13 +546,13 @@ async fn spawn_program(pool: &VrlPool, tenant: &str, stream: &str, program: &str
     pool.spawn(tenant, program, worker_limits(limits, address_space)).await.map_err(|e| program_error(stream, e))
 }
 
-fn check_json_templates(v: &Value) -> Result<(), EngineError> {
+fn check_json_templates(v: &Value, extra: &[&str]) -> Result<(), EngineError> {
     match v {
         Value::String(s) => {
-            template::references(s)?;
+            template::references_in(s, extra)?;
         }
-        Value::Array(a) => a.iter().try_for_each(check_json_templates)?,
-        Value::Object(m) => m.values().try_for_each(check_json_templates)?,
+        Value::Array(a) => a.iter().try_for_each(|v| check_json_templates(v, extra))?,
+        Value::Object(m) => m.values().try_for_each(|v| check_json_templates(v, extra))?,
         _ => {}
     }
     Ok(())
@@ -554,25 +584,11 @@ struct Run {
     checkpoints: StdMutex<HashMap<String, Value>>,
     /// (derived secrets seen, matcher) for [`Run::secrets`].
     secret_cache: StdMutex<Option<(usize, Arc<SecretSet>)>>,
-    feed_id: Option<String>,
-    /// The platform pull broker call for this run's tenant, when the runner
-    /// has a broker and the run has a tenant.
-    pull_broker: Option<PullBrokerCall>,
-    /// When the run started (identity: `identity_last_full_at`).
+    /// When the run started (point-forward activation; identity:
+    /// `identity_last_full_at`).
     started: DateTime<Utc>,
     /// Identity users streams: the mode each one ran in.
     identity_modes: StdMutex<Vec<(String, IdentityMode)>>,
-}
-
-/// One run's pull-broker identity: endpoint, fixed policy and caller token.
-/// The token is a run secret (redacted, refused in vendor requests).
-struct PullBrokerCall {
-    endpoint: url::Url,
-    graph_endpoint: url::Url,
-    okta_endpoint: url::Url,
-    hosts: HostPolicy,
-    token: String,
-    object: String,
 }
 
 impl Run {
@@ -619,8 +635,7 @@ impl Run {
                 return set.clone();
             }
         }
-        let platform = self.pull_broker.as_ref().map(|p| p.token.as_str());
-        let set = Arc::new(SecretSet::with_derived(self.creds.values(), derived.iter().map(String::as_str).chain(platform)));
+        let set = Arc::new(SecretSet::with_derived(self.creds.values(), derived.iter().map(String::as_str)));
         *cache = Some((derived.len(), set.clone()));
         set
     }
@@ -697,15 +712,19 @@ impl Run {
         let (mut n429, mut n5xx, mut refreshed) = (0u32, 0u32, false);
         let origin_host = base.url.host_str().unwrap_or_default().to_string();
         loop {
-            if self.requests.fetch_add(1, Ordering::SeqCst) >= self.compiled.limits.max_requests {
-                return Err(EngineError::Cap(format!("{} requests", self.compiled.limits.max_requests)));
-            }
-            self.pace(None).await;
             let mut req = base.clone();
             let mut hops = 0;
             let resp = loop {
-                if req.url.host_str() == Some(origin_host.as_str()) {
-                    let cx = AuthContext { creds: &self.creds, fetch: self, scope, now: self.now(), feed_id: self.feed_id.as_deref() };
+                // Every network exchange (first try, transport retry,
+                // redirect hop) consumes the request budget and observes the
+                // spec's pacing.
+                if self.requests.fetch_add(1, Ordering::SeqCst) >= self.compiled.limits.max_requests {
+                    return Err(EngineError::Cap(format!("{} requests", self.compiled.limits.max_requests)));
+                }
+                self.pace(None).await;
+                let at_origin = req.url.host_str() == Some(origin_host.as_str());
+                if at_origin {
+                    let cx = AuthContext { creds: &self.creds, fetch: self, scope, now: self.now(),  };
                     self.compiled.auth.apply(&mut req, &cx).await.map_err(|e| match e {
                         AuthError::RateLimited => EngineError::Upstream {
                             status: 429,
@@ -714,7 +733,15 @@ impl Run {
                         e => EngineError::Auth(e),
                     })?;
                 }
-                let r = match self.transport.send_once(&req, &self.hosts, self.caps()).await {
+                // Off the authentication origin, no credential of any kind:
+                // header/query auth is not applied above, and the TLS client
+                // identity (mTLS) is not presented either.
+                let sent = if at_origin {
+                    self.transport.send_once(&req, &self.hosts, self.caps()).await
+                } else {
+                    self.transport.send_once_without_client_auth(&req, &self.hosts, self.caps()).await
+                };
+                let r = match sent {
                     Ok(r) => r,
                     Err(e @ (BrokerError::Connect(..) | BrokerError::Timeout(_) | BrokerError::Http(_))) => {
                         n5xx += 1;
@@ -1004,56 +1031,6 @@ impl TokenFetch for Run {
         let r = self.transport.send_once(&req, &self.hosts, self.caps()).await.map_err(|e| e.to_string())?;
         Ok((r.status, r.body.to_vec()))
     }
-
-    /// The platform broker call: the engine transport (pinning, TLS,
-    /// timeouts) under the broker's fixed single-route policy, never the
-    /// spec allowlist. Small bodies only; no redirects.
-    async fn post_dwd_assertion(&self, body: &Value) -> Result<auth::BrokerReply, String> {
-        let Some(p) = &self.pull_broker else {
-            return Err(crate::pull_broker::UNCONFIGURED.into());
-        };
-        self.post_broker(p.endpoint.clone(), body).await
-    }
-
-    async fn post_graph_token(&self, body: &Value) -> Result<auth::BrokerReply, String> {
-        let Some(p) = &self.pull_broker else {
-            return Err(crate::pull_broker::UNCONFIGURED.into());
-        };
-        self.post_broker(p.graph_endpoint.clone(), body).await
-    }
-
-    async fn post_okta_assertion(&self, body: &Value) -> Result<auth::BrokerReply, String> {
-        let Some(p) = &self.pull_broker else {
-            return Err(crate::pull_broker::UNCONFIGURED.into());
-        };
-        self.post_broker(p.okta_endpoint.clone(), body).await
-    }
-}
-
-impl Run {
-    async fn post_broker(&self, url: url::Url, body: &Value) -> Result<auth::BrokerReply, String> {
-        let Some(p) = &self.pull_broker else {
-            return Err(crate::pull_broker::UNCONFIGURED.into());
-        };
-        let req = OutboundRequest {
-            method: http::Method::POST,
-            url,
-            headers: vec![
-                ("Authorization".into(), format!("Bearer {}", p.token)),
-                ("x-nano-pull-broker-object".into(), p.object.clone()),
-                ("Content-Type".into(), "application/json".into()),
-                ("Accept".into(), "application/json".into()),
-            ],
-            body: Bytes::from(body.to_string()),
-        };
-        if self.requests.fetch_add(1, Ordering::SeqCst) >= self.compiled.limits.max_requests {
-            return Err("request cap reached".into());
-        }
-        let caps = BodyCaps { max_response_bytes: 64 * 1024, max_decompressed_bytes: 64 * 1024 };
-        let r = self.transport.send_once(&req, &p.hosts, caps).await.map_err(|e| e.to_string())?;
-        let retry_after = r.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok());
-        Ok(auth::BrokerReply { status: r.status, retry_after, body: r.body.to_vec() })
-    }
 }
 
 /// Redact every string (and key) of a JSON value; a string that still
@@ -1182,7 +1159,7 @@ struct Seq<'a> {
 
 impl Seq<'_> {
     /// Identity full runs and memberships save no per-page checkpoint: a
-    /// full run's cursor moves only after the coordinator committed it.
+    /// full run's cursor moves only after the directory committed it.
     fn defers_checkpoint(&self) -> bool {
         matches!(self.identity, Some((IdentityRole::Memberships, _) | (_, IdentityMode::Full)))
     }
@@ -1686,11 +1663,8 @@ pub async fn run(
     let compiled = compile(spec, &cfg.ceilings)?;
     let config = Value::Object(input.config.clone());
     let base_scope = Scope { config: config.clone(), ..Default::default() };
-    // The platform broker host is never a vendor: a spec that allowlists it
-    // is still refused when it targets it.
-    let broker_deny = EgressDeny { hosts: cfg.pull_broker.iter().map(|b| b.host().to_string()).collect(), cidrs: vec![] };
     let hosts = HostPolicy::compile(&spec.allow, &base_scope)?
-        .with_deny(cfg.platform_deny.merged(&input.egress_deny).merged(&broker_deny))?;
+        .with_deny(cfg.platform_deny.merged(&input.egress_deny))?;
     for t in compiled.auth.token_endpoints() {
         // Token URLs may template `config.*` (an Entra directory id, an Okta
         // domain); the plugin renders the same template at fetch time.
@@ -1700,32 +1674,17 @@ pub async fn run(
     for c in compiled.auth.credential_fields() {
         input.credentials.get(&c)?;
     }
-    // The platform broker identity is built only for a hosted run whose spec
-    // uses it (a broker configured on the runner, a tenant on the run, the
-    // `google_dwd_broker` plugin). Its policy carries the platform deny list
-    // only: a tenant's own deny list governs its vendors, not the platform.
-    // Any failure here leaves the broker unset, so only this plugin fails
-    // (`google_dwd_broker_unconfigured`); no other run is affected.
-    let pull_broker = match (&cfg.pull_broker, &input.tenant) {
-        (Some(b), Some(t)) if matches!(spec.auth.kind.as_str(), "google_dwd_broker" | "entra_fic_broker" | "okta_broker_jwt") => {
-            match (b.caller_token(t), crate::pull_broker::PlatformBroker::object_header(t), b.host_policy(cfg.platform_deny.clone())) {
-                (Ok(token), Ok(object), Ok(hosts)) => Some(PullBrokerCall {
-                    endpoint: b.endpoint().clone(),
-                    graph_endpoint: b.graph_token_endpoint(),
-                    okta_endpoint: b.okta_assertion_endpoint(),
-                    hosts,
-                    token,
-                    object,
-                }),
-                (_, _, Err(e)) => {
-                    tracing::warn!(target: "nano_connector::audit", error = %e, "platform pull broker is denied by the platform egress policy for this run");
-                    None
-                }
-                _ => None,
-            }
+    // A secret shorter than the scrubber's minimum would be sent by its auth
+    // plugin but never redacted from a vendor echo: refuse it up front.
+    for c in compiled.auth.secret_fields() {
+        // Absent optional secrets are fine (required ones failed above).
+        if input.credentials.get(&c).is_ok_and(|v| v.len() < crate::secrets::MIN_SECRET_LEN) {
+            return Err(EngineError::Auth(AuthError::Params(format!(
+                "credential `{c}` is shorter than {} bytes; secrets that short cannot be redacted safely",
+                crate::secrets::MIN_SECRET_LEN
+            ))));
         }
-        _ => None,
-    };
+    }
     let transport: Arc<dyn Transport> = match &cfg.transport {
         Some(t) => t.clone(),
         None => {
@@ -1799,8 +1758,6 @@ pub async fn run(
         _vrl_slots: slots,
         checkpoints: StdMutex::new(HashMap::new()),
         secret_cache: StdMutex::new(None),
-        feed_id: input.feed_id.clone(),
-        pull_broker,
         started: (cfg.clock)(),
         identity_modes: StdMutex::new(Vec::new()),
     });
@@ -1830,8 +1787,8 @@ pub async fn run(
     };
     if outcome.is_err() {
         if let Some(t) = run.sink.identity() {
-            // Best effort: staged runs that will never be committed (the
-            // coordinator also expires them after 6 h).
+            // Best effort: drop what the failed run buffered (nothing it
+            // buffered may be committed as a snapshot).
             let _ = tokio::time::timeout(Duration::from_secs(15), t.abort()).await;
         }
     }
@@ -1928,7 +1885,7 @@ pub const IDENTITY_LAST_FULL_AT: &str = "identity_last_full_at";
 pub const IDENTITY_LAST_FULL_ROWS: &str = "identity_last_full_rows";
 
 /// A `kind: identity` run: every users stream (full or delta), then every
-/// memberships stream (always full), then the memberships sub-feed commit.
+/// memberships stream (always full), then the memberships commit.
 async fn run_identity(run: &Arc<Run>, input: &RunInput) -> Result<(), EngineError> {
     let enabled = |s: &&Stream| input.enabled_streams.as_ref().is_none_or(|en| en.contains(&s.id));
     let role = |s: &Stream| s.identity.as_ref().map(|i| i.role);
@@ -1955,8 +1912,8 @@ async fn run_identity(run: &Arc<Run>, input: &RunInput) -> Result<(), EngineErro
 /// there is no saved cursor, the last full run is older than
 /// `identity.full_every_secs`, or the program answers `restart_full`;
 /// `delta` otherwise. A full run's checkpoint (cursor + last full time) is
-/// saved only after the coordinator committed the snapshot; a delta run
-/// saves one per page after the coordinator acknowledged its rows.
+/// saved only after the directory committed the snapshot; a delta run saves
+/// one per page after the directory applied its rows.
 async fn run_identity_users(run: &Arc<Run>, s: &Stream, saved: Value, allow_shrink: bool) -> Result<(), EngineError> {
     let stepper = paging::build(&s.pagination.kind, &s.pagination.params).map_err(EngineError::Spec)?;
     let worker = match &s.program {
@@ -1972,7 +1929,7 @@ async fn run_identity_users(run: &Arc<Run>, s: &Stream, saved: Value, allow_shri
     let sink = run.sink.identity();
     let wants_delta = s.identity.as_ref().and_then(|i| i.mode) == Some(IdentityMode::Delta);
     if wants_delta && sink.is_some_and(|t| !t.delta_supported()) {
-        tracing::debug!(stream = %s.id, "identity delta runs need the v2 coordinator contract; running full");
+        tracing::debug!(stream = %s.id, "identity target does not take delta rows; running full");
     }
     let wants_delta = wants_delta && sink.is_none_or(|t| t.delta_supported());
     let guard = crate::identity::ShrinkGuard { previous_rows: saved.get(IDENTITY_LAST_FULL_ROWS).and_then(Value::as_u64), allow: allow_shrink };
@@ -2066,7 +2023,7 @@ async fn futures_join_all<F: std::future::Future>(fs: impl IntoIterator<Item = F
 async fn discover(run: &Arc<Run>, f: &crate::spec::Fanout, memberships: bool) -> Result<Vec<Value>, EngineError> {
     // Memberships: an unset `max_items` (the collector default) means the
     // identity ceiling, and discovering more items than allowed is an error
-    // (a truncated group list would commit a partial snapshot).
+    // (a truncated group list would apply a partial membership snapshot).
     let max = if memberships {
         let asked = if f.max_items == crate::spec::Fanout::DEFAULT_MAX_ITEMS { MAX_IDENTITY_FANOUT_ITEMS } else { f.max_items };
         asked.min(MAX_IDENTITY_FANOUT_ITEMS) as usize

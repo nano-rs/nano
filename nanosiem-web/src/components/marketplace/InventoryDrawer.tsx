@@ -1,40 +1,58 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from '@/components/ui/sheet';
+import type { ReactNode } from 'react';
+import { DetailSheet } from '@/components/ui/detail-sheet';
 import { Button } from '@/components/ui/button';
 import { inventoryAction, inventoryReason, type InventoryItem } from '@/lib/api/marketplace-inventory';
-import type { ReactNode } from 'react';
-import { capabilityLabel, executionStageLabel, inventoryHealthLabel } from '@/lib/marketplace-labels';
-export function InventoryDrawer({ item, onClose, onToggle, onEdit, onConnect, purchaseStatus, onPurchase, busy }: { item: InventoryItem; onClose: () => void; onToggle: () => void; onEdit?: () => void; onConnect?: () => void; purchaseStatus?: ReactNode; onPurchase?: () => void; busy: boolean }) {
-  return <Sheet open onOpenChange={open => { if (!open) onClose(); }}>
-    <SheetContent className="text-[12px]">
-      <SheetHeader><SheetTitle>{item.name}</SheetTitle><SheetDescription>{inventoryReason(item)}</SheetDescription></SheetHeader>
-      <dl className="my-4 grid grid-cols-[110px_1fr] gap-2">
-        <dt>Item</dt><dd className="font-mono break-all">{item.id}</dd>
-        <dt>Execution</dt><dd className="font-mono">{executionStageLabel(item.execution_stage)}</dd>
-        <dt>Health</dt><dd>{inventoryHealthLabel(item.effective_health)}</dd>
-        <dt>Revision</dt><dd className="font-mono">{item.revision ?? '—'}</dd>
-        <dt>Last sync</dt><dd className="font-mono">{item.last_sync ?? 'Not recorded'}</dd>
-        <dt>Next refresh</dt><dd className="font-mono">{item.next_refresh ?? 'Not scheduled'}</dd>
-        {item.kind === 'custom' ? <>
-          <dt>Author</dt><dd className="font-mono break-all">{item.author}</dd>
-          <dt>Tenant scope</dt><dd className="font-mono break-all">{item.tenant_id}</dd>
-          <dt>Connector</dt><dd className="font-mono break-all">{item.connector}</dd>
-          <dt>Repository</dt><dd className="font-mono break-all">{item.repository_id ?? 'None'}</dd>
-          <dt>Repo commit</dt><dd className="font-mono">{item.repo_commit ?? 'Not recorded'}</dd>
-          <dt>Artifact</dt><dd className="font-mono break-all">{item.artifact_id ?? 'Not deployed'}</dd>
-          <dt>Artifact SHA256</dt><dd className="font-mono break-all">{item.artifact_sha256 ?? 'Not deployed'}</dd>
-        </> : <>
-          <dt>Grant revision</dt><dd className="font-mono">{item.grant_revision ?? 'None'}</dd>
-          <dt>Feed revision</dt><dd className="font-mono">{item.feed_revision ?? 'None'}</dd>
-        </>}
-        <dt>Capabilities</dt><dd>{item.capabilities.map(capabilityLabel).join(', ') || 'None'}</dd>
-      </dl>
-      {item.kind === 'premium' && purchaseStatus}
-      {item.kind === 'baseline' ? <p>Included · On</p> : item.kind === 'premium' && !item.entitled ? <div>
-        <Button disabled={!onPurchase || busy} onClick={onPurchase}>Purchase</Button><p className="mt-2 text-muted-foreground">Payment is confirmed by billing verification.</p>
-      </div> : <Button disabled={busy || !item.can_toggle} onClick={onToggle}>{inventoryAction(item)}</Button>}
-      {item.kind === 'custom' && item.can_edit && onEdit && <Button variant="outline" className="ml-2" onClick={onEdit}>Edit provider</Button>}
-      {item.kind === 'custom' && onConnect && <Button variant="outline" className="ml-2" onClick={onConnect}>Configure connection</Button>}
-    </SheetContent>
-  </Sheet>;
+import { capabilityLabel, executionStageLabel, humanizeEnum, inventoryHealthLabel } from '@/lib/marketplace-labels';
+import { formatUTCCompact } from '@/lib/date-utils';
+import { BundleFeedStatus } from './BundleFeedStatus';
+
+export interface InventoryDrawerActions {
+  onInstall?: () => void;
+  onToggle?: () => void;
+  onConfigure?: () => void;
+  onConnect?: () => void;
+  onEdit?: () => void;
+  onUninstall?: () => void;
+}
+
+/** Inventory detail sheet: provenance, state and the actions this caller may take. */
+export function InventoryDrawer({ item, onClose, busy, entitlement, actions }: {
+  item: InventoryItem;
+  onClose: () => void;
+  busy: boolean;
+  entitlement?: ReactNode;
+  actions: InventoryDrawerActions;
+}) {
+  const { onInstall, onToggle, onConfigure, onConnect, onEdit, onUninstall } = actions;
+  const btn = 'h-7 text-[11.5px]';
+  return <DetailSheet open onOpenChange={open => { if (!open) onClose(); }} size="md" breadcrumb={['Marketplace', humanizeEnum(item.kind)]}
+    title={item.name} description={item.description || inventoryReason(item)}
+    meta={<span className="font-mono">{item.id} · {inventoryHealthLabel(item.effective_health)}</span>}
+    footer={<>
+      {item.installed && onUninstall && <Button size="sm" variant="outline" className={`${btn} mr-auto`} disabled={busy} onClick={onUninstall}>Uninstall</Button>}
+      {item.can_edit && onEdit && <Button size="sm" variant="outline" className={btn} disabled={busy} onClick={onEdit}>Edit provider</Button>}
+      {onConnect && <Button size="sm" variant="outline" className={btn} disabled={busy} onClick={onConnect}>Configure connection</Button>}
+      {item.installed && onConfigure && <Button size="sm" variant="outline" className={btn} disabled={busy} onClick={onConfigure}>Configure</Button>}
+      {/* A feed the nano bundle provides is managed in Platform feeds, not toggled here. */}
+      {item.installed && onToggle && !item.provided_by_bundle && <Button size="sm" className={btn} disabled={busy || !item.can_toggle} onClick={onToggle}>{inventoryAction(item)}</Button>}
+      {!item.installed && !item.requirement && !item.provided_by_bundle && onInstall && <Button size="sm" className={btn} disabled={busy} onClick={onInstall}>Install</Button>}
+    </>}>
+    <dl className="grid grid-cols-[110px_1fr] gap-x-3 gap-y-1.5 text-[12px]" data-testid="inventory-details">
+      <dt className="text-muted-foreground">Item</dt><dd className="font-mono break-all">{item.id}</dd>
+      <dt className="text-muted-foreground">Category</dt><dd>{humanizeEnum(item.category)}</dd>
+      <dt className="text-muted-foreground">Execution</dt><dd className="font-mono">{executionStageLabel(item.execution_stage)}</dd>
+      <dt className="text-muted-foreground">Health</dt><dd>{item.reason ? `${inventoryHealthLabel(item.effective_health)} · ${inventoryReason(item)}` : inventoryHealthLabel(item.effective_health)}</dd>
+      <dt className="text-muted-foreground">Version</dt><dd className="font-mono">{item.version ?? '—'}</dd>
+      <dt className="text-muted-foreground">Last sync</dt><dd className="font-mono">{item.last_sync ? formatUTCCompact(item.last_sync) : 'Not recorded'}</dd>
+      {item.record_count !== null && <><dt className="text-muted-foreground">Records</dt><dd className="font-mono tabular-nums">{item.record_count}</dd></>}
+      <dt className="text-muted-foreground">Author</dt><dd className="font-mono break-all">{item.author}</dd>
+      <dt className="text-muted-foreground">Repository</dt><dd className="font-mono break-all">{item.repository_name ?? (item.source === 'custom_enrichment' ? 'Authored here' : 'Built in')}</dd>
+      {item.repo_commit && <><dt className="text-muted-foreground">Repo commit</dt><dd className="font-mono">{item.repo_commit.slice(0, 12)}</dd></>}
+      <dt className="text-muted-foreground">Capabilities</dt><dd>{item.capabilities.map(capabilityLabel).join(', ') || 'None'}</dd>
+    </dl>
+    {entitlement}
+    {/* NAN-4959: revision, last update and next refresh from the platform feed status. */}
+    {item.provided_by_bundle && <BundleFeedStatus provision={item.provided_by_bundle} className="mt-4 pt-3 border-t border-border/60" />}
+  </DetailSheet>;
 }

@@ -5,6 +5,7 @@ import { Search, Filter, Bookmark, Share2, ChevronDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { RiskSheetLauncher } from '@/enterprise/components/risk/RiskSheetLauncher';
 import { AddToWatchlistMenu } from '@/enterprise/components/risk/watchlists/AddToWatchlistMenu';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import type { AssetDossierIdentity } from '@/lib/api/types';
 import type { EntityRiskSummary } from '@/lib/api/types';
 import {
@@ -39,6 +40,8 @@ export function AssetIdentityHeader({
   tags = [],
   onInvestigate,
 }: AssetIdentityHeaderProps) {
+  // Risk watchlists are enterprise; the open stub renders nothing.
+  const { capabilities } = useCapabilities();
   const [scoreOpen, setScoreOpen] = useState(false);
   const [shareCopied, setShareCopied] = useState(false);
   // Risk service can emit scores > 100 (uncapped sum of contributing factors);
@@ -239,6 +242,7 @@ export function AssetIdentityHeader({
               disabled
             />
             {/* NAN-3228: add / remove this entity on risk watchlists. */}
+            {capabilities.risk && (
             <AddToWatchlistMenu
               entity={entityValue}
               entityType={/ip$/.test(entityField) ? 'ip' : kind}
@@ -252,6 +256,7 @@ export function AssetIdentityHeader({
                 <Bookmark className="w-[12px] h-[12px]" />
               </button>
             </AddToWatchlistMenu>
+            )}
             <HeaderAction
               icon={<Share2 className="w-[12px] h-[12px]" />}
               label={shareCopied ? 'Copied' : ''}

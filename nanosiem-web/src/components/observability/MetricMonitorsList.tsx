@@ -14,8 +14,9 @@ import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { api } from '@/lib/api';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
-import { TelemetrySetupHint } from './TelemetryUnavailable';
-import type { MetricMonitorEvaluation, MetricMonitor, MetricMonitorRequest } from '@/lib/api/types';
+import { TelemetrySetupHint } from './TelemetrySetupHint';
+import { fmtAgo } from './format';
+import type { MetricMonitorEvaluationSummary, MetricMonitor, MetricMonitorRequest } from '@/lib/api/types';
 import { MetricMonitorDialog } from './MetricMonitorDialog';
 
 const COMPARATOR_SYMBOL: Record<string, string> = { gt: '>', gte: '≥', lt: '<', lte: '≤' };
@@ -34,26 +35,28 @@ export interface MetricMonitorsListProps {
 
 export function MetricMonitorsList({ reloadKey = 0 }: MetricMonitorsListProps) {
   const [monitors, setMonitors] = useState<MetricMonitor[]>([]);
-  const [evaluations, setEvaluations] = useState<MetricMonitorEvaluation[] | null>(null);
+  const [summaries, setSummaries] = useState<MetricMonitorEvaluationSummary[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<MetricMonitor | null>(null);
   const [editMonitor, setEditMonitor] = useState<MetricMonitor | null>(null);
 
-  const load = useCallback(() => {
-    setLoading(true);
+  // `background` (the 30 s evaluation poll) refreshes without the loading
+  // state, so the list does not flicker its empty state on every poll.
+  const load = useCallback((background = false) => {
+    if (!background) setLoading(true);
     setError(null);
     api.observability
       .listMetricMonitors()
-      .then((r) => { setMonitors(r.monitors); setEvaluations(r.evaluations ?? null); })
+      .then((r) => { setMonitors(r.monitors); setSummaries(r.evaluation_summaries ?? null); })
       .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Failed to load monitors'))
-      .finally(() => setLoading(false));
+      .finally(() => { if (!background) setLoading(false); });
   }, []);
 
   useEffect(() => {
     load();
-    const timer = window.setInterval(load, 30_000);
+    const timer = window.setInterval(() => load(true), 30_000);
     return () => window.clearInterval(timer);
   }, [load, reloadKey]);
 
@@ -94,12 +97,10 @@ export function MetricMonitorsList({ reloadKey = 0 }: MetricMonitorsListProps) {
     }
   };
 
-  const byMonitor = new Map<string, MetricMonitorEvaluation[]>();
-  for (const evaluation of evaluations ?? []) {
-    const group = byMonitor.get(evaluation.monitor_id) ?? [];
-    group.push(evaluation);
-    byMonitor.set(evaluation.monitor_id, group);
-  }
+  // Status comes from the complete per-monitor summary, never from the
+  // bounded series sample (a breach can sort past it).
+  const byMonitor = new Map<string, MetricMonitorEvaluationSummary>();
+  for (const summary of summaries ?? []) byMonitor.set(summary.monitor_id, summary);
 
   return (
     <div className="rounded-md border border-border bg-card overflow-hidden">
@@ -131,7 +132,7 @@ export function MetricMonitorsList({ reloadKey = 0 }: MetricMonitorsListProps) {
         </div>
       )}
 
-      {evaluations?.length === 0 && monitors.some((m) => m.enabled) && (
+      {summaries?.length === 0 && monitors.some((m) => m.enabled) && (
         <div className="px-3 py-2 text-[11px] text-fg-3">
           No recent monitor evaluations. Check that scheduled evaluation is enabled and metric delivery is current.
           <TelemetrySetupHint />
@@ -139,12 +140,12 @@ export function MetricMonitorsList({ reloadKey = 0 }: MetricMonitorsListProps) {
       )}
       <div className="divide-y divide-border">
         {monitors.map((m) => {
-          const states = byMonitor.get(m.id) ?? [];
-          const status = !m.enabled ? 'Paused' : states.length === 0 ? 'Awaiting evaluation'
-            : states.some((s) => s.breaching) ? 'Breaching'
-            : states.every((s) => s.no_data) ? 'No data'
-            : states.some((s) => s.no_data) ? 'Partial data' : 'Within threshold';
-          const evaluatedAt = states.map((s) => s.evaluated_at).sort().at(-1);
+          const evalSummary = byMonitor.get(m.id);
+          const status = !m.enabled ? 'Paused' : !evalSummary || evalSummary.series === 0 ? 'Awaiting evaluation'
+            : evalSummary.breaching > 0 ? 'Breaching'
+            : evalSummary.no_data >= evalSummary.series ? 'No data'
+            : evalSummary.no_data > 0 ? 'Partial data' : 'Within threshold';
+          const evaluatedAt = evalSummary?.evaluated_at;
           const summary = [
             `${m.agg}(${m.metric_name})`,
             m.group_by ? `by ${m.group_by}` : null,
@@ -156,11 +157,6 @@ export function MetricMonitorsList({ reloadKey = 0 }: MetricMonitorsListProps) {
             <div key={m.id} className="px-3 py-2 flex items-center gap-3">
               <div className="min-w-0 flex-1">
                 <div className="text-[12px] text-foreground truncate">{m.name}</div>
-                {states.filter((state) => state.series_key).map((state) => (
-                  <div key={state.series_key} className="font-mono text-[10.5px] text-fg-2 truncate" title={state.series_key}>
-                    {m.group_by ?? 'series'}={state.series_key} · {state.no_data ? 'No data' : state.value}
-                  </div>
-                ))}
                 <div className="font-mono text-[10.5px] text-fg-3 truncate">
                   {summary}{' '}
                   <span className="text-fg-2">
@@ -170,9 +166,13 @@ export function MetricMonitorsList({ reloadKey = 0 }: MetricMonitorsListProps) {
                 </div>
               </div>
 
-              {evaluations !== null && (
+              {summaries !== null && (
                 <span className="font-mono text-[10.5px] text-fg-3 shrink-0" title={evaluatedAt ? `Last evaluated ${evaluatedAt}` : 'No recent result for the current definition'}>
-                  {status}
+                  <span>{status}</span>
+                  {evalSummary && evalSummary.breaching > 0 && evalSummary.series > 1 && (
+                    <span className="text-fg-4"> · {evalSummary.breaching}/{evalSummary.series} series</span>
+                  )}
+                  {evaluatedAt && <span className="text-fg-4"> · {fmtAgo(evaluatedAt)}</span>}
                 </span>
               )}
               {/* enable toggle */}
@@ -222,7 +222,7 @@ export function MetricMonitorsList({ reloadKey = 0 }: MetricMonitorsListProps) {
         open={editMonitor != null}
         onOpenChange={(o) => !o && setEditMonitor(null)}
         monitor={editMonitor}
-        onCreated={load}
+        onCreated={() => load()}
       />
 
       <ConfirmDialog

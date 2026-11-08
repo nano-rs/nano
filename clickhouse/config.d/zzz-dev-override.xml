@@ -39,6 +39,15 @@
     <compiled_expression_cache_size>33554432</compiled_expression_cache_size> <!-- 32MB (was 128MB) -->
     <query_condition_cache_size>67108864</query_condition_cache_size> <!-- 64MB (was 256MB) -->
 
+    <!-- NAN-4934: text-index caches (tier: small). Caps, not reservations (SLRU,
+         filled on demand); they sit outside the per-query memory limit but inside
+         max_server_memory_usage. The 26.x defaults are 1 GB / 1 GB / 2 GB. The
+         header cache needs ~300 B per (part, index), so it never needs 1 GB;
+         postings (decoded posting lists) is the one that grows. Known to 26.8 too. -->
+    <text_index_tokens_cache_size>134217728</text_index_tokens_cache_size> <!-- 128MB -->
+    <text_index_header_cache_size>67108864</text_index_header_cache_size> <!-- 64MB -->
+    <text_index_postings_cache_size>268435456</text_index_postings_cache_size> <!-- 256MB -->
+
     <!-- Minimal background threads (was 32/128/8/8/16/16/16) -->
     <background_pool_size>2</background_pool_size>
     <background_merges_mutations_concurrency_ratio>2</background_merges_mutations_concurrency_ratio>
@@ -49,12 +58,13 @@
     <background_buffer_flush_schedule_pool_size>2</background_buffer_flush_schedule_pool_size>
     <background_message_broker_schedule_pool_size>2</background_message_broker_schedule_pool_size>
 
-    <!-- Sane local concurrency (was 500/200/300) -->
+    <!-- Docker/open-core targets 2-6 GiB boxes. Keep admission and flush
+         concurrency bounded so a backlog cannot turn into error 241. -->
     <max_concurrent_queries>50</max_concurrent_queries>
     <max_concurrent_insert_queries>20</max_concurrent_insert_queries>
     <max_concurrent_select_queries>30</max_concurrent_select_queries>
+    <concurrent_threads_scheduler>round_robin</concurrent_threads_scheduler>
 
-    <!-- Reduce async insert threads (was 8) -->
     <async_insert_threads>2</async_insert_threads>
 
     <!-- Reduce connections (was 4096) -->
@@ -62,6 +72,19 @@
 
     <!-- All must be less than background_pool_size * concurrency_ratio (2*2=4) -->
     <merge_tree>
+        <!-- NAN-4957: every column, mark and skip-index stream of a part being
+             written holds a buffer of max_compress_block_size (default 1 MiB)
+             plus its compressed twin, so the write cost is per STREAM, not per
+             row. On nanosiem.logs (191 columns, 113 skip indexes) measured on
+             26.10.3.7 at a 4G limit: a 1-row (Compact) insert held 330 MiB and
+             a 20k-row (Wide part) insert 1.23 GiB; with 64 KiB blocks the Wide
+             insert held 176 MiB. With the 1 MiB default four concurrent inserts,
+             or one Wide insert plus the resident dictionaries, crossed the 3.2
+             GiB server limit (241); a 500k-row load into a copy of logs lost 80%
+             of its batches to 241 at 1 MiB and none at 64 KiB. Compression ratio
+             was unchanged on the same rows (11.71 at 1 MiB, 12.05 at 64 KiB). -->
+        <max_compress_block_size>65536</max_compress_block_size>
+        <min_compress_block_size>16384</min_compress_block_size>
         <number_of_free_entries_in_pool_to_execute_mutation>1</number_of_free_entries_in_pool_to_execute_mutation>
         <number_of_free_entries_in_pool_to_lower_max_size_of_merge>1</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
         <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>1</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>

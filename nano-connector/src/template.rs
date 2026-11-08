@@ -6,7 +6,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::Value;
 
 mod expression;
-pub use expression::{evaluate, expression_references};
+pub use expression::{evaluate, expression_references, expression_references_in};
 
 /// Values a template may read.
 #[derive(Debug, Clone, Default)]
@@ -18,11 +18,16 @@ pub struct Scope {
     pub item: Value,
     pub input: Value,
     pub window: Value,
-    pub steps: Value,
-    pub poll: Value,
-    pub run: Value,
-    pub alert: Value,
-    pub case: Value,
+    /// Extra namespaces supplied by the embedding host process (never by
+    /// template data or spec authors), for hosts that render templates
+    /// outside the collector loop. The connector engine itself supplies
+    /// none; a name colliding with a built-in or forbidden namespace is
+    /// ignored. Templates may reference them only where the host compiled
+    /// them with [`references_in`] / [`crate::engine::compile_with_namespaces`].
+    pub host: std::collections::BTreeMap<String, Value>,
+    /// Host namespaces that hold response data: in planning mode
+    /// (`defer_responses`) expressions over them stay as placeholders.
+    pub deferred: Vec<String>,
     /// Planning mode: retain response-dependent expressions as placeholders.
     pub defer_responses: bool,
     pub now: String,
@@ -46,10 +51,10 @@ impl std::fmt::Debug for SecretGuard {
     }
 }
 impl SecretGuard {
-    pub(crate) fn new(connection: crate::secrets::SecretSet, caller: crate::secrets::SecretSet) -> Self {
+    pub fn new(connection: crate::secrets::SecretSet, caller: crate::secrets::SecretSet) -> Self {
         Self { connection, caller, raw_preview: false }
     }
-    pub(crate) fn for_preview(mut self) -> Self {
+    pub fn for_preview(mut self) -> Self {
         self.raw_preview = true;
         self
     }
@@ -77,7 +82,7 @@ pub enum TemplateError {
     Expression(String),
 }
 
-const NAMESPACES: &[&str] = &["config", "state", "item", "input", "window", "steps", "poll", "run", "alert", "case", "now", "initial_cursor", "backfill_from"];
+const NAMESPACES: &[&str] = &["config", "state", "item", "input", "window", "now", "initial_cursor", "backfill_from"];
 const FORBIDDEN: &[&str] = &["credentials", "credential", "secrets", "secret", "auth", "env"];
 pub const MAX_RENDER_BYTES: usize = 4 * 1024 * 1024;
 
@@ -89,8 +94,13 @@ fn charge(remaining: &mut usize, bytes: usize) -> Result<(), TemplateError> {
 /// Path segment: encode everything that could change the URL's structure.
 const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
 
-/// Every `{{…}}` reference in `t`, validated against the namespaces.
+/// Every `{{…}}` reference in `t`, validated against the built-in namespaces.
 pub fn references(t: &str) -> Result<Vec<String>, TemplateError> {
+    references_in(t, &[])
+}
+
+/// [`references`], also admitting the host namespaces `extra`.
+pub fn references_in(t: &str, extra: &[&str]) -> Result<Vec<String>, TemplateError> {
     let mut out = Vec::new();
     let mut rest = t;
     while let Some(start) = rest.find("{{") {
@@ -99,7 +109,7 @@ pub fn references(t: &str) -> Result<Vec<String>, TemplateError> {
             .find("}}")
             .ok_or_else(|| TemplateError::Unterminated(t.to_string()))?;
         let path = after[..end].trim().to_string();
-        expression_references(&path)?;
+        expression_references_in(&path, extra)?;
         out.push(path);
         rest = &after[end + 2..];
     }
@@ -114,11 +124,6 @@ fn lookup(path: &str, scope: &Scope) -> Value {
         "item" => &scope.item,
         "input" => &scope.input,
         "window" => &scope.window,
-        "steps" => &scope.steps,
-        "poll" => &scope.poll,
-        "run" => &scope.run,
-        "alert" => &scope.alert,
-        "case" => &scope.case,
         "now" => return Value::String(scope.now.clone()),
         "initial_cursor" | "backfill_from" => {
             return scope
@@ -127,7 +132,10 @@ fn lookup(path: &str, scope: &Scope) -> Value {
                 .map(Value::String)
                 .unwrap_or(Value::Null);
         }
-        _ => return Value::Null,
+        other => match scope.host.get(other) {
+            Some(v) => v,
+            None => return Value::Null,
+        },
     };
     let mut cur = root;
     for p in parts {
@@ -153,8 +161,15 @@ pub fn value_to_string(v: &Value) -> String {
     }
 }
 
+impl Scope {
+    /// The host namespace names, for validating a rendered template.
+    pub fn host_names(&self) -> Vec<&str> {
+        self.host.keys().map(String::as_str).collect()
+    }
+}
+
 fn render_with(t: &str, scope: &Scope, enc: impl Fn(String) -> String) -> Result<String, TemplateError> {
-    references(t)?;
+    references_in(t, &scope.host_names())?;
     let mut out = String::new();
     let mut remaining = MAX_RENDER_BYTES;
     let mut rest = t;
@@ -189,7 +204,7 @@ fn render_json_inner(t: &Value, scope: &Scope, remaining: &mut usize) -> Result<
     let rendered = match t {
         Value::String(s) => {
             let trimmed = s.trim();
-            let refs = references(s)?;
+            let refs = references_in(s, &scope.host_names())?;
             if refs.len() == 1 && trimmed.starts_with("{{") && trimmed.find("}}") == Some(trimmed.len() - 2) {
                 evaluate(&refs[0], scope)?
             } else {
@@ -262,7 +277,7 @@ pub fn render_url(t: &str, scope: &Scope) -> Result<url::Url, TemplateError> {
     } else {
         authority.to_string()
     };
-    for expr in references(path)? {
+    for expr in references_in(path, &scope.host_names())? {
         let value = value_to_string(&evaluate(&expr, scope)?);
         if value == "." || value == ".." { return Err(TemplateError::Url("path substitution cannot be a dot segment".into())); }
     }

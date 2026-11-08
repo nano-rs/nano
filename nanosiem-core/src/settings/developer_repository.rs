@@ -115,7 +115,7 @@ impl DeveloperSettingsRepository {
         Ok(enabled)
     }
 
-    /// NAN-3219: the deployment's tenant-wide AI tuning mode
+    /// NAN-3219: the deployment-wide AI tuning mode
     /// (`system_settings.ai_tuning_mode`, default `on`). ANDed with
     /// [`Self::is_tuning_scheduler_enabled`] by the tuning scheduler.
     pub async fn ai_tuning_mode(

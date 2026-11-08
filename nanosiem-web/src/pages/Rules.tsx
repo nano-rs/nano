@@ -54,10 +54,6 @@ type SevFilter = 'all' | SeverityKey;
 type ModeFilter = 'all' | 'scheduled' | 'real-time';
 type StatusFilter = 'all' | 'live' | 'staging' | 'disabled';
 
-// NAN-2361: one Rules dashboard for every deployment mode. The hosted-shared
-// tenant is served the same stats / today-counts / alert-velocity / fleet-health
-// routes on the tenant substrate, so the earlier stripped "tenant rules" list
-// is gone.
 export function Rules() {
   useDocumentTitle('Rules');
   const navigate = useNavigate();
@@ -67,7 +63,12 @@ export function Rules() {
   const canCreate = hasPermission('detections:create');
   // NAN-4595: drafting rules from a narrative runs in the pivt panel.
   const { capabilities } = useCapabilities();
-  const canDraftWithPivt = canCreate && capabilities.melod && hasPermission('melod:chat');
+  const canDraftWithPivt =
+    canCreate &&
+    capabilities.melod &&
+    hasPermission('search:execute') &&
+    hasPermission('melod:chat') &&
+    hasPermission('melod:detection');
   // `?ids=a,b` narrows the list to specific rules (pivt opens it this way
   // after creating candidates in staging).
   const [searchParams, setSearchParams] = useSearchParams();

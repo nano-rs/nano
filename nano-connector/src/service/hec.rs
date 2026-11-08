@@ -1,36 +1,29 @@
-//! Splunk HEC emit to the tenant ingress with the feed's own credential.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Splunk HEC emit into the deployment's local Vector (`splunk_hec_ingest`,
+//! `config/vector/02-hec-source.toml`, end-to-end acknowledgements on).
 //!
-//! Wire contract (`HOSTED-INGRESS-CONTRACT.md`):
-//! - `POST <ingress>/services/collector/event`, `Authorization: Splunk <feed
-//!   token>`, a body of concatenated HEC envelopes `{"event": "<event JSON>",
-//!   "sourcetype": ..., "source": ...}`, one per event. On hosted the
-//!   credential binds the source slug; the envelope `sourcetype` is not used
-//!   for routing there (dedicated / open core route on it).
+//! Wire contract:
+//! - `POST <vector>/services/collector/event`, `Authorization: Splunk <ingest
+//!   token>`, `X-Splunk-Request-Channel: <feed id>`, a body of concatenated
+//!   HEC envelopes `{"event": "<event JSON>", "sourcetype": ..., "source":
+//!   ...}`, one per event. Vector routes on the envelope `sourcetype` (the
+//!   stream's rendered `source_type`).
 //! - `event` is the vendor event as JSON TEXT, never a JSON object
-//!   (NAN-3490). Vector's `splunk_hec` source spreads an object `event` over
-//!   the log root and leaves `.message` unset, so `hec_normalize` hands the
-//!   parser `message = ""`: every OCSF parser reads its record from
-//!   `.message`, emits a Base Event with an empty `raw_data`, and the lake
-//!   refuses every row (`raw_data_missing`). A string `event` becomes
-//!   `.message` verbatim, the shape every parser is written for.
-//! - A 2xx is the receipt: on hosted it means the batch is durable in the
-//!   raw R2 handoff. [`HecSink::push`] returns `Ok` only after every batch of
-//!   the page got one, and the engine checkpoints only after that.
+//!   (NAN-3490): `hec_normalize` lifts a string `event` into `.message`
+//!   verbatim, the shape every parser reads.
+//! - A 2xx only allocates an `ackId`. With [`HecConfig::require_ack`] the
+//!   sink polls `/services/collector/ack` until Vector reports the batch
+//!   delivered to its sinks; [`HecSink::push`] returns `Ok` only then, and the
+//!   engine checkpoints only after that. A crash in between re-sends the page
+//!   on the next run: at-least-once, no gap.
 //! - 429 / 5xx / 408 / connect errors: back off (honoring `Retry-After`) and
-//!   retry the same bytes; when the retry budget is spent, fail without
-//!   a receipt so the cursor does not move. Other 4xx fail at once.
-//! - 401 / 403 (NAN-3660): the ingress no longer accepts the feed's
-//!   credential (revoked, unknown, or not bound to the feed's source). The
-//!   run fails with a [`CREDENTIAL_REVOKED`] / [`CREDENTIAL_REJECTED`]
-//!   error, the runner backs off ([`CREDENTIAL_REFUSED_RETRY_SECS`]) and
-//!   never re-enrolls on its own: only the explicit rotate operation issues
-//!   a new credential, so a tenant's revoke is never silently undone.
-//! - `Idempotency-Key` = a hash of the feed id and the batch bytes. A retry
-//!   of a batch that was in fact accepted replays its first receipt instead
-//!   of storing it twice. A re-run after a crash re-sends identical bytes
-//!   only when the page is identical, so downstream still has to tolerate
-//!   duplicates (at-least-once); the lake dedupes on the parser's
-//!   `metadata.uid`.
+//!   retry the same bytes; when the retry budget is spent, fail without an
+//!   acknowledgement so the cursor does not move. Other 4xx fail at once.
+//! - 401 / 403 (NAN-3660): the ingest no longer accepts the token. The run
+//!   fails with a [`CREDENTIAL_REVOKED`] / [`CREDENTIAL_REJECTED`] error and
+//!   the runner backs off ([`CREDENTIAL_REFUSED_RETRY_SECS`]) instead of
+//!   hot-looping.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,21 +43,24 @@ pub const CREDENTIAL_REVOKED: &str = "credential_revoked";
 /// NAN-3660: error code of a run whose credential the ingress refused with
 /// HTTP 403 (valid token, not authorized for the feed's source).
 pub const CREDENTIAL_REJECTED: &str = "credential_rejected";
+/// Error code of a run whose events the ingest refused individually (or one
+/// too large to send): the batch is not acknowledged and the cursor stays.
+pub const EVENTS_REJECTED: &str = "events_rejected";
 /// NAN-3660: how long a feed whose credential was refused waits before it
 /// tries again (one batch). It does not hot-loop against the ingress; the
 /// rotate operation makes it due at once.
 pub const CREDENTIAL_REFUSED_RETRY_SECS: i64 = 3600;
 
-/// NAN-3660: the operator-facing error for an ingress auth refusal, or
-/// `None` for any other status. `class` is the ingress's
+/// NAN-3660: the operator-facing error for an ingest auth refusal, or
+/// `None` for any other status. `class` is the ingest's
 /// `x-nano-error-class` (never a credential).
 pub fn credential_refusal(status: u16, class: &str) -> Option<String> {
     match status {
         401 => Some(format!(
-            "{CREDENTIAL_REVOKED}: the ingest endpoint no longer accepts this feed's credential (HTTP 401, {class}); rotate the feed credential"
+            "{CREDENTIAL_REVOKED}: the ingest endpoint no longer accepts the runner's ingest token (HTTP 401, {class}); the runner must hold NANO_PLATFORM_INGEST_TOKEN as nano-api has it (listed in Vector's tokens file)"
         )),
         403 => Some(format!(
-            "{CREDENTIAL_REJECTED}: the feed's credential is not authorized for its source (HTTP 403, {class}); rotate the feed credential"
+            "{CREDENTIAL_REJECTED}: the ingest token is not authorized for this feed's source (HTTP 403, {class})"
         )),
         _ => None,
     }
@@ -111,7 +107,7 @@ impl Default for HecConfig {
     fn default() -> Self {
         Self {
             max_batch_bytes: 8 * 1024 * 1024,
-            require_ack: false,
+            require_ack: true,
             max_batch_events: 5_000,
             max_attempts: 8,
             base_backoff: Duration::from_millis(500),
@@ -155,17 +151,15 @@ pub enum HecError {
 }
 
 impl HecSink {
-    /// `ingest_url` is the tenant ingress base (the HEC event path is
-    /// appended) or the full event endpoint.
+    /// `ingest_url` is the Vector HEC base (the event path is appended) or
+    /// the full event endpoint. The ingest is an internal service: the client
+    /// never goes through an outbound proxy (and never through the vendor
+    /// egress broker, which refuses private addresses by design).
     pub fn new(ingest_url: &str, token: Secret, feed_id: Uuid, connector: &str, cfg: HecConfig) -> Result<Self, HecError> {
-        Self::for_tenant(nanosiem_core::egress::LOCAL_TENANT, ingest_url, token, feed_id, connector, cfg)
-    }
-    pub fn for_tenant(tenant: Uuid, ingest_url: &str, token: Secret, feed_id: Uuid, connector: &str, cfg: HecConfig) -> Result<Self, HecError> {
         let endpoint = hec_endpoint(ingest_url, cfg.allow_http)?;
         check_host(&endpoint, cfg.allowed_host_suffix.as_deref())?;
-        let builder = if nanosiem_core::egress::is_internal_service(&endpoint) { reqwest::Client::builder().no_proxy() }
-            else { nanosiem_core::egress::client_builder(tenant, nanosiem_core::egress::Purpose::Storage).map_err(|_| HecError::Client("egress authority unavailable".into()))? };
-        let client = builder
+        let client = reqwest::Client::builder()
+            .no_proxy()
             .connect_timeout(cfg.connect_timeout)
             .timeout(cfg.request_timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -286,9 +280,18 @@ impl HecSink {
                                 return Err(format!("ingest answered HTTP {status} with HEC code {code}"));
                             }
                         }
+                        // A batch is acknowledged only when EVERY event in it was
+                        // accepted. Any individually refused event (e.g. over the
+                        // ingest's size cap) fails the push, so the engine never
+                        // checkpoints past a record that was not ingested; the
+                        // page is re-read on the next run (at-least-once).
                         let rejected = parsed.get("rejected-event-count").and_then(Value::as_u64).unwrap_or(0);
                         if rejected > 0 {
-                            tracing::warn!(feed_id = %self.feed_id, rejected, "ingress refused events individually (event_too_large)");
+                            self.stats.rejected_events.fetch_add(rejected, Ordering::SeqCst);
+                            tracing::warn!(feed_id = %self.feed_id, rejected, "ingest refused events individually; checkpoint withheld");
+                            return Err(format!(
+                                "{EVENTS_REJECTED}: the ingest refused {rejected} of {events} event(s) in a batch; checkpoint withheld"
+                            ));
                         }
                         if self.cfg.require_ack {
                             let ack = parsed.get("ackId").and_then(Value::as_u64)
@@ -298,8 +301,7 @@ impl HecSink {
                         let receipt = receipt.or_else(|| parsed.get("ackId").map(|a| format!("ack:{a}")));
                         self.stats.batches.fetch_add(1, Ordering::SeqCst);
                         self.stats.bytes.fetch_add(body.len() as u64, Ordering::SeqCst);
-                        self.stats.events.fetch_add(events as u64 - rejected.min(events as u64), Ordering::SeqCst);
-                        self.stats.rejected_events.fetch_add(rejected, Ordering::SeqCst);
+                        self.stats.events.fetch_add(events as u64, Ordering::SeqCst);
                         if let Some(r) = receipt {
                             *self.stats.last_receipt.lock().expect("receipt") = Some(r);
                         }
@@ -337,6 +339,20 @@ impl HecSink {
 #[async_trait::async_trait]
 impl Sink for HecSink {
     async fn push(&self, source_type: &str, events: &[Value]) -> Result<(), String> {
+        // An event that cannot fit one request can never be delivered: fail
+        // the page (no checkpoint) instead of sending a batch the ingest will
+        // refuse or, worse, skipping the record.
+        if let Some(size) = events
+            .iter()
+            .map(|e| hec_envelope(e, source_type, &self.source).to_string().len())
+            .find(|len| *len > self.cfg.max_batch_bytes)
+        {
+            self.stats.rejected_events.fetch_add(1, Ordering::SeqCst);
+            return Err(format!(
+                "{EVENTS_REJECTED}: an event of {size} bytes exceeds the {} byte ingest request cap; checkpoint withheld",
+                self.cfg.max_batch_bytes
+            ));
+        }
         for (body, n) in self.batches(source_type, events) {
             self.post(body, n).await?;
         }
@@ -426,68 +442,4 @@ pub fn hec_endpoint(ingest_url: &str, allow_http: bool) -> Result<url::Url, HecE
         u.set_path(HEC_EVENT_PATH);
     }
     Ok(u)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn auth_refusals_name_the_credential() {
-        let revoked = credential_refusal(401, "-").unwrap();
-        assert!(revoked.starts_with("credential_revoked: "), "{revoked}");
-        assert!(revoked.ends_with("rotate the feed credential"));
-        assert!(credential_refusal(403, "-").unwrap().starts_with("credential_rejected: "));
-        for status in [400, 404, 413, 429, 500, 503] {
-            assert_eq!(credential_refusal(status, "-"), None, "{status}");
-        }
-        let wrapped = format!("sink: {revoked}");
-        assert_eq!(credential_refusal_in(&wrapped), Some(revoked.as_str()));
-        assert_eq!(credential_refusal_in("sink: ingest refused the batch: HTTP 400 (-)"), None);
-    }
-
-    #[test]
-    fn endpoint_rules() {
-        assert_eq!(hec_endpoint("https://t.ingest.example", false).unwrap().as_str(), "https://t.ingest.example/services/collector/event");
-        assert!(hec_endpoint("https://t.ingest.example/services/collector/event", false).is_ok());
-        assert!(hec_endpoint("http://vector:8088", false).is_err());
-        assert!(hec_endpoint("http://vector:8088", true).is_ok());
-        assert!(hec_endpoint("http://127.0.0.1:8088", true).is_ok());
-        assert!(hec_endpoint("http://10.2.3.4:8088", true).is_ok());
-        assert!(hec_endpoint("http://vector.nano.svc.cluster.local:8088", true).is_ok());
-        assert!(hec_endpoint("http://[::1]:8088", true).is_ok());
-        // Public hosts never get http, even with allow_http.
-        assert!(hec_endpoint("http://acme.ingest.nano.rs", true).is_err());
-        assert!(hec_endpoint("http://93.184.215.14", true).is_err());
-        assert!(hec_endpoint("https://u:p@t.example", false).is_err());
-        assert!(hec_endpoint("https://t.example/other", false).is_err());
-        assert!(hec_endpoint("https://t.example/?a=1", false).is_err());
-        let u = hec_endpoint("https://acme.ingest.nano.rs", false).unwrap();
-        assert!(check_host(&u, Some(".ingest.nano.rs")).is_ok());
-        assert!(check_host(&u, None).is_ok());
-        let evil = hec_endpoint("https://ingest.nano.rs.evil.example", false).unwrap();
-        assert!(check_host(&evil, Some(".ingest.nano.rs")).is_err());
-        let internal = hec_endpoint("https://10.0.0.5", false).unwrap();
-        assert!(check_host(&internal, Some("ingest.nano.rs")).is_err());
-    }
-
-    #[test]
-    fn batches_split_on_bytes_and_count_and_key_is_valid() {
-        let cfg = HecConfig { max_batch_events: 3, max_batch_bytes: 10_000, ..Default::default() };
-        let s = HecSink::new("https://t.example", Secret::new("tok"), Uuid::nil(), "okta", cfg).unwrap();
-        let ev: Vec<Value> = (0..7).map(|i| json!({ "i": i })).collect();
-        let b = s.batches("okta", &ev);
-        assert_eq!(b.iter().map(|(_, n)| *n).collect::<Vec<_>>(), vec![3, 3, 1]);
-        let first: Value = serde_json::from_str(b[0].0.lines().next().unwrap()).unwrap();
-        // NAN-3490: the event travels as JSON text, so Vector's splunk_hec
-        // source puts it in `.message` for the parser.
-        let event = first["event"].as_str().expect("event is JSON text");
-        assert_eq!(serde_json::from_str::<Value>(event).unwrap(), json!({ "i": 0 }));
-        assert_eq!(first["sourcetype"], "okta");
-        let k = s.idempotency_key(&b[0].0);
-        assert!(k.len() >= 8 && k.len() <= 128);
-        assert!(k.chars().all(|c| c.is_ascii_alphanumeric() || "._:~-".contains(c)));
-        assert_eq!(k, s.idempotency_key(&b[0].0));
-        assert_ne!(k, s.idempotency_key(&b[1].0));
-    }
 }

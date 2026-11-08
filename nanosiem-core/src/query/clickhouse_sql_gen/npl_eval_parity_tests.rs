@@ -28,10 +28,8 @@ fn gen1() -> ClickHouseSqlGenerator {
 }
 
 fn lean() -> ClickHouseSqlGenerator {
-    ClickHouseSqlGenerator::with_table("__nano_lake_source__").with_profile(Arc::new(
-        OcsfProfile::try_lake_1_9_with_snapshot_field_types(Default::default())
-            .expect("lake profile"),
-    ))
+    // ClickHouse return (NAN-4933): the OCSF store profile (`ocsf_logs`).
+    ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()))
 }
 
 fn sql_with(generator: ClickHouseSqlGenerator, npl: &str) -> Result<String, String> {
@@ -62,11 +60,9 @@ fn eval_contains_is_case_insensitive_like_where() {
     for (engine, sql) in
         both(r#"* | eval x=if(process_name CONTAINS "EdgeUpdate", 1, 0) | table x"#)
     {
-        assert!(
-            sql.contains("positionCaseInsensitiveUTF8("),
-            "{engine}: {sql}"
-        );
-        assert!(!sql.contains("(position("), "{engine}: {sql}");
+        // NAN-4943: the single nPL lowercase match.
+        assert!(sql.contains(" LIKE '%edgeupdate%'"), "{engine}: {sql}");
+        assert!(!sql.contains("(position(") && !sql.contains("iLike"), "{engine}: {sql}");
     }
 }
 
@@ -78,8 +74,9 @@ fn eval_like_operator_and_function_are_case_insensitive_like_where() {
         r#"* | where like(process_name, "%Edge%") | table process_name"#,
     ] {
         for (engine, sql) in both(npl) {
-            assert!(sql.contains(" iLike '%Edge%'"), "{engine} {npl}: {sql}");
-            assert!(!sql.contains(" LIKE '%Edge%'"), "{engine} {npl}: {sql}");
+            // NAN-4943: `lower(..) LIKE '<lowered>'`, never iLike.
+            assert!(sql.contains(" LIKE '%edge%'"), "{engine} {npl}: {sql}");
+            assert!(!sql.contains("iLike"), "{engine} {npl}: {sql}");
         }
     }
 }
@@ -102,8 +99,9 @@ fn eval_regex_literal_compiles_to_a_case_insensitive_match() {
             assert!(!sql.contains("= 'edge"), "{engine} {npl}: {sql}");
         }
     }
+    // NAN-4943: a literal regex is the nPL lowercase match (`regex_plan`).
     for (engine, sql) in both(r#"* | eval x=if(process_name!=/edge/i, 1, 0) | table x"#) {
-        assert!(sql.contains("NOT match(toString("), "{engine}: {sql}");
+        assert!(sql.contains(")) LIKE '%edge%'))") && sql.contains("(NOT (lower(toString("), "{engine}: {sql}");
     }
 }
 
@@ -137,12 +135,9 @@ fn eval_in_list_operator_parses_and_is_case_insensitive() {
         );
     }
     for (engine, sql) in both(r#"* | eval x=if(process_name NOT IN ("a.exe"), 1, 0) | table x"#) {
-        // `NOT IN` is null-safe like search `NOT`: a missing value is "not in".
-        assert!(
-            sql.contains("(NOT ifNull(((lower(toString("),
-            "{engine}: {sql}"
-        );
-        assert!(sql.contains(") IN ('a.exe'))), false))"), "{engine}: {sql}");
+        // `NOT IN` lowers to dev's three-valued eval `NOT` (NAN-4902 lane I).
+        assert!(sql.contains("(NOT (lower(toString("), "{engine}: {sql}");
+        assert!(sql.contains(") IN ('a.exe')))"), "{engine}: {sql}");
     }
 }
 
@@ -171,97 +166,55 @@ fn where_accepts_the_in_function_like_the_in_operator() {
 #[test]
 fn eval_not_negates_a_predicate() {
     for (engine, sql) in both(r#"* | eval x=if(NOT process_name IN ("a.exe"), 1, 0) | table x"#) {
-        assert!(sql.contains("NOT ifNull(("), "{engine}: {sql}");
+        assert!(sql.contains("(NOT (lower(toString("), "{engine}: {sql}");
     }
 }
 
 // --- 5. aliases resolve after a pipe -----------------------------------------
-
-#[test]
-fn lean_where_resolves_udm_aliases_like_the_search_term() {
-    let search = sql_with(lean(), r#"user="x" | table user"#).unwrap();
-    assert!(
-        search.contains(r#"if("user.name" != '', "user.name", "actor.user.name")"#),
-        "{search}"
-    );
-    for npl in [
-        r#"* | where NOT user="x" | table user"#,
-        r#"* | where user="x" | table user"#,
-        r#"* | where user IN ("x", "y") | table user"#,
-        r#"* | where user CONTAINS "x" | table user"#,
-        r#"* | where user=/x.*/ | table user"#,
-    ] {
-        let sql = sql_with(lean(), npl).unwrap();
-        assert!(
-            sql.contains(r#"if("user.name" != '', "user.name", "actor.user.name")"#),
-            "{npl}: {sql}"
-        );
-        assert!(!sql.contains(r#"toString("user")"#), "{npl}: {sql}");
-        assert!(!sql.contains(r#"lower("user")"#), "{npl}: {sql}");
-    }
-    let sql = sql_with(lean(), r#"* | where src_ip="10.0.0.1" | table src_ip"#).unwrap();
-    assert!(sql.contains(r#""src_endpoint.ip""#), "{sql}");
-    assert!(!sql.contains("toString(src_ip)"), "{sql}");
-}
-
-#[test]
-fn where_after_stats_still_reads_the_stats_column() {
-    let sql = sql_with(lean(), r#"* | stats count by user | where user="x""#).unwrap();
-    let tail = &sql[sql.rfind("stage_").unwrap()..];
-    let last_where = &sql[sql.rfind("WHERE").unwrap()..];
-    assert!(last_where.contains(r#"toString("user")"#), "{tail}\n{sql}");
-    assert!(!last_where.contains("user.name"), "{sql}");
-}
-
-#[test]
-fn gen1_where_on_a_udm_column_is_unchanged() {
-    let sql = sql_with(gen1(), r#"* | where NOT user="x" | table user"#).unwrap();
-    assert!(
-        sql.contains(r#"NOT ifNull((lower("user") = 'x'), false)"#),
-        "{sql}"
-    );
-}
+// Not ported (NAN-4933): clickhouse/dev already resolves `| where` aliases
+// (NAN-4903 `needs_resolved_stage_access`); see npl_bc_ch.rs for the live check.
 
 // --- 6. term-prefix keywords -------------------------------------------------
 
 #[test]
 fn bare_prefix_keyword_matches_a_term_prefix_not_the_body_prefix() {
     for (engine, sql) in both("svch* | table message") {
-        assert!(!sql.contains("iLike 'svch%'"), "{engine}: {sql}");
-        // Index-servable substring guard, refined by a term-boundary regex.
+        assert!(!sql.contains("LIKE 'svch%'"), "{engine}: {sql}");
+        // Index-servable substring guard, refined by a term-boundary regex
+        // over the lowered column (NAN-4943: ASCII fold, no `(?i)`).
         assert!(
-            sql.contains("lower(message) iLike '%svch%'"),
+            sql.contains("lower(message) LIKE '%svch%'"),
             "{engine}: {sql}"
         );
         assert!(
-            sql.contains(r"match(message, '(?i)(?:^|[^a-z0-9])svch')"),
+            sql.contains(r"match(lower(message), '(?:^|[^a-z0-9])svch')"),
             "{engine}: {sql}"
         );
     }
     // Suffix and infix wildcards get the same term semantics.
     for (engine, sql) in both("*host.exe | table message") {
         assert!(
-            sql.contains(r"match(message, '(?i)host\\.exe(?:$|[^a-z0-9])')"),
+            sql.contains(r"match(lower(message), 'host\\.exe(?:$|[^a-z0-9])')"),
             "{engine}: {sql}"
         );
     }
     for (engine, sql) in both("svc*exe | table message") {
         assert!(
-            sql.contains(r"match(message, '(?i)(?:^|[^a-z0-9])svc\\S*exe(?:$|[^a-z0-9])')"),
+            sql.contains(r"match(lower(message), '(?:^|[^a-z0-9])svc\\S*exe(?:$|[^a-z0-9])')"),
             "{engine}: {sql}"
         );
     }
     // `*kw*` stays the plain substring search (NAN-3034).
     for (engine, sql) in both("*svch* | table message") {
         assert!(
-            sql.contains("lower(message) iLike '%svch%'"),
+            sql.contains("lower(message) LIKE '%svch%'"),
             "{engine}: {sql}"
         );
-        assert!(!sql.contains("match(message"), "{engine}: {sql}");
+        assert!(!sql.contains("match(lower(message)"), "{engine}: {sql}");
     }
     let lean_sql = sql_with(lean(), "svch* | table message").unwrap();
     assert!(
-        lean_sql.contains(r"match(raw_data, '(?i)(?:^|[^a-z0-9])svch')"),
+        lean_sql.contains(r"match(lower(raw_data), '(?:^|[^a-z0-9])svch')"),
         "{lean_sql}"
     );
 }
@@ -331,11 +284,9 @@ fn conditional_risk_escalation_uses_the_same_predicates() {
     for (engine, sql) in both(
         r#"* | risk score=if(command_line CONTAINS "IEX" OR process_name IN ("WINWORD.EXE"), 20, 0) factor=if(command_line=/invoke-expression/i, "iex", null())"#,
     ) {
-        assert!(
-            sql.contains("positionCaseInsensitiveUTF8("),
-            "{engine}: {sql}"
-        );
+        assert!(sql.contains(" LIKE '%iex%'"), "{engine}: {sql}");
         assert!(sql.contains(") IN ('winword.exe')"), "{engine}: {sql}");
-        assert!(sql.contains("'(?i)invoke-expression')"), "{engine}: {sql}");
+        // NAN-4943: a literal regex is the nPL lowercase match.
+        assert!(sql.contains(" LIKE '%invoke-expression%'"), "{engine}: {sql}");
     }
 }

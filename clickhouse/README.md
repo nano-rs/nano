@@ -30,7 +30,7 @@ Pick the next number from `ls clickhouse/ | sort | tail` — not "the next one I
 
 ### Baseline
 
-`init.sql` represents the post-state of every numbered migration up through some version. The list of versions baked in lives in `BASELINE_MIGRATIONS` (`nanosiem-core/src/db/clickhouse_migrate/tracking.rs`); the migrator seeds those rows into `_migrations` on a fresh deploy so the runner doesn't re-apply files whose work is already in `init.sql`. When you fold a numbered migration into `init.sql`, add its version to `BASELINE_MIGRATIONS`.
+`init.sql` represents the post-state of every numbered migration up through some version. The list of versions baked in lives in `clickhouse/baseline_migrations.json`; both the migrator and upgrade preflight consume that contract. The migrator seeds those rows into `_migrations` on a fresh deploy so the runner doesn't re-apply files whose work is already in `init.sql`. When you fold a numbered migration into `init.sql`, add its version and name to the shared JSON contract.
 
 ---
 

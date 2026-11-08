@@ -10,7 +10,8 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { formatUTCShort } from '@/lib/date-utils';
 import { isClickHouseDefault } from '@/lib/utils';
 import { api } from '@/lib/api';
-import { resolveLogTraceId } from '@/lib/otel-correlation';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import { keyChipSpecs, readKeyChip } from './key-chips';
 import {
   flattenEventFields,
   buildFieldCategories,
@@ -157,33 +158,10 @@ export function EventInspectorPanel({
         : new Set<string>(),
     [schemaFields],
   );
-  // Per-event key-field summary chips follow the active schema (NAN-1241): under
-  // OCSF the same row carries src_endpoint.ip/user.name/activity rather than the
-  // UDM src_ip/src_host/user/event_type, so the spec must switch on the profile
-  // or only `source_type` survives. Mirrors SearchResults RawView keyChipSpecs.
-  const keyChipSpecs: Array<{ label: string; field: string; accent?: boolean }> =
-    schemaFields?.schema === 'ocsf'
-      ? [
-          { label: 'log source', field: 'metadata.log_source' },
-          { label: 'host', field: 'device.hostname' },
-          { label: 'src_ip', field: 'src_endpoint.ip' },
-          { label: 'src_host', field: 'src_endpoint.hostname' },
-          { label: 'dest_ip', field: 'dst_endpoint.ip' },
-          { label: 'dest_host', field: 'dst_endpoint.hostname' },
-          { label: 'user', field: 'user.name' },
-          { label: 'status', field: 'status' },
-          { label: 'activity', field: 'activity_name', accent: true },
-        ]
-      : [
-          { label: 'sourcetype', field: 'source_type' },
-          { label: 'src_ip', field: 'src_ip' },
-          { label: 'src_host', field: 'src_host' },
-          { label: 'dest_ip', field: 'dest_ip' },
-          { label: 'dest_host', field: 'dest_host' },
-          { label: 'user', field: 'user' },
-          { label: 'dest_user', field: 'dest_user' },
-          { label: 'event_type', field: 'event_type', accent: true },
-        ];
+  // Per-event key-field summary chips follow the active schema (NAN-1241,
+  // NAN-4903): built from the profile-aware field map, shared with SearchResults.
+  const schemaMap = useSchemaFieldMap();
+  const chipSpecs = React.useMemo(() => keyChipSpecs(schemaMap), [schemaMap]);
   const widthRef = useRef(width);
   widthRef.current = width;
   const panelRef = useRef<HTMLDivElement>(null);
@@ -208,13 +186,13 @@ export function EventInspectorPanel({
     ? { ...event.fields, ...fullLogData }
     : event.fields;
 
-  // OTLP log↔trace correlation follows the canonical OCSF model first:
-  // Trace Profile classes expose trace.uid; generic Base Events retain the id
-  // as unmapped.trace_id. Keep the old top-level column as a migration fallback.
-  const resolvedTraceId = resolveLogTraceId(displayFields);
+  // NAN-1528: OTLP log↔trace correlation. When a log row carries a non-empty
+  // trace_id (the column added to logs/ocsf_logs), surface a "View trace" pivot
+  // that opens the distributed-trace waterfall.
+  const rawTraceId = displayFields?.['trace_id'];
   const traceId =
-    resolvedTraceId && !isClickHouseDefault(resolvedTraceId, 'trace_id')
-      ? resolvedTraceId
+    typeof rawTraceId === 'string' && rawTraceId.trim() && !isClickHouseDefault(rawTraceId, 'trace_id')
+      ? rawTraceId.trim()
       : null;
 
   const isOcsf = schemaFields?.schema === 'ocsf';
@@ -296,9 +274,9 @@ export function EventInspectorPanel({
     });
   }, []);
 
-  // Raw tab text: the original log line (OCSF `raw_data`, UDM `message`,
-  // `_raw`), else the synthetic structured record for OTLP rows (NAN-1568,
-  // NAN-3245). See resolveRawView.
+  // OCSF preserves the original line in `raw_data`; UDM uses `message` and
+  // legacy rows may expose `_raw`. Structured telemetry falls back to a
+  // synthetic JSON record (NAN-1568/NAN-4951).
   const rawView = resolveRawView(displayFields);
   const rawMessage = rawView && !rawView.synthetic ? rawView.text : undefined;
   const syntheticRaw = rawView?.synthetic ? rawView.text : null;
@@ -411,20 +389,13 @@ export function EventInspectorPanel({
       {/* Key fields summary */}
       <div className="px-3 py-2 sticky top-[45px] z-10" style={{ background: 'var(--card)' }}>
         <div className="flex flex-wrap gap-1 font-mono text-[10.5px]">
-          {keyChipSpecs.map(({ label: displayField, field, accent }) => {
-            // NAN-2208: `event_type` is UDM's canonical name for the physical
-            // `action` column. Both read paths now emit `event_type`, but a row
-            // cached from before the fix (or a hand-built payload) may still
-            // carry only `action` — mirror SearchResults' fallback rather than
-            // rendering a blank chip. Harmless under OCSF, which has neither.
-            const value =
-              field === 'event_type'
-                ? (displayFields?.event_type ?? displayFields?.action)
-                : displayFields?.[field];
+          {chipSpecs.map((spec) => {
+            const { label: displayField, field, value } = readKeyChip(spec, displayFields);
+            const accent = spec.accent;
             if (!value || isClickHouseDefault(value, field)) return null;
             return (
               <span
-                key={field}
+                key={spec.label}
                 className={`inline-flex rounded-sm overflow-hidden border transition-colors ${
                   accent ? 'border-primary/25 hover:border-primary/50' : 'border-border hover:border-border/80'
                 }`}

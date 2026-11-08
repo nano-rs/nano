@@ -27,7 +27,8 @@ test('explicit subject and canonical identity retain precedence over account', (
   for (const fields of [
     { entity: 'preferred', entity_type: 'user' },
     { _match_entity: 'preferred', _match_entity_type: 'user' },
-    { 'actor.user.uid': 'preferred' },
+    // OCSF `actor.user.uid` precedence is deferred to the OCSF 1.9 lane (B):
+    // the base's extractEntity is UDM-only.
   ]) {
     assert.equal(extractEntity([{ _match_kind: 'aggregate', account: 'other', ...fields }]).label, 'preferred');
   }

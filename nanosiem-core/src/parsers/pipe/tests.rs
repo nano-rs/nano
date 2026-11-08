@@ -166,7 +166,7 @@ async fn split_limit_errors_instead_of_silently_truncating() {
 #[test]
 fn stored_plans_require_exact_marker_and_reject_config_injection() {
     assert!(
-        vrl::compiler::compile(BODY, &crate::parsers::validator::safe_vrl_functions()).is_err(),
+        vrl::compiler::compile(BODY, &crate::parsers::vrl_functions::parser_vrl_functions()).is_err(),
         "Old builders must reject the marker, never treat it as an identity parser"
     );
     let plan = plan(vec![step(
@@ -256,4 +256,141 @@ fn input_ids_are_canonical_push_or_pull_uuids() {
     super::condition(&predicate(&inputs)).unwrap();
     assert!(parse_list(&serde_json::json!([])).is_err());
     assert!(parse_list(&serde_json::json!(vec![format!("push:{id}"); 65])).is_err());
+}
+
+// --- NAN-4919: ClickHouse-product port ---------------------------------------
+
+fn run_vrl(code: &str, input: Value) -> Result<Value, String> {
+    use vrl::compiler::{runtime::Runtime, TargetValue, TimeZone};
+    let program = crate::parsers::vrl_guard::compile(
+        code,
+        &crate::parsers::vrl_functions::parser_vrl_functions(),
+    )
+    .map_err(|e| e.render(code))?
+    .program;
+    let mut target = TargetValue {
+        value: vrl::value::Value::from(input),
+        metadata: vrl::value::Value::Object(Default::default()),
+        secrets: vrl::value::Secrets::new(),
+    };
+    Runtime::default()
+        .resolve(&mut target, &program, &TimeZone::parse("UTC").unwrap())
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(target.value).map_err(|e| e.to_string())
+}
+
+#[test]
+fn inline_lookup_matches_like_the_batch_preview_and_compiles_on_the_allowlist() {
+    let lookup = step(
+        "lookup",
+        json!({"table":"owners","version":"1","missing":"leave",
+               "rows":[{"host":"h1","port":"1","owner":"al\"ice\u{7}"},{"host":"h1","port":"2","owner":"bøb"}],
+               "match":{"host":"host","port":"port"},"outputs":{"owner":"unmapped.owner"}}),
+    );
+    let native::Native::Lookup(spec) = native::parse(&lookup).unwrap() else {
+        panic!()
+    };
+    let code = spec.program().unwrap();
+    assert!(!code.contains("enrichment_table"));
+    let hit = run_vrl(&code, json!({"host":"h1","port":1.0})).unwrap();
+    assert_eq!(hit["unmapped"]["owner"], "al\"ice\u{7}");
+    let hit = run_vrl(&code, json!({"host":"h1","port":"2"})).unwrap();
+    assert_eq!(hit["unmapped"]["owner"], "bøb");
+    let miss = run_vrl(&code, json!({"host":"h2","port":"1"})).unwrap();
+    assert!(miss.get("unmapped").is_none());
+    // The batch preview agrees.
+    let plan = plan(vec![lookup.clone()]);
+    let rows = batch::run(&plan, &[json!({"host":"h1","port":1.0})], None).unwrap();
+    assert_eq!(rows[0].outputs[0]["unmapped"]["owner"], "al\"ice\u{7}");
+    // missing = error aborts.
+    let mut strict = lookup;
+    strict.config.insert("missing".into(), json!("error"));
+    let native::Native::Lookup(spec) = native::parse(&strict).unwrap() else {
+        panic!()
+    };
+    assert!(run_vrl(&spec.program().unwrap(), json!({"host":"zz","port":"1"})).is_err());
+}
+
+#[test]
+fn lookup_snapshots_are_byte_bounded() {
+    let rows: Vec<Value> = (0..100)
+        .map(|i| json!({"k": format!("{i}"), "v": "x".repeat(4000)}))
+        .collect();
+    let lookup = step(
+        "lookup",
+        json!({"table":"big","version":"1","rows":rows,"match":{"k":"k"},"outputs":{"v":"v"}}),
+    );
+    assert!(native::parse(&lookup).unwrap_err().contains("KiB"));
+}
+
+#[test]
+fn combine_is_preview_only_until_the_runtime_ships_reduce_and_lua() {
+    let plan = plan(vec![step("combine", json!({"keys":["host"]}))]);
+    plan.validate().unwrap();
+    let pinned: std::collections::BTreeSet<String> = native::PINNED_RUNTIME_TRANSFORMS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert!(native::deployable_with(&plan, &pinned).is_err());
+    let mut extended = pinned;
+    extended.extend(["reduce".to_string(), "lua".to_string()]);
+    native::deployable_with(&plan, &extended).unwrap();
+}
+
+#[tokio::test]
+async fn validator_checks_stored_plans_as_they_deploy() {
+    let validator = VrlValidator::new();
+    // A literal containing triple quotes is data inside a basic string.
+    let ok = plan(vec![step("set", json!({"field":"note","value":"'''"}))]);
+    let result = validator.validate_vrl(&ok.stored().unwrap()).await.unwrap();
+    assert!(result.valid, "{result:?}");
+    // Advanced VRL compiles on the parser ALLOWLIST: `log` is refused.
+    let bad = plan(vec![step("vrl", json!({"code":"log(.message)"}))]);
+    let result = validator.validate_vrl(&bad.stored().unwrap()).await.unwrap();
+    assert!(!result.valid);
+    // Native plans validate every predicate, also on the allowlist.
+    let route = plan(vec![step(
+        "route",
+        json!({"routes":[{"label":"a","predicate":"get_hostname!() == \"x\""}]}),
+    )]);
+    let result = validator.validate_vrl(&route.stored().unwrap()).await.unwrap();
+    assert!(!result.valid, "{result:?}");
+    // An edited body is refused, never treated as an identity parser.
+    let edited = ok.stored().unwrap().replace(BODY, ".");
+    assert!(!validator.validate_vrl(&edited).await.unwrap().valid);
+    // Combine validates (preview works) but warns that it cannot publish here.
+    let combine = plan(vec![step("combine", json!({"keys":["host"]}))]);
+    let result = validator.validate_vrl(&combine.stored().unwrap()).await.unwrap();
+    assert!(result.valid);
+    assert!(result.warnings.iter().any(|w| w.contains("reduce and lua")));
+}
+
+#[tokio::test]
+async fn chain_tests_run_native_plans_with_the_extension() {
+    let plan = plan(vec![
+        step("dedupe", json!({"fields":["message"]})),
+    ]);
+    let result = VrlValidator::new()
+        .test_vrl_chain(&[&plan.stored().unwrap(), ".extended = true"], "hello")
+        .await
+        .unwrap();
+    assert!(result.success, "{result:?}");
+    assert_eq!(result.output.unwrap()["extended"], true);
+}
+
+/// Codex P1 (NAN-4919): a metadata write split across steps (the variable is
+/// set in one step, the write is in the next) is refused when the whole plan
+/// program compiles metadata-read-only — in validation and in preview.
+#[tokio::test]
+async fn cross_step_and_two_target_metadata_writes_are_refused_everywhere() {
+    let mut setup = step("vrl", json!({"code":"forged = string!(.spoof)"}));
+    setup.id = "setup".into();
+    let mut write = step("vrl", json!({"code":"%nano_credential_id, err = forged"}));
+    write.id = "write".into();
+    let plan = plan(vec![setup, write]);
+    let stored = plan.stored().unwrap();
+    let result = VrlValidator::new().validate_vrl(&stored).await.unwrap();
+    assert!(!result.valid, "{result:?}");
+    let rows = batch::run(&plan, &[json!({"spoof":"6f1c0c1e-2b8f-4d7e-9a51-0c5e6c1d2a10"})], None).unwrap();
+    assert!(rows[0].error.is_some(), "preview must not run a metadata write: {:?}", rows[0]);
 }

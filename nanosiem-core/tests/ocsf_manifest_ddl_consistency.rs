@@ -1,91 +1,48 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-//! OCSF Phase 0 (NAN-1242) — manifest ⟷ DDL consistency gate.
+//! NAN-4903 — promotion manifest ⟷ generated DDL ⟷ OCSF contract gate.
 //!
-//! The promotion manifest (`docs/ocsf/1.8.0/udm_ocsf_mapping.json`) and the
-//! canonical DDL (`clickhouse/ocsf/init.sql`) are two hand-maintained artifacts
-//! that MUST stay in lock-step: the DDL is the mechanical realization of the
-//! manifest, and in Phase 4 the `OcsfProfile` is generated from the manifest.
-//! If they drift, the query layer and the physical table silently disagree
-//! (wrong / empty results, never an error — exactly the silent-bug class this
-//! gate exists to prevent).
+//! `nanosiem-core/docs/ocsf/events/promoted.json` is the single source of truth
+//! for which OCSF paths are typed columns. `scripts/gen-ocsf-ddl.py` renders the
+//! `@generated` block of `clickhouse/ocsf/init.sql` from it, and `OcsfProfile`
+//! reads it at runtime. This PURE test (no ClickHouse) fails when any of the
+//! three disagree:
 //!
-//! This test is PURE (no ClickHouse) and always runs in CI. The companion
-//! `ocsf_materialization_integration` test proves the DDL's JSONExtract
-//! expressions actually produce the right values against a live CH.
-//!
-//! NAMING (NAN-1242): promoted columns use literal dotted OCSF paths
-//! (`src_endpoint.ip`, `actor.process.cmd_line`). `_search` companions append a
-//! `.search` SUFFIX to the base column (`actor.process.cmd_line.search`), not an
-//! underscore. Array-derived columns that select by a STRING key (enrichments[]
-//! by `name`) carry `array_key.key_value_str` instead of the int `key_value`.
+//! - every manifest path is an attribute of an embedded OCSF contract, with the
+//!   same array-ness the contract declares (Array type ⟺ the path crosses an
+//!   OCSF array);
+//! - every manifest column exists in `ocsf_logs` with the manifest's type, and
+//!   every promoted scalar is `SKIP`ped from the stored `event` JSON (stored
+//!   once) while arrays of objects are not (the whole object stays in `event`);
+//! - every non-bookkeeping column of `ocsf_logs` is known to `OcsfProfile`, so
+//!   nothing physical is invisible to nPL;
+//! - the `@generated` markers are present (the file came from the generator).
+//!   `python3 scripts/gen-ocsf-ddl.py --check` proves byte-equality in CI.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Legacy `<col>.search` companion suffix. No such columns exist anymore
-/// (NAN-1241 moved full-text to expression indexes); retained so the orphan /
-/// stray-column guard tests still reject any regression that re-adds one.
-const SEARCH_SUFFIX: &str = ".search";
-
-/// Full-text search no longer materializes a `<col>.search` companion column
-/// (NAN-1241): the text skip index is attached to the SAME expression the query
-/// generator emits, so it actually prunes. Post-NAN-1247 the generator emits
-/// `lower(<col>)` for full-text on any plain String column (message included);
-/// only ext/JSON/numeric fields get the `toString` wrapper. Every OCSF full-text
-/// field is a promoted String column, so the expected index expression is:
-fn expected_search_index_expr(ch_column_name: &str) -> String {
-    if ch_column_name == "message" {
-        "lower(message)".to_string()
-    } else {
-        format!("lower(`{ch_column_name}`)")
-    }
-}
-
-/// Extract the indexed EXPRESSION from every `INDEX <name> <expr> TYPE text(...)`
-/// line in the DDL (the text/full-text skip indexes), normalized on whitespace.
-fn ddl_text_index_exprs(ddl: &str) -> std::collections::HashSet<String> {
-    let mut set = std::collections::HashSet::new();
-    for line in ocsf_logs_table_body(ddl).lines() {
-        let t = line.trim().trim_end_matches(',');
-        let Some(after_index) = t.strip_prefix("INDEX ") else {
-            continue;
-        };
-        // "<name> <expr> TYPE text(...)" — drop the index name, then take the
-        // expression up to ` TYPE text`.
-        let Some((_name, expr_and_type)) = after_index.split_once(' ') else {
-            continue;
-        };
-        if let Some(expr) = expr_and_type.split(" TYPE text").next() {
-            if expr_and_type.contains(" TYPE text") {
-                set.insert(expr.trim().to_string());
-            }
-        }
-    }
-    set
-}
+use nanosiem_core::schema::ocsf_registry;
+use nanosiem_core::schema::{OcsfProfile, SchemaProfile, OCSF_BOOKKEEPING_COLUMNS};
 
 const MANIFEST: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/docs/ocsf/1.8.0/udm_ocsf_mapping.json"
+    "/docs/ocsf/events/promoted.json"
+));
+const JSON_HINTS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/docs/ocsf/events/json_hints.json"
 ));
 const DDL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../clickhouse/ocsf/init.sql"
 ));
 
-/// Columns the DDL owns for bookkeeping/ingest that legitimately have no
-/// manifest promotion entry. Hoisted to
-/// `nanosiem_core::schema::OCSF_BOOKKEEPING_COLUMNS` (NAN-1397) so the
-/// field-stats inventory regression tests consume the SAME registry this gate
-/// enforces — see the const's doc for the per-column rationale.
-const BOOKKEEPING: &[&str] = nanosiem_core::schema::OCSF_BOOKKEEPING_COLUMNS;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Kind {
+    Plain,
     Materialized,
     Alias,
     Default,
-    Plain,
 }
 
 #[derive(Debug, Clone)]
@@ -94,54 +51,27 @@ struct DdlColumn {
     kind: Kind,
 }
 
-/// Collapse a ClickHouse type to its comparable base identifier:
-/// `LowCardinality(String)` → `String`, `DateTime64(3, 'UTC')` → `DateTime64`,
-/// `Nullable(UInt8)` → `UInt8`. Codecs/precision/timezone are intentionally
-/// ignored — we gate on type *kind* (String vs UInt vs DateTime), not on
-/// storage-tuning details that legitimately differ between manifest and DDL.
 fn normalize_base(ty: &str) -> String {
     let t = ty.trim().trim_end_matches(',').trim();
     for wrap in ["LowCardinality", "Nullable"] {
-        let prefix = format!("{wrap}(");
-        if let Some(inner) = t.strip_prefix(&prefix) {
+        if let Some(inner) = t.strip_prefix(&format!("{wrap}(")) {
             if let Some(inner) = inner.strip_suffix(')') {
                 return normalize_base(inner);
             }
         }
     }
-    t.split('(').next().unwrap_or(t).trim().to_string()
+    t.to_string()
 }
 
-/// Slice the DDL down to just the `nanosiem.ocsf_logs` CREATE TABLE body (from
-/// the CREATE line up to its terminating `ENGINE =`). The file also contains the
-/// schema-agnostic prevalence infrastructure (summary tables, dicts) and the OCSF
-/// prevalence summary MVs (NAN-1248) — those statements carry backtick-quoted
-/// column references inside SELECTs (e.g. `\`src_endpoint.ip\` AS ip`) that the
-/// naive line parser would misread as column declarations. The manifest⟷DDL gate
-/// only concerns the `ocsf_logs` promoted columns, so we parse just that block.
 fn ocsf_logs_table_body(ddl: &str) -> &str {
-    // NAN-1465: anchor on the exact table — `nanosiem.ocsf_logs` is a substring
-    // prefix of `nanosiem.ocsf_logs_raw` (declared first, NAN-1443), so a bare
-    // `find` matched the Null raw table's body and the whole gate silently
-    // parsed the wrong columns. The trailing newline pins the real table.
     let start = ddl
         .find("CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs\n")
         .expect("ocsf_logs CREATE TABLE must exist");
     let rest = &ddl[start..];
-    // The column/index list ends at the table's ENGINE clause; everything after
-    // (PARTITION/ORDER/SETTINGS, then the appended prevalence statements) is out
-    // of scope for column parsing.
-    // NAN-1465: anchor on a line-start `ENGINE =` — the leading NAN-1443 comment
-    // block mentions `(ENGINE = Null)` mid-line, which a bare `find("ENGINE =")`
-    // matched, truncating the body to the comment (0 columns parsed).
     let end = rest.find("\nENGINE =").map(|i| i + 1).unwrap_or(rest.len());
     &rest[..end]
 }
 
-/// Parse every `\`name\` <Type> [MATERIALIZED|ALIAS|DEFAULT ...]` column line out
-/// of the CREATE TABLE body. Multi-line MATERIALIZED expressions are fine — we
-/// only read name + type + kind from the column's opening line. Lines that
-/// don't start with a backtick (INDEX, ORDER BY, settings, comments) are skipped.
 fn parse_ddl_columns(ddl: &str) -> BTreeMap<String, DdlColumn> {
     let mut out = BTreeMap::new();
     for raw in ocsf_logs_table_body(ddl).lines() {
@@ -153,11 +83,7 @@ fn parse_ddl_columns(ddl: &str) -> BTreeMap<String, DdlColumn> {
             continue;
         };
         let name = after_tick[..end].to_string();
-        let rest = after_tick[end + 1..].trim();
-
-        // Accumulate whitespace-separated tokens into the type until parens
-        // balance (handles `DateTime64(3, 'UTC')` which contains a space).
-        let mut toks = rest.split_whitespace();
+        let mut toks = after_tick[end + 1..].split_whitespace();
         let mut ty = String::new();
         for tok in toks.by_ref() {
             if !ty.is_empty() {
@@ -168,188 +94,268 @@ fn parse_ddl_columns(ddl: &str) -> BTreeMap<String, DdlColumn> {
                 break;
             }
         }
-        let ty = ty.trim_end_matches(',').trim().to_string();
-
         let kind = match toks.next() {
             Some("MATERIALIZED") => Kind::Materialized,
             Some("ALIAS") => Kind::Alias,
             Some("DEFAULT") => Kind::Default,
             _ => Kind::Plain,
         };
-
-        out.insert(name, DdlColumn { ty, kind });
+        out.insert(name, DdlColumn { ty: ty.trim_end_matches(',').to_string(), kind });
     }
     out
 }
 
-#[derive(Debug, Clone)]
-struct ManifestEntry {
-    ch_column_name: String,
-    ch_type: String,
-    is_search_col: bool,
+fn manifest() -> Vec<serde_json::Value> {
+    serde_json::from_str(MANIFEST).expect("promoted.json must be a JSON array")
 }
 
-fn parse_manifest() -> Vec<ManifestEntry> {
-    let v: serde_json::Value =
-        serde_json::from_str(MANIFEST).expect("udm_ocsf_mapping.json must be valid JSON");
-    let arr = v.as_array().expect("manifest must be a JSON array");
-    arr.iter()
-        .map(|e| ManifestEntry {
-            ch_column_name: e["ch_column_name"]
-                .as_str()
-                .expect("every entry needs ch_column_name")
-                .to_string(),
-            ch_type: e["ch_type"]
-                .as_str()
-                .expect("every entry needs ch_type")
-                .to_string(),
-            is_search_col: e["is_search_col"].as_bool().unwrap_or(false),
-        })
+fn event_column_line(ddl: &str) -> &str {
+    ocsf_logs_table_body(ddl)
+        .lines()
+        .find(|l| l.trim_start().starts_with("`event` JSON("))
+        .expect("ocsf_logs must store `event` JSON")
+}
+
+#[test]
+fn ddl_carries_generated_markers() {
+    assert!(DDL.contains("-- @generated begin: scripts/gen-ocsf-ddl.py"));
+    assert!(DDL.contains("-- @generated end"));
+}
+
+#[test]
+fn every_manifest_path_is_an_ocsf_attribute_with_matching_arrayness() {
+    let mut bad = Vec::new();
+    for e in manifest() {
+        let path = e["ocsf_path"].as_str().unwrap();
+        let ty = e["ch_type"].as_str().unwrap();
+        match ocsf_registry::known(path) {
+            None => bad.push(format!("{path}: not an OCSF attribute")),
+            Some(info) => {
+                if info.is_multi_valued() != ty.starts_with("Array(") {
+                    bad.push(format!(
+                        "{path}: contract multi-valued={} but ch_type={ty}",
+                        info.is_multi_valued()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "manifest/contract drift:\n{}", bad.join("\n"));
+}
+
+#[test]
+fn every_manifest_column_exists_with_its_type() {
+    let cols = parse_ddl_columns(DDL);
+    let mut bad = Vec::new();
+    for e in manifest() {
+        let c = e["ch_column_name"].as_str().unwrap();
+        let ty = e["ch_type"].as_str().unwrap();
+        match cols.get(c) {
+            None => bad.push(format!("{c}: missing from ocsf_logs")),
+            Some(d) if normalize_base(&d.ty) != normalize_base(ty) => {
+                bad.push(format!("{c}: manifest {ty} vs DDL {}", d.ty))
+            }
+            Some(d) if d.kind != Kind::Plain => {
+                bad.push(format!("{c}: promoted columns are plain (MV-written), got {:?}", d.kind))
+            }
+            _ => {}
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+#[test]
+fn promoted_scalars_are_skipped_from_event_and_arrays_are_kept() {
+    let line = event_column_line(DDL);
+    let mut bad = Vec::new();
+    for e in manifest() {
+        let p = e["ocsf_path"].as_str().unwrap();
+        let skipped = line.contains(&format!("SKIP `{p}`"));
+        let array = e["ch_type"].as_str().unwrap().starts_with("Array(");
+        if array == skipped {
+            bad.push(format!("{p}: array={array} skipped={skipped}"));
+        }
+    }
+    assert!(line.contains("SKIP `unmapped`"), "`unmapped` is stored in its own column");
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// JSON type hints (`json_hints.json`, design doc §3.6) are typed paths inside
+/// `event`. They must be OCSF scalar strings that are not promoted, with a
+/// String-family Nullable type: any JSON value casts to it, so no INSERT or merge
+/// can fail on an off-type producer value, and an absent path stays NULL.
+#[test]
+fn json_hints_are_unpromoted_scalar_strings_typed_in_event() {
+    let hints: Vec<serde_json::Value> =
+        serde_json::from_str(JSON_HINTS).expect("json_hints.json must be a JSON array");
+    assert!(!hints.is_empty());
+    let promoted: BTreeSet<String> = manifest()
+        .iter()
+        .map(|e| e["ocsf_path"].as_str().unwrap().to_string())
+        .collect();
+    let line = event_column_line(DDL);
+    let mut bad = Vec::new();
+    for h in &hints {
+        let p = h["ocsf_path"].as_str().unwrap();
+        let t = h["ch_type"].as_str().unwrap();
+        if promoted.contains(p) {
+            bad.push(format!("{p}: promoted; a hint would duplicate the column"));
+        }
+        if !matches!(t, "Nullable(String)" | "LowCardinality(Nullable(String))") {
+            bad.push(format!("{p}: ch_type {t} is not a Nullable String type"));
+        }
+        match ocsf_registry::known(p) {
+            None => bad.push(format!("{p}: not an OCSF attribute")),
+            Some(info) => {
+                if info.is_multi_valued() || info.leaf != ocsf_registry::OcsfLeafType::String {
+                    bad.push(format!("{p}: not a scalar string ({:?})", info.leaf));
+                }
+            }
+        }
+        if !line.contains(&format!("`{p}` {t},")) {
+            bad.push(format!("{p}: not typed as {t} in the event column"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Boot detection (`event_json_hints_in_type`) must find every manifest hint
+/// in the generated `event` type, and none in an unhinted one.
+#[test]
+fn boot_hint_detection_reads_the_generated_event_type() {
+    let line = event_column_line(DDL);
+    let found = nanosiem_core::schema::event_json_hints_in_type(line);
+    let manifest = nanosiem_core::schema::manifest_event_json_hints();
+    assert_eq!(found.len(), manifest.len(), "found {found:?}");
+    let unhinted = "JSON(max_dynamic_paths = 1024, SKIP `process.name`, SKIP unmapped)";
+    assert!(nanosiem_core::schema::event_json_hints_in_type(unhinted).is_empty());
+    // system.columns renders simple names unquoted.
+    let rendered = "JSON(action LowCardinality(Nullable(String)), `process.file.name` Nullable(String), SKIP unmapped)";
+    let got = nanosiem_core::schema::event_json_hints_in_type(rendered);
+    assert!(got.contains("action") && got.contains("process.file.name") && got.len() == 2, "{got:?}");
+}
+
+#[test]
+fn every_physical_column_is_known_to_the_profile() {
+    let profile = OcsfProfile::new();
+    let bookkeeping: BTreeSet<&str> = OCSF_BOOKKEEPING_COLUMNS.iter().copied().collect();
+    let mut bad = Vec::new();
+    for (name, col) in parse_ddl_columns(DDL) {
+        if bookkeeping.contains(name.as_str()) || name == "id" || name.starts_with("prevalence_") {
+            continue;
+        }
+        if !profile.is_known_field(&name) {
+            bad.push(format!("{name} ({:?})", col.kind));
+        }
+    }
+    assert!(bad.is_empty(), "columns invisible to nPL:\n{}", bad.join("\n"));
+}
+
+#[test]
+fn lowered_flags_drive_the_profile() {
+    let profile = OcsfProfile::new();
+    for e in manifest() {
+        let c = e["ch_column_name"].as_str().unwrap();
+        assert_eq!(
+            profile.is_lowercased_at_ingest(c),
+            e["lowered_at_ingest"].as_bool().unwrap(),
+            "{c}"
+        );
+    }
+}
+
+#[test]
+fn array_columns_are_profile_arrays() {
+    let profile = OcsfProfile::new();
+    for e in manifest() {
+        let c = e["ch_column_name"].as_str().unwrap();
+        let array = e["ch_type"].as_str().unwrap().starts_with("Array(");
+        assert_eq!(profile.is_array_field(c), array, "{c}");
+    }
+}
+
+const MIGRATION_180: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/180_ocsf_version_agnostic_store.sql"
+));
+
+fn sql_statements(sql: &str) -> Vec<String> {
+    sql.lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .split(';')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .collect()
 }
 
-/// Every promoted column named in the manifest must exist in the DDL.
+/// NAN-4903 (codex P0): migration 180 must never drop the data-bearing
+/// `ocsf_logs`. It renames it to `ocsf_logs_legacy_v179`, and it drops exactly
+/// the data-free objects the overlay recreates: the ingest MVs, the Null
+/// landing tables, the Distributed wrapper and EVERY overlay MV that reads
+/// `nanosiem.ocsf_logs` (a RENAME carries MV source bindings with the table, so
+/// a reader left out here would silently keep reading the frozen legacy table).
 #[test]
-fn every_manifest_column_exists_in_ddl() {
-    let ddl = parse_ddl_columns(DDL);
-    let missing: Vec<String> = parse_manifest()
-        .iter()
-        .filter(|e| !ddl.contains_key(&e.ch_column_name))
-        .map(|e| e.ch_column_name.clone())
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "manifest columns absent from clickhouse/ocsf/init.sql: {missing:?}"
-    );
-}
-
-/// A manifest entry that declares `is_search_col` must have a text skip index on
-/// the exact expression the query generator emits for full-text on that field
-/// (NAN-1241). This is what makes full-text hunts index-pruned; a mismatch (e.g.
-/// an index on a stored `<col>.search` column while codegen queries the
-/// expression) silently degrades to a full scan.
-#[test]
-fn search_companions_exist_for_search_columns() {
-    let exprs = ddl_text_index_exprs(DDL);
-    // Guard against regressing to the dead-index design: no stored `.search`
-    // companion column should exist anymore.
-    let ddl_cols = parse_ddl_columns(DDL);
-    let mut problems = Vec::new();
-    for e in parse_manifest().iter().filter(|e| e.is_search_col) {
-        let expected = expected_search_index_expr(&e.ch_column_name);
-        if !exprs.contains(&expected) {
-            problems.push(format!("{} (no text index on `{expected}`)", e.ch_column_name));
-        }
-        let stale_col = format!("{}.search", e.ch_column_name);
-        if ddl_cols.contains_key(&stale_col) {
-            problems.push(format!("{stale_col} (stale stored .search column — should be dropped)"));
-        }
-    }
-    assert!(
-        problems.is_empty(),
-        "is_search_col entries without a matching text index on the codegen expression: {problems:?}"
-    );
-}
-
-/// No orphan promotions: every non-`_search` MATERIALIZED column in the DDL must
-/// trace back to a manifest entry (or be bookkeeping). Catches a column added to
-/// the DDL without recording it in the manifest — which would make Phase 4's
-/// generated `OcsfProfile` blind to a real physical column.
-#[test]
-fn no_materialized_columns_missing_from_manifest() {
-    let ddl = parse_ddl_columns(DDL);
-    let manifest_cols: BTreeSet<String> = parse_manifest()
-        .into_iter()
-        .map(|e| e.ch_column_name)
-        .collect();
-    let bookkeeping: BTreeSet<&str> = BOOKKEEPING.iter().copied().collect();
-
-    let orphans: Vec<String> = ddl
-        .iter()
-        .filter(|(name, c)| {
-            c.kind == Kind::Materialized
-                && !name.ends_with(SEARCH_SUFFIX)
-                && !manifest_cols.contains(name.as_str())
-                && !bookkeeping.contains(name.as_str())
-        })
-        .map(|(name, _)| name.clone())
-        .collect();
-    assert!(
-        orphans.is_empty(),
-        "DDL MATERIALIZED columns with no manifest entry: {orphans:?}"
-    );
-}
-
-/// Every `_search` MATERIALIZED column must correspond to a manifest entry that
-/// actually declared `is_search_col` — no stray search columns.
-#[test]
-fn search_columns_trace_back_to_search_entries() {
-    let ddl = parse_ddl_columns(DDL);
-    let search_stems: BTreeSet<String> = parse_manifest()
-        .into_iter()
-        .filter(|e| e.is_search_col)
-        .map(|e| e.ch_column_name)
-        .collect();
-
-    let strays: Vec<String> = ddl
-        .iter()
-        .filter(|(name, c)| c.kind == Kind::Materialized && name.ends_with(SEARCH_SUFFIX))
-        .filter_map(|(name, _)| {
-            let stem = name.strip_suffix(SEARCH_SUFFIX).unwrap();
-            (!search_stems.contains(stem)).then(|| name.clone())
-        })
-        .collect();
-    assert!(
-        strays.is_empty(),
-        "_search columns with no is_search_col manifest entry: {strays:?}"
-    );
-}
-
-/// The CH type kind must agree between manifest and DDL for every promoted
-/// column. Gates gross drift (e.g. a column silently changing String→UInt)
-/// while tolerating LowCardinality/codec/precision differences.
-#[test]
-fn column_types_agree_between_manifest_and_ddl() {
-    let ddl = parse_ddl_columns(DDL);
-    let mut mismatches = Vec::new();
-    for e in parse_manifest() {
-        let Some(col) = ddl.get(&e.ch_column_name) else {
-            continue; // presence is asserted by every_manifest_column_exists_in_ddl
+fn migration_180_preserves_ocsf_logs_and_drops_only_recreated_views() {
+    let stmts = sql_statements(MIGRATION_180);
+    let mut dropped_views = BTreeSet::new();
+    let mut dropped_tables = BTreeSet::new();
+    let mut renames = Vec::new();
+    for s in &stmts {
+        let u = s.to_uppercase();
+        let name = |prefix: &str| {
+            s[prefix.len()..]
+                .trim()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .trim_start_matches("nanosiem.")
+                .to_string()
         };
-        let want = normalize_base(&e.ch_type);
-        let got = normalize_base(&col.ty);
-        if want != got {
-            mismatches.push(format!(
-                "{}: manifest={} ddl={} (base {want} != {got})",
-                e.ch_column_name, e.ch_type, col.ty
-            ));
+        if u.starts_with("DROP VIEW IF EXISTS ") {
+            dropped_views.insert(name("DROP VIEW IF EXISTS "));
+        } else if u.starts_with("DROP TABLE IF EXISTS ") {
+            dropped_tables.insert(name("DROP TABLE IF EXISTS "));
+        } else if u.starts_with("RENAME TABLE ") {
+            renames.push(s.clone());
+        } else {
+            panic!("unexpected statement in migration 180: {s}");
         }
     }
     assert!(
-        mismatches.is_empty(),
-        "manifest⟷DDL type-kind mismatches: {mismatches:#?}"
+        !dropped_tables.contains("ocsf_logs") && !dropped_views.contains("ocsf_logs"),
+        "migration 180 must not drop the data-bearing ocsf_logs"
     );
-}
-
-/// `activity_id` is intentionally shared by two manifest entries (taxonomy
-/// `event_type` and `file_action`). If they ever disagree on the physical
-/// column or type, the shared-column assumption is broken.
-#[test]
-fn shared_columns_are_self_consistent() {
-    let mut by_name: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for e in parse_manifest() {
-        by_name
-            .entry(e.ch_column_name)
-            .or_default()
-            .insert(normalize_base(&e.ch_type));
-    }
-    let conflicts: Vec<String> = by_name
+    let allowed_tables: BTreeSet<String> = ["ocsf_logs_distributed", "ocsf_logs_native_raw", "ocsf_logs_raw"]
         .iter()
-        .filter(|(_, types)| types.len() > 1)
-        .map(|(name, types)| format!("{name}: {types:?}"))
+        .map(|s| s.to_string())
         .collect();
+    assert_eq!(dropped_tables, allowed_tables, "only data-free tables may be dropped");
+    assert_eq!(renames.len(), 1, "{renames:?}");
     assert!(
-        conflicts.is_empty(),
-        "columns shared across manifest entries with conflicting types: {conflicts:?}"
+        renames[0].contains("nanosiem.ocsf_logs TO nanosiem.ocsf_logs_legacy_v179")
+            && renames[0].contains("nano:skip-if-unknown-table"),
+        "{}",
+        renames[0]
     );
+
+    // Every overlay MV that reads ocsf_logs (or feeds it) must be in the drop list.
+    let mut overlay_views = BTreeSet::new();
+    for s in sql_statements(DDL) {
+        let Some(rest) = s.strip_prefix("CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.") else {
+            continue;
+        };
+        let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        let reads_store = s.split("FROM nanosiem.ocsf_logs").skip(1).any(|tail| {
+            !tail.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+        });
+        let writes_store = s.contains("TO nanosiem.ocsf_logs\n");
+        if reads_store || writes_store {
+            overlay_views.insert(name);
+        }
+    }
+    assert!(overlay_views.len() >= 20, "{overlay_views:?}");
+    let missing: Vec<_> = overlay_views.difference(&dropped_views).collect();
+    assert!(missing.is_empty(), "overlay MVs on ocsf_logs that 180 does not drop: {missing:?}");
 }

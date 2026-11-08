@@ -97,8 +97,8 @@ impl PrettyPrint for Command {
                 aggregations,
                 split_by,
                 limit,
-                cont,
                 useother,
+                cont,
             } => {
                 let aggs = aggregations
                     .iter()
@@ -164,9 +164,11 @@ impl PrettyPrint for Command {
                 output_new,
                 case_insensitive,
             } => {
-                let mut result = format!("lookup {} {}", table_name, key_field);
-                if key_field != event_field {
-                    result.push_str(&format!(" AS {}", event_field));
+                // `<event field> AS <lookup key>` (the parser's grammar).
+                let event = if event_field.is_empty() { key_field } else { event_field };
+                let mut result = format!("lookup {} {}", table_name, event);
+                if key_field != event {
+                    result.push_str(&format!(" AS {}", key_field));
                 }
                 if let Some(fields) = output_fields {
                     let fields = fields
@@ -406,11 +408,7 @@ impl PrettyPrint for Command {
                     result.push_str(&format!(" output={}", o));
                 }
                 if let Some(p) = path {
-                    // `path` accepts quoted strings specifically because JSON
-                    // paths can contain punctuation (`Content-Type`, `{}`).
-                    // Always preserve it as a literal so parse -> print ->
-                    // parse cannot reinterpret path characters as nPL syntax.
-                    result.push_str(&format!(" path={}", super::helpers::npl_quoted_literal(p)));
+                    result.push_str(&format!(" path={}", p));
                 }
                 result
             }
@@ -494,18 +492,13 @@ impl PrettyPrint for Command {
                 result
             }
             Command::Prevalence {
-                artifact_fields,
                 conditions,
                 time_window,
                 enrich,
             } => {
                 if *enrich {
                     // Enrichment mode
-                    let mut result = if artifact_fields.is_empty() {
-                        "prevalence enrich=true".to_string()
-                    } else {
-                        format!("prevalence {}", artifact_fields.join(", "))
-                    };
+                    let mut result = "prevalence enrich=true".to_string();
                     if let Some(tw) = time_window {
                         result.push_str(&format!(" window={}", tw.as_str()));
                     }
@@ -643,7 +636,6 @@ impl PrettyPrint for Command {
                 parts.join(" ")
             }
             Command::Tree {
-                preset,
                 parent_field,
                 child_field,
                 label_field,
@@ -651,16 +643,6 @@ impl PrettyPrint for Command {
                 prevalence_field,
                 root_filter,
             } => {
-                if let Some(preset) = preset {
-                    let mut parts = vec![match preset {
-                        TreePreset::Process => "tree process".to_string(),
-                        TreePreset::Web => "tree web".to_string(),
-                    }];
-                    if let Some(root) = root_filter {
-                        parts.push(format!("root=\"{}\"", root));
-                    }
-                    return parts.join(" ");
-                }
                 // Positional form: the parser's `tree <field>` syntax leaves `parent_field`
                 // empty and sets child==label. Emitting the named form with an empty
                 // `parent=` produces invalid nPL (`tree parent= child=…`) that fails the
@@ -689,13 +671,9 @@ impl PrettyPrint for Command {
                 }
                 parts.join(" ")
             }
-            Command::ResolveIdentity {
-                field,
-                field_is_default,
-                max_age,
-            } => {
+            Command::ResolveIdentity { field, max_age } => {
                 let mut parts = vec!["resolve_identity".to_string()];
-                if !field_is_default {
+                if field != "src_ip" {
                     parts.push(format!("field={}", field));
                 }
                 let default_max_age = std::time::Duration::from_secs(24 * 3600);

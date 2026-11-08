@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! One durable incident per monitor series. Callers own the transaction; hosted
-//! callers must supply the attested tenant and keep notification outbox writes
-//! in that same transaction.
+//! One durable incident per monitor series (NAN-3975). Callers own the
+//! transaction. The single-tenant ClickHouse product always passes
+//! `tenant: None` (no tenant predicate is emitted); the parameter is kept so the
+//! module stays a clean cherry-pick target from main.
 use chrono::{DateTime, Utc};
 use sqlx::{Postgres, QueryBuilder, Transaction};
 use uuid::Uuid;
@@ -12,10 +13,10 @@ fn scope<'a>(query: &mut QueryBuilder<'a, Postgres>, tenant: Option<Uuid>) {
     }
 }
 
-/// Collapse pre-existing hourly duplicates without deleting audit history.
-/// Keep the earliest start and the latest observed payload. Called even on
-/// no-data windows, so a restart safely repairs existing incidents.
-pub async fn reconcile(
+/// Serialize writers of one monitor's incidents for the rest of the
+/// transaction. Held only for the short apply transaction, never across the
+/// ClickHouse query (see the scheduler).
+pub async fn lock_monitor(
     tx: &mut Transaction<'_, Postgres>,
     tenant: Option<Uuid>,
     monitor: Uuid,
@@ -24,22 +25,228 @@ pub async fn reconcile(
         .bind(format!("{tenant:?}:{monitor}"))
         .execute(&mut **tx)
         .await?;
+    Ok(())
+}
+
+/// Workflow state of one open incident row, for keeper selection.
+#[derive(Debug, Clone)]
+pub struct IncidentWorkflow {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub acknowledged: bool,
+    pub assigned: bool,
+    /// Linked to a case or incident (`case_id`, `incident_id` or a
+    /// `case_alerts` row).
+    pub case_linked: bool,
+}
+
+/// The duplicate that survives consolidation: the one an analyst has worked
+/// (case-linked, then acknowledged/assigned), else the earliest. Closing the
+/// row an analyst acknowledged or attached to a case would resurface the
+/// incident in triage and strand the case's link.
+pub fn choose_keeper(rows: &[IncidentWorkflow]) -> Option<usize> {
+    let rank = |r: &IncidentWorkflow| {
+        if r.case_linked {
+            2
+        } else if r.acknowledged || r.assigned {
+            1
+        } else {
+            0
+        }
+    };
+    rows.iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            rank(a)
+                .cmp(&rank(b))
+                // Earliest wins a tie (max_by keeps the last maximum, so invert).
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id))
+        })
+        .map(|(i, _)| i)
+}
+
+/// Optional link schema: the open-core fresh snapshot has neither, the
+/// enterprise / legacy schema has `alerts.case_id`, `alerts.incident_id`
+/// and `case_alerts`.
+struct LinkSchema {
+    case_id: bool,
+    incident_id: bool,
+    case_alerts: bool,
+}
+
+async fn link_schema(tx: &mut Transaction<'_, Postgres>) -> Result<LinkSchema, sqlx::Error> {
+    let (case_id, incident_id, case_alerts): (bool, bool, bool) = sqlx::query_as(
+        "SELECT \
+           EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' \
+                   AND table_name = 'alerts' AND column_name = 'case_id'), \
+           EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' \
+                   AND table_name = 'alerts' AND column_name = 'incident_id'), \
+           to_regclass('public.case_alerts') IS NOT NULL",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(LinkSchema {
+        case_id,
+        incident_id,
+        case_alerts,
+    })
+}
+
+/// Collapse pre-existing hourly duplicates (left by the old 1h re-arm)
+/// without deleting audit history. The caller holds [`lock_monitor`].
+///
+/// Per duplicated series: keep the worked row ([`choose_keeper`]), merge the
+/// others' workflow into it (acknowledgement, assignee, case/incident link,
+/// the latest observed payload, the earliest start as `first_seen_at`),
+/// repoint their `case_alerts` links to it, then close them with
+/// `merged_into` recorded in their payload.
+pub async fn reconcile(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: Option<Uuid>,
+    monitor: Uuid,
+) -> Result<(), sqlx::Error> {
     let mut q = QueryBuilder::<Postgres>::new(
-        "WITH ranked AS (SELECT id, first_value(id) OVER (PARTITION BY source_id ORDER BY created_at,id) AS keeper, \
-         first_value(matched_events) OVER (PARTITION BY source_id ORDER BY COALESCE((matched_events->0->>'evaluated_at')::timestamptz, created_at) DESC,id DESC) AS latest \
-         FROM alerts WHERE kind='metric_monitor' AND status IN ('new','acknowledged') AND starts_with(source_id, ",
+        "SELECT source_id FROM alerts WHERE kind='metric_monitor' AND status IN ('new','acknowledged') \
+         AND starts_with(source_id, ",
     );
     q.push_bind(format!("{monitor}:")).push(")");
     scope(&mut q, tenant);
-    q.push(") UPDATE alerts a SET matched_events = CASE WHEN a.id=r.keeper THEN r.latest ELSE a.matched_events END, \
-        status=CASE WHEN a.id=r.keeper THEN a.status ELSE 'closed' END, \
-        closed_at=CASE WHEN a.id=r.keeper THEN a.closed_at ELSE now() END \
-        FROM ranked r WHERE a.id=r.id AND (a.id<>r.keeper OR a.matched_events IS DISTINCT FROM r.latest)");
-    // Repeat the tenant fence on the mutation, not just its input CTE.
-    if let Some(tenant) = tenant {
-        q.push(" AND a.tenant_id = ").push_bind(tenant);
+    q.push(" GROUP BY source_id HAVING count(*) > 1");
+    let duplicated: Vec<String> = q.build_query_scalar().fetch_all(&mut **tx).await?;
+    if duplicated.is_empty() {
+        return Ok(());
     }
-    q.build().execute(&mut **tx).await?;
+    let links = link_schema(tx).await?;
+    for source in duplicated {
+        consolidate(tx, tenant, &source, &links).await?;
+    }
+    Ok(())
+}
+
+async fn consolidate(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: Option<Uuid>,
+    source: &str,
+    links: &LinkSchema,
+) -> Result<(), sqlx::Error> {
+    let case_col = if links.case_id { "case_id IS NOT NULL" } else { "false" };
+    let incident_col = if links.incident_id { "incident_id IS NOT NULL" } else { "false" };
+    let link_col = if links.case_alerts {
+        "EXISTS (SELECT 1 FROM case_alerts ca WHERE ca.alert_id = alerts.id)"
+    } else {
+        "false"
+    };
+    let mut q = QueryBuilder::<Postgres>::new(format!(
+        "SELECT id, created_at, status = 'acknowledged', assigned_to IS NOT NULL, \
+         ({case_col} OR {incident_col} OR {link_col}) \
+         FROM alerts WHERE kind='metric_monitor' AND status IN ('new','acknowledged') AND source_id = "
+    ));
+    q.push_bind(source.to_owned());
+    scope(&mut q, tenant);
+    q.push(" ORDER BY created_at, id FOR UPDATE");
+    let rows: Vec<(Uuid, Option<DateTime<Utc>>, bool, bool, bool)> =
+        q.build_query_as().fetch_all(&mut **tx).await?;
+    let workflow: Vec<IncidentWorkflow> = rows
+        .iter()
+        .map(|(id, created_at, acknowledged, assigned, case_linked)| IncidentWorkflow {
+            id: *id,
+            created_at: created_at.unwrap_or(DateTime::<Utc>::MIN_UTC),
+            acknowledged: *acknowledged,
+            assigned: *assigned,
+            case_linked: *case_linked,
+        })
+        .collect();
+    let Some(keeper_idx) = choose_keeper(&workflow) else {
+        return Ok(());
+    };
+    if workflow.len() < 2 {
+        return Ok(());
+    }
+    let keeper = workflow[keeper_idx].id;
+    let all: Vec<Uuid> = workflow.iter().map(|w| w.id).collect();
+    let dups: Vec<Uuid> = all.iter().copied().filter(|id| *id != keeper).collect();
+
+    // Merge workflow + payload into the keeper. Every value comes from rows of
+    // this one series (`all`), most recent first.
+    let mut merge = String::from(
+        "UPDATE alerts k SET \
+           status = CASE WHEN EXISTS (SELECT 1 FROM alerts d WHERE d.id = ANY($2) AND d.status = 'acknowledged') \
+                    THEN 'acknowledged' ELSE k.status END, \
+           acknowledged_by = COALESCE(k.acknowledged_by, (SELECT d.acknowledged_by FROM alerts d \
+                    WHERE d.id = ANY($2) AND d.acknowledged_by IS NOT NULL \
+                    ORDER BY d.acknowledged_at DESC NULLS LAST LIMIT 1)), \
+           acknowledged_at = COALESCE(k.acknowledged_at, (SELECT d.acknowledged_at FROM alerts d \
+                    WHERE d.id = ANY($2) AND d.acknowledged_at IS NOT NULL \
+                    ORDER BY d.acknowledged_at DESC LIMIT 1)), \
+           assigned_to = COALESCE(k.assigned_to, (SELECT d.assigned_to FROM alerts d \
+                    WHERE d.id = ANY($2) AND d.assigned_to IS NOT NULL \
+                    ORDER BY d.created_at DESC LIMIT 1)), \
+           matched_events = jsonb_set( \
+             (SELECT d.matched_events FROM alerts d WHERE d.id = ANY($2) \
+              ORDER BY COALESCE((d.matched_events->0->>'evaluated_at')::timestamptz, d.created_at) DESC, d.id DESC \
+              LIMIT 1), \
+             '{0,first_seen_at}', \
+             to_jsonb((SELECT min(d.created_at) FROM alerts d WHERE d.id = ANY($2))))",
+    );
+    for (enabled, col) in [(links.case_id, "case_id"), (links.incident_id, "incident_id")] {
+        if enabled {
+            merge.push_str(&format!(
+                ", {col} = COALESCE(k.{col}, (SELECT d.{col} FROM alerts d WHERE d.id = ANY($2) \
+                 AND d.{col} IS NOT NULL ORDER BY d.created_at DESC LIMIT 1))"
+            ));
+        }
+    }
+    merge.push_str(" WHERE k.id = $1");
+    sqlx::query(&merge)
+        .bind(keeper)
+        .bind(&all)
+        .execute(&mut **tx)
+        .await?;
+
+    if links.case_alerts {
+        // Repoint the duplicates' case links to the keeper (one link per
+        // case; primary if any duplicate was primary), then drop theirs.
+        sqlx::query(
+            "INSERT INTO case_alerts (case_id, alert_id, added_at, added_by, is_primary) \
+             SELECT case_id, $1, min(added_at), (array_agg(added_by ORDER BY added_at))[1], bool_or(is_primary) \
+             FROM case_alerts WHERE alert_id = ANY($2) GROUP BY case_id \
+             ON CONFLICT (case_id, alert_id) DO UPDATE \
+               SET is_primary = case_alerts.is_primary OR EXCLUDED.is_primary",
+        )
+        .bind(keeper)
+        .bind(&dups)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query("DELETE FROM case_alerts WHERE alert_id = ANY($1)")
+            .bind(&dups)
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    // A closed duplicate no longer counts toward the keeper's case/incident.
+    for (enabled, col) in [(links.case_id, "case_id"), (links.incident_id, "incident_id")] {
+        if enabled {
+            sqlx::query(&format!(
+                "UPDATE alerts d SET {col} = NULL FROM alerts k \
+                 WHERE k.id = $1 AND d.id = ANY($2) AND d.{col} = k.{col}"
+            ))
+            .bind(keeper)
+            .bind(&dups)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+
+    sqlx::query(
+        "UPDATE alerts SET status = 'closed', closed_at = now(), \
+         matched_events = jsonb_set(matched_events, '{0,merged_into}', to_jsonb($1::text)) \
+         WHERE id = ANY($2)",
+    )
+    .bind(keeper.to_string())
+    .bind(&dups)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -103,30 +310,6 @@ pub async fn observe(
     Ok(Some(id))
 }
 
-/// Fix only the shipped node definitions; leave custom fleet-wide monitors alone.
-pub async fn repair_default_grouping(
-    tx: &mut Transaction<'_, Postgres>,
-    tenant: Option<Uuid>,
-) -> Result<(), sqlx::Error> {
-    let mut q = QueryBuilder::<Postgres>::new("UPDATE observability_metric_monitors SET group_by='instance', updated_at=now() \
-        WHERE COALESCE(group_by,'')='' AND ((metric_name='node_filesystem_avail_bytes' AND name IN \
-        ('Node disk low (<10 GiB free on /)', 'Node disk low (< 10 GiB free on /)')) OR \
-        (metric_name='node_pressure_cpu_waiting_seconds_total' AND name='Node CPU saturated (PSI waiting > 50%)'))");
-    scope(&mut q, tenant);
-    q.build().execute(&mut **tx).await?;
-    // Repair the exact shipped absolute threshold, including already-grouped
-    // definitions. Preserve custom names/thresholds and all tenant fences.
-    let mut q = QueryBuilder::<Postgres>::new("UPDATE observability_metric_monitors SET name='Node disk low (<10% free on /)', \
-        metric_name='node_filesystem_avail_ratio', agg='min', threshold=0.1, comparator='lt', group_by='instance', \
-        filters=COALESCE((SELECT jsonb_agg(f) FROM jsonb_array_elements(filters) f WHERE f->>'key'<>'mountpoint'), '[]'::jsonb) \
-          || '[{\"key\":\"mountpoint\",\"value\":\"/\"}]'::jsonb, updated_at=now() \
-        WHERE metric_name='node_filesystem_avail_bytes' AND threshold=10737418240 AND comparator='lt' \
-        AND name IN ('Node disk low (<10 GiB free on /)', 'Node disk low (< 10 GiB free on /)')");
-    scope(&mut q, tenant);
-    q.build().execute(&mut **tx).await?;
-    Ok(())
-}
-
 /// The old empty-instance incident represents a fleet aggregate, not any one
 /// node. Retire it once labelled samples arrive; never assign its history to an
 /// arbitrary node. Its original start and payload remain available for audit.
@@ -145,4 +328,181 @@ pub async fn retire_unlabelled(
         .push_bind(now);
     q.build().execute(&mut **tx).await?;
     Ok(())
+}
+
+/// Durable per-(monitor, series) evaluation cursor (migration 292). Records
+/// this evaluation — value, breach, no-data — and returns `true` only when it
+/// is newer than the last one recorded. A `false` result means a newer
+/// evaluation (possibly a healthy one that touched no incident) already
+/// applied, so the caller must not open, update or resolve anything with
+/// this stale result. The caller holds [`lock_monitor`].
+pub async fn advance_cursor(
+    tx: &mut Transaction<'_, Postgres>,
+    monitor: Uuid,
+    series_key: &str,
+    value: Option<f64>,
+    breaching: bool,
+    definition_updated_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    let applied: Option<i32> = sqlx::query_scalar(
+        "INSERT INTO observability_metric_monitor_state \
+           (monitor_id, series_key, value, breaching, no_data, definition_updated_at, evaluated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (monitor_id, series_key) DO UPDATE SET \
+           value = EXCLUDED.value, breaching = EXCLUDED.breaching, no_data = EXCLUDED.no_data, \
+           definition_updated_at = EXCLUDED.definition_updated_at, evaluated_at = EXCLUDED.evaluated_at \
+         WHERE observability_metric_monitor_state.evaluated_at < EXCLUDED.evaluated_at \
+         RETURNING 1",
+    )
+    .bind(monitor)
+    .bind(series_key)
+    .bind(value)
+    .bind(breaching)
+    .bind(value.is_none())
+    .bind(definition_updated_at)
+    .bind(now)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(applied.is_some())
+}
+
+/// Advance the monitor-wide evaluation generation to `now` (migration 295).
+/// Returns `false` when an evaluation at or after `now` was already applied —
+/// the caller must then write nothing. The caller holds [`lock_monitor`].
+pub async fn advance_generation(
+    tx: &mut Transaction<'_, Postgres>,
+    monitor: Uuid,
+    now: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    let applied: Option<i32> = sqlx::query_scalar(
+        "INSERT INTO observability_metric_monitor_generation (monitor_id, evaluated_at) \
+         VALUES ($1, $2) \
+         ON CONFLICT (monitor_id) DO UPDATE SET evaluated_at = EXCLUDED.evaluated_at \
+         WHERE observability_metric_monitor_generation.evaluated_at < EXCLUDED.evaluated_at \
+         RETURNING 1",
+    )
+    .bind(monitor)
+    .bind(now)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(applied.is_some())
+}
+
+/// A newly opened incident, to notify once the apply transaction committed.
+#[derive(Debug, Clone)]
+pub struct IncidentOpened {
+    pub id: Uuid,
+    /// Webhook entity: the series, or the monitor's service when ungrouped.
+    pub entity: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+/// Apply one monitor evaluation (`results` from the ClickHouse query, taken at
+/// `now`) in a SHORT transaction: serialize this monitor's writers, collapse
+/// legacy duplicates, retire the unlabelled fleet incident once labelled
+/// series report, then per series advance the durable cursor and — only when
+/// this result is the newest — open, update or resolve its incident. The
+/// ClickHouse query must already be finished: no PostgreSQL transaction or
+/// lock is held across it. Returns the incidents opened (notify after this
+/// returns; updates never re-notify).
+pub async fn apply_evaluation(
+    pool: &sqlx::PgPool,
+    monitor: &super::MetricMonitor,
+    results: Vec<(String, Option<f64>)>,
+    now: DateTime<Utc>,
+) -> Result<Vec<IncidentOpened>, sqlx::Error> {
+    use super::eval::{metric_breach, metric_monitor_source_id, metric_payload};
+    let mut tx = pool.begin().await?;
+    lock_monitor(&mut tx, None, monitor.id).await?;
+    // Monitor-wide generation fence (migration 295): every result set —
+    // including an empty one — must be newer than the last one applied, or it
+    // is dropped whole. Holding the monitor lock, every write below therefore
+    // belongs to the current generation: an older evaluation cannot open an
+    // incident for a series a newer (possibly empty) result never saw.
+    if !advance_generation(&mut tx, monitor.id, now).await? {
+        tx.commit().await?;
+        return Ok(Vec::new());
+    }
+    reconcile(&mut tx, None, monitor.id).await?;
+
+    // A grouped monitor that now reports labelled series retires the legacy
+    // empty-series incident (a fleet aggregate, not any one node).
+    if monitor.group_by.is_some()
+        && results
+            .iter()
+            .any(|(key, value)| !key.is_empty() && value.is_some())
+    {
+        retire_unlabelled(&mut tx, None, monitor.id, now).await?;
+    }
+    // NAN-3894: state is the current series inventory, not an unbounded
+    // history. Retire series this evaluation no longer returns once they are a
+    // day old: well past any in-flight evaluation, so the per-series cursor
+    // still fences slow evaluators.
+    let keys: Vec<&str> = results.iter().map(|(key, _)| key.as_str()).collect();
+    sqlx::query(
+        "DELETE FROM observability_metric_monitor_state \
+          WHERE monitor_id = $1 AND evaluated_at < $2 - INTERVAL '1 day' \
+            AND NOT (series_key = ANY($3))",
+    )
+    .bind(monitor.id)
+    .bind(now)
+    .bind(&keys)
+    .execute(&mut *tx)
+    .await?;
+    // An evaluation that returned no series at all is still an evaluation:
+    // record it as no-data on the empty key so the console shows "No data"
+    // rather than "Awaiting evaluation". No incident is touched.
+    if results.is_empty() {
+        advance_cursor(&mut tx, monitor.id, "", None, false, monitor.updated_at, now).await?;
+    }
+    let mut opened = Vec::new();
+    for (series_key, value) in results {
+        // A grouped monitor's unlabelled (empty-key) rows are not a series.
+        if monitor.group_by.is_some() && series_key.is_empty() {
+            continue;
+        }
+        let value = value.filter(|v| v.is_finite());
+        let breaching = metric_breach(monitor, value);
+        // Record the evaluation (no-data included); skip a result older than
+        // one already applied — e.g. a slow evaluator across a jobs leader
+        // failover must not reopen after a newer recovery.
+        if !advance_cursor(
+            &mut tx,
+            monitor.id,
+            &series_key,
+            value,
+            breaching,
+            monitor.updated_at,
+            now,
+        )
+        .await?
+        {
+            continue;
+        }
+        // O13: no-data can neither open nor resolve an incident.
+        let Some(value) = value else {
+            continue;
+        };
+        let source = metric_monitor_source_id(monitor.id, &series_key);
+        let payload = metric_payload(monitor, &series_key, value, now);
+        if let Some(id) = observe(&mut tx, None, &source, breaching, &payload, now).await? {
+            tracing::info!(
+                monitor = %monitor.name,
+                series = %series_key,
+                value,
+                threshold = monitor.threshold,
+                comparator = monitor.comparator.as_str(),
+                "Metric-monitor breach — incident opened"
+            );
+            let entity = if series_key.is_empty() {
+                monitor.service_name.clone()
+            } else {
+                Some(series_key)
+            };
+            opened.push(IncidentOpened { id, entity, payload });
+        }
+    }
+    tx.commit().await?;
+    Ok(opened)
 }

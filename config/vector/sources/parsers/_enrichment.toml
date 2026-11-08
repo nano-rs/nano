@@ -123,73 +123,126 @@ if deleted != 1 { deleted = 0 }
 
 '''
 
-[sinks.lake_ip_context]
-type = "http"
+# NAN-1728: `ip_enrichments` is a CLUSTER-WIDE REPLICATED table (shared ZK path,
+# no {shard} macro), so a write landing on ANY node via the load-balanced
+# clickhouse-ingest Service replicates to every node and is globally visible —
+# each node's local `ip_enrichment_dict` refresh then reads a complete table.
+# Deliberately write the plain LOCAL name (NOT a `_distributed` wrapper): routing
+# reference-table writes through a Distributed wrapper is unnecessary and would
+# break the per-node dict source chain.
+[sinks.clickhouse_ip_enrichments]
+type = "clickhouse"
 inputs = ["enrichment_normalize_custom"]
-uri = "${NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-http://127.0.0.1:9}/v1/ip-context/batch"
-method = "post"
-encoding.codec = "json"
-framing.method = "newline_delimited"
-acknowledgements.enabled = true
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "ip_enrichments"
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+compression = "gzip"
+date_time_best_effort = true
+skip_unknown_fields = true
 
-[sinks.lake_ip_context.buffer]
+[sinks.clickhouse_ip_enrichments.buffer]
 type = "disk"
-max_size = 1073741824
+max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
 when_full = "block"
 
-[sinks.lake_ip_context.batch]
-max_bytes = 33554432
-max_events = 100000
-timeout_secs = 2
-
-[sinks.lake_ip_context.request]
-concurrency = 1
-timeout_secs = 300
-retry_initial_backoff_secs = 1
-retry_max_duration_secs = 3600
-
-[sinks.lake_ip_context.request.headers]
-Authorization = "Bearer ${NANO_LAKE_ENRICHMENT_TOKEN:-lake-disabled-lake-disabled}"
-Content-Type = "application/x-ndjson"
-X-Nano-Tenant-ID = "${NANO_LAKE_TENANT_ID:-default}"
-
-[sinks.lake_ip_context.healthcheck]
+[sinks.clickhouse_ip_enrichments.acknowledgements]
 enabled = false
 
-[sinks.lake_identity_directory]
-type = "http"
+[sinks.clickhouse_ip_enrichments.batch]
+max_events = 1000
+timeout_secs = 5
+
+[sinks.clickhouse_ip_enrichments.request]
+concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+timeout_secs = 60
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 60
+
+# NAN-1728: `user_registry` is a CLUSTER-WIDE REPLICATED table (shared ZK path,
+# no {shard} macro) — a single-node write replicates to all nodes and is globally
+# visible, so each node's `user_registry_dict` refresh reads a complete table.
+# Deliberately write the plain LOCAL name, NOT a `_distributed` wrapper (see the
+# ip_enrichments sink note above).
+[sinks.clickhouse_user_registry]
+type = "clickhouse"
 inputs = ["enrichment_normalize_ad"]
-uri = "${NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-http://127.0.0.1:9}/v1/identity/users/batch"
-method = "post"
-encoding.codec = "json"
-framing.method = "newline_delimited"
-acknowledgements.enabled = true
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "user_registry"
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+compression = "gzip"
+date_time_best_effort = true
+skip_unknown_fields = true
 
-[sinks.lake_identity_directory.buffer]
+[sinks.clickhouse_user_registry.buffer]
 type = "disk"
-max_size = 1073741824
+max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
 when_full = "block"
 
-[sinks.lake_identity_directory.batch]
-max_bytes = 33554432
-max_events = 100000
-timeout_secs = 2
-
-[sinks.lake_identity_directory.request]
-concurrency = 1
-timeout_secs = 300
-retry_initial_backoff_secs = 1
-retry_max_duration_secs = 3600
-
-[sinks.lake_identity_directory.request.headers]
-Authorization = "Bearer ${NANO_LAKE_ENRICHMENT_TOKEN:-lake-disabled-lake-disabled}"
-Content-Type = "application/x-ndjson"
-X-Nano-Tenant-ID = "${NANO_LAKE_TENANT_ID:-default}"
-
-[sinks.lake_identity_directory.healthcheck]
+[sinks.clickhouse_user_registry.acknowledgements]
 enabled = false
+
+[sinks.clickhouse_user_registry.batch]
+max_events = 1000
+timeout_secs = 5
+
+[sinks.clickhouse_user_registry.request]
+concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+timeout_secs = 60
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 60
+
+[transforms.enrichment_dead_letter_record]
+type = "remap"
+inputs = ["enrichment_ingest_prepare.dropped", "enrichment_router._unmatched", "enrichment_router.ioc", "enrichment_router.asset", "enrichment_normalize_ad.dropped", "enrichment_normalize_custom.dropped"]
+source = '''
+raw_content = encode_json(.)
+source_info = encode_json({
+    "source": to_string(.source) ?? "",
+    "kind": to_string(.kind) ?? ""
+})
+. = {
+    "id": uuid_v7(),
+    "timestamp": now(),
+    "error_type": "enrichment_dead_letter",
+    "error_message": "push-enrichment record rejected by decoding, routing, or normalization",
+    "raw_content": raw_content,
+    "source_info": source_info
+}
+'''
 
 [sinks.enrichment_dead_letter]
-type = "blackhole"
-inputs = ["enrichment_normalize_ad.dropped", "enrichment_normalize_custom.dropped"]
-print_interval_secs = 0
+type = "clickhouse"
+inputs = ["enrichment_dead_letter_record"]
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "ingestion_errors"
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+compression = "gzip"
+date_time_best_effort = true
+skip_unknown_fields = true
+
+[sinks.enrichment_dead_letter.buffer]
+type = "disk"
+max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+when_full = "block"
+
+[sinks.enrichment_dead_letter.acknowledgements]
+enabled = false
+
+[sinks.enrichment_dead_letter.batch]
+max_events = 1000
+timeout_secs = 5
+
+[sinks.enrichment_dead_letter.request]
+concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+timeout_secs = 60
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 60

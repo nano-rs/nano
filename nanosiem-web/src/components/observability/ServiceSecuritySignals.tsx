@@ -7,15 +7,14 @@
 //
 // Data is REAL: api.observability.getServiceSecuritySignals(service, { start,
 // end }) → { host_count, signal_total, signal_count, signals: [{ ts, rule_name,
-// severity, matched_entity, matched_entity_type }] } (NAN-2361 — OCSF
-// Detection Findings from the lake). signal_total is the true range count;
+// src_host, src_ip, severity }] }. signal_total is the true range count;
 // signal_count is the bounded sample size (signals.length). The strip is
 // best-effort decoration — it never blocks
 // or errors the parent detail, and the common case is zero (rendered as a clean
 // "no detections" line, NOT a heavy empty panel).
 //
 // Each signal links into the SIEM search scoped to its matched entity so an
-// analyst lands on the underlying logs (mirrors InfraTab's /search#q= pattern).
+// analyst lands on the underlying logs (mirrors InfraTab's /search?q= pattern).
 
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -26,8 +25,9 @@ import { cn } from '@/lib/utils';
 import { parseUTCTimestamp } from '@/lib/date-utils';
 import type { ServiceSecuritySignalsResponse, ServiceSecuritySignal } from '@/lib/api/observability';
 import type { TimeRange } from '@/lib/api/types';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import { buildMultiFieldFilter, type SchemaProfileId, type SemanticField } from '@/lib/schema-fields';
 import { matchSearchUrl } from '@/components/matches/search-window';
-import { nplQuotedBody } from '@/lib/npl-quote';
 
 // How many of the sampled signals to render inline. The backend already caps
 // the sample; this keeps the strip from growing tall on a noisy host.
@@ -52,22 +52,30 @@ function sevTone(sev: string | null): SevTone {
   return (sev != null && SEV_TONE[sev.toLowerCase()]) || SEV_FALLBACK;
 }
 
-/** Build a SIEM search query scoped to the signal's matched entity.
- *
- * OCSF paths ONLY (NAN-2361): the lake validates every field name and an
- * unknown field invalidates the ENTIRE query (all-or-nothing), so retired UDM
- * names (src_ip/dest_ip/src_host/dest_host/hostname) would 400 every
- * drill-down — OR'd OCSF halves never rescue it.
+/** Build a SIEM search query scoped to the signal's matched entity, over the
+ *  active profile's columns (NAN-4903: profile-aware field map). */
+/**
+ * The lookback a pivot assumes when the firing rule's own lookback cannot be
+ * resolved (no `detections:view`, or the rule is gone): the longest lookback a
+ * rule may have (`MAX_LOOKBACK_MINUTES`, 7 days, in
+ * nanosiem-core/src/models/detection_rule.rs), so the contributing events are
+ * never cut out of the window; the analyst narrows from there. Never Search's
+ * ±1 minute default (NAN-4927).
  */
-export function searchHref(s: ServiceSecuritySignal, lookbackMinutes?: number): string {
+export const UNRESOLVED_RULE_LOOKBACK_MINUTES = 7 * 24 * 60;
+
+export function searchHref(s: ServiceSecuritySignal, profile: SchemaProfileId, lookbackMinutes?: number): string {
+  const orOver = (keys: readonly SemanticField[], extra: readonly string[], value: string) =>
+    buildMultiFieldFilter(profile, keys, value, extra);
   let q: string | null = null;
-  if (s.matched_entity && s.matched_entity_type === 'ip') {
-    const ip = nplQuotedBody(s.matched_entity);
-    q = `src_endpoint.ip="${ip}" OR dst_endpoint.ip="${ip}"`;
-  } else if (s.matched_entity) {
-    const h = nplQuotedBody(s.matched_entity);
-    q = `device.hostname="${h}"`;
+  if (s.src_ip) {
+    q = orOver(['srcIp', 'destIp'], [], s.src_ip);
+  } else if (s.src_host) {
+    // `hostname` is a flat alias some UDM sources emit.
+    q = orOver(['srcHost', 'destHost', 'host'], profile === 'udm' ? ['hostname'] : [], s.src_host);
   }
+  // #7030: carry the fired detection's window (signal time padded by the
+  // rule's lookback) into Search instead of Search's default preset.
   return q ? matchSearchUrl(q, { events: [], detectedAt: parseUTCTimestamp(s.ts) }, lookbackMinutes) : '/alerts';
 }
 
@@ -91,6 +99,7 @@ export interface ServiceSecuritySignalsProps {
 }
 
 export function ServiceSecuritySignals({ service, apiTimeRange }: ServiceSecuritySignalsProps) {
+  const { profile, ready, guard } = useSchemaFieldMap();
   const [data, setData] = useState<ServiceSecuritySignalsResponse | null>(null);
   const [errored, setErrored] = useState(false);
   const { data: rules, loading: rulesLoading, error: rulesError } = useDetections({ includeArchived: true }, { skip: !data?.signal_total });
@@ -159,20 +168,25 @@ export function ServiceSecuritySignals({ service, apiTimeRange }: ServiceSecurit
       {shown.map((s, i) => (
         <Link
           key={`${s.ts}-${s.rule_name}-${i}`}
-          to={searchHref(s, rules?.find((rule) => rule.name === s.rule_name)?.lookback_minutes)}
-          aria-disabled={rulesLoading || (!rules && !rulesError)}
-          onClick={(event) => {
-            if (rulesLoading || (!rules && !rulesError)) event.preventDefault();
+          // NAN-4903: no pivot until the tenant's schema profile is known.
+          to={ready
+            ? searchHref(s, profile, rules?.find((rule) => rule.name === s.rule_name)?.lookback_minutes ?? UNRESOLVED_RULE_LOOKBACK_MINUTES)
+            : '#'}
+          onClick={(ev) => {
+            if (!ready) { ev.preventDefault(); guard(() => {})(); return; }
+            // The pivot window needs the rule's lookback; wait for the rules.
+            if (rulesLoading || (!rules && !rulesError)) ev.preventDefault();
           }}
+          aria-disabled={!ready || rulesLoading || (!rules && !rulesError)}
           className="group flex items-center gap-2.5 px-3.5 py-2 border-b border-danger/10 last:border-b-0 hover:bg-danger/10"
         >
           <span className={cn('w-1.5 h-1.5 rounded-full shrink-0', sevTone(s.severity).dot)} />
           <span className="font-mono text-[11.5px] text-fg truncate flex-1" title={s.rule_name}>
             {s.rule_name}
           </span>
-          {s.matched_entity && (
+          {(s.src_host || s.src_ip) && (
             <span className="font-mono text-[10.5px] text-fg-3 truncate max-w-[160px] shrink-0">
-              {s.matched_entity}
+              {s.src_host || s.src_ip}
             </span>
           )}
           {s.severity && (

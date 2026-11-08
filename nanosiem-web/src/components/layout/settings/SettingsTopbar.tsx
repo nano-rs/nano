@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
- * Settings topbar — breadcrumb + Recent Changes button + theme/pivt/bell.
+ * Settings topbar — breadcrumb + Recent Changes button + theme/PIVT/bell.
  * Mirrors `design-ref/shadcn/settings-shell.jsx` `SettingsTopbar`.
  */
 
@@ -43,7 +43,7 @@ export function SettingsTopbar({ onOpenAudit, auditOpen, pivt }: SettingsTopbarP
   const parent = parentId ? SECTION_BY_ID[parentId] : null;
   const groupLabel = section ? GROUP_LABEL[section.group] : null;
 
-  // Pull a count for the "Recent changes" button: the last 50 changes, without routine key-auth rows.
+  // Pull a count for the "Recent changes" button. Cheap query — last 24h, 50 entries.
   const { data: auditData } = useRecentAuditChanges({ limit: 50 });
   const auditCount = auditData?.logs?.length ?? 0;
 

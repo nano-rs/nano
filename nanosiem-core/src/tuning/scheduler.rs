@@ -23,11 +23,11 @@ use crate::extensions::TuningProposalGenerator;
 use crate::settings::DeveloperSettingsRepository;
 
 /// NAN-3219: a task runs only when the developer scheduler switch is on AND
-/// the tenant-wide AI tuning mode admits it (`off`: nothing, metrics
+/// the deployment-wide AI tuning mode admits it (`off`: nothing, metrics
 /// included; `manual`: metrics and baselines only, no automatic proposals or
 /// notifications). Without a settings pool both default to running. An
-/// unreadable mode skips the tick: a tenant that turned tuning off must not
-/// get automatic work because a read failed.
+/// unreadable mode skips the tick: a deployment that turned tuning off must
+/// not get automatic work because a read failed.
 async fn task_allowed(settings: Option<&DeveloperSettingsRepository>, task: TuningTask) -> bool {
     let Some(repo) = settings else { return true };
     match repo.is_tuning_scheduler_enabled().await {
@@ -43,7 +43,7 @@ async fn task_allowed(settings: Option<&DeveloperSettingsRepository>, task: Tuni
     match repo.ai_tuning_mode().await {
         Ok(mode) if task.allowed(mode) => true,
         Ok(mode) => {
-            debug!(?task, %mode, "AI tuning mode excludes this task, skipping");
+            info!(?task, %mode, "AI tuning mode excludes this task, skipping");
             false
         }
         Err(e) => {
@@ -171,20 +171,12 @@ impl TuningScheduler {
         // Start baseline update task
         handles.push(self.start_baseline_update_task());
 
-        // Threshold breaches and silent-rule diagnostics feed AI tuning, and
-        // their tables (`detection_threshold_breaches`, tuning_*) exist only
-        // under the enterprise overlay. In the open edition the 15-minute
-        // breach check failed on every tick with `relation does not exist`
-        // (NAN-3463), so neither task starts there. Metrics and baselines
-        // are open tables and keep running.
-        if cfg!(feature = "enterprise") {
-            // Start threshold detection task
-            handles.push(self.start_threshold_detection_task());
+        // Start threshold detection task
+        handles.push(self.start_threshold_detection_task());
 
-            // Start silent-rule diagnostic task (daily — separate from the 15-min
-            // threshold tick because each silent rule can cost an AI call)
-            handles.push(self.start_silent_rule_task());
-        }
+        // Start silent-rule diagnostic task (daily — separate from the 15-min
+        // threshold tick because each silent rule can cost an AI call)
+        handles.push(self.start_silent_rule_task());
 
         // Start notification batching task
         handles.push(self.start_notification_batch_task());
@@ -215,7 +207,7 @@ impl TuningScheduler {
             loop {
                 check_interval.tick().await;
 
-                // Developer scheduler switch AND the tenant-wide AI tuning mode (NAN-3219).
+                // Developer scheduler switch AND the deployment-wide AI tuning mode (NAN-3219).
                 if !task_allowed(developer_settings.as_deref(), TuningTask::Metrics).await {
                     continue;
                 }
@@ -265,7 +257,7 @@ impl TuningScheduler {
             loop {
                 check_interval.tick().await;
 
-                // Developer scheduler switch AND the tenant-wide AI tuning mode (NAN-3219).
+                // Developer scheduler switch AND the deployment-wide AI tuning mode (NAN-3219).
                 if !task_allowed(developer_settings.as_deref(), TuningTask::Baselines).await {
                     continue;
                 }
@@ -328,7 +320,7 @@ impl TuningScheduler {
             loop {
                 check_interval.tick().await;
 
-                // Developer scheduler switch AND the tenant-wide AI tuning mode (NAN-3219).
+                // Developer scheduler switch AND the deployment-wide AI tuning mode (NAN-3219).
                 if !task_allowed(developer_settings.as_deref(), TuningTask::Breaches).await {
                     continue;
                 }
@@ -424,13 +416,15 @@ impl TuningScheduler {
             loop {
                 check_interval.tick().await;
 
-                // Developer scheduler switch AND the tenant-wide AI tuning mode (NAN-3219).
+                // Developer scheduler switch AND the deployment-wide AI tuning mode (NAN-3219).
                 if !task_allowed(developer_settings.as_deref(), TuningTask::SilentRules).await {
                     continue;
                 }
 
                 let Some(orch) = &orchestrator else {
-                    debug!("No orchestrator (AI not configured); skipping silent-rule diagnostics");
+                    debug!(
+                        "No orchestrator (AI not configured); skipping silent-rule diagnostics"
+                    );
                     continue;
                 };
 
@@ -469,7 +463,7 @@ impl TuningScheduler {
             loop {
                 check_interval.tick().await;
 
-                // Developer scheduler switch AND the tenant-wide AI tuning mode (NAN-3219).
+                // Developer scheduler switch AND the deployment-wide AI tuning mode (NAN-3219).
                 if !task_allowed(developer_settings.as_deref(), TuningTask::Notifications).await {
                     continue;
                 }

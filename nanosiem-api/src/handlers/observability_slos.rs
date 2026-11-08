@@ -3,12 +3,13 @@
 //! SLO (service-level objective) CRUD for the Observability console (NAN-1536).
 //!
 //! SLO *definitions* are PostgreSQL-backed (`observability_slos`, migration
-//! 209). Their live *attainment* — `current` SLI, `budget_remaining_pct`,
-//! `burn_rate`, `status` — is NOT stored; it is computed on read from
-//! `otel_spans` over the SLO's rolling `window_days` window via the search
-//! service's `observability_slo_compute` glue and merged onto the definition
-//! here. Keeping only the definition persisted means the number is always
-//! consistent with the spans and there is no recompute job.
+//! 209). Their *attainment* — `current` SLI, `budget_remaining_pct`,
+//! `burn_rate`, `status` — comes from the SLO scheduler's persisted result
+//! (`observability_slo_evaluations`, migration 295, NAN-3894) while it is
+//! fresh for the current definition, else it is computed live from
+//! `otel_spans` over the SLO's rolling `window_days` window. Either way a
+//! window the target service's telemetry does not fully cover (first seen
+//! inside it, or a gap over 6 h) reports `partial`.
 //!
 //! The list endpoint computes live attainment from `otel_spans`, so it requires
 //! `search:view` AND `search:execute` (NAN-2083): a view-only principal that is
@@ -28,6 +29,9 @@ use crate::error::{ApiError, ErrorResponse};
 use crate::middleware::{AuthContext, ensure_permission};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
+use nanosiem_core::observability::evaluation_state::{
+    SloEvaluationRecord as EvaluationRecord, list_fresh_slo_evaluations,
+};
 use nanosiem_core::observability::{SloDefinition, SloRepository, SloRepositoryError, SloSliKind};
 use nanosiem_core::query::TimeRange;
 use nanosiem_core::typeid::TypeIdParam;
@@ -41,27 +45,36 @@ const SERVICE_MAX_LEN: usize = 200;
 // ~100% while the window still claims to cover them. We enforce ≤ 30 here in the
 // handler rather than in the shipped PG migration 209 CHECK (which still permits
 // ≤ 90 and must not be modified).
-const WINDOW_DAYS_MAX: i32 = nanosiem_core::observability::slo_repository::SLO_WINDOW_DAYS_MAX;
+const WINDOW_DAYS_MAX: i32 = 30;
 
-/// An SLO with its live attainment merged in. Flattens the stored
+/// An SLO with its attainment merged in. Flattens the stored
 /// [`SloDefinition`] and adds the computed fields.
+///
+/// Attainment comes from the SLO scheduler's persisted result while it is
+/// fresh for the current definition (NAN-3894), else from a live compute.
+/// `current` / `budget_remaining_pct` / `burn_rate` are `null` when the
+/// status is `partial` (the target service's telemetry does not cover the
+/// whole window, so there is no honest number).
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct Slo {
     #[serde(flatten)]
     #[schema(value_type = SloDefinition)]
     pub definition: SloDefinition,
     /// Current SLI attainment in `0..1` over the window.
-    pub current: f64,
+    pub current: Option<f64>,
     /// Error budget remaining as a percentage of the allowed budget
     /// (`100` = full budget; `0` = budget exhausted; can go negative when
     /// breaching). `100` when the SLO is perfectly met.
-    pub budget_remaining_pct: f64,
+    pub budget_remaining_pct: Option<f64>,
     /// Burn rate: how fast the budget is being consumed relative to the
     /// window. `1.0` = on track to exactly exhaust the budget at window end;
     /// `>1` = burning too fast. `0` when there is budget to spare / no errors.
-    pub burn_rate: f64,
-    /// Rollup status: `ok` | `at_risk` | `breaching` | `no_data`.
-    pub status: &'static str,
+    pub burn_rate: Option<f64>,
+    /// Rollup status: `ok` | `at_risk` | `breaching` | `no_data` | `partial`.
+    pub status: String,
+    /// When the scheduler last evaluated this SLO; `null` when the figures
+    /// were computed live for this request (no fresh scheduled result).
+    pub evaluated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Response for the SLO list.
@@ -146,17 +159,18 @@ fn map_repo_err(e: SloRepositoryError) -> ApiError {
     }
 }
 
-/// Compute the live attainment for one SLO definition from `otel_spans` and
-/// merge it into a [`Slo`]. `current` is the SLI fraction over the window; the
-/// budget / burn / status math is layered on here.
+/// Compute the live attainment for one SLO definition from `otel_spans` with
+/// the full-window coverage probe (NAN-3894) and merge it into a [`Slo`].
+/// The budget / burn / status math is shared with the scheduler
+/// ([`nanosiem_core::observability::eval::slo_evaluation`]).
 async fn enrich(state: &AppState, def: SloDefinition) -> Result<Slo, ApiError> {
     let now = chrono::Utc::now();
     let begin = now - chrono::Duration::days(def.window_days as i64);
     let time_range = TimeRange::new(begin, now);
 
-    let (current, _total, no_data) = state
+    let (current, _total, no_data, complete) = state
         .search_service
-        .observability_slo_compute(
+        .observability_slo_compute_with_coverage(
             &def.service,
             def.sli_kind.to_query_kind(),
             def.latency_threshold_ms,
@@ -168,18 +182,35 @@ async fn enrich(state: &AppState, def: SloDefinition) -> Result<Slo, ApiError> {
             ApiError::InternalError("Failed to compute SLO attainment".to_string())
         })?;
 
-    let evaluation = nanosiem_core::observability::eval::slo_evaluation(def.target, current, no_data, false);
-    let budget_remaining_pct = evaluation.budget_remaining_pct;
-    let burn_rate = evaluation.burn_rate;
-    let status = evaluation.status;
-
+    // O17 (NAN-1721): a zero-traffic window computes `current = 1.0` (no spans →
+    // nothing failed); `no_data` keeps it from reading as attained. NAN-3894:
+    // an uncovered window is `partial` and carries no figures at all.
+    let evaluation =
+        nanosiem_core::observability::eval::slo_evaluation(def.target, current, no_data, !complete);
+    let partial = evaluation.status == "partial";
     Ok(Slo {
         definition: def,
-        current,
-        budget_remaining_pct,
-        burn_rate,
-        status,
+        current: (!partial).then_some(current),
+        budget_remaining_pct: (!partial).then_some(evaluation.budget_remaining_pct),
+        burn_rate: (!partial).then_some(evaluation.burn_rate),
+        status: evaluation.status.to_string(),
+        evaluated_at: None,
     })
+}
+
+/// Merge a fresh persisted scheduler result. `no_data` keeps the historical
+/// read-path figures (`current = 1`, full budget, zero burn) so existing
+/// consumers see the same shape whether the number is live or persisted.
+fn from_persisted(def: SloDefinition, record: EvaluationRecord) -> Slo {
+    let no_data = record.status == "no_data";
+    Slo {
+        definition: def,
+        current: record.current.or(no_data.then_some(1.0)),
+        budget_remaining_pct: record.budget_remaining_pct.or(no_data.then_some(100.0)),
+        burn_rate: record.burn_fast.or(no_data.then_some(0.0)),
+        status: record.status,
+        evaluated_at: Some(record.evaluated_at),
+    }
 }
 
 /// List all SLOs with live attainment.
@@ -205,10 +236,24 @@ pub async fn list_slos(
 
     let repo = SloRepository::new(state.pool.clone());
     let defs = repo.list().await.map_err(map_repo_err)?;
+    // NAN-3894: serve the scheduler's fresh result for the current definition;
+    // compute live only for SLOs without one (scheduler not running yet, just
+    // created or edited). A state read failure degrades to live compute.
+    let mut persisted: std::collections::HashMap<uuid::Uuid, EvaluationRecord> =
+        match list_fresh_slo_evaluations(&state.pool).await {
+            Ok(rows) => rows.into_iter().map(|r| (r.slo_id, r)).collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "SLO evaluation state unavailable; computing live");
+                Default::default()
+            }
+        };
 
     let mut slos = Vec::with_capacity(defs.len());
     for def in defs {
-        slos.push(enrich(&state, def).await?);
+        match persisted.remove(&def.id) {
+            Some(record) => slos.push(from_persisted(def, record)),
+            None => slos.push(enrich(&state, def).await?),
+        }
     }
 
     Ok(Json(ListSlosResponse { slos }))

@@ -351,4 +351,5 @@ mod tests {
         assert!(ScoreCalculator::validate_weight(-0.1).is_err());
         assert!(ScoreCalculator::validate_weight(1.1).is_err());
     }
+
 }

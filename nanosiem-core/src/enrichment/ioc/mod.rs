@@ -19,17 +19,118 @@ mod types;
 pub use types::IocLookupResult;
 
 use crate::db::dual_pool::{on_cluster_clause, TableNames};
-use crate::lake_http::LakeRequestBuilderExt;
 use clickhouse::Row;
-use serde::{Deserialize as SerdeDeserialize, Serialize};
-use std::path::PathBuf;
-use std::time::Duration;
+use serde::Deserialize as SerdeDeserialize;
 use thiserror::Error;
 use tracing::instrument;
 
+/// Reserved namespace stem of code-free IOC list rows (enterprise
+/// `ioc_lists`). Each publication writes under its own storage namespace
+/// `ioc_list/<version>` ([`ioc_list_namespace`]); custom enrichments may not
+/// use any namespace starting with `ioc_list`.
+pub const IOC_LIST_NAMESPACE: &str = "ioc_list";
+
+/// Bare name of the IOC list publication commit-marker table (migration 182).
+pub const IOC_LIST_COMMITS_TABLE: &str = "ioc_list_commits";
+
+/// Storage namespace of one IOC list publication. Putting the version in the
+/// ReplacingMergeTree key means rows of different publications never collapse
+/// into each other: an uncommitted (failed) publication can never physically
+/// replace the committed one on insert or merge.
+/// Canonical form of a URL indicator for ingest-time IOC matching (NAN-4982).
+///
+/// Trimmed of spaces; when it has a `scheme://`, only the scheme and host are
+/// ASCII-lowercased. Userinfo, port, path, query and fragment keep their case
+/// and bytes (they can be case-sensitive, so `User@host/Dropper/A` and
+/// `user@host/dropper/a` are distinct indicators). Without `://` the trimmed
+/// value is returned unchanged.
+///
+/// Byte-for-byte twin of `url_canon_sql` in scripts/gen-ocsf-ddl.py, which the
+/// OCSF ingest view applies to event URLs and migration 188's dictionary
+/// sources apply to `url` keys: a URL key only matches when both sides agree.
+pub fn canonical_url(value: &str) -> String {
+    let t = value.trim_matches(' ');
+    let Some(at) = t.find("://") else {
+        return t.to_string();
+    };
+    let (scheme, rest) = (&t[..at + 3], &t[at + 3..]);
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let userinfo_end = authority.rfind('@').map_or(0, |i| i + 1);
+    let host_port = &authority[userinfo_end..];
+    let host_end = if host_port.starts_with('[') {
+        host_port
+            .find(']')
+            .map_or_else(
+                || host_port.find(':').unwrap_or(host_port.len()),
+                |i| i + 1,
+            )
+    } else {
+        host_port.find(':').unwrap_or(host_port.len())
+    };
+    format!(
+        "{}{}{}{}{}",
+        scheme.to_ascii_lowercase(),
+        &authority[..userinfo_end],
+        host_port[..host_end].to_ascii_lowercase(),
+        &host_port[host_end..],
+        &rest[end..]
+    )
+}
+
+pub fn ioc_list_namespace(version: u32) -> String {
+    format!("{IOC_LIST_NAMESPACE}/{version}")
+}
+
+/// SQL predicate: the row is NOT an IOC list row.
+pub fn not_ioc_list_row() -> String {
+    format!("NOT startsWith(namespace, '{IOC_LIST_NAMESPACE}/')")
+}
+
+/// Row-level visibility predicate for `custom_enrichment_results`
+/// (NAN-4902 lane G, migration 182): an IOC list row exists for readers only
+/// if it belongs to its list's ACTIVE publication — the highest committed
+/// version per list in `ioc_list_commits`. A publication that failed
+/// part-way never becomes visible; a superseded one disappears the moment the
+/// next commits (a removed indicator needs no tombstone); a delete commits an
+/// empty withdrawal. Every reader applies it BEFORE the per-key collapse.
+/// `GLOBAL IN` keeps it valid when the outer read is a `_distributed`
+/// wrapper. `commits_table` is the fully-qualified (cluster-routed) table.
+///
+/// NAN-4948: the same predicate also hides platform feed bundle rows
+/// (`platform_feed/<feed>/<sequence>` namespaces) that are not their feed's
+/// active, committed generation (migration 184), so every reader that already
+/// applies IOC-list visibility gets platform-feed visibility with no change.
+/// The platform commits table is derived from `commits_table` (same database,
+/// same `_distributed` routing). NAN-4959: legacy marketplace IOC rows (a
+/// retired Deno ThreatFox / Tor install, an air-gap IOC import) stop being
+/// visible once the bundle has committed a ThreatFox / Tor generation
+/// (`ioc_visible_predicate`, CH migration 187).
+pub fn committed_rows_predicate(commits_table: &str) -> String {
+    let platform_commits = commits_table.replace(
+        IOC_LIST_COMMITS_TABLE,
+        crate::platform_enrichment::state::PLATFORM_FEED_COMMITS_TABLE,
+    );
+    format!(
+        "(({} OR version GLOBAL IN (SELECT max(version) FROM {commits_table} GROUP BY list_id)) AND {})",
+        not_ioc_list_row(),
+        crate::platform_enrichment::state::ioc_visible_predicate(&platform_commits)
+    )
+}
+
+/// The commits table matching a fully-qualified `custom_enrichment_results`
+/// reference (local or `_distributed`), for callers that only hold the table
+/// string.
+pub fn commits_table_for(results_table: &str) -> String {
+    results_table.replace("custom_enrichment_results", IOC_LIST_COMMITS_TABLE)
+}
+
 /// Row shape for the CH `custom_enrichment_results` aggregation. The
 /// `clickhouse` crate requires a `Row`-deriving named struct for column
-/// mapping — tuples don't implement `Row`.
+/// mapping — tuples don't implement `Row`. Its RowBinary schema validation is
+/// strict on integer width: `toUnixTimestamp` yields UInt32, so the SQL casts
+/// to Int64 for the `i64` fields (without the cast every lookup failed with a
+/// SchemaMismatch, found by the NAN-4902 lane G real-ClickHouse suite).
 #[derive(Debug, Row, SerdeDeserialize)]
 struct CustomEnrichmentIocRow {
     enrichment_name: String,
@@ -47,865 +148,6 @@ struct CustomEnrichmentIocRow {
 pub enum IocLookupError {
     #[error("ClickHouse error: {0}")]
     Clickhouse(#[from] clickhouse::error::Error),
-    #[error("Lake IOC lookup error: {0}")]
-    Lake(String),
-}
-
-/// Typed client for the tenant-pinned immutable IOC snapshot assigned to a
-/// lake worker. Storage coordinates and credentials never appear in product
-/// requests; the caller supplies only an indicator and the expected snapshot
-/// identity from process configuration.
-#[derive(Clone)]
-pub struct LakeIocClient {
-    http: reqwest::Client,
-    base_url: String,
-    tenant_id: String,
-    bearer_token: String,
-    snapshot_id: String,
-}
-
-impl LakeIocClient {
-    /// The cell route is resolved from the authenticated tenant.
-    pub fn from_lake_cell_route(route: &crate::search::lake_cell::LakeCellRoute) -> Result<Self, IocLookupError> {
-        route.validate_query_base().map_err(IocLookupError::Lake)?;
-        let bearer_token = route.read_router_token().map_err(IocLookupError::Lake)?;
-        let tenant_id = route.tenant_id.to_string();
-        let http = crate::search::lake_cell::lake_cell_http_client_builder(Duration::from_secs(130))
-            .build()
-            .map_err(|error| IocLookupError::Lake(format!("build cell IOC client: {error}")))?;
-        Ok(Self { http, base_url: route.query_base_url.clone(), tenant_id: tenant_id.clone(),
-            bearer_token, snapshot_id: default_ioc_snapshot_id(&tenant_id) })
-    }
-    pub fn from_env() -> Result<Option<Self>, IocLookupError> {
-        // NAN-3492: a trusted-local install reads IOC through its dedicated
-        // lean cell's query[T] (the tenant-bound current pointer).
-        if let Some(route) = crate::search::lake_cell::dedicated_route_from_env()
-            .map_err(IocLookupError::Lake)?
-        {
-            return Self::from_lake_cell_route(&route).map(Some);
-        }
-        let base_url = required_env("NANO_LAKE_QUERY_URL")?;
-        let tenant_id = required_env("NANO_LAKE_TENANT_ID")?;
-        validate_identity("NANO_LAKE_TENANT_ID", &tenant_id)?;
-        // The enrichment coordinator intentionally keeps one stable logical
-        // pointer per tenant while the immutable snapshot version changes
-        // inside the atomically activated worker generation. Derive that
-        // pointer from the already-required tenant assignment so a lake
-        // install cannot accidentally enable writes while leaving every IOC
-        // read path disabled. Historical/fault tests may still override it.
-        let snapshot_id = optional_env("NANO_LAKE_IOC_SNAPSHOT_ID")
-            .unwrap_or_else(|| default_ioc_snapshot_id(&tenant_id));
-        validate_identity("NANO_LAKE_IOC_SNAPSHOT_ID", &snapshot_id)?;
-        let token_file = PathBuf::from(required_env("NANO_LAKE_QUERY_TOKEN_FILE")?);
-        let bearer_token = std::fs::read_to_string(&token_file)
-            .map_err(|error| {
-                IocLookupError::Lake(format!(
-                    "failed to read NANO_LAKE_QUERY_TOKEN_FILE {}: {error}",
-                    token_file.display()
-                ))
-            })?
-            .trim()
-            .to_string();
-        if bearer_token.is_empty() {
-            return Err(IocLookupError::Lake(
-                "NANO_LAKE_QUERY_TOKEN_FILE contains no bearer token".to_string(),
-            ));
-        }
-        let timeout_secs = optional_env("NANO_LAKE_IOC_TIMEOUT_SECS")
-            .map(|value| {
-                value.parse::<u64>().map_err(|_| {
-                    IocLookupError::Lake(
-                        "NANO_LAKE_IOC_TIMEOUT_SECS must be an integer".to_string(),
-                    )
-                })
-            })
-            .transpose()?
-            .unwrap_or(10);
-        if !(1..=300).contains(&timeout_secs) {
-            return Err(IocLookupError::Lake(
-                "NANO_LAKE_IOC_TIMEOUT_SECS must be between 1 and 300".to_string(),
-            ));
-        }
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|error| IocLookupError::Lake(format!("build IOC client: {error}")))?;
-        Ok(Some(Self {
-            http,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            tenant_id,
-            bearer_token,
-            snapshot_id,
-        }))
-    }
-
-    /// NAN-2361 wave 6: build the IOC reader for ONE hosted-shared tenant
-    /// from its verified worker assignment — the
-    /// `RiskLakeClient::from_shared_assignment` shape. The tenant id is the
-    /// security tenant UUID the assignment was admitted for (never
-    /// `NANO_LAKE_TENANT_ID`), the endpoint and bearer credential are the
-    /// tenant query worker's, and the snapshot identity is the stable
-    /// per-tenant pointer the tenant `lake_enrichment_coordinator` publishes
-    /// under (`ioc-<tenant uuid>-current`, enforced by that binary at start).
-    pub fn from_shared_assignment(
-        assignment: &crate::search::SharedLakeWorkerAssignment,
-    ) -> Result<Self, IocLookupError> {
-        if assignment.tenant_id.is_nil() {
-            return Err(IocLookupError::Lake(
-                "shared lake IOC assignment has a nil tenant".to_string(),
-            ));
-        }
-        let tenant_id = assignment.tenant_id.to_string();
-        let bearer_token = std::fs::read_to_string(&assignment.credential_file)
-            .map_err(|error| {
-                IocLookupError::Lake(format!(
-                    "failed to read shared lake worker credential reference {}: {error}",
-                    assignment.credential_file.display()
-                ))
-            })?
-            .trim()
-            .to_string();
-        if bearer_token.len() < 32 {
-            return Err(IocLookupError::Lake(
-                "shared lake worker credential must contain at least 32 characters".to_string(),
-            ));
-        }
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(assignment.timeout_secs.clamp(1, 300)))
-            .build()
-            .map_err(|error| IocLookupError::Lake(format!("build IOC client: {error}")))?;
-        Ok(Self {
-            http,
-            base_url: assignment.internal_endpoint.trim_end_matches('/').to_string(),
-            snapshot_id: default_ioc_snapshot_id(&tenant_id),
-            tenant_id,
-            bearer_token,
-        })
-    }
-
-    /// The tenant this reader is pinned to.
-    pub fn tenant_id(&self) -> &str {
-        &self.tenant_id
-    }
-
-    pub async fn lookup(&self, value: &str) -> Result<Vec<IocLookupResult>, IocLookupError> {
-        self.post_lookup(OWN_SNAPSHOT_LOOKUP_PATH, value)
-            .await?
-            .map(|lookup| lookup.results)
-            .ok_or_else(|| IocLookupError::Lake("worker returned HTTP 404".to_string()))
-    }
-
-    /// NAN-3881: point lookup over every IOC source the tenant has enabled —
-    /// its own published IOC lists/feeds plus the platform baseline feeds its
-    /// policy grants (ThreatFox, Tor exit nodes...) — reporting every source
-    /// searched. The worker reads the same snapshot and bundle/policy pair
-    /// ingest matching uses. A worker that predates `/v1/ioc/indicator-sets`
-    /// (404) falls back to the own-snapshot lookup, where a tenant with no
-    /// published snapshot has zero sources (an answer, not a failure).
-    pub async fn lookup_indicator_sets(&self, value: &str) -> Result<IocSetLookup, IocLookupError> {
-        if let Some(lookup) = self.post_lookup(INDICATOR_SETS_LOOKUP_PATH, value).await? {
-            return Ok(lookup);
-        }
-        match self.post_lookup(OWN_SNAPSHOT_LOOKUP_PATH, value).await {
-            Ok(Some(lookup)) => Ok(lookup),
-            Ok(None) => Err(IocLookupError::Lake("worker returned HTTP 404".to_string())),
-            Err(IocLookupError::Lake(message)) if message.contains(IOC_POINTER_ABSENT) => {
-                Ok(IocSetLookup { sources: Some(Vec::new()), ..IocSetLookup::default() })
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// `Ok(None)` only for a 404 (a worker without the route).
-    async fn post_lookup(&self, path: &str, value: &str) -> Result<Option<IocSetLookup>, IocLookupError> {
-        let indicator_sets = path == INDICATOR_SETS_LOOKUP_PATH;
-        let value = value.trim();
-        if value.is_empty() || value.len() > 4_096 || value.chars().any(char::is_control) {
-            return Err(IocLookupError::Lake(
-                "IOC lookup value is empty or exceeds its text contract".to_string(),
-            ));
-        }
-        let request_id = uuid::Uuid::now_v7().to_string();
-        let response = self
-            .http
-            .post(format!("{}{path}", self.base_url))
-            .bearer_auth(&self.bearer_token)
-            .json(&LakeIocRequest {
-                request_id: &request_id,
-                tenant_id: &self.tenant_id,
-                snapshot_id: &self.snapshot_id,
-                value,
-            })
-            .send_idempotent_with_recovery()
-            .await
-            .map_err(|error| IocLookupError::Lake(format!("request failed: {error}")))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| IocLookupError::Lake(format!("response read failed: {error}")))?;
-        let envelope: LakeIocResponse = serde_json::from_slice(&body).map_err(|error| {
-            IocLookupError::Lake(format!("worker returned invalid JSON ({status}): {error}"))
-        })?;
-        if !status.is_success() || !envelope.ok {
-            return Err(IocLookupError::Lake(
-                envelope
-                    .error
-                    .unwrap_or_else(|| format!("worker returned HTTP {status}")),
-            ));
-        }
-        if envelope.request_id.as_deref() != Some(request_id.as_str())
-            || envelope.tenant_id.as_deref() != Some(self.tenant_id.as_str())
-            || envelope.snapshot_id.as_deref() != Some(self.snapshot_id.as_str())
-            // The indicator-set answer carries no snapshot version when the
-            // tenant has not published one (its baseline feeds still count).
-            || (!indicator_sets && envelope.snapshot_version.is_none())
-            || envelope.snapshot_version.as_deref().is_some_and(valid_digest_not)
-            || (indicator_sets
-                && (envelope.sources.is_none()
-                    || !matches!(envelope.platform_status.as_deref(), Some("ok" | "not_configured" | "unavailable"))))
-            || envelope
-                .value
-                .as_deref()
-                .is_none_or(|returned| !returned.eq_ignore_ascii_case(value))
-            || envelope.results.len() > 10_000
-            || envelope.sources.as_ref().is_some_and(|sources| sources.len() > 10_000)
-        {
-            return Err(IocLookupError::Lake(
-                "worker response did not match the pinned IOC request".to_string(),
-            ));
-        }
-        Ok(Some(IocSetLookup {
-            results: envelope.results,
-            sources: envelope.sources,
-            platform_unavailable: envelope.platform_status.as_deref() == Some("unavailable"),
-        }))
-    }
-
-    /// Enumerate a bounded current feed selection from the same immutable
-    /// snapshot used for ingest decoration and point lookup. This replaces the
-    /// legacy product reads of `custom_enrichment_results` in primary lake
-    /// mode without exposing SQL or object-store coordinates.
-    pub async fn source_records(
-        &self,
-        feeds: &[String],
-        feed_name_contains: &[String],
-        tags: &[String],
-        artifact_types: &[String],
-        cursor: Option<(i64, &str)>,
-        limit: usize,
-        count_only: bool,
-    ) -> Result<(Vec<LakeIocSourceRecord>, usize), IocLookupError> {
-        if limit == 0 || limit > 100_000 {
-            return Err(IocLookupError::Lake(
-                "IOC source record limit must be between 1 and 100000".to_string(),
-            ));
-        }
-        let request_id = uuid::Uuid::now_v7().to_string();
-        let response = self
-            .http
-            .post(format!("{}/v1/ioc/source-records", self.base_url))
-            .bearer_auth(&self.bearer_token)
-            .json(&LakeIocSourceRequest {
-                request_id: &request_id,
-                tenant_id: &self.tenant_id,
-                snapshot_id: &self.snapshot_id,
-                feeds,
-                feed_name_contains,
-                tags,
-                artifact_types,
-                cursor_published_at_ms: cursor.map(|(timestamp, _)| timestamp),
-                cursor_value: cursor.map(|(_, value)| value),
-                limit,
-                count_only,
-            })
-            .send_idempotent_with_recovery()
-            .await
-            .map_err(|error| IocLookupError::Lake(format!("request failed: {error}")))?;
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| IocLookupError::Lake(format!("response read failed: {error}")))?;
-        let envelope: LakeIocSourceResponse = serde_json::from_slice(&body).map_err(|error| {
-            IocLookupError::Lake(format!("worker returned invalid JSON ({status}): {error}"))
-        })?;
-        if !status.is_success() || !envelope.ok {
-            return Err(IocLookupError::Lake(
-                envelope
-                    .error
-                    .unwrap_or_else(|| format!("worker returned HTTP {status}")),
-            ));
-        }
-        if envelope.request_id.as_deref() != Some(request_id.as_str())
-            || envelope.tenant_id.as_deref() != Some(self.tenant_id.as_str())
-            || envelope.snapshot_id.as_deref() != Some(self.snapshot_id.as_str())
-            || envelope
-                .snapshot_version
-                .as_deref()
-                .is_none_or(valid_digest_not)
-            || envelope.count > 5_000_000
-            || envelope.records.len() > limit
-            || envelope.records.iter().any(|record| {
-                record.value.is_empty()
-                    || record.value.len() > 4_096
-                    || record.key_type.is_empty()
-                    || record.source_id.is_empty()
-                    || record.enrichment_name.is_empty()
-                    || !(0..=100).contains(&record.confidence)
-                    || record.published_at_ms < 0
-            })
-        {
-            return Err(IocLookupError::Lake(
-                "worker response did not match the pinned IOC source request".to_string(),
-            ));
-        }
-        Ok((envelope.records, envelope.count))
-    }
-}
-
-impl LakeIocClient {
-    /// NAN-4169: the tenant's granted platform IOC feeds (ThreatFox, Tor exit
-    /// nodes...) whose bundle revision differs from `known` (feed -> revision
-    /// the caller last processed), with every live row of each changed feed.
-    /// A worker without platform mounts (open core) answers with no feeds.
-    pub async fn platform_records(
-        &self,
-        known: &std::collections::BTreeMap<String, i64>,
-        artifact_types: &[String],
-        max_records: usize,
-    ) -> Result<Vec<LakePlatformFeedDelta>, IocLookupError> {
-        if max_records == 0 || max_records > MAX_PLATFORM_DELTA_RECORDS {
-            return Err(IocLookupError::Lake(format!(
-                "platform record limit must be between 1 and {MAX_PLATFORM_DELTA_RECORDS}"
-            )));
-        }
-        let request_id = uuid::Uuid::now_v7().to_string();
-        let response = self
-            .http
-            .post(format!("{}/v1/ioc/platform-records", self.base_url))
-            .bearer_auth(&self.bearer_token)
-            .json(&serde_json::json!({
-                "request_id": request_id,
-                "tenant_id": self.tenant_id,
-                "snapshot_id": self.snapshot_id,
-                "known": known,
-                "artifact_types": artifact_types,
-                "max_records": max_records,
-            }))
-            .send_idempotent_with_recovery()
-            .await
-            .map_err(|error| IocLookupError::Lake(format!("request failed: {error}")))?;
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| IocLookupError::Lake(format!("response read failed: {error}")))?;
-        let envelope: LakePlatformRecordsResponse = serde_json::from_slice(&body).map_err(|error| {
-            IocLookupError::Lake(format!("worker returned invalid JSON ({status}): {error}"))
-        })?;
-        if !status.is_success() || !envelope.ok {
-            return Err(IocLookupError::Lake(
-                envelope
-                    .error
-                    .unwrap_or_else(|| format!("worker returned HTTP {status}")),
-            ));
-        }
-        let total: usize = envelope.feeds.iter().map(|feed| feed.records.len()).sum();
-        if envelope.request_id.as_deref() != Some(request_id.as_str())
-            || envelope.tenant_id.as_deref() != Some(self.tenant_id.as_str())
-            || envelope.snapshot_id.as_deref() != Some(self.snapshot_id.as_str())
-            || envelope.feeds.len() > 64
-            || total > max_records
-            || envelope.feeds.iter().any(|feed| {
-                feed.feed.is_empty()
-                    || feed.feed.len() > 64
-                    || feed.revision <= 0
-                    || (!feed.changed && !feed.records.is_empty())
-                    || feed.records.iter().any(|record| {
-                        record.value.is_empty()
-                            || record.value.len() > 4_096
-                            || record.key_type.is_empty()
-                            || !(0..=100).contains(&record.confidence)
-                    })
-            })
-        {
-            return Err(IocLookupError::Lake(
-                "worker response did not match the pinned platform record request".to_string(),
-            ));
-        }
-        Ok(envelope.feeds)
-    }
-}
-
-/// Upper bound on platform rows one retro delta request may carry (the
-/// worker's own contract).
-pub const MAX_PLATFORM_DELTA_RECORDS: usize = 500_000;
-
-/// One granted platform IOC feed in a retro delta answer (NAN-4169).
-#[derive(Debug, Clone, SerdeDeserialize, Serialize)]
-pub struct LakePlatformFeedDelta {
-    pub feed: String,
-    #[serde(default)]
-    pub display_name: String,
-    pub revision: i64,
-    /// The bundle revision differs from the caller's known revision; only
-    /// then are `records` populated.
-    pub changed: bool,
-    #[serde(default)]
-    pub records: Vec<LakePlatformRecord>,
-}
-
-/// One live platform IOC row (lowercased value + coarse retro type).
-#[derive(Debug, Clone, SerdeDeserialize, Serialize)]
-pub struct LakePlatformRecord {
-    pub value: String,
-    pub key_type: String,
-    #[serde(default)]
-    pub confidence: i32,
-    #[serde(default)]
-    pub tags: Vec<String>,
-}
-
-#[derive(SerdeDeserialize)]
-struct LakePlatformRecordsResponse {
-    #[serde(default)]
-    ok: bool,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    snapshot_id: Option<String>,
-    #[serde(default)]
-    feeds: Vec<LakePlatformFeedDelta>,
-}
-
-fn valid_digest_not(version: &str) -> bool {
-    version.len() != 64
-        || !version
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-/// The worker's error text when the tenant has no published IOC snapshot
-/// (`lean_ioc_query::lookup`).
-const IOC_POINTER_ABSENT: &str = "tenant IOC pointer is absent";
-/// Own-snapshot point lookup (search, retro, prevalence discovery).
-const OWN_SNAPSHOT_LOOKUP_PATH: &str = "/v1/ioc/lookup";
-/// Every enabled source: own snapshot plus granted platform feeds (NAN-3881).
-const INDICATOR_SETS_LOOKUP_PATH: &str = "/v1/ioc/indicator-sets";
-
-/// One point lookup over the tenant's indicator sets (NAN-3881).
-#[derive(Debug, Clone, Default)]
-pub struct IocSetLookup {
-    /// One verdict per matching (source, type, threat, malware, confidence).
-    pub results: Vec<IocLookupResult>,
-    /// Display names of every indicator source searched (the tenant's own
-    /// lists/feeds and its enabled platform baseline feeds); `None` when the
-    /// worker does not report them.
-    pub sources: Option<Vec<String>>,
-    /// The tenant has platform feed mounts but its policy or bundle could
-    /// not be read for this lookup: the baseline feeds were not searched.
-    pub platform_unavailable: bool,
-}
-
-#[derive(Serialize)]
-struct LakeIocRequest<'a> {
-    request_id: &'a str,
-    tenant_id: &'a str,
-    snapshot_id: &'a str,
-    value: &'a str,
-}
-
-#[derive(Serialize)]
-struct LakeIocSourceRequest<'a> {
-    request_id: &'a str,
-    tenant_id: &'a str,
-    snapshot_id: &'a str,
-    feeds: &'a [String],
-    feed_name_contains: &'a [String],
-    tags: &'a [String],
-    artifact_types: &'a [String],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cursor_published_at_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cursor_value: Option<&'a str>,
-    limit: usize,
-    count_only: bool,
-}
-
-#[derive(Debug, Clone, SerdeDeserialize, Serialize)]
-pub struct LakeIocSourceRecord {
-    pub value: String,
-    pub key_type: String,
-    pub source_id: String,
-    pub enrichment_name: String,
-    pub confidence: i32,
-    pub tags: Vec<String>,
-    pub published_at_ms: i64,
-}
-
-#[derive(SerdeDeserialize)]
-struct LakeIocResponse {
-    #[serde(default)]
-    ok: bool,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    snapshot_id: Option<String>,
-    #[serde(default)]
-    snapshot_version: Option<String>,
-    #[serde(default)]
-    value: Option<String>,
-    #[serde(default)]
-    results: Vec<IocLookupResult>,
-    #[serde(default)]
-    sources: Option<Vec<String>>,
-    #[serde(default)]
-    platform_status: Option<String>,
-}
-
-#[derive(SerdeDeserialize)]
-struct LakeIocSourceResponse {
-    #[serde(default)]
-    ok: bool,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    snapshot_id: Option<String>,
-    #[serde(default)]
-    snapshot_version: Option<String>,
-    #[serde(default)]
-    count: usize,
-    #[serde(default)]
-    records: Vec<LakeIocSourceRecord>,
-}
-
-fn optional_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn required_env(name: &str) -> Result<String, IocLookupError> {
-    optional_env(name)
-        .ok_or_else(|| IocLookupError::Lake(format!("{name} is required for lake IOC lookup")))
-}
-
-fn validate_identity(name: &str, value: &str) -> Result<(), IocLookupError> {
-    if value.len() > 256
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.:-".contains(&byte))
-    {
-        return Err(IocLookupError::Lake(format!("{name} is invalid")));
-    }
-    Ok(())
-}
-
-fn default_ioc_snapshot_id(tenant_id: &str) -> String {
-    format!("ioc-{tenant_id}-current")
-}
-
-#[cfg(test)]
-mod lake_client_tests {
-    use super::default_ioc_snapshot_id;
-
-    #[test]
-    fn cell_route_pins_ioc_client_to_router_tenant() {
-        let dir = tempfile::tempdir().unwrap();
-        let token = dir.path().join("router-token");
-        std::fs::write(&token, "0123456789abcdef0123456789abcdef\n").unwrap();
-        let tenant = uuid::Uuid::from_u128(7);
-        let mut route = crate::search::lake_cell::LakeCellRoute::for_test(tenant, "http://127.0.0.1:8790", token);
-        let client = super::LakeIocClient::from_lake_cell_route(&route).unwrap();
-        assert_eq!(client.tenant_id(), tenant.to_string());
-        assert!(client.base_url.ends_with(&format!("/{tenant}/query")));
-        route.query_base_url = format!("http://127.0.0.1:8790/v1/tenants/{}/query", uuid::Uuid::from_u128(8));
-        assert!(super::LakeIocClient::from_lake_cell_route(&route).is_err());
-    }
-
-    #[test]
-    fn shared_assignment_pins_the_tenant_uuid_and_its_current_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let credential = dir.path().join("worker-token");
-        std::fs::write(&credential, "0123456789abcdef0123456789abcdef\n").unwrap();
-        let tenant = uuid::Uuid::from_u128(7);
-        let assignment = crate::search::SharedLakeWorkerAssignment {
-            tenant_id: tenant,
-            internal_endpoint: "http://lake-worker.tenant.svc:8090/".into(),
-            credential_file: credential.clone(),
-            expected_worker_identity: "nano-query-x".into(),
-            expected_worker_revision: 1,
-            timeout_secs: 30,
-            prevalence_snapshots: crate::prevalence::LakePrevalenceSnapshots {
-                one_hour: "p1h".into(),
-                twenty_four_hours: "p24h".into(),
-                seven_days: "p7d".into(),
-                thirty_days: "p30d".into(),
-            },
-            prevalence_rarity_threshold: 3,
-            prevalence_timeout_secs: 30,
-            enrichment_coordinator: None,
-            otel_ingest: None,
-            erasure_executor: None,
-        };
-        let client = super::LakeIocClient::from_shared_assignment(&assignment).unwrap();
-        assert_eq!(client.tenant_id(), tenant.to_string());
-        assert_eq!(client.snapshot_id, default_ioc_snapshot_id(&tenant.to_string()));
-        assert_eq!(client.base_url, "http://lake-worker.tenant.svc:8090");
-        std::fs::write(&credential, "short").unwrap();
-        assert!(super::LakeIocClient::from_shared_assignment(&assignment).is_err());
-        let mut nil = assignment;
-        nil.tenant_id = uuid::Uuid::nil();
-        assert!(super::LakeIocClient::from_shared_assignment(&nil).is_err());
-    }
-
-    fn assignment_client(tenant: uuid::Uuid, endpoint: &str, dir: &std::path::Path) -> super::LakeIocClient {
-        let credential = dir.join("worker-token");
-        std::fs::write(&credential, "0123456789abcdef0123456789abcdef\n").unwrap();
-        let assignment = crate::search::SharedLakeWorkerAssignment {
-            tenant_id: tenant,
-            internal_endpoint: endpoint.into(),
-            credential_file: credential,
-            expected_worker_identity: "nano-query-x".into(),
-            expected_worker_revision: 1,
-            timeout_secs: 5,
-            prevalence_snapshots: crate::prevalence::LakePrevalenceSnapshots {
-                one_hour: "p1h".into(),
-                twenty_four_hours: "p24h".into(),
-                seven_days: "p7d".into(),
-                thirty_days: "p30d".into(),
-            },
-            prevalence_rarity_threshold: 3,
-            prevalence_timeout_secs: 5,
-            enrichment_coordinator: None,
-            otel_ingest: None,
-            erasure_executor: None,
-        };
-        super::LakeIocClient::from_shared_assignment(&assignment).unwrap()
-    }
-
-    /// The worker echoes the pinned identity; the body's own request id is
-    /// copied back so the envelope check passes.
-    struct Echo {
-        tenant: String,
-        sources: serde_json::Value,
-        results: serde_json::Value,
-    }
-
-    impl wiremock::Respond for Echo {
-        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
-            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-            let mut out = serde_json::json!({
-                "ok": true, "request_id": body["request_id"], "tenant_id": self.tenant,
-                "snapshot_id": format!("ioc-{}-current", self.tenant), "snapshot_version": "a".repeat(64),
-                "value": body["value"], "results": self.results,
-            });
-            if !self.sources.is_null() {
-                out["sources"] = self.sources.clone();
-            }
-            wiremock::ResponseTemplate::new(200).set_body_json(out)
-        }
-    }
-
-    /// NAN-3881: the flyout's indicator-set search reports the tenant's own
-    /// sources beside the matches, and tolerates a worker without the field.
-    #[tokio::test]
-    async fn indicator_set_lookup_reports_sources_and_matches() {
-        use wiremock::{matchers, Mock, MockServer};
-        let server = MockServer::start().await;
-        let tenant = uuid::Uuid::from_u128(0xa);
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/ioc/lookup"))
-            .and(matchers::body_partial_json(serde_json::json!({ "value": "198.51.100.7" })))
-            .respond_with(Echo {
-                tenant: tenant.to_string(),
-                sources: serde_json::json!(["Custom IOC list", "ThreatFox", "Tor exit nodes"]),
-                results: serde_json::json!([{ "found": true, "source_id": "ThreatFox", "ioc_type": "ip",
-                    "confidence_level": 75, "tags": ["botnet_cc"] }]),
-            })
-            .mount(&server)
-            .await;
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/ioc/lookup"))
-            .and(matchers::body_partial_json(serde_json::json!({ "value": "old-worker.example" })))
-            .respond_with(Echo { tenant: tenant.to_string(), sources: serde_json::Value::Null, results: serde_json::json!([]) })
-            .mount(&server)
-            .await;
-        let dir = tempfile::tempdir().unwrap();
-        let client = assignment_client(tenant, &server.uri(), dir.path());
-        let hit = client.lookup_indicator_sets("198.51.100.7").await.unwrap();
-        assert_eq!(hit.sources.as_deref().map(<[String]>::len), Some(3));
-        assert_eq!(hit.results.len(), 1);
-        assert_eq!(hit.results[0].source_id.as_deref(), Some("ThreatFox"));
-        let old = client.lookup_indicator_sets("old-worker.example").await.unwrap();
-        assert!(old.results.is_empty() && old.sources.is_none());
-    }
-
-    /// NAN-3881 zero cross-tenant sharing: a worker answering with another
-    /// tenant's identity (tenant B's snapshot) is refused, never shown to
-    /// tenant A as matches or sources.
-    #[tokio::test]
-    async fn indicator_set_lookup_refuses_another_tenants_answer() {
-        use wiremock::{matchers, Mock, MockServer};
-        let server = MockServer::start().await;
-        let tenant_a = uuid::Uuid::from_u128(0xa);
-        let tenant_b = uuid::Uuid::from_u128(0xb);
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/ioc/lookup"))
-            .respond_with(Echo {
-                tenant: tenant_b.to_string(),
-                sources: serde_json::json!(["B private feed"]),
-                results: serde_json::json!([{ "found": true, "source_id": "B private feed", "ioc_type": "ip", "tags": [] }]),
-            })
-            .mount(&server)
-            .await;
-        let dir = tempfile::tempdir().unwrap();
-        let client = assignment_client(tenant_a, &server.uri(), dir.path());
-        let error = client.lookup_indicator_sets("198.51.100.7").await.unwrap_err();
-        assert!(error.to_string().contains("did not match the pinned IOC request"), "{error}");
-    }
-
-    /// The `/v1/ioc/indicator-sets` answer: tenant + pinned identity echoed,
-    /// no `snapshot_version` when the tenant has no own snapshot.
-    struct SetsEcho {
-        tenant: String,
-        sources: serde_json::Value,
-        results: serde_json::Value,
-        platform_status: &'static str,
-    }
-
-    impl wiremock::Respond for SetsEcho {
-        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
-            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "ok": true, "request_id": body["request_id"], "tenant_id": self.tenant,
-                "snapshot_id": format!("ioc-{}-current", self.tenant), "snapshot_version": null,
-                "value": body["value"], "results": self.results, "sources": self.sources,
-                "platform_status": self.platform_status, "platform_feeds": ["threatfox", "tor_exit_nodes"],
-            }))
-        }
-    }
-
-    /// The flyout searches the tenant's enabled
-    /// platform baseline feeds too. A tenant with ThreatFox + Tor granted and
-    /// no own snapshot gets both as searched sources and the ThreatFox match;
-    /// `/v1/ioc/lookup` is never consulted when the new route answers.
-    #[tokio::test]
-    async fn indicator_set_lookup_includes_enabled_baseline_feeds() {
-        use wiremock::{matchers, Mock, MockServer};
-        let server = MockServer::start().await;
-        let tenant = uuid::Uuid::from_u128(0xa);
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/ioc/indicator-sets"))
-            .respond_with(SetsEcho {
-                tenant: tenant.to_string(),
-                sources: serde_json::json!(["ThreatFox", "Tor exit nodes", "easy_intel"]),
-                results: serde_json::json!([{ "found": true, "source_id": "ThreatFox", "ioc_type": "ip",
-                    "threat_type": "botnet_cc", "confidence_level": 75, "tags": [] }]),
-                platform_status: "ok",
-            })
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/ioc/lookup"))
-            .respond_with(wiremock::ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-        let dir = tempfile::tempdir().unwrap();
-        let client = assignment_client(tenant, &server.uri(), dir.path());
-        let hit = client.lookup_indicator_sets("198.51.100.7").await.unwrap();
-        assert_eq!(
-            hit.sources.as_deref(),
-            Some(&["ThreatFox".to_string(), "Tor exit nodes".to_string(), "easy_intel".to_string()][..])
-        );
-        assert_eq!(hit.results.len(), 1);
-        assert!(!hit.platform_unavailable);
-    }
-
-    /// An unreadable policy is reported, not hidden as "no baseline feeds".
-    #[tokio::test]
-    async fn indicator_set_lookup_reports_unavailable_baseline_feeds() {
-        use wiremock::{matchers, Mock, MockServer};
-        let server = MockServer::start().await;
-        let tenant = uuid::Uuid::from_u128(0xa);
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/ioc/indicator-sets"))
-            .respond_with(SetsEcho { tenant: tenant.to_string(), sources: serde_json::json!(["easy_intel"]),
-                results: serde_json::json!([]), platform_status: "unavailable" })
-            .mount(&server)
-            .await;
-        let dir = tempfile::tempdir().unwrap();
-        let client = assignment_client(tenant, &server.uri(), dir.path());
-        let answer = client.lookup_indicator_sets("198.51.100.7").await.unwrap();
-        assert!(answer.platform_unavailable);
-        assert_eq!(answer.sources.as_deref().map(<[String]>::len), Some(1));
-    }
-
-    /// NAN-3881 zero cross-tenant sharing on the new route: tenant B's
-    /// answer (B's feeds and list) is refused for tenant A's reader.
-    #[tokio::test]
-    async fn indicator_sets_route_refuses_another_tenants_answer() {
-        use wiremock::{matchers, Mock, MockServer};
-        let server = MockServer::start().await;
-        let tenant_a = uuid::Uuid::from_u128(0xa);
-        let tenant_b = uuid::Uuid::from_u128(0xb);
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/ioc/indicator-sets"))
-            .respond_with(SetsEcho { tenant: tenant_b.to_string(),
-                sources: serde_json::json!(["B private feed", "ThreatFox"]),
-                results: serde_json::json!([{ "found": true, "source_id": "B private feed", "ioc_type": "ip", "tags": [] }]),
-                platform_status: "ok" })
-            .mount(&server)
-            .await;
-        let dir = tempfile::tempdir().unwrap();
-        let client = assignment_client(tenant_a, &server.uri(), dir.path());
-        let error = client.lookup_indicator_sets("198.51.100.7").await.unwrap_err();
-        assert!(error.to_string().contains("did not match the pinned IOC request"), "{error}");
-    }
-
-    /// A tenant with no published IOC snapshot has zero indicator sources.
-    #[tokio::test]
-    async fn indicator_set_lookup_without_a_snapshot_is_zero_sources() {
-        use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/ioc/lookup"))
-            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
-                "ok": false, "error": "tenant IOC pointer is absent", "reason": "internal" })))
-            .mount(&server)
-            .await;
-        let dir = tempfile::tempdir().unwrap();
-        let client = assignment_client(uuid::Uuid::from_u128(0xa), &server.uri(), dir.path());
-        let none = client.lookup_indicator_sets("198.51.100.7").await.unwrap();
-        assert!(none.results.is_empty());
-        assert_eq!(none.sources, Some(Vec::new()));
-        // The plain lookup keeps its error semantics.
-        assert!(client.lookup("198.51.100.7").await.is_err());
-    }
-
-    #[test]
-    fn derives_the_coordinator_snapshot_pointer_from_the_tenant() {
-        assert_eq!(default_ioc_snapshot_id("tenant-a"), "ioc-tenant-a-current");
-    }
 }
 
 /// Look an artifact up across every Deno IOC enrichment whose rows are
@@ -952,30 +194,48 @@ pub async fn lookup_ioc_all_sources(
     // reference is byte-identical. Routing through the wrapper is required so the
     // read covers ALL shards, not the one this connection landed on.
     //
-    // No `argMax(…, version)` collapse here — unlike a single-row lookup, this
-    // query DELIBERATELY reads every version of a row to recover first_seen /
-    // last_seen from `min/max(fetched_at)` (see the note above). Cross-shard
-    // duplicates of the same content merge into the same GROUP BY bucket (min/max
-    // are idempotent, tags are arrayDistinct'd), so completeness — not
-    // version-collapse — is the correct multi-shard fix; this matches the
-    // existing single-shard pre-merge semantics.
-    let table = TableNames::new(!on_cluster_clause().is_empty()).read("custom_enrichment_results");
+    // Latest version per storage key FIRST (NAN-4902 lane G): each
+    // `(namespace, enrichment_name, key_type, key_value)` collapses to its
+    // newest row by `argMax(…, (version, fetched_at))`, and only then are
+    // liveness and the verdict read. Without it a republished IOC list that
+    // changed a verdict (risk 25 → 90, a new threat type) returned BOTH the
+    // obsolete and the current verdict — on different shards ReplacingMergeTree
+    // merges never repair it. first_seen / last_seen stay historical:
+    // min/max of fetched_at over every committed version of the key.
+    //
+    // Only the active publication of an IOC list is visible (uncommitted and
+    // superseded ones are not): see `committed_rows_predicate`.
+    let names = TableNames::new(!on_cluster_clause().is_empty());
+    let table = names.read("custom_enrichment_results");
+    let visible = committed_rows_predicate(&names.read(IOC_LIST_COMMITS_TABLE));
     let rows: Vec<CustomEnrichmentIocRow> = ch
         .query(&format!(
             "SELECT
                  enrichment_name,
                  key_type,
-                 threat_type,
-                 malware,
-                 confidence,
-                 toUnixTimestamp(min(fetched_at)) AS first_seen,
-                 toUnixTimestamp(max(fetched_at)) AS last_seen,
-                 arrayDistinct(arrayFlatten(groupArray(tags))) AS tags
-             FROM {table}
-             WHERE key_value = ?
-               AND is_ioc = 1
-               AND expires_at > now()
-             GROUP BY enrichment_name, key_type, threat_type, malware, confidence
+                 live_threat_type AS threat_type,
+                 live_malware AS malware,
+                 live_confidence AS confidence,
+                 first_seen,
+                 last_seen,
+                 live_tags AS tags
+             FROM (
+                 SELECT
+                     enrichment_name,
+                     key_type,
+                     argMax(threat_type, (version, fetched_at)) AS live_threat_type,
+                     argMax(malware, (version, fetched_at)) AS live_malware,
+                     argMax(confidence, (version, fetched_at)) AS live_confidence,
+                     arrayDistinct(argMax(tags, (version, fetched_at))) AS live_tags,
+                     argMax(is_ioc, (version, fetched_at)) AS live_is_ioc,
+                     argMax(expires_at, (version, fetched_at)) AS live_expires_at,
+                     toInt64(toUnixTimestamp(min(fetched_at))) AS first_seen,
+                     toInt64(toUnixTimestamp(max(fetched_at))) AS last_seen
+                 FROM {table}
+                 WHERE key_value = ? AND {visible}
+                 GROUP BY namespace, enrichment_name, key_type
+             )
+             WHERE live_is_ioc = 1 AND live_expires_at > now()
              ORDER BY confidence DESC, enrichment_name",
         ))
         .bind(value)
@@ -1008,6 +268,30 @@ pub async fn lookup_ioc_all_sources(
 
 #[cfg(test)]
 mod tests {
+    const URL_CANON_VECTORS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ocsf_url_canonicalization.tsv"
+    ));
+
+    #[test]
+    fn canonical_url_matches_shared_rust_and_sql_vectors() {
+        use super::canonical_url as c;
+        for (line_no, line) in URL_CANON_VECTORS.lines().enumerate() {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 3, "vector line {}: {line:?}", line_no + 1);
+            assert_eq!(c(fields[1]), fields[2], "vector {}", fields[0]);
+        }
+        assert_ne!(
+            c("https://User@bad.example/Dropper/A"),
+            c("https://user@bad.example/Dropper/A")
+        );
+        assert_ne!(
+            c("https://bad.example/Dropper/A"),
+            c("https://bad.example/dropper/a")
+        );
+        assert_eq!(c(c("HTTP://A.B/X").as_str()), "http://a.b/X", "idempotent");
+    }
+
     use super::*;
 
     #[tokio::test]

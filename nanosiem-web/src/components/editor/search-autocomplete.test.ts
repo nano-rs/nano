@@ -106,9 +106,9 @@ describe('search bar field groups (NAN-3812)', () => {
     const mocked = await import('@/lib/query-autocomplete');
     suggestions.next = {
       options: [
-        { value: 'src_endpoint.ip', section: 'recent' },
-        { value: 'class_uid', section: 'popular' },
-        { value: 'metadata.log_source', section: 'common' },
+        { value: 'src_ip', section: 'recent' },
+        { value: 'dest_ip', section: 'popular' },
+        { value: 'source_type', section: 'common' },
         { value: 'zeta', section: 'other' },
       ],
       context: 'field',

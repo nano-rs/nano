@@ -194,3 +194,23 @@ test('every theme explicitly defines the logo accent token', () => {
     assert.ok(tokensOf(selector).has('--primary'), `${theme} must define --primary`);
   }
 });
+
+test('index.html first-paint script accepts every theme in THEMES', () => {
+  // The inline script runs before the bundle and validates the stored theme
+  // against its own copy of the list. A theme missing there paints `dark`
+  // until React mounts — a flash of the wrong theme on every load.
+  const html = readFileSync(join(process.cwd(), 'index.html'), 'utf8');
+  const literal = html.match(/const themes = \[([^\]]*)\]/)?.[1];
+  assert.ok(literal, 'no `const themes = [...]` in the index.html theme script');
+  const listed = Array.from(literal.matchAll(/'([^']+)'/g), (m) => m[1]);
+  assert.deepEqual([...listed].sort(), [...THEMES].sort());
+});
+
+test('theme swatches paint without gradients', () => {
+  // CLAUDE.md: no gradients. Swatches are two clipped solid halves and the
+  // overflow affordance is a solid bordered strip. (nano-desktop is stripped
+  // from the open-core mirror; its swatches are guarded in accent.test.ts.)
+  const src = readFileSync(join(process.cwd(), 'src/components/ui/theme-swatches.tsx'), 'utf8');
+  const code = src.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l));
+  assert.deepEqual(code.filter((l) => /gradient/.test(l)), []);
+});

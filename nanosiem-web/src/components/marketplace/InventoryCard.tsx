@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 import { inventoryAction, inventoryReason, type InventoryItem } from '@/lib/api/marketplace-inventory';
 import { AirgapBadge } from './IntegrationCard';
 import { MonoSwatch } from './MonoSwatch';
-import { executionStageLabel, inventoryHealthLabel } from '@/lib/marketplace-labels';
+import { executionStageLabel, humanizeEnum, inventoryHealthLabel } from '@/lib/marketplace-labels';
 
 export interface CatalogCardProps {
   /** Stable id, exposed as `data-mp-slug`. */
@@ -50,14 +50,13 @@ export function MetaBadge({ children }: { children: ReactNode }) {
 }
 
 export function InventoryCard({ item, onOpen, airGap = false }: { item: InventoryItem; onOpen: () => void; airGap?: boolean }) {
-  // Platform feeds and connectors need live connectivity. Custom providers only
-  // claim offline availability for the explicitly local transform/lookup types.
-  const requiresNetwork = item.kind !== 'custom' || item.id.startsWith('connector:') || !['transform', 'lookup'].includes(item.connector);
+  // A browsing card describes the integration; once it needs attention the
+  // reason takes over the body.
+  const body = item.reason && item.reason !== 'not_installed' ? inventoryReason(item) : item.description || inventoryReason(item);
   return <CatalogCard id={item.id} name={item.name} onOpen={onOpen}
-    meta={<>{item.kind} · {inventoryHealthLabel(item.effective_health)}</>}
-    body={inventoryReason(item)}
+    meta={<>{item.provided_by_bundle ? <><MetaBadge>nano feed bundle</MetaBadge> · {item.provided_by_bundle.revision !== null && <span data-testid="inventory-card-bundle-rev">rev {item.provided_by_bundle.revision} · </span>}</> : null}{item.kind} · {humanizeEnum(item.category)} · {inventoryHealthLabel(item.effective_health)}</>}
+    body={body}
     footerLabel={executionStageLabel(item.execution_stage)}
-    footerAction={inventoryAction(item)}
-    footerActionDisabled={airGap && item.kind === 'premium' && !item.entitled}
-    trailing={airGap && <AirgapBadge requiresNetwork={requiresNetwork} />} />;
+    footerAction={<span className={item.requirement || item.provided_by_bundle ? 'text-muted-foreground' : 'text-primary'}>{inventoryAction(item)}</span>}
+    trailing={airGap && <AirgapBadge requiresNetwork={item.requires_network} />} />;
 }

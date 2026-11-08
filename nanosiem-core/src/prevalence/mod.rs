@@ -10,20 +10,16 @@
 //! - Rarity detection based on configurable thresholds
 //! - Configurable settings with hot-reload support
 
-mod exact_window;
-pub use exact_window::ExactPrevalenceWindow;
-pub mod lookup;
+pub mod coverage;
 pub mod repository;
 pub mod service;
 pub mod settings;
-pub mod stamped;
 pub mod types;
 
-pub use lookup::{LakePrevalenceClient, LakePrevalenceSnapshots, PrevalenceLookup};
+pub use coverage::{PrevalenceCoverageState, PrevalenceProductState};
 pub use repository::PrevalenceRepository;
-pub use service::{PrevalenceError, PrevalenceService, MAX_BULK_ARTIFACTS};
-pub use settings::{PrevalenceSettings, PrevalenceSettingsError, RarityThresholdSetting};
+pub use service::{
+    invalidate_coverage_probe_cache, PrevalenceError, PrevalenceService, MAX_BULK_ARTIFACTS,
+};
+pub use settings::{PrevalenceSettings, PrevalenceSettingsError};
 pub use types::*;
-
-#[cfg(test)]
-mod exact_window_tests;

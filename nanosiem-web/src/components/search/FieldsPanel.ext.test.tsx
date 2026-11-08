@@ -38,24 +38,6 @@ afterEach(cleanup);
 
 const panel = (p: ComponentProps<typeof FieldsPanel>) => <QueryClientProvider client={client}><FieldsPanel {...p} /></QueryClientProvider>;
 
-function expectNoTilde(container: HTMLElement) {
-  expect(container.textContent).not.toContain('~');
-  for (const element of container.querySelectorAll('[title]')) {
-    expect(element.getAttribute('title')).not.toContain('~');
-  }
-}
-
-function expectSampleBelowValues(view: ReturnType<typeof render>, label: string) {
-  const disclosures = view.getAllByText(label);
-  expect(disclosures).toHaveLength(1);
-  const disclosure = disclosures[0];
-  expect(disclosure.className).toContain('font-mono');
-  expect(disclosure.className).toContain('text-muted-foreground');
-  expect(disclosure.parentElement?.lastElementChild).toBe(disclosure);
-  expect(view.getByText('10.0.0.1').compareDocumentPosition(disclosure) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-  expectNoTilde(view.container);
-}
-
 it('NAN-3299: fetches ext names once per run scope, across re-renders and a remount', async () => {
   const view = render(panel(props()));
   await waitFor(() => expect(mocks.ext).toHaveBeenCalledOnce());
@@ -86,76 +68,4 @@ it('NAN-3299: a superseded ext fetch is aborted when the run scope moves on', as
   view.rerender(panel(props({ query: 'user="other"' })));
   await waitFor(() => expect(mocks.ext).toHaveBeenCalledTimes(2));
   await waitFor(() => expect(first.aborted).toBe(true));
-});
-
-it('shows plain sampled cardinality and discloses the sample below values while loading', async () => {
-  const fieldStats = stats().map(stat => ({ ...stat, sampledRows: 1000 }));
-  const view = render(panel(props({ fieldStats, onFetchFieldValues: undefined })));
-  expect(view.getByTitle('1 unique values in a sample of 1,000 events. Expand to load field statistics.').textContent).toBe('1');
-  expect(view.queryByText('sample · 1,000 events')).toBeNull();
-  expectNoTilde(view.container);
-  view.rerender(panel(props({
-    fieldStats,
-    expandedFields: new Set(['src_ip']),
-    onFetchFieldValues: () => new Promise(() => {}),
-  })));
-  await waitFor(() => expect(view.getByText('Loading full stats…')).toBeTruthy());
-  expect(view.getByText('1 unique · 1 events')).toBeTruthy();
-  expect(view.getByText('100.0%')).toBeTruthy();
-  expectSampleBelowValues(view, 'sample · 1,000 events');
-});
-
-it('removes the sample disclosure after an exact drill-in returns', async () => {
-  const view = render(panel(props({
-    fieldStats: stats().map(stat => ({ ...stat, sampledRows: 1000 })),
-    expandedFields: new Set(['src_ip']),
-    onFetchFieldValues: async () => ({ values: [
-      { value: '10.0.0.1', count: 1500, percentage: 99.93 },
-      { value: '10.0.0.2', count: 1, percentage: 0.07 },
-    ], total_count: 1501 }),
-  })));
-  await waitFor(() => expect(view.getByTitle('2 unique values')).toBeTruthy());
-  expect(view.queryByText(/^sample ·/)).toBeNull();
-  expect(view.getByText('2 unique · 1,501 events')).toBeTruthy();
-  expect(view.getByText('10.0.0.2')).toBeTruthy();
-  expectNoTilde(view.container);
-});
-
-it('discloses the time sample once below values when the drill-in is still approximate', async () => {
-  const view = render(panel(props({
-    fieldStats: stats().map(stat => ({ ...stat, sampledRows: 1000 })),
-    expandedFields: new Set(['src_ip']),
-    onFetchFieldValues: async () => ({ values: stats()[0].topValues, total_count: 1,
-      approximate: true, sampled_start: range.start, sampled_end: range.end }),
-  })));
-  await waitFor(() => expect(view.getByText('sample · last 1h')).toBeTruthy());
-  expect(view.queryByText('sample · 1,000 events')).toBeNull();
-  expectSampleBelowValues(view, 'sample · last 1h');
-});
-
-it('keeps plain counts and the sample disclosure when the drill-in fails', async () => {
-  const view = render(panel(props({
-    fieldStats: stats().map(stat => ({ ...stat, sampledRows: 1000 })),
-    expandedFields: new Set(['src_ip']),
-    onFetchFieldValues: async () => { throw new Error('Field values unavailable'); },
-  })));
-  await waitFor(() => expect(view.queryByText('Loading full stats…')).toBeNull());
-  expect(view.getByTitle('1 unique values in a sample of 1,000 events. Expand to load field statistics.').textContent).toBe('1');
-  expectSampleBelowValues(view, 'sample · 1,000 events');
-});
-
-it.each([0, 1234])('formats sampled cardinality %i as a plain number', uniqueCount => {
-  const view = render(panel(props({
-    fieldStats: stats().map(stat => ({ ...stat, uniqueCount, sampledRows: 5000 })),
-    onFetchFieldValues: undefined,
-  })));
-  expect(view.getByTitle(`${uniqueCount.toLocaleString()} unique values in a sample of 5,000 events. Expand to load field statistics.`).textContent).toBe(uniqueCount.toLocaleString());
-  expectNoTilde(view.container);
-});
-
-it('leaves exact field cardinality unmarked', () => {
-  const view = render(panel(props({ onFetchFieldValues: undefined })));
-  expect(view.getByTitle('1 unique values').textContent).toBe('1');
-  expect(view.queryByText(/^sample ·/)).toBeNull();
-  expectNoTilde(view.container);
 });

@@ -247,6 +247,9 @@ export function PrevalencePanel({
         totalOccurrences: number;
       }>();
       for (const p of response.hash_points) {
+        // host_count null = unknown (prevalence still warming / partial for
+        // this window): leave it unbaselined rather than plot a zero.
+        if (p.host_count == null) continue;
         hashPrevalenceMap.set(p.artifact.toLowerCase(), {
           hostCount: p.host_count,
           isRare: p.is_rare,
@@ -266,6 +269,9 @@ export function PrevalencePanel({
         totalOccurrences: number;
       }>();
       for (const p of response.domain_points) {
+        // host_count null = unknown (prevalence still warming / partial for
+        // this window): leave it unbaselined rather than plot a zero.
+        if (p.host_count == null) continue;
         domainPrevalenceMap.set(p.artifact.toLowerCase(), {
           hostCount: p.host_count,
           isRare: p.is_rare,

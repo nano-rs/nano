@@ -14,7 +14,6 @@
  */
 
 import { useState, useCallback, useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
 import { Sheet, SheetContent } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -110,13 +109,6 @@ function hydratePanelCustomRange(cr: TimeRange | undefined): TimeRangeValue {
 }
 
 export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorProps) {
-  const { data: activeSchema } = useQuery({
-    queryKey: ['schema-fields'],
-    queryFn: () => api.getSchemaFields(),
-    staleTime: Infinity,
-    gcTime: Infinity,
-  });
-  const strictOcsf = activeSchema?.schema === 'ocsf';
   const [title, setTitle] = useState(panel?.title || '');
   const [query, setQuery] = useState(panel?.query || '');
   const [queryMode, setQueryMode] = useState<'piped' | 'sql'>(panel?.queryMode || 'piped');
@@ -260,7 +252,7 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
     try {
       const response = await queryJob.start(() => api.melodBuildQuery({
         message: aiPrompt,
-        query_mode: queryMode === 'sql' && !strictOcsf ? 'advanced' : 'standard',
+        query_mode: queryMode === 'sql' ? 'advanced' : 'standard',
         time_range: {
           start: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
           end: new Date().toISOString(),
@@ -281,7 +273,7 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
     } finally {
       setAiLoading(false);
     }
-  }, [aiPrompt, queryMode, queryJob, strictOcsf]);
+  }, [aiPrompt, queryMode, queryJob]);
 
   return (
     <>
@@ -343,8 +335,6 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                     <button
                       type="button"
                       onClick={() => setQueryMode('sql')}
-                      disabled={strictOcsf}
-                      title={strictOcsf ? 'Raw SQL is intentionally unavailable on the tenant-pinned lake query path.' : undefined}
                       className={`h-[22px] px-2.5 rounded-[3px] text-[11.5px] font-medium transition-colors ${
                         queryMode === 'sql'
                           ? 'bg-card text-foreground shadow-[0_1px_3px_rgba(0,0,0,0.1)]'
@@ -431,9 +421,7 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                   value={query}
                   onChange={setQuery}
                   placeholder={queryMode === 'piped'
-                    ? strictOcsf
-                      ? 'metadata.log_source="apache" | stats count by http_response.code'
-                      : 'source_type="apache" | stats count by status_code'
+                    ? 'source_type="apache" | stats count by status_code'
                     : 'SELECT status_code, COUNT(*) as count FROM logs GROUP BY status_code'
                   }
                   minHeight={120}
@@ -457,11 +445,6 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                       $__timeTo
                     </code>
                     ) to scope the panel to the picker.
-                  </p>
-                )}
-                {strictOcsf && (
-                  <p className="text-[10.5px] leading-relaxed text-muted-foreground">
-                    Lake panels use tenant-scoped nPL over canonical OCSF 1.9 fields. Raw SQL is disabled so panels cannot bypass tenant, snapshot, or scan-budget controls.
                   </p>
                 )}
               </div>
@@ -572,9 +555,7 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                     <Input
                       value={drilldownTemplate}
                       onChange={e => setDrilldownTemplate(e.target.value)}
-                      placeholder={strictOcsf
-                        ? 'e.g., metadata.log_source=$metadata.log_source http_response.code=$value'
-                        : 'e.g., source_type=$source_type status_code=$value'}
+                      placeholder="e.g., source_type=$source_type status_code=$value"
                       className="h-[30px] text-[12px] font-mono"
                     />
                   </div>

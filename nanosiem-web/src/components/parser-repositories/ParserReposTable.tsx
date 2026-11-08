@@ -3,10 +3,6 @@
 // NAN-526 — header strip, toolbar, filter row, table, row, and per-row action.
 // Port of design-ref/shadcn/log-repos-view.jsx (header) and log-repos-table.jsx.
 
-import { Link } from 'react-router-dom';
-import { useAuth } from '@/contexts/AuthContext';
-import { parserSlug, systemSource } from '@/lib/source-catalog';
-import type { RepositoryParser } from '@/lib/api/parser-repositories';
 import type { ReactNode } from 'react';
 import {
   Box,
@@ -58,7 +54,7 @@ export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlo
         </div>
         <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed max-w-[760px]">
           Parser libraries synced from Git. Preview the VRL, inspect the normalized schema, and
-          import into a Source Config as a new log source — linked to upstream (auto-update) or
+          import as a new log source — linked to upstream (auto-update) or
           forked (edit locally; we'll flag drift).
         </div>
       </div>
@@ -100,7 +96,7 @@ export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlo
                 className={cn('w-[11px] h-[11px]', syncing && 'animate-spin')}
                 strokeWidth={1.5}
               />
-              {syncing ? (repo.raw.sync_started_at ? `Syncing since ${new Date(repo.raw.sync_started_at).toLocaleTimeString()}` : 'Syncing…') : 'Sync now'}
+              {syncing ? 'Syncing…' : 'Sync now'}
             </button>
           </div>
         )
@@ -273,7 +269,7 @@ export function ReposTable({
             <th className="py-2 pl-1 text-left font-medium w-[74px] @max-[900px]:hidden">Transport</th>
             <th className="py-2 pl-1 text-left font-medium w-[74px] @max-[680px]:hidden">Version</th>
             <th className="py-2 pl-1 text-left font-medium w-[100px] @max-[1060px]:hidden">Commit</th>
-            <th className="py-2 pl-1 pr-3 w-[150px]" />
+            <th className="py-2 pl-1 pr-3 w-[80px]" />
           </tr>
         </thead>
         <tbody>
@@ -409,7 +405,7 @@ function ParserRow({
         <div className="text-[10px] text-muted-foreground truncate">{parser.updated}</div>
       </td>
       <td className="py-2 pl-1 pr-3" onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-center justify-end gap-2"><OnboardLink parser={parser.raw} /><RowAction parser={parser} onAction={onAction} access={actionAccess} /></div>
+        <RowAction parser={parser} onAction={onAction} access={actionAccess} />
       </td>
     </tr>
   );
@@ -542,10 +538,4 @@ function RowAction({
       </Tooltip>
     </PermissionAction>
   );
-}
-
-function OnboardLink({ parser }: { parser: RepositoryParser }) {
-  const { hasPermission } = useAuth();
-  if (!hasPermission('log_sources:create') || parser.kind === 'enrichment' || systemSource(parserSlug(parser))) return null;
-  return <Link className="inline-flex h-6 items-center px-2 rounded border border-border text-[11.5px] hover:bg-muted" to={`/ingestion/log-sources/new?type=${encodeURIComponent(parser.id)}`}>Onboard</Link>;
 }

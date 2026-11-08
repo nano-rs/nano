@@ -1,5 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Validated native Vector stages and tenant-owned immutable lookup data.
+//! Validated native Vector stages and source-owned immutable lookup data.
+//!
+//! ClickHouse-product port (NAN-4919) differences from main:
+//! - **Lookup** is a compiler-owned remap carrying the snapshot inline as a
+//!   VRL object literal, so it needs no enrichment-table file (nothing to stage,
+//!   promote, publish or sync beside the parser TOML) and calls no
+//!   `get_enrichment_table_record`. The guard refuses enrichment-table
+//!   functions and `enrichment_tables` in every parser document.
+//! - **Route first-match** renders as a chain of single-branch `route`s,
+//!   each fed by the previous `_unmatched`: the pinned nano Vector image has
+//!   no `exclusive_route`.
+//! - **Combine** renders main's reduce + fixed Lua gate graph, but the pinned
+//!   image ships neither transform, so [`deployable`] refuses it at publish and
+//!   deploy until the image carries them ([`RUNTIME_TRANSFORMS_ENV`]).
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use sha2::Digest;
@@ -10,7 +23,54 @@ pub const MAX_EXPIRE_SEC: u64 = 5;
 pub const MAX_DEDUPE_EVENTS: usize = 5000;
 
 pub const KINDS: &[&str] = &["dedupe", "combine", "route", "lookup"];
-pub const LOOKUP_ROOT: &str = "${NANO_PIPE_LOOKUP_ROOT:-/etc/vector/sources/parsers}";
+/// Total bytes of lookup cells one step may embed in its compiled remap.
+pub const MAX_LOOKUP_BYTES: usize = 256 * 1024;
+
+/// Transform types the pinned Vector image (`ghcr.io/nano-rs/vector:0.61.0-nano.2`)
+/// ships, from `vector list`. The fork is built with a minimal feature set.
+pub const PINNED_RUNTIME_TRANSFORMS: &[&str] = &[
+    "dedupe",
+    "filter",
+    "metric_to_log",
+    "remap",
+    "route",
+    "throttle",
+    "trace_to_log",
+];
+/// Comma-separated extra transform types a deployment's Vector image provides
+/// (e.g. `reduce,lua` once the fork enables them). Read by nano-api only.
+pub const RUNTIME_TRANSFORMS_ENV: &str = "NANO_PIPE_VECTOR_TRANSFORMS";
+
+/// Transform types the deployment's Vector can run.
+pub fn runtime_transforms() -> BTreeSet<String> {
+    let mut set: BTreeSet<String> = PINNED_RUNTIME_TRANSFORMS.iter().map(|s| s.to_string()).collect();
+    if let Ok(extra) = std::env::var(RUNTIME_TRANSFORMS_ENV) {
+        set.extend(
+            extra
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_')),
+        );
+    }
+    set
+}
+
+/// Whether `plan` can be published to a Vector that runs `transforms`. Preview
+/// simulates every kind; only publication needs the runtime components.
+pub fn deployable_with(plan: &Plan, transforms: &BTreeSet<String>) -> Result<(), String> {
+    let combines = plan.steps.iter().any(|s| s.enabled && s.kind == "combine");
+    if combines && !(transforms.contains("reduce") && transforms.contains("lua")) {
+        return Err("Combine needs Vector's reduce and lua transforms, which this deployment's \
+                    Vector image does not include. Preview it here; disable the step to publish."
+            .into());
+    }
+    Ok(())
+}
+
+/// [`deployable_with`] against this deployment's runtime.
+pub fn deployable(plan: &Plan) -> Result<(), String> {
+    deployable_with(plan, &runtime_transforms())
+}
 
 #[derive(Clone, Debug)]
 pub struct Merge {
@@ -276,6 +336,7 @@ pub fn parse(step: &Step) -> Result<Native, String> {
             }
             let mut data = Vec::new();
             let mut identities = BTreeSet::new();
+            let mut total_bytes = 0usize;
             let columns: BTreeSet<String> = matches.keys().chain(outputs.keys()).cloned().collect();
             for row in rows {
                 let row = row
@@ -293,9 +354,16 @@ pub fn parse(step: &Step) -> Result<Native, String> {
                         if value.len() > 4096 {
                             return Err("Lookup cell exceeds 4096 bytes".into());
                         }
+                        total_bytes += value.len() + key.len();
                         Ok((key.clone(), value.to_string()))
                     })
                     .collect::<Result<_, String>>()?;
+                if total_bytes > MAX_LOOKUP_BYTES {
+                    return Err(format!(
+                        "A lookup snapshot holds at most {} KiB of cells",
+                        MAX_LOOKUP_BYTES / 1024
+                    ));
+                }
                 let identity: Vec<_> = matches.keys().map(|k| row[k].clone()).collect();
                 if !identities.insert(identity) {
                     return Err("Lookup match keys must be unique".into());
@@ -320,39 +388,48 @@ pub fn parse(step: &Step) -> Result<Native, String> {
 }
 
 impl Lookup {
-    pub fn csv(&self) -> Vec<u8> {
-        let columns: Vec<&String> = self.rows[0].keys().collect();
-        let row = |values: Vec<&str>| {
-            values
-                .into_iter()
-                .map(|v| format!("\"{}\"", v.replace('"', "\"\"")))
-                .collect::<Vec<_>>()
-                .join(",")
-                + "\n"
-        };
-        let mut csv = row(columns.iter().map(|v| v.as_str()).collect());
-        for values in &self.rows {
-            csv.push_str(&row(columns.iter().map(|k| values[*k].as_str()).collect()));
+    /// The compiler-owned lookup remap. The snapshot is a nested VRL object
+    /// literal keyed by the match columns in column order; matching uses VRL's
+    /// own `to_string` conversion (so `1.0` matches the cell `"1"`), exactly as
+    /// the batch preview does. Only allowlisted functions are called.
+    pub fn program(&self) -> Result<String, String> {
+        let mut tree = serde_json::Map::new();
+        for row in &self.rows {
+            let mut node = &mut tree;
+            let keys: Vec<&String> = self.matches.keys().collect();
+            for (depth, column) in keys.iter().enumerate() {
+                let cell = row[*column].clone();
+                if depth + 1 == keys.len() {
+                    let outputs: serde_json::Map<String, Value> = self
+                        .outputs
+                        .keys()
+                        .map(|c| (c.clone(), Value::String(row[c].clone())))
+                        .collect();
+                    node.insert(cell, Value::Object(outputs));
+                } else {
+                    node = node
+                        .entry(cell)
+                        .or_insert_with(|| Value::Object(Default::default()))
+                        .as_object_mut()
+                        .ok_or("Lookup match keys must be unique")?;
+                }
+            }
         }
-        csv.into_bytes()
-    }
-    pub fn program(&self, table_id: &str) -> Result<String, String> {
-        let pairs = self
+        let path = self
             .matches
-            .iter()
-            .map(|(column, path)| {
-                Ok(format!(
-                    "{}: to_string({}) ?? \"\"",
-                    quote(column),
-                    field(path)?
-                ))
-            })
+            .values()
+            .map(|path| Ok(format!("to_string({}) ?? \"\"", field(path)?)))
             .collect::<Result<Vec<_>, String>>()?;
-        let mut code=format!("# nano-pipe-lookup-name: {}\nnano_lookup, nano_lookup_error = get_enrichment_table_record({}, {{ {} }}, case_sensitive: true)\n",quote(&self.table),quote(table_id),pairs.join(", "));
+        let mut code = format!(
+            "# nano-pipe-lookup-name: {}\nnano_lookup = get({}, [{}]) ?? null\n",
+            quote(&self.table),
+            vrl_value(&Value::Object(tree)),
+            path.join(", ")
+        );
         if self.missing_error {
-            code.push_str("if nano_lookup_error != null { abort }\n");
+            code.push_str("if !is_object(nano_lookup) { abort }\n");
         }
-        code.push_str("if nano_lookup_error == null {\n");
+        code.push_str("if is_object(nano_lookup) {\n");
         for (column, path) in &self.outputs {
             code.push_str(&format!(
                 "  {} = get!(nano_lookup, [{}])\n",
@@ -365,13 +442,7 @@ impl Lookup {
     }
 }
 
-pub fn table_id(prefix: &str, index: usize) -> String {
-    format!("{prefix}_pipe_{index}_lookup")
-}
-pub fn table_file(prefix: &str, index: usize) -> String {
-    format!("{}_lookup_{index}.csv", prefix)
-}
-
+/// Whether `name` is a component the pipeline compiler generates for `prefix`.
 pub fn owns_component(prefix: &str, name: &str) -> bool {
     let Some(tail) = name
         .strip_prefix(prefix)
@@ -390,115 +461,11 @@ pub fn owns_component(prefix: &str, name: &str) -> bool {
         "control", "stash", "restore",
     ]
     .contains(&suffix)
-        || suffix
-            .strip_prefix("branch_")
-            .is_some_and(|value| value.parse::<usize>().is_ok_and(|i| i < 16))
-}
-fn lookup_index(prefix: &str, name: &str) -> Result<usize, String> {
-    name.strip_prefix(&format!("{prefix}_pipe_"))
-        .and_then(|s| s.strip_suffix("_lookup"))
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|i| *i < 50)
-        .ok_or_else(|| "Lookup table is outside its source namespace".into())
-}
-pub fn lookup_files(prefix: &str, document: &toml::Table) -> Result<Vec<String>, String> {
-    let Some(tables) = document.get("enrichment_tables") else {
-        return Ok(vec![]);
-    };
-    let tables = tables
-        .as_table()
-        .ok_or("Enrichment tables must be a table")?;
-    let mut paths = Vec::new();
-    for (name, table) in tables {
-        let index = lookup_index(prefix, name)?;
-        let table = table
-            .as_table()
-            .ok_or("Lookup definition must be a table")?;
-        if table
-            .keys()
-            .any(|key| !["type", "file"].contains(&key.as_str()))
-            || table.get("type").and_then(toml::Value::as_str) != Some("file")
-        {
-            return Err("Only source-owned CSV lookup tables are allowed".into());
-        }
-        let file = table
-            .get("file")
-            .and_then(toml::Value::as_table)
-            .ok_or("Lookup file definition is missing")?;
-        if file
-            .keys()
-            .any(|key| !["path", "encoding"].contains(&key.as_str()))
-        {
-            return Err("Unknown lookup file setting".into());
-        }
-        let expected = format!("{LOOKUP_ROOT}/{}", table_file(prefix, index));
-        if file.get("path").and_then(toml::Value::as_str) != Some(expected.as_str()) {
-            return Err("Lookup path must be the managed source-owned snapshot".into());
-        }
-        let encoding = file
-            .get("encoding")
-            .and_then(toml::Value::as_table)
-            .ok_or("CSV encoding is missing")?;
-        if encoding
-            .keys()
-            .any(|key| !["type", "include_headers"].contains(&key.as_str()))
-            || encoding.get("type").and_then(toml::Value::as_str) != Some("csv")
-            || encoding.get("include_headers") != Some(&toml::Value::Boolean(true))
-        {
-            return Err("Lookup encoding must be CSV with headers".into());
-        }
-        paths.push(format!("sources/parsers/{}", table_file(prefix, index)));
-    }
-    Ok(paths)
-}
-pub fn restore_lookup_paths(prefix: &str, text: &str) -> Result<String, String> {
-    let mut doc: toml::Table = text.parse().map_err(|e| format!("{e}"))?;
-    let Some(tables) = doc
-        .get_mut("enrichment_tables")
-        .and_then(toml::Value::as_table_mut)
-    else {
-        return Ok(text.into());
-    };
-    for (name, table) in tables {
-        let index = lookup_index(prefix, name)?;
-        let expected = format!("{LOOKUP_ROOT}/{}", table_file(prefix, index));
-        let path = table
-            .get_mut("file")
-            .and_then(|file| file.get_mut("path"))
-            .ok_or("Lookup file path is missing")?;
-        if path.as_str() != Some(expected.replace('$', "$$").as_str()) {
-            return Err("Lookup path was not generated by the managed compiler".into());
-        }
-        *path = expected.into();
-    }
-    lookup_files(prefix, &doc)?;
-    toml::to_string(&doc).map_err(|e| e.to_string())
-}
-pub fn interpolation_scan(prefix: &str, text: &str) -> Result<String, String> {
-    let mut doc: toml::Table = text.parse().map_err(|e| format!("{e}"))?;
-    lookup_files(prefix, &doc)?;
-    if let Some(tables) = doc
-        .get_mut("enrichment_tables")
-        .and_then(toml::Value::as_table_mut)
-    {
-        for (_, table) in tables.iter_mut() {
-            *table
-                .get_mut("file")
-                .and_then(|file| file.get_mut("path"))
-                .ok_or("Lookup path missing")? = "managed-lookup.csv".into();
-        }
-    }
-    toml::to_string(&doc).map_err(|e| e.to_string())
-}
-pub fn lookup_calls_owned(prefix: &str, source: &str) -> bool {
-    let calls = regex::Regex::new(
-        r"(?:get_enrichment_table_record|find_enrichment_table_records)\s*!?\s*\(",
-    )
-    .expect("static lookup regex");
-    let literals=regex::Regex::new(r#"(?:get_enrichment_table_record|find_enrichment_table_records)\s*!?\s*\(\s*"([A-Za-z0-9_]+)"\s*,"#).expect("static lookup literal regex");
-    let tables: Vec<_> = literals.captures_iter(source).collect();
-    tables.len() == calls.find_iter(source).count()
-        && tables.iter().all(|m| lookup_index(prefix, &m[1]).is_ok())
+        || ["branch_", "route_"].iter().any(|prefix| {
+            suffix
+                .strip_prefix(prefix)
+                .is_some_and(|value| value.parse::<usize>().is_ok_and(|i| i < 16))
+        })
 }
 
 pub fn guard_transform(kind: &str, body: &toml::Table) -> Result<(), String> {
@@ -620,8 +587,6 @@ pub fn guard_transform(kind: &str, body: &toml::Table) -> Result<(), String> {
 
 pub struct Chain {
     pub transforms: toml::Table,
-    pub tables: toml::Table,
-    pub files: BTreeMap<String, Vec<u8>>,
     pub output: String,
     pub failures: Vec<String>,
 }
@@ -695,8 +660,6 @@ pub fn render(plan: &Plan, prefix: &str, input: &str) -> Result<Chain, String> {
     plan.validate()?;
     let mut chain = Chain {
         transforms: toml::Table::new(),
-        tables: toml::Table::new(),
-        files: BTreeMap::new(),
         output: input.into(),
         failures: vec![],
     };
@@ -776,9 +739,8 @@ pub fn render(plan: &Plan, prefix: &str, input: &str) -> Result<Chain, String> {
                     "\"count\": 1".into(),
                     format!("\"group_hash\": {}", signature(&keys, false)?),
                 ];
-                let mut checks = String::from(
-                    "del(._nano_pipe_metadata)\ndel(._nano_pipe_keys)\ndel(._nano_pipe_scope)\n",
-                );
+                let mut checks =
+                    String::from("del(._nano_pipe_metadata)\ndel(._nano_pipe_scope)\n");
                 for (i, merge) in merges.iter().enumerate() {
                     let value = format!("nano_value_{i}");
                     checks.push_str(&format!("{value} = {}\n", field(&merge.field)?));
@@ -794,8 +756,8 @@ pub fn render(plan: &Plan, prefix: &str, input: &str) -> Result<Chain, String> {
                     }
                 }
                 checks.push_str(&format!(". = {{ {} }}\n", pairs.join(", ")));
-                // Scope keys by the authored pipeline/revision as well as its
-                // member identities; a different combine must not share a UID.
+                // Scope group keys by the authored pipeline step, so two
+                // combines never share a group.
                 let scope = hex::encode(sha2::Sha256::digest(
                     serde_json::to_vec(&(prefix, index, plan)).map_err(|e| e.to_string())?,
                 ));
@@ -849,7 +811,6 @@ pub fn render(plan: &Plan, prefix: &str, input: &str) -> Result<Chain, String> {
                 strategies.insert("count".into(), "sum".into());
                 strategies.insert("group_hash".into(), "retain".into());
                 strategies.insert("_nano_pipe_metadata".into(), "discard".into());
-                strategies.insert("_nano_pipe_keys".into(), "array".into());
                 for (i, merge) in merges.iter().enumerate() {
                     strategies.insert(format!("value_{i}"), merge.strategy.clone().into());
                 }
@@ -880,24 +841,9 @@ pub fn render(plan: &Plan, prefix: &str, input: &str) -> Result<Chain, String> {
                 finish
             }
             Native::Lookup(lookup) => {
-                let table = table_id(prefix, index);
-                let file = table_file(prefix, index);
-                let mut definition = toml::Table::new();
-                definition.insert("type".into(), "file".into());
-                let mut config = toml::Table::new();
-                config.insert("path".into(), format!("{LOOKUP_ROOT}/{file}").into());
-                let mut encoding = toml::Table::new();
-                encoding.insert("type".into(), "csv".into());
-                encoding.insert("include_headers".into(), true.into());
-                config.insert("encoding".into(), encoding.into());
-                definition.insert("file".into(), config.into());
-                chain.tables.insert(table.clone(), definition.into());
-                chain
-                    .files
-                    .insert(format!("sources/parsers/{file}"), lookup.csv());
                 chain.transforms.insert(
                     name.clone(),
-                    remap(lookup.program(&table)?, vec![input]).into(),
+                    remap(lookup.program()?, vec![input]).into(),
                 );
                 chain.failures.push(format!("{name}.dropped"));
                 name
@@ -908,30 +854,38 @@ pub fn render(plan: &Plan, prefix: &str, input: &str) -> Result<Chain, String> {
                 branches,
                 fallback_drop,
             } => {
-                let mut body = transform(
-                    if fanout { "route" } else { "exclusive_route" },
-                    vec![input],
-                );
-                if fanout {
+                // Each branch's events come from `(route, output port)`.
+                let mut branch_inputs = Vec::new();
+                let unmatched = if fanout {
+                    let mut body = transform("route", vec![input]);
                     let mut routes = toml::Table::new();
                     for (i, branch) in branches.iter().enumerate() {
                         routes.insert(format!("branch_{i}"), branch.predicate.clone().into());
+                        branch_inputs.push(format!("{name}.branch_{i}"));
                     }
                     body.insert("route".into(), routes.into());
+                    chain.transforms.insert(name.clone(), body.into());
+                    format!("{name}._unmatched")
                 } else {
-                    let routes = branches
-                        .iter()
-                        .enumerate()
-                        .map(|(i, branch)| {
-                            let mut route = toml::Table::new();
-                            route.insert("name".into(), format!("branch_{i}").into());
-                            route.insert("condition".into(), branch.predicate.clone().into());
-                            toml::Value::Table(route)
-                        })
-                        .collect();
-                    body.insert("routes".into(), toml::Value::Array(routes));
-                }
-                chain.transforms.insert(name.clone(), body.into());
+                    // The pinned image has no `exclusive_route`. First-match is
+                    // a CHAIN of single-branch routes, each consuming the
+                    // previous one's `_unmatched`: a predicate's runtime error is
+                    // a non-match there, so the event moves on to the next
+                    // branch (negating an erroring predicate would error too
+                    // and drop the event — Codex P1, NAN-4919).
+                    let mut previous = input;
+                    for (i, branch) in branches.iter().enumerate() {
+                        let id = format!("{prefix}_pipe_{index}_route_{i}");
+                        let mut body = transform("route", vec![previous]);
+                        let mut routes = toml::Table::new();
+                        routes.insert("branch".into(), branch.predicate.clone().into());
+                        body.insert("route".into(), routes.into());
+                        chain.transforms.insert(id.clone(), body.into());
+                        branch_inputs.push(format!("{id}.branch"));
+                        previous = format!("{id}._unmatched");
+                    }
+                    previous
+                };
                 let mut inputs = Vec::new();
                 for (i, branch) in branches.iter().enumerate() {
                     let id = format!("{prefix}_pipe_{index}_branch_{i}");
@@ -942,7 +896,7 @@ pub fn render(plan: &Plan, prefix: &str, input: &str) -> Result<Chain, String> {
                     };
                     chain.transforms.insert(
                         id.clone(),
-                        remap(source, vec![format!("{name}.branch_{i}")]).into(),
+                        remap(source, vec![branch_inputs[i].clone()]).into(),
                     );
                     chain.failures.push(format!("{id}.dropped"));
                     inputs.push(id);
@@ -955,7 +909,7 @@ pub fn render(plan: &Plan, prefix: &str, input: &str) -> Result<Chain, String> {
                 };
                 chain.transforms.insert(
                     fallback.clone(),
-                    remap(source, vec![format!("{name}._unmatched")]).into(),
+                    remap(source, vec![unmatched]).into(),
                 );
                 chain.failures.push(format!("{fallback}.dropped"));
                 inputs.push(fallback);

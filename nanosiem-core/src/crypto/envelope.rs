@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Versioned bytes survive B/J/T serializers that retain only ciphertext and nonce.
 use super::{CryptoError, EncryptedData};
 use base64::{engine::general_purpose::STANDARD, Engine};

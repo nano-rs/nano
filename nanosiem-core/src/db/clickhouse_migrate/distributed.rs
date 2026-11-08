@@ -101,11 +101,7 @@ impl ClickHouseMigrator {
                 .fetch_one()
                 .await
                 .unwrap_or(0);
-            let physical = if local_exists > 0 {
-                local_name.as_str()
-            } else {
-                table
-            };
+            let physical = if local_exists > 0 { local_name.as_str() } else { table };
 
             let baseline = format!(
                 "CREATE ROW POLICY OR REPLACE rawsql_baseline_{name} ON {db}.{tbl}{oc} \
@@ -134,7 +130,7 @@ impl ClickHouseMigrator {
                 })?;
             }
             tracing::info!(
-                "raw-SQL audit row policies ensured on {}.{} (source col '{}'){}",
+                "NAN-2001: raw-SQL audit row policies ensured on {}.{} (source col '{}'){}",
                 self.database,
                 physical,
                 col,
@@ -228,7 +224,7 @@ impl ClickHouseMigrator {
                 })?;
             if exists > 0 {
                 tracing::info!(
-                    "raw-SQL user '{}' already present — leaving its \
+                    "NAN-2003: raw-SQL user '{}' already present — leaving its \
                      declaratively-managed grants untouched",
                     user
                 );
@@ -339,7 +335,7 @@ impl ClickHouseMigrator {
 
             created += 1;
             tracing::info!(
-                "created raw-SQL user '{}' with {} SELECT grant(s){}",
+                "NAN-2003: created raw-SQL user '{}' with {} SELECT grant(s){}",
                 user,
                 grant_count,
                 if on_cluster.is_empty() {
@@ -825,7 +821,8 @@ impl ClickHouseMigrator {
             }
 
             // DROP wrapper columns the source no longer has.
-            let source_names: Vec<String> = source_specs.iter().map(|(n, ..)| n.clone()).collect();
+            let source_names: Vec<String> =
+                source_specs.iter().map(|(n, ..)| n.clone()).collect();
             for col in stale_wrapper_columns(&dist_cols, &source_names) {
                 if !is_safe_identifier(&col) {
                     tracing::warn!(
@@ -870,7 +867,10 @@ impl ClickHouseMigrator {
         }
 
         if changed > 0 {
-            tracing::info!("Reconciled {} column(s) on distributed wrappers", changed);
+            tracing::info!(
+                "Reconciled {} column(s) on distributed wrappers",
+                changed
+            );
         }
         Ok(changed)
     }
@@ -886,17 +886,18 @@ impl ClickHouseMigrator {
     /// `ensure_distributed_tables` runs — which is AFTER `run_init_sql` /
     /// `run_migrations`. Reading the wrapper at init time would abort cluster boot
     /// with `UNKNOWN_TABLE`.
-    const DICT_REFRESH_MV_BASES: &'static [(&'static str, &'static str)] = &[
+    pub(super) const DICT_REFRESH_MV_BASES: &'static [(&'static str, &'static str)] = &[
         ("ip_enrichment_dict_refresh", "ip_enrichments"),
+        // NAN-4948 (migration 184): the platform feed commit-marker subquery
+        // (`source_id GLOBAL IN (SELECT argMax(storage_key, …) FROM platform_feed_commits …)`).
+        ("ip_enrichment_dict_refresh", "platform_feed_commits"),
         ("ioc_enrichment_dict_refresh", "custom_enrichment_results"),
-        (
-            "custom_enrichment_dict_refresh",
-            "custom_enrichment_results",
-        ),
-        (
-            "custom_ioc_enrichment_dict_refresh",
-            "custom_enrichment_results",
-        ),
+        ("ioc_enrichment_dict_refresh", "platform_feed_commits"),
+        ("custom_enrichment_dict_refresh", "custom_enrichment_results"),
+        ("custom_ioc_enrichment_dict_refresh", "custom_enrichment_results"),
+        // NAN-4902 lane G (migration 182): the same body's commit-marker
+        // subquery (`version GLOBAL IN (SELECT max(version) FROM ioc_list_commits …)`).
+        ("custom_ioc_enrichment_dict_refresh", "ioc_list_commits"),
         ("user_registry_dict_refresh", "user_registry"),
         // NAN-1732 (P2-D): prevalence finalized-host_count refresh MVs. Their FROM
         // (and the two-step `GLOBAL IN` recent-keys subquery — repoint_from_table
@@ -904,10 +905,7 @@ impl ClickHouseMigrator {
         // wrapper on clusters so uniqMerge fans in the global count; single-node
         // keeps the local summary. See clickhouse/160_prevalence_finalized_host_count.sql.
         ("hash_prevalence_final_refresh", "hash_prevalence_summary"),
-        (
-            "domain_prevalence_final_refresh",
-            "domain_prevalence_summary",
-        ),
+        ("domain_prevalence_final_refresh", "domain_prevalence_summary"),
         ("ip_prevalence_final_refresh", "ip_prevalence_summary"),
     ];
 
@@ -1048,7 +1046,8 @@ pub(super) fn repoint_from_table(body: &str, db: &str, base: &str) -> Option<Str
     while i < body.len() {
         if body[i..].starts_with(&needle) {
             let after = bytes.get(i + nb.len()).copied();
-            let is_ident = matches!(after, Some(c) if c.is_ascii_alphanumeric() || c == b'_');
+            let is_ident =
+                matches!(after, Some(c) if c.is_ascii_alphanumeric() || c == b'_');
             if !is_ident {
                 out.push_str(&wrapper);
                 i += nb.len();
@@ -1074,7 +1073,8 @@ pub(super) fn repoint_from_table(body: &str, db: &str, base: &str) -> Option<Str
 /// Split out from [`ClickHouseMigrator::reconcile_distributed_columns`] so the
 /// set difference is unit-testable without a live cluster.
 pub(super) fn stale_wrapper_columns(wrapper: &[String], source: &[String]) -> Vec<String> {
-    let source_set: std::collections::HashSet<&str> = source.iter().map(String::as_str).collect();
+    let source_set: std::collections::HashSet<&str> =
+        source.iter().map(String::as_str).collect();
     wrapper
         .iter()
         .filter(|c| !source_set.contains(c.as_str()))
@@ -1091,7 +1091,8 @@ pub(super) fn columns_to_add<'a>(
     wrapper: &[String],
     source_specs: &'a [(String, String, String, String)],
 ) -> Vec<(&'a String, &'a String, &'a String, &'a String)> {
-    let wrapper_set: std::collections::HashSet<&str> = wrapper.iter().map(String::as_str).collect();
+    let wrapper_set: std::collections::HashSet<&str> =
+        wrapper.iter().map(String::as_str).collect();
     let mut missing: Vec<_> = source_specs
         .iter()
         .filter(|(name, ..)| !wrapper_set.contains(name.as_str()))

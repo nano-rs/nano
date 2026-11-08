@@ -529,3 +529,40 @@ describe('paged poll cursor handoff (NAN-3264)', () => {
     assert.equal(w.startMs, watermark - TAIL_LOOKBACK_MS);
   });
 });
+
+describe('paged poll: bursts that share one millisecond (NAN-4927 review)', () => {
+  const INSTANT = T0 + 600_000;
+  // 600 unique events at one millisecond, plus older background traffic.
+  const burst = Array.from({ length: 600 }, (_, i) => ({ uid: `b${String(i).padStart(3, '0')}`, ms: INSTANT }));
+  const older = Array.from({ length: 50 }, (_, i) => ({ uid: `o${i}`, ms: INSTANT - 1_000 - i * 1_000 }));
+  const all = [...burst, ...older];
+  const rowTimeMs = (e: { ms: number }) => e.ms;
+  const fetchPage = async (w: TailWindow) => all.filter(e => e.ms >= w.startMs && e.ms <= w.endMs).slice(0, TAIL_FETCH_LIMIT);
+  // Stable order within the instant (event id), paged by offset.
+  const fetchTied = async (instantMs: number, offset: number) => all
+    .filter(e => e.ms === instantMs)
+    .sort((a, b) => (a.uid < b.uid ? 1 : -1))
+    .slice(offset, offset + TAIL_FETCH_LIMIT);
+
+  it('drains all 600 events at one millisecond before reporting caught up', async () => {
+    const cursorMs = INSTANT - 120_000;
+    const polled = await collectTailPages({ fetchPage, fetchTied, rowTimeMs, cursorMs, window: tailWindow(cursorMs, INSTANT + 5_000, 15_000) });
+    const uids = new Set(polled.rows.map(e => e.uid));
+    for (const e of burst) assert.ok(uids.has(e.uid), `${e.uid} must arrive`);
+    assert.equal(polled.complete, true);
+    assert.equal(polled.capped, false);
+  });
+
+  it('a burst at the cursor instant itself is drained too', async () => {
+    const polled = await collectTailPages({ fetchPage, fetchTied, rowTimeMs, cursorMs: INSTANT, window: tailWindow(INSTANT, INSTANT + 5_000, 15_000) });
+    assert.equal(new Set(polled.rows.map(e => e.uid)).size >= 600, true);
+    assert.equal(polled.complete, true);
+  });
+
+  it('without a tied-instant reader the burst is reported incomplete, never caught up', async () => {
+    const cursorMs = INSTANT - 120_000;
+    const polled = await collectTailPages({ fetchPage, rowTimeMs, cursorMs, window: tailWindow(cursorMs, INSTANT + 5_000, 15_000) });
+    assert.equal(polled.complete, false);
+    assert.equal(polled.capped, false);
+  });
+});

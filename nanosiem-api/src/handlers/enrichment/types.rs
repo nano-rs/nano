@@ -17,41 +17,14 @@ pub struct EnrichmentSourceInfo {
     pub name: String,
     pub source_type: String,
     pub description: Option<String>,
-    pub download_url: Option<String>,
     pub enabled: bool,
     pub last_sync_at: Option<String>,
     pub last_sync_status: Option<String>,
     pub record_count: i64,
-    /// rows deprovisioned by the reconcile job (push sources).
+    /// NAN-1124: rows deprovisioned by the reconcile job (push sources).
     pub deprovisioned_count: i64,
     /// Sanitized config (API keys masked)
     pub config: serde_json::Value,
-}
-
-/// Request to configure an enrichment source
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct ConfigureEnrichmentRequest {
-    pub download_url: String,
-}
-
-/// Response for sync operation (synchronous - legacy)
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-// Schema renamed for the spec only (NAN-2270): handlers::mitre has its own SyncResponse, and the
-// OpenAPI component registry is flat. The Rust name stays.
-#[schema(as = EnrichmentSyncResponse)]
-pub struct SyncResponse {
-    pub success: bool,
-    pub records_loaded: u64,
-    pub duration_ms: u64,
-    pub error: Option<String>,
-}
-
-/// Response for async sync operation (202 Accepted or 409 Conflict)
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct AsyncSyncResponse {
-    pub source_id: String,
-    pub status: String,
-    pub message: String,
 }
 
 /// Response for enrichment stats
@@ -75,35 +48,12 @@ pub struct IpLookupResponse {
     pub as_domain: Option<String>,
 }
 
-/// Request to configure auto-sync settings
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct AutoSyncConfigRequest {
-    /// Enable or disable auto-sync
-    pub enabled: bool,
-    /// Sync interval in hours (default: 24)
-    #[serde(default = "default_sync_interval")]
-    pub interval_hours: u64,
-}
-
-fn default_sync_interval() -> u64 {
-    24
-}
-
-/// Response for auto-sync configuration
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct AutoSyncConfigResponse {
-    pub source_id: String,
-    pub auto_sync_enabled: bool,
-    pub sync_interval_hours: u64,
-    pub next_sync_at: Option<String>,
-}
-
 // NAN-1111: ConfigureThreatFoxRequest, IocLookupResponse, IocStatsResponse,
 // and ConfigureTorRequest used to live here. Both providers sunset to the
 // marketplace + Deno (nano-rs/nano-enrichments); the IOC lookup/stats
 // endpoints they shared had no remaining UI callers and were deleted with
-// the rest. See project_ipinfo_lite_stays_native for why IPinfo Lite
-// stays native instead.
+// the rest. IPinfo Lite comes from nano's signed platform feed bundle
+// (NAN-4959).
 
 /// Request to look up an artifact via agent enrichment providers
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -132,8 +82,8 @@ pub struct AgentLookupResponse {
     pub artifact: String,
     pub artifact_type: String,
     pub results: Vec<AgentLookupProviderResult>,
-    /// Why no external provider was called ( `internal_domain` when
-    /// the artifact is under an internal DNS suffix; privacy and cost).
+    /// Why no external provider was called (`internal_domain` when the
+    /// artifact is under an internal DNS suffix; privacy and cost).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
 }

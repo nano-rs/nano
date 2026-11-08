@@ -19,7 +19,7 @@ fn lookup_cmd(table: &str) -> LookupCommandInfo {
         event_field: "src_ip".to_string(),
         key_field: "src_ip".to_string(),
         output_fields: None,
-        output_renames: Vec::new(),
+        output_renames: vec![],
         output_new: false,
         case_insensitive: false,
     }

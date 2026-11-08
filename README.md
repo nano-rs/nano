@@ -34,9 +34,8 @@
 
 nano is built around a small set of beliefs:
 
-- **OCSF 1.9 is the contract.** Events land as typed OCSF 1.9 Parquet on
-  object storage, queried by an embedded chDB engine. Searches stay fast
-  because the schema does the work, and no database cluster is required.
+- **The UDM is the contract.** Logs land in 75+ explicit columns; ad-hoc fields
+  go in `ext`. Searches stay fast because the schema does the work.
 - **nPL beats SQL for hunting.** A piped query language (`error | stats count
   by src_ip | where count > 10`) keeps analyst muscle memory portable.
 - **Detections have a lifecycle.** Rules move Staging → Live → Alerting. Match
@@ -67,60 +66,23 @@ curl -fsSL https://get.nano.rs | bash
 </p>
 
 The installer clones this repo to `~/nano`, generates secrets, pulls the
-prebuilt images from `ghcr.io/nano-rs`, verifies their digests against
-[`images.lock`](./images.lock), brings up the lean OCSF 1.9 lake stack
-(PostgreSQL + Dragonfly + RustFS object store + one single-tenant lake cell
-with an embedded chDB engine + enrichment, telemetry, and bucket-drop
-services + api/search/jobs/web + Vector + nginx), and walks you through
-creating the first admin account. Open `http://localhost` when it finishes.
+prebuilt images from `ghcr.io/nano-rs`, brings up the stack
+(postgres + clickhouse + api/search/jobs/web + vector + nginx), and walks
+you through creating the first admin account. Open `http://localhost`
+when it finishes.
 
-**Prereqs:** Docker with Compose v2.24 or newer, git, openssl, curl, python3.
-Images are published for x86-64 and arm64.
+**Prereqs:** Docker, docker compose v2, git, openssl, curl.
 
-**Minimum host:** an 8 GiB VM. The installer derives its visible-memory minimum
-from measured service peaks and fits the service and cell budgets within 95%
-of the memory actually reported, including on a nominal 8 GiB VM reporting
-7,934 MiB. On Docker Desktop, use the VM's memory setting. The supported event
-rate scales with available memory. The 8 GiB size is a trial tier for personal
-or test data, with a reference load of 150 events/second sustained and bursts
-to 300 events/second. Use a dedicated VM with at least 16 GiB for higher rates
-and bulk replays. The release visibility target for the trial tier is that
-every acknowledged marker becomes searchable within five minutes at the
-reference load. The HEC gateway returns retryable 503 responses when native
-commit lag or a busy writer's commit stall reaches 30 seconds, or fresh commit
-status is unavailable. A successful HEC response still requires durable Bronze
-delivery; senders must retry 503 responses.
+**Minimum host:** 2 vCPU, 4 GB RAM — the lowest stable spec, suitable for up to ~10 GB/day of ingest. Below this, ClickHouse and the API will OOM under load.
 
-**Ports:** 80 (web UI and API through nginx), 8080 (HTTP ingest), 8088 (HEC),
-and 8090 (enrichment ingress) listen on all interfaces. OTLP (4317/4318),
-Vector native (6000), Fluent Forward (24224), and the object store
-(9000/9001) bind to 127.0.0.1 only.
+**Hardware sizing:** `install.sh` detects CPU and RAM on every install or rerun and scales ClickHouse query/merge/insert settings, PostgreSQL, Vector, and the containers while reserving host headroom. The 2 vCPU / 4 GB floor keeps ClickHouse at 2 GB with the NAN-4988 admission limits. Add any setting after the installer-owned sizing block in `.env` to pin an operator override.
 
-### Ingest: Vector, Tenzir, or both
-
-The default install runs Vector (HTTP `/ingest`, HEC, OTLP, pull connectors)
-**and** the OCSF bucket drop, where Tenzir writes OCSF 1.9 files straight into
-the object store. For a Tenzir-only install without Vector:
-
-```sh
-curl -fsSL https://get.nano.rs | bash -s -- --tenzir
-```
-
-Re-running the installer keeps the mode an install already has;
-`--add-vector` adds Vector to a Tenzir-only install. See
-[`tenzir/AGENTS.md`](./tenzir/AGENTS.md) for writing Tenzir pipelines.
-
-### Upgrading from the ClickHouse edition
-
-The ClickHouse edition is retired and **cannot be upgraded in place**. Run
-over a ClickHouse install, the installer stops before changing anything and
-prints the steps: back up what you need, `docker compose down` the old stack
-(its volumes are kept), and install the current edition into a new
-directory. Nothing is migrated; the new install starts empty. The last
-ClickHouse source is the `legacy/clickhouse` branch, unsupported.
+**ClickHouse memory:** without enrichment, 2–4 GB for ClickHouse is fine for small and test tenants. **Enrichment (the IPinfo, Tor and ThreatFox feeds, on by default) requires 6 GB:** use a larger host or set `CLICKHOUSE_MEM_LIMIT=6G` in `.env`, or turn the feeds off with `PLATFORM_FEEDS_AUTO_UPDATE=false`. Plan for 6 GB if you enrich. With too little memory the IP dictionary cannot load: events get no geo/ASN, ingest keeps working, and SIEM Health shows the dictionary failing and how much memory the dictionaries take. `install.sh` prints a notice when feeds are on and the limit is below 6 GB.
 
 For non-interactive installs, pre-set `NANO_ADMIN_EMAIL`,
-`NANO_ADMIN_NAME`, `NANO_ADMIN_PASSWORD`, and `NANO_BASE_URL` before piping. See [`.env.opensource.example`](./.env.opensource.example) for
+`NANO_ADMIN_NAME`, `NANO_ADMIN_PASSWORD`, `NANO_BASE_URL`, and optionally
+`NANO_SCHEMA_PROFILE` (`udm` | `ocsf`, see [below](#schema-profile-udm-or-ocsf))
+before piping. See [`.env.opensource.example`](./.env.opensource.example) for
 the full env-var surface.
 
 ### HTTPS / TLS
@@ -146,33 +108,49 @@ in `.env` so login cookies get the `Secure` flag. Renew certs out of band and
 `docker compose ... restart nginx` to pick them up. See
 [`config/nginx/ssl/README.md`](./config/nginx/ssl/README.md) for details.
 
-## Storage: the lake
+## Schema profile: OCSF or UDM
 
-Events are stored as OCSF 1.9 Parquet on a bundled RustFS object store and
-queried by the lake cell's embedded chDB engine. There is no ClickHouse server. See
-[docs/deployment/open-lean-install.md](./docs/deployment/open-lean-install.md)
-for ingest modes, upgrades, backups and release notes.
+New installs store events in **OCSF** (Open Cybersecurity Schema Framework
+1.9), the open, vendor-neutral standard schema. Fields are OCSF paths
+(`src_endpoint.ip`, `actor.user.name`, `process.cmd_line`,
+`metadata.log_source`, …), and the official parsers and detection rules follow
+the OCSF content channel (`main` in
+[nano-rs/parsers](https://github.com/nano-rs/parsers) and
+[nano-rs/rules](https://github.com/nano-rs/rules)).
 
-> The retired ClickHouse edition (UDM + the ClickHouse `legacy` compose
-> profile) lives on branch `legacy/clickhouse`, unsupported. Existing
-> ClickHouse installs move by fresh install (see
-> [Upgrading from the ClickHouse edition](#upgrading-from-the-clickhouse-edition)).
+**UDM** (Unified Data Model), nano's earlier native schema with short field
+names (`src_ip`, `dest_ip`, `process_name`, …), stays supported for existing
+installs. Its content stays on the `legacy/clickhouse` branch of both
+repositories. Existing installs keep the profile they were installed with;
+moving one to OCSF is a separate, planned migration.
+
+```sh
+# Interactive install prompts for this (default: ocsf). To preset it:
+NANO_SCHEMA_PROFILE=ocsf curl -fsSL https://get.nano.rs | bash
+# Legacy UDM schema:
+NANO_SCHEMA_PROFILE=udm curl -fsSL https://get.nano.rs | bash
+```
+
+> **Pick once.** The schema profile is fixed at first install and recorded in
+> `.env`. It selects the ClickHouse tables, parsers, and fields the whole stack
+> runs against, so it can't be switched after you've ingested data without a
+> full re-ingest into a fresh deployment. A new install defaults to `ocsf`; an
+> `.env` with no `NANO_SCHEMA_PROFILE` predates the choice and keeps `udm`.
 
 ## What's in the box
 
-- **Ingestion** — Vector-based collectors with VRL parsers (HTTP push, HEC,
-  OTLP, syslog, S3 pull), and Tenzir writing OCSF files straight into the
-  object store. Parser content is published separately under Apache-2.0.
-- **Storage** — OCSF 1.9 Parquet on a bundled RustFS object store, run by a
-  single-tenant lake cell; PostgreSQL for metadata.
-- **Search** — nPL parser and compiler, executed by the lake cell's embedded
-  chDB engine; field-stat sidebar.
-- **Detection** — scheduled (cron) + real-time (five-second micro-batch) rules,
-  findings logged back into the lake, prevalence-based noise reduction.
+- **Ingestion** — Vector-based collectors with VRL parsers (HTTP push,
+  syslog, S3 pull). Parser content is published separately under Apache-2.0.
+- **Storage** — ClickHouse for events (daily partitions, 90-day default TTL),
+  PostgreSQL for metadata.
+- **Search** — nPL parser, ClickHouse SQL generator, field-stat sidebar,
+  bloom-filter-aware tokenization.
+- **Detection** — scheduled (cron) + real-time (materialized view) rules,
+  signal logging, prevalence-based noise reduction.
 - **Alerts** — lifecycle (new → triaged → resolved), grouping, dedup.
 - **Marketplace** — install + configure out-of-the-box enrichment
-  providers (identity and geolocation in open core).
-  Coverage indicator across OCSF fields.
+  providers (threat intel, identity, asset inventory, geolocation).
+  Coverage indicator across UDM fields.
 - **Web UI** — React SPA, lazy-loaded, runs in any modern browser.
 
 <p align="center">
@@ -196,7 +174,7 @@ for ingest modes, upgrades, backups and release notes.
 </p>
 
 <p align="center">
-  <em>Marketplace — enrichment catalog (identity and geolocation in open core). Coverage indicator tracks which OCSF fields have a provider behind them.</em>
+  <em>Marketplace — out-of-the-box enrichment catalog (threat intel, identity, asset inventory, geolocation). Coverage indicator tracks which UDM fields have a provider behind them.</em>
 </p>
 
 ## Develop from source
@@ -204,9 +182,10 @@ for ingest modes, upgrades, backups and release notes.
 The [Install](#install) flow above is the right path if you just want
 to run nano. To hack on the engine itself:
 
-- Prereqs: Rust stable, Node 20+, Docker
-- `./install.sh` from this checkout brings up the lean stack
-  (`COMPOSE_PROFILES=lean`) that the services run against
+- Prereqs: Rust stable, Node 20+, PostgreSQL 18+, ClickHouse 24+
+- Bring up Postgres + ClickHouse via your usual local tooling
+- `./scripts/start-microservices-dev.sh` — launches `nanosiem-api` (3000),
+  `nanosiem-search` (3002), and `nanosiem-jobs` with sane local defaults
 - `cd nanosiem-web && npm install && npm run dev` (port 5173)
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for the day-to-day dev workflow
@@ -217,31 +196,29 @@ Full documentation: **[nano.rs/docs](https://nano.rs/docs/getting-started/first-
 ## Architecture
 
 ```
-+------------+     +------------+     +------------------+
-|  Vector    | --> | nanosiem-  | --> | RustFS object    |
-|  parsers   |     | api  :3000 |     | store (OCSF 1.9  |
-+------------+     +------------+     | Parquet)         |
-                         |            +------------------+
-                         v                     ^
-                   +------------+     +--------+---------+
-                   | PostgreSQL |     | lake cell:       |
-                   | (rules,    |     | ingest, chDB     |
-                   |  alerts,   |     | query, detect,   |
-                   |  audit)    |     | compaction +     |
-                   +------------+     | retention        |
-                                      +------------------+
-                                               ^
-                                      +--------+---------+
-                                      | nanosiem-search  |
-                                      | :3002 <- web SPA |
-                                      +------------------+
++------------+     +------------+     +-------------+
+|  Vector    | --> | nanosiem-  | --> | ClickHouse  |
+|  parsers   |     | api  :3000 |     | (events)    |
++------------+     +------------+     +-------------+
+                         |                   ^
+                         v                   |
+                   +------------+     +------+------+
+                   | PostgreSQL |     | nanosiem-   |
+                   | (rules,    |     | search:3002 |
+                   |  alerts,   |     +-------------+
+                   |  audit)    |             ^
+                   +------------+             |
+                                       +-------------+
+                                       | nanosiem-   |
+                                       | web (SPA)   |
+                                       +-------------+
 ```
 
 - `nanosiem-api` — rules, alerts, settings, ingestion, OpenAPI at `/swagger-ui`
 - `nanosiem-search` — query execution, field stats, log fetch
 - `nanosiem-jobs` — scheduled detection runner, repository sync
-- `nanosiem-lake-cell` — the single-tenant lake cell: ingest, chDB query,
-  detection windows, compaction, and retention for the object lake
+- Both Postgres + ClickHouse are required. The DualPool abstraction wires
+  the two together; boot fails fast if either is unreachable.
 
 ## Documentation
 
@@ -252,7 +229,7 @@ Full documentation: **[nano.rs/docs](https://nano.rs/docs/getting-started/first-
 - **[Detection Authoring](https://nano.rs/docs/user-guide/detections/)** —
   write rules, manage lifecycle, tune for noise
 - **[UDM Reference](https://nano.rs/docs/reference/udm-fields/)** — the
-  legacy UDM field names, still accepted in nPL as aliases for OCSF fields
+  75+ explicit columns the schema is built around
 - **[Coding Agents](https://nano.rs/docs/coding-agents)** — manage
   searches, parsers, and detections via Claude Code / Codex pointed at
   your nano instance. The hosted plan ships an in-app AI assistant
@@ -275,19 +252,6 @@ the content layer most teams want on day one:
   detection-as-code: define rules in Git, sync to nano via GitOps
 - **[models](https://github.com/nano-rs/models)** — LiteLLM model
   catalog backing pivt's AI features
-
-nano ships no parsers or rules of its own. On first start, an install
-registers `nano-rs/parsers` and `nano-rs/rules` on their `main` branches
-(OCSF 1.9 content) and syncs them, so the full catalog is there at first login.
-After that it checks them every hour. An upgraded install with those
-repositories on the retired `ocsf-1.9` branch, or with auto-sync off, is moved
-to `main` and starts following them with no action needed. Upstream updates refresh the catalog only: parsers and rules you
-already imported are flagged for review and never overwritten. To stop following
-a catalog, disable that repository (a deleted one is registered again on the
-next start). Offline installs keep booting and show the
-failed sync on the repository page. Air-gapped installs (`AIRGAP_MODE`) never
-contact GitHub and take signed content bundles instead. Third-party repositories
-default to `main`, and explicit branch pins are kept.
 
 ## What's open vs. hosted
 

@@ -9,11 +9,9 @@
 # What it does:
 #   1. Validates prerequisites (docker, docker compose v2, git, openssl, curl)
 #   2. Clones (or pulls) nano-rs/nano into $NANO_INSTALL_DIR (default ~/nano)
-#   3. Prompts for admin email / password / public BASE_URL (reads /dev/tty
-#      even when stdin is piped from curl). Storage is the OCSF 1.9 object
-#      lake. The ClickHouse edition is retired (NAN-3491): it cannot be
-#      installed, and an existing ClickHouse install is refused before
-#      anything is changed (NAN-3853; it is a fresh install, see the message).
+#   3. Prompts for admin email / password / public BASE_URL and the storage
+#      schema profile (UDM or OCSF) (reads /dev/tty even when stdin is piped
+#      from curl)
 #   4. Generates strong random secrets and writes .env
 #   5. Pulls images from ghcr.io/nano-rs
 #   6. Verifies the pulled first-party image digests against images.lock
@@ -21,130 +19,134 @@
 #   8. Waits for the API to report healthy
 #   9. POSTs to /api/setup/initialize to create the first admin account
 #  10. Prints the login URL
-#  11. Optionally runs the checksum-verified nano connect wizard (TTY only;
-#      skipped for --yes, CI, and Tenzir-direct installs)
 #
 # Non-interactive use: set the prompt values as env vars before running.
 #   NANO_ADMIN_EMAIL, NANO_ADMIN_NAME, NANO_ADMIN_PASSWORD, NANO_BASE_URL
-#   An env value always wins over its prompt. For unattended runs (Ansible,
-#   cloud-init, CI) also pass NANO_NONINTERACTIVE=1 or `--non-interactive`
-#   (alias `--yes`/`-y`; `curl … | bash -s -- --yes`): no prompt ever reads
-#   /dev/tty, unset values take their defaults, and a value with no default
-#   (NANO_ADMIN_EMAIL) is a hard error instead of a hang. Without a usable
-#   terminal the installer switches to this mode on its own.
-#   A blank NANO_ADMIN_PASSWORD autogenerates one that satisfies the API's
-#   password policy; it is kept in .env (mode 600) until you delete it.
-#   New installs use the OCSF 1.9 object lake. The retired ClickHouse
-#   edition (NANO_ENABLE_LAKE_CONTROL_PLANE=0, NANO_SCHEMA_PROFILE=udm) is
-#   refused.
-#
-# Ingest mode (NAN-3807), persisted in .env as NANO_VECTOR_PROFILE:
-#   (default)      Vector ingest (HTTP /ingest, HEC, OTLP, pull connectors) AND
-#                  the OCSF bucket drop (lean-landing): Tenzir can drop files
-#                  into the object store beside Vector.
-#   --tenzir       Tenzir-direct: no Vector and no connector runner. Tenzir
-#                  writes OCSF files into the object store; lean-landing turns
-#                  them into lake rows. Same as NANO_INGEST_MODE=tenzir.
-#   --add-vector   Turn a Tenzir-direct install back into the default (adds
-#                  Vector). Same as NANO_INGEST_MODE=vector.
-#   A re-run without either flag keeps the mode the install already has.
-#
-# Lake cell sizing (NAN-4749), persisted in .env; a re-run keeps it:
-#   --target-eps N   NANO_LAKE_TARGET_EPS: the sustained events/s the cell
-#                    must admit. Sizes the ingest role for that rate (at
-#                    most half the cell's memory, taken from search) and
-#                    places the tenant at it. Unset: sized from the host.
-#   NANO_LAKE_MERGE_MINUTE_CONCURRENCY, NANO_LAKE_MERGE_HISTORY_CONCURRENCY,
-#   NANO_LAKE_COMPACTION_PACING: ingest merge tuning, set in .env to forward
-#                    them to the cell (unset keeps the defaults).
+#   NANO_SCHEMA_PROFILE (ocsf | udm | ocsf+tenzir, default ocsf) — chosen at
+#   first install and immutable afterward; see the prompt below. New installs
+#   are OCSF-first (NAN-4903); an existing install keeps the profile recorded in
+#   its .env (a .env without one predates the choice and is pinned to udm).
 #
 # Override defaults: NANO_INSTALL_DIR, NANO_REPO_URL, NANO_BRANCH, NANO_VERSION.
+# NANO_VERSION defaults to the release recorded in the edition's images lock
+# ("# Release: vX.Y.Z"). It must be a v2+ release (X.Y.Z, major >= 2): no
+# floating tag is published, so "latest" is refused, and 0.x/1.x images belong
+# to other product lines. Re-running the installer moves the install to the
+# checkout's release (an upgrade).
+# Edition (open | enterprise) comes from, and must agree across: the source
+# tree's .nano-edition marker (the public repo and the open bundle say open,
+# the enterprise compose bundle says enterprise), NANO_EDITION in an existing
+# install's .env, and the NANO_EDITION environment variable. Any disagreement
+# fails closed; an install never changes edition on a re-run. Enterprise uses
+# images.enterprise.lock (enterprise bundle only; needs a registry login),
+# open core uses images.lock (ghcr.io).
+# NANO_INSTALL_DIR may also be an extracted release bundle (a directory with a
+# .nano-bundle marker) instead of a git checkout.
+# NANO_CHECK_ONLY=1 validates the inputs, prints the resolved edition, release
+# and image source, and exits before writing .env, pulling or starting anything.
 # Set NANO_SKIP_IMAGE_VERIFY=1 to skip the image digest supply-chain check.
-# NANO_HEALTH_TIMEOUT_SECONDS bounds the wait for the API (default 1800 on the
-# lake profile, whose first boot waits for the query worker's bootstrap
-# generation; 300 on the legacy ClickHouse profile).
-#
-# Re-running is safe: if a previous run timed out before the admin account was
-# created, the next run creates it (keyed on GET /api/setup/status, not on
-# whether .env exists) with the same credentials.
+# Unauthenticated ingest ports (Vector native :6000, raw OTLP :4317/:4318,
+# Fluent :24224, bundled Tenzir :9095) bind 127.0.0.1. Opt in to exposing them
+# with NANO_VECTOR_NATIVE_BIND_ADDRESS / NANO_OTLP_BIND_ADDRESS /
+# NANO_FLUENT_BIND_ADDRESS / NANO_TENZIR_BIND_ADDRESS (persisted to .env).
 
-# Disable inherited tracing before reading credentials (also safe for sh).
-{ set +x; } 2>/dev/null
-
-# Keep this guard POSIX-safe: piped scripts ignore the Bash shebang.
-if [ -z "${BASH_VERSION:-}" ]; then
-    if [ "$#" -gt 0 ]; then
-        printf '%s\n' "nano's installer needs bash: curl -fsSL https://get.nano.rs | bash -s -- $*" >&2
-    else
-        printf '%s\n' "nano's installer needs bash: curl -fsSL https://get.nano.rs | bash" >&2
-    fi
-    exit 1
-fi
-
-# Parse the complete script before any subprocess can consume curl's stdin.
-main() {
 set -euo pipefail
+umask 077
 
-# H01: one purchaser entry from the authenticated native distribution. Dispatch
-# before legacy env/defaults, Docker, git, admin setup or verification bypasses.
-# The executable derives its protected home from its own installed location.
-if [ "${1:-}" = sovereign ]; then
-    shift
-    # NAN-4629: --tenzir records the Tenzir ingest model (no Vector; Tenzir
-    # drops OCSF files into the object store). Fixed at install.
-    local sovereign_flags=()
-    if [ "${1:-}" = --tenzir ]; then
-        sovereign_flags=(--tenzir)
-        shift
-    fi
-    if [ "$#" -ne 1 ]; then
-        printf '%s\n' 'Usage: install.sh sovereign [--tenzir] purchaser-inputs.json' >&2
-        return 2
-    fi
-    local native_home
-    native_home="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || return 1
-    # The authenticated distribution bundles its bootstrap libc/loader when
-    # needed. This loader is one level below home so /proc/self/exe retains
-    # the same protected home as bin/install. The cell itself is static musl.
-    if [[ -x "$native_home/runtime/ld-linux-x86-64.so.2" ]]; then
-        exec "$native_home/runtime/ld-linux-x86-64.so.2" --library-path "$native_home/runtime/lib" "$native_home/bin/nano-sovereign-linux-install" ${sovereign_flags[@]+"${sovereign_flags[@]}"} < "$1"
-    fi
-    exec "$native_home/bin/nano-sovereign-linux-install" ${sovereign_flags[@]+"${sovereign_flags[@]}"} < "$1"
+INSTALLER_SOURCE_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    INSTALLER_SOURCE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 fi
-
-# NAN-3402: containers bind-mount files from this checkout (Hydra, nginx,
-# Vector, ClickHouse configs) and run as non-root users, so they must be
-# world-readable. A hardened `umask 077` login made the cloned Hydra config
-# unreadable. Secret files (.env) are created 0600 explicitly instead.
-umask 022
-
-NANO_INSTALL_DIR="${NANO_INSTALL_DIR:-$HOME/nano}"
+if [[ -z "${NANO_INSTALL_DIR:-}" ]]; then
+    if [[ -n "$INSTALLER_SOURCE_DIR" \
+        && ( -f "$INSTALLER_SOURCE_DIR/.nano-bundle" \
+            || -f "$INSTALLER_SOURCE_DIR/.nano-edition" \
+            || -e "$INSTALLER_SOURCE_DIR/.git" ) ]]; then
+        # A directly executed checkout or extracted bundle is already the
+        # install source. In particular, `/opt/nano/install.sh` must not ignore
+        # its enterprise bundle and clone the public repository into ~/nano.
+        NANO_INSTALL_DIR="$INSTALLER_SOURCE_DIR"
+    else
+        # curl | bash has no source file, so retain the one-line install default.
+        NANO_INSTALL_DIR="$HOME/nano"
+    fi
+fi
 NANO_REPO_URL="${NANO_REPO_URL:-https://github.com/nano-rs/nano.git}"
 NANO_BRANCH="${NANO_BRANCH:-main}"
-# Image release. Empty = the release recorded in the checkout's images.lock.
-# NAN-3491 froze `:latest` on the last ClickHouse release (0.1.703); lean never
-# pulls it (see resolve_lean_version).
 NANO_VERSION="${NANO_VERSION:-}"
+NANO_VERSION="${NANO_VERSION#v}"
+ENV_EDITION="${NANO_EDITION:-}"
 COMPOSE_FILE="docker-compose.opensource.yml"
-# NAN-4686: extra compose files layered on the base, space-separated and
-# relative to the install dir (the sovereign single-host wrapper passes
-# docker-compose.sovereign.yml). Empty, the open-core default, changes nothing.
-COMPOSE_ARGS=(-f "$COMPOSE_FILE")
-read -r -a NANO_OVERLAY_LIST <<< "${NANO_COMPOSE_OVERLAYS:-}" # split on spaces, never globbed
-for overlay in ${NANO_OVERLAY_LIST[@]+"${NANO_OVERLAY_LIST[@]}"}; do
-    if [[ ! "$overlay" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$ ]]; then
-        printf '%s\n' "NANO_COMPOSE_OVERLAYS: '$overlay' is not a compose file name in the install dir" >&2
-        exit 1
-    fi
-    COMPOSE_ARGS+=(-f "$overlay")
+ROLE_ARG=""
+INVENTORY_ARG=""
+TOPOLOGY_MIGRATION_SHA=""
+ENV_TEMP_FILE=""
+cleanup_env_temp() {
+    [[ -z "$ENV_TEMP_FILE" ]] || rm -f -- "$ENV_TEMP_FILE"
+}
+trap cleanup_env_temp EXIT
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --role)
+            [[ $# -ge 2 ]] || { printf '%s\n' "--role requires a comma-separated role list" >&2; exit 2; }
+            ROLE_ARG="$2"; shift 2 ;;
+        --inventory)
+            [[ $# -ge 2 ]] || { printf '%s\n' "--inventory requires an inventory.yaml path" >&2; exit 2; }
+            INVENTORY_ARG="$2"; shift 2 ;;
+        --accept-topology-migration)
+            [[ $# -ge 2 ]] || { printf '%s\n' "--accept-topology-migration requires the currently recorded identity SHA-256" >&2; exit 2; }
+            TOPOLOGY_MIGRATION_SHA="$2"; shift 2 ;;
+        -h|--help)
+            cat <<'EOF'
+Usage: install.sh [--role app,ingest,clickhouse,keeper,postgres --inventory inventory.yaml]
+                  [--accept-topology-migration CURRENT_IDENTITY_SHA256]
+
+Without role/inventory arguments, installs the unchanged single-node stack.
+Enterprise bundles may select one or more roles from a shared host inventory.
+The migration acknowledgement is valid only for a role-split install after its
+data-movement runbook has completed; the exact recorded identity is required.
+EOF
+            exit 0 ;;
+        *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2 ;;
+    esac
 done
+if [[ -n "$ROLE_ARG" && -z "$INVENTORY_ARG" ]] || [[ -z "$ROLE_ARG" && -n "$INVENTORY_ARG" ]]; then
+    printf '%s\n' "--role and --inventory must be provided together" >&2
+    exit 2
+fi
+if [[ -n "$TOPOLOGY_MIGRATION_SHA" && -z "$INVENTORY_ARG" ]]; then
+    printf '%s\n' "--accept-topology-migration is valid only with --role/--inventory" >&2
+    exit 2
+fi
+if [[ -n "$TOPOLOGY_MIGRATION_SHA" && ! "$TOPOLOGY_MIGRATION_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+    printf '%s\n' "--accept-topology-migration requires a lowercase 64-character SHA-256" >&2
+    exit 2
+fi
+ROLE_ARG=$(printf '%s' "$ROLE_ARG" | tr -d '[:space:]')
+# Lowest major this installer may deploy. Mirrors LINE_FLOOR_MAJOR in
+# scripts/ci/release-version.sh (not shipped in the public tree).
+RELEASE_FLOOR_MAJOR=2
+
+# 0 iff $1 is an X.Y.Z release on this product line (major >= RELEASE_FLOOR_MAJOR).
+is_line_release() {
+    [[ "$1" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+        && (( BASH_REMATCH[1] >= RELEASE_FLOOR_MAJOR ))
+}
+
+# Fail before anything is cloned, written, pulled or started.
+if [[ -n "$NANO_VERSION" ]] && ! is_line_release "$NANO_VERSION"; then
+    printf 'NANO_VERSION=%s is not a v%s+ release (X.Y.Z). No floating tag such as latest is published, and 0.x/1.x images belong to other product lines. Unset NANO_VERSION to use the checkout'"'"'s release.\n' \
+        "$NANO_VERSION" "$RELEASE_FLOOR_MAJOR" >&2
+    exit 1
+fi
+case "$ENV_EDITION" in
+    "" | open | enterprise) ;;
+    *) printf 'NANO_EDITION must be open or enterprise (got %s)\n' "$ENV_EDITION" >&2; exit 1 ;;
+esac
 # All traffic goes through the nginx reverse proxy on port 80. The internal
 # nano-api / nano-search ports are not exposed to the host by default.
 HOST_PORT="${NANO_HOST_PORT:-80}"
 API_BASE="http://localhost:${HOST_PORT}"
-NANO_NONINTERACTIVE="${NANO_NONINTERACTIVE:-0}"
-platform_feeds_file=""
-platform_feeds_license=""
 
 c_reset='\033[0m'
 c_bold='\033[1m'
@@ -158,64 +160,55 @@ ok()     { printf "%b✓%b %s\n"   "$c_green$c_bold" "$c_reset" "$*"; }
 warn()   { printf "%b!%b %s\n"   "$c_yellow$c_bold" "$c_reset" "$*"; }
 fail()   { printf "%b✗ %s%b\n"   "$c_red$c_bold" "$*" "$c_reset" >&2; exit 1; }
 
+resolve_env_target() {
+    local current="$1" link directory hops=0
+    [[ "$current" = /* ]] || current="$PWD/$current"
+    while [[ -L "$current" ]]; do
+        hops=$((hops + 1))
+        (( hops <= 40 )) || return 1
+        link=$(readlink "$current") || return 1
+        if [[ "$link" = /* ]]; then
+            current="$link"
+        else
+            current="$(dirname "$current")/$link"
+        fi
+    done
+    directory=$(cd "$(dirname "$current")" 2>/dev/null && pwd -P) || return 1
+    printf '%s/%s\n' "$directory" "$(basename "$current")"
+}
+
+validate_env_file() {
+    local path="$1" target owner mode
+    target=$(resolve_env_target "$path") \
+        || fail "Cannot resolve $path. Correct the symbolic link before retrying; no secrets were read."
+    [[ -f "$target" ]] \
+        || fail "$path must resolve to a regular file owned by the installer user; no secrets were read."
+    if owner=$(stat -f '%u' "$target" 2>/dev/null); then
+        mode=$(stat -f '%Lp' "$target")
+    else
+        owner=$(stat -c '%u' "$target" 2>/dev/null) || fail "Cannot inspect owner of $path; no secrets were read."
+        mode=$(stat -c '%a' "$target" 2>/dev/null) || fail "Cannot inspect mode of $path; no secrets were read."
+    fi
+    [[ "$owner" == "$(id -u)" ]] \
+        || fail "$path is owned by uid $owner, not the current uid $(id -u). Correct ownership before retrying; no secrets were read."
+    [[ "$mode" == "600" ]] \
+        || fail "$path has mode $mode; run 'chmod 600 $path' before retrying. No secrets were read."
+}
+
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || fail "$1 is required but not installed. $2"
 }
 
-usage() {
-    cat <<'EOF'
-Usage: install.sh [--non-interactive | --yes | -y] [--tenzir | --add-vector] [--target-eps N] [--feeds-file F | --feeds-license F] [--help]
-
-  --non-interactive, --yes, -y
-      Never prompt. Every value comes from its env var or its default
-      (same as NANO_NONINTERACTIVE=1). NANO_ADMIN_EMAIL is then required on
-      the first install.
-  --tenzir
-      Tenzir-direct install: the lean lake WITHOUT Vector. Tenzir writes
-      OCSF 1.9 files into the install's object store (the bucket drop);
-      HTTP /ingest, HEC, OTLP and pull connectors are not offered.
-  --add-vector
-      Add Vector to a --tenzir install (Vector ingest plus the bucket drop,
-      the default). A re-run without either flag keeps the current mode.
-  --target-eps N
-      Size the lake cell to admit N events per second sustained (same as
-      NANO_LAKE_TARGET_EPS=N; kept in .env for re-runs).
-
-  --feeds-file F
-      Install an offline signed platform feed bundle instead of pulling online.
-  --feeds-license F
-      Authenticate the sovereign install-time pull with its signed license file.
-
-See the header of this script for every NANO_* environment variable.
-EOF
-}
-
-is_truthy() {
-    # No ${1,,}: macOS still ships bash 3.2.
-    case "$1" in
-        1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Yy]|[Oo][Nn]) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-# True when /dev/tty can actually be opened. `-e /dev/tty` is not enough: the
-# node exists in every container and under cron/systemd, but opening it fails
-# with ENXIO when the process has no controlling terminal.
-tty_usable() {
-    { : < /dev/tty; } 2>/dev/null
-}
-
 prompt_tty() {
     # $1 = prompt, $2 = default value (optional), $3 = "secret" to suppress echo
-    # In non-interactive mode this never touches /dev/tty and returns the
-    # default (possibly empty — the caller decides whether that is fatal).
     local prompt="$1" default="${2:-}" secret="${3:-}" answer=""
     local display_prompt="$prompt"
     [[ -n "$default" ]] && display_prompt="$prompt [$default]"
 
-    if [[ "${NANO_NONINTERACTIVE:-0}" == "1" ]] || ! tty_usable; then
-        printf "%s" "$default"
-        return 0
+    if ! have_controlling_tty; then
+        # `/dev/tty` commonly exists in noninteractive services but open(2)
+        # returns ENXIO because the process has no controlling terminal.
+        fail "No TTY available for interactive prompts. Set NANO_ADMIN_EMAIL, NANO_ADMIN_NAME, NANO_ADMIN_PASSWORD, NANO_BASE_URL via env and re-run."
     fi
 
     if [[ -n "$secret" ]]; then
@@ -230,375 +223,126 @@ prompt_tty() {
     printf "%s" "$answer"
 }
 
-# Optional onboarding is isolated from the successful install, including SIGINT.
-# The API key stays in memory; connect owns its private 0600 profile.
-onboard_data() {
-    (
-        set +x
-        local url="${API_BASE}" answer="" key="" work="" expected="" actual=""
-        if [[ "${TENZIR_DIRECT:-0}" == "1" ]]; then
-            return 0
-        fi
-        printf '\n  Onboard data later:\n    curl -fsSL https://get.nano.rs/connect | bash -s -- --url %q\n' "$url"
-        if [[ "${NANO_NONINTERACTIVE:-0}" == "1" || -n "${CI:-}" ]] || ! tty_usable; then
-            return 0
-        fi
-        trap 'exit 0' INT TERM
-        answer=$(prompt_tty "Onboard data now? (y/N)" "N")
-        case "$answer" in y|Y|yes|YES) ;; *) return 0 ;; esac
-        printf '\n  Open %s, sign in, then go to Settings → Access Control → API Keys.\n' "$BASE_URL"
-        printf '  Create an API key with settings:system and search:execute permissions.\n'
-        printf '  Return here and paste the key; input is hidden. connect saves its private profile (0600).\n'
-        key=$(prompt_tty "API key (blank to skip)" "" secret)
-        [[ -n "$key" ]] || return 0
-        work=$(mktemp -d) || return 0
-        trap 'rm -rf "$work"' EXIT
-        if ! curl -fsSL --connect-timeout 10 --max-time 120 https://get.nano.rs/connect -o "$work/connect.sh" ||
-           ! curl -fsSL --connect-timeout 10 --max-time 120 https://get.nano.rs/connect.sh.sha256 -o "$work/connect.sh.sha256"; then
-            warn "Could not download nano connect; use the command above later."
-            return 0
-        fi
-        # Accept the release's sha256sum format, but never trust its filename.
-        expected=$(awk 'NR == 1 {print $1}' "$work/connect.sh.sha256")
-        if command -v sha256sum >/dev/null 2>&1; then
-            actual=$(sha256sum "$work/connect.sh") || return 0
-        elif command -v shasum >/dev/null 2>&1; then
-            actual=$(shasum -a 256 "$work/connect.sh") || return 0
-        else
-            warn "No SHA-256 verifier available; skipping onboarding."
-            return 0
-        fi
-        actual=${actual%% *}
-        if [[ ! "$expected" =~ ^[a-fA-F0-9]{64}$ || "$actual" != "$expected" ]]; then
-            warn "nano connect checksum mismatch; skipping onboarding."
-            return 0
-        fi
-        # No key in argv, installer output, or temporary files. A pipe-fed
-        # installer must give the interactive connector the controlling TTY.
-        if ! NANO_API_KEY="$key" bash "$work/connect.sh" --url "$url" < /dev/tty; then
-            warn "Onboarding stopped; nano is still installed. Use the command above later."
-        fi
-    ) || true
-}
-
-# NAN-3807: the compose profile Vector and the connector runner carry
-# (`${NANO_VECTOR_PROFILE:-lean}`). `none` = Tenzir-direct (no Vector).
-# --tenzir / --add-vector (NANO_INGEST_MODE) decide; otherwise the install
-# keeps the mode its .env records, and a new install gets Vector.
-resolve_vector_profile() {
-    case "${NANO_INGEST_MODE:-}" in
-        tenzir) echo none ;;
-        vector) echo lean ;;
-        *) if [[ "$(env_file_value NANO_VECTOR_PROFILE)" == none ]]; then echo none; else echo lean; fi ;;
-    esac
+have_controlling_tty() {
+    (exec 9<>/dev/tty) 2>/dev/null
 }
 
 gen_secret() { openssl rand -hex 32; }
 
-# Mirror of nanosiem-core/src/auth/password.rs `validate_password` (the policy
-# POST /api/setup/initialize enforces): 12..1024 bytes with at least one ASCII
-# uppercase, lowercase, digit, and special character. The Rust special set is
-# exactly ASCII punctuation, i.e. [[:punct:]] in the C locale. Checking here
-# lets a weak operator-supplied password fail in seconds instead of after the
-# first-boot wait.
-password_meets_policy() {
-    local LC_ALL=C pw="$1"
-    (( ${#pw} >= 12 && ${#pw} <= 1024 )) || return 1
-    [[ "$pw" =~ [A-Z] ]] || return 1
-    [[ "$pw" =~ [a-z] ]] || return 1
-    [[ "$pw" =~ [0-9] ]] || return 1
-    [[ "$pw" =~ [[:punct:]] ]] || return 1
-}
-
-# Autogenerate an initial admin password that satisfies password_meets_policy.
-# 24 characters from letters, digits, and a special set chosen to survive
-# every place the value travels unquoted: .env (no '#', '$', quotes, spaces),
-# compose interpolation, the JSON payload (json_escape), and a terminal
-# copy/paste. Rejection sampling keeps the draw uniform; a draw lacking a
-# required class (~8% of draws, mostly no special) is simply redrawn.
-ADMIN_PASSWORD_SPECIALS='@%+=_-.'
-gen_admin_password() {
-    local alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789${ADMIN_PASSWORD_SPECIALS}"
-    local n=${#alphabet} limit pw byte attempt
-    limit=$(( 256 - 256 % n ))
-    for (( attempt = 0; attempt < 100; attempt++ )); do
-        pw=""
-        while read -r byte; do
-            (( byte < limit )) || continue
-            pw+="${alphabet:byte % n:1}"
-            (( ${#pw} == 24 )) && break
-        done < <(openssl rand 96 | od -An -v -tu1 | tr -s ' ' '\n' | grep -v '^$')
-        if (( ${#pw} == 24 )) && password_meets_policy "$pw"; then
-            printf '%s' "$pw"
-            return 0
-        fi
-    done
-    return 1
-}
-
-# Return the memory capacity Docker can actually use. On Docker Desktop this is
-# the VM allocation, which can be much smaller than the physical Mac/Windows
-# host. Linux falls back to MemTotal and macOS to hw.memsize when Docker does
-# not report a numeric value. NANO_MEMORY_CAPACITY_BYTES exists for deterministic
-# installer tests and unusual runtimes that cannot expose their cgroup capacity.
-memory_capacity_bytes() {
-    local bytes kb
-
-    bytes="${NANO_MEMORY_CAPACITY_BYTES:-}"
-    if [[ -n "$bytes" ]]; then
-        [[ "$bytes" =~ ^[0-9]+$ ]] || fail "NANO_MEMORY_CAPACITY_BYTES must be an integer number of bytes."
-        echo "$bytes"
-        return
+# Keep first-run validation identical to nanosiem-core's authoritative policy.
+# This runs before .env is written or any image is pulled/started, so a weak
+# non-interactive password cannot leave a distributed install half-mutated.
+validate_admin_password() {
+    local password="$1" byte_length i char
+    local has_upper=0 has_lower=0 has_digit=0 has_special=0
+    local LC_ALL=C
+    byte_length=${#password}
+    if (( byte_length < 12 || byte_length > 1024 )); then
+        fail "Admin password must be 12 to 1024 bytes and contain uppercase, lowercase, a digit, and a special character."
     fi
-
-    bytes=$(docker </dev/null info --format '{{.MemTotal}}' 2>/dev/null || true)
-    if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes > 0 )); then
-        echo "$bytes"
-        return
-    fi
-
-    kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)
-    if [[ "$kb" =~ ^[0-9]+$ ]] && (( kb > 0 )); then
-        echo $((kb * 1024))
-        return
-    fi
-
-    bytes=$(sysctl -n hw.memsize 2>/dev/null || true)
-    if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes > 0 )); then
-        echo "$bytes"
-        return
-    fi
-
-    echo 0
-}
-
-memory_capacity_gib() {
-    local bytes
-    bytes=$(memory_capacity_bytes)
-    if (( bytes < 1073741824 )); then
-        echo 0
-    else
-        # Floor rather than round up: a 15.6 GiB Docker VM must be planned as
-        # 15 GiB or the simultaneous interactive + durable lanes can overcommit.
-        echo $((bytes / 1073741824))
-    fi
-}
-
-# Shared with the compiled cell renderer. Read beside this installer when it
-# is a file; a piped installer fetches the policy from the same source branch.
-# This happens before updating an existing checkout or writing configuration.
-lean_minimum_install_memory_bytes() {
-    local script_path="${BASH_SOURCE[0]:-}" policy="" repo_path vector_profile="${1:-lean}"
-    if [[ -f "$script_path" && -f "$(dirname "$script_path")/config/lean-startup-memory.json" ]]; then
-        policy=$(cat "$(dirname "$script_path")/config/lean-startup-memory.json") || return 1
-    else
-        repo_path="${NANO_REPO_URL#https://github.com/}"
-        repo_path="${repo_path%.git}"
-        [[ "$repo_path" != "$NANO_REPO_URL" && "$repo_path" != *://* ]] || return 1
-        policy=$(curl -fsSL --max-time 30 "https://raw.githubusercontent.com/${repo_path}/${NANO_BRANCH}/config/lean-startup-memory.json") || return 1
-    fi
-    printf '%s' "$policy" | python3 -c '
-import json, sys
-p = json.load(sys.stdin)
-mib = 1 << 20
-assert p["cell_mib"] and p["services"]
-assert all(type(v) is int and v > 0 for v in p["cell_mib"].values())
-compose = 0
-for name, v in p["services"].items():
-    if (sys.argv[1] != "none" and name == "tenzir") or (sys.argv[1] == "none" and name in ("vector", "connector-runner", "lean-hec-proxy")):
-        continue
-    guard, peak, idle = v["guard_mib"], v["peak_bytes"], v.get("idle_rss_bytes", 0)
-    assert type(guard) is int and guard >= 0
-    assert type(peak) is int and peak > 0
-    assert type(idle) is int and idle >= 0
-    floor = max(guard * mib, (peak * 5 + 3) // 4, (idle * 5 + 3) // 4)
-    compose += ((floor + mib - 1) // mib) * mib
-total = compose + sum(p["cell_mib"].values()) * mib
-gib = 1024 * mib
-supported = p["minimum_host_gib"]
-assert type(supported) is int and supported > 0
-reserve = p["kernel_reserve_mib"]
-assert type(reserve) is int and 0 <= reserve <= 512
-print(max(supported * gib - reserve * mib, ((total * 100 + 95 * mib - 1) // (95 * mib)) * mib))
-' "$vector_profile"
-}
-
-# NAN-2252: size the ClickHouse container memory limit from available Docker RAM
-# rounded to whole GiB minus a fixed 4G reserve for the rest of the stack
-# (api/search/jobs/vector/postgres/dragonfly limits total ~3.7G and do NOT
-# scale with RAM), floored at the historical 2G. ClickHouse 26.x sizes its
-# usable memory ceiling to the container cgroup limit, so the old flat 2G gave
-# every host a 1.6 GiB ceiling that permanently wedges ingest around 300 eps
-# (NAN-2251) while leaving bigger hosts mostly idle. 8G host → 4G, 16G → 12G,
-# 32G → 28G. Falls back to 2G when Docker and both host probes are unreadable.
-ch_mem_limit() {
-    local g
-    g=$(memory_capacity_gib)
-    if (( g == 0 )); then
-        echo "2G"
-        return
-    fi
-    g=$((g - 4))
-    (( g < 2 )) && g=2
-    echo "${g}G"
-}
-
-env_file_value() {
-    local key="$1"
-    awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' .env 2>/dev/null || true
-}
-
-# Compose's project name for the install at $1: COMPOSE_PROJECT_NAME from the
-# environment or the install's .env, else the directory name; lowercased, with
-# only [a-z0-9_-] kept, as Compose normalizes it.
-install_compose_project() {
-    local project="${COMPOSE_PROJECT_NAME:-}"
-    if [[ -z "$project" && -f "$1/.env" ]]; then
-        project=$(awk -F= '$1 == "COMPOSE_PROJECT_NAME" {sub(/^[^=]*=/, ""); print; exit}' "$1/.env" 2>/dev/null || true)
-    fi
-    [[ -n "$project" ]] || project=$(basename "$1")
-    printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-'
-}
-
-# NAN-3853: the retired ClickHouse edition (NAN-3491) cannot be upgraded in
-# place. Echo why the install at $1 is that edition and return 0, or return 1.
-# Runs before the checkout is updated, so it reads only what is on disk and in
-# Docker, and changes neither.
-#
-# A lean .env (COMPOSE_PROFILES=lean) always wins: an install that took the
-# fresh-lean cutover keeps its old ClickHouse variables and volumes for
-# rollback but is lean. A gen1 lake .env (COMPOSE_PROFILES with `lake`, or
-# NANO_LOG_QUERY_BACKEND=lake) is not this edition either; the main flow
-# handles it. Otherwise any of these marks the ClickHouse edition:
-#   - .env selects the ClickHouse query backend or the `legacy` compose profile
-#   - .env carries CLICKHOUSE_PASSWORD (every ClickHouse install wrote it,
-#     including those from before compose profiles existed)
-#   - this compose project has a clickhouse container or the
-#     nano-clickhouse-data volume (Compose creates neither for a lean stack:
-#     the clickhouse service and its volume belong to the `legacy` profile)
-legacy_clickhouse_reason() {
-    local dir="$1" env_file="$1/.env" profiles="" backend="" project ids
-    if [[ -f "$env_file" ]]; then
-        # Tolerate an operator's CRLF line endings or quoted values.
-        profiles=$(awk -F= '$1 == "COMPOSE_PROFILES" {sub(/^[^=]*=/, ""); print; exit}' "$env_file" 2>/dev/null | tr -d '\r"'"'"' ' || true)
-        backend=$(awk -F= '$1 == "NANO_LOG_QUERY_BACKEND" {sub(/^[^=]*=/, ""); print; exit}' "$env_file" 2>/dev/null | tr -d '\r"'"'"' ' || true)
-        [[ "$profiles" == lean ]] && return 1
-        [[ ",${profiles}," == *,lake,* || "$backend" == lake ]] && return 1
-        if [[ "$backend" == clickhouse ]]; then
-            echo "its .env sets NANO_LOG_QUERY_BACKEND=clickhouse"; return 0
-        fi
-        if [[ ",${profiles}," == *,legacy,* ]]; then
-            echo "its .env selects the legacy ClickHouse compose profile"; return 0
-        fi
-        if grep -qE '^CLICKHOUSE_PASSWORD=' "$env_file" 2>/dev/null; then
-            echo "its .env holds ClickHouse credentials and no lean settings"; return 0
-        fi
-    fi
-    project=$(install_compose_project "$dir")
-    [[ -n "$project" ]] || return 1
-    ids=$(docker </dev/null ps -aq \
-        --filter "label=com.docker.compose.project=${project}" \
-        --filter "label=com.docker.compose.service=clickhouse" 2>/dev/null || true)
-    if [[ -n "$ids" ]]; then
-        echo "Docker has a ClickHouse container for its compose project '${project}'"; return 0
-    fi
-    if docker </dev/null volume inspect "${project}_nano-clickhouse-data" >/dev/null 2>&1; then
-        echo "Docker has its ClickHouse data volume ${project}_nano-clickhouse-data"; return 0
-    fi
-    return 1
-}
-
-# Print why the ClickHouse edition cannot be upgraded and what to do instead,
-# then exit non-zero. There is deliberately no override.
-refuse_legacy_clickhouse_install() {
-    local dir="$1" reason="$2" project stop_cmd
-    project=$(install_compose_project "$dir")
-    if [[ -f "$dir/$COMPOSE_FILE" ]]; then
-        stop_cmd="cd ${dir} && docker compose -f ${COMPOSE_FILE} down"
-    else
-        stop_cmd="docker compose -p ${project} down"
-    fi
-    printf "%b✗ %s is the retired ClickHouse edition of nano%b\n" "$c_red$c_bold" "$dir" "$c_reset" >&2
-    cat >&2 <<EOF
-
-  Detected because ${reason}.
-
-  This edition cannot be upgraded in place. The current edition stores events
-  in an OCSF object lake, not ClickHouse, and is a fresh install: nothing is
-  migrated from the old one. This run changed nothing: no update, pull,
-  migration, restart, or data change.
-
-  To move to the current edition:
-
-    1. Back up what you want to keep: copy out the detection rules, saved
-       searches, and results you need from the web UI, and keep a copy of
-       ${dir}/.env (it holds this install's secrets).
-
-    2. Stop the old stack:
-         ${stop_cmd}
-       Its data volumes (ClickHouse events, PostgreSQL) are kept. Do not add
-       -v unless you want that data deleted.
-
-    3. Install the current edition into a new directory, so it gets its own
-       volumes and never opens the old ones:
-         curl -fsSL https://get.nano.rs | NANO_INSTALL_DIR=\$HOME/nano-lake bash
-       To reuse ${dir} instead, first delete the old directory AND its
-       volumes (docker volume ls | grep '^${project}_'; deleting them deletes
-       the old data), then re-run the installer.
-
-  What happens to your data: the new install starts empty. Events, users,
-  rules, dashboards, and cases stay in the old volumes and are not imported.
-  They remain on disk until you remove them with docker volume rm.
-
-  To stay on the ClickHouse edition (unsupported, no further fixes), do not
-  re-run this installer. Its last source is the legacy/clickhouse branch of
-  ${NANO_REPO_URL%.git}, and its last images are tagged 0.1.703.
-EOF
-    exit 1
-}
-
-upsert_env_file_value() {
-    local key="$1" value="$2" tmp
-    tmp=$(mktemp "${TMPDIR:-/tmp}/nano-env.XXXXXX") \
-        || fail "Could not create a temporary file while updating .env."
-    awk -F= -v key="$key" -v value="$value" '
-        BEGIN { found = 0 }
-        $1 == key { if (!found) print key "=" value; found = 1; next }
-        { print }
-        END { if (!found) print key "=" value }
-    ' .env > "$tmp"
-    chmod 600 "$tmp"
-    mv "$tmp" .env
-}
-
-
-
-# Encode a string as a JSON string literal (quotes included).
-# Handles backslash, double-quote, and the C0 controls that JSON forbids.
-# Pure bash: a fresh host has no Node (NAN-3306 lab: Debian 12 LXC), and a
-# `fail` inside the caller's $(...) only exits the subshell, so a missing
-# helper used to send `{"email":,...}` and fail admin setup with a 400.
-json_escape() {
-    local s=$1 out="" c i code
-    for (( i = 0; i < ${#s}; i++ )); do
-        c=${s:i:1}
-        # shellcheck disable=SC1003 # '\' is a literal backslash, not an escaped quote
-        case "$c" in
-            '"')  out+='\"' ;;
-            '\') out+='\\' ;;
-            $'\n') out+='\n' ;;
-            $'\r') out+='\r' ;;
-            $'\t') out+='\t' ;;
-            *)
-                LC_ALL=C printf -v code '%d' "'$c" 2>/dev/null || code=32
-                if (( code >= 0 && code < 32 )); then
-                    printf -v c '\\u%04x' "$code"
-                fi
-                out+=$c
-                ;;
+    for ((i = 0; i < byte_length; i++)); do
+        char=${password:i:1}
+        case "$char" in
+            [A-Z]) has_upper=1 ;;
+            [a-z]) has_lower=1 ;;
+            [0-9]) has_digit=1 ;;
+            '!'|'@'|'#'|'$'|'%'|'^'|'&'|'*'|'('|')'|'-'|'_'|'='|'+'|'['|']'|'{'|'}'|'|'|'\'|';'|':'|"'"|'"'|','|'.'|'<'|'>'|'/'|'?'|'`'|'~') has_special=1 ;;
         esac
     done
-    printf '"%s"' "$out"
+    if (( ! has_upper || ! has_lower || ! has_digit || ! has_special )); then
+        fail "Admin password must be 12 to 1024 bytes and contain uppercase, lowercase, a digit, and a special character."
+    fi
+}
+# NAN-4957: enrichment (the IPinfo, Tor, ThreatFox platform feeds) REQUIRES a
+# 6G ClickHouse. Informational only — does not change the sizing above, and
+# says nothing about smaller limits when the feeds are off (2-4G is fine for
+# small and test tenants). Feeds are on unless .env turns
+# PLATFORM_FEEDS_AUTO_UPDATE off.
+ch_mem_feeds_note() {
+    local v n unit mib
+    # Dedicated app, ingest, PostgreSQL, and Keeper hosts do not run a
+    # ClickHouse server. Their role-local sizing cannot act on this warning,
+    # and emitting it made healthy split installs look under-provisioned.
+    if [[ "${MULTI_NODE:-0}" == "1" && ",${ROLE_ARG:-}," != *,clickhouse,* ]]; then
+        return 0
+    fi
+    if grep -qiE '^PLATFORM_FEEDS_AUTO_UPDATE=["'"'"']?(0|false|no|off)' .env 2>/dev/null; then
+        return 0
+    fi
+    v="${CLICKHOUSE_MEM_LIMIT:-}"
+    if [[ -z "$v" ]]; then
+        v=$(grep -E '^CLICKHOUSE_MEM_LIMIT=' .env 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "\"' ")
+    fi
+    [[ -z "$v" ]] && v=2G   # compose fallback when the var is absent
+    if [[ "$v" =~ ^([0-9]+)([gGmM])[bB]?$ ]]; then
+        n=${BASH_REMATCH[1]}; unit=${BASH_REMATCH[2]}
+        case "$unit" in g|G) mib=$((n * 1024)) ;; *) mib=$n ;; esac
+    else
+        return 0   # unparseable: leave it to the operator
+    fi
+    if (( mib < 6144 )); then
+        warn "Enrichment requires 6 GB for ClickHouse; CLICKHOUSE_MEM_LIMIT is $v and the enrichment feeds (IPinfo, Tor, ThreatFox) are on. Raise it to CLICKHOUSE_MEM_LIMIT=6G in .env, or disable the feeds with PLATFORM_FEEDS_AUTO_UPDATE=false, then docker compose up -d. Without the memory, events get no geo/ASN (ingest keeps working)."
+    fi
+}
+
+# Escape a string for safe embedding inside a JSON string literal.
+# Handles backslash, double-quote, and the C0 controls that JSON forbids.
+json_escape() {
+    python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.argv[1]))' "$1" 2>/dev/null \
+        || node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' -- "$1" 2>/dev/null \
+        || fail "Neither python3 nor node is available to JSON-escape the admin password. Install one and retry."
+}
+
+# Classify the rendered Vector data mount without trusting raw YAML text. Fresh
+# single-node installs already require one of Python/Node for JSON-safe admin
+# setup; retain that portable soft dependency rather than making Python alone a
+# new quickstart prerequisite.
+vector_data_storage_mode_from_json() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json
+import sys
+
+document = json.load(sys.stdin)
+mounts = [
+    mount
+    for mount in document.get("services", {}).get("vector", {}).get("volumes", [])
+    if mount.get("target") == "/var/lib/vector"
+]
+if len(mounts) != 1:
+    raise SystemExit("Vector must have exactly one /var/lib/vector mount")
+mount = mounts[0]
+if mount.get("type") == "volume":
+    definition = document.get("volumes", {}).get(mount.get("source"), {})
+    driver = definition.get("driver", "local")
+    options = definition.get("driver_opts") or {}
+    external = bool(definition.get("external"))
+    print("named" if driver == "local" and not options and not external else "bind")
+else:
+    print("bind")
+'
+        return
+    fi
+    if command -v node >/dev/null 2>&1; then
+        node -e '
+let input = "";
+process.stdin.on("data", chunk => input += chunk).on("end", () => {
+  const document = JSON.parse(input);
+  const mounts = (((document.services || {}).vector || {}).volumes || [])
+    .filter(mount => mount.target === "/var/lib/vector");
+  if (mounts.length !== 1) process.exit(2);
+  const mount = mounts[0];
+  if (mount.type !== "volume") return console.log("bind");
+  const definition = (document.volumes || {})[mount.source] || {};
+  const options = definition.driver_opts || {};
+  const named = (definition.driver || "local") === "local"
+    && Object.keys(options).length === 0 && !definition.external;
+  console.log(named ? "named" : "bind");
+});
+'
+        return
+    fi
+    fail "Neither python3 nor node is available to inspect Vector's rendered data mount. Install one and retry."
 }
 
 # Verify that the images we just pulled match the sha256 manifest digests
@@ -611,7 +355,7 @@ json_escape() {
 # carries a tag (a ':' in its last path segment):
 #   - First-party  "ghcr.io/nano-rs/nano-api sha256:…"  (no tag) — the tag is
 #     NANO_VERSION, and the digest is release-specific. CI regenerates these.
-#   - Third-party  "postgres:18 sha256:…"  (tagged, self-contained) — mirrors
+#   - Third-party  "postgres:17 sha256:…"  (tagged, self-contained) — mirrors
 #     the @sha256 pins in docker-compose.opensource.yml. Version-independent.
 
 # Resolve owner/repo from NANO_REPO_URL when it points at GitHub, else empty.
@@ -628,55 +372,44 @@ github_owner_repo() {
 }
 
 # Echo (newest first) the commit SHAs that touched images.lock on the configured
-# GitHub repo, via the commits API. Parsed with python3, which the installer
-# already requires (NAN-4417: Docker-only hosts have no node, and the old node
-# parser silently skipped first-party verification there). Empty on any failure.
+# GitHub repo, via the commits API. Needs python3 or node to parse JSON (same
+# soft dep as json_escape). Empty on any failure.
 github_lock_commit_shas() {
     local owner_repo json
     owner_repo=$(github_owner_repo) || return 1
     json=$(curl -fsSL -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/${owner_repo}/commits?path=images.lock&per_page=100" 2>/dev/null) \
         || return 1
-    printf '%s' "$json" | python3 -I -c '
-import json, re, sys
-for commit in json.load(sys.stdin):
-    sha = commit.get("sha", "") if isinstance(commit, dict) else ""
-    if re.fullmatch(r"[0-9a-f]{40}", sha):
-        print(sha)
+    printf '%s' "$json" | python3 -c '
+import json,sys
+for c in json.load(sys.stdin): print(c["sha"])
+' 2>/dev/null && return 0
+    printf '%s' "$json" | node -e '
+let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const c of JSON.parse(s))console.log(c.sha);});
 ' 2>/dev/null
 }
 
 # Fetch the images.lock whose "# Release:" header matches the pinned version into
-# a temp file and echo its path. The working-tree lock tracks the latest release,
+# a temp file and echo its path. The working-tree lock tracks the current release,
 # so its first-party digests won't match an older pinned NANO_VERSION. We walk
 # the commits that touched images.lock (newest first) and return the first whose
 # header matches — this works whether the repo keeps a commit per release (the
 # dev repo) or snapshot-sync commits (the public mirror), since both carry the
-# "# Release:" header in the file itself. The checkout's own git history is
-# tried first (no network; a full clone or a non-GitHub remote has it), then the
-# GitHub commits API with raw file fetches. Empty on failure.
+# "# Release:" header in the file itself. Empty on failure.
 fetch_release_lock() {
     local want="${1#v}" want_re owner_repo sha tmp tried=0
+    owner_repo=$(github_owner_repo) || return 1
     want_re="${want//./\\.}"   # dots are literal, not regex wildcards
-    tmp=$(mktemp "${TMPDIR:-/tmp}/nano-images-lock.XXXXXX") || return 1
     while read -r sha; do
         [[ -z "$sha" ]] && continue
-        if git show "${sha}:images.lock" > "$tmp" 2>/dev/null \
+        tried=$((tried + 1)); [[ "$tried" -gt 40 ]] && break
+        tmp=$(mktemp) || return 1
+        if curl -fsSL "https://raw.githubusercontent.com/${owner_repo}/${sha}/images.lock" -o "$tmp" 2>/dev/null \
            && grep -qE "^# Release: v?${want_re}([^0-9]|\$)" "$tmp"; then
             printf '%s' "$tmp"; return 0
         fi
-    done < <(git log --format=%H -n 40 -- images.lock 2>/dev/null)
-    if owner_repo=$(github_owner_repo); then
-        while read -r sha; do
-            [[ -z "$sha" ]] && continue
-            tried=$((tried + 1)); [[ "$tried" -gt 40 ]] && break
-            if curl -fsSL "https://raw.githubusercontent.com/${owner_repo}/${sha}/images.lock" -o "$tmp" 2>/dev/null \
-               && grep -qE "^# Release: v?${want_re}([^0-9]|\$)" "$tmp"; then
-                printf '%s' "$tmp"; return 0
-            fi
-        done < <(github_lock_commit_shas)
-    fi
-    rm -f "$tmp"
+        rm -f "$tmp"
+    done < <(github_lock_commit_shas)
     return 1
 }
 
@@ -685,7 +418,7 @@ fetch_release_lock() {
 # network, no tag re-resolution.
 repo_digest_of() {
     local line
-    line=$(docker </dev/null image inspect "$1" \
+    line=$(docker image inspect "$1" \
         --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
         | grep -F "${2}@" | head -1)
     printf '%s' "${line##*@}"
@@ -720,22 +453,23 @@ verify_one_digest() {
     fi
 }
 
-# NAN-4743: the distinct repository paths (registry/namespace) of the images the
-# active compose deploys, for the pull log line. `nginx:alpine` -> docker.io/library.
-image_sources() { # <newline-separated image refs>
-    local ref path srcs=""
-    while read -r ref; do
-        [[ -n "$ref" ]] || continue
-        ref="${ref%@*}"; path="${ref%/*}"
-        if [[ "$ref" != */* ]]; then path="docker.io/library"
-        elif [[ "${ref%%/*}" != *[.:]* && "${ref%%/*}" != localhost ]]; then path="docker.io/$path"; fi
-        [[ ",$srcs," == *",$path,"* ]] || srcs="${srcs:+$srcs,}$path"
-    done <<< "$1"
-    [[ -n "$srcs" ]] && printf '%s\n' "${srcs//,/, }" || echo "the configured registries"
+# The "# Release: vX.Y.Z" header of a lock file, without the leading v.
+lock_release() {
+    local r
+    r=$(sed -n 's/^# Release: v\{0,1\}//p' "$1" 2>/dev/null | head -1)
+    printf '%s' "${r%% *}"
 }
 
 verify_image_digests() {
-    local lockfile="images.lock"
+    local lockfile="$IMAGES_LOCK"
+
+    image_is_active() {
+        local ref="$1" active
+        while IFS= read -r active; do
+            [[ "$active" == "$ref" || "$active" == "$ref@sha256:"* ]] && return 0
+        done <<< "${ACTIVE_IMAGES:-}"
+        return 1
+    }
 
     # Escape hatch (NAN-1328): let an operator opt out of the supply-chain check
     # if they hit an environment the digest readback can't handle. Off by default
@@ -746,32 +480,30 @@ verify_image_digests() {
     fi
 
     if [[ ! -f "$lockfile" ]]; then
-        warn "images.lock not found — skipping image digest verification."
+        warn "$lockfile not found — skipping image digest verification."
         return 0
     fi
 
     # Third-party base images are version-independent and always verified against
-    # the local lock. First-party digests are release-specific: on 'latest' the
-    # local lock matches; on a pinned NANO_VERSION we fetch the matching release's
-    # lock so a careful (pinned) operator stays verified instead of skipped.
-    local fp_lockfile="$lockfile" fetched="" want_re
-    want_re="${NANO_VERSION#v}"; want_re="${want_re//./\\.}"
-    if grep -qE "^# Release: v?${want_re}([^0-9]|\$)" "$lockfile"; then
-        : # this checkout's lock is the pinned release's lock
-    elif [[ "$NANO_VERSION" != "latest" ]]; then
-        if fetched=$(fetch_release_lock "$NANO_VERSION") && [[ -n "$fetched" ]]; then
+    # the local lock. First-party digests are release-specific. The local lock
+    # already describes this release (the default: NANO_VERSION is read from it),
+    # so only an explicitly pinned OTHER release needs its own lock fetched, which
+    # keeps a pinned operator verified instead of skipped. Fetching walks the
+    # public repo's history, so it exists for open core only.
+    local fp_lockfile="$lockfile" fetched=""
+    if [[ "$(lock_release "$lockfile")" != "${NANO_VERSION#v}" ]]; then
+        if [[ "$NANO_EDITION" == "open" ]] && fetched=$(fetch_release_lock "$NANO_VERSION") && [[ -n "$fetched" ]]; then
             fp_lockfile="$fetched"
             ok "Fetched images.lock for pinned release v${NANO_VERSION#v}"
         else
-            # NAN-4417: never start first-party images that nothing vouched for.
-            fail "Could not find images.lock for release v${NANO_VERSION#v}, so the first-party image digests cannot be verified. Check that v${NANO_VERSION#v} is a published release and that this host can reach api.github.com and raw.githubusercontent.com, or re-run without NANO_VERSION to install this checkout's release. NANO_SKIP_IMAGE_VERIFY=1 proceeds unverified."
+            fp_lockfile=""
+            warn "Could not fetch images.lock for pinned NANO_VERSION='$NANO_VERSION' — first-party digests not verified (base images still are)."
         fi
     fi
 
     log "Verifying pulled image digests against images.lock"
-    local ref expected basename repo_notag inspect_ref result active_images
-    local mismatch=0 verified_fp=0 verified_tp=0 not_deployed_fp=""
-    active_images=$(docker </dev/null compose "${COMPOSE_ARGS[@]}" config --images 2>/dev/null || true)
+    local ref expected basename repo_notag inspect_ref result
+    local mismatch=0 verified_fp=0 verified_tp=0
 
     # First-party lines (no tag): inspect repo:NANO_VERSION, from fp_lockfile.
     if [[ -n "$fp_lockfile" ]]; then
@@ -779,476 +511,42 @@ verify_image_digests() {
             [[ -z "$ref" || "$ref" == \#* ]] && continue
             basename="${ref##*/}"; [[ "$basename" == *:* ]] && continue
             inspect_ref="${ref}:${NANO_VERSION}"; repo_notag="$ref"
+            # Only a Compose-selected image can affect this host. Inspecting a
+            # cached same-tag image from an inactive role turns harmless stale
+            # cache state into a false supply-chain failure.
+            image_is_active "$inspect_ref" || continue
             result=$(verify_one_digest "$inspect_ref" "$repo_notag" "$expected")
             case "$result" in
                 ok) verified_fp=$((verified_fp + 1)) ;;
                 missing)
-                    if printf '%s\n' "$active_images" | grep -qxF "$inspect_ref"; then
-                        fail "No registry digest found for active image ${inspect_ref} — cannot verify it against images.lock. Refusing to start with unverifiable images."
-                    fi
-                    # NAN-4743: not deployed by this compose (profile off, or replaced by an
-                    # overlay such as docker-compose.sovereign.yml): one summary line below.
-                    not_deployed_fp="${not_deployed_fp:+$not_deployed_fp, }${ref##*/}" ;;
+                    fail "No registry digest found for ${inspect_ref} — cannot verify an active role image against $lockfile. Refusing to start with unverifiable images." ;;
                 *) mismatch=1 ;;
             esac
         done < "$fp_lockfile"
     fi
-
-    [[ -z "$not_deployed_fp" ]] \
-        || log "Not deployed by this install (inactive profile or replaced by an overlay), so not verified against images.lock: ${not_deployed_fp}"
 
     # Third-party lines (tagged): self-contained, always from the local lock.
     while read -r ref expected; do
         [[ -z "$ref" || "$ref" == \#* ]] && continue
         basename="${ref##*/}"; [[ "$basename" == *:* ]] || continue
         inspect_ref="$ref"; repo_notag="${ref%:*}"
+        image_is_active "$inspect_ref" || continue
         result=$(verify_one_digest "$inspect_ref" "$repo_notag" "$expected")
         case "$result" in
             ok) verified_tp=$((verified_tp + 1)) ;;
-            # NAN-1659: a "missing" third-party image was NOT pulled — i.e. it
-            # belongs to an optional compose profile that's off for this install
-            # (e.g. tenzir, `profiles: ["tenzir"]`, only pulled when
-            # COMPOSE_PROFILES=tenzir). images.lock records every profile's
-            # images, but `docker compose pull` only fetches the active set, so
-            # the purely-local digest readback finds nothing. That's not a
-            # supply-chain risk — the image isn't deployed, and the compose file
-            # pins it inline by @sha256 for when the profile IS enabled — so skip
-            # it rather than refuse to start. A tampered image that IS running
-            # would be present and caught as a "mismatch" below. First-party
-            # cores are always deployed, so their "missing" stays fatal.
             missing)
-                warn "Skipping digest verify for ${inspect_ref} — not pulled (optional/profile-gated image, not deployed)." ;;
+                fail "No registry digest found for ${inspect_ref} — cannot verify an active role image against $lockfile. Refusing to start with unverifiable images." ;;
             *) mismatch=1 ;;
         esac
     done < "$lockfile"
 
-    # NAN-2361: the loops above iterate images.lock, so an image the compose
-    # actually DEPLOYS but the lock does not record is never considered at all —
-    # no warning, no failure, and the summary below still reports a clean
-    # verification. Cross-check the other way round: every first-party image in
-    # the ACTIVE profile must have a lock line, or it is unverifiable and we
-    # refuse rather than pretend. (Third-party images are pinned inline by
-    # @sha256 in the compose, so an absent lock line there cannot go unnoticed.)
-    local uncovered=""
-    if [[ -n "$fp_lockfile" && -f "$fp_lockfile" ]]; then
-        while read -r active_ref; do
-            # NAN-3604: first-party is ghcr.io/nano-rs/nano-* only (the
-            # ghcr.io/nano-rs/vector fork is digest-pinned like third-party).
-            [[ "$active_ref" == ghcr.io/nano-rs/nano-* ]] || continue
-            repo_notag="${active_ref%:*}"
-            awk -v r="$repo_notag" '$1 == r { found = 1 } END { exit !found }' "$fp_lockfile" \
-                || uncovered="${uncovered}${repo_notag}"$'\n'
-        done <<< "$active_images"
-    fi
-
     [[ -n "$fetched" ]] && rm -f "$fetched"
-
-    if [[ -n "$uncovered" ]]; then
-        warn "Deployed by $COMPOSE_FILE but absent from images.lock:"
-        while read -r u; do [[ -n "$u" ]] && warn "  $u"; done <<< "$uncovered"
-        fail "images.lock does not cover every first-party image this profile deploys, so they cannot be verified against a vouched digest. Regenerate images.lock (build-and-push.yml merge-manifests records one line per built component) or re-run with NANO_SKIP_IMAGE_VERIFY=1 to proceed unverified."
-    fi
 
     if [[ "$mismatch" == "1" ]]; then
         fail "Image digest verification failed: pulled images do not match images.lock. Refusing to start. If you deliberately changed image versions this is expected — otherwise it may indicate a tampered or re-pushed tag."
     fi
     ok "Verified $verified_fp first-party + $verified_tp third-party image digest(s) against images.lock"
 }
-
-# NAN-3402: containers read bind-mounted config as non-root users. A checkout
-# made under a restrictive umask (077) leaves those files 0600 root-owned, and
-# `git reset` does not repair modes of unchanged files, so re-runs stayed
-# broken. Open up only TRACKED files under the compose file's bind-mount
-# sources (they are public repo content); untracked operator files such as
-# TLS keys keep their modes.
-ensure_bind_mounts_readable() {
-    local compose="$1" src
-    local -a sources=()
-    while read -r src; do
-        [[ -n "$src" && -e "$src" ]] && sources+=("$src")
-    done < <(sed -nE 's/^[[:space:]]*-[[:space:]]+\.\/([^:[:space:]]+):.*/\1/p' "$compose" | sort -u)
-    (( ${#sources[@]} > 0 )) || return 0
-    git ls-files -z -- ${sources[@]+"${sources[@]}"} | xargs -0 chmod go+rX 2>/dev/null || true
-    find ${sources[@]+"${sources[@]}"} -type d -exec chmod go+rx {} + 2>/dev/null || true
-}
-
-# NAN-4408: a failed `up -d` (one container exited, a dependency wait timed
-# out) leaves its dependents Created, and Compose never starts them later. A
-# re-run whose API was already healthy then skipped every retry and failed the
-# connector-runner wait. Prints, one per line, each service of the active
-# profiles that is not running: no container yet, Created, Restarting, Dead,
-# or Exited. A one-shot job (restart policy no/on-failure) that exited 0 has
-# done its work and is not listed. Returns 1 if Compose cannot be queried.
-unconverged_services() {
-    local services ps_out svc line id state code policy
-    services=$(docker </dev/null compose "${COMPOSE_ARGS[@]}" config --services 2>/dev/null) || return 1
-    ps_out=$(docker </dev/null compose "${COMPOSE_ARGS[@]}" ps -a \
-        --format '{{.Service}} {{.ID}} {{.State}} {{.ExitCode}}' 2>/dev/null) || return 1
-    while IFS= read -r svc; do
-        [[ -n "$svc" ]] || continue
-        line=$(awk -v s="$svc" '$1 == s { print; exit }' <<< "$ps_out")
-        if [[ -z "$line" ]]; then
-            echo "$svc"
-            continue
-        fi
-        read -r _ id state code <<< "$line"
-        case "$state" in
-            running) ;;
-            exited)
-                if [[ "$code" == 0 ]]; then
-                    policy=$(docker </dev/null inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$id" 2>/dev/null || true)
-                    case "$policy" in ""|no|on-failure) continue ;; esac
-                fi
-                echo "$svc"
-                ;;
-            *) echo "$svc" ;;
-        esac
-    done <<< "$services"
-}
-
-# Bounded convergence after `up -d`: re-run `up -d` for exactly the services
-# that are not running, up to 3 attempts with backoff (5s, 10s, 20s). A
-# service still down afterwards — e.g. crash-looping on a config error — fails
-# the install with its name and the last 30 lines of its logs.
-converge_services() {
-    local attempt pending delay=5 retried=0 svc
-    for (( attempt = 1; attempt <= 3; attempt++ )); do
-        if ! pending=$(unconverged_services); then
-            warn "Could not read service states from docker compose; skipping the convergence check."
-            return 0
-        fi
-        [[ -z "$pending" ]] && break
-        warn "Services not running after docker compose up: $(echo "$pending" | tr '\n' ' ')— starting them again (attempt $attempt of 3)."
-        # shellcheck disable=SC2086 # one word per service name
-        docker </dev/null compose "${COMPOSE_ARGS[@]}" up -d $pending >> "${COMPOSE_UP_LOG:-/dev/null}" 2>&1 || true
-        retried=1
-        sleep "$delay"
-        delay=$((delay * 2))
-    done
-    if (( attempt > 3 )); then
-        pending=$(unconverged_services) || pending=""
-    fi
-    if [[ -n "$pending" ]]; then
-        for svc in $pending; do
-            printf "%b✗ Service '%s' is not running after 3 attempts. Last 30 log lines:%b\n" "$c_red$c_bold" "$svc" "$c_reset" >&2
-            docker </dev/null compose "${COMPOSE_ARGS[@]}" logs --no-color --tail 30 "$svc" 1>&2 || true
-        done
-        fail "Services did not start: $(echo "$pending" | tr '\n' ' ')— see the logs above. Fix the cause and re-run this installer."
-    fi
-    if (( retried )); then
-        ok "All services running after retry"
-        # Recreated app containers have new IPs; see compose_up (NAN-1237).
-        docker </dev/null compose "${COMPOSE_ARGS[@]}" exec -T nginx nginx -s reload >/dev/null 2>&1 || true
-    fi
-    return 0
-}
-
-# Bring the stack up, wait for the API through nginx, and finish admin setup.
-#
-# On a fresh lake, `up -d` itself can fail: nano-api depends on
-# lake-query-worker being healthy, and the worker only turns healthy once its
-# bootstrap generation is admitted. Its healthcheck (start_period 300s, then
-# 60 retries x 5s) marks it unhealthy after ~10 min, Compose's dependency wait
-# gives up with "dependency failed to start", and nano-api/nginx are left
-# Created. That is not fatal on the lake profile: the wait below keeps
-# re-running `up -d` until the API answers or the health timeout expires.
-start_and_wait_for_api() {
-    local timeout
-    timeout=$(health_timeout_seconds)
-    COMPOSE_RETRY_WHILE_WAITING=0
-    log "Starting services"
-    if ! compose_up loud; then
-        if [[ "${ENABLE_LAKE_CONTROL_PLANE:-0}" == "1" ]]; then
-            warn "docker compose up -d did not finish (log: $COMPOSE_UP_LOG). On the lake profile this is expected while lake-query-worker waits for its bootstrap generation; retrying about once a minute while waiting."
-            COMPOSE_RETRY_WHILE_WAITING=1
-        else
-            warn "docker compose up -d did not finish (log: $COMPOSE_UP_LOG). Retrying the services that did not start."
-            converge_services
-            # Confirm the whole stack now comes up; a persistent failure stays
-            # fatal here rather than surfacing later as an API health timeout.
-            compose_up quiet \
-                || fail "docker compose up -d failed (log: $COMPOSE_UP_LOG). Check 'docker compose -f $COMPOSE_FILE ps' and logs."
-        fi
-    fi
-    if [[ "${ENABLE_LAKE_CONTROL_PLANE:-0}" == "1" && "${REUSE_ENV:-0}" != "1" ]]; then
-        log "Waiting for API to become healthy through nginx (up to $((timeout / 60)) min — a fresh lake waits for the query worker's bootstrap generation, often ~10 min)"
-    else
-        log "Waiting for API to become healthy through nginx (up to $((timeout / 60)) min — first run includes DB migrations)"
-    fi
-    if ! wait_for_api_health "${API_BASE}/api/health" "$timeout"; then
-        fail "API did not become healthy within $((timeout / 60)) min. Check 'docker compose -f $COMPOSE_FILE logs nano-api nano-nginx' (compose up log: ${COMPOSE_UP_LOG:-none}). Re-running this installer is safe and will finish admin setup (raise NANO_HEALTH_TIMEOUT_SECONDS to wait longer)."
-    fi
-    # NAN-4845: every successful health path (including retries and resumes)
-    # must finish admin setup before any later service check can fail.
-    bootstrap_admin
-    # NAN-4408: a healthy API does not mean every service started (a re-run
-    # whose first `up -d` failed partway leaves e.g. connector-runner Created).
-    converge_services
-    # The compose profile also starts the dedicated pull-feed worker. Do not
-    # report a successful upgrade while its boot/sandbox/database check fails.
-    if docker </dev/null compose "${COMPOSE_ARGS[@]}" config --services | grep -qx connector-runner; then
-        local connector_id connector_status connector_start
-        connector_start=$(date +%s)
-        while :; do
-            connector_id=$(docker </dev/null compose "${COMPOSE_ARGS[@]}" ps -q connector-runner)
-            connector_status=$(docker </dev/null inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$connector_id" 2>/dev/null || true)
-            [[ "$connector_status" == healthy ]] && break
-            if (( $(date +%s) - connector_start >= 180 )); then
-                fail "Connector runner did not become healthy. Check 'docker compose -f $COMPOSE_FILE logs connector-runner'."
-            fi
-            sleep 5
-        done
-        ok "Connector runner healthy"
-    fi
-    [[ "${COMPOSE_UP_LOG:-/dev/null}" == /dev/null ]] || rm -f "$COMPOSE_UP_LOG"
-}
-
-# Health wait for the API through nginx. A fresh lake keeps nano-api unhealthy
-# until the query worker admits its bootstrap generation (~10 min on a small
-# host), so the lake default is generous; NANO_HEALTH_TIMEOUT_SECONDS
-# overrides it. Logs progress once a minute so an unattended run is not silent.
-health_timeout_seconds() {
-    local timeout="${NANO_HEALTH_TIMEOUT_SECONDS:-}"
-    if [[ -z "$timeout" ]]; then
-        if [[ "${ENABLE_LAKE_CONTROL_PLANE:-0}" == "1" ]]; then timeout=1800; else timeout=300; fi
-    fi
-    if [[ ! "$timeout" =~ ^[0-9]+$ ]] || (( timeout == 0 )); then
-        fail "NANO_HEALTH_TIMEOUT_SECONDS must be a positive integer number of seconds."
-    fi
-    echo "$timeout"
-}
-
-# `docker compose up -d`, output appended to a temp log (container names and
-# status lines only; Compose never prints environment values). $1=loud also
-# streams it to the terminal. On success, reload nginx: on a re-run/upgrade
-# `up -d` recreates the app containers (new IPs) but leaves nginx as-is, and it
-# won't have loaded an updated nginx.conf either, so it would proxy dead old
-# IPs and 502 until restarted (NAN-1237). Best-effort.
-COMPOSE_UP_LOG=""
-compose_up() {
-    local mode="${1:-quiet}" rc
-    if [[ -z "${COMPOSE_UP_LOG:-}" ]]; then
-        COMPOSE_UP_LOG=$(mktemp "${TMPDIR:-/tmp}/nano-compose-up.XXXXXX" 2>/dev/null) || COMPOSE_UP_LOG=/dev/null
-    fi
-    if [[ "$mode" == "loud" ]]; then
-        docker </dev/null compose "${COMPOSE_ARGS[@]}" up -d 2>&1 | tee -a "$COMPOSE_UP_LOG"
-        rc=${PIPESTATUS[0]}
-    else
-        docker </dev/null compose "${COMPOSE_ARGS[@]}" up -d >> "$COMPOSE_UP_LOG" 2>&1
-        rc=$?
-    fi
-    (( rc == 0 )) || return "$rc"
-    # container_name is gone (one install per compose project): address nginx by service.
-    docker </dev/null compose "${COMPOSE_ARGS[@]}" exec -T nginx nginx -s reload >/dev/null 2>&1 || true
-}
-
-# While waiting, COMPOSE_RETRY_WHILE_WAITING=1 re-runs the idempotent
-# `up -d` about once a minute (COMPOSE_UP_RETRY_SECONDS). Compose does not
-# later start dependents it skipped after a failed dependency wait, so without
-# this nano-api/nginx would stay Created even once the query worker turns
-# healthy.
-wait_for_api_health() {
-    local url="$1" timeout="$2" start now next_report next_up pending
-    local retry_every="${COMPOSE_UP_RETRY_SECONDS:-60}"
-    start=$(date +%s)
-    next_report=$((start + 60))
-    next_up=$((start + retry_every))
-    while :; do
-        if curl -fsS -o /dev/null --max-time 10 "$url" 2>/dev/null; then
-            ok "API healthy after $(( $(date +%s) - start ))s"
-            return 0
-        fi
-        now=$(date +%s)
-        if (( now - start >= timeout )); then
-            return 1
-        fi
-        if [[ "${COMPOSE_RETRY_WHILE_WAITING:-0}" == "1" ]] && (( now >= next_up )); then
-            if compose_up quiet; then
-                log "docker compose up -d completed — every service has started; waiting for the API."
-                COMPOSE_RETRY_WHILE_WAITING=0
-            fi
-            now=$(date +%s)
-            next_up=$((now + retry_every))
-        fi
-        if (( now >= next_report )); then
-            pending=$(docker </dev/null compose "${COMPOSE_ARGS[@]}" ps --format '{{.Name}}={{.Health}}' 2>/dev/null \
-                | grep -E '=(starting|unhealthy)$' | tr '\n' ' ' || true)
-            log "Still waiting for the API ($(( (now - start) / 60 ))m of $(( timeout / 60 ))m)${pending:+ — not yet healthy: $pending}"
-            next_report=$((now + 60))
-        fi
-        sleep 3
-    done
-}
-
-# GET /api/setup/status → {"initialized":bool,"has_users":bool}. Echoes
-# "initialized" only when initialized:true, otherwise "pending". With $1=1,
-# retry pending states too, to confirm initialization after a POST. An
-# unreachable or unconfirmed endpoint is fatal rather than guessed.
-setup_state() {
-    local state attempt require_initialized="${1:-0}"
-    for (( attempt = 0; attempt < 10; attempt++ )); do
-        if state=$(curl --disable -fsS --max-time 10 "${API_BASE}/api/setup/status" 2>/dev/null | python3 -I -c '
-import json, sys
-value = json.load(sys.stdin)["initialized"]
-if type(value) is not bool:
-    sys.exit(1)
-print("initialized" if value else "pending")
-' 2>/dev/null); then
-            if [[ "$state" == initialized ]]; then
-                echo initialized; return 0
-            fi
-            if [[ "$require_initialized" != 1 && "$state" == pending ]]; then
-                echo pending; return 0
-            fi
-        fi
-        sleep "${SETUP_STATE_RETRY_SECONDS:-3}"
-    done
-    return 1
-}
-
-ADMIN_PASSWORD_POLICY_MSG="Admin password must be 12-1024 characters with at least one uppercase letter, one lowercase letter, one digit, and one special character."
-
-# Resolve the admin credentials for a re-run that finds the system not yet
-# initialized (a first run timed out before admin creation, NAN-3402):
-# env var → the value the first run recorded in .env → prompt. A password
-# autogenerated by the first run is reused from .env, never regenerated, so the
-# operator is not handed one that differs from the first run's output.
-resolve_rerun_admin_credentials() {
-    local stored
-    if [[ -z "$ADMIN_EMAIL" ]]; then
-        ADMIN_EMAIL=$(env_file_value INITIAL_ADMIN_EMAIL)
-        [[ -z "$ADMIN_EMAIL" ]] && ADMIN_EMAIL=$(prompt_tty "Admin email")
-        [[ -z "$ADMIN_EMAIL" ]] && fail "The admin account has not been created yet and no admin email is known. Set NANO_ADMIN_EMAIL and re-run."
-    fi
-    if [[ -z "$ADMIN_NAME" ]]; then
-        ADMIN_NAME=$(env_file_value INITIAL_ADMIN_NAME)
-        [[ -z "$ADMIN_NAME" ]] && ADMIN_NAME=$(prompt_tty "Admin display name" "Admin")
-        [[ -z "$ADMIN_NAME" ]] && ADMIN_NAME="Admin"
-    fi
-    if [[ -z "$ADMIN_PASSWORD" ]]; then
-        stored=$(env_file_value INITIAL_ADMIN_PASSWORD)
-        if [[ -n "$stored" ]] && ! password_meets_policy "$stored"; then
-            # Installers before NAN-3402 generated hex, which the API rejects;
-            # that admin was therefore never created, so nobody can be using
-            # it. Replace it rather than leave the re-run stuck.
-            warn "The stored INITIAL_ADMIN_PASSWORD predates the password policy fix; generating a compliant one."
-            stored=""
-            ADMIN_PASSWORD=$(gen_admin_password) || fail "Could not generate an admin password."
-            GENERATED_PASSWORD=1
-            upsert_env_file_value INITIAL_ADMIN_PASSWORD "$ADMIN_PASSWORD"
-        elif [[ -n "$stored" ]]; then
-            ADMIN_PASSWORD="$stored"
-            GENERATED_PASSWORD=1
-        else
-            ADMIN_PASSWORD=$(prompt_tty "Admin password (blank = autogenerate)" "" secret)
-            if [[ -z "$ADMIN_PASSWORD" ]]; then
-                ADMIN_PASSWORD=$(gen_admin_password) || fail "Could not generate an admin password."
-                GENERATED_PASSWORD=1
-                # Persist before use so a failure below cannot lose it.
-                upsert_env_file_value INITIAL_ADMIN_PASSWORD "$ADMIN_PASSWORD"
-            fi
-        fi
-    fi
-    password_meets_policy "$ADMIN_PASSWORD" || fail "$ADMIN_PASSWORD_POLICY_MSG"
-}
-
-# Create the first admin unless the API says it exists. Idempotent: keyed on
-# the live setup status, so a re-run after a timed-out first boot finishes the
-# job, and a normal upgrade re-run is a no-op.
-bootstrap_admin() {
-    local state payload code body_file
-    ADMIN_CREATED=0
-    state=$(setup_state) \
-        || fail "Could not read ${API_BASE}/api/setup/status. Check 'docker compose -f $COMPOSE_FILE logs nano-api'."
-    if [[ "$state" == "initialized" ]]; then
-        ok "Admin account already exists — skipping admin initialization."
-        return 0
-    fi
-    if [[ "${REUSE_ENV:-0}" == "1" ]]; then
-        warn "The admin account was never created (a previous run likely timed out) — creating it now."
-        resolve_rerun_admin_credentials
-    fi
-
-    log "Creating admin user $ADMIN_EMAIL"
-    payload=$(printf '{"email":%s,"name":%s,"password":%s}' \
-        "$(json_escape "$ADMIN_EMAIL")" \
-        "$(json_escape "$ADMIN_NAME")" \
-        "$(json_escape "$ADMIN_PASSWORD")")
-    body_file=$(mktemp "${TMPDIR:-/tmp}/nano-setup.XXXXXX") \
-        || fail "Could not create a temporary file for the setup response."
-    # The payload goes on stdin, not argv, so the password is not visible in ps.
-    code=$(curl --disable -sS -o "$body_file" -w '%{http_code}' --max-time 60 -X POST \
-        -H "Content-Type: application/json" \
-        --data-binary @- \
-        "${API_BASE}/api/setup/initialize" <<< "$payload" 2>/dev/null) || code=000
-    case "$code" in
-        200)
-            rm -f "$body_file"
-            ;;
-        409)
-            rm -f "$body_file"
-            warn "System was initialized concurrently — skipping admin creation."
-            ;;
-        *)
-            # Do not print the response: a proxy or server may echo credentials.
-            warn "POST /api/setup/initialize returned HTTP $code."
-            rm -f "$body_file"
-            fail "Admin initialization failed. Fix the cause and re-run this installer; it will retry admin creation. Logs: 'docker compose -f $COMPOSE_FILE logs nano-api'."
-            ;;
-    esac
-    state=$(setup_state 1) \
-        || fail "Admin initialization could not be confirmed (expected initialized:true from ${API_BASE}/api/setup/status). Re-run this installer to retry admin setup. Logs: 'docker compose -f $COMPOSE_FILE logs nano-api'."
-    if [[ "$code" == 200 ]]; then
-        ADMIN_CREATED=1
-        ok "Admin user created and initialization confirmed"
-    fi
-}
-
-# ----------------------------------------------------------------------------
-# 0. Arguments / interactivity
-# ----------------------------------------------------------------------------
-while (( $# > 0 )); do
-    case "$1" in
-        --non-interactive|--noninteractive|--yes|-y) NANO_NONINTERACTIVE=1 ;;
-        --tenzir) NANO_INGEST_MODE=tenzir ;;
-        --add-vector|--with-vector) NANO_INGEST_MODE=vector ;;
-        --target-eps)
-            [[ $# -ge 2 ]] || { usage >&2; fail "--target-eps needs a value"; }
-            NANO_LAKE_TARGET_EPS="$2"; shift ;;
-        --target-eps=*) NANO_LAKE_TARGET_EPS="${1#--target-eps=}" ;;
-        --feeds-file|--feeds-license)
-            [[ $# -ge 2 ]] || { usage >&2; fail "$1 needs a file"; }
-            if [[ $1 == --feeds-file ]]; then platform_feeds_file=$(realpath -- "$2");
-            else platform_feeds_license=$(realpath -- "$2"); fi
-            shift ;;
-        -h|--help) usage; exit 0 ;;
-        *) usage >&2; fail "Unknown argument: $1" ;;
-    esac
-    shift
-done
-[[ -z $platform_feeds_file || -z $platform_feeds_license ]] || fail "--feeds-file and --feeds-license cannot be combined"
-# NAN-4749: lake cell target rate (trusted-local init validates the range).
-if [[ -n "${NANO_LAKE_TARGET_EPS:-}" && ! "${NANO_LAKE_TARGET_EPS}" =~ ^[1-9][0-9]*$ ]]; then
-    fail "NANO_LAKE_TARGET_EPS must be a positive integer (got '${NANO_LAKE_TARGET_EPS}')."
-fi
-case "${NANO_INGEST_MODE:-}" in
-    ""|tenzir|vector) ;;
-    *) fail "NANO_INGEST_MODE must be 'tenzir' or 'vector' (got '${NANO_INGEST_MODE}')." ;;
-esac
-# NAN-3853: the ClickHouse edition is retired; it can no longer be installed.
-if [[ "${NANO_ENABLE_LAKE_CONTROL_PLANE:-1}" == 0 ]] \
-    || [[ "$(printf '%s' "${NANO_SCHEMA_PROFILE:-}" | tr '[:upper:]' '[:lower:]')" == udm ]]; then
-    fail "The ClickHouse edition (NANO_ENABLE_LAKE_CONTROL_PLANE=0 / NANO_SCHEMA_PROFILE=udm) is retired and can no longer be installed. Unset both: new installs use the OCSF object lake."
-fi
-if is_truthy "$NANO_NONINTERACTIVE"; then
-    NANO_NONINTERACTIVE=1
-else
-    NANO_NONINTERACTIVE=0
-    if ! tty_usable; then
-        NANO_NONINTERACTIVE=1
-        warn "No usable terminal — running non-interactively (env values and defaults only)."
-    fi
-fi
 
 # ----------------------------------------------------------------------------
 # 1. Prereq check
@@ -1259,66 +557,101 @@ require_cmd docker   "Install Docker: https://docs.docker.com/get-docker/"
 require_cmd git      "Install git (most package managers)."
 require_cmd openssl  "Install openssl (most distros ship it by default)."
 require_cmd curl     "Install curl."
-require_cmd python3  "Install Python 3 for lean bootstrap validation."
 
-if ! docker </dev/null compose version >/dev/null 2>&1; then
+if ! docker compose version >/dev/null 2>&1; then
     fail "docker compose v2 is required. Update Docker or install the compose plugin."
 fi
 
-if ! docker </dev/null info >/dev/null 2>&1; then
+if [[ -n "$INVENTORY_ARG" ]]; then
+    require_cmd python3 "Install Python 3 (used only to validate and render the sovereign host inventory)."
+    compose_version=$(docker compose version --short 2>/dev/null | sed 's/^v//' | cut -d- -f1)
+    IFS=. read -r compose_major compose_minor compose_patch <<< "$compose_version"
+    compose_major=${compose_major:-0}; compose_minor=${compose_minor:-0}; compose_patch=${compose_patch:-0}
+    if (( compose_major < 2 || (compose_major == 2 && compose_minor < 24) || (compose_major == 2 && compose_minor == 24 && compose_patch < 4) )); then
+        fail "Role-split installs require Docker Compose 2.24.4+ (found $compose_version)."
+    fi
+    [[ -f "$INVENTORY_ARG" ]] || fail "Inventory not found: $INVENTORY_ARG"
+    INVENTORY_PATH="$(cd "$(dirname "$INVENTORY_ARG")" && pwd -P)/$(basename "$INVENTORY_ARG")"
+fi
+
+if [[ "${NANO_PREPARE_ONLY:-0}" != "1" && "${NANO_CHECK_ONLY:-0}" != "1" ]] \
+    && ! docker info >/dev/null 2>&1; then
     fail "Docker daemon is not running or this user can't talk to it. Start Docker and retry."
+fi
+
+# NAN-4906 / NAN-4999: ClickHouse 26.6+ and ClickHouse Keeper need AVX2 on
+# x86-64 and die with an illegal instruction without it. Role-split app,
+# ingest, and PostgreSQL hosts do not run either binary and must not inherit
+# that hardware gate. Single-node installs still run ClickHouse locally.
+AVX2_REQUIRED_BY=""
+if [[ -z "$INVENTORY_ARG" ]]; then
+    AVX2_REQUIRED_BY="ClickHouse server (single-node role)"
+else
+    [[ ",${ROLE_ARG}," == *,clickhouse,* ]] && AVX2_REQUIRED_BY="ClickHouse role"
+    if [[ ",${ROLE_ARG}," == *,keeper,* ]]; then
+        [[ -n "$AVX2_REQUIRED_BY" ]] && AVX2_REQUIRED_BY+=", "
+        AVX2_REQUIRED_BY+="Keeper role"
+    fi
+fi
+CPUINFO_PATH=/proc/cpuinfo
+if [[ -n "${NANO_INSTALLER_TEST_CPUINFO_PATH:-}" ]]; then
+    [[ "${NANO_INSTALLER_TEST_MODE:-0}" == "1" ]] \
+        || fail "NANO_INSTALLER_TEST_CPUINFO_PATH is reserved for installer tests."
+    CPUINFO_PATH="$NANO_INSTALLER_TEST_CPUINFO_PATH"
+fi
+# No /proc/cpuinfo on macOS: Docker runs inside a VM. The fail-closed
+# clickhouse-preflight service runs in both ClickHouse and Keeper profiles,
+# checks the Docker VM's /proc/cpuinfo, and each stateful role depends on it.
+if [[ -n "$AVX2_REQUIRED_BY" && "$(uname -m)" == "x86_64" && -r "$CPUINFO_PATH" ]] \
+    && ! grep -qw avx2 "$CPUINFO_PATH"; then
+    fail "$AVX2_REQUIRED_BY requires AVX2 on x86-64 because it runs ClickHouse 26.6+ binaries. Use an AVX2-capable host (on Proxmox, set the VM CPU type to 'host' or x86-64-v3)."
 fi
 
 ok "All prerequisites present"
 
-# NAN-3853: refuse the retired ClickHouse edition before the checkout, .env,
-# images, or containers are touched.
-if LEGACY_CH_REASON=$(legacy_clickhouse_reason "$NANO_INSTALL_DIR"); then
-    refuse_legacy_clickhouse_install "$NANO_INSTALL_DIR" "$LEGACY_CH_REASON"
-fi
-
-# Refuse before updating the checkout, .env, or live placement. In particular,
-# lean-init re-renders files an existing cell watches even without a restart.
-# A smaller existing install must keep its working release and budgets.
-LEAN_HOST_MEMORY_BYTES=$(memory_capacity_bytes)
-LEAN_PREFLIGHT_VECTOR_PROFILE=$(if [[ -d "$NANO_INSTALL_DIR" ]]; then
-    (cd "$NANO_INSTALL_DIR" && resolve_vector_profile)
-else
-    case "${NANO_INGEST_MODE:-}" in tenzir) echo none ;; *) echo lean ;; esac
-fi)
-LEAN_MINIMUM_MEMORY_BYTES=$(lean_minimum_install_memory_bytes "$LEAN_PREFLIGHT_VECTOR_PROFILE") \
-    || fail "Could not read the lean startup memory policy; upgrade stopped before changing this install."
-LEAN_MINIMUM_MEMORY_MIB=$((LEAN_MINIMUM_MEMORY_BYTES / 1048576))
-if (( LEAN_HOST_MEMORY_BYTES < LEAN_MINIMUM_MEMORY_BYTES )); then
-    if [[ -f "$NANO_INSTALL_DIR/.env" ]]; then
-        fail "This release needs at least ${LEAN_MINIMUM_MEMORY_MIB} MiB available to Docker for the service and cell startup minimums (detected ${LEAN_HOST_MEMORY_BYTES} bytes). Upgrade stopped before changing the existing install; its release, configuration and running services are preserved. Resize the host before retrying."
+# v2 runs on ClickHouse. A 1.x install ran the OCSF object lake (gen1 `lake`
+# profile or the lean `lean` profile), whose data and services this release
+# does not have: an in-place upgrade would start an empty ClickHouse stack over
+# it. Refuse BEFORE the checkout is touched, so the lake install stays intact.
+if [[ -e "$NANO_INSTALL_DIR/.env" || -L "$NANO_INSTALL_DIR/.env" ]]; then
+    validate_env_file "$NANO_INSTALL_DIR/.env"
+    if tr -d '\r"'"'"'' < "$NANO_INSTALL_DIR/.env" \
+        | grep -qE '^(COMPOSE_PROFILES=(.*,)?(lake|lean)(,|$)|NANO_LOG_QUERY_BACKEND=lake|NANO_ENABLE_LAKE_CONTROL_PLANE=(1|true)|NANO_LAKE_[A-Z_]+=)'; then
+        fail "The install at $NANO_INSTALL_DIR runs the 1.x object-lake edition, which cannot be upgraded in place to this release. Install into a new directory (NANO_INSTALL_DIR=\$HOME/nano-v2) and move sources there."
     fi
-    fail "A fresh lean install needs at least ${LEAN_MINIMUM_MEMORY_MIB} MiB available to Docker for the service and cell startup minimums (detected ${LEAN_HOST_MEMORY_BYTES} bytes). Increase Docker memory or resize this host before installing."
 fi
 
 # ----------------------------------------------------------------------------
 # 2. Clone or update the repo
 # ----------------------------------------------------------------------------
-if [[ -d "$NANO_INSTALL_DIR/.git" ]]; then
+if [[ -e "$NANO_INSTALL_DIR/.git" ]]; then
     if [[ "${NANO_SKIP_GIT_UPDATE:-0}" == "1" ]]; then
-        # NAN-4686: a wrapper shipped inside this exact checkout installs it as is.
         log "NANO_SKIP_GIT_UPDATE=1 — installing the checkout at $NANO_INSTALL_DIR as is"
-    elif [[ -n "$(git -C "$NANO_INSTALL_DIR" status --porcelain 2>/dev/null)" ]]; then
-        warn "$NANO_INSTALL_DIR has local changes — skipping git update so your edits stay intact."
     else
-        log "Updating existing checkout at $NANO_INSTALL_DIR"
-        git -C "$NANO_INSTALL_DIR" fetch --depth 1 origin "$NANO_BRANCH"
-        # The nano-rs/nano mirror is force-regenerated on every sync, so its
-        # history diverges from any prior checkout and can never fast-forward.
-        # Hard-reset to the fetched remote HEAD instead. Safe: the clean-tree
-        # check above already skips this branch (preserving edits) when there
-        # are local changes, so this only resets an unmodified checkout — the
-        # authoritative state is always the mirror. (NAN-1929: an ff-only merge
-        # left a stale images.lock and then failed digest verification against
-        # the freshly-pulled :latest images.)
-        git -C "$NANO_INSTALL_DIR" reset --hard FETCH_HEAD \
-            || fail "Could not update $NANO_INSTALL_DIR to the latest release. Remove it and re-run to reclone."
+        # Older checkouts predate the shipped ignore rule for the helper's stable
+        # flock identity. Ignore only that generated, untracked root path; any
+        # tracked change or other untracked customer file still blocks the reset.
+        GIT_DIRTY_STATUS=$(git -C "$NANO_INSTALL_DIR" status --porcelain 2>/dev/null \
+            | awk '$0 != "?? .env.nano-generated-secrets.lock"')
+        if [[ -n "$GIT_DIRTY_STATUS" ]]; then
+            warn "$NANO_INSTALL_DIR has local changes — skipping git update so your edits stay intact."
+        else
+            log "Updating existing checkout at $NANO_INSTALL_DIR"
+            git -C "$NANO_INSTALL_DIR" fetch --depth 1 origin "$NANO_BRANCH"
+            # The nano-rs/nano mirror is force-regenerated on every sync, so its
+            # history diverges from any prior checkout and can never fast-forward.
+            # Hard-reset to the fetched remote HEAD instead. Safe: the clean-tree
+            # check above already skips this branch (preserving edits) when there
+            # are local changes, so this only resets an unmodified checkout — the
+            # authoritative state is always the mirror. (NAN-1929: an ff-only merge
+            # left a stale images.lock and then failed digest verification against
+            # the freshly-pulled images.)
+            git -C "$NANO_INSTALL_DIR" reset --hard FETCH_HEAD \
+                || fail "Could not update $NANO_INSTALL_DIR to the current release. Remove it and re-run to reclone."
+        fi
     fi
+elif [[ -f "$NANO_INSTALL_DIR/.nano-bundle" ]]; then
+    log "Using extracted release bundle at $NANO_INSTALL_DIR ($(head -1 "$NANO_INSTALL_DIR/.nano-bundle"))"
 elif [[ -e "$NANO_INSTALL_DIR" ]]; then
     fail "$NANO_INSTALL_DIR exists but is not a git checkout. Move/remove it or set NANO_INSTALL_DIR to a different path."
 else
@@ -1326,13 +659,296 @@ else
     git clone --depth 1 --branch "$NANO_BRANCH" "$NANO_REPO_URL" "$NANO_INSTALL_DIR"
 fi
 ok "Sources ready at $NANO_INSTALL_DIR"
+if [[ -f "$NANO_INSTALL_DIR/.nano-test-upgrade-root" ]]; then
+    warn "NON-RELEASE TEST BUILD: this compose bundle trusts one embedded lab upgrade signing root. Never use it for production."
+fi
 
 cd "$NANO_INSTALL_DIR"
+
+if [[ -e .env || -L .env ]]; then
+    validate_env_file "$NANO_INSTALL_DIR/.env"
+fi
 
 if [[ ! -f "$COMPOSE_FILE" ]]; then
     fail "$COMPOSE_FILE not found in $NANO_INSTALL_DIR. Branch '$NANO_BRANCH' may not include the OSS quickstart yet."
 fi
-ensure_bind_mounts_readable "$COMPOSE_FILE"
+
+[[ -r scripts/lib/generated-secrets.sh ]] \
+    || fail "scripts/lib/generated-secrets.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
+# shellcheck source=scripts/lib/generated-secrets.sh
+. scripts/lib/generated-secrets.sh
+[[ -r scripts/lib/async-loader-readiness.sh ]] \
+    || fail "scripts/lib/async-loader-readiness.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
+# shellcheck source=scripts/lib/async-loader-readiness.sh
+. scripts/lib/async-loader-readiness.sh
+
+nano_async_loader_query() {
+    local admin_password curl_password endpoint query resolve_address url_address
+    local targets target address port response failed not_ok total
+    local failed_sum=0 not_ok_sum=0 total_sum=0
+    local -a curl_args target_list
+    admin_password=$(env_value CLICKHOUSE_ADMIN_PASSWORD)
+    [[ -n "$admin_password" ]] || return 1
+    # curl config arrives on stdin, keeping the credential out of argv and logs.
+    curl_password=${admin_password//\\/\\\\}
+    curl_password=${curl_password//\"/\\\"}
+    query="SELECT countIf(status = 'FAILED'), countIf(status != 'OK'), count() FROM system.asynchronous_loader FORMAT TabSeparatedRaw"
+    targets=${NANO_CLICKHOUSE_HTTP_TARGETS:-${NANO_CLICKHOUSE_REMOTE_ADDRESS}@${NANO_CLICKHOUSE_HTTP_PORT}}
+    IFS=',' read -r -a target_list <<< "$targets"
+    ((${#target_list[@]} > 0)) || return 1
+
+    # Probe each shard directly as the admin user. clusterAllReplicas would use
+    # the runtime credentials embedded in remote_servers for its remote hops,
+    # which would force REMOTE and system-table grants back onto that user.
+    for target in "${target_list[@]}"; do
+        address=${target%@*}
+        port=${target##*@}
+        [[ -n "$address" && "$target" == *@* && "$port" =~ ^[0-9]+$ ]] || return 1
+        curl_args=(-fsS --max-time 15 --data-binary "$query")
+        if [[ "${NANO_PRIVATE_TLS:-false}" == "true" ]]; then
+            endpoint="https://${NANO_TLS_SERVER_NAME}:${port}/"
+            resolve_address="$address"
+            [[ "$resolve_address" == *:* && "$resolve_address" != \[*\] ]] \
+                && resolve_address="[$resolve_address]"
+            curl_args+=(--cacert "$NANO_TLS_CA" --resolve "${NANO_TLS_SERVER_NAME}:${port}:${resolve_address}")
+        else
+            url_address="$address"
+            [[ "$url_address" == *:* && "$url_address" != \[*\] ]] \
+                && url_address="[$url_address]"
+            endpoint="http://${url_address}:${port}/"
+        fi
+        response=$(printf 'user = "nanosiem_admin:%s"\n' "$curl_password" \
+            | curl --config - "${curl_args[@]}" "$endpoint") || return 1
+        [[ "$response" =~ ^([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)$ ]] || return 1
+        failed=${BASH_REMATCH[1]}
+        not_ok=${BASH_REMATCH[2]}
+        total=${BASH_REMATCH[3]}
+        failed_sum=$((failed_sum + failed))
+        not_ok_sum=$((not_ok_sum + not_ok))
+        total_sum=$((total_sum + total))
+    done
+    printf '%s\t%s\t%s\n' "$failed_sum" "$not_ok_sum" "$total_sum"
+}
+
+[[ -r scripts/lib/resource-sizing.sh ]] \
+    || fail "scripts/lib/resource-sizing.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
+RESOURCE_SIZING="$PWD/scripts/lib/resource-sizing.sh"
+
+# Replace only the installer-owned sizing block. It stays first in .env, so an
+# operator assignment later in the file wins exactly as Docker Compose's
+# last-assignment semantics promise. Existing pre-NAN-4997 keys are outside the
+# block and are therefore treated as explicit overrides. Resolve a symlinked
+# .env to preserve the link itself.
+write_auto_sizing_block() {
+    local env_path="$1" sizing_path="$2"
+    local begin_marker='# BEGIN NANO AUTO SIZING (installer managed; explicit keys below override)'
+    local end_marker='# END NANO AUTO SIZING'
+    nano_replace_managed_env_block "$env_path" "$sizing_path" "$begin_marker" "$end_marker" \
+        || fail "Could not safely replace the nano auto-sizing block in $env_path."
+}
+
+# Snapshot only sizing keys from an existing .env. This deliberately takes its
+# key allowlist from the sizer output so credentials can never enter a diff or
+# an installer log. Docker Compose uses the last assignment, so do the same.
+snapshot_effective_sizing_env() {
+    local source_env="$1" sizing_keys="$2" output="$3"
+    awk -F= '
+        NR == FNR {
+            if ($0 ~ /^[A-Z][A-Z0-9_]*=/) {
+                key = $1
+                wanted[key] = 1
+                order[++count] = key
+            }
+            next
+        }
+        $0 ~ /^[A-Z][A-Z0-9_]*=/ && ($1 in wanted) {
+            key = $1
+            sub(/^[^=]*=/, "")
+            value[key] = $0
+        }
+        END {
+            for (i = 1; i <= count; i++) {
+                key = order[i]
+                if ((key in ENVIRON) && ENVIRON[key] != "")
+                    print key "=" ENVIRON[key]
+                else if (key in value)
+                    print key "=" value[key]
+            }
+        }
+    ' "$sizing_keys" "$source_env" > "$output"
+}
+
+sizing_numeric_value() {
+    local key="$1" value="$2"
+    value="${value%\"}" value="${value#\"}"
+    value="${value%\'}" value="${value#\'}"
+    awk -v key="$key" -v value="$value" '
+        BEGIN {
+            if (key ~ /CPU/) {
+                if (value ~ /^[0-9]+([.][0-9]+)?m$/) {
+                    sub(/m$/, "", value)
+                    print value / 1000
+                } else if (value ~ /^[0-9]+([.][0-9]+)?$/) {
+                    print value + 0
+                }
+                exit
+            }
+            if (value ~ /^[0-9]+([.][0-9]+)?([KMGT]i?B?|[kmgt]i?b?)$/) {
+                unit = value
+                sub(/^[0-9]+([.][0-9]+)?/, "", unit)
+                number = value
+                sub(/[^0-9.].*$/, "", number)
+                unit = toupper(unit)
+                if (unit ~ /^K/) number /= 1024
+                else if (unit ~ /^G/) number *= 1024
+                else if (unit ~ /^T/) number *= 1048576
+                print number + 0
+                exit
+            }
+            if (value ~ /^[0-9]+([.][0-9]+)?$/)
+                print value + 0
+        }
+    '
+}
+
+report_sizing_changes() {
+    local old_env="$1" new_env="$2" old_server="$3" new_server="$4" old_users="$5" new_users="$6"
+    local key old_value new_value old_number new_number xml_kind old_xml new_xml line reductions=""
+
+    while IFS=$'\t' read -r key old_value new_value; do
+        [[ -n "$key" ]] || continue
+        log "Sizing change: env $key: $old_value -> $new_value"
+        old_number=$(sizing_numeric_value "$key" "$old_value")
+        new_number=$(sizing_numeric_value "$key" "$new_value")
+        if [[ -n "$old_number" && -n "$new_number" ]] \
+            && awk -v old="$old_number" -v new="$new_number" 'BEGIN { exit !(new < old) }'; then
+            reductions="${reductions}${reductions:+, }$key ($old_value -> $new_value)"
+        fi
+    done < <(
+        awk -F= '
+            NR == FNR {
+                if ($0 ~ /^[A-Z][A-Z0-9_]*=/) {
+                    key = $1
+                    sub(/^[^=]*=/, "")
+                    old[key] = $0
+                }
+                next
+            }
+            $0 ~ /^[A-Z][A-Z0-9_]*=/ {
+                key = $1
+                sub(/^[^=]*=/, "")
+                new = $0
+                before = (key in old) ? old[key] : "<unset>"
+                if (before != new)
+                    print key "\t" before "\t" new
+            }
+        ' "$old_env" "$new_env"
+    )
+
+    for xml_kind in server users; do
+        if [[ "$xml_kind" == server ]]; then
+            old_xml="$old_server" new_xml="$new_server"
+        else
+            old_xml="$old_users" new_xml="$new_users"
+        fi
+        [[ -s "$old_xml" && -s "$new_xml" ]] || continue
+        while IFS= read -r line; do
+            case "$line" in
+                ---*|+++*|@@*) continue ;;
+                -*|+*) log "Sizing change: ClickHouse $xml_kind XML: $line" ;;
+            esac
+        done < <(diff -U0 "$old_xml" "$new_xml" || true)
+    done
+
+    if [[ -n "$reductions" ]]; then
+        warn "RESOURCE LIMIT REDUCTION ON RERUN — review before services restart: $reductions"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Edition, release and image source (fail closed; nothing written yet)
+# ----------------------------------------------------------------------------
+# One value from .env (KEY=value), quotes and CR stripped; empty when absent.
+env_value() {
+    [[ -f .env ]] || return 0
+    awk -v k="$1" '
+        index($0, k "=") == 1 {
+            sub(/^[^=]*=/, "")
+            gsub(/[\r"'"'"']/, "")
+            value = $0
+        }
+        END { print value }
+    ' .env
+}
+
+RECORDED_EDITION=$(env_value NANO_EDITION)
+RECORDED_PREFIX=$(env_value NANO_IMAGE_PREFIX)
+if [[ -f .env && -z "$RECORDED_EDITION" ]]; then
+    # A .env without NANO_EDITION was written before editions existed, when
+    # only open core had a compose installer, unless it already carries an
+    # image prefix (written by this installer), which makes it ambiguous.
+    if [[ -n "$RECORDED_PREFIX" ]]; then
+        fail ".env records NANO_IMAGE_PREFIX=$RECORDED_PREFIX but no NANO_EDITION. Add NANO_EDITION=open or NANO_EDITION=enterprise to $NANO_INSTALL_DIR/.env to match what this install runs, then re-run."
+    fi
+    RECORDED_EDITION=open
+fi
+MARKER_EDITION=""
+[[ -f .nano-edition ]] && MARKER_EDITION=$(tr -d '[:space:]' < .nano-edition)
+
+NANO_EDITION="" EDITION_FROM=""
+for src in "the source tree (.nano-edition)=$MARKER_EDITION" "this install's .env=$RECORDED_EDITION" "the NANO_EDITION environment variable=$ENV_EDITION"; do
+    value="${src##*=}" origin="${src%=*}"
+    [[ -z "$value" ]] && continue
+    [[ "$value" == open || "$value" == enterprise ]] || fail "Invalid edition '$value' from $origin (expected open or enterprise)."
+    if [[ -z "$NANO_EDITION" ]]; then
+        NANO_EDITION="$value" EDITION_FROM="$origin"
+    elif [[ "$value" != "$NANO_EDITION" ]]; then
+        fail "Edition mismatch: $EDITION_FROM says $NANO_EDITION but $origin says $value. An install never switches edition; use the bundle for this install's edition, or a new NANO_INSTALL_DIR."
+    fi
+done
+[[ -n "$NANO_EDITION" ]] || fail "Cannot determine the edition: $NANO_INSTALL_DIR has no .nano-edition marker and no recorded install. Set NANO_EDITION=open or NANO_EDITION=enterprise."
+
+case "$NANO_EDITION" in
+    open) IMAGES_LOCK="images.lock" ;;
+    enterprise) IMAGES_LOCK="${NANO_IMAGES_LOCK:-images.enterprise.lock}" ;;
+esac
+[[ -f "$IMAGES_LOCK" ]] || fail "$IMAGES_LOCK not found in $NANO_INSTALL_DIR. Edition $NANO_EDITION needs it (the enterprise lock ships only in the enterprise compose bundle)."
+
+MULTI_NODE=0
+if [[ -n "$INVENTORY_ARG" ]]; then
+    [[ "$NANO_EDITION" == "enterprise" ]] \
+        || fail "--role/--inventory is available only in the enterprise compose bundle; open core keeps the shared single-node edge."
+    COMPOSE_FILE="deploy/compose/docker-compose.enterprise.yml"
+    [[ -f "$COMPOSE_FILE" ]] \
+        || fail "$COMPOSE_FILE not found. Use the enterprise compose bundle for a role-split install."
+    [[ -x deploy/compose/render-inventory.py || -f deploy/compose/render-inventory.py ]] \
+        || fail "deploy/compose/render-inventory.py not found in the enterprise compose bundle."
+    MULTI_NODE=1
+fi
+
+if [[ -z "$NANO_VERSION" ]]; then
+    NANO_VERSION=$(lock_release "$IMAGES_LOCK")
+    [[ -n "$NANO_VERSION" ]] || fail "$IMAGES_LOCK has no '# Release:' header. Set NANO_VERSION explicitly."
+    is_line_release "$NANO_VERSION" \
+        || fail "$IMAGES_LOCK is for release $NANO_VERSION, which is not a v${RELEASE_FLOOR_MAJOR}+ release. This source tree has not been released yet; use a released bundle or checkout."
+fi
+
+NANO_IMAGE_PREFIX=$(awk '$1 ~ /-api$/ && $2 ~ /^sha256:/ {sub(/-api$/, "", $1); print $1; exit}' "$IMAGES_LOCK")
+[[ -n "$NANO_IMAGE_PREFIX" ]] || fail "$IMAGES_LOCK records no <prefix>-api image."
+OPEN_IMAGE_PREFIX="ghcr.io/nano-rs/nano"
+if [[ "$NANO_EDITION" == open && "$NANO_IMAGE_PREFIX" != "$OPEN_IMAGE_PREFIX" ]] \
+    || [[ "$NANO_EDITION" == enterprise && "$NANO_IMAGE_PREFIX" == "$OPEN_IMAGE_PREFIX" ]]; then
+    fail "$IMAGES_LOCK lists $NANO_IMAGE_PREFIX-* images, which are not the $NANO_EDITION edition's."
+fi
+if [[ -n "$RECORDED_PREFIX" && "$RECORDED_PREFIX" != "$NANO_IMAGE_PREFIX" ]]; then
+    fail "This install runs $RECORDED_PREFIX-* images but $IMAGES_LOCK lists $NANO_IMAGE_PREFIX-*. Refusing to switch image source on a re-run."
+fi
+ok "Edition $NANO_EDITION (from $EDITION_FROM), release $NANO_VERSION ($NANO_IMAGE_PREFIX-*)"
+
+if [[ "${NANO_CHECK_ONLY:-0}" == "1" ]]; then
+    printf 'edition=%s\nversion=%s\nimage_prefix=%s\nlock=%s\n' "$NANO_EDITION" "$NANO_VERSION" "$NANO_IMAGE_PREFIX" "$IMAGES_LOCK"
+    exit 0
+fi
 
 # ----------------------------------------------------------------------------
 # 3. Collect admin info (env first, then interactive)
@@ -1342,141 +958,50 @@ ADMIN_NAME="${NANO_ADMIN_NAME:-}"
 ADMIN_PASSWORD="${NANO_ADMIN_PASSWORD:-}"
 BASE_URL="${NANO_BASE_URL:-http://localhost}"
 
-USE_LEAN=1
-FRESH_LEAN_CUTOVER=0
-if [[ -f .env ]] && ! grep -qE '^COMPOSE_PROFILES=lean$' .env; then
-    if [[ "${NANO_FRESH_LEAN_CUTOVER:-0}" != "1" ]]; then
-        fail "This install predates lean. Re-run with NANO_FRESH_LEAN_CUTOVER=1 for a fresh UUID tenant without history adoption. Existing data volumes are retained; see docs/deployment/open-lean-install.md."
-    fi
-    FRESH_LEAN_CUTOVER=1
-    # Retain the prior credentials and stop its processes before selecting lean.
-    cp -p .env ".env.pre-lean.$(date -u +%Y%m%dT%H%M%SZ)"
+if [[ "$MULTI_NODE" == "1" && ! -f .env && ",${ROLE_ARG}," != *,app,* ]]; then
+    fail "A role-split cluster's shared .env must be created on an app-role host first (use NANO_PREPARE_ONLY=1), then copied securely to this host before installing role(s) $ROLE_ARG."
 fi
-
-# Pin the image release before any .env is written or reused. An explicit
-# NANO_VERSION in the environment wins: that is an operator pin or rollback for
-# this run. Otherwise the release is the "# Release:" of this checkout's
-# images.lock, which must list the lean cell. The pin a previous run wrote into
-# .env is NOT reused: re-runs are upgrades, and the checkout has just been moved
-# to the newest release, so its compose file and lock are the ones to deploy
-# (NAN-4417 — reusing the .env pin left an updated checkout on the old images).
-# The resolved release is written back to .env, which is where compose reads it.
-resolve_lean_version() {
-    local requested="$NANO_VERSION" release previous=""
-    # A gen1 install's pin names pre-lean images; a cutover never reports it.
-    if [[ -f .env && "$FRESH_LEAN_CUTOVER" != "1" ]]; then
-        previous=$(env_file_value NANO_VERSION)
-        [[ "$previous" == "latest" ]] && previous=""
-    fi
-    if [[ "$requested" == "latest" ]]; then
-        warn "NANO_VERSION=latest is frozen on the ClickHouse 0.1.703 release; pinning a lean release instead."
-        requested=""
-    fi
-    if [[ -n "$requested" ]]; then
-        NANO_VERSION="$requested"
-    else
-        release=$(sed -nE 's/^# Release: v?([0-9][0-9A-Za-z.+-]*).*$/\1/p' images.lock 2>/dev/null | head -1)
-        [[ -n "$release" ]] || fail "images.lock names no release. Set NANO_VERSION to a published lean release."
-        if ! grep -qE '^ghcr\.io/nano-rs/nano-lake-cell sha256:' images.lock; then
-            fail "Release v${release} in images.lock has no lean lake-cell image; no lean release is published on this branch yet. Set NANO_VERSION to a published lean release."
-        fi
-        NANO_VERSION="$release"
-    fi
-    if [[ -n "$previous" && "${previous#v}" != "${NANO_VERSION#v}" ]]; then
-        if [[ -n "$requested" ]]; then
-            ok "Image release: ${previous} → ${NANO_VERSION} (pinned by NANO_VERSION)"
-        else
-            ok "Image release: ${previous} → ${NANO_VERSION}"
-        fi
-    elif [[ -n "$requested" ]]; then
-        ok "Image release: ${NANO_VERSION} (pinned by NANO_VERSION)"
-    else
-        ok "Image release: ${NANO_VERSION}"
-    fi
-    # Compose reads the tag from .env: never leave an old pin or a gen1 `latest`.
-    if [[ -f .env ]]; then
-        upsert_env_file_value NANO_VERSION "$NANO_VERSION"
-    fi
-}
-resolve_lean_version
 
 if [[ -f .env ]]; then
     warn ".env already exists — keeping existing secrets, will only (re)start the stack."
-    # resolve_lean_version above already wrote the resolved NANO_VERSION here.
     REUSE_ENV=1
-    chmod 600 .env
-    # Show the configured URL in the summary, not the localhost default.
-    if [[ -z "${NANO_BASE_URL:-}" ]]; then
-        BASE_URL=$(env_file_value BASE_URL)
-        BASE_URL="${BASE_URL:-http://localhost}"
-    fi
-    # NAN-835: pick the existing ingest token out of .env so the success
-    # block can re-print it on every install run (not just the first one).
-    VECTOR_AUTH_TOKEN=$(grep -E '^VECTOR_AUTH_TOKEN=' .env | head -1 | cut -d= -f2- || true)
-    # NAN-1604: read the ingest password back too, so the direct-OCSF block can
-    # re-print it on every run.
-    CLICKHOUSE_INGEST_PASSWORD=$(grep -E '^CLICKHOUSE_INGEST_PASSWORD=' .env | head -1 | cut -d= -f2- || true)
-    # Schema profile is fixed at first install (see below); read it back so the
-    # summary reflects the live value. Default udm for .env files predating it.
-    SCHEMA_PROFILE=$(grep -E '^NANO_SCHEMA_PROFILE=' .env | head -1 | cut -d= -f2- || true)
-    SCHEMA_PROFILE="${SCHEMA_PROFILE:-udm}"
-    # NAN-1604: did the first install bundle the Tenzir node? (COMPOSE_PROFILES=tenzir)
+    # Role-split compose intentionally exposes only the five fixed roles. The
+    # single-node-only Tenzir profile is not silently dropped or allowed to
+    # replace the requested host profile set.
     BUNDLE_TENZIR=0
     grep -qE '^COMPOSE_PROFILES=.*tenzir' .env 2>/dev/null && BUNDLE_TENZIR=1
-    # Never turn the lake on implicitly for an existing UDM/ClickHouse install.
-    # If the operator already enabled it, preserve it; otherwise activate the
-    # explicit legacy profile required by the mutually-exclusive compose lanes.
-    ENABLE_LAKE_CONTROL_PLANE=0
-    grep -qE '^COMPOSE_PROFILES=.*(lake|lean)' .env 2>/dev/null && ENABLE_LAKE_CONTROL_PLANE=1
-
-    # NAN-2252: only the maintenance-only legacy profile owns ClickHouse.
-    if [[ "$ENABLE_LAKE_CONTROL_PLANE" != "1" ]] && ! grep -qE '^CLICKHOUSE_MEM_LIMIT=' .env; then
-        CH_MEM_LIMIT=$(ch_mem_limit)
-        log "Sized ClickHouse memory limit to $CH_MEM_LIMIT (Docker RAM − 4G reserve, 2G floor)"
-        echo "CLICKHOUSE_MEM_LIMIT=$CH_MEM_LIMIT" >> .env
+    if [[ "$MULTI_NODE" == "1" && "$BUNDLE_TENZIR" == "1" ]]; then
+        fail "The bundled Tenzir profile is single-node only; role-split installs must use the ocsf or udm schema profile without bundled Tenzir."
     fi
-
-    if [[ "$ENABLE_LAKE_CONTROL_PLANE" == "1" && "$BUNDLE_TENZIR" == "1" ]]; then
-        fail "The bundled Tenzir-to-ClickHouse profile (ocsf+tenzir) was removed with ClickHouse. Re-run with --tenzir for a Tenzir-direct install: Tenzir writes OCSF files into the object store (tenzir/AGENTS.md)."
-    elif [[ "$ENABLE_LAKE_CONTROL_PLANE" == "1" ]]; then
-        upsert_env_file_value COMPOSE_PROFILES lake
-        upsert_env_file_value NANO_LOG_QUERY_BACKEND lake
-    elif [[ "$BUNDLE_TENZIR" == "1" ]]; then
-        upsert_env_file_value COMPOSE_PROFILES legacy,tenzir
-    else
-        upsert_env_file_value COMPOSE_PROFILES legacy
+    secret_mode=generate
+    if [[ "$MULTI_NODE" == "1" && ",${ROLE_ARG}," != *,app,* ]]; then
+        secret_mode=validate-only
     fi
-    if [[ "$ENABLE_LAKE_CONTROL_PLANE" != "1" ]]; then
-        # NAN-3491: compose now defaults to lake + OCSF; pin a legacy .env to
-        # the values it previously inherited from the compose defaults.
-        upsert_env_file_value NANO_LOG_QUERY_BACKEND clickhouse
-        upsert_env_file_value NANO_SCHEMA_PROFILE "$SCHEMA_PROFILE"
+    nano_backfill_generated_secrets .env "$secret_mode" \
+        || fail "Could not validate/backfill required generated secrets in $NANO_INSTALL_DIR/.env."
+    if [[ -n "$NANO_BACKFILLED_SECRET_KEYS" ]]; then
+        log "Backfilled required generated secrets in .env: $NANO_BACKFILLED_SECRET_KEYS"
     fi
-
-    if [[ "$ENABLE_LAKE_CONTROL_PLANE" == "1" ]]; then
-        # Backfill secrets introduced after the first lake beta without
-        # rotating any established credential. A literal CHANGE_ME is not an
-        # installer-generated value and is rejected later by the profile guard.
-        lake_secret_keys=(
-            NANO_LAKE_ENRICHMENT_TOKEN
-            NANO_OTEL_LAKE_INGEST_TOKEN
-            NANO_OTEL_LAKE_QUERY_TOKEN
-        )
-        for key in "${lake_secret_keys[@]}"; do
-            if [[ -z "$(env_file_value "$key")" ]]; then
-                upsert_env_file_value "$key" "$(gen_secret)"
-                log "Generated missing $key for the upgraded lake profile"
-            fi
-        done
-        # Cell and Compose budgets are rendered together by lean-init.
-
+    VECTOR_AUTH_TOKEN_PRESENT=0
+    grep -qE '^VECTOR_AUTH_TOKEN=.' .env && VECTOR_AUTH_TOKEN_PRESENT=1
+    # Schema profile is fixed at first install (see below); read it back so the
+    # summary reflects the live value. A .env without the key predates the
+    # profile choice, so its data is UDM: pin that explicitly (NAN-4903) so the
+    # install never depends on a compose/runtime fallback, which new installs
+    # no longer share. An existing value is never rewritten.
+    SCHEMA_PROFILE=$(env_value NANO_SCHEMA_PROFILE)
+    if [[ -z "$SCHEMA_PROFILE" ]]; then
+        SCHEMA_PROFILE=udm
+        # Append the effective assignment so a symlinked .env remains a link.
+        echo "NANO_SCHEMA_PROFILE=udm" >> .env
+        log "Pinned NANO_SCHEMA_PROFILE=udm in .env (this install predates the schema choice)"
     fi
 else
     REUSE_ENV=0
     log "Configuring first-time admin account"
 
     [[ -z "$ADMIN_EMAIL" ]]    && ADMIN_EMAIL=$(prompt_tty "Admin email")
-    [[ -z "$ADMIN_EMAIL" ]]    && fail "Admin email is required (set NANO_ADMIN_EMAIL for unattended installs)."
+    [[ -z "$ADMIN_EMAIL" ]]    && fail "Admin email is required."
 
     [[ -z "$ADMIN_NAME" ]]     && ADMIN_NAME=$(prompt_tty "Admin display name" "Admin")
     [[ -z "$ADMIN_NAME" ]]     && fail "Admin name is required."
@@ -1484,16 +1009,17 @@ else
     if [[ -z "$ADMIN_PASSWORD" ]]; then
         ADMIN_PASSWORD=$(prompt_tty "Admin password (blank = autogenerate)" "" secret)
         if [[ -z "$ADMIN_PASSWORD" ]]; then
-            # NAN-3402: hex never satisfied the API's complexity policy.
-            ADMIN_PASSWORD=$(gen_admin_password) || fail "Could not generate an admin password."
+            ADMIN_PASSWORD="N!a1$(gen_secret | cut -c1-20)"
             GENERATED_PASSWORD=1
         fi
     fi
-    # Same policy the API enforces — fail now, not after the first-boot wait.
-    password_meets_policy "$ADMIN_PASSWORD" || fail "$ADMIN_PASSWORD_POLICY_MSG"
+    validate_admin_password "$ADMIN_PASSWORD"
 
-    # NAN-3402: an explicit NANO_BASE_URL is the answer; never prompt over it.
-    [[ -z "${NANO_BASE_URL:-}" ]] && BASE_URL=$(prompt_tty "Public base URL" "$BASE_URL")
+    # An explicit environment value makes the documented non-interactive
+    # install path fully non-interactive.
+    if [[ -z "${NANO_BASE_URL:-}" ]]; then
+        BASE_URL=$(prompt_tty "Public base URL" "$BASE_URL")
+    fi
 
     # Plain-HTTP deployments need NANOSIEM_DEV_MODE=true so the auth refresh
     # cookie is set without the Secure flag — otherwise browsers silently
@@ -1505,217 +1031,337 @@ else
         DEV_MODE=false
     fi
 
-    # Storage schema profile — OCSF (canonical lake) or, on the unsupported
-    # legacy ClickHouse branch only, UDM. This picks the tables, parsers, and
-    # field universe the whole stack runs against, so it CANNOT be changed after the first event is ingested
+    # Storage schema profile — OCSF (the default for new installs, NAN-4903) or
+    # UDM (the legacy nano-native, CIM-style schema). This picks the ClickHouse
+    # tables, parsers, rules content channel and field universe the whole stack
+    # runs against, so it CANNOT be changed after the first event is ingested
     # (switching repoints search/detection to a different, empty table). Pinned
     # in .env on first install and never re-prompted on later runs.
     # NAN-1604: 'ocsf+tenzir' = the OCSF profile PLUS a bundled Tenzir node
     # (compose `tenzir` profile) pre-wired to the native OCSF entrypoint, for
     # direct ingestion. It resolves to NANO_SCHEMA_PROFILE=ocsf + BUNDLE_TENZIR=1.
     BUNDLE_TENZIR=0
-    ENABLE_LAKE_CONTROL_PLANE="${NANO_ENABLE_LAKE_CONTROL_PLANE:-1}"
-    case "$ENABLE_LAKE_CONTROL_PLANE" in
-        0|1) ;;
-        *) fail "NANO_ENABLE_LAKE_CONTROL_PLANE must be 0 or 1." ;;
-    esac
     SCHEMA_PROFILE="${NANO_SCHEMA_PROFILE:-}"
-    if [[ -z "$SCHEMA_PROFILE" && "$ENABLE_LAKE_CONTROL_PLANE" == "1" ]]; then
+    if [[ -z "$SCHEMA_PROFILE" ]] && ! have_controlling_tty; then
+        # Fully non-interactive (no TTY): take the default rather than fail.
         SCHEMA_PROFILE=ocsf
-        log "Using the canonical OCSF 1.9 object-lake profile"
     elif [[ -z "$SCHEMA_PROFILE" ]]; then
         while :; do
             SCHEMA_PROFILE=$(prompt_tty \
-                "Schema profile — 'ocsf' (recommended) or 'udm' (legacy CIM-style, unsupported)" "ocsf")
+                "Schema profile — 'ocsf' (recommended), 'ocsf+tenzir' (OCSF + a bundled Tenzir node for direct ingestion), or 'udm' (legacy CIM-style)" "ocsf")
             SCHEMA_PROFILE=$(printf '%s' "$SCHEMA_PROFILE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
             case "$SCHEMA_PROFILE" in
                 ""|ocsf)     SCHEMA_PROFILE=ocsf; break ;;
                 udm)         break ;;
-                ocsf+tenzir) fail "The bundled Tenzir-to-ClickHouse profile (ocsf+tenzir) was removed with ClickHouse. Re-run with --tenzir for a Tenzir-direct install: Tenzir writes OCSF files into the object store (tenzir/AGENTS.md)." ;;
-                *) warn "Enter 'ocsf' or 'udm'." ;;
+                ocsf+tenzir) SCHEMA_PROFILE=ocsf; BUNDLE_TENZIR=1; break ;;
+                *) warn "Enter 'ocsf', 'ocsf+tenzir', or 'udm'." ;;
             esac
         done
     else
         SCHEMA_PROFILE=$(printf '%s' "$SCHEMA_PROFILE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
         case "$SCHEMA_PROFILE" in
             udm|ocsf)    ;;
-            ocsf+tenzir) fail "The bundled Tenzir-to-ClickHouse profile (ocsf+tenzir) was removed with ClickHouse. Re-run with --tenzir for a Tenzir-direct install: Tenzir writes OCSF files into the object store (tenzir/AGENTS.md)." ;;
-            *) fail "NANO_SCHEMA_PROFILE must be 'udm' or 'ocsf' (got '$SCHEMA_PROFILE')." ;;
+            ocsf+tenzir) SCHEMA_PROFILE=ocsf; BUNDLE_TENZIR=1 ;;
+            *) fail "NANO_SCHEMA_PROFILE must be 'udm', 'ocsf', or 'ocsf+tenzir' (got '$SCHEMA_PROFILE')." ;;
         esac
     fi
-    if [[ "$ENABLE_LAKE_CONTROL_PLANE" == "1" && "$SCHEMA_PROFILE" != "ocsf" ]]; then
-        fail "The canonical object lake requires NANO_SCHEMA_PROFILE=ocsf. UDM is maintenance-only and remains on the legacy ClickHouse profile."
-    fi
-    if [[ "$ENABLE_LAKE_CONTROL_PLANE" == "1" && "$BUNDLE_TENZIR" == "1" ]]; then
-        fail "The bundled Tenzir-to-ClickHouse profile (ocsf+tenzir) was removed with ClickHouse. Re-run with --tenzir for a Tenzir-direct install: Tenzir writes OCSF files into the object store (tenzir/AGENTS.md)."
+    if [[ "$MULTI_NODE" == "1" && "$BUNDLE_TENZIR" == "1" ]]; then
+        fail "The bundled Tenzir profile is single-node only; role-split installs must use the ocsf or udm schema profile without bundled Tenzir."
     fi
 
     log "Generating secrets and writing .env"
-    # NAN-835: bind the ingest token to a shell var so the success block can
-    # surface it. (Other secrets stay inline — they aren't user-facing.)
-    VECTOR_AUTH_TOKEN=$(gen_secret)
-    if [[ "$ENABLE_LAKE_CONTROL_PLANE" == "1" ]]; then
-        log "Lake memory budgets will be derived from the shared startup policy by lean-init"
-    else
-        # NAN-1604: surface the native ClickHouse ingest credential only on the
-        # maintenance-only legacy profile.
-        CLICKHOUSE_INGEST_PASSWORD=$(gen_secret)
-        CH_MEM_LIMIT=$(ch_mem_limit)
-        log "Sized ClickHouse memory limit to $CH_MEM_LIMIT (Docker RAM − 4G reserve, 2G floor)"
-    fi
-    # Create .env 0600 before any secret is written (umask is 022 above).
-    ( umask 077; : > .env )
-    chmod 600 .env
-    cat > .env <<EOF
+    ENV_TEMP_FILE=$(mktemp .env.tmp.XXXXXX)
+    chmod 600 "$ENV_TEMP_FILE"
+    cat > "$ENV_TEMP_FILE" <<EOF
 NANO_VERSION=$NANO_VERSION
+NANO_IMAGE_PREFIX=$NANO_IMAGE_PREFIX
+NANO_EDITION=$NANO_EDITION
 BASE_URL=$BASE_URL
 NANOSIEM_DEV_MODE=$DEV_MODE
 NANO_SCHEMA_PROFILE=$SCHEMA_PROFILE
-POSTGRES_PASSWORD=$(gen_secret)
-JWT_SECRET=$(gen_secret)
-NANOSIEM_ENCRYPTION_KEY=$(gen_secret)
-VECTOR_AUTH_TOKEN=$VECTOR_AUTH_TOKEN
 RUST_LOG=info
 EOF
-    if [[ "${ENABLE_LAKE_CONTROL_PLANE:-0}" == "1" ]]; then
-        cat >> .env <<EOF
-
-# NAN-2361 canonical OCSF 1.9 object-lake runtime. The mutually-exclusive
-# The lake compose profile starts no ClickHouse service or migrator.
-NANO_LAKE_ACCESS_KEY_ID=$(gen_secret)
-NANO_LAKE_SECRET_ACCESS_KEY=$(gen_secret)
-NANO_LAKE_ENTITY_HMAC_KEY=$(gen_secret)
-NANO_LAKE_QUERY_TOKEN=$(gen_secret)
-NANO_LAKE_ENRICHMENT_TOKEN=$(gen_secret)
-NANO_OTEL_LAKE_INGEST_TOKEN=$(gen_secret)
-NANO_OTEL_LAKE_QUERY_TOKEN=$(gen_secret)
-NANO_LAKE_TENANT_ID=default
-NANO_LAKE_EVENT_TABLE=default.events
-NANO_LAKE_EVENT_TABLE_LOCATION_PREFIX=s3://nano-lake/warehouse/default/events/
-NANO_LAKE_WORKER_SOURCE=http://lake-object-store:9000/nano-lake/warehouse/default/events
-NANO_LOG_QUERY_BACKEND=lake
-NANO_LAKE_BRONZE_BUCKET=nano-lake
-NANO_LAKE_OBJECT_ENDPOINT=http://lake-object-store:9000
-NANO_LAKE_FORCE_PATH_STYLE=true
-NANO_LAKEKEEPER_DB_PASSWORD=$(gen_secret)
-NANO_LAKEKEEPER_OIDC_DB_PASSWORD=$(gen_secret)
-NANO_LAKEKEEPER_OPENFGA_DB_PASSWORD=$(gen_secret)
-NANO_LAKEKEEPER_ENCRYPTION_KEY=$(gen_secret)
-NANO_LAKEKEEPER_OIDC_SYSTEM_SECRET=$(gen_secret)
-NANO_LAKEKEEPER_OIDC_PAIRWISE_SALT=$(gen_secret)
-NANO_LAKEKEEPER_OPERATOR_CLIENT_SECRET=$(gen_secret)
-NANO_LAKEKEEPER_RUNTIME_CLIENT_SECRET=$(gen_secret)
-NANO_LAKEKEEPER_OPENFGA_PRESHARED_KEY=$(gen_secret)
-EOF
-    else
-        cat >> .env <<EOF
-
-# Unsupported legacy UDM/ClickHouse runtime.
-NANO_LOG_QUERY_BACKEND=clickhouse
-CLICKHOUSE_MEM_LIMIT=$CH_MEM_LIMIT
-CLICKHOUSE_PASSWORD=$(gen_secret)
-CLICKHOUSE_ADMIN_PASSWORD=$(gen_secret)
-CLICKHOUSE_INGEST_PASSWORD=$CLICKHOUSE_INGEST_PASSWORD
-CLICKHOUSE_RAWSQL_PASSWORD=$(gen_secret)
-CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD=$(gen_secret)
-EOF
-    fi
+    nano_backfill_generated_secrets "$ENV_TEMP_FILE" generate "$PWD/.env" \
+        || fail "Could not generate required secrets for $NANO_INSTALL_DIR/.env."
+    # The success summary needs only to know that ingest is configured. Secret
+    # values stay in .env and are never copied into output-bearing variables.
+    VECTOR_AUTH_TOKEN_PRESENT=1
+    # NAN-1604: 'ocsf+tenzir' install — activate the bundled Tenzir compose
+    # profile. `docker compose` reads COMPOSE_PROFILES from .env, so the existing
+    # `pull` / `up -d` below bring the nano-tenzir service along automatically.
     if [[ "${BUNDLE_TENZIR:-0}" == "1" ]]; then
-        echo "COMPOSE_PROFILES=legacy,tenzir" >> .env
-    elif [[ "${ENABLE_LAKE_CONTROL_PLANE:-0}" == "1" ]]; then
-        echo "COMPOSE_PROFILES=lake" >> .env
-    else
-        echo "COMPOSE_PROFILES=legacy" >> .env
+        echo "COMPOSE_PROFILES=tenzir" >> "$ENV_TEMP_FILE"
     fi
-    chmod 600 .env
-
     # Persist the autogenerated admin password BEFORE the docker pull so a
     # mid-install failure doesn't lose it (NAN-807 bug #9). User-supplied
     # passwords are already known to the user — only stash the generated ones.
-    # NAN-3402: the email/name are recorded too, so a re-run after a first-boot
-    # timeout can still create the admin without re-asking. .env is parsed by
-    # Compose (unquoted, `$` interpolated, `#` comments), so a value with any
-    # other character is not recorded; such a re-run asks for it again.
-    printf '\n# Initial admin account, used by install.sh re-runs until the account exists.\n' >> .env
-    for kv in "INITIAL_ADMIN_EMAIL=$ADMIN_EMAIL" "INITIAL_ADMIN_NAME=$ADMIN_NAME"; do
-        if [[ "${kv#*=}" =~ ^[A-Za-z0-9@._+\ -]+$ ]]; then
-            printf '%s\n' "$kv" >> .env
-        fi
-    done
     if [[ "${GENERATED_PASSWORD:-0}" == "1" ]]; then
-        cat >> .env <<EOF
+        cat >> "$ENV_TEMP_FILE" <<EOF
+
 # Autogenerated initial admin password — printed by install.sh on success.
 # Safe to delete once you've signed in and confirmed the credentials.
 INITIAL_ADMIN_PASSWORD=$ADMIN_PASSWORD
 EOF
     fi
 
+    mv "$ENV_TEMP_FILE" .env
+    ENV_TEMP_FILE=""
+
     ok "Wrote .env (mode 600)"
 fi
 
-if [[ "$USE_LEAN" == "1" ]]; then
-    if [[ "$FRESH_LEAN_CUTOVER" == "1" ]]; then
-        ENABLE_LAKE_CONTROL_PLANE=1
-        BUNDLE_TENZIR=0
+# Resolve overlays before sizing as well as startup: an overlay can replace the
+# Vector data volume with a host bind/external driver, whose capacity cannot be
+# inferred from DockerRootDir. Keeping one validated list prevents the sizing
+# and runtime Compose graphs from disagreeing.
+read -r -a NANO_OVERLAY_LIST <<< "${NANO_COMPOSE_OVERLAYS:-}"
+for overlay in ${NANO_OVERLAY_LIST[@]+"${NANO_OVERLAY_LIST[@]}"}; do
+    if [[ ! "$overlay" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$ ]]; then
+        fail "NANO_COMPOSE_OVERLAYS: '$overlay' is not a compose file name in the install directory"
     fi
-    [[ "${BUNDLE_TENZIR:-0}" == "0" ]] || fail "The bundled Tenzir-to-ClickHouse profile (ocsf+tenzir) was removed with ClickHouse. Re-run with --tenzir for a Tenzir-direct install: Tenzir writes OCSF files into the object store (tenzir/AGENTS.md)."
-    [[ "${ENABLE_LAKE_CONTROL_PLANE:-0}" == "1" ]] \
-        || fail "Open lean requires OCSF lake storage."
-    # NAN-3807: the ingest mode. Vector and the connector runner carry the
-    # compose profile ${NANO_VECTOR_PROFILE:-lean}; `none` leaves them out of
-    # the lean stack (Tenzir-direct). A re-run without a flag keeps the mode.
-    NANO_VECTOR_PROFILE=$(resolve_vector_profile)
-    upsert_env_file_value NANO_VECTOR_PROFILE "$NANO_VECTOR_PROFILE"
-    if [[ "$NANO_VECTOR_PROFILE" == none ]]; then
-        TENZIR_DIRECT=1
-        log "Ingest mode: Tenzir-direct (no Vector; OCSF bucket drop only)"
-    else
-        TENZIR_DIRECT=0
-        log "Ingest mode: Vector plus the OCSF bucket drop"
-    fi
-    for key in NANO_LAKE_ACCESS_KEY_ID NANO_LAKE_SECRET_ACCESS_KEY NANO_LAKE_ENRICHMENT_TOKEN NANO_OTEL_LAKE_INGEST_TOKEN NANO_OTEL_LAKE_QUERY_TOKEN NANO_LOCAL_AUDIT_TOKEN; do
-        [[ -n "$(env_file_value "$key")" ]] || upsert_env_file_value "$key" "$(gen_secret)"
+    [[ -f "$overlay" ]] || fail "NANO_COMPOSE_OVERLAYS: '$overlay' does not exist in $NANO_INSTALL_DIR"
+done
+
+# NAN-4997: single-node sizing is recalculated on every install/upgrade. The
+# managed block contains defaults only; any same-named assignment outside it,
+# or in the invoking environment, remains an explicit operator override. A
+# role-split cluster cannot share one host's defaults in its common .env, so its
+# renderer performs this same calculation independently on every role host.
+if [[ "$MULTI_NODE" != "1" ]]; then
+    sizing_compose_args=(-f "$COMPOSE_FILE")
+    for overlay in ${NANO_OVERLAY_LIST[@]+"${NANO_OVERLAY_LIST[@]}"}; do
+        sizing_compose_args+=(-f "$overlay")
     done
-    upsert_env_file_value COMPOSE_PROFILES lean
-    upsert_env_file_value NANO_SCHEMA_PROFILE ocsf
-    upsert_env_file_value NANO_LOG_QUERY_BACKEND lake
-    # The dedicated cell route (lake-cell.env) is the only lake backend; an
-    # inherited gen1 query URL would be refused alongside it.
-    upsert_env_file_value NANO_LAKE_QUERY_URL ''
-    upsert_env_file_value NANO_OTEL_LAKE_HOST lean-otel
-    upsert_env_file_value NANO_LAKE_ENRICHMENT_HOST lean-enrichment
-    upsert_env_file_value NANO_OTEL_LAKE_QUERY_TOKEN_FILE /etc/nano-lake-cell/otel-query.token
-    upsert_env_file_value NANO_LAKE_ENRICHMENT_COORDINATOR_TOKEN_FILE /etc/nano-lake-cell/enrichment.token
-    upsert_env_file_value NANO_LAKE_BRONZE_BUCKET nano-lake
-    upsert_env_file_value NANO_LAKE_OBJECT_ENDPOINT http://lake-object-store:9000
-    upsert_env_file_value NANO_LAKE_FORCE_PATH_STYLE true
-    # Host-side port/bind overrides given to the installer must survive a
-    # later plain `docker compose up`, which reads only .env.
-    for key in NANO_LAKE_OBJECT_PORT NANO_LAKE_CONSOLE_PORT NANO_VECTOR_NATIVE_BIND_ADDRESS NANO_FLUENT_BIND_ADDRESS; do
-        if [[ -n "${!key:-}" ]]; then upsert_env_file_value "$key" "${!key}"; fi
-    done
-    SCHEMA_PROFILE=ocsf
-    # The bundled Tenzir node's pipeline (compose profile `tenzir`, started
-    # only on request). Seed it with the example once; it is the operator's
-    # file afterwards and git-ignored, so updates never touch it.
-    if [[ ! -e .nano-tenzir/pipeline.tql && -f tenzir/lean/sysmon-bucket.tql ]]; then
-        # The pasted sink carries a key: the directory is private to this
-        # user; the file stays readable for the container's own user.
-        mkdir -p .nano-tenzir
-        chmod 700 .nano-tenzir
-        cp tenzir/lean/sysmon-bucket.tql .nano-tenzir/pipeline.tql
-        chmod 644 .nano-tenzir/pipeline.tql
+    if ! NANO_VECTOR_DATA_STORAGE_MODE=$(
+        docker compose "${sizing_compose_args[@]}" config --format json \
+            | vector_data_storage_mode_from_json
+    ); then
+        fail "Could not determine whether Vector data uses Docker-root or bind/external storage."
     fi
-    mkdir -p .nano-tenzir/data
-    chmod 755 .nano-tenzir/data
-    mkdir -p .nano-lean
-    chmod 700 .nano-lean
-    if [[ "$FRESH_LEAN_CUTOVER" == "1" ]]; then
-        : > .nano-lean/cutover-pending
-    elif [[ -f .nano-lean/cutover-pending ]]; then
-        FRESH_LEAN_CUTOVER=1
+    export NANO_VECTOR_DATA_STORAGE_MODE
+    sizing_roles=app,ingest,clickhouse,postgres
+    [[ "${BUNDLE_TENZIR:-0}" == "1" ]] && sizing_roles+=,tenzir
+    sizing_defaults=$(mktemp .nano-sizing.defaults.XXXXXX)
+    "$RESOURCE_SIZING" \
+        --topology single \
+        --roles "$sizing_roles" \
+        --shards 1 \
+        --format env > "$sizing_defaults"
+
+    old_sizing_env="" old_sizing_server="" old_sizing_users=""
+    if [[ "$REUSE_ENV" == "1" ]]; then
+        old_sizing_env=$(mktemp .nano-sizing.old-env.XXXXXX)
+        old_sizing_server=$(mktemp .nano-sizing.old-server.XXXXXX)
+        old_sizing_users=$(mktemp .nano-sizing.old-users.XXXXXX)
+        snapshot_effective_sizing_env .env "$sizing_defaults" "$old_sizing_env"
+        [[ -f .nano-generated/sizing/clickhouse-config.xml ]] \
+            && cp .nano-generated/sizing/clickhouse-config.xml "$old_sizing_server"
+        [[ -f .nano-generated/sizing/clickhouse-users.xml ]] \
+            && cp .nano-generated/sizing/clickhouse-users.xml "$old_sizing_users"
     fi
+
+    write_auto_sizing_block .env "$sizing_defaults"
+    rm -f "$sizing_defaults"
+    mkdir -p .nano-generated/sizing
+    new_sizing_env=$(mktemp .nano-generated/sizing/host.env.XXXXXX)
+    "$RESOURCE_SIZING" \
+        --topology single \
+        --roles "$sizing_roles" \
+        --shards 1 \
+        --override-env .env \
+        --server-output .nano-generated/sizing/clickhouse-config.xml \
+        --users-output .nano-generated/sizing/clickhouse-users.xml \
+        --format env > "$new_sizing_env"
+    mv "$new_sizing_env" .nano-generated/sizing/host.env
+    if [[ "$REUSE_ENV" == "1" ]]; then
+        report_sizing_changes \
+            "$old_sizing_env" .nano-generated/sizing/host.env \
+            "$old_sizing_server" .nano-generated/sizing/clickhouse-config.xml \
+            "$old_sizing_users" .nano-generated/sizing/clickhouse-users.xml
+        rm -f "$old_sizing_env" "$old_sizing_server" "$old_sizing_users"
+    fi
+    sized_cpu=$(env_value NANO_DETECTED_CPU_CORES)
+    sized_memory=$(env_value NANO_DETECTED_MEMORY_MIB)
+    sized_ch=$(env_value CLICKHOUSE_MEM_LIMIT)
+    log "Rendered shared-host sizing for ${sized_cpu} CPU / ${sized_memory} MiB RAM (ClickHouse limit $sized_ch)"
 fi
+
+# NAN-3322 / NAN-4909: the unauthenticated ingest ports (Vector native :6000,
+# raw OTLP :4317/:4318, Fluent :24224, bundled Tenzir :9095) bind 127.0.0.1
+# unless the operator opts
+# in. A bind override given to the installer must survive a later plain
+# `docker compose up`, which reads only .env, so persist it there.
+for key in NANO_VECTOR_NATIVE_BIND_ADDRESS NANO_OTLP_BIND_ADDRESS NANO_FLUENT_BIND_ADDRESS NANO_TENZIR_BIND_ADDRESS; do
+    if [[ -n "${!key:-}" ]]; then
+        # The last assignment wins in Compose and append follows a symlinked
+        # .env without replacing the link.
+        printf '%s=%s\n' "$key" "${!key}" >> .env
+        log "Persisted $key=${!key} to .env (re-exposes an unauthenticated ingest port)"
+    fi
+done
+
+# Build the compose invocation only after edition resolution and .env creation.
+# The role env contains no secrets: it is a validated rendering of inventory
+# addresses, ports, profiles and generated-config paths. Compose reads it
+# directly; values needed by this script are decoded without evaluating them as
+# shell input.
+COMPOSE_ARGS=()
+if [[ "$MULTI_NODE" == "1" ]]; then
+    log "Validating durable topology identity before rendering host configuration"
+    candidate_identity_json=$(python3 -I deploy/compose/render-inventory.py \
+        --inventory "$INVENTORY_PATH" \
+        --roles "$ROLE_ARG" \
+        --identity-only \
+        --override-env .env) \
+        || fail "Inventory identity validation failed. Published role configuration was not changed."
+    IFS=$'\t' read -r candidate_identity candidate_deployment candidate_host candidate_plaintext < <(
+        python3 -I -c 'import json,sys; value=json.loads(sys.argv[1]); print(value["sha256"], value["deployment_id"], value["host_id"], "1" if value["allow_plaintext_private_network"] else "0", sep="\t")' \
+            "$candidate_identity_json"
+    )
+    if [[ "$candidate_plaintext" == "1" ]]; then
+        if [[ "${NANO_LAB_ONLY_PLAINTEXT:-0}" != "1" ]]; then
+            fail "cluster.allow_plaintext_private_network=true is refused for production installs. It is only available on an isolated disposable lab when every installer invocation explicitly sets NANO_LAB_ONLY_PLAINTEXT=1. Published role configuration was not changed."
+        fi
+        warn "======================================================================"
+        warn "TEST/LAB ONLY: NANO_LAB_ONLY_PLAINTEXT=1 explicitly accepted plaintext"
+        warn "Private credentials and event data will cross the inventory network unencrypted."
+        warn "This mode is forbidden for production and must never be exposed to untrusted networks."
+        warn "======================================================================"
+    fi
+    recorded_identity=$(env_value NANO_DEPLOYMENT_IDENTITY_SHA256)
+    topology_migration_accepted=0
+    if [[ -n "$recorded_identity" && "$recorded_identity" != "$candidate_identity" ]]; then
+        if [[ "$TOPOLOGY_MIGRATION_SHA" != "$recorded_identity" ]]; then
+            fail "Inventory durable topology identity changed. Existing identity is $recorded_identity; candidate identity is $candidate_identity. Published role configuration was not changed. Complete the data-movement runbook, then acknowledge that exact current identity with --accept-topology-migration $recorded_identity."
+        fi
+        topology_migration_accepted=1
+        warn "Explicit topology migration acknowledged for $recorded_identity -> $candidate_identity"
+    elif [[ -n "$TOPOLOGY_MIGRATION_SHA" ]]; then
+        fail "--accept-topology-migration was supplied, but the inventory durable topology identity did not change. Remove the stale acknowledgement flag."
+    fi
+
+    host_identity_file=.nano-host-identity
+    if [[ -e "$host_identity_file" || -L "$host_identity_file" ]]; then
+        validate_env_file "$NANO_INSTALL_DIR/$host_identity_file"
+        recorded_deployment=$(awk -F= '$1 == "NANO_DEPLOYMENT_ID" {print $2; exit}' "$host_identity_file")
+        recorded_host=$(awk -F= '$1 == "NANO_HOST_ID" {print $2; exit}' "$host_identity_file")
+        if [[ "$recorded_deployment" != "$candidate_deployment" || "$recorded_host" != "$candidate_host" ]]; then
+            fail "This install directory belongs to deployment/host $recorded_deployment/$recorded_host, not $candidate_deployment/$candidate_host. Published role configuration was not changed."
+        fi
+    fi
+
+    had_prior_role_sizing=0
+    old_role_sizing_env=$(mktemp .nano-sizing.old-env.XXXXXX)
+    old_role_sizing_server=$(mktemp .nano-sizing.old-server.XXXXXX)
+    old_role_sizing_users=$(mktemp .nano-sizing.old-users.XXXXXX)
+    if [[ -f .nano-generated/sizing/host.env ]]; then
+        cp .nano-generated/sizing/host.env "$old_role_sizing_env"
+        had_prior_role_sizing=1
+    elif [[ -f .nano-role.env ]]; then
+        python3 -I - .nano-role.env > "$old_role_sizing_env" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as env_file:
+    for line in env_file:
+        key, encoded = line.rstrip("\n").split("=", 1)
+        value = json.loads(encoded)
+        if isinstance(value, str) and "\n" not in value:
+            print(f"{key}={value}")
+PY
+        had_prior_role_sizing=1
+    fi
+    if [[ -f .nano-generated/sizing/clickhouse-config.xml ]]; then
+        cp .nano-generated/sizing/clickhouse-config.xml "$old_role_sizing_server"
+    elif [[ -f .nano-generated/clickhouse/config.d/zzzz-nano-sizing.xml ]]; then
+        cp .nano-generated/clickhouse/config.d/zzzz-nano-sizing.xml "$old_role_sizing_server"
+    fi
+    if [[ -f .nano-generated/sizing/clickhouse-users.xml ]]; then
+        cp .nano-generated/sizing/clickhouse-users.xml "$old_role_sizing_users"
+    elif [[ -f .nano-generated/clickhouse/users.d/zzzz-nano-sizing.xml ]]; then
+        cp .nano-generated/clickhouse/users.d/zzzz-nano-sizing.xml "$old_role_sizing_users"
+    fi
+
+    ROLE_CONFIG_WAS_PUBLISHED=0
+    if [[ -d .nano-generated || -f .nano-role.env ]]; then
+        ROLE_CONFIG_WAS_PUBLISHED=1
+    fi
+    log "Rendering host roles '$ROLE_ARG' from $INVENTORY_PATH"
+    python3 -I deploy/compose/render-inventory.py \
+        --inventory "$INVENTORY_PATH" \
+        --roles "$ROLE_ARG" \
+        --output-dir .nano-generated \
+        --env-output .nano-role.env \
+        --override-env .env \
+        || fail "Inventory validation/rendering failed. No services have started."
+    while IFS= read -r -d '' role_key && IFS= read -r -d '' role_value; do
+        printf -v "$role_key" '%s' "$role_value"
+        export "${role_key?}"
+    done < <(
+        python3 -I - .nano-role.env <<'PY'
+import json
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as role_env:
+    for line in role_env:
+        key, encoded = line.rstrip("\n").split("=", 1)
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+            raise SystemExit(f"{path}: invalid key {key!r}")
+        value = json.loads(encoded)
+        if not isinstance(value, str):
+            raise SystemExit(f"{path}: {key} is not a string")
+        sys.stdout.buffer.write(key.encode() + b"\0" + value.encode() + b"\0")
+PY
+    )
+    if [[ "$had_prior_role_sizing" == "1" ]]; then
+        report_sizing_changes \
+            "$old_role_sizing_env" .nano-generated/sizing/host.env \
+            "$old_role_sizing_server" .nano-generated/sizing/clickhouse-config.xml \
+            "$old_role_sizing_users" .nano-generated/sizing/clickhouse-users.xml
+    fi
+    rm -f "$old_role_sizing_env" "$old_role_sizing_server" "$old_role_sizing_users"
+    log "Rendered host-local sizing for ${NANO_DETECTED_CPU_CORES} CPU / ${NANO_DETECTED_MEMORY_MIB} MiB RAM"
+    if [[ ",${ROLE_ARG}," == *,clickhouse,* ]]; then
+        log "Using host-local ClickHouse memory limit $CLICKHOUSE_MEM_LIMIT"
+    fi
+    if [[ "$NANO_PRIVATE_TLS" == "true" ]]; then
+        for tls_path in "$NANO_TLS_CERT" "$NANO_TLS_KEY" "$NANO_TLS_CA"; do
+            [[ -f "$tls_path" && -r "$tls_path" ]] \
+                || fail "Inventory TLS file is not a readable regular file on this host: $tls_path"
+        done
+    else
+        warn "PLAINTEXT PRIVATE NETWORK ENABLED — ClickHouse, Keeper, and app-internal traffic is not encrypted."
+    fi
+
+    [[ "$NANO_DEPLOYMENT_IDENTITY_SHA256" == "$candidate_identity" ]] \
+        || fail "Renderer identity changed between preflight and publication; refusing to continue."
+    if [[ -z "$recorded_identity" || "$topology_migration_accepted" == "1" ]]; then
+        printf 'NANO_DEPLOYMENT_IDENTITY_SHA256=%s\n' "$candidate_identity" >> .env
+    fi
+
+    if [[ ! -e "$host_identity_file" && ! -L "$host_identity_file" ]]; then
+        ENV_TEMP_FILE=$(mktemp .nano-host-identity.XXXXXX)
+        printf 'NANO_DEPLOYMENT_ID=%s\nNANO_HOST_ID=%s\n' "$NANO_DEPLOYMENT_ID" "$NANO_HOST_ID" > "$ENV_TEMP_FILE"
+        chmod 600 "$ENV_TEMP_FILE"
+        mv "$ENV_TEMP_FILE" "$host_identity_file"
+        ENV_TEMP_FILE=""
+    fi
+    COMPOSE_ARGS=(--env-file .env --env-file .nano-role.env -f "$COMPOSE_FILE")
+    HOST_PORT="$NANO_APP_PORT"
+    API_BASE="http://localhost:${HOST_PORT}"
+else
+    COMPOSE_ARGS=(-f "$COMPOSE_FILE")
+fi
+ch_mem_feeds_note
+
+# Optional root-level compose overlays, ported from the sovereign single-host
+# installer. The list was validated before sizing so a storage override affects
+# both the capacity contract and the graph that starts below.
+for overlay in ${NANO_OVERLAY_LIST[@]+"${NANO_OVERLAY_LIST[@]}"}; do
+    COMPOSE_ARGS+=(-f "$overlay")
+done
 
 # ----------------------------------------------------------------------------
 # 4. Pull images + bring stack up
@@ -1727,181 +1373,185 @@ fi
 # fails. Re-export the *resolved* profile (and the compose profile) so the value
 # the containers see matches what we wrote to .env in both fresh and re-run paths.
 export NANO_SCHEMA_PROFILE="$SCHEMA_PROFILE"
-if [[ "${BUNDLE_TENZIR:-0}" == "1" ]]; then
-    export COMPOSE_PROFILES=legacy,tenzir
-elif [[ "${USE_LEAN:-0}" == "1" ]]; then
-    export COMPOSE_PROFILES=lean
-    # The shell wins over .env in compose interpolation: export the resolved mode.
-    export NANO_VECTOR_PROFILE="${NANO_VECTOR_PROFILE:-lean}"
-elif [[ "${ENABLE_LAKE_CONTROL_PLANE:-0}" == "1" ]]; then
-    export COMPOSE_PROFILES=lake
-else
-    export COMPOSE_PROFILES=legacy
+[[ "${BUNDLE_TENZIR:-0}" == "1" ]] && export COMPOSE_PROFILES=tenzir
+
+# Record the resolved release + image source in .env (a re-run upgrades an
+# existing install to this checkout's release) and export them, since the shell
+# environment wins over .env during compose interpolation.
+for kv in "NANO_EDITION=$NANO_EDITION" "NANO_VERSION=$NANO_VERSION" "NANO_IMAGE_PREFIX=$NANO_IMAGE_PREFIX"; do
+    # Append the effective assignment so a symlinked .env remains a link.
+    echo "$kv" >> .env
+done
+export NANO_VERSION NANO_IMAGE_PREFIX
+
+if [[ "${NANO_PREPARE_ONLY:-0}" == "1" ]]; then
+    ok "Prepared .env and role configuration without pulling the application stack or starting services (the pinned Vector image may be cached/pulled for the storage-capacity probe)"
+    if [[ "$MULTI_NODE" == "1" ]]; then
+        printf 'Securely copy %s/.env and %s to every inventory host, then install the data roles before the app role.\n' \
+            "$NANO_INSTALL_DIR" "$INVENTORY_PATH"
+    fi
+    exit 0
 fi
 
-# ----------------------------------------------------------------------------
-# 3b. PostgreSQL major-version preflight
-# ----------------------------------------------------------------------------
-# A PostgreSQL server refuses to open a data directory written by a different
-# major version. Because `postgres` is restart: unless-stopped, that otherwise
-# surfaces five minutes later as "API did not become healthy", pointing at
-# nano-api/nginx rather than at the database that never came up. The compose
-# `postgres-version-guard` blocks the actual start; this runs the same check
-# before the multi-GB pull so an upgrader is not made to wait for it.
-if [[ -x ./scripts/preflight-postgres-major.sh ]]; then
-    ./scripts/preflight-postgres-major.sh -f "$COMPOSE_FILE" \
-        || fail "PostgreSQL major-version mismatch — see the migration command above. Nothing was changed."
-else
-    warn "scripts/preflight-postgres-major.sh not found — skipping the PostgreSQL major-version preflight."
+log "Pulling images from ${NANO_IMAGE_PREFIX%/*} (this may take a minute on first run)"
+if ! docker compose "${COMPOSE_ARGS[@]}" pull; then
+    if [[ "$NANO_EDITION" == "enterprise" ]]; then
+        fail "docker compose pull failed. Enterprise images are in a private registry: log in to ${NANO_IMAGE_PREFIX%%/*} with the pull credential nano issued you, then re-run."
+    fi
+    fail "docker compose pull failed. If you see '401 Unauthorized', the GHCR packages may still be private — run 'docker login ghcr.io' or wait for nano-rs to flip them public."
 fi
 
-if [[ "${NANO_SKIP_IMAGE_PULL:-0}" == "1" ]]; then
-    # Air-gapped or locally built images (`docker load` / local build) already
-    # tagged ${NANO_VERSION}. Digest verification still runs unless
-    # NANO_SKIP_IMAGE_VERIFY=1 is set too.
-    warn "NANO_SKIP_IMAGE_PULL=1 — using images already present locally."
-elif log "Pulling images from $(image_sources "$(docker </dev/null compose "${COMPOSE_ARGS[@]}" config --images 2>/dev/null || true)") (this may take a minute on first run)" \
-    && ! docker </dev/null compose "${COMPOSE_ARGS[@]}" pull; then
-    fail "docker compose pull failed; the error above names the image. For a ghcr.io/nano-rs image, a '403 Forbidden' on ghcr.io/token (or '401 Unauthorized') means that GHCR package is not public yet: run 'docker login ghcr.io' if you have access, or wait for nano-rs to publish it. For any other registry, check this host is logged in to it."
-fi
+ACTIVE_IMAGES=$(docker compose "${COMPOSE_ARGS[@]}" config --images)
 
 verify_image_digests
 
-if [[ "$USE_LEAN" == "1" ]]; then
-    if [[ "$FRESH_LEAN_CUTOVER" == "1" ]]; then
-        # Keep prior processes available until every required image is vouched.
-        # .env already selects the lean profile, so a plain `down` skips the
-        # gen1 legacy/tenzir services (ClickHouse, its migrator, Tenzir): they
-        # are still defined, so not orphans, and would keep running beside
-        # lean. Stop every profile; volumes are retained for rollback.
-        docker </dev/null compose "${COMPOSE_ARGS[@]}" --profile '*' down --remove-orphans
-    fi
-    # NAN-4749: a target rate given to this run is kept for re-runs; lean-init
-    # reads it from .env (unset keeps what .env already has).
-    if [[ -n "${NANO_LAKE_TARGET_EPS:-}" ]]; then
-        upsert_env_file_value NANO_LAKE_TARGET_EPS "$NANO_LAKE_TARGET_EPS"
-    fi
-    log "Initializing the trusted-local UUID tenant using the cell initializer"
-    docker </dev/null compose "${COMPOSE_ARGS[@]}" run --rm --no-deps -e NANO_LEAN_FRESH_TENANT="$FRESH_LEAN_CUTOVER" lean-init \
-        || fail "Lean initializer failed. No services have started."
-    # A retry after initializer completion reuses its UUID rather than rotating again.
-    if [[ -f .nano-lean/cutover-pending ]]; then
-        python3 -c 'from pathlib import Path; Path(".nano-lean/cutover-pending").unlink()'
-    fi
-    LEAN_TENANT_ID=$(cat .nano-lean/tenant_id)
-    upsert_env_file_value NANO_LAKE_TENANT_ID "$LEAN_TENANT_ID"
-    upsert_env_file_value NANO_TENANT_ID "$LEAN_TENANT_ID"
-    # Dedicated Redis keys are installation-wide. A fresh tenant must not load
-    # the former gen1 job snapshots; keep that prior volume for rollback.
-    LEAN_DRAGONFLY_VOLUME="${COMPOSE_PROJECT_NAME:-nano}_lean-dragonfly-${LEAN_TENANT_ID}"
-    upsert_env_file_value NANO_DRAGONFLY_DATA_VOLUME "$LEAN_DRAGONFLY_VOLUME"
-    upsert_env_file_value NANO_DRAGONFLY_VOLUME nano-lean-dragonfly
-    export NANO_LAKE_TENANT_ID="$LEAN_TENANT_ID" NANO_TENANT_ID="$LEAN_TENANT_ID"
-    export NANO_DRAGONFLY_DATA_VOLUME="$LEAN_DRAGONFLY_VOLUME" NANO_DRAGONFLY_VOLUME=nano-lean-dragonfly
-    # One model owns roles AND containers; re-render after every host resize.
-    # The generated file supersedes fixed compose limits and historical sizing
-    # overrides (NANO_*_MEM_LIMIT, Dragonfly maxmemory, Vector batch/buffer).
-    [[ -f .nano-lean/compose.resources.json ]] || fail "lean-init did not render host resources; use matching cell images."
-    cp .nano-lean/compose.resources.json docker-compose.host-resources.yml
-    if [[ ! " ${COMPOSE_ARGS[*]} " == *" -f docker-compose.host-resources.yml "* ]]; then
-        COMPOSE_ARGS+=(-f docker-compose.host-resources.yml)
-    fi
-    local host_compose_files="$COMPOSE_FILE"
-    for overlay in ${NANO_OVERLAY_LIST[@]+"${NANO_OVERLAY_LIST[@]}"}; do
-        host_compose_files+=":$overlay"
-    done
-    upsert_env_file_value COMPOSE_FILE "$host_compose_files:docker-compose.host-resources.yml"
-    log "Applied host-sized role and container resources"
-    python3 - .nano-lean/compose.resources.json <<'PYEPS'
-import json, sys
-s = json.load(open(sys.argv[1]))["x-nano-host-sizing"]
-print(f"Host sizing: {s['ingest_agent']} ingest, supported rate {s['supported_eps']} EPS (memory curve), cell plus Compose within 95% of host RAM")
-PYEPS
-    log "Probing cell isolation; missing Landlock warns on trusted-local only"
-    LEAN_PROBE_LOG=$(mktemp "${TMPDIR:-/tmp}/nano-lean-probe.XXXXXX")
-    if ! docker </dev/null compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint nanosiem-lake-cell lake-cell \
-        probe --write --config /etc/nano-cell/cell.json > "$LEAN_PROBE_LOG"; then
-        rm -f "$LEAN_PROBE_LOG"
-        fail "Cell isolation probe failed."
-    fi
-    if ! python3 - "$LEAN_PROBE_LOG" <<'PYPROBE'
-import json, sys
-with open(sys.argv[1]) as file:
-    report = json.load(file)
-if report['identity']['fatal'] or report['selected'].get('mode') is None:
-    print('Cell isolation probe refused this host: ' + report['selected']['why'], file=sys.stderr)
-    sys.exit(1)
-if report['selected'].get('mode') == 'watchdog':
-    print('Cell isolation: watchdog limits (add docker-compose.lean-cgroup-limits.yml for kernel cgroup limits)')
-else:
-    print('Cell isolation: ' + report['selected']['why'])
-PYPROBE
-    then
-        rm -f "$LEAN_PROBE_LOG"
-        fail "Cell isolation is unsupported on this host."
-    fi
-    rm -f "$LEAN_PROBE_LOG"
-    ok "Lean tenant initialized; the existing history remains outside the new tenant"
-fi
-
-# Existing single-host lake installs need a staged query/compiler rollout.
-# The generation manager publishes an immutable config pinned to the pulled
-# compiler before the only query worker and its durable runner are replaced.
-# Fresh installs have no serving process to preserve and fall through to the
-# normal Compose bootstrap below.
-if [[ "${USE_LEAN:-0}" != "1" && "${REUSE_ENV:-0}" == "1" && "${ENABLE_LAKE_CONTROL_PLANE:-0}" == "1" ]]; then
-    log "Staging the lake query/compiler upgrade"
-    if ! ./scripts/rollout-lake-runtime.sh "${COMPOSE_ARGS[@]}"; then
-        fail "Lake runtime rollout failed before the general service update. The prior loaded generation remains the recovery target; inspect lake-generation-manager and lake-query-worker logs."
-    fi
-fi
-
-# ----------------------------------------------------------------------------
-# 5. Start services, wait for API health, and initialize admin. The lake
-#    tolerates a slow first boot (see start_and_wait_for_api).
-# ----------------------------------------------------------------------------
-if [[ "${TENZIR_DIRECT:-0}" == "1" ]]; then
-    # Switching an existing install to Tenzir-direct: Vector and the connector
-    # runner are no longer in the stack, so `up -d` would leave their old
-    # containers running. Remove them; their volumes stay for --add-vector.
-    docker </dev/null compose "${COMPOSE_ARGS[@]}" --profile '*' rm -sf vector connector-runner lean-hec-proxy >/dev/null 2>&1 \
-        || fail "Could not stop Vector and connector-runner; refusing to start a plan that excludes their memory."
-else
-    # The Vector plan excludes the optional local Tenzir node. It may still
-    # be running after an earlier Tenzir-direct install and --add-vector.
-    docker </dev/null compose "${COMPOSE_ARGS[@]}" --profile '*' rm -sf tenzir >/dev/null 2>&1 \
-        || fail "Could not stop Tenzir; refusing to start a plan that excludes its memory."
-fi
-# NAN-4686: a wrapper (scripts/sovereign/single-host.sh) renders material
-# that needs this run's .env and lean tenant (installation facts, product
-# PostgreSQL DSN) before any product service starts.
 if [[ -n "${NANO_PRE_START_HOOK:-}" ]]; then
     [[ "$NANO_PRE_START_HOOK" == /* && -x "$NANO_PRE_START_HOOK" ]] \
         || fail "NANO_PRE_START_HOOK must be an absolute path to an executable."
     log "Running the pre-start hook"
-    "$NANO_PRE_START_HOOK" pre-start || fail "Pre-start hook failed. No product services have started."
+    "$NANO_PRE_START_HOOK" pre-start \
+        || fail "Pre-start hook failed. No product services have started."
 fi
-start_and_wait_for_api
+
+# Plaintext is admitted only for an explicitly opted-in disposable lab. Before
+# an app role starts, close Keeper's otherwise-open root namespace with the
+# shared digest identity and prove that an anonymous create is rejected. Data
+# roles are installed first, so a split Keeper quorum is available here. For a
+# co-located app+Keeper lab, start only Keeper before applying the guard.
+if [[ "$MULTI_NODE" == "1" && "${candidate_plaintext:-0}" == "1" \
+    && ",${ROLE_ARG}," == *,app,* ]]; then
+    [[ -r scripts/nano-keeper-root-guard ]] \
+        || fail "scripts/nano-keeper-root-guard not found in $NANO_INSTALL_DIR. The release bundle is incomplete."
+    if [[ ",${ROLE_ARG}," == *,keeper,* ]]; then
+        log "Starting co-located lab Keeper before protecting its root namespace"
+        docker compose "${COMPOSE_ARGS[@]}" up -d keeper
+    fi
+    keeper_password=$(env_value NANO_KEEPER_PASSWORD)
+    [[ -n "$keeper_password" ]] \
+        || fail "NANO_KEEPER_PASSWORD is missing; cannot protect the plaintext lab Keeper root."
+    IFS=',' read -r -a keeper_endpoint_list <<< "$NANO_KEEPER_ENDPOINTS"
+    keeper_guard_args=()
+    for keeper_endpoint in "${keeper_endpoint_list[@]}"; do
+        [[ -n "$keeper_endpoint" ]] && keeper_guard_args+=(--endpoint "$keeper_endpoint")
+    done
+    ((${#keeper_guard_args[@]} > 0)) \
+        || fail "The rendered role configuration has no Keeper endpoints for the plaintext lab guard."
+    log "Protecting the plaintext lab Keeper root before starting the app role"
+    printf '%s' "$keeper_password" \
+        | python3 -I scripts/nano-keeper-root-guard "${keeper_guard_args[@]}" \
+            --password-stdin --timeout "${NANO_KEEPER_ROOT_GUARD_TIMEOUT:-120}" \
+        || fail "Could not protect the plaintext lab Keeper root. Confirm the Keeper quorum is ready, then retry the app role."
+    unset keeper_password
+    ok "Keeper root rejects anonymous znode creation"
+fi
+
+log "Starting services"
+compose_up_args=(up -d)
+if [[ "$MULTI_NODE" == "1" && "${ROLE_CONFIG_WAS_PUBLISHED:-0}" == "1" ]]; then
+    # The renderer transactionally swaps `.nano-generated`. A running Docker
+    # container keeps a directory bind mount attached to the retired inode,
+    # so a plain `up -d` can leave ClickHouse with an empty config.d after a
+    # rerun or role change. Recreate every selected role service immediately
+    # after publication so all mounts bind the newly published tree.
+    compose_up_args+=(--force-recreate)
+    log "Recreating selected role services to attach the newly published configuration"
+fi
+docker compose "${COMPOSE_ARGS[@]}" "${compose_up_args[@]}"
+
+# On a re-run/upgrade, `up -d` recreates the app containers (new IPs) but leaves
+# nginx as-is — and it won't have loaded an updated nginx.conf either. Reload
+# nginx so it picks up any config change and re-resolves upstream IPs, otherwise
+# it proxies dead old IPs and 502s until restarted (NAN-1237). Best-effort.
+docker compose "${COMPOSE_ARGS[@]}" exec -T nginx nginx -s reload >/dev/null 2>&1 || true
 
 # ----------------------------------------------------------------------------
-# 6b. NAN-4759: platform feeds (IPinfo Lite geo/ASN, ThreatFox, Tor). An online
-#     install pulls the signed feed bundle once here; the runtime never fetches.
-#     --feeds-file installs a bundle copied to this host instead (offline).
-#     A failed pull warns; the operator can retry with scripts/nano feeds update.
+# 5. Wait for API health
 # ----------------------------------------------------------------------------
-install_platform_feeds() {
-    [[ "${USE_LEAN:-0}" == "1" && -x scripts/nano ]] || return 0
-    local args=()
-    if [[ -n "$platform_feeds_file" ]]; then
-        args=(--file "$platform_feeds_file")
-    elif [[ -n "$platform_feeds_license" ]]; then
-        args=(--license-file "$platform_feeds_license")
+HAS_APP=1
+HAS_INGEST=0
+if [[ "$MULTI_NODE" == "1" ]]; then
+    HAS_APP=0
+    [[ ",${ROLE_ARG}," == *,app,* ]] && HAS_APP=1
+    [[ ",${ROLE_ARG}," == *,ingest,* ]] && HAS_INGEST=1
+fi
+
+if [[ "$HAS_APP" == "1" ]]; then
+    log "Waiting for API to become healthy through the app edge (up to 5 min — first run includes DB migrations)"
+    HEALTH_URL="${API_BASE}/api/health"
+    deadline=$(( $(date +%s) + 300 ))
+    while (( $(date +%s) < deadline )); do
+        if curl -fsS -o /dev/null "$HEALTH_URL"; then
+            ok "API healthy"
+            break
+        fi
+        sleep 3
+    done
+    if ! curl -fsS -o /dev/null "$HEALTH_URL"; then
+        fail "API did not become healthy within 5 min. Check 'docker compose ${COMPOSE_ARGS[*]} logs nano-api nginx clickhouse-migrate'."
     fi
-    log "Installing the signed platform feed bundle"
-    scripts/nano feeds update ${args[@]+"${args[@]}"} >/dev/null \
-        || warn "Platform feed install failed; run 'scripts/nano feeds update' (sovereign: --license-file <license>) or import with --file."
-}
-install_platform_feeds
+    if [[ "$MULTI_NODE" == "1" ]]; then
+        log "Waiting for every ClickHouse asynchronous-loader object to become OK"
+        nano_wait_async_loaders "${NANO_ASYNC_LOADER_TIMEOUT:-300}" 3 \
+            || fail "ClickHouse asynchronous-loader readiness failed. Check ClickHouse logs and system.asynchronous_loader before retrying."
+        ok "ClickHouse asynchronous loaders ready"
+    fi
+elif [[ "$HAS_INGEST" == "1" ]]; then
+    INGEST_HEALTH_URL="http://localhost:${NANO_INGEST_PORT}/healthz"
+    log "Waiting for the ingest edge at $INGEST_HEALTH_URL"
+    deadline=$(( $(date +%s) + 120 ))
+    while (( $(date +%s) < deadline )); do
+        curl -fsS -o /dev/null "$INGEST_HEALTH_URL" && break
+        sleep 2
+    done
+    curl -fsS -o /dev/null "$INGEST_HEALTH_URL" \
+        || fail "Ingest edge did not become healthy. Check 'docker compose ${COMPOSE_ARGS[*]} logs vector vector-config-consumer ingest-edge'."
+    ok "Ingest edge healthy"
+else
+    # Stateful roles have their scenario-level readiness proven by the e2e
+    # harness. Here, fail quickly if the requested long-running container died.
+    for role_service in ${ROLE_ARG//,/ }; do
+        case "$role_service" in
+            postgres|clickhouse|keeper)
+                docker compose "${COMPOSE_ARGS[@]}" ps --status running --services | grep -qx "$role_service" \
+                    || fail "$role_service did not stay running. Check 'docker compose ${COMPOSE_ARGS[*]} logs $role_service'." ;;
+        esac
+    done
+    ok "Requested role container(s) running"
+fi
+
+# ----------------------------------------------------------------------------
+# 6. Initialize admin user only when setup status is still uninitialized
+# ----------------------------------------------------------------------------
+if [[ "$HAS_APP" != "1" ]]; then
+    ok "Admin initialization belongs to the app role; skipped on this host"
+else
+    STATUS_JSON=$(curl -fsS "${API_BASE}/api/setup/status" || echo '{}')
+    if echo "$STATUS_JSON" | grep -q '"initialized":true'; then
+        warn "System is already initialized — skipping admin creation."
+    else
+        if [[ "$REUSE_ENV" == "1" ]]; then
+            [[ -n "$ADMIN_EMAIL" ]] || fail "The prepared multi-node cluster is not initialized. Re-run the app role with NANO_ADMIN_EMAIL, NANO_ADMIN_NAME and NANO_ADMIN_PASSWORD set."
+            [[ -n "$ADMIN_NAME" ]] || fail "The prepared multi-node cluster is not initialized. Re-run the app role with NANO_ADMIN_EMAIL, NANO_ADMIN_NAME and NANO_ADMIN_PASSWORD set."
+            if [[ -z "$ADMIN_PASSWORD" ]]; then
+                ADMIN_PASSWORD=$(env_value INITIAL_ADMIN_PASSWORD)
+            fi
+            [[ -n "$ADMIN_PASSWORD" ]] || fail "The prepared multi-node cluster is not initialized. Set NANO_ADMIN_PASSWORD (or use the autogenerated INITIAL_ADMIN_PASSWORD in .env) and re-run the app role."
+            validate_admin_password "$ADMIN_PASSWORD"
+        fi
+        log "Creating admin user $ADMIN_EMAIL"
+        payload=$(printf '{"email":%s,"name":%s,"password":%s}' \
+            "$(json_escape "$ADMIN_EMAIL")" \
+            "$(json_escape "$ADMIN_NAME")" \
+            "$(json_escape "$ADMIN_PASSWORD")")
+        if ! curl -fsS -X POST \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "${API_BASE}/api/setup/initialize" > /dev/null; then
+            fail "Admin initialization failed. Check 'docker compose -f $COMPOSE_FILE logs nano-api'."
+        fi
+        ok "Admin user created"
+    fi
+fi
 
 # ----------------------------------------------------------------------------
 # 7. Done
@@ -1910,85 +1560,91 @@ echo
 printf "%bnano is up.%b\n" "$c_green$c_bold" "$c_reset"
 echo
 printf "  Open:     %s\n" "$BASE_URL"
-[[ -z "$ADMIN_EMAIL" ]] && ADMIN_EMAIL=$(env_file_value INITIAL_ADMIN_EMAIL)
+if [[ "$MULTI_NODE" == "1" ]]; then
+    printf "  Host:     %s\n" "$NANO_HOST_NAME"
+    printf "  Roles:    %s\n" "$ROLE_ARG"
+fi
 printf "  Login:    %s\n" "${ADMIN_EMAIL:-(existing user)}"
-printf "  Schema:   %s\n" "$(printf '%s' "${SCHEMA_PROFILE:-ocsf}" | tr '[:lower:]' '[:upper:]')"
-if [[ "${ADMIN_CREATED:-0}" == "1" ]]; then
-    printf "  Password saved in %s/.env as INITIAL_ADMIN_PASSWORD.\n" "$NANO_INSTALL_DIR"
+printf "  Schema:   %s\n" "$(printf '%s' "${SCHEMA_PROFILE:-udm}" | tr '[:lower:]' '[:upper:]')"
+if [[ "${GENERATED_PASSWORD:-0}" == "1" ]]; then
+    printf "  Password: see %s/.env (INITIAL_ADMIN_PASSWORD)\n" "$NANO_INSTALL_DIR"
 fi
 # NAN-835 / NAN-836: surface every ingest endpoint + one-line curl so users
-# can point external Vector / HEC forwarders / curl at the new instance
+# can point external Vector / Splunk forwarder / curl at the new instance
 # without spelunking through .env or docker-compose.
-if [[ "${TENZIR_DIRECT:-0}" == "1" ]]; then
-    # NAN-3807: no Vector, so none of the ingest endpoints below exist. The
-    # per-source key is minted by lean-landing-admin and shown only there.
-    echo
-    printf "  Ingest:   Tenzir-direct (OCSF bucket drop; no Vector, so no HTTP /ingest, HEC, OTLP or pull connectors)\n"
-    printf "  Next:     add a source; it prints a write-only key and a ready-to-paste Tenzir to_s3 sink once:\n"
-    printf "              (cd %q && docker compose run --rm lean-landing-admin add --name <name>)\n" "$NANO_INSTALL_DIR"
-    printf "            Run Tenzir on this host's compose network (%s_default, endpoint lake-object-store:9000),\n" "${COMPOSE_PROJECT_NAME:-$(basename "$NANO_INSTALL_DIR")}"
-    printf "            or use the bundled node: put the pipeline in %s/.nano-tenzir/pipeline.tql and run\n" "$NANO_INSTALL_DIR"
-    printf "              (cd %q && docker compose --profile tenzir up -d tenzir)\n" "$NANO_INSTALL_DIR"
-    printf "            Put sysmon.ndjson in %s/.nano-tenzir/data (mounted at /data, read-only).\n" "$NANO_INSTALL_DIR"
-    printf "            Example pipeline: %s/tenzir/lean/sysmon-bucket.tql   Guide: %s/tenzir/AGENTS.md\n" "$NANO_INSTALL_DIR" "$NANO_INSTALL_DIR"
-    printf "            Status: Ingestion → Credentials → Bucket drop sources.   Add Vector later: install.sh --add-vector\n"
-elif [[ "$NANO_NONINTERACTIVE" != "1" && -n "${VECTOR_AUTH_TOKEN:-}" ]]; then
+if [[ "${VECTOR_AUTH_TOKEN_PRESENT:-0}" == "1" ]]; then
+    INGEST_BASE_URL="$BASE_URL"
+    if [[ "$MULTI_NODE" == "1" ]]; then
+        case "$BASE_URL" in
+            https://*) INGEST_BASE_URL="https://${NANO_INGEST_HOSTNAME}" ;;
+            *) INGEST_BASE_URL="http://${NANO_INGEST_HOSTNAME}" ;;
+        esac
+    fi
     # Strip scheme + path from BASE_URL to get bare host for host:port endpoints
-    INGEST_HOST="${BASE_URL#http://}"
+    INGEST_HOST="${INGEST_BASE_URL#http://}"
     INGEST_HOST="${INGEST_HOST#https://}"
     INGEST_HOST="${INGEST_HOST%%/*}"
     INGEST_HOST="${INGEST_HOST%%:*}"
     echo
-    printf "  Token:    %b%s%b  ← bound to the install source (OpenTelemetry Logs on a fresh install)\n" "$c_yellow$c_bold" "$VECTOR_AUTH_TOKEN" "$c_reset"
+    # NAN-4907: the token decides the source. Senders use a named ingest token
+    # per source (shown once in the UI); the install token is not an ingest
+    # credential on a fresh install. An upgraded install keeps it in the
+    # deprecated legacy multiplex mode (routed by X-Source-Type / sourcetype).
+    printf "  Ingest tokens: issue one per sender in %s/ingestion/ingest-tokens\n" "$BASE_URL"
+    printf "              (bound to one log source, which it decides; shown once)\n"
+    if [[ "${REUSE_ENV:-0}" == "1" ]]; then
+        printf "  Install token: VECTOR_AUTH_TOKEN in %s/.env  ← legacy multiplex (deprecated) on upgraded installs\n" "$NANO_INSTALL_DIR"
+    fi
     echo
-    printf "  Per-source tokens: Ingestion → Credentials. Use a token bound to your intended source.\n"
-    printf "  HTTP:     POST %s/ingest\n" "$BASE_URL"
-    printf "              curl -X POST %s/ingest \\\\\n" "$BASE_URL"
-    printf "                -H 'Authorization: Bearer %s' \\\\\n" "$VECTOR_AUTH_TOKEN"
+    printf "  HTTP:     POST %s/ingest\n" "$INGEST_BASE_URL"
+    printf "              curl -X POST %s/ingest \\\\\n" "$INGEST_BASE_URL"
+    printf "                -H 'Authorization: Bearer <ingest token>' \\\\\n"
     printf "                -d '{\"message\":\"hello nano\"}'\n"
     echo
-    printf "  HEC:      POST http://%s:8088/services/collector/event\n" "$INGEST_HOST"
-    printf "              curl -X POST http://%s:8088/services/collector/event \\\\\n" "$INGEST_HOST"
-    printf "                -H 'Authorization: Splunk %s' \\\\\n" "$VECTOR_AUTH_TOKEN"
-    printf "                -H 'X-Splunk-Request-Channel: 11111111-1111-4111-8111-111111111111' \\\\\n"
+    if [[ "$MULTI_NODE" == "1" ]]; then
+        HEC_URL="$INGEST_BASE_URL/services/collector/event"
+    else
+        HEC_URL="http://$INGEST_HOST:8088/services/collector/event"
+    fi
+    printf "  HEC:      POST %s\n" "$HEC_URL"
+    printf "              curl -X POST %s \\\\\n" "$HEC_URL"
+    printf "                -H 'Authorization: Splunk <ingest token>' \\\\\n"
+    printf "                -H 'X-Splunk-Request-Channel: <uuid>' \\\\\n"
     printf "                -d '{\"event\":\"hello nano\"}'\n"
     echo
-    printf "  OTLP/HTTP: %s/otlp  (SDK/collector endpoint; /v1/logs, /v1/traces, /v1/metrics)\n" "$BASE_URL"
-    printf "              header 'Authorization: Bearer <source-bound token>'\n"
-    printf "              Create a named token bound to the enabled OpenTelemetry Logs source.\n"
-    printf "              Raw OTLP ports (:4317/:4318) stay internal; remote senders use\n"
-    printf "              authenticated OTLP/HTTP at /otlp with a source-bound ingest token.\n"
+    printf "  OTLP:     POST %s/otlp/v1/{logs,traces,metrics}  (Authorization: Bearer <ingest token>)\n" "$INGEST_BASE_URL"
     echo
-    # NAN-3322: Vector's native `vector` source/sink pair has no auth option, and
-    # the :6000 source checks nothing, so the token above does not apply here.
-    printf "  Vector:   %s:6000  (Vector → Vector native protocol, v2)\n" "$INGEST_HOST"
-    printf '              point on-prem Vector aggregators here with a "vector" sink.\n'
-    printf "              UNAUTHENTICATED: the token above is not checked on this port,\n"
-    printf "              so it binds 127.0.0.1 unless NANO_VECTOR_NATIVE_BIND_ADDRESS is\n"
-    printf "              set. Prefer the authenticated HTTP / HEC endpoints above.\n"
-    if [[ "${USE_LEAN:-0}" == "1" ]]; then
-        echo
-        printf "  Tenzir:   OCSF bucket drop beside Vector (tenzir/AGENTS.md); add a source with\n"
-        printf "              (cd %q && docker compose run --rm lean-landing-admin add --name <name>)\n" "$NANO_INSTALL_DIR"
-    fi
+    printf "  Vector:   %s:6000  (Vector → Vector native protocol, v2; loopback by default)\n" "$INGEST_HOST"
+    printf "              no credential check: events land as source_type=vector_native\n"
+    printf "              (prefer an HEC sink with a named ingest token per source)\n"
     # NAN-1603 / NAN-1604: direct OCSF ingestion (Tenzir / Cribl / custom) writes
     # straight into ClickHouse, bypassing Vector. Only meaningful on the OCSF profile.
-    if [[ "$SCHEMA_PROFILE" == "ocsf" && "$ENABLE_LAKE_CONTROL_PLANE" != "1" ]]; then
+    if [[ "$SCHEMA_PROFILE" == "ocsf" ]]; then
         echo
         printf "  Direct OCSF ingestion (Tenzir / Cribl / custom)\n"
-        printf "            Native sink: clickhouse:9000  (internal docker network)\n"
+        if [[ "$MULTI_NODE" == "1" ]]; then
+            printf "            Native sink(s): %s\n" "$NANO_CLICKHOUSE_NATIVE_ENDPOINTS"
+        else
+            printf "            Native sink: clickhouse:9000  (internal docker network)\n"
+        fi
         printf "            User/Table:  nanosiem_ingest → nanosiem.ocsf_logs_native_raw\n"
-        printf "            Password:    %b%s%b\n" "$c_yellow$c_bold" "${CLICKHOUSE_INGEST_PASSWORD:-(see .env)}" "$c_reset"
-        printf "            Docs:        https://nano.rs/docs/concepts/ocsf-schema\n"
+        printf "            Password:    see %s/.env (CLICKHOUSE_INGEST_PASSWORD)\n" "$NANO_INSTALL_DIR"
+        printf "            Docs:        https://nano.rs/docs/ocsf/integrations/direct-ocsf\n"
+        if [[ "${BUNDLE_TENZIR:-0}" == "1" ]]; then
+            echo
+            printf "  Tenzir:   bundled node %b'nano-tenzir'%b is running (Tenzir ≥ 6.4.0).\n" "$c_bold" "$c_reset"
+            printf "              Send OCSF NDJSON:  POST http://%s:9095/  (UNAUTHENTICATED)\n" "$INGEST_HOST"
+            printf "                                 binds 127.0.0.1 unless NANO_TENZIR_BIND_ADDRESS is set.\n"
+            printf "              Edit its pipeline: %s/tenzir/pipeline.tql\n" "$NANO_INSTALL_DIR"
+            printf "                                 (add your sources + OCSF mapping; the sink is pre-wired)\n"
+            printf "              Apply edits:       docker compose -f %s/%s restart tenzir\n" "$NANO_INSTALL_DIR" "$COMPOSE_FILE"
+        else
+            printf "            Native client (Tenzir ≥ 6.4.0): configure TLS to match the inventory transport mode\n"
+        fi
     fi
 fi
 echo
-echo "  Logs:     docker compose -f $NANO_INSTALL_DIR/$COMPOSE_FILE logs -f"
-echo "  Stop:     docker compose -f $NANO_INSTALL_DIR/$COMPOSE_FILE down"
-echo "  Reset:    docker compose -f $NANO_INSTALL_DIR/$COMPOSE_FILE down -v   (DELETES ALL DATA)"
-# Open-core installer only; run after health and admin bootstrap succeeded.
-onboard_data
+echo "  Logs:     cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} logs -f"
+echo "  Stop:     cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} down"
+echo "  Reset:    cd $NANO_INSTALL_DIR && docker compose ${COMPOSE_ARGS[*]} down -v   (DELETES ALL DATA)"
 echo
-
-}
-main "$@"

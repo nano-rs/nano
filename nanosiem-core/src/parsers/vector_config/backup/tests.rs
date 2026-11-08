@@ -15,9 +15,7 @@ use tempfile::TempDir;
 async fn manager_with_active(files: &[(&str, &str)]) -> (TempDir, VectorConfigManager) {
     let tmp = TempDir::new().expect("tempdir");
     let manager = VectorConfigManager::new(tmp.path());
-    fs::create_dir_all(&manager.parsers_dir)
-        .await
-        .expect("mkdir");
+    fs::create_dir_all(&manager.parsers_dir).await.expect("mkdir");
     for (name, body) in files {
         fs::write(manager.parsers_dir.join(name), body)
             .await
@@ -154,9 +152,7 @@ async fn a_generation_from_an_earlier_attempt_is_refused() {
     // A real config goes live, and deploy 2 snapshots it.
     fs::create_dir_all(&manager.parsers_dir).await.unwrap();
     for (name, body) in coherent() {
-        fs::write(manager.parsers_dir.join(name), body)
-            .await
-            .unwrap();
+        fs::write(manager.parsers_dir.join(name), body).await.unwrap();
     }
     let second = manager.backup_current().await.expect("second backup");
     assert_ne!(first, second);
@@ -191,9 +187,7 @@ async fn a_failed_snapshot_yields_no_token_and_leaves_the_old_backup_alone() {
 
     fs::create_dir_all(&manager.parsers_dir).await.unwrap();
     for (name, body) in coherent() {
-        fs::write(manager.parsers_dir.join(name), body)
-            .await
-            .unwrap();
+        fs::write(manager.parsers_dir.join(name), body).await.unwrap();
     }
     fs::write(
         manager.parsers_dir.join("apache__old_.toml"),
@@ -336,12 +330,9 @@ async fn restore_publishes_into_the_live_directory_without_recreating_it() {
     fs::write(manager.parsers_dir.join("apache.toml"), "CLOBBERED")
         .await
         .unwrap();
-    fs::write(
-        manager.parsers_dir.join("orphan.toml"),
-        "added after the snapshot",
-    )
-    .await
-    .unwrap();
+    fs::write(manager.parsers_dir.join("orphan.toml"), "added after the snapshot")
+        .await
+        .unwrap();
 
     manager.restore_backup(&gen).await.expect("restore");
 
@@ -498,10 +489,7 @@ async fn the_swap_cleans_up_after_itself() {
             leftovers.push(name);
         }
     }
-    assert!(
-        leftovers.is_empty(),
-        "workspace directories leaked: {leftovers:?}"
-    );
+    assert!(leftovers.is_empty(), "workspace directories leaked: {leftovers:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -562,10 +550,7 @@ async fn the_gate_catches_a_dangling_enrichment_router_route() {
         .backup_current()
         .await
         .expect_err("an enrichment route the router no longer emits is dangling");
-    assert!(
-        format!("{err}").contains("enrichment_router.identity"),
-        "{err}"
-    );
+    assert!(format!("{err}").contains("enrichment_router.identity"), "{err}");
 }
 
 /// NAN-1584's shape: the OCSF sink forks every enabled parser's
@@ -830,12 +815,7 @@ async fn a_tree_from_the_real_generators_passes_the_gate() {
 
     // Sanity: the tree really is the generated one, not an empty directory that
     // would pass the gate for the wrong reason.
-    for expected in [
-        "_router.toml",
-        "_combiner.toml",
-        "_pipeline.toml",
-        "_enrichment.toml",
-    ] {
+    for expected in ["_router.toml", "_combiner.toml", "_pipeline.toml", "_enrichment.toml"] {
         assert!(
             manager.parsers_dir.join(expected).exists(),
             "{expected} missing — the fixture is not a real generated tree"
@@ -886,10 +866,7 @@ async fn a_tree_from_the_real_generators_round_trips_through_a_rollback() {
     }
     after.sort();
 
-    assert_eq!(
-        before, after,
-        "the rollback did not reproduce the snapshot exactly"
-    );
+    assert_eq!(before, after, "the rollback did not reproduce the snapshot exactly");
 }
 
 // ---------------------------------------------------------------------------
@@ -902,6 +879,29 @@ fn graph(docs: &[(&str, &str)]) -> ComponentGraph {
         .map(|(n, b)| (n.to_string(), b.to_string()))
         .collect();
     ComponentGraph::from_documents(&owned)
+}
+
+#[test]
+fn every_static_enrichment_component_is_known_external() {
+    let raw = include_str!("../../../../../config/vector/04-enrichment-source.toml");
+    let parsed: toml::Table = toml::from_str(&substitute_env(raw)).expect("static config parses");
+    let g = graph(&[]);
+
+    let declared: std::collections::HashSet<_> = ["sources", "transforms", "sinks"]
+        .into_iter()
+        .filter_map(|section| parsed.get(section).and_then(|value| value.as_table()))
+        .flat_map(|section| section.keys().cloned())
+        .collect();
+
+    assert!(
+        !declared.is_empty(),
+        "fixture must declare Vector components"
+    );
+    assert!(
+        declared.is_subset(&g.known_external),
+        "every component in 04-enrichment-source.toml must be accepted as external: missing {:?}",
+        declared.difference(&g.known_external).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -925,9 +925,7 @@ type = \"route\"\n\
 identity = 'x'\n";
 
     let g = graph(&[("_router.toml", toml)]);
-    let source = g
-        .route_names("source_router")
-        .expect("source_router is a route");
+    let source = g.route_names("source_router").expect("source_router is a route");
     assert!(source.contains("apache_http_server"));
     assert!(source.contains("generic"));
     // Belongs to a different route table — counting it would mask a dangling
@@ -937,10 +935,7 @@ identity = 'x'\n";
     assert!(!source.contains("type"));
     assert!(!source.contains("condition"));
 
-    assert!(g
-        .route_names("enrichment_router")
-        .unwrap()
-        .contains("identity"));
+    assert!(g.route_names("enrichment_router").unwrap().contains("identity"));
     // A filter is not a route, so it has no named outputs to validate against.
     assert!(g.route_names("aws_alb_route_unclaimed").is_none());
 }
@@ -1015,16 +1010,10 @@ fn the_dangling_report_is_capped_but_reports_the_true_count() {
 
 #[test]
 fn env_interpolation_is_substituted_the_way_vector_does_it() {
-    assert_eq!(
-        substitute_env("max_bytes = ${A:-52428800}\n"),
-        "max_bytes = 52428800\n"
-    );
+    assert_eq!(substitute_env("max_bytes = ${A:-52428800}\n"), "max_bytes = 52428800\n");
     // No default: Vector substitutes the empty string.
     assert_eq!(substitute_env("x = \"${A}\"\n"), "x = \"\"\n");
-    assert_eq!(
-        substitute_env("no interpolation here"),
-        "no interpolation here"
-    );
+    assert_eq!(substitute_env("no interpolation here"), "no interpolation here");
     // Unterminated: left alone so the parse fails honestly rather than silently
     // producing a different document.
     assert_eq!(substitute_env("x = ${UNCLOSED"), "x = ${UNCLOSED");

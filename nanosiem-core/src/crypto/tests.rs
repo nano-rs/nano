@@ -1,10 +1,14 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Key ring compatibility, rotation and fail-closed proofs (NAN-4933; the v2
+//! envelope and parser cases are ported from main's NAN-4401 CP2a suite).
 use super::*;
 use serde_json::json;
-use std::process::Command;
 use uuid::Uuid;
 
 const ROOT: &str = "0123456789abcdef0123456789abcdef";
 const OTHER: &str = "fedcba9876543210fedcba9876543210";
+const THIRD: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+
 fn config(legacy: &[(&str, &str)]) -> String {
     let mut keys = vec![json!({"id":"active", "key":STANDARD.encode(ROOT)})];
     keys.extend(
@@ -24,349 +28,56 @@ fn tenant() -> EncryptionService {
         "feed-1",
     )
 }
+/// A ring whose active key is `active_id` among two base64 roots.
+fn two_key_ring(active_id: &str) -> EncryptionService {
+    EncryptionService::from_config(
+        &json!({
+            "version": 1,
+            "active": active_id,
+            "keys": [
+                {"id": "k1", "key": STANDARD.encode(ROOT)},
+                {"id": "k2", "key": STANDARD.encode(OTHER)},
+            ],
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+// ---- existing single-key installs ---------------------------------------
 
 #[test]
-fn permanent_plain_string_import_preserves_ascii_hex_bytes() {
+fn legacy_ciphertext_decrypts_under_plain_string_import() {
+    // The installer's 64-hex value: the old cipher used its first 32 ASCII
+    // bytes, NOT the hex-decoded bytes. Old ciphertext must still open.
     let generated = format!("{ROOT}{OTHER}");
-    let cipher = EncryptionService::from_config(&generated).unwrap();
-    assert_eq!(cipher.active_key_id(), "legacy-0");
-    let data = cipher.encrypt(b"secret").unwrap();
+    let old = EncryptionService::new(ROOT.as_bytes())
+        .encrypt(b"pre-ring secret")
+        .unwrap();
+    let ring = EncryptionService::from_config(&generated).unwrap();
+    assert_eq!(ring.active_key_id(), LEGACY_ID);
+    assert_eq!(ring.decrypt(&old).unwrap(), b"pre-ring secret");
+    // And the ring's own writes are byte-compatible with the old reader.
+    let fresh = ring.encrypt(b"new").unwrap();
+    assert!(!fresh.nonce.contains(':'));
     assert_eq!(
-        EncryptionService::from_config(ROOT)
-            .unwrap()
-            .decrypt(&data)
+        EncryptionService::new(ROOT.as_bytes())
+            .decrypt(&fresh)
             .unwrap(),
-        b"secret"
-    );
-    assert!(!data.nonce.contains(':'));
-    // UTF-8 is truncated by byte, even across a character boundary.
-    let utf8 = format!("{}é", "a".repeat(31));
-    let utf8_service = EncryptionService::from_config(&utf8).unwrap();
-    let old_effective = [vec![b'a'; 31], vec![0xc3]].concat();
-    assert_eq!(
-        EncryptionService::new(&old_effective)
-            .decrypt(&utf8_service.encrypt(b"ok").unwrap())
-            .unwrap(),
-        b"ok"
+        b"new"
     );
 }
+
 #[test]
-fn short_legacy_requires_valid_active_and_explicit_decrypt_entry() {
+fn short_single_keys_from_earlier_releases_keep_working() {
+    // 16-31 byte keys were accepted (zero padded) by every earlier release.
     let short = "old-16-byte-key!!";
-    assert!(EncryptionService::from_config(short).is_err());
-    let ring = EncryptionService::from_config(&config(&[("legacy-0", short)])).unwrap();
-    let mut old_key = [0; 32];
-    old_key[..short.len()].copy_from_slice(short.as_bytes());
-    // Fixture from the old effective key, not a bypass for the ring under test.
-    let old = EncryptionService::new(&old_key)
+    let old = EncryptionService::new(short.as_bytes())
         .encrypt(b"old secret")
         .unwrap();
+    let ring = EncryptionService::from_config(short).unwrap();
     assert_eq!(ring.decrypt(&old).unwrap(), b"old secret");
-    assert!(EncryptionService::from_config(&config(&[("legacy-0", "too-short")])).is_err());
-    let bad =
-        config(&[("legacy-0", short)]).replace("\"active\":\"active\"", "\"active\":\"legacy-0\"");
-    assert!(EncryptionService::from_config(&bad).is_err());
-}
-#[test]
-fn public_default_explicit_decrypt_only_and_never_active() {
-    let public = "nanosiem-default-key-32bytes!!";
-    let ring = EncryptionService::from_config(&config(&[("legacy-0", public)])).unwrap();
-    let mut key = [0; 32];
-    key[..public.len()].copy_from_slice(public.as_bytes());
-    let nonce = [1; 12];
-    let ct = Aes256Gcm::new_from_slice(&key)
-        .unwrap()
-        .encrypt(Nonce::from_slice(&nonce), b"old public secret".as_slice())
-        .unwrap();
-    assert_eq!(
-        ring.decrypt(&EncryptedData::from_bytea(&ct, &STANDARD.encode(nonce)))
-            .unwrap(),
-        b"old public secret"
-    );
-    assert!(EncryptionService::from_config(&format!("{public}00000000")).is_err());
-    let bad =
-        config(&[("legacy-0", public)]).replace("\"active\":\"active\"", "\"active\":\"legacy-0\"");
-    assert!(EncryptionService::from_config(&bad).is_err());
-    let mut value: serde_json::Value =
-        serde_json::from_str(&config(&[("legacy-0", public)])).unwrap();
-    value["legacy_decrypt_ids"] = json!([]);
-    assert!(EncryptionService::from_config(&value.to_string()).is_err());
-}
-#[test]
-fn parser_refuses_malformed_unbounded_duplicate_or_missing_key_configuration() {
-    for value in [
-        "",
-        "short",
-        "{",
-        "{}",
-        "CHANGE_ME_GENERATE_WITH_OPENSSL_RAND_HEX_32",
-    ] {
-        assert!(EncryptionService::from_config(value).is_err());
-    }
-    let valid = config(&[]);
-    let mut value: serde_json::Value = serde_json::from_str(&valid).unwrap();
-    for mutation in [
-        json!({"version":2}),
-        json!({"active":"absent"}),
-        json!({"keys":[]}),
-        json!({"unknown":"secret"}),
-        json!({"legacy_decrypt_ids":["absent"]}),
-    ] {
-        let mut bad = value.clone();
-        for (k, v) in mutation.as_object().unwrap() {
-            bad[k] = v.clone();
-        }
-        assert!(EncryptionService::from_config(&bad.to_string()).is_err());
-    }
-    value["keys"] = json!([value["keys"][0].clone(), value["keys"][0].clone()]);
-    assert!(EncryptionService::from_config(&value.to_string()).is_err());
-    assert!(EncryptionService::from_config(&format!("{{{}", "x".repeat(65537))).is_err());
-    for bytes in [vec![7; 31], vec![7; 33], vec![0; 32]] {
-        let mut bad: serde_json::Value = serde_json::from_str(&valid).unwrap();
-        bad["keys"][0]["key"] = json!(STANDARD.encode(bytes));
-        assert!(EncryptionService::from_config(&bad.to_string()).is_err());
-    }
-}
-#[test]
-fn active_legacy_writes_are_readable_even_when_only_old_ids_are_listed() {
-    let service = EncryptionService::from_config(&config(&[("legacy-0", OTHER)])).unwrap();
-    let data = service.encrypt_json(&json!({"token":"value"})).unwrap();
-    assert!(!data.nonce.contains(':'));
-    assert_eq!(
-        service.decrypt_json::<serde_json::Value>(&data).unwrap(),
-        json!({"token":"value"})
-    );
-}
-#[test]
-fn all_storage_adapters_preserve_key_id_and_context() {
-    let service = tenant();
-    let value = service.seal_v2(br#"{"token":"value"}"#).unwrap();
-    let (bytes, nonce) = value.to_bytea().unwrap();
-    let b = EncryptedData::from_bytea(&bytes, &nonce);
-    let j = EncryptedData::from_json_bytes(&value.to_json_bytes().unwrap()).unwrap();
-    let t = EncryptedData::from_text_bytea(value.ciphertext.as_bytes(), &nonce).unwrap();
-    let (raw, nonce, version) = value.to_raw_nonce().unwrap();
-    assert_eq!(version, 2);
-    assert_eq!(nonce.len(), 12);
-    let d = EncryptedData::from_raw_nonce(&raw, &nonce, version).unwrap();
-    for data in [b, j, t, d] {
-        assert_eq!(
-            service
-                .decrypt_credentials_bytea(&data.to_bytea().unwrap().0, &data.nonce)
-                .unwrap()["token"],
-            "value"
-        );
-    }
-    assert!(EncryptedData::from_raw_nonce(&raw, &nonce, 3).is_err());
-    assert!(EncryptedData::from_raw_nonce(&raw, &nonce[..11], 2).is_err());
-}
-#[test]
-fn different_tenant_actual_derivations_cannot_open_each_others_data() {
-    let a = tenant();
-    let b = service().with_context(
-        CredentialScope::Tenant(Uuid::from_u128(2)),
-        "connector.vendor",
-        "feed-1",
-    );
-    let ca = a.context.as_ref().unwrap();
-    let cb = b.context.as_ref().unwrap();
-    let ka = derive(ROOT.as_bytes(), ca).unwrap();
-    let kb = derive(ROOT.as_bytes(), cb).unwrap();
-    assert_ne!(ka.as_ref(), kb.as_ref());
-    let ct = a.seal_v2(b"tenant secret").unwrap();
-    assert!(b.decrypt(&ct).is_err());
-    assert!(a.decrypt(&b.seal_v2(b"b secret").unwrap()).is_err());
-    let bytes = STANDARD.decode(&ct.ciphertext).unwrap();
-    let (_, head, body) = envelope::parse(&bytes).unwrap();
-    let nonce = decode_nonce(ct.nonce.strip_prefix(envelope::V2_NONCE_PREFIX).unwrap()).unwrap();
-    assert!(Aes256Gcm::new_from_slice(kb.as_ref())
-        .unwrap()
-        .decrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: body,
-                aad: &ca.aad(head).unwrap()
-            }
-        )
-        .is_err());
-}
-#[test]
-fn platform_cannot_open_in_tenant_account_or_deployment_scope() {
-    let platform = service().with_context(CredentialScope::Platform, "ai.provider", "provider");
-    let data = platform.seal_v2(b"platform").unwrap();
-    for scope in [
-        CredentialScope::Tenant(Uuid::from_u128(1)),
-        CredentialScope::Account(Uuid::from_u128(1)),
-        CredentialScope::Deployment,
-    ] {
-        let other = service().with_context(scope, "ai.provider", "provider");
-        assert!(other.decrypt(&data).is_err());
-        assert!(platform.decrypt(&other.seal_v2(b"other").unwrap()).is_err());
-    }
-    assert!(service().decrypt(&data).is_err());
-}
-#[test]
-fn wrong_account_purpose_row_and_nil_identity_are_rejected() {
-    let scope = CredentialScope::Account(Uuid::from_u128(1));
-    let account = service().with_context(scope, "account.totp", "user");
-    let data = account.seal_v2(b"totp").unwrap();
-    for (scope, purpose, row) in [
-        (
-            CredentialScope::Account(Uuid::from_u128(2)),
-            "account.totp",
-            "user",
-        ),
-        (scope, "account.backup", "user"),
-        (scope, "account.totp", "other"),
-    ] {
-        assert!(service()
-            .with_context(scope, purpose, row)
-            .decrypt(&data)
-            .is_err());
-    }
-    assert!(service()
-        .with_context(CredentialScope::Tenant(Uuid::nil()), "purpose", "row")
-        .seal_v2(b"x")
-        .is_err());
-}
-#[test]
-fn tampering_and_format_downgrades_fail_closed() {
-    let service = tenant();
-    let data = service.seal_v2(b"value").unwrap();
-    let original = STANDARD.decode(&data.ciphertext).unwrap();
-    for index in 0..original.len() {
-        let mut bytes = original.clone();
-        bytes[index] ^= 1;
-        let changed = EncryptedData::from_bytea(&bytes, &data.nonce);
-        assert!(service.decrypt(&changed).is_err());
-    }
-    let mut changed = data.clone();
-    changed.nonce = changed.nonce.replace("nck2:", "");
-    assert!(service.decrypt(&changed).is_err());
-    changed.nonce = data.nonce.replace("nck2:", "nck3:");
-    assert!(service.decrypt(&changed).is_err());
-    for nonce in ["nck2:", "nck2:AAAA", "not base64"] {
-        assert!(service
-            .decrypt(&EncryptedData {
-                ciphertext: data.ciphertext.clone(),
-                nonce: nonce.into()
-            })
-            .is_err());
-    }
-}
-#[test]
-fn retired_v2_roots_remain_readable_and_nonces_are_unique() {
-    let old = tenant();
-    let a = old.seal_v2(b"secret").unwrap();
-    let b = old.seal_v2(b"secret").unwrap();
-    assert_ne!(a.nonce, b.nonce);
-    let cfg = json!({"version":1,"active":"next","keys":[{"id":"next","key":STANDARD.encode(OTHER)},{"id":"active","key":STANDARD.encode(ROOT)}],"legacy_decrypt_ids":[]});
-    let next = EncryptionService::from_config(&cfg.to_string())
-        .unwrap()
-        .with_context(
-            CredentialScope::Tenant(Uuid::from_u128(1)),
-            "connector.vendor",
-            "feed-1",
-        );
-    assert_eq!(next.decrypt(&a).unwrap(), b"secret");
-}
-#[test]
-fn redacted_debug_and_configuration_errors_never_echo_material() {
-    let secret = "NEVER_PRINT_THIS_MATERIAL";
-    let bad = format!(
-        r#"{{"version":1,"active":"{secret}","keys":[{{"id":"x","key":"{secret}"}}],"legacy_decrypt_ids":[]}}"#
-    );
-    let error = EncryptionService::from_config(&bad)
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(!error.contains(secret));
-    let data = service().encrypt(secret.as_bytes()).unwrap();
-    assert_eq!(format!("{data:?}"), "EncryptedData([redacted])");
-}
-#[test]
-#[ignore = "subprocess production constructor probe"]
-fn boot_probe() {
-    let _tracing = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .try_init();
-    let _ = EncryptionService::from_env();
-}
-#[test]
-#[ignore = "subprocess production JWT constructor probe"]
-fn jwt_boot_probe() {
-    let _ = crate::auth::TokenConfig::default();
-}
-fn probe(
-    name: &str,
-    key: Option<&str>,
-    oidc: Option<&str>,
-    jwt: Option<&str>,
-) -> std::process::Output {
-    let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args(["--exact", name, "--ignored", "--nocapture"])
-        .env_clear();
-    if let Some(key) = key {
-        cmd.env("NANOSIEM_ENCRYPTION_KEY", key);
-    }
-    if let Some(key) = oidc {
-        cmd.env("OIDC_SECRET_KEY", key);
-    }
-    if let Some(key) = jwt {
-        cmd.env("JWT_SECRET", key);
-    }
-    cmd.output().unwrap()
-}
-#[test]
-fn boot_refusal_subprocess_uses_guarded_production_loader() {
-    for key in [
-        None,
-        Some(""),
-        Some("short"),
-        Some("old-16-byte-key!!"),
-        Some("{"),
-        Some("CHANGE_ME_GENERATE_WITH_OPENSSL_RAND_HEX_32"),
-    ] {
-        assert!(!probe("crypto::tests::boot_probe", key, None, None)
-            .status
-            .success());
-    }
-    for key in [ROOT, &config(&[])] {
-        assert!(probe("crypto::tests::boot_probe", Some(key), None, None)
-            .status
-            .success());
-    }
-    let result = probe("crypto::tests::boot_probe", None, Some(ROOT), None);
-    assert!(!result.status.success());
-    let output = String::from_utf8_lossy(&result.stderr);
-    assert!(output.contains("move the existing OIDC_SECRET_KEY value"));
-    assert!(!output.contains(ROOT));
-    let result = probe(
-        "crypto::tests::boot_probe",
-        Some(&config(&[("legacy-0", "nanosiem-default-key-32bytes!!")])),
-        None,
-        None,
-    );
-    assert!(result.status.success());
-    assert!(String::from_utf8_lossy(&result.stdout).contains("PUBLIC DEFAULT"));
-}
-#[test]
-fn jwt_refuses_missing_short_and_public_secrets_in_production_constructor() {
-    for key in [
-        None,
-        Some("short"),
-        Some("nanosiem-dev-secret-change-in-production"),
-        Some("default-dev-jwt-secret-32chars!!"),
-    ] {
-        assert!(!probe("crypto::tests::jwt_boot_probe", None, None, key)
-            .status
-            .success());
-    }
-    assert!(
-        probe("crypto::tests::jwt_boot_probe", None, None, Some(ROOT))
-            .status
-            .success()
-    );
+    assert!(EncryptionService::from_config("too-short").is_err());
 }
 
 #[test]
@@ -375,7 +86,7 @@ fn independent_fixed_legacy_fixtures_open_through_every_storage_adapter() {
         serde_json::from_str(include_str!("legacy-fixtures.json")).unwrap();
     for fixture in fixtures {
         let input = fixture["key_input"].as_str().unwrap();
-        let config = if input.len() < 32 {
+        let config = if input.len() < 32 || keyring::is_public_plain(input) {
             config(&[("legacy-0", input)])
         } else {
             input.to_string()
@@ -400,148 +111,65 @@ fn independent_fixed_legacy_fixtures_open_through_every_storage_adapter() {
         }
     }
 }
+
 #[test]
-fn raw_constructor_cannot_bypass_active_key_validation() {
-    for key in [vec![1; 16], vec![1; 31], vec![1; 33], vec![0; 32]] {
-        assert!(std::panic::catch_unwind(|| EncryptionService::new(&key)).is_err());
-    }
-}
-#[test]
-fn removed_escape_hatch_cannot_enable_public_keys() {
-    for name in ["crypto::tests::boot_probe", "crypto::tests::jwt_boot_probe"] {
-        let result = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--ignored", "--nocapture"])
-            .env_clear()
-            .env("NANOSIEM_ALLOW_DEFAULT_KEYS", "true")
-            .env("NANOSIEM_DEV_MODE", "true")
-            .output()
-            .unwrap();
-        assert!(!result.status.success());
-    }
+fn public_placeholder_never_active_but_readable_as_decrypt_only() {
+    let public = "nanosiem-default-key-32bytes!!";
+    assert!(EncryptionService::from_config(public).is_err());
+    assert!(EncryptionService::from_config("CHANGE_ME_GENERATE_WITH_OPENSSL_RAND_HEX_32").is_err());
+    let old = EncryptionService::new(public.as_bytes())
+        .encrypt(b"dev secret")
+        .unwrap();
+    let ring = EncryptionService::from_config(&config(&[("legacy-0", public)])).unwrap();
+    assert_eq!(ring.decrypt(&old).unwrap(), b"dev secret");
+    // ...and the re-wrap moves it onto the real key.
+    let (fresh, from) = ring.rewrap(&old).unwrap().unwrap();
+    assert_eq!(from, "legacy-0");
+    assert!(EncryptionService::new(public.as_bytes()).decrypt(&fresh).is_err());
+    let bad =
+        config(&[("legacy-0", public)]).replace("\"active\":\"active\"", "\"active\":\"legacy-0\"");
+    assert!(EncryptionService::from_config(&bad).is_err());
 }
 
 #[test]
-fn signature_verifier_uses_recorded_id_and_never_active_fallback() {
-    let old = EncryptionService::from_config(ROOT).unwrap();
-    let sig = old.keyed_mac_sha512(b"ledger", b"message");
-    let cfg = json!({"version":1,"active":"next","keys":[{"id":"next","key":STANDARD.encode(OTHER)},{"id":"legacy-0","key":STANDARD.encode(ROOT)}],"legacy_decrypt_ids":["legacy-0"]});
-    let next = EncryptionService::from_config(&cfg.to_string()).unwrap();
-    assert!(next
-        .verify_mac_sha512("legacy-0", b"ledger", b"message", &sig)
-        .is_ok());
-    for id in ["next", "missing"] {
-        assert!(next
-            .verify_mac_sha512(id, b"ledger", b"message", &sig)
-            .is_err());
+fn parser_refuses_malformed_unbounded_duplicate_or_missing_key_configuration() {
+    for value in ["", "short", "{", "{}"] {
+        assert!(EncryptionService::from_config(value).is_err());
     }
-    assert!(next
-        .verify_mac_sha512("legacy-0", b"other", b"message", &sig)
-        .is_err());
-    assert!(next
-        .verify_mac_sha512("legacy-0", b"ledger", b"changed", &sig)
-        .is_err());
-    assert!(next
-        .verify_mac_sha512("legacy-0", b"ledger", b"message", &sig[..63])
-        .is_err());
-    assert!(next
-        .verify_mac_sha512(
-            next.active_key_id(),
-            b"ledger",
-            b"message",
-            &next.keyed_mac_sha512(b"ledger", b"message")
-        )
-        .is_ok());
-}
-#[cfg(feature = "enterprise")]
-#[test]
-#[ignore = "subprocess control-plane production constructor probe"]
-fn control_boot_probe() {
-    crate::enterprise_shared_platform_ai_provider::encryption_service_from_env().unwrap();
-}
-#[cfg(feature = "enterprise")]
-#[test]
-fn control_boot_constructor_allows_absent_but_refuses_present_invalid() {
-    assert!(
-        probe("crypto::tests::control_boot_probe", None, Some(ROOT), None)
-            .status
-            .success()
-    );
-    assert!(!probe(
-        "crypto::tests::control_boot_probe",
-        Some("short"),
-        None,
-        None
-    )
-    .status
-    .success());
-    assert!(
-        probe("crypto::tests::control_boot_probe", Some(ROOT), None, None)
-            .status
-            .success()
-    );
-}
-
-#[test]
-fn independent_legacy_hmac_vector_remains_verifiable() {
-    let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("legacy-hmac.json")).unwrap();
-    let domain = fixture["domain"].as_str().unwrap().as_bytes();
-    let message = hex::decode(fixture["message_hex"].as_str().unwrap()).unwrap();
-    let expected = hex::decode(fixture["signature_hex"].as_str().unwrap()).unwrap();
-    let cipher = EncryptionService::from_config(ROOT).unwrap();
-    assert_eq!(
-        cipher.keyed_mac_sha512(domain, &message).as_slice(),
-        expected
-    );
-    assert!(cipher
-        .verify_mac_sha512("legacy-0", domain, &message, &expected)
-        .is_ok());
-}
-
-#[test]
-fn duplicate_json_fields_invalid_ids_and_excessive_root_lists_are_rejected() {
-    assert!(EncryptionService::from_config(
-        r#"{"version":1,"version":1,"active":"a","keys":[],"legacy_decrypt_ids":[]}"#
-    )
-    .is_err());
-    for id in ["", "bad:id", &"x".repeat(65)] {
-        let cfg = json!({"version":1,"active":id,"keys":[{"id":id,"key":STANDARD.encode(ROOT)}],"legacy_decrypt_ids":[]});
-        assert!(EncryptionService::from_config(&cfg.to_string()).is_err());
-    }
-    let keys: Vec<_> = (0..33)
-        .map(|i| json!({"id":format!("k{i}"),"key":STANDARD.encode(ROOT)}))
-        .collect();
-    let cfg = json!({"version":1,"active":"k0","keys":keys,"legacy_decrypt_ids":[]});
-    assert!(EncryptionService::from_config(&cfg.to_string()).is_err());
-    for entry in [
-        json!({"id":"active","key":"invalid base64"}),
-        json!({"id":"active","key":STANDARD.encode(ROOT),"legacy":ROOT}),
+    let valid = config(&[]);
+    let value: serde_json::Value = serde_json::from_str(&valid).unwrap();
+    for mutation in [
+        json!({"version":2}),
+        json!({"active":"absent"}),
+        json!({"keys":[]}),
+        json!({"unknown":"secret"}),
+        json!({"legacy_decrypt_ids":["absent"]}),
     ] {
-        let cfg = json!({"version":1,"active":"active","keys":[entry],"legacy_decrypt_ids":[]});
+        let mut bad = value.clone();
+        for (k, v) in mutation.as_object().unwrap() {
+            bad[k] = v.clone();
+        }
+        assert!(EncryptionService::from_config(&bad.to_string()).is_err());
+    }
+    let mut dup = value.clone();
+    dup["keys"] = json!([value["keys"][0].clone(), value["keys"][0].clone()]);
+    assert!(EncryptionService::from_config(&dup.to_string()).is_err());
+    assert!(EncryptionService::from_config(&format!("{{{}", "x".repeat(65537))).is_err());
+    for bytes in [vec![7; 31], vec![7; 33], vec![0; 32]] {
+        let mut bad: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        bad["keys"][0]["key"] = json!(STANDARD.encode(bytes));
+        assert!(EncryptionService::from_config(&bad.to_string()).is_err());
+    }
+    for id in ["", "bad:id", &"x".repeat(65)] {
+        let cfg = json!({"version":1,"active":id,"keys":[{"id":id,"key":STANDARD.encode(ROOT)}]});
         assert!(EncryptionService::from_config(&cfg.to_string()).is_err());
     }
-    let cfg = json!({"version":1,"active":"active","keys":[{"id":"active","key":STANDARD.encode(ROOT)}],"legacy_decrypt_ids":["active","active"]});
-    assert!(EncryptionService::from_config(&cfg.to_string()).is_err());
-}
-#[test]
-fn maximum_existing_bytea_payloads_remain_readable() {
-    let service = EncryptionService::from_config(ROOT).unwrap();
-    for bound in [4096, 16384, 32768, 65536] {
-        let original = vec![b'x'; bound - 16];
-        let data = service.encrypt(&original).unwrap();
-        let (ct, nonce) = data.to_bytea().unwrap();
-        assert_eq!(ct.len(), bound);
-        assert_eq!(
-            service
-                .decrypt(&EncryptedData::from_bytea(&ct, &nonce))
-                .unwrap(),
-            original
-        );
-    }
+    // A renamed historical import is refused.
+    assert!(EncryptionService::from_config(&config(&[("renamed", OTHER)])).is_err());
 }
 
 #[test]
-fn json_looking_legacy_keys_require_explicit_import_and_never_fallback() {
+fn json_looking_legacy_keys_require_explicit_import() {
     let old = "  {historical-key-material-that-looks-like-json";
     assert!(EncryptionService::from_config(old).is_err());
     let ring = EncryptionService::from_config(&config(&[("legacy-0", old)])).unwrap();
@@ -551,20 +179,346 @@ fn json_looking_legacy_keys_require_explicit_import_and_never_fallback() {
     assert_eq!(ring.decrypt(&data).unwrap(), b"historical");
 }
 
+// ---- rotation ------------------------------------------------------------
+
 #[test]
-fn historical_import_cannot_rename_the_signature_key_id() {
-    let valid = config(&[("legacy-0", OTHER)]);
-    let renamed = valid.replace("legacy-0", "renamed");
-    let error = EncryptionService::from_config(&renamed)
+fn mixed_key_rows_all_decrypt_and_report_their_key() {
+    let under_k1 = two_key_ring("k1").encrypt(b"row on k1").unwrap();
+    let under_k2 = two_key_ring("k2").encrypt(b"row on k2").unwrap();
+    let legacy = EncryptionService::from_config(THIRD)
+        .unwrap()
+        .encrypt(b"row on legacy-0")
+        .unwrap();
+    let ring = EncryptionService::from_config(
+        &json!({
+            "version": 1,
+            "active": "k2",
+            "keys": [
+                {"id": "k2", "key": STANDARD.encode(OTHER)},
+                {"id": "k1", "key": STANDARD.encode(ROOT)},
+                {"id": "legacy-0", "legacy": THIRD},
+            ],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for (data, plain, id) in [
+        (&under_k1, &b"row on k1"[..], "k1"),
+        (&under_k2, &b"row on k2"[..], "k2"),
+        (&legacy, &b"row on legacy-0"[..], "legacy-0"),
+    ] {
+        let (opened, key_id) = ring.decrypt_with_key_id(data).unwrap();
+        assert_eq!(opened, plain);
+        assert_eq!(key_id, id);
+    }
+}
+
+#[test]
+fn rotation_rewrap_moves_old_rows_to_active_and_is_idempotent() {
+    let old_ring = two_key_ring("k1");
+    let rows: Vec<_> = (0..5)
+        .map(|i| old_ring.encrypt(format!("secret-{i}").as_bytes()).unwrap())
+        .collect();
+    let new_ring = two_key_ring("k2");
+    for (i, row) in rows.iter().enumerate() {
+        let (fresh, from) = new_ring.rewrap(row).unwrap().expect("old row is re-wrapped");
+        assert_eq!(from, "k1");
+        let (plain, id) = new_ring.decrypt_with_key_id(&fresh).unwrap();
+        assert_eq!(plain, format!("secret-{i}").as_bytes());
+        assert_eq!(id, "k2");
+        // Already on the active key: nothing to do.
+        assert!(new_ring.rewrap(&fresh).unwrap().is_none());
+        // After k1 leaves the ring, the re-wrapped row still opens.
+        let k2_only = EncryptionService::from_config(
+            &json!({"version":1,"active":"k2","keys":[{"id":"k2","key":STANDARD.encode(OTHER)}]})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(k2_only.decrypt(&fresh).unwrap(), format!("secret-{i}").as_bytes());
+    }
+}
+
+#[test]
+fn omitted_legacy_list_means_every_non_active_key_decrypts() {
+    let old = two_key_ring("k1").encrypt(b"x").unwrap();
+    assert_eq!(two_key_ring("k2").decrypt(&old).unwrap(), b"x");
+    // An explicit empty list keeps main's strict meaning: k1 opens only v2.
+    let strict = EncryptionService::from_config(
+        &json!({
+            "version": 1, "active": "k2",
+            "keys": [{"id": "k2", "key": STANDARD.encode(OTHER)}, {"id": "k1", "key": STANDARD.encode(ROOT)}],
+            "legacy_decrypt_ids": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert!(strict.decrypt(&old).is_err());
+    let roles: Vec<_> = strict.ring_keys().into_iter().map(|k| (k.id, k.role)).collect();
+    assert!(roles.contains(&("k1".into(), KeyRole::V2Only)));
+    assert!(roles.contains(&("k2".into(), KeyRole::Active)));
+}
+
+#[test]
+fn wrong_key_fails_closed() {
+    let data = two_key_ring("k1").encrypt(b"secret").unwrap();
+    let wrong = EncryptionService::from_config(THIRD).unwrap();
+    assert!(matches!(wrong.decrypt(&data), Err(CryptoError::InvalidEnvelope)));
+    assert!(wrong.rewrap(&data).is_err());
+    assert!(wrong.decrypt_json::<serde_json::Value>(&data).is_err());
+    // Truncated / bit-flipped legacy ciphertext never yields plaintext.
+    let ring = two_key_ring("k1");
+    let mut bytes = STANDARD.decode(&data.ciphertext).unwrap();
+    bytes[0] ^= 1;
+    assert!(ring
+        .decrypt(&EncryptedData::from_bytea(&bytes, &data.nonce))
+        .is_err());
+    let short_nonce = EncryptedData {
+        ciphertext: data.ciphertext.clone(),
+        nonce: STANDARD.encode(b"short"),
+    };
+    assert!(matches!(ring.decrypt(&short_nonce), Err(CryptoError::InvalidNonce)));
+}
+
+#[test]
+fn fingerprints_identify_material_without_revealing_it() {
+    let a = two_key_ring("k1").ring_keys();
+    let b = two_key_ring("k2").ring_keys();
+    let fp = |keys: &[RingKeyInfo], id: &str| keys.iter().find(|k| k.id == id).unwrap().fingerprint.clone();
+    assert_eq!(fp(&a, "k1"), fp(&b, "k1"));
+    assert_ne!(fp(&a, "k1"), fp(&a, "k2"));
+    assert_eq!(fp(&a, "k1").len(), 16);
+    for key in [&a, &b].into_iter().flatten() {
+        assert!(!key.fingerprint.contains(&hex::encode(ROOT)));
+        assert!(!format!("{key:?}").contains(ROOT));
+    }
+}
+
+#[test]
+fn redacted_debug_and_configuration_errors_never_echo_material() {
+    let secret = "NEVER_PRINT_THIS_MATERIAL";
+    let bad = format!(
+        r#"{{"version":1,"active":"{secret}","keys":[{{"id":"x","key":"{secret}"}}],"legacy_decrypt_ids":[]}}"#
+    );
+    let error = EncryptionService::from_config(&bad)
         .err()
         .unwrap()
         .to_string();
-    assert!(error.contains("legacy-0"));
-    assert!(!error.contains(OTHER));
-    let old = EncryptionService::from_config(OTHER).unwrap();
-    let signature = old.keyed_mac_sha512(b"ledger", b"historical");
-    let ring = EncryptionService::from_config(&valid).unwrap();
-    assert!(ring
-        .verify_mac_sha512("legacy-0", b"ledger", b"historical", &signature)
-        .is_ok());
+    assert!(!error.contains(secret));
+    let data = service().encrypt(secret.as_bytes()).unwrap();
+    assert_eq!(format!("{data:?}"), "EncryptedData([redacted])");
+}
+
+/// `try_from_env` reads only env vars no other test in this binary sets, so
+/// this single sequential test owns them (NAN-1355 gating preserved).
+#[test]
+fn env_loader_gates_default_key_and_reads_ring_json() {
+    fn save(k: &str) -> Option<String> {
+        std::env::var(k).ok()
+    }
+    let names = [
+        "NANOSIEM_ENCRYPTION_KEY",
+        "NANOSIEM_ENCRYPTION_KEY_FILE",
+        "OIDC_SECRET_KEY",
+        "NANOSIEM_ALLOW_DEFAULT_KEYS",
+        "NANOSIEM_DEV_MODE",
+    ];
+    let saved: Vec<_> = names.iter().map(|k| (*k, save(k))).collect();
+    for k in names {
+        std::env::remove_var(k);
+    }
+
+    // dev-mode alone never unlocks the public key.
+    std::env::set_var("NANOSIEM_DEV_MODE", "true");
+    assert!(EncryptionService::try_from_env().is_err());
+    // allow-default-keys does, and writes stay readable by the old reader.
+    std::env::set_var("NANOSIEM_ALLOW_DEFAULT_KEYS", "true");
+    let dev = EncryptionService::try_from_env().unwrap();
+    let ct = dev.encrypt(b"secret").unwrap();
+    assert_eq!(
+        EncryptionService::new(PUBLIC_DEV_KEY).decrypt(&ct).unwrap(),
+        b"secret"
+    );
+    std::env::remove_var("NANOSIEM_ALLOW_DEFAULT_KEYS");
+
+    // Deprecated OIDC fallback still loads an existing install.
+    std::env::set_var("OIDC_SECRET_KEY", ROOT);
+    assert_eq!(EncryptionService::try_from_env().unwrap().active_key_id(), LEGACY_ID);
+    std::env::remove_var("OIDC_SECRET_KEY");
+
+    // Ring JSON from a file (trailing newline ignored).
+    let dir = std::env::temp_dir().join(format!("nan4933-ring-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ring.json");
+    std::fs::write(&path, format!("{}\n", config(&[("legacy-0", OTHER)]))).unwrap();
+    std::env::set_var("NANOSIEM_ENCRYPTION_KEY_FILE", &path);
+    let ring = EncryptionService::try_from_env().unwrap();
+    assert_eq!(ring.active_key_id(), "active");
+    let old = EncryptionService::new(OTHER.as_bytes()).encrypt(b"o").unwrap();
+    assert_eq!(ring.decrypt(&old).unwrap(), b"o");
+    std::fs::remove_dir_all(&dir).ok();
+
+    for (k, v) in saved {
+        match v {
+            Some(val) => std::env::set_var(k, val),
+            None => std::env::remove_var(k),
+        }
+    }
+}
+
+// ---- v2 envelopes (compatible readers, ported from main CP2a) ------------
+
+#[test]
+fn all_storage_adapters_preserve_key_id_and_context() {
+    let service = tenant();
+    let value = service.seal_v2(br#"{"token":"value"}"#).unwrap();
+    let (bytes, nonce) = value.to_bytea().unwrap();
+    let b = EncryptedData::from_bytea(&bytes, &nonce);
+    let j = EncryptedData::from_json_bytes(&value.to_json_bytes().unwrap()).unwrap();
+    let t = EncryptedData::from_text_bytea(value.ciphertext.as_bytes(), &nonce).unwrap();
+    let (raw, nonce, version) = value.to_raw_nonce().unwrap();
+    assert_eq!(version, 2);
+    let d = EncryptedData::from_raw_nonce(&raw, &nonce, version).unwrap();
+    for data in [b, j, t, d] {
+        assert_eq!(
+            service
+                .decrypt_credentials_bytea(&data.to_bytea().unwrap().0, &data.nonce)
+                .unwrap()["token"],
+            "value"
+        );
+        assert_eq!(v2_key_id(&data).unwrap(), "active");
+    }
+    assert!(EncryptedData::from_raw_nonce(&raw, &nonce, 3).is_err());
+    assert!(EncryptedData::from_raw_nonce(&raw, &nonce[..11], 2).is_err());
+    // A context-bound v2 envelope is never re-wrapped context-free.
+    assert!(service.rewrap(&value).unwrap().is_none());
+}
+
+#[test]
+fn different_scopes_cannot_open_each_others_v2_data() {
+    let a = tenant();
+    let b = service().with_context(
+        CredentialScope::Tenant(Uuid::from_u128(2)),
+        "connector.vendor",
+        "feed-1",
+    );
+    assert!(b.decrypt(&a.seal_v2(b"tenant secret").unwrap()).is_err());
+    let platform = service().with_context(CredentialScope::Platform, "ai.provider", "provider");
+    let data = platform.seal_v2(b"platform").unwrap();
+    for scope in [
+        CredentialScope::Tenant(Uuid::from_u128(1)),
+        CredentialScope::Account(Uuid::from_u128(1)),
+        CredentialScope::Deployment,
+    ] {
+        assert!(service().with_context(scope, "ai.provider", "provider").decrypt(&data).is_err());
+    }
+    assert!(service().decrypt(&data).is_err());
+    assert!(service()
+        .with_context(CredentialScope::Tenant(Uuid::nil()), "purpose", "row")
+        .seal_v2(b"x")
+        .is_err());
+}
+
+#[test]
+fn v2_tampering_and_format_downgrades_fail_closed() {
+    let service = tenant();
+    let data = service.seal_v2(b"value").unwrap();
+    let original = STANDARD.decode(&data.ciphertext).unwrap();
+    for index in 0..original.len() {
+        let mut bytes = original.clone();
+        bytes[index] ^= 1;
+        assert!(service
+            .decrypt(&EncryptedData::from_bytea(&bytes, &data.nonce))
+            .is_err());
+    }
+    let mut changed = data.clone();
+    changed.nonce = changed.nonce.replace("nck2:", "");
+    assert!(service.decrypt(&changed).is_err());
+    changed.nonce = data.nonce.replace("nck2:", "nck3:");
+    assert!(service.decrypt(&changed).is_err());
+}
+
+#[test]
+fn retired_v2_roots_remain_readable_while_in_ring() {
+    let old = tenant();
+    let a = old.seal_v2(b"secret").unwrap();
+    let cfg = json!({"version":1,"active":"next","keys":[{"id":"next","key":STANDARD.encode(OTHER)},{"id":"active","key":STANDARD.encode(ROOT)}],"legacy_decrypt_ids":[]});
+    let next = EncryptionService::from_config(&cfg.to_string())
+        .unwrap()
+        .with_context(
+            CredentialScope::Tenant(Uuid::from_u128(1)),
+            "connector.vendor",
+            "feed-1",
+        );
+    assert_eq!(next.decrypt(&a).unwrap(), b"secret");
+    let reader = V2CredentialReader::from_root("active", ROOT.as_bytes()).unwrap();
+    assert_eq!(
+        &*reader
+            .open(CredentialScope::Tenant(Uuid::from_u128(1)), "connector.vendor", "feed-1", &a)
+            .unwrap(),
+        b"secret"
+    );
+}
+
+// ---- rotation inventory ----------------------------------------------------
+
+/// Every column that stores `EncryptionService` output must be a re-wrap
+/// target, or rotation silently strands it. A new secret column fails here
+/// until it is added to `rotation::TARGETS`.
+#[test]
+fn rotation_targets_cover_every_encrypted_column() {
+    let expected = [
+        "cloud_credentials.credentials_encrypted",
+        "cloud_credential_versions.credentials_encrypted",
+        "marketplace_catalog.credentials_encrypted",
+        "system_settings.tiering_s3_credentials_encrypted",
+        "detection_code_targets.token_encrypted",
+        "users.totp_secret_encrypted",
+        "users.backup_codes_encrypted",
+        "integration_instances.credentials_encrypted",
+        "soar_connections.credentials_encrypted",
+        "oidc_providers.client_secret_encrypted",
+        "oidc_providers.google_service_account_encrypted",
+        "provider_credentials.credentials_encrypted",
+        "agent_enrichment_providers.api_key_encrypted",
+        "identity_providers.credentials_encrypted",
+        "webhooks.url_encrypted",
+        "webhooks.headers_encrypted",
+        "webhooks.secret_encrypted",
+    ];
+    let names: Vec<_> = rotation::TARGETS.iter().map(|t| t.name).collect();
+    assert_eq!(names, expected);
+    for target in rotation::TARGETS {
+        assert_eq!(target.name, format!("{}.{}", target.table, target.column));
+    }
+}
+
+// ---- key policy (Dan, 2026-11-03) -----------------------------------------
+
+#[test]
+fn short_pre_ring_key_stays_active_but_carries_a_visible_warning() {
+    let ring = EncryptionService::from_config("old-16-byte-key!!").unwrap();
+    let keys = ring.ring_keys();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].role, KeyRole::Active);
+    let warning = keys[0].warning.as_deref().expect("short key is flagged");
+    assert!(warning.contains("shorter than 32 bytes"));
+    assert!(!warning.contains("old-16-byte-key"), "warning never echoes material");
+    // Full-length keys carry no warning.
+    assert!(EncryptionService::from_config(ROOT).unwrap().ring_keys()[0].warning.is_none());
+    assert!(two_key_ring("k1").ring_keys().iter().all(|k| k.warning.is_none()));
+    // A short import kept as decrypt-only during rotation stays flagged.
+    let rotated = EncryptionService::from_config(&config(&[("legacy-0", "old-16-byte-key!!")])).unwrap();
+    assert!(rotated.ring_keys().iter().any(|k| k.id == "legacy-0" && k.warning.is_some()));
+}
+
+#[test]
+fn every_new_ring_key_must_be_exactly_32_bytes() {
+    for bytes in [vec![9u8; 16], vec![9u8; 24], vec![9u8; 31], vec![9u8; 33]] {
+        let cfg = json!({"version":1,"active":"next","keys":[{"id":"next","key":STANDARD.encode(&bytes)}]});
+        let error = EncryptionService::from_config(&cfg.to_string()).err().expect("refused").to_string();
+        assert!(error.contains("exactly 32 bytes"), "{error}");
+    }
+    // A short key cannot be smuggled in as a new active `legacy` entry either.
+    let cfg = json!({"version":1,"active":"legacy-0","keys":[{"id":"legacy-0","legacy":"old-16-byte-key!!"}]});
+    assert!(EncryptionService::from_config(&cfg.to_string()).is_err());
 }

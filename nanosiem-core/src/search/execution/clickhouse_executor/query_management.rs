@@ -173,8 +173,6 @@ impl ClickHouseExecutor {
                 };
 
                 return Ok(Some(crate::search::jobs::SearchJobProgress {
-                    phase: None,
-                    attempt: None,
                     rows_scanned,
                     rows_total,
                     percent,

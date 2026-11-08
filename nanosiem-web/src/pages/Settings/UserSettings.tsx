@@ -20,7 +20,6 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Link as RouterLink, useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
 import { useResetOnboarding } from '@/hooks/use-api';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { Button } from '@/components/ui/button';
@@ -73,9 +72,9 @@ import {
 } from '@/contexts/UserPreferencesContext';
 import { api } from '@/lib/api';
 import type { MfaStatusResponse, MfaSetupResponse } from '@/lib/api/types';
-import { PendingTenantInvitations } from '@/components/settings/PendingTenantInvitations';
 import { cn } from '@/lib/utils';
 import { THEMES, THEME_LABELS, type Theme } from '@/lib/theme';
+import { ThemeSwatches } from '@/components/ui/theme-swatches';
 import { Checkbox } from '@/components/ui/checkbox';
 
 type MfaStep = 'idle' | 'scan' | 'verify' | 'backup';
@@ -364,14 +363,6 @@ export function UserSettings() {
     }
   }, [resetOnboarding, navigate, toast]);
   const canSql = hasPermission('search:sql');
-  const { data: activeSchema } = useQuery({
-    queryKey: ['schema-fields'],
-    queryFn: () => api.getSchemaFields(),
-    staleTime: Infinity,
-    gcTime: Infinity,
-  });
-  const strictOcsf = activeSchema?.schema === 'ocsf';
-  const canRawSql = canSql && !strictOcsf;
   const {
     queryMode,
     setQueryMode,
@@ -656,9 +647,6 @@ export function UserSettings() {
         </nav>
       </div>
 
-      {/* Hosted-shared: invitations from other organizations (NAN-2361 wave 5) */}
-      <PendingTenantInvitations />
-
       {/* General + Query Mode */}
       <div className="grid grid-cols-1 lg:grid-cols-[1.05fr_1fr] gap-5 items-start">
         {/* GENERAL */}
@@ -759,6 +747,7 @@ export function UserSettings() {
           </Row>
 
           <Row label="Theme" desc="Choose a theme, or follow your system setting.">
+            <div className="flex w-[200px] flex-col items-end gap-3">
             <Select
               value={theme || 'system'}
               onValueChange={(v) => {
@@ -806,6 +795,11 @@ export function UserSettings() {
                 </SelectItem>
               </SelectContent>
             </Select>
+            {/* The swatch row lives here, outside any menu, where its buttons
+                are reachable by Tab and arrow keys. The user menu uses radio
+                items instead (components/layout/ThemeMenu.tsx). */}
+            <ThemeSwatches />
+            </div>
           </Row>
 
           <Row
@@ -838,7 +832,7 @@ export function UserSettings() {
 
           <div className="p-4 space-y-3">
             <QueryModeOption
-              active={queryMode === 'standard' || strictOcsf}
+              active={queryMode === 'standard'}
               onSelect={() => handleQueryModeChange('standard')}
               icon={<Terminal className="w-[14px] h-[14px]" />}
               title="Standard (nPL)"
@@ -856,23 +850,21 @@ export function UserSettings() {
               ]}
             />
             <QueryModeOption
-              active={queryMode === 'advanced' && !strictOcsf}
+              active={queryMode === 'advanced'}
               onSelect={() => handleQueryModeChange('advanced')}
-              disabled={!canRawSql}
+              disabled={!canSql}
               icon={<Database className="w-[14px] h-[14px]" />}
               title="Advanced (SQL)"
               badge={
-                !canRawSql ? (
+                !canSql ? (
                   <span className="inline-flex items-center gap-1 text-[10px] font-mono text-muted-foreground">
                     <Lock className="w-[10px] h-[10px]" />
-                    {strictOcsf ? 'unavailable' : 'locked'}
+                    locked
                   </span>
                 ) : undefined
               }
               desc={
-                strictOcsf
-                  ? 'Raw SQL is intentionally unavailable on the tenant-pinned OCSF lake path. nPL retains the full scoped query and durable-job contract.'
-                  : canSql
+                canSql
                   ? 'Full ClickHouse SQL power including window functions, CTEs, and complex JOINs.'
                   : 'Requires the search:sql permission. Contact your administrator.'
               }

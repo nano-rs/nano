@@ -41,8 +41,7 @@ impl PlaybookRepoRepository {
         repo: &NewPlaybookRepository,
         created_by: Option<Uuid>,
     ) -> Result<PlaybookRepository, PlaybookRepoRepositoryError> {
-        let slug =
-            crate::db::repo_store::slug_from_url(&repo.url, &repo.name, repo.slug.as_deref());
+        let slug = crate::db::repo_store::slug_from_url(&repo.url, &repo.name, repo.slug.as_deref());
 
         let result = sqlx::query_as::<_, PlaybookRepository>(
             r#"
@@ -95,6 +94,14 @@ impl PlaybookRepoRepository {
         crate::db::repo_store::list(&self.pool, "playbook_repositories").await
     }
 
+    /// Enabled, auto-sync repositories past their `sync_interval_hours`
+    /// (NAN-4947: the leader's playbook repository sync scheduler).
+    pub async fn list_for_auto_sync(
+        &self,
+    ) -> Result<Vec<PlaybookRepository>, PlaybookRepoRepositoryError> {
+        crate::db::repo_store::list_for_auto_sync(&self.pool, "playbook_repositories").await
+    }
+
     pub async fn update(
         &self,
         id: Uuid,
@@ -122,12 +129,7 @@ impl PlaybookRepoRepository {
         .bind(update.name.as_ref().unwrap_or(&repo.name))
         .bind(update.description.as_ref().or(repo.description.as_ref()))
         .bind(update.branch.as_ref().unwrap_or(&repo.branch))
-        .bind(
-            update
-                .playbooks_path
-                .as_ref()
-                .or(repo.playbooks_path.as_ref()),
-        )
+        .bind(update.playbooks_path.as_ref().or(repo.playbooks_path.as_ref()))
         .bind(update.auto_sync_enabled.or(repo.auto_sync_enabled))
         .bind(update.sync_interval_hours.or(repo.sync_interval_hours))
         .bind(update.enabled.or(repo.enabled))
@@ -210,6 +212,39 @@ impl RepositoryPlaybooksRepository {
         parse_error: Option<&str>,
         step_count: Option<i32>,
     ) -> Result<RepositoryPlaybook, RepositoryPlaybooksRepositoryError> {
+        Self::upsert_with(
+            &self.pool, repository_id, file_path, file_sha, raw_content, kind, title, subtitle,
+            category, match_signals, tags, owner_team, authored_date, danger_policy,
+            review_cadence, scope, parse_status, parse_error, step_count,
+        )
+        .await
+    }
+
+    /// [`Self::upsert`] on any executor (NAN-4947: the fenced sync applies
+    /// every write in one transaction).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_with<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        repository_id: Uuid,
+        file_path: &str,
+        file_sha: Option<&str>,
+        raw_content: &str,
+        // From the file's own frontmatter. Never derived from `file_path`.
+        kind: &str,
+        title: Option<&str>,
+        subtitle: Option<&str>,
+        category: Option<&str>,
+        match_signals: Option<&[String]>,
+        tags: Option<&[String]>,
+        owner_team: Option<&str>,
+        authored_date: Option<NaiveDate>,
+        danger_policy: Option<&serde_json::Value>,
+        review_cadence: Option<&str>,
+        scope: Option<&str>,
+        parse_status: &str,
+        parse_error: Option<&str>,
+        step_count: Option<i32>,
+    ) -> Result<RepositoryPlaybook, RepositoryPlaybooksRepositoryError> {
         let result = sqlx::query_as::<_, RepositoryPlaybook>(
             r#"
             INSERT INTO repository_playbooks (
@@ -219,7 +254,7 @@ impl RepositoryPlaybooksRepository {
                 parse_status, parse_error, step_count
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-            ON CONFLICT ON CONSTRAINT repository_playbooks_repository_id_file_path_key DO UPDATE SET
+            ON CONFLICT (repository_id, file_path) DO UPDATE SET
                 file_sha = EXCLUDED.file_sha,
                 raw_content = EXCLUDED.raw_content,
                 kind = EXCLUDED.kind,
@@ -258,7 +293,7 @@ impl RepositoryPlaybooksRepository {
         .bind(parse_status)
         .bind(parse_error)
         .bind(step_count)
-        .fetch_one(&self.pool)
+        .fetch_one(executor)
         .await?;
         Ok(result)
     }
@@ -305,8 +340,7 @@ impl RepositoryPlaybooksRepository {
         }
         if let Some(ref s) = filter.search {
             let pattern = format!("%{}%", s);
-            qb.push(" AND (COALESCE(title, '') ILIKE ")
-                .push_bind(pattern.clone());
+            qb.push(" AND (COALESCE(title, '') ILIKE ").push_bind(pattern.clone());
             qb.push(" OR file_path ILIKE ").push_bind(pattern);
             qb.push(")");
         }

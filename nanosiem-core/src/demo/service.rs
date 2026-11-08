@@ -15,7 +15,6 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::auth::{
-    permissions::DEMO_PERMISSIONS,
     repository::{SessionRepository, UserRepository},
     service::hash_token,
     types::{AuthResponse, CreateUserRequest, LandingPage, QueryMode, TimeRangePreset, UserInfo},
@@ -226,7 +225,7 @@ impl DemoService {
 
         // Issue tokens with demo permissions
         let roles = vec!["demo_analyst".to_string()];
-        let permissions: Vec<String> = DEMO_PERMISSIONS.iter().map(|s| s.to_string()).collect();
+        let permissions: Vec<String> = crate::auth::permissions::demo_permissions();
 
         let token_pair = self
             .token_service
@@ -238,16 +237,9 @@ impl DemoService {
         // rotate it.  Without this, demo users get logged out when the
         // access token expires (~15 min) because the refresh silently fails.
         let refresh_token_hash = hash_token(&token_pair.refresh_token);
-        let session_expires_at =
-            Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
+        let session_expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
         self.session_repo
-            .create_session(
-                user.id,
-                &refresh_token_hash,
-                ip_address,
-                user_agent,
-                session_expires_at,
-            )
+            .create_session(user.id, &refresh_token_hash, ip_address, user_agent, session_expires_at)
             .await
             .map_err(|e| DemoError::UserError(format!("session creation failed: {e}")))?;
 
@@ -307,7 +299,7 @@ impl DemoService {
 
         // Issue tokens
         let roles = vec!["demo_analyst".to_string()];
-        let permissions: Vec<String> = DEMO_PERMISSIONS.iter().map(|s| s.to_string()).collect();
+        let permissions: Vec<String> = crate::auth::permissions::demo_permissions();
 
         let token_pair = self
             .token_service
@@ -316,15 +308,11 @@ impl DemoService {
 
         // Clean up any previous auth sessions for this user (re-claims
         // would otherwise stack orphan rows until the 7-day TTL expires)
-        let _ = self
-            .session_repo
-            .delete_user_sessions(session.user_id)
-            .await;
+        let _ = self.session_repo.delete_user_sessions(session.user_id).await;
 
         // Create a session row so the standard refresh_token flow works
         let refresh_token_hash = hash_token(&token_pair.refresh_token);
-        let session_expires_at =
-            Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
+        let session_expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
         self.session_repo
             .create_session(
                 session.user_id,

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Getting Started checklist probes for a dedicated deployment (open core,
-//! sovereign single-host, dedicated hosted) — NAN-4779.
+//! Getting Started checklist probes (NAN-4779, ported to the ClickHouse
+//! product by NAN-4912).
 //!
 //! Each probe answers "has the operator done this step?" from a row the
 //! matching settings page or wizard actually writes, and ignores rows that
 //! migrations seed on every fresh install. Before NAN-4779:
 //! - `has_users` counted the seeded `system-ai` service account, so the Team
 //!   step was checked on a fresh install;
-//! - `has_log_sources` counted the seeded OpenTelemetry log source (migration
-//!   315), so the Log Source step was checked on a fresh install;
+//! - `has_log_sources` counted any seeded log source (none ships on the
+//!   ClickHouse product today, migration 113 removed the old seeds; the list
+//!   below keeps a future seed from re-checking the step);
 //! - `has_parsers` read only `parser_imports`, which only a parser-repository
 //!   import writes. The Add data wizard stores the parser it builds as
 //!   `log_sources.parser_vrl`, and nano no longer bundles parsers, so the Log
@@ -28,10 +29,7 @@ use super::types::OnboardingStatus;
 /// Log sources migrations seed on every install. They are platform plumbing,
 /// not something the operator connected, so they never satisfy a step.
 /// `log_sources.name` is UNIQUE, so the name pins the exact seeded row.
-pub const PLATFORM_SEEDED_LOG_SOURCES: &[&str] = &[
-    // migrations/postgres/315_seed_otlp_log_ocsf_parser.sql
-    "OpenTelemetry Logs (OCSF)",
-];
+pub const PLATFORM_SEEDED_LOG_SOURCES: &[&str] = &[];
 
 /// Any guidance field the AI Guidance tab can save counts as configured.
 pub const ORG_CONTEXT_CONFIGURED_SQL: &str =
@@ -78,7 +76,7 @@ pub struct DedicatedProbeInputs {
     pub ai_available: bool,
     /// The in-process meloD service is loaded (AI is live right now).
     pub ai_service_loaded: bool,
-    /// The build ships SSO; `oidc_providers` only exists under the enterprise overlay.
+    /// The deployment can configure SSO (`oidc_providers` exists).
     pub sso_available: bool,
 }
 

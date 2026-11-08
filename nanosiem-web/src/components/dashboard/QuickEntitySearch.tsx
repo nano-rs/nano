@@ -7,98 +7,47 @@
  * Navigates to the search page with a pre-filled query.
  */
 
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Search, ArrowRight } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
-import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
-import type { SchemaFieldsResponse } from '@/lib/api/types';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import { buildMultiFieldFilter, type SchemaProfileId, type SemanticField } from '@/lib/schema-fields';
 
-// UDM defaults for each detection bucket. Under UDM (or when the schema response
-// is unavailable) these are used verbatim so the generated nPL is byte-identical
-// to the pre-OCSF behavior (NAN-1241).
-const UDM_IP_FIELDS = ['src_ip', 'dest_ip'] as const;
-const UDM_EMAIL_FIELDS = ['user', 'email'] as const;
-const UDM_HOSTNAME_FIELDS = ['src_host', 'dest_host', 'domain'] as const;
-const UDM_GENERIC_FIELDS = ['user', 'src_host', 'dest_host'] as const;
+// Concepts searched for each detection bucket (NAN-4903: resolved through the
+// profile-aware field map, so OCSF installs hit `src_endpoint.ip`, …).
+const IP_KEYS: readonly SemanticField[] = ['srcIp', 'destIp'];
+const EMAIL_KEYS: readonly SemanticField[] = ['user', 'email'];
+const HOSTNAME_KEYS: readonly SemanticField[] = ['srcHost', 'destHost', 'domain'];
+const GENERIC_KEYS: readonly SemanticField[] = ['user', 'srcHost', 'destHost'];
 
-/** Collect the active schema's column names for the given backend entity types,
- *  in manifest order, deduped. Empty when the schema is UDM / unavailable. */
-function schemaFieldsForEntities(
-  schemaFields: SchemaFieldsResponse | undefined,
-  entityTypes: readonly string[],
-  extraCategories: readonly string[] = [],
-): string[] {
-  if (!schemaFields || schemaFields.schema === 'udm') return [];
-  const wantEntity = new Set(entityTypes);
-  const wantCategory = new Set(extraCategories);
-  const out: string[] = [];
-  for (const f of schemaFields.fields) {
-    const hit =
-      (f.entity_type != null && wantEntity.has(f.entity_type)) ||
-      wantCategory.has(f.category);
-    if (hit && !out.includes(f.name)) out.push(f.name);
+
+/** Classify the input (IP / email / hostname / generic) and build the nPL. */
+export function buildEntitySearchQuery(profile: SchemaProfileId, input: string): string {
+  const trimmed = input.trim();
+  if (/^[\d.]+$/.test(trimmed) || (trimmed.includes(':') && !trimmed.includes(' '))) {
+    return buildMultiFieldFilter(profile, IP_KEYS, trimmed);
   }
-  return out;
-}
-
-/** Build an OR-clause over `fields` for `value`; UDM `fallback` when the schema
- *  contributes nothing (keeps UDM output byte-identical). */
-function orClause(fields: string[], fallback: readonly string[], value: string): string {
-  const cols = fields.length > 0 ? fields : fallback;
-  return cols.map((c) => `${c} = "${value}"`).join(' OR ');
+  if (trimmed.includes('@')) return buildMultiFieldFilter(profile, EMAIL_KEYS, trimmed);
+  if (trimmed.includes('.') && !trimmed.includes(' ')) return buildMultiFieldFilter(profile, HOSTNAME_KEYS, trimmed);
+  return buildMultiFieldFilter(profile, GENERIC_KEYS, trimmed);
 }
 
 export function QuickEntitySearch() {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
-  const { schemaFields } = useSchemaEntityMap();
+  // NAN-4903: no query is built until the tenant's schema profile is known.
+  const { profile, ready, guard, unresolvedReason } = useSchemaFieldMap();
 
-  // Schema-correct field sets per detection bucket. Empty arrays under UDM →
-  // orClause() falls back to the UDM_* defaults (byte-identical). Under OCSF
-  // these resolve to the promoted columns (`src_endpoint.ip`, `url.hostname`,
-  // `email.from`, …) so the generated nPL hits real columns instead of silently
-  // empty UDM names.
-  const ipFields = useMemo(() => schemaFieldsForEntities(schemaFields, ['ip']), [schemaFields]);
-  const emailFields = useMemo(
-    () => schemaFieldsForEntities(schemaFields, ['user'], ['Email']),
-    [schemaFields],
-  );
-  const hostnameFields = useMemo(
-    () => schemaFieldsForEntities(schemaFields, ['host', 'domain']),
-    [schemaFields],
-  );
-  const genericFields = useMemo(
-    () => schemaFieldsForEntities(schemaFields, ['user', 'host']),
-    [schemaFields],
-  );
-
+  const runSearch = guard(() => {
+    const searchQuery = buildEntitySearchQuery(profile, query);
+    navigate(`/search#q=${encodeURIComponent(searchQuery)}`);
+  });
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
     if (!query.trim()) return;
-
-    // Build a search query based on the input
-    // Detect if it's an IP, email, or generic term
-    const trimmed = query.trim();
-    let searchQuery = '';
-
-    if (/^[\d.]+$/.test(trimmed) || (trimmed.includes(':') && !trimmed.includes(' '))) {
-      // Looks like an IP address (v4 or v6)
-      searchQuery = orClause(ipFields, UDM_IP_FIELDS, trimmed);
-    } else if (trimmed.includes('@')) {
-      // Looks like an email
-      searchQuery = orClause(emailFields, UDM_EMAIL_FIELDS, trimmed);
-    } else if (trimmed.includes('.') && !trimmed.includes(' ')) {
-      // Looks like a hostname/domain
-      searchQuery = orClause(hostnameFields, UDM_HOSTNAME_FIELDS, trimmed);
-    } else {
-      // Generic search - could be username or anything
-      searchQuery = orClause(genericFields, UDM_GENERIC_FIELDS, trimmed);
-    }
-
-    // Navigate to search with the query
-    navigate(`/search#q=${encodeURIComponent(searchQuery)}`);
+    runSearch();
   };
 
   return (
@@ -115,7 +64,8 @@ export function QuickEntitySearch() {
       </div>
       <Button
         type="submit"
-        disabled={!query.trim()}
+        disabled={!query.trim() || !ready}
+        title={unresolvedReason ?? undefined}
         className="bg-primary hover:bg-primary/90 rounded-xl h-11 px-4"
       >
         <ArrowRight className="w-4 h-4" />

@@ -18,7 +18,7 @@ vi.mock('@/components/matches/MatchesHero', () => ({ MatchesHero: () => null }))
 vi.mock('@/components/matches/MatchesList', () => ({ MatchesList: () => null }));
 vi.mock('@/components/matches/LogicTab', () => ({ LogicTab: () => null }));
 vi.mock('@/components/matches/MatchesDetail', () => ({ MatchesDetail: ({ view, onRunRuleQuery }: any) => <button onClick={() => onRunRuleQuery(view)}>Run rule query</button> }));
-function Location() { return <output>{useLocation().search}</output>; }
+function Location() { return <output>{useLocation().hash.slice(1)}</output>; }
 it('runs the complete ops rule verbatim over the contributing-event window', () => {
   render(<MemoryRouter initialEntries={['/rules/r/matches']}><Routes><Route path="/rules/:id/matches" element={<Matches />} /><Route path="/search" element={<Location />} /></Routes></MemoryRouter>);
   fireEvent.click(screen.getByRole('button', { name: 'Run rule query' }));

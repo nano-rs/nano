@@ -115,7 +115,6 @@ pub async fn get_mitre_data(
         (status = 200, description = "MITRE data synced successfully", body = SyncResponse),
         (status = 403, description = "Forbidden - Missing permission: mitre:sync"),
         (status = 409, description = "A MITRE sync is already running"),
-        (status = 503, description = "Outbound synchronization is disabled"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -133,28 +132,6 @@ pub async fn sync_mitre_data(
     let expected_release = sync.release().to_string();
     let expected_source_url = sync.source_url().to_string();
     let expected_source_sha256 = sync.source_sha256().to_string();
-
-    if !state.config.egress_jobs_enabled() {
-        state.emit_audit(
-            AuditEvent::builder(AuditSource::Mitre, MITRE_CATALOG_SYNCED)
-                .actor(Some(auth.user_id()), None)
-                .api_key(auth.api_key_id, auth.api_key_name.clone())
-                .resource("mitre_catalog", None, Some(expected_release.clone()))
-                .client_context(&client)
-                .success(false)
-                .details(serde_json::json!({
-                    "release": expected_release,
-                    "source_url": expected_source_url,
-                    "source_sha256": expected_source_sha256,
-                    "result": "egress_disabled",
-                }))
-                .build(),
-        );
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Outbound MITRE catalog synchronization is disabled".to_string(),
-        ));
-    }
 
     match sync.sync().await {
         Ok(MitreSyncOutcome::Synced(result)) => {
@@ -414,7 +391,7 @@ pub struct QuarantineResponse {
 
 /// List detection-rule MITRE mappings dropped by a catalog sync.
 ///
-/// before this endpoint existed the quarantine table had no reader at
+/// NAN-1918: before this endpoint existed the quarantine table had no reader at
 /// all, so a sync that renumbered techniques destroyed rule mappings with no
 /// operator-visible trace beyond a log line carrying a bare count.
 #[utoipa::path(

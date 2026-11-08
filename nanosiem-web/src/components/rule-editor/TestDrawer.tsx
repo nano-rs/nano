@@ -38,9 +38,10 @@ import type { TestDetectionResult, TimeRange } from '@/lib/api/types';
 import { toApiTimeRange, type TimeRangeValue } from '@/hooks/use-api';
 import { QueryEditor } from '@/components/editor';
 import { isClickHouseDefault } from '@/lib/utils';
-import { eventFieldValue } from '@/lib/event-field-access';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import { SEMANTIC_FIELDS, type SemanticField } from '@/lib/schema-fields';
 // Reuse the Matches extractors so rows + detail pane pick the same canonical
-// semantics (activity / entity / IP / region / time) as `/rules/:id/matches`.
+// fields (action / entity / src_ip / region / timestamp) as `/rules/:id/matches`.
 import {
   extractAction,
   extractEntity,
@@ -51,53 +52,46 @@ import {
 
 // Mirror `components/matches/EventViewer.PREVIEW_KEYS` so TestDrawer rows pick
 // the same first-N non-empty fields the /rules/:id/matches page surfaces.
-// Keep this list in sync with that one — any change there should land here too.
-const PREVIEW_KEYS = [
-  'actor.user.name',
-  'user.name',
-  'device.hostname',
-  'src_endpoint.ip',
-  'dst_endpoint.ip',
-  'src_endpoint.hostname',
-  'dst_endpoint.hostname',
-  'activity_name',
-  'action',
-  'status',
-  'http_request.http_method',
-  'http_request.url.url_string',
-  'http_response.code',
-  'actor.process.name',
-  'actor.process.cmd_line',
-  'process.name',
-  'process.cmd_line',
-  'file.hashes.value',
-  'file.name',
-  'file.path',
-  // Retiring UDM / vendor payload tail.
-  'user',
-  'src_ip',
-  'dest_ip',
-  'src_host',
-  'dest_host',
-  'http_method',
-  'http_status_code',
-  'status_code',
-  'url',
-  'event_type',
-  'event_id',
-  'process_name',
-  'command_line',
-  'file_hash',
-  'file_path',
-  'eventName',
-  'sourceIPAddress',
-  'source_type',
+// NAN-4903: built from the profile-aware field map — the UDM columns first, then
+// the OCSF columns of the same concepts (a row carries one shape or the other,
+// so each profile's preview keeps its order).
+const PREVIEW_CONCEPTS: readonly SemanticField[] = [
+  'user', 'srcIp', 'destIp', 'srcHost', 'destHost', 'httpMethod', 'httpStatus',
+  'url', 'eventType', 'processName', 'fileHash', 'filePath',
 ];
+const PREVIEW_KEYS: readonly string[] = (() => {
+  const out: string[] = [];
+  const add = (c: string) => { if (!out.includes(c)) out.push(c); };
+  for (const k of PREVIEW_CONCEPTS) {
+    add(SEMANTIC_FIELDS[k].udm[0]);
+    if (k === 'httpStatus') add('status_code');
+    if (k === 'eventType') add('event_id');
+  }
+  for (const k of [...PREVIEW_CONCEPTS, 'parentProcessName', 'fileName'] as SemanticField[]) {
+    for (const c of SEMANTIC_FIELDS[k].ocsf) add(c);
+  }
+  // CloudTrail raw keys + the routing key.
+  add('eventName');
+  add('sourceIPAddress');
+  add('source_type');
+  return out;
+})();
 const PREVIEW_MAX = 5;
 const FIELD_PREVIEW_MAX = 260;
 
 function getFieldValue(event: Record<string, unknown>, field: string): string {
-  const v = eventFieldValue(event, field);
+  // Promoted OCSF columns arrive as FLAT dotted keys (`src_endpoint.ip`), so
+  // try the literal key before walking a nested path.
+  let v: unknown;
+  if (Object.prototype.hasOwnProperty.call(event, field)) {
+    v = event[field];
+  } else {
+    v = event;
+    for (const p of field.split('.')) {
+      if (v === null || v === undefined || typeof v !== 'object') return '';
+      v = (v as Record<string, unknown>)[p];
+    }
+  }
   if (isClickHouseDefault(v, field)) return '';
   const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
   return s.length > FIELD_PREVIEW_MAX ? `${s.slice(0, FIELD_PREVIEW_MAX)}…` : s;
@@ -923,6 +917,7 @@ function EventRow({
 }
 
 function EventDetail({ event }: { event: Record<string, unknown> }) {
+  const fieldMap = useSchemaFieldMap();
   // Canonical match fields — same set the Matches page surfaces on each row.
   const time = extractEventTime(event);
   const action = extractAction(event);
@@ -930,10 +925,10 @@ function EventDetail({ event }: { event: Record<string, unknown> }) {
   const ip = extractIp(event);
   const region = extractRegion(event);
   const canonical: Array<[string, string | undefined]> = [
-    ['event time', time?.toISOString()],
-    ['activity', action],
+    ['timestamp', time?.toISOString()],
+    ['event_type', action],
     [entity.type === 'other' ? 'entity' : entity.type, entity.label !== 'unknown' ? entity.label : undefined],
-    ['ip', ip],
+    [fieldMap.field('srcIp'), ip],
     ['region', region],
   ].filter((pair): pair is [string, string] => typeof pair[1] === 'string' && pair[1].length > 0);
 

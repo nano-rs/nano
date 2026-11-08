@@ -51,15 +51,12 @@ export class DetectionsApi {
     search?: string;
     /** Include archived (deleted) rules, which the API hides by default. */
     includeArchived?: boolean;
-    /** NAN-4586: at most this many rules (1–50). Omit for the full list. */
-    limit?: number;
   }): Promise<DetectionRule[]> {
     const searchParams = new URLSearchParams();
     if (params?.severity) searchParams.set('severity', params.severity);
     if (params?.mode) searchParams.set('mode', params.mode);
     if (params?.search) searchParams.set('search', params.search);
     if (params?.includeArchived) searchParams.set('include_archived', 'true');
-    if (params?.limit) searchParams.set('limit', String(params.limit));
 
     const query = searchParams.toString();
     return this.request(`/api/rules${query ? `?${query}` : ''}`);
@@ -125,15 +122,17 @@ export class DetectionsApi {
     return this.request(`/api/rules/${id}/retro-hunt/runs`);
   }
 
-  async pauseDetection(id: string): Promise<DetectionRule> {
+  async pauseDetection(id: string, expectedMode: DetectionRule['mode']): Promise<DetectionRule> {
     return this.request(`/api/rules/${id}/pause`, {
       method: 'POST',
+      body: JSON.stringify({ expected_mode: expectedMode }),
     });
   }
 
-  async resumeDetection(id: string): Promise<DetectionRule> {
+  async resumeDetection(id: string, expectedMode: DetectionRule['mode']): Promise<DetectionRule> {
     return this.request(`/api/rules/${id}/resume`, {
       method: 'POST',
+      body: JSON.stringify({ expected_mode: expectedMode }),
     });
   }
 
@@ -182,15 +181,17 @@ export class DetectionsApi {
     });
   }
 
-  async promoteDetection(id: string): Promise<DetectionRule> {
+  async promoteDetection(id: string, expectedMode: DetectionRule['mode']): Promise<DetectionRule> {
     return this.request(`/api/rules/${id}/promote`, {
       method: 'POST',
+      body: JSON.stringify({ expected_mode: expectedMode }),
     });
   }
 
-  async demoteDetection(id: string): Promise<DetectionRule> {
+  async demoteDetection(id: string, expectedMode: DetectionRule['mode']): Promise<DetectionRule> {
     return this.request(`/api/rules/${id}/demote`, {
       method: 'POST',
+      body: JSON.stringify({ expected_mode: expectedMode }),
     });
   }
 
@@ -222,7 +223,7 @@ export class DetectionsApi {
     return this.request('/api/rules/fleet-health');
   }
 
-  /** Per-tenant detection scheduling lag for the /rules overview strip (NAN-3064). */
+  /** Detection scheduling lag for the /rules overview strip (NAN-3064). */
   async getSchedulingLag(): Promise<ScheduleLagSummary> {
     return this.request('/api/rules/scheduling-lag');
   }

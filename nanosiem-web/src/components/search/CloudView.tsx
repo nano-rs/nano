@@ -4,18 +4,15 @@ import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { Cloud, Shield, ChevronDown, ChevronRight, Server, Globe, MapPin, User, KeyRound, Search, X, AlertTriangle, Users } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api } from '@/lib/api';
+import { retryOnAdmissionDenied } from '@/lib/admission-retry';
 import type { CacheMeta } from '@/lib/api';
-import type { CloudEventFilters, CloudFacets, CloudEventsRequest, CloudEventsResponse, CloudUserActivity } from '@/lib/api/types';
+import type { CloudEventFilters, CloudFacets, CloudEventsRequest, CloudUserActivity } from '@/lib/api/types';
 import { CachedNotice } from '@/components/search/CachedNotice';
-import { DurableJobNotice, type DurableProductJobState } from './DurableJobNotice';
-import { waitForDurableProductArtifact } from './durable-product-job';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Progress } from '@/components/ui/progress';
 import { Input } from '@/components/ui/input';
-import { formatUTCShort, formatCompactNumber, parseTimestampAsUTC } from '@/lib/date-utils';
-import { isPlaceholderValue } from '@/lib/is-placeholder-value';
-import { isAdmissionDenied, retryOnAdmissionDenied } from '@/lib/admission-retry';
+import { formatUTCShort, formatCompactNumber } from '@/lib/date-utils';
 import { CloudUserTimelineSheet } from './CloudUserTimelineSheet';
 import { CloudEntityPivotSheet } from './CloudEntityPivotSheet';
 import { CopyableValue } from './CopyableValue';
@@ -76,11 +73,9 @@ interface CloudEvent {
 
 interface CloudPagination {
   total_count: number;
-  total_count_exact?: boolean;
   offset: number;
   limit: number;
   has_more: boolean;
-  next_cursor?: import('@/lib/api/types').ProductViewCursor;
   facets?: CloudFacets;
 }
 
@@ -132,18 +127,6 @@ const FACET_TO_FILTER_KEY: Record<string, keyof CloudEventFilters> = {
 // ============================================================================
 // Helpers
 // ============================================================================
-
-// NAN-2361 (audit bug 2): OCSF parsers commonly emit the literal placeholder
-// "-" for fields they had nothing to fill. A "-" wrapped in a clickable pivot
-// CopyableValue is indistinguishable from the view's own '-' empty-state glyph,
-// so a user can click "nothing" and pivot into a nonsense query. Returns the
-// first candidate that is a real value, or null when none is.
-function realEntityValue(...candidates: (string | undefined)[]): string | null {
-  for (const c of candidates) {
-    if (!isPlaceholderValue(c)) return c as string;
-  }
-  return null;
-}
 
 function ChangeTypeBadge({ type: changeType }: { type: string }) {
   return (
@@ -335,7 +318,7 @@ function ResourceCard({ resource }: { resource: CloudResource }) {
               {additionalChangeCount > 0 ? ` +${additionalChangeCount}` : ''}
             </div>
             <div className="search-console-section-meta mt-1 truncate">
-              First {formatUTCShort(parseTimestampAsUTC(resource.first_seen))} · Last {formatUTCShort(parseTimestampAsUTC(resource.last_seen))}
+              First {formatUTCShort(new Date(resource.first_seen))} · Last {formatUTCShort(new Date(resource.last_seen))}
             </div>
           </div>
           <div className="justify-self-end text-right">
@@ -357,11 +340,11 @@ function ResourceCard({ resource }: { resource: CloudResource }) {
             </div>
             <div>
               <div className="search-console-section-meta mb-1">First Seen</div>
-              <div className="font-mono text-xs text-foreground">{formatUTCShort(parseTimestampAsUTC(resource.first_seen))}</div>
+              <div className="font-mono text-xs text-foreground">{formatUTCShort(new Date(resource.first_seen))}</div>
             </div>
             <div>
               <div className="search-console-section-meta mb-1">Last Seen</div>
-              <div className="font-mono text-xs text-foreground">{formatUTCShort(parseTimestampAsUTC(resource.last_seen))}</div>
+              <div className="font-mono text-xs text-foreground">{formatUTCShort(new Date(resource.last_seen))}</div>
             </div>
           </div>
           <div className="mt-3">
@@ -425,9 +408,7 @@ function MfaPanel({ mfa, onUserClick }: { mfa: CloudMfa; onUserClick?: (user: st
               return (
                 <TableRow key={u.user}>
                   <TableCell className="text-xs font-medium">
-                    {isPlaceholderValue(u.user) ? (
-                      u.user || '-'
-                    ) : onUserClick ? (
+                    {onUserClick ? (
                       <CopyableValue value={u.user} className="text-primary hover:underline" onClick={() => onUserClick(u.user)} />
                     ) : <CopyableValue value={u.user} />}
                   </TableCell>
@@ -498,16 +479,11 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
   // getCloudEvents fetch behind any filter change or an explicit refresh.
   const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [durableJob, setDurableJob] = useState<DurableProductJobState | null>(null);
-  const [summaryError, setSummaryError] = useState<Error | null>(null);
-  // NAN-2361 (audit bug 3): event-page / load-more failures must surface
-  // visibly — a swallowed 429 previously rendered identically to a genuine
-  // empty result ("No cloud events").
-  const [eventsError, setEventsError] = useState<{ message: string; source: 'page' | 'more' } | null>(null);
-  const requestAbort = useRef<AbortController | null>(null);
-  useEffect(() => () => { requestAbort.current?.abort(); ++applyFiltersSeq.current; initialLoadKeyRef.current = ''; }, [cloudQuery, timeRange?.start, timeRange?.end]);
   const applyFiltersSeq = useRef(0); // NAN-1595: drop stale out-of-order offset-0 fetches
-  const initialLoadKeyRef = useRef('');
+  // NAN-3077: one controller owns the current events requests (offset-0 page
+  // and infinite scroll); a new filter / query / window or unmount aborts it.
+  const requestAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => { requestAbort.current?.abort(); ++applyFiltersSeq.current; }, [cloudQuery, timeRange?.start, timeRange?.end]);
 
   // Panel data state (resources, MFA, users) — updated when filters change
   const [resources, setResources] = useState<CloudResource[]>(initialResources);
@@ -531,7 +507,6 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
       // Fresh envelope from a new `| cloud` run — clear any stale cache badge
       // (the envelope page itself carries no cache header).
       setCacheMeta(null);
-      setEventsError(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [eventsKey]);
@@ -626,7 +601,7 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
       // Include everything EXCEPT the excluded values
       const facetKey = FACET_TO_FILTER_KEY[dimension];
       if (!facetKey) continue;
-      const allValues = currentFacets[dimension] || initialFacets[dimension] || [];
+      const allValues = initialFacets[dimension] || [];
       const included = allValues
         .map((v) => v.value)
         .filter((v) => !excludedSet.has(v));
@@ -638,7 +613,7 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
       filters.search_text = text;
     }
     return filters;
-  }, [currentFacets, initialFacets]);
+  }, [initialFacets]);
 
   // Apply filters — resets to offset 0, replaces events. This offset-0 fetch is
   // the events view's primary/header-defining load, so it captures the server
@@ -654,9 +629,6 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
     if (!cloudQuery || !timeRange) return;
     if (bypass) setRefreshing(true);
     setIsLoadingMore(true);
-    setDurableJob(null);
-    setSummaryError(null);
-    setEventsError(null);
     if (!bypass) setCacheMeta(null); // clear stale badge while the fresh page loads
     try {
       const request: CloudEventsRequest = {
@@ -668,11 +640,8 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
         offset: 0,
         limit: 200,
         filters: Object.keys(filters).length > 0 ? filters : undefined,
-        fetch: 'page',
       };
 
-      // Retry admission refusals (429 / ADMISSION_DENIED): rapid facet clicks +
-      // pivot sheets can stack past the search service's 5-concurrent limit.
       const response = await retryOnAdmissionDenied(() => api.getCloudEvents(request, {
         onMeta: (m) => { if (seq === applyFiltersSeq.current) setCacheMeta(m); },
         bypass,
@@ -683,78 +652,32 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
       setPaginatedEvents(events);
       setPaginatedPagination({
         total_count: response.total_count,
-        total_count_exact: response.total_count_exact,
         offset: response.offset,
         limit: response.limit,
         has_more: response.has_more,
-        next_cursor: response.next_cursor,
       });
 
-      // The page is now paintable. Exact facets and the resource/user panels
-      // run as a separate companion so they cannot delay visible events.
-      const mergeSummary = (summary: CloudEventsResponse) => {
-        if (seq !== applyFiltersSeq.current) return;
-        setPaginatedPagination((current) => ({
-          ...current,
-          total_count: summary.total_count,
-          total_count_exact: summary.total_count_exact,
-          has_more: current.offset + events.length < summary.total_count,
-        }));
+      // Update current facet counts from response
+      if (response.facets) {
         const newFacets: Record<string, FacetValue[]> = {};
         for (const dim of ['cloud_provider', 'cloud_service', 'cloud_region', 'cloud_account_id', 'resource_type', 'change_type'] as const) {
-          const tuples = summary.facets[dim] as [string, number][] | undefined;
+          const tuples = response.facets[dim] as [string, number][] | undefined;
           if (tuples && tuples.length > 0) {
             newFacets[dim] = tuples.map(([value, count]) => ({ value, count }));
           }
         }
         setCurrentFacets(newFacets);
-        if (summary.resources) {
-          setResources(summary.resources as unknown as CloudResource[]);
-        }
-        if (summary.user_activity) {
-          setUserActivity(summary.user_activity as unknown as CloudUserActivity[]);
-        }
-      };
-      const loadSummary = async () => {
-        const summary = await api.getCloudEvents({ ...request, fetch: 'summary', limit: 1 }, { signal });
-        if (!summary.durable_job) {
-          mergeSummary(summary);
-          return;
-        }
-        setDurableJob({ jobId: summary.durable_job.job_id, status: 'queued' });
-        const artifact = await waitForDurableProductArtifact(
-          summary.durable_job.job_id,
-          'cloud_events_summary_v1',
-          (job) => { if (seq === applyFiltersSeq.current) setDurableJob(job); },
-          () => seq === applyFiltersSeq.current && !signal.aborted,
-          signal,
-        );
-        if (artifact.row.operation !== 'cloud_events_summary') {
-          throw new Error('Durable Cloud event summary returned an invalid operation');
-        }
-        const durableSummary = artifact.row.response as unknown as CloudEventsResponse | undefined;
-        if (!durableSummary?.total_count_exact || !durableSummary.facets) {
-          throw new Error('Durable Cloud event summary returned an invalid response');
-        }
-        mergeSummary(durableSummary);
-        if (seq === applyFiltersSeq.current) setDurableJob(null);
-      };
-      void loadSummary().catch((error) => {
-        if (seq !== applyFiltersSeq.current || String(error).includes('superseded')) return;
-        const resolved = error instanceof Error ? error : new Error(String(error));
-        setSummaryError(resolved);
-        console.error('Failed to load exact cloud summary:', resolved);
-      });
-    } catch (e) {
-      console.error('Failed to apply cloud filters:', e);
-      if (seq === applyFiltersSeq.current) {
-        setEventsError({
-          message: isAdmissionDenied(e)
-            ? 'The search service is at its concurrent-query limit — cloud events may be missing.'
-            : `Failed to load cloud events: ${e instanceof Error ? e.message : String(e)}`,
-          source: 'page',
-        });
       }
+
+      // Update panel data when returned (offset=0 filter changes)
+      if (response.resources) {
+        setResources(response.resources as unknown as CloudResource[]);
+      }
+      if (response.user_activity) {
+        setUserActivity(response.user_activity as unknown as CloudUserActivity[]);
+      }
+    } catch (e) {
+      if (!signal.aborted) console.error('Failed to apply cloud filters:', e);
     } finally {
       if (seq === applyFiltersSeq.current) {
         setIsLoadingMore(false);
@@ -762,18 +685,6 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
       }
     }
   }, [cloudQuery, timeRange]);
-
-  // The lake search envelope is intentionally a typed dispatcher marker; it
-  // does not duplicate the cloud event scan. Fetch the first real page once
-  // for each query/window. The ClickHouse envelope still carries initial rows,
-  // so its established path remains unchanged.
-  useEffect(() => {
-    if (initialEvents.length > 0 || !cloudQuery || !timeRange) return;
-    const key = `${cloudQuery}\u0000${timeRange.start}\u0000${timeRange.end}`;
-    if (initialLoadKeyRef.current === key) return;
-    initialLoadKeyRef.current = key;
-    void applyFilters({});
-  }, [applyFilters, cloudQuery, initialEvents.length, timeRange]);
 
   // Force a live re-fetch of the events page (offset 0) bypassing the server
   // cache, preserving the active facet/search filters (NAN-1595).
@@ -786,18 +697,11 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
   const loadMore = useCallback(async () => {
     if (!cloudQuery || !timeRange || !paginatedPagination.has_more || isLoadingMore) return;
 
-    setIsLoadingMore(true);
-    // Same generation guard `applyFilters` uses, for the same reason.
-    //
-    // `loadMore` APPENDS, so a page fetched under the old filter set landing
-    // after a facet click mixes two populations under one filter label — and
-    // then overwrites the cursor, so every later page comes from the wrong
-    // position. `isLoadingMore` does not prevent this: it is only checked on
-    // entry. The admission retry made the window wide enough to hit in practice
-    // (up to ~2.7s of backoff across three attempts).
+    // A newer offset-0 fetch / reset supersedes this page (seq guard + abort).
     const seq = applyFiltersSeq.current;
     if (!requestAbort.current || requestAbort.current.signal.aborted) requestAbort.current = new AbortController();
     const signal = requestAbort.current.signal;
+    setIsLoadingMore(true);
     try {
       const newOffset = paginatedEvents.length;
       const filters = buildFiltersFromExclusions(excludedFacets, searchText || undefined);
@@ -809,34 +713,22 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
           end: timeRange.end,
         },
         offset: newOffset,
-        cursor: paginatedPagination.next_cursor,
         limit: 200,
         filters: Object.keys(filters).length > 0 ? filters : undefined,
-        fetch: 'page',
       };
 
       const response = await retryOnAdmissionDenied(() => api.getCloudEvents(request, { signal }), signal);
       if (seq !== applyFiltersSeq.current) return;
       const newEvents = (response.events || []) as unknown as CloudEvent[];
-      setEventsError(null);
       setPaginatedEvents((prev) => [...prev, ...newEvents]);
-      setPaginatedPagination((current) => ({
-        total_count: current.total_count_exact ? current.total_count : response.total_count,
-        total_count_exact: current.total_count_exact,
+      setPaginatedPagination({
+        total_count: response.total_count,
         offset: response.offset,
         limit: response.limit,
         has_more: response.has_more,
-        next_cursor: response.next_cursor,
-      }));
-    } catch (e) {
-      if (seq !== applyFiltersSeq.current) return;
-      console.error('Failed to load more cloud events:', e);
-      setEventsError({
-        message: isAdmissionDenied(e)
-          ? 'The search service is at its concurrent-query limit — some events may be missing.'
-          : `Failed to load more cloud events: ${e instanceof Error ? e.message : String(e)}`,
-        source: 'more',
       });
+    } catch (e) {
+      if (!signal.aborted) console.error('Failed to load more cloud events:', e);
     } finally {
       if (seq === applyFiltersSeq.current) setIsLoadingMore(false);
     }
@@ -894,7 +786,7 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
   }, [paginatedPagination.has_more, isLoadingMore, loadMore]);
 
   // Provider badges for the summary bar
-  const providers = currentFacets.cloud_provider || initialFacets.cloud_provider || [];
+  const providers = initialFacets.cloud_provider || [];
 
   const facetOrder = ['cloud_provider', 'cloud_service', 'cloud_region', 'cloud_account_id', 'resource_type', 'change_type'];
 
@@ -1059,28 +951,6 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
             <span className="flex-1" />
             <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
           </div>
-          {durableJob && <DurableJobNotice job={durableJob} />}
-          {summaryError && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px] text-destructive">
-              Exact Cloud summary failed: {summaryError.message}
-            </div>
-          )}
-          {eventsError && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px] text-destructive flex items-center gap-2">
-              <span className="flex-1">{eventsError.message}</span>
-              <button
-                className="underline hover:no-underline shrink-0"
-                onClick={() => {
-                  const source = eventsError.source;
-                  setEventsError(null);
-                  if (source === 'more') void loadMore();
-                  else refresh();
-                }}
-              >
-                Retry
-              </button>
-            </div>
-          )}
 
           <div className="border rounded-md overflow-x-auto">
             <Table className="table-fixed w-full" style={{ minWidth: evtCols.totalWidth }}>
@@ -1102,23 +972,14 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
                 {paginatedEvents.length === 0 ? (
                   <TableRow>
                     <TableCell colSpan={9} className="text-center text-xs text-muted-foreground py-8">
-                      {isLoadingMore
-                        ? 'Loading cloud events...'
-                        : eventsError
-                          ? 'Cloud events failed to load — see the error above'
-                          : 'No cloud events returned for the current scope'}
+                      {isLoadingMore ? 'Loading cloud events...' : 'No cloud events returned for the current scope'}
                     </TableCell>
                   </TableRow>
                 ) : (
-                  paginatedEvents.map((evt, i) => {
-                    const ts = formatUTCShort(parseTimestampAsUTC(evt.timestamp));
-                    const resourceVal = realEntityValue(evt.resource_name, evt.resource_id);
-                    const userVal = realEntityValue(evt.user);
-                    const ipVal = realEntityValue(evt.src_ip);
-                    return (
+                  paginatedEvents.map((evt, i) => (
                     <TableRow key={i} className="hover:bg-accent/30">
-                      <TableCell className="text-xs font-mono truncate" title={ts}>
-                        {ts}
+                      <TableCell className="text-xs font-mono truncate" title={formatUTCShort(new Date(evt.timestamp))}>
+                        {formatUTCShort(new Date(evt.timestamp))}
                       </TableCell>
                       <TableCell className="text-xs truncate" title={evt.cloud_provider}>
                         {evt.cloud_provider}
@@ -1129,12 +990,12 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
                       <TableCell className="text-xs truncate" title={evt.cloud_region}>
                         {evt.cloud_region}
                       </TableCell>
-                      <TableCell className="text-xs truncate" title={resourceVal ?? undefined}>
-                        {resourceVal ? (
+                      <TableCell className="text-xs truncate" title={evt.resource_name || evt.resource_id}>
+                        {(evt.resource_name || evt.resource_id) ? (
                           <CopyableValue
-                            value={resourceVal}
+                            value={evt.resource_name || evt.resource_id}
                             className="text-primary hover:underline"
-                            onClick={() => handleEntityClick('resource', resourceVal)}
+                            onClick={() => handleEntityClick('resource', evt.resource_name || evt.resource_id)}
                             truncate
                           />
                         ) : '-'}
@@ -1142,22 +1003,22 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
                       <TableCell className="text-xs truncate">
                         {evt.change_type ? <ChangeTypeBadge type={evt.change_type} /> : '-'}
                       </TableCell>
-                      <TableCell className="text-xs truncate" title={userVal ?? undefined}>
-                        {userVal ? (
+                      <TableCell className="text-xs truncate" title={evt.user}>
+                        {evt.user ? (
                           <CopyableValue
-                            value={userVal}
+                            value={evt.user}
                             className="text-primary hover:underline"
-                            onClick={() => handleUserClick(userVal)}
+                            onClick={() => handleUserClick(evt.user)}
                             truncate
                           />
                         ) : '-'}
                       </TableCell>
-                      <TableCell className="text-xs font-mono truncate" title={ipVal ?? undefined}>
-                        {ipVal ? (
+                      <TableCell className="text-xs font-mono truncate" title={evt.src_ip}>
+                        {evt.src_ip ? (
                           <CopyableValue
-                            value={ipVal}
+                            value={evt.src_ip}
                             className="text-primary hover:underline"
-                            onClick={() => handleEntityClick('ip', ipVal)}
+                            onClick={() => handleEntityClick('ip', evt.src_ip)}
                             truncate
                           />
                         ) : '-'}
@@ -1166,8 +1027,7 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
                         {evt.http_user_agent || '-'}
                       </TableCell>
                     </TableRow>
-                    );
-                  })
+                  ))
                 )}
               </TableBody>
             </Table>
@@ -1241,11 +1101,7 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
                   return (
                     <TableRow key={u.user} className="hover:bg-accent/30">
                       <TableCell className="text-xs font-medium truncate" title={u.user}>
-                        {isPlaceholderValue(u.user) ? (
-                          u.user || '-'
-                        ) : (
-                          <CopyableValue value={u.user} className="text-primary hover:underline" onClick={() => handleUserClick(u.user)} truncate />
-                        )}
+                        <CopyableValue value={u.user} className="text-primary hover:underline" onClick={() => handleUserClick(u.user)} truncate />
                       </TableCell>
                       <TableCell className="text-xs text-right">{formatCompactNumber(u.event_count)}</TableCell>
                       <TableCell className="text-xs text-right">{u.distinct_services}</TableCell>

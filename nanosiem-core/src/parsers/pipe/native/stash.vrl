@@ -1,11 +1,15 @@
 # Renderer-owned: overwrite any payload-supplied envelope with trusted values.
+# Vector reduce drops `%` metadata; these are the fields nano's ClickHouse
+# lanes read after the pipeline (OCSF prepare, UDM output, Route by input).
 ._nano_pipe_metadata = [{
-  "tenant_id": %tenant_id,
   "source_type": %source_type,
-  "ingress_transport": %ingress_transport
+  "nano_claimed_source_type": %nano_claimed_source_type,
+  "nano_credential_id": %nano_credential_id,
+  "nano_credential_name": %nano_credential_name
 }]
-._nano_pipe_keys = to_string(%nano_event_key) ?? ""
+# Groups never span sources or ingest credentials, so the restored envelope
+# is the identity of every member, not just the first one.
 .group_hash = sha2(encode_json([
-  %tenant_id, %source_type, %ingress_transport, .group_hash, ._nano_pipe_scope
+  %source_type, %nano_credential_id, .group_hash, ._nano_pipe_scope
 ]), variant: "SHA-256")
 del(._nano_pipe_scope)

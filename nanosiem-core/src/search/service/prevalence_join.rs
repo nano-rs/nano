@@ -2,6 +2,7 @@
 
 use super::prevalence_processing::{rescue_transform_sql, PrevalenceRescue, RescueAttr};
 use super::*;
+use crate::query::clickhouse_sql_gen::{ch_lower, ci_like, escape_like_pattern};
 use crate::sql_hygiene::escape_sql_string;
 
 /// Schema-resolved artifact lookup-key expressions (`_domain_lookup` /
@@ -299,7 +300,6 @@ impl SearchService {
                     crate::query::Dataset::from_selector(
                         request.dataset.as_deref().unwrap_or("logs"),
                     ),
-                    &std::collections::BTreeSet::new(),
                 )
                 .await?;
             tracing::info!(
@@ -329,7 +329,9 @@ impl SearchService {
 
         // NAN-806: surface the implicit auto-sort decision here too — the
         // prevalence-join path bypasses the standard merge in `search()`.
-        if let Some(w) = crate::search::query_processing::auto_sort_warning(auto_sort_decision) {
+        if let Some(w) =
+            crate::search::query_processing::auto_sort_warning(auto_sort_decision)
+        {
             warnings_output.push(w);
         }
 
@@ -348,12 +350,11 @@ impl SearchService {
         let column_order = get_column_order(query);
 
         Ok(SearchResponse {
-            server_wall_ms: None,
             results,
             total_count,
-            // The prevalence-join path runs the exact count companion.
-            total_count_exact: true,
             execution_time_ms,
+            server_wall_ms: None,
+            queue_wait_ms: None,
             fields,
             generated_sql: if request.include_sql.unwrap_or(false) {
                 Some(sql)
@@ -365,7 +366,6 @@ impl SearchService {
             cost_score,
             display_type: Some(display_type),
             column_order,
-            completeness: None,
         })
     }
 
@@ -415,8 +415,7 @@ impl SearchService {
                     if existing != tw {
                         return Err(SearchError::SqlValidationError(
                             "multiple `| prevalence` commands with different windows are not \
-                             supported in one query; use a single window"
-                                .to_string(),
+                             supported in one query; use a single window".to_string(),
                         ));
                     }
                 }
@@ -495,10 +494,7 @@ impl SearchService {
             if branches.is_empty() {
                 "NULL".to_string()
             } else {
-                format!(
-                    "COALESCE(\n            {}\n        )",
-                    branches.join(",\n            ")
-                )
+                format!("COALESCE(\n            {}\n        )", branches.join(",\n            "))
             }
         };
 
@@ -517,10 +513,7 @@ impl SearchService {
             if branches.is_empty() {
                 "NULL".to_string()
             } else {
-                format!(
-                    "COALESCE(\n            {}\n        )",
-                    branches.join(",\n            ")
-                )
+                format!("COALESCE(\n            {}\n        )", branches.join(",\n            "))
             }
         };
 
@@ -617,10 +610,12 @@ impl SearchService {
             } else {
                 3
             };
-            if let Some(threshold) = super::prevalence_processing::decorated_filter_rescue_threshold(
-                post_prevalence_commands,
-                rarity_threshold,
-            ) {
+            if let Some(threshold) =
+                super::prevalence_processing::decorated_filter_rescue_threshold(
+                    post_prevalence_commands,
+                    rarity_threshold,
+                )
+            {
                 let syn = |field: PrevalenceField| PrevalenceCondition {
                     field,
                     operator: PrevalenceOperator::Lte,
@@ -1126,50 +1121,66 @@ impl SearchService {
         // key differs: domain/ip use `ifNull(_x_lookup, '')`, hash uses
         // `_hash_lookup` bare). The transform match-key always `ifNull(..)`s so
         // an empty/NULL lookup can never collide with a rescued (non-empty) key.
-        let build_projection = |dict: &str, dict_key: &str, xform_key: &str, rescued: &[_]| {
-            let host_count_base = format!(
-                "if(dictGetOrDefault('{dict}', 'last_seen', {dict_key}, toDateTime64(0, 6)) >= {w},\n           dictGetOrDefault('{dict}', 'host_count', {dict_key}, toUInt16(9999)),\n           toUInt16(9999))",
-                w = window_cutoff_sql,
-            );
-            let first_seen_base =
-                format!("dictGetOrDefault('{dict}', 'first_seen', {dict_key}, toDateTime64(0, 6))");
-            let last_seen_base =
-                format!("dictGetOrDefault('{dict}', 'last_seen', {dict_key}, toDateTime64(0, 6))");
-            let total_occ_base =
-                format!("dictGetOrDefault('{dict}', 'total_occurrences', {dict_key}, toUInt64(0))");
-            (
-                rescue_transform_sql(&host_count_base, xform_key, rescued, RescueAttr::HostCount),
-                rescue_transform_sql(&first_seen_base, xform_key, rescued, RescueAttr::FirstSeen),
-                rescue_transform_sql(&last_seen_base, xform_key, rescued, RescueAttr::LastSeen),
-                rescue_transform_sql(
-                    &total_occ_base,
-                    xform_key,
-                    rescued,
-                    RescueAttr::TotalOccurrences,
-                ),
-            )
-        };
-        let (dp_host_count_expr, dp_first_seen_expr, dp_last_seen_expr, dp_total_occurrences_expr) =
-            build_projection(
-                &domain_dict,
-                "ifNull(_domain_lookup, '')",
-                "ifNull(_domain_lookup, '')",
-                &rescue.domains,
-            );
-        let (hp_host_count_expr, hp_first_seen_expr, hp_last_seen_expr, hp_total_occurrences_expr) =
-            build_projection(
-                &hash_dict,
-                "_hash_lookup",
-                "ifNull(_hash_lookup, '')",
-                &rescue.hashes,
-            );
-        let (ip_host_count_expr, ip_first_seen_expr, ip_last_seen_expr, ip_total_occurrences_expr) =
-            build_projection(
-                &ip_dict,
-                "ifNull(_ip_lookup, '')",
-                "ifNull(_ip_lookup, '')",
-                &rescue.ips,
-            );
+        let build_projection =
+            |dict: &str, dict_key: &str, xform_key: &str, rescued: &[_]| {
+                let host_count_base = format!(
+                    "if(dictGetOrDefault('{dict}', 'last_seen', {dict_key}, toDateTime64(0, 6)) >= {w},\n           dictGetOrDefault('{dict}', 'host_count', {dict_key}, toUInt16(9999)),\n           toUInt16(9999))",
+                    w = window_cutoff_sql,
+                );
+                let first_seen_base = format!(
+                    "dictGetOrDefault('{dict}', 'first_seen', {dict_key}, toDateTime64(0, 6))"
+                );
+                let last_seen_base = format!(
+                    "dictGetOrDefault('{dict}', 'last_seen', {dict_key}, toDateTime64(0, 6))"
+                );
+                let total_occ_base = format!(
+                    "dictGetOrDefault('{dict}', 'total_occurrences', {dict_key}, toUInt64(0))"
+                );
+                (
+                    rescue_transform_sql(&host_count_base, xform_key, rescued, RescueAttr::HostCount),
+                    rescue_transform_sql(&first_seen_base, xform_key, rescued, RescueAttr::FirstSeen),
+                    rescue_transform_sql(&last_seen_base, xform_key, rescued, RescueAttr::LastSeen),
+                    rescue_transform_sql(
+                        &total_occ_base,
+                        xform_key,
+                        rescued,
+                        RescueAttr::TotalOccurrences,
+                    ),
+                )
+            };
+        let (
+            dp_host_count_expr,
+            dp_first_seen_expr,
+            dp_last_seen_expr,
+            dp_total_occurrences_expr,
+        ) = build_projection(
+            &domain_dict,
+            "ifNull(_domain_lookup, '')",
+            "ifNull(_domain_lookup, '')",
+            &rescue.domains,
+        );
+        let (
+            hp_host_count_expr,
+            hp_first_seen_expr,
+            hp_last_seen_expr,
+            hp_total_occurrences_expr,
+        ) = build_projection(
+            &hash_dict,
+            "_hash_lookup",
+            "ifNull(_hash_lookup, '')",
+            &rescue.hashes,
+        );
+        let (
+            ip_host_count_expr,
+            ip_first_seen_expr,
+            ip_last_seen_expr,
+            ip_total_occurrences_expr,
+        ) = build_projection(
+            &ip_dict,
+            "ifNull(_ip_lookup, '')",
+            "ifNull(_ip_lookup, '')",
+            &rescue.ips,
+        );
 
         // Build the final SQL using dictGet() against precomputed per-window prevalence dicts.
         // NAN-362: Replaces the old CTE + LEFT JOIN path which aggregated the entire
@@ -1348,12 +1359,48 @@ ORDER BY l.timestamp DESC"#,
         Ok((sql, num_commands_pushed))
     }
 
+    /// Convert a prevalence-related condition to SQL (see [`prevalence_condition_sql`]).
+    fn prevalence_condition_to_sql_with_eval(
+        &self,
+        condition: &crate::query::SearchExpr,
+        eval_field_names: &std::collections::HashSet<String>,
+        rarity_threshold: u64,
+    ) -> Result<String, SearchError> {
+        prevalence_condition_sql(&self.ch_sql_generator, condition, eval_field_names, rarity_threshold)
+    }
+
+    fn eval_expression_to_clickhouse_sql_with_context_and_eval_fields(
+        &self,
+        expr: &crate::query::EvalExpression,
+        in_prevalence_context: bool,
+        eval_field_names: &std::collections::HashSet<String>,
+    ) -> Result<String, SearchError> {
+        prevalence_eval_sql(&self.ch_sql_generator, expr, in_prevalence_context, eval_field_names)
+    }
+}
+
+/// NAN-4943: the `WHERE` SQL a post-`| prevalence` predicate is pushed down to
+/// (over the joined `l` row alias), for parity tests that run it on real
+/// ClickHouse next to the canonical generator and the post-stage evaluator.
+#[doc(hidden)]
+pub fn prevalence_where_sql(
+    gen: &crate::query::ClickHouseSqlGenerator,
+    condition: &crate::query::SearchExpr,
+) -> Result<String, SearchError> {
+    prevalence_condition_sql(gen, condition, &std::collections::HashSet::new(), 3)
+}
+
+/// Convert a prevalence-related condition to SQL, with support for eval-created fields.
+///
+/// NAN-4943: string predicates use the canonical generator's helpers
+/// (`ci_like`, `ch_lower`, `regex_predicate_sql`, `keyword_predicate`), so a
+/// predicate means the same thing before and after `| prevalence`.
     /// Convert a prevalence-related condition to SQL, with support for eval-created fields
     ///
     /// Similar to `prevalence_condition_to_sql`, but also recognizes fields created by
     /// EVAL commands that appear before the WHERE in post-prevalence processing.
-    fn prevalence_condition_to_sql_with_eval(
-        &self,
+pub(crate) fn prevalence_condition_sql(
+        gen: &crate::query::ClickHouseSqlGenerator,
         condition: &crate::query::SearchExpr,
         eval_field_names: &std::collections::HashSet<String>,
         rarity_threshold: u64,
@@ -1361,11 +1408,9 @@ ORDER BY l.timestamp DESC"#,
         use crate::query::{Comparator, EvalExpression, SearchExpr, Value};
 
         match condition {
-            SearchExpr::FieldFilter {
-                field, op, value, ..
-            } => {
+            SearchExpr::FieldFilter { field, op, value } => {
                 // Normalize field name (e.g., command_line -> process)
-                let field = Self::normalize_prevalence_field(field);
+                let field = normalize_prevalence_field(field);
                 let field_name = field.as_ref().to_string();
                 // Check if the field is an eval-created field
                 let (sql_field, needs_null_check): (std::borrow::Cow<'_, str>, bool) =
@@ -1397,6 +1442,16 @@ ORDER BY l.timestamp DESC"#,
                     }
                     };
 
+                // NAN-4943: an array column is element membership, through
+                // the canonical array predicate (`has` / `arrayExists`).
+                if !needs_null_check && !eval_field_names.contains(&field_name) {
+                    if let Some(sql) = gen
+                        .array_field_predicate_sql(&field_name, &sql_field, op, value)
+                        .map_err(|e| SearchError::SqlGenError(e.to_string()))?
+                    {
+                        return Ok(sql);
+                    }
+                }
                 let condition = match op {
                     Comparator::Eq
                     | Comparator::Ne
@@ -1413,12 +1468,31 @@ ORDER BY l.timestamp DESC"#,
                             Comparator::Gte => ">=",
                             _ => unreachable!(),
                         };
+                        // NAN-4943: string equality on a row column is the nPL
+                        // lowercase match (`lower(toString(col)) = '<ch_lower>'`),
+                        // exactly the canonical generator's; numeric literals and
+                        // the computed prevalence fields stay typed.
+                        if let Value::String(text) = value {
+                            let is_bool_literal = matches!(text.to_ascii_lowercase().as_str(), "true" | "false");
+                            let computed = needs_null_check
+                                || matches!(field_name.as_str(), "is_rare" | "prevalence_score");
+                            if matches!(op, Comparator::Eq | Comparator::Ne)
+                                && !computed
+                                && !(is_bool_literal && field_name == "is_rare")
+                                && !gen.is_profile_numeric_field(&field_name)
+                            {
+                                return Ok(format!(
+                                    "lower(toString({sql_field})) {sql_op} '{}'",
+                                    escape_sql_string(&ch_lower(text))
+                                ));
+                            }
+                        }
                         let sql_value = match value {
                             Value::Number(n) => n.to_string(),
                             Value::String(s) => {
                                 // Boolean coercion: "true"/"false" → 1/0 for known boolean fields only
                                 // Only is_rare is a computed UInt8 boolean in the prevalence JOIN
-                                let lower = s.to_lowercase();
+                                let lower = s.to_ascii_lowercase();
                                 if (lower == "true" || lower == "false") && field_name == "is_rare"
                                 {
                                     if lower == "true" {
@@ -1434,7 +1508,7 @@ ORDER BY l.timestamp DESC"#,
                             _ => {
                                 return Err(SearchError::SqlGenError(
                                     "Unsupported value type".to_string(),
-                                ));
+                                ))
                             }
                         };
                         format!("{} {} {}", sql_field, sql_op, sql_value)
@@ -1443,17 +1517,15 @@ ORDER BY l.timestamp DESC"#,
                         let negate = matches!(op, Comparator::NotContains);
                         match value {
                             Value::String(s) => {
-                                let escaped = escape_sql_string(s).to_lowercase();
-                                let like_op = if negate { "NOT iLike" } else { "iLike" };
-                                format!(
-                                    "lower(toString({})) {} '%{}%'",
-                                    sql_field, like_op, escaped
-                                )
+                                // NAN-4943: the single nPL lowercase match, with
+                                // `%`/`_`/`\` in the value matched literally.
+                                let escaped = escape_like_pattern(&escape_sql_string(&ch_lower(s)));
+                                ci_like(&format!("toString({})", sql_field), &format!("%{escaped}%"), negate)
                             }
                             _ => {
                                 return Err(SearchError::SqlGenError(
                                     "Contains requires string value".to_string(),
-                                ));
+                                ))
                             }
                         }
                     }
@@ -1461,14 +1533,13 @@ ORDER BY l.timestamp DESC"#,
                         let negate = matches!(op, Comparator::NotStartsWith);
                         match value {
                             Value::String(s) => {
-                                let escaped = escape_sql_string(s).to_lowercase();
-                                let like_op = if negate { "NOT iLike" } else { "iLike" };
-                                format!("lower(toString({})) {} '{}%'", sql_field, like_op, escaped)
+                                let escaped = escape_like_pattern(&escape_sql_string(&ch_lower(s)));
+                                ci_like(&format!("toString({})", sql_field), &format!("{escaped}%"), negate)
                             }
                             _ => {
                                 return Err(SearchError::SqlGenError(
                                     "StartsWith requires string value".to_string(),
-                                ));
+                                ))
                             }
                         }
                     }
@@ -1476,52 +1547,50 @@ ORDER BY l.timestamp DESC"#,
                         let negate = matches!(op, Comparator::NotEndsWith);
                         match value {
                             Value::String(s) => {
-                                let escaped = escape_sql_string(s).to_lowercase();
-                                let like_op = if negate { "NOT iLike" } else { "iLike" };
-                                format!("lower(toString({})) {} '%{}'", sql_field, like_op, escaped)
+                                let escaped = escape_like_pattern(&escape_sql_string(&ch_lower(s)));
+                                ci_like(&format!("toString({})", sql_field), &format!("%{escaped}"), negate)
                             }
                             _ => {
                                 return Err(SearchError::SqlGenError(
                                     "EndsWith requires string value".to_string(),
-                                ));
+                                ))
                             }
                         }
                     }
                     Comparator::Like | Comparator::NotLike => {
-                        let like_op = if matches!(op, Comparator::NotLike) {
-                            "NOT iLike"
-                        } else {
-                            "iLike"
-                        };
+                        let negate = matches!(op, Comparator::NotLike);
                         match value {
-                            Value::String(s) => format!(
-                                "toString({}) {} '{}'",
-                                sql_field,
-                                like_op,
-                                escape_sql_string(s)
+                            // Explicit LIKE: the user's `%`/`_` are the wildcards.
+                            Value::String(s) => ci_like(
+                                &format!("toString({})", sql_field),
+                                &escape_sql_string(&ch_lower(s)),
+                                negate,
                             ),
                             _ => {
                                 return Err(SearchError::SqlGenError(
                                     "Like requires string value".to_string(),
-                                ));
+                                ))
                             }
                         }
                     }
                     Comparator::Regex | Comparator::NotRegex => {
                         let negate = matches!(op, Comparator::NotRegex);
                         let pattern = match value {
-                            Value::Regex(p) | Value::String(p) => escape_sql_string(p),
+                            Value::Regex(p) | Value::String(p) => p,
                             _ => {
                                 return Err(SearchError::SqlGenError(
                                     "Regex requires string/regex value".to_string(),
-                                ));
+                                ))
                             }
                         };
-                        let not_str = if negate { "NOT " } else { "" };
-                        format!(
-                            "{}match(toString({}), '(?i){}')",
-                            not_str, sql_field, pattern
+                        // NAN-4943: the canonical regex classification — a literal
+                        // regex is the lowercase match, anything else RE2.
+                        crate::query::clickhouse_sql_gen::search_expr::regex_predicate_sql(
+                            &format!("toString({})", sql_field),
+                            pattern,
+                            negate,
                         )
+                        .map_err(|e| SearchError::SqlGenError(e.to_string()))?
                     }
                 };
 
@@ -1537,7 +1606,8 @@ ORDER BY l.timestamp DESC"#,
                 function,
             } => {
                 // Normalize field name (e.g., command_line -> process)
-                let field = Self::normalize_prevalence_field(field);
+                let field = normalize_prevalence_field(field);
+                let field_name = field.as_ref().to_string();
                 // Check if the field is an eval-created field
                 let (sql_field, needs_null_check): (std::borrow::Cow<'_, str>, bool) =
                     if eval_field_names.contains(field.as_ref()) {
@@ -1563,7 +1633,7 @@ ORDER BY l.timestamp DESC"#,
                         return Err(SearchError::SqlGenError(format!(
                             "Unsupported operator: {:?}",
                             op
-                        )));
+                        )))
                     }
                 };
 
@@ -1574,7 +1644,7 @@ ORDER BY l.timestamp DESC"#,
                         // Eval-created field reference - use directly
                         name.clone()
                     }
-                    _ => self.eval_expression_to_clickhouse_sql(function)?,
+                    _ => prevalence_eval_sql(gen, function, false, &std::collections::HashSet::new())?,
                 };
 
                 if needs_null_check {
@@ -1582,17 +1652,29 @@ ORDER BY l.timestamp DESC"#,
                         "({} IS NOT NULL AND {} {} {})",
                         sql_field, sql_field, sql_op, func_sql
                     ))
+                } else if matches!(op, Comparator::Eq | Comparator::Ne)
+                    && !gen.is_profile_numeric_field(&field_name)
+                {
+                    // NAN-4943: string equality against a function folds both
+                    // sides with ClickHouse `lower()`, as the canonical
+                    // generator's `field = lower(func)` form does.
+                    Ok(format!(
+                        "lower(toString({})) {} lower(toString({}))",
+                        sql_field, sql_op, func_sql
+                    ))
                 } else {
                     Ok(format!("{} {} {}", sql_field, sql_op, func_sql))
                 }
             }
             SearchExpr::And(left, right) => {
-                let left_sql = self.prevalence_condition_to_sql_with_eval(
+                let left_sql = prevalence_condition_sql(
+                    gen,
                     left,
                     eval_field_names,
                     rarity_threshold,
                 )?;
-                let right_sql = self.prevalence_condition_to_sql_with_eval(
+                let right_sql = prevalence_condition_sql(
+                    gen,
                     right,
                     eval_field_names,
                     rarity_threshold,
@@ -1600,12 +1682,14 @@ ORDER BY l.timestamp DESC"#,
                 Ok(format!("({} AND {})", left_sql, right_sql))
             }
             SearchExpr::Or(left, right) => {
-                let left_sql = self.prevalence_condition_to_sql_with_eval(
+                let left_sql = prevalence_condition_sql(
+                    gen,
                     left,
                     eval_field_names,
                     rarity_threshold,
                 )?;
-                let right_sql = self.prevalence_condition_to_sql_with_eval(
+                let right_sql = prevalence_condition_sql(
+                    gen,
                     right,
                     eval_field_names,
                     rarity_threshold,
@@ -1613,17 +1697,17 @@ ORDER BY l.timestamp DESC"#,
                 Ok(format!("({} OR {})", left_sql, right_sql))
             }
             SearchExpr::Not(inner) => {
-                let inner_sql = self.prevalence_condition_to_sql_with_eval(
+                let inner_sql = prevalence_condition_sql(
+                    gen,
                     inner,
                     eval_field_names,
                     rarity_threshold,
                 )?;
-                // NAN-3037: search NOT — a NULL (missing) operand counts as
-                // "did not match", so NOT includes it (see `null_safe_not`).
-                Ok(format!("NOT ifNull(({}), false)", inner_sql))
+                Ok(format!("NOT ({})", inner_sql))
             }
             SearchExpr::Group(inner) => {
-                let inner_sql = self.prevalence_condition_to_sql_with_eval(
+                let inner_sql = prevalence_condition_sql(
+                    gen,
                     inner,
                     eval_field_names,
                     rarity_threshold,
@@ -1635,13 +1719,22 @@ ORDER BY l.timestamp DESC"#,
                 values,
                 negated,
             } => {
-                let field = Self::normalize_prevalence_field(field);
-                let sql_field: std::borrow::Cow<'_, str> =
-                    if eval_field_names.contains(field.as_ref()) {
-                        field.into_owned().into()
-                    } else {
-                        format!("l.{}", field).into()
-                    };
+                let field = normalize_prevalence_field(field);
+                let field_name = field.as_ref().to_string();
+                let is_eval_field = eval_field_names.contains(field.as_ref());
+                let sql_field: std::borrow::Cow<'_, str> = if is_eval_field {
+                    field.into_owned().into()
+                } else {
+                    format!("l.{}", field).into()
+                };
+                if !is_eval_field {
+                    if let Some(sql) = gen
+                        .array_in_list_sql(&field_name, &sql_field, values, *negated)
+                        .map_err(|e| SearchError::SqlGenError(e.to_string()))?
+                    {
+                        return Ok(sql);
+                    }
+                }
                 let op = if *negated { "NOT IN" } else { "IN" };
                 let all_strings = values.iter().all(|v| matches!(v, Value::String(_)));
                 let values_sql: Vec<String> = values
@@ -1649,7 +1742,8 @@ ORDER BY l.timestamp DESC"#,
                     .map(|v| match v {
                         Value::String(s) => {
                             if all_strings {
-                                format!("'{}'", escape_sql_string(s).to_lowercase())
+                                // NAN-4943: ClickHouse `lower()` semantics.
+                                format!("'{}'", escape_sql_string(&ch_lower(s)))
                             } else {
                                 format!("'{}'", escape_sql_string(s))
                             }
@@ -1670,9 +1764,13 @@ ORDER BY l.timestamp DESC"#,
                 }
             }
             SearchExpr::Keyword(kw) => {
-                // Keyword search in prevalence context - search message field
-                let escaped = escape_sql_string(kw).to_lowercase();
-                Ok(format!("lower(toString(l.message)) iLike '%{}%'", escaped))
+                // NAN-4943: the canonical keyword predicate (token search; term
+                // boundaries for one-sided wildcards) over the profile's body
+                // columns of the joined row.
+                let cols: Vec<String> =
+                    gen.keyword_search_columns().iter().map(|c| format!("l.{c}")).collect();
+                let cols: Vec<&str> = cols.iter().map(String::as_str).collect();
+                Ok(crate::query::clickhouse_sql_gen::keyword_predicate(kw, &cols))
             }
             // NAN-2336: arithmetic `where` predicates (NAN-2331) used to fall
             // into the catch-all below and fail the query at RUNTIME with
@@ -1689,12 +1787,16 @@ ORDER BY l.timestamp DESC"#,
             // something that does not resolve. Validated against live
             // ClickHouse: the rewritten predicate parses and selects the
             // rarest artifact's timestamps.
-            SearchExpr::EvalPredicate(expression) => self
-                .eval_expression_to_clickhouse_sql_with_context_and_eval_fields(
-                    expression,
-                    true,
-                    eval_field_names,
-                ),
+            SearchExpr::EvalPredicate(expression) => {
+                prevalence_eval_sql(gen, expression, true, eval_field_names)
+            }
+            // NAN-4943: a standalone boolean function (`like(f, "…")`,
+            // `isnull(f)`, `cidrmatch(…)`) lowers through the same typed eval
+            // path as the canonical generator; it failed the whole query with
+            // "Unsupported expression type" after `| prevalence`.
+            SearchExpr::BooleanFunction(function) => {
+                prevalence_eval_sql(gen, function, true, eval_field_names)
+            }
             _ => Err(SearchError::SqlGenError(format!(
                 "Unsupported expression type: {:?}",
                 condition
@@ -1702,8 +1804,9 @@ ORDER BY l.timestamp DESC"#,
         }
     }
 
+
     /// Normalize field names for prevalence SQL (mirrors clickhouse_sql_gen::normalize_field_name)
-    fn normalize_prevalence_field(field: &str) -> std::borrow::Cow<'_, str> {
+fn normalize_prevalence_field(field: &str) -> std::borrow::Cow<'_, str> {
         match field {
             "process" => "command_line".into(),
             "parent_process" => "parent_command_line".into(),
@@ -1720,23 +1823,12 @@ ORDER BY l.timestamp DESC"#,
         }
     }
 
-    /// Convert eval expression to ClickHouse SQL for function calls in search service
-    fn eval_expression_to_clickhouse_sql(
-        &self,
-        expr: &crate::query::EvalExpression,
-    ) -> Result<String, SearchError> {
-        self.eval_expression_to_clickhouse_sql_with_context_and_eval_fields(
-            expr,
-            false,
-            &std::collections::HashSet::new(),
-        )
-    }
 
     /// Route prevalence evals through the same typed, profile-aware lowering as
     /// ordinary nPL. Only names created by an earlier eval and the logical
     /// prevalence timestamp fields override normal schema resolution.
-    fn eval_expression_to_clickhouse_sql_with_context_and_eval_fields(
-        &self,
+fn prevalence_eval_sql(
+        gen: &crate::query::ClickHouseSqlGenerator,
         expr: &crate::query::EvalExpression,
         in_prevalence_context: bool,
         eval_field_names: &std::collections::HashSet<String>,
@@ -1759,10 +1851,10 @@ ORDER BY l.timestamp DESC"#,
         };
 
         crate::query::clickhouse_sql_gen::typed_eval_expression_to_sql_with_field_override(
-            &self.ch_sql_generator,
+            gen,
             expr,
             &override_field,
         )
         .map_err(|error| SearchError::SqlGenError(error.to_string()))
     }
-}
+

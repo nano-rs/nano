@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 //! Quick smash-and-grab attack scenario (<5 minutes)
 //!
 //! Simulates a fast attack: initial access → recon → credential dump → exfil.

@@ -11,7 +11,6 @@
  */
 
 import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -31,10 +30,10 @@ import { useTestLogSourceVrl, useTestLogSourceVrlLive } from '@/hooks/use-api';
 import { useToast } from '@/hooks/use-toast';
 import { extractFields } from './TestResultRow';
 import type { LiveTestResult } from '@/lib/api/types';
-import { api } from '@/lib/api';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import { readSchemaFieldEntry, type SemanticField } from '@/lib/schema-fields';
 
 interface ParserTestLabProps {
-  logSourceId: string;
   vrlCode: string;
   sourceType: string;
   currentDeployedVrl?: string;
@@ -47,7 +46,9 @@ interface ParserTestLabProps {
 }
 
 /** Key fields to preview in collapsed row — shown as badges */
-const PREVIEW_FIELDS = ['event_type', 'src_ip', 'dest_host', 'dest_ip', 'user', 'process_name', 'http_method', 'src_host'];
+// NAN-4903: named as concepts and read through the profile-aware field map, so
+// an OCSF parser's `src_endpoint.ip` previews like a UDM parser's `src_ip`.
+const PREVIEW_FIELDS: readonly SemanticField[] = ['eventType', 'srcIp', 'destHost', 'destIp', 'user', 'processName', 'httpMethod', 'srcHost'];
 
 /** Render parsed fields — diffs grouped at top, unchanged in grid below */
 function FieldGrid({
@@ -164,10 +165,12 @@ function EventRowHeader({
   expanded: boolean;
   onToggle: () => void;
 }) {
+  const { profile } = useSchemaFieldMap();
   const previewEntries = PREVIEW_FIELDS
-    .filter(k => fields[k])
+    .map(k => readSchemaFieldEntry(fields, k, profile))
+    .filter((e): e is { key: string; value: unknown } => e !== null)
     .slice(0, 4)
-    .map(k => ({ key: k, value: fields[k] }));
+    .map(e => ({ key: e.key, value: String(e.value) }));
 
   return (
     <button
@@ -211,15 +214,8 @@ function EventRowHeader({
   );
 }
 
-export function ParserTestLab({ logSourceId, vrlCode, sourceType, currentDeployedVrl, extensionVrl }: ParserTestLabProps) {
+export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensionVrl }: ParserTestLabProps) {
   const { toast } = useToast();
-  const { data: activeSchema } = useQuery({
-    queryKey: ['schema-fields'],
-    queryFn: () => api.getSchemaFields(),
-    staleTime: Infinity,
-    gcTime: Infinity,
-  });
-  const validateOcsf = activeSchema?.schema === 'ocsf';
   const { mutate: testVrl, loading: testLoading } = useTestLogSourceVrl();
   const { mutate: testVrlLive, loading: liveLoading } = useTestLogSourceVrlLive();
 
@@ -260,7 +256,7 @@ export function ParserTestLab({ logSourceId, vrlCode, sourceType, currentDeploye
     try {
       const results = await Promise.all(
         capped.map((line) =>
-          testVrl({ vrlCode, sampleLog: line, extensionVrl, validateOcsf, logSourceId }).then((r) => ({
+          testVrl({ vrlCode, sampleLog: line, extensionVrl }).then((r) => ({
             input: line,
             success: r.success,
             output: r.output as Record<string, unknown> | undefined,

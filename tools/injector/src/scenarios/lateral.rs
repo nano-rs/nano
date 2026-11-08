@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 //! Lateral movement scenario — pivot across hosts via RDP/SMB
 //!
 //! Scripted sysmon steps go through `process_create_step` (NAN-1058) so the

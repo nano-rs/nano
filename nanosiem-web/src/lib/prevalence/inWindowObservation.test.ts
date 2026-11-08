@@ -8,71 +8,55 @@ import {
   buildObservationQueries,
   buildObservationQuery,
   DOMAIN_PATHS,
-  harvestIngestStamps,
   HASH_PATHS,
   mergeDiscoveryResults,
   mergeObservations,
   OBSERVATION_BATCH_SIZE,
+  observationPathsFor,
 } from './inWindowObservation.ts';
-
-/** Shaped from a real lake event (verified live 2026-08-21). */
-function stampedRow(value: string, isNew: boolean, ts: number) {
-  return {
-    time: ts,
-    enrichments: [
-      {
-        name: 'prevalence',
-        provider: 'nano',
-        type: 'reputation',
-        short_desc: isNew ? 'new artifact' : 'observed',
-        value,
-        data: {
-          artifact_type: 'hash',
-          as_of: 'ingest',
-          host_count: 1,
-          host_count_saturated: false,
-          is_new: isNew,
-          is_rare: true,
-        },
-      },
-    ],
-  } as Record<string, unknown>;
-}
-
-const tsOf = (row: Record<string, unknown>) =>
-  typeof row.time === 'number' ? row.time : null;
 
 const HASH_A = '9728a804f1c4b7a1f3c2d5e6b7a8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f70';
 const HASH_B = 'd4a566ae1ebc4f198f6bfee9def3ba543ffd727678886f7ed0f69d8728864b7f';
 
-// NAN-2361: `field=*` is wrong in BOTH directions on the lake path -- measured
+// NAN-2361: `field=*` was wrong in BOTH directions on the lake path -- measured
 // on a pinned window it admitted 395/400 rows carrying no hash at all, and
 // found 13 hosts for an artifact an equality filter proved was on 27. If this
 // regresses to a wildcard the chart's counts silently become fiction.
 test('observation query uses equality ORs, never an existence filter', () => {
-  const { npl } = buildObservationQuery('file.hashes.value', [HASH_A, HASH_B]);
+  const { npl } = buildObservationQuery('file_hash', [HASH_A, HASH_B]);
   assert.ok(!npl.includes('=*'), 'must not emit an existence filter');
-  assert.ok(npl.includes(`file.hashes.value="${HASH_A}"`));
+  assert.ok(npl.includes(`file_hash="${HASH_A}"`));
   assert.ok(npl.includes(' OR '));
 });
 
-// A plain dc(device.hostname) returns 0 for OCSF classes carrying no `device`
-// object (verified against http_request rows). The baseline builder coalesces,
-// so layer 1 must too, or the two layers count different things.
+// The ClickHouse prevalence MVs (clickhouse/129) key a host as
+// `if(src_host != '', src_host, if(src_ip != '', src_ip, 'unknown'))`.
+// Layer 1 must count the same thing. NOT `coalesce`: UDM string columns are
+// '' when absent, and coalesce('') collapses host-less rows into one host
+// (measured on the G22 e2e stack: 2 host-less IPs counted as 1).
 test('observation query mirrors the baseline builder host identity', () => {
-  const { npl } = buildObservationQuery('file.hashes.value', [HASH_A]);
-  assert.ok(npl.includes('coalesce(device.hostname, src_endpoint.hostname, "unknown")'));
+  const { npl } = buildObservationQuery('file_hash', [HASH_A]);
+  assert.ok(npl.includes('eval __h=if(src_host!="", src_host, if(src_ip!="", src_ip, "unknown"))'), npl);
+  assert.ok(!npl.includes('coalesce'));
   assert.ok(npl.includes('stats dc(__h) as hosts'));
+  assert.ok(npl.includes('min(timestamp) as first_in_window'));
+});
+
+// The paths are the ones the baseline aggregates read (UDM names; under the
+// OCSF schema profile they resolve to OCSF paths as nPL aliases).
+test('observation paths mirror the baseline aggregates', () => {
+  assert.deepEqual([...HASH_PATHS], ['file_hash', 'process_hash']);
+  assert.deepEqual([...DOMAIN_PATHS], ['dest_host', 'query', 'url_domain']);
 });
 
 test('observation query groups by the queried path', () => {
-  const { npl } = buildObservationQuery('process.file.hashes.value', [HASH_A]);
-  assert.ok(npl.endsWith('by process.file.hashes.value'));
+  const { npl } = buildObservationQuery('process_hash', [HASH_A]);
+  assert.ok(npl.endsWith('by process_hash'));
 });
 
 test('observation query strips quotes that would break out of the literal', () => {
-  const { npl } = buildObservationQuery('url.hostname', ['ev"il.com']);
-  assert.ok(npl.includes('url.hostname="evil.com"'));
+  const { npl } = buildObservationQuery('dest_host', ['ev"il.com']);
+  assert.ok(npl.includes('dest_host="evil.com"'));
   assert.ok(!npl.includes('ev"il'));
 });
 
@@ -88,7 +72,7 @@ test('queries chunk to the bulk limit', () => {
   const many = Array.from({ length: OBSERVATION_BATCH_SIZE * 2 + 1 }, (_, i) =>
     i.toString(16).padStart(64, '0'),
   );
-  const queries = buildObservationQueries(many, ['file.hashes.value']);
+  const queries = buildObservationQueries(many, ['file_hash']);
   assert.equal(queries.length, 3);
   assert.equal(queries[0].artifacts.length, OBSERVATION_BATCH_SIZE);
   assert.equal(queries[2].artifacts.length, 1);
@@ -107,8 +91,8 @@ test('merge matches array group keys by containment', () => {
     [HASH_A],
     [
       {
-        path: 'file.hashes.value',
-        row: { 'file.hashes.value': ['deadbeef', HASH_A], hosts: 4, events: 9 },
+        path: 'file_hash',
+        row: { 'file_hash': ['deadbeef', HASH_A], hosts: 4, events: 9 },
       },
     ],
   );
@@ -118,7 +102,7 @@ test('merge matches array group keys by containment', () => {
 test('merge handles scalar group keys (domain paths)', () => {
   const merged = mergeObservations(
     ['evil.com'],
-    [{ path: 'url.hostname', row: { 'url.hostname': 'evil.com', hosts: 2, events: 3 } }],
+    [{ path: 'dest_host', row: { 'dest_host': 'evil.com', hosts: 2, events: 3 } }],
   );
   assert.equal(merged.get('evil.com')?.hosts, 2);
 });
@@ -130,10 +114,10 @@ test('merge takes max hosts across paths, never the sum', () => {
   const merged = mergeObservations(
     [HASH_A],
     [
-      { path: 'file.hashes.value', row: { 'file.hashes.value': [HASH_A], hosts: 6, events: 6 } },
+      { path: 'file_hash', row: { 'file_hash': [HASH_A], hosts: 6, events: 6 } },
       {
-        path: 'process.file.hashes.value',
-        row: { 'process.file.hashes.value': [HASH_A], hosts: 2, events: 4 },
+        path: 'process_hash',
+        row: { 'process_hash': [HASH_A], hosts: 2, events: 4 },
       },
     ],
   );
@@ -149,13 +133,13 @@ test('merge keeps the earliest in-window occurrence across paths', () => {
     [HASH_A],
     [
       {
-        path: 'file.hashes.value',
-        row: { 'file.hashes.value': [HASH_A], hosts: 1, first_in_window: 2_000_000_000_000 },
+        path: 'file_hash',
+        row: { 'file_hash': [HASH_A], hosts: 1, first_in_window: 2_000_000_000_000 },
       },
       {
-        path: 'process.file.hashes.value',
+        path: 'process_hash',
         row: {
-          'process.file.hashes.value': [HASH_A],
+          'process_hash': [HASH_A],
           hosts: 1,
           first_in_window: 1_000_000_000_000,
         },
@@ -168,7 +152,7 @@ test('merge keeps the earliest in-window occurrence across paths', () => {
 test('merge ignores group keys that were not requested', () => {
   const merged = mergeObservations(
     [HASH_A],
-    [{ path: 'file.hashes.value', row: { 'file.hashes.value': [HASH_B], hosts: 9 } }],
+    [{ path: 'file_hash', row: { 'file_hash': [HASH_B], hosts: 9 } }],
   );
   assert.equal(merged.has(HASH_B), false);
   assert.equal(merged.size, 0);
@@ -179,7 +163,7 @@ test('merge ignores group keys that were not requested', () => {
 test('merge drops the empty group key rather than inventing an artifact', () => {
   const merged = mergeObservations(
     [HASH_A],
-    [{ path: 'file.hashes.value', row: { 'file.hashes.value': [], hosts: 2000 } }],
+    [{ path: 'file_hash', row: { 'file_hash': [], hosts: 2000 } }],
   );
   assert.equal(merged.size, 0);
 });
@@ -188,7 +172,7 @@ test('merge matches case-insensitively and returns the requested casing', () => 
   const upper = HASH_A.toUpperCase();
   const merged = mergeObservations(
     [upper],
-    [{ path: 'file.hashes.value', row: { 'file.hashes.value': [HASH_A], hosts: 3 } }],
+    [{ path: 'file_hash', row: { 'file_hash': [HASH_A], hosts: 3 } }],
   );
   assert.equal(merged.get(upper)?.hosts, 3);
 });
@@ -198,74 +182,13 @@ test('merge coerces string-typed aggregate values', () => {
     [HASH_A],
     [
       {
-        path: 'file.hashes.value',
-        row: { 'file.hashes.value': [HASH_A], hosts: '7', events: '12' },
+        path: 'file_hash',
+        row: { 'file_hash': [HASH_A], hosts: '7', events: '12' },
       },
     ],
   );
   assert.equal(merged.get(HASH_A)?.hosts, 7);
   assert.equal(merged.get(HASH_A)?.events, 12);
-});
-
-// NAN-2361: `is_new` is evaluated against the SAME lagging snapshot, so during
-// the 30-90 minute catch-up every occurrence of a fresh artifact is stamped
-// new. Deduping per artifact (and pinning to the earliest occurrence) is what
-// stops a single new artifact painting a novelty ring on every dot it owns.
-test('stamp harvest dedupes newness per artifact and keeps the earliest', () => {
-  const stamps = harvestIngestStamps(
-    [
-      stampedRow(HASH_A, true, 3_000),
-      stampedRow(HASH_A, true, 1_000),
-      stampedRow(HASH_A, true, 2_000),
-    ],
-    tsOf,
-  );
-  assert.equal(stamps.size, 1);
-  assert.equal(stamps.get(HASH_A)?.isNew, true);
-  assert.equal(stamps.get(HASH_A)?.earliestMs, 1_000);
-});
-
-test('stamp harvest treats any new occurrence as new', () => {
-  const stamps = harvestIngestStamps(
-    [stampedRow(HASH_A, false, 1_000), stampedRow(HASH_A, true, 2_000)],
-    tsOf,
-  );
-  assert.equal(stamps.get(HASH_A)?.isNew, true);
-});
-
-test('stamp harvest ignores non-prevalence enrichments', () => {
-  const row = {
-    time: 1_000,
-    enrichments: [{ name: 'geoip', value: HASH_A, data: { is_new: true } }],
-  } as Record<string, unknown>;
-  assert.equal(harvestIngestStamps([row], tsOf).size, 0);
-});
-
-// Rows with no `enrichments` are ClickHouse/UDM tenants and the fail-open
-// cases. An empty map is the gate: callers skip the whole layer rather than
-// branching on backend identity.
-test('stamp harvest returns empty for rows without enrichments', () => {
-  const rows = [{ time: 1_000, message: 'plain udm row' }] as Array<Record<string, unknown>>;
-  assert.equal(harvestIngestStamps(rows, tsOf).size, 0);
-});
-
-test('stamp harvest parses a JSON-encoded enrichments column', () => {
-  const row = {
-    time: 5_000,
-    enrichments: JSON.stringify([
-      { name: 'prevalence', value: HASH_B, data: { is_new: true, as_of: 'ingest' } },
-    ]),
-  } as Record<string, unknown>;
-  assert.equal(harvestIngestStamps([row], tsOf).get(HASH_B)?.isNew, true);
-});
-
-test('stamp harvest survives malformed enrichments without throwing', () => {
-  const rows = [
-    { time: 1, enrichments: 'not json at all' },
-    { time: 2, enrichments: [null, 'string', { name: 'prevalence' }] },
-    { time: 3, enrichments: [{ name: 'prevalence', value: '', data: {} }] },
-  ] as Array<Record<string, unknown>>;
-  assert.equal(harvestIngestStamps(rows, tsOf).size, 0);
 });
 
 // NAN-2361 discovery: a failed path (admission-control 429 after retries) must
@@ -275,14 +198,14 @@ test('stamp harvest survives malformed enrichments without throwing', () => {
 test('discovery merge reports failed paths distinctly from empty ones', () => {
   const out = mergeDiscoveryResults([
     {
-      path: 'file.hashes.value',
-      rows: [{ 'file.hashes.value': [HASH_A], hosts: 2, events: 5, first_in_window: 1_700_000_000 }],
+      path: 'file_hash',
+      rows: [{ 'file_hash': [HASH_A], hosts: 2, events: 5, first_in_window: 1_700_000_000 }],
       totalCount: 1,
     },
-    { path: 'process.file.hashes.value', rows: [], totalCount: 0 }, // genuinely empty
-    { path: 'actor.process.file.hashes.value', rows: [], totalCount: null, failed: true },
+    { path: 'process_hash', rows: [], totalCount: 0 }, // genuinely empty
+    { path: 'actor.process_hash', rows: [], totalCount: null, failed: true },
   ]);
-  assert.deepEqual(out.failedPaths, ['actor.process.file.hashes.value']);
+  assert.deepEqual(out.failedPaths, ['actor.process_hash']);
   assert.equal(out.truncated, false); // a failure is not truncation
   assert.equal(out.observations.get(HASH_A)?.hosts, 2);
 });
@@ -298,4 +221,21 @@ test('discovery merge flags truncation when a path hit its limit', () => {
   assert.equal(out.truncated, true);
   assert.equal(out.totalArtifacts, 3);
   assert.deepEqual(out.failedPaths, []);
+});
+
+// NAN-4931: the OCSF profile reads the OCSF hash arrays / hostnames and keys
+// hosts on device.hostname, not the UDM names (which match nothing there).
+test('observationPathsFor picks the OCSF paths and host identity under OCSF', () => {
+  const ocsf = observationPathsFor(true);
+  assert.deepEqual([...ocsf.hashPaths], ['file.hashes.value', 'process.file.hashes.value', 'actor.process.file.hashes.value']);
+  assert.ok(ocsf.domainPaths.includes('dst_endpoint.hostname'));
+  assert.match(ocsf.hostEval, /device\.hostname/);
+  const [q] = buildObservationQueries(['abc'], ocsf.hashPaths.slice(0, 1), ocsf.hostEval);
+  assert.equal(
+    q.npl,
+    'file.hashes.value="abc" | eval __h=if(device.hostname!="", device.hostname, if(src_endpoint.hostname!="", src_endpoint.hostname, "unknown")) | stats dc(__h) as hosts, count as events, min(timestamp) as first_in_window by file.hashes.value',
+  );
+  const udm = observationPathsFor(false);
+  assert.deepEqual([...udm.hashPaths], ['file_hash', 'process_hash']);
+  assert.match(udm.hostEval, /src_host/);
 });

@@ -558,7 +558,7 @@ impl LookupSpec {
                 "max_run_secs": 20, "max_pages": 1, "max_requests": 3, "max_events": 1,
                 "max_event_bytes": 8 * 1024 * 1024, "max_response_bytes": 4 * 1024 * 1024,
                 "max_decompressed_bytes": 8 * 1024 * 1024, "vrl_timeout_ms": 1000, "max_redirects": 2,
-                "max_checkpoint_bytes": 1024 * 1024, "max_identity_memberships": 1
+                "max_checkpoint_bytes": 1024 * 1024
             },
             // A 429 is the quota answer, never retried: the tenant's limiter
             // and the caller decide what happens next.

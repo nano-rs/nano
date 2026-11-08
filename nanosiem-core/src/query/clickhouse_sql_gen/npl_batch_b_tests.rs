@@ -2,8 +2,8 @@
 
 //! nPL parser / eval batch B (NAN-3312, 3313, 3315, 3318, 3319, 3324, 3326).
 //!
-//! Each test pins the lean lake compile (`lake_query_compile`'s OCSF 1.9
-//! profile) for a query that used to compile into the wrong SQL or fail.
+//! Each test pins the OCSF-store compile (clickhouse/dev `ocsf_logs`, ported
+//! by NAN-4933) for a query that used to compile into the wrong SQL or fail.
 
 use std::sync::Arc;
 
@@ -24,12 +24,11 @@ fn time_range() -> TimeRange {
 }
 
 fn lake_profile() -> OcsfProfile {
-    OcsfProfile::try_lake_1_9_with_snapshot_field_types(Default::default()).expect("lake profile")
+    OcsfProfile::new()
 }
 
 fn lean() -> ClickHouseSqlGenerator {
-    ClickHouseSqlGenerator::with_table("__nano_lake_source__")
-        .with_profile(Arc::new(lake_profile()))
+    ClickHouseSqlGenerator::new().with_profile(Arc::new(lake_profile()))
 }
 
 fn lean_sql(npl: &str) -> Result<String, String> {
@@ -111,10 +110,11 @@ fn nan3313_type_test_functions_compile_in_where_and_eval() {
 
 #[test]
 fn nan3313_searchmatch_uses_base_search_semantics() {
+    // NAN-4923: an exact literal pattern lowers to `lower(col) LIKE`.
     let sql = ok(r#"* | where searchmatch("user.name=adm*")"#);
-    assert!(sql.contains("iLike 'adm%'"), "{sql}");
+    assert!(sql.contains("lower(\"user.name\") LIKE 'adm%'"), "{sql}");
     let sql = ok(r#"* | eval hit=if(searchmatch("user.name=adm*"), 1, 0) | table hit"#);
-    assert!(sql.contains("iLike 'adm%'"), "{sql}");
+    assert!(sql.contains("LIKE 'adm%'"), "{sql}");
 }
 
 #[test]
@@ -134,28 +134,28 @@ fn nan3313_searchmatch_rejects_pipes() {
 #[test]
 fn nan3315_piped_search_wildcard_matches_like_base_search() {
     let sql = ok("* | search user.name=adm*");
-    assert!(sql.contains("iLike 'adm%'"), "{sql}");
+    assert!(sql.contains(" LIKE 'adm%'") && !sql.contains("iLike"), "{sql}");
     assert!(!sql.contains("'adm*'"), "{sql}");
 
     let sql = ok("* | search user.name!=adm*");
-    assert!(sql.contains("NOT iLike 'adm%'"), "{sql}");
+    assert!(sql.contains("NOT LIKE 'adm%'"), "{sql}");
 
     let sql = ok("* | search user.name=a?min");
-    assert!(sql.contains("iLike 'a_min'"), "{sql}");
+    assert!(sql.contains(" LIKE 'a_min'"), "{sql}");
 }
 
 #[test]
 fn nan3315_piped_search_escapes_like_metacharacters() {
     let sql = ok("* | search user.name=svc_*");
-    assert!(sql.contains(r"iLike 'svc\\_%'"), "{sql}");
+    assert!(sql.contains(r" LIKE 'svc\\_%'"), "{sql}");
 }
 
 #[test]
 fn nan3315_piped_search_rewrites_nested_terms() {
     let sql = ok("* | search (user.name=adm* OR user.name=root) NOT process.name=*.tmp");
-    assert!(sql.contains("iLike 'adm%'"), "{sql}");
+    assert!(sql.contains(" LIKE 'adm%'"), "{sql}");
     assert!(
-        sql.contains("NOT ifNull((toString(\"process.name\") iLike '%.tmp')"),
+        sql.contains("NOT (lower(toString(\"process.name\")) LIKE '%.tmp')"),
         "{sql}"
     );
 }
@@ -200,15 +200,6 @@ fn nan3315_piped_search_round_trips_through_pretty_print() {
 }
 
 // --- NAN-3318: bare fillnull ------------------------------------------------
-
-#[test]
-fn nan3318_bare_fillnull_on_the_lake_is_an_error_not_a_no_op() {
-    let err = lean_sql("* | fillnull").expect_err("bare fillnull cannot be compiled");
-    assert!(err.contains("fillnull needs a field list"), "{err}");
-    // The field-list form keeps working.
-    let sql = ok(r#"* | fillnull value="-" user.name"#);
-    assert!(sql.contains("ifNull(toString("), "{sql}");
-}
 
 #[test]
 fn nan3318_bare_fillnull_on_gen1_is_unchanged() {
@@ -321,17 +312,6 @@ fn nan3326_base64_decode_is_non_throwing() {
 // --- NAN-3313 follow-up: fields named inside searchmatch("...") -------------
 
 #[test]
-fn nan3313_searchmatch_fields_are_referenced_for_projection() {
-    let profile = lake_profile();
-    let query = parse_query(r#"* | where searchmatch("process.cmd_line=*enc*")"#).unwrap();
-    let referenced = super::field_analysis::collect_referenced_fields(&query, &profile);
-    assert!(referenced.contains("process.cmd_line"), "{referenced:?}");
-    let required = super::field_analysis::analyze_required_fields(&query, true, &profile)
-        .expect("table view prunes");
-    assert!(required.contains("process.cmd_line"), "{required:?}");
-}
-
-#[test]
 fn nan3313_searchmatch_lake_compile_projects_and_validates_inner_fields() {
     let npl = r#"* | where searchmatch("user.name=j*")"#;
     let query = parse_query(npl).unwrap();
@@ -346,7 +326,7 @@ fn nan3313_searchmatch_lake_compile_projects_and_validates_inner_fields() {
         .unwrap();
     let stage_0 = sql.split("stage_1").next().unwrap();
     assert!(stage_0.contains("\"user.name\""), "{sql}");
-    assert!(sql.contains("iLike 'j%'"), "{sql}");
+    assert!(sql.contains("LIKE 'j%'"), "{sql}");
 
     // A field only named inside the string is still validated.
     let query = parse_query(r#"* | where searchmatch("user.nmae=j*")"#).unwrap();

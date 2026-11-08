@@ -1,0 +1,26 @@
+q01_needle_ip_7d	7	src_endpoint.ip="203.0.113.77" | stats count
+q02_needle_user_30d	30	user="needle_user" | stats count
+q03_needle_host_30d	30	device.hostname="needle-host-01" | stats count
+q04_needle_sha256_30d	30	process.file.hashes.value="09881f6ed93360a2f6ad81f435a8ca51ca4575d0f954f197ff8f7d16c6565562" | stats count
+q05_cmdline_like_30d	30	process.cmd_line="*needlekw7*" | stats count
+q06_keyword_text_30d	30	mimikatz | stats count
+q07_stats_src_ip_7d	7	class_uid=4001 | stats count by src_endpoint.ip | sort -count | head 10
+q08_stats_user_30d	30	* | stats count by user | sort -count | head 10
+q09_stats_port_class_7d	7	class_uid=4001 | stats count by dst_endpoint.port, class_uid | sort -count | head 20
+q10_pivot_host_30d	30	device.hostname="needle-host-01" | table timestamp, class_uid, user, src_endpoint.ip, process.cmd_line | head 100
+q11_array_promoted_30d	30	observables.value="needle-c2.example.org" | stats count
+q12_array_json_30d	30	observables.name="dns.query" | stats count
+q13_cold_json_leaf_30d	30	actor.process.file.name="mimikatz.exe" | stats count
+q14_cold_json_stats_30d	30	class_uid=4001 | stats count by firewall_rule.name | sort -count | head 10
+q15_unmapped_leaf_30d	30	unmapped.routing.plat="268435456" | stats count
+q16_arrayjoin_stats_30d	30	RAW
+q17_timechart_7d	7	* | timechart span=1h count by class_uid
+q18_full_row_30d	30	user="needle_user" | head 100
+h01_json_eq_process_file_30d	30	process.file.name="mimikatz.exe" | stats count
+h02_json_eq_actor_file_30d	30	actor.process.file.name="cmd.exe" | stats count
+h03_json_stats_actor_file_30d	30	* | stats count by actor.process.file.name | sort -count | head 10
+h04_json_lc_filter_stats_30d	30	disposition="Blocked" | stats count by action | sort -count
+h05_json_stats_svc_7d	7	class_uid=4001 | stats count by connection_info.protocol_name, dst_endpoint.svc_name | sort -count | head 20
+h06_json_presence_30d	30	service.name=* | stats count
+h07_json_wildcard_30d	30	process.file.name="*mimi*" | stats count
+h08_json_two_leaf_30d	30	metadata.log_level="error" | stats count by status_detail | sort -count | head 10

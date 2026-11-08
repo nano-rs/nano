@@ -8,10 +8,11 @@
 //! 1. Pulls the DELTA of newly-landed feed indicators from
 //!    `custom_enrichment_results` above the rule's watermark, minus the values it
 //!    has already hunted (the per-rule hunted-indicator set).
-//! 2. Caps the batch at `max_indicators_per_run`; the overflow is carried to the
-//!    next run (the watermark only advances over the timestamp range this run
-//!    fully covered, and the hunted-set anti-join drains the rest — no silent
-//!    caps: truncation is recorded in the run-history row).
+//! 2. Caps the batch at `max_indicators_per_run` NEW values; already-hunted
+//!    values are walked past without counting toward the cap (bounded by a
+//!    per-run scan budget). The overflow is carried to the next run (the
+//!    keyset cursor only advances over the candidates this run covered — no
+//!    silent caps: truncation is recorded in the run-history row).
 //! 3. Runs the retro engine over the delta as ONE batched list rollup, over the
 //!    configured lookback window.
 //! 4. Synthesizes a detection-match event per HIT and emits it through the SAME
@@ -83,10 +84,7 @@ impl DetectionService {
             return Err(DetectionError::RulePaused(rule.id));
         }
         if rule.mode == RuleMode::Staging {
-            debug!(
-                "Skipping execution of staging retro-hunt rule: {}",
-                rule.name
-            );
+            debug!("Skipping execution of staging retro-hunt rule: {}", rule.name);
             return Ok(None);
         }
 
@@ -114,17 +112,12 @@ impl DetectionService {
         // with a timestamp but no value (impossible via this engine, but cheap to
         // guard) restarts from the beginning rather than skipping the tie group.
         let watermark_before = state.as_ref().and_then(|s| s.watermark);
-        let platform_known = state
-            .as_ref()
-            .map(|s| s.platform_revision_map())
-            .unwrap_or_default();
-        let cursor_before: Option<(i64, String)> =
-            state
-                .as_ref()
-                .and_then(|s| match (s.watermark, s.watermark_value.as_ref()) {
-                    (Some(ts), Some(v)) => Some((ts.timestamp_millis(), v.clone())),
-                    _ => None,
-                });
+        let cursor_before: Option<(i64, String)> = state.as_ref().and_then(|s| {
+            match (s.watermark, s.watermark_value.as_ref()) {
+                (Some(ts), Some(v)) => Some((ts.timestamp_millis(), v.clone())),
+                _ => None,
+            }
+        });
 
         let run_id = repo
             .start_run(rule.id, watermark_before)
@@ -134,7 +127,7 @@ impl DetectionService {
         // Everything after the run row is opened runs through this inner result so
         // a failure still closes the run history row with status='error'.
         match self
-            .run_retro_hunt(rule, &config, &repo, cursor_before, &platform_known)
+            .run_retro_hunt(rule, &config, &repo, cursor_before)
             .await
         {
             Ok(outcome) => {
@@ -148,7 +141,7 @@ impl DetectionService {
                         outcome.truncated,
                         outcome.overflow_remaining as i32,
                         outcome.watermark_after,
-                        outcome.note.as_deref(),
+                        None,
                     )
                     .await
                 {
@@ -159,15 +152,7 @@ impl DetectionService {
             Err(e) => {
                 if let Err(fe) = repo
                     .finish_run(
-                        run_id,
-                        "error",
-                        0,
-                        0,
-                        0,
-                        false,
-                        0,
-                        watermark_before,
-                        Some(&e.to_string()),
+                        run_id, "error", 0, 0, 0, false, 0, watermark_before, Some(&e.to_string()),
                     )
                     .await
                 {
@@ -186,98 +171,55 @@ impl DetectionService {
         config: &RetroHuntConfig,
         repo: &RetroHuntRepository,
         cursor_before: Option<(i64, String)>,
-        platform_known: &std::collections::BTreeMap<String, i64>,
     ) -> Result<RetroHuntOutcome, DetectionError> {
-        let started = std::time::Instant::now();
         let cap = config.max_indicators_per_run.max(1) as usize;
 
-        // Fetch the cap+1 candidates strictly after the cursor, ordered by
-        // (fetched_at, value); the +1 detects truncation without a second query.
-        let candidates: Vec<RetroFeedCandidate> = self
-            .search_service
-            .retro_hunt_feed_candidates(
-                &config.feeds,
-                &config.artifact_types,
-                cursor_before.as_ref().map(|(ms, v)| (*ms, v.as_str())),
-                cap + 1,
-            )
-            .await
-            .map_err(|e| DetectionError::SearchError(e.to_string()))?;
-
-        // The "covered" window this run advances past: the first `cap` candidates.
-        // Advancing over the whole covered set — hunted or not — is what
-        // guarantees forward progress even if every covered candidate turns out to
-        // be already hunted (the cursor advance is independent of the anti-join).
-        let covered: Vec<&RetroFeedCandidate> = candidates.iter().take(cap).collect();
-
-        let keys: Vec<(i64, String)> = candidates
-            .iter()
-            .map(|c| (c.fetched_at_ms, c.value.clone()))
-            .collect();
-        let (truncated, cursor_after) = plan_cursor(&keys, cap, cursor_before);
+        // Walk the delta in pages, skipping already-hunted values WITHOUT
+        // charging them to the per-run cap (NAN-4902 lane G). A feed that
+        // restamps `fetched_at` on every sync re-surfaces its whole set above
+        // the cursor; charging those to the cap made a 50k-row resync take
+        // 100 runs to drain while genuinely new indicators queued behind it.
+        // Partition-prunable window (NAN-4902 lane G): the walk never starts
+        // before `now - lookback_days`. A new rule (no cursor) or one idle for
+        // longer than its lookback would otherwise group the whole
+        // `custom_enrichment_results` history. Consistent with the hunt itself:
+        // an indicator learned before the lookback window would only be matched
+        // against logs it was already stamped on at ingest. `until` keeps the
+        // cursor behind publications that may still be committing.
+        let now_ms = Utc::now().timestamp_millis();
+        let start = effective_start_cursor(cursor_before, now_ms, config.lookback_days);
+        let until_ms = Some(now_ms - CANDIDATE_SETTLE_MS);
+        let search = &self.search_service;
+        let walk = walk_candidates(
+            start,
+            cap,
+            candidate_page_size(cap),
+            CANDIDATE_SCAN_BUDGET,
+            |cursor, limit| async move {
+                search
+                    .retro_hunt_feed_candidates(
+                        &config.feeds,
+                        &config.artifact_types,
+                        cursor.as_ref().map(|(ms, v)| (*ms, v.as_str())),
+                        until_ms,
+                        limit,
+                    )
+                    .await
+                    .map_err(|e| DetectionError::SearchError(e.to_string()))
+            },
+            |values| async move {
+                repo.already_hunted(rule.id, &values)
+                    .await
+                    .map_err(|e| DetectionError::RepositoryError(e.to_string()))
+            },
+        )
+        .await?;
+        let truncated = walk.truncated;
+        let cursor_after = walk.cursor_after;
         let watermark_after = cursor_after
             .as_ref()
             .and_then(|(ms, _)| chrono::DateTime::from_timestamp_millis(*ms));
-
-        // Anti-join against the per-rule hunted set: only hunt values not yet
-        // hunted. Preserves oldest-first order.
-        let covered_values: Vec<String> = covered.iter().map(|c| c.value.clone()).collect();
-        let already = repo
-            .already_hunted(rule.id, &covered_values)
-            .await
-            .map_err(|e| DetectionError::RepositoryError(e.to_string()))?;
-        let mut to_hunt: Vec<&RetroFeedCandidate> = covered
-            .iter()
-            .copied()
-            .filter(|c| !already.contains(&c.value))
-            .collect();
-
-        // NAN-4169: the platform half of the delta (ThreatFox incl. ip:port,
-        // Tor exit nodes...), for a rule watching ALL feeds. Only feeds whose
-        // revision moved are enumerated; first sight baselines. A platform read
-        // failure never blocks the tenant-list half: it is noted on the run and
-        // no platform revision advances, so the next run retries it.
-        let mut platform_plan = PlatformDeltaPlan::default();
-        let mut note: Option<String> = None;
-        if config.feeds.is_empty() {
-            match self
-                .search_service
-                .retro_hunt_platform_delta(platform_known, &config.artifact_types)
-                .await
-            {
-                Ok(feeds) => {
-                    let values = platform_delta_values(&feeds);
-                    let seen = repo
-                        .already_hunted(rule.id, &values)
-                        .await
-                        .map_err(|e| DetectionError::RepositoryError(e.to_string()))?;
-                    let budget = cap.saturating_sub(to_hunt.len());
-                    platform_plan = plan_platform_delta(
-                        &feeds,
-                        platform_known,
-                        &seen,
-                        budget,
-                        Utc::now().timestamp_millis(),
-                    );
-                    if !platform_plan.baseline.is_empty() {
-                        repo.record_hunted(rule.id, &platform_plan.baseline)
-                            .await
-                            .map_err(|e| DetectionError::RepositoryError(e.to_string()))?;
-                        info!(
-                            rule_id = %rule.id,
-                            baselined = platform_plan.baseline.len(),
-                            "Retro-hunt baselined newly watched platform feeds"
-                        );
-                    }
-                }
-                Err(error) => {
-                    warn!(rule_id = %rule.id, %error, "Retro-hunt platform feed delta unavailable; tenant feeds only this run");
-                    note = Some(format!("platform feeds skipped: {error}"));
-                }
-            }
-        }
-        let platform_candidates = platform_plan.to_hunt.clone();
-        to_hunt.extend(platform_candidates.iter());
+        let to_hunt: Vec<&RetroFeedCandidate> = walk.to_hunt.iter().collect();
         // The batched retro hunt. Batched PER ARTIFACT TYPE (at most 4 queries —
         // ip/domain/hash/url — not one per indicator): the retro engine's
         // `scope_observables` narrows the scanned columns to those an indicator
@@ -320,7 +262,6 @@ impl DetectionService {
         // Record the hunted values AFTER emission (a crash before here re-hunts
         // rather than silently skipping). Record ALL to_hunt — including
         // no-hit indicators — so a value with no logs isn't re-scanned every run.
-        // Platform revisions advance only after their values are recorded.
         if !to_hunt.is_empty() {
             let pairs: Vec<(String, String)> = to_hunt
                 .iter()
@@ -328,14 +269,6 @@ impl DetectionService {
                 .collect();
             if let Err(e) = repo.record_hunted(rule.id, &pairs).await {
                 warn!(rule_id = %rule.id, "Failed to record hunted indicators: {}", e);
-            }
-        }
-        if note.is_none() && config.feeds.is_empty() && platform_plan.revisions_after != *platform_known {
-            if let Err(e) = repo
-                .set_platform_revisions(rule.id, &platform_plan.revisions_after)
-                .await
-            {
-                warn!(rule_id = %rule.id, "Failed to persist retro-hunt platform revisions: {}", e);
             }
         }
 
@@ -361,6 +294,7 @@ impl DetectionService {
                     &config.feeds,
                     &config.artifact_types,
                     cursor_after.as_ref().map(|(ms, v)| (*ms, v.as_str())),
+                    until_ms,
                 )
                 .await
                 .unwrap_or(0)
@@ -371,7 +305,7 @@ impl DetectionService {
         if truncated {
             info!(
                 rule_id = %rule.id,
-                covered = covered.len(),
+                covered = walk.covered,
                 hunted = to_hunt.len(),
                 hits = hits.len(),
                 overflow_remaining,
@@ -379,27 +313,14 @@ impl DetectionService {
             );
         }
 
-        // NAN-4169: the run's measured cost, for the bounded-cost budget.
-        info!(
-            rule_id = %rule.id,
-            wall_ms = started.elapsed().as_millis() as u64,
-            list_candidates = covered.len(),
-            platform_new = platform_plan.considered,
-            platform_baselined = platform_plan.baseline.len(),
-            hunted = to_hunt.len(),
-            hits = hits.len(),
-            "Retro-hunt run cost"
-        );
-
         Ok(RetroHuntOutcome {
-            candidates_considered: (covered.len() + platform_plan.considered) as u64,
+            candidates_considered: walk.covered as u64,
             indicators_hunted: to_hunt.len() as u64,
             hits: hits.len() as u64,
-            truncated: truncated || platform_plan.overflow > 0,
-            overflow_remaining: overflow_remaining + platform_plan.overflow as u64,
+            truncated,
+            overflow_remaining,
             watermark_after,
             alert,
-            note,
         })
     }
 
@@ -426,31 +347,6 @@ impl DetectionService {
             debug!(rule_id = %rule.id, "All retro-hunt hits were already matched; nothing to emit");
             return Ok(None);
         }
-
-        let per_event_remaining = if rule.mode == RuleMode::Alerting
-            && rule.alert_mode == AlertMode::PerEvent
-        {
-            let plan = super::alerts::plan_per_event_batch(
-                results.len(),
-                self.config.max_events_per_alert,
-            )?;
-            results.truncate(plan.batch_len);
-            if self.primary_lake_detection_backend() {
-                plan.remaining
-            } else {
-                if plan.remaining > 0 {
-                    warn!(
-                        rule_id = %rule.id,
-                        retained = plan.batch_len,
-                        dropped = plan.remaining,
-                        "Legacy ClickHouse retro per-event window exceeded its configured storm cap"
-                    );
-                }
-                0
-            }
-        } else {
-            0
-        };
 
         inject_detected_at(&mut results, Utc::now());
         let match_count = results.len() as i64;
@@ -501,21 +397,12 @@ impl DetectionService {
                             match_count,
                             today,
                             global_weight,
-                            matched_kind,
                         )
                         .await?
                     }
                 };
-                if rule.alert_mode != AlertMode::PerEvent {
-                    self.record_matched_events(rule.id, matched_kind, &results)
-                        .await?;
-                }
-                if per_event_remaining > 0 {
-                    return Err(DetectionError::WindowDrainPending {
-                        processed: results.len(),
-                        remaining_at_least: per_event_remaining,
-                    });
-                }
+                self.record_matched_events(rule.id, matched_kind, &results)
+                    .await?;
                 Ok(alert)
             }
             // Staging/Paused are handled by the caller.
@@ -545,9 +432,7 @@ impl DetectionService {
             .unwrap_or_else(|| DEFAULT_RETRO_HUNT_CRON.to_string());
         self.validate_cron(&cron)?;
 
-        let lookback_days = req
-            .lookback_days
-            .unwrap_or(DEFAULT_RETRO_HUNT_LOOKBACK_DAYS);
+        let lookback_days = req.lookback_days.unwrap_or(DEFAULT_RETRO_HUNT_LOOKBACK_DAYS);
         let max_indicators = req
             .max_indicators_per_run
             .unwrap_or(DEFAULT_RETRO_HUNT_MAX_INDICATORS);
@@ -560,8 +445,9 @@ impl DetectionService {
         } else {
             req.feeds.join(", ")
         };
-        let display_query =
-            format!("retro-hunt: new IOCs from {feeds_label} over last {lookback_days}d");
+        let display_query = format!(
+            "retro-hunt: new IOCs from {feeds_label} over last {lookback_days}d"
+        );
 
         let new_rule = NewDetectionRule {
             name: req.name.clone(),
@@ -618,10 +504,7 @@ impl DetectionService {
         // live+cron rule to the scheduler, which would try to parse that
         // placeholder as nPL and fail on every cycle. Roll the rule back instead
         // and surface the error.
-        if let Err(e) = self
-            .finish_retro_hunt_create(&rule, req, lookback_days, max_indicators, &cron)
-            .await
-        {
+        if let Err(e) = self.finish_retro_hunt_create(&rule, req, lookback_days, max_indicators, &cron).await {
             if let Err(cleanup) = self.rule_repo.delete(rule.id).await {
                 error!(
                     rule_id = %rule.id,
@@ -774,145 +657,129 @@ struct RetroHuntOutcome {
     overflow_remaining: u64,
     watermark_after: Option<chrono::DateTime<Utc>>,
     alert: Option<Alert>,
-    /// Non-fatal run note (e.g. platform feeds skipped this run).
-    note: Option<String>,
 }
 
-/// Decide `(truncated, cursor_after)` from the `cap + 1` candidate probe
-/// (ordered by `(fetched_at, value)`), given the prior cursor.
+/// Smallest candidate page: large enough that a restamped feed's
+/// already-hunted backlog drains in a few round-trips.
+const CANDIDATE_PAGE_MIN: usize = 10_000;
+/// Candidates a single run may walk past (hunted or not) before it stops and
+/// carries the rest to the next run.
+const CANDIDATE_SCAN_BUDGET: usize = 50_000;
+
+/// How far behind "now" the cursor stays, so it never passes indicators of a
+/// publication that has written its rows but not yet committed them (IOC list
+/// publications commit within seconds; the API marks one interrupted after 15
+/// minutes, which bounds the worst case).
+const CANDIDATE_SETTLE_MS: i64 = 15 * 60 * 1000;
+
+/// The keyset cursor a run starts from: the persisted cursor, floored at
+/// `now - lookback_days` (empty value: every candidate at the floor timestamp
+/// is after it).
+fn effective_start_cursor(
+    cursor_before: Option<(i64, String)>,
+    now_ms: i64,
+    lookback_days: i32,
+) -> Option<(i64, String)> {
+    let floor = (now_ms - i64::from(lookback_days.max(1)) * 86_400_000, String::new());
+    match cursor_before {
+        Some(cursor) if cursor >= floor => Some(cursor),
+        _ => Some(floor),
+    }
+}
+
+fn candidate_page_size(cap: usize) -> usize {
+    cap.max(CANDIDATE_PAGE_MIN)
+}
+
+/// Result of walking the candidate delta for one run.
+#[derive(Debug)]
+struct CandidateWalk {
+    /// Candidates to hunt (not yet hunted by this rule), oldest first, at most
+    /// `cap`.
+    to_hunt: Vec<RetroFeedCandidate>,
+    /// Candidates the cursor moved past (hunted or not).
+    covered: usize,
+    /// The new keyset cursor: the last COVERED candidate.
+    cursor_after: Option<(i64, String)>,
+    /// More candidates remain after `cursor_after`.
+    truncated: bool,
+}
+
+/// Walk the candidate delta strictly after `cursor_before`, page by page,
+/// collecting up to `cap` values this rule has not hunted yet.
 ///
-/// The cursor is the `(fetched_at_ms, value)` of the LAST candidate this run
-/// covered, and the candidate query selects rows STRICTLY after it. Because the
-/// ordering key is unique per candidate (value is the group key), the cursor is
-/// strictly monotonic: every run advances past exactly the candidates it covered,
-/// so nothing is skipped and nothing stalls.
+/// The cursor is the `(fetched_at_ms, value)` of the LAST candidate covered,
+/// and the candidate query selects rows STRICTLY after it. Because the
+/// ordering key is unique per candidate (value is the group key), the cursor
+/// is strictly monotonic: every run advances past exactly the candidates it
+/// covered, so nothing is skipped and nothing stalls.
 ///
 /// A bare-timestamp cursor CANNOT do this. A feed sync stamps thousands of
-/// indicators with the same `fetched_at`; if such a tie group exceeds `cap`, a
-/// timestamp cursor must either skip the group's unprocessed tail (advance past
-/// the timestamp) or stall forever (not advance — the capped ordered query then
-/// keeps returning the same already-hunted rows, and `to_hunt` is empty every
-/// run). The value tiebreak is what makes the tail reachable.
+/// indicators with the same `fetched_at`; if such a tie group exceeds a page,
+/// a timestamp cursor must either skip the group's unprocessed tail or stall
+/// forever. The value tiebreak is what makes the tail reachable.
 ///
-/// * No candidates → cursor unchanged (nothing new landed).
-/// * `> cap` candidates (truncation) → advance to the last COVERED candidate
-///   (index `cap - 1`); the rest is carried to the next run.
-/// * `<= cap` candidates → everything after the cursor was covered; advance to
-///   the newest.
-///
-/// Pure + deterministic so the drain/skip invariants are unit-tested.
-pub fn plan_cursor(
-    candidates: &[(i64, String)],
-    cap: usize,
+/// Already-hunted candidates are covered (the cursor moves past them) but do
+/// not count toward `cap`. The walk stops when `cap` values are collected
+/// (`truncated` if any candidate remains), when the delta is exhausted, or
+/// after `budget` covered candidates. `fetch(cursor, limit)` returns up to
+/// `limit` candidates ordered by `(fetched_at, value)`; `hunted(values)`
+/// returns the subset this rule already hunted.
+async fn walk_candidates<F, FFut, H, HFut>(
     cursor_before: Option<(i64, String)>,
-) -> (bool, Option<(i64, String)>) {
-    if candidates.is_empty() {
-        return (false, cursor_before);
-    }
-    let truncated = candidates.len() > cap;
-    let last_covered = if truncated {
-        candidates.get(cap - 1)
-    } else {
-        candidates.last()
-    };
-    (truncated, last_covered.cloned())
-}
-
-/// NAN-4169: what one run does with the platform half of its delta.
-#[derive(Debug, Default, Clone)]
-pub struct PlatformDeltaPlan {
-    /// First sight of a feed: its current values are recorded as hunted
-    /// WITHOUT a hunt. The retro hunt covers indicators learned after the
-    /// rule started watching the feed, never the whole feed at once.
-    pub baseline: Vec<(String, String)>,
-    /// New indicators of a feed revision to hunt this run.
-    pub to_hunt: Vec<RetroFeedCandidate>,
-    /// Feed -> revision to persist after the run. A feed whose new values did
-    /// not all fit the run budget keeps its previous revision, so the next run
-    /// re-enumerates it and the hunted-set anti-join resumes where this left off.
-    pub revisions_after: std::collections::BTreeMap<String, i64>,
-    /// New values considered (post anti-join).
-    pub considered: usize,
-    /// New values left for a later run.
-    pub overflow: usize,
-}
-
-/// Fold a platform feed delta into a run (pure; unit-tested).
-///
-/// * unchanged feed -> revision carried, nothing to do;
-/// * changed feed never seen before -> baseline (record, don't hunt);
-/// * changed known feed -> hunt values not in `already_hunted`, up to `budget`.
-///
-/// A feed the tenant is no longer granted drops out of `revisions_after`; a
-/// later re-grant is a first sight again (baseline), never a full-feed hunt.
-pub fn plan_platform_delta(
-    feeds: &[crate::enrichment::ioc::LakePlatformFeedDelta],
-    known: &std::collections::BTreeMap<String, i64>,
-    already_hunted: &std::collections::HashSet<String>,
+    cap: usize,
+    page_size: usize,
     budget: usize,
-    learned_at_ms: i64,
-) -> PlatformDeltaPlan {
-    let mut plan = PlatformDeltaPlan::default();
-    let mut chosen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for feed in feeds {
-        let Some(previous) = known.get(&feed.feed) else {
-            for record in &feed.records {
-                if !already_hunted.contains(&record.value) && chosen.insert(record.value.clone()) {
-                    plan.baseline.push((record.value.clone(), record.key_type.clone()));
-                }
-            }
-            plan.revisions_after.insert(feed.feed.clone(), feed.revision);
-            continue;
-        };
-        if !feed.changed {
-            plan.revisions_after.insert(feed.feed.clone(), feed.revision);
-            continue;
+    mut fetch: F,
+    mut hunted: H,
+) -> Result<CandidateWalk, DetectionError>
+where
+    F: FnMut(Option<(i64, String)>, usize) -> FFut,
+    FFut: std::future::Future<Output = Result<Vec<RetroFeedCandidate>, DetectionError>>,
+    H: FnMut(Vec<String>) -> HFut,
+    HFut: std::future::Future<Output = Result<std::collections::HashSet<String>, DetectionError>>,
+{
+    let cap = cap.max(1);
+    let page_size = page_size.max(1);
+    let mut walk = CandidateWalk {
+        to_hunt: Vec::new(),
+        covered: 0,
+        cursor_after: cursor_before,
+        truncated: false,
+    };
+    loop {
+        // +1 detects "more remain" without a second query.
+        let page = fetch(walk.cursor_after.clone(), page_size + 1).await?;
+        let more = page.len() > page_size;
+        let window: Vec<RetroFeedCandidate> = page.into_iter().take(page_size).collect();
+        if window.is_empty() {
+            return Ok(walk);
         }
-        let mut complete = true;
-        for record in &feed.records {
-            if already_hunted.contains(&record.value) || chosen.contains(&record.value) {
-                continue;
+        let already = hunted(window.iter().map(|c| c.value.clone()).collect()).await?;
+        let mut stopped_at_cap = false;
+        for candidate in window {
+            if walk.to_hunt.len() == cap {
+                stopped_at_cap = true;
+                break;
             }
-            plan.considered += 1;
-            if plan.to_hunt.len() >= budget {
-                complete = false;
-                plan.overflow += 1;
-                continue;
+            walk.covered += 1;
+            walk.cursor_after = Some((candidate.fetched_at_ms, candidate.value.clone()));
+            if !already.contains(&candidate.value) {
+                walk.to_hunt.push(candidate);
             }
-            chosen.insert(record.value.clone());
-            plan.to_hunt.push(RetroFeedCandidate {
-                value: record.value.clone(),
-                key_type: record.key_type.clone(),
-                enrichment_name: if feed.display_name.is_empty() {
-                    feed.feed.clone()
-                } else {
-                    feed.display_name.clone()
-                },
-                confidence: record.confidence.clamp(0, 100) as u32,
-                fetched_at_ms: learned_at_ms,
-                feed_revision: Some(feed.revision),
-            });
         }
-        plan.revisions_after.insert(
-            feed.feed.clone(),
-            if complete { feed.revision } else { *previous },
-        );
+        if stopped_at_cap {
+            walk.truncated = true;
+            return Ok(walk);
+        }
+        if !more {
+            return Ok(walk);
+        }
+        if walk.to_hunt.len() == cap || walk.covered >= budget {
+            walk.truncated = true;
+            return Ok(walk);
+        }
     }
-    plan
-}
-
-/// Every value of a CHANGED feed in a platform delta answer: the set the
-/// hunted-set anti-join is asked about (first-sight feeds included, since a
-/// value may already be hunted through another feed or a list).
-pub fn platform_delta_values(feeds: &[crate::enrichment::ioc::LakePlatformFeedDelta]) -> Vec<String> {
-    let mut values: Vec<String> = feeds
-        .iter()
-        .filter(|feed| feed.changed)
-        .flat_map(|feed| feed.records.iter().map(|record| record.value.clone()))
-        .collect();
-    values.sort_unstable();
-    values.dedup();
-    values
 }
 
 /// Deterministic per-hit event id so the matched-event dedup is stable across
@@ -930,7 +797,7 @@ fn hit_event_id(rule_id: uuid::Uuid, value: &str, last_seen: &str) -> String {
 
 /// Synthesize one detection-match event per retro HIT, carrying the indicator as
 /// the risk entity plus retro context for the alert/matches UI.
-pub fn build_hit_events(
+fn build_hit_events(
     rule_id: uuid::Uuid,
     hits: &[RetroHuntHit],
     candidates: &[&RetroFeedCandidate],
@@ -946,6 +813,11 @@ pub fn build_hit_events(
                 .map(|c| c.enrichment_name.clone())
                 .unwrap_or_default();
             let confidence = cand.map(|c| c.confidence).unwrap_or(0);
+            // When the indicator was learned (its feed `fetched_at`): later than
+            // the matched activity is exactly what makes this a retro match.
+            let learned_at = cand
+                .and_then(|c| chrono::DateTime::from_timestamp_millis(c.fetched_at_ms))
+                .map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
             // last_seen anchors both the dedup identity (aggregate branch keys on
             // `_last_seen`) and the synthesized event timestamp.
             let last_seen = hit.last_seen.clone().unwrap_or_else(|| {
@@ -971,19 +843,22 @@ pub fn build_hit_events(
             obj.insert("indicator".into(), serde_json::json!(hit.value));
             obj.insert("indicator_type".into(), serde_json::json!(hit.indicator_type));
             // Populate the matched observable column too (realistic alert row).
-            // An `ip:port` hit matched through an IP column: the column
-            // carries the bare IP (`indicator` keeps the full `ip:port`).
             if !hit.field.is_empty() {
-                let column_value = crate::search::service::retro_split_ip_port(&hit.value)
-                    .map_or_else(|| hit.value.clone(), |(ip, _)| ip);
-                obj.insert(hit.field.clone(), serde_json::json!(column_value));
+                obj.insert(hit.field.clone(), serde_json::json!(hit.value));
             }
             obj.insert("message".into(), serde_json::json!(message));
             obj.insert("timestamp".into(), serde_json::json!(last_seen));
             // Canonical activity window → aggregate dedup branch keys on _last_seen.
             obj.insert("_first_seen".into(), serde_json::json!(first_seen));
             obj.insert("_last_seen".into(), serde_json::json!(last_seen));
-            // Retro context for the alert / matches UI.
+            // Retro context for the alert / matches UI. `retro` / `retro_ioc`
+            // flag the event (and, through the finding writer, the OCSF finding)
+            // as a retro IOC match (NAN-4169 parity).
+            obj.insert("retro".into(), serde_json::json!(true));
+            obj.insert("retro_ioc".into(), serde_json::json!(true));
+            if let Some(learned_at) = &learned_at {
+                obj.insert("retro_learned_at".into(), serde_json::json!(learned_at));
+            }
             obj.insert("retro_feed".into(), serde_json::json!(feed));
             obj.insert("retro_source".into(), serde_json::json!(feed));
             obj.insert("retro_confidence".into(), serde_json::json!(confidence));
@@ -994,23 +869,6 @@ pub fn build_hit_events(
             obj.insert("retro_field".into(), serde_json::json!(hit.field));
             obj.insert("retro_first_seen".into(), serde_json::json!(first_seen));
             obj.insert("retro_last_seen".into(), serde_json::json!(last_seen));
-            // NAN-4169: the searchable retro signal. `retro=true` / `retro_ioc=true`
-            // tell an analyst the match was found AFTER ingest (the indicator was
-            // learned later); `retro_learned_at` is when the feed delivered it.
-            obj.insert("retro".into(), serde_json::json!(true));
-            obj.insert("retro_ioc".into(), serde_json::json!(true));
-            if let Some(learned) = cand
-                .and_then(|c| chrono::DateTime::from_timestamp_millis(c.fetched_at_ms))
-                .filter(|_| cand.is_some_and(|c| c.fetched_at_ms > 0))
-            {
-                obj.insert(
-                    "retro_learned_at".into(),
-                    serde_json::json!(learned.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
-                );
-            }
-            if let Some(revision) = cand.and_then(|c| c.feed_revision) {
-                obj.insert("retro_feed_revision".into(), serde_json::json!(revision));
-            }
             serde_json::Value::Object(obj)
         })
         .collect()

@@ -121,6 +121,18 @@ impl AuthPlugin for SessionLoginAuth {
     fn credential_fields(&self) -> Vec<String> {
         self.p.credential_fields.values().cloned().collect()
     }
+    /// The login field names a credential is posted under decide it: a
+    /// username/login/email/client id is an identifier, anything else
+    /// (password, secret, token, key) is a secret.
+    fn identifier_fields(&self) -> Vec<String> {
+        const IDENTIFIERS: &[&str] = &["username", "user", "user_name", "login", "email", "client_id", "account", "account_id"];
+        self.p
+            .credential_fields
+            .iter()
+            .filter(|(name, _)| IDENTIFIERS.contains(&name.to_ascii_lowercase().as_str()))
+            .map(|(_, field)| field.clone())
+            .collect()
+    }
     fn token_endpoints(&self) -> Vec<String> {
         vec![self.p.login_url.clone()]
     }

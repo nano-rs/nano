@@ -153,7 +153,9 @@ impl EnrichmentRepository {
     /// leader-only (advisory-lock election in `jobs`), so at most one instance
     /// runs it.
     #[instrument(skip(self))]
-    pub async fn reset_interrupted_syncs(&self) -> Result<Vec<String>, EnrichmentRepositoryError> {
+    pub async fn reset_interrupted_syncs(
+        &self,
+    ) -> Result<Vec<String>, EnrichmentRepositoryError> {
         let ids: Vec<String> = sqlx::query_scalar(
             r#"
             UPDATE enrichment_sources SET
@@ -196,91 +198,6 @@ impl EnrichmentRepository {
         Ok(())
     }
 
-    /// Update source configuration (for auto-sync settings, etc.)
-    #[instrument(skip(self, config))]
-    pub async fn update_source_config(
-        &self,
-        source_id: &str,
-        config: serde_json::Value,
-    ) -> Result<(), EnrichmentRepositoryError> {
-        let result = sqlx::query(
-            "UPDATE enrichment_sources SET config = $2, updated_at = NOW() WHERE id = $1",
-        )
-        .bind(source_id)
-        .bind(config)
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(EnrichmentRepositoryError::SourceNotFound(
-                source_id.to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-
-    /// Update source download URL, discarding any sync error left by the
-    /// previous URL and re-queueing the source for an immediate sync.
-    ///
-    /// The single writer for this column — the marketplace credential path
-    /// routes here too, so the re-queue semantics below cannot drift between
-    /// the two configure surfaces (NAN-2343).
-    ///
-    /// `last_sync_error` is otherwise cleared only by a sync attempt, so after
-    /// correcting a bad URL the operator kept seeing the *old* failure
-    /// verbatim — with `auto_sync_enabled` on, the scheduler re-ran and rewrote
-    /// the identical message, making it look permanently stuck and giving no
-    /// signal that the new value had been accepted. `pending` is the
-    /// scheduler's immediate-sync request (bypasses interval/auto-sync checks),
-    /// so a corrected URL is exercised promptly rather than at the next tick.
-    ///
-    /// Both of those only fire when the URL actually **changed**. In an UPDATE,
-    /// the right-hand side sees the pre-update row, so `download_url IS
-    /// DISTINCT FROM $2` compares old against new:
-    ///
-    /// - Re-saving an identical URL is inert. Otherwise every save queued a
-    ///   fresh multi-million-row download, and re-pasting the same value to be
-    ///   sure is exactly what an operator does when a feed looks wrong.
-    /// - An in-flight sync is never overwritten. Stamping `pending` over
-    ///   `in_progress` would both lose the request (the running sync writes its
-    ///   own terminal status last) and invite a second, overlapping download.
-    ///   The new URL still lands; the running sync finishes and the scheduler's
-    ///   normal cadence picks it up.
-    #[instrument(skip(self))]
-    pub async fn update_source_url(
-        &self,
-        source_id: &str,
-        url: &str,
-    ) -> Result<(), EnrichmentRepositoryError> {
-        let result = sqlx::query(
-            "UPDATE enrichment_sources \
-             SET download_url = $2, \
-                 last_sync_error = CASE \
-                     WHEN download_url IS DISTINCT FROM $2 THEN NULL \
-                     ELSE last_sync_error END, \
-                 last_sync_status = CASE \
-                     WHEN download_url IS DISTINCT FROM $2 \
-                          AND last_sync_status IS DISTINCT FROM 'in_progress' \
-                     THEN 'pending' \
-                     ELSE last_sync_status END, \
-                 updated_at = NOW() \
-             WHERE id = $1",
-        )
-        .bind(source_id)
-        .bind(url)
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(EnrichmentRepositoryError::SourceNotFound(
-                source_id.to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-
     // ========================================================================
     // Statistics (config side)
     // ========================================================================
@@ -299,21 +216,6 @@ impl EnrichmentRepository {
             sqlx::query_as("SELECT COUNT(*) FROM enrichment_sources WHERE enabled = true")
                 .fetch_one(&self.pool)
                 .await?;
-        Ok(count)
-    }
-
-    /// Count networks in enabled IP feeds from the publisher's immutable
-    /// snapshot metadata. The MMDB request path must not scan the database to
-    /// render a settings-page statistic.
-    #[instrument(skip(self))]
-    pub async fn count_enabled_ip_records(&self) -> Result<i64, EnrichmentRepositoryError> {
-        let (count,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(record_count), 0)::BIGINT \
-             FROM enrichment_sources \
-             WHERE enabled = true AND source_type = 'ipinfo_lite'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
         Ok(count)
     }
 }

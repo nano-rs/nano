@@ -23,6 +23,45 @@ use crate::db::TableNames;
 /// Maximum number of entries in the prevalence cache
 const DEFAULT_CACHE_SIZE: usize = 10_000;
 
+/// How long one coverage probe is reused. The probe is metadata-only, but it
+/// decorates every prevalence response; a minute is far below the 10-minute
+/// snapshot cadence it reports on.
+const COVERAGE_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+type CoverageProbeEntry = (std::time::Instant, super::coverage::CoverageProbe);
+static COVERAGE_PROBE_CACHE: std::sync::Mutex<Option<CoverageProbeEntry>> = std::sync::Mutex::new(None);
+
+/// Scoped coverage answers, keyed by a process-local digest of the viewer's
+/// deny set (never returned or logged), the artifact kind and the hour the
+/// window starts in.
+type ScopedCoverageKey = (u64, super::coverage::ArtifactKind, i64);
+static SCOPED_COVERAGE_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<ScopedCoverageKey, (std::time::Instant, Option<bool>)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+const SCOPED_COVERAGE_CACHE_MAX: usize = 4_096;
+
+/// Drop the cached coverage probes so the next prevalence response re-reads
+/// ClickHouse metadata (tests; after a reset or backfill).
+pub fn invalidate_coverage_probe_cache() {
+    if let Ok(mut guard) = COVERAGE_PROBE_CACHE.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = SCOPED_COVERAGE_CACHE.lock() {
+        guard.clear();
+    }
+}
+
+/// Process-local identity of a restricted scope for the coverage cache: a hash
+/// of the normalized deny set. It never leaves the process.
+fn scope_digest(scope: &ArtifactScope) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut deny: Vec<&String> = scope.deny_bind_values().iter().collect();
+    deny.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    deny.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Maximum artifacts per bulk query
 pub const MAX_BULK_ARTIFACTS: usize = 100;
 
@@ -50,8 +89,12 @@ impl CacheEntry {
         }
     }
 
+    /// `expires_at` is the first instant the entry is no longer valid, so an
+    /// entry is expired at or after it (a 0 s TTL is expired immediately). The
+    /// strict `>` let a 0 s entry survive its own creation tick, which made
+    /// `test_cache_entry_expiration` flaky under load.
     fn is_expired(&self) -> bool {
-        Utc::now() > self.expires_at
+        Utc::now() >= self.expires_at
     }
 }
 
@@ -129,10 +172,6 @@ pub struct PrevalenceService {
     repository: PrevalenceRepository,
     config: Arc<RwLock<PrevalenceConfig>>,
     cache: Arc<RwLock<PrevalenceCache>>,
-    /// NAN-3451: the rarity threshold as last read from or written to
-    /// Settings; empty for a service built from defaults. Lake prevalence
-    /// clients bind to it so Settings drive the lake path too.
-    settings_rarity: super::settings::RarityThresholdSetting,
 }
 
 impl PrevalenceService {
@@ -146,7 +185,6 @@ impl PrevalenceService {
                 config.cache_ttl_seconds,
             ))),
             config: Arc::new(RwLock::new(config)),
-            settings_rarity: Default::default(),
         }
     }
 
@@ -163,7 +201,6 @@ impl PrevalenceService {
                 config.cache_ttl_seconds,
             ))),
             config: Arc::new(RwLock::new(config)),
-            settings_rarity: Default::default(),
         }
     }
 
@@ -181,31 +218,101 @@ impl PrevalenceService {
         use super::settings::PrevalenceSettings;
 
         let settings = PrevalenceSettings::new(pg_pool.clone());
-        let stored = settings.stored_config().await.unwrap_or_else(|e| {
+        let config = settings.get_config().await.unwrap_or_else(|e| {
             tracing::warn!(
                 "Failed to load prevalence config from database: {}, using defaults",
                 e
             );
-            None
+            PrevalenceConfig::default()
         });
 
-        // NAN-3226: the tenant's internal suffixes never list as domains.
-        let internal = crate::internal_domains::dedicated_cached(pg_pool).await;
-        let mut service = Self::with_config(
-            clickhouse_client,
-            table_names,
-            stored.clone().unwrap_or_default(),
-        );
+        // NAN-3226: names under an internal suffix never list as domains.
+        let internal = crate::internal_domains::effective(pg_pool).await;
+        let mut service = Self::with_config(clickhouse_client, table_names, config);
         service.repository = service.repository.with_internal_domains(&internal);
-        if let Some(config) = stored {
-            service.settings_rarity.set(config.rarity_threshold);
-        }
         service
     }
 
     /// Get the current configuration
     pub async fn get_config(&self) -> PrevalenceConfig {
         self.config.read().await.clone()
+    }
+
+    /// Coverage of a prevalence read whose window starts at `window_start`,
+    /// per artifact kind: ready / warming / partial / stale (see
+    /// [`super::coverage`]). `source` is the snapshot the read uses: `Live`
+    /// for the agg-backed single / bulk / scatter lookups, `Refreshed` for the
+    /// rare / new lists and the explorer. A source-restricted `scope` gets the
+    /// coverage of its own attributed rows and no cross-source timestamps.
+    pub async fn coverage_report_since(
+        &self,
+        window_start: DateTime<Utc>,
+        source: super::coverage::CoverageSource,
+        scope: &ArtifactScope,
+    ) -> super::coverage::CoverageReport {
+        use super::coverage::{classify, restrict, ArtifactKind, CoverageReport, BUCKET_SLACK};
+        let cached = COVERAGE_PROBE_CACHE
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .filter(|(at, _)| at.elapsed() < COVERAGE_PROBE_TTL)
+            .map(|(_, probe)| probe);
+        let probe = match cached {
+            Some(probe) => probe,
+            None => {
+                let probe = self.repository.coverage_probe().await;
+                if let Ok(mut guard) = COVERAGE_PROBE_CACHE.lock() {
+                    *guard = Some((std::time::Instant::now(), probe));
+                }
+                probe
+            }
+        };
+        let now = Utc::now();
+        let mut states = Vec::with_capacity(3);
+        for kind in ArtifactKind::ALL {
+            let global = classify(&probe, kind, source, window_start, now);
+            if scope.is_unrestricted() {
+                states.push(global);
+                continue;
+            }
+            let before = window_start + BUCKET_SLACK;
+            let key = (scope_digest(scope), kind, before.timestamp().div_euclid(3600));
+            let hit = SCOPED_COVERAGE_CACHE
+                .lock()
+                .ok()
+                .and_then(|guard| guard.get(&key).copied())
+                .filter(|(at, _)| at.elapsed() < COVERAGE_PROBE_TTL)
+                .map(|(_, covered)| covered);
+            let covered = match hit {
+                Some(covered) => covered,
+                None => {
+                    let covered = self.repository.scoped_coverage_before(kind, scope, before).await;
+                    if let Ok(mut guard) = SCOPED_COVERAGE_CACHE.lock() {
+                        if guard.len() >= SCOPED_COVERAGE_CACHE_MAX {
+                            guard.clear();
+                        }
+                        guard.insert(key, (std::time::Instant::now(), covered));
+                    }
+                    covered
+                }
+            };
+            states.push(restrict(global, covered));
+        }
+        let ip = states.pop().expect("three kinds");
+        let domain = states.pop().expect("three kinds");
+        let hash = states.pop().expect("three kinds");
+        CoverageReport::new(hash, domain, ip)
+    }
+
+    /// [`Self::coverage_report_since`] for a rolling window ending now.
+    pub async fn coverage_report(
+        &self,
+        time_window: TimeWindow,
+        source: super::coverage::CoverageSource,
+        scope: &ArtifactScope,
+    ) -> super::coverage::CoverageReport {
+        self.coverage_report_since(Utc::now() - Duration::hours(time_window.hours()), source, scope)
+            .await
     }
 
     /// Update the configuration (invalidates cache)
@@ -216,18 +323,10 @@ impl PrevalenceService {
         let mut cache = self.cache.write().await;
         cache.update_ttl(new_config.cache_ttl_seconds);
 
-        // Every caller passes a config read from or written to Settings.
-        self.settings_rarity.set(new_config.rarity_threshold);
         let mut config = self.config.write().await;
         *config = new_config;
 
         debug!("Prevalence config updated, cache invalidated");
-    }
-
-    /// NAN-3451: the live Settings rarity threshold, for binding a lake
-    /// prevalence client (`LakePrevalenceClient::with_rarity_setting`).
-    pub fn rarity_setting(&self) -> super::settings::RarityThresholdSetting {
-        self.settings_rarity.clone()
     }
 
     /// Get the current rarity threshold value
@@ -493,10 +592,8 @@ impl PrevalenceService {
             // `Accounts.Google.com` both MATCH a found row and get a correctly
             // keyed empty fallback (audit P9). The final result lookup lowercases
             // the input, so an empty keyed on the verbatim case would be lost.
-            let found_domains: std::collections::HashSet<String> = domain_rows
-                .iter()
-                .map(|r| r.domain.to_lowercase())
-                .collect();
+            let found_domains: std::collections::HashSet<String> =
+                domain_rows.iter().map(|r| r.domain.to_lowercase()).collect();
 
             // Add found domains to results
             for row in domain_rows {
@@ -663,8 +760,7 @@ impl PrevalenceService {
         // doesn't store it.
         let to_data = |row: super::repository::DictPrevalenceRow| PrevalenceData {
             artifact_type: ArtifactType::detect(&row.artifact),
-            host_count: row.host_count,
-            host_count_saturated: false,
+            host_count: Some(row.host_count),
             total_occurrences: row.total_occurrences,
             first_seen: PrevalenceRepository::micros_to_datetime(row.first_seen),
             last_seen: PrevalenceRepository::micros_to_datetime(row.last_seen),
@@ -897,6 +993,15 @@ impl PrevalenceService {
         let include_hashes = artifact_type.map_or(true, |t| t.is_hash());
         let include_domains = artifact_type.map_or(true, |t| t.is_domain());
         let include_ips = artifact_type.map_or(true, |t| t.is_ip());
+        // Coverage is reported over the kinds this page actually lists.
+        let explorer_kinds: Vec<super::coverage::ArtifactKind> = [
+            (include_hashes && config.enable_hash_tracking, super::coverage::ArtifactKind::Hash),
+            (include_domains && config.enable_domain_tracking, super::coverage::ArtifactKind::Domain),
+            (include_ips && config.enable_ip_tracking, super::coverage::ArtifactKind::Ip),
+        ]
+        .into_iter()
+        .filter_map(|(on, kind)| on.then_some(kind))
+        .collect();
 
         // Search filtering and cross-type merging still happen in memory after fetch.
         // Keep a larger buffer in those cases so pagination doesn't hide valid results.
@@ -1224,18 +1329,21 @@ impl PrevalenceService {
             .collect();
 
         Ok(ArtifactExplorerResponse {
-            product_state: None,
             artifacts,
             total,
             limit,
             offset,
             has_more,
-            next_cursor: None,
             rarity_threshold,
             rare_count,
             new_count,
             high_risk_asset_count,
             counts_approximate,
+            product_state: Some(
+                self.coverage_report(time_window, super::coverage::CoverageSource::Refreshed, scope)
+                    .await
+                    .combined(&explorer_kinds),
+            ),
         })
     }
 
@@ -1306,19 +1414,12 @@ impl PrevalenceService {
         }
 
         // Active schema profile for column resolution (NAN-1241). This is a
-        // best-effort enrichment path with no Result channel.
-        //
-        // NAN-2361: it used to substitute the UDM profile here. On the canonical
-        // OCSF lake that aims the inline-context SQL at UDM column names, so the
-        // subtitles are either empty or resolved from the wrong schema. Leave the
-        // context unset and say why — a missing subtitle is obvious, a wrong one
-        // is not.
-        let Ok(profile) = crate::schema::active_profile_from_env() else {
-            tracing::error!(
-                "prevalence explorer context skipped: cannot resolve the active schema profile"
-            );
-            return;
-        };
+        // best-effort enrichment path with no Result channel; a malformed
+        // profile env already fails fast at boot, so fall back to the UDM
+        // profile (byte-identical default) on the unreachable error case.
+        let profile = crate::schema::active_profile_from_env().unwrap_or_else(|_| {
+            crate::schema::profile_for_id(crate::schema::SchemaId::Udm)
+        });
 
         let ctx_map = self
             .repository
@@ -1406,24 +1507,40 @@ impl PrevalenceService {
             },
         );
 
-        let hash_points: Vec<PrevalenceScatterPoint> = hash_res?
-            .into_iter()
-            .map(PrevalenceScatterPoint::from)
-            .collect();
-        let domain_points: Vec<PrevalenceScatterPoint> = domain_res?
-            .into_iter()
-            .map(PrevalenceScatterPoint::from)
-            .collect();
-        let ip_points: Vec<PrevalenceScatterPoint> = ip_res?
-            .into_iter()
-            .map(PrevalenceScatterPoint::from)
-            .collect();
+        // A miss outside prevalence coverage is unknown (`host_count: null`),
+        // not a rare zero-host artifact.
+        let report = self
+            .coverage_report(time_window, super::coverage::CoverageSource::Live, scope)
+            .await;
+        let mut kinds = Vec::new();
+        for (asked, kind) in [
+            (!hashes.is_empty(), super::coverage::ArtifactKind::Hash),
+            (!domains.is_empty(), super::coverage::ArtifactKind::Domain),
+            (!ips.is_empty(), super::coverage::ArtifactKind::Ip),
+        ] {
+            if asked {
+                kinds.push(kind);
+            }
+        }
+        let state = report.combined(&kinds);
+        let points = |rows: Vec<PrevalenceData>| -> Vec<PrevalenceScatterPoint> {
+            rows.into_iter()
+                .map(|mut data| {
+                    report.apply(&mut data);
+                    PrevalenceScatterPoint::from(data)
+                })
+                .collect()
+        };
+        let hash_points = points(hash_res?);
+        let domain_points = points(domain_res?);
+        let ip_points = points(ip_res?);
 
         Ok(PrevalenceScatterData {
             hash_points,
             domain_points,
             ip_points,
             rarity_threshold,
+            product_state: Some(state),
         })
     }
 }
@@ -1445,9 +1562,6 @@ pub enum PrevalenceError {
 
     #[error("Configuration error: {0}")]
     Config(String),
-
-    #[error("Prevalence backend error: {0}")]
-    Backend(String),
 }
 
 #[cfg(test)]

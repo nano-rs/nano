@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { useHref } from 'react-router-dom';
 
 /**
  * Panel Component
@@ -202,7 +201,6 @@ export function Panel({
   effectiveTimeRange,
   children,
 }: PanelProps) {
-  const searchPath = useHref('/search');
   const [showQueryDialog, setShowQueryDialog] = useState(false);
   const [showFullscreen, setShowFullscreen] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -247,7 +245,7 @@ export function Panel({
       params.set('start', effectiveTimeRange.start);
       params.set('end', effectiveTimeRange.end);
     }
-    window.open(`${searchPath}#${params.toString()}`, '_blank', 'noopener,noreferrer');
+    window.open(`/search#${params.toString()}`, '_blank');
   };
 
   // DSH40: the result is capped/truncated when the backend says so, or when the

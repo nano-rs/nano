@@ -13,8 +13,6 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::security_tenant_scope::SecurityTenantScope;
-
 const KEY_PREFIX: &str = "nanosiem:rule-test:v1";
 const LEASE_TTL_SECS: u64 = 300;
 const RENEW_INTERVAL_SECS: u64 = 60;
@@ -34,16 +32,6 @@ end
 return 0
 "#;
 
-/// Local-slot identity: tenant scope + user (NAN-2718).
-type AdmissionSlot = (SecurityTenantScope, Uuid);
-
-/// Redis lease key. Dedicated output is byte-identical to the historical
-/// `nanosiem:rule-test:v1:<user>`; hosted-shared tenants get their own
-/// namespace so a lease in one tenant never gates (or reveals) another.
-fn lease_key(scope: SecurityTenantScope, user_id: Uuid) -> String {
-    scope.cache_key(&format!("{KEY_PREFIX}:{user_id}"))
-}
-
 #[derive(Debug, Error)]
 pub enum RuleTestAdmissionError {
     #[error("distributed rule-test admission is unavailable")]
@@ -52,7 +40,7 @@ pub enum RuleTestAdmissionError {
 
 #[derive(Clone)]
 enum Backend {
-    Local(Arc<DashMap<AdmissionSlot, ()>>),
+    Local(Arc<DashMap<Uuid, ()>>),
     Redis(Arc<RedisBackend>),
 }
 
@@ -106,36 +94,24 @@ impl RuleTestAdmission {
         &self,
         user_id: Uuid,
     ) -> Result<Option<RuleTestPermit>, RuleTestAdmissionError> {
-        self.acquire_in(SecurityTenantScope::dedicated(), user_id).await
-    }
-
-    /// Tenant-scoped [`Self::acquire`]. Enterprise-shared callers MUST pass the
-    /// server-resolved tenant scope so leases never share a keyspace across
-    /// tenants (NAN-2718).
-    pub async fn acquire_in(
-        &self,
-        scope: SecurityTenantScope,
-        user_id: Uuid,
-    ) -> Result<Option<RuleTestPermit>, RuleTestAdmissionError> {
         match &self.backend {
             Backend::Local(active) => {
                 use dashmap::mapref::entry::Entry;
-                let slot = (scope, user_id);
-                match active.entry(slot) {
+                match active.entry(user_id) {
                     Entry::Occupied(_) => Ok(None),
                     Entry::Vacant(entry) => {
                         entry.insert(());
                         Ok(Some(RuleTestPermit {
                             release: Some(PermitRelease::Local {
                                 active: Arc::clone(active),
-                                slot,
+                                user_id,
                             }),
                         }))
                     }
                 }
             }
             Backend::Redis(backend) => {
-                let key = lease_key(scope, user_id);
+                let key = format!("{KEY_PREFIX}:{user_id}");
                 let owner = Uuid::now_v7().to_string();
                 let mut connection = backend.connection().await?;
                 let result = tokio::time::timeout(REDIS_OPERATION_TIMEOUT, async {
@@ -183,7 +159,7 @@ impl RedisBackend {
             return Ok(connection.clone());
         }
 
-        let client = crate::redis_transport::client_from_url(self.redis_url.as_str()).map_err(|error| {
+        let client = redis::Client::open(self.redis_url.as_str()).map_err(|error| {
             warn!(%error, "Invalid Redis configuration for rule-test admission");
             RuleTestAdmissionError::Unavailable
         })?;
@@ -235,8 +211,8 @@ fn spawn_renewal(mut connection: ConnectionManager, key: String, owner: String) 
 
 enum PermitRelease {
     Local {
-        active: Arc<DashMap<AdmissionSlot, ()>>,
-        slot: AdmissionSlot,
+        active: Arc<DashMap<Uuid, ()>>,
+        user_id: Uuid,
     },
     Redis {
         connection: ConnectionManager,
@@ -258,8 +234,8 @@ impl Drop for RuleTestPermit {
             return;
         };
         match release {
-            PermitRelease::Local { active, slot } => {
-                active.remove(&slot);
+            PermitRelease::Local { active, user_id } => {
+                active.remove(&user_id);
             }
             PermitRelease::Redis {
                 mut connection,
@@ -331,36 +307,6 @@ mod tests {
         assert!(RENEW_IF_OWNER_SCRIPT.contains("EXPIRE"));
         assert!(RELEASE_IF_OWNER_SCRIPT.contains("GET"));
         assert!(RELEASE_IF_OWNER_SCRIPT.contains("DEL"));
-    }
-
-    /// NAN-2718: dedicated lease keys keep the historical byte shape; two
-    /// hosted-shared tenants never share a lease key for the same user id.
-    #[test]
-    fn lease_key_is_tenant_scoped() {
-        let user = Uuid::from_u128(7);
-        assert_eq!(
-            lease_key(SecurityTenantScope::dedicated(), user),
-            format!("nanosiem:rule-test:v1:{user}")
-        );
-        let a = SecurityTenantScope::EnterpriseShared(Uuid::from_u128(1));
-        let b = SecurityTenantScope::EnterpriseShared(Uuid::from_u128(2));
-        assert_ne!(lease_key(a, user), lease_key(b, user));
-        assert_ne!(lease_key(a, user), lease_key(SecurityTenantScope::dedicated(), user));
-    }
-
-    /// NAN-2718: the same user id in two tenants holds independent local slots.
-    #[tokio::test]
-    async fn local_admission_is_scoped_per_tenant() {
-        let admission = RuleTestAdmission::local();
-        let user = Uuid::now_v7();
-        let a = SecurityTenantScope::EnterpriseShared(Uuid::from_u128(1));
-        let b = SecurityTenantScope::EnterpriseShared(Uuid::from_u128(2));
-        let held = admission.acquire_in(a, user).await.unwrap().unwrap();
-        assert!(admission.acquire_in(a, user).await.unwrap().is_none());
-        assert!(admission.acquire_in(b, user).await.unwrap().is_some());
-        assert!(admission.acquire(user).await.unwrap().is_some());
-        drop(held);
-        assert!(admission.acquire_in(a, user).await.unwrap().is_some());
     }
 
     #[tokio::test]

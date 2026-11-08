@@ -7,9 +7,7 @@
 // Task #15 — until then the stub keeps the call sites compilable and
 // renders the buttons as inert.
 
-import type { MelodJobStartResponse } from '@/lib/api/types';
-import type { PollMelodJobOptions, StartMelodJobOptions } from '@/lib/melod-job-time';
-
+// Shared with the enterprise poller: core parser pages import these.
 export {
   DEFAULT_JOB_MAX_WAIT_MS,
   PARSER_JOB_SERVER_TIMEOUT_MS,
@@ -18,25 +16,30 @@ export {
   jobTimeoutMessage,
   useElapsedWhile,
 } from '@/lib/melod-job-time';
+export type { PollMelodJobOptions, StartMelodJobOptions } from '@/lib/melod-job-time';
 
+export const JOB_CANCELLED_MESSAGE = 'Job cancelled';
+
+// Same shape as src/enterprise/hooks/use-melod-job.ts so core callers
+// type-check against the stub exactly as they do against the real hook.
 export interface UseMelodJobReturn<TResult> {
-  isRunning: boolean;
+  start: (
+    fn: () => Promise<import('@/lib/api').MelodJobStartResponse>,
+    options?: import('@/lib/melod-job-time').StartMelodJobOptions,
+  ) => Promise<TResult>;
+  /** Stop polling and cancel the job on the server (no-op here). */
+  cancel: () => void;
+  result: TResult | null;
+  error: string | null;
   loading: boolean;
   progress: string | null;
-  status: string | null;
-  error: string | null;
-  result: TResult | null;
-  start: (fn: () => Promise<MelodJobStartResponse>, options?: StartMelodJobOptions) => Promise<TResult>;
-  cancel: () => void;
   reset: () => void;
 }
 
 export async function pollMelodJob<TResult>(
-  _fn: () => Promise<MelodJobStartResponse | TResult>,
-  _opts?: PollMelodJobOptions,
+  _fn: () => Promise<unknown>,
+  _opts?: import('@/lib/melod-job-time').PollMelodJobOptions,
 ): Promise<TResult> {
-  void _fn;
-  void _opts;
   throw new Error(
     'pollMelodJob is unavailable in open-core builds. Gate callers with ' +
       'useCapabilities().capabilities.melod before invoking.',
@@ -50,7 +53,7 @@ export async function pollMelodJob<TResult>(
 // down the React tree. Gate-the-caller cleanup is in Task #15.
 function rejectedStart() {
   console.warn(
-    '[open-core] useMelodJob.start() called in open-core build. ' +
+    '[NAN-745] useMelodJob.start() called in open-core build. ' +
       'Gate this caller with useCapabilities().capabilities.melod.',
   );
   return Promise.reject(
@@ -58,15 +61,13 @@ function rejectedStart() {
   );
 }
 
-const STUB_RETURN = {
-  isRunning: false,
-  progress: null,
-  loading: false,
-  status: null,
-  error: null,
-  result: null,
+const STUB_RETURN: UseMelodJobReturn<never> = {
   start: rejectedStart,
   cancel: () => {},
+  result: null,
+  error: null,
+  loading: false,
+  progress: null,
   reset: () => {},
 };
 

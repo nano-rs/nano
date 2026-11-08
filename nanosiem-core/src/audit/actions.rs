@@ -160,21 +160,10 @@ pub const SOURCE_SCOPE_UNRESTRICTED: &str = "source_scope_unrestricted";
 pub const SOURCE_SCOPE_GRANTED: &str = "source_scope_granted";
 /// A group's grant on a restricted `source_type` was revoked
 pub const SOURCE_SCOPE_REVOKED: &str = "source_scope_revoked";
-/// NAN-2361 wave 8 (hosted-shared lake): a tenant group's restricted source
-/// set (`metadata.log_source` slugs) was replaced
-pub const SOURCE_VISIBILITY_GROUP_SET: &str = "source_visibility_group_set";
-/// NAN-2361 wave 8: a tenant member's per-member source exceptions
-/// (`restrict` / `allow`) were replaced
-pub const SOURCE_VISIBILITY_MEMBER_SET: &str = "source_visibility_member_set";
-/// NAN-2361 wave 8: a read ran OUTSIDE the member deny set — the tenant
-/// detection runtime / a runner reading the full lake, or a case participant
-/// reading a case's attached evidence. Emitted once per run / read, with
-/// `source_visibility_bypass` naming the reason.
-pub const SOURCE_VISIBILITY_BYPASS: &str = "source_visibility_bypass";
 /// NAN-3222: a source-restricted caller's search explicitly named a source it
 /// cannot see (rows withheld, outcome `filtered`), or its raw SQL was refused
 /// because it is source-scoped (outcome `refused`). Rate limited per
-/// (tenant, actor, label, entry point); the user response is unchanged.
+/// (actor, label, entry point); the user response is unchanged.
 pub const SEARCH_SOURCE_SCOPE_DENIED: &str = "search.source_scope_denied";
 
 // =============================================================================
@@ -207,11 +196,6 @@ pub const SEARCH_HISTORY_CLEARED: &str = "search_history_cleared";
 pub const SEARCH_HISTORY_ENABLED: &str = "search_history_enabled";
 /// Search-history tracking was turned off (evasion lever — single-filter hunt)
 pub const SEARCH_HISTORY_DISABLED: &str = "search_history_disabled";
-
-/// A stored short link (`POST /api/search/share`) was created (NAN-2361)
-pub const SHARED_SEARCH_CREATED: &str = "shared_search_created";
-/// An AI query explanation was stored in the tenant cache (NAN-2361)
-pub const QUERY_EXPLANATION_STORED: &str = "query_explanation_stored";
 
 // =============================================================================
 // System Actions
@@ -364,6 +348,16 @@ pub const LOG_SOURCE_PUBLISHED: &str = "log_source_published";
 pub const LOG_SOURCE_REVERTED: &str = "log_source_reverted";
 /// All log sources were deployed
 pub const LOG_SOURCE_DEPLOY_ALL: &str = "log_source_deploy_all";
+/// Nano Pipe (NAN-4919): recent stored events read as preview samples
+pub const PIPE_RECENT_EVENTS_READ: &str = "pipe_recent_events_read";
+/// Nano Pipe (NAN-4919): a draft pipeline was previewed in the sandbox
+pub const PIPE_PREVIEWED: &str = "pipe_previewed";
+/// Nano Pipe (NAN-4919): a live tap session on a source's Vector input started
+pub const PIPE_TAP_STARTED: &str = "pipe_tap_started";
+/// Nano Pipe (NAN-4919): a live tap session's captured events were read
+pub const PIPE_TAP_READ: &str = "pipe_tap_read";
+/// Nano Pipe (NAN-4919): a live tap session was stopped
+pub const PIPE_TAP_STOPPED: &str = "pipe_tap_stopped";
 
 // =============================================================================
 // Integration Collector Actions (NAN-2189)
@@ -385,7 +379,7 @@ pub const CUSTOM_INTEGRATION_UPDATED: &str = "custom_integration_updated";
 pub const CUSTOM_INTEGRATION_DELETED: &str = "custom_integration_deleted";
 /// User-authored collector code was exercised against transient test values
 pub const CUSTOM_INTEGRATION_PREVIEWED: &str = "custom_integration_previewed";
-/// pivt generated a collector code candidate from a user-authored definition
+/// PIVT generated a collector code candidate from a user-authored definition
 pub const CUSTOM_INTEGRATION_CODE_GENERATED: &str = "custom_integration_code_generated";
 
 // =============================================================================
@@ -488,6 +482,18 @@ pub const SOURCE_CONFIG_DEPLOYED: &str = "source_config_deployed";
 pub const SOURCE_CONFIG_UNDEPLOYED: &str = "source_config_undeployed";
 /// All source configs were deployed
 pub const SOURCE_CONFIG_DEPLOY_ALL: &str = "source_config_deploy_all";
+/// NAN-4914: a connector pull feed was created
+pub const CONNECTOR_FEED_CREATED: &str = "connector_feed_created";
+/// NAN-4914: a connector pull feed was paused
+pub const CONNECTOR_FEED_PAUSED: &str = "connector_feed_paused";
+/// NAN-4914: a connector pull feed was resumed
+pub const CONNECTOR_FEED_RESUMED: &str = "connector_feed_resumed";
+/// NAN-4914: a connector pull feed was removed
+pub const CONNECTOR_FEED_DELETED: &str = "connector_feed_deleted";
+/// NAN-4914: a connector pull feed stream was re-anchored point-forward
+pub const CONNECTOR_FEED_CHECKPOINT_RESET: &str = "connector_feed_checkpoint_reset";
+/// NAN-4931: an operator adopted a newer bundled connector spec for a pull feed
+pub const CONNECTOR_FEED_SPEC_ADOPTED: &str = "connector_feed_spec_adopted";
 /// Routing rule was created
 pub const ROUTING_RULE_CREATED: &str = "routing_rule_created";
 /// Routing rule was updated
@@ -513,6 +519,17 @@ pub const ENRICHMENT_DISABLED: &str = "enrichment_disabled";
 pub const AUTO_SYNC_CONFIGURED: &str = "auto_sync_configured";
 
 // =============================================================================
+// Content channel actions (NAN-4955)
+// =============================================================================
+
+/// A nano content channel check ran (check now, or the scheduled check).
+pub const CONTENT_CHANNELS_CHECKED: &str = "content_channels_checked";
+/// A content bundle file was imported (air-gap).
+pub const CONTENT_CHANNEL_IMPORTED: &str = "content_channel_imported";
+/// A content channel was opted out of or back into online updates.
+pub const CONTENT_CHANNEL_UPDATED: &str = "content_channel_updated";
+
+// =============================================================================
 // Custom Enrichment Actions
 // =============================================================================
 
@@ -528,21 +545,18 @@ pub const CUSTOM_ENRICHMENT_DEPLOYED: &str = "custom_enrichment_deployed";
 pub const CUSTOM_ENRICHMENT_DISABLED: &str = "custom_enrichment_disabled";
 /// Custom enrichment run was triggered
 pub const CUSTOM_ENRICHMENT_RUN_TRIGGERED: &str = "custom_enrichment_run_triggered";
-/// Custom enrichment execution (validate / deploy / run) was refused because
-/// tenant-authored code cannot run in hosted-shared mode (NAN-2862)
-pub const CUSTOM_ENRICHMENT_EXECUTION_REFUSED: &str = "custom_enrichment_execution_refused";
 
 // =============================================================================
-// IOC List Actions (NAN-3038: code-free tenant indicator lists)
+// IOC List Actions (enterprise code-free IOC lists)
 // =============================================================================
 
 /// IOC list was created
 pub const IOC_LIST_CREATED: &str = "ioc_list_created";
-/// IOC list indicators or description were updated
+/// IOC list indicators or metadata changed (append / replace / remove / expiry)
 pub const IOC_LIST_UPDATED: &str = "ioc_list_updated";
-/// IOC list was deleted (and withdrawn from the tenant IOC snapshot)
+/// IOC list was deleted (its live indicators withdrawn from ClickHouse)
 pub const IOC_LIST_DELETED: &str = "ioc_list_deleted";
-/// IOC list was published to the tenant IOC snapshot
+/// IOC list publication finished (success or failure; see `success`)
 pub const IOC_LIST_PUBLISHED: &str = "ioc_list_published";
 
 // =============================================================================
@@ -557,13 +571,18 @@ pub const AGENT_ENRICHMENT_UPDATED: &str = "agent_enrichment_updated";
 pub const AGENT_ENRICHMENT_DELETED: &str = "agent_enrichment_deleted";
 /// Agent enrichment provider credentials were updated
 pub const AGENT_ENRICHMENT_CREDENTIALS_UPDATED: &str = "agent_enrichment_credentials_updated";
-/// NAN-3763: a threat-intel provider was installed for the tenant
+
+// =============================================================================
+// Threat-intel lookup actions (NAN-3763 / NAN-4931)
+// =============================================================================
+
+/// A threat-intel lookup provider was installed
 pub const THREAT_INTEL_PROVIDER_INSTALLED: &str = "threat_intel_provider_installed";
-/// NAN-3763: a tenant threat-intel provider's credential, limits or state changed
+/// A threat-intel lookup provider's settings or credential changed
 pub const THREAT_INTEL_PROVIDER_UPDATED: &str = "threat_intel_provider_updated";
-/// NAN-3763: a threat-intel provider was removed (credential, cache and counters go with it)
+/// A threat-intel lookup provider was uninstalled
 pub const THREAT_INTEL_PROVIDER_UNINSTALLED: &str = "threat_intel_provider_uninstalled";
-/// NAN-3763: one provider result for one artifact lookup (fresh, cached, refused)
+/// One provider result of a threat-intel lookup (fresh, cached or refused)
 pub const THREAT_INTEL_LOOKUP_FETCHED: &str = "threat_intel_lookup_fetched";
 
 // =============================================================================
@@ -593,6 +612,23 @@ pub const OIDC_PROVIDER_DISABLED: &str = "oidc_provider_disabled";
 pub const OIDC_GROUP_MAPPINGS_UPDATED: &str = "oidc_group_mappings_updated";
 /// A new user was just-in-time provisioned on first OIDC login
 pub const OIDC_USER_PROVISIONED: &str = "oidc_user_provisioned";
+/// NAN-3904: an SSO sign-in was refused (no mapped IdP group for a first-time
+/// or JIT user, invitation-only provider, or group membership unknown)
+pub const SSO_SIGN_IN_DENIED: &str = "sso_sign_in_denied";
+/// NAN-3904: an SSO sign-in reconciled the user's group grants against the
+/// groups the IdP asserted (SSO-derived grants added/removed; manual kept)
+pub const SSO_GROUP_GRANTS_SYNCHRONIZED: &str = "sso_group_grants_synchronized";
+
+// =============================================================================
+// Playbook Repository Actions (NAN-4947)
+// =============================================================================
+
+/// Playbook repository was registered (first-party catalog reconcile)
+pub const PLAYBOOK_REPO_CREATED: &str = "playbook_repo_created";
+/// Playbook repository was updated (first-party catalog reconcile)
+pub const PLAYBOOK_REPO_UPDATED: &str = "playbook_repo_updated";
+/// Playbook repository was synced (scheduled)
+pub const PLAYBOOK_REPO_SYNCED: &str = "playbook_repo_synced";
 
 // =============================================================================
 // Parser Repository Actions
@@ -712,18 +748,10 @@ pub const MELOD_CONFIG_UPDATED: &str = "melod_config_updated";
 pub const MELOD_CREDENTIALS_UPDATED: &str = "melod_credentials_updated";
 /// MeloD connection was validated
 pub const MELOD_CONNECTION_VALIDATED: &str = "melod_connection_validated";
-/// NAN-2361 wave 6: a tenant system AI principal run (background narration /
-/// hunting / summary) finished; details carry purpose, calls, credits, outcome.
-pub const MELOD_BACKGROUND_AI_RAN: &str = "melod_background_ai_ran";
-/// NAN-3205: pivt drafted a playbook from an analyst brief (dedicated and
-/// enterprise-shared). Details carry the brief size, category, step count and
-/// whether the single repair pass was needed — never the brief text itself.
+/// NAN-3205: pivt drafted a playbook from an analyst brief. Details carry the
+/// brief size, category, step count and whether the single repair pass was
+/// needed — never the brief text itself.
 pub const MELOD_PLAYBOOK_DRAFTED: &str = "melod_playbook_drafted";
-/// NAN-4535: pivt drafted a disabled SOAR flow from an analyst brief
-/// (enterprise-shared). Details carry the brief size, trigger kind, module
-/// count, the created draft flow id and whether the single repair pass was
-/// needed, never the brief text itself.
-pub const MELOD_FLOW_DRAFTED: &str = "melod_flow_drafted";
 /// NAN-4653: pivt proposed a revision of an open artifact in a conversational
 /// edit session (kind, artifact id and base version). Nothing is saved: the
 /// page applies the revision as an unsaved change. Details carry sizes, the
@@ -756,13 +784,6 @@ pub const TIERING_CONFIG_APPLIED: &str = "tiering_config_applied";
 pub const ORG_CONTEXT_UPDATED: &str = "org_context_updated";
 /// Health monitoring settings were updated
 pub const HEALTH_MONITORING_UPDATED: &str = "health_monitoring_updated";
-/// The tenant's internal DNS suffix list was updated (NAN-3226)
-pub const INTERNAL_DOMAINS_UPDATED: &str = "internal_domains_updated";
-/// A SIEM-health finding suppression was recorded (NAN-2361 tenant port; the
-/// dedicated handler never audited these).
-pub const SIEM_HEALTH_SUPPRESSION_RECORDED: &str = "siem_health_suppression_recorded";
-/// A SIEM-health finding suppression was deactivated.
-pub const SIEM_HEALTH_SUPPRESSION_REVOKED: &str = "siem_health_suppression_revoked";
 /// Developer settings were updated
 pub const DEVELOPER_SETTINGS_UPDATED: &str = "developer_settings_updated";
 /// Search admission settings were updated
@@ -783,10 +804,6 @@ pub const AVAILABLE_MODEL_DELETED: &str = "available_model_deleted";
 pub const MODEL_CATALOG_SYNCED: &str = "model_catalog_synced";
 /// Webhook was tested
 pub const WEBHOOK_TESTED: &str = "webhook_tested";
-
-/// The sovereign capacity advisor raised, changed or cleared a
-/// recommendation (add hosts, add disks, raise host RAM/CPU, grow a cell volume).
-pub const SOVEREIGN_CAPACITY_RECOMMENDED: &str = "sovereign_capacity_recommended";
 
 /// A system-health lifecycle was acknowledged by an owner.
 pub const SYSTEM_HEALTH_ACKNOWLEDGED: &str = "system_health_acknowledged";
@@ -814,16 +831,6 @@ pub const TUNING_REVERTED: &str = "tuning_reverted";
 pub const RISK_ENTITY_CLEARED: &str = "risk_entity_cleared";
 /// All risk scores were cleared
 pub const RISK_ALL_CLEARED: &str = "risk_all_cleared";
-/// A risk watchlist was created (NAN-3228)
-pub const RISK_WATCHLIST_CREATED: &str = "risk_watchlist_created";
-/// A risk watchlist's name / description / weight / scoring / review date changed
-pub const RISK_WATCHLIST_UPDATED: &str = "risk_watchlist_updated";
-/// A risk watchlist was deleted (with its members)
-pub const RISK_WATCHLIST_DELETED: &str = "risk_watchlist_deleted";
-/// Entities were added to a risk watchlist
-pub const RISK_WATCHLIST_MEMBERS_ADDED: &str = "risk_watchlist_members_added";
-/// Entities were removed from a risk watchlist
-pub const RISK_WATCHLIST_MEMBERS_REMOVED: &str = "risk_watchlist_members_removed";
 
 // =============================================================================
 // Detection Actions (additional)
@@ -872,9 +879,6 @@ pub const MFA_CHALLENGE_FAILED: &str = "mfa_challenge_failed";
 pub const MFA_BACKUP_CODE_USED: &str = "mfa_backup_code_used";
 /// MFA setup was initiated (TOTP secret issued, not yet verified)
 pub const MFA_SETUP_INITIATED: &str = "mfa_setup_initiated";
-/// A hosted-shared local account was activated from its one-time invitation
-/// (password set; MFA enrollment pending). NAN-3436.
-pub const ENTERPRISE_SHARED_LOCAL_ACTIVATION: &str = "enterprise_shared_local_activation";
 /// MFA setup was completed (first valid code verified, MFA now active)
 pub const MFA_SETUP_COMPLETE: &str = "mfa_setup_complete";
 /// MFA was disabled for an account
@@ -917,8 +921,6 @@ pub const MITRE_CATALOG_SYNCED: &str = "mitre_catalog_synced";
 pub const MARKETPLACE_REPO_CREATED: &str = "marketplace_repo_created";
 /// Marketplace repository was updated
 pub const MARKETPLACE_REPO_UPDATED: &str = "marketplace_repo_updated";
-/// Marketplace repository was deleted
-pub const MARKETPLACE_REPO_DELETED: &str = "marketplace_repo_deleted";
 
 // =============================================================================
 // GDPR Anonymization Actions
@@ -934,17 +936,20 @@ pub const GDPR_ANONYMIZATION_COMPLETED: &str = "gdpr_anonymization_completed";
 pub const GDPR_ANONYMIZATION_FAILED: &str = "gdpr_anonymization_failed";
 
 // =============================================================================
-// Ingest Token Actions (NAN-3770, dedicated deployments)
+// Ingest Token Actions (NAN-4907, ported from NAN-3770 / NAN-3806)
 // =============================================================================
 
 /// A named ingest token was issued (the value is never in the audit row)
 pub const INGEST_TOKEN_CREATED: &str = "ingest_token_created";
+/// A named ingest token was rotated: a new value was issued with the same
+/// name and source, and the old value revoked in the same transaction
+pub const INGEST_TOKEN_ROTATED: &str = "ingest_token_rotated";
 /// A named ingest token was revoked
 pub const INGEST_TOKEN_REVOKED: &str = "ingest_token_revoked";
-/// An unbound named ingest token was bound to a log source (NAN-3806)
+/// An unbound ingest token was bound to a log source
 pub const INGEST_TOKEN_BOUND: &str = "ingest_token_bound";
-/// The install-wide ingest token was enabled or disabled
-pub const INGEST_INSTALL_TOKEN_UPDATED: &str = "ingest_install_token_updated";
+/// The install-wide ingest token's state changed (enabled, mode or binding)
+pub const INGEST_TOKEN_SETTINGS_UPDATED: &str = "ingest_token_settings_updated";
 
 // =============================================================================
 // IP Allowlist Actions
@@ -1042,12 +1047,14 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
     APIKEY_ENABLED,
     APIKEY_DISABLED,
     APIKEY_UPDATED,
-    // Ingest credential lifecycle (NAN-3770) — admin-gated, low-volume
-    // changes to who may write events. Durable like the API-key lifecycle.
+    // Ingest credential lifecycle (NAN-4907) — admin-gated, low-volume
+    // changes to who may write events, and as which source. Durable like the
+    // API-key lifecycle.
     INGEST_TOKEN_CREATED,
+    INGEST_TOKEN_ROTATED,
     INGEST_TOKEN_REVOKED,
     INGEST_TOKEN_BOUND,
-    INGEST_INSTALL_TOKEN_UPDATED,
+    INGEST_TOKEN_SETTINGS_UPDATED,
     // Federated identity — JIT provisioning of a new user on first OIDC login.
     OIDC_USER_PROVISIONED,
     // Session termination — administrative, low-volume.
@@ -1061,14 +1068,6 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
     SOURCE_SCOPE_UNRESTRICTED,
     SOURCE_SCOPE_GRANTED,
     SOURCE_SCOPE_REVOKED,
-    // NAN-2361 wave 8: the group / member visibility writes are admin-gated
-    // (`source_scopes:manage`) and low-volume, like the four above. The
-    // BYPASS record is deliberately NOT here: a case participant can issue
-    // case-evidence searches at will, so a durable per-read insert would be
-    // floodable; on the shared lake it is appended inside the signed tenant
-    // transaction regardless.
-    SOURCE_VISIBILITY_GROUP_SET,
-    SOURCE_VISIBILITY_MEMBER_SET,
 ];
 
 /// Returns `true` when `action` must be emitted durably (synchronous insert,
@@ -1107,9 +1106,10 @@ mod durable_classifier_tests {
             "apikey_disabled",
             "apikey_updated",
             "ingest_token_created",
+            "ingest_token_rotated",
             "ingest_token_revoked",
             "ingest_token_bound",
-            "ingest_install_token_updated",
+            "ingest_token_settings_updated",
             "oidc_user_provisioned",
             "session_terminated",
             "user_sessions_terminated",
@@ -1117,8 +1117,6 @@ mod durable_classifier_tests {
             "source_scope_unrestricted",
             "source_scope_granted",
             "source_scope_revoked",
-            "source_visibility_group_set",
-            "source_visibility_member_set",
         ];
         let mut actual: Vec<&str> = SECURITY_CRITICAL_ACTIONS.to_vec();
         expected.sort_unstable();

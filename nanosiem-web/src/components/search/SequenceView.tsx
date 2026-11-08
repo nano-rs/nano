@@ -7,10 +7,8 @@ import {
   Zap,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { isPlaceholderValue } from '@/lib/is-placeholder-value';
-import { parseTimestampAsUTC } from '@/lib/date-utils';
-import { formatCellValue } from '@/lib/format-cell-value';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
+import { SEMANTIC_FIELDS, isSchemaField } from '@/lib/schema-fields';
 import { buildSecondaryPrefs, SEQUENCE_SECONDARY_BASE } from '@/lib/secondary-identity-prefs';
 
 // ─────────────────────────── types ───────────────────────────
@@ -108,9 +106,10 @@ function formatUtcHms(ms: number): string {
 
 function parseStepTime(raw: string): number {
   if (!raw) return NaN;
-  // Backend hands us ISO-ish or "YYYY-MM-DD HH:MM:SS" — tolerate both;
-  // naive strings are treated as UTC.
-  const t = parseTimestampAsUTC(raw).getTime();
+  // Backend hands us ISO-ish or "YYYY-MM-DD HH:MM:SS" — tolerate both.
+  const iso = raw.includes('T') ? raw : raw.replace(' ', 'T');
+  const withZ = /Z$/.test(iso) ? iso : `${iso}Z`;
+  const t = new Date(withZ).getTime();
   return Number.isFinite(t) ? t : NaN;
 }
 
@@ -159,9 +158,7 @@ function adaptResult(
 
   for (const [key, value] of Object.entries(f)) {
     if (META_KEYS.has(key)) continue;
-    // "-" is the OCSF "no value" placeholder, not a real label/group key;
-    // formatCellValue keeps Array(String) columns from leaking `["v"]` JSON.
-    const strValue = isPlaceholderValue(value) ? '' : formatCellValue(value);
+    const strValue = value == null ? '' : String(value);
 
     const stepMatch = key.match(/^step(\d+)_(.+)$/);
     if (stepMatch) {
@@ -183,22 +180,35 @@ function adaptResult(
     const s = stepData[n];
     const captured = s.fields;
     // Best-effort summary: proc > spawned, proc → dest, or first captured
-    const procKey = Object.keys(captured).find((k) => /^(process|proc|process_name|parent_process_name)$/.test(k));
+    // Captured names may be either profile's column (NAN-4903 field map).
+    const procKey = Object.keys(captured).find(
+      (k) => /^(process|proc)$/.test(k) || isSchemaField(k, 'processName') || isSchemaField(k, 'parentProcessName'),
+    );
     const spawnedKey = Object.keys(captured).find((k) => /^(child_process|child_process_name|spawned)$/.test(k));
-    const destKey = Object.keys(captured).find((k) => /^(dest|dest_ip|dest_host|dest_domain|dest_url|url)$/.test(k));
+    const destKey = Object.keys(captured).find(
+      (k) =>
+        /^(dest|dest_domain|dest_url)$/.test(k) ||
+        isSchemaField(k, 'destIp') ||
+        isSchemaField(k, 'destHost') ||
+        isSchemaField(k, 'url'),
+    );
     let summary = '';
     if (procKey && spawnedKey) summary = `${captured[procKey]} › ${captured[spawnedKey]}`;
     else if (procKey && destKey) summary = `${captured[procKey]} → ${captured[destKey]}`;
     else if (procKey) summary = captured[procKey];
     else if (destKey) summary = captured[destKey];
     else {
-      // First non-empty captured field value (placeholders already blanked)
-      const first = Object.values(captured).find((v) => v);
-      summary = first || (s.eventId ? `event_id=${s.eventId}` : `step ${n}`);
+      // First non-meta captured field value
+      const first = Object.values(captured)[0];
+      summary = first ?? (s.eventId ? `event_id=${s.eventId}` : `step ${n}`);
     }
 
     // Details: the next most-useful captured string, preferring cmdline/details/http
-    const detailKeyOrder = ['command_line', 'cmdline', 'details', 'http_url', 'http_referrer', 'file_path'];
+    const detailKeyOrder = [
+      ...SEMANTIC_FIELDS.commandLine.udm, ...SEMANTIC_FIELDS.commandLine.ocsf,
+      'cmdline', 'details', 'http_url', 'http_referrer',
+      ...SEMANTIC_FIELDS.filePath.udm, ...SEMANTIC_FIELDS.filePath.ocsf,
+    ];
     let details: string | null = null;
     for (const k of detailKeyOrder) {
       const v = captured[k];

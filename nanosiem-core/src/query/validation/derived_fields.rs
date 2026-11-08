@@ -13,11 +13,6 @@ use crate::query::ast::{
 use crate::query::command_outputs::command_created_columns;
 use std::collections::HashSet;
 
-/// Marker used by the validator after a command whose output schema is loaded
-/// at runtime. Field-name syntax is still validated, but a static event-schema
-/// typo gate cannot judge columns supplied by an input/lookup table.
-pub(crate) const DYNAMIC_PIPELINE_SCHEMA: &str = "__nano_dynamic_pipeline_schema__";
-
 /// Collect all field names created by pipeline commands in a query.
 ///
 /// Walks the parsed AST and returns a `HashSet<String>` of field names that
@@ -119,9 +114,6 @@ fn insert_agg_reference_alias(agg: &Aggregation, fields: &mut HashSet<String>) {
     if agg.alias.is_none() {
         if let Some(field) = &agg.field {
             fields.insert(format!("{}_{}", agg.func.as_str(), field).to_lowercase());
-            if let Some(leaf) = field.rsplit('.').next().filter(|leaf| *leaf != field) {
-                fields.insert(format!("{}_{}", agg.func.as_str(), leaf).to_lowercase());
-            }
         }
     }
 }
@@ -235,12 +227,6 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
             for sb in split_by {
                 fields.insert(sb.to_lowercase());
             }
-            // NAN-4289 (F25): a split timechart pivots into one column per
-            // series VALUE (`GET`, `POST`, `OTHER`), known only at runtime.
-            // Later commands may address them (`| where GET > 7000`).
-            if !split_by.is_empty() {
-                fields.insert(DYNAMIC_PIPELINE_SCHEMA.to_string());
-            }
             for agg in aggregations {
                 fields.insert(get_aggregation_output_name(agg));
                 insert_agg_reference_alias(agg, fields);
@@ -271,25 +257,13 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
                 fields.insert("last_seen".to_string());
             }
         }
-        Command::Lookup {
-            output_fields,
-            output_renames,
-            ..
-        } => {
+        Command::Lookup { output_fields, output_renames, .. } => {
             if let Some(of) = output_fields {
                 for f in of {
-                    let target = output_renames
-                        .iter()
-                        .find(|r| &r.from == f)
-                        .map_or(f, |r| &r.to);
+                    let target = output_renames.iter().find(|r| &r.from == f).map_or(f, |r| &r.to);
                     fields.insert(target.to_lowercase());
                 }
-            } else {
-                fields.insert(DYNAMIC_PIPELINE_SCHEMA.to_string());
             }
-        }
-        Command::InputLookup { .. } => {
-            fields.insert(DYNAMIC_PIPELINE_SCHEMA.to_string());
         }
         Command::Transaction {
             fields: tx_fields, ..
@@ -319,20 +293,12 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
                 fields.insert(format!("step{}_time", n));
                 fields.insert(format!("step{}_event_id", n));
                 for field in capture_fields {
-                    fields.insert(format!(
-                        "step{}_{}",
-                        n,
-                        field.to_lowercase().replace('.', "_")
-                    ));
+                    fields.insert(format!("step{}_{}", n, field.to_lowercase()));
                 }
                 // Auto-captured fields from condition expressions
                 let cond_fields = collect_fields_from_expr(cond);
                 for field in &cond_fields {
-                    fields.insert(format!(
-                        "step{}_{}",
-                        n,
-                        field.to_lowercase().replace('.', "_")
-                    ));
+                    fields.insert(format!("step{}_{}", n, field.to_lowercase()));
                 }
             }
             fields.insert("sequence_duration_seconds".to_string());
@@ -357,10 +323,6 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
             // resolve_identity makes them unambiguous — an ambiguous reference
             // is codegen's diagnostic to give, not a "did you mean" typo).
             for f in [
-                "identity_name",
-                "identity_hostname",
-                "identity_user",
-                "identity_mac",
                 "identity_confidence",
                 "identity_observed_at",
                 "identity_source",
@@ -396,18 +358,6 @@ mod tests {
         let fields = collect_derived_fields(&query);
         assert!(fields.contains("unique_users"));
         assert!(fields.contains("src_ip"));
-    }
-
-    #[test]
-    fn anomaly_aggregation_registers_stable_output_fields() {
-        let query = parse_query(
-            "* | anomaly sum(traffic.bytes) by src_endpoint.ip | table sum_traffic_bytes, expected, anomaly_score",
-        )
-        .unwrap();
-        let fields = collect_derived_fields(&query);
-        assert!(fields.contains("sum_traffic_bytes"));
-        assert!(fields.contains("expected"));
-        assert!(fields.contains("anomaly_score"));
     }
 
     #[test]
@@ -692,14 +642,12 @@ mod tests {
         ] {
             assert!(fields.contains(f), "missing always-bare output: {f}");
         }
-        for (col_suffix, _, _) in crate::query::clickhouse_sql_gen::identity::IDENTITY_COLUMN_FIELDS
-            .iter()
-            .chain(crate::query::clickhouse_sql_gen::identity::IDENTITY_DICT_ONLY_FIELDS.iter())
+        for (col_suffix, _, _) in
+            crate::query::clickhouse_sql_gen::identity::IDENTITY_COLUMN_FIELDS
+                .iter()
+                .chain(crate::query::clickhouse_sql_gen::identity::IDENTITY_DICT_ONLY_FIELDS.iter())
         {
-            assert!(
-                fields.contains(*col_suffix),
-                "missing bare alias: {col_suffix}"
-            );
+            assert!(fields.contains(*col_suffix), "missing bare alias: {col_suffix}");
         }
     }
 
@@ -733,17 +681,5 @@ mod tests {
         assert!(fields.contains("step3_user_agent"));
         assert!(fields.contains("sequence_duration_seconds"));
         assert!(fields.contains("sequence_count"));
-    }
-
-    #[test]
-    fn sequence_dotted_capture_uses_its_query_facing_alias() {
-        let query = parse_query(
-            r#"metadata.log_source="windows_sysmon" | sequence by user.name maxspan=5m fields(file.hashes.value) [class_uid=1001] [class_uid=1007]"#,
-        )
-        .unwrap();
-        let fields = collect_derived_fields(&query);
-        assert!(fields.contains("step1_file_hashes_value"));
-        assert!(fields.contains("step2_file_hashes_value"));
-        assert!(!fields.contains("step2_file.hashes.value"));
     }
 }

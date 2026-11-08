@@ -6,6 +6,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { meaningfulAuditEntries, RECENT_CHANGES_FETCH_LIMIT } from '@/lib/audit-feed';
 import { 
   api, 
   DetectionRule, 
@@ -14,8 +15,6 @@ import {
   TimeRange,
   QueryWarning,
 } from '@/lib/api';
-import { eventFieldValue } from '@/lib/event-field-access';
-import { meaningfulAuditEntries, RECENT_CHANGES_FETCH_LIMIT } from '@/lib/audit-feed';
 
 interface UseQueryResult<T> {
   data: T | null;
@@ -27,8 +26,6 @@ interface UseQueryResult<T> {
 interface UseQueryOptions {
   /** Skip the query (useful for conditional fetching based on permissions) */
   skip?: boolean;
-  /** Abort transport on navigation or a replacement fetch. */
-  abortOnCleanup?: boolean;
 }
 
 // Export for use in other files
@@ -43,7 +40,7 @@ interface UseMutationResult<TData, TVariables> {
 
 // Generic hook for queries
 function useQuery<T>(
-  queryFn: (signal?: AbortSignal) => Promise<T>,
+  queryFn: () => Promise<T>,
   deps: unknown[] = [],
   options?: UseQueryOptions
 ): UseQueryResult<T> {
@@ -57,14 +54,9 @@ function useQuery<T>(
   // fetch's data. Without this a slow dashboard-A response can land after a fast
   // dashboard-B fetch and render A's content under B's URL.
   const requestSeq = useRef(0);
-  const transport = useRef<AbortController | null>(null);
 
   const fetch = useCallback(async () => {
     const seq = ++requestSeq.current;
-    if (options?.abortOnCleanup) {
-      transport.current?.abort();
-      transport.current = new AbortController();
-    }
     if (options?.skip) {
       setLoading(false);
       return;
@@ -72,7 +64,7 @@ function useQuery<T>(
     setLoading(true);
     setError(null);
     try {
-      const result = await queryFn(transport.current?.signal);
+      const result = await queryFn();
       if (seq !== requestSeq.current) return; // superseded by a newer fetch
       setData(result);
     } catch (err) {
@@ -81,16 +73,14 @@ function useQuery<T>(
     } finally {
       if (seq === requestSeq.current) setLoading(false);
     }
-  }, [...deps, options?.skip, options?.abortOnCleanup]);
+  }, [...deps, options?.skip]);
 
   useEffect(() => {
-    if (options?.abortOnCleanup) setData(null);
     fetch();
     // Invalidate the in-flight request on deps change / unmount so its late
     // resolve is discarded (DSH10).
     return () => {
       requestSeq.current++;
-      if (options?.abortOnCleanup) transport.current?.abort();
     };
   }, [fetch]);
 
@@ -178,19 +168,31 @@ export function useClearFolderIcon() {
 }
 
 export function usePauseDetection() {
-  return useMutation((id: string) => api.pauseDetection(id));
+  return useMutation(
+    ({ id, expectedMode }: { id: string; expectedMode: DetectionRule['mode'] }) =>
+      api.pauseDetection(id, expectedMode),
+  );
 }
 
 export function useResumeDetection() {
-  return useMutation((id: string) => api.resumeDetection(id));
+  return useMutation(
+    ({ id, expectedMode }: { id: string; expectedMode: DetectionRule['mode'] }) =>
+      api.resumeDetection(id, expectedMode),
+  );
 }
 
 export function usePromoteDetection() {
-  return useMutation((id: string) => api.promoteDetection(id));
+  return useMutation(
+    ({ id, expectedMode }: { id: string; expectedMode: DetectionRule['mode'] }) =>
+      api.promoteDetection(id, expectedMode),
+  );
 }
 
 export function useDemoteDetection() {
-  return useMutation((id: string) => api.demoteDetection(id));
+  return useMutation(
+    ({ id, expectedMode }: { id: string; expectedMode: DetectionRule['mode'] }) =>
+      api.demoteDetection(id, expectedMode),
+  );
 }
 
 export function useRuleVersions(ruleId: string | undefined) {
@@ -255,7 +257,7 @@ export function useFleetHealth() {
 }
 
 /**
- * NAN-3064 — per-tenant detection scheduling lag (rules behind schedule,
+ * NAN-3064 — detection scheduling lag (rules behind schedule,
  * max / p95 lag, degraded when a rule lags > 2× its interval).
  */
 export function useSchedulingLag() {
@@ -412,12 +414,12 @@ export function useSearchFieldValues() {
 }
 
 // Saved search hooks
-export function useSavedSearches(options?: UseQueryOptions) {
-  return useQuery(() => api.listSavedSearches(), [], options);
+export function useSavedSearches() {
+  return useQuery(() => api.listSavedSearches(), []);
 }
 
-export function useSharedSearches(options?: UseQueryOptions) {
-  return useQuery(() => api.listSharedSearches(), [], options);
+export function useSharedSearches() {
+  return useQuery(() => api.listSharedSearches(), []);
 }
 
 export function useMySavedSearches() {
@@ -540,43 +542,21 @@ export function fromApiDetection(rule: DetectionRule) {
 // Extract key entities from matched events for display
 function extractEntities(events: Record<string, unknown>[]): string[] {
   if (!events || events.length === 0) return [];
-
+  
   const entities: string[] = [];
   const firstEvent = events[0];
-
-  // Canonical OCSF paths first. The accessor also handles literal dotted
-  // projection keys and repeated objects such as `file.hashes[].value`.
-  const entityFields = [
-    'actor.user.name',
-    'user.name',
-    'device.hostname',
-    'src_endpoint.ip',
-    'dst_endpoint.ip',
-    'src_endpoint.hostname',
-    'dst_endpoint.hostname',
-    'http_request.url.hostname',
-    'file.hashes.value',
-    'process.file.hashes.value',
-    'user',
-    'src_ip',
-    'dest_ip',
-    'dest_host',
-    'hostname',
-    'file_hash',
-    'url_domain',
-  ];
-
+  
+  // Priority order for entity extraction
+  const entityFields = ['user', 'src_ip', 'dest_ip', 'dest_host', 'hostname', 'file_hash', 'url_domain'];
+  
   for (const field of entityFields) {
-    const raw = eventFieldValue(firstEvent, field);
-    const values = Array.isArray(raw) ? raw : [raw];
-    for (const value of values) {
-      if (typeof value === 'string' && value.trim() && !entities.includes(value)) {
-        entities.push(value);
-        if (entities.length >= 2) return entities;
-      }
+    const value = firstEvent[field];
+    if (value && typeof value === 'string' && value.trim()) {
+      entities.push(value);
+      if (entities.length >= 2) break; // Max 2 entities
     }
   }
-
+  
   return entities;
 }
 
@@ -619,8 +599,8 @@ export function fromApiAlert(alert: Alert) {
 
 
 // Log Source hooks
-export function useLogSources(options?: UseQueryOptions) {
-  return useQuery(() => api.listLogSources(), [], options);
+export function useLogSources() {
+  return useQuery(() => api.listLogSources(), []);
 }
 
 export function useLogSource(id: string | undefined) {
@@ -666,16 +646,12 @@ export function useTestLogSourceVrl() {
       vrlCode,
       sampleLog,
       extensionVrl,
-      validateOcsf,
-      logSourceId,
     }: {
       vrlCode: string;
       sampleLog: string;
       /** NAN-874: when present, run vrlCode → extensionVrl as a chain. */
       extensionVrl?: string;
-      validateOcsf?: boolean;
-      logSourceId?: string;
-    }) => api.testLogSourceVrl(vrlCode, sampleLog, extensionVrl, validateOcsf, logSourceId)
+    }) => api.testLogSourceVrl(vrlCode, sampleLog, extensionVrl)
   );
 }
 
@@ -793,15 +769,6 @@ export function useUpdateOrganizationalContext() {
   return useMutation(api.updateOrganizationalContext.bind(api));
 }
 
-// Hosted-shared tenant AI settings (NAN-2361)
-export function useTenantAiSettings(options?: UseQueryOptions) {
-  return useQuery(() => api.getTenantAiSettings(), [], options);
-}
-
-export function useUpdateTenantAiSettings() {
-  return useMutation(api.updateTenantAiSettings.bind(api));
-}
-
 // Risk Settings hooks
 export function useRiskConfig() {
   return useQuery(() => api.getRiskConfig(), []);
@@ -831,7 +798,7 @@ export function useUpdateRiskNotableConfig() {
 export function useRiskyEntities(params?: import('@/lib/api').RiskEntitiesQuery) {
   return useQuery(
     () => api.getRiskyEntities(params),
-    [params?.window, params?.entity_type, params?.min_score, params?.max_score, params?.limit, params?.offset]
+    [params?.window, params?.entity_type, params?.min_score, params?.limit, params?.offset]
   );
 }
 
@@ -894,11 +861,10 @@ export function useSystemOverview(hours?: number) {
   );
 }
 
-export function useSystemConfig(options?: UseQueryOptions) {
+export function useSystemConfig() {
   return useQuery(
     () => api.getSystemConfig(),
-    [],
-    options
+    []
   );
 }
 
@@ -1119,35 +1085,9 @@ export function useBulkPrevalence() {
 
 export function useRareArtifacts(params?: { window?: string; type?: string; limit?: number; offset?: number }) {
   return useQuery(
-    () => rareArtifactsFollowingJob(params),
+    () => api.getRareArtifacts(params),
     [params?.window, params?.type, params?.limit, params?.offset]
   );
-}
-
-/** NAN-3088: on a lean tenant the rare list is a durable cell job. A pending
- * answer names its job; follow it through the Search Jobs API, then read the
- * page from that job's result. Dedicated tenants answer the first call. */
-export async function rareArtifactsFollowingJob(
-  params?: { window?: string; type?: string; limit?: number; offset?: number },
-  isCurrent: () => boolean = () => true,
-): Promise<import('@/lib/api/types').ArtifactListResponse> {
-  const first = await api.getRareArtifacts(params);
-  if (!first.job_id || first.job_status === 'completed' || first.job_status === undefined) return first;
-  const jobId = first.job_id;
-  const deadline = Date.now() + 40 * 60 * 1000;
-  for (;;) {
-    if (!isCurrent()) throw new Error('Rare-artifact list request was superseded');
-    if (Date.now() > deadline) throw new Error('The rare-artifact list did not finish computing in time');
-    const status = await api.getSearchJob(jobId);
-    if (status.task_kind && status.task_kind !== 'prevalence_export_v1') {
-      throw new Error('Rare-artifact job changed type unexpectedly');
-    }
-    if (status.status === 'completed') return api.getRareArtifacts({ ...params, job_id: jobId });
-    if (status.status === 'failed' || status.status === 'cancelled') {
-      throw new Error(status.error || `Rare-artifact job ${status.status}`);
-    }
-    await new Promise((resolve) => window.setTimeout(resolve, 1500));
-  }
 }
 
 export function useNewArtifacts(params?: { since?: string; type?: string; limit?: number; offset?: number }) {
@@ -1157,18 +1097,17 @@ export function useNewArtifacts(params?: { since?: string; type?: string; limit?
   );
 }
 
-export function useArtifactExplorer(params?: { window?: string; type?: string; risk_level?: string; search?: string; limit?: number; offset?: number; cursor_last_seen?: string; cursor_kind?: string; cursor_artifact?: string }) {
+export function useArtifactExplorer(params?: { window?: string; type?: string; risk_level?: string; search?: string; limit?: number; offset?: number }) {
   return useQuery(
     () => api.getArtifactExplorer(params),
-    [params?.window, params?.type, params?.risk_level, params?.search, params?.limit, params?.offset, params?.cursor_last_seen, params?.cursor_kind, params?.cursor_artifact]
+    [params?.window, params?.type, params?.risk_level, params?.search, params?.limit, params?.offset]
   );
 }
 
 export function useArtifactDetail(artifact: string | undefined, window?: string) {
   return useQuery(
-    (signal) => artifact ? api.getArtifactDetail(artifact, window, signal) : Promise.resolve(null),
-    [artifact, window],
-    { abortOnCleanup: true }
+    () => artifact ? api.getArtifactDetail(artifact, window) : Promise.resolve(null),
+    [artifact, window]
   );
 }
 
@@ -1401,11 +1340,6 @@ export function useOnboardingStatus(options?: UseQueryOptions) {
   );
 }
 
-/** NAN-4779: tenant members (and, on hosted-shared, pending invitations) for the Team step. */
-export function useUserList(options?: UseQueryOptions) {
-  return useQuery(() => api.listUsers(), [], options);
-}
-
 export function useCompleteOnboardingStep() {
   return useMutation((req: import('@/lib/api/onboarding').StepActionRequest) =>
     api.onboarding.completeStep(req)
@@ -1602,9 +1536,9 @@ export function useAuditLog(query: {
 
 /**
  * "Recent changes" / activity feeds: the newest `limit` audit entries that
- * record a change, without routine access rows (`apikey_authenticated`,
- * session refreshes; see `lib/audit-feed.ts`). Over-fetches so a burst of
- * routine rows cannot push every change out of the window.
+ * record a change, without routine access rows (key authentications, session
+ * and token refreshes; see `lib/audit-feed.ts`). Over-fetches so a burst of
+ * routine rows cannot push every change out of the window (NAN-3031).
  */
 export function useRecentAuditChanges(query: { start_time?: string; limit: number }) {
   return useQuery(

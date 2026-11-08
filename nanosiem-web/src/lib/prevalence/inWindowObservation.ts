@@ -1,40 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// NAN-2361 layer 1: in-window artifact observation.
+// NAN-2361 layer 1: in-window artifact observation (ported to the ClickHouse
+// product in G22 / NAN-4931).
 //
 // WHY THIS EXISTS
-// The rarity chart's Y axis used to come from the immutable prevalence snapshot,
-// which rebuilds per generation and therefore lags ingest by 30-90 minutes at
-// 120 eps (the tail compactor withholds a generation-ready commit until 64 MB /
-// hour-close / 900K staged rows, then the manager rate-limits promotion to one
-// per 900s). An analyst triaging a minutes-old alert asked the chart "how many
-// hosts touched this?" and got a snapshot miss, which the UI rendered as
-// hostCount 0 -- indistinguishable from "common and boring".
+// The rarity chart's Y axis comes from the prevalence baseline, which on
+// ClickHouse is a set of materialized-view aggregates (clickhouse/129) read
+// through refreshed dictionaries, so a minutes-old artifact can have no
+// baseline yet. The UI rendered that miss as hostCount 0 -- indistinguishable
+// from "common and boring". (On main the lag was the lake snapshot's; the gap
+// is the same.)
 //
-// The answer was always sitting in the events the search already matched. This
+// The answer is sitting in the events the search already matched. This
 // module asks for it directly: an equality-filtered `stats dc(host) by <path>`
-// over the SAME window the user just searched. Measured at 87ms for 18
-// artifacts over a 322,927-row window.
+// over the SAME window the user just searched.
 //
-// THREE TRAPS THIS ENCODES (all found by measurement, not inspection):
+// TRAPS THIS ENCODES:
 //
-// 1. NEVER use an existence filter (`file.hashes.value=*`). On the lake path it
-//    is wrong in BOTH directions: it admits rows carrying no hashes at all (395
-//    of 400 sampled) and drops ~55% of genuinely matching rows (13 hosts vs the
-//    27 an equality filter finds for the same artifact and window). Equality
-//    ORs are the only shape verified correct. Tracked separately as a lake
-//    search-correctness bug.
+// 1. Equality ORs only, never an existence filter (`file_hash=*`): equality is
+//    the shape verified correct on both stores.
 //
-// 2. Host identity MUST mirror the baseline builder's, or layers 1 and 2 count
-//    different things and disagree on screen. `prevalence_build.rs`
-//    (SQL_OBSERVATION_PART) keys on
-//    `coalesce(nullIf(device.hostname,''), nullIf(src_endpoint.hostname,''), 'unknown')`.
-//    A plain `dc(device.hostname)` returns 0 for OCSF classes that carry no
-//    `device` object at all (verified against http_request rows).
+// 2. Host identity MUST mirror the baseline's, or the two layers count
+//    different things and disagree on screen. The ClickHouse prevalence MVs
+//    key on `if(src_host != '', src_host, if(src_ip != '', src_ip, 'unknown'))`.
+//    NOT `coalesce`: UDM string columns are '' when absent and coalesce('')
+//    collapses every host-less row into one host (measured on the G22 e2e
+//    stack: two host-less IPs counted as 1).
 //
-// 3. Group keys for hash paths are the ARRAY, not the element -- `['9728...']`,
-//    not `'9728...'`. Today's data is >=99% single-element SHA-256, but a future
-//    `[md5, sha256]` array forms a composite key, so callers match by
+// 3. Group keys may be arrays (an OCSF hash array); callers match by
 //    CONTAINMENT rather than equality.
 //
 // `dc()` compiles to ClickHouse `uniqExact` (clickhouse_sql_gen/aggregation.rs),
@@ -50,53 +43,56 @@ import { nplQuotedBody } from '../npl-quote.ts';
 export const OBSERVATION_BATCH_SIZE = 100;
 
 /**
- * OCSF paths that can carry a file hash.
- *
- * The baseline builder ingests only `file.hashes` and `process.file.hashes`;
- * the ingest stamper additionally reads `actor.process.file.hashes`. We query
- * the union so layer 1 is never blinder than either -- an artifact the stamper
- * flagged must be countable here.
+ * UDM profile: fields that carry a file hash, exactly what the baseline
+ * aggregates read (`hash_prevalence_file_hash_mv`,
+ * `hash_prevalence_process_hash_mv`). Under the OCSF profile these UDM names
+ * do NOT reach the OCSF hash arrays (measured on an OCSF stack: 0 rows for a
+ * hash present in `process.file.hashes.value`), so OCSF uses
+ * {@link OCSF_HASH_PATHS}; pick the set with {@link observationPathsFor}.
  */
-export const HASH_PATHS = [
+export const HASH_PATHS = ['file_hash', 'process_hash'] as const;
+
+/**
+ * Fields that carry a domain: what the domain prevalence aggregates read
+ * (`domain_prevalence_mv` on `dest_host`, `_query_mv`, `_url_domain_mv`).
+ */
+export const DOMAIN_PATHS = ['dest_host', 'query', 'url_domain'] as const;
+
+/** OCSF profile (`ocsf_logs`): the hash arrays the OCSF baseline and the
+    ingest stamper read. Equality on an array path is containment. */
+export const OCSF_HASH_PATHS = [
   'file.hashes.value',
   'process.file.hashes.value',
   'actor.process.file.hashes.value',
 ] as const;
 
-/**
- * OCSF paths that can carry a domain/hostname.
- *
- * `dst_endpoint.hostname` is frequently a `'-'` placeholder; it is included
- * because it is what the BASELINE builder reads, and omitting it would make
- * layer 1 disagree with layer 2 on exactly the artifacts that do have it.
- */
-export const DOMAIN_PATHS = [
+/** OCSF profile: the paths that carry a domain / hostname. */
+export const OCSF_DOMAIN_PATHS = [
   'query.hostname',
   'http_request.url.hostname',
   'url.hostname',
   'dst_endpoint.hostname',
 ] as const;
 
-/**
- * Host identity, mirroring the baseline builder. Kept as a single exported
- * constant so a future change to the builder has one obvious counterpart here.
- */
-export const HOST_IDENTITY_EVAL =
-  'eval __h=coalesce(device.hostname, src_endpoint.hostname, "unknown")';
+/** OCSF host identity: device first, then the source endpoint (main's
+    `coalesce(nullIf(device.hostname,''), nullIf(src_endpoint.hostname,''), 'unknown')`). */
+export const OCSF_HOST_IDENTITY_EVAL =
+  'eval __h=if(device.hostname!="", device.hostname, if(src_endpoint.hostname!="", src_endpoint.hostname, "unknown"))';
 
 /**
- * KNOWN LIMITATION, shared with the baseline builder.
- *
- * Rows carrying neither `device.hostname` nor `src_endpoint.hostname` all
- * collapse into the single literal host `'unknown'`. Measured on the live soak:
- * 96,597 of 322,720 events in a 45-minute window (30%) land in that bucket.
- *
- * So an artifact seen ONLY on host-less rows reports `hosts: 1` and reads as
- * rare when its true spread is unknown, not small. This is not introduced here
- * -- `prevalence_build.rs` coalesces identically, and deliberately: the two
- * layers must count the same notion of "host" or they visibly disagree on the
- * same artifact. Fixing it means giving host-less OCSF classes a real identity
- * at ingest, which is a schema question, not a chart one.
+ * Host identity, mirroring the baseline aggregates. Kept as a single exported
+ * constant so a change to the aggregates has one obvious counterpart here.
+ */
+export const HOST_IDENTITY_EVAL =
+  'eval __h=if(src_host!="", src_host, if(src_ip!="", src_ip, "unknown"))';
+
+/** The event time field the window minimum is taken over. */
+export const TIME_FIELD = 'timestamp';
+
+/**
+ * KNOWN LIMITATION, shared with the baseline: rows carrying neither
+ * `src_host` nor `src_ip` all collapse into the single literal host
+ * `'unknown'`, so an artifact seen only on such rows reports `hosts: 1`.
  */
 export const HOST_IDENTITY_UNKNOWN_BUCKET = 'unknown';
 
@@ -116,76 +112,6 @@ export interface ObservationQuery {
   npl: string;
 }
 
-/**
- * The ingest stamp's newness flag, per artifact.
- *
- * NAN-2361: `is_new` is NOT "first ever seen". The stamper evaluates it against
- * the same lagging snapshot the query path reads, so during the 30-90 minute
- * catch-up EVERY occurrence of a fresh artifact is stamped new, not just the
- * first. Callers must therefore treat this as a per-ARTIFACT property (deduped
- * here) and pin any UI cue to the earliest occurrence, or a single new artifact
- * paints a ring on every dot it owns.
- */
-export interface IngestStamp {
-  isNew: boolean;
-  /** Earliest event timestamp (ms) carrying this stamp, for pinning the cue. */
-  earliestMs: number | null;
-}
-
-interface EnrichmentLike {
-  name?: unknown;
-  data?: Record<string, unknown> | null;
-}
-
-/**
- * Harvest per-artifact ingest stamps from loaded search rows.
- *
- * Rows without `enrichments` (ClickHouse/UDM tenants, and the fail-open cases
- * where the stamper had no snapshot) simply contribute nothing, which is why
- * this doubles as the lake-vs-CH gate: an empty map means no lake stamps, so
- * callers skip the whole layer rather than branching on backend identity.
- */
-export function harvestIngestStamps(
-  rows: Array<Record<string, unknown>>,
-  timestampOf: (row: Record<string, unknown>) => number | null,
-): Map<string, IngestStamp> {
-  const stamps = new Map<string, IngestStamp>();
-  for (const row of rows) {
-    let enrichments = row.enrichments as unknown;
-    if (typeof enrichments === 'string') {
-      try {
-        enrichments = JSON.parse(enrichments);
-      } catch {
-        continue;
-      }
-    }
-    if (!Array.isArray(enrichments)) continue;
-    const ts = timestampOf(row);
-    for (const raw of enrichments as EnrichmentLike[]) {
-      if (!raw || typeof raw !== 'object' || raw.name !== 'prevalence') continue;
-      const data = raw.data;
-      if (!data || typeof data !== 'object') continue;
-      // `value` carries the artifact the stamp describes.
-      const value = (raw as { value?: unknown }).value;
-      if (typeof value !== 'string' || value.length === 0) continue;
-      const key = value.toLowerCase();
-      const isNew = data.is_new === true;
-      const existing = stamps.get(key);
-      if (!existing) {
-        stamps.set(key, { isNew, earliestMs: ts });
-        continue;
-      }
-      // Any occurrence asserting newness makes the artifact new; keep the
-      // earliest timestamp so the ring lands on the first dot, not all of them.
-      existing.isNew = existing.isNew || isNew;
-      if (ts != null && (existing.earliestMs == null || ts < existing.earliestMs)) {
-        existing.earliestMs = ts;
-      }
-    }
-  }
-  return stamps;
-}
-
 function chunk<T>(items: T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
@@ -195,17 +121,21 @@ function chunk<T>(items: T[], size: number): T[][] {
 /**
  * Build the nPL for one path + artifact chunk.
  *
- * Shape (validated live at 87ms / 322,927 rows):
- *   <path>="a" OR <path>="b" | eval __h=coalesce(...) | stats dc(__h) as hosts,
- *     count as events, min(time) as first_in_window by <path>
+ * Shape (validated on the G22 e2e stack against the search API):
+ *   <path>="a" OR <path>="b" | eval __h=if(src_host!="", ...) | stats dc(__h) as hosts,
+ *     count as events, min(timestamp) as first_in_window by <path>
  */
-export function buildObservationQuery(path: string, artifacts: string[]): ObservationQuery {
+export function buildObservationQuery(
+  path: string,
+  artifacts: string[],
+  hostEval: string = HOST_IDENTITY_EVAL,
+): ObservationQuery {
   const predicate = artifacts
     .map((value) => `${path}="${nplQuotedBody(value)}"`)
     .join(' OR ');
   const npl =
-    `${predicate} | ${HOST_IDENTITY_EVAL} | ` +
-    `stats dc(__h) as hosts, count as events, min(time) as first_in_window by ${path}`;
+    `${predicate} | ${hostEval} | ` +
+    `stats dc(__h) as hosts, count as events, min(${TIME_FIELD}) as first_in_window by ${path}`;
   return { path, artifacts, npl };
 }
 
@@ -219,15 +149,29 @@ export function buildObservationQuery(path: string, artifacts: string[]): Observ
 export function buildObservationQueries(
   artifacts: string[],
   paths: readonly string[],
+  hostEval: string = HOST_IDENTITY_EVAL,
 ): ObservationQuery[] {
   if (artifacts.length === 0) return [];
   const queries: ObservationQuery[] = [];
   for (const path of paths) {
     for (const batch of chunk(artifacts, OBSERVATION_BATCH_SIZE)) {
-      queries.push(buildObservationQuery(path, batch));
+      queries.push(buildObservationQuery(path, batch, hostEval));
     }
   }
   return queries;
+}
+
+/** The observation paths and host identity for the active schema profile
+    (NAN-4931: the ClickHouse edition runs either UDM `logs` or OCSF
+    `ocsf_logs`). */
+export function observationPathsFor(isOcsf: boolean): {
+  hashPaths: readonly string[];
+  domainPaths: readonly string[];
+  hostEval: string;
+} {
+  return isOcsf
+    ? { hashPaths: OCSF_HASH_PATHS, domainPaths: OCSF_DOMAIN_PATHS, hostEval: OCSF_HOST_IDENTITY_EVAL }
+    : { hashPaths: HASH_PATHS, domainPaths: DOMAIN_PATHS, hostEval: HOST_IDENTITY_EVAL };
 }
 
 /** Normalize a `stats … by <path>` group key, which may be a scalar or an array. */
@@ -336,7 +280,7 @@ export function buildDiscoveryQuery(baseQuery: string, path: string): Observatio
   const prefix = trimmed.length > 0 ? `${trimmed} | ` : '';
   const npl =
     `${prefix}${HOST_IDENTITY_EVAL} | ` +
-    `stats dc(__h) as hosts, count as events, min(time) as first_in_window by ${path}`;
+    `stats dc(__h) as hosts, count as events, min(${TIME_FIELD}) as first_in_window by ${path}`;
   return { path, artifacts: [], npl };
 }
 

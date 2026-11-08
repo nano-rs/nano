@@ -129,7 +129,7 @@ async fn successful_replace_and_delete_with_rule_conflict() {
 
     let rule_id: uuid::Uuid = sqlx::query_scalar(
         "INSERT INTO detection_rules (name, query, severity) VALUES ($1, $2, 'low') RETURNING id",
-    ).bind(&rule_name).bind(format!("search * | lookup @{name}.id")).fetch_one(&pool).await.expect("create referencing rule");
+    ).bind(&rule_name).bind(format!("search * | lookup {name} id")).fetch_one(&pool).await.expect("create referencing rule");
     let conflict = svc.drop_table(&name).await.expect_err("referenced table must stay");
     assert!(matches!(conflict, nanosiem_core::LookupError::TableInUse(rules) if rules.contains(&rule_name)));
     assert_eq!(svc.get_table(&name).await.expect("table survives conflict").row_count, 1);

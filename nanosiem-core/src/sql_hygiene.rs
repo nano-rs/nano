@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 //! Shared SQL-literal hygiene helpers (NAN-1616).
 //!
 //! Consolidates the escaping/formatting logic that was previously copy-pasted
@@ -94,7 +92,10 @@ pub fn is_safe_sql_identifier(s: &str) -> bool {
 /// columns in ClickHouse, so do not swap one form for the other in existing SQL
 /// without checking which the schema actually has.
 pub fn escape_sql_identifier(s: impl AsRef<str>) -> String {
-    format!("`{}`", s.as_ref().replace('\\', "\\\\").replace('`', "\\`"))
+    format!(
+        "`{}`",
+        s.as_ref().replace('\\', "\\\\").replace('`', "\\`")
+    )
 }
 
 /// Escape a raw string for use in a ClickHouse `LIKE`/`ILIKE` pattern.
@@ -122,28 +123,12 @@ pub(crate) fn format_ch_bound_micros(dt: &DateTime<Utc>) -> String {
 /// `[start, end)`: `column >= 'start' AND column < 'end'`.
 ///
 /// The inclusive `BETWEEN` it replaces counted an event exactly on a shared
-/// boundary in BOTH adjacent windows (24 hourly windows, chunked jobs, a
-/// histogram split in two). One plain conjunction keeps ClickHouse/chDB
-/// partition, min-max and move-to-PREWHERE pruning exactly as before.
-///
-/// This is the single source of the text: the lake worker's fast-path
-/// recognizers (keyword counts, entity counts, fragment-cache window
-/// normalization) build their patterns from [`half_open_time_bound_pattern`],
-/// so the two can never drift apart silently.
-pub fn half_open_time_bound(column: &str, start_literal: &str, end_literal: &str) -> String {
+/// boundary in BOTH adjacent windows (consecutive scheduled-detection windows,
+/// a histogram next to its search, saved-search slices). One plain
+/// conjunction inside the single WHERE keeps partition, min-max and
+/// move-to-PREWHERE pruning exactly as before.
+pub(crate) fn half_open_time_bound(column: &str, start_literal: &str, end_literal: &str) -> String {
     format!("{column} >= '{start_literal}' AND {column} < '{end_literal}'")
-}
-
-/// [`half_open_time_bound`] as a regex fragment with the two literals as
-/// capture groups (`literal` is the pattern each must match, e.g.
-/// `[0-9: .-]+`). Everything else is matched verbatim.
-pub fn half_open_time_bound_pattern(column: &str, literal: &str) -> String {
-    // Plain-word markers: `regex::escape` leaves them untouched.
-    const START: &str = "NANOSTARTLITERAL";
-    const END: &str = "NANOENDLITERAL";
-    regex::escape(&half_open_time_bound(column, START, END))
-        .replace(START, &format!("({literal})"))
-        .replace(END, &format!("({literal})"))
 }
 
 /// Format a UTC instant as a ClickHouse bound with second precision

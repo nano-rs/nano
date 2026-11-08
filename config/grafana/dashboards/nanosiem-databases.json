@@ -1151,17 +1151,17 @@
       "pluginVersion": "10.2.2",
       "targets": [
         {
-          "expr": "rate(nanosiem_vector_adaptive_concurrency_in_flight_sum{job=\"vector\", component_id=\"clickhouse_logs\"}[5m])",
-          "legendFormat": "In-Flight Requests",
+          "expr": "rate(nanosiem_vector_component_sent_events_total{job=\"vector\", component_id=\"clickhouse_logs\"}[5m])",
+          "legendFormat": "Events Sent/s",
           "refId": "A"
         },
         {
-          "expr": "rate(nanosiem_vector_adaptive_concurrency_limit_sum{job=\"vector\", component_id=\"clickhouse_logs\"}[5m])",
-          "legendFormat": "Concurrency Limit",
+          "expr": "rate(nanosiem_vector_component_errors_total{job=\"vector\", component_id=\"clickhouse_logs\"}[5m])",
+          "legendFormat": "Errors/s",
           "refId": "B"
         }
       ],
-      "title": "Adaptive Concurrency (ClickHouse Sink)",
+      "title": "ClickHouse Sink Throughput and Errors (fixed concurrency: 6)",
       "type": "timeseries"
     },
     {

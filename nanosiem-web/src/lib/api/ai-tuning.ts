@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
- * Tenant-wide AI tuning mode (NAN-3219) — `/api/melod/settings/ai-tuning`
- * (dedicated and hosted-shared, same wire shape).
+ * Deployment-wide AI tuning mode (NAN-3219) — `/api/melod/settings/ai-tuning`.
  *
  * - `on`: automatic proposals + the Tune wizard (default).
  * - `manual`: no automatic proposals or notifications; Tune / `@tune` work.

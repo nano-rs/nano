@@ -6,6 +6,7 @@
 // in review — see PR body for the list of unwired pieces.
 
 import { useMemo } from 'react';
+import { readSchemaFieldString } from '@/lib/schema-fields';
 import { Link } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -26,7 +27,7 @@ import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { useDetectionMatches, useRuleDispositionStats } from '@/hooks/use-api';
 import { parseUTCTimestamp } from '@/lib/date-utils';
-import { SEV_META, normalizeSeverity, primaryTactic, primaryTechnique, meanTimeToDetect, extractIp, type MatchView } from './helpers';
+import { SEV_META, normalizeSeverity, primaryTactic, primaryTechnique, meanTimeToDetect, type MatchView } from './helpers';
 import { LatencyPill } from './LatencyPill';
 
 // 28-day heat strip — identical algorithm to design-ref/matches-hero.jsx.
@@ -107,6 +108,8 @@ interface MatchesHeroProps {
   onTogglePause: () => void;
   onToggleAlerting: () => void;
   canEdit: boolean;
+  canManageLifecycle: boolean;
+  lifecyclePending: boolean;
 }
 
 export function MatchesHero({
@@ -118,6 +121,8 @@ export function MatchesHero({
   onTogglePause,
   onToggleAlerting,
   canEdit,
+  canManageLifecycle,
+  lifecyclePending,
 }: MatchesHeroProps) {
   const sev = SEV_META[normalizeSeverity(rule.severity)];
   const tactic = primaryTactic(rule);
@@ -175,8 +180,9 @@ export function MatchesHero({
 
   const uniqueIps = useMemo(() => {
     const s = new Set<string>();
-    for (const view of views) for (const event of view.events) {
-      const ip = extractIp(event);
+    // NAN-4903: source IP under either profile (`src_ip` / `src_endpoint.ip`).
+    for (const v of views) for (const e of v.events) {
+      const ip = readSchemaFieldString(e as Record<string, unknown>, 'srcIp');
       if (ip) s.add(ip);
     }
     return s.size;
@@ -208,6 +214,17 @@ export function MatchesHero({
 
   const isPaused = rule.mode === 'paused';
   const isAlerting = rule.mode === 'alerting';
+  const modeLabel = {
+    staging: 'Staging',
+    live: 'Live',
+    alerting: 'Alerting',
+    paused: 'Paused',
+  }[rule.mode];
+  const alertingAction = rule.mode === 'staging'
+    ? 'Promote to live'
+    : rule.mode === 'live'
+      ? 'Enable alerting'
+      : 'Disable alerting';
 
   return (
     <div className="flex flex-col gap-2.5">
@@ -231,7 +248,7 @@ export function MatchesHero({
                   isPaused && 'bg-muted-foreground',
                 )}
               />
-              <span className="text-[11px] text-foreground">{isPaused ? 'Paused' : 'Live'}</span>
+              <span className="text-[11px] text-foreground">{modeLabel}</span>
             </div>
             <div className="flex items-center gap-1.5">
               <span className="w-[6px] h-[6px] rounded-full" style={{ background: sev.color }} />
@@ -296,14 +313,17 @@ export function MatchesHero({
               Edit
             </Link>
           )}
-          <button
-            type="button"
-            onClick={onTogglePause}
-            className="h-8 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 flex items-center gap-1.5"
-          >
-            {isPaused ? <Play className="w-3.5 h-3.5" strokeWidth={2} /> : <Pause className="w-3.5 h-3.5" strokeWidth={2} />}
-            {isPaused ? 'Resume' : 'Pause'}
-          </button>
+          {canManageLifecycle && rule.mode !== 'staging' && (
+            <button
+              type="button"
+              onClick={onTogglePause}
+              disabled={lifecyclePending}
+              className="h-8 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 flex items-center gap-1.5 disabled:opacity-50"
+            >
+              {isPaused ? <Play className="w-3.5 h-3.5" strokeWidth={2} /> : <Pause className="w-3.5 h-3.5" strokeWidth={2} />}
+              {isPaused ? 'Resume' : 'Pause'}
+            </button>
+          )}
           <button
             type="button"
             onClick={copyRuleId}
@@ -312,20 +332,22 @@ export function MatchesHero({
           >
             <Copy className="w-3.5 h-3.5" strokeWidth={2} />
           </button>
-          <button
-            type="button"
-            onClick={onToggleAlerting}
-            disabled={isPaused}
-            className={cn(
-              'h-8 px-3 rounded-md text-[11.5px] font-medium flex items-center gap-1.5 disabled:opacity-50',
-              isAlerting
-                ? 'bg-primary text-[var(--brand-ink)] hover:bg-primary/90'
-                : 'border border-border text-foreground hover:bg-foreground/5',
-            )}
-          >
-            <Bell className="w-3.5 h-3.5" strokeWidth={2} />
-            {isAlerting ? 'Alerting on' : 'Alerting off'}
-          </button>
+          {canManageLifecycle && !isPaused && (
+            <button
+              type="button"
+              onClick={onToggleAlerting}
+              disabled={lifecyclePending}
+              className={cn(
+                'h-8 px-3 rounded-md text-[11.5px] font-medium flex items-center gap-1.5 disabled:opacity-50',
+                isAlerting
+                  ? 'bg-primary text-[var(--brand-ink)] hover:bg-primary/90'
+                  : 'border border-border text-foreground hover:bg-foreground/5',
+              )}
+            >
+              <Bell className="w-3.5 h-3.5" strokeWidth={2} />
+              {alertingAction}
+            </button>
+          )}
         </div>
       </div>
 

@@ -81,6 +81,13 @@ async fn isolated_pool() -> (PgPool, PgPool, String) {
     .execute(&pool)
     .await
     .expect("apply publication fidelity migration");
+    // NAN-4973: renderer epochs are allocated per renderer identity.
+    sqlx::raw_sql(include_str!(
+        "../../migrations/postgres/313_vector_config_renderer_epochs.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("apply renderer epoch migration");
     (admin, pool, schema)
 }
 

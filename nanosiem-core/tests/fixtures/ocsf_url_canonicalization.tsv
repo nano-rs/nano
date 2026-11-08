@@ -1,0 +1,8 @@
+mixed_components	  HTTPS://User:Pass@Bad.Example:8443/Dropper/A?Key=V#F 	https://User:Pass@bad.example:8443/Dropper/A?Key=V#F
+userinfo_positive	HTTPS://CaseSensitive:PaSS@Evil.Example/Drop	https://CaseSensitive:PaSS@evil.example/Drop
+userinfo_negative	https://casesensitive:PaSS@EVIL.EXAMPLE/Drop	https://casesensitive:PaSS@evil.example/Drop
+query_without_path	HTTP://User@Bad.Example:8080?Q=Value	http://User@bad.example:8080?Q=Value
+bracketed_ipv6	HTTPS://User@[2001:DB8::A]:0443/Path	https://User@[2001:db8::a]:0443/Path
+multiple_at	HTTPS://Us@er:PaSS@Bad.Example/P	https://Us@er:PaSS@bad.example/P
+no_tail	HTTP://BAD.EXAMPLE	http://bad.example
+no_scheme	/No/Scheme	/No/Scheme

@@ -1,0 +1,160 @@
+# nano: local single-tenant ENTERPRISE dev stack, infrastructure only (NAN-4905)
+#
+# Overlay on docker-compose.opensource.yml (the validated single-host template).
+# Docker runs ONLY the infrastructure: ClickHouse, PostgreSQL, Dragonfly and
+# Vector. The app (nano-api, nano-search, nano-jobs, the ClickHouse migrator)
+# runs natively from this checkout via scripts/start-microservices-dev.sh, and
+# the web UI runs on the Vite dev server (Dan, 11-02).
+#
+# Don't run this file by hand. Use scripts/local-stack.sh, which passes both -f
+# files, the project name (nanoch) and the generated env file:
+#
+#   scripts/local-stack.sh up      # infra in Docker + native app + Vite; admin once
+#   scripts/local-stack.sh status | logs [svc] | restart | down | nuke | smoke
+#
+# Single tenant per deployment. There is no shared or hosted mode (Dan, 11-02).
+#
+# Infra ports (127.0.0.1 only, overridable in dev/local-stack/.env.local):
+#   Vector HTTP ingest (Bearer)     ${NANOCH_VECTOR_HTTP_PORT:-18080}
+#   Vector enrichment (Bearer)      ${NANOCH_VECTOR_ENRICH_PORT:-18091}
+#   Vector HEC-compatible           ${NANOCH_HEC_PORT:-8088}
+#   ClickHouse HTTP                 ${NANOCH_CH_HTTP_PORT:-8123}
+#   ClickHouse native               ${NANOCH_CH_NATIVE_PORT:-9010}
+#   PostgreSQL                      ${NANOCH_PG_PORT:-15432}
+#   Dragonfly (Redis protocol)      ${NANOCH_REDIS_PORT:-16379}
+#   nginx ingest edge               ${NANOCH_EDGE_PORT:-18090}  (/ingest, /otlp/v1/*, API, UI)
+#   Nano Pipe tap relay             ${NANOCH_VECTOR_TAP_PORT:-18687}  (Bearer NANO_VECTOR_TAP_TOKEN)
+#   Vector OTLP/HTTP (loopback)     ${NANOCH_VECTOR_OTLP_PORT:-14318}  (unauthenticated; the edge's /otlp target on Linux)
+# The native app uses the fixed dev ports 3000 (api), 3002 (search), 3003 (jobs)
+# and 5173 (Vite); the Vite proxy in nanosiem-web/vite.config.ts targets them.
+
+services:
+  postgres:
+    container_name: ${NANOCH_PROJECT:-nanoch}-postgres
+    ports: !override
+      - "127.0.0.1:${NANOCH_PG_PORT:-15432}:5432"
+
+  clickhouse-preflight:
+    container_name: ${NANOCH_PROJECT:-nanoch}-clickhouse-preflight
+
+  clickhouse:
+    container_name: ${NANOCH_PROJECT:-nanoch}-clickhouse
+    ports: !override
+      - "127.0.0.1:${NANOCH_CH_HTTP_PORT:-8123}:8123"
+      - "127.0.0.1:${NANOCH_CH_NATIVE_PORT:-9010}:9000"
+
+  dragonfly:
+    container_name: ${NANOCH_PROJECT:-nanoch}-dragonfly
+    ports: !override
+      - "127.0.0.1:${NANOCH_REDIS_PORT:-16379}:6379"
+
+  vector-netns:
+    container_name: ${NANOCH_PROJECT:-nanoch}-vector-netns
+    ports: !override
+      - "127.0.0.1:${NANOCH_VECTOR_HTTP_PORT:-18080}:8080"
+      - "127.0.0.1:${NANOCH_VECTOR_ENRICH_PORT:-18091}:8090"
+      - "127.0.0.1:${NANOCH_HEC_PORT:-8088}:8088"
+      # NAN-4907: Vector metrics, so the native api can sample per-token usage
+      # (hashed_token_requests_total{credential_id}).
+      - "127.0.0.1:${NANOCH_VECTOR_METRICS_PORT:-19598}:9598"
+      # NAN-4945: the vector-tap relay listens on 8687 in this network
+      # namespace; the native api calls it here (token-gated).
+      - "127.0.0.1:${NANOCH_VECTOR_TAP_PORT:-18687}:8687"
+      # NAN-4945: Vector's OTLP/HTTP receiver on loopback (as the opensource
+      # compose's default bind). A Linux edge on the host network forwards
+      # authenticated /otlp/v1/* here.
+      - "127.0.0.1:${NANOCH_VECTOR_OTLP_PORT:-14318}:4318"
+
+  vector:
+    container_name: ${NANOCH_PROJECT:-nanoch}-vector
+    # The migrator runs natively now; local-stack.sh starts Vector after it.
+    depends_on: !override
+      vector-netns:
+        condition: service_started
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      # Replaces the nano-vector-dynamic named volume (compose merges volumes by
+      # target). The native api writes parser/source configs here
+      # (VECTOR_CONFIG_DIR), and Vector picks them up through --watch-config,
+      # the same hand-off the dockerized api did through the shared volume.
+      # Gitignored, so the tracked config/vector tree stays clean.
+      - ./dev/local-stack/state/${NANOCH_PROJECT:-nanoch}/vector-dynamic:/etc/vector/dynamic
+
+  # The dockerized app is off: these services exist only in the base template.
+  # The profile keeps a bare `compose up` from starting the public images.
+  clickhouse-migrate:
+    profiles: ["docker-app"]
+  nano-api:
+    profiles: ["docker-app"]
+  nano-jobs:
+    profiles: ["docker-app"]
+  nano-search:
+    profiles: ["docker-app"]
+  nano-web:
+    profiles: ["docker-app"]
+
+  # NAN-4945: the ingest edge, the same nginx as the opensource compose
+  # (config/nginx/nginx.opensource.conf: /ingest and /otlp/v1/* behind
+  # auth_request, plus the API and UI routes). local-stack.sh renders the conf
+  # into the state dir with the native app's upstreams on the Docker host, so
+  # Add source snippets reach Vector the way a real install does, instead of
+  # posting /ingest to Vite (a silent 404). HEC stays on Vector's own listener
+  # (NANOCH_HEC_PORT), as in install.sh.
+  nginx:
+    profiles: !reset []
+    container_name: ${NANOCH_PROJECT:-nanoch}-nginx
+    command: ["nginx", "-c", "/etc/nginx/nano/nginx.conf", "-g", "daemon off;"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes: !override
+      # A directory, not the file: a re-render replaces the file, and a file
+      # bind mount would keep showing the old inode.
+      - ./dev/local-stack/state/${NANOCH_PROJECT:-nanoch}/edge:/etc/nginx/nano:ro
+    ports: !override
+      - "127.0.0.1:${NANOCH_EDGE_PORT:-18090}:80"
+    depends_on: !override
+      vector:
+        condition: service_started
+    # Answered by nginx itself (not via the native api). On Linux,
+    # local-stack.sh adds an override: network_mode host, 127.0.0.1:<edge port>.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/_nano_edge/health >/dev/null 2>&1 || exit 1"]
+
+  # NAN-4919 / NAN-4945: the Nano Pipe live-tap relay, as in the opensource
+  # compose: `nanosiem-api --vector-tap-relay` in Vector's stable network
+  # namespace, the only client of Vector's loopback API.
+  # The public image predates the relay, so it is built from this checkout
+  # (dev/local-stack/Dockerfile.tap-relay; incremental through BuildKit cache
+  # mounts). `compose up -d` builds it once when the image is missing; after
+  # relay code changes: scripts/local-stack.sh compose build vector-tap.
+  # The native api reaches it on the port published by `vector-netns` above, with
+  # NANO_VECTOR_TAP_TOKEN (generated into the env file).
+  vector-tap:
+    profiles: !reset []
+    container_name: ${NANOCH_PROJECT:-nanoch}-vector-tap
+    image: ${NANOCH_PROJECT:-nanoch}-vector-tap:dev
+    build:
+      context: .
+      dockerfile: dev/local-stack/Dockerfile.tap-relay
+
+  # NAN-4914: the pull-feed runner, in Docker on macOS too (its VRL sandbox
+  # wants Linux). Built from this checkout's Dockerfile target, opt-in:
+  #   scripts/local-stack.sh runner up      # build + start
+  #   scripts/local-stack.sh runner logs
+  # It reads the same PostgreSQL and NANOSIEM_ENCRYPTION_KEY as the native api
+  # and posts to Vector's HEC listener over the compose network.
+  connector-runner:
+    container_name: ${NANOCH_PROJECT:-nanoch}-connector-runner
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: connector-runner
+    image: ${NANOCH_PROJECT:-nanoch}-connector-runner:dev
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      vector:
+        condition: service_healthy

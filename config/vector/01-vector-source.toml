@@ -4,6 +4,16 @@
 #
 # Use case: On-premise Vector aggregator forwarding to cloud SIEM
 # Events arrive pre-structured, minimal processing needed
+#
+# NAN-4907: this listener has NO credential check (the vector source has no
+# auth option), so it can never decide a source the way an ingest token does.
+# Its events land under the fixed route `vector_native` and a declared
+# `.source_type` survives only as `claimed_source_type`, so a sender that can
+# reach :6000 cannot select a parser. A deployment that trusts every sender
+# on this port (private network, upstream aggregators it controls) can opt
+# back into the declared type with NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE=true.
+# Keep the port off untrusted networks either way (the open-core compose binds
+# it to loopback by default).
 
 [sources.vector_native]
 type = "vector"
@@ -33,6 +43,17 @@ if !exists(.source_type) || !is_string(.source_type) {
 # Normalize source_type to lowercase
 .source_type = downcase(to_string(.source_type) ?? "unknown")
 
+# NAN-4907: an unauthenticated sender never selects a parser route.
+del(.claimed_source_type)
+del(%nano_claimed_source_type)
+if (get_env_var("NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE") ?? "") != "true" {
+    if .source_type != "unknown" && .source_type != "vector_native" {
+        .claimed_source_type = .source_type
+        %nano_claimed_source_type = .source_type
+    }
+    .source_type = "vector_native"
+}
+
 # Ensure message exists
 if !exists(.message) {
     if exists(.log) {
@@ -52,9 +73,6 @@ if !exists(.metadata) || !is_object(.metadata) {
 
 # Mark as forwarded from Vector
 .metadata.forwarded_via = "vector_native"
-# NAN-2361 wave 8: ingress lane for the lake sink's `metadata.ingress_transport`
-# (see 00-base.toml `source_type_extract`).
-%ingress_transport = "vector"
 '''
 
 # =============================================================================

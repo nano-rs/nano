@@ -4,6 +4,24 @@
 //!
 //! Uses the Tree API for file listing (playbook markdown files are small,
 //! unlike the rule_repository pattern we don't need sparse-checkout).
+//!
+//! NAN-4947: a sync runs in two phases.
+//!
+//! 1. **Stage** (no writes): resolve the upstream commit, list the tree,
+//!    compare blob SHAs against the cached rows, fetch and parse only the
+//!    changed files. This is the slow, network-bound part.
+//! 2. **Apply** (one transaction): check the leader fence, then upsert the
+//!    changed rows, mark imports whose source changed, prune rows no longer
+//!    upstream and record the sync status. Nothing commits unless the fence
+//!    holds at that moment, and the fence lock is never held across the
+//!    network phase. A leader that was paused mid-sync and evicted therefore
+//!    cannot prune rows (and cascade away `playbook_imports` provenance) that
+//!    the new leader catalogued meanwhile.
+//!
+//! A row that fails to write aborts the whole apply: the previous catalog and
+//! commit stay in place, the repository is marked failed with the reason, and
+//! the next sync retries (NAN-2332: never report success for a write that did
+//! not happen).
 
 use std::time::Instant;
 use tracing::{info, warn};
@@ -16,15 +34,75 @@ use crate::rule_repository::GitHubClient;
 
 use super::super::error::PlaybookRepositoryError;
 use super::super::models::{PlaybookRepository, PlaybookSyncResult, PlaybookSyncStatus};
-use super::super::repository::{
-    PlaybookImportsRepository, PlaybookRepoRepository, RepositoryPlaybooksRepository,
-};
+use super::super::repository::{RepositoryPlaybooksRepository};
 use super::{PlaybookRepositoryService, PlaybookRepositoryServiceConfig};
 
+/// One changed file, fetched and parsed, ready to write.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct StagedRow {
+    pub path: String,
+    pub sha: String,
+    pub content: String,
+    pub kind: String,
+    pub title: Option<String>,
+    pub subtitle: Option<String>,
+    pub category: Option<String>,
+    pub match_signals: Option<Vec<String>>,
+    pub tags: Option<Vec<String>>,
+    pub owner_team: Option<String>,
+    pub authored_date: Option<chrono::NaiveDate>,
+    pub danger_policy: Option<serde_json::Value>,
+    pub review_cadence: Option<String>,
+    pub scope: Option<String>,
+    pub parse_status: &'static str,
+    pub parse_error: Option<String>,
+    pub step_count: Option<i32>,
+    /// A cached row already exists (an update, so imports are marked).
+    pub existing: bool,
+}
+
+/// Everything the network phase learned; applied in one fenced transaction.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub enum StagedSync {
+    /// The stored commit is already upstream: only the status is recorded.
+    UpToDate { commit: String, total: i32 },
+    Changed {
+        commit: String,
+        rows: Vec<StagedRow>,
+        /// Paths that stay catalogued (everything else is pruned).
+        keep: Vec<String>,
+    },
+}
+
 impl PlaybookRepositoryService {
-    /// Start a background sync (non-blocking).
-    pub async fn start_sync(&self, id: Uuid) -> Result<(), PlaybookRepositoryError> {
-        // Check if sync is already in progress
+    /// Record a sync status under the leader fence. Returns `Fenced` (and
+    /// writes nothing) when this process no longer leads.
+    async fn write_status_fenced(
+        &self,
+        id: Uuid,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), PlaybookRepositoryError> {
+        let mut tx = self.pg_pool.begin().await.map_err(db_err)?;
+        self.fence.guard(&mut tx).await.map_err(|e| PlaybookRepositoryError::Fenced(e.to_string()))?;
+        crate::db::repo_store::update_sync_status(
+            &mut *tx, "playbook_repositories", "playbook_count", id, status, None, None, error,
+        )
+        .await
+        .map_err(|e| PlaybookRepositoryError::Internal(e.to_string()))?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Record a failed sync (e.g. a scheduler timeout) under the leader fence.
+    pub async fn record_sync_failure(&self, id: Uuid, message: &str) -> Result<(), PlaybookRepositoryError> {
+        self.write_status_fenced(id, "failed", Some(message)).await
+    }
+
+    /// Claim the per-service in-progress slot and load an enabled repository.
+    async fn begin_sync(&self, id: Uuid) -> Result<PlaybookRepository, PlaybookRepositoryError> {
         {
             let mut syncing = self.syncing_repos.write().await;
             if syncing.contains(&id) {
@@ -32,90 +110,54 @@ impl PlaybookRepositoryService {
             }
             syncing.insert(id);
         }
-
-        let repo = self.get_repository(id).await?;
-
-        if !repo.enabled.unwrap_or(true) {
-            let mut syncing = self.syncing_repos.write().await;
-            syncing.remove(&id);
-            return Err(PlaybookRepositoryError::RepositoryDisabled);
+        let loaded = match self.get_repository(id).await {
+            Ok(repo) if !repo.enabled.unwrap_or(true) => Err(PlaybookRepositoryError::RepositoryDisabled),
+            other => other,
+        };
+        let loaded = match loaded {
+            Ok(repo) => self.write_status_fenced(id, "syncing", None).await.map(|()| repo),
+            Err(e) => Err(e),
+        };
+        if loaded.is_err() {
+            self.syncing_repos.write().await.remove(&id);
         }
+        loaded
+    }
 
-        let _ = self
-            .repo_repository
-            .update_sync_status(id, "syncing", None, None, None)
-            .await;
-
-        let repo_repository = self.repo_repository.clone();
-        let playbooks_repository = self.playbooks_repository.clone();
-        let imports_repository = self.imports_repository.clone();
-        let github_client = self.github_client.clone();
-        let config = self.config.clone();
-        let syncing_repos = self.syncing_repos.clone();
-
-        tokio::spawn(async move {
-            let result = Self::run_sync(
-                id,
-                repo,
-                repo_repository.clone(),
-                playbooks_repository,
-                imports_repository,
-                github_client,
-                config,
-            )
-            .await;
-
-            match result {
-                Ok(sync_result) => {
-                    // NAN-2332: a run that could not write every file is not a
-                    // success, and saying otherwise is the bug this change
-                    // exists to fix. Persisting "success" here would leave the
-                    // repository screen green — it only surfaces
-                    // last_sync_error when the status is "failed" — so the
-                    // detail threaded into that column would never be read.
-                    //
-                    // Withholding the commit is the other half. The next sync
-                    // takes an early-return fast path when the stored commit
-                    // already matches upstream, so recording it after a partial
-                    // failure would both clear last_sync_error and skip the
-                    // retry, stranding the unwritten file until someone pushed
-                    // an unrelated change. Leaving the previous commit in place
-                    // makes the next sync try again; files that did land are
-                    // skipped cheaply by their own blob SHA.
-                    let (status, commit) = match sync_result.error.as_deref() {
-                        Some(_) => ("failed", None),
-                        None => ("success", sync_result.commit.as_deref()),
-                    };
-                    let _ = repo_repository
-                        .update_sync_status(
-                            id,
-                            status,
-                            commit,
-                            Some(sync_result.playbooks_total),
-                            sync_result.error.as_deref(),
-                        )
-                        .await;
-                    info!(
-                        "Playbook sync complete for repo {}: {} added, {} updated, {} removed",
-                        id,
-                        sync_result.playbooks_added,
-                        sync_result.playbooks_updated,
-                        sync_result.playbooks_removed
-                    );
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    let _ = repo_repository
-                        .update_sync_status(id, "failed", None, None, Some(&msg))
-                        .await;
-                    warn!("Playbook sync failed for repo {}: {}", id, msg);
+    /// Run a claimed sync to completion and record a failure (unless fenced).
+    async fn finish_sync(
+        self,
+        id: Uuid,
+        repo: PlaybookRepository,
+    ) -> Result<PlaybookSyncResult, PlaybookRepositoryError> {
+        let result = self.run_sync(id, repo).await;
+        match &result {
+            Ok(sync) => info!(
+                "Playbook sync complete for repo {}: {} added, {} updated, {} removed",
+                id, sync.playbooks_added, sync.playbooks_updated, sync.playbooks_removed
+            ),
+            Err(PlaybookRepositoryError::Fenced(reason)) => {
+                warn!("Playbook sync for repo {} abandoned: {}", id, reason)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                warn!("Playbook sync failed for repo {}: {}", id, msg);
+                if let Err(err) = self.write_status_fenced(id, "failed", Some(&msg)).await {
+                    warn!("Could not record the failed sync for repo {}: {}", id, err);
                 }
             }
+        }
+        self.syncing_repos.write().await.remove(&id);
+        result
+    }
 
-            let mut syncing = syncing_repos.write().await;
-            syncing.remove(&id);
+    /// Start a background sync (non-blocking).
+    pub async fn start_sync(&self, id: Uuid) -> Result<(), PlaybookRepositoryError> {
+        let repo = self.begin_sync(id).await?;
+        let service = self.clone();
+        tokio::spawn(async move {
+            let _ = service.finish_sync(id, repo).await;
         });
-
         Ok(())
     }
 
@@ -124,342 +166,236 @@ impl PlaybookRepositoryService {
         &self,
         id: Uuid,
     ) -> Result<PlaybookSyncResult, PlaybookRepositoryError> {
-        {
-            let mut syncing = self.syncing_repos.write().await;
-            if syncing.contains(&id) {
-                return Err(PlaybookRepositoryError::SyncInProgress(id));
-            }
-            syncing.insert(id);
-        }
-
-        let repo = self.get_repository(id).await?;
-        if !repo.enabled.unwrap_or(true) {
-            let mut syncing = self.syncing_repos.write().await;
-            syncing.remove(&id);
-            return Err(PlaybookRepositoryError::RepositoryDisabled);
-        }
-
-        let _ = self
-            .repo_repository
-            .update_sync_status(id, "syncing", None, None, None)
-            .await;
-
-        let result = Self::run_sync(
-            id,
-            repo,
-            self.repo_repository.clone(),
-            self.playbooks_repository.clone(),
-            self.imports_repository.clone(),
-            self.github_client.clone(),
-            self.config.clone(),
-        )
-        .await;
-
-        match &result {
-            Ok(sync_result) => {
-                let _ = self
-                    .repo_repository
-                    .update_sync_status(
-                        id,
-                        // NAN-2332: same reasoning as the background path —
-                        // a partial failure persists as "failed" (so the UI
-                        // surfaces the reason) and withholds the commit (so
-                        // the next sync retries rather than fast-pathing).
-                        if sync_result.error.is_some() {
-                            "failed"
-                        } else {
-                            "success"
-                        },
-                        if sync_result.error.is_some() {
-                            None
-                        } else {
-                            sync_result.commit.as_deref()
-                        },
-                        Some(sync_result.playbooks_total),
-                        sync_result.error.as_deref(),
-                    )
-                    .await;
-            }
-            Err(e) => {
-                let _ = self
-                    .repo_repository
-                    .update_sync_status(id, "failed", None, None, Some(&e.to_string()))
-                    .await;
-            }
-        }
-
-        {
-            let mut syncing = self.syncing_repos.write().await;
-            syncing.remove(&id);
-        }
-
-        result
+        let repo = self.begin_sync(id).await?;
+        self.clone().finish_sync(id, repo).await
     }
 
-    /// Internal sync implementation.
-    #[allow(clippy::too_many_arguments)]
+    /// Stage, then apply under the fence.
     pub(crate) async fn run_sync(
+        &self,
         id: Uuid,
         repo: PlaybookRepository,
-        _repo_repository: PlaybookRepoRepository,
-        playbooks_repository: RepositoryPlaybooksRepository,
-        imports_repository: PlaybookImportsRepository,
-        github_client: GitHubClient,
-        config: PlaybookRepositoryServiceConfig,
     ) -> Result<PlaybookSyncResult, PlaybookRepositoryError> {
         let start = Instant::now();
+        let staged = stage_sync(&repo, &self.playbooks_repository, &self.github_client, &self.config, id).await?;
+        self.apply_staged(id, &repo, staged, start).await
+    }
 
-        let (owner, repo_name) = GitHubClient::parse_url(&repo.url)
-            .map_err(|_| PlaybookRepositoryError::InvalidUrl(repo.url.clone()))?;
-
-        info!(
-            "Syncing playbook repository {}/{} ({})",
-            owner, repo_name, repo.name
-        );
-
-        // Check commit changed
-        let commit = github_client
-            .get_latest_commit(&owner, &repo_name, &repo.branch)
-            .await
-            .map_err(|e| PlaybookRepositoryError::GitHubApi(e.to_string()))?;
-
-        if repo.last_sync_commit.as_ref() == Some(&commit) {
-            info!(
-                "Playbook repo {} is up to date at commit {}",
-                repo.name, commit
-            );
-            return Ok(PlaybookSyncResult {
-                repository_id: id,
-                status: PlaybookSyncStatus::Success,
-                commit: Some(commit),
-                playbooks_added: 0,
-                playbooks_updated: 0,
-                playbooks_removed: 0,
-                playbooks_total: repo.playbook_count.unwrap_or(0),
-                duration_ms: start.elapsed().as_millis() as u64,
-                error: None,
-            });
-        }
-
-        let playbooks_path = repo.playbooks_path.as_deref().unwrap_or("");
-        let tree_path = if playbooks_path.is_empty() {
-            None
-        } else {
-            Some(playbooks_path)
-        };
-
-        let tree = github_client
-            .get_tree(&owner, &repo_name, &repo.branch, tree_path)
-            .await
-            .map_err(|e| PlaybookRepositoryError::GitHubApi(e.to_string()))?;
-
-        let files: Vec<_> = tree
-            .into_iter()
-            .filter(|e| {
-                e.entry_type == "blob"
-                    && is_syncable_playbook_file(&e.path, &config.playbook_extensions)
-            })
-            .take(config.max_playbooks_per_repo)
-            .collect();
-
-        let mut added = 0i32;
-        let mut updated = 0i32;
-        let mut synced_paths = Vec::new();
-        let mut kind_refused = 0i32;
-        let mut write_failed = 0i32;
-
-        for entry in &files {
-            // Presence in `synced_paths` is what protects a cached row from
-            // `delete_not_in_paths` below — and deleting one cascades to its
-            // `playbook_imports` provenance. So a path is recorded as soon as
-            // it is seen in the tree, and only a DELIBERATE refusal removes it:
-            // a transient fetch error or an unparseable file must leave the
-            // existing catalog row (and its import history) alone.
-            synced_paths.push(entry.path.clone());
-
-            // Skip unchanged files
-            let existing = playbooks_repository
-                .find_by_path(id, &entry.path)
-                .await
-                .ok();
-            if let Some(ref e) = existing {
-                if e.file_sha.as_deref() == Some(entry.sha.as_str()) {
-                    // Re-apply the kind gate to unchanged rows too, using the
-                    // kind recorded at their own sync. Narrowing
-                    // `allowed_kinds` and re-syncing then actually clears the
-                    // catalog of what the repository no longer carries — an
-                    // out-of-contract row left behind would still be visible to
-                    // browse even though import refuses it.
-                    if !repo_accepts_kind(&repo, &e.kind) {
-                        drop_from_catalog(&mut synced_paths, &entry.path);
-                        kind_refused += 1;
+    /// Phase 2: one transaction, fence first. Public to the crate so tests can
+    /// prove a superseded fence writes nothing.
+    #[doc(hidden)]
+    pub async fn apply_staged(
+        &self,
+        id: Uuid,
+        repo: &PlaybookRepository,
+        staged: StagedSync,
+        start: Instant,
+    ) -> Result<PlaybookSyncResult, PlaybookRepositoryError> {
+        let mut tx = self.pg_pool.begin().await.map_err(db_err)?;
+        self.fence.guard(&mut tx).await.map_err(|e| PlaybookRepositoryError::Fenced(e.to_string()))?;
+        let (commit, added, updated, removed, total) = match staged {
+            StagedSync::UpToDate { commit, total } => {
+                info!("Playbook repo {} is up to date at commit {}", repo.name, commit);
+                (commit, 0, 0, 0, total)
+            }
+            StagedSync::Changed { commit, rows, keep } => {
+                let (mut added, mut updated) = (0i32, 0i32);
+                for row in &rows {
+                    let stored = RepositoryPlaybooksRepository::upsert_with(
+                        &mut *tx,
+                        id,
+                        &row.path,
+                        Some(&row.sha),
+                        &row.content,
+                        &row.kind,
+                        row.title.as_deref(),
+                        row.subtitle.as_deref(),
+                        row.category.as_deref(),
+                        row.match_signals.as_deref(),
+                        row.tags.as_deref(),
+                        row.owner_team.as_deref(),
+                        row.authored_date,
+                        row.danger_policy.as_ref(),
+                        row.review_cadence.as_deref(),
+                        row.scope.as_deref(),
+                        row.parse_status,
+                        row.parse_error.as_deref(),
+                        row.step_count,
+                    )
+                    .await
+                    .map_err(|e| {
+                        PlaybookRepositoryError::Internal(format!(
+                            "playbook {} could not be written to the catalog: {e}",
+                            row.path
+                        ))
+                    })?;
+                    if row.existing {
+                        updated += 1;
+                        sqlx::query("UPDATE playbook_imports SET upstream_changed = TRUE WHERE repository_playbook_id = $1")
+                            .bind(stored.id)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(db_err)?;
+                    } else {
+                        added += 1;
                     }
-                    continue;
                 }
-            }
-
-            // Fetch raw content
-            let content = match github_client
-                .get_raw_file(&owner, &repo_name, &entry.path, &commit)
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("Failed to fetch {}: {}", entry.path, e);
-                    continue;
+                let removed = if keep.is_empty() {
+                    crate::db::repo_store::delete_by_repository(&mut *tx, "repository_playbooks", id).await
+                } else {
+                    crate::db::repo_store::prune_not_in_paths(&mut *tx, "repository_playbooks", id, &keep).await
                 }
-            };
-
-            // Split frontmatter + parse body
-            let (fm, body, parse_status, parse_error, step_count) =
-                match split_frontmatter(&content) {
-                    Ok((fm, body)) => {
-                        let tree = parse_playbook(body);
-                        let steps: i32 = (tree.phases.iter().map(|p| p.steps.len()).sum::<usize>()
-                            + tree.steps.len()) as i32;
-                        (fm, body.to_string(), "success", None, Some(steps))
-                    }
-                    Err(e) => (None, content.clone(), "failed", Some(e.to_string()), None),
-                };
-
-            // The kind comes from the file's own frontmatter — NEVER from the
-            // directory it was found in. `playbooks_path` is operator-
-            // configurable and a repository can be retargeted at any time, so
-            // path inference would silently reclassify a folder of documents
-            // into scheduled processes with no diff to review.
-            let kind = catalog_kind(fm.as_ref());
-
-            if !repo_accepts_kind(&repo, kind.as_str()) {
-                // Not catalogued at all: the repository has declared it does
-                // not carry this kind, so the file is outside its contract.
-                // Leaving it browsable-but-unimportable would only invite the
-                // question of why it cannot be imported.
-                drop_from_catalog(&mut synced_paths, &entry.path);
-                kind_refused += 1;
-                continue;
+                .map_err(db_err)? as i32;
+                (commit, added, updated, removed, keep.len() as i32)
             }
-
-            let title = fm.as_ref().and_then(|f| f.title.clone());
-            let subtitle = fm.as_ref().and_then(|f| f.subtitle.clone());
-            let category = fm.as_ref().and_then(|f| f.category.clone());
-            let match_signals = fm.as_ref().map(|f| f.match_signals.clone());
-            let tags = fm.as_ref().map(|f| f.tags.clone());
-            let owner_team = fm.as_ref().and_then(|f| f.owner.clone());
-            let authored_date = fm.as_ref().and_then(|f| f.authored);
-            let danger_policy = fm
-                .as_ref()
-                .map(|f| serde_json::to_value(&f.danger_policy).unwrap_or(serde_json::Value::Null));
-            let review_cadence = fm.as_ref().and_then(|f| f.review_cadence.clone());
-            let scope = fm.as_ref().and_then(|f| f.scope.clone());
-
-            let _ = body; // currently unused; the full raw_content is stored
-
-            let (category, parse_status, parse_error) =
-                resolve_category(category, parse_status, parse_error);
-
-            let upserted = playbooks_repository
-                .upsert(
-                    id,
-                    &entry.path,
-                    Some(&entry.sha),
-                    &content,
-                    kind.as_str(),
-                    title.as_deref(),
-                    subtitle.as_deref(),
-                    category.as_deref(),
-                    match_signals.as_deref(),
-                    tags.as_deref(),
-                    owner_team.as_deref(),
-                    authored_date,
-                    danger_policy.as_ref(),
-                    review_cadence.as_deref(),
-                    scope.as_deref(),
-                    parse_status,
-                    parse_error.as_deref(),
-                    step_count,
-                )
-                .await;
-
-            // NAN-2332: never count a write that did not happen. This used to
-            // be `let _ = upsert(...)` followed by an unconditional increment,
-            // so a failed write was reported to the operator as an added or
-            // updated playbook — success reported for a row that never landed.
-            if let Err(e) = upserted {
-                warn!("Failed to catalog playbook {}: {}", entry.path, e);
-                write_failed += 1;
-                // The path stays in `synced_paths` deliberately: a transient
-                // write error must not delete the existing catalog row and
-                // cascade away its import provenance (see the note above).
-                continue;
-            }
-
-            if existing.is_some() {
-                updated += 1;
-                // Mark imports as having upstream changes
-                if let Ok(stored) = playbooks_repository.find_by_path(id, &entry.path).await {
-                    let _ = imports_repository.mark_upstream_changed(stored.id).await;
-                }
-            } else {
-                added += 1;
-            }
-        }
-
-        let removed = playbooks_repository
-            .delete_not_in_paths(id, &synced_paths)
-            .await
-            .unwrap_or(0) as i32;
-
-        let total = synced_paths.len() as i32;
-
-        if kind_refused > 0 {
-            info!(
-                "Playbook repo {} declares allowed_kinds={:?}; {} file(s) of another kind were \
-                 not catalogued",
-                repo.name, repo.allowed_kinds, kind_refused
-            );
-        }
-
-        // NAN-2332: surface write failures to the OPERATOR, not just to the
-        // server log. A warning in the log is invisible to whoever is looking
-        // at the repository in the product, and "the sync said success" is the
-        // whole bug this change exists to fix — reporting it only somewhere
-        // they will not look reproduces it one layer up.
-        let error = if write_failed > 0 {
-            warn!(
-                "Playbook repo {}: {} file(s) failed to write to the catalog and were not \
-                 counted as added or updated; see the per-file warnings above",
-                repo.name, write_failed
-            );
-            Some(format!(
-                "{write_failed} playbook(s) could not be written to the catalog and are \
-                 missing or stale; see the server log for the affected files"
-            ))
-        } else {
-            None
         };
-
+        crate::db::repo_store::update_sync_status(
+            &mut *tx,
+            "playbook_repositories",
+            "playbook_count",
+            id,
+            "success",
+            Some(&commit),
+            Some(total),
+            None,
+        )
+        .await
+        .map_err(|e| PlaybookRepositoryError::Internal(e.to_string()))?;
+        tx.commit().await.map_err(db_err)?;
         Ok(PlaybookSyncResult {
             repository_id: id,
-            // Mirrors what gets persisted: a run with unwritten files reports
-            // Failed, so an API caller reading this struct and an operator
-            // reading the repository row are told the same thing.
-            status: if error.is_some() {
-                PlaybookSyncStatus::Failed
-            } else {
-                PlaybookSyncStatus::Success
-            },
+            status: PlaybookSyncStatus::Success,
             commit: Some(commit),
             playbooks_added: added,
             playbooks_updated: updated,
             playbooks_removed: removed,
-            // Failed writes stay in `synced_paths` on purpose (it is what keeps
-            // `delete_not_in_paths` from dropping the existing row), but they
-            // are NOT in the catalog, so they must not inflate the count that
-            // is persisted as the repository's playbook_count.
-            playbooks_total: total - write_failed,
+            playbooks_total: total,
             duration_ms: start.elapsed().as_millis() as u64,
-            error,
+            error: None,
         })
+    }
+}
+
+fn db_err(e: sqlx::Error) -> PlaybookRepositoryError {
+    PlaybookRepositoryError::Internal(e.to_string())
+}
+
+/// Phase 1: network and parse only. Reads the cached rows; writes nothing.
+pub(crate) async fn stage_sync(
+    repo: &PlaybookRepository,
+    playbooks_repository: &RepositoryPlaybooksRepository,
+    github_client: &GitHubClient,
+    config: &PlaybookRepositoryServiceConfig,
+    id: Uuid,
+) -> Result<StagedSync, PlaybookRepositoryError> {
+    let (owner, repo_name) = crate::schema::github_owner_repo(&repo.url)
+        .ok_or_else(|| PlaybookRepositoryError::InvalidUrl(repo.url.clone()))?;
+    info!("Syncing playbook repository {}/{} ({})", owner, repo_name, repo.name);
+
+    let commit = github_client
+        .get_latest_commit(&owner, &repo_name, &repo.branch)
+        .await
+        .map_err(|e| PlaybookRepositoryError::GitHubApi(e.to_string()))?;
+    if repo.last_sync_commit.as_ref() == Some(&commit) {
+        return Ok(StagedSync::UpToDate { commit, total: repo.playbook_count.unwrap_or(0) });
+    }
+
+    let playbooks_path = repo.playbooks_path.as_deref().unwrap_or("");
+    let tree_path = (!playbooks_path.is_empty()).then_some(playbooks_path);
+    let tree = github_client
+        .get_tree(&owner, &repo_name, &repo.branch, tree_path)
+        .await
+        .map_err(|e| PlaybookRepositoryError::GitHubApi(e.to_string()))?;
+    let files: Vec<_> = tree
+        .into_iter()
+        .filter(|e| e.entry_type == "blob" && is_syncable_playbook_file(&e.path, &config.playbook_extensions))
+        .take(config.max_playbooks_per_repo)
+        .collect();
+
+    let mut keep = Vec::new();
+    let mut rows = Vec::new();
+    let mut kind_refused = 0i32;
+    for entry in &files {
+        // Presence in `keep` is what protects a cached row from the prune —
+        // and deleting one cascades to its `playbook_imports` provenance. So a
+        // path is kept as soon as it is seen in the tree, and only a DELIBERATE
+        // refusal removes it: a transient fetch error or an unparseable file
+        // must leave the existing catalog row (and its import history) alone.
+        keep.push(entry.path.clone());
+        let existing = playbooks_repository.find_by_path(id, &entry.path).await.ok();
+        if let Some(ref e) = existing {
+            if e.file_sha.as_deref() == Some(entry.sha.as_str()) {
+                // Re-apply the kind gate to unchanged rows too, so narrowing
+                // `allowed_kinds` and re-syncing clears what the repository no
+                // longer carries.
+                if !repo_accepts_kind(repo, &e.kind) {
+                    drop_from_catalog(&mut keep, &entry.path);
+                    kind_refused += 1;
+                }
+                continue;
+            }
+        }
+        let content = match github_client.get_raw_file(&owner, &repo_name, &entry.path, &commit).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to fetch {}: {}", entry.path, e);
+                continue;
+            }
+        };
+        let row = staged_row(&entry.path, &entry.sha, content, existing.is_some());
+        // The kind comes from the file's own frontmatter — NEVER from the
+        // directory it was found in.
+        if !repo_accepts_kind(repo, &row.kind) {
+            drop_from_catalog(&mut keep, &entry.path);
+            kind_refused += 1;
+            continue;
+        }
+        rows.push(row);
+    }
+    if kind_refused > 0 {
+        info!(
+            "Playbook repo {} declares allowed_kinds={:?}; {} file(s) of another kind were not catalogued",
+            repo.name, repo.allowed_kinds, kind_refused
+        );
+    }
+    Ok(StagedSync::Changed { commit, rows, keep })
+}
+
+/// Parse one fetched file into the row the catalog stores.
+#[doc(hidden)]
+pub fn staged_row(path: &str, sha: &str, content: String, existing: bool) -> StagedRow {
+    let (fm, parse_status, parse_error, step_count) = match split_frontmatter(&content) {
+        Ok((fm, body)) => {
+            let tree = parse_playbook(body);
+            let steps = (tree.phases.iter().map(|p| p.steps.len()).sum::<usize>() + tree.steps.len()) as i32;
+            (fm, "success", None, Some(steps))
+        }
+        Err(e) => (None, "failed", Some(e.to_string()), None),
+    };
+    let kind = catalog_kind(fm.as_ref());
+    let category = fm.as_ref().and_then(|f| f.category.clone());
+    let (category, parse_status, parse_error) = resolve_category(category, parse_status, parse_error);
+    StagedRow {
+        path: path.to_owned(),
+        sha: sha.to_owned(),
+        kind: kind.as_str().to_owned(),
+        title: fm.as_ref().and_then(|f| f.title.clone()),
+        subtitle: fm.as_ref().and_then(|f| f.subtitle.clone()),
+        category,
+        match_signals: fm.as_ref().map(|f| f.match_signals.clone()),
+        tags: fm.as_ref().map(|f| f.tags.clone()),
+        owner_team: fm.as_ref().and_then(|f| f.owner.clone()),
+        authored_date: fm.as_ref().and_then(|f| f.authored),
+        danger_policy: fm
+            .as_ref()
+            .map(|f| serde_json::to_value(&f.danger_policy).unwrap_or(serde_json::Value::Null)),
+        review_cadence: fm.as_ref().and_then(|f| f.review_cadence.clone()),
+        scope: fm.as_ref().and_then(|f| f.scope.clone()),
+        parse_status,
+        parse_error,
+        step_count,
+        existing,
+        content,
     }
 }
 
@@ -556,7 +492,11 @@ pub(crate) fn resolve_category<'a>(
         // the constraint, which is precisely the silent failure this function
         // exists to prevent.
         Some(ref value) => match PlaybookCategory::parse(value) {
-            Some(known) => (Some(known.as_str().to_string()), parse_status, parse_error),
+            Some(known) => (
+                Some(known.as_str().to_string()),
+                parse_status,
+                parse_error,
+            ),
             None => (
                 None,
                 "failed",

@@ -14,7 +14,7 @@ use axum::{
 use chrono::{Duration, Utc};
 use nanosiem_core::auth::permissions;
 use nanosiem_core::udm::UdmField;
-use nanosiem_core::{SearchRequest, TimeRangeInput};
+use nanosiem_core::TimeRangeInput;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -187,52 +187,6 @@ pub async fn get_source_types(
 
     let time_range = query.time_range();
 
-    if state.search_service.backend() == nanosiem_core::SearchBackend::Lake {
-        let response = state
-            .search_service
-            .search(
-                SearchRequest {
-                    query: "* | stats count() as count by metadata.log_source | sort -count"
-                        .to_string(),
-                    time_range,
-                    limit: Some(1_000),
-                    offset: None,
-                    include_sql: Some(false),
-                    skip_histogram: true,
-                    skip_field_stats: true,
-                    use_cache: true,
-                    table_view: false,
-                    request_id: None,
-                    async_mode: false,
-                    priority: None,
-                    dataset: Some("logs".to_string()),
-                },
-                &auth.effective_viewer_scope(),
-            )
-            .await?;
-        let rows = response
-            .results
-            .into_iter()
-            .filter_map(|row| {
-                let source = row.get("metadata.log_source")?.as_str()?.to_string();
-                if source.is_empty() {
-                    return None;
-                }
-                let count = row
-                    .get("count")
-                    .and_then(|value| {
-                        value
-                            .as_i64()
-                            .or_else(|| value.as_u64().map(|count| count as i64))
-                            .or_else(|| value.as_f64().map(|count| count as i64))
-                    })
-                    .unwrap_or(0);
-                Some((source, count))
-            })
-            .collect();
-        return Ok(Json(rows));
-    }
-
     {
         let ch_client = state.dual_pool.clickhouse();
 
@@ -243,7 +197,7 @@ pub async fn get_source_types(
         // its bare key and re-resolved through the tenant/cluster-aware
         // `table_names` registry, so `_distributed` read routing applies
         // identically to both — same mechanism `SearchService` uses.
-        let profile = state.schema_profile();
+        let profile = state.config.schema_profile();
         let table = state
             .dual_pool
             .table_names()
@@ -304,7 +258,7 @@ pub struct UdmFieldInfo {
 /// search's predicate (the fields picker, NAN-1510) so listed keys match what a
 /// field expand can return; with bounds only, the search window (NAN-1505);
 /// absent, a bounded recent window (the syntax-highlighter path).
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ExtFieldsQuery {
     /// nPL search query to scope enumeration to (matches the per-field value fetch)
     pub query: Option<String>,
@@ -317,6 +271,9 @@ pub struct ExtFieldsQuery {
 /// Get ext field names discovered in the data.
 /// Used by the fields picker (scoped to the search query+window) and to enable
 /// syntax highlighting for non-UDM fields (no params → recent window).
+///
+/// Deprecated: the hunt query travels in the URL, so it reaches server and
+/// proxy logs. Use `POST /api/fields/ext`, which takes it in the body.
 #[utoipa::path(
     get,
     path = "/api/fields/ext",
@@ -328,6 +285,7 @@ pub struct ExtFieldsQuery {
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
+#[deprecated(note = "the query reaches server and proxy logs; use POST /api/fields/ext")]
 pub async fn get_ext_fields(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
@@ -344,7 +302,37 @@ pub async fn get_ext_fields(
     // view without execute — so that concession protected nobody real while
     // leaving this route weaker than `/api/search`. One gate now.
     ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
+    ext_field_names(&state, &auth, params).await
+}
 
+/// Get ext field names discovered in the data, with the search query in the
+/// request body so it never reaches server or proxy logs. Same semantics and
+/// gate as the deprecated `GET /api/fields/ext`.
+#[utoipa::path(
+    post,
+    path = "/api/fields/ext",
+    tag = "fields",
+    request_body = ExtFieldsQuery,
+    responses(
+        (status = 200, description = "List of ext field names", body = Vec<String>),
+        (status = 403, description = "Missing search:execute permission"),
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn post_ext_fields(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(params): Json<ExtFieldsQuery>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
+    ext_field_names(&state, &auth, params).await
+}
+
+async fn ext_field_names(
+    state: &AppState,
+    auth: &AuthContext,
+    params: ExtFieldsQuery,
+) -> Result<Json<Vec<String>>, ApiError> {
     // Only scope when BOTH bounds are present; a half-specified range falls back
     // to the recent default rather than silently using "now" for the missing end.
     let time_range = match (params.start, params.end) {
@@ -365,13 +353,42 @@ pub async fn get_ext_fields(
     Ok(Json(names))
 }
 
-/// Wire types for `GET /api/schema/fields`. Defined in core (NAN-2361) so the
-/// hosted-shared adapter renders the identical contract without ClickHouse.
-pub use nanosiem_core::schema::{SchemaFieldInfo, SchemaFieldsResponse};
+/// A single field in the active schema profile's queryable universe.
+///
+/// Profile-agnostic (OCSF Phase 3b, NAN-1241): the shape is the same whether the
+/// deployment runs UDM or OCSF — only the discriminator + the field set differ.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SchemaFieldInfo {
+    /// Canonical field name as typed in nPL (e.g. `src_ip`, `src_endpoint.ip`).
+    pub name: String,
+    /// Value type (`string`, `ip_address`, `integer`, `uuid`, ...).
+    pub r#type: String,
+    /// Coarse category for grouping/UX (`network`, `authentication`, ...).
+    pub category: String,
+    /// Security entity the field denotes, if any (`ip`, `host`, `user`, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_type: Option<String>,
+    /// Whether the field is PREWHERE/index-eligible for the active profile.
+    pub prewhere: bool,
+    /// Whether the profile exposes a `_search`/`.search` full-text companion for
+    /// this field (UDM today exposes none in the field universe; reserved for
+    /// OCSF's declared search companions).
+    pub search: bool,
+}
+
+/// Response for the profile-aware `GET /api/schema/fields` endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SchemaFieldsResponse {
+    /// The active schema discriminator (`udm` | `ocsf`) — lets the frontend
+    /// hydrate its field universe and report the deployment's schema.
+    pub schema: String,
+    /// The active profile's full field universe.
+    pub fields: Vec<SchemaFieldInfo>,
+}
 
 /// Get the active schema profile's field universe.
 ///
-/// Profile-aware replacement for `/api/udm/fields` (OCSF Phase 3b):
+/// Profile-aware replacement for `/api/udm/fields` (OCSF Phase 3b, NAN-1241):
 /// returns the field set of whatever schema the deployment booted with
 /// (`NANO_SCHEMA_PROFILE`), so the frontend can discover fields and report the
 /// active schema without assuming UDM. Additive — `/api/udm/fields` is retained
@@ -395,18 +412,58 @@ pub async fn get_schema_fields(
     ensure_permission(&auth, permissions::SEARCH_VIEW)?;
 
     Ok(Json(build_schema_fields_response(
-        state.schema_profile().as_ref(),
+        state.config.schema_profile().as_ref(),
     )))
 }
 
 /// Build the `/api/schema/fields` response from a schema profile.
 ///
-/// Thin wrapper over the pure core builder so the existing unit tests keep
-/// exercising the handler-facing name.
+/// Pure (no I/O) so it is unit-testable against any profile without a live
+/// AppState/DualPool. The handler is a thin wrapper that resolves the active
+/// profile from config and delegates here.
 fn build_schema_fields_response(
     profile: &dyn nanosiem_core::schema::SchemaProfile,
 ) -> SchemaFieldsResponse {
-    nanosiem_core::schema::schema_fields_response(profile)
+    // PREWHERE-eligible set, looked up O(1) per field.
+    let prewhere: std::collections::HashSet<&str> =
+        profile.prewhere_fields().iter().copied().collect();
+    // Field-universe set, so a `{name}_search` companion can be detected without
+    // a dedicated trait method (the profile declares its own search companions as
+    // fields; UDM declares none, OCSF may declare `.search` siblings).
+    let universe: std::collections::HashSet<&str> =
+        profile.fields().iter().map(|f| f.name).collect();
+
+    let fields = profile
+        .fields()
+        .iter()
+        .map(|f| {
+            let search_companion = format!("{}_search", f.name);
+            SchemaFieldInfo {
+                name: f.name.to_string(),
+                r#type: serde_field_value(&f.field_type),
+                category: serde_field_value(&f.category),
+                entity_type: f.entity_type.as_ref().map(serde_field_value),
+                prewhere: prewhere.contains(f.name),
+                search: universe.contains(search_companion.as_str()),
+            }
+        })
+        .collect();
+
+    SchemaFieldsResponse {
+        schema: serde_field_value(&profile.id()),
+        fields,
+    }
+}
+
+/// Render a `#[serde(rename_all = "snake_case")]` enum to its wire string
+/// (e.g. `FieldType::IpAddress` → `"ip_address"`) by reusing its `Serialize`
+/// impl, so the API surface matches the schema-core vocabulary exactly and never
+/// drifts from a hand-maintained `match`.
+fn serde_field_value<T: Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|j| j.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 /// Get all UDM fields with their metadata
@@ -623,6 +680,7 @@ mod authz_parity_tests {
         get_field_values,
         get_source_types,
         get_ext_fields,
+        post_ext_fields,
         get_udm_fields,
         get_schema_fields,
     ),
@@ -630,6 +688,7 @@ mod authz_parity_tests {
         schemas(
             FieldValuesResponse,
             FieldValue,
+            ExtFieldsQuery,
             UdmFieldsResponse,
             UdmFieldInfo,
             SchemaFieldsResponse,
@@ -653,8 +712,6 @@ mod tests {
         let resp = build_schema_fields_response(&profile);
 
         assert_eq!(resp.schema, "udm");
-        assert_eq!(resp.schema_version, None);
-        assert!(!resp.strict_canonical_fields);
         // Reports the full active-profile field universe.
         assert_eq!(resp.fields.len(), profile.fields().len());
         assert!(!resp.fields.is_empty());
@@ -685,24 +742,9 @@ mod tests {
 
     #[test]
     fn schema_fields_reports_ocsf_discriminator() {
-        // The ClickHouse compatibility profile is OCSF-shaped but must not
-        // claim the strict 1.9 lake contract.
+        // The discriminator follows the active profile, not a hardcoded "udm".
         let resp = build_schema_fields_response(&OcsfProfile::new());
         assert_eq!(resp.schema, "ocsf");
-        assert_eq!(resp.schema_version, None);
-        assert!(!resp.strict_canonical_fields);
-        assert!(!resp.fields.is_empty());
-    }
-
-    #[test]
-    fn schema_fields_proves_exact_strict_ocsf_release() {
-        let resp = build_schema_fields_response(&OcsfProfile::lake_1_9());
-        assert_eq!(resp.schema, "ocsf");
-        assert_eq!(
-            resp.schema_version.as_deref(),
-            Some(nanosiem_core::parsers::OCSF_VALIDATION_VERSION)
-        );
-        assert!(resp.strict_canonical_fields);
         assert!(!resp.fields.is_empty());
     }
 
@@ -737,10 +779,7 @@ mod tests {
             &nanosiem_core::auth::ScopeSet::unrestricted(),
         );
         assert!(!sql.contains("lower(source_type)"), "got: {sql}");
-        assert!(
-            sql.contains("WHERE timestamp >= '2026-07-24 00:00:00'"),
-            "got: {sql}"
-        );
+        assert!(sql.contains("WHERE timestamp >= '2026-07-24 00:00:00'"), "got: {sql}");
         assert!(sql.contains("AND source_type != ''"), "got: {sql}");
         assert!(sql.contains("GROUP BY source_type"), "got: {sql}");
     }
@@ -759,10 +798,7 @@ mod tests {
             &deny(&["audit", "windows_sysmon"]),
         );
         assert!(sql.contains("lower(source_type) NOT IN ("), "got: {sql}");
-        assert!(
-            sql.contains("'audit'") && sql.contains("'windows_sysmon'"),
-            "got: {sql}"
-        );
+        assert!(sql.contains("'audit'") && sql.contains("'windows_sysmon'"), "got: {sql}");
 
         // A single denied source uses the inequality form.
         let one = build_source_types_sql("nanosiem.logs", &test_range(), &deny(&["audit"]));
@@ -774,9 +810,7 @@ mod tests {
         // Appended after GROUP BY this would be a syntax error; appended after
         // ORDER BY it would silently do nothing. Pin the position.
         let sql = build_source_types_sql("nanosiem.logs", &test_range(), &deny(&["audit"]));
-        let scope_at = sql
-            .find("lower(source_type)")
-            .expect("scope predicate present");
+        let scope_at = sql.find("lower(source_type)").expect("scope predicate present");
         let group_at = sql.find("GROUP BY").expect("group clause present");
         assert!(scope_at < group_at, "got: {sql}");
     }

@@ -12,6 +12,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use rand::Rng;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -33,6 +34,29 @@ pub const API_KEY_MIN_BYTES: usize = 32;
 
 /// Prefix length for API key identification
 pub const API_KEY_PREFIX_LENGTH: usize = 8;
+
+/// Domain tag for the fast verifier digest (NAN-3798 port).
+const API_KEY_DIGEST_TAG: &[u8] = b"nano-api-key-digest-v1\0";
+
+/// SHA-256 verifier over the row's bcrypt `key_hash` and the secret.
+///
+/// The secret is 256 bits from the OS CSPRNG, so a fast digest is as strong as
+/// bcrypt against offline guessing and costs microseconds instead of ~0.3 s per
+/// request. Binding the digest to `key_hash` means a digest left behind after a
+/// hash change can never authenticate: the verifier falls back to bcrypt.
+pub(crate) fn api_key_digest(key_hash: &str, secret: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(API_KEY_DIGEST_TAG);
+    hasher.update((key_hash.len() as u64).to_be_bytes());
+    hasher.update(key_hash.as_bytes());
+    hasher.update(secret.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Constant-time equality for the digest comparison.
+fn digests_equal(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
 
 /// API key service errors
 #[derive(Error, Debug)]
@@ -126,17 +150,7 @@ impl ApiKeyService {
         _ip_address: Option<&str>,
         _user_agent: Option<&str>,
     ) -> Result<ApiKeyCreated, ApiKeyServiceError> {
-        // Generate a secure random key
-        let plaintext_key = Self::generate_key();
-        let key_prefix = Self::extract_prefix(&plaintext_key);
-
-        // Hash the key for storage (use spawn_blocking as bcrypt is CPU-intensive)
-        // Requirements: 12.3 - Store API keys as hashed values
-        let key_to_hash = plaintext_key.clone();
-        let key_hash = tokio::task::spawn_blocking(move || hash_password(&key_to_hash))
-            .await
-            .map_err(|e| ApiKeyServiceError::HashingError(e.to_string()))?
-            .map_err(|e| ApiKeyServiceError::HashingError(e.to_string()))?;
+        let (plaintext_key, key_prefix, key_hash) = Self::new_key_material().await?;
 
         // Create the API key in the database
         let api_key = self
@@ -153,6 +167,8 @@ impl ApiKeyService {
             )
             .await?;
 
+        self.store_digest(&api_key, &plaintext_key).await;
+
         Ok(ApiKeyCreated {
             id: api_key.id,
             key: plaintext_key,
@@ -160,6 +176,85 @@ impl ApiKeyService {
             key_prefix,
             created_at: api_key.created_at,
         })
+    }
+
+    /// [`Self::create_key`] with the `apikey_created` audit record committed in
+    /// the same PostgreSQL transaction as the key (NAN-4954). `audit` builds
+    /// the event from the new key's id and name. Returns the recorded event so
+    /// the caller can hand it to ClickHouse delivery.
+    pub async fn create_key_audited<F>(
+        &self,
+        request: CreateApiKeyRequest,
+        created_by: Option<Uuid>,
+        audit: F,
+    ) -> Result<(ApiKeyCreated, crate::audit::AuditEvent), ApiKeyServiceError>
+    where
+        F: FnOnce(Uuid, &str) -> crate::audit::AuditEvent,
+    {
+        let (plaintext_key, key_prefix, key_hash) = Self::new_key_material().await?;
+        let (api_key, event) = self
+            .repo
+            .create_key_audited(
+                &request.name,
+                request.description.as_deref(),
+                &key_hash,
+                &key_prefix,
+                &request.permissions,
+                request.expires_at,
+                request.rate_limit,
+                created_by,
+                |key| audit(key.id, &key.name),
+            )
+            .await?;
+        self.store_digest(&api_key, &plaintext_key).await;
+        Ok((
+            ApiKeyCreated {
+                id: api_key.id,
+                key: plaintext_key,
+                name: api_key.name,
+                key_prefix,
+                created_at: api_key.created_at,
+            },
+            event,
+        ))
+    }
+
+    /// [`Self::delete_key`] with the `apikey_deleted` audit record committed in
+    /// the same transaction as the delete (NAN-4954).
+    pub async fn delete_key_audited(
+        &self,
+        id: Uuid,
+        event: &crate::audit::AuditEvent,
+    ) -> Result<(), ApiKeyServiceError> {
+        self.repo.get_key_by_id(id).await?;
+        self.repo.delete_key_audited(id, event).await?;
+        Ok(())
+    }
+
+    /// Generate a key, its prefix, and its bcrypt hash (on the blocking pool).
+    /// Requirements: 12.3 - Store API keys as hashed values
+    async fn new_key_material() -> Result<(String, String, String), ApiKeyServiceError> {
+        let plaintext_key = Self::generate_key();
+        let key_prefix = Self::extract_prefix(&plaintext_key);
+        let key_to_hash = plaintext_key.clone();
+        let key_hash = tokio::task::spawn_blocking(move || hash_password(&key_to_hash))
+            .await
+            .map_err(|e| ApiKeyServiceError::HashingError(e.to_string()))?
+            .map_err(|e| ApiKeyServiceError::HashingError(e.to_string()))?;
+        Ok((plaintext_key, key_prefix, key_hash))
+    }
+
+    /// Write the fast verifier digest. Best-effort: a failure leaves the
+    /// digest NULL and the next successful bcrypt verify backfills it.
+    async fn store_digest(&self, api_key: &ApiKey, plaintext_key: &str) {
+        let digest = api_key_digest(&api_key.key_hash, plaintext_key);
+        if let Err(error) = self
+            .repo
+            .set_key_digest(api_key.id, &api_key.key_hash, &digest)
+            .await
+        {
+            tracing::warn!(key_id = %api_key.id, %error, "api key digest write failed; bcrypt fallback stays in effect");
+        }
     }
 
     /// Reset an API key (generate a new key value)
@@ -188,6 +283,7 @@ impl ApiKeyService {
 
         // Update the key in the database
         let api_key = self.repo.reset_key(id, &key_hash, &key_prefix).await?;
+        self.store_digest(&api_key, &plaintext_key).await;
 
         Ok(ApiKeyCreated {
             id: api_key.id,
@@ -210,26 +306,42 @@ impl ApiKeyService {
             return Err(ApiKeyServiceError::InvalidFormat);
         }
 
-        // Find all keys with matching prefix
+        // Candidate keys with a matching prefix (indexed lookup).
         let prefix = Self::extract_prefix(key);
-        let keys = self.repo.list_keys().await?;
+        let candidates = self.repo.list_candidates_by_prefix(&prefix).await?;
 
-        // Find the key that matches the hash
-        for api_key in keys {
-            if api_key.key_prefix != prefix {
-                continue;
-            }
+        for (api_key, stored_digest) in candidates {
+            // NAN-3798 port: a matching fast digest authenticates without
+            // bcrypt. A missing or mismatched digest falls back to bcrypt, so a
+            // stale digest can never authenticate anything.
+            let digest = api_key_digest(&api_key.key_hash, key);
+            let verified = if stored_digest
+                .as_deref()
+                .is_some_and(|stored| digests_equal(stored, &digest))
+            {
+                true
+            } else {
+                // Verify the key hash (spawn_blocking: bcrypt is CPU-intensive)
+                let k = key.to_string();
+                let h = api_key.key_hash.clone();
+                let ok = tokio::task::spawn_blocking(move || {
+                    crate::auth::password::verify_password(&k, &h)
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                    == Some(true);
+                if ok {
+                    // Backfill so the next request skips bcrypt.
+                    let _ = self
+                        .repo
+                        .set_key_digest(api_key.id, &api_key.key_hash, &digest)
+                        .await;
+                }
+                ok
+            };
 
-            // Verify the key hash (use spawn_blocking as bcrypt is CPU-intensive)
-            let k = key.to_string();
-            let h = api_key.key_hash.clone();
-            let verify_result =
-                tokio::task::spawn_blocking(move || crate::auth::password::verify_password(&k, &h))
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok());
-
-            if verify_result == Some(true) {
+            if verified {
                 // Check if key is enabled
                 if !api_key.enabled {
                     return Err(ApiKeyServiceError::Disabled);
@@ -414,6 +526,20 @@ mod tests {
         let key1 = ApiKeyService::generate_key();
         let key2 = ApiKeyService::generate_key();
         assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn digest_is_bound_to_hash_and_secret() {
+        let a = api_key_digest("$2b$12$hashA", "secret-1");
+        assert!(digests_equal(&a, &api_key_digest("$2b$12$hashA", "secret-1")));
+        assert!(!digests_equal(&a, &api_key_digest("$2b$12$hashB", "secret-1")));
+        assert!(!digests_equal(&a, &api_key_digest("$2b$12$hashA", "secret-2")));
+        // Length-prefixing keeps the (hash, secret) split unambiguous.
+        assert!(!digests_equal(
+            &api_key_digest("ab", "c"),
+            &api_key_digest("a", "bc")
+        ));
+        assert!(!digests_equal(&a, &a[..31]));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Eval expression parsers for the query parser
 //!
 //! Handles eval command parsing and the eval expression hierarchy:
-//! logical OR/AND, comparison, additive, multiplicative, concatenation,
+//! logical OR/AND, unary NOT, comparison, additive, multiplicative, concatenation,
 //! and primary expressions (function calls, literals, field references).
 
 use nom::{
@@ -111,28 +111,44 @@ fn logical_and_expr(input: &str) -> ParseResult<'_, EvalExpression> {
     Ok((input, expr))
 }
 
-/// Parse `NOT <predicate>` (NAN-3041). Splunk's eval accepts a unary `NOT`;
-/// nPL had none, so `if(NOT x IN (...), …)` could not be written. It lowers
-/// to the `not()` function, which the SQL generator makes null-safe like the
-/// search-side `NOT` (a missing value does not match the inner predicate).
-fn not_expr(input: &str) -> ParseResult<'_, EvalExpression> {
-    if let Ok((rest, _)) = nom::sequence::terminated(
-        tag_no_case::<&str, &str, nom::error::Error<&str>>("NOT"),
-        multispace1,
-    )
-    .parse(input)
-    {
-        let _guard = super::enter_nesting(input)?;
-        let (rest, inner) = not_expr(rest)?;
-        return Ok((
-            rest,
-            EvalExpression::FunctionCall {
-                name: "not".to_string(),
-                args: vec![inner],
-            },
-        ));
+/// Canonical function name a unary `NOT` lowers to. Lowering to an ordinary
+/// function call keeps every AST walk (complexity budget, field analysis,
+/// pretty-printing, the post-stage capability table) on its existing
+/// `FunctionCall` arm, and `not(x)` re-parses to the same tree.
+pub(crate) const NOT_FUNCTION: &str = "not";
+
+/// The `NOT` keyword as a prefix operator: it must be followed by whitespace
+/// or `(` so field names such as `notes` or `not_flag` still parse as fields.
+fn not_keyword(input: &str) -> ParseResult<'_, ()> {
+    let (rest, _) = tag_no_case("NOT").parse(input)?;
+    if rest.starts_with(|c: char| c.is_whitespace() || c == '(') {
+        let (rest, _) = multispace0(rest)?;
+        Ok((rest, ()))
+    } else {
+        Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )))
     }
-    comparison_expr(input)
+}
+
+/// Parse unary NOT (`NOT expr`), binding looser than comparison and tighter
+/// than AND, as in SQL: `NOT a = b` is `NOT (a = b)` and `NOT a AND b` is
+/// `(NOT a) AND b`. Repeated `NOT`s are consumed iteratively (no recursion per
+/// keyword) and counted against the operator-chain bound; the nested
+/// `not(...)` calls they produce are then subject to the NAN-4917 function
+/// nesting budget like any other call.
+fn not_expr(input: &str) -> ParseResult<'_, EvalExpression> {
+    let (input, nots) = nom::multi::many0(not_keyword).parse(input)?;
+    super::check_chain_len(input, nots.len())?;
+    let (input, inner) = comparison_expr(input)?;
+    let expr = nots
+        .into_iter()
+        .fold(inner, |acc, ()| EvalExpression::FunctionCall {
+            name: NOT_FUNCTION.to_string(),
+            args: vec![acc],
+        });
+    Ok((input, expr))
 }
 
 /// Parse the `IN (v1, v2, …)` / `NOT IN (…)` membership suffix (NAN-3041).
@@ -356,6 +372,11 @@ fn eval_regex_literal(input: &str) -> ParseResult<'_, EvalExpression> {
 
 /// Parse function call in eval expression
 fn eval_function_call(input: &str) -> ParseResult<'_, EvalExpression> {
+    // NAN-4917: one guarded recursion point per nesting level.
+    crate::query::complexity::ensure_sufficient_stack(|| eval_function_call_unguarded(input))
+}
+
+fn eval_function_call_unguarded(input: &str) -> ParseResult<'_, EvalExpression> {
     let _guard = super::enter_nesting(input)?;
     let (input, name) = take_while1(|c: char| c.is_alphanumeric() || c == '_').parse(input)?;
     let (input, _) = char('(').parse(input)?;
@@ -379,6 +400,11 @@ fn eval_function_call(input: &str) -> ParseResult<'_, EvalExpression> {
 
 /// Parse parenthesized eval expression
 fn eval_parentheses(input: &str) -> ParseResult<'_, EvalExpression> {
+    // NAN-4917: one guarded recursion point per nesting level.
+    crate::query::complexity::ensure_sufficient_stack(|| eval_parentheses_unguarded(input))
+}
+
+fn eval_parentheses_unguarded(input: &str) -> ParseResult<'_, EvalExpression> {
     let _guard = super::enter_nesting(input)?;
     delimited(
         pair(char('('), multispace0),

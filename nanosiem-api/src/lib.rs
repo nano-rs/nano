@@ -12,9 +12,12 @@
 pub mod config;
 pub mod error;
 pub mod handlers;
+#[cfg(feature = "enterprise")]
+pub mod license_admission;
 pub mod metrics;
 pub mod middleware;
 pub mod openapi;
+pub mod pipe_tap_relay;
 pub mod routes;
 pub mod state;
 pub mod utils;
@@ -22,9 +25,5 @@ pub mod utils;
 pub use config::ApiConfig;
 pub use error::ApiError;
 pub use metrics::AppMetrics;
-pub use routes::{create_router, hosted_config_router, soar_egress_router, APP_FEATURES};
+pub use routes::create_router;
 pub use state::AppState;
-
-pub use routes::{create_internal_router, internal_route_manifest, route_manifest, INTERNAL_API_PORT};
-
-pub mod jobs_listener;

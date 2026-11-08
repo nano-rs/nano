@@ -16,12 +16,11 @@
 // + `playbook_id` follow the YAML `playbook:` shorthand (NAN-452/NAN-453), and
 // save posts the same full field set the legacy editor did.
 
+import { authenticatedFetch } from '@/lib/authenticated-fetch';
 import { useCallback, useEffect, useMemo, useRef, useState, Suspense } from 'react';
 import { useNavigate, useParams, useSearchParams, useLocation } from 'react-router-dom';
 import { ShieldPlus } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
-import { getAccessToken } from '@/lib/auth-token';
-import { requestCredentials } from '@/lib/request-credentials';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
@@ -99,9 +98,6 @@ import { ruleDiffAccess } from '@/components/repositories/repository-action-poli
 import type { AiTriageHints, CaseVisibility, TestDetectionResult } from '@/lib/api/types';
 import type { PlaybookSelectorMode } from '@/enterprise/components/detection/editor/RulePlaybookSelector';
 
-/** Cron for a scheduled rule saved without one: every minute (NAN-3468). */
-const DEFAULT_SCHEDULE_CRON = '* * * * *';
-
 export function RuleEditorRedesign() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -109,7 +105,10 @@ export function RuleEditorRedesign() {
   const [searchParams] = useSearchParams();
   const { user, hasPermission } = useAuth();
 
+  const canCreate = hasPermission('detections:create');
   const canEdit = hasPermission('detections:edit');
+  const canDelete = hasPermission('detections:delete');
+  const canPromote = hasPermission('detections:promote');
   const upstreamDiffAccess = ruleDiffAccess(hasPermission);
   const isNewMode = location.pathname.endsWith('/new') || routeId === 'new';
   const id = isNewMode ? undefined : routeId;
@@ -135,10 +134,11 @@ export function RuleEditorRedesign() {
   const { mutate: createDetection, loading: creating } = useCreateDetection();
   const { mutate: deleteDetection } = useDeleteDetection();
   const { data: detectionStats } = useDetectionStats(28);
-  const { mutate: pauseDetection } = usePauseDetection();
-  const { mutate: resumeDetection } = useResumeDetection();
-  const { mutate: promoteDetection } = usePromoteDetection();
-  const { mutate: demoteDetection } = useDemoteDetection();
+  const { mutate: pauseDetection, loading: pausing } = usePauseDetection();
+  const { mutate: resumeDetection, loading: resuming } = useResumeDetection();
+  const { mutate: promoteDetection, loading: promoting } = usePromoteDetection();
+  const { mutate: demoteDetection, loading: demoting } = useDemoteDetection();
+  const lifecyclePending = pausing || resuming || promoting || demoting;
   const { mutate: formatQuery } = useFormatQuery();
   const { data: folderSettingsData, refetch: refetchFolderSettings } = useFolderSettings();
   const { mutate: setFolderIconMutation } = useSetFolderIcon();
@@ -181,14 +181,9 @@ export function RuleEditorRedesign() {
   // (`@detection`); its "Open in editor" lands here through the rule-editor
   // bridge. The old auto-open NewRuleAiPanel aside is gone.
   const { capabilities } = useCapabilities();
-  // NAN-2361: the hosted-shared lake has no materialized-view real-time path;
-  // shared authoring accepts scheduled rules only. Default to scheduled and
-  // never offer the real-time flip there.
-  const sharedLake = user?.deployment_mode === 'enterprise_shared';
-  const defaultDetectionMode: 'realtime' | 'scheduled' = sharedLake ? 'scheduled' : 'realtime';
   // NAN-4590: AI tuning runs in the pivt panel (panel-first, NAN-4588). The
   // Tune action sends `@tune`; pivt reads this editor and writes accepted
-  // suggestions back through the rule-editor bridge below. A tenant that
+  // suggestions back through the rule-editor bridge below. A deployment that
   // turned AI tuning off (NAN-3219) gets the explanation in pivt.
   const aiTuningAvailable = capabilities.melod && capabilities.aiTuning;
   const { dispatch: pivtDispatch } = usePivtCommands();
@@ -218,16 +213,8 @@ export function RuleEditorRedesign() {
     let cancelled = false;
     (async () => {
       try {
-        const token = getAccessToken();
         const base = import.meta.env.VITE_API_URL ?? '';
-        const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
-        // NAN-2361: a same-origin fetch sends the access-token cookie by
-        // default; with the bearer as well the shared-tenant API rejects the
-        // request as carrying two credentials (401). Match the ApiClient.
-        const resp = await fetch(`${base}/api/rules/${id}/versions`, {
-          headers,
-          credentials: requestCredentials(`/api/rules/${id}/versions`, headers),
-        });
+        const resp = await authenticatedFetch(`/api/rules/${id}/versions`, `${base}/api/rules/${id}/versions`);
         if (!resp.ok || cancelled) return;
         type ApiVersion = {
           id: number;
@@ -282,7 +269,7 @@ export function RuleEditorRedesign() {
           author: user?.name || '',
           severity: initialSeverity,
           mode: 'staging',
-          detection_mode: defaultDetectionMode,
+          detection_mode: 'realtime',
           tags: initialTags,
           narrative: initialNarrative,
           mitre_tactics: initialTactics.join(', '),
@@ -475,7 +462,7 @@ export function RuleEditorRedesign() {
   }, [canEdit, metadata, actualQuery]);
 
   const realtimeNudgeAvailable =
-    canEdit && !sharedLake && detectionModeLens === 'scheduled' && (metadata.dataset || 'logs') === 'logs';
+    canEdit && detectionModeLens === 'scheduled' && (metadata.dataset || 'logs') === 'logs';
 
   // Browser close / refresh guard — mirrors the legacy editor.
   useEffect(() => {
@@ -542,13 +529,8 @@ export function RuleEditorRedesign() {
   const buildPayload = useCallback(() => {
     const severity = (metadata.severity || 'medium') as 'critical' | 'high' | 'medium' | 'low';
     const mode = (metadata.mode || 'staging') as 'staging' | 'live' | 'alerting';
-    const detectionMode = sharedLake || metadata.detection_mode === 'scheduled' ? 'scheduled' : 'real-time';
-    // NAN-3468: a scheduled rule with no schedule used to be saved without a
-    // cron and then never ran. Blank now means the documented default, every
-    // minute (the server applies the same default).
-    const schedule =
-      metadata.schedule?.trim() ||
-      (detectionMode === 'real-time' ? '*/30 * * * * *' : DEFAULT_SCHEDULE_CRON);
+    const detectionMode = metadata.detection_mode === 'scheduled' ? 'scheduled' : 'real-time';
+    const schedule = metadata.schedule || (detectionMode === 'real-time' ? '*/30 * * * * *' : '');
     const lookbackMinutes = metadata.lookback ? parseLookbackToMinutes(metadata.lookback) : undefined;
     const tags = metadata.tags ? metadata.tags.split(',').map((t) => t.trim()).filter(Boolean) : undefined;
     const mitreTactics = metadata.mitre_tactics
@@ -572,10 +554,6 @@ export function RuleEditorRedesign() {
       // made it impossible to flip a spans/metrics/risk rule back to logs.
       // Rules whose YAML has no dataset key keep omitting it (unchanged).
       dataset: metadata.dataset || undefined,
-      // Lean audit #2: hosted-shared rules run against one bound ingest
-      // source. Send the picked one; omitted, the server binds the query's
-      // unambiguous source when the rule goes live.
-      ...(sharedLake && metadata.source?.trim() ? { source_slug: metadata.source.trim() } : {}),
       // NAN-1825: mirror the backend feedback-loop guard (NAN-1805). A
       // dataset=risk rule's findings feed the risk dataset itself, so it must
       // not contribute risk: the server requires risk_score EXPLICITLY 0
@@ -610,7 +588,6 @@ export function RuleEditorRedesign() {
   }, [
     metadata,
     actualQuery,
-    sharedLake,
     playbookMode,
     playbookPickId,
     triageHints,
@@ -775,13 +752,13 @@ export function RuleEditorRedesign() {
   }, [id, updateDetection, refetchRules, refetchRule]);
 
   const handleTogglePause = useCallback(async () => {
-    if (!id || !apiRule) return;
+    if (!id || !apiRule || !canPromote || lifecyclePending) return;
     try {
       if (apiRule.mode === 'paused') {
-        await resumeDetection(id);
+        await resumeDetection({ id, expectedMode: apiRule.mode });
         toast.success('Rule resumed');
       } else {
-        await pauseDetection(id);
+        await pauseDetection({ id, expectedMode: apiRule.mode });
         toast.success('Rule paused');
       }
       refetchRules();
@@ -789,31 +766,31 @@ export function RuleEditorRedesign() {
     } catch {
       toast.error('Failed to update rule status');
     }
-  }, [id, apiRule, pauseDetection, resumeDetection, refetchRules, refetchRule]);
+  }, [id, apiRule, canPromote, lifecyclePending, pauseDetection, resumeDetection, refetchRules, refetchRule]);
 
   const handlePromote = useCallback(async () => {
-    if (!id || !apiRule) return;
+    if (!id || !apiRule || !canPromote || lifecyclePending) return;
     try {
-      const updated = await promoteDetection(id);
+      const updated = await promoteDetection({ id, expectedMode: apiRule.mode });
       toast.success(`Promoted to ${updated.mode}`);
       refetchRules();
       refetchRule();
-    } catch (e: unknown) {
-      toast.error('Failed to promote rule', { description: e instanceof Error ? e.message : undefined });
+    } catch {
+      toast.error('Failed to promote rule');
     }
-  }, [id, apiRule, promoteDetection, refetchRules, refetchRule]);
+  }, [id, apiRule, canPromote, lifecyclePending, promoteDetection, refetchRules, refetchRule]);
 
   const handleDemote = useCallback(async () => {
-    if (!id || !apiRule) return;
+    if (!id || !apiRule || !canPromote || lifecyclePending) return;
     try {
-      const updated = await demoteDetection(id);
+      const updated = await demoteDetection({ id, expectedMode: apiRule.mode });
       toast.success(`Demoted to ${updated.mode}`);
       refetchRules();
       refetchRule();
-    } catch (e: unknown) {
-      toast.error('Failed to demote rule', { description: e instanceof Error ? e.message : undefined });
+    } catch {
+      toast.error('Failed to demote rule');
     }
-  }, [id, apiRule, demoteDetection, refetchRules, refetchRule]);
+  }, [id, apiRule, canPromote, lifecyclePending, demoteDetection, refetchRules, refetchRule]);
 
   const handleOpenTune = useCallback(() => {
     if (!aiTuningAvailable) {
@@ -829,20 +806,22 @@ export function RuleEditorRedesign() {
   // Rail row actions — act on any rule in the list, not just the focused one.
   // Each short-circuits into the same mutation hooks the topbar uses.
   const railRowActions = useMemo(() => {
-    if (!canEdit) return undefined;
     const findRule = (ruleId: string) => apiRules?.find((r) => r.id === ruleId);
     return {
       onViewMatches: (ruleId: string) => navigate(`/rules/${ruleId}/matches`),
-      onDuplicate: (ruleId: string) => navigate(`/rules/editor/new?duplicate=${ruleId}`),
-      onTogglePause: async (ruleId: string) => {
+      onDuplicate: canCreate
+        ? (ruleId: string) => navigate(`/rules/editor/new?duplicate=${ruleId}`)
+        : undefined,
+      lifecyclePending,
+      onTogglePause: canPromote ? async (ruleId: string) => {
         const rule = findRule(ruleId);
-        if (!rule) return;
+        if (!rule || lifecyclePending) return;
         try {
           if (rule.mode === 'paused') {
-            await resumeDetection(ruleId);
+            await resumeDetection({ id: ruleId, expectedMode: rule.mode });
             toast.success('Rule resumed');
           } else {
-            await pauseDetection(ruleId);
+            await pauseDetection({ id: ruleId, expectedMode: rule.mode });
             toast.success('Rule paused');
           }
           refetchRules();
@@ -850,28 +829,32 @@ export function RuleEditorRedesign() {
         } catch {
           toast.error('Failed to update rule status');
         }
-      },
-      onPromote: async (ruleId: string) => {
+      } : undefined,
+      onPromote: canPromote ? async (ruleId: string) => {
+        const rule = findRule(ruleId);
+        if (!rule || lifecyclePending) return;
         try {
-          const updated = await promoteDetection(ruleId);
+          const updated = await promoteDetection({ id: ruleId, expectedMode: rule.mode });
           toast.success(`Promoted to ${updated.mode}`);
           refetchRules();
           if (ruleId === id) refetchRule();
-        } catch (e: unknown) {
-          toast.error('Failed to promote rule', { description: e instanceof Error ? e.message : undefined });
+        } catch {
+          toast.error('Failed to promote rule');
         }
-      },
-      onDemote: async (ruleId: string) => {
+      } : undefined,
+      onDemote: canPromote ? async (ruleId: string) => {
+        const rule = findRule(ruleId);
+        if (!rule || lifecyclePending) return;
         try {
-          const updated = await demoteDetection(ruleId);
+          const updated = await demoteDetection({ id: ruleId, expectedMode: rule.mode });
           toast.success(`Demoted to ${updated.mode}`);
           refetchRules();
           if (ruleId === id) refetchRule();
-        } catch (e: unknown) {
-          toast.error('Failed to demote rule', { description: e instanceof Error ? e.message : undefined });
+        } catch {
+          toast.error('Failed to demote rule');
         }
-      },
-      onArchive: async (ruleId: string) => {
+      } : undefined,
+      onArchive: canEdit ? async (ruleId: string) => {
         try {
           await updateDetection({ id: ruleId, data: { archived: true } });
           toast.success('Rule archived');
@@ -880,8 +863,8 @@ export function RuleEditorRedesign() {
         } catch {
           toast.error('Failed to archive rule');
         }
-      },
-      onUnarchive: async (ruleId: string) => {
+      } : undefined,
+      onUnarchive: canEdit ? async (ruleId: string) => {
         try {
           await updateDetection({ id: ruleId, data: { archived: false, mode: 'staging' } });
           toast.success('Rule unarchived');
@@ -890,8 +873,8 @@ export function RuleEditorRedesign() {
         } catch {
           toast.error('Failed to unarchive rule');
         }
-      },
-      onDelete: async (ruleId: string) => {
+      } : undefined,
+      onDelete: canDelete ? async (ruleId: string) => {
         const rule = findRule(ruleId);
         const name = rule?.name || 'this rule';
         if (!window.confirm(`Delete ${name}? It stops running and moves to Archived; its matches and alerts are kept.`)) return;
@@ -903,10 +886,14 @@ export function RuleEditorRedesign() {
         } catch {
           toast.error('Failed to delete rule');
         }
-      },
+      } : undefined,
     };
   }, [
+    canCreate,
     canEdit,
+    canDelete,
+    canPromote,
+    lifecyclePending,
     apiRules,
     id,
     navigate,
@@ -982,7 +969,7 @@ export function RuleEditorRedesign() {
           {
             ...draft.metadata,
             author: draft.metadata.author || user?.name || '',
-            detection_mode: draft.metadata.detection_mode || defaultDetectionMode,
+            detection_mode: draft.metadata.detection_mode || 'realtime',
           },
           draft.query,
         ),
@@ -991,7 +978,7 @@ export function RuleEditorRedesign() {
       handleHintsChange(edit.hints);
       setInspectorCollapsed(false);
     }
-  }, [handleHintsChange, user?.name, defaultDetectionMode]);
+  }, [handleHintsChange, user?.name]);
   useRuleEditBridge({
     ready: isNewMode || (!ruleLoading && apiRule?.id === id && savedContent !== ''),
     snapshot: {
@@ -1139,13 +1126,14 @@ export function RuleEditorRedesign() {
           onFormat={canEdit ? handleFormat : undefined}
           onOpenTest={handleOpenTest}
           onViewMatches={!isNewMode && id ? () => navigate(`/rules/${id}/matches`) : undefined}
-          onDuplicate={!isNewMode && id ? () => navigate(`/rules/editor/new?duplicate=${id}`) : undefined}
-          onTogglePause={!isNewMode && id && canEdit ? handleTogglePause : undefined}
-          onPromote={!isNewMode && id && canEdit ? handlePromote : undefined}
-          onDemote={!isNewMode && id && canEdit ? handleDemote : undefined}
+          onDuplicate={!isNewMode && id && canCreate ? () => navigate(`/rules/editor/new?duplicate=${id}`) : undefined}
+          onTogglePause={!isNewMode && id && canPromote ? handleTogglePause : undefined}
+          onPromote={!isNewMode && id && canPromote ? handlePromote : undefined}
+          onDemote={!isNewMode && id && canPromote ? handleDemote : undefined}
+          lifecyclePending={lifecyclePending}
           onArchive={!isNewMode && id && canEdit ? () => setShowArchiveConfirm(true) : undefined}
           onUnarchive={!isNewMode && id && canEdit && apiRule?.archived ? handleUnarchive : undefined}
-          onDelete={!isNewMode && id && canEdit && !apiRule?.archived ? () => setShowDeleteConfirm(true) : undefined}
+          onDelete={!isNewMode && id && canDelete && !apiRule?.archived ? () => setShowDeleteConfirm(true) : undefined}
           onOpenTune={!isNewMode && id && canEdit ? handleOpenTune : undefined}
           enabledLenses={new Set<ViewMode>(['code', 'flow', 'form'])}
           availableFolders={availableFolders}
@@ -1254,7 +1242,6 @@ export function RuleEditorRedesign() {
         pendingVersionFocusId={pendingVersionFocusId}
         onPendingVersionConsumed={() => setPendingVersionFocusId(null)}
       />
-
 
       {/* Test drawer — absolute-positioned child of the content row so its
           backdrop dims the rule rail + main pane + inspector, and the

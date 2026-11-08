@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 //! Multi-rhythm spike scheduler.
 //!
 //! A `SpikeProfile` is a baseline EPS plus a list of overlapping rhythms.

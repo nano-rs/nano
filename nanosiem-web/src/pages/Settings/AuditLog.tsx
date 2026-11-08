@@ -14,7 +14,8 @@
 
 import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { auditFiltersFromSearch } from '@/lib/audit-filters';
+import { auditFiltersFromSearch, auditFiltersToSearch, sameAuditUrlFilters } from '@/lib/audit-filters';
+import { auditActorLabel } from '@/lib/audit-feed';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 // Badge not used in redesign pass
@@ -48,25 +49,22 @@ import { useToast } from '@/hooks/use-toast';
 import { api, AuditLogEntry, AuditLogQuery } from '@/lib/api';
 import { formatUTC } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
-import { auditCsvCell } from '@/lib/audit-csv';
-import { browserTenantRuntime } from '@/lib/tenant-runtime';
+import { auditCsv } from '@/lib/audit-csv';
+
+// Radix Select refuses an empty-string item value (it throws and blanks the
+// page), so "all" is a sentinel that maps to an absent filter.
+const ALL_FILTER = '__all__';
 
 // Common audit actions for filtering (underscore convention)
 const AUDIT_ACTIONS = [
-  { value: '', label: 'All Actions' },
-  { value: 'soar.settings.updated', label: 'SOAR Settings Updated' },
-  { value: 'inputlookup_allowlist_updated', label: 'Lookup URL Allowlist Updated' },
-  { value: 'inputlookup_fetch', label: 'Inputlookup Fetch' },
-  { value: 'inputlookup_egress_denied', label: 'Inputlookup Egress Denied' },
+  { value: ALL_FILTER, label: 'All Actions' },
   { value: 'login_success', label: 'Login Success' },
   { value: 'login_failed', label: 'Login Failed' },
   { value: 'logout', label: 'Logout' },
   { value: 'auth_denied', label: 'Authorization Denied' },
-  { value: 'auth_session_created', label: 'Session Created' },
-  { value: 'auth_session_refreshed', label: 'Session Refreshed' },
-  { value: 'auth_session_removed', label: 'Session Removed' },
-  { value: 'auth_tenant_sessions_revoked', label: 'Tenant Sessions Revoked' },
-  { value: 'auth_tenant_session_fence_changed', label: 'Session Revocation Boundary Changed' },
+  { value: 'sso_sign_in_denied', label: 'SSO Sign-in Denied' },
+  { value: 'sso_group_grants_synchronized', label: 'SSO Group Grants Synchronized' },
+  { value: 'token_refresh', label: 'Session Refreshed' },
   { value: 'user_created', label: 'User Created' },
   { value: 'user_updated', label: 'User Updated' },
   { value: 'user_deleted', label: 'User Deleted' },
@@ -79,10 +77,9 @@ const AUDIT_ACTIONS = [
   { value: 'alert_acknowledged', label: 'Alert Acknowledged' },
   { value: 'alert_closed', label: 'Alert Closed' },
   { value: 'apikey_created', label: 'API Key Created' },
-  { value: 'apikey_rotated', label: 'API Key Rotated' },
-  { value: 'apikey_revoked', label: 'API Key Revoked' },
-  { value: 'apikey_authenticated', label: 'API Key Authenticated' },
-  { value: 'apikey_rate_limited', label: 'API Key Rate Limited' },
+  { value: 'apikey_updated', label: 'API Key Updated' },
+  { value: 'apikey_enabled', label: 'API Key Enabled' },
+  { value: 'apikey_disabled', label: 'API Key Disabled' },
   { value: 'apikey_deleted', label: 'API Key Deleted' },
   { value: 'session_terminated', label: 'Session Terminated' },
   { value: 'oidc_provider_created', label: 'OIDC Provider Created' },
@@ -90,7 +87,7 @@ const AUDIT_ACTIONS = [
 
 // Audit source subsystems for filtering
 const AUDIT_SOURCES = [
-  { value: '', label: 'All Sources' },
+  { value: ALL_FILTER, label: 'All Sources' },
   { value: 'search', label: 'Search' },
   { value: 'auth', label: 'Authentication' },
   { value: 'detection', label: 'Detection' },
@@ -109,6 +106,7 @@ const AUDIT_SOURCES = [
   { value: 'oidc', label: 'OIDC' },
   { value: 'parser_repo', label: 'Parser Repos' },
   { value: 'rule_repo', label: 'Rule Repos' },
+  { value: 'playbook_repo', label: 'Playbook Repos' },
   { value: 'marketplace', label: 'Marketplace' },
   { value: 'session', label: 'Sessions' },
   { value: 'settings', label: 'System Settings' },
@@ -148,26 +146,30 @@ function formatAction(action: string): string {
 }
 
 // Content component for use in tabbed Access Control page
-function actorLabel(log: AuditLogEntry): string {
-  if (log.details?.principal_kind === 'egress_helper') return 'Egress proxy';
-  return log.user_name || log.user_id || (log.details?.initiator_known === false ? 'Unknown initiator' : 'System');
-}
-
 export function AuditLogContent() {
   const { toast } = useToast();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   // Data state
   const [logs, setLogs] = useState<AuditLogEntry[]>([]);
   const [total, setTotal] = useState(0);
+  const [degradedReason, setDegradedReason] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [serverExporting, setServerExporting] = useState(false);
 
   // Filter state
+  // NAN-4480: action / source / resource_type round-trip through the URL so a
+  // filtered view is a shareable deep link (other params, e.g. `tab`, kept).
   const [filters, setFilters] = useState<AuditLogQuery>(() => auditFiltersFromSearch(searchParams));
   useEffect(() => {
     const next = auditFiltersFromSearch(searchParams);
-    setFilters((current) => current.action === next.action && current.resource_type === next.resource_type && current.source === next.source ? current : next);
+    setFilters((current) => (sameAuditUrlFilters(current, next) ? current : { ...current, action: next.action, source: next.source, resource_type: next.resource_type, offset: 0 }));
   }, [searchParams]);
+  useEffect(() => {
+    if (sameAuditUrlFilters(filters, auditFiltersFromSearch(searchParams))) return;
+    setSearchParams((current) => auditFiltersToSearch(current, filters), { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters.action, filters.source, filters.resource_type]);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterOpen, setFilterOpen] = useState(false);
 
@@ -181,6 +183,7 @@ export function AuditLogContent() {
       const response = await api.queryAuditLogs(filters);
       setLogs(response.logs);
       setTotal(response.total);
+      setDegradedReason(response.degraded ? (response.degraded_reason ?? 'Audit store degraded') : null);
     } catch (err) {
       toast({
         title: 'Error',
@@ -202,6 +205,7 @@ export function AuditLogContent() {
     return (
       log.action?.toLowerCase().includes(query) ||
       log.user_name?.toLowerCase().includes(query) ||
+      log.api_key_name?.toLowerCase().includes(query) ||
       log.source?.toLowerCase().includes(query) ||
       log.ip_address?.toLowerCase().includes(query) ||
       log.resource_type?.toLowerCase().includes(query) ||
@@ -209,6 +213,8 @@ export function AuditLogContent() {
       log.message?.toLowerCase().includes(query)
     );
   });
+  const exportAllBlockedBySearch = searchQuery.trim().length > 0;
+  const exportAllSearchReason = 'Clear the search to export all rows matching the filters';
 
   const handleFilterChange = (key: keyof AuditLogQuery, value: string) => {
     setFilters(prev => ({
@@ -230,18 +236,8 @@ export function AuditLogContent() {
 
   const handleExport = async () => {
     try {
-      const headers = ['Timestamp', 'User', 'Source', 'Action', 'Resource Type', 'Resource Name', 'IP Address', 'Success'];
-      const rows = logs.map(log => [
-        log.timestamp,
-        actorLabel(log),
-        log.source || '',
-        log.action || '',
-        log.resource_type || '',
-        log.resource_name || '',
-        log.ip_address || '',
-        log.success ? 'Yes' : 'No',
-      ]);
-      const csv = [headers, ...rows].map(row => row.map(auditCsvCell).join(',')).join('\n');
+      // Exactly the rows on screen (search box applied), formula-neutralized.
+      const csv = auditCsv(filteredLogs);
       const blob = new Blob([csv], { type: 'text/csv' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -261,62 +257,32 @@ export function AuditLogContent() {
     }
   };
 
-  // NAN-2361 hosted-shared tenants: a full export (up to 100 000 rows, all
-  // current filters) is a queued tenant export job. The route exists only
-  // under the hosted-shared profile; elsewhere the button stays hidden.
-  const [serverExporting, setServerExporting] = useState(false);
-  const isSharedTenant = browserTenantRuntime.current().scope.kind === 'enterprise_shared';
-  const handleServerExport = async () => {
+  const handleExportAll = async () => {
+    if (exportAllBlockedBySearch) return;
     setServerExporting(true);
     try {
-      const toIso = (value?: string) => {
-        if (!value) return undefined;
-        const parsed = new Date(value);
-        return Number.isNaN(parsed.getTime()) ? undefined : parsed.toISOString();
-      };
-      const job = await api.enqueueExport('audit', {
+      const { offset: _offset, ...matchingFilters } = filters;
+      const download = await api.exportAuditLogs({
+        ...matchingFilters,
+        limit: 100_000,
         format: 'csv',
-        params: {
-          action: filters.action || undefined,
-          source: filters.source || undefined,
-          resource_type: filters.resource_type || undefined,
-          success: filters.success,
-          start_time: toIso(filters.start_time),
-          end_time: toIso(filters.end_time),
-        },
       });
-      toast({ title: 'Export queued', description: 'The audit export is running; the download starts when it completes.' });
-      const deadline = Date.now() + 40 * 60 * 1000;
-      for (;;) {
-        if (Date.now() > deadline) throw new Error('Audit export did not complete in time');
-        await new Promise((resolve) => window.setTimeout(resolve, 1500));
-        const status = await api.getExportJob(job.status_url);
-        if (status.status === 'completed') {
-          const download = await api.downloadExportJob(job.download_url, status.filename ?? 'audit_logs.csv');
-          const url = URL.createObjectURL(download.blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = download.filename;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          URL.revokeObjectURL(url);
-          toast({
-            title: 'Export complete',
-            description: status.truncated
-              ? `Exported ${status.row_count ?? 0} rows (bounded); narrow the window for the rest.`
-              : `Exported ${status.row_count ?? 0} rows.`,
-          });
-          return;
-        }
-        if (status.status === 'failed' || status.status === 'expired') {
-          throw new Error(status.error || `Audit export ${status.status}`);
-        }
-      }
+      const url = URL.createObjectURL(download.blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = download.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast({
+        title: 'Export complete',
+        description: 'Downloaded up to 100,000 matching audit rows.',
+      });
     } catch (err) {
       toast({
         title: 'Error',
-        description: err instanceof Error ? err.message : 'Failed to export audit log',
+        description: err instanceof Error ? err.message : 'Failed to export all audit logs',
         variant: 'destructive',
       });
     } finally {
@@ -333,7 +299,7 @@ export function AuditLogContent() {
   const offset = filters.offset || 0;
   const currentPage = Math.floor(offset / limit) + 1;
   const totalPages = Math.ceil(total / limit);
-  const hasActiveFilters = !!(filters.action || filters.source || filters.start_time || filters.end_time);
+  const hasActiveFilters = !!(filters.action || filters.source || filters.resource_type || filters.start_time || filters.end_time);
 
   if (loading && logs.length === 0) {
     return (
@@ -371,8 +337,8 @@ export function AuditLogContent() {
               <div className="space-y-1.5">
                 <label className="text-[11px] text-muted-foreground">Action</label>
                 <Select
-                  value={filters.action || ''}
-                  onValueChange={(value) => handleFilterChange('action', value)}
+                  value={filters.action || ALL_FILTER}
+                  onValueChange={(value) => handleFilterChange('action', value === ALL_FILTER ? '' : value)}
                 >
                   <SelectTrigger className="h-8 text-[12px] border-border">
                     <SelectValue placeholder="All Actions" />
@@ -389,8 +355,8 @@ export function AuditLogContent() {
               <div className="space-y-1.5">
                 <label className="text-[11px] text-muted-foreground">Source</label>
                 <Select
-                  value={filters.source || ''}
-                  onValueChange={(value) => handleFilterChange('source', value)}
+                  value={filters.source || ALL_FILTER}
+                  onValueChange={(value) => handleFilterChange('source', value === ALL_FILTER ? '' : value)}
                 >
                   <SelectTrigger className="h-8 text-[12px] border-border">
                     <SelectValue placeholder="All Sources" />
@@ -445,20 +411,41 @@ export function AuditLogContent() {
           <Download className="w-3 h-3" />
           Export CSV
         </Button>
-        {isSharedTenant && (
-          <Button
-            onClick={handleServerExport}
-            disabled={serverExporting}
-            variant="outline"
-            size="sm"
-            className="h-7 text-[11.5px] px-2.5 gap-1.5 border-border"
-            title="Queue a full export (up to 100,000 rows) with the current filters"
+        <Button
+          onClick={handleExportAll}
+          disabled={serverExporting || exportAllBlockedBySearch}
+          variant="outline"
+          size="sm"
+          className="h-7 text-[11.5px] px-2.5 gap-1.5 border-border"
+          title={exportAllBlockedBySearch
+            ? exportAllSearchReason
+            : 'Export all matching audit rows (up to 100,000)'}
+        >
+          {serverExporting ? <LoadingIcon className="w-3 h-3" /> : <Download className="w-3 h-3" />}
+          {serverExporting ? 'Exporting…' : 'Export all'}
+        </Button>
+        {exportAllBlockedBySearch && (
+          <span
+            data-testid="audit-export-all-search-reason"
+            className="font-mono text-[10.5px] text-muted-foreground"
           >
-            <Download className="w-3 h-3" />
-            {serverExporting ? 'Exporting…' : 'Export all'}
-          </Button>
+            {exportAllSearchReason}
+          </span>
+        )}
+        {serverExporting && (
+          <span role="status" className="font-mono text-[10.5px] text-muted-foreground">
+            Exporting up to 100,000 matching rows…
+          </span>
         )}
       </div>
+
+      {degradedReason && (
+        <div role="status" className="rounded border border-warning/40 bg-warning/10 px-3 py-2 text-[12px] text-foreground">
+          <span className="font-medium">Partial audit view.</span>{' '}
+          ClickHouse is not answering, so only security-critical events (logins, MFA, API keys, credentials) from the PostgreSQL record are shown.
+          <div className="mt-0.5 font-mono text-[10.5px] text-muted-foreground break-all">{degradedReason}</div>
+        </div>
+      )}
 
       {/* Table */}
       <div className="rounded-lg border border-border overflow-hidden">
@@ -496,8 +483,8 @@ export function AuditLogContent() {
                   <td className="px-3 py-1.5">
                     <div className="flex items-center gap-1.5">
                       <User className="w-3 h-3 text-muted-foreground shrink-0" />
-                      <span className="font-mono text-[10.5px] text-foreground truncate max-w-[90px]">
-                        {actorLabel(log)}
+                      <span className="font-mono text-[10.5px] text-foreground truncate max-w-[90px]" title={auditActorLabel(log)}>
+                        {auditActorLabel(log)}
                       </span>
                     </div>
                   </td>
@@ -596,7 +583,7 @@ export function AuditLogContent() {
             <>
               <span title="Event ID">{selectedLog.id}</span>
               <span title="Timestamp">{formatUTC(selectedLog.timestamp)}</span>
-              <span title="Actor">{actorLabel(selectedLog)}</span>
+              <span title="Actor">{auditActorLabel(selectedLog)}</span>
             </>
           )
         }
@@ -626,8 +613,19 @@ export function AuditLogContent() {
               </div>
               <div>
                 <p className="text-[11px] text-muted-foreground mb-0.5">Actor</p>
-                <p className="font-mono text-[11px] text-foreground">{actorLabel(selectedLog)}</p>
+                <p className="font-mono text-[11px] text-foreground">{auditActorLabel(selectedLog)}</p>
               </div>
+              {(selectedLog.api_key_name || selectedLog.api_key_id) && (
+                <div>
+                  <p className="text-[11px] text-muted-foreground mb-0.5">API key</p>
+                  <p className="font-mono text-[11px] text-foreground">
+                    {selectedLog.api_key_name || selectedLog.api_key_id}
+                    {selectedLog.api_key_name && selectedLog.api_key_id && (
+                      <span className="text-muted-foreground"> · {selectedLog.api_key_id}</span>
+                    )}
+                  </p>
+                </div>
+              )}
               {selectedLog.source && (
                 <div>
                   <p className="text-[11px] text-muted-foreground mb-0.5">Source</p>

@@ -184,15 +184,40 @@ pub struct PrevalenceRepository {
     hash_prevalence_source_summary: String,
     domain_prevalence_source_summary: String,
     ip_prevalence_source_summary: String,
-    /// NAN-3226: ` AND NOT arrayExists(...)` over the tenant's internal
+    /// NAN-3226: ` AND NOT arrayExists(...)` over the Settings > Risk internal
     /// suffixes for the domain LIST reads (rare / new), or empty. The built-in
-    /// suffixes are already excluded at write time by the domain MVs.
+    /// suffixes are already excluded at write time by the domain MVs (CH 111).
     internal_domain_filter: String,
+    /// Active raw logs table (coverage probe: oldest / newest event).
+    logs_table: String,
 }
 
-/// The SQL predicate excluding `domain` values equal to or under a tenant
-/// internal suffix (label boundary: `endsWith('.' || domain, '.' || s)`).
-/// Empty when the tenant added no suffixes, so queries stay byte-identical.
+/// `min(time_bucket)` + row count of one `*_prevalence_agg` table.
+#[derive(Debug, Row, Deserialize)]
+struct AggCoverageRow {
+    since: i64,
+    n: u64,
+}
+
+/// Oldest / newest event (epoch ms) + row count of the raw logs table.
+#[derive(Debug, Row, Deserialize)]
+struct IngestCoverageRow {
+    since: i64,
+    head: i64,
+    n: u64,
+}
+
+/// Oldest last successful refresh (epoch s, 0 = none) of the final views.
+#[derive(Debug, Row, Deserialize)]
+struct RefreshCoverageRow {
+    t: i64,
+    n: u64,
+}
+
+/// The SQL predicate excluding `domain` values equal to or under an internal
+/// suffix added in Settings > Risk (label boundary:
+/// `endsWith('.' || domain, '.' || s)`). Empty when none were added, so the
+/// queries stay byte-identical.
 pub(crate) fn internal_domain_predicate(
     internal: &crate::internal_domains::InternalDomains,
 ) -> String {
@@ -208,8 +233,25 @@ pub(crate) fn internal_domain_predicate(
     format!(" AND NOT arrayExists(s -> endsWith(concat('.', domain), concat('.', s)), [{list}])")
 }
 
+/// Distinct domain candidates for query-artifact discovery (NAN-3226): the
+/// internal-name exclusion runs in the WHERE, BEFORE `DISTINCT ... LIMIT`, so
+/// a query that touches many internal hosts cannot crowd external domains out
+/// of the `cap` budget.
+pub fn distinct_domain_candidates_sql(
+    host_col: &str,
+    logs_table: &str,
+    filter: &str,
+    internal: &crate::internal_domains::InternalDomains,
+    cap: usize,
+) -> String {
+    format!(
+        "SELECT DISTINCT {host_col} AS value FROM {logs_table} WHERE {filter} AND {host_col} != '' AND {not_internal} LIMIT {cap}",
+        not_internal = internal.sql_not_internal(host_col),
+    )
+}
+
 impl PrevalenceRepository {
-    /// Exclude the tenant's internal suffixes from domain list reads (NAN-3226).
+    /// Exclude the internal suffixes from domain list reads (NAN-3226).
     pub fn with_internal_domains(
         mut self,
         internal: &crate::internal_domains::InternalDomains,
@@ -248,6 +290,104 @@ impl PrevalenceRepository {
             domain_prevalence_source_summary: table_names.read("domain_prevalence_source_summary"),
             ip_prevalence_source_summary: table_names.read("ip_prevalence_source_summary"),
             internal_domain_filter: String::new(),
+            logs_table: table_names.read(crate::schema::active_logs_table()),
+        }
+    }
+
+    /// Coverage metadata for [`super::coverage::classify`].
+    ///
+    /// Every read is answered from part metadata (the agg tables are
+    /// partitioned by `toYYYYMM(time_bucket)` and the logs tables by day, so
+    /// `min` / `max` / `count()` use the implicit min-max projection; measured
+    /// at 4-8 rows read). A failed read leaves its field `None`: the probe
+    /// never fails the request it decorates.
+    pub async fn coverage_probe(&self) -> super::coverage::CoverageProbe {
+        use super::coverage::ArtifactKind;
+        let mut probe = super::coverage::CoverageProbe::default();
+
+        // One row per kind, in a fixed order, so an EMPTY table stays visible
+        // as "no coverage for that kind" instead of borrowing another kind's.
+        for (kind, table) in [
+            (ArtifactKind::Hash, self.hash_prevalence_table.as_str()),
+            (ArtifactKind::Domain, self.domain_prevalence_table.as_str()),
+            (ArtifactKind::Ip, self.ip_prevalence_table.as_str()),
+        ] {
+            let query = format!(
+                "SELECT toInt64(toUnixTimestamp(min(time_bucket))) AS since, count() AS n FROM {table}"
+            );
+            match self.client.query(&query).fetch_one::<AggCoverageRow>().await {
+                Ok(row) if row.n > 0 => {
+                    probe.set_covered_since(kind, DateTime::from_timestamp(row.since, 0));
+                }
+                Ok(_) => {}
+                Err(error) => debug!(%error, ?kind, "prevalence coverage: agg probe failed"),
+            }
+        }
+
+        let query = format!(
+            "SELECT toInt64(toUnixTimestamp64Milli(min(timestamp))) AS since, \
+                    toInt64(toUnixTimestamp64Milli(max(timestamp))) AS head, count() AS n \
+             FROM {}",
+            self.logs_table
+        );
+        match self.client.query(&query).fetch_one::<IngestCoverageRow>().await {
+            Ok(row) if row.n > 0 => {
+                probe.ingest_since = DateTime::from_timestamp_millis(row.since);
+                probe.ingest_head = DateTime::from_timestamp_millis(row.head);
+            }
+            Ok(_) => {}
+            Err(error) => debug!(%error, "prevalence coverage: ingest probe failed"),
+        }
+
+        // The refreshable views behind `*_prevalence_final` (CH 160): the rare /
+        // new lists and the prevalence dictionaries (CH 162) read that snapshot.
+        let query = "SELECT ifNull(toInt64(toUnixTimestamp(min(last_success_time))), 0) AS t, count() AS n \
+                     FROM system.view_refreshes \
+                     WHERE view IN ('hash_prevalence_final_refresh', 'domain_prevalence_final_refresh', \
+                                    'ip_prevalence_final_refresh')";
+        match self.client.query(query).fetch_one::<RefreshCoverageRow>().await {
+            Ok(row) if row.n > 0 && row.t > 0 => {
+                probe.refreshed_at = DateTime::from_timestamp(row.t, 0);
+            }
+            Ok(_) => {}
+            Err(error) => debug!(%error, "prevalence coverage: refresh probe failed"),
+        }
+
+        probe
+    }
+
+    /// Source-restricted coverage (NAN-4902 lane E): whether the viewer's
+    /// source-attributed rows of `kind` reach back to `before`. Uses the same
+    /// attributed table and source predicate as that viewer's reads; those
+    /// tables were never backfilled (ClickHouse 170), so on an upgraded
+    /// install this is `Some(false)` until attribution has run for the whole
+    /// window. Bounded: partitions after `before` are pruned and the read
+    /// stops at the first matching row. `None` for an unrestricted scope or a
+    /// failed probe (callers treat that as not covered).
+    pub async fn scoped_coverage_before(
+        &self,
+        kind: super::coverage::ArtifactKind,
+        scope: &ArtifactScope,
+        before: DateTime<Utc>,
+    ) -> Option<bool> {
+        use super::coverage::ArtifactKind;
+        let source_filter = Self::attributed_source_filter(scope)?;
+        let table = match kind {
+            ArtifactKind::Hash => &self.hash_prevalence_source_agg,
+            ArtifactKind::Domain => &self.domain_prevalence_source_agg,
+            ArtifactKind::Ip => &self.ip_prevalence_source_agg,
+        };
+        let before = crate::sql_hygiene::format_ch_bound(&before).to_string();
+        let query = format!(
+            "SELECT count() AS n FROM (SELECT 1 FROM {table} \
+             WHERE time_bucket <= toDateTime('{before}', 'UTC') AND {source_filter} LIMIT 1)"
+        );
+        match self.client.query(&query).fetch_one::<u64>().await {
+            Ok(n) => Some(n > 0),
+            Err(error) => {
+                debug!(%error, ?kind, "prevalence coverage: scoped probe failed");
+                None
+            }
         }
     }
 
@@ -1515,8 +1655,7 @@ impl PrevalenceRepository {
         PrevalenceData {
             artifact: row.file_hash,
             artifact_type,
-            host_count: row.host_count,
-            host_count_saturated: false,
+            host_count: Some(row.host_count),
             total_occurrences: row.total_count,
             first_seen: Self::micros_to_datetime(row.first_seen),
             last_seen: Self::micros_to_datetime(row.last_seen),
@@ -1543,8 +1682,7 @@ impl PrevalenceRepository {
         PrevalenceData {
             artifact: row.domain,
             artifact_type,
-            host_count: row.source_host_count,
-            host_count_saturated: false,
+            host_count: Some(row.source_host_count),
             total_occurrences: row.total_count,
             first_seen: Self::micros_to_datetime(row.first_seen),
             last_seen: Self::micros_to_datetime(row.last_seen),
@@ -1571,8 +1709,7 @@ impl PrevalenceRepository {
         PrevalenceData {
             artifact: row.ip,
             artifact_type,
-            host_count: row.source_host_count,
-            host_count_saturated: false,
+            host_count: Some(row.source_host_count),
             total_occurrences: row.total_count,
             first_seen: Self::micros_to_datetime(row.first_seen),
             last_seen: Self::micros_to_datetime(row.last_seen),
@@ -1749,7 +1886,6 @@ impl PrevalenceRepository {
             network: Vec::new(),
             geo: Vec::new(),
             threat_intel: Vec::new(),
-            coverage: None,
         }
     }
 
@@ -1878,10 +2014,7 @@ impl PrevalenceRepository {
                     "SELECT {u} AS user, count() AS cnt \
                      FROM {} WHERE {} AND {} AND {u} != '' \
                      GROUP BY {u} ORDER BY cnt DESC LIMIT 10",
-                    logs_table,
-                    time_filter,
-                    where_clause,
-                    u = user
+                    logs_table, time_filter, where_clause, u = user
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1937,11 +2070,7 @@ impl PrevalenceRepository {
                     "SELECT {pn} AS process_name, {cl} AS command_line, count() AS cnt \
                      FROM {} WHERE {} AND {} AND {pn} != '' \
                      GROUP BY {pn}, {cl} ORDER BY cnt DESC LIMIT 5",
-                    logs_table,
-                    time_filter,
-                    where_clause,
-                    pn = process_name,
-                    cl = command_line
+                    logs_table, time_filter, where_clause, pn = process_name, cl = command_line
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1978,10 +2107,7 @@ impl PrevalenceRepository {
                     "SELECT {fn_} AS file_name, count() AS cnt \
                      FROM {} WHERE {} AND {} AND {fn_} != '' \
                      GROUP BY {fn_} ORDER BY cnt DESC LIMIT 5",
-                    logs_table,
-                    time_filter,
-                    where_clause,
-                    fn_ = file_name
+                    logs_table, time_filter, where_clause, fn_ = file_name
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -2016,11 +2142,7 @@ impl PrevalenceRepository {
                     "SELECT {dp} AS dest_port, {proto} AS protocol, count() AS cnt \
                      FROM {} WHERE {} AND {} AND {dp} > 0 \
                      GROUP BY {dp}, {proto} ORDER BY cnt DESC LIMIT 10",
-                    logs_table,
-                    time_filter,
-                    where_clause,
-                    dp = dest_port,
-                    proto = protocol
+                    logs_table, time_filter, where_clause, dp = dest_port, proto = protocol
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -2059,11 +2181,7 @@ impl PrevalenceRepository {
                     "SELECT {cc} AS country, {asn} AS asn, count() AS cnt \
                      FROM {} WHERE {} AND {} AND {cc} != '' \
                      GROUP BY country, asn ORDER BY cnt DESC LIMIT 5",
-                    logs_table,
-                    time_filter,
-                    where_clause,
-                    cc = country_col,
-                    asn = asn_col
+                    logs_table, time_filter, where_clause, cc = country_col, asn = asn_col
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -2090,7 +2208,6 @@ impl PrevalenceRepository {
             // Populated at the service layer where the EnrichmentService
             // handle is available — the repository only knows about CH.
             threat_intel: Vec::new(),
-            coverage: None,
         })
     }
 
@@ -2420,22 +2537,12 @@ impl PrevalenceRepository {
 }
 
 #[cfg(test)]
+#[path = "repository_internal_domains_tests.rs"]
+mod internal_domains_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    /// NAN-3226 dedicated parity: no tenant suffixes keeps the SQL unchanged;
-    /// tenant suffixes become a label-boundary `endsWith` exclusion.
-    #[test]
-    fn internal_domain_predicate_is_label_bounded_and_empty_by_default() {
-        use crate::internal_domains::InternalDomains;
-        assert_eq!(internal_domain_predicate(&InternalDomains::builtin()), "");
-        let predicate =
-            internal_domain_predicate(&InternalDomains::with_tenant(["prod", "corp.example.com"]));
-        assert_eq!(
-            predicate,
-            " AND NOT arrayExists(s -> endsWith(concat('.', domain), concat('.', s)), ['corp.example.com', 'prod'])"
-        );
-    }
 
     /// NAN-1729 (P2-B): the recency predicate must compare the RAW DateTime64
     /// column so the idx_last_seen / idx_first_seen minmax indexes (migration

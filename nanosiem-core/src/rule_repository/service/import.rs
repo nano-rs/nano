@@ -337,15 +337,16 @@ impl RuleRepositoryService {
             Option<i32>,
         );
 
-        let row: Option<ExistingImportTargetRow> = sqlx::query_as(
-            "SELECT id, dataset, risk_score, severity, schedule_cron, lookback_minutes \
+        let row: Option<ExistingImportTargetRow> =
+            sqlx::query_as(
+                "SELECT id, dataset, risk_score, severity, schedule_cron, lookback_minutes \
                  FROM detection_rules WHERE name = $1 AND source_repository_id = $2 LIMIT 1",
-        )
-        .bind(name)
-        .bind(repo_id)
-        .fetch_optional(&self.pg_pool)
-        .await
-        .map_err(RuleRepositoryError::Database)?;
+            )
+            .bind(name)
+            .bind(repo_id)
+            .fetch_optional(&self.pg_pool)
+            .await
+            .map_err(RuleRepositoryError::Database)?;
 
         Ok(row.map(
             |(id, dataset, risk_score, severity, schedule_cron, lookback_minutes)| {
@@ -611,9 +612,7 @@ impl RuleRepositoryService {
             // caller who only holds create.
             grants
                 .ensure(TargetEffect::DetectionEdit)
-                .map_err(|effect| {
-                    RuleRepositoryError::Forbidden(effect.permission().to_string())
-                })?;
+                .map_err(|effect| RuleRepositoryError::Forbidden(effect.permission().to_string()))?;
 
             // ...and the update branch rewrites severity / schedule_cron /
             // lookback_minutes on a possibly-live rule, which the canonical
@@ -622,11 +621,9 @@ impl RuleRepositoryService {
             // Same predicate `plan_import` preflighted, re-evaluated against the
             // row we actually found.
             if lifecycle.requires_promote_for_update(&existing) {
-                grants
-                    .ensure(TargetEffect::DetectionPromote)
-                    .map_err(|effect| {
-                        RuleRepositoryError::Forbidden(effect.permission().to_string())
-                    })?;
+                grants.ensure(TargetEffect::DetectionPromote).map_err(|effect| {
+                    RuleRepositoryError::Forbidden(effect.permission().to_string())
+                })?;
             }
 
             info!(
@@ -708,9 +705,7 @@ impl RuleRepositoryService {
         if lifecycle.requires_promote_for_create() {
             grants
                 .ensure(TargetEffect::DetectionPromote)
-                .map_err(|effect| {
-                    RuleRepositoryError::Forbidden(effect.permission().to_string())
-                })?;
+                .map_err(|effect| RuleRepositoryError::Forbidden(effect.permission().to_string()))?;
         }
 
         // Create the detection rule
@@ -866,17 +861,7 @@ impl RuleRepositoryService {
                 // visible in the catalog rather than silently dropped.
                 Err(e) => {
                     warn!(repo_id = %repo.id, path = %path, error = %e, "Failed to parse nPL rule in air-gap bundle");
-                    (
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some("failed"),
-                    )
+                    (None, None, None, None, None, None, None, None, Some("failed"))
                 }
             };
 
@@ -946,7 +931,7 @@ impl RuleRepositoryService {
             name: AIRGAP_RULE_REPOSITORY_NAME.to_string(),
             slug: Some(AIRGAP_RULE_REPOSITORY_SLUG.to_string()),
             description: Some(
-                "Rules imported from offline air-gapped bundles.".to_string(),
+                "Rules imported from offline air-gapped bundles (NAN-1220).".to_string(),
             ),
             // Sentinel, never-fetched URL — air-gap bundles are uploaded, not synced.
             url: "airgap://rules".to_string(),
@@ -960,13 +945,12 @@ impl RuleRepositoryService {
         match self.repo_repository.create(&new_repo, user_id).await {
             Ok(repo) => Ok(repo),
             // Lost a create race with a concurrent bundle upload — re-fetch.
-            Err(
-                crate::rule_repository::repository::RuleRepositoryRepositoryError::AlreadyExists(_),
-            ) => self
-                .repo_repository
-                .find_by_slug(AIRGAP_RULE_REPOSITORY_SLUG)
-                .await
-                .map_err(|e| RuleRepositoryError::Internal(e.to_string())),
+            Err(crate::rule_repository::repository::RuleRepositoryRepositoryError::AlreadyExists(_)) => {
+                self.repo_repository
+                    .find_by_slug(AIRGAP_RULE_REPOSITORY_SLUG)
+                    .await
+                    .map_err(|e| RuleRepositoryError::Internal(e.to_string()))
+            }
             Err(e) => Err(RuleRepositoryError::Internal(e.to_string())),
         }
     }

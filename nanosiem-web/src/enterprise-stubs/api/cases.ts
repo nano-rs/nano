@@ -3,8 +3,6 @@
 // Open-edition stub for CasesApi. Cases (investigation management) is enterprise-only.
 
 import type {
-  InboxCountsResponse,
-  InboxIncidentsResponse,
   Case,
   CaseListResponse,
   CaseSummary,
@@ -36,6 +34,8 @@ import type {
   CaseHandoff,
   BounceHandoffRequest,
   PresenceHeartbeatResponse,
+  InboxCountsResponse,
+  InboxIncidentsResponse,
 } from '@/lib/api/types';
 
 const ENTERPRISE_ONLY = (): Promise<never> =>
@@ -51,13 +51,14 @@ export class CasesApi {
   listCases(_params?: CaseFilter): Promise<CaseListResponse> {
     return ENTERPRISE_ONLY();
   }
+  getMyCases(_limit?: number): Promise<CaseSummary[]> {
+    return ENTERPRISE_ONLY();
+  }
+  // NAN-1093: Signal Inbox aggregation (shapes match src/enterprise/api/cases.ts).
   getInboxCounts(_params?: { queue_group?: string; groups?: string[] }): Promise<InboxCountsResponse> {
     return ENTERPRISE_ONLY();
   }
   getInboxIncidents(_params?: { queue_group?: string }): Promise<InboxIncidentsResponse> {
-    return ENTERPRISE_ONLY();
-  }
-  getMyCases(_limit?: number): Promise<CaseSummary[]> {
     return ENTERPRISE_ONLY();
   }
   getCaseStats(): Promise<CaseStats> {

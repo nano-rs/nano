@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
- * Ingestion → Credentials on dedicated / open-core deployments (NAN-3770):
- * named, revocable HEC / HTTP ingest tokens plus the install token
- * (`VECTOR_AUTH_TOKEN`, "Install token (legacy)").
+ * Ingestion → Ingest tokens (NAN-4907, ported from main's NAN-3770 / NAN-3806
+ * panel): named, revocable per-source HEC / HTTP / OTLP ingest tokens plus the
+ * install token (`VECTOR_AUTH_TOKEN`, "Install token (legacy)").
  *
- * NAN-3806: a token decides the source, 100% token based. Every token is bound
- * to one log source when it is issued, and every event sent with it lands in
- * that source whatever sourcetype it declares. A token with no source (one the
- * upgrade could not bind unambiguously, the install token, or one whose source
- * was deleted) is refused until an admin binds it here. A binding never
- * changes: revoke and issue a new token instead.
+ * A token decides the source. Every token is bound to one log source when it
+ * is issued, and every event sent with it lands in that source whatever
+ * sourcetype it declares. A token whose source was deleted is refused until an
+ * admin binds it here. A binding never changes: rotate keeps it, revoke and
+ * issue a new token to move a sender.
+ *
+ * The install token on an upgraded deployment starts in the deprecated legacy
+ * multiplex mode (routed by the sender's X-Source-Type, as before). The panel
+ * flags it and offers "Bind to a source" or "Stop multiplexing".
  *
  * A token value is shown once, in the issue dialog, and is never readable
  * again (the server keeps only its SHA-256). Rows carry the prefix only.
@@ -20,8 +23,9 @@
 
 import { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, Check, Copy, KeyRound, Link2, Plus, ShieldOff } from 'lucide-react';
+import { AlertTriangle, Check, Copy, KeyRound, Link2, Plus, RotateCcw, ShieldOff } from 'lucide-react';
 
+import { Snippet } from '@/components/add-data/CopySnippet';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
@@ -54,7 +58,7 @@ function StateBadge({ state }: { state: string }) {
   const tone =
     state === 'active' || state === 'enabled'
       ? 'text-emerald-500 border-emerald-500/40'
-      : state === 'disabled' || state === 'unbound'
+      : state === 'disabled' || state === 'unbound' || state === 'legacy multiplex'
         ? 'text-amber-500 border-amber-500/40'
         : 'text-muted-foreground border-border';
   return <span className={cn('inline-flex items-center h-4 px-1.5 rounded-sm border font-mono text-[10px]', tone)}>{state}</span>;
@@ -98,6 +102,9 @@ function SourcePicker({
             <span className="font-mono text-[11px]">{source.route_key}</span>
             <span className="ml-2 text-muted-foreground">{source.name}</span>
             {!source.enabled && <span className="ml-2 font-mono text-[10px] text-amber-500">disabled</span>}
+            {source.deployed === false && (
+              <span className="ml-2 font-mono text-[10px] text-muted-foreground">no parser yet</span>
+            )}
           </SelectItem>
         ))}
       </SelectContent>
@@ -193,8 +200,10 @@ function IssueTokenDialog({
                 </Button>
               </div>
               <div className="text-[11px] text-muted-foreground">
-                Send it as <span className="font-mono">Authorization: Splunk &lt;token&gt;</span> (HEC, :8088) or{' '}
-                <span className="font-mono">Authorization: Bearer &lt;token&gt;</span> (HTTP, :8080).
+                Send it as <span className="font-mono">Authorization: Splunk &lt;token&gt;</span> (HEC, :8088),{' '}
+                <span className="font-mono">Authorization: Bearer &lt;token&gt;</span> (HTTP, :8080), or the same
+                Bearer header to <span className="font-mono">/otlp</span>. Until the source has a parser, events land
+                unparsed and are searchable as <span className="font-mono">source_type={issued.credential.route_key}</span>.
               </div>
             </>
           ) : (
@@ -260,6 +269,71 @@ function IssueTokenDialog({
   );
 }
 
+/** Shows a rotated token's new value once. */
+function RotatedTokenDialog({ issued, onClose }: { issued: IssuedIngestToken | null; onClose: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const close = () => {
+    setCopied(false);
+    onClose();
+  };
+  return (
+    <Dialog open={issued !== null} onOpenChange={(open) => !open && close()}>
+      <DialogContent className="max-w-md gap-0 p-0" data-testid="rotated-ingest-token-dialog">
+        <DialogHeader className="border-b border-border px-5 py-4">
+          <DialogTitle className="flex items-center gap-2">
+            <RotateCcw className="w-4 h-4 text-muted-foreground" strokeWidth={1.5} /> Token rotated
+          </DialogTitle>
+          <DialogDescription>
+            Copy the new token now. It is shown once. The old value
+            {issued?.replaced ? (
+              <>
+                {' '}(<span className="font-mono">{issued.replaced.token_prefix}…</span>)
+              </>
+            ) : null}{' '}
+            is refused within a few seconds.
+          </DialogDescription>
+        </DialogHeader>
+        {issued && (
+          <div className="px-5 py-4 space-y-2">
+            <div className="text-[11px] text-muted-foreground">
+              <span className="font-mono text-foreground">{issued.credential.name}</span>
+              <span className="mx-1.5">→</span>
+              <span className="font-mono text-foreground">{issued.credential.route_key}</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <code
+                className="flex-1 min-w-0 break-all rounded-sm border border-border bg-muted/40 px-2 py-1.5 font-mono text-[11px] select-all"
+                data-testid="rotated-ingest-token"
+              >
+                {issued.token}
+              </code>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 gap-1 text-[11.5px]"
+                onClick={() => {
+                  void navigator.clipboard
+                    .writeText(issued.token)
+                    .then(() => setCopied(true))
+                    .catch(() => setCopied(false));
+                }}
+              >
+                {copied ? <Check className="w-3 h-3" strokeWidth={1.5} /> : <Copy className="w-3 h-3" strokeWidth={1.5} />}
+                {copied ? 'Copied' : 'Copy'}
+              </Button>
+            </div>
+          </div>
+        )}
+        <DialogFooter className="border-t border-border px-5 py-3">
+          <Button size="sm" className="h-8 text-[11.5px]" onClick={close}>
+            Done
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 /** What is being bound: a named token, or the install token. */
 type BindTarget = { kind: 'token'; token: IngestToken } | { kind: 'install' };
 
@@ -305,8 +379,19 @@ function BindDialog({
             <Link2 className="w-4 h-4 text-muted-foreground" strokeWidth={1.5} /> Bind this token to a source
           </DialogTitle>
           <DialogDescription>
-            <span className="font-mono text-foreground">{label}</span> is refused until it is bound. Pick the source its
-            sender feeds: every event it sends lands there, whatever sourcetype it declares. The binding never changes.
+            {target?.kind === 'install' ? (
+              <>
+                Pick the source every <span className="font-mono text-foreground">{label}</span> sender feeds: every
+                event it sends lands there, whatever sourcetype it declares. This ends legacy multiplex mode; senders
+                that send several log types need one named token per type first. The binding never changes.
+              </>
+            ) : (
+              <>
+                <span className="font-mono text-foreground">{label}</span> is refused until it is bound. Pick the source
+                its sender feeds: every event it sends lands there, whatever sourcetype it declares. The binding never
+                changes.
+              </>
+            )}
           </DialogDescription>
         </DialogHeader>
         <div className="px-5 py-4 space-y-2">
@@ -332,35 +417,6 @@ function BindDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
-  );
-}
-
-function Snippet({ title, body, testId }: { title: string; body: string; testId: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <div className="border border-border">
-      <div className="flex items-center h-7 px-2 border-b border-border">
-        <span className="font-mono text-[10.5px] uppercase tracking-wide text-muted-foreground">{title}</span>
-        <span className="flex-1" />
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-6 px-2 gap-1 text-[11px]"
-          onClick={() => {
-            void navigator.clipboard
-              .writeText(body)
-              .then(() => setCopied(true))
-              .catch(() => setCopied(false));
-          }}
-        >
-          {copied ? <Check className="w-3 h-3" strokeWidth={1.5} /> : <Copy className="w-3 h-3" strokeWidth={1.5} />}
-          {copied ? 'Copied' : 'Copy'}
-        </Button>
-      </div>
-      <pre className="overflow-x-auto px-2 py-1.5 font-mono text-[11px] leading-[1.5] text-foreground" data-testid={testId}>
-        {body}
-      </pre>
-    </div>
   );
 }
 
@@ -442,7 +498,10 @@ export function IngestTokensPanel() {
   const [issue, setIssue] = useState<{ sourceId?: string } | null>(null);
   const [bindTarget, setBindTarget] = useState<BindTarget | null>(null);
   const [revokeTarget, setRevokeTarget] = useState<IngestToken | null>(null);
+  const [rotateTarget, setRotateTarget] = useState<IngestToken | null>(null);
+  const [rotated, setRotated] = useState<IssuedIngestToken | null>(null);
   const [installConfirm, setInstallConfirm] = useState<boolean | null>(null);
+  const [strictConfirm, setStrictConfirm] = useState(false);
 
   const list = useQuery({
     queryKey: INGEST_TOKENS_QUERY_KEY,
@@ -457,6 +516,25 @@ export function IngestTokensPanel() {
       toast({ title: 'Ingest token revoked', description: `${token.name} is refused within a few seconds.` });
     },
     onError: (error) => toast({ title: 'Revoke failed', description: errorText(error), variant: 'destructive' }),
+    onSettled: () => void queryClient.invalidateQueries({ queryKey: INGEST_TOKENS_QUERY_KEY }),
+  });
+
+  const rotate = useMutation({
+    mutationFn: (id: string) => {
+      // Drop any earlier one-time value before a new rotation starts.
+      setRotated(null);
+      return api.ingestTokens.rotate(id);
+    },
+    onSuccess: (result) => setRotated(result),
+    onError: (error) => toast({ title: 'Rotate failed', description: errorText(error), variant: 'destructive' }),
+    onSettled: () => void queryClient.invalidateQueries({ queryKey: INGEST_TOKENS_QUERY_KEY }),
+  });
+
+  const strict = useMutation({
+    mutationFn: () => api.ingestTokens.setInstallTokenStrict(),
+    onSuccess: () =>
+      toast({ title: 'Legacy multiplex mode ended', description: 'The install token is refused until it is bound.' }),
+    onError: (error) => toast({ title: 'Update failed', description: errorText(error), variant: 'destructive' }),
     onSettled: () => void queryClient.invalidateQueries({ queryKey: INGEST_TOKENS_QUERY_KEY }),
   });
 
@@ -486,6 +564,8 @@ export function IngestTokensPanel() {
   const count = (state: string) => tokens.filter((t) => t.state === state).length;
   const unbound = count('unbound');
   const installUnbound = installToken.state === 'unbound';
+  const installLegacy = installToken.state === 'legacy_multiplex';
+  const undelivered = list.data.delivery === 'none';
 
   return (
     <div className="space-y-3" data-testid="ingest-tokens-panel">
@@ -494,12 +574,64 @@ export function IngestTokensPanel() {
           {count('active')} active · {unbound} unbound · {count('revoked')} revoked · install token {installToken.state.replace('_', ' ')}
         </span>
         <span className="flex-1" />
-        {canManage && (
+        {canManage && !undelivered && (
           <Button size="sm" className="h-7 gap-1.5 text-[11.5px]" onClick={() => setIssue({})}>
             <Plus className="w-3 h-3" strokeWidth={1.5} /> New token
           </Button>
         )}
       </div>
+
+      {undelivered && (
+        <div
+          className="flex items-start gap-2 border border-amber-500/40 px-2.5 py-2 text-[11.5px] text-amber-500"
+          role="alert"
+          data-testid="token-delivery-alert"
+        >
+          <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" strokeWidth={1.5} />
+          <span>
+            Token delivery to Vector is not configured for this deployment (
+            <span className="font-mono">NANO_INGEST_TOKENS_DELIVERY</span>), so named tokens cannot be issued: Vector
+            would never see them.
+          </span>
+        </div>
+      )}
+
+      {installLegacy && (
+        <div
+          className="flex items-start gap-2 border border-amber-500/40 px-2.5 py-2 text-[11.5px] text-amber-500"
+          role="alert"
+          data-testid="legacy-multiplex-alert"
+        >
+          <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" strokeWidth={1.5} />
+          <span className="flex-1">
+            Deprecated: the install token (<span className="font-mono">VECTOR_AUTH_TOKEN</span>) is in legacy multiplex
+            mode. Its senders choose their own source with <span className="font-mono">X-Source-Type</span> /{' '}
+            <span className="font-mono">sourcetype</span>, and revoking it cuts off all of them at once. Issue one named
+            token per sender and source, then bind the install token to a source or stop multiplexing.
+          </span>
+          {canManage && (
+            <span className="flex shrink-0 gap-1">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-6 px-2 text-[11px]"
+                onClick={() => setBindTarget({ kind: 'install' })}
+              >
+                Bind to a source
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-6 px-2 text-[11px]"
+                disabled={strict.isPending}
+                onClick={() => setStrictConfirm(true)}
+              >
+                Stop multiplexing
+              </Button>
+            </span>
+          )}
+        </div>
+      )}
 
       {(unbound > 0 || installUnbound) && (
         <div
@@ -526,14 +658,18 @@ export function IngestTokensPanel() {
             <th className="px-2 font-medium text-right">Requests</th>
             <th className="px-2 font-medium">Last used (UTC)</th>
             <th className="px-2 font-medium">Created (UTC)</th>
-            <th className="px-2 w-28" />
+            <th className="px-2 w-36" />
           </tr>
         </thead>
         <tbody>
           <tr className="h-7 border-b border-border" data-testid="install-token-row">
             <td className="px-2 text-foreground">{installToken.name}</td>
             <td className="px-2">
-              <SourceCell name={installToken.source_name} routeKey={installToken.route_key} />
+              {installLegacy ? (
+                <span className="font-mono text-[10.5px] text-amber-500">X-Source-Type (multiplex)</span>
+              ) : (
+                <SourceCell name={installToken.source_name} routeKey={installToken.route_key} />
+              )}
             </td>
             <td className="px-2 font-mono text-[10.5px] text-muted-foreground">VECTOR_AUTH_TOKEN</td>
             <td className="px-2">
@@ -543,7 +679,7 @@ export function IngestTokensPanel() {
             <td className="px-2 font-mono text-[10.5px] text-muted-foreground">—</td>
             <td className="px-2 font-mono text-[10.5px] text-muted-foreground">install</td>
             <td className="px-2 text-right whitespace-nowrap">
-              {canManage && installUnbound && (
+              {canManage && (installUnbound || installLegacy) && (
                 <Button
                   variant="ghost"
                   size="sm"
@@ -598,6 +734,17 @@ export function IngestTokensPanel() {
                     Bind
                   </Button>
                 )}
+                {canManage && token.state === 'active' && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-2 text-[11px]"
+                    disabled={rotate.isPending}
+                    onClick={() => setRotateTarget(token)}
+                  >
+                    Rotate
+                  </Button>
+                )}
                 {canManage && token.revocable && token.state !== 'revoked' && (
                   <Button
                     variant="ghost"
@@ -617,7 +764,7 @@ export function IngestTokensPanel() {
       {tokens.length === 0 && (
         <div className="text-[11.5px] text-muted-foreground">
           No named tokens yet. Issue one per sender and source: its events land in that source, you can tell senders
-          apart in search (<span className="font-mono">metadata.nano_credential_id</span>), and you can revoke one
+          apart in search (<span className="font-mono">ext.nano_credential_id</span>), and you can revoke one
           without touching the others.
         </div>
       )}
@@ -625,7 +772,7 @@ export function IngestTokensPanel() {
       <SendDataSection
         sources={sources}
         tokens={tokens}
-        canManage={canManage}
+        canManage={canManage && !undelivered}
         onIssue={(sourceId) => setIssue({ sourceId })}
       />
 
@@ -642,6 +789,64 @@ export function IngestTokensPanel() {
       )}
 
       {canManage && <BindDialog target={bindTarget} onClose={() => setBindTarget(null)} sources={sources} />}
+
+      <RotatedTokenDialog
+        issued={rotated}
+        onClose={() => {
+          // The one-time value lives in the mutation state too: discard both.
+          setRotated(null);
+          rotate.reset();
+        }}
+      />
+
+      <ConfirmDialog
+        open={rotateTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setRotateTarget(null);
+        }}
+        title="Rotate ingest token"
+        icon={<RotateCcw className="w-4 h-4 text-amber-500" strokeWidth={1.5} />}
+        description={
+          rotateTarget ? (
+            <>
+              A new value is issued for <span className="font-mono text-foreground">{rotateTarget.name}</span> (same
+              source, <span className="font-mono">{rotateTarget.route_key}</span>). The current value (
+              <span className="font-mono">{rotateTarget.token_prefix}…</span>) is refused within a few seconds, so
+              update the sender right after.
+            </>
+          ) : undefined
+        }
+        confirmLabel="Rotate"
+        variant="warning"
+        onConfirm={() => {
+          if (rotateTarget) {
+            rotate.reset();
+            rotate.mutate(rotateTarget.credential_id);
+          }
+          setRotateTarget(null);
+        }}
+      />
+
+      <ConfirmDialog
+        open={strictConfirm}
+        onOpenChange={setStrictConfirm}
+        title="Stop multiplexing the install token"
+        icon={<AlertTriangle className="w-4 h-4 text-amber-500" strokeWidth={1.5} />}
+        description={
+          <>
+            Senders using <span className="font-mono text-foreground">VECTOR_AUTH_TOKEN</span> are refused on the HEC,
+            HTTP and OTLP endpoints within a few seconds, until it is bound to a source. Built-in collector integrations
+            use their own platform credential and keep delivering. Move every sender to a named token first. This
+            cannot be undone.
+          </>
+        }
+        confirmLabel="Stop multiplexing"
+        variant="warning"
+        onConfirm={() => {
+          strict.mutate();
+          setStrictConfirm(false);
+        }}
+      />
 
       <ConfirmDialog
         open={revokeTarget !== null}
@@ -676,7 +881,12 @@ export function IngestTokensPanel() {
         icon={<AlertTriangle className="w-4 h-4 text-amber-500" strokeWidth={1.5} />}
         description={
           installConfirm ? (
-            installToken.route_key ? (
+            installToken.mode === 'legacy_multiplex' ? (
+              <>
+                Senders using <span className="font-mono text-foreground">VECTOR_AUTH_TOKEN</span> are accepted again,
+                routed by the source type they declare (legacy multiplex, deprecated).
+              </>
+            ) : installToken.route_key ? (
               <>
                 Senders using <span className="font-mono text-foreground">VECTOR_AUTH_TOKEN</span> are accepted again;
                 their events land in <span className="font-mono text-foreground">{installToken.route_key}</span>.

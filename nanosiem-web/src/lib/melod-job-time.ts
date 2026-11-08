@@ -1,20 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+// Wall-clock limits for polled AI jobs, shared by the enterprise poller and
+// the open-edition stub so core pages (Add data, parser editor) compile in
+// both editions (NAN-4778, ported for NAN-4912 P3).
+
 import { useEffect, useState } from 'react';
 
-/** Eleven minutes for other wizards, above their ten-minute server ceiling. */
-export const DEFAULT_JOB_MAX_WAIT_MS = 11 * 60_000;
-/** Parser create/edit run for 40 minutes; the browser allows five more. */
-export const PARSER_JOB_SERVER_TIMEOUT_MS = 40 * 60_000;
+/** Other wizards: a minute above their five-minute server ceiling. */
+export const DEFAULT_JOB_MAX_WAIT_MS = 6 * 60_000;
+/** Parser create/edit jobs run up to 25 minutes on the server (NAN-4778). */
+export const PARSER_JOB_SERVER_TIMEOUT_MS = 25 * 60_000;
+/** The browser waits five minutes past the server ceiling. */
 export const PARSER_JOB_MAX_WAIT_MS = PARSER_JOB_SERVER_TIMEOUT_MS + 5 * 60_000;
 
 export interface StartMelodJobOptions {
+  /** Absolute wall-clock limit for the whole job, polling included. */
   maxWaitMs?: number;
 }
 
 export interface PollMelodJobOptions extends StartMelodJobOptions {
   signal?: AbortSignal;
   onProgress?: (message: string | undefined, elapsedMs: number) => void;
+  /** Called once the server has accepted the job. */
+  onJobId?: (jobId: string) => void;
 }
 
 export function jobTimeoutMessage(maxWaitMs: number): string {

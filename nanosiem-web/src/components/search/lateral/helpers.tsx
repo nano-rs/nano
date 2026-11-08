@@ -3,6 +3,7 @@
 import type { ReactNode } from 'react';
 import type { LateralBand, LateralMethodGroup, LateralNodeType } from './types';
 import { nplQuotedBody } from '@/lib/npl-quote';
+import type { SchemaFieldMap, SemanticField } from '@/lib/schema-fields';
 
 // Band colors lifted verbatim from `design-ref/shadcn/lateral-graph.jsx`.
 export const LATERAL_BAND_COLOR: Record<LateralBand, string> = {
@@ -139,21 +140,40 @@ export function stripLateralCommand(query: string): string {
   return query.replace(/\s*\|\s*lateral\b[^|]*/i, '').trim();
 }
 
+/** Concept a lateral node kind pivots on (NAN-4903: resolved per profile). */
+export function lateralNodeKey(
+  kind: 'host' | 'user' | 'ip' | 'process',
+  hostKey: SemanticField = 'srcHost',
+): SemanticField {
+  if (kind === 'user') return 'user';
+  if (kind === 'ip') return 'srcIp';
+  if (kind === 'process') return 'processName';
+  return hostKey;
+}
+
+/** `col=value` over every column of `key` in the active profile; a
+ *  class-dependent concept becomes an OR group. Bare tokens stay unquoted, so
+ *  UDM output is unchanged (`src_host=WIN-HR11`). */
+export function lateralFilter(map: SchemaFieldMap, key: SemanticField, value: string): string {
+  const cols = map.candidates(key);
+  const v = quoteValue(value);
+  if (cols.length === 1) return `${cols[0]}=${v}`;
+  return `(${cols.map((c) => `${c}=${v}`).join(' OR ')})`;
+}
+
 // Rewrite the `| lateral` arg to seed on a different entity. Drops any
 // existing seed=, entity=, methods=, maxhops=, window= so the rebuilt command
 // is clean. Mirrors cloud-dossier's `appendCloudArg` rewrite pattern.
 export function rewriteLateralSeed(
   _query: string,
-  field: string,
-  value: string
+  kind: 'host' | 'user' | 'ip',
+  value: string,
+  map: SchemaFieldMap,
 ): string {
-  const escaped = nplQuotedBody(value);
-  const filter = /^[A-Za-z0-9_.-]+$/.test(value) ? `${field}=${value}` : `${field}="${escaped}"`;
+  const filter = lateralFilter(map, lateralNodeKey(kind), value);
   // Prior base filters were often entity-filters that conflict with the new
   // seed, so we drop the whole prior search and let the new seed become the
   // entire query.
-  const seedMode = field === 'user' || field === 'actor.user.name' || field === 'user.name'
-    ? 'seed=user'
-    : 'seed=host';
+  const seedMode = kind === 'user' ? 'seed=user' : 'seed=host';
   return `${filter} | lateral ${seedMode}`;
 }

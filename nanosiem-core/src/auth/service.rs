@@ -11,26 +11,21 @@
 //! - Password reset request and completion
 
 use base64::Engine;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::password::{validate_password, verify_password, PasswordError};
 use super::repository::{
-    BackupCodeRotation, GroupRepository, GroupRepositoryError, SessionRepository,
-    SessionRepositoryError, UserRepository, UserRepositoryError,
+    GroupRepository, GroupRepositoryError, SessionRepository, SessionRepositoryError,
+    UserRepository, UserRepositoryError,
 };
 use super::token::{TokenError, TokenService};
+use crate::settings::local_auth::LocalAuthSettings;
 use super::types::{
     config_defaults, AuthResponse, LandingPage, LoginResult, QueryMode, TimeRangePreset, TokenPair,
     User, UserInfo,
 };
-use super::{ResolvedTenantMembership, TenantMembershipResolver, TenantResolutionError, TrustedTenantContext};
-use crate::settings::local_auth::LocalAuthSettings;
-
-// Hosted tenant-bound AuthService entry points (NAN-3861).
-#[cfg(feature = "enterprise")]
-mod enterprise_shared_auth;
 
 /// SECURITY: Dummy bcrypt hash used for timing attack mitigation
 /// This is a valid bcrypt hash that will always fail verification
@@ -38,6 +33,20 @@ mod enterprise_shared_auth;
 const DUMMY_BCRYPT_HASH: &str = "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4.VTtYA/pWrZ5Wiq";
 
 /// Authentication service errors
+/// NAN-2453: how long the immediately previous refresh token stays usable
+/// after a rotation (concurrent tabs presenting the same cookie).
+pub const REFRESH_GRACE_SECS: i64 = 20;
+
+/// Result of [`AuthService::refresh_token`].
+#[derive(Debug, Clone)]
+pub struct RefreshOutcome {
+    /// `refresh_token` is empty when `rotated` is false.
+    pub tokens: TokenPair,
+    /// `false` for a grace refresh: an access token for the same session, no
+    /// new refresh token, and the refresh cookie must be left untouched.
+    pub rotated: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("Invalid credentials")]
@@ -65,15 +74,6 @@ pub enum AuthError {
 
     #[error("Session not found or expired")]
     SessionNotFound,
-
-    #[error("An active tenant selection is required")]
-    TenantRequired,
-
-    #[error("Tenant access denied")]
-    TenantAccessDenied,
-
-    #[error("Tenant membership is temporarily unavailable")]
-    TenantUnavailable,
 
     #[error("Password does not meet requirements: {0}")]
     PasswordRequirementsNotMet(String),
@@ -183,9 +183,6 @@ pub struct MfaCompletion {
     pub response: AuthResponse,
     /// True when a backup code (not a TOTP code) satisfied the challenge.
     pub used_backup_code: bool,
-    /// Hosted shared only: the tenant the challenge was revalidated against,
-    /// so the caller can write the login audit in that tenant (NAN-3790).
-    pub tenant: Option<TrustedTenantContext>,
 }
 
 /// Authentication service
@@ -197,13 +194,10 @@ pub struct AuthService {
     group_repo: GroupRepository,
     token_service: TokenService,
     config: AuthConfig,
-    /// Legacy deployment-wide toggle for local password sign-in (NAN-2181).
-    /// Exact hosted shared deliberately ignores this singleton: the
-    /// per-tenant policy (`shared_tenant_auth_methods`, NAN-2361
-    /// wave 8) is consulted by slug instead.
+    /// Tenant toggle for local password sign-in (NAN-2181). Held here rather
+    /// than checked in the handler so every caller of `login()` passes the
+    /// same gate.
     local_auth_settings: LocalAuthSettings,
-    /// Present only for the exact hosted-shared profile.
-    tenant_resolver: Option<TenantMembershipResolver>,
 }
 
 impl AuthService {
@@ -223,54 +217,7 @@ impl AuthService {
             token_service,
             config,
             local_auth_settings,
-            tenant_resolver: None,
         }
-    }
-
-    fn map_tenant_error(error: TenantResolutionError) -> AuthError {
-        match error {
-            TenantResolutionError::AccessDenied => AuthError::TenantAccessDenied,
-            TenantResolutionError::Unavailable => AuthError::TenantUnavailable,
-        }
-    }
-
-    /// Enforce policy only after authoritative membership resolution. Legacy
-    /// deployments never enter this path and keep their existing admission.
-    async fn require_tenant_ip_policy(
-        &self,
-        tenant: &ResolvedTenantMembership,
-        ip_address: Option<&str>,
-    ) -> Result<(), AuthError> {
-        use crate::ip_allowlist::tenant::{
-            require_tenant_ip_allowed, TenantIpPolicyError, TenantIpPolicyScope,
-        };
-        require_tenant_ip_allowed(
-            self.user_repo.pool(),
-            &tenant.context,
-            ip_address.and_then(|ip| ip.parse().ok()),
-            TenantIpPolicyScope::Api,
-        )
-        .await
-        .map_err(|error| match error {
-            TenantIpPolicyError::Denied => AuthError::TenantAccessDenied,
-            TenantIpPolicyError::Unavailable => AuthError::TenantUnavailable,
-        })
-    }
-
-    async fn resolve_login_tenant(
-        &self,
-        user_id: uuid::Uuid,
-        tenant_slug: Option<&str>,
-    ) -> Result<Option<ResolvedTenantMembership>, AuthError> {
-        let Some(resolver) = &self.tenant_resolver else {
-            return Ok(None);
-        };
-        let slug = tenant_slug.ok_or(AuthError::TenantRequired)?;
-        resolver
-            .resolve_slug(user_id, slug)
-            .await
-            .map(Some)
-            .map_err(Self::map_tenant_error)
     }
 
     /// Authenticate user with email and password
@@ -284,7 +231,6 @@ impl AuthService {
         &self,
         email: &str,
         password: &str,
-        tenant_slug: Option<&str>,
         ip_address: Option<&str>,
         user_agent: Option<&str>,
     ) -> Result<LoginResult, AuthError> {
@@ -294,47 +240,17 @@ impl AuthService {
         // after the lookup would answer faster for unknown emails than for
         // known ones, turning an SSO-only tenant into an account oracle. Here
         // every request costs one settings read and returns the same error.
-        if self.tenant_resolver.is_none() {
-            if !self
-                .local_auth_settings
-                .is_local_password_enabled()
-                .await
-                .map_err(|e| AuthError::DatabaseError(e.to_string()))?
-            {
-                return Err(AuthError::LocalPasswordDisabled);
-            }
-        } else if let Some(slug) = tenant_slug
-            .and_then(|slug| crate::auth::CanonicalTenantOidcSlug::parse(slug).ok())
+        if !self
+            .local_auth_settings
+            .is_local_password_enabled()
+            .await
+            .map_err(|e| AuthError::DatabaseError(e.to_string()))?
         {
-            // NAN-2361 wave 8: the shared product keeps the toggle per tenant
-            // (`shared_tenant_auth_methods`, 9001020). The slug is
-            // only a selector: it is read through the control login before
-            // any user lookup, answers the same for every request against
-            // that tenant, and an unknown slug reads as "password allowed" so
-            // the flow fails on membership exactly as it does today. A slug
-            // that does not parse is left to `resolve_login_tenant`.
-            if !crate::auth::tenant_login_local_password_enabled(self.user_repo.pool(), &slug)
-                .await
-                .map_err(|e| AuthError::DatabaseError(e.to_string()))?
-            {
-                return Err(AuthError::LocalPasswordDisabled);
-            }
+            return Err(AuthError::LocalPasswordDisabled);
         }
 
-        // Try to find the user by email. Hosted shared identities are
-        // tenant-scoped (FRO-754): resolve the selected tenant's own identity
-        // first, the legacy global row only when that tenant has none.
-        #[cfg(feature = "enterprise")]
-        let lookup = if self.tenant_resolver.is_some() {
-            self.user_repo
-                .get_enterprise_shared_user_for_login(tenant_slug, email)
-                .await
-        } else {
-            self.user_repo.get_user_by_email(email).await
-        };
-        #[cfg(not(feature = "enterprise"))]
-        let lookup = self.user_repo.get_user_by_email(email).await;
-        let user = match lookup {
+        // Try to find the user by email
+        let user = match self.user_repo.get_user_by_email(email).await {
             Ok(user) => user,
             Err(UserRepositoryError::NotFoundByEmail(_)) => {
                 // SECURITY: Perform dummy password verification to prevent timing attacks
@@ -423,117 +339,42 @@ impl AuthService {
             return Err(AuthError::InvalidCredentials);
         }
 
-        // In shared mode, bcrypt success is only provisional. Wait behind any
-        // in-flight password reset/change, lock the current users row, require
-        // the byte-for-byte hash we actually verified, then obtain the durable
-        // authentication fence. This closes the old-hash MVCC race without
-        // holding a database connection during bcrypt.
-        let shared_authentication_fence = if self.tenant_resolver.is_some() {
-            Some(
-                self.user_repo
-                    .lock_current_password_authentication(user.id, password_hash)
-                    .await?
-                    .ok_or(AuthError::InvalidCredentials)?,
-            )
-        } else {
-            None
-        };
-
         // Successful login - reset failed attempts and update last login
         self.user_repo.reset_failed_attempts(user.id).await?;
-
-        // A tenant slug is only a selector. Resolve it after password
-        // verification (avoids a pre-auth membership oracle) and carry only
-        // the server-resolved UUID into signed credentials.
-        let tenant = self.resolve_login_tenant(user.id, tenant_slug).await?;
-        if let Some(tenant) = &tenant {
-            self.require_tenant_ip_policy(tenant, ip_address).await?;
-        }
 
         // === MFA Check ===
         // If user has MFA enabled, issue a challenge token instead of full auth
         if user.mfa_enabled {
-            let challenge_token = match &tenant {
-                #[cfg(feature = "enterprise")]
-                Some(tenant) => self
-                    .token_service
-                    .create_enterprise_shared_mfa_challenge_token(
-                        user.id,
-                        tenant.context.tenant_id,
-                        shared_authentication_fence.expect("shared authentication fence"),
-                    )?,
-                #[cfg(not(feature = "enterprise"))]
-                Some(_) => return Err(AuthError::TenantUnavailable),
-                None => self.token_service.create_mfa_challenge_token(user.id)?,
-            };
+            let challenge_token = self.token_service.create_mfa_challenge_token(user.id)?;
             return Ok(LoginResult::MfaRequired { challenge_token });
         }
 
-        // Exact hosted-shared always requires local MFA, regardless of
-        // the legacy deployment-wide setting or an optional tenant OIDC
-        // identity. Dedicated/open-core keep their existing configurable
-        // behavior.
-        let mfa_required = if tenant.is_some() {
-            true
-        } else if user.oidc_provider_id.is_none() {
-            self.user_repo
+        // If admin requires MFA globally and this non-OIDC user hasn't set up yet
+        if user.oidc_provider_id.is_none() {
+            let mfa_required = self
+                .user_repo
                 .is_mfa_required_globally()
                 .await
-                .unwrap_or(false)
-        } else {
-            false
-        };
-        if mfa_required {
-            if !user.mfa_setup_pending {
-                let _ = self.user_repo.set_mfa_setup_pending(user.id, true).await;
+                .unwrap_or(false);
+            if mfa_required && !user.mfa_enabled {
+                if !user.mfa_setup_pending {
+                    let _ = self.user_repo.set_mfa_setup_pending(user.id, true).await;
+                }
+                let challenge_token = self.token_service.create_mfa_challenge_token(user.id)?;
+                return Ok(LoginResult::MfaSetupRequired { challenge_token });
             }
-            let challenge_token = match &tenant {
-                #[cfg(feature = "enterprise")]
-                Some(tenant) => self
-                    .token_service
-                    .create_enterprise_shared_mfa_challenge_token(
-                        user.id,
-                        tenant.context.tenant_id,
-                        shared_authentication_fence.expect("shared authentication fence"),
-                    )?,
-                #[cfg(not(feature = "enterprise"))]
-                Some(_) => return Err(AuthError::TenantUnavailable),
-                None => self.token_service.create_mfa_challenge_token(user.id)?,
-            };
-            return Ok(LoginResult::MfaSetupRequired { challenge_token });
         }
 
-        let (roles, permissions) = match &tenant {
-            Some(tenant) => (tenant.roles.clone(), tenant.permissions.clone()),
-            None => (
-                self.group_repo.get_user_roles(user.id).await?,
-                self.group_repo.get_user_permissions(user.id).await?,
-            ),
-        };
+        // Get user's roles and permissions
+        let roles = self.group_repo.get_user_roles(user.id).await?;
+        let permissions = self.group_repo.get_user_permissions(user.id).await?;
 
         // Create tokens (Requirement 1.2)
         // Permissions are NOT embedded in the JWT — they are resolved server-side
         // by the auth middleware via PermissionResolver.
-        let shared_authenticated_at = tenant
-            .as_ref()
-            .map(|_| shared_authentication_fence.expect("shared authentication fence"));
-        let token_pair = match &tenant {
-            #[cfg(feature = "enterprise")]
-            Some(tenant) => self
-                .token_service
-                .create_enterprise_shared_token_pair_with_authentication(
-                    user.id,
-                    roles.clone(),
-                    tenant.context.tenant_id,
-                    shared_authenticated_at.expect("shared authentication time"),
-                    None,
-                )?,
-            #[cfg(not(feature = "enterprise"))]
-            Some(_) => return Err(AuthError::TenantUnavailable),
-            None => self
-                .token_service
-                .create_token_pair(user.id, roles.clone())?,
-        };
+        let token_pair = self
+            .token_service
+            .create_token_pair(user.id, roles.clone())?;
 
         // Create session with hashed refresh token
         let refresh_token_hash = hash_token(&token_pair.refresh_token);
@@ -558,33 +399,15 @@ impl AuthService {
             }
         }
 
-        match &tenant {
-            Some(tenant) => {
-                self.session_repo
-                    .create_tenant_session(
-                        user.id,
-                        tenant.context.tenant_id,
-                        shared_authenticated_at.expect("shared authentication time"),
-                        None,
-                        &refresh_token_hash,
-                        ip_address,
-                        user_agent,
-                        expires_at,
-                    )
-                    .await?;
-            }
-            None => {
-                self.session_repo
-                    .create_session(
-                        user.id,
-                        &refresh_token_hash,
-                        ip_address,
-                        user_agent,
-                        expires_at,
-                    )
-                    .await?;
-            }
-        }
+        self.session_repo
+            .create_session(
+                user.id,
+                &refresh_token_hash,
+                ip_address,
+                user_agent,
+                expires_at,
+            )
+            .await?;
 
         // Parse query mode preference (default to Standard if not set)
         let preferred_query_mode = user
@@ -626,84 +449,23 @@ impl AuthService {
     ///
     /// Called after the user receives a challenge token from login().
     /// Verifies the TOTP code, creates tokens and session, and returns AuthResponse.
-    #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
     pub async fn complete_mfa_login(
         &self,
         challenge_token: &str,
         code: &str,
-        tenant_slug: Option<&str>,
         encryption: &crate::crypto::EncryptionService,
         ip_address: Option<&str>,
         user_agent: Option<&str>,
     ) -> Result<MfaCompletion, AuthError> {
-        // Shared challenges carry the already-resolved tenant UUID. Revalidate
-        // membership before accepting the MFA code; a suspended membership
-        // cannot finish a challenge minted moments earlier.
-        let (claims, tenant, challenge_authenticated_at): (
-            super::types::TokenClaims,
-            Option<ResolvedTenantMembership>,
-            Option<DateTime<Utc>>,
-        ) = match &self.tenant_resolver {
-            #[cfg(feature = "enterprise")]
-            Some(_) => {
-                let shared = self
-                    .token_service
-                    .validate_enterprise_shared_mfa_challenge_token_async(challenge_token)
-                    .await
-                    .map_err(|_| AuthError::InvalidToken)?;
-                let authenticated_at = DateTime::<Utc>::from_timestamp_micros(
-                    shared
-                        .credential_time_micros
-                        .ok_or(AuthError::InvalidToken)?,
-                )
-                .ok_or(AuthError::InvalidToken)?;
-                if crate::auth::token::is_persisted_access_token_revoked(
-                    self.user_repo.pool(),
-                    shared.claims.jti,
-                    shared.claims.sub,
-                    authenticated_at.timestamp_micros(),
-                )
-                .await
-                .map_err(|error| AuthError::DatabaseError(error.to_string()))?
-                {
-                    return Err(AuthError::InvalidToken);
-                }
-                let tenant = self
-                    .resolve_enterprise_shared_continuation(
-                        shared.claims.sub,
-                        shared.tenant_id,
-                        authenticated_at.timestamp_micros(),
-                        tenant_slug,
-                        ip_address,
-                    )
-                    .await?;
-                (shared.claims, Some(tenant), Some(authenticated_at))
-            }
-            #[cfg(not(feature = "enterprise"))]
-            Some(_) => return Err(AuthError::TenantUnavailable),
-            None => (
-                self.token_service
-                    .validate_mfa_challenge_token_async(challenge_token)
-                    .await
-                    .map_err(|_| AuthError::InvalidToken)?,
-                None,
-                None,
-            ),
-        };
+        // Validate the challenge token
+        let claims = self
+            .token_service
+            .validate_mfa_challenge_token(challenge_token)
+            .map_err(|_| AuthError::InvalidToken)?;
         let user_id = claims.sub;
 
         // Get the user
         let user = self.user_repo.get_user_by_id(user_id).await?;
-
-        // A password-verified challenge is not a durable grant. Account
-        // disable/lock changes made during the MFA window must take effect
-        // before the second factor can mint a session.
-        if user.status == "disabled" {
-            return Err(AuthError::AccountDisabled);
-        }
-        if user.status == "locked" && self.is_account_locked(&user).await? {
-            return Err(AuthError::AccountLocked);
-        }
 
         if !user.mfa_enabled {
             return Err(AuthError::InvalidToken);
@@ -723,38 +485,35 @@ impl AuthService {
                 "MFA enabled but no TOTP nonce".to_string(),
             ))?;
 
-        let secret = super::mfa::decrypt_secret(totp_encrypted, totp_nonce, &(encryption).with_context(crate::crypto::CredentialScope::Account(user.id), "account.totp", user.id))
+        let secret = super::mfa::decrypt_secret(totp_encrypted, totp_nonce, encryption)
             .map_err(|e| AuthError::InternalError(e.to_string()))?;
 
         // Try TOTP verification first
         let totp_valid = super::mfa::verify_totp(&secret, &user.email, code).unwrap_or(false);
 
         let mut used_backup_code = false;
-        let mut backup_rotation = None;
         if !totp_valid {
             // Try backup code
             if let (Some(backup_enc), Some(backup_nonce)) =
                 (&user.backup_codes_encrypted, &user.backup_codes_nonce)
             {
                 let mut hashed_codes =
-                    super::mfa::decrypt_backup_codes(backup_enc, backup_nonce, &(encryption).with_context(crate::crypto::CredentialScope::Account(user.id), "account.backup-codes", user.id))
+                    super::mfa::decrypt_backup_codes(backup_enc, backup_nonce, encryption)
                         .map_err(|e| AuthError::InternalError(e.to_string()))?;
 
                 if let Some(idx) = super::mfa::verify_backup_code(code, &hashed_codes) {
                     used_backup_code = true;
                     // Remove used backup code and re-encrypt
                     hashed_codes.remove(idx);
-                    let new_encrypted = super::mfa::encrypt_backup_codes(&hashed_codes, &(encryption).with_context(crate::crypto::CredentialScope::Account(user.id), "account.backup-codes", user.id))
+                    let new_encrypted = super::mfa::encrypt_backup_codes(&hashed_codes, encryption)
                         .map_err(|e| AuthError::InternalError(e.to_string()))?;
                     let ciphertext = base64::engine::general_purpose::STANDARD
                         .decode(&new_encrypted.ciphertext)
                         .map_err(|e| AuthError::InternalError(e.to_string()))?;
-                    backup_rotation = Some((
-                        backup_enc.clone(),
-                        backup_nonce.clone(),
-                        ciphertext,
-                        new_encrypted.nonce,
-                    ));
+                    let _ = self
+                        .user_repo
+                        .update_backup_codes(user_id, &ciphertext, &new_encrypted.nonce)
+                        .await;
                 } else {
                     // Neither TOTP nor backup code matched
                     return Err(AuthError::InvalidCredentials);
@@ -765,82 +524,15 @@ impl AuthService {
             }
         }
 
-        let rotation = backup_rotation.as_ref().map(
-            |(expected_encrypted, expected_nonce, replacement_encrypted, replacement_nonce)| {
-                BackupCodeRotation {
-                    expected_encrypted,
-                    expected_nonce,
-                    replacement_encrypted,
-                    replacement_nonce,
-                }
-            },
-        );
-        #[cfg(feature = "enterprise")]
-        let consumed = if let Some(authenticated_at) = challenge_authenticated_at {
-            let tenant_id = tenant
-                .as_ref()
-                .ok_or(AuthError::InvalidToken)?
-                .context
-                .tenant_id;
-            self.user_repo
-                .consume_enterprise_shared_mfa_challenge(
-                    tenant_id,
-                    user_id,
-                    claims.jti,
-                    claims.exp,
-                    authenticated_at,
-                    rotation,
-                )
-                .await?
-        } else {
-            self.user_repo
-                .consume_mfa_challenge(user_id, claims.jti, claims.exp, rotation)
-                .await?
-        };
-        #[cfg(not(feature = "enterprise"))]
-        let consumed = self
-            .user_repo
-            .consume_mfa_challenge(user_id, claims.jti, claims.exp, rotation)
-            .await?;
-        if !consumed {
-            return Err(AuthError::InvalidToken);
-        }
-
-        // Publish the durable challenge claim to the process/Redis denylist.
-        self.token_service
-            .revoke_token(claims.jti, claims.exp)
-            .await;
+        // Revoke the challenge token (single-use)
+        self.token_service.revoke_token(claims.jti, claims.exp).await;
 
         // MFA verified — now complete login (same flow as non-MFA)
-        let (roles, permissions) = match &tenant {
-            Some(tenant) => (tenant.roles.clone(), tenant.permissions.clone()),
-            None => (
-                self.group_repo.get_user_roles(user_id).await?,
-                self.group_repo.get_user_permissions(user_id).await?,
-            ),
-        };
-        // Preserve the original password-authentication fence. Advancing this
-        // to MFA completion time would let a challenge minted from an old
-        // password appear newer than a reset/logout that happened meanwhile.
-        let authenticated_at = challenge_authenticated_at.unwrap_or_else(Utc::now);
-        let mfa_authenticated_at = Utc::now();
-        let token_pair = match &tenant {
-            #[cfg(feature = "enterprise")]
-            Some(tenant) => self
-                .token_service
-                .create_enterprise_shared_token_pair_with_authentication(
-                    user_id,
-                    roles.clone(),
-                    tenant.context.tenant_id,
-                    authenticated_at,
-                    Some(mfa_authenticated_at),
-                )?,
-            #[cfg(not(feature = "enterprise"))]
-            Some(_) => return Err(AuthError::TenantUnavailable),
-            None => self
-                .token_service
-                .create_token_pair(user_id, roles.clone())?,
-        };
+        let roles = self.group_repo.get_user_roles(user_id).await?;
+        let permissions = self.group_repo.get_user_permissions(user_id).await?;
+        let token_pair = self
+            .token_service
+            .create_token_pair(user_id, roles.clone())?;
 
         let refresh_token_hash = hash_token(&token_pair.refresh_token);
         let expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
@@ -859,33 +551,15 @@ impl AuthService {
                 .await;
         }
 
-        match &tenant {
-            Some(tenant) => {
-                self.session_repo
-                    .create_tenant_session(
-                        user_id,
-                        tenant.context.tenant_id,
-                        authenticated_at,
-                        Some(mfa_authenticated_at),
-                        &refresh_token_hash,
-                        ip_address,
-                        user_agent,
-                        expires_at,
-                    )
-                    .await?;
-            }
-            None => {
-                self.session_repo
-                    .create_session(
-                        user_id,
-                        &refresh_token_hash,
-                        ip_address,
-                        user_agent,
-                        expires_at,
-                    )
-                    .await?;
-            }
-        }
+        self.session_repo
+            .create_session(
+                user_id,
+                &refresh_token_hash,
+                ip_address,
+                user_agent,
+                expires_at,
+            )
+            .await?;
 
         let preferred_query_mode = user
             .preferred_query_mode
@@ -905,7 +579,6 @@ impl AuthService {
 
         Ok(MfaCompletion {
             used_backup_code,
-            tenant: tenant.map(|tenant| tenant.context),
             response: AuthResponse {
                 user: UserInfo {
                     id: user.id,
@@ -948,64 +621,43 @@ impl AuthService {
     /// Requirements: 2.3, 2.4
     /// - 2.3: Allow token refresh using a valid refresh token
     /// - 2.4: Issue new access token and rotate the refresh token
-    #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
+    ///
+    /// NAN-2453 (race-tolerant rotation): the refresh token is single-use, but
+    /// the immediately previous token is honoured for [`REFRESH_GRACE_SECS`]
+    /// after a rotation. Such a "grace" refresh mints an access token for the
+    /// same session and does NOT rotate (`rotated == false`, no new refresh
+    /// token), so two tabs racing on the same cookie both stay signed in and
+    /// the refresh chain is never forked. Older tokens, and the previous token
+    /// after the window, are refused as before.
     pub async fn refresh_token(
         &self,
         refresh_token: &str,
-        tenant_slug: Option<&str>,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
-    ) -> Result<TokenPair, AuthError> {
-        let (claims, tenant_id) = match &self.tenant_resolver {
-            #[cfg(feature = "enterprise")]
-            Some(_) => {
-                let shared = self
-                    .token_service
-                    .validate_enterprise_shared_refresh_token(refresh_token)?;
-                (shared.claims, Some(shared.tenant_id))
-            }
-            #[cfg(not(feature = "enterprise"))]
-            Some(_) => return Err(AuthError::TenantUnavailable),
-            None => (
-                self.token_service.validate_refresh_token(refresh_token)?,
-                None,
-            ),
-        };
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
+    ) -> Result<RefreshOutcome, AuthError> {
+        // Validate the refresh token JWT
+        let claims = self.token_service.validate_refresh_token(refresh_token)?;
 
-        // Find the session by token hash
+        // Find the session by its current token hash, else by the immediately
+        // previous one within the grace window.
         let refresh_token_hash = hash_token(refresh_token);
-        let session = self
+        let (session, grace) = match self
             .session_repo
             .get_session_by_token_hash(&refresh_token_hash)
-            .await?;
-
-        // The signed tenant binding and durable session binding must be exact.
-        if session.user_id != claims.sub || session.tenant_id != tenant_id {
-            return Err(AuthError::InvalidToken);
-        }
-
-        // A shared session carries the original authentication fence across
-        // every refresh. This also rejects the narrow race where MFA
-        // completion inserts a session after logout deleted the prior session
-        // rows but after logout advanced the user's watermark.
-        #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
-        let shared_credential_time_micros = if tenant_id.is_some() {
-            let authenticated_at = session.authenticated_at.ok_or(AuthError::InvalidToken)?;
-            if crate::auth::token::is_persisted_access_token_revoked(
-                self.user_repo.pool(),
-                claims.jti,
-                claims.sub,
-                authenticated_at.timestamp_micros(),
-            )
             .await
-            .map_err(|error| AuthError::DatabaseError(error.to_string()))?
-            {
-                return Err(AuthError::InvalidToken);
-            }
-            Some(authenticated_at.timestamp_micros())
-        } else {
-            None
+        {
+            Ok(session) => (session, false),
+            Err(SessionRepositoryError::NotFoundByToken) => (
+                self.grace_session(&refresh_token_hash)
+                    .await?
+                    .ok_or(AuthError::SessionNotFound)?,
+                true,
+            ),
+            Err(e) => return Err(e.into()),
         };
+        if session.user_id != claims.sub {
+            return Err(AuthError::SessionNotFound);
+        }
 
         // Get the user
         let user = self.user_repo.get_user_by_id(claims.sub).await?;
@@ -1021,29 +673,8 @@ impl AuthService {
             }
         }
 
-        let tenant: Option<ResolvedTenantMembership> = match (&self.tenant_resolver, tenant_id) {
-            #[cfg(feature = "enterprise")]
-            (Some(_), Some(tenant_id)) => Some(
-                self.resolve_enterprise_shared_continuation(
-                    user.id,
-                    tenant_id,
-                    shared_credential_time_micros.ok_or(AuthError::InvalidToken)?,
-                    tenant_slug,
-                    ip_address,
-                )
-                .await?,
-            ),
-            #[cfg(not(feature = "enterprise"))]
-            (Some(_), Some(_)) => return Err(AuthError::TenantUnavailable),
-            (Some(_), None) => return Err(AuthError::InvalidToken),
-            (None, _) => None,
-        };
-
         // Get fresh roles (permissions are resolved server-side by auth middleware)
-        let mut roles = match &tenant {
-            Some(tenant) => tenant.roles.clone(),
-            None => self.group_repo.get_user_roles(user.id).await?,
-        };
+        let mut roles = self.group_repo.get_user_roles(user.id).await?;
 
         // Preserve demo_analyst role for active demo sessions.
         // Demo users have no database role assignments — the role is injected
@@ -1054,70 +685,76 @@ impl AuthService {
             roles.push("demo_analyst".to_string());
         }
 
+        if grace {
+            let access_token = self.token_service.create_access_token(user.id, roles)?;
+            return Ok(RefreshOutcome {
+                tokens: TokenPair::new(access_token, String::new(), self.token_service.access_token_ttl()),
+                rotated: false,
+            });
+        }
+
         // Create new token pair (Requirement 2.4 - rotation)
         // Permissions are NOT embedded in the JWT — resolved server-side.
-        let new_token_pair = match &tenant {
-            #[cfg(feature = "enterprise")]
-            Some(tenant) => {
-                let authenticated_at = session.authenticated_at.ok_or(AuthError::InvalidToken)?;
-                self.token_service
-                    .create_enterprise_shared_token_pair_with_authentication(
-                        user.id,
-                        roles,
-                        tenant.context.tenant_id,
-                        authenticated_at,
-                        session.mfa_authenticated_at,
-                    )?
-            }
-            #[cfg(not(feature = "enterprise"))]
-            Some(_) => return Err(AuthError::TenantUnavailable),
-            None => self.token_service.create_token_pair(user.id, roles)?,
-        };
+        let new_token_pair = self.token_service.create_token_pair(user.id, roles.clone())?;
 
         // Rotate the refresh token in the session
         let new_refresh_token_hash = hash_token(&new_token_pair.refresh_token);
         let new_expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
 
         // Compare-and-swap on the old hash so only one concurrent refresh of a
-        // single-use token wins; losers/replays get NotFoundByToken -> 401.
-        self.session_repo
+        // single-use token rotates. A concurrent loser falls back to the grace
+        // path (it just lost to the rotation of THIS token) instead of a 401.
+        match self
+            .session_repo
             .rotate_refresh_token(
                 session.id,
                 &refresh_token_hash,
                 &new_refresh_token_hash,
                 new_expires_at,
-                ip_address,
-                user_agent,
             )
-            .await?;
+            .await
+        {
+            Ok(_) => Ok(RefreshOutcome {
+                tokens: new_token_pair,
+                rotated: true,
+            }),
+            Err(SessionRepositoryError::NotFoundByToken) => {
+                let lost = self
+                    .grace_session(&refresh_token_hash)
+                    .await?
+                    .filter(|s| s.id == session.id)
+                    .ok_or(AuthError::SessionNotFound)?;
+                let access_token = self.token_service.create_access_token(lost.user_id, roles)?;
+                Ok(RefreshOutcome {
+                    tokens: TokenPair::new(access_token, String::new(), self.token_service.access_token_ttl()),
+                    rotated: false,
+                })
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 
-        Ok(new_token_pair)
+    async fn grace_session(
+        &self,
+        refresh_token_hash: &str,
+    ) -> Result<Option<crate::auth::Session>, AuthError> {
+        Ok(self
+            .session_repo
+            .get_session_in_refresh_grace(refresh_token_hash, REFRESH_GRACE_SECS)
+            .await?)
     }
 
     /// Request a password reset
     ///
     /// Requirements: 1.7 - Generate a time-limited reset token valid for 1 hour
-    #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
     pub async fn request_password_reset(
         &self,
         email: &str,
-        tenant_slug: Option<&str>,
         _ip_address: Option<&str>,
         _user_agent: Option<&str>,
     ) -> Result<String, AuthError> {
-        // Try to find the user, with the same tenant-scoped resolution as
-        // login (FRO-754): a reset only ever touches one tenant's identity.
-        #[cfg(feature = "enterprise")]
-        let lookup = if self.tenant_resolver.is_some() {
-            self.user_repo
-                .get_enterprise_shared_user_for_login(tenant_slug, email)
-                .await
-        } else {
-            self.user_repo.get_user_by_email(email).await
-        };
-        #[cfg(not(feature = "enterprise"))]
-        let lookup = self.user_repo.get_user_by_email(email).await;
-        let user = match lookup {
+        // Try to find the user
+        let user = match self.user_repo.get_user_by_email(email).await {
             Ok(user) => user,
             Err(UserRepositoryError::NotFoundByEmail(_)) => {
                 // SECURITY: Don't reveal whether user exists
@@ -1148,22 +785,24 @@ impl AuthService {
         new_password: &str,
         _ip_address: Option<&str>,
         _user_agent: Option<&str>,
-    ) -> Result<uuid::Uuid, AuthError> {
+    ) -> Result<(), AuthError> {
         // Validate complexity AND the MAX_PASSWORD_BYTES upper bound before any
         // bcrypt work is scheduled, so an oversized body cannot dictate hashing
         // cost (same cap the activation paths enforce).
         validate_password(new_password)?;
 
-        // Consume the reset token, update the password, advance the durable
-        // credential watermark and delete refresh sessions atomically. The
-        // account whose password changed is returned so the caller can audit
-        // it in that account's tenant(s) (NAN-3790).
-        let user_id = self
-            .user_repo
-            .reset_password_and_revoke_sessions(token, new_password)
+        // Find user by reset token (this also validates expiration)
+        let user = self.user_repo.get_user_by_reset_token(token).await?;
+
+        // Update the password
+        self.user_repo
+            .update_password(user.id, new_password)
             .await?;
 
-        Ok(user_id)
+        // Invalidate all existing sessions for security
+        self.session_repo.delete_user_sessions(user.id).await?;
+
+        Ok(())
     }
 
     /// Change password for an authenticated user
@@ -1201,15 +840,18 @@ impl AuthService {
         // bound before scheduling the bcrypt hash.
         validate_password(new_password)?;
 
-        // Compare-and-swap the exact hash we verified. A concurrent reset or
-        // password change cannot be overwritten by this slower bcrypt path.
-        if !self
-            .user_repo
-            .change_password_and_revoke_sessions_if_current(user_id, password_hash, new_password)
-            .await?
-        {
-            return Err(AuthError::InvalidCredentials);
-        }
+        // Update the password
+        self.user_repo
+            .update_password(user_id, new_password)
+            .await?;
+
+        // F-32: stamp the forced-revocation watermark so already-issued access
+        // tokens (the account stays `active` across a password change, so the
+        // status gate alone would not catch them) are rejected by the middleware.
+        self.user_repo.stamp_tokens_valid_from(user_id).await?;
+
+        // Invalidate all existing sessions for security
+        self.session_repo.delete_user_sessions(user_id).await?;
 
         Ok(())
     }
@@ -1258,12 +900,6 @@ impl AuthService {
         ip_address: Option<&str>,
         user_agent: Option<&str>,
     ) -> Result<TokenPair, AuthError> {
-        // The existing OIDC callback has no tenant selector in its signed state.
-        // Refuse tenantless issuance in hosted-shared until that flow gains
-        // the same authoritative membership resolution as password login.
-        if self.tenant_resolver.is_some() {
-            return Err(AuthError::TenantRequired);
-        }
         // Create tokens — permissions are NOT embedded in the JWT
         let token_pair = self
             .token_service

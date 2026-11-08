@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::{serialize_rule_to_npl, splice_query};
-use crate::models::detection_rule::{AlertMode, DetectionMode, DetectionRule, RuleMode, Severity};
+use crate::models::detection_rule::{
+    AlertMode, DetectionMode, DetectionRule, RuleMode, Severity,
+};
 use crate::rule_repository::parse_npl;
 use chrono::Utc;
 use uuid::Uuid;
@@ -25,8 +27,6 @@ fn sample_rule() -> DetectionRule {
         realtime_enabled: false,
         detection_mode: DetectionMode::Scheduled,
         materialized_view_name: None,
-        near_real_time_interval_seconds: None,
-        execution_mode: None,
         risk_score: None,
         risk_entity_field: None,
         risk_modifiers: sqlx::types::Json(vec![]),

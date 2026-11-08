@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { TelemetrySetupHint } from '@/components/observability/TelemetryUnavailable';
+import { TelemetrySetupHint } from '@/components/observability/TelemetrySetupHint';
 
 // MetricsTab (NAN-1540) — metrics-v2 explorer.
 //
@@ -25,7 +25,6 @@ import { TelemetrySetupHint } from '@/components/observability/TelemetryUnavaila
 
 import { Fragment, useCallback, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { useAuth } from '@/contexts/AuthContext';
 import { AlertCircle, LineChart, Plus, RotateCw } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
@@ -42,17 +41,9 @@ import type { ObservabilityTabProps } from '../types';
 /** Upper bound on explorer panels in the tab. */
 export const MAX_METRIC_PANELS = 6;
 
-function formatWindowStart(iso: string | undefined): string | null {
-  if (!iso) return null;
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
 export function MetricsTab({ apiTimeRange }: ObservabilityTabProps) {
-  const { tenantRuntime } = useAuth();
   const catalog = useQuery({
-    queryKey: ['metric-names', tenantRuntime.key],
+    queryKey: ['metric-names'],
     queryFn: () => api.observability.listMetricNames(),
     staleTime: 60_000,
     retry: false,
@@ -77,7 +68,7 @@ export function MetricsTab({ apiTimeRange }: ObservabilityTabProps) {
     return { status: 'ready', partial: catalog.data?.partial };
   }, [catalog.isError, catalog.isPending, catalog.isFetching, catalog.data, errorMessage, retry, metricNames.length]);
 
-  const partialSince = catalog.data?.partial ? formatWindowStart(catalog.data.window_start) : null;
+  const capped = catalog.data?.partial === true;
 
   return (
     <div className="flex flex-col gap-2.5">
@@ -116,10 +107,11 @@ export function MetricsTab({ apiTimeRange }: ObservabilityTabProps) {
           </Button>
         </div>
       )}
-      {catalog.isSuccess && partialSince && metricNames.length > 0 && (
+      {catalog.isSuccess && capped && metricNames.length > 0 && (
         <div className="text-[11px] text-fg-3">
-          Catalog lists names seen since <span className="font-mono">{partialSince}</span>; the
-          rest of the last 24 h fills in shortly. Any metric name can be typed.
+          The catalog is capped at the first{' '}
+          <span className="font-mono">{metricNames.length.toLocaleString()}</span> metric names
+          (alphabetical). Type a name in the picker to chart one that is not listed.
         </div>
       )}
       {catalog.isSuccess && metricNames.length === 0 && (
@@ -129,9 +121,8 @@ export function MetricsTab({ apiTimeRange }: ObservabilityTabProps) {
         </div>
       )}
 
-      {/* One keyed fragment: a tenant switch remounts the panels and the
-          monitors list together, and the two never share a sibling key. */}
-      <Fragment key={tenantRuntime.key}>
+      {/* The panels and the monitors list never share a sibling key. */}
+      <Fragment>
         <MetricPanels
           metricNames={metricNames}
           catalog={catalogStatus}

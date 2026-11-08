@@ -13,20 +13,19 @@
 //! - Prevalence-based detection: supports filtering by artifact prevalence
 
 mod alerts;
-mod open_cell;
-#[cfg(test)]
-mod open_cell_tests;
 mod analysis;
 #[cfg(test)]
 mod cooldown_tests;
 mod execution;
 pub(crate) mod helpers;
-pub(crate) mod retro_hunt;
+mod retro_hunt;
 mod rules;
 #[cfg(test)]
 mod source_stamp_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod eval_chain_guard_tests;
 
 // Audit D13: the real-time SignalProcessor shares the scheduled path's
 // finding-emission dedup (candidate type + store helpers in `helpers`).
@@ -235,28 +234,6 @@ pub struct DetectionService {
 }
 
 impl DetectionService {
-    /// Re-pin this service's event reader to an already tenant-pinned lake
-    /// `SearchService` (NAN-2361 Rules dashboard port).
-    ///
-    /// The interactive "test rule" preview in enterprise-shared mode must run
-    /// every stepped window through the caller's attested tenant lake view,
-    /// never the process singleton (which deliberately has no lake client in
-    /// that profile). Only the pure evaluators (`analyze_query_stepped`,
-    /// `analyze_rule_stepped`, `evaluate_window`) are meaningful on the
-    /// returned value: the rule/alert repositories, finding logger and version
-    /// manager still point at the dedicated pool and MUST NOT be used through
-    /// it. The caller (an enterprise handler) is responsible for having proven
-    /// `search` is pinned to the request's tenant.
-    pub fn with_tenant_search_view(&self, search: SearchService) -> Self {
-        let mut view = self.clone();
-        // NAN-2718: entity grouping/scoring follows the tenant view's schema,
-        // not the process singleton's.
-        view.active_profile = search.active_profile().clone();
-        view.search_service = search;
-        view.finding_logger = None;
-        view
-    }
-
     /// Serialize materialized-view writers for one rule across API nodes.
     pub async fn acquire_rule_runtime_lock(
         &self,

@@ -40,6 +40,10 @@ pub enum IdentityServiceError {
     /// NAN-3483: the normalizer rejected every record the provider returned.
     #[error("Sync dead-lettered every record: {0}")]
     AllRecordsDeadLettered(String),
+    /// G22: the provider is managed by a connector identity feed; sync it and
+    /// change its credential on the feed.
+    #[error("Provider {0} is managed by connector identity feed {1}; use the feed")]
+    ManagedByConnectorFeed(String, String),
 }
 
 // =============================================================================
@@ -117,7 +121,22 @@ impl IdentitySyncService {
         id: &str,
         credentials: &serde_json::Value,
     ) -> Result<(), IdentityServiceError> {
+        Self::refuse_feed_managed(&self.repo.get_provider(id).await?)?;
         Ok(self.repo.update_credentials(id, credentials).await?)
+    }
+
+    /// G22: a provider a connector identity feed manages is synced by the
+    /// connector runner with the feed's bound credential; the native sync and
+    /// credential paths refuse it rather than run a second, credential-less
+    /// sync against the same directory.
+    fn refuse_feed_managed(provider: &IdentityProvider) -> Result<(), IdentityServiceError> {
+        match provider.connector_feed_id {
+            Some(feed) => Err(IdentityServiceError::ManagedByConnectorFeed(
+                provider.id.clone(),
+                crate::typeid::encode(crate::typeid::connector_feed::PREFIX, &feed),
+            )),
+            None => Ok(()),
+        }
     }
 
     // ========================================================================
@@ -132,6 +151,7 @@ impl IdentitySyncService {
     ) -> Result<IdentitySyncResult, IdentityServiceError> {
         let start = std::time::Instant::now();
         let provider = self.repo.get_provider(provider_id).await?;
+        Self::refuse_feed_managed(&provider)?;
 
         // Check if already in progress
         if provider.sync_status.as_deref() == Some("in_progress") {
@@ -314,8 +334,9 @@ impl IdentitySyncService {
         let start = std::time::Instant::now();
         // NAN-1151: providers now fetch RAW user objects and we emit them onto
         // the nano_enrich lane (tagged kind=identity, source=<provider>); the
-        // repo-sourced per-source VRL maps them into user_registry. The lane is
-        // fire-and-forget, so deprovisioning is the staleness reconciler's job
+        // repo-sourced per-source VRL maps them into user_registry. The lane's
+        // response confirms a durable disk handoff, while deprovisioning remains
+        // the staleness reconciler's job
         // (scheduler) — NOT a synchronous mark-absent here, which would race the
         // async writes and false-delete the just-emitted users.
         // NAN-3483: every record is still emitted (Vector normalizes and
@@ -497,7 +518,7 @@ impl IdentitySyncService {
 
     /// Tombstone directory accounts not seen since `cutoff` — the staleness
     /// deprovisioning model that replaces synchronous per-sync mark-absent once
-    /// providers emit through the (fire-and-forget) enrichment lane.
+    /// providers emit through the asynchronous, durably handed-off enrichment lane.
     ///
     /// With synchronous writes, "absent" meant "not in THIS sync" (cutoff =
     /// sync start). Through the lane, emitted records land asynchronously, so a

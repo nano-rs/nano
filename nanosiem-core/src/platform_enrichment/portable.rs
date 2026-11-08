@@ -30,11 +30,11 @@
 //! 2. [`VerifiedBundle::accept_after`] against the installed descriptor
 //!    (refuses rollback, same-sequence substitution, per-feed revision
 //!    regression and an entirely expired bundle);
-//! 3. [`VerifiedBundle::install_payload`] into the cell's `platform_bundle_dir`
-//!    as `platform-<sha256>.nanpfb` (0444, re-hashed while copying), then a
-//!    tenant policy whose grants come from the descriptor (lake-worker
-//!    `TenantPlatformPolicy::from_portable`). The cell load path is the same
-//!    one hosted uses.
+//! 3. loading the payload. On the ClickHouse product (NAN-4948) that is
+//!    `platform_enrichment::loader`, which writes the feeds into the
+//!    ClickHouse enrichment tables the ingest dictionaries read.
+//!    [`VerifiedBundle::install_payload`] (a sealed content-addressed copy)
+//!    is kept from main for file-based consumers.
 //!
 //! Only feeds in [`PORTABLE_FEEDS`] may appear. Synthient (contracted,
 //! non-redistributable) is refused by both the descriptor and payload checks.
@@ -260,6 +260,11 @@ impl KeyRing {
     pub fn contains(&self, id: &str, key: &VerifyingKey) -> bool {
         self.0.get(id) == Some(key)
     }
+    /// The trusted key with this id (NAN-4955: the content bundle verifier
+    /// shares this ring type under its own compiled-in key list).
+    pub fn key(&self, id: &str) -> Option<&VerifyingKey> {
+        self.0.get(id)
+    }
 }
 
 fn key_id_ok(id: &str) -> bool {
@@ -416,6 +421,12 @@ impl VerifiedBundle {
 
     pub fn descriptor(&self) -> &Descriptor {
         &self.signed.descriptor
+    }
+
+    /// Byte offset of the NANPFB01 payload inside the verified container
+    /// (NAN-4948: the ClickHouse loader reads the payload sections in place).
+    pub fn payload_offset(&self) -> u64 {
+        self.payload_offset
     }
 
     /// Install policy: refuse a bundle that is older than, or a substitute
@@ -728,29 +739,6 @@ pub fn seal(
     staged.persist(out).map_err(|e| BundleError::Io(e.error))?;
     File::open(parent)?.sync_all()?;
     Ok(signed)
-}
-
-#[cfg(feature = "enterprise")]
-impl FeedEntry {
-    /// Project a verified hosted manifest onto its portable entry. The
-    /// manifest's bucket, object key and fencing epoch are dropped.
-    pub fn from_hosted_manifest(m: &super::publisher::Manifest) -> Result<(String, Self)> {
-        let terms =
-            portable_terms(&m.feed_id).ok_or(BundleError::Invalid("feed is not portable"))?;
-        Ok((
-            m.feed_id.clone(),
-            Self {
-                revision: m.revision,
-                license_id: terms.license_id.into(),
-                terms_revision: m.license_revision.clone(),
-                upstream_at: m.upstream_at,
-                produced_at: m.fetched_at,
-                hard_expiry: m.valid_until,
-                row_count: m.row_count,
-                source_sha256: m.digest.clone(),
-            },
-        ))
-    }
 }
 
 #[cfg(test)]

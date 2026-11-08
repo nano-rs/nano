@@ -20,18 +20,18 @@
 //! detection `signals` table — that path takes the caller's [`ScopeSet`] and
 //! AND-s the deny-set exclusion onto both its signals reads.
 
-use super::lateral::source_scope_sql_predicate;
 use super::*;
+use super::lateral::source_scope_sql_predicate;
 use crate::auth::ScopeSet;
 use crate::query::{
-    infra_hosts_sql, metric_names_sql, metric_scalar_sql, metric_tag_keys_sql,
+    infra_hosts_sql, metric_names_sql, metric_names_window_start, metric_scalar_sql, metric_tag_keys_sql,
     metric_tag_values_sql, metric_timeseries_sql, metric_timeseries_v2_sql, recent_traces_sql,
     rum_pageviews_series_sql, rum_recent_errors_sql, rum_top_pages_sql, rum_web_vitals_sql,
     security_signals_for_entities_sql, service_endpoints_sql, service_entities_sql,
-    service_exemplars_sql, service_red_timeseries_sql, services_overview_sql,
-    services_sparkline_sql, slo_compute_sql, synthetic_history_sql, synthetic_summary_sql,
-    trace_by_id_sql, InfraHostsFilters, MetricQuery, RumFilters, ServicesOverviewFilters,
-    ServicesSort, SliKind, TimeRange, TraceListFilters,
+    service_exemplars_sql, service_red_timeseries_sql, services_overview_sql, services_sparkline_sql,
+    slo_compute_sql, slo_coverage_sql, synthetic_history_sql, synthetic_summary_sql, trace_by_id_sql,
+    InfraHostsFilters, MetricQuery, RumFilters, ServicesOverviewFilters, ServicesSort, SliKind,
+    TimeRange, TraceListFilters,
 };
 
 impl SearchService {
@@ -45,7 +45,6 @@ impl SearchService {
         &self,
         trace_id: &str,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
-        self.require_dedicated_retention_surface("OTEL trace-by-id queries")?;
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
@@ -68,21 +67,13 @@ impl SearchService {
         time_range: &TimeRange,
         step_secs: u64,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
             ))
         })?;
 
-        let sql = metric_timeseries_sql(
-            metric_name,
-            service_name,
-            time_range,
-            step_secs,
-            self.table_names.is_clustered(),
-        );
+        let sql = metric_timeseries_sql(metric_name, service_name, time_range, step_secs, self.table_names.is_clustered());
         debug!("OTEL metric timeseries SQL: {}", sql);
         ch_executor.execute_sql_to_json(&sql).await
     }
@@ -101,8 +92,6 @@ impl SearchService {
         query: &MetricQuery<'_>,
         time_range: &TimeRange,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
@@ -155,8 +144,6 @@ impl SearchService {
         metric_name: &str,
         time_range: &TimeRange,
     ) -> Result<Vec<String>, SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
@@ -166,11 +153,7 @@ impl SearchService {
         let sql = metric_tag_keys_sql(metric_name, time_range, self.table_names.is_clustered());
         debug!("OTEL metric tag-keys SQL: {}", sql);
         let rows = ch_executor.execute_sql_to_json(&sql).await?;
-        Ok(rows
-            .iter()
-            .map(|r| json_str(r, "k"))
-            .filter(|s| !s.is_empty())
-            .collect())
+        Ok(rows.iter().map(|r| json_str(r, "k")).filter(|s| !s.is_empty()).collect())
     }
 
     /// Distinct VALUES of one tag `key` for a metric over `time_range`
@@ -183,20 +166,13 @@ impl SearchService {
         key: &str,
         time_range: &TimeRange,
     ) -> Result<Vec<String>, SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
             ))
         })?;
 
-        let sql = metric_tag_values_sql(
-            metric_name,
-            key,
-            time_range,
-            self.table_names.is_clustered(),
-        );
+        let sql = metric_tag_values_sql(metric_name, key, time_range, self.table_names.is_clustered());
         debug!("OTEL metric tag-values SQL: {}", sql);
         let rows = ch_executor.execute_sql_to_json(&sql).await?;
         Ok(rows
@@ -206,7 +182,7 @@ impl SearchService {
             .collect())
     }
 
-    /// Metric-monitor EVAL: compute the monitor's aggregate as one
+    /// Metric-monitor EVAL (NAN-1540): compute the monitor's aggregate as one
     /// scalar PER SERIES over the window via [`metric_scalar_sql`], returning
     /// `(series_key, value)` pairs where `value` is `Option<f64>`. The jobs
     /// runner compares each `Some(value)` to the monitor threshold per its
@@ -214,54 +190,48 @@ impl SearchService {
     /// exactly one pair with key `""`; an empty result (a group_by series that
     /// vanished) yields an empty vec.
     ///
-    /// O13: `value` is `None` for a no-data window — either
+    /// O13 (NAN-1721): `value` is `None` for a no-data window — either
     /// `row_count == 0` (Contract #1: `metric_scalar_sql` emits
-    /// `count AS row_count`) or a NULL aggregate (avg/min/max/quantile over an
+    /// `count() AS row_count`) or a NULL aggregate (avg/min/max/quantile over an
     /// empty set). None is NEVER coerced to 0.0, so the runner treats it as
     /// no-data (no compare, no alert) instead of false-firing an `lt`/`eq 0`
     /// monitor when the metric stops reporting. Bounded by the window + LIMIT
+    /// (NAN-1032).
     ///
-    #[instrument(skip_all)]
+    /// NAN-4031: a filtered `rate` monitor (e.g. `status=500`) proves absence of
+    /// a sparse label with two count queries, so a series whose base metric is
+    /// reporting but whose filtered label has no rows yet evaluates as `0.0`
+    /// rather than no-data. A NULL rate on an existing but undersampled series
+    /// stays unknown.
+    #[instrument(skip(self))]
     pub async fn evaluate_metric_monitor(
         &self,
         query: &MetricQuery<'_>,
         time_range: &TimeRange,
     ) -> Result<Vec<(String, Option<f64>)>, SearchError> {
-        // Built-in derived monitor: both operands use the same bounded event-time
-        // window, tag filters and node grouping on either storage backend.
-        if query.metric_name == "node_filesystem_avail_ratio" {
-            let available = MetricQuery {
-                metric_name: "node_filesystem_avail_bytes",
-                agg: crate::query::MetricAgg::Min,
-                ..query.clone()
-            };
-            let capacity = MetricQuery {
-                metric_name: "node_filesystem_size_bytes",
-                agg: crate::query::MetricAgg::Max,
-                ..query.clone()
-            };
-            let available = self
-                .evaluate_raw_metric_monitor(&available, time_range)
-                .await?;
-            let capacity = self
-                .evaluate_raw_metric_monitor(&capacity, time_range)
-                .await?;
-            return Ok(crate::observability::eval::filesystem_ratios(
-                available, capacity,
-            ));
-        }
         let rows = self.evaluate_raw_metric_monitor(query, time_range).await?;
-        // NAN-4031: sparse counter labels (e.g. status=500) need not exist
-        // before the first event. Prove absence with a count query: a NULL
-        // rate on an existing but undersampled series must remain unknown.
         if query.agg != crate::query::MetricAgg::Rate || query.filters.is_empty() {
             return Ok(rows);
         }
-        let counts_query = MetricQuery { agg: crate::query::MetricAgg::Count, ..query.clone() };
-        let filtered_counts = self.evaluate_raw_metric_monitor(&counts_query, time_range).await?;
-        let base_query = MetricQuery { filters: &[], ..counts_query };
-        let base_counts = self.evaluate_raw_metric_monitor(&base_query, time_range).await?;
-        Ok(crate::observability::eval::fill_missing_counter_rates(rows, filtered_counts, base_counts))
+        let counts_query = MetricQuery {
+            agg: crate::query::MetricAgg::Count,
+            ..query.clone()
+        };
+        let filtered_counts = self
+            .evaluate_raw_metric_monitor(&counts_query, time_range)
+            .await?;
+        let base_query = MetricQuery {
+            filters: &[],
+            ..counts_query
+        };
+        let base_counts = self
+            .evaluate_raw_metric_monitor(&base_query, time_range)
+            .await?;
+        Ok(crate::observability::eval::fill_missing_counter_rates(
+            rows,
+            filtered_counts,
+            base_counts,
+        ))
     }
 
     async fn evaluate_raw_metric_monitor(
@@ -269,14 +239,6 @@ impl SearchService {
         query: &MetricQuery<'_>,
         time_range: &TimeRange,
     ) -> Result<Vec<(String, Option<f64>)>, SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
-        if let Some(client) = self.otel_lake.as_ref() {
-            return client
-                .metric_scalar(query, time_range)
-                .await
-                .map_err(SearchError::ServiceUnavailable);
-        }
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
@@ -319,8 +281,6 @@ impl SearchService {
         time_range: &TimeRange,
         filters: &TraceListFilters<'_>,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
@@ -334,23 +294,30 @@ impl SearchService {
 
     /// List distinct metric names for the Metrics explorer dropdown (NAN-1534).
     ///
-    /// Returns one JSON object per distinct `metric_name`, optionally restricted
-    /// to a single `service_name`, name-ordered. Bounded by `LIMIT 10000`.
+    /// Returns `(names, window_start, partial)`: one JSON object per distinct
+    /// `metric_name` that reported in the last `window_hours` (NAN-4098,
+    /// clamped to 1h..7d), optionally restricted to a single `service_name`,
+    /// name-ordered, at most [`crate::query::METRIC_NAMES_CAP`]. `partial` is
+    /// true when the catalog was capped.
     #[instrument(skip(self))]
     pub async fn list_otel_metric_names(
         &self,
         service_name: Option<&str>,
-    ) -> Result<Vec<serde_json::Value>, SearchError> {
-        self.require_dedicated_retention_surface("OTEL metric-name enumeration")?;
+        window_hours: u32,
+    ) -> Result<(Vec<serde_json::Value>, chrono::DateTime<chrono::Utc>, bool), SearchError> {
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
             ))
         })?;
 
-        let sql = metric_names_sql(service_name, self.table_names.is_clustered());
+        let now = chrono::Utc::now();
+        let sql = metric_names_sql(service_name, now, window_hours, self.table_names.is_clustered());
         debug!("OTEL metric-names SQL: {}", sql);
-        ch_executor.execute_sql_to_json(&sql).await
+        let mut names = ch_executor.execute_sql_to_json(&sql).await?;
+        let partial = names.len() > crate::query::METRIC_NAMES_CAP;
+        names.truncate(crate::query::METRIC_NAMES_CAP);
+        Ok((names, metric_names_window_start(now, window_hours), partial))
     }
 
     // ========================================================================
@@ -390,8 +357,6 @@ impl SearchService {
         offset: u32,
         limit: Option<u32>,
     ) -> Result<(Vec<serde_json::Value>, usize), SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
@@ -400,16 +365,11 @@ impl SearchService {
 
         let window_secs = ((time_range.end - time_range.start).num_seconds().max(1)) as f64;
 
-        let overview_sql =
-            services_overview_sql(time_range, filters, self.table_names.is_clustered());
+        let overview_sql = services_overview_sql(time_range, filters, self.table_names.is_clustered());
         debug!("OTEL services-overview SQL: {}", overview_sql);
         let rows = ch_executor.execute_sql_to_json(&overview_sql).await?;
 
-        let spark_sql = services_sparkline_sql(
-            time_range,
-            sparkline_step_secs,
-            self.table_names.is_clustered(),
-        );
+        let spark_sql = services_sparkline_sql(time_range, sparkline_step_secs, self.table_names.is_clustered());
         debug!("OTEL services-sparkline SQL: {}", spark_sql);
         let spark_rows = ch_executor.execute_sql_to_json(&spark_sql).await?;
 
@@ -443,8 +403,7 @@ impl SearchService {
                     0.0
                 };
                 let p95_ms = json_f64(&row, "p95_ms");
-                let background = is_background_service(&service);
-                let health = service_health(&service, error_rate, p95_ms);
+                let health = service_health(error_rate, p95_ms);
                 let sparkline = sparklines.remove(&service).unwrap_or_default();
                 let obj = serde_json::json!({
                     "service": service,
@@ -455,7 +414,6 @@ impl SearchService {
                     "p95_ms": p95_ms,
                     "p99_ms": json_f64(&row, "p99_ms"),
                     "health": health,
-                    "workload": if background { "background" } else { "interactive" },
                     "sparkline": sparkline,
                 });
                 (error_rate, health, obj)
@@ -499,20 +457,13 @@ impl SearchService {
         red_step_secs: u64,
         exemplar_limit: Option<u32>,
     ) -> Result<serde_json::Value, SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
             ))
         })?;
 
-        let red_sql = service_red_timeseries_sql(
-            service,
-            time_range,
-            red_step_secs,
-            self.table_names.is_clustered(),
-        );
+        let red_sql = service_red_timeseries_sql(service, time_range, red_step_secs, self.table_names.is_clustered());
         debug!("OTEL service-detail RED SQL: {}", red_sql);
         let red_rows = ch_executor.execute_sql_to_json(&red_sql).await?;
 
@@ -531,8 +482,7 @@ impl SearchService {
             }));
         }
 
-        let endpoints_sql =
-            service_endpoints_sql(service, time_range, self.table_names.is_clustered());
+        let endpoints_sql = service_endpoints_sql(service, time_range, self.table_names.is_clustered());
         debug!("OTEL service-detail endpoints SQL: {}", endpoints_sql);
         let endpoint_rows = ch_executor.execute_sql_to_json(&endpoints_sql).await?;
         let endpoints: Vec<serde_json::Value> = endpoint_rows
@@ -554,12 +504,7 @@ impl SearchService {
             })
             .collect();
 
-        let exemplars_sql = service_exemplars_sql(
-            service,
-            time_range,
-            exemplar_limit,
-            self.table_names.is_clustered(),
-        );
+        let exemplars_sql = service_exemplars_sql(service, time_range, exemplar_limit, self.table_names.is_clustered());
         debug!("OTEL service-detail exemplars SQL: {}", exemplars_sql);
         let exemplar_rows = ch_executor.execute_sql_to_json(&exemplars_sql).await?;
         let exemplars: Vec<serde_json::Value> = exemplar_rows
@@ -581,19 +526,6 @@ impl SearchService {
             "endpoints": endpoints,
             "exemplars": exemplars,
         }))
-    }
-
-    /// Hosted evaluator read with an explicit full-window coverage attestation.
-    /// Older and hot-tail readers omit it and therefore return `false`.
-    pub async fn observability_slo_compute_with_coverage(
-        &self, service: &str, sli_kind: SliKind, latency_threshold_ms: Option<f64>, time_range: &TimeRange,
-    ) -> Result<(f64, i64, bool, bool), SearchError> {
-        let range = self.otel_retention_require_query_range(time_range, chrono::Utc::now())?;
-        let client = self.otel_lake.as_ref().ok_or_else(|| SearchError::ServiceUnavailable("tenant OTLP evaluator unavailable".into()))?;
-        let (current,total,no_data,complete) = client.slo_compute_with_coverage(service,sli_kind,latency_threshold_ms,&range)
-            .await.map_err(SearchError::ServiceUnavailable)?;
-        // Retention clamping also makes the originally requested window partial.
-        Ok((current,total,no_data,complete && range.start == time_range.start && range.end == time_range.end))
     }
 
     /// Compute one SLO's spans-based attainment over `time_range` (NAN-1536).
@@ -620,27 +552,13 @@ impl SearchService {
         latency_threshold_ms: Option<f64>,
         time_range: &TimeRange,
     ) -> Result<(f64, i64, bool), SearchError> {
-        let retention_range = self.otel_retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
-        if let Some(client) = self.otel_lake.as_ref() {
-            return client
-                .slo_compute(service, sli_kind, latency_threshold_ms, time_range)
-                .await
-                .map_err(SearchError::ServiceUnavailable);
-        }
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
             ))
         })?;
 
-        let sql = slo_compute_sql(
-            service,
-            sli_kind,
-            latency_threshold_ms,
-            time_range,
-            self.table_names.is_clustered(),
-        );
+        let sql = slo_compute_sql(service, sli_kind, latency_threshold_ms, time_range, self.table_names.is_clustered());
         debug!("OTEL SLO-compute SQL: {}", sql);
         let rows = ch_executor.execute_sql_to_json(&sql).await?;
 
@@ -657,6 +575,47 @@ impl SearchService {
         Ok((current, total as i64, no_data))
     }
 
+    /// [`Self::observability_slo_compute`] plus a full-window coverage
+    /// attestation (NAN-3894): `(current, total_spans, no_data, complete)`.
+    /// `complete = false` means the target service's telemetry does not cover
+    /// the whole window (first seen inside it, or a gap longer than
+    /// [`crate::query::SLO_COVERAGE_MAX_GAP_SECS`]; see [`slo_coverage_sql`]),
+    /// so callers report `partial` and never alert. Both reads run concurrently.
+    #[instrument(skip(self))]
+    pub async fn observability_slo_compute_with_coverage(
+        &self,
+        service: &str,
+        sli_kind: SliKind,
+        latency_threshold_ms: Option<f64>,
+        time_range: &TimeRange,
+    ) -> Result<(f64, i64, bool, bool), SearchError> {
+        let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
+            SearchError::DatabaseError(sqlx::Error::Configuration(
+                "ClickHouse client not configured".into(),
+            ))
+        })?;
+        let coverage_sql = slo_coverage_sql(service, time_range, self.table_names.is_clustered());
+        debug!("OTEL SLO-coverage SQL: {}", coverage_sql);
+        let (attainment, coverage) = tokio::try_join!(
+            self.observability_slo_compute(service, sli_kind, latency_threshold_ms, time_range),
+            async { Ok::<_, SearchError>(ch_executor.execute_sql_to_json(&coverage_sql).await?) },
+        )?;
+        let (current, total, no_data) = attainment;
+        let reaches_ttl = (time_range.end - time_range.start).num_seconds()
+            + crate::query::SLO_COVERAGE_MAX_GAP_SECS
+            >= crate::query::OTEL_SPAN_TTL_SECS;
+        let complete = coverage.first().is_some_and(|row| {
+            crate::query::slo_coverage_complete(
+                json_f64(row, "samples") as u64,
+                json_f64(row, "first_seen") as i64,
+                json_f64(row, "max_gap_secs") as i64,
+                time_range.start,
+                reaches_ttl,
+            )
+        });
+        Ok((current, total, no_data, complete))
+    }
+
     // ========================================================================
     // Observability console — Infra host inventory (NAN-1537)
     // ========================================================================
@@ -669,9 +628,12 @@ impl SearchService {
     ///   - `mem_pct`  — `system.memory.utilization` ×100
     ///   - `load`     — `system.cpu.load_average.1m` (as-is)
     ///   - `net_bytes_per_sec` — cumulative network counter rate, or `system.network.io`
-    ///
     ///   - `group`    — `host.group` resource attr, else `service_name`
-    ///   - `status`   — `good`|`warn`|`bad` from cpu/mem thresholds
+    ///   - `status`   — `good`|`warn`|`bad` from `nano.infra.health` and cpu/mem
+    ///     thresholds; `unknown` when neither readiness nor utilization reported
+    ///   - NAN-3972 Kubernetes fields: `kind` (`node`|`pod`), `node_name`,
+    ///     `pod_name`, `namespace`, `workload`, `phase`, `cluster`, `region`,
+    ///     `instance_type`, `cpu_cores`, `mem_bytes`, `restarts` (null = no sample)
     ///
     /// NAN-4028: absent system memory/load/network series fall back to raw
     /// node-exporter gauges and interface counters in SQL. Existing OTel values,
@@ -693,8 +655,6 @@ impl SearchService {
         offset: u32,
         limit: Option<u32>,
     ) -> Result<(Vec<serde_json::Value>, usize), SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
@@ -802,8 +762,6 @@ impl SearchService {
         series_step_secs: u64,
         filters: &RumFilters<'_>,
     ) -> Result<serde_json::Value, SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
@@ -824,12 +782,7 @@ impl SearchService {
         };
 
         // Page views + JS errors, bucketed.
-        let series_sql = rum_pageviews_series_sql(
-            time_range,
-            series_step_secs,
-            filters,
-            self.table_names.is_clustered(),
-        );
+        let series_sql = rum_pageviews_series_sql(time_range, series_step_secs, filters, self.table_names.is_clustered());
         debug!("OTEL RUM page-views series SQL: {}", series_sql);
         let series_rows = ch_executor.execute_sql_to_json(&series_sql).await?;
         let mut page_views: i64 = 0;
@@ -846,8 +799,7 @@ impl SearchService {
         }
 
         // Top pages with per-page p75 LCP.
-        let top_pages_sql =
-            rum_top_pages_sql(time_range, None, filters, self.table_names.is_clustered());
+        let top_pages_sql = rum_top_pages_sql(time_range, None, filters, self.table_names.is_clustered());
         debug!("OTEL RUM top-pages SQL: {}", top_pages_sql);
         let top_rows = ch_executor.execute_sql_to_json(&top_pages_sql).await?;
         let top_pages: Vec<serde_json::Value> = top_rows
@@ -863,8 +815,7 @@ impl SearchService {
             .collect();
 
         // Recent JS-error sample.
-        let errors_sql =
-            rum_recent_errors_sql(time_range, None, filters, self.table_names.is_clustered());
+        let errors_sql = rum_recent_errors_sql(time_range, None, filters, self.table_names.is_clustered());
         debug!("OTEL RUM recent-errors SQL: {}", errors_sql);
         let error_rows = ch_executor.execute_sql_to_json(&errors_sql).await?;
         let recent_errors: Vec<serde_json::Value> = error_rows
@@ -908,14 +859,6 @@ impl SearchService {
         &self,
         time_range: &TimeRange,
     ) -> Result<std::collections::HashMap<String, serde_json::Value>, SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
-        if let Some(client) = self.otel_lake.as_ref() {
-            return client
-                .synthetic_summary(time_range)
-                .await
-                .map_err(SearchError::ServiceUnavailable);
-        }
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
@@ -961,22 +904,13 @@ impl SearchService {
         time_range: &TimeRange,
         limit: Option<u32>,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
-        if let Some(client) = self.otel_lake.as_ref() {
-            return client
-                .synthetic_history(check_id, time_range, limit.unwrap_or(90).clamp(1, 365))
-                .await
-                .map_err(SearchError::ServiceUnavailable);
-        }
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
             ))
         })?;
 
-        let sql =
-            synthetic_history_sql(check_id, time_range, limit, self.table_names.is_clustered());
+        let sql = synthetic_history_sql(check_id, time_range, limit, self.table_names.is_clustered());
         debug!("OTEL synthetic-history SQL: {}", sql);
         let rows = ch_executor.execute_sql_to_json(&sql).await?;
 
@@ -1044,8 +978,6 @@ impl SearchService {
         limit: Option<u32>,
         scope: &ScopeSet,
     ) -> Result<(usize, usize, u64, Vec<serde_json::Value>), SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
-        let time_range = &retention_range;
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
@@ -1053,8 +985,7 @@ impl SearchService {
         })?;
 
         // 1) Resolve the service's distinct entities (src_ip + host).
-        let entities_sql =
-            service_entities_sql(service, time_range, self.table_names.is_clustered());
+        let entities_sql = service_entities_sql(service, time_range, self.table_names.is_clustered());
         debug!("OTEL service-entities SQL: {}", entities_sql);
         let entity_rows = ch_executor.execute_sql_to_json(&entities_sql).await?;
         let entities: Vec<String> = entity_rows
@@ -1116,8 +1047,8 @@ impl SearchService {
                 let entity = json_str(row, "risk_entity");
                 // Map the matched entity to src_ip when it parses as an IP (or is
                 // in the resolved ip set), else to src_host.
-                let is_ip =
-                    ip_set.contains(entity.as_str()) || entity.parse::<std::net::IpAddr>().is_ok();
+                let is_ip = ip_set.contains(entity.as_str())
+                    || entity.parse::<std::net::IpAddr>().is_ok();
                 let (src_ip, src_host) = if is_ip {
                     (
                         serde_json::Value::String(entity.clone()),
@@ -1252,25 +1183,13 @@ fn json_bool(row: &serde_json::Value, key: &str) -> bool {
     }
 }
 
-fn is_background_service(service: &str) -> bool {
-    let lower = service.to_ascii_lowercase();
-    let mut tokens = lower.rsplit(['-', '_', '.']);
-    let last = tokens.next().unwrap_or("");
-    let role = if !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()) {
-        tokens.next().unwrap_or("")
-    } else { last };
-    matches!(role, "job" | "jobs" | "scheduler" | "schedulers")
-}
-
 /// Service-health classification from the RED signals (NAN-1536), mirroring the
 /// design's `healthOf` thresholds (obs-data.jsx) re-expressed against the
 /// contract's fractional `error_rate` (the design used whole-percent `errPct`):
 ///   - `bad`  — error_rate ≥ 5% OR p95 ≥ 1000 ms
 ///   - `warn` — error_rate ≥ 1% OR p95 ≥ 600 ms
 ///   - `good` — otherwise
-fn service_health(service: &str, error_rate: f64, p95_ms: f64) -> &'static str {
-    // Background jobs have no implicit latency objective. Error thresholds still apply.
-    let p95_ms = if is_background_service(service) { 0.0 } else { p95_ms };
+fn service_health(error_rate: f64, p95_ms: f64) -> &'static str {
     if error_rate >= 0.05 || p95_ms >= 1000.0 {
         "bad"
     } else if error_rate >= 0.01 || p95_ms >= 600.0 {
@@ -1335,87 +1254,5 @@ fn vital_or_null(row: &serde_json::Value, value_key: &str, count_key: &str) -> s
         serde_json::Value::Null
     } else {
         serde_json::json!(json_f64(row, value_key))
-    }
-}
-
-#[cfg(test)]
-mod child_span_tests {
-    use super::*;
-    use tracing::Instrument;
-    use tracing_subscriber::prelude::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[tokio::test]
-    async fn monitor_evaluation_exports_timed_child_and_preserves_scheduler_parent() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buf = [0_u8; 16384];
-            loop {
-                let n = stream.read(&mut buf).await.unwrap();
-                if n == 0 || buf[..n].windows(4).any(|v| v == b"\r\n\r\n") { break; }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            let body = "{\"series_key\":\"\",\"v\":3.0,\"row_count\":1}\n";
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
-        let config = crate::db::DualPoolConfig::with_auth(
-            "postgres://unused:unused@127.0.0.1:1/nanosiem", &format!("http://{address}"),
-            "nanosiem", "unused", "unused");
-        let pool = crate::db::DualPool::new_lake_control_plane(&config).await.unwrap();
-        let mut service = SearchService::with_dual_pool_and_profile_unrouted(
-            &pool, std::sync::Arc::new(crate::schema::UdmProfile::new()));
-        service.otel_lake = None;
-        service.ch_executor = Some(ClickHouseExecutor::new(pool.clickhouse().clone()
-            .with_compression(clickhouse::Compression::None)));
-        let (layer, mut rx) = crate::telemetry::OtlpTraceLayer::capture_for_test(1);
-        let subscriber = tracing_subscriber::registry().with(layer);
-        use tracing::instrument::WithSubscriber;
-        async move {
-            let query = MetricQuery { metric_name: "test_metric", service_name: None,
-                agg: crate::query::MetricAgg::Avg, group_by: None, filters: &[], step_secs: 60 };
-            let now = chrono::Utc::now();
-            let range = TimeRange { start: now - chrono::Duration::minutes(1), end: now };
-            let root = tracing::info_span!("scheduler.metric_monitor");
-            // The shared spawn wrapper must retain the active scheduler span.
-            let result = async move {
-                tokio::spawn(crate::search::request_actor::inherit(async move {
-                    service.evaluate_metric_monitor(&query, &range).await
-                })).await.unwrap()
-            }.instrument(root).await.unwrap();
-            assert_eq!(result.len(), 1);
-            assert_eq!(result[0].1, Some(3.0));
-        }.with_subscriber(subscriber).await;
-        server.await.unwrap();
-        let mut spans = Vec::new();
-        while let Ok(span) = rx.try_recv() { spans.push(span); }
-        let root = spans.iter().find(|s| s.name == "scheduler.metric_monitor").unwrap();
-        let evaluation = spans.iter().find(|s| s.name == "evaluate_metric_monitor").unwrap();
-        let child = spans.iter().find(|s| s.name == "db.clickhouse.execute").unwrap();
-        assert_eq!(evaluation.parent_span_id, root.span_id);
-        assert_eq!(child.parent_span_id, evaluation.span_id);
-        assert_eq!(child.trace_id, root.trace_id);
-        assert!(child.end_time_unix_nano > child.start_time_unix_nano);
-        assert!(child.attributes.iter().any(|a| a.key == "db.response.rows"));
-        assert!(child.attributes.iter().any(|a| a.key == "db.response.bytes"));
-    }
-}
-
-#[cfg(test)]
-mod background_health_tests {
-    use super::*;
-    #[test]
-    fn background_latency_does_not_change_error_health() {
-        for name in ["lake-jobs", "scheduler", "tenant.scheduler.2", "JOBS"] {
-            assert!(is_background_service(name));
-            assert_eq!(service_health(name, 0.0, 5000.0), "good");
-        }
-        for name in ["jobs-api", "jobs-search", "myjobs", "api"] { assert!(!is_background_service(name)); }
-        assert_eq!(service_health("jobs", 0.05, 5000.0), "bad");
-        assert_eq!(service_health("jobs", 0.01, 5000.0), "warn");
-        assert_eq!(service_health("api", 0.0, 5000.0), "bad");
-
     }
 }

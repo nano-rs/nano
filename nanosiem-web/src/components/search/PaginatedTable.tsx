@@ -6,10 +6,9 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, BookOpen, ArrowUp, ArrowDown, ArrowUpDown, Info, Copy, Check, Table, Download } from 'lucide-react';
 import { IpIdentityPopover } from './IpIdentityPopover';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
+import { SEMANTIC_FIELDS, semanticFieldsFor } from '@/lib/schema-fields';
 import { cn, isClickHouseDefault } from '@/lib/utils';
 import { isPrevalenceSentinelField, prevalenceSentinelLabel } from '@/lib/prevalence-sentinels';
-import { localResultStart } from '@/lib/durable-result-paging';
-import { formatCellValue as formatCellValueShared } from '@/lib/format-cell-value';
 
 /** Try to coerce a value into a numeric array for sparkline rendering.
  *  Handles: native arrays, JSON-encoded strings like "[1,2,3]", and
@@ -212,6 +211,10 @@ function getAiVerdictRowClass(fields: Record<string, unknown>): string {
   return '';
 }
 
+function isUdmColumn(k: string): boolean {
+  return semanticFieldsFor(k).some((c) => (SEMANTIC_FIELDS[c].udm as readonly string[]).includes(k));
+}
+
 /** Classify a field name into a color category. The mapping is by name (or
  *  suffix) rather than value type, so `event.action` colors the same as `action`
  *  and `dest_user` colors the same as `user`. One "hero" (verb) + muted time +
@@ -226,6 +229,15 @@ function getFieldColorClass(columnKey: string): string {
   if (/^(_?time|timestamp|_?received|first_seen|last_seen|event_time|occurred_at)$/.test(tail)) {
     return 'text-muted-foreground/70';
   }
+  // NAN-4903: OCSF dotted columns whose tail is generic (`actor.user.name`,
+  // `file.hashes.value`, `activity_name`) classify through the field map.
+  // UDM column names (and names shared with UDM, like `status`) keep the
+  // name-based rules below, so UDM coloring is unchanged.
+  const concepts = isUdmColumn(k) ? [] : semanticFieldsFor(k);
+  if (concepts.some((c) => c === 'eventType' || c === 'authResult')) return 'text-primary';
+  if (concepts.some((c) => c === 'srcIp' || c === 'destIp' || c === 'deviceIp')) return 'text-[var(--chart-2)]';
+  if (concepts.some((c) => c === 'fileHash' || c === 'processHash')) return 'text-[var(--chart-3)]';
+  if (concepts.some((c) => c === 'user' || c === 'srcUser' || c === 'destUser')) return 'text-[var(--chart-4)]';
   // Enum verbs — the single "hero" column that anchors the scan.
   if (/^(event_type|action|verb|method|method_detail|auth_result|result|outcome)$/.test(tail)) {
     return 'text-primary';
@@ -243,8 +255,6 @@ interface PaginatedTableProps {
   totalCount: number;
   currentPage: number;
   pageSize: number;
-  /** Absolute row offset represented by results[0] for durable artifact pages. */
-  resultRowOffset?: number;
   onPageChange?: (page: number) => void;
   onPageSizeChange?: (size: number) => void;
   onDrilldown?: (filters: Record<string, unknown>) => void;
@@ -296,7 +306,6 @@ export function PaginatedTable({
   totalCount,
   currentPage,
   pageSize,
-  resultRowOffset = 0,
   onPageChange,
   onPageSizeChange,
   onDrilldown,
@@ -491,7 +500,10 @@ export function PaginatedTable({
     if (fieldName && isPrevalenceSentinelField(fieldName, value)) {
       return prevalenceSentinelLabel(fieldName, value) ?? '-';
     }
-    return formatCellValueShared(value);
+    if (typeof value === 'object') {
+      return JSON.stringify(value);
+    }
+    return String(value);
   };
 
   // Pagination — use local result count so client-side pagination works
@@ -504,9 +516,7 @@ export function PaginatedTable({
   const canGoNext = currentPage < totalPages - 1;
 
   // Only render the current page's rows — avoids dumping thousands of DOM nodes
-  const absoluteStart = currentPage * pageSize;
-  const localStart = localResultStart(absoluteStart, resultRowOffset);
-  const pageRows = flattenedResults.slice(localStart, localStart + pageSize);
+  const pageRows = flattenedResults.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
 
   const handleResizeStart = (columnKey: string, event: React.PointerEvent<HTMLSpanElement>) => {
     event.preventDefault();

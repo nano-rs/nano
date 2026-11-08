@@ -39,8 +39,12 @@ export function usePipePivt(sourceId: string, workspace: Workspace) {
   const available = reason === null;
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
 
-  const { pipeline, draft, frozen, samples, preview, previewError, permissions, changeDraft } = workspace;
-  const sample = frozen ?? samples[0] ?? null;
+  const { pipeline, draft, sample: savedSample, tap, preview, previewError, permissions, changeDraft } = workspace;
+  // A saved sample wins; otherwise the live tap's events (NAN-4919).
+  const sample = useMemo(
+    () => savedSample ?? (tap.events.length ? { name: 'Live tap', events: tap.events } : null),
+    [savedSample, tap.events],
+  );
   const snapshot = useMemo<PivtPipeSnapshot | null>(
     () =>
       pipeline && draft

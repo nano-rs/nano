@@ -5,6 +5,8 @@
 import type {
   Feedback,
   CreateFeedbackRequest,
+  UpdateFeedbackRequest,
+  FeedbackListResponse,
 } from '@/lib/api/types';
 
 const ENTERPRISE_ONLY = (): Promise<never> =>
@@ -18,6 +20,20 @@ export class FeedbackApi {
   }
 
   createFeedback(_request: CreateFeedbackRequest): Promise<Feedback> {
+    return ENTERPRISE_ONLY();
+  }
+  updateFeedback(_id: string, _request: UpdateFeedbackRequest): Promise<Feedback> {
+    return ENTERPRISE_ONLY();
+  }
+  deleteFeedback(_id: string): Promise<{ success: boolean }> {
+    return ENTERPRISE_ONLY();
+  }
+  listFeedback(_options?: {
+    category?: string;
+    status?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<FeedbackListResponse> {
     return ENTERPRISE_ONLY();
   }
 }

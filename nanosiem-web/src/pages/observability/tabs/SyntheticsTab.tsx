@@ -25,8 +25,6 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { UptimeBar } from '@/components/observability/UptimeBar';
 import { SyntheticEditorDialog } from '@/components/observability/SyntheticEditorDialog';
 import { cn } from '@/lib/utils';
-import { useIngestGate } from '@/hooks/use-capabilities';
-import { TenzirOnlyNote, TENZIR_ONLY_NOTE } from '@/components/add-data/TenzirOnlyNote';
 import type { ObservabilityTabProps } from '../types';
 
 type SynStatus = 'up' | 'degraded' | 'down' | 'nodata';
@@ -63,9 +61,6 @@ const fmtMs = (v: number | null): string =>
 const fmtUptime = (v: number | null): string => (v == null ? '–' : `${v.toFixed(2)}%`);
 
 export function SyntheticsTab(_props: ObservabilityTabProps) {
-  // NAN-3844: check results are delivered through Vector; an
-  // `install.sh --tenzir` install has none. Existing checks can be deleted.
-  const { tenzirOnly, blocked } = useIngestGate();
   const [checks, setChecks] = useState<SyntheticCheck[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -174,15 +169,11 @@ export function SyntheticsTab(_props: ObservabilityTabProps) {
         {down > 0 && <span className="font-mono text-[11px] text-danger">{down} down</span>}
         <span className="text-[11px] text-fg-4">· sorted by uptime</span>
         <div className="flex-1" />
-        {!blocked && (
-          <Button size="sm" className="h-7 gap-1.5 text-[11.5px]" onClick={openCreate}>
-            <Plus className="h-[13px] w-[13px]" />
-            New check
-          </Button>
-        )}
+        <Button size="sm" className="h-7 gap-1.5 text-[11.5px]" onClick={openCreate}>
+          <Plus className="h-[13px] w-[13px]" />
+          New check
+        </Button>
       </div>
-
-      {tenzirOnly && <TenzirOnlyNote />}
 
       {error != null && (
         <div className="flex items-center gap-2 rounded-lg border border-danger/30 bg-danger/[0.06] px-3.5 py-2.5 text-[12px] text-danger">
@@ -229,12 +220,10 @@ export function SyntheticsTab(_props: ObservabilityTabProps) {
         <div className="flex flex-col items-center gap-3 py-12 text-center">
           <Radar className="h-6 w-6 text-fg-4" />
           <span className="text-[12.5px] text-fg-3">No synthetic checks defined yet.</span>
-          {!blocked && (
-            <Button size="sm" className="h-7 gap-1.5 text-[11.5px]" onClick={openCreate}>
-              <Plus className="h-[13px] w-[13px]" />
-              Create your first check
-            </Button>
-          )}
+          <Button size="sm" className="h-7 gap-1.5 text-[11.5px]" onClick={openCreate}>
+            <Plus className="h-[13px] w-[13px]" />
+            Create your first check
+          </Button>
         </div>
       ) : sorted.length > 0 ? (
         <div className="rounded-lg border border-border bg-card overflow-hidden">
@@ -308,7 +297,7 @@ export function SyntheticsTab(_props: ObservabilityTabProps) {
                   <Switch
                     className="h-4 w-7"
                     checked={c.enabled}
-                    disabled={togglingId === c.id || blocked}
+                    disabled={togglingId === c.id}
                     onCheckedChange={(v) => void handleToggle(c, v)}
                     aria-label={c.enabled ? 'Pause check' : 'Resume check'}
                     title={c.enabled ? 'Pause check' : 'Resume check'}
@@ -316,9 +305,8 @@ export function SyntheticsTab(_props: ObservabilityTabProps) {
                   <div className="flex items-center gap-1">
                     <button
                       onClick={() => openEdit(c)}
-                      disabled={blocked}
-                      className="inline-flex items-center rounded p-1 text-fg-3 hover:bg-fg/5 hover:text-fg disabled:opacity-40 disabled:pointer-events-none"
-                      title={tenzirOnly ? TENZIR_ONLY_NOTE : 'Edit check'}
+                      className="inline-flex items-center rounded p-1 text-fg-3 hover:bg-fg/5 hover:text-fg"
+                      title="Edit check"
                     >
                       <Pencil className="h-[12px] w-[12px]" />
                     </button>

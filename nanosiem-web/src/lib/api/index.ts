@@ -1,5 +1,3 @@
-import { ConnectorFeedsApi } from './connector-feeds';
-import { SourceOnboardingApi } from './source-onboarding';
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
@@ -13,15 +11,15 @@ import { SourceOnboardingApi } from './source-onboarding';
  */
 
 import { getServiceUrl, API_BASE_URL } from './utils';
+import { getAccessToken as getInMemoryToken } from '../auth-token';
 import { sessionCredentials } from '../session-credentials';
 import { authenticatedFetch } from '../authenticated-fetch';
-import { tenantAppHref } from '../tenant-auth-shell';
-import { getAccessToken as getInMemoryToken } from '../auth-token';
 import { AuthApi } from './auth';
 import { SearchApi } from './search';
 import { ObservabilityApi } from './observability';
 import { DetectionsApi } from './detections';
 import { CredentialsApi } from './credentials';
+import { ConnectorFeedsApi } from './connector-feeds';
 import { MelodApi } from '@/enterprise/api/melod';
 import { CoreApi } from './core';
 import { TuningAPI } from '@/enterprise/api/tuning';
@@ -30,53 +28,46 @@ import { QueuesApi } from '@/enterprise/api/queues';
 import { IncidentsApi } from '@/enterprise/api/incidents';
 import { NotebooksApi } from '@/enterprise/api/notebooks';
 import { LogSourcesApi } from './log-sources';
-import { PipelinesApi } from './pipelines';
 import { SourceConfigsApi } from './source-configs';
 import { SourceScopesApi } from './source-scopes';
-import { SourceVisibilityApi } from './source-visibility';
 import { AccessControlApi } from './access-control';
 import { DashboardsApi } from './dashboards';
 import { StorageApi } from './storage';
 import { RiskApi } from '@/enterprise/api/risk';
+import { IocListsApi } from '@/enterprise/api/ioc-lists';
+import { ThreatIntelApi } from '@/enterprise/api/threat-intel';
+import { SoarApi } from '@/enterprise/api/soar';
+import { InternalDomainsApi } from './internal-domains';
 import { RiskWatchlistsApi } from '@/enterprise/api/risk-watchlists';
 import { NotificationsApi } from './notifications';
 import { FeedbackApi } from '@/enterprise/api/feedback';
 import { EnrichmentApi } from './enrichment';
 import { IdentityApi } from './identity';
 import { CustomEnrichmentApi } from '@/enterprise/api/custom-enrichment';
-import { PrevalenceApi, leanPrevalencePath } from './prevalence';
+import { PrevalenceApi } from './prevalence';
 import { UploadApi } from './upload';
 import { LookupTablesApi } from './lookup-tables';
-import { IocListsApi } from './ioc-lists';
-import { AiTierApi } from './ai-tier';
-import { InternalDomainsApi } from './internal-domains';
-import { AiTuningApi } from './ai-tuning';
 import { AuditApi } from './audit';
+import { AiTuningApi } from './ai-tuning';
 import { ContextApi } from './context';
 import { RuleRepositoriesApi } from './rule-repositories';
 import { DetectionCodeTargetsApi } from './detection-code-targets';
 import { ParserRepositoriesApi } from './parser-repositories';
 import { WebhooksApi } from './webhooks';
-import { PullSourcesApi } from './pull-sources';
 import { MarketplaceApi } from './marketplace';
-import { LookupUrlAllowlistApi } from './lookup-url-allowlist';
-import { SoarApi } from './soar';
-import { ThreatIntelApi } from './threat-intel';
 import { IntegrationsApi } from './integrations';
 import { GdprApi } from './gdpr';
 import { TierApi } from './tier';
 import { IpAllowlistApi } from './ip-allowlist';
 import { IngestTokensApi } from './ingest-tokens';
-import { LandingSourcesApi } from './landing-sources';
+import { LogSourceConnectApi } from './log-source-connect';
 import { OnboardingApi } from './onboarding';
 import { DemoApi } from './demo';
 import { SiemHealthApi } from './siem-health';
 import { SystemHealthApi } from './system-health';
 import { PlaybooksApi } from '@/enterprise/api/playbooks';
 import { ReportsApi } from './reports';
-import { browserTenantRuntime } from '../tenant-runtime';
-import { withLockContentionRetry } from './lock-contention-retry';
-import { normalizeErrorBody } from './http-error';
+import { PipelinesApi } from './pipelines';
 
 // Re-export types
 export * from './types';
@@ -95,6 +86,31 @@ export interface LicenseStatusResponse {
    * here; treat `airgap || enforcement_enabled` as "enforced" (NAN-1222).
    */
   airgap?: boolean;
+  mode: 'hosted' | 'offline' | 'unconfigured';
+  runtime_state?: 'running' | 'renewal_due' | 'grace' | 'shut_off' | 'refused' | 'legacy_upgrade_grace';
+  installation_id?: string;
+  organization_id?: string;
+  installation_fingerprint?: string;
+  license_id?: string;
+  license_type?: 'production' | 'evaluation' | 'legacy_offline';
+  revision?: number;
+  valid_from?: string;
+  recovery_epoch: number;
+  recovery_required: boolean;
+  components: string[];
+  notice?: string;
+}
+
+export interface ClockRecoveryRequest {
+  schema_version: number;
+  installation_id: string;
+  organization_id: string;
+  installation_fingerprint: string;
+  request_nonce: string;
+  stuck_floor_unix_seconds: number;
+  host_now_unix_seconds: number;
+  license_sha256: string;
+  recovery_epoch: number;
 }
 export type {
   MarketplaceCatalogEntry, EnrichmentMarketplaceRepo, CatalogStats,
@@ -128,11 +144,14 @@ export interface CacheMeta {
 
 /** Per-call cache controls threaded down to the low-level request. */
 export interface CacheRequestOpts {
+  /** Aborts the request (e.g. a superseded search run's companions). */
   signal?: AbortSignal;
   /** Invoked with the server cache status parsed from response headers. */
   onMeta?: (meta: CacheMeta) => void;
   /** When true, send `x-nano-cache-bypass: 1` so the server recomputes live (refresh). */
   bypass?: boolean;
+  /** Client timeout override in ms (default 60 s), for requests that block longer by design. */
+  timeoutMs?: number;
 }
 
 /** Parse the cache-status headers off a fetch Response. */
@@ -163,7 +182,9 @@ export class ApiClientError extends Error {
     public code: string,
     public details?: unknown,
     /** HTTP status code, when the error originated from an HTTP response. */
-    public status?: number
+    public status?: number,
+    /** Seconds from a 429/503 `Retry-After` header, when the server sent one. */
+    public retryAfter?: number
   ) {
     super(message);
     this.name = 'ApiClientError';
@@ -174,7 +195,6 @@ export class ApiClientError extends Error {
  * Main API client that provides access to all API endpoints
  */
 class ApiClient {
-  readonly connectorFeeds: ConnectorFeedsApi;
   private baseUrl: string;
   private authFailureCallback: (() => void) | null = null;
   private refreshCallback: (() => Promise<boolean>) | null = null;
@@ -184,8 +204,8 @@ class ApiClient {
   private _search: SearchApi;
   private _observability: ObservabilityApi;
   private _detections: DetectionsApi;
-  readonly sourceOnboarding: SourceOnboardingApi;
   private _credentials: CredentialsApi;
+  private _connectorFeeds: ConnectorFeedsApi;
   private _melod: MelodApi;
   private _core: CoreApi;
   private _tuning: TuningAPI;
@@ -194,14 +214,16 @@ class ApiClient {
   private _incidents: IncidentsApi;
   private _notebooks: NotebooksApi;
   private _logSources: LogSourcesApi;
-  private _pipelines: PipelinesApi;
   private _sourceConfigs: SourceConfigsApi;
   private _sourceScopes: SourceScopesApi;
-  private _sourceVisibility: SourceVisibilityApi;
   private _accessControl: AccessControlApi;
   private _dashboards: DashboardsApi;
   private _storage: StorageApi;
   private _risk: RiskApi;
+  private _iocLists: IocListsApi;
+  private _threatIntel: ThreatIntelApi;
+  private _soar: SoarApi;
+  private _internalDomains: InternalDomainsApi;
   private _riskWatchlists: RiskWatchlistsApi;
   private _notifications: NotificationsApi;
   private _feedback: FeedbackApi;
@@ -211,36 +233,29 @@ class ApiClient {
   private _prevalence: PrevalenceApi;
   private _upload: UploadApi;
   private _lookupTables: LookupTablesApi;
-  private _iocLists: IocListsApi;
-  private _aiTier: AiTierApi;
-  private _internalDomains: InternalDomainsApi;
-  private _aiTuning: AiTuningApi;
   private _audit: AuditApi;
+  private _aiTuning: AiTuningApi;
   private _context: ContextApi;
   private _ruleRepositories: RuleRepositoriesApi;
   private _detectionCodeTargets: DetectionCodeTargetsApi;
   private _parserRepositories: ParserRepositoriesApi;
   private _webhooks: WebhooksApi;
   private _marketplace: MarketplaceApi;
-  private _pullSources: PullSourcesApi;
-  private _lookupUrlAllowlist: LookupUrlAllowlistApi;
-  private _soar: SoarApi;
-  private _threatIntel: ThreatIntelApi;
   private _integrations: IntegrationsApi;
   private _gdpr: GdprApi;
   private _tier: TierApi;
   private _ipAllowlist: IpAllowlistApi;
   private _ingestTokens: IngestTokensApi;
-  private _landingSources: LandingSourcesApi;
+  private _logSourceConnect: LogSourceConnectApi;
   private _onboarding: OnboardingApi;
   private _demo: DemoApi;
   private _siemHealth: SiemHealthApi;
   private _systemHealth: SystemHealthApi;
   private _playbooks: PlaybooksApi;
   private _reports: ReportsApi;
+  private _pipelines: PipelinesApi;
 
   constructor(baseUrl: string = API_BASE_URL) {
-    this.connectorFeeds = new ConnectorFeedsApi(this.request.bind(this));
     this.baseUrl = baseUrl;
 
     // Initialize route modules with the request function
@@ -262,8 +277,8 @@ class ApiClient {
       (metricName, key, timeRange) => this._search.listMetricTags(metricName, key, timeRange)
     );
     this._detections = new DetectionsApi(this.request.bind(this));
-    this.sourceOnboarding = new SourceOnboardingApi(this.request.bind(this), this.requestRaw.bind(this));
     this._credentials = new CredentialsApi(this.request.bind(this));
+    this._connectorFeeds = new ConnectorFeedsApi(this.request.bind(this));
     this._melod = new MelodApi(
       this.request.bind(this),
       this.getAccessToken.bind(this),
@@ -280,14 +295,16 @@ class ApiClient {
       this.baseUrl
     );
     this._logSources = new LogSourcesApi(this.request.bind(this));
-    this._pipelines = new PipelinesApi(this.request.bind(this));
     this._sourceConfigs = new SourceConfigsApi(this.request.bind(this));
     this._sourceScopes = new SourceScopesApi(this.request.bind(this));
-    this._sourceVisibility = new SourceVisibilityApi(this.request.bind(this));
     this._accessControl = new AccessControlApi(this.request.bind(this));
     this._dashboards = new DashboardsApi(this.request.bind(this));
     this._storage = new StorageApi(this.request.bind(this));
     this._risk = new RiskApi(this.request.bind(this));
+    this._iocLists = new IocListsApi(this.request.bind(this));
+    this._threatIntel = new ThreatIntelApi(this.request.bind(this));
+    this._soar = new SoarApi(this.request.bind(this));
+    this._internalDomains = new InternalDomainsApi(this.request.bind(this));
     this._riskWatchlists = new RiskWatchlistsApi(this.request.bind(this));
     this._notifications = new NotificationsApi(this.request.bind(this));
     this._feedback = new FeedbackApi(this.request.bind(this));
@@ -297,66 +314,72 @@ class ApiClient {
     this._prevalence = new PrevalenceApi(this.request.bind(this));
     this._upload = new UploadApi(this.request.bind(this), this.getAccessToken.bind(this));
     this._lookupTables = new LookupTablesApi(this.request.bind(this), this.getAccessToken.bind(this));
-    this._iocLists = new IocListsApi(this.request.bind(this));
-    this._aiTier = new AiTierApi(this.request.bind(this));
-    this._internalDomains = new InternalDomainsApi(this.request.bind(this));
+    this._audit = new AuditApi(this.request.bind(this), this.requestRaw.bind(this));
     this._aiTuning = new AiTuningApi(this.request.bind(this));
-    this._audit = new AuditApi(this.request.bind(this));
     this._context = new ContextApi(this.request.bind(this));
     this._ruleRepositories = new RuleRepositoriesApi(this.request.bind(this));
     this._detectionCodeTargets = new DetectionCodeTargetsApi(this.request.bind(this));
     this._parserRepositories = new ParserRepositoriesApi(this.request.bind(this));
     this._webhooks = new WebhooksApi(this.request.bind(this));
     this._marketplace = new MarketplaceApi(this.request.bind(this));
-    this._pullSources = new PullSourcesApi(this.request.bind(this));
-    this._lookupUrlAllowlist = new LookupUrlAllowlistApi(this.request.bind(this));
-    this._soar = new SoarApi(this.request.bind(this));
-    this._threatIntel = new ThreatIntelApi(this.request.bind(this));
     this._integrations = new IntegrationsApi(this.request.bind(this));
     this._gdpr = new GdprApi(this.request.bind(this));
     this._tier = new TierApi(this.request.bind(this));
     this._ipAllowlist = new IpAllowlistApi(this.request.bind(this));
     this._ingestTokens = new IngestTokensApi(this.request.bind(this));
-    this._landingSources = new LandingSourcesApi(this.request.bind(this));
+    this._logSourceConnect = new LogSourceConnectApi(this.request.bind(this));
     this._onboarding = new OnboardingApi(this.request.bind(this));
     this._demo = new DemoApi(this.request.bind(this));
     this._siemHealth = new SiemHealthApi(this.request.bind(this));
     this._systemHealth = new SystemHealthApi(this.request.bind(this));
     this._playbooks = new PlaybooksApi(this.request.bind(this));
     this._reports = new ReportsApi(this.request.bind(this), this.getAccessToken.bind(this));
+    this._pipelines = new PipelinesApi(
+      this.request.bind(this),
+      // NAN-4919: a live tap blocks for its capture window (up to 60 s), past
+      // the default 60 s client timeout.
+      (endpoint, options, timeoutMs) => this.request(endpoint, options, { timeoutMs }),
+    );
   }
 
   // Expose modules for direct access when needed
-  get iocLists(): IocListsApi {
-    return this._iocLists;
-  }
-
   /** NAN-3228: weighted risk watchlists. */
   get riskWatchlists(): RiskWatchlistsApi {
     return this._riskWatchlists;
   }
 
-  /** NAN-3191: hosted-shared tenant AI cost/quality tier. */
-  get aiTier(): AiTierApi {
-    return this._aiTier;
-  }
-
-  /** NAN-3226: tenant internal DNS suffixes (internal hosts, not domains). */
+  /** NAN-3226: internal DNS suffixes (internal hosts, not domains). */
   get internalDomains(): InternalDomainsApi {
     return this._internalDomains;
   }
 
-  /** NAN-3219: tenant-wide AI tuning mode (on / manual / off). */
+  /** NAN-3219: deployment-wide AI tuning mode (on / manual / off). */
   get aiTuning(): AiTuningApi {
     return this._aiTuning;
   }
 
-  get pipelines(): PipelinesApi {
-    return this._pipelines;
-  }
-
   get auth(): AuthApi {
     return this._auth;
+  }
+
+  /** NAN-4914: connector pull feeds. */
+  get connectorFeeds(): ConnectorFeedsApi {
+    return this._connectorFeeds;
+  }
+
+  /** Code-free IOC lists (enterprise; the open build carries a rejecting stub). */
+  get iocLists(): IocListsApi {
+    return this._iocLists;
+  }
+
+  /** Threat-intel lookups + Enrich flyout (enterprise; the open build carries a rejecting stub). */
+  get threatIntel(): ThreatIntelApi {
+    return this._threatIntel;
+  }
+
+  /** SOAR automation (enterprise; the open build carries a rejecting stub). */
+  get soar(): SoarApi {
+    return this._soar;
   }
 
   get dashboards(): DashboardsApi {
@@ -395,15 +418,6 @@ class ApiClient {
     return this._marketplace;
   }
 
-  get pullSources(): PullSourcesApi {
-    return this._pullSources;
-  }
-
-  get lookupUrlAllowlist(): LookupUrlAllowlistApi { return this._lookupUrlAllowlist; }
-  /** Tenant SOAR opt-in (NAN-4462). */
-  get soar(): SoarApi { return this._soar; }
-  get threatIntel(): ThreatIntelApi { return this._threatIntel; }
-
   /** Integration collectors (NAN-2189) — instances of collector-category
    *  marketplace entries. Enterprise only; the routes 404 on open builds. */
   get integrations(): IntegrationsApi {
@@ -414,16 +428,16 @@ class ApiClient {
     return this._tier;
   }
 
-  get ipAllowlist(): IpAllowlistApi {
-    return this._ipAllowlist;
-  }
-
   get ingestTokens(): IngestTokensApi {
     return this._ingestTokens;
   }
 
-  get landingSources(): LandingSourcesApi {
-    return this._landingSources;
+  get logSourceConnect(): LogSourceConnectApi {
+    return this._logSourceConnect;
+  }
+
+  get ipAllowlist(): IpAllowlistApi {
+    return this._ipAllowlist;
   }
 
   get onboarding(): OnboardingApi {
@@ -454,13 +468,13 @@ class ApiClient {
     return this._reports;
   }
 
-  get sourceScopes(): SourceScopesApi {
-    return this._sourceScopes;
+  /** NAN-4919: Nano Pipe authoring (capabilities, preview, samples, live tap). */
+  get pipelines(): PipelinesApi {
+    return this._pipelines;
   }
 
-  /** Hosted-shared lake source visibility (NAN-2361 wave 8). */
-  get sourceVisibility(): SourceVisibilityApi {
-    return this._sourceVisibility;
+  get sourceScopes(): SourceScopesApi {
+    return this._sourceScopes;
   }
 
   private getAccessToken(): string | null {
@@ -482,8 +496,6 @@ class ApiClient {
     options: RequestInit = {},
     cacheOpts?: CacheRequestOpts
   ): Promise<T> {
-    if (cacheOpts?.signal) options = { ...options, signal: options.signal ? AbortSignal.any([options.signal, cacheOpts.signal]) : cacheOpts.signal };
-    const capturedRuntime = browserTenantRuntime.current();
     // Use service-aware routing for microservices architecture
     const serviceUrl = getServiceUrl(endpoint);
     const url = `${serviceUrl}${endpoint}`;
@@ -496,31 +508,53 @@ class ApiClient {
 
     // Set up timeout using AbortController (60s — AI ops are async jobs now)
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000);
+    const timeoutId = setTimeout(() => controller.abort(), cacheOpts?.timeoutMs ?? 60000);
+    // NAN-3299: a caller-supplied signal (RequestInit or cacheOpts) also aborts
+    // the request, so a superseded run's companions stop holding server
+    // admission permits.
+    const callerSignal = cacheOpts?.signal ?? options.signal ?? undefined;
+    const onCallerAbort = () => controller.abort();
+    if (callerSignal) {
+      if (callerSignal.aborted) controller.abort();
+      else callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+    }
 
     try {
-      const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
-      // NAN-3761: a read deferred by 503 RESOURCE_LOCK_CONTENTION is retried
-      // with backoff + jitter before any caller sees it.
-      const response = await withLockContentionRetry(options.method, () => authenticatedFetch(endpoint, url, {
+      // NAN-2453: waits for an in-flight refresh, never sends a protected
+      // request without a bearer, replays a 401 once with the replacement
+      // and expires the session once per tab on a second 401.
+      const response = await authenticatedFetch(endpoint, url, {
         ...options,
         headers,
-        signal,
-      }, () => browserTenantRuntime.assertCurrent(capturedRuntime), capturedRuntime.scope.kind === 'enterprise_shared'), signal);
+        signal: controller.signal,
+      });
 
       if (!response.ok) {
-        // NAN-4753: an edge/proxy error page (Cloudflare 524, NGINX 502) is
-        // HTML, not our JSON. Never surface it — describe it instead.
-        const error = normalizeErrorBody(response.status, await response.text().catch(() => ''), response.headers);
+        const errorBody = await response.json().catch(() => ({
+          error: {
+            code: 'UNKNOWN_ERROR',
+            message: response.statusText,
+          }
+        }));
+        // Handlers answer `{error: {code, message}}` or `{error: "<code>", message}`
+        // (e.g. credentials' 409 credential_in_use); keep the message either way.
+        const error = typeof errorBody.error === 'string'
+          ? { code: errorBody.error, message: errorBody.message, details: errorBody.details }
+          : errorBody.error || errorBody;
 
         // Handle IP_DENIED — redirect to deny page instead of login
         if (error.code === 'IP_DENIED' && typeof window !== 'undefined') {
-          window.location.href = tenantAppHref('/denied');
+          window.location.href = '/denied';
           // Throw to halt further execution
-          throw new ApiClientError(error.message ?? 'Access denied', 'IP_DENIED');
+          throw new ApiClientError(error.message, 'IP_DENIED');
         }
 
-        throw new ApiClientError(error.message || 'Request failed', error.code ?? 'UNKNOWN_ERROR', error.details, response.status);
+        const retryHeader = response.headers?.get?.('Retry-After');
+        const retryAfter = retryHeader ? Number(retryHeader) : NaN;
+        throw new ApiClientError(
+          error.message || 'Request failed', error.code, error.details, response.status,
+          Number.isFinite(retryAfter) ? retryAfter : undefined,
+        );
       }
 
       // NAN-1595: surface server cache status to the caller (badge driver).
@@ -531,49 +565,41 @@ class ApiClient {
         return undefined as T;
       }
 
-      const value = await response.json();
-      browserTenantRuntime.assertCurrent(capturedRuntime);
-      return value;
+      return response.json();
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
+        if (callerSignal?.aborted) throw new ApiClientError('Request aborted', 'ABORTED');
         throw new ApiClientError('Request timeout', 'TIMEOUT');
       }
       throw error;
     } finally {
       clearTimeout(timeoutId);
+      callerSignal?.removeEventListener('abort', onCallerAbort);
     }
   }
 
-  /** Fetch a non-JSON response through the same auth, refresh, routing, and
-   * error contract as request(). Used for authenticated durable downloads. */
-  private async requestRaw(
-    endpoint: string,
-    options: RequestInit = {},
-    timeoutMs = 60_000,
-  ): Promise<Response> {
-    const capturedRuntime = browserTenantRuntime.current();
-    const serviceUrl = getServiceUrl(endpoint);
-    const url = `${serviceUrl}${endpoint}`;
-    const headers: HeadersInit = { ...options.headers };
+  /** Fetch a non-JSON response (file downloads) with the same auth, 401
+   * refresh-and-retry, and error contract as request(). */
+  private async requestRaw(endpoint: string, options: RequestInit = {}): Promise<Response> {
+    const url = `${getServiceUrl(endpoint)}${endpoint}`;
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
+    const timeoutId = setTimeout(() => controller.abort(), 60000);
     try {
       const response = await authenticatedFetch(endpoint, url, {
         ...options,
-        headers,
-        signal: options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal,
-      }, () => browserTenantRuntime.assertCurrent(capturedRuntime), capturedRuntime.scope.kind === 'enterprise_shared');
+        signal: controller.signal,
+      });
       if (!response.ok) {
-        const error = normalizeErrorBody(response.status, await response.text().catch(() => ''), response.headers);
-        throw new ApiClientError(
-          error.message || 'Request failed',
-          error.code || 'UNKNOWN_ERROR',
-          error.details,
-          response.status,
-        );
+        const errorBody = await response.json().catch(() => ({
+          error: { code: 'UNKNOWN_ERROR', message: response.statusText },
+        }));
+        // Handlers answer `{error: {code, message}}` or `{error: "<code>", message}`
+        // (e.g. credentials' 409 credential_in_use); keep the message either way.
+        const error = typeof errorBody.error === 'string'
+          ? { code: errorBody.error, message: errorBody.message, details: errorBody.details }
+          : errorBody.error || errorBody;
+        throw new ApiClientError(error.message || 'Request failed', error.code, error.details, response.status);
       }
-      browserTenantRuntime.assertCurrent(capturedRuntime);
       return response;
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
@@ -707,41 +733,42 @@ class ApiClient {
     return this._search.cancelSearch(requestId);
   }
 
-  // Interactive admission and async search methods
-  async searchInteractive(request: Omit<import('./types').SearchRequest, 'async_mode'>, retry?: import('./search-authority-retry').AuthorityRetryOptions, onCacheMeta?: (meta: CacheMeta) => void): Promise<import('./types').SearchResponse | import('./types').AsyncSearchResponse> {
-    return onCacheMeta ? this._search.searchInteractive(request, retry, onCacheMeta) : this._search.searchInteractive(request, retry);
+  // Async search methods
+  async searchAsync(request: Omit<import('./types').SearchRequest, 'async_mode'>, signal?: AbortSignal): Promise<import('./types').AsyncSearchResponse> {
+    return this._search.searchAsync(request, signal);
   }
 
-  async searchHistogram(request: import('./types').SearchHistogramRequest, signal?: AbortSignal): Promise<import('./types').SearchHistogramResponse> {
-    return this._search.searchHistogram(request, signal);
+  /** NAN-3077: progressive-view opt-in for the Search page (see SearchApi.searchInteractive). */
+  async searchInteractive(
+    request: Omit<import('./types').SearchRequest, 'async_mode'>,
+    opts?: { acceptAsync?: boolean; signal?: AbortSignal },
+  ): Promise<import('./types').SearchResponse | import('./types').AsyncSearchResponse> {
+    return this._search.searchInteractive(request, opts);
   }
 
   async getTreePage(request: import('./types').TreePageRequest, signal?: AbortSignal): Promise<import('./types').TreePageResponse> {
     return this._search.getTreePage(request, signal);
   }
 
-  async searchAsync(request: Omit<import('./types').SearchRequest, 'async_mode'>, retry?: import('./search-authority-retry').AuthorityRetryOptions, signal?: AbortSignal): Promise<import('./types').AsyncSearchResponse> {
-    return this._search.searchAsync(request, retry, signal);
-  }
-
   searchStreamSSE(
     request: Omit<import('./types').SearchRequest, 'async_mode'>,
     callbacks: import('./types').SearchStreamCallbacks,
-    opts?: { bypass?: boolean; follow?: boolean }
+    opts?: { bypass?: boolean; acceptAsync?: boolean; progressive?: boolean }
   ): AbortController {
     return this._search.searchStreamSSE(request, callbacks, opts);
   }
 
-  async getSearchJob(jobId: string, retry?: import('./search-authority-retry').AuthorityRetryOptions, signal?: AbortSignal): Promise<import('./types').SearchJobStatus> {
-    return this._search.getSearchJob(jobId, retry, signal);
-  }
-
-  async getSearchJobResultPage(jobId: string, page: number, signal?: AbortSignal): Promise<import('./types').SearchJobResultPage> {
-    return this._search.getSearchJobResultPage(jobId, page, signal);
+  async getSearchJob(jobId: string): Promise<import('./types').SearchJobStatus> {
+    return this._search.getSearchJob(jobId);
   }
 
   async cancelSearchJob(jobId: string): Promise<{ cancelled: boolean }> {
     return this._search.cancelSearchJob(jobId);
+  }
+
+  // NAN-4915: continuation pages of a completed background search job.
+  async getSearchJobResults(jobId: string, offset: number, limit: number): Promise<import('./types').JobResultsPage> {
+    return this._search.getSearchJobResults(jobId, offset, limit);
   }
 
   // Paginated asset events (for infinite scroll and server-side filtering)
@@ -788,7 +815,7 @@ class ApiClient {
   async getRetro(
     request: import('./types').RetroRequest,
     cacheOpts?: CacheRequestOpts
-  ): Promise<import('./types').RetroResultResponse> {
+  ): Promise<import('./types').RetroResponse> {
     return this._search.getRetro(request, cacheOpts);
   }
 
@@ -883,12 +910,18 @@ class ApiClient {
     return this._detections.listRetroHuntRuns(id);
   }
 
-  async pauseDetection(id: string): Promise<import('./types').DetectionRule> {
-    return this._detections.pauseDetection(id);
+  async pauseDetection(
+    id: string,
+    expectedMode: import('./types').DetectionRule['mode'],
+  ): Promise<import('./types').DetectionRule> {
+    return this._detections.pauseDetection(id, expectedMode);
   }
 
-  async resumeDetection(id: string): Promise<import('./types').DetectionRule> {
-    return this._detections.resumeDetection(id);
+  async resumeDetection(
+    id: string,
+    expectedMode: import('./types').DetectionRule['mode'],
+  ): Promise<import('./types').DetectionRule> {
+    return this._detections.resumeDetection(id, expectedMode);
   }
 
   async testDetection(
@@ -910,12 +943,18 @@ class ApiClient {
     return this._detections.validateDetection(query, detectionMode);
   }
 
-  async promoteDetection(id: string): Promise<import('./types').DetectionRule> {
-    return this._detections.promoteDetection(id);
+  async promoteDetection(
+    id: string,
+    expectedMode: import('./types').DetectionRule['mode'],
+  ): Promise<import('./types').DetectionRule> {
+    return this._detections.promoteDetection(id, expectedMode);
   }
 
-  async demoteDetection(id: string): Promise<import('./types').DetectionRule> {
-    return this._detections.demoteDetection(id);
+  async demoteDetection(
+    id: string,
+    expectedMode: import('./types').DetectionRule['mode'],
+  ): Promise<import('./types').DetectionRule> {
+    return this._detections.demoteDetection(id, expectedMode);
   }
 
   async listRuleVersions(id: string): Promise<import('./types').RuleVersionResponse[]> {
@@ -943,7 +982,7 @@ class ApiClient {
     return this._detections.getFleetHealth();
   }
 
-  /** NAN-3064 — per-tenant detection scheduling lag. */
+  /** NAN-3064 — detection scheduling lag. */
   async getSchedulingLag(): Promise<import('./types').ScheduleLagSummary> {
     return this._detections.getSchedulingLag();
   }
@@ -1105,6 +1144,11 @@ class ApiClient {
     return this._melod.melodCreateParser(request);
   }
 
+  /** Start a parser-draft job (`Prefer: respond-async`, NAN-4912 P3). */
+  async melodCreateParserJob(request: import('./types').MelodCreateParserRequest): Promise<import('./types').MelodJobStartResponse> {
+    return this._melod.melodCreateParserJob(request);
+  }
+
   melodCreateParserStreaming(
     request: import('./types').MelodCreateParserRequest,
     onProgress: (event: import('./types').ParserProgressEvent) => void,
@@ -1141,19 +1185,17 @@ class ApiClient {
     return this._melod.melodEditParser(request);
   }
 
+  async fetchUrlForDetection(url: string): Promise<import('./types').FetchUrlForDetectionResponse> {
+    return this._melod.fetchUrlForDetection(url);
+  }
+
+  async generateDetectionHints(request: import('./types').GenerateDetectionHintsRequest): Promise<import('./types').MelodJobStartResponse> {
+    return this._melod.generateDetectionHints(request);
+  }
+
   // AI Providers (LiteLLM multi-provider support)
   async getAiAvailability(): Promise<import('./types').AiAvailability> {
     return this._melod.getAiAvailability();
-  }
-
-  async getTenantAiSettings(): Promise<import('./types').TenantAiSettings> {
-    return this._melod.getTenantAiSettings();
-  }
-
-  async updateTenantAiSettings(
-    request: import('./types').UpdateTenantAiSettingsRequest,
-  ): Promise<import('./types').TenantAiSettings> {
-    return this._melod.updateTenantAiSettings(request);
   }
 
   async listAiProviders(): Promise<import('./types').ProviderCredentials[]> {
@@ -1227,6 +1269,15 @@ class ApiClient {
 
   async getSystemConfig(): Promise<import('./types').SystemConfig> {
     return this._core.getSystemConfig();
+  }
+
+  // Developer Settings (Scheduler Control)
+  async getDeveloperSettings(): Promise<import('./types').DeveloperSettings> {
+    return this._core.getDeveloperSettings();
+  }
+
+  async updateDeveloperSettings(request: import('./types').UpdateDeveloperSettingsRequest): Promise<import('./types').DeveloperSettings> {
+    return this._core.updateDeveloperSettings(request);
   }
 
   // Tuning
@@ -1674,8 +1725,8 @@ class ApiClient {
     return this._logSources.toggleLogSource(id, enabled);
   }
 
-  async deployLogSource(id: string, ocsfSampleLogs?: string[], samples?: string[]): Promise<import('./types').SharedDeploymentResponse> {
-    return this._logSources.deployLogSource(id, ocsfSampleLogs, samples);
+  async deployLogSource(id: string): Promise<import('./types').EnhancedDeploymentResponse> {
+    return this._logSources.deployLogSource(id);
   }
 
   async undeployLogSource(id: string): Promise<import('./types').EnhancedDeploymentResponse> {
@@ -1686,12 +1737,8 @@ class ApiClient {
     return this._logSources.getLogSourceHealth(id);
   }
 
-  async getLogSourceStats(id: string, hours?: number): Promise<import('./types').TenantLogSourceStats> {
-    return this._logSources.getLogSourceStats(id, hours);
-  }
-
-  async getIngestionHistory(hours?: number): Promise<import('./types').IngestionHistoryPoint[]> {
-    return this._logSources.getIngestionHistory(hours);
+  async getIngestEndpoint(): Promise<import('./types').IngestEndpoint> {
+    return this._logSources.getIngestEndpoint();
   }
 
   async getHealthSeries(hours?: number): Promise<import('./types').LogSourceHealthSeries[]> {
@@ -1702,68 +1749,8 @@ class ApiClient {
     return this._logSources.getLogSourceHealthSeries(id, hours);
   }
 
-  // NAN-2361 hosted-shared tenants only
-  async getIngestEndpoint(): Promise<import('./types').TenantIngestEndpoint> {
-    return this._logSources.getIngestEndpoint();
-  }
-
-  async listIngestCredentials(): Promise<import('./types').TenantIngestCredentialList> {
-    return this._logSources.listIngestCredentials();
-  }
-
-  async getIngestCredentialRequest(requestId: string): Promise<import('./types').IngestCredentialReveal> {
-    return this._logSources.getIngestCredentialRequest(requestId);
-  }
-
-  async revealIngestCredential(requestId: string): Promise<import('./types').IngestCredentialReveal> {
-    return this._logSources.revealIngestCredential(requestId);
-  }
-
-  async assignIngestSource(credentialId: string, sourceSlug: string, label: string) {
-    return this._logSources.assignIngestSource(credentialId, sourceSlug, label);
-  }
-
-  async revokeIngestCredential(
-    credentialId: string,
-    reason: string,
-  ): Promise<import('./types').IngestCredentialRevocation> {
-    return this._logSources.revokeIngestCredential(credentialId, reason);
-  }
-
-  async getSenderTemplates(): Promise<import('./types').SenderTemplateCatalog> {
-    return this._logSources.getSenderTemplates();
-  }
-
-  async getLogSourceCredentials(id: string): Promise<import('./types').TenantSourceWriters> {
-    return this._logSources.getLogSourceCredentials(id);
-  }
-
-  async getSourceWriters(sourceSlug: string): Promise<import('./types').TenantSourceWriters> {
-    return this._logSources.getSourceWriters(sourceSlug);
-  }
-
-  async getIngestCredentialActivity(credentialId: string, hours?: number): Promise<import('./types').IngestCredentialActivity> {
-    return this._logSources.getIngestCredentialActivity(credentialId, hours);
-  }
-
-  async getIngestSourceActivity(sourceSlug: string, hours?: number): Promise<import('./types').IngestSourceActivity> {
-    return this._logSources.getIngestSourceActivity(sourceSlug, hours);
-  }
-
-  async requestIngestCredential(
-    input: import('./types').IngestCredentialRequestInput,
-  ): Promise<import('./types').TenantIngestCredentialRequest> {
-    return this._logSources.requestIngestCredential(input);
-  }
-
-  async precheckIngestCredential(
-    input: import('./types').IngestCredentialPrecheckInput,
-  ): Promise<import('./types').IngestCredentialPrecheck> {
-    return this._logSources.precheckIngestCredential(input);
-  }
-
-  async getIngestionObserved(hours?: number): Promise<import('./types').TenantIngestObservation> {
-    return this._logSources.getIngestionObserved(hours);
+  async getIngestionHistory(hours?: number): Promise<import('./types').IngestionHistoryPoint[]> {
+    return this._logSources.getIngestionHistory(hours);
   }
 
   async validateLogSource(id: string): Promise<import('./types').LogSourceVrlValidationResult> {
@@ -1778,10 +1765,8 @@ class ApiClient {
     vrlCode: string,
     sampleLog: string,
     extensionVrl?: string,
-    validateOcsf: boolean = false,
-    logSourceId?: string,
   ): Promise<import('./types').LogSourceTestResult> {
-    return this._logSources.testLogSourceVrl(vrlCode, sampleLog, extensionVrl, validateOcsf, logSourceId);
+    return this._logSources.testLogSourceVrl(vrlCode, sampleLog, extensionVrl);
   }
 
   async testLogSourceVrlLive(vrlCode: string, sourceType: string, currentVrl?: string, limit?: number): Promise<import('./types').LiveTestResult[]> {
@@ -1800,45 +1785,12 @@ class ApiClient {
     return this._logSources.getLogSourceVersions(id);
   }
 
-  async publishLogSource(id: string, samples?: string[]): Promise<import('./types').SharedDeploymentResponse> {
-    return this._logSources.publishLogSource(id, samples);
+  async publishLogSource(id: string, expectedUpdatedAt?: string): Promise<import('./types').EnhancedDeploymentResponse> {
+    return this._logSources.publishLogSource(id, expectedUpdatedAt);
   }
 
-  async revertLogSourceVersion(id: string, versionId: number): Promise<import('./types').SharedRevertResponse> {
+  async revertLogSourceVersion(id: string, versionId: number): Promise<import('./types').LogSourceVersion> {
     return this._logSources.revertLogSourceVersion(id, versionId);
-  }
-
-  // Parser-bundle rollouts (hosted-shared, NAN-2607)
-  async requestParserRollout(id: string, input?: { samples?: string[]; reason?: string }): Promise<import('./types').TenantParserRollout> {
-    return this._logSources.requestParserRollout(id, input);
-  }
-
-  async listLogSourceRollouts(id: string, limit?: number): Promise<import('./types').TenantParserRollout[]> {
-    return this._logSources.listLogSourceRollouts(id, limit);
-  }
-
-  async listParserRollouts(filter?: { states?: string[]; limit?: number }): Promise<import('./types').TenantParserRollout[]> {
-    return this._logSources.listParserRollouts(filter);
-  }
-
-  async getParserRollout(rolloutId: string): Promise<import('./types').TenantParserRollout> {
-    return this._logSources.getParserRollout(rolloutId);
-  }
-
-  async listParserBaseOffers(): Promise<import('./types').TenantParserBaseOffer[]> {
-    return this._logSources.listParserBaseOffers();
-  }
-
-  async mergeParserBaseOffer(offerId: string, reason?: string): Promise<import('./types').TenantParserRollout> {
-    return this._logSources.mergeParserBaseOffer(offerId, reason);
-  }
-
-  async getLogSourceSamples(id: string): Promise<import('./types').TenantParserSamples> {
-    return this._logSources.getLogSourceSamples(id);
-  }
-
-  async putLogSourceSamples(id: string, samples: string[]): Promise<import('./types').TenantParserSamples> {
-    return this._logSources.putLogSourceSamples(id, samples);
   }
 
   async validateNamespace(namespace: string): Promise<import('./types').NamespaceValidationResult> {
@@ -1956,58 +1908,6 @@ class ApiClient {
 
   async updateUser(id: string, request: import('./types').UpdateUserRequest): Promise<import('./types').UserDetail> {
     return this._accessControl.updateUser(id, request);
-  }
-
-  /** Hosted-shared tenant (NAN-2361): invite a member; the activation link is returned once. */
-  async inviteSharedTenantMember(request: import('./types').SharedTenantInviteRequest): Promise<import('./types').SharedTenantInviteResponse> {
-    return this._accessControl.inviteSharedTenantMember(request);
-  }
-
-  /** Hosted-shared tenant (NAN-2361): replace a member's roles and/or suspend / re-activate. */
-  async updateSharedTenantMember(id: string, request: import('./types').SharedTenantUpdateMemberRequest): Promise<import('./types').SharedTenantMember> {
-    return this._accessControl.updateSharedTenantMember(id, request);
-  }
-
-  // Hosted-shared tenant: existing-identity invitations (NAN-2361 wave 5)
-  async listSharedTenantMembershipInvitations(): Promise<import('./types').SharedTenantMembershipInvitationListResponse> {
-    return this._accessControl.listSharedTenantMembershipInvitations();
-  }
-
-  async revokeSharedTenantMembershipInvitation(id: string): Promise<void> {
-    return this._accessControl.revokeSharedTenantMembershipInvitation(id);
-  }
-
-  async listMySharedTenantInvitations(): Promise<import('./types').MySharedTenantInvitationListResponse> {
-    return this._accessControl.listMySharedTenantInvitations();
-  }
-
-  async acceptMySharedTenantInvitation(id: string, idempotencyKey: string): Promise<import('./types').AcceptMySharedTenantInvitationResponse> {
-    return this._accessControl.acceptMySharedTenantInvitation(id, idempotencyKey);
-  }
-
-  // Hosted-shared OIDC provider administration (step-up admin API, NAN-2361 wave 5)
-  async listSharedOidcAdminProviders(): Promise<import('./types').SharedOidcAdminProviderList> {
-    return this._accessControl.listSharedOidcAdminProviders();
-  }
-
-  async createSharedOidcAdminProvider(request: import('./types').SharedOidcAdminCreateRequest): Promise<import('./types').SharedOidcAdminMutationResponse> {
-    return this._accessControl.createSharedOidcAdminProvider(request);
-  }
-
-  async updateSharedOidcAdminProvider(id: string, request: import('./types').SharedOidcAdminUpdateRequest): Promise<import('./types').SharedOidcAdminMutationResponse> {
-    return this._accessControl.updateSharedOidcAdminProvider(id, request);
-  }
-
-  async rotateSharedOidcAdminProviderSecret(id: string, idempotencyKey: string, clientSecret: string): Promise<import('./types').SharedOidcAdminMutationResponse> {
-    return this._accessControl.rotateSharedOidcAdminProviderSecret(id, idempotencyKey, clientSecret);
-  }
-
-  async setSharedOidcAdminProviderEnabled(id: string, idempotencyKey: string, enabled: boolean): Promise<import('./types').SharedOidcAdminMutationResponse> {
-    return this._accessControl.setSharedOidcAdminProviderEnabled(id, idempotencyKey, enabled);
-  }
-
-  async deleteSharedOidcAdminProvider(id: string, idempotencyKey: string): Promise<import('./types').SharedOidcAdminMutationResponse> {
-    return this._accessControl.deleteSharedOidcAdminProvider(id, idempotencyKey);
   }
 
   async deleteUser(id: string): Promise<void> {
@@ -2278,18 +2178,13 @@ class ApiClient {
     return this._melod.melodDraftPlaybook(request);
   }
 
-  // NAN-4535: pivt SOAR flow drafting (async job → FlowDraftCreated)
-  async melodDraftFlow(request: import('./types').DraftFlowRequest): Promise<import('./types').MelodJobStartResponse> {
-    return this._melod.melodDraftFlow(request);
-  }
-  // NAN-4653: pivt edit-session turn on the open artifact (async job → EditTurnResult)
-  async melodEditTurn(request: import('./types').EditTurnRequest): Promise<import('./types').MelodJobStartResponse> {
-    return this._melod.melodEditTurn(request);
-  }
-
   /** @deprecated Use getMelodJobStatus instead */
   async melodGetDashboardJob(jobId: string): Promise<import('./types').MelodJobStatusResponse> {
     return this._melod.melodGetDashboardJob(jobId);
+  }
+
+  async melodEditTurn(request: import('./types').EditTurnRequest): Promise<import('./types').MelodJobStartResponse> {
+    return this._melod.melodEditTurn(request);
   }
 
   async melodRefineDashboard(request: import('./types').RefineDashboardRequest): Promise<import('./types').MelodJobStartResponse> {
@@ -2299,6 +2194,11 @@ class ApiClient {
   // Generic meloD job polling
   async getMelodJobStatus(jobId: string, signal?: AbortSignal): Promise<import('./types').MelodJobStatusResponse> {
     return this._melod.getMelodJobStatus(jobId, signal);
+  }
+
+  /** Cancel a running meloD job (NAN-4912 P3). */
+  async cancelMelodJob(jobId: string): Promise<import('./types').MelodJobStatusResponse> {
+    return this._melod.cancelMelodJob(jobId);
   }
 
   // Notifications
@@ -2323,21 +2223,30 @@ class ApiClient {
     return this._feedback.createFeedback(request);
   }
 
+  async listFeedback(options?: { category?: string; status?: string; limit?: number; offset?: number }): Promise<import('./types').FeedbackListResponse> {
+    return this._feedback.listFeedback(options);
+  }
+
+  async updateFeedback(id: string, request: import('./types').UpdateFeedbackRequest): Promise<import('./types').Feedback> {
+    return this._feedback.updateFeedback(id, request);
+  }
+
+  async deleteFeedback(id: string): Promise<{ success: boolean }> {
+    return this._feedback.deleteFeedback(id);
+  }
+
   // Enrichment
+  /** NAN-4948: signed platform feed bundle status / check now. */
   async getPlatformFeeds(): Promise<import('./enrichment').PlatformFeedsStatus> {
     return this._enrichment.getPlatformFeeds();
   }
 
+  async checkPlatformFeeds(): Promise<{ accepted: boolean }> {
+    return this._enrichment.checkPlatformFeeds();
+  }
+
   async listEnrichmentSources(): Promise<import('./types').EnrichmentSource[]> {
     return this._enrichment.listEnrichmentSources();
-  }
-
-  async configureIpinfo(config: import('./types').IpinfoConfig): Promise<{ success: boolean; message: string }> {
-    return this._enrichment.configureIpinfo(config);
-  }
-
-  async syncIpinfo(): Promise<import('./enrichment').SyncStartResult> {
-    return this._enrichment.syncIpinfo();
   }
 
   async enableEnrichmentSource(sourceId: string): Promise<{ success: boolean; message: string }> {
@@ -2354,14 +2263,6 @@ class ApiClient {
 
   async lookupIp(ip: string): Promise<import('./types').IpLookupResult> {
     return this._enrichment.lookupIp(ip);
-  }
-
-  async getAutoSyncConfig(): Promise<import('./types').AutoSyncConfig> {
-    return this._enrichment.getAutoSyncConfig();
-  }
-
-  async configureAutoSync(config: { enabled: boolean; interval_hours?: number }): Promise<import('./types').AutoSyncConfig> {
-    return this._enrichment.configureAutoSync(config);
   }
 
   async listAgentEnrichmentProviders(): Promise<import('./types').ListAgentEnrichmentProvidersResponse> {
@@ -2452,8 +2353,8 @@ class ApiClient {
   // NAN-1111: ThreatFox + TOR Exit Nodes delegate methods and the shared
   // lookupIoc / getIocStats delegates were deleted alongside the legacy
   // backend routes. Both providers moved to the marketplace + Deno
-  // (nano-rs/nano-enrichments). See project_ipinfo_lite_stays_native for
-  // why IPinfo Lite (above) stays native.
+  // (nano-rs/nano-enrichments). IPinfo Lite comes from nano's signed
+  // platform feed bundle (NAN-4959).
 
   // Custom Enrichments
   async listCustomEnrichments(enrichmentType?: 'data' | 'agent'): Promise<import('@/enterprise/api/custom-enrichment').CustomEnrichmentSummary[]> {
@@ -2504,8 +2405,8 @@ class ApiClient {
     return this._customEnrichment.getRuns(id, limit);
   }
 
-  async generateCustomEnrichmentCode(request: import('@/enterprise/api/custom-enrichment').GenerateCodeRequest): Promise<import('@/enterprise/api/custom-enrichment').GenerateCodeResponse> {
-    return this._customEnrichment.generateCode(request);
+  async generateCustomEnrichmentCode(request: import('@/enterprise/api/custom-enrichment').GenerateCodeRequest, options?: { signal?: AbortSignal; onProgress?: (progress: import('./job-result').JobResultProgress) => void }): Promise<import('@/enterprise/api/custom-enrichment').GenerateCodeResponse> {
+    return this._customEnrichment.generateCode(request, options);
   }
 
   async getCustomEnrichmentTemplates(): Promise<import('@/enterprise/api/custom-enrichment').CodeTemplates> {
@@ -2537,70 +2438,8 @@ class ApiClient {
     return this._prevalence.getArtifactExplorer(params);
   }
 
-  async getArtifactDetail(artifact: string, window?: string, signal?: AbortSignal): Promise<import('./types').ArtifactDetailResponse> {
-    return this._prevalence.getArtifactDetail(artifact, window, signal);
-  }
-
-  async startPrevalenceExport(params: {
-    window: string;
-    type?: string;
-    format?: 'csv' | 'json';
-  }): Promise<
-    | { kind: 'completed'; blob: Blob; filename: string }
-    | { kind: 'queued'; job: import('./types').AsyncSearchResponse }
-  > {
-    const query = new URLSearchParams({
-      window: params.window,
-      format: params.format ?? 'csv',
-    });
-    if (params.type) query.set('type', params.type);
-    // NAN-3088: a lean tenant's export is always a durable cell job (202).
-    const response = await this.requestRaw(`${leanPrevalencePath('export')}?${query.toString()}`);
-    if (response.status === 202) {
-      return { kind: 'queued', job: await response.json() };
-    }
-    return {
-      kind: 'completed',
-      blob: await response.blob(),
-      filename: filenameFromDisposition(response, `prevalence_export.${params.format ?? 'csv'}`),
-    };
-  }
-
-  // NAN-2361 hosted-shared tenants: queued export jobs (prevalence, audit).
-  // These routes exist only under the hosted-shared profile.
-
-  async enqueueExport(kind: 'prevalence' | 'audit', request: import('./types').EnqueueExportRequest): Promise<import('./types').TenantExportJob> {
-    return this.request(`/api/exports/${kind}`, { method: 'POST', body: JSON.stringify(request) });
-  }
-
-  async listExportJobs(kind: 'prevalence' | 'audit', limit?: number): Promise<import('./types').TenantExportJob[]> {
-    const params = limit ? `?limit=${limit}` : '';
-    return this.request(`/api/exports/${kind}${params}`);
-  }
-
-  /** Poll one export job by its `status_url` (or kind + id). */
-  async getExportJob(statusUrl: string): Promise<import('./types').TenantExportJob> {
-    return this.request(statusUrl);
-  }
-
-  async downloadExportJob(downloadUrl: string, fallbackFilename = 'export.csv'): Promise<{ blob: Blob; filename: string }> {
-    const response = await this.requestRaw(downloadUrl, {}, 60 * 60 * 1000);
-    return {
-      blob: await response.blob(),
-      filename: filenameFromDisposition(response, fallbackFilename),
-    };
-  }
-
-  async downloadSearchJob(jobId: string): Promise<{ blob: Blob; filename: string }> {
-    const response = await this.requestRaw(
-      `/api/search/jobs/${encodeURIComponent(jobId)}/download`,
-      {},
-      60 * 60 * 1000,
-    );
-    return {
-      blob: await response.blob(),
-      filename: filenameFromDisposition(response, 'prevalence_export.csv'),
-    };
+  async getArtifactDetail(artifact: string, window?: string): Promise<import('./types').ArtifactDetailResponse> {
+    return this._prevalence.getArtifactDetail(artifact, window);
   }
 
   async getPrevalenceScatterData(request: import('./types').ScatterPlotRequest): Promise<import('./types').PrevalenceScatterDataResponse> {
@@ -2656,7 +2495,7 @@ class ApiClient {
   async getPrevalenceArtifactsForQuery(request: { query: string; time_range: string | { start: string; end: string } }): Promise<{
     hash_points: Array<{
       artifact: string;
-      host_count: number;
+      host_count: number | null;
       first_seen: string;
       last_seen: string;
       total_occurrences: number;
@@ -2665,7 +2504,7 @@ class ApiClient {
     }>;
     domain_points: Array<{
       artifact: string;
-      host_count: number;
+      host_count: number | null;
       first_seen: string;
       last_seen: string;
       total_occurrences: number;
@@ -2673,7 +2512,6 @@ class ApiClient {
       prevalence_score: number;
     }>;
     rarity_threshold: number;
-    artifacts_truncated: boolean;
   }> {
     return this._prevalence.getPrevalenceArtifactsForQuery(request);
   }
@@ -2778,6 +2616,20 @@ class ApiClient {
     return this._audit.queryAuditLogs(query);
   }
 
+  async exportAuditLogs(query: import('./types').AuditExportQuery): Promise<{ blob: Blob; filename: string }> {
+    return this._audit.exportAuditLogs(query);
+  }
+
+  // AI Debug
+  async getAiFailures(request?: import('./types').GetAiFailuresRequest): Promise<import('./types').AiFailuresResponse> {
+    const params = new URLSearchParams();
+    if (request?.agent_type) params.set('agent_type', request.agent_type);
+    if (request?.limit) params.set('limit', String(request.limit));
+    if (request?.offset) params.set('offset', String(request.offset));
+    const query = params.toString();
+    return this.request(`/api/ai/failures${query ? `?${query}` : ''}`);
+  }
+
   // Organizational Context
   async getOrganizationalContext(): Promise<import('./types').OrganizationalContext> {
     return this._context.getOrganizationalContext();
@@ -2836,6 +2688,24 @@ class ApiClient {
   // License status
   async getLicenseStatus(): Promise<LicenseStatusResponse> {
     return this.request('/api/license');
+  }
+
+  async importOfflineLicense(file: File, renewal: boolean): Promise<LicenseStatusResponse> {
+    return this.request(renewal ? '/api/license/renew' : '/api/license/import', {
+      method: 'POST',
+      body: await file.arrayBuffer(),
+    });
+  }
+
+  async createClockRecoveryRequest(): Promise<ClockRecoveryRequest> {
+    return this.request('/api/license/clock-recovery/request', { method: 'POST' });
+  }
+
+  async applyClockRecovery(file: File): Promise<LicenseStatusResponse> {
+    return this.request('/api/license/clock-recovery', {
+      method: 'POST',
+      body: await file.arrayBuffer(),
+    });
   }
 
   // GDPR Anonymization

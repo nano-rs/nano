@@ -53,6 +53,11 @@ function stripInlineMarkdown(text: string): string {
  * Status bar — 22px-tall strip at the bottom. Mono text on --panel bg.
  * Wired to SIEM health + ingestion history. Rendered on every page, so queries
  * should stay cheap (both return single aggregates / small arrays).
+ *
+ * Extension point: a route contributes its own segment through
+ * `LayoutContext.setPageStatus` (Search's query stats, the Automation
+ * workspace's running / waiting-on-you counts, NAN-4649). Ingestion items
+ * (NAN-4922) plug in the same way rather than adding queries here.
  */
 export function StatusBar() {
   const currentTitle = useCurrentPageTitle();

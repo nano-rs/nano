@@ -31,29 +31,6 @@ fn raw_cloudtrail_event_uses_canonical_fields() {
 }
 
 #[test]
-fn canonical_ocsf_epoch_milliseconds_populate_match_event_time() {
-    let v = normalize(json!({
-        "time": 1_786_896_014_123_i64,
-        "activity_name": "Launch",
-    }));
-    assert_eq!(field(&v, MATCH_EVENT_TIME), "2026-08-16T16:00:14.123Z");
-    assert_eq!(field(&v, MATCH_EVENT_LABEL), "Launch");
-}
-
-#[test]
-fn numeric_event_time_units_normalize_identically() {
-    let expected = "2026-08-16T16:00:14.123Z";
-    for time in [
-        json!(1_786_896_014_123_i64),
-        json!(1_786_896_014_123_000_i64),
-        json!(1_786_896_014_123_000_000_i64),
-    ] {
-        let v = normalize(json!({ "time": time }));
-        assert_eq!(field(&v, MATCH_EVENT_TIME), expected);
-    }
-}
-
-#[test]
 fn underscore_prefixed_aggregate_works() {
     let v = normalize(json!({
         "_first_seen": "2026-05-16 14:20:28.000000",
@@ -452,7 +429,7 @@ fn risk_output_envelope_prefers_scored_entity_and_keeps_rows_isolated() {
     assert_eq!(rows[1][MATCH_ENTITY], "203.0.113.9");
     assert_eq!(rows[1][MATCH_ENTITY_TYPE], "ip");
     assert!(rows[2].get(MATCH_ENTITY).is_none());
-    let mut invalid = vec![json!({"actor.user.uid": "fallback"})];
+    let mut invalid = vec![json!({"user": "fallback"})];
     normalize_match_events_for_query(&mut invalid, "| invalid command");
     assert_eq!(invalid[0][MATCH_ENTITY], "fallback");
 }

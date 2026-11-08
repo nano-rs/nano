@@ -866,7 +866,12 @@ async fn workers_are_single_use_and_strict_mode_is_honoured() {
         let out = r.out.expect("run");
         let (_, rep) = &out.sandbox[0];
         assert!(rep.rlimits);
-        assert_eq!(rep.seccomp, "enforced", "seccomp must be available on Linux test hosts");
+        if cfg!(target_os = "linux") {
+            assert_eq!(rep.seccomp, "enforced", "seccomp must be available on Linux test hosts");
+        } else {
+            // No seccomp off Linux: reported, never silent (NAN-4914).
+            assert!(rep.seccomp.starts_with("unavailable") && rep.degraded(), "{rep:?}");
+        }
     }
     assert_eq!(h.cfg.vrl_pool.spawned.load(std::sync::atomic::Ordering::SeqCst) - before, 3, "one fresh worker per run");
 

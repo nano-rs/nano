@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
-import { waitForDurableProductArtifact } from '../durable-product-job';
-import { DurableJobNotice, type DurableProductJobState } from '../DurableJobNotice';
 import { useReportPhase2Status } from '../footer-reporter';
 import { LateralTopStrip } from './LateralTopStrip';
 import { LateralReasoningBand } from './LateralReasoningBand';
@@ -13,7 +10,9 @@ import { LateralLegend } from './LateralLegend';
 import { LateralNodeDrawer } from './LateralNodeDrawer';
 import { LateralEdgeDrawer } from './LateralEdgeDrawer';
 import { LateralEmpty } from './LateralEmpty';
-import { quoteValue, rewriteLateralSeed, stripLateralCommand } from './helpers';
+import { lateralFilter, lateralNodeKey, rewriteLateralSeed, stripLateralCommand } from './helpers';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import type { SemanticField } from '@/lib/schema-fields';
 import type {
   LateralBand,
   LateralEdge,
@@ -46,6 +45,16 @@ interface LateralViewProps {
 
 function asString(v: unknown): string {
   return typeof v === 'string' ? v : '';
+}
+
+interface LateralStreamState {
+  key: string;
+  graph: LateralGraphPayload | null;
+  hops: number;
+  complete: boolean;
+  settled?: boolean;
+  totalCount?: number;
+  error?: string;
 }
 
 function asNumber(v: unknown): number {
@@ -143,88 +152,79 @@ export function LateralView({
   onExpandFields,
 }: LateralViewProps) {
   const meta = results.find((r) => r.fields?._display_type === 'lateral');
+  // NAN-3077: a progressive answer is a pending marker; this view streams the
+  // traversal itself and paints the cumulative graph after each hop.
   const pending = meta?.fields?._lateral_pending === true;
   const range = meta?.fields?._lateral_time_range as { start: string; end: string } | undefined;
-  const streamKey = JSON.stringify([query, range?.start, range?.end, meta?.fields?._lateral_config, meta?.fields?._lateral_trace_id]);
-  const [durableJob, setDurableJob] = useState<{ key: string; job: DurableProductJobState } | null>(null);
-  const [streamed, setStreamed] = useState<{ key: string; graph: LateralGraphPayload | null; hops: number; complete: boolean; settled?: boolean; totalCount?: number; error?: string } | null>(null);
+  const pendingConfig = meta?.fields?._lateral_config as Record<string, unknown> | undefined;
+  const plannedHops = asNumber(pendingConfig?.max_hops);
+  const streamKey = JSON.stringify([query, range?.start, range?.end, pendingConfig, meta?.fields?._lateral_trace_id]);
+  const [streamed, setStreamed] = useState<LateralStreamState | null>(null);
   useEffect(() => {
     if (!pending || !query || !range) return;
     let current = true;
-    let finished = false;
-    let completing = false;
-    const jobController = new AbortController();
-    setDurableJob(null);
     setStreamed({ key: streamKey, graph: null, hops: 0, complete: false });
     const accept = (rows: Record<string, unknown>[], hops: number, complete: boolean) => {
       if (!current) return;
-      const marker = rows.find(row => row._display_type === 'lateral');
-      const graph = parseGraphPayload(marker?._lateral_graph);
-      if (graph) finished = complete;
-      if (graph) setStreamed(previous => ({ ...previous, key: streamKey, graph, hops, complete, totalCount: typeof (marker?._lateral_config as Record<string, unknown> | undefined)?.total_edges === 'number' ? (marker?._lateral_config as Record<string, number>).total_edges : previous?.totalCount }));
+      const marker = rows.find((row) => row._display_type === 'lateral');
+      const next = parseGraphPayload(marker?._lateral_graph);
+      if (!next) return;
+      const totalEdges = (marker?._lateral_config as Record<string, unknown> | undefined)?.total_edges;
+      setStreamed((previous) => ({
+        ...previous,
+        key: streamKey,
+        graph: next,
+        hops: Math.max(hops, previous?.key === streamKey ? previous.hops : 0),
+        complete,
+        totalCount: typeof totalEdges === 'number' ? totalEdges : previous?.totalCount,
+      }));
     };
-    const completeAsJob = async () => {
-      if (!current || completing || finished) return;
-      completing = true;
-      try {
-        const queued = await api.searchAsync({ query, time_range: range, skip_histogram: true, skip_field_stats: true }, undefined, jobController.signal);
-        if (!current) return;
-        const { row } = await waitForDurableProductArtifact(queued.job_id, 'lateral_v1',
-          job => { if (current) setDurableJob({ key: streamKey, job }); }, () => current, jobController.signal);
-        const response = row.response as { results?: Record<string, unknown>[] } | undefined;
-        if (row.operation !== 'lateral' || !Array.isArray(response?.results) || !parseGraphPayload(response.results.find(result => result._display_type === 'lateral')?._lateral_graph)) throw new Error('Invalid durable Lateral result');
-        accept(response.results, 0, true);
-        if (current) setStreamed(previous => previous?.key === streamKey ? { ...previous, settled: true } : previous);
-      } catch (error) {
-        if (current) setStreamed(previous => previous?.key === streamKey ? {
-          ...previous, settled: true, error: `Traversal is incomplete: ${error instanceof Error ? error.message : String(error)}`,
-        } : previous);
-      }
-    };
-    const controller = api.searchStreamSSE({ query, time_range: range, skip_histogram: true, skip_field_stats: true }, {
-      onViewUpdate: update => { if (update.view === 'lateral') accept(update.rows, update.completed_hops, update.complete); },
-      // Cached streams and older servers deliver the final graph in a row batch.
-      onRows: update => accept(update.rows, 0, !update.rows.some(row => (row._lateral_config as Record<string, unknown> | undefined)?.time_truncated_at_hop != null)),
-      onCompleted: () => {
-        if (finished && current) setStreamed(previous => previous?.key === streamKey ? { ...previous, settled: true } : previous);
-        else void completeAsJob();
+    const controller = api.searchStreamSSE(
+      { query, time_range: range, skip_histogram: true, skip_field_stats: true },
+      {
+        onViewUpdate: (update) => {
+          if (update.view === 'lateral') accept(update.rows, update.completed_hops, update.complete);
+        },
+        // Cached streams deliver the final graph in a row batch.
+        onRows: (update) => accept(update.rows, 0, true),
+        onCompleted: () => {
+          if (current) setStreamed((previous) => previous?.key === streamKey
+            ? { ...previous, settled: true, error: previous.complete ? previous.error : 'Traversal stopped; graph is incomplete' }
+            : previous);
+        },
+        onError: (error) => {
+          if (current) setStreamed((previous) => previous?.key === streamKey ? { ...previous, settled: true, error: error.message } : previous);
+        },
       },
-      onError: () => {
-        if (finished && current) setStreamed(previous => previous?.key === streamKey ? { ...previous, settled: true } : previous);
-        else void completeAsJob();
-      },
-    }, { bypass: true });
-    return () => { current = false; controller.abort(); jobController.abort(); };
-  }, [pending, query, range?.start, range?.end, streamKey]);
+      { bypass: true, progressive: false },
+    );
+    // Dropping the SSE body aborts the server traversal (superseded pivot / unmount).
+    return () => { current = false; controller.abort(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- streamKey covers query/range/config/trace id
+  }, [pending, streamKey]);
   const activeStream = streamed?.key === streamKey ? streamed : null;
-  const graph = useMemo(() => activeStream?.graph ?? parseGraphPayload(meta?.fields?._lateral_graph), [activeStream, meta]);
+  const graph = useMemo(
+    () => activeStream?.graph ?? parseGraphPayload(meta?.fields?._lateral_graph),
+    [activeStream, meta],
+  );
   useReportPhase2Status({
     loading: pending && !activeStream?.settled,
-    settled: pending ? !!activeStream?.settled : !!graph,
+    settled: pending ? !!activeStream?.settled : true,
     error: activeStream?.error,
     totalCount: pending ? activeStream?.totalCount : asNumber((meta?.fields?._lateral_config as Record<string, unknown> | undefined)?.total_edges),
   });
   const progress = pending && !activeStream?.complete
-    ? activeStream?.error ?? (durableJob?.key === streamKey && !activeStream?.settled ? 'Completing traversal in the background…' : activeStream?.hops ? `Loading · ${activeStream.hops} hops discovered; enrichment pending` : 'Loading first hop…')
-    : null;
-  const { data: schemaFields } = useQuery({
-    queryKey: ['schema-fields'],
-    queryFn: () => api.getSchemaFields(),
-    staleTime: Infinity,
-    gcTime: Infinity,
-  });
-  const isOcsf = schemaFields?.schema === 'ocsf';
-  const entityField = (kind: string, destination = false) => {
-    if (!isOcsf) {
-      return kind === 'user' ? 'user' : kind === 'ip' ? 'src_ip' : kind === 'process' ? 'process_name' : destination ? 'dest_host' : 'src_host';
-    }
-    return kind === 'user' ? 'actor.user.name' : kind === 'ip' ? 'src_endpoint.ip' : kind === 'process' ? 'process.name' : destination ? 'dst_endpoint.hostname' : 'src_endpoint.hostname';
-  };
+    ? activeStream?.error
+      ?? (activeStream?.hops
+        ? `hop ${activeStream.hops}${plannedHops ? ` of ${plannedHops}` : ''} · ${activeStream.graph?.edges.length ?? 0} edges · enrichment pending`
+        : 'Loading first hop…')
+    : activeStream?.error ?? null;
 
   const seedId = graph?.summary.seed.id ?? '';
   const initialMaxHops = Math.max(2, Math.min(4, graph?.summary.maxHops || 4));
 
   // ─── View-local state (NAN-395 invariant 1: never touches the query) ────────
+  const fieldMap = useSchemaFieldMap();
   const [maxHops, setMaxHops] = useState(initialMaxHops);
   const [methods, setMethods] = useState<Set<LateralMethodGroup>>(
     () => new Set(['auth', 'network', 'process'])
@@ -249,27 +249,27 @@ export function LateralView({
   // Used by the critical-path breadcrumb — just stays in the same surface.
   const handlePivotSeed = (id: string, kind: 'host' | 'user' | 'ip') => {
     if (!id || id === seedId) return;
-    const field = entityField(kind);
+    // NAN-4903: no profile-shaped query until the schema profile is known.
+    if (!fieldMap.ready) return fieldMap.guard(() => {})();
     if (query && onSetQuery) {
-      onSetQuery(rewriteLateralSeed(query, field, id));
+      onSetQuery(rewriteLateralSeed(query, kind, id, fieldMap));
     } else if (onAddToQuery) {
-      onAddToQuery(field, id, false);
+      onAddToQuery(fieldMap.field(lateralNodeKey(kind)), id, false);
     }
   };
 
   // Open asset view for a host/user node — drops `| lateral` and pipes to `| asset`.
   const handleOpenAsset = (node: LateralNode) => {
+    // NAN-4903: no profile-shaped query until the schema profile is known.
+    if (!fieldMap.ready) return fieldMap.guard(() => {})();
+    const kind = node.type === 'process' ? 'host' : node.type;
+    const key = lateralNodeKey(kind);
     if (!query || !onSetQuery) {
-      onAddToQuery?.(
-        entityField(node.type),
-        node.label,
-        false
-      );
+      onAddToQuery?.(fieldMap.field(key), node.label, false);
       return;
     }
-    const field = entityField(node.type);
     const withoutLateral = stripLateralCommand(query);
-    const filter = `${field}=${quoteValue(node.label)}`;
+    const filter = lateralFilter(fieldMap, key, node.label);
     const base = withoutLateral ? `${withoutLateral} ${filter}` : filter;
     onSetQuery(`${base} | asset`);
   };
@@ -277,32 +277,33 @@ export function LateralView({
   // "Pivot to events" for nodes / edges — drops `| lateral` and appends a base
   // filter so the user sees raw events. NAN-395 invariant 3.
   const handlePivotEventsForNode = (node: LateralNode) => {
-    const field = entityField(node.type);
-    pivotToEvents(field, node.label);
+    pivotToEvents(lateralNodeKey(node.type), node.label);
   };
 
   const handlePivotEventsForEdge = (edge: LateralEdge) => {
     // Edge → use the destination as the filter (where the connection landed)
     const dest = graph?.nodes.find((n) => n.id === edge.to);
     if (!dest) return;
-    const field = entityField(dest.type, true);
-    pivotToEvents(field, dest.label);
+    pivotToEvents(lateralNodeKey(dest.type, 'destHost'), dest.label);
   };
 
-  function pivotToEvents(field: string, value: string) {
+  function pivotToEvents(key: SemanticField, value: string) {
     if (!value) return;
+    // NAN-4903: no profile-shaped query until the schema profile is known.
+    if (!fieldMap.ready) return fieldMap.guard(() => {})();
     if (query && onSetQuery) {
       const withoutLateral = stripLateralCommand(query);
-      const filter = `${field}=${quoteValue(value)}`;
+      const filter = lateralFilter(fieldMap, key, value);
       onSetQuery(withoutLateral ? `${withoutLateral} ${filter}` : filter);
     } else if (onAddToQuery) {
-      onAddToQuery(field, value, false);
+      onAddToQuery(fieldMap.field(key), value, false);
     }
   }
 
   const handleCopyQuery = (node: LateralNode) => {
-    const field = entityField(node.type);
-    const q = `${field}=${quoteValue(node.label)}`;
+    // NAN-4903: no profile-shaped query until the schema profile is known.
+    if (!fieldMap.ready) return fieldMap.guard(() => {})();
+    const q = lateralFilter(fieldMap, lateralNodeKey(node.type), node.label);
     if (typeof navigator !== 'undefined' && navigator.clipboard) {
       navigator.clipboard.writeText(q).catch(() => {});
     }
@@ -312,8 +313,11 @@ export function LateralView({
   if (!graph || !seedId) {
     return (
       <div className="flex flex-col min-h-0 min-w-0 overflow-hidden">
-        {durableJob?.key === streamKey && !activeStream?.settled && <DurableJobNotice job={durableJob.job} detail="Completing the Lateral traversal in the background." />}
-        {pending ? <div className="p-4 text-[11px] font-mono text-muted-foreground" role="status">{progress}</div> : <LateralEmpty reason="no-seed" />}
+        {pending ? (
+          <div className="px-4 py-3 text-[10.5px] font-mono text-muted-foreground" role="status">{progress}</div>
+        ) : (
+          <LateralEmpty reason="no-seed" />
+        )}
       </div>
     );
   }
@@ -332,7 +336,7 @@ export function LateralView({
     if (node.type === 'host' || node.type === 'user' || node.type === 'ip') {
       handlePivotSeed(node.label, node.type);
     } else if (node.type === 'process') {
-      pivotToEvents('process_name', node.label);
+      pivotToEvents('processName', node.label);
     }
   };
 
@@ -342,8 +346,9 @@ export function LateralView({
     // without clipping; larger graphs get in-canvas scroll via `overflow-
     // auto` in LateralGraph.
     <div className="flex flex-col h-[680px] min-w-0 overflow-hidden">
-      {durableJob?.key === streamKey && !activeStream?.settled && <DurableJobNotice job={durableJob.job} detail="Completing the remaining Lateral traversal in the background." />}
-      {progress && <div className="px-4 py-1 text-[11px] font-mono text-muted-foreground" role="status">{progress}</div>}
+      {progress && (
+        <div className="px-4 py-1 border-b border-border text-[10.5px] font-mono text-muted-foreground" role="status">{progress}</div>
+      )}
       <LateralTopStrip
         summary={graph.summary}
         maxHops={maxHops}

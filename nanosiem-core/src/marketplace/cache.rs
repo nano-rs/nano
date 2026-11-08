@@ -14,17 +14,17 @@
 //! source visibility for the next 6 hours, without exposing an unrestricted
 //! result to a restricted caller (NAN-2061).
 //!
-//! Mirrors the wiring pattern of `enterprise::cases::PresenceTracker`
+//! Mirrors the wiring pattern of `nanosiem_enterprise::cases::PresenceTracker`
 //! (lifted in Phase 3.2 of NAN-744): an `Option<Arc<Mutex<ConnectionManager>>>`
 //! so single-node dev (no Redis) short-circuits to a "cache miss every time"
 //! path without any branches at the call site.
 //!
 //! ## Behavior
 //!
-//! - `get(scope)` — `GET marketplace:coverage:v2:<scope-hash>`, deserialize
+//! - `get(scope)` — `GET marketplace:coverage:v3:<scope-hash>`, deserialize
 //!   JSON. Any miss / error / decode failure returns `None` so the caller will
 //!   recompute.
-//! - `set(scope)` — `SETEX marketplace:coverage:v2:<scope-hash> 21600 <json>`.
+//! - `set(scope)` — `SETEX marketplace:coverage:v3:<scope-hash> 21600 <json>`.
 //!   Best effort; Redis errors are logged and swallowed.
 //! - `invalidate(scope)` — deletes only that caller scope's partition. Backs the
 //!   manual refresh button without evicting other principals' scoped results.
@@ -39,9 +39,11 @@
 //!
 //! ### Versioning
 //!
-//! The cache key is suffixed with `:v2` for the NAN-2061 scope policy. If the
+//! The cache key is suffixed with `:v3`: `:v2` was the NAN-2061 scope policy;
+//! `:v3` (NAN-4946) adds `measured` / `telemetry_available`, so an old-shape
+//! zero-count payload is never read as a measured 0 %. If the
 //! `MarketplaceCoverage` schema or authorization context ever changes shape,
-//! bump to `:v3` rather than flushing — old replicas keep working until they
+//! bump the suffix again rather than flushing — old replicas keep working until they
 //! roll, and new replicas overlap cleanly.
 
 use std::collections::BTreeSet;
@@ -62,7 +64,7 @@ const COVERAGE_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
 
 /// Versioned key prefix — bump the suffix on schema or authorization-policy
 /// changes (see module docs).
-const COVERAGE_CACHE_KEY_PREFIX: &str = "marketplace:coverage:v2";
+const COVERAGE_CACHE_KEY_PREFIX: &str = "marketplace:coverage:v3";
 
 /// Authorization policy represented by this key version. Feeding the required
 /// capability context into the digest makes the partition definition explicit:
@@ -123,16 +125,16 @@ impl MarketplaceCoverageCache {
     /// be established. Mirrors `PresenceTracker::try_with_redis_url` so the
     /// `nanosiem-api` startup code stays out of the redis crate's surface.
     pub async fn try_with_redis_url(redis_url: &str) -> Self {
-        match crate::redis_transport::client_from_url(redis_url) {
+        match redis::Client::open(redis_url) {
             Ok(client) => match ConnectionManager::new(client).await {
                 Ok(conn) => Self::with_redis(conn),
                 Err(err) => {
-                    warn!(error = %err, "marketplace_coverage_cache: Redis ConnectionManager failed; cache disabled");
+                    warn!(redis_url, error = %err, "marketplace_coverage_cache: Redis ConnectionManager failed; cache disabled");
                     Self::new()
                 }
             },
             Err(err) => {
-                warn!(error = %err, "marketplace_coverage_cache: invalid Redis URL; cache disabled");
+                warn!(redis_url, error = %err, "marketplace_coverage_cache: invalid Redis URL; cache disabled");
                 Self::new()
             }
         }
@@ -231,6 +233,7 @@ mod tests {
         MarketplaceCoverage {
             artifacts: vec![],
             computed_at: chrono::DateTime::from_timestamp(1_700_000_000 + minute * 60, 0).unwrap(),
+            telemetry_available: true,
         }
     }
 
@@ -263,7 +266,7 @@ mod tests {
             coverage_cache_key(&scope(&["secret", "audit"])),
             "BTreeSet order must produce the same partition"
         );
-        assert!(restricted.starts_with("marketplace:coverage:v2:"));
+        assert!(restricted.starts_with("marketplace:coverage:v3:"));
         assert!(
             !restricted.contains("secret"),
             "raw source names must not leak into Redis keys"

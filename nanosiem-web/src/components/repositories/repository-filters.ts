@@ -4,7 +4,11 @@ import type { RepositoryRule } from '@/lib/api/rule-repositories';
 
 export type ImportStatusFilter = 'all' | 'imported' | 'not-imported';
 
-export function ruleSourceTypes(rule: Pick<RepositoryRule, 'requires_source_types' | 'suggested_source_types'>): string[] {
+// `suggested_source_types` is optional: this API does not return it yet, so only
+// `requires_source_types` populates the filter until it does.
+export function ruleSourceTypes(
+  rule: Pick<RepositoryRule, 'requires_source_types'> & { suggested_source_types?: string[] | null },
+): string[] {
   return [...new Set([...(rule.requires_source_types ?? []), ...(rule.suggested_source_types ?? [])].filter(Boolean))];
 }
 

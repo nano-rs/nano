@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 /**
- * NAN-4754: the Review step's validation gate. Renders exactly what
+ * NAN-4754 (ported, NAN-4912): the Review step's validation gate. Renders exactly what
  * `computeDeployGate` decided: one row per check, the fix link for a blocked
  * check, the warnings with their acknowledge checkbox (only when there are
- * warnings), and a footer line naming the real reason activation is held.
+ * warnings), and a footer line naming the real reason publishing is held.
  */
 import type { ReactNode } from 'react';
-import { AlertTriangle, Check, Loader2, X } from 'lucide-react';
+import { AlertTriangle, Check, X } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { Checkbox } from '@/components/ui/checkbox';
 import { cn } from '@/lib/utils';
 import type { DeployGate, GateAction, GateCheck } from './deploy-gate';
 
 const ACTION_LABEL: Record<GateAction, string> = {
   step1: 'Go to step 1',
-  step2: 'Go to step 2',
+  connect: 'Go to step 2',
+  step2: 'Go to step 3',
   'run-tests': 'Run tests',
 };
 
@@ -33,7 +35,7 @@ function GateIcon({ check, acknowledged }: { check: GateCheck; acknowledged: boo
       ) : check.status === 'block' ? (
         <X className="w-2 h-2" />
       ) : check.status === 'pending' ? (
-        <Loader2 className="w-2 h-2 animate-spin" />
+        <LoadingIcon className="w-2 h-2" />
       ) : (
         <AlertTriangle className="w-2 h-2" />
       )}
@@ -43,11 +45,10 @@ function GateIcon({ check, acknowledged }: { check: GateCheck; acknowledged: boo
 
 export function DeployGatePanel({
   gate,
-  parserStep = 2,
+  parserStep = 3,
   acknowledged,
   setAcknowledged,
   onAction,
-  shared,
   children,
 }: {
   gate: DeployGate;
@@ -55,11 +56,10 @@ export function DeployGatePanel({
   acknowledged: boolean;
   setAcknowledged: (v: boolean) => void;
   onAction: (action: GateAction) => void;
-  shared?: boolean;
-  /** Notes rendered under the checks (hosted build note, rollout status). */
+  /** Notes rendered under the checks. */
   children?: ReactNode;
 }) {
-  const verb = shared ? 'Activate' : 'Deploy';
+  const verb = 'Publish';
   return (
     <div className="rounded-lg border border-border bg-background overflow-hidden" data-testid="deploy-gate">
       <div className="px-3 py-2 border-b border-border bg-card/40">
@@ -71,7 +71,7 @@ export function DeployGatePanel({
             <div className="flex items-center gap-2">
               <GateIcon check={check} acknowledged={acknowledged} />
               <span className="text-[11px] text-foreground/80">{check.label}</span>
-              {check.action && check.status === 'block' && (
+              {check.action && (check.status === 'block' || check.action === 'connect') && (
                 <button
                   type="button"
                   onClick={() => onAction(check.action!)}

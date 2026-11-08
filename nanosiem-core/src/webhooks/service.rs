@@ -6,7 +6,6 @@
 //! Fire-and-forget via tokio::spawn — never blocks the detection pipeline.
 
 use chrono::Utc;
-use futures::stream::{FuturesUnordered, StreamExt};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::collections::{BTreeSet, HashMap};
@@ -21,8 +20,7 @@ use crate::inputlookup::{IpCidr, SsrfConfig, SsrfValidator};
 
 use super::channels::{build_channel_body, ChannelType, FormatContext};
 use super::models::*;
-use super::repository::{decrypt_envelope_json, decrypt_envelope_string, WebhookRepository};
-use crate::crypto::EncryptionService;
+use super::repository::WebhookRepository;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -113,8 +111,8 @@ pub(crate) fn canonical_origin(raw: &str) -> Option<String> {
 /// storing a caller string that would build first-party-looking links resolving
 /// to another host. Also rejects non-http(s) schemes and host-less URLs.
 pub fn validate_base_origin(raw: &str) -> Result<String, String> {
-    let url =
-        url::Url::parse(raw.trim()).map_err(|_| "base_url must be a valid URL".to_string())?;
+    let url = url::Url::parse(raw.trim())
+        .map_err(|_| "base_url must be a valid URL".to_string())?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("base_url must use http or https".to_string());
     }
@@ -267,7 +265,7 @@ impl WebhookService {
     /// config-time validation and connect. Redirects are disabled so there is no
     /// second, unvalidated hop. Returns the rejection reason on block (recorded
     /// as the delivery failure).
-    pub(crate) async fn ssrf_checked_client(url: &str) -> Result<reqwest::Client, String> {
+    async fn ssrf_checked_client(url: &str) -> Result<reqwest::Client, String> {
         let (parsed, addrs) = Self::validator()
             .validate_and_resolve(url)
             .await
@@ -295,24 +293,10 @@ impl WebhookService {
             .map_err(|e| format!("HTTP client build failed: {e}"))
     }
 
-
-    async fn ssrf_checked_proxy_client(url: &str, tenant: Uuid) -> Result<reqwest::Client, String> {
-        if !crate::egress::hosted_proxy_configured() { return Self::ssrf_checked_client(url).await; }
-        // Keep config/delivery-time SSRF validation. Squid re-resolves and
-        // refuses private, special-use, and recorded infrastructure addresses;
-        // it additionally checks the tenant's current receiver origin.
-        Self::validator().validate_and_resolve(url).await
-            .map_err(|_| "blocked by SSRF guard".to_owned())?;
-        crate::egress::client_builder(tenant, crate::egress::Purpose::Webhook)
-            .map_err(str::to_owned)?
-            .timeout(std::time::Duration::from_secs(DELIVERY_TIMEOUT_SECS))
-            .build().map_err(|_| "webhook proxy client unavailable".to_owned())
-    }
-
     /// Read at most `RESPONSE_READ_CAP` bytes of a receiver's response, then
     /// drop the rest. Bounds memory against a hostile endpoint returning a huge
     /// body — `reqwest::Response::text()`/`bytes()` would buffer it all first.
-    pub(crate) async fn read_body_capped(mut response: reqwest::Response) -> String {
+    async fn read_body_capped(mut response: reqwest::Response) -> String {
         let mut buf: Vec<u8> = Vec::new();
         loop {
             if buf.len() >= RESPONSE_READ_CAP {
@@ -465,77 +449,16 @@ impl WebhookService {
         matched_events: &serde_json::Value,
         created_at: chrono::DateTime<Utc>,
     ) {
-        if let Err(error) = self
-            .fire_alert_with_mode(
-                alert_id,
-                kind,
-                rule_id,
-                rule_name,
-                severity,
-                entity,
-                matched_events,
-                created_at,
-                false,
-            )
-            .await
-        {
-            error!(%alert_id, %error, "Failed to schedule alert webhooks");
-        }
-    }
-
-    /// Deliver alert webhooks before acknowledging a durable caller. Receivers
-    /// get a stable idempotency key derived from the alert, so reclaiming an
-    /// outbox item after a crash remains an at-least-once retry rather than a
-    /// new logical notification.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn fire_alert_durable(
-        &self,
-        alert_id: Uuid,
-        kind: &str,
-        rule_id: Option<Uuid>,
-        rule_name: &str,
-        severity: &str,
-        entity: Option<String>,
-        matched_events: &serde_json::Value,
-        created_at: chrono::DateTime<Utc>,
-    ) -> Result<(), String> {
-        self.fire_alert_with_mode(
-            alert_id,
-            kind,
-            rule_id,
-            rule_name,
-            severity,
-            entity,
-            matched_events,
-            created_at,
-            true,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn fire_alert_with_mode(
-        &self,
-        alert_id: Uuid,
-        kind: &str,
-        rule_id: Option<Uuid>,
-        rule_name: &str,
-        severity: &str,
-        entity: Option<String>,
-        matched_events: &serde_json::Value,
-        created_at: chrono::DateTime<Utc>,
-        durable: bool,
-    ) -> Result<(), String> {
         let webhooks = match self.repo.list_enabled().await {
             Ok(w) => w,
             Err(e) => {
                 error!("Failed to load webhooks: {}", e);
-                return Err(format!("failed to load enabled webhooks: {e}"));
+                return;
             }
         };
 
         if webhooks.is_empty() {
-            return Ok(());
+            return;
         }
 
         // Which subscription checkbox gates this alert (siem_alert | obs_alert).
@@ -604,12 +527,10 @@ impl WebhookService {
             health_summary: None,
             health_diagnostic_context: None,
             health_remediation: None,
-            idempotency_key: Some(format!("alert.created:{alert_id}")),
+            idempotency_key: None,
         };
 
         let severity_lower = severity.to_lowercase();
-        let mut failures = Vec::new();
-        let mut durable_deliveries = FuturesUnordered::new();
 
         for webhook in webhooks {
             // Subscription filter: skip webhooks not subscribed to this stream.
@@ -677,60 +598,21 @@ impl WebhookService {
                         0,
                     )
                     .await;
-                    if durable {
-                        failures.push(format!(
-                            "webhook {} was shed because the delivery lane is saturated",
-                            webhook.id
-                        ));
-                    }
                     continue;
                 }
             };
 
-            if durable {
-                let svc = self.clone();
-                let payload = payload.clone();
-                durable_deliveries.push(async move {
-                    let _inflight = inflight_permit;
-                    let _permit = svc
-                        .semaphore
-                        .acquire()
-                        .await
-                        .map_err(|_| "webhook delivery semaphore closed".to_string())?;
-                    let webhook_id = webhook.id;
-                    let outcome = svc
-                        .deliver(&webhook, &payload, Some(alert_id), "alert.created")
-                        .await;
-                    Ok::<_, String>((webhook_id, outcome))
-                });
-            } else {
-                let svc = self.clone();
-                let payload = payload.clone();
-                let alert_id_copy = alert_id;
+            let svc = self.clone();
+            let payload = payload.clone();
+            let alert_id_copy = alert_id;
 
-                // Fire-and-forget with concurrency limit
-                tokio::spawn(async move {
-                    let _inflight = inflight_permit; // held for the task's lifetime
-                    let _permit = svc.semaphore.acquire().await;
-                    svc.deliver(&webhook, &payload, Some(alert_id_copy), "alert.created")
-                        .await;
-                });
-            }
-        }
-        while let Some(delivery) = durable_deliveries.next().await {
-            match delivery {
-                Ok((webhook_id, outcome)) if !outcome.success => failures.push(format!(
-                    "webhook {webhook_id} failed: {}",
-                    outcome.error.as_deref().unwrap_or("non-success response")
-                )),
-                Ok(_) => {}
-                Err(error) => failures.push(error),
-            }
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(failures.join("; "))
+            // Fire-and-forget with concurrency limit
+            tokio::spawn(async move {
+                let _inflight = inflight_permit; // held for the task's lifetime
+                let _permit = svc.semaphore.acquire().await;
+                svc.deliver(&webhook, &payload, Some(alert_id_copy), "alert.created")
+                    .await;
+            });
         }
     }
 
@@ -949,38 +831,6 @@ impl WebhookService {
         payload_bytes: &[u8],
         sign_generic: bool,
     ) -> Result<reqwest::RequestBuilder, String> {
-        build_signed_request(&self.repo.encryption().with_context(crate::crypto::CredentialScope::Deployment, "webhook.headers", webhook.id), client, webhook, payload_bytes, sign_generic)
-    }
-
-    /// Render the outbound body for a channel and whether it should be HMAC-
-    /// signed (generic only). See [`render_channel_body`].
-    fn channel_body(
-        &self,
-        webhook: &super::models::Webhook,
-        payload: &WebhookPayload,
-    ) -> Result<(Vec<u8>, bool), String> {
-        render_channel_body(&self.repo.encryption().with_context(crate::crypto::CredentialScope::Deployment, "webhook.secret", webhook.id), webhook, payload)
-    }
-}
-
-/// Build the outbound request for `webhook`: content headers, the configured
-/// custom headers and, for the generic channel, the Stripe-style
-/// `X-NanoSIEM-Timestamp` / `X-NanoSIEM-Signature` HMAC-SHA256 pair. Shared by
-/// the dedicated fanout and the hosted-shared tenant runner (NAN-2361).
-///
-/// **Fails closed on a crypto error.** If a webhook has configured custom
-/// headers or an HMAC secret that cannot be decrypted (e.g. the encryption
-/// key was rotated), this returns `Err` and the caller must NOT send — a
-/// silent downgrade to an unsigned request, or one missing its configured
-/// auth headers, would be a security regression the receiver can't detect.
-pub fn build_signed_request(
-    encryption: &EncryptionService,
-    client: &reqwest::Client,
-    webhook: &super::models::Webhook,
-    payload_bytes: &[u8],
-    sign_generic: bool,
-) -> Result<reqwest::RequestBuilder, String> {
-    {
         let mut request = client
             .post(&webhook.url)
             .header("Content-Type", "application/json")
@@ -999,7 +849,9 @@ pub fn build_signed_request(
             // surfaces as a build error at send. A decrypt failure fails closed.
             if let Some(ref encrypted) = webhook.headers_encrypted {
                 if !encrypted.is_empty() {
-                    let headers = decrypt_envelope_json::<HashMap<String, String>>(&encryption.with_purpose("webhook.headers"), encrypted)
+                    let headers = self
+                        .repo
+                        .decrypt_json::<HashMap<String, String>>(encrypted)
                         .map_err(|e| {
                             format!("configured custom headers could not be decrypted: {e}")
                         })?;
@@ -1013,7 +865,7 @@ pub fn build_signed_request(
             // decrypt failure fails closed rather than delivering unsigned.
             if let Some(ref encrypted_secret) = webhook.secret_encrypted {
                 if !encrypted_secret.is_empty() {
-                    let secret = decrypt_envelope_string(&encryption.with_purpose("webhook.secret"), encrypted_secret).map_err(|e| {
+                    let secret = self.repo.decrypt_string(encrypted_secret).map_err(|e| {
                         format!("configured HMAC secret could not be decrypted: {e}")
                     })?;
                     // Sign `<unix_ts>.<body>` (Stripe-style) and send the
@@ -1038,165 +890,43 @@ pub fn build_signed_request(
 
         Ok(request)
     }
-}
 
-/// Render the outbound body for a channel and whether it should be HMAC-
-/// signed (generic only). Decrypts the PagerDuty routing key here (fail
-/// closed — a channel whose secret can't be decrypted must not deliver an
-/// unauthenticated event). Deterministic, so `deliver` computes it once
-/// before the retry loop.
-pub fn render_channel_body(
-    encryption: &EncryptionService,
-    webhook: &super::models::Webhook,
-    payload: &WebhookPayload,
-) -> Result<(Vec<u8>, bool), String> {
-    // Strict: an unknown stored channel_type fails closed rather than
-    // silently delivering as `generic` (which would sign + ship this row's
-    // secret to its endpoint).
-    let channel_type = webhook.resolve_channel_type()?;
+    /// Render the outbound body for a channel and whether it should be HMAC-
+    /// signed (generic only). Decrypts the PagerDuty routing key here (fail
+    /// closed — a channel whose secret can't be decrypted must not deliver an
+    /// unauthenticated event). Deterministic, so `deliver` computes it once
+    /// before the retry loop.
+    fn channel_body(
+        &self,
+        webhook: &super::models::Webhook,
+        payload: &WebhookPayload,
+    ) -> Result<(Vec<u8>, bool), String> {
+        // Strict: an unknown stored channel_type fails closed rather than
+        // silently delivering as `generic` (which would sign + ship this row's
+        // secret to its endpoint).
+        let channel_type = webhook.resolve_channel_type()?;
 
-    // PagerDuty carries its routing key in the encrypted secret column.
-    let routing_key = if channel_type == ChannelType::PagerDuty {
-        match &webhook.secret_encrypted {
-            Some(enc) if !enc.is_empty() => Some(
-                decrypt_envelope_string(&encryption.with_purpose("webhook.secret"), enc)
-                    .map_err(|e| format!("PagerDuty routing key could not be decrypted: {e}"))?,
-            ),
-            _ => None, // build_channel_body reports the missing-key error
-        }
-    } else {
-        None
-    };
-
-    let ctx = FormatContext {
-        routing_key: routing_key.as_deref(),
-    };
-    let formatted = build_channel_body(channel_type, payload, &ctx)?;
-    Ok((formatted.bytes, formatted.sign_hmac))
-}
-
-/// Outcome of ONE HTTP delivery attempt (nothing persisted). The hosted-shared
-/// tenant runner (NAN-2361) owns its own retry ledger and calls
-/// [`attempt_webhook_delivery`] once per attempt; the dedicated
-/// `WebhookService::deliver` keeps its in-process retry loop.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WebhookAttemptOutcome {
-    pub success: bool,
-    pub status_code: Option<u16>,
-    /// Receiver body, capped at `RESPONSE_READ_CAP` bytes.
-    pub response_body: Option<String>,
-    /// Never carries the destination URL (a Slack/Teams URL is a credential).
-    pub error: Option<String>,
-    /// Whether a later attempt could succeed: transport error, HTTP 5xx or
-    /// 429. Formatter / crypto / SSRF refusals and terminal 4xx are `false`.
-    pub retryable: bool,
-    pub duration_ms: u64,
-}
-
-impl WebhookAttemptOutcome {
-    fn refused(reason: String, started: Instant) -> Self {
-        Self {
-            success: false,
-            status_code: None,
-            response_body: None,
-            error: Some(reason),
-            retryable: false,
-            duration_ms: started.elapsed().as_millis() as u64,
-        }
-    }
-}
-
-/// Perform ONE delivery attempt of `payload` to `webhook` through exactly the
-/// dedicated delivery path: provider body rendering, delivery-time SSRF
-/// re-resolve + IP pinning (`ssrf_checked_client`), custom headers and HMAC
-/// signing (`build_signed_request`), the idempotency header, the bounded
-/// response read. Egress that the pod's NetworkPolicy blocks surfaces as a
-/// retryable transport error in `error` — recorded honestly, never worked
-/// around here.
-pub async fn attempt_webhook_delivery(
-    encryption: &EncryptionService,
-    webhook: &super::models::Webhook,
-    payload: &WebhookPayload,
-) -> WebhookAttemptOutcome {
-    if crate::demo_outbound::legacy_demo() { return demo_suppressed(); }
-    attempt_webhook_delivery_inner(crate::egress::LOCAL_TENANT, encryption, webhook, payload).await
-}
-
-#[cfg(feature = "enterprise")]
-pub async fn attempt_webhook_delivery_for_tenant(
-    lease: crate::demo_outbound::NotificationSendLease,
-    encryption: &EncryptionService,
-    webhook: &super::models::Webhook,
-    payload: &WebhookPayload,
-) -> WebhookAttemptOutcome {
-    let tenant = lease.tenant();
-    lease.run(attempt_webhook_delivery_inner(tenant, encryption, webhook, payload)).await
-        .unwrap_or_else(notification_attempt_expired)
-}
-
-#[cfg(feature = "enterprise")]
-pub fn notification_attempt_expired() -> WebhookAttemptOutcome {
-    WebhookAttemptOutcome { success:false,status_code:None,response_body:None,
-        error:Some("delivery attempt exceeded its admitted deadline".into()),retryable:true,duration_ms:45_000 }
-}
-
-pub fn demo_suppressed() -> WebhookAttemptOutcome {
-    WebhookAttemptOutcome { success: false, status_code: None, response_body: None,
-        error: Some(crate::demo_outbound::SUPPRESSED_DEMO.into()), retryable: false, duration_ms: 0 }
-}
-
-async fn attempt_webhook_delivery_inner(
-    tenant: Uuid,
-    encryption: &EncryptionService,
-    webhook: &super::models::Webhook,
-    payload: &WebhookPayload,
-) -> WebhookAttemptOutcome {
-    let started = Instant::now();
-    let (payload_bytes, sign_generic) = match render_channel_body(encryption, webhook, payload) {
-        Ok(v) => v,
-        Err(reason) => return WebhookAttemptOutcome::refused(reason, started),
-    };
-    let client = match WebhookService::ssrf_checked_proxy_client(&webhook.url, tenant).await {
-        Ok(c) => c,
-        Err(reason) => return WebhookAttemptOutcome::refused(reason, started),
-    };
-    let request = match build_signed_request(encryption, &client, webhook, &payload_bytes, sign_generic) {
-        Ok(r) => r,
-        Err(reason) => return WebhookAttemptOutcome::refused(reason, started),
-    };
-    let request = if let Some(key) = payload.idempotency_key.as_deref() {
-        request.header("X-NanoSIEM-Idempotency-Key", key)
-    } else {
-        request
-    };
-    match request.body(payload_bytes).send().await {
-        Ok(response) => {
-            let status = response.status();
-            let success = status.is_success();
-            let retryable = status.is_server_error() || status.as_u16() == 429;
-            let body = WebhookService::read_body_capped(response).await;
-            WebhookAttemptOutcome {
-                success,
-                status_code: Some(status.as_u16()),
-                response_body: Some(body),
-                error: if success { None } else { Some(format!("HTTP {}", status.as_u16())) },
-                retryable: !success && retryable,
-                duration_ms: started.elapsed().as_millis() as u64,
+        // PagerDuty carries its routing key in the encrypted secret column.
+        let routing_key = if channel_type == ChannelType::PagerDuty {
+            match &webhook.secret_encrypted {
+                Some(enc) if !enc.is_empty() => Some(
+                    self.repo
+                        .decrypt_string(enc)
+                        .map_err(|e| format!("PagerDuty routing key could not be decrypted: {e}"))?,
+                ),
+                _ => None, // build_channel_body reports the missing-key error
             }
-        }
-        Err(e) => WebhookAttemptOutcome {
-            success: false,
-            status_code: None,
-            response_body: None,
-            // F-39: strip the URL from the transport error.
-            error: Some(e.without_url().to_string()),
-            retryable: true,
-            duration_ms: started.elapsed().as_millis() as u64,
-        },
-    }
-}
+        } else {
+            None
+        };
 
-impl WebhookService {
+        let ctx = FormatContext {
+            routing_key: routing_key.as_deref(),
+        };
+        let formatted = build_channel_body(channel_type, payload, &ctx)?;
+        Ok((formatted.bytes, formatted.sign_hmac))
+    }
+
     /// Deliver a webhook payload with delivery-time SSRF pinning and bounded
     /// retries, then log a single delivery-log row for the final outcome.
     ///
@@ -1214,10 +944,6 @@ impl WebhookService {
         event_type: &str,
     ) -> WebhookTestResult {
         let start = Instant::now();
-        if crate::demo_outbound::legacy_demo() {
-            self.record(webhook, alert_id, event_type, None, None, false, Some(crate::demo_outbound::SUPPRESSED_DEMO), 0).await;
-            return WebhookTestResult { success: false, status_code: None, error: Some(crate::demo_outbound::SUPPRESSED_DEMO.into()), duration_ms: 0 };
-        }
 
         // Render the provider-specific body once (deterministic across retries).
         // A formatter or secret-decrypt failure is recorded as a failed delivery
@@ -1286,10 +1012,6 @@ impl WebhookService {
         };
 
         for attempt in 1..=MAX_DELIVERY_ATTEMPTS {
-            if crate::demo_outbound::legacy_demo() {
-                self.record(webhook, alert_id, event_type, None, None, false, Some(crate::demo_outbound::SUPPRESSED_DEMO), 0).await;
-                return WebhookTestResult { success: false, status_code: None, error: Some(crate::demo_outbound::SUPPRESSED_DEMO.into()), duration_ms: 0 };
-            }
             // Fail closed on a crypto error (deterministic — don't burn retries).
             let request = match self.build_request(&client, webhook, &payload_bytes, sign_generic) {
                 Ok(r) => r,
@@ -1523,6 +1245,86 @@ impl WebhookService {
         }
     }
 
+    /// One delivery attempt of a caller-rendered body to a caller-held
+    /// channel snapshot: no re-fetch of the channel row, no internal retry.
+    ///
+    /// For callers that own their retry / approval state and must not have a
+    /// request silently repeated (a receiver that may already have acted).
+    /// The SSRF pin, custom headers and HMAC signing (when `sign_hmac`) are
+    /// the same as every other delivery. The outcome says whether the request
+    /// can have reached the receiver.
+    pub async fn send_once(
+        &self,
+        webhook: &super::models::Webhook,
+        body: Vec<u8>,
+        sign_hmac: bool,
+        idempotency_key: Option<&str>,
+        event_type: &str,
+    ) -> SingleAttempt {
+        let start = Instant::now();
+        let outcome = async {
+            let client = match Self::ssrf_checked_client(&webhook.url).await {
+                Ok(c) => c,
+                Err(reason) => return (SingleAttemptOutcome::Blocked, None, Some(reason)),
+            };
+            let request = match self.build_request(&client, webhook, &body, sign_hmac) {
+                Ok(r) => r,
+                Err(reason) => return (SingleAttemptOutcome::NotSent, None, Some(reason)),
+            };
+            let request = match idempotency_key {
+                Some(key) => request.header("X-NanoSIEM-Idempotency-Key", key),
+                None => request,
+            };
+            match request.body(body.clone()).send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let _ = Self::read_body_capped(response).await;
+                    if status.is_success() {
+                        (SingleAttemptOutcome::Delivered, Some(status.as_u16()), None)
+                    } else if status.is_server_error() {
+                        // The receiver may have acted before failing.
+                        (SingleAttemptOutcome::MaybeDelivered, Some(status.as_u16()), Some(format!("HTTP {status}")))
+                    } else {
+                        (SingleAttemptOutcome::Rejected, Some(status.as_u16()), Some(format!("HTTP {status}")))
+                    }
+                }
+                // F-39: never carry the URL (a bearer credential) in the error.
+                Err(e) if e.is_connect() || e.is_builder() => {
+                    (SingleAttemptOutcome::NotSent, None, Some(e.without_url().to_string()))
+                }
+                Err(e) => (SingleAttemptOutcome::MaybeDelivered, None, Some(e.without_url().to_string())),
+            }
+        }
+        .await;
+        let (outcome, status, error) = outcome;
+        let duration_ms = start.elapsed().as_millis() as i32;
+        self.record(
+            webhook,
+            None,
+            event_type,
+            status.map(i32::from),
+            None,
+            outcome == SingleAttemptOutcome::Delivered,
+            error.as_deref(),
+            duration_ms,
+        )
+        .await;
+        SingleAttempt { outcome, status_code: status, error }
+    }
+
+    /// Decrypt a channel's stored secret (the PagerDuty routing key, or the
+    /// generic channel's HMAC secret) for a caller rendering its own body.
+    pub fn channel_secret(&self, webhook: &super::models::Webhook) -> Result<Option<String>, String> {
+        match &webhook.secret_encrypted {
+            Some(enc) if !enc.is_empty() => self
+                .repo
+                .decrypt_string(enc)
+                .map(Some)
+                .map_err(|e| format!("channel secret could not be decrypted: {e}")),
+            _ => Ok(None),
+        }
+    }
+
     /// Send a synchronous test delivery to a webhook endpoint.
     pub async fn send_test(&self, webhook_id: Uuid) -> Result<WebhookTestResult, String> {
         let webhook = self
@@ -1530,11 +1332,6 @@ impl WebhookService {
             .get(webhook_id)
             .await
             .map_err(|e| format!("Webhook not found: {}", e))?;
-
-        if crate::demo_outbound::legacy_demo() {
-            self.record(&webhook, None, "webhook.test", None, None, false, Some(crate::demo_outbound::SUPPRESSED_DEMO), 0).await;
-            return Ok(WebhookTestResult { success: false, status_code: None, error: Some(crate::demo_outbound::SUPPRESSED_DEMO.into()), duration_ms: 0 });
-        }
 
         let base = self.resolve_base_url().await;
         let payload = WebhookPayload {
@@ -1717,6 +1514,28 @@ impl WebhookService {
     pub fn repo(&self) -> &WebhookRepository {
         &self.repo
     }
+}
+
+/// Result of [`WebhookService::send_once`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SingleAttemptOutcome {
+    /// 2xx.
+    Delivered,
+    /// A terminal non-5xx refusal: the receiver did not act.
+    Rejected,
+    /// Refused by the delivery-time SSRF guard; nothing was sent.
+    Blocked,
+    /// Nothing left this process (no connection, or the request could not be built).
+    NotSent,
+    /// The request may have reached the receiver (5xx, timeout, reset).
+    MaybeDelivered,
+}
+
+#[derive(Debug, Clone)]
+pub struct SingleAttempt {
+    pub outcome: SingleAttemptOutcome,
+    pub status_code: Option<u16>,
+    pub error: Option<String>,
 }
 
 /// Extract the distinct origin `source_type`s from a stored `matched_events`

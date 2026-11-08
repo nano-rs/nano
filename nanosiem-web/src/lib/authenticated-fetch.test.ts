@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+/// <reference types="node" />
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { authenticatedFetch } from './authenticated-fetch.ts';
+import { allowsAnonymousRequest, authenticatedFetch } from './authenticated-fetch.ts';
 import { clearAccessToken, setAccessToken } from './auth-token.ts';
-import { sessionCredentials } from './session-credentials.ts';
-import { SessionExpiredError } from './request-credentials.ts';
+import { sessionCredentials, SessionExpiredError } from './session-credentials.ts';
 
 const url = 'https://example.test/api/search';
 
@@ -20,10 +20,9 @@ test('JSON and SSE requests wait for refresh, then fetch exactly once each', asy
   const sent: string[] = [];
   t.mock.method(globalThis, 'fetch', async (_url: string, options: RequestInit) => {
     sent.push(new Headers(options.headers).get('Authorization')!);
-    assert.equal(options.credentials, 'omit');
     return new Response('{}');
   });
-  const requests = ['/api/dashboards', '/api/search/stream', '/api/auth/tenant-bootstrap']
+  const requests = ['/api/dashboards', '/api/search/stream', '/api/cases/events']
     .map(endpoint => authenticatedFetch(endpoint, url));
   await Promise.resolve();
   assert.equal(sent.length, 0);
@@ -84,7 +83,19 @@ test('a second 401 expires once, while a non-auth retry error stays a normal res
   assert.equal(prompts, 1);
 });
 
-test('cancelled requests do not replay after waiting for refresh', async t => {
+test('a 401 from an anonymous auth route (wrong password) never refreshes or expires', async t => {
+  clearAccessToken();
+  let refreshes = 0;
+  let prompts = 0;
+  sessionCredentials.configure(async () => { refreshes++; return true; }, () => { prompts++; });
+  t.mock.method(globalThis, 'fetch', async () => new Response('{}', { status: 401 }));
+  const response = await authenticatedFetch('/api/auth/login', 'https://example.test/api/auth/login');
+  assert.equal(response.status, 401);
+  assert.equal(refreshes, 0);
+  assert.equal(prompts, 0);
+});
+
+test('cancelled requests do not send after waiting for refresh', async t => {
   setAccessToken('cancel-login', 900);
   const controller = new AbortController();
   controller.abort();
@@ -93,18 +104,13 @@ test('cancelled requests do not replay after waiting for refresh', async t => {
   assert.equal(fetch.mock.callCount(), 0);
 });
 
-test('tenant replacement while waiting prevents a request under the new identity', async t => {
-  setAccessToken('tenant-a', 900);
-  let replaced = false;
-  const refresh = sessionCredentials.runRefresh(async () => {
-    setAccessToken('tenant-b', 900);
-    replaced = true;
-    return true;
-  });
-  const fetch = t.mock.method(globalThis, 'fetch', async () => new Response('{}'));
-  await assert.rejects(authenticatedFetch('/api/search', url, {}, () => {
-    if (replaced) throw new Error('stale tenant');
-  }), /stale tenant/);
-  await refresh;
-  assert.equal(fetch.mock.callCount(), 0);
+test('only authentication and bootstrap routes are anonymous', () => {
+  for (const endpoint of ['/api/auth/login', '/api/auth/refresh', '/api/auth/oidc/providers',
+    '/api/auth/oidc/okta/callback', '/api/setup/status', '/api/capabilities', '/api/search/shared/abc']) {
+    assert.ok(allowsAnonymousRequest(endpoint), endpoint);
+  }
+  for (const endpoint of ['/api/auth/me', '/api/auth/password', '/api/auth/mfa/status', '/api/search',
+    '/api/search/history', '/api/rules', '/api/auth/loginx']) {
+    assert.ok(!allowsAnonymousRequest(endpoint), endpoint);
+  }
 });

@@ -36,7 +36,8 @@
       // Keep in sync with THEMES in src/lib/theme.ts. This runs before the
       // bundle loads, so it cannot import it — but an unknown stored value must
       // not be pasted onto <html> as a class, so validate against the list.
-      const themes = ['light', 'dark', 'matte'];
+      // theme-parity.test.ts fails if this list drifts from THEMES.
+      const themes = ['light', 'paper', 'dark', 'matte', 'mono', 'dark-pink', 'dark-violet', 'dark-emerald', 'dark-amber'];
       const storageKey = 'nanosiem-theme';
       const stored = localStorage.getItem(storageKey) || 'dark';
       const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';

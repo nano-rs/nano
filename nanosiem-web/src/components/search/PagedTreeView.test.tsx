@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 // @vitest-environment jsdom
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -71,12 +69,4 @@ it('keeps atomic tree compatibility and settles its footer without starting pane
   expect(screen.getByTestId('nodes').textContent).toBe('atomic:0');
   expect(mocks.page).not.toHaveBeenCalled(); expect(mocks.job).not.toHaveBeenCalled();
   expect(report).toHaveBeenLastCalledWith(expect.objectContaining({ loading: false }));
-});
-it('shows the server note naming the missing field on an empty exact tree (NAN-3261)', async () => {
-  mocks.job.mockResolvedValue({ job_id: 'owned-job', status: 'queued' });
-  mocks.page.mockImplementation(request => Promise.resolve(request.job_id
-    ? { ...page(false, []), total_roots: 0, total_nodes: 0, note: 'No events in range carry http_request.referrer.' }
-    : page(true, [])));
-  render(<PagedTreeView marker={marker} nodes={[]} config={config} />);
-  await waitFor(() => expect(screen.getByRole('status').textContent).toContain('No events in range carry http_request.referrer.'));
 });

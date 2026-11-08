@@ -28,7 +28,6 @@ import {
   Database,
   Shield,
   ShieldCheck,
-  Globe,
   EyeOff,
   KeyRound,
   Users as UsersIcon,
@@ -45,7 +44,6 @@ import {
   MessageSquare,
   Zap,
   PackageOpen,
-  Workflow,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -62,8 +60,6 @@ export interface SettingsSectionChild {
   permissions?: string | string[];
   /** Build-time capability gate — hides the entry in open-core builds when off. */
   capability?: keyof Capabilities;
-  /** Hidden for hosted-shared tenants (NAN-2361): a deployment-global control. */
-  sharedHidden?: boolean;
   icon?: LucideIcon | ComponentType<SVGProps<SVGSVGElement>>;
 }
 
@@ -95,7 +91,6 @@ export interface SettingsSection {
   demoHidden?: boolean;
   /** Only show when the deployment runs in air-gapped mode (`system_config.air_gap`). */
   airgapOnly?: boolean;
-  sharedOnly?: boolean;
   children?: SettingsSectionChild[];
 }
 
@@ -168,12 +163,6 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
       },
     ],
   },
-  {
-    id: 'integrations', sharedOnly: true, label: 'Integrations', group: 'workspace', icon: Cloud,
-    desc: 'Tenant lookup URL destinations.', href: '/settings/integrations/lookup-url-allowlist',
-    permissions: 'settings:system',
-    children: [{ id: 'lookup-url-allowlist', icon: Globe, label: 'Lookup URL allowlist', href: '/settings/integrations/lookup-url-allowlist', permissions: 'settings:system' }],
-  },
   // Notification channels (NAN-1790): the unified outbound surface. Absorbs the
   // legacy generic webhooks — Slack / Teams / PagerDuty / generic all live here.
   {
@@ -184,19 +173,6 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     desc: 'Slack, Teams, PagerDuty, and webhook channels — plus routing.',
     href: '/settings/notifications',
     permissions: 'settings:webhooks',
-    status: 'ok',
-  },
-  // Tenant SOAR opt-in (NAN-4462). Only plans with the optional `soar`
-  // component show it; `soar:view` reads, `settings:system` saves.
-  {
-    id: 'soar',
-    label: 'SOAR',
-    group: 'workspace',
-    icon: Workflow,
-    desc: 'Turn automated response on or off for this tenant.',
-    href: '/settings/soar',
-    permissions: ['soar:view', 'settings:system'],
-    capability: 'soar',
     status: 'ok',
   },
   // The standalone Webhooks rail item is retired in favor of the unified
@@ -283,6 +259,17 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     status: 'ok',
   },
   {
+    id: 'soar',
+    label: 'SOAR',
+    group: 'workspace',
+    icon: Zap,
+    desc: 'Response automation switch, AI budget, notifications, private-network egress.',
+    href: '/settings/soar',
+    permissions: ['settings:system', 'soar:view'],
+    capability: 'soar',
+    status: 'ok',
+  },
+  {
     id: 'risk',
     label: 'Risk Scoring',
     group: 'detection',
@@ -319,7 +306,6 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
         href: '/settings/storage?tab=clickhouse',
         icon: Zap,
         permissions: 'settings:retention',
-        sharedHidden: true,
       },
       {
         id: 'storage-postgres',
@@ -390,7 +376,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     label: 'Source Visibility',
     group: 'admin',
     icon: EyeOff,
-    desc: 'Restrict which groups can see events from each source.',
+    desc: 'Restrict which groups can see events from a source type.',
     href: '/settings/source-scopes',
     matchPrefixes: ['/settings/source-scopes'],
     permissions: 'source_scopes:view',
@@ -426,6 +412,17 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     desc: 'Data subject requests, retention overrides, legal hold.',
     href: '/settings/gdpr',
     permissions: 'gdpr:anonymize',
+    status: 'ok',
+  },
+  {
+    id: 'license',
+    label: 'Offline License',
+    group: 'admin',
+    icon: KeyRound,
+    desc: 'Install, renew, inspect, and recover the C05 offline entitlement.',
+    href: '/settings/license',
+    permissions: 'settings:system',
+    airgapOnly: true,
     status: 'ok',
   },
   {

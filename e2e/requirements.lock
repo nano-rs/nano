@@ -1,0 +1,31 @@
+# nano-e2e pinned dependencies (generated with pip freeze from pyproject.toml's ranges).
+# Regenerate: python3 -m venv /tmp/v && /tmp/v/bin/pip install -e '.' && /tmp/v/bin/pip freeze --exclude nano-e2e
+anyio==4.16.0
+boto3==1.43.123
+botocore==1.43.123
+certifi==2026.10.23
+cffi==2.1.1
+charset-normalizer==3.5.2
+cryptography==50.0.2
+google-auth==2.62.1
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+iniconfig==2.3.1
+jmespath==1.1.0
+packaging==26.3
+pluggy==1.7.0
+pyasn1==0.6.5
+pyasn1_modules==0.4.2
+pycparser==3.12
+Pygments==2.21.0
+pytest-timeout==2.4.0
+pytest==9.2.0
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+requests==2.34.2
+s3transfer==0.19.3
+six==1.17.0
+typing_extensions==4.16.0
+urllib3==2.8.0

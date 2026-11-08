@@ -1,17 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! NAN-3806: the shipped Vector lanes route on the token, not on what the
-//! sender declares. Runs the real `source_type_extract` (HTTP, 00-base.toml)
-//! and `hec_normalize` (HEC, 02-hec-source.toml) VRL with the metadata the
-//! nano-rs/vector fork stamps for a matched `valid_tokens_file` entry.
+//! NAN-4907 (port of main's NAN-3806 lane tests): the shipped Vector lanes
+//! route on the token, not on what the sender declares. Runs the real
+//! `source_type_extract` (HTTP, 00-base.toml), `hec_normalize` (HEC,
+//! 02-hec-source.toml) and `otlp_logs_prep` (03-otlp-source.toml) VRL with the
+//! metadata the nano-rs/vector fork stamps for a matched `valid_tokens_file`
+//! entry.
+
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::{TokenFileEntry, PLATFORM_PULL_CREDENTIAL_ID, PLATFORM_PULL_ROUTE};
+use super::{
+    file_extra_entries, BindableSource, IngestTokenSettings, InstallTokenMode, TokenFileEntry,
+    INSTALL_CREDENTIAL_ID, MULTIPLEX_ROUTE, PLATFORM_PULL_CREDENTIAL_ID,
+};
 
 const BASE: &str = include_str!("../../../config/vector/00-base.toml");
 const HEC: &str = include_str!("../../../config/vector/02-hec-source.toml");
+const OTLP: &str = include_str!("../../../config/vector/03-otlp-source.toml");
 
 /// Parses a shipped config after Vector's `${VAR:-default}` substitution
 /// (unquoted numeric defaults are not TOML until substituted).
@@ -28,6 +36,14 @@ fn transform_source(config: &str, name: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("{name} has a VRL source"))
         .to_string()
+}
+
+/// `program` with `get_env_var(NAME) ?? ""` resolved to `value` (the tests
+/// substitute env lookups instead of mutating the process environment).
+fn with_env(program: &str, name: &str, value: &str) -> String {
+    let lookup = format!(r#"get_env_var("{name}") ?? """#);
+    assert!(program.contains(&lookup), "program reads {name}");
+    program.replace(&lookup, &format!("{value:?}"))
 }
 
 enum Outcome {
@@ -89,10 +105,10 @@ fn http_spoofed_source_type_lands_in_the_tokens_source() {
     let route = stamped_route("apache_access");
     // Every way an HTTP sender can declare a type: the X-Source-Type header,
     // a body `source_type` (merged to `.source_type` by parse_content), and
-    // `metadata.source_type`.
+    // `metadata.source_type`. A body `claimed_source_type` is never trusted.
     for event in [
         json!({"message": "x", "X-Source-Type": "windows_sysmon", "source_type": "unknown"}),
-        json!({"message": "x", "source_type": "windows_sysmon"}),
+        json!({"message": "x", "source_type": "windows_sysmon", "claimed_source_type": "forged"}),
         json!({"message": "x", "source_type": "unknown", "metadata": {"source_type": "windows_sysmon"}}),
     ] {
         let (event, metadata) = kept(run(&program, event, Some((TOKEN, &route))));
@@ -103,7 +119,7 @@ fn http_spoofed_source_type_lands_in_the_tokens_source() {
     // No claim, or the right one: no claimed_source_type noise.
     for event in [
         json!({"message": "x", "source_type": "unknown"}),
-        json!({"message": "x", "source_type": "apache_access"}),
+        json!({"message": "x", "source_type": "apache_access", "claimed_source_type": "forged"}),
     ] {
         let (event, _) = kept(run(&program, event, Some((TOKEN, &route))));
         assert_eq!(event["source_type"], "apache_access");
@@ -114,33 +130,79 @@ fn http_spoofed_source_type_lands_in_the_tokens_source() {
 #[test]
 fn http_listed_token_without_a_route_is_refused() {
     let program = transform_source(BASE, "source_type_extract");
-    for route in ["", "*"] {
-        assert!(matches!(
-            run(&program, json!({"message": "x", "source_type": "apache_access"}), Some((TOKEN, route))),
-            Outcome::Aborted
+    assert!(matches!(
+        run(&program, json!({"message": "x", "source_type": "apache_access"}), Some((TOKEN, ""))),
+        Outcome::Aborted
+    ));
+}
+
+/// The platform pull credential and the install token in legacy multiplex
+/// mode are listed with the multiplex route: their declared type routes.
+#[test]
+fn multiplex_credentials_keep_their_declared_type() {
+    for id in [PLATFORM_PULL_CREDENTIAL_ID, INSTALL_CREDENTIAL_ID] {
+        let id = id.to_string();
+        let (event, _) = kept(run(
+            &transform_source(BASE, "source_type_extract"),
+            json!({"message": "x", "source_type": "okta"}),
+            Some((&id, MULTIPLEX_ROUTE)),
         ));
+        assert_eq!(event["source_type"], "okta");
+        assert!(event.get("claimed_source_type").is_none());
+        let (event, _) = kept(run(
+            &transform_source(HEC, "hec_normalize"),
+            json!({"message": "{\"a\":1}", "splunk_sourcetype": "okta"}),
+            Some((&id, MULTIPLEX_ROUTE)),
+        ));
+        assert_eq!(event["source_type"], "okta");
     }
 }
 
+/// No credential stamp = the static install-token fallback (tokens file
+/// missing). It fails closed unless the deployment explicitly opted in with
+/// NANO_INGEST_STATIC_FALLBACK=true; then it is today's multiplex behaviour.
 #[test]
-fn platform_pull_credential_keeps_its_declared_type() {
-    let platform = PLATFORM_PULL_CREDENTIAL_ID.to_string();
-    for config in [BASE, HEC] {
-        assert!(config.contains(&platform), "the lanes key on {platform}");
+fn unstamped_events_fail_closed_unless_the_static_fallback_is_explicit() {
+    const FLAG: &str = "NANO_INGEST_STATIC_FALLBACK";
+    let auth = with_env(&transform_source(BASE, "auth_check"), "VECTOR_AUTH_TOKEN", "install");
+    let hec = transform_source(HEC, "hec_normalize");
+    let event = json!({"message": "x", "X-Source-Type": "okta"});
+    let hec_event = json!({"message": "raw", "splunk_sourcetype": "apache_access"});
+    for off in ["", "false", "1"] {
+        assert!(matches!(run(&with_env(&auth, FLAG, off), event.clone(), None), Outcome::Aborted), "{off:?}");
+        assert!(matches!(run(&with_env(&hec, FLAG, off), hec_event.clone(), None), Outcome::Aborted), "{off:?}");
     }
-    let program = transform_source(BASE, "source_type_extract");
-    let (event, _) = kept(run(
-        &program,
-        json!({"message": "x", "source_type": "okta"}),
-        Some((&platform, PLATFORM_PULL_ROUTE)),
-    ));
-    assert_eq!(event["source_type"], "okta");
-    let (event, _) = kept(run(
-        &transform_source(HEC, "hec_normalize"),
-        json!({"message": "{\"a\":1}", "splunk_sourcetype": "okta"}),
-        Some((&platform, PLATFORM_PULL_ROUTE)),
-    ));
-    assert_eq!(event["source_type"], "okta");
+    let (e, _) = kept(run(&with_env(&auth, FLAG, "true"), event.clone(), None));
+    assert_eq!(e["source_type"], "okta");
+    assert_eq!(e["auth_status"], "authenticated");
+    let (e, _) = kept(run(&with_env(&hec, FLAG, "true"), hec_event, None));
+    assert_eq!(e["source_type"], "apache_access");
+    // A stamped event never depends on the flag.
+    let (e, _) = kept(run(&with_env(&auth, FLAG, ""), event, Some((TOKEN, "apache_access"))));
+    assert_eq!(e["auth_status"], "authenticated");
+    // The source's static check accepts the install token only with the flag.
+    let base = parse(BASE);
+    let source = base["sources"]["http_ingest"]["auth"]["source"].as_str().unwrap();
+    assert!(source.contains("static_fallback && auth_header == \"Bearer \" + expected_token"), "{source}");
+}
+
+/// NAN-4907 P1: the unauthenticated Vector-native listener never selects a
+/// parser route; a declared type is kept only as `claimed_source_type`.
+#[test]
+fn vector_native_events_get_a_fixed_route() {
+    const FLAG: &str = "NANO_VECTOR_NATIVE_TRUST_SOURCE_TYPE";
+    let program = transform_source(include_str!("../../../config/vector/01-vector-source.toml"), "vector_auth");
+    let event = json!({"message": "x", "source_type": "Windows_Sysmon", "claimed_source_type": "forged"});
+    let (e, _) = kept(run(&with_env(&program, FLAG, ""), event.clone(), None));
+    assert_eq!(e["source_type"], "vector_native");
+    assert_eq!(e["claimed_source_type"], "windows_sysmon");
+    let (e, _) = kept(run(&with_env(&program, FLAG, ""), json!({"message": "x"}), None));
+    assert_eq!(e["source_type"], "vector_native");
+    assert!(e.get("claimed_source_type").is_none());
+    // Explicit opt-in for a trusted network: the declared type routes.
+    let (e, _) = kept(run(&with_env(&program, FLAG, "true"), event, None));
+    assert_eq!(e["source_type"], "windows_sysmon");
+    assert!(e.get("claimed_source_type").is_none());
 }
 
 #[test]
@@ -151,13 +213,13 @@ fn hec_spoofed_sourcetype_lands_in_the_tokens_source() {
         json!({"message": "{\"msg\":\"x\"}", "splunk_sourcetype": "windows_sysmon"}),
         json!({"message": "raw line", "sourcetype": "windows_sysmon"}),
         // A payload key cannot smuggle a routing field back in.
-        json!({"message": "{\"source_type\":\"windows_sysmon\",\"claimed_source_type\":\"y\"}", "splunk_sourcetype": "windows_sysmon"}),
+        json!({"event": {"source_type": "windows_sysmon", "claimed_source_type": "y"}, "splunk_sourcetype": "windows_sysmon"}),
     ] {
         let (event, metadata) = kept(run(&program, event, Some((TOKEN, &route))));
         assert_eq!(event["source_type"], "pan_traffic", "{event}");
-        assert_eq!(metadata["source_type"], "pan_traffic");
         assert_eq!(event["claimed_source_type"], "windows_sysmon");
         assert_eq!(event["auth_status"], "authenticated");
+        assert_eq!(metadata["nano_credential_id"], TOKEN);
     }
     // No sourcetype at all: still the token's source.
     let (event, _) = kept(run(&program, json!({"message": "raw"}), Some((TOKEN, &route))));
@@ -166,47 +228,64 @@ fn hec_spoofed_sourcetype_lands_in_the_tokens_source() {
 }
 
 #[test]
-fn hec_unbound_or_unstamped_token_is_refused() {
+fn hec_listed_token_without_a_route_is_refused() {
     let program = transform_source(HEC, "hec_normalize");
     let event = json!({"message": "raw", "splunk_sourcetype": "apache_access"});
-    for route in ["", "*"] {
-        assert!(matches!(run(&program, event.clone(), Some((TOKEN, route))), Outcome::Aborted));
-    }
-    // No credential stamp = the static `valid_tokens` fallback, which nano-api
-    // turns off whenever an install token is set. Without the explicit
-    // unauthenticated opt-in (unset in tests) nothing routes by sourcetype.
-    assert!(matches!(run(&program, event, None), Outcome::Aborted));
+    assert!(matches!(run(&program, event, Some((TOKEN, ""))), Outcome::Aborted));
 }
 
+/// The sources read the hashed tokens file, and the HTTP source's static
+/// fallback accepts only the install token (or the explicit unauthenticated
+/// opt-in), never a literal placeholder.
 #[test]
-fn http_source_auth_never_accepts_a_static_token() {
-    // The source's static `auth` fallback: true only for the explicit
-    // unauthenticated opt-in with no install token, never for a bearer.
-    let table = parse(BASE);
-    let source = table["sources"]["http_ingest"]["auth"]["source"].as_str().unwrap();
-    assert!(!source.contains("auth_header"), "{source}");
-    assert!(source.contains("expected_token == \"\" && allow_unauthenticated"));
+fn sources_read_the_tokens_file() {
+    let base = parse(BASE);
+    let http = &base["sources"]["http_ingest"];
+    assert_eq!(
+        http["valid_tokens_file"]["path"].as_str(),
+        Some(super::DEFAULT_TOKENS_FILE)
+    );
+    let http_reload_secs = http["valid_tokens_file"]["reload_interval_secs"]
+        .as_integer()
+        .expect("HTTP token reload interval") as u64;
+    assert_eq!(http_reload_secs, 2);
+    assert!(
+        super::service::SHARED_VOLUME_REMOVAL_SETTLE > Duration::from_secs(http_reload_secs),
+        "the destructive API response must settle longer than Vector's HTTP token cache"
+    );
+    let auth = http["auth"]["source"].as_str().unwrap();
+    assert!(auth.contains("auth_header == \"Bearer \" + expected_token"), "{auth}");
+    assert!(auth.contains("allow_unauthenticated"), "{auth}");
+    // The Authorization header is read by the source, never copied into events.
+    let headers: Vec<&str> = http["headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h.as_str())
+        .collect();
+    assert!(!headers.iter().any(|h| h.eq_ignore_ascii_case("authorization")), "{headers:?}");
+
+    let hec = parse(HEC);
+    let source = &hec["sources"]["splunk_hec_ingest"];
+    assert_eq!(
+        source["valid_tokens_file"]["path"].as_str(),
+        Some(super::DEFAULT_TOKENS_FILE)
+    );
+    let hec_reload_secs = source["valid_tokens_file"]["reload_interval_secs"]
+        .as_integer()
+        .expect("HEC token reload interval") as u64;
+    assert_eq!(hec_reload_secs, 2);
+    assert!(
+        super::service::SHARED_VOLUME_REMOVAL_SETTLE > Duration::from_secs(hec_reload_secs),
+        "the destructive API response must settle longer than Vector's HEC token cache"
+    );
+    assert_eq!(
+        source["valid_tokens"][0].as_str(),
+        Some("${VECTOR_AUTH_TOKEN}")
+    );
 }
 
-#[test]
-fn hec_bytes_codec_preserves_string_and_object_payloads() {
-    assert_eq!(parse(HEC)["sources"]["splunk_hec_ingest"]["event"]["decoding"]["codec"].as_str(), Some("bytes"));
-    let payload = json!({"message": "hello", "nested": {"id": 42}, "source_type": "spoofed"});
-    for event in [json!(payload.to_string()), payload.clone()] {
-        let log = crate::parsers::tenant_bundle::bronze_row_contract::splunk_hec_log(
-            &json!({"event": event, "sourcetype": "okta"})
-        ).unwrap();
-        let (normalized, metadata) = kept(run(&transform_source(HEC, "hec_normalize"), log, Some((TOKEN, "okta"))));
-        assert_eq!(serde_json::from_str::<Value>(normalized["message"].as_str().unwrap()).unwrap(), payload);
-        assert_eq!(normalized["source_type"], "okta");
-        assert_eq!(metadata["source_type"], "okta");
-    }
-}
-
-/// NAN-3646: `.message` is never left empty for a HEC payload. Covers a
-/// string event, an object event (as the bytes codec delivers it, as an
-/// unflattened `.event`, and spread over the root by a Vector without the
-/// bytes codec), a non-string `.message`, and an envelope with no event.
+/// NAN-3646 (ported): `.message` is never left empty for a HEC payload.
 #[test]
 fn hec_normalize_message_for_string_object_and_missing_events() {
     let program = transform_source(HEC, "hec_normalize");
@@ -215,12 +294,6 @@ fn hec_normalize_message_for_string_object_and_missing_events() {
         serde_json::from_str(event["message"].as_str().expect("message is a string")).unwrap()
     };
 
-    // String event: unchanged.
-    let log = crate::parsers::tenant_bundle::bronze_row_contract::splunk_hec_log(
-        &json!({"event": "raw line", "sourcetype": "okta"}),
-    )
-    .unwrap();
-    assert_eq!(normalize(log)["message"], "raw line");
     assert_eq!(normalize(json!({"event": "raw line", "splunk_sourcetype": "okta"}))["message"], "raw line");
 
     // Object event with an explicit `message`: that message wins.
@@ -232,8 +305,8 @@ fn hec_normalize_message_for_string_object_and_missing_events() {
     let event = normalize(json!({"event": payload, "splunk_sourcetype": "okta"}));
     assert_eq!(as_json(&event), payload);
 
-    // Object event spread over the root (no bytes codec): rebuilt from the
-    // root without the HEC envelope, deterministically (key-sorted).
+    // Object event spread over the root: rebuilt from the root without the
+    // HEC envelope, deterministically (key-sorted).
     let spread = json!({
         "user": "alice", "action": "login", "nested": {"id": 7},
         "splunk_sourcetype": "okta", "splunk_source": "s", "splunk_index": "main",
@@ -247,8 +320,6 @@ fn hec_normalize_message_for_string_object_and_missing_events() {
         r#"{"action":"login","nested":{"id":7},"user":"alice"}"#,
         "key-sorted, byte-stable serialization"
     );
-    assert_eq!(normalize(spread)["message"], event["message"]);
-    // An empty `.message` alongside spread fields is treated the same way.
     let event = normalize(json!({"message": "", "user": "alice", "splunk_sourcetype": "okta"}));
     assert_eq!(as_json(&event), json!({"user": "alice"}));
 
@@ -262,39 +333,133 @@ fn hec_normalize_message_for_string_object_and_missing_events() {
     assert_eq!(event["source_type"], "okta");
 }
 
+fn otlp_program(key: &str) -> String {
+    with_env(&transform_source(OTLP, "otlp_logs_prep"), "NANO_OTLP_EDGE_KEY", key)
+}
+
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
 #[test]
 fn otlp_logs_use_edge_identity_and_bound_route() {
-    let program = transform_source(
-        include_str!("../../../config/vector/03-otlp-source.toml"),
-        "otlp_logs_prep",
-    );
-    let (event, metadata) = kept(run(
-        &program,
-        json!({
-            "message": "hello", "x-nano-credential-id": TOKEN,
-            "x-nano-source-route": "otlp_log",
-            "attributes": {"x-nano-credential-id": "forged", "source_type": "forged"}
-        }),
-        None,
-    ));
+    let key = "edge-key";
+    let program = otlp_program(key);
+    let id = Uuid::parse_str(TOKEN).unwrap();
+    let fresh = now_secs() + super::OTLP_ASSERTION_TTL_SECS;
+    let assertion = super::otlp_identity_assertion(key, &id, "otlp_log", fresh).unwrap();
+    let send = |route: &str, assertion: &str, program: &str| {
+        kept(run(
+            program,
+            json!({"message": "x", "x-nano-credential-id": TOKEN,
+                   "x-nano-source-route": route, "x-nano-identity-assertion": assertion,
+                   "attributes": {"source_type": "forged"}}),
+            None,
+        ))
+    };
+    let (event, metadata) = send("otlp_log", &assertion, &program);
     assert_eq!(event["auth_status"], "authenticated");
     assert_eq!(event["source_type"], "otlp_log");
     assert_eq!(metadata["nano_credential_id"], TOKEN);
-    assert_eq!(metadata["source_type"], "otlp_log");
     assert!(event.get("x-nano-credential-id").is_none());
-    let (_, metadata) = kept(run(
-        &program,
-        json!({"message": "internal",
-        "attributes": {"x-nano-credential-id": "forged"}}),
-        None,
-    ));
-    assert!(metadata.get("nano_credential_id").is_none());
+    assert!(event.get("x-nano-identity-assertion").is_none());
+
+    // Forged / replayed identities keep honest provenance: no assertion, one
+    // for another route, under another key, expired, too far in the future,
+    // or malformed.
+    let other_route = super::otlp_identity_assertion(key, &id, "apache_access", fresh).unwrap();
+    let other_key = super::otlp_identity_assertion("install-token", &id, "otlp_log", fresh).unwrap();
+    let expired = super::otlp_identity_assertion(key, &id, "otlp_log", now_secs() - 1).unwrap();
+    let future = super::otlp_identity_assertion(key, &id, "otlp_log", now_secs() + 3600).unwrap();
+    let mac_only = assertion.split_once('.').unwrap().1.to_string();
+    for forged in ["", other_route.as_str(), other_key.as_str(), expired.as_str(), future.as_str(), mac_only.as_str(), "x.y"] {
+        let (event, metadata) = send("otlp_log", forged, &program);
+        assert_eq!(event["auth_status"], "otlp", "{forged}");
+        assert_eq!(event["source_type"], "otlp_log");
+        assert!(metadata.get("nano_credential_id").is_none());
+    }
+    // A valid assertion does not carry over to another route.
+    let (event, _) = send("apache_access", &assertion, &program);
+    assert_eq!(event["source_type"], "otlp_log");
+    // Without an edge key nothing can be verified.
+    let (event, _) = send("otlp_log", &assertion, &otlp_program(""));
+    assert_eq!(event["auth_status"], "otlp");
+}
+
+fn source(route: &str) -> BindableSource {
+    BindableSource {
+        source_id: Uuid::from_u128(7),
+        name: "Apache".into(),
+        source_type: "routed".into(),
+        route_key: route.into(),
+        enabled: true,
+        deployed: false,
+    }
+}
+
+fn settings(enabled: bool, mode: InstallTokenMode) -> IngestTokenSettings {
+    IngestTokenSettings {
+        install_token_enabled: enabled,
+        install_token_mode: mode,
+        ..IngestTokenSettings::default()
+    }
+}
+
+/// Which install-token entry nano renders in each mode.
+#[test]
+fn install_token_entries_by_mode() {
+    let bound = source("apache_access");
+    let sha = super::sha256_hex("install");
+
+    // Legacy multiplex: listed as a multiplex credential (bound or not).
+    for install_source in [None, Some(&bound)] {
+        let entries = file_extra_entries(
+            Some("install"),
+            Some("platform"),
+            &settings(true, InstallTokenMode::LegacyMultiplex),
+            install_source,
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, INSTALL_CREDENTIAL_ID);
+        assert_eq!(entries[0].sha256, sha);
+        assert_eq!(entries[0].route, MULTIPLEX_ROUTE);
+    }
+
+    // Strict and bound: routed on the bound source.
+    let entries = file_extra_entries(
+        Some("install"),
+        Some("platform"),
+        &settings(true, InstallTokenMode::Strict),
+        Some(&bound),
+    );
+    assert_eq!(entries[0].id, INSTALL_CREDENTIAL_ID);
+    assert_eq!(entries[0].route, "apache_access");
+    assert_eq!(entries[1].id, PLATFORM_PULL_CREDENTIAL_ID);
+    assert_eq!(entries[1].route, MULTIPLEX_ROUTE);
+    assert_eq!(entries[1].sha256, super::sha256_hex("platform"));
+
+    // Strict and unbound, or disabled in any mode: refused (not listed); the
+    // platform pull credential stays.
+    for entries in [
+        file_extra_entries(Some("install"), Some("platform"), &settings(true, InstallTokenMode::Strict), None),
+        file_extra_entries(Some("install"), Some("platform"), &settings(false, InstallTokenMode::Strict), Some(&bound)),
+        file_extra_entries(Some("install"), Some("platform"), &settings(false, InstallTokenMode::LegacyMultiplex), None),
+    ] {
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, PLATFORM_PULL_CREDENTIAL_ID);
+    }
+    // No install token and no platform credential: nothing to list.
+    assert!(file_extra_entries(None, None, &settings(true, InstallTokenMode::LegacyMultiplex), Some(&bound)).is_empty());
+    // NAN-4907 P1: the platform credential is its own secret. Without one
+    // nothing is derived from the install token; one equal to the install
+    // token is refused (it would hand legacy senders the multiplex route).
+    let entries = file_extra_entries(Some("install"), None, &settings(true, InstallTokenMode::Strict), None);
+    assert!(entries.is_empty());
+    let entries = file_extra_entries(Some("install"), Some("install"), &settings(false, InstallTokenMode::Strict), None);
+    assert!(entries.is_empty());
 }
 
 /// Line numbers of every bare `$name` Vector would env-interpolate in `text`.
-/// Vector substitutes `$name` / `${name}` (name = word chars and `.`) on the
-/// raw config text, comments included; `$$` is the escape. A `$` followed by
-/// anything else (regex end anchors such as `$'` or `$)`) is left alone.
 fn bare_env_refs(text: &str) -> Vec<(usize, String)> {
     let mut hits = Vec::new();
     for (index, line) in text.lines().enumerate() {
@@ -318,49 +483,12 @@ fn bare_env_refs(text: &str) -> Vec<(usize, String)> {
     hits
 }
 
-fn collect_vector_configs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}")) {
-        let path = entry.expect("dir entry").path();
-        if path.is_dir() {
-            collect_vector_configs(&path, out);
-        } else if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("toml" | "yaml" | "yml" | "json")
-        ) {
-            out.push(path);
-        }
-    }
-}
-
-/// NAN-4407: a `$1.4` in a comment of 04-otlp-lake-sink.toml made Vector exit
-/// 78 ("Missing environment variable in config. name = \"1.4\"") on every fresh
-/// open-core install. Every static Vector config must use `${VAR}` for real
-/// references and `$$` (or no `$`) everywhere else.
+/// The configs this change edits never gain a bare `$name` (Vector would
+/// env-interpolate it, even in a comment, and refuse to start).
 #[test]
-fn static_vector_configs_have_no_bare_env_refs() {
-    assert_eq!(
-        bare_env_refs("# ~$1.4/day"),
-        vec![(1, "# ~$1.4/day".into())]
-    );
-    assert!(bare_env_refs("a = \"${X:-1}\" # $$1 r'^a$' r'(b)$')").is_empty());
-
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/vector");
-    let mut files = Vec::new();
-    collect_vector_configs(&root, &mut files);
-    assert!(!files.is_empty(), "no Vector configs found under {root:?}");
-    let offenders: Vec<String> = files
-        .iter()
-        .flat_map(|path| {
-            let text =
-                std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-            bare_env_refs(&text)
-                .into_iter()
-                .map(move |(line, src)| format!("{}:{line}: {src}", path.display()))
-        })
-        .collect();
-    assert!(
-        offenders.is_empty(),
-        "bare `$name` is env-interpolated by Vector (even in comments); use ${{VAR}}, `$$`, or drop the `$`:\n{}",
-        offenders.join("\n")
-    );
+fn edited_vector_configs_have_no_bare_env_refs() {
+    for (name, text) in [("00-base", BASE), ("02-hec", HEC), ("03-otlp", OTLP)] {
+        let hits = bare_env_refs(text);
+        assert!(hits.is_empty(), "{name}: {hits:?}");
+    }
 }

@@ -31,6 +31,8 @@ use super::yaml_parser::parse_parser_yaml;
 
 /// Allowed parser repository sources (owner/repo format, lowercase)
 const ALLOWED_REPOSITORIES: &[&str] = &["nano-rs/parsers"];
+/// Synthetic repository signed air-gap parser bundles are applied to.
+const AIRGAP_PARSERS_URL: &str = "airgap://parsers";
 
 /// Stable slug + display name for the synthetic repository that air-gapped
 /// parser bundles (NAN-1201/NAN-1204) are imported into. Lazily created on
@@ -125,12 +127,6 @@ impl ParserRepositoryService {
             pg_pool: pool,
             syncing_repos: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
-    }
-
-    /// Use a specific GitHub client (local fixtures in tests).
-    pub fn with_github_client(mut self, github_client: GitHubClient) -> Self {
-        self.github_client = github_client;
-        self
     }
 
     /// Compatibility check between a `source_configurations.config_type`
@@ -366,17 +362,29 @@ impl ParserRepositoryService {
     // =========================================================================
 
     pub async fn list_repositories(&self) -> Result<Vec<ParserRepository>, ParserRepositoryError> {
-        self.repo_repository
+        // NAN-4947: third-party rows (disabled on upgrade) are hidden.
+        Ok(self
+            .repo_repository
             .list()
             .await
-            .map_err(|e| ParserRepositoryError::Internal(e.to_string()))
+            .map_err(|e| ParserRepositoryError::Internal(e.to_string()))?
+            .into_iter()
+            .filter(|r| Self::first_party(&r.url))
+            .collect())
+    }
+
+    /// NAN-4947: only nano first-party repositories (and the air-gap bundle
+    /// repository) are admissible.
+    pub fn first_party(url: &str) -> bool {
+        crate::content_catalog_defaults::is_allowed_repository(url, ALLOWED_REPOSITORIES, AIRGAP_PARSERS_URL)
     }
 
     pub async fn get_repository(
         &self,
         id: Uuid,
     ) -> Result<ParserRepository, ParserRepositoryError> {
-        self.repo_repository
+        let repo = self
+            .repo_repository
             .find_by_id(id)
             .await
             .map_err(|e| match e {
@@ -384,7 +392,12 @@ impl ParserRepositoryService {
                     ParserRepositoryError::RepositoryNotFound(id)
                 }
                 other => ParserRepositoryError::Internal(other.to_string()),
-            })
+            })?;
+        // NAN-4947: the chokepoint for sync, browse, import and upstream diffs.
+        if !Self::first_party(&repo.url) {
+            return Err(ParserRepositoryError::RepositoryNotAllowed(repo.url));
+        }
+        Ok(repo)
     }
 
     pub async fn create_repository(
@@ -392,8 +405,15 @@ impl ParserRepositoryService {
         req: NewParserRepository,
         user_id: Option<Uuid>,
     ) -> Result<ParserRepository, ParserRepositoryError> {
-        // Validate URL is in allowlist
-        self.validate_url(&req.url)?;
+        // NAN-4947: first-party only, stored in the canonical spelling the
+        // sync parses back.
+        if !Self::first_party(&req.url) {
+            return Err(ParserRepositoryError::RepositoryNotAllowed(req.url));
+        }
+        let mut req = req;
+        if let Some(canonical) = crate::schema::canonical_github_url(&req.url) {
+            req.url = canonical;
+        }
 
         self.repo_repository
             .create(&req, user_id)
@@ -411,6 +431,8 @@ impl ParserRepositoryService {
         id: Uuid,
         update: UpdateParserRepository,
     ) -> Result<ParserRepository, ParserRepositoryError> {
+        // NAN-4947: a disabled third-party row can never be re-enabled.
+        self.get_repository(id).await?;
         self.repo_repository
             .update(id, &update)
             .await
@@ -534,23 +556,7 @@ impl ParserRepositoryService {
         let parsers_path =
             crate::schema::active_repo_path(repo.parsers_path.as_deref().unwrap_or("parsers/"));
         let parsers_path = parsers_path.as_str();
-        // NAN-3897: the first-party OCSF 1.9 content lives on `main`; a row
-        // still on the retired `ocsf-1.9` default syncs `main`. Only the
-        // first-party content repo is resolved — a third-party branch is kept.
-        let resolved_branch = if owner == "nano-rs" {
-            crate::schema::active_content_branch(&repo.branch)
-        } else {
-            repo.branch.clone()
-        };
-        if resolved_branch != repo.branch {
-            info!(
-                repo_id = %id,
-                stored = %repo.branch,
-                resolved = %resolved_branch,
-                "Retired ocsf-1.9 content branch: syncing main"
-            );
-        }
-        let branch = resolved_branch.as_str();
+        let branch = &repo.branch;
 
         info!(repo_id = %id, owner = %owner, repo = %repo_name, "Starting parser repository sync");
 
@@ -773,6 +779,7 @@ impl ParserRepositoryService {
         repo_id: Uuid,
         path: &str,
     ) -> Result<RepositoryParser, ParserRepositoryError> {
+        self.get_repository(repo_id).await?;
         self.parsers_repository
             .find_by_path(repo_id, path)
             .await
@@ -1069,8 +1076,6 @@ impl ParserRepositoryService {
             // NAN-1920: repo imports create real, immediately-usable feeds —
             // not wizard drafts — so they stay 'active' (the INSERT default).
             lifecycle_status: None,
-            extension_vrl: None,
-            extension_enabled: None,
         };
 
         // NAN-950: do the log_sources and parser_imports writes inside one
@@ -2044,7 +2049,7 @@ impl ParserRepositoryService {
             name: AIRGAP_REPOSITORY_NAME.to_string(),
             slug: Some(AIRGAP_REPOSITORY_SLUG.to_string()),
             description: Some(
-                "Parsers imported from offline air-gapped bundles.".to_string(),
+                "Parsers imported from offline air-gapped bundles (NAN-1201).".to_string(),
             ),
             // Sentinel, never-fetched URL — air-gap bundles are uploaded, not synced.
             url: "airgap://parsers".to_string(),
@@ -2064,25 +2069,6 @@ impl ParserRepositoryService {
                 .map_err(|e| ParserRepositoryError::Internal(e.to_string())),
             Err(e) => Err(ParserRepositoryError::Internal(e.to_string())),
         }
-    }
-
-    fn validate_url(&self, url: &str) -> Result<(), ParserRepositoryError> {
-        let normalized = url
-            .trim_end_matches('/')
-            .trim_end_matches(".git")
-            .to_lowercase();
-
-        let is_allowed = ALLOWED_REPOSITORIES.iter().any(|allowed| {
-            let suffix = format!("github.com/{}", allowed);
-            normalized == format!("https://{}", suffix)
-                || normalized == format!("http://{}", suffix)
-        });
-
-        if !is_allowed {
-            return Err(ParserRepositoryError::RepositoryNotAllowed(url.to_string()));
-        }
-
-        Ok(())
     }
 }
 

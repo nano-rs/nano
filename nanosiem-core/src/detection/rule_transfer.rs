@@ -2,9 +2,8 @@
 
 //! Wire formats for `POST /api/rules/import` and `GET /api/rules/export`.
 //!
-//! Shared by the dedicated handler (`nanosiem-api`) and the enterprise-shared
-//! adapter (the enterprise crate) so both deployments accept and emit the
-//! same shapes:
+//! Used by the rules import/export handler (`nanosiem-api`), which accepts
+//! and emits these shapes:
 //!
 //! * Import takes either the structured `{"rules": [...]}` body or the web
 //!   client's file-upload body `{"data": "<file contents>", "format":

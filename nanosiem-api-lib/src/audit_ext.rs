@@ -1,10 +1,8 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 //! [`AuditExt`] — convenience trait for fire-and-forget audit-event emission
 //! from request handlers.
 //!
 //! Lives in `nanosiem-api-lib` (not `nanosiem-api`) so that enterprise handler
-//! modules in the enterprise crate can import it directly. Before this lift
+//! modules in `nanosiem-enterprise` can import it directly. Before this lift
 //! the trait sat in `nanosiem-api/src/handlers/mod.rs` and the OIDC
 //! `OidcAppState::emit_audit` impl had to use a fully-qualified call as a
 //! workaround. With the trait here, every per-module `*AppState` trait can
@@ -15,7 +13,6 @@
 //! crate just defines the trait surface.
 
 use nanosiem_core::audit::AuditEvent;
-use nanosiem_core::auth::TrustedTenantContext;
 
 /// Extension trait for convenient audit event emission from handlers.
 ///
@@ -38,23 +35,28 @@ pub trait AuditExt {
     /// (open-core / no-ClickHouse mode), the event drops on the floor.
     fn emit_audit(&self, event: AuditEvent);
 
-    /// Emit auth events that `actor` completed in `tenant` (fire-and-forget).
+    /// Emit an audit event, and for a SECURITY-CRITICAL event (see
+    /// [`nanosiem_core::audit::is_security_critical`]) do not return until it is
+    /// durably recorded (NAN-4954).
     ///
-    /// NAN-3790: on the hosted shared deployment `emit_audit` cannot persist
-    /// anything (the shared emitter refuses tenantless writes), so auth flows
-    /// that know their tenant and verified account call this instead. The
-    /// `nanosiem-api` implementation writes the events together in one signed
-    /// tenant + actor transaction there; elsewhere, and by default, each
-    /// event goes through [`Self::emit_audit`] unchanged.
-    fn emit_tenant_auth_audit(
-        &self,
-        tenant: TrustedTenantContext,
-        actor: uuid::Uuid,
-        events: Vec<AuditEvent>,
-    ) {
-        let _ = (tenant, actor);
-        for event in events {
-            self.emit_audit(event);
-        }
+    /// The production implementation awaits the PostgreSQL outbox write before
+    /// returning and detaches only the ClickHouse delivery, so a process crash
+    /// after the handler responds can no longer lose the event. Routine events
+    /// stay fire-and-forget. Handlers emitting a security-critical action must
+    /// `.await` this instead of calling [`Self::emit_audit`] (enforced by the
+    /// `audit_durability_callsites_tests` source guard).
+    ///
+    /// The default implementation (test states) is the fire-and-forget path.
+    fn emit_audit_durable(&self, event: AuditEvent) -> impl std::future::Future<Output = ()> + Send {
+        self.emit_audit(event);
+        std::future::ready(())
+    }
+
+    /// Hand an event that the caller ALREADY recorded in the PostgreSQL outbox
+    /// inside its own transaction (`SecurityAuditOutbox::enqueue_tx`) to the
+    /// ClickHouse delivery path, detached. The default (test states) falls back
+    /// to [`Self::emit_audit`].
+    fn deliver_recorded_audit(&self, event: AuditEvent) {
+        self.emit_audit(event);
     }
 }

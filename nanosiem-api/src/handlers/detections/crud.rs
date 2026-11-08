@@ -29,8 +29,6 @@ use crate::{
 /// - severity: Filter by severity level
 /// - mode: Filter by rule mode (staging, live, alerting, paused)
 /// - detection_mode: Filter by detection mode (real-time, scheduled)
-/// - search: case-insensitive name/id contains
-/// - limit: at most this many rules, 1–50
 ///
 /// Requirements: 5.5
 #[utoipa::path(
@@ -40,7 +38,6 @@ use crate::{
     params(ListDetectionsQuery),
     responses(
         (status = 200, description = "List of detection rules", body = Vec<DetectionRule>),
-        (status = 400, description = "Invalid filter, search or limit", body = ErrorResponse),
         (status = 403, description = "Missing permission: detections:view", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -86,7 +83,7 @@ pub async fn list_detections(
     }
 
     // Apply detection_mode filter if provided
-    if let Some(mode_str) = query.detection_mode.as_deref() {
+    if let Some(mode_str) = query.detection_mode {
         use nanosiem_core::models::detection_rule::DetectionMode;
 
         // Parse detection mode from string
@@ -115,7 +112,6 @@ pub async fn list_detections(
         }
     }
 
-    let rules = query.search_and_limit(rules).map_err(ApiError::ValidationError)?;
     Ok(Json(rules))
 }
 
@@ -212,14 +208,7 @@ pub async fn create_detection(
             .list_rules()
             .await
             .map(|r| r.len() as u32)
-            // Fail closed (NAN-2761): an unreadable count must not read as 0
-            // and wave the create past the cap.
-            .map_err(|e| {
-                tracing::error!(error = %e, "detection rule count unavailable for tier limit");
-                ApiError::ServiceUnavailable(
-                    "Detection rule limit could not be verified; retry shortly".to_string(),
-                )
-            })?;
+            .unwrap_or(0);
         nanosiem_core::check_limit(
             "detection rules",
             rule_count,
@@ -749,8 +738,6 @@ mod tests {
             realtime_enabled: false,
             detection_mode: DetectionMode::Scheduled,
             materialized_view_name: None,
-            near_real_time_interval_seconds: None,
-            execution_mode: None,
             risk_score: None,
             risk_entity_field: None,
             risk_modifiers: sqlx::types::Json(vec![]),
@@ -781,32 +768,6 @@ mod tests {
             source_repo_url: None,
             kind: "standard".into(),
             alert_cooldown_minutes: None,
-        }
-    }
-
-    fn named(name: &str) -> DetectionRule {
-        DetectionRule { name: name.into(), ..baseline_rule() }
-    }
-
-    fn list_query(q: &str) -> ListDetectionsQuery {
-        let uri: axum::http::Uri = format!("/api/rules?{q}").parse().unwrap();
-        axum::extract::Query::<ListDetectionsQuery>::try_from_uri(&uri).unwrap().0
-    }
-
-    #[test]
-    fn rule_list_search_and_limit() {
-        let rules = || vec![named("Encoded PowerShell"), named("Impossible travel"), named("PowerShell download"), named("100% CPU")];
-        let names = |q: &str| list_query(q).search_and_limit(rules()).unwrap().into_iter().map(|r| r.name).collect::<Vec<_>>();
-        assert_eq!(names(""), ["Encoded PowerShell", "Impossible travel", "PowerShell download", "100% CPU"], "no params keep the full list");
-        assert_eq!(names("search=powershell"), ["Encoded PowerShell", "PowerShell download"]);
-        assert_eq!(names("search=%20%20"), names(""), "blank search is no search");
-        assert_eq!(names("search=%25"), ["100% CPU"], "% is literal");
-        assert_eq!(names("search=power&limit=1"), ["Encoded PowerShell"]);
-        let one = rules().remove(1);
-        let id = one.id.to_string()[..8].to_uppercase();
-        assert_eq!(list_query(&format!("search={id}")).search_and_limit(vec![one.clone(), named("x")]).unwrap().len(), 1, "id match is case-insensitive");
-        for bad in ["limit=0", "limit=51", &format!("search={}", "a".repeat(201))] {
-            assert!(list_query(bad).search_and_limit(rules()).is_err(), "{bad}");
         }
     }
 

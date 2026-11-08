@@ -6,37 +6,73 @@ use uuid::Uuid;
 
 use crate::models::DetectionRule;
 
+/// A detection window the scheduler could not evaluate and moved past
+/// (NAN-4910). Persisted in `detection_coverage_gaps`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectionCoverageGap {
+    pub window_start: chrono::DateTime<chrono::Utc>,
+    pub window_end: chrono::DateTime<chrono::Utc>,
+    /// Consecutive size-class failures that led to the gap.
+    pub attempts: i32,
+    /// The last execution error (truncated).
+    pub error_message: String,
+}
+
 use super::types::{DetectionRuleRepository, DetectionRuleRepositoryError};
 
 impl DetectionRuleRepository {
-    /// Stop future scheduler claims before deleting a rule and report whether
-    /// the current claim has drained.
+    /// Stop future scheduler claims before archiving a deleted rule and report
+    /// whether the current claim has drained (NAN-3816).
     ///
-    /// A scheduler executes outside the claim transaction. Deleting its rule
-    /// row while that execution is still writing matches/statistics violates
-    /// foreign keys and turns an ordinary lifecycle operation into a failed
-    /// detection run. Pausing and clearing `next_run_at` closes the door to new
-    /// claims; callers may delete only after `claimed_by` is empty.
+    /// A scheduler executes outside the claim transaction, so archiving while
+    /// that execution is still writing matches/statistics would race it.
+    /// Pausing and clearing `next_run_at` closes the door to new claims;
+    /// callers may archive only after `claimed_by` is empty.
+    ///
+    /// Returns `Ok(false)` WITHOUT mutating the rule when it is claimed, so a
+    /// retryable 409 leaves the rule running on its schedule (NAN-4902 review).
+    /// The row lock taken by `FOR UPDATE` makes the check-and-pause atomic
+    /// against `claim_due_rules`: a claim committed first is seen here (the
+    /// locked read returns the latest row version), and a claim attempted
+    /// after commit no longer matches its `mode`/`next_run_at` predicate.
     pub async fn quiesce_for_delete(
         &self,
         rule_id: Uuid,
     ) -> Result<bool, DetectionRuleRepositoryError> {
+        let mut tx = self.pool.begin().await?;
         let claimed_by: Option<Option<String>> = sqlx::query_scalar(
             r#"
-            UPDATE detection_rules
-            SET mode = 'paused',
-                next_run_at = NULL
-            WHERE id = $1
-            RETURNING claimed_by
+            SELECT claimed_by FROM detection_rules
+            WHERE id = $1 AND archived = false
+            FOR UPDATE
             "#,
         )
         .bind(rule_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
         match claimed_by {
-            Some(owner) => Ok(owner.is_none()),
             None => Err(DetectionRuleRepositoryError::NotFound(rule_id)),
+            Some(Some(_)) => Ok(false),
+            Some(None) => {
+                sqlx::query(
+                    r#"
+                    UPDATE detection_rules
+                    SET paused_from_mode = CASE
+                            WHEN mode IN ('staging', 'live', 'alerting') THEN mode
+                            ELSE paused_from_mode
+                        END,
+                        mode = 'paused',
+                        next_run_at = NULL
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(rule_id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(true)
+            }
         }
     }
 
@@ -51,36 +87,16 @@ impl DetectionRuleRepository {
         batch_size: i64,
         node_id: &str,
         stale_timeout_secs: i64,
-        include_realtime_microbatches: bool,
     ) -> Result<Vec<DetectionRule>, DetectionRuleRepositoryError> {
         let results = sqlx::query_as::<_, DetectionRule>(
             r#"
             WITH claimable AS (
                 SELECT id FROM detection_rules
                 WHERE archived = false
-                  AND (
-                      detection_mode = 'scheduled'
-                      OR ($4 AND detection_mode = 'real-time')
-                  )
-                  AND mode NOT IN ('staging', 'paused')
+                  AND detection_mode = 'scheduled' AND mode NOT IN ('staging', 'paused')
                   AND schedule_cron IS NOT NULL AND next_run_at IS NOT NULL
                   AND next_run_at <= NOW()
                   AND (claimed_by IS NULL OR claimed_at < NOW() - make_interval(secs => $3))
-                  -- A due late-arrival repair shares this rule's claim fence.
-                  -- Give it priority over the normal cron lane or a five-second
-                  -- real-time rule can win every synchronized poll forever and
-                  -- starve its repair job. Retry backoff does not block normal
-                  -- execution until the repair is actually due again.
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM detection_late_replay_jobs replay
-                      WHERE replay.rule_id = detection_rules.id
-                        AND (
-                            (replay.status = 'pending' AND replay.next_attempt_at <= NOW())
-                            OR
-                            (replay.status = 'running' AND replay.claim_expires_at < NOW())
-                        )
-                  )
                 ORDER BY next_run_at ASC
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
@@ -93,7 +109,6 @@ impl DetectionRuleRepository {
         .bind(batch_size)
         .bind(node_id)
         .bind(stale_timeout_secs as f64)
-        .bind(include_realtime_microbatches)
         .fetch_all(&self.pool)
         .await?;
 
@@ -111,7 +126,13 @@ impl DetectionRuleRepository {
     ///   events), rather than `NOW()` at query-completion time;
     /// - on a normal failure → `None`, leaving the existing high-water mark
     ///   untouched (`COALESCE`) so the failed window is re-scanned next cycle
-    ///   instead of being silently dropped.
+    ///   instead of being silently dropped;
+    /// - on a recorded coverage gap (NAN-4910) → the gap's end.
+    ///
+    /// `catchup_size_failures` is the new consecutive size-failure count that
+    /// selects the next catch-up slice size (NAN-4910). When `coverage_gap` is
+    /// set, the unevaluated window is inserted into `detection_coverage_gaps`
+    /// in the same statement, and only if this node still holds the claim.
     ///
     /// This makes `release_claim` the sole writer of `last_run_at`.
     pub async fn release_claim(
@@ -120,28 +141,64 @@ impl DetectionRuleRepository {
         node_id: &str,
         next_run_at: chrono::DateTime<chrono::Utc>,
         advance_last_run_to: Option<chrono::DateTime<chrono::Utc>>,
+        catchup_size_failures: i16,
+        coverage_gap: Option<&DetectionCoverageGap>,
     ) -> Result<(), DetectionRuleRepositoryError> {
+        let (gap_start, gap_end, gap_attempts, gap_error) = match coverage_gap {
+            Some(gap) => (
+                Some(gap.window_start),
+                Some(gap.window_end),
+                Some(gap.attempts),
+                Some(gap.error_message.as_str()),
+            ),
+            None => (None, None, None, None),
+        };
         sqlx::query(
             r#"
-            UPDATE detection_rules
-            SET claimed_by = NULL,
-                claimed_at = NULL,
-                last_run_at = COALESCE($4, last_run_at),
-                next_run_at = CASE
-                    WHEN archived OR mode IN ('staging', 'paused') THEN NULL
-                    ELSE $2
-                END
-            WHERE id = $1 AND claimed_by = $3
+            WITH released AS (
+                UPDATE detection_rules
+                SET claimed_by = NULL,
+                    claimed_at = NULL,
+                    last_run_at = COALESCE($4, last_run_at),
+                    next_run_at = $2,
+                    catchup_size_failures = $5
+                WHERE id = $1 AND claimed_by = $3
+                RETURNING id
+            )
+            INSERT INTO detection_coverage_gaps (
+                rule_id, window_start, window_end, attempts, error_message
+            )
+            SELECT id, $6, $7, $8, $9 FROM released
+            WHERE $6::timestamptz IS NOT NULL
             "#,
         )
         .bind(rule_id)
         .bind(next_run_at)
         .bind(node_id)
         .bind(advance_last_run_to)
+        .bind(catchup_size_failures)
+        .bind(gap_start)
+        .bind(gap_end)
+        .bind(gap_attempts)
+        .bind(gap_error)
         .execute(&self.pool)
         .await?;
 
         Ok(())
+    }
+
+    /// Current consecutive size-failure count for a rule's catch-up (NAN-4910).
+    /// Selects how large the next catch-up slice may be.
+    pub async fn get_catchup_size_failures(
+        &self,
+        id: Uuid,
+    ) -> Result<i16, DetectionRuleRepositoryError> {
+        let row: Option<(i16,)> =
+            sqlx::query_as("SELECT catchup_size_failures FROM detection_rules WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(n,)| n).unwrap_or(0))
     }
 
     /// Fetch just the current `schedule_cron` for a rule.
@@ -167,21 +224,6 @@ impl DetectionRuleRepository {
         &self,
         node_id: &str,
     ) -> Result<u64, DetectionRuleRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        // Late-arrival jobs share the rule claim to exclude a concurrent normal
-        // cron run. Put owned jobs back before clearing those claims so another
-        // node can safely resume them after this process shuts down.
-        sqlx::query(
-            r#"
-            UPDATE detection_late_replay_jobs
-            SET status = 'pending', claimed_by = NULL, claimed_at = NULL,
-                claim_expires_at = NULL, next_attempt_at = NOW()
-            WHERE status = 'running' AND claimed_by = $1
-            "#,
-        )
-        .bind(node_id)
-        .execute(&mut *transaction)
-        .await?;
         let result = sqlx::query(
             r#"
             UPDATE detection_rules
@@ -190,9 +232,8 @@ impl DetectionRuleRepository {
             "#,
         )
         .bind(node_id)
-        .execute(&mut *transaction)
+        .execute(&self.pool)
         .await?;
-        transaction.commit().await?;
 
         Ok(result.rows_affected())
     }
@@ -223,22 +264,16 @@ impl DetectionRuleRepository {
     /// List all eligible rules that are missing next_run_at (for startup backfill).
     pub async fn list_missing_next_run_at(
         &self,
-        include_realtime_microbatches: bool,
     ) -> Result<Vec<DetectionRule>, DetectionRuleRepositoryError> {
         let results = sqlx::query_as::<_, DetectionRule>(
             r#"
             SELECT * FROM detection_rules
             WHERE archived = false
-              AND (
-                  detection_mode = 'scheduled'
-                  OR ($1 AND detection_mode = 'real-time')
-              )
-              AND mode NOT IN ('staging', 'paused')
+              AND detection_mode = 'scheduled' AND mode NOT IN ('staging', 'paused')
               AND schedule_cron IS NOT NULL
               AND next_run_at IS NULL
             "#,
         )
-        .bind(include_realtime_microbatches)
         .fetch_all(&self.pool)
         .await?;
 

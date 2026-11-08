@@ -38,7 +38,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use super::{
     decayed_overview_query, entity_scores_query, entity_set_scores_query, entity_types_query,
     lateral_scores_query, risk_dataset_base_query, risk_for_entities_query, risky_entities_query,
-    rule_contributions_query, rule_timeline_buckets_query, ClearedBoundaries, EntityScoreSelection,
+    rule_contributions_query, ClearedBoundaries, EntityScoreSelection,
     RiskChQuery, RiskFindingsSource, RiskSqlBind,
 };
 use crate::auth::{ScopeSet, UNRESOLVED_SOURCE_SENTINEL};
@@ -50,7 +50,7 @@ use crate::risk::types::{RiskDecayConfig, RiskTimeWindow};
 
 /// `get_time_windowed_risk_scores_clickhouse` raw template, pre-refactor,
 /// plus the NAN-1806 stamped-type first branch (see module docs) and the
-/// NAN-3228 watchlist weight (base / weight / effective decayed scores).
+/// read-time score weight (base / weight / effective decayed scores).
 const ORIG_TIME_WINDOWED: &str = r#"
             WITH signal_scores AS (
                 SELECT
@@ -98,10 +98,10 @@ const ORIG_TIME_WINDOWED: &str = r#"
                     -- breakdown, which also rounds (NAN-1658 / R3).
                     toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as base_decayed_score_24h,
                     toInt64(round(sum(risk_score * decay_factor))) as base_decayed_score_7d,
-                    -- Watchlist weight (NAN-3228): MAX enabled-list weight for
-                    -- the entity value, 0 when unwatched; the decayed scores
-                    -- below are the EFFECTIVE (weighted) scores.
-                    arrayElement(?, indexOf(?, lower(entity))) as watch_weight,
+                    -- Read-time score weight for the entity value (0 when none
+                    -- applies); the decayed scores below are the EFFECTIVE
+                    -- (weighted) scores.
+                    toFloat64(arrayElement(?, indexOf(?, lower(entity)))) as watch_weight,
                     toInt64(round(base_decayed_score_24h * (1 + watch_weight))) as decayed_score_24h,
                     toInt64(round(base_decayed_score_7d * (1 + watch_weight))) as decayed_score_7d,
                     countIf(ts_micros >= ?) as signal_count_24h,
@@ -135,7 +135,7 @@ const ORIG_TIME_WINDOWED: &str = r#"
 
 /// `get_decayed_overview_clickhouse` raw template, pre-refactor (the
 /// `{dscore}`/`{scount}` format! holes renamed to sentinels), plus the
-/// NAN-3228 watchlist weight: bands count the effective scores.
+/// read-time score weight: bands count the effective scores.
 const ORIG_OVERVIEW: &str = r#"
             WITH signal_scores AS (
                 SELECT
@@ -161,7 +161,7 @@ const ORIG_OVERVIEW: &str = r#"
                     entity,
                     toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as base_decayed_score_24h,
                     toInt64(round(sum(risk_score * decay_factor))) as base_decayed_score_7d,
-                    arrayElement(?, indexOf(?, lower(entity))) as watch_weight,
+                    toFloat64(arrayElement(?, indexOf(?, lower(entity)))) as watch_weight,
                     toInt64(round(base_decayed_score_24h * (1 + watch_weight))) as decayed_score_24h,
                     toInt64(round(base_decayed_score_7d * (1 + watch_weight))) as decayed_score_7d,
                     countIf(ts_micros >= ?) as signal_count_24h,
@@ -319,9 +319,9 @@ fn fixed_cutoffs() -> (i64, i64, i64, i64) {
     )
 }
 
-/// The watchlist weight lookup binds for a tenant with no watchlists (the
+/// The score weight lookup binds when no weights apply (the
 /// `('', 0.0)` typing sentinel only), in placeholder order.
-fn unwatched_binds() -> [RiskSqlBind; 2] {
+fn unweighted_binds() -> [RiskSqlBind; 2] {
     [
         RiskSqlBind::F64List(vec![0.0]),
         RiskSqlBind::StrList(vec![String::new()]),
@@ -682,7 +682,7 @@ fn leaderboard_windows_selection_and_binds() {
         RiskSqlBind::I64(c24),
         RiskSqlBind::I64(c24),
     ]);
-    expected.extend(unwatched_binds());
+    expected.extend(unweighted_binds());
     expected.extend([
         RiskSqlBind::I64(c24),
         RiskSqlBind::I64(5),  // floor
@@ -723,48 +723,6 @@ fn leaderboard_windows_selection_and_binds() {
 }
 
 #[test]
-fn leaderboard_entity_type_filter_binds_after_floor() {
-    let (c24, _c3d, _c5d, c7d) = fixed_cutoffs();
-    let (cleared, cleared_micros) = one_cleared_entity();
-    let q = risky_entities_query(
-        &RiskFindingsSource::new(false, "logs"),
-        fixed_now(),
-        &decay_config(),
-        &cleared,
-        RiskTimeWindow::Last7Days,
-        Some("cloud_account"),
-        0,
-        None,
-        200,
-        0,
-    );
-    assert!(
-        q.sql
-            .contains("WHERE decayed_score_7d >= ? AND signal_count_7d > 0 AND entity_type = ?"),
-        "{}",
-        q.sql
-    );
-    let mut expected = expected_decay_binds();
-    expected.extend([
-        RiskSqlBind::I64(c7d),
-        RiskSqlBind::I64List(vec![cleared_micros, 0]),
-        RiskSqlBind::StrList(vec!["john.doe".into(), String::new()]),
-        RiskSqlBind::I64(c24),
-        RiskSqlBind::I64(c24),
-    ]);
-    expected.extend(unwatched_binds());
-    expected.extend([
-        RiskSqlBind::I64(c24),
-        RiskSqlBind::I64(0),
-        RiskSqlBind::Str("cloud_account".into()),
-        RiskSqlBind::I64(200),
-        RiskSqlBind::I64(0),
-    ]);
-    assert_eq!(q.binds, expected);
-    assert_placeholder_bind_parity(&q);
-}
-
-#[test]
 fn leaderboard_score_band_is_parameterized_before_type_and_pagination() {
     let (c24, _c3d, _c5d, c7d) = fixed_cutoffs();
     let (cleared, cleared_micros) = one_cleared_entity();
@@ -795,7 +753,7 @@ fn leaderboard_score_band_is_parameterized_before_type_and_pagination() {
         RiskSqlBind::I64(c24),
         RiskSqlBind::I64(c24),
     ]);
-    expected.extend(unwatched_binds());
+    expected.extend(unweighted_binds());
     expected.extend([
         RiskSqlBind::I64(c24),
         RiskSqlBind::I64(51),
@@ -811,6 +769,48 @@ fn leaderboard_score_band_is_parameterized_before_type_and_pagination() {
 /// The stamped write-side type is honored for cloud_account ONLY — every
 /// other branch of the inference is the pre-P4 value inference, so scores and
 /// groupings for unstamped/non-cloud entities are unchanged.
+#[test]
+fn leaderboard_entity_type_filter_binds_after_floor() {
+    let (c24, _c3d, _c5d, c7d) = fixed_cutoffs();
+    let (cleared, cleared_micros) = one_cleared_entity();
+    let q = risky_entities_query(
+        &RiskFindingsSource::new(false, "logs"),
+        fixed_now(),
+        &decay_config(),
+        &cleared,
+        RiskTimeWindow::Last7Days,
+        Some("cloud_account"),
+        0,
+        None,
+        200,
+        0,
+    );
+    assert!(
+        q.sql
+            .contains("WHERE decayed_score_7d >= ? AND signal_count_7d > 0 AND entity_type = ?"),
+        "{}",
+        q.sql
+    );
+    let mut expected = expected_decay_binds();
+    expected.extend([
+        RiskSqlBind::I64(c7d),
+        RiskSqlBind::I64List(vec![cleared_micros, 0]),
+        RiskSqlBind::StrList(vec!["john.doe".into(), String::new()]),
+        RiskSqlBind::I64(c24),
+        RiskSqlBind::I64(c24),
+    ]);
+    expected.extend(unweighted_binds());
+    expected.extend([
+        RiskSqlBind::I64(c24),
+        RiskSqlBind::I64(0),
+        RiskSqlBind::Str("cloud_account".into()),
+        RiskSqlBind::I64(200),
+        RiskSqlBind::I64(0),
+    ]);
+    assert_eq!(q.binds, expected);
+    assert_placeholder_bind_parity(&q);
+}
+
 #[test]
 fn entity_type_inference_honors_cloud_account_stamp_only() {
     let (cleared, _) = one_cleared_entity();
@@ -869,7 +869,7 @@ fn dossier_query_restricts_to_entity_set_and_ranks_by_decayed_7d() {
         RiskSqlBind::I64(c24),
         RiskSqlBind::I64(c24),
     ]);
-    expected.extend(unwatched_binds());
+    expected.extend(unweighted_binds());
     expected.extend([RiskSqlBind::I64(c24)]);
     assert_eq!(q.binds, expected);
     assert_placeholder_bind_parity(&q);
@@ -948,7 +948,7 @@ fn lateral_query_matches_lowered_and_fqdn_stripped_ids() {
         RiskSqlBind::StrList(ids.clone()),
         RiskSqlBind::StrList(ids.clone()),
     ]);
-    expected.extend(unwatched_binds());
+    expected.extend(unweighted_binds());
     assert_eq!(q.binds, expected);
     assert_placeholder_bind_parity(&q);
 }
@@ -1028,7 +1028,7 @@ fn entity_list_bind_order_matches_pre_refactor_chain() {
         RiskSqlBind::I64(c24),                         // sumIf 24h raw
         RiskSqlBind::I64(c24),                         // sumIf 24h decayed
     ]);
-    expected.extend(unwatched_binds()); // watchlist weight lookup (NAN-3228)
+    expected.extend(unweighted_binds()); // score weight lookup
     expected.extend([
         RiskSqlBind::I64(c24), // countIf 24h
         RiskSqlBind::I64(5),   // WHERE decayed_score_24h >= ?
@@ -1057,7 +1057,7 @@ fn overview_bind_order_matches_pre_refactor_chain() {
         RiskSqlBind::StrList(vec!["john.doe".into(), String::new()]),
         RiskSqlBind::I64(c24), // sumIf 24h decayed
     ]);
-    expected.extend(unwatched_binds()); // watchlist weight lookup (NAN-3228)
+    expected.extend(unweighted_binds()); // score weight lookup
     expected.extend([
         RiskSqlBind::I64(c24), // countIf 24h
     ]);
@@ -1153,7 +1153,7 @@ fn dataset_base_shares_the_entity_scores_scan() {
         RiskSqlBind::StrList(vec!["john.doe".into(), String::new()]),
     ]);
     expected.push(RiskSqlBind::I64(c24));
-    expected.extend(unwatched_binds());
+    expected.extend(unweighted_binds());
     expected.extend(std::iter::repeat(RiskSqlBind::I64(c24)).take(4));
     let dataset = risk_dataset_base_query(
         &RiskFindingsSource::new(false, "logs"),
@@ -1288,78 +1288,31 @@ fn cleared_boundaries_preserves_value_and_micros() {
     assert!(bounds.entities().iter().any(|e| e.is_empty()));
 }
 
-// ---------------------------------------------------------------------------
-// NAN-3225: entity risk timeline buckets
-// ---------------------------------------------------------------------------
-
+/// NAN-3226 read-time contract: the stored `risk_entity_type` stamp is honored
+/// only for `cloud_account`; every other type comes from the value, so a
+/// stored `domain` (internal or not) reads as `hostname`. Nothing written at
+/// detection time can pin a name to the domain or host type.
 #[test]
-fn timeline_buckets_are_anchor_aligned_bounded_and_unscoped_by_default() {
-    let now = fixed_now();
-    let query = rule_timeline_buckets_query(
-        &RiskFindingsSource::new(false, "logs"),
-        now,
-        &["alice".to_string()],
-    );
-    let anchor_us = now.timestamp_micros();
-    let lookback_us = (now - chrono::Duration::hours(336)).timestamp_micros();
-    assert_eq!(
-        query.binds,
-        vec![
-            RiskSqlBind::I64(anchor_us), // hours_ago = intDiv(anchor - 1 - ts, 1h)
-            RiskSqlBind::StrList(vec!["alice".into()]),
-            RiskSqlBind::I64(lookback_us),
-            RiskSqlBind::I64(anchor_us), // ts < anchor
-        ]
-    );
-    assert_eq!(query.sql.matches('?').count(), query.binds.len());
-    assert!(query.sql.contains("intDiv(? - 1 - ts_micros, 3600000000)"));
-    assert!(query.sql.contains("ORDER BY hours_ago ASC, rule_id ASC"));
-    assert!(query.sql.contains("LIMIT 10000"));
-    assert!(query
-        .sql
-        .contains("JSONExtract(metadata, 'mitre_tactics', 'Array(String)')"));
-    assert!(!query.sql.contains("PREWHERE"), "single WHERE (NAN-1412)");
-    assert!(
-        !query.sql.contains("hasAny"),
-        "unrestricted callers emit no scope predicate"
-    );
-}
-
-/// Source visibility: a restricted viewer's buckets carry the same fail-closed
-/// origin predicate as every other risk read, bound last.
-#[test]
-fn restricted_timeline_buckets_hide_denied_and_unattributed_origins() {
-    let source = RiskFindingsSource::new(true, "ocsf_logs")
-        .with_source_scope(&restricted_scope(&["apache_access"]));
-    let query = rule_timeline_buckets_query(&source, fixed_now(), &["10.0.0.5".to_string()]);
-    assert!(query.sql.contains(
-        "AND notEmpty(JSONExtract(toString(unmapped), 'origin_source_types', 'Array(String)'))"
-    ));
-    assert!(query.sql.contains("AND NOT hasAny("));
-    assert_eq!(query.sql.matches('?').count(), query.binds.len());
-    match query.binds.last() {
-        Some(RiskSqlBind::StrList(deny)) => {
-            assert!(deny.contains(&"apache_access".to_string()));
-            assert!(deny.contains(&UNRESOLVED_SOURCE_SENTINEL.to_string()));
-        }
-        other => panic!("deny set must be the last bind, got {other:?}"),
-    }
+fn risk_read_projection_never_reads_a_stored_domain_type() {
+    assert!(super::ENTITY_SELECT_COLS.contains("__RISK_ENTITY_TYPE__ = 'cloud_account', 'cloud_account'"));
+    assert!(!super::ENTITY_SELECT_COLS.contains("'domain'"));
+    assert!(super::ENTITY_SELECT_COLS.contains("position(__RISK_ENTITY__, '.') > 0, 'hostname'"));
 }
 
 // ---------------------------------------------------------------------------
-// NAN-3228: watchlist weights
+// Read-time score weights
 // ---------------------------------------------------------------------------
 
-fn watched(cleared: ClearedBoundaries) -> ClearedBoundaries {
-    use crate::risk::watchlist::RiskWatchWeights;
-    cleared.with_watch(RiskWatchWeights::from_rows([
+fn weighted(cleared: ClearedBoundaries) -> ClearedBoundaries {
+    use crate::risk::score_weights::EntityScoreWeights;
+    cleared.with_score_weights(EntityScoreWeights::from_rows([
         ("alice".to_string(), 60),
         ("alice".to_string(), 25),
         ("web-01".to_string(), 100),
     ]))
 }
 
-fn watched_binds() -> [RiskSqlBind; 2] {
+fn weighted_binds() -> [RiskSqlBind; 2] {
     [
         RiskSqlBind::F64List(vec![0.6, 1.0, 0.0]),
         RiskSqlBind::StrList(vec!["alice".into(), "web-01".into(), String::new()]),
@@ -1373,7 +1326,7 @@ fn watched_binds() -> [RiskSqlBind; 2] {
 #[test]
 fn every_entity_grain_builder_binds_the_watch_weights_once() {
     let (cleared, _) = one_cleared_entity();
-    let cleared = watched(cleared);
+    let cleared = weighted(cleared);
     let source = RiskFindingsSource::new(false, "logs");
     let queries = [
         entity_scores_query(
@@ -1422,12 +1375,12 @@ fn every_entity_grain_builder_binds_the_watch_weights_once() {
         ),
         risk_dataset_base_query(&source, fixed_now(), &decay_config(), &cleared),
     ];
-    let [weights, entities] = watched_binds();
+    let [weights, entities] = weighted_binds();
     for q in &queries {
         assert_placeholder_bind_parity(q);
         assert!(
             q.sql
-                .contains("arrayElement(?, indexOf(?, lower(entity))) as watch_weight"),
+                .contains("toFloat64(arrayElement(?, indexOf(?, lower(entity)))) as watch_weight"),
             "{}",
             q.sql
         );
@@ -1441,7 +1394,7 @@ fn every_entity_grain_builder_binds_the_watch_weights_once() {
     }
 }
 
-/// Notable threshold with a watched entity: the `dataset=risk` columns a
+/// Notable threshold with a weighted entity: the `dataset=risk` columns a
 /// risk-notable rule thresholds on (`score_24h` / `score_7d`) ARE the
 /// effective scores; the base stays alongside, internal to the CTE.
 #[test]
@@ -1451,7 +1404,7 @@ fn dataset_notable_threshold_reads_the_effective_score() {
         &RiskFindingsSource::new(false, "logs"),
         fixed_now(),
         &decay_config(),
-        &watched(cleared),
+        &weighted(cleared),
     );
     assert!(q
         .sql
@@ -1464,7 +1417,7 @@ fn dataset_notable_threshold_reads_the_effective_score() {
     assert!(inline.contains("[0.6, 1.0, 0.0]"), "{inline}");
     assert!(inline.contains("['alice', 'web-01', '']"), "{inline}");
     // 60 base on a 0.6-weight list → 96 effective, over a `score_24h > 90` rule.
-    assert_eq!(crate::risk::watchlist::effective_score(60, 0.6), 96);
+    assert_eq!(crate::risk::score_weights::weighted_score(60, 0.6), 96);
 }
 
 #[test]
@@ -1476,7 +1429,7 @@ fn member_scores_query_matches_lowered_values_and_binds_in_order() {
         &RiskFindingsSource::new(false, "logs"),
         fixed_now(),
         &decay_config(),
-        &watched(cleared),
+        &weighted(cleared),
         &values,
         500,
     );
@@ -1495,85 +1448,8 @@ fn member_scores_query_matches_lowered_values_and_binds_in_order() {
         RiskSqlBind::I64(c24),
         RiskSqlBind::I64(c24),
     ]);
-    expected.extend(watched_binds());
+    expected.extend(weighted_binds());
     expected.extend([RiskSqlBind::I64(c24), RiskSqlBind::I64(500)]);
     assert_eq!(q.binds, expected);
     assert_placeholder_bind_parity(&q);
-}
-
-// ---------------------------------------------------------------------------
-// NAN-3249: watchlist entity suggestions
-// ---------------------------------------------------------------------------
-
-fn suggest_plan(values: &[&str]) -> crate::risk::watchlist_suggest::SuggestPlan {
-    use crate::risk::watchlist_suggest::{plan, SuggestInput};
-    plan(
-        &values
-            .iter()
-            .map(|value| SuggestInput { value: value.to_string(), entity_type: None })
-            .collect::<Vec<_>>(),
-    )
-    .unwrap()
-}
-
-/// Bounded (28d window, per-value LIMIT BY) and fully parameterized: typed
-/// values — including LIKE metacharacters and quotes — only ever travel as
-/// binds, and the SQL never uses LIKE.
-#[test]
-fn watchlist_suggest_query_is_bounded_parameterized_and_like_free() {
-    use super::watchlist_suggest_query;
-    use crate::risk::watchlist_suggest::{SUGGEST_LOOKBACK_DAYS, SUGGEST_ROWS_PER_VALUE};
-    let plan = suggest_plan(&["o'neil%_x", "web01.corp.local"]);
-    let q = watchlist_suggest_query(&RiskFindingsSource::new(false, "logs"), fixed_now(), &plan.patterns);
-    assert_placeholder_bind_parity(&q);
-    let upper = q.sql.to_uppercase();
-    assert!(!upper.contains("LIKE"), "{}", q.sql);
-    assert!(!q.sql.contains("o'neil") && !q.sql.contains("web01"), "values must be bound");
-    assert!(q.sql.contains("LIMIT ? BY value_index"), "{}", q.sql);
-    assert!(!q.sql.contains("PREWHERE"));
-    assert!(!q.sql.contains("__"), "every sentinel substituted: {}", q.sql);
-    assert!(!q.sql.contains("hasAny"), "unrestricted callers emit no scope predicate");
-    let texts: Vec<String> = plan.patterns.iter().map(|p| p.text.clone()).collect();
-    let ops: Vec<i64> = plan.patterns.iter().map(|p| i64::from(p.op.code())).collect();
-    let groups: Vec<i64> = plan.patterns.iter().map(|p| i64::from(p.group)).collect();
-    let expected = vec![
-        RiskSqlBind::I64((fixed_now() - chrono::Duration::days(SUGGEST_LOOKBACK_DAYS)).timestamp_micros()),
-        RiskSqlBind::I64(fixed_now().timestamp_micros()),
-        RiskSqlBind::StrList(texts.clone()),
-        RiskSqlBind::I64List(ops.clone()),
-        RiskSqlBind::StrList(texts),
-        RiskSqlBind::I64List(ops),
-        RiskSqlBind::I64List(groups),
-        RiskSqlBind::I64List((1..=plan.patterns.len() as i64).collect()),
-        RiskSqlBind::I64(SUGGEST_ROWS_PER_VALUE as i64),
-    ];
-    assert_eq!(q.binds, expected);
-    // The inlined rendering escapes the quote rather than breaking out.
-    assert!(q.to_inline_sql().contains("'o''neil%_x'"), "{}", q.to_inline_sql());
-}
-
-/// A restricted viewer's suggestions carry the same fail-closed origin
-/// predicate as every other risk read, bound right after the pruning arrays.
-#[test]
-fn watchlist_suggest_query_applies_the_source_scope_deny() {
-    use super::watchlist_suggest_query;
-    let plan = suggest_plan(&["jsmith"]);
-    for (ocsf, table, origin) in [
-        (false, "logs", "JSONExtract(metadata, 'origin_source_types', 'Array(String)')"),
-        (true, "ocsf_logs", "JSONExtract(toString(unmapped), 'origin_source_types', 'Array(String)')"),
-    ] {
-        let source = RiskFindingsSource::new(ocsf, table).with_source_scope(&restricted_scope(&[" Apache_Access "]));
-        let q = watchlist_suggest_query(&source, fixed_now(), &plan.patterns);
-        assert_placeholder_bind_parity(&q);
-        assert!(q.sql.contains(&format!("AND notEmpty({origin})")), "{}", q.sql);
-        assert!(q.sql.contains("AND NOT hasAny("), "{}", q.sql);
-        match &q.binds[4] {
-            RiskSqlBind::StrList(deny) => {
-                assert!(deny.contains(&"apache_access".to_string()), "{deny:?}");
-                assert!(deny.contains(&UNRESOLVED_SOURCE_SENTINEL.to_string()));
-            }
-            other => panic!("deny set must follow the pruning arrays, got {other:?}"),
-        }
-        assert!(q.sql.contains(&format!("FROM {table}")));
-    }
 }

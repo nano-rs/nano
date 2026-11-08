@@ -2,12 +2,12 @@
 
 /** React Query hooks for the ATT&CK catalog and coverage data. */
 
+import { authenticatedFetch } from '@/lib/authenticated-fetch';
 import { useQuery } from '@tanstack/react-query';
 
 import type { CoverageFilters, MitreCoverageResponse } from '@/components/mitre/types';
 import { useAuth } from '@/contexts/AuthContext';
 import { getAccessToken } from '@/lib/auth-token';
-import { requestCredentials } from '@/lib/request-credentials';
 import { mitreAuthScope, mitreQueryKeys, normalizeMitreFilter } from './mitre-query-keys';
 
 interface MitreTactic {
@@ -61,27 +61,12 @@ interface MitreDataResponse {
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
 
-function authHeaders(): HeadersInit {
-  const token = getAccessToken();
-  return {
-    'Content-Type': 'application/json',
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-  };
-}
-
 async function fetchJson<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(authHeaders());
+  const headers = new Headers({ 'Content-Type': 'application/json' });
   new Headers(init.headers).forEach((value, key) => headers.set(key, value));
-  // NAN-2361: never present the tab bearer AND the origin's access-token
-  // cookie together. The shared-tenant API refuses a request carrying two
-  // credentials ("Provide exactly one authentication credential", 401)
-  // before any route fence runs — which is exactly how /api/mitre* returned
-  // 401 (not the 503 tenant_route_not_scoped every other unported route
-  // gave) for a tenant session. Same rule the main ApiClient applies.
-  const response = await fetch(`${API_BASE_URL}${path}`, {
+  const response = await authenticatedFetch(path, `${API_BASE_URL}${path}`, {
     ...init,
     headers,
-    credentials: requestCredentials(path, headers),
   });
   if (!response.ok) {
     throw new Error(`MITRE request failed (${response.status})`);

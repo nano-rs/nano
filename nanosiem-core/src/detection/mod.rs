@@ -15,10 +15,9 @@
 //! - Prevalence-based detection conditions
 
 pub mod distributed_scheduler;
-pub mod entity_risk;
 pub mod error;
 pub mod event_envelope;
-pub(crate) mod finding_ocsf;
+pub(crate) mod finding_evidence;
 pub mod findings;
 pub mod match_scope;
 pub mod materialized_view;

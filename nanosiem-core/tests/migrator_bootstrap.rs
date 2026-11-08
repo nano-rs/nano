@@ -10,16 +10,28 @@
 //!   docker run -d --rm --name test-ch-nan811 -p 18123:8123 \
 //!     -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=admin \
 //!     -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
-//!     clickhouse/clickhouse-server:26.4
+//!     clickhouse/clickhouse-server:26.10.3.7
 //!
 //! Run: cargo test -p nanosiem-core --test migrator_bootstrap -- --nocapture
 
 use nanosiem_core::db::ClickHouseMigrator;
 use std::path::PathBuf;
 
-const CH_URL: &str = "http://localhost:18123";
-const CH_USER: &str = "admin";
-const CH_PASSWORD: &str = "admin";
+/// Default `http://localhost:18123`. Override with `MIGRATOR_BOOTSTRAP_CH_URL` when
+/// another ClickHouse already owns that port: this test DROPs and recreates its own
+/// database, so never point it at a server you don't own (NAN-4906).
+fn ch_url() -> String {
+    std::env::var("MIGRATOR_BOOTSTRAP_CH_URL").unwrap_or_else(|_| "http://localhost:18123".to_string())
+}
+/// Default `admin`/`admin` (the docker run above). Override with
+/// `MIGRATOR_BOOTSTRAP_CH_USER` / `MIGRATOR_BOOTSTRAP_CH_PASSWORD` for a server
+/// with other credentials; an auth failure reads as "unreachable" and skips.
+fn ch_user() -> String {
+    std::env::var("MIGRATOR_BOOTSTRAP_CH_USER").unwrap_or_else(|_| "admin".to_string())
+}
+fn ch_password() -> String {
+    std::env::var("MIGRATOR_BOOTSTRAP_CH_PASSWORD").unwrap_or_else(|_| "admin".to_string())
+}
 
 fn fresh_db_name() -> String {
     // Use a per-run name so repeat runs don't see a database left over from a
@@ -36,8 +48,8 @@ fn fresh_db_name() -> String {
 
 async fn ch_reachable() -> bool {
     reqwest::Client::new()
-        .get(format!("{}/?query=SELECT+1", CH_URL))
-        .basic_auth(CH_USER, Some(CH_PASSWORD))
+        .get(format!("{}/?query=SELECT+1", ch_url()))
+        .basic_auth(ch_user(), Some(ch_password()))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -46,18 +58,18 @@ async fn ch_reachable() -> bool {
 
 async fn drop_db(db: &str) {
     let _ = reqwest::Client::new()
-        .post(format!("{}/?query=DROP+DATABASE+IF+EXISTS+{}", CH_URL, db))
-        .basic_auth(CH_USER, Some(CH_PASSWORD))
+        .post(format!("{}/?query=DROP+DATABASE+IF+EXISTS+{}", ch_url(), db))
+        .basic_auth(ch_user(), Some(ch_password()))
         .send()
         .await;
 }
 
 fn build_client(database: &str) -> clickhouse::Client {
     clickhouse::Client::default()
-        .with_url(CH_URL)
+        .with_url(ch_url())
         .with_database(database)
-        .with_user(CH_USER)
-        .with_password(CH_PASSWORD)
+        .with_user(ch_user())
+        .with_password(ch_password())
 }
 
 #[tokio::test]
@@ -68,8 +80,8 @@ async fn migrator_creates_target_database_when_missing() {
              (start with: docker run -d --rm --name test-ch-nan811 \
              -p 18123:8123 -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=admin \
              -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
-             clickhouse/clickhouse-server:26.4)",
-            CH_URL
+             clickhouse/clickhouse-server:26.10.3.7)",
+            ch_url()
         );
         return;
     }

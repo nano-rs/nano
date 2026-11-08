@@ -84,93 +84,82 @@ export function hasValue(value: unknown, fieldName?: string): boolean {
  * Supports:
  * - Single-line comments: // comment
  * - Multi-line comments: slash-star ... star-slash
- * 
- * Comments inside quoted strings or regex patterns are preserved.
- * 
+ *
+ * Mirrors the server's nPL `strip_comments` (NAN-4902): a `//` or slash-star
+ * opens a comment only at the start of the query or after whitespace, so bare
+ * URLs (`http://evil.example/x`), URL path globs (`/api/*`) and regex literals
+ * survive. Text inside single- or double-quoted strings is never a comment; as
+ * on the server, a backslash does not escape the closing quote (NAN-1157).
+ * Inside a `field=/regex/` literal a backslash escapes the next character.
+ *
  * @param query The search query to strip comments from
  * @returns The query with comments removed
  */
-// NAN-4283: a `//` or `/*` starts a comment only at a token boundary (start,
-// whitespace, or a pipeline/grouping delimiter). Inside an unquoted value such
-// as `url=https://host/x` it is part of the value. Mirrors the server's
-// `comment_may_start_after` so the UI never sends a truncated query.
-function commentMayStartAfter(result: string): boolean {
-  if (result.length === 0) return true;
-  return /[\s|()[\],]/.test(result[result.length - 1]);
-}
-
 export function stripComments(query: string): string {
   let result = '';
   let i = 0;
-  let inQuote = false;
+  let quote: '"' | "'" | null = null;
   let inRegex = false;
-  
+
   while (i < query.length) {
     const c = query[i];
     const next = query[i + 1];
-    
-    // Handle escape sequences
-    if (c === '\\' && i + 1 < query.length) {
-      result += c + next;
-      i += 2;
+    // Comment openers need a token boundary: start of input or whitespace.
+    const atBoundary = i === 0 || /\s/.test(query[i - 1]);
+
+    if (quote) {
+      result += c;
+      if (c === quote) quote = null;
+      i++;
       continue;
     }
-    
-    // Handle quotes (toggle quote state)
-    if (c === '"' && !inRegex) {
-      inQuote = !inQuote;
+
+    if (inRegex) {
+      if (c === '\\' && i + 1 < query.length) {
+        result += c + next;
+        i += 2;
+        continue;
+      }
+      if (c === '/') inRegex = false;
       result += c;
       i++;
       continue;
     }
-    
-    // Handle regex patterns (after = or !=)
-    if (c === '/' && !inQuote) {
-      if (!inRegex) {
-        // Check if this is a regex delimiter (preceded by = or !=)
-        const before = result.trimEnd();
-        if (before.endsWith('=') || before.endsWith('!=')) {
-          inRegex = true;
-          result += c;
-          i++;
-          continue;
-        }
-      } else {
-        // End of regex
-        inRegex = false;
-        result += c;
-        i++;
-        continue;
-      }
-    }
-    
-    // Skip single-line comments (// ...) when not in quote or regex
-    if (!inQuote && !inRegex && c === '/' && next === '/' && commentMayStartAfter(result)) {
-      // Skip until end of line
-      while (i < query.length && query[i] !== '\n') {
-        i++;
-      }
+
+    if (c === '"' || c === "'") {
+      quote = c;
+      result += c;
+      i++;
       continue;
     }
-    
-    // Skip multi-line comments (/* ... */) when not in quote or regex
-    if (!inQuote && !inRegex && c === '/' && next === '*' && commentMayStartAfter(result)) {
-      i += 2; // Skip /*
-      // Find closing */
-      while (i < query.length - 1) {
-        if (query[i] === '*' && query[i + 1] === '/') {
-          i += 2; // Skip */
-          break;
-        }
-        i++;
-      }
+
+    if (c === '/' && atBoundary && next === '/') {
+      // Single-line comment: skip to end of line (the newline is kept).
+      while (i < query.length && query[i] !== '\n' && query[i] !== '\r') i++;
+      result += ' ';
       continue;
     }
-    
+
+    if (c === '/' && atBoundary && next === '*') {
+      i += 2;
+      while (i < query.length && !(query[i] === '*' && query[i + 1] === '/')) i++;
+      i = Math.min(i + 2, query.length);
+      result += ' ';
+      continue;
+    }
+
+    // A regex literal follows `=` / `!=` (optionally with spaces between).
+    if (c === '/') {
+      const before = result.trimEnd();
+      if (before.endsWith('=')) {
+        inRegex = true;
+      }
+    }
+
     result += c;
     i++;
   }
-  
+
   return result.trim();
 }
 

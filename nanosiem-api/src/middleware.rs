@@ -9,9 +9,9 @@
 //! - Request ID propagation for distributed tracing
 //! - Rate limiting for auth endpoints
 
-pub mod api_cache_control;
 pub mod audit_authz;
 pub mod auth;
+pub mod backup_mutation_fence;
 pub mod demo_guard;
 pub mod denied_source_audit;
 pub mod ip_allowlist;
@@ -22,20 +22,22 @@ pub mod rate_limit;
 pub mod request_id;
 pub mod sanitize_errors;
 pub mod tier_guard;
-pub mod vector_ingest_guard;
 
-pub use api_cache_control::api_default_cache_control;
 pub use audit_authz::audit_authz_failures;
 pub use auth::{
     auth_middleware, check_all_permissions, check_any_permission, check_permission,
     ensure_interactive_session, ensure_permission, optional_auth_middleware, require_session_auth,
     require_session_or_self, AuthContext, AuthErrorResponse, AuthState,
 };
+pub use backup_mutation_fence::{backup_mutation_fence, BackupMutationFence};
 pub use demo_guard::demo_guard;
 pub use ip_allowlist::{ip_allowlist_middleware, IpAllowlistState};
 #[cfg(feature = "enterprise")]
+pub use license_guard::component_guard;
+#[cfg(feature = "enterprise")]
 pub use license_guard::license_guard;
 pub use logging::request_logging_layer;
+pub use nanosiem_api_lib::api_cache_control::api_default_cache_control;
 pub use rate_limit::{
     dry_resolve_rate_limit_middleware, kafka_probe_rate_limit_middleware,
     login_rate_limit_middleware, marketplace_preview_rate_limit_middleware,
@@ -45,4 +47,3 @@ pub use rate_limit::{
 pub use request_id::{request_id_middleware, RequestId, REQUEST_ID_HEADER};
 pub use sanitize_errors::sanitize_error_responses;
 pub use tier_guard::api_write_guard;
-pub use vector_ingest_guard::vector_ingest_guard;

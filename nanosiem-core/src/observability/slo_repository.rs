@@ -15,22 +15,6 @@ use uuid::Uuid;
 
 use crate::query::SliKind;
 
-/// Longest SLO window (days) either SLO surface accepts. NAN-1721 O5: a
-/// window must stay inside OTLP span retention, or attainment is computed
-/// over expired spans and silently overstated.
-pub const SLO_WINDOW_DAYS_MAX: i32 = 30;
-
-/// NAN-3894 (Dan 10-15): OTLP spans and metrics are kept at least this many
-/// days, whatever the tenant's log retention, so the longest SLO window plus
-/// the one-hour coverage skew is always attestable. Retention only ever grows
-/// to this floor; a longer tenant setting is kept as is.
-pub const OTEL_MIN_RETENTION_DAYS: u32 = 31;
-
-const _: () = assert!(
-    OTEL_MIN_RETENTION_DAYS as i64 * 24 >= SLO_WINDOW_DAYS_MAX as i64 * 24 + 1,
-    "OTLP retention must cover the longest SLO window plus the coverage skew hour"
-);
-
 #[derive(Error, Debug)]
 pub enum SloRepositoryError {
     #[error("Database error: {0}")]
@@ -44,9 +28,7 @@ pub enum SloRepositoryError {
 /// The SLI kind an SLO is measured against. Mirrors the storage CHECK
 /// constraint (`'availability' | 'latency'`) and maps to the query layer's
 /// [`SliKind`] for spans-based compute.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SloSliKind {
     Availability,
@@ -234,8 +216,9 @@ impl SloRepository {
 
     fn row_to_slo(row: &sqlx::postgres::PgRow) -> Result<SloDefinition, SloRepositoryError> {
         let kind_str: String = row.get("sli_kind");
-        let sli_kind = SloSliKind::from_str(&kind_str)
-            .ok_or_else(|| SloRepositoryError::Invalid(format!("unknown sli_kind '{kind_str}'")))?;
+        let sli_kind = SloSliKind::from_str(&kind_str).ok_or_else(|| {
+            SloRepositoryError::Invalid(format!("unknown sli_kind '{kind_str}'"))
+        })?;
         Ok(SloDefinition {
             id: row.get("id"),
             name: row.get("name"),

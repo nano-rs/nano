@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+/// <reference types="node" />
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { SessionCredentials } from './session-credentials.ts';
-import { requestCredentials, SessionExpiredError } from './request-credentials.ts';
+import { SessionCredentials, SessionExpiredError } from './session-credentials.ts';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -10,7 +10,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-test('requests queue during scheduled refresh and each sends once with fresh bearer', async () => {
+test('requests queue during a scheduled refresh and each sends once with the fresh bearer', async () => {
   let token: string | null = 'old';
   const gate = new SessionCredentials(() => token);
   const refresh = deferred<boolean>();
@@ -20,11 +20,7 @@ test('requests queue during scheduled refresh and each sends once with fresh bea
     return true;
   });
   const sent: string[] = [];
-  const requests = Array.from({ length: 20 }, async () => {
-    const credential = await gate.credential();
-    assert.equal(requestCredentials('/api/search', { Authorization: `Bearer ${credential}` }), 'omit');
-    sent.push(credential);
-  });
+  const requests = Array.from({ length: 20 }, async () => { sent.push(await gate.credential()); });
   await Promise.resolve();
   assert.equal(sent.length, 0);
   refresh.resolve(true);
@@ -60,15 +56,11 @@ test('a late 401 reuses an already refreshed credential without another rotation
   assert.equal(await gate.credential('old'), 'new');
 });
 
-test('empty and malformed credentials never send a protected request', async () => {
-  let sent = 0;
-  for (const headers of [{}, { Authorization: '' }, { Authorization: 'Bearer ' }] as HeadersInit[]) {
-    await assert.rejects(async () => {
-      requestCredentials('/api/auth/tenant-bootstrap', headers);
-      sent++;
-    }, SessionExpiredError);
-  }
-  assert.equal(sent, 0);
-  assert.equal(requestCredentials('/api/auth/refresh', {}), 'include');
-  assert.equal(requestCredentials('/api/auth/login', {}), 'include');
+test('the silent page-load refresh latches without prompting a never-signed-in visitor', async () => {
+  let prompts = 0;
+  const gate = new SessionCredentials(() => null);
+  gate.configure(async () => false, () => { prompts++; });
+  await assert.rejects(gate.runRefresh(async () => false, false), SessionExpiredError);
+  await assert.rejects(gate.credential(), SessionExpiredError);
+  assert.equal(prompts, 0);
 });

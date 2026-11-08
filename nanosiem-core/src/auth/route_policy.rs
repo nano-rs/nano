@@ -15,9 +15,10 @@
 //! (only) inside the handler. This module is the **pure decision core**: the
 //! policy type, the minimal principal view it needs ([`RoutePrincipal`]), and
 //! [`RoutePolicy::evaluate`]. Route-registration wiring, the enforcing
-//! middleware, and production-app HTTP matrices live in each service. API and
-//! enterprise registration use `nanosiem-api-lib::route_policy`; Search has its
-//! own registration adapter to the same decision core.
+//! middleware, and the completeness/zero-permission test matrix are layered on
+//! top in each service (see the phased plan on NAN-2042) — they are behavior
+//! -changing and land in reviewed increments. Nothing here is wired into
+//! request handling yet, so adding this module changes no runtime behavior.
 //!
 //! ## Model: auth mode × capability are independent
 //!
@@ -39,13 +40,11 @@
 //! FIRST; a handler may then apply ownership, case visibility, source scope, or
 //! row filtering as defense in depth. Capability first, ownership/scope second.
 
-use std::borrow::Cow;
-
 /// The minimal view of an authenticated caller that a [`RoutePolicy`] needs to
 /// reach a decision.
 ///
 /// Each HTTP service has its own `AuthContext` type (`nanosiem-api-lib` for
-/// `nanosiem-api` / the enterprise crate, and a separate one in
+/// `nanosiem-api` / `nanosiem-enterprise`, and a separate one in
 /// `nanosiem-search`). Implementing this trait on each lets the decision logic
 /// in [`RoutePolicy::evaluate`] be written once and shared across all three,
 /// instead of re-deriving it per service (the divergence class NAN-2043 was
@@ -54,16 +53,6 @@ pub trait RoutePrincipal {
     /// True when the caller authenticated with an API key (as opposed to an
     /// interactive JWT/cookie session).
     fn is_api_key(&self) -> bool;
-
-    /// Only a positively identified interactive session may satisfy this mode.
-    fn is_interactive_session(&self) -> bool {
-        false
-    }
-
-    /// Supplied only by verified internal service authentication, never headers.
-    fn service_identity(&self) -> Option<&str> {
-        None
-    }
 
     /// True when the caller holds `permission`.
     fn has_permission(&self, permission: &str) -> bool;
@@ -92,11 +81,6 @@ pub enum AuthMode {
     /// service-to-service key must never act (mirrors
     /// `AuthContext::ensure_interactive_session`).
     InteractiveSession,
-    /// A verified service on a private listener, with its own operation grants.
-    ServiceIdentity(&'static str),
-    /// Human self-service, or an explicitly granted administration capability.
-    /// The handler must still bind the requested resource to the session owner.
-    InteractiveOrCapability,
 }
 
 /// The permission requirement a route imposes **on top of** its [`AuthMode`]
@@ -106,15 +90,9 @@ pub enum CapabilityRequirement {
     /// No permission check beyond the auth mode.
     None,
     /// The caller must hold **every** listed permission.
-    AllOf(Cow<'static, [&'static str]>),
+    AllOf(&'static [&'static str]),
     /// The caller must hold **at least one** listed permission.
-    AnyOf(Cow<'static, [&'static str]>),
-    /// Every primary grant plus at least one declared alternative. Used where
-    /// a common operation has two valid resource-specific authorities.
-    AllOfAnyOf {
-        all: &'static [&'static str],
-        any: &'static [&'static str],
-    },
+    AnyOf(&'static [&'static str]),
 }
 
 /// The fail-closed authorization policy attached to a `(method, matched-path
@@ -174,35 +152,26 @@ impl RoutePolicy {
     /// No authentication and no capability required. The only variant that
     /// admits an unauthenticated caller.
     pub const fn public() -> Self {
-        Self {
-            auth_mode: AuthMode::Public,
-            capability: CapabilityRequirement::None,
-        }
+        Self { auth_mode: AuthMode::Public, capability: CapabilityRequirement::None }
     }
 
     /// Any authenticated principal (session or API key); no permission beyond
     /// authentication.
     pub const fn authenticated() -> Self {
-        Self {
-            auth_mode: AuthMode::Authenticated,
-            capability: CapabilityRequirement::None,
-        }
+        Self { auth_mode: AuthMode::Authenticated, capability: CapabilityRequirement::None }
     }
 
     /// An authenticated interactive session (API keys denied); no permission
     /// beyond the session requirement.
     pub const fn interactive_session() -> Self {
-        Self {
-            auth_mode: AuthMode::InteractiveSession,
-            capability: CapabilityRequirement::None,
-        }
+        Self { auth_mode: AuthMode::InteractiveSession, capability: CapabilityRequirement::None }
     }
 
     /// Any authenticated principal that holds **all** of `perms`.
     pub const fn all_of(perms: &'static [&'static str]) -> Self {
         Self {
             auth_mode: AuthMode::Authenticated,
-            capability: CapabilityRequirement::AllOf(Cow::Borrowed(perms)),
+            capability: CapabilityRequirement::AllOf(perms),
         }
     }
 
@@ -210,7 +179,7 @@ impl RoutePolicy {
     pub const fn any_of(perms: &'static [&'static str]) -> Self {
         Self {
             auth_mode: AuthMode::Authenticated,
-            capability: CapabilityRequirement::AnyOf(Cow::Borrowed(perms)),
+            capability: CapabilityRequirement::AnyOf(perms),
         }
     }
 
@@ -220,7 +189,7 @@ impl RoutePolicy {
     pub const fn interactive_all_of(perms: &'static [&'static str]) -> Self {
         Self {
             auth_mode: AuthMode::InteractiveSession,
-            capability: CapabilityRequirement::AllOf(Cow::Borrowed(perms)),
+            capability: CapabilityRequirement::AllOf(perms),
         }
     }
 
@@ -229,53 +198,7 @@ impl RoutePolicy {
     pub const fn interactive_any_of(perms: &'static [&'static str]) -> Self {
         Self {
             auth_mode: AuthMode::InteractiveSession,
-            capability: CapabilityRequirement::AnyOf(Cow::Borrowed(perms)),
-        }
-    }
-
-    /// A registration-time permission resolved from an existing typed operation.
-    pub fn one(permission: &'static str) -> Self {
-        Self {
-            auth_mode: AuthMode::Authenticated,
-            capability: CapabilityRequirement::AllOf(Cow::Owned(vec![permission])),
-        }
-    }
-
-    pub fn service(identity: &'static str, operation: &'static str) -> Self {
-        Self {
-            auth_mode: AuthMode::ServiceIdentity(identity),
-            capability: CapabilityRequirement::AllOf(Cow::Owned(vec![operation])),
-        }
-    }
-
-    /// A service operation union (for protocols multiplexing commands on one URI).
-    pub const fn service_any_of(
-        identity: &'static str,
-        operations: &'static [&'static str],
-    ) -> Self {
-        Self {
-            auth_mode: AuthMode::ServiceIdentity(identity),
-            capability: CapabilityRequirement::AnyOf(Cow::Borrowed(operations)),
-        }
-    }
-
-    /// Preserve a capability requirement while requiring a positive session.
-    pub fn interactive(mut self) -> Self {
-        self.auth_mode = AuthMode::InteractiveSession;
-        self
-    }
-
-    pub const fn interactive_or_all_of(perms: &'static [&'static str]) -> Self {
-        Self {
-            auth_mode: AuthMode::InteractiveOrCapability,
-            capability: CapabilityRequirement::AllOf(Cow::Borrowed(perms)),
-        }
-    }
-
-    pub const fn all_of_any_of(all: &'static [&'static str], any: &'static [&'static str]) -> Self {
-        Self {
-            auth_mode: AuthMode::Authenticated,
-            capability: CapabilityRequirement::AllOfAnyOf { all, any },
+            capability: CapabilityRequirement::AnyOf(perms),
         }
     }
 
@@ -324,27 +247,7 @@ impl RoutePolicy {
                 None => return Deny,
             },
             AuthMode::InteractiveSession => match principal {
-                Some(p) if p.is_interactive_session() => Some(p),
-                _ => return Deny,
-            },
-            AuthMode::InteractiveOrCapability => match principal {
-                Some(p) if p.is_interactive_session() => {
-                    return match &self.capability {
-                        CapabilityRequirement::AllOf(perms)
-                            if !perms.is_empty() && perms.iter().all(|perm| !perm.is_empty()) =>
-                        {
-                            Allow
-                        }
-                        _ => Deny,
-                    };
-                }
-                Some(p) => Some(p),
-                None => return Deny,
-            },
-            AuthMode::ServiceIdentity(identity) => match principal {
-                Some(p) if !identity.is_empty() && p.service_identity() == Some(identity) => {
-                    Some(p)
-                }
+                Some(p) if !p.is_api_key() => Some(p),
                 _ => return Deny,
             },
         };
@@ -362,36 +265,13 @@ impl RoutePolicy {
                 _ => Allow,
             },
             CapabilityRequirement::AllOf(perms) => match authed {
-                Some(p)
-                    if !perms.is_empty()
-                        && perms
-                            .iter()
-                            .all(|perm| !perm.is_empty() && p.has_permission(perm)) =>
-                {
-                    Allow
-                }
-                _ => Deny,
-            },
-            CapabilityRequirement::AllOfAnyOf { all, any } => match authed {
-                Some(p)
-                    if !all.is_empty()
-                        && !any.is_empty()
-                        && all.iter().chain(any.iter()).all(|p| !p.is_empty())
-                        && all.iter().all(|perm| p.has_permission(perm))
-                        && p.has_any_permission(any) =>
-                {
+                Some(p) if !perms.is_empty() && perms.iter().all(|perm| p.has_permission(perm)) => {
                     Allow
                 }
                 _ => Deny,
             },
             CapabilityRequirement::AnyOf(perms) => match authed {
-                Some(p)
-                    if !perms.is_empty()
-                        && perms.iter().all(|perm| !perm.is_empty())
-                        && p.has_any_permission(perms) =>
-                {
-                    Allow
-                }
+                Some(p) if !perms.is_empty() && p.has_any_permission(perms) => Allow,
                 _ => Deny,
             },
         }
@@ -442,25 +322,16 @@ mod tests {
 
     impl TestPrincipal {
         fn session(perms: &[&'static str]) -> Self {
-            Self {
-                api_key: false,
-                perms: perms.to_vec(),
-            }
+            Self { api_key: false, perms: perms.to_vec() }
         }
         fn api_key(perms: &[&'static str]) -> Self {
-            Self {
-                api_key: true,
-                perms: perms.to_vec(),
-            }
+            Self { api_key: true, perms: perms.to_vec() }
         }
     }
 
     impl RoutePrincipal for TestPrincipal {
         fn is_api_key(&self) -> bool {
             self.api_key
-        }
-        fn is_interactive_session(&self) -> bool {
-            !self.api_key
         }
         fn has_permission(&self, permission: &str) -> bool {
             self.perms.iter().any(|p| *p == permission)
@@ -474,12 +345,8 @@ mod tests {
     fn public_allows_everyone_including_anonymous() {
         let policy = RoutePolicy::public();
         assert!(policy.evaluate(ANON).is_allow());
-        assert!(policy
-            .evaluate(Some(&TestPrincipal::session(&[])))
-            .is_allow());
-        assert!(policy
-            .evaluate(Some(&TestPrincipal::api_key(&[])))
-            .is_allow());
+        assert!(policy.evaluate(Some(&TestPrincipal::session(&[]))).is_allow());
+        assert!(policy.evaluate(Some(&TestPrincipal::api_key(&[]))).is_allow());
         assert!(policy.is_public());
         assert!(!policy.requires_interactive_session());
     }
@@ -488,13 +355,9 @@ mod tests {
     fn authenticated_only_denies_anon_allows_any_principal() {
         let policy = RoutePolicy::authenticated();
         assert_eq!(policy.evaluate(ANON), PolicyDecision::Deny);
-        assert!(policy
-            .evaluate(Some(&TestPrincipal::session(&[])))
-            .is_allow());
+        assert!(policy.evaluate(Some(&TestPrincipal::session(&[]))).is_allow());
         // An API key is still an authenticated principal here.
-        assert!(policy
-            .evaluate(Some(&TestPrincipal::api_key(&[])))
-            .is_allow());
+        assert!(policy.evaluate(Some(&TestPrincipal::api_key(&[]))).is_allow());
         assert!(!policy.is_public());
     }
 
@@ -506,9 +369,7 @@ mod tests {
             policy.evaluate(Some(&TestPrincipal::api_key(&[]))),
             PolicyDecision::Deny
         );
-        assert!(policy
-            .evaluate(Some(&TestPrincipal::session(&[])))
-            .is_allow());
+        assert!(policy.evaluate(Some(&TestPrincipal::session(&[]))).is_allow());
         assert!(policy.requires_interactive_session());
     }
 
@@ -516,10 +377,7 @@ mod tests {
     fn all_of_requires_every_permission() {
         let policy = RoutePolicy::all_of(&["search:execute", "search:sql"]);
         assert!(policy
-            .evaluate(Some(&TestPrincipal::session(&[
-                "search:execute",
-                "search:sql"
-            ])))
+            .evaluate(Some(&TestPrincipal::session(&["search:execute", "search:sql"])))
             .is_allow());
         assert_eq!(
             policy.evaluate(Some(&TestPrincipal::session(&["search:execute"]))),
@@ -591,7 +449,7 @@ mod tests {
         // than allowing a permissioned principal through a "public" route.
         let malformed = RoutePolicy {
             auth_mode: AuthMode::Public,
-            capability: CapabilityRequirement::AllOf(Cow::Borrowed(&["search:execute"])),
+            capability: CapabilityRequirement::AllOf(&["search:execute"]),
         };
         assert_eq!(malformed.evaluate(ANON), PolicyDecision::Deny);
         assert_eq!(
@@ -604,10 +462,7 @@ mod tests {
     fn constructors_never_produce_public_with_capability() {
         // The public construction surface (constructors) cannot express the
         // malformed state: the only Public constructor pairs it with None.
-        assert_eq!(
-            RoutePolicy::public().capability(),
-            &CapabilityRequirement::None
-        );
+        assert_eq!(RoutePolicy::public().capability(), &CapabilityRequirement::None);
         assert!(RoutePolicy::public().is_public());
     }
 
@@ -636,100 +491,5 @@ mod tests {
         // Unauthenticated → deny.
         assert_eq!(policy.evaluate(ANON), PolicyDecision::Deny);
         assert!(policy.requires_interactive_session());
-    }
-    #[test]
-    fn service_identity_is_positive_exact_and_operation_bound() {
-        struct Service {
-            identity: Option<&'static str>,
-            permission: &'static str,
-        }
-        impl RoutePrincipal for Service {
-            fn is_api_key(&self) -> bool {
-                false
-            }
-            fn service_identity(&self) -> Option<&str> {
-                self.identity
-            }
-            fn has_permission(&self, p: &str) -> bool {
-                p == self.permission
-            }
-        }
-        let service = Service {
-            identity: Some("platform"),
-            permission: "tenant:provision",
-        };
-        let unknown = Service {
-            identity: None,
-            permission: "tenant:provision",
-        };
-        let other = Service {
-            identity: Some("runner"),
-            permission: "tenant:provision",
-        };
-        let policy = RoutePolicy::service("platform", "tenant:provision");
-        assert!(policy.evaluate(Some(&service)).is_allow());
-        assert!(!policy.evaluate(Some(&unknown)).is_allow());
-        assert!(!policy.evaluate(Some(&other)).is_allow());
-        assert!(!RoutePolicy::service("platform", "tenant:delete")
-            .evaluate(Some(&service))
-            .is_allow());
-        assert!(!RoutePolicy::interactive_session()
-            .evaluate(Some(&service))
-            .is_allow());
-        assert!(!RoutePolicy::interactive_session()
-            .evaluate(Some(&unknown))
-            .is_allow());
-        assert!(!RoutePolicy::service("", "tenant:provision")
-            .evaluate(Some(&service))
-            .is_allow());
-        let empty = Service {
-            identity: Some("platform"),
-            permission: "",
-        };
-        assert!(!RoutePolicy::service("platform", "")
-            .evaluate(Some(&empty))
-            .is_allow());
-    }
-    #[test]
-    fn self_service_and_composite_alternatives_keep_positive_boundaries() {
-        let self_service = RoutePolicy::interactive_or_all_of(&["users:edit"]);
-        assert!(self_service
-            .evaluate(Some(&TestPrincipal::session(&[])))
-            .is_allow());
-        assert!(!self_service
-            .evaluate(Some(&TestPrincipal::api_key(&[])))
-            .is_allow());
-        assert!(self_service
-            .evaluate(Some(&TestPrincipal::api_key(&["users:edit"])))
-            .is_allow());
-        assert!(!RoutePolicy::interactive_or_all_of(&[])
-            .evaluate(Some(&TestPrincipal::session(&[])))
-            .is_allow());
-        let composite =
-            RoutePolicy::all_of_any_of(&["melod:notebook"], &["notebooks:edit", "cases:edit"]);
-        for api_key in [false, true] {
-            for perms in [
-                vec![],
-                vec!["melod:notebook"],
-                vec!["notebooks:edit"],
-                vec!["cases:edit"],
-            ] {
-                let principal = TestPrincipal {
-                    api_key,
-                    perms: perms.to_vec(),
-                };
-                assert!(!composite.evaluate(Some(&principal)).is_allow());
-            }
-            for permissions in [
-                ["melod:notebook", "notebooks:edit"],
-                ["melod:notebook", "cases:edit"],
-            ] {
-                let principal = TestPrincipal {
-                    api_key,
-                    perms: permissions.to_vec(),
-                };
-                assert!(composite.evaluate(Some(&principal)).is_allow());
-            }
-        }
     }
 }

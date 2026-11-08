@@ -22,16 +22,9 @@ path = "src/bin/jobs.rs"
 name = "clickhouse_migrator"
 path = "src/bin/clickhouse_migrator.rs"
 
-[[bin]]
-name = "postgres_migrator"
-path = "src/bin/postgres_migrator.rs"
-
-
-
-
-
 [dependencies]
 nanosiem-core = { path = "../nanosiem-core" }
+# NAN-4914: connector pull feeds (bundled specs, feed store) — open core.
 nano-connector = { path = "../nano-connector" }
 nanosiem-api-lib = { path = "../nanosiem-api-lib" }
 nanosiem-search = { path = "../nanosiem-search" }
@@ -55,13 +48,6 @@ regex = "1.12"
 async-stream = "0.3"
 async-trait = "0.1"
 dashmap = "6.1"
-# Wait-free publication of the boot-resolved schema profile (NAN-2361), same
-# version nanosiem-core uses for the enrichment snapshot slot.
-arc-swap = "1.7"
-# Confirming a promoted lake schema manifest by CONTENT digest before the API
-# adopts it (NAN-2361), same versions nanosiem-core verifies artifacts with.
-sha2 = "0.11"
-hex = "0.4"
 futures = "0.3.32"
 reqwest = { version = "0.13", features = ["json"] }
 scraper = "0.26"
@@ -71,30 +57,14 @@ metrics-exporter-prometheus.workspace = true
 feed-rs.workspace = true
 once_cell = "1.20"
 base64 = "0.22.1"
-# Parsing the IPinfo-Lite CSV payload in the air-gap enrichment import (NAN-1205).
-csv = "1.3"
 utoipa.workspace = true
 utoipa-swagger-ui.workspace = true
-url = "2.5"
-zeroize = "1.8"
 
 [features]
 default = []
 [dev-dependencies]
 proptest.workspace = true
-# NAN-4729: paused-clock leader-lease tests of the convergence worker.
-tokio = { workspace = true, features = ["test-util"] }
-libc = "0.2"
 tempfile = "3.25"
-
-
-
-
-
-
-
-
-
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("enterprise"))'] }

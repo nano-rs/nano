@@ -253,7 +253,7 @@ export function BatchImportParsersModal({
             <SelectContent>
               <SelectItem value="routed">HTTP (Routed)</SelectItem>
               <SelectItem value="vector">Vector</SelectItem>
-              <SelectItem value="splunk_hec">HEC</SelectItem>
+              <SelectItem value="splunk_hec">Splunk HEC</SelectItem>
               <SelectItem value="kafka">Kafka</SelectItem>
               <SelectItem value="aws_s3">AWS S3</SelectItem>
               <SelectItem value="gcp_pubsub">GCP Pub/Sub</SelectItem>
@@ -366,7 +366,7 @@ export function BatchImportParsersModal({
                         <SelectContent>
                           <SelectItem value="routed">HTTP (Routed)</SelectItem>
                           <SelectItem value="vector">Vector</SelectItem>
-                          <SelectItem value="splunk_hec">HEC</SelectItem>
+                          <SelectItem value="splunk_hec">Splunk HEC</SelectItem>
                           <SelectItem value="kafka">Kafka</SelectItem>
                           <SelectItem value="aws_s3">AWS S3</SelectItem>
                           <SelectItem value="gcp_pubsub">GCP Pub/Sub</SelectItem>

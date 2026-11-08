@@ -10,8 +10,7 @@ incremental = false
 # size-optimized. Measured on real tenant1 bronze objects, admission cost
 # 2.3 ms CPU per event at "z" vs 0.28 ms at 3; one ed25519 verify_strict
 # was 1,351 us vs 23 us. Services are CPU-bound; binary size is not a
-# constraint. Guarded by nanosiem-lake-worker/tests/
-# nan2793_release_profile_static_contract.rs.
+# constraint. Ported from main for clickhouse/dev (NAN-4905).
 opt-level = 3
 # NAN-3450: thin LTO + 16 codegen units. Fat LTO with codegen-units = 1
 # serialized every release link onto one core: the 2026-10-09 macy trial
@@ -51,11 +50,3 @@ split-debuginfo = "unpacked"
 [profile.test]
 debug = 1
 split-debuginfo = "unpacked"
-
-[env]
-# NAN-3861: tests render, deploy and read back hosted tenant Workers against this
-# placeholder Cloudflare account (the Worker build-context fixture account id),
-# so no checked-in fixture carries the hosted account.
-# Applies only to processes cargo starts (tests, `cargo run`); deployed hosted
-# binaries do not see it and keep resolving the hosted pin.
-NANO_CLOUDFLARE_ACCOUNT_ID = "0123456789abcdef0123456789abcdef"

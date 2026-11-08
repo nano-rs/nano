@@ -38,7 +38,6 @@ struct SecurityAddon;
 impl Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         if let Some(components) = openapi.components.as_mut() {
-            components.add_security_scheme("egress_service_bearer", SecurityScheme::Http(HttpBuilder::new().scheme(HttpAuthScheme::Bearer).description(Some("Internal squid helper service credential; never user auth")).build()));
             components.add_security_scheme(
                 "bearer_auth",
                 SecurityScheme::Http(
@@ -70,9 +69,8 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     // Merge handler sub-docs. Paths already include the full `/api/...` prefix.
     for sub in [
         handlers::SearchApiDoc::openapi(),
-        crate::inputlookup_egress::EgressApiDoc::openapi(),
-        handlers::tree_page::TreePageApiDoc::openapi(),
         handlers::identity::IdentityApiDoc::openapi(),
+        handlers::tree_page::TreePageApiDoc::openapi(),
     ] {
         spec.paths.paths.extend(sub.paths.paths);
         if let Some(sub_components) = sub.components {
@@ -134,10 +132,7 @@ mod tests {
             "/api/search/prevalence-artifacts",
             "/api/search/field-stats",
             "/api/search/field-values",
-            "/api/search/histogram",
             "/api/search/retro",
-            "/api/search/prevalence/export",
-            "/api/search/prevalence/rare",
             "/api/search/saved",
             "/api/search/saved/shared",
             "/api/search/saved/mine",
@@ -152,7 +147,9 @@ mod tests {
             "/api/search/asset-dossier",
             "/api/search/cloud-overview",
             "/api/search/cloud-dossier",
+            "/api/search/jobs",
             "/api/search/jobs/{job_id}",
+            "/api/search/jobs/{job_id}/results",
             "/api/search/{request_id}",
             "/api/search/admin/jobs",
             "/api/search/admin/stats",
@@ -178,19 +175,5 @@ mod tests {
                 paths
             );
         }
-    }
-}
-
-/// Shared documentation and live admission use the same route policy.
-/// An open build documents no shared surface.
-pub fn shared_documented_operation(method: &axum::http::Method, path: &str) -> bool {
-    #[cfg(feature = "enterprise")]
-    {
-        crate::middleware::enterprise_shared_search_route_is_open(method, path)
-    }
-    #[cfg(not(feature = "enterprise"))]
-    {
-        let _ = (method, path);
-        false
     }
 }

@@ -4,8 +4,104 @@
 
 use super::{ClickHouseMigrateError, ClickHouseMigrator, Migration};
 use std::collections::HashSet;
+use std::time::Duration;
+
+const DATABASE_BOOTSTRAP_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(60);
+const DATABASE_BOOTSTRAP_VISIBILITY_POLL: Duration = Duration::from_millis(250);
+const DATABASE_BOOTSTRAP_DDL_OUTPUT_MODE: &str = "throw";
+
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct DatabaseBootstrapVisibility {
+    visible_nodes: u64,
+    expected_nodes: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaselineMigration {
+    version: String,
+    name: String,
+}
+
+const BASELINE_MIGRATIONS_JSON: &str =
+    include_str!("../../../../clickhouse/baseline_migrations.json");
 
 impl ClickHouseMigrator {
+    pub(super) fn database_bootstrap_sql(&self) -> String {
+        let is_cloud = self.is_cloud.unwrap_or(false);
+        match self.cluster.as_ref().and_then(|cluster| cluster.as_ref()) {
+            Some(cluster) if !is_cloud && cluster != &self.database => format!(
+                "CREATE DATABASE IF NOT EXISTS {} ON CLUSTER '{}'",
+                self.database, cluster
+            ),
+            _ => format!("CREATE DATABASE IF NOT EXISTS {}", self.database),
+        }
+    }
+
+    pub(super) fn database_bootstrap_visibility_sql(&self) -> Option<String> {
+        let is_cloud = self.is_cloud.unwrap_or(false);
+        let cluster = self.cluster.as_ref().and_then(|cluster| cluster.as_ref())?;
+        if is_cloud || cluster == &self.database {
+            return None;
+        }
+
+        let database = crate::sql_hygiene::escape_sql_string(&self.database);
+        let cluster = crate::sql_hygiene::escape_sql_string(cluster);
+        Some(format!(
+            "SELECT countIf(name = '{database}') AS visible_nodes, \
+             (SELECT count() FROM system.clusters WHERE cluster = '{cluster}') AS expected_nodes \
+             FROM clusterAllReplicas('{cluster}', system.databases)"
+        ))
+    }
+
+    async fn wait_for_database_bootstrap_visibility(
+        &self,
+        bootstrap_client: &clickhouse::Client,
+    ) -> Result<(), ClickHouseMigrateError> {
+        let Some(sql) = self.database_bootstrap_visibility_sql() else {
+            return Ok(());
+        };
+
+        let deadline = tokio::time::Instant::now() + DATABASE_BOOTSTRAP_VISIBILITY_TIMEOUT;
+        loop {
+            let last_observation =
+                match bootstrap_client
+                    .query(&sql)
+                    .fetch_one::<DatabaseBootstrapVisibility>()
+                    .await
+                {
+                    Ok(DatabaseBootstrapVisibility {
+                        visible_nodes,
+                        expected_nodes: Some(expected_nodes),
+                    }) if expected_nodes > 0 && visible_nodes == expected_nodes =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(DatabaseBootstrapVisibility {
+                        visible_nodes,
+                        expected_nodes: Some(expected_nodes),
+                    }) => {
+                        format!("database visible on {visible_nodes}/{expected_nodes} nodes")
+                    }
+                    Ok(DatabaseBootstrapVisibility {
+                        visible_nodes,
+                        expected_nodes: None,
+                    }) => {
+                        format!("database visible on {visible_nodes} nodes; cluster size unavailable")
+                    }
+                    Err(error) => format!("cluster visibility query failed: {error}"),
+                };
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ClickHouseMigrateError::ClickHouse(format!(
+                    "timed out waiting for database {} after ON CLUSTER bootstrap: {}",
+                    self.database, last_observation
+                )));
+            }
+            tokio::time::sleep(DATABASE_BOOTSTRAP_VISIBILITY_POLL).await;
+        }
+    }
+
     /// Ensure the _migrations table exists
     pub(super) async fn ensure_migrations_table(&self) -> Result<(), ClickHouseMigrateError> {
         // NAN-811: ensure the target database exists before any statement that
@@ -20,16 +116,37 @@ impl ClickHouseMigrator {
         // rejects the session with UNKNOWN_DATABASE before any statement runs
         // when that database doesn't exist yet. Clone the client and swap to
         // the always-present `default` database just for this one statement.
-        // The CREATE DATABASE itself is idempotent and safe in all modes:
-        // cloud already has a Replicated target DB (no-op); cluster mode
-        // creates per-node, matching the per-node pattern we use for the
-        // _migrations table itself below.
-        let bootstrap_client = self.client.clone().with_database("default");
+        // The CREATE DATABASE itself is idempotent and safe in all modes.
+        // Explicit operator clusters require ON CLUSTER so the very first
+        // `_migrations` DDL can address the database on every blank shard.
+        // Cloud/Replicated-database and implicit/single-node modes deliberately
+        // retain the exact historical statement without an ON CLUSTER clause.
+        // This is the ordering barrier for every later cluster DDL statement.
+        // Never inherit an asynchronous/none output mode from a deployment
+        // profile: that lets CREATE TABLE reach another blank shard before its
+        // CREATE DATABASE task has executed there. `throw` waits for every
+        // active host and propagates a remote failure instead of publishing a
+        // partially bootstrapped cluster.
+        let bootstrap_client = self
+            .client
+            .clone()
+            .with_database("default")
+            .with_option(
+                "distributed_ddl_output_mode",
+                DATABASE_BOOTSTRAP_DDL_OUTPUT_MODE,
+            );
         bootstrap_client
-            .query(&format!("CREATE DATABASE IF NOT EXISTS {}", self.database))
+            .query(&self.database_bootstrap_sql())
             .execute()
             .await
             .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+        // Keep an explicit all-node visibility assertion after the synchronous
+        // ON CLUSTER DDL barrier. Do not let init.sql or `_migrations` rely on
+        // implicit observation timing or stale cluster membership on a blank
+        // cluster. The non-cluster, implicit-cluster, Replicated-DB, and cloud
+        // paths skip this wait and retain their historical statement/ordering.
+        self.wait_for_database_bootstrap_visibility(&bootstrap_client)
+            .await?;
 
         // Pick the engine + ON CLUSTER form to match the deployment topology.
         // Three modes — same shape as `transform_for_cluster` post-NAN-1092:
@@ -90,6 +207,152 @@ impl ClickHouseMigrator {
             .execute()
             .await
             .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+
+        // NAN-4977: durable work queue for refreshable-view query changes.
+        // It deliberately shares `_migrations`' cluster-global replication
+        // group shape (no `{shard}`), so whichever jobs replica becomes leader
+        // sees the same pending/failed/succeeded state.
+        let refresh_engine = replacing_revision_engine(&global_table_engine(
+            &engine,
+            crate::db::migration_refresh::MIGRATION_REFRESH_TABLE,
+        ));
+        let refresh_sql = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {}.{}{}
+            (
+                `version` String,
+                `view` String,
+                `reload_target` String,
+                `state` LowCardinality(String),
+                `revision` UInt64,
+                `phase` LowCardinality(String) DEFAULT 'refresh',
+                `attempts` UInt8 DEFAULT 0,
+                `next_attempt_at` DateTime64(6, 'UTC') DEFAULT now64(6),
+                `last_error` String DEFAULT '',
+                `updated_at` DateTime64(6, 'UTC') DEFAULT now64(6)
+            )
+            ENGINE = {}
+            ORDER BY (version, view)
+            SETTINGS index_granularity = 8192
+            "#,
+            self.database,
+            crate::db::migration_refresh::MIGRATION_REFRESH_TABLE,
+            on_cluster,
+            refresh_engine
+        );
+        self.client
+            .query(&refresh_sql)
+            .execute()
+            .await
+            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+
+        // NAN-4939: exact, immutable membership for an operator repair run.
+        // This has the same cluster-global topology as `_migrations`, allowing
+        // every shard-local DELETE mutation to see the identical repair set.
+        let repair_set_engine = global_table_engine(
+            &engine,
+            crate::db::future_timestamp_repair::FUTURE_REPAIR_SET_TABLE,
+        );
+        let repair_set_sql = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {}.{}{}
+            (
+                `repair_id` UUID,
+                `source_table` LowCardinality(String),
+                `event_id` UUID,
+                `source_timestamp` DateTime64(6, 'UTC'),
+                `created_at` DateTime64(6, 'UTC') DEFAULT now64(6)
+            )
+            ENGINE = {}
+            ORDER BY (repair_id, source_table, event_id, source_timestamp)
+            TTL created_at + INTERVAL 7 DAY DELETE
+            SETTINGS index_granularity = 8192
+            "#,
+            self.database,
+            crate::db::future_timestamp_repair::FUTURE_REPAIR_SET_TABLE,
+            on_cluster,
+            repair_set_engine
+        );
+        self.client
+            .query(&repair_set_sql)
+            .execute()
+            .await
+            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+
+        // `ip_enrichments.updated_at` is the ReplacingMergeTree version and
+        // ClickHouse therefore forbids ALTER UPDATE on it. A corrected copy has
+        // a lower version than the bad far-future tombstone, so copying beside
+        // the original can also be merged away before deletion. Persist the
+        // exact confirmed tombstone rows in a cluster-global buffer first;
+        // NAN-4939 can then delete the bad winners and restore from this durable
+        // copy without risking resurrection or payload loss.
+        let ip_repair_rows_engine = global_table_engine(
+            &engine,
+            crate::db::future_timestamp_repair::FUTURE_IP_REPAIR_ROWS_TABLE,
+        );
+        let ip_repair_rows_sql = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {}.{}{}
+            (
+                `repair_id` UUID,
+                `network` String,
+                `source_id` LowCardinality(String),
+                `country` String DEFAULT '',
+                `country_code` String DEFAULT '',
+                `continent` String DEFAULT '',
+                `continent_code` String DEFAULT '',
+                `asn` String DEFAULT '',
+                `as_name` String DEFAULT '',
+                `as_domain` String DEFAULT '',
+                `updated_at` DateTime64(3, 'UTC'),
+                `deleted` UInt8,
+                `created_at` DateTime64(6, 'UTC') DEFAULT now64(6)
+            )
+            ENGINE = {}
+            ORDER BY (repair_id, source_id, network, updated_at)
+            SETTINGS index_granularity = 8192
+            "#,
+            self.database,
+            crate::db::future_timestamp_repair::FUTURE_IP_REPAIR_ROWS_TABLE,
+            on_cluster,
+            ip_repair_rows_engine
+        );
+        self.client
+            .query(&ip_repair_rows_sql)
+            .execute()
+            .await
+            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+
+        // The buffer becomes the only authoritative tombstone payload after
+        // the bad ReplacingMergeTree winner is deleted. It must never expire
+        // automatically. Upgrade the first NAN-4939 schema, which briefly
+        // shipped with a seven-day TTL, in place. Normal and manual cleanup are
+        // both scoped to a verified repair_id.
+        let escaped_database = crate::sql_hygiene::escape_sql_string(&self.database);
+        let escaped_table = crate::sql_hygiene::escape_sql_string(
+            crate::db::future_timestamp_repair::FUTURE_IP_REPAIR_ROWS_TABLE,
+        );
+        let ip_buffer_has_ttl: u64 = self
+            .client
+            .query(&format!(
+                "SELECT count() FROM system.tables WHERE database = '{escaped_database}' \
+                 AND name = '{escaped_table}' AND position(create_table_query, 'TTL') > 0"
+            ))
+            .fetch_one()
+            .await
+            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+        if ip_buffer_has_ttl > 0 {
+            self.client
+                .query(&format!(
+                    "ALTER TABLE {}.{}{} REMOVE TTL",
+                    self.database,
+                    crate::db::future_timestamp_repair::FUTURE_IP_REPAIR_ROWS_TABLE,
+                    on_cluster
+                ))
+                .execute()
+                .await
+                .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+        }
 
         Ok(())
     }
@@ -168,65 +431,81 @@ impl ClickHouseMigrator {
         Ok(())
     }
 
-    /// All migration versions baked into init.sql.
-    /// When init.sql creates a fresh schema, these are seeded into `_migrations`
-    /// so the runner doesn't try to re-apply them.
-    pub(super) const BASELINE_MIGRATIONS: &'static [(&'static str, &'static str)] = &[
-        ("001", "init_clickhouse"),
-        ("002", "rename_raw_content_to_message"),
-        ("003", "add_enrich_time"),
-        ("004", "add_source_column"),
-        ("005", "ip_prevalence_table"),
-        ("006", "ip_prevalence_mv"),
-        ("007", "ioc_enrichment_columns"),
-        ("008", "add_missing_enrichment_columns"),
-        ("075", "create_identity_observations"),
-        ("075a", "create_identity_mv"),
-        ("075b", "create_nat_detection"),
-        ("076", "add_identity_source_priority"),
-        ("078", "full_text_search_index"),
-        ("079", "add_namespace_column"),
-        ("079a", "update_identity_mv_namespace"),
-        ("080", "custom_enrichment_results"),
-        ("081", "custom_enrichment_dictionary"),
-        ("082", "add_process_guids"),
-        ("083", "grant_dictionary_permissions"),
-        ("084", "add_geo_enrichment_columns"),
-        ("085", "add_sample_by_key"),
-        ("086", "cim_alignment_and_indexes"),
-        ("087", "add_query_projections"),
-        ("088", "extend_identity_ttl"),
-        ("089", "log_deduplication"),
-        ("090", "entity_time_range_mv"),
-        ("091", "restore_geo_enrichment_defaults"),
-        ("092", "cloud_user_activity_mv"),
-        ("093", "ipv6_enrichment_fix"),
-        ("094", "storage_optimization"),
-        ("095", "drop_message_search_column"),
-        ("097", "user_registry_dictionary"),
-        ("098", "identity_enrichment_columns"),
-        ("103", "flexible_enrichment_columns"),
-        // 104-108 baseline names match the original /migrations/clickhouse/
-        // history applied to existing tenants by the pre-NAN-606 runner.
-        // Seeding by version number is what the runner dedupes on, so the
-        // exact name strings here are informational — they just need to be
-        // recognizable in `_migrations` rows.
-        ("104", "drop_log_hash_uuid_v7"),
-        ("105", "remove_hardcoded_ttl"),
-        ("106", "rename_process_to_command_line"),
-        ("107", "logs_ttl_hard_cap"),
-        ("108", "prevalence_min_inline_default"),
-        // 109-112 are the post-108 migrations whose effects are now in
-        // init.sql (109/110/111 already; 112 folded in for NAN-606). On
-        // a fresh deploy init.sql creates the post-state, so we seed these
-        // versions to stop the runner from re-applying their files.
-        ("109", "drop_windowed_prevalence_dicts"),
-        ("110", "prevalence_summary_tables"),
-        ("111", "filter_internal_tlds_domain_prevalence"),
-        ("112", "fix_prevalence_dict_layout"),
-        ("168", "parser_health_5m"),
-        ("169", "profile_aware_logs_per_source_5m"),
-    ];
+    /// Record refresh invalidations declared by a migration. Called after its
+    /// SQL succeeds but before `_migrations` is advanced, so a queue-write
+    /// failure leaves the migration retryable instead of silently losing the
+    /// activation request.
+    pub(super) async fn record_refresh_invalidations(
+        &self,
+        migration: &Migration,
+        directives: &[crate::db::migration_refresh::MigrationRefreshDirective],
+    ) -> Result<usize, ClickHouseMigrateError> {
+        let table = format!(
+            "{}.{}",
+            self.database,
+            crate::db::migration_refresh::MIGRATION_REFRESH_TABLE
+        );
+        for directive in directives {
+            let version = crate::sql_hygiene::escape_sql_string(&migration.version);
+            let view = crate::sql_hygiene::escape_sql_string(&directive.view);
+            let reload = crate::sql_hygiene::escape_sql_string(&directive.reload_target);
+            let sql = format!(
+                "INSERT INTO {table} \
+                    (version, view, reload_target, state, revision, phase, attempts, next_attempt_at) \
+                 SELECT '{version}', '{view}', '{reload}', 'pending', ifNull(max(revision), 0) + 1, \
+                        'refresh', 0, now64(6) \
+                 FROM {table} FINAL WHERE version = '{version}' AND view = '{view}'"
+            );
+            self.client
+                .query(&sql)
+                .execute()
+                .await
+                .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+        }
+        Ok(directives.len())
+    }
+
+    /// All migration versions baked into init.sql. The same JSON contract is
+    /// consumed by the upgrade validator when it permits checksum-less fresh
+    /// seed rows; keeping the identities in one file prevents contract drift.
+    fn baseline_migrations() -> Result<Vec<BaselineMigration>, ClickHouseMigrateError> {
+        let migrations: Vec<BaselineMigration> = serde_json::from_str(BASELINE_MIGRATIONS_JSON)
+            .map_err(|error| {
+                ClickHouseMigrateError::ClickHouse(format!(
+                    "invalid embedded baseline migration contract: {error}"
+                ))
+            })?;
+        if migrations.is_empty() {
+            return Err(ClickHouseMigrateError::ClickHouse(
+                "embedded baseline migration contract is empty".to_string(),
+            ));
+        }
+        let mut versions = HashSet::new();
+        for migration in &migrations {
+            let digit_count = migration
+                .version
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .count();
+            if digit_count == 0
+                || migration.version[digit_count..]
+                    .chars()
+                    .any(|character| !character.is_ascii_lowercase())
+                || migration.name.is_empty()
+                || migration.name.chars().any(|character| {
+                    !character.is_ascii_lowercase()
+                        && !character.is_ascii_digit()
+                        && character != '_'
+                })
+                || !versions.insert(migration.version.clone())
+            {
+                return Err(ClickHouseMigrateError::ClickHouse(
+                    "invalid embedded baseline migration contract entry".to_string(),
+                ));
+            }
+        }
+        Ok(migrations)
+    }
 
     /// Seed all baseline migration versions into `_migrations`.
     /// Called after init.sql on a fresh deployment so the runner won't re-apply them.
@@ -241,12 +520,12 @@ impl ClickHouseMigrator {
         }
 
         let mut seeded = 0;
-        for (version, name) in Self::BASELINE_MIGRATIONS {
+        for migration in Self::baseline_migrations()? {
             let sql = format!(
                 "INSERT INTO {}._migrations (version, name) VALUES ('{}', '{}')",
                 self.database,
-                crate::sql_hygiene::escape_sql_string(version),
-                crate::sql_hygiene::escape_sql_string(name)
+                crate::sql_hygiene::escape_sql_string(&migration.version),
+                crate::sql_hygiene::escape_sql_string(&migration.name)
             );
             self.client
                 .query(&sql)
@@ -260,3 +539,28 @@ impl ClickHouseMigrator {
         Ok(seeded)
     }
 }
+
+fn global_table_engine(base: &str, table: &str) -> String {
+    base.replace("/_migrations", &format!("/{table}"))
+}
+
+fn replacing_revision_engine(base: &str) -> String {
+    if base == "MergeTree" {
+        return "ReplacingMergeTree(revision)".to_string();
+    }
+    let Some(args) = base
+        .strip_prefix("ReplicatedMergeTree(")
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return base.to_string();
+    };
+    if args.is_empty() {
+        "ReplicatedReplacingMergeTree(revision)".to_string()
+    } else {
+        format!("ReplicatedReplacingMergeTree({args}, revision)")
+    }
+}
+
+#[cfg(test)]
+#[path = "tracking_tests.rs"]
+mod tests;

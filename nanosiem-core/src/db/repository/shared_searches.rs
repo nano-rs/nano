@@ -39,11 +39,7 @@ impl SharedSearchRepository {
             .collect()
     }
 
-    /// Create a new shared search with a short ID.
-    ///
-    /// NAN-2361 (9001060): `shared_searches` is tenant-scoped with PRIMARY KEY
-    /// `(tenant_id, id)`; this dedicated insert takes the compatibility-tenant
-    /// DEFAULT, so the conflict target leads with `tenant_id`.
+    /// Create a new shared search with a short ID
     pub async fn create(
         &self,
         search: &NewSharedSearch,
@@ -53,12 +49,12 @@ impl SharedSearchRepository {
             let id = Self::generate_short_id();
 
             let result = sqlx::query_as::<_, SharedSearch>(
-                concat!(r#"
+                r#"
                 INSERT INTO shared_searches (id, query, query_mode, time_range_type, time_range_preset, time_range_start, time_range_end)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT ("#, crate::tenant_key!(), r#"id) DO NOTHING
+                ON CONFLICT (id) DO NOTHING
                 RETURNING *
-                "#),
+                "#,
             )
             .bind(&id)
             .bind(&search.query)

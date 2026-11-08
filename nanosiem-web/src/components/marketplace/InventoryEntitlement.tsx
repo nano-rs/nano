@@ -1,26 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { Button } from '@/components/ui/button';
-import { entitlementLabel, type MarketplaceEntitlement } from '@/lib/api/marketplace-inventory';
+import type { InventoryRequirement } from '@/lib/api/marketplace-inventory';
+import type { BuildEdition } from '@/hooks/use-capabilities';
 
-export function InventoryEntitlement({ status, loading, failed, onRefresh, checkoutPending }: {
-  status: MarketplaceEntitlement | null | undefined;
-  checkoutPending?: boolean;
-  loading: boolean;
-  failed: boolean;
-  onRefresh: () => void;
-}) {
-  return <section aria-label="Purchase status" className="my-3 border-t pt-3">
-    {loading ? <p role="status">Checking purchase status…</p>
-      : failed ? <p role="alert">Could not verify purchase status.</p>
-      : status ? <>
-        <p role="status">{entitlementLabel(status)}</p>
-        <dl className="my-2 grid grid-cols-[110px_1fr] gap-2">
-          <dt>Paid through</dt><dd className="font-mono">{status.expires_at ?? 'Not recorded'}</dd>
-          <dt>Entitlement revision</dt><dd className="font-mono">{status.revision}</dd>
-        </dl>
-        {status.state === 'pending' && <p>Waiting for verified payment confirmation. You can reload this item safely.</p>}
-        {status.state === 'active' && <p>Renewals update the paid-through date after billing verification and preserve your enable/disable preference.</p>}
-      </> : <p>{checkoutPending ? "Checkout started · awaiting verified billing confirmation" : "No purchase is recorded."}</p>}
-    <Button variant="outline" disabled={loading} onClick={onRefresh}>Refresh purchase status</Button>
+/**
+ * What an item is entitled to on this deployment (NAN-4946). Main showed the
+ * hosted purchase state here; a single-tenant install has no purchase, so the
+ * entitlement is the build itself: the capability the item needs and whether
+ * this edition ships it. Read from `/api/capabilities`, never a hosted flag.
+ */
+export function InventoryEntitlement({ requirement, edition }: { requirement: InventoryRequirement; edition: BuildEdition }) {
+  return <section aria-label="Entitlement" className="my-3 rounded-md border border-border px-3 py-2.5">
+    <p role="status" className="text-[12px] text-foreground">Requires the {requirement.label}</p>
+    <dl className="my-2 grid grid-cols-[110px_1fr] gap-1.5 text-[11.5px]">
+      <dt className="text-muted-foreground">Capability</dt><dd className="font-mono">{requirement.capability}</dd>
+      <dt className="text-muted-foreground">This build</dt><dd className="font-mono">{edition}</dd>
+    </dl>
+    <p className="text-[11px] leading-[1.45] text-muted-foreground">
+      This edition does not include the runtime this integration executes on, so it cannot be installed here.
+      It installs and runs unchanged on an enterprise deployment.
+    </p>
   </section>;
 }

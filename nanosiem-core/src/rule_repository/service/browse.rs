@@ -60,6 +60,7 @@ impl RuleRepositoryService {
         repo_id: Uuid,
         path: &str,
     ) -> Result<RepositoryRule, RuleRepositoryError> {
+        self.get_repository(repo_id).await?;
         self.rules_repository
             .find_by_path(repo_id, path)
             .await
@@ -124,10 +125,7 @@ impl RuleRepositoryService {
             if analyzer.is_inventory_empty() {
                 drop(analyzer); // Release read lock before acquiring write lock
                 let mut analyzer = self.coverage_analyzer.write().await;
-                if let Err(e) = analyzer
-                    .refresh_available_fields(self.search_service.as_deref())
-                    .await
-                {
+                if let Err(e) = analyzer.refresh_available_fields().await {
                     warn!("Failed to refresh coverage data: {}", e);
                 }
             }

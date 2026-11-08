@@ -55,15 +55,17 @@ export function segmentKey(s: Pick<SegmentHealthSeries, 'dimension' | 'value'>):
 const HOUR_MS = 3_600_000;
 
 /**
- * Search scoped to a source's slugs (`metadata.log_source`, the field Search
- * scopes by on the lake), optionally narrowed to one segment value and to a
+ * Search scoped to a source's route keys (on the active schema's log-source
+ * field), optionally narrowed to one segment value and to a
  * time window.
  */
 export function healthSearchHref(
   sourceSlugs: string[],
-  opts: { field?: string; value?: string; start?: string; end?: string; sourceField?: string } = {},
+  opts: { field?: string; value?: string; start?: string; end?: string; sourceField: string },
 ): string {
-  const sourceField = opts.sourceField ?? 'metadata.log_source';
+  // The active schema's log-source field (`useSchemaFieldMap().field('logSource')`):
+  // `source_type` on UDM, `metadata.log_source` on OCSF. Required, never defaulted.
+  const sourceField = opts.sourceField;
   const scope =
     sourceSlugs.length === 1
       ? nplFieldEquals(sourceField, sourceSlugs[0])
@@ -78,7 +80,7 @@ export function healthSearchHref(
     params.set('start', opts.start);
     params.set('end', opts.end);
   }
-  return `/search#${params.toString()}`;
+  return `/search?${params.toString()}`;
 }
 
 export function hourWindow(points: HealthSeriesPoint[], idx?: number): { start?: string; end?: string } {

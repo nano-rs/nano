@@ -13,6 +13,7 @@
 
 pub mod api_key;
 pub mod artifact_provenance;
+pub mod authz_generation;
 pub mod content_repo;
 pub mod credential_use;
 pub mod google_sso;
@@ -26,25 +27,21 @@ pub mod permissions;
 pub mod repository;
 pub mod route_policy;
 pub mod scope;
-/// NAN-3231: one-snapshot enterprise-shared Search admission.
-pub mod search_admission;
 pub mod service;
+pub mod service_credential;
 pub mod session;
-pub mod session_cookies;
-pub mod source_scope_resolver;
-/// NAN-2361 wave 8: the explicit visibility a shared-lake read runs under
-/// (member deny set, detection runtime / runner, case-scoped evidence).
-pub mod source_visibility;
 pub mod sso_policy;
-pub mod tenant;
-pub mod tenant_auth_methods;
-pub mod tenant_oidc;
+pub mod source_scope_resolver;
 pub mod token;
 pub mod types;
 pub mod user_status_cache;
 
 #[cfg(test)]
 mod group_membership_tests;
+#[cfg(test)]
+mod service_credential_tests;
+#[cfg(test)]
+mod sso_admission_tests;
 
 pub use api_key::*;
 pub use artifact_provenance::*;
@@ -63,11 +60,8 @@ pub use route_policy::*;
 pub use scope::*;
 pub use service::*;
 pub use session::*;
-pub use source_scope_resolver::*;
 pub use sso_policy::*;
-pub use tenant::*;
-pub use tenant_auth_methods::*;
-pub use tenant_oidc::*;
+pub use source_scope_resolver::*;
 pub use token::*;
 pub use types::*;
 pub use user_status_cache::*;

@@ -19,6 +19,44 @@ const INPUT_MONO = 'h-8 text-[12px] font-mono bg-card';
 const SELECT_TRIGGER = 'h-8 text-[12px] bg-card';
 const SELECT_ITEM = 'text-[12px]';
 
+/**
+ * NAN-4914: queue / subscription sources start at current activity. A new
+ * source acknowledges, without ingesting, whatever the queue held before the
+ * source config was created (dated by the cloud's send time, with a 5-minute
+ * grace). This opts one source out.
+ */
+function IncludeBacklogToggle({
+  config,
+  onChange,
+  disabled,
+}: {
+  config: Record<string, unknown>;
+  onChange: (config: Record<string, unknown>) => void;
+  disabled?: boolean;
+}) {
+  const checked = config.include_backlog === true;
+  return (
+    <div className="space-y-1">
+      <label className="flex items-center gap-2 text-[12px]">
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(e) =>
+            onChange({ ...config, include_backlog: e.target.checked ? true : undefined })
+          }
+          disabled={disabled}
+          className="h-3.5 w-3.5 accent-primary"
+        />
+        Ingest backlog
+      </label>
+      <p className={HELP_TEXT}>
+        Off by default: the source starts at current activity and skips messages sent more
+        than 5 minutes before it was created.
+      </p>
+    </div>
+  );
+}
+
 interface SourceConfigFormProps {
   sourceType: string;
   config: Record<string, unknown>;
@@ -93,7 +131,7 @@ export function SourceConfigForm({
       );
 
     case 'splunk_hec':
-      return <HecConfigForm />;
+      return <SplunkHecConfigForm />;
 
     case 'vector':
       return (
@@ -400,6 +438,8 @@ function SqsConfigForm({ config, onChange, credentialId, onCredentialChange, dis
         </div>
       </details>
 
+      <IncludeBacklogToggle config={config} onChange={onChange} disabled={disabled} />
+
       <CredentialPicker
         provider="aws_s3"
         value={credentialId}
@@ -540,8 +580,35 @@ function S3ConfigForm({ config, onChange, credentialId, onCredentialChange, disa
               use Vector's default.
             </p>
           </div>
+
+          <div className="space-y-1.5">
+            <Label className={FIELD_LABEL}>SQS visibility timeout (seconds)</Label>
+            <Input
+              type="number"
+              min={1}
+              max={43200}
+              value={(config.visibility_timeout_secs as number | undefined) ?? ''}
+              onChange={(e) =>
+                onChange({
+                  ...config,
+                  visibility_timeout_secs: e.target.value ? Number(e.target.value) : undefined,
+                })
+              }
+              placeholder="300"
+              disabled={disabled}
+              className={INPUT_MONO}
+            />
+            <p className={HELP_TEXT}>
+              How long a notification stays hidden while its object is fetched. A
+              notification in flight when Vector restarts comes back after this long.
+              Must exceed the time to process one object, or it is redelivered and its
+              events duplicated. New sources start at 60; blank uses Vector's 300.
+            </p>
+          </div>
         </div>
       </details>
+
+      <IncludeBacklogToggle config={config} onChange={onChange} disabled={disabled} />
 
       <CredentialPicker
         provider="aws_s3"
@@ -614,6 +681,8 @@ function GcpPubSubConfigForm({ config, onChange, credentialId, onCredentialChang
           className={INPUT_BASE}
         />
       </div>
+
+      <IncludeBacklogToggle config={config} onChange={onChange} disabled={disabled} />
 
       <CredentialPicker
         provider="gcp_pubsub"
@@ -727,12 +796,12 @@ function EventHubsConfigForm({ config, onChange, credentialId, onCredentialChang
 // A user HEC source config is a routing profile only — `address`,
 // `valid_tokens`, `permit_origin`, and `tls` no longer have any effect at
 // deploy time, so the form has nothing per-config to ask for.
-function HecConfigForm() {
+function SplunkHecConfigForm() {
   return (
     <div className="p-4 bg-muted/30 rounded-md text-center text-muted-foreground">
       <Zap className="w-8 h-8 mx-auto mb-2 opacity-50" />
       <p className="text-[12px]">
-        HEC events arrive on the platform-managed listener.
+        Splunk HEC events arrive on the platform-managed listener.
       </p>
       <p className="text-[10.5px] mt-2 leading-relaxed">
         No per-config connection settings. Events are accepted on{' '}

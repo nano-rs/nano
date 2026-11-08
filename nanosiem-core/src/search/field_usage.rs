@@ -4,14 +4,14 @@
 //!
 //! The search bar orders field suggestions as "Recent (you)" → "Popular in
 //! this workspace" → curated defaults → everything else. Both ranked groups
-//! are derived from the search history the product already stores (open core:
-//! `search_history`; hosted shared: the RLS `tenant_search_history` ledger).
+//! are derived from the `search_history` table the product already stores
+//! (one workspace per deployment).
 //! There is no new tracking: each stored query is re-parsed with the nPL
 //! parser and only the *field names* it references are kept. Values, keywords
 //! and literals never leave this module.
 //!
-//! Storage access lives with each backend; this module is pure (parse, rank)
-//! plus a short-lived per-(tenant, user) cache shared by both handlers.
+//! Storage access lives in `SearchHistoryRepository::field_usage_rows`; this
+//! module is pure (parse, rank) plus a short-lived per-user cache.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -31,8 +31,8 @@ pub const RECENT_LIMIT: usize = 5;
 pub const POPULAR_LIMIT: usize = 15;
 /// Most recent history rows of the caller considered for Recent.
 pub const USER_ROW_LIMIT: i64 = 200;
-/// Most recent tenant-wide history rows considered for Popular.
-pub const TENANT_ROW_LIMIT: i64 = 2_000;
+/// Most recent workspace-wide history rows considered for Popular.
+pub const WORKSPACE_ROW_LIMIT: i64 = 2_000;
 /// History older than this does not count toward either group.
 pub const HISTORY_WINDOW_DAYS: i64 = 90;
 /// Recency half-life for the Recent score.
@@ -40,6 +40,9 @@ const RECENT_HALF_LIFE_HOURS: f64 = 24.0 * 7.0;
 /// One heavy user cannot dominate Popular: each user contributes at most this
 /// many queries per field.
 const POPULAR_PER_USER_CAP: usize = 20;
+/// A field is "popular in this workspace" only once this many DISTINCT users
+/// searched it: Popular must never reveal what one colleague is looking at.
+pub const POPULAR_MIN_DISTINCT_USERS: usize = 3;
 /// Longest field name we report. Anything longer is not a real field.
 const MAX_FIELD_LEN: usize = 128;
 /// Longest stored query we bother parsing.
@@ -50,12 +53,11 @@ const MAX_QUERY_LEN: usize = 10_000;
 pub struct SearchFieldUsage {
     /// Fields the caller used most recently / most often (recency-weighted).
     pub recent: Vec<String>,
-    /// Fields most used across all members of the caller's tenant.
+    /// Fields most used across every user of this deployment.
     pub popular: Vec<String>,
 }
 
-/// One stored history row, as read by either backend. The backend must have
-/// already restricted rows to the caller's tenant.
+/// One stored history row (`search_history.user_id, query, created_at`).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct FieldUsageRow {
     pub user_id: Uuid,
@@ -128,7 +130,7 @@ impl Collector {
             | SearchExpr::InList { field, .. } => self.field(field),
             SearchExpr::InSubsearch { field, subsearch, .. } => {
                 self.field(field);
-                // The subsearch runs on the same tenant's data; its fields count too.
+                // The subsearch's own field references count too.
                 let mut inner = Collector::default();
                 inner.query(subsearch);
                 for name in inner.out {
@@ -203,13 +205,11 @@ impl Collector {
                     self.derive(&a.field);
                 }
             }
-            Command::Lookup { event_field, output_fields, output_renames, .. } => {
-                self.field(event_field);
+            Command::Lookup { event_field, key_field, output_fields, output_renames, .. } => {
+                self.field(&Command::lookup_event_field(event_field, key_field));
                 for name in output_fields.iter().flatten() {
-                    self.derive(name);
-                }
-                for r in output_renames {
-                    self.derive(&r.to);
+                    let target = output_renames.iter().find(|r| &r.from == name).map_or(name, |r| &r.to);
+                    self.derive(target);
                 }
             }
             Command::Mvexpand { field, .. } => self.field(field),
@@ -241,6 +241,23 @@ impl Collector {
     }
 }
 
+/// Whether `name` is a field of a public schema registry (UDM or OCSF
+/// promoted columns), and so safe to share across users. `ext.*` and every
+/// other name outside the registries are private to their author.
+pub fn is_public_schema_field(name: &str) -> bool {
+    static PUBLIC: once_cell::sync::Lazy<HashSet<String>> = once_cell::sync::Lazy::new(|| {
+        use crate::schema::SchemaProfile;
+        let udm = crate::schema::UdmProfile;
+        let ocsf = crate::schema::OcsfProfile::new();
+        udm.fields()
+            .iter()
+            .chain(ocsf.fields().iter())
+            .map(|f| f.name.to_string())
+            .collect()
+    });
+    !name.starts_with("ext.") && PUBLIC.contains(name)
+}
+
 /// A plausible field identifier: no spaces, quotes, operators or wildcards.
 /// This is also the guarantee that nothing value-shaped is ever reported.
 fn is_reportable_field(name: &str) -> bool {
@@ -258,15 +275,14 @@ fn is_reportable_field(name: &str) -> bool {
     !matches!(name, "dataset" | "ioc" | "index")
 }
 
-/// Rank Recent and Popular from tenant-scoped history rows.
+/// Rank Recent and Popular from history rows.
 ///
-/// `user_rows` are the caller's own rows; `tenant_rows` are rows of every
-/// member of the caller's tenant (they may include the caller). Both are
-/// assumed already filtered to one tenant by the backend.
+/// `user_rows` are the caller's own rows; `workspace_rows` are rows of every
+/// user of this deployment (they may include the caller).
 pub fn rank_field_usage(
     actor: Uuid,
     user_rows: &[FieldUsageRow],
-    tenant_rows: &[FieldUsageRow],
+    workspace_rows: &[FieldUsageRow],
     now: DateTime<Utc>,
 ) -> SearchFieldUsage {
     let cutoff = now - chrono::Duration::days(HISTORY_WINDOW_DAYS);
@@ -299,9 +315,9 @@ pub fn rank_field_usage(
         bsc.partial_cmp(asc).unwrap_or(std::cmp::Ordering::Equal).then(bt.cmp(at)).then(an.cmp(bn))
     });
 
-    // Popular: per-user-capped query counts across the tenant.
+    // Popular: per-user-capped query counts across the workspace.
     let mut per_user: HashMap<(String, Uuid), usize> = HashMap::new();
-    for row in tenant_rows.iter().filter(|r| r.created_at >= cutoff) {
+    for row in workspace_rows.iter().filter(|r| r.created_at >= cutoff) {
         for field in fields_of(&row.query) {
             *per_user.entry((field, row.user_id)).or_default() += 1;
         }
@@ -312,7 +328,14 @@ pub fn rank_field_usage(
         entry.0 += count.min(POPULAR_PER_USER_CAP);
         entry.1 += 1;
     }
-    let mut popular: Vec<(String, (usize, usize))> = popular.into_iter().collect();
+    // Cross-user results are limited to public schema fields (the UDM / OCSF
+    // registries) searched by enough distinct users. Custom and dynamic names
+    // (`ext.*`, parser-specific keys) can encode what a restricted source holds
+    // or what one analyst is investigating; they stay in that user's Recent.
+    let mut popular: Vec<(String, (usize, usize))> = popular
+        .into_iter()
+        .filter(|(field, (_, users))| *users >= POPULAR_MIN_DISTINCT_USERS && is_public_schema_field(field))
+        .collect();
     popular.sort_by(|(an, (ac, au)), (bn, (bc, bu))| bc.cmp(ac).then(bu.cmp(au)).then(an.cmp(bn)));
 
     SearchFieldUsage {
@@ -325,16 +348,13 @@ pub fn rank_field_usage(
 pub const FIELD_USAGE_CACHE_TTL: Duration = Duration::from_secs(60);
 const FIELD_USAGE_CACHE_MAX_ENTRIES: usize = 10_000;
 
-/// Short-lived cache of ranked field names. "Recent" is cached per
-/// `(tenant, user)`; "Popular" once per tenant, so the tenant-wide history
-/// scan runs at most once per TTL per tenant however many members type.
-/// Open core has one tenant per deployment and keys it as [`Uuid::nil`]. The
-/// tenant is part of every key, so one tenant's ranking is never served to
-/// another tenant's member.
+/// Short-lived cache of ranked field names. "Recent" is cached per user;
+/// "Popular" once for the deployment, so the workspace-wide history scan runs
+/// at most once per TTL however many users type.
 pub struct FieldUsageCache {
     ttl: Duration,
-    /// `(tenant, Some(user))` → Recent; `(tenant, None)` → Popular.
-    entries: DashMap<(Uuid, Option<Uuid>), (Instant, Vec<String>)>,
+    /// `Some(user)` → Recent; `None` → Popular.
+    entries: DashMap<Option<Uuid>, (Instant, Vec<String>)>,
 }
 
 /// What the cache already holds for one request; `None` parts must be computed.
@@ -352,7 +372,7 @@ impl CachedFieldUsage {
     pub fn needs_user_rows(&self) -> bool {
         self.recent.is_none()
     }
-    pub fn needs_tenant_rows(&self) -> bool {
+    pub fn needs_workspace_rows(&self) -> bool {
         self.popular.is_none()
     }
 }
@@ -362,12 +382,12 @@ impl FieldUsageCache {
         Self { ttl, entries: DashMap::new() }
     }
 
-    fn fresh(&self, key: (Uuid, Option<Uuid>)) -> Option<Vec<String>> {
+    fn fresh(&self, key: Option<Uuid>) -> Option<Vec<String>> {
         let hit = self.entries.get(&key)?;
         (hit.0.elapsed() < self.ttl).then(|| hit.1.clone())
     }
 
-    fn put(&self, key: (Uuid, Option<Uuid>), value: Vec<String>) {
+    fn put(&self, key: Option<Uuid>, value: Vec<String>) {
         if self.entries.len() >= FIELD_USAGE_CACHE_MAX_ENTRIES {
             let ttl = self.ttl;
             self.entries.retain(|_, (at, _)| at.elapsed() < ttl);
@@ -378,25 +398,25 @@ impl FieldUsageCache {
         self.entries.insert(key, (Instant::now(), value));
     }
 
-    pub fn lookup(&self, tenant: Uuid, user: Uuid) -> CachedFieldUsage {
-        CachedFieldUsage { recent: self.fresh((tenant, Some(user))), popular: self.fresh((tenant, None)) }
+    pub fn lookup(&self, user: Uuid) -> CachedFieldUsage {
+        CachedFieldUsage { recent: self.fresh(Some(user)), popular: self.fresh(None) }
     }
 
     /// Store the parts that were computed (those missing from `cached`) and
     /// return the full answer: cached parts win over the empty placeholders
     /// `computed` carries for groups whose rows were not read.
-    pub fn fill(&self, tenant: Uuid, user: Uuid, cached: CachedFieldUsage, computed: SearchFieldUsage) -> SearchFieldUsage {
+    pub fn fill(&self, user: Uuid, cached: CachedFieldUsage, computed: SearchFieldUsage) -> SearchFieldUsage {
         let recent = match cached.recent {
             Some(recent) => recent,
             None => {
-                self.put((tenant, Some(user)), computed.recent.clone());
+                self.put(Some(user), computed.recent.clone());
                 computed.recent
             }
         };
         let popular = match cached.popular {
             Some(popular) => popular,
             None => {
-                self.put((tenant, None), computed.popular.clone());
+                self.put(None, computed.popular.clone());
                 computed.popular
             }
         };
@@ -405,137 +425,14 @@ impl FieldUsageCache {
 
     /// Drop the caller's Recent so a search they just ran shows up on the next
     /// request. Popular refreshes on its TTL.
-    pub fn invalidate(&self, tenant: Uuid, user: Uuid) {
-        self.entries.remove(&(tenant, Some(user)));
+    pub fn invalidate(&self, user: Uuid) {
+        self.entries.remove(&Some(user));
     }
 }
 
-/// Process-wide cache used by both the open-core and the hosted handler.
+/// Process-wide cache used by `GET /api/me/field-usage`.
 pub static FIELD_USAGE_CACHE: Lazy<FieldUsageCache> = Lazy::new(|| FieldUsageCache::new(FIELD_USAGE_CACHE_TTL));
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn row(user: Uuid, query: &str, hours_ago: i64, now: DateTime<Utc>) -> FieldUsageRow {
-        FieldUsageRow { user_id: user, query: query.into(), created_at: now - chrono::Duration::hours(hours_ago) }
-    }
-
-    #[test]
-    fn extracts_filter_and_command_fields_in_order() {
-        let fields = extract_query_fields(
-            r#"metadata.log_source="aws_cloudtrail" src_endpoint.ip=10.0.0.1 | where actor.user.name="root" | stats count by dst_endpoint.ip | sort -count"#,
-        );
-        assert_eq!(fields, vec!["metadata.log_source", "src_endpoint.ip", "actor.user.name", "dst_endpoint.ip"]);
-    }
-
-    #[test]
-    fn never_reports_values_keywords_or_derived_names() {
-        let q = r#"powershell "secret-token" user="alice@corp.example" src_ip IN ("10.1.1.1", "10.2.2.2") | eval risky=1 | rename user AS who | stats count AS hits by who, risky | table hits, who"#;
-        let fields = extract_query_fields(q);
-        assert_eq!(fields, vec!["user", "src_ip"]);
-        for leaked in ["powershell", "secret-token", "alice@corp.example", "10.1.1.1", "risky", "who", "hits"] {
-            assert!(!fields.iter().any(|f| f == leaked), "{leaked} leaked: {fields:?}");
-        }
-    }
-
-    #[test]
-    fn unparseable_or_empty_queries_yield_nothing() {
-        assert!(extract_query_fields("").is_empty());
-        assert!(extract_query_fields("| | |").is_empty());
-        assert!(extract_query_fields(&"a".repeat(MAX_QUERY_LEN + 1)).is_empty());
-    }
-
-    #[test]
-    fn recent_is_the_callers_own_recency_weighted_fields() {
-        let now = Utc::now();
-        let me = Uuid::new_v4();
-        let other = Uuid::new_v4();
-        let user_rows = vec![
-            row(me, "src_endpoint.ip=1.2.3.4", 1, now),
-            row(me, "user=bob", 24 * 60, now),
-            row(me, "user=carol", 24 * 61, now),
-            // A row for someone else must never count toward my Recent.
-            row(other, "process.name=cmd.exe", 0, now),
-        ];
-        let usage = rank_field_usage(me, &user_rows, &[], now);
-        assert_eq!(usage.recent.first().map(String::as_str), Some("src_endpoint.ip"));
-        assert!(usage.recent.contains(&"user".to_string()));
-        assert!(!usage.recent.contains(&"process.name".to_string()));
-    }
-
-    #[test]
-    fn recent_ignores_history_outside_the_window() {
-        let now = Utc::now();
-        let me = Uuid::new_v4();
-        let rows = vec![row(me, "file.path=x", 24 * (HISTORY_WINDOW_DAYS + 1), now)];
-        assert!(rank_field_usage(me, &rows, &rows, now).recent.is_empty());
-    }
-
-    #[test]
-    fn popular_reflects_other_members_and_caps_one_heavy_user() {
-        let now = Utc::now();
-        let (me, a, b, heavy) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let mut tenant = vec![
-            row(a, "dst_endpoint.ip=1.1.1.1", 2, now),
-            row(b, "dst_endpoint.ip=8.8.8.8 | stats count by device.hostname", 3, now),
-        ];
-        // 25 queries from one user on one field count as POPULAR_PER_USER_CAP.
-        for i in 0..25 {
-            tenant.push(row(heavy, "http_request.url.hostname=x", i, now));
-        }
-        for i in 0..11 {
-            tenant.push(row(a, "class_uid=3002", i, now));
-            tenant.push(row(b, "class_uid=3002", i, now));
-        }
-        let usage = rank_field_usage(me, &[], &tenant, now);
-        assert_eq!(usage.popular[0], "class_uid", "{:?}", usage.popular);
-        assert_eq!(usage.popular[1], "http_request.url.hostname");
-        assert!(usage.popular.contains(&"dst_endpoint.ip".to_string()));
-        assert!(usage.popular.contains(&"device.hostname".to_string()));
-        assert!(usage.recent.is_empty());
-    }
-
-    #[test]
-    fn limits_are_respected() {
-        let now = Utc::now();
-        let me = Uuid::new_v4();
-        let rows: Vec<_> = (0..40).map(|i| row(me, &format!("f{i}=1"), i, now)).collect();
-        let usage = rank_field_usage(me, &rows, &rows, now);
-        assert_eq!(usage.recent.len(), RECENT_LIMIT);
-        assert_eq!(usage.popular.len(), POPULAR_LIMIT);
-        assert_eq!(usage.recent[0], "f0");
-    }
-
-    #[test]
-    fn cache_is_keyed_by_tenant_and_user_and_expires() {
-        let cache = FieldUsageCache::new(Duration::from_secs(60));
-        let (tenant_a, tenant_b, user, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let computed = SearchFieldUsage { recent: vec!["a.mine".into()], popular: vec!["a.secret_field".into()] };
-        let served = cache.fill(tenant_a, user, CachedFieldUsage::default(), computed.clone());
-        assert_eq!(served, computed);
-        assert_eq!(cache.lookup(tenant_a, user).complete(), Some(computed));
-
-        // Another member of the same tenant shares Popular but not Recent.
-        let peer = cache.lookup(tenant_a, other);
-        assert_eq!(peer.popular, Some(vec!["a.secret_field".to_string()]));
-        assert!(peer.needs_user_rows() && !peer.needs_tenant_rows());
-
-        // Negative cross-tenant: the same user id in another tenant misses both.
-        let foreign = cache.lookup(tenant_b, user);
-        assert_eq!(foreign, CachedFieldUsage::default());
-        assert!(foreign.needs_user_rows() && foreign.needs_tenant_rows());
-
-        // A cached part beats the empty placeholder of an unread group.
-        let merged = cache.fill(tenant_a, other, peer, SearchFieldUsage { recent: vec!["x".into()], popular: vec![] });
-        assert_eq!(merged.popular, vec!["a.secret_field".to_string()]);
-
-        cache.invalidate(tenant_a, user);
-        let after = cache.lookup(tenant_a, user);
-        assert!(after.needs_user_rows() && !after.needs_tenant_rows());
-
-        let expired = FieldUsageCache::new(Duration::ZERO);
-        expired.fill(tenant_a, user, CachedFieldUsage::default(), SearchFieldUsage::default());
-        assert_eq!(expired.lookup(tenant_a, user), CachedFieldUsage::default());
-    }
-}
+#[path = "field_usage_tests.rs"]
+mod tests;

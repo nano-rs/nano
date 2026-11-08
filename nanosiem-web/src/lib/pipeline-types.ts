@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-/** Host-independent view models for the shared-lake pipeline workspace. */
+/**
+ * View models for the Nano Pipe workspace (NAN-4919). A pipeline is a log
+ * source's parser written as ordered steps and stored in its `parser_vrl`.
+ */
 export type PipelineStepKind = 'parse' | 'rename' | 'remove' | 'set' | 'redact' | 'filter' | 'sample' | 'split' | 'fields' | 'mask' | 'combine' | 'lookup' | 'dedupe' | 'route' | 'vrl';
 export interface PipelineStep {
   id: string;
@@ -16,14 +19,15 @@ export interface PipelineDraft {
   revision: number;
   steps: PipelineStep[];
 }
+/** One published version of the source (`GET /api/log-sources/{id}/versions`). */
 export interface PipelineRelease {
   id: string;
-  revision: number | null;
-  state: string;
+  versionId: number;
+  revision: number;
+  active: boolean;
   createdAt: string;
   actor?: string;
-  error?: string;
-  versionId?: number;
+  reason?: string;
 }
 export interface PipelineSummary {
   id: string;
@@ -32,19 +36,34 @@ export interface PipelineSummary {
   sourceId: string;
   sourceName: string;
   sourceType: string;
+  /** Active published version number, when known. */
   activeRevision: number | null;
   draftRevision: number;
   hasDraft: boolean;
-  health: 'healthy' | 'warning' | 'unknown';
-  latestRelease: PipelineRelease | null;
+  /** Stored as a step plan (true) or plain VRL (false). */
+  stepPlan: boolean;
+  stepCount: number;
+  enabled: boolean;
+  deployed: boolean;
+  deployedAt?: string;
+  updatedAt: string;
+}
+/** A kind this deployment previews but refuses to publish, with the server's reason. */
+export interface PreviewOnlyKind {
+  kind: PipelineStepKind;
+  reason: string;
 }
 export interface PipelineCapabilities {
   supportedSteps: PipelineStepKind[];
-  capture: { available: boolean; reason?: string; maxEvents?: number; maxDurationSeconds?: number; maxBytes?: number };
-  previewReason?: string;
+  previewOnly: PreviewOnlyKind[];
   preview: boolean;
-  /** `not_available`: this backend does not serve the pipe runtime endpoints yet (a quiet state, not an error). */
-  runtime?: 'loading' | 'ready' | 'not_available' | 'error';
+  previewReason?: string;
+  /** The preview worker runs without Linux resource limits (development host). */
+  previewDegraded: boolean;
+  tap: { available: boolean; reason?: string; maxEvents: number; maxSeconds: number };
+  /** `not_available`: this backend does not serve the pipe endpoints (a quiet state, not an error). */
+  runtime: 'loading' | 'ready' | 'not_available' | 'error';
+  maxSteps: number;
   ai: boolean;
   /** Why pivt is off (open edition, not enabled, missing permission); shown on the disabled button. */
   aiReason?: string;
@@ -52,100 +71,95 @@ export interface PipelineCapabilities {
 export interface PipelinePermissions {
   view: boolean;
   edit: boolean;
-  capture: boolean;
+  /** Read raw source events (live tap, recent events, preview payloads): `search:execute`. */
+  events: boolean;
   release: boolean;
 }
 export interface CapturedEvent {
   id: string;
   input: unknown;
   capturedAt?: string;
-  /** NAN-3625: the input it arrived on (`push:<credential id>` / `pull:<source id>`), when known. */
+  /** The input identity it arrived on (`push:<credential id>` / `pull:<source id>`), when known. */
   nanoInput?: string;
 }
-/** NAN-3625: one input feeding a lane, as the lane inputs API lists it. */
 export interface PipelineLaneInput {
-  /** Canonical `push:<credential id>` or `pull:<pull source id>`; feeds use their ingest credential. */
+  /** Canonical `push:<credential id>` or `pull:<pull source id>`. */
   id: string;
   kind: 'push' | 'pull' | 'feed';
   label: string;
 }
-export interface PipelineCaptureOptions {
-  sourceId: string;
-  point: 'input';
-  durationSeconds: number;
-  eventLimit: number;
-  filter?: string;
+export interface PipelineTapOptions {
+  seconds: number;
+  maxEvents: number;
 }
-export interface PipelineCapture {
-  state: 'ready' | 'connecting' | 'capturing' | 'completed' | 'stopped' | 'no_traffic' | 'unavailable' | 'failed' | 'forbidden' | 'no_matches' | 'interrupted' | 'limit' | 'release_changed' | 'expired';
+export interface PipelineTap {
+  state: 'ready' | 'capturing' | 'completed' | 'no_traffic' | 'cancelled' | 'failed' | 'busy' | 'unavailable' | 'forbidden';
   events: CapturedEvent[];
-  sourceId: string;
-  point: 'input';
-  startedAt?: string;
+  /** Capture window of the running/last tap. */
+  seconds?: number;
+  startedAt?: number;
+  /** `deadline`, `max_events`, `max_bytes` or `stream_closed`. */
+  ended?: string;
+  droppedOversize?: number;
+  component?: string;
   reason?: string;
-  sessionId?: string;
-  activeBundleSha256?: string | null;
-  truncated?: boolean;
-  /** Count the runtime reports; `events` holds only what was read from the edge snapshot. */
-  observedEvents?: number;
-  /** The server purges the snapshot at this time; the live view expires with it. */
-  retainUntil?: string;
-  snapshotAvailable?: boolean;
+  /** 429: seconds until a retry can be admitted. */
+  retryAfter?: number;
 }
 export interface PipelinePreviewEvent {
   inputId: string;
   input: unknown;
   outputs: unknown[];
-  outcome: 'retained' | 'filtered' | 'sampled_out' | 'split' | 'combined' | 'pending' | 'error';
+  outcome: string;
   error?: string;
-  trace?: Array<{ stepId: string; outputs: unknown[]; error?: string }>;
+  trace?: Array<{ stepId: string; outputs: unknown[]; error?: string; bypassed?: boolean }>;
+}
+export interface PipelinePreviewSummary {
+  inputEvents: number;
+  outputEvents: number;
+  droppedEvents: number;
+  errorEvents: number;
+  inputBytes: number;
+  outputBytes: number;
 }
 export interface PipelinePreview {
   warnings?: string[];
   revision: number;
   fingerprint: string;
+  engine: string;
+  degraded: boolean;
   events: PipelinePreviewEvent[];
-  inputCount: number;
-  outputCount: number;
+  summary: PipelinePreviewSummary;
   stale: boolean;
 }
 export interface PipelineValidation {
   valid: boolean;
   errors: string[];
   warnings: string[];
-  compiledVrl?: string;
 }
+/** The frozen release snapshot: exactly what Publish sends. */
 export interface PipelineReleasePlan {
   fingerprint: string;
   revision: number;
-  compiledVrl: string;
+  /** The source row as reviewed; publish refuses if the server moved past it. */
+  snapshot: import('./api/pipelines').PipePublicationSnapshot;
   validation: PipelineValidation;
+  /** The steps of the reviewed plan (empty for plain VRL). */
+  steps: PipelineStep[];
   activeVrl: string;
-  /**
-   * Raw messages from a live capture that publishing could save as this
-   * version's test samples. Unset when the reviewed sample is not a capture.
-   * Saving them is opt-in: they would outlive the 10-minute capture purge.
-   */
-  capturedSampleCount?: number;
-}
-/** The reviewer's explicit choices for one publication. */
-export interface PipelinePublishOptions {
-  /** Store the reviewed captured events with the version (default false). */
-  persistCapturedSamples: boolean;
+  activeVersion: number | null;
+  /** Enabled step kinds that this deployment refuses to publish. */
+  previewOnly: PreviewOnlyKind[];
 }
 export interface PipelineSample {
   id: string;
   name: string;
   events: CapturedEvent[];
-  /**
-   * `capture`: frozen from a live capture; captured bodies are never persisted without explicit consent.
-   * `recent` / `pasted`: loaded from stored events or pasted (NAN-3447); browser-only, never
-   * attached to a release and never written server-side.
-   */
-  origin?: 'capture' | 'supplied' | 'recent' | 'pasted';
+  /** All origins are browser-only: never saved or attached to a release. */
+  origin: 'tap' | 'recent' | 'pasted';
 }
 /** Each operation owns its error so a banner names the operation that failed and clears when it next succeeds. */
-export type PipelineOperation = 'save' | 'validate' | 'review' | 'publish' | 'rollback' | 'capture' | 'stop' | 'sample' | 'load' | 'discard' | 'reload';
+export type PipelineOperation = 'save' | 'validate' | 'review' | 'publish' | 'rollback' | 'tap' | 'load' | 'discard' | 'reload';
 export type PipelineOperationErrors = Partial<Record<PipelineOperation, string>>;
 /** The server copy moved past this editor's save/review baseline. Saving or publishing fails until resolved. */
 export interface PipelineConflict {

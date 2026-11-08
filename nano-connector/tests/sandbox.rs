@@ -7,6 +7,9 @@
 //! refuses (EPERM) each attempt. No worker death ever goes through the
 //! kernel's core-dump path: every fatal signal becomes `_exit(128 + sig)`.
 
+// The seccomp probes below run on Linux only; helpers are unused elsewhere.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 mod common;
 
 use std::os::unix::process::ExitStatusExt;
@@ -54,6 +57,8 @@ fn errno(p: &Probe) -> i64 {
     p.out.as_ref().and_then(|v| v["errno"].as_i64()).unwrap_or(-1)
 }
 
+// seccomp is Linux-only; tests/sandbox_platform.rs covers the other targets.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn worker_sandbox_blocks_escape_attempts() {
     // A canary in the parent's environment and a leaked fd without CLOEXEC.
@@ -104,6 +109,7 @@ async fn worker_sandbox_blocks_escape_attempts() {
     unsafe { std::env::remove_var("NANO_TEST_CANARY") };
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn workers_never_dump_core() {
     // What tenant code runs with: no core limit, not dumpable.
@@ -220,12 +226,12 @@ streams:
     }
 }
 
-/// NAN-3503: the runner holds the lean-assignments file (coordinator
-/// endpoints) and per-tenant identity-writer token files. A VRL worker can
-/// neither read them nor learn their path from its environment.
+/// A file the host process can read (on main, NAN-3503's identity-writer
+/// token mount; for pull feeds, any credential file the runner holds) is
+/// neither readable by a VRL worker nor discoverable from its environment.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn worker_cannot_read_the_identity_assignments_mount() {
+async fn worker_cannot_read_host_credential_files() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("nan3503-sandbox-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("tokens")).unwrap();
     let assignments = dir.join("assignments.json");

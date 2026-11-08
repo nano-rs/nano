@@ -24,8 +24,29 @@
 //! Layers 2 and 3 depend on the host. Each has an [`Enforce`] mode: `Require`
 //! fails the run when the layer is missing; `Prefer` runs without it but logs
 //! a warning and reports it in [`SandboxReport`]; it is never silent.
+//!
+//! ## Platforms (NAN-4914)
+//!
+//! Production runs on Linux, where every layer above is compiled in
+//! unchanged. seccomp, `prctl` (`no_new_privs`, `PR_SET_DUMPABLE`),
+//! `close_range`, `oom_score_adj` and cgroup v2 are Linux kernel facilities,
+//! so on other targets (the macOS native dev stack) the crate builds a
+//! limited sandbox instead:
+//!
+//! - spawn: cleared environment, new session, and the rlimits the host
+//!   supports (CPU seconds, no file writes, no core dumps, 8 fds, no child
+//!   processes, the stack clamped to the host's hard limit). There is no
+//!   `no_new_privs` and the address-space limit is not set (macOS does not
+//!   enforce `RLIMIT_AS`).
+//! - worker: fatal signals still become `_exit(128 + sig)`, `RLIMIT_CORE 0`,
+//!   inherited fds are closed. There is no `PR_SET_DUMPABLE`.
+//! - seccomp is always **unavailable**: [`install_seccomp`] reports
+//!   `unavailable: ...` under `Prefer` (so [`SandboxReport::degraded`] is
+//!   true and the engine logs it on every worker), and **fails** under
+//!   `Require`. `NANO_CONNECTOR_SANDBOX=strict` therefore refuses to run VRL
+//!   on macOS rather than run it with less isolation than it asked for.
+//! - cgroup v2 probing fails (no cgroupfs) and is reported the same way.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -90,6 +111,9 @@ impl SandboxPolicy {
     ///
     /// Any other value is an error, never a silent fallback: a typo such as
     /// `NANO_CONNECTOR_SECCOMP=required` must not quietly mean `prefer`.
+    /// `strict` is authoritative: a per-layer setting other than `require`
+    /// next to it is a conflicting configuration and an error, never a
+    /// downgrade.
     pub fn from_env() -> Result<Self, String> {
         Self::from_lookup(|k| std::env::var(k).ok())
     }
@@ -98,19 +122,23 @@ impl SandboxPolicy {
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let mut p = Self::default();
         let set = |k: &str| get(k).filter(|v| !v.trim().is_empty());
-        if let Some(v) = set("NANO_CONNECTOR_SANDBOX") {
-            match v.trim().to_ascii_lowercase().as_str() {
-                "strict" => {
-                    p.seccomp = Enforce::Require;
-                    p.cgroup = Enforce::Require;
-                }
-                "default" | "prefer" => {}
+        let strict = match set("NANO_CONNECTOR_SANDBOX") {
+            None => false,
+            Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "strict" => true,
+                "default" | "prefer" => false,
                 _ => return Err(format!("NANO_CONNECTOR_SANDBOX=`{v}` is not one of: strict, prefer")),
-            }
-        }
+            },
+        };
         for (k, slot) in [("NANO_CONNECTOR_SECCOMP", &mut p.seccomp), ("NANO_CONNECTOR_CGROUP", &mut p.cgroup)] {
             if let Some(v) = set(k) {
                 *slot = Enforce::parse(&v).ok_or_else(|| format!("{k}=`{v}` is not one of: off, prefer, require"))?;
+                if strict && *slot != Enforce::Require {
+                    return Err(format!("{k}=`{v}` conflicts with NANO_CONNECTOR_SANDBOX=strict (which requires every layer)"));
+                }
+            }
+            if strict {
+                *slot = Enforce::Require;
             }
         }
         p.cgroup_parent = set("NANO_CONNECTOR_CGROUP_PARENT").map(PathBuf::from);
@@ -157,6 +185,8 @@ pub struct Rlimits {
 pub fn harden_command(cmd: &mut tokio::process::Command, lim: Rlimits) {
     cmd.env_clear().current_dir("/").kill_on_drop(true);
     let Rlimits { address_space_bytes, cpu_secs, stack_bytes } = lim;
+    #[cfg(not(target_os = "linux"))]
+    let _ = address_space_bytes;
     let cpu = cpu_secs.max(1);
     // SAFETY: only async-signal-safe libc calls between fork and exec; no
     // allocation (the closure captures plain integers).
@@ -169,6 +199,9 @@ pub fn harden_command(cmd: &mut tokio::process::Command, lim: Rlimits) {
                 }
                 Ok(())
             };
+            // macOS accepts but does not enforce RLIMIT_AS (an alias of
+            // RLIMIT_RSS there); the limit is set only where it is real.
+            #[cfg(target_os = "linux")]
             set(libc::RLIMIT_AS, address_space_bytes, address_space_bytes)?;
             // Soft limit sends SIGXCPU, the hard limit one second later SIGKILL.
             set(libc::RLIMIT_CPU, cpu, cpu + 1)?;
@@ -176,23 +209,39 @@ pub fn harden_command(cmd: &mut tokio::process::Command, lim: Rlimits) {
             set(libc::RLIMIT_CORE, 0, 0)?;
             set(libc::RLIMIT_NOFILE, 8, 8)?;
             set(libc::RLIMIT_MEMLOCK, 0, 0)?;
+            #[cfg(target_os = "linux")]
             set(libc::RLIMIT_MSGQUEUE, 0, 0)?;
+            #[cfg(target_os = "linux")]
             set(libc::RLIMIT_STACK, stack_bytes, stack_bytes)?;
+            // Elsewhere the stack hard limit can sit below 64 MiB (macOS:
+            // 65532 KiB) and an unprivileged process cannot raise it: clamp.
+            #[cfg(not(target_os = "linux"))]
+            {
+                let mut cur = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                if libc::getrlimit(libc::RLIMIT_STACK, &mut cur) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let stack = (stack_bytes as libc::rlim_t).min(cur.rlim_max);
+                set(libc::RLIMIT_STACK, stack as u64, stack as u64)?;
+            }
             // Fork fallback when seccomp is unavailable. Not enforced for
             // root or CAP_SYS_RESOURCE; the jobs pods run unprivileged.
             set(libc::RLIMIT_NPROC, 0, 0)?;
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // Without a cgroup, the kernel OOM killer should pick a worker,
-            // never the runner. Best effort (raising it needs no privilege).
-            let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
-            if fd >= 0 {
-                libc::write(fd, b"1000".as_ptr().cast(), 4);
-                libc::close(fd);
+            #[cfg(target_os = "linux")]
+            {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Without a cgroup, the kernel OOM killer should pick a worker,
+                // never the runner. Best effort (raising it needs no privilege).
+                let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                if fd >= 0 {
+                    libc::write(fd, b"1000".as_ptr().cast(), 4);
+                    libc::close(fd);
+                }
             }
             Ok(())
         });
@@ -209,6 +258,7 @@ pub fn harden_command(cmd: &mut tokio::process::Command, lim: Rlimits) {
 /// close loop up to the fd hard limit. Returns how it was done.
 pub fn close_inherited_fds() -> Result<&'static str, String> {
     // SAFETY: close_range / close on our own fd table.
+    #[cfg(target_os = "linux")]
     unsafe {
         if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) == 0 {
             return Ok("close_range");
@@ -276,6 +326,7 @@ pub fn harden_worker_process() -> Result<(), String> {
         if libc::setrlimit(libc::RLIMIT_CORE, &zero) != 0 {
             return Err(format!("RLIMIT_CORE: {}", std::io::Error::last_os_error()));
         }
+        #[cfg(target_os = "linux")]
         if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
             return Err(format!("PR_SET_DUMPABLE: {}", std::io::Error::last_os_error()));
         }
@@ -290,6 +341,7 @@ pub fn harden_worker_process() -> Result<(), String> {
 pub fn harden_host_process() -> Result<(), String> {
     // SAFETY: plain prctl / setrlimit on ourselves.
     unsafe {
+        #[cfg(target_os = "linux")]
         if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
             return Err(format!("PR_SET_DUMPABLE: {}", std::io::Error::last_os_error()));
         }
@@ -301,6 +353,7 @@ pub fn harden_host_process() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 /// Syscalls the worker may make. Everything a single-threaded VRL
 /// interpreter reading stdin and writing stdout needs, and nothing else.
 fn allowed_syscalls() -> Vec<i64> {
@@ -337,6 +390,7 @@ fn allowed_syscalls() -> Vec<i64> {
     v
 }
 
+#[cfg(target_os = "linux")]
 /// Syscalls that end the worker on sight: the ones an escaped interpreter
 /// would need to reach the network, other processes or new code. They trap
 /// (SIGSYS) rather than `KILL_PROCESS`: the syscall never runs either way,
@@ -383,15 +437,18 @@ fn fatal_syscalls() -> Vec<i64> {
     v
 }
 
+#[cfg(target_os = "linux")]
 fn se<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+#[cfg(target_os = "linux")]
 /// Build the worker's seccomp programs (kill list, then allowlist), in the
 /// order they must be installed.
 pub fn worker_seccomp() -> Result<Vec<seccompiler::BpfProgram>, String> {
     use seccompiler::{SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule, TargetArch};
     let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(|e| e.to_string())?;
+    use std::collections::BTreeMap;
     let mut allow: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     for s in allowed_syscalls() {
         allow.insert(s, vec![]);
@@ -454,12 +511,15 @@ pub fn install_seccomp(seccomp: Enforce) -> Result<String, String> {
     if seccomp == Enforce::Off {
         return Ok("off".into());
     }
+    #[cfg(target_os = "linux")]
     let installed = worker_seccomp().and_then(|progs| {
         for p in &progs {
             seccompiler::apply_filter(p).map_err(|e| e.to_string())?;
         }
         Ok(())
     });
+    #[cfg(not(target_os = "linux"))]
+    let installed: Result<(), String> = Err(format!("seccomp is Linux-only (this host is {})", std::env::consts::OS));
     match (installed, seccomp) {
         (Ok(()), _) => Ok("enforced".into()),
         (Err(e), Enforce::Require) => Err(format!("seccomp is required but could not be installed: {e}")),

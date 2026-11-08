@@ -3,13 +3,12 @@
 //! Pinned, bounded MITRE ATT&CK catalog synchronization.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
-use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{info, warn};
 
+use crate::content_bundle::store::ContentStore;
 use crate::mitre::repository::MitreRepository;
 use crate::mitre::types::{
     MitreTactic, MitreTechnique, MitreTechniqueAlias, StixBundle, StixObject,
@@ -17,10 +16,22 @@ use crate::mitre::types::{
 
 const MITRE_SYNC_LOCK_ID: i64 = 0x4d49_5452_455f_5359;
 const MITRE_RELEASE: &str = "v19.1";
-const MITRE_CTI_URL: &str = "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/v19.1/enterprise-attack/enterprise-attack.json";
+const MITRE_CHANNEL: &str = "mitre-attack.v19-1";
+const MITRE_CONTENT_PATH: &str = "enterprise-attack/enterprise-attack.json";
+const MITRE_CONTENT_URL: &str =
+    "nano-content://mitre-attack.v19-1/enterprise-attack/enterprise-attack.json";
 const MITRE_SHA256: &str = "bdf1ce86a4e604214c5076d37ae4dcb322678afc528df8492e6fdc1b554f5da3";
 const MITRE_BUNDLE_ID: &str = "bundle--64af0946-bfeb-481d-96df-a38e2709e3db";
+const MITRE_BUNDLE_BYTES: u64 = 53_277_393;
 const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
+const _: () = assert!(MITRE_BUNDLE_BYTES <= crate::content_bundle::tree::MAX_FILE_BYTES);
+
+#[cfg(nano_content_acceptance)]
+const ACCEPTANCE_RELEASE: &str = "nan4955-test";
+#[cfg(nano_content_acceptance)]
+const ACCEPTANCE_SHA256: &str = "2f8b6cc66181e244e6b1f48853a134c840476d1ff1fd0381287aeaa057a03323";
+#[cfg(nano_content_acceptance)]
+const ACCEPTANCE_BUNDLE_ID: &str = "bundle--nan4955-acceptance";
 
 #[derive(Debug, Clone)]
 struct SyncSource {
@@ -37,9 +48,23 @@ struct SyncSource {
 
 impl SyncSource {
     fn pinned() -> Self {
+        #[cfg(nano_content_acceptance)]
+        if std::env::var("MITRE_CONTENT_ACCEPTANCE_FIXTURE").is_ok_and(|value| value == "1") {
+            return Self {
+                release: ACCEPTANCE_RELEASE.to_string(),
+                url: MITRE_CONTENT_URL.to_string(),
+                sha256: ACCEPTANCE_SHA256.to_string(),
+                bundle_id: ACCEPTANCE_BUNDLE_ID.to_string(),
+                max_bytes: MAX_BUNDLE_BYTES,
+                min_objects: 2,
+                min_tactics: 1,
+                min_techniques: 1,
+                min_aliases: 0,
+            };
+        }
         Self {
             release: MITRE_RELEASE.to_string(),
-            url: MITRE_CTI_URL.to_string(),
+            url: MITRE_CONTENT_URL.to_string(),
             sha256: MITRE_SHA256.to_string(),
             bundle_id: MITRE_BUNDLE_ID.to_string(),
             max_bytes: MAX_BUNDLE_BYTES,
@@ -76,10 +101,8 @@ pub enum MitreSyncOutcome {
 
 #[derive(Debug, Error)]
 pub enum MitreSyncError {
-    #[error("MITRE source request failed: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("MITRE source returned HTTP {0}")]
-    HttpStatus(reqwest::StatusCode),
+    #[error("signed MITRE content channel is not installed yet")]
+    ContentNotInstalled,
     #[error("MITRE bundle exceeds {limit} bytes (observed at least {observed})")]
     BundleTooLarge { observed: usize, limit: usize },
     #[error("MITRE bundle digest mismatch (expected {expected}, got {actual})")]
@@ -95,28 +118,17 @@ pub enum MitreSyncError {
 /// Service for syncing MITRE ATT&CK data.
 pub struct MitreSync {
     repository: MitreRepository,
+    content: ContentStore,
     source: SyncSource,
-    reconcile_rules: bool,
 }
 
 impl MitreSync {
     pub fn new(repository: MitreRepository) -> Self {
+        let content = ContentStore::new(repository.pool().clone());
         Self {
             repository,
+            content,
             source: SyncSource::pinned(),
-            reconcile_rules: true,
-        }
-    }
-
-    /// Platform-catalog-only sync for the hosted-shared control login: the
-    /// six `mitre_*` tables are written, the detection-rule mapping reconcile
-    /// (which touches the RLS-registered `detection_rules`) is skipped. Tenant
-    /// rule mappings are validated on write by the 9000262 definer trigger.
-    pub fn platform_catalog_only(repository: MitreRepository) -> Self {
-        Self {
-            repository,
-            source: SyncSource::pinned(),
-            reconcile_rules: false,
         }
     }
 
@@ -206,7 +218,7 @@ impl MitreSync {
         info!(
             release = %self.source.release,
             source = %self.source.url,
-            "Fetching pinned MITRE ATT&CK catalog"
+            "Reading pinned MITRE ATT&CK catalog from signed content channel"
         );
         let bundle = self.fetch_bundle().await?;
         let (tactics, techniques, aliases) = self.parse_catalog(&bundle)?;
@@ -224,7 +236,6 @@ impl MitreSync {
             &self.source.release,
             &self.source.url,
             &self.source.sha256,
-            self.reconcile_rules,
         )
         .await?;
 
@@ -270,43 +281,21 @@ impl MitreSync {
     }
 
     async fn fetch_bundle(&self) -> Result<StixBundle, MitreSyncError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("nanosiem-mitre-sync")
-            .build()?;
-        let response = client.get(&self.source.url).send().await?;
-        if !response.status().is_success() {
-            return Err(MitreSyncError::HttpStatus(response.status()));
-        }
-        if let Some(length) = response.content_length() {
-            if length > self.source.max_bytes as u64 {
-                return Err(MitreSyncError::BundleTooLarge {
-                    observed: length.min(usize::MAX as u64) as usize,
-                    limit: self.source.max_bytes,
-                });
-            }
-        }
+        let body = self
+            .content
+            .read_file(MITRE_CHANNEL, MITRE_CONTENT_PATH)
+            .await?
+            .ok_or(MitreSyncError::ContentNotInstalled)?;
+        self.decode_bundle(&body)
+    }
 
-        let mut body = Vec::with_capacity(
-            response
-                .content_length()
-                .unwrap_or_default()
-                .min(self.source.max_bytes as u64) as usize,
-        );
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            if body.len().saturating_add(chunk.len()) > self.source.max_bytes {
-                return Err(MitreSyncError::BundleTooLarge {
-                    observed: body.len().saturating_add(chunk.len()),
-                    limit: self.source.max_bytes,
-                });
-            }
-            body.extend_from_slice(&chunk);
+    fn decode_bundle(&self, body: &[u8]) -> Result<StixBundle, MitreSyncError> {
+        if body.len() > self.source.max_bytes {
+            return Err(MitreSyncError::BundleTooLarge {
+                observed: body.len(),
+                limit: self.source.max_bytes,
+            });
         }
-
         let actual_digest = hex::encode(Sha256::digest(&body));
         if actual_digest != self.source.sha256 {
             return Err(MitreSyncError::DigestMismatch {
@@ -335,14 +324,8 @@ impl MitreSync {
     fn parse_catalog(
         &self,
         bundle: &StixBundle,
-    ) -> Result<
-        (
-            Vec<MitreTactic>,
-            Vec<MitreTechnique>,
-            Vec<MitreTechniqueAlias>,
-        ),
-        MitreSyncError,
-    > {
+    ) -> Result<(Vec<MitreTactic>, Vec<MitreTechnique>, Vec<MitreTechniqueAlias>), MitreSyncError>
+    {
         let mut tactic_map = HashMap::new();
         let mut tactic_ids = HashSet::new();
         let mut tactics = Vec::new();
@@ -764,8 +747,6 @@ fn valid_technique_id(id: &str) -> bool {
 mod tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;
-    use wiremock::matchers::method;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const TEST_BUNDLE: &str = r#"{
         "type": "bundle",
@@ -802,16 +783,16 @@ mod tests {
         ]
     }"#;
 
-    fn test_sync(url: String, body: &[u8], bundle_id: &str, max_bytes: usize) -> MitreSync {
+    fn test_sync(body: &[u8], bundle_id: &str, max_bytes: usize) -> MitreSync {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://postgres:postgres@localhost/nanosiem_test")
             .expect("lazy pool");
         MitreSync {
-            repository: MitreRepository::new(pool),
-            reconcile_rules: true,
+            repository: MitreRepository::new(pool.clone()),
+            content: ContentStore::new(pool),
             source: SyncSource {
                 release: "test".to_string(),
-                url,
+                url: "nano-content://test/bundle.json".to_string(),
                 sha256: hex::encode(Sha256::digest(body)),
                 bundle_id: bundle_id.to_string(),
                 max_bytes,
@@ -889,9 +870,7 @@ mod tests {
     #[test]
     fn harvests_revoked_by_edges_as_technique_aliases() {
         let bundle: StixBundle = serde_json::from_str(ALIAS_BUNDLE).expect("bundle parses");
-        let live: HashSet<String> = ["T1059".to_string(), "T1685".to_string()]
-            .into_iter()
-            .collect();
+        let live: HashSet<String> = ["T1059".to_string(), "T1685".to_string()].into_iter().collect();
 
         let aliases = resolve_technique_aliases(&bundle, &live);
 
@@ -916,13 +895,9 @@ mod tests {
         let bundle: StixBundle = serde_json::from_str(ALIAS_BUNDLE).expect("bundle parses");
         // Pretend T1562.001 is still live: it must not be recorded as an alias,
         // or resolve_mitre_technique_alias would forward a current technique.
-        let live: HashSet<String> = [
-            "T1059".to_string(),
-            "T1685".to_string(),
-            "T1562.001".to_string(),
-        ]
-        .into_iter()
-        .collect();
+        let live: HashSet<String> = ["T1059".to_string(), "T1685".to_string(), "T1562.001".to_string()]
+            .into_iter()
+            .collect();
 
         let aliases = resolve_technique_aliases(&bundle, &live);
 
@@ -983,8 +958,9 @@ mod tests {
         )
         .expect("bundle parses");
 
-        let sync = test_sync("http://x".to_string(), b"x", "bundle--ds", 1_048_576);
-        let (_tactics, techniques, _aliases) = sync.parse_catalog(&bundle).expect("catalog parses");
+        let sync = test_sync(b"x", "bundle--ds", 1_048_576);
+        let (_tactics, techniques, _aliases) =
+            sync.parse_catalog(&bundle).expect("catalog parses");
         let technique = techniques
             .iter()
             .find(|t| t.id == "T1059")
@@ -993,10 +969,7 @@ mod tests {
         // these are exactly the labels nanosiem_sources_for keys on.
         assert_eq!(
             technique.data_sources,
-            vec![
-                "Command Execution".to_string(),
-                "Process Creation".to_string()
-            ]
+            vec!["Command Execution".to_string(), "Process Creation".to_string()]
         );
     }
 
@@ -1011,20 +984,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_fetch_validates_and_parses_the_pinned_shape() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(TEST_BUNDLE, "application/json"))
-            .mount(&server)
-            .await;
-        let sync = test_sync(
-            server.uri(),
-            TEST_BUNDLE.as_bytes(),
-            "bundle--test",
-            16 * 1024,
-        );
+    async fn bounded_decode_validates_and_parses_the_pinned_shape() {
+        let sync = test_sync(TEST_BUNDLE.as_bytes(), "bundle--test", 16 * 1024);
 
-        let bundle = sync.fetch_bundle().await.expect("valid bundle");
+        let bundle = sync.decode_bundle(TEST_BUNDLE.as_bytes()).expect("valid bundle");
         let (tactics, techniques, _aliases) = sync.parse_catalog(&bundle).expect("valid catalog");
         assert_eq!(tactics.len(), 1);
         assert_eq!(techniques.len(), 1);
@@ -1032,70 +995,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_rejects_bad_status_before_parsing() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&server)
-            .await;
-        let sync = test_sync(server.uri(), TEST_BUNDLE.as_bytes(), "bundle--test", 1024);
-
-        assert!(matches!(
-            sync.fetch_bundle().await,
-            Err(MitreSyncError::HttpStatus(status)) if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-        ));
-    }
-
-    #[tokio::test]
-    async fn fetch_rejects_oversized_body() {
-        let server = MockServer::start().await;
+    async fn decode_rejects_oversized_body() {
         let body = b"body larger than the configured ceiling";
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
-            .mount(&server)
-            .await;
-        let sync = test_sync(server.uri(), body, "bundle--test", 4);
+        let sync = test_sync(body, "bundle--test", 4);
 
         assert!(matches!(
-            sync.fetch_bundle().await,
+            sync.decode_bundle(body),
             Err(MitreSyncError::BundleTooLarge { limit: 4, .. })
         ));
     }
 
     #[tokio::test]
-    async fn fetch_rejects_digest_and_bundle_identity_mismatches() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(TEST_BUNDLE, "application/json"))
-            .mount(&server)
-            .await;
-
-        let mut bad_digest = test_sync(
-            server.uri(),
-            TEST_BUNDLE.as_bytes(),
-            "bundle--test",
-            16 * 1024,
-        );
+    async fn decode_rejects_digest_and_bundle_identity_mismatches() {
+        let mut bad_digest = test_sync(TEST_BUNDLE.as_bytes(), "bundle--test", 16 * 1024);
         bad_digest.source.sha256 = "0".repeat(64);
         assert!(matches!(
-            bad_digest.fetch_bundle().await,
+            bad_digest.decode_bundle(TEST_BUNDLE.as_bytes()),
             Err(MitreSyncError::DigestMismatch { .. })
         ));
 
-        let bad_identity = test_sync(
-            server.uri(),
-            TEST_BUNDLE.as_bytes(),
-            "bundle--different",
-            16 * 1024,
-        );
+        let bad_identity = test_sync(TEST_BUNDLE.as_bytes(), "bundle--different", 16 * 1024);
         assert!(matches!(
-            bad_identity.fetch_bundle().await,
+            bad_identity.decode_bundle(TEST_BUNDLE.as_bytes()),
             Err(MitreSyncError::InvalidBundle(_))
         ));
     }
 
     #[tokio::test]
-    #[ignore = "networked verification of the reviewed upstream release artifact"]
+    #[ignore = "manual verification requiring the reviewed signed MITRE channel in PostgreSQL"]
     async fn pinned_release_digest_and_catalog_shape_match() {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://postgres:postgres@localhost/nanosiem_test")

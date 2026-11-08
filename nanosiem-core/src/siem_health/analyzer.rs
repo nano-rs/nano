@@ -9,7 +9,7 @@
 //! [`fallback_report`] on `Err`.
 //!
 //! The AI-driven path (system prompt + AI invocation + JSON parsing) lives
-//! in `enterprise::siem_health::ai_analyzer` (lifted in Phase 3.6
+//! in `nanosiem-enterprise::siem_health::ai_analyzer` (lifted in Phase 3.6
 //! of NAN-744).
 
 use super::types::*;
@@ -71,27 +71,11 @@ pub fn fallback_report(metrics: &CollectedMetrics) -> AnalysisResult {
     let enrichment_score = score_enrichment(&metrics.enrichment);
     let detection_score = score_detection(&metrics.detection);
     let alerting_score = score_alerting(&metrics.alerting, &metrics.detection);
-    let weighted_overall_score = (ingestion_score as f64 * 0.25
+    let overall_score = (ingestion_score as f64 * 0.25
         + parsing_score as f64 * 0.20
         + enrichment_score as f64 * 0.15
         + detection_score as f64 * 0.25
         + alerting_score as f64 * 0.15) as i32;
-    // A weighted average must not turn a confirmed critical outage in one
-    // dimension into a green top-level report. Build deterministic findings
-    // first, then keep the headline score in the critical band whenever any
-    // of those findings is critical.
-    let mut recommendations = insert_integrity_recommendations(&metrics.ingestion.insert_integrity);
-    recommendations.extend(lake_publication_recommendations(&metrics.ingestion));
-    recommendations.extend(lowercase_invariant_recommendations(&metrics.parsing));
-    recommendations.extend(late_replay_recommendations(&metrics.detection));
-    let overall_score = if recommendations
-        .iter()
-        .any(|recommendation| recommendation.priority == "critical")
-    {
-        weighted_overall_score.min(49)
-    } else {
-        weighted_overall_score
-    };
 
     let alerting_summary_total: i64 = metrics.alerting.total_alerts_24h;
 
@@ -137,11 +121,13 @@ pub fn fallback_report(metrics: &CollectedMetrics) -> AnalysisResult {
         // depend on an LLM being reachable to surface.
         // NAN-1643: same posture for ingest-lowercase invariant drift — silent
         // query divergence must not depend on an LLM either.
-        // NAN-2361: the binding built above is a superset of the two helpers
-        // main inlined here — it adds lake publication and late replay — and it
-        // is the same value the overall score is derived from, so the heuristic
-        // report and its score cannot disagree about what is critical.
-        recommendations,
+        recommendations: {
+            let mut recs =
+                insert_integrity_recommendations(&metrics.ingestion.insert_integrity);
+            recs.extend(lowercase_invariant_recommendations(&metrics.parsing));
+            recs.extend(coverage_gap_recommendations(&metrics.detection));
+            recs
+        },
         // NAN-2357: same framing problem as the summary heading. The scores and
         // findings for every dimension are real; only the prose narrative is
         // absent. The open-edition page hides this block entirely rather than
@@ -207,7 +193,8 @@ fn fresh_deployment_report() -> AnalysisResult {
             .to_string(),
         recommendations: vec![],
         dimension_details: DimensionDetails {
-            ingestion: "No events ingested yet — this is a fresh deployment.".to_string(),
+            ingestion: "No events ingested yet — this is a fresh deployment."
+                .to_string(),
             parsing: "No events to parse.".to_string(),
             enrichment: "No events to enrich.".to_string(),
             detection: "No detection rules configured yet.".to_string(),
@@ -254,7 +241,8 @@ fn stalled_ingestion_report(metrics: &CollectedMetrics) -> AnalysisResult {
              sources, Vector / agent connectivity, and upstream filtering."
         ),
         recommendations: vec![Recommendation {
-            title: "Investigate stalled ingestion: zero events in the last 48h".to_string(),
+            title: "Investigate stalled ingestion: zero events in the last 48h"
+                .to_string(),
             description: format!(
                 "This tenant has {configured_summary} but no events have \
                  been ingested in the last 48 hours. Check that Vector and \
@@ -277,7 +265,8 @@ fn stalled_ingestion_report(metrics: &CollectedMetrics) -> AnalysisResult {
                 "{rules} rule(s) are enabled but cannot fire without \
                  ingestion."
             ),
-            alerting: "No alerts will be generated until ingestion resumes.".to_string(),
+            alerting: "No alerts will be generated until ingestion resumes."
+                .to_string(),
         },
     }
 }
@@ -299,24 +288,6 @@ fn has_critical_insert_integrity(ii: &InsertIntegrityMetrics) -> bool {
 
 // Simple heuristic scorers for fallback mode
 fn score_ingestion(m: &IngestionMetrics) -> i32 {
-    let lake_publication_penalty = m
-        .lake_publication
-        .as_ref()
-        .map(|health| {
-            if health.last_reconciled_age_seconds.is_none()
-                || health
-                    .last_reconciled_age_seconds
-                    .is_some_and(|age| age > 30)
-                || health
-                    .oldest_unpublished_age_seconds
-                    .is_some_and(|age| age > 30)
-            {
-                40
-            } else {
-                0
-            }
-        })
-        .unwrap_or(0);
     // NAN-1405: insert-path integrity first — these signals mean rows are
     // being discarded RIGHT NOW, regardless of what the 24h volume windows
     // show (during the first hours of a NAN-1404-style outage the 24h totals
@@ -328,7 +299,7 @@ fn score_ingestion(m: &IngestionMetrics) -> i32 {
     }
 
     if m.source_volumes.is_empty() {
-        return (50 - lake_publication_penalty).clamp(0, 100);
+        return 50;
     }
     let silent_penalty = (m.silent_sources.len() as i32) * 15;
     let volume_change = if m.total_events_prior_24h > 0 {
@@ -363,43 +334,81 @@ fn score_ingestion(m: &IngestionMetrics) -> i32 {
     if !ii.stale_dict_refreshes.is_empty() {
         integrity_penalty += 15;
     }
-    (100 - silent_penalty - volume_change - integrity_penalty - lake_publication_penalty)
-        .clamp(0, 100)
+    if ii.ingest_watchdog.iter().any(watchdog_views_stopped) {
+        integrity_penalty += 10;
+    }
+    if ii.ingest_watchdog.iter().any(|state| {
+        state.replicas.iter().any(|replica| !replica.reachable)
+    }) {
+        integrity_penalty += 10;
+    }
+    // NAN-4957: dictionaries holding half the server limit leave a reload (which
+    // needs the same again) and every query fighting over the rest.
+    if dictionary_memory_share_pct(ii).is_some_and(|pct| pct >= DICT_MEMORY_HIGH_PCT) {
+        integrity_penalty += 10;
+    }
+    (100 - silent_penalty - volume_change - integrity_penalty).clamp(0, 100)
 }
 
-fn lake_publication_recommendations(m: &IngestionMetrics) -> Vec<Recommendation> {
-    let Some(health) = &m.lake_publication else {
-        return Vec::new();
-    };
-    let reconciler_stale = health
-        .last_reconciled_age_seconds
-        .is_none_or(|age| age > 30);
-    let backlog_stale = health
-        .oldest_unpublished_age_seconds
-        .is_some_and(|age| age > 30);
-    if !reconciler_stale && !backlog_stale {
-        return Vec::new();
+/// Dictionary share of the server memory limit at which SIEM Health warns
+/// (NAN-4957). A reload builds the new copy next to the old one, so at 35% a
+/// reload alone takes 70% of the limit.
+pub(crate) const DICT_MEMORY_WARN_PCT: u64 = 35;
+/// Share at which the warning is high priority and drags the ingestion score.
+pub(crate) const DICT_MEMORY_HIGH_PCT: u64 = 50;
+
+/// Resident dictionary bytes as a percentage of the server memory limit, when
+/// both were measured.
+pub(crate) fn dictionary_memory_share_pct(ii: &InsertIntegrityMetrics) -> Option<u64> {
+    (ii.dictionary_memory_probe_ok && ii.server_memory_limit_bytes > 0)
+        .then(|| ii.dictionary_bytes_total.saturating_mul(100) / ii.server_memory_limit_bytes)
+}
+
+fn mib(bytes: u64) -> String {
+    format!("{:.0} MiB", bytes as f64 / 1_048_576.0)
+}
+
+fn watchdog_views_stopped(state: &IngestWatchdogHealth) -> bool {
+    !state.disabled_views.is_empty()
+        && matches!(
+            state.action.as_str(),
+            "auto_stop"
+                | "manual_stop"
+                | "manual_stop_reapplied"
+                | "observed_manual_stop"
+                | "auto_enabled_shedding"
+        )
+}
+
+/// NAN-4957: warn when the dictionaries hold too much of the server memory
+/// limit, naming the largest ones.
+fn dictionary_memory_recommendation(ii: &InsertIntegrityMetrics) -> Option<Recommendation> {
+    let pct = dictionary_memory_share_pct(ii)?;
+    if pct < DICT_MEMORY_WARN_PCT {
+        return None;
     }
-    vec![Recommendation {
-        title: "Object-lake freshness publication is stalled".to_string(),
+    let top = ii
+        .dictionary_memory
+        .iter()
+        .take(3)
+        .map(|d| format!("{} ({}, {})", d.name, d.layout, mib(d.bytes_allocated)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(Recommendation {
+        title: format!("ClickHouse dictionaries hold {pct}% of the server memory limit"),
         description: format!(
-            "The signed hot-tail publisher last reconciled {} seconds ago; {} visibility-ledger \
-             revision(s) are newer than its last successful publication and the oldest has waited \
-             {} seconds. Ingest bytes remain durable, but Search and scheduled detections may not \
-             see the newest events until publication recovers. Check the staged-tail singleton, \
-             PostgreSQL lease/connectivity, signed-manifest volume, and query-worker tail health.",
-            health
-                .last_reconciled_age_seconds
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-            health.unpublished_revisions,
-            health
-                .oldest_unpublished_age_seconds
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
+            "Resident dictionaries take {} of the {} ClickHouse memory limit. Largest: {top}. \
+             A dictionary reload builds the new copy next to the old one, so a reload needs the \
+             same again, and searches and inserts share what is left; past the limit they fail \
+             with MEMORY_LIMIT_EXCEEDED (241). Enrichment (the IPinfo, Tor and ThreatFox \
+             feeds) requires 6 GB for ClickHouse: set CLICKHOUSE_MEM_LIMIT=6G on compose \
+             installs, or disable the feeds (PLATFORM_FEEDS_AUTO_UPDATE=false). Without \
+             enrichment, 2-4 GB is fine for small and test tenants.",
+            mib(ii.dictionary_bytes_total),
+            mib(ii.server_memory_limit_bytes)
         ),
-        priority: "critical".to_string(),
-    }]
+        priority: if pct >= DICT_MEMORY_HIGH_PCT { "high" } else { "medium" }.to_string(),
+    })
 }
 
 /// Recommendations for fired insert-integrity signals (NAN-1405). Used by the
@@ -408,6 +417,9 @@ fn lake_publication_recommendations(m: &IngestionMetrics) -> Vec<Recommendation>
 /// proven during NAN-1404 (dict status → part_log → system.errors).
 fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommendation> {
     let mut recs = Vec::new();
+    if let Some(rec) = dictionary_memory_recommendation(ii) {
+        recs.push(rec);
+    }
     if !ii.failed_logs_dictionaries.is_empty() {
         let dicts = ii
             .failed_logs_dictionaries
@@ -420,9 +432,9 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
             description: format!(
                 "The logs table's MATERIALIZED columns call dictGetOrDefault on {dicts}, and an \
                  unhealthy dictionary makes that call THROW on every insert flush — all incoming \
-                 batches are being discarded while every upstream ACK stays green. \
+                 batches are being discarded while every upstream ACK stays green (NAN-1404). \
                  This is either FAILED status OR a degraded CACHE dict (e.g. a prevalence dict) \
-                 that reports LOADED while its source errors and every lookup throws. \
+                 that reports LOADED while its source errors and every lookup throws (NAN-1667). \
                  Inspect system.dictionaries.last_exception, fix the dictionary source, then \
                  SYSTEM RELOAD DICTIONARY to restore ingestion."
             ),
@@ -437,7 +449,7 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
             ),
             description: "INSERTs into the logs table keep finishing (the ingest chain is \
                  ACKing), but part_log shows no new parts reaching storage — async-insert \
-                 flushes are discarding every batch (the silent-loss fingerprint). \
+                 flushes are discarding every batch (the NAN-1404 silent-loss fingerprint). \
                  Check system.dictionaries for FAILED dictionaries, system.errors for \
                  MEMORY_LIMIT_EXCEEDED, and system.asynchronous_insert_log for flush \
                  exceptions."
@@ -462,7 +474,7 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
             title: "ClickHouse is hitting its memory limit".to_string(),
             description: format!(
                 "system.errors shows {} MEMORY_LIMIT_EXCEEDED occurrences with activity in the \
-                 last 24h. On a memory-capped deployment this is the silent-loss trigger: \
+                 last 24h. On a memory-capped deployment this is the NAN-1404 trigger: \
                  dictionary loads / insert flushes OOM and ingestion fails. Check dictionary \
                  source queries and merge pressure before it escalates.",
                 ii.memory_limit_errors
@@ -503,14 +515,69 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
             .map(|r| format!(" Last refresh exception: {}", r.exception))
             .unwrap_or_default();
         recs.push(Recommendation {
-            title: format!("Enrichment dictionary refresh is failing or stale: {views}"),
+            title: format!("Enrichment activation is failing or stale: {views}"),
             description: format!(
-                "The dictionary-staging refresh views ({views}) are failing, disabled, or \
-                 overdue past their refresh schedule (system.view_refreshes). Ingestion is NOT \
-                 affected — the dictionaries keep serving the last good staging snapshot \
-                 — but enrichment values (GeoIP/IOC/identity/prevalence) are \
-                 drifting stale. Inspect system.view_refreshes.exception, fix the \
-                 underlying source query/table, then SYSTEM REFRESH VIEW to catch up.{detail}"
+                "The dictionary-staging refresh views or durable post-migration activation jobs \
+                 ({views}) are failing or overdue. Ingestion is NOT affected — dictionaries keep \
+                 serving the last good staging snapshot — but enrichment values \
+                 (GeoIP/IOC/identity/prevalence) are drifting stale. Inspect \
+                 system.view_refreshes and nanosiem._migration_refreshes, fix the underlying \
+                 source query/table, then allow the jobs leader to retry.{detail}"
+            ),
+            priority: "high".to_string(),
+        });
+    }
+    let stopped = ii
+        .ingest_watchdog
+        .iter()
+        .filter(|state| watchdog_views_stopped(state))
+        .collect::<Vec<_>>();
+    if !stopped.is_empty() {
+        let nodes = stopped
+            .iter()
+            .map(|state| {
+                format!(
+                    "{} (mode {}, views: {})",
+                    state.node,
+                    state.mode,
+                    state.disabled_views.join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let manual = stopped
+            .iter()
+            .any(|state| state.mode.eq_ignore_ascii_case("manual"));
+        let ownership = if manual {
+            "At least one shard is in manual mode: the watchdog will never restart those views. Run `nanosiem-jobs ingest-watchdog manual-start` when it is safe, then `nanosiem-jobs ingest-watchdog auto` to return ownership."
+        } else {
+            "Automatic mode restarts and catches the views up after twenty calm samples and at least fifteen minutes. Use `nanosiem-jobs ingest-watchdog status` to inspect current pressure."
+        };
+        recs.push(Recommendation {
+            title: "Refreshable views are stopped to protect ingestion".to_string(),
+            description: format!(
+                "The ingest watchdog stopped refreshable views on {nodes}. Primary ingest remains running and incremental materialized views are untouched. {ownership}"
+            ),
+            priority: "high".to_string(),
+        });
+    }
+    let unreachable = ii
+        .ingest_watchdog
+        .iter()
+        .flat_map(|state| {
+            state
+                .replicas
+                .iter()
+                .filter(|replica| !replica.reachable)
+                .map(|replica| format!("{}/{} ({})", state.node, replica.replica, replica.error))
+        })
+        .collect::<Vec<_>>();
+    if !unreachable.is_empty() {
+        recs.push(Recommendation {
+            title: "Ingest watchdog replica coverage is degraded".to_string(),
+            description: format!(
+                "The watchdog cannot sample {}. Missing coverage is never counted as CALM; jobs and ingest remain up while the watchdog retries. Restore replica connectivity and confirm all targets in `nanosiem-jobs ingest-watchdog status`.",
+                unreachable.join(", ")
             ),
             priority: "high".to_string(),
         });
@@ -551,6 +618,120 @@ fn lowercase_invariant_recommendations(p: &ParsingMetrics) -> Vec<Recommendation
              (a new source, a backfill, or a parser regression that skips the Vector \
              downcase stage) and restore lowercase normalization; existing mixed-case \
              rows should be rewritten or re-ingested."
+        ),
+        priority: "high".to_string(),
+    }]
+}
+
+/// NAN-4910: recorded detection coverage gaps. High, not critical: the events
+/// are still stored (nothing was lost from the log store), but the listed rules
+/// never evaluated these windows, so a detection may have been missed there.
+/// NAN-4954: append the audit-durability findings to ANY analysis result —
+/// AI, fallback, or the Fresh/Stalled short-circuits. While ClickHouse is
+/// failing, ingestion probes read zero and the heuristic can land on "Fresh"
+/// (score 100, no findings); the audit backlog must still surface there, and
+/// it must not depend on an LLM choosing to mention it.
+///
+/// A live backlog also caps the overall score — warning (≤ 79), critical
+/// (≤ 49) once the oldest event is 15 minutes old — so the headline can never
+/// read "healthy" while the audit trail has a hole in it.
+pub fn ensure_audit_durability_findings(analysis: &mut AnalysisResult, metrics: &CollectedMetrics) {
+    for rec in audit_durability_recommendations(metrics.audit_durability.as_ref()) {
+        let cap = match rec.priority.as_str() {
+            "critical" => Some(49),
+            "high" => Some(79),
+            _ => None,
+        };
+        if let Some(cap) = cap {
+            analysis.overall_score = analysis.overall_score.min(cap);
+        }
+        if !analysis.recommendations.iter().any(|r| r.title == rec.title) {
+            analysis.recommendations.insert(0, rec);
+        }
+    }
+}
+
+/// NAN-4954: security-critical audit events that are recorded in PostgreSQL
+/// but not yet in ClickHouse, and inline ClickHouse audit-write failures.
+/// Deterministic (no AI needed) and emitted on every report path, because an
+/// audit trail with holes in it is a security problem, not a data-quality one.
+pub fn audit_durability_recommendations(
+    stats: Option<&crate::audit::AuditOutboxStats>,
+) -> Vec<Recommendation> {
+    let Some(stats) = stats else {
+        return vec![];
+    };
+    let mut recs = Vec::new();
+    if stats.is_backlogged() {
+        let age_min = stats.oldest_pending_age_secs.unwrap_or(0) / 60;
+        recs.push(Recommendation {
+            title: format!(
+                "{} security audit events are not in ClickHouse yet",
+                stats.overdue
+            ),
+            description: format!(
+                "{} security-critical audit event(s) (logins, MFA, API-key and credential \
+                 changes) are safely recorded in PostgreSQL but have not reached ClickHouse; \
+                 the oldest is {} minute(s) old after {} delivery attempt(s). Audit search and \
+                 the audit page are missing them until ClickHouse accepts inserts again — \
+                 delivery then resumes automatically. Last ClickHouse error: {}",
+                stats.overdue,
+                age_min,
+                stats.max_attempts,
+                stats.last_error.as_deref().unwrap_or("none recorded"),
+            ),
+            priority: if age_min >= 15 { "critical" } else { "high" }.to_string(),
+        });
+    } else if stats.deferred_24h > 0 {
+        recs.push(Recommendation {
+            title: format!(
+                "{} security audit writes to ClickHouse failed in the last 24h",
+                stats.deferred_24h
+            ),
+            description: format!(
+                "{} of {} security-critical audit event(s) in the last 24h could not be written \
+                 to ClickHouse when they happened and were delivered later from the PostgreSQL \
+                 outbox. Nothing was lost, but ClickHouse was refusing inserts — check its \
+                 memory limit (MEMORY_LIMIT_EXCEEDED) and availability.",
+                stats.deferred_24h, stats.recorded_24h,
+            ),
+            priority: "medium".to_string(),
+        });
+    }
+    recs
+}
+
+fn coverage_gap_recommendations(d: &DetectionMetrics) -> Vec<Recommendation> {
+    if d.coverage_gaps_7d_total <= 0 {
+        return vec![];
+    }
+    let examples = d
+        .coverage_gaps_7d
+        .iter()
+        .take(5)
+        .map(|g| {
+            format!(
+                "{} [{} → {}]",
+                g.rule_name,
+                g.window_start.format("%Y-%m-%d %H:%M:%SZ"),
+                g.window_end.format("%Y-%m-%d %H:%M:%SZ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    vec![Recommendation {
+        title: format!(
+            "{} detection window(s) could not be evaluated in the last 7 days",
+            d.coverage_gaps_7d_total
+        ),
+        description: format!(
+            "The detection scheduler gave up on these windows after the smallest \
+             catch-up slice kept failing for a size reason (ClickHouse memory \
+             limit, too many rows/bytes, server-side query timeout): {examples}. Events in those windows are stored \
+             but were never checked by the rule, so a detection may have been missed. \
+             Narrow the rule (more selective filters, fewer fields) or raise the \
+             ClickHouse memory/time limits, then replay the windows listed in \
+             detection_coverage_gaps by hand (e.g. a retro hunt over each window)."
         ),
         priority: "high".to_string(),
     }]
@@ -612,67 +793,9 @@ fn score_detection(m: &DetectionMetrics) -> i32 {
         (stale_pct * 40.0) as i32
     };
     let noise_penalty = (m.noisy_rules.len() as i32) * 5;
-    let replay_penalty = if m.late_replay.dead_letter_jobs > 0 {
-        40
-    } else if m
-        .late_replay
-        .oldest_unplanned_age_seconds
-        .is_some_and(|age| age > 60)
-        || m.late_replay
-            .oldest_outstanding_job_age_seconds
-            .is_some_and(|age| age > 300)
-    {
-        25
-    } else {
-        0
-    };
-    (100 - stale_penalty - noise_penalty - replay_penalty).clamp(0, 100)
-}
-
-fn late_replay_recommendations(m: &DetectionMetrics) -> Vec<Recommendation> {
-    if m.late_replay.dead_letter_jobs > 0 {
-        return vec![Recommendation {
-            title: "Late-arrival detection replay has dead-lettered work".to_string(),
-            description: format!(
-                "{} replay job(s) exhausted their retry budget. The underlying events remain \
-                 searchable, but scheduled rules may have missed them. Inspect the stored replay \
-                 errors, repair the rule/query failure, and explicitly requeue the affected \
-                 immutable publication windows.",
-                m.late_replay.dead_letter_jobs
-            ),
-            priority: "critical".to_string(),
-        }];
-    }
-    let stalled = m
-        .late_replay
-        .oldest_unplanned_age_seconds
-        .is_some_and(|age| age > 60)
-        || m.late_replay
-            .oldest_outstanding_job_age_seconds
-            .is_some_and(|age| age > 300);
-    if !stalled {
-        return Vec::new();
-    }
-    vec![Recommendation {
-        title: "Late-arrival detection replay is falling behind".to_string(),
-        description: format!(
-            "{} publication(s) remain unplanned and {} replay job(s) are pending/running. The \
-             oldest unplanned publication is {} seconds old and the oldest outstanding replay is \
-             {} seconds old. Normal rule watermarks remain safe, but late events will not receive \
-             complete detection coverage until this durable backlog drains.",
-            m.late_replay.unplanned_publications,
-            m.late_replay.pending_jobs + m.late_replay.running_jobs,
-            m.late_replay
-                .oldest_unplanned_age_seconds
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-            m.late_replay
-                .oldest_outstanding_job_age_seconds
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-        ),
-        priority: "high".to_string(),
-    }]
+    // NAN-4910: windows a rule never evaluated are a coverage hole.
+    let gap_penalty = if m.coverage_gaps_7d_total > 0 { 20 } else { 0 };
+    (100 - stale_penalty - noise_penalty - gap_penalty).clamp(0, 100)
 }
 
 fn score_alerting(m: &AlertingMetrics, d: &DetectionMetrics) -> i32 {
@@ -731,6 +854,18 @@ fn score_alerting(m: &AlertingMetrics, d: &DetectionMetrics) -> i32 {
 
     score.clamp(0, 100)
 }
+
+#[cfg(test)]
+#[path = "analyzer_dict_memory_tests.rs"]
+mod dict_memory_tests;
+
+#[cfg(test)]
+#[path = "audit_durability_tests.rs"]
+mod audit_durability_tests;
+
+#[cfg(test)]
+#[path = "analyzer_ingest_watchdog_tests.rs"]
+mod ingest_watchdog_tests;
 
 #[cfg(test)]
 mod tests {
@@ -831,7 +966,7 @@ mod tests {
 
     /// Base fixture with everything at zero — tests above tweak fields to
     /// exercise specific deployment_state branches.
-    fn base_zero_metrics_fixture() -> CollectedMetrics {
+    pub(super) fn base_zero_metrics_fixture() -> CollectedMetrics {
         CollectedMetrics {
             ingestion: IngestionMetrics {
                 source_volumes: vec![],
@@ -839,7 +974,6 @@ mod tests {
                 total_events_prior_24h: 0,
                 silent_sources: vec![],
                 insert_integrity: Default::default(),
-                lake_publication: None,
             },
             parsing: ParsingMetrics {
                 field_coverage: vec![],
@@ -863,8 +997,10 @@ mod tests {
                 stale_rules: vec![],
                 noisy_rules: vec![],
                 alerts_24h_by_severity: vec![],
-                late_replay: Default::default(),
+                coverage_gaps_7d: vec![],
+                coverage_gaps_7d_total: 0,
             },
+            audit_durability: None,
             alerting: AlertingMetrics {
                 total_alerts_24h: 0,
                 total_alerts_prior_24h: 0,
@@ -953,7 +1089,8 @@ mod tests {
             stale_rules: vec![],
             noisy_rules: vec![],
             alerts_24h_by_severity: vec![],
-            late_replay: Default::default(),
+            coverage_gaps_7d: vec![],
+            coverage_gaps_7d_total: 0,
         }
     }
 
@@ -981,6 +1118,33 @@ mod tests {
             score >= 80,
             "detections firing + no alerting-mode rules must be Healthy, got {score}"
         );
+    }
+
+    /// NAN-4910: a recorded detection coverage gap is a high-priority finding
+    /// and drags the detection score, without an LLM.
+    #[test]
+    fn detection_coverage_gaps_recommend_and_drag_detection_score() {
+        let clean = detection_with(5, 100);
+        assert!(coverage_gap_recommendations(&clean).is_empty());
+        let mut gapped = detection_with(5, 100);
+        gapped.coverage_gaps_7d_total = 2;
+        gapped.coverage_gaps_7d = vec![DetectionCoverageGapSummary {
+            rule_name: "Brute force".to_string(),
+            window_start: chrono::DateTime::parse_from_rfc3339("2026-07-05T03:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            window_end: chrono::DateTime::parse_from_rfc3339("2026-07-05T03:05:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            recorded_at: chrono::Utc::now(),
+            error_message: "Code: 241. DB::Exception: Memory limit (for query) exceeded (MEMORY_LIMIT_EXCEEDED)".to_string(),
+        }];
+        let recs = coverage_gap_recommendations(&gapped);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].priority, "high");
+        assert!(recs[0].title.starts_with("2 detection window(s)"), "{}", recs[0].title);
+        assert!(recs[0].description.contains("Brute force [2026-07-05 03:00:00Z"));
+        assert!(score_detection(&gapped) < score_detection(&clean));
     }
 
     /// No alerting-mode rules AND nothing matching → mild Warning, not critical.
@@ -1030,10 +1194,7 @@ mod tests {
         // And a real geo gap still drags the score down.
         m.geoip_fill_pct = 10.0;
         m.asn_fill_pct = 10.0;
-        assert!(
-            score_enrichment(&m) < 50,
-            "genuinely low geo/asn is still bad"
-        );
+        assert!(score_enrichment(&m) < 50, "genuinely low geo/asn is still bad");
     }
 
     /// NAN-1405: a healthy ingestion fixture for the insert-integrity tests —
@@ -1053,7 +1214,6 @@ mod tests {
                 probes_available: true,
                 ..Default::default()
             },
-            lake_publication: None,
         }
     }
 
@@ -1079,63 +1239,6 @@ mod tests {
                 .any(|r| r.priority == "critical" && r.title.contains("ip_enrichment_dict")),
             "must raise a critical recommendation naming the dict; got {recs:?}"
         );
-    }
-
-    #[test]
-    fn frozen_lake_tail_is_visible_even_while_event_volume_looks_healthy() {
-        let mut ingestion = healthy_ingestion();
-        ingestion.lake_publication = Some(LakePublicationHealth {
-            last_reconciled_age_seconds: Some(45),
-            unpublished_revisions: 7,
-            oldest_unpublished_age_seconds: Some(41),
-            visible_objects: 12,
-            visible_bytes: 42_000,
-            manifest_sha256: Some("a".repeat(64)),
-            newest_visible_event_time: Some(chrono::Utc::now()),
-        });
-        assert!(score_ingestion(&ingestion) <= 60);
-        let recommendations = lake_publication_recommendations(&ingestion);
-        assert_eq!(recommendations.len(), 1);
-        assert_eq!(recommendations[0].priority, "critical");
-        assert!(recommendations[0]
-            .description
-            .contains("7 visibility-ledger"));
-    }
-
-    #[test]
-    fn critical_lake_tail_finding_cannot_leave_overall_health_green() {
-        let mut metrics = base_zero_metrics_fixture();
-        metrics.ingestion = healthy_ingestion();
-        metrics.ingestion.lake_publication = Some(LakePublicationHealth {
-            last_reconciled_age_seconds: Some(45),
-            unpublished_revisions: 7,
-            oldest_unpublished_age_seconds: Some(41),
-            visible_objects: 12,
-            visible_bytes: 42_000,
-            manifest_sha256: Some("a".repeat(64)),
-            newest_visible_event_time: Some(chrono::Utc::now()),
-        });
-
-        let report = fallback_report(&metrics);
-        assert!(report
-            .recommendations
-            .iter()
-            .any(|recommendation| recommendation.priority == "critical"));
-        assert!(
-            report.overall_score < 50,
-            "a critical tail-publication outage cannot report healthy overall: {}",
-            report.overall_score
-        );
-    }
-
-    #[test]
-    fn late_replay_dead_letter_is_a_detection_health_failure() {
-        let mut detection = detection_with(1, 10);
-        detection.late_replay.dead_letter_jobs = 2;
-        assert!(score_detection(&detection) <= 60);
-        let recommendations = late_replay_recommendations(&detection);
-        assert_eq!(recommendations.len(), 1);
-        assert_eq!(recommendations[0].priority, "critical");
     }
 
     #[test]
@@ -1213,8 +1316,8 @@ mod tests {
         );
         let recs = insert_integrity_recommendations(&m.insert_integrity);
         assert!(
-            recs.iter()
-                .any(|r| r.priority == "critical" && r.title.contains("flush failures")),
+            recs.iter().any(|r| r.priority == "critical"
+                && r.title.contains("flush failures")),
             "flush failures are confirmed loss — critical; got {recs:?}"
         );
         assert!(

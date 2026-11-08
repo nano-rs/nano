@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { toast as sonnerToast } from 'sonner';
+import { SESSION_EXPIRED_MESSAGE } from '@/lib/session-credentials';
 
 interface ToastAction {
   label: string;
@@ -16,8 +17,9 @@ interface ToastOptions {
 }
 
 function toast({ title, description, variant, action, duration }: ToastOptions) {
-  // AuthContext owns the single session-expired prompt.
-  if (description === 'Session expired — sign in again') return;
+  // NAN-2453: AuthContext owns the single session-expired prompt; a
+  // SessionExpiredError surfaced by N failed requests must not toast N times.
+  if (description === SESSION_EXPIRED_MESSAGE || title === SESSION_EXPIRED_MESSAGE) return;
   const opts: Record<string, unknown> = { description };
   if (action) {
     opts.action = { label: action.label, onClick: action.onClick };

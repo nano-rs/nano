@@ -167,7 +167,8 @@ async fn production_sql_filters_sources_before_merge_order_and_limit() {
         .expect("NANOSIEM_TEST_CLICKHOUSE_URL must target a disposable ClickHouse");
     let mut client = clickhouse::Client::default()
         .with_url(url)
-        .with_database("nanosiem");
+        .with_database("nanosiem")
+        .with_compression(clickhouse::Compression::None);
     if let Ok(user) = std::env::var("NANOSIEM_TEST_CLICKHOUSE_USER") {
         client = client.with_user(user);
     }
@@ -225,7 +226,7 @@ async fn production_sql_filters_sources_before_merge_order_and_limit() {
         .await
         .expect("SYSTEM prevalence");
     assert_eq!(
-        unrestricted.host_count, 6,
+        unrestricted.host_count, Some(6),
         "default/system callers retain the legacy aggregate fast path, including unknown provenance"
     );
 
@@ -234,7 +235,7 @@ async fn production_sql_filters_sources_before_merge_order_and_limit() {
         .await
         .expect("audit-denied prevalence");
     assert_eq!(
-        before_revocation.host_count, 3,
+        before_revocation.host_count, Some(3),
         "audit plus empty/unknown incomplete provenance are excluded before host aggregation"
     );
 
@@ -243,7 +244,7 @@ async fn production_sql_filters_sources_before_merge_order_and_limit() {
         .await
         .expect("revoked prevalence");
     assert_eq!(
-        after_revocation.host_count, 1,
+        after_revocation.host_count, Some(1),
         "a later source revocation takes effect immediately and bypasses the system cache"
     );
 
@@ -252,7 +253,7 @@ async fn production_sql_filters_sources_before_merge_order_and_limit() {
         .await
         .expect("scoped domain prevalence");
     assert_eq!(
-        scoped_domain.host_count, 1,
+        scoped_domain.host_count, Some(1),
         "the domain lookup uses the same pre-aggregation source policy"
     );
 
@@ -260,14 +261,14 @@ async fn production_sql_filters_sources_before_merge_order_and_limit() {
         .get_ip_prevalence(MIXED_IP, TimeWindow::ThirtyDays, &system)
         .await
         .expect("SYSTEM IP prevalence");
-    assert_eq!(unrestricted_ip.host_count, 2);
+    assert_eq!(unrestricted_ip.host_count, Some(2));
 
     let scoped_ip = service
         .get_ip_prevalence(MIXED_IP, TimeWindow::ThirtyDays, &revoked)
         .await
         .expect("scoped IP prevalence");
     assert_eq!(
-        scoped_ip.host_count, 1,
+        scoped_ip.host_count, Some(1),
         "the IP lookup uses the same pre-aggregation source policy"
     );
 
@@ -276,7 +277,7 @@ async fn production_sql_filters_sources_before_merge_order_and_limit() {
         .await
         .expect("scoped bulk prevalence");
     assert_eq!(bulk.len(), 1);
-    assert_eq!(bulk[0].host_count, 1);
+    assert_eq!(bulk[0].host_count, Some(1));
 
     let rare = service
         .get_rare_artifacts(
@@ -342,9 +343,12 @@ async fn production_sql_filters_sources_before_merge_order_and_limit() {
         .await
         .expect("scoped scatter");
     assert_eq!(scatter.hash_points.len(), 2);
-    assert_eq!(scatter.hash_points[0].host_count, 1);
-    assert_eq!(
-        scatter.hash_points[1].host_count, 0,
-        "a denied-only artifact remains an explicit zero in bounded scatter output"
+    assert_eq!(scatter.hash_points[0].host_count, Some(1));
+    // A denied-only artifact is a miss: `0` when prevalence covers the window,
+    // `null` (unknown) while it warms up. Coverage is global, never per
+    // artifact, so neither form reveals the denied source.
+    assert!(
+        matches!(scatter.hash_points[1].host_count, None | Some(0)),
+        "a denied-only artifact must never show a host count in bounded scatter output"
     );
 }

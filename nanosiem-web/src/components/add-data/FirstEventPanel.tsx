@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
- * First-event confirmation (NAN-2599, design §3.3 "First-event panel"): after
- * the token is copied, a live checklist "credential issued → first event
- * received at the edge → searchable" with timestamps and elapsed times. It
- * polls the credential's activity (NAN-2598) until the first event is
- * searchable, and maps the edge's last refusal and any parse failures to
- * troubleshooting hints.
+ * First-event confirmation (main's NAN-2599 panel; NAN-4922 re-backs it on the
+ * ClickHouse product): after the token is copied, a live checklist "token
+ * issued → first request accepted → searchable" with timestamps and elapsed
+ * times. It polls the source's connect status (the same cache the Connect
+ * summary reads) until an event issued after the token is searchable, and
+ * maps what has not arrived to troubleshooting hints.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -16,11 +16,14 @@ import { AlertTriangle, Check, Circle, Info, Radio, Search } from 'lucide-react'
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { api } from '@/lib/api';
+import { connectDetailQueryKey } from '@/lib/api/log-source-connect';
 import { formatTimeUTC } from '@/lib/date-utils';
+import { nplFieldEquals } from '@/lib/npl-quote';
 import {
   FIRST_EVENT_POLL_MS,
   RECEIVED_TARGET_MS,
   SEARCHABLE_TARGET_MS,
+  firstEventFacts,
   firstEventSteps,
   formatElapsed,
   troubleshootingHints,
@@ -31,10 +34,6 @@ import { cn } from '@/lib/utils';
 
 /** Stop polling a credential nobody has sent to after this long (resume with the button). */
 const MAX_WAIT_MS = 30 * 60 * 1000;
-
-function credentialActivityQueryKey(credentialId: string) {
-  return ['ingest-credential-activity', credentialId] as const;
-}
 
 function StepIcon({ step }: { step: FirstEventStep }) {
   if (step.state === 'done') {
@@ -68,7 +67,7 @@ function HintRow({ hint, parserHref }: { hint: TroubleshootingHint; parserHref?:
         <div className="text-muted-foreground">{hint.detail}</div>
         {hint.parserLink && parserHref && (
           <Link to={parserHref} className="text-primary hover:underline" data-testid="first-event-parser-link">
-            Open the parser
+            Build the parser
           </Link>
         )}
       </div>
@@ -77,32 +76,37 @@ function HintRow({ hint, parserHref }: { hint: TroubleshootingHint; parserHref?:
 }
 
 export function FirstEventPanel({
+  logSourceId,
   credentialId,
   issuedAt,
   sourceSlugs,
   parserHref,
+  searchField = 'source_type',
 }: {
+  logSourceId: string;
   credentialId: string;
-  /** When the token was revealed (browser clock, ISO). */
+  /** When the token was issued (browser clock, ISO). */
   issuedAt: string;
   sourceSlugs: string[];
-  /** Where "Open the parser" goes when the lake reports parse failures. */
+  /** Where "Build the parser" goes when events arrive unparsed. */
   parserHref?: string;
+  /** The field Search scopes a source by (`metadata.log_source` on OCSF). */
+  searchField?: string;
 }) {
   const [now, setNow] = useState(() => Date.now());
   const [waitFrom, setWaitFrom] = useState(() => new Date(issuedAt).getTime());
   const timedOut = now - waitFrom > MAX_WAIT_MS;
 
-  const { data: activity, error, refetch } = useQuery({
-    queryKey: credentialActivityQueryKey(credentialId),
-    // One hour covers the first event; the counts shown are the first ones.
-    queryFn: () => api.getIngestCredentialActivity(credentialId, 1),
+  const { data: detail, error, refetch } = useQuery({
+    queryKey: connectDetailQueryKey(logSourceId),
+    queryFn: () => api.logSourceConnect.getStatus(logSourceId),
     refetchInterval: (query) =>
-      query.state.data?.first_event.state === 'searchable' || timedOut ? false : FIRST_EVENT_POLL_MS,
+      firstEventFacts(query.state.data, credentialId, issuedAt).state === 'searchable' || timedOut ? false : FIRST_EVENT_POLL_MS,
     refetchIntervalInBackground: true,
     retry: 1,
   });
-  const searchable = activity?.first_event.state === 'searchable';
+  const facts = useMemo(() => (detail ? firstEventFacts(detail, credentialId, issuedAt) : undefined), [detail, credentialId, issuedAt]);
+  const searchable = facts?.state === 'searchable';
 
   // Tick the elapsed clocks while waiting.
   useEffect(() => {
@@ -111,16 +115,11 @@ export function FirstEventPanel({
     return () => clearInterval(t);
   }, [searchable, timedOut]);
 
-  const steps = useMemo(() => firstEventSteps(issuedAt, activity, now), [issuedAt, activity, now]);
-  const hints = useMemo(
-    () => troubleshootingHints(activity, now - new Date(issuedAt).getTime()),
-    [activity, now, issuedAt],
-  );
+  const steps = useMemo(() => firstEventSteps(issuedAt, facts, now), [issuedAt, facts, now]);
+  const hints = useMemo(() => troubleshootingHints(facts, now - new Date(issuedAt).getTime()), [facts, now, issuedAt]);
   const received = steps[1];
-  const lake = activity?.lake;
-  // `metadata.log_source` is the field Search scopes by on the lake.
-  const firstSource = lake?.sources[0]?.source_slug ?? sourceSlugs[0];
-  const searchQuery = firstSource ? `metadata.log_source="${firstSource}"` : '';
+  const firstSource = detail?.route_key ?? sourceSlugs[0];
+  const searchQuery = firstSource ? nplFieldEquals(searchField, firstSource) : '';
 
   return (
     <div className="rounded-md border border-border" data-testid="first-event-panel" role="region" aria-label="First event">
@@ -148,7 +147,7 @@ export function FirstEventPanel({
               className={cn('font-mono text-[10.5px] tabular-nums w-[88px] text-right', step.overTarget ? 'text-amber-500' : 'text-muted-foreground')}
               title={
                 step.key === 'received'
-                  ? `Target: ≤ ${RECEIVED_TARGET_MS / 1000} s after the first send`
+                  ? `Target: ≤ ${RECEIVED_TARGET_MS / 1000} s after the first send (sampled)`
                   : step.key === 'searchable'
                     ? `Target: ≤ ${SEARCHABLE_TARGET_MS / 60000} min after receipt`
                     : undefined
@@ -157,7 +156,7 @@ export function FirstEventPanel({
               {step.key === 'issued'
                 ? ''
                 : step.state === 'done'
-                  ? `+${formatElapsed(step.elapsedMs)}`
+                  ? step.elapsedMs === null ? '' : `+${formatElapsed(step.elapsedMs)}`
                   : step.state === 'active' && step.key === 'searchable' && received.at
                     ? formatElapsed(now - new Date(received.at).getTime())
                     : step.state === 'active'
@@ -168,24 +167,12 @@ export function FirstEventPanel({
         ))}
       </ol>
 
-      {(activity?.edge || (lake && lake.events > 0)) && (
+      {facts && facts.events24h > 0 && (
         <div className="flex flex-wrap gap-x-4 gap-y-1 px-3 pb-2 font-mono text-[10.5px] text-muted-foreground" data-testid="first-event-counts">
-          {activity?.edge && (
-            <span>
-              edge <span className="text-foreground/80 tabular-nums">{activity.edge.events_24h.toLocaleString()}</span> events ·{' '}
-              <span className="text-foreground/80 tabular-nums">{activity.edge.requests_24h.toLocaleString()}</span> requests
-            </span>
-          )}
-          {lake && lake.events > 0 && (
-            <span>
-              lake <span className="text-foreground/80 tabular-nums">{lake.events.toLocaleString()}</span> events
-              {lake.parse_failures > 0 && (
-                <>
-                  {' '}· <span className="text-amber-500 tabular-nums">{lake.parse_failures.toLocaleString()}</span> parse failures
-                </>
-              )}
-            </span>
-          )}
+          <span>
+            source <span className="text-foreground/80 tabular-nums">{facts.events24h.toLocaleString()}</span> events 24h
+            {facts.unparsed && <> · <span className="text-amber-500">not parsed</span></>}
+          </span>
         </div>
       )}
 

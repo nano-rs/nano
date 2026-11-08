@@ -15,11 +15,11 @@
  */
 
 import { useEffect, useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
 import { Crosshair, Clock, Download, ChevronRight } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
-import { parseTimestampAsUTC } from '@/lib/parse-timestamp-utc';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import type { SemanticField } from '@/lib/schema-fields';
 import type {
   TimeRange,
   RetroAxis,
@@ -30,11 +30,10 @@ import type {
 } from '@/lib/api/types';
 import { useRetro, readRetroMarker, prefetchRetro } from './useRetro';
 import { CachedNotice } from '../CachedNotice';
-import { DurableJobNotice } from '../DurableJobNotice';
 import { RetroSummary } from './RetroSummary';
 import { RetroCampaign } from './RetroCampaign';
 import { RetroPivot } from './RetroPivot';
-import { api } from '@/lib/api';
+import { nplExactEquals } from '@/lib/npl-quote';
 
 /** Local row shape — matches the sibling special views' `SearchResult`. */
 interface SearchResult {
@@ -63,15 +62,9 @@ export interface RetroViewProps {
   onSetQueryWithTime?: (query: string, startIso: string, endIso: string) => void;
   /** Add a field=value filter to the running query (drill-down fallback). */
   onAddToQuery?: (field: string, value: string, exclude: boolean) => void;
-  onOpenJobs?: () => void;
 }
 
 type ViewId = 'summary' | 'list' | 'asset' | 'user';
-
-/** NAN-3086: on a lean tenant every retro hunt is a durable job whose
- * result is bound to the tenant's retention cutoff. */
-const RETRO_JOB_DETAIL =
-  'Retro hunts run as a background job over your retention window; events past the retention cutoff are never counted, and the result expires with them.';
 
 const VIEWS: { id: ViewId; label: string }[] = [
   { id: 'summary', label: 'Summary' },
@@ -191,17 +184,9 @@ export function RetroView({
   onSetQuery,
   onSetQueryWithTime,
   onAddToQuery,
-  onOpenJobs,
 }: RetroViewProps) {
-  const { data: schemaFields } = useQuery({
-    queryKey: ['schema-fields'],
-    queryFn: () => api.getSchemaFields(),
-    staleTime: Infinity,
-    gcTime: Infinity,
-  });
-  const strictOcsf = schemaFields?.schema === 'ocsf';
   const marker = useMemo(() => readRetroMarker(results?.[0]?.fields), [results]);
-  const { data, loading, loadingMore, error, hasMore, loadMore, cacheMeta, refresh, durableJob } = useRetro(query ?? '', timeRange, marker);
+  const { data, loading, loadingMore, error, hasMore, loadMore, cacheMeta, refresh } = useRetro(query ?? '', timeRange, marker);
 
   const submode: RetroSubmode = data?.submode ?? marker.submode;
   const axis: RetroAxis = data?.axis ?? marker.axis;
@@ -237,6 +222,7 @@ export function RetroView({
   // value grammar (no `@`, `&`, `=`, …), so emails/URLs must be quoted. Prefer
   // double quotes; fall back to single quotes (stripping any embedded ') when
   // the value already contains a double quote.
+  const fieldMap = useSchemaFieldMap();
   const quoteIoc = (v: string) => (v.includes('"') ? `'${v.replace(/'/g, '')}'` : `"${v}"`);
 
   // Drill-down: set `ioc=<value> | retro` and reuse the standard search path.
@@ -247,15 +233,8 @@ export function RetroView({
   // Run `q` over the exposure window (first→last seen, padded ±1h so a
   // single-point hit stays viewable) in one search; falls back to no time jump.
   const drillToEvents = (q: string, firstSeen?: string | null, lastSeen?: string | null) => {
-    // NAN-2361: parse as UTC. Retro's first/last seen arrive NAIVE from the lake
-    // ("2026-08-21 22:16:47.235000" — space separator, no zone), and a bare
-    // `new Date(...)` on that is interpreted as LOCAL time. The drilldown window
-    // was therefore shifted by the viewer's UTC offset, landing the analyst on a
-    // range that does not contain the sighting they clicked. Same defect class
-    // already fixed in the rarity chart and cloud view; this is the shared
-    // helper those now use.
-    const last = lastSeen ? parseTimestampAsUTC(lastSeen) : new Date();
-    const first = firstSeen ? parseTimestampAsUTC(firstSeen) : last;
+    const last = lastSeen ? new Date(lastSeen) : new Date();
+    const first = firstSeen ? new Date(firstSeen) : last;
     const padMs = 60 * 60 * 1000;
     const startIso = new Date(Math.min(first.getTime(), last.getTime()) - padMs).toISOString();
     const endIso = new Date(last.getTime() + padMs).toISOString();
@@ -271,13 +250,13 @@ export function RetroView({
     firstSeen?: string | null,
     lastSeen?: string | null
   ) => {
-    const q = strictOcsf
-      ? kind === 'user'
-        ? `user.name=${quoteIoc(name)} OR actor.user.name=${quoteIoc(name)}`
-        : `device.hostname=${quoteIoc(name)} OR src_endpoint.hostname=${quoteIoc(name)} OR dst_endpoint.hostname=${quoteIoc(name)} OR src_endpoint.ip=${quoteIoc(name)} OR dst_endpoint.ip=${quoteIoc(name)}`
-      : kind === 'user'
-        ? `user=${quoteIoc(name)}`
-        : `src_host=${quoteIoc(name)} OR dest_host=${quoteIoc(name)} OR src_ip=${quoteIoc(name)} OR dest_ip=${quoteIoc(name)}`;
+    // NAN-4903: columns from the profile-aware field map; none until known.
+    if (!fieldMap.ready) return fieldMap.guard(() => {})();
+    const keys: SemanticField[] = kind === 'user' ? ['user'] : ['srcHost', 'destHost', 'srcIp', 'destIp'];
+    const q = fieldMap
+      .columnsOf(keys)
+      .map((col) => nplExactEquals(col, name))
+      .join(' OR ');
     drillToEvents(q, firstSeen, lastSeen);
   };
 
@@ -340,14 +319,6 @@ export function RetroView({
         <div className="m-4 rounded-lg border border-[oklch(62%_0.18_28/0.4)] p-4 text-[12px] text-[oklch(72%_0.17_28)]">
           Failed to load retro hunt: {error.message}
         </div>
-      )}
-
-      {durableJob && (
-        <DurableJobNotice
-          job={durableJob}
-          onOpenJobs={onOpenJobs}
-          detail={RETRO_JOB_DETAIL}
-        />
       )}
 
       {!data && loading && (

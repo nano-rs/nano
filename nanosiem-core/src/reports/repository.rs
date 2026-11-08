@@ -14,29 +14,6 @@ use uuid::Uuid;
 
 use super::types::*;
 
-/// NAN-2361: the fixed compatibility tenant every deployment-global writer
-/// lands in (migrations 9000073/9000084/9000230). The dedicated repository
-/// only ever sees this tenant; hosted-shared tenants are reached exclusively
-/// through `crate::shared_reports` inside a signed transaction.
-pub const COMPATIBILITY_TENANT_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0100);
-
-// The tenant column exists only under the enterprise overlay migrations
-// (9000230). The open edition keeps the pre-NAN-2361 SQL; every tenant-aware
-// fragment below is selected at compile time by the feature, and the bound
-// tenant parameter stays in place so the placeholder numbering is identical.
-#[cfg(feature = "enterprise")]
-const DEFINITION_TENANT_PREDICATE: &str = "AND rd.tenant_id = $2";
-#[cfg(not(feature = "enterprise"))]
-const DEFINITION_TENANT_PREDICATE: &str = "AND $2::uuid IS NOT NULL";
-#[cfg(feature = "enterprise")]
-const CLAIMABLE_TENANT_PREDICATE: &str = "AND tenant_id = $4";
-#[cfg(not(feature = "enterprise"))]
-const CLAIMABLE_TENANT_PREDICATE: &str = "AND $4::uuid IS NOT NULL";
-#[cfg(feature = "enterprise")]
-const RUN_CONFLICT_TARGET: &str = "ON CONFLICT (tenant_id, id)";
-#[cfg(not(feature = "enterprise"))]
-const RUN_CONFLICT_TARGET: &str = "ON CONFLICT (id)";
-
 #[derive(Debug, Error)]
 pub enum ReportRepositoryError {
     #[error("Database error: {0}")]
@@ -103,19 +80,15 @@ impl ReportRepository {
         &self,
         id: Uuid,
     ) -> Result<ReportDefinition, ReportRepositoryError> {
-        let row = sqlx::query_as::<_, ReportDefinitionRow>(&format!(
+        let row = sqlx::query_as::<_, ReportDefinitionRow>(
             r#"
             SELECT rd.*, u.name AS owner_name
             FROM report_definitions rd
             LEFT JOIN users u ON u.id = rd.owner_id
             WHERE rd.id = $1
-              -- NAN-2361: hosted-shared tenants' definitions are reachable
-              -- only through the enterprise-shared tenant surface.
-              {DEFINITION_TENANT_PREDICATE}
             "#,
-        ))
+        )
         .bind(id)
-        .bind(COMPATIBILITY_TENANT_ID)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(ReportRepositoryError::DefinitionNotFound(id))?;
@@ -222,16 +195,11 @@ impl ReportRepository {
         node_id: &str,
         stale_timeout_secs: i64,
     ) -> Result<Vec<ClaimedReportDefinition>, ReportRepositoryError> {
-        let rows = sqlx::query_as::<_, ReportDefinitionRow>(&format!(
+        let rows = sqlx::query_as::<_, ReportDefinitionRow>(
             r#"
             WITH claimable AS (
                 SELECT id FROM report_definitions
                 WHERE enabled = true
-                  -- NAN-2361: a hosted-shared tenant's definition is executed
-                  -- only by the per-tenant runner inside that tenant's signed
-                  -- transaction; the deployment-global scheduler claims only
-                  -- compatibility-tenant rows.
-                  {CLAIMABLE_TENANT_PREDICATE}
                   AND next_run_at IS NOT NULL AND next_run_at <= NOW()
                   AND (claimed_by IS NULL OR claimed_at < NOW() - make_interval(secs => $3))
                   -- F-32: never schedule a run for a definition whose OWNER is
@@ -256,11 +224,10 @@ impl ReportRepository {
             WHERE id IN (SELECT id FROM claimable)
             RETURNING *, NULL::text AS owner_name
             "#,
-        ))
+        )
         .bind(batch_size)
         .bind(node_id)
         .bind(stale_timeout_secs as f64)
-        .bind(COMPATIBILITY_TENANT_ID)
         .fetch_all(&self.pool)
         .await?;
 
@@ -348,17 +315,17 @@ impl ReportRepository {
         definition_id: Uuid,
         triggered_by: &str,
     ) -> Result<(), ReportRepositoryError> {
-        sqlx::query(&format!(
+        sqlx::query(
             r#"
             INSERT INTO report_runs (id, definition_id, status, triggered_by, started_at)
             VALUES ($1, $2, 'running', $3, NOW())
-            {RUN_CONFLICT_TARGET} DO UPDATE
+            ON CONFLICT (id) DO UPDATE
                 SET status = 'running', started_at = NOW(),
                     finished_at = NULL, error = NULL,
                     requires_search_sql = FALSE,
                     search_sql_requirement_complete = FALSE
             "#,
-        ))
+        )
         .bind(run_id)
         .bind(definition_id)
         .bind(triggered_by)
@@ -439,7 +406,6 @@ impl ReportRepository {
             .await?;
 
         for artifact in artifacts {
-            let artifact_id = Uuid::now_v7();
             sqlx::query(
                 r#"
                 INSERT INTO report_run_artifacts
@@ -447,7 +413,7 @@ impl ReportRepository {
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 "#,
             )
-            .bind(artifact_id)
+            .bind(Uuid::now_v7())
             .bind(run_id)
             .bind(&artifact.kind)
             .bind(&artifact.filename)

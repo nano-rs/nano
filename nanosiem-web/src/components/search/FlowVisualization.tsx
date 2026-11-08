@@ -2,9 +2,6 @@
 
 import React from 'react';
 import { Percent, TrendingDown } from 'lucide-react';
-import { isPlaceholderValue } from '@/lib/is-placeholder-value';
-import { parseTimestampAsUTC } from '@/lib/date-utils';
-import { formatCellValue } from '@/lib/format-cell-value';
 import { CHART_SERIES } from '@/lib/chart-colors';
 
 interface SearchResult {
@@ -76,9 +73,8 @@ function FunnelVisualization({ results, onDrilldown }: { results: SearchResult[]
       const dropoffPercent = prevCount > 0 ? (dropoff / prevCount) * 100 : 0;
 
       // Use step_name from backend if available, otherwise fall back to "Step N"
-      // ("none" and "-"/"--" are backend placeholders, not real stage names).
       const stepName = result.fields.step_name;
-      const name = stepName && stepName !== 'none' && !isPlaceholderValue(stepName)
+      const name = stepName && stepName !== 'none'
         ? String(stepName)
         : `Step ${level}`;
 
@@ -241,9 +237,7 @@ function parseSequenceResult(fields: Record<string, unknown>): SequenceMatch {
   ]);
 
   for (const [key, value] of Object.entries(fields)) {
-    // "-" is the OCSF "no value" placeholder, not a real label/group value;
-    // formatCellValue keeps Array(String) columns from leaking `["v"]` JSON.
-    const strValue = isPlaceholderValue(value) ? '' : formatCellValue(value);
+    const strValue = value != null ? String(value) : '';
 
     // Check if this is a step field (step1_time, step2_url_domain, etc.)
     const stepMatch = key.match(/^step(\d+)_(.+)$/);
@@ -286,22 +280,21 @@ function parseSequenceResult(fields: Record<string, unknown>): SequenceMatch {
   };
 }
 
-// Format timestamp for display (UTC — matches SequenceView.tsx and the rest
-// of the app's timestamp convention). parseTimestampAsUTC appends `Z` only
-// when the string carries no zone suffix — the old unconditional append
-// doubled the `Z` on already-zoned strings, producing Invalid Date.
+// Format timestamp for display
 function formatStepTime(time: string): string {
   if (!time) return '-';
-  const date = parseTimestampAsUTC(time);
-  if (isNaN(date.getTime())) return time;
-  return date.toLocaleString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    timeZone: 'UTC',
-  });
+  try {
+    const date = new Date(time.replace(' ', 'T') + 'Z');
+    return date.toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+  } catch {
+    return time;
+  }
 }
 
 function SequenceVisualization({ results, onDrilldown }: { results: SearchResult[]; onDrilldown?: FlowVisualizationProps['onDrilldown'] }) {
@@ -371,7 +364,7 @@ function SequenceVisualization({ results, onDrilldown }: { results: SearchResult
                 {/* Entity info */}
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-3 flex-wrap">
-                    {Object.entries(seq.groupFields).filter(([, value]) => value).map(([key, value]) => (
+                    {Object.entries(seq.groupFields).map(([key, value]) => (
                       <span key={key} className="inline-flex items-center gap-1">
                         <span className="text-xs text-muted-foreground">{key}:</span>
                         <span className="font-mono text-sm font-medium truncate max-w-[200px]" title={value}>
@@ -442,7 +435,7 @@ function SequenceVisualization({ results, onDrilldown }: { results: SearchResult
 
                         {/* Captured fields */}
                         <div className="space-y-1">
-                          {Object.entries(step.capturedFields).filter(([, value]) => value).map(([key, value]) => (
+                          {Object.entries(step.capturedFields).map(([key, value]) => (
                             <div key={key} className="flex items-start gap-1">
                               <span className="text-xs text-muted-foreground shrink-0">{key}:</span>
                               <span

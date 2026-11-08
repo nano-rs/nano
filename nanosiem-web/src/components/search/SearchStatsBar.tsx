@@ -5,27 +5,16 @@ import { X, Clock, CalendarRange, CircleCheck, Rows3, Crosshair, Timer, Terminal
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { formatCompactNumber } from '@/lib/date-utils';
 import { useLayoutOptional } from '@/contexts/LayoutContext';
-import type { SearchJobProgress } from '@/lib/api/types';
-import { backgroundJobPhaseLabel, coldScanLabel, hasMeasuredProgress, isColdScanProgress } from '@/lib/cold-scan-progress';
+import type { SearchTimingBreakdown } from '@/lib/search-timing';
 
 interface SearchStatsBarProps {
   isSearching: boolean;
   hasSearched: boolean;
   totalCount: number;
-  /**
-   * NAN-2550: false when `totalCount` is a proven lower bound rather than a
-   * total (a lake page, a native-OTLP page, a clamped ClickHouse count). The
-   * count then renders as `N+`. Defaults to `true` so callers that genuinely
-   * know their count is exact need not pass it.
-   */
-  totalCountExact?: boolean;
   executionTimeMs: number | null;
-  firstRowsMs?: number;
-  completionMs?: number;
-  asyncJobProgress: SearchJobProgress | null;
+  timing?: SearchTimingBreakdown | null;
+  asyncJobProgress: { rows_scanned: number; rows_total: number; percent: number; elapsed_ms: number } | null;
   asyncJobStatus: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | null;
-  /** NAN-3883: the search runs as a durable background job (not a stream). */
-  backgroundJob?: boolean;
   queuePosition: number | null;
   isStreamingResults: boolean;
   onCancel?: () => void;
@@ -54,13 +43,10 @@ export function SearchStatsBar({
   isSearching,
   hasSearched,
   totalCount,
-  totalCountExact = true,
   executionTimeMs,
-  firstRowsMs,
-  completionMs,
+  timing,
   asyncJobProgress,
   asyncJobStatus,
-  backgroundJob = false,
   queuePosition,
   isStreamingResults,
   onCancel,
@@ -72,11 +58,6 @@ export function SearchStatsBar({
 
   const formatTime = (ms: number) =>
     ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(2)}s`;
-
-  // NAN-2550: a lower bound reads as "50+ hits" inline, next to the number it
-  // qualifies. It is a property of the count, not an incident, so it does not
-  // get a banner.
-  const hits = `${formatCompactNumber(totalCount)}${totalCountExact ? '' : '+'}`;
 
   const content = useMemo<React.ReactNode>(() => {
     if (!isSearching && !hasSearched) return null;
@@ -103,14 +84,7 @@ export function SearchStatsBar({
       return (
         <>
           <LoadingIcon className="w-3 h-3 text-primary flex-shrink-0" />
-          {backgroundJob && asyncJobProgress && !hasMeasuredProgress(asyncJobProgress) && !isColdScanProgress(asyncJobProgress) ? (
-            <>
-              <span>{backgroundJobPhaseLabel(asyncJobProgress)}</span>
-              {elapsed && (
-                <Stat icon={<Timer className="w-3 h-3" />}>{elapsed}</Stat>
-              )}
-            </>
-          ) : asyncJobProgress ? (
+          {asyncJobProgress ? (
             <>
               <div className="w-20 h-1 bg-muted rounded-full overflow-hidden flex-shrink-0">
                 <div
@@ -119,9 +93,6 @@ export function SearchStatsBar({
                 />
               </div>
               <span className="tabular-nums">{asyncJobProgress.percent}%</span>
-              {isColdScanProgress(asyncJobProgress) && (
-                <span className="font-mono tabular-nums">{coldScanLabel(asyncJobProgress)}</span>
-              )}
               {asyncJobProgress.rows_total > 0 && (
                 <Stat icon={<Rows3 className="w-3 h-3" />}>
                   {formatCompactNumber(asyncJobProgress.rows_scanned)} / {formatCompactNumber(asyncJobProgress.rows_total)}
@@ -136,7 +107,7 @@ export function SearchStatsBar({
           )}
           {isStreamingResults && totalCount > 0 && (
             <Stat icon={<Crosshair className="w-3 h-3" />}>
-              <span className="font-mono tabular-nums">{hits}</span> hits
+              {formatCompactNumber(totalCount)} hits
             </Stat>
           )}
           {onCancel && (
@@ -156,20 +127,32 @@ export function SearchStatsBar({
       return (
         <>
           <Stat icon={<CircleCheck className="w-3 h-3" style={{ color: 'var(--success)' }} />}>
-            <span style={{ color: 'var(--success)' }}>{firstRowsMs !== undefined && completionMs === undefined ? 'Rows ready' : 'Query complete'}</span>
+            <span style={{ color: 'var(--success)' }}>Query complete</span>
           </Stat>
           <Stat icon={<Crosshair className="w-3 h-3" />}>
-            <span
-              className="font-mono tabular-nums"
-              title={totalCountExact ? undefined : 'At least this many events match; an exact total is not available for this result.'}
-            >
-              {hits}
-            </span>{' '}hits
+            {formatCompactNumber(totalCount)} hits
           </Stat>
-          <Stat icon={<Timer className="w-3 h-3" />}>
-            {firstRowsMs === undefined ? formatTime(executionTimeMs) : `${formatTime(firstRowsMs)} first rows`}
-            {completionMs !== undefined && ` · ${formatTime(completionMs)} complete`}
-          </Stat>
+          {timing?.serverWallMs != null ? (
+            <>
+              <Stat icon={<Timer className="w-3 h-3" />}>
+                <span data-testid="search-server-wall">Server {formatTime(timing.serverWallMs)}</span>
+              </Stat>
+              {timing.queryExecutionMs != null && (
+                <Stat icon={<Timer className="w-3 h-3" />}>
+                  <span data-testid="search-query-execution">Query {formatTime(timing.queryExecutionMs)}</span>
+                </Stat>
+              )}
+              {timing.queueWaitMs != null && (
+                <Stat icon={<Clock className="w-3 h-3" />}>
+                  <span data-testid="search-queue-wait">Queue {formatTime(timing.queueWaitMs)}</span>
+                </Stat>
+              )}
+            </>
+          ) : (
+            <Stat icon={<Timer className="w-3 h-3" />}>
+              {formatTime(executionTimeMs)}
+            </Stat>
+          )}
           {timeWindow && (
             <Stat icon={<CalendarRange className="w-3 h-3" />}>
               <span className="font-mono text-[10.5px] tabular-nums" data-testid="search-time-window">{timeWindow}</span>
@@ -189,15 +172,11 @@ export function SearchStatsBar({
   }, [
     isSearching,
     hasSearched,
-    hits,
     totalCount,
-    totalCountExact,
     executionTimeMs,
-    firstRowsMs,
-    completionMs,
+    timing,
     asyncJobProgress,
     asyncJobStatus,
-    backgroundJob,
     queuePosition,
     isStreamingResults,
     onCancel,

@@ -19,8 +19,6 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
-import { isPlaceholderValue } from '@/lib/is-placeholder-value';
-import { parseTimestampAsUTC } from '@/lib/date-utils';
 import { CHART_OTHER, seriesColor as chartSeriesColor } from '@/lib/chart-colors';
 
 interface SearchResult {
@@ -51,11 +49,7 @@ function formatY(value: number): string {
 function parseTimeBucket(value: unknown): number | null {
   if (typeof value === 'number') return value;
   if (typeof value === 'string') {
-    // UTC-safe parse: the canonical `time_bucket` key arrives Z-normalized
-    // from the backend, but the fallback path (any alias containing "time")
-    // can hand us a naive "YYYY-MM-DD HH:MM:SS" string — treat it as UTC
-    // instead of local time.
-    const d = parseTimestampAsUTC(value);
+    const d = new Date(value);
     if (!isNaN(d.getTime())) return d.getTime();
   }
   return null;
@@ -133,26 +127,33 @@ export function transformResults(results: SearchResult[]): TransformedData {
     if (t) timeKey = t;
   }
 
-  const numericKeys = Object.keys(sample).filter((k) => k !== timeKey && typeof sample[k] === 'number');
+  const serverPivot = results.some((result) => Boolean(result.fields?._timechart));
+  const responseKeys = Array.from(
+    new Set(results.flatMap((result) => Object.keys(result.fields ?? {})))
+  );
+  const valueKeys = serverPivot
+    ? responseKeys.filter((key) => key !== timeKey && key !== '_timechart')
+    : Object.keys(sample).filter((k) => k !== timeKey && typeof sample[k] === 'number');
   const stringKeys = Object.keys(sample).filter((k) => k !== timeKey && typeof sample[k] === 'string');
 
   // Split-by pattern: pivot on the string column(s)
-  const isSplitBy = stringKeys.length >= 1 && numericKeys.length >= 1;
+  const isSplitBy = stringKeys.length >= 1 && valueKeys.length >= 1;
 
   const bucketMap = new Map<number, Record<string, unknown>>();
   const totalsMap = new Map<string, number>();
+  if (serverPivot) {
+    for (const key of valueKeys) totalsMap.set(key, 0);
+  }
 
   if (isSplitBy) {
-    const valueField = numericKeys[0];
+    const valueField = valueKeys[0];
     for (const r of results) {
       const f = r.fields || {};
       const ts = parseTimeBucket(f[timeKey]);
       if (ts == null) continue;
-      // "-"/"--" are OCSF "no value" placeholders — fold them into the same
-      // bucket as null so "-" never gets a first-class series + legend slot.
       const key = stringKeys.length === 1
-        ? (isPlaceholderValue(f[stringKeys[0]]) ? 'unknown' : String(f[stringKeys[0]]))
-        : stringKeys.map((k) => (isPlaceholderValue(f[k]) ? '' : String(f[k]))).join(' / ');
+        ? String(f[stringKeys[0]] ?? 'unknown')
+        : stringKeys.map((k) => String(f[k] ?? '')).join(' / ');
       const v = Number(f[valueField] ?? 0);
       totalsMap.set(key, (totalsMap.get(key) ?? 0) + v);
       let row = bucketMap.get(ts);
@@ -168,17 +169,16 @@ export function transformResults(results: SearchResult[]): TransformedData {
       const ts = parseTimeBucket(f[timeKey]);
       if (ts == null) continue;
       const row: Record<string, unknown> = { [timeKey]: f[timeKey], timestamp: ts };
-      for (const k of numericKeys) {
-        const v = Number(f[k] ?? 0);
+      for (const k of valueKeys) {
+        const v = typeof f[k] === 'number' ? f[k] : null;
         row[k] = v;
-        totalsMap.set(k, (totalsMap.get(k) ?? 0) + v);
+        if (v != null) totalsMap.set(k, (totalsMap.get(k) ?? 0) + v);
       }
       bucketMap.set(ts, row);
     }
   }
 
   const sortedByTotal = Array.from(totalsMap.entries()).sort((a, b) => b[1] - a[1]);
-  const serverPivot = Boolean(sample._timechart);
   const effectiveLimit = serverPivot ? sortedByTotal.length : TOP_N;
   const topKeys = sortedByTotal.slice(0, effectiveLimit).map((x) => x[0]);
   const otherKeys = sortedByTotal.slice(effectiveLimit).map((x) => x[0]);
@@ -192,7 +192,9 @@ export function transformResults(results: SearchResult[]): TransformedData {
       for (const k of otherKeys) {
         other += Number(row[k] ?? 0);
       }
-      for (const k of topKeys) if (row[k] == null) row[k] = 0;
+      if (!serverPivot) {
+        for (const k of topKeys) if (row[k] == null) row[k] = 0;
+      }
       if (otherKeys.length) row.Other = other;
       return row;
     })
@@ -222,8 +224,8 @@ function ChartTooltip({ active, payload, label }: RechartsTooltipProps) {
     try { timeLabel = formatInTimeZone(new Date(label), 'UTC', 'MM/dd HH:mm'); }
     catch { timeLabel = String(label); }
   } else if (typeof label === 'string') {
-    const ts = parseTimeBucket(label);
-    timeLabel = ts != null ? formatInTimeZone(new Date(ts), 'UTC', 'MM/dd HH:mm') : label;
+    const d = new Date(label);
+    timeLabel = !isNaN(d.getTime()) ? formatInTimeZone(d, 'UTC', 'MM/dd HH:mm') : label;
   }
 
   const entries = [...payload]
@@ -267,16 +269,26 @@ interface LegendProps {
   colorFor: (i: number, k: string) => string;
 }
 
-function Sparkline({ values, color, dim }: { values: number[]; color: string; dim: boolean }) {
+function Sparkline({ values, color, dim }: { values: Array<number | null>; color: string; dim: boolean }) {
   if (!values.length) return null;
-  const max = Math.max(1, ...values);
+  const numericValues = values.filter((value): value is number => value != null);
+  if (!numericValues.length) return null;
+  const max = Math.max(1, ...numericValues);
   const W = 44, H = 14;
-  const d = values
-    .map((v, i) => `${((i / Math.max(1, values.length - 1)) * W).toFixed(1)},${(H - (v / max) * H).toFixed(1)}`)
-    .join(' L ');
+  let drawing = false;
+  const d = values.map((value, i) => {
+    if (value == null) {
+      drawing = false;
+      return '';
+    }
+    const point = `${((i / Math.max(1, values.length - 1)) * W).toFixed(1)},${(H - (value / max) * H).toFixed(1)}`;
+    const command = drawing ? 'L' : 'M';
+    drawing = true;
+    return `${command} ${point}`;
+  }).join(' ');
   return (
     <svg width={W} height={H} className="shrink-0">
-      <path d={`M ${d}`} fill="none" stroke={color} strokeWidth={1} strokeOpacity={dim ? 0.5 : 1} />
+      <path d={d} fill="none" stroke={color} strokeWidth={1} strokeOpacity={dim ? 0.5 : 1} />
     </svg>
   );
 }
@@ -302,7 +314,7 @@ function Legend({ seriesKeys, seriesTotals, rows, muted, isolated, onToggleMute,
           {items.map(({ k, i, total }) => {
             const visible = isolated ? k === isolated : !muted.has(k);
             const color = colorFor(i, k);
-            const spark = rows.map((r) => Number(r[k] ?? 0));
+            const spark = rows.map((r) => typeof r[k] === 'number' ? r[k] : null);
             return (
               <div
                 key={k}
@@ -407,21 +419,25 @@ function PivotTable({
         </thead>
         <tbody>
           {rows.map((row, i) => {
-            const total = cols.reduce((s, k) => s + Number(row[k] ?? 0), 0);
+            const values = cols.map((key) => typeof row[key] === 'number' ? row[key] : null);
+            const numericValues = values.filter((value): value is number => value != null);
+            const total = numericValues.reduce((sum, value) => sum + value, 0);
             return (
               <tr key={i} className="border-b border-border/50 hover:bg-foreground/[0.03]">
                 <td className="py-1 px-3 text-foreground">
                   {formatBucketTime(row.timestamp as number)}
                 </td>
                 {cols.map((k) => {
-                  const v = Number(row[k] ?? 0);
+                  const v = typeof row[k] === 'number' ? row[k] : null;
                   return (
                     <td key={k} className="py-1 px-2 text-right text-foreground tabular-nums">
-                      {v || ''}
+                      {v ?? ''}
                     </td>
                   );
                 })}
-                <td className="py-1 px-3 text-right text-foreground font-semibold tabular-nums">{total}</td>
+                <td className="py-1 px-3 text-right text-foreground font-semibold tabular-nums">
+                  {numericValues.length ? total : ''}
+                </td>
               </tr>
             );
           })}
@@ -480,7 +496,13 @@ export function TimechartView({
 
   const spanMetadata = results[0]?.fields?._timechart as { span_seconds?: number } | undefined;
   const seconds = spanMetadata?.span_seconds;
-  const span: Span = seconds ? (seconds % 3600 === 0 ? { n: seconds / 3600, unit: 'h' } : seconds % 60 === 0 ? { n: seconds / 60, unit: 'm' } : { n: seconds, unit: 's' }) : parseSpan(query);
+  const span: Span = seconds
+    ? seconds % 3600 === 0
+      ? { n: seconds / 3600, unit: 'h' }
+      : seconds % 60 === 0
+        ? { n: seconds / 60, unit: 'm' }
+        : { n: seconds, unit: 's' }
+    : parseSpan(query);
   const { aggLabel, by } = parseTimechartHeader(query);
 
   const handleSpan = (s: string) => {

@@ -56,8 +56,10 @@ const SEED_ROUTES = [
   '/cases', '/cases/search', '/playbooks', '/playbooks/new', '/playbooks/repositories',
   '/notebooks', '/marketplace', '/enrichments', '/enrichments/custom/new', '/upload',
   '/ingestion/log-sources', '/ingestion/log-sources/new', '/ingestion/log-sources/wizard',
-  '/ingestion/log-sources/repositories', '/ingestion/credentials',
-  '/ingestion/source-configurations', '/settings', '/settings/user', '/settings/notifications',
+  '/ingestion/log-sources/repositories', '/ingestion/log-sources/credentials',
+  '/ingestion/log-sources/cloud-pull', '/ingestion/log-sources/pull-feeds',
+  // NAN-4941: retired pages, kept as redirects into the Log Sources tabs.
+  '/ingestion/credentials', '/ingestion/pull-feeds', '/ingestion/source-configurations', '/settings', '/settings/user', '/settings/notifications',
   '/settings/search', '/settings/storage', '/settings/ai', '/settings/prevalence',
   '/settings/risk', '/settings/cases', '/settings/cases/queues', '/settings/source-scopes',
   '/settings/access-control', '/settings/oidc', '/settings/audit', '/settings/gdpr',

@@ -15,16 +15,6 @@ import type {
   PrevalenceSettingsResponse,
   UpdatePrevalenceSettingsRequest,
 } from './types';
-import { browserTenantRuntime } from '../tenant-runtime';
-
-/** NAN-3088: a lean (enterprise-shared) tenant's rare list and export are
- * durable jobs on its own Search view. The API's `/api/prevalence/*` answer
- * a 307 there too; calling Search directly avoids the hop. */
-export function leanPrevalencePath(route: 'rare' | 'export'): string {
-  return browserTenantRuntime.current().scope.kind === 'enterprise_shared'
-    ? `/api/search/prevalence/${route}`
-    : `/api/prevalence/${route}`;
-}
 
 export class PrevalenceApi {
   constructor(
@@ -52,10 +42,8 @@ export class PrevalenceApi {
     if (params?.type) searchParams.set('type', params.type);
     if (params?.limit) searchParams.set('limit', String(params.limit));
     if (params?.offset) searchParams.set('offset', String(params.offset));
-    if (params?.job_id) searchParams.set('job_id', params.job_id);
-    if (params?.refresh) searchParams.set('refresh', 'true');
     const query = searchParams.toString();
-    return this.request(`${leanPrevalencePath('rare')}${query ? `?${query}` : ''}`);
+    return this.request(`/api/prevalence/rare${query ? `?${query}` : ''}`);
   }
 
   async getNewArtifacts(params?: NewArtifactsQuery): Promise<ArtifactListResponse> {
@@ -76,20 +64,15 @@ export class PrevalenceApi {
     if (params?.search) searchParams.set('search', params.search);
     if (params?.limit) searchParams.set('limit', String(params.limit));
     if (params?.offset != null) searchParams.set('offset', String(params.offset));
-    if (params?.cursor_last_seen) searchParams.set('cursor_last_seen', params.cursor_last_seen);
-    if (params?.cursor_kind) searchParams.set('cursor_kind', params.cursor_kind);
-    if (params?.cursor_artifact) searchParams.set('cursor_artifact', params.cursor_artifact);
     const query = searchParams.toString();
     return this.request(`/api/prevalence/explorer${query ? `?${query}` : ''}`);
   }
 
-  async getArtifactDetail(artifact: string, window?: string, signal?: AbortSignal): Promise<ArtifactDetailResponse> {
+  async getArtifactDetail(artifact: string, window?: string): Promise<ArtifactDetailResponse> {
     const searchParams = new URLSearchParams();
     searchParams.set('artifact', artifact);
     if (window) searchParams.set('window', window);
-    return this.request(`/api/prevalence/explorer/detail?${searchParams.toString()}`, {
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
-    });
+    return this.request(`/api/prevalence/explorer/detail?${searchParams.toString()}`);
   }
 
   async getPrevalenceScatterData(request: ScatterPlotRequest): Promise<PrevalenceScatterDataResponse> {
@@ -113,7 +96,7 @@ export class PrevalenceApi {
   async getPrevalenceArtifactsForQuery(request: { query: string; time_range: string | { start: string; end: string } }): Promise<{
     hash_points: Array<{
       artifact: string;
-      host_count: number;
+      host_count: number | null;
       first_seen: string;
       last_seen: string;
       total_occurrences: number;
@@ -122,7 +105,7 @@ export class PrevalenceApi {
     }>;
     domain_points: Array<{
       artifact: string;
-      host_count: number;
+      host_count: number | null;
       first_seen: string;
       last_seen: string;
       total_occurrences: number;
@@ -130,7 +113,6 @@ export class PrevalenceApi {
       prevalence_score: number;
     }>;
     rarity_threshold: number;
-    artifacts_truncated: boolean;
   }> {
     return this.request('/api/prevalence/query-artifacts', {
       method: 'POST',

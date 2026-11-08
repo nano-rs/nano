@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { TelemetrySetupHint } from '@/components/observability/TelemetryUnavailable';
+import { TelemetrySetupHint } from '@/components/observability/TelemetrySetupHint';
 
 // Cluster-scoped Kubernetes node and pod inventory. All metrics are real samples;
 // missing samples are explicit. Reuses the app's Select, Table and LoadingIcon.
@@ -30,7 +30,7 @@ import {
 } from '@/components/observability/infra-waffle';
 import type { InfraHost, HostStatus } from '@/lib/api/observability';
 import type { ObservabilityTabProps } from '../types';
-import { nplQuotedBody } from '@/lib/npl-quote';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 
 // The server bounds inventory to 10,000 entities. Fetch that bounded set so
 // switching between nodes/pods cannot silently omit pods behind the node page.
@@ -48,6 +48,7 @@ const STATUS_FILTERS: Array<{ key: HostStatus | 'all'; label: string }> = [
 // ---------------------------------------------------------------------------
 
 function HostDetail({ host, metric }: { host: InfraHost | null; metric: InfraMetric }) {
+  const fieldMap = useSchemaFieldMap();
   if (!host) {
     return (
       <div className="rounded-lg border border-border bg-card p-5 flex flex-col items-center justify-center text-center min-h-[220px]">
@@ -61,16 +62,16 @@ function HostDetail({ host, metric }: { host: InfraHost | null; metric: InfraMet
   }
 
   const tone = toDesignHealth(host.status === 'unknown' ? 'warn' : host.status);
-  // O34 (NAN-1721) / NAN-2370: pivot on the canonical OCSF host path only.
-  //
-  // This used to OR the UDM names (`src_host` / `dest_host` / `hostname`)
-  // alongside the OCSF one. On the lake that is strictly worse than useless:
-  // field validation is all-or-nothing, so a single retired name rejects the
-  // WHOLE predicate and "Explore in search" 400s — the OCSF half never gets a
-  // chance to match. UDM is retired on this branch (NAN-2371), so emit the one
-  // path that resolves.
-  const hq = nplQuotedBody(host.node_name || host.host);
-  const hostSearchQuery = `device.hostname="${hq}"`;
+  // O34 (NAN-1721): pivot on the real UDM/OCSF host columns via an OR-query
+  // (mirrors ServiceSecuritySignals). The old `host.name="…"` resolved to
+  // `ext.host.name` on the logs table, which UDM/OCSF parsers never populate —
+  // so "Explore in search" always came back empty. A pod pivots on its node.
+  // NAN-4903: the active profile's host columns from the field map.
+  const hostSearchQuery = fieldMap.filterAny(
+    ['srcHost', 'destHost', 'host'],
+    host.node_name || host.host,
+    fieldMap.isOcsf ? [] : ['hostname'],
+  );
   const fmtCell = (v: number | null, fmt: (n: number) => string) => (v == null ? '–' : fmt(v));
   const stats: Array<{ k: string; v: string; hot: boolean }> = [
     { k: 'CPU', v: fmtCell(host.cpu_pct, (n) => Math.round(n) + '%'), hot: (host.cpu_pct ?? 0) >= 90 },
@@ -118,7 +119,10 @@ function HostDetail({ host, metric }: { host: InfraHost | null; metric: InfraMet
       </div>
       <div className="p-3 border-t border-border">
         <Link
-          to={`/search#q=${encodeURIComponent(hostSearchQuery)}`}
+          // NAN-4903: no pivot until the tenant's schema profile is known.
+          to={fieldMap.ready ? `/search#q=${encodeURIComponent(hostSearchQuery)}` : '#'}
+          onClick={fieldMap.ready ? undefined : (ev) => { ev.preventDefault(); fieldMap.guard(() => {})(); }}
+          aria-disabled={!fieldMap.ready}
           className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-md border border-border text-[11.5px] text-fg-2 hover:border-border-2 hover:text-foreground"
         >
           <Search className="w-[12px] h-[12px] text-fg-3" />

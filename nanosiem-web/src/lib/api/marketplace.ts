@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import type { InventoryItem } from './marketplace-inventory';
-import type { HostedCollector, HostedCollectorFeed, HostedCollectorInstall, HostedCollectorRotation, HostedFeedCredentialRotation, HostedFeedCredentialRotationResult } from '@/enterprise/api/hosted-collectors';
 
 /**
  * Marketplace API client
@@ -90,7 +88,6 @@ export interface CredentialFieldDef {
 }
 
 export interface EnrichmentMarketplaceRepo {
-  managed_by_platform?: boolean;
   id: string;
   name: string;
   slug: string;
@@ -222,19 +219,15 @@ export interface ArtifactCoverage {
   missing: string[];
   /**
    * NAN-3762: `false` when this deployment has no measurement for the
-   * artifact type yet (shared/lean lake before its first snapshot, or a type
-   * the lake has no signal for). `pct` is then meaningless and must render as
-   * "not measured yet", never 0 %. Absent (open core) means measured.
+   * artifact type yet. `pct` is then meaningless and must render as
+   * "not measured yet", never 0 %. Absent means measured.
    */
   measured?: boolean;
 }
 
 export interface MarketplaceCoverage {
   artifacts: ArtifactCoverage[];
-  /**
-   * Shared/lean deployments report whether any telemetry backs the numbers.
-   * `false` → every row is unmeasured. Absent (open core) → measured.
-   */
+  /** `false` → every row is unmeasured. Absent → measured. */
   telemetry_available?: boolean;
   /**
    * Wall-clock time (ISO-8601 UTC) the underlying SQL was last actually
@@ -256,7 +249,7 @@ export function isCoverageMeasured(coverage: MarketplaceCoverage, row: ArtifactC
 // =============================================================================
 
 /**
- * The native IPinfo Lite IP geo/ASN enrichment is distributed under
+ * The IPinfo Lite IP geo/ASN enrichment (platform feed bundle) is distributed under
  * CC BY-SA 4.0, so any surface that exposes it must carry an attribution
  * credit. This detects the IPinfo entry robustly (slug / name /
  * native_source_id contains "ipinfo", case-insensitive) rather than
@@ -277,71 +270,12 @@ export const CC_BY_SA_4_URL = 'https://creativecommons.org/licenses/by-sa/4.0/';
 // API Client
 // =============================================================================
 
-export type RepositorySyncResponse =
-  | { message: string; managed_by_platform?: false }
-  | { request_id: string; repository_id: string; managed_by_platform: true; status: 'accepted' };
-
 export class MarketplaceApi {
   constructor(
     private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>,
   ) {}
 
   // ── Catalog ──────────────────────────────────────────────────────────
-
-  listInventory(): Promise<InventoryItem[]> {
-    return this.request('/api/marketplace/items');
-  }
-
-  checkout(feedId: string, origin?: 'signup' | 'later'): Promise<import('./marketplace-inventory').CheckoutResponse> {
-    return this.request(`/api/marketplace/items/${encodeURIComponent(feedId)}/checkout`, origin ? {
-      method: 'POST', body: JSON.stringify({ origin }),
-    } : undefined);
-  }
-
-  inventoryEntitlement(feedId: string): Promise<import('./marketplace-inventory').MarketplaceEntitlement> {
-    return this.request(`/api/enrichment/entitlements/${encodeURIComponent(feedId)}`);
-  }
-
-  inventoryDetail(id: string): Promise<InventoryItem> {
-    return this.request(`/api/marketplace/items/${encodeURIComponent(id)}`);
-  }
-
-  toggleInventory(item: InventoryItem): Promise<InventoryItem> {
-    return this.request(`/api/marketplace/items/${encodeURIComponent(item.id)}/toggle`, {
-      method: 'POST', body: JSON.stringify({ enabled: !item.enabled, expected_revision: item.revision }),
-    });
-  }
-
-  hostedCollectors(): Promise<HostedCollector[]> {
-    return this.request('/api/marketplace/collectors');
-  }
-  hostedCollectorFeeds(slug: string): Promise<HostedCollectorFeed[]> {
-    return this.request(`/api/marketplace/collectors/${encodeURIComponent(slug)}`);
-  }
-  installHostedCollector(slug: string, input: HostedCollectorInstall): Promise<{ message: string }> {
-    return this.request(`/api/marketplace/collectors/${encodeURIComponent(slug)}/install`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
-    });
-  }
-  rotateHostedCollectorCredentials(slug: string, input: HostedCollectorRotation): Promise<{ message: string; feeds: string[] }> {
-    return this.request(`/api/marketplace/collectors/${encodeURIComponent(slug)}/credentials`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
-    });
-  }
-  /** NAN-3660: re-issue one feed's ingest credential (no reinstall; the checkpoint is kept). */
-  rotateHostedFeedCredential(slug: string, feedId: string, input: HostedFeedCredentialRotation): Promise<HostedFeedCredentialRotationResult> {
-    return this.request(`/api/marketplace/collectors/${encodeURIComponent(slug)}/feeds/${encodeURIComponent(feedId)}/rotate-credential`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
-    });
-  }
-  enableHostedCollector(slug: string, enabled: boolean): Promise<{ message: string }> {
-    return this.request(`/api/marketplace/collectors/${encodeURIComponent(slug)}`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }),
-    });
-  }
-  uninstallHostedCollector(slug: string): Promise<{ message: string }> {
-    return this.request(`/api/marketplace/collectors/${encodeURIComponent(slug)}`, { method: 'DELETE' });
-  }
 
   async listCatalog(filter?: CatalogFilter): Promise<CatalogListResponse> {
     const params = new URLSearchParams();
@@ -459,8 +393,8 @@ export class MarketplaceApi {
     });
   }
 
-  async syncRepo(id: string): Promise<RepositorySyncResponse> {
-    return this.request<RepositorySyncResponse>(`/api/marketplace/repos/${id}/sync`, {
+  async syncRepo(id: string): Promise<{ message: string }> {
+    return this.request<{ message: string }>(`/api/marketplace/repos/${id}/sync`, {
       method: 'POST',
     });
   }

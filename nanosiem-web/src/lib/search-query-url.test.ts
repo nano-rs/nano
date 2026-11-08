@@ -21,3 +21,26 @@ test('browser search history and copied URLs exclude lookup credentials', () => 
   assert.equal(searchQueryForUrl('| inputlookup url="https://storage.googleapis.com/bucket/x?sig=TEST_CREDENTIAL" | head 2'),
     '| inputlookup url="https://storage.googleapis.com/bucket/x?[REDACTED]" | head 2');
 });
+
+test('ordinary URL literals replay byte for byte; only credential parameters are redacted (NAN-4927 review)', () => {
+  for (const query of [
+    'url.full="https://example.test/download?id=incident-42"',
+    'http_request.url.url_string="https://example.test/a/b?x=1&y=two#frag"',
+    'https://example.test/search?q=error&page=2 | head 5',
+  ]) {
+    assert.equal(searchQueryForUrl(query), query);
+  }
+  assert.equal(
+    searchQueryForUrl('url.full="https://example.test/cb?id=7&access_token=TEST_CREDENTIAL&X-Amz-Signature=TEST_CREDENTIAL"'),
+    'url.full="https://example.test/cb?id=7&access_token=[REDACTED]&X-Amz-Signature=[REDACTED]"',
+  );
+  assert.equal(
+    searchQueryForUrl('url.full="https://example.test/cb#id_token=TEST_CREDENTIAL&state=s1"'),
+    'url.full="https://example.test/cb#id_token=[REDACTED]&state=s1"',
+  );
+  // A lookup URL can carry its credential in any parameter: it stays fully redacted.
+  assert.equal(
+    searchQueryForUrl('error | inputlookup url="https://storage.example.test/x?X-Goog-Credential=TEST_CREDENTIAL&id=1"'),
+    'error | inputlookup url="https://storage.example.test/x?[REDACTED]"',
+  );
+});

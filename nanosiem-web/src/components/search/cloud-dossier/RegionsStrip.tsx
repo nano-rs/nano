@@ -2,6 +2,7 @@
 
 import { Globe, AlertTriangle } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import type { CloudDossierIdentity, CloudDossierRegion } from '@/lib/api/types';
 import { CloudCard, fmtCount } from '../cloud-overview/shared';
 
@@ -20,6 +21,7 @@ export function RegionsStrip({
   onPivotRegion,
   onPivotIp,
 }: RegionsStripProps) {
+  const srcIpField = useSchemaFieldMap().field('srcIp');
   const anomalous = regions.filter((r) => r.anomaly !== null && r.anomaly !== undefined);
   const travelIps = identity.ips.slice(0, 2);
 
@@ -48,7 +50,7 @@ export function RegionsStrip({
                   onClick={() => onPivotIp?.(travelIps[0].ip)}
                   disabled={!onPivotIp}
                   className="text-[oklch(72%_0.17_28)] enabled:hover:underline"
-                  title={onPivotIp ? `Filter by src_ip=${travelIps[0].ip}` : undefined}
+                  title={onPivotIp ? `Filter by ${srcIpField}=${travelIps[0].ip}` : undefined}
                 >
                   {travelIps[0].ip}
                   {travelIps[0].geo ? ` (${travelIps[0].geo})` : ''}
@@ -58,7 +60,7 @@ export function RegionsStrip({
                   onClick={() => onPivotIp?.(travelIps[1].ip)}
                   disabled={!onPivotIp}
                   className="text-[oklch(72%_0.17_28)] enabled:hover:underline"
-                  title={onPivotIp ? `Filter by src_ip=${travelIps[1].ip}` : undefined}
+                  title={onPivotIp ? `Filter by ${srcIpField}=${travelIps[1].ip}` : undefined}
                 >
                   {travelIps[1].ip}
                   {travelIps[1].geo ? ` (${travelIps[1].geo})` : ''}

@@ -84,7 +84,8 @@ describe('pipe context helpers', () => {
 
   it('prefers the preview request error, else the first errored event trace', () => {
     const preview: PipelinePreview = {
-      revision: 1, fingerprint: 'f', inputCount: 1, outputCount: 0, stale: false,
+      revision: 1, fingerprint: 'f', stale: false, engine: 'pipeline', degraded: false,
+      summary: { inputEvents: 1, outputEvents: 0, droppedEvents: 0, errorEvents: 1, inputBytes: 2, outputBytes: 0 },
       events: [{ inputId: 'e1', input: {}, outputs: [], outcome: 'error', error: 'aborted', trace: [{ stepId: 'v', outputs: [], error: 'function call error' }] }],
     };
     expect(previewIssue(preview, 'worker down')).toBe('worker down');

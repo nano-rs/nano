@@ -14,7 +14,6 @@ import {
 import type {
   PipelineLaneInput,
   PipelinePreview,
-  PipelinePreviewEvent,
   PipelineSample,
 } from '@/lib/pipeline-types';
 import {
@@ -26,6 +25,18 @@ import {
 import { cn } from '@/lib/utils';
 import { DEFAULT_RECENT_EVENTS, MAX_RECENT_EVENTS } from '@/lib/api/pipelines';
 import { PREVIEW_SCOPE_DETAILS, PREVIEW_SCOPE_NOTE } from '@/lib/pipeline-model';
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+}
+
+function byteChange(before: number, after: number): string {
+  if (!before) return '';
+  const change = Math.round(((after - before) / before) * 100);
+  return change === 0 ? '' : ` (${change > 0 ? '+' : ''}${change}%)`;
+}
 
 const PASTE_PLACEHOLDER = '{"EventID":1,"Image":"C:\\Windows\\System32\\cmd.exe"}\n<134>Oct  9 10:00:00 fw01 action=allow src=10.0.0.5';
 
@@ -72,6 +83,7 @@ function PreviewScopeNote({ extra }: { extra?: string }) {
 function SampleSources({
   primary,
   disabled,
+  recentDisabled = false,
   loading,
   count,
   onCountChange,
@@ -83,6 +95,8 @@ function SampleSources({
   count: string;
   onCountChange: (count: string) => void;
   disabled: boolean;
+  /** Recent events need search:execute; paste does not. */
+  recentDisabled?: boolean;
   loading: boolean;
   onLoadRecent?: (limit: number) => void;
   onPasteSample?: (text: string) => void;
@@ -102,7 +116,8 @@ function SampleSources({
             <Button
               variant={primary ? 'default' : 'outline'}
               className={size}
-              disabled={disabled || loading || !validCount}
+              disabled={disabled || recentDisabled || loading || !validCount}
+              title={recentDisabled ? 'Reading stored events requires search:execute' : undefined}
               onClick={() => onLoadRecent(limit)}
             >
               <History
@@ -119,7 +134,7 @@ function SampleSources({
               max={MAX_RECENT_EVENTS}
               className={cn('w-14 font-mono', primary ? 'h-7 text-[11.5px]' : 'h-6 text-[10.5px]')}
               value={count}
-              disabled={disabled || loading}
+              disabled={disabled || recentDisabled || loading}
               onChange={(event) => onCountChange(event.target.value)}
             />
           </>
@@ -308,16 +323,16 @@ function PreviewInputSelect({
 
 export function PipelinePreviewPanel({
   sample,
-  samples,
   preview,
   revision,
   pending,
-  canViewEvents,
+  canPreview,
+  canReadEvents,
+  degraded = false,
   available,
   unavailableReason,
   error,
   selectedStepId,
-  onSampleSelect,
   onPreview,
   onLoadRecent,
   onPasteSample,
@@ -330,17 +345,20 @@ export function PipelinePreviewPanel({
   onPreviewInputChange,
 }: {
   sample?: PipelineSample | null;
-  samples: PipelineSample[];
-  preview?: (PipelinePreview & { warnings?: string[] }) | null;
+  preview?: PipelinePreview | null;
   revision: number;
   pending: boolean;
-  canViewEvents: boolean;
+  /** Preview runs tenant-authored code: log_sources:edit. */
+  canPreview: boolean;
+  /** Reading stored/tapped events: search:execute. */
+  canReadEvents: boolean;
+  /** The preview worker runs without Linux resource limits. */
+  degraded?: boolean;
   available: boolean;
   unavailableReason?: string;
   /** The last preview run failed; cleared by the next successful run. */
   error?: string | null;
   selectedStepId: string | null;
-  onSampleSelect: (sample: PipelineSample) => void;
   onPreview: () => void;
   /** NAN-3447: load the source's newest stored raw events as browser-only input. */
   onLoadRecent?: (limit: number) => void;
@@ -365,12 +383,12 @@ export function PipelinePreviewPanel({
   const [view, setView] = useState<'diff' | 'in' | 'out'>('diff');
   const [search, setSearch] = useState('');
   const [traceMode, setTraceMode] = useState<'final' | 'selected'>('final');
-  if (!canViewEvents)
+  if (!canPreview)
     return (
       <div className="p-3">
-        <PipelineNotice title="Source-event permission required">
-          Your role can read configuration, but cannot view captured or
-          previewed event payloads.
+        <PipelineNotice title="Edit permission required">
+          Draft preview runs pipeline code and requires log_sources:edit.
+          Your role can read the configuration.
         </PipelineNotice>
       </div>
     );
@@ -394,7 +412,7 @@ export function PipelinePreviewPanel({
   const outputs = trace?.outputs ?? selected?.outputs ?? [];
   const output =
     outputs[Math.min(outputIndex, Math.max(0, outputs.length - 1))];
-  const outcomeText: Partial<Record<PipelinePreviewEvent['outcome'], string>> =
+  const outcomeText: Partial<Record<string, string>> =
     {
       filtered: 'Filtered by the draft pipeline.',
       sampled_out: 'Sampled out by the draft pipeline.',
@@ -419,37 +437,15 @@ export function PipelinePreviewPanel({
           </span>
         </div>
         <div className="flex items-center gap-2">
-          <select
-            aria-label="Input sample"
-            className="h-7 min-w-0 flex-1 rounded-md border border-border bg-input px-2 text-[11.5px]"
-            value={sample?.id ?? ''}
-            onChange={(event) => {
-              const chosen = samples.find(
-                (item) => item.id === event.target.value
-              );
-              if (chosen) {
-                setSelectedId(null);
-                setOutputIndex(0);
-                setInputIndex(0);
-                onSampleSelect(chosen);
-              }
-            }}
-          >
-            <option value="">Choose saved input sample</option>
-            {sample && !samples.some((item) => item.id === sample.id) && (
-              <option value={sample.id}>{sample.name}</option>
-            )}
-            {samples.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name}
-              </option>
-            ))}
-          </select>
+          <span className="min-w-0 flex-1 truncate font-mono text-[10.5px] text-muted-foreground">
+            {sample ? 'Browser-only input · never saved' : 'Load recent events, tap live input, or paste a sample'}
+          </span>
           <Button
             variant="outline"
             className="h-7 text-[11.5px]"
             onClick={onPreview}
             disabled={!sample || !available || pending}
+            title={!sample ? 'Choose an input first' : undefined}
           >
             <RefreshCw
               className={cn('h-3.5 w-3.5', pending && 'animate-spin')}
@@ -470,6 +466,7 @@ export function PipelinePreviewPanel({
           <SampleSources
             primary={false}
             disabled={pending}
+            recentDisabled={!canReadEvents}
             loading={loadingRecent}
             count={recentCount}
             onCountChange={setRecentCount}
@@ -488,10 +485,15 @@ export function PipelinePreviewPanel({
         {!available && (
           <PipelineNotice title="Runtime preview unavailable">
             {unavailableReason ??
-              'The runtime has not advertised preview support. Captures and saved samples remain inspectable.'}
+              'This deployment does not run draft preview. Loaded events remain inspectable.'}
           </PipelineNotice>
         )}
         {available && <PreviewScopeNote extra={unavailableReason} />}
+        {available && degraded && (
+          <p className="text-[10.5px] text-warning">
+            Preview worker runs without resource limits on this host (development isolation).
+          </p>
+        )}
         {available && error && (
           <PipelineNotice title="Preview failed" tone="error">
             {error}
@@ -507,12 +509,14 @@ export function PipelinePreviewPanel({
           </PipelineNotice>
         )}
         {preview && (
-          <div className="flex flex-wrap gap-3 font-mono text-[10.5px] text-muted-foreground">
+          <div className="flex flex-wrap gap-3 font-mono text-[10.5px] text-muted-foreground" data-testid="preview-summary">
             <span>
-              Sample results · {preview.inputCount} IN → {preview.outputCount}{' '}
-              OUT
+              {preview.summary.inputEvents} IN → {preview.summary.outputEvents} OUT
             </span>
-            <span>Isolated preview state</span>
+            {preview.summary.droppedEvents > 0 && <span>{preview.summary.droppedEvents} dropped</span>}
+            {preview.summary.errorEvents > 0 && <span className="text-destructive">{preview.summary.errorEvents} errors</span>}
+            <span>{formatBytes(preview.summary.inputBytes)} → {formatBytes(preview.summary.outputBytes)}{byteChange(preview.summary.inputBytes, preview.summary.outputBytes)}</span>
+            <span>engine {preview.engine}</span>
           </div>
         )}
       </div>
@@ -524,9 +528,7 @@ export function PipelinePreviewPanel({
           {sample?.events.length ? (
             <>
               <div className="border-b border-border px-3 py-2 font-mono text-[10.5px] text-muted-foreground">
-                {sample.origin === 'recent' || sample.origin === 'pasted'
-                  ? 'Browser-only input'
-                  : 'Frozen input'}{' '}
+                {sample.origin === 'tap' ? 'Live tap input' : sample.origin === 'recent' ? 'Recent stored events' : 'Pasted input'}{' '}
                 · {sample.events.length} events · output has not been computed
               </div>
               <div
@@ -565,20 +567,17 @@ export function PipelinePreviewPanel({
                 <p className="text-[12px] font-medium text-foreground">No preview input yet</p>
                 <p className="text-[11.5px] text-muted-foreground">
                   Preview runs this draft on raw events before any parsing. Load
-                  the newest events stored for this source, or paste raw events
-                  — one per line, or a JSON array. Input stays in this browser and
-                  is never saved; draft preview never changes production.
+                  the newest events stored for this source, capture a live tap,
+                  or paste raw events (one per line, or a JSON array). Input stays
+                  in this browser and is never saved; draft preview never changes
+                  production.
                 </p>
-                {samples.length > 0 && (
-                  <p className="text-[11px] text-muted-foreground">
-                    Saved input samples are also available in the list above.
-                  </p>
-                )}
               </div>
               {(onLoadRecent || onPasteSample) && (
                 <SampleSources
                   primary
                   disabled={pending}
+                  recentDisabled={!canReadEvents}
                   loading={loadingRecent}
                   count={recentCount}
                   onCountChange={setRecentCount}

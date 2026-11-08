@@ -22,6 +22,15 @@
          At 256MB can cache ~2 billion granule entries -->
     <query_condition_cache_size>268435456</query_condition_cache_size> <!-- 256MB -->
 
+    <!-- NAN-4934: text-index caches (tier: large). Caps, not reservations (SLRU,
+         filled on demand); they sit outside the per-query memory limit but inside
+         max_server_memory_usage. The 26.x defaults are 1 GB / 1 GB / 2 GB. The
+         header cache needs ~300 B per (part, index), so it never needs 1 GB;
+         postings (decoded posting lists) is the one that grows. Known to 26.8 too. -->
+    <text_index_tokens_cache_size>1073741824</text_index_tokens_cache_size> <!-- 1GB -->
+    <text_index_header_cache_size>268435456</text_index_header_cache_size> <!-- 256MB -->
+    <text_index_postings_cache_size>2147483648</text_index_postings_cache_size> <!-- 2GB -->
+
     <!-- =======================================================================
          BACKGROUND POOLS (Server-level)
          ======================================================================= -->
@@ -39,15 +48,18 @@
          CONCURRENT QUERY LIMITS (Server-level)
          ======================================================================= -->
 
-    <max_concurrent_queries>500</max_concurrent_queries>
-    <max_concurrent_insert_queries>200</max_concurrent_insert_queries>
-    <max_concurrent_select_queries>300</max_concurrent_select_queries>
+    <!-- Conservative open-core default for 2-6 GiB nodes. Large/xlarge Helm
+         presets override these explicitly. -->
+    <max_concurrent_queries>100</max_concurrent_queries>
+    <max_concurrent_insert_queries>50</max_concurrent_insert_queries>
+    <max_concurrent_select_queries>75</max_concurrent_select_queries>
+    <concurrent_threads_scheduler>round_robin</concurrent_threads_scheduler>
 
     <!-- =======================================================================
          ASYNC INSERT THREADS (Server-level)
          ======================================================================= -->
 
-    <async_insert_threads>8</async_insert_threads>
+    <async_insert_threads>4</async_insert_threads>
 
     <!-- =======================================================================
          DICTIONARY CONFIGURATION (Server-level)

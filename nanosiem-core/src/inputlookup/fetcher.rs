@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use url::Url;
 use governor::{
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
@@ -21,7 +22,6 @@ use governor::{
 use reqwest::{redirect::Policy, Client, Response};
 use thiserror::Error;
 use tracing::{debug, warn};
-use url::Url;
 
 use super::ssrf::{SsrfConfig, SsrfError, SsrfValidator};
 use super::types::InputLookupConfig;
@@ -219,11 +219,7 @@ impl UrlFetcher {
             // (this fn recurses per hop).
             let (validated, addrs) = self.validator.validate_and_resolve(url).await?;
             let client = self.pinned_client(&validated, &addrs)?;
-            let response = client
-                .get(validated.clone())
-                .timeout(timeout)
-                .send()
-                .await?;
+            let response = client.get(validated.clone()).timeout(timeout).send().await?;
 
             // Handle redirects (Policy::none, so 3xx surfaces here).
             if response.status().is_redirection() {

@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Versioned processing plans stored with a source's existing parser revision.
+//! Nano Pipe (NAN-4919, port of main NAN-3418): versioned processing plans
+//! stored with a log source's existing parser revision (`parser_vrl`), so the
+//! source's draft / publish / versions / revert machinery carries them.
+//!
 //! The fixed body is a marker, never user-supplied executable configuration.
-//! Publication and preview compile the same validated plan.
+//! Publication, deploy and preview compile the same validated plan, and every
+//! piece of tenant VRL in it (advanced steps, conditions, route predicates)
+//! compiles through [`super::vrl_guard`] against the event-parser ALLOWLIST
+//! ([`super::vrl_functions::parser_vrl_functions`]). Compiler-generated code
+//! (masking, sampling, lookup tables, the combine envelope) only calls
+//! allowlisted functions too, so nothing here widens the parser registry.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,8 +25,12 @@ pub const STATELESS_KINDS: &[&str] = &[
 ];
 pub const MAX_OUTPUTS: usize = 1000;
 pub mod batch;
+pub mod guard;
 pub mod input;
 pub mod native;
+pub mod preview;
+pub mod sandbox;
+pub mod tap;
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -176,8 +188,48 @@ impl Plan {
     }
 }
 
-fn quote(value: &str) -> String {
-    serde_json::to_string(value).expect("string serialization")
+/// `value` as a VRL string literal. VRL does not accept JSON's `\uXXXX`
+/// escapes (NAN-4919: main's JSON quoting made any control character in a
+/// set value, mask replacement or lookup cell an uncompilable program), so
+/// escape with VRL's own forms. `{`/`}` are escaped so no VRL version reads a
+/// template out of tenant data.
+pub(crate) fn quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '{' => out.push_str("\\{"),
+            '}' => out.push_str("\\}"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A JSON value as a VRL literal (set values, lookup snapshots).
+pub(crate) fn vrl_value(value: &Value) -> String {
+    match value {
+        Value::Object(map) => format!(
+            "{{ {} }}",
+            map.iter()
+                .map(|(k, v)| format!("{}: {}", quote(k), vrl_value(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Array(values) => format!(
+            "[{}]",
+            values.iter().map(vrl_value).collect::<Vec<_>>().join(", ")
+        ),
+        Value::String(s) => quote(s),
+        other => other.to_string(),
+    }
 }
 fn indent(code: &str) -> String {
     code.lines()
@@ -206,6 +258,9 @@ pub fn field(value: &str) -> Result<String, String> {
         "_nano_pipe_metadata",
         "_nano_pipe_keys",
         "_nano_pipe_scope",
+        // Protected parser-health identity stamped after the pipeline runs.
+        "_nano_parser_id",
+        "_nano_parser_failure",
     ]
     .contains(&parts[0])
         || parts[0] == "metadata"
@@ -365,8 +420,7 @@ fn field_operation(
         "remove" => Ok(format!("del({path})")),
         "set" => Ok(format!(
             "{path} = {}",
-            serde_json::to_string(config.get("value").ok_or("A JSON value is required")?)
-                .map_err(|e| e.to_string())?
+            vrl_value(config.get("value").ok_or("A JSON value is required")?)
         )),
         _ => Err("Choose rename, remove or set".into()),
     }
@@ -455,6 +509,7 @@ pub fn compile_step(step: &Step) -> Result<String, String> {
             if code.trim().is_empty() {
                 return Err("Add VRL code".into());
             }
+            refuse_metadata_writes(code)?;
             code.to_string()
         }
         "parse" => {
@@ -538,6 +593,37 @@ pub fn compile_step(step: &Step) -> Result<String, String> {
     })
 }
 
+/// Advanced VRL may read Vector `%` metadata but never write it: the input
+/// identity (`%nano_credential_id`), the bound route (`%nano_credential_name`)
+/// and the routing key (`%source_type`) are platform-stamped, and Route by
+/// input trusts them. Checked with VRL's own read-only-path analysis (every
+/// assignment form, `del`), not a text pattern.
+///
+/// A step that does not compile on its own (it uses a variable an earlier
+/// step set) is checked when the whole program compiles: every plan program
+/// is compiled metadata-read-only by the validator, the preview engine and
+/// the deploy guard ([`compile_plan_program`]).
+pub fn refuse_metadata_writes(code: &str) -> Result<(), String> {
+    let fns = super::vrl_functions::parser_vrl_functions();
+    if super::vrl_guard::compile(code, &fns).is_ok()
+        && super::vrl_guard::compile_metadata_read_only(code, &fns).is_err()
+    {
+        return Err("Advanced VRL cannot write or delete event metadata (%...)".into());
+    }
+    Ok(())
+}
+
+/// Compile a generated plan program the one sanctioned way: guarded, on the
+/// parser allowlist, with event metadata read-only.
+pub fn compile_plan_program(
+    code: &str,
+) -> Result<super::vrl_guard::Compiled, super::vrl_guard::VrlCompileError> {
+    super::vrl_guard::compile_metadata_read_only(
+        code,
+        &super::vrl_functions::parser_vrl_functions(),
+    )
+}
+
 fn sequence(steps: &[&Step], depth: usize) -> Result<String, String> {
     let Some((step, rest)) = steps.split_first() else {
         return Ok(".".into());
@@ -583,31 +669,6 @@ fn sequence(steps: &[&Step], depth: usize) -> Result<String, String> {
 
 pub fn runtime_program(source: &str) -> Result<String, String> {
     stored_plan(source)?.map_or_else(|| Ok(source.to_string()), |plan| plan.program())
-}
-
-/// Offline sample classification for release tests. Uses the same restricted
-/// function registry as preview; a runtime error never predicts an intentional
-/// drop. This runs inside the bounded parser-bundle build job.
-pub fn evaluate(plan: &Plan, input: &Value) -> Result<Value, String> {
-    use vrl::compiler::{runtime::Runtime, state::RuntimeState, TargetValue, TimeZone};
-    use vrl::value::{Secrets, Value as VrlValue};
-    let source = plan.program()?;
-    let program = super::vrl_guard::compile(&source, &super::validator::safe_vrl_functions())
-        .map_err(|e| e.render(&source))?
-        .program;
-    let mut target = TargetValue {
-        value: VrlValue::from(input.clone()),
-        metadata: VrlValue::Object(Default::default()),
-        secrets: Secrets::new(),
-    };
-    Runtime::new(RuntimeState::default())
-        .resolve(
-            &mut target,
-            &program,
-            &TimeZone::parse("UTC").expect("UTC timezone"),
-        )
-        .map_err(|e| e.to_string())?;
-    serde_json::to_value(target.value).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

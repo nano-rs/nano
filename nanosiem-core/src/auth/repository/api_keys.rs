@@ -5,10 +5,11 @@
 //! Requirements: 12.1, 12.4, 12.6, 12.8, 12.10
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::audit::{AuditEvent, SecurityAuditOutbox};
 use crate::auth::types::ApiKey;
 
 #[derive(Error, Debug)]
@@ -49,6 +50,60 @@ impl ApiKeyRepository {
         rate_limit: Option<i32>,
         created_by: Option<Uuid>,
     ) -> Result<ApiKey, ApiKeyRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let api_key = Self::insert_key(
+            &mut tx, name, description, key_hash, key_prefix, permissions, expires_at,
+            rate_limit, created_by,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(api_key)
+    }
+
+    /// [`Self::create_key`] plus the security-critical audit record, committed
+    /// in ONE transaction (NAN-4954): the key exists if and only if its
+    /// `apikey_created` event is recorded in `security_audit_events`. `audit`
+    /// builds the event from the inserted row (it needs the new id).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_key_audited<F>(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        key_hash: &str,
+        key_prefix: &str,
+        permissions: &[String],
+        expires_at: Option<DateTime<Utc>>,
+        rate_limit: Option<i32>,
+        created_by: Option<Uuid>,
+        audit: F,
+    ) -> Result<(ApiKey, AuditEvent), ApiKeyRepositoryError>
+    where
+        F: FnOnce(&ApiKey) -> AuditEvent,
+    {
+        let mut tx = self.pool.begin().await?;
+        let api_key = Self::insert_key(
+            &mut tx, name, description, key_hash, key_prefix, permissions, expires_at,
+            rate_limit, created_by,
+        )
+        .await?;
+        let event = audit(&api_key);
+        SecurityAuditOutbox::enqueue_tx(&mut tx, &event).await?;
+        tx.commit().await?;
+        Ok((api_key, event))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_key(
+        tx: &mut Transaction<'_, Postgres>,
+        name: &str,
+        description: Option<&str>,
+        key_hash: &str,
+        key_prefix: &str,
+        permissions: &[String],
+        expires_at: Option<DateTime<Utc>>,
+        rate_limit: Option<i32>,
+        created_by: Option<Uuid>,
+    ) -> Result<ApiKey, ApiKeyRepositoryError> {
         let api_key = sqlx::query_as::<_, ApiKey>(
             r#"
             INSERT INTO api_keys (name, description, key_hash, key_prefix, permissions, expires_at, rate_limit, created_by)
@@ -64,7 +119,7 @@ impl ApiKeyRepository {
         .bind(expires_at)
         .bind(rate_limit)
         .bind(created_by)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut **tx)
         .await?;
 
         Ok(api_key)
@@ -131,6 +186,44 @@ impl ApiKeyRepository {
         Ok(api_key)
     }
 
+    /// Candidate keys for a presented credential, with their fast verifier
+    /// digest (NAN-3798 port). Prefix-indexed: validation no longer loads the
+    /// whole table on every request.
+    pub async fn list_candidates_by_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(ApiKey, Option<Vec<u8>>)>, ApiKeyRepositoryError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            #[sqlx(flatten)]
+            key: ApiKey,
+            key_digest: Option<Vec<u8>>,
+        }
+        let rows = sqlx::query_as::<_, Row>("SELECT * FROM api_keys WHERE key_prefix = $1")
+            .bind(prefix)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| (r.key, r.key_digest)).collect())
+    }
+
+    /// Store the fast verifier digest for a key, only while `key_hash` is
+    /// still the hash the digest was computed from. A concurrent reset that
+    /// changed the hash makes this a no-op instead of pinning a stale digest.
+    pub async fn set_key_digest(
+        &self,
+        id: Uuid,
+        key_hash: &str,
+        digest: &[u8],
+    ) -> Result<(), ApiKeyRepositoryError> {
+        sqlx::query("UPDATE api_keys SET key_digest = $3 WHERE id = $1 AND key_hash = $2")
+            .bind(id)
+            .bind(key_hash)
+            .bind(digest)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// List all API keys (masked - key_hash is not exposed in responses)
     /// Requirements: 12.8
     pub async fn list_keys(&self) -> Result<Vec<ApiKey>, ApiKeyRepositoryError> {
@@ -177,6 +270,27 @@ impl ApiKeyRepository {
             return Err(ApiKeyRepositoryError::NotFound(id));
         }
 
+        Ok(())
+    }
+
+    /// [`Self::delete_key`] plus the security-critical audit record in ONE
+    /// transaction (NAN-4954): the key is gone if and only if its
+    /// `apikey_deleted` event is recorded.
+    pub async fn delete_key_audited(
+        &self,
+        id: Uuid,
+        event: &AuditEvent,
+    ) -> Result<(), ApiKeyRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("DELETE FROM api_keys WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiKeyRepositoryError::NotFound(id));
+        }
+        SecurityAuditOutbox::enqueue_tx(&mut tx, event).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -239,7 +353,7 @@ impl ApiKeyRepository {
     ) -> Result<ApiKey, ApiKeyRepositoryError> {
         let api_key = sqlx::query_as::<_, ApiKey>(
             r#"
-            UPDATE api_keys SET key_hash = $2, key_prefix = $3
+            UPDATE api_keys SET key_hash = $2, key_prefix = $3, key_digest = NULL
             WHERE id = $1
             RETURNING *
             "#,

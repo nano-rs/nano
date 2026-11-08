@@ -39,6 +39,49 @@ mod tests {
     }
 
     #[test]
+    fn indicator_feeds_with_leading_comments_stay_headerless() {
+        // A common feed shape: a comment banner, blank lines, then one
+        // indicator per line. Detection and parsing must agree that the data
+        // starts at the first IP, and neither may turn a comment into a column.
+        let feed = "# updated 2026-11-02\n# source: example blocklist\n\n198.51.100.4\n203.0.113.9\n# trailing note\n192.0.2.10\n";
+        assert!(!FileParser::detect_has_header(feed.as_bytes(), ','));
+        let result = FileParser::new()
+            .parse(feed.as_bytes(), &ParserConfig::csv())
+            .unwrap();
+        assert_eq!(result.headers, Some(vec!["ip".to_string()]));
+        assert_eq!(result.successful, 3, "{:?}", result.errors);
+        let ips: Vec<String> = result
+            .records
+            .iter()
+            .map(|r| r.fields["ip"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ips, ["198.51.100.4", "203.0.113.9", "192.0.2.10"]);
+
+        // The scheduler resolves the choice once from the first payload.
+        assert!(!FileParser::resolve_has_header(feed.as_bytes(), &ParserConfig::csv()));
+
+        // A legacy one-column table keeps its stored name on the same feed.
+        let legacy: ParserConfig = serde_json::from_str("{\"format\":\"csv\"}").unwrap();
+        let recovered =
+            FileParser::config_for_existing_column(feed.as_bytes(), &legacy, "col_198_51_100_4");
+        let result = FileParser::new().parse(feed.as_bytes(), &recovered).unwrap();
+        assert_eq!(result.successful, 3);
+        assert_eq!(result.headers, Some(vec!["col_198_51_100_4".to_string()]));
+    }
+
+    #[test]
+    fn a_hash_that_does_not_open_the_file_is_data() {
+        // Comment skipping is gated on the payload opening with one, so a
+        // headered CSV whose values start with `#` is unchanged.
+        let csv = "tag,count\n#ops,3\n#sec,5\n";
+        let result = FileParser::new()
+            .parse(csv.as_bytes(), &ParserConfig::csv())
+            .unwrap();
+        assert_eq!(result.headers, Some(vec!["tag".to_string(), "count".to_string()]));
+        assert_eq!(result.successful, 2);
+    }
+
+    #[test]
     fn explicit_header_choice_and_legacy_column_recovery() {
         let content = b"1.0.164.165\n1.0.212.159\n";
         let config = ParserConfig::csv().with_headers(true);

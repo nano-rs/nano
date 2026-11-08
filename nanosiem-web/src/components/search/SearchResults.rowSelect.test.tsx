@@ -7,7 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { SearchResults } from './SearchResults';
+import { SearchResults, FieldValueMenu } from './SearchResults';
+import userEvent from '@testing-library/user-event';
 
 vi.mock('@/lib/api', () => ({
   api: { getSchemaFields: async () => ({ schema: 'udm', fields: [] }) },
@@ -217,5 +218,23 @@ describe('long message expander and value menus', () => {
     plainClick(chipValue);
     await waitFor(() => expect(screen.getByText('Add to filter')).toBeTruthy());
     expect(isExpanded()).toBe(false);
+  });
+});
+
+describe('selectable field-value keyboard menu', () => {
+  it.each(['{Enter}', ' '])('opens with %j and restores focus on Escape', async key => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(['schema-fields'], { schema: 'udm', fields: [] });
+    render(<QueryClientProvider client={client}><MemoryRouter>
+      <FieldValueMenu fieldName="src_ip" value="10.0.0.1" displayValue="10.0.0.1" onAddToQuery={vi.fn()} query="*" />
+    </MemoryRouter></QueryClientProvider>);
+    const user = userEvent.setup();
+    const trigger = screen.getByRole('button', { name: '10.0.0.1' });
+    await user.tab();expect(document.activeElement).toBe(trigger);
+    await user.keyboard(key);
+    await waitFor(() => expect(screen.getByRole('menu')).toBeTruthy());
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+    expect(document.activeElement).toBe(trigger);
   });
 });

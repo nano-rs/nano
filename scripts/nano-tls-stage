@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# Privileged one-time staging for sovereign role-split TLS material.
+set -euo pipefail
+umask 077
+
+usage() {
+  cat <<'EOF'
+Usage: sudo scripts/nano-tls-stage \
+  --cert /root/source/server.crt --key /root/source/server.key \
+  --ca /root/source/ca.crt --output /var/lib/nano/tls/staged \
+  --installer-user USER
+
+Copies root-owned TLS files from non-writable root-controlled directories into
+a root:nano-tls staging bundle and adds USER to the dedicated nano-tls
+supplementary group. The private key must be mode 0600. Start a new login
+session after this command, then point inventory cluster.tls paths at OUTPUT.
+OUTPUT must be a direct child of /var/lib/nano/tls using a simple file name.
+EOF
+}
+
+cert=""
+key=""
+ca=""
+output=""
+installer_user="${SUDO_USER:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cert) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; cert="$2"; shift 2 ;;
+    --key) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; key="$2"; shift 2 ;;
+    --ca) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; ca="$2"; shift 2 ;;
+    --output) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; output="$2"; shift 2 ;;
+    --installer-user) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; installer_user="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+[[ $(id -u) == 0 ]] || { printf 'nano-tls-stage must run as root (use sudo).\n' >&2; exit 1; }
+[[ -n "$cert" && -n "$key" && -n "$ca" && -n "$output" && -n "$installer_user" ]] \
+  || { usage >&2; exit 2; }
+output_root=/var/lib/nano/tls
+[[ "$output" =~ ^/var/lib/nano/tls/[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] \
+  || { printf '%s\n' '--output must be /var/lib/nano/tls/NAME (NAME uses only letters, digits, dot, underscore, or hyphen).' >&2; exit 2; }
+id "$installer_user" >/dev/null 2>&1 \
+  || { printf 'Installer user does not exist: %s\n' "$installer_user" >&2; exit 1; }
+for source_file in "$cert" "$key" "$ca"; do
+  [[ "$source_file" == /* ]] \
+    || { printf 'TLS source paths must be absolute: %s\n' "$source_file" >&2; exit 2; }
+done
+
+validate_output_ancestor() {
+  local directory="$1" directory_uid directory_mode directory_mode_value
+  [[ ! -L "$directory" && -d "$directory" ]] \
+    || { printf 'TLS output ancestor must be a non-symlink directory: %s\n' "$directory" >&2; exit 1; }
+  directory_uid=$(stat -c '%u' -- "$directory")
+  directory_mode=$(stat -c '%a' -- "$directory")
+  directory_mode_value=$((8#$directory_mode))
+  [[ "$directory_uid" == 0 ]] \
+    || { printf 'TLS output ancestor must be root-owned: %s\n' "$directory" >&2; exit 1; }
+  (( (directory_mode_value & 0022) == 0 )) \
+    || { printf 'TLS output ancestor must not be writable by group or other: %s\n' "$directory" >&2; exit 1; }
+  (( (directory_mode_value & 0001) != 0 )) \
+    || { printf 'TLS output ancestor must be traversable without changing its mode: %s\n' "$directory" >&2; exit 1; }
+}
+
+preflight_output_ancestor() {
+  local directory="$1"
+  if [[ -e "$directory" || -L "$directory" ]]; then
+    validate_output_ancestor "$directory"
+  fi
+}
+
+create_output_ancestor() {
+  local directory="$1"
+  if [[ -e "$directory" || -L "$directory" ]]; then
+    validate_output_ancestor "$directory"
+    return
+  fi
+  mkdir --mode=0755 -- "$directory"
+  chown root:root "$directory"
+  validate_output_ancestor "$directory"
+}
+
+# Constrain the output and validate every existing ancestor before group/user
+# or filesystem mutation. Existing ancestors are read-only inputs to this
+# helper: their attributes are validated, never repaired.
+validate_output_ancestor /var
+validate_output_ancestor /var/lib
+preflight_output_ancestor /var/lib/nano
+preflight_output_ancestor "$output_root"
+
+if ! getent group nano-tls >/dev/null; then
+  groupadd --system nano-tls
+fi
+usermod -a -G nano-tls "$installer_user"
+
+# Explicit attributes apply only to missing dedicated parents and to the new
+# leaf staging/output directory. Revalidate existing parents before use.
+create_output_ancestor /var/lib/nano
+create_output_ancestor "$output_root"
+
+parent="$output_root"
+base=$(basename -- "$output")
+stage=$(mktemp -d "$parent/.${base}.staging.XXXXXX")
+backup=""
+cleanup() {
+  [[ -z "$stage" || ! -e "$stage" ]] || rm -rf -- "$stage"
+  [[ -z "$backup" || ! -e "$backup" ]] || rm -rf -- "$backup"
+}
+trap cleanup EXIT
+chown root:nano-tls "$stage"
+chmod 0750 "$stage"
+tls_gid=$(getent group nano-tls | awk -F: '{print $3}')
+[[ "$tls_gid" =~ ^[0-9]+$ ]] \
+  || { printf 'Could not resolve the nano-tls group ID.\n' >&2; exit 1; }
+
+# Pin every input once with O_NOFOLLOW before copying any bytes. All validation
+# and copying below is fd-based, so a pathname swap cannot redirect a privileged
+# read. The final pathname and the copies are revalidated before publication.
+python3 -I - "$cert" "$key" "$ca" "$stage" "$tls_gid" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+
+class StageError(Exception):
+    pass
+
+
+def reject(message):
+    raise StageError(message)
+
+
+def components(path):
+    normalized = os.path.normpath(path)
+    if not normalized.startswith("/"):
+        reject(f"TLS source path must be absolute: {path}")
+    parts = [part for part in normalized.split("/") if part]
+    if not parts:
+        reject(f"TLS source path names a directory: {path}")
+    return normalized, parts
+
+
+def validate_directory(directory_stat, display):
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        reject(f"TLS source ancestor is not a directory: {display}")
+    mode = stat.S_IMODE(directory_stat.st_mode)
+    non_root_owner_write = directory_stat.st_uid != 0 and mode & stat.S_IWUSR
+    if non_root_owner_write or mode & (stat.S_IWGRP | stat.S_IWOTH):
+        reject(f"TLS source ancestor is writable by non-root: {display}")
+
+
+def walk_parent(path):
+    normalized, parts = components(path)
+    current_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        validate_directory(os.fstat(current_fd), "/")
+        display = ""
+        for part in parts[:-1]:
+            display += "/" + part
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+            validate_directory(os.fstat(current_fd), display)
+        return normalized, parts[-1], current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def source_snapshot(file_stat):
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_mode,
+        file_stat.st_uid,
+        file_stat.st_gid,
+        file_stat.st_nlink,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def open_source(label, path, private):
+    normalized, name, parent_fd = walk_parent(path)
+    try:
+        source_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+    finally:
+        os.close(parent_fd)
+    file_stat = os.fstat(source_fd)
+    try:
+        if not stat.S_ISREG(file_stat.st_mode):
+            reject(f"TLS {label} must be a regular file: {normalized}")
+        if file_stat.st_uid != 0:
+            reject(f"TLS {label} must be root-owned: {normalized}")
+        if file_stat.st_nlink != 1:
+            reject(f"TLS {label} must have exactly one hard link: {normalized}")
+        mode = stat.S_IMODE(file_stat.st_mode)
+        if private and mode != 0o600:
+            reject(f"TLS private key must be mode 0600 before staging: {normalized}")
+        if not private and mode & (stat.S_IWGRP | stat.S_IWOTH):
+            reject(f"TLS {label} must not be writable by group or other: {normalized}")
+    except Exception:
+        os.close(source_fd)
+        raise
+    return {
+        "label": label,
+        "path": normalized,
+        "fd": source_fd,
+        "snapshot": source_snapshot(file_stat),
+    }
+
+
+def copy_from_fd(source, destination, mode, gid):
+    source_fd = source["fd"]
+    os.lseek(source_fd, 0, os.SEEK_SET)
+    destination_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        os.fchown(destination_fd, 0, gid)
+        os.fchmod(destination_fd, mode)
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    reject(f"short write while staging TLS {source['label']}")
+                view = view[written:]
+        os.fsync(destination_fd)
+    finally:
+        os.close(destination_fd)
+    return digest.digest(), size
+
+
+def validate_source_again(source):
+    current = os.fstat(source["fd"])
+    if source_snapshot(current) != source["snapshot"]:
+        reject(f"TLS {source['label']} changed while it was being staged: {source['path']}")
+
+    normalized, name, parent_fd = walk_parent(source["path"])
+    try:
+        path_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    finally:
+        os.close(parent_fd)
+    if stat.S_ISLNK(path_stat.st_mode) or (path_stat.st_dev, path_stat.st_ino) != (
+        current.st_dev,
+        current.st_ino,
+    ):
+        reject(f"TLS {source['label']} pathname changed while it was being staged: {normalized}")
+
+
+def validate_copy(path, expected_mode, gid, expected_digest, expected_size):
+    copy_fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        file_stat = os.fstat(copy_fd)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+            reject(f"staged TLS output is not a single-link regular file: {path}")
+        if file_stat.st_uid != 0 or file_stat.st_gid != gid:
+            reject(f"staged TLS output has unexpected ownership: {path}")
+        if stat.S_IMODE(file_stat.st_mode) != expected_mode:
+            reject(f"staged TLS output has unexpected mode: {path}")
+        while True:
+            chunk = os.read(copy_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+    finally:
+        os.close(copy_fd)
+    if size != expected_size or digest.digest() != expected_digest:
+        reject(f"staged TLS output differs from its pinned source: {path}")
+
+
+cert_path, key_path, ca_path, stage_path, raw_gid = sys.argv[1:]
+gid = int(raw_gid)
+sources = []
+try:
+    # Open every source before any copy. Keeping these fds open is the security
+    # boundary: later pathname changes can only make the operation fail.
+    sources.append(open_source("certificate", cert_path, private=False))
+    sources.append(open_source("private key", key_path, private=True))
+    sources.append(open_source("CA", ca_path, private=False))
+    destinations = [
+        (os.path.join(stage_path, "server.crt"), 0o644),
+        (os.path.join(stage_path, "server.key"), 0o640),
+        (os.path.join(stage_path, "ca.crt"), 0o644),
+    ]
+    copied = []
+    for source, (destination, mode) in zip(sources, destinations, strict=True):
+        digest, size = copy_from_fd(source, destination, mode, gid)
+        copied.append((destination, mode, digest, size))
+    for source in sources:
+        validate_source_again(source)
+    for destination, mode, digest, size in copied:
+        validate_copy(destination, mode, gid, digest, size)
+except (OSError, StageError) as error:
+    print(f"nano-tls-stage: {error}", file=sys.stderr)
+    raise SystemExit(1)
+finally:
+    for source in sources:
+        os.close(source["fd"])
+PY
+
+if [[ -e "$output" || -L "$output" ]]; then
+  backup=$(mktemp -d "$parent/.${base}.old.XXXXXX")
+  rmdir "$backup"
+  mv -- "$output" "$backup"
+fi
+if ! mv -- "$stage" "$output"; then
+  [[ -z "$backup" || -e "$output" ]] || mv -- "$backup" "$output"
+  exit 1
+fi
+stage=""
+[[ -z "$backup" ]] || rm -rf -- "$backup"
+backup=""
+printf 'Staged TLS material at %s for root:nano-tls. Start a new login session for %s before installing.\n' \
+  "$output" "$installer_user"

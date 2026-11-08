@@ -3,13 +3,11 @@
 // NAN-526 — slide-over drawers for the redesigned Parser Repositories page.
 //   • SyncHistoryDrawer — single "last sync" entry until a backend history
 //     endpoint exists. Mirrors NAN-505's RuleRepositories drawer.
-//   • AddRepoDrawer — wired to createRepository.
 //
 // Bulk import remains in `BatchImportParsersModal.tsx` (already wired to the
 // per-parser ingestion-method picker that the legacy page used). The new
 // toolbar opens that modal directly.
 
-import { useEffect, useState } from 'react';
 import {
   CircleAlert,
   CircleCheck,
@@ -21,7 +19,6 @@ import {
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
-import type { CreateParserRepositoryRequest } from '@/lib/api/parser-repositories';
 import type { ParserRepoView } from './helpers';
 
 // ------------------------------------------------------------------
@@ -111,11 +108,7 @@ export function SyncHistoryDrawer({
       footer={
         <div className="flex items-center gap-2">
           <div className="flex-1 text-[10.5px] text-muted-foreground font-mono">
-            {repo.autoSync !== 'off' && repo.nextSync.overdue ? (
-              <span className={repo.lastSync.result === 'failed' ? 'text-destructive' : 'text-warning'}>
-                auto-sync overdue · {repo.nextSync.cadence}
-              </span>
-            ) : repo.autoSync !== 'off' ? (
+            {repo.autoSync !== 'off' ? (
               <>
                 next auto-sync in <span className="text-foreground/70">{repo.nextSync.in}</span> ·{' '}
                 {repo.nextSync.cadence}
@@ -212,151 +205,5 @@ export function SyncHistoryDrawer({
         </div>
       </div>
     </SideDrawer>
-  );
-}
-
-// ------------------------------------------------------------------
-// Add repo drawer — wired to createRepository
-// ------------------------------------------------------------------
-
-interface AddRepoProps {
-  open: boolean;
-  onClose: () => void;
-  onSubmit: (req: CreateParserRepositoryRequest) => Promise<void> | void;
-  submitting?: boolean;
-}
-
-export function AddRepoDrawer({ open, onClose, onSubmit, submitting }: AddRepoProps) {
-  const [name, setName] = useState('');
-  const [url, setUrl] = useState('');
-  const [branch, setBranch] = useState('');
-  const [parsersPath, setParsersPath] = useState('');
-  const [cadence, setCadence] = useState<'off' | 'hourly' | '4h' | 'daily'>('hourly');
-
-  useEffect(() => {
-    if (open) {
-      setName('');
-      setUrl('');
-      setBranch('');
-      setParsersPath('');
-      setCadence('hourly');
-    }
-  }, [open]);
-
-  const cadenceHours =
-    cadence === 'hourly' ? 1 : cadence === '4h' ? 4 : cadence === 'daily' ? 24 : 0;
-  const valid = name.trim().length > 0 && url.trim().length > 0;
-
-  const submit = () => {
-    if (!valid) return;
-    onSubmit({
-      name: name.trim(),
-      url: url.trim(),
-      branch: branch.trim() || undefined,
-      parsers_path: parsersPath.trim() || undefined,
-      auto_sync_enabled: cadence !== 'off',
-      sync_interval_hours: cadenceHours || 1,
-    });
-  };
-
-  return (
-    <SideDrawer
-      open={open}
-      onClose={onClose}
-      title="Connect a parser repo"
-      subtitle="GitHub, GitLab, or a public Git URL"
-      width={460}
-      footer={
-        <div className="flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={onClose}
-            className="h-[28px] px-3 rounded-md text-muted-foreground hover:text-foreground hover:bg-foreground/5 text-[11.5px]"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={submit}
-            disabled={!valid || submitting}
-            className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium disabled:opacity-60"
-          >
-            {submitting ? 'Connecting…' : 'Connect & sync'}
-          </button>
-        </div>
-      }
-    >
-      <div className="p-4 space-y-3">
-        <Field label="Display name">
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="acme parsers (internal)"
-            className="w-full h-[30px] px-2.5 rounded-md border border-border bg-card text-[12px] focus:outline-none focus:border-primary"
-          />
-        </Field>
-        <Field label="Repository URL">
-          <input
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://github.com/acme-corp/parsers"
-            className="w-full h-[30px] px-2.5 rounded-md border border-border bg-card text-[12px] font-mono placeholder:text-muted-foreground focus:outline-none focus:border-primary"
-          />
-        </Field>
-        <div className="grid grid-cols-2 gap-2">
-          <Field label="Branch">
-            <input
-              value={branch}
-              placeholder="Automatic"
-              onChange={(e) => setBranch(e.target.value)}
-              className="w-full h-[30px] px-2.5 rounded-md border border-border bg-card text-[12px] font-mono focus:outline-none focus:border-primary"
-            />
-          </Field>
-          <Field label="Parsers path">
-            <input
-              value={parsersPath}
-              onChange={(e) => setParsersPath(e.target.value)}
-              placeholder="parsers/"
-              className="w-full h-[30px] px-2.5 rounded-md border border-border bg-card text-[12px] font-mono focus:outline-none focus:border-primary"
-            />
-          </Field>
-        </div>
-        <Field label="Auto-sync cadence">
-          <div className="flex items-center gap-1">
-            {(['off', 'hourly', '4h', 'daily'] as const).map((c) => (
-              <button
-                key={c}
-                type="button"
-                onClick={() => setCadence(c)}
-                className={cn(
-                  'h-[26px] px-2.5 rounded-md text-[11.5px] border transition',
-                  cadence === c
-                    ? 'border-primary/40 bg-primary/10 text-primary'
-                    : 'border-border bg-card text-foreground/70 hover:bg-muted',
-                )}
-              >
-                {c}
-              </button>
-            ))}
-          </div>
-        </Field>
-        <div className="rounded-md border border-border bg-card/30 px-3 py-2 flex items-start gap-2">
-          <Clock className="w-[12px] h-[12px] text-muted-foreground mt-0.5" strokeWidth={1.5} />
-          <div className="text-[10.5px] text-muted-foreground leading-relaxed">
-            After connecting, the repo will be synced once immediately. Auto-sync runs in the
-            background — sync history surfaces in the Sync history drawer.
-          </div>
-        </div>
-      </div>
-    </SideDrawer>
-  );
-}
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1.5">{label}</div>
-      {children}
-    </div>
   );
 }

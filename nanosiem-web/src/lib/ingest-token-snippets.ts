@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
- * Copy-paste sender snippets for open-core ingest tokens (NAN-3806).
+ * Copy-paste sender snippets for per-source ingest tokens (NAN-4907, ported from NAN-3806).
  *
  * A token decides the source: every event sent with it lands in the source it
  * is bound to, whatever `sourcetype` / `X-Source-Type` the sender declares. So
@@ -40,8 +40,9 @@ function componentId(source: Pick<BindableSource, 'route_key'>): string {
 export function hecCurl(host: string, source: Pick<BindableSource, 'route_key'>): string {
   const env = tokenEnvVar(source);
   return [
-    `curl -sS http://${host}:${HEC_PORT}/services/collector/event \\`,
+    `curl -sS --fail-with-body http://${host}:${HEC_PORT}/services/collector/event \\`,
     `  -H "Authorization: Splunk $${env}" \\`,
+    `  -H "X-Splunk-Request-Channel: $(uuidgen)" \\`,
     `  -d '{"event": {"message": "hello from nano"}}'`,
   ].join('\n');
 }
@@ -49,7 +50,7 @@ export function hecCurl(host: string, source: Pick<BindableSource, 'route_key'>)
 export function httpCurl(host: string, source: Pick<BindableSource, 'route_key'>): string {
   const env = tokenEnvVar(source);
   return [
-    `curl -sS http://${host}:${HTTP_PORT}/ \\`,
+    `curl -sS --fail-with-body http://${host}:${HTTP_PORT}/ \\`,
     `  -H "Authorization: Bearer $${env}" \\`,
     `  -H "Content-Type: application/json" \\`,
     `  -d '{"message": "hello from nano"}'`,

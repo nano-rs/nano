@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# nano platform feeds (NAN-4948): nano's signed feed bundle (IPinfo Lite
+# geo/ASN, ThreatFox, Tor exit list) on a ClickHouse install.
+#
+#   scripts/nano-feeds status                 installed feeds, revision, age, hard expiry
+#   scripts/nano-feeds update                 check nano's feed endpoint now and install a newer bundle
+#   scripts/nano-feeds update --file FILE     install a .nanfeed bundle you copied here (air-gap)
+#
+# The jobs leader already checks on a schedule (PLATFORM_FEEDS_POLL_SECS,
+# default hourly; off in AIRGAP_MODE). This is the operator surface: it calls
+# the local API, which verifies the bundle's signature, digest, format and
+# expiry before writing anything. A refused bundle leaves the installed one in
+# place.
+#
+# Environment:
+#   NANO_URL          API base URL (default http://127.0.0.1:3000)
+#   NANO_API_KEY      API key with enrichments:configure (status needs enrichments:view)
+#   NANO_API_KEY_FILE file holding the key (preferred: keeps it out of the environment)
+#
+# To get a bundle file for an air-gapped install, on a connected machine:
+#   curl -s https://api.nano.rs/api/feeds/v1/open/current \
+#     | python3 -c 'import json,sys; print(json.load(sys.stdin)["bundle_url"])' \
+#     | xargs curl -fsSL -o bundle.nanfeed
+{ set +x; } 2>/dev/null
+set -euo pipefail
+
+die() { printf 'nano-feeds: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '4,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+base=${NANO_URL:-http://127.0.0.1:3000}
+base=${base%/}
+[[ $base =~ ^https?://[^[:space:]/?#@]+(/[A-Za-z0-9._~/-]*)?$ ]] || die "NANO_URL must be a plain http(s) URL"
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/nano-feeds.XXXXXX")
+trap 'rm -rf -- "$work"' EXIT
+chmod 700 "$work"
+header=$work/header
+key=${NANO_API_KEY:-}
+if [[ -z $key && -n ${NANO_API_KEY_FILE:-} ]]; then
+    [[ -f $NANO_API_KEY_FILE && ! -L $NANO_API_KEY_FILE ]] || die "NANO_API_KEY_FILE must be a regular file"
+    key=$(tr -d '\r\n' < "$NANO_API_KEY_FILE")
+fi
+[[ -n $key ]] || die "set NANO_API_KEY or NANO_API_KEY_FILE (an API key with enrichments:configure)"
+# Keep the key out of argv (and so out of ps).
+printf 'X-API-Key: %s\n' "$key" > "$header"
+
+api() { # <method> <path> [curl args...]
+    local method=$1 path=$2; shift 2
+    local out=$work/body code
+    code=$(curl --disable --silent --show-error --header "@$header" -X "$method" \
+        --output "$out" --write-out '%{http_code}' "$@" "$base$path") || die "request to $base$path failed"
+    if [[ $code != 2* ]]; then
+        printf 'nano-feeds: %s %s returned HTTP %s\n' "$method" "$path" "$code" >&2
+        cat "$out" >&2; echo >&2
+        return 1
+    fi
+    cat "$out"
+}
+
+status() {
+    api GET /api/enrichment/platform-feeds > "$work/status.json"
+    python3 -I - "$work/status.json" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+g = s.get
+if not g("installed"):
+    print("No feed bundle installed.")
+else:
+    sha = (g("bundle_sha256") or "")[:12]
+    print("installed %s via %s (%s), sequence %s, payload %s" % (g("installed_at"), g("channel"), g("source"), g("sequence"), sha))
+    for f in g("feeds", []):
+        active = "stamping" if f.get("active") else "NOT stamping"
+        print("  %-15s rev %-6s %-8s %-13s loaded %-9s hard expiry %s" % (
+            f["feed_id"], f["revision"], f["state"], active, f.get("loaded"), f["hard_expiry"]))
+        if f.get("detail"):
+            print("  %-15s %s" % ("", f["detail"]))
+print("last check: %s at %s; auto-update %s" % (g("last_check_status"), g("last_check_at"), "on" if g("auto_update") else "off"))
+if g("last_error"):
+    print("last error: %s" % g("last_error"))
+PY
+}
+
+update() {
+    local file=""
+    while (($#)); do
+        case $1 in
+            --file) [[ $# -ge 2 ]] || usage; file=$2; shift 2 ;;
+            *) usage ;;
+        esac
+    done
+    if [[ -n $file ]]; then
+        [[ -f $file && ! -L $file ]] || die "$file is not a regular file"
+        printf 'Verifying and installing %s\n' "$file"
+        api POST /api/enrichment/platform-feeds/import --form "file=@$file;type=application/octet-stream" >/dev/null \
+            || die "the bundle was refused or could not be installed; the installed bundle is kept"
+        printf 'Installed. New events are stamped from it once the dictionaries reload (seconds to minutes).\n'
+    else
+        api POST /api/enrichment/platform-feeds/check >/dev/null || die "the check could not start"
+        printf 'Checking nano'"'"'s feed endpoint'
+        for _ in $(seq 1 240); do
+            sleep 5
+            local state
+            state=$(api GET /api/enrichment/platform-feeds | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("last_check_status") or "")')
+            [[ $state == checking ]] || { printf ' %s\n' "$state"; break; }
+            printf '.'
+        done
+    fi
+    status
+}
+
+case ${1:-} in
+    status) shift; (($# == 0)) || usage; status ;;
+    update) shift; update "$@" ;;
+    *) usage ;;
+esac

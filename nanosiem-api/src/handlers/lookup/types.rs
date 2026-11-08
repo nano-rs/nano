@@ -48,7 +48,7 @@ pub struct CreateLookupTableResponse {
     pub records_inserted: usize,
     /// Columns whose original CSV/JSON header was sanitized to a SQL-safe
     /// identifier on upload (e.g. `Customer Id → customer_id`). Empty if all
-    /// original headers were already valid identifiers. See the identifier validation rules.
+    /// original headers were already valid identifiers. See NAN-513.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub renamed_columns: Vec<RenamedColumn>,
 }

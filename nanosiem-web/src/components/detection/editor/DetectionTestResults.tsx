@@ -11,6 +11,7 @@ import { isClickHouseDefault, cn } from '@/lib/utils';
 import { toast } from 'sonner';
 import type { SearchResponse, DisplayType } from '@/lib/api/types';
 import { isPrevalenceSentinelField } from '@/lib/prevalence-sentinels';
+import { SEMANTIC_FIELDS, type SemanticField } from '@/lib/schema-fields';
 
 interface SearchResult {
   id: string;
@@ -108,11 +109,23 @@ function formatWindowRange(start: Date, end: Date): string {
 }
 
 // Entity fields to scan for dominant entity surfacing (ordered by priority)
-const ENTITY_FIELDS = [
-  'src_ip', 'dest_ip', 'user', 'src_user', 'dest_user',
-  'src_host', 'dest_host', 'host', 'hostname',
-  'process_name', 'file_hash', 'process_hash',
+// NAN-4903: concepts resolved through the profile-aware field map; each expands
+// to its UDM and OCSF columns so rows of either shape surface their entity.
+const ENTITY_KEYS: readonly SemanticField[] = [
+  'srcIp', 'destIp', 'user', 'srcUser', 'destUser',
+  'srcHost', 'destHost', 'host',
+  'processName', 'fileHash', 'processHash',
 ];
+const ENTITY_FIELDS: readonly string[] = (() => {
+  const out: string[] = [];
+  const add = (c: string) => { if (!out.includes(c)) out.push(c); };
+  for (const k of ENTITY_KEYS) {
+    for (const c of [...SEMANTIC_FIELDS[k].udm, ...SEMANTIC_FIELDS[k].ocsf]) add(c);
+    // Legacy flat host aliases some sources emit.
+    if (k === 'host') { add('host'); add('hostname'); }
+  }
+  return out;
+})();
 
 interface DominantEntity {
   field: string;

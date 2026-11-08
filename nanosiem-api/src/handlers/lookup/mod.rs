@@ -53,6 +53,9 @@ pub(crate) fn lookup_error_to_api(err: LookupError) -> ApiError {
         LookupError::TableInUse(rules) => ApiError::Conflict(format!(
             "Lookup table is used by detection rules: {}. Remove those references before deleting it.", rules
         )),
+        LookupError::ConcurrentModification(name) => ApiError::Conflict(format!(
+            "Lookup table '{}' was changed by another request. Reload it and try again.", name
+        )),
         LookupError::ReferenceConflict => ApiError::Conflict(
             "Lookup table is still referenced by related records. Remove those references before deleting it.".to_string()
         ),
@@ -136,6 +139,14 @@ mod tests {
     fn referenced_lookup_is_a_conflict_with_rule_names() {
         let error = lookup_error_to_api(LookupError::TableInUse("Suspicious login".into()));
         assert!(matches!(error, ApiError::Conflict(message) if message.contains("Suspicious login")));
+    }
+
+    #[test]
+    fn concurrent_replace_is_a_conflict() {
+        assert!(matches!(
+            lookup_error_to_api(LookupError::ConcurrentModification("t".into())),
+            ApiError::Conflict(_)
+        ));
     }
 
     #[test]

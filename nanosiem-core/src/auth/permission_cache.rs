@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
-use super::permissions::DEMO_PERMISSIONS;
 
 /// Cached permission resolver -- loads user permissions from PostgreSQL
 /// with a short-lived in-memory cache to avoid hitting the DB on every request.
@@ -29,6 +28,9 @@ pub struct PermissionResolver {
 struct CachedPermissions {
     permissions: Vec<String>,
     cached_at: Instant,
+    /// `users.authz_generation` the entry was computed at (NAN-3904): a hit is
+    /// served only while it is still the user's current generation.
+    generation: Option<i64>,
 }
 
 const CACHE_TTL_SECS: u64 = 60;
@@ -53,12 +55,17 @@ impl PermissionResolver {
     pub async fn resolve_with_roles(&self, user_id: Uuid, roles: &[String]) -> Vec<String> {
         // Demo users: return hardcoded permissions (they have no DB group assignments)
         if roles.iter().any(|r| r == "demo_analyst") {
-            return DEMO_PERMISSIONS.iter().map(|s| s.to_string()).collect();
+            return super::permissions::demo_permissions();
         }
 
-        // Check cache first
+        // Check cache first — valid only within the TTL AND at the user's
+        // current authorization generation, so a group shrink made by any
+        // process is honoured on the next request (NAN-3904).
+        let generation = super::authz_generation::current_authz_generation(&self.pool, user_id).await;
         if let Some(cached) = self.cache.get(&user_id) {
-            if cached.cached_at.elapsed().as_secs() < CACHE_TTL_SECS {
+            if cached.cached_at.elapsed().as_secs() < CACHE_TTL_SECS
+                && super::authz_generation::generation_still_current(cached.generation, &generation)
+            {
                 return cached.permissions.clone();
             }
         }
@@ -91,6 +98,7 @@ impl PermissionResolver {
             CachedPermissions {
                 permissions: permissions.clone(),
                 cached_at: Instant::now(),
+                generation: generation.ok().flatten(),
             },
         );
 

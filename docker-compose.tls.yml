@@ -1,0 +1,24 @@
+# TLS overlay for the open-source stack — bring-your-own-certificate.
+#
+# 1. Put your cert chain + private key here (PEM):
+#      config/nginx/ssl/fullchain.pem
+#      config/nginx/ssl/privkey.pem
+#    Get them however you like — Let's Encrypt/certbot, your own CA, or a
+#    self-signed pair via `config/nginx/generate-ssl.sh` (browser warning).
+#
+# 2. Bring the stack up with this overlay:
+#      docker compose -f docker-compose.opensource.yml -f docker-compose.tls.yml up -d
+#
+# 3. Set BASE_URL=https://your.domain in .env so login cookies get the Secure
+#    flag (the installer already leaves NANOSIEM_DEV_MODE=false for https URLs).
+#
+# nginx serves HTTPS on :443 and 301-redirects :80 → :443. No extra proxy or
+# ACME client — renew your certs out of band and `docker compose ... restart nginx`.
+services:
+  nginx:
+    volumes:
+      - ./config/nginx/nginx.opensource-tls.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx/ssl:/etc/nginx/ssl:ro
+    ports:
+      - "80:80"
+      - "443:443"

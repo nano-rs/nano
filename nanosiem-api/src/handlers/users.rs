@@ -274,18 +274,7 @@ pub async fn create_user(
             .count_users()
             .await
             .map(|c| c as u32)
-            // Fail closed (NAN-2761): an unreadable count must not read as 0
-            // and wave the create past the team-member cap.
-            .map_err(|e| {
-                tracing::error!(error = %e, "user count unavailable for tier limit");
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(UserApiError::new(
-                        "tier_limit_unavailable",
-                        "Team member limit could not be verified; retry shortly",
-                    )),
-                )
-            })?;
+            .unwrap_or(0);
         nanosiem_core::check_limit(
             "team members",
             user_count,

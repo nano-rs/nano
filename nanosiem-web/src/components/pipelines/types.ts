@@ -2,23 +2,20 @@
 
 import type {
   PipelineCapabilities,
-  PipelineCapture,
-  PipelineCaptureOptions,
   PipelineConflict,
   PipelineDraft,
   PipelineLaneInput,
   PipelineOperationErrors,
   PipelinePermissions,
   PipelinePreview,
-  PipelinePublishOptions,
   PipelineRelease,
   PipelineReleasePlan,
   PipelineSample,
   PipelineSummary,
+  PipelineTap,
+  PipelineTapOptions,
   PipelineValidation,
 } from '@/lib/pipeline-types';
-import type { PipelineInputsPanelProps } from './PipelineInputs';
-import type { PipeLaneInputCounts } from '@/lib/api/pipelines';
 
 export interface PipelineListProps {
   pipelines: PipelineSummary[];
@@ -28,8 +25,6 @@ export interface PipelineListProps {
   onCreate: () => void;
   onOpen: (id: string) => void;
   onRetry: () => void;
-  /** NAN-3621: input counts by pipeline (log source) id; absent while loading or unsupported. */
-  inputCounts?: Record<string, PipeLaneInputCounts>;
 }
 
 export interface PipelineEditorProps {
@@ -38,50 +33,47 @@ export interface PipelineEditorProps {
   capabilities: PipelineCapabilities;
   permissions: PipelinePermissions;
   dirty: boolean;
+  /** The saved parser is plain VRL, shown as one Advanced VRL step. */
+  imported?: boolean;
   busy?: string | null;
   /** Per-operation failures; publish/rollback errors belong to their own sheets. */
   errors?: PipelineOperationErrors;
   /** The server copy changed after this editor loaded it. */
   conflict?: PipelineConflict | null;
-  /** Runtime capability load failure (not a 404 "not available yet"). */
+  /** Capability load failure (not a 404 "not available yet"). */
   capabilitiesError?: string | null;
   previewError?: string | null;
   validation?: PipelineValidation | null;
-  capture?: PipelineCapture | null;
-  samples: PipelineSample[];
+  tap: PipelineTap;
   sample?: PipelineSample | null;
   preview?: PipelinePreview | null;
   previewPending?: boolean;
   onDraftChange: (draft: PipelineDraft) => void;
-  /** NAN-3625: the lane's inputs, for "Input is" route branches and preview. */
+  /** Inputs seen in captured events, for "Input is" route branches and preview. */
   laneInputs?: PipelineLaneInput[];
-  /** NAN-3625: inputs the draft's route branches name (shown even when the lane does not list them). */
+  /** Inputs the draft's route branches name. */
   routedInputs?: string[];
-  /** NAN-3625: preview every event as arriving on this input; null = as recorded. */
+  /** Preview every event as arriving on this input; null = as recorded. */
   previewInput?: string | null;
   onPreviewInputChange?: (input: string | null) => void;
   onSave: () => void;
   onValidate: () => void;
   onReview: () => void;
   onHistory: () => void;
-  onCaptureStart: (options: PipelineCaptureOptions) => void;
-  onCaptureStop: () => void;
-  onFreeze: () => void;
-  onSampleSelect: (sample: PipelineSample) => void;
+  onTapStart: (options: PipelineTapOptions) => void;
+  onTapCancel: () => void;
+  /** Use the tapped events as the preview input. */
+  onTapPreview: () => void;
   onPreview: () => void;
-  onSaveSample?: () => void;
-  canSaveSample?: boolean;
-  /** NAN-3447: load the source's newest stored raw events as browser-only preview input. */
+  /** Load the source's newest stored raw events as browser-only preview input. */
   onLoadRecent?: (limit: number) => void;
-  /** NAN-3447: use pasted raw events as browser-only preview input; throws on unusable text. */
+  /** Use pasted raw events as browser-only preview input; throws on unusable text. */
   onPasteSample?: (text: string) => void;
   /** No usable events came back from the last load. */
   sampleNotice?: string | null;
-  /** NAN-3621: the lane's inputs (push, connector, pull). Absent: the flow strip shows the source name. */
-  inputs?: PipelineInputsPanelProps;
-  /** Opens pivt focused on the selected step (NAN-3453). */
+  /** Opens pivt focused on the selected step. */
   onAssistant?: (selectedStepId: string | null) => void;
-  /** NAN-4609: the selected step, so pivt (`@pipe`) works on what the analyst is looking at. */
+  /** The selected step, so pivt (`@pipe`) works on what the analyst is looking at. */
   onSelectedStepChange?: (stepId: string | null) => void;
   /** Conflict recovery: discard local edits and load the server's latest saved draft. */
   onReloadLatest?: () => void;
@@ -100,7 +92,7 @@ export interface PipelineReleaseReviewProps {
   stale?: boolean;
   error?: string | null;
   onOpenChange: (open: boolean) => void;
-  onPublish: (options: PipelinePublishOptions) => void;
+  onPublish: () => void;
 }
 
 export interface PipelineReleaseHistoryProps {
@@ -109,7 +101,7 @@ export interface PipelineReleaseHistoryProps {
   releases: PipelineRelease[];
   canRollback: boolean;
   pending?: boolean;
-  /** Release history could not be loaded. */
+  /** Version history could not be loaded. */
   loadError?: string | null;
   /** The last rollback request failed. */
   error?: string | null;
@@ -119,8 +111,5 @@ export interface PipelineReleaseHistoryProps {
   savedDraft?: boolean;
   onOpenChange: (open: boolean) => void;
   /** `unsavedEdits` echoes what the confirmation warned about, so a changed draft is refused. */
-  onRollback: (
-    release: PipelineRelease,
-    confirmed: { unsavedEdits: boolean }
-  ) => void;
+  onRollback: (release: PipelineRelease, confirmed: { unsavedEdits: boolean }) => void;
 }

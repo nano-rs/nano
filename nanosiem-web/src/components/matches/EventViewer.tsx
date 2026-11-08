@@ -3,60 +3,62 @@
 // NAN-483 — expandable contributing-events viewer for the Matches detail pane.
 // Ports the pagination + all-field inspection pattern from the pre-redesign
 // DetectionMatches EventViewer into the new density. Field categorisation
-// (metadata / prevalence / OCSF enrichments / lookup / unmapped / event) matches
-// Search while retaining the legacy names until that backend is removed.
+// (metadata / prevalence / enriched / lookup / ext / UDM) matches Search.
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, ChevronLeft } from 'lucide-react';
 import { cn, isClickHouseDefault } from '@/lib/utils';
-import { eventFieldValue, flattenEventFieldEntries } from '@/lib/event-field-access';
 import { extractEventTime, eventLatency } from './helpers';
 import { LatencyPill } from './LatencyPill';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import { schemaFieldCandidates, type SchemaProfileId, type SemanticField } from '@/lib/schema-fields';
 
-// Preview key-fields in canonical OCSF 1.9 priority order. Legacy UDM fields
-// stay at the tail while the old backend remains supported, but can no longer
-// crowd canonical fields out of a five-value preview on mixed payloads.
-const PREVIEW_KEYS = [
-  'actor.user.name',
-  'user.name',
-  'device.hostname',
-  'src_endpoint.ip',
-  'dst_endpoint.ip',
-  'src_endpoint.hostname',
-  'dst_endpoint.hostname',
-  'activity_name',
-  'action',
-  'status',
-  'http_request.http_method',
-  'http_request.url.url_string',
-  'http_response.code',
-  'actor.process.name',
-  'actor.process.cmd_line',
-  'process.name',
-  'process.cmd_line',
-  'file.hashes.value',
-  'file.name',
-  'file.path',
+// Preview key-fields — priority order. A row picks the first N non-empty
+// values so it works across every log source without a per-source column map.
+// NAN-4903: concepts resolve through the profile-aware field map, the active
+// profile's columns first, then the other profile's (events are flattened to
+// dotted keys, so OCSF `src_endpoint.ip` is a flat key here).
+const PREVIEW_CONCEPTS: readonly SemanticField[] = [
   'user',
-  'src_ip',
-  'dest_ip',
-  'src_host',
-  'dest_host',
-  'http_method',
-  'http_status_code',
-  'status_code',
+  'srcIp',
+  'destIp',
+  'srcHost',
+  'destHost',
+  'httpMethod',
+  'httpStatus',
   'url',
-  'event_type',
-  'event_id',
-  'process_name',
-  'command_line',
-  'file_hash',
-  'file_path',
-  'eventName',
-  'sourceIPAddress',
-  'source_type',
+  'eventType',
+  'processName',
+  'fileHash',
+  'filePath',
+  'fileName',
 ];
+// Non-concept keys: UDM aliases and AWS/CloudTrail raw names — surface only if
+// the concepts above didn't fill the preview.
+const PREVIEW_EXTRA_KEYS = ['status_code', 'event_id', 'eventName', 'sourceIPAddress', 'source_type'];
+
+function previewKeys(profile: SchemaProfileId): string[] {
+  const other: SchemaProfileId = profile === 'udm' ? 'ocsf' : 'udm';
+  const out: string[] = [];
+  for (const p of [profile, other]) {
+    for (const key of PREVIEW_CONCEPTS) {
+      for (const col of schemaFieldCandidates(p, key)) if (!out.includes(col)) out.push(col);
+    }
+  }
+  for (const k of PREVIEW_EXTRA_KEYS) if (!out.includes(k)) out.push(k);
+  return out;
+}
 const PREVIEW_MAX = 5;
+
+function flattenObject(obj: Record<string, unknown>, prefix = ''): Array<{ key: string; value: unknown }> {
+  return Object.entries(obj).flatMap(([k, v]) => {
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (typeof v === 'object' && v !== null && !Array.isArray(v)) {
+      return flattenObject(v as Record<string, unknown>, key);
+    }
+    return [{ key, value: v }];
+  });
+}
 
 // Category numbers match the existing Search field ordering.
 function fieldCategory(name: string): number {
@@ -68,15 +70,9 @@ function fieldCategory(name: string): number {
     name === 'prevalence_artifact' || name === 'total_occurrences' ||
     name === 'first_seen' || name === 'last_seen'
   ) return 1;
-  if (
-    name.startsWith('enrichments.') || name === 'enrichments' ||
-    name.startsWith('enriched.') || name.startsWith('enriched_')
-  ) return 2;
+  if (name.startsWith('enriched.') || name.startsWith('enriched_')) return 2;
   if (name.startsWith('lookup.') || name.startsWith('lookup_')) return 3;
-  if (
-    name.startsWith('unmapped.') || name === 'unmapped' ||
-    name.startsWith('ext.') || name === 'ext'
-  ) return 4;
+  if (name.startsWith('ext.')) return 4;
   return 5;
 }
 
@@ -91,7 +87,7 @@ function fieldKeyColor(name: string): string {
 }
 
 function visibleFields(event: Record<string, unknown>): string[] {
-  return flattenEventFieldEntries(event)
+  return flattenObject(event)
     .filter(({ key, value }) => {
       const isPrevalence = key.startsWith('_prevalence.') || key === '_prevalence' ||
         key === 'host_count' || key === 'is_rare' || key === 'prevalence_score' ||
@@ -113,7 +109,12 @@ function visibleFields(event: Record<string, unknown>): string[] {
 const FIELD_PREVIEW_MAX = 500;
 
 function getFieldValue(event: Record<string, unknown>, field: string): string {
-  const v = eventFieldValue(event, field);
+  const parts = field.split('.');
+  let v: unknown = event;
+  for (const p of parts) {
+    if (v === null || v === undefined || typeof v !== 'object') return '';
+    v = (v as Record<string, unknown>)[p];
+  }
   if (isClickHouseDefault(v, field)) return '';
   const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
   return s.length > FIELD_PREVIEW_MAX ? `${s.slice(0, FIELD_PREVIEW_MAX)}… (${s.length} chars)` : s;
@@ -130,6 +131,8 @@ interface EventViewerProps {
 export function EventViewer({ events, matchDetectedAt, hoveredId, onHover, pageSize = 10 }: EventViewerProps) {
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [page, setPage] = useState(0);
+  const { profile } = useSchemaFieldMap();
+  const previewKeyList = useMemo(() => previewKeys(profile), [profile]);
 
   const totalPages = Math.max(1, Math.ceil(events.length / pageSize));
   const start = page * pageSize;
@@ -196,7 +199,7 @@ export function EventViewer({ events, matchDetectedAt, hoveredId, onHover, pageS
             const messageField = getFieldValue(e, 'message');
 
             const previewPairs: Array<[string, string]> = [];
-            for (const k of PREVIEW_KEYS) {
+            for (const k of previewKeyList) {
               if (previewPairs.length >= PREVIEW_MAX) break;
               const v = getFieldValue(e, k);
               if (v) previewPairs.push([k, v]);

@@ -67,9 +67,10 @@ fn agg_stage(sql: &str) -> String {
 fn ocsf_sum_risk_score_extracts_numeric_not_string() {
     let sql = ocsf_sql(r#"risk_entity="x" | stats sum(risk_score) by risk_entity"#);
     let agg = agg_stage(&sql);
-    // The summed value must be the numeric Float64 subcolumn extractor …
+    // The summed value must be the numeric Float64 subcolumn extractor. stage_0
+    // computes it once and the aggregation reads that alias (NAN-4934) …
     assert!(
-        agg.contains(RISK_SCORE_FLOAT),
+        sql.contains(&format!("{RISK_SCORE_FLOAT} AS risk_score")) && agg.contains("sum(risk_score)"),
         "risk_score must be summed as Float64, not String; got:\n{sql}"
     );
     // … and must NOT be a String extraction wrapped in sum() (the CH Code 43 bug).
@@ -85,8 +86,10 @@ fn ocsf_avg_risk_score_extracts_numeric() {
     // so they all get the Float64 extractor once risk_score is typed numeric.
     let sql = ocsf_sql(r#"* | stats avg(risk_score)"#);
     let agg = agg_stage(&sql);
+    // stage_0 computes the Float64 extractor; the aggregation reads its alias
+    // (NAN-4934).
     assert!(
-        agg.contains(RISK_SCORE_FLOAT),
+        sql.contains(&format!("{RISK_SCORE_FLOAT} AS risk_score")) && agg.contains("avg(risk_score)"),
         "risk_score must extract as Float64 for avg; got:\n{sql}"
     );
     assert!(

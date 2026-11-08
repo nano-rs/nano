@@ -23,12 +23,15 @@ use uuid::Uuid;
 
 use nanosiem_core::audit::{
     AuditEvent, AuditSource, ClientContext, CREDENTIAL_CREATED, CREDENTIAL_DELETED,
-    CREDENTIAL_ROLLED_BACK, CREDENTIAL_ROTATED, CREDENTIAL_UPDATED,
+    CREDENTIAL_ROLLED_BACK, CREDENTIAL_ROTATED, CREDENTIAL_UPDATED, SOURCE_CONFIG_DEPLOYED,
 };
+use nanosiem_core::source_configs::{CredentialRefresh, CredentialRefreshOutcome};
 use nanosiem_core::parsers::{
-    azure_event_hubs_credentials_complete, is_supported_credential_provider, CloudCredential,
-    CloudCredentialVersion, CreateCloudCredential, CredentialRepository, CredentialRepositoryError,
-    RollbackCloudCredential, RotateCloudCredential, UpdateCloudCredential,
+    is_supported_credential_provider, normalize_credential_payload, validate_credential_payload,
+    CloudCredential,
+    CloudCredentialVersion, CreateCloudCredential, CredentialRepository,
+    CredentialRepositoryError, RollbackCloudCredential, RotateCloudCredential,
+    UpdateCloudCredential, SUPPORTED_CREDENTIAL_PROVIDERS,
 };
 
 use crate::handlers::AuditExt;
@@ -59,8 +62,14 @@ impl CredentialApiError {
                 (StatusCode::NOT_FOUND, "version_not_found")
             }
             CredentialRepositoryError::DuplicateName(_) => (StatusCode::CONFLICT, "duplicate_name"),
+            // NAN-4902: deleting a credential that is still referenced is a
+            // conflict the caller can fix, not a server error.
+            CredentialRepositoryError::InUse { .. } => (StatusCode::CONFLICT, "credential_in_use"),
             CredentialRepositoryError::InvalidProvider(_) => {
                 (StatusCode::BAD_REQUEST, "invalid_provider")
+            }
+            CredentialRepositoryError::InvalidCredentials(_) => {
+                (StatusCode::BAD_REQUEST, "invalid_credentials")
             }
             CredentialRepositoryError::EncryptionError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "encryption_error")
@@ -79,7 +88,10 @@ fn invalid_provider() -> (StatusCode, Json<CredentialApiError>) {
         StatusCode::BAD_REQUEST,
         Json(CredentialApiError::new(
             "invalid_provider",
-            "Provider must be 'aws_s3', 'gcp_pubsub', 'kafka', or 'azure_event_hubs'",
+            &format!(
+                "Provider must be one of: {}",
+                SUPPORTED_CREDENTIAL_PROVIDERS.join(", ")
+            ),
         )),
     )
 }
@@ -120,7 +132,7 @@ pub async fn list_credentials(
 ) -> Result<Json<CredentialListResponse>, (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, "credentials:view").map_err(|_| forbidden())?;
 
-    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
+    let repo = CredentialRepository::new(state.pool.clone());
     let credentials = repo.list().await.map_err(|e| {
         let (status, err) = CredentialApiError::from_repo_error(&e);
         (status, Json(err))
@@ -152,7 +164,7 @@ pub async fn get_credential(
 ) -> Result<Json<CloudCredential>, (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, "credentials:view").map_err(|_| forbidden())?;
 
-    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
+    let repo = CredentialRepository::new(state.pool.clone());
     let credential = repo.get(*id).await.map_err(|e| {
         let (status, err) = CredentialApiError::from_repo_error(&e);
         (status, Json(err))
@@ -203,49 +215,18 @@ pub async fn create_credential(
         return Err(invalid_provider());
     }
 
-    if request.provider == "aws_s3" {
-        // NAN-2186: two valid postures. Static keys, OR a role this deployment
-        // assumes with its own ambient identity (instance profile / IRSA) —
-        // which is the whole point for a customer who will not mint an access
-        // key. Requiring keys unconditionally made the role posture
-        // unreachable through the API.
-        let has_static_keys = request.credentials.get("access_key_id").is_some()
-            && request.credentials.get("secret_access_key").is_some();
-        let has_assume_role = request.credentials.get("assume_role_arn").is_some();
-        if !has_static_keys && !has_assume_role {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(CredentialApiError::new(
-                    "invalid_credentials",
-                    "AWS S3 credentials must include either 'access_key_id' and \
-                     'secret_access_key', or 'assume_role_arn' for cross-account \
-                     role assumption",
-                )),
-            ));
-        }
-    } else if request.provider == "gcp_pubsub"
-        && request.credentials.get("credentials_json").is_none()
+    // Provider-specific completeness (AWS static keys or role, GCP service
+    // account JSON, Event Hubs connection string or service principal, ...).
+    // Kafka credentials are optional (can be unauthenticated).
+    let mut request = request;
+    if let Err(message) = normalize_credential_payload(&request.provider, &mut request.credentials)
+        .and_then(|()| validate_credential_payload(&request.provider, &request.credentials))
     {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(CredentialApiError::new(
-                "invalid_credentials",
-                "GCP Pub/Sub credentials must include 'credentials_json'",
-            )),
-        ));
-    } else if request.provider == "azure_event_hubs"
-        && !azure_event_hubs_credentials_complete(&request.credentials)
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(CredentialApiError::new(
-                "invalid_credentials",
-                "Azure Event Hubs credentials must include either 'connection_string', or \
-                 'azure_tenant_id', 'azure_client_id' and 'azure_client_secret'",
-            )),
+            Json(CredentialApiError::new("invalid_credentials", &message)),
         ));
     }
-    // Kafka credentials are optional (can be unauthenticated)
 
     let cred_name = request.name.clone();
     let cred_provider = request.provider.clone();
@@ -274,7 +255,7 @@ pub async fn create_credential(
         expires_at: request.expires_at,
     };
 
-    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
+    let repo = CredentialRepository::new(state.pool.clone());
     let credential = repo
         .create(&create_req, Some(auth.user_id()))
         .await
@@ -348,7 +329,7 @@ pub async fn update_credential(
         expires_at: request.expires_at,
     };
 
-    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
+    let repo = CredentialRepository::new(state.pool.clone());
     let credential = repo.update(*id, &update_req).await.map_err(|e| {
         let (status, err) = CredentialApiError::from_repo_error(&e);
         (status, Json(err))
@@ -391,6 +372,7 @@ pub struct DeleteResponse {
         (status = 200, description = "Credential deleted", body = DeleteResponse),
         (status = 403, description = "Forbidden", body = CredentialApiError),
         (status = 404, description = "Not found", body = CredentialApiError),
+        (status = 409, description = "Credential is still used by a source configuration or custom enrichment", body = CredentialApiError),
     ),
     security(("api_key" = []))
 )]
@@ -402,7 +384,7 @@ pub async fn delete_credential(
 ) -> Result<Json<DeleteResponse>, (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, "credentials:delete").map_err(|_| forbidden())?;
 
-    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
+    let repo = CredentialRepository::new(state.pool.clone());
 
     let cred_name = repo
         .get(*id)
@@ -436,7 +418,7 @@ pub async fn delete_credential(
     path = "/api/credentials/provider/{provider}",
     tag = "credentials",
     params(
-        ("provider" = String, Path, description = "Provider name (aws_s3, gcp_pubsub, kafka, azure_event_hubs)")
+        ("provider" = String, Path, description = "Provider name (aws_s3, gcp_pubsub, kafka, azure_event_hubs, okta, google_workspace, slack, saas_api)")
     ),
     responses(
         (status = 200, description = "List of credentials for provider", body = CredentialListResponse),
@@ -456,7 +438,7 @@ pub async fn list_credentials_by_provider(
         return Err(invalid_provider());
     }
 
-    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
+    let repo = CredentialRepository::new(state.pool.clone());
     let credentials = repo.list_by_provider(&provider).await.map_err(|e| {
         let (status, err) = CredentialApiError::from_repo_error(&e);
         (status, Json(err))
@@ -485,6 +467,131 @@ pub struct RotateCredentialRequest {
 pub struct CredentialRotationResponse {
     pub credential: CloudCredential,
     pub version: CloudCredentialVersion,
+    /// NAN-4914: what happened to the deployed source configurations bound to
+    /// this credential (secret-only refresh). The rotation itself always
+    /// committed when this response is returned.
+    pub source_refresh: SourceRefreshReport,
+}
+
+/// NAN-4914: the secret-only refresh of bound source configs after a
+/// rotation or rollback.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SourceRefreshReport {
+    /// `none` (no deployed source uses the credential), `complete` (every
+    /// bound source now runs the new secret), or `partial_failure` (at least
+    /// one bound source still runs the previous secret, or the bound sources
+    /// could not even be listed; see `error` and `results`).
+    pub status: SourceRefreshStatus,
+    pub results: Vec<SourceRefreshResult>,
+    /// Set when the bound sources could not be enumerated at all.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRefreshStatus {
+    None,
+    Complete,
+    PartialFailure,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SourceRefreshResult {
+    /// `srcfg_...`
+    pub source_configuration_id: String,
+    pub name: String,
+    /// `redeployed`, `pending_edits` (saved but undeployed edits: not
+    /// redeployed, still on the previous secret until deployed),
+    /// `no_deployed_snapshot` or `failed`.
+    pub outcome: String,
+    pub message: Option<String>,
+}
+
+pub(crate) fn source_refresh_report(
+    refreshed: Result<Vec<CredentialRefresh>, String>,
+) -> SourceRefreshReport {
+    let results = match refreshed {
+        Ok(results) => results,
+        Err(error) => {
+            return SourceRefreshReport { status: SourceRefreshStatus::PartialFailure, results: Vec::new(), error: Some(error) }
+        }
+    };
+    let status = if results.is_empty() {
+        SourceRefreshStatus::None
+    } else if results.iter().all(|r| r.outcome == CredentialRefreshOutcome::Redeployed) {
+        SourceRefreshStatus::Complete
+    } else {
+        SourceRefreshStatus::PartialFailure
+    };
+    let results = results
+        .into_iter()
+        .map(|r| {
+            let (outcome, message) = match r.outcome {
+                CredentialRefreshOutcome::Redeployed => ("redeployed", None),
+                CredentialRefreshOutcome::PendingEdits => (
+                    "pending_edits",
+                    Some("saved edits are not deployed; deploy the source to apply the new secret".to_string()),
+                ),
+                CredentialRefreshOutcome::NoDeployedSnapshot => (
+                    "no_deployed_snapshot",
+                    Some("no deployment snapshot to refresh from; deploy the source".to_string()),
+                ),
+                CredentialRefreshOutcome::Failed(m) => ("failed", Some(m)),
+            };
+            SourceRefreshResult {
+                source_configuration_id: nanosiem_core::typeid::encode("srcfg", &r.source_configuration_id),
+                name: r.name,
+                outcome: outcome.to_string(),
+                message,
+            }
+        })
+        .collect();
+    SourceRefreshReport { status, results, error: None }
+}
+
+/// NAN-4914: secret-only refresh of every deployed source config bound to a
+/// rotated or rolled-back credential (see
+/// `SourceConfigService::refresh_secrets_for_credential`). Each redeploy is
+/// audited as a source-config deploy carrying the triggering credential. An
+/// enumeration failure is reported as `partial_failure`, never as "no bound
+/// sources": the rotation itself already committed.
+async fn refresh_bound_source_configs(
+    state: &AppState,
+    auth: &AuthContext,
+    client: &ClientContext,
+    credential_id: Uuid,
+    previous: Option<&serde_json::Value>,
+    trigger: &str,
+) -> SourceRefreshReport {
+    let refreshed = state
+        .source_config_service
+        .refresh_secrets_for_credential(credential_id, previous)
+        .await
+        .map_err(|error| {
+            tracing::error!(%credential_id, %error, "listing source configs to refresh after credential change failed");
+            format!("the bound source configurations could not be refreshed: {error}")
+        });
+    if let Ok(results) = &refreshed {
+        for r in results {
+            let redeployed = r.outcome == CredentialRefreshOutcome::Redeployed;
+            state.emit_audit(
+                AuditEvent::builder(AuditSource::SourceConfig, SOURCE_CONFIG_DEPLOYED)
+                    .actor(Some(auth.user_id()), None)
+                    .api_key(auth.api_key_id, auth.api_key_name.clone())
+                    .resource("source_config", Some(r.source_configuration_id), Some(r.name.clone()))
+                    .client_context(client)
+                    .details(serde_json::json!({
+                        "success": redeployed,
+                        "outcome": format!("{:?}", r.outcome),
+                        "trigger": trigger,
+                        "secret_only": true,
+                        "credential_id": nanosiem_core::typeid::encode("cred", &credential_id),
+                    }))
+                    .build(),
+            );
+        }
+    }
+    source_refresh_report(refreshed)
 }
 
 /// Wrapper for the version list endpoint
@@ -495,8 +602,8 @@ pub struct CredentialVersionListResponse {
 }
 
 /// Rotate the secret material on a credential — creates a new active version
-/// while preserving the prior version for rollback. Source configs pick up
-/// the new secret on their next deploy.
+/// while preserving the prior version for rollback. Deployed source configs
+/// bound to the credential are redeployed with the new secret (NAN-4914).
 #[utoipa::path(
     post,
     path = "/api/credentials/{id}/rotate",
@@ -521,7 +628,24 @@ pub async fn rotate_credential(
 ) -> Result<Json<CredentialRotationResponse>, (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, permissions::CREDENTIALS_ROTATE).map_err(|_| forbidden())?;
 
-    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
+    let repo = CredentialRepository::new(state.pool.clone());
+
+    // The new version must satisfy the same provider rules as a create
+    // (NAN-4914: connector vendor credentials are a flat field map; a Google
+    // Workspace service-account key is split into its two fields).
+    let existing = repo.get(*id).await.map_err(|e| {
+        let (status, err) = CredentialApiError::from_repo_error(&e);
+        (status, Json(err))
+    })?;
+    let mut request = request;
+    if let Err(message) = normalize_credential_payload(&existing.provider, &mut request.credentials)
+        .and_then(|()| validate_credential_payload(&existing.provider, &request.credentials))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(CredentialApiError::new("invalid_credentials", &message)),
+        ));
+    }
 
     // Same lift as create: `external_id` is readable metadata, not payload.
     // A rotation may switch posture (static keys -> cross-account role), so it
@@ -539,6 +663,9 @@ pub async fn rotate_credential(
         note: request.note.clone(),
     };
 
+    // The payload being replaced, to recognize which values in the deployed
+    // snapshots are credential material (secret-only refresh, NAN-4914).
+    let previous = repo.get_decrypted(*id).await.ok();
     let (credential, version) = repo
         .rotate(*id, &rotate_req, Some(auth.user_id()))
         .await
@@ -564,9 +691,20 @@ pub async fn rotate_credential(
             .build(),
     );
 
+    let source_refresh = refresh_bound_source_configs(
+        &state,
+        &auth,
+        &client,
+        credential.id,
+        previous.as_ref(),
+        "credential_rotated",
+    )
+    .await;
+
     Ok(Json(CredentialRotationResponse {
         credential,
         version,
+        source_refresh,
     }))
 }
 
@@ -592,7 +730,7 @@ pub async fn list_credential_versions(
 ) -> Result<Json<CredentialVersionListResponse>, (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, "credentials:view").map_err(|_| forbidden())?;
 
-    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
+    let repo = CredentialRepository::new(state.pool.clone());
     let versions = repo.list_versions(*id).await.map_err(|e| {
         let (status, err) = CredentialApiError::from_repo_error(&e);
         (status, Json(err))
@@ -636,12 +774,15 @@ pub async fn rollback_credential(
 ) -> Result<Json<CredentialRotationResponse>, (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, permissions::CREDENTIALS_ROTATE).map_err(|_| forbidden())?;
 
-    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
+    let repo = CredentialRepository::new(state.pool.clone());
     let rollback_req = RollbackCloudCredential {
         version: request.version,
         note: request.note.clone(),
     };
 
+    // The payload being replaced, to recognize which values in the deployed
+    // snapshots are credential material (secret-only refresh, NAN-4914).
+    let previous = repo.get_decrypted(*id).await.ok();
     let (credential, version) = repo
         .rollback(*id, &rollback_req, Some(auth.user_id()))
         .await
@@ -668,9 +809,20 @@ pub async fn rollback_credential(
             .build(),
     );
 
+    let source_refresh = refresh_bound_source_configs(
+        &state,
+        &auth,
+        &client,
+        credential.id,
+        previous.as_ref(),
+        "credential_rolled_back",
+    )
+    .await;
+
     Ok(Json(CredentialRotationResponse {
         credential,
         version,
+        source_refresh,
     }))
 }
 
@@ -700,6 +852,9 @@ pub async fn rollback_credential(
         RotateCredentialRequest,
         RollbackCredentialRequest,
         CredentialRotationResponse,
+        SourceRefreshReport,
+        SourceRefreshStatus,
+        SourceRefreshResult,
         CredentialVersionListResponse,
         CloudCredentialVersion,
     ))
@@ -718,3 +873,11 @@ impl CredentialsApiDoc {
         vec![]
     }
 }
+
+#[cfg(test)]
+#[path = "credentials_refresh_tests.rs"]
+mod refresh_tests;
+
+#[cfg(test)]
+#[path = "credentials_tests.rs"]
+mod credentials_tests;

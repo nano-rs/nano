@@ -4,6 +4,31 @@
 
 use super::{ClickHouseMigrateError, ClickHouseMigrator};
 
+const CLUSTER_DETECTION_SQL: &str = "SELECT cluster FROM system.clusters \
+     WHERE cluster NOT IN ('_all_databases', 'system') \
+     GROUP BY cluster HAVING count() > 1 \
+     ORDER BY count() DESC, cluster ASC LIMIT 1";
+
+/// Resolve the explicit operator cluster or probe the same deterministic
+/// `system.clusters` candidate used by the migrator. Runtime repair code calls
+/// this only after observing a Distributed wrapper and fails closed when the
+/// result is absent or the probe cannot be executed.
+pub(crate) async fn configured_or_detected_cluster(
+    client: &clickhouse::Client,
+) -> Result<Option<String>, clickhouse::error::Error> {
+    if let Ok(env_cluster) = std::env::var("CLICKHOUSE_CLUSTER") {
+        let trimmed = env_cluster.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+    let rows = client
+        .query(CLUSTER_DETECTION_SQL)
+        .fetch_all::<String>()
+        .await?;
+    Ok(rows.into_iter().next())
+}
+
 impl ClickHouseMigrator {
     /// Detect whether we're running against ClickHouse Cloud.
     /// CH Cloud restricts certain settings (storage_policy, experimental indexes).
@@ -41,6 +66,35 @@ impl ClickHouseMigrator {
         Ok(is_cloud)
     }
 
+    /// Detect the server's `(major, minor)` version (NAN-4906), cached.
+    ///
+    /// Used to drop DDL settings that only exist on newer servers (see
+    /// `strip_settings_unsupported_by`). A failed probe or an unparsable
+    /// version yields `None`, which callers treat as a current server: every
+    /// pinned deployment runs the current release, so the SQL stays untouched.
+    pub(super) async fn detect_server_version(&mut self) -> Option<(u32, u32)> {
+        if let Some(v) = self.server_version {
+            return v;
+        }
+        let v = match self.client.query("SELECT version()").fetch_one::<String>().await {
+            Ok(raw) => Self::parse_server_version(&raw),
+            Err(e) => {
+                tracing::warn!("Could not read ClickHouse version(): {e}; assuming a current server");
+                None
+            }
+        };
+        self.server_version = Some(v);
+        v
+    }
+
+    /// Parse `"26.10.3.7"` (or `"26.4.5.143 (official build)"`) into `(26, 10)`.
+    pub(super) fn parse_server_version(raw: &str) -> Option<(u32, u32)> {
+        let mut parts = raw.trim().split(|c: char| c == '.' || c.is_whitespace());
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        Some((major, minor))
+    }
+
     /// Detect whether we're running against a ClickHouse cluster.
     /// Returns the cluster name if found (e.g., "nanosiem_cluster"), None for single-node.
     pub(super) async fn detect_cluster(
@@ -56,20 +110,8 @@ impl ClickHouseMigrator {
         // avoids the ambiguity of auto-detecting between e.g. an operator's
         // `nanosiem_cluster` and an auto-created `default`. Empty/whitespace is
         // treated as unset (open-core / single-node), falling through to probing.
-        if let Ok(env_cluster) = std::env::var("CLICKHOUSE_CLUSTER") {
-            let trimmed = env_cluster.trim();
-            if !trimmed.is_empty() {
-                tracing::info!(
-                    "Using ClickHouse cluster '{}' from CLICKHOUSE_CLUSTER env",
-                    trimmed
-                );
-                let name = Some(trimmed.to_string());
-                self.cluster = Some(name.clone());
-                return Ok(name);
-            }
-        }
-
-        // Look for a cluster with multiple shards in system.clusters.
+        // Look for a configured cluster first, then a cluster with multiple
+        // shards in system.clusters.
         // The operator creates a 'default' cluster automatically.
         // Exclude built-in system clusters: '_all_databases' and 'system'.
         //
@@ -78,17 +120,10 @@ impl ClickHouseMigrator {
         // `nanosiem_cluster` and an auto `default`) would be picked
         // nondeterministically across runs, so a migrator could target a
         // different cluster each time (M-8/D10).
-        let cluster_name = self
-            .client
-            .query(
-                "SELECT cluster FROM system.clusters \
-                 WHERE cluster NOT IN ('_all_databases', 'system') \
-                 GROUP BY cluster HAVING count() > 1 \
-                 ORDER BY count() DESC, cluster ASC LIMIT 1",
-            )
-            .fetch_one::<String>()
+        let cluster_name = configured_or_detected_cluster(&self.client)
             .await
-            .ok();
+            .ok()
+            .flatten();
 
         if let Some(ref name) = cluster_name {
             tracing::info!(

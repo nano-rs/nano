@@ -10,7 +10,8 @@ import { PROTOCOL_LABEL } from '@/lib/add-data-sources';
 import { CopyButton } from './CopyButton';
 
 /**
- * The plaintext token, shown once (NAN-2593). Copy is focused on mount and the
+ * The plaintext token, shown once (NAN-2593; ported by NAN-4922 over the
+ * single-tenant ingest tokens of NAN-4907). Copy is focused on mount and the
  * panel scrolls into view. The token stays until the user says it is saved;
  * dismissing a token that was never copied asks first, because it can never
  * be shown again (the NAN-2589 lesson).
@@ -54,11 +55,9 @@ export function OneTimeToken({
           </span>
         ))}
         <span className="flex-1" />
-        {credential.credentialId && (
-          <span className="font-mono text-[10.5px] text-muted-foreground/70 truncate" title="credential id">
-            {credential.credentialId}
-          </span>
-        )}
+        <span className="font-mono text-[10.5px] text-muted-foreground/70 truncate" title="token prefix (all that is shown again)">
+          {credential.tokenPrefix}…
+        </span>
       </div>
       <div className="px-3 py-2.5 space-y-2">
         <div className="flex items-center gap-2">
@@ -76,7 +75,7 @@ export function OneTimeToken({
         <div className="flex items-center gap-2">
           <AlertTriangle className="w-3 h-3 text-amber-500 shrink-0" strokeWidth={1.5} />
           <span className="text-[11px] text-muted-foreground">
-            Shown once. nano does not keep it; if you lose it, revoke the credential and issue another.
+            Shown once. nano keeps only a hash; if you lose it, rotate or revoke the token and issue another.
           </span>
           <span className="flex-1" />
           <Button
@@ -93,7 +92,7 @@ export function OneTimeToken({
         open={confirmOpen}
         onOpenChange={setConfirmOpen}
         title="Hide a token you haven't copied?"
-        description="This token was never copied. Once hidden it can never be shown again; you would have to revoke the credential and issue a new one."
+        description="This token was never copied. Once hidden it can never be shown again; you would have to rotate or revoke the token and issue a new one."
         confirmLabel="Hide token"
         cancelLabel="Keep it"
         variant="warning"

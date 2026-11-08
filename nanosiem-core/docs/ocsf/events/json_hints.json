@@ -1,0 +1,66 @@
+[
+ {
+  "ocsf_path": "action",
+  "ch_type": "LowCardinality(Nullable(String))"
+ },
+ {
+  "ocsf_path": "actor.process.file.name",
+  "ch_type": "Nullable(String)"
+ },
+ {
+  "ocsf_path": "connection_info.protocol_name",
+  "ch_type": "LowCardinality(Nullable(String))"
+ },
+ {
+  "ocsf_path": "device.type",
+  "ch_type": "LowCardinality(Nullable(String))"
+ },
+ {
+  "ocsf_path": "disposition",
+  "ch_type": "LowCardinality(Nullable(String))"
+ },
+ {
+  "ocsf_path": "dst_endpoint.svc_name",
+  "ch_type": "Nullable(String)"
+ },
+ {
+  "ocsf_path": "firewall_rule.name",
+  "ch_type": "Nullable(String)"
+ },
+ {
+  "ocsf_path": "firewall_rule.uid",
+  "ch_type": "Nullable(String)"
+ },
+ {
+  "ocsf_path": "http_response.status",
+  "ch_type": "LowCardinality(Nullable(String))"
+ },
+ {
+  "ocsf_path": "logon_type",
+  "ch_type": "LowCardinality(Nullable(String))"
+ },
+ {
+  "ocsf_path": "metadata.log_level",
+  "ch_type": "LowCardinality(Nullable(String))"
+ },
+ {
+  "ocsf_path": "metadata.log_source",
+  "ch_type": "LowCardinality(Nullable(String))"
+ },
+ {
+  "ocsf_path": "metadata.original_event_uid",
+  "ch_type": "Nullable(String)"
+ },
+ {
+  "ocsf_path": "process.file.name",
+  "ch_type": "Nullable(String)"
+ },
+ {
+  "ocsf_path": "query.type",
+  "ch_type": "LowCardinality(Nullable(String))"
+ },
+ {
+  "ocsf_path": "service.name",
+  "ch_type": "Nullable(String)"
+ }
+]

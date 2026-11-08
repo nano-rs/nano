@@ -44,7 +44,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
 import { formatUTC } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
-import type { ReportArtifactMeta, ReportDefinition, ReportRun, ReportRunAiSummary } from '@/lib/api';
+import type { ReportArtifactMeta, ReportDefinition, ReportRun } from '@/lib/api';
 
 type FilterTab = 'mine' | 'all';
 
@@ -88,45 +88,6 @@ function formatBytes(n: number): string {
 
 function formatSchedule(cron: string): string {
   return cron;
-}
-
-/**
- * NAN-2361 wave 7: the hosted-shared narrative block. A skipped/failed lane
- * states its reason instead of hiding; completed shows the narrative and
- * the concrete findings.
- */
-function RunAiSummary({ summary }: { summary: ReportRunAiSummary }) {
-  if (summary.state !== 'completed') {
-    return (
-      <div className="basis-full text-[10.5px] font-mono text-muted-foreground/80">
-        ai summary {summary.state}
-        {summary.reason ? `: ${summary.reason}` : ''}
-      </div>
-    );
-  }
-  return (
-    <div className="basis-full border border-border rounded px-2.5 py-2 mb-1">
-      <div className="flex items-center gap-2 mb-1">
-        <span className="font-mono text-[9.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-          ai summary
-        </span>
-        {summary.model_id && (
-          <span className="font-mono text-[9.5px] text-muted-foreground/70">{summary.model_id}</span>
-        )}
-      </div>
-      <p className="text-[11.5px] text-foreground leading-snug">{summary.narrative}</p>
-      {summary.key_findings.length > 0 && (
-        <ul className="mt-1.5 space-y-0.5">
-          {summary.key_findings.map((finding, index) => (
-            <li key={index} className="text-[11px] text-muted-foreground leading-snug">
-              <span className="font-mono text-[10px] text-muted-foreground/60 mr-1.5">{index + 1}.</span>
-              {finding}
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
 }
 
 /** Per-run row: expands to load artifacts (the runs list returns none). */
@@ -234,7 +195,6 @@ function RunRow({ run }: { run: ReportRun }) {
               <div className="text-[11px] text-red-400 font-mono">{run.error}</div>
             ) : artifacts && artifacts.length > 0 ? (
               <div className="flex flex-wrap items-center gap-2">
-                {run.ai_summary && <RunAiSummary summary={run.ai_summary} />}
                 {artifacts.map((a) => (
                   <button
                     key={a.id}

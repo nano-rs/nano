@@ -37,11 +37,11 @@ const MIGRATION_129: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../clickhouse/129_prevalence_mv_split.sql"
 ));
-// NAN-1443 lean-storage rework: the promote MV in migration 135 populates
-// event_bytes on existing tenants; it must match ocsf/init.sql's ingest MV.
-const MIGRATION_135: &str = include_str!(concat!(
+// NAN-4903: migration 180 drops the 1.8-shaped OCSF objects (including the
+// migration-135 ingest MV that used to define event_bytes on existing tenants).
+const MIGRATION_180: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../clickhouse/135_ocsf_promote_udm_parity.sql"
+    "/../clickhouse/180_ocsf_version_agnostic_store.sql"
 ));
 // NAN-1661: migration 150 supersedes migration 129 for the OCSF prevalence
 // branch MVs — it retargets them from the entity-keyed *_prevalence_summary
@@ -310,46 +310,35 @@ fn migration_152_matches_init_definitions() {
 }
 
 /// The OCSF telemetry rollup depends on `event_bytes` (the serialized-event byte
-/// count). NAN-1443 ("OCSF lean storage via Null-table + MV") replaced the old
-/// MATERIALIZED-at-insert column with a PLAIN column whose value is computed by
-/// the ingest MV (`length(toString(event))` off `ocsf_logs_raw`). Two locksteps
-/// must hold or fresh-vs-migrated tables diverge:
-///   1. the plain column definition is byte-identical in the fresh CREATE TABLE
-///      and the existing-tenant overlay ALTER (both in ocsf/init.sql);
-///   2. the MV value expression is byte-identical between ocsf/init.sql's ingest
-///      MV and the migration-135 promote MV that populates existing tenants.
-///
-/// Migration 128's earlier `ADD COLUMN … MATERIALIZED` is SUPERSEDED by the
-/// NAN-1443 rework and intentionally not asserted: it survives only as an
-/// `ADD COLUMN IF NOT EXISTS` no-op once init.sql has created the plain column.
+/// count), a PLAIN column whose value the ingest MV computes off `ocsf_logs_raw`
+/// (NAN-1443). NAN-4903: migration 180 drops the 1.8-shaped `ocsf_logs` and its
+/// MV, and the generated overlay (`scripts/gen-ocsf-ddl.py`) is now the only
+/// definition — fresh and migrated tenants both get it from the same CREATE, so
+/// the old CREATE-vs-ALTER and init-vs-migration-135 locksteps no longer exist.
+/// What must hold: one column definition, one MV expression, both generated,
+/// and no `event_bytes` in the UDM schema.
 #[test]
 fn event_bytes_definitions_in_lockstep() {
-    // 1. Plain column — twice in ocsf/init.sql (CREATE TABLE + overlay ALTER).
-    let col_def = "`event_bytes` UInt64 CODEC(T64, LZ4)";
+    let col_def = "`event_bytes` UInt32 CODEC(T64, LZ4)";
     assert_eq!(
         OCSF_INIT.matches(col_def).count(),
-        2,
-        "ocsf/init.sql must define the plain event_bytes column exactly twice \
-         (CREATE TABLE + overlay ALTER); NAN-1443 dropped the MATERIALIZED form"
+        1,
+        "ocsf/init.sql must define the plain event_bytes column exactly once (generated CREATE TABLE)"
     );
-    // event_bytes is OCSF-only — it must not leak into the UDM schema.
     assert_eq!(
-        UDM_INIT.matches(col_def).count(),
+        UDM_INIT.matches("`event_bytes`").count(),
         0,
         "event_bytes is an OCSF-only column; it must not appear in clickhouse/init.sql"
     );
-
-    // 2. The MV value expression must be byte-identical in the fresh ingest MV
-    //    (ocsf/init.sql) and the migration-135 promote MV.
-    let mv_expr = "length(toString(event)) AS `event_bytes`";
+    let mv_expr = "toUInt32(length(toJSONString(event))) AS `event_bytes`";
     assert_eq!(
         OCSF_INIT.matches(mv_expr).count(),
         1,
         "ocsf/init.sql's ingest MV must compute event_bytes exactly once"
     );
-    assert_eq!(
-        MIGRATION_135.matches(mv_expr).count(),
-        1,
-        "migration 135's promote MV must compute event_bytes identically to ocsf/init.sql"
+    assert!(
+        MIGRATION_180.contains("DROP VIEW IF EXISTS nanosiem.ocsf_logs_raw_mv"),
+        "migration 180 must drop the 1.8 ingest MV (migration 135's event_bytes definition) \
+         so the overlay's definition is the only one"
     );
 }

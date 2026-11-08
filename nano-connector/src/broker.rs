@@ -11,19 +11,24 @@
 //! Connections are reused within one run (one broker per run): an idle
 //! connection is keyed by (host, pinned address), so a reused connection is
 //! always the one that was dialed to the pinned IP and verified for that
-//! host name. Nothing is shared across runs, so nothing is shared across
-//! tenants.
+//! host name. Nothing is shared across runs.
 //!
 //! Timeouts: connect, TLS handshake, response headers, the gap between two
 //! body frames (slowloris), and the whole exchange.
 //!
-//! Egress proxy (NAN-4369): with a [`crate::egress_proxy::ProxyDialer`] the
-//! TCP leg is a CONNECT tunnel through the platform egress proxy, which
-//! authorizes the exact host for the run's [`EgressGrant`]. Every check above
-//! still runs in process first (allowlist, deny list, resolve-and-refuse
-//! non-public answers); the proxy re-resolves and enforces its own private
-//! range deny. TLS (SNI and certificate name = the host) runs inside the
-//! tunnel, so the proxy never sees request headers or vendor credentials.
+//! Address checks: every resolved answer must pass the connector's own
+//! reserved-range list AND the platform's shared SSRF validator
+//! (`nanosiem_core::inputlookup::SsrfValidator`), see
+//! [`HostPolicy::check_ip`].
+//!
+//! Operator egress proxy (NAN-4914): with a [`crate::egress::ProxyDialer`]
+//! the TCP leg is a CONNECT tunnel to the pinned address through the
+//! operator's forward proxy. Every check above still runs in process first.
+//! TLS (SNI and certificate name = the host) runs inside the tunnel, so the
+//! proxy never sees request headers or vendor credentials. In the opt-in
+//! hostname mode ([`crate::egress::ProxyMode::Hostname`]) the tunnel targets
+//! `host:port` and the proxy resolves the name: the broker skips its own DNS
+//! resolution and address checks for that hop (see [`Dialer::resolves_remotely`]).
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -53,7 +58,7 @@ pub enum BrokerError {
     Connect(SocketAddr, String),
     /// The egress proxy did not open a tunnel; nothing reached the vendor.
     #[error("{0}; the request was not sent")]
-    EgressProxy(crate::egress_proxy::ProxyRefusal),
+    EgressProxy(crate::egress::ProxyRefusal),
     #[error("TLS with {0} failed: {1}")]
     Tls(String, String),
     #[error("HTTP exchange failed: {0}")]
@@ -93,52 +98,35 @@ impl Resolver for SystemResolver {
     }
 }
 
-/// What a run's egress is authorized for, carried to the dialer. One broker
-/// serves one run, so the grant is fixed for the broker's lifetime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EgressGrant {
-    pub tenant: uuid::Uuid,
-    pub connection: uuid::Uuid,
-    pub revision: i64,
-    pub purpose: GrantPurpose,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantPurpose {
-    /// A native SOAR vendor call.
-    Soar,
-    SoarSmtp,
-    Connector,
-    ThreatIntel,
-}
-
-impl GrantPurpose {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Soar => "soar",
-            Self::SoarSmtp => "soar_smtp",
-            Self::Connector => "connector",
-            Self::ThreatIntel => "threat_intel",
-        }
-    }
-}
-
-/// One new connection: the policy-checked host, the pinned address it
-/// resolved to, and the run's grant (absent outside granted runs).
+/// One new connection: the policy-checked host and the pinned address it
+/// resolved to.
 #[derive(Debug, Clone, Copy)]
 pub struct DialTarget<'a> {
     pub host: &'a str,
     pub addr: SocketAddr,
-    pub grant: Option<&'a EgressGrant>,
 }
 
 /// TCP connect for one new connection. Production connects directly to the
-/// pinned address or tunnels through the egress proxy; tests map pinned
-/// public addresses onto a local mock.
+/// pinned address or tunnels to it through the operator's egress proxy
+/// ([`crate::egress`]); tests map pinned public addresses onto a local mock.
 #[async_trait::async_trait]
 pub trait Dialer: Send + Sync {
     async fn dial(&self, target: DialTarget<'_>) -> std::io::Result<TcpStream>;
+
+    /// True when this dialer hands `host` to an egress proxy by name and the
+    /// proxy resolves it ([`crate::egress::ProxyMode::Hostname`]). The broker
+    /// then never resolves or pins the name: it dials
+    /// [`REMOTE_RESOLUTION_ADDR`] on the request's port, and the dialer uses
+    /// only `host` and the port. The allowlist, deny list and literal-IP
+    /// refusal still run first. Default: false (resolve, check and pin).
+    fn resolves_remotely(&self, _host: &str) -> bool {
+        false
+    }
 }
+
+/// Address the broker passes in a [`DialTarget`] when the dialer resolves the
+/// name remotely: unspecified, never a connectable destination.
+pub const REMOTE_RESOLUTION_ADDR: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
 
 pub struct DirectDialer;
 
@@ -174,9 +162,6 @@ impl ClientIdentity {
 pub struct BrokerConfig {
     pub resolver: Arc<dyn Resolver>,
     pub dialer: Arc<dyn Dialer>,
-    /// The run's egress grant, passed to the dialer (NAN-4369). Set per run
-    /// by the caller that owns the tenant connection; never shared.
-    pub egress_grant: Option<EgressGrant>,
     /// Extra trust anchors (tests). Production trusts webpki roots only.
     pub extra_roots: Vec<CertificateDer<'static>>,
     /// TCP connect, and separately the TLS handshake.
@@ -205,7 +190,6 @@ impl Default for BrokerConfig {
         Self {
             resolver: Arc::new(SystemResolver),
             dialer: Arc::new(DirectDialer),
-            egress_grant: None,
             extra_roots: Vec::new(),
             connect_timeout: Duration::from_secs(10),
             response_timeout: Duration::from_secs(60),
@@ -262,12 +246,22 @@ impl Drop for IdleConn {
     }
 }
 
-type PoolKey = (String, SocketAddr);
+/// (host, pinned address, whether the connection presented the client
+/// identity): an mTLS connection is never reused for an anonymous exchange,
+/// nor the reverse.
+type PoolKey = (String, SocketAddr, bool);
 
 /// One broker per run: pins, pooled connections and TLS identity are per run.
+///
+/// The mTLS client identity is presented only on exchanges sent with
+/// [`Broker::send_once`] (the request's own authentication origin). The
+/// engine sends a redirect hop to another host with
+/// [`Broker::send_once_without_client_auth`], which handshakes with no client
+/// certificate, exactly as header/query auth is dropped for that hop.
 pub struct Broker {
     cfg: BrokerConfig,
     tls: Arc<ClientConfig>,
+    tls_anonymous: Arc<ClientConfig>,
     pins: Mutex<HashMap<String, IpAddr>>,
     pool: Mutex<HashMap<PoolKey, Vec<IdleConn>>>,
     /// (host, dialed address) per new connection, for audit and tests.
@@ -290,6 +284,8 @@ impl Broker {
             .with_safe_default_protocol_versions()
             .map_err(|e| BrokerError::Tls("config".into(), e.to_string()))?
             .with_root_certificates(roots);
+        let mut tls_anonymous = builder.clone().with_no_client_auth();
+        tls_anonymous.alpn_protocols = vec![b"http/1.1".to_vec()];
         let mut tls = match identity {
             Some(id) => builder
                 .with_client_auth_cert(id.cert_chain, id.key)
@@ -300,6 +296,7 @@ impl Broker {
         Ok(Self {
             cfg,
             tls: Arc::new(tls),
+            tls_anonymous: Arc::new(tls_anonymous),
             pins: Mutex::new(HashMap::new()),
             pool: Mutex::new(HashMap::new()),
             dial_log: Mutex::new(Vec::new()),
@@ -371,13 +368,13 @@ impl Broker {
         }
     }
 
-    async fn dial(&self, host: &str, addr: SocketAddr) -> Result<IdleConn, BrokerError> {
+    async fn dial(&self, host: &str, addr: SocketAddr, client_auth: bool) -> Result<IdleConn, BrokerError> {
         self.dial_log.lock().expect("dial log").push((host.to_string(), addr));
-        let target = DialTarget { host, addr, grant: self.cfg.egress_grant.as_ref() };
+        let target = DialTarget { host, addr };
         let tcp = tokio::time::timeout(self.cfg.connect_timeout, self.cfg.dialer.dial(target))
             .await
             .map_err(|_| BrokerError::Timeout("connect"))?
-            .map_err(|e| match crate::egress_proxy::ProxyRefusal::from_io(&e) {
+            .map_err(|e| match crate::egress::ProxyRefusal::from_io(&e) {
                 Some(refusal) => BrokerError::EgressProxy(refusal),
                 None => BrokerError::Connect(addr, e.to_string()),
             })?;
@@ -385,7 +382,8 @@ impl Broker {
             .map_err(|e| BrokerError::Tls(host.to_string(), e.to_string()))?;
         let tls = tokio::time::timeout(
             self.cfg.connect_timeout,
-            tokio_rustls::TlsConnector::from(self.tls.clone()).connect(server_name, tcp),
+            tokio_rustls::TlsConnector::from(if client_auth { self.tls.clone() } else { self.tls_anonymous.clone() })
+                .connect(server_name, tcp),
         )
         .await
         .map_err(|_| BrokerError::Timeout("tls handshake"))?
@@ -423,20 +421,49 @@ impl Broker {
             .map_err(|e| BrokerError::Http(e.to_string()))
     }
 
-    /// One HTTP exchange, no redirect following.
+    /// One HTTP exchange, no redirect following. Presents the client
+    /// identity (if any): use only for the request's authentication origin.
     pub async fn send_once(
         &self,
         req: &OutboundRequest,
         hosts: &HostPolicy,
         caps: BodyCaps,
     ) -> Result<InboundResponse, BrokerError> {
+        self.exchange(req, hosts, caps, true).await
+    }
+
+    /// [`Broker::send_once`] with no client certificate in the handshake (a
+    /// redirect hop away from the authentication origin).
+    pub async fn send_once_without_client_auth(
+        &self,
+        req: &OutboundRequest,
+        hosts: &HostPolicy,
+        caps: BodyCaps,
+    ) -> Result<InboundResponse, BrokerError> {
+        self.exchange(req, hosts, caps, false).await
+    }
+
+    async fn exchange(
+        &self,
+        req: &OutboundRequest,
+        hosts: &HostPolicy,
+        caps: BodyCaps,
+        client_auth: bool,
+    ) -> Result<InboundResponse, BrokerError> {
         self.check_request(req)?;
         let (host, port) = hosts.check(&req.url)?;
-        let ip = self.pinned_ip(&host, hosts).await?;
-        // Defense in depth: the pinned address passed the same check above.
-        hosts.check_ip(ip)?;
-        let addr = SocketAddr::new(ip, port);
-        let key: PoolKey = (host.clone(), addr);
+        let addr = if self.cfg.dialer.resolves_remotely(&host) {
+            // Hostname-mode egress proxy (NAN-4918): the proxy resolves and
+            // enforces egress; the name was allowlist-checked above and a
+            // literal IP never passes `check`.
+            SocketAddr::new(REMOTE_RESOLUTION_ADDR, port)
+        } else {
+            let ip = self.pinned_ip(&host, hosts).await?;
+            // Defense in depth: the pinned address passed the same check above.
+            hosts.check_ip(ip)?;
+            SocketAddr::new(ip, port)
+        };
+        let key: PoolKey = (host.clone(), addr, client_auth);
 
         let deadline = Instant::now() + self.cfg.response_timeout;
         // A pooled connection can be closed by the server between our
@@ -445,7 +472,7 @@ impl Broker {
         let (mut conn, resp) = loop {
             let (mut conn, pooled) = match self.take_idle(&key) {
                 Some(c) => (c, true),
-                None => (self.dial(&host, addr).await?, false),
+                None => (self.dial(&host, addr, client_auth).await?, false),
             };
             let hreq = self.build_request(req, &host)?;
             let left = deadline.saturating_duration_since(Instant::now());

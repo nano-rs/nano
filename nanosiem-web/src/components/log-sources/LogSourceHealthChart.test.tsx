@@ -10,9 +10,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import type { HealthSeriesPoint, LogSourceHealthSeries } from '@/lib/api';
 
+const schema = vi.hoisted(() => ({ profile: 'ocsf' }));
 const mocks = vi.hoisted(() => ({
   getHealthSeries: vi.fn(),
   getLogSourceHealthSeries: vi.fn(),
+  // NAN-4922: drill-downs scope by the active schema's log-source field.
+  getSchemaFields: vi.fn(async () => ({ schema: schema.profile, fields: [] })),
 }));
 vi.mock('@/lib/api', () => ({ api: mocks }));
 
@@ -113,6 +116,8 @@ function Loc() {
 
 function wrap(ui: React.ReactNode, initial = '/') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  // The schema profile is resolved before the chart is clicked (as in the app after load).
+  qc.setQueryData(['schema-fields'], { schema: schema.profile, fields: [] });
   return render(
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={[initial]}>
@@ -237,6 +242,23 @@ describe('LogSourceHealthPanel', () => {
     expect(params.get('end')).toBe('2026-10-07T01:00:00.000Z');
   });
 
+  it('scopes the drill-down by source_type on a UDM install', async () => {
+    schema.profile = 'udm';
+    try {
+      mocks.getLogSourceHealthSeries.mockResolvedValue([CLOUDTRAIL]);
+      wrap(<LogSourceHealthPanel logSourceId="lsrc_cloudtrail" />);
+      const panel = await screen.findByTestId('log-source-health-panel');
+      const chart = within(panel).getAllByTestId('health-band-chart')[0];
+      fireEvent.mouseMove(chart, { clientX: 44 });
+      fireEvent.click(chart);
+      await waitFor(() => expect(screen.getByTestId('loc').textContent).toMatch(/^\/search\?/));
+      const params = new URLSearchParams(screen.getByTestId('loc').textContent!.split('?')[1]);
+      expect(params.get('q')).toBe('source_type="aws_cloudtrail"');
+    } finally {
+      schema.profile = 'ocsf';
+    }
+  });
+
   it('shows an unavailable note when the source is not visible', async () => {
     mocks.getLogSourceHealthSeries.mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }));
     wrap(<LogSourceHealthPanel logSourceId="lsrc_nope" />);
@@ -253,10 +275,12 @@ describe('helpers', () => {
   });
 
   it('ORs multiple slugs in parentheses', () => {
-    const href = healthSearchHref(['a', 'b'], { field: 'class_name', value: 'Process Activity' });
+    const href = healthSearchHref(['a', 'b'], { sourceField: 'metadata.log_source', field: 'class_name', value: 'Process Activity' });
     expect(new URLSearchParams(href.split('?')[1]).get('q')).toBe(
       '(metadata.log_source="a" OR metadata.log_source="b") class_name="Process Activity"',
     );
+    const udm = healthSearchHref(['a'], { sourceField: 'source_type' });
+    expect(new URLSearchParams(udm.split('?')[1]).get('q')).toBe('source_type="a"');
   });
 });
 

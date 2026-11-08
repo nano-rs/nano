@@ -158,7 +158,7 @@ export function IntegrationCard({ entry, onOpen, onInstall, airGap = false, onIm
           : <FooterAction state={state} slug={entry.slug} onInstall={onInstall} />}
       </div>
 
-      {/* CC BY-SA 4.0 redistribution credit for the native IPinfo Lite feed. */}
+      {/* CC BY-SA 4.0 redistribution credit for the IPinfo Lite feed (platform feed bundle). */}
       {isIpInfoEntry(entry) && <IpInfoCredit className="mt-2" />}
     </button>
   );

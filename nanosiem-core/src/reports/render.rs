@@ -166,7 +166,12 @@ svg{max-width:100%;height:auto;border:1px solid var(--border);border-radius:4px;
 /// Append an HTML `<table>` for `rows`, bounded by `byte_cap` (stops adding rows
 /// before the cap). Returns whether it truncated. Adds a "showing N of M" note
 /// when rows exceed the display cap.
-fn push_html_table(out: &mut String, rows: &[Value], columns: &[String], byte_cap: usize) -> bool {
+fn push_html_table(
+    out: &mut String,
+    rows: &[Value],
+    columns: &[String],
+    byte_cap: usize,
+) -> bool {
     let cols = resolve_columns(columns, rows);
     if cols.is_empty() {
         out.push_str("<p class=\"empty\">No columns.</p>");
@@ -188,10 +193,7 @@ fn push_html_table(out: &mut String, rows: &[Value], columns: &[String], byte_ca
         let obj = row.as_object();
         let mut line = String::from("<tr>");
         for c in &cols {
-            let cell = obj
-                .and_then(|o| o.get(c))
-                .map(cell_to_string)
-                .unwrap_or_default();
+            let cell = obj.and_then(|o| o.get(c)).map(cell_to_string).unwrap_or_default();
             line.push_str("<td>");
             line.push_str(&html_escape(&cell));
             line.push_str("</td>");
@@ -476,14 +478,14 @@ pub fn render_dashboard_html(
         out.push_str(&format!("<h2>{}</h2>", html_escape(&panel.title)));
 
         if let Some(reason) = &panel.unsupported {
-            out.push_str(&format!("<p class=\"empty\">{}</p>", html_escape(reason)));
+            out.push_str(&format!(
+                "<p class=\"empty\">{}</p>",
+                html_escape(reason)
+            ));
             continue;
         }
         if let Some(err) = &panel.error {
-            out.push_str(&format!(
-                "<p class=\"err\">Panel failed: {}</p>",
-                html_escape(err)
-            ));
+            out.push_str(&format!("<p class=\"err\">Panel failed: {}</p>", html_escape(err)));
             continue;
         }
         if panel.rows.is_empty() {
@@ -500,18 +502,12 @@ pub fn render_dashboard_html(
                 .and_then(|o| o.values().next())
                 .map(cell_to_string)
                 .unwrap_or_default();
-            out.push_str(&format!(
-                "<div class=\"single\">{}</div>",
-                html_escape(&value)
-            ));
+            out.push_str(&format!("<div class=\"single\">{}</div>", html_escape(&value)));
             continue;
         }
 
         // Chartable line/area/bar shapes → inline SVG; else a table.
-        let charted = if matches!(
-            panel.viz_type.as_str(),
-            "line" | "area" | "bar" | "ranked_bar"
-        ) {
+        let charted = if matches!(panel.viz_type.as_str(), "line" | "area" | "bar" | "ranked_bar") {
             try_svg_chart(&panel.rows, &panel.columns, &panel.viz_type)
         } else {
             None

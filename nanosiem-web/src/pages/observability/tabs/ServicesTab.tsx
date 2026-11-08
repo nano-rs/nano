@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { TelemetrySetupHint } from '@/components/observability/TelemetryUnavailable';
+import { TelemetrySetupHint } from '@/components/observability/TelemetrySetupHint';
 
 // ServicesTab (NAN-1536) — RED overview across all services, health-sorted.
 //
@@ -30,8 +30,6 @@ import { HEALTH, fmtNum, fmtRate, fmtMs, fmtPct, toDesignHealth, type DesignHeal
 import type { ServiceSummary, ServiceHealth, ServicesSort } from '@/lib/api/observability';
 import type { ObservabilityTabProps } from '../types';
 
-import { isBackgroundService, latencyClass, backgroundHealth } from '@/components/observability/workload';
-
 type ViewMode = 'list' | 'grid';
 
 // One page of services pulled per fetch; "Load more" appends the next page.
@@ -56,7 +54,7 @@ const HealthDot = ({ h, pulse }: { h: DesignHealth; pulse?: boolean }) => (
     className={cn(
       'inline-block w-[7px] h-[7px] rounded-full shrink-0',
       HEALTH[h].dot,
-      pulse && (h === 'warn' || h === 'danger') && 'animate-pulse'
+      pulse && h !== 'good' && 'animate-pulse'
     )}
   />
 );
@@ -72,9 +70,7 @@ function SummaryStrip({ services, total }: { services: ServiceSummary[]; total: 
   const totalErr = services.reduce((s, x) => s + x.rate_per_sec * x.error_rate, 0);
   const weightedErrPct = totalRate > 0 ? (totalErr / totalRate) * 100 : 0;
   const worstP95 = services.length ? Math.max(...services.map((s) => s.p95_ms)) : 0;
-  const foreground = services.filter((s) => !isBackgroundService(s.service));
-  const backgroundCount = services.length - foreground.length;
-  const healthy = foreground.filter((s) => s.health === 'good').length;
+  const healthy = services.filter((s) => s.health === 'good').length;
 
   // O51 (NAN-1721): these figures aggregate only the loaded page of services,
   // not the whole fleet. When more services exist than are loaded, annotate the
@@ -95,14 +91,13 @@ function SummaryStrip({ services, total }: { services: ServiceSummary[]; total: 
       label: 'Latency p95',
       value: fmtMs(worstP95),
       unit: isSlice ? `worst · ${sliceUnit}` : 'worst',
-      tone: services.filter((s) => s.p95_ms === worstP95).every((s) => isBackgroundService(s.service))
-        ? 'neutral' : worstP95 >= 1800 ? 'danger' : worstP95 >= 600 ? 'warn' : 'good',
+      tone: worstP95 >= 1800 ? 'danger' : worstP95 >= 600 ? 'warn' : 'good',
     },
     {
       label: 'Services',
-      value: isSlice ? `${services.length}/${total}` : foreground.length ? `${healthy}/${foreground.length}` : String(services.length),
-      unit: isSlice ? 'loaded' : foreground.length ? `healthy${backgroundCount ? ` · ${backgroundCount} background` : ''}` : 'background',
-      tone: foreground.length ? (healthy === foreground.length ? 'good' : 'warn') : 'neutral',
+      value: isSlice ? `${services.length}/${total}` : `${healthy}/${services.length}`,
+      unit: isSlice ? 'loaded' : 'healthy',
+      tone: healthy === services.length ? 'good' : 'warn',
     },
   ];
 
@@ -133,7 +128,7 @@ function SummaryStrip({ services, total }: { services: ServiceSummary[]; total: 
 const LIST_COLS = 'grid-cols-[22px_minmax(180px,1.4fr)_1fr_1fr_1.5fr_18px]';
 
 function ServiceListRow({ s, onOpen }: { s: ServiceSummary; onOpen: (svc: string) => void }) {
-  const h = isBackgroundService(s.service) ? backgroundHealth(s.error_rate) : toDesignHealth(s.health);
+  const h = toDesignHealth(s.health);
   const errPct = s.error_rate * 100;
   const errPerSec = s.rate_per_sec * s.error_rate;
   return (
@@ -153,7 +148,7 @@ function ServiceListRow({ s, onOpen }: { s: ServiceSummary; onOpen: (svc: string
         </span>
         <div className="min-w-0">
           <div className="text-[13px] text-fg font-medium truncate leading-tight font-mono">{s.service}</div>
-          <div className="text-[10px] text-fg-4 truncate">{fmtNum(s.request_count)} spans{isBackgroundService(s.service) ? ' · background · no latency objective' : ''}</div>
+          <div className="text-[10px] text-fg-4 truncate">{fmtNum(s.request_count)} spans</div>
         </div>
       </div>
       <div className="flex items-center gap-2">
@@ -182,8 +177,8 @@ function ServiceListRow({ s, onOpen }: { s: ServiceSummary; onOpen: (svc: string
         {(
           [
             ['p50', s.p50_ms, 'text-fg-2'],
-            ['p95', s.p95_ms, latencyClass(s.service, 'p95', s.p95_ms)],
-            ['p99', s.p99_ms, latencyClass(s.service, 'p99', s.p99_ms)],
+            ['p95', s.p95_ms, s.p95_ms >= 600 ? 'text-warn' : 'text-fg'],
+            ['p99', s.p99_ms, s.p99_ms >= 1800 ? 'text-danger' : 'text-fg-2'],
           ] as Array<[string, number, string]>
         ).map(([k, v, cls]) => (
           <div key={k} className="leading-tight">
@@ -225,7 +220,7 @@ function ServicesList({ services, onOpen }: { services: ServiceSummary[]; onOpen
 // ---------------------------------------------------------------------------
 
 function ServiceCard({ s, onOpen }: { s: ServiceSummary; onOpen: (svc: string) => void }) {
-  const h = isBackgroundService(s.service) ? backgroundHealth(s.error_rate) : toDesignHealth(s.health);
+  const h = toDesignHealth(s.health);
   const errPct = s.error_rate * 100;
   const metrics: Array<{ k: string; v: string; series: number[]; color: string; cls: string }> = [
     { k: 'rps', v: fmtRate(s.rate_per_sec), series: spark(s), color: 'var(--color-brand)', cls: 'text-fg' },
@@ -241,7 +236,7 @@ function ServiceCard({ s, onOpen }: { s: ServiceSummary; onOpen: (svc: string) =
       v: fmtMs(s.p95_ms),
       series: spark(s),
       color: 'var(--color-brand)',
-      cls: latencyClass(s.service, 'p95', s.p95_ms),
+      cls: s.p95_ms >= 600 ? 'text-warn' : 'text-fg',
     },
   ];
   return (
@@ -255,7 +250,7 @@ function ServiceCard({ s, onOpen }: { s: ServiceSummary; onOpen: (svc: string) =
         </span>
         <div className="min-w-0 flex-1">
           <div className="text-[13px] text-fg font-medium truncate font-mono leading-tight">{s.service}</div>
-          <div className="text-[10px] text-fg-4">{fmtNum(s.request_count)} spans{isBackgroundService(s.service) ? ' · background · no latency objective' : ''}</div>
+          <div className="text-[10px] text-fg-4">{fmtNum(s.request_count)} spans</div>
         </div>
         <span
           className={cn(

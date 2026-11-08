@@ -2,17 +2,15 @@
 
 import { Globe } from 'lucide-react';
 import type { AssetDossierDns } from '@/lib/api/types';
-import { SectionCard, EmptyCell, PendingCell, StatCell } from './_shared';
+import { SectionCard, EmptyCell, StatCell } from './_shared';
 import { formatCompact } from '../helpers';
 
 interface DnsCardProps {
-  /** NAN-3291: the dossier is still reading; an empty section is not yet known to be empty. */
-  pending?: boolean;
   dns: AssetDossierDns;
   onOpenTopDomains?: () => void;
 }
 
-export function DnsCard({ dns, onOpenTopDomains, pending = false }: DnsCardProps) {
+export function DnsCard({ dns, onOpenTopDomains }: DnsCardProps) {
   const { queries, unique, nx, rare_tlds, top } = dns;
 
   if (queries === 0 && top.length === 0) {
@@ -23,7 +21,7 @@ export function DnsCard({ dns, onOpenTopDomains, pending = false }: DnsCardProps
         onActionClick={onOpenTopDomains}
         icon={<Globe className="w-[13px] h-[13px] text-muted-foreground/70" />}
       >
-        {pending ? <PendingCell /> : <EmptyCell>No DNS events for this entity in range</EmptyCell>}
+        <EmptyCell>No DNS events for this entity in range</EmptyCell>
       </SectionCard>
     );
   }

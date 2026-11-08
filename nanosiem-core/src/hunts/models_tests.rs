@@ -232,13 +232,7 @@ mod lead_detail_wire {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            [
-                "playbook_version",
-                "query_sha",
-                "scored_by",
-                "sweep_id",
-                "swept_at"
-            ],
+            ["playbook_version", "query_sha", "scored_by", "sweep_id", "swept_at"],
             "the provenance shape drifted from WireLeadProvenance"
         );
         assert_eq!(json["provenance"]["scored_by"], "server");

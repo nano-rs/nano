@@ -1,27 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! NAN-3770: named, revocable per-sender ingest tokens (dedicated deployments).
+//! NAN-4907: named, revocable per-source ingest tokens (ported from main's
+//! open-core NAN-3770 / NAN-3806 / NAN-3933 handlers, single-tenant).
 //!
+//! - GET  /api/internal/otlp-auth                     - nginx auth_request for OTLP (credential, not session)
 //! - GET  /api/ingest-tokens                          - list tokens, install-token state, bindable sources
 //! - POST /api/ingest-tokens                          - issue a token bound to a source (value returned once)
 //! - POST /api/ingest-tokens/{credential_id}/bind     - bind an unbound token to a source
+//! - POST /api/ingest-tokens/{credential_id}/rotate   - new value, same name + source; old value revoked
 //! - POST /api/ingest-tokens/{credential_id}/revoke   - revoke a token
-//! - PUT  /api/ingest-tokens/install-token            - enable/disable or bind the install token
+//! - PUT  /api/ingest-tokens/install-token            - enable/disable, bind, or leave legacy multiplex mode
 //!
-//! NAN-3806: a token decides the source, 100% token based. Every token is
-//! bound to exactly one log source at creation; every event sent with it is
-//! routed to that source whatever `sourcetype` / `X-Source-Type` it declares.
-//! An unbound token (a pre-NAN-3806 token migration 363 could not bind
-//! unambiguously, or one whose source was deleted) is refused by Vector until
-//! an admin binds it. A binding never changes: revoke and reissue instead.
+//! A token decides the source. Every token is bound to exactly one log source
+//! at creation; every event sent with it is routed to that source whatever
+//! `sourcetype` / `X-Source-Type` it declares. A token whose source was
+//! deleted is unbound and refused by Vector until an admin binds it. A binding
+//! never changes: rotate keeps it, revoke-and-reissue moves a sender.
 //!
-//! The shape follows hosted's `/api/log-sources/ingest-credentials` where it
-//! applies (`credential_id`, `state`, `revocable`, `created_at`, `revoked_at`,
-//! `POST …/{credential_id}/revoke`). Hosted-shared tenants do not mount these
-//! routes: their credentials are verified at the edge Worker.
-//!
-//! The token value appears only in the create response (`Cache-Control:
-//! no-store`); it is never logged, audited or readable again.
+//! The token value appears only in the create / rotate response
+//! (`Cache-Control: no-store`); it is never logged, audited or readable again.
 
 use axum::{
     extract::{Path, State},
@@ -30,12 +27,13 @@ use axum::{
     Extension, Json,
 };
 use nanosiem_core::audit::{
-    AuditEvent, AuditSource, ClientContext, INGEST_INSTALL_TOKEN_UPDATED, INGEST_TOKEN_BOUND,
-    INGEST_TOKEN_CREATED, INGEST_TOKEN_REVOKED,
+    AuditEvent, AuditSource, ClientContext, INGEST_TOKEN_BOUND, INGEST_TOKEN_CREATED,
+    INGEST_TOKEN_REVOKED, INGEST_TOKEN_ROTATED, INGEST_TOKEN_SETTINGS_UPDATED,
 };
 use nanosiem_core::auth::permissions;
 use nanosiem_core::ingest_tokens::{
     BindableSource, IngestToken, IngestTokenService, IngestTokenServiceError, IngestTokenSettings,
+    InstallTokenMode, TokenDelivery,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -50,7 +48,7 @@ use crate::state::AppState;
 #[utoipa::path(get, path = "/api/internal/otlp-auth", tag = "ingest_tokens",
     summary = "Authenticate an OTLP ingestion credential",
     description = "Requires an active source-bound ingestion Bearer credential, not a user session. No positive cache.",
-    responses((status = 204, description = "Active OTLP credential; identity in X-Nano-Credential-Id and X-Nano-Source-Route headers"),
+    responses((status = 204, description = "Active OTLP credential; identity in X-Nano-Credential-Id, X-Nano-Source-Route and a signed, short-lived X-Nano-Identity-Assertion. Served to the nginx edge's subrequest; nginx returns 404 for direct requests"),
               (status = 401, description = "Invalid or inactive credential"),
               (status = 503, description = "Credential state unavailable")),
     security(("bearer_auth" = [])))]
@@ -77,6 +75,15 @@ pub async fn authenticate_otlp(
                 HeaderValue::from_str(&credential.id.to_string()).expect("UUID is a header value"),
             );
             response.headers_mut().insert("x-nano-source-route", route);
+            // Vector trusts the identity only with this short-lived assertion
+            // signed by the edge-only key, so a sender on the raw OTLP port
+            // cannot forge it and a captured one expires.
+            if let Some(assertion) = state.ingest_token_service.otlp_identity_assertion(&credential) {
+                response.headers_mut().insert(
+                    "x-nano-identity-assertion",
+                    HeaderValue::from_str(&assertion).expect("digits and hex are a header value"),
+                );
+            }
             response
                 .headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -95,12 +102,18 @@ pub const INSTALL_TOKEN_NAME: &str = "Install token (legacy)";
 pub struct InstallTokenState {
     /// Always "Install token (legacy)".
     pub name: String,
-    /// The admin switch. Senders are accepted only while it is enabled AND
-    /// the token is bound (`state` = `active`).
+    /// The admin switch. Disabled = refused in every mode.
     pub enabled: bool,
-    /// `active` (enabled and bound), `unbound` (enabled, refused until it is
-    /// bound), `disabled`, or `not_configured` (no `VECTOR_AUTH_TOKEN`).
+    /// `strict` (accepted only while bound) or `legacy_multiplex` (deprecated:
+    /// routed by the sender's X-Source-Type / sourcetype).
+    pub mode: InstallTokenMode,
+    /// `legacy_multiplex` (accepted, routed by what the sender declares;
+    /// deprecated), `active` (strict and bound), `unbound` (strict, refused
+    /// until it is bound), `disabled`, or `not_configured` (no
+    /// `VECTOR_AUTH_TOKEN`).
     pub state: String,
+    /// Whether the current state is deprecated (legacy multiplex).
+    pub deprecated: bool,
     /// The log source every event sent with the install token lands in.
     pub source_id: Option<Uuid>,
     pub source_name: Option<String>,
@@ -117,9 +130,12 @@ pub struct IngestTokenList {
     /// refuses until an admin binds it to a source.
     pub tokens: Vec<IngestToken>,
     pub install_token: InstallTokenState,
-    /// Log sources a token can be bound to (push-capable: HTTP, HEC, Vector;
-    /// never OTLP or a pulled source).
+    /// Log sources a token can be bound to (token-authenticated push lanes:
+    /// HTTP, HEC, OTLP; never a pulled source or the Vector-native listener).
     pub sources: Vec<BindableSource>,
+    /// How the tokens file reaches Vector. `none`: issuing, rotating and
+    /// binding are refused for this deployment.
+    pub delivery: TokenDelivery,
 }
 
 /// `POST /api/ingest-tokens`.
@@ -129,7 +145,10 @@ pub struct CreateIngestTokenRequest {
     /// Sender name, 1-100 characters, unique among active tokens.
     pub name: String,
     /// The log source every event sent with this token lands in (required;
-    /// see `sources` in the list response). Never changes.
+    /// see `sources` in the list response). Never changes. A log source
+    /// TypeID (`ls_…`, as `/api/log-sources` returns it) or a bare UUID.
+    #[serde(deserialize_with = "nanosiem_core::typeid::log_source::deserialize")]
+    #[schema(value_type = String, example = "ls_01h455vb4pex5vsknk084sn02q")]
     pub source_id: Uuid,
 }
 
@@ -137,6 +156,9 @@ pub struct CreateIngestTokenRequest {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BindIngestTokenRequest {
+    /// A log source TypeID or a bare UUID.
+    #[serde(deserialize_with = "nanosiem_core::typeid::log_source::deserialize")]
+    #[schema(value_type = String, example = "ls_01h455vb4pex5vsknk084sn02q")]
     pub source_id: Uuid,
 }
 
@@ -145,8 +167,11 @@ pub struct BindIngestTokenRequest {
 pub struct IssuedIngestToken {
     pub credential: IngestToken,
     /// The token value. Send it as `Authorization: Splunk <token>` (HEC) or
-    /// `Authorization: Bearer <token>` (HTTP ingest).
+    /// `Authorization: Bearer <token>` (HTTP ingest, OTLP through `/otlp`).
     pub token: String,
+    /// On a rotation: the replaced token, now revoked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<IngestToken>,
 }
 
 impl std::fmt::Debug for IssuedIngestToken {
@@ -164,22 +189,19 @@ impl std::fmt::Debug for IssuedIngestToken {
 pub struct UpdateInstallTokenRequest {
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// Binds the install token to this log source. Only while it is unbound.
-    #[serde(default)]
+    /// Binds the install token to this log source (only while it is
+    /// unbound). Binding also leaves legacy multiplex mode. A log source
+    /// TypeID or a bare UUID.
+    #[serde(default, deserialize_with = "nanosiem_core::typeid::log_source::opt::deserialize")]
+    #[schema(value_type = Option<String>, example = "ls_01h455vb4pex5vsknk084sn02q")]
     pub source_id: Option<Uuid>,
+    /// `strict` leaves the deprecated legacy multiplex mode (one-way; the
+    /// unbound install token is then refused). `legacy_multiplex` is refused.
+    #[serde(default)]
+    pub mode: Option<InstallTokenMode>,
 }
 
-fn dedicated_only(state: &AppState) -> Result<(), ApiError> {
-    #[cfg(feature = "enterprise")]
-    if state.config.deployment_mode.is_enterprise_shared() {
-        return Err(ApiError::NotFound(
-            "Ingest tokens are issued through Log Sources on hosted tenants".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn service_error(error: IngestTokenServiceError) -> ApiError {
+pub(crate) fn service_error(error: IngestTokenServiceError) -> ApiError {
     match error {
         IngestTokenServiceError::InvalidName(message) => ApiError::BadRequest(message),
         IngestTokenServiceError::NotFound => ApiError::NotFound("Ingest token not found".into()),
@@ -189,6 +211,14 @@ fn service_error(error: IngestTokenServiceError) -> ApiError {
         IngestTokenServiceError::InvalidSource(message) => ApiError::BadRequest(message),
         IngestTokenServiceError::AlreadyBound => ApiError::Conflict(
             "This token is already bound to a source; a binding never changes. Revoke it and issue a new token instead"
+                .into(),
+        ),
+        IngestTokenServiceError::NotRotatable => ApiError::Conflict(
+            "Only an active, bound token with no rotation in progress can be rotated".into(),
+        ),
+        IngestTokenServiceError::DeliveryNotConfigured => ApiError::ServiceUnavailable(
+            "Ingest token delivery to Vector is not configured for this deployment \
+             (NANO_INGEST_TOKENS_DELIVERY); a token issued now would be refused, so none was issued"
                 .into(),
         ),
         IngestTokenServiceError::Repository(
@@ -209,7 +239,9 @@ fn service_error(error: IngestTokenServiceError) -> ApiError {
     }
 }
 
-fn audit(
+/// Every ingest-token action is security-critical (NAN-4907), so the record
+/// is durable before the handler responds (NAN-4954).
+async fn audit(
     state: &AppState,
     auth: &AuthContext,
     client: &ClientContext,
@@ -218,15 +250,36 @@ fn audit(
     name: Option<String>,
     details: serde_json::Value,
 ) {
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::Settings, action)
-            .actor(Some(auth.user_id()), None)
-            .api_key(auth.api_key_id, auth.api_key_name.clone())
-            .resource("ingest_token", id, name)
-            .details(details)
-            .client_context(client)
-            .build(),
-    );
+    state
+        .emit_audit_durable(
+            AuditEvent::builder(AuditSource::Settings, action)
+                .actor(Some(auth.user_id()), None)
+                .api_key(auth.api_key_id, auth.api_key_name.clone())
+                .resource("ingest_token", id, name)
+                .details(details)
+                .client_context(client)
+                .build(),
+        )
+        .await;
+}
+
+/// The install token's state label (see [`InstallTokenState::state`]).
+pub(crate) fn install_state_label(
+    configured: bool,
+    settings: &IngestTokenSettings,
+    bound: bool,
+) -> &'static str {
+    if !configured {
+        "not_configured"
+    } else if !settings.install_token_enabled {
+        "disabled"
+    } else if settings.install_token_mode == InstallTokenMode::LegacyMultiplex {
+        "legacy_multiplex"
+    } else if bound {
+        "active"
+    } else {
+        "unbound"
+    }
 }
 
 async fn install_token_state(
@@ -237,18 +290,16 @@ async fn install_token_state(
         .install_token_source(&settings)
         .await
         .map_err(service_error)?;
-    let state = if !service.install_token_configured() {
-        "not_configured"
-    } else if !settings.install_token_enabled {
-        "disabled"
-    } else if source.is_none() {
-        "unbound"
-    } else {
-        "active"
-    };
+    let state = install_state_label(
+        service.install_token_configured(),
+        &settings,
+        source.is_some(),
+    );
     Ok(InstallTokenState {
         name: INSTALL_TOKEN_NAME.into(),
         enabled: settings.install_token_enabled,
+        mode: settings.install_token_mode,
+        deprecated: state == "legacy_multiplex",
         state: state.into(),
         source_id: settings.install_token_source_id,
         source_name: source.as_ref().map(|s| s.name.clone()),
@@ -261,14 +312,13 @@ async fn install_token_state(
 
 #[utoipa::path(get, path = "/api/ingest-tokens", tag = "ingest_tokens",
     responses((status = 200, body = IngestTokenList), (status = 403, description = "Forbidden"),
-        (status = 404, description = "Not available on hosted tenants")),
+        (status = 404, description = "Not found")),
     security(("bearer_auth" = []), ("api_key" = [])))]
 pub async fn list_ingest_tokens(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<IngestTokenList>, ApiError> {
     ensure_permission(&auth, permissions::LOG_SOURCES_VIEW)?;
-    dedicated_only(&state)?;
     let service = &state.ingest_token_service;
     let tokens = service.list().await.map_err(service_error)?;
     let settings = service.settings().await.map_err(service_error)?;
@@ -277,6 +327,7 @@ pub async fn list_ingest_tokens(
         tokens,
         install_token: install_token_state(service, settings).await?,
         sources,
+        delivery: service.delivery(),
     }))
 }
 
@@ -286,7 +337,7 @@ pub async fn list_ingest_tokens(
         (status = 400, description = "Invalid name, or the source does not exist / cannot receive pushed events"),
         (status = 403, description = "Forbidden (admins only)"),
         (status = 409, description = "An active token has this name"),
-        (status = 503, description = "Vector's tokens file could not be written; nothing was issued")),
+        (status = 503, description = "Vector's tokens file could not be written, or token delivery is not configured for this deployment; nothing was issued")),
     security(("bearer_auth" = []), ("api_key" = [])))]
 pub async fn create_ingest_token(
     State(state): State<AppState>,
@@ -295,7 +346,6 @@ pub async fn create_ingest_token(
     Json(request): Json<CreateIngestTokenRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
-    dedicated_only(&state)?;
     let (credential, token) = state
         .ingest_token_service
         .create(&request.name, request.source_id, Some(auth.user_id()))
@@ -313,10 +363,14 @@ pub async fn create_ingest_token(
             "source_id": credential.source_id,
             "route_key": credential.route_key,
         }),
-    );
+    ).await;
     let mut response = (
         StatusCode::CREATED,
-        Json(IssuedIngestToken { credential, token }),
+        Json(IssuedIngestToken {
+            credential,
+            token,
+            replaced: None,
+        }),
     )
         .into_response();
     response
@@ -342,7 +396,6 @@ pub async fn bind_ingest_token(
     Json(request): Json<BindIngestTokenRequest>,
 ) -> Result<Json<IngestToken>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
-    dedicated_only(&state)?;
     let result = state
         .ingest_token_service
         .bind(credential_id, request.source_id, Some(auth.user_id()))
@@ -362,9 +415,60 @@ pub async fn bind_ingest_token(
             Some(credential_id),
             (!name.is_empty()).then_some(name),
             serde_json::json!({ "source_id": request.source_id, "route_key": route_key }),
-        );
+        ).await;
     }
     result.map(Json).map_err(service_error)
+}
+
+#[utoipa::path(post, path = "/api/ingest-tokens/{credential_id}/rotate", tag = "ingest_tokens",
+    params(("credential_id" = Uuid, Path, description = "Credential id")),
+    responses((status = 201, body = IssuedIngestToken, description = "Rotated; the new `token` is shown once and the old value is revoked"),
+        (status = 403, description = "Forbidden (admins only)"), (status = 404, description = "Not found"),
+        (status = 409, description = "Revoked or unbound (bind it first)"),
+        (status = 503, description = "Not rotated: the replacement could not be published (the old token keeps working), or token delivery is not configured")),
+    security(("bearer_auth" = []), ("api_key" = [])))]
+pub async fn rotate_ingest_token(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Extension(client): Extension<ClientContext>,
+    Path(credential_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
+    let (old, new, token) = state
+        .ingest_token_service
+        .rotate(credential_id, Some(auth.user_id()))
+        .await
+        // Two-phase rotation: any error leaves the old token active and
+        // nothing rotated, so there is nothing to audit.
+        .map_err(service_error)?;
+    audit(
+        &state,
+        &auth,
+        &client,
+        INGEST_TOKEN_ROTATED,
+        Some(new.credential_id),
+        Some(new.name.clone()),
+        serde_json::json!({
+            "replaced_credential_id": old.credential_id,
+            "replaced_token_prefix": old.token_prefix,
+            "token_prefix": new.token_prefix,
+            "source_id": new.source_id,
+            "route_key": new.route_key,
+        }),
+    ).await;
+    let mut response = (
+        StatusCode::CREATED,
+        Json(IssuedIngestToken {
+            credential: new,
+            token,
+            replaced: Some(old),
+        }),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 #[utoipa::path(post, path = "/api/ingest-tokens/{credential_id}/revoke", tag = "ingest_tokens",
@@ -380,7 +484,6 @@ pub async fn revoke_ingest_token(
     Path(credential_id): Path<Uuid>,
 ) -> Result<Json<IngestToken>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
-    dedicated_only(&state)?;
     let result = state
         .ingest_token_service
         .revoke(credential_id, Some(auth.user_id()))
@@ -406,7 +509,7 @@ pub async fn revoke_ingest_token(
             Some(id),
             (!name.is_empty()).then_some(name),
             serde_json::json!({ "token_prefix": prefix }),
-        );
+        ).await;
     }
     result.map(Json).map_err(service_error)
 }
@@ -414,7 +517,7 @@ pub async fn revoke_ingest_token(
 #[utoipa::path(put, path = "/api/ingest-tokens/install-token", tag = "ingest_tokens",
     request_body = UpdateInstallTokenRequest,
     responses((status = 200, body = InstallTokenState),
-        (status = 400, description = "Empty request, or the source does not exist / cannot receive pushed events"),
+        (status = 400, description = "Empty request, `mode: legacy_multiplex` (one-way), or the source does not exist / cannot receive pushed events"),
         (status = 403, description = "Forbidden (admins only)"),
         (status = 409, description = "The install token is already bound (bindings never change)"),
         (status = 503, description = "Saved, but Vector's tokens file update is still pending")),
@@ -426,10 +529,14 @@ pub async fn update_install_token(
     Json(request): Json<UpdateInstallTokenRequest>,
 ) -> Result<Json<InstallTokenState>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
-    dedicated_only(&state)?;
-    if request.enabled.is_none() && request.source_id.is_none() {
+    if request.enabled.is_none() && request.source_id.is_none() && request.mode.is_none() {
         return Err(ApiError::BadRequest(
-            "Set `enabled`, `source_id`, or both".into(),
+            "Set `enabled`, `source_id`, `mode`, or a combination".into(),
+        ));
+    }
+    if request.mode == Some(InstallTokenMode::LegacyMultiplex) {
+        return Err(ApiError::BadRequest(
+            "Legacy multiplex mode is deprecated and cannot be re-enabled; bind the install token to a source or issue named tokens".into(),
         ));
     }
     let service = &state.ingest_token_service;
@@ -443,11 +550,26 @@ pub async fn update_install_token(
                 &state,
                 &auth,
                 &client,
-                INGEST_INSTALL_TOKEN_UPDATED,
+                INGEST_TOKEN_SETTINGS_UPDATED,
                 None,
                 Some(INSTALL_TOKEN_NAME.into()),
-                serde_json::json!({ "source_id": source_id }),
-            );
+                serde_json::json!({ "source_id": source_id, "mode": "strict" }),
+            ).await;
+        }
+        result.map_err(service_error)?;
+    }
+    if request.mode == Some(InstallTokenMode::Strict) && request.source_id.is_none() {
+        let result = service.set_install_token_strict(Some(auth.user_id())).await;
+        if matches!(&result, Ok(_) | Err(IngestTokenServiceError::Publish { .. })) {
+            audit(
+                &state,
+                &auth,
+                &client,
+                INGEST_TOKEN_SETTINGS_UPDATED,
+                None,
+                Some(INSTALL_TOKEN_NAME.into()),
+                serde_json::json!({ "mode": "strict" }),
+            ).await;
         }
         result.map_err(service_error)?;
     }
@@ -461,11 +583,11 @@ pub async fn update_install_token(
                 &state,
                 &auth,
                 &client,
-                INGEST_INSTALL_TOKEN_UPDATED,
+                INGEST_TOKEN_SETTINGS_UPDATED,
                 None,
                 Some(INSTALL_TOKEN_NAME.into()),
                 serde_json::json!({ "enabled": enabled }),
-            );
+            ).await;
         }
         result.map_err(service_error)?;
     }
@@ -480,6 +602,7 @@ pub async fn update_install_token(
         list_ingest_tokens,
         create_ingest_token,
         bind_ingest_token,
+        rotate_ingest_token,
         revoke_ingest_token,
         update_install_token
     ),
@@ -491,94 +614,14 @@ pub async fn update_install_token(
         CreateIngestTokenRequest,
         BindIngestTokenRequest,
         IssuedIngestToken,
-        UpdateInstallTokenRequest
+        UpdateInstallTokenRequest,
+        InstallTokenMode,
+        TokenDelivery
     )),
-    tags((name = "ingest_tokens", description = "Named, revocable ingest tokens, each bound to one log source (dedicated deployments)"))
+    tags((name = "ingest_tokens", description = "Named, revocable ingest tokens, each bound to one log source"))
 )]
 pub struct IngestTokensApiDoc;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn create_request_rejects_unknown_fields() {
-        let source = Uuid::nil().to_string();
-        assert!(serde_json::from_value::<CreateIngestTokenRequest>(
-            serde_json::json!({"name": "fw", "source_id": source, "token": "chosen-by-caller"})
-        )
-        .is_err());
-        assert!(serde_json::from_value::<CreateIngestTokenRequest>(
-            serde_json::json!({"name": "fw", "source_id": source, "tenant_id": "x"})
-        )
-        .is_err());
-        // Every token is bound at creation: no source, no token.
-        assert!(serde_json::from_value::<CreateIngestTokenRequest>(
-            serde_json::json!({"name": "fw"})
-        )
-        .is_err());
-        // A sourcetype is never a binding.
-        assert!(serde_json::from_value::<CreateIngestTokenRequest>(
-            serde_json::json!({"name": "fw", "sourcetype": "apache_access"})
-        )
-        .is_err());
-        assert!(serde_json::from_value::<CreateIngestTokenRequest>(
-            serde_json::json!({"name": "fw", "source_id": source})
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn issued_token_debug_is_redacted() {
-        let issued = IssuedIngestToken {
-            credential: IngestToken {
-                credential_id: Uuid::nil(),
-                name: "fw".into(),
-                token_prefix: "nit_abcdefgh".into(),
-                state: "active".into(),
-                source_id: None,
-                source_name: None,
-                route_key: None,
-                source_bound_at: None,
-                request_count: 0,
-                created_at: chrono::Utc::now(),
-                created_by: None,
-                last_used_at: None,
-                revoked_at: None,
-                revoked_by: None,
-                revocable: true,
-            },
-            token: "nit_abcdefghSECRETSECRET".into(),
-        };
-        assert!(!format!("{issued:?}").contains("SECRET"));
-    }
-
-    #[test]
-    fn listed_token_schema_has_no_secret_fields() {
-        let token = IngestToken {
-            credential_id: Uuid::nil(),
-            name: "fw".into(),
-            token_prefix: "nit_abcdefgh".into(),
-            state: "active".into(),
-            source_id: None,
-            source_name: None,
-            route_key: None,
-            source_bound_at: None,
-            request_count: 0,
-            created_at: chrono::Utc::now(),
-            created_by: None,
-            last_used_at: None,
-            revoked_at: None,
-            revoked_by: None,
-            revocable: true,
-        };
-        let value = serde_json::to_value(&token).unwrap();
-        let keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
-        for forbidden in ["token", "value", "token_sha256", "sha256", "hash"] {
-            assert!(
-                !keys.iter().any(|k| k == forbidden),
-                "{forbidden} in {keys:?}"
-            );
-        }
-    }
-}
+#[path = "ingest_tokens_tests.rs"]
+mod tests;

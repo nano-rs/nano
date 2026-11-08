@@ -2,13 +2,15 @@
 
 /**
  * Core API routes
- * Handles health checks, fields, source types, ingestion and system metrics
+ * Handles health checks, fields, source types, ingestion, system metrics, and developer settings
  */
 
 import type {
   SchemaFieldsResponse,
   SystemOverview,
   SystemConfig,
+  DeveloperSettings,
+  UpdateDeveloperSettingsRequest,
 } from './types';
 
 export class CoreApi {
@@ -32,15 +34,16 @@ export class CoreApi {
   // the query, a filtered search listed keys from other source types that then
   // expanded empty. Omit all params for the syntax-highlighter path → backend
   // uses a recent default window.
+  // NAN-4928: POST with the query in the body, so the hunt never lands in a
+  // GET URL (server and proxy logs). The GET form is deprecated.
   async getExtFieldNames(query?: string, start?: string, end?: string, signal?: AbortSignal): Promise<string[]> {
-    const p = new URLSearchParams();
-    if (query) p.set('query', query);
+    const body: { query?: string; start?: string; end?: string } = {};
+    if (query) body.query = query;
     if (start && end) {
-      p.set('start', start);
-      p.set('end', end);
+      body.start = start;
+      body.end = end;
     }
-    const qs = p.toString();
-    return this.request(`/api/fields/ext${qs ? `?${qs}` : ''}`, signal ? { signal } : undefined);
+    return this.request('/api/fields/ext', { method: 'POST', body: JSON.stringify(body), ...(signal ? { signal } : {}) });
   }
 
   async getFieldValues(name: string, limit: number = 10): Promise<[string, number][]> {
@@ -79,5 +82,17 @@ export class CoreApi {
 
   async getSystemConfig(): Promise<SystemConfig> {
     return this.request('/api/system/config');
+  }
+
+  // Developer Settings (Scheduler Control)
+  async getDeveloperSettings(): Promise<DeveloperSettings> {
+    return this.request('/api/settings/developer');
+  }
+
+  async updateDeveloperSettings(request: UpdateDeveloperSettingsRequest): Promise<DeveloperSettings> {
+    return this.request('/api/settings/developer', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
   }
 }

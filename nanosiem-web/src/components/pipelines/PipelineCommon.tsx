@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { ReactNode } from 'react';
-import { AlertCircle, CheckCircle2, Clock, Info, Loader2 } from 'lucide-react';
+import { AlertCircle, CheckCircle2, Clock, Info } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 
 export function PipelineNotice({
@@ -47,13 +48,14 @@ export function PipelineNotice({
 }
 
 export function PipelineStateBadge({ state }: { state: string }) {
-  const live = state === 'live' || state === 'healthy' || state === 'validated';
+  const live = state === 'live' || state === 'healthy' || state === 'validated' || state === 'retained';
   const failed = [
     'failed',
     'rejected',
     'invalid',
     'error',
     'delivery_errors',
+    'busy',
   ].includes(state);
   const pending = [
     'pending',
@@ -64,7 +66,7 @@ export function PipelineStateBadge({ state }: { state: string }) {
     'connecting',
   ].includes(state);
   const Icon = pending
-    ? Loader2
+    ? LoadingIcon
     : live
       ? CheckCircle2
       : failed
@@ -82,7 +84,7 @@ export function PipelineStateBadge({ state }: { state: string }) {
       )}
     >
       <Icon
-        className={cn('h-3 w-3', pending && 'animate-spin')}
+        className="h-3 w-3"
         strokeWidth={1.5}
         aria-hidden="true"
       />
@@ -143,7 +145,7 @@ export function PipelineLoading({
       role="status"
       className="flex items-center gap-2 p-4 text-[12px] text-muted-foreground"
     >
-      <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
+      <LoadingIcon className="h-3.5 w-3.5" strokeWidth={1.5} />
       {label}
     </div>
   );

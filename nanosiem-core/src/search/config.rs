@@ -46,8 +46,6 @@ impl Default for SearchConfig {
 pub enum SearchBackend {
     /// Use ClickHouse for log queries
     ClickHouse,
-    /// Use the tenant-pinned chDB lake worker for log queries.
-    Lake,
 }
 
 impl Default for SearchBackend {
@@ -77,6 +75,5 @@ mod tests {
     #[test]
     fn test_search_backend_equality() {
         assert_eq!(SearchBackend::ClickHouse, SearchBackend::ClickHouse);
-        assert_ne!(SearchBackend::ClickHouse, SearchBackend::Lake);
     }
 }

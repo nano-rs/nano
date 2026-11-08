@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+import { SEMANTIC_FIELDS, type SemanticField } from './schema-fields';
 
 /**
  * OCSF native-column fallbacks for UDM-semantic concepts (NAN-1322/NAN-1324).
@@ -7,32 +7,26 @@
  * (`process.name`, `user.name`, `dst_endpoint.hostname`, …) instead of UDM
  * names, so UDM-keyed accessors (`row.process_name`) read `undefined`. Resolve a
  * UDM concept through `fieldVal`: the UDM key is checked FIRST (so under UDM the
- * value is byte-identical), then the native OCSF column(s). Mirrors the backend
- * `class_split_udm_field` / `display_field_name` mappings. Concepts OCSF has no
- * clean column for are simply absent → the bare UDM key is used (graceful).
+ * value is byte-identical), then the native OCSF column(s).
+ *
+ * NAN-4903: derived from the profile-aware field map (`./schema-fields`), the
+ * single source of truth — keyed by each concept's UDM column, valued with the
+ * union of the OCSF columns of every concept sharing that UDM column (`src_host`
+ * is both `srcHost` and `host`, so it falls back to `src_endpoint.hostname` and
+ * `device.hostname`). New code should name the concept and use
+ * `readSchemaField` / `useSchemaFieldMap` directly.
  */
-export const OCSF_FIELD_FALLBACKS: Record<string, string[]> = {
-  process_name: ['process.name', 'actor.process.name'],
-  command_line: ['process.cmd_line', 'actor.process.cmd_line'],
-  parent_command_line: ['actor.process.cmd_line'],
-  user: ['user.name', 'actor.user.name'],
-  file_name: ['file.name'],
-  file_path: ['file.path'],
-  file_hash: ['file.hashes.sha256'],
-  process_hash: ['process.file.hashes.sha256', 'actor.process.file.hashes.sha256'],
-  dest_host: ['dst_endpoint.hostname'],
-  dest_ip: ['dst_endpoint.ip'],
-  dest_port: ['dst_endpoint.port'],
-  src_ip: ['src_endpoint.ip'],
-  src_host: ['src_endpoint.hostname', 'device.hostname'],
-  src_mac: ['src_endpoint.mac'],
-  url: ['url.url_string', 'http_request.url.url_string'],
-  query: ['query.hostname'],
-  answer: ['answers.rdata'],
-  auth_type: ['auth_protocol'],
-  bytes_out: ['traffic.bytes_out'],
-  bytes_in: ['traffic.bytes_in'],
-};
+export const OCSF_FIELD_FALLBACKS: Record<string, string[]> = (() => {
+  const out: Record<string, string[]> = {};
+  for (const key of Object.keys(SEMANTIC_FIELDS) as SemanticField[]) {
+    const def = SEMANTIC_FIELDS[key];
+    const udm = def.udm[0];
+    const list = out[udm] ?? [];
+    for (const col of def.ocsf) if (col !== udm && !list.includes(col)) list.push(col);
+    if (list.length) out[udm] = list;
+  }
+  return out;
+})();
 
 /** A value is "empty" if it's null/undefined/'' or the `"-"` placeholder that
  *  many sources (Sysmon, syslog) emit for an absent field. */

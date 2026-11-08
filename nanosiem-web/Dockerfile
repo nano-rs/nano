@@ -1,6 +1,5 @@
 # Build stage
-# node:22-alpine (index digest, 2026-10-22: node v22.23.4, CVE-2026-111497). Node 20 is EOL.
-FROM node:22-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914 AS builder
+FROM node:20-alpine AS builder
 
 WORKDIR /app
 
@@ -8,8 +7,8 @@ WORKDIR /app
 ARG VITE_API_URL=
 ENV VITE_API_URL=$VITE_API_URL
 
-# Edition flag (NAN-745). `enterprise` keeps the @/enterprise/*
-# alias pointed at the real implementations under src/enterprise/. `open` (the default)
+# Edition flag (NAN-745). `enterprise` (default) keeps the @/enterprise/*
+# alias pointed at the real implementations under src/enterprise/. `open`
 # swaps it to the no-op stubs under src/enterprise-stubs/ for the open-core
 # release. Mirrors the cargo edition flag in the root Dockerfile.
 ARG VITE_EDITION=open

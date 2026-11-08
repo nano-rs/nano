@@ -2,7 +2,7 @@
 //! Audit of searches that explicitly name a source the caller cannot see
 //! (NAN-3222).
 //!
-//! The source gate ([`crate::search::query_processing::enforce_source_visibility_with_field`])
+//! The source gate ([`crate::search::query_processing::enforce_source_scope`])
 //! silently excludes denied sources: a source-restricted member who searches
 //! `metadata.log_source=insider_threat` gets an empty result and no hint.
 //! That silence is the product contract ("not visible means absent") and this
@@ -17,16 +17,17 @@
 //!   wildcard / LIKE / CONTAINS / STARTSWITH / ENDSWITH or regex? Broad
 //!   searches (a keyword, `source_type=*`) name nothing.
 //! * [`DeniedSourceAuditScope`] — installed per request by the search and API
-//!   auth layers ([`with_scope`]) carrying the actor, tenant, the caller's
-//!   per-source RBAC deny set, the entry point, the request id and a
+//!   auth layers ([`with_scope`]) carrying the actor, the caller's per-source
+//!   RBAC deny set, the entry point, the request id and a
 //!   [`DeniedSourceAuditSink`]. Like the request actor it is a task-local and
 //!   follows spawned work only through [`crate::search::request_actor::inherit`].
 //! * [`observe_gated_query`] / [`observe_raw_sql_refused`] — the two hooks:
-//!   the source gate calls the first for every query it gates, the raw-SQL
-//!   refusal calls the second. Outside a scope (detection runtime, runners,
-//!   lake workers, tests) both are no-ops.
+//!   the source gate ([`crate::search::query_processing::enforce_source_scope`])
+//!   calls the first for every query it gates, the raw-SQL refusal calls the
+//!   second. Outside a scope (detection runtime, runners, tests) both are
+//!   no-ops.
 //! * [`DeniedSourceAuditLimiter`] — in-process, bounded: at most one audit
-//!   per (tenant, actor, label, entry point) per [`AUDIT_WINDOW`], so
+//!   per (actor, label, entry point) per [`AUDIT_WINDOW`], so
 //!   dashboards and live tail cannot flood the audit ledger. No table, no
 //!   growth: the state is a capped per-pod map.
 //!
@@ -42,10 +43,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::audit::{actions, AuditEvent, AuditSource, ClientContext};
-use crate::auth::TrustedTenantContext;
 use crate::query::{Command, Comparator, Query, SearchExpr, Value};
 
-/// One audit per (tenant, actor, label, entry point) per window.
+/// One audit per (actor, label, entry point) per window.
 pub const AUDIT_WINDOW: Duration = Duration::from_secs(300);
 /// Per-pod bound on rate-limit keys. When full the OLDEST key is evicted,
 /// which can only cause an extra audit row, never a missed one.
@@ -58,11 +58,9 @@ const MAX_ENTRY_POINT_BYTES: usize = 96;
 /// Rate-limit key used for a raw-SQL refusal that names no denied label.
 const RAW_SQL_UNNAMED_KEY: &str = "*";
 
-/// Fields that carry an event's source provenance in nPL.
-const SOURCE_FIELDS: [&str; 2] = [
-    "source_type",
-    crate::search::query_processing::LAKE_SOURCE_FIELD,
-];
+/// Fields that carry an event's source provenance in nPL. On the OCSF store
+/// `metadata.log_source` resolves to the same `source_type` column.
+const SOURCE_FIELDS: [&str; 2] = ["source_type", "metadata.log_source"];
 
 /// What happened to the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +83,6 @@ impl DeniedSourceOutcome {
 /// One audit row, before it is shaped into an [`AuditEvent`].
 #[derive(Debug, Clone)]
 pub struct DeniedSourceAuditRecord {
-    pub tenant: Option<TrustedTenantContext>,
     pub actor_id: Uuid,
     pub api_key_id: Option<Uuid>,
     /// Only the denied labels the query referenced (never the full deny set).
@@ -113,23 +110,20 @@ impl DeniedSourceAuditRecord {
                 "query": self.query,
                 "entry_point": self.entry_point,
                 "request_id": self.request_id,
-                "tenant_id": self.tenant.as_ref().map(|t| t.tenant_id),
             }))
             .build()
     }
 }
 
 /// Where audit records go. Implementations MUST NOT block: they enqueue or
-/// spawn. Dedicated deployments write the platform audit pipeline; shared
-/// deployments append through a signed tenant transaction.
+/// spawn.
 pub trait DeniedSourceAuditSink: Send + Sync {
     fn submit(&self, record: DeniedSourceAuditRecord);
 }
 
 /// Dedicated-deployment sink over the platform [`crate::audit::AuditEmitter`]
 /// (background runners with no request; request paths use their service's
-/// own audit queue). A tenant-scoped record is refused here: shared tenants
-/// append through a signed tenant transaction, never the platform emitter.
+/// own audit queue).
 pub struct EmitterDeniedSourceAuditSink {
     emitter: Arc<crate::audit::AuditEmitter>,
 }
@@ -142,12 +136,6 @@ impl EmitterDeniedSourceAuditSink {
 
 impl DeniedSourceAuditSink for EmitterDeniedSourceAuditSink {
     fn submit(&self, record: DeniedSourceAuditRecord) {
-        if record.tenant.is_some() {
-            tracing::error!(
-                "denied-source audit for a shared tenant reached the platform emitter; dropped"
-            );
-            return;
-        }
         let emitter = self.emitter.clone();
         let event = record.to_audit_event();
         tokio::spawn(async move {
@@ -162,7 +150,7 @@ impl DeniedSourceAuditSink for EmitterDeniedSourceAuditSink {
 // Rate limiter
 // ---------------------------------------------------------------------------
 
-type LimiterKey = (Option<Uuid>, Uuid, String, String);
+type LimiterKey = (Uuid, String, String);
 
 /// Bounded in-process rate limiter. Windows are fixed length, so insertion
 /// order is expiry order and the queue front is always the oldest key.
@@ -199,7 +187,6 @@ impl DeniedSourceAuditLimiter {
     /// records it as admitted now).
     pub fn admit(
         &self,
-        tenant: Option<Uuid>,
         actor: Uuid,
         label: &str,
         entry_point: &str,
@@ -219,7 +206,7 @@ impl DeniedSourceAuditLimiter {
                 state.admitted.remove(&key);
             }
         }
-        let key: LimiterKey = (tenant, actor, label.to_string(), entry_point.to_string());
+        let key: LimiterKey = (actor, label.to_string(), entry_point.to_string());
         if state.admitted.contains_key(&key) {
             return false;
         }
@@ -248,11 +235,10 @@ impl DeniedSourceAuditLimiter {
 
 /// Everything a request's audit needs; installed by the auth layer.
 pub struct DeniedSourceAuditScope {
-    pub tenant: Option<TrustedTenantContext>,
     pub actor_id: Uuid,
     pub api_key_id: Option<Uuid>,
-    /// The caller's per-source RBAC deny set (NOT the `audit:view` row gate),
-    /// normalized and expanded over the Unattributed aliases.
+    /// The caller's effective deny set (per-source RBAC plus the `audit` row
+    /// gate without `audit:view`), lowercased.
     denied: BTreeSet<String>,
     pub entry_point: String,
     pub request_id: Option<String>,
@@ -266,7 +252,6 @@ impl DeniedSourceAuditScope {
     /// actor), so callers skip installing a scope entirely.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        tenant: Option<TrustedTenantContext>,
         actor_id: Uuid,
         api_key_id: Option<Uuid>,
         denied: &BTreeSet<String>,
@@ -275,12 +260,15 @@ impl DeniedSourceAuditScope {
         client: ClientContext,
         sink: Arc<dyn DeniedSourceAuditSink>,
     ) -> Option<Self> {
-        let denied = crate::auth::source_visibility::expand_unattributed_sources(denied);
+        let denied: BTreeSet<String> = denied
+            .iter()
+            .map(|label| label.trim().to_ascii_lowercase())
+            .filter(|label| !label.is_empty())
+            .collect();
         if denied.is_empty() || actor_id.is_nil() {
             return None;
         }
         Some(Self {
-            tenant,
             actor_id,
             api_key_id,
             denied,
@@ -300,11 +288,9 @@ impl DeniedSourceAuditScope {
 
     fn submit(&self, labels: BTreeSet<String>, query: &str, outcome: DeniedSourceOutcome) {
         let now = Instant::now();
-        let tenant_id = self.tenant.as_ref().map(|t| t.tenant_id);
         let fresh: Vec<String> = if labels.is_empty() {
             // Only a raw-SQL refusal reaches here without labels.
             if !self.limiter.admit(
-                tenant_id,
                 self.actor_id,
                 RAW_SQL_UNNAMED_KEY,
                 &self.entry_point,
@@ -318,7 +304,7 @@ impl DeniedSourceAuditScope {
                 .into_iter()
                 .filter(|label| {
                     self.limiter
-                        .admit(tenant_id, self.actor_id, label, &self.entry_point, now)
+                        .admit(self.actor_id, label, &self.entry_point, now)
                 })
                 .collect();
             if fresh.is_empty() {
@@ -327,7 +313,6 @@ impl DeniedSourceAuditScope {
             fresh
         };
         self.sink.submit(DeniedSourceAuditRecord {
-            tenant: self.tenant.clone(),
             actor_id: self.actor_id,
             api_key_id: self.api_key_id,
             labels: fresh,
@@ -395,8 +380,7 @@ pub fn observe_raw_sql_refused(sql: &str) {
 /// `NOT IN`, `NOT …`) exclude a source and name nothing — which also makes
 /// the gate's own injected `NOT IN` conjunct invisible here.
 ///
-/// On the lake field the Unattributed spellings fold to the restriction label
-/// (`unknown` → `default`). `denied` is normalized by the caller (lowercase).
+/// `denied` is normalized by the caller (lowercase).
 pub fn denied_sources_named(query: &Query, denied: &BTreeSet<String>) -> BTreeSet<String> {
     let mut named = BTreeSet::new();
     if !denied.is_empty() {
@@ -461,14 +445,14 @@ fn walk_expr(
         SearchExpr::FieldFilter {
             field, op, value, ..
         } => {
-            let Some(lake) = source_field(field) else {
+            if !is_source_field(field) {
                 return;
-            };
+            }
             let Some((matcher, op_positive)) = matcher_for(op, value) else {
                 return;
             };
             if op_positive == positive {
-                collect_matches(&matcher, lake, denied, named);
+                collect_matches(&matcher, denied, named);
             }
         }
         SearchExpr::InList {
@@ -476,15 +460,15 @@ fn walk_expr(
             values,
             negated,
         } => {
-            let Some(lake) = source_field(field) else {
+            if !is_source_field(field) {
                 return;
-            };
+            }
             if *negated == positive {
                 return;
             }
             for value in values {
                 if let Some((matcher, true)) = matcher_for(&Comparator::Eq, value) {
-                    collect_matches(&matcher, lake, denied, named);
+                    collect_matches(&matcher, denied, named);
                 }
             }
         }
@@ -498,13 +482,12 @@ fn walk_expr(
     }
 }
 
-/// `Some(is_lake_field)` when `field` is a source field.
-fn source_field(field: &str) -> Option<bool> {
+/// Whether `field` names an event's source.
+fn is_source_field(field: &str) -> bool {
     let field = field.trim();
     SOURCE_FIELDS
         .iter()
-        .find(|candidate| field.eq_ignore_ascii_case(candidate))
-        .map(|candidate| *candidate == crate::search::query_processing::LAKE_SOURCE_FIELD)
+        .any(|candidate| field.eq_ignore_ascii_case(candidate))
 }
 
 enum Matcher {
@@ -625,19 +608,10 @@ fn like_to_regex(like: &str) -> String {
     out
 }
 
-fn collect_matches(
-    matcher: &Matcher,
-    lake_field: bool,
-    denied: &BTreeSet<String>,
-    named: &mut BTreeSet<String>,
-) {
+fn collect_matches(matcher: &Matcher, denied: &BTreeSet<String>, named: &mut BTreeSet<String>) {
     for label in denied {
         if matcher.matches(label) {
-            named.insert(if lake_field {
-                crate::auth::source_visibility::canonical_restriction_slug(label)
-            } else {
-                label.clone()
-            });
+            named.insert(label.clone());
         }
     }
 }
@@ -652,7 +626,7 @@ pub fn raw_sql_named_denied_sources(sql: &str, denied: &BTreeSet<String>) -> BTr
             let label = label.to_ascii_lowercase();
             lowered.contains(&format!("'{label}'")) || lowered.contains(&format!("\"{label}\""))
         })
-        .map(|label| crate::auth::source_visibility::canonical_restriction_slug(label))
+        .cloned()
         .collect()
 }
 

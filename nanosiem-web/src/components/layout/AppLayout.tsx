@@ -53,8 +53,9 @@ import {
   NavCollapse,
 } from '@/components/layout/nav-icons';
 import { PivtIcon } from '@/components/icons/PivtIcon';
+import { ingestionNavigation } from './ingestion-navigation';
+import { LOG_SOURCES_PATH, ingestionHomeFor } from '@/lib/ingestion-paths';
 import { cn } from '@/lib/utils';
-import { swaggerUiPath } from '@/lib/tenant-auth-shell';
 import { useAuth } from '@/contexts/AuthContext';
 import { useOnboardingProgress } from '@/hooks/use-api';
 import { VersionBadge } from '@/components/VersionBadge';
@@ -62,10 +63,11 @@ import { ScrollContainerProvider } from '@/contexts/ScrollContainerContext';
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext';
 import { DemoBanner } from '@/components/DemoBanner';
 import { LicenseBanner } from '@/components/LicenseBanner';
-import { AiAllowanceBanner } from '@/components/AiAllowanceBanner';
 import { AppBreadcrumbs, useCurrentPageTitle } from '@/components/layout/AppBreadcrumbs';
 import { useNotebookOptional } from '@/enterprise/contexts/NotebookContext';
 import { usePivtState, type PivtState } from '@/enterprise/hooks/use-pivt-state';
+import { AUTOMATION_SECTION_ICON, useAutomationNav } from '@/enterprise/pages/Automation/automation-nav';
+import { ApprovalsBell } from '@/enterprise/pages/Automation/ApprovalsBell';
 import { PivtSummon } from '@/enterprise/components/pivt/PivtSummon';
 import { PivtShellOverlay } from '@/enterprise/components/pivt/PivtShellOverlay';
 import { useCapabilities, type Capabilities } from '@/hooks/use-capabilities';
@@ -74,13 +76,9 @@ import { NotificationBell } from '@/components/NotificationBell';
 import { SettingsLayout } from '@/components/layout/settings/SettingsLayout';
 const CommandPalette = lazy(() => import('@/components/shared/CommandPalette').then(m => ({ default: m.CommandPalette })));
 import { Button } from '@/components/ui/button';
-import { useSharedTenant } from '@/hooks/use-shared-tenant';
-import { ingestionNavigation, visibleOnEdition } from './ingestion-navigation';
 import { StatusBar } from './StatusBar';
-import { AUTOMATION_SECTION_ICON, useAutomationNav } from '@/pages/Automation/automation-nav';
-import { ApprovalsBell } from '@/pages/Automation/ApprovalsBell';
 import { Logo } from '@/components/ui/logo';
-import { ThemeSwatches } from '@/components/ui/theme-swatches';
+import { ThemeMenu } from './ThemeMenu';
 import {
   Sheet,
   SheetContent,
@@ -208,19 +206,6 @@ export interface NavItem {
    * URL. (NAN-437)
    */
   activePrefixes?: string[];
-  /**
-   * Hide on hosted-shared tenants (NAN-2593): the surface is platform-managed
-   * there (e.g. Source Configs: transports and routing belong to the platform).
-   */
-  hideOnShared?: boolean;
-  /** Hosted shared-lake pipeline management has a tenant runtime contract. */
-  sharedOnly?: boolean;
-  /**
-   * Hide from demo analysts (Saturn role or a live shared demo session,
-   * NAN-4152): the surface is refused by the demo guard even though a demo
-   * permission happens to match (same rule as the settings `demoHidden`).
-   */
-  demoHidden?: boolean;
 }
 
 /**
@@ -231,7 +216,7 @@ export interface NavItem {
 const navigation: NavItem[] = [
   { name: 'Home', href: '/', icon: NavHome }, // Always visible
   { name: 'Getting Started', href: '/getting-started', icon: NavPlusCross }, // Onboarding wizard
-  { name: 'Search', href: '/search', icon: NavSearch, permissions: 'search:view', capability: 'search' },
+  { name: 'Search', href: '/search', icon: NavSearch, permissions: 'search:view' },
   { name: 'Dashboards', href: '/dashboards', icon: NavGrid, permissions: 'dashboards:view' },
   // NAN-1793: scheduled reports — cron a saved search / dashboard into
   // downloadable CSV/HTML artifacts. Gated on search:view (same as Search).
@@ -279,8 +264,7 @@ const detectionNavigation: NavItem[] = [
   { name: 'Rule Editor', href: '/rules/editor', icon: PenTool, permissions: 'detections:create' },
   { name: 'Repositories', href: '/rules/repositories', icon: FolderInput, permissions: 'detections:view' },
   { name: 'Lookup Tables', href: '/rules/lookup-tables', icon: Table, permissions: 'lookup:view' },
-  // NAN-3467: `/api/ioc-lists` exists only on hosted-shared tenants.
-  { name: 'IOC Lists', href: '/rules/ioc-lists', icon: LucideShield, permissions: 'enrichments:view', capability: 'iocLists' },
+  { name: 'IOC Lists', href: '/rules/ioc-lists', icon: ShieldCheck, permissions: 'enrichments:view', capability: 'iocLists' },
   { name: 'MITRE Coverage', href: '/rules/coverage', icon: Target, permissions: 'detections:view' },
   { name: 'AI Tuning', href: '/rules/tuning', icon: PivtIcon, permissions: 'detections:view', capability: 'aiTuning' },
 ];
@@ -299,7 +283,7 @@ const settingsNavigation: NavItem[] = [
   { name: 'Risk Scoring', href: '/settings/risk', icon: TrendingUp, permissions: 'risk:configure', capability: 'risk' },
   { name: 'Storage', href: '/settings/storage', icon: Database, permissions: 'settings:retention' },
   { name: 'Search', href: '/settings/search', icon: Gauge, permissions: 'settings:system' },
-  { name: 'AI', href: '/settings/ai', icon: Bot, permissions: ['settings:ai', 'settings:ai_providers', 'settings:agent_models'], capability: 'melod', demoHidden: true },
+  { name: 'AI', href: '/settings/ai', icon: Bot, permissions: ['settings:ai', 'settings:ai_providers', 'settings:agent_models'], capability: 'melod' },
   { name: 'Webhooks', href: '/settings/webhooks', icon: Webhook, permissions: 'settings:webhooks' },
   { name: 'GDPR', href: '/settings/gdpr', icon: ShieldCheck, permissions: 'gdpr:anonymize' },
   { name: 'Access Control', href: '/settings/access-control', icon: LucideShield, permissions: ['users:view', 'groups:view', 'roles:view', 'apikeys:view', 'audit:view'] },
@@ -369,13 +353,13 @@ function TopBar({
 
       <div className="flex-1 min-w-0" />
 
-      {/* Right actions — pivt is the new home for notebook interaction;
+      {/* Right actions — PIVT is the new home for notebook interaction;
           the legacy `Start a new notebook` icon (which opened the
-          deprecated NotebookSidebar via toggleSidebar) is gone. pivt's
-          @-commands cover notebook creation; the floating pivt panel
+          deprecated NotebookSidebar via toggleSidebar) is gone. PIVT's
+          @-commands cover notebook creation; the floating PIVT panel
           owns the read surface. */}
       <div className="flex items-center gap-1 shrink-0">
-        {/* NAN-4546: SOAR approvals waiting on you (renders nothing unless SOAR is on). */}
+        {/* NAN-4546: automation approvals waiting on you (renders nothing while automation is off). */}
         <ApprovalsBell />
         {melodEnabled && <PivtSummon state={pivt} />}
         <NotificationBell />
@@ -433,22 +417,14 @@ function UserMenuContent({
         User Settings
       </DropdownMenuItem>
       {/* NAN-917 F-25: theme control is reachable from every route via the user
-          menu (previously only on /settings/*). It was a light/dark toggle,
-          which could not express a third theme — now a swatch row, so Matte
-          Black is reachable here too. `onSelect`+preventDefault keeps the menu
-          OPEN while you try themes: picking one repaints the menu itself, and
-          closing on each click would make comparing them a chore.
+          menu. Menu-native radio items in a submenu (not a row of buttons
+          nested in a menu item, which Radix's roving focus cannot reach), so
+          every theme is selectable by keyboard. `onSelect`+preventDefault keeps
+          the menu OPEN while you try themes: picking one repaints the menu
+          itself, and closing on each pick makes comparing them a chore.
           `system` is deliberately not here — it has no colour to preview; it
-          stays in Settings → User Settings. */}
-      <DropdownMenuItem
-        onSelect={(event) => event.preventDefault()}
-        className={cn(itemCls, 'flex-col items-start gap-1.5 focus:bg-transparent')}
-      >
-        <span className="text-[10.5px] uppercase tracking-wide text-muted-foreground">
-          Theme
-        </span>
-        <ThemeSwatches />
-      </DropdownMenuItem>
+          stays in Settings → User Settings, next to the swatch row. */}
+      <ThemeMenu itemCls={itemCls} />
       <DropdownMenuSeparator />
       <DropdownMenuItem asChild className={itemCls}>
         <a href="https://nano.rs/docs/" target="_blank" rel="noopener noreferrer">
@@ -458,7 +434,7 @@ function UserMenuContent({
         </a>
       </DropdownMenuItem>
       <DropdownMenuItem asChild className={itemCls}>
-        <a href={swaggerUiPath(window.location.pathname)} target="_blank" rel="noopener noreferrer">
+        <a href="/swagger-ui/" target="_blank" rel="noopener noreferrer">
           <Code className="w-3.5 h-3.5" />
           API
           <ExternalLink className="w-3 h-3 ml-auto opacity-50" />
@@ -487,7 +463,7 @@ function MainAppShell({ children }: AppLayoutProps) {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const pivt = usePivtState();
 
-  // ── pivt keyboard shortcuts ─────────────────────────────────────────────
+  // ── PIVT keyboard shortcuts ─────────────────────────────────────────────
   // ⌘. / ctrl+.            → toggle open/close
   // ⌘⇧. / ctrl+shift+.     → switch dock ↔ float (and open if closed)
   // Escape hatch: don't fire while the user is typing into an input /
@@ -522,13 +498,10 @@ function MainAppShell({ children }: AppLayoutProps) {
    * Requirements: 5.3 - Hide menu items user cannot access
    */
   const { capabilities } = useCapabilities();
-  const sharedTenant = useSharedTenant();
   const filterNavItems = useCallback((items: NavItem[]): NavItem[] => {
     return items.filter(item => {
       // Build-time capability gate — open-core builds drop enterprise items.
       if (item.capability && !capabilities[item.capability]) return false;
-      if (!visibleOnEdition(item, sharedTenant)) return false;
-      if (item.demoHidden && isDemoUser) return false;
 
       // No permission required - always show
       if (!item.permissions) return true;
@@ -539,7 +512,7 @@ function MainAppShell({ children }: AppLayoutProps) {
       }
       return hasPermission(item.permissions);
     });
-  }, [hasPermission, hasAnyPermission, capabilities, sharedTenant, isDemoUser]);
+  }, [hasPermission, hasAnyPermission, capabilities]);
 
   // Filtered navigation arrays based on user permissions
   const filteredNavigation = useMemo(() => {
@@ -557,9 +530,13 @@ function MainAppShell({ children }: AppLayoutProps) {
   const filteredSecondaryMainNavigation = useMemo(() => filterNavItems(secondaryMainNavigation), [filterNavItems]);
   const filteredCasesNavigation = useMemo(() => filterNavItems(casesNavigation), [filterNavItems]);
   const filteredDetectionNavigation = useMemo(() => filterNavItems(detectionNavigation), [filterNavItems]);
-  const filteredIngestionNavigation = useMemo(() => filterNavItems(ingestionNavigation), [filterNavItems]);
+  const filteredIngestionNavigation = useMemo(
+    () => filterNavItems(ingestionNavigation).map((item) =>
+      item.href === LOG_SOURCES_PATH ? { ...item, href: ingestionHomeFor(hasPermission) } : item),
+    [filterNavItems, hasPermission],
+  );
   const filteredSettingsNavigation = useMemo(() => filterNavItems(settingsNavigation), [filterNavItems]);
-  // NAN-4540: empty unless SOAR is enabled; flips live with Settings → SOAR.
+  // NAN-4540 / NAN-4925: empty unless automation is enabled; flips live with its setting.
   const automationNav = useAutomationNav();
   const automationItems = automationNav.items;
 
@@ -664,14 +641,8 @@ function MainAppShell({ children }: AppLayoutProps) {
 
   // Handle logout
   const handleLogout = useCallback(async () => {
-    try {
-      await logout();
-    } catch {
-      // AuthContext already cleared local credentials and surfaced the durable
-      // revocation failure. Do not leak an unhandled event-handler rejection.
-    } finally {
-      navigate('/login', { replace: true });
-    }
+    await logout();
+    navigate('/login', { replace: true });
   }, [logout, navigate]);
 
   // Get user initials for avatar
@@ -952,7 +923,7 @@ function MainAppShell({ children }: AppLayoutProps) {
             </Link>
           )}
 
-          {/* Automation Section (NAN-4540) — only while SOAR is enabled */}
+          {/* Automation Section (NAN-4540) — only while automation is enabled */}
           {automationItems.length > 0 && (
             <div className="pt-2" data-testid="nav-automation">
               {sidebarCollapsed ? (
@@ -1176,10 +1147,10 @@ function MainAppShell({ children }: AppLayoutProps) {
             pivt={pivt}
           />
 
-          {/* Main area + notebook sidebar + pivt dock share this 1fr row.
+          {/* Main area + notebook sidebar + PIVT dock share this 1fr row.
               PivtShellOverlay renders the docked panel as a flex sibling
               after NotebookSidebar (so they can coexist until NAN-405
-              consolidates NotebookChat into pivt). Float + rail are absolute
+              consolidates NotebookChat into PIVT). Float + rail are absolute
               positioned and don't affect this layout.
               Open-core builds skip the overlay entirely; the main content is
               rendered as a flex child directly. */}
@@ -1188,7 +1159,6 @@ function MainAppShell({ children }: AppLayoutProps) {
               const mainContent = (
                 <main className="flex-1 flex flex-col min-w-0 overflow-x-hidden md:[overflow-x:clip]">
                   <LicenseBanner />
-                  <AiAllowanceBanner />
                   <DemoBanner />
                   <div
                     ref={scrollContainerRef}

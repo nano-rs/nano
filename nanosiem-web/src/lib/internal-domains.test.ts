@@ -3,13 +3,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   BUILTIN_INTERNAL_SUFFIXES,
-  buildInternalDomainsPreviewQuery,
   effectiveInternalSuffixes,
   isInternalName,
-  isPublicTldWarning,
-  publicSuffixWarningText,
-  REFUSED_PUBLIC_TLDS,
-  refusedSuffixMessage,
   normalizeSuffix,
 } from './internal-domains';
 
@@ -63,7 +58,7 @@ describe('normalizeSuffix', () => {
     `${'a'.repeat(60)}.`.repeat(5),
     '10.0.0.1',
     'fe80::1',
-    'ünïcode',
+    
   ])('rejects %j', (raw) => {
     expect(normalizeSuffix(raw)).toBeNull();
   });
@@ -82,66 +77,11 @@ describe('effectiveInternalSuffixes', () => {
   });
 });
 
-describe('isPublicTldWarning', () => {
-  it('flags single-label public TLDs only', () => {
-    expect(isPublicTldWarning('cloud')).toBe(true);
-    expect(isPublicTldWarning('.PROD')).toBe(true);
-    expect(isPublicTldWarning('corp.example.cloud')).toBe(false);
-    expect(isPublicTldWarning('corp')).toBe(false);
-    expect(isPublicTldWarning('bad name')).toBe(false);
-  });
-
-  it('never warns on a refused suffix (it is refused instead)', () => {
-    for (const tld of REFUSED_PUBLIC_TLDS) expect(isPublicTldWarning(tld)).toBe(false);
-  });
-});
-
-describe('refusedSuffixMessage (NAN-3230)', () => {
-  it.each(['com', 'NET', '.io', 'app', 'dev', 'co', 'biz', 'info'])('refuses high-volume TLD %j', (raw) => {
-    expect(refusedSuffixMessage(raw)).toMatch(/is a high-volume public TLD/);
-  });
-  it.each(['uk', 'de', 'au'])('refuses bare ccTLD %j', (raw) => {
-    expect(refusedSuffixMessage(raw)).toMatch(/is a country-code TLD/);
-  });
-  it.each(['co.uk', 'com.au', 'ne.jp'])('refuses registry second level %j', (raw) => {
-    expect(refusedSuffixMessage(raw)).toMatch(/is a public registry suffix/);
-  });
-  it.each(['cloud', 'prod', 'corp.example.com', 'example.co.uk', 'mycorp-internal', 'bad name'])(
-    'allows %j',
-    (raw) => {
-      expect(refusedSuffixMessage(raw)).toBeNull();
-    },
-  );
-  it('names the narrower alternative', () => {
-    expect(refusedSuffixMessage('com')).toMatch(/such as corp\.example\.com\.$/);
-  });
-});
-
-describe('publicSuffixWarningText', () => {
-  it('spells out the blinding effect', () => {
-    expect(publicSuffixWarningText('cloud')).toBe(
-      'Domains under .cloud will no longer get threat-intel enrichment or domain rarity, including attacker-registered ones like evil.cloud. Prefer a narrower suffix such as corp.example.cloud.',
-    );
-  });
-});
-
-describe('buildInternalDomainsPreviewQuery', () => {
-  it('builds a UDM query', () => {
-    expect(buildInternalDomainsPreviewQuery(['prod'], 'udm')).toBe(
-      'dest_host="*.prod" OR dest_host="prod" | stats dc(dest_host) as names',
-    );
-  });
-
-  it('builds an OCSF query across suffixes and drops invalid ones', () => {
-    expect(buildInternalDomainsPreviewQuery(['prod', 'Nano.Cloud', 'bad name'], 'ocsf')).toBe(
-      'dst_endpoint.hostname="*.prod" OR dst_endpoint.hostname="prod" OR ' +
-        'dst_endpoint.hostname="*.nano.cloud" OR dst_endpoint.hostname="nano.cloud" ' +
-        '| stats dc(dst_endpoint.hostname) as names',
-    );
-  });
-
-  it('returns null with no valid suffix', () => {
-    expect(buildInternalDomainsPreviewQuery([], 'udm')).toBeNull();
-    expect(buildInternalDomainsPreviewQuery(['a b'], 'udm')).toBeNull();
+describe('IDNA equivalence (U-label vs A-label)', () => {
+  it('matches a U-label name against an A-label suffix and the reverse', () => {
+    expect(isInternalName('db.bücher.example', ['xn--bcher-kva.example'])).toBe(true);
+    expect(isInternalName('DB.XN--BCHER-KVA.EXAMPLE', ['bücher.example'])).toBe(true);
+    expect(isInternalName('db.bucher.example', ['bücher.example'])).toBe(false);
+    expect(normalizeSuffix('*.Bücher.Example.')).toBe('xn--bcher-kva.example');
   });
 });

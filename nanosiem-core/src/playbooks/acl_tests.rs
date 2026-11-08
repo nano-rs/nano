@@ -118,8 +118,7 @@ fn view_and_action_flags_must_share_a_single_exists_subquery() {
     ] {
         let sql = acl_sql("playbooks.id", action, "$1", "$2", "$3");
         assert_eq!(
-            sql.matches("OR EXISTS (SELECT 1 FROM playbook_permissions pp")
-                .count(),
+            sql.matches("OR EXISTS (SELECT 1 FROM playbook_permissions pp").count(),
             1,
             "{action:?} must use a single grant subquery, not one per flag: {sql}"
         );
@@ -130,8 +129,7 @@ fn view_and_action_flags_must_share_a_single_exists_subquery() {
         // And exactly one "no ACL rows" escape, so the open-by-default branch
         // cannot be satisfied independently per flag either.
         assert_eq!(
-            sql.matches("NOT EXISTS (SELECT 1 FROM playbook_permissions pp")
-                .count(),
+            sql.matches("NOT EXISTS (SELECT 1 FROM playbook_permissions pp").count(),
             1,
             "{action:?}: {sql}"
         );

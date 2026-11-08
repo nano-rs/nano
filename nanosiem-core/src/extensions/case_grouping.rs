@@ -8,7 +8,6 @@
 //! is_new_case, notebook_id).
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::extensions::ExtensionError;
@@ -17,8 +16,7 @@ use crate::models::Alert;
 /// Case visibility / routing settings inherited from the firing detection rule.
 /// Mirrors enterprise `cases::CasePermissionSettings` but lives in core so the
 /// detection engine can build it without depending on the cases module.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Default)]
 pub struct AlertCasePermissions {
     /// "public" | "group" | "private"
     pub visibility: String,

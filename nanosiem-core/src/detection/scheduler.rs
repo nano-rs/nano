@@ -135,15 +135,6 @@ pub fn calculate_next_run_phased(
     next
 }
 
-/// Cron a scheduled rule runs on when it is saved without one: every minute,
-/// the documented default for scheduled rules.
-///
-/// NAN-3468: a scheduled rule saved with no `schedule_cron` (API or editor)
-/// was accepted and then never claimed; the scheduler only logged "it will
-/// never run". Every create/update path (dedicated `DetectionService` and the
-/// hosted-shared authoring path) now fills this in instead.
-pub const DEFAULT_SCHEDULE_CRON: &str = "* * * * *";
-
 /// Normalize a cron expression to 6-field format
 ///
 /// The `cron` crate requires 6 fields (sec min hour day month weekday).

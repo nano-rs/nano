@@ -1,15 +1,46 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { BrowserTelemetry } from '@/components/observability/BrowserTelemetry';
-import { lazyWithRetry } from '@/lib/lazyWithRetry';
-import { reloadRouteChunk } from '@/lib/reload-route-chunk';
-import { authenticatedFetch } from '@/lib/authenticated-fetch';
-import { customInventoryRedirect } from '@/lib/api/marketplace-inventory';
 
-import { BrowserRouter, Routes, Route, useLocation, Navigate, useParams, useSearchParams, Link } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, useLocation, Navigate, useParams, Link } from 'react-router-dom';
+import { PivtSessionGuard } from '@/enterprise/components/pivt/PivtSessionGuard';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import { useTier, TierProvider } from '@/hooks/use-tier';
 import { useState, useEffect, lazy, Suspense, ComponentType } from 'react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ThemeProvider } from '@/components/theme-provider';
 import { sourceOnboardingPermission } from '@/lib/add-data-sources';
+import { reloadRouteChunk } from '@/lib/reload-route-chunk';
+
+// Helper to handle chunk load failures after deployments
+// When a new version is deployed, old chunk files may no longer exist
+// This wrapper auto-refreshes the page to load the new bundle
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function lazyWithRetry<T extends ComponentType<any>>(
+  importFn: () => Promise<{ default: T }>
+): React.LazyExoticComponent<T> {
+  return lazy(() =>
+    importFn().catch((err) => {
+      // Chunk failed to load - likely a new deployment
+      // Refresh to get the new bundle (#7041: never replaying a ?q= URL)
+      reloadRouteChunk(err);
+      // Return a never-resolving promise to prevent error flash
+      return new Promise(() => {});
+    })
+  );
+}
+
+/**
+ * NAN-4922 (main's NAN-4847): the old Add Feed wizard address. A deep link
+ * that names a source (`?source=`, `?sources=`, `?convert=`) opens Add source
+ * on it; anything else lands on Log Sources.
+ */
+function LegacyAddDataRedirect() {
+  const { search } = useLocation();
+  const params = new URLSearchParams(search);
+  const target = params.has('source') || params.has('sources') || params.has('convert') || params.has('source_id') || params.has('clone')
+    ? '/ingestion/log-sources/new'
+    : '/ingestion/log-sources';
+  return <Navigate replace to={target + search} />;
+}
 
 // Variant for named exports
 // NAN-998: throw loudly if the named export is missing (e.g. caller mismatched
@@ -17,12 +48,6 @@ import { sourceOnboardingPermission } from '@/lib/add-data-sources';
 // Previously this silently resolved to `{ default: undefined }`, which paints
 // a blank page with React error #306 at render time — hard to trace.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function LegacyAddDataRedirect() {
-  const { search } = useLocation();
-  const params = new URLSearchParams(search);
-  return <Navigate replace to={(params.has('source') || params.has('sources') || params.has('convert') ? '/ingestion/log-sources/new' : '/ingestion/log-sources') + search} />;
-}
-
 function lazyWithRetryNamed<T extends ComponentType<any>>(
   importFn: () => Promise<{ [key: string]: T }>,
   namedExport: string
@@ -51,27 +76,26 @@ function lazyWithRetryNamed<T extends ComponentType<any>>(
   );
 }
 
+// Create a QueryClient instance for React Query
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 60, // 1 minute
+      retry: 1,
+    },
+  },
+});
+
 // Context providers and core components - keep eager
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
-import { TenantRuntimeBoundary } from '@/components/auth/TenantRuntimeBoundary';
-import {
-  tenantBasename,
-  tenantSlugFromLoginPath,
-  tenantSlugFromMfaSetupPath,
-} from '@/lib/tenant-auth-shell';
 import { UserPreferencesProvider, useUserPreferences } from '@/contexts/UserPreferencesContext';
 import { useOnboardingProgress } from '@/hooks/use-api';
 import { SsoRouteGate } from '@/pages/Settings/SsoRouteGate';
-import { IocListsRouteGate } from '@/pages/IocListsRouteGate';
 import { useRegisterSchemaHighlightFields } from '@/hooks/useRegisterSchemaHighlightFields';
 import { NotebookProvider } from '@/enterprise/contexts/NotebookContext';
-import { PivtSessionGuard } from '@/enterprise/components/pivt/PivtSessionGuard';
 import { LayoutProvider } from '@/contexts/LayoutContext';
 import { CapabilitiesProvider } from '@/contexts/CapabilitiesProvider';
 import { ProtectedRoute } from '@/components/auth/ProtectedRoute';
-import { RetiredOnSharedRoute } from '@/components/auth/RetiredOnSharedRoute';
-import { VectorRequiredRoute } from '@/components/add-data/VectorRequiredRoute';
-import { CLOUD_PULL_PATH } from '@/lib/shared-credentials-retired';
 import { AppLayout } from '@/components/layout/AppLayout';
 import { PageContextProvider } from '@/contexts/PageContext';
 import { Toaster } from '@/components/ui/sonner';
@@ -95,18 +119,10 @@ import { Demo } from '@/enterprise/pages/Demo';
 import { DemoClaim } from '@/enterprise/pages/DemoClaim';
 import { Setup } from '@/pages/Setup';
 import { AuthCallback } from '@/enterprise/pages/AuthCallback';
-import {
-  EnterpriseSharedOidcCallback,
-  EnterpriseSharedOidcEntry,
-} from '@/pages/EnterpriseSharedOidc';
-import { EnterpriseSharedActivation } from '@/pages/EnterpriseSharedActivation';
-import { EnterpriseSharedMembershipAcceptance } from '@/pages/EnterpriseSharedMembershipAcceptance';
 import Denied from '@/pages/Denied';
 
 // Dashboard and Search are lazy-loaded — they pull in heavy visualization deps
 // (recharts, @xyflow/react, react-markdown) that would bloat the main bundle
-// On-demand threat-intel enrichment sheet; listens for Enrich actions app-wide.
-const EnrichSheetHost = lazyWithRetryNamed(() => import('@/components/threat-intel/EnrichSheet'), 'EnrichSheetHost');
 const Dashboard = lazyWithRetryNamed(() => import('@/pages/Dashboard'), 'Dashboard');
 const Search = lazyWithRetryNamed(() => import('@/pages/Search'), 'Search');
 const TracePage = lazyWithRetryNamed(() => import('@/pages/TracePage'), 'TracePage');
@@ -128,6 +144,8 @@ const CustomIntegrationWizard = lazyWithRetryNamed(() => import('@/enterprise/pa
 // LAZY IMPORTS - Tier 2: Large pages (1000+ lines)
 // ============================================================================
 const AddFeed = lazyWithRetryNamed(() => import('@/pages/AddFeed'), 'AddFeed');
+// On-demand threat-intel Enrich flyout; listens for Enrich actions app-wide (enterprise, NAN-4931).
+const EnrichSheetHost = lazyWithRetryNamed(() => import('@/enterprise/components/threat-intel/EnrichSheet'), 'EnrichSheetHost');
 const LogSourceDetail = lazyWithRetryNamed(() => import('@/pages/LogSourceDetail'), 'LogSourceDetail');
 const CaseDetail = lazyWithRetryNamed(() => import('@/enterprise/pages/CaseDetail'), 'CaseDetail');
 // NAN-437: /inbox route renders the workspace shell without a selected case.
@@ -150,9 +168,16 @@ const RetroHunt = lazyWithRetryNamed(() => import('@/pages/RetroHunt'), 'RetroHu
 const LogSources = lazyWithRetryNamed(() => import('@/pages/LogSources'), 'LogSources');
 const Pipelines = lazyWithRetryNamed(() => import('@/pages/Pipelines'), 'Pipelines');
 const IngestCredentials = lazyWithRetryNamed(() => import('@/pages/IngestCredentials'), 'IngestCredentials');
-const ConnectorFeeds = lazyWithRetryNamed(() => import('@/pages/ConnectorFeeds'), 'ConnectorFeeds');
 const CloudPull = lazyWithRetryNamed(() => import('@/pages/CloudPull'), 'CloudPull');
 const Risk = lazyWithRetryNamed(() => import('@/enterprise/pages/Risk'), 'Risk');
+// Code-free IOC lists (enterprise; NAN-4902 lane G). Open builds render the stub.
+const IocLists = lazyWithRetryNamed(() => import('@/enterprise/pages/IocLists'), 'IocLists');
+// NAN-4540 / NAN-4925: Automation workspace (enterprise); each route gates itself.
+const AutomationRunsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Automation'), 'AutomationRunsRoute');
+const AutomationFlowsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Automation'), 'AutomationFlowsRoute');
+const AutomationFlowRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Automation'), 'AutomationFlowRoute');
+const AutomationApprovalsRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Automation'), 'AutomationApprovalsRoute');
+const AutomationCapabilitiesRoute = lazyWithRetryNamed(() => import('@/enterprise/pages/Automation'), 'AutomationCapabilitiesRoute');
 const RiskWatchlists = lazyWithRetryNamed(() => import('@/enterprise/pages/RiskWatchlists'), 'RiskWatchlists');
 const Prevalence = lazyWithRetryNamed(() => import('@/pages/Prevalence'), 'Prevalence');
 const Dashboards = lazyWithRetryNamed(() => import('@/pages/Dashboards'), 'Dashboards');
@@ -184,24 +209,26 @@ const PlaybookNew = lazyWithRetryNamed(() => import('@/enterprise/pages/Playbook
 // NAN-470: Playbook repositories admin page (Settings → Playbook Repositories)
 const PlaybookRepositories = lazyWithRetryNamed(() => import('@/enterprise/pages/PlaybookRepositories'), 'PlaybookRepositories');
 const Marketplace = lazyWithRetryNamed(() => import('@/pages/Marketplace'), 'Marketplace');
-const EnrichmentDetail = lazyWithRetryNamed(() => import('@/pages/Settings/EnrichmentDetail'), 'EnrichmentDetail');
 // NAN-1111: AgentEnrichmentDetail (and the only provider it dispatched,
 // VirusTotal) sunset to the marketplace path; the route is now handled by
 // LegacyAgentEnrichmentRedirect below. The lazy import is intentionally
 // removed alongside the deletion of the file.
-const Credentials = lazyWithRetryNamed(() => import('@/pages/Credentials'), 'Credentials');
+// NAN-4941: the retired ingestion pages redirect into Log Sources.
+const LegacyCredentialRedirect = lazyWithRetryNamed(() => import('@/pages/LegacyIngestionRedirects'), 'LegacyCredentialRedirect');
+const LegacySourceConfigRedirect = lazyWithRetryNamed(() => import('@/pages/LegacyIngestionRedirects'), 'LegacySourceConfigRedirect');
+const LegacyCredentialNewRedirect = lazyWithRetryNamed(() => import('@/pages/LegacyIngestionRedirects'), 'LegacyCredentialNewRedirect');
+const LegacyPullFeedsRedirect = lazyWithRetryNamed(() => import('@/pages/LegacyIngestionRedirects'), 'LegacyPullFeedsRedirect');
+const ConnectorFeeds = lazyWithRetryNamed(() => import('@/pages/ConnectorFeeds'), 'ConnectorFeeds');
 // NAN-998: Upload.tsx is a default export — must use lazyWithRetry, not the
 // Named variant. Previously crashed with React error #306 on /upload because
 // module['Upload'] was undefined.
 const Upload = lazyWithRetry(() => import('@/pages/Upload'));
 const LookupTables = lazyWithRetryNamed(() => import('@/pages/LookupTables'), 'LookupTables');
-const IocLists = lazyWithRetryNamed(() => import('@/pages/IocLists'), 'IocLists');
 const LookupTableCreate = lazyWithRetryNamed(() => import('@/pages/LookupTableCreate'), 'LookupTableCreate');
 const LookupTableView = lazyWithRetryNamed(() => import('@/pages/LookupTableView'), 'LookupTableView');
 const Notebooks = lazyWithRetryNamed(() => import('@/enterprise/pages/Notebooks'), 'Notebooks');
 // Placeholder lazy-loader removed with NAN-1008 (/help now redirects to /docs).
 const SiemHealth = lazyWithRetryNamed(() => import('@/pages/SiemHealth'), 'SiemHealth');
-const SourceConfigurations = lazyWithRetry(() => import('@/pages/SourceConfigurations'));
 const SourceConfigurationDetail = lazyWithRetry(() => import('@/pages/SourceConfigurationDetail'));
 
 // ============================================================================
@@ -211,6 +238,7 @@ const SettingsLandingPage = lazyWithRetryNamed(() => import('@/pages/Settings/Se
 const MelodSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/MelodSettings'), 'MelodSettings');
 const RetentionSettings = lazyWithRetryNamed(() => import('@/pages/Settings/RetentionSettings'), 'RetentionSettings');
 const RiskSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/RiskSettings'), 'RiskSettings');
+const SoarSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/SoarSettings'), 'SoarSettings');
 const OidcProvidersPage = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/OidcProviders'), 'OidcProvidersPage');
 const AuditLogPage = lazyWithRetryNamed(() => import('@/pages/Settings/AuditLog'), 'AuditLogPage');
 const AccessControlPage = lazyWithRetryNamed(() => import('@/pages/Settings/AccessControl'), 'AccessControlPage');
@@ -220,18 +248,11 @@ const CaseSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Setting
 const QueueSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/QueueSettings'), 'QueueSettings');
 const UserSettings = lazyWithRetryNamed(() => import('@/pages/Settings/UserSettings'), 'UserSettings');
 const NotificationSettings = lazyWithRetryNamed(() => import('@/pages/Settings/NotificationSettings'), 'NotificationSettings');
-const LookupUrlAllowlist = lazyWithRetryNamed(() => import('@/pages/Settings/LookupUrlAllowlist'), 'LookupUrlAllowlist');
 const SearchSettings = lazyWithRetryNamed(() => import('@/pages/Settings/SearchSettings'), 'SearchSettings');
-const SoarSettings = lazyWithRetryNamed(() => import('@/pages/Settings/SoarSettings'), 'SoarSettings');
-// NAN-4540: Automation workspace, gated by soar_enabled inside each route.
-const AutomationRunsRoute = lazyWithRetryNamed(() => import('@/pages/Automation'), 'AutomationRunsRoute');
-const AutomationFlowsRoute = lazyWithRetryNamed(() => import('@/pages/Automation'), 'AutomationFlowsRoute');
-const AutomationFlowRoute = lazyWithRetryNamed(() => import('@/pages/Automation'), 'AutomationFlowRoute');
-const AutomationApprovalsRoute = lazyWithRetryNamed(() => import('@/pages/Automation'), 'AutomationApprovalsRoute');
-const AutomationCapabilitiesRoute = lazyWithRetryNamed(() => import('@/pages/Automation'), 'AutomationCapabilitiesRoute');
 const SourceScopes = lazyWithRetryNamed(() => import('@/pages/Settings/SourceScopes'), 'SourceScopes');
 const GdprAnonymization = lazyWithRetryNamed(() => import('@/pages/Settings/GdprAnonymization'), 'GdprAnonymizationPage');
 const AirgapImportPage = lazyWithRetryNamed(() => import('@/enterprise/airgap/AirgapImportPage'), 'AirgapImportPage');
+const LicenseSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/License'), 'LicenseSettings');
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
 
@@ -247,16 +268,15 @@ function SetupRedirect({ children }: { children: React.ReactNode }) {
   const location = useLocation();
 
   useEffect(() => {
-    // Shared auth-shell routes cannot call the legacy global setup endpoint.
-    if (location.pathname === '/setup' || location.pathname.startsWith('/t/')) {
-      setNeedsSetup(false);
+    // Skip check if already on setup page
+    if (location.pathname === '/setup') {
       setIsChecking(false);
       return;
     }
 
     const checkSetupStatus = async () => {
       try {
-        const response = await authenticatedFetch('/api/setup/status', `${API_BASE_URL}/api/setup/status`);
+        const response = await fetch(`${API_BASE_URL}/api/setup/status`);
         if (response.ok) {
           const status: SetupStatus = await response.json();
           // Need setup if not initialized AND no users exist
@@ -286,56 +306,6 @@ function SetupRedirect({ children }: { children: React.ReactNode }) {
   }
 
   return <>{children}</>;
-}
-
-function rawBrowserPath(fallback: string): string {
-  return typeof window === 'undefined' ? fallback : window.location.pathname;
-}
-
-/**
- * `/login` under a tenant basename IS the tenant login: the slug comes from
- * the browser path (`/t/<slug>/login`), validated against the auth contract.
- * Outside a tenant prefix it is the plain product login.
- */
-function LoginRoute() {
-  const raw = rawBrowserPath('/');
-  if (!raw.startsWith('/t/')) return <Login />;
-  try {
-    return <Login tenantSlug={tenantSlugFromLoginPath(raw)} />;
-  } catch {
-    return <Denied />;
-  }
-}
-
-/** `/mfa-setup` under a tenant basename must agree with the continuation state. */
-function MfaSetupRoute() {
-  const location = useLocation();
-  const raw = rawBrowserPath('/');
-  if (!raw.startsWith('/t/')) return <MfaSetup />;
-  try {
-    const tenantSlug = tenantSlugFromMfaSetupPath(raw);
-    const stateTenant = (location.state as { tenantSlug?: string } | null)?.tenantSlug;
-    if (stateTenant !== undefined && stateTenant !== tenantSlug) return <Denied />;
-    return <MfaSetup />;
-  } catch {
-    return <Denied />;
-  }
-}
-
-/**
- * A shared-lake tenant gets the FULL product. This used to redirect every
- * hosted-shared session into a three-surface "tenant shell" under
- * `/t/<slug>/`, which is what the first real tenant landed on after two
- * months of infrastructure work (2026-09-16) -- no rail, no product. The API
- * mounts the whole product in hosted-shared mode (only risk analytics,
- * entity context and notebooks are held back), and capabilities already gate
- * what the tenant's plan enables, so there is nothing for a reduced shell to
- * protect. `/t/<slug>/...` survives as redirects for the links already in
- * inboxes and bookmarks.
- */
-function ProductRouteGate({ children }: { children: React.ReactNode }) {
-  // Under a tenant basename `/login` already resolves to `/t/<slug>/login`.
-  return <ProtectedRoute>{children}</ProtectedRoute>;
 }
 
 // Helper component to wrap routes with permission checks
@@ -404,18 +374,11 @@ function SsoEditRedirect() {
 }
 
 // NAN-1111: the legacy /enrichments/:id deep-link used to render
-// pre-marketplace per-provider Settings UIs. ThreatFox + Tor moved to
-// the marketplace; IPinfo Lite stays native (binary-volume + non-IOC
-// schema — see project_ipinfo_lite_stays_native memory).
-//
-// NAN-2343: IPinfo redirects too now. Its pass-through was the last route
-// still rendering a pre-marketplace provider UI, and it survived largely
-// because it was the one surface showing `download_url` in cleartext — the
-// marketplace drawer masked it. Migration 285 makes the field readable in the
-// drawer, so the second page no longer earns its keep: two config surfaces
-// writing the same column through different endpoints, only one of which
-// validated, is how a malformed URL got persisted and then blamed on the SSRF
-// check. IPinfo Lite remains native on the backend; only its legacy UI is gone.
+// pre-marketplace per-provider Settings UIs. ThreatFox + Tor moved to the
+// marketplace; NAN-2343 retired the IPinfo Lite page. NAN-4959: IPinfo Lite
+// comes only from nano's signed platform feed bundle, so no native provider
+// page is left and every legacy id redirects to the marketplace (to the
+// matching entry when there is one).
 const LEGACY_ENRICHMENT_TO_MARKETPLACE: Record<string, string> = {
   threatfox: 'threatfox',
   tor: 'tor-exit-nodes',
@@ -424,41 +387,13 @@ const LEGACY_ENRICHMENT_TO_MARKETPLACE: Record<string, string> = {
 };
 
 function LegacyEnrichmentRoute() {
+  // Pure redirect: do NOT gate behind enrichments:view. A user with
+  // marketplace permission but no legacy enrichments permission still
+  // deserves to follow an old bookmark; the marketplace route enforces its
+  // own permission downstream.
   const { id } = useParams();
-  if (id && LEGACY_ENRICHMENT_TO_MARKETPLACE[id]) {
-    // Pure redirect: do NOT gate behind enrichments:view. A user with
-    // marketplace permission but no legacy enrichments permission still
-    // deserves to follow an old bookmark; the marketplace route enforces
-    // its own permission downstream.
-    return (
-      <Navigate
-        to={`/marketplace?slug=${encodeURIComponent(LEGACY_ENRICHMENT_TO_MARKETPLACE[id])}`}
-        replace
-      />
-    );
-  }
-  // Any other still-native source renders the legacy Settings detail page,
-  // gated by enrichments:view. EnrichmentDetail itself shows a "not
-  // available" fallback for unknown source types so unknown IDs don't 500.
-  return (
-    <PermissionRoute
-      permission="enrichments:view"
-      element={
-        <Suspense fallback={<DetailPageLoadingFallback />}>
-          <EnrichmentDetail />
-        </Suspense>
-      }
-    />
-  );
-}
-
-function CustomInventoryRoute() {
-  const { user } = useAuth();
-  const { id } = useParams();
-  const [params] = useSearchParams();
-  const redirect = customInventoryRedirect(id ?? '', user?.deployment_mode === 'enterprise_shared', params.toString());
-  if (redirect) return <Navigate to={redirect} replace />;
-  return <Suspense fallback={<EditorLoadingFallback />}><CustomEnrichmentWizard /></Suspense>;
+  const slug = id ? LEGACY_ENRICHMENT_TO_MARKETPLACE[id] : undefined;
+  return <Navigate to={slug ? `/marketplace?slug=${encodeURIComponent(slug)}` : '/marketplace'} replace />;
 }
 
 // NAN-1111: the agent-enrichment deep-link only ever dispatched
@@ -570,26 +505,6 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
-
-          {/* Automation (NAN-4540) — SOAR runs, flows, approvals, capabilities */}
-          <Route path="/automation" element={<Navigate to="/automation/runs" replace />} />
-          {([
-            ['/automation/runs', AutomationRunsRoute],
-            ['/automation/runs/:id', AutomationRunsRoute],
-            ['/automation/flows', AutomationFlowsRoute],
-            ['/automation/flows/:id', AutomationFlowRoute],
-            ['/automation/approvals', AutomationApprovalsRoute],
-            ['/automation/approvals/:id', AutomationApprovalsRoute],
-            ['/automation/capabilities', AutomationCapabilitiesRoute],
-          ] as const).map(([path, Page]) => (
-            <Route key={path} path={path} element={
-              <PermissionRoute permission="soar:view" element={
-                <Suspense fallback={<ListPageLoadingFallback />}>
-                  <Page key={resetKey} />
-                </Suspense>
-              } />
-            } />
-          ))}
 
           {/* Scheduled reports (NAN-1793) */}
           <Route path="/reports" element={
@@ -748,7 +663,35 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
-          {/* NAN-3228: risk watchlists; NAN-3232: own grant (plus risk:view server-side) */}
+          {/* Automation (enterprise, NAN-4911 / NAN-4925): runs, flows,
+              approvals, capabilities. Each route renders an "off" state
+              itself; open builds render the paid-plan stub. */}
+          <Route path="/automation" element={<Navigate to="/automation/runs" replace />} />
+          {([
+            ['/automation/runs', AutomationRunsRoute],
+            ['/automation/runs/:id', AutomationRunsRoute],
+            ['/automation/flows', AutomationFlowsRoute],
+            ['/automation/flows/:id', AutomationFlowRoute],
+            ['/automation/approvals', AutomationApprovalsRoute],
+            ['/automation/approvals/:id', AutomationApprovalsRoute],
+            ['/automation/capabilities', AutomationCapabilitiesRoute],
+          ] as const).map(([path, Page]) => (
+            <Route key={path} path={path} element={
+              <PermissionRoute permission="soar:view" element={
+                <Suspense fallback={<ListPageLoadingFallback />}>
+                  <Page key={resetKey} />
+                </Suspense>
+              } />
+            } />
+          ))}
+          <Route path="/settings/soar" element={
+            <PermissionRoute anyPermission={['settings:system', 'soar:view']} element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <SoarSettings key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* NAN-3228: risk watchlists */}
           <Route path="/risk/watchlists" element={
             <PermissionRoute permission="risk:watchlists" element={
               <Suspense fallback={<ChartPageLoadingFallback />}>
@@ -909,9 +852,7 @@ function ProtectedAppRoutes() {
               somewhere useful (NAN-1111). Every pre-marketplace provider UI is
               now retired, IPinfo Lite included (NAN-2343). */}
           <Route path="/enrichments" element={<Navigate to="/marketplace" replace />} />
-          {/* LegacyEnrichmentRoute handles the permission check itself: the
-              fallback branch is gated by enrichments:view, but the redirect
-              branch deliberately is not (see comment in the wrapper). */}
+          {/* LegacyEnrichmentRoute is a pure redirect (see the wrapper). */}
           <Route path="/enrichments/:id" element={<LegacyEnrichmentRoute key={resetKey} />} />
 
           {/* Agent Enrichments — VirusTotal redirects to marketplace (NAN-1111).
@@ -928,19 +869,19 @@ function ProtectedAppRoutes() {
           } />
           <Route path="/enrichments/custom/:id" element={
             <PermissionRoute permission="enrichments:view" element={
-              <CustomInventoryRoute key={resetKey} />
+              <Suspense fallback={<EditorLoadingFallback />}>
+                <CustomEnrichmentWizard key={resetKey} />
+              </Suspense>
             } />
           } />
 
           {/* Custom scheduled API integrations */}
           <Route path="/integrations/custom/new" element={
-            <VectorRequiredRoute title="New custom integration">
-              <PermissionRoute permission="log_sources:create" element={
-                <Suspense fallback={<EditorLoadingFallback />}>
-                  <CustomIntegrationWizard key={resetKey} />
-                </Suspense>
-              } />
-            </VectorRequiredRoute>
+            <PermissionRoute permission="log_sources:create" element={
+              <Suspense fallback={<EditorLoadingFallback />}>
+                <CustomIntegrationWizard key={resetKey} />
+              </Suspense>
+            } />
           } />
           <Route path="/integrations/custom/:id" element={
             <PermissionRoute permission="log_sources:view" element={
@@ -950,16 +891,6 @@ function ProtectedAppRoutes() {
             } />
           } />
 
-          <Route path="/ingestion/pipelines" element={
-            <PermissionRoute permission="log_sources:view" element={
-              <Suspense fallback={<ListPageLoadingFallback />}><Pipelines key={resetKey} /></Suspense>
-            } />
-          } />
-          <Route path="/ingestion/pipelines/:id" element={
-            <PermissionRoute permission="log_sources:view" element={
-              <Suspense fallback={<ListPageLoadingFallback />}><Pipelines key={resetKey} /></Suspense>
-            } />
-          } />
           {/* Log Sources */}
           <Route path="/ingestion/log-sources" element={
             <PermissionRoute permission="log_sources:view" element={
@@ -968,36 +899,59 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
+          {/* Nano Pipe (NAN-4919): every edition and deployment. */}
+          <Route path="/ingestion/pipelines" element={
+            <PermissionRoute permission="log_sources:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <Pipelines key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/ingestion/pipelines/:id" element={
+            <PermissionRoute permission="log_sources:view" element={
+              <Suspense fallback={<DetailPageLoadingFallback />}>
+                <Pipelines key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* NAN-4922: Log Sources → Credentials replaced the Ingest tokens page. */}
+          <Route path="/ingestion/ingest-tokens" element={<Navigate to="/ingestion/log-sources/credentials" replace />} />
           <Route path="/ingestion/log-sources/onboarding" element={<Navigate to="/ingestion/log-sources" replace />} />
-          {/* NAN-3844: the Add data wizard creates Vector-delivered sources. */}
+          {/* NAN-4922 (main's NAN-4847): one "Add source" flow; the old Add Feed wizard route redirects into it. */}
           <Route path="/ingestion/log-sources/new" element={
-            <VectorRequiredRoute title="Add source">
-              <PermissionRoute permission={sourceOnboardingPermission(location.search)} element={
-                <Suspense fallback={<WizardLoadingFallback />}>
-                  <AddFeed key={resetKey} />
-                </Suspense>
-              } />
-            </VectorRequiredRoute>
+            <PermissionRoute permission={sourceOnboardingPermission(location.search)} element={
+              <Suspense fallback={<WizardLoadingFallback />}>
+                <AddFeed key={resetKey} />
+              </Suspense>
+            } />
           } />
           <Route path="/ingestion/log-sources/wizard" element={<LegacyAddDataRedirect />} />
-          {/* NAN-2593: hosted-shared ingest credentials (Log Sources → Credentials). */}
           <Route path="/ingestion/log-sources/credentials" element={
-            <PermissionRoute permission="log_sources:view" element={
+            <PermissionRoute anyPermission={['log_sources:view', 'source_configs:view']} element={
               <Suspense fallback={<ListPageLoadingFallback />}>
                 <IngestCredentials key={resetKey} />
               </Suspense>
             } />
           } />
-          {/* NAN-3596: hosted-shared cloud pull (Log Sources → Cloud pull). */}
-          <Route path="/ingestion/connector-feeds" element={
-            <PermissionRoute permission="log_sources:view" element={
-              <Suspense fallback={<ListPageLoadingFallback />}><ConnectorFeeds key={resetKey} /></Suspense>
-            } />
-          } />
           <Route path="/ingestion/log-sources/cloud-pull" element={
-            <PermissionRoute permission="log_sources:view" element={
+            <PermissionRoute anyPermission={['source_configs:view', 'credentials:view']} element={
               <Suspense fallback={<ListPageLoadingFallback />}>
                 <CloudPull key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* NAN-4941: Pull feeds and source configuration detail live under Log Sources. */}
+          <Route path="/ingestion/log-sources/pull-feeds" element={
+            <PermissionRoute anyPermission={['log_sources:view', 'credentials:view']} element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <ConnectorFeeds key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/ingestion/log-sources/inputs/:id" element={
+            <PermissionRoute permission="source_configs:view" element={
+              <Suspense fallback={<DetailPageLoadingFallback />}>
+                <SourceConfigurationDetail key={resetKey} />
               </Suspense>
             } />
           } />
@@ -1009,33 +963,12 @@ function ProtectedAppRoutes() {
             } />
           } />
 
-          {/* Cloud Credentials — single consolidated page; legacy /new and /:id
-              routes redirect into it via query params. Retired on hosted-shared
-              (NAN-3620): cloud pull is keyless, so every credentials route
-              lands on Log Sources → Cloud pull there. */}
-          <Route path="/ingestion/credentials" element={
-            <RetiredOnSharedRoute to={CLOUD_PULL_PATH}>
-              <PermissionRoute permission="credentials:view" element={
-                <Suspense fallback={<ListPageLoadingFallback />}>
-                  <Credentials key={resetKey} />
-                </Suspense>
-              } />
-            </RetiredOnSharedRoute>
-          } />
-          <Route path="/ingestion/credentials/new" element={
-            <RetiredOnSharedRoute to={CLOUD_PULL_PATH}>
-              <Navigate to="/ingestion/credentials?add=aws_s3" replace />
-            </RetiredOnSharedRoute>
-          } />
-          <Route path="/ingestion/credentials/:id" element={
-            <RetiredOnSharedRoute to={CLOUD_PULL_PATH}>
-              <PermissionRoute permission="credentials:view" element={
-                <Suspense fallback={<ListPageLoadingFallback />}>
-                  <Credentials key={resetKey} />
-                </Suspense>
-              } />
-            </RetiredOnSharedRoute>
-          } />
+          {/* NAN-4941: retired Credentials / Pull feeds pages → Log Sources tabs, keeping the item. */}
+          <Route path="/ingestion/credentials" element={<Suspense fallback={<ListPageLoadingFallback />}><LegacyCredentialRedirect /></Suspense>} />
+          <Route path="/ingestion/credentials/new" element={<Suspense fallback={<ListPageLoadingFallback />}><LegacyCredentialNewRedirect /></Suspense>} />
+          <Route path="/ingestion/credentials/:id" element={<Suspense fallback={<ListPageLoadingFallback />}><LegacyCredentialRedirect /></Suspense>} />
+          <Route path="/ingestion/pull-feeds" element={<Suspense fallback={<ListPageLoadingFallback />}><LegacyPullFeedsRedirect /></Suspense>} />
+          <Route path="/ingestion/connector-feeds" element={<Suspense fallback={<ListPageLoadingFallback />}><LegacyPullFeedsRedirect /></Suspense>} />
 
           {/* Upload & Lookup */}
           <Route path="/upload" element={
@@ -1045,22 +978,18 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
+          <Route path="/rules/ioc-lists" element={
+            <PermissionRoute permission="enrichments:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <IocLists key={resetKey} />
+              </Suspense>
+            } />
+          } />
           <Route path="/rules/lookup-tables" element={
             <PermissionRoute permission="lookup:view" element={
               <Suspense fallback={<ListPageLoadingFallback />}>
                 <LookupTables key={resetKey} />
               </Suspense>
-            } />
-          } />
-          {/* NAN-3467: gated on capabilities.iocLists — only hosted-shared
-              tenants mount /api/ioc-lists. */}
-          <Route path="/rules/ioc-lists" element={
-            <PermissionRoute permission="enrichments:view" element={
-              <IocListsRouteGate>
-                <Suspense fallback={<ListPageLoadingFallback />}>
-                  <IocLists key={resetKey} />
-                </Suspense>
-              </IocListsRouteGate>
             } />
           } />
           <Route path="/rules/lookup-tables/new" element={
@@ -1093,18 +1022,6 @@ function ProtectedAppRoutes() {
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <NotificationSettings key={resetKey} />
               </Suspense>
-            } />
-          } />
-          <Route path="/settings/integrations/lookup-url-allowlist" element={
-            <PermissionRoute permission="settings:system" element={
-              <Suspense fallback={<SettingsLoadingFallback />}><LookupUrlAllowlist key={resetKey} /></Suspense>
-            } />
-          } />
-          {/* NAN-4462: SOAR opt-in; the page renders nothing actionable
-              unless the tenant plan grants the `soar` component. */}
-          <Route path="/settings/soar" element={
-            <PermissionRoute anyPermission={['soar:view', 'settings:system']} element={
-              <Suspense fallback={<SettingsLoadingFallback />}><SoarSettings key={resetKey} /></Suspense>
             } />
           } />
           <Route path="/settings/search" element={
@@ -1156,10 +1073,17 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
+          <Route path="/settings/license" element={
+            <PermissionRoute permission="settings:system" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <LicenseSettings key={resetKey} />
+              </Suspense>
+            } />
+          } />
 
           {/* Access Control - requires user management permissions */}
           <Route path="/settings/access-control" element={
-            <PermissionRoute anyPermission={['users:view', 'groups:view', 'roles:view']} element={
+            <PermissionRoute anyPermission={['users:view', 'groups:view', 'roles:view', 'apikeys:view']} element={
               <Suspense fallback={<ListPageLoadingFallback />}>
                 <AccessControlPage key={resetKey} />
               </Suspense>
@@ -1269,21 +1193,9 @@ function ProtectedAppRoutes() {
             <Navigate to="/settings/audit" replace />
           } />
 
-          {/* Source Configurations - infrastructure + routing */}
-          <Route path="/ingestion/source-configurations" element={
-            <PermissionRoute permission="source_configs:view" element={
-              <Suspense fallback={<ListPageLoadingFallback />}>
-                <SourceConfigurations key={resetKey} />
-              </Suspense>
-            } />
-          } />
-          <Route path="/ingestion/source-configurations/:id" element={
-            <PermissionRoute permission="source_configs:view" element={
-              <Suspense fallback={<DetailPageLoadingFallback />}>
-                <SourceConfigurationDetail key={resetKey} />
-              </Suspense>
-            } />
-          } />
+          {/* NAN-4941: retired Source Configs page → Cloud pull; a config opens under Log Sources. */}
+          <Route path="/ingestion/source-configurations" element={<Suspense fallback={<ListPageLoadingFallback />}><LegacySourceConfigRedirect /></Suspense>} />
+          <Route path="/ingestion/source-configurations/:id" element={<Suspense fallback={<DetailPageLoadingFallback />}><LegacySourceConfigRedirect /></Suspense>} />
 
           {/* User Settings - accessible to all authenticated users */}
           <Route path="/settings/user" element={
@@ -1311,49 +1223,41 @@ function ProtectedAppRoutes() {
   );
 }
 
+/** NAN-4606: pivt panel runs and action cards never outlive the session.
+    Only meloD deployments have panel runs to clear. */
+function PivtSessionBinding() {
+  const { capabilities } = useCapabilities();
+  return capabilities.melod ? <PivtSessionGuard /> : null;
+}
+
 function App() {
   return (
-    <ThemeProvider>
-      {/*
-        A shared-lake tenant's whole product lives under `/t/<slug>/…` (the
-        way a workspace-scoped SaaS URL does): the router's basename carries
-        the selector, so every absolute link in the product resolves inside
-        the tenant and every auth continuation can read it off the URL.
-        Outside a tenant prefix the basename is unset and nothing changes.
-      */}
-      <BrowserRouter basename={tenantBasename(rawBrowserPath('/'))}>
-        <AuthProvider>
-          <BrowserTelemetry />
-          {/* NAN-4606: pivt runs and action cards never outlive the session. */}
-          <PivtSessionGuard />
-          <TenantRuntimeBoundary>
-            <CapabilitiesProvider>
+    <QueryClientProvider client={queryClient}>
+      <ThemeProvider>
+        <BrowserRouter>
+          <CapabilitiesProvider>
+          <AuthProvider>
+            {/* NAN-4606: pivt runs and action cards never outlive the session. */}
+            <PivtSessionBinding />
             <UserPreferencesProvider>
               <SetupRedirect>
                 <Routes>
                 {/* Public routes - outside ProtectedRoute */}
-                <Route path="/login" element={<LoginRoute />} />
-                <Route path="/mfa-setup" element={<MfaSetupRoute />} />
+                <Route path="/login" element={<Login />} />
+                <Route path="/mfa-setup" element={<MfaSetup />} />
                 <Route path="/demo" element={<Demo />} />
                 <Route path="/d/:token" element={<DemoClaim />} />
                 <Route path="/denied" element={<Denied />} />
                 <Route path="/setup" element={<Setup />} />
                 <Route path="/auth/callback/:provider" element={<AuthCallback />} />
-                <Route path="/auth/shared/oidc/entry" element={<EnterpriseSharedOidcEntry />} />
-                <Route path="/auth/shared/oidc/callback" element={<EnterpriseSharedOidcCallback />} />
-                <Route path="/auth/shared/activate" element={<EnterpriseSharedActivation />} />
-                <Route
-                  path="/auth/shared/memberships/accept"
-                  element={<EnterpriseSharedMembershipAcceptance />}
-                />
 
                 {/* Protected routes - require authentication */}
                 <Route
                   path="/*"
                   element={
-                    <ProductRouteGate>
+                    <ProtectedRoute>
                       <ProtectedAppRoutes />
-                    </ProductRouteGate>
+                    </ProtectedRoute>
                   }
                 />
               </Routes>
@@ -1363,11 +1267,11 @@ function App() {
                 <EnrichSheetHost />
               </Suspense>
             </UserPreferencesProvider>
-            </CapabilitiesProvider>
-          </TenantRuntimeBoundary>
-        </AuthProvider>
-      </BrowserRouter>
-    </ThemeProvider>
+          </AuthProvider>
+          </CapabilitiesProvider>
+        </BrowserRouter>
+      </ThemeProvider>
+    </QueryClientProvider>
   );
 }
 

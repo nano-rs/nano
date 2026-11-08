@@ -412,12 +412,18 @@ impl Default for MetricAgg {
 /// POSITIVE consecutive deltas of the time-ordered `value`s WITHIN the grouping (a
 /// counter reset yields a negative delta which is dropped rather than counted as a
 /// spike). For a monotonic counter with no reset this equals `last - first`.
-/// Byte-identical to the NUMERATOR of the nPL metrics `rate()` form
+/// Same reset rule as the NUMERATOR of the nPL metrics `rate()` form
 /// (`ClickHouseSqlGenerator::metric_rate_expr` in `aggregation.rs`) and hardcodes
 /// the `otel_metrics` `timestamp` time column and `value` measurement column —
 /// this dataset always carries both. Cross-series contamination within a single
-/// grouping remains a limitation of the nPL rate path (O15); metrics-v2 rates partition full series first (NAN-4031).
-const METRIC_CUMULATIVE_WINDOW_DELTA_EXPR: &str = "arraySum(arrayMap(d -> if(d > 0, d, 0), arrayDifference(arrayMap(p -> p.2, arraySort(p -> p.1, groupArray((timestamp, value)))))))";
+/// grouping remains a limitation of the nPL rate path (O15); metrics-v2 rates
+/// partition full series first (NAN-4031, [`grouped_metric_rate_sql`]).
+///
+/// Reset rule (Prometheus `increase`): a decrease means the counter restarted
+/// from zero, so the post-reset value itself is the increment (`100 -> 150 ->
+/// 5 -> 20` is `50 + 5 + 15 = 70`); an unchanged counter adds zero. The nPL
+/// `rate()` numerator in `aggregation.rs` applies the same rule (NAN-4902).
+const METRIC_CUMULATIVE_WINDOW_DELTA_EXPR: &str = "arraySum(arrayMap((d, v) -> if(d >= 0, d, v), arrayDifference(arrayMap(p -> p.2, arraySort(p -> p.1, groupArray((timestamp, value))))), arrayMap(p -> p.2, arraySort(p -> p.1, groupArray((timestamp, value))))))";
 
 /// Temporality-aware `sum` for the metrics dataset (NAN-1734, O26 consumer half).
 /// Standard OTel SDKs export SUM metrics as CUMULATIVE by default — each point is
@@ -437,9 +443,7 @@ const METRIC_CUMULATIVE_WINDOW_DELTA_EXPR: &str = "arraySum(arrayMap(d -> if(d >
 /// on raw `otel_metrics` (which the metrics-v2 builders read); never used against
 /// the rollup tables (which lack it).
 fn metric_sum_expr() -> String {
-    format!(
-        "if(max(aggregation_temporality) = 2, {METRIC_CUMULATIVE_WINDOW_DELTA_EXPR}, sum(value))"
-    )
+    format!("if(max(aggregation_temporality) = 2, {METRIC_CUMULATIVE_WINDOW_DELTA_EXPR}, sum(value))")
 }
 
 /// Temporality-aware per-second `rate` for the metrics dataset (NAN-1721 O15 +
@@ -456,10 +460,28 @@ fn metric_rate_expr() -> String {
     )
 }
 
-/// NAN-4031: difference each complete metric series before summing rates into the requested attribute group.
-/// Canonical attribute ordering keeps equivalent maps in the same series even when an SDK reorders its tags.
-/// Hashing canonical maps avoids grouping by variable-length arrays (200k-point benchmark: ~25–31%
-/// over the former unpartitioned path, accepted in favor of replica/reset correctness).
+/// NAN-4031: per-series counter rates for metrics-v2 (monitor scalar and panel
+/// timeseries).
+///
+/// Every complete metric series (metric, service, `mapSort`'d attribute maps —
+/// an SDK may reorder its tags) is differenced on its own over the WHOLE query
+/// window, before the per-series rates are summed into the requested group.
+/// Interleaving two replicas at different absolute totals inside one group
+/// would read every replica switch as a positive delta.
+///
+/// Per point, with the previous sample of the same series (`lagInFrame`):
+/// - cumulative (`aggregation_temporality = 2`): the first point of a series
+///   has no previous sample, so no increment (NULL); a decrease is a reset and
+///   adds the post-reset value; otherwise `value - previous`;
+/// - delta/unspecified: the point is already the increment.
+///
+/// Scalar (monitor): a series with fewer than two distinct sample timestamps
+/// has no rate (NULL), otherwise `increase / observed seconds`. Timeseries: the
+/// increment lands in the LATER point's bucket and the rate is
+/// `increase / step`, so a counter scraped once per bucket keeps its
+/// cross-bucket continuity instead of reading 0 (each bucket alone used to
+/// hold one sample). All aggregates are nullable: a group whose series are all
+/// undersampled is NULL (no data), never a healthy 0.
 fn grouped_metric_rate_sql(
     table: &str,
     series_select: &str,
@@ -467,31 +489,41 @@ fn grouped_metric_rate_sql(
     time_range: &TimeRange,
     step_secs: Option<u64>,
 ) -> String {
-    let value_expr = metric_rate_expr();
-    let (bucket_select, group_keys, count_select, limit) = match step_secs {
-        Some(step) => (
-            format!(", toStartOfInterval(timestamp, toIntervalSecond({step})) AS bucket"),
-            "series_key, bucket",
-            "",
-            200000,
-        ),
-        None => (
-            String::new(),
-            "series_key",
-            ", sum(row_count) AS row_count",
-            100000,
-        ),
-    };
-    format!(
-        "SELECT {group_keys}, sum(v) AS v{count_select}\n\
-         FROM (SELECT {series_select}{bucket_select}, {value_expr} AS v, count() AS row_count\n\
+    let points = format!(
+        "SELECT {series_select}, timestamp, \
+         cityHash64(metric_name, service_name, mapSort(attributes), mapSort(resource_attributes)) AS nano_sid, \
+         multiIf(aggregation_temporality != 2, value, \
+           row_number() OVER nano_w = 1, CAST(NULL AS Nullable(Float64)), \
+           value >= lagInFrame(value) OVER nano_w, value - lagInFrame(value) OVER nano_w, \
+           value) AS nano_inc\n\
          FROM {table}\n\
          WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({filter})\n\
-         GROUP BY {group_keys}, cityHash64(metric_name, service_name, mapSort(attributes), mapSort(resource_attributes)))\n\
-         GROUP BY {group_keys} ORDER BY {group_keys} ASC LIMIT {limit}",
+         WINDOW nano_w AS (PARTITION BY nano_sid ORDER BY timestamp ASC \
+           ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
         start = crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
         end = crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
-    )
+    );
+    match step_secs {
+        Some(step) => format!(
+            "SELECT series_key, bucket, sum(v) AS v\n\
+             FROM (SELECT series_key, toStartOfInterval(timestamp, toIntervalSecond({step})) AS bucket, \
+               sum(nano_inc) / {step} AS v\n\
+             FROM ({points})\n\
+             GROUP BY series_key, bucket, nano_sid)\n\
+             GROUP BY series_key, bucket ORDER BY series_key ASC, bucket ASC LIMIT 200000"
+        ),
+        None => format!(
+            "SELECT series_key, sum(v) AS v, sum(row_count) AS row_count\n\
+             FROM (SELECT series_key, \
+               if(uniqExact(timestamp) >= 2, \
+                 sum(nano_inc) / greatest(dateDiff('second', min(timestamp), max(timestamp)), 1), \
+                 CAST(NULL AS Nullable(Float64))) AS v, \
+               count() AS row_count\n\
+             FROM ({points})\n\
+             GROUP BY series_key, nano_sid)\n\
+             GROUP BY series_key ORDER BY series_key ASC LIMIT 100000"
+        ),
+    }
 }
 
 impl MetricAgg {
@@ -594,6 +626,10 @@ fn tag_lookup_expr(key: &str) -> String {
         "if(has(attributes, '{k}'), attributes['{k}'], \
          if(has(resource_attributes, '{k}'), resource_attributes['{k}'], ''))"
     );
+    // NAN-3975: OTLP host/node metrics carry their node identity as a resource
+    // attribute, not a Prometheus `instance` label. Fall back to it so a
+    // `group_by = instance` monitor keeps one series (one incident) per node
+    // instead of collapsing every node into the empty series.
     if key == "instance" {
         format!(
             "if(({direct}) = '', if(resource_attributes['host.name'] != '', \
@@ -702,11 +738,7 @@ pub fn metric_timeseries_v2_sql(
 /// rows for a vanished series, which the scheduler already treats as no-data.
 /// (The `rate` denominator is the grouping's observed `min/max(timestamp)` — see
 /// [`metric_rate_expr`] — so no window seconds are threaded here anymore.)
-pub fn metric_scalar_sql(
-    query: &MetricQuery,
-    time_range: &TimeRange,
-    is_clustered: bool,
-) -> String {
+pub fn metric_scalar_sql(query: &MetricQuery, time_range: &TimeRange, is_clustered: bool) -> String {
     let name = escape_string(query.metric_name);
     let value_expr = query.agg.value_expr();
     let table = otel_read_table("otel_metrics", is_clustered);
@@ -760,11 +792,7 @@ pub fn metric_scalar_sql(
 /// keys of `attributes` and `resource_attributes` via `arrayJoin(mapKeys(...))`.
 /// `metric_name` is escaped; bounded `LIMIT 1000` (attribute cardinality is
 /// instrumentation-bounded). A `time_range` keeps the scan partition-pruned.
-pub fn metric_tag_keys_sql(
-    metric_name: &str,
-    time_range: &TimeRange,
-    is_clustered: bool,
-) -> String {
+pub fn metric_tag_keys_sql(metric_name: &str, time_range: &TimeRange, is_clustered: bool) -> String {
     let name = escape_string(metric_name);
     let table = otel_read_table("otel_metrics", is_clustered);
     format!(
@@ -934,32 +962,63 @@ pub fn recent_traces_sql(
     )
 }
 
-/// SQL for the distinct metric-name list (NAN-1534) — the Metrics explorer's
-/// dropdown source. Returns `metric_name` rows, optionally restricted to a
-/// single `service_name`, name-ordered. `LIMIT 10000` is an ample cap for a
-/// dropdown (metric cardinality is bounded by instrumentation, not data volume).
+/// Default metric-catalog window (NAN-4098): the last 24 hours.
+pub const METRIC_NAMES_DEFAULT_WINDOW_HOURS: u32 = 24;
+/// Widest metric-catalog window a caller may request: 7 days.
+pub const METRIC_NAMES_MAX_WINDOW_HOURS: u32 = 168;
+/// Names returned before the catalog is reported `partial`. The SQL asks for
+/// one more so the caller can tell "exactly the cap" from "capped".
+pub const METRIC_NAMES_CAP: usize = 10_000;
+
+/// SQL for the distinct metric-name list (NAN-1534 / NAN-4098) — the Metrics
+/// explorer's dropdown source. Returns `metric_name` rows, optionally
+/// restricted to a single `service_name`, name-ordered.
 ///
-/// This dropdown is deliberately UNBOUNDED in time (bounding it would drop names
-/// that stopped reporting inside the window — lossy), so it reads the minute
-/// rollup `nanosiem.otel_metrics_1m` (migration 144) rather than the raw table:
-/// the rollup is keyed (metric_name, service_name, minute) and carries the
-/// identical name universe at orders of magnitude fewer rows (NAN-1632 3.12).
-/// It must stay on `_1m` — the `_1h` rollup keeps 400d vs the shared 90d TTL of
-/// `_1m`/raw, so past day 90 it would return a stale-name superset.
-pub fn metric_names_sql(service_name: Option<&str>, is_clustered: bool) -> String {
-    let table = otel_read_table("otel_metrics_1m", is_clustered);
-    let mut filter = String::new();
-    if let Some(svc) = service_name {
-        if !svc.is_empty() {
-            filter = format!("\nWHERE service_name = '{}'", escape_string(svc));
-        }
-    }
+/// Bounded (NAN-4098): the old time-unbounded scan read 90 days of the minute
+/// rollup on every cold catalog load. The catalog now covers the names that
+/// reported in the last `window_hours` (clamped to
+/// 1..=[`METRIC_NAMES_MAX_WINDOW_HOURS`]), read from the HOURLY rollup
+/// `nanosiem.otel_metrics_1h` (migration 144) — ~60x fewer rows than `_1m`,
+/// partition-pruned by the single time-bounded WHERE. The `_1h` 400-day TTL
+/// is irrelevant inside a ≤ 7-day window. A name that stopped reporting
+/// earlier is not listed; the explorer accepts typed names for it.
+/// `LIMIT {cap+1}` lets the caller flag a capped catalog; `max_execution_time`
+/// keeps a pathological catalog from holding a search slot.
+pub fn metric_names_sql(
+    service_name: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    window_hours: u32,
+    is_clustered: bool,
+) -> String {
+    let table = otel_read_table("otel_metrics_1h", is_clustered);
+    let table_ref = otel_read_table_ref("otel_metrics_1h", is_clustered);
+    let start = metric_names_window_start(now, window_hours);
+    let service = service_name
+        .filter(|svc| !svc.is_empty())
+        .map(|svc| format!("\n  AND service_name = '{}'", escape_string(svc)))
+        .unwrap_or_default();
     format!(
         "SELECT DISTINCT metric_name\n\
-         FROM {table}{filter}\n\
+         FROM {table}\n\
+         WHERE {table_ref}.hour BETWEEN '{start}' AND '{end}'{service}\n\
          ORDER BY metric_name ASC\n\
-         LIMIT 10000"
+         LIMIT {limit}\n\
+         SETTINGS max_execution_time = 30",
+        start = crate::sql_hygiene::format_ch_bound_micros(&start),
+        end = crate::sql_hygiene::format_ch_bound_micros(&now),
+        limit = METRIC_NAMES_CAP + 1,
     )
+}
+
+/// Start of the window [`metric_names_sql`] covers for `window_hours` at `now`.
+pub fn metric_names_window_start(
+    now: chrono::DateTime<chrono::Utc>,
+    window_hours: u32,
+) -> chrono::DateTime<chrono::Utc> {
+    use chrono::{DurationRound, TimeDelta};
+    let hours = window_hours.clamp(1, METRIC_NAMES_MAX_WINDOW_HOURS);
+    let start = now - TimeDelta::hours(i64::from(hours));
+    start.duration_trunc(TimeDelta::hours(1)).unwrap_or(start)
 }
 
 // ============================================================================
@@ -1130,11 +1189,7 @@ pub fn services_overview_sql(
 /// (service, bucket). `step_secs` is clamped to ≥1; the rollup grain is 1 minute,
 /// so a sub-minute step collapses onto the minute bucket (the rollup's finest
 /// resolution) — fine for a sparkline.
-pub fn services_sparkline_sql(
-    time_range: &TimeRange,
-    step_secs: u64,
-    is_clustered: bool,
-) -> String {
+pub fn services_sparkline_sql(time_range: &TimeRange, step_secs: u64, is_clustered: bool) -> String {
     let step = step_secs.max(1);
     let table = otel_read_table("otel_service_red_1m", is_clustered);
     let table_ref = otel_read_table_ref("otel_service_red_1m", is_clustered);
@@ -1355,6 +1410,84 @@ pub fn slo_compute_sql(
     )
 }
 
+/// Largest gap in a service's telemetry an SLO window may contain and still
+/// count as fully covered (NAN-3894): 6 hours. A quiet low-volume service
+/// (a request or a metric export every few hours) stays covered; telemetry
+/// that was absent for longer marks the window `partial`.
+pub const SLO_COVERAGE_MAX_GAP_SECS: i64 = 6 * 3600;
+/// Span retention (`otel_spans` / `otel_service_red_1m` TTL, migrations
+/// 138/143): 30 days.
+pub const OTEL_SPAN_TTL_SECS: i64 = 30 * 86_400;
+
+/// Per-service telemetry coverage probe for an SLO window (NAN-3894).
+///
+/// Returns one row: `samples`, `first_seen` (unix seconds, 0 when none) and
+/// `max_gap_secs` over the TARGET service's activity in
+/// `[start - SLO_COVERAGE_MAX_GAP_SECS, end]`. Activity is the union of
+///   - the service's RED rollup minutes (`otel_service_red_1m`: it handled a
+///     request), and
+///   - the service's metric-export hours (`otel_metrics_1h`: its SDK or
+///     collector was delivering even with no traffic),
+/// both of which are durable rollups kept at least as long as the window.
+/// [`slo_coverage_complete`] turns the row into the verdict. Each branch has
+/// its own single time-bounded WHERE (no PREWHERE) on its sort-key prefix.
+pub fn slo_coverage_sql(service: &str, time_range: &TimeRange, is_clustered: bool) -> String {
+    let svc = escape_string(service);
+    let lo = time_range.start - chrono::Duration::seconds(SLO_COVERAGE_MAX_GAP_SECS);
+    let red = otel_read_table("otel_service_red_1m", is_clustered);
+    let red_ref = otel_read_table_ref("otel_service_red_1m", is_clustered);
+    let hourly = otel_read_table("otel_metrics_1h", is_clustered);
+    let hourly_ref = otel_read_table_ref("otel_metrics_1h", is_clustered);
+    format!(
+        "SELECT length(a) AS samples,\n       \
+                if(length(a) > 0, toUnixTimestamp(a[1]), 0) AS first_seen,\n       \
+                if(length(a) > 1, arrayMax(arrayDifference(arrayMap(x -> toInt64(toUnixTimestamp(x)), a))), 0) AS max_gap_secs\n\
+         FROM (\n  \
+           SELECT arraySort(groupUniqArray(seen)) AS a FROM (\n    \
+             SELECT {red_ref}.minute AS seen FROM {red}\n    \
+             WHERE {red_ref}.minute BETWEEN '{lo_s}' AND '{hi_s}' AND service_name = '{svc}'\n    \
+             UNION ALL\n    \
+             SELECT toDateTime({hourly_ref}.hour, 'UTC') AS seen FROM {hourly}\n    \
+             WHERE {hourly_ref}.hour BETWEEN '{lo_h}' AND '{hi_us}' AND service_name = '{svc}'\n  \
+           )\n\
+         )",
+        // The RED `minute` is a DateTime (second precision); the hourly
+        // rollup's `hour` is DateTime64 (microsecond literal). The hourly
+        // lower bound is floored to the hour so the bucket holding `lo` counts.
+        lo_s = crate::sql_hygiene::format_ch_bound(&lo),
+        hi_s = crate::sql_hygiene::format_ch_bound(&time_range.end),
+        lo_h = crate::sql_hygiene::format_ch_bound_micros(
+            &chrono::DurationRound::duration_trunc(lo, chrono::Duration::hours(1)).unwrap_or(lo)
+        ),
+        hi_us = crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
+    )
+}
+
+/// Coverage verdict for one SLO window (NAN-3894). Complete iff the target
+/// service
+///   - has activity at or before the window start (service-start semantics:
+///     a service first seen inside the window has not been observed for the
+///     whole window), and
+///   - shows no gap longer than [`SLO_COVERAGE_MAX_GAP_SECS`] between
+///     consecutive activity samples from there on.
+///
+/// `window_reaches_span_ttl`: rows before the start of a window as long as
+/// the span TTL are being reaped, so for such a window activity within one
+/// tolerance after the start stands in for "at or before". A trailing gap
+/// (the service went silent before `end`) is NOT partial: that is a live
+/// outage, reported as such rather than hidden.
+pub fn slo_coverage_complete(
+    samples: u64,
+    first_seen_unix: i64,
+    max_gap_secs: i64,
+    window_start: chrono::DateTime<chrono::Utc>,
+    window_reaches_span_ttl: bool,
+) -> bool {
+    let allowed_first = window_start.timestamp()
+        + if window_reaches_span_ttl { SLO_COVERAGE_MAX_GAP_SECS } else { 0 };
+    samples > 0 && first_seen_unix <= allowed_first && max_gap_secs <= SLO_COVERAGE_MAX_GAP_SECS
+}
+
 // ============================================================================
 // Observability console — Infra (host inventory) (NAN-1537)
 // ============================================================================
@@ -1386,7 +1519,36 @@ pub struct InfraHostsFilters<'a> {
     pub env: Option<&'a str>,
 }
 
+/// Per-second rate of one cumulative counter within a host's GROUP BY row
+/// (NAN-4902 lane F review). Samples are ordered by time and every
+/// consecutive delta is summed: a negative delta is a counter reset (reboot),
+/// which contributes the post-reset value rather than dropping or netting
+/// the window. Divided by the time the samples span; `NULL` with fewer than
+/// two samples or a zero span.
+fn counter_rate_expr(metric: &str) -> String {
+    let samples = format!(
+        "arrayMap(p -> p.2, arraySort(p -> p.1, groupArrayIf((timestamp, value), metric_name = '{metric}')))"
+    );
+    format!(
+        "if(countIf(metric_name = '{metric}') >= 2, \
+arraySum(arrayMap((d, v) -> if(d >= 0, d, v), arrayPopFront(arrayDifference({samples})), arrayPopFront({samples}))) \
+/ nullIf(dateDiff('millisecond', minIf(timestamp, metric_name = '{metric}'), maxIf(timestamp, metric_name = '{metric}')) / 1000.0, 0), NULL)"
+    )
+}
+
 /// SQL for the Infra host inventory (`GET /api/search/infra/hosts`).
+///
+/// NAN-3972: the inventory also carries Kubernetes nodes and pods — the
+/// latest `nano.infra.kind` (`node` | `pod`), `k8s.node.name`,
+/// `k8s.pod.name`, `k8s.namespace.name`, `k8s.workload.name`,
+/// `k8s.pod.phase`, `nano.cluster`, `cloud.region`, `host.type` resource
+/// attributes; CPU cores (`system.cpu.usage` / `system.cpu.logical.count`),
+/// memory bytes, `k8s.pod.restarts`, `nano.infra.health` (0 ok, 1 warn, 2
+/// bad); and a network rate from the cumulative `system.network.io.total`
+/// counter delta. Metadata is the latest non-empty value per row, so the
+/// `group` filter is a HAVING on the aggregated label. The collector recipe
+/// that emits these attributes is `docs/observability/kubernetes-collector.md`.
+///
 /// NAN-4028: when system.* series are absent, raw node-exporter memory/load
 /// gauges and per-scrape interface-counter sums supply the same columns.
 /// Existing OTel readings, including zero, always take precedence.
@@ -1407,9 +1569,10 @@ pub struct InfraHostsFilters<'a> {
 /// placed in the inventory). `argMaxIf` returns the metric type's default (0)
 /// when a host never reported a given gauge; the glue maps an all-zero gauge to
 /// a `null` field so the FE renders "–" rather than a fake 0. Single
-/// time-bound WHERE (NAN-1412), bounded `LIMIT 10000` (host cardinality is
-/// fleet-bounded, not data-volume-bounded). NAN-1543 pushes the optional
-/// `q`/`group`/`env` filters into the WHERE; the no-filter default is unchanged.
+/// time-bound WHERE (NAN-1412) in both the sample CTE and the outer read,
+/// bounded `LIMIT 10000` (host cardinality is fleet-bounded, not
+/// data-volume-bounded). NAN-1543 pushes the optional `q`/`env` filters into
+/// the WHERE (`group` is a HAVING, see above).
 pub fn infra_hosts_sql(
     time_range: &TimeRange,
     filters: &InfraHostsFilters,
@@ -1447,11 +1610,11 @@ pub fn infra_hosts_sql(
     // NAN-4028: aggregate node-exporter interfaces per scrape at query time.
     // Bound both UNION branches before aggregation; keep customer OTel series.
     let node_source = format!(
-        "WITH infra_raw AS (SELECT resource_attributes, attributes, timestamp, metric_name, value \
+        "WITH infra_raw AS (SELECT resource_attributes, attributes, service_name, timestamp, metric_name, value \
          FROM {table} WHERE timestamp BETWEEN '{start}' AND '{end}' \
          AND metric_name IN ('system.cpu.utilization', 'system.memory.utilization', 'system.cpu.load_average.1m', 'system.network.io', 'system.cpu.usage', 'system.cpu.logical.count', 'system.memory.usage', 'system.network.io.total', 'k8s.pod.restarts', 'nano.infra.health', 'node_memory_MemAvailable_bytes', 'node_memory_MemTotal_bytes', 'node_load1', 'node_network_receive_bytes_total', 'node_network_transmit_bytes_total') AND resource_attributes['host.name'] != ''{extra}), \
-         infra_samples AS (SELECT resource_attributes, timestamp, metric_name, value FROM infra_raw \
-         UNION ALL SELECT resource_attributes, timestamp, 'nano.node.network.io.total', \
+         infra_samples AS (SELECT resource_attributes, service_name, timestamp, metric_name, value FROM infra_raw \
+         UNION ALL SELECT resource_attributes, any(service_name), timestamp, 'nano.node.network.io.total', \
          sum(value) FROM infra_raw \
          WHERE metric_name IN ('node_network_receive_bytes_total', 'node_network_transmit_bytes_total') \
          AND attributes['device'] != '' AND NOT match(attributes['device'], '^(lo|veth|cali|cni|docker|flannel)') \
@@ -1460,9 +1623,16 @@ pub fn infra_hosts_sql(
         end = crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
     );
 
+    // Prefer the OTel network counter; node-exporter interface sums only
+    // when the host reports no OTel network series at all.
+    let net_rate = format!(
+        "if(countIf(metric_name IN ('system.network.io.total', 'system.network.io')) > 0, {otel}, {node})",
+        otel = counter_rate_expr("system.network.io.total"),
+        node = counter_rate_expr("nano.node.network.io.total"),
+    );
     format!(
         "{node_source}SELECT resource_attributes['host.name'] AS host,\n       \
-                argMaxIf(resource_attributes['host.group'], timestamp, resource_attributes['host.group'] != '') AS host_group,\n       \
+                if(countIf(resource_attributes['host.group'] != '') > 0, argMaxIf(resource_attributes['host.group'], timestamp, resource_attributes['host.group'] != ''), any(service_name)) AS host_group,\n       \
                 argMaxIf(resource_attributes['nano.infra.kind'], timestamp, resource_attributes['nano.infra.kind'] != '') AS kind,\n       \
                 argMaxIf(resource_attributes['k8s.node.name'], timestamp, resource_attributes['k8s.node.name'] != '') AS node_name,\n       \
                 argMaxIf(resource_attributes['k8s.pod.name'], timestamp, resource_attributes['k8s.pod.name'] != '') AS pod_name,\n       \
@@ -1482,7 +1652,7 @@ pub fn infra_hosts_sql(
                 countIf(metric_name = 'k8s.pod.restarts') AS restarts_n,\n       \
                 argMaxIf(value, timestamp, metric_name = 'nano.infra.health') AS health,\n       \
                 countIf(metric_name = 'nano.infra.health') AS health_n,\n       \
-                if(countIf(metric_name IN ('system.network.io.total', 'system.network.io')) > 0, if(countIf(metric_name = 'system.network.io.total') >= 2 AND argMaxIf(value, timestamp, metric_name = 'system.network.io.total') >= argMinIf(value, timestamp, metric_name = 'system.network.io.total'), (argMaxIf(value, timestamp, metric_name = 'system.network.io.total') - argMinIf(value, timestamp, metric_name = 'system.network.io.total')) / nullIf(dateDiff('millisecond', minIf(timestamp, metric_name = 'system.network.io.total'), maxIf(timestamp, metric_name = 'system.network.io.total')) / 1000.0, 0), NULL), if(countIf(metric_name = 'nano.node.network.io.total') >= 2 AND argMaxIf(value, timestamp, metric_name = 'nano.node.network.io.total') >= argMinIf(value, timestamp, metric_name = 'nano.node.network.io.total'), (argMaxIf(value, timestamp, metric_name = 'nano.node.network.io.total') - argMinIf(value, timestamp, metric_name = 'nano.node.network.io.total')) / nullIf(dateDiff('millisecond', minIf(timestamp, metric_name = 'nano.node.network.io.total'), maxIf(timestamp, metric_name = 'nano.node.network.io.total')) / 1000.0, 0), NULL)) AS net_rate,\n       \
+                {net_rate} AS net_rate,\n       \
                 argMaxIf(value, timestamp, metric_name = 'system.cpu.utilization') AS cpu_util,\n       \
                 if(countIf(metric_name = 'system.memory.utilization') > 0, argMaxIf(value, timestamp, metric_name = 'system.memory.utilization'), if(countIf(metric_name = 'node_memory_MemAvailable_bytes') > 0 AND argMaxIf(value, timestamp, metric_name = 'node_memory_MemTotal_bytes') > 0, 1 - argMaxIf(value, timestamp, metric_name = 'node_memory_MemAvailable_bytes') / nullIf(argMaxIf(value, timestamp, metric_name = 'node_memory_MemTotal_bytes'), 0), NULL)) AS mem_util,\n       \
                 if(countIf(metric_name = 'system.cpu.load_average.1m') > 0, argMaxIf(value, timestamp, metric_name = 'system.cpu.load_average.1m'), argMaxIf(value, timestamp, metric_name = 'node_load1')) AS load_1m,\n       \
@@ -1525,11 +1695,7 @@ pub fn infra_hosts_sql(
 /// data"). Single time-bound WHERE, no GROUP BY (one row), `LIMIT 1`.
 /// NAN-1543: an `env` filter (from [`RumFilters`]) scopes the vitals; page /
 /// browser don't apply to metric rows (they carry no such attribute).
-pub fn rum_web_vitals_sql(
-    time_range: &TimeRange,
-    filters: &RumFilters,
-    is_clustered: bool,
-) -> String {
+pub fn rum_web_vitals_sql(time_range: &TimeRange, filters: &RumFilters, is_clustered: bool) -> String {
     let table = otel_read_table("otel_metrics", is_clustered);
     let table_ref = otel_read_table_ref("otel_metrics", is_clustered);
     format!(

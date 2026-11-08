@@ -593,6 +593,7 @@ async fn restricted_trigger_still_applies_tenant_suppressions() {
     let ai_id = run_health_check_with_trigger(
         &pool,
         &ch_client(),
+        &ch_client(),
         false,
         &ai,
         &repo,
@@ -609,6 +610,7 @@ async fn restricted_trigger_still_applies_tenant_suppressions() {
     let fallback = RecordingAnalyzer::new(AnalyzerMode::Fallback);
     let fallback_id = run_health_check_with_trigger(
         &pool,
+        &ch_client(),
         &ch_client(),
         false,
         &fallback,

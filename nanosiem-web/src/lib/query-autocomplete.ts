@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // Shared autocomplete logic for query editors (Search, RuleEditor)
+import { authenticatedFetch } from '@/lib/authenticated-fetch';
 import { api } from '@/lib/api';
-import { getAccessToken } from '@/lib/auth-token';
 import { PIPE_COMMANDS, EVAL_FUNCTIONS, COMMAND_PARAMS } from '@/lib/query-tokens';
-import { browserTenantRuntime, tenantModuleCacheKey } from '@/lib/tenant-runtime';
-import { requestCredentials } from '@/lib/request-credentials';
 import {
   curatedFieldsFor,
   rankFieldSuggestions,
@@ -13,6 +11,9 @@ import {
   type FieldUsage,
   type RankableField,
 } from '@/lib/field-suggestion-ranking';
+import { schemaField } from '@/lib/schema-fields';
+
+const OCSF_LOG_SOURCE_FIELD = schemaField('ocsf', 'logSource');
 
 export type { FieldSection, FieldUsage } from '@/lib/field-suggestion-ranking';
 
@@ -69,9 +70,7 @@ export interface AutocompleteDataSource {
   } | null>;
   /** `/api/udm/fields` — UDM only, but carries the human-readable descriptions. */
   getLegacyUdmFields(): Promise<UdmFieldInfo[]>;
-  /** Product-specific fields that should be offered before the schema fetch lands. */
-  commonQueryFields?: AutocompleteOption[];
-  /** `/api/me/field-usage` — the caller's recent + tenant-popular fields. Optional. */
+  /** `/api/me/field-usage` — the caller's recent + workspace-popular fields. Optional. */
   getFieldUsage?(): Promise<FieldUsage | null>;
 }
 
@@ -79,23 +78,13 @@ const defaultDataSource: AutocompleteDataSource = {
   getSourceTypes: (timeRange) => api.getSourceTypes(timeRange),
   getSchemaFields: () => api.getSchemaFields(),
   getLegacyUdmFields: () => {
-    const token = getAccessToken();
-    const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
-    return fetch(`${import.meta.env.VITE_API_URL ?? ''}/api/udm/fields`, {
-      headers,
-      credentials: requestCredentials('/api/udm/fields', headers),
-    })
+    return authenticatedFetch('/api/udm/fields', `${import.meta.env.VITE_API_URL ?? ''}/api/udm/fields`)
       .then((res) => res.json())
       .then((data) => (data.fields || []) as UdmFieldInfo[])
       .catch(() => [] as UdmFieldInfo[]);
   },
   getFieldUsage: () => {
-    const token = getAccessToken();
-    const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
-    return fetch(`${import.meta.env.VITE_API_URL ?? ''}/api/me/field-usage`, {
-      headers,
-      credentials: requestCredentials('/api/me/field-usage', headers),
-    })
+    return authenticatedFetch('/api/me/field-usage', `${import.meta.env.VITE_API_URL ?? ''}/api/me/field-usage`)
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => (data ? normalizeFieldUsage(data) : null))
       .catch(() => null);
@@ -114,20 +103,11 @@ let dataSource: AutocompleteDataSource = defaultDataSource;
 /** Swap the transport (see AutocompleteDataSource). Clears any cached results. */
 export function setAutocompleteDataSource(source: AutocompleteDataSource) {
   dataSource = source;
-  commonQueryFields = source.commonQueryFields ?? LEGACY_COMMON_QUERY_FIELDS;
-  curatedOverride = source.commonQueryFields;
-  resetAutocompleteCaches();
-}
-
-export function resetAutocompleteCaches(): void {
   sourceTypesCache = null;
   sourceTypesCacheKey = null;
   sourceTypesFetchPromise = null;
-  sourceTypesFetchPromiseKey = null;
   udmFieldsCache = null;
-  udmFieldsCacheKey = null;
   udmFieldsFetchPromise = null;
-  udmFieldsFetchPromiseKey = null;
   invalidateFieldUsageCache();
 }
 
@@ -135,15 +115,13 @@ export function resetAutocompleteCaches(): void {
  *  search lands in history, or history is cleared). */
 export function invalidateFieldUsageCache(): void {
   fieldUsageCache = null;
-  fieldUsageCacheKey = null;
   fieldUsageFetchPromise = null;
-  fieldUsageFetchPromiseKey = null;
 }
 
 const pipeCommands = PIPE_COMMANDS as readonly string[];
 
 // Common fields that should always be available for autocomplete (not always in UDM API)
-const LEGACY_COMMON_QUERY_FIELDS: AutocompleteOption[] = [
+const commonQueryFields: AutocompleteOption[] = [
   { value: 'sourcetype', description: 'Data source type', category: 'Source' },
   { value: 'source_type', description: 'Data source type (alias)', category: 'Source' },
   { value: 'source', description: 'Data source', category: 'Source' },
@@ -156,42 +134,32 @@ const LEGACY_COMMON_QUERY_FIELDS: AutocompleteOption[] = [
   { value: 'file_path', description: 'File path', category: 'File' },
   { value: 'event_type', description: 'Event type', category: 'Event' },
 ];
-let commonQueryFields = LEGACY_COMMON_QUERY_FIELDS;
-/** A data source's own curated list (desktop) replaces the OCSF default. */
-let curatedOverride: AutocompleteOption[] | undefined;
 
-// Field usage (recent + tenant-popular), refreshed at most once a minute.
+// Field usage (recent + workspace-popular), refreshed at most once a minute.
 const FIELD_USAGE_TTL_MS = 60_000;
 let fieldUsageCache: { at: number; usage: FieldUsage | null } | null = null;
-let fieldUsageCacheKey: string | null = null;
 let fieldUsageFetchPromise: Promise<FieldUsage | null> | null = null;
-let fieldUsageFetchPromiseKey: string | null = null;
 
 async function fetchFieldUsage(): Promise<FieldUsage | null> {
   if (!dataSource.getFieldUsage) return null;
-  const capturedRuntime = browserTenantRuntime.current();
-  const cacheKey = tenantModuleCacheKey(capturedRuntime, 'field-usage');
-  if (fieldUsageCache && fieldUsageCacheKey === cacheKey && Date.now() - fieldUsageCache.at < FIELD_USAGE_TTL_MS) {
+  if (fieldUsageCache && Date.now() - fieldUsageCache.at < FIELD_USAGE_TTL_MS) {
     return fieldUsageCache.usage;
   }
-  if (fieldUsageFetchPromise && fieldUsageFetchPromiseKey === cacheKey) return fieldUsageFetchPromise;
-  fieldUsageFetchPromiseKey = cacheKey;
+  if (fieldUsageFetchPromise) return fieldUsageFetchPromise;
   const promise = dataSource
     .getFieldUsage()
+    .catch(() => null)
     .then((usage) => {
-      browserTenantRuntime.assertCurrent(capturedRuntime);
       // A failed read is cached too (as null) so a broken endpoint is not
       // hammered on every keystroke; suggestions fall back to the defaults.
-      fieldUsageCache = { at: Date.now(), usage };
-      fieldUsageCacheKey = cacheKey;
+      // An invalidation while in flight wins: do not resurrect a stale answer.
+      if (fieldUsageFetchPromise === promise) {
+        fieldUsageCache = { at: Date.now(), usage };
+      }
       return usage;
     })
-    .catch(() => null)
     .finally(() => {
-      if (fieldUsageFetchPromise === promise) {
-        fieldUsageFetchPromise = null;
-        fieldUsageFetchPromiseKey = null;
-      }
+      if (fieldUsageFetchPromise === promise) fieldUsageFetchPromise = null;
     });
   fieldUsageFetchPromise = promise;
   return promise;
@@ -201,13 +169,10 @@ async function fetchFieldUsage(): Promise<FieldUsage | null> {
 let sourceTypesCache: string[] | null = null;
 let sourceTypesCacheKey: string | null = null;
 let sourceTypesFetchPromise: Promise<string[]> | null = null;
-let sourceTypesFetchPromiseKey: string | null = null;
 
 // Cache for UDM fields to avoid repeated API calls
 let udmFieldsCache: UdmFieldInfo[] | null = null;
-let udmFieldsCacheKey: string | null = null;
 let udmFieldsFetchPromise: Promise<UdmFieldInfo[]> | null = null;
-let udmFieldsFetchPromiseKey: string | null = null;
 
 // Current time range for source type queries (set by caller)
 let _currentTimeRange: { start: string; end: string } | undefined;
@@ -218,30 +183,20 @@ export function setAutocompleteTimeRange(timeRange?: { start: string; end: strin
 }
 
 async function fetchSourceTypes(): Promise<string[]> {
-  const capturedRuntime = browserTenantRuntime.current();
-  const timeKey = _currentTimeRange ? `${_currentTimeRange.start}_${_currentTimeRange.end}` : 'default';
-  const cacheKey = tenantModuleCacheKey(capturedRuntime, `source-types:${timeKey}`);
+  const cacheKey = _currentTimeRange ? `${_currentTimeRange.start}_${_currentTimeRange.end}` : 'default';
   if (sourceTypesCache && sourceTypesCacheKey === cacheKey) return sourceTypesCache;
-  if (sourceTypesFetchPromise && sourceTypesFetchPromiseKey === cacheKey) {
-    return sourceTypesFetchPromise;
-  }
 
   sourceTypesCache = null;
   sourceTypesFetchPromise = null;
   sourceTypesCacheKey = cacheKey;
-  sourceTypesFetchPromiseKey = cacheKey;
 
   sourceTypesFetchPromise = dataSource.getSourceTypes(_currentTimeRange)
     .then(values => {
-      browserTenantRuntime.assertCurrent(capturedRuntime);
       sourceTypesCache = values.map(([value]) => value);
       return sourceTypesCache;
     })
     .catch(() => {
-      if (sourceTypesFetchPromiseKey === cacheKey) {
-        sourceTypesFetchPromise = null;
-        sourceTypesFetchPromiseKey = null;
-      }
+      sourceTypesFetchPromise = null;
       return [];
     });
 
@@ -270,16 +225,8 @@ async function fetchLegacyUdmFields(): Promise<UdmFieldInfo[]> {
  * - Schema endpoint unavailable / empty: fall back to `/api/udm/fields`.
  */
 async function fetchUdmFields(): Promise<UdmFieldInfo[]> {
-  const capturedRuntime = browserTenantRuntime.current();
-  const cacheKey = tenantModuleCacheKey(capturedRuntime, 'schema-fields');
-  if (udmFieldsCache && udmFieldsCacheKey === cacheKey) return udmFieldsCache;
-  if (udmFieldsFetchPromise && udmFieldsFetchPromiseKey === cacheKey) {
-    return udmFieldsFetchPromise;
-  }
-  udmFieldsCache = null;
-  udmFieldsCacheKey = cacheKey;
-  udmFieldsFetchPromise = null;
-  udmFieldsFetchPromiseKey = cacheKey;
+  if (udmFieldsCache) return udmFieldsCache;
+  if (udmFieldsFetchPromise) return udmFieldsFetchPromise;
 
   udmFieldsFetchPromise = dataSource
     .getSchemaFields()
@@ -296,19 +243,30 @@ async function fetchUdmFields(): Promise<UdmFieldInfo[]> {
         category: f.category,
         description: '',
       }));
+      // NAN-4903: `metadata.log_source` is the OCSF routing key, but it resolves
+      // to the operational `source_type` column rather than a promoted one, so
+      // the backend universe omits it. Without it the OCSF universe was never
+      // recognized (the ranking keys on it): the UDM common list (`src_ip`,
+      // `process_name`, …) buried the real columns and `metadata.` completed to
+      // nothing source-scoped.
+      if (!fields.some((f) => f.name === OCSF_LOG_SOURCE_FIELD)) {
+        fields.unshift({
+          name: OCSF_LOG_SOURCE_FIELD,
+          column_name: OCSF_LOG_SOURCE_FIELD,
+          data_type: 'String',
+          category: 'Metadata',
+          description: 'Log source (routing key)',
+        });
+      }
       return fields;
     })
     .catch(() => fetchLegacyUdmFields())
     .then((fields) => {
-      browserTenantRuntime.assertCurrent(capturedRuntime);
       udmFieldsCache = fields;
       return fields;
     })
     .catch(() => {
-      if (udmFieldsFetchPromiseKey === cacheKey) {
-        udmFieldsFetchPromise = null;
-        udmFieldsFetchPromiseKey = null;
-      }
+      udmFieldsFetchPromise = null;
       return [] as UdmFieldInfo[];
     });
 
@@ -318,7 +276,7 @@ async function fetchUdmFields(): Promise<UdmFieldInfo[]> {
 /**
  * Field suggestions for `partial`, grouped Recent → Popular → Common → rest
  * (NAN-3812). The universe is the schema fields plus fields seen in the current
- * results plus the legacy common list; usage comes from `/api/me/field-usage`.
+ * results plus the common list; usage comes from `/api/me/field-usage`.
  */
 async function rankedFieldOptions(
   partial: string,
@@ -333,9 +291,10 @@ async function rankedFieldOptions(
     if (!universe.has(name)) universe.set(name, { value: name });
   }
   const schemaKnown = universe.size > 0;
-  // Legacy aliases only join the universe when there is no schema yet, or the
-  // schema is itself legacy; under OCSF they would bury the real columns.
-  if (!schemaKnown || !universe.has('metadata.log_source')) {
+  // The UDM common list (aliases like `sourcetype` the schema does not carry)
+  // joins the universe unless the schema is OCSF, where it would bury the real
+  // columns.
+  if (!universe.has(OCSF_LOG_SOURCE_FIELD)) {
     for (const f of commonQueryFields) if (!universe.has(f.value)) universe.set(f.value, f);
   }
   let usage: FieldUsage | null = null;
@@ -344,7 +303,7 @@ async function rankedFieldOptions(
   } catch {
     usage = null;
   }
-  const curated = curatedFieldsFor(schemaKnown ? universe : new Map(), commonQueryFields, curatedOverride);
+  const curated = curatedFieldsFor(schemaKnown ? universe : new Map(), commonQueryFields);
   return rankFieldSuggestions({ partial, universe, universeComplete: schemaKnown, usage, curated });
 }
 
@@ -468,8 +427,8 @@ export async function getQueryAutocompleteSuggestions(
     }
   }
 
-  // Source-value completion supports canonical OCSF and the isolated legacy lane.
-  const sourceTypeMatch = textBeforeCursor.match(/(?:metadata\.log_source|source_type|sourcetype)\s*=\s*"?([^"\s]*)$/i);
+  // Check for source_type= context
+  const sourceTypeMatch = textBeforeCursor.match(/(?:source_type|sourcetype|metadata\.log_source)\s*=\s*"?([^"\s]*)$/i);
   if (sourceTypeMatch) {
     const partial = sourceTypeMatch[1].toLowerCase();
     try {
@@ -536,8 +495,8 @@ export async function getQueryAutocompleteSuggestions(
   const isInFieldContext = fieldContextPatterns.some(pattern => pattern.test(textBeforeCursor));
 
   // Empty field prompt (Ctrl+Space at the start of the query, or after a
-  // complete filter term): offer the grouped field list, metadata.log_source
-  // first on a cold start. Only on explicit request so it never pops on space.
+  // complete filter term): offer the grouped field list. Only on explicit
+  // request so it never pops on space.
   if (opts.explicit && !isInFieldContext && isEmptyFilterPosition(textBeforeCursor)) {
     const fieldOptions = await rankedFieldOptions('', availableFields, udmFields);
     if (fieldOptions.length > 0) {
@@ -594,3 +553,4 @@ export async function getQueryAutocompleteSuggestions(
     context: null,
   };
 }
+

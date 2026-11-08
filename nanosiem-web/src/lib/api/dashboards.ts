@@ -14,8 +14,6 @@ import type {
   ValidateCronRequest,
   ValidateCronResponse,
 } from './types';
-import { browserTenantRuntime } from '@/lib/tenant-runtime';
-import { runSharedPanelQuery } from '@/lib/shared-dashboard-panels';
 
 // Retry panel queries that the search admission controller sheds (HTTP 429
 // TOO_MANY_REQUESTS / AdmissionDenied). The backend caps concurrent queries per
@@ -114,12 +112,6 @@ export class DashboardsApi {
   }
 
   async panelQuery(request: PanelQueryRequest): Promise<PanelQueryResponse> {
-    // NAN-2361: a shared-lake tenant has no `/api/dashboards/panel/query`;
-    // panels run through the same `POST /api/search` the Search page uses
-    // (`getServiceUrl` routes it to the search service).
-    if (browserTenantRuntime.current().scope.kind === 'enterprise_shared') {
-      return retryOn429(() => runSharedPanelQuery(request, this.request));
-    }
     return retryOn429(() =>
       this.request<PanelQueryResponse>('/api/dashboards/panel/query', {
         method: 'POST',

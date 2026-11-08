@@ -19,7 +19,9 @@ use std::collections::HashMap;
 use tracing::instrument;
 use uuid::Uuid;
 
-use super::repository::{LookupRepositoryError, LookupStore, RuleReferenceRow};
+use super::repository::{
+    LookupMutationGuard, LookupRepositoryError, LookupStore, RuleReferenceRow,
+};
 use super::types::*;
 use crate::upload::ColumnType;
 
@@ -33,67 +35,68 @@ const INTERNAL_COLUMNS: &[&str] = &["_row_id"];
 #[derive(Clone)]
 pub struct PostgresLookupRepository {
     pool: PgPool,
-    /// NAN-4712: run lookup DDL through the sovereign SECURITY DEFINER
-    /// functions (`scripts/sovereign/sql/single-host-grants.sql`) because the
-    /// runtime role is DML-only there. Defaults to the process's sovereign
-    /// mode; every other deployment keeps direct DDL.
-    definer_ddl: bool,
-}
-
-/// Whether this process is a sovereign runtime. Invalid facts count as
-/// sovereign (fail closed), as in `sovereign_runtime::airgap_equivalent`.
-fn sovereign_process() -> bool {
-    !matches!(crate::sovereign_runtime::process_runtime(), Ok(None))
-}
-
-/// The table-name grammar the definer functions enforce (they re-check it):
-/// `^lookup_[a-z0-9_]{1,48}$`.
-fn is_definer_lookup_name(name: &str) -> bool {
-    name.strip_prefix(LOOKUP_TABLE_PREFIX).is_some_and(|rest| {
-        (1..=48).contains(&rest.len())
-            && rest.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-    })
 }
 
 impl PostgresLookupRepository {
     /// Create a new PostgreSQL-backed lookup repository
     pub fn new(pool: PgPool) -> Self {
-        Self {
-            pool,
-            definer_ddl: sovereign_process(),
-        }
+        Self { pool }
     }
 
-    /// Override the DDL path (injected in tests; production derives it from
-    /// the process's sovereign facts).
-    pub fn with_definer_ddl(mut self, definer_ddl: bool) -> Self {
-        self.definer_ddl = definer_ddl;
-        self
+    /// Acquire the transaction-scoped advisory lock shared by every mutator of
+    /// one logical lookup. The transaction deliberately carries no data work:
+    /// it is an ownership guard around backend writes that may live in another
+    /// database (ClickHouse).
+    pub async fn lock_logical_table(
+        &self,
+        name: &str,
+    ) -> Result<LookupMutationGuard, LookupRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('nanosiem.lookup:' || $1, 0))")
+            .bind(name)
+            .execute(&mut *transaction)
+            .await?;
+        Ok(LookupMutationGuard::locked(transaction))
     }
 
-    fn definer_name(name: &str) -> Result<&str, LookupRepositoryError> {
-        if is_definer_lookup_name(name) {
-            Ok(name)
-        } else {
-            Err(LookupRepositoryError::InvalidTableName(name.to_string()))
-        }
-    }
-
-    /// The definer function's column contract: `[{name, type, nullable}]`
-    /// with `type` one of the Postgres types lookup columns map to.
-    fn definer_columns(columns: &[LookupColumn]) -> serde_json::Value {
-        serde_json::Value::Array(
-            columns
-                .iter()
-                .map(|c| {
-                    serde_json::json!({
-                        "name": c.name,
-                        "type": c.data_type.to_postgres_type(),
-                        "nullable": c.nullable,
-                    })
-                })
-                .collect(),
+    pub async fn record_staged_generation(
+        &self,
+        logical_name: &str,
+        physical_name: &str,
+        storage_backend: &str,
+    ) -> Result<(), LookupRepositoryError> {
+        sqlx::query(
+            r#"
+            INSERT INTO lookup_generation_cleanup
+                (physical_name, logical_name, storage_backend, generation_state)
+            VALUES ($1, $2, $3, 'staged')
+            ON CONFLICT (physical_name) DO UPDATE
+            SET logical_name = EXCLUDED.logical_name,
+                storage_backend = EXCLUDED.storage_backend,
+                generation_state = 'staged',
+                attempt_count = 0,
+                next_attempt_at = NOW(),
+                last_error = NULL,
+                updated_at = NOW()
+            "#,
         )
+        .bind(physical_name)
+        .bind(logical_name)
+        .bind(storage_backend)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_generation_live(
+        &self,
+        physical_name: &str,
+    ) -> Result<(), LookupRepositoryError> {
+        sqlx::query("DELETE FROM lookup_generation_cleanup WHERE physical_name = $1")
+            .bind(physical_name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     // ========================================================================
@@ -313,31 +316,186 @@ impl PostgresLookupRepository {
         Ok(())
     }
 
-    /// Publish a ClickHouse replacement's schema and statistics in one
-    /// PostgreSQL statement, so readers cannot see half-updated metadata.
-    pub async fn publish_replaced_table(
+    /// Point the registry entry `name` at a fully staged replacement in one
+    /// locked PostgreSQL transaction (NAN-2875 review fix).
+    ///
+    /// The staged generation lives under its own physical name, so until this
+    /// commits every reader still resolves the old physical name and sees only
+    /// old data; after it commits they resolve the staging name and see only
+    /// new data. There is never a moment where both generations answer.
+    ///
+    /// The physical name is the compare-and-swap revision: every replace stages
+    /// under a fresh random name, so if the row's `table_name` is no longer
+    /// `expected_physical` a concurrent replace or delete already moved it and
+    /// this one is refused. The caller purges `expected_physical` only after
+    /// this returns `Ok`.
+    pub async fn publish_staged_table(
         &self,
         name: &str,
+        expected_physical: &str,
+        staging_physical: &str,
         columns: &[LookupColumn],
         primary_key: Option<&str>,
         row_count: i64,
+        storage_backend: &str,
     ) -> Result<(), LookupRepositoryError> {
         let columns_json = serde_json::to_value(columns).map_err(|error| {
             LookupRepositoryError::DatabaseError(sqlx::Error::Protocol(error.to_string()))
         })?;
-        let updated = sqlx::query(
-            "UPDATE lookup_tables_registry SET columns = $2, primary_key = $3, row_count = $4, size_bytes = 0, updated_at = NOW() WHERE name = $1",
+        let mut tx = self.pool.begin().await?;
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT table_name FROM lookup_tables_registry WHERE name = $1 FOR UPDATE",
         )
         .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match current {
+            None => return Err(LookupRepositoryError::TableNotFound(name.to_string())),
+            Some(current) if current != expected_physical => {
+                return Err(LookupRepositoryError::ConcurrentModification(
+                    name.to_string(),
+                ))
+            }
+            Some(_) => {}
+        }
+        sqlx::query(
+            "UPDATE lookup_tables_registry SET table_name = $2, columns = $3, primary_key = $4, \
+             row_count = $5, size_bytes = 0, updated_at = NOW() WHERE name = $1",
+        )
+        .bind(name)
+        .bind(staging_physical)
         .bind(columns_json)
         .bind(primary_key)
         .bind(row_count)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        if updated == 0 {
-            return Err(LookupRepositoryError::TableNotFound(name.to_string()));
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO lookup_generation_cleanup
+                (physical_name, logical_name, storage_backend, generation_state)
+            VALUES ($1, $2, $3, 'retired')
+            ON CONFLICT (physical_name) DO UPDATE
+            SET logical_name = EXCLUDED.logical_name,
+                storage_backend = EXCLUDED.storage_backend,
+                generation_state = 'retired',
+                attempt_count = 0,
+                next_attempt_at = NOW(),
+                last_error = NULL,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(expected_physical)
+        .bind(name)
+        .bind(storage_backend)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM lookup_generation_cleanup WHERE physical_name = $1")
+            .bind(staging_physical)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Delete the registry entry for `table` only if no active detection rule
+    /// depends on it, with the check and the delete serialized (NAN-2875
+    /// review fix).
+    ///
+    /// - `FOR UPDATE` on the registry row fences a concurrent replace/delete.
+    /// - `LOCK TABLE detection_rules IN SHARE MODE` blocks rule inserts and
+    ///   updates until this commits (and waits out in-flight ones), so a rule
+    ///   cannot gain the reference between the check and the delete.
+    /// - The reference check parses each candidate rule with the nPL parser
+    ///   ([`super::references`]), not a single textual spelling.
+    ///
+    /// With `drop_physical_in_tx` the PostgreSQL row table is dropped in the
+    /// same transaction (transactional DDL). The ClickHouse backend passes
+    /// `false` and purges its rows after this commits.
+    pub async fn delete_table_guarded(
+        &self,
+        table: &LookupTable,
+        drop_physical_in_tx: bool,
+        storage_backend: &str,
+    ) -> Result<(), LookupRepositoryError> {
+        if drop_physical_in_tx && !Self::is_valid_identifier(&table.table_name) {
+            return Err(LookupRepositoryError::InvalidTableName(
+                table.table_name.clone(),
+            ));
         }
+        let mut tx = self.pool.begin().await?;
+        let locked: Option<String> = sqlx::query_scalar(
+            "SELECT table_name FROM lookup_tables_registry WHERE id = $1 AND name = $2 FOR UPDATE",
+        )
+        .bind(table.id)
+        .bind(&table.name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(physical) = locked else {
+            return Err(LookupRepositoryError::TableNotFound(table.name.clone()));
+        };
+        if physical != table.table_name {
+            return Err(LookupRepositoryError::ConcurrentModification(
+                table.name.clone(),
+            ));
+        }
+        sqlx::query("LOCK TABLE detection_rules IN SHARE MODE")
+            .execute(&mut *tx)
+            .await?;
+        let rules = Self::rules_referencing(&mut *tx, &table.name).await?;
+        if !rules.is_empty() {
+            let names = rules
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(LookupRepositoryError::TableInUse(names));
+        }
+        sqlx::query("DELETE FROM lookup_tables_registry WHERE id = $1 AND name = $2")
+            .bind(table.id)
+            .bind(&table.name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                if error.as_database_error().and_then(|db| db.code()).as_deref() == Some("23503") {
+                    tracing::warn!(table_name = %table.name, error = %error, "Lookup table delete blocked by database reference");
+                    LookupRepositoryError::ReferenceConflict
+                } else {
+                    LookupRepositoryError::DatabaseError(error)
+                }
+            })?;
+        sqlx::query(
+            r#"
+            INSERT INTO lookup_generation_cleanup
+                (physical_name, logical_name, storage_backend, generation_state)
+            VALUES ($1, $2, $3, 'retired')
+            ON CONFLICT (physical_name) DO UPDATE
+            SET logical_name = EXCLUDED.logical_name,
+                storage_backend = EXCLUDED.storage_backend,
+                generation_state = 'retired',
+                attempt_count = 0,
+                next_attempt_at = NOW(),
+                last_error = NULL,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(&table.table_name)
+        .bind(&table.name)
+        .bind(storage_backend)
+        .execute(&mut *tx)
+        .await?;
+        if drop_physical_in_tx {
+            sqlx::query(&format!(
+                "DROP TABLE IF EXISTS \"{}\" CASCADE",
+                table.table_name
+            ))
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM lookup_generation_cleanup WHERE physical_name = $1")
+                .bind(&table.table_name)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -372,16 +530,6 @@ impl PostgresLookupRepository {
             if !columns.iter().any(|c| c.name == pk) {
                 return Err(LookupRepositoryError::PrimaryKeyNotFound(pk.to_string()));
             }
-        }
-
-        if self.definer_ddl {
-            sqlx::query("SELECT public.nano_lookup_create_table($1, $2, $3)")
-                .bind(Self::definer_name(table_name)?)
-                .bind(Self::definer_columns(columns))
-                .bind(primary_key)
-                .execute(&self.pool)
-                .await?;
-            return Ok(());
         }
 
         // Build CREATE TABLE statement (prepend hidden _row_id for stable row identification)
@@ -426,18 +574,15 @@ impl PostgresLookupRepository {
             ));
         }
 
-        if self.definer_ddl {
-            sqlx::query("SELECT public.nano_lookup_drop_table($1)")
-                .bind(Self::definer_name(table_name)?)
-                .execute(&self.pool)
-                .await?;
-            return Ok(());
-        }
-
         let drop_sql = format!("DROP TABLE IF EXISTS \"{}\" CASCADE", table_name);
         sqlx::query(&drop_sql).execute(&self.pool).await?;
 
         Ok(())
+    }
+
+    pub async fn cleanup_generation(&self, table_name: &str) -> Result<(), LookupRepositoryError> {
+        self.drop_dynamic_table(table_name).await?;
+        self.mark_generation_live(table_name).await
     }
 
     /// Truncate a dynamic lookup table (for replace mode)
@@ -450,14 +595,6 @@ impl PostgresLookupRepository {
             return Err(LookupRepositoryError::InvalidTableName(
                 table_name.to_string(),
             ));
-        }
-
-        if self.definer_ddl {
-            sqlx::query("SELECT public.nano_lookup_truncate_table($1)")
-                .bind(Self::definer_name(table_name)?)
-                .execute(&self.pool)
-                .await?;
-            return Ok(());
         }
 
         let truncate_sql = format!("TRUNCATE TABLE \"{}\"", table_name);
@@ -492,51 +629,21 @@ impl PostgresLookupRepository {
                 staging_physical.to_string(),
             ));
         }
-
-        let columns_json = serde_json::to_value(columns).map_err(|e| {
-            LookupRepositoryError::DatabaseError(sqlx::Error::Protocol(e.to_string()))
-        })?;
-
-        let mut tx = self.pool.begin().await?;
-
-        if self.definer_ddl {
-            sqlx::query("SELECT public.nano_lookup_swap_table($1, $2)")
-                .bind(Self::definer_name(old_physical)?)
-                .bind(Self::definer_name(staging_physical)?)
-                .execute(&mut *tx)
-                .await?;
-        } else {
-            sqlx::query(&format!(
-                "DROP TABLE IF EXISTS \"{}\" CASCADE",
-                old_physical
-            ))
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query(&format!(
-                "ALTER TABLE \"{}\" RENAME TO \"{}\"",
-                staging_physical, old_physical
-            ))
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        sqlx::query(
-            r#"
-            UPDATE lookup_tables_registry
-            SET columns = $2, primary_key = $3, row_count = $4,
-                size_bytes = 0, updated_at = NOW()
-            WHERE name = $1
-            "#,
+        // Switch the registry pointer to the staged table (locked, CAS on the
+        // old physical name), then drop the old table only after the commit.
+        self.publish_staged_table(
+            registry_name,
+            old_physical,
+            staging_physical,
+            columns,
+            primary_key,
+            row_count,
+            "postgres",
         )
-        .bind(registry_name)
-        .bind(columns_json)
-        .bind(primary_key)
-        .bind(row_count)
-        .execute(&mut *tx)
         .await?;
-
-        tx.commit().await?;
+        if let Err(error) = self.cleanup_generation(old_physical).await {
+            tracing::warn!(old_physical, %error, "replaced lookup table left behind; registry already points at the new table");
+        }
         Ok(())
     }
 
@@ -633,13 +740,6 @@ impl PostgresLookupRepository {
         .fetch_one(&self.pool)
         .await?;
         if already_unique {
-            return Ok(());
-        }
-        if self.definer_ddl {
-            sqlx::query("SELECT public.nano_lookup_ensure_row_id_index($1)")
-                .bind(Self::definer_name(table_name)?)
-                .execute(&self.pool)
-                .await?;
             return Ok(());
         }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1159,63 +1259,50 @@ impl PostgresLookupRepository {
         &self,
         table_name: &str,
     ) -> Result<Vec<RuleReferenceRow>, LookupRepositoryError> {
-        let token = format!("@{}", table_name);
-        let like_pattern = format!("%{}%", token);
+        Self::rules_referencing(&self.pool, table_name).await
+    }
 
-        // Use ILIKE for case-insensitive match. The PG planner can still use a
-        // seq scan on the (small) detection_rules table; this is fine for v1.
+    /// Active rules whose nPL depends on lookup `table_name`. A cheap
+    /// `ILIKE '%name%'` narrows the candidates (every real reference contains
+    /// the name); each candidate is then judged by
+    /// [`super::references::query_text_references_lookup`], which parses it.
+    async fn rules_referencing<'e, E>(
+        executor: E,
+        table_name: &str,
+    ) -> Result<Vec<RuleReferenceRow>, LookupRepositoryError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        let escaped = table_name
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let like_pattern = format!("%{escaped}%");
         let rows: Vec<(Uuid, String, Option<Vec<String>>, String)> = sqlx::query_as(
             r#"
             SELECT id, name, mitre_tactics, query
             FROM detection_rules
             WHERE archived = FALSE
-              AND query ILIKE $1
+              AND query ILIKE $1 ESCAPE '\'
             ORDER BY name
             "#,
         )
         .bind(&like_pattern)
-        .fetch_all(&self.pool)
+        .fetch_all(executor)
         .await?;
 
-        let token_lc = token.to_lowercase();
-        let mut out = Vec::new();
-        for (id, name, tactics, query) in rows {
-            if Self::has_word_bounded_token(&query, &token_lc) {
-                out.push(RuleReferenceRow {
-                    id,
-                    name,
-                    mitre_tactics: tactics.unwrap_or_default(),
-                    query,
-                });
-            }
-        }
-        Ok(out)
-    }
-
-    /// True if `haystack` contains `token` (case-insensitive) at a position
-    /// where the next character (if any) is NOT an identifier continuation
-    /// character (alphanumeric or underscore). This treats `@foo` as distinct
-    /// from `@foobar` while still matching `@foo`, `@foo.col`, `@foo)`, etc.
-    fn has_word_bounded_token(haystack: &str, token_lc: &str) -> bool {
-        if token_lc.is_empty() {
-            return false;
-        }
-        let hay_lc = haystack.to_lowercase();
-        let mut start = 0;
-        while let Some(idx) = hay_lc[start..].find(token_lc) {
-            let pos = start + idx;
-            let end = pos + token_lc.len();
-            let next_char = hay_lc[end..].chars().next();
-            let is_bounded = match next_char {
-                None => true,
-                Some(c) => !(c.is_ascii_alphanumeric() || c == '_'),
-            };
-            if is_bounded {
-                return true;
-            }
-            start = end;
-        }
-        false
+        Ok(rows
+            .into_iter()
+            .filter(|(_, _, _, query)| {
+                super::references::query_text_references_lookup(query, table_name)
+            })
+            .map(|(id, name, tactics, query)| RuleReferenceRow {
+                id,
+                name,
+                mitre_tactics: tactics.unwrap_or_default(),
+                query,
+            })
+            .collect())
     }
 
     // ========================================================================
@@ -1415,6 +1502,13 @@ impl PostgresLookupRepository {
 /// the concrete Postgres implementation rather than recursing through the trait.
 #[async_trait]
 impl LookupStore for PostgresLookupRepository {
+    async fn lock_logical_table(
+        &self,
+        name: &str,
+    ) -> Result<LookupMutationGuard, LookupRepositoryError> {
+        PostgresLookupRepository::lock_logical_table(self, name).await
+    }
+
     async fn list_tables(&self) -> Result<Vec<LookupTable>, LookupRepositoryError> {
         PostgresLookupRepository::list_tables(self).await
     }
@@ -1456,39 +1550,12 @@ impl LookupStore for PostgresLookupRepository {
     }
 
     async fn delete_table(&self, table: &LookupTable) -> Result<(), LookupRepositoryError> {
-        if !Self::is_valid_identifier(&table.table_name) {
-            return Err(LookupRepositoryError::InvalidTableName(table.table_name.clone()));
+        PostgresLookupRepository::delete_table_guarded(self, table, false, "postgres").await?;
+        if let Err(error) =
+            PostgresLookupRepository::cleanup_generation(self, &table.table_name).await
+        {
+            tracing::warn!(table = %table.table_name, %error, "deleted lookup table left for durable cleanup");
         }
-        let mut tx = self.pool.begin().await?;
-        // Remove the registry first so a constraint failure leaves the physical
-        // table untouched. Transactional DDL also rolls back the DROP on error.
-        let deleted = sqlx::query("DELETE FROM lookup_tables_registry WHERE id = $1 AND name = $2")
-            .bind(table.id)
-            .bind(&table.name)
-            .execute(&mut *tx)
-            .await.map_err(|error| {
-                if error.as_database_error().and_then(|db| db.code()).as_deref() == Some("23503") {
-                    tracing::warn!(table_name = %table.name, error = %error, "Lookup table delete blocked by database reference");
-                    LookupRepositoryError::ReferenceConflict
-                } else {
-                    LookupRepositoryError::DatabaseError(error)
-                }
-            })?
-            .rows_affected();
-        if deleted == 0 {
-            return Err(LookupRepositoryError::TableNotFound(table.name.clone()));
-        }
-        if self.definer_ddl {
-            sqlx::query("SELECT public.nano_lookup_drop_table($1)")
-                .bind(Self::definer_name(&table.table_name)?)
-                .execute(&mut *tx)
-                .await?;
-        } else {
-            sqlx::query(&format!("DROP TABLE IF EXISTS \"{}\" CASCADE", table.table_name))
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
         Ok(())
     }
 
@@ -1512,6 +1579,28 @@ impl LookupStore for PostgresLookupRepository {
 
     async fn drop_dynamic_table(&self, table_name: &str) -> Result<(), LookupRepositoryError> {
         PostgresLookupRepository::drop_dynamic_table(self, table_name).await
+    }
+
+    async fn record_staged_generation(
+        &self,
+        logical_name: &str,
+        physical_name: &str,
+    ) -> Result<(), LookupRepositoryError> {
+        PostgresLookupRepository::record_staged_generation(
+            self,
+            logical_name,
+            physical_name,
+            "postgres",
+        )
+        .await
+    }
+
+    async fn mark_generation_live(&self, physical_name: &str) -> Result<(), LookupRepositoryError> {
+        PostgresLookupRepository::mark_generation_live(self, physical_name).await
+    }
+
+    async fn cleanup_generation(&self, physical_name: &str) -> Result<(), LookupRepositoryError> {
+        PostgresLookupRepository::cleanup_generation(self, physical_name).await
     }
 
     async fn truncate_dynamic_table(&self, table_name: &str) -> Result<(), LookupRepositoryError> {
@@ -1591,6 +1680,7 @@ impl LookupStore for PostgresLookupRepository {
     async fn lookup(
         &self,
         table_name: &str,
+        _columns: &[LookupColumn],
         key_field: &str,
         key_value: &serde_json::Value,
         output_fields: Option<&[String]>,
@@ -1610,6 +1700,7 @@ impl LookupStore for PostgresLookupRepository {
     async fn lookup_batch(
         &self,
         table_name: &str,
+        _columns: &[LookupColumn],
         key_field: &str,
         key_values: &[serde_json::Value],
         output_fields: Option<&[String]>,
@@ -1637,6 +1728,7 @@ impl LookupStore for PostgresLookupRepository {
     async fn list_rows(
         &self,
         table_name: &str,
+        _columns: &[LookupColumn],
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<HashMap<String, serde_json::Value>>, i64), LookupRepositoryError> {
@@ -1686,83 +1778,6 @@ impl LookupStore for PostgresLookupRepository {
 mod tests {
     use super::*;
 
-    /// NAN-4712: the client-side mirror of the definer functions' grammar.
-    #[test]
-    fn definer_lookup_name_grammar() {
-        for ok in ["lookup_a", "lookup_bad_ips_2", &format!("lookup_{}", "a".repeat(48))] {
-            assert!(is_definer_lookup_name(ok), "{ok}");
-        }
-        for bad in [
-            "lookup_",
-            "lookup",
-            "users",
-            "public.users",
-            "pg_catalog.pg_class",
-            "lookup_Bad",
-            "lookup_x\"; DROP TABLE users; --",
-            "lookup_x-y",
-            "lookup_\u{e9}",
-            "lookup_a\n",
-            &format!("lookup_{}", "a".repeat(49)),
-        ] {
-            assert!(!is_definer_lookup_name(bad), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn definer_columns_carry_only_name_type_and_nullability() {
-        let columns = vec![
-            LookupColumn::new("ip", ColumnType::Text, false),
-            LookupColumn::new("score", ColumnType::Float, true),
-        ];
-        assert_eq!(
-            PostgresLookupRepository::definer_columns(&columns),
-            serde_json::json!([
-                {"name": "ip", "type": "TEXT", "nullable": false},
-                {"name": "score", "type": "DOUBLE PRECISION", "nullable": true},
-            ])
-        );
-    }
-
-    /// A name outside the grammar is refused before any database call.
-    #[tokio::test]
-    async fn definer_ddl_refuses_bad_names_before_the_database() {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .acquire_timeout(std::time::Duration::from_millis(200))
-            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
-            .unwrap();
-        let repo = PostgresLookupRepository::new(pool).with_definer_ddl(true);
-        let columns = vec![LookupColumn::new("ip", ColumnType::Text, false)];
-        let long = format!("lookup_{}", "a".repeat(49));
-        for name in ["lookup_Bad", long.as_str()] {
-            assert!(matches!(
-                repo.create_dynamic_table(name, &columns, None).await,
-                Err(LookupRepositoryError::InvalidTableName(_))
-            ));
-            assert!(matches!(
-                repo.drop_dynamic_table(name).await,
-                Err(LookupRepositoryError::InvalidTableName(_))
-            ));
-            assert!(matches!(
-                repo.truncate_dynamic_table(name).await,
-                Err(LookupRepositoryError::InvalidTableName(_))
-            ));
-        }
-        // A valid name reaches the (unreachable) database.
-        assert!(matches!(
-            repo.create_dynamic_table("lookup_ok", &columns, None).await,
-            Err(LookupRepositoryError::DatabaseError(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn non_sovereign_process_keeps_direct_ddl() {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
-            .unwrap();
-        assert!(!PostgresLookupRepository::new(pool).definer_ddl);
-    }
-
     #[test]
     fn test_is_valid_identifier() {
         assert!(PostgresLookupRepository::is_valid_identifier("valid_name"));
@@ -1774,39 +1789,6 @@ mod tests {
         assert!(!PostgresLookupRepository::is_valid_identifier("has-dash"));
         assert!(!PostgresLookupRepository::is_valid_identifier("has space"));
         assert!(!PostgresLookupRepository::is_valid_identifier("has.dot"));
-    }
-
-    #[test]
-    fn test_word_bounded_token_match() {
-        // exact end-of-string match
-        assert!(PostgresLookupRepository::has_word_bounded_token(
-            "foo @bar", "@bar"
-        ));
-        // followed by dot (column ref)
-        assert!(PostgresLookupRepository::has_word_bounded_token(
-            "x IN @bar.col",
-            "@bar"
-        ));
-        // followed by space / paren / comma
-        assert!(PostgresLookupRepository::has_word_bounded_token(
-            "where x = @bar)",
-            "@bar"
-        ));
-        // case-insensitive
-        assert!(PostgresLookupRepository::has_word_bounded_token(
-            "WHERE x = @BAR",
-            "@bar"
-        ));
-        // NOT a match: token is a prefix of a longer identifier
-        assert!(!PostgresLookupRepository::has_word_bounded_token(
-            "use @bar_baz",
-            "@bar"
-        ));
-        // NOT a match: missing entirely
-        assert!(!PostgresLookupRepository::has_word_bounded_token(
-            "use @other",
-            "@bar"
-        ));
     }
 
     #[test]

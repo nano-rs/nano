@@ -1,0 +1,11 @@
+# actionlint configuration (see .github/workflows/actionlint.yml).
+self-hosted-runner:
+  labels:
+    - rust-heavy
+    - spot
+    - nano-ci-light
+    - nano-ci-suite
+    - proxmox
+    - proxmox-builder
+    - avx2
+    - macy

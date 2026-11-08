@@ -2,14 +2,13 @@
 
 //! NAN-3282: memory budgets for product-view assembly.
 //!
-//! The Asset / Cloud / tree / prevalence views read lake responses into the
-//! search process and decode them to `serde_json::Value`. One shared search
-//! pod serves every tenant, so a single busy-host view (or a UI polling the
-//! same view every two seconds while earlier answers are still in flight) must
-//! never be able to OOM the process.
+//! The Asset / Cloud / tree / prevalence views read ClickHouse answers into
+//! the search process and decode them to `serde_json::Value`. A single
+//! busy-host view (or a UI polling the same view while earlier answers are
+//! still in flight) must never be able to OOM the process.
 //!
-//! Two bounds, both charged as lake response bodies are *received* (before
-//! they are decoded):
+//! Two bounds, both charged as ClickHouse response bytes are *received*
+//! (before they are decoded):
 //!
 //! 1. **Per request** — a [`ViewMemoryLedger`] accumulates every byte read on
 //!    behalf of one view request. Past its budget the read stops with
@@ -21,9 +20,9 @@
 //!    (HTTP 503, retryable). Reservations are released when the ledger drops,
 //!    i.e. when the request (or the background snapshot build) finishes.
 //!
-//! The ledger is carried as a task-local, so the lake client accounts every
-//! response read inside a scoped view without each call site threading it
-//! through. Reads outside a scope (ordinary searches, jobs) are unaffected.
+//! The ledger is carried as a task-local, so the ClickHouse executor accounts
+//! every response read inside a scoped view without each call site threading
+//! it through. Reads outside a scope (ordinary searches, jobs) are unaffected.
 //!
 //! Wire bytes are charged times [`DECODE_AMPLIFICATION`]: the raw body and its
 //! decoded `serde_json::Value` tree are resident together, and a JSON row
@@ -56,7 +55,8 @@ const MIN_BUDGET_BYTES: u64 = 16 * MIB;
 /// How long a view waits for global headroom before a retryable 503.
 const DEFAULT_WAIT: Duration = Duration::from_secs(5);
 /// Charge the ledger at most once per this many wire bytes while streaming.
-const CHARGE_STEP_BYTES: u64 = 256 * 1024;
+/// Executor reads charge the ledger at most once per this many wire bytes.
+pub const CHARGE_STEP_BYTES: u64 = 256 * 1024;
 
 pub const ENV_GLOBAL_MIB: &str = "NANO_SEARCH_VIEW_MEMORY_MIB";
 pub const ENV_REQUEST_MIB: &str = "NANO_SEARCH_VIEW_REQUEST_MIB";
@@ -256,9 +256,10 @@ impl ViewMemoryLedger {
             let permit = match acquired {
                 Ok(Ok(permit)) => permit,
                 Ok(Err(_closed)) => {
-                    return Err(SearchError::ServiceUnavailable(
-                        "product-view memory budget is closed".to_string(),
-                    ))
+                    return Err(SearchError::ViewMemoryBusy {
+                        view: self.view.clone(),
+                        waited_ms: 0,
+                    })
                 }
                 Err(_elapsed) => {
                     let waited_ms = started.elapsed().as_millis() as u64;
@@ -288,7 +289,7 @@ tokio::task_local! {
     static LEDGER: Arc<ViewMemoryLedger>;
 }
 
-/// Run `future` with `ledger` accounting every lake response it reads.
+/// Run `future` with `ledger` accounting every ClickHouse response it reads.
 pub async fn scope<F: Future>(ledger: Arc<ViewMemoryLedger>, future: F) -> F::Output {
     LEDGER.scope(ledger, future).await
 }
@@ -312,12 +313,12 @@ pub fn current() -> Option<Arc<ViewMemoryLedger>> {
     LEDGER.try_with(Arc::clone).ok()
 }
 
-/// Charge `wire_bytes` of a lake response (amplified for its decoded form)
-/// to the current view; a no-op outside a view scope.
+/// Charge `wire_bytes` of a ClickHouse response (amplified for its decoded
+/// form) to the current view; a no-op outside a view scope.
 ///
-/// Boxed (type-erased) like [`read_body`]: these sit deep inside every lake
-/// read, and callers such as meloD tool futures are already near rustc's
-/// layout query depth limit.
+/// Boxed (type-erased): this sits deep inside every executor read, and
+/// callers such as meloD tool futures are already near rustc's layout query
+/// depth limit.
 pub fn charge_wire_bytes(wire_bytes: u64) -> BoxFuture<'static, Result<(), SearchError>> {
     Box::pin(async move {
         match current() {
@@ -327,197 +328,6 @@ pub fn charge_wire_bytes(wire_bytes: u64) -> BoxFuture<'static, Result<(), Searc
     })
 }
 
-/// Read a response body, charging it to the current view as it arrives so an
-/// oversized answer is refused before it is fully buffered or decoded.
-/// Outside a view scope this is `response.bytes()`.
-pub fn read_body<'a>(
-    response: reqwest::Response,
-    map_error: impl Fn(reqwest::Error) -> SearchError + Send + Sync + 'a,
-) -> BoxFuture<'a, Result<bytes::Bytes, SearchError>> {
-    Box::pin(async move {
-        let Some(ledger) = current() else {
-            return response.bytes().await.map_err(map_error);
-        };
-        read_body_charged(response, &ledger, map_error).await
-    })
-}
-
-async fn read_body_charged(
-    mut response: reqwest::Response,
-    ledger: &ViewMemoryLedger,
-    map_error: impl Fn(reqwest::Error) -> SearchError,
-) -> Result<bytes::Bytes, SearchError> {
-    // A declared length is charged up front: an oversized answer is refused
-    // without reading it.
-    if let Some(length) = response.content_length() {
-        ledger.charge(length.saturating_mul(DECODE_AMPLIFICATION)).await?;
-        return response.bytes().await.map_err(map_error);
-    }
-    let mut body = bytes::BytesMut::new();
-    let mut pending = 0u64;
-    while let Some(chunk) = response.chunk().await.map_err(&map_error)? {
-        pending += chunk.len() as u64;
-        body.extend_from_slice(&chunk);
-        if pending >= CHARGE_STEP_BYTES {
-            ledger.charge(pending.saturating_mul(DECODE_AMPLIFICATION)).await?;
-            pending = 0;
-        }
-    }
-    if pending > 0 {
-        ledger.charge(pending.saturating_mul(DECODE_AMPLIFICATION)).await?;
-    }
-    Ok(body.freeze())
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn budget(global_mib: u64, request_mib: u64, wait_ms: u64) -> Arc<ViewMemoryBudget> {
-        ViewMemoryBudget::new(ViewMemoryConfig::derive(
-            None,
-            Some(global_mib),
-            Some(request_mib),
-            Some(wait_ms),
-        ))
-    }
-
-    #[test]
-    fn cgroup_limits_parse_v1_and_v2_shapes() {
-        assert_eq!(parse_cgroup_memory_limit("1073741824\n"), Some(1 << 30));
-        assert_eq!(parse_cgroup_memory_limit("max\n"), None);
-        assert_eq!(parse_cgroup_memory_limit(""), None);
-        assert_eq!(parse_cgroup_memory_limit("0"), None);
-        assert_eq!(parse_cgroup_memory_limit("garbage"), None);
-        // cgroup v1 "unlimited".
-        assert_eq!(parse_cgroup_memory_limit("9223372036854771712"), None);
-    }
-
-    #[test]
-    fn budgets_derive_from_the_container_limit() {
-        // The incident pod: a 1 GiB limit → ~40% for views, a third per request.
-        let config = ViewMemoryConfig::derive(Some(1 << 30), None, None, None);
-        assert_eq!(config.global_bytes, (1u64 << 30) / 100 * 40);
-        assert_eq!(config.request_bytes, config.global_bytes / 3);
-        assert_eq!(config.wait, DEFAULT_WAIT);
-
-        // No readable limit → the conservative constant.
-        let config = ViewMemoryConfig::derive(None, None, None, None);
-        assert_eq!(config.global_bytes, FALLBACK_GLOBAL_BYTES);
-
-        // Overrides win; a request never exceeds the global budget; floors hold.
-        let config = ViewMemoryConfig::derive(Some(1 << 30), Some(100), Some(500), Some(250));
-        assert_eq!(config.global_bytes, 100 * MIB);
-        assert_eq!(config.request_bytes, 100 * MIB);
-        assert_eq!(config.wait, Duration::from_millis(250));
-        let config = ViewMemoryConfig::derive(Some(MIB), None, None, None);
-        assert_eq!(config.global_bytes, MIN_BUDGET_BYTES);
-        assert_eq!(config.request_bytes, MIN_BUDGET_BYTES);
-    }
-
-    #[tokio::test]
-    async fn a_request_over_its_budget_is_a_typed_view_too_large() {
-        let budget = budget(64, 16, 100);
-        let ledger = budget.ledger("asset-dossier");
-        ledger.charge(10 * MIB).await.expect("within budget");
-        let error = ledger.charge(7 * MIB).await.expect_err("over the per-request budget");
-        match error {
-            SearchError::ViewTooLarge { view, needed_bytes, budget_bytes } => {
-                assert_eq!(view, "asset-dossier");
-                assert_eq!(needed_bytes, 17 * MIB);
-                assert_eq!(budget_bytes, 16 * MIB);
-            }
-            other => panic!("expected ViewTooLarge, got {other:?}"),
-        }
-        // The refused charge is not recorded and nothing leaks.
-        assert_eq!(ledger.charged_bytes(), 10 * MIB);
-        drop(ledger);
-        assert_eq!(budget.available_mib(), 64);
-    }
-
-    #[tokio::test]
-    async fn concurrent_requests_are_bounded_by_the_global_budget() {
-        let budget = budget(32, 16, 50);
-        let first = budget.ledger("asset-events");
-        let second = budget.ledger("asset-events");
-        first.charge(16 * MIB).await.expect("first fits");
-        second.charge(16 * MIB).await.expect("second fits");
-        assert_eq!(budget.available_mib(), 0);
-
-        // A third request cannot reserve while both hold their bytes.
-        let third = budget.ledger("asset-artifacts");
-        let error = third.charge(MIB).await.expect_err("global budget exhausted");
-        assert!(matches!(error, SearchError::ViewMemoryBusy { .. }), "got {error:?}");
-        assert_eq!(third.charged_bytes(), 0);
-
-        // Finishing one request releases its reservation for the next.
-        drop(first);
-        assert_eq!(budget.available_mib(), 16);
-        third.charge(MIB).await.expect("headroom after release");
-        assert_eq!(third.reserved_mib().await, 1);
-    }
-
-    #[tokio::test]
-    async fn a_waiter_proceeds_when_headroom_frees_within_the_window() {
-        let budget = budget(16, 16, 2_000);
-        let holder = budget.ledger("cloud-dossier");
-        holder.charge(16 * MIB).await.unwrap();
-        let waiter = budget.ledger("cloud-dossier");
-        let release = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            drop(holder);
-        });
-        waiter.charge(4 * MIB).await.expect("acquires once the holder finishes");
-        release.await.unwrap();
-        assert_eq!(budget.available_mib(), 12);
-    }
-
-    #[tokio::test]
-    async fn reservations_grow_in_whole_mib_and_charges_outside_a_scope_are_free() {
-        let budget = budget(64, 32, 50);
-        let ledger = budget.ledger("tree-page");
-        ledger.charge(100).await.unwrap();
-        ledger.charge(100).await.unwrap();
-        assert_eq!(ledger.reserved_mib().await, 1);
-        ledger.charge(MIB).await.unwrap();
-        assert_eq!(ledger.reserved_mib().await, 2);
-        assert_eq!(budget.available_mib(), 62);
-
-        // No scope → no accounting, never an error.
-        assert!(current().is_none());
-        charge_wire_bytes(u64::MAX / 4).await.expect("unscoped reads are not budgeted");
-
-        // Inside a scope the amplified wire bytes land on the ledger.
-        let scoped_ledger = budget.ledger("asset-dossier");
-        scope(scoped_ledger.clone(), async {
-            charge_wire_bytes(MIB).await.unwrap();
-            let error = charge_wire_bytes(10 * MIB).await.expect_err("amplified over 32 MiB");
-            assert!(matches!(error, SearchError::ViewTooLarge { .. }));
-        })
-        .await;
-        assert_eq!(scoped_ledger.charged_bytes(), DECODE_AMPLIFICATION * MIB);
-    }
-
-    #[tokio::test]
-    async fn scoped_if_absent_keeps_an_enclosing_ledger_and_scopes_bare_work() {
-        let budget = budget(64, 32, 50);
-        let outer = budget.ledger("asset-dossier");
-        scope(outer.clone(), async {
-            scoped_if_absent("detection rule", async {
-                assert_eq!(current().expect("still scoped").view(), "asset-dossier");
-                charge_wire_bytes(MIB).await.unwrap();
-            })
-            .await;
-        })
-        .await;
-        assert_eq!(outer.charged_bytes(), DECODE_AMPLIFICATION * MIB);
-
-        // Bare work (a scheduled detection rule) gets its own ledger.
-        assert!(current().is_none());
-        let view = scoped_if_absent("detection rule", async {
-            current().map(|ledger| ledger.view().to_string())
-        })
-        .await;
-        assert_eq!(view.as_deref(), Some("detection rule"));
-    }
-}
+#[path = "view_memory_tests.rs"]
+mod tests;

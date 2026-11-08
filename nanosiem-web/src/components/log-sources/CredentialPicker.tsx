@@ -1,21 +1,44 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { Key, Plus, CircleAlert } from 'lucide-react';
+import { useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { Key, Plus, CircleAlert, Lock, RotateCcw, Settings2 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Label } from '@/components/ui/label';
+import { Button } from '@/components/ui/button';
+import {
+  AddCredentialSheet,
+  CredentialInspectorSheet,
+  useCredentialUsage,
+} from '@/components/credentials/CredentialsManager';
+import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
-import { useSharedTenant } from '@/hooks/use-shared-tenant';
-import { CLOUD_PULL_PATH } from '@/lib/shared-credentials-retired';
-import type { CloudCredential } from '@/lib/api/types';
+
+export type CredentialPickerProvider = 'aws_s3' | 'gcp_pubsub' | 'kafka' | 'azure_event_hubs';
 
 interface CredentialPickerProps {
-  provider: 'aws_s3' | 'gcp_pubsub' | 'kafka' | 'azure_event_hubs';
+  provider: CredentialPickerProvider;
   value: string | undefined;
   onChange: (credentialId: string | undefined) => void;
   disabled?: boolean;
+}
+
+/** The credential provider a source configuration type reads with, if it takes one. */
+export function credentialProviderFor(configType: string): CredentialPickerProvider | null {
+  switch (configType) {
+    case 'aws_s3':
+    case 'aws_sqs':
+      return 'aws_s3';
+    case 'gcp_pubsub':
+      return 'gcp_pubsub';
+    case 'azure_event_hubs':
+      return 'azure_event_hubs';
+    case 'kafka':
+      return 'kafka';
+    default:
+      return null;
+  }
 }
 
 const PROVIDER_LABELS: Record<string, string> = {
@@ -38,52 +61,28 @@ const NONE_OPTION_LABEL: Record<string, string> = {
 };
 
 /**
- * Stored cloud credential picker. Retired on hosted-shared tenants (NAN-3620):
- * nothing there consumes stored keys (transports are platform-managed and
- * hosted cloud pull is keyless), so shared renders a pointer to Log Sources →
- * Cloud pull instead of a picker and never lists or links credentials.
+ * Pick the stored credential a pull source reads with. NAN-4941: the secret
+ * is entered ("Enter new"), rotated and managed (versions, rollback, usage,
+ * delete) in place; it is only ever shown masked.
  */
-export function CredentialPicker(props: CredentialPickerProps) {
-  const shared = useSharedTenant();
-  if (shared) {
-    return (
-      <p className="text-[11px] text-muted-foreground leading-relaxed" data-testid="credential-picker-retired">
-        Stored cloud credentials are not used on hosted tenants. Cloud pull is keyless:{' '}
-        <Link to={CLOUD_PULL_PATH} className="text-primary hover:underline">Log Sources → Cloud pull</Link>.
-      </p>
-    );
-  }
-  return <StoredCredentialPicker {...props} />;
-}
-
-function StoredCredentialPicker({ provider, value, onChange, disabled }: CredentialPickerProps) {
-  const [credentials, setCredentials] = useState<CloudCredential[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    async function fetchCredentials() {
-      setLoading(true);
-      setError(null);
-      try {
-        const response = await api.listCredentials();
-        // Filter by provider on the frontend
-        const filtered = response.credentials.filter(c => c.provider === provider);
-        setCredentials(filtered);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to load credentials');
-        setCredentials([]);
-      } finally {
-        setLoading(false);
-      }
-    }
-    fetchCredentials();
-  }, [provider]);
-
-  const selectedCredential = credentials.find(c => c.id === value);
+export function CredentialPicker({ provider, value, onChange, disabled }: CredentialPickerProps) {
+  const { hasPermission } = useAuth();
+  const canView = hasPermission('credentials:view');
+  const canCreate = hasPermission('credentials:create');
+  const canRotate = hasPermission('credentials:rotate');
+  const [adding, setAdding] = useState(false);
+  const [managing, setManaging] = useState<'inspect' | 'rotate' | null>(null);
+  const list = useQuery({
+    queryKey: ['credentials'],
+    queryFn: () => api.listCredentials().then((r) => r.credentials),
+    enabled: canView,
+  });
+  const usage = useCredentialUsage();
+  const credentials = (list.data ?? []).filter((c) => c.provider === provider);
+  const selectedCredential = credentials.find((c) => c.id === value);
 
   return (
-    <div className="space-y-1.5">
+    <div className="space-y-1.5" data-testid="credential-picker">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-1.5">
           <Key className="w-3 h-3 text-muted-foreground" />
@@ -91,24 +90,31 @@ function StoredCredentialPicker({ provider, value, onChange, disabled }: Credent
             {PROVIDER_LABELS[provider]} Credentials
           </Label>
         </div>
-        <Link
-          to={`/ingestion/credentials?add=${provider}`}
-          className="flex items-center gap-1 text-[10.5px] text-primary hover:underline"
-        >
-          <Plus className="w-3 h-3" />
-          Create new
-        </Link>
+        {canCreate && !disabled && (
+          <button
+            type="button"
+            onClick={() => setAdding(true)}
+            className="flex items-center gap-1 text-[10.5px] text-primary hover:underline"
+          >
+            <Plus className="w-3 h-3" />
+            Enter new
+          </button>
+        )}
       </div>
 
-      {loading ? (
+      {!canView ? (
+        <p className="text-[10.5px] text-muted-foreground">
+          {value ? <span className="font-mono">{value}</span> : 'No credential'} · you need credentials:view to change it.
+        </p>
+      ) : list.isLoading ? (
         <div className="flex items-center gap-2 px-2.5 py-1.5 bg-muted/30 rounded-md">
           <LoadingIcon className="w-3 h-3 text-muted-foreground" />
           <span className="text-[11px] text-muted-foreground">Loading credentials…</span>
         </div>
-      ) : error ? (
+      ) : list.error ? (
         <div className="flex items-center gap-2 px-2.5 py-1.5 bg-red-500/10 rounded-md text-red-400">
           <CircleAlert className="w-3 h-3" />
-          <span className="text-[11px]">{error}</span>
+          <span className="text-[11px]">{list.error instanceof Error ? list.error.message : 'Failed to load credentials'}</span>
         </div>
       ) : (
         <Select
@@ -116,7 +122,7 @@ function StoredCredentialPicker({ provider, value, onChange, disabled }: Credent
           onValueChange={(v) => onChange(v === '_none' ? undefined : v)}
           disabled={disabled}
         >
-          <SelectTrigger className="h-8 text-[12px] bg-card">
+          <SelectTrigger className="h-8 text-[12px] bg-card" aria-label={`${PROVIDER_LABELS[provider]} credential`}>
             <SelectValue placeholder="Select credentials..." />
           </SelectTrigger>
           <SelectContent>
@@ -138,26 +144,52 @@ function StoredCredentialPicker({ provider, value, onChange, disabled }: Credent
       )}
 
       {selectedCredential && (
-        <p className="text-[10.5px] text-muted-foreground leading-relaxed">
-          {selectedCredential.description || `Using ${selectedCredential.name}`}
-          {selectedCredential.region && ` in ${selectedCredential.region}`}
-        </p>
+        <div className="flex items-center gap-2 h-7 px-2 rounded-md border border-border bg-card" data-testid="credential-picker-selected">
+          <Lock className="w-3 h-3 text-muted-foreground shrink-0" />
+          <span className="font-mono text-[11px] text-muted-foreground truncate" aria-label="Secret hidden">
+            {selectedCredential.external_id ? 'role assumption' : '••••••••••••'} · v{selectedCredential.active_version}
+          </span>
+          <span className="flex-1" />
+          {canRotate && (
+            <Button type="button" variant="ghost" size="sm" className="h-5 px-1.5 text-[10.5px] gap-1" onClick={() => setManaging('rotate')}>
+              <RotateCcw className="w-3 h-3" /> Rotate
+            </Button>
+          )}
+          <Button type="button" variant="ghost" size="sm" className="h-5 px-1.5 text-[10.5px] gap-1" onClick={() => setManaging('inspect')}>
+            <Settings2 className="w-3 h-3" /> Manage
+          </Button>
+        </div>
       )}
 
-      {!loading && credentials.length === 0 && !error && (
+      {canView && !list.isLoading && credentials.length === 0 && !list.error && (
         <p className="text-[10.5px] text-amber-600 dark:text-amber-400 leading-relaxed">
-          No {PROVIDER_LABELS[provider]} credentials configured.{' '}
-          <Link
-            to={`/ingestion/credentials?add=${provider}`}
-            className="underline hover:text-amber-500 dark:hover:text-amber-300"
-          >
-            Add credentials
-          </Link>
+          No {PROVIDER_LABELS[provider]} credentials stored.{' '}
+          {canCreate && (
+            <button type="button" onClick={() => setAdding(true)} className="underline hover:text-amber-500 dark:hover:text-amber-300">
+              Enter one
+            </button>
+          )}
           {provider === 'kafka'
             ? ' — or leave as None for an unauthenticated broker.'
             : ' or use environment variables/IAM roles.'}
         </p>
       )}
+
+      {canCreate && (
+        <AddCredentialSheet
+          open={adding}
+          onOpenChange={setAdding}
+          initialProvider={provider}
+          providers={[provider]}
+          onCreated={(cred) => onChange(cred.id)}
+        />
+      )}
+      <CredentialInspectorSheet
+        cred={managing && selectedCredential ? selectedCredential : null}
+        usage={selectedCredential ? usage.get(selectedCredential.id) ?? [] : []}
+        rotateOnOpen={managing === 'rotate'}
+        onClose={() => setManaging(null)}
+      />
     </div>
   );
 }

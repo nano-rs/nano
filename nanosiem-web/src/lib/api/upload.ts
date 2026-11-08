@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { authenticatedFetch } from '../authenticated-fetch';
 import type {
   FileFormat,
   PreviewResult,
@@ -7,12 +8,11 @@ import type {
   UploadHistoryFilter,
 } from './types';
 import { getServiceUrl } from './utils';
-import { requestCredentials } from '@/lib/request-credentials';
 
 export class UploadApi {
   constructor(
     private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>,
-    private getAccessToken?: () => string | null
+    _getAccessToken?: () => string | null
   ) {}
 
   async previewUpload(file: File, format?: FileFormat, delimiter?: string, hasHeader?: boolean): Promise<PreviewResult> {
@@ -35,18 +35,8 @@ export class UploadApi {
     const serviceUrl = getServiceUrl(endpoint);
     const url = `${serviceUrl}${endpoint}`;
 
-    const headers: HeadersInit = {};
-    if (this.getAccessToken) {
-      const token = this.getAccessToken();
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
-      }
-    }
-
-    const response = await fetch(url, {
+    const response = await authenticatedFetch(endpoint, url, {
       method: 'POST',
-      headers,
-      credentials: requestCredentials(endpoint, headers),
       body: formData,
     });
 

@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Read-only delegated Directory membership checks. Only mapped groups are queried.
+//! Google Workspace group membership for SSO admission (NAN-3904 / NAN-3935).
+//!
+//! Google ID tokens carry no groups claim, so membership is read with a
+//! read-only delegated Directory API call: a service account impersonates the
+//! configured Workspace administrator and asks, for each MAPPED group only,
+//! whether the signing-in user is a member. Any failure is "membership
+//! unknown", which never admits a first-time user.
 use super::{OidcError, SsoAccessPolicy};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
@@ -31,11 +37,13 @@ pub async fn google_workspace_groups(
     policy: &SsoAccessPolicy,
     credential: &str,
     email: &str,
+    mapped_groups: &[String],
 ) -> Result<Vec<String>, OidcError> {
     validate_google_service_account(credential).map_err(|_| denied())?;
-    policy
-        .validate(policy.mappings.iter().any(|m| !m.role_ids.is_empty()))
-        .map_err(|_| denied())?;
+    policy.validate().map_err(|_| denied())?;
+    if mapped_groups.len() > 64 {
+        return Err(denied());
+    }
     let key: ServiceAccount = serde_json::from_str(credential).map_err(|_| denied())?;
     let delegate = policy
         .google_delegated_admin
@@ -89,7 +97,7 @@ pub async fn google_workspace_groups(
             &client,
             "https://admin.googleapis.com/admin/directory/v1/groups/",
             &token.access_token,
-            policy,
+            mapped_groups,
             email,
         ),
     )
@@ -102,16 +110,16 @@ async fn lookup_memberships(
     client: &reqwest::Client,
     endpoint: &str,
     token: &str,
-    policy: &SsoAccessPolicy,
+    mapped_groups: &[String],
     email: &str,
 ) -> Result<Vec<String>, OidcError> {
     let mut groups = vec![];
-    for mapping in &policy.mappings {
+    for idp_group in mapped_groups {
         let mut url = url::Url::parse(endpoint).map_err(|_| denied())?;
         url.path_segments_mut()
             .map_err(|_| denied())?
             .pop_if_empty()
-            .push(&mapping.idp_group)
+            .push(idp_group)
             .push("hasMember")
             .push(email);
         let response = client
@@ -127,7 +135,7 @@ async fn lookup_memberships(
         }
         let member: Membership = bounded_json(response).await?;
         if member.is_member {
-            groups.push(mapping.idp_group.clone());
+            groups.push(idp_group.clone());
         }
     }
     Ok(groups)
@@ -147,80 +155,7 @@ async fn bounded_json<T: serde::de::DeserializeOwned>(
     }
     serde_json::from_slice(&bytes).map_err(|_| denied())
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn configured_directory_lookup_allows_only_positive_membership() {
-        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
-        for member in [true, false] {
-            let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({"isMember":member})),
-                )
-                .mount(&server)
-                .await;
-            let policy = SsoAccessPolicy {
-                mappings: vec![super::super::SsoGroupMapping {
-                    idp_group: "security@example.com".into(),
-                    group_ids: vec![uuid::Uuid::new_v4()],
-                    role_ids: vec![],
-                }],
-                ..Default::default()
-            };
-            let groups = lookup_memberships(
-                &reqwest::Client::new(),
-                &server.uri(),
-                "fixture-token",
-                &policy,
-                "user@example.com",
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                groups,
-                if member {
-                    vec!["security@example.com"]
-                } else {
-                    vec![]
-                }
-            );
-        }
-        assert!(
-            google_workspace_groups(&SsoAccessPolicy::default(), "{}", "user@example.com")
-                .await
-                .is_err()
-        );
-    }
 
-    #[test]
-    fn invalid_service_accounts_fail_closed() {
-        for key in ["", "{}", "{\"token_uri\":\"https://evil.example\"}"] {
-            assert!(validate_google_service_account(key).is_err());
-        }
-    }
-    #[tokio::test]
-    async fn failed_or_unparseable_lookup_never_returns_membership() {
-        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
-        for (status, body) in [(403, "{}"), (200, "{\"isMember\":\"true\"}"), (200, "{}")] {
-            let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .respond_with(ResponseTemplate::new(status).set_body_string(body))
-                .mount(&server)
-                .await;
-            #[derive(Deserialize)]
-            struct Membership {
-                #[serde(rename = "isMember")]
-                _member: bool,
-            }
-            let response = reqwest::Client::new()
-                .get(server.uri())
-                .send()
-                .await
-                .unwrap();
-            assert!(bounded_json::<Membership>(response).await.is_err());
-        }
-    }
-}
+#[cfg(test)]
+#[path = "google_sso_tests.rs"]
+mod tests;

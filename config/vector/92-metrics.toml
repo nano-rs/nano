@@ -8,7 +8,8 @@
 # - nanosiem_vector_component_errors_total{component_id="clickhouse_logs"}
 # - nanosiem_vector_buffer_size_bytes{component_id="clickhouse_logs"}
 # - nanosiem_vector_buffer_size_events{component_id="clickhouse_logs"}
-# - nanosiem_vector_adaptive_concurrency_in_flight{component_id="clickhouse_logs"}
+# Request concurrency is a fixed deployment setting (default 6), not an
+# adaptive Vector metric; watch errors and buffer occupancy for pressure.
 
 # =============================================================================
 # Internal Metrics Source
@@ -16,7 +17,7 @@
 # Collects metrics from all Vector components (sources, transforms, sinks)
 [sources.internal_metrics]
 type = "internal_metrics"
-scrape_interval_secs = 10
+scrape_interval_secs = 10      # More frequent scraping (was 15s)
 namespace = "nanosiem_vector"
 
 # Tags are added automatically by Vector
@@ -60,18 +61,7 @@ type = "internal_logs"
 [transforms.filter_internal_logs]
 type = "filter"
 inputs = ["internal_logs"]
-condition = '(.metadata.level == "WARN" || .metadata.level == "ERROR") && .vector.component_id != "clickhouse_internal_logs" && .vector.component_id != "lake_collector_errors"'
-
-# The historical collector-error sink is a ClickHouse table. Keep stdout in
-# every deployment, but only feed that persistence sink in the retiring legacy
-# profile. Without this route a healthy ClickHouse-free collector continually
-# retries DNS for a backend that is intentionally absent.
-[transforms.internal_logs_backend]
-type = "route"
-inputs = ["filter_internal_logs"]
-reroute_unmatched = false
-route.legacy = 'get_env_var!("NANO_LOG_QUERY_BACKEND") != "lake"'
-route.lake = 'get_env_var!("NANO_LOG_QUERY_BACKEND") == "lake"'
+condition = '(.metadata.level == "WARN" || .metadata.level == "ERROR") && .vector.component_id != "clickhouse_internal_logs"'
 
 # =============================================================================
 # Prometheus Metrics Sink
@@ -115,7 +105,7 @@ encoding.codec = "json"
 # `<safe_name(name)>_source`.
 [sinks.clickhouse_internal_logs]
 type = "clickhouse"
-inputs = ["internal_logs_backend.legacy"]
+inputs = ["filter_internal_logs"]
 
 endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
 database = "${CLICKHOUSE_DATABASE:-nanosiem}"
@@ -144,37 +134,8 @@ buffer.when_full = "drop_newest"
 # "no error history", never to "no ingest".
 healthcheck.enabled = false
 
-# ClickHouse-free collector diagnostics. This is bounded operational metadata,
-# not customer event payload. The coordinator persists 14 days in PostgreSQL
-# and the log-source health API reads only the assigned tenant/component.
-[sinks.lake_collector_errors]
-type = "http"
-inputs = ["internal_logs_backend.lake"]
-uri = "${NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-http://127.0.0.1:9}/v1/collector-errors/batch"
-method = "post"
-encoding.codec = "json"
-framing.method = "newline_delimited"
-healthcheck.enabled = false
-
-[sinks.lake_collector_errors.buffer]
-type = "memory"
-max_events = 1000
-when_full = "drop_newest"
-
-[sinks.lake_collector_errors.acknowledgements]
-enabled = false
-
-[sinks.lake_collector_errors.batch]
-max_events = 1000
-timeout_secs = 2
-
-[sinks.lake_collector_errors.request]
-concurrency = 1
-timeout_secs = 10
+[sinks.clickhouse_internal_logs.request]
+concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
+timeout_secs = 60
 retry_initial_backoff_secs = 1
-retry_max_duration_secs = 30
-
-[sinks.lake_collector_errors.request.headers]
-Authorization = "Bearer ${NANO_LAKE_ENRICHMENT_TOKEN:-lake-disabled-lake-disabled}"
-Content-Type = "application/x-ndjson"
-X-Nano-Tenant-ID = "${NANO_LAKE_TENANT_ID:-default}"
+retry_max_duration_secs = 60

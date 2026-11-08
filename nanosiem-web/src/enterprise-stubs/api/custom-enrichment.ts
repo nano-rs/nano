@@ -198,7 +198,10 @@ export class CustomEnrichmentApi {
   getRuns(_id: string, _limit?: number): Promise<RunInfo[]> {
     return ENTERPRISE_ONLY();
   }
-  generateCode(_request: GenerateCodeRequest): Promise<GenerateCodeResponse> {
+  generateCode(
+    _request: GenerateCodeRequest,
+    _options?: { signal?: AbortSignal; onProgress?: (progress: import('@/lib/api/job-result').JobResultProgress) => void },
+  ): Promise<GenerateCodeResponse> {
     return ENTERPRISE_ONLY();
   }
   getTemplates(): Promise<CodeTemplates> {

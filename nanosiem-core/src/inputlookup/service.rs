@@ -41,9 +41,6 @@ pub enum InputLookupError {
     #[error("URL template substitution failed: missing field '{0}'")]
     TemplateSubstitutionFailed(String),
 
-    #[error("{0}")]
-    SharedStorage(&'static str),
-
     #[error("No data returned from URL")]
     EmptyResponse,
 
@@ -95,7 +92,6 @@ pub struct InputLookupService {
     /// construction paths — a `lookup://` URL then errors clearly rather than
     /// silently falling through to an HTTP attempt.
     lookup_service: Option<Arc<LookupService>>,
-    shared_storage: Option<super::shared::SharedStorageLookup>,
 }
 
 impl InputLookupService {
@@ -110,7 +106,6 @@ impl InputLookupService {
             fetcher,
             config,
             lookup_service: None,
-            shared_storage: None,
         }
     }
 
@@ -119,15 +114,6 @@ impl InputLookupService {
     pub fn with_lookup_service(mut self, lookup_service: Arc<LookupService>) -> Self {
         self.lookup_service = Some(lookup_service);
         self
-    }
-
-    pub fn with_shared_storage(mut self, shared: super::shared::SharedStorageLookup) -> Self {
-        self.shared_storage = Some(shared);
-        self
-    }
-
-    pub fn shared_storage_tenant(&self) -> Option<uuid::Uuid> {
-        self.shared_storage.as_ref().map(|s| s.tenant_id())
     }
 
     /// Detect a `lookup://<name>` URL and return the (trimmed) table name.
@@ -192,13 +178,9 @@ impl InputLookupService {
             return self.read_internal_lookup(table).await;
         }
 
-        if let Some(shared) = &self.shared_storage {
-            return shared.fetch(params).await.map_err(InputLookupError::SharedStorage);
-        }
-
         debug!(
             "Fetching data source: url={}, format={:?}",
-            super::storage_policy::redact_single_url(&params.url.template), params.format
+            params.url.template, params.format
         );
 
         // URL should not have placeholders in data source mode
@@ -307,14 +289,10 @@ impl InputLookupService {
                 .await;
         }
 
-        if self.shared_storage.is_some() {
-            return Err(InputLookupError::SharedStorage(super::storage_policy::STORAGE_POLICY_ERROR));
-        }
-
         debug!(
             "Enriching {} results with inputlookup: url={}, key_field={}, format={:?}",
             results.len(),
-            super::storage_policy::redact_single_url(&params.url.template),
+            params.url.template,
             key_field,
             params.format
         );
@@ -431,7 +409,7 @@ impl InputLookupService {
                  rows for the failed keys are un-enriched",
                 failed_fetches,
                 unique_keys.len(),
-                super::storage_policy::redact_single_url(&params.url.template),
+                params.url.template,
                 last_error.unwrap_or_else(|| "unknown error".to_string()),
             ));
         }
@@ -566,7 +544,7 @@ pub fn params_from_command(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use serde_json::json;
 
@@ -588,38 +566,24 @@ pub(crate) mod tests {
     /// Minimal in-memory [`LookupStore`] for routing tests: only the registry +
     /// full-read methods used by `read_all_rows` are implemented; the rest panic
     /// (they must never be reached on the `lookup://` data-source path).
-    pub(crate) struct FakeStore {
+    struct FakeStore {
         /// logical name -> rows (each row already user-column-only + a `_row_id`
         /// internal column to prove it gets stripped).
-        pub(crate) tables: StdHashMap<String, Vec<StdHashMap<String, Value>>>,
+        tables: StdHashMap<String, Vec<StdHashMap<String, Value>>>,
     }
 
     impl FakeStore {
-        fn table_meta(name: &str, rows: &[StdHashMap<String, Value>]) -> LookupTable {
-            let mut names = rows
-                .iter()
-                .flat_map(|row| row.keys())
-                .filter(|name| !name.starts_with('_'))
-                .cloned()
-                .collect::<Vec<_>>();
-            names.sort();
-            names.dedup();
-            if names.is_empty() {
-                names.push("host".to_string());
-            }
+        fn table_meta(name: &str) -> LookupTable {
             LookupTable {
                 id: uuid::Uuid::new_v4(),
                 name: name.to_string(),
                 description: None,
                 table_name: format!("lookup_{name}"),
-                columns: names
-                    .into_iter()
-                    .map(|name| LookupColumn {
-                        name,
-                        data_type: ColumnType::Text,
-                        nullable: false,
-                    })
-                    .collect(),
+                columns: vec![LookupColumn {
+                    name: "host".to_string(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                }],
                 primary_key: Some("host".to_string()),
                 row_count: 0,
                 size_bytes: 0,
@@ -633,15 +597,11 @@ pub(crate) mod tests {
     #[async_trait]
     impl LookupStore for FakeStore {
         async fn list_tables(&self) -> Result<Vec<LookupTable>, LookupRepositoryError> {
-            Ok(self
-                .tables
-                .iter()
-                .map(|(n, rows)| Self::table_meta(n, rows))
-                .collect())
+            Ok(self.tables.keys().map(|n| Self::table_meta(n)).collect())
         }
         async fn get_table(&self, name: &str) -> Result<LookupTable, LookupRepositoryError> {
-            if let Some(rows) = self.tables.get(name) {
-                Ok(Self::table_meta(name, rows))
+            if self.tables.contains_key(name) {
+                Ok(Self::table_meta(name))
             } else {
                 Err(LookupRepositoryError::TableNotFound(name.to_string()))
             }
@@ -652,6 +612,7 @@ pub(crate) mod tests {
         async fn list_rows(
             &self,
             table_name: &str,
+            _columns: &[LookupColumn],
             limit: i64,
             offset: i64,
         ) -> Result<(Vec<StdHashMap<String, Value>>, i64), LookupRepositoryError> {
@@ -743,6 +704,7 @@ pub(crate) mod tests {
         async fn lookup(
             &self,
             _: &str,
+            _: &[LookupColumn],
             _: &str,
             _: &Value,
             _: Option<&[String]>,
@@ -753,6 +715,7 @@ pub(crate) mod tests {
         async fn lookup_batch(
             &self,
             _: &str,
+            _: &[LookupColumn],
             _: &str,
             _: &[Value],
             _: Option<&[String]>,
@@ -911,7 +874,7 @@ pub(crate) mod tests {
 
         let outcome = service
             .execute(
-                vec![json!({"host": "web01"}), json!({"host": "web99", "inputlookup_owner": "prior"})],
+                vec![json!({"host": "web01"}), json!({"host": "web99"})],
                 &lookup_params("my_table", Some("host")),
             )
             .await
@@ -920,9 +883,8 @@ pub(crate) mod tests {
         assert_eq!(outcome.results[0]["inputlookup_owner"], json!("alice"));
         // internal columns never leak even through enrichment
         assert!(outcome.results[0].get("inputlookup__row_id").is_none());
-        // A nonmatching row keeps an existing prefixed field. A worker-native
-        // rewrite must preserve this when nested inputlookup is added.
-        assert_eq!(outcome.results[1]["inputlookup_owner"], json!("prior"));
+        // unmatched row is untouched
+        assert!(outcome.results[1].get("inputlookup_owner").is_none());
     }
 
     /// A real `https://` URL still routes to the SSRF-guarded fetcher even when a

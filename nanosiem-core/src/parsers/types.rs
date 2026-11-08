@@ -25,7 +25,7 @@ pub enum SourceType {
     AwsSqs,
     /// GCP Pub/Sub subscription
     GcpPubSub,
-    /// Azure Event Hubs consumer group (NAN-3764)
+    /// Azure Event Hubs consumer group (NAN-3764, ported in NAN-4914)
     AzureEventHubs,
 }
 
@@ -81,8 +81,32 @@ impl SourceType {
 /// Canonical `cloud_credentials.provider` values a credential can be created
 /// with (the DB check constraint also admits the legacy `azure_blob` /
 /// `splunk_hec`, which nothing creates any more).
-pub const SUPPORTED_CREDENTIAL_PROVIDERS: &[&str] =
-    &["aws_s3", "gcp_pubsub", "kafka", "azure_event_hubs"];
+///
+/// `aws_s3`, `gcp_pubsub`, `kafka` and `azure_event_hubs` back source configs;
+/// `smtp` is an outbound mail relay password (migration 297, NAN-4911);
+/// `okta`, `google_workspace`, `slack` and `saas_api` hold the vendor
+/// credentials of connector pull feeds (NAN-4914). Together with
+/// [`LEGACY_CREDENTIAL_PROVIDERS`] this is exactly the set migration 298's
+/// constraint admits (`credential_provider_tests` checks it).
+pub const SUPPORTED_CREDENTIAL_PROVIDERS: &[&str] = &[
+    "aws_s3",
+    "gcp_pubsub",
+    "kafka",
+    "smtp",
+    "azure_event_hubs",
+    "okta",
+    "google_workspace",
+    "slack",
+    "saas_api",
+];
+
+/// Providers the DB constraint still admits for old rows but nothing creates.
+pub const LEGACY_CREDENTIAL_PROVIDERS: &[&str] = &["azure_blob", "splunk_hec"];
+
+/// Credential providers that hold a connector pull feed's vendor secret
+/// (NAN-4914). A feed may only bind a credential of one of these providers.
+pub const CONNECTOR_CREDENTIAL_PROVIDERS: &[&str] =
+    &["okta", "google_workspace", "slack", "saas_api"];
 
 /// Whether `provider` is one a credential can be created or listed with.
 pub fn is_supported_credential_provider(provider: &str) -> bool {
@@ -106,6 +130,108 @@ pub fn azure_event_hubs_credentials_complete(credentials: &serde_json::Value) ->
         || (present("azure_tenant_id")
             && present("azure_client_id")
             && present("azure_client_secret"))
+}
+
+/// Provider-specific completeness check of a credential payload at create
+/// time. `Err` carries the user-facing message. Unknown providers pass (the
+/// provider allowlist is checked separately).
+pub fn validate_credential_payload(
+    provider: &str,
+    credentials: &serde_json::Value,
+) -> Result<(), String> {
+    match provider {
+        "aws_s3" => {
+            // NAN-2186: two valid postures. Static keys, OR a role this
+            // deployment assumes with its own ambient identity (instance
+            // profile / IRSA), for a customer who will not mint an access key.
+            let has_static_keys = credentials.get("access_key_id").is_some()
+                && credentials.get("secret_access_key").is_some();
+            let has_assume_role = credentials.get("assume_role_arn").is_some();
+            if !has_static_keys && !has_assume_role {
+                return Err("AWS S3 credentials must include either 'access_key_id' and \
+                     'secret_access_key', or 'assume_role_arn' for cross-account \
+                     role assumption"
+                    .to_string());
+            }
+        }
+        "smtp"
+            if !credentials
+                .get("password")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| !v.is_empty()) =>
+        {
+            return Err("SMTP credentials must include 'password'".to_string());
+        }
+        "gcp_pubsub" => {
+            // NAN-4935: service_account, authorized_user (ADC), external_account
+            // (workload identity federation) or impersonated_service_account.
+            // The project comes from the source configuration, never the
+            // credential.
+            crate::parsers::gcp_credentials::validate_gcp_pubsub_payload(credentials)?;
+        }
+        provider if CONNECTOR_CREDENTIAL_PROVIDERS.contains(&provider) => {
+            // NAN-4914: a connector feed's vendor secret is a flat map of the
+            // fields its spec's auth plugin reads (e.g. `API_TOKEN`); the
+            // feed binding checks the exact fields against the spec.
+            let Some(map) = credentials.as_object().filter(|m| !m.is_empty()) else {
+                return Err(format!("{provider} credentials must be a non-empty object of fields"));
+            };
+            if let Some((k, _)) = map
+                .iter()
+                .find(|(_, v)| !v.as_str().is_some_and(|s| !s.trim().is_empty()))
+            {
+                return Err(format!("{provider} credential field `{k}` must be a non-empty string"));
+            }
+        }
+        "azure_event_hubs" => {
+            if !azure_event_hubs_credentials_complete(credentials) {
+                return Err("Azure Event Hubs credentials must include either 'connection_string', \
+                     or 'azure_tenant_id', 'azure_client_id' and 'azure_client_secret'"
+                    .to_string());
+            }
+            // Every endpoint inside a connection string must be an Azure host
+            // (or admin-allowlisted): Vector dials it carrying the secret.
+            crate::source_configs::azure_event_hubs::check_credential_endpoints(credentials)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// NAN-4914: provider-specific convenience rewrites of a credential payload
+/// before it is sealed. A `google_workspace` credential may be given as the
+/// downloaded service-account key (`credentials_json`); it is stored as the
+/// two fields the Google Workspace spec's `google_service_account` auth reads
+/// (`CLIENT_EMAIL`, `PRIVATE_KEY`), so the key file's other fields (project,
+/// key id, client id) never reach a run.
+pub fn normalize_credential_payload(
+    provider: &str,
+    credentials: &mut serde_json::Value,
+) -> Result<(), String> {
+    if provider != "google_workspace" {
+        return Ok(());
+    }
+    let Some(map) = credentials.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(raw) = map.remove("credentials_json") else {
+        return Ok(());
+    };
+    let key: serde_json::Value = match &raw {
+        serde_json::Value::String(s) => serde_json::from_str(s)
+            .map_err(|_| "credentials_json is not a service-account key JSON".to_string())?,
+        other => other.clone(),
+    };
+    let field = |name: &str| {
+        key.get(name)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("credentials_json has no `{name}`"))
+    };
+    map.insert("CLIENT_EMAIL".into(), field("client_email")?.into());
+    map.insert("PRIVATE_KEY".into(), field("private_key")?.into());
+    Ok(())
 }
 
 /// Cloud provider types
@@ -151,7 +277,7 @@ pub struct CloudCredential {
     pub provider: String,
     pub description: Option<String>,
     pub region: Option<String>,
-    /// `sts:ExternalId` for a cross-account role assumption.
+    /// `sts:ExternalId` for a cross-account role assumption (NAN-2186).
     ///
     /// Stored and returned UNENCRYPTED, unlike the credential payload. An
     /// ExternalId is not a secret — it is an unguessable identifier the account

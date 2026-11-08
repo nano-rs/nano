@@ -14,13 +14,33 @@ use super::VectorConfigError;
 use super::VectorConfigManager;
 use crate::parsers::types::Parser;
 
-/// NAN-1128/1150: report any sink in the shipped topology — the static base
-/// sources/router/combiner/pipeline plus the *candidate* enrichment lane TOML —
-/// that backpressures a shared ingest source. A sink that blocks
-/// (`buffer.when_full = "block"`) or waits on `acknowledgements.enabled = true`
-/// and whose input chain reaches a shared ingest source (`http_server` /
-/// `vector` / `splunk_hec`) would stall LOG ingestion when its target stalls
-/// (the NAN-1120 silent-halt class). Empty result = safe.
+/// Byte range and text of one top-level sink, including its nested
+/// buffer/request sections. The next unrelated TOML section ends the block.
+fn sink_block<'a>(content: &'a str, name: &str) -> Option<(usize, usize, &'a str)> {
+    let header = format!("[sinks.{name}]");
+    let start = content.find(&header)?;
+    let nested_prefix = format!("[sinks.{name}.");
+    let after_header = start + header.len();
+    let mut cursor = after_header;
+    let mut end = content.len();
+    for line in content[after_header..].split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') && !trimmed.starts_with(&nested_prefix) {
+            end = cursor;
+            break;
+        }
+        cursor += line.len();
+    }
+    Some((start, end, &content[start..end]))
+}
+
+/// NAN-1128/1150: report any enrichment sink in the shipped topology — the
+/// static base sources/router/combiner/pipeline plus the *candidate* enrichment
+/// lane TOML — that backpressures a shared ingest source. NAN-5004 deliberately
+/// exempts the durable event sinks and the dedicated enrichment source: success
+/// waits for their disk buffers and a full buffer must block rather than
+/// silently finalize Dropped as Delivered. The enrichment source remains an
+/// independent backpressure domain from every log source.
 ///
 /// Shared by the build-time `shared_ingest_source_sinks_must_not_backpressure`
 /// test (passing the committed `enrichment_lane_content()`) and the deploy-time
@@ -57,6 +77,37 @@ impl std::fmt::Display for VerifyFailure {
 /// that name for ingest (`VECTOR_INGEST_URL: http://vector:8080/`). The exporter
 /// itself is `[sinks.prometheus_metrics]` in config/vector/92-metrics.toml.
 const DEFAULT_VECTOR_METRICS_URL: &str = "http://vector:9598/metrics";
+
+/// Vector 0.61's exact lower bound for one on-disk buffer stage.
+///
+/// This is 256 MiB plus Vector's 32-byte internal framing allowance. Using a
+/// rounded 256 MiB default makes the entire topology fail to build before any
+/// source can listen.
+pub(super) const VECTOR_DISK_BUFFER_MIN_BYTES: i64 = 268_435_488;
+
+/// Canonical rendered disk-buffer inventory. Compose reads this file directly;
+/// Helm consumes the copy produced by `scripts/sync-files.sh`. Keeping the Rust
+/// renderer on the same manifest makes an added generated sink fail closed
+/// instead of silently multiplying the filesystem commitment.
+const VECTOR_DISK_BUFFER_BUDGET_MANIFEST: &str =
+    include_str!("../../../../config/vector/disk-buffer-budget.env");
+
+fn vector_disk_buffer_contract_value(key: &str) -> usize {
+    VECTOR_DISK_BUFFER_BUDGET_MANIFEST
+        .lines()
+        .find_map(|line| {
+            let (candidate, value) = line.split_once('=')?;
+            (candidate == key).then(|| value.parse::<usize>().ok()).flatten()
+        })
+        .unwrap_or_else(|| panic!("disk-buffer manifest is missing a numeric {key}"))
+}
+
+fn disk_buffer_component_count(content: &str) -> usize {
+    content
+        .lines()
+        .filter(|line| line.trim() == "type = \"disk\"")
+        .count()
+}
 
 /// Seconds to wait for Vector to acknowledge a reload before calling it dead.
 ///
@@ -252,9 +303,14 @@ impl ReloadAckProbe {
     /// Read the counters once. `None` means the endpoint is unreadable, which is
     /// "no evidence", never "no reload".
     pub(super) async fn read(&self) -> Option<ReloadCounters> {
+        self.read_body().await.map(|body| parse_reload_counters(&body))
+    }
+
+    /// The raw exposition, or `None` when unreadable.
+    pub(super) async fn read_body(&self) -> Option<String> {
         match self.client.get(&self.url).send().await {
             Ok(response) if response.status().is_success() => match response.text().await {
-                Ok(body) => Some(parse_reload_counters(&body)),
+                Ok(body) => Some(body),
                 Err(e) => {
                     tracing::debug!(url = %self.url, "Vector metrics body unreadable: {e}");
                     None
@@ -285,11 +341,20 @@ impl ReloadAckProbe {
                 // Vector did LAST is what it is running now, so bailing at the
                 // first rejection would roll back a config it went on to
                 // accept.
-                if counter_advanced(before.reloads, now.reloads) {
-                    return ReloadAck::Accepted;
-                }
                 if counter_advanced(before.config_failures, now.config_failures) {
                     saw_rejection = true;
+                }
+                // NAN-4936: a reload counter that came back LOWER than the
+                // snapshot is only presumed to be a restarted series when
+                // nothing in the window says Vector refused the config. With a
+                // rejection on record, a lower number is not evidence of an
+                // acceptance, and treating it as one reported a parser publish
+                // live while every reload was failing (the NAN-4920 run). A
+                // genuine increment still wins over an earlier rejection.
+                if now.reloads > before.reloads
+                    || (!saw_rejection && counter_advanced(before.reloads, now.reloads))
+                {
+                    return ReloadAck::Accepted;
                 }
             }
 
@@ -304,6 +369,37 @@ impl ReloadAckProbe {
             ReloadAck::Rejected
         } else {
             ReloadAck::NotAcknowledged
+        }
+    }
+
+    /// Correlated acknowledgement (NAN-4936): wait for the named marker
+    /// component to be running. A configuration failure seen in the window, with
+    /// the marker never appearing, is a rejection of this change.
+    pub(super) async fn await_marker(&self, before: ReloadCounters, component_id: &str) -> ReloadAck {
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let mut saw_rejection = false;
+        let mut readable = false;
+        loop {
+            if let Some(body) = self.read_body().await {
+                readable = true;
+                if marker_is_live(&body, component_id) {
+                    return ReloadAck::Accepted;
+                }
+                let now = parse_reload_counters(&body);
+                if counter_advanced(before.config_failures, now.config_failures) {
+                    saw_rejection = true;
+                }
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(remaining.min(self.poll_interval)).await;
+        }
+        match (saw_rejection, readable) {
+            (true, _) => ReloadAck::Rejected,
+            (false, true) => ReloadAck::NotAcknowledged,
+            (false, false) => ReloadAck::Unverifiable,
         }
     }
 }
@@ -375,10 +471,340 @@ pub(super) fn reload_outcome(
             tracing::warn!(
                 delivery = delivered.unwrap_or("none — relied on Vector's config watcher"),
                 "Reload acceptance checking is disabled (VECTOR_RELOAD_ACK_TIMEOUT_SECS=0) — this \
-                 deploy is reported successful without any evidence Vector loaded it"
+                 deploy is reported successful without any evidence Vector loaded it (NAN-2305)"
             );
             Ok(())
         }
+    }
+}
+
+/// What Vector did with a config change made by a caller that writes straight
+/// into the watched tree (source-configuration deploys).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationOutcome {
+    /// Vector applied a topology containing the change.
+    Accepted,
+    /// Vector refused the config and is still running the previous topology.
+    Rejected,
+    /// No evidence either way (metrics unreadable, nothing acknowledged in the
+    /// window, or checking switched off). The string says which.
+    Unconfirmed(String),
+}
+
+/// NAN-4936: the reload-acknowledgement protocol for callers that write into the
+/// live tree (source-configuration deploys, undeploys and quarantines).
+///
+/// Two modes:
+///
+/// * **Correlated marker** (codex P1): when Vector reads the same tree the api
+///   writes (the shared-volume topology, signalled by `VECTOR_VALIDATION_DIR`),
+///   [`Self::outcome`] writes a uniquely named marker component
+///   (`nano_activation_<id>`, a 1/s `demo_logs` source into a blackhole) next to
+///   the change. The marker can only be running if Vector loaded a tree that
+///   contains this change, so "marker running" proves THIS change is live, and
+///   an unrelated concurrent reload can never satisfy it. Rejection is the
+///   `configuration_failed` counter moving while the marker never appears.
+/// * **Global counters** (legacy, e.g. Kubernetes where the api's tree is not
+///   what Vector reads): any reload-success increment counts. Callers serialize
+///   the whole baseline/write/signal/ack window under the shared deploy lock so
+///   at least nano's own writers cannot interleave.
+///
+/// Take the baseline with [`Self::begin`] BEFORE the first write, then ask
+/// [`Self::outcome`] after the last one, without releasing the deploy lock in
+/// between.
+pub struct ReloadWatch {
+    probe: Option<ReloadAckProbe>,
+    before: Option<ReloadCounters>,
+    marker: Option<ActivationMarker>,
+}
+
+/// The per-change marker of [`ReloadWatch`]'s correlated mode.
+#[derive(Debug, Clone)]
+pub(super) struct ActivationMarker {
+    pub(super) id: String,
+    pub(super) path: std::path::PathBuf,
+}
+
+/// File (in `sources/configs`) that holds the current activation marker. One
+/// file, rewritten per change, so markers never accumulate.
+pub(super) const ACTIVATION_MARKER_FILE: &str = "_nano_activation.toml";
+
+impl ActivationMarker {
+    pub(super) fn component_id(&self) -> String {
+        format!("nano_activation_{}", self.id)
+    }
+
+    pub(super) fn toml(&self) -> String {
+        let id = self.component_id();
+        format!(
+            "# NAN-4936 activation marker: proves which change Vector has loaded.\n\
+             # Rewritten by nano-api on every source deploy; DO NOT EDIT.\n\
+             [sources.{id}]\n\
+             type = \"demo_logs\"\n\
+             format = \"shuffle\"\n\
+             lines = [\"nano activation marker\"]\n\
+             interval = 1.0\n\n\
+             [sinks.{id}_sink]\n\
+             type = \"blackhole\"\n\
+             inputs = [\"{id}\"]\n\
+             print_interval_secs = 0\n"
+        )
+    }
+}
+
+/// Is the correlated marker mode on? Only where Vector reads the tree the api
+/// writes; `VECTOR_ACTIVATION_MARKER=off` disables it.
+fn activation_marker_enabled() -> bool {
+    if matches!(
+        std::env::var("VECTOR_ACTIVATION_MARKER").as_deref(),
+        Ok("off") | Ok("false") | Ok("0")
+    ) {
+        return false;
+    }
+    std::env::var("VECTOR_VALIDATION_DIR").is_ok_and(|v| !v.trim().is_empty())
+}
+
+/// Is the marker component running, by Vector's own metrics? Its source series
+/// (`component_sent_events_total{component_id="nano_activation_<id>"}`) only
+/// exists once a topology containing it was built.
+pub(super) fn marker_is_live(body: &str, component_id: &str) -> bool {
+    let needle = format!("component_id=\"{component_id}\"");
+    body.lines().map(str::trim).filter(|l| !l.starts_with('#')).any(|line| {
+        let mut fields = line.split_whitespace();
+        let (Some(series), Some(value)) = (fields.next(), fields.next()) else {
+            return false;
+        };
+        let name = series.split('{').next().unwrap_or(series);
+        name.ends_with("component_sent_events_total")
+            && series.contains(&needle)
+            && value.parse::<f64>().is_ok_and(|v| v > 0.0)
+    })
+}
+
+impl ReloadWatch {
+    /// `config_dir` is the api's VECTOR_CONFIG_DIR (the marker goes in its
+    /// `sources/configs`).
+    pub async fn begin(config_dir: &std::path::Path) -> Self {
+        let probe = ReloadAckProbe::from_env();
+        let before = match probe.as_ref() {
+            Some(probe) => probe.read().await,
+            None => None,
+        };
+        let marker = activation_marker_enabled().then(|| ActivationMarker {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            path: config_dir
+                .join("sources")
+                .join("configs")
+                .join(ACTIVATION_MARKER_FILE),
+        });
+        Self { probe, before, marker }
+    }
+
+    pub async fn outcome(self) -> ActivationOutcome {
+        if let Some(marker) = self.marker.as_ref() {
+            if let Err(error) = write_marker(marker).await {
+                return ActivationOutcome::Unconfirmed(format!(
+                    "could not write the activation marker: {error}"
+                ));
+            }
+        }
+        // Let the filesystem settle (Docker volume mounts), then signal Vector
+        // explicitly; the watcher alone is not reliable on every mount.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let delivery = deliver_reload_signal().await;
+        let ack = match (self.probe.as_ref(), self.before, self.marker.as_ref()) {
+            (Some(probe), Some(before), Some(marker)) => {
+                probe.await_marker(before, &marker.component_id()).await
+            }
+            (Some(probe), Some(before), None) => probe.await_ack(before).await,
+            (Some(_), None, _) => ReloadAck::Unverifiable,
+            (None, _, _) => ReloadAck::VerificationDisabled,
+        };
+        match ack {
+            ReloadAck::Accepted => ActivationOutcome::Accepted,
+            ReloadAck::Rejected => ActivationOutcome::Rejected,
+            ReloadAck::NotAcknowledged => ActivationOutcome::Unconfirmed(match &delivery {
+                Ok(_) => "Vector did not load the change within the acknowledgement window".to_string(),
+                Err(reason) => format!(
+                    "Vector did not load the change within the acknowledgement window; {reason}"
+                ),
+            }),
+            ReloadAck::Unverifiable => ActivationOutcome::Unconfirmed(format!(
+                "Vector's metrics endpoint (VECTOR_METRICS_URL) was unreadable (reload signal: {})",
+                match &delivery {
+                    Ok(method) => (*method).to_string(),
+                    Err(reason) => reason.clone(),
+                }
+            )),
+            ReloadAck::VerificationDisabled => ActivationOutcome::Unconfirmed(
+                "reload acknowledgement is disabled (VECTOR_RELOAD_ACK_TIMEOUT_SECS=0)".to_string(),
+            ),
+        }
+    }
+}
+
+/// Atomically replace the marker file (dotfile temp + rename: Vector's loader
+/// skips dotfiles, so it never reads a half-written marker).
+async fn write_marker(marker: &ActivationMarker) -> std::io::Result<()> {
+    let dir = marker
+        .path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("marker path has no parent"))?;
+    tokio::fs::create_dir_all(dir).await?;
+    let tmp = dir.join(format!(".{ACTIVATION_MARKER_FILE}.tmp-{}", marker.id));
+    tokio::fs::write(&tmp, marker.toml()).await?;
+    tokio::fs::rename(&tmp, &marker.path).await
+}
+
+/// The Vector container a reload signal may target: `VECTOR_CONTAINER_NAME`, or
+/// the historical default. A single named container, never a name pattern.
+fn vector_container_name() -> String {
+    std::env::var("VECTOR_CONTAINER_NAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "nanosiem-vector".to_string())
+}
+
+/// argv for signalling the Vector container: `docker kill --signal HUP <name>`.
+///
+/// NAN-4936: this used to be `docker exec <name> pkill -HUP vector` with a
+/// host-wide `pkill -HUP vector` fallback. `pkill` matches by NAME, so the
+/// fallback SIGHUP-killed any process whose name contained "vector" (it took
+/// down an unrelated test binary named `*ingest_tokens*vector*`), and inside
+/// the container it also hit the isolation responder's `vector validate`.
+/// `docker kill` signals exactly the container's PID 1, which is the Vector
+/// process (`exec /usr/bin/vector` in every shipped topology), and fails
+/// loudly when that container does not exist or is not running.
+pub(super) fn reload_signal_argv(container: &str) -> Vec<String> {
+    vec![
+        "kill".to_string(),
+        "--signal".to_string(),
+        "HUP".to_string(),
+        container.to_string(),
+    ]
+}
+
+/// Send Vector a reload signal: only to the configured container, never by
+/// process-name pattern. `Ok(method)` when the container accepted it,
+/// `Err(reason)` otherwise; the reason is surfaced in the reload outcome
+/// (Vector may still reload from its `--watch-config` watcher, which the
+/// acknowledgement check confirms or denies, but a deploy that is not
+/// acknowledged says why no signal was sent).
+async fn deliver_reload_signal() -> Result<&'static str, String> {
+    let docker = deliver_via_docker().await;
+    if docker.is_ok() {
+        return docker;
+    }
+    // NAN-4936: the open-compose api image has no docker CLI. The Vector
+    // container's responder (config/vector/.nano/vector-entrypoint.sh) carries
+    // reload requests over the shared validation volume and SIGHUPs PID 1 after
+    // checking it is the Vector binary.
+    match request_reload_via_responder().await {
+        Ok(method) => Ok(method),
+        Err(responder) => Err(match docker {
+            Err(docker) => format!("{docker}; {responder}"),
+            Ok(_) => responder,
+        }),
+    }
+}
+
+/// How long to wait for the responder to act on a reload request (it polls
+/// every second).
+const RESPONDER_RELOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ask the Vector container's responder to SIGHUP Vector. `Err` when no
+/// validation volume is configured or nothing answered.
+pub(super) async fn request_reload_via_responder() -> Result<&'static str, String> {
+    let Some(root) = std::env::var("VECTOR_VALIDATION_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return Err("no validation volume (VECTOR_VALIDATION_DIR) to carry a reload request".to_string());
+    };
+    request_reload_in(std::path::Path::new(&root), RESPONDER_RELOAD_TIMEOUT).await
+}
+
+pub(crate) async fn request_reload_in(
+    root: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<&'static str, String> {
+    let dir = root.join("reload");
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let io = |e: std::io::Error| format!("could not write a reload request to {}: {e}", dir.display());
+    tokio::fs::create_dir_all(&dir).await.map_err(io)?;
+    let tmp = dir.join(format!(".{id}.tmp"));
+    tokio::fs::write(&tmp, b"HUP\n").await.map_err(io)?;
+    tokio::fs::rename(&tmp, dir.join(format!("{id}.request")))
+        .await
+        .map_err(io)?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let outcome = loop {
+        if tokio::fs::try_exists(dir.join(format!("{id}.done"))).await.unwrap_or(false) {
+            break Ok("validation-volume reload request");
+        }
+        if tokio::fs::try_exists(dir.join(format!("{id}.refused"))).await.unwrap_or(false) {
+            break Err("the Vector container refused the reload request (PID 1 is not the Vector binary)".to_string());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break Err("no responder answered the reload request".to_string());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    for suffix in ["request", "done", "refused"] {
+        let _ = tokio::fs::remove_file(dir.join(format!("{id}.{suffix}"))).await;
+    }
+    if let Err(reason) = &outcome {
+        tracing::warn!(%reason, "reload request via the validation volume failed");
+    } else {
+        tracing::info!("Vector reloaded via the validation-volume responder");
+    }
+    outcome
+}
+
+async fn deliver_via_docker() -> Result<&'static str, String> {
+    let container = vector_container_name();
+    let mut cmd = Command::new("docker");
+    cmd.args(reload_signal_argv(&container));
+    match run_bounded(
+        cmd,
+        std::time::Duration::from_secs(15),
+        "docker kill --signal HUP <vector container> (reload)",
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => {
+            tracing::info!(%container, "Sent SIGHUP to the Vector container");
+            Ok("docker kill --signal HUP")
+        }
+        Ok(output) => {
+            let reason = format!(
+                "the Vector container '{container}' did not accept the reload signal: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            tracing::warn!("{reason}");
+            Err(reason)
+        }
+        Err(error) => {
+            let reason = format!(
+                "could not signal the Vector container '{container}' (docker unavailable: {error})"
+            );
+            tracing::warn!("{reason}");
+            Err(reason)
+        }
+    }
+}
+
+/// Fold the undelivered-signal reason into a failed reload outcome, so a
+/// deploy that Vector never acknowledged says that no signal reached it.
+fn with_delivery_reason(
+    result: Result<(), VectorConfigError>,
+    delivery: &Result<&'static str, String>,
+) -> Result<(), VectorConfigError> {
+    match (result, delivery) {
+        (Err(VectorConfigError::ReloadFailed(message)), Err(reason)) => Err(
+            VectorConfigError::ReloadFailed(format!("{message} Reload signal not delivered: {reason}.")),
+        ),
+        (other, _) => other,
     }
 }
 
@@ -426,19 +852,14 @@ pub(super) fn enrichment_lane_backpressure_violations(
     // shared LOG ingest source like http/vector/hec, so an enrichment-lane sink
     // that backpressures into it would stall OTLP ingestion (NAN-1120 class).
     const INGEST_SOURCE_TYPES: &[&str] = &["http_server", "vector", "splunk_hec", "opentelemetry"];
-    // The dedicated enrichment ingress has its own backpressure domain, so its
-    // durable lake sink can block rather than silently dropping directory rows.
+    // Sources with their own backpressure domain.
     const DEDICATED_ENRICHMENT_SOURCES: &[&str] = &["enrichment_ingest"];
 
     // Vector substitutes `${VAR:-default}` before parsing TOML, so mirror that
     // (value after `:-`, else empty) to make the raw configs parseable.
+    // NAN-4953: one implementation of Vector's grammar, `$$` included.
     fn substitute_env(raw: &str) -> String {
-        let re = regex::Regex::new(r"\$\{([^}]*)\}").unwrap();
-        re.replace_all(raw, |caps: &regex::Captures| match caps[1].find(":-") {
-            Some(pos) => caps[1][pos + 2..].to_string(),
-            None => String::new(),
-        })
-        .into_owned()
+        crate::vector_env::substitute_like_vector(raw)
     }
 
     fn input_list(def: &toml::Value) -> Vec<String> {
@@ -465,7 +886,7 @@ pub(super) fn enrichment_lane_backpressure_violations(
         acks: bool,
     }
 
-    let docs: [(&str, &str); 8] = [
+    let docs: [(&str, &str); 9] = [
         (
             "00-base.toml",
             include_str!("../../../../config/vector/00-base.toml"),
@@ -477,6 +898,10 @@ pub(super) fn enrichment_lane_backpressure_violations(
         (
             "02-hec-source.toml",
             include_str!("../../../../config/vector/02-hec-source.toml"),
+        ),
+        (
+            "04-enrichment-source.toml",
+            include_str!("../../../../config/vector/04-enrichment-source.toml"),
         ),
         (
             "92-metrics.toml",
@@ -583,6 +1008,12 @@ pub(super) fn enrichment_lane_backpressure_violations(
 
     let mut violations: Vec<String> = Vec::new();
     for (name, sink) in &sinks {
+        if matches!(
+            name.as_str(),
+            "clickhouse_logs" | "clickhouse_parser_health" | "clickhouse_ocsf_logs"
+        ) {
+            continue;
+        }
         if !sink.blocks && !sink.acks {
             continue;
         }
@@ -645,80 +1076,6 @@ fn is_safe_enrich_source(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
-/// NAN-3767: the lean coordinator's NDJSON identity route (stage / delta
-/// lines). The gen1 `/v1/identity/users/batch` route does not exist on the
-/// lean coordinator: every batch sent there was a 404.
-pub(crate) const IDENTITY_INGEST_PATH: &str = "/v1/identity/directory/ingest";
-/// Validates `kind: identity_directory` records (the connector runner's
-/// stage / delta envelopes) into coordinator lines.
-pub(crate) const IDENTITY_ENVELOPE_TRANSFORM: &str = "enrichment_identity_envelope";
-/// Turns user_registry-shaped rows from the identity normalizers (provider
-/// sync, Cribl / HEC push) into coordinator `delta` lines.
-pub(crate) const IDENTITY_LINES_TRANSFORM: &str = "enrichment_identity_lines";
-
-/// [`IDENTITY_ENVELOPE_TRANSFORM`]: a runner envelope to one coordinator
-/// line. Only the shape is checked here; the coordinator validates every
-/// row and refuses the whole request (so the sender sees the failure).
-const IDENTITY_ENVELOPE_VRL: &str = r#"op = to_string(.op) ?? ""
-if op == "stage" {
-    . = {"op": "stage", "feed_id": .feed_id, "run_id": .run_id, "row": .row}
-} else if op == "delta" {
-    line = {"op": "delta", "row": .row, "patch": to_bool(.patch) ?? false}
-    if is_object(.manager_ref) {
-        line.manager_ref = .manager_ref
-    }
-    . = line
-} else {
-    log("nano_enrich identity_directory record without a stage/delta op; dead-lettering", level: "warn")
-    abort
-}"#;
-
-/// [`IDENTITY_LINES_TRANSFORM`]: a normalizer's user_registry row (provider
-/// sync, Cribl / HEC push) to a coordinator `delta` line of feed
-/// `push:<provider>`. `account_status = deleted` is a tombstone.
-const IDENTITY_LINES_VRL: &str = r#"provider = to_string(.provider_id) ?? ""
-provider = replace(provider, r'[^A-Za-z0-9_.:-]', "_")
-if provider == "" { provider = "directory" }
-external_id = to_string(.external_id) ?? ""
-if external_id == "" {
-    log("nano_enrich identity row missing external_id; dead-lettering", level: "warn")
-    abort
-}
-version = to_int(.version) ?? 0
-if version <= 0 { version = to_unix_timestamp(now(), unit: "milliseconds") }
-status = downcase(to_string(.account_status) ?? "")
-groups = array(.groups) ?? []
-groups = filter(groups) -> |_index, group| { is_string(group) && group != "" }
-row = {
-    "feed_id": truncate("push:" + provider, 256),
-    "external_id": external_id,
-    "source_kind": "push",
-    "version": version,
-    "deleted": status == "deleted",
-    "username": to_string(.username) ?? "",
-    "upn": to_string(.upn) ?? "",
-    "email": to_string(.email) ?? "",
-    "display_name": to_string(.display_name) ?? "",
-    "first_name": to_string(.first_name) ?? "",
-    "last_name": to_string(.last_name) ?? "",
-    "department": to_string(.department) ?? "",
-    "title": to_string(.title) ?? "",
-    "manager_upn": to_string(.manager_upn) ?? "",
-    "manager_display_name": to_string(.manager_display_name) ?? "",
-    "company": to_string(.company) ?? "",
-    "office_location": to_string(.office_location) ?? "",
-    "city": to_string(.city) ?? "",
-    "country": to_string(.country) ?? "",
-    "groups": groups,
-    "account_enabled": (to_int(.account_enabled) ?? 1) != 0,
-    "account_status": status,
-    "mfa_enabled": (to_int(.mfa_enabled) ?? 0) != 0,
-    "phone": to_string(.phone) ?? "",
-    "employee_id": to_string(.employee_id) ?? "",
-    "employee_type": to_string(.employee_type) ?? ""
-}
-. = {"op": "delta", "row": row}"#;
-
 /// NAN-1197: assert the generated enrichment lane contains only the components
 /// `generate_enrichment_lane` is supposed to emit. This is the defense-in-depth
 /// backstop to the per-parser source-text checks: even if a future escaping bug
@@ -727,8 +1084,12 @@ row = {
 /// here before the config is written. Only the GENERATED path calls this — the
 /// committed static fallback is trusted.
 fn assert_enrichment_lane_topology(toml_str: &str) -> Result<(), String> {
-    let doc: toml::Table =
-        toml::from_str(toml_str).map_err(|e| format!("candidate TOML parse failed: {e}"))?;
+    // Install-owned sink limits are intentionally unquoted Vector environment
+    // expressions. Mirror Vector's pre-parse interpolation before inspecting
+    // the topology; parsing the raw template rejects valid numeric settings.
+    let interpolated = crate::vector_env::substitute_like_vector(toml_str);
+    let doc: toml::Table = toml::from_str(&interpolated)
+        .map_err(|e| format!("candidate TOML parse failed after environment substitution: {e}"))?;
 
     // The lane must not introduce sources.
     if doc.contains_key("sources") {
@@ -737,11 +1098,8 @@ fn assert_enrichment_lane_topology(toml_str: &str) -> Result<(), String> {
 
     if let Some(transforms) = doc.get("transforms").and_then(|v| v.as_table()) {
         for (name, def) in transforms {
-            // NAN-3483: the dead-letter report remap is generator-owned too.
             if !name.starts_with("enrichment_normalize_")
-                && name != "enrichment_dead_letter_report"
-                && name != IDENTITY_ENVELOPE_TRANSFORM
-                && name != IDENTITY_LINES_TRANSFORM
+                && name != "enrichment_dead_letter_record"
             {
                 return Err(format!("unexpected transform '{name}'"));
             }
@@ -755,34 +1113,8 @@ fn assert_enrichment_lane_topology(toml_str: &str) -> Result<(), String> {
     if let Some(sinks) = doc.get("sinks").and_then(|v| v.as_table()) {
         for (name, def) in sinks {
             let ty = def.get("type").and_then(|v| v.as_str()).unwrap_or_default();
-            let fixed_lake_sink =
-                matches!(name.as_str(), "lake_identity_directory" | "lake_ip_context")
-                    && ty == "http"
-                    && def
-                        .get("uri")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|uri| {
-                            uri.starts_with("${NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-")
-                                && uri.rsplit_once('}').map(|(_, path)| path)
-                                    == Some(if name == "lake_identity_directory" {
-                                        IDENTITY_INGEST_PATH
-                                    } else {
-                                        "/v1/ip-context/batch"
-                                    })
-                        });
-            // NAN-3483: the dead-letter sink reports to the collector-error
-            // channel (fixed coordinator path, or ClickHouse).
-            let dead_letter = name == "enrichment_dead_letter"
-                && (ty == "clickhouse"
-                    || (ty == "http"
-                        && def.get("uri").and_then(|v| v.as_str()).is_some_and(|uri| {
-                            uri.starts_with("${NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-")
-                                && uri.rsplit_once('}').map(|(_, path)| path)
-                                    == Some("/v1/collector-errors/batch")
-                        })));
-            let ok = (name.starts_with("clickhouse_") && ty == "clickhouse")
-                || fixed_lake_sink
-                || dead_letter;
+            let ok = (name.starts_with("clickhouse_") || name == "enrichment_dead_letter")
+                && ty == "clickhouse";
             if !ok {
                 return Err(format!("unexpected sink '{name}' (type '{ty}')"));
             }
@@ -790,14 +1122,6 @@ fn assert_enrichment_lane_topology(toml_str: &str) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// NAN-3807: the canonical object-lake sink text exactly as a lean install's
-/// Vector receives it (static credential references, one placeholder input).
-/// The landing converter runs this text's `ocsf_lake_storage_prepare` stage
-/// itself, so a landed row and a Vector row come out of the same VRL.
-pub(crate) fn lake_ocsf_sink_text() -> String {
-    VectorConfigManager::lake_ocsf_sink_content(&["\"landing_ocsf\"".to_string()], true)
 }
 
 impl VectorConfigManager {
@@ -849,6 +1173,10 @@ impl VectorConfigManager {
             .filter(|p| p.kind != "enrichment")
             .cloned()
             .collect();
+        // NAN-4956: a fetch parser whose source-config route is not on disk
+        // is rendered as disabled (no file, no claim), never as a filter on a
+        // missing component.
+        let log_parsers = self.without_unroutable_parsers(&log_parsers).await;
 
         // NAN-2247: refuse before touching disk. Two enabled parsers claiming
         // one source_type on the same lane double-write every matching event,
@@ -899,7 +1227,7 @@ impl VectorConfigManager {
                 self.remove_legacy_parser_credential_files(parser).await?;
 
                 // Write config for enabled parser
-                let config = self.generate_parser_config(parser);
+                let config = self.guarded_parser_config(parser)?;
                 fs::write(&filepath, &config).await?;
                 expected_files.insert(filename);
                 tracing::info!(
@@ -1004,7 +1332,11 @@ impl VectorConfigManager {
             return Ok(());
         }
 
-        fs::write(&sink_path, Self::ocsf_sink_content(&inputs)).await?;
+        let content = Self::shard_route_clickhouse_sinks(
+            Self::ocsf_sink_content(&inputs),
+            &Self::clickhouse_shard_endpoints(),
+        );
+        fs::write(&sink_path, content).await?;
         tracing::info!(
             "Wrote OCSF ingestion sink ({} parser fork(s)) to {}",
             inputs.len(),
@@ -1040,185 +1372,9 @@ impl VectorConfigManager {
         v
     }
 
-    /// Render the OCSF sink selected by the event-storage backend. The legacy
-    /// lane remains byte-identical for ClickHouse deployments; primary-lake
-    /// deployments write canonical OCSF roots as zstd Parquet bronze objects.
+    /// NAN-1584: render the `clickhouse_ocsf_logs` sink TOML for the given inputs.
+    /// Shared by the active and staged writers.
     pub(super) fn ocsf_sink_content(inputs: &[String]) -> String {
-        if Self::lake_mode() {
-            let static_auth = std::env::var("NANO_LAKE_SINK_STATIC_AUTH")
-                .is_ok_and(|value| value.eq_ignore_ascii_case("true") || value == "1");
-            return Self::lake_ocsf_sink_content(inputs, static_auth);
-        }
-        Self::clickhouse_ocsf_sink_content(inputs)
-    }
-
-    fn lake_ocsf_sink_content(inputs: &[String], static_auth: bool) -> String {
-        let auth = if static_auth {
-            "auth.access_key_id = \"${NANO_LAKE_ACCESS_KEY_ID}\"\n\
-             auth.secret_access_key = \"${NANO_LAKE_SECRET_ACCESS_KEY}\"\n"
-        } else {
-            "# Authentication is supplied by the pod/instance workload role.\n"
-        };
-        format!(
-            "# Auto-generated canonical OCSF object-lake sink (NAN-2361)\n\
-             # DO NOT EDIT - regenerated on every parser deploy.\n\
-             # Vector performs real source parsing, then durably writes Parquet\n\
-             # bronze objects. The coordinator compacts and commits them to the\n\
-             # tenant's Iceberg table; no ClickHouse event copy is written.\n\
-             [transforms.ocsf_lake_storage_prepare]\n\
-             type = \"remap\"\n\
-             inputs = [{inputs}]\n\
-             drop_on_abort = true\n\
-             drop_on_error = true\n\
-             reroute_dropped = true\n\
-             source = '''\n\
-             source_type = downcase(to_string(.source_type) ?? to_string(%source_type) ?? \"unknown\")\n\
-             if source_type == \"\" {{ source_type = \"unknown\" }}\n\
-             tenant_id = downcase(to_string(%tenant_id) ?? \"\")\n\
-             if tenant_id == \"\" {{ tenant_id = downcase(get_env_var(\"NANO_TENANT_ID\") ?? \"\") }}\n\
-             if tenant_id == \"\" {{ abort }}\n\
-             event = .event\n\
-             if is_object(event) {{ . = event }}\n\
-             del(._nano_parser_id)\n\
-             del(._nano_parser_failure)\n\
-             # Preserve the verbatim source payload in canonical OCSF 1.9.\n\
-             # The imported parsers currently carry it in `message`; future\n\
-             # parsers can provide `raw_data` directly and retain precedence.\n\
-             raw_data = to_string(.raw_data) ?? \"\"\n\
-             if raw_data == \"\" {{ raw_data = to_string(.message) ?? \"\" }}\n\
-             if raw_data != \"\" {{\n\
-                 .raw_data = raw_data\n\
-                 .raw_data_size = length(raw_data)\n\
-             }}\n\
-             time_ms = to_int(.time) ?? 0\n\
-             event_time = now()\n\
-             if time_ms > 0 {{ event_time = from_unix_timestamp!(time_ms, unit: \"milliseconds\") }}\n\
-             metadata = .metadata\n\
-             if !is_object(metadata) {{ metadata = {{}} }}\n\
-             metadata.version = \"1.9.0\"\n\
-             metadata.log_source = source_type\n\
-             # NAN-2361 wave 8: the ingress lane the row arrived on (nano extension like\n\
-             # log_source): nano_https | hec | otlp | vector. Absent on rows from a lane\n\
-             # that does not stash `%ingress_transport`; the Bronze publisher's\n\
-             # per-source counters then assume the conventional HEC path.\n\
-             ingress_transport = downcase(to_string(%ingress_transport) ?? \"\")\n\
-             if ingress_transport != \"\" {{ metadata.ingress_transport = ingress_transport }}\n\
-             metadata.tenant_uid = tenant_id\n\
-             # NAN-3770: the named ingest token (Ingestion -> Credentials) the sender\n\
-             # authenticated with, stamped by the nano-rs/vector `valid_tokens_file` check.\n\
-             # Only the canonical credential id is stored, never the token. A value a\n\
-             # parser copied from the payload is dropped so attribution cannot be forged.\n\
-             nano_sender_credential = downcase(to_string(%nano_credential_id) ?? \"\")\n\
-             if match(nano_sender_credential, r'^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[1-8][0-9a-f]{{3}}-[89ab][0-9a-f]{{3}}-[0-9a-f]{{12}}$') {{\n\
-             metadata.nano_credential_id = nano_sender_credential\n\
-             }} else {{\n\
-             metadata = remove!(metadata, [\"nano_credential_id\"])\n\
-             }}\n\
-             processed_time = to_unix_timestamp(now(), unit: \"milliseconds\")\n\
-             metadata.processed_time = processed_time\n\
-             metadata.logged_time = processed_time\n\
-             # NAN-2992: a deterministic event uid ONLY from the edge Worker's signed\n\
-             # per-event key (`%nano_event_key` = receipt digest + ordinal, verified by\n\
-             # hec_normalize), so a redelivered batch carries the same uids and the\n\
-             # ingest uid ledger drops it. A uid the event supplied (or a parser derived\n\
-             # from it) is kept: anything that is not a UUIDv4, or a UUIDv4 that appears\n\
-             # verbatim in the raw payload. Without a key nothing is derived from content:\n\
-             # the parser's random uid stays (identical real events are never collapsed).\n\
-             # The derived uid is UUID-shaped with version 8, so this stage is idempotent.\n\
-             uid = to_string(metadata.uid) ?? \"\"\n\
-             event_key = to_string(%nano_event_key) ?? \"\"\n\
-             uid_minted = uid == \"\" || (match(uid, r'^[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-4[0-9a-fA-F]{{3}}-[89abAB][0-9a-fA-F]{{3}}-[0-9a-fA-F]{{12}}$') && !contains(raw_data, uid, case_sensitive: false))\n\
-             if event_key != \"\" && uid_minted {{\n\
-             uid_digest = sha2(\"nano-uid-v1:key:\" + tenant_id + \":\" + event_key, variant: \"SHA-256\")\n\
-             metadata.uid = slice!(uid_digest, 0, 8) + \"-\" + slice!(uid_digest, 8, 12) + \"-8\" + slice!(uid_digest, 13, 16) + \"-a\" + slice!(uid_digest, 17, 20) + \"-\" + slice!(uid_digest, 20, 32)\n\
-             }} else if uid == \"\" {{\n\
-             metadata.uid = uuid_v4()\n\
-             }}\n\
-             # One Vector sink can feed independently owned Bronze publisher\n\
-             # partitions without changing the event body. A single-shard\n\
-             # deployment keeps the historic tenant prefix byte-for-byte;\n\
-             # multi-shard deployments route a stable UID hash into one of the\n\
-             # bounded prefixes accepted by lake_bronze_publish.\n\
-             bronze_shards = ${{NANO_LAKE_BRONZE_SHARDS:-1}}\n\
-             if bronze_shards < 1 || bronze_shards > 128 {{ abort }}\n\
-             ._nano_bronze_partition = if bronze_shards > 1 {{\n\
-                 bronze_digest = sha2!(to_string!(metadata.uid), variant: \"SHA-256\")\n\
-                 bronze_hash_prefix = slice!(bronze_digest, 0, 8)\n\
-                 bronze_hash_value = parse_int!(bronze_hash_prefix, base: 16)\n\
-                 bronze_shard = mod!(bronze_hash_value, bronze_shards)\n\
-                 \"shard=\" + to_string!(bronze_shard) + \"/\"\n\
-             }} else {{\n\
-                 \"\"\n\
-             }}\n\
-             .metadata = metadata\n\
-             .time = event_time\n\
-             %tenant_id = tenant_id\n\
-             %source_type = source_type\n\
-             %class_uid = to_int(.class_uid) ?? 0\n\
-             %event_day = format_timestamp!(event_time, \"%Y%m%d\")\n\
-             # Bronze is the durable handoff, not the serving partition layout.\n\
-             # Each selected Bronze partition remains lexically append-only;\n\
-             # Vector's timestamped filenames preserve arrival order and the\n\
-             # Rust publisher writes\n\
-             # canonical event-hour Iceberg partitions.\n\
-             {bronze_row}'''\n\
-             \n\
-             [sinks.ocsf_parquet_bronze]\n\
-             type = \"aws_s3\"\n\
-             inputs = [\"ocsf_lake_storage_prepare\"]\n\
-             bucket = \"${{NANO_LAKE_BRONZE_BUCKET}}\"\n\
-             region = \"${{AWS_REGION:-us-east-1}}\"\n\
-             endpoint = \"${{NANO_LAKE_OBJECT_ENDPOINT:-https://s3.amazonaws.com}}\"\n\
-             force_path_style = ${{NANO_LAKE_FORCE_PATH_STYLE:-false}}\n\
-             {auth}\
-             key_prefix = \"bronze-v2/{{{{ _nano_bronze_partition }}}}tenant_id={{{{ %tenant_id }}}}/\"\n\
-             filename_extension = \"parquet\"\n\
-             filename_append_uuid = true\n\
-             acknowledgements.enabled = true\n\
-             \n\
-             [sinks.ocsf_parquet_bronze.encoding]\n\
-             codec = \"json\"\n\
-             except_fields = [\"_nano_bronze_partition\"]\n\
-             \n\
-             [sinks.ocsf_parquet_bronze.batch]\n\
-             max_bytes = ${{VECTOR_LAKE_BATCH_MAX_BYTES:-33554432}}\n\
-             max_events = ${{VECTOR_LAKE_BATCH_MAX_EVENTS:-10000}}\n\
-             # The byte/event thresholds still produce sized objects under load. The\n\
-             # short timeout bounds low-rate source visibility; it is not a tenant EPS cap.\n\
-             timeout_secs = ${{VECTOR_LAKE_BATCH_TIMEOUT_SECS:-1}}\n\
-             \n\
-             [sinks.ocsf_parquet_bronze.batch_encoding]\n\
-             codec = \"parquet\"\n\
-             schema_mode = \"auto_infer\"\n\
-             \n\
-             [sinks.ocsf_parquet_bronze.batch_encoding.compression]\n\
-             algorithm = \"zstd\"\n\
-             # Bronze is retained only for replay and is re-encoded into the serving layout.\n\
-             level = ${{VECTOR_LAKE_BRONZE_ZSTD_LEVEL:-6}}\n\
-             \n\
-             [sinks.ocsf_parquet_bronze.buffer]\n\
-             # NAN-3523: bounded by in-memory BYTES, not events: an event may be up to\n\
-             # 4 MiB, so 20000 events could hold ~80 GiB. 64 MiB is four of the hosted\n\
-             # Worker's 16 MiB batches, a small slice of the smallest Container. Memory\n\
-             # (never disk) keeps the source ACK behind the completed PUT; when full it\n\
-             # blocks, pushing back on the source and the durable raw handoff upstream.\n\
-             type = \"memory\"\n\
-             max_size = ${{VECTOR_LAKE_BUFFER_MAX_BYTES:-67108864}}\n\
-             when_full = \"block\"\n\
-             \n\
-             [sinks.ocsf_parquet_bronze.request]\n\
-             concurrency = \"adaptive\"\n\
-             timeout_secs = 120\n\
-             retry_initial_backoff_secs = 1\n\
-             retry_max_duration_secs = 300\n",
-            inputs = inputs.join(", "),
-            // NAN-3339: every bronze row has the same two columns, so one
-            // row's shape can never fail (and drop) the batch's Parquet encode.
-            bronze_row = crate::parsers::lake_bronze_row::LAKE_BRONZE_ROW_VRL,
-        )
-    }
-
-    fn clickhouse_ocsf_sink_content(inputs: &[String]) -> String {
         format!(
             "# Auto-generated OCSF ingestion sink (NAN-1246)\n\
              # DO NOT EDIT - regenerated on every parser deploy.\n\
@@ -1254,13 +1410,12 @@ impl VectorConfigManager {
              [sinks.clickhouse_ocsf_logs.query_settings.async_insert_settings]\n\
              deduplicate = true\n\
              \n\
-             # NAN-2253: disk + drop_newest — the OCSF event lane gets the\n\
-             # same durable buffer as clickhouse_logs (see that sink's\n\
-             # comment; NAN-1114 forbids block on shared-source sinks).\n\
+             # NAN-5004: disk + block — HTTP/OTLP success must never cover a\n\
+             # drop_newest finalizer (Vector folds Dropped into Delivered).\n\
              [sinks.clickhouse_ocsf_logs.buffer]\n\
              type = \"disk\"\n\
-             max_size = 2147483648\n\
-             when_full = \"drop_newest\"\n\
+             max_size = ${{VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}}\n\
+             when_full = \"block\"\n\
              \n\
              [sinks.clickhouse_ocsf_logs.acknowledgements]\n\
              enabled = false\n\
@@ -1271,7 +1426,7 @@ impl VectorConfigManager {
              timeout_secs = ${{VECTOR_BATCH_TIMEOUT_SECS:-10}}\n\
              \n\
              [sinks.clickhouse_ocsf_logs.request]\n\
-             concurrency = \"adaptive\"\n\
+             concurrency = ${{VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}}\n\
              timeout_secs = 120\n\
              retry_initial_backoff_secs = 1\n\
              retry_max_duration_secs = 300\n",
@@ -1392,7 +1547,8 @@ impl VectorConfigManager {
     /// Returns the static pipeline config content (generic parser, normalization, clickhouse mapping, sink).
     /// Shared between write_pipeline_config (deploy) and write_staged_pipeline_config (staged deploy).
     pub(super) fn pipeline_config_content() -> &'static str {
-        r#"# Auto-generated static pipeline config
+        concat!(
+            r#"# Auto-generated static pipeline config
 # DO NOT EDIT - regenerated by deploy_parsers
 # Contains: generic parser, normalization, clickhouse mapping, clickhouse sink
 
@@ -1500,11 +1656,24 @@ if !is_timestamp(ts) {
 '''
 
 # =============================================================================
-# Deduplication - Remove duplicate events (retries, redundant forwarders)
+# Deduplication - only protocols without a durable per-request success contract
 # =============================================================================
+# NAN-5004: Vector's dedupe transform finalizes a duplicate as Dropped, and the
+# source acknowledgement aggregator treats Dropped as Delivered. HTTP and OTLP
+# must therefore bypass dedupe: every record covered by a successful response
+# continues to a durable sink. Those protocols are at-least-once; a retry after
+# an ambiguous response can produce a duplicate.
+[transforms.durable_delivery_route]
+type = "route"
+inputs = ["normalize"]
+
+[transforms.durable_delivery_route.route]
+durable = 'includes(["http", "otlp"], to_string(.metadata.forwarded_via) ?? "")'
+dedupe = '!includes(["http", "otlp"], to_string(.metadata.forwarded_via) ?? "")'
+
 [transforms.dedupe]
 type = "dedupe"
-inputs = ["normalize"]
+inputs = ["durable_delivery_route.dedupe"]
 
 [transforms.dedupe.fields]
 match = ["message", "source_type", "timestamp"]
@@ -1517,9 +1686,12 @@ num_events = 5000
 # =============================================================================
 [transforms.prepare_output]
 type = "remap"
-inputs = ["dedupe"]
+inputs = ["durable_delivery_route.durable", "dedupe"]
 source = '''
-src_type = .source_type
+"#,
+            credential_field_redaction_vrl!(),
+            ingest_transport_strip_vrl!(),
+            r#"src_type = .source_type
 if src_type == null { src_type = "unknown" }
 
 raw_message = .message
@@ -1534,9 +1706,17 @@ otlp_severity = .severity
 otlp_ext = .ext
 otlp_trace_id = .trace_id
 otlp_span_id = .span_id
+# NAN-4912: a token-bound event that takes this generic lane (its source's
+# parser is not published yet) keeps the type the sender declared, when it
+# differs from the token's source, as `claimed_source_type` (clickhouse_mapping
+# moves it into `ext`). Without this the rebuild below dropped it, so the
+# attribution evidence existed only for parsed sources.
+claimed_source_type = .claimed_source_type
+if claimed_source_type == null { claimed_source_type = %nano_claimed_source_type }
 
 . = {
     "timestamp": .udm.timestamp,
+    "claimed_source_type": claimed_source_type,
     "severity": otlp_severity,
     "ext": otlp_ext,
     "trace_id": otlp_trace_id,
@@ -1600,10 +1780,25 @@ source = '''
 # Internal marker exists only long enough for the per-parser sample transform
 # to retain failures. The durable diagnostic lives in metadata.parse_error.
 del(._nano_parser_failure)
+# NAN-5004: per-parser sampling reads this transient protocol marker. Never
+# persist it after it has served that routing decision.
+del(._nano_durable_ingest)
+"#,
+            credential_field_redaction_vrl!(),
+            ingest_transport_strip_vrl!(),
+            r#"# Protected transport identity survives parser/root rebuilds in
+# metadata. Remove every event-supplied copy now; the canonical values are
+# inserted into ext at the storage boundary below.
+nano_ingest_client_ip = to_string(%nano_ingest_client_ip) ?? ""
+nano_ingest_peer = to_string(%nano_ingest_peer) ?? ""
+del(.client_ip)
+del(.ingest_client_ip)
+del(.ingest_peer)
 ts_fell_back = false
+event_ts = now()
+original_ts = ""
 if !exists(.timestamp) {
     ts_fell_back = true
-    .timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
 } else if is_string(.timestamp) {
     raw_ts = to_string(.timestamp) ?? ""
     ts, err = parse_timestamp(raw_ts, "%+")
@@ -1624,17 +1819,33 @@ if !exists(.timestamp) {
         ts, err = parse_timestamp(candidate_ts, "%+")
     }
     if err == null {
-        .timestamp = format_timestamp!(ts, format: "%Y-%m-%d %H:%M:%S")
+        event_ts = ts
+        original_ts = raw_ts
     } else {
         ts_fell_back = true
-        .timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
     }
 } else if is_timestamp(.timestamp) {
-    .timestamp = format_timestamp!(.timestamp, format: "%Y-%m-%d %H:%M:%S")
+    event_ts = .timestamp
+    original_ts = format_timestamp!(event_ts, "%+")
 } else {
     ts_fell_back = true
-    .timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
 }
+
+# NAN-4939: future timestamps make retention and time-window queries miss live
+# events. Clamp only beyond the configured tolerance and keep the sender's
+# original value in an explicit repair/audit column.
+skew_seconds = to_int(get_env_var("NANO_FUTURE_TIMESTAMP_SKEW_SECONDS") ?? "86400") ?? 86400
+if skew_seconds < 0 { skew_seconds = 86400 }
+now_ts = now()
+event_seconds = to_unix_timestamp!(event_ts)
+now_seconds = to_unix_timestamp!(now_ts)
+if event_seconds > now_seconds + skew_seconds {
+    .original_timestamp = if original_ts != "" { original_ts } else { format_timestamp!(event_ts, "%+") }
+    event_ts = now_ts
+} else {
+    .original_timestamp = ""
+}
+.timestamp = format_timestamp!(event_ts, format: "%Y-%m-%d %H:%M:%S")
 # Marked, not silent. Written before `.metadata` is JSON-encoded below, and
 # guarded because a parser can leave `.metadata` as a non-object.
 if ts_fell_back {
@@ -1765,7 +1976,7 @@ if pcmd_val == null || pcmd_val == "" { pcmd_val = .parent_process }
 
 # Build ext JSON with all non-explicit fields
 explicit_columns = [
-    "id", "timestamp", "message", "metadata", "source_type", "namespace", "ingest_time", "_inserted_at",
+    "id", "timestamp", "original_timestamp", "message", "metadata", "source_type", "namespace", "ingest_time", "_inserted_at",
     "src_ip", "dest_ip", "src_host", "dest_host", "src_port", "dest_port", "protocol",
     "bytes_in", "bytes_out", "packets_in", "packets_out", "direction", "src_mac", "dest_mac", "vlan",
     "user", "src_user", "dest_user", "user_id", "user_name", "user_domain", "user_type",
@@ -1801,6 +2012,26 @@ for_each(keys(.)) -> |_idx, key| {
         }
     }
 }
+# NAN-4907: the ingest token the sender authenticated with, stamped by the
+# nano-rs/vector `valid_tokens_file` check (or the OTLP edge). Only the
+# canonical credential id is stored, never the token. A value a sender or
+# parser put in the event is dropped so attribution cannot be forged.
+ext_existing = remove!(ext_existing, ["nano_credential_id"])
+nano_sender_credential = downcase(to_string(%nano_credential_id) ?? "")
+if match(nano_sender_credential, r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
+    ext_existing = set!(ext_existing, ["nano_credential_id"], nano_sender_credential)
+}
+# Sender/parser copies are untrusted even when nested in a pre-existing ext.
+ext_existing = remove!(ext_existing, ["client_ip"])
+ext_existing = remove!(ext_existing, ["ingest_client_ip"])
+ext_existing = remove!(ext_existing, ["ingest_peer"])
+if nano_ingest_client_ip != "" {
+    ext_existing = set!(ext_existing, ["client_ip"], nano_ingest_client_ip)
+    ext_existing = set!(ext_existing, ["ingest_client_ip"], nano_ingest_client_ip)
+}
+if nano_ingest_peer != "" {
+    ext_existing = set!(ext_existing, ["ingest_peer"], nano_ingest_peer)
+}
 .ext = ext_existing
 
 .ingest_time = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S.%f")
@@ -1820,22 +2051,17 @@ for_each(keys(.)) -> |_idx, key| {
 # which silently shed everything past ~100k events during a ClickHouse memory
 # wedge (NAN-2251) while sources ACKed 200, and a Vector restart evaporated
 # the rest; only ~4k of ~180k survived a real wedge). Disk survives restarts
-# under VECTOR_DATA_DIR and holds a bounded 2 GiB backlog. when_full stays
-# drop_newest, NOT block — this sink reaches the shared ingest sources, and
-# a blocking sink would stall every other lane through them (NAN-1114
-# invariant, enforced by shared_ingest_source_sinks_must_not_backpressure).
+# under VECTOR_DATA_DIR and holds a bounded 2 GiB backlog. NAN-5004 changes
+# when_full to block: HTTP/OTLP success waits for this buffer, and Vector folds
+# a drop_newest finalizer into Delivered. A full buffer must backpressure the
+# sender instead of returning a false success. The host sizer inventories the
+# fully shard-expanded graph and assigns one share of its filesystem-level
+# total to every disk buffer.
 #
-# Cluster routing contract (NAN-1728, C4/W1) — kept byte-for-byte in sync with
-# config/vector/sources/parsers/_pipeline.toml. `table` is env-driven and
-# defaults to the shard-LOCAL `logs`:
-#   * SINGLE-SHARD (dev / Saturn / most tenants): leave CLICKHOUSE_LOGS_TABLE
-#     UNSET -> writes the plain local `logs`, unchanged. No `logs_distributed`
-#     wrapper exists there, so the default MUST stay `logs`.
-#   * ENTERPRISE 3x2 CLUSTER: deploy/k8s/rackspace/vector.yaml sets
-#     CLICKHOUSE_LOGS_TABLE=logs_distributed so writes go THROUGH the Distributed
-#     wrapper (sharded by cityHash64(id), content hash not rand()), so a
-#     timed-out-then-retried batch re-hashes to the SAME shard and per-shard
-#     block dedup catches the duplicate; also removes per-connection shard skew.
+# Cluster routing contract (NAN-4988): generated multi-shard configs stable-hash
+# events into direct shard sinks; this committed config is the single-node form.
+# Never set CLICKHOUSE_LOGS_TABLE=logs_distributed or use a generic cross-shard
+# Service for this local-table sink.
 # =============================================================================
 [sinks.clickhouse_logs]
 type = "clickhouse"
@@ -1843,7 +2069,7 @@ inputs = ["clickhouse_mapping"]
 
 endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
 database = "${CLICKHOUSE_DATABASE:-nanosiem}"
-table = "${CLICKHOUSE_LOGS_TABLE:-logs}"
+table = "${CLICKHOUSE_LOGS_TABLE:-logs_ingest}"
 
 auth.strategy = "basic"
 auth.user = "${CLICKHOUSE_USER:-nanosiem}"
@@ -1864,8 +2090,8 @@ deduplicate = true
 
 [sinks.clickhouse_logs.buffer]
 type = "disk"
-max_size = 2147483648
-when_full = "drop_newest"
+max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+when_full = "block"
 
 [sinks.clickhouse_logs.acknowledgements]
 enabled = false
@@ -1876,7 +2102,7 @@ max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
 timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
 
 [sinks.clickhouse_logs.request]
-concurrency = "adaptive"
+concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
 timeout_secs = 120
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 300
@@ -1887,6 +2113,15 @@ retry_max_duration_secs = 300
 # `db_parser_health` sees parser output before optional sampling and reduces
 # each attempt to parser_id/source_type/observed_at/failure. The destination is
 # ENGINE=Null; its materialized view retains only five-minute aggregates.
+#
+# NAN-4976: disk-buffered like clickhouse_logs. Every parsed event also takes
+# this branch, and Vector finalizes an event (HEC indexer ackId, connector
+# cursor) only when ALL its sinks have. A memory buffer held the ack until
+# this telemetry INSERT, and a ClickHouse outage past retry_max_duration_secs
+# expired it Errored: the ack never resolved although the event sat safely in
+# clickhouse_logs' disk buffer, so senders re-sent (duplicates). With both
+# buffers on disk an ackId means one thing on every lane: committed to the
+# durable buffer in front of ClickHouse. 268435488 is Vector's disk minimum.
 # =============================================================================
 [sinks.clickhouse_parser_health]
 type = "clickhouse"
@@ -1908,9 +2143,9 @@ skip_unknown_fields = true
 deduplicate = true
 
 [sinks.clickhouse_parser_health.buffer]
-type = "memory"
-max_events = 100000
-when_full = "drop_newest"
+type = "disk"
+max_size = ${VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}
+when_full = "block"
 
 [sinks.clickhouse_parser_health.acknowledgements]
 enabled = false
@@ -1921,11 +2156,12 @@ max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
 timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
 
 [sinks.clickhouse_parser_health.request]
-concurrency = "adaptive"
+concurrency = ${VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}
 timeout_secs = 120
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 300
 "#
+        )
     }
 
     /// NAN-1325: generic OCSF **Base Event** lane. Under `NANO_SCHEMA_PROFILE=ocsf`,
@@ -1935,13 +2171,13 @@ retry_max_duration_secs = 300
     /// they reach the UDM `logs` table but never `ocsf_logs`. Since OCSF search reads
     /// `ocsf_logs`, that unconfigured/early/unknown data was silently invisible
     /// (UDM keeps it searchable in its `unknown` bucket). This transform forks off
-    /// `generic_parser` and shapes a valid OCSF 1.9 Base Event (`class_uid = 0`).
-    /// The source-native record is encoded under `unmapped.raw_event` and
-    /// `raw_data`; unknown source fields never leak into the canonical root or
-    /// force an unbounded physical Iceberg schema. The
+    /// `generic_parser` and shapes a minimal Base Event (`class_uid = 0`, the raw
+    /// record preserved in `event`, a `message`, `source_type`, `timestamp`) — the
+    /// row shape `clickhouse_ocsf_logs` expects (mirrors `OCSF_PREPARE_VRL`). The
     /// sink wires `generic_ocsf_prepare` into its inputs. Appended only under OCSF
     /// (UDM deployments get the static config verbatim — byte-identical).
-    const GENERIC_OCSF_PREPARE_BLOCK: &'static str = r#"
+    const GENERIC_OCSF_PREPARE_BLOCK: &'static str = concat!(
+        r#"
 # =============================================================================
 # Generic OCSF Base Event lane (NAN-1325) — unparsed/unknown source types still
 # land searchable in ocsf_logs as a class_uid=0 Base Event. OCSF deployments only.
@@ -1952,152 +2188,168 @@ inputs = ["generic_parser"]
 drop_on_abort = false
 drop_on_error = false
 source = '''
-raw_event = .
-# NAN-2612: the storage label (`metadata.log_source`, which source-visibility
-# RBAC keys on) must be the row's real source, never a blanket `unknown`.
-# Two inputs feed this lane, with different metadata shapes:
-#   * `generic_parser` keeps `.metadata` an object and stashes the pre-parser
-#     routing key in `.metadata.original_source_type`, because a parse error
-#     rewrites the top-level `source_type` to `parse_failure`.
-#   * `db_parsers_combined` (lake mode: every parser runtime failure and any
-#     parser output without a root `class_uid`) carries `.metadata` as a JSON
-#     STRING, and `<parser>_output` has already resolved `.source_type`.
-#     `.metadata.original_source_type` is null there and `to_string(null)` is
-#     `""` without an error, so a `??` fallback never reached `.source_type`
-#     and every such row was stored as `unknown`. The string is parser-authored,
-#     so it is never read for the label.
-# `unknown` stays only for an event that declared no source (design §10.5).
-src_type = ""
-if is_object(.metadata) {
-    src_type = to_string(.metadata.original_source_type) ?? ""
-}
-if src_type == "" {
-    src_type = to_string(.source_type) ?? ""
-}
-if src_type == "parse_failure" { src_type = "" }
-src_type = downcase(src_type)
+"#,
+        credential_field_redaction_vrl!(),
+        ingest_transport_strip_vrl!(),
+        r#"raw_record = .
+raw_record = remove!(raw_record, ["client_ip"])
+raw_record = remove!(raw_record, ["ingest_client_ip"])
+raw_record = remove!(raw_record, ["ingest_peer"])
+src_type = downcase(to_string(.metadata.original_source_type) ?? to_string(.source_type) ?? "unknown")
 if src_type == "" { src_type = "unknown" }
 msg = to_string(.message) ?? ""
-raw_json = encode_json(raw_event)
-if msg == "" { msg = raw_json }
-
-event_time = now()
-source_time = .timestamp
-if source_time == null { source_time = .created_at }
-if source_time == null && is_object(.id) { source_time = .id.time }
-if is_timestamp(source_time) {
-    event_time = source_time
-} else if is_integer(source_time) {
-    parsed_time, time_err = from_unix_timestamp(source_time, unit: "milliseconds")
-    if time_err == null { event_time = parsed_time }
-} else {
-    raw_time = to_string(source_time) ?? ""
-    if raw_time != "" {
-        parsed_time, time_err = parse_timestamp(raw_time, "%+")
-        if time_err != null {
-            candidate_time = replace(raw_time, " ", "T")
-            if !match(candidate_time, r'(Z|[+-]\d{2}:?\d{2})$') {
-                candidate_time = candidate_time + "Z"
-            }
-            parsed_time, time_err = parse_timestamp(candidate_time, "%+")
-        }
-        if time_err == null { event_time = parsed_time }
-    }
+if msg == "" { msg = encode_json(raw_record) }
+# NAN-4903: the unparsed record is vendor data, not OCSF — it goes under
+# `unmapped` (queried as `unmapped.<key>` or the bare key) so arbitrary keys
+# never spend the `event` column's dynamic-path budget.
+ocsf_event = { "class_uid": 0, "category_uid": 0, "message": msg, "metadata": { "log_source": src_type }, "unmapped": raw_record }
+nano_ingest_client_ip = to_string(%nano_ingest_client_ip) ?? ""
+nano_ingest_peer = to_string(%nano_ingest_peer) ?? ""
+if nano_ingest_client_ip != "" {
+    ocsf_event.unmapped.client_ip = nano_ingest_client_ip
+    ocsf_event.unmapped.ingest_client_ip = nano_ingest_client_ip
 }
-
-severity = strip_whitespace(to_string(.severity) ?? "")
-if severity == "" { severity = "Unknown" }
-severity_lower = downcase(severity)
-severity_id = if severity_lower == "fatal" { 6 } else if severity_lower == "critical" { 5 } else if severity_lower == "error" { 4 } else if severity_lower == "warn" || severity_lower == "warning" { 3 } else if severity_lower == "info" || severity_lower == "informational" || severity_lower == "debug" || severity_lower == "trace" { 1 } else { 0 }
-
-# OCSF Base Event does not carry the Trace Profile. Preserve OTLP correlation
-# identifiers as typed unmapped leaves instead of leaving them stranded inside
-# raw_data. Parsers that emit a trace-profile-bearing OCSF class can map these
-# to trace.uid / trace.span.uid directly.
-# NAN-2370: `source_type` is retired UDM vocabulary and must not be persisted
-# into new OCSF lake rows. The value is not lost: it is already on
-# `metadata.log_name` below, and the lake sink stamps `metadata.log_source`
-# from the same routing key. Carrying it a third time under `unmapped` only
-# taught analysts a field name the strict OCSF validator rejects.
-unmapped = { "raw_event": raw_json }
-otlp_trace_id = downcase(to_string(.trace_id) ?? "")
-otlp_span_id = downcase(to_string(.span_id) ?? "")
-if otlp_trace_id != "" { unmapped.trace_id = otlp_trace_id }
-if otlp_span_id != "" { unmapped.span_id = otlp_span_id }
-
-ocsf_event = {
-    "activity_id": 0,
-    "activity_name": "Unknown",
-    "category_name": "Uncategorized",
-    "category_uid": 0,
-    "class_name": "Base Event",
-    "class_uid": 0,
-    "message": msg,
-    "metadata": {
-        "log_name": src_type,
-        "product": { "name": "Nano Generic Source", "vendor_name": "Nano" },
-        "version": "1.9.0"
-    },
-    "raw_data": raw_json,
-    "raw_data_size": length(raw_json),
-    "severity": severity,
-    "severity_id": severity_id,
-    "time": to_unix_timestamp!(event_time, unit: "milliseconds"),
-    "type_name": "Base Event: Unknown",
-    "type_uid": 0,
-    "unmapped": unmapped
-}
+if nano_ingest_peer != "" { ocsf_event.unmapped.ingest_peer = nano_ingest_peer }
 
 # NAN-1556: OTLP LogRecords (source_type=otlp_log) reach this generic lane with
 # canonical fields already set by otlp_logs_prep (.severity, .metadata.src_host
-# from resource service.name, .trace_id/.span_id).
-# NAN-3242: the OTLP resource `service.name` is a logical service, not a host,
-# and `device` is a Host-profile attribute that a class 0 Base Event without
-# `metadata.profiles: ["host"]` may not carry: the strict OCSF 1.9 lake refused
-# every such row. Map it to `metadata.product.feature.name`, valid on every
-# class without a profile and the slot the OTLP OCSF parsers already use for
-# service identity. Gated on the OTLP lane's provenance stamp (set by
-# otlp_logs_prep), so other parserless events are byte-unchanged.
-if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
-    otlp_service = strip_whitespace(to_string(.metadata.src_host) ?? "")
-    if otlp_service != "" {
-        ocsf_event.metadata.product.feature = { "name": otlp_service }
-    }
+# from resource service.name, .trace_id/.span_id). Promote them to OCSF Base
+# Event keys inside `event` so the ocsf_logs promoted columns
+# (severity_id / severity / src_endpoint.hostname / trace.uid / time, derived
+# from `event` by ocsf_logs_raw_mv) populate. Each map is gated on presence, so non-OTLP parserless
+# events are byte-unchanged (their severity/src_host are unset).
+sev_str = to_string(.severity) ?? ""
+if sev_str != "" {
+    ocsf_event.severity = sev_str
+    sl = downcase(sev_str)
+    ocsf_event.severity_id = if sl == "fatal" { 6 } else if sl == "critical" { 5 } else if sl == "error" { 4 } else if sl == "warn" || sl == "warning" { 3 } else if sl == "info" || sl == "informational" || sl == "debug" || sl == "trace" { 1 } else { 0 }
+}
+otlp_host = to_string(.metadata.src_host) ?? ""
+if otlp_host != "" {
+    # Object literals are typed exactly in VRL, so a nested assignment onto an
+    # absent key is a compile error (E642); merge a sub-object instead.
+    ocsf_event = merge(ocsf_event, { "src_endpoint": { "hostname": downcase(otlp_host) } }, deep: true)
+}
+otlp_trace = to_string(.trace_id) ?? ""
+if otlp_trace != "" {
+    trace_obj = { "uid": downcase(otlp_trace) }
+    otlp_span = to_string(.span_id) ?? ""
+    if otlp_span != "" { trace_obj = merge(trace_obj, { "span": { "uid": downcase(otlp_span) } }) }
+    ocsf_event = merge(ocsf_event, { "trace": trace_obj }, deep: true)
+}
+otlp_time = to_string(.timestamp) ?? ""
+if otlp_time != "" {
+    ocsf_event.time = otlp_time
 }
 
-. = { "event": ocsf_event, "timestamp": event_time, "source_type": src_type }
+skew_seconds = to_int(get_env_var("NANO_FUTURE_TIMESTAMP_SKEW_SECONDS") ?? "86400") ?? 86400
+if skew_seconds < 0 { skew_seconds = 86400 }
+. = { "event": ocsf_event, "timestamp": format_timestamp!(now(), "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type, "future_timestamp_skew_seconds": skew_seconds }
 '''
-"#;
+"#
+    );
 
-    /// The pipeline config for the active schema and storage backend. The
-    /// ClickHouse/UDM branch stays byte-identical. A primary-lake branch has no
-    /// ClickHouse terminal sinks: leaving those dead sinks connected caused
-    /// acknowledged HTTP batches to time out, retry, and publish duplicate
-    /// bronze objects even though the S3 write had succeeded.
+    /// The pipeline config for the active schema. A multi-shard deployment sets
+    /// `VECTOR_CLICKHOUSE_SHARD_ENDPOINTS` to a comma-separated list of direct
+    /// shard Services. Every ClickHouse sink is then expanded into a stable-hash
+    /// route and one sink per shard; retries remain pinned to the same shard.
+    /// With zero/one endpoint the single-node config is byte-identical.
     pub(super) fn full_pipeline_config_content() -> String {
-        Self::pipeline_config_content_for(Self::ocsf_mode(), Self::lake_mode())
+        let mut content = Self::pipeline_config_content().to_string();
+        if Self::ocsf_mode() {
+            content.push_str(Self::GENERIC_OCSF_PREPARE_BLOCK);
+        }
+        let endpoints = Self::clickhouse_shard_endpoints();
+        Self::shard_route_clickhouse_sinks(content, &endpoints)
     }
 
-    pub(super) fn pipeline_config_content_for(ocsf: bool, lake: bool) -> String {
-        let mut content = Self::pipeline_config_content().to_string();
-        if lake {
-            let marker = "# =============================================================================\n# ClickHouse Sink\n";
-            let boundary = content
-                .find(marker)
-                .expect("static Vector pipeline lost its ClickHouse sink boundary");
-            content.truncate(boundary);
+    pub(super) fn clickhouse_shard_endpoints() -> Vec<String> {
+        std::env::var("VECTOR_CLICKHOUSE_SHARD_ENDPOINTS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    pub(super) fn shard_route_clickhouse_sinks(
+        mut content: String,
+        endpoints: &[String],
+    ) -> String {
+        if endpoints.len() <= 1 {
+            return content;
         }
-        if ocsf {
-            let generic = if lake {
-                Self::GENERIC_OCSF_PREPARE_BLOCK.replacen(
-                    "inputs = [\"generic_parser\"]",
-                    "inputs = [\"generic_parser\", \"db_parsers_combined\"]",
-                    1,
-                )
-            } else {
-                Self::GENERIC_OCSF_PREPARE_BLOCK.to_string()
+
+        // Snapshot names before rewriting. A top-level sink header has exactly
+        // `sinks.<name>`; nested buffer/request headers contain another dot.
+        let names: Vec<String> = content
+            .lines()
+            .filter_map(|line| {
+                let inner = line.strip_prefix("[sinks.")?.strip_suffix(']')?;
+                (!inner.contains('.')).then(|| inner.to_owned())
+            })
+            .filter(|name| {
+                sink_block(&content, name)
+                    .is_some_and(|(_, _, block)| block.lines().any(|line| line.trim() == "type = \"clickhouse\""))
+            })
+            .collect();
+
+        for name in names {
+            let Some((start, end, block)) = sink_block(&content, &name) else {
+                continue;
             };
-            content.push_str(&generic);
+            let Some(inputs) = block
+                .lines()
+                .find(|line| line.trim_start().starts_with("inputs = "))
+                .map(str::trim)
+            else {
+                continue;
+            };
+            let inputs = inputs.trim_start_matches("inputs = ");
+            let route_name = format!("{name}_shard_route");
+            let mut replacement = format!(
+                "[transforms.{route_name}]\ntype = \"route\"\ninputs = {inputs}\n"
+            );
+            for shard in 0..endpoints.len() {
+                replacement.push_str(&format!(
+                    "route.shard_{shard} = 'mod(to_int!(xxhash(encode_json(.), \"XXH32\")), {}) == {shard}'\n",
+                    endpoints.len()
+                ));
+            }
+            replacement.push('\n');
+
+            for (shard, endpoint) in endpoints.iter().enumerate() {
+                let shard_name = format!("{name}_shard_{shard}");
+                let mut shard_block = block.replace(
+                    &format!("sinks.{name}"),
+                    &format!("sinks.{shard_name}"),
+                );
+                shard_block = shard_block.replacen(
+                    &format!("inputs = {inputs}"),
+                    &format!("inputs = [\"{route_name}.shard_{shard}\"]"),
+                    1,
+                );
+                if let Some(endpoint_line) = shard_block
+                    .lines()
+                    .find(|line| line.trim_start().starts_with("endpoint = "))
+                    .map(str::to_owned)
+                {
+                    shard_block = shard_block.replacen(
+                        &endpoint_line,
+                        &format!("endpoint = \"{endpoint}\""),
+                        1,
+                    );
+                }
+                // Every disk buffer uses the one per-component allocation from
+                // the shared inventory contract. Keeping the expression intact
+                // makes shard expansion consume one declared share per sink.
+                replacement.push_str(&shard_block);
+                if !replacement.ends_with('\n') {
+                    replacement.push('\n');
+                }
+            }
+            content.replace_range(start..end, &replacement);
         }
         content
     }
@@ -2120,13 +2372,12 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
     /// Returns the push enrichment lane config (NAN-1124): per-kind normalize
     /// transforms + dedicated ClickHouse sinks consuming the
     /// `enrichment_router.<kind>` outputs. Single source of truth is the
-    /// immutable legacy template embedded beside this module. The live
-    /// `_enrichment.toml` is a generated runtime artifact and must never be an
-    /// `include_str!` input: a lake-mode API run rewrites that file, and a later
-    /// build would otherwise compile the generated lake output back in as the
-    /// legacy source template.
+    /// committed `_enrichment.toml`, embedded via `include_str!` so it ships in
+    /// the binary and reaches every deployment (dev/compose mounted, Rackspace
+    /// GCS-synced, SaaS dynamic ConfigMap) through the same path as
+    /// `_pipeline.toml`. No drift: the const IS the file.
     pub(super) fn enrichment_lane_content() -> &'static str {
-        include_str!("enrichment_legacy.toml")
+        include_str!("../../../../config/vector/sources/parsers/_enrichment.toml")
     }
 
     /// Write the push enrichment lane config alongside the static pipeline.
@@ -2143,14 +2394,17 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
         enrichment_parsers: &[Parser],
     ) -> Result<(), VectorConfigError> {
         let enrichment_path = self.parsers_dir.join("_enrichment.toml");
-        let content =
-            Self::enrichment_lane_config_for_backend(enrichment_parsers, Self::lake_mode());
+        let content = Self::enrichment_lane_config(enrichment_parsers);
 
         // NAN-1150: deploy-time guardrails — reject a malformed enrichment lane
         // BEFORE Vector reloads, so a bad parser can never corrupt the dict and
         // halt logs ingestion (NAN-1120 class).
         Self::guard_enrichment_lane(enrichment_parsers, &content)?;
 
+        let content = Self::shard_route_clickhouse_sinks(
+            content,
+            &Self::clickhouse_shard_endpoints(),
+        );
         fs::write(&enrichment_path, &content).await?;
         tracing::info!(
             "Generated push enrichment lane config at {} ({} enrichment parser(s))",
@@ -2165,11 +2419,11 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
     /// security checks (`'''` / TOML-header / blocked-function breakout) AND
     /// compile + satisfy the `user_registry` encoding contract (NAN-1123),
     /// (2) `target_table` / `enrich_source` are interpolated into the generated
-    /// TOML/VRL, so they must be safe identifiers, (3) the generated
+    /// TOML/VRL, so they must be safe identifiers (NAN-1197), (3) the generated
     /// lane's component topology must be exactly what the generator intended —
-    /// no injected transform/sink, and (4) the candidate lane TOML
-    /// must not introduce a sink that backpressures the shared ingest upstream
-    /// (NAN-1114/1128). Returns `ValidationFailed` with a clear, parser-named
+    /// no injected transform/sink (NAN-1197), and (4) the candidate lane TOML
+    /// must keep every blocking sink on the dedicated enrichment source rather
+    /// than a shared log source (NAN-1114/1128). Returns `ValidationFailed` with a clear, parser-named
     /// reason on the first violation.
     pub(super) fn guard_enrichment_lane(
         enrichment_parsers: &[Parser],
@@ -2201,20 +2455,6 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
                         p.name
                     )));
                 }
-                if Self::lake_mode()
-                    && !matches!(
-                        table,
-                        "user_registry"
-                            | "nanosiem.user_registry"
-                            | "ip_enrichments"
-                            | "nanosiem.ip_enrichments"
-                    )
-                {
-                    return Err(VectorConfigError::ValidationFailed(format!(
-                        "enrichment parser '{}' targets unsupported lake payload {table:?}",
-                        p.name
-                    )));
-                }
             }
 
             // NAN-1197: `enrich_source` is interpolated into the router VRL
@@ -2223,16 +2463,6 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
                 if !src.is_empty() && !is_safe_enrich_source(src) {
                     return Err(VectorConfigError::ValidationFailed(format!(
                         "enrichment parser '{}' rejected at deploy: unsafe enrich_source {src:?}",
-                        p.name
-                    )));
-                }
-                // NAN-3483: the dead-letter route for sources without a
-                // normalizer owns this name.
-                if super::router::enrichment_route_name(src)
-                    == super::router::UNROUTED_IDENTITY_ROUTE
-                {
-                    return Err(VectorConfigError::ValidationFailed(format!(
-                        "enrichment parser '{}' rejected at deploy: enrich_source {src:?} is reserved",
                         p.name
                     )));
                 }
@@ -2251,21 +2481,31 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
 
         // NAN-1197: defense-in-depth — on the GENERATED path, assert the lane's
         // component topology matches exactly what `generate_enrichment_lane`
-        // emits (only `enrichment_normalize_*` remaps, the dead-letter report,
-        // and the directory / collector-error sinks). Skipped for the trusted committed static fallback (no enabled
+        // emits (only `enrichment_normalize_*` remaps and ClickHouse/blackhole
+        // sinks). Skipped for the trusted committed static fallback (no enabled
         // parsers), whose shape is fixed at build time.
         if enrichment_parsers.iter().any(|p| p.enabled) {
             assert_enrichment_lane_topology(candidate_toml).map_err(|e| {
                 VectorConfigError::ValidationFailed(format!(
-                    "enrichment lane failed topology check: {e}"
+                    "enrichment lane failed topology check (NAN-1197): {e}"
                 ))
             })?;
+        }
+
+        let enrichment_buffer_limit = vector_disk_buffer_contract_value(
+            "VECTOR_DISK_BUFFER_ENRICHMENT_SHARDED_COUNT",
+        );
+        let enrichment_buffer_count = disk_buffer_component_count(candidate_toml);
+        if enrichment_buffer_count > enrichment_buffer_limit {
+            return Err(VectorConfigError::ValidationFailed(format!(
+                "enrichment lane renders {enrichment_buffer_count} disk buffers, exceeding the shared filesystem budget inventory of {enrichment_buffer_limit}; increase the declared inventory and rerun host sizing before deploying this parser"
+            )));
         }
 
         let backpressure = enrichment_lane_backpressure_violations(candidate_toml);
         if !backpressure.is_empty() {
             return Err(VectorConfigError::ValidationFailed(format!(
-                "enrichment lane would backpressure shared ingest: {}",
+                "enrichment lane would backpressure shared ingest (NAN-1114): {}",
                 backpressure.join("; ")
             )));
         }
@@ -2280,250 +2520,35 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
     /// deploys the SAME dynamic lane as startup `deploy_to_vector` — without this
     /// the `/deploy` endpoint promoted the static lane and silently reverted
     /// per-source enrichment parsers.
+    ///
+    /// NAN-4953: this file keeps nano's own `${CLICKHOUSE_*}` references, so it
+    /// cannot be escaped wholesale. Each normalize VRL body is escaped where it
+    /// is embedded ([`Self::normalize_transform_block`]) and line 1 carries
+    /// [`crate::vector_env::ENV_ESCAPED_TENANT_HEADER`], which tells the Vector
+    /// entrypoint not to touch it. A header-less (pre-upgrade) copy gets its
+    /// `'''` VRL bodies escaped by the entrypoint before Vector starts.
     pub(super) fn enrichment_lane_config(enrichment_parsers: &[Parser]) -> String {
-        Self::enrichment_lane_config_for_backend(enrichment_parsers, false)
-    }
-
-    pub(super) fn enrichment_lane_config_for_backend(
-        enrichment_parsers: &[Parser],
-        lake: bool,
-    ) -> String {
         let enabled: Vec<&Parser> = enrichment_parsers.iter().filter(|p| p.enabled).collect();
-        if enabled.is_empty() {
-            Self::static_enrichment_lane(lake)
+        let lane = if enabled.is_empty() {
+            Self::static_enrichment_lane()
         } else {
             // NAN-3483: plus a built-in normalizer for every identity source
             // no enabled parser covers (the router emits the same set).
             let effective = super::router::effective_enrichment_parsers(&enabled);
             let effective: Vec<&Parser> = effective.iter().collect();
-            Self::generate_enrichment_lane_for_backend(&effective, lake)
-        }
+            Self::generate_enrichment_lane(&effective)
+        };
+        format!("{}\n{lane}", crate::vector_env::ENV_ESCAPED_TENANT_HEADER)
     }
-
-    /// Generate the push enrichment lane from deployed enrichment parsers
-    /// (NAN-1149). One `[transforms.enrichment_normalize_<enrich_kind>]` per
-    /// parser (keyed by `enrich_kind`; P1 assumes one parser per kind), each
-    /// feeding a dedicated ClickHouse sink per `target_table`, plus a metered
-    /// dead-letter sink unioning every normalize's `.dropped` output. The sink
-    /// discipline (memory buffer + `drop_newest` + acks off) matches
-    /// `clickhouse_logs` so an enrichment sink can never backpressure the shared
-    /// ingest upstream; the `shared_ingest_source_sinks_must_not_backpressure`
-    /// lint covers this. Shape mirrors the committed `_enrichment.toml` so a
-    /// single identity parser regenerates an equivalent lane.
-    fn generate_enrichment_lane(parsers: &[&Parser]) -> String {
-        Self::generate_enrichment_lane_for_backend(parsers, false)
-    }
-
-    fn generate_enrichment_lane_for_backend(parsers: &[&Parser], lake: bool) -> String {
-        use std::collections::BTreeMap;
-
-        let mut out = String::from(
-            "# =============================================================================\n\
-             # NAN-1149: Push enrichment lane (GENERATED from deployed enrichment parsers)\n\
-             # DO NOT EDIT - regenerated on every parser deploy.\n\
-             # =============================================================================\n\n",
-        );
-
-        // target_table -> normalize transforms feeding its sink.
-        let mut by_table: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        // Lake: identity normalizers feeding the coordinator lines transform.
-        let mut identity_inputs: Vec<String> = Vec::new();
-        let mut dropped_inputs: Vec<String> = Vec::new();
-        let mut seen_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for p in parsers {
-            // NAN-1151: one normalize transform per `enrich_source`, so multiple
-            // sources of the same kind (e.g. `ad` + `entra`, both identity) each
-            // carry their own VRL. The route name + transform suffix go through
-            // the same `enrichment_route_name` the router uses, so the
-            // `enrichment_router.<source>` input always resolves. MUST key on the
-            // same field the router emits routes for (`enrich_source`) — a parser
-            // without one produces neither a route nor a transform here, so a
-            // missing source can't strand a transform on a dangling router input.
-            let source = match p.enrich_source.as_deref().filter(|s| !s.is_empty()) {
-                Some(s) => s,
-                None => {
-                    tracing::warn!(
-                        parser = %p.name,
-                        "enrichment parser has no enrich_source; skipping (no lane route)"
-                    );
-                    continue;
-                }
-            };
-            let route = super::router::enrichment_route_name(source);
-            // Skip duplicate sources rather than emit a duplicate transform name
-            // that would break the Vector reload. NAN-3767: the runner's
-            // envelope route owns `identity_directory` (no router output).
-            if route == super::router::IDENTITY_DIRECTORY_ROUTE
-                || !seen_sources.insert(route.clone())
-            {
-                continue;
-            }
-            let transform = format!("enrichment_normalize_{route}");
-            let vrl = p.normalize_vrl.as_deref().unwrap_or("");
-            let table = p
-                .target_table
-                .as_deref()
-                .unwrap_or("user_registry")
-                .to_string();
-
-            out.push_str(&Self::normalize_transform_block(&transform, &route, vrl));
-
-            by_table
-                .entry(table)
-                .or_default()
-                .push(format!("\"{transform}\""));
-            dropped_inputs.push(format!("\"{transform}.dropped\""));
-        }
-
-        for (table, inputs) in &by_table {
-            if lake {
-                let (sink, path) = match table.as_str() {
-                    "user_registry" | "nanosiem.user_registry" => {
-                        identity_inputs.extend(inputs.iter().cloned());
-                        continue;
-                    }
-                    "ip_enrichments" | "nanosiem.ip_enrichments" => {
-                        ("lake_ip_context", "/v1/ip-context/batch")
-                    }
-                    _ => {
-                        let sink = format!("lake_{}", Self::safe_name(table));
-                        out.push_str(&Self::lake_enrichment_sink(
-                            &sink,
-                            inputs,
-                            "/v1/enrichment/unsupported",
-                        ));
-                        continue;
-                    }
-                };
-                out.push_str(&Self::lake_enrichment_sink(sink, inputs, path));
-                continue;
-            }
-            // Sanitize the sink component id (a db-qualified or hyphenated
-            // target_table would otherwise produce an invalid Vector component
-            // name). `user_registry` is unchanged; the `table =` value stays raw.
-            let sink = format!("clickhouse_{}", Self::safe_name(table));
-            out.push_str(&format!(
-                "[sinks.{sink}]\n\
-                 type = \"clickhouse\"\n\
-                 inputs = [{inputs}]\n\
-                 endpoint = \"${{CLICKHOUSE_URL:-http://clickhouse:8123}}\"\n\
-                 database = \"${{CLICKHOUSE_DATABASE:-nanosiem}}\"\n\
-                 table = \"{table}\"\n\
-                 auth.strategy = \"basic\"\n\
-                 auth.user = \"${{CLICKHOUSE_USER:-nanosiem}}\"\n\
-                 auth.password = \"${{CLICKHOUSE_PASSWORD:-nanosiem}}\"\n\
-                 compression = \"gzip\"\n\
-                 date_time_best_effort = true\n\
-                 skip_unknown_fields = true\n\n\
-                 healthcheck.enabled = false\n\n\
-                 [sinks.{sink}.buffer]\n\
-                 type = \"memory\"\n\
-                 max_events = 50000\n\
-                 when_full = \"drop_newest\"\n\n\
-                 [sinks.{sink}.acknowledgements]\n\
-                 enabled = false\n\n\
-                 [sinks.{sink}.batch]\n\
-                 max_events = 1000\n\
-                 timeout_secs = 5\n\n\
-                 [sinks.{sink}.request]\n\
-                 concurrency = \"adaptive\"\n\
-                 timeout_secs = 60\n\
-                 retry_initial_backoff_secs = 1\n\
-                 retry_max_duration_secs = 60\n\n",
-                inputs = inputs.join(", "),
-            ));
-        }
-
-        if lake {
-            out.push_str(&Self::lake_identity_lane(&identity_inputs));
-            dropped_inputs.extend(Self::lake_identity_dead_letter_inputs(&identity_inputs));
-        }
-        out.push_str(&Self::unrouted_identity_transform_block());
-        dropped_inputs.extend(Self::unrouted_identity_dead_letter_inputs());
-        out.push_str(&Self::dead_letter_block(&dropped_inputs, lake));
-
-        out
-    }
-
-    /// NAN-3767: the lake identity lane. Every identity record reaches the
-    /// lean coordinator through `lake_identity_directory` as an NDJSON line
-    /// of [`IDENTITY_INGEST_PATH`]:
-    /// - `kind: identity_directory` (the connector runner's directory sync):
-    ///   already normalized `stage` / `delta` envelopes, checked by
-    ///   [`IDENTITY_ENVELOPE_TRANSFORM`];
-    /// - `kind: identity` (provider sync, Cribl / HEC push): the per-source
-    ///   normalizers' user_registry rows, turned into `delta` lines of feed
-    ///   `push:<provider>` by [`IDENTITY_LINES_TRANSFORM`].
-    ///
-    /// The sink keeps a memory buffer so its acknowledgement reaches the
-    /// sender only once the coordinator answered (a disk buffer acks on
-    /// write): the runner's 200 from Vector means the rows are staged.
-    fn lake_identity_lane(normalized: &[String]) -> String {
-        let mut out = Self::normalize_transform_block(
-            IDENTITY_ENVELOPE_TRANSFORM,
-            super::router::IDENTITY_DIRECTORY_ROUTE,
-            IDENTITY_ENVELOPE_VRL,
-        );
-        let mut inputs = vec![format!("\"{IDENTITY_ENVELOPE_TRANSFORM}\"")];
-        if !normalized.is_empty() {
-            out.push_str(&format!(
-                "[transforms.{IDENTITY_LINES_TRANSFORM}]\n\
-                 type = \"remap\"\n\
-                 inputs = [{}]\n\
-                 drop_on_abort = true\n\
-                 drop_on_error = true\n\
-                 reroute_dropped = true\n\
-                 source = '''\n{IDENTITY_LINES_VRL}\n'''\n\n",
-                normalized.join(", ")
-            ));
-            inputs.push(format!("\"{IDENTITY_LINES_TRANSFORM}\""));
-        }
-        out.push_str(&format!(
-            "[sinks.lake_identity_directory]\n\
-             type = \"http\"\n\
-             inputs = [{inputs}]\n\
-             uri = \"${{NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-http://127.0.0.1:9}}{IDENTITY_INGEST_PATH}\"\n\
-             method = \"post\"\n\
-             encoding.codec = \"json\"\n\
-             framing.method = \"newline_delimited\"\n\
-             acknowledgements.enabled = true\n\n\
-             [sinks.lake_identity_directory.buffer]\n\
-             type = \"memory\"\n\
-             max_events = 200000\n\
-             when_full = \"block\"\n\n\
-             [sinks.lake_identity_directory.batch]\n\
-             max_bytes = 16777216\n\
-             max_events = 20000\n\
-             timeout_secs = 1\n\n\
-             [sinks.lake_identity_directory.request]\n\
-             concurrency = 1\n\
-             timeout_secs = 600\n\
-             retry_initial_backoff_secs = 1\n\
-             retry_max_duration_secs = 300\n\n\
-             [sinks.lake_identity_directory.request.headers]\n\
-             Authorization = \"Bearer ${{NANO_LAKE_ENRICHMENT_TOKEN:-lake-disabled-lake-disabled}}\"\n\
-             Content-Type = \"application/x-ndjson\"\n\
-             X-Nano-Tenant-ID = \"${{NANO_LAKE_TENANT_ID:-default}}\"\n\n\
-             [sinks.lake_identity_directory.healthcheck]\n\
-             enabled = false\n\n",
-            inputs = inputs.join(", "),
-        ));
-        out
-    }
-
-    fn lake_identity_dead_letter_inputs(normalized: &[String]) -> Vec<String> {
-        let mut out = vec![format!("\"{IDENTITY_ENVELOPE_TRANSFORM}.dropped\"")];
-        if !normalized.is_empty() {
-            out.push(format!("\"{IDENTITY_LINES_TRANSFORM}.dropped\""));
-        }
-        out
-    }
-
 
     /// One per-source normalize remap consuming `enrichment_router.<route>`.
     /// Aborts/errors are rerouted to `.dropped` (the dead-letter sink).
+    ///
+    /// NAN-4953: `vrl` is tenant-authored for an enrichment parser and lands in
+    /// a file Vector env-interpolates, so its `$` are doubled here (Vector reads
+    /// `$$` back as `$`; see [`crate::vector_env`]).
     fn normalize_transform_block(transform: &str, route: &str, vrl: &str) -> String {
+        let vrl = crate::vector_env::escape_fragment(vrl);
         format!(
             "[transforms.{transform}]\n\
              type = \"remap\"\n\
@@ -2580,50 +2605,41 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
 
     /// The lane deployed when no enrichment parser is enabled: the committed
     /// static lane (AD identity + custom ip_context, routed per kind) plus,
-    /// since NAN-3483, a built-in normalizer per other identity source and
-    /// the unrouted-identity dead-letter, all feeding the same directory sink.
-    fn static_enrichment_lane(lake: bool) -> String {
+    /// since NAN-3483, a built-in normalizer per other identity source and the
+    /// unrouted-identity dead-letter, all feeding the same ClickHouse sinks.
+    /// Before NAN-3483 an Okta/Entra/Google/Workday pull with
+    /// no imported parser went to the AD normalizer and every record was
+    /// dead-lettered.
+    pub(super) fn static_enrichment_lane() -> String {
         let builtins = Self::static_builtin_identity_transforms();
         let mut identity_inputs = vec!["\"enrichment_normalize_ad\"".to_string()];
         identity_inputs.extend(builtins.iter().map(|(t, _)| format!("\"{t}\"")));
         let mut dead_letter_inputs = vec![
+            "\"enrichment_ingest_prepare.dropped\"".to_string(),
+            "\"enrichment_router._unmatched\"".to_string(),
+            "\"enrichment_router.ioc\"".to_string(),
+            "\"enrichment_router.asset\"".to_string(),
             "\"enrichment_normalize_ad.dropped\"".to_string(),
             "\"enrichment_normalize_custom.dropped\"".to_string(),
         ];
         dead_letter_inputs.extend(builtins.iter().map(|(t, _)| format!("\"{t}.dropped\"")));
         dead_letter_inputs.extend(Self::unrouted_identity_dead_letter_inputs());
-        if lake {
-            dead_letter_inputs.extend(Self::lake_identity_dead_letter_inputs(&identity_inputs));
-        }
 
         let source = Self::enrichment_lane_content();
-        let mut out = if lake {
-            let marker = "# NAN-1728: `ip_enrichments`";
-            let boundary = source
-                .find(marker)
-                .expect("static enrichment lane lost its sink boundary");
-            let mut out = source[..boundary].to_string();
-            out.push_str(&Self::lake_enrichment_sink(
-                "lake_ip_context",
-                &["\"enrichment_normalize_custom\"".to_string()],
-                "/v1/ip-context/batch",
-            ));
-            out.push_str(&Self::lake_identity_lane(&identity_inputs));
-            out
-        } else {
-            // Committed ClickHouse lane up to its dead-letter sink, with the
-            // user_registry sink fed by every identity normalizer.
-            let dead_letter = "[sinks.enrichment_dead_letter]";
-            let boundary = source
-                .find(dead_letter)
-                .expect("static enrichment lane lost its dead-letter sink");
-            let sink_inputs = "[sinks.clickhouse_user_registry]\ntype = \"clickhouse\"\ninputs = [\"enrichment_normalize_ad\"]";
-            assert_eq!(
-                source[..boundary].matches(sink_inputs).count(),
-                1,
-                "static enrichment lane lost its user_registry sink inputs"
-            );
-            source[..boundary].replacen(
+        let sink_inputs = "[sinks.clickhouse_user_registry]\ntype = \"clickhouse\"\ninputs = [\"enrichment_normalize_ad\"]";
+        assert_eq!(
+            source.matches(sink_inputs).count(),
+            1,
+            "static enrichment lane lost its user_registry sink inputs"
+        );
+        let dead_letter = "[transforms.enrichment_dead_letter_record]\ntype = \"remap\"\ninputs = [\"enrichment_ingest_prepare.dropped\", \"enrichment_router._unmatched\", \"enrichment_router.ioc\", \"enrichment_router.asset\", \"enrichment_normalize_ad.dropped\", \"enrichment_normalize_custom.dropped\"]";
+        assert_eq!(
+            source.matches(dead_letter).count(),
+            1,
+            "static enrichment lane lost its dead-letter sink inputs"
+        );
+        let mut out = source
+            .replacen(
                 sink_inputs,
                 &format!(
                     "[sinks.clickhouse_user_registry]\ntype = \"clickhouse\"\ninputs = [{}]",
@@ -2631,143 +2647,186 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
                 ),
                 1,
             )
-        };
+            .replacen(
+                dead_letter,
+                &format!(
+                    "[transforms.enrichment_dead_letter_record]\ntype = \"remap\"\ninputs = [{}]",
+                    dead_letter_inputs.join(", ")
+                ),
+                1,
+            );
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
         out.push_str(
-            "# NAN-3483: built-in identity normalizers (one per provider source)\n\
+            "\n# NAN-3483: built-in identity normalizers (one per provider source)\n\
              # and the dead-letter for identity sources without one.\n",
         );
         for (_, block) in &builtins {
             out.push_str(block);
         }
         out.push_str(&Self::unrouted_identity_transform_block());
-        out.push_str(&Self::dead_letter_block(&dead_letter_inputs, lake));
         out
     }
 
-    /// NAN-3483: where dead-lettered enrichment records go. They used to land
-    /// in a `blackhole` (`print_interval_secs = 0`), so a lane that dropped
-    /// every record looked exactly like a quiet one. Now each one becomes a
-    /// collector diagnostic (WARN, `error_type = enrichment_dead_letter`, the
-    /// kind / source / provider, never the record's payload) on the existing
-    /// collector-error channel: the coordinator's `/v1/collector-errors/batch`
-    /// on the lake (reads `metadata.level` / `vector.component_*`), the
-    /// `collector_errors` table on ClickHouse (flat `level` / `component_*`
-    /// columns), so the report carries both shapes. The count is
-    /// also Vector's `component_received_events_total{component_id=
-    /// "enrichment_dead_letter"}` on the metrics exporter. Like the 92-metrics
-    /// diagnostics sinks it never backpressures: memory buffer, `drop_newest`,
-    /// no acknowledgements.
-    fn dead_letter_block(dropped_inputs: &[String], lake: bool) -> String {
-        let report = "kind = truncate(to_string(.kind) ?? \"\", 64)\n\
-             src = truncate(to_string(.source) ?? \"\", 128)\n\
-             provider = truncate(to_string(.provider_id) ?? \"\", 128)\n\
-             . = {\n\
-             \x20   \"timestamp\": format_timestamp!(now(), \"%Y-%m-%dT%H:%M:%S%.3fZ\", timezone: \"UTC\"),\n\
-             \x20   \"level\": \"WARN\",\n\
-             \x20   \"metadata\": {\"level\": \"WARN\"},\n\
-             \x20   \"message\": \"nano_enrich \" + kind + \" record from source '\" + src + \"' (provider '\" + provider + \"') was dead-lettered by its normalizer and not applied\",\n\
-             \x20   \"error_code\": \"enrichment_dead_letter\",\n\
-             \x20   \"error_type\": \"enrichment_dead_letter\",\n\
-             \x20   \"stage\": \"processing\",\n\
-             \x20   \"vector\": {\"component_id\": \"enrichment_dead_letter\", \"component_kind\": \"transform\", \"component_type\": \"remap\"},\n\
-             \x20   \"component_id\": \"enrichment_dead_letter\",\n\
-             \x20   \"component_kind\": \"transform\",\n\
-             \x20   \"component_type\": \"remap\",\n\
-             \x20   \"host\": get_hostname() ?? \"\"\n\
-             }";
-        let mut out = format!(
-            "[transforms.enrichment_dead_letter_report]\n\
-             type = \"remap\"\n\
-             inputs = [{}]\n\
-             source = '''\n{report}\n'''\n\n",
-            dropped_inputs.join(", ")
+    /// Generate the push enrichment lane from deployed enrichment parsers
+    /// (NAN-1149). One `[transforms.enrichment_normalize_<enrich_kind>]` per
+    /// parser (keyed by `enrich_kind`; P1 assumes one parser per kind), each
+    /// feeding a dedicated ClickHouse sink per `target_table`, plus a persistent
+    /// dead-letter sink unioning every rejected output. Every sink uses a
+    /// blocking disk buffer and acknowledges at buffer acceptance. The
+    /// dedicated `enrichment_ingest` source keeps that backpressure completely
+    /// separate from shared log ingestion. Shape mirrors the committed
+    /// `_enrichment.toml` so a single identity parser regenerates an equivalent
+    /// lane.
+    fn generate_enrichment_lane(parsers: &[&Parser]) -> String {
+        use std::collections::BTreeMap;
+
+        let mut out = String::from(
+            "# =============================================================================\n\
+             # NAN-1149: Push enrichment lane (GENERATED from deployed enrichment parsers)\n\
+             # DO NOT EDIT - regenerated on every parser deploy.\n\
+             # =============================================================================\n\n",
         );
-        if lake {
-            out.push_str(
-                "[sinks.enrichment_dead_letter]\n\
-                 type = \"http\"\n\
-                 inputs = [\"enrichment_dead_letter_report\"]\n\
-                 uri = \"${NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-http://127.0.0.1:9}/v1/collector-errors/batch\"\n\
-                 method = \"post\"\n\
-                 encoding.codec = \"json\"\n\
-                 framing.method = \"newline_delimited\"\n\
-                 healthcheck.enabled = false\n\n\
-                 [sinks.enrichment_dead_letter.buffer]\n\
-                 type = \"memory\"\n\
-                 max_events = 1000\n\
-                 when_full = \"drop_newest\"\n\n\
-                 [sinks.enrichment_dead_letter.acknowledgements]\n\
-                 enabled = false\n\n\
-                 [sinks.enrichment_dead_letter.batch]\n\
-                 max_events = 1000\n\
-                 timeout_secs = 2\n\n\
-                 [sinks.enrichment_dead_letter.request]\n\
-                 concurrency = 1\n\
-                 timeout_secs = 10\n\
-                 retry_initial_backoff_secs = 1\n\
-                 retry_max_duration_secs = 30\n\n\
-                 [sinks.enrichment_dead_letter.request.headers]\n\
-                 Authorization = \"Bearer ${NANO_LAKE_ENRICHMENT_TOKEN:-lake-disabled-lake-disabled}\"\n\
-                 Content-Type = \"application/x-ndjson\"\n\
-                 X-Nano-Tenant-ID = \"${NANO_LAKE_TENANT_ID:-default}\"\n",
-            );
-        } else {
-            out.push_str(
-                "[sinks.enrichment_dead_letter]\n\
+
+        // target_table -> normalize transforms feeding its sink.
+        let mut by_table: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut dropped_inputs: Vec<String> = vec![
+            "\"enrichment_ingest_prepare.dropped\"".to_string(),
+            "\"enrichment_router._unmatched\"".to_string(),
+        ];
+        let mut seen_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for p in parsers {
+            // NAN-1151: one normalize transform per `enrich_source`, so multiple
+            // sources of the same kind (e.g. `ad` + `entra`, both identity) each
+            // carry their own VRL. The route name + transform suffix go through
+            // the same `enrichment_route_name` the router uses, so the
+            // `enrichment_router.<source>` input always resolves. MUST key on the
+            // same field the router emits routes for (`enrich_source`) — a parser
+            // without one produces neither a route nor a transform here, so a
+            // missing source can't strand a transform on a dangling router input.
+            let source = match p.enrich_source.as_deref().filter(|s| !s.is_empty()) {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(
+                        parser = %p.name,
+                        "enrichment parser has no enrich_source; skipping (no lane route)"
+                    );
+                    continue;
+                }
+            };
+            let route = super::router::enrichment_route_name(source);
+            // Skip duplicate sources rather than emit a duplicate transform name
+            // that would break the Vector reload.
+            if !seen_sources.insert(route.clone()) {
+                continue;
+            }
+            let transform = format!("enrichment_normalize_{route}");
+            let vrl = p.normalize_vrl.as_deref().unwrap_or("");
+            let table = p
+                .target_table
+                .as_deref()
+                .unwrap_or("user_registry")
+                .to_string();
+
+            out.push_str(&Self::normalize_transform_block(&transform, &route, vrl));
+
+            by_table
+                .entry(table)
+                .or_default()
+                .push(format!("\"{transform}\""));
+            dropped_inputs.push(format!("\"{transform}.dropped\""));
+        }
+
+        for (table, inputs) in &by_table {
+            // Sanitize the sink component id (a db-qualified or hyphenated
+            // target_table would otherwise produce an invalid Vector component
+            // name). `user_registry` is unchanged; the `table =` value stays raw.
+            let sink = format!("clickhouse_{}", Self::safe_name(table));
+            out.push_str(&format!(
+                "[sinks.{sink}]\n\
                  type = \"clickhouse\"\n\
-                 inputs = [\"enrichment_dead_letter_report\"]\n\
-                 endpoint = \"${CLICKHOUSE_URL:-http://clickhouse:8123}\"\n\
-                 database = \"${CLICKHOUSE_DATABASE:-nanosiem}\"\n\
-                 table = \"${CLICKHOUSE_COLLECTOR_ERRORS_TABLE:-collector_errors}\"\n\
+                 inputs = [{inputs}]\n\
+                 endpoint = \"${{CLICKHOUSE_URL:-http://clickhouse:8123}}\"\n\
+                 database = \"${{CLICKHOUSE_DATABASE:-nanosiem}}\"\n\
+                 table = \"{table}\"\n\
                  auth.strategy = \"basic\"\n\
-                 auth.user = \"${CLICKHOUSE_USER:-nanosiem}\"\n\
-                 auth.password = \"${CLICKHOUSE_PASSWORD:-nanosiem}\"\n\
+                 auth.user = \"${{CLICKHOUSE_USER:-nanosiem}}\"\n\
+                 auth.password = \"${{CLICKHOUSE_PASSWORD:-nanosiem}}\"\n\
                  compression = \"gzip\"\n\
                  date_time_best_effort = true\n\
-                 skip_unknown_fields = true\n\
-                 healthcheck.enabled = false\n\n\
-                 [sinks.enrichment_dead_letter.buffer]\n\
-                 type = \"memory\"\n\
+                 skip_unknown_fields = true\n\n\
+                 [sinks.{sink}.buffer]\n\
+                 type = \"disk\"\n\
+                 max_size = ${{VECTOR_DISK_BUFFER_MAX_BYTES:-268435488}}\n\
+                 when_full = \"block\"\n\n\
+                 [sinks.{sink}.acknowledgements]\n\
+                 enabled = false\n\n\
+                 [sinks.{sink}.batch]\n\
                  max_events = 1000\n\
-                 when_full = \"drop_newest\"\n\n\
-                 [sinks.enrichment_dead_letter.acknowledgements]\n\
-                 enabled = false\n",
-            );
+                 timeout_secs = 5\n\n\
+                 [sinks.{sink}.request]\n\
+                 concurrency = ${{VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}}\n\
+                 timeout_secs = 60\n\
+                 retry_initial_backoff_secs = 1\n\
+                 retry_max_duration_secs = 60\n\n",
+                inputs = inputs.join(", "),
+            ));
         }
-        out
-    }
 
-    fn lake_enrichment_sink(sink: &str, inputs: &[String], path: &str) -> String {
-        format!(
-            "[sinks.{sink}]\n\
-             type = \"http\"\n\
-             inputs = [{inputs}]\n\
-             uri = \"${{NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-http://127.0.0.1:9}}{path}\"\n\
-             method = \"post\"\n\
-             encoding.codec = \"json\"\n\
-             framing.method = \"newline_delimited\"\n\
-             acknowledgements.enabled = true\n\n\
-             [sinks.{sink}.buffer]\n\
+        // NAN-3483: identity records whose source has no normalizer.
+        out.push_str(&Self::unrouted_identity_transform_block());
+        dropped_inputs.extend(Self::unrouted_identity_dead_letter_inputs());
+        out.push_str(&format!(
+            "[transforms.enrichment_dead_letter_record]\n\
+             type = \"remap\"\n\
+             inputs = [{}]\n\
+             source = '''\n\
+             raw_content = encode_json(.)\n\
+             source_info = encode_json({{\n\
+                 \"source\": to_string(.source) ?? \"\",\n\
+                 \"kind\": to_string(.kind) ?? \"\"\n\
+             }})\n\
+             . = {{\n\
+                 \"id\": uuid_v7(),\n\
+                 \"timestamp\": now(),\n\
+                 \"error_type\": \"enrichment_dead_letter\",\n\
+                 \"error_message\": \"push-enrichment record rejected by decoding, routing, or normalization\",\n\
+                 \"raw_content\": raw_content,\n\
+                 \"source_info\": source_info\n\
+             }}\n\
+             '''\n\n\
+             [sinks.enrichment_dead_letter]\n\
+             type = \"clickhouse\"\n\
+             inputs = [\"enrichment_dead_letter_record\"]\n\
+             endpoint = \"${{CLICKHOUSE_URL:-http://clickhouse:8123}}\"\n\
+             database = \"${{CLICKHOUSE_DATABASE:-nanosiem}}\"\n\
+             table = \"ingestion_errors\"\n\
+             auth.strategy = \"basic\"\n\
+             auth.user = \"${{CLICKHOUSE_USER:-nanosiem}}\"\n\
+             auth.password = \"${{CLICKHOUSE_PASSWORD:-nanosiem}}\"\n\
+             compression = \"gzip\"\n\
+             date_time_best_effort = true\n\
+             skip_unknown_fields = true\n\n\
+             [sinks.enrichment_dead_letter.buffer]\n\
              type = \"disk\"\n\
-             max_size = 1073741824\n\
+             max_size = ${{VECTOR_DISK_BUFFER_MAX_BYTES:-{VECTOR_DISK_BUFFER_MIN_BYTES}}}\n\
              when_full = \"block\"\n\n\
-             [sinks.{sink}.batch]\n\
-             max_bytes = 33554432\n\
-             max_events = 100000\n\
-             timeout_secs = 2\n\n\
-             [sinks.{sink}.request]\n\
-             concurrency = 1\n\
-             timeout_secs = 300\n\
+             [sinks.enrichment_dead_letter.acknowledgements]\n\
+             enabled = false\n\n\
+             [sinks.enrichment_dead_letter.batch]\n\
+             max_events = 1000\n\
+             timeout_secs = 5\n\n\
+             [sinks.enrichment_dead_letter.request]\n\
+             concurrency = ${{VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY:-6}}\n\
+             timeout_secs = 60\n\
              retry_initial_backoff_secs = 1\n\
-             retry_max_duration_secs = 3600\n\n\
-             [sinks.{sink}.request.headers]\n\
-             Authorization = \"Bearer ${{NANO_LAKE_ENRICHMENT_TOKEN:-lake-disabled-lake-disabled}}\"\n\
-             Content-Type = \"application/x-ndjson\"\n\
-             X-Nano-Tenant-ID = \"${{NANO_LAKE_TENANT_ID:-default}}\"\n\n\
-             [sinks.{sink}.healthcheck]\n\
-             enabled = false\n\n",
-            inputs = inputs.join(", "),
-        )
+             retry_max_duration_secs = 60\n",
+            dropped_inputs.join(", ")
+        ));
+
+        out
     }
 
     /// Send Vector a reload signal, best effort.
@@ -2778,62 +2837,8 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
     /// Vector reloads from its own `--watch-config` watcher. `None` therefore
     /// is not a failure on its own; it only becomes one when nothing
     /// acknowledges the reload either (see [`reload_outcome`]).
-    async fn deliver_reload_signal(&self) -> Option<&'static str> {
-        // Method 1: Docker exec (for containerized Vector without --watch-config)
-        let container_name = std::env::var("VECTOR_CONTAINER_NAME")
-            .unwrap_or_else(|_| "nanosiem-vector".to_string());
-
-        let mut reload_cmd = Command::new("docker");
-        reload_cmd.args(["exec", &container_name, "pkill", "-HUP", "vector"]);
-        let docker_result = run_bounded(
-            reload_cmd,
-            std::time::Duration::from_secs(15),
-            "docker exec pkill -HUP vector (reload)",
-        )
-        .await;
-
-        if let Ok(output) = docker_result {
-            if output.status.success() {
-                tracing::info!("Sent SIGHUP to Vector via docker exec");
-                return Some("docker exec SIGHUP");
-            }
-            // Docker exec failed - Vector might be using --watch-config or not in Docker
-            tracing::debug!(
-                "docker exec failed (Vector may use --watch-config or not be in Docker): {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        // Method 2: Direct SIGHUP (for non-containerized Vector without --watch-config)
-        #[cfg(unix)]
-        {
-            // NAN-2305: this one was missed by the NAN-2297 sweep that put every
-            // other deploy-time subprocess under a deadline. It runs while the
-            // shared deploy mutex is held, so a `pkill` that never returns (a
-            // wedged process table, an unkillable target in uninterruptible
-            // sleep) stops every deploy in the process until restart.
-            let mut pkill = Command::new("pkill");
-            pkill.args(["-HUP", "vector"]);
-            let pkill_result = run_bounded(
-                pkill,
-                std::time::Duration::from_secs(5),
-                "pkill -HUP vector (reload)",
-            )
-            .await;
-
-            if let Ok(output) = pkill_result {
-                if output.status.success() {
-                    tracing::info!("Sent SIGHUP to local Vector process");
-                    return Some("local SIGHUP");
-                }
-            }
-        }
-
-        tracing::debug!(
-            "No explicit reload method succeeded — relying on Vector's config watcher, which the \
-             acknowledgement check below will confirm or deny"
-        );
-        None
+    async fn deliver_reload_signal(&self) -> Result<&'static str, String> {
+        deliver_reload_signal().await
     }
 
     /// Signal Vector to reload its configuration and confirm that it did.
@@ -2845,7 +2850,32 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
     /// The verdict now comes from Vector itself — see [`ReloadCounters`] for the
     /// protocol and [`reload_outcome`] for how the cases are graded.
     pub async fn reload_vector(&self) -> Result<(), VectorConfigError> {
+        self.reload_vector_graded().await.1
+    }
+
+    /// [`Self::reload_vector`] plus the raw acknowledgement, so a caller can
+    /// tell a definitive refusal ([`ReloadAck::Rejected`]: roll back) from an
+    /// unconfirmed reload (Vector down or slow: keep what was written).
+    ///
+    /// NAN-4952: where Vector reads the tree the api writes (the shared-volume
+    /// topology, see [`activation_marker_enabled`]) this uses NAN-4936's
+    /// correlated activation marker: a uniquely named component is written next
+    /// to the change, and only a topology that contains THIS change can run it.
+    /// Parser deploys used to grade the global reload counters only, which a
+    /// concurrent unrelated reload (a source-config deploy, the watcher picking
+    /// up an earlier write) can satisfy or spoil. The marker is written after
+    /// the baseline is taken, so a reload the watcher already attempted on the
+    /// promoted files does not count either way: only the marker's reload does.
+    async fn reload_vector_graded(&self) -> (ReloadAck, Result<(), VectorConfigError>) {
         let probe = ReloadAckProbe::from_env();
+        let marker = activation_marker_enabled().then(|| ActivationMarker {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            path: self
+                .config_dir
+                .join("sources")
+                .join("configs")
+                .join(ACTIVATION_MARKER_FILE),
+        });
 
         // Snapshot BEFORE anything else, including the filesystem-sync sleep.
         // The config is already on disk by the time this is called and a
@@ -2861,20 +2891,38 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
             None => None,
         };
 
+        // The marker goes in only once a baseline exists to compare against.
+        let marker = match (marker, before) {
+            (Some(marker), Some(_)) => match write_marker(&marker).await {
+                Ok(()) => Some(marker),
+                Err(error) => {
+                    tracing::warn!(%error, "could not write the activation marker; grading this reload by the global counters");
+                    None
+                }
+            },
+            _ => None,
+        };
+
         // Give the filesystem a moment to sync (helps with Docker volume mounts)
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let delivered = self.deliver_reload_signal().await;
+        let delivery = self.deliver_reload_signal().await;
 
-        let ack = match (probe.as_ref(), before) {
-            (Some(probe), Some(before)) => probe.await_ack(before).await,
+        let ack = match (probe.as_ref(), before, marker.as_ref()) {
+            (Some(probe), Some(before), Some(marker)) => {
+                probe.await_marker(before, &marker.component_id()).await
+            }
+            (Some(probe), Some(before), None) => probe.await_ack(before).await,
             // Configured but unreadable: no baseline means no comparison, and a
             // missing baseline must not be read as a missing reload.
-            (Some(_), None) => ReloadAck::Unverifiable,
-            (None, _) => ReloadAck::VerificationDisabled,
+            (Some(_), None, _) => ReloadAck::Unverifiable,
+            (None, _, _) => ReloadAck::VerificationDisabled,
         };
 
-        reload_outcome(delivered, ack)
+        (
+            ack,
+            with_delivery_reason(reload_outcome(delivery.as_ref().ok().copied(), ack), &delivery),
+        )
     }
 
     /// Deploy parsers and reload Vector (serialized via deploy lock)
@@ -2893,11 +2941,57 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
     /// active tree (log-source deletion, NAN-2305) drive `deploy_parsers` and
     /// `reload_vector` themselves under a [`Self::lock_deploys`] guard — the
     /// mutex is not reentrant, so this wrapper would deadlock there.
+    ///
+    /// NAN-4952: no longer without a way back. The active tree is snapshotted
+    /// first; a write that fails partway, or a config Vector definitively
+    /// REFUSES, is restored from that snapshot, so the rejected files never stay
+    /// in the watched directory to poison every later reload. An unconfirmed
+    /// reload (Vector down or still starting, e.g. at boot) keeps the new tree:
+    /// it may well be loaded, and reverting it would undo upgrades such as the
+    /// NAN-4953 re-render.
     pub async fn deploy_and_reload(&self, parsers: &[Parser]) -> Result<(), VectorConfigError> {
-        let _guard = self.deploy_lock.lock().await;
-        self.deploy_parsers(parsers).await?;
-        self.reload_vector().await?;
-        Ok(())
+        let _guard = self.lock_deploys().await;
+        let backup = match self.backup_current().await {
+            Ok(generation) => Some(generation),
+            Err(error) => {
+                tracing::warn!(%error, "could not snapshot the active Vector config; this deploy cannot roll back");
+                None
+            }
+        };
+        if let Err(error) = self.deploy_parsers(parsers).await {
+            self.restore_after_failed_deploy(backup.as_ref(), false).await;
+            return Err(error);
+        }
+        let (ack, result) = self.reload_vector_graded().await;
+        if result.is_err() && ack == ReloadAck::Rejected {
+            self.restore_after_failed_deploy(backup.as_ref(), true).await;
+        }
+        result
+    }
+
+    /// Put the snapshot taken for this attempt back (and reload Vector onto it
+    /// when it was signalled). Best effort and loud: the caller already returns
+    /// the deploy's own error.
+    async fn restore_after_failed_deploy(
+        &self,
+        backup: Option<&super::backup::BackupGeneration>,
+        reload: bool,
+    ) {
+        let Some(backup) = backup else {
+            tracing::error!("deploy failed and no snapshot was taken; the active Vector config was NOT rolled back");
+            return;
+        };
+        match self.restore_backup(backup).await {
+            Ok(()) => {
+                tracing::warn!("deploy failed; restored the previous Vector config");
+                if reload {
+                    if let Err(error) = self.reload_vector().await {
+                        tracing::error!(%error, "reload after restoring the previous Vector config failed");
+                    }
+                }
+            }
+            Err(error) => tracing::error!(%error, "deploy failed and restoring the previous Vector config also failed"),
+        }
     }
 
     /// Hold the deploy mutex across a caller-owned sequence.
@@ -2911,15 +3005,18 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
     /// Returns an owned guard so callers can hold it across their whole
     /// sequence. The mutex is not reentrant: anything called while holding this
     /// must be a `*_locked` variant, never the public self-locking wrapper.
-    pub async fn lock_deploys(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.deploy_lock.clone().lock_owned().await
+    ///
+    /// NAN-4953: also holds the cross-process config-dir lock shared with the
+    /// Vector entrypoint's migration (see `config_lock`).
+    pub async fn lock_deploys(&self) -> super::config_lock::DeployGuard {
+        super::config_lock::DeployGuard::acquire(self.deploy_lock.clone(), &self.config_dir).await
     }
 
     /// Render a complete parser tree without signaling a live Vector process.
     /// Used by the DB-backed publication reconciler, which renders into an
     /// isolated directory before the revision CAS makes it visible.
     pub async fn render_parsers(&self, parsers: &[Parser]) -> Result<(), VectorConfigError> {
-        let _guard = self.deploy_lock.lock().await;
+        let _guard = self.lock_deploys().await;
         self.deploy_parsers(parsers).await
     }
 
@@ -2978,7 +3075,7 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
             std::time::Duration::from_secs(10),
             "docker exec pgrep vector (health)",
         )
-        .await
+            .await
         {
             if output.status.success() {
                 return true;
@@ -3152,6 +3249,22 @@ if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
 #[cfg(test)]
 mod deletion_tests;
 #[cfg(test)]
+mod future_timestamp_tests;
+#[cfg(test)]
 mod reload_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod credential_header_tests;
+#[cfg(test)]
+mod transport_header_tests;
+#[cfg(test)]
+mod render_contract_tests;
+#[cfg(test)]
+mod route_prune_tests;
+#[cfg(test)]
+mod hec_ack_contract_tests;
+#[cfg(test)]
+mod http_durability_contract_tests;
+#[cfg(test)]
+mod buffer_budget_contract_tests;

@@ -50,7 +50,7 @@ pub async fn acquire_rule_runtime_lock(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut backoff = std::time::Duration::from_millis(20);
     loop {
-        let mut connection = crate::db::pooler::session_connection(pool).await?;
+        let mut connection = pool.acquire().await?;
         // Set this before the query: cancellation after PostgreSQL grants the
         // lock must close the session instead of returning it to the pool.
         connection.close_on_drop();
@@ -874,8 +874,6 @@ mod tests {
             realtime_enabled: false,
             detection_mode: DetectionMode::RealTime,
             materialized_view_name: None,
-            near_real_time_interval_seconds: None,
-            execution_mode: None,
             risk_score: Some(75),
             risk_entity_field: Some("src_ip".to_string()),
             risk_modifiers: sqlx::types::Json(vec![]),
@@ -1081,8 +1079,8 @@ mod tests {
     fn test_realtime_where_matches_canonical() {
         for q in [
             "process_name=\"Mimikatz\"",                         // case folding
-            "process_name=/mimikatz/",                           // regex -> (?i)/iLike
-            "command_line=\"*powershell*\"",                     // wildcard -> iLike
+            "process_name=/mimikatz/",                           // regex -> lower() LIKE
+            "command_line=\"*powershell*\"",                     // wildcard -> lower() LIKE
             "src_host=\"dc01\"",                                 // FQDN expansion
             "dest_ip=\"192.0.2.1\"",                             // IP equality
             "dest_port=443",                                     // numeric equality

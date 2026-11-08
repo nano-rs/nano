@@ -202,8 +202,6 @@ function RoleDetailView({
   onDelete,
 }: RoleDetailViewProps) {
   const { hasPermission } = useAuth();
-  // Hosted-shared tenants create their own custom roles since NAN-2361
-  // wave 5; the platform's system roles stay read-only (`is_system`).
   const canEdit = hasPermission('roles:edit');
   const canCreate = hasPermission('roles:create');
   const canDelete = hasPermission('roles:delete');

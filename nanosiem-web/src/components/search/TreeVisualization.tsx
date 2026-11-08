@@ -22,9 +22,9 @@ import {
   Share2,
   X,
 } from 'lucide-react';
-import { atPath, firstStringAt, firstBoolAt } from '@/lib/row-path';
 import { cn } from '@/lib/utils';
-import { parseTimestampAsUTC } from '@/lib/date-utils';
+import { SEMANTIC_FIELDS } from '@/lib/schema-fields';
+import { parseTimestampAsUTC } from '@/lib/parse-timestamp-utc';
 
 // ─────────────────────────── public types ───────────────────────────
 
@@ -181,8 +181,6 @@ interface DisplayNode {
   isRare: boolean;
   signed?: boolean;
   signer?: string;
-  /** Whether the event carried ANY code-signing data — distinct from `signed`. */
-  signatureCollected: boolean;
   ts?: string;
   tsDate?: string;
   flags: string[];
@@ -193,32 +191,26 @@ function derive(node: TreeNode, preset: Preset): DisplayNode {
   const r = node._data;
   const name = typeof node.label === 'string' ? node.label : JSON.stringify(node.label ?? node.id);
 
-  // Lookup key lists union the UDM names with their OCSF equivalents
-  // (NAN-1241). NAN-2361: they resolve through `firstStringAt`, not a flat
-  // `row[k]`.
-  //
-  // The dotted OCSF entries were added on the assumption that they would
-  // "let user/cmd/hash nodes populate", but a full-event row is NESTED, so a
-  // flat lookup of `actor.user.name` found nothing and every one of them was
-  // dead. Verified against a live ProcessCreate row: user and cmd resolve only
-  // nested, and `hashes` is an ARRAY of {algorithm_id, value} so it needs the
-  // `.value` leaf. UDM rows are flat and keep resolving on the first branch.
+  // Lookup key lists union the UDM names with their OCSF promoted-column
+  // equivalents (NAN-1241). UDM rows never carry the dotted OCSF keys, so the
+  // extra entries are inert under UDM (firstString skips absent keys → output
+  // byte-identical); under OCSF they let user/cmd/hash/signer nodes populate.
   const pid = preset === 'process'
-    ? firstStringAt(r, ['pid', 'process_id', 'ProcessId', 'process.pid', 'actor.process.pid'])
+    ? firstString(r, ['pid', 'process_id', 'ProcessId', 'actor.process.pid'])
     : undefined;
 
-  const user = firstStringAt(r, [
+  const user = firstString(r, [
     'user', 'user_name', 'username', 'target_user', 'process_user',
     'actor.user.name', 'user.name',
   ]);
 
   const cmd = node.detail
-    ?? firstStringAt(r, [
+    ?? firstString(r, [
       'command_line', 'CommandLine', 'cmdline', 'url', 'http_url',
-      'process.cmd_line', 'actor.process.cmd_line', 'url.url_string',
+      'actor.process.cmd_line', 'process.cmd_line', 'url.url_string',
     ]);
 
-  const hashRaw = firstStringAt(r, [
+  const hashRaw = firstString(r, [
     'process_hash',
     'file_hash',
     'image_hash',
@@ -227,59 +219,36 @@ function derive(node: TreeNode, preset: Preset): DisplayNode {
     'md5',
     'MD5',
     'sha1',
-    // Own binary before the parent's, and the array leaf rather than the array.
-    'process.file.hashes.value',
-    'file.hashes.value',
+    // Promoted OCSF hash columns (NAN-4903 field map), then the nested objects.
+    ...SEMANTIC_FIELDS.processHash.ocsf,
+    ...SEMANTIC_FIELDS.fileHash.ocsf,
     'actor.process.file.hashes.value',
+    'actor.process.file.hashes',
+    'process.file.hashes',
+    'file.hashes',
   ]);
 
   const prevHostCount = node.prevalence?.host_count;
   const isRare = !!(node.prevalence?.is_rare);
 
-  // OCSF puts code signing in a PLURAL `signatures[]` array hanging off the
-  // relevant file object, with the signer in `developer_uid` — not in a
-  // singular `signature` object with a `certificate.subject`. The old candidate
-  // lists matched neither the shape nor the leaf names, and were flat-only
-  // besides, so this row was structurally incapable of resolving under OCSF.
-  //
-  // `process.file` is the node's OWN binary; `actor.process.file` is its
-  // PARENT's; `module.file` is the loaded image on ImageLoad rows. Own-binary
-  // first — attributing the parent's signature to the child would be worse than
-  // showing nothing.
-  const SIGNATURE_OBJECTS = [
-    'process.file',
-    'file',
-    'module.file',
-    'actor.process.file',
-  ];
-  const signatureStatePaths = SIGNATURE_OBJECTS.flatMap((base) => [
-    `${base}.signatures.state`,
-    `${base}.signature.state`,
+  const signed = firstBool(r, [
+    'process_signed',
+    'file_signed',
+    'image_signed',
+    'signature_verified',
+    'signed',
+    'actor.process.file.signature.state',
+    'file.signature.state',
   ]);
-  const signerPaths = SIGNATURE_OBJECTS.flatMap((base) => [
-    `${base}.signatures.developer_uid`,
-    `${base}.signatures.certificate.subject`,
-    `${base}.signature.developer_uid`,
-    `${base}.signature.certificate.subject`,
+  const signer = firstString(r, [
+    'process_signer',
+    'file_signer',
+    'image_signer',
+    'signature_subject',
+    'signer',
+    'actor.process.file.signature.certificate.subject',
+    'file.signature.certificate.subject',
   ]);
-
-  const signed =
-    firstBool(r, ['process_signed', 'file_signed', 'image_signed', 'signature_verified', 'signed']) ??
-    // OCSF `state` is a verdict string ("Valid"/"Expired"/"Untrusted"/…).
-    // Unrecognised verdicts stay undefined ("collected but not a clean
-    // yes/no") rather than being reported as unsigned.
-    firstBoolAt(r, signatureStatePaths);
-  const signer =
-    firstString(r, ['process_signer', 'file_signer', 'image_signer', 'signature_subject', 'signer']) ??
-    firstStringAt(r, signerPaths);
-  // Distinguish "not signed" from "never collected". Sysmon emits signature
-  // fields only on ImageLoad by default, so ProcessCreate rows — the ones that
-  // become tree nodes — legitimately carry nothing. Rendering that as an empty
-  // dash alongside genuine unsigned binaries invites the wrong read.
-  const signatureCollected =
-    signed !== undefined ||
-    signer !== undefined ||
-    signatureStatePaths.some((p) => atPath(r, p) != null);
 
   const ts = formatUtcTime(r?.timestamp ?? r?.event_time ?? r?.utc_time);
   const tsDate = formatUtcDate(r?.timestamp ?? r?.event_time ?? r?.utc_time);
@@ -307,7 +276,6 @@ function derive(node: TreeNode, preset: Preset): DisplayNode {
     isRare,
     signed,
     signer,
-    signatureCollected,
     ts,
     tsDate,
     flags,
@@ -697,23 +665,8 @@ function TreeDetail({
                 <AlertTriangle className="w-[11px] h-[11px]" />
                 Unsigned
               </span>
-            ) : display.signatureCollected ? (
-              // Signature data exists but its verdict is not a clean yes/no
-              // (Expired, Untrusted, Revoked, …). Show the verdict rather than
-              // rounding it to signed or unsigned.
-              <span className="inline-flex items-center gap-1.5 text-foreground">
-                <FileSignature className="w-[11px] h-[11px] text-muted-foreground" />
-                {display.signer ?? 'Present'}
-                <span className="text-muted-foreground/70">(unverified)</span>
-              </span>
             ) : (
-              // NOT the same as unsigned. Sysmon emits signature fields only on
-              // ImageLoad by default, so ProcessCreate rows — exactly the ones
-              // that become tree nodes — carry none. A bare dash next to real
-              // unsigned binaries reads as "we checked and it is fine".
-              <span className="text-muted-foreground/70" title="No code-signing data on this event">
-                not collected
-              </span>
+              <span className="text-muted-foreground/70">—</span>
             )}
           </DetailRow>
           {display.cmd && (

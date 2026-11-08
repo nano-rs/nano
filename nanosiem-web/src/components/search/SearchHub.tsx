@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { authenticatedFetch } from '@/lib/authenticated-fetch';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useUserPreferences } from '@/contexts/UserPreferencesContext';
@@ -82,17 +83,9 @@ import {
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useViewPreference } from '@/hooks/use-view-preference';
-import { getAccessToken } from '@/lib/auth-token';
 import { useIsMobile } from '@/hooks/use-mobile';
-import { requestCredentials } from '@/lib/request-credentials';
 
-function getAuthHeaders(): HeadersInit {
-  const token = getAccessToken();
-  if (token) {
-    return { 'Authorization': `Bearer ${token}` };
-  }
-  return {};
-}
+
 
 // localStorage keys
 const STORAGE_KEYS = {
@@ -356,10 +349,7 @@ export function SearchHub({
       const params = new URLSearchParams();
       if (searchTerm) params.set('search', searchTerm);
       if (selectedCategory) params.set('category', selectedCategory);
-      const response = await fetch(`${API_BASE}/api/query-library?${params}`, {
-        headers: getAuthHeaders(),
-        credentials: requestCredentials('/api/query-library', getAuthHeaders()),
-      });
+      const response = await authenticatedFetch('/api/query-library', `${API_BASE}/api/query-library?${params}`);
       if (response.ok) {
         const data = await response.json();
         setQueries(data.queries || []);
@@ -374,10 +364,7 @@ export function SearchHub({
   // Fetch categories
   const fetchCategories = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/api/query-library/categories`, {
-        headers: getAuthHeaders(),
-        credentials: requestCredentials('/api/query-library/categories', getAuthHeaders()),
-      });
+      const response = await authenticatedFetch('/api/query-library/categories', `${API_BASE}/api/query-library/categories`);
       if (response.ok) {
         const data = await response.json();
         setCategories(data.categories || []);

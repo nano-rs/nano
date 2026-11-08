@@ -28,6 +28,7 @@
  */
 
 import { useMemo, useState } from 'react';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Bell,
@@ -50,7 +51,6 @@ import { useToast } from '@/hooks/use-toast';
 import { Markdown } from '@/components/ui/markdown';
 import { SystemHealthEventsPanel } from '@/components/system-health/SystemHealthEventsPanel';
 import { LogSourceHealthList } from '@/components/log-sources/LogSourceHealthChart';
-import { useSharedTenant } from '@/hooks/use-shared-tenant';
 import {
   Popover,
   PopoverContent,
@@ -59,7 +59,7 @@ import {
 import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { isPlaceholderDimensionDetail } from '@/lib/siem-health-placeholders';
-import { api, ApiClientError } from '@/lib/api';
+import { api } from '@/lib/api';
 import type {
   CollectedMetrics,
   FindingSuppression,
@@ -67,6 +67,7 @@ import type {
   SiemHealthReport,
 } from '@/lib/api/siem-health';
 import { cn } from '@/lib/utils';
+import { formatBytes } from '@/lib/date-utils';
 
 /* ============================================================================
    TONE / TOKENS
@@ -777,6 +778,7 @@ function SuppressFindingButton({
   const [open, setOpen] = useState(false);
   const [reason, setReason] = useState('');
   const aiAuthored = useAiAuthored();
+  const srcIpField = useSchemaFieldMap().field('srcIp');
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -802,7 +804,7 @@ function SuppressFindingButton({
         <textarea
           value={reason}
           onChange={(e) => setReason(e.target.value)}
-          placeholder="e.g. windows_sysmon process events legitimately don't have src_ip"
+          placeholder={`e.g. windows_sysmon process events legitimately don't have ${srcIpField}`}
           rows={3}
           maxLength={500}
           className="w-full resize-none rounded-md border border-border bg-background p-2 text-[11px] outline-none focus:border-primary/50"
@@ -890,11 +892,8 @@ function StageDetail({
       </div>
 
       {/* Stage-specific content */}
-      {stage.id === 'ingestion' && (report.metrics?.ingestion || !report.metrics?.tenant_ingestion) && (
-        <IngestionDetail metrics={report.metrics?.ingestion} />
-      )}
-      {stage.id === 'ingestion' && !report.metrics?.ingestion && report.metrics?.tenant_ingestion && (
-        <TenantIngestionDetail metrics={report.metrics.tenant_ingestion} />
+      {stage.id === 'ingestion' && (
+        <IngestionDetail metrics={report.metrics?.ingestion} audit={report.metrics?.audit_durability} />
       )}
       {stage.id === 'parsing' && (
         <ParsingDetail metrics={report.metrics?.parsing} />
@@ -938,8 +937,10 @@ function StageDetail({
 
 function IngestionDetail({
   metrics,
+  audit,
 }: {
   metrics?: CollectedMetrics['ingestion'];
+  audit?: CollectedMetrics['audit_durability'];
 }) {
   if (!metrics) return <EmptyDetail label="ingestion" />;
   const total = metrics.total_events_24h;
@@ -954,6 +955,18 @@ function IngestionDetail({
   // NAN-1407: failing/stale dict-staging refreshes — stale enrichment, not
   // loss (rows keep landing with the last good snapshot).
   const staleRefreshes = ii?.stale_dict_refreshes ?? [];
+  const stoppedWatchdogs = (ii?.ingest_watchdog ?? []).filter(
+    (state) =>
+      [
+        'auto_stop',
+        'manual_stop',
+        'manual_stop_reapplied',
+        'observed_manual_stop',
+        'auto_enabled_shedding',
+      ].includes(
+        state.action,
+      ) && state.disabled_views.length > 0,
+  );
   const integrityRows: Array<{
     key: string;
     label: string;
@@ -1008,9 +1021,72 @@ function IngestionDetail({
                 : 'none',
             bad: staleRefreshes.length > 0,
           },
+          {
+            key: 'ingest-watchdog',
+            label: 'Refreshable views stopped by ingest watchdog',
+            value:
+              stoppedWatchdogs.length > 0
+                ? stoppedWatchdogs
+                    .map(
+                      (state) =>
+                        `${state.node} (${state.mode}): ${state.disabled_views.join(', ')}`,
+                    )
+                    .join('; ')
+                : 'none',
+            bad: stoppedWatchdogs.length > 0,
+          },
+          {
+            key: 'ingest-watchdog-coverage',
+            label: 'Ingest watchdog replica coverage',
+            value: (ii.ingest_watchdog ?? []).flatMap((state) => state.replicas ?? []).length
+              ? (ii.ingest_watchdog ?? [])
+                  .flatMap((state) =>
+                    (state.replicas ?? []).map(
+                      (replica) =>
+                        `${state.node}/${replica.replica}: ${replica.reachable ? (replica.hot ? 'HOT' : 'calm') : `unreachable (${replica.error})`}`,
+                    ),
+                  )
+                  .join('; ')
+              : 'no samples',
+            bad: (ii.ingest_watchdog ?? []).some((state) =>
+              (state.replicas ?? []).some((replica) => !replica.reachable || replica.hot),
+            ),
+          },
         ]
       : [];
+  // NAN-4954: security-critical audit events recorded in PostgreSQL but not
+  // yet in ClickHouse, and inline ClickHouse audit-write failures. PG-backed,
+  // so it reports even while ClickHouse is the thing failing.
+  if (audit) {
+    integrityRows.push(
+      {
+        key: 'audit-backlog',
+        label: 'Security audit events awaiting ClickHouse',
+        value:
+          audit.overdue > 0
+            ? `${audit.overdue.toLocaleString()} · oldest ${Math.floor((audit.oldest_pending_age_secs ?? 0) / 60)} min`
+            : 'none',
+        bad: audit.overdue > 0,
+      },
+      {
+        key: 'audit-deferred',
+        label: 'Security audit writes deferred (24h)',
+        value: `${audit.deferred_24h.toLocaleString()} of ${audit.recorded_24h.toLocaleString()}`,
+        bad: audit.deferred_24h > 0,
+      },
+    );
+  }
   const integrityBadCount = integrityRows.filter((r) => r.bad).length;
+  // NAN-4957: dictionaries are resident inside the ClickHouse memory limit and
+  // a reload needs the same again. Mirrors DICT_MEMORY_WARN_PCT (analyzer.rs).
+  const dictMemory =
+    ii?.dictionary_memory_probe_ok && ii.dictionary_memory
+      ? ii.dictionary_memory.filter((d) => d.bytes_allocated > 0)
+      : [];
+  const dictLimit = ii?.server_memory_limit_bytes ?? 0;
+  const dictTotal = ii?.dictionary_bytes_total ?? 0;
+  const dictPct = dictLimit > 0 ? Math.floor((dictTotal * 100) / dictLimit) : null;
+  const dictWarn = dictPct !== null && dictPct >= 35;
   return (
     <>
       <MetricsGrid
@@ -1083,6 +1159,39 @@ function IngestionDetail({
                 </div>
               </div>
             )}
+          </div>
+        </SubPanel>
+      )}
+      {dictMemory.length > 0 && (
+        <SubPanel
+          title="Dictionary memory"
+          subtitle={
+            dictPct !== null
+              ? `${formatBytes(dictTotal)} of ${formatBytes(dictLimit)} ClickHouse limit · ${dictPct}%${dictWarn ? ' — a reload needs the same again' : ''}`
+              : `${formatBytes(dictTotal)} resident`
+          }
+        >
+          <div className="divide-y divide-border">
+            {dictMemory.map((d) => (
+              <div
+                key={d.name}
+                className="flex items-center gap-3 px-5 py-2.5 hover:bg-foreground/[.02]"
+              >
+                <span
+                  className="h-[6px] w-[6px] shrink-0 rounded-full"
+                  style={{ background: dictWarn ? TONE_DOT.medium : TONE_DOT.good }}
+                />
+                <span className="flex-1 truncate font-mono text-[12px] text-foreground">
+                  {d.name.replace(/^nanosiem\./, '')}
+                </span>
+                <span className="font-mono text-[10.5px] text-muted-foreground">
+                  {d.layout} · {d.element_count.toLocaleString()}
+                </span>
+                <span className="w-[84px] text-right font-mono text-[11px] tabular-nums text-muted-foreground">
+                  {formatBytes(d.bytes_allocated)}
+                </span>
+              </div>
+            ))}
           </div>
         </SubPanel>
       )}
@@ -1172,8 +1281,15 @@ function ParsingDetail({
 }: {
   metrics?: CollectedMetrics['parsing'];
 }) {
+  const schemaMap = useSchemaFieldMap();
   if (!metrics) return <EmptyDetail label="parsing" />;
   const cov = metrics.field_coverage;
+  // Column names the backend coverage SQL actually measures for the active
+  // profile (`build_field_coverage_sql`): src_ip / user / event_type under UDM,
+  // src_endpoint.ip / user.name / class_uid under OCSF (NAN-4903).
+  const labels = schemaMap.isOcsf
+    ? { srcIp: schemaMap.field('srcIp'), user: 'user.name', eventType: 'class_uid' }
+    : { srcIp: schemaMap.field('srcIp'), user: schemaMap.field('user'), eventType: schemaMap.field('eventType') };
   const avgUser =
     cov.length > 0
       ? Math.round(
@@ -1196,12 +1312,12 @@ function ParsingDetail({
             tone: 'fg',
           },
           {
-            label: 'Avg user fill',
+            label: `Avg ${labels.user} fill`,
             value: avgUser != null ? `${avgUser}%` : '—',
             tone: coverageTone(avgUser),
           },
           {
-            label: 'Avg src_ip fill',
+            label: `Avg ${labels.srcIp} fill`,
             value: avgIp != null ? `${avgIp}%` : '—',
             tone: coverageTone(avgIp),
           },
@@ -1228,15 +1344,15 @@ function ParsingDetail({
                   {c.source_type}
                 </span>
                 <CoverageCell
-                  label="user"
+                  label={labels.user}
                   pct={c.user_filled_pct}
                 />
                 <CoverageCell
-                  label="src_ip"
+                  label={labels.srcIp}
                   pct={c.src_ip_filled_pct}
                 />
                 <CoverageCell
-                  label="event_type"
+                  label={labels.eventType}
                   pct={c.event_type_filled_pct}
                 />
                 <CoverageCell
@@ -1540,63 +1656,6 @@ function AlertingDetail({
   );
 }
 
-function formatLakeBytes(bytes: number): string {
-  if (bytes >= 1e12) return `${(bytes / 1e12).toFixed(1)} TB`;
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
-  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
-  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(1)} KB`;
-  return `${bytes} B`;
-}
-
-/** Hosted-shared tenant (NAN-2361): what the lake recorded, not event counts. */
-function TenantIngestionDetail({
-  metrics,
-}: {
-  metrics: NonNullable<CollectedMetrics['tenant_ingestion']>;
-}) {
-  const delta =
-    metrics.bytes_prior_24h > 0
-      ? Math.round(((metrics.bytes_24h - metrics.bytes_prior_24h) / metrics.bytes_prior_24h) * 100)
-      : null;
-  return (
-    <>
-      <MetricsGrid
-        items={[
-          {
-            label: 'Objects / 24h',
-            value: metrics.objects_24h.toLocaleString(),
-            tone: metrics.objects_24h > 0 ? 'good' : metrics.lifetime_objects > 0 ? 'critical' : 'fg-2',
-          },
-          {
-            label: 'Bytes / 24h',
-            value: formatLakeBytes(metrics.bytes_24h),
-            delta,
-            tone: deltaTone(delta),
-          },
-          {
-            label: 'Prior 24h',
-            value: `${metrics.objects_prior_24h.toLocaleString()} · ${formatLakeBytes(metrics.bytes_prior_24h)}`,
-            tone: 'fg-2',
-          },
-          {
-            label: 'Written to date',
-            value: `${metrics.lifetime_objects.toLocaleString()} · ${formatLakeBytes(metrics.lifetime_bytes)}`,
-            tone: 'fg',
-          },
-        ]}
-      />
-      <div className="px-5 py-3 text-[11.5px] text-muted-foreground">
-        Objects and bytes are the lake's writer completion receipts for this tenant
-        {metrics.writer_classes_24h.length > 0
-          ? ` (${metrics.writer_classes_24h.join(', ')})`
-          : ''}
-        ; per-event counts are not recorded per object.
-        {metrics.last_written_at ? ` Last write ${metrics.last_written_at.replace('T', ' ').slice(0, 19)} UTC.` : ''}
-      </div>
-    </>
-  );
-}
-
 function EmptyDetail({ label }: { label: string }) {
   return (
     <div className="px-5 py-8 text-center text-[12.5px] text-muted-foreground">
@@ -1729,38 +1788,22 @@ export function SiemHealth() {
   const { toast } = useToast();
   const isAdmin = hasPermission('settings:system');
   const aiAuthored = useAiAuthored();
-  // NAN-3207: per-source volume vs expected band (hosted-shared tenants only).
-  const shared = useSharedTenant();
-  const sourceHealth = shared && hasPermission('log_sources:view') ? (
+  const sourceHealth = hasPermission('log_sources:view') ? (
     <div className="mt-4">
       <LogSourceHealthList />
     </div>
   ) : null;
 
-  const { data: report, isLoading, error: latestError, refetch: refetchLatest } = useQuery({
+  const { data: report, isLoading } = useQuery({
     queryKey: ['siem-health', 'latest'],
     queryFn: () => api.getSiemHealthLatest(),
     retry: false,
   });
-  // `GET /api/siem-health/reports/latest` answers 404 while no report exists
-  // (the tenant-scoped handler on the shared lake too). That is the empty
-  // state, not a failure; only another status is an error.
-  const noReportYet = latestError instanceof ApiClientError
-    ? latestError.status === 404
-    : (latestError as { status?: number } | null)?.status === 404;
-  const latestFailed = latestError !== null && !noReportYet;
 
   const triggerMutation = useMutation({
     mutationFn: () => api.triggerSiemHealthCheck(),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['siem-health'] });
-    },
-    onError: (err: unknown) => {
-      toast({
-        title: 'Health check did not run',
-        description: err instanceof Error ? err.message : 'Try again in a moment.',
-        variant: 'destructive',
-      });
     },
   });
 
@@ -1851,37 +1894,7 @@ export function SiemHealth() {
     );
   }
 
-  /* ---- Could not load ---- */
-  if (!report && latestFailed) {
-    return (
-      <div className="flex flex-col px-6 pt-5 pb-6">
-        <div className="flex items-end gap-3">
-          <div className="min-w-0">
-            <Eyebrow icon={HeartPulse}>SIEM health</Eyebrow>
-            <h1 className="mt-1 text-[20px] font-semibold tracking-[-0.015em] text-foreground">
-              Health report unavailable
-            </h1>
-            <p className="mt-0.5 text-[12px] text-muted-foreground">
-              {latestError instanceof Error ? latestError.message : 'The latest report could not be loaded.'}
-            </p>
-          </div>
-        </div>
-        <SystemHealthEventsPanel />
-        <div className="mt-8 rounded-md border border-border bg-card px-6 py-10 text-center">
-          <button
-            type="button"
-            onClick={() => refetchLatest()}
-            className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-[11.5px] font-medium text-foreground hover:bg-foreground/[0.04]"
-          >
-            <RefreshCw className="h-[12px] w-[12px]" />
-            Retry
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  /* ---- No report yet (404 from /reports/latest) ---- */
+  /* ---- No report yet ---- */
   if (!report) {
     return (
       <div className="flex flex-col px-6 pt-5 pb-6">
@@ -1889,17 +1902,17 @@ export function SiemHealth() {
           <div className="min-w-0">
             <Eyebrow icon={HeartPulse}>SIEM health</Eyebrow>
             <h1 className="mt-1 text-[20px] font-semibold tracking-[-0.015em] text-foreground">
-              No health report yet
+              No health reports yet
             </h1>
             <p className="mt-0.5 text-[12px] text-muted-foreground">
               Health checks run automatically every 12 hours.
-              {isAdmin ? ' Generate the first one now.' : ''}
+              {isAdmin ? ' You can also trigger one manually below.' : ''}
             </p>
           </div>
         </div>
         <SystemHealthEventsPanel />
         {sourceHealth}
-        <div className="mt-8 rounded-md border border-border bg-card px-6 py-12 text-center">
+        <div className="mt-8 rounded-xl border border-border bg-card px-6 py-12 text-center">
           <HeartPulse className="mx-auto mb-3 h-8 w-8 text-muted-foreground/40" />
           <p className="text-[13px] text-foreground">
             Once a health check completes, this page will surface ingestion,
@@ -1918,7 +1931,9 @@ export function SiemHealth() {
                   triggerMutation.isPending && 'animate-spin',
                 )}
               />
-              {triggerMutation.isPending ? 'Generating…' : 'Generate now'}
+              {triggerMutation.isPending
+                ? 'Running…'
+                : 'Run first health check'}
             </button>
           )}
         </div>

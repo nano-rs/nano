@@ -119,15 +119,6 @@ pub const UPLOAD_HISTORY: &str = "upload:history";
 pub const RISK_VIEW: &str = "risk:view";
 pub const RISK_CONFIGURE: &str = "risk:configure";
 pub const RISK_CLEAR: &str = "risk:clear";
-/// View and manage risk watchlists (NAN-3232).
-///
-/// Separate from `risk:view` / `risk:configure` on purpose: a watchlist's name
-/// and members say who the organization is watching (VIPs, insider-threat
-/// subjects). Every `/api/risk/watchlists*` endpoint requires it (together
-/// with `risk:view`), and risk reads omit the watch fields (`base_risk_score`,
-/// `watch_weight`, `base_decayed_score_*`) for callers without it. Granted to
-/// the built-in Admin role only; custom roles and API keys opt in.
-pub const RISK_WATCHLISTS: &str = "risk:watchlists";
 
 // Prevalence tracking permissions
 pub const PREVALENCE_VIEW: &str = "prevalence:view";
@@ -233,12 +224,6 @@ pub const PLAYBOOKS_VIEW: &str = "playbooks:view";
 pub const PLAYBOOKS_MANAGE: &str = "playbooks:manage";
 pub const PLAYBOOKS_RUN: &str = "playbooks:run";
 pub const PLAYBOOKS_PUBLISH: &str = "playbooks:publish";
-
-// Native automation permissions (enterprise endpoints).
-pub const SOAR_VIEW: &str = "soar:view";
-pub const SOAR_MANAGE: &str = "soar:manage";
-pub const SOAR_RUN: &str = "soar:run";
-pub const SOAR_APPROVE: &str = "soar:approve";
 
 // Playbook Repository permissions
 pub const PLAYBOOK_REPOSITORIES_VIEW: &str = "playbook_repositories:view";
@@ -391,7 +376,6 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     RISK_VIEW,
     RISK_CONFIGURE,
     RISK_CLEAR,
-    RISK_WATCHLISTS,
     // Prevalence
     PREVALENCE_VIEW,
     PREVALENCE_CONFIGURE,
@@ -465,11 +449,6 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     PLAYBOOKS_MANAGE,
     PLAYBOOKS_RUN,
     PLAYBOOKS_PUBLISH,
-    // Native automation
-    SOAR_VIEW,
-    SOAR_MANAGE,
-    SOAR_RUN,
-    SOAR_APPROVE,
     // Playbook Repositories
     PLAYBOOK_REPOSITORIES_VIEW,
     PLAYBOOK_REPOSITORIES_MANAGE,
@@ -486,9 +465,39 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     GDPR_ANONYMIZE,
 ];
 
+/// Extra demo permissions registered at startup by builds that add surfaces
+/// of their own (an enterprise extension calls
+/// [`register_demo_permissions`]). Open builds register none.
+static DEMO_PERMISSION_EXTENSIONS: std::sync::OnceLock<std::sync::Mutex<Vec<&'static str>>> =
+    std::sync::OnceLock::new();
+
+/// Add read-only permissions to the demo set. Idempotent.
+pub fn register_demo_permissions(extra: &[&'static str]) {
+    let lock = DEMO_PERMISSION_EXTENSIONS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut list = lock.lock().unwrap_or_else(|e| e.into_inner());
+    for p in extra {
+        if !list.contains(p) {
+            list.push(p);
+        }
+    }
+}
+
+/// [`DEMO_PERMISSIONS`] plus any registered extensions.
+pub fn demo_permissions() -> Vec<String> {
+    let mut out: Vec<String> = DEMO_PERMISSIONS.iter().map(|s| s.to_string()).collect();
+    if let Some(lock) = DEMO_PERMISSION_EXTENSIONS.get() {
+        let list = lock.lock().unwrap_or_else(|e| e.into_inner());
+        for p in list.iter() {
+            if !out.iter().any(|o| o == p) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Permissions granted to demo users — analyst experience without admin access
 pub const DEMO_PERMISSIONS: &[&str] = &[
-    "soar:view",
     // Search — full power
     SEARCH_VIEW,
     SEARCH_EXECUTE,
@@ -598,7 +607,6 @@ pub const CATEGORIES: &[&str] = &[
     "rule_repositories",
     "parser_repositories",
     "hunts",
-    "soar",
     "gdpr",
 ];
 

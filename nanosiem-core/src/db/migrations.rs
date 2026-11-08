@@ -4,12 +4,12 @@
 //!
 //! This module owns the open-tier portion of the migration topology
 //! introduced by NAN-747 (overlay split) and NAN-749 (fresh-init snapshot).
-//! Callers in `nanosiem-api` invoke [`run_postgres_migrations`] in place of
-//! `sqlx::migrate!("../migrations/postgres").run(pool)`. The enterprise
-//! overlay (the enterprise migrations) stays at the call site under
-//! its `#[cfg(feature = "enterprise")]` block — this helper only deals with
-//! the open-tier path because `nanosiem-core` does not see the enterprise
-//! feature flag.
+//! The one-shot `clickhouse_migrator` invokes [`run_postgres_migrations`]
+//! before any ClickHouse DDL. API, jobs, and search only call
+//! [`ensure_postgres_schema_is_current`] and refuse to serve if the one-shot
+//! gate was skipped. The enterprise overlay (`migrations/postgres-enterprise/`)
+//! stays at the feature-gated call sites because `nanosiem-core` does not see
+//! the enterprise feature flag.
 //!
 //! Three deployment states (see `migrations/SPLIT_RATIONALE.md`):
 //!
@@ -36,7 +36,8 @@
 //!    deployments.
 
 use sqlx::migrate::Migrator;
-use sqlx::{Acquire, PgConnection, PgPool, Postgres};
+use sqlx::PgPool;
+use std::collections::HashMap;
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -89,11 +90,56 @@ pub enum MigrationError {
     /// table-exists probe fails.
     #[error("nan-922 collision repair failed: {0}")]
     RepairFailed(#[source] sqlx::Error),
+}
 
-    /// Acquiring the single migration session, or restoring its session
-    /// state after the open chain (NAN-4461), failed.
-    #[error("migration session setup failed: {0}")]
-    SessionFailed(#[source] sqlx::Error),
+/// A serving binary found that PostgreSQL does not match the migrations it
+/// was compiled with. Only the one-shot migrator applies DDL; API, jobs and
+/// search use this error to refuse startup before a missing relation can turn
+/// every request into a runtime 503.
+#[derive(Debug, Error)]
+pub enum SchemaCheckError {
+    #[error(
+        "PostgreSQL migration history is unavailable while checking {label}: {source}; run clickhouse_migrator before starting serving processes"
+    )]
+    HistoryUnavailable {
+        label: &'static str,
+        #[source]
+        source: sqlx::Error,
+    },
+
+    #[error(
+        "PostgreSQL schema is behind this binary: {label} migration {version} ({description}) is not applied; run clickhouse_migrator"
+    )]
+    Pending {
+        label: &'static str,
+        version: i64,
+        description: String,
+    },
+
+    #[error(
+        "PostgreSQL schema is not healthy: {label} migration {version} ({description}) is recorded as failed; run clickhouse_migrator"
+    )]
+    Failed {
+        label: &'static str,
+        version: i64,
+        description: String,
+    },
+
+    #[error(
+        "PostgreSQL schema does not match this binary: {label} migration {version} ({description}) has a different checksum; run clickhouse_migrator and investigate migration drift"
+    )]
+    ChecksumMismatch {
+        label: &'static str,
+        version: i64,
+        description: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct AppliedMigrationState {
+    version: i64,
+    success: bool,
+    checksum: Vec<u8>,
 }
 
 /// Mode for [`run_postgres_migrations`], controlled by the
@@ -217,25 +263,22 @@ const NAN922_BRAND_RENAME_DESCRIPTION: &str = "brand rename system ai";
 /// Errors are not silenced: callers receive [`MigrationError::RepairFailed`]
 /// so a broken privilege model surfaces as a boot failure rather than
 /// half-fixing the DB and proceeding.
-pub async fn repair_nan922_185_collision<'c, A>(conn: A) -> Result<(), sqlx::Error>
-where
-    A: Acquire<'c, Database = Postgres>,
-{
-    let mut conn = conn.acquire().await?;
+pub async fn repair_nan922_185_collision(pool: &PgPool) -> Result<(), sqlx::Error> {
     let has_sqlx_table: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
          WHERE table_schema = 'public' AND table_name = '_sqlx_migrations')",
     )
-    .fetch_one(&mut *conn)
+    .fetch_one(pool)
     .await?;
     if !has_sqlx_table {
         return Ok(());
     }
 
-    let row_185: Option<(String,)> =
-        sqlx::query_as("SELECT description FROM public._sqlx_migrations WHERE version = 185")
-            .fetch_optional(&mut *conn)
-            .await?;
+    let row_185: Option<(String,)> = sqlx::query_as(
+        "SELECT description FROM public._sqlx_migrations WHERE version = 185",
+    )
+    .fetch_optional(pool)
+    .await?;
     let Some((description_185,)) = row_185 else {
         return Ok(());
     };
@@ -246,16 +289,16 @@ where
     let has_187: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM public._sqlx_migrations WHERE version = 187)",
     )
-    .fetch_one(&mut *conn)
+    .fetch_one(pool)
     .await?;
     if has_187 {
         return Ok(());
     }
 
     warn!(
-        "Migration version collision detected: removing poisoned _sqlx_migrations row \
+        "NAN-922 collision detected: removing poisoned _sqlx_migrations row \
          (version=185, description='{}') so the renamed brand-rename can \
-         re-land at version=187.",
+         re-land at version=187. See NAN-926.",
         NAN922_BRAND_RENAME_DESCRIPTION
     );
     sqlx::query(
@@ -263,7 +306,7 @@ where
          WHERE version = 185 AND description = $1",
     )
     .bind(NAN922_BRAND_RENAME_DESCRIPTION)
-    .execute(&mut *conn)
+    .execute(pool)
     .await?;
 
     Ok(())
@@ -289,7 +332,7 @@ where
 /// `migrations_to_backfill` helper isolates the filter so it can be
 /// unit-tested without a real PG.
 async fn backfill_legacy_migration_history(
-    conn: &mut PgConnection,
+    pool: &PgPool,
     migrator: &Migrator,
 ) -> Result<(), sqlx::Error> {
     // Schema-qualify everything as `public.*`. The snapshot's pg_dump
@@ -306,7 +349,7 @@ async fn backfill_legacy_migration_history(
             execution_time BIGINT NOT NULL \
         )",
     )
-    .execute(&mut *conn)
+    .execute(pool)
     .await?;
 
     let mut count = 0usize;
@@ -320,7 +363,7 @@ async fn backfill_legacy_migration_history(
         .bind(migration.version)
         .bind(migration.description.as_ref())
         .bind(migration.checksum.as_ref())
-        .execute(&mut *conn)
+        .execute(pool)
         .await?;
         count += 1;
     }
@@ -339,10 +382,77 @@ async fn backfill_legacy_migration_history(
 ///
 /// Extracted so the cutoff logic can be unit-tested without a real PG
 /// (NAN-791).
-fn migrations_to_backfill(migrator: &Migrator) -> impl Iterator<Item = &sqlx::migrate::Migration> {
+fn migrations_to_backfill(
+    migrator: &Migrator,
+) -> impl Iterator<Item = &sqlx::migrate::Migration> {
     migrator
         .iter()
         .filter(|m| m.version <= OPEN_INIT_BASELINE_VERSION)
+}
+
+fn validate_migrator_is_current(
+    migrator: &Migrator,
+    applied: &[AppliedMigrationState],
+    label: &'static str,
+) -> Result<(), SchemaCheckError> {
+    let applied_by_version: HashMap<i64, &AppliedMigrationState> =
+        applied.iter().map(|row| (row.version, row)).collect();
+
+    for migration in migrator.iter() {
+        let Some(row) = applied_by_version.get(&migration.version) else {
+            return Err(SchemaCheckError::Pending {
+                label,
+                version: migration.version,
+                description: migration.description.to_string(),
+            });
+        };
+        if !row.success {
+            return Err(SchemaCheckError::Failed {
+                label,
+                version: migration.version,
+                description: migration.description.to_string(),
+            });
+        }
+        if row.checksum.as_slice() != migration.checksum.as_ref() {
+            return Err(SchemaCheckError::ChecksumMismatch {
+                label,
+                version: migration.version,
+                description: migration.description.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to serve when any migration embedded in `migrator` is pending,
+/// failed, or has drifted. Applied rows from other migration sets are ignored,
+/// which is required because core and enterprise overlays share SQLx's table.
+pub async fn ensure_migrator_is_current(
+    pool: &PgPool,
+    migrator: &Migrator,
+    label: &'static str,
+) -> Result<(), SchemaCheckError> {
+    let rows: Vec<(i64, bool, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, success, checksum FROM public._sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|source| SchemaCheckError::HistoryUnavailable { label, source })?;
+    let applied: Vec<AppliedMigrationState> = rows
+        .into_iter()
+        .map(|(version, success, checksum)| AppliedMigrationState {
+            version,
+            success,
+            checksum,
+        })
+        .collect();
+    validate_migrator_is_current(migrator, &applied, label)
+}
+
+/// Validate the open/core PostgreSQL schema embedded in every serving binary.
+pub async fn ensure_postgres_schema_is_current(pool: &PgPool) -> Result<(), SchemaCheckError> {
+    let migrator = sqlx::migrate!("../migrations/postgres");
+    ensure_migrator_is_current(pool, &migrator, "core").await
 }
 
 /// Run open-tier PostgreSQL migrations.
@@ -350,7 +460,7 @@ fn migrations_to_backfill(migrator: &Migrator) -> impl Iterator<Item = &sqlx::mi
 /// Decides between the legacy path (today's behavior) and the fresh-init
 /// path (NAN-749) based on [`MigrationMode::from_env`] and, when in
 /// `Auto` mode, runtime detection via [`is_fresh_database`]. The enterprise
-/// overlay (the enterprise migrations) is NOT applied here — call
+/// overlay (`migrations/postgres-enterprise/`) is NOT applied here — call
 /// sites layer it under their own `#[cfg(feature = "enterprise")]` block
 /// because `nanosiem-core` does not see the enterprise feature flag.
 pub async fn run_postgres_migrations(pool: &PgPool) -> Result<(), MigrationError> {
@@ -379,7 +489,10 @@ pub async fn run_postgres_migrations(pool: &PgPool) -> Result<(), MigrationError
         }
         MigrationMode::Auto => match is_fresh_database(pool).await {
             Ok(fresh) => {
-                info!(fresh, "Detected database state for migration mode (auto)");
+                info!(
+                    fresh,
+                    "Detected database state for migration mode (auto)"
+                );
                 fresh
             }
             Err(err) => {
@@ -395,38 +508,24 @@ pub async fn run_postgres_migrations(pool: &PgPool) -> Result<(), MigrationError
         },
     };
 
-    // NAN-4461: every step that can change session state runs on ONE
-    // connection, which is returned to the caller's pool with the session
-    // state a freshly opened connection has. The snapshot's pg_dump preamble
-    // and core 001 both `SET row_security = off` session-wide; left on a
-    // pooled connection it leaks into whatever runs next on that pool (the
-    // enterprise overlay). There, on an activated role contract, the
-    // owner-held SECURITY DEFINER playbook-ACL trigger bodies fired by a
-    // `role_permissions` write (9014310 and later) read the FORCE-RLS
-    // `playbook_permissions` with row_security=off and fail with 42501
-    // "query would be affected by row-level security policy". A live
-    // release migrate Job never ran 001 in its own session, so the overlay
-    // must see the same session here, deterministically, whichever pooled
-    // connection serves it.
-    let mut conn = pool.acquire().await.map_err(MigrationError::SessionFailed)?;
-
     if take_fresh_path {
         info!("Applying open-init snapshot (migrations/postgres-open/000_open_init.sql)");
         sqlx::raw_sql(OPEN_INIT_SNAPSHOT)
-            .execute(&mut *conn)
+            .execute(pool)
             .await
             .map_err(MigrationError::SnapshotFailed)?;
         // Defense-in-depth: `tools/nan749_split_open_overlay.py` strips
         // `set_config('search_path', '', false)` from the snapshot at
         // generation time (load-bearing fix), but if a regenerated
-        // snapshot ever ships with that line restored, RESET search_path
-        // here ensures `public.*` resolves for the subsequent backfill
-        // INSERTs and `migrator.run()`.
+        // snapshot ever ships with that line restored — or if a pool
+        // connection reuses session state from elsewhere — RESET
+        // search_path here ensures `public.*` resolves for the
+        // subsequent backfill INSERTs and `migrator.run()`.
         sqlx::query("RESET search_path")
-            .execute(&mut *conn)
+            .execute(pool)
             .await
             .map_err(MigrationError::SnapshotFailed)?;
-        backfill_legacy_migration_history(&mut conn, &open_migrator)
+        backfill_legacy_migration_history(pool, &open_migrator)
             .await
             .map_err(MigrationError::BackfillFailed)?;
         info!("Open-init snapshot applied; legacy history backfilled");
@@ -437,134 +536,61 @@ pub async fn run_postgres_migrations(pool: &PgPool) -> Result<(), MigrationError
     // on fresh DBs (signal: _sqlx_migrations absent), DBs that already
     // applied the new 185 (signal: description mismatch), and DBs that have
     // already self-healed (signal: 187 row present).
-    repair_nan922_185_collision(&mut *conn)
+    repair_nan922_185_collision(pool)
         .await
         .map_err(MigrationError::RepairFailed)?;
 
     info!("Running PostgreSQL migrations (sqlx::migrate!('../migrations/postgres'))");
-    open_migrator.run(&mut *conn).await?;
-    // NAN-4461: undo the snapshot / 001 session-wide `row_security = off`.
-    // RESET restores the role/database default a fresh session starts with
-    // (on, unless an operator configured otherwise), i.e. exactly what a
-    // live upgrade Job's overlay run sees.
-    sqlx::query("RESET row_security")
-        .execute(&mut *conn)
-        .await
-        .map_err(MigrationError::SessionFailed)?;
+    open_migrator.run(pool).await?;
     info!("PostgreSQL migrations complete");
     Ok(())
-}
-
-/// Every version [`run_postgres_migrations`] records in `_sqlx_migrations`
-/// on a successful run, ascending (NAN-4711).
-///
-/// Both the snapshot path (backfill of `1..=`[`OPEN_INIT_BASELINE_VERSION`]
-/// with `success = TRUE`, then the migrator for the rest) and the legacy path
-/// (migrator for everything) end with one successful row per embedded up
-/// migration, so the expected set is the same in every `NANOSIEM_MIGRATION_MODE`.
-pub fn embedded_postgres_versions() -> Vec<i64> {
-    let migrator = sqlx::migrate!("../migrations/postgres");
-    up_versions(&migrator)
-}
-
-/// The up-migration versions of `migrator`, ascending. sqlx never records
-/// down migrations on `run`.
-pub fn up_versions(migrator: &Migrator) -> Vec<i64> {
-    let mut versions: Vec<i64> = migrator
-        .iter()
-        .filter(|m| !m.migration_type.is_down_migration())
-        .map(|m| m.version)
-        .collect();
-    versions.sort_unstable();
-    versions.dedup();
-    versions
-}
-
-/// Boot refusal for a runtime that does not own migrations (NAN-4711).
-#[derive(Debug, Error)]
-pub enum SchemaHeadError {
-    #[error("PostgreSQL schema history (_sqlx_migrations) is missing: postgres-migrate must complete before this service starts")]
-    HistoryMissing,
-    #[error("PostgreSQL migration {0} is not applied: postgres-migrate must complete before this service starts")]
-    MissingVersion(i64),
-    #[error("reading PostgreSQL schema history failed: {0}")]
-    Query(#[source] sqlx::Error),
-}
-
-/// Pure comparison: the first (lowest) expected version absent from the
-/// successfully applied set, if any.
-pub fn first_missing_version(
-    expected: &[i64],
-    applied: &std::collections::HashSet<i64>,
-) -> Option<i64> {
-    let mut expected = expected.to_vec();
-    expected.sort_unstable();
-    expected.into_iter().find(|version| !applied.contains(version))
-}
-
-/// Verify that every `expected` migration is recorded with `success = TRUE`.
-/// SELECT only, so a DML-only runtime role can run it. Extra applied versions
-/// (a newer migrator ran first) are fine.
-pub async fn verify_postgres_schema_head(
-    pool: &PgPool,
-    expected: &[i64],
-) -> Result<(), SchemaHeadError> {
-    let has_history: bool =
-        sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
-            .fetch_one(pool)
-            .await
-            .map_err(SchemaHeadError::Query)?;
-    if !has_history {
-        return Err(SchemaHeadError::HistoryMissing);
-    }
-    let applied: std::collections::HashSet<i64> =
-        sqlx::query_scalar("SELECT version FROM public._sqlx_migrations WHERE success")
-            .fetch_all(pool)
-            .await
-            .map_err(SchemaHeadError::Query)?
-            .into_iter()
-            .collect();
-    match first_missing_version(expected, &applied) {
-        Some(version) => Err(SchemaHeadError::MissingVersion(version)),
-        None => Ok(()),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn first_missing_version_reports_the_lowest_gap() {
-        let applied: std::collections::HashSet<i64> = [1, 2, 4, 9_000_001].into_iter().collect();
-        assert_eq!(first_missing_version(&[4, 3, 1, 5], &applied), Some(3));
-        assert_eq!(first_missing_version(&[1, 2, 4], &applied), None);
-        // A newer migrator's extra rows never fail an older binary.
-        assert_eq!(first_missing_version(&[1, 2], &applied), None);
-        assert_eq!(first_missing_version(&[], &applied), None);
-        assert_eq!(
-            first_missing_version(&[1], &std::collections::HashSet::new()),
-            Some(1)
-        );
+    fn applied_rows(migrator: &Migrator) -> Vec<AppliedMigrationState> {
+        migrator
+            .iter()
+            .map(|migration| AppliedMigrationState {
+                version: migration.version,
+                success: true,
+                checksum: migration.checksum.to_vec(),
+            })
+            .collect()
     }
 
     #[test]
-    fn embedded_versions_cover_the_snapshot_backfill_and_the_rest() {
-        let versions = embedded_postgres_versions();
+    fn serving_schema_check_rejects_a_pending_embedded_migration() {
         let migrator = sqlx::migrate!("../migrations/postgres");
-        // Fresh path: the backfill rows plus the migrator rows are exactly the
-        // embedded set, so a fresh install satisfies the head check.
-        let mut recorded: Vec<i64> = migrations_to_backfill(&migrator).map(|m| m.version).collect();
-        recorded.extend(
-            migrator
-                .iter()
-                .filter(|m| m.version > OPEN_INIT_BASELINE_VERSION)
-                .map(|m| m.version),
-        );
-        recorded.sort_unstable();
-        recorded.dedup();
-        assert_eq!(versions, recorded);
-        assert!(versions.windows(2).all(|w| w[0] < w[1]));
+        let latest = migrator.iter().last().expect("core migrations exist");
+        let mut applied = applied_rows(&migrator);
+        applied.retain(|row| row.version != latest.version);
+
+        assert!(matches!(
+            validate_migrator_is_current(&migrator, &applied, "core"),
+            Err(SchemaCheckError::Pending { version, .. }) if version == latest.version
+        ));
+    }
+
+    #[test]
+    fn serving_schema_check_rejects_checksum_drift() {
+        let migrator = sqlx::migrate!("../migrations/postgres");
+        let mut applied = applied_rows(&migrator);
+        applied.last_mut().expect("core migrations exist").checksum[0] ^= 0xff;
+
+        assert!(matches!(
+            validate_migrator_is_current(&migrator, &applied, "core"),
+            Err(SchemaCheckError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn serving_schema_check_accepts_the_complete_embedded_set() {
+        let migrator = sqlx::migrate!("../migrations/postgres");
+        let applied = applied_rows(&migrator);
+        validate_migrator_is_current(&migrator, &applied, "core").unwrap();
     }
 
     #[test]
@@ -771,7 +797,9 @@ mod tests {
             r"(?i)\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:public\.)?([a-z_][a-z0-9_]*)",
         )
         .unwrap();
-        re.captures_iter(sql).map(|c| c[1].to_lowercase()).collect()
+        re.captures_iter(sql)
+            .map(|c| c[1].to_lowercase())
+            .collect()
     }
 
     /// Bare table names a chunk of SQL READS/WRITES in a way that requires the
@@ -835,7 +863,7 @@ mod tests {
     /// This bit us as NAN-1251 (cases, → NAN-1265) and again as NAN-1488
     /// (shadow_investigations, migrations 204/205/206) + the NAN-1501 bedrock
     /// fix (agent_model_config, 207) → NAN-1502. The fix for each was to move
-    /// the migration into the enterprise migrations.
+    /// the migration into `migrations/postgres-enterprise/`.
     ///
     /// This guard models a fresh open DB (snapshot tables only) and walks the
     /// post-baseline core migrations, asserting every table they touch is
@@ -851,28 +879,16 @@ mod tests {
         let line_comment = "-- that already references one, only when it holds x\n\
              INSERT INTO permissions (id) VALUES ('a') ON CONFLICT DO NOTHING;";
         let refs = referenced_tables(line_comment);
-        assert!(
-            !refs.contains("one"),
-            "prose in a -- comment read as a table: {refs:?}"
-        );
-        assert!(
-            refs.contains("permissions"),
-            "real INSERT target lost: {refs:?}"
-        );
+        assert!(!refs.contains("one"), "prose in a -- comment read as a table: {refs:?}");
+        assert!(refs.contains("permissions"), "real INSERT target lost: {refs:?}");
 
         // String literal: "references live exclusively in …" is English too.
         let in_literal = "COMMENT ON TABLE log_sources IS \
              'Transport connections and credential references live exclusively here';\n\
              ALTER TABLE log_sources DROP COLUMN foo;";
         let refs = referenced_tables(in_literal);
-        assert!(
-            !refs.contains("live"),
-            "prose in a literal read as a table: {refs:?}"
-        );
-        assert!(
-            refs.contains("log_sources"),
-            "real ALTER target lost: {refs:?}"
-        );
+        assert!(!refs.contains("live"), "prose in a literal read as a table: {refs:?}");
+        assert!(refs.contains("log_sources"), "real ALTER target lost: {refs:?}");
 
         // Block comments too.
         let block = "/* REFERENCES nope */ CREATE TABLE real_one (id int);";
@@ -888,10 +904,7 @@ mod tests {
              ALTER TABLE alerts ADD COLUMN x int;";
         let refs = referenced_tables(sql);
         assert!(refs.contains("settings"), "{refs:?}");
-        assert!(
-            refs.contains("alerts"),
-            "statement after the literal was swallowed: {refs:?}"
-        );
+        assert!(refs.contains("alerts"), "statement after the literal was swallowed: {refs:?}");
     }
 
     /// `guarded_tables` must keep reading names OUT of literals — that is how
@@ -932,9 +945,7 @@ mod tests {
                      (see ENTERPRISE_TABLES in tools/nan749_split_open_overlay.py), move this \
                      migration to migrations/postgres-enterprise/; otherwise add the table to \
                      the open snapshot.",
-                    m.version,
-                    t,
-                    t
+                    m.version, t, t
                 );
             }
             available.extend(created);

@@ -6,9 +6,6 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
-// Parse timestamp string as UTC (handles database format without Z suffix).
-// Shared with the asset view.
-import { parseTimestampAsUTC } from '@/lib/parse-timestamp-utc';
 import {
   ChartColumn,
   TrendingUp,
@@ -38,31 +35,23 @@ import {
   YAxis,
 } from 'recharts';
 import { Button } from '@/components/ui/button';
-import {
-  PrevalenceScatterPlot,
-  type PrevalenceScatterData,
-  type PrevalenceSource,
-} from '@/components/prevalence/PrevalenceScatterPlot';
-import {
-  buildDiscoveryQueries,
-  buildObservationQueries,
-  DOMAIN_PATHS,
-  harvestIngestStamps,
-  HASH_PATHS,
-  mergeDiscoveryResults,
-  mergeObservations,
-  type DiscoveryResult,
-  type InWindowObservation,
-  type IngestStamp,
-} from '@/lib/prevalence/inWindowObservation';
+import { PrevalenceScatterPlot, type PrevalenceScatterData } from '@/components/prevalence/PrevalenceScatterPlot';
 import { usePrevalenceScatterData } from '@/hooks/use-api';
 import { useInternalDomains } from '@/hooks/use-internal-domains';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { isInternalName } from '@/lib/internal-domains';
-import { api, ApiClientError } from '@/lib/api';
+import { api } from '@/lib/api';
 import type { ArtifactOccurrence as ApiArtifactOccurrence } from '@/lib/api/types';
 import { formatInTimeZone } from 'date-fns-tz';
 import { CHART_AXIS_LINE, CHART_AXIS_TEXT } from '@/lib/chart-colors';
 import { buildTimelinePlotData, timelinePlotDomain, timelineSeriesData, resolveBucketStart, type TimelinePlotPoint } from './timeline-fill';
+import {
+  buildObservationQueries,
+  mergeObservations,
+  OBSERVATION_BATCH_SIZE,
+  observationPathsFor,
+  type InWindowObservation,
+} from '@/lib/prevalence/inWindowObservation';
 
 interface TimelineDataPoint {
   time: string;
@@ -151,117 +140,22 @@ interface ArtifactOccurrence {
   occurrenceCount: number;
 }
 
-interface BaselinePrevalence {
-  hostCount: number;
-  isRare: boolean;
-  prevalenceScore: number;
-  totalOccurrences: number;
-  envFirstSeen: Date;
-}
-
 /**
- * Assemble one scatter point from the three prevalence sources.
- *
- * NAN-2361 precedence, and the reasoning behind it:
- *
- * The BASELINE wins whenever it has an answer, even if the in-window count is
- * larger. "Is this rare in my environment?" is a question about history — an
- * asset that touched the artifact yesterday sits outside a one-hour search
- * window, so the in-window number is a strict LOWER BOUND on environment
- * prevalence and would understate exactly the case an analyst must not
- * underestimate.
- *
- * The IN-WINDOW count is the fallback for artifacts the baseline has never
- * heard of — the minutes-old-alert case that motivated this work. It is
- * flagged `in-window` so the plot can draw it hollow and the tooltip can say
- * it is window-scoped, rather than passing it off as environment truth.
- *
- * `max()` across the two was considered and rejected: both are lower bounds so
- * the larger is technically the better estimate, but it produces a number whose
- * measurement period is unstated, which is how a chart loses an analyst's
- * trust. Two labelled numbers beat one ambiguous one.
+ * Parse timestamp string as UTC (handles database format without Z suffix)
  */
-function buildPoint(
-  occ: ArtifactOccurrence,
-  artifactType: 'hash' | 'domain',
-  baseline: BaselinePrevalence | undefined,
-  observation: InWindowObservation | undefined,
-  stamp: IngestStamp | undefined,
-  rarityThreshold: number,
-): PrevalenceScatterData['hashPoints'][number] {
-  const inWindowHosts = observation?.hosts;
-  const isNewAtIngest = stamp?.isNew === true;
-  // Pin the novelty cue to the artifact's earliest occurrence. `is_new` is
-  // stamped on EVERY occurrence during the snapshot catch-up, so without this
-  // one new artifact rings every dot it owns.
-  const isEarliestOccurrence =
-    stamp?.earliestMs == null || occ.eventTimestamp.getTime() <= stamp.earliestMs;
-  // `occ.eventTimestamp` only reflects rows the search page actually loaded
-  // (top-N by recency), so under any volume that exceeds the page size every
-  // artifact's "first occurrence" collapses to the tail of the window. The
-  // in-window observation's `firstInWindow` comes from an unbounded
-  // `min(time)` aggregate over the SAME window and is not subject to that
-  // truncation -- prefer it whenever it's available.
-  const firstSeen =
-    observation?.firstInWindow != null ? new Date(observation.firstInWindow) : occ.eventTimestamp;
+function parseTimestampAsUTC(timestamp: string | Date | undefined): Date {
+  if (!timestamp) return new Date();
+  if (timestamp instanceof Date) return timestamp;
 
-  if (baseline) {
-    return {
-      artifact: occ.artifact,
-      artifactType,
-      hostCount: baseline.hostCount,
-      firstSeen,
-      lastSeen: occ.eventTimestamp,
-      totalOccurrences: occ.occurrenceCount,
-      isRare: baseline.isRare,
-      prevalenceScore: baseline.prevalenceScore,
-      // NAN-1699: no event-time fallback — "new to env" must key off a REAL
-      // env-first-seen, not the occurrence time, or every miss looks new.
-      envFirstSeen: baseline.envFirstSeen,
-      prevalenceSource: 'baseline',
-      baselineHostCount: baseline.hostCount,
-      inWindowHosts,
-      inWindowEvents: observation?.events,
-    };
+  // If it already has timezone info (Z or +/-), parse directly
+  if (timestamp.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(timestamp)) {
+    return new Date(timestamp);
   }
 
-  if (inWindowHosts != null && inWindowHosts > 0) {
-    return {
-      artifact: occ.artifact,
-      artifactType,
-      hostCount: inWindowHosts,
-      firstSeen,
-      lastSeen: occ.eventTimestamp,
-      totalOccurrences: occ.occurrenceCount,
-      // Rarity against the same threshold the baseline uses, so the colour
-      // means the same thing on both. The COUNT's provenance differs, which is
-      // what the hollow fill and the tooltip communicate.
-      isRare: inWindowHosts < rarityThreshold,
-      prevalenceScore: 0,
-      envFirstSeen: undefined,
-      prevalenceSource: 'in-window',
-      inWindowHosts,
-      inWindowEvents: observation?.events,
-      isNewAtIngest: isNewAtIngest && isEarliestOccurrence,
-    };
-  }
-
-  return {
-    artifact: occ.artifact,
-    artifactType,
-    hostCount: 0,
-    firstSeen,
-    lastSeen: occ.eventTimestamp,
-    totalOccurrences: occ.occurrenceCount,
-    isRare: false,
-    prevalenceScore: 0,
-    envFirstSeen: undefined,
-    prevalenceSource: 'none',
-    inWindowHosts,
-    inWindowEvents: observation?.events,
-  };
+  // Database format: "YYYY-MM-DD HH:MM:SS.ffffff" - append Z to treat as UTC
+  const isoString = timestamp.replace(' ', 'T') + 'Z';
+  return new Date(isoString);
 }
-
 
 // NAN-1701: a dotted string is only a trackable DOMAIN artifact if its last
 // label is a plausible public TLD — otherwise filenames (`BGInfo.bmp`,
@@ -295,8 +189,8 @@ function isTrackableDomain(value: string, internalSuffixes: readonly string[] = 
   // internal-TLD / file-extension blocklist.
   if (tld.length < 2 || !/^[a-z]{2,24}$/.test(tld)) return false;
   if (NON_DOMAIN_LAST_LABELS.has(tld)) return false;
-  // NAN-3226: names under a tenant internal suffix (Settings → Risk) are
-  // internal hosts — the prevalence agg excludes them, so never plot them.
+  // NAN-3226: names under an internal suffix (Settings > Risk) are internal
+  // hosts; the domain prevalence lists exclude them, so never plot them.
   return !isInternalName(value, internalSuffixes);
 }
 
@@ -308,43 +202,55 @@ const RARITY_AUTO_MAX_HOURS = 4;
 // set can't fire hundreds of requests or drop tens of thousands of SVG dots.
 const RARITY_MAX_ARTIFACTS = 1000;
 const RARITY_BATCH_SIZE = 100; // == backend MAX_BULK_ARTIFACTS
-// NAN-2361: `limit` caps GROUPS on an aggregate, not events. Must clear the
-// per-query artifact count or artifacts silently vanish from the result.
-const OBSERVATION_LIMIT = 250;
-// NAN-2361: discovery asks "which artifacts appear" with no artifact filter,
-// so its `limit` caps distinct-artifact CARDINALITY for the search, not raw
-// events -- at real ingest volume this covers the whole window where the old
-// raw-row extraction covered a few seconds of it. `_FULL` is the ceiling for
-// an explicit "load all artifacts" click: still bounded (an unfiltered `*`
-// over a huge window can have very high cardinality), just far higher than
-// the default.
-const DISCOVERY_LIMIT = 500;
-const DISCOVERY_LIMIT_FULL = 10000;
-const RARITY_MAX_CONCURRENT = 6; // cap parallel prevalence batches (API service)
-// NAN-2361: the SEARCH service admission-controls at 5 concurrent queries per
-// user, and over-limit requests 429 IMMEDIATELY (no queueing). Discovery fires
-// 3 hash + 4 domain queries while the page's own search / artifact fetch can
-// still be in flight, so a cap of 6 guaranteed 429s — and a 429'd path used to
-// degrade silently to "found nothing". Keep search-service fan-out at 3 to
-// leave admission headroom, and retry throttled queries (below).
-const SEARCH_MAX_CONCURRENT = 3;
+const RARITY_MAX_CONCURRENT = 6; // cap parallel prevalence batches
+// In-window observation queries are real searches: keep them under the search
+// admission budget (over-limit requests 429 rather than queue).
+const OBSERVATION_MAX_CONCURRENT = 2;
 
-// Retry a search that was refused by admission control (429 / ADMISSION_DENIED).
-// The refusal is instantaneous, so a short backoff while sibling queries drain
-// almost always succeeds; anything else (real errors) is NOT retried.
-async function searchWithRetry(
-  req: Parameters<typeof api.search>[0],
-): Promise<Awaited<ReturnType<typeof api.search>>> {
-  for (let attempt = 0; ; attempt++) {
+/**
+ * G22 / NAN-2361 layer 1: the prevalence aggregates lag ingest, so a
+ * minutes-old artifact has no baseline yet and would plot as "not baselined"
+ * (hostCount 0, indistinguishable from boring). For exactly those artifacts,
+ * ask the searched window itself: an equality-filtered
+ * `stats dc(host) by <path>` per OCSF artifact path (see
+ * `lib/prevalence/inWindowObservation`). Best effort: a failed query leaves
+ * its artifacts unbaselined, it never breaks the chart.
+ */
+async function fetchInWindowObservations(
+  timeRange: { start: string; end: string } | undefined,
+  hashes: string[],
+  domains: string[],
+  isOcsf: boolean,
+): Promise<Map<string, InWindowObservation>> {
+  const out = new Map<string, InWindowObservation>();
+  if (!timeRange?.start || !timeRange?.end || (hashes.length === 0 && domains.length === 0)) return out;
+  // Over the whole searched window, not the user's filter: "how many hosts
+  // touched this artifact", like the baseline.
+  const { hashPaths, domainPaths, hostEval } = observationPathsFor(isOcsf);
+  const queries = [
+    ...buildObservationQueries(hashes, hashPaths, hostEval),
+    ...buildObservationQueries(domains, domainPaths, hostEval),
+  ];
+  const results = await mapLimit(queries, OBSERVATION_MAX_CONCURRENT, async (q) => {
     try {
-      return await api.search(req);
-    } catch (err) {
-      const throttled =
-        err instanceof ApiClientError && (err.status === 429 || err.code === 'ADMISSION_DENIED');
-      if (!throttled || attempt >= 3) throw err;
-      await new Promise((r) => setTimeout(r, 350 * 2 ** attempt + Math.random() * 250));
+      const resp = await api.search({
+        query: q.npl,
+        time_range: timeRange,
+        limit: OBSERVATION_BATCH_SIZE * 4,
+        skip_field_stats: true,
+        skip_histogram: true,
+      });
+      const rows = (resp.results || []).filter(
+        (r): r is Record<string, unknown> => r != null && typeof r === 'object',
+      );
+      return rows.map((row) => ({ path: q.path, row }));
+    } catch {
+      return [];
     }
-  }
+  });
+  const merged = mergeObservations([...hashes, ...domains], results.flat());
+  for (const [artifact, obs] of merged) out.set(artifact.toLowerCase(), obs);
+  return out;
 }
 
 // Run `fn` over `items` with at most `limit` in flight; preserves input order.
@@ -449,32 +355,6 @@ function extractArtifactsWithTimestamps(
       }
     };
 
-    // NAN-2361: OCSF/lake rows carry NONE of the UDM field names below, so the
-    // rarity chart extracted nothing and rendered permanently empty on a lake
-    // tenant. OCSF nests hashes in `<obj>.hashes[]` arrays and hostnames under
-    // endpoint/url/query objects. Both vocabularies are read so one component
-    // serves UDM, OCSF-on-ClickHouse and the lake.
-    const atPath = (root: unknown, path: string): unknown => {
-      let cur: unknown = root;
-      for (const part of path.split('.')) {
-        if (!cur || typeof cur !== 'object') return undefined;
-        cur = (cur as Record<string, unknown>)[part];
-      }
-      return cur;
-    };
-    // `hashes` is an array of {algorithm, value} objects in OCSF.
-    const addOcsfHashes = (path: string) => {
-      const arr = atPath(fields, path);
-      if (Array.isArray(arr)) {
-        for (const h of arr) {
-          if (h && typeof h === 'object') addHash((h as Record<string, unknown>).value);
-        }
-      }
-    };
-    for (const p of ['file.hashes', 'process.file.hashes', 'actor.process.file.hashes']) {
-      addOcsfHashes(p);
-    }
-
     // Extract file hashes
     addHash(fields.file_hash);
     addHash(fields.process_hash);
@@ -507,19 +387,6 @@ function extractArtifactsWithTimestamps(
     addDomain(fields.query);       // DNS queries (Sysmon Event 22)
     addDomain(fields.url_domain);  // Proxy/web logs
     addDomain(fields.http_host);   // HTTP Host header
-
-    // OCSF hostname surfaces (see the note above).
-    for (const p of [
-      'dst_endpoint.hostname',
-      'src_endpoint.hostname',
-      'url.hostname',
-      'query.hostname',
-      'http_request.url.hostname',
-    ]) {
-      addDomain(atPath(fields, p));
-    }
-    extractDomainFromUrl(atPath(fields, 'url.url_string'));
-    extractDomainFromUrl(atPath(fields, 'http_request.url.url_string'));
 
     // Extract domains from URL fields
     extractDomainFromUrl(fields.url);
@@ -554,6 +421,14 @@ function extractArtifactsWithTimestamps(
 type VisualizationMode = 'timeline' | 'prevalence';
 
 interface TimelineVisualizationProps {
+  /**
+   * NAN-4927: when the parent owns the page URL (Search keeps its state in
+   * the fragment), it passes the `view=rarity` flag and a setter so there is
+   * one URL-state owner. Without them the component reads/writes
+   * `?view=rarity` itself (dashboard panels).
+   */
+  urlRarityView?: boolean;
+  onUrlRarityViewChange?: (rarity: boolean) => void;
   timelineData: TimelineDataPoint[];
   eventCount: number;
   collapsed: boolean;
@@ -628,6 +503,8 @@ export function TimelineVisualization({
   resultCount,
   staticMode = false,
   title,
+  urlRarityView,
+  onUrlRarityViewChange,
   isAssetMode = false,
   onClearAssetFilter,
   assetFilterActive = false,
@@ -637,7 +514,8 @@ export function TimelineVisualization({
   // or any other value keeps the default Timeline view. Asset mode always starts in
   // prevalence and ignores the URL (the asset detail route owns its own URL shape).
   const [searchParams, setSearchParams] = useSearchParams();
-  const urlWantsRarity = searchParams.get('view') === 'rarity';
+  const urlControlled = onUrlRarityViewChange !== undefined;
+  const urlWantsRarity = urlControlled ? urlRarityView === true : searchParams.get('view') === 'rarity';
   const [mode, setMode] = useState<VisualizationMode>(
     isAssetMode || urlWantsRarity ? 'prevalence' : 'timeline'
   );
@@ -648,13 +526,6 @@ export function TimelineVisualization({
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const lastFetchedKeyRef = useRef<string | null>(null);
-  // Monotonic id for `loadScatterData` invocations; a run only commits its
-  // results while it is still the newest. See the guard at its top.
-  const scatterRunRef = useRef(0);
-  // Key of the run currently in flight, or null when nothing is running. The
-  // dedup guards need it: "already fetched this key" is only a safe skip when
-  // no DIFFERENT key is still in flight behind it.
-  const activeRunKeyRef = useRef<string | null>(null);
   // Track the max host count for server-side re-fetch in asset mode
   // Default high so the chart isn't empty — analysts can drag down to focus on rare artifacts
   const [assetMaxHostCount, setAssetMaxHostCount] = useState(10000);
@@ -671,6 +542,11 @@ export function TimelineVisualization({
   // Sync mode → URL (skip for asset mode, which doesn't own the search URL).
   useEffect(() => {
     if (isAssetMode) return;
+    if (urlControlled) {
+      const wantRarity = mode === 'prevalence';
+      if (wantRarity !== (urlRarityView === true)) onUrlRarityViewChange?.(wantRarity);
+      return;
+    }
     const current = searchParams.get('view');
     const desired = mode === 'prevalence' ? 'rarity' : null;
     if (current === desired) return;
@@ -678,9 +554,11 @@ export function TimelineVisualization({
     if (desired) next.set('view', desired);
     else next.delete('view');
     setSearchParams(next, { replace: true });
-  }, [mode, isAssetMode, searchParams, setSearchParams]);
+  }, [mode, isAssetMode, searchParams, setSearchParams, urlControlled, urlRarityView, onUrlRarityViewChange]);
 
   const { mutate: fetchScatterData } = usePrevalenceScatterData();
+  // In-window observation paths differ per schema profile (NAN-4931).
+  const { isOcsf } = useSchemaFieldMap();
   // Stable ref for fetchScatterData — useMutation returns a new function identity
   // every render (because .bind() creates a new ref), which would cascade into
   // loadScatterData getting a new identity → trigger effect re-firing → double fetch.
@@ -758,204 +636,17 @@ export function TimelineVisualization({
       });
     return () => {
       cancelled = true;
-      // Same wedge as the discovery effect below: a cancelled run must release
-      // the claims it made before fetching, or the flag stays true and the key
-      // stays claimed forever.
-      if (artifactFetchKeyRef.current === artifactFetchKey) artifactFetchKeyRef.current = null;
-      setArtifactFetchLoading(false);
     };
   }, [mode, isAssetMode, slimHasArtifacts, artifactFetchKey, _query, timeRange]);
-
-  // NAN-2361: which artifacts exist in this window, discovered by an aggregate
-  // (`stats ... by <path>`) over the caller's OWN query -- no artifact filter,
-  // no raw-row extraction. `limit` here bounds distinct-artifact CARDINALITY,
-  // not events, so it covers the real window at real ingest volume instead of
-  // a few seconds of it (see DISCOVERY_LIMIT). Supersedes raw-row extraction
-  // as the artifact-list source; `fetchedArtifacts` above still runs and now
-  // serves only `rarityRows` (ingest-stamp / novelty harvesting below).
-  // "Load all" opt-in is KEYED to the query+window it was clicked for: a new
-  // search must fall back to the default limit rather than silently inheriting
-  // a prior query's 10,000-group opt-in. (A plain boolean reset via effect
-  // would still let the discovery effect fire once at the stale FULL limit
-  // before the reset committed.)
-  const [discoveryLoadAllKey, setDiscoveryLoadAllKey] = useState<string | null>(null);
-  const discoveryLoadAll = discoveryLoadAllKey != null && discoveryLoadAllKey === artifactFetchKey;
-  const [discovered, setDiscovered] = useState<{
-    key: string;
-    hash: DiscoveryResult;
-    domain: DiscoveryResult;
-  } | null>(null);
-  const [discoveryLoading, setDiscoveryLoading] = useState(false);
-  const discoveryKeyRef = useRef<string | null>(null);
-  // Bumped by the failure banner's retry button to re-run an incomplete discovery.
-  const [discoveryRetryNonce, setDiscoveryRetryNonce] = useState(0);
-
-  useEffect(() => {
-    // NAN-2361: aggregate discovery runs even when the LOADED rows already
-    // carry artifacts.
-    //
-    // `slimHasArtifacts` describes the current PAGE, not the result set. Gating
-    // on it meant one artifact anywhere in the loaded rows suppressed the
-    // aggregate entirely, and the chart then plotted only that page's artifacts
-    // while presenting itself as the environment view — every artifact outside
-    // the loaded page silently missing. The full-field page fetch above still
-    // uses the flag (it exists only to recover pruned columns); completeness of
-    // the artifact SET is this query's job.
-    if (mode !== 'prevalence' || isAssetMode || !artifactFetchKey || !_query) return;
-    const limit = discoveryLoadAll ? DISCOVERY_LIMIT_FULL : DISCOVERY_LIMIT;
-    const effectiveKey = `${artifactFetchKey}|${limit}`;
-    if (discoveryKeyRef.current === effectiveKey) return;
-    discoveryKeyRef.current = effectiveKey;
-    setDiscoveryLoading(true);
-    let cancelled = false;
-
-    // ONE bounded pool across hash + domain paths — two parallel pools of 6
-    // meant 7 concurrent searches against a 5-per-user admission limit, so at
-    // least two paths 429'd on EVERY discovery run and silently dropped out.
-    const hashQueries = buildDiscoveryQueries(_query!, HASH_PATHS);
-    const domainQueries = buildDiscoveryQueries(_query!, DOMAIN_PATHS);
-    mapLimit([...hashQueries, ...domainQueries], SEARCH_MAX_CONCURRENT, async (q) => {
-      try {
-        const resp = await searchWithRetry({
-          query: q.npl,
-          time_range: timeRange!,
-          limit,
-          skip_histogram: true,
-        });
-        return {
-          path: q.path,
-          rows: (resp.results ?? []) as Record<string, unknown>[],
-          totalCount: resp.total_count ?? null,
-        };
-      } catch {
-        // Discovery is an enhancement; a failed path never breaks the chart —
-        // but it is NOT "found nothing": mark it so the UI can say the list
-        // is incomplete (a bare empty result here used to be indistinguishable
-        // from a genuinely artifact-free path).
-        return { path: q.path, rows: [], totalCount: null, failed: true };
-      }
-    })
-      .then((results) => {
-        if (cancelled) return;
-        const hash = mergeDiscoveryResults(results.slice(0, hashQueries.length));
-        const domain = mergeDiscoveryResults(results.slice(hashQueries.length));
-        setDiscovered({ key: effectiveKey, hash, domain });
-      })
-      .catch(() => {
-        if (cancelled) return;
-        if (discoveryKeyRef.current === effectiveKey) discoveryKeyRef.current = null;
-      })
-      .finally(() => {
-        if (!cancelled) setDiscoveryLoading(false);
-      });
-    return () => {
-      cancelled = true;
-      // Release BOTH claims this run made, or a cancelled run wedges the tab.
-      //
-      // The run marks the key as attempted and flips the loading flag before
-      // fetching, but `.finally` is guarded by `!cancelled` — so switching away
-      // from Rarity mid-flight (or any re-render handing down a new `timeRange`
-      // identity) tore the effect down with `discoveryLoading` stuck true and
-      // the key stuck claimed. Coming back rendered the spinner branch forever:
-      // no chart, no empty state, and neither retry button reachable, since both
-      // live in branches that require a `discoveryResult`.
-      if (discoveryKeyRef.current === effectiveKey) discoveryKeyRef.current = null;
-      setDiscoveryLoading(false);
-    };
-  }, [mode, isAssetMode, artifactFetchKey, _query, timeRange, discoveryLoadAll, discoveryRetryNonce]);
-
-  const discoveryResult =
-    discovered && discovered.key === `${artifactFetchKey}|${discoveryLoadAll ? DISCOVERY_LIMIT_FULL : DISCOVERY_LIMIT}`
-      ? discovered
-      : null;
 
   // Only trust fetched rows that belong to the CURRENT query + window; a stale
   // set from a prior query is ignored (→ empty until the new fetch resolves).
   const extractedData = useMemo(() => {
-    // NAN-2361: discovery WINS whenever it has landed, including when the
-    // loaded page already carries artifacts.
-    //
-    // Preferring `slimExtracted` in that case reintroduced the very bug the
-    // discovery effect above was un-gated to fix: the effect now always runs,
-    // but its result was discarded the moment one artifact appeared in the
-    // loaded rows, so the chart still plotted a page-local subset while
-    // presenting itself as the environment view. `slimExtracted` stays as the
-    // PROGRESSIVE fallback — something to render while discovery is in flight
-    // (or if it never resolves) — not as the preferred source.
-    if (!discoveryResult) {
-      return slimHasArtifacts
-        ? slimExtracted
-        : { hashes: [], domains: [], hashOccurrences: [], domainOccurrences: [], droppedCount: 0 };
-    }
-    // Discovery groups on WHATEVER value the field holds — unlike the raw-row
-    // path (`addHash`/`isTrackableDomain` below), there's no per-row client
-    // filter before a group key becomes an artifact. `dst_endpoint.hostname`
-    // et al. are frequently the placeholder `"-"` when no hostname exists for
-    // that event; without this filter it group-bys into a "rare, 1-host,
-    // not-yet-baselined" dot that isn't a real artifact at all.
-    const toOccurrences = (
-      result: DiscoveryResult,
-      isValid: (artifact: string) => boolean,
-    ): ArtifactOccurrence[] =>
-      Array.from(result.observations.entries())
-        .filter(([artifact]) => isValid(artifact))
-        .map(([artifact, obs]) => ({
-          artifact,
-          // No `min(time)` for the group: anchor to the window start, not to
-          // "now". The artifact demonstrably occurred somewhere in this window,
-          // so the window's left edge is the honest lower bound; `new Date()`
-          // would place it at the right edge and read as a fresh sighting.
-          eventTimestamp:
-            obs.firstInWindow != null
-              ? new Date(obs.firstInWindow)
-              : parseTimestampAsUTC(timeRange?.start),
-          occurrenceCount: obs.events || 1,
-        }));
-    const allHashes = toOccurrences(discoveryResult.hash, (a) => /^[a-fA-F0-9]{32,64}$/.test(a));
-    const allDomains = toOccurrences(discoveryResult.domain, (a) => isTrackableDomain(a, internalSuffixes));
-    const keptHashes = allHashes.slice(0, RARITY_MAX_ARTIFACTS).map((o) => o.artifact);
-    const keptDomains = allDomains
-      .slice(0, Math.max(0, RARITY_MAX_ARTIFACTS - keptHashes.length))
-      .map((o) => o.artifact);
-    const kept = new Set([...keptHashes, ...keptDomains]);
-    const droppedCount = allHashes.length + allDomains.length - kept.size;
-    return {
-      hashes: keptHashes,
-      domains: keptDomains,
-      hashOccurrences: allHashes.filter((o) => kept.has(o.artifact)),
-      domainOccurrences: allDomains.filter((o) => kept.has(o.artifact)),
-      droppedCount,
-    };
-  }, [slimHasArtifacts, slimExtracted, discoveryResult, timeRange, internalSuffixes]);
-
-  // NAN-2361: the rows the ingest stamps are harvested from. Unlike the artifact
-  // LIST (which discovery owns), a stamp is a per-source earliest-ingest time —
-  // any loaded rows for this query carry it, so preferring already-loaded
-  // `results` over a second fetch costs nothing in correctness.
-  const rarityRows: SearchResult[] = useMemo(() => {
-    if (slimHasArtifacts) return results;
-    return fetchedArtifacts && fetchedArtifacts.key === artifactFetchKey
-      ? fetchedArtifacts.rows
-      : [];
-  }, [slimHasArtifacts, results, fetchedArtifacts, artifactFetchKey]);
-  // NAN-2361: truncation is now an ARTIFACT-cardinality signal from discovery
-  // (`total_count` on the aggregate vs rows returned), not an events-loaded
-  // signal -- a query can load a "sample" of 500 events yet discover its
-  // complete artifact population, or vice versa. It is no longer suppressed
-  // when the page happens to hold artifacts: discovery now owns the list in
-  // that case too, so its truncation is the honest signal for what is plotted.
-  const rarityTruncated =
-    !isAssetMode && !!discoveryResult &&
-    (discoveryResult.hash.truncated || discoveryResult.domain.truncated);
-  const rarityTotalArtifacts = discoveryResult
-    ? discoveryResult.hash.totalArtifacts + discoveryResult.domain.totalArtifacts
-    : 0;
-  // Paths whose discovery query failed even after 429 retries: the artifact
-  // list is incomplete in a way the truncation banner cannot express (a failed
-  // path reports totalCount null and never trips `truncated`).
-  const discoveryFailedPaths = discoveryResult
-    ? [...discoveryResult.hash.failedPaths, ...discoveryResult.domain.failedPaths]
-    : [];
+    if (slimHasArtifacts) return slimExtracted;
+    const fresh =
+      fetchedArtifacts && fetchedArtifacts.key === artifactFetchKey ? fetchedArtifacts.rows : [];
+    return extractArtifactsWithTimestamps(fresh, internalSuffixes);
+  }, [slimHasArtifacts, slimExtracted, fetchedArtifacts, artifactFetchKey, internalSuffixes]);
   const hasArtifacts = extractedData.hashes.length > 0 || extractedData.domains.length > 0;
 
   // NAN-1700 progressive render: pending scatter points derived purely from the
@@ -1262,14 +953,10 @@ export function TimelineVisualization({
   // One dot per event, positioned at the event's actual timestamp.
   const buildScatterPoints = useCallback((
     occurrences: ApiArtifactOccurrence[],
-    prevalenceMap: Map<string, { hostCount: number; isRare: boolean; prevalenceScore: number; totalOccurrences: number; envFirstSeen?: Date; prevalenceSource?: PrevalenceSource; inWindowHosts?: number }>,
+    prevalenceMap: Map<string, { hostCount: number; isRare: boolean; prevalenceScore: number; totalOccurrences: number; envFirstSeen: Date }>,
     artifactType: 'hash' | 'domain',
   ): PrevalenceScatterData['hashPoints'] => {
     return occurrences
-      // An occurrence with no usable timestamp has no X position. Plotting it at
-      // "now" (what the old parse fallback did) puts it at the right-hand edge
-      // and reads as a fresh sighting; dropping it is the honest rendering.
-      .filter((occ) => !Number.isNaN(parseTimestampAsUTC(occ.timestamp).getTime()))
       .map((occ) => {
         const prevalence = prevalenceMap.get(occ.artifact.toLowerCase());
         const eventTs = parseTimestampAsUTC(occ.timestamp);
@@ -1290,62 +977,12 @@ export function TimelineVisualization({
           // No event-time fallback: novelty ("new to env") must key off a REAL
           // env-first-seen, never the occurrence time (which is always "now").
           envFirstSeen: prevalence?.envFirstSeen,
-          // NAN-2361: asset mode computes layer 1 SERVER-side (the rows are
-          // already in hand there, so it costs no extra query) and sends the
-          // provenance down. Absent = ClickHouse/UDM, where a real count is a
-          // baseline and a zero is genuinely absent.
-          prevalenceSource:
-            prevalence?.prevalenceSource ??
-            ((prevalence?.hostCount ?? 0) > 0 ? 'baseline' : 'none'),
-          inWindowHosts: prevalence?.inWindowHosts,
-          baselineHostCount:
-            prevalence?.prevalenceSource === 'in-window' ? undefined : prevalence?.hostCount,
         };
       });
   }, []);
 
   // Fetch scatter data when panel is opened and artifacts change
   const loadScatterData = useCallback(async (maxHostCountOverride?: number) => {
-    // NAN-2361: last-writer-wins guard.
-    //
-    // This loader is fired for the SLIM artifact set as soon as the page has
-    // artifacts, and again when discovery lands with the complete set. Both
-    // calls are long-running and both commit unconditionally, so whichever
-    // resolves LAST won — and the slim run is the smaller query, but not
-    // reliably the faster one (it can be queued behind the discovery fan-out at
-    // the 5-per-user admission limit). When it lost the race it restored the
-    // page-derived chart on top of discovery's, leaving the plotted dots out of
-    // lockstep with `rarityTruncated` and the artifact-count banner.
-    //
-    // Every commit below is therefore gated on this run still being current.
-    //
-    // The generation is claimed only once a branch actually commits to
-    // fetching — NOT at entry. Bumping on entry would let an invocation that
-    // immediately returns on the dedup guard (or on `!hasArtifacts`) orphan a
-    // genuinely in-flight run, which would then decline to clear the spinner
-    // that nothing else is going to clear.
-    let isStale = () => false;
-    const beginRun = (key: string | null) => {
-      const run = ++scatterRunRef.current;
-      activeRunKeyRef.current = key;
-      isStale = () => scatterRunRef.current !== run;
-    };
-    // Settle: only the current run may release the in-flight marker.
-    const endRun = () => {
-      if (!isStale()) activeRunKeyRef.current = null;
-    };
-    // "Already fetched" is a safe skip ONLY while nothing newer is in flight.
-    //
-    // Otherwise this sequence commits stale data: K0 completes, K1 starts (and
-    // has already blanked the chart), then the inputs revert to K0. Comparing
-    // against `lastFetchedKeyRef` alone made that third invocation return
-    // immediately, leaving K1 the current run — so K1 passed its own staleness
-    // check and painted its results over a UI whose inputs are K0. Falling
-    // through instead supersedes K1 and refetches K0, which is a wasted query
-    // in a rare case and the correct chart in every case.
-    const canSkipAsAlreadyFetched = (key: string) =>
-      key === lastFetchedKeyRef.current &&
-      (activeRunKeyRef.current === null || activeRunKeyRef.current === key);
     // In asset mode, use the dedicated endpoint that does server-side prevalence filtering
     if (isAssetMode && assetContext && timeRange) {
       const effectiveMaxHostCount = maxHostCountOverride ?? assetMaxHostCount;
@@ -1355,9 +992,8 @@ export function TimelineVisualization({
         timeRange,
         maxHostCount: effectiveMaxHostCount,
       });
-      if (canSkipAsAlreadyFetched(assetKey)) return;
+      if (assetKey === lastFetchedKeyRef.current) return;
 
-      beginRun(assetKey);
       setIsLoading(true);
       setError(null);
 
@@ -1375,39 +1011,25 @@ export function TimelineVisualization({
         // (prevalence is unfiltered — covers ALL artifacts for slider range)
         const hashPrevalenceMap = new Map<string, {
           hostCount: number; isRare: boolean; prevalenceScore: number;
-          totalOccurrences: number; envFirstSeen?: Date;
-          prevalenceSource?: PrevalenceSource; inWindowHosts?: number;
+          totalOccurrences: number; envFirstSeen: Date;
         }>();
         for (const p of response.hash_prevalence) {
           hashPrevalenceMap.set(p.artifact.toLowerCase(), {
             hostCount: p.host_count, isRare: p.is_rare,
             prevalenceScore: p.prevalence_score, totalOccurrences: p.total_occurrences,
-            // REAL env-wide first-seen only. `p.first_seen` is the in-window
-            // minimum — keying novelty off it stamped long-known artifacts
-            // "new to env" whenever their first in-window hit was recent.
-            envFirstSeen: p.env_first_seen ? parseTimestampAsUTC(p.env_first_seen) : undefined,
-            // NAN-2361: computed server-side for asset mode; absent on the
-            // ClickHouse/UDM path.
-            prevalenceSource: p.prevalence_source,
-            inWindowHosts: p.in_window_hosts,
+            envFirstSeen: new Date(p.first_seen),
           });
         }
 
         const domainPrevalenceMap = new Map<string, {
           hostCount: number; isRare: boolean; prevalenceScore: number;
-          totalOccurrences: number; envFirstSeen?: Date;
-          prevalenceSource?: PrevalenceSource; inWindowHosts?: number;
+          totalOccurrences: number; envFirstSeen: Date;
         }>();
         for (const p of response.domain_prevalence) {
           domainPrevalenceMap.set(p.artifact.toLowerCase(), {
             hostCount: p.host_count, isRare: p.is_rare,
             prevalenceScore: p.prevalence_score, totalOccurrences: p.total_occurrences,
-            // REAL env-wide first-seen only — see the hash map above.
-            envFirstSeen: p.env_first_seen ? parseTimestampAsUTC(p.env_first_seen) : undefined,
-            // NAN-2361: computed server-side for asset mode; absent on the
-            // ClickHouse/UDM path.
-            prevalenceSource: p.prevalence_source,
-            inWindowHosts: p.in_window_hosts,
+            envFirstSeen: new Date(p.first_seen),
           });
         }
 
@@ -1422,12 +1044,8 @@ export function TimelineVisualization({
           ...response.domain_prevalence.map(p => p.host_count),
         ];
         const maxArtifactHostCount = allHostCounts.length > 0 ? Math.max(...allHostCounts) : undefined;
-        // Prefer the backend's pre-LIMIT total: the prevalence arrays are
-        // capped at 50 per class, so their lengths under-count on busy assets.
-        const totalUnfilteredArtifacts = response.total_artifacts
-          ?? (response.hash_prevalence.length + response.domain_prevalence.length);
+        const totalUnfilteredArtifacts = response.hash_prevalence.length + response.domain_prevalence.length;
 
-        if (isStale()) return;
         setScatterData({
           hashPoints,
           domainPoints,
@@ -1437,28 +1055,17 @@ export function TimelineVisualization({
         });
         lastFetchedKeyRef.current = assetKey;
       } catch (err) {
-        if (isStale()) return;
         setError(err instanceof Error ? err.message : 'Failed to load prevalence data');
         lastFetchedKeyRef.current = null;
       } finally {
-        // A superseded run must not clear the spinner the CURRENT run is still
-        // showing, nor leave it stuck when it is itself the current run.
-        if (!isStale()) setIsLoading(false);
-        endRun();
+        setIsLoading(false);
       }
       return;
     }
 
     // Non-asset mode: use artifacts extracted from search results
     if (!hasArtifacts) {
-      // Supersede any in-flight run: "this query has no artifacts" is a final
-      // answer, and letting an older fetch land afterwards would repopulate the
-      // chart from a superseded artifact set. Clear the spinner here since the
-      // orphaned run will now decline to.
-      beginRun(null);
       setScatterData(null);
-      setIsLoading(false);
-      activeRunKeyRef.current = null;
       return;
     }
 
@@ -1471,14 +1078,13 @@ export function TimelineVisualization({
       domains: extractedData.domains,
       window: timeWindow,
     });
-    if (canSkipAsAlreadyFetched(currentKey)) {
+    if (currentKey === lastFetchedKeyRef.current) {
       return;
     }
 
     // NAN-1700: new artifact set/window — drop the previous (now stale) enriched
     // data so the pending points render immediately for THIS search instead of
     // the old dots lingering until the new fetch lands.
-    beginRun(currentKey);
     setScatterData(null);
     setIsLoading(true);
     setError(null);
@@ -1521,6 +1127,9 @@ export function TimelineVisualization({
         envFirstSeen: Date;
       }>();
       for (const p of response.hash_points) {
+        // host_count null = unknown (prevalence still warming / partial for
+        // this window): leave it unbaselined rather than plot a zero.
+        if (p.host_count == null) continue;
         hashPrevalenceMap.set(p.artifact.toLowerCase(), {
           hostCount: p.host_count,
           isRare: p.is_rare,
@@ -1538,6 +1147,9 @@ export function TimelineVisualization({
         envFirstSeen: Date;
       }>();
       for (const p of response.domain_points) {
+        // host_count null = unknown (prevalence still warming / partial for
+        // this window): leave it unbaselined rather than plot a zero.
+        if (p.host_count == null) continue;
         domainPrevalenceMap.set(p.artifact.toLowerCase(), {
           hostCount: p.host_count,
           isRare: p.is_rare,
@@ -1547,133 +1159,70 @@ export function TimelineVisualization({
         });
       }
 
-      // NAN-2361 layer 1: ask the events we already matched how many hosts
-      // touched each artifact IN THIS WINDOW. The baseline snapshot lags ingest
-      // by 30-90 min, so for a minutes-old alert it simply has nothing — and a
-      // miss used to arrive as host_count 0, rendered as "boring".
-      //
-      // This does NOT replace the baseline. Environment prevalence is a
-      // question about history: an asset that touched the artifact yesterday is
-      // outside the search window and invisible here. So layer 1 is only ever
-      // the fallback when the baseline has nothing, and is labelled as a
-      // window-scoped lower bound when used.
-      //
-      // Skipped entirely for ClickHouse/UDM tenants: those rows carry no
-      // `enrichments`, so the stamp map is empty and we never issue the queries.
-      // `rarityRows` are `SearchResult`-shaped (`{id, timestamp, source, fields}`),
-      // not raw OCSF rows -- `enrichments` lives at `.fields.enrichments`, one
-      // level down. Passing the wrapper itself left every row's `enrichments`
-      // undefined, so `lakeShaped` was permanently false and the whole in-window
-      // layer silently never ran on the search page (asset mode is unaffected;
-      // it builds its rows differently).
-      const rowsForStamps = rarityRows.map(
-        (r) => (r as unknown as { fields?: Record<string, unknown> }).fields ?? {},
+      // G22 / NAN-2361 layer 1: artifacts the baseline has nothing for get
+      // their distinct-host count from the searched window instead.
+      const unbaselined = (list: string[], map: Map<string, { hostCount: number }>) =>
+        list.filter((a) => !((map.get(a)?.hostCount ?? 0) > 0));
+      const observed = await fetchInWindowObservations(
+        timeRange,
+        unbaselined(extractedData.hashes, hashPrevalenceMap),
+        unbaselined(extractedData.domains, domainPrevalenceMap),
+        isOcsf,
       );
-      const ingestStamps: Map<string, IngestStamp> = harvestIngestStamps(
-        rowsForStamps,
-        (row) => {
-          const raw = (row as { timestamp?: unknown }).timestamp ?? (row as { time?: unknown }).time;
-          if (raw == null) return null;
-          if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
-          // Lake rows carry `time` as a NAIVE string ("2026-08-21 12:28:28.109000",
-          // no zone). A bare Date.parse reads that as LOCAL time, shifting
-          // `earliestMs` by the viewer's UTC offset while the occurrence
-          // timestamps it's compared against are parsed as UTC — west of UTC
-          // every occurrence passed the earliest-pin check (novelty ring on
-          // every dot), east of UTC none did (ring suppressed entirely).
-          const parsed = parseTimestampAsUTC(String(raw)).getTime();
-          return Number.isFinite(parsed) ? parsed : null;
-        },
-      );
-      const lakeShaped = ingestStamps.size > 0;
-
-      let hashObservations = new Map<string, InWindowObservation>();
-      let domainObservations = new Map<string, InWindowObservation>();
-      // Mirrors `extractedData`'s source precedence exactly: whenever discovery
-      // supplied the artifact list, it must also supply their observations, or
-      // the two fall out of lockstep and artifacts render with another source's
-      // host counts.
-      if (discoveryResult) {
-        // Discovery (above) already ran the unbounded `stats ... by <path>`
-        // aggregate to build the artifact list in the first place, so it
-        // already carries hosts/events/first_in_window per artifact -- no
-        // second per-artifact lookup round trip needed here.
-        hashObservations = discoveryResult.hash.observations;
-        domainObservations = discoveryResult.domain.observations;
-      } else if (lakeShaped && timeRange?.start && timeRange?.end) {
-        // slim mode: artifacts came from already-loaded `results`, not
-        // discovery, so their in-window stats still need a lookup.
-        const runObservations = async (artifacts: string[], paths: readonly string[]) => {
-          const queries = buildObservationQueries(artifacts, paths);
-          if (queries.length === 0) return new Map<string, InWindowObservation>();
-          // SEARCH_MAX_CONCURRENT + retry: same 5-concurrent admission limit as
-          // discovery — a pool of 6 could 429 its own sixth query.
-          const responses = await mapLimit(queries, SEARCH_MAX_CONCURRENT, async (q) => {
-            try {
-              const resp = await searchWithRetry({
-                query: q.npl,
-                time_range: timeRange!,
-                // `limit` caps GROUPS, not events — must clear the chunk size or
-                // artifacts silently drop out of the aggregate.
-                limit: Math.max(OBSERVATION_LIMIT, q.artifacts.length * 2),
-                skip_histogram: true,
-              });
-              return (resp.results ?? []).map((row) => ({
-                path: q.path,
-                row: row as unknown as Record<string, unknown>,
-              }));
-            } catch {
-              // Layer 1 is an enhancement; a failed aggregate must degrade to
-              // "no in-window data", never break the chart.
-              return [];
-            }
-          });
-          return mergeObservations(artifacts, responses.flat());
-        };
-        [hashObservations, domainObservations] = await Promise.all([
-          runObservations(extractedData.hashes, HASH_PATHS),
-          runObservations(extractedData.domains, DOMAIN_PATHS),
-        ]);
-      }
+      const rarityThreshold = response.rarity_threshold;
+      const withObservation = <T extends { hostCount: number; isRare: boolean }>(artifact: string, point: T): T & { inWindow?: boolean } => {
+        if (point.hostCount > 0) return point;
+        const obs = observed.get(artifact);
+        if (!obs || obs.hosts <= 0) return point;
+        return { ...point, hostCount: obs.hosts, isRare: obs.hosts < rarityThreshold, inWindow: true };
+      };
 
       // Merge per-event timestamps (from extractedData) with environment-wide
-      // prevalence stats (from API). X-axis prefers the in-window observation's
-      // `firstInWindow` (unbounded aggregate) over the raw occurrence timestamp,
-      // which is truncated to whatever page the search loaded and collapses to
-      // the tail of the window once event volume exceeds the page size.
+      // prevalence stats (from API). X-axis uses event timestamps
+      // so the scatter spreads across the search timeframe.
       const hashPoints: PrevalenceScatterData['hashPoints'] = extractedData.hashOccurrences
-        .map((occ) =>
-          buildPoint(
-            occ,
-            'hash',
-            hashPrevalenceMap.get(occ.artifact),
-            hashObservations.get(occ.artifact),
-            ingestStamps.get(occ.artifact),
-            response.rarity_threshold,
-          ),
-        );
+        .map((occ) => {
+          const prevalence = hashPrevalenceMap.get(occ.artifact);
+          return withObservation(occ.artifact, {
+            artifact: occ.artifact,
+            artifactType: 'hash' as const,
+            hostCount: prevalence?.hostCount ?? 0,
+            firstSeen: occ.eventTimestamp,
+            lastSeen: occ.eventTimestamp,
+            totalOccurrences: occ.occurrenceCount,
+            isRare: prevalence?.isRare ?? false,
+            prevalenceScore: prevalence?.prevalenceScore ?? 0,
+            // NAN-1699: no event-time fallback — "new to env" must key off a REAL
+            // env-first-seen, not the occurrence time, or every miss looks new.
+            envFirstSeen: prevalence?.envFirstSeen,
+          });
+        });
 
       const domainPoints: PrevalenceScatterData['domainPoints'] = extractedData.domainOccurrences
-        .map((occ) =>
-          buildPoint(
-            occ,
-            'domain',
-            domainPrevalenceMap.get(occ.artifact),
-            domainObservations.get(occ.artifact),
-            ingestStamps.get(occ.artifact),
-            response.rarity_threshold,
-          ),
-        );
+        .map((occ) => {
+          const prevalence = domainPrevalenceMap.get(occ.artifact);
+          return withObservation(occ.artifact, {
+            artifact: occ.artifact,
+            artifactType: 'domain' as const,
+            hostCount: prevalence?.hostCount ?? 0,
+            firstSeen: occ.eventTimestamp,
+            lastSeen: occ.eventTimestamp,
+            totalOccurrences: occ.occurrenceCount,
+            isRare: prevalence?.isRare ?? false,
+            prevalenceScore: prevalence?.prevalenceScore ?? 0,
+            // NAN-1699: no event-time fallback — "new to env" must key off a REAL
+            // env-first-seen, not the occurrence time, or every miss looks new.
+            envFirstSeen: prevalence?.envFirstSeen,
+          });
+        });
 
-      if (isStale()) return;
       setScatterData({
         hashPoints,
         domainPoints,
-        rarityThreshold: response.rarity_threshold,
+        rarityThreshold,
       });
       lastFetchedKeyRef.current = currentKey;
     } catch (err) {
-      if (isStale()) return;
       setError(err instanceof Error ? err.message : 'Failed to load prevalence data');
       // NAN-1700: DON'T mark the key as fetched on failure, or the Retry button
       // (and a later re-open) hit the dedup guard and can never recover — mirror
@@ -1682,16 +1231,11 @@ export function TimelineVisualization({
       lastFetchedKeyRef.current = null;
       setMode('timeline');
     } finally {
-      // See the asset branch: only the current run owns the spinner.
-      if (!isStale()) setIsLoading(false);
-      endRun();
+      setIsLoading(false);
     }
   // Note: fetchScatterData accessed via stable ref (fetchScatterDataRef) to avoid
   // cascading identity changes from useMutation on every render
-  // `rarityRows` is included because NAN-2361's stamp harvest reads it; it is
-  // memoized from the same inputs as `extractedData`, so it changes in lockstep
-  // rather than adding a new invalidation source.
-  }, [extractedData, rarityRows, hasArtifacts, timeWindow, isAssetMode, assetContext, timeRange, buildScatterPoints, assetMaxHostCount, discoveryResult, slimHasArtifacts]);
+  }, [extractedData, hasArtifacts, timeWindow, isAssetMode, assetContext, timeRange, buildScatterPoints, assetMaxHostCount, isOcsf]);
 
   // NAN-1700: PREFETCH prevalence as soon as a search yields artifacts — not
   // gated on the Rarity tab being open. The agg lookup can take a while, so
@@ -1842,7 +1386,7 @@ export function TimelineVisualization({
                     value="rarity"
                     disabled={!hasSearched && !isAssetMode}
                     title={
-                      artifactFetchLoading || discoveryLoading
+                      artifactFetchLoading
                         ? 'Finding artifacts…'
                         : !hasSearched && !isAssetMode
                           ? 'Run a search to see artifact rarity'
@@ -1989,41 +1533,6 @@ export function TimelineVisualization({
                   // positions) and let the enriched scatterData animate the rarity
                   // in when it lands — no full-panel spinner blocking the view.
                   <>
-                    {rarityTruncated && (
-                      <div className="text-[10px] text-amber-400/80 text-center pb-1 flex items-center justify-center gap-2">
-                        <span>
-                          artifact discovery capped at {(discoveryLoadAll ? DISCOVERY_LIMIT_FULL : DISCOVERY_LIMIT).toLocaleString()} — {rarityTotalArtifacts.toLocaleString()} artifact matches across all paths (an artifact seen on several paths counts once per path)
-                        </span>
-                        {!discoveryLoadAll && (
-                          <button
-                            type="button"
-                            className="underline underline-offset-2 hover:text-amber-300 disabled:opacity-50"
-                            disabled={discoveryLoading}
-                            onClick={() => setDiscoveryLoadAllKey(artifactFetchKey)}
-                          >
-                            load all (slower)
-                          </button>
-                        )}
-                      </div>
-                    )}
-                    {discoveryFailedPaths.length > 0 && (
-                      <div className="text-[10px] text-amber-400/80 text-center pb-1 flex items-center justify-center gap-2">
-                        <span>
-                          {discoveryFailedPaths.length} of {HASH_PATHS.length + DOMAIN_PATHS.length} artifact discovery queries failed — the chart may be missing artifacts
-                        </span>
-                        <button
-                          type="button"
-                          className="underline underline-offset-2 hover:text-amber-300 disabled:opacity-50"
-                          disabled={discoveryLoading}
-                          onClick={() => {
-                            discoveryKeyRef.current = null;
-                            setDiscoveryRetryNonce((n) => n + 1);
-                          }}
-                        >
-                          retry
-                        </button>
-                      </div>
-                    )}
                     {extractedData.droppedCount > 0 && (
                       <div className="text-[10px] text-amber-400/80 text-center pb-1">
                         showing first {RARITY_MAX_ARTIFACTS.toLocaleString()} of {(RARITY_MAX_ARTIFACTS + extractedData.droppedCount).toLocaleString()} artifacts — narrow the window to score the rest
@@ -2031,30 +1540,10 @@ export function TimelineVisualization({
                     )}
                     <PrevalenceScatterPlot data={(scatterData ?? pendingScatterData)!} onArtifactClick={handleArtifactClick} onSelectionChange={handleSelectionChange} height={180} loading={isLoading} timeRange={timeRange} onMaxHostCountChange={isAssetMode ? handleMaxHostCountChange : undefined} />
                   </>
-                ) : (isLoading || artifactFetchLoading || discoveryLoading) ? (
+                ) : (isLoading || artifactFetchLoading) ? (
                   <div className="flex items-center justify-center py-8 text-muted-foreground text-sm"><LoadingIcon className="w-4 h-4 mr-2" />Loading rarity index...</div>
                 ) : (
-                  // Total-failure case: every discovery path failed, so there are
-                  // no dots to hang the incomplete-data banner on — say why the
-                  // chart is empty rather than presenting a failure as "no data".
-                  <div className="flex flex-col items-center justify-center py-8 gap-1.5 text-muted-foreground text-sm">
-                    <span>No rarity data available</span>
-                    {discoveryFailedPaths.length > 0 && (
-                      <span className="text-[10px] text-amber-400/80 flex items-center gap-2">
-                        {discoveryFailedPaths.length} of {HASH_PATHS.length + DOMAIN_PATHS.length} artifact discovery queries failed
-                        <button
-                          type="button"
-                          className="underline underline-offset-2 hover:text-amber-300"
-                          onClick={() => {
-                            discoveryKeyRef.current = null;
-                            setDiscoveryRetryNonce((n) => n + 1);
-                          }}
-                        >
-                          retry
-                        </button>
-                      </span>
-                    )}
-                  </div>
+                  <div className="flex items-center justify-center py-8 text-muted-foreground text-sm">No rarity data available</div>
                 )}
               </div>
             )}

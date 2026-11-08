@@ -9,7 +9,7 @@
 //   • Cases    — InspectorCasesTab (case visibility + default queue)
 //   • Versions — InspectorVersionsTab (history, inline diff, revert)
 //
-// NAN-3023: styling follows the "Rules pivt Panel" handoff mapped onto the app
+// NAN-3023: styling follows the "Rules Pivt Panel" handoff mapped onto the app
 // type scale; shared pieces live in ./InspectorPrimitives.
 //
 // Mirrors `design-ref/shadcn/editor-inspector.jsx` structure but composes the

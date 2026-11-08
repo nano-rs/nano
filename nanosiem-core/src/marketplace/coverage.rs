@@ -116,12 +116,16 @@ pub struct ArtifactCoverage {
     pub have: Vec<String>,
     /// Display labels of recommended providers that are NOT installed
     pub missing: Vec<String>,
-    /// Whether `pct` is a measurement. Omitted by the open-core
-    /// (ClickHouse) path, which always measures; the shared lake path sets
-    /// `false` for a type it has no measurement for, so the page renders
-    /// "not measured yet" instead of a 0 % gap.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub measured: Option<bool>,
+    /// NAN-4946 (main NAN-3762): `false` when no event in the window carried
+    /// this artifact type, so `pct` has no denominator and renders as "not
+    /// measured yet", never 0 %. Defaults to `true` for cached payloads that
+    /// predate the field.
+    #[serde(default = "measured_default")]
+    pub measured: bool,
+}
+
+fn measured_default() -> bool {
+    true
 }
 
 /// Top-level response.
@@ -134,6 +138,10 @@ pub struct MarketplaceCoverage {
     /// time the request was served. Use the manual-refresh button to
     /// force a recompute.
     pub computed_at: DateTime<Utc>,
+    /// NAN-4946: `false` when the ClickHouse aggregate could not run, so every
+    /// row is unknown rather than 0 %.
+    #[serde(default = "measured_default")]
+    pub telemetry_available: bool,
 }
 
 // ============================================================================
@@ -202,7 +210,7 @@ SELECT
      OR (dest_ip != '' AND enriched_dest_asn != '')
     )                                                                                              AS asn_enriched
 FROM logs
-PREWHERE timestamp >= now() - INTERVAL 24 HOUR
+WHERE timestamp >= now() - INTERVAL 24 HOUR
 "#;
 
 /// SQL access expression for a UDM-semantic column under `profile`, or `None`
@@ -275,7 +283,9 @@ fn count_if(pred: Option<String>) -> String {
 /// and the bare UDM `enriched_*`/`ioc_*` columns aren't promoted there).
 fn build_coverage_sql(profile: &dyn SchemaProfile, is_clustered: bool) -> String {
     // FROM the active schema's logs table (`nanosiem.ocsf_logs` for OCSF). The
-    // PREWHERE timestamp column is the same in both schemas (`timestamp`).
+    // The WHERE timestamp column is the same in both schemas (`timestamp`).
+    // One WHERE, no explicit PREWHERE (NAN-1412): ClickHouse's
+    // optimize_move_to_prewhere places the predicates.
     // NAN-1728 (H5/R11): on a cluster the read fans in across all shards via the
     // `_distributed` wrapper; single-node keeps the bare local name
     // (byte-identical). Both logs and ocsf_logs are in the distributed set.
@@ -324,10 +334,7 @@ fn build_coverage_sql(profile: &dyn SchemaProfile, is_clustered: bool) -> String
             .as_ref()
             .map(|c| format!("({c} != '' AND NOT isIPv4String({c}))")),
     ]);
-    let domain_enriched = match (
-        dest_host.as_ref(),
-        prev_present(profile, "prevalence_dest_domain"),
-    ) {
+    let domain_enriched = match (dest_host.as_ref(), prev_present(profile, "prevalence_dest_domain")) {
         (Some(c), Some(p)) => Some(format!("({c} != '' AND NOT isIPv4String({c}) AND {p})")),
         _ => None,
     };
@@ -340,10 +347,7 @@ fn build_coverage_sql(profile: &dyn SchemaProfile, is_clustered: bool) -> String
         process_hash.as_ref().map(|c| format!("{c} != ''")),
     ]);
     let hash_enriched = any_of(vec![
-        match (
-            file_hash.as_ref(),
-            prev_present(profile, "prevalence_file_hash"),
-        ) {
+        match (file_hash.as_ref(), prev_present(profile, "prevalence_file_hash")) {
             (Some(c), Some(p)) => Some(format!("({c} != '' AND {p})")),
             _ => None,
         },
@@ -370,10 +374,7 @@ fn build_coverage_sql(profile: &dyn SchemaProfile, is_clustered: bool) -> String
     // enrichment lands. TODO(OCSF): wire user-identity enrichment presence once
     // the OCSF identity-enrichment columns exist (NAN-1148 lane).
     let user_enriched = any_of(vec![
-        match (
-            src_user.as_ref(),
-            str_present(profile, "src_user_identity_display_name"),
-        ) {
+        match (src_user.as_ref(), str_present(profile, "src_user_identity_display_name")) {
             (Some(c), Some(p)) => Some(format!("({c} != '' AND {p})")),
             _ => None,
         },
@@ -395,17 +396,11 @@ fn build_coverage_sql(profile: &dyn SchemaProfile, is_clustered: bool) -> String
     // Asset enrichment reuses the destination-domain prevalence signal (matches
     // the UDM query's existing — admittedly approximate — heuristic).
     let asset_enriched = any_of(vec![
-        match (
-            src_host.as_ref(),
-            prev_present(profile, "prevalence_dest_domain"),
-        ) {
+        match (src_host.as_ref(), prev_present(profile, "prevalence_dest_domain")) {
             (Some(c), Some(p)) => Some(format!("({c} != '' AND {p})")),
             _ => None,
         },
-        match (
-            dest_host.as_ref(),
-            prev_present(profile, "prevalence_dest_domain"),
-        ) {
+        match (dest_host.as_ref(), prev_present(profile, "prevalence_dest_domain")) {
             (Some(c), Some(p)) => Some(format!("({c} != '' AND {p})")),
             _ => None,
         },
@@ -428,7 +423,7 @@ fn build_coverage_sql(profile: &dyn SchemaProfile, is_clustered: bool) -> String
     ]);
 
     format!(
-        "SELECT\n    {} AS ip_total,\n    {} AS ip_enriched,\n    {} AS domain_total,\n    {} AS domain_enriched,\n    {} AS hash_total,\n    {} AS hash_enriched,\n    {} AS user_total,\n    {} AS user_enriched,\n    {} AS asset_total,\n    {} AS asset_enriched,\n    {} AS asn_total,\n    {} AS asn_enriched\nFROM {}\nPREWHERE timestamp >= now() - INTERVAL 24 HOUR\n",
+        "SELECT\n    {} AS ip_total,\n    {} AS ip_enriched,\n    {} AS domain_total,\n    {} AS domain_enriched,\n    {} AS hash_total,\n    {} AS hash_enriched,\n    {} AS user_total,\n    {} AS user_enriched,\n    {} AS asset_total,\n    {} AS asset_enriched,\n    {} AS asn_total,\n    {} AS asn_enriched\nFROM {}\nWHERE timestamp >= now() - INTERVAL 24 HOUR\n",
         count_if(ip_total),
         count_if(ip_enriched),
         count_if(domain_total),
@@ -473,10 +468,10 @@ fn coverage_sql(
     let Some(predicate) = source_scope_sql_predicate("source_type", denied_sources) else {
         return base;
     };
-    let time_gate = "PREWHERE timestamp >= now() - INTERVAL 24 HOUR";
+    let time_gate = "WHERE timestamp >= now() - INTERVAL 24 HOUR";
     debug_assert!(
         base.contains(time_gate),
-        "coverage aggregate must retain its 24-hour PREWHERE"
+        "coverage aggregate must retain its 24-hour time bound"
     );
     base.replacen(time_gate, &format!("{time_gate} AND {predicate}"), 1)
 }
@@ -485,13 +480,13 @@ async fn fetch_counts(
     ch: &ChClient,
     profile: &dyn SchemaProfile,
     denied_sources: &BTreeSet<String>,
-) -> CoverageCounts {
+) -> Option<CoverageCounts> {
     let sql = coverage_sql(profile, coverage_is_clustered(), denied_sources);
     match ch.query(&sql).fetch_one::<CoverageCounts>().await {
-        Ok(row) => row,
+        Ok(row) => Some(row),
         Err(e) => {
-            warn!(error = %e, "marketplace_coverage: ClickHouse aggregate failed; returning zeros");
-            CoverageCounts::default()
+            warn!(error = %e, "marketplace_coverage: ClickHouse aggregate failed; rows are unmeasured");
+            None
         }
     }
 }
@@ -588,117 +583,66 @@ impl MarketplaceCoverageService {
         // 1. Look up installed slug → name from Postgres so the hero chips can
         // render display labels rather than raw slugs. We pull both because
         // the recommended map is keyed by slug but the chips show the name.
-        let installed: Vec<(String, String)> =
-            sqlx::query_as("SELECT slug, name FROM marketplace_catalog WHERE installed = true")
-                .fetch_all(&self.pool)
-                .await?;
+        let installed: Vec<(String, String)> = sqlx::query_as(
+            "SELECT slug, name FROM marketplace_catalog WHERE installed = true",
+        )
+        .fetch_all(&self.pool)
+        .await?;
 
         // 2. Fan one query at ClickHouse — built against the active schema.
-        let counts =
+        let fetched =
             fetch_counts(&self.ch_client, self.profile.as_ref(), &self.denied_sources).await;
+        let telemetry_available = fetched.is_some();
+        let counts = fetched.unwrap_or_default();
 
         // 3. Project each artifact row using the counts + installed set + the
         // recommended map.
-        let artifacts = project_counts(&counts, &installed);
+        let artifacts = ARTIFACTS
+            .iter()
+            .map(|(id, label, recommended)| {
+                let (total, enriched) = match *id {
+                    "ip" => (counts.ip_total, counts.ip_enriched),
+                    "domain" => (counts.domain_total, counts.domain_enriched),
+                    "hash" => (counts.hash_total, counts.hash_enriched),
+                    "user" => (counts.user_total, counts.user_enriched),
+                    "asset" => (counts.asset_total, counts.asset_enriched),
+                    "asn" => (counts.asn_total, counts.asn_enriched),
+                    _ => (0, 0),
+                };
+                let pct = if total == 0 {
+                    0
+                } else {
+                    ((enriched as f64 / total as f64) * 100.0).round().clamp(0.0, 100.0) as u8
+                };
+
+                let mut have = Vec::new();
+                let mut missing = Vec::new();
+                for slug in *recommended {
+                    if let Some((_, name)) = installed.iter().find(|(s, _)| s == slug) {
+                        have.push(name.clone());
+                    } else {
+                        missing.push(human_name_for(slug));
+                    }
+                }
+
+                ArtifactCoverage {
+                    id: (*id).to_string(),
+                    label: (*label).to_string(),
+                    pct,
+                    state: CoverageState::from_pct(pct),
+                    have,
+                    missing,
+                    measured: telemetry_available && total > 0,
+                }
+            })
+            .collect();
 
         Ok(MarketplaceCoverage {
             artifacts,
             computed_at: Utc::now(),
+            telemetry_available,
         })
     }
-}
-
-/// `pct` of `enriched` over `total`, rounded, clamped to 0..=100; 0 when
-/// there is nothing to measure.
-fn ratio_pct(total: u64, enriched: u64) -> u8 {
-    if total == 0 {
-        0
-    } else {
-        ((enriched as f64 / total as f64) * 100.0).round().clamp(0.0, 100.0) as u8
-    }
-}
-
-/// `have` / `missing` chips for one artifact's recommended providers.
-fn provider_chips(recommended: &[&str], installed: &[(String, String)]) -> (Vec<String>, Vec<String>) {
-    let mut have = Vec::new();
-    let mut missing = Vec::new();
-    for slug in recommended {
-        if let Some((_, name)) = installed.iter().find(|(s, _)| s == slug) {
-            have.push(name.clone());
-        } else {
-            missing.push(human_name_for(slug));
-        }
-    }
-    (have, missing)
-}
-
-/// Open-core (ClickHouse) projection: every row is measured from `counts`
-/// and carries no `measured` flag (its JSON is unchanged by NAN-3762).
-fn project_counts(counts: &CoverageCounts, installed: &[(String, String)]) -> Vec<ArtifactCoverage> {
-    ARTIFACTS
-        .iter()
-        .map(|(id, label, recommended)| {
-            let (total, enriched) = match *id {
-                "ip" => (counts.ip_total, counts.ip_enriched),
-                "domain" => (counts.domain_total, counts.domain_enriched),
-                "hash" => (counts.hash_total, counts.hash_enriched),
-                "user" => (counts.user_total, counts.user_enriched),
-                "asset" => (counts.asset_total, counts.asset_enriched),
-                "asn" => (counts.asn_total, counts.asn_enriched),
-                _ => (0, 0),
-            };
-            let pct = ratio_pct(total, enriched);
-            let (have, missing) = provider_chips(recommended, installed);
-            ArtifactCoverage {
-                id: (*id).to_string(),
-                label: (*label).to_string(),
-                pct,
-                state: CoverageState::from_pct(pct),
-                have,
-                missing,
-                measured: None,
-            }
-        })
-        .collect()
-}
-
-/// Shared/lean projection (NAN-3762): `measure(id)` returns `(total,
-/// enriched)` for the artifact types the deployment measured. A type with no
-/// measurement, or nothing to measure (`total == 0`), reports
-/// `measured: false` and `pct = 0` so the page renders "not measured yet";
-/// measured types report `measured: true`.
-pub fn coverage_with_measurements(
-    installed: &[(String, String)],
-    measure: impl Fn(&str) -> Option<(u64, u64)>,
-    computed_at: DateTime<Utc>,
-) -> MarketplaceCoverage {
-    let artifacts = ARTIFACTS
-        .iter()
-        .map(|(id, label, recommended)| {
-            let measured = measure(id).filter(|(total, _)| *total > 0);
-            let pct = measured.map_or(0, |(total, enriched)| ratio_pct(total, enriched));
-            let (have, missing) = provider_chips(recommended, installed);
-            ArtifactCoverage {
-                id: (*id).to_string(),
-                label: (*label).to_string(),
-                pct,
-                state: CoverageState::from_pct(pct),
-                have,
-                missing,
-                measured: Some(measured.is_some()),
-            }
-        })
-        .collect();
-    MarketplaceCoverage { artifacts, computed_at }
-}
-
-/// Coverage projection with NO telemetry counts (NAN-2361 shared lake): the
-/// recommended-provider chips still render from `installed` (`(slug, name)`),
-/// while every artifact reports `measured: false` (`pct = 0`). The caller
-/// also flags the response as telemetry-unavailable so the page does not read
-/// the zeros as a measured gap.
-pub fn coverage_without_telemetry(installed: &[(String, String)]) -> MarketplaceCoverage {
-    coverage_with_measurements(installed, |_| None, Utc::now())
 }
 
 /// Best-effort display name for a slug that isn't installed yet (so it has no
@@ -745,78 +689,6 @@ mod tests {
         assert_eq!(CoverageState::from_pct(74), CoverageState::Partial);
         assert_eq!(CoverageState::from_pct(75), CoverageState::Good);
         assert_eq!(CoverageState::from_pct(100), CoverageState::Good);
-    }
-
-    /// NAN-3762: pins the open-core (ClickHouse) projection — row order,
-    /// rounding, zero-denominator, provider chips, and the JSON shape (no
-    /// `measured` key) — so the lean work cannot drift the dedicated path.
-    #[test]
-    fn open_core_projection_is_pinned() {
-        let counts = CoverageCounts {
-            ip_total: 3,
-            ip_enriched: 2,
-            domain_total: 0,
-            domain_enriched: 0,
-            hash_total: 1000,
-            hash_enriched: 745,
-            user_total: 8,
-            user_enriched: 9,
-            asset_total: 200,
-            asset_enriched: 59,
-            asn_total: 3,
-            asn_enriched: 1,
-        };
-        let installed = vec![("ipinfo_lite".to_string(), "IPinfo Lite (installed)".to_string())];
-        let rows = project_counts(&counts, &installed);
-        let got: Vec<(&str, u8, CoverageState)> = rows.iter().map(|r| (r.id.as_str(), r.pct, r.state)).collect();
-        assert_eq!(
-            got,
-            vec![
-                ("ip", 67, CoverageState::Partial),
-                ("domain", 0, CoverageState::Gap),
-                ("hash", 75, CoverageState::Good),
-                ("user", 100, CoverageState::Good),
-                ("asset", 30, CoverageState::Partial),
-                ("asn", 33, CoverageState::Partial),
-            ]
-        );
-        assert_eq!(rows[0].label, "IP addresses");
-        assert_eq!(rows[0].have, vec!["IPinfo Lite (installed)"]);
-        assert_eq!(rows[0].missing, vec!["AbuseIPDB", "GreyNoise", "VirusTotal", "Tor Exit Nodes"]);
-        assert_eq!(rows[5].have, vec!["IPinfo Lite (installed)"]);
-        assert_eq!(rows[5].missing, vec!["Shodan"]);
-        let json = serde_json::to_value(&rows[0]).unwrap();
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "id": "ip", "label": "IP addresses", "pct": 67, "state": "partial",
-                "have": ["IPinfo Lite (installed)"],
-                "missing": ["AbuseIPDB", "GreyNoise", "VirusTotal", "Tor Exit Nodes"],
-            }),
-            "open-core rows never carry `measured`"
-        );
-    }
-
-    #[test]
-    fn lean_projection_flags_unmeasured_rows_instead_of_zero() {
-        let at = Utc::now();
-        let coverage = coverage_with_measurements(
-            &[],
-            |id| match id {
-                "ip" | "asn" => Some((200, 150)),
-                "hash" => Some((0, 0)),
-                _ => None,
-            },
-            at,
-        );
-        assert_eq!(coverage.computed_at, at);
-        let by_id = |id: &str| coverage.artifacts.iter().find(|a| a.id == id).unwrap();
-        assert_eq!((by_id("ip").pct, by_id("ip").measured), (75, Some(true)));
-        assert_eq!((by_id("asn").pct, by_id("asn").measured), (75, Some(true)));
-        assert_eq!(by_id("hash").measured, Some(false), "nothing to measure is not a 0 % gap");
-        assert_eq!(by_id("domain").measured, Some(false));
-        let none = coverage_without_telemetry(&[]);
-        assert!(none.artifacts.iter().all(|a| a.measured == Some(false) && a.pct == 0));
     }
 
     #[test]
@@ -867,10 +739,7 @@ mod tests {
 
         // FROM the OCSF table, not the nonexistent `logs`.
         assert!(sql.contains("FROM nanosiem.ocsf_logs"), "sql:\n{sql}");
-        assert!(
-            !sql.contains("FROM logs\n"),
-            "must not read UDM logs:\n{sql}"
-        );
+        assert!(!sql.contains("FROM logs\n"), "must not read UDM logs:\n{sql}");
 
         // Promoted dotted columns resolve (escaped) instead of bare UDM names.
         assert!(sql.contains("\"src_endpoint.ip\""), "sql:\n{sql}");
@@ -911,7 +780,7 @@ mod tests {
 
         assert!(
             sql.contains(
-                "PREWHERE timestamp >= now() - INTERVAL 24 HOUR \
+                "WHERE timestamp >= now() - INTERVAL 24 HOUR \
                  AND lower(source_type) NOT IN ('audit', 'windows_sysmon')"
             ),
             "coverage aggregate must gate every counted row with the canonical predicate:\n{sql}"
@@ -946,3 +815,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "coverage_measured_tests.rs"]
+mod measured_tests;

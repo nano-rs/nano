@@ -10,6 +10,15 @@ fn exe() -> Command {
     Command::new(env!("CARGO_BIN_EXE_nano-connector"))
 }
 
+/// Run `cmd` with credentials on stdin (`--creds-stdin`), never on argv.
+fn with_creds(mut cmd: Command, creds: &str) -> std::process::Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = cmd.arg("--creds-stdin").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(creds.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+
 fn dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/specs")
 }
@@ -36,13 +45,13 @@ fn validate_accepts_shipped_specs_and_rejects_bad_vrl() {
 
 #[test]
 fn preview_runs_an_agent_enrichment_offline() {
-    let out = exe()
+    let mut cmd = exe();
+    cmd
         .args(["preview"])
         .arg(dir().join("virustotal.yaml"))
         .arg(recordings().join("virustotal_hash.json"))
-        .args(["--cred", "API_KEY=preview-key-1", "--artifact", "44d88612fea8a8f36de82e1278abb02f", "--type", "hash"])
-        .output()
-        .unwrap();
+        .args(["--artifact", "44d88612fea8a8f36de82e1278abb02f", "--type", "hash"]);
+    let out = with_creds(cmd, "API_KEY=preview-key-1");
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stderr)));
     assert_eq!(v["ok"], true, "{v}");
     assert_eq!(v["result"]["risk_score"], 86);
@@ -51,13 +60,13 @@ fn preview_runs_an_agent_enrichment_offline() {
 
 #[test]
 fn preview_runs_a_paged_windowed_collector_offline() {
-    let out = exe()
+    let mut cmd = exe();
+    cmd
         .args(["preview"])
         .arg(dir().join("okta_system_log.yaml"))
         .arg(recordings().join("okta_system_log.json"))
-        .args(["--cred", "API_TOKEN=preview-token-1", "--config", "OKTA_DOMAIN=acme.okta.com", "--now", "2026-10-10T11:05:00Z", "--show", "3"])
-        .output()
-        .unwrap();
+        .args(["--config", "OKTA_DOMAIN=acme.okta.com", "--now", "2026-10-10T11:05:00Z", "--show", "3"]);
+    let out = with_creds(cmd, "API_TOKEN=preview-token-1");
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stderr)));
     assert_eq!(v["ok"], true, "{v}");
     // Every window replays the same recording; dedupe ships each uuid once.
@@ -67,13 +76,13 @@ fn preview_runs_a_paged_windowed_collector_offline() {
 
 #[test]
 fn preview_refuses_a_request_outside_the_allowlist() {
-    let out = exe()
+    let mut cmd = exe();
+    cmd
         .args(["preview"])
         .arg(dir().join("okta_system_log.yaml"))
         .arg(recordings().join("okta_system_log.json"))
-        .args(["--cred", "API_TOKEN=preview-token-1", "--config", "OKTA_DOMAIN=metadata.google.internal"])
-        .output()
-        .unwrap();
+        .args(["--config", "OKTA_DOMAIN=metadata.google.internal"]);
+    let out = with_creds(cmd, "API_TOKEN=preview-token-1");
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], false);
     assert!(v["error"].as_str().unwrap().to_lowercase().contains("host") || v["error"].as_str().unwrap().contains("denied"), "{v}");
@@ -102,13 +111,13 @@ fn validate_rejects_a_collector_with_no_ingest_id_or_window() {
 
 #[test]
 fn preview_stamps_the_provider_uid_as_nano_ingest_id() {
-    let out = exe()
+    let mut cmd = exe();
+    cmd
         .args(["preview"])
         .arg(dir().join("okta_system_log.yaml"))
         .arg(recordings().join("okta_system_log.json"))
-        .args(["--cred", "API_TOKEN=preview-token-1", "--config", "OKTA_DOMAIN=acme.okta.com", "--now", "2026-10-10T11:05:00Z", "--show", "3"])
-        .output()
-        .unwrap();
+        .args(["--config", "OKTA_DOMAIN=acme.okta.com", "--now", "2026-10-10T11:05:00Z", "--show", "3"]);
+    let out = with_creds(cmd, "API_TOKEN=preview-token-1");
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["content_hash_ingest_ids"], 0, "{v}");
     let sample = v["sample"].as_array().unwrap();
@@ -121,12 +130,9 @@ fn preview_stamps_the_provider_uid_as_nano_ingest_id() {
 #[test]
 fn shadow_only_talks_to_a_loopback_mock() {
     for url in ["http://10.0.0.1:8080", "https://127.0.0.1:8080", "http://localhost.example:80"] {
-        let out = exe()
-            .args(["shadow"])
-            .arg(dir().join("okta_system_log.yaml"))
-            .args(["--mock-url", url, "--cred", "API_TOKEN=t", "--config", "OKTA_DOMAIN=acme.okta.com"])
-            .output()
-            .unwrap();
+        let mut cmd = exe();
+        cmd.args(["shadow"]).arg(dir().join("okta_system_log.yaml")).args(["--mock-url", url, "--config", "OKTA_DOMAIN=acme.okta.com"]);
+        let out = with_creds(cmd, "API_TOKEN=t");
         assert_eq!(out.status.code(), Some(2), "{url}: {}", String::from_utf8_lossy(&out.stdout));
         assert!(String::from_utf8_lossy(&out.stderr).contains("loopback"), "{url}: {}", String::from_utf8_lossy(&out.stderr));
     }

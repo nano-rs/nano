@@ -13,7 +13,8 @@ use super::super::error::RuleRepositoryError;
 use super::super::github_client::GitHubClient;
 use super::super::models::{FolderInfo, NewRuleRepository, RuleRepository, UpdateRuleRepository};
 use super::RuleRepositoryService;
-use super::ALLOWED_REPOSITORIES;
+use super::{AIRGAP_RULES_URL, ALLOWED_REPOSITORIES};
+use crate::content_catalog_defaults::is_allowed_repository;
 
 impl RuleRepositoryService {
     // =========================================================================
@@ -22,15 +23,27 @@ impl RuleRepositoryService {
 
     /// List all repositories
     pub async fn list_repositories(&self) -> Result<Vec<RuleRepository>, RuleRepositoryError> {
-        self.repo_repository
+        // NAN-4947: third-party rows (disabled on upgrade) are hidden.
+        Ok(self
+            .repo_repository
             .list()
             .await
-            .map_err(|e| RuleRepositoryError::from_repo_error(e))
+            .map_err(|e| RuleRepositoryError::from_repo_error(e))?
+            .into_iter()
+            .filter(|r| Self::first_party(&r.url))
+            .collect())
+    }
+
+    /// NAN-4947: only nano first-party repositories (and the air-gap bundle
+    /// repository) are admissible.
+    pub fn first_party(url: &str) -> bool {
+        is_allowed_repository(url, ALLOWED_REPOSITORIES, AIRGAP_RULES_URL)
     }
 
     /// Get a repository by ID
     pub async fn get_repository(&self, id: Uuid) -> Result<RuleRepository, RuleRepositoryError> {
-        self.repo_repository
+        let repo = self
+            .repo_repository
             .find_by_id(id)
             .await
             .map_err(|e| match e {
@@ -38,7 +51,12 @@ impl RuleRepositoryService {
                     RuleRepositoryError::RepositoryNotFound(id)
                 }
                 _ => RuleRepositoryError::from_repo_error(e),
-            })
+            })?;
+        // NAN-4947: the chokepoint for sync, browse, import and upstream diffs.
+        if !Self::first_party(&repo.url) {
+            return Err(RuleRepositoryError::RepositoryNotAllowed(repo.url));
+        }
+        Ok(repo)
     }
 
     /// Get a repository by slug
@@ -64,9 +82,14 @@ impl RuleRepositoryService {
 
         // Check against allowlist - only permitted repositories can be added
         let repo_key = format!("{}/{}", owner.to_lowercase(), repo_name.to_lowercase());
-        if !ALLOWED_REPOSITORIES.contains(&repo_key.as_str()) {
+        if !Self::first_party(&req.url) {
             warn!("Attempted to add non-allowlisted repository: {}", repo_key);
             return Err(RuleRepositoryError::RepositoryNotAllowed(repo_key));
+        }
+        // NAN-4947: store the canonical spelling the sync parses back.
+        let mut req = req;
+        if let Some(canonical) = crate::schema::canonical_github_url(&req.url) {
+            req.url = canonical;
         }
 
         self.repo_repository
@@ -86,6 +109,8 @@ impl RuleRepositoryService {
         id: Uuid,
         req: UpdateRuleRepository,
     ) -> Result<RuleRepository, RuleRepositoryError> {
+        // NAN-4947: a disabled third-party row can never be re-enabled.
+        self.get_repository(id).await?;
         self.repo_repository
             .update(id, &req)
             .await

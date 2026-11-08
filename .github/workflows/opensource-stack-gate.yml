@@ -1,0 +1,117 @@
+name: opensource stack gate
+
+# NAN-1261 — cheap PR gate for the open-source quickstart stack DEFINITION.
+# Validates docker-compose.opensource.yml + images.lock + install.sh + the
+# config/vector bundle WITHOUT standing the stack up, so breakage like NAN-1260
+# (vector rejecting a removed config field after a version bump) is caught on the
+# PR, not after merge. The heavy full bring-up + ingestion smoke is a separate,
+# dispatch-only gate (see enrichment-lane-gate.yml for that pattern).
+
+on:
+  pull_request:
+    paths:
+      - docker-compose.opensource.yml
+      - docker-compose.siem-only.yml
+      - images.lock
+      - install.sh
+      - scripts/lib/resource-sizing.sh
+      - clickhouse/config.d/zzzz-nano-sizing.xml
+      - clickhouse/users.d/zzzz-nano-sizing.xml
+      - Dockerfile*
+      - scripts/check-cargo-package-scoping.sh
+      - config/vector/**
+      - scripts/check-opensource-pins.sh
+      - clickhouse/preflight/**
+      - nanosiem-web/**
+      - tools/sync-to-nano-mirror.sh
+      - tools/scan-mirror-secrets.sh
+      - tools/tests/**
+      - scripts/tests/install-edition.test.sh
+      - scripts/tests/install-resource-sizing.test.sh
+      - scripts/tests/resource-sizing.test.sh
+      - scripts/tests/clickhouse-sizing-mount.test.sh
+      - scripts/tests/fixtures/resource-sizing.snap
+      - scripts/check-opencore-web-build.sh
+      - .github/workflows/opensource-stack-gate.yml
+  workflow_dispatch:
+
+concurrency:
+  group: opensource-stack-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    # Self-hosted only (repo rule — never ubuntu-latest). Needs docker +
+    # docker compose v2 on the runner (same as enrichment-lane-gate).
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: shellcheck install.sh + gate script (best-effort)
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -x install.sh scripts/lib/resource-sizing.sh scripts/check-opensource-pins.sh
+          else
+            echo "shellcheck not installed on runner — skipping."
+          fi
+
+      # NAN-2363: an unscoped `cargo build` in the Dockerfile selects the whole
+      # workspace and unifies features, so nanosiem-enterprise turned on
+      # nanosiem-core/enterprise for OPEN images too. Both editions still
+      # compile, so only a structural check catches it.
+      - name: Cargo package scoping (open-edition feature leak)
+        run: bash scripts/check-cargo-package-scoping.sh
+
+      - name: Validate open-source stack definition
+        run: bash scripts/check-opensource-pins.sh
+
+      # NAN-4968: install.sh edition/release resolution fails closed, and the
+      # mirror credential scan catches multiline PEM private keys. The install
+      # test lives under scripts/, which the public mirror strips.
+      - name: install.sh edition and release scenarios
+        run: |
+          if [ -f scripts/tests/install-edition.test.sh ]; then
+            bash scripts/tests/install-edition.test.sh
+          else
+            echo "install-edition test not in this tree (public mirror); skipping"
+          fi
+
+      - name: Host resource sizing scenarios
+        run: |
+          if [ -f scripts/tests/resource-sizing.test.sh ]; then
+            bash scripts/tests/resource-sizing.test.sh
+            bash scripts/tests/install-resource-sizing.test.sh
+            bash scripts/tests/clickhouse-sizing-mount.test.sh
+          else
+            echo "resource-sizing tests not in this tree (public mirror); skipping"
+          fi
+
+      - name: Mirror credential scan tests
+        run: bash tools/tests/scan-mirror-secrets.test.sh
+
+      # NAN-4906: the ClickHouse pre-start preflight (AVX2 + obsolete s3-disk
+      # elements) gates every compose stack's server start.
+      - name: ClickHouse preflight script tests
+        run: sh clickhouse/preflight/test-clickhouse-preflight.sh
+
+      # NAN-4902: the open web edition must build from the STRIPPED tree. In
+      # the private tree `@/enterprise/*` still resolves to the real sources
+      # (tsconfig falls back to the stubs), so drifted stubs only break the
+      # public mirror. Run in a one-off container so Node 22 and rsync are
+      # available even when the bare self-hosted runner has drifted. The
+      # checkout is mounted read-only; npm writes only to the container's
+      # per-run stripped tree and cannot leave root-owned workspace files.
+      - name: Open-core web build from the stripped tree
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace:ro" -w /workspace \
+            node:22-bookworm \
+            bash -euo pipefail -c '
+              if ! command -v rsync >/dev/null 2>&1; then
+                apt-get update
+                apt-get install -y --no-install-recommends rsync
+              fi
+              bash scripts/check-opencore-web-build.sh
+            '

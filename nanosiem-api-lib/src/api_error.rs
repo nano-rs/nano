@@ -1,13 +1,11 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 //! Shared `ApiError` type — lifted out of `nanosiem-api/src/error.rs` so that
-//! enterprise handler modules in the enterprise crate can return the same
+//! enterprise handler modules in `nanosiem-enterprise` can return the same
 //! error type without depending on `nanosiem-api` (which would create a
 //! circular crate dependency).
 //!
 //! All `From` impls that involve only `nanosiem-core` types live here.
 //! `From` impls for enterprise-tier error types
-//! (e.g. `enterprise::CaseServiceError`) live in the enterprise crate
+//! (e.g. `nanosiem_enterprise::CaseServiceError`) live in `nanosiem-enterprise`
 //! to satisfy the orphan rule — the enterprise crate references both
 //! `ApiError` (from this crate, on which it depends) and the enterprise error
 //! type, so the impl is legal there.
@@ -41,66 +39,14 @@ pub enum ApiError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
-    /// A one-time resource that no longer exists (e.g. an already revealed
-    /// sealed ingest credential, NAN-2592). 410.
-    #[error("Gone: {0}")]
-    Gone(String),
-
-    /// NAN-3620: a write surface deliberately retired on this deployment
-    /// (e.g. stored cloud credentials on hosted-shared tenants, where cloud
-    /// pull is keyless). 410 with a stable lowercase `code` the client can
-    /// key off and `details.reason` carrying the same value; reads and
-    /// deletes of existing rows stay available.
-    #[error("{message}")]
-    Retired { code: &'static str, message: &'static str },
-
     #[error("Too many requests: {0}")]
     TooManyRequests(String),
-
-    /// NAN-3512: the tenant's monthly AI allowance is spent (the lean AI soft
-    /// cap). 429 with `code = ai_allowance_exhausted` and a `Retry-After` of
-    /// the seconds to the UTC month reset, so clients tell it apart from the
-    /// concurrency 429 and do not retry early. Build with
-    /// [`ApiError::ai_allowance_paused`].
-    #[error("{}", nanosiem_core::ai_allowance_paused_message(*.now))]
-    AiAllowancePaused { now: chrono::DateTime<chrono::Utc> },
-
-    #[error("Enterprise-shared search admission is unavailable")]
-    AdmissionBackendUnavailable,
 
     #[error("Payload too large: {0}")]
     PayloadTooLarge(String),
 
-    #[error(transparent)]
-    IocLimitExceeded(nanosiem_core::ioc_limits::IocLimitExceeded),
-
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
-
-    /// NAN-3442: a feature this deployment deliberately leaves off (e.g. Nano
-    /// Pipe preview without `NANO_PIPE_PREVIEW_ENABLED`). The wire contract is
-    /// identical to [`ApiError::ServiceUnavailable`] — 503, `SERVICE_UNAVAILABLE`,
-    /// "Service unavailable: …" — because the web UI keys its "not enabled for
-    /// this workspace" state off it. Only the logging differs: this is an
-    /// expected answer, not a fault, so it logs at debug and the response
-    /// carries [`ExpectedUnavailable`] so the request trace layer does not
-    /// classify it as a failure either.
-    #[error("Service unavailable: {0}")]
-    FeatureDisabled(String),
-
-    #[error("Resource is locked by another operation; retry shortly")]
-    ResourceLockContention,
-
-    #[error("{0}")]
-    SearchAdmissionUnavailable(String),
-
-    #[error("{0}")]
-    TenantLakePublicationDegraded(String),
-
-    /// NAN-3644: the reader's cold-read ceiling (an OOM safety net). A cold
-    /// read under it queues and runs; it is never refused for being cold.
-    #[error("{}", nanosiem_core::search::cold_scan_too_large_message(*needed_bytes, *ceiling_bytes, *background_ceiling_bytes))]
-    ColdScanTooLarge { needed_bytes: u64, ceiling_bytes: u64, background_ceiling_bytes: Option<u64> },
 
     #[error("Validation error: {0}")]
     ValidationError(String),
@@ -130,18 +76,15 @@ pub enum ApiError {
     #[error("Unscoped prevalence query")]
     UnscopedPrevalence(Vec<String>),
 
-    /// NAN-3230: high-volume public suffixes refused as internal domains.
-    /// `details.refused` carries one `{suffix, reason, message}` per entry so
-    /// the settings UI can show each inline.
-    #[error("{}", nanosiem_core::internal_domains::InternalDomainsRejection::Refused(.0.clone()))]
-    InternalDomainsRefused(Vec<nanosiem_core::internal_domains::RefusedSuffix>),
+    /// A 422 with a specific machine-readable `code` and structured
+    /// `details` (for example per-entry refusals the UI shows inline).
+    #[error("{message}")]
+    UnprocessableWithDetails {
+        code: &'static str,
+        message: String,
+        details: serde_json::Value,
+    },
 }
-
-/// Response extension marking a 5xx as an expected, non-fault answer
-/// (NAN-3442). The API's request trace classifier treats a response carrying
-/// it as a success so `tower_http` does not log "response failed" at ERROR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExpectedUnavailable;
 
 /// Error response body
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
@@ -159,31 +102,17 @@ pub struct ErrorDetail {
 }
 
 impl ApiError {
-    /// NAN-3512: the AI allowance pause as of `now`.
-    pub fn ai_allowance_paused(now: chrono::DateTime<chrono::Utc>) -> Self {
-        ApiError::AiAllowancePaused { now }
-    }
-
     /// Get the error code
     pub fn code(&self) -> &'static str {
         match self {
-            ApiError::ResourceLockContention => nanosiem_core::db::contention::RESOURCE_LOCK_CONTENTION,
             ApiError::NotFound(_) => "NOT_FOUND",
             ApiError::BadRequest(_) => "BAD_REQUEST",
             ApiError::Unauthorized(_) => "UNAUTHORIZED",
             ApiError::Forbidden(_) => "FORBIDDEN",
             ApiError::Conflict(_) => "CONFLICT",
-            ApiError::Gone(_) => "GONE",
-            ApiError::Retired { code, .. } => code,
-            ApiError::AdmissionBackendUnavailable => "ADMISSION_BACKEND_UNAVAILABLE",
             ApiError::TooManyRequests(_) => "TOO_MANY_REQUESTS",
-            ApiError::AiAllowancePaused { .. } => nanosiem_core::AI_ALLOWANCE_PAUSED_CODE,
             ApiError::PayloadTooLarge(_) => "PAYLOAD_TOO_LARGE",
-            ApiError::IocLimitExceeded(_) => "IOC_LIMIT_EXCEEDED",
-            ApiError::SearchAdmissionUnavailable(_) => "SEARCH_ADMISSION_UNAVAILABLE",
-            ApiError::TenantLakePublicationDegraded(_) => "TENANT_LAKE_PUBLICATION_DEGRADED",
-            ApiError::ServiceUnavailable(_) | ApiError::FeatureDisabled(_) => "SERVICE_UNAVAILABLE",
-            ApiError::ColdScanTooLarge { .. } => "COLD_SCAN_TOO_LARGE",
+            ApiError::ServiceUnavailable(_) => "SERVICE_UNAVAILABLE",
             ApiError::ValidationError(_) => "VALIDATION_ERROR",
             ApiError::ParseError(_) => "PARSE_ERROR",
             ApiError::SqlValidationError(_) => "SQL_VALIDATION_ERROR",
@@ -192,30 +121,21 @@ impl ApiError {
             ApiError::Timeout(_) => "TIMEOUT",
             ApiError::TierLimitExceeded(_) => "TIER_LIMIT_EXCEEDED",
             ApiError::UnscopedPrevalence(_) => "UNSCOPED_PREVALENCE",
-            ApiError::InternalDomainsRefused(_) => "INTERNAL_DOMAINS_REFUSED",
+            ApiError::UnprocessableWithDetails { code, .. } => code,
         }
     }
 
     /// Get the HTTP status code
     pub fn status_code(&self) -> StatusCode {
         match self {
-            ApiError::ResourceLockContention => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
-            ApiError::Gone(_) | ApiError::Retired { .. } => StatusCode::GONE,
-            ApiError::AdmissionBackendUnavailable
-            | ApiError::TooManyRequests(_)
-            | ApiError::AiAllowancePaused { .. } => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
-            ApiError::IocLimitExceeded(limit) if limit.limit.ends_with("_bytes") => StatusCode::PAYLOAD_TOO_LARGE,
-            ApiError::IocLimitExceeded(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            ApiError::SearchAdmissionUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-            ApiError::TenantLakePublicationDegraded(_) => StatusCode::SERVICE_UNAVAILABLE,
-            ApiError::ServiceUnavailable(_) | ApiError::FeatureDisabled(_) => StatusCode::SERVICE_UNAVAILABLE,
-            ApiError::ColdScanTooLarge { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::ValidationError(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::ParseError(_) => StatusCode::BAD_REQUEST,
             ApiError::SqlValidationError(_) => StatusCode::BAD_REQUEST,
@@ -224,7 +144,7 @@ impl ApiError {
             ApiError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             ApiError::TierLimitExceeded(_) => StatusCode::FORBIDDEN,
             ApiError::UnscopedPrevalence(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            ApiError::InternalDomainsRefused(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::UnprocessableWithDetails { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         }
     }
 }
@@ -246,10 +166,6 @@ pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        let admission_unavailable = matches!(self, Self::AdmissionBackendUnavailable);
-        if admission_unavailable {
-            tracing::warn!(reason = "admission_backend_unavailable", "search admission failed closed");
-        }
         // NAN-2266: every 5xx must name its cause in the server log. Before
         // this, an internal error became a bare `500` status line and nothing
         // else — the sweep-report failure this ticket fixes had to be diagnosed
@@ -263,13 +179,7 @@ impl IntoResponse for ApiError {
         // limits) are deliberately NOT logged here: they are the caller's
         // mistake, not ours, and logging them at ERROR would bury the real
         // faults under noise.
-        let feature_disabled = matches!(self, ApiError::FeatureDisabled(_));
-        if matches!(self, ApiError::ResourceLockContention) {
-            tracing::warn!(code = self.code(), "request deferred by resource lock contention");
-        } else if feature_disabled {
-            // NAN-3442: an expected feature-off answer, not a server fault.
-            tracing::debug!(code = self.code(), error = %self, "request refused: feature disabled on this deployment");
-        } else if status.is_server_error() {
+        if status.is_server_error() {
             tracing::error!(
                 status = status.as_u16(),
                 code = self.code(),
@@ -278,12 +188,6 @@ impl IntoResponse for ApiError {
             );
         }
         let details = match &self {
-            ApiError::IocLimitExceeded(limit) => Some(serde_json::to_value(limit).unwrap_or_default()),
-            ApiError::ColdScanTooLarge { needed_bytes, ceiling_bytes, background_ceiling_bytes } => Some(serde_json::json!({
-                "reason": "cold_scan_too_large", "needed_bytes": needed_bytes, "ceiling_bytes": ceiling_bytes,
-                "background_ceiling_bytes": background_ceiling_bytes, "retryable": false,
-            })),
-            ApiError::AdmissionBackendUnavailable => Some(serde_json::json!({"dependency": "admission_backend_unavailable", "retryable": true})),
             ApiError::TierLimitExceeded(info) => {
                 Some(serde_json::to_value(info).unwrap_or_default())
             }
@@ -293,16 +197,7 @@ impl IntoResponse for ApiError {
             ApiError::UnscopedPrevalence(fields) => Some(serde_json::json!({
                 "wildcard_fields": fields,
             })),
-            ApiError::InternalDomainsRefused(refused) => Some(serde_json::json!({
-                "refused": refused,
-            })),
-            ApiError::Retired { code, .. } => Some(serde_json::json!({"reason": code, "retryable": false})),
-            ApiError::AiAllowancePaused { now } => Some(serde_json::json!({
-                "reason": nanosiem_core::AI_ALLOWANCE_PAUSED_CODE,
-                "resets_at": nanosiem_core::next_ai_allowance_reset(*now),
-                "retry_after_secs": ai_allowance_retry_after_secs(*now),
-                "retryable": false,
-            })),
+            ApiError::UnprocessableWithDetails { details, .. } => Some(details.clone()),
             _ => None,
         };
         // NAN-712: override the default Display text with a friendly message
@@ -316,8 +211,7 @@ impl IntoResponse for ApiError {
                 "This panel uses `| prevalence` and won't run with all wildcards ({}). Set at least one to a specific value and click Run.",
                 fields.iter().map(|f| format!("{}=*", f)).collect::<Vec<_>>().join(", ")
             ),
-            // NAN-4282: customers never see the internal code name "lean".
-            _ => nanosiem_core::branding::without_internal_code_name(&self.to_string()).into_owned(),
+            _ => self.to_string(),
         };
         let body = ErrorResponse {
             error: ErrorDetail {
@@ -327,27 +221,8 @@ impl IntoResponse for ApiError {
             },
         };
 
-        let mut response = (status, Json(body)).into_response();
-        if matches!(self, ApiError::ResourceLockContention) || admission_unavailable {
-            response.headers_mut().insert(axum::http::header::RETRY_AFTER, if admission_unavailable { "2" } else { "1" }.parse().unwrap());
-        }
-        if let ApiError::AiAllowancePaused { now } = &self {
-            response.headers_mut().insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from(ai_allowance_retry_after_secs(*now)),
-            );
-        }
-        if feature_disabled {
-            response.extensions_mut().insert(ExpectedUnavailable);
-        }
-        response
+        (status, Json(body)).into_response()
     }
-}
-
-/// Seconds from `now` to the UTC month reset (at least 1).
-fn ai_allowance_retry_after_secs(now: chrono::DateTime<chrono::Utc>) -> u64 {
-    let secs = (nanosiem_core::next_ai_allowance_reset(now) - now).num_seconds();
-    u64::try_from(secs).unwrap_or(0).max(1)
 }
 
 // ----------------------------------------------------------------------------
@@ -356,11 +231,7 @@ fn ai_allowance_retry_after_secs(now: chrono::DateTime<chrono::Utc>) -> u64 {
 
 impl From<nanosiem_core::SearchError> for ApiError {
     fn from(err: nanosiem_core::SearchError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         match err {
-            nanosiem_core::SearchError::AdmissionBackendUnavailable => ApiError::AdmissionBackendUnavailable,
             nanosiem_core::SearchError::ParseError(msg) => ApiError::ParseError(msg),
             nanosiem_core::SearchError::StructuredParseError { formatted, .. } => {
                 ApiError::ParseError(formatted)
@@ -394,34 +265,6 @@ impl From<nanosiem_core::SearchError> for ApiError {
                 ))
             }
             nanosiem_core::SearchError::AdmissionDenied(msg) => ApiError::TooManyRequests(msg),
-            // The client message stays generic on purpose — it describes backend
-            // topology the caller cannot act on. But discarding the detail
-            // silently made this class of failure near-undiagnosable from the
-            // outside: an OTLP dataset that simply had no table yet surfaced as
-            // "retry shortly" forever, and only a log dive found the real code.
-            // Log the cause here so the boundary that erases it also records it.
-            nanosiem_core::SearchError::SearchAdmissionUnavailable(detail) => ApiError::SearchAdmissionUnavailable(detail),
-            nanosiem_core::SearchError::TenantLakePublicationDegraded(detail) => ApiError::TenantLakePublicationDegraded(detail),
-            nanosiem_core::SearchError::ServiceUnavailable(detail) => {
-                tracing::warn!(detail = %detail, "search dependency unavailable");
-                ApiError::ServiceUnavailable(
-                    "A required search service is temporarily unavailable; retry shortly"
-                        .to_string(),
-                )
-            }
-            nanosiem_core::SearchError::ColdScanTooLarge { needed_bytes, ceiling_bytes, background_ceiling_bytes } =>
-                ApiError::ColdScanTooLarge { needed_bytes, ceiling_bytes, background_ceiling_bytes },
-            nanosiem_core::SearchError::ResourceExhausted(kind) => {
-                ApiError::TooManyRequests(format!("Interactive query exhausted its {kind} budget"))
-            }
-            // NAN-2361 wave 8: the tenant's lake worker is starting or busy;
-            // the request is retryable, so it is a 503, never a 500.
-            nanosiem_core::SearchError::LakeWorkerNotReady(detail) => {
-                tracing::warn!(detail = %detail, "tenant lake worker not ready");
-                ApiError::ServiceUnavailable(
-                    "The tenant's lake query worker is not ready yet; retry shortly".to_string(),
-                )
-            }
             // NAN-1436: a deliberately killed query (CH 394 via search cancel)
             // is not a server fault — surface 409 instead of a generic 500.
             // (nanosiem-search has its own dedicated QUERY_CANCELLED code; the
@@ -429,6 +272,7 @@ impl From<nanosiem_core::SearchError> for ApiError {
             nanosiem_core::SearchError::Cancelled => {
                 ApiError::Conflict("Query was cancelled".to_string())
             }
+            nanosiem_core::SearchError::JobResultsUnavailable(msg) => ApiError::Conflict(msg),
             // NAN-3282: product-view memory budgets (413 narrow / 503 retry).
             error @ nanosiem_core::SearchError::ViewTooLarge { .. } => {
                 ApiError::PayloadTooLarge(error.to_string())
@@ -445,9 +289,6 @@ impl From<nanosiem_core::SearchError> for ApiError {
 
 impl From<nanosiem_core::DetectionError> for ApiError {
     fn from(err: nanosiem_core::DetectionError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         match &err {
             nanosiem_core::DetectionError::RuleNotFound(id) => {
                 ApiError::NotFound(format!("Detection rule not found: {}", id))
@@ -490,9 +331,6 @@ impl From<nanosiem_core::DetectionError> for ApiError {
 
 impl From<nanosiem_core::TierError> for ApiError {
     fn from(err: nanosiem_core::TierError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         match err {
             nanosiem_core::TierError::LimitExceeded(msg) => {
                 ApiError::Forbidden(format!("Tier limit exceeded: {}", msg))
@@ -521,9 +359,6 @@ impl From<nanosiem_core::TierError> for ApiError {
 
 impl From<sqlx::Error> for ApiError {
     fn from(err: sqlx::Error) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         // Log the actual error server-side for debugging, but return a generic
         // message to the client. `error_chain` walks `source()` so the line
         // names the database's own error (constraint, column, SQLSTATE context)
@@ -535,9 +370,6 @@ impl From<sqlx::Error> for ApiError {
 
 impl From<nanosiem_core::FeedServiceError> for ApiError {
     fn from(err: nanosiem_core::FeedServiceError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         match &err {
             nanosiem_core::FeedServiceError::RepositoryError(repo_err) => {
                 match repo_err {
@@ -568,9 +400,6 @@ impl From<nanosiem_core::FeedServiceError> for ApiError {
 
 impl From<nanosiem_core::ParserServiceError> for ApiError {
     fn from(err: nanosiem_core::ParserServiceError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         match &err {
             nanosiem_core::ParserServiceError::RepositoryError(repo_err) => match repo_err {
                 nanosiem_core::parsers::ParserRepositoryError::NotFound(id) => {
@@ -631,9 +460,6 @@ impl From<nanosiem_core::ParserServiceError> for ApiError {
 
 impl From<nanosiem_core::LogSourceServiceError> for ApiError {
     fn from(err: nanosiem_core::LogSourceServiceError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         match &err {
             nanosiem_core::LogSourceServiceError::RepositoryError(repo_err) => match repo_err {
                 nanosiem_core::log_sources::LogSourceRepositoryError::NotFound(id) => {
@@ -689,9 +515,6 @@ impl From<nanosiem_core::LogSourceServiceError> for ApiError {
             nanosiem_core::LogSourceServiceError::VrlValidationFailed(msg) => {
                 ApiError::ValidationError(format!("VRL validation failed: {}", msg))
             }
-            nanosiem_core::LogSourceServiceError::OcsfValidationFailed(msg) => {
-                ApiError::ValidationError(format!("OCSF validation failed: {}", msg))
-            }
             nanosiem_core::LogSourceServiceError::VectorValidationFailed(msg) => {
                 ApiError::ValidationError(format!("Vector validation failed: {}", msg))
             }
@@ -719,9 +542,6 @@ impl From<nanosiem_core::LogSourceServiceError> for ApiError {
 
 impl From<nanosiem_core::SourceConfigServiceError> for ApiError {
     fn from(err: nanosiem_core::SourceConfigServiceError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         match &err {
             nanosiem_core::SourceConfigServiceError::RepositoryError(repo_err) => match repo_err {
                 nanosiem_core::source_configs::SourceConfigRepositoryError::NotFound(id) => {
@@ -745,12 +565,12 @@ impl From<nanosiem_core::SourceConfigServiceError> for ApiError {
                         )
                     ))
                 }
-                nanosiem_core::source_configs::SourceConfigRepositoryError::CredentialChanged(
-                    _,
-                ) => ApiError::Conflict(
-                    "Source configuration credentials changed concurrently; retry the update"
-                        .to_string(),
-                ),
+                nanosiem_core::source_configs::SourceConfigRepositoryError::CredentialChanged(_) => {
+                    ApiError::Conflict(
+                        "Source configuration credentials changed concurrently; retry the update"
+                            .to_string(),
+                    )
+                }
                 nanosiem_core::source_configs::SourceConfigRepositoryError::RuleNotFound(id) => {
                     ApiError::NotFound(format!("Routing rule not found: {}", id))
                 }
@@ -768,9 +588,7 @@ impl From<nanosiem_core::SourceConfigServiceError> for ApiError {
             nanosiem_core::SourceConfigServiceError::InvalidConfig(msg) => {
                 ApiError::ValidationError(format!("Invalid configuration: {}", msg))
             }
-            nanosiem_core::SourceConfigServiceError::Conflict(msg) => {
-                ApiError::Conflict(msg.clone())
-            }
+            nanosiem_core::SourceConfigServiceError::Conflict(msg) => ApiError::Conflict(msg.clone()),
             nanosiem_core::SourceConfigServiceError::DeploymentFailed(msg) => {
                 ApiError::InternalError(format!("Deployment failed: {}", msg))
             }
@@ -799,9 +617,6 @@ impl From<nanosiem_core::SourceConfigServiceError> for ApiError {
 
 impl From<nanosiem_core::RetentionError> for ApiError {
     fn from(err: nanosiem_core::RetentionError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         use nanosiem_core::RetentionError;
         match &err {
             RetentionError::InvalidPeriod(msg) => ApiError::ValidationError(msg.clone()),
@@ -820,9 +635,6 @@ impl From<nanosiem_core::RetentionError> for ApiError {
 
 impl From<nanosiem_core::settings::TieringError> for ApiError {
     fn from(err: nanosiem_core::settings::TieringError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         use nanosiem_core::settings::TieringError;
         match &err {
             TieringError::Config(msg) => ApiError::ValidationError(msg.clone()),
@@ -854,9 +666,6 @@ impl From<nanosiem_core::settings::TieringError> for ApiError {
 
 impl From<nanosiem_core::settings::OrganizationalContextError> for ApiError {
     fn from(err: nanosiem_core::settings::OrganizationalContextError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         use nanosiem_core::settings::OrganizationalContextError;
         match &err {
             OrganizationalContextError::Database(e) => {
@@ -870,9 +679,6 @@ impl From<nanosiem_core::settings::OrganizationalContextError> for ApiError {
 
 impl From<nanosiem_core::detection::risk::RiskError> for ApiError {
     fn from(err: nanosiem_core::detection::risk::RiskError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         use nanosiem_core::detection::risk::RiskError;
         match &err {
             RiskError::WeightOutOfBounds(w) => ApiError::ValidationError(format!(
@@ -892,9 +698,6 @@ impl From<nanosiem_core::detection::risk::RiskError> for ApiError {
 
 impl From<nanosiem_core::identity::IdentityServiceError> for ApiError {
     fn from(err: nanosiem_core::identity::IdentityServiceError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         use nanosiem_core::identity::{IdentityRepositoryError, IdentityServiceError};
         match &err {
             IdentityServiceError::ProviderNotFound(id) => {
@@ -926,23 +729,6 @@ impl From<nanosiem_core::identity::IdentityServiceError> for ApiError {
             IdentityServiceError::Repository(IdentityRepositoryError::ClickHouse(e)) => {
                 ApiError::DatabaseError(format!("ClickHouse error: {}", e))
             }
-            IdentityServiceError::Repository(IdentityRepositoryError::Lake(e)) => {
-                tracing::error!(error = %e, "Lake identity directory request failed");
-                ApiError::InternalError("Identity directory is temporarily unavailable".to_string())
-            }
-            // NAN-3767: lean (query[T]) directory reads. Bad input is the
-            // caller's; everything else is the directory being unavailable.
-            IdentityServiceError::Repository(IdentityRepositoryError::Directory(e)) => match e {
-                nanosiem_core::identity::LeanDirectoryError::Invalid(detail) => {
-                    ApiError::BadRequest(detail.clone())
-                }
-                other => {
-                    tracing::error!(error = %other, "Lean identity directory request failed");
-                    ApiError::ServiceUnavailable(
-                        "Identity directory is temporarily unavailable".to_string(),
-                    )
-                }
-            },
             IdentityServiceError::Sync(e) => ApiError::InternalError(format!("Sync error: {}", e)),
             // NAN-3483: a provider whose records cannot be normalized is a
             // configuration problem the operator must fix, not a server fault.
@@ -952,15 +738,15 @@ impl From<nanosiem_core::identity::IdentityServiceError> for ApiError {
             IdentityServiceError::AllRecordsDeadLettered(m) => {
                 ApiError::Conflict(format!("Sync dead-lettered every record: {}", m))
             }
+            // G22: sync and credentials of a feed-managed provider live on
+            // its connector feed.
+            IdentityServiceError::ManagedByConnectorFeed(..) => ApiError::Conflict(err.to_string()),
         }
     }
 }
 
 impl From<nanosiem_core::DashboardRepositoryError> for ApiError {
     fn from(err: nanosiem_core::DashboardRepositoryError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         use nanosiem_core::DashboardRepositoryError;
         // DSH42: render dashboard ids as `dash_<base32>` typeids (the form the
         // API exposes everywhere else) rather than leaking a bare UUID.
@@ -994,9 +780,6 @@ impl From<nanosiem_core::DashboardRepositoryError> for ApiError {
 
 impl From<nanosiem_core::MarketplaceError> for ApiError {
     fn from(err: nanosiem_core::MarketplaceError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         use nanosiem_core::MarketplaceError;
         match &err {
             MarketplaceError::CatalogEntryNotFound(slug) => {
@@ -1031,7 +814,8 @@ impl From<nanosiem_core::MarketplaceError> for ApiError {
             MarketplaceError::InvalidCredential { field, reason } => {
                 ApiError::ValidationError(format!("Invalid value for '{}': {}", field, reason))
             }
-            MarketplaceError::BackendUnavailable(message) => ApiError::Forbidden(message.clone()),
+            // NAN-4959: served by nano's signed platform feed bundle.
+            MarketplaceError::ProvidedByPlatformFeed(_) => ApiError::Conflict(err.to_string()),
             _ => ApiError::InternalError(err.to_string()),
         }
     }
@@ -1039,9 +823,6 @@ impl From<nanosiem_core::MarketplaceError> for ApiError {
 
 impl From<nanosiem_core::ParserRepositoryError> for ApiError {
     fn from(err: nanosiem_core::ParserRepositoryError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         use nanosiem_core::ParserRepositoryError;
         match err {
             ParserRepositoryError::RepositoryNotFound(id) => {
@@ -1094,9 +875,6 @@ impl From<nanosiem_core::ParserRepositoryError> for ApiError {
 
 impl From<nanosiem_core::PlaybookRepositoryError> for ApiError {
     fn from(err: nanosiem_core::PlaybookRepositoryError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         use nanosiem_core::PlaybookRepositoryError;
         match err {
             PlaybookRepositoryError::RepositoryNotFound(id) => {
@@ -1151,9 +929,6 @@ impl From<nanosiem_core::PlaybookRepositoryError> for ApiError {
 /// tells the runner to stop.
 impl From<nanosiem_core::hunts::HuntError> for ApiError {
     fn from(err: nanosiem_core::hunts::HuntError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         use nanosiem_core::hunts::HuntError;
         match err {
             HuntError::NotFound(id) => ApiError::NotFound(format!("Hunt not found: {id}")),
@@ -1189,9 +964,6 @@ impl From<nanosiem_core::hunts::HuntError> for ApiError {
 
 impl From<nanosiem_core::playbooks::PlaybookError> for ApiError {
     fn from(err: nanosiem_core::playbooks::PlaybookError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         use nanosiem_core::playbooks::PlaybookError;
         match err {
             PlaybookError::NotFound(id) => {
@@ -1224,9 +996,6 @@ impl From<nanosiem_core::playbooks::PlaybookError> for ApiError {
 
 impl From<nanosiem_core::db::repository::NotebookRepositoryError> for ApiError {
     fn from(err: nanosiem_core::db::repository::NotebookRepositoryError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         use nanosiem_core::db::repository::NotebookRepositoryError;
         match err {
             NotebookRepositoryError::NotFound(id) => {
@@ -1269,9 +1038,6 @@ impl From<nanosiem_core::db::repository::NotebookRepositoryError> for ApiError {
 
 impl From<nanosiem_core::RuleRepositoryError> for ApiError {
     fn from(err: nanosiem_core::RuleRepositoryError) -> Self {
-        if nanosiem_core::db::contention::is_lock_contention(&err) {
-            return ApiError::ResourceLockContention;
-        }
         use nanosiem_core::RuleRepositoryError;
         match err {
             RuleRepositoryError::RepositoryNotFound(id) => {
@@ -1314,6 +1080,11 @@ impl From<nanosiem_core::RuleRepositoryError> for ApiError {
             RuleRepositoryError::RepositoryDisabled => {
                 ApiError::Forbidden("Repository is disabled".to_string())
             }
+            // NAN-4947: was an unmapped 500. Only nano first-party content
+            // repositories are supported.
+            RuleRepositoryError::RepositoryNotAllowed(repo) => ApiError::Forbidden(format!(
+                "Only nano first-party content repositories are supported (refused: {repo})"
+            )),
             RuleRepositoryError::GitHubApi(msg) => {
                 ApiError::ServiceUnavailable(format!("GitHub API error: {}", msg))
             }
@@ -1326,20 +1097,6 @@ impl From<nanosiem_core::RuleRepositoryError> for ApiError {
 mod tests {
     use super::*;
     use uuid::Uuid;
-
-    #[tokio::test]
-    async fn ioc_limit_errors_report_usage_and_attempt_with_typed_status() {
-        for (limit, expected) in [("upload_bytes", StatusCode::PAYLOAD_TOO_LARGE), ("indicators_per_tenant", StatusCode::UNPROCESSABLE_ENTITY)] {
-            let response = ApiError::IocLimitExceeded(nanosiem_core::ioc_limits::IocLimitExceeded {
-                limit, maximum: 10, current: 9, attempted: 11,
-            }).into_response();
-            assert_eq!(response.status(), expected);
-            let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(body["error"]["code"], "IOC_LIMIT_EXCEEDED");
-            assert_eq!(body["error"]["details"], serde_json::json!({"limit":limit,"maximum":10,"current":9,"attempted":11}));
-        }
-    }
 
     #[test]
     fn stale_log_source_version_maps_to_conflict() {
@@ -1387,10 +1144,7 @@ mod tests {
         ));
         assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error.code(), "DATABASE_ERROR");
-        assert_eq!(
-            error.to_string(),
-            "Database error: A database error occurred"
-        );
+        assert_eq!(error.to_string(), "Database error: A database error occurred");
     }
 
     #[test]
@@ -1417,9 +1171,8 @@ mod tests {
         assert_eq!(lease.status_code(), StatusCode::CONFLICT);
         assert!(lease.to_string().contains("sweep x was reassigned"));
 
-        let validation = ApiError::from(nanosiem_core::hunts::HuntError::Validation(
-            "bad turns".to_string(),
-        ));
+        let validation =
+            ApiError::from(nanosiem_core::hunts::HuntError::Validation("bad turns".to_string()));
         assert_eq!(validation.status_code(), StatusCode::BAD_REQUEST);
         assert!(validation.to_string().contains("bad turns"));
     }
@@ -1485,46 +1238,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn feature_disabled_keeps_the_503_contract_without_error_noise() {
-        // NAN-3442: the web UI relies on 503 SERVICE_UNAVAILABLE "... not
-        // enabled ..." to render "preview not enabled for this workspace";
-        // only the log level and the trace classification change.
-        let message = "Pipeline preview is not enabled on this deployment";
-        let disabled = ApiError::FeatureDisabled(message.to_string());
-        let unavailable = ApiError::ServiceUnavailable(message.to_string());
-        assert_eq!(disabled.status_code(), unavailable.status_code());
-        assert_eq!(disabled.code(), unavailable.code());
-        assert_eq!(disabled.to_string(), unavailable.to_string());
-
-        let mut response = None;
-        let log = captured_log(|| {
-            response = Some(disabled.into_response());
-        });
-        assert!(log.is_empty(), "a feature-disabled 503 logged at ERROR: {log}");
-
-        let response = response.unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.extensions().get::<ExpectedUnavailable>(), Some(&ExpectedUnavailable));
-        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({"error": {
-                "code": "SERVICE_UNAVAILABLE",
-                "message": "Service unavailable: Pipeline preview is not enabled on this deployment",
-            }})
-        );
-
-        // A genuine 503 still logs at ERROR and carries no marker.
-        let mut genuine = None;
-        let log = captured_log(|| {
-            genuine = Some(ApiError::ServiceUnavailable("worker crashed".to_string()).into_response());
-        });
-        assert!(log.contains("ERROR"), "a genuine 503 lost its ERROR line: {log}");
-        assert!(genuine.unwrap().extensions().get::<ExpectedUnavailable>().is_none());
-    }
-
     #[test]
     fn error_chain_walks_every_source() {
         #[derive(Debug)]
@@ -1545,170 +1258,5 @@ mod tests {
 }
 
 #[cfg(test)]
-mod dependency_contract_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn actionable_search_dependencies_keep_their_codes_and_reasons() {
-        let cases = [
-            (
-                nanosiem_core::SearchError::SearchAdmissionUnavailable(
-                    "distributed search admission (Redis) is not configured for this deployment".into(),
-                ),
-                "SEARCH_ADMISSION_UNAVAILABLE",
-                "distributed search admission (Redis) is not configured for this deployment",
-            ),
-            (
-                nanosiem_core::SearchError::TenantLakePublicationDegraded(
-                    "lake event publication is temporarily unavailable (bootstrap); retry the request".into(),
-                ),
-                "TENANT_LAKE_PUBLICATION_DEGRADED",
-                "lake event publication is temporarily unavailable (bootstrap); retry the request",
-            ),
-        ];
-        for (error, code, message) in cases {
-            let mapped = ApiError::from(error);
-            assert_eq!(mapped.code(), code);
-            assert_eq!(mapped.status_code(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(mapped.to_string(), message);
-            let response = mapped.into_response();
-            let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(body["error"]["code"], code);
-            assert_eq!(body["error"]["message"], message);
-        }
-    }
-}
-
-#[cfg(test)]
-mod lock_contention_contract_tests {
-    use super::*;
-    #[derive(Debug, thiserror::Error)]
-    #[error("private database diagnostic")]
-    struct DatabaseFailure(&'static str);
-    impl sqlx::error::DatabaseError for DatabaseFailure {
-        fn message(&self) -> &str { "private database diagnostic" }
-        fn code(&self) -> Option<std::borrow::Cow<'_, str>> { Some(self.0.into()) }
-        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) { self }
-        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) { self }
-        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> { self }
-        fn kind(&self) -> sqlx::error::ErrorKind { sqlx::error::ErrorKind::Other }
-    }
-    pub(crate) fn database_error(code: &'static str) -> sqlx::Error {
-        sqlx::Error::Database(Box::new(DatabaseFailure(code)))
-    }
-
-    #[tokio::test]
-    async fn sqlstate_55p03_never_maps_to_500() {
-        let errors = [
-            ApiError::from(database_error("55P03")),
-            ApiError::from(nanosiem_core::hunts::HuntError::Database(database_error("55P03"))),
-            ApiError::from(nanosiem_core::SearchError::DatabaseError(database_error("55P03"))),
-        ];
-        for error in errors {
-            assert_eq!(error.code(), "RESOURCE_LOCK_CONTENTION");
-            let response = error.into_response();
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(response.headers()["retry-after"], "1");
-            let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(body["error"]["code"], "RESOURCE_LOCK_CONTENTION");
-            assert!(!String::from_utf8_lossy(&bytes).contains("private database diagnostic"));
-        }
-        for code in ["XX000", "23505", "42501", "55P04"] {
-            let error = ApiError::from(database_error(code));
-            assert_eq!(error.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
-            assert_eq!(error.code(), "DATABASE_ERROR");
-            assert!(!error.into_response().headers().contains_key("retry-after"));
-        }
-    }
-}
-
-#[cfg(test)]
-mod cold_budget_tests {
-    use super::*;
-
-    /// NAN-3644: only the reader's ceiling is a 422 now; it keeps its bytes.
-    #[tokio::test]
-    async fn cold_ceiling_api_contract_keeps_bytes_and_terminal_422() {
-        let mapped = ApiError::from(nanosiem_core::SearchError::ColdScanTooLarge {
-            needed_bytes: 14_800_000_000, ceiling_bytes: 9_600_000_000, background_ceiling_bytes: None,
-        });
-        let response = mapped.into_response();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(!response.headers().contains_key(axum::http::header::RETRY_AFTER));
-        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"]["code"], "COLD_SCAN_TOO_LARGE");
-        assert!(body["error"]["message"].as_str().unwrap().contains("~14.8 GB"));
-        assert_eq!(body["error"]["details"]["needed_bytes"], 14_800_000_000_u64);
-        assert_eq!(body["error"]["details"]["ceiling_bytes"], 9_600_000_000_u64);
-        assert_eq!(body["error"]["details"]["retryable"], false);
-        assert_eq!(body["error"]["details"]["reason"], "cold_scan_too_large");
-    }
-}
-
-#[cfg(test)]
-mod internal_domains_refused_tests {
-    use super::*;
-
-    /// NAN-3230: a refused internal-domain suffix is a 422 with one
-    /// `details.refused` entry per refused suffix.
-    #[tokio::test]
-    async fn refused_suffixes_are_422_with_per_entry_details() {
-        let Err(nanosiem_core::internal_domains::InternalDomainsRejection::Refused(refused)) =
-            nanosiem_core::internal_domains::validate_tenant_suffixes(["com", "prod", "co.uk"])
-        else {
-            panic!("expected refusal");
-        };
-        let response = ApiError::InternalDomainsRefused(refused).into_response();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let bytes = axum::body::to_bytes(response.into_body(), 16_384).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"]["code"], "INTERNAL_DOMAINS_REFUSED");
-        let refused = body["error"]["details"]["refused"].as_array().unwrap();
-        let names: Vec<&str> = refused.iter().map(|r| r["suffix"].as_str().unwrap()).collect();
-        assert_eq!(names, ["co.uk", "com"]);
-        assert_eq!(refused[1]["reason"], "high_volume_tld");
-        assert!(body["error"]["message"].as_str().unwrap().contains("co.uk, com"));
-    }
-
-    #[tokio::test]
-    async fn retired_surface_is_a_coded_410() {
-        let response = ApiError::Retired { code: "thing_retired", message: "Use the other thing." }.into_response();
-        assert_eq!(response.status(), StatusCode::GONE);
-        let bytes = axum::body::to_bytes(response.into_body(), 16_384).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"]["code"], "thing_retired");
-        assert_eq!(body["error"]["message"], "Use the other thing.");
-        assert_eq!(body["error"]["details"]["reason"], "thing_retired");
-        assert_eq!(body["error"]["details"]["retryable"], false);
-    }
-}
-
-#[cfg(test)]
-mod ai_allowance_paused_tests {
-    use super::*;
-    use chrono::TimeZone;
-
-    /// NAN-3512: the allowance pause is a 429 clients can tell apart from the
-    /// concurrency 429: its own code, the reset in `details`, and a
-    /// `Retry-After` of the seconds to the UTC month reset.
-    #[tokio::test]
-    async fn pause_is_a_429_with_its_own_code_and_retry_after_to_the_reset() {
-        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 31, 23, 0, 0).unwrap();
-        let response = ApiError::ai_allowance_paused(now).into_response();
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "3600");
-        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"]["code"], nanosiem_core::AI_ALLOWANCE_PAUSED_CODE);
-        assert_eq!(body["error"]["message"], nanosiem_core::ai_allowance_paused_message(now));
-        assert_eq!(body["error"]["details"]["retry_after_secs"], 3600);
-        assert_eq!(body["error"]["details"]["resets_at"], "2026-11-01T00:00:00Z");
-        assert_eq!(body["error"]["details"]["retryable"], false);
-
-        let concurrency = ApiError::TooManyRequests("Tenant AI concurrency limit reached".into());
-        assert_eq!(concurrency.code(), "TOO_MANY_REQUESTS");
-    }
-}
+#[path = "api_error_details_tests.rs"]
+mod details_tests;

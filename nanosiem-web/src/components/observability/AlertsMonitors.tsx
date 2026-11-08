@@ -289,6 +289,7 @@ export function AlertsMonitors() {
         await runner(id);
         toast({ title: `${label} monitor alert` });
       } catch (err) {
+        // eslint-disable-next-line no-console
         console.error(`${label} failed for ${id}:`, err);
         toast({ title: `${label} failed`, variant: 'destructive' });
       } finally {

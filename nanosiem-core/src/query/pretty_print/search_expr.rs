@@ -9,6 +9,10 @@ use super::PrettyPrint;
 /// parenthesized expressions retain a `Group` node, preserving round trips.
 pub(super) fn print_search_expr(expr: &SearchExpr, where_mode: bool) -> String {
     fn render(expr: &SearchExpr, where_mode: bool, parent: u8) -> String {
+        // NAN-4917: guarded recursion point.
+        crate::query::complexity::ensure_sufficient_stack(|| render_unguarded(expr, where_mode, parent))
+    }
+    fn render_unguarded(expr: &SearchExpr, where_mode: bool, parent: u8) -> String {
         let precedence = match expr {
             SearchExpr::And(_, _) => {
                 if where_mode {
@@ -86,12 +90,7 @@ impl PrettyPrint for SearchExpr {
                     super::helpers::npl_quoted_literal(kw)
                 }
             }
-            SearchExpr::FieldFilter {
-                field,
-                op,
-                value,
-                rhs,
-            } => {
+            SearchExpr::FieldFilter { field, op, value } => {
                 // Word-based operators need spaces around them
                 let op_str = op.as_str();
                 let needs_spaces = matches!(
@@ -106,23 +105,7 @@ impl PrettyPrint for SearchExpr {
                         | Comparator::NotEndsWith
                 );
                 let field_str = emit_field(field);
-                // NAN-2380: a BAREWORD right-hand side must be re-emitted bare.
-                // Quoting it would erase the one bit that distinguishes
-                // `src_ip != dest_ip` (a column comparison) from
-                // `src_ip != "dest_ip"` (a literal), so an AST -> text -> AST
-                // round-trip — which the source-scope gate performs on every
-                // scoped query — would silently downgrade the comparison back to
-                // the inverted literal form. `is_bareword_identifier` only ever
-                // marks tokens that re-tokenize verbatim (dotted identifier
-                // segments, no reserved words), so emitting them bare cannot
-                // break out of the filter the way an unquoted arbitrary value
-                // could (NAN-2006).
-                let value_str = match (rhs, value) {
-                    (RhsSyntax::Bareword, Value::String(text)) if is_bareword_identifier(text) => {
-                        text.clone()
-                    }
-                    _ => format_value_for_filter(value),
-                };
+                let value_str = format_value_for_filter(value);
                 if needs_spaces {
                     format!("{} {} {}", field_str, op_str, value_str)
                 } else {
@@ -147,21 +130,6 @@ impl PrettyPrint for SearchExpr {
                 op,
                 function,
             } => {
-                // NAN-2380: a bare field reference on the RHS of `=` / `!=` must
-                // be re-emitted in backticks. Printed bare it would re-parse as
-                // an ordinary `FieldFilter` — ambiguous on UDM, and a literal
-                // wherever the field is unknown — so an AST -> text -> AST
-                // round-trip (the source-scope gate does one on every scoped
-                // query) would silently change an explicit column comparison
-                // into something else. `>` `<` `>=` `<=` already re-parse as a
-                // field reference bare, so they keep their existing spelling.
-                if let (EvalExpression::Field(name), Comparator::Eq | Comparator::Ne) =
-                    (function, op)
-                {
-                    if is_bareword_identifier(name) {
-                        return format!("{}{}`{}`", emit_field(field), op.as_str(), name);
-                    }
-                }
                 format!("{}{}{}", field, op.as_str(), function.pretty_print())
             }
             SearchExpr::InList {
@@ -202,11 +170,7 @@ impl PrettyPrint for SearchExpr {
                 )
             }
             // NAN-1580 / NAN-1581: render the `ioc` surface forms back out.
-            SearchExpr::IocMatch {
-                values,
-                feed,
-                lookup,
-            } => {
+            SearchExpr::IocMatch { values, feed, lookup } => {
                 let lit = super::helpers::npl_quoted_literal;
                 if let Some(f) = feed {
                     format!("ioc in {}({})", f.name, lit(&f.arg))
@@ -311,6 +275,5 @@ fn is_bare_field(field: &str) -> bool {
         None => false,
     };
     first_ok
-        && segments
-            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        && segments.all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_'))
 }

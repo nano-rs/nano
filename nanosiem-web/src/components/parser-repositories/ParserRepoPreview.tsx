@@ -607,13 +607,13 @@ function DispatchFromField({
         Dispatch from
       </div>
       <div className="text-[11px] text-muted-foreground mb-2 leading-relaxed">
-        The Source Config that will route events into this parser. Compatible configs are
+        The input (pull source or push listener) that routes events into this parser. Compatible ones are
         highlighted based on the parser's transport.
       </div>
       {configs.length === 0 ? (
         <div className="rounded-md border border-border bg-card px-3 py-2.5 text-[11px] text-muted-foreground leading-relaxed">
-          No deployed source configurations. Create or deploy one before importing — the parser
-          still imports as a draft, but no events will route into it until a config exists.
+          No deployed inputs. Add one under Log Sources → Cloud pull (or a push listener under
+          Credentials) — the parser still imports as a draft, but no events route into it until one exists.
         </div>
       ) : (
         <div className="space-y-1.5">
@@ -945,7 +945,7 @@ function isTransportCompat(transport: RepoTransport | null, configType: string):
   if (transport === 'pubsub') return t.includes('pubsub') || t.includes('gcp');
   if (transport === 'kafka') return t === 'kafka';
   if (transport === 'syslog') return t === 'syslog';
-  if (transport === 'splunk_hec') return t.includes('splunk_hec');
+  if (transport === 'splunk_hec') return t.includes('splunk');
   if (transport === 'vector') return t === 'vector';
   if (transport === 'http') return t === 'http' || t === 'routed';
   return false;

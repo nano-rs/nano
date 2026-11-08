@@ -5,8 +5,9 @@
  *
  * Field suggestions come in four groups, in this order:
  *   1. Recent (you): fields from the caller's own search history (server-ranked).
- *   2. Popular in this workspace: fields most used across the tenant.
- *   3. Common: a curated cold-start list, `metadata.log_source` first.
+ *   2. Popular in this workspace: fields most used across the deployment.
+ *   3. Common: a curated cold-start list (the UDM common fields, or the OCSF
+ *      list with `metadata.log_source` first when the schema is OCSF).
  *   4. Everything else, alphabetical.
  * The typed prefix filters inside every group. A field appears in one group only.
  */
@@ -75,10 +76,11 @@ export const CURATED_OCSF_FIELDS: RankableField[] = [
 ];
 
 /**
- * Pick the curated list for the active field universe. OCSF (or unknown, e.g.
- * the schema fetch has not landed yet) gets the OCSF list filtered to fields
- * the tenant actually has, with `metadata.log_source` always kept. A legacy
- * UDM universe (no `metadata.log_source`) keeps the legacy list.
+ * Pick the curated list for the active field universe. An OCSF universe (it
+ * has `metadata.log_source`) gets the OCSF list filtered to fields the
+ * deployment actually has, with `metadata.log_source` always kept. A UDM
+ * universe, or an unknown one (the schema fetch has not landed yet), keeps the
+ * UDM common list: UDM is this edition's default schema.
  */
 export function curatedFieldsFor(
   universe: ReadonlyMap<string, RankableField>,
@@ -86,8 +88,7 @@ export function curatedFieldsFor(
   override?: RankableField[],
 ): RankableField[] {
   if (override) return override;
-  if (universe.size === 0) return CURATED_OCSF_FIELDS;
-  if (!universe.has('metadata.log_source')) return legacy;
+  if (universe.size === 0 || !universe.has('metadata.log_source')) return legacy;
   return CURATED_OCSF_FIELDS.filter((f) => f.value === 'metadata.log_source' || universe.has(f.value));
 }
 

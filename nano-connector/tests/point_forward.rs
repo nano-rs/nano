@@ -160,19 +160,6 @@ async fn google_workspace_resumes_each_application_cursor() {
     assert_activation(&out.checkpoints["activities"]["items"]["admin"]);
 }
 
-#[tokio::test]
-async fn google_workspace_hosted_spec_starts_at_now_minus_overlap() {
-    // The hosted spec's 24 h `initial_lookback_secs` does not move the first
-    // window either (its DWD auth itself is covered in google_dwd.rs).
-    let spec = gws_spec("google_workspace_hosted.yaml");
-    assert!(spec.streams[0].window.as_ref().unwrap().initial_lookback_secs > INITIAL_CURSOR_OVERLAP_SECS as u64);
-    let mock = start_mock(Arc::new(|_r: &MockReq| MockResp::json(json!({"items": []}))), false).await;
-    let h = pinned(&mock, now());
-    run(&h, &spec, gws_input(HashMap::new())).await.out.expect("run");
-    assert!(!mock.requests().is_empty());
-    assert!(mock.requests().iter().all(|r| rfc(&r.query["startTime"]) == ic()), "{:?}", mock.requests());
-}
-
 // ----------------------------------------------------------- Slack audit --
 
 fn slack_audit_input(cps: HashMap<String, Value>) -> RunInput {
@@ -359,7 +346,7 @@ streams:
 "#;
     let mock = start_mock(Arc::new(|_r: &MockReq| MockResp::json(json!({"data": []}))), false).await;
     let h = pinned(&mock, now());
-    let out = run(&h, &spec(yaml), input(&[("TOKEN", "t")], json!({}), HashMap::new())).await.out.expect("run");
+    let out = run(&h, &spec(yaml), input(&[("TOKEN", "token-123456")], json!({}), HashMap::new())).await.out.expect("run");
     let q = &mock.requests()[0].query;
     assert_eq!(q["since"], "2026-10-12T13:55:00Z");
     assert_eq!(q["alias"], "2026-10-12T13:55:00Z");

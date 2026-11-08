@@ -6,27 +6,7 @@ use crate::search::execution::clickhouse_executor::{
     raw_sql_needs_skip_index_guard, wrap_query_for_count, wrap_query_with_pagination,
     BoundedCountInput, ClickHouseExecutor,
 };
-use crate::search::query_processing::{enforce_source_scope, enforce_source_scope_with_field};
-
-fn enforce_explain_source_scope(
-    query: &str,
-    dataset: crate::query::Dataset,
-    lake_mode: LakeQueryMode,
-    scope: &ScopeSet,
-) -> Result<String, SearchError> {
-    if dataset != crate::query::Dataset::Logs {
-        // Native spans and metrics have no log-source dimension. Risk applies
-        // this deny-set while constructing its derived grain in the lake
-        // worker, so injecting a logs-only field here would be both invalid
-        // and different from the execution path.
-        return Ok(query.to_string());
-    }
-    if lake_mode == LakeQueryMode::Primary {
-        enforce_source_scope_with_field(query, scope.deny_set(), "metadata.log_source")
-    } else {
-        enforce_source_scope(query, scope.deny_set())
-    }
-}
+use crate::search::query_processing::enforce_source_scope;
 
 /// NAN-2001: which raw-SQL ClickHouse identity a caller runs as. This is the ONE
 /// security decision the raw-SQL handler makes — everything else (table
@@ -58,7 +38,7 @@ impl SearchService {
         };
         executor.ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
-                "raw-SQL ClickHouse feature identity not configured".into(),
+                "raw-SQL ClickHouse feature identity not configured (NAN-2001)".into(),
             ))
         })
     }
@@ -82,15 +62,6 @@ impl SearchService {
         audit: RawSqlAuditAccess,
     ) -> Result<SearchResponse, SearchError> {
         let start_time = Instant::now();
-
-        self.require_dedicated_retention_surface("raw SQL")?;
-
-        if self.lake_query.mode == LakeQueryMode::Primary {
-            return Err(SearchError::SqlValidationError(
-                "raw SQL is not supported by the lake MVP; use nPL so Nano can enforce tenant and byte-scan policy"
-                    .to_string(),
-            ));
-        }
 
         if scope.is_restricted() {
             // NAN-3222: audit the refusal; the error the caller sees is unchanged.
@@ -145,17 +116,12 @@ impl SearchService {
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
 
         // Raw SQL queries don't get cost analysis or display type (we can't parse them)
-        // NAN-2550: raw SQL pages the same way. Page 1 ran the count companion;
-        // a later page reports `paged_total_estimate`, which is exact only when
-        // the page came back short (proving the end of the result set).
-        let total_count_exact = offset == 0 || results.len() < limit;
-
         Ok(SearchResponse {
-            server_wall_ms: None,
             results,
             total_count,
-            total_count_exact,
             execution_time_ms,
+            server_wall_ms: None,
+            queue_wait_ms: None,
             fields,
             generated_sql: Some(sql.to_string()),
             histogram,
@@ -163,7 +129,6 @@ impl SearchService {
             cost_score: None,
             display_type: None, // Raw SQL - let frontend determine
             column_order: None, // Raw SQL - no parsed column order
-            completeness: None,
         })
     }
 
@@ -173,7 +138,7 @@ impl SearchService {
     /// the query text exactly as the executed path does, so "Inspect SQL"
     /// renders the SQL that would actually run for this caller (including the
     /// scope exclusion) and the two can never diverge.
-    #[instrument(skip(self, scope, query), fields(query = %crate::inputlookup::storage_policy::redact_url_credentials(query)))]
+    #[instrument(skip(self, scope), fields(query = %query))]
     pub async fn explain(
         &self,
         query: &str,
@@ -182,75 +147,21 @@ impl SearchService {
         dataset: Option<&str>,
         scope: &ScopeSet,
     ) -> Result<String, SearchError> {
-        let (cleaned_query, earliest, latest) = extract_time_bounds(query)?;
-        let mut requested_time_range = time_range.clone();
-        if let Some(start) = earliest { requested_time_range.start = start; }
-        if let Some(end) = latest { requested_time_range.end = end; }
-        let time_range = &requested_time_range;
+        // Validate time range
         time_range.validate()?;
-        let Some(retention_time_range) =
-            self.retention_bound_input_range(time_range, chrono::Utc::now())?
-        else {
-            return Ok(
-                "-- requested time range is outside the current retention window".to_string(),
-            );
-        };
-        let time_range = &retention_time_range;
-
-        let query_dataset = crate::query::Dataset::from_selector(dataset.unwrap_or("logs"));
-        if self.lake_query.mode == LakeQueryMode::Primary
-            && matches!(
-                query_dataset,
-                crate::query::Dataset::Logs | crate::query::Dataset::Risk
-            )
-        {
-            let cleaned_query = enforce_explain_source_scope(
-                &cleaned_query,
-                query_dataset,
-                self.lake_query.mode,
-                scope,
-            )?;
-            let adjusted_time_range = time_range.clone();
-            let request_id = format!("lake-explain-{}", uuid::Uuid::now_v7());
-            let request = SearchRequest {
-                query: cleaned_query,
-                time_range: adjusted_time_range,
-                limit: Some(1_000_000),
-                offset: Some(0),
-                include_sql: Some(true),
-                skip_histogram: true,
-                skip_field_stats: true,
-                use_cache: false,
-                table_view,
-                request_id: Some(request_id.clone()),
-                async_mode: false,
-                priority: None,
-                dataset: dataset.map(ToOwned::to_owned),
-            };
-            let client = self.lake_query.client.as_ref().ok_or_else(|| {
-                SearchError::ServiceUnavailable(
-                    "canonical lake query worker is not configured".to_string(),
-                )
-            })?;
-            return client
-                .explain(&request, &request_id, scope.deny_set())
-                .await;
-        }
 
         // NAN-1569: resolve the per-query dataset profile so explain matches the
         // executed path — without this, "Inspect SQL" validates against and
         // renders the logs table for a spans/metrics query (misleading FROM logs).
         let query_profile = self.dataset_profile(dataset);
 
+        // Extract time modifiers and clean the query
+        let (cleaned_query, _, _) = extract_time_bounds(query)?;
+
         // NAN-1799: same injection point as `search()` — before the parse, so
         // every explain branch below (prevalence pushdown included) renders
         // the gated query. Empty deny-set → text unchanged.
-        let cleaned_query = enforce_explain_source_scope(
-            &cleaned_query,
-            query_dataset,
-            self.lake_query.mode,
-            scope,
-        )?;
+        let cleaned_query = enforce_source_scope(&cleaned_query, scope.deny_set())?;
 
         // Parse the cleaned query
         let parsed = parse_query(&cleaned_query).map_err(|e| convert_parse_error(e))?;
@@ -262,7 +173,8 @@ impl SearchService {
         // NAN-806: keep `explain` honest — the executed query has implicit
         // top-N sorting injected after a trailing `stats … by …`, and the
         // explained SQL should reflect that.
-        let (parsed, auto_sort_decision) = crate::search::query_processing::apply_auto_sort(parsed);
+        let (parsed, auto_sort_decision) =
+            crate::search::query_processing::apply_auto_sort(parsed);
 
         // Extract post-prevalence commands to determine if we need to strip them
         let post_prevalence = extract_post_prevalence_commands(&parsed);
@@ -328,7 +240,7 @@ impl SearchService {
                 .is_some();
             if has_count_conditions || enrich_decorated_filter {
                 sql.push_str(
-                    "\n\n-- Note: at execute time, artifacts the prevalence dict cannot resolve (brand-new,\n-- inside the dict cache LIFETIME) are re-verified against *_prevalence_summary and, if rare,\n-- their _hp/_dp/_ip_host_count projection is transform()-rewritten to the fresh count so the\n-- filter and every decoration/`| where host_count` see the truth in-SQL. The IP\n-- dimension is rescued only for the enrich+decorated-filter form; broad rules are bounded\n-- (miss-key cap) and rarest-capped with a WARN on overflow.",
+                    "\n\n-- Note: at execute time, artifacts the prevalence dict cannot resolve (brand-new,\n-- inside the dict cache LIFETIME) are re-verified against *_prevalence_summary and, if rare,\n-- their _hp/_dp/_ip_host_count projection is transform()-rewritten to the fresh count so the\n-- filter and every decoration/`| where host_count` see the truth in-SQL (NAN-1705). The IP\n-- dimension is rescued only for the enrich+decorated-filter form; broad rules are bounded\n-- (miss-key cap) and rarest-capped with a WARN on overflow.",
                 );
             }
             return Ok(sql);
@@ -349,6 +261,13 @@ impl SearchService {
         } else {
             query_for_sql
         };
+        // NAN-4933: a lookup is a Nano-side boundary (see core_search).
+        let query_for_sql =
+            if crate::search::query_processing::lookup_boundary_plan(&query_for_sql) == Ok(true) {
+                crate::search::query_processing::strip_enrichment_and_after(&query_for_sql)
+            } else {
+                query_for_sql
+            };
 
         // Strip AI commands — LLM enrichment happens in post-processing
         let has_ai = extract_ai_command(&query_for_sql).is_some();
@@ -425,7 +344,7 @@ impl SearchService {
         match auto_sort_decision {
             crate::search::query_processing::AutoSortDecision::Applied { field } => {
                 sql.push_str(&format!(
-                    "\n\n-- Note: implicit `| sort -{}` injected so the outer LIMIT keeps top-N",
+                    "\n\n-- Note: implicit `| sort -{}` injected so the outer LIMIT keeps top-N (NAN-806)",
                     field
                 ));
             }
@@ -516,9 +435,7 @@ impl SearchService {
                 )
                 .await
         } else {
-            ch_executor
-                .execute_sql(sql, limit, offset, preserve_columns)
-                .await
+            ch_executor.execute_sql(sql, limit, offset, preserve_columns).await
         }
     }
 
@@ -540,9 +457,28 @@ impl SearchService {
         // the CH >=26.4 unkillable planner wedge (ClickHouse#113003). Apply the
         // same guard when the text carries the map pattern; top-level SETTINGS
         // on the wrap applies to the whole query including the subquery.
+        let mut settings: Vec<String> = Vec::new();
         if raw_sql_needs_skip_index_guard(sql) {
-            paginated_sql.push_str(" SETTINGS use_skip_indexes = 0");
-            count_sql.push_str(" SETTINGS use_skip_indexes = 0");
+            settings.push("use_skip_indexes = 0".to_string());
+        }
+        // NAN-4957 review: raw SQL (searches, SQL dashboard panels, reports)
+        // gets the server-derived per-query memory ceiling too. The rows query
+        // and its count run at the same time, so they split one search's
+        // budget: two thirds for the rows (which also sort), one third for the
+        // count. Each spills its GROUP BY / ORDER BY at half its own cap, so a
+        // large aggregation goes to disk instead of hitting the cap.
+        let (rows_settings, count_settings) = match raw_sql_memory_split(self.query_memory_ceiling_bytes) {
+            Some((rows, count)) => (
+                [settings.clone(), raw_sql_memory_settings(rows)].concat(),
+                [settings, raw_sql_memory_settings(count)].concat(),
+            ),
+            None => (settings.clone(), settings),
+        };
+        if !rows_settings.is_empty() {
+            paginated_sql.push_str(&format!(" SETTINGS {}", rows_settings.join(", ")));
+        }
+        if !count_settings.is_empty() {
+            count_sql.push_str(&format!(" SETTINGS {}", count_settings.join(", ")));
         }
 
         // NAN-2001: main query + count companion both run on the selected
@@ -561,60 +497,20 @@ impl SearchService {
     }
 }
 
-#[cfg(test)]
-mod explain_scope_tests {
-    use super::*;
-    use std::collections::BTreeSet;
+/// NAN-4957 review: per-query `max_memory_usage` (rows, count) for the two
+/// concurrent raw-SQL queries under a search memory ceiling; they sum to at
+/// most the ceiling. Measured on a 10M-group GROUP BY: rows 650+ MiB (sorting
+/// the groups), count 182 MiB.
+pub(crate) fn raw_sql_memory_split(ceiling: Option<u64>) -> Option<(u64, u64)> {
+    ceiling.map(|c| ((c / 3 * 2).max(1), (c / 3).max(1)))
+}
 
-    fn restricted_scope() -> ScopeSet {
-        ScopeSet::from_denied(BTreeSet::from([
-            "audit".to_string(),
-            "restricted-edr".to_string(),
-        ]))
-    }
-
-    #[test]
-    fn primary_lake_log_explain_uses_canonical_ocsf_source_field() {
-        let out = enforce_explain_source_scope(
-            r#"metadata.log_source="windows_sysmon" | stats count()"#,
-            crate::query::Dataset::Logs,
-            LakeQueryMode::Primary,
-            &restricted_scope(),
-        )
-        .unwrap();
-
-        assert!(out.contains("metadata.log_source NOT IN"), "{out}");
-        assert!(!out.contains("source_type"), "{out}");
-    }
-
-    #[test]
-    fn legacy_log_explain_preserves_legacy_source_scope_field() {
-        let out = enforce_explain_source_scope(
-            "error | stats count()",
-            crate::query::Dataset::Logs,
-            LakeQueryMode::Disabled,
-            &restricted_scope(),
-        )
-        .unwrap();
-
-        assert!(out.contains("source_type NOT IN"), "{out}");
-    }
-
-    #[test]
-    fn non_log_explain_does_not_inject_a_log_source_field() {
-        for dataset in [
-            crate::query::Dataset::Spans,
-            crate::query::Dataset::Metrics,
-            crate::query::Dataset::Risk,
-        ] {
-            let out = enforce_explain_source_scope(
-                "service.name=auth",
-                dataset,
-                LakeQueryMode::Primary,
-                &restricted_scope(),
-            )
-            .unwrap();
-            assert_eq!(out, "service.name=auth");
-        }
-    }
+/// `max_memory_usage` plus spill thresholds at half of it, for one raw-SQL query.
+pub(crate) fn raw_sql_memory_settings(cap: u64) -> Vec<String> {
+    let spill = (cap / 2).max(1);
+    vec![
+        format!("max_memory_usage = {cap}"),
+        format!("max_bytes_before_external_group_by = {spill}"),
+        format!("max_bytes_before_external_sort = {spill}"),
+    ]
 }

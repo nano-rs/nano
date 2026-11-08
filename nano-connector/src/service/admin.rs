@@ -1,97 +1,60 @@
-//! Feed administration (NAN-3490 item 2): create a feed from a marketplace
-//! catalog entry, list feeds, enable / disable them.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Feed administration: plan a feed from a bundled spec, check its operator
+//! input, and resolve the parser lanes it will emit into.
 //!
-//! The operator surface is the `nano-connector-runner feed ...` CLI; the
-//! functions here are the reusable core an API handler can call later. They
-//! never take the tenant, the spec, or (on hosted-shared) the ingest URL
-//! from the caller's free input:
-//! - the tenant comes from the store's tenant inventory (on shared: the
-//!   worker-assignment ledger), and every write is a signed tenant
-//!   transaction;
-//! - the spec is the catalog entry's `config.connector_spec`, checked against
-//!   `config.connector_spec_sha256` and pinned on the feed;
-//! - the hosted ingest URL is derived from the tenant's own slug and the
-//!   deployment's ingest domain (`https://<slug>.<domain>/services/collector/event`),
-//!   so a platform-held token is never pointed at another tenant's ingress;
-//! - config and vendor credentials must be exactly what the spec reads.
+//! The functions never take the spec or the ingest destination from the
+//! caller's free input: the spec is a reviewed bundled spec selected by name
+//! ([`crate::first_party`]) and pinned on the feed by sha256; the ingest
+//! destination is the runner's own configuration. Config must be exactly what
+//! the spec reads.
 
 use std::collections::{BTreeSet, HashMap};
 
-use serde::Serialize;
 use serde_json::{Map, Value};
-use uuid::Uuid;
 
-use crate::spec::{ConnectorSpec, Kind};
-
-/// The catalog marker the content lane writes (`config.runtime`).
-pub const CONNECTOR_RUNTIME: &str = "connector";
+use crate::spec::{ConnectorSpec, Discover, Kind};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AdminError {
-    #[error("catalog entry `{0}` not found")]
+    #[error("connector `{0}` is not a bundled spec")]
     CatalogNotFound(String),
-    #[error("catalog entry `{slug}` is not a connector-runtime entry: {why}")]
-    NotConnector { slug: String, why: String },
-    #[error("catalog spec for `{0}` does not match its connector_spec_sha256; re-sync the catalog")]
-    SpecDigestMismatch(String),
     #[error("connector spec is invalid: {0}")]
     InvalidSpec(String),
     #[error("feed input is invalid: {0}")]
     InvalidInput(String),
-    #[error("tenant {0} is not served by this runner")]
-    UnknownTenant(Uuid),
     #[error("feed {0} not found")]
-    FeedNotFound(Uuid),
+    FeedNotFound(uuid::Uuid),
+    #[error("a feed with this name already exists")]
+    DuplicateName,
     #[error("{0}")]
     Backend(String),
 }
 
-/// What a catalog entry pins onto a new feed.
+/// What a bundled spec pins onto a new feed.
 #[derive(Debug, Clone)]
 pub struct FeedPlan {
-    pub catalog_id: Uuid,
     pub connector: String,
     pub spec_yaml: String,
     pub spec_sha256: String,
-    /// The lane the feed's ingest credential is bound to: the spec's single
-    /// stream `source_type`.
-    pub source_slug: String,
+    /// The lane label: the spec's single stream `source_type`, literal or a
+    /// template (`gws_{{item}}`) for a fan-out spec.
+    pub source_type: String,
     pub spec: ConnectorSpec,
 }
 
-/// Operator input for a new feed (never the tenant, the spec or, on shared,
-/// the ingest URL).
+/// Operator input for a new feed (never the spec or the ingest destination).
 #[derive(Debug, Clone, Default)]
 pub struct NewFeed {
     pub name: String,
     pub config: Map<String, Value>,
-    pub vendor_credentials: HashMap<String, String>,
+    pub credential_id: Option<uuid::Uuid>,
     pub schedule: Option<String>,
     pub max_run_secs: Option<i32>,
     pub enabled: bool,
 }
 
-/// A feed as an operator sees it. No secret material.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct FeedSummary {
-    pub id: Uuid,
-    pub name: String,
-    pub connector: String,
-    pub source_slug: String,
-    pub spec_sha256: String,
-    pub enabled: bool,
-    pub ingest_url: String,
-    /// `ready` (token stored), `pending` (issuance in flight), `none`, or
-    /// `not_required` (identity feeds).
-    pub credential: String,
-    pub credential_error: Option<String>,
-    pub next_run_at: chrono::DateTime<chrono::Utc>,
-    pub last_status: Option<String>,
-    pub last_error: Option<String>,
-    pub last_success_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-fn is_source_slug(s: &str) -> bool {
+pub(crate) fn is_source_slug(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
         && b.len() <= 100
@@ -100,154 +63,109 @@ fn is_source_slug(s: &str) -> bool {
         && s != "unknown"
 }
 
-/// Turn a catalog row (`id`, `slug`, `config`) into a feed plan.
-pub fn plan_from_catalog(catalog_id: Uuid, slug: &str, config: &Value) -> Result<FeedPlan, AdminError> {
-    let not = |why: &str| AdminError::NotConnector { slug: slug.to_string(), why: why.to_string() };
-    if config.get("runtime").and_then(Value::as_str) != Some(CONNECTOR_RUNTIME) {
-        return Err(not("config.runtime is not `connector`"));
-    }
-    let spec_yaml = config.get("connector_spec").and_then(Value::as_str).ok_or_else(|| not("config.connector_spec is missing"))?;
-    let digest = config
-        .get("connector_spec_sha256")
-        .and_then(Value::as_str)
-        .ok_or_else(|| not("config.connector_spec_sha256 is missing"))?;
-    let actual = super::feed::spec_sha256(spec_yaml);
-    if !actual.eq_ignore_ascii_case(digest) {
-        return Err(AdminError::SpecDigestMismatch(slug.to_string()));
-    }
+/// The lane label of an identity feed (`kind: identity`, G22): its rows go
+/// to the user directory, not to a parser lane.
+pub const IDENTITY_LANE_LABEL: &str = "identity";
+
+/// Plan a feed from a spec. Collectors and identity directory syncs run as
+/// feeds. Every collector stream must name a `source_type` (a feed's events
+/// always land in a known lane); an identity feed has no lane.
+pub fn plan_from_spec(connector: &str, spec_yaml: &str) -> Result<FeedPlan, AdminError> {
     let spec = ConnectorSpec::from_yaml(spec_yaml).map_err(|e| AdminError::InvalidSpec(e.to_string()))?;
     crate::preview::validate_static(&spec).map_err(|e| AdminError::InvalidSpec(e.to_string()))?;
     if spec.kind == Kind::Identity {
-        // No ingest lane: the feed writes the tenant's identity directory.
-        // `source_slug` only names the feed's connector.
-        if !is_source_slug(&spec.name) {
-            return Err(AdminError::InvalidSpec(format!("identity connector name `{}` is not a slug", spec.name)));
-        }
+        crate::engine::compile(&spec, &crate::engine::default_ceilings()).map_err(|e| AdminError::InvalidSpec(e.to_string()))?;
         return Ok(FeedPlan {
-            catalog_id,
-            connector: spec.name.clone(),
+            connector: connector.to_string(),
             spec_yaml: spec_yaml.to_string(),
-            spec_sha256: actual,
-            source_slug: spec.name.clone(),
+            spec_sha256: super::feed::spec_sha256(spec_yaml),
+            source_type: IDENTITY_LANE_LABEL.to_string(),
             spec,
         });
     }
     if spec.kind != Kind::Collector {
-        return Err(AdminError::InvalidSpec("only collector and identity specs run as feeds".into()));
+        return Err(AdminError::InvalidSpec("only collector and identity specs run as pull feeds".into()));
     }
-    let slugs: BTreeSet<&str> = spec.streams.iter().filter_map(|s| s.source_type.as_deref()).collect();
-    if spec.streams.iter().any(|s| s.source_type.is_none()) || slugs.len() != 1 {
-        // One feed = one source credential. A multi-source spec needs a
-        // collector credential (follow-up).
+    let labels: BTreeSet<&str> = spec.streams.iter().filter_map(|s| s.source_type.as_deref()).collect();
+    if spec.streams.iter().any(|s| s.source_type.is_none()) || labels.len() != 1 {
         return Err(AdminError::InvalidSpec(format!(
             "a feed needs every stream on one source_type; this spec has {}",
-            if slugs.is_empty() { "none".to_string() } else { slugs.into_iter().collect::<Vec<_>>().join(", ") }
+            if labels.is_empty() { "none".to_string() } else { labels.into_iter().collect::<Vec<_>>().join(", ") }
         )));
     }
-    let source_slug = slugs.into_iter().next().unwrap_or_default().to_string();
-    if !is_source_slug(&source_slug) {
-        return Err(AdminError::InvalidSpec(format!("source_type `{source_slug}` is not a source slug")));
+    let source_type = labels.into_iter().next().unwrap_or_default().to_string();
+    if !source_type.contains("{{") && !is_source_slug(&source_type) {
+        return Err(AdminError::InvalidSpec(format!("source_type `{source_type}` is not a source slug")));
     }
     Ok(FeedPlan {
-        catalog_id,
-        connector: spec.name.clone(),
+        connector: connector.to_string(),
         spec_yaml: spec_yaml.to_string(),
-        spec_sha256: actual,
-        source_slug,
+        spec_sha256: super::feed::spec_sha256(spec_yaml),
+        source_type,
         spec,
     })
 }
 
-/// Live-validation catalog entries (NAN-3490 item 5): a shipped spec copy
-/// pinned to a public mock vendor. Their slug ends in this suffix, which the
-/// marketplace reserves (a repository sync skips such manifests).
-pub const MOCK_SLUG_SUFFIX: &str = nanosiem_core::marketplace::VALIDATION_MOCK_SLUG_SUFFIX;
-/// The value this CLI stamps on a mock entry, as `author` and as
-/// `config.validation_mock`; remove only ever deletes rows carrying it, and
-/// the marketplace hides and refuses to edit any row with the config key.
-pub const MOCK_AUTHOR: &str = "nano-connector-runner:validation-mock";
-/// The only place a mock vendor may live: a Cloudflare workers.dev host.
-#[cfg(feature = "enterprise")]
-pub const MOCK_HOST_SUFFIX: &str = ".workers.dev";
-
-/// Refuse a slug that is not a `_mock` catalog slug.
-pub fn check_mock_slug(slug: &str) -> Result<(), AdminError> {
-    let ok = slug.len() > MOCK_SLUG_SUFFIX.len()
-        && slug.len() <= 64
-        && slug.ends_with(MOCK_SLUG_SUFFIX)
-        && is_source_slug(slug)
-        && !slug.contains('-');
-    if ok {
-        Ok(())
-    } else {
-        Err(AdminError::InvalidInput(format!("`{slug}` is not a mock catalog slug (lowercase, `_`-separated, ending in `{MOCK_SLUG_SUFFIX}`)")))
+/// The parser lanes a feed with `config` emits into: a literal stream
+/// `source_type`, or a `{{item}}` template expanded over the stream's
+/// config-driven fan-out (`discover: {from: config, key: K}`, a
+/// comma-separated list, as the engine reads it). `Err` when a template
+/// cannot be expanded from config (a request-discovered fan-out).
+pub fn lanes(plan: &FeedPlan, config: &Map<String, Value>) -> Result<BTreeSet<String>, AdminError> {
+    let mut out = BTreeSet::new();
+    if plan.spec.kind == Kind::Identity {
+        // Identity rows go to the user directory: no parser lane.
+        return Ok(out);
     }
+    for stream in &plan.spec.streams {
+        let Some(label) = stream.source_type.as_deref() else { continue };
+        if !label.contains("{{") {
+            out.insert(label.to_string());
+            continue;
+        }
+        let key = match stream.fanout.as_ref().map(|f| &f.discover) {
+            Some(Discover::Config { key }) if label.matches("{{").count() == 1 && label.contains("{{item}}") => key,
+            _ => {
+                return Err(AdminError::InvalidSpec(format!(
+                    "stream `{}` source_type `{label}` cannot be resolved from config",
+                    stream.id
+                )))
+            }
+        };
+        let items = config.get(key).map(crate::template::value_to_string).unwrap_or_default();
+        for item in items.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let lane = label.replace("{{item}}", item);
+            if !is_source_slug(&lane) {
+                return Err(AdminError::InvalidInput(format!("`{item}` in {key} makes `{lane}`, which is not a source slug")));
+            }
+            out.insert(lane);
+        }
+    }
+    if out.is_empty() {
+        return Err(AdminError::InvalidInput("the feed would emit into no parser lane".into()));
+    }
+    Ok(out)
 }
 
-/// Refuse anything but one plain DNS label as the workers.dev account
-/// subdomain (`<account>` in `<worker>.<account>.workers.dev`).
-#[cfg(feature = "enterprise")]
-pub fn check_mock_account(account: &str) -> Result<(), AdminError> {
-    let ok = !account.is_empty()
-        && account.len() <= 63
-        && !account.starts_with('-')
-        && !account.ends_with('-')
-        && account.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if ok {
-        Ok(())
-    } else {
-        Err(AdminError::InvalidInput(format!("`{account}` is not a workers.dev account subdomain (one lowercase DNS label)")))
-    }
-}
-
-/// Plan a mock catalog entry: an ordinary connector entry (same checks as
-/// `plan_from_catalog`) whose spec is named after the slug and may reach
-/// exactly one host, a literal `<worker>.<account>.workers.dev` name on the
-/// operator's own Cloudflare `account` subdomain.
-#[cfg(feature = "enterprise")]
-pub fn plan_mock_catalog(slug: &str, config: &Value, account: &str) -> Result<FeedPlan, AdminError> {
-    check_mock_slug(slug)?;
-    check_mock_account(account)?;
-    let plan = plan_from_catalog(Uuid::nil(), slug, config)?;
-    if plan.spec.name != slug {
-        return Err(AdminError::InvalidSpec(format!("a mock spec must be named after its slug `{slug}`, not `{}`", plan.spec.name)));
-    }
-    let [rule] = plan.spec.allow.as_slice() else {
-        return Err(AdminError::InvalidSpec(format!("a mock spec must allow exactly one host; it has {} rules", plan.spec.allow.len())));
-    };
-    let host = rule.host.as_deref().unwrap_or_default();
-    let account_suffix = format!(".{account}{MOCK_HOST_SUFFIX}");
-    let worker = host.strip_suffix(account_suffix.as_str()).unwrap_or_default();
-    if host.contains("{{")
-        || !rule.host_suffixes.is_empty()
-        || !crate::policy::is_plain_hostname(host)
-        || worker.is_empty()
-        || worker.contains('.')
-    {
-        return Err(AdminError::InvalidSpec(format!(
-            "a mock spec's allow host must be one literal <worker>{account_suffix} name, not {host:?}{}",
-            if rule.host_suffixes.is_empty() { "" } else { " with host_suffixes" }
-        )));
-    }
-    Ok(plan)
-}
-
-/// Every config key the spec reads: each `{{config.X}}` template reference
-/// and each `.config.X` read inside a stream's VRL `program` (NAN-3767: e.g.
-/// the directory specs' `PRIVILEGED_GROUPS`).
+/// The config keys a spec reads: `{{config.X}}` references in templates,
+/// and each `.config.X` read inside a stream's VRL `program`.
 pub fn config_keys(spec_yaml: &str) -> Result<BTreeSet<String>, AdminError> {
     let doc: Value = serde_yaml::from_str(spec_yaml).map_err(|e| AdminError::InvalidSpec(e.to_string()))?;
     let mut out = template_keys(&doc)?;
     out.extend(program_config_keys(&doc));
+    out.extend(fanout_config_keys(&doc));
+    out.extend(engine_config_keys(&doc));
     Ok(out)
 }
 
-/// The config keys only `{{config.X}}` templates read (no VRL program
-/// reads). A stored feed config keeps these even when empty; a key only a
-/// program reads is optional and dropped when empty.
-pub fn template_config_keys(spec_yaml: &str) -> Result<BTreeSet<String>, AdminError> {
-    let doc: Value = serde_yaml::from_str(spec_yaml).map_err(|e| AdminError::InvalidSpec(e.to_string()))?;
-    template_keys(&doc)
+/// Config keys the engine itself reads (always optional): an identity feed's
+/// `identity_allow_shrink` (G22, the shrink guard override).
+fn engine_config_keys(doc: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if doc.get("kind").and_then(Value::as_str) == Some("identity") {
+        out.insert(crate::identity::ALLOW_SHRINK_CONFIG.to_string());
+    }
+    out
 }
 
 fn template_keys(doc: &Value) -> Result<BTreeSet<String>, AdminError> {
@@ -268,6 +186,27 @@ fn template_keys(doc: &Value) -> Result<BTreeSet<String>, AdminError> {
         }
     }
     Ok(out)
+}
+
+/// `discover: {from: config, key: K}` reads config key `K`.
+fn fanout_config_keys(doc: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![doc];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Array(a) => stack.extend(a.iter()),
+            Value::Object(m) => {
+                if m.get("from").and_then(Value::as_str) == Some("config") {
+                    if let Some(k) = m.get("key").and_then(Value::as_str) {
+                        out.insert(k.to_string());
+                    }
+                }
+                stack.extend(m.values());
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Config keys read by `.config.X` paths in VRL `program` strings. A program
@@ -306,9 +245,8 @@ fn program_config_keys(doc: &Value) -> BTreeSet<String> {
 }
 
 /// Config keys a feed may leave out: every reference to them is a whole
-/// request query value (`param: "{{config.X}}"`). The engine omits a query
-/// parameter whose value renders empty, so leaving such a key unset (or
-/// empty) simply drops the parameter (e.g. Google's optional `customerId`).
+/// request query value (`param: "{{config.X}}"`, the engine omits an empty
+/// query parameter) or a VRL program read.
 pub fn optional_config_keys(spec_yaml: &str) -> Result<BTreeSet<String>, AdminError> {
     fn walk(v: &Value, under_query: bool, seen: &mut BTreeSet<String>, other: &mut BTreeSet<String>) -> Result<(), AdminError> {
         match v {
@@ -353,8 +291,9 @@ pub fn optional_config_keys(spec_yaml: &str) -> Result<BTreeSet<String>, AdminEr
     let doc: Value = serde_yaml::from_str(spec_yaml).map_err(|e| AdminError::InvalidSpec(e.to_string()))?;
     let (mut seen, mut other) = (BTreeSet::new(), BTreeSet::new());
     walk(&doc, false, &mut seen, &mut other)?;
-    // NAN-3767: keys only VRL programs read are optional.
     seen.extend(program_config_keys(&doc));
+    seen.extend(engine_config_keys(&doc));
+    other.extend(fanout_config_keys(&doc));
     Ok(seen.difference(&other).cloned().collect())
 }
 
@@ -364,9 +303,13 @@ pub fn credential_fields(spec: &ConnectorSpec) -> Result<BTreeSet<String>, Admin
     Ok(plugin.credential_fields().into_iter().collect())
 }
 
-/// Config and credentials must be exactly what the spec reads: nothing
-/// missing (a run would fail) and nothing extra (a typo, or a secret in the
-/// wrong place).
+/// Fastest schedule a feed override may set: once a minute.
+pub const MIN_SCHEDULE_SECS: i64 = 60;
+
+/// Config, schedule and run limits must fit the spec: nothing missing (a
+/// run would fail), nothing extra (a typo, or a secret in the wrong place),
+/// a schedule no faster than the spec's own cadence (the vendor's floor) and
+/// a run limit inside the spec's.
 pub fn check_inputs(plan: &FeedPlan, feed: &NewFeed) -> Result<(), AdminError> {
     let name = feed.name.trim();
     if name.is_empty() || name.chars().count() > 100 || name != feed.name || name.chars().any(char::is_control) {
@@ -390,195 +333,86 @@ pub fn check_inputs(plan: &FeedPlan, feed: &NewFeed) -> Result<(), AdminError> {
     {
         return Err(AdminError::InvalidInput(format!("config `{k}` is empty")));
     }
-    let wanted = credential_fields(&plan.spec)?;
-    let given: BTreeSet<String> = feed.vendor_credentials.keys().cloned().collect();
-    let missing: Vec<_> = wanted.difference(&given).cloned().collect();
-    let extra: Vec<_> = given.difference(&wanted).cloned().collect();
-    if !missing.is_empty() {
-        return Err(AdminError::InvalidInput(format!("credentials are missing {}", missing.join(", "))));
+    if let Some((k, _)) = feed.config.iter().find(|(_, v)| !(v.is_string() || v.is_number() || v.is_boolean())) {
+        return Err(AdminError::InvalidInput(format!("config `{k}` must be a string, number or boolean")));
     }
-    if !extra.is_empty() {
-        return Err(AdminError::InvalidInput(format!("credentials have fields the spec never reads: {}", extra.join(", "))));
+    if feed.config.get(crate::identity::ALLOW_SHRINK_CONFIG).is_some_and(|v| !v.is_boolean()) {
+        return Err(AdminError::InvalidInput(format!("config `{}` must be true or false", crate::identity::ALLOW_SHRINK_CONFIG)));
     }
-    if let Some((k, _)) = feed.vendor_credentials.iter().find(|(_, v)| v.trim().is_empty()) {
-        return Err(AdminError::InvalidInput(format!("credential `{k}` is empty")));
+    if !credential_fields(&plan.spec)?.is_empty() && feed.credential_id.is_none() {
+        return Err(AdminError::InvalidInput("this connector needs a credential".into()));
     }
-    if let Some(s) = &feed.schedule {
-        super::feed::next_scheduled(s, chrono::Utc::now())
-            .map_err(|e| AdminError::InvalidInput(format!("schedule `{s}` is not a valid cron expression: {e}")))?;
+    if let Some(s) = feed.schedule.as_deref() {
+        check_schedule(plan, s)?;
     }
-    if feed.max_run_secs.is_some_and(|m| !(10..=3600).contains(&m)) {
-        return Err(AdminError::InvalidInput("max_run_secs must be 10..=3600".into()));
+    if let Some(m) = feed.max_run_secs {
+        let ceiling = plan.spec.limits.max_run_secs.clamp(10, 3600) as i32;
+        if !(10..=ceiling).contains(&m) {
+            return Err(AdminError::InvalidInput(format!("max_run_secs must be 10..={ceiling} (the spec's own limit)")));
+        }
     }
     Ok(())
 }
 
-/// The hosted HEC URL for a tenant: `https://<slug>.<domain>/services/collector/event`
-/// (the tenant Worker's custom-domain route, NAN-2644). `host_suffix` is the
-/// runner's `CONNECTOR_INGEST_HOST_SUFFIX`; the URL must satisfy it.
-pub fn hosted_ingest_url(tenant_slug: &str, ingest_domain: &str, host_suffix: Option<&str>) -> Result<String, AdminError> {
-    let domain = ingest_domain.trim().trim_matches('.').to_ascii_lowercase();
-    let label_ok = |l: &str| {
-        let b = l.as_bytes();
-        !b.is_empty()
-            && b.len() <= 63
-            && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
-            && b[0] != b'-'
-            && b[b.len() - 1] != b'-'
-    };
-    if domain.is_empty() || domain.len() > 200 || !domain.split('.').all(label_ok) || !domain.contains('.') {
-        return Err(AdminError::InvalidInput("the ingest domain is not a DNS name".into()));
+/// NAN-4931: whether an operator can adopt the bundled `bundled` plan (a
+/// newer build's spec) for a feed pinned to `pinned_yaml` without editing the
+/// feed: the same kind, stream ids and credential fields, and the feed's
+/// existing config still satisfies the new spec. A precondition for EXPLICIT
+/// adoption only (which also resets checkpoints); nothing re-pins
+/// automatically. `Err` names why the feed must be recreated instead.
+pub fn repin_compatible(pinned_yaml: &str, bundled: &FeedPlan, feed: &NewFeed) -> Result<(), String> {
+    let old = ConnectorSpec::from_yaml(pinned_yaml).map_err(|e| format!("pinned spec unreadable: {e}"))?;
+    if old.kind != bundled.spec.kind {
+        return Err("the spec kind changed".into());
     }
-    if !label_ok(tenant_slug) {
-        return Err(AdminError::InvalidInput("tenant slug is not a DNS label; the ingest hostname cannot be derived".into()));
+    let ids = |s: &ConnectorSpec| s.streams.iter().map(|x| x.id.clone()).collect::<BTreeSet<_>>();
+    if ids(&old) != ids(&bundled.spec) {
+        return Err("the stream ids changed (checkpoints would not carry over)".into());
     }
-    let host = format!("{tenant_slug}.{domain}");
-    if let Some(suffix) = host_suffix {
-        let suffix = suffix.trim().to_ascii_lowercase();
-        let suffix = suffix.trim_start_matches('.');
-        if !(host == suffix || host.ends_with(&format!(".{suffix}"))) {
-            return Err(AdminError::InvalidInput(format!("ingest host {host} is outside CONNECTOR_INGEST_HOST_SUFFIX {suffix}")));
-        }
+    let creds = |s: &ConnectorSpec| credential_fields(s).map_err(|e| e.to_string());
+    if creds(&old)? != creds(&bundled.spec)? {
+        return Err("the credential fields changed".into());
     }
-    Ok(format!("https://{host}/services/collector/event"))
+    check_inputs(bundled, feed).map_err(|e| format!("the feed's settings do not fit the new spec: {e}"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SPEC: &str = include_str!("../../tests/fixtures/specs/okta_system_log.yaml");
-
-    fn catalog(spec: &str) -> Value {
-        serde_json::json!({
-            "runtime": "connector",
-            "connector_spec": spec,
-            "connector_spec_sha256": super::super::feed::spec_sha256(spec),
-        })
-    }
-
-    fn feed() -> NewFeed {
-        NewFeed {
-            name: "Okta".into(),
-            config: serde_json::json!({ "OKTA_DOMAIN": "acme.okta.com" }).as_object().unwrap().clone(),
-            vendor_credentials: HashMap::from([("API_TOKEN".into(), "00abc".into())]),
-            enabled: true,
-            ..Default::default()
+/// A feed's schedule override: valid cron, at most once a minute, and no
+/// faster than the spec's schedule (the vendor's rate floor).
+pub fn check_schedule(plan: &FeedPlan, schedule: &str) -> Result<(), AdminError> {
+    let now = chrono::Utc::now();
+    let gap = super::feed::min_interval(schedule, now)
+        .map_err(|e| AdminError::InvalidInput(format!("schedule `{schedule}` is not a valid cron expression: {e}")))?;
+    let mut floor = chrono::Duration::seconds(MIN_SCHEDULE_SECS);
+    if let Some(spec_schedule) = plan.spec.schedule.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Ok(spec_gap) = super::feed::min_interval(spec_schedule, now) {
+            floor = floor.max(spec_gap);
         }
     }
-
-    #[cfg(feature = "enterprise")]
-    fn mock_catalog(slug: &str, host_line: &str) -> Value {
-        let spec = SPEC.replacen("name: okta_system_log\n", &format!("name: {slug}\n"), 1).replacen(
-            "  - host: \"{{config.OKTA_DOMAIN}}\"\n    host_suffixes: [\".okta.com\", \".oktapreview.com\", \".okta-emea.com\", \".okta-gov.com\", \".okta.mil\"]\n",
-            host_line,
-            1,
-        );
-        catalog(&spec)
+    if gap < floor {
+        return Err(AdminError::InvalidInput(format!(
+            "schedule `{schedule}` runs every {} s; this connector allows at most one run every {} s",
+            gap.num_seconds(),
+            floor.num_seconds()
+        )));
     }
+    Ok(())
+}
 
-    #[test]
-    #[cfg(feature = "enterprise")]
-    fn mock_catalog_entries_are_pinned_to_one_workers_dev_host() {
-        let good = "  - host: \"nano-okta-mock.acct.workers.dev\"\n";
-        let plan = plan_mock_catalog("okta_system_log_mock", &mock_catalog("okta_system_log_mock", good), "acct").unwrap();
-        assert_eq!((plan.connector.as_str(), plan.source_slug.as_str()), ("okta_system_log_mock", "okta"));
-
-        // The slug must end in _mock, and the spec must carry that name.
-        for slug in ["okta_system_log", "okta-system-log_mock", "_mock", "Okta_mock", "okta_mockx"] {
-            assert!(matches!(plan_mock_catalog(slug, &mock_catalog(slug, good), "acct"), Err(AdminError::InvalidInput(_))), "{slug}");
-        }
-        assert!(matches!(
-            plan_mock_catalog("other_mock", &mock_catalog("okta_system_log_mock", good), "acct"),
-            Err(AdminError::InvalidSpec(_))
-        ));
-        // The shipped spec (Okta suffixes, templated host) is refused.
-        assert!(matches!(plan_mock_catalog("okta_system_log_mock", &catalog(SPEC), "acct"), Err(AdminError::InvalidSpec(_))));
-        for bad in [
-            "  - host: \"{{config.OKTA_DOMAIN}}\"\n    host_suffixes: [\".workers.dev\"]\n",
-            "  - host: \"acct.workers.dev\"\n",
-            "  - host: \"workers.dev\"\n",
-            "  - host: \"mock.example.com\"\n",
-            "  - host: \"mock.acct.workers.dev.evil.com\"\n",
-            "  - host: \"mock.acct.workers.dev\"\n  - host: \"mock2.acct.workers.dev\"\n",
-            // nano-red M4: the account label is pinned, so another
-            // Cloudflare account's worker (or a nested name) is refused.
-            "  - host: \"nano-okta-mock.other.workers.dev\"\n",
-            "  - host: \"nano-okta-mock.xacct.workers.dev\"\n",
-            "  - host: \"a.nano-okta-mock.acct.workers.dev\"\n",
-            "  - host: \".acct.workers.dev\"\n",
-        ] {
-            let r = plan_mock_catalog("okta_system_log_mock", &mock_catalog("okta_system_log_mock", bad), "acct");
-            assert!(matches!(r, Err(AdminError::InvalidSpec(_))), "{bad}: {r:?}");
-        }
-        // The account itself must be one lowercase DNS label.
-        for account in ["", "Acct", "acct.workers", "-acct", "acct-", "ac ct", "acct.workers.dev"] {
-            let r = plan_mock_catalog("okta_system_log_mock", &mock_catalog("okta_system_log_mock", good), account);
-            assert!(matches!(r, Err(AdminError::InvalidInput(_))), "{account:?}: {r:?}");
-        }
+/// Credential fields of a stored credential payload that the spec reads,
+/// as runner secrets. Extra fields (metadata the credentials store merges in,
+/// such as `external_id`) are ignored; a missing or blank field is an error
+/// so the run fails with a clear message instead of an auth failure.
+pub fn vendor_secrets(spec: &ConnectorSpec, payload: &Value) -> Result<HashMap<String, super::feed::Secret>, String> {
+    let wanted = credential_fields(spec).map_err(|e| e.to_string())?;
+    let mut out = HashMap::new();
+    for field in wanted {
+        let value = payload
+            .get(&field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("the bound credential has no `{field}`"))?;
+        out.insert(field, super::feed::Secret::new(value));
     }
-
-    #[test]
-    fn plans_the_okta_catalog_entry() {
-        let plan = plan_from_catalog(Uuid::nil(), "okta_system_log", &catalog(SPEC)).unwrap();
-        assert_eq!(plan.connector, "okta_system_log");
-        assert_eq!(plan.source_slug, "okta");
-        assert_eq!(plan.spec_sha256, super::super::feed::spec_sha256(SPEC));
-        assert_eq!(config_keys(SPEC).unwrap(), BTreeSet::from(["OKTA_DOMAIN".to_string()]));
-        assert_eq!(credential_fields(&plan.spec).unwrap(), BTreeSet::from(["API_TOKEN".to_string()]));
-        check_inputs(&plan, &feed()).unwrap();
-    }
-
-    #[test]
-    fn refuses_non_connector_entries_and_tampered_specs() {
-        let mut c = catalog(SPEC);
-        c["runtime"] = "deno".into();
-        assert!(matches!(plan_from_catalog(Uuid::nil(), "x", &c), Err(AdminError::NotConnector { .. })));
-        let mut c = catalog(SPEC);
-        c["connector_spec"] = Value::String(SPEC.replace("*/2 * * * *", "* * * * *"));
-        assert_eq!(plan_from_catalog(Uuid::nil(), "x", &c).unwrap_err(), AdminError::SpecDigestMismatch("x".into()));
-        assert!(matches!(plan_from_catalog(Uuid::nil(), "x", &serde_json::json!({})), Err(AdminError::NotConnector { .. })));
-    }
-
-    #[test]
-    fn refuses_missing_extra_and_empty_inputs() {
-        let plan = plan_from_catalog(Uuid::nil(), "okta_system_log", &catalog(SPEC)).unwrap();
-        let mut f = feed();
-        f.config.clear();
-        assert!(check_inputs(&plan, &f).unwrap_err().to_string().contains("missing OKTA_DOMAIN"));
-        let mut f = feed();
-        f.config.insert("OKTA_DOMIAN".into(), "x".into());
-        assert!(check_inputs(&plan, &f).unwrap_err().to_string().contains("never reads: OKTA_DOMIAN"));
-        let mut f = feed();
-        f.vendor_credentials.clear();
-        assert!(check_inputs(&plan, &f).unwrap_err().to_string().contains("missing API_TOKEN"));
-        let mut f = feed();
-        f.vendor_credentials.insert("PASSWORD".into(), "x".into());
-        assert!(check_inputs(&plan, &f).unwrap_err().to_string().contains("never reads: PASSWORD"));
-        let mut f = feed();
-        f.vendor_credentials.insert("API_TOKEN".into(), " ".into());
-        assert!(check_inputs(&plan, &f).is_err());
-        let mut f = feed();
-        f.name = " Okta".into();
-        assert!(check_inputs(&plan, &f).is_err());
-        let mut f = feed();
-        f.schedule = Some("every minute".into());
-        assert!(check_inputs(&plan, &f).is_err());
-        let mut f = feed();
-        f.max_run_secs = Some(5);
-        assert!(check_inputs(&plan, &f).is_err());
-    }
-
-    #[test]
-    fn hosted_ingest_url_comes_from_the_tenant_slug() {
-        assert_eq!(
-            hosted_ingest_url("acme", "ingest.nano.rs", Some(".ingest.nano.rs")).unwrap(),
-            "https://acme.ingest.nano.rs/services/collector/event"
-        );
-        assert!(hosted_ingest_url("acme", "ingest.nano.rs", Some(".other.example")).is_err());
-        assert!(hosted_ingest_url("Acme", "ingest.nano.rs", None).is_err());
-        assert!(hosted_ingest_url("acme.evil", "ingest.nano.rs", None).is_err());
-        assert!(hosted_ingest_url("acme", "localhost", None).is_err());
-        assert!(hosted_ingest_url("acme", "ingest.nano.rs/x", None).is_err());
-    }
+    Ok(out)
 }

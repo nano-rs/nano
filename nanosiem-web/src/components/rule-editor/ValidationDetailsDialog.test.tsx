@@ -4,7 +4,6 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { ValidationDetailsDialog } from './ValidationDetailsDialog';
-import { VersionHistoryModal } from '@/enterprise/components/tuning/RuleVersionHistory';
 
 beforeAll(() => {
   if (!window.matchMedia) {
@@ -66,21 +65,5 @@ describe('ValidationDetailsDialog (DetailSheet)', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: /Run test/ }));
     expect(onOpenChange).toHaveBeenCalledWith(false);
     expect(onRunTest).toHaveBeenCalled();
-  });
-});
-
-describe('VersionHistoryModal (DetailSheet)', () => {
-  it('renders in an xl sheet with the version count in meta and closes', () => {
-    const onOpenChange = vi.fn();
-    render(
-      <VersionHistoryModal open onOpenChange={onOpenChange} versions={[]} onRevert={async () => {}} />,
-    );
-    const sheet = sheetEl();
-    expect(sheet!.getAttribute('data-size')).toBe('xl');
-    const dialog = screen.getByRole('dialog', { name: 'Version History' });
-    expect(dialog.querySelector('[data-slot="meta"]')!.textContent).toBe('0 versions');
-    expect(within(dialog).getByText('No version history available')).toBeTruthy();
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
-    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 });

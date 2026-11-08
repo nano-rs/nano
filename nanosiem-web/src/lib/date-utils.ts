@@ -11,21 +11,6 @@ import { formatDistanceToNow } from 'date-fns';
 import { formatInTimeZone } from 'date-fns-tz';
 
 /**
- * Parse a timestamp string as UTC (handles database format without Z suffix).
- *
- * ClickHouse `toString(DateTime)` and the lake's chDB JSONEachRow both emit
- * naive `"YYYY-MM-DD HH:MM:SS[.ffffff]"` strings. A bare `new Date(...)` would
- * interpret those in the browser's LOCAL zone — actively wrong when the UI
- * prints the result with a "UTC" label.
- *
- * Re-exported from `lib/parse-timestamp-utc.ts` rather than reimplemented: two
- * same-named copies existed with DIFFERENT empty-input contracts (Invalid Date
- * here, "now" there), split across twelve files with nothing to indicate which
- * one a new call site would get.
- */
-export { parseTimestampAsUTC } from './parse-timestamp-utc';
-
-/**
  * Format a date as UTC string for display
  * Example: "Dec 21, 2025, 14:30:45 UTC"
  */
@@ -90,6 +75,18 @@ export function formatRelativeCompact(date: Date | string | null | undefined): s
   if (diffHours < 24) return `${diffHours}h ago`;
   if (diffDays < 7) return `${diffDays}d ago`;
   return formatInTimeZone(d, 'UTC', 'MMM d');
+}
+
+/** "in 42m" / "in 3h" / "due" for a time in the future. */
+export function formatUntil(at: string, now: Date = new Date()): string {
+  const ms = new Date(at).getTime() - now.getTime();
+  if (Number.isNaN(ms)) return '';
+  if (ms <= 60_000) return 'due';
+  const mins = Math.round(ms / 60_000);
+  if (mins < 60) return `in ${mins}m`;
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return `in ${hours}h`;
+  return `in ${Math.round(hours / 24)}d`;
 }
 
 /**

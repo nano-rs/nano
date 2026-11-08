@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { authenticatedFetch } from '../authenticated-fetch';
 import type {
   CreateReportRequest,
   ReportDefinition,
@@ -12,7 +13,6 @@ import type {
   UpdateReportRequest,
 } from './types';
 import { getServiceUrl } from './utils';
-import { requestCredentials } from '@/lib/request-credentials';
 
 /**
  * Scheduled Reports API (NAN-1793).
@@ -26,7 +26,7 @@ export class ReportsApi {
     private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>,
     // Needed for the binary artifact download, which cannot go through the
     // JSON-parsing `request` transport. Mirrors UploadApi.
-    private getAccessToken?: () => string | null,
+    _getAccessToken?: () => string | null,
   ) {}
 
   /** filter=all only works for admins; default mine. */
@@ -92,19 +92,7 @@ export class ReportsApi {
     const endpoint = `/api/reports/artifacts/${artifactId}/download`;
     const url = `${getServiceUrl(endpoint)}${endpoint}`;
 
-    const headers: HeadersInit = {};
-    const token = this.getAccessToken?.();
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
-
-    const response = await fetch(url, {
-      method: 'GET',
-      headers,
-      // Bearer and cookie must not travel together (shared auth refuses
-      // two credentials with 401); mirror the JSON transport's rule.
-      credentials: requestCredentials(endpoint, headers),
-    });
+    const response = await authenticatedFetch(endpoint, url, { method: 'GET' });
 
     if (!response.ok) {
       const errorBody = await response.json().catch(() => ({

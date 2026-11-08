@@ -1,0 +1,6207 @@
+{
+  "total_fields": 512,
+  "fields": [
+    {
+      "field_name": "action",
+      "snake_case_name": "action",
+      "pascal_case_name": "Action",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "ai_confidence",
+      "snake_case_name": "ai_confidence",
+      "pascal_case_name": "AiConfidence",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "Integer",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "ai_reasoning",
+      "snake_case_name": "ai_reasoning",
+      "pascal_case_name": "AiReasoning",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "ai_verdict",
+      "snake_case_name": "ai_verdict",
+      "pascal_case_name": "AiVerdict",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "additional_answer_count",
+      "snake_case_name": "additional_answer_count",
+      "pascal_case_name": "AdditionalAnswerCount",
+      "data_models": [
+        "DNS"
+      ],
+      "inferred_type": "Integer",
+      "category": "Dns"
+    },
+    {
+      "field_name": "answer",
+      "snake_case_name": "answer",
+      "pascal_case_name": "Answer",
+      "data_models": [
+        "DNS"
+      ],
+      "inferred_type": "String",
+      "category": "Dns"
+    },
+    {
+      "field_name": "answer_count",
+      "snake_case_name": "answer_count",
+      "pascal_case_name": "AnswerCount",
+      "data_models": [
+        "DNS"
+      ],
+      "inferred_type": "Integer",
+      "category": "Dns"
+    },
+    {
+      "field_name": "app",
+      "snake_case_name": "app",
+      "pascal_case_name": "App",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "app_id",
+      "snake_case_name": "app_id",
+      "pascal_case_name": "AppId",
+      "data_models": [
+        "Data Access"
+      ],
+      "inferred_type": "Integer",
+      "category": "DataAccess"
+    },
+    {
+      "field_name": "array",
+      "snake_case_name": "array",
+      "pascal_case_name": "Array",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "authentication_method",
+      "snake_case_name": "authentication_method",
+      "pascal_case_name": "AuthenticationMethod",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "authentication_service",
+      "snake_case_name": "authentication_service",
+      "pascal_case_name": "AuthenticationService",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "auth_result",
+      "snake_case_name": "auth_result",
+      "pascal_case_name": "AuthResult",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "auth_type",
+      "snake_case_name": "auth_type",
+      "pascal_case_name": "AuthType",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "authority_answer_count",
+      "snake_case_name": "authority_answer_count",
+      "pascal_case_name": "AuthorityAnswerCount",
+      "data_models": [
+        "DNS"
+      ],
+      "inferred_type": "Integer",
+      "category": "Dns"
+    },
+    {
+      "field_name": "availability",
+      "snake_case_name": "availability",
+      "pascal_case_name": "Availability",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "avg_executions",
+      "snake_case_name": "avg_executions",
+      "pascal_case_name": "AvgExecutions",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "blocksize",
+      "snake_case_name": "blocksize",
+      "pascal_case_name": "Blocksize",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "buffer_cache_hit_ratio",
+      "snake_case_name": "buffer_cache_hit_ratio",
+      "pascal_case_name": "BufferCacheHitRatio",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Float",
+      "category": "Database"
+    },
+    {
+      "field_name": "bugtraq",
+      "snake_case_name": "bugtraq",
+      "pascal_case_name": "Bugtraq",
+      "data_models": [
+        "Vulnerability"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "bytes",
+      "snake_case_name": "bytes",
+      "pascal_case_name": "Bytes",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "Long",
+      "category": "Entity"
+    },
+    {
+      "field_name": "bytes_in",
+      "snake_case_name": "bytes_in",
+      "pascal_case_name": "BytesIn",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "Long",
+      "category": "Entity"
+    },
+    {
+      "field_name": "bytes_out",
+      "snake_case_name": "bytes_out",
+      "pascal_case_name": "BytesOut",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "Long",
+      "category": "Entity"
+    },
+    {
+      "field_name": "cached",
+      "snake_case_name": "cached",
+      "pascal_case_name": "Cached",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "category",
+      "snake_case_name": "category",
+      "pascal_case_name": "Category",
+      "data_models": [
+        "Data Loss Prevention"
+      ],
+      "inferred_type": "String",
+      "category": "DataLossPrevention"
+    },
+    {
+      "field_name": "cert",
+      "snake_case_name": "cert",
+      "pascal_case_name": "Cert",
+      "data_models": [
+        "Vulnerability"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "change_type",
+      "snake_case_name": "change_type",
+      "pascal_case_name": "ChangeType",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "channel",
+      "snake_case_name": "channel",
+      "pascal_case_name": "Channel",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "cloud_account_id",
+      "snake_case_name": "cloud_account_id",
+      "pascal_case_name": "CloudAccountId",
+      "data_models": [
+        "Cloud"
+      ],
+      "inferred_type": "Integer",
+      "category": "Entity"
+    },
+    {
+      "field_name": "cloud_account_name",
+      "snake_case_name": "cloud_account_name",
+      "pascal_case_name": "CloudAccountName",
+      "data_models": [
+        "Cloud"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "cloud_provider",
+      "snake_case_name": "cloud_provider",
+      "pascal_case_name": "CloudProvider",
+      "data_models": [
+        "Cloud"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "cloud_region",
+      "snake_case_name": "cloud_region",
+      "pascal_case_name": "CloudRegion",
+      "data_models": [
+        "Cloud"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "cloud_service",
+      "snake_case_name": "cloud_service",
+      "pascal_case_name": "CloudService",
+      "data_models": [
+        "Cloud"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "cluster",
+      "snake_case_name": "cluster",
+      "pascal_case_name": "Cluster",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "command",
+      "snake_case_name": "command",
+      "pascal_case_name": "Command",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "command_line",
+      "snake_case_name": "command_line",
+      "pascal_case_name": "CommandLine",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "commits",
+      "snake_case_name": "commits",
+      "pascal_case_name": "Commits",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "cookie",
+      "snake_case_name": "cookie",
+      "pascal_case_name": "Cookie",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "cpu_cores",
+      "snake_case_name": "cpu_cores",
+      "pascal_case_name": "CpuCores",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "cpu_count",
+      "snake_case_name": "cpu_count",
+      "pascal_case_name": "CpuCount",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "Integer",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "cpu_load_mhz",
+      "snake_case_name": "cpu_load_mhz",
+      "pascal_case_name": "CpuLoadMhz",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "Float",
+      "category": "Performance"
+    },
+    {
+      "field_name": "cpu_load_percent",
+      "snake_case_name": "cpu_load_percent",
+      "pascal_case_name": "CpuLoadPercent",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "Float",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "cpu_mhz",
+      "snake_case_name": "cpu_mhz",
+      "pascal_case_name": "CpuMhz",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "cpu_used",
+      "snake_case_name": "cpu_used",
+      "pascal_case_name": "CpuUsed",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "cpu_user_percent",
+      "snake_case_name": "cpu_user_percent",
+      "pascal_case_name": "CpuUserPercent",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "Float",
+      "category": "Performance"
+    },
+    {
+      "field_name": "creation_time",
+      "snake_case_name": "creation_time",
+      "pascal_case_name": "CreationTime",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "cursor",
+      "snake_case_name": "cursor",
+      "pascal_case_name": "Cursor",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "custom_dest_ip_risk",
+      "snake_case_name": "custom_dest_ip_risk",
+      "pascal_case_name": "CustomDestIpRisk",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_dest_ip_tags",
+      "snake_case_name": "custom_dest_ip_tags",
+      "pascal_case_name": "CustomDestIpTags",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "Array",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_domain_risk",
+      "snake_case_name": "custom_domain_risk",
+      "pascal_case_name": "CustomDomainRisk",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_domain_tags",
+      "snake_case_name": "custom_domain_tags",
+      "pascal_case_name": "CustomDomainTags",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "Array",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_hash_risk",
+      "snake_case_name": "custom_hash_risk",
+      "pascal_case_name": "CustomHashRisk",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_hash_tags",
+      "snake_case_name": "custom_hash_tags",
+      "pascal_case_name": "CustomHashTags",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "Array",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_ioc_dest_ip_confidence",
+      "snake_case_name": "custom_ioc_dest_ip_confidence",
+      "pascal_case_name": "CustomIocDestIpConfidence",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_ioc_dest_ip_malware",
+      "snake_case_name": "custom_ioc_dest_ip_malware",
+      "pascal_case_name": "CustomIocDestIpMalware",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_ioc_dest_ip_threat_type",
+      "snake_case_name": "custom_ioc_dest_ip_threat_type",
+      "pascal_case_name": "CustomIocDestIpThreatType",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_ioc_domain_confidence",
+      "snake_case_name": "custom_ioc_domain_confidence",
+      "pascal_case_name": "CustomIocDomainConfidence",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "Integer",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_ioc_domain_threat_type",
+      "snake_case_name": "custom_ioc_domain_threat_type",
+      "pascal_case_name": "CustomIocDomainThreatType",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_ioc_hash_confidence",
+      "snake_case_name": "custom_ioc_hash_confidence",
+      "pascal_case_name": "CustomIocHashConfidence",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "Integer",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_ioc_hash_threat_type",
+      "snake_case_name": "custom_ioc_hash_threat_type",
+      "pascal_case_name": "CustomIocHashThreatType",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_ioc_src_ip_confidence",
+      "snake_case_name": "custom_ioc_src_ip_confidence",
+      "pascal_case_name": "CustomIocSrcIpConfidence",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_ioc_src_ip_malware",
+      "snake_case_name": "custom_ioc_src_ip_malware",
+      "pascal_case_name": "CustomIocSrcIpMalware",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_ioc_src_ip_threat_type",
+      "snake_case_name": "custom_ioc_src_ip_threat_type",
+      "pascal_case_name": "CustomIocSrcIpThreatType",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_src_ip_risk",
+      "snake_case_name": "custom_src_ip_risk",
+      "pascal_case_name": "CustomSrcIpRisk",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_src_ip_tags",
+      "snake_case_name": "custom_src_ip_tags",
+      "pascal_case_name": "CustomSrcIpTags",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "Array",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_url_risk",
+      "snake_case_name": "custom_url_risk",
+      "pascal_case_name": "CustomUrlRisk",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "custom_url_tags",
+      "snake_case_name": "custom_url_tags",
+      "pascal_case_name": "CustomUrlTags",
+      "data_models": [
+        "Custom Enrichment"
+      ],
+      "inferred_type": "Array",
+      "category": "CustomEnrichment"
+    },
+    {
+      "field_name": "cve",
+      "snake_case_name": "cve",
+      "pascal_case_name": "Cve",
+      "data_models": [
+        "Vulnerability"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "cvss",
+      "snake_case_name": "cvss",
+      "pascal_case_name": "Cvss",
+      "data_models": [
+        "Vulnerability"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "date",
+      "snake_case_name": "date",
+      "pascal_case_name": "Date",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "delay",
+      "snake_case_name": "delay",
+      "pascal_case_name": "Delay",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "description",
+      "snake_case_name": "description",
+      "pascal_case_name": "Description",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "String",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "dest",
+      "snake_case_name": "dest",
+      "pascal_case_name": "Dest",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "String",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "dest_dns",
+      "snake_case_name": "dest_dns",
+      "pascal_case_name": "DestDns",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dest_host",
+      "snake_case_name": "dest_host",
+      "pascal_case_name": "DestHost",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dest_interface",
+      "snake_case_name": "dest_interface",
+      "pascal_case_name": "DestInterface",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dest_ip",
+      "snake_case_name": "dest_ip",
+      "pascal_case_name": "DestIp",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dest_ip_range",
+      "snake_case_name": "dest_ip_range",
+      "pascal_case_name": "DestIpRange",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dest_mac",
+      "snake_case_name": "dest_mac",
+      "pascal_case_name": "DestMac",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dest_name",
+      "snake_case_name": "dest_name",
+      "pascal_case_name": "DestName",
+      "data_models": [
+        "Data Access"
+      ],
+      "inferred_type": "String",
+      "category": "DataAccess"
+    },
+    {
+      "field_name": "dest_nt_domain",
+      "snake_case_name": "dest_nt_domain",
+      "pascal_case_name": "DestNtDomain",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "dest_nt_host",
+      "snake_case_name": "dest_nt_host",
+      "pascal_case_name": "DestNtHost",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dest_port",
+      "snake_case_name": "dest_port",
+      "pascal_case_name": "DestPort",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "Integer",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dest_port_range",
+      "snake_case_name": "dest_port_range",
+      "pascal_case_name": "DestPortRange",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dest_user",
+      "snake_case_name": "dest_user",
+      "pascal_case_name": "DestUser",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "dest_user_identity_account_status",
+      "snake_case_name": "dest_user_identity_account_status",
+      "pascal_case_name": "DestUserIdentityAccountStatus",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_company",
+      "snake_case_name": "dest_user_identity_company",
+      "pascal_case_name": "DestUserIdentityCompany",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_country",
+      "snake_case_name": "dest_user_identity_country",
+      "pascal_case_name": "DestUserIdentityCountry",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_department",
+      "snake_case_name": "dest_user_identity_department",
+      "pascal_case_name": "DestUserIdentityDepartment",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_display_name",
+      "snake_case_name": "dest_user_identity_display_name",
+      "pascal_case_name": "DestUserIdentityDisplayName",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_email",
+      "snake_case_name": "dest_user_identity_email",
+      "pascal_case_name": "DestUserIdentityEmail",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_employee_id",
+      "snake_case_name": "dest_user_identity_employee_id",
+      "pascal_case_name": "DestUserIdentityEmployeeId",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "Integer",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_employee_type",
+      "snake_case_name": "dest_user_identity_employee_type",
+      "pascal_case_name": "DestUserIdentityEmployeeType",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_groups",
+      "snake_case_name": "dest_user_identity_groups",
+      "pascal_case_name": "DestUserIdentityGroups",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_manager",
+      "snake_case_name": "dest_user_identity_manager",
+      "pascal_case_name": "DestUserIdentityManager",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_manager_upn",
+      "snake_case_name": "dest_user_identity_manager_upn",
+      "pascal_case_name": "DestUserIdentityManagerUpn",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_mfa_enabled",
+      "snake_case_name": "dest_user_identity_mfa_enabled",
+      "pascal_case_name": "DestUserIdentityMfaEnabled",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "Boolean",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_office_location",
+      "snake_case_name": "dest_user_identity_office_location",
+      "pascal_case_name": "DestUserIdentityOfficeLocation",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_phone",
+      "snake_case_name": "dest_user_identity_phone",
+      "pascal_case_name": "DestUserIdentityPhone",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_user_identity_title",
+      "snake_case_name": "dest_user_identity_title",
+      "pascal_case_name": "DestUserIdentityTitle",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "dest_translated_ip",
+      "snake_case_name": "dest_translated_ip",
+      "pascal_case_name": "DestTranslatedIp",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dest_translated_port",
+      "snake_case_name": "dest_translated_port",
+      "pascal_case_name": "DestTranslatedPort",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "Integer",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dest_type",
+      "snake_case_name": "dest_type",
+      "pascal_case_name": "DestType",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "String",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "dest_url",
+      "snake_case_name": "dest_url",
+      "pascal_case_name": "DestUrl",
+      "data_models": [
+        "Data Access"
+      ],
+      "inferred_type": "String",
+      "category": "DataAccess"
+    },
+    {
+      "field_name": "dest_zone",
+      "snake_case_name": "dest_zone",
+      "pascal_case_name": "DestZone",
+      "data_models": [
+        "Data Loss Prevention"
+      ],
+      "inferred_type": "String",
+      "category": "DataLossPrevention"
+    },
+    {
+      "field_name": "direction",
+      "snake_case_name": "direction",
+      "pascal_case_name": "Direction",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dlp_type",
+      "snake_case_name": "dlp_type",
+      "pascal_case_name": "DlpType",
+      "data_models": [
+        "Data Loss Prevention"
+      ],
+      "inferred_type": "String",
+      "category": "DataLossPrevention"
+    },
+    {
+      "field_name": "dns",
+      "snake_case_name": "dns",
+      "pascal_case_name": "Dns",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "dns_answers",
+      "snake_case_name": "dns_answers",
+      "pascal_case_name": "DnsAnswers",
+      "data_models": [
+        "DNS"
+      ],
+      "inferred_type": "String",
+      "category": "Dns"
+    },
+    {
+      "field_name": "dump_area_used",
+      "snake_case_name": "dump_area_used",
+      "pascal_case_name": "DumpAreaUsed",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "duration",
+      "snake_case_name": "duration",
+      "pascal_case_name": "Duration",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dvc",
+      "snake_case_name": "dvc",
+      "pascal_case_name": "Dvc",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dvc_ip",
+      "snake_case_name": "dvc_ip",
+      "pascal_case_name": "DvcIp",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dvc_mac",
+      "snake_case_name": "dvc_mac",
+      "pascal_case_name": "DvcMac",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "dvc_zone",
+      "snake_case_name": "dvc_zone",
+      "pascal_case_name": "DvcZone",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "elapsed_time",
+      "snake_case_name": "elapsed_time",
+      "pascal_case_name": "ElapsedTime",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "Database"
+    },
+    {
+      "field_name": "email",
+      "snake_case_name": "email",
+      "pascal_case_name": "Email",
+      "data_models": [
+        "Data Access"
+      ],
+      "inferred_type": "String",
+      "category": "DataAccess"
+    },
+    {
+      "field_name": "enabled",
+      "snake_case_name": "enabled",
+      "pascal_case_name": "Enabled",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "enrich_time",
+      "snake_case_name": "enrich_time",
+      "pascal_case_name": "EnrichTime",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "System"
+    },
+    {
+      "field_name": "enriched_dest_as_domain",
+      "snake_case_name": "enriched_dest_as_domain",
+      "pascal_case_name": "EnrichedDestAsDomain",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "enriched_dest_as_name",
+      "snake_case_name": "enriched_dest_as_name",
+      "pascal_case_name": "EnrichedDestAsName",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "enriched_dest_asn",
+      "snake_case_name": "enriched_dest_asn",
+      "pascal_case_name": "EnrichedDestAsn",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "enriched_dest_continent",
+      "snake_case_name": "enriched_dest_continent",
+      "pascal_case_name": "EnrichedDestContinent",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "enriched_dest_continent_code",
+      "snake_case_name": "enriched_dest_continent_code",
+      "pascal_case_name": "EnrichedDestContinentCode",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "Integer",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "enriched_dest_country",
+      "snake_case_name": "enriched_dest_country",
+      "pascal_case_name": "EnrichedDestCountry",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "enriched_dest_country_code",
+      "snake_case_name": "enriched_dest_country_code",
+      "pascal_case_name": "EnrichedDestCountryCode",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "Integer",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "enriched_src_as_domain",
+      "snake_case_name": "enriched_src_as_domain",
+      "pascal_case_name": "EnrichedSrcAsDomain",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "enriched_src_as_name",
+      "snake_case_name": "enriched_src_as_name",
+      "pascal_case_name": "EnrichedSrcAsName",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "enriched_src_asn",
+      "snake_case_name": "enriched_src_asn",
+      "pascal_case_name": "EnrichedSrcAsn",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "enriched_src_continent",
+      "snake_case_name": "enriched_src_continent",
+      "pascal_case_name": "EnrichedSrcContinent",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "enriched_src_continent_code",
+      "snake_case_name": "enriched_src_continent_code",
+      "pascal_case_name": "EnrichedSrcContinentCode",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "Integer",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "enriched_src_country",
+      "snake_case_name": "enriched_src_country",
+      "pascal_case_name": "EnrichedSrcCountry",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "enriched_src_country_code",
+      "snake_case_name": "enriched_src_country_code",
+      "pascal_case_name": "EnrichedSrcCountryCode",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "Integer",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "error_code",
+      "snake_case_name": "error_code",
+      "pascal_case_name": "ErrorCode",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "Integer",
+      "category": "Web"
+    },
+    {
+      "field_name": "event_type",
+      "snake_case_name": "event_type",
+      "pascal_case_name": "EventType",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "ext",
+      "snake_case_name": "ext",
+      "pascal_case_name": "Ext",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "family",
+      "snake_case_name": "family",
+      "pascal_case_name": "Family",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "fan_speed",
+      "snake_case_name": "fan_speed",
+      "pascal_case_name": "FanSpeed",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "String",
+      "category": "Performance"
+    },
+    {
+      "field_name": "fd_max",
+      "snake_case_name": "fd_max",
+      "pascal_case_name": "FdMax",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "fd_used",
+      "snake_case_name": "fd_used",
+      "pascal_case_name": "FdUsed",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "String",
+      "category": "Performance"
+    },
+    {
+      "field_name": "file_access_time",
+      "snake_case_name": "file_access_time",
+      "pascal_case_name": "FileAccessTime",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "file_action",
+      "snake_case_name": "file_action",
+      "pascal_case_name": "FileAction",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "file_acl",
+      "snake_case_name": "file_acl",
+      "pascal_case_name": "FileAcl",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "file_create_time",
+      "snake_case_name": "file_create_time",
+      "pascal_case_name": "FileCreateTime",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "file_hash",
+      "snake_case_name": "file_hash",
+      "pascal_case_name": "FileHash",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "file_modify_time",
+      "snake_case_name": "file_modify_time",
+      "pascal_case_name": "FileModifyTime",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "file_name",
+      "snake_case_name": "file_name",
+      "pascal_case_name": "FileName",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "file_path",
+      "snake_case_name": "file_path",
+      "pascal_case_name": "FilePath",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "file_size",
+      "snake_case_name": "file_size",
+      "pascal_case_name": "FileSize",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "Long",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "filter_action",
+      "snake_case_name": "filter_action",
+      "pascal_case_name": "FilterAction",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "filter_score",
+      "snake_case_name": "filter_score",
+      "pascal_case_name": "FilterScore",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "Float",
+      "category": "Email"
+    },
+    {
+      "field_name": "flow_id",
+      "snake_case_name": "flow_id",
+      "pascal_case_name": "FlowId",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "Integer",
+      "category": "Entity"
+    },
+    {
+      "field_name": "free_bytes",
+      "snake_case_name": "free_bytes",
+      "pascal_case_name": "FreeBytes",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Long",
+      "category": "Database"
+    },
+    {
+      "field_name": "http_content_type",
+      "snake_case_name": "http_content_type",
+      "pascal_case_name": "HttpContentType",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "http_method",
+      "snake_case_name": "http_method",
+      "pascal_case_name": "HttpMethod",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "http_referrer",
+      "snake_case_name": "http_referrer",
+      "pascal_case_name": "HttpReferrer",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "http_status_code",
+      "snake_case_name": "http_status_code",
+      "pascal_case_name": "HttpStatusCode",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "Integer",
+      "category": "Web"
+    },
+    {
+      "field_name": "http_referrer_domain",
+      "snake_case_name": "http_referrer_domain",
+      "pascal_case_name": "HttpReferrerDomain",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "http_user_agent",
+      "snake_case_name": "http_user_agent",
+      "pascal_case_name": "HttpUserAgent",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "http_user_agent_length",
+      "snake_case_name": "http_user_agent_length",
+      "pascal_case_name": "HttpUserAgentLength",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "hypervisor",
+      "snake_case_name": "hypervisor",
+      "pascal_case_name": "Hypervisor",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "hypervisor_id",
+      "snake_case_name": "hypervisor_id",
+      "pascal_case_name": "HypervisorId",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "Integer",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "icmp_code",
+      "snake_case_name": "icmp_code",
+      "pascal_case_name": "IcmpCode",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "Integer",
+      "category": "Entity"
+    },
+    {
+      "field_name": "icmp_type",
+      "snake_case_name": "icmp_type",
+      "pascal_case_name": "IcmpType",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "id",
+      "snake_case_name": "id",
+      "pascal_case_name": "Id",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "ids_type",
+      "snake_case_name": "ids_type",
+      "pascal_case_name": "IdsType",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "String",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "image_id",
+      "snake_case_name": "image_id",
+      "pascal_case_name": "ImageId",
+      "data_models": [
+        "Cloud"
+      ],
+      "inferred_type": "Integer",
+      "category": "Entity"
+    },
+    {
+      "field_name": "ingest_time",
+      "snake_case_name": "ingest_time",
+      "pascal_case_name": "IngestTime",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "System"
+    },
+    {
+      "field_name": "indexes_hit",
+      "snake_case_name": "indexes_hit",
+      "pascal_case_name": "IndexesHit",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "inline_nat",
+      "snake_case_name": "inline_nat",
+      "pascal_case_name": "InlineNat",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "instance_name",
+      "snake_case_name": "instance_name",
+      "pascal_case_name": "InstanceName",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "instance_reads",
+      "snake_case_name": "instance_reads",
+      "pascal_case_name": "InstanceReads",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "instance_type",
+      "snake_case_name": "instance_type",
+      "pascal_case_name": "InstanceType",
+      "data_models": [
+        "Cloud"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "instance_version",
+      "snake_case_name": "instance_version",
+      "pascal_case_name": "InstanceVersion",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "instance_writes",
+      "snake_case_name": "instance_writes",
+      "pascal_case_name": "InstanceWrites",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "interactive",
+      "snake_case_name": "interactive",
+      "pascal_case_name": "Interactive",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "interface",
+      "snake_case_name": "interface",
+      "pascal_case_name": "Interface",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "ioc_confidence",
+      "snake_case_name": "ioc_confidence",
+      "pascal_case_name": "IocConfidence",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "Integer",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_dest_ip_confidence",
+      "snake_case_name": "ioc_dest_ip_confidence",
+      "pascal_case_name": "IocDestIpConfidence",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_dest_ip_malware",
+      "snake_case_name": "ioc_dest_ip_malware",
+      "pascal_case_name": "IocDestIpMalware",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_dest_ip_threat_type",
+      "snake_case_name": "ioc_dest_ip_threat_type",
+      "pascal_case_name": "IocDestIpThreatType",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_domain_confidence",
+      "snake_case_name": "ioc_domain_confidence",
+      "pascal_case_name": "IocDomainConfidence",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "Integer",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_domain_malware",
+      "snake_case_name": "ioc_domain_malware",
+      "pascal_case_name": "IocDomainMalware",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "String",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_domain_threat_type",
+      "snake_case_name": "ioc_domain_threat_type",
+      "pascal_case_name": "IocDomainThreatType",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "String",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_hash_confidence",
+      "snake_case_name": "ioc_hash_confidence",
+      "pascal_case_name": "IocHashConfidence",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "Integer",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_hash_malware",
+      "snake_case_name": "ioc_hash_malware",
+      "pascal_case_name": "IocHashMalware",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "String",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_hash_threat_type",
+      "snake_case_name": "ioc_hash_threat_type",
+      "pascal_case_name": "IocHashThreatType",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "String",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_matched",
+      "snake_case_name": "ioc_matched",
+      "pascal_case_name": "IocMatched",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "Boolean",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_source",
+      "snake_case_name": "ioc_source",
+      "pascal_case_name": "IocSource",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "String",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_src_ip_confidence",
+      "snake_case_name": "ioc_src_ip_confidence",
+      "pascal_case_name": "IocSrcIpConfidence",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_src_ip_malware",
+      "snake_case_name": "ioc_src_ip_malware",
+      "pascal_case_name": "IocSrcIpMalware",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_src_ip_threat_type",
+      "snake_case_name": "ioc_src_ip_threat_type",
+      "pascal_case_name": "IocSrcIpThreatType",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "ioc_tags",
+      "snake_case_name": "ioc_tags",
+      "pascal_case_name": "IocTags",
+      "data_models": [
+        "Threat Intelligence"
+      ],
+      "inferred_type": "Array",
+      "category": "ThreatIntelligence"
+    },
+    {
+      "field_name": "internal_message_id",
+      "snake_case_name": "internal_message_id",
+      "pascal_case_name": "InternalMessageId",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "Integer",
+      "category": "Email"
+    },
+    {
+      "field_name": "ip",
+      "snake_case_name": "ip",
+      "pascal_case_name": "Ip",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "last_call_minute",
+      "snake_case_name": "last_call_minute",
+      "pascal_case_name": "LastCallMinute",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "latency",
+      "snake_case_name": "latency",
+      "pascal_case_name": "Latency",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "lb_method",
+      "snake_case_name": "lb_method",
+      "pascal_case_name": "LbMethod",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "lease_duration",
+      "snake_case_name": "lease_duration",
+      "pascal_case_name": "LeaseDuration",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "lease_scope",
+      "snake_case_name": "lease_scope",
+      "pascal_case_name": "LeaseScope",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "lock_mode",
+      "snake_case_name": "lock_mode",
+      "pascal_case_name": "LockMode",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "lock_session_id",
+      "snake_case_name": "lock_session_id",
+      "pascal_case_name": "LockSessionId",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Integer",
+      "category": "Database"
+    },
+    {
+      "field_name": "logical_reads",
+      "snake_case_name": "logical_reads",
+      "pascal_case_name": "LogicalReads",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "logon_time",
+      "snake_case_name": "logon_time",
+      "pascal_case_name": "LogonTime",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "mac",
+      "snake_case_name": "mac",
+      "pascal_case_name": "Mac",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "machine",
+      "snake_case_name": "machine",
+      "pascal_case_name": "Machine",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "mem",
+      "snake_case_name": "mem",
+      "pascal_case_name": "Mem",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "mem_committed",
+      "snake_case_name": "mem_committed",
+      "pascal_case_name": "MemCommitted",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "String",
+      "category": "Performance"
+    },
+    {
+      "field_name": "mem_free",
+      "snake_case_name": "mem_free",
+      "pascal_case_name": "MemFree",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "String",
+      "category": "Performance"
+    },
+    {
+      "field_name": "mem_used",
+      "snake_case_name": "mem_used",
+      "pascal_case_name": "MemUsed",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "memory_sorts",
+      "snake_case_name": "memory_sorts",
+      "pascal_case_name": "MemorySorts",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Long",
+      "category": "Database"
+    },
+    {
+      "field_name": "message",
+      "snake_case_name": "message",
+      "pascal_case_name": "Message",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "metadata",
+      "snake_case_name": "metadata",
+      "pascal_case_name": "Metadata",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "message_id",
+      "snake_case_name": "message_id",
+      "pascal_case_name": "MessageId",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "Integer",
+      "category": "Email"
+    },
+    {
+      "field_name": "message_info",
+      "snake_case_name": "message_info",
+      "pascal_case_name": "MessageInfo",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "mfa_used",
+      "snake_case_name": "mfa_used",
+      "pascal_case_name": "MfaUsed",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "mitre_technique_id",
+      "snake_case_name": "mitre_technique_id",
+      "pascal_case_name": "MitreTechniqueId",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "Integer",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "mount",
+      "snake_case_name": "mount",
+      "pascal_case_name": "Mount",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "msft",
+      "snake_case_name": "msft",
+      "pascal_case_name": "Msft",
+      "data_models": [
+        "Vulnerability"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "mskb",
+      "snake_case_name": "mskb",
+      "pascal_case_name": "Mskb",
+      "data_models": [
+        "Vulnerability"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "name",
+      "snake_case_name": "name",
+      "pascal_case_name": "Name",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "namespace",
+      "snake_case_name": "namespace",
+      "pascal_case_name": "Namespace",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "node",
+      "snake_case_name": "node",
+      "pascal_case_name": "Node",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "node_port",
+      "snake_case_name": "node_port",
+      "pascal_case_name": "NodePort",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "Integer",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "number_of_users",
+      "snake_case_name": "number_of_users",
+      "pascal_case_name": "NumberOfUsers",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "obj_name",
+      "snake_case_name": "obj_name",
+      "pascal_case_name": "ObjName",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "object",
+      "snake_case_name": "object",
+      "pascal_case_name": "Object",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "object_attrs",
+      "snake_case_name": "object_attrs",
+      "pascal_case_name": "ObjectAttrs",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "object_category",
+      "snake_case_name": "object_category",
+      "pascal_case_name": "ObjectCategory",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "object_id",
+      "snake_case_name": "object_id",
+      "pascal_case_name": "ObjectId",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "Integer",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "object_path",
+      "snake_case_name": "object_path",
+      "pascal_case_name": "ObjectPath",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "object_size",
+      "snake_case_name": "object_size",
+      "pascal_case_name": "ObjectSize",
+      "data_models": [
+        "Data Access"
+      ],
+      "inferred_type": "Long",
+      "category": "DataAccess"
+    },
+    {
+      "field_name": "operation",
+      "snake_case_name": "operation",
+      "pascal_case_name": "Operation",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "orig_dest",
+      "snake_case_name": "orig_dest",
+      "pascal_case_name": "OrigDest",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "orig_recipient",
+      "snake_case_name": "orig_recipient",
+      "pascal_case_name": "OrigRecipient",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "orig_src",
+      "snake_case_name": "orig_src",
+      "pascal_case_name": "OrigSrc",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "original_file_name",
+      "snake_case_name": "original_file_name",
+      "pascal_case_name": "OriginalFileName",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "os",
+      "snake_case_name": "os",
+      "pascal_case_name": "Os",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "os_pid",
+      "snake_case_name": "os_pid",
+      "pascal_case_name": "OsPid",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "Integer",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "owner",
+      "snake_case_name": "owner",
+      "pascal_case_name": "Owner",
+      "data_models": [
+        "Data Access"
+      ],
+      "inferred_type": "String",
+      "category": "DataAccess"
+    },
+    {
+      "field_name": "owner_email",
+      "snake_case_name": "owner_email",
+      "pascal_case_name": "OwnerEmail",
+      "data_models": [
+        "Data Access"
+      ],
+      "inferred_type": "String",
+      "category": "DataAccess"
+    },
+    {
+      "field_name": "owner_id",
+      "snake_case_name": "owner_id",
+      "pascal_case_name": "OwnerId",
+      "data_models": [
+        "Data Access"
+      ],
+      "inferred_type": "Integer",
+      "category": "DataAccess"
+    },
+    {
+      "field_name": "packets",
+      "snake_case_name": "packets",
+      "pascal_case_name": "Packets",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "packets_in",
+      "snake_case_name": "packets_in",
+      "pascal_case_name": "PacketsIn",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "packets_out",
+      "snake_case_name": "packets_out",
+      "pascal_case_name": "PacketsOut",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "parent",
+      "snake_case_name": "parent",
+      "pascal_case_name": "Parent",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "parent_object",
+      "snake_case_name": "parent_object",
+      "pascal_case_name": "ParentObject",
+      "data_models": [
+        "Data Access"
+      ],
+      "inferred_type": "String",
+      "category": "DataAccess"
+    },
+    {
+      "field_name": "parent_object_category",
+      "snake_case_name": "parent_object_category",
+      "pascal_case_name": "ParentObjectCategory",
+      "data_models": [
+        "Data Access"
+      ],
+      "inferred_type": "String",
+      "category": "DataAccess"
+    },
+    {
+      "field_name": "parent_object_id",
+      "snake_case_name": "parent_object_id",
+      "pascal_case_name": "ParentObjectId",
+      "data_models": [
+        "Data Access"
+      ],
+      "inferred_type": "Integer",
+      "category": "DataAccess"
+    },
+    {
+      "field_name": "parent_command_line",
+      "snake_case_name": "parent_command_line",
+      "pascal_case_name": "ParentCommandLine",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "parent_process_exec",
+      "snake_case_name": "parent_process_exec",
+      "pascal_case_name": "ParentProcessExec",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "parent_process_guid",
+      "snake_case_name": "parent_process_guid",
+      "pascal_case_name": "ParentProcessGuid",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "parent_process_id",
+      "snake_case_name": "parent_process_id",
+      "pascal_case_name": "ParentProcessId",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "Integer",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "parent_process_name",
+      "snake_case_name": "parent_process_name",
+      "pascal_case_name": "ParentProcessName",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "parent_process_path",
+      "snake_case_name": "parent_process_path",
+      "pascal_case_name": "ParentProcessPath",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "password",
+      "snake_case_name": "password",
+      "pascal_case_name": "Password",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "physical_reads",
+      "snake_case_name": "physical_reads",
+      "pascal_case_name": "PhysicalReads",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "power",
+      "snake_case_name": "power",
+      "pascal_case_name": "Power",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "String",
+      "category": "Performance"
+    },
+    {
+      "field_name": "prevalence_dest_domain",
+      "snake_case_name": "prevalence_dest_domain",
+      "pascal_case_name": "PrevalenceDestDomain",
+      "data_models": [
+        "Prevalence"
+      ],
+      "inferred_type": "Integer",
+      "category": "Prevalence"
+    },
+    {
+      "field_name": "prevalence_dest_ip",
+      "snake_case_name": "prevalence_dest_ip",
+      "pascal_case_name": "PrevalenceDestIp",
+      "data_models": [
+        "Prevalence"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "Prevalence"
+    },
+    {
+      "field_name": "prevalence_file_hash",
+      "snake_case_name": "prevalence_file_hash",
+      "pascal_case_name": "PrevalenceFileHash",
+      "data_models": [
+        "Prevalence"
+      ],
+      "inferred_type": "Integer",
+      "category": "Prevalence"
+    },
+    {
+      "field_name": "prevalence_min",
+      "snake_case_name": "prevalence_min",
+      "pascal_case_name": "PrevalenceMin",
+      "data_models": [
+        "Prevalence"
+      ],
+      "inferred_type": "Integer",
+      "category": "Prevalence"
+    },
+    {
+      "field_name": "prevalence_process_hash",
+      "snake_case_name": "prevalence_process_hash",
+      "pascal_case_name": "PrevalenceProcessHash",
+      "data_models": [
+        "Prevalence"
+      ],
+      "inferred_type": "Integer",
+      "category": "Prevalence"
+    },
+    {
+      "field_name": "process_current_directory",
+      "snake_case_name": "process_current_directory",
+      "pascal_case_name": "ProcessCurrentDirectory",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "process_exec",
+      "snake_case_name": "process_exec",
+      "pascal_case_name": "ProcessExec",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "process_guid",
+      "snake_case_name": "process_guid",
+      "pascal_case_name": "ProcessGuid",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "process_hash",
+      "snake_case_name": "process_hash",
+      "pascal_case_name": "ProcessHash",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "process_id",
+      "snake_case_name": "process_id",
+      "pascal_case_name": "ProcessId",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "Integer",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "process_integrity_level",
+      "snake_case_name": "process_integrity_level",
+      "pascal_case_name": "ProcessIntegrityLevel",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "process_limit",
+      "snake_case_name": "process_limit",
+      "pascal_case_name": "ProcessLimit",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "process_name",
+      "snake_case_name": "process_name",
+      "pascal_case_name": "ProcessName",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "process_path",
+      "snake_case_name": "process_path",
+      "pascal_case_name": "ProcessPath",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "processes",
+      "snake_case_name": "processes",
+      "pascal_case_name": "Processes",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "product",
+      "snake_case_name": "product",
+      "pascal_case_name": "Product",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "product_version",
+      "snake_case_name": "product_version",
+      "pascal_case_name": "ProductVersion",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "protocol",
+      "snake_case_name": "protocol",
+      "pascal_case_name": "Protocol",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "protocol_version",
+      "snake_case_name": "protocol_version",
+      "pascal_case_name": "ProtocolVersion",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "query",
+      "snake_case_name": "query",
+      "pascal_case_name": "Query",
+      "data_models": [
+        "DNS"
+      ],
+      "inferred_type": "String",
+      "category": "Dns"
+    },
+    {
+      "field_name": "query_count",
+      "snake_case_name": "query_count",
+      "pascal_case_name": "QueryCount",
+      "data_models": [
+        "DNS"
+      ],
+      "inferred_type": "Integer",
+      "category": "Dns"
+    },
+    {
+      "field_name": "query_id",
+      "snake_case_name": "query_id",
+      "pascal_case_name": "QueryId",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Integer",
+      "category": "Database"
+    },
+    {
+      "field_name": "query_plan_hit",
+      "snake_case_name": "query_plan_hit",
+      "pascal_case_name": "QueryPlanHit",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "query_time",
+      "snake_case_name": "query_time",
+      "pascal_case_name": "QueryTime",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "Database"
+    },
+    {
+      "field_name": "query_type",
+      "snake_case_name": "query_type",
+      "pascal_case_name": "QueryType",
+      "data_models": [
+        "DNS"
+      ],
+      "inferred_type": "String",
+      "category": "Dns"
+    },
+    {
+      "field_name": "read_blocks",
+      "snake_case_name": "read_blocks",
+      "pascal_case_name": "ReadBlocks",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "read_latency",
+      "snake_case_name": "read_latency",
+      "pascal_case_name": "ReadLatency",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "read_ops",
+      "snake_case_name": "read_ops",
+      "pascal_case_name": "ReadOps",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "reason",
+      "snake_case_name": "reason",
+      "pascal_case_name": "Reason",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "recipient",
+      "snake_case_name": "recipient",
+      "pascal_case_name": "Recipient",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "recipient_count",
+      "snake_case_name": "recipient_count",
+      "pascal_case_name": "RecipientCount",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "Integer",
+      "category": "Email"
+    },
+    {
+      "field_name": "recipient_domain",
+      "snake_case_name": "recipient_domain",
+      "pascal_case_name": "RecipientDomain",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "recipient_status",
+      "snake_case_name": "recipient_status",
+      "pascal_case_name": "RecipientStatus",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "record_type",
+      "snake_case_name": "record_type",
+      "pascal_case_name": "RecordType",
+      "data_models": [
+        "DNS"
+      ],
+      "inferred_type": "String",
+      "category": "Dns"
+    },
+    {
+      "field_name": "records_affected",
+      "snake_case_name": "records_affected",
+      "pascal_case_name": "RecordsAffected",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "registry_hive",
+      "snake_case_name": "registry_hive",
+      "pascal_case_name": "RegistryHive",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "registry_key_name",
+      "snake_case_name": "registry_key_name",
+      "pascal_case_name": "RegistryKeyName",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "registry_path",
+      "snake_case_name": "registry_path",
+      "pascal_case_name": "RegistryPath",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "registry_value_data",
+      "snake_case_name": "registry_value_data",
+      "pascal_case_name": "RegistryValueData",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "registry_value_name",
+      "snake_case_name": "registry_value_name",
+      "pascal_case_name": "RegistryValueName",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "registry_value_text",
+      "snake_case_name": "registry_value_text",
+      "pascal_case_name": "RegistryValueText",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "registry_value_type",
+      "snake_case_name": "registry_value_type",
+      "pascal_case_name": "RegistryValueType",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "reply_code",
+      "snake_case_name": "reply_code",
+      "pascal_case_name": "ReplyCode",
+      "data_models": [
+        "DNS"
+      ],
+      "inferred_type": "Integer",
+      "category": "Dns"
+    },
+    {
+      "field_name": "reply_code_id",
+      "snake_case_name": "reply_code_id",
+      "pascal_case_name": "ReplyCodeId",
+      "data_models": [
+        "DNS"
+      ],
+      "inferred_type": "Integer",
+      "category": "Dns"
+    },
+    {
+      "field_name": "resource_id",
+      "snake_case_name": "resource_id",
+      "pascal_case_name": "ResourceId",
+      "data_models": [
+        "Cloud"
+      ],
+      "inferred_type": "Integer",
+      "category": "Entity"
+    },
+    {
+      "field_name": "resource_name",
+      "snake_case_name": "resource_name",
+      "pascal_case_name": "ResourceName",
+      "data_models": [
+        "Cloud"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "resource_type",
+      "snake_case_name": "resource_type",
+      "pascal_case_name": "ResourceType",
+      "data_models": [
+        "Cloud"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "response_time",
+      "snake_case_name": "response_time",
+      "pascal_case_name": "ResponseTime",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "result",
+      "snake_case_name": "result",
+      "pascal_case_name": "Result",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "result_id",
+      "snake_case_name": "result_id",
+      "pascal_case_name": "ResultId",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "Integer",
+      "category": "System"
+    },
+    {
+      "field_name": "risk_entity",
+      "snake_case_name": "risk_entity",
+      "pascal_case_name": "RiskEntity",
+      "data_models": [
+        "Risk"
+      ],
+      "inferred_type": "String",
+      "category": "Risk"
+    },
+    {
+      "field_name": "risk_level",
+      "snake_case_name": "risk_level",
+      "pascal_case_name": "RiskLevel",
+      "data_models": [
+        "Risk"
+      ],
+      "inferred_type": "String",
+      "category": "Risk"
+    },
+    {
+      "field_name": "risk_score",
+      "snake_case_name": "risk_score",
+      "pascal_case_name": "RiskScore",
+      "data_models": [
+        "Risk"
+      ],
+      "inferred_type": "Float",
+      "category": "Risk"
+    },
+    {
+      "field_name": "retries",
+      "snake_case_name": "retries",
+      "pascal_case_name": "Retries",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "return_addr",
+      "snake_case_name": "return_addr",
+      "pascal_case_name": "ReturnAddr",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "rule",
+      "snake_case_name": "rule",
+      "pascal_case_name": "Rule",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "rule_action",
+      "snake_case_name": "rule_action",
+      "pascal_case_name": "RuleAction",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "rule_id",
+      "snake_case_name": "rule_id",
+      "pascal_case_name": "RuleId",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "Integer",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "rule_name",
+      "snake_case_name": "rule_name",
+      "pascal_case_name": "RuleName",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "String",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "seconds_in_wait",
+      "snake_case_name": "seconds_in_wait",
+      "pascal_case_name": "SecondsInWait",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "sender",
+      "snake_case_name": "sender",
+      "pascal_case_name": "Sender",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "sender_domain",
+      "snake_case_name": "sender_domain",
+      "pascal_case_name": "SenderDomain",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "serial",
+      "snake_case_name": "serial",
+      "pascal_case_name": "Serial",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "serial_num",
+      "snake_case_name": "serial_num",
+      "pascal_case_name": "SerialNum",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "service",
+      "snake_case_name": "service",
+      "pascal_case_name": "Service",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "service_dll",
+      "snake_case_name": "service_dll",
+      "pascal_case_name": "ServiceDll",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "service_dll_hash",
+      "snake_case_name": "service_dll_hash",
+      "pascal_case_name": "ServiceDllHash",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "service_dll_path",
+      "snake_case_name": "service_dll_path",
+      "pascal_case_name": "ServiceDllPath",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "service_dll_signature_exists",
+      "snake_case_name": "service_dll_signature_exists",
+      "pascal_case_name": "ServiceDllSignatureExists",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "service_dll_signature_verified",
+      "snake_case_name": "service_dll_signature_verified",
+      "pascal_case_name": "ServiceDllSignatureVerified",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "service_exec",
+      "snake_case_name": "service_exec",
+      "pascal_case_name": "ServiceExec",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "service_hash",
+      "snake_case_name": "service_hash",
+      "pascal_case_name": "ServiceHash",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "service_id",
+      "snake_case_name": "service_id",
+      "pascal_case_name": "ServiceId",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "Integer",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "service_name",
+      "snake_case_name": "service_name",
+      "pascal_case_name": "ServiceName",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "service_path",
+      "snake_case_name": "service_path",
+      "pascal_case_name": "ServicePath",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "service_signature_exists",
+      "snake_case_name": "service_signature_exists",
+      "pascal_case_name": "ServiceSignatureExists",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "service_signature_verified",
+      "snake_case_name": "service_signature_verified",
+      "pascal_case_name": "ServiceSignatureVerified",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "session_id",
+      "snake_case_name": "session_id",
+      "pascal_case_name": "SessionId",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "Integer",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "trace_id",
+      "snake_case_name": "trace_id",
+      "pascal_case_name": "TraceId",
+      "data_models": [
+        "Custom"
+      ],
+      "inferred_type": "Integer",
+      "category": "Entity"
+    },
+    {
+      "field_name": "span_id",
+      "snake_case_name": "span_id",
+      "pascal_case_name": "SpanId",
+      "data_models": [
+        "Custom"
+      ],
+      "inferred_type": "Integer",
+      "category": "Entity"
+    },
+    {
+      "field_name": "session_limit",
+      "snake_case_name": "session_limit",
+      "pascal_case_name": "SessionLimit",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "session_status",
+      "snake_case_name": "session_status",
+      "pascal_case_name": "SessionStatus",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "sessions",
+      "snake_case_name": "sessions",
+      "pascal_case_name": "Sessions",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "severity",
+      "snake_case_name": "severity",
+      "pascal_case_name": "Severity",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "String",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "severity_id",
+      "snake_case_name": "severity_id",
+      "pascal_case_name": "SeverityId",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "Integer",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "sga_buffer_cache_size",
+      "snake_case_name": "sga_buffer_cache_size",
+      "pascal_case_name": "SgaBufferCacheSize",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Long",
+      "category": "Database"
+    },
+    {
+      "field_name": "sga_buffer_hit_limit",
+      "snake_case_name": "sga_buffer_hit_limit",
+      "pascal_case_name": "SgaBufferHitLimit",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "sga_data_dict_hit_ratio",
+      "snake_case_name": "sga_data_dict_hit_ratio",
+      "pascal_case_name": "SgaDataDictHitRatio",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Float",
+      "category": "Database"
+    },
+    {
+      "field_name": "sga_fixed_area_size",
+      "snake_case_name": "sga_fixed_area_size",
+      "pascal_case_name": "SgaFixedAreaSize",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Long",
+      "category": "Database"
+    },
+    {
+      "field_name": "sga_free_memory",
+      "snake_case_name": "sga_free_memory",
+      "pascal_case_name": "SgaFreeMemory",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Long",
+      "category": "Database"
+    },
+    {
+      "field_name": "sga_library_cache_size",
+      "snake_case_name": "sga_library_cache_size",
+      "pascal_case_name": "SgaLibraryCacheSize",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Long",
+      "category": "Database"
+    },
+    {
+      "field_name": "sga_redo_log_buffer_size",
+      "snake_case_name": "sga_redo_log_buffer_size",
+      "pascal_case_name": "SgaRedoLogBufferSize",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Long",
+      "category": "Database"
+    },
+    {
+      "field_name": "sga_shared_pool_size",
+      "snake_case_name": "sga_shared_pool_size",
+      "pascal_case_name": "SgaSharedPoolSize",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Long",
+      "category": "Database"
+    },
+    {
+      "field_name": "sga_sql_area_size",
+      "snake_case_name": "sga_sql_area_size",
+      "pascal_case_name": "SgaSqlAreaSize",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Long",
+      "category": "Database"
+    },
+    {
+      "field_name": "shell",
+      "snake_case_name": "shell",
+      "pascal_case_name": "Shell",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "signature",
+      "snake_case_name": "signature",
+      "pascal_case_name": "Signature",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "String",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "signature_extra",
+      "snake_case_name": "signature_extra",
+      "pascal_case_name": "SignatureExtra",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "signature_id",
+      "snake_case_name": "signature_id",
+      "pascal_case_name": "SignatureId",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "Integer",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "signature_version",
+      "snake_case_name": "signature_version",
+      "pascal_case_name": "SignatureVersion",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "site",
+      "snake_case_name": "site",
+      "pascal_case_name": "Site",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "size",
+      "snake_case_name": "size",
+      "pascal_case_name": "Size",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "snapshot",
+      "snake_case_name": "snapshot",
+      "pascal_case_name": "Snapshot",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "source",
+      "snake_case_name": "source",
+      "pascal_case_name": "Source",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "source_type",
+      "snake_case_name": "source_type",
+      "pascal_case_name": "SourceType",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "src",
+      "snake_case_name": "src",
+      "pascal_case_name": "Src",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "String",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "src_dns",
+      "snake_case_name": "src_dns",
+      "pascal_case_name": "SrcDns",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "src_host",
+      "snake_case_name": "src_host",
+      "pascal_case_name": "SrcHost",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "src_interface",
+      "snake_case_name": "src_interface",
+      "pascal_case_name": "SrcInterface",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "src_ip",
+      "snake_case_name": "src_ip",
+      "pascal_case_name": "SrcIp",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "Entity"
+    },
+    {
+      "field_name": "src_ip_range",
+      "snake_case_name": "src_ip_range",
+      "pascal_case_name": "SrcIpRange",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "Entity"
+    },
+    {
+      "field_name": "src_mac",
+      "snake_case_name": "src_mac",
+      "pascal_case_name": "SrcMac",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "src_nt_domain",
+      "snake_case_name": "src_nt_domain",
+      "pascal_case_name": "SrcNtDomain",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "src_nt_host",
+      "snake_case_name": "src_nt_host",
+      "pascal_case_name": "SrcNtHost",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "src_port",
+      "snake_case_name": "src_port",
+      "pascal_case_name": "SrcPort",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "Integer",
+      "category": "Entity"
+    },
+    {
+      "field_name": "src_port_range",
+      "snake_case_name": "src_port_range",
+      "pascal_case_name": "SrcPortRange",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "src_translated_ip",
+      "snake_case_name": "src_translated_ip",
+      "pascal_case_name": "SrcTranslatedIp",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "IpAddress",
+      "category": "Entity"
+    },
+    {
+      "field_name": "src_translated_port",
+      "snake_case_name": "src_translated_port",
+      "pascal_case_name": "SrcTranslatedPort",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "Integer",
+      "category": "Entity"
+    },
+    {
+      "field_name": "src_type",
+      "snake_case_name": "src_type",
+      "pascal_case_name": "SrcType",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "String",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "src_user",
+      "snake_case_name": "src_user",
+      "pascal_case_name": "SrcUser",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "src_user_domain",
+      "snake_case_name": "src_user_domain",
+      "pascal_case_name": "SrcUserDomain",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "src_user_id",
+      "snake_case_name": "src_user_id",
+      "pascal_case_name": "SrcUserId",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "Integer",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "src_user_name",
+      "snake_case_name": "src_user_name",
+      "pascal_case_name": "SrcUserName",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "src_user_role",
+      "snake_case_name": "src_user_role",
+      "pascal_case_name": "SrcUserRole",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "src_user_identity_account_status",
+      "snake_case_name": "src_user_identity_account_status",
+      "pascal_case_name": "SrcUserIdentityAccountStatus",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_company",
+      "snake_case_name": "src_user_identity_company",
+      "pascal_case_name": "SrcUserIdentityCompany",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_country",
+      "snake_case_name": "src_user_identity_country",
+      "pascal_case_name": "SrcUserIdentityCountry",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_department",
+      "snake_case_name": "src_user_identity_department",
+      "pascal_case_name": "SrcUserIdentityDepartment",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_display_name",
+      "snake_case_name": "src_user_identity_display_name",
+      "pascal_case_name": "SrcUserIdentityDisplayName",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_email",
+      "snake_case_name": "src_user_identity_email",
+      "pascal_case_name": "SrcUserIdentityEmail",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_employee_id",
+      "snake_case_name": "src_user_identity_employee_id",
+      "pascal_case_name": "SrcUserIdentityEmployeeId",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "Integer",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_employee_type",
+      "snake_case_name": "src_user_identity_employee_type",
+      "pascal_case_name": "SrcUserIdentityEmployeeType",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_groups",
+      "snake_case_name": "src_user_identity_groups",
+      "pascal_case_name": "SrcUserIdentityGroups",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_manager",
+      "snake_case_name": "src_user_identity_manager",
+      "pascal_case_name": "SrcUserIdentityManager",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_manager_upn",
+      "snake_case_name": "src_user_identity_manager_upn",
+      "pascal_case_name": "SrcUserIdentityManagerUpn",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_mfa_enabled",
+      "snake_case_name": "src_user_identity_mfa_enabled",
+      "pascal_case_name": "SrcUserIdentityMfaEnabled",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "Boolean",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_office_location",
+      "snake_case_name": "src_user_identity_office_location",
+      "pascal_case_name": "SrcUserIdentityOfficeLocation",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_phone",
+      "snake_case_name": "src_user_identity_phone",
+      "pascal_case_name": "SrcUserIdentityPhone",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_identity_title",
+      "snake_case_name": "src_user_identity_title",
+      "pascal_case_name": "SrcUserIdentityTitle",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "src_user_type",
+      "snake_case_name": "src_user_type",
+      "pascal_case_name": "SrcUserType",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "src_zone",
+      "snake_case_name": "src_zone",
+      "pascal_case_name": "SrcZone",
+      "data_models": [
+        "Data Loss Prevention"
+      ],
+      "inferred_type": "String",
+      "category": "DataLossPrevention"
+    },
+    {
+      "field_name": "ssid",
+      "snake_case_name": "ssid",
+      "pascal_case_name": "Ssid",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "ssl_end_time",
+      "snake_case_name": "ssl_end_time",
+      "pascal_case_name": "SslEndTime",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_engine",
+      "snake_case_name": "ssl_engine",
+      "pascal_case_name": "SslEngine",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_hash",
+      "snake_case_name": "ssl_hash",
+      "pascal_case_name": "SslHash",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_is_valid",
+      "snake_case_name": "ssl_is_valid",
+      "pascal_case_name": "SslIsValid",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_issuer",
+      "snake_case_name": "ssl_issuer",
+      "pascal_case_name": "SslIssuer",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_issuer_common_name",
+      "snake_case_name": "ssl_issuer_common_name",
+      "pascal_case_name": "SslIssuerCommonName",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_issuer_email",
+      "snake_case_name": "ssl_issuer_email",
+      "pascal_case_name": "SslIssuerEmail",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_issuer_email_domain",
+      "snake_case_name": "ssl_issuer_email_domain",
+      "pascal_case_name": "SslIssuerEmailDomain",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_issuer_locality",
+      "snake_case_name": "ssl_issuer_locality",
+      "pascal_case_name": "SslIssuerLocality",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_issuer_organization",
+      "snake_case_name": "ssl_issuer_organization",
+      "pascal_case_name": "SslIssuerOrganization",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_issuer_state",
+      "snake_case_name": "ssl_issuer_state",
+      "pascal_case_name": "SslIssuerState",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_issuer_street",
+      "snake_case_name": "ssl_issuer_street",
+      "pascal_case_name": "SslIssuerStreet",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_issuer_unit",
+      "snake_case_name": "ssl_issuer_unit",
+      "pascal_case_name": "SslIssuerUnit",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_name",
+      "snake_case_name": "ssl_name",
+      "pascal_case_name": "SslName",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_policies",
+      "snake_case_name": "ssl_policies",
+      "pascal_case_name": "SslPolicies",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_publickey",
+      "snake_case_name": "ssl_publickey",
+      "pascal_case_name": "SslPublickey",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_publickey_algorithm",
+      "snake_case_name": "ssl_publickey_algorithm",
+      "pascal_case_name": "SslPublickeyAlgorithm",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_serial",
+      "snake_case_name": "ssl_serial",
+      "pascal_case_name": "SslSerial",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_session_id",
+      "snake_case_name": "ssl_session_id",
+      "pascal_case_name": "SslSessionId",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "Integer",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_signature_algorithm",
+      "snake_case_name": "ssl_signature_algorithm",
+      "pascal_case_name": "SslSignatureAlgorithm",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_start_time",
+      "snake_case_name": "ssl_start_time",
+      "pascal_case_name": "SslStartTime",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_subject",
+      "snake_case_name": "ssl_subject",
+      "pascal_case_name": "SslSubject",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_subject_common_name",
+      "snake_case_name": "ssl_subject_common_name",
+      "pascal_case_name": "SslSubjectCommonName",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_subject_email",
+      "snake_case_name": "ssl_subject_email",
+      "pascal_case_name": "SslSubjectEmail",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_subject_email_domain",
+      "snake_case_name": "ssl_subject_email_domain",
+      "pascal_case_name": "SslSubjectEmailDomain",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_subject_locality",
+      "snake_case_name": "ssl_subject_locality",
+      "pascal_case_name": "SslSubjectLocality",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_subject_organization",
+      "snake_case_name": "ssl_subject_organization",
+      "pascal_case_name": "SslSubjectOrganization",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_subject_state",
+      "snake_case_name": "ssl_subject_state",
+      "pascal_case_name": "SslSubjectState",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_subject_street",
+      "snake_case_name": "ssl_subject_street",
+      "pascal_case_name": "SslSubjectStreet",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_subject_unit",
+      "snake_case_name": "ssl_subject_unit",
+      "pascal_case_name": "SslSubjectUnit",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_validity_window",
+      "snake_case_name": "ssl_validity_window",
+      "pascal_case_name": "SslValidityWindow",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "ssl_version",
+      "snake_case_name": "ssl_version",
+      "pascal_case_name": "SslVersion",
+      "data_models": [
+        "Certificates"
+      ],
+      "inferred_type": "String",
+      "category": "Certificate"
+    },
+    {
+      "field_name": "start_mode",
+      "snake_case_name": "start_mode",
+      "pascal_case_name": "StartMode",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "start_time",
+      "snake_case_name": "start_time",
+      "pascal_case_name": "StartTime",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "System"
+    },
+    {
+      "field_name": "state",
+      "snake_case_name": "state",
+      "pascal_case_name": "State",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "String",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "status",
+      "snake_case_name": "status",
+      "pascal_case_name": "Status",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "status_code",
+      "snake_case_name": "status_code",
+      "pascal_case_name": "StatusCode",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "Integer",
+      "category": "Web"
+    },
+    {
+      "field_name": "storage",
+      "snake_case_name": "storage",
+      "pascal_case_name": "Storage",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "storage_free",
+      "snake_case_name": "storage_free",
+      "pascal_case_name": "StorageFree",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "String",
+      "category": "Performance"
+    },
+    {
+      "field_name": "storage_free_percent",
+      "snake_case_name": "storage_free_percent",
+      "pascal_case_name": "StorageFreePercent",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "Float",
+      "category": "Performance"
+    },
+    {
+      "field_name": "storage_name",
+      "snake_case_name": "storage_name",
+      "pascal_case_name": "StorageName",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "storage_used",
+      "snake_case_name": "storage_used",
+      "pascal_case_name": "StorageUsed",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "String",
+      "category": "Performance"
+    },
+    {
+      "field_name": "storage_used_percent",
+      "snake_case_name": "storage_used_percent",
+      "pascal_case_name": "StorageUsedPercent",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "Float",
+      "category": "Performance"
+    },
+    {
+      "field_name": "stored_procedures_called",
+      "snake_case_name": "stored_procedures_called",
+      "pascal_case_name": "StoredProceduresCalled",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "subject",
+      "snake_case_name": "subject",
+      "pascal_case_name": "Subject",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "swap",
+      "snake_case_name": "swap",
+      "pascal_case_name": "Swap",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "String",
+      "category": "Performance"
+    },
+    {
+      "field_name": "swap_free",
+      "snake_case_name": "swap_free",
+      "pascal_case_name": "SwapFree",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "String",
+      "category": "Performance"
+    },
+    {
+      "field_name": "swap_used",
+      "snake_case_name": "swap_used",
+      "pascal_case_name": "SwapUsed",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "String",
+      "category": "Performance"
+    },
+    {
+      "field_name": "table_scans",
+      "snake_case_name": "table_scans",
+      "pascal_case_name": "TableScans",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "tables_hit",
+      "snake_case_name": "tables_hit",
+      "pascal_case_name": "TablesHit",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "tablespace_name",
+      "snake_case_name": "tablespace_name",
+      "pascal_case_name": "TablespaceName",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "tablespace_reads",
+      "snake_case_name": "tablespace_reads",
+      "pascal_case_name": "TablespaceReads",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "tablespace_status",
+      "snake_case_name": "tablespace_status",
+      "pascal_case_name": "TablespaceStatus",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "tablespace_used",
+      "snake_case_name": "tablespace_used",
+      "pascal_case_name": "TablespaceUsed",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "tablespace_writes",
+      "snake_case_name": "tablespace_writes",
+      "pascal_case_name": "TablespaceWrites",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "tag",
+      "snake_case_name": "tag",
+      "pascal_case_name": "Tag",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "String",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "tcp_flag",
+      "snake_case_name": "tcp_flag",
+      "pascal_case_name": "TcpFlag",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "temperature",
+      "snake_case_name": "temperature",
+      "pascal_case_name": "Temperature",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "String",
+      "category": "Performance"
+    },
+    {
+      "field_name": "tags",
+      "snake_case_name": "tags",
+      "pascal_case_name": "Tags",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "String",
+      "category": "System"
+    },
+    {
+      "field_name": "thruput",
+      "snake_case_name": "thruput",
+      "pascal_case_name": "Thruput",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "String",
+      "category": "Performance"
+    },
+    {
+      "field_name": "thruput_max",
+      "snake_case_name": "thruput_max",
+      "pascal_case_name": "ThruputMax",
+      "data_models": [
+        "Performance"
+      ],
+      "inferred_type": "String",
+      "category": "Performance"
+    },
+    {
+      "field_name": "time",
+      "snake_case_name": "time",
+      "pascal_case_name": "Time",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "System"
+    },
+    {
+      "field_name": "timestamp",
+      "snake_case_name": "timestamp",
+      "pascal_case_name": "Timestamp",
+      "data_models": [
+        "System"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "System"
+    },
+    {
+      "field_name": "tos",
+      "snake_case_name": "tos",
+      "pascal_case_name": "Tos",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "transaction_id",
+      "snake_case_name": "transaction_id",
+      "pascal_case_name": "TransactionId",
+      "data_models": [
+        "DNS"
+      ],
+      "inferred_type": "Integer",
+      "category": "Dns"
+    },
+    {
+      "field_name": "transport",
+      "snake_case_name": "transport",
+      "pascal_case_name": "Transport",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "transport_dest_port",
+      "snake_case_name": "transport_dest_port",
+      "pascal_case_name": "TransportDestPort",
+      "data_models": [
+        "Endpoint"
+      ],
+      "inferred_type": "Integer",
+      "category": "Endpoint"
+    },
+    {
+      "field_name": "ttl",
+      "snake_case_name": "ttl",
+      "pascal_case_name": "Ttl",
+      "data_models": [
+        "DNS"
+      ],
+      "inferred_type": "String",
+      "category": "Dns"
+    },
+    {
+      "field_name": "type",
+      "snake_case_name": "type",
+      "pascal_case_name": "Type",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "String",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "uri_path",
+      "snake_case_name": "uri_path",
+      "pascal_case_name": "UriPath",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "uri_query",
+      "snake_case_name": "uri_query",
+      "pascal_case_name": "UriQuery",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "url",
+      "snake_case_name": "url",
+      "pascal_case_name": "Url",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "url_domain",
+      "snake_case_name": "url_domain",
+      "pascal_case_name": "UrlDomain",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "url_length",
+      "snake_case_name": "url_length",
+      "pascal_case_name": "UrlLength",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "user",
+      "snake_case_name": "user",
+      "pascal_case_name": "User",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "user_identity_account_status",
+      "snake_case_name": "user_identity_account_status",
+      "pascal_case_name": "UserIdentityAccountStatus",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_company",
+      "snake_case_name": "user_identity_company",
+      "pascal_case_name": "UserIdentityCompany",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_country",
+      "snake_case_name": "user_identity_country",
+      "pascal_case_name": "UserIdentityCountry",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_department",
+      "snake_case_name": "user_identity_department",
+      "pascal_case_name": "UserIdentityDepartment",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_display_name",
+      "snake_case_name": "user_identity_display_name",
+      "pascal_case_name": "UserIdentityDisplayName",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_email",
+      "snake_case_name": "user_identity_email",
+      "pascal_case_name": "UserIdentityEmail",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_employee_id",
+      "snake_case_name": "user_identity_employee_id",
+      "pascal_case_name": "UserIdentityEmployeeId",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "Integer",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_employee_type",
+      "snake_case_name": "user_identity_employee_type",
+      "pascal_case_name": "UserIdentityEmployeeType",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_groups",
+      "snake_case_name": "user_identity_groups",
+      "pascal_case_name": "UserIdentityGroups",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_manager",
+      "snake_case_name": "user_identity_manager",
+      "pascal_case_name": "UserIdentityManager",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_manager_upn",
+      "snake_case_name": "user_identity_manager_upn",
+      "pascal_case_name": "UserIdentityManagerUpn",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_mfa_enabled",
+      "snake_case_name": "user_identity_mfa_enabled",
+      "pascal_case_name": "UserIdentityMfaEnabled",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "Boolean",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_office_location",
+      "snake_case_name": "user_identity_office_location",
+      "pascal_case_name": "UserIdentityOfficeLocation",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_phone",
+      "snake_case_name": "user_identity_phone",
+      "pascal_case_name": "UserIdentityPhone",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_identity_title",
+      "snake_case_name": "user_identity_title",
+      "pascal_case_name": "UserIdentityTitle",
+      "data_models": [
+        "Enrichment"
+      ],
+      "inferred_type": "String",
+      "category": "Enrichment"
+    },
+    {
+      "field_name": "user_agent",
+      "snake_case_name": "user_agent",
+      "pascal_case_name": "UserAgent",
+      "data_models": [
+        "Web"
+      ],
+      "inferred_type": "String",
+      "category": "Web"
+    },
+    {
+      "field_name": "user_domain",
+      "snake_case_name": "user_domain",
+      "pascal_case_name": "UserDomain",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "user_group",
+      "snake_case_name": "user_group",
+      "pascal_case_name": "UserGroup",
+      "data_models": [
+        "Data Access"
+      ],
+      "inferred_type": "String",
+      "category": "DataAccess"
+    },
+    {
+      "field_name": "user_id",
+      "snake_case_name": "user_id",
+      "pascal_case_name": "UserId",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "Integer",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "user_name",
+      "snake_case_name": "user_name",
+      "pascal_case_name": "UserName",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "user_role",
+      "snake_case_name": "user_role",
+      "pascal_case_name": "UserRole",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "user_type",
+      "snake_case_name": "user_type",
+      "pascal_case_name": "UserType",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "vendor",
+      "snake_case_name": "vendor",
+      "pascal_case_name": "Vendor",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "vendor_account",
+      "snake_case_name": "vendor_account",
+      "pascal_case_name": "VendorAccount",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "String",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "vendor_product",
+      "snake_case_name": "vendor_product",
+      "pascal_case_name": "VendorProduct",
+      "data_models": [
+        "Authentication"
+      ],
+      "inferred_type": "String",
+      "category": "Authentication"
+    },
+    {
+      "field_name": "vendor_product_id",
+      "snake_case_name": "vendor_product_id",
+      "pascal_case_name": "VendorProductId",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "Integer",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "vendor_region",
+      "snake_case_name": "vendor_region",
+      "pascal_case_name": "VendorRegion",
+      "data_models": [
+        "Alerts"
+      ],
+      "inferred_type": "String",
+      "category": "Alerts"
+    },
+    {
+      "field_name": "version",
+      "snake_case_name": "version",
+      "pascal_case_name": "Version",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "vip_port",
+      "snake_case_name": "vip_port",
+      "pascal_case_name": "VipPort",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "Integer",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "vlan",
+      "snake_case_name": "vlan",
+      "pascal_case_name": "Vlan",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "wait_state",
+      "snake_case_name": "wait_state",
+      "pascal_case_name": "WaitState",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "String",
+      "category": "Database"
+    },
+    {
+      "field_name": "wait_time",
+      "snake_case_name": "wait_time",
+      "pascal_case_name": "WaitTime",
+      "data_models": [
+        "Databases"
+      ],
+      "inferred_type": "Timestamp",
+      "category": "Database"
+    },
+    {
+      "field_name": "wifi",
+      "snake_case_name": "wifi",
+      "pascal_case_name": "Wifi",
+      "data_models": [
+        "Network"
+      ],
+      "inferred_type": "String",
+      "category": "Entity"
+    },
+    {
+      "field_name": "write_blocks",
+      "snake_case_name": "write_blocks",
+      "pascal_case_name": "WriteBlocks",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "write_latency",
+      "snake_case_name": "write_latency",
+      "pascal_case_name": "WriteLatency",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "write_ops",
+      "snake_case_name": "write_ops",
+      "pascal_case_name": "WriteOps",
+      "data_models": [
+        "Inventory"
+      ],
+      "inferred_type": "String",
+      "category": "Inventory"
+    },
+    {
+      "field_name": "xdelay",
+      "snake_case_name": "xdelay",
+      "pascal_case_name": "Xdelay",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    },
+    {
+      "field_name": "xref",
+      "snake_case_name": "xref",
+      "pascal_case_name": "Xref",
+      "data_models": [
+        "Email"
+      ],
+      "inferred_type": "String",
+      "category": "Email"
+    }
+  ],
+  "fields_by_category": {
+    "System": [
+      "action",
+      "app",
+      "change_type",
+      "date",
+      "enrich_time",
+      "ext",
+      "id",
+      "ingest_time",
+      "message",
+      "metadata",
+      "name",
+      "namespace",
+      "result",
+      "result_id",
+      "source",
+      "source_type",
+      "start_time",
+      "status",
+      "tags",
+      "time",
+      "timestamp"
+    ],
+    "Enrichment": [
+      "ai_confidence",
+      "ai_reasoning",
+      "ai_verdict",
+      "dest_user_identity_account_status",
+      "dest_user_identity_company",
+      "dest_user_identity_country",
+      "dest_user_identity_department",
+      "dest_user_identity_display_name",
+      "dest_user_identity_email",
+      "dest_user_identity_employee_id",
+      "dest_user_identity_employee_type",
+      "dest_user_identity_groups",
+      "dest_user_identity_manager",
+      "dest_user_identity_manager_upn",
+      "dest_user_identity_mfa_enabled",
+      "dest_user_identity_office_location",
+      "dest_user_identity_phone",
+      "dest_user_identity_title",
+      "enriched_dest_as_domain",
+      "enriched_dest_as_name",
+      "enriched_dest_asn",
+      "enriched_dest_continent",
+      "enriched_dest_continent_code",
+      "enriched_dest_country",
+      "enriched_dest_country_code",
+      "enriched_src_as_domain",
+      "enriched_src_as_name",
+      "enriched_src_asn",
+      "enriched_src_continent",
+      "enriched_src_continent_code",
+      "enriched_src_country",
+      "enriched_src_country_code",
+      "src_user_identity_account_status",
+      "src_user_identity_company",
+      "src_user_identity_country",
+      "src_user_identity_department",
+      "src_user_identity_display_name",
+      "src_user_identity_email",
+      "src_user_identity_employee_id",
+      "src_user_identity_employee_type",
+      "src_user_identity_groups",
+      "src_user_identity_manager",
+      "src_user_identity_manager_upn",
+      "src_user_identity_mfa_enabled",
+      "src_user_identity_office_location",
+      "src_user_identity_phone",
+      "src_user_identity_title",
+      "user_identity_account_status",
+      "user_identity_company",
+      "user_identity_country",
+      "user_identity_department",
+      "user_identity_display_name",
+      "user_identity_email",
+      "user_identity_employee_id",
+      "user_identity_employee_type",
+      "user_identity_groups",
+      "user_identity_manager",
+      "user_identity_manager_upn",
+      "user_identity_mfa_enabled",
+      "user_identity_office_location",
+      "user_identity_phone",
+      "user_identity_title"
+    ],
+    "Dns": [
+      "additional_answer_count",
+      "answer",
+      "answer_count",
+      "authority_answer_count",
+      "dns_answers",
+      "query",
+      "query_count",
+      "query_type",
+      "record_type",
+      "reply_code",
+      "reply_code_id",
+      "transaction_id",
+      "ttl"
+    ],
+    "DataAccess": [
+      "app_id",
+      "dest_name",
+      "dest_url",
+      "email",
+      "object_size",
+      "owner",
+      "owner_email",
+      "owner_id",
+      "parent_object",
+      "parent_object_category",
+      "parent_object_id",
+      "user_group"
+    ],
+    "Inventory": [
+      "array",
+      "blocksize",
+      "cluster",
+      "cpu_cores",
+      "cpu_count",
+      "cpu_mhz",
+      "dns",
+      "enabled",
+      "family",
+      "fd_max",
+      "hypervisor",
+      "hypervisor_id",
+      "inline_nat",
+      "interactive",
+      "interface",
+      "ip",
+      "latency",
+      "lb_method",
+      "mac",
+      "mem",
+      "mount",
+      "node",
+      "node_port",
+      "parent",
+      "password",
+      "read_blocks",
+      "read_latency",
+      "read_ops",
+      "serial",
+      "shell",
+      "snapshot",
+      "storage",
+      "version",
+      "vip_port",
+      "write_blocks",
+      "write_latency",
+      "write_ops"
+    ],
+    "Authentication": [
+      "authentication_method",
+      "authentication_service",
+      "auth_result",
+      "auth_type",
+      "dest_nt_domain",
+      "dest_user",
+      "logon_time",
+      "mfa_used",
+      "product",
+      "reason",
+      "response_time",
+      "session_id",
+      "src_nt_domain",
+      "src_user",
+      "src_user_domain",
+      "src_user_id",
+      "src_user_name",
+      "src_user_role",
+      "src_user_type",
+      "user",
+      "user_domain",
+      "user_id",
+      "user_name",
+      "user_role",
+      "user_type",
+      "vendor",
+      "vendor_product"
+    ],
+    "Database": [
+      "availability",
+      "avg_executions",
+      "buffer_cache_hit_ratio",
+      "commits",
+      "cpu_used",
+      "cursor",
+      "dump_area_used",
+      "elapsed_time",
+      "free_bytes",
+      "indexes_hit",
+      "instance_name",
+      "instance_reads",
+      "instance_version",
+      "instance_writes",
+      "last_call_minute",
+      "lock_mode",
+      "lock_session_id",
+      "logical_reads",
+      "memory_sorts",
+      "number_of_users",
+      "obj_name",
+      "physical_reads",
+      "process_limit",
+      "processes",
+      "query_id",
+      "query_plan_hit",
+      "query_time",
+      "records_affected",
+      "seconds_in_wait",
+      "serial_num",
+      "session_limit",
+      "session_status",
+      "sessions",
+      "sga_buffer_cache_size",
+      "sga_buffer_hit_limit",
+      "sga_data_dict_hit_ratio",
+      "sga_fixed_area_size",
+      "sga_free_memory",
+      "sga_library_cache_size",
+      "sga_redo_log_buffer_size",
+      "sga_shared_pool_size",
+      "sga_sql_area_size",
+      "stored_procedures_called",
+      "table_scans",
+      "tables_hit",
+      "tablespace_name",
+      "tablespace_reads",
+      "tablespace_status",
+      "tablespace_used",
+      "tablespace_writes",
+      "wait_state",
+      "wait_time"
+    ],
+    "Entity": [
+      "bugtraq",
+      "bytes",
+      "bytes_in",
+      "bytes_out",
+      "cert",
+      "channel",
+      "cloud_account_id",
+      "cloud_account_name",
+      "cloud_provider",
+      "cloud_region",
+      "cloud_service",
+      "cve",
+      "cvss",
+      "dest_dns",
+      "dest_host",
+      "dest_interface",
+      "dest_ip",
+      "dest_ip_range",
+      "dest_mac",
+      "dest_nt_host",
+      "dest_port",
+      "dest_port_range",
+      "dest_translated_ip",
+      "dest_translated_port",
+      "direction",
+      "duration",
+      "dvc",
+      "dvc_ip",
+      "dvc_mac",
+      "dvc_zone",
+      "flow_id",
+      "icmp_code",
+      "icmp_type",
+      "image_id",
+      "instance_type",
+      "lease_duration",
+      "lease_scope",
+      "msft",
+      "mskb",
+      "packets",
+      "packets_in",
+      "packets_out",
+      "protocol",
+      "protocol_version",
+      "resource_id",
+      "resource_name",
+      "resource_type",
+      "rule",
+      "rule_action",
+      "trace_id",
+      "span_id",
+      "src_dns",
+      "src_host",
+      "src_interface",
+      "src_ip",
+      "src_ip_range",
+      "src_mac",
+      "src_nt_host",
+      "src_port",
+      "src_port_range",
+      "src_translated_ip",
+      "src_translated_port",
+      "ssid",
+      "tcp_flag",
+      "tos",
+      "transport",
+      "vlan",
+      "wifi"
+    ],
+    "Web": [
+      "cached",
+      "cookie",
+      "error_code",
+      "http_content_type",
+      "http_method",
+      "http_referrer",
+      "http_status_code",
+      "http_referrer_domain",
+      "http_user_agent",
+      "http_user_agent_length",
+      "operation",
+      "site",
+      "status_code",
+      "storage_name",
+      "uri_path",
+      "uri_query",
+      "url",
+      "url_domain",
+      "url_length",
+      "user_agent"
+    ],
+    "DataLossPrevention": [
+      "category",
+      "dest_zone",
+      "dlp_type",
+      "src_zone"
+    ],
+    "Endpoint": [
+      "command",
+      "command_line",
+      "cpu_load_percent",
+      "creation_time",
+      "event_type",
+      "file_access_time",
+      "file_action",
+      "file_acl",
+      "file_create_time",
+      "file_hash",
+      "file_modify_time",
+      "file_name",
+      "file_path",
+      "file_size",
+      "machine",
+      "mem_used",
+      "object",
+      "object_attrs",
+      "object_category",
+      "object_id",
+      "object_path",
+      "original_file_name",
+      "os",
+      "os_pid",
+      "parent_command_line",
+      "parent_process_exec",
+      "parent_process_guid",
+      "parent_process_id",
+      "parent_process_name",
+      "parent_process_path",
+      "process_current_directory",
+      "process_exec",
+      "process_guid",
+      "process_hash",
+      "process_id",
+      "process_integrity_level",
+      "process_name",
+      "process_path",
+      "product_version",
+      "registry_hive",
+      "registry_key_name",
+      "registry_path",
+      "registry_value_data",
+      "registry_value_name",
+      "registry_value_text",
+      "registry_value_type",
+      "service",
+      "service_dll",
+      "service_dll_hash",
+      "service_dll_path",
+      "service_dll_signature_exists",
+      "service_dll_signature_verified",
+      "service_exec",
+      "service_hash",
+      "service_id",
+      "service_name",
+      "service_path",
+      "service_signature_exists",
+      "service_signature_verified",
+      "signature_version",
+      "start_mode",
+      "state",
+      "transport_dest_port"
+    ],
+    "Performance": [
+      "cpu_load_mhz",
+      "cpu_user_percent",
+      "fan_speed",
+      "fd_used",
+      "mem_committed",
+      "mem_free",
+      "power",
+      "storage_free",
+      "storage_free_percent",
+      "storage_used",
+      "storage_used_percent",
+      "swap",
+      "swap_free",
+      "swap_used",
+      "temperature",
+      "thruput",
+      "thruput_max"
+    ],
+    "CustomEnrichment": [
+      "custom_dest_ip_risk",
+      "custom_dest_ip_tags",
+      "custom_domain_risk",
+      "custom_domain_tags",
+      "custom_hash_risk",
+      "custom_hash_tags",
+      "custom_ioc_dest_ip_confidence",
+      "custom_ioc_dest_ip_malware",
+      "custom_ioc_dest_ip_threat_type",
+      "custom_ioc_domain_confidence",
+      "custom_ioc_domain_threat_type",
+      "custom_ioc_hash_confidence",
+      "custom_ioc_hash_threat_type",
+      "custom_ioc_src_ip_confidence",
+      "custom_ioc_src_ip_malware",
+      "custom_ioc_src_ip_threat_type",
+      "custom_src_ip_risk",
+      "custom_src_ip_tags",
+      "custom_url_risk",
+      "custom_url_tags"
+    ],
+    "Email": [
+      "delay",
+      "filter_action",
+      "filter_score",
+      "internal_message_id",
+      "message_id",
+      "message_info",
+      "orig_dest",
+      "orig_recipient",
+      "orig_src",
+      "recipient",
+      "recipient_count",
+      "recipient_domain",
+      "recipient_status",
+      "retries",
+      "return_addr",
+      "sender",
+      "sender_domain",
+      "signature_extra",
+      "size",
+      "subject",
+      "xdelay",
+      "xref"
+    ],
+    "Alerts": [
+      "description",
+      "dest",
+      "dest_type",
+      "ids_type",
+      "mitre_technique_id",
+      "rule_id",
+      "rule_name",
+      "severity",
+      "severity_id",
+      "signature",
+      "signature_id",
+      "src",
+      "src_type",
+      "tag",
+      "type",
+      "vendor_account",
+      "vendor_product_id",
+      "vendor_region"
+    ],
+    "ThreatIntelligence": [
+      "ioc_confidence",
+      "ioc_dest_ip_confidence",
+      "ioc_dest_ip_malware",
+      "ioc_dest_ip_threat_type",
+      "ioc_domain_confidence",
+      "ioc_domain_malware",
+      "ioc_domain_threat_type",
+      "ioc_hash_confidence",
+      "ioc_hash_malware",
+      "ioc_hash_threat_type",
+      "ioc_matched",
+      "ioc_source",
+      "ioc_src_ip_confidence",
+      "ioc_src_ip_malware",
+      "ioc_src_ip_threat_type",
+      "ioc_tags"
+    ],
+    "Prevalence": [
+      "prevalence_dest_domain",
+      "prevalence_dest_ip",
+      "prevalence_file_hash",
+      "prevalence_min",
+      "prevalence_process_hash"
+    ],
+    "Risk": [
+      "risk_entity",
+      "risk_level",
+      "risk_score"
+    ],
+    "Certificate": [
+      "ssl_end_time",
+      "ssl_engine",
+      "ssl_hash",
+      "ssl_is_valid",
+      "ssl_issuer",
+      "ssl_issuer_common_name",
+      "ssl_issuer_email",
+      "ssl_issuer_email_domain",
+      "ssl_issuer_locality",
+      "ssl_issuer_organization",
+      "ssl_issuer_state",
+      "ssl_issuer_street",
+      "ssl_issuer_unit",
+      "ssl_name",
+      "ssl_policies",
+      "ssl_publickey",
+      "ssl_publickey_algorithm",
+      "ssl_serial",
+      "ssl_session_id",
+      "ssl_signature_algorithm",
+      "ssl_start_time",
+      "ssl_subject",
+      "ssl_subject_common_name",
+      "ssl_subject_email",
+      "ssl_subject_email_domain",
+      "ssl_subject_locality",
+      "ssl_subject_organization",
+      "ssl_subject_state",
+      "ssl_subject_street",
+      "ssl_subject_unit",
+      "ssl_validity_window",
+      "ssl_version"
+    ]
+  },
+  "fields_by_type": {
+    "String": [
+      "action",
+      "ai_reasoning",
+      "ai_verdict",
+      "answer",
+      "app",
+      "array",
+      "authentication_method",
+      "authentication_service",
+      "auth_result",
+      "auth_type",
+      "availability",
+      "avg_executions",
+      "blocksize",
+      "bugtraq",
+      "cached",
+      "category",
+      "cert",
+      "change_type",
+      "channel",
+      "cloud_account_name",
+      "cloud_provider",
+      "cloud_region",
+      "cloud_service",
+      "cluster",
+      "command",
+      "command_line",
+      "commits",
+      "cookie",
+      "cpu_cores",
+      "cpu_mhz",
+      "cpu_used",
+      "cursor",
+      "custom_domain_risk",
+      "custom_hash_risk",
+      "custom_ioc_domain_threat_type",
+      "custom_ioc_hash_threat_type",
+      "custom_url_risk",
+      "cve",
+      "cvss",
+      "date",
+      "delay",
+      "description",
+      "dest",
+      "dest_dns",
+      "dest_host",
+      "dest_interface",
+      "dest_mac",
+      "dest_name",
+      "dest_nt_domain",
+      "dest_nt_host",
+      "dest_port_range",
+      "dest_user",
+      "dest_user_identity_account_status",
+      "dest_user_identity_company",
+      "dest_user_identity_country",
+      "dest_user_identity_department",
+      "dest_user_identity_display_name",
+      "dest_user_identity_email",
+      "dest_user_identity_employee_type",
+      "dest_user_identity_groups",
+      "dest_user_identity_manager",
+      "dest_user_identity_manager_upn",
+      "dest_user_identity_office_location",
+      "dest_user_identity_phone",
+      "dest_user_identity_title",
+      "dest_type",
+      "dest_url",
+      "dest_zone",
+      "direction",
+      "dlp_type",
+      "dns",
+      "dns_answers",
+      "dump_area_used",
+      "duration",
+      "dvc",
+      "dvc_mac",
+      "dvc_zone",
+      "email",
+      "enabled",
+      "enriched_dest_as_domain",
+      "enriched_dest_as_name",
+      "enriched_dest_asn",
+      "enriched_dest_continent",
+      "enriched_dest_country",
+      "enriched_src_as_domain",
+      "enriched_src_as_name",
+      "enriched_src_asn",
+      "enriched_src_continent",
+      "enriched_src_country",
+      "event_type",
+      "ext",
+      "family",
+      "fan_speed",
+      "fd_max",
+      "fd_used",
+      "file_action",
+      "file_acl",
+      "file_hash",
+      "file_name",
+      "file_path",
+      "filter_action",
+      "http_content_type",
+      "http_method",
+      "http_referrer",
+      "http_referrer_domain",
+      "http_user_agent",
+      "http_user_agent_length",
+      "hypervisor",
+      "icmp_type",
+      "id",
+      "ids_type",
+      "indexes_hit",
+      "inline_nat",
+      "instance_name",
+      "instance_reads",
+      "instance_type",
+      "instance_version",
+      "instance_writes",
+      "interactive",
+      "interface",
+      "ioc_domain_malware",
+      "ioc_domain_threat_type",
+      "ioc_hash_malware",
+      "ioc_hash_threat_type",
+      "ioc_source",
+      "last_call_minute",
+      "latency",
+      "lb_method",
+      "lease_duration",
+      "lease_scope",
+      "lock_mode",
+      "logical_reads",
+      "mac",
+      "machine",
+      "mem",
+      "mem_committed",
+      "mem_free",
+      "mem_used",
+      "message",
+      "metadata",
+      "message_info",
+      "mfa_used",
+      "mount",
+      "msft",
+      "mskb",
+      "name",
+      "namespace",
+      "node",
+      "number_of_users",
+      "obj_name",
+      "object",
+      "object_attrs",
+      "object_category",
+      "object_path",
+      "operation",
+      "orig_dest",
+      "orig_recipient",
+      "orig_src",
+      "original_file_name",
+      "os",
+      "owner",
+      "owner_email",
+      "packets",
+      "packets_in",
+      "packets_out",
+      "parent",
+      "parent_object",
+      "parent_object_category",
+      "parent_command_line",
+      "parent_process_exec",
+      "parent_process_guid",
+      "parent_process_name",
+      "parent_process_path",
+      "password",
+      "physical_reads",
+      "power",
+      "process_current_directory",
+      "process_exec",
+      "process_guid",
+      "process_hash",
+      "process_integrity_level",
+      "process_limit",
+      "process_name",
+      "process_path",
+      "processes",
+      "product",
+      "product_version",
+      "protocol",
+      "protocol_version",
+      "query",
+      "query_plan_hit",
+      "query_type",
+      "read_blocks",
+      "read_latency",
+      "read_ops",
+      "reason",
+      "recipient",
+      "recipient_domain",
+      "recipient_status",
+      "record_type",
+      "records_affected",
+      "registry_hive",
+      "registry_key_name",
+      "registry_path",
+      "registry_value_data",
+      "registry_value_name",
+      "registry_value_text",
+      "registry_value_type",
+      "resource_name",
+      "resource_type",
+      "result",
+      "risk_entity",
+      "risk_level",
+      "retries",
+      "return_addr",
+      "rule",
+      "rule_action",
+      "rule_name",
+      "seconds_in_wait",
+      "sender",
+      "sender_domain",
+      "serial",
+      "serial_num",
+      "service",
+      "service_dll",
+      "service_dll_hash",
+      "service_dll_path",
+      "service_dll_signature_exists",
+      "service_dll_signature_verified",
+      "service_exec",
+      "service_hash",
+      "service_name",
+      "service_path",
+      "service_signature_exists",
+      "service_signature_verified",
+      "session_limit",
+      "session_status",
+      "sessions",
+      "severity",
+      "sga_buffer_hit_limit",
+      "shell",
+      "signature",
+      "signature_extra",
+      "signature_version",
+      "site",
+      "size",
+      "snapshot",
+      "source",
+      "source_type",
+      "src",
+      "src_dns",
+      "src_host",
+      "src_interface",
+      "src_mac",
+      "src_nt_domain",
+      "src_nt_host",
+      "src_port_range",
+      "src_type",
+      "src_user",
+      "src_user_domain",
+      "src_user_name",
+      "src_user_role",
+      "src_user_identity_account_status",
+      "src_user_identity_company",
+      "src_user_identity_country",
+      "src_user_identity_department",
+      "src_user_identity_display_name",
+      "src_user_identity_email",
+      "src_user_identity_employee_type",
+      "src_user_identity_groups",
+      "src_user_identity_manager",
+      "src_user_identity_manager_upn",
+      "src_user_identity_office_location",
+      "src_user_identity_phone",
+      "src_user_identity_title",
+      "src_user_type",
+      "src_zone",
+      "ssid",
+      "ssl_engine",
+      "ssl_hash",
+      "ssl_is_valid",
+      "ssl_issuer",
+      "ssl_issuer_common_name",
+      "ssl_issuer_email",
+      "ssl_issuer_email_domain",
+      "ssl_issuer_locality",
+      "ssl_issuer_organization",
+      "ssl_issuer_state",
+      "ssl_issuer_street",
+      "ssl_issuer_unit",
+      "ssl_name",
+      "ssl_policies",
+      "ssl_publickey",
+      "ssl_publickey_algorithm",
+      "ssl_serial",
+      "ssl_signature_algorithm",
+      "ssl_subject",
+      "ssl_subject_common_name",
+      "ssl_subject_email",
+      "ssl_subject_email_domain",
+      "ssl_subject_locality",
+      "ssl_subject_organization",
+      "ssl_subject_state",
+      "ssl_subject_street",
+      "ssl_subject_unit",
+      "ssl_validity_window",
+      "ssl_version",
+      "start_mode",
+      "state",
+      "status",
+      "storage",
+      "storage_free",
+      "storage_name",
+      "storage_used",
+      "stored_procedures_called",
+      "subject",
+      "swap",
+      "swap_free",
+      "swap_used",
+      "table_scans",
+      "tables_hit",
+      "tablespace_name",
+      "tablespace_reads",
+      "tablespace_status",
+      "tablespace_used",
+      "tablespace_writes",
+      "tag",
+      "tcp_flag",
+      "temperature",
+      "tags",
+      "thruput",
+      "thruput_max",
+      "tos",
+      "transport",
+      "ttl",
+      "type",
+      "uri_path",
+      "uri_query",
+      "url",
+      "url_domain",
+      "url_length",
+      "user",
+      "user_identity_account_status",
+      "user_identity_company",
+      "user_identity_country",
+      "user_identity_department",
+      "user_identity_display_name",
+      "user_identity_email",
+      "user_identity_employee_type",
+      "user_identity_groups",
+      "user_identity_manager",
+      "user_identity_manager_upn",
+      "user_identity_office_location",
+      "user_identity_phone",
+      "user_identity_title",
+      "user_agent",
+      "user_domain",
+      "user_group",
+      "user_name",
+      "user_role",
+      "user_type",
+      "vendor",
+      "vendor_account",
+      "vendor_product",
+      "vendor_region",
+      "version",
+      "vlan",
+      "wait_state",
+      "wifi",
+      "write_blocks",
+      "write_latency",
+      "write_ops",
+      "xdelay",
+      "xref"
+    ],
+    "Integer": [
+      "ai_confidence",
+      "additional_answer_count",
+      "answer_count",
+      "app_id",
+      "authority_answer_count",
+      "cloud_account_id",
+      "cpu_count",
+      "custom_ioc_domain_confidence",
+      "custom_ioc_hash_confidence",
+      "dest_port",
+      "dest_user_identity_employee_id",
+      "dest_translated_port",
+      "enriched_dest_continent_code",
+      "enriched_dest_country_code",
+      "enriched_src_continent_code",
+      "enriched_src_country_code",
+      "error_code",
+      "flow_id",
+      "http_status_code",
+      "hypervisor_id",
+      "icmp_code",
+      "image_id",
+      "ioc_confidence",
+      "ioc_domain_confidence",
+      "ioc_hash_confidence",
+      "internal_message_id",
+      "lock_session_id",
+      "message_id",
+      "mitre_technique_id",
+      "node_port",
+      "object_id",
+      "os_pid",
+      "owner_id",
+      "parent_object_id",
+      "parent_process_id",
+      "prevalence_dest_domain",
+      "prevalence_file_hash",
+      "prevalence_min",
+      "prevalence_process_hash",
+      "process_id",
+      "query_count",
+      "query_id",
+      "recipient_count",
+      "reply_code",
+      "reply_code_id",
+      "resource_id",
+      "result_id",
+      "rule_id",
+      "service_id",
+      "session_id",
+      "trace_id",
+      "span_id",
+      "severity_id",
+      "signature_id",
+      "src_port",
+      "src_translated_port",
+      "src_user_id",
+      "src_user_identity_employee_id",
+      "ssl_session_id",
+      "status_code",
+      "transaction_id",
+      "transport_dest_port",
+      "user_identity_employee_id",
+      "user_id",
+      "vendor_product_id",
+      "vip_port"
+    ],
+    "Float": [
+      "buffer_cache_hit_ratio",
+      "cpu_load_mhz",
+      "cpu_load_percent",
+      "cpu_user_percent",
+      "filter_score",
+      "risk_score",
+      "sga_data_dict_hit_ratio",
+      "storage_free_percent",
+      "storage_used_percent"
+    ],
+    "Long": [
+      "bytes",
+      "bytes_in",
+      "bytes_out",
+      "file_size",
+      "free_bytes",
+      "memory_sorts",
+      "object_size",
+      "sga_buffer_cache_size",
+      "sga_fixed_area_size",
+      "sga_free_memory",
+      "sga_library_cache_size",
+      "sga_redo_log_buffer_size",
+      "sga_shared_pool_size",
+      "sga_sql_area_size"
+    ],
+    "Timestamp": [
+      "creation_time",
+      "elapsed_time",
+      "enrich_time",
+      "file_access_time",
+      "file_create_time",
+      "file_modify_time",
+      "ingest_time",
+      "logon_time",
+      "query_time",
+      "response_time",
+      "ssl_end_time",
+      "ssl_start_time",
+      "start_time",
+      "time",
+      "timestamp",
+      "wait_time"
+    ],
+    "IpAddress": [
+      "custom_dest_ip_risk",
+      "custom_ioc_dest_ip_confidence",
+      "custom_ioc_dest_ip_malware",
+      "custom_ioc_dest_ip_threat_type",
+      "custom_ioc_src_ip_confidence",
+      "custom_ioc_src_ip_malware",
+      "custom_ioc_src_ip_threat_type",
+      "custom_src_ip_risk",
+      "dest_ip",
+      "dest_ip_range",
+      "dest_translated_ip",
+      "dvc_ip",
+      "ioc_dest_ip_confidence",
+      "ioc_dest_ip_malware",
+      "ioc_dest_ip_threat_type",
+      "ioc_src_ip_confidence",
+      "ioc_src_ip_malware",
+      "ioc_src_ip_threat_type",
+      "ip",
+      "prevalence_dest_ip",
+      "src_ip",
+      "src_ip_range",
+      "src_translated_ip"
+    ],
+    "Array": [
+      "custom_dest_ip_tags",
+      "custom_domain_tags",
+      "custom_hash_tags",
+      "custom_src_ip_tags",
+      "custom_url_tags",
+      "ioc_tags"
+    ],
+    "Boolean": [
+      "dest_user_identity_mfa_enabled",
+      "ioc_matched",
+      "src_user_identity_mfa_enabled",
+      "user_identity_mfa_enabled"
+    ]
+  }
+}

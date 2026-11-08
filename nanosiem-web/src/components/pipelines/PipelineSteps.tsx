@@ -24,7 +24,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
-import type { PipelineLaneInput, PipelineStep, PipelineStepKind } from '@/lib/pipeline-types';
+import type { PipelineLaneInput, PipelineStep, PipelineStepKind, PreviewOnlyKind } from '@/lib/pipeline-types';
 import { compileStep, type PipelineStepStatus } from '@/lib/pipeline-model';
 import { PipelineField, PipelineNotice } from './PipelineCommon';
 import { STEP_LABELS, newPipelineStep } from './pipeline-catalog';
@@ -44,6 +44,8 @@ export function PipelineStepList({
   onChange,
   onConfigure,
   onCollapsePanel,
+  previewOnly = [],
+  maxSteps = 50,
 }: {
   steps: PipelineStep[];
   selectedId: string | null;
@@ -55,7 +57,12 @@ export function PipelineStepList({
   onConfigure: () => void;
   /** Collapse the whole step column to a rail. */
   onCollapsePanel?: () => void;
+  /** Kinds this deployment previews but refuses to publish. */
+  previewOnly?: PreviewOnlyKind[];
+  maxSteps?: number;
 }) {
+  const previewOnlyReason = (kind: PipelineStepKind) => previewOnly.find((entry) => entry.kind === kind)?.reason;
+  const full = steps.length >= maxSteps;
   const [dragId, setDragId] = useState<string | null>(null);
   const [mode, setMode] = useState<CollapseMode>('auto');
   const [overrides, setOverrides] = useState<Record<string, boolean>>({});
@@ -85,7 +92,7 @@ export function PipelineStepList({
     onChange(next);
   };
   const duplicate = (step: PipelineStep) => {
-    if (readOnly) return;
+    if (readOnly || full) return;
     const duplicateStep = {
       ...structuredClone(step),
       id: safeRandomUUID(),
@@ -267,6 +274,9 @@ export function PipelineStepList({
                     {STEP_LABELS[step.kind]}
                   </span>
                 )}
+                {!open && previewOnlyReason(step.kind) && (
+                  <span className="shrink-0 font-mono text-[10px] text-warning" title={previewOnlyReason(step.kind)}>preview only</span>
+                )}
                 {!open && <StepStatusBadge status={result} />}
                 <Checkbox
                   aria-label={`Enable ${step.name}`}
@@ -305,6 +315,9 @@ export function PipelineStepList({
                     {!supportedSteps.includes(step.kind) && (
                       <span className="text-warning">· unavailable</span>
                     )}
+                    {previewOnlyReason(step.kind) && (
+                      <span className="text-warning" title={previewOnlyReason(step.kind)}>· preview only</span>
+                    )}
                   </div>
                   {!readOnly && (
                     <div
@@ -327,6 +340,7 @@ export function PipelineStepList({
                         {
                           Icon: Copy,
                           label: 'Duplicate',
+                          disabled: full,
                           action: () => duplicate(step),
                         },
                         {
@@ -364,7 +378,8 @@ export function PipelineStepList({
             <Button
               variant="outline"
               className="h-7 w-full text-[11.5px]"
-              disabled={readOnly}
+              disabled={readOnly || full}
+              title={full ? `A pipeline has at most ${maxSteps} steps` : undefined}
             >
               <Plus className="h-3.5 w-3.5" strokeWidth={1.5} />
               Add step
@@ -385,11 +400,15 @@ export function PipelineStepList({
                   }}
                 >
                   {label}
-                  {!supportedSteps.includes(kind) && (
+                  {!supportedSteps.includes(kind) ? (
                     <span className="ml-auto text-[10px] text-muted-foreground">
                       unavailable
                     </span>
-                  )}
+                  ) : previewOnlyReason(kind) ? (
+                    <span className="ml-auto text-[10px] text-warning" title={previewOnlyReason(kind)}>
+                      preview only
+                    </span>
+                  ) : null}
                 </DropdownMenuItem>
               )
             )}
@@ -430,6 +449,7 @@ export function PipelineStepSettings({
   onChange,
   laneInputs = [],
   mixedInputs = false,
+  previewOnlyReason,
 }: {
   step: PipelineStep | undefined;
   readOnly: boolean;
@@ -439,6 +459,8 @@ export function PipelineStepSettings({
   laneInputs?: PipelineLaneInput[];
   /** NAN-3621: the lane has push (or connector) and pull inputs, so it runs in more than one Vector process. */
   mixedInputs?: boolean;
+  /** This deployment previews the step's kind but refuses to publish it. */
+  previewOnlyReason?: string;
 }) {
   const id = useId();
   if (!step)
@@ -531,9 +553,14 @@ export function PipelineStepSettings({
         {STEP_LABELS[step.kind]}
       </div>
       {!supported && (
-        <PipelineNotice title="Unavailable in this runtime" tone="warning">
-          This step can be inspected, but cannot be released until the tenant
-          runtime supports it.
+        <PipelineNotice title="Unavailable on this deployment" tone="warning">
+          This step can be inspected, but cannot be published until this
+          deployment supports it.
+        </PipelineNotice>
+      )}
+      {supported && previewOnlyReason && (
+        <PipelineNotice title="Preview only on this deployment" tone="warning">
+          {previewOnlyReason}
         </PipelineNotice>
       )}
       {readOnly && (
@@ -707,27 +734,26 @@ export function PipelineStepSettings({
           {text('field', 'Branch label field')}
           {select('fallback', 'Unmatched events', [['keep', 'Keep'], ['drop', 'Drop']])}
           <p className="text-[10.5px] text-muted-foreground">
-            Each kept branch is tagged and continues to Nano Lake. Fan-out produces one copy per kept matching branch; external destinations are unavailable.
+            Each kept branch is tagged and continues to storage. Fan-out produces one copy per kept matching branch; external destinations are unavailable.
             &ldquo;Input is&rdquo; matches the input the platform recorded at ingress, not fields in the event, and must come before any Combine step.
           </p>
         </>
       )}
       {step.kind !== 'vrl' && supported && (
-        <PipelineField label={['dedupe', 'combine', 'route', 'lookup'].includes(step.kind) ? 'Generated Vector configuration' : 'Generated VRL'}>
+        <PipelineField label={['dedupe', 'combine', 'route', 'lookup'].includes(step.kind) ? 'Illustrative Vector configuration' : 'Illustrative VRL'} hint="The server compiles the exact program at publication.">
           <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-all border border-border p-2 font-mono text-[10.5px]">{generated}</pre>
         </PipelineField>
       )}
       {step.kind === 'vrl' && (
         <PipelineField
           label="Vector Remap Language"
-          hint="Compiled and tested by the tenant runtime."
+          hint="Compiled and validated by the server."
         >
           <VrlEditor
             className={cn(
               'h-60 rounded-md border border-border',
               (readOnly || !supported) && 'opacity-80'
             )}
-            ariaLabel="Vector Remap Language"
             readOnly={readOnly || !supported}
             value={String(config.code ?? '')}
             onChange={(code) => set('code', code)}

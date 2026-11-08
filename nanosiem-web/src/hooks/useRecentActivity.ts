@@ -10,10 +10,9 @@
  * - Active notebooks (from notebook tabs API)
  */
 
+import { authenticatedFetch } from '@/lib/authenticated-fetch';
 import { useState, useEffect, useCallback } from 'react';
 import { api, RecentActivityItem, RecentItemType, NotebookTabWithDetails } from '@/lib/api';
-import { getAccessToken } from '@/lib/auth-token';
-import { requestCredentials } from '@/lib/request-credentials';
 
 export interface UnifiedRecentItem {
   type: 'search' | 'notebook' | RecentItemType;
@@ -52,10 +51,11 @@ interface UseRecentActivityResult {
 // Fetch search history directly (API client method)
 async function fetchSearchHistory(limit: number): Promise<SearchHistoryEntry[]> {
   try {
-    const response = await fetch(`${import.meta.env.VITE_API_URL ?? ''}/api/search/history?limit=${limit}`, {
-      headers: getAuthHeaders(),
-        credentials: requestCredentials('/api/search/history', getAuthHeaders()),
-    });
+    const response = await authenticatedFetch(
+      '/api/search/history',
+      `${import.meta.env.VITE_API_URL ?? ''}/api/search/history?limit=${limit}`,
+      { headers: { 'Content-Type': 'application/json' } },
+    );
     if (response.ok) {
       const data = await response.json();
       return data.entries || [];
@@ -66,16 +66,7 @@ async function fetchSearchHistory(limit: number): Promise<SearchHistoryEntry[]> 
   return [];
 }
 
-function getAuthHeaders(): HeadersInit {
-  const token = getAccessToken();
-  if (token) {
-    return {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    };
-  }
-  return { 'Content-Type': 'application/json' };
-}
+
 
 /**
  * Hook to fetch recent activity from all sources

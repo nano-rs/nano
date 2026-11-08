@@ -1,41 +1,56 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Open core and dedicated installs follow the first-party catalogs (NAN-3758).
+//! Every install follows the first-party content catalogs (NAN-4940, a port
+//! of main's NAN-3758 / NAN-3897 without the hosted platform mirror).
 //!
 //! The open edition ships no parser or rule content: every install pulls it
-//! from `nano-rs/parsers` and `nano-rs/rules`. Hosted-shared tenants get that
-//! from the platform catalog follow (`shared_catalog_follow`). This
-//! is the single-tenant equivalent, with no platform mirror: the install pulls
-//! GitHub directly through the existing repository sync apply path.
+//! from `nano-rs/parsers` and `nano-rs/rules` straight from GitHub through the
+//! existing repository sync path.
 //!
 //! [`ensure_first_party_catalogs`] runs from the leader's repository sync
-//! schedulers on every start, so it covers both a first boot and an upgrade:
+//! schedulers on every start, so it covers a first boot and an upgrade. The
+//! target branch is the active schema profile's content channel
+//! ([`crate::schema::content_branch_for`]): OCSF follows `main`, UDM follows
+//! the frozen `legacy/clickhouse` branch.
 //!
-//! * **Missing** catalog row: registered at the content branch (`main`, which
-//!   carries the OCSF 1.9 content since NAN-3897) with auto-sync on and an
-//!   hourly cadence, so the schedulers sync it straight away and the full
-//!   catalog is there at first login.
-//! * **Existing, enabled** row on the retired `ocsf-1.9` default (NAN-3758)
-//!   or an empty branch: moved to `main`. Auto-sync off: switched on, exactly
-//!   like the hosted `ensure_default_catalog` reconcile. Either change clears
-//!   `last_synced_at` so the row is due on the next scheduler pass.
-//! * **Disabled** row: the operator's opt-out. Left alone.
+//! * **Missing** catalog row, not yet adopted: registered at the content
+//!   branch with auto-sync on and an hourly cadence, so the schedulers sync it
+//!   straight away and the full catalog is there at first login.
+//! * **Existing, enabled** row on another first-party channel (`main`,
+//!   `legacy/clickhouse`, the retired `ocsf-1.9`) or an empty branch: moved to
+//!   the content branch. Auto-sync off on a not-yet-adopted row (the old
+//!   one-click add created rows with it off): switched on. Either change
+//!   clears `last_synced_at` / `last_sync_commit` so the row is due on the
+//!   next scheduler pass.
+//! * **Disabled** row (`enabled = false`): the operator's opt-out. Left alone.
 //! * Any other branch (an explicit pin or fork branch): kept.
 //!
+//! Adoption (`first_party_content_catalogs`, migration 302) is recorded the
+//! first time the reconcile registers or adopts a catalog. After that the
+//! operator owns it: a deleted catalog is NOT re-created and auto-sync turned
+//! off is NOT turned back on. (Main re-created deleted rows and re-enabled
+//! auto-sync on every start, and its UI exposes neither `enabled` nor any
+//! other opt-out, so those were the only ways to stop following.)
+//!
 //! Syncing only refreshes the catalog (`repository_parsers` /
-//! `repository_rules`). As in hosted follow, nothing is imported, enabled or
-//! promoted automatically, and an upstream change to content the operator
-//! already imported only flags it `upstream_changed`: customised parsers and
-//! rules are never overwritten.
+//! `repository_rules`). Nothing is imported, enabled or promoted
+//! automatically, and an upstream change to content the operator already
+//! imported only flags it `upstream_changed`: customised parsers and rules are
+//! never overwritten.
+//!
+//! The same reconcile is generic over [`CatalogSpec`]: the enterprise overlay
+//! registers `nano-rs/playbooks` through [`ensure_catalog`] (NAN-4947) with
+//! the same adoption marker and opt-out rules, without this open module
+//! naming the enterprise table.
 //!
 //! Air-gapped installs (`AIRGAP_MODE`) never call this: their egress
-//! schedulers do not start, and the repository pages show the air-gap bundle
-//! import state instead. An install that is merely offline registers the rows
-//! and every failed pull is recorded on the row (`last_sync_status='failed'`
-//! plus the error), which the repository pages show. Neither ever blocks boot.
+//! schedulers do not start. An install that is merely offline registers the
+//! rows and every failed pull is recorded on the row. Neither ever blocks boot.
 
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
+
+use crate::schema::SchemaId;
 
 /// Hourly cadence for registered first-party catalogs. An unchanged rule
 /// catalog costs one GitHub API call per check, a parser catalog three.
@@ -44,6 +59,111 @@ pub const FIRST_PARTY_SYNC_INTERVAL_HOURS: i32 = 1;
 /// Serializes concurrent reconciles (parser and rule schedulers, replicas).
 const RECONCILE_LOCK_KEY: i64 = 0x6e61_6e6f_3735_38;
 
+/// One first-party catalog the reconcile follows: which repository, which
+/// repository table, and how a fresh row is registered (NAN-4947: generic, so
+/// the enterprise overlay registers `nano-rs/playbooks` through the same
+/// reconcile without the open core naming it).
+#[derive(Debug, PartialEq, Eq)]
+pub struct CatalogSpec {
+    key: &'static str,
+    repo: &'static str,
+    name: &'static str,
+    description: &'static str,
+    table: &'static str,
+    insert_sql: &'static str,
+    sync_interval_hours: i32,
+}
+
+impl CatalogSpec {
+    /// A catalog definition.
+    ///
+    /// * `key`: the `first_party_content_catalogs.catalog` value (the column's
+    ///   CHECK must admit it).
+    /// * `repo`: lowercase `owner/repo` on github.com.
+    /// * `insert_sql`: one `INSERT INTO <table> ... ON CONFLICT DO NOTHING
+    ///   RETURNING id` binding `$1` name, `$2` slug, `$3` description, `$4`
+    ///   url, `$5` branch and `$6` sync interval (hours), with auto-sync on.
+    pub const fn new(
+        key: &'static str,
+        repo: &'static str,
+        name: &'static str,
+        description: &'static str,
+        table: &'static str,
+        insert_sql: &'static str,
+        sync_interval_hours: i32,
+    ) -> Self {
+        Self { key, repo, name, description, table, insert_sql, sync_interval_hours }
+    }
+
+    /// Canonical `https://github.com/<repo>` URL a fresh row is registered at.
+    pub fn url(&self) -> String {
+        format!("https://github.com/{}", self.repo)
+    }
+
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Key in `first_party_content_catalogs`.
+    pub const fn key(&self) -> &'static str {
+        self.key
+    }
+
+    pub const fn table(&self) -> &'static str {
+        self.table
+    }
+
+    pub const fn sync_interval_hours(&self) -> i32 {
+        self.sync_interval_hours
+    }
+
+    /// Whether a stored repository URL is this catalog (scheme, `www.`, case,
+    /// `.git` and a trailing slash ignored; credentials, ports, queries and
+    /// fragments never match).
+    pub fn matches_url(&self, url: &str) -> bool {
+        crate::schema::github_repo_path(url).as_deref() == Some(self.repo)
+    }
+}
+
+static PARSERS: CatalogSpec = CatalogSpec::new(
+    "parsers",
+    "nano-rs/parsers",
+    "nano parsers",
+    "Official nano parsers for common log sources",
+    "parser_repositories",
+    "INSERT INTO parser_repositories (name, slug, description, url, branch, parsers_path, \
+        auto_sync_enabled, sync_interval_hours) \
+     VALUES ($1,$2,$3,$4,$5,'parsers/',TRUE,$6) ON CONFLICT DO NOTHING RETURNING id",
+    FIRST_PARTY_SYNC_INTERVAL_HOURS,
+);
+
+// Native nPL rules at the repository root, like the one-click add.
+static RULES: CatalogSpec = CatalogSpec::new(
+    "rules",
+    "nano-rs/rules",
+    "nano rules",
+    "Official nano detection rules in native nPL format",
+    "rule_repositories",
+    "INSERT INTO rule_repositories (name, slug, description, url, branch, rules_path, rule_format, \
+        auto_sync_enabled, sync_interval_hours) \
+     VALUES ($1,$2,$3,$4,$5,'','nanosiem',TRUE,$6) ON CONFLICT DO NOTHING RETURNING id",
+    FIRST_PARTY_SYNC_INTERVAL_HOURS,
+);
+
+/// NAN-4947 (11-03 decision): every parser, rule and playbook repository is a
+/// nano first-party source. A repository row is admissible only when its URL
+/// is one of the `allowed` first-party GitHub repositories (`owner/repo`,
+/// matched like [`CatalogSpec::matches_url`]) or the synthetic repository
+/// signed air-gap bundles are applied to (`airgap_url`, e.g.
+/// `airgap://rules`). Anything else (SigmaHQ, forks, customer repositories)
+/// is refused on create, update, sync, browse and import, and hidden from
+/// listings; migration 305 / 9000085 disabled such rows on upgrade.
+pub fn is_allowed_repository(url: &str, allowed: &[&str], airgap_url: &str) -> bool {
+    url.trim() == airgap_url
+        || crate::schema::github_repo_path(url).is_some_and(|path| allowed.contains(&path.as_str()))
+}
+
+/// The open edition's first-party catalogs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirstPartyCatalog {
     Parsers,
@@ -53,45 +173,34 @@ pub enum FirstPartyCatalog {
 impl FirstPartyCatalog {
     pub const ALL: [Self; 2] = [Self::Parsers, Self::Rules];
 
-    pub const fn url(self) -> &'static str {
+    pub fn spec(self) -> &'static CatalogSpec {
         match self {
-            Self::Parsers => "https://github.com/nano-rs/parsers",
-            Self::Rules => "https://github.com/nano-rs/rules",
+            Self::Parsers => &PARSERS,
+            Self::Rules => &RULES,
         }
     }
 
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Parsers => "nano parsers",
-            Self::Rules => "nano rules",
-        }
+    pub fn url(self) -> String {
+        self.spec().url()
     }
 
-    const fn description(self) -> &'static str {
-        match self {
-            Self::Parsers => "Official nano parsers for common log sources",
-            Self::Rules => "Official nano detection rules in native nPL format",
-        }
+    pub fn name(self) -> &'static str {
+        self.spec().name()
     }
 
-    const fn table(self) -> &'static str {
-        match self {
-            Self::Parsers => "parser_repositories",
-            Self::Rules => "rule_repositories",
-        }
+    /// Key in `first_party_content_catalogs`.
+    pub fn key(self) -> &'static str {
+        self.spec().key()
+    }
+
+    /// The first-party catalog a repository URL names, if any.
+    pub fn from_url(url: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|catalog| catalog.matches_url(url))
     }
 
     /// Whether a stored repository URL is this first-party catalog.
     pub fn matches_url(self, url: &str) -> bool {
-        crate::schema::is_first_party_content_url(url)
-            && url
-                .trim_end_matches('/')
-                .trim_end_matches(".git")
-                .to_ascii_lowercase()
-                .ends_with(match self {
-                    Self::Parsers => "/parsers",
-                    Self::Rules => "/rules",
-                })
+        self.spec().matches_url(url)
     }
 }
 
@@ -113,30 +222,39 @@ pub enum CatalogPlan {
     Update { id: Uuid, branch: Option<String>, enable_auto_sync: bool },
     Current(Uuid),
     Disabled(Uuid),
+    /// Adopted earlier and since deleted by the operator: not re-created.
+    Removed,
 }
 
-/// Pure reconcile decision, given the target content branch for this install.
-pub fn plan(existing: Option<&ExistingCatalog>, target_branch: &str) -> CatalogPlan {
+/// Pure reconcile decision, given the target content branch for this install
+/// and whether the catalog was already adopted (see the module docs).
+pub fn plan(existing: Option<&ExistingCatalog>, target_branch: &str, adopted: bool) -> CatalogPlan {
     let Some(row) = existing else {
-        return CatalogPlan::Create { branch: target_branch.to_owned() };
+        return if adopted {
+            CatalogPlan::Removed
+        } else {
+            CatalogPlan::Create { branch: target_branch.to_owned() }
+        };
     };
     if !row.enabled {
         return CatalogPlan::Disabled(row.id);
     }
     let stored = row.branch.trim();
-    let retired = stored.is_empty() || stored == crate::schema::RETIRED_OCSF_CONTENT_BRANCH;
-    let branch = (retired && stored != target_branch).then(|| target_branch.to_owned());
-    if branch.is_none() && row.auto_sync_enabled {
+    let branch = (crate::schema::is_known_content_channel(stored) && stored != target_branch)
+        .then(|| target_branch.to_owned());
+    let enable_auto_sync = !adopted && !row.auto_sync_enabled;
+    if branch.is_none() && !enable_auto_sync {
         return CatalogPlan::Current(row.id);
     }
-    CatalogPlan::Update { id: row.id, branch, enable_auto_sync: !row.auto_sync_enabled }
+    CatalogPlan::Update { id: row.id, branch, enable_auto_sync }
 }
 
 /// One reconciled catalog, for logging and audit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogReconcile {
-    pub catalog: FirstPartyCatalog,
-    pub repository_id: Uuid,
+    pub catalog: &'static CatalogSpec,
+    /// `None` only for [`CatalogPlan::Removed`].
+    pub repository_id: Option<Uuid>,
     pub name: String,
     pub plan: CatalogPlan,
     pub previous_branch: Option<String>,
@@ -151,15 +269,15 @@ impl CatalogReconcile {
     pub fn audit_details(&self) -> serde_json::Value {
         let mut details = serde_json::json!({
             "automatic": true,
-            // mirror-gate: wire (persisted audit detail)
-            "issue": "NAN-3758",
+            "issue": "NAN-4940",
+            "catalog": self.catalog.key(),
             "url": self.catalog.url(),
         });
         match &self.plan {
             CatalogPlan::Create { branch } => {
                 details["branch"] = branch.clone().into();
                 details["auto_sync_enabled"] = true.into();
-                details["sync_interval_hours"] = FIRST_PARTY_SYNC_INTERVAL_HOURS.into();
+                details["sync_interval_hours"] = self.catalog.sync_interval_hours().into();
             }
             CatalogPlan::Update { branch, enable_auto_sync, .. } => {
                 if let Some(branch) = branch {
@@ -170,91 +288,151 @@ impl CatalogReconcile {
                     details["auto_sync_enabled"] = true.into();
                 }
             }
-            CatalogPlan::Current(_) | CatalogPlan::Disabled(_) => {}
+            CatalogPlan::Current(_) | CatalogPlan::Disabled(_) | CatalogPlan::Removed => {}
         }
         details
     }
 }
 
-/// Register or reconcile both first-party catalogs. Idempotent and safe to
-/// run concurrently. Never touches GitHub.
-pub async fn ensure_first_party_catalogs(pool: &PgPool) -> Result<Vec<CatalogReconcile>, sqlx::Error> {
+/// Register or reconcile both first-party catalogs for the given schema
+/// profile. Idempotent and safe to run concurrently. Never touches GitHub.
+pub async fn ensure_first_party_catalogs(
+    pool: &PgPool,
+    profile: SchemaId,
+) -> Result<Vec<CatalogReconcile>, sqlx::Error> {
+    let target = crate::schema::content_branch_for(profile);
     let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(RECONCILE_LOCK_KEY).execute(&mut *tx).await?;
+    lock_first_party_catalogs(&mut tx).await?;
     let mut outcomes = Vec::with_capacity(FirstPartyCatalog::ALL.len());
     for catalog in FirstPartyCatalog::ALL {
-        outcomes.push(reconcile_one(&mut tx, catalog).await?);
+        outcomes.push(reconcile_one(&mut tx, catalog.spec(), target).await?);
     }
     tx.commit().await?;
     Ok(outcomes)
 }
 
-async fn reconcile_one(
-    tx: &mut Transaction<'_, Postgres>,
-    catalog: FirstPartyCatalog,
+/// Register or reconcile one first-party catalog at `target_branch`, under the
+/// same lock and adoption rules as [`ensure_first_party_catalogs`]. The entry
+/// point for a catalog the open edition does not ship (NAN-4947: the
+/// enterprise overlay's `nano-rs/playbooks`); the caller's schema must admit
+/// `spec.key()` in `first_party_content_catalogs`.
+pub async fn ensure_catalog(
+    pool: &PgPool,
+    spec: &'static CatalogSpec,
+    target_branch: &str,
 ) -> Result<CatalogReconcile, sqlx::Error> {
-    let table = catalog.table();
+    let mut tx = pool.begin().await?;
+    lock_first_party_catalogs(&mut tx).await?;
+    let outcome = reconcile_one(&mut tx, spec, target_branch).await?;
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// Take the transaction-scoped lock that serializes every write that can
+/// register a first-party catalog: the boot reconcile and the repository create
+/// APIs (codex review of NAN-4940). Without it a concurrent API create and the
+/// reconcile could each see no catalog and both insert one.
+pub async fn lock_first_party_catalogs(tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(RECONCILE_LOCK_KEY).execute(&mut **tx).await?;
+    Ok(())
+}
+
+/// The stored row of a first-party catalog, locked `FOR UPDATE`. When the
+/// operator registered it twice (possible only before migration 302), an
+/// enabled row wins, then the oldest.
+pub async fn find_first_party_catalog(
+    tx: &mut Transaction<'_, Postgres>,
+    catalog: &CatalogSpec,
+) -> Result<Option<ExistingCatalog>, sqlx::Error> {
     let rows: Vec<(Uuid, String, String, String, bool, bool)> = sqlx::query_as(&format!(
-        "SELECT id, name, url, branch, enabled, auto_sync_enabled FROM {table} ORDER BY created_at, id FOR UPDATE"
+        "SELECT id, name, url, branch, COALESCE(enabled, TRUE), COALESCE(auto_sync_enabled, FALSE) \
+         FROM {} ORDER BY created_at, id FOR UPDATE",
+        catalog.table()
     ))
     .fetch_all(&mut **tx)
     .await?;
-    let existing = rows
+    let mut matches: Vec<ExistingCatalog> = rows
         .into_iter()
-        .find(|(_, _, url, ..)| catalog.matches_url(url))
+        .filter(|(_, _, url, ..)| catalog.matches_url(url))
         .map(|(id, name, _, branch, enabled, auto_sync_enabled)| ExistingCatalog {
             id,
             name,
             branch,
             enabled,
             auto_sync_enabled,
-        });
-    let target = crate::schema::default_content_branch(catalog.url(), None);
-    let plan = plan(existing.as_ref(), &target);
+        })
+        .collect();
+    Ok(match matches.iter().position(|row| row.enabled) {
+        Some(index) => Some(matches.swap_remove(index)),
+        None => matches.into_iter().next(),
+    })
+}
+
+async fn reconcile_one(
+    tx: &mut Transaction<'_, Postgres>,
+    catalog: &'static CatalogSpec,
+    target: &str,
+) -> Result<CatalogReconcile, sqlx::Error> {
+    let table = catalog.table();
+    let adopted: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM first_party_content_catalogs WHERE catalog = $1)",
+    )
+    .bind(catalog.key())
+    .fetch_one(&mut **tx)
+    .await?;
+    let mut existing = find_first_party_catalog(tx, catalog).await?;
+    let mut plan = plan(existing.as_ref(), target, adopted);
     let (repository_id, name) = match &plan {
-        CatalogPlan::Create { branch } => {
-            let slug = crate::db::repo_store::slug_from_url(catalog.url(), catalog.name(), None);
-            let id: Uuid = match catalog {
-                FirstPartyCatalog::Parsers => sqlx::query_scalar(
-                    "INSERT INTO parser_repositories (name, slug, description, url, branch, parsers_path, \
-                        auto_sync_enabled, sync_interval_hours) \
-                     VALUES ($1,$2,$3,$4,$5,'parsers/',TRUE,$6) RETURNING id",
-                ),
-                // Native nPL rules at the repository root, like the hosted
-                // catalog and the one-click add.
-                FirstPartyCatalog::Rules => sqlx::query_scalar(
-                    "INSERT INTO rule_repositories (name, slug, description, url, branch, rules_path, rule_format, \
-                        auto_sync_enabled, sync_interval_hours) \
-                     VALUES ($1,$2,$3,$4,$5,'','nanosiem',TRUE,$6) RETURNING id",
-                ),
+        CatalogPlan::Create { branch } => match insert_catalog(tx, catalog, branch).await? {
+            InsertOutcome::Inserted(id) => (Some(id), catalog.name().to_owned()),
+            // Registered concurrently by a writer that did not hold the lock
+            // (an older replica): adopt that row as the operator left it
+            // rather than registering a second copy.
+            InsertOutcome::Existing(row) => {
+                plan = if row.enabled { CatalogPlan::Current(row.id) } else { CatalogPlan::Disabled(row.id) };
+                let adopted_row = (Some(row.id), row.name.clone());
+                existing = Some(row);
+                adopted_row
             }
-            .bind(catalog.name())
-            .bind(&slug)
-            .bind(catalog.description())
-            .bind(catalog.url())
-            .bind(branch)
-            .bind(FIRST_PARTY_SYNC_INTERVAL_HOURS)
-            .fetch_one(&mut **tx)
-            .await?;
-            (id, catalog.name().to_owned())
-        }
+        },
         CatalogPlan::Update { id, branch, enable_auto_sync } => {
             sqlx::query(&format!(
                 "UPDATE {table} SET branch = COALESCE($2, branch), \
-                    auto_sync_enabled = auto_sync_enabled OR $3, \
-                    last_synced_at = NULL, updated_at = NOW() WHERE id = $1"
+                    auto_sync_enabled = COALESCE(auto_sync_enabled, FALSE) OR $3, \
+                    last_synced_at = NULL, last_sync_commit = NULL, updated_at = NOW() WHERE id = $1"
             ))
             .bind(id)
             .bind(branch.as_deref())
             .bind(*enable_auto_sync)
             .execute(&mut **tx)
             .await?;
-            (*id, existing.as_ref().map(|row| row.name.clone()).unwrap_or_default())
+            (Some(*id), existing.as_ref().map(|row| row.name.clone()).unwrap_or_default())
         }
         CatalogPlan::Current(id) | CatalogPlan::Disabled(id) => {
-            (*id, existing.as_ref().map(|row| row.name.clone()).unwrap_or_default())
+            (Some(*id), existing.as_ref().map(|row| row.name.clone()).unwrap_or_default())
         }
+        CatalogPlan::Removed => (None, catalog.name().to_owned()),
     };
+    // NAN-4947: the stored URL is the canonical spelling the sync parses
+    // (`https://github.com/<owner>/<repo>`), whatever form an older build or
+    // the operator stored (`www.`, `.git`, case, trailing slash).
+    if let Some(id) = repository_id {
+        sqlx::query(&format!("UPDATE {table} SET url = $2, updated_at = NOW() WHERE id = $1 AND url <> $2"))
+            .bind(id)
+            .bind(catalog.url())
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !adopted {
+        sqlx::query(
+            "INSERT INTO first_party_content_catalogs (catalog, repository_id) VALUES ($1, $2) \
+             ON CONFLICT (catalog) DO NOTHING",
+        )
+        .bind(catalog.key())
+        .bind(repository_id)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(CatalogReconcile {
         catalog,
         repository_id,
@@ -264,54 +442,46 @@ async fn reconcile_one(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Result of registering a catalog row.
+enum InsertOutcome {
+    Inserted(Uuid),
+    /// The catalog already exists (it committed after this transaction's read).
+    Existing(ExistingCatalog),
+}
 
-    fn row(branch: &str, enabled: bool, auto: bool) -> ExistingCatalog {
-        ExistingCatalog { id: Uuid::nil(), name: "x".into(), branch: branch.into(), enabled, auto_sync_enabled: auto }
-    }
-
-    #[test]
-    fn fresh_install_registers_main() {
-        assert_eq!(crate::schema::default_content_branch(FirstPartyCatalog::Rules.url(), None), "main");
-        assert_eq!(plan(None, "main"), CatalogPlan::Create { branch: "main".into() });
-    }
-
-    /// NAN-3897: the retired `ocsf-1.9` default (or an unset branch) moves to `main`.
-    #[test]
-    fn upgrade_moves_ocsf19_or_unset_to_main_and_enables_auto_sync() {
-        for stored in ["ocsf-1.9", "", " ocsf-1.9 "] {
-            assert_eq!(
-                plan(Some(&row(stored, true, false)), "main"),
-                CatalogPlan::Update { id: Uuid::nil(), branch: Some("main".into()), enable_auto_sync: true }
-            );
+/// Insert the catalog row. `name`, `slug` and (migration 302) the normalized
+/// first-party URL are unique. After any conflict the catalog is looked up by
+/// URL first and adopted if present; only when an UNRELATED repository holds
+/// the default name is the row registered under a `(nano-rs)` suffix, instead
+/// of failing the reconcile on every start.
+async fn insert_catalog(
+    tx: &mut Transaction<'_, Postgres>,
+    catalog: &CatalogSpec,
+    branch: &str,
+) -> Result<InsertOutcome, sqlx::Error> {
+    let fallback_name = format!("{} (nano-rs)", catalog.name());
+    for name in [catalog.name(), fallback_name.as_str()] {
+        let explicit_slug = (name != catalog.name()).then(|| format!("nano-rs-{}", catalog.key()));
+        let url = catalog.url();
+        let slug = crate::db::repo_store::slug_from_url(&url, name, explicit_slug.as_deref());
+        let id: Option<Uuid> = sqlx::query_scalar(catalog.insert_sql)
+            .bind(name)
+            .bind(&slug)
+            .bind(catalog.description)
+            .bind(&url)
+            .bind(branch)
+            .bind(catalog.sync_interval_hours)
+            .fetch_optional(&mut **tx)
+            .await?;
+        if let Some(id) = id {
+            return Ok(InsertOutcome::Inserted(id));
         }
-        assert_eq!(
-            plan(Some(&row("ocsf-1.9", true, true)), "main"),
-            CatalogPlan::Update { id: Uuid::nil(), branch: Some("main".into()), enable_auto_sync: false }
-        );
-        assert_eq!(
-            plan(Some(&row("main", true, false)), "main"),
-            CatalogPlan::Update { id: Uuid::nil(), branch: None, enable_auto_sync: true }
-        );
+        if let Some(row) = find_first_party_catalog(tx, catalog).await? {
+            return Ok(InsertOutcome::Existing(row));
+        }
     }
-
-    #[test]
-    fn main_pins_and_opt_outs_are_kept() {
-        assert_eq!(plan(Some(&row("main", true, true)), "main"), CatalogPlan::Current(Uuid::nil()));
-        assert_eq!(plan(Some(&row("my-fork", true, true)), "main"), CatalogPlan::Current(Uuid::nil()));
-        assert_eq!(plan(Some(&row("legacy/clickhouse", true, true)), "main"), CatalogPlan::Current(Uuid::nil()));
-        assert_eq!(plan(Some(&row("ocsf-1.9", false, false)), "main"), CatalogPlan::Disabled(Uuid::nil()));
-    }
-
-    #[test]
-    fn catalog_urls_match_only_their_own_repository() {
-        assert!(FirstPartyCatalog::Parsers.matches_url("https://github.com/nano-rs/parsers"));
-        assert!(FirstPartyCatalog::Parsers.matches_url("https://github.com/NANO-RS/Parsers.git"));
-        assert!(!FirstPartyCatalog::Parsers.matches_url("https://github.com/nano-rs/rules"));
-        assert!(FirstPartyCatalog::Rules.matches_url("github.com/nano-rs/rules/"));
-        assert!(!FirstPartyCatalog::Rules.matches_url("https://github.com/someone/rules"));
-        assert!(!FirstPartyCatalog::Rules.matches_url("https://github.com/SigmaHQ/sigma"));
-    }
+    Err(sqlx::Error::Protocol(format!(
+        "first-party catalog {}: name and slug taken by other repositories",
+        catalog.url()
+    )))
 }

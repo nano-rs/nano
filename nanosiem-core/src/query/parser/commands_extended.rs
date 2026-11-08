@@ -485,7 +485,6 @@ pub(super) fn regex_command(input: &str) -> ParseResult<'_, Command> {
         field,
         op,
         value: Value::Regex(pattern),
-        rhs: RhsSyntax::Literal,
     };
     Ok((input, Command::Where { condition }))
 }
@@ -1104,8 +1103,13 @@ pub(super) fn append_command(input: &str) -> ParseResult<'_, Command> {
     let (input, _) = char('[').parse(input)?;
     let (input, _) = multispace0(input)?;
 
-    // Parse the subsearch query
-    let (input, subsearch) = query(input)?;
+    // Parse the subsearch query. NAN-4917: a nested `append [ … append [ … ] ]`
+    // / `join [ … join [ … ] ]` chain recurses through `query` once per bracket
+    // — count it toward MAX_NESTING_DEPTH like `IN [subsearch]` (NAN-2010 F10)
+    // and guard the stack, or bracket nesting is unbounded recursive descent.
+    let _guard = super::enter_nesting(input)?;
+    let (input, subsearch) =
+        crate::query::complexity::ensure_sufficient_stack(|| query(input))?;
 
     let (input, _) = multispace0(input)?;
     let (input, _) = char(']').parse(input)?;
@@ -1215,8 +1219,13 @@ pub(super) fn join_command(input: &str) -> ParseResult<'_, Command> {
     let (input, subsearch_dataset) = opt(subsearch_dataset_token).parse(input)?;
     let (input, _) = multispace0(input)?;
 
-    // Parse the subsearch query
-    let (input, subsearch) = query(input)?;
+    // Parse the subsearch query. NAN-4917: a nested `append [ … append [ … ] ]`
+    // / `join [ … join [ … ] ]` chain recurses through `query` once per bracket
+    // — count it toward MAX_NESTING_DEPTH like `IN [subsearch]` (NAN-2010 F10)
+    // and guard the stack, or bracket nesting is unbounded recursive descent.
+    let _guard = super::enter_nesting(input)?;
+    let (input, subsearch) =
+        crate::query::complexity::ensure_sufficient_stack(|| query(input))?;
 
     let (input, _) = multispace0(input)?;
     let (input, _) = char(']').parse(input)?;

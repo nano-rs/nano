@@ -60,7 +60,7 @@ export function LicenseBanner() {
     // Suppress the overlay while the operator is on the import page itself so
     // the dropzone underneath stays usable.
     if (status.airgap) {
-      if (location.pathname.startsWith('/settings/airgap-import')) {
+      if (location.pathname.startsWith('/settings/license')) {
         return null;
       }
       return <AirgapLockoutOverlay reason={status.locked_reason} />;
@@ -70,6 +70,7 @@ export function LicenseBanner() {
 
   // Grace period warning (dismissable)
   if (status.state === 'grace_period' && !dismissed) {
+    const legacyUpgrade = status.runtime_state === 'legacy_upgrade_grace';
     const graceEnd = status.grace_ends_at
       ? new Date(status.grace_ends_at)
       : null;
@@ -87,19 +88,29 @@ export function LicenseBanner() {
             </span>
           </div>
           <span className="text-amber-700 dark:text-amber-300">
-            Your subscription is expiring{graceEnd ? ` on ${graceEnd.toLocaleDateString()}` : ''}.
-            Update your billing to avoid service interruption.
+            {legacyUpgrade
+              ? status.notice || 'Import a C05 licence before the legacy upgrade grace ends.'
+              : `Your subscription is expiring${graceEnd ? ` on ${graceEnd.toLocaleDateString()}` : ''}. Update your billing to avoid service interruption.`}
           </span>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <a
-            href="https://app.nano.rs"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1.5 rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700 transition-colors"
-          >
-            Update Billing
-          </a>
+          {status.mode === 'offline' ? (
+            <Link
+              to="/settings/license"
+              className="inline-flex items-center gap-1.5 rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700 transition-colors"
+            >
+              {legacyUpgrade ? 'Import C05 licence' : 'Upload renewal'}
+            </Link>
+          ) : (
+            <a
+              href="https://app.nano.rs"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700 transition-colors"
+            >
+              Update Billing
+            </a>
+          )}
           <button
             onClick={() => setDismissed(true)}
             className="rounded p-1 text-amber-400 hover:text-amber-600 hover:bg-amber-100 dark:hover:bg-amber-500/20 transition-colors"
@@ -149,9 +160,9 @@ function LicenseLockoutOverlay({ reason }: { reason?: string }) {
 /**
  * Air-gapped lockout (NAN-1222). An air-gapped deployment without a valid,
  * non-expired signed offline license fails closed. There is no outbound network
- * to resubscribe over, so the only recovery is importing a signed offline
- * license bundle. The CTA routes to the in-app import surface (which is
- * license-guard-exempt server-side and un-overlaid client-side).
+ * to resubscribe over, so recovery uses an exact signed C05 file or a
+ * nonce-bound signed clock-recovery response. The CTA routes to the in-app C05
+ * surface (which is license-guard-exempt server-side and un-overlaid client-side).
  */
 function AirgapLockoutOverlay({ reason }: { reason?: string }) {
   return (
@@ -166,11 +177,11 @@ function AirgapLockoutOverlay({ reason }: { reason?: string }) {
           </h1>
           <p className="text-muted-foreground">
             {reason ||
-              'This air-gapped deployment requires a signed offline license. Import a license bundle to unlock access.'}
+              'This air-gapped deployment requires a signed C05 license file. Install or recover the license to unlock access.'}
           </p>
         </div>
         <Link
-          to="/settings/airgap-import"
+          to="/settings/license"
           className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-6 py-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
         >
           <KeyRound className="h-4 w-4" />
@@ -178,7 +189,7 @@ function AirgapLockoutOverlay({ reason }: { reason?: string }) {
         </Link>
         <p className="text-xs text-muted-foreground">
           Your data is safe. Access is restored as soon as a valid signed
-          license bundle is imported.
+          C05 file or matching clock-recovery response is accepted.
         </p>
       </div>
     </div>

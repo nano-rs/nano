@@ -18,7 +18,7 @@
 // endpoints only on the enterprise build.
 #[cfg(feature = "enterprise")]
 mod ai_providers;
-// NAN-3226: dedicated "Internal domains" (enterprise migration 9011200).
+// NAN-3226: "Internal domains" (enterprise overlay migration 9000074).
 #[cfg(feature = "enterprise")]
 mod internal_domains;
 mod operational;
@@ -42,36 +42,16 @@ pub use webhooks::*;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// Guard: reject mutations when settings are platform-owned.
+/// Guard: reject mutations when in managed deployment mode.
 ///
 /// Only the `ai_providers` submodule consumes this in open-core builds —
 /// keeping the cfg-gate avoids a dead-code warning when ai_providers is gated
 /// out.
 #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 fn check_not_managed(state: &AppState) -> Result<(), ApiError> {
-    #[cfg(feature = "enterprise")]
-    let shared_profile = state.config.deployment_mode.is_enterprise_shared();
-    #[cfg(not(feature = "enterprise"))]
-    let shared_profile = false;
-    if state.config.deployment_mode.is_managed() || shared_profile {
+    if state.config.deployment_mode.is_managed() {
         return Err(ApiError::Forbidden(
             "This setting is managed by the platform and cannot be modified. Contact support for changes.".to_string()
-        ));
-    }
-    Ok(())
-}
-
-/// Dedicated ClickHouse/SystemSettings retention and tiering are process-wide.
-/// They are never tenant authority in hosted shared: exposing even the
-/// read endpoints would disclose another tenant's/global storage state, while
-/// mutation or manual-run endpoints could destroy unrelated data. The shared
-/// read-only plan view must come from the exact tenant retention revision.
-#[cfg(feature = "enterprise")]
-pub(super) fn reject_enterprise_shared_storage_settings(state: &AppState) -> Result<(), ApiError> {
-    if state.config.deployment_mode.is_enterprise_shared() {
-        return Err(ApiError::Forbidden(
-            "Enterprise-shared retention is plan-authoritative and cannot use global retention or tiering settings"
-                .to_string(),
         ));
     }
     Ok(())
@@ -102,9 +82,9 @@ impl utoipa::OpenApi for SettingsApiDoc {
                 risk::get_risk_decay_config,
                 risk::update_risk_decay_config,
                 risk::get_risk_notable_config,
+                risk::update_risk_notable_config,
                 internal_domains::get_internal_domains,
                 internal_domains::update_internal_domains,
-                risk::update_risk_notable_config,
                 retention::get_storage_overview,
                 retention::get_clickhouse_storage_stats,
                 retention::update_clickhouse_retention,
@@ -167,11 +147,11 @@ impl utoipa::OpenApi for SettingsApiDoc {
                     risk::UpdateRiskDecayConfigRequest,
                     nanosiem_core::risk::RiskNotableConfig,
                     nanosiem_core::risk::RiskNotableTypeThresholds,
-                    nanosiem_core::internal_domains::InternalDomainsSettings,
-                    nanosiem_core::internal_domains::InternalDomainsDistribution,
-                    nanosiem_core::internal_domains::UpdateInternalDomainsRequest,
-                    nanosiem_core::internal_domains::RefusedSuffix,
-                    nanosiem_core::internal_domains::SuffixRefusal,
+                    nanosiem_core::internal_domains::store::InternalDomainsSettings,
+                    nanosiem_core::internal_domains::store::InternalDomainsDistribution,
+                    nanosiem_core::internal_domains::store::UpdateInternalDomainsRequest,
+                    nanosiem_core::internal_domains::store::RefusedSuffix,
+                    nanosiem_core::internal_domains::store::SuffixRefusal,
                     retention::StorageOverviewResponse,
                     retention::ClickHouseStorageStatsResponse,
                     retention::UpdateClickHouseRetentionRequest,
@@ -233,57 +213,6 @@ impl utoipa::OpenApi for SettingsApiDoc {
         struct ApiDoc;
 
         ApiDoc::openapi()
-    }
-}
-
-#[cfg(all(test, feature = "enterprise"))]
-mod enterprise_shared_retention_route_tests {
-    fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
-        let marker = format!("pub async fn {name}(");
-        let start = source.find(&marker).expect("handler exists");
-        let tail = &source[start..];
-        let end = tail[marker.len()..]
-            .find("pub async fn ")
-            .map(|offset| marker.len() + offset)
-            .unwrap_or(tail.len());
-        &tail[..end]
-    }
-
-    #[test]
-    fn global_retention_and_tiering_handlers_reject_enterprise_shared_before_state_access() {
-        let retention = include_str!("retention.rs");
-        for name in [
-            "get_retention_config",
-            "update_retention_config",
-            "get_storage_stats",
-            "run_retention_now",
-            "get_storage_overview",
-            "get_clickhouse_storage_stats",
-            "update_clickhouse_retention",
-            "run_clickhouse_retention_now",
-        ] {
-            assert!(
-                function_body(retention, name)
-                    .contains("reject_enterprise_shared_storage_settings(&state)?"),
-                "{name} must reject shared tenants before global storage access"
-            );
-        }
-
-        let tiering = include_str!("tiering.rs");
-        for name in [
-            "get_tiering_config",
-            "update_tiering_config",
-            "set_tiering_credentials",
-            "test_tiering_connection",
-            "apply_tiering_config",
-            "get_tier_stats",
-        ] {
-            assert!(
-                function_body(tiering, name)
-                    .contains("reject_enterprise_shared_storage_settings(&state)?"),
-                "{name} must reject shared tenants before global tiering access"
-            );
-        }
     }
 }
 

@@ -40,15 +40,15 @@ use crate::db::repository::SourceScopeRepository;
 use crate::models::{NewNotification, NotificationType};
 use crate::query::{parse_query, PrettyPrint, Query};
 use crate::scheduler::{calculate_next_run, calculate_next_runs, validate_cron};
-use crate::search::query_processing::enforce_source_scope_with_field;
+use crate::search::query_processing::enforce_non_audit_query;
 use crate::shutdown::ShutdownToken;
 use crate::webhooks::{WebhookRepository, WebhookService};
 use crate::{Dashboard, RawSqlRequest, SearchRequest, SearchService, TimeRangeInput};
 
-use super::authz::MAX_DASHBOARD_PANELS;
 use super::render::{self, PanelOutput};
 use super::repository::{ReportRepository, ReportRepositoryError};
 use super::types::*;
+use super::authz::MAX_DASHBOARD_PANELS;
 use super::{
     dashboard_panel_executes_search_sql, ReportAuthorizationError, ReportAuthorizer,
     ReportExecutionAuthorization,
@@ -87,9 +87,9 @@ const MIN_CRON_INTERVAL_SECS: i64 = 300;
 
 /// Reject cron expressions that fire more often than [`MIN_CRON_INTERVAL_SECS`],
 /// measured as the gap between the next two occurrences.
-pub fn validate_cron_interval(expression: &str) -> Result<(), ReportError> {
-    let upcoming =
-        calculate_next_runs(expression, 2).map_err(|e| ReportError::InvalidCron(e.to_string()))?;
+pub(super) fn validate_cron_interval(expression: &str) -> Result<(), ReportError> {
+    let upcoming = calculate_next_runs(expression, 2)
+        .map_err(|e| ReportError::InvalidCron(e.to_string()))?;
     if upcoming.len() == 2 {
         let gap = (upcoming[1] - upcoming[0]).num_seconds();
         if gap < MIN_CRON_INTERVAL_SECS {
@@ -129,7 +129,9 @@ impl From<ReportAuthorizationError> for ReportError {
     fn from(error: ReportAuthorizationError) -> Self {
         match error {
             ReportAuthorizationError::Denied(message) => Self::AuthorizationDenied(message),
-            ReportAuthorizationError::Resolution(message) => Self::AuthorizationResolution(message),
+            ReportAuthorizationError::Resolution(message) => {
+                Self::AuthorizationResolution(message)
+            }
         }
     }
 }
@@ -164,24 +166,22 @@ enum ExecOutcome {
     ClaimLost,
 }
 
-/// Everything a completed execution produced, ready to persist. Public so the
-/// enterprise-shared tenant runner can persist the same shape inside a signed
-/// tenant transaction.
-pub struct ExecutionOutput {
-    pub artifacts: Vec<RenderedArtifact>,
-    pub row_count: Option<i64>,
-    pub result_truncated: bool,
-    pub artifact_truncated: bool,
+/// Everything a completed execution produced, ready to persist.
+struct ExecutionOutput {
+    artifacts: Vec<RenderedArtifact>,
+    row_count: Option<i64>,
+    result_truncated: bool,
+    artifact_truncated: bool,
     /// F-31: the DISTINCT `source_type` manifest of the rendered artifacts —
     /// what a later source-access revocation is checked against at download.
-    pub source_types: Vec<String>,
+    source_types: Vec<String>,
     /// F-31: whether `source_types` is a COMPLETE, trustworthy account of the
     /// artifact's provenance. `false` (aggregate/projection/SQL/dashboard rows
     /// that dropped `source_type`, or a companion that could not resolve) makes
     /// the download gate deny every source-restricted requester.
-    pub source_types_complete: bool,
+    source_types_complete: bool,
     /// NAN-2066: whether the authorized source snapshot executed raw SQL.
-    pub requires_search_sql: bool,
+    requires_search_sql: bool,
 }
 
 /// F-31: authorization predicate for downloading (or seeing the artifact
@@ -255,10 +255,6 @@ impl ReportService {
         &self.repository
     }
 
-    fn enforce_non_audit(&self, query: &str) -> Result<String, crate::SearchError> {
-        enforce_non_audit_for(&self.search_service, query)
-    }
-
     // ==================== DEFINITION CRUD ====================
 
     pub async fn create_definition(
@@ -280,11 +276,7 @@ impl ReportService {
     fn validate_source(&self, new: &NewReportDefinition) -> Result<(), ReportError> {
         match new.source_type {
             ReportSourceType::Search => {
-                if new
-                    .source_query
-                    .as_ref()
-                    .map_or(true, |q| q.trim().is_empty())
-                {
+                if new.source_query.as_ref().map_or(true, |q| q.trim().is_empty()) {
                     return Err(ReportError::InvalidDefinition(
                         "search report requires a non-empty query".into(),
                     ));
@@ -375,10 +367,7 @@ impl ReportService {
         definition_id: Uuid,
         limit: i64,
     ) -> Result<Vec<ReportRun>, ReportError> {
-        Ok(self
-            .repository
-            .list_runs(definition_id, limit.clamp(1, 500))
-            .await?)
+        Ok(self.repository.list_runs(definition_id, limit.clamp(1, 500)).await?)
     }
 
     pub async fn get_run(&self, run_id: Uuid) -> Result<ReportRun, ReportError> {
@@ -587,7 +576,6 @@ impl ReportService {
                     // search (rate limited; the run is unchanged).
                     let audit_scope = self.denied_source_audit.as_ref().and_then(|sink| {
                         crate::search::denied_source_audit::DeniedSourceAuditScope::new(
-                            None,
                             def.owner_id,
                             None,
                             scope.deny_set(),
@@ -602,14 +590,16 @@ impl ReportService {
                         Some(audit_scope) => {
                             tokio::time::timeout(
                                 timeout,
-                                crate::search::denied_source_audit::with_scope(Arc::new(audit_scope), produce),
+                                crate::search::denied_source_audit::with_scope(
+                                    Arc::new(audit_scope),
+                                    produce,
+                                ),
                             )
                             .await
                         }
                         None => tokio::time::timeout(timeout, produce).await,
                     };
-                    match produced
-                    {
+                    match produced {
                         Ok(res) => res,
                         Err(_) => Err(ReportError::Timeout),
                     }
@@ -741,7 +731,69 @@ impl ReportService {
         end: DateTime<Utc>,
         scope: &ScopeSet,
     ) -> (BTreeSet<String>, bool) {
-        source_types_for_result_with(&self.search_service, companion_query, rows, start, end, scope).await
+        if rows.is_empty() {
+            return (BTreeSet::new(), true);
+        }
+
+        let lacks_source_type = |event: &Value| {
+            event
+                .get("source_type")
+                .and_then(|v| v.as_str())
+                .map_or(true, |s| s.trim().is_empty())
+        };
+        // Derive DIRECTLY over the slice — never clone up to REPORT_RESULT_ROW_CAP
+        // (50k) rows just to read their source_type values.
+        let direct = distinct_source_types_over(rows);
+
+        // Fast path: every row already carries a per-event source_type.
+        if !rows.iter().any(lacks_source_type) {
+            return (direct, true);
+        }
+
+        // Rows dropped source_type — recover it via the owner-scoped companion.
+        let base = match companion_query.and_then(|q| report_companion_query(q)) {
+            Some(base) => base,
+            None => return (direct, false),
+        };
+        // Audit-strip the companion exactly as the main query is stripped; a
+        // strip error means we can't trust it → incomplete.
+        let safe = match enforce_non_audit_query(&base) {
+            Ok(q) => q,
+            Err(_) => return (direct, false),
+        };
+        let req = SearchRequest {
+            query: safe,
+            time_range: TimeRangeInput::new(start, end),
+            limit: Some(REPORT_PANEL_ROW_CAP),
+            offset: None,
+            include_sql: Some(false),
+            skip_histogram: true,
+            skip_field_stats: true,
+            use_cache: false,
+            table_view: false,
+            request_id: None,
+            async_mode: false,
+            priority: None,
+            dataset: None,
+        };
+        match self.search_service.search(req, scope).await {
+            Ok(resp) => {
+                // NAN-2155: one classification, whose precedence rules live (and
+                // are tested) in `companion_provenance`. `trustworthy` false =>
+                // the window was not fully attributed, so the manifest is
+                // incomplete and the download gate denies every restricted
+                // requester — even if some groups DID name real sources
+                // (codex round 7).
+                let (companion_types, trustworthy) = companion_provenance(&resp.results);
+                if !trustworthy {
+                    return (direct, false);
+                }
+                let mut union = direct;
+                union.extend(companion_types);
+                (union, true)
+            }
+            Err(_) => (direct, false),
+        }
     }
 
     async fn produce(
@@ -776,8 +828,101 @@ impl ReportService {
         def: &ReportDefinition,
         scope: &ScopeSet,
     ) -> Result<ExecutionOutput, ReportError> {
-        let registry = self.restricted_registry().await;
-        produce_search_report(&self.search_service, def, scope, registry).await
+        let query = def
+            .source_query
+            .clone()
+            .filter(|q| !q.trim().is_empty())
+            .ok_or_else(|| ReportError::InvalidDefinition("search report has no query".into()))?;
+
+        let now = Utc::now();
+        let start = now - chrono::Duration::seconds(def.time_range_seconds.max(1));
+
+        // Fail-closed audit stripping (execution identity seam): reports never
+        // surface audit-log data (owner has no permission context here yet).
+        let safe_query =
+            enforce_non_audit_query(&query).map_err(|e| ReportError::Execution(e.to_string()))?;
+
+        let req = SearchRequest {
+            query: safe_query,
+            time_range: TimeRangeInput::new(start, now),
+            limit: Some(REPORT_RESULT_ROW_CAP),
+            offset: None,
+            include_sql: Some(false),
+            skip_histogram: true,
+            skip_field_stats: true,
+            use_cache: false,
+            table_view: false,
+            request_id: None,
+            async_mode: false,
+            priority: None,
+            dataset: None,
+        };
+
+        let resp = self
+            .search_service
+            // OWNER-SCOPED (NAN-1809): the report owner's per-source deny set,
+            // resolved fail-closed in run_and_record. Audit exclusion is already
+            // handled upstream (enforce_non_audit_query).
+            .search(req, scope)
+            .await
+            .map_err(|e| ReportError::Execution(e.to_string()))?;
+
+        let rows = resp.results;
+        let columns = resp.column_order.unwrap_or_default();
+        let result_truncated =
+            rows.len() == REPORT_RESULT_ROW_CAP && resp.total_count > rows.len() as u64;
+
+        let (csv_bytes, csv_trunc) =
+            render::render_csv(&rows, &columns, REPORT_ARTIFACT_BYTE_CAP);
+        // The HTML shows the ORIGINAL configured query (not the audit-stripped one).
+        let (html_bytes, html_trunc) = render::render_search_html(
+            &def.name,
+            &query,
+            start,
+            now,
+            now,
+            &rows,
+            &columns,
+            resp.total_count,
+            result_truncated,
+            REPORT_ARTIFACT_BYTE_CAP,
+        );
+
+        let base = artifact_basename(&def.name, now);
+        let artifacts = vec![
+            RenderedArtifact {
+                kind: "csv".into(),
+                filename: format!("{base}.csv"),
+                content_type: "text/csv; charset=utf-8".into(),
+                content: csv_bytes,
+            },
+            RenderedArtifact {
+                kind: "html".into(),
+                filename: format!("{base}.html"),
+                content_type: "text/html; charset=utf-8".into(),
+                content: html_bytes,
+            },
+        ];
+
+        // F-31: manifest of the source_types feeding these artifacts. Use the
+        // ORIGINAL (not audit-stripped) query as the companion base; the
+        // companion runs owner-scoped so it reflects exactly what the owner saw.
+        let (mut source_types, complete) = self
+            .source_types_for_result(Some(query.as_str()), &rows, start, now, scope)
+            .await;
+        if !complete {
+            source_types.extend(self.restricted_registry().await);
+        }
+
+        Ok(ExecutionOutput {
+            artifacts,
+            row_count: Some(rows.len() as i64),
+            result_truncated,
+            artifact_truncated: csv_trunc || html_trunc,
+            source_types: source_types.into_iter().collect(),
+            source_types_complete: complete,
+            requires_search_sql: false,
+        })
     }
 
     async fn produce_dashboard(
@@ -801,10 +946,7 @@ impl ReportService {
             let out = self.run_panel(panel, start, now, scope).await;
             // Only piped-mode panels with a query are companionable; SQL panels
             // (and query-less widgets) that dropped source_type force incomplete.
-            let mode = panel
-                .get("queryMode")
-                .and_then(|v| v.as_str())
-                .unwrap_or("piped");
+            let mode = panel.get("queryMode").and_then(|v| v.as_str()).unwrap_or("piped");
             let query = panel.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let companion = if mode != "sql" && !query.trim().is_empty() {
                 Some(query)
@@ -877,8 +1019,8 @@ impl ReportService {
 
         // Metric widgets fetch from the metrics timeseries endpoint, not the
         // nPL/SQL panel-query path — not rendered in v1 reports.
-        let is_metric =
-            viz == "obs_metric" || panel.get("metricConfig").map_or(false, |v| !v.is_null());
+        let is_metric = viz == "obs_metric"
+            || panel.get("metricConfig").map_or(false, |v| !v.is_null());
         if is_metric {
             return PanelOutput {
                 title,
@@ -929,29 +1071,28 @@ impl ReportService {
                 )
                 .await
         } else {
-            match self.enforce_non_audit(&query) {
+            match enforce_non_audit_query(&query) {
                 Ok(safe) => {
                     self.search_service
-                        .search(
-                            SearchRequest {
-                                query: safe,
-                                time_range: TimeRangeInput::new(start, end),
-                                limit: Some(REPORT_PANEL_ROW_CAP),
-                                offset: None,
-                                include_sql: Some(false),
-                                skip_histogram: true,
-                                skip_field_stats: true,
-                                use_cache: false,
-                                table_view: false,
-                                request_id: None,
-                                async_mode: false,
-                                priority: None,
-                                dataset: None,
-                            },
-                            // OWNER-SCOPED (NAN-1809): the report owner's per-source
-                            // deny set, resolved fail-closed in run_and_record.
-                            scope,
-                        )
+                        .search(SearchRequest {
+                            query: safe,
+                            time_range: TimeRangeInput::new(start, end),
+                            limit: Some(REPORT_PANEL_ROW_CAP),
+                            offset: None,
+                            include_sql: Some(false),
+                            skip_histogram: true,
+                            skip_field_stats: true,
+                            use_cache: false,
+                            table_view: false,
+                            request_id: None,
+                            async_mode: false,
+                            priority: None,
+                            dataset: None,
+                        },
+                        // OWNER-SCOPED (NAN-1809): the report owner's per-source
+                        // deny set, resolved fail-closed in run_and_record.
+                        scope,
+                    )
                         .await
                 }
                 Err(e) => Err(e),
@@ -1070,9 +1211,7 @@ impl ReportService {
                         self.run_claimed(c, &node_id).await;
                     }
                 }
-                Some(Err(e)) => {
-                    warn!(error = %e, "Report scheduler: failed to claim due definitions")
-                }
+                Some(Err(e)) => warn!(error = %e, "Report scheduler: failed to claim due definitions"),
             }
             drop(permit);
 
@@ -1136,14 +1275,7 @@ impl ReportService {
 
         match self
             .repository
-            .release_claim(
-                def_id,
-                node_id,
-                generation,
-                status,
-                error.as_deref(),
-                next_run_at,
-            )
+            .release_claim(def_id, node_id, generation, status, error.as_deref(), next_run_at)
             .await
         {
             Ok(true) => {}
@@ -1176,208 +1308,6 @@ impl ReportService {
     }
 }
 
-
-/// Log-source field for the active search profile.
-pub fn log_source_field_for(search_service: &SearchService) -> &'static str {
-    if search_service.active_profile().uses_strict_canonical_fields() {
-        "metadata.log_source"
-    } else {
-        "source_type"
-    }
-}
-
-/// Fail-closed audit stripping: reports never surface audit-log data.
-pub fn enforce_non_audit_for(
-    search_service: &SearchService,
-    query: &str,
-) -> Result<String, crate::SearchError> {
-    enforce_source_scope_with_field(
-        query,
-        &BTreeSet::from(["audit".to_string()]),
-        log_source_field_for(search_service),
-    )
-}
-
-/// F-31 provenance derivation over an arbitrary `SearchService` (see the
-/// method of the same name on [`ReportService`] for the rules).
-pub async fn source_types_for_result_with(
-    search_service: &SearchService,
-    companion_query: Option<&str>,
-    rows: &[Value],
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    scope: &ScopeSet,
-) -> (BTreeSet<String>, bool) {
-    if rows.is_empty() {
-        return (BTreeSet::new(), true);
-    }
-
-    let source_field = log_source_field_for(search_service);
-
-    let lacks_source_type = |event: &Value| {
-        report_source_value(event, source_field).map_or(true, |s| s.trim().is_empty())
-    };
-    // Derive DIRECTLY over the slice — never clone up to REPORT_RESULT_ROW_CAP
-    // (50k) rows just to read their source_type values.
-    let direct = distinct_source_types_over_field(rows, source_field);
-
-    // Fast path: every row already carries a per-event source_type.
-    if !rows.iter().any(lacks_source_type) {
-        return (direct, true);
-    }
-
-    // Rows dropped source_type — recover it via the owner-scoped companion.
-    let base = match companion_query.and_then(|q| report_companion_query(q, source_field)) {
-        Some(base) => base,
-        None => return (direct, false),
-    };
-    // Audit-strip the companion exactly as the main query is stripped; a
-    // strip error means we can't trust it → incomplete.
-    let safe = match enforce_non_audit_for(search_service, &base) {
-        Ok(q) => q,
-        Err(_) => return (direct, false),
-    };
-    let req = SearchRequest {
-        query: safe,
-        time_range: TimeRangeInput::new(start, end),
-        limit: Some(REPORT_PANEL_ROW_CAP),
-        offset: None,
-        include_sql: Some(false),
-        skip_histogram: true,
-        skip_field_stats: true,
-        use_cache: false,
-        table_view: false,
-        request_id: None,
-        async_mode: false,
-        priority: None,
-        dataset: None,
-    };
-    match search_service.search(req, scope).await {
-        Ok(resp) => {
-            // NAN-2155: one classification, whose precedence rules live (and
-            // are tested) in `companion_provenance`. `trustworthy` false =>
-            // the window was not fully attributed, so the manifest is
-            // incomplete and the download gate denies every restricted
-            // requester — even if some groups DID name real sources
-            // (codex round 7).
-            let (companion_types, trustworthy) =
-                companion_provenance_field(&resp.results, source_field);
-            if !trustworthy {
-                return (direct, false);
-            }
-            let mut union = direct;
-            union.extend(companion_types);
-            (union, true)
-        }
-        Err(_) => (direct, false),
-    }
-}
-
-/// Execute a SEARCH report over an arbitrary `SearchService`. The dedicated
-/// service passes its process-global service; the enterprise-shared tenant
-/// runner passes the tenant-pinned lake view. `restricted_registry` is unioned
-/// into an INCOMPLETE manifest as belt-and-braces (an incomplete manifest
-/// already denies every restricted requester at download).
-pub async fn produce_search_report(
-    search_service: &SearchService,
-    def: &ReportDefinition,
-    scope: &ScopeSet,
-    restricted_registry: BTreeSet<String>,
-) -> Result<ExecutionOutput, ReportError> {
-    let query = def
-        .source_query
-        .clone()
-        .filter(|q| !q.trim().is_empty())
-        .ok_or_else(|| ReportError::InvalidDefinition("search report has no query".into()))?;
-
-    let now = Utc::now();
-    let start = now - chrono::Duration::seconds(def.time_range_seconds.max(1));
-
-    // Fail-closed audit stripping (execution identity seam): reports never
-    // surface audit-log data (owner has no permission context here yet).
-    let safe_query = enforce_non_audit_for(search_service, &query)
-        .map_err(|e| ReportError::Execution(e.to_string()))?;
-
-    let req = SearchRequest {
-        query: safe_query,
-        time_range: TimeRangeInput::new(start, now),
-        limit: Some(REPORT_RESULT_ROW_CAP),
-        offset: None,
-        include_sql: Some(false),
-        skip_histogram: true,
-        skip_field_stats: true,
-        use_cache: false,
-        table_view: false,
-        request_id: None,
-        async_mode: false,
-        priority: None,
-        dataset: None,
-    };
-
-    let resp = search_service
-        // OWNER-SCOPED (NAN-1809): the report owner's per-source deny set,
-        // resolved fail-closed in run_and_record. Audit exclusion is already
-        // handled upstream (enforce_non_audit_query).
-        .search(req, scope)
-        .await
-        .map_err(|e| ReportError::Execution(e.to_string()))?;
-
-    let rows = resp.results;
-    let columns = resp.column_order.unwrap_or_default();
-    let result_truncated =
-        rows.len() == REPORT_RESULT_ROW_CAP && resp.total_count > rows.len() as u64;
-
-    let (csv_bytes, csv_trunc) = render::render_csv(&rows, &columns, REPORT_ARTIFACT_BYTE_CAP);
-    // The HTML shows the ORIGINAL configured query (not the audit-stripped one).
-    let (html_bytes, html_trunc) = render::render_search_html(
-        &def.name,
-        &query,
-        start,
-        now,
-        now,
-        &rows,
-        &columns,
-        resp.total_count,
-        result_truncated,
-        REPORT_ARTIFACT_BYTE_CAP,
-    );
-
-    let base = artifact_basename(&def.name, now);
-    let artifacts = vec![
-        RenderedArtifact {
-            kind: "csv".into(),
-            filename: format!("{base}.csv"),
-            content_type: "text/csv; charset=utf-8".into(),
-            content: csv_bytes,
-        },
-        RenderedArtifact {
-            kind: "html".into(),
-            filename: format!("{base}.html"),
-            content_type: "text/html; charset=utf-8".into(),
-            content: html_bytes,
-        },
-    ];
-
-    // F-31: manifest of the source_types feeding these artifacts. Use the
-    // ORIGINAL (not audit-stripped) query as the companion base; the
-    // companion runs owner-scoped so it reflects exactly what the owner saw.
-    let (mut source_types, complete) = source_types_for_result_with(search_service, Some(query.as_str()), &rows, start, now, scope)
-        .await;
-    if !complete {
-        source_types.extend(restricted_registry);
-    }
-
-    Ok(ExecutionOutput {
-        artifacts,
-        row_count: Some(rows.len() as i64),
-        result_truncated,
-        artifact_truncated: csv_trunc || html_trunc,
-        source_types: source_types.into_iter().collect(),
-        source_types_complete: complete,
-        requires_search_sql: false,
-    })
-}
-
 /// Per-run execution timeout (env-overridable, floored at 30s).
 fn run_timeout_secs() -> u64 {
     std::env::var("REPORT_RUN_TIMEOUT_SECS")
@@ -1405,21 +1335,7 @@ fn stale_timeout_secs() -> i64 {
 /// so a 50k-row search result is not deep-cloned into a `Value::Array` just to
 /// read its source types. Trim + lowercase (OCSF `source_type` is not
 /// ingest-lowercased), sorted-unique via `BTreeSet`.
-fn report_source_value<'a>(event: &'a Value, field: &str) -> Option<&'a str> {
-    if let Some(value) = event.get(field).and_then(Value::as_str) {
-        return Some(value);
-    }
-    let mut value = event;
-    for segment in field.split('.') {
-        value = value.get(segment)?;
-    }
-    value.as_str()
-}
-
-pub(crate) fn distinct_source_types_over_field(
-    rows: &[Value],
-    source_field: &str,
-) -> BTreeSet<String> {
+fn distinct_source_types_over(rows: &[Value]) -> BTreeSet<String> {
     fn insert_normalized(raw: &str, set: &mut BTreeSet<String>) {
         let norm = raw.trim().to_lowercase();
         if !norm.is_empty() {
@@ -1435,7 +1351,9 @@ pub(crate) fn distinct_source_types_over_field(
         // single crafted event could take a scheduled report offline. Only the
         // engine's `_nano_source_types` stamp below may carry the sentinel,
         // where it legitimately means "provenance unresolved".
-        if let Some(st) = report_source_value(event, source_field)
+        if let Some(st) = event
+            .get("source_type")
+            .and_then(|v| v.as_str())
             .filter(|st| !crate::auth::is_reserved_source_type(st))
         {
             insert_normalized(st, &mut set);
@@ -1470,19 +1388,13 @@ pub(crate) fn distinct_source_types_over_field(
 ///   denied it (codex round 5). Failing closed here would let one crafted event
 ///   take a scheduled report offline for every restricted requester, including
 ///   its owner.
-#[cfg(test)]
 pub(crate) fn companion_provenance(rows: &[Value]) -> (BTreeSet<String>, bool) {
-    companion_provenance_field(rows, "source_type")
-}
-
-pub(crate) fn companion_provenance_field(
-    rows: &[Value],
-    source_field: &str,
-) -> (BTreeSet<String>, bool) {
     let mut types: BTreeSet<String> = BTreeSet::new();
     let mut any_unattributed = false;
     for event in rows {
-        match report_source_value(event, source_field)
+        match event
+            .get("source_type")
+            .and_then(|v| v.as_str())
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
         {
@@ -1513,24 +1425,21 @@ pub(crate) fn companion_provenance_field(
 /// could only narrow the set) — over-stamping hides the artifact from MORE
 /// scoped viewers, never fewer (the fail-closed direction). `None` when the
 /// query cannot be parsed.
-pub(crate) fn report_companion_query(query: &str, source_field: &str) -> Option<String> {
+fn report_companion_query(query: &str) -> Option<String> {
     let parsed = parse_query(query).ok()?;
     let mut node: &Query = &parsed;
     loop {
         match node {
             Query::Piped { source, .. } => node = source,
             Query::Search(expr) => {
-                return Some(format!(
-                    "{} | stats count by {source_field}",
-                    expr.pretty_print()
-                ));
+                return Some(format!("{} | stats count by source_type", expr.pretty_print()));
             }
         }
     }
 }
 
 /// Build a filesystem-safe artifact basename: `<slug>-<YYYYmmdd-HHMMSS>`.
-pub fn artifact_basename(name: &str, at: DateTime<Utc>) -> String {
+fn artifact_basename(name: &str, at: DateTime<Utc>) -> String {
     let mut slug = String::with_capacity(name.len());
     let mut prev_dash = false;
     for c in name.chars() {

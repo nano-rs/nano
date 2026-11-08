@@ -3,11 +3,10 @@
 //! Tenant-wide AI tuning mode (NAN-3219).
 //!
 //! One switch above the per-rule `detection_rules.auto_tuning_enabled`
-//! toggle; the two are ANDed. Stored per tenant on hosted-shared
-//! (`shared_tenant_ai_settings.ai_tuning_mode`, read in the signed
-//! tenant transaction) and once per deployment on dedicated
-//! (`system_settings.ai_tuning_mode`), both added by enterprise migration
-//! 9010950 with the default `on`.
+//! toggle; the two are ANDed. Stored once per deployment on
+//! `system_settings.ai_tuning_mode`, added by enterprise overlay migration
+//! 9000086 with the default `on`. Open-core builds never get the column and
+//! read the default `on` (see [`read_deployment_ai_tuning_mode`]).
 //!
 //! * [`AiTuningMode::On`] — automatic proposals + the Tune wizard (default).
 //! * [`AiTuningMode::Manual`] — metrics and baselines keep flowing, but no
@@ -17,7 +16,7 @@
 
 use sqlx::PgPool;
 
-/// The tenant's AI tuning mode.
+/// The deployment's AI tuning mode.
 #[derive(
     Debug,
     Clone,
@@ -42,7 +41,7 @@ pub enum AiTuningMode {
 }
 
 /// The one message every refused Tune surface returns when the mode is `off`.
-pub const AI_TUNING_OFF_MESSAGE: &str = "AI tuning is turned off for this tenant. \
+pub const AI_TUNING_OFF_MESSAGE: &str = "AI tuning is turned off for this deployment. \
 An administrator with the settings:ai permission can turn it back on in Settings → AI & pivt → Models.";
 
 impl AiTuningMode {
@@ -156,57 +155,5 @@ pub async fn write_deployment_ai_tuning_mode(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn defaults_to_on() {
-        assert_eq!(AiTuningMode::default(), AiTuningMode::On);
-    }
-
-    #[test]
-    fn round_trips_and_rejects_unknown_names() {
-        for mode in AiTuningMode::ALL {
-            assert_eq!(AiTuningMode::parse(mode.as_str()), Some(mode));
-            assert_eq!(
-                serde_json::to_value(mode).unwrap(),
-                serde_json::json!(mode.as_str())
-            );
-        }
-        assert_eq!(AiTuningMode::parse("manual_only"), None);
-        assert_eq!(AiTuningMode::parse("ON"), None);
-        assert!(serde_json::from_value::<AiTuningMode>(serde_json::json!("disabled")).is_err());
-    }
-
-    #[test]
-    fn capability_matrix() {
-        use AiTuningMode::*;
-        assert!(On.collects_metrics() && On.automatic_proposals() && On.wizard_allowed());
-        assert!(
-            Manual.collects_metrics() && !Manual.automatic_proposals() && Manual.wizard_allowed()
-        );
-        assert!(!Off.collects_metrics() && !Off.automatic_proposals() && !Off.wizard_allowed());
-    }
-
-    #[test]
-    fn dedicated_scheduler_tasks_honour_the_mode() {
-        use AiTuningMode::*;
-        use TuningTask::*;
-        let all = [Metrics, Baselines, Breaches, SilentRules, Notifications];
-        for task in all {
-            assert!(task.allowed(On), "{task:?} runs when on");
-            assert!(
-                !task.allowed(Off),
-                "{task:?} never runs when off (metrics included)"
-            );
-        }
-        assert!(Metrics.allowed(Manual));
-        assert!(Baselines.allowed(Manual));
-        assert!(!Breaches.allowed(Manual), "manual: no automatic proposals");
-        assert!(
-            !SilentRules.allowed(Manual),
-            "manual: no automatic proposals"
-        );
-        assert!(!Notifications.allowed(Manual), "manual: no notifications");
-    }
-}
+#[path = "mode_tests.rs"]
+mod tests;

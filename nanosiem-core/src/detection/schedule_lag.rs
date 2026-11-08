@@ -2,20 +2,15 @@
 
 //! Detection scheduling lag (NAN-3064).
 //!
-//! A tenant running a couple hundred rules needs to know when the detection
+//! A deployment running a couple hundred rules needs to know when the detection
 //! scheduler is falling behind, not just that it is running. Lag is measured
 //! per active scheduled rule as `now - next_run_at` once the rule is due:
 //! `next_run_at` already carries the rule's phase offset (NAN-3063), so a
 //! positive lag is time the rule has spent waiting for, or in, its run. A rule
 //! whose `next_run_at` is in the future has lag 0.
 //!
-//! The summary is a pure function over rows so the dedicated handler, the
-//! enterprise-shared (lean) handler and the runtimes' health signal all agree.
-
-use std::{
-    collections::HashMap,
-    sync::{Mutex, OnceLock},
-};
+//! The summary is a pure function over rows so the handler and the
+//! scheduler's health signal agree.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -27,7 +22,7 @@ use super::scheduler::schedule_interval;
 /// absorbs the poll interval (5 s) plus a normal claim/refill turn.
 pub const BEHIND_SCHEDULE_GRACE_SECS: i64 = 30;
 /// A rule lagging more than this multiple of its own interval has missed at
-/// least one whole run: the tenant's detection health is degraded.
+/// least one whole run: detection health is degraded.
 pub const DEGRADED_INTERVAL_MULTIPLE: i64 = 2;
 /// Worst-lagging rules returned for display.
 pub const WORST_RULES_LIMIT: usize = 10;
@@ -57,7 +52,7 @@ pub struct LaggingRule {
     pub over_2x_interval: bool,
 }
 
-/// Per-tenant detection scheduling lag.
+/// Detection scheduling lag for this deployment.
 #[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
 pub struct ScheduleLagSummary {
     /// Active scheduled rules measured (Live/Alerting, not archived, with a schedule).
@@ -170,51 +165,40 @@ fn percentile(sorted: &[i64], pct: usize) -> i64 {
 }
 
 /// Emit the lag summary as Prometheus gauges and WARN when degraded.
-/// `tenant` labels the lean (per-tenant) runtime; the dedicated scheduler
-/// passes `None`.
-pub fn record_schedule_lag(summary: &ScheduleLagSummary, tenant: Option<Uuid>) {
-    let tenant_label = tenant.map(|t| t.to_string()).unwrap_or_else(|| "dedicated".into());
-    // NAN-4031: identify the rule behind a max-lag page. Clear the previous
-    // labelled series when the worst rule changes (or recovers), so a stale
-    // failure cannot remain the maximum forever. Existing consumers can
-    // continue aggregating the same metric name by tenant.
-    static WORST_GAUGES: OnceLock<Mutex<HashMap<String, metrics::Gauge>>> = OnceLock::new();
-    let mut previous = WORST_GAUGES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(gauge) = previous.remove(&tenant_label) {
-        gauge.set(0.0);
-    }
-    let rule_id = summary.worst.first().map(|rule| rule.rule_id.clone()).unwrap_or_default();
-    let gauge = metrics::gauge!("nanosiem_detection_schedule_lag_max_seconds",
-        "tenant" => tenant_label.clone(), "rule_id" => rule_id);
-    gauge.set(summary.max_lag_secs as f64);
-    previous.insert(tenant_label.clone(), gauge);
-    drop(previous);
-    metrics::gauge!("nanosiem_detection_schedule_lag_p95_seconds", "tenant" => tenant_label.clone())
+pub fn record_schedule_lag(summary: &ScheduleLagSummary) {
+    // Unlabelled on purpose (NAN-4902 review): a per-`rule_id` label minted a
+    // new permanent series every time the worst rule changed (zeroing a gauge
+    // never unregisters it). The worst rule is identified in the WARN below
+    // and in `ScheduleLagSummary::worst` (`GET /api/rules/fleet-health`).
+    metrics::gauge!("nanosiem_detection_schedule_lag_max_seconds")
+        .set(summary.max_lag_secs as f64);
+    metrics::gauge!("nanosiem_detection_schedule_lag_p95_seconds")
         .set(summary.p95_lag_secs as f64);
-    metrics::gauge!("nanosiem_detection_rules_behind_schedule", "tenant" => tenant_label.clone())
+    metrics::gauge!("nanosiem_detection_rules_behind_schedule")
         .set(summary.behind_schedule as f64);
-    metrics::gauge!("nanosiem_detection_rules_lagging_over_2x_interval", "tenant" => tenant_label.clone())
+    metrics::gauge!("nanosiem_detection_rules_lagging_over_2x_interval")
         .set(summary.over_2x_interval as f64);
-    metrics::gauge!("nanosiem_detection_schedule_degraded", "tenant" => tenant_label)
+    metrics::gauge!("nanosiem_detection_schedule_degraded")
         .set(if summary.degraded { 1.0 } else { 0.0 });
     if summary.degraded {
         let worst = summary.worst.first();
         tracing::warn!(
-            tenant_id = ?tenant,
             rules = summary.total,
             behind_schedule = summary.behind_schedule,
             over_2x_interval = summary.over_2x_interval,
             max_lag_secs = summary.max_lag_secs,
             p95_lag_secs = summary.p95_lag_secs,
             worst_rule = worst.map(|r| r.rule_name.as_str()).unwrap_or(""),
+            worst_rule_id = worst.map(|r| r.rule_id.as_str()).unwrap_or(""),
             worst_interval_secs = worst.and_then(|r| r.interval_secs).unwrap_or(0),
             "detection scheduling degraded: rules are lagging more than twice their interval"
         );
     }
 }
+
+#[cfg(test)]
+#[path = "schedule_lag_metrics_tests.rs"]
+mod schedule_lag_metrics_tests;
 
 #[cfg(test)]
 mod tests {

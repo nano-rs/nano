@@ -257,30 +257,10 @@ impl SessionService {
             return Err(SessionError::PermissionDenied);
         }
 
-        // Delete refresh sessions and advance the access-token revocation
-        // watermark atomically. A refresh racing this operation cannot leave a
-        // usable access token behind even if its HTTP response arrives last.
-        let count = self.session_repo.revoke_all_user_sessions(user_id).await?;
+        // Delete all sessions for the user
+        let count = self.session_repo.delete_user_sessions(user_id).await?;
 
         Ok(count)
-    }
-
-    /// Terminate one tenant's shared sessions without invalidating an
-    /// independently authenticated session for another tenant.
-    pub async fn terminate_tenant_user_sessions(
-        &self,
-        tenant_id: Uuid,
-        user_id: Uuid,
-        requesting_user_id: Uuid,
-        is_admin: bool,
-    ) -> Result<u64, SessionError> {
-        if user_id != requesting_user_id && !is_admin {
-            return Err(SessionError::PermissionDenied);
-        }
-        self.session_repo
-            .revoke_tenant_user_sessions(tenant_id, user_id)
-            .await
-            .map_err(Into::into)
     }
 
     /// Cleanup expired sessions

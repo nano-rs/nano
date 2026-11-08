@@ -89,6 +89,7 @@ interface EditorTopBarProps {
   onUnarchive?: () => void;
   onDelete?: () => void;
   onOpenTune?: () => void;
+  lifecyclePending?: boolean;
   /** Disabled when FLOW/FORM lenses ship in later PRs. */
   enabledLenses?: ReadonlySet<ViewMode>;
   /** All folders the user can pick from in the meta-row folder chip
@@ -111,7 +112,7 @@ function ModePill({ mode }: { mode: string }) {
   return (
     <span
       className={cn(
-        'inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap px-2 h-5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em]',
+        'inline-flex items-center gap-1.5 px-2 h-5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em]',
         meta.tone,
       )}
       style={{
@@ -465,6 +466,7 @@ export function EditorTopBar({
   onUnarchive,
   onDelete,
   onOpenTune,
+  lifecyclePending = false,
   enabledLenses,
   availableFolders,
   onFolderChange,
@@ -482,27 +484,23 @@ export function EditorTopBar({
   const demoteTarget = effectiveMode === 'alerting' ? 'live' : 'staging';
 
   return (
-    // NAN-3241: `@container` so the right-hand controls compact by the bar's
-    // own width (the inspector / pivt panel narrows it, not the viewport),
-    // and every badge / control is shrink-0 so nothing overlaps — only the
-    // title truncates.
-    <div className="@container border-b border-border bg-background shrink-0">
-      <div className="h-12 flex min-w-0 items-center overflow-hidden px-4 gap-3">
+    <div className="border-b border-border bg-background shrink-0">
+      <div className="h-12 flex items-center px-4 gap-3">
         <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={onBack} aria-label="Back">
           <ArrowLeft className="w-3.5 h-3.5" strokeWidth={1.75} />
         </Button>
 
-        <div className="flex items-center gap-2 min-w-0 flex-1 overflow-hidden">
-          <div className="min-w-0 text-[14px] font-mono font-semibold text-foreground truncate" title={title}>{title}</div>
+        <div className="flex items-center gap-2 min-w-0 flex-1">
+          <div className="text-[14px] font-mono font-semibold text-foreground truncate">{title}</div>
           {!isNewMode && <ModePill mode={effectiveMode} />}
           {archived && (
-            <span className="inline-flex shrink-0 items-center whitespace-nowrap h-5 px-1.5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em] uppercase bg-muted text-muted-foreground">
+            <span className="inline-flex items-center h-5 px-1.5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em] uppercase bg-muted text-muted-foreground">
               ARCHIVED
             </span>
           )}
           {dirty && (
             <span
-              className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap h-5 px-1.5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em] text-[var(--warning)]"
+              className="inline-flex items-center gap-1 h-5 px-1.5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em] text-[var(--warning)]"
               style={{ background: 'color-mix(in srgb, var(--warning) 15%, transparent)' }}
             >
               <span className="w-1.5 h-1.5 rounded-full bg-[var(--warning)]" />
@@ -511,7 +509,7 @@ export function EditorTopBar({
           )}
           {isNewMode && (
             <span
-              className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap h-5 px-1.5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em] text-[var(--primary)]"
+              className="inline-flex items-center gap-1 h-5 px-1.5 rounded-[3px] text-[10px] font-mono font-semibold tracking-[0.08em] text-[var(--primary)]"
               style={{ background: 'color-mix(in srgb, var(--primary) 15%, transparent)' }}
             >
               DRAFT
@@ -541,33 +539,33 @@ export function EditorTopBar({
                       ? 'hover:text-foreground'
                       : 'opacity-40 cursor-not-allowed',
                 )}
-                title={!enabled ? `${m.toUpperCase()} view coming soon` : m.toUpperCase()}
+                title={!enabled ? `${m.toUpperCase()} view coming soon` : undefined}
               >
-                <Icon className={cn('w-3 h-3 shrink-0', m === 'flow' && 'rotate-90')} strokeWidth={1.75} />
-                <span className="@max-[760px]:sr-only">{m}</span>
+                <Icon className={cn('w-3 h-3', m === 'flow' && 'rotate-90')} strokeWidth={1.75} />
+                {m}
               </button>
             );
           })}
         </div>
 
-        <Separator orientation="vertical" className="h-6 shrink-0" />
+        <Separator orientation="vertical" className="h-6" />
 
         {onViewMatches && (
-          <Button variant="outline" size="sm" className="h-7 shrink-0 text-[11.5px] px-2.5 gap-1.5" onClick={onViewMatches} title="Matches">
+          <Button variant="outline" size="sm" className="h-7 text-[11.5px] px-2.5 gap-1.5" onClick={onViewMatches}>
             <Focus className="w-3 h-3" strokeWidth={1.75} />
-            <span className="@max-[980px]:sr-only">Matches</span>
+            Matches
           </Button>
         )}
         {onOpenTest && (
-          <Button variant="outline" size="sm" className="h-7 shrink-0 text-[11.5px] px-2.5 gap-1.5" onClick={onOpenTest} title="Test rule">
+          <Button variant="outline" size="sm" className="h-7 text-[11.5px] px-2.5 gap-1.5" onClick={onOpenTest}>
             <Play className="w-3 h-3" strokeWidth={1.75} />
-            <span className="@max-[980px]:sr-only">Test rule</span>
+            Test rule
           </Button>
         )}
 
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label="Rule actions">
+            <Button variant="ghost" size="icon" className="h-7 w-7" aria-label="Rule actions">
               <MoreHorizontal className="w-3.5 h-3.5" strokeWidth={1.75} />
             </Button>
           </DropdownMenuTrigger>
@@ -600,19 +598,19 @@ export function EditorTopBar({
             <DropdownMenuSeparator />
             <DropdownMenuLabel>Lifecycle</DropdownMenuLabel>
             {onPromote && promotable && (
-              <DropdownMenuItem onClick={onPromote}>
+              <DropdownMenuItem onClick={onPromote} disabled={lifecyclePending}>
                 <ArrowUp className="w-3.5 h-3.5" strokeWidth={1.75} />
                 Promote to {promoteTarget}
               </DropdownMenuItem>
             )}
             {onDemote && demotable && (
-              <DropdownMenuItem onClick={onDemote}>
+              <DropdownMenuItem onClick={onDemote} disabled={lifecyclePending}>
                 <ArrowDown className="w-3.5 h-3.5" strokeWidth={1.75} />
                 Demote to {demoteTarget}
               </DropdownMenuItem>
             )}
             {onTogglePause && (
-              <DropdownMenuItem onClick={onTogglePause}>
+              <DropdownMenuItem onClick={onTogglePause} disabled={lifecyclePending}>
                 {paused ? (
                   <>
                     <KeyRound className="w-3.5 h-3.5" strokeWidth={1.75} />
@@ -650,7 +648,7 @@ export function EditorTopBar({
         <Button
           onClick={onSave}
           disabled={!dirty || !valid || saving}
-          className={cn('h-7 shrink-0 whitespace-nowrap text-[11.5px] px-3 gap-1.5', !dirty && 'opacity-60')}
+          className={cn('h-7 text-[11.5px] px-3 gap-1.5', !dirty && 'opacity-60')}
         >
           <Save className="w-3 h-3" strokeWidth={1.75} />
           {saving ? 'Saving…' : dirty ? (isNewMode ? 'Create rule' : 'Save rule') : 'Saved'}

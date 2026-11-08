@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 //! Persistence scenario — multiple persistence mechanisms.
 //!
 //! All scripted sysmon steps route through `process_create_step` (NAN-1058);

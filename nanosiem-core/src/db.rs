@@ -3,14 +3,13 @@
 //! Database connection and pool management
 
 pub mod clickhouse_migrate;
+pub mod clickhouse_transport;
 pub mod config;
-pub mod contention;
-pub mod connection_budget;
 pub mod dual_pool;
-pub mod edition_sql;
+pub mod future_timestamp_repair;
+pub mod migration_refresh;
 pub mod migrations;
 pub mod pool;
-pub mod pooler;
 pub mod repo_error;
 pub mod repo_store;
 pub mod repository;
@@ -19,8 +18,8 @@ pub use clickhouse_migrate::{ClickHouseMigrateError, ClickHouseMigrator};
 pub use config::DatabaseConfig;
 pub use dual_pool::{DualPool, DualPoolConfig, DualPoolError, HealthStatus, TableNames};
 pub use migrations::{
-    embedded_postgres_versions, run_postgres_migrations, verify_postgres_schema_head, MigrationError,
-    MigrationMode, SchemaHeadError,
+    ensure_migrator_is_current, ensure_postgres_schema_is_current, run_postgres_migrations,
+    MigrationError, MigrationMode, SchemaCheckError,
 };
 pub use pool::Database;
 pub use repo_error::RepoError;

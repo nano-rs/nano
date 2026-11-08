@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
+import { LogSourcesTabs } from '@/components/add-data/LogSourcesTabs';
+import { isListenerConfigType } from '@/lib/ingestion-paths';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
@@ -30,7 +32,6 @@ import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
-import { nplQuotedBody } from '@/lib/npl-quote';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -68,10 +69,7 @@ import {
 } from '@/components/ui/tooltip';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
-import { useIngestGate } from '@/hooks/use-capabilities';
-import { TenzirOnlyNote, TENZIR_ONLY_NOTE } from '@/components/add-data/TenzirOnlyNote';
 import { api } from '@/lib/api';
-import { buildConnectionSummary } from '@/lib/sender-config';
 import type {
   LogSource,
   MatchFieldPreset,
@@ -108,7 +106,7 @@ const TRANSPORT_LABEL: Record<string, string> = {
   gcp_pubsub: 'GCP Pub/Sub',
   azure_event_hubs: 'Azure Event Hubs',
   kafka: 'Kafka',
-  splunk_hec: 'HEC',
+  splunk_hec: 'Splunk HEC',
 };
 
 // Backend match_type values, with friendlier UI labels.
@@ -135,7 +133,7 @@ const matchTypeMeta = (value: string) =>
 const CANONICAL_MATCH_FIELD: Partial<Record<SourceConfigType, { field: string; hint: string }>> = {
   http: { field: 'source_type', hint: 'Routes from the X-Source-Type header.' },
   vector: { field: 'source_type', hint: 'Vector tag/source_type.' },
-  splunk_hec: { field: 'sourcetype', hint: 'HEC sourcetype field.' },
+  splunk_hec: { field: 'sourcetype', hint: 'Splunk HEC sourcetype field.' },
   kafka: { field: 'topic', hint: 'Kafka topic name.' },
   aws_s3: { field: 'bucket', hint: 'S3 bucket name.' },
   gcp_pubsub: { field: 'subscription', hint: 'GCP Pub/Sub subscription name.' },
@@ -196,7 +194,7 @@ const BINDING_CALLOUT: Partial<
 // not a new socket. Only one HEC routing config is expected per
 // deployment; backend rejects duplicates with 409.
 const HEC_BINDING_CALLOUT =
-  'HEC events arrive on the platform-managed listener (:8088, shared token). This config decides how each event is routed based on its sourcetype. Only one HEC routing config is supported per deployment.';
+  'Splunk HEC events arrive on the platform-managed listener (:8088, shared token). This config decides how each event is routed based on its sourcetype. Only one HEC routing config is supported per deployment.';
 
 const ROUTING_MODEL_DOCS_URL = 'https://nano.rs/docs/integrations/routing-model';
 
@@ -260,20 +258,11 @@ export default function SourceConfigurationDetail() {
 
   const canEdit = hasPermission('source_configs:edit');
   const canDeploy = hasPermission('source_configs:deploy');
-  // NAN-3844: a source configuration is a Vector listener. Tenzir-only (or not
-  // known yet): enabling and deploying are off; disable / undeploy stay.
-  const { tenzirOnly, blocked: vectorBlocked } = useIngestGate();
 
   const { data: config, isLoading, refetch } = useQuery({
     queryKey: ['sourceConfig', id],
     queryFn: () => api.getSourceConfigWithRules(id!),
     enabled: !!id,
-  });
-  const { data: activeSchema } = useQuery({
-    queryKey: ['schema-fields'],
-    queryFn: () => api.getSchemaFields(),
-    staleTime: Infinity,
-    gcTime: Infinity,
   });
 
   const { data: logSources = [] } = useQuery({
@@ -635,26 +624,24 @@ export default function SourceConfigurationDetail() {
   return (
     <TooltipProvider delayDuration={200}>
       <div className="-m-3 flex h-[calc(100%+1.5rem)] min-h-0 flex-col overflow-hidden [contain:layout]">
+        {/* NAN-4941: a source configuration opens inside Log Sources; push
+            listeners belong to the Credentials tab, pull transports to Cloud pull. */}
+        <LogSourcesTabs active={isListenerConfigType(config.config_type) ? 'credentials' : 'cloud-pull'} />
         <SourceConfigHeader
           config={config}
           hasPendingChanges={hasPendingChanges}
           pendingChanges={pendingChanges}
           canEdit={canEdit}
           canDeploy={canDeploy}
-          vectorBlocked={vectorBlocked}
           onToggle={(enabled) => toggleMutation.mutate({ enabled })}
           onDeploy={() => setDeployTargetOpen(true)}
           onUndeploy={() => setUndeployTargetOpen(true)}
           onOpenConnection={() => setEditConnectionOpen(true)}
-          onViewLogs={() => {
-            const field = activeSchema?.schema === 'ocsf' ? 'metadata.log_source' : 'source_type';
-            const targets = [...new Set(config.routing_rules.map((rule) => rule.target_source_type).filter(Boolean))];
-            const query = targets.map((target) => `${field}="${nplQuotedBody(target)}"`).join(' OR ');
-            navigate(query ? `/search#q=${encodeURIComponent(query)}&run=true` : '/search');
-          }}
+          onViewLogs={() =>
+            navigate(`/search#source_type=${encodeURIComponent(config.config_type)}`)
+          }
           telemetry={config as AccessTelemetry}
         />
-        {tenzirOnly && <TenzirOnlyNote className="mx-4 mt-3" />}
 
         {/* NAN-649: pull-source binding callout + mode switcher. HTTP / Vector
             (push sources) skip this entirely and render the legacy UI. */}
@@ -937,7 +924,6 @@ function SourceConfigHeader({
   pendingChanges,
   canEdit,
   canDeploy,
-  vectorBlocked,
   onToggle,
   onDeploy,
   onUndeploy,
@@ -950,7 +936,6 @@ function SourceConfigHeader({
   pendingChanges: string[];
   canEdit: boolean;
   canDeploy: boolean;
-  vectorBlocked: boolean;
   onToggle: (enabled: boolean) => void;
   onDeploy: () => void;
   onUndeploy: () => void;
@@ -963,6 +948,13 @@ function SourceConfigHeader({
   const eps = computeEps(config.events_24h);
   const bytesPerDay = telemetry.bytes_per_day_24h;
   const lastEventAt = telemetry.last_event_at;
+  // NAN-4936: a deploy Vector could not build (quarantined) or never
+  // confirmed is surfaced with its reason, not hidden behind "Ready".
+  const last = config.last_deployment;
+  const lastDeployFailure =
+    last && last.action === 'deploy' && ['quarantined', 'quarantine_unconfirmed', 'failure', 'unconfirmed'].includes(last.status)
+      ? last.error_message || last.status
+      : null;
 
   return (
     <div className="shrink-0 border-b border-border bg-card/40 px-4 py-3 flex items-center gap-4">
@@ -1014,6 +1006,17 @@ function SourceConfigHeader({
             {config.description}
           </div>
         )}
+        {lastDeployFailure && (
+          <div
+            className="mt-1 flex items-start gap-1.5 max-w-[760px] text-[11px] text-red-500"
+            data-testid="source-config-deploy-failure"
+          >
+            <span className="shrink-0 font-mono text-[10px] uppercase tracking-wider font-semibold mt-px">
+              {config.last_deployment?.status?.startsWith('quarantine') ? 'Quarantined' : 'Last deploy failed'}
+            </span>
+            <span className="font-mono text-[10.5px] break-words">{lastDeployFailure}</span>
+          </div>
+        )}
       </div>
 
       <div className="flex-1" />
@@ -1057,7 +1060,6 @@ function SourceConfigHeader({
         {canEdit && (
           <EnabledToggle
             checked={config.enabled}
-            blocked={vectorBlocked && !config.enabled}
             onClick={() => onToggle(!config.enabled)}
           />
         )}
@@ -1094,8 +1096,7 @@ function SourceConfigHeader({
             size="sm"
             className="h-[28px] px-3 text-[11.5px]"
             onClick={onDeploy}
-            disabled={(!hasPendingChanges && config.deployed) || vectorBlocked}
-            title={vectorBlocked ? TENZIR_ONLY_NOTE : undefined}
+            disabled={!hasPendingChanges && config.deployed}
           >
             <Rocket className="h-3 w-3" />
             {config.deployed ? 'Deploy changes' : 'Deploy'}
@@ -1150,12 +1151,9 @@ function HeaderStat({
 
 function EnabledToggle({
   checked,
-  blocked = false,
   onClick,
 }: {
   checked: boolean;
-  /** NAN-3844: enabling needs Vector. */
-  blocked?: boolean;
   onClick: () => void;
 }) {
   return (
@@ -1164,12 +1162,10 @@ function EnabledToggle({
         <button
           type="button"
           onClick={onClick}
-          disabled={blocked}
           aria-pressed={checked}
           className={cn(
             'w-[30px] h-[17px] rounded-full flex items-center transition-colors relative shrink-0 mr-1',
             checked ? 'bg-primary' : 'bg-foreground/[0.05] border border-border',
-            blocked && 'opacity-50 cursor-not-allowed',
           )}
         >
           <span
@@ -1181,7 +1177,7 @@ function EnabledToggle({
         </button>
       </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={6} className="text-[11px]">
-        {blocked ? TENZIR_ONLY_NOTE : checked ? 'Disable transport' : 'Enable transport'}
+        {checked ? 'Disable transport' : 'Enable transport'}
       </TooltipContent>
     </Tooltip>
   );
@@ -1331,6 +1327,148 @@ function ConnectionField({
       {children}
     </div>
   );
+}
+
+interface ConnectionSummary {
+  method?: string;
+  display: string;
+  full?: string;
+  authLabel?: string;
+  auth?: string;
+  headers?: Array<{ key: string; value: string; hint?: string }>;
+  snippet?: string;
+  usesPlaceholderHost: boolean;
+}
+
+function buildConnectionSummary(config: SourceConfigurationWithRules): ConnectionSummary {
+  const cc = config.connection_config ?? {};
+  const HOST = '{your-ingest-host}';
+  const usesPlaceholderHost = true;
+
+  switch (config.config_type) {
+    case 'http': {
+      const port = (cc.port as number | string) ?? 9090;
+      const path = (cc.path as string) ?? '/ingest';
+      const full = `https://${HOST}:${port}${path}`;
+      return {
+        method: 'POST',
+        full,
+        display: `POST ${path}`,
+        authLabel: 'Auth',
+        auth: 'Bearer ${NANO_INGEST_TOKEN}',
+        headers: [
+          { key: 'Content-Type', value: 'application/json' },
+          {
+            key: 'X-Source-Type',
+            value: '<source_type>',
+            hint: 'matched by routing rules',
+          },
+        ],
+        snippet: [
+          `curl -X POST ${full} \\`,
+          `  -H 'Authorization: Bearer $NANO_INGEST_TOKEN' \\`,
+          `  -H 'Content-Type: application/json' \\`,
+          `  -H 'X-Source-Type: aws_cloudtrail' \\`,
+          `  -d '{"eventSource":"s3.amazonaws.com",…}'`,
+        ].join('\n'),
+        usesPlaceholderHost,
+      };
+    }
+    case 'vector': {
+      const address = (cc.address as string) ?? `${HOST}:6000`;
+      return {
+        method: 'SOCKET',
+        full: `vector://${address}`,
+        display: `Vector ${address.includes(':') ? address : ':6000'}`,
+        authLabel: 'Auth',
+        auth: 'mTLS (certificate pinned)',
+        headers: [],
+        snippet: [
+          '# In your upstream Vector config:',
+          '[sinks.nano]',
+          'type      = "vector"',
+          `address   = "${address}"`,
+          'inputs    = ["your_source"]',
+          'tls.enabled = true',
+        ].join('\n'),
+        usesPlaceholderHost,
+      };
+    }
+    case 'aws_s3': {
+      const sqs = (cc.sqs_queue_url as string) ?? `arn:aws:sqs:us-east-1:••••:nano-ingest`;
+      return {
+        method: 'SQS',
+        full: sqs,
+        display: 'SQS-driven',
+        authLabel: 'Assume role',
+        auth: config.credential_id
+          ? `credential ${config.credential_id}`
+          : '(no credential attached)',
+        headers: [],
+        snippet: [
+          '# S3 event notifications → SQS → nano poller',
+          '# Configure in the S3 bucket properties:',
+          'Event type: s3:ObjectCreated:*',
+          `Destination: ${sqs}`,
+          'Then grant sqs:ReceiveMessage to the assumed role above.',
+        ].join('\n'),
+        usesPlaceholderHost: false,
+      };
+    }
+    case 'gcp_pubsub': {
+      const project = (cc.project as string) ?? '<project>';
+      const subscription = (cc.subscription as string) ?? '<subscription>';
+      const full = subscription.startsWith('projects/')
+        ? subscription
+        : `projects/${project}/subscriptions/${subscription}`;
+      return {
+        method: 'SUB',
+        full,
+        display: 'Pub/Sub subscription',
+        authLabel: 'Google credentials',
+        auth: config.credential_id
+          ? `credential ${config.credential_id}`
+          : '(no credential attached)',
+        headers: [],
+        usesPlaceholderHost: false,
+      };
+    }
+    case 'kafka': {
+      const bootstrap = (cc.bootstrap_servers as string) ?? '<bootstrap>';
+      const topics = ((cc.topics as string[]) ?? []).join(', ') || '<topics>';
+      return {
+        method: 'CONSUME',
+        full: `bootstrap=${bootstrap}  topics=${topics}`,
+        display: 'Kafka consumer',
+        authLabel: 'Auth',
+        auth: config.credential_id
+          ? `credential ${config.credential_id}`
+          : 'SASL_SSL / SCRAM-SHA-512',
+        headers: [],
+        usesPlaceholderHost: false,
+      };
+    }
+    case 'splunk_hec': {
+      const port = (cc.port as number | string) ?? 8088;
+      const full = `https://${HOST}:${port}/services/collector/event`;
+      return {
+        method: 'POST',
+        full,
+        display: `Splunk HEC :${port}`,
+        authLabel: 'Auth',
+        auth: 'Splunk HEC token (rotate via credentials)',
+        headers: [{ key: 'Authorization', value: 'Splunk <token>' }],
+        snippet: [
+          `curl -X POST ${full} \\`,
+          `  -H 'Authorization: Splunk $HEC_TOKEN' \\`,
+          `  -d '{"event":{…},"sourcetype":"okta:log"}'`,
+        ].join('\n'),
+        usesPlaceholderHost,
+      };
+    }
+    default:
+      return { display: 'No endpoint summary', usesPlaceholderHost: false };
+  }
 }
 
 // ============================================================================
@@ -1903,14 +2041,14 @@ function DispatchedSources({
           </span>
         ) : (
           dispatched.map((ls) => (
-            <Link
+            <a
               key={ls.id}
-              to={`/ingestion/log-sources/${ls.id}`}
+              href={`/ingestion/log-sources/${ls.id}`}
               className="font-mono text-[10.5px] text-foreground/80 bg-card border border-border rounded px-2 py-1 hover:border-primary/40 hover:text-primary transition-colors inline-flex items-center gap-1"
             >
               {ls.name}
               <ArrowUpRight className="w-[9px] h-[9px] opacity-60" />
-            </Link>
+            </a>
           ))
         )}
       </div>

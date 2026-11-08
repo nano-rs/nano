@@ -16,44 +16,6 @@ use super::error::MarketplaceError;
 use super::repository::MarketplaceRepository;
 use super::types::*;
 use crate::crypto::EncryptionService;
-use crate::inputlookup::SsrfValidator;
-
-/// NAN-3490: a connector-runtime entry runs on the nano-connector engine,
-/// which ships in every edition, so the Deno/collector edition gate does not
-/// apply to it. Everything else must pass `ensure_backend_available`.
-fn ensure_installable(
-    entry: &MarketplaceCatalogEntry,
-    backend: ExecutionBackend,
-    slug: &str,
-) -> Result<(), MarketplaceError> {
-    if entry.is_connector_runtime() {
-        return Ok(());
-    }
-    ensure_backend_available(backend, slug)
-}
-
-/// Refuse to install an entry whose backend this edition cannot run.
-///
-/// NAN-3463: a Deno-backed feed is stored in `custom_enrichments` and executed
-/// by the enterprise custom-enrichment sandbox, and a collector runs from
-/// `integration_instances`, which only the enterprise integrations routes
-/// create. None of these exists in the open edition, so the install, sync or
-/// uninstall used to fail with a 500 (`relation ... does not exist`). Native
-/// and identity backends are open.
-fn ensure_backend_available(backend: ExecutionBackend, slug: &str) -> Result<(), MarketplaceError> {
-    if cfg!(feature = "enterprise") {
-        return Ok(());
-    }
-    match backend {
-        ExecutionBackend::Deno => Err(MarketplaceError::BackendUnavailable(format!(
-            "'{slug}' is a custom-enrichment feed, which requires the enterprise edition"
-        ))),
-        ExecutionBackend::Collector => Err(MarketplaceError::BackendUnavailable(format!(
-            "'{slug}' is a pull collector, which requires the enterprise edition"
-        ))),
-        ExecutionBackend::Native | ExecutionBackend::Identity => Ok(()),
-    }
-}
 
 /// Service for installing/uninstalling enrichments from the marketplace
 pub struct MarketplaceInstallService {
@@ -88,8 +50,20 @@ impl MarketplaceInstallService {
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
         let entry = self.repository.get_catalog_entry(slug).await?;
 
+        // NAN-4959: IPinfo Lite, ThreatFox and Tor come only from nano's signed
+        // platform feed bundle; no direct fetcher installs for them.
+        if super::platform_feed::bundle_feed_for_slug(&entry.slug).is_some() {
+            return Err(MarketplaceError::ProvidedByPlatformFeed(entry.slug));
+        }
+
         if entry.installed {
             return Err(MarketplaceError::AlreadyInstalled(slug.to_string()));
+        }
+
+        // NAN-4946: content installs only from nano's first-party catalogs.
+        if let Some(repo_id) = entry.repository_id {
+            let repo = self.repository.get_repo(repo_id).await?;
+            super::first_party::validate_first_party_repo_url(&repo.url)?;
         }
 
         // Backend-specific install logic
@@ -97,9 +71,6 @@ impl MarketplaceInstallService {
             .execution_backend
             .parse()
             .map_err(|e: String| MarketplaceError::Internal(e))?;
-
-        let connector = entry.is_connector_runtime();
-        ensure_installable(&entry, backend, slug)?;
 
         // Check credential requirements
         let req: CredentialRequirement = entry
@@ -119,9 +90,8 @@ impl MarketplaceInstallService {
             return Err(MarketplaceError::CredentialRequired);
         }
 
-        // NAN-2343: same validation the update path runs, before anything is
-        // written. An install that stores a malformed download URL is exactly
-        // as broken as an update that does.
+        // Same validation the update path runs, before anything is written
+        // (NAN-2343, NAN-4959).
         if let Some(ref creds) = request.credentials {
             validate_credential_values(&entry, creds)?;
         }
@@ -135,9 +105,6 @@ impl MarketplaceInstallService {
         };
 
         match backend {
-            // NAN-3490: nothing to provision. The connector service reads the
-            // spec from this row's config when an operator configures a feed.
-            _ if connector => {}
             ExecutionBackend::Deno => {
                 self.install_deno_enrichment(&entry, request, user_id)
                     .await?;
@@ -190,19 +157,23 @@ impl MarketplaceInstallService {
             .map_err(|e: String| MarketplaceError::Internal(e))?;
 
         match backend {
-            // NAN-3490: the connector service owns its feeds and stops
-            // running them once the catalog row is no longer installed. Where
-            // this edition has the Deno/collector tables, fall through anyway:
-            // an entry installed under Deno and later switched to the
-            // connector runtime still has legacy rows to disable.
-            _ if entry.is_connector_runtime() && ensure_backend_available(backend, slug).is_err() => {}
             ExecutionBackend::Deno => {
                 // Disable the custom enrichment
                 if let Some(ce_id) = entry.custom_enrichment_id {
+                    // NAN-4946: uninstall removes the install's secrets; an
+                    // install-time config override may carry credentials.
+                    let config: Option<(serde_json::Value,)> =
+                        sqlx::query_as("SELECT config FROM custom_enrichments WHERE id = $1")
+                            .bind(ce_id)
+                            .fetch_optional(&self.pool)
+                            .await?;
+                    let mut config = config.map(|(c,)| c).unwrap_or(serde_json::Value::Null);
+                    crate::config_secrets::strip_config_secrets(&mut config);
                     sqlx::query(
-                        "UPDATE custom_enrichments SET enabled = false, status = 'draft' WHERE id = $1",
+                        "UPDATE custom_enrichments SET enabled = false, status = 'draft', config = COALESCE($2, config) WHERE id = $1",
                     )
                     .bind(ce_id)
+                    .bind(if config.is_null() { None } else { Some(config) })
                     .execute(&self.pool)
                     .await?;
                 }
@@ -210,10 +181,18 @@ impl MarketplaceInstallService {
             ExecutionBackend::Native => {
                 if let Some(ref source_id) = entry.native_source_id {
                     // Try agent_enrichment_providers first, then enrichment_sources
-                    let rows = self.set_agent_provider_enabled(source_id, false).await?;
+                    let rows = sqlx::query(
+                        "UPDATE agent_enrichment_providers SET enabled = false, api_key_encrypted = NULL WHERE id = $1",
+                    )
+                    .bind(source_id)
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected();
 
                     if rows == 0 {
-                        sqlx::query("UPDATE enrichment_sources SET enabled = false WHERE id = $1")
+                        // A download URL carrying a provider token (IPinfo
+                        // `?token=`) is a credential; a public default URL stays.
+                        sqlx::query("UPDATE enrichment_sources SET enabled = false, download_url = CASE WHEN download_url ~* '[?&]token=' THEN NULL ELSE download_url END WHERE id = $1")
                             .bind(source_id)
                             .execute(&self.pool)
                             .await?;
@@ -222,7 +201,7 @@ impl MarketplaceInstallService {
             }
             ExecutionBackend::Identity => {
                 if let Some(ref provider_id) = entry.identity_provider_id {
-                    sqlx::query("UPDATE identity_providers SET enabled = false WHERE id = $1")
+                    sqlx::query("UPDATE identity_providers SET enabled = false, credentials_encrypted = NULL WHERE id = $1")
                         .bind(provider_id)
                         .execute(&self.pool)
                         .await?;
@@ -235,7 +214,7 @@ impl MarketplaceInstallService {
                 // Dropping those would silently restart collection from "now"
                 // on reinstall, losing everything in between.
                 sqlx::query(
-                    "UPDATE integration_instances SET enabled = false, updated_at = NOW() WHERE catalog_id = $1",
+                    "UPDATE integration_instances SET enabled = false, credentials_encrypted = NULL, credentials_nonce = NULL, updated_at = NOW() WHERE catalog_id = $1",
                 )
                 .bind(entry.id)
                 .execute(&self.pool)
@@ -247,13 +226,20 @@ impl MarketplaceInstallService {
             .repository
             .set_installed(slug, false, None, None)
             .await?;
-        info!(slug = %slug, "Uninstalled enrichment from marketplace");
+        // NAN-4946: uninstall deletes the stored credentials (set_installed
+        // keeps them by COALESCE for the install / configure paths).
+        let updated = self.repository.clear_credentials(&updated.slug).await?;
+        info!(slug = %slug, "Uninstalled enrichment from marketplace; credentials removed");
         Ok(updated)
     }
 
     /// Trigger data sync for an installed enrichment
     pub async fn trigger_sync(&self, slug: &str) -> Result<(), MarketplaceError> {
         let entry = self.repository.get_catalog_entry(slug).await?;
+
+        if super::platform_feed::bundle_feed_for_slug(&entry.slug).is_some() {
+            return Err(MarketplaceError::ProvidedByPlatformFeed(entry.slug));
+        }
 
         if !entry.installed {
             return Err(MarketplaceError::NotInstalled(slug.to_string()));
@@ -265,11 +251,6 @@ impl MarketplaceInstallService {
             .map_err(|e: String| MarketplaceError::Internal(e))?;
 
         match backend {
-            // NAN-3490: connector runs go through the connector service's
-            // scheduler, not the Deno run tables.
-            _ if entry.is_connector_runtime() => {
-                info!(slug = %slug, "Connector-runtime entry: runs are scheduled by the connector service");
-            }
             ExecutionBackend::Deno => {
                 if let Some(ce_id) = entry.custom_enrichment_id {
                     // Trigger a run via custom_enrichment_runs
@@ -344,9 +325,6 @@ impl MarketplaceInstallService {
             .map_err(|e: String| MarketplaceError::Internal(e))?;
 
         match backend {
-            // NAN-3490: sync already wrote the new spec into the catalog row,
-            // which is where the connector service reads it.
-            _ if entry.is_connector_runtime() => {}
             ExecutionBackend::Deno => {
                 // Re-deploy code from catalog to custom_enrichments
                 if let Some(ce_id) = entry.custom_enrichment_id {
@@ -406,18 +384,17 @@ impl MarketplaceInstallService {
     ) -> Result<(), MarketplaceError> {
         let entry = self.repository.get_catalog_entry(slug).await?;
 
-        // NAN-2343: validate BEFORE anything is persisted, so a bad value never
-        // reaches the catalog ciphertext or the operational column. Previously
-        // the only feedback was a sync failure minutes-to-hours later, reported
-        // as an SSRF rejection.
-        //
-        // Ordered ahead of the masked/empty shortcut deliberately: a payload of
-        // `{"download_url": ""}` is "empty" by that guard's reckoning and would
-        // return success having written nothing, so clearing the field and
-        // saving reported "Credentials saved" while the broken URL stayed put.
-        // The validator passes masked sentinels through untouched so the
-        // NAN-1107 skip below still owns that case.
+        // Validate BEFORE anything is persisted (NAN-2343), and ahead of the
+        // masked/empty shortcut so `{"download_url": ""}` is refused rather
+        // than reported saved (NAN-4959: native entries take no download URL).
         validate_credential_values(&entry, credentials)?;
+
+        // NAN-4959: a bundle-provided feed takes no credentials (no direct pull).
+        if super::platform_feed::bundle_feed_for_slug(&entry.slug).is_some()
+            && !credentials_payload_is_masked_or_empty(credentials)
+        {
+            return Err(MarketplaceError::ProvidedByPlatformFeed(entry.slug));
+        }
 
         if credentials_payload_is_masked_or_empty(credentials) {
             // Promoted from info! — under correct frontend operation the
@@ -428,7 +405,7 @@ impl MarketplaceInstallService {
             // breadcrumb so the next regression is loud, not silent.
             tracing::warn!(
                 slug = %slug,
-                "Skipping credential update — payload contains only empty values or masked placeholders"
+                "Skipping credential update — payload contains only empty values or masked placeholders (NAN-1107)"
             );
             return Ok(());
         }
@@ -467,12 +444,10 @@ impl MarketplaceInstallService {
     /// Push credential fields that a native backend reads from its own table
     /// rather than from `marketplace_catalog.credentials_encrypted`.
     ///
-    /// NAN-2343: shared by `install` and `update_credentials`. Previously only
-    /// the update path did this, so a `download_url` supplied in the install
-    /// dialog was encrypted into the catalog and never reached
-    /// `enrichment_sources` — the source stayed unconfigured while the UI
-    /// showed a `CONFIGURED` badge (which only proves catalog ciphertext
-    /// exists). Callers must have run [`validate_credential_values`] first.
+    /// NAN-2343: shared by `install` and `update_credentials`, so a value
+    /// supplied in the install dialog reaches the backend's table and not only
+    /// the catalog ciphertext. Callers must have run
+    /// [`validate_credential_values`] first.
     async fn push_native_credentials(
         &self,
         entry: &MarketplaceCatalogEntry,
@@ -485,27 +460,12 @@ impl MarketplaceInstallService {
             return Ok(());
         };
 
-        // IPinfo uses download_url on enrichment_sources. Delegated to the
-        // enrichment repository rather than re-issuing the UPDATE here, so the
-        // clear-error / re-queue-on-change semantics have exactly one
-        // definition and cannot drift between the two configure surfaces that
-        // write this column (NAN-2343).
-        if let Some(url) = credentials.get("download_url").and_then(|v| v.as_str()) {
-            crate::enrichment::EnrichmentRepository::new(self.pool.clone())
-                .update_source_url(source_id, url)
-                .await
-                .map_err(|e| {
-                    MarketplaceError::Internal(format!("Failed to update download URL: {e}"))
-                })?;
-        }
+        // NAN-4959: no `download_url` is pushed to `enrichment_sources`; IPinfo
+        // Lite comes only from the platform feed bundle (validate_credential_values
+        // refuses one).
 
         // Agent providers use api_key on agent_enrichment_providers
-        // The column stores JSON-encoded {"ciphertext": "...", "nonce": "..."} bytes.
-        // That table is enterprise-only (NAN-3463); the open edition keeps the
-        // key only in the catalog row's encrypted credentials.
-        if !cfg!(feature = "enterprise") {
-            return Ok(());
-        }
+        // The column stores JSON-encoded {"ciphertext": "...", "nonce": "..."} bytes
         if let Some(api_key) = credentials.get("API_KEY").and_then(|v| v.as_str()) {
             let encrypted = self.encryption.encrypt(api_key.as_bytes()).map_err(|e| {
                 MarketplaceError::Internal(format!("Failed to encrypt API key: {}", e))
@@ -630,28 +590,6 @@ impl MarketplaceInstallService {
         Ok(())
     }
 
-    /// Enable or disable a native agent enrichment provider; returns the rows
-    /// changed. `agent_enrichment_providers` is created by the enterprise
-    /// overlay only, so the open edition has none and native entries resolve
-    /// to `enrichment_sources` (NAN-3463).
-    async fn set_agent_provider_enabled(
-        &self,
-        source_id: &str,
-        enabled: bool,
-    ) -> Result<u64, MarketplaceError> {
-        if !cfg!(feature = "enterprise") {
-            return Ok(0);
-        }
-        Ok(
-            sqlx::query("UPDATE agent_enrichment_providers SET enabled = $2 WHERE id = $1")
-                .bind(source_id)
-                .bind(enabled)
-                .execute(&self.pool)
-                .await?
-                .rows_affected(),
-        )
-    }
-
     /// Install a native-backed enrichment by enabling the underlying source
     async fn install_native_enrichment(
         &self,
@@ -659,7 +597,12 @@ impl MarketplaceInstallService {
     ) -> Result<(), MarketplaceError> {
         if let Some(ref source_id) = entry.native_source_id {
             // Try agent_enrichment_providers first
-            let rows = self.set_agent_provider_enabled(source_id, true).await?;
+            let rows =
+                sqlx::query("UPDATE agent_enrichment_providers SET enabled = true WHERE id = $1")
+                    .bind(source_id)
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected();
 
             if rows == 0 {
                 // Try enrichment_sources — also clear last_sync_status so the
@@ -743,24 +686,17 @@ fn credentials_payload_is_masked_or_empty(credentials: &serde_json::Value) -> bo
     })
 }
 
-/// Validate credential values that a backend will later hand to a fetcher, so
-/// a malformed one is rejected at save time (NAN-2343).
+/// Refuse credential values no backend may store.
 ///
-/// Scoped to `native` entries. `download_url` is the one credential name whose
-/// shape this crate actually knows — it is copied into an operational column a
-/// background job dereferences — but the name is not reserved, so imposing
-/// IPinfo's http/https + SSRF contract on a third-party Deno or collector
-/// manifest that happens to use it would reject values that are perfectly
-/// valid for that backend.
+/// NAN-4959: IPinfo Lite is served only from nano's signed platform feed
+/// bundle, so a native entry has no bring-your-own `download_url` (an IPinfo
+/// token URL). Any non-null value is refused with a 422 naming the field, so
+/// no client can reintroduce one through the configure or install path; the
+/// catalog entry no longer declares the field (migration 311). Null reads as
+/// absent and masked sentinels keep the NAN-1107 silent no-op.
 ///
-/// Deliberately uses the **synchronous** [`SsrfValidator::validate_url`] rather
-/// than `validate_with_dns`. That covers the entire reported failure class —
-/// parse failures, bad schemes, literal loopback/metadata targets — without
-/// making a credential save depend on live DNS, which would fail on a
-/// transient resolver blip or in an air-gapped deployment. The full DNS-aware
-/// check plus address pinning still runs at fetch time, where it has to run
-/// regardless: DNS can change between save and fetch, so a save-time
-/// resolution proves nothing about the eventual connection.
+/// Scoped to `native` entries: `download_url` is not a reserved name, and a
+/// first-party Deno or collector manifest may legitimately use it.
 fn validate_credential_values(
     entry: &MarketplaceCatalogEntry,
     credentials: &serde_json::Value,
@@ -768,49 +704,16 @@ fn validate_credential_values(
     if entry.execution_backend != "native" {
         return Ok(());
     }
-
-    let Some(value) = credentials.get("download_url") else {
-        // Absent means "not being changed" — the stored value stands.
-        return Ok(());
-    };
-
-    // Explicit JSON null reads as absent too, matching how
-    // `credentials_payload_is_masked_or_empty` classifies it. A client that
-    // sends nulls for untouched fields must keep getting the silent no-op
-    // rather than a 422.
-    if value.is_null() {
-        return Ok(());
+    match credentials.get("download_url") {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(serde_json::Value::String(s)) if is_masked_sentinel(s) => Ok(()),
+        Some(_) => Err(MarketplaceError::InvalidCredential {
+            field: "download_url".to_string(),
+            reason: "IPinfo Lite comes from nano's signed platform feed bundle; \
+                     there is no download URL to configure"
+                .to_string(),
+        }),
     }
-
-    let invalid = |reason: &str| MarketplaceError::InvalidCredential {
-        field: "download_url".to_string(),
-        reason: reason.to_string(),
-    };
-
-    let Some(url) = value.as_str() else {
-        // A number/bool/object/null would otherwise be dropped silently by the
-        // `as_str()` on the write path: accepted, never stored, reported saved.
-        return Err(invalid("must be a string"));
-    };
-
-    // Present-but-blank is a real submission (the operator cleared the field),
-    // not an absent one. Storing it would persist an empty string, which parses
-    // as `RelativeUrlWithoutBase` and reads back as an SSRF rejection.
-    if url.trim().is_empty() {
-        return Err(invalid("must not be empty"));
-    }
-
-    // A masked sentinel is a frontend round-tripping its own placeholder, which
-    // `credentials_payload_is_masked_or_empty` skips by design (NAN-1107).
-    // Rejecting it here would turn that silent, intentional no-op into a 422.
-    if is_masked_sentinel(url) {
-        return Ok(());
-    }
-
-    SsrfValidator::http_allowed_validator()
-        .validate_url(url)
-        .map(|_| ())
-        .map_err(|e| invalid(&e.to_string()))
 }
 
 #[cfg(test)]

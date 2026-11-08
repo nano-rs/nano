@@ -1,0 +1,4 @@
+{
+  "_doc": "Cross-version OCSF renames (NAN-4903, docs/design/OCSF-CLICKHOUSE.md section 5). One entry per superseded path: rows written under an older OCSF version carry `from`; newer rows carry `to`. Field resolution queries BOTH, so a saved search or rule written with either spelling matches rows of every version without a rewrite or backfill. Add entries when an embedded contract marks an attribute @deprecated with a named replacement. Empty while only OCSF 1.9 is embedded.",
+  "aliases": []
+}

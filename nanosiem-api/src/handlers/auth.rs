@@ -14,7 +14,7 @@
 
 use axum::{
     extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode},
+    http::{header::SET_COOKIE, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -26,14 +26,13 @@ use crate::utils::{extract_client_ip, extract_user_agent};
 use nanosiem_core::audit::{
     AuditEvent, AuditSource, ClientContext, LOGIN_FAILED, LOGIN_SUCCESS, LOGOUT,
     MFA_CHALLENGE_ISSUED, PASSWORD_CHANGED, PASSWORD_RESET_COMPLETE, PASSWORD_RESET_REQUEST,
-    USER_LOCKED,
+    TOKEN_REFRESH, USER_LOCKED,
 };
 use nanosiem_core::auth::{
     AuthError, AuthResponse, LoginRequest, LoginResult, PasswordResetCompletion,
-    PasswordResetRequest, RefreshTokenRequest, TrustedTenantContext,
+    PasswordResetRequest, RefreshTokenRequest,
 };
 
-use crate::config::DeploymentMode;
 use crate::handlers::AuditExt;
 use crate::middleware::{require_session_auth, AuthContext};
 use crate::state::AppState;
@@ -41,22 +40,13 @@ use crate::state::AppState;
 // The Set-Cookie helpers (`build_access_token_cookie`,
 // `build_refresh_token_cookie`, the `clear_*` variants, and
 // `extract_refresh_token_cookie`) were lifted to nanosiem-api-lib in NAN-751
-// so that the OIDC handlers in the enterprise crate can reuse them without
+// so that the OIDC handlers in nanosiem-enterprise can reuse them without
 // creating a circular crate dependency. Re-exported here so existing
 // `crate::handlers::auth::*` imports continue to resolve.
 pub use nanosiem_api_lib::{
     build_access_token_cookie, build_refresh_token_cookie, clear_access_token_cookie,
     clear_refresh_token_cookie, extract_refresh_token_cookie,
 };
-use nanosiem_api_lib::{
-    append_set_cookies, clear_session_cookies_for, issued_session_set_cookies,
-    legacy_session_cookie_tenant, select_tenant_cookie, shared_refresh_token_tenant,
-    SessionCookieScope, REFRESH_TOKEN_COOKIE,
-};
-#[cfg(feature = "enterprise")]
-use nanosiem_api_lib::{request_cookies, SharedRefreshCookieError};
-#[cfg(feature = "enterprise")]
-use nanosiem_core::auth::session_cookies::select_shared_refresh_cookie;
 
 /// Error response for auth endpoints
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -106,21 +96,6 @@ impl AuthApiError {
                 StatusCode::UNAUTHORIZED,
                 "session_not_found",
                 "Session not found or expired",
-            ),
-            AuthError::TenantRequired => (
-                StatusCode::BAD_REQUEST,
-                "tenant_required",
-                "An active tenant selection is required",
-            ),
-            AuthError::TenantAccessDenied => (
-                StatusCode::FORBIDDEN,
-                "tenant_access_denied",
-                "Tenant access denied",
-            ),
-            AuthError::TenantUnavailable => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "tenant_unavailable",
-                "Tenant membership is temporarily unavailable",
             ),
             AuthError::PasswordRequirementsNotMet(msg) => (
                 StatusCode::BAD_REQUEST,
@@ -173,7 +148,6 @@ impl AuthApiError {
     responses(
         (status = 200, description = "Login successful", body = AuthResponse),
         (status = 401, description = "Invalid credentials", body = AuthApiError),
-        (status = 503, description = "Authentication or durable audit unavailable", body = AuthApiError),
     ),
     security(())
 )]
@@ -192,7 +166,6 @@ pub async fn login(
         .login(
             &request.email,
             &request.password,
-            request.tenant_slug.as_deref(),
             ip_address.as_deref(),
             user_agent.as_deref(),
         )
@@ -201,7 +174,7 @@ pub async fn login(
     match result {
         Ok(LoginResult::Success(response)) => {
             // Emit login success audit event
-            state.emit_audit(
+            state.emit_audit_durable(
                 AuditEvent::builder(AuditSource::Auth, LOGIN_SUCCESS)
                     .actor(Some(response.user.id), Some(response.user.email.clone()))
                     .resource(
@@ -211,68 +184,45 @@ pub async fn login(
                     )
                     .client_context(&client_ctx)
                     .build(),
-            );
+            ).await;
 
-            // Set the access_token cookie (browser-based access, e.g. Swagger UI)
-            // and the HttpOnly refresh_token cookie (scoped to /api/auth).
-            // NAN-3548: hosted-shared names them per tenant.
-            #[cfg(feature = "enterprise")]
-            let cookies = issued_session_set_cookies(
-                &headers,
-                &state.token_service,
-                state.config.deployment_mode.is_enterprise_shared(),
+            // Set access_token cookie for browser-based access (e.g. Swagger UI)
+            let access_cookie = build_access_token_cookie(
                 &response.tokens.access_token,
                 response.tokens.expires_in,
-                &response.tokens.refresh_token,
-                state.token_service.refresh_token_ttl(),
             );
-            #[cfg(not(feature = "enterprise"))]
-            let cookies = issued_session_set_cookies(
-                &headers,
-                &state.token_service,
-                false,
-                &response.tokens.access_token,
-                response.tokens.expires_in,
+            // Set refresh_token HttpOnly cookie (scoped to /api/auth)
+            let refresh_cookie = build_refresh_token_cookie(
                 &response.tokens.refresh_token,
                 state.token_service.refresh_token_ttl(),
             );
             let mut res = Json(&response).into_response();
-            append_set_cookies(res.headers_mut(), cookies);
+            res.headers_mut().append(
+                SET_COOKIE,
+                access_cookie.parse().expect("valid cookie header"),
+            );
+            res.headers_mut().append(
+                SET_COOKIE,
+                refresh_cookie.parse().expect("valid cookie header"),
+            );
             Ok(res)
         }
         Ok(LoginResult::MfaRequired { challenge_token }) => {
             // Password verified; MFA code now required. Audit the challenge
             // issuance (the actor is recovered from the freshly minted challenge
             // token). Completion/failure is audited by verify_mfa_challenge.
-            #[cfg(feature = "enterprise")]
-            if state.config.deployment_mode.is_enterprise_shared() {
-                super::auth_challenge_audit::record(
-                    &state, &challenge_token, request.tenant_slug.as_deref(), &client_ctx,
-                    MFA_CHALLENGE_ISSUED, true, None,
-                ).await.map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, Json(
-                    AuthApiError::new("audit_unavailable", "Authentication auditing is temporarily unavailable"),
-                )))?;
-            } else {
-                let actor_id = state.token_service.validate_mfa_challenge_token_async(&challenge_token)
-                    .await.ok().map(|c| c.sub);
-                state.emit_audit(
-                    AuditEvent::builder(AuditSource::Auth, MFA_CHALLENGE_ISSUED)
-                        .actor(actor_id, Some(request.email.clone()))
-                        .resource("user", actor_id, Some(request.email.clone()))
-                        .client_context(&client_ctx).build(),
-                );
-            }
-            #[cfg(not(feature = "enterprise"))]
-            {
-                let actor_id = state.token_service.validate_mfa_challenge_token_async(&challenge_token)
-                    .await.ok().map(|c| c.sub);
-                state.emit_audit(
-                    AuditEvent::builder(AuditSource::Auth, MFA_CHALLENGE_ISSUED)
-                        .actor(actor_id, Some(request.email.clone()))
-                        .resource("user", actor_id, Some(request.email.clone()))
-                        .client_context(&client_ctx).build(),
-                );
-            }
+            let actor_id = state
+                .token_service
+                .validate_mfa_challenge_token(&challenge_token)
+                .ok()
+                .map(|c| c.sub);
+            state.emit_audit(
+                AuditEvent::builder(AuditSource::Auth, MFA_CHALLENGE_ISSUED)
+                    .actor(actor_id, Some(request.email.clone()))
+                    .resource("user", actor_id, Some(request.email.clone()))
+                    .client_context(&client_ctx)
+                    .build(),
+            );
             // MFA enabled — return challenge token, no cookies/tokens
             Ok(Json(serde_json::json!({
                 "status": "mfa_required",
@@ -283,15 +233,6 @@ pub async fn login(
         }
         Ok(LoginResult::MfaSetupRequired { challenge_token }) => {
             // Admin requires MFA but user hasn't enrolled yet
-            #[cfg(feature = "enterprise")]
-            if state.config.deployment_mode.is_enterprise_shared() {
-                super::auth_challenge_audit::record(
-                    &state, &challenge_token, request.tenant_slug.as_deref(), &client_ctx,
-                    MFA_CHALLENGE_ISSUED, true, Some(serde_json::json!({"setup_required": true})),
-                ).await.map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, Json(
-                    AuthApiError::new("audit_unavailable", "Authentication auditing is temporarily unavailable"),
-                )))?;
-            }
             Ok(Json(serde_json::json!({
                 "status": "mfa_setup_required",
                 "mfa_setup_required": true,
@@ -300,11 +241,8 @@ pub async fn login(
             .into_response())
         }
         Err(e) => {
-            // Emit login failed audit event. NAN-3790: on the hosted shared
-            // host there is no verified actor; the row is written actorless
-            // into the tenant the route slug selects.
-            state.emit_preauth_audit(
-                request.tenant_slug.as_deref(),
+            // Emit login failed audit event
+            state.emit_audit(
                 AuditEvent::builder(AuditSource::Auth, LOGIN_FAILED)
                     .actor(None, Some(request.email.clone()))
                     .resource("user", None, Some(request.email.clone()))
@@ -334,8 +272,7 @@ pub async fn login(
             // enumerate. The account is identified by email; no user_id is exposed
             // here (enumeration-safety), matching login_failed.
             if matches!(e, AuthError::AccountLocked) {
-                state.emit_preauth_audit(
-                    request.tenant_slug.as_deref(),
+                state.emit_audit_durable(
                     AuditEvent::builder(AuditSource::Auth, USER_LOCKED)
                         .actor(None, Some(request.email.clone()))
                         .resource("user", None, Some(request.email.clone()))
@@ -345,7 +282,7 @@ pub async fn login(
                             "reason": "failed_login_threshold_exceeded"
                         }))
                         .build(),
-                );
+                ).await;
             }
             let (status, err) = AuthApiError::from_auth_error(&e);
             Err((status, Json(err)))
@@ -373,7 +310,6 @@ pub struct LogoutRequest {
         (status = 204, description = "Logout successful"),
         (status = 401, description = "Invalid token", body = AuthApiError),
         (status = 403, description = "Forbidden — interactive session required (API keys have no session)", body = AuthApiError),
-        (status = 500, description = "Shared-mode durable revocation could not be completed safely", body = AuthApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -382,199 +318,50 @@ pub async fn logout(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Extension(auth): Extension<AuthContext>,
-    tenant: Option<Extension<TrustedTenantContext>>,
     Json(request): Json<LogoutRequest>,
-) -> Result<Response, Response> {
+) -> Result<Response, (StatusCode, Json<AuthApiError>)> {
     // NAN-2040: an API key has no interactive browser session to end. Its subject
     // is its owner, so without this a (possibly zero-permission) key could
     // force-revoke ALL of the owner's browser sessions via the bulk termination
     // below (the alternate route past the session-handler guards). API keys are
     // revoked by deleting the key, not by logout.
-    #[cfg(feature = "enterprise")]
-    let shared_logout = state.config.deployment_mode.is_enterprise_shared();
-    #[cfg(not(feature = "enterprise"))]
-    let shared_logout = false;
-    let shared_tenant_id = tenant.as_ref().map(|Extension(tenant)| tenant.tenant_id);
-    // NAN-3548: shared logout ends exactly the authenticated tenant's browser
-    // session; other tenants' cookies in the same jar are never touched. The
-    // legacy unsuffixed pair is cleared only when it is bound to this tenant.
-    let logout_clears = match (shared_logout, shared_tenant_id) {
-        (false, _) => clear_session_cookies_for(SessionCookieScope::Default),
-        (true, None) => Vec::new(),
-        (true, Some(tenant_id)) => {
-            let mut clears = clear_session_cookies_for(SessionCookieScope::Tenant(tenant_id));
-            if legacy_session_cookie_tenant(&headers, &state.token_service) == Some(tenant_id) {
-                clears.extend(clear_session_cookies_for(SessionCookieScope::Default));
-            }
-            clears
-        }
-    };
     if auth.is_api_key {
-        return Err(logout_error_response(
-            &logout_clears,
+        return Err((
             StatusCode::FORBIDDEN,
-            AuthApiError::new(
+            Json(AuthApiError::new(
                 "interactive_session_required",
                 "Logout requires an interactive session; API keys have no session to end.",
-            ),
+            )),
         ));
     }
 
     let ip_address = extract_client_ip(&headers, Some(&addr));
     let user_agent = extract_user_agent(&headers);
     let client_ctx = ClientContext::new(ip_address.clone(), user_agent.clone());
-    let refresh_token = request.refresh_token.or_else(|| {
-        if shared_logout {
-            shared_tenant_id.and_then(|tenant_id| {
-                select_tenant_cookie(&headers, REFRESH_TOKEN_COOKIE, tenant_id, |token| {
-                    shared_refresh_token_tenant(&state.token_service, token)
-                })
-                .map(|cookie| cookie.value)
-            })
-        } else {
-            extract_refresh_token_cookie(&headers)
-        }
-    });
 
-    // A queued tenant-A logout can run after another tab has installed tenant
-    // B's origin-wide refresh cookie. The bearer still authenticates A, so
-    // compare the independently presented refresh credential before mutating
-    // either identity. A mismatch is a stale browser operation: fail without
-    // clearing cookies or deleting B's session.
-    #[cfg(feature = "enterprise")]
-    if shared_logout {
-        let trusted_tenant = tenant
-            .as_ref()
-            .map(|Extension(tenant)| tenant)
-            .ok_or_else(|| {
-                logout_error_response_without_cookie_clear(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    AuthApiError::new(
-                        "tenant_context_unavailable",
-                        "Tenant session authorization is temporarily unavailable",
-                    ),
-                )
-            })?;
-        if let Some(token) = refresh_token.as_deref() {
-            if let Ok(refresh) = state
-                .token_service
-                .validate_enterprise_shared_refresh_token(token)
-            {
-                if !shared_logout_identity_matches(
-                    auth.user_id(),
-                    trusted_tenant.tenant_id,
-                    refresh.claims.sub,
-                    refresh.tenant_id,
-                ) {
-                    // The replacement cookie belongs to B, but the presented
-                    // bearer is still A's exact credential. Revoke the whole
-                    // tenant-A session namespace while preserving B. Otherwise
-                    // a captured A refresh cookie could survive a user-visible
-                    // logout simply because B currently owns the browser's
-                    // origin-wide refresh cookie.
-                    state
-                        .session_service
-                        .terminate_tenant_user_sessions(
-                            trusted_tenant.tenant_id,
-                            auth.user_id(),
-                            auth.user_id(),
-                            true,
-                        )
-                        .await
-                        .map_err(|error| {
-                            tracing::error!(
-                                tenant_id = %trusted_tenant.tenant_id,
-                                user_id = %auth.user_id(),
-                                %error,
-                                "failed to revoke replaced tenant session namespace"
-                            );
-                            logout_error_response_without_cookie_clear(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                AuthApiError::new(
-                                    "revocation_unavailable",
-                                    "Tenant session could not be revoked safely",
-                                ),
-                            )
-                        })?;
-                    nanosiem_core::auth::token::persist_revoked_token(
-                        &state.pool,
-                        auth.claims.jti,
-                        auth.claims.exp,
-                    )
-                    .await
-                    .map_err(|error| {
-                        tracing::error!(jti = %auth.claims.jti, %error, "failed to persist stale logout credential revocation");
-                        logout_error_response_without_cookie_clear(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            AuthApiError::new(
-                                "revocation_unavailable",
-                                "Logout credential could not be revoked safely",
-                            ),
-                        )
-                    })?;
-                    state
-                        .token_service
-                        .revoke_token(auth.claims.jti, auth.claims.exp)
-                        .await;
-                    return Err(logout_error_response_without_cookie_clear(
-                        StatusCode::CONFLICT,
-                        AuthApiError::new(
-                            "session_replaced",
-                            "A different tenant session replaced this browser session",
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-
-    // Shared logout revokes exactly this authenticated tenant's sessions.
-    // The same user can independently belong to another tenant. Dedicated
-    // compatibility still revokes all sessions for the authenticated user.
-    // C4: Always revoke ALL sessions in the selected namespace on logout.
+    // C4: Always revoke ALL sessions for the authenticated user on logout.
     // Previously only the session matching the provided refresh token was deleted,
-    // leaving other refresh tokens alive for up to 7 days. The service now
-    // advances the user (dedicated) or membership (shared) revocation watermark
-    // in the same transaction as the session
-    // delete, so an in-flight refresh response cannot restore a usable access
-    // cookie after this logout completes.
-    let terminate_result = if shared_logout {
-        let tenant_id = tenant.as_ref().map(|Extension(tenant)| tenant.tenant_id)
-            .ok_or_else(|| {
-                logout_error_response_without_cookie_clear(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    AuthApiError::new(
-                        "tenant_context_unavailable",
-                        "Tenant session authorization is temporarily unavailable",
-                    ),
-                )
-            })?;
-        state.session_service
-            .terminate_tenant_user_sessions(tenant_id, auth.user_id(), auth.user_id(), true)
-            .await
-    } else {
-        state.session_service.terminate_all_user_sessions(
-            auth.user_id(), auth.user_id(), true,
-            ip_address.as_deref(), user_agent.as_deref(),
-        ).await
-    };
-    let termination_failed = terminate_result
-        .inspect_err(|error| {
-            tracing::warn!(user_id = %auth.user_id(), %error, "failed to terminate sessions during logout");
-        })
-        .is_err();
+    // leaving other refresh tokens alive for up to 7 days.
+    let _ = state
+        .session_service
+        .terminate_all_user_sessions(
+            auth.user_id(),
+            auth.user_id(),
+            true, // user is terminating their own sessions
+            ip_address.as_deref(),
+            user_agent.as_deref(),
+        )
+        .await;
 
-    // Dedicated compatibility retains the legacy single-session cleanup.
-    // Shared logout already atomically removed this authenticated tenant/user
-    // namespace above. Any independently presented refresh credential was
-    // identity-matched before mutation; bearer-only clients need no cookie.
-    if !shared_logout {
-        if let Some(ref token) = refresh_token {
-            let _ = state
-                .auth_service
-                .logout(token, ip_address.as_deref(), user_agent.as_deref())
-                .await;
-        }
+    // Also try single-session logout via refresh token for audit trail
+    let refresh_token = request
+        .refresh_token
+        .or_else(|| extract_refresh_token_cookie(&headers));
+    if let Some(ref token) = refresh_token {
+        let _ = state
+            .auth_service
+            .logout(token, ip_address.as_deref(), user_agent.as_deref())
+            .await;
     }
 
     // Revoke the current access token so it cannot be reused before expiry
@@ -583,64 +370,37 @@ pub async fn logout(
         .revoke_token(auth.claims.jti, auth.claims.exp)
         .await;
     // H8: Persist revocation to PostgreSQL so it survives restarts
-    let persistence = nanosiem_core::auth::token::persist_revoked_token(
+    nanosiem_core::auth::token::persist_revoked_token(
         &state.pool,
         auth.claims.jti,
         auth.claims.exp,
     )
     .await;
-    let persistence_failed = persistence
-        .inspect_err(|error| {
-            tracing::warn!(jti = %auth.claims.jti, %error, "failed to persist token revocation during logout");
-        })
-        .is_err();
-    if shared_logout && (termination_failed || persistence_failed) {
-        return Err(logout_error_response(
-            &logout_clears,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            AuthApiError::new("internal_error", "Logout could not be completed safely"),
-        ));
-    }
 
-    // Emit logout audit event. NAN-3790: hosted shared writes it in the
-    // authenticated tenant (the shared emitter refuses tenantless rows).
-    let logout_event = AuditEvent::builder(AuditSource::Auth, LOGOUT)
-        .actor(Some(auth.user_id()), None)
-        .resource("session", None, None)
-        .client_context(&client_ctx)
-        .build();
-    match tenant.filter(|_| shared_logout) {
-        Some(Extension(tenant)) => state.emit_tenant_auth_audit(tenant, auth.user_id(), vec![logout_event]),
-        None => state.emit_audit(logout_event),
-    }
+    // Emit logout audit event
+    state.emit_audit(
+        AuditEvent::builder(AuditSource::Auth, LOGOUT)
+            .actor(Some(auth.user_id()), None)
+            .resource("session", None, None)
+            .client_context(&client_ctx)
+            .build(),
+    );
 
-    // Clear this session's access + refresh cookies
+    // Clear both cookies
     let mut res = StatusCode::NO_CONTENT.into_response();
-    append_set_cookies(res.headers_mut(), logout_clears);
+    res.headers_mut().append(
+        SET_COOKIE,
+        clear_access_token_cookie()
+            .parse()
+            .expect("valid cookie header"),
+    );
+    res.headers_mut().append(
+        SET_COOKIE,
+        clear_refresh_token_cookie()
+            .parse()
+            .expect("valid cookie header"),
+    );
     Ok(res)
-}
-
-fn logout_error_response(clears: &[String], status: StatusCode, error: AuthApiError) -> Response {
-    let mut response = (status, Json(error)).into_response();
-    append_set_cookies(response.headers_mut(), clears.iter().cloned());
-    response
-}
-
-fn logout_error_response_without_cookie_clear(
-    status: StatusCode,
-    error: AuthApiError,
-) -> Response {
-    (status, Json(error)).into_response()
-}
-
-#[cfg(feature = "enterprise")]
-fn shared_logout_identity_matches(
-    authenticated_user_id: Uuid,
-    authenticated_tenant_id: Uuid,
-    refresh_user_id: Uuid,
-    refresh_tenant_id: Uuid,
-) -> bool {
-    authenticated_user_id == refresh_user_id && authenticated_tenant_id == refresh_tenant_id
 }
 
 /// Refresh token response
@@ -664,7 +424,6 @@ pub struct RefreshTokenResponse {
     request_body = RefreshTokenRequest,
     responses(
         (status = 200, description = "Token refreshed successfully", body = RefreshTokenResponse),
-        (status = 400, description = "No refresh token in body or cookie (e.g. hosted-shared activation before MFA enrollment issues a session)", body = AuthApiError),
         (status = 401, description = "Invalid refresh token", body = AuthApiError),
     ),
     security(())
@@ -677,85 +436,72 @@ pub async fn refresh_token(
 ) -> Result<Response, (StatusCode, Json<AuthApiError>)> {
     let ip_address = extract_client_ip(&headers, Some(&addr));
     let user_agent = extract_user_agent(&headers);
-    let tenant_slug = request.tenant_slug.clone();
 
-    #[cfg(feature = "enterprise")]
-    let enterprise_shared = state.config.deployment_mode.is_enterprise_shared();
-    let missing_token = || {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(AuthApiError::new(
-                "missing_token",
-                "Refresh token required (in body or cookie)",
-            )),
-        )
-    };
-
-    // Resolve refresh token from body or cookie. `refusal_clears` names the
-    // cookies a refused refresh may clear: in single-tenant modes the one
-    // session pair; in hosted-shared only the pair of the tenant being
-    // refreshed (NAN-3548), so a refusal for tenant B never ends tenant A.
-    #[cfg(feature = "enterprise")]
-    let (refresh_token_value, refusal_clears) = match request.refresh_token {
-        Some(token) => (
-            token,
-            if enterprise_shared {
-                Vec::new()
-            } else {
-                clear_session_cookies_for(SessionCookieScope::Default)
-            },
-        ),
-        None if enterprise_shared => {
-            match select_shared_refresh_cookie(
-                &state.auth_service,
-                &state.token_service,
-                &request_cookies(&headers),
-                tenant_slug.as_deref(),
+    // Resolve refresh token from body or cookie
+    let refresh_token_value = request
+        .refresh_token
+        .or_else(|| extract_refresh_token_cookie(&headers))
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(AuthApiError::new(
+                    "missing_token",
+                    "Refresh token required (in body or cookie)",
+                )),
             )
-            .await
-            {
-                Ok(cookie) => (cookie.value, cookie.refusal_clears),
-                Err(SharedRefreshCookieError::Missing) => return Err(missing_token()),
-                Err(SharedRefreshCookieError::Auth(error)) => {
-                    let (status, err) = AuthApiError::from_auth_error(&error);
-                    return Err((status, Json(err)));
-                }
-            }
-        }
-        None => (
-            extract_refresh_token_cookie(&headers).ok_or_else(missing_token)?,
-            clear_session_cookies_for(SessionCookieScope::Default),
-        ),
-    };
-    #[cfg(not(feature = "enterprise"))]
-    let (refresh_token_value, refusal_clears) = match request.refresh_token {
-        Some(token) => (token, clear_session_cookies_for(SessionCookieScope::Default)),
-        None => (
-            extract_refresh_token_cookie(&headers).ok_or_else(missing_token)?,
-            clear_session_cookies_for(SessionCookieScope::Default),
-        ),
-    };
+        })?;
 
-    let token_pair = match state
+    // NAN-3460: attribute the refresh to the session owner. Only a
+    // signature-valid, unexpired refresh JWT names a user; a forged or expired
+    // token is audited without an actor rather than trusting its payload.
+    let refresh_owner = state
+        .token_service
+        .validate_refresh_token(&refresh_token_value)
+        .ok()
+        .map(|claims| claims.sub);
+    let client_ctx = ClientContext::new(ip_address.clone(), user_agent.clone());
+
+    let outcome = match state
         .auth_service
         .refresh_token(
             &refresh_token_value,
-            tenant_slug.as_deref(),
             ip_address.as_deref(),
             user_agent.as_deref(),
         )
         .await
     {
-        Ok(pair) => pair,
+        Ok(outcome) => {
+            state.emit_audit(refresh_audit_event(
+                refresh_owner,
+                &client_ctx,
+                None,
+                !outcome.rotated,
+            ));
+            outcome
+        }
         Err(e) => {
+            state.emit_audit(refresh_audit_event(refresh_owner, &client_ctx, Some(&e), false));
             let (status, err) = AuthApiError::from_auth_error(&e);
             // Clear stale cookies so they don't persist and keep failing
             let mut res = (status, Json(err)).into_response();
-            append_set_cookies(res.headers_mut(), refusal_clears);
+            res.headers_mut().append(
+                SET_COOKIE,
+                clear_access_token_cookie()
+                    .parse()
+                    .expect("valid cookie header"),
+            );
+            res.headers_mut().append(
+                SET_COOKIE,
+                clear_refresh_token_cookie()
+                    .parse()
+                    .expect("valid cookie header"),
+            );
             return Ok(res);
         }
     };
 
+    let rotated = outcome.rotated;
+    let token_pair = outcome.tokens;
     let response = RefreshTokenResponse {
         access_token: token_pair.access_token,
         refresh_token: token_pair.refresh_token,
@@ -764,31 +510,64 @@ pub async fn refresh_token(
     };
 
     // Set updated cookies (append pattern for multiple Set-Cookie headers).
-    // NAN-3548: shared mode re-issues under the tenant-suffixed names and
-    // clears the same tenant's legacy unsuffixed pair (migration).
-    #[cfg(feature = "enterprise")]
-    let cookies = issued_session_set_cookies(
-        &headers,
-        &state.token_service,
-        enterprise_shared,
-        &response.access_token,
-        response.expires_in,
-        &response.refresh_token,
-        state.token_service.refresh_token_ttl(),
-    );
-    #[cfg(not(feature = "enterprise"))]
-    let cookies = issued_session_set_cookies(
-        &headers,
-        &state.token_service,
-        false,
-        &response.access_token,
-        response.expires_in,
-        &response.refresh_token,
-        state.token_service.refresh_token_ttl(),
-    );
+    // NAN-2453: a grace refresh (another tab already rotated this token) does
+    // not rotate, so it must not touch the refresh cookie — the browser
+    // already holds the winner's newer one.
+    let access_cookie = build_access_token_cookie(&response.access_token, response.expires_in);
     let mut res = Json(&response).into_response();
-    append_set_cookies(res.headers_mut(), cookies);
+    res.headers_mut().append(
+        SET_COOKIE,
+        access_cookie.parse().expect("valid cookie header"),
+    );
+    if rotated {
+        let refresh_cookie = build_refresh_token_cookie(
+            &response.refresh_token,
+            state.token_service.refresh_token_ttl(),
+        );
+        res.headers_mut().append(
+            SET_COOKIE,
+            refresh_cookie.parse().expect("valid cookie header"),
+        );
+    }
     Ok(res)
+}
+
+/// Audit row for one `POST /api/auth/refresh` (NAN-3460).
+///
+/// A refresh mints a new access token and rotates the single-use refresh
+/// token, so it is a session event a SOC needs: the row names the session
+/// owner and the client of THIS request (trusted-proxy-aware IP and user
+/// agent), never the session's creation metadata. A failed refresh is
+/// recorded too: after rotation, a second presentation of the same refresh
+/// token is either a lost multi-tab race or token replay from another client,
+/// and only the client address separates the two.
+pub(crate) fn refresh_audit_event(
+    user_id: Option<Uuid>,
+    client_ctx: &ClientContext,
+    failure: Option<&AuthError>,
+    grace: bool,
+) -> AuditEvent {
+    let mut builder = AuditEvent::builder(AuditSource::Auth, TOKEN_REFRESH)
+        .actor(user_id, None)
+        .resource("session", None, None)
+        .client_context(client_ctx)
+        .success(failure.is_none());
+    if let Some(err) = failure {
+        let reason = match err {
+            AuthError::SessionNotFound | AuthError::InvalidToken => "refresh_token_rejected",
+            AuthError::AccountDisabled | AuthError::AccountLocked | AuthError::UserNotFound => {
+                "account_unavailable"
+            }
+            _ => "refresh_failed",
+        };
+        builder = builder.details(serde_json::json!({ "reason": reason }));
+    } else if grace {
+        // NAN-2453: served from the previous-token grace window (a concurrent
+        // tab rotated first). Recorded so replay of a just-rotated token from
+        // a different client stays visible.
+        builder = builder.details(serde_json::json!({ "grace": true }));
+    }
+    builder.build()
 }
 
 /// Password reset request response
@@ -825,18 +604,11 @@ pub async fn request_password_reset(
     // Note: In production, this would send an email instead of returning the token
     let result = state
         .auth_service
-        .request_password_reset(
-            &request.email,
-            request.tenant_slug.as_deref(),
-            ip_address.as_deref(),
-            user_agent.as_deref(),
-        )
+        .request_password_reset(&request.email, ip_address.as_deref(), user_agent.as_deref())
         .await;
 
     // Emit audit event regardless of success (but don't reveal if email exists)
-    // NAN-3790: actorless; hosted shared scopes it to the slug's tenant.
-    state.emit_preauth_audit(
-        request.tenant_slug.as_deref(),
+    state.emit_audit(
         AuditEvent::builder(AuditSource::Auth, PASSWORD_RESET_REQUEST)
             .actor(None, Some(request.email.clone()))
             .resource("user", None, Some(request.email.clone()))
@@ -901,18 +673,18 @@ pub async fn reset_password(
         .await;
 
     match &result {
-        Ok(user_id) => {
-            // Emit password reset complete audit event. NAN-3790: hosted
-            // shared writes it, signed as the account whose password changed,
-            // in its home tenant (tenant-scoped identity) or in every tenant
-            // where a legacy global identity is an active member.
-            state.emit_password_reset_complete_audit(*user_id, client_ctx.clone());
+        Ok(_) => {
+            // Emit password reset complete audit event
+            state.emit_audit_durable(
+                AuditEvent::builder(AuditSource::Auth, PASSWORD_RESET_COMPLETE)
+                    .resource("user", None, None)
+                    .client_context(&client_ctx)
+                    .build(),
+            ).await;
         }
         Err(e) => {
-            // Emit failed password reset audit event. The token resolved to
-            // no account, so hosted shared has no tenant to scope it to.
-            state.emit_preauth_audit(
-                None,
+            // Emit failed password reset audit event
+            state.emit_audit_durable(
                 AuditEvent::builder(AuditSource::Auth, PASSWORD_RESET_COMPLETE)
                     .resource("user", None, None)
                     .client_context(&client_ctx)
@@ -921,7 +693,7 @@ pub async fn reset_password(
                         "error": e.to_string()
                     }))
                     .build(),
-            );
+            ).await;
         }
     }
 
@@ -969,13 +741,11 @@ pub struct ChangePasswordResponse {
     ),
     security(("bearer_auth" = []))
 )]
-#[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
 pub async fn change_password(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Extension(auth): Extension<AuthContext>,
-    tenant: Option<Extension<TrustedTenantContext>>,
     Json(request): Json<ChangePasswordRequest>,
 ) -> Result<Response, (StatusCode, Json<AuthApiError>)> {
     // NAN-2080: credential mutation is session-only. An owner-bound API key maps
@@ -1002,28 +772,30 @@ pub async fn change_password(
         )
         .await;
 
-    let mut password_event = AuditEvent::builder(AuditSource::Auth, PASSWORD_CHANGED)
-        .actor(Some(auth.user_id()), None)
-        .resource("user", Some(auth.user_id()), None)
-        .client_context(&client_ctx);
-    if let Err(e) = &result {
-        password_event = password_event
-            .success(false)
-            .details(serde_json::json!({
-                "error": e.to_string()
-            }));
-    }
-    let password_event = password_event.build();
-    // NAN-3790: hosted shared writes it in the authenticated tenant.
-    #[cfg(feature = "enterprise")]
-    match tenant.clone().filter(|_| state.config.deployment_mode.is_enterprise_shared()) {
-        Some(Extension(tenant)) => {
-            state.emit_tenant_auth_audit(tenant, auth.user_id(), vec![password_event])
+    match &result {
+        Ok(_) => {
+            state.emit_audit_durable(
+                AuditEvent::builder(AuditSource::Auth, PASSWORD_CHANGED)
+                    .actor(Some(auth.user_id()), None)
+                    .resource("user", Some(auth.user_id()), None)
+                    .client_context(&client_ctx)
+                    .build(),
+            ).await;
         }
-        None => state.emit_audit(password_event),
+        Err(e) => {
+            state.emit_audit_durable(
+                AuditEvent::builder(AuditSource::Auth, PASSWORD_CHANGED)
+                    .actor(Some(auth.user_id()), None)
+                    .resource("user", Some(auth.user_id()), None)
+                    .client_context(&client_ctx)
+                    .success(false)
+                    .details(serde_json::json!({
+                        "error": e.to_string()
+                    }))
+                    .build(),
+            ).await;
+        }
     }
-    #[cfg(not(feature = "enterprise"))]
-    state.emit_audit(password_event);
 
     result.map_err(|e| {
         let (status, err) = AuthApiError::from_auth_error(&e);
@@ -1035,36 +807,22 @@ pub async fn change_password(
         message: "Password changed successfully. Please log in again.".to_string(),
     })
     .into_response();
-    // NAN-3548: shared mode clears this tenant's pair (and the legacy pair
-    // only when it is bound to this tenant); single-tenant modes unchanged.
-    #[cfg(feature = "enterprise")]
-    let clears = match tenant.filter(|_| state.config.deployment_mode.is_enterprise_shared()) {
-        Some(Extension(tenant)) => {
-            let mut clears =
-                clear_session_cookies_for(SessionCookieScope::Tenant(tenant.tenant_id));
-            if legacy_session_cookie_tenant(&headers, &state.token_service)
-                == Some(tenant.tenant_id)
-            {
-                clears.extend(clear_session_cookies_for(SessionCookieScope::Default));
-            }
-            clears
-        }
-        None => clear_session_cookies_for(SessionCookieScope::Default),
-    };
-    #[cfg(not(feature = "enterprise"))]
-    let clears = clear_session_cookies_for(SessionCookieScope::Default);
-    append_set_cookies(res.headers_mut(), clears);
+    res.headers_mut().append(
+        SET_COOKIE,
+        clear_access_token_cookie()
+            .parse()
+            .expect("valid cookie header"),
+    );
+    res.headers_mut().append(
+        SET_COOKIE,
+        clear_refresh_token_cookie()
+            .parse()
+            .expect("valid cookie header"),
+    );
     Ok(res)
 }
 
 /// Current user response
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct ActiveTenantResponse {
-    #[schema(value_type = String)]
-    pub id: Uuid,
-    pub slug: String,
-}
-
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct CurrentUserResponse {
     #[serde(with = "nanosiem_core::typeid::user")]
@@ -1077,21 +835,6 @@ pub struct CurrentUserResponse {
     pub is_api_key: bool,
     pub preferred_query_mode: Option<String>,
     pub landing_page: Option<String>,
-    /// Exact server-owned profile. The browser must not infer shared tenancy
-    /// from a build flag or from the route it happened to load.
-    pub deployment_mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_tenant: Option<ActiveTenantResponse>,
-    /// Present only for a live demo analyst of a demo tenant.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub demo: Option<CurrentUserDemo>,
-}
-
-/// The caller's demo session (shared demo tenants only).
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct CurrentUserDemo {
-    pub active: bool,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Get current authenticated user
@@ -1114,25 +857,7 @@ pub struct CurrentUserDemo {
 pub async fn get_current_user(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-    tenant: Option<Extension<TrustedTenantContext>>,
-    #[cfg(feature = "enterprise")] demo: Option<Extension<nanosiem_core::enterprise_shared_demo::SharedDemoPrincipal>>,
 ) -> Result<Json<CurrentUserResponse>, (StatusCode, Json<AuthApiError>)> {
-    #[cfg(feature = "enterprise")]
-    let demo = demo.map(|Extension(principal)| CurrentUserDemo { active: true, expires_at: principal.expires_at });
-    #[cfg(not(feature = "enterprise"))]
-    let demo: Option<CurrentUserDemo> = None;
-    let deployment_mode = match state.config.deployment_mode {
-        DeploymentMode::Managed => "managed",
-        #[cfg(feature = "enterprise")]
-        DeploymentMode::EnterpriseShared => "enterprise_shared",
-        DeploymentMode::SelfHosted => "self-hosted",
-        DeploymentMode::Demo => "demo",
-    }
-    .to_string();
-    let active_tenant = tenant.map(|Extension(tenant)| ActiveTenantResponse {
-        id: tenant.tenant_id,
-        slug: tenant.tenant_slug,
-    });
     if auth.is_api_key {
         // For API keys, we don't have a real user - return API key info
         return Ok(Json(CurrentUserResponse {
@@ -1147,9 +872,6 @@ pub async fn get_current_user(
             is_api_key: true,
             preferred_query_mode: None,
             landing_page: None,
-            deployment_mode,
-            active_tenant,
-            demo,
         }));
     }
 
@@ -1180,32 +902,10 @@ pub async fn get_current_user(
         is_api_key: false,
         preferred_query_mode,
         landing_page,
-        deployment_mode,
-        active_tenant,
-        demo,
     }))
 }
 
-/// Server-resolved identity for an owner-bound agent search key.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct AgentLaneIdentity {
-    pub tenant_id: Uuid,
-    pub key_id: Uuid,
-    pub owner_id: Uuid,
-    pub permissions: Vec<String>,
-    pub restricted: bool,
-    pub source: Option<String>,
-    pub source_allowed: Option<bool>,
-}
-
-/// A decision for one requested source; never disclose the viewer's deny sets.
-#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
-pub struct AgentLaneValidationQuery {
-    pub agent_tenant: Option<Uuid>,
-    pub agent_source: Option<String>,
-}
-
-/// Token validation response.
+/// Token validation response
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct TokenValidationResponse {
     pub valid: bool,
@@ -1213,9 +913,6 @@ pub struct TokenValidationResponse {
     #[schema(value_type = String)]
     pub user_id: Uuid,
     pub expires_at: i64,
-    /// Present only for an owner-bound search API key in a trusted tenant.
-    /// The gateway never accepts a client-supplied tenant or source scope.
-    pub agent_lane: Option<AgentLaneIdentity>,
 }
 
 /// Validate token (for frontend to check if token is still valid)
@@ -1225,49 +922,20 @@ pub struct TokenValidationResponse {
     get,
     path = "/api/auth/validate",
     tag = "auth",
-    params(AgentLaneValidationQuery),
     responses(
         (status = 200, description = "Token is valid", body = TokenValidationResponse),
         (status = 401, description = "Token is invalid or expired", body = AuthApiError),
-        (status = 403, description = "Requested agent tenant does not match the key", body = AuthApiError),
-        (status = 400, description = "Invalid source decision request", body = AuthApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
 pub async fn validate_token(
     Extension(auth): Extension<AuthContext>,
-    tenant: Option<Extension<TrustedTenantContext>>,
-    axum::extract::Query(query): axum::extract::Query<AgentLaneValidationQuery>,
-) -> Result<Json<TokenValidationResponse>, (StatusCode, Json<AuthApiError>)> {
-    if query.agent_tenant.is_some_and(|expected| tenant.as_ref().is_none_or(|t| t.tenant_id != expected)) {
-        return Err((StatusCode::FORBIDDEN, Json(AuthApiError::new("agent_tenant_denied", "The key does not authorize the requested tenant"))));
-    }
-    if query.agent_source.as_ref().is_some_and(|s| s.is_empty() || s.len() > 255
-        || !s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_:-".contains(&b))) {
-        return Err((StatusCode::BAD_REQUEST, Json(AuthApiError::new("invalid_agent_source", "Invalid source decision request"))));
-    }
-    let agent_lane = tenant.and_then(|Extension(tenant)| {
-        if !auth.is_api_key || auth.user_id().is_nil() || tenant.tenant_id.is_nil()
-            || !auth.has_permission("search:execute") {
-            return None;
-        }
-        let scope = auth.effective_viewer_scope();
-        Some(AgentLaneIdentity {
-            tenant_id: tenant.tenant_id,
-            key_id: auth.api_key_id?,
-            owner_id: auth.user_id(),
-            permissions: auth.claims.permissions.clone(),
-            restricted: scope.is_restricted() || scope.is_artifact_restricted(),
-            source_allowed: query.agent_source.as_ref().map(|source| !scope.deny_set().contains(source)),
-            source: query.agent_source,
-        })
-    });
-    Ok(Json(TokenValidationResponse {
+) -> Json<TokenValidationResponse> {
+    Json(TokenValidationResponse {
         valid: true,
         user_id: auth.claims.sub,
         expires_at: auth.claims.exp,
-        agent_lane,
-    }))
+    })
 }
 
 /// Which authentication methods this deployment currently accepts.
@@ -1343,117 +1011,19 @@ pub async fn get_auth_methods(
         ChangePasswordRequest,
         ChangePasswordResponse,
         CurrentUserResponse,
-        ActiveTenantResponse,
-        CurrentUserDemo,
         TokenValidationResponse,
-        AgentLaneIdentity,
         AuthMethodsResponse
     ))
 )]
 pub struct AuthApiDoc;
 
 #[cfg(test)]
+#[path = "auth_refresh_audit_tests.rs"]
+mod refresh_audit_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn agent_lane_identity_uses_trusted_tenant_and_canonical_viewer_scope() {
-        let key = nanosiem_core::auth::ApiKeyInfo {
-            id: Uuid::now_v7(), name: "desktop".into(),
-            permissions: vec!["search:execute".into()], user_id: Some(Uuid::now_v7()),
-        };
-        let mut auth = AuthContext::from_api_key(&key);
-        auth.denied_sources = nanosiem_core::auth::ScopeSet::from_denied(
-            ["windows_sysmon".to_string()].into_iter().collect());
-        let tenant = TrustedTenantContext { tenant_id: Uuid::now_v7(), tenant_slug: "tenant-a".into() };
-        let query = || axum::extract::Query(AgentLaneValidationQuery { agent_tenant: Some(tenant.tenant_id), agent_source: Some("windows_sysmon".into()) });
-        let Json(response) = validate_token(Extension(auth.clone()), Some(Extension(tenant.clone())), query()).await.unwrap();
-        let identity = response.agent_lane.unwrap();
-        assert_eq!(identity.tenant_id, tenant.tenant_id);
-        assert_eq!(identity.key_id, key.id);
-        assert_eq!(identity.owner_id, key.user_id.unwrap());
-        assert!(identity.restricted);
-        assert_eq!(identity.source.as_deref(), Some("windows_sysmon"));
-        assert_eq!(identity.source_allowed, Some(false));
-        let encoded = serde_json::to_value(&identity).unwrap();
-        assert!(encoded.get("denied_sources").is_none());
-        assert!(encoded.get("artifact_denied_sources").is_none());
-        let public = || axum::extract::Query(AgentLaneValidationQuery::default());
-        assert!(validate_token(Extension(auth.clone()), None, public()).await.unwrap().0.agent_lane.is_none());
-        auth.is_api_key = false;
-        assert!(validate_token(Extension(auth.clone()), Some(Extension(tenant.clone())), public()).await.unwrap().0.agent_lane.is_none());
-        auth.is_api_key = true;
-        auth.claims.permissions.clear();
-        assert!(validate_token(Extension(auth), Some(Extension(tenant)), public()).await.unwrap().0.agent_lane.is_none());
-    }
-
-    /// NAN-3790: on the hosted shared host the plain `emit_audit` path can
-    /// persist nothing (the shared emitter refuses tenantless rows), so every
-    /// auth emission reachable there must use a tenant-aware writer.
-    #[test]
-    fn hosted_reachable_auth_audit_uses_tenant_aware_writers() {
-        let auth = include_str!("auth.rs");
-        let mfa = include_str!("mfa.rs");
-        // Production code only: this test's own literals must not satisfy it.
-        let compact = |source: &str| {
-            source.split("#[cfg(test)]").next().unwrap_or_default().split_whitespace().collect::<String>()
-        };
-        let (auth, mfa) = (compact(auth), compact(mfa));
-        for action in ["LOGIN_FAILED", "USER_LOCKED", "PASSWORD_RESET_REQUEST"] {
-            assert!(auth.contains(&format!(
-                "state.emit_preauth_audit(request.tenant_slug.as_deref(),AuditEvent::builder(AuditSource::Auth,{action})"
-            )), "{action} must be scoped to the route slug's tenant");
-        }
-        assert!(auth.contains("state.emit_preauth_audit(None,AuditEvent::builder(AuditSource::Auth,PASSWORD_RESET_COMPLETE)"));
-        assert!(auth.contains("Ok(user_id)=>{"), "a completed reset is audited for its account");
-        assert!(auth.contains("state.emit_password_reset_complete_audit(*user_id,client_ctx.clone());"));
-        assert!(auth.contains("Some(Extension(tenant))=>state.emit_tenant_auth_audit(tenant,auth.user_id(),vec![logout_event])"));
-        assert!(auth.contains("state.emit_tenant_auth_audit(tenant,auth.user_id(),vec![password_event])"));
-        assert!(mfa.contains("Some(tenant)=>state.emit_tenant_auth_audit(tenant,user.id,vec![setup_complete])"));
-        assert!(mfa.contains("matchoutcome.tenant{Some(tenant)=>state.emit_tenant_auth_audit(tenant,actor_id,events)"));
-    }
-
-    #[cfg(feature = "enterprise")]
-    #[test]
-    fn enterprise_shared_logout_does_not_swallow_durable_revocation_failures() {
-        let source = include_str!("auth.rs");
-        assert!(source.contains("let terminate_result = if shared_logout"));
-        assert!(
-            source.contains("let persistence = nanosiem_core::auth::token::persist_revoked_token")
-        );
-        assert!(source.contains("shared_logout && (termination_failed || persistence_failed)"));
-        assert!(source.contains("Shared-mode durable revocation could not be completed safely"));
-        assert!(source.contains("fn logout_error_response"));
-        assert!(source.contains("clear_refresh_token_cookie"));
-    }
-
-    #[cfg(feature = "enterprise")]
-    #[test]
-    fn enterprise_shared_logout_rejects_a_foreign_refresh_cookie_without_clearing_it() {
-        let user_a = Uuid::now_v7();
-        let user_b = Uuid::now_v7();
-        let tenant_a = Uuid::now_v7();
-        let tenant_b = Uuid::now_v7();
-        assert!(shared_logout_identity_matches(user_a, tenant_a, user_a, tenant_a));
-        assert!(!shared_logout_identity_matches(user_a, tenant_a, user_a, tenant_b));
-        assert!(!shared_logout_identity_matches(user_a, tenant_a, user_b, tenant_a));
-
-        let source = include_str!("auth.rs");
-        assert!(source.contains("logout_error_response_without_cookie_clear"));
-        assert!(source.contains("\"session_replaced\""));
-        assert!(source.contains("if !shared_logout"));
-    }
-
-    #[test]
-    fn normal_shared_logout_revokes_only_the_authenticated_tenant_namespace() {
-        let source = include_str!("auth.rs");
-        let branch = source.split("let terminate_result = if shared_logout {").nth(1).unwrap();
-        let shared = branch.split("} else {").next().unwrap();
-        assert!(shared.contains("tenant.as_ref()"));
-        assert!(shared.contains("terminate_tenant_user_sessions("));
-        assert!(!shared.contains("terminate_all_user_sessions("));
-        assert!(branch.split("} else {").nth(1).unwrap().contains("terminate_all_user_sessions("));
-    }
 
     /// NAN-2080: `change_password` is session-only. An owner-bound API key (whose
     /// `sub` maps to the owner) plus the owner's password must not be able to

@@ -3,6 +3,38 @@
 use super::AppState;
 
 impl AppState {
+    /// Reconcile durable staged/retired lookup generations. This task is
+    /// started only by `start_leader_schedulers`; every pass and retry batch is
+    /// bounded, while per-generation backoff remains durable in PostgreSQL.
+    pub fn start_lookup_generation_cleanup(&self) -> tokio::task::JoinHandle<()> {
+        let reconciler = nanosiem_core::lookup::LookupGenerationReconciler::new(
+            self.pool.clone(),
+            self.dual_pool.clickhouse().clone(),
+        );
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                match reconciler.run_once(50).await {
+                    Ok(report) if report.examined > 0 => tracing::info!(
+                        examined = report.examined,
+                        purged = report.purged,
+                        live_entries_cleared = report.live_journal_entries_cleared,
+                        busy = report.busy,
+                        failed = report.failed,
+                        "Lookup generation cleanup reconciliation completed"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "Lookup generation cleanup reconciliation failed")
+                    }
+                }
+            }
+        })
+    }
+
     /// Start the job store cleanup task
     ///
     /// This spawns a background task that periodically cleans up old jobs

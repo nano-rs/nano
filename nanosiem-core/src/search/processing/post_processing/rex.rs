@@ -8,21 +8,10 @@
 
 use regex::Regex;
 
-use super::helpers::get_nested_map_value;
 use crate::query::RexMode;
 use crate::search::SearchError;
 
 use super::helpers::get_nested_value;
-
-/// Extract named capture group names from a regex pattern
-/// Returns a list of group names in order of appearance
-/// Example: "(?<user>\w+)@(?<domain>\w+)" -> ["user", "domain"]
-fn extract_named_groups(pattern: &str) -> Vec<String> {
-    let re = Regex::new(r"\(\?<([^>]+)>").unwrap();
-    re.captures_iter(pattern)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
-        .collect()
-}
 
 /// Apply rex command as post-processing
 ///
@@ -45,18 +34,39 @@ pub(super) fn apply_rex_post_processing(
 
     match mode {
         RexMode::Extract => {
-            // Extract named capture groups
-            let group_names = extract_named_groups(pattern);
-
-            if group_names.is_empty() {
-                tracing::warn!("Rex pattern has no named capture groups: {}", pattern);
-                return Ok(results);
-            }
-
             // Compile the regex
             let re = Regex::new(pattern).map_err(|e| {
                 SearchError::SqlGenError(format!("Invalid rex pattern '{}': {}", pattern, e))
             })?;
+            // NAN-4933: the regex engine's own group names, so both
+            // `(?<name>…)` and Python's `(?P<name>…)` extract (the hand-rolled
+            // scan knew only the first and silently left the rows unchanged).
+            let group_names: Vec<String> = re.capture_names().flatten().map(str::to_string).collect();
+
+            if group_names.is_empty() {
+                // No named groups: the SQL path's `rex_matches` column
+                // (`extractAll`: the first capturing group, else the match).
+                return Ok(results
+                    .into_iter()
+                    .map(|mut row| {
+                        let source_value = get_nested_value(&row, source_field)
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        if let serde_json::Value::Object(ref mut obj) = row {
+                            let matches: Vec<serde_json::Value> = source_value
+                                .map(|text| {
+                                    re.captures_iter(&text)
+                                        .filter_map(|c| c.get(1).or_else(|| c.get(0)))
+                                        .map(|m| serde_json::Value::String(m.as_str().to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            obj.insert("rex_matches".into(), serde_json::Value::Array(matches));
+                        }
+                        row
+                    })
+                    .collect());
+            }
 
             Ok(results
                 .into_iter()
@@ -70,15 +80,15 @@ pub(super) fn apply_rex_post_processing(
                         (source_value, &mut row)
                     {
                         // Apply regex and extract named groups
-                        if let Some(captures) = re.captures(&source_value) {
-                            for name in &group_names {
-                                if let Some(matched) = captures.name(name.as_str()) {
-                                    obj.insert(
-                                        name.clone(),
-                                        serde_json::Value::String(matched.as_str().to_string()),
-                                    );
-                                }
-                            }
+                        // As the SQL `extractGroups(...)[i]`: '' when the
+                        // pattern or the group does not match.
+                        let captures = re.captures(&source_value);
+                        for name in &group_names {
+                            let text = captures
+                                .as_ref()
+                                .and_then(|c| c.name(name.as_str()))
+                                .map_or("", |m| m.as_str());
+                            obj.insert(name.clone(), serde_json::Value::String(text.to_string()));
                         }
                     }
                     row
@@ -96,9 +106,7 @@ pub(super) fn apply_rex_post_processing(
                 .map(|mut row| {
                     if let serde_json::Value::Object(ref mut obj) = row {
                         // Get the source field value
-                        if let Some(source_value) =
-                            get_nested_map_value(&obj, source_field).and_then(|v| v.as_str())
-                        {
+                        if let Some(source_value) = obj.get(source_field).and_then(|v| v.as_str()) {
                             // Apply regex replacement
                             let replaced = re.replace_all(source_value, replacement.as_str());
                             obj.insert(

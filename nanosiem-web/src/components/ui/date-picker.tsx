@@ -61,12 +61,16 @@ export interface DatePickerProps {
 export function DatePicker({ value, onChange, placeholder = 'Pick a date', disabled, clearable = true, align = 'start', className, id, ...aria }: DatePickerProps) {
   const [open, setOpen] = React.useState(false);
   const selected = parseDay(value);
+  const shown = selected ? format(selected, DAY) : placeholder;
+  // A bare aria-label would replace the button text in the accessible name,
+  // hiding the current value from screen readers — so append it.
+  const accessibleName = aria['aria-label'] ? `${aria['aria-label']}: ${shown}` : undefined;
   return <Popover open={open} onOpenChange={setOpen}>
     <PopoverTrigger asChild>
-      <Button id={id} type="button" variant="outline" disabled={disabled} aria-label={aria['aria-label']}
+      <Button id={id} type="button" variant="outline" disabled={disabled} aria-label={accessibleName}
         className={cn('h-8 justify-start gap-2 px-2.5 font-mono text-[12px] font-normal', !selected && 'text-muted-foreground', className)}>
         <CalendarDays className="size-3.5 shrink-0 opacity-60" strokeWidth={1.5} aria-hidden="true" />
-        <span className="truncate">{selected ? format(selected, DAY) : placeholder}</span>
+        <span className="truncate">{shown}</span>
       </Button>
     </PopoverTrigger>
     <PopoverContent className="w-auto p-2" align={align}>

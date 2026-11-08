@@ -1,5 +1,0 @@
-# The sender Authorization remains bound to its source in the API. This
-# independently authenticates the ingress service on the private API listener.
-map "" $nano_ingress_service_authorization {
-    default "Bearer ${VECTOR_AUTH_TOKEN}";
-}

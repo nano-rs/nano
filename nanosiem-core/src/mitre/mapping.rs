@@ -171,13 +171,33 @@ pub fn mitre_mapping_unchanged(
     };
     let stored_tactics = stored_tactics.as_deref().unwrap_or_default();
     let stored_techniques = stored_techniques.as_deref().unwrap_or_default();
-    let Ok(requested) = canonicalize_mitre_mappings(
-        tactics.unwrap_or(stored_tactics),
-        techniques.unwrap_or(stored_techniques),
-    ) else {
+    let (tactics, techniques) = effective_mitre_mapping(stored, tactics, techniques);
+    let Ok(requested) = canonicalize_mitre_mappings(tactics, techniques) else {
         return false;
     };
     requested.tactics == stored_tactics && requested.techniques == stored_techniques
+}
+
+/// The `(tactics, techniques)` an UPDATE would write: each list absent from
+/// the request keeps the edited rule's stored value (`stored`), and falls back
+/// to empty for a create / unknown rule. Validate must check this merged
+/// mapping, not the request's halves alone (NAN-4902 review).
+pub fn effective_mitre_mapping<'a>(
+    stored: Option<&'a (Option<Vec<String>>, Option<Vec<String>>)>,
+    tactics: Option<&'a [String]>,
+    techniques: Option<&'a [String]>,
+) -> (&'a [String], &'a [String]) {
+    let (stored_tactics, stored_techniques) = match stored {
+        Some((tactics, techniques)) => (
+            tactics.as_deref().unwrap_or_default(),
+            techniques.as_deref().unwrap_or_default(),
+        ),
+        None => (&[][..], &[][..]),
+    };
+    (
+        tactics.unwrap_or(stored_tactics),
+        techniques.unwrap_or(stored_techniques),
+    )
 }
 
 pub(crate) fn database_mapping_violation(error: &sqlx::Error) -> Option<String> {
@@ -187,6 +207,10 @@ pub(crate) fn database_mapping_violation(error: &sqlx::Error) -> Option<String> 
     (database.constraint() == Some(MITRE_MAPPING_CONSTRAINT))
         .then(|| database.message().to_string())
 }
+
+#[cfg(test)]
+#[path = "mapping_merge_tests.rs"]
+mod mapping_merge_tests;
 
 #[cfg(test)]
 mod tests {

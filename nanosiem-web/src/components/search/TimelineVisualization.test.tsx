@@ -8,6 +8,7 @@ import { TimelineVisualization } from './TimelineVisualization';
 
 vi.mock('@/hooks/use-api', () => ({ usePrevalenceScatterData: () => ({ mutate: vi.fn() }) }));
 vi.mock('@/hooks/use-internal-domains', () => ({ useInternalDomains: () => [] }));
+vi.mock('@/hooks/useSchemaFieldMap', () => ({ useSchemaFieldMap: () => ({ isOcsf: false }) }));
 vi.mock('recharts', async importOriginal => {
   const actual = await importOriginal<typeof import('recharts')>();
   return { ...actual,

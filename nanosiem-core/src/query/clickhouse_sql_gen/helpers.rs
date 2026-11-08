@@ -25,11 +25,7 @@ pub(crate) fn generate_settings(
     has_selective_indexed_eq: bool,
     is_non_timechart_aggregation: bool,
 ) -> String {
-    let read_in_order = if has_selective_indexed_eq || is_non_timechart_aggregation {
-        0
-    } else {
-        1
-    };
+    let read_in_order = if has_selective_indexed_eq || is_non_timechart_aggregation { 0 } else { 1 };
     let agg_in_order = if is_non_timechart_aggregation { 0 } else { 1 };
     if use_cache {
         format!(
@@ -238,6 +234,12 @@ pub(crate) fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (S
         if field.starts_with("ext.") && !gen.resolves_to_json_path(field) {
             return (escape_identifier(field), false);
         }
+        // NAN-4934: past stage_0 a tail field it projected is a plain String
+        // column. No cast and no re-alias: `toString("f") AS "f"` would make a
+        // `GROUP BY toString("f")` bind the alias, not stage_0's column (Code 215).
+        if let Some(alias) = gen.stage_tail_alias(field, "String") {
+            return (alias, false);
+        }
         return (gen.generate_json_extract(field, "String"), true);
     }
 
@@ -287,6 +289,10 @@ pub(crate) fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (S
         } else {
             "String"
         };
+        // NAN-4934: see the dotted branch above.
+        if let Some(alias) = gen.stage_tail_alias(field, json_type) {
+            return (alias, false);
+        }
         return (gen.field_access_expr(field, json_type), true);
     }
     // For unknown fields without metadata_ prefix and no dots:
@@ -639,6 +645,9 @@ pub(crate) fn escape_regex_pattern(s: &str) -> String {
 ///   JSONExtractFloat on every edge probed: numeric strings ("42.5"→42.5),
 ///   non-numeric strings (→NULL→0), bools (true→1), objects/arrays (→NULL→0).
 ///   (Suffix nomenclature: the extractor is `Float`, NOT `Float64` — NAN-1383.)
+/// - `"NullableFloat"` → `accurateCastOrNull(sub, 'Float64')`: the predicate
+///   form for numeric OCSF attributes (NAN-4918). Absent / malformed values
+///   stay NULL so a comparison excludes them rather than treating them as 0.
 /// - anything else (`"Bool"`, raw forms) → the legacy `JSONExtract{T}` form.
 ///   `Bool` is deliberately NOT converted: `accurateCastOrNull('true','Bool')`
 ///   is `true` where `JSONExtractBool` returns `false` for string-typed values,
@@ -659,12 +668,46 @@ pub(crate) fn escape_regex_pattern(s: &str) -> String {
 /// into shared data, which subcolumn reads must scan — less surgical, but never
 /// worse than the full-event decode this replaces.
 pub(crate) fn json_tail_access_sql(col: &str, path: &[String], json_type: &str) -> String {
+    if path.iter().any(|p| p == JSON_ARRAY_SEGMENT) {
+        return json_array_access_sql(col, path, json_type);
+    }
     let segments: Vec<String> = path
         .iter()
         .map(|p| format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\"\"")))
         .collect();
     let sub = format!("{}.{}", col, segments.join("."));
+    // CH-2610 adoption: a JSON type hint (`json_hints.json`) stores the path as
+    // a typed Nullable(String) subcolumn, and the insert cast turns any value a
+    // producer sends there (number, object, array) into its text. So the typed
+    // subcolumn alone answers both the scalar and the object case: reading it
+    // skips the `event.^path` sub-object read, which scans the shared data and
+    // dominated the cost (measured 3.3-4.3x warm on equality/presence/wildcard
+    // filters over the hinted path, identical results). A NULL is an absent
+    // path, as for Dynamic paths. Gated on the hint being physically present in
+    // this deployment's table (`is_event_json_hint` reads the boot-detected
+    // live schema): on an unhinted table an object value sits in `event.^path`
+    // and only the parity form below finds it.
+    if col == "event"
+        && matches!(json_type, "String" | "Presence")
+        && crate::schema::is_event_json_hint(&path.join("."))
+    {
+        let typed = format!("ifNull(toString({sub}), '')");
+        return if json_type == "String" {
+            typed
+        } else {
+            format!("({typed} NOT IN ('', '[]'))")
+        };
+    }
     match json_type {
+        "Presence" => {
+            let subtree = format!("toJSONString({}.^{})", col, segments.join("."));
+            // Serialize the Dynamic value before checking emptiness: [] is
+            // absent, but the string "[]", numeric zero and false are present.
+            // Objects live in the subtree rather than the scalar subcolumn.
+            format!(
+                "(({sub} IS NOT NULL AND toJSONString({sub}) NOT IN ('\"\"', '[]')) OR {subtree} != '{{}}')"
+            )
+        }
         "String" => {
             let subtree = format!("toJSONString({}.^{})", col, segments.join("."));
             format!(
@@ -672,18 +715,71 @@ pub(crate) fn json_tail_access_sql(col: &str, path: &[String], json_type: &str) 
             )
         }
         "Float" => format!("coalesce(accurateCastOrNull({sub}, 'Float64'), 0.)"),
+        // NAN-4918: predicate form. Absent or non-numeric stays NULL, so SQL
+        // three-valued logic excludes the row from `<`, `!=`, `IN`, `NOT IN`
+        // alike instead of comparing a fabricated 0.
+        "NullableFloat" => format!("accurateCastOrNull({sub}, 'Float64')"),
         _ => {
             let path_args: Vec<String> = path
                 .iter()
                 .map(|p| format!("'{}'", escape_string(p)))
                 .collect();
-            format!(
-                "JSONExtract{}({}, {})",
-                json_type,
-                col,
-                path_args.join(", ")
-            )
+            format!("JSONExtract{}({}, {})", json_type, col, path_args.join(", "))
         }
+    }
+}
+
+/// Path-segment marker for an OCSF array (NAN-4903). A profile puts it after a
+/// segment that is an array: `["answers", "[]", "rdata"]` is `answers[].rdata`
+/// (array of objects); a trailing marker (`["email", "to", "[]"]`) is a leaf
+/// array of scalars. [`json_tail_access_sql`] then returns an `Array(String)`
+/// (or `Array(Float64)`) expression instead of a scalar.
+pub(crate) const JSON_ARRAY_SEGMENT: &str = "[]";
+
+/// Array form of [`json_tail_access_sql`] for paths carrying
+/// [`JSON_ARRAY_SEGMENT`] markers.
+///
+/// - Arrays of objects use ClickHouse's native `col."a"[]."b"` element access
+///   (`Array(Dynamic)`, NULL where an element lacks the key); nested arrays
+///   (`a[].b[].c`) come back as `Array(Array(..))` and are `arrayFlatten`ed so
+///   membership (`has`) sees every value.
+/// - A trailing marker is a leaf array of scalars (`email.to`): the subcolumn is
+///   a `Dynamic` that normally holds an array, but a producer may send a lone
+///   scalar, so the cast is guarded by `dynamicType` (a bare CAST of a String
+///   value throws "Array does not start with '['" — measured on 26.10).
+///
+/// Elements are stringified with `ifNull(toString(x), '')`, so missing keys
+/// keep their slot (positional, like the promoted array columns) and compare as
+/// `''`. `toString()` of the result renders `['a','b']`, the shape rule evals
+/// such as `tostring(module.file.signatures.state) CONTAINS "'valid'"` expect.
+fn json_array_access_sql(col: &str, path: &[String], json_type: &str) -> String {
+    let quote = |p: &str| format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\"\""));
+    let leaf_array = path.last().map(String::as_str) == Some(JSON_ARRAY_SEGMENT);
+    let body = if leaf_array { &path[..path.len() - 1] } else { path };
+    let mut expr = col.to_string();
+    let mut depth = 0usize;
+    for seg in body {
+        if seg == JSON_ARRAY_SEGMENT {
+            expr.push_str("[]");
+            depth += 1;
+        } else {
+            expr.push('.');
+            expr.push_str(&quote(seg));
+        }
+    }
+    let elems = if depth == 0 {
+        // Leaf scalar array only.
+        format!(
+            "if(dynamicType({expr}) LIKE 'Array(%', CAST({expr}, 'Array(Nullable(String))'), if(isNull({expr}), [], [toString({expr})]))"
+        )
+    } else if depth > 1 {
+        format!("arrayFlatten({expr})")
+    } else {
+        expr
+    };
+    match json_type {
+        "Float" | "NullableFloat" => format!("arrayMap(x -> coalesce(accurateCastOrNull(x, 'Float64'), 0.), {elems})"),
+        _ => format!("arrayMap(x -> ifNull(toString(x), ''), {elems})"),
     }
 }
 
@@ -702,9 +798,9 @@ pub(crate) fn json_tail_access_sql(col: &str, path: &[String], json_type: &str) 
 pub(crate) fn map_tail_access_sql(col: &str, fallback: Option<&str>, key: &str) -> String {
     let k = escape_string(key);
     match fallback {
-        Some(fb) => {
-            format!("if(has({col}, '{k}'), {col}['{k}'], if(has({fb}, '{k}'), {fb}['{k}'], ''))")
-        }
+        Some(fb) => format!(
+            "if(has({col}, '{k}'), {col}['{k}'], if(has({fb}, '{k}'), {fb}['{k}'], ''))"
+        ),
         None => format!("if(has({col}, '{k}'), {col}['{k}'], '')"),
     }
 }
@@ -738,7 +834,7 @@ pub(crate) const GUARD_TOKEN_MIN_LEN: usize = 6;
 /// needle is a single token: any non-alphanumeric char in the needle (space,
 /// `.`, `-`, `_`, `/`, …) makes the index bail and the column full-scans —
 /// measured up to 307x read_bytes on `%failed login%` vs `%failed%`. The fix:
-/// AND an index-servable guard `... iLike '%<longest token>%'` after the
+/// AND an index-servable guard `... LIKE '%<longest token>%'` after the
 /// full-needle predicate (full-needle first — see the Keyword arm for the
 /// ordering rationale). Every token is a contiguous substring of the needle,
 /// so `full ∧ guard ≡ full` — byte-identical results by construction.
@@ -748,7 +844,7 @@ pub(crate) const GUARD_TOKEN_MIN_LEN: usize = 6;
 /// [`GUARD_TOKEN_MIN_LEN`]+letter bar; picks the longest qualifying token,
 /// ties resolving to the first occurrence (deterministic SQL). Single-token
 /// needles return `None` so their emission shape is untouched (the
-/// single-token iLike is already index-served with DIRECT READ — do not
+/// single-token LIKE is already index-served with DIRECT READ — do not
 /// disturb it). Longest-token-only is deliberate: ANDing *all* tokens was
 /// measured to regress dense matches (CPU 0.90M→1.63M µs) for marginal I/O
 /// gain.
@@ -799,15 +895,15 @@ fn guard_token_scan(needle_lower: &str) -> (usize, Option<&str>) {
 ///
 /// Same token bar and extraction as [`longest_guard_token`], with one deliberate
 /// policy difference: **single-token literals DO return a guard**. The ≥2-token
-/// requirement over there exists because a single-token `iLike '%tok%'` primary
+/// requirement over there exists because a single-token `LIKE '%tok%'` primary
 /// predicate is already text-index-served, so a guard would be redundant. Here
 /// the primary predicate is `startsWith`/`endsWith`, which NO skip index serves
 /// (text-index analysis yields `tokens: []` — EXPLAIN-verified), so even a
-/// single-token literal like `powershell` needs the iLike conjunct to engage the
+/// single-token literal like `powershell` needs the LIKE conjunct to engage the
 /// `lower(col)` text index (Saturn: 19.97GiB → 25.71MiB read_bytes, 795x).
 ///
 /// Soundness: the token is a contiguous substring of the anchored literal, so
-/// `startsWith(x, lit) ⇒ x iLike '%tok%'` (likewise `endsWith`) — ANDing the
+/// `startsWith(x, lit) ⇒ x LIKE '%tok%'` (likewise `endsWith`) — ANDing the
 /// guard is a pure conjunctive implication, results identical by construction.
 /// Like the keyword guard, the returned token is pure ASCII-alnum: no LIKE
 /// metachars, no quotes, no escaping needed.
@@ -840,8 +936,8 @@ pub(crate) fn anchored_guard_token(literal_lower: &str) -> Option<&str> {
 ///   not `update`). Substring matching that spans token boundaries can't be
 ///   served by a posting-list lookup — it requires the dictionary/`position`
 ///   full scan (77–250× slower) — so substring intent goes through the explicit
-///   `*kw*` / `CONTAINS` arms (still iLike). Splunk parity.
-/// * **No token content** (`!!!`, `---`) → fall back to the substring iLike; the
+///   `*kw*` / `CONTAINS` arms (still LIKE). Splunk parity.
+/// * **No token content** (`!!!`, `---`) → fall back to the substring LIKE; the
 ///   text index has no tokens to serve (rare).
 ///
 /// Multi-token needles are pure token-AND — we deliberately do NOT add a
@@ -884,22 +980,14 @@ pub(crate) fn anchored_guard_token(literal_lower: &str) -> Option<&str> {
 /// `lower(if(raw_data != '', raw_data, message))`. ClickHouse builds the index but
 /// the planner NEVER considers it (EXPLAIN shows no `Skip` entry at all) — text
 /// indexes do not match a non-trivial expression. Do not retry it.
-///
-/// NULL columns: the lean lake reads Parquet where an absent `message` /
-/// `raw_data` is NULL, so a leg here can evaluate to NULL. That is harmless for a
-/// positive search (NULL filters like false, and `NULL OR true` is true) but not
-/// under negation — see [`null_safe_not`], which every `NOT` goes through.
-pub(crate) fn bare_keyword_predicate(kw: &str, cols: &[&str], term_adjacency: bool) -> String {
-    debug_assert!(
-        !cols.is_empty(),
-        "keyword_search_columns() must never be empty"
-    );
+pub(crate) fn bare_keyword_predicate(kw: &str, cols: &[&str]) -> String {
+    debug_assert!(!cols.is_empty(), "keyword_search_columns() must never be empty");
     match cols {
-        [col] => bare_keyword_predicate_for_column(kw, col, term_adjacency),
+        [col] => bare_keyword_predicate_for_column(kw, col),
         _ => {
             let folded = cols
                 .iter()
-                .map(|col| bare_keyword_predicate_for_column(kw, col, term_adjacency))
+                .map(|col| bare_keyword_predicate_for_column(kw, col))
                 .collect::<Vec<_>>()
                 .join(" OR ");
             // Parenthesized: the caller splices this into a larger AND-chain, and
@@ -910,288 +998,45 @@ pub(crate) fn bare_keyword_predicate(kw: &str, cols: &[&str], term_adjacency: bo
     }
 }
 
-/// Negate a search predicate with two-valued (search) semantics, not SQL's
-/// three-valued logic (NAN-3037).
-///
-/// In search, a field or body column that is absent does not match any
-/// positive term, so `NOT <term>` must match it. SQL disagrees: on a NULL
-/// column `hasAllTokens(lower(message), 'x')` is NULL, `NOT NULL` is NULL, and
-/// WHERE drops the row. On the lean lake (Parquet, nullable columns) this made
-/// `svchost NOT <absent token>` return only the rows that had BOTH body columns
-/// set (6,821 of 116,486 live). `ifNull(inner, false)` turns "unknown" into
-/// "did not match" before negating.
-///
-/// This is the only place NULL needs folding. AND/OR are monotone, so under
-/// Kleene logic a NULL result means "false once every NULL leaf is false";
-/// WHERE already reads a top-level NULL as false, and every nested NOT is
-/// folded here. The result is exactly "a missing value never matches a leaf".
-///
-/// That gives the Splunk contract:
-/// - `field!=value` is a LEAF and excludes rows missing the field (NULL leaf);
-/// - `NOT field=value` includes them (NULL leaf, folded to false, negated).
-///
-/// Gen1 (MergeTree) body and UDM columns are non-Nullable, so `ifNull` is a
-/// no-op there and the results are unchanged. Skip indexes cannot prune a
-/// negated text/bloom predicate, so no index use is lost.
-pub(crate) fn null_safe_not(inner_sql: &str) -> String {
-    format!("NOT ifNull(({inner_sql}), false)")
-}
-
 /// The single-column predicate. Every arm below must stay index-compatible: the
 /// emitted expression is matched by ClickHouse against the text index BY
 /// EXPRESSION, so `lower(<col>)` here must mirror the DDL exactly.
-fn bare_keyword_predicate_for_column(kw: &str, col: &str, term_adjacency: bool) -> String {
-    let lowered = kw.to_lowercase();
+fn bare_keyword_predicate_for_column(kw: &str, col: &str) -> String {
+    // ClickHouse `lower()` semantics (ASCII only) so the literal agrees with the
+    // `lower(col)` side — see [`ch_lower`].
+    let lowered = ch_lower(kw);
 
     // Explicit wildcards (`cmd*`, `*cmd`, `c?d`, `**`) are partial-match intent →
-    // an iLike pattern on the text index, NOT a token lookup. This is the
+    // a `lower(col) LIKE` pattern on the text index, NOT a token lookup. This is the
     // documented escape hatch from token search. Checked FIRST so wildcard-only
     // needles (`**`, `?`) convert to `%`/`_` rather than falling into the
     // all-separator literal branch below. (`*cmd*` is already lowered to a
     // wildcard upstream; this covers single-sided forms that reach here as a bare
     // Keyword and stops `hasAllTokens` from tokenizing a `*`/`?` needle.)
     if lowered.contains('*') || lowered.contains('?') {
-        return wildcard_keyword_predicate_for_column(&lowered, col);
+        let pattern = wildcard_to_like_pattern(&lowered);
+        return ci_like(&format!("lower({col})"), &pattern, false);
     }
 
     let escaped = escape_string(&lowered);
 
-    // All-separator needles (`!!!`) tokenize to nothing — keep the substring iLike.
-    if lowered
-        .chars()
-        .all(|c| c.is_ascii() && !c.is_ascii_alphanumeric())
-    {
-        return format!("lower({col}) iLike '%{}%'", escape_like_pattern(&escaped));
+    // All-separator needles (`!!!`) tokenize to nothing — keep the substring match.
+    if lowered.chars().all(|c| c.is_ascii() && !c.is_ascii_alphanumeric()) {
+        let pattern = escape_like_pattern(&escaped);
+        return ci_like(&format!("lower({col})"), &format!("%{pattern}%"), false);
     }
 
-    // NAN-4164: an ASCII multi-token needle is the exact term regex alone.
-    // It implies the token test (see `keyword_term_regex_ascii_exact`), and
-    // `hasAllTokens(lower(col), …)` copies and tokenizes every value: on a
-    // 2.1M-row raw_data scan on a large tenant, the token-guarded form cost 0.6-0.8 s
-    // over a 0.3 s read floor, the regex alone 0.1 s, same rows.
-    if term_adjacency {
-        if let Some(term) = keyword_term_regex_ascii_exact(&lowered) {
-            return format!("match({col}, '{}')", escape_regex_pattern(&term));
-        }
-    }
-    let tokens = format!("hasAllTokens(lower({col}), '{}')", escaped);
-    match term_adjacency.then(|| keyword_term_regex(&lowered)).flatten() {
-        Some(term) => format!("({tokens} AND match({col}, '{}'))", escape_regex_pattern(&term)),
-        None => tokens,
-    }
-}
-
-/// NAN-4288 (F17): a backslash in a phrase matches a RUN of backslashes.
-///
-/// Raw text keeps a JSON event's escaping, so Sysmon stores
-/// `C:\\Windows\\System32\\svchost.exe` with doubled backslashes, while
-/// analysts paste the path as it displays, with single ones. The phrase then
-/// never matched (0 rows against 78,126 for the field compare). Backslashes
-/// are token separators, so the token prefilter is unchanged.
-const ESCAPED_BACKSLASH_RUN: &str = r"\\+";
-
-/// NAN-4164: the adjacency regex of a bare keyword that ClickHouse splits
-/// into two or more tokens; `None` for a single-token needle (token search
-/// is already exact for it).
-///
-/// Token-AND alone lets the pieces match anywhere in the event, which is
-/// wrong for exactly the needles analysts type most: on the live lean tenant
-/// `"10.1.4.20"` matched 13,766 events in an hour where 646 hold the IP
-/// (`10`, `1`, `4` and `20` occur in nearly every timestamp), and
-/// `"failed password"` matched 2,207 events where none holds the phrase.
-/// The needle is matched as a TERM instead: the characters in order, with a
-/// token boundary on each end. The regex requires the needle's characters in
-/// order (case-insensitive, a run of whitespace matching any whitespace run)
-/// and, where the needle starts/ends with an alphanumeric, an ASCII
-/// non-alphanumeric neighbour: the ClickHouse token boundary, where every
-/// non-ASCII byte is a token character. The lake's adjacent-pair index
-/// (NAN-4164 v5 `tokens.nti`) relies on that edge: a matching needle's pieces
-/// are then whole, adjacent index tokens. So `10.1.4.20` no longer
-/// matches `110.1.4.201`, and `ws-fin-095` no longer matches
-/// `ws-fin-0951`. Every match still satisfies `hasAllTokens`, which stays in
-/// front as the cheap prefilter and the token-index hint.
-pub(crate) fn keyword_term_regex(lowered: &str) -> Option<String> {
-    let mut pieces = 0;
-    let mut in_token = false;
-    for byte in lowered.bytes() {
-        let token_byte = byte.is_ascii_alphanumeric() || byte >= 0x80;
-        if token_byte && !in_token {
-            pieces += 1;
-        }
-        in_token = token_byte;
-    }
-    if pieces < 2 {
-        return None;
-    }
-    let is_alnum = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
-    let trimmed = lowered.trim();
-    let mut regex = String::from("(?i)");
-    if is_alnum(trimmed.chars().next()) {
-        regex.push_str(r"(?:^|[^a-z0-9\x{80}-\x{10FFFF}])");
-    }
-    let mut literal = String::new();
-    let mut in_space = false;
-    for c in trimmed.chars() {
-        if c.is_whitespace() {
-            if !in_space {
-                regex.push_str(&regex::escape(&literal));
-                literal.clear();
-                regex.push_str(r"\s+");
-            }
-            in_space = true;
-        } else if c == '\\' {
-            // NAN-4288 (F17): see `ESCAPED_BACKSLASH_RUN`.
-            in_space = false;
-            regex.push_str(&regex::escape(&literal));
-            literal.clear();
-            regex.push_str(ESCAPED_BACKSLASH_RUN);
-        } else {
-            in_space = false;
-            literal.push(c);
-        }
-    }
-    regex.push_str(&regex::escape(&literal));
-    if is_alnum(trimmed.chars().last()) {
-        regex.push_str(r"(?:$|[^a-z0-9\x{80}-\x{10FFFF}])");
-    }
-    Some(regex)
-}
-
-/// NAN-4164: [`keyword_term_regex`] for an ASCII needle, folding case with
-/// ASCII classes (`[Ff]`) instead of `(?i)`, so a match is EXACTLY
-/// `hasAllTokens(lower(col), needle) AND match(col, keyword_term_regex)`:
-///
-/// - `lower` and the token searcher fold ASCII only, while RE2's `(?i)` also
-///   folds `ſ` to `s` and the Kelvin sign to `k`; ASCII classes fold exactly
-///   what `lower` folds, so the regex alone never accepts a value the token
-///   test rejects for case;
-/// - every needle piece (an ASCII alphanumeric run, which is what
-///   `splitByNonAlpha` makes of an ASCII needle) is matched whole: its
-///   neighbours are the needle's own separators (matched literally, or `\s+`
-///   for whitespace) or, at an alphanumeric end, the boundary class
-///   `[^A-Za-z0-9\x{80}-\x{10FFFF}]` (a non-token ASCII byte) or the value's
-///   edge. So every piece is a token of the value, which is the token test.
-///
-/// `None` for a non-ASCII needle (its edges and folding need the token test)
-/// and for a single-token needle (token search is already exact).
-pub(crate) fn keyword_term_regex_ascii_exact(lowered: &str) -> Option<String> {
-    if !lowered.is_ascii() {
-        return None;
-    }
-    keyword_term_regex(lowered)?;
-    let trimmed = lowered.trim();
-    let starts = trimmed.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
-    let ends = trimmed.chars().last().is_some_and(|c| c.is_ascii_alphanumeric());
-    const EDGE: &str = r"[^A-Za-z0-9\x{80}-\x{10FFFF}]";
-    let mut regex = String::new();
-    if starts {
-        regex.push_str(&format!("(?:^|{EDGE})"));
-    }
-    let mut in_space = false;
-    for c in trimmed.chars() {
-        if c.is_whitespace() {
-            if !in_space {
-                regex.push_str(r"\s+");
-            }
-            in_space = true;
-            continue;
-        }
-        in_space = false;
-        if c == '\\' {
-            regex.push_str(ESCAPED_BACKSLASH_RUN);
-        } else if c.is_ascii_alphabetic() {
-            regex.push('[');
-            regex.push(c.to_ascii_uppercase());
-            regex.push(c.to_ascii_lowercase());
-            regex.push(']');
-        } else {
-            regex.push_str(&regex::escape(&c.to_string()));
-        }
-    }
-    if ends {
-        regex.push_str(&format!("(?:$|{EDGE})"));
-    }
-    Some(regex)
-}
-
-/// A bare keyword carrying `*`/`?` (NAN-3041): Splunk TERM semantics.
-///
-/// `svch*` matches any term that STARTS with `svch` (`svchost.exe` anywhere in
-/// the body), `*host.exe` any term that ends with it, `svc*exe` a term that
-/// starts `svc` and ends `exe`. The old lowering was a whole-value
-/// `iLike 'svch%'`, which only matched when the ENTIRE message/raw_data began
-/// with `svch` — effectively never.
-///
-/// Emitted as `lower(col) iLike '%<pieces>%' AND match(col, <term regex>)`:
-/// - the `iLike` guard is the pre-existing substring form, implied by the term
-///   match (so it never drops a row), and keeps the gen1 `lower(col)` text
-///   index and the lean fragment/`positionCaseInsensitive` prefilters working;
-/// - the regex adds the term boundaries. A boundary is a character outside
-///   `[a-z0-9]` — the `splitByNonAlpha` / `nano_split_lower_v1` token rule — and
-///   is only required on a side that is not already a wildcard and whose
-///   needle character is itself alphanumeric. Inside the term, `*` spans any
-///   non-whitespace run and `?` one non-whitespace character.
-///
-/// `*kw*` (wildcards on both ends only) needs no boundary and stays the plain
-/// substring `iLike` (NAN-3034). Candidate hints for these needles are
-/// `contains`-mode (lake_query_compile), whose pruning only requires pieces as
-/// substrings — a superset of the term match, so the keyword index never
-/// prunes a matching block.
-fn wildcard_keyword_predicate_for_column(lowered: &str, col: &str) -> String {
-    let like = wildcard_to_like_pattern(lowered);
-    let first = lowered.chars().next();
-    let last = lowered.chars().last();
-    let is_wild = |c: Option<char>| matches!(c, Some('*' | '?'));
-    let is_alnum = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
-    let needs_start = !is_wild(first) && is_alnum(first);
-    let needs_end = !is_wild(last) && is_alnum(last);
-    let body = lowered.trim_matches('*');
-    if !needs_start && !needs_end && !body.contains(['*', '?']) {
-        // `*kw*` / `*-enc*` / all-wildcard: substring semantics already.
-        return format!("lower({col}) iLike '{like}'");
-    }
-
-    // Substring guard: the needle unanchored on both ends.
-    let guard_like = format!(
-        "{}{}{}",
-        if lowered.starts_with('*') { "" } else { "%" },
-        like,
-        if lowered.ends_with('*') { "" } else { "%" }
-    );
-
-    let mut term_regex = String::from("(?i)");
-    if needs_start {
-        term_regex.push_str("(?:^|[^a-z0-9])");
-    }
-    let mut literal = String::new();
-    for c in body.chars() {
-        match c {
-            '*' | '?' => {
-                term_regex.push_str(&regex::escape(&literal));
-                literal.clear();
-                term_regex.push_str(if c == '*' { r"\S*" } else { r"\S" });
-            }
-            other => literal.push(other),
-        }
-    }
-    term_regex.push_str(&regex::escape(&literal));
-    if needs_end {
-        term_regex.push_str("(?:$|[^a-z0-9])");
-    }
-    format!(
-        "(lower({col}) iLike '{guard_like}' AND match({col}, '{}'))",
-        escape_regex_pattern(&term_regex)
-    )
+    format!("hasAllTokens(lower({col}), '{}')", escaped)
 }
 
 /// Add LIKE-pattern escaping on top of an already SQL-escaped string (single
 /// quotes doubled, backslashes doubled by `escape_string`) so that it matches
-/// as a literal substring inside an `iLike '%X%'` body.
+/// as a literal substring inside an `LIKE '%X%'` body.
 ///
-/// In ClickHouse LIKE/iLike, `\` is the pattern escape character, so a literal
+/// In ClickHouse LIKE/LIKE, `\` is the pattern escape character, so a literal
 /// backslash needs `\\` *in the pattern value* — which, after the string-literal
 /// layer, is `\\\\` in the SQL text. `escape_string` only produced `\\` (one
-/// backslash in the pattern value), which iLike then consumed as an escape,
+/// backslash in the pattern value), which LIKE then consumed as an escape,
 /// silently matching nothing — so every `CONTAINS`/keyword over a Windows path
 /// (`C:\Windows\System32\`, `\NETLOGON\`, …) failed to match. We therefore
 /// double the (already-doubled) backslashes here, and escape `%`/`_` so literal
@@ -1199,17 +1044,105 @@ fn wildcard_keyword_predicate_for_column(lowered: &str, col: &str) -> String {
 ///
 /// Use this for the codegen path that lowered to `hasToken*` pre-NAN-1026 —
 /// `hasToken` is whole-token semantic and silently drops fragments like
-/// `/dc/` not matching `srv-dc01`; iLike with the splitByNonAlpha text index
+/// `/dc/` not matching `srv-dc01`; LIKE with the splitByNonAlpha text index
 /// (CH 26.4's LIKE-via-dictionary-scan) gives both correct substring
 /// semantics AND granule pruning.
 pub(crate) fn escape_like_pattern(escaped: &str) -> String {
     // Backslash first: each `\` (the SQL-escape layer already made them pairs)
-    // becomes `\\` in the pattern value so iLike matches it literally. The `\\`
+    // becomes `\\` in the pattern value so LIKE matches it literally. The `\\`
     // we add for `%`/`_` is then NOT re-doubled (it's added after this step).
     escaped
         .replace('\\', "\\\\")
         .replace('%', "\\\\%")
         .replace('_', "\\\\_")
+}
+
+/// Lowercase a literal exactly the way ClickHouse `lower()` does: ASCII letters
+/// only (`lower('ÄÉЖ') = 'ÄÉЖ'`, verified on 26.10.3.7; `lowerUTF8` is the
+/// Unicode one). Every case-insensitive pattern compares `lower(<col>)` with a
+/// literal lowered HERE, so both sides must use the same mapping: Rust's
+/// Unicode `to_lowercase()` would turn `Äbc` into `äbc`, which `lower(col)` can
+/// never produce from the stored `Äbc`, and the search would silently miss it.
+pub(crate) fn ch_lower(s: &str) -> String {
+    s.to_ascii_lowercase()
+}
+
+/// THE case-insensitive pattern predicate of nPL (NAN-4943). Every literal
+/// `*kw*` / `kw*` / `*kw` wildcard, `CONTAINS`, `STARTSWITH`, `ENDSWITH`,
+/// explicit `LIKE`, simple-regex token, keyword fallback and regex-literal
+/// rewrite — and the negation of each — is emitted here and nowhere else:
+///
+/// ```sql
+/// lower(<expr>) [NOT ]LIKE '<pattern lowered with ClickHouse lower() semantics>'
+/// ```
+///
+/// `body` is the SQL text between the quotes: already string-escaped and
+/// LIKE-escaped by the caller (`escape_like_pattern` for a user literal,
+/// `wildcard_to_like_pattern` for `*`/`?` wildcards, plain `escape_string` for
+/// an explicit `LIKE` whose `%`/`_` are intentional). It is ASCII-lowercased
+/// again here so the invariant cannot be broken by a caller; that is safe on
+/// escaped text because `escape_string` doubles every backslash, so no letter
+/// ever follows a lone `\` (lowercasing `\N` into `\n` cannot happen).
+///
+/// `lhs` is the index expression. An expression that is already `lower(…)`
+/// (the exact form of the `lower(col)` text indexes — ClickHouse matches skip
+/// indexes BY EXPRESSION) is used as is; anything else (`toString(ext.x)`, a
+/// CTE column) is wrapped in `lower(…)`.
+///
+/// **Semantics: case-insensitive = lowercase match**, the same rule as
+/// `field=value` → `lower(col) = '<lowered>'`. ClickHouse `ILIKE` is no longer
+/// emitted for a literal: on 26.10 the text index does not serve
+/// `lower(col) ILIKE` (k-patterns like `%mimikatz%` read the whole column),
+/// while `lower(col) LIKE` is served by the index dictionary scan. Consequences,
+/// pinned by `ci_like_parity_integration`:
+///
+/// - mixed-case ASCII: identical to `ILIKE` and to `=`;
+/// - non-ASCII letters match their own case only (`*Äbc*` finds `ÄBC`'s `Ä`
+///   but not `äbc`; Cyrillic likewise), because `lower()` folds ASCII only;
+/// - U+212A KELVIN SIGN and U+017F LONG S are distinct characters: `*kelvin*`
+///   does not match `Kelvin` written with the Kelvin sign (26.10 `ILIKE` did),
+///   and `*svchost*` does not match `ſvchost` (26.10 `ILIKE` did not either).
+///   To every OS these are different names; detection loses nothing.
+///
+/// Expression-valued patterns (`CONTAINS other_field`, `STARTSWITH <expr>`)
+/// do not come through here: their case and charset are only known at run time,
+/// so they keep `iLike concat(…)`.
+pub(crate) fn ci_like(lhs: &str, body: &str, negate: bool) -> String {
+    let not = if negate { "NOT " } else { "" };
+    let body = body.to_ascii_lowercase();
+    if is_lower_call(lhs) {
+        format!("{lhs} {not}LIKE '{body}'")
+    } else {
+        format!("lower({lhs}) {not}LIKE '{body}'")
+    }
+}
+
+/// True when `expr` is one whole `lower( … )` call (not `lower(a) || b`).
+fn is_lower_call(expr: &str) -> bool {
+    let Some(inner) = expr.strip_prefix("lower(").and_then(|s| s.strip_suffix(')')) else {
+        return false;
+    };
+    // The opening paren must close at the very end: track depth outside quotes.
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if in_str => {
+                chars.next();
+            }
+            '\'' => in_str = !in_str,
+            '(' if !in_str => depth += 1,
+            ')' if !in_str => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0 && !in_str
 }
 
 /// Validate a regex pattern for complexity to prevent ReDoS attacks.
@@ -1261,20 +1194,77 @@ pub(crate) fn validate_regex_pattern(pattern: &str) -> Result<(), String> {
 /// Simple patterns like "explorer" can use hasToken() which leverages bloom filter indexes.
 /// Returns Some(token) if simple, None if it contains regex metacharacters.
 pub(crate) fn extract_simple_regex_token(pattern: &str) -> Option<String> {
-    let pattern = pattern.strip_prefix("(?i)").unwrap_or(pattern);
     // Regex metacharacters that indicate a complex pattern
     const REGEX_METACHARACTERS: &[char] = &[
         '^', '$', '.', '*', '+', '?', '[', ']', '(', ')', '{', '}', '|', '\\',
     ];
 
-    // If pattern contains any metacharacters, it's not simple
-    if pattern.chars().any(|c| REGEX_METACHARACTERS.contains(&c)) {
+    // NAN-4943: the bare `*kw*` keyword reaches here as `(?i)<regex::escape(kw)>`
+    // (`*cmd.exe*` → `(?i)cmd\.exe`). A leading `(?i)` is a no-op (matching is
+    // always case-insensitive) and an escaped ASCII punctuation character is a
+    // literal, so such a pattern is still a plain substring.
+    let pattern = pattern.strip_prefix("(?i)").unwrap_or(pattern);
+    let mut literal = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(e) if e.is_ascii_punctuation() => literal.push(e),
+                // `\d`, `\w`, `\x41`, trailing `\` … are regex syntax.
+                _ => return None,
+            }
+        } else if REGEX_METACHARACTERS.contains(&c) {
+            return None;
+        } else {
+            literal.push(c);
+        }
+    }
+    if literal.is_empty() {
         return None;
     }
+    let pattern = literal.as_str();
 
-    // Pattern is simple - just a literal token
-    // Convert to lowercase for case-insensitive hasToken matching
-    Some(pattern.to_lowercase())
+    // NAN-4943: an ASCII literal is rewritten to the nPL lowercase match
+    // (`lower(col) LIKE '%tok%'`, see `ci_like`), dropping RE2's Unicode folds
+    // of `k`/`s` (Kelvin sign, long s) by design. A literal with non-ASCII
+    // letters stays a real `match()`: RE2 `(?i)` folds `Ä`↔`ä`, which an
+    // ASCII-only `lower()` comparison cannot express.
+    if !regex_literal_rewrite_safe(pattern) {
+        return None;
+    }
+    Some(ch_lower(pattern))
+}
+
+/// NAN-4943: what an nPL field regex (`f=/re/`) MEANS, decided once for every
+/// engine. The canonical SQL generator ([`regex_predicate_sql`]), the
+/// prevalence pushdown and the post-stage Rust evaluator all branch on this,
+/// so a predicate never changes its answer when it moves across a pipe.
+///
+/// - `Contains` / `Prefix` / `Suffix` / `AnyContains`: the regex is a literal
+///   (or literal alternation / anchored literal) and is evaluated as the nPL
+///   lowercase match (ClickHouse `lower()`, ASCII-only fold);
+/// - `Match`: everything else stays a real case-insensitive RE2 match.
+///
+/// [`regex_predicate_sql`]: super::regex_predicate_sql
+#[derive(Debug, PartialEq)]
+pub(crate) enum RegexPlan {
+    Contains(String),
+    Prefix(String),
+    Suffix(String),
+    AnyContains(Vec<String>),
+    Match,
+}
+
+pub(crate) fn regex_plan(pattern: &str) -> RegexPlan {
+    if let Some(token) = extract_simple_regex_token(pattern) {
+        return RegexPlan::Contains(token);
+    }
+    match analyze_regex_for_optimization(pattern) {
+        Some(RegexOptimization::Prefix(p)) => RegexPlan::Prefix(p),
+        Some(RegexOptimization::Suffix(s)) => RegexPlan::Suffix(s),
+        Some(RegexOptimization::LiteralAlternation(l)) => RegexPlan::AnyContains(l),
+        Some(RegexOptimization::BloomGuard(_)) | None => RegexPlan::Match,
+    }
 }
 
 /// Result of analyzing a regex pattern for optimization opportunities.
@@ -1295,10 +1285,43 @@ pub(crate) enum RegexOptimization {
     BloomGuard(String),
 }
 
+/// NAN-4943: may a regex literal be REWRITTEN (match() eliminated) into the
+/// nPL lowercase match? Yes for ASCII: the only difference from RE2 `(?i)` is
+/// its Kelvin-sign / long-s folding, which nPL case-insensitivity deliberately
+/// does not do (see `ci_like`). Non-ASCII literals keep `match()`.
+fn regex_literal_rewrite_safe(literal: &str) -> bool {
+    literal.is_ascii()
+}
+
+/// Is `ch` folded by RE2 `(?i)` onto ASCII only? Used for BloomGuard tokens,
+/// which are ANDed IN FRONT of a surviving `match()`: there the guard must be a
+/// superset of what RE2 accepts, so a `k`/`s` (which RE2 folds onto U+212A /
+/// U+017F) must not appear in it. Rewrites that eliminate `match()` use
+/// [`regex_literal_rewrite_safe`] instead.
+fn regex_char_ascii_case_safe(ch: char) -> bool {
+    use regex_syntax::hir::{ClassUnicode, ClassUnicodeRange};
+    static SAFE: std::sync::OnceLock<[bool; 128]> = std::sync::OnceLock::new();
+    ch.is_ascii() && SAFE.get_or_init(|| std::array::from_fn(|byte| {
+        let ch = byte as u8 as char;
+        let mut class = ClassUnicode::new([ClassUnicodeRange::new(ch, ch)]);
+        class.case_fold_simple();
+        class.ranges().iter().all(|range| range.end().is_ascii())
+    }))[ch as usize]
+}
+
+/// Shorthand/hex/Unicode escapes are regex syntax, never literal suffixes or alternation branches.
+fn has_regex_character_escape(pattern: &str) -> bool {
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && chars.next().is_some_and(|escaped| escaped.is_ascii_alphanumeric()) { return true; }
+    }
+    false
+}
+
 /// Analyze a regex pattern for optimization opportunities.
 ///
 /// Checks (in priority order):
-/// 1. Anchored prefix: `^literal.*` or `^literal$` → startsWith
+/// 1. Anchored prefix: `^literal.*` or `^literal` → startsWith
 /// 2. Anchored suffix: `.*literal$` or `literal$` with no other metacharacters → endsWith
 /// 3. Pure literal alternation: `(a|b|c)` where all branches are plain text → hasToken OR chain
 /// 4. Longest literal substring: extract for bloom filter pre-filtering → hasToken AND match
@@ -1314,23 +1337,24 @@ pub(crate) fn analyze_regex_for_optimization(pattern: &str) -> Option<RegexOptim
 
     // 1. Anchored prefix: ^literal.* or ^literal (exact prefix match)
     if let Some(prefix) = extract_anchored_prefix(pat) {
-        if prefix.len() >= 2 {
-            return Some(RegexOptimization::Prefix(prefix.to_lowercase()));
+        if prefix.len() >= 2 && regex_literal_rewrite_safe(&prefix) {
+            return Some(RegexOptimization::Prefix(ch_lower(&prefix)));
         }
     }
 
     // 2. Anchored suffix: .*literal$ or just literal$
     if let Some(suffix) = extract_anchored_suffix(pat) {
-        if suffix.len() >= 2 {
-            return Some(RegexOptimization::Suffix(suffix.to_lowercase()));
+        if suffix.len() >= 2 && regex_literal_rewrite_safe(&suffix) && !has_regex_character_escape(pat) {
+            return Some(RegexOptimization::Suffix(ch_lower(&suffix)));
         }
     }
 
     // 3. Pure literal alternation: (a|b|c) or a|b|c (entire pattern)
     if let Some(literals) = extract_literal_alternation(pat) {
-        if literals.len() >= 2 && literals.iter().all(|l| l.len() >= 2) {
+        if literals.len() >= 2 && !pat.contains('\\')
+            && literals.iter().all(|l| l.len() >= 2 && regex_literal_rewrite_safe(l)) {
             return Some(RegexOptimization::LiteralAlternation(
-                literals.into_iter().map(|l| l.to_lowercase()).collect(),
+                literals.into_iter().map(|l| ch_lower(&l)).collect(),
             ));
         }
     }
@@ -1339,7 +1363,7 @@ pub(crate) fn analyze_regex_for_optimization(pattern: &str) -> Option<RegexOptim
     if let Some(token) = extract_longest_literal(pat) {
         // hasToken needs at least 3 chars for meaningful bloom filter selectivity
         if token.len() >= 3 {
-            return Some(RegexOptimization::BloomGuard(token.to_lowercase()));
+            return Some(RegexOptimization::BloomGuard(ch_lower(&token)));
         }
     }
 
@@ -1377,9 +1401,9 @@ fn extract_anchored_prefix(pat: &str) -> Option<String> {
         return None;
     }
 
-    // Remaining must be empty, .*, $, or .*$
+    // A plain prefix or trailing .* is exact. ^literal$ needs the final match(), not startsWith.
     let rest: String = chars.collect();
-    if rest.is_empty() || rest == ".*" || rest == "$" || rest == ".*$" {
+    if rest.is_empty() || rest == ".*" || rest == ".*$" {
         return Some(literal);
     }
 
@@ -1458,28 +1482,11 @@ fn extract_literal_alternation(pat: &str) -> Option<Vec<String>> {
     Some(literals)
 }
 
-/// Extract the longest contiguous literal substring from a regex pattern,
-/// reduced to its longest index-servable token when one qualifies.
-/// Splits on metacharacters and takes the longest piece; within that piece,
-/// prefers the longest [`GUARD_TOKEN_MIN_LEN`]+letter run of ASCII
-/// alphanumerics (ties → first occurrence), falling back to the raw piece.
+/// Extract a mandatory literal run from the regex HIR, then its longest index-servable ASCII token.
+/// The guard is a candidate filter: Unicode folds that an ASCII lower() LIKE guard cannot represent must be omitted.
+/// A shorter safe token still matches the existing lower(col) text-index expression.
 ///
-/// NAN-1416: the per-piece tokenization matters because a literal piece can
-/// itself be multi-token (`/svchost\.exe (started|stopped)/` has the piece
-/// `svchost.exe `) and the splitByNonAlpha text index cannot serve an iLike
-/// guard containing non-alphanumeric chars — the old `'%svchost.exe %'` guard
-/// was index-useless (measured: `'%svchost%'` guard 1.53 GiB / 0.88s CPU vs
-/// `'%svchost.exe%'` 1.84 GiB / 1.08s vs unguarded match() 1.84 GiB / 3.26s).
-/// When no token qualifies the RAW piece is kept: unlike the iLike arms, the
-/// regex guard also pays for itself as a cheap row-level pre-filter ahead of
-/// the expensive `match()`, so dropping it would regress the pre-NAN-1416
-/// behavior. Tokenizing only the WINNING piece (rather than picking the
-/// globally longest token across all pieces) is deliberate: a token of the
-/// winning piece is a substring of it, so the new guard is implied by the old
-/// one — the soundness profile is exactly the pre-existing behavior, never
-/// worse.
-///
-/// SOUNDNESS (NAN-2361). The returned literal becomes an ANDed `iLike` guard in
+/// SOUNDNESS (NAN-2361). The returned literal becomes an ANDed `LIKE` guard in
 /// front of `match()`, so it must be present in EVERY string the pattern
 /// matches. The original implementation split the raw pattern on
 /// metacharacters and took the longest piece, which silently harvested
@@ -1514,16 +1521,23 @@ fn extract_longest_literal(pat: &str) -> Option<String> {
     // Longest qualifying ASCII-alnum token within the winning piece
     // (strictly-greater comparison keeps the first occurrence on ties). For a
     // piece that is already a single pure-alphanumeric qualifying token this
-    // is the identity — the pre-NAN-1416 shape is preserved.
+    // is the identity when ASCII case folding is sufficient.
     let token = best
-        .split(|c: char| !c.is_ascii_alphanumeric())
+        .split(|c: char| !c.is_ascii_alphanumeric() || !regex_char_ascii_case_safe(c))
         .filter(|t| t.len() >= GUARD_TOKEN_MIN_LEN && t.chars().any(|c| c.is_ascii_alphabetic()))
         .fold("", |acc, t| if t.len() > acc.len() { t } else { acc });
 
-    if token.is_empty() {
+    if !token.is_empty() {
+        Some(token.to_string())
+    } else if best.chars().all(regex_char_ascii_case_safe) {
         Some(best)
     } else {
-        Some(token.to_string())
+        // A shorter mandatory ASCII fragment is still a safe row prefilter.
+        // Never carry the K/S Unicode-fold mismatch into the lower() LIKE guard.
+        best.split(|c: char| !c.is_ascii_alphanumeric() || !regex_char_ascii_case_safe(c))
+            .filter(|run| run.len() >= 3)
+            .max_by_key(|run| run.len())
+            .map(str::to_owned)
     }
 }
 
@@ -1714,13 +1728,13 @@ pub(crate) fn convert_named_groups_to_numbered(pattern: &str) -> String {
 /// crosses two decoders on its way to a match:
 ///
 /// 1. the SQL string-literal parser, which turns `\\` into `\`
-/// 2. `iLike`, which reads `\` as its own escape character
+/// 2. `LIKE`, which reads `\` as its own escape character
 ///
 /// So one literal backslash needs FOUR here: `\\\\` -> `\\` after the literal
 /// parser -> one literal `\` at match time. Emitting two was enough for the
 /// common case only by accident — ClickHouse leaves an unrecognised escape like
 /// `\w` alone, so `C:\Windows*` matched. `\\fileserver\share*` did not match
-/// itself: the doubled backslash collapsed to one and `iLike` ate it as an
+/// itself: the doubled backslash collapsed to one and `LIKE` ate it as an
 /// escape (NAN-2269).
 pub(crate) fn wildcard_to_like_pattern(s: &str) -> String {
     let mut result = String::with_capacity(s.len() * 2);
@@ -1729,7 +1743,7 @@ pub(crate) fn wildcard_to_like_pattern(s: &str) -> String {
             '*' => result.push('%'),
             '?' => result.push('_'),
             // `\%` survives the literal parser intact (unrecognised escape) and
-            // reaches iLike as an escaped, literal `%`.
+            // reaches LIKE as an escaped, literal `%`.
             '%' => result.push_str("\\%"),
             '_' => result.push_str("\\_"),
             '\'' => result.push_str("''"),
@@ -1826,24 +1840,6 @@ pub(crate) fn is_reserved_word(word: &str) -> bool {
 #[cfg(test)]
 mod inline_tests {
     use super::*;
-
-    /// NAN-4288 (F17): a pasted Windows path matches raw text that keeps the
-    /// JSON escaping (doubled backslashes) as well as unescaped text, and
-    /// still requires the backslash.
-    #[test]
-    fn phrase_backslash_matches_json_escaped_raw_text() {
-        let needle = r"c:\windows\system32\svchost.exe";
-        for regex in [
-            keyword_term_regex_ascii_exact(needle).unwrap(),
-            keyword_term_regex(needle).unwrap(),
-        ] {
-            let re = regex::Regex::new(&regex).unwrap();
-            assert!(re.is_match(r#"{"Image":"C:\\Windows\\System32\\svchost.exe"}"#), "{regex}");
-            assert!(re.is_match(r"Image: C:\Windows\System32\svchost.exe"), "{regex}");
-            assert!(!re.is_match(r"C:/Windows/System32/svchost.exe"), "{regex}");
-            assert!(!re.is_match(r"C:\Windows\System32\svchost.exe2"), "{regex}");
-        }
-    }
 
     #[test]
     fn extract_named_groups_handles_both_pcre_forms() {
@@ -1990,12 +1986,14 @@ mod inline_tests {
             Some(RegexOptimization::Prefix("admin".to_string()))
         );
         assert_eq!(
+            // NAN-4943: an `s`/`k` no longer blocks the rewrite (nPL
+            // case-insensitivity is a lowercase match, no Unicode folds).
             analyze_regex_for_optimization("^PowerShell.*$"),
             Some(RegexOptimization::Prefix("powershell".to_string()))
         );
         assert_eq!(
             analyze_regex_for_optimization("^admin$"),
-            Some(RegexOptimization::Prefix("admin".to_string()))
+            Some(RegexOptimization::BloomGuard("admin".to_string()))
         );
     }
 
@@ -2055,11 +2053,11 @@ mod inline_tests {
     fn test_regex_opt_bloom_guard() {
         assert_eq!(
             analyze_regex_for_optimization(r"powershell.*-enc.*"),
-            Some(RegexOptimization::BloomGuard("powershell".to_string()))
+            Some(RegexOptimization::BloomGuard("power".to_string()))
         );
         assert_eq!(
             analyze_regex_for_optimization(r".*mimikatz.*sekurlsa.*"),
-            Some(RegexOptimization::BloomGuard("mimikatz".to_string()))
+            Some(RegexOptimization::BloomGuard("mimi".to_string()))
         );
     }
 
@@ -2089,7 +2087,7 @@ mod inline_tests {
     fn test_extract_longest_literal() {
         assert_eq!(
             extract_longest_literal("powershell.*-enc.*"),
-            Some("powershell".to_string())
+            Some("power".to_string())
         );
         assert_eq!(extract_longest_literal(".*"), None);
         // Escaped dot is treated as literal, so foo.bar is one contiguous
@@ -2106,16 +2104,16 @@ mod inline_tests {
     /// token so the splitByNonAlpha text index can serve it.
     #[test]
     fn test_extract_longest_literal_tokenizes_winning_piece() {
-        // Winning piece is `svchost.exe ` (escaped dot + trailing space);
-        // `svchost` (7) qualifies → index-servable single-token guard.
+        // The winning mandatory piece contains Unicode-folded S; use only
+        // its safe ASCII fragment, retaining match() for the full expression.
         assert_eq!(
             extract_longest_literal(r"svchost\.exe (started|stopped)"),
-            Some("svchost".to_string())
+            Some("vcho".to_string())
         );
-        // Pure-alnum winning piece is the identity (pre-NAN-1416 shape).
+        // The Kelvin-sign fold in K also requires a shorter safe fragment.
         assert_eq!(
             extract_longest_literal(r"mimikatz.*sekurlsa"),
-            Some("mimikatz".to_string())
+            Some("mimi".to_string())
         );
         // No qualifying token → raw piece kept (regex row-prefilter intact).
         assert_eq!(
@@ -2131,7 +2129,7 @@ mod inline_tests {
     fn test_regex_opt_bloom_guard_single_token() {
         assert_eq!(
             analyze_regex_for_optimization(r"svchost\.exe (started|stopped)"),
-            Some(RegexOptimization::BloomGuard("svchost".to_string()))
+            Some(RegexOptimization::BloomGuard("vcho".to_string()))
         );
         // `a.b ` has no qualifying token; the raw piece (≥3 chars) stays the
         // pre-filter exactly as before NAN-1416.
@@ -2143,14 +2141,14 @@ mod inline_tests {
 
     /// NAN-2361 CANDIDATE-SUPERSET INVARIANT.
     ///
-    /// `analyze_regex_for_optimization` feeds an ANDed `iLike '%token%'` guard
+    /// `analyze_regex_for_optimization` feeds an ANDed `LIKE '%token%'` guard
     /// in front of `match()`. The guard is a candidate filter, never the
     /// predicate — so it MUST NOT exclude any string the regex accepts.
     ///
     /// This models the emitted SQL in Rust: `match()` is the compiled regex
     /// (case-insensitive, unanchored `is_match`, exactly what ClickHouse runs
     /// for `'(?i)<pat>'`) and the guard is a case-insensitive substring test,
-    /// exactly what `lower(col) iLike '%tok%'` computes. Any sample the regex
+    /// exactly what `lower(col) LIKE '%tok%'` computes. Any sample the regex
     /// matches but the guard rejects is a silently lost row.
     ///
     /// The anchored-alternation-with-unequal-branch-lengths shape is the one
@@ -2180,10 +2178,7 @@ mod inline_tests {
             (r"\.(exe|scr)$", &["payload.exe", "payload.scr"]),
             // Mandatory literals mixed with alternation — the guard should
             // still be taken, from the mandatory part only.
-            (
-                r"svchost\.exe (started|stopped)",
-                &["svchost.exe started", "svchost.exe stopped"],
-            ),
+            (r"svchost\.exe (started|stopped)", &["svchost.exe started", "svchost.exe stopped"]),
             ("(net|net1) user", &["net user", "net1 user"]),
             (r"foo.*(bar|bazlong)", &["foo bar", "foo bazlong"]),
             // Plain mandatory-literal patterns (guard must stay effective).
@@ -2219,7 +2214,7 @@ mod inline_tests {
         }
     }
 
-    /// NAN-2361: the exact shapes observed against the live OCSF lake. An
+    /// NAN-4902: the anchored-alternation shapes used by ClickHouse rules. An
     /// alternation branch is never a mandatory literal, so no guard is taken.
     #[test]
     fn anchored_alternation_takes_no_bloom_guard() {
@@ -2254,10 +2249,7 @@ mod inline_tests {
             extract_longest_literal("admin(istrator)?"),
             Some("admin".to_string())
         );
-        assert_eq!(
-            extract_longest_literal("(mimikatz)*sekurlsa"),
-            Some("sekurlsa".to_string())
-        );
+        assert_eq!(extract_longest_literal("(mimikatz)*sekurlsa"), Some("url".to_string()));
         // `.` alone is the only mandatory literal and is below the 3-char bar.
         assert_eq!(analyze_regex_for_optimization(r"\.(exe|scr)$"), None);
     }
@@ -2267,7 +2259,10 @@ mod inline_tests {
         // Multi-token needles → longest qualifying token; ties → first.
         assert_eq!(longest_guard_token("failed login"), Some("failed"));
         assert_eq!(longest_guard_token("svchost.exe"), Some("svchost"));
-        assert_eq!(longest_guard_token("failed_login_attempt"), Some("attempt"));
+        assert_eq!(
+            longest_guard_token("failed_login_attempt"),
+            Some("attempt")
+        );
         assert_eq!(
             longest_guard_token("news.ycombinator.com"),
             Some("ycombinator")
@@ -2329,7 +2324,7 @@ mod inline_tests {
     /// NAN-1640: guard token for anchored prefix/suffix literals. Identical bar
     /// to `longest_guard_token`, but single-token literals DO guard — the
     /// startsWith/endsWith primary predicate is never index-served, unlike the
-    /// single-token iLike that justifies the ≥2-token policy over there.
+    /// single-token LIKE that justifies the ≥2-token policy over there.
     #[test]
     fn test_anchored_guard_token() {
         // Single-token literal ≥6 chars + lettered → guards (the 795x case).
@@ -2338,10 +2333,7 @@ mod inline_tests {
         // Multi-token literal → longest qualifying token (ties → first), same
         // as the keyword guard.
         assert_eq!(anchored_guard_token("svchost.exe started"), Some("svchost"));
-        assert_eq!(
-            anchored_guard_token("run mimikatz64.log"),
-            Some("mimikatz64")
-        );
+        assert_eq!(anchored_guard_token("run mimikatz64.log"), Some("mimikatz64"));
         // NAN-1416 bar still applies: short tokens never guard…
         assert_eq!(anchored_guard_token(".exe"), None);
         assert_eq!(anchored_guard_token("admin"), None);
@@ -2351,120 +2343,5 @@ mod inline_tests {
         // No alphanumeric content → no guard.
         assert_eq!(anchored_guard_token("***"), None);
         assert_eq!(anchored_guard_token(""), None);
-    }
-
-    /// NAN-4164: a multi-token bare keyword is matched as a term (characters
-    /// in order, token boundary on each end); a single token stays token-only.
-    #[test]
-    fn keyword_term_regex_pins_compound_needles() {
-        assert_eq!(keyword_term_regex("sysmon"), None);
-        assert_eq!(keyword_term_regex("-sysmon-"), None);
-        assert_eq!(keyword_term_regex(""), None);
-        assert_eq!(
-            keyword_term_regex("10.1.4.20").as_deref(),
-            Some(r"(?i)(?:^|[^a-z0-9\x{80}-\x{10FFFF}])10\.1\.4\.20(?:$|[^a-z0-9\x{80}-\x{10FFFF}])")
-        );
-        assert_eq!(
-            keyword_term_regex("failed  password").as_deref(),
-            Some(r"(?i)(?:^|[^a-z0-9\x{80}-\x{10FFFF}])failed\s+password(?:$|[^a-z0-9\x{80}-\x{10FFFF}])")
-        );
-        assert_eq!(
-            keyword_term_regex("c:\\windows\\").as_deref(),
-            // NAN-4288: each backslash matches a JSON-escaped run.
-            Some(r"(?i)(?:^|[^a-z0-9\x{80}-\x{10FFFF}])c:\\+windows\\+")
-        );
-
-        let matches = |needle: &str, text: &str| {
-            regex::Regex::new(&keyword_term_regex(needle).unwrap()).unwrap().is_match(text)
-        };
-        assert!(matches("10.1.4.20", "src=10.1.4.20 dst=1.1.1.1"));
-        assert!(matches("10.1.4.20", "10.1.4.20"));
-        assert!(!matches("10.1.4.20", "src=110.1.4.201"));
-        // A non-ASCII neighbour is a token character to ClickHouse and to
-        // the lake token index, so it is not a term boundary either.
-        assert!(!matches("10.1.4.20", "src=é10.1.4.20"));
-        assert!(!matches("10.1.4.20", "10.1.4.20ü"));
-        assert!(!matches("10.1.4.20", "→10.1.4.20←"));
-        assert!(!matches("10.1.4.20", "2026-10-01T04:20:00 host 10.1.9.4"));
-        assert!(matches("ws-fin-095", "Computer: WS-FIN-095.corp"));
-        assert!(!matches("ws-fin-095", "ws-fin-0951"));
-        assert!(matches("failed password", "sshd: Failed\tpassword for root"));
-        assert!(!matches("failed password", "password failed"));
-        assert!(!matches("failed password", "failedpassword"));
-    }
-
-    #[test]
-    fn bare_keyword_predicate_adds_term_match_only_when_enabled() {
-        let cols = ["message"];
-        assert_eq!(
-            bare_keyword_predicate("10.1.4.20", &cols, false),
-            "hasAllTokens(lower(message), '10.1.4.20')"
-        );
-        assert_eq!(
-            bare_keyword_predicate("10.1.4.20", &cols, true),
-            r"match(message, '(?:^|[^A-Za-z0-9\\x{80}-\\x{10FFFF}])10\\.1\\.4\\.20(?:$|[^A-Za-z0-9\\x{80}-\\x{10FFFF}])')"
-        );
-        assert_eq!(
-            bare_keyword_predicate("Sysmon", &cols, true),
-            "hasAllTokens(lower(message), 'sysmon')"
-        );
-        assert_eq!(
-            bare_keyword_predicate("o'brien x", &cols, true),
-            r"match(message, '(?:^|[^A-Za-z0-9\\x{80}-\\x{10FFFF}])[Oo]''[Bb][Rr][Ii][Ee][Nn]\\s+[Xx](?:$|[^A-Za-z0-9\\x{80}-\\x{10FFFF}])')"
-        );
-        // A non-ASCII needle keeps the token test in front of the term regex.
-        assert_eq!(
-            bare_keyword_predicate("straße x", &cols, true),
-            r"(hasAllTokens(lower(message), 'straße x') AND match(message, '(?i)(?:^|[^a-z0-9\\x{80}-\\x{10FFFF}])straße\\s+x(?:$|[^a-z0-9\\x{80}-\\x{10FFFF}])'))"
-        );
-    }
-
-    /// NAN-4164: for an ASCII needle the exact term regex alone accepts
-    /// exactly what `hasAllTokens(lower(col), needle) AND match(col, (?i)
-    /// term)` accepts, including the values where RE2's Unicode case
-    /// folding (`ſ`, the Kelvin sign) or a non-ASCII neighbour would differ.
-    #[test]
-    fn ascii_exact_term_regex_equals_tokens_and_term_regex() {
-        // ClickHouse `splitByNonAlpha` over ASCII-lowered text: ASCII
-        // alphanumerics and every non-ASCII character are token characters.
-        fn tokens(text: &str) -> Vec<String> {
-            text.to_ascii_lowercase()
-                .split(|c: char| c.is_ascii() && !c.is_ascii_alphanumeric())
-                .filter(|piece| !piece.is_empty())
-                .map(str::to_string)
-                .collect()
-        }
-        const FRAGMENTS: [&str; 22] = [
-            "10.1.4.20", "110.1.4.201", "FAILED", "failed", "Password", "paſsword", "\u{212A}ey", "Key", " ", "\t",
-            ".", "-", "é", "→", "WS-FIN-095", "ws-fin-0951", "C:\\WINDOWS\\", "x", "Y", "-X Y", "ü10", "20ü",
-        ];
-        const NEEDLES: [&str; 8] =
-            ["10.1.4.20", "failed password", "ws-fin-095", "c:\\windows\\", "-x y", "key x", "failed\tpassword", "4.20"];
-        let mut haystacks = vec![String::new()];
-        for a in FRAGMENTS {
-            haystacks.push(a.to_string());
-            for b in FRAGMENTS {
-                haystacks.push(format!("{a}{b}"));
-                for c in FRAGMENTS {
-                    haystacks.push(format!("{a}{b}{c}"));
-                }
-            }
-        }
-        for needle in NEEDLES {
-            let lowered = needle.to_lowercase();
-            let exact = regex::Regex::new(&keyword_term_regex_ascii_exact(&lowered).unwrap()).unwrap();
-            let term = regex::Regex::new(&keyword_term_regex(&lowered).unwrap()).unwrap();
-            let wanted = tokens(&lowered);
-            let mut matched = 0;
-            for haystack in &haystacks {
-                let have = tokens(haystack);
-                let old = wanted.iter().all(|token| have.contains(token)) && term.is_match(haystack);
-                assert_eq!(exact.is_match(haystack), old, "{needle:?} over {haystack:?}");
-                matched += usize::from(old);
-            }
-            assert!(matched > 0, "{needle:?} must match some haystack");
-        }
-        assert_eq!(keyword_term_regex_ascii_exact("straße x"), None);
-        assert_eq!(keyword_term_regex_ascii_exact("sysmon"), None);
     }
 }

@@ -12,8 +12,7 @@ import { X, Search, Shield, Briefcase, BarChart3, ArrowRight, Play } from 'lucid
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
-import { useQuery } from '@tanstack/react-query';
-import { api } from '@/lib/api';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 
 // ============================================================================
 // Core DemoHint wrapper
@@ -82,27 +81,20 @@ function QueryChip({ query, label, onClick }: QueryChipProps) {
  * Search page hint: sample queries users can click to try
  */
 export function SearchDemoHint({ onRunQuery }: { onRunQuery: (query: string) => void }) {
-  const { data: activeSchema } = useQuery({
-    queryKey: ['schema-fields'],
-    queryFn: () => api.getSchemaFields(),
-    staleTime: Infinity,
-    gcTime: Infinity,
-  });
-  const SAMPLE_QUERIES = activeSchema?.schema === 'ocsf'
-    ? [
-        { query: 'metadata.log_source=windows_event class_uid=3002 status_id=2 | stats count by actor.user.name | sort -count | head 20', label: 'Failed logins by user' },
-        { query: 'metadata.log_source=conduit_proxy | stats count by dst_endpoint.hostname | sort -count | head 20', label: 'Top proxy destinations' },
-        { query: 'device.hostname="lt-eng-012.corp.local" | asset', label: 'Asset investigation' },
-        { query: '* | timechart span=1m count by metadata.log_source', label: 'Activity by log source' },
-        { query: 'metadata.log_source=aws_cloudtrail | cloud', label: 'Cloud activity' },
-      ]
-    : [
-        { query: 'source_type=windows_event event_id=4625 | stats count by user | sort -count | head 20', label: 'Failed logins by user' },
-        { query: 'source_type=conduit_proxy | stats count by dest_host | sort -count | head 20', label: 'Top proxy destinations' },
-        { query: 'src_host="lt-eng-012.corp.local" | asset', label: 'Asset investigation' },
-        { query: '* | timechart span=1m count by source_type', label: 'Activity by source type' },
-        { query: 'source_type=aws_cloudtrail | cloud', label: 'Cloud activity' },
-      ];
+  // NAN-4903: column names from the profile-aware field map. The auth subject
+  // is `user.name` under OCSF (auth events), `user` under UDM; the Windows event
+  // id is `metadata.event_code` under OCSF.
+  const fm = useSchemaFieldMap();
+  const src = fm.field('logSource');
+  const authUser = fm.isOcsf ? fm.field('destUser') : fm.field('user');
+  const eventId = fm.isOcsf ? 'metadata.event_code' : 'event_id';
+  const SAMPLE_QUERIES = [
+    { query: `${src}=windows_event ${eventId}=4625 | stats count by ${authUser} | sort -count | head 20`, label: 'Failed logins by user' },
+    { query: `${src}=conduit_proxy | stats count by ${fm.field('destHost')} | sort -count | head 20`, label: 'Top proxy destinations' },
+    { query: `${fm.filter('host', 'lt-eng-012.corp.local')} | asset`, label: 'Asset investigation' },
+    { query: `* | timechart span=1m count by ${src}`, label: 'Activity by source type' },
+    { query: `${src}=aws_cloudtrail | cloud`, label: 'Cloud activity' },
+  ];
 
   return (
     <DemoHint id="search">
@@ -115,7 +107,7 @@ export function SearchDemoHint({ onRunQuery }: { onRunQuery: (query: string) => 
           </p>
           <div className="flex flex-wrap gap-2">
             {SAMPLE_QUERIES.map((sq) => (
-              <QueryChip key={sq.query} {...sq} onClick={onRunQuery} />
+              <QueryChip key={sq.query} {...sq} onClick={fm.guard(onRunQuery)} />
             ))}
           </div>
         </div>

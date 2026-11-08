@@ -367,7 +367,7 @@ export function RuleRow({ rule, expanded, onToggle, selected, onSelect, onSetMod
   const { hasPermission } = useAuth();
   const canEdit = hasPermission('detections:edit');
   const canPromote = hasPermission('detections:promote');
-  const canDelete = hasPermission('detections:delete') || hasPermission('detections:edit');
+  const canDelete = hasPermission('detections:delete');
   const sev = SEV_META[rule.severity];
   const isDisabled = rule.detectionStatus === 'paused';
   return (

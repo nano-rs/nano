@@ -81,7 +81,7 @@ pub struct CreatePlaybookRepositoryRequest {
     pub auto_sync_enabled: Option<bool>,
     #[serde(default)]
     pub sync_interval_hours: Option<i32>,
-    /// Which `playbooks.kind` values this repository may produce.
+    /// Which `playbooks.kind` values this repository may produce (NAN-2238).
     /// Omitted means both, matching the column default.
     #[serde(default)]
     pub allowed_kinds: Option<Vec<String>>,
@@ -136,7 +136,7 @@ pub struct ListRepositoryPlaybooksResponse {
 
 /// Bulk import request body.
 ///
-/// today the only knob is `import_type` (linked vs. forked) — applied
+/// NAN-611: today the only knob is `import_type` (linked vs. forked) — applied
 /// uniformly to every playbook. Per-item overrides (à la `BatchImportItem` for
 /// rules) can be added later when there's a UI for it; mass-syncing the stock
 /// nano repo doesn't need them.
@@ -332,7 +332,6 @@ pub async fn delete_playbook_repository(
     params(("id" = String, Path, description = "Repository TypeID")),
     responses(
         (status = 200, description = "Sync started", body = PlaybookSyncStartResponse),
-        (status = 202, description = "Shared tenant sync accepted; poll the repository", body = nanosiem_core::rule_repository::SyncAccepted),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
     ),
@@ -425,7 +424,7 @@ pub async fn list_repository_playbooks(
 
 /// Import a repository playbook into the main library.
 ///
-/// path is a catch-all suffix (`{*path}`) so multi-segment file
+/// NAN-453: path is a catch-all suffix (`{*path}`) so multi-segment file
 /// paths like `identity/credential_reuse.md` round-trip cleanly. Matches
 /// `/api/rule-repositories/{id}/rules/import/{*path}` from rule_repositories.
 #[utoipa::path(
@@ -471,7 +470,7 @@ pub async fn import_repository_playbook(
 
 /// Import every parseable cached playbook from a repository into the library.
 ///
-/// closes the sync→library gap. Sync alone only populates the staging
+/// NAN-611: closes the sync→library gap. Sync alone only populates the staging
 /// `repository_playbooks` cache; users were left wondering why "16 playbooks
 /// synced" never showed up at `/playbooks`. This is the bulk equivalent of the
 /// per-path import endpoint — mirrors `batch_import_rules` for rule
@@ -717,7 +716,6 @@ pub async fn sync_and_import_repository(
         CreatePlaybookRepositoryRequest,
         UpdatePlaybookRepositoryRequest,
         PlaybookSyncStartResponse,
-        nanosiem_core::rule_repository::SyncAccepted,
         PlaybookSyncStatusResponse,
         ListRepositoryPlaybooksResponse,
         ImportAllPlaybooksRequest,

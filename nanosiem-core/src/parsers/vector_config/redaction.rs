@@ -190,9 +190,6 @@ mod tests {
     #[test]
     fn handles_missing_trailing_newline() {
         let toml = "password = \"x\"";
-        assert_eq!(
-            redact_config_snapshot(toml),
-            "password = \"***REDACTED***\""
-        );
+        assert_eq!(redact_config_snapshot(toml), "password = \"***REDACTED***\"");
     }
 }

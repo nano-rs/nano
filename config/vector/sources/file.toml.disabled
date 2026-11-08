@@ -1,0 +1,82 @@
+# File Source Configuration for NanoSIEM
+#
+# This configuration provides file input sources for Vector.
+# Monitors log files and streams new entries to NanoSIEM.
+
+# =============================================================================
+# System Logs
+# =============================================================================
+# Monitor common system log locations
+
+[sources.system_logs]
+type = "file"
+include = [
+    "/var/log/syslog",
+    "/var/log/messages",
+    "/var/log/auth.log",
+    "/var/log/secure",
+    "/var/log/kern.log"
+]
+read_from = "end"  # Start from end of file for new logs
+ignore_older_secs = 86400  # Ignore files older than 24 hours
+fingerprint.strategy = "device_and_inode"
+
+# =============================================================================
+# Application Logs
+# =============================================================================
+# Monitor application-specific log directories
+
+[sources.app_logs]
+type = "file"
+include = [
+    "/var/log/nginx/*.log",
+    "/var/log/apache2/*.log",
+    "/var/log/httpd/*.log"
+]
+exclude = ["*.gz", "*.zip", "*.bz2"]
+read_from = "end"
+ignore_older_secs = 86400
+fingerprint.strategy = "device_and_inode"
+
+# =============================================================================
+# Security Logs
+# =============================================================================
+# Monitor security-related log files
+
+[sources.security_logs]
+type = "file"
+include = [
+    "/var/log/audit/*.log",
+    "/var/log/fail2ban.log",
+    "/var/log/ufw.log",
+    "/var/log/firewalld"
+]
+read_from = "end"
+ignore_older_secs = 86400
+fingerprint.strategy = "device_and_inode"
+
+# =============================================================================
+# Custom Application Logs
+# =============================================================================
+# Add your custom application log paths here
+
+# [sources.custom_logs]
+# type = "file"
+# include = ["/path/to/your/app/*.log"]
+# read_from = "end"
+# ignore_older_secs = 86400
+
+# =============================================================================
+# JSON Log Files
+# =============================================================================
+# For applications that output JSON-formatted logs
+
+[sources.json_logs]
+type = "file"
+include = [
+    "/var/log/**/*.json",
+    "/var/log/**/*.ndjson"
+]
+read_from = "end"
+ignore_older_secs = 86400
+fingerprint.strategy = "device_and_inode"

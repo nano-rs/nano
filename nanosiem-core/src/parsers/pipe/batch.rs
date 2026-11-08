@@ -32,22 +32,37 @@ pub struct ResultRow {
     pub traces: Vec<Trace>,
 }
 struct Vm {
-    programs: HashMap<String, Program>,
+    /// Keyed by (program, metadata read-only).
+    programs: HashMap<(String, bool), Program>,
 }
 impl Vm {
-    fn compile(&mut self, code: &str) -> Result<(), String> {
-        if !self.programs.contains_key(code) {
-            let compiled = crate::parsers::vrl_guard::compile(
-                code,
-                &crate::parsers::validator::safe_vrl_functions(),
-            )
+    /// Plan programs compile with event metadata read-only (NAN-4919); the
+    /// separate source extension is ordinary parser VRL.
+    fn compile(&mut self, code: &str, plan: bool) -> Result<(), String> {
+        let key = (code.to_string(), plan);
+        if !self.programs.contains_key(&key) {
+            let fns = crate::parsers::vrl_functions::parser_vrl_functions();
+            let compiled = if plan {
+                crate::parsers::vrl_guard::compile_metadata_read_only(code, &fns)
+            } else {
+                crate::parsers::vrl_guard::compile(code, &fns)
+            }
             .map_err(|e| e.render(code))?;
-            self.programs.insert(code.into(), compiled.program);
+            self.programs.insert(key, compiled.program);
         }
         Ok(())
     }
-    fn run(&mut self, code: &str, input: &Value, metadata: &Value) -> Result<Value, String> {
-        self.compile(code)?;
+    /// Run one program; returns the event and its (possibly changed) `%`
+    /// metadata, which the caller carries to the next step exactly as Vector
+    /// carries it between transforms.
+    fn run(
+        &mut self,
+        code: &str,
+        plan: bool,
+        input: &Value,
+        metadata: &Value,
+    ) -> Result<(Value, Value), String> {
+        self.compile(code, plan)?;
         let mut target = TargetValue {
             value: VrlValue::from(input.clone()),
             metadata: if metadata.is_object() {
@@ -60,18 +75,21 @@ impl Vm {
         Runtime::default()
             .resolve(
                 &mut target,
-                &self.programs[code],
+                &self.programs[&(code.to_string(), plan)],
                 &TimeZone::parse("UTC").expect("UTC timezone"),
             )
             .map_err(|e| e.to_string())?;
-        serde_json::to_value(target.value).map_err(|e| e.to_string())
+        Ok((
+            serde_json::to_value(target.value).map_err(|e| e.to_string())?,
+            serde_json::to_value(target.metadata).map_err(|e| e.to_string())?,
+        ))
     }
     fn matches(&mut self, expr: &str, input: &Value, metadata: &Value) -> Result<bool, String> {
         let code = format!("nano_condition = {expr}\n. = {{ \"result\": bool!(nano_condition) }}");
-        self.compile(&code)?;
+        self.compile(&code, true)?;
         // Vector treats a condition's runtime failure as a non-match. Compile
         // failures still reject the preview rather than becoming false.
-        let Ok(value) = self.run(&code, input, metadata) else {
+        let Ok((value, _)) = self.run(&code, true, input, metadata) else {
             return Ok(false);
         };
         value
@@ -260,8 +278,8 @@ fn aggregate(frames: Vec<Frame>, count: &str, merges: &[Merge]) -> Result<Frame,
         };
         assign(&mut output, &merge.field, merged)?;
     }
-    // Vector reduce drops `%` metadata; the combine restore re-sets only the
-    // tenant/source/transport envelope, never the input identity.
+    // Vector reduce drops `%` metadata. The restore re-sets the trusted
+    // envelope, but Route by input after Combine stays refused (main parity).
     Ok(Frame {
         value: output,
         origins,
@@ -345,9 +363,9 @@ pub fn run_from(
                 for &origin in &frame.origins {
                     applied[origin] = true;
                 }
-                match vm.run(&code, &frame.value, &frame.metadata) {
+                match vm.run(&code, true, &frame.value, &frame.metadata) {
                     Err(message) => error(&mut rows, &frame.origins, message),
-                    Ok(value) => {
+                    Ok((value, metadata)) => {
                         let values = unpack(value);
                         if values.is_empty() {
                             drop(
@@ -367,7 +385,7 @@ pub fn run_from(
                             next.push(Frame {
                                 value,
                                 origins: frame.origins.clone(),
-                                metadata: frame.metadata.clone(),
+                                metadata: metadata.clone(),
                             });
                         }
                     }
@@ -483,7 +501,7 @@ pub fn run_from(
                             .join(", ")
                     );
                     for mut frame in eligible {
-                        let values = vm.run(&match_code, &frame.value, &frame.metadata)?;
+                        let (values, _) = vm.run(&match_code, true, &frame.value, &frame.metadata)?;
                         let matched = lookup.rows.iter().find(|row| {
                             lookup
                                 .matches
@@ -530,14 +548,16 @@ pub fn run_from(
                             continue;
                         }
                         // The prepare remap writes missing group keys as null.
-                        let identity = serde_json::to_string(
-                            &keys
-                                .iter()
+                        // The Vector stash also scopes groups by the input
+                        // identity (NAN-4919), so preview groups do too.
+                        let identity = serde_json::to_string(&(
+                            frame.metadata.get(super::input::METADATA),
+                            keys.iter()
                                 .map(|path| {
                                     canonical(peek(&frame.value, path).unwrap_or(&Value::Null))
                                 })
                                 .collect::<Vec<_>>(),
-                        )
+                        ))
                         .expect("group key");
                         let index = if let Some(&index) = ids.get(&identity) {
                             index
@@ -624,13 +644,13 @@ pub fn run_from(
         let code = runtime_program(extension)?;
         let mut next = Vec::new();
         for frame in frames {
-            match vm.run(&code, &frame.value, &frame.metadata) {
-                Ok(value) => {
+            match vm.run(&code, false, &frame.value, &frame.metadata) {
+                Ok((value, metadata)) => {
                     for value in unpack(value) {
                         next.push(Frame {
                             value,
                             origins: frame.origins.clone(),
-                            metadata: frame.metadata.clone(),
+                            metadata: metadata.clone(),
                         });
                     }
                 }

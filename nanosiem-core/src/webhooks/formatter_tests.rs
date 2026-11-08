@@ -74,25 +74,10 @@ fn sample_feed_health(status: &str) -> WebhookPayload {
     } else {
         "Log source stopped sending: apache".to_string()
     });
-    payload.severity = Some(
-        if status == "resolved" {
-            "informational"
-        } else {
-            "high"
-        }
-        .to_string(),
-    );
+    payload.severity = Some(if status == "resolved" { "informational" } else { "high" }.to_string());
     payload.entity = Some("apache".to_string());
-    payload.health_event_id =
-        Some(Uuid::parse_str("0198a822-d0e5-7692-8f76-b963afca5e23").unwrap());
-    payload.health_status = Some(
-        if status == "resolved" {
-            "resolved"
-        } else {
-            "active"
-        }
-        .to_string(),
-    );
+    payload.health_event_id = Some(Uuid::parse_str("0198a822-d0e5-7692-8f76-b963afca5e23").unwrap());
+    payload.health_status = Some(if status == "resolved" { "resolved" } else { "active" }.to_string());
     payload.health_category = Some("log_source".to_string());
     payload.health_resource_type = Some("log_source".to_string());
     payload.health_resource_id = Some("61321828-ed33-47fa-9701-e2d960573446".to_string());
@@ -173,14 +158,8 @@ fn slack_block_kit_shape() {
         .map(|f| f["text"].as_str().unwrap_or_default())
         .collect::<Vec<_>>()
         .join(" ");
-    assert!(
-        joined.contains("*Severity*\n`HIGH`"),
-        "mono severity: {joined}"
-    );
-    assert!(
-        joined.contains("*Entity*\n`10.0.0.5`"),
-        "mono entity: {joined}"
-    );
+    assert!(joined.contains("*Severity*\n`HIGH`"), "mono severity: {joined}");
+    assert!(joined.contains("*Entity*\n`10.0.0.5`"), "mono entity: {joined}");
 
     // A deep-link button when link_url is present.
     let actions = blocks.iter().find(|b| b["type"] == "actions").unwrap();
@@ -204,10 +183,7 @@ fn slack_report_card_is_kind_aware() {
 
     // Report-appropriate title.
     assert_eq!(blocks[0]["type"], "header");
-    assert_eq!(
-        blocks[0]["text"]["text"],
-        "Report ready: Weekly auth failures"
-    );
+    assert_eq!(blocks[0]["text"]["text"], "Report ready: Weekly auth failures");
 
     // Status / Rows / Source fields — no Severity/Type framing.
     let fields = blocks[1]["fields"].as_array().unwrap();
@@ -216,23 +192,11 @@ fn slack_report_card_is_kind_aware() {
         .map(|f| f["text"].as_str().unwrap_or_default())
         .collect::<Vec<_>>()
         .join(" ");
-    assert!(
-        joined.contains("*Status*\n`SUCCESS`"),
-        "status field: {joined}"
-    );
+    assert!(joined.contains("*Status*\n`SUCCESS`"), "status field: {joined}");
     assert!(joined.contains("*Rows*\n`1234`"), "rows field: {joined}");
-    assert!(
-        joined.contains("*Source*\n`search`"),
-        "source field: {joined}"
-    );
-    assert!(
-        !joined.contains("*Severity*"),
-        "no alert severity framing: {joined}"
-    );
-    assert!(
-        !joined.contains("*Type*"),
-        "no alert type framing: {joined}"
-    );
+    assert!(joined.contains("*Source*\n`search`"), "source field: {joined}");
+    assert!(!joined.contains("*Severity*"), "no alert severity framing: {joined}");
+    assert!(!joined.contains("*Type*"), "no alert type framing: {joined}");
 
     // The deep-link button still renders when a link is present.
     let actions = blocks.iter().find(|b| b["type"] == "actions").unwrap();
@@ -307,27 +271,15 @@ fn teams_report_card_is_kind_aware() {
 
     // Report-appropriate title, status-driven "Good" color (not the alert
     // severity→color enum).
-    assert_eq!(
-        content["body"][0]["text"],
-        "Report ready: Weekly auth failures"
-    );
+    assert_eq!(content["body"][0]["text"], "Report ready: Weekly auth failures");
     assert_eq!(content["body"][0]["color"], "Good");
 
     // Status / Rows / Source facts — no Severity/Type framing.
     let facts = content["body"][1]["facts"].as_array().unwrap();
-    assert!(facts
-        .iter()
-        .any(|f| f["title"] == "Status" && f["value"] == "SUCCESS"));
-    assert!(facts
-        .iter()
-        .any(|f| f["title"] == "Rows" && f["value"] == "1234"));
-    assert!(facts
-        .iter()
-        .any(|f| f["title"] == "Source" && f["value"] == "search"));
-    assert!(
-        !facts.iter().any(|f| f["title"] == "Severity"),
-        "no severity fact"
-    );
+    assert!(facts.iter().any(|f| f["title"] == "Status" && f["value"] == "SUCCESS"));
+    assert!(facts.iter().any(|f| f["title"] == "Rows" && f["value"] == "1234"));
+    assert!(facts.iter().any(|f| f["title"] == "Source" && f["value"] == "search"));
+    assert!(!facts.iter().any(|f| f["title"] == "Severity"), "no severity fact");
     assert!(!facts.iter().any(|f| f["title"] == "Type"), "no type fact");
 
     // The deep-link action still renders when a link is present.
@@ -358,12 +310,12 @@ fn pagerduty_events_v2_shape() {
     assert!(v["dedup_key"].as_str().unwrap().starts_with("alert_"));
     // Severity mapping high → error.
     assert_eq!(v["payload"]["severity"], "error");
-    assert!(v["payload"]["summary"]
-        .as_str()
-        .unwrap()
-        .contains("Impossible travel"));
+    assert!(v["payload"]["summary"].as_str().unwrap().contains("Impossible travel"));
     assert_eq!(v["payload"]["source"], "10.0.0.5");
-    assert_eq!(v["client_url"], "https://nano.example.com/alerts/alert_abc");
+    assert_eq!(
+        v["client_url"],
+        "https://nano.example.com/alerts/alert_abc"
+    );
 }
 
 #[test]
@@ -386,67 +338,38 @@ fn pagerduty_report_event_is_info_not_a_page() {
     assert_eq!(v["payload"]["custom_details"]["status"], "success");
     assert_eq!(v["payload"]["custom_details"]["row_count"], 1234);
     // No dedup key: each run is its own informational event.
-    assert!(
-        v.get("dedup_key").is_none(),
-        "no dedup key for report events"
-    );
+    assert!(v.get("dedup_key").is_none(), "no dedup key for report events");
     // The deep link still rides along when present.
-    assert_eq!(
-        v["client_url"],
-        "https://nano.example.com/reports/report_abc"
-    );
+    assert_eq!(v["client_url"], "https://nano.example.com/reports/report_abc");
 }
 
 #[test]
 fn pagerduty_feed_stale_and_recovery_share_incident_key() {
-    let ctx = FormatContext {
-        routing_key: Some("R0UTINGKEY"),
-    };
+    let ctx = FormatContext { routing_key: Some("R0UTINGKEY") };
     let stale = parse(
-        &build_channel_body(
-            ChannelType::PagerDuty,
-            &sample_feed_health("triggered"),
-            &ctx,
-        )
-        .unwrap()
-        .bytes,
+        &build_channel_body(ChannelType::PagerDuty, &sample_feed_health("triggered"), &ctx)
+            .unwrap()
+            .bytes,
     );
     let recovered = parse(
-        &build_channel_body(
-            ChannelType::PagerDuty,
-            &sample_feed_health("resolved"),
-            &ctx,
-        )
-        .unwrap()
-        .bytes,
+        &build_channel_body(ChannelType::PagerDuty, &sample_feed_health("resolved"), &ctx)
+            .unwrap()
+            .bytes,
     );
 
     assert_eq!(stale["event_action"], "trigger");
     assert_eq!(recovered["event_action"], "resolve");
     assert_eq!(stale["dedup_key"], recovered["dedup_key"]);
-    assert_eq!(
-        stale["dedup_key"],
-        "nano-health-0198a822-d0e5-7692-8f76-b963afca5e23"
-    );
-    assert_eq!(
-        stale["payload"]["custom_details"]["health_category"],
-        "log_source"
-    );
-    assert_eq!(
-        stale["payload"]["custom_details"]["health_remediation"],
-        "Check the upstream sender and network path."
-    );
+    assert_eq!(stale["dedup_key"], "nano-health-0198a822-d0e5-7692-8f76-b963afca5e23");
+    assert_eq!(stale["payload"]["custom_details"]["health_category"], "log_source");
+    assert_eq!(stale["payload"]["custom_details"]["health_remediation"], "Check the upstream sender and network path.");
 }
 
 #[test]
 fn slack_feed_health_card_is_actionable() {
     let payload = sample_feed_health("triggered");
     let ctx = FormatContext { routing_key: None };
-    let card = parse(
-        &build_channel_body(ChannelType::Slack, &payload, &ctx)
-            .unwrap()
-            .bytes,
-    );
+    let card = parse(&build_channel_body(ChannelType::Slack, &payload, &ctx).unwrap().bytes);
     let blocks = card["attachments"][0]["blocks"].as_array().unwrap();
     let rendered = serde_json::to_string(blocks).unwrap();
 
@@ -460,10 +383,7 @@ fn pagerduty_missing_routing_key_fails_closed() {
     let payload = sample_alert();
     let ctx = FormatContext { routing_key: None };
     let err = build_channel_body(ChannelType::PagerDuty, &payload, &ctx).unwrap_err();
-    assert!(
-        err.contains("routing key"),
-        "explains the missing key: {err}"
-    );
+    assert!(err.contains("routing key"), "explains the missing key: {err}");
 }
 
 #[test]
@@ -476,11 +396,7 @@ fn pagerduty_dedup_key_strategy() {
     let mut test = sample_alert();
     test.alert_id = None;
     test.event_type = "webhook.test".to_string();
-    let v = parse(
-        &build_channel_body(ChannelType::PagerDuty, &test, &ctx)
-            .unwrap()
-            .bytes,
-    );
+    let v = parse(&build_channel_body(ChannelType::PagerDuty, &test, &ctx).unwrap().bytes);
     assert_eq!(v["dedup_key"], "nano-test");
 
     // Rule-less non-test events (e.g. case events) get no dedup key, so each is
@@ -488,11 +404,7 @@ fn pagerduty_dedup_key_strategy() {
     let mut case = sample_alert();
     case.alert_id = None;
     case.event_type = "case.created".to_string();
-    let v = parse(
-        &build_channel_body(ChannelType::PagerDuty, &case, &ctx)
-            .unwrap()
-            .bytes,
-    );
+    let v = parse(&build_channel_body(ChannelType::PagerDuty, &case, &ctx).unwrap().bytes);
     assert!(v.get("dedup_key").is_none(), "no dedup key for case events");
 }
 
@@ -547,55 +459,4 @@ fn severity_hex_is_distinct_per_level() {
     let unique: std::collections::HashSet<_> = colors.iter().collect();
     assert_eq!(unique.len(), 5);
     assert_eq!(severity_hex("nonsense"), severity_hex("informational"));
-}
-
-#[test]
-fn catalog_transports_reuse_existing_channel_cards_and_generic_bytes() {
-    use serde_json::{Value, json};
-    let event = sample_alert();
-    let ctx = FormatContext {
-        routing_key: Some("fixture-key"),
-    };
-    let slack: Value = serde_json::from_slice(
-        &build_notification_body(
-            NotificationTransport::SlackChat {
-                channel: "C0123456789",
-            },
-            &event,
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let original = SlackFormatter.format(&event, &ctx);
-    assert_eq!(slack["attachments"], original["attachments"]);
-    assert_eq!(slack["text"], original["text"]);
-    assert_eq!(slack["channel"], json!("C0123456789"));
-    let teams: Value = serde_json::from_slice(
-        &build_notification_body(NotificationTransport::TeamsGraph, &event).unwrap(),
-    )
-    .unwrap();
-    let card: Value =
-        serde_json::from_str(teams["attachments"][0]["content"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        card,
-        TeamsFormatter.format(&event, &ctx)["attachments"][0]["content"]
-    );
-    let mut pd: Value = serde_json::from_slice(
-        &build_notification_body(NotificationTransport::PagerDuty, &event).unwrap(),
-    )
-    .unwrap();
-    assert!(pd.get("routing_key").is_none());
-    pd["routing_key"] = json!("fixture-key");
-    assert_eq!(
-        serde_json::to_vec(&pd).unwrap(),
-        build_channel_body(ChannelType::PagerDuty, &event, &ctx)
-            .unwrap()
-            .bytes
-    );
-    assert_eq!(
-        build_notification_body(NotificationTransport::Generic, &event).unwrap(),
-        build_channel_body(ChannelType::Generic, &event, &ctx)
-            .unwrap()
-            .bytes
-    );
 }

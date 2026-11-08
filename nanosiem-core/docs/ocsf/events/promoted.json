@@ -1,0 +1,1634 @@
+[
+ {
+  "ocsf_path": "class_uid",
+  "ch_column_name": "class_uid",
+  "ch_type": "UInt32",
+  "lowered_at_ingest": false,
+  "index": "sortkey",
+  "entity_type": null,
+  "category": "Taxonomy",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": true
+ },
+ {
+  "ocsf_path": "category_uid",
+  "ch_column_name": "category_uid",
+  "ch_type": "UInt16",
+  "lowered_at_ingest": false,
+  "index": "minmax",
+  "entity_type": null,
+  "category": "Taxonomy",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": true
+ },
+ {
+  "ocsf_path": "activity_id",
+  "ch_column_name": "activity_id",
+  "ch_type": "Int32",
+  "lowered_at_ingest": false,
+  "index": "minmax",
+  "entity_type": null,
+  "category": "Taxonomy",
+  "since": "1.9.0",
+  "udm_fields": [
+   "event_type",
+   "file_action",
+   "change_type"
+  ],
+  "prewhere": true,
+  "enum_label_column": "activity"
+ },
+ {
+  "ocsf_path": "type_uid",
+  "ch_column_name": "type_uid",
+  "ch_type": "Int64",
+  "lowered_at_ingest": false,
+  "index": "minmax",
+  "entity_type": null,
+  "category": "Taxonomy",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": true
+ },
+ {
+  "ocsf_path": "severity_id",
+  "ch_column_name": "severity_id",
+  "ch_type": "Int32",
+  "lowered_at_ingest": false,
+  "index": "minmax",
+  "entity_type": null,
+  "category": "Taxonomy",
+  "since": "1.9.0",
+  "udm_fields": [
+   "severity"
+  ],
+  "prewhere": true,
+  "enum_values": {
+   "unknown": 0,
+   "informational": 1,
+   "low": 2,
+   "medium": 3,
+   "high": 4,
+   "critical": 5,
+   "fatal": 6,
+   "other": 99
+  }
+ },
+ {
+  "ocsf_path": "status_id",
+  "ch_column_name": "status_id",
+  "ch_type": "Int32",
+  "lowered_at_ingest": false,
+  "index": "minmax",
+  "entity_type": null,
+  "category": "Taxonomy",
+  "since": "1.9.0",
+  "udm_fields": [
+   "auth_result"
+  ],
+  "prewhere": false,
+  "enum_values": {
+   "unknown": 0,
+   "success": 1,
+   "failure": 2,
+   "other": 99
+  }
+ },
+ {
+  "ocsf_path": "disposition_id",
+  "ch_column_name": "disposition_id",
+  "ch_type": "Int32",
+  "lowered_at_ingest": false,
+  "index": "minmax",
+  "entity_type": null,
+  "category": "Taxonomy",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "action_id",
+  "ch_column_name": "action_id",
+  "ch_type": "Int32",
+  "lowered_at_ingest": false,
+  "index": "minmax",
+  "entity_type": null,
+  "category": "Taxonomy",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "auth_protocol_id",
+  "ch_column_name": "auth_protocol_id",
+  "ch_type": "Int32",
+  "lowered_at_ingest": false,
+  "index": "minmax",
+  "entity_type": null,
+  "category": "Authentication",
+  "since": "1.9.0",
+  "udm_fields": [
+   "auth_type"
+  ],
+  "prewhere": false,
+  "enum_values": {
+   "unknown": 0,
+   "ntlm": 1,
+   "kerberos": 2,
+   "digest": 3,
+   "openid": 4,
+   "saml": 5,
+   "oauth 2.0": 6,
+   "pap": 7,
+   "chap": 8,
+   "eap": 9,
+   "radius": 10,
+   "other": 99
+  }
+ },
+ {
+  "ocsf_path": "class_name",
+  "ch_column_name": "class_name",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": "set",
+  "entity_type": null,
+  "category": "Taxonomy",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "category_name",
+  "ch_column_name": "category_name",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Taxonomy",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "activity_name",
+  "ch_column_name": "activity_name",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": "set",
+  "entity_type": null,
+  "category": "Taxonomy",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "severity",
+  "ch_column_name": "severity",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Taxonomy",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "status",
+  "ch_column_name": "status",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Taxonomy",
+  "since": "1.9.0",
+  "udm_fields": [
+   "status"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "metadata.version",
+  "ch_column_name": "metadata.version",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": "set",
+  "entity_type": null,
+  "category": "Metadata",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "metadata.uid",
+  "ch_column_name": "metadata.uid",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Metadata",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "metadata.event_code",
+  "ch_column_name": "metadata.event_code",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": null,
+  "category": "Metadata",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "metadata.product.name",
+  "ch_column_name": "metadata.product.name",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Metadata",
+  "since": "1.9.0",
+  "udm_fields": [
+   "vendor_product"
+  ],
+  "prewhere": true
+ },
+ {
+  "ocsf_path": "metadata.product.vendor_name",
+  "ch_column_name": "metadata.product.vendor_name",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Metadata",
+  "since": "1.9.0",
+  "udm_fields": [
+   "vendor"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "metadata.log_name",
+  "ch_column_name": "metadata.log_name",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Metadata",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "metadata.log_provider",
+  "ch_column_name": "metadata.log_provider",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Metadata",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "metadata.correlation_uid",
+  "ch_column_name": "metadata.correlation_uid",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Metadata",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "message",
+  "ch_column_name": "message",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "text",
+  "entity_type": null,
+  "category": "Core",
+  "since": "1.9.0",
+  "udm_fields": [
+   "message"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "raw_data",
+  "ch_column_name": "raw_data",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "text",
+  "entity_type": null,
+  "category": "Core",
+  "since": "1.9.0",
+  "udm_fields": [
+   "raw_data"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "actor.user.name",
+  "ch_column_name": "actor.user.name",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "user",
+  "category": "Identity",
+  "since": "1.9.0",
+  "udm_fields": [
+   "src_user"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "actor.user.uid",
+  "ch_column_name": "actor.user.uid",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "user",
+  "category": "Identity",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "actor.user.domain",
+  "ch_column_name": "actor.user.domain",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Identity",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "actor.user.email_addr",
+  "ch_column_name": "actor.user.email_addr",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "user",
+  "category": "Identity",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "user.name",
+  "ch_column_name": "user.name",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "user",
+  "category": "Identity",
+  "since": "1.9.0",
+  "udm_fields": [
+   "user",
+   "dest_user"
+  ],
+  "prewhere": true
+ },
+ {
+  "ocsf_path": "user.uid",
+  "ch_column_name": "user.uid",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "user",
+  "category": "Identity",
+  "since": "1.9.0",
+  "udm_fields": [
+   "user_id"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "user.domain",
+  "ch_column_name": "user.domain",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": true,
+  "index": null,
+  "entity_type": null,
+  "category": "Identity",
+  "since": "1.9.0",
+  "udm_fields": [
+   "user_domain"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "user.email_addr",
+  "ch_column_name": "user.email_addr",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "user",
+  "category": "Identity",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "device.hostname",
+  "ch_column_name": "device.hostname",
+  "ch_type": "String",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": "host",
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "device.ip",
+  "ch_column_name": "device.ip",
+  "ch_type": "String",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": "ip",
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "device.uid",
+  "ch_column_name": "device.uid",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "host",
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "src_endpoint.ip",
+  "ch_column_name": "src_endpoint.ip",
+  "ch_type": "String",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": "ip",
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [
+   "src_ip"
+  ],
+  "prewhere": true
+ },
+ {
+  "ocsf_path": "src_endpoint.hostname",
+  "ch_column_name": "src_endpoint.hostname",
+  "ch_type": "String",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": "host",
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [
+   "src_host"
+  ],
+  "prewhere": true
+ },
+ {
+  "ocsf_path": "src_endpoint.port",
+  "ch_column_name": "src_endpoint.port",
+  "ch_type": "Int32",
+  "lowered_at_ingest": false,
+  "index": "minmax",
+  "entity_type": null,
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [
+   "src_port"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "src_endpoint.mac",
+  "ch_column_name": "src_endpoint.mac",
+  "ch_type": "String",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [
+   "src_mac"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "src_endpoint.location.country",
+  "ch_column_name": "src_endpoint.location.country",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Enrichment",
+  "since": "1.9.0",
+  "udm_fields": [
+   "enriched_src_country_code",
+   "enriched_src_country"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "src_endpoint.autonomous_system.number",
+  "ch_column_name": "src_endpoint.autonomous_system.number",
+  "ch_type": "Int64",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Enrichment",
+  "since": "1.9.0",
+  "udm_fields": [
+   "enriched_src_asn"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "dst_endpoint.ip",
+  "ch_column_name": "dst_endpoint.ip",
+  "ch_type": "String",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": "ip",
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [
+   "dest_ip"
+  ],
+  "prewhere": true
+ },
+ {
+  "ocsf_path": "dst_endpoint.hostname",
+  "ch_column_name": "dst_endpoint.hostname",
+  "ch_type": "String",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": "host",
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [
+   "dest_host"
+  ],
+  "prewhere": true
+ },
+ {
+  "ocsf_path": "dst_endpoint.port",
+  "ch_column_name": "dst_endpoint.port",
+  "ch_type": "Int32",
+  "lowered_at_ingest": false,
+  "index": "minmax",
+  "entity_type": null,
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [
+   "dest_port"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "dst_endpoint.mac",
+  "ch_column_name": "dst_endpoint.mac",
+  "ch_type": "String",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [
+   "dest_mac"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "dst_endpoint.location.country",
+  "ch_column_name": "dst_endpoint.location.country",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Enrichment",
+  "since": "1.9.0",
+  "udm_fields": [
+   "enriched_dest_country_code",
+   "enriched_dest_country"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "dst_endpoint.autonomous_system.number",
+  "ch_column_name": "dst_endpoint.autonomous_system.number",
+  "ch_type": "Int64",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Enrichment",
+  "since": "1.9.0",
+  "udm_fields": [
+   "enriched_dest_asn"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "connection_info.protocol_num",
+  "ch_column_name": "connection_info.protocol_num",
+  "ch_type": "Int32",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [
+   "protocol"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "traffic.bytes_in",
+  "ch_column_name": "traffic.bytes_in",
+  "ch_type": "UInt64",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [
+   "bytes_in"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "traffic.bytes_out",
+  "ch_column_name": "traffic.bytes_out",
+  "ch_type": "UInt64",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [
+   "bytes_out"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "traffic.packets_in",
+  "ch_column_name": "traffic.packets_in",
+  "ch_type": "UInt64",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [
+   "packets_in"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "traffic.packets_out",
+  "ch_column_name": "traffic.packets_out",
+  "ch_type": "UInt64",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Network",
+  "since": "1.9.0",
+  "udm_fields": [
+   "packets_out"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "process.name",
+  "ch_column_name": "process.name",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "process",
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [
+   "process_name"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "process.cmd_line",
+  "ch_column_name": "process.cmd_line",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "text",
+  "entity_type": "process",
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [
+   "command_line"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "process.pid",
+  "ch_column_name": "process.pid",
+  "ch_type": "Int64",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [
+   "process_id"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "process.uid",
+  "ch_column_name": "process.uid",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [
+   "process_guid"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "process.file.path",
+  "ch_column_name": "process.file.path",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "file",
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [
+   "process_path"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "process.file.hashes.value",
+  "ch_column_name": "process.file.hashes.value",
+  "ch_type": "Array(String)",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": "hash",
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "process.parent_process.name",
+  "ch_column_name": "process.parent_process.name",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "process",
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [
+   "parent_process_name"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "process.parent_process.cmd_line",
+  "ch_column_name": "process.parent_process.cmd_line",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "text",
+  "entity_type": "process",
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "actor.process.name",
+  "ch_column_name": "actor.process.name",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "process",
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": true
+ },
+ {
+  "ocsf_path": "actor.process.cmd_line",
+  "ch_column_name": "actor.process.cmd_line",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "text",
+  "entity_type": "process",
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [
+   "parent_command_line"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "actor.process.pid",
+  "ch_column_name": "actor.process.pid",
+  "ch_type": "Int64",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "actor.process.uid",
+  "ch_column_name": "actor.process.uid",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [
+   "parent_process_guid"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "actor.process.file.path",
+  "ch_column_name": "actor.process.file.path",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "file",
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [
+   "parent_process_path"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "actor.process.file.hashes.value",
+  "ch_column_name": "actor.process.file.hashes.value",
+  "ch_type": "Array(String)",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": "hash",
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "file.path",
+  "ch_column_name": "file.path",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "file",
+  "category": "File",
+  "since": "1.9.0",
+  "udm_fields": [
+   "file_path"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "file.name",
+  "ch_column_name": "file.name",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "file",
+  "category": "File",
+  "since": "1.9.0",
+  "udm_fields": [
+   "file_name"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "file.hashes.value",
+  "ch_column_name": "file.hashes.value",
+  "ch_type": "Array(String)",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": "hash",
+  "category": "File",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "reg_key.path",
+  "ch_column_name": "reg_key.path",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": null,
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [
+   "registry_path"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "reg_value.path",
+  "ch_column_name": "reg_value.path",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": null,
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [
+   "registry_key_name"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "http_request.url.url_string",
+  "ch_column_name": "http_request.url.url_string",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "text",
+  "entity_type": "url",
+  "category": "Web",
+  "since": "1.9.0",
+  "udm_fields": [
+   "url"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "http_request.url.hostname",
+  "ch_column_name": "http_request.url.hostname",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "domain",
+  "category": "Web",
+  "since": "1.9.0",
+  "udm_fields": [
+   "url_domain"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "http_request.url.path",
+  "ch_column_name": "http_request.url.path",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Web",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "http_request.http_method",
+  "ch_column_name": "http_request.http_method",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Web",
+  "since": "1.9.0",
+  "udm_fields": [
+   "http_method"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "http_request.user_agent",
+  "ch_column_name": "http_request.user_agent",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "text",
+  "entity_type": null,
+  "category": "Web",
+  "since": "1.9.0",
+  "udm_fields": [
+   "http_user_agent",
+   "user_agent"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "http_response.code",
+  "ch_column_name": "http_response.code",
+  "ch_type": "Int32",
+  "lowered_at_ingest": false,
+  "index": "minmax",
+  "entity_type": null,
+  "category": "Web",
+  "since": "1.9.0",
+  "udm_fields": [
+   "http_status_code",
+   "status_code"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "url.url_string",
+  "ch_column_name": "url.url_string",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "text",
+  "entity_type": "url",
+  "category": "Web",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "url.hostname",
+  "ch_column_name": "url.hostname",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "domain",
+  "category": "Web",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "query.hostname",
+  "ch_column_name": "query.hostname",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "domain",
+  "category": "DNS",
+  "since": "1.9.0",
+  "udm_fields": [
+   "query"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "answers.rdata",
+  "ch_column_name": "answers.rdata",
+  "ch_type": "Array(String)",
+  "lowered_at_ingest": false,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "DNS",
+  "since": "1.9.0",
+  "udm_fields": [
+   "answer"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "api.operation",
+  "ch_column_name": "api.operation",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": null,
+  "category": "Cloud",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "api.service.name",
+  "ch_column_name": "api.service.name",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Cloud",
+  "since": "1.9.0",
+  "udm_fields": [
+   "cloud_service"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "cloud.provider",
+  "ch_column_name": "cloud.provider",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Cloud",
+  "since": "1.9.0",
+  "udm_fields": [
+   "cloud_provider"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "cloud.region",
+  "ch_column_name": "cloud.region",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Cloud",
+  "since": "1.9.0",
+  "udm_fields": [
+   "cloud_region"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "cloud.account.uid",
+  "ch_column_name": "cloud.account.uid",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Cloud",
+  "since": "1.9.0",
+  "udm_fields": [
+   "cloud_account_id"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "session.uid",
+  "ch_column_name": "session.uid",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Authentication",
+  "since": "1.9.0",
+  "udm_fields": [
+   "session_id"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "email.from",
+  "ch_column_name": "email.from",
+  "ch_type": "String",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": "user",
+  "category": "Email",
+  "since": "1.9.0",
+  "udm_fields": [
+   "sender"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "email.subject",
+  "ch_column_name": "email.subject",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "text",
+  "entity_type": null,
+  "category": "Email",
+  "since": "1.9.0",
+  "udm_fields": [
+   "subject"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "email.to",
+  "ch_column_name": "email.to",
+  "ch_type": "Array(String)",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": "user",
+  "category": "Email",
+  "since": "1.9.0",
+  "udm_fields": [
+   "recipient"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "finding_info.uid",
+  "ch_column_name": "finding_info.uid",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Finding",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "finding_info.title",
+  "ch_column_name": "finding_info.title",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "text",
+  "entity_type": null,
+  "category": "Finding",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "observables.value",
+  "ch_column_name": "observables.value",
+  "ch_type": "Array(String)",
+  "lowered_at_ingest": false,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Core",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "observables.type_id",
+  "ch_column_name": "observables.type_id",
+  "ch_type": "Array(UInt16)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Core",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "enrichments.value",
+  "ch_column_name": "enrichments.value",
+  "ch_type": "Array(String)",
+  "lowered_at_ingest": false,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Enrichment",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "enrichments.name",
+  "ch_column_name": "enrichments.name",
+  "ch_type": "Array(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Enrichment",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "resources.uid",
+  "ch_column_name": "resources.uid",
+  "ch_type": "Array(String)",
+  "lowered_at_ingest": false,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Cloud",
+  "since": "1.9.0",
+  "udm_fields": [
+   "resource_id"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "vulnerabilities.cve.uid",
+  "ch_column_name": "vulnerabilities.cve.uid",
+  "ch_type": "Array(String)",
+  "lowered_at_ingest": false,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Finding",
+  "since": "1.9.0",
+  "udm_fields": [
+   "cve"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "actor.user.type",
+  "ch_column_name": "actor.user.type",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Identity",
+  "since": "1.9.0",
+  "udm_fields": [
+   "user_type"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "auth_protocol",
+  "ch_column_name": "auth_protocol",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Authentication",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "is_mfa",
+  "ch_column_name": "is_mfa",
+  "ch_type": "Bool",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Authentication",
+  "since": "1.9.0",
+  "udm_fields": [
+   "mfa_used"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "logon_type_id",
+  "ch_column_name": "logon_type_id",
+  "ch_type": "Int32",
+  "lowered_at_ingest": false,
+  "index": "minmax",
+  "entity_type": null,
+  "category": "Authentication",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "cloud.account.name",
+  "ch_column_name": "cloud.account.name",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Cloud",
+  "since": "1.9.0",
+  "udm_fields": [
+   "cloud_account_name"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "src_endpoint.autonomous_system.name",
+  "ch_column_name": "src_endpoint.autonomous_system.name",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Enrichment",
+  "since": "1.9.0",
+  "udm_fields": [
+   "enriched_src_as_name"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "src_endpoint.location.continent",
+  "ch_column_name": "src_endpoint.location.continent",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Enrichment",
+  "since": "1.9.0",
+  "udm_fields": [
+   "enriched_src_continent"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "dst_endpoint.autonomous_system.name",
+  "ch_column_name": "dst_endpoint.autonomous_system.name",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Enrichment",
+  "since": "1.9.0",
+  "udm_fields": [
+   "enriched_dest_as_name"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "dst_endpoint.location.continent",
+  "ch_column_name": "dst_endpoint.location.continent",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Enrichment",
+  "since": "1.9.0",
+  "udm_fields": [
+   "enriched_dest_continent"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "duration",
+  "ch_column_name": "duration",
+  "ch_type": "Int64",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Core",
+  "since": "1.9.0",
+  "udm_fields": [
+   "duration"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "email.message_uid",
+  "ch_column_name": "email.message_uid",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Email",
+  "since": "1.9.0",
+  "udm_fields": [
+   "message_id"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "http_request.referrer",
+  "ch_column_name": "http_request.referrer",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Web",
+  "since": "1.9.0",
+  "udm_fields": [
+   "http_referrer"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "trace.uid",
+  "ch_column_name": "trace.uid",
+  "ch_type": "String",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Core",
+  "since": "1.9.0",
+  "udm_fields": [
+   "trace_id"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "trace.span.uid",
+  "ch_column_name": "trace.span.uid",
+  "ch_type": "String",
+  "lowered_at_ingest": true,
+  "index": "bloom",
+  "entity_type": null,
+  "category": "Core",
+  "since": "1.9.0",
+  "udm_fields": [
+   "span_id"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "http_request.url.categories",
+  "ch_column_name": "http_request.url.categories",
+  "ch_type": "Array(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Web",
+  "since": "1.9.0",
+  "udm_fields": [
+   "category"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "metadata.product.feature.name",
+  "ch_column_name": "metadata.product.feature.name",
+  "ch_type": "LowCardinality(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Metadata",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "module.file.name",
+  "ch_column_name": "module.file.name",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "file",
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "module.file.path",
+  "ch_column_name": "module.file.path",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": "file",
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "reg_value.name",
+  "ch_column_name": "reg_value.name",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "bloom_lower",
+  "entity_type": null,
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [
+   "registry_value_name"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "reg_value.data",
+  "ch_column_name": "reg_value.data",
+  "ch_type": "String",
+  "lowered_at_ingest": false,
+  "index": "text",
+  "entity_type": null,
+  "category": "Process",
+  "since": "1.9.0",
+  "udm_fields": [
+   "registry_value_data"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "resources.name",
+  "ch_column_name": "resources.name",
+  "ch_type": "Array(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Cloud",
+  "since": "1.9.0",
+  "udm_fields": [
+   "resource_name"
+  ],
+  "prewhere": false
+ },
+ {
+  "ocsf_path": "resources.type",
+  "ch_column_name": "resources.type",
+  "ch_type": "Array(String)",
+  "lowered_at_ingest": false,
+  "index": null,
+  "entity_type": null,
+  "category": "Cloud",
+  "since": "1.9.0",
+  "udm_fields": [
+   "resource_type"
+  ],
+  "prewhere": false
+ }
+]

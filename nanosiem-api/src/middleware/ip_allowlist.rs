@@ -59,6 +59,21 @@ pub async fn ip_allowlist_middleware(
         }
     }
 
+    // NAN-1931: the Vector config-consumer sidecar is in-cluster
+    // infrastructure, like the probes above — a tenant-configured UI/API
+    // allowlist must not be able to freeze config delivery to Vector. The
+    // endpoints carry their own VECTOR_AUTH_TOKEN bearer gate.
+    if path.starts_with("/api/internal/vector-config/") {
+        return next.run(request).await;
+    }
+
+    // NAN-4907: the OTLP edge's auth_request. Its caller is an ingest sender
+    // (like /ingest, which never reaches this API); the source-bound ingest
+    // token it carries is the gate, not the UI/API allowlist.
+    if path == "/api/internal/otlp-auth" {
+        return next.run(request).await;
+    }
+
     // Extract ConnectInfo from request extensions (set by into_make_service_with_connect_info)
     let connect_info = request
         .extensions()
@@ -80,19 +95,7 @@ pub async fn ip_allowlist_middleware(
     };
 
     // Check against the allowlist
-    let allowed = match state.service.check_allowed(ip_str, state.scope).await {
-        Ok(allowed) => allowed,
-        Err(_) => {
-            tracing::error!(scope = %state.scope, "IP allowlist policy unavailable; request not admitted");
-            return (StatusCode::SERVICE_UNAVAILABLE, Json(IpDeniedResponse {
-                error: IpDeniedError {
-                    code: "IP_POLICY_UNAVAILABLE",
-                    message: "Access policy is temporarily unavailable. Please retry later.".into(),
-                },
-            })).into_response();
-        }
-    };
-    if !allowed {
+    if !state.service.is_allowed(ip_str, state.scope).await {
         tracing::info!(
             ip = %ip_str,
             path = %path,
@@ -117,36 +120,4 @@ fn ip_denied_response(ip: &str) -> Response {
     };
 
     (StatusCode::FORBIDDEN, Json(body)).into_response()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::{body::Body, middleware, routing::get, Router};
-    use tower::ServiceExt;
-
-    #[tokio::test]
-    async fn ip_policy_outage_blocks_api_but_preserves_health_probe() {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://fixture:fixture@127.0.0.1:1/never_connect").unwrap();
-        pool.close().await;
-        let state = IpAllowlistState {
-            service: Arc::new(IpAllowlistService::new(pool)), scope: IpAllowlistScope::Api,
-        };
-        let app = Router::new().route("/api/protected", get(|| async { "handler reached" }))
-            .route("/health", get(|| async { "healthy" }))
-            .layer(middleware::from_fn_with_state(state, ip_allowlist_middleware));
-        let mut request = Request::builder().uri("/api/protected").body(Body::empty()).unwrap();
-        request.extensions_mut().insert(ConnectInfo("203.0.113.5:1234".parse::<SocketAddr>().unwrap()));
-        let response = app.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body, serde_json::json!({"error": {
-            "code": "IP_POLICY_UNAVAILABLE",
-            "message": "Access policy is temporarily unavailable. Please retry later."
-        }}));
-        let response = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
 }

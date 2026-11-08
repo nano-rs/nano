@@ -68,6 +68,15 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/prevalence', segments: [{ label: 'Home', href: '/' }, { label: 'Prevalence' }] },
   { path: '/settings/prevalence', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Rarity Thresholds' }] },
   { path: '/risk', segments: [{ label: 'Home', href: '/' }, { label: 'Risk' }], capability: 'risk' },
+  { path: '/settings/soar', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'SOAR' }], capability: 'soar' },
+  // NAN-4540 / NAN-4925: Automation workspace
+  { path: '/automation/runs', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Runs' }], capability: 'soar' },
+  { path: '/automation/runs/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Runs', href: '/automation/runs' }, { label: 'Run' }], capability: 'soar' },
+  { path: '/automation/flows', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Flows' }], capability: 'soar' },
+  { path: '/automation/flows/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Flows', href: '/automation/flows' }, { label: 'Flow' }], capability: 'soar' },
+  { path: '/automation/approvals', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Approvals' }], capability: 'soar' },
+  { path: '/automation/approvals/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Approvals', href: '/automation/approvals' }, { label: 'Approval' }], capability: 'soar' },
+  { path: '/automation/capabilities', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Capabilities' }], capability: 'soar' },
   { path: '/risk/watchlists', segments: [{ label: 'Home', href: '/' }, { label: 'Risk', href: '/risk' }, { label: 'Watchlists' }], capability: 'risk' },
   { path: '/settings/risk', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Risk Scoring' }], capability: 'risk' },
   { path: '/platform/health', segments: [{ label: 'Home', href: '/' }, { label: 'SIEM Health' }], capability: 'siemHealth' },
@@ -87,8 +96,8 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/alerts/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Alerts', href: '/alerts' }, { label: ':dynamic' }] },
 
   // Lookup Tables (under Rules)
+  { path: '/rules/ioc-lists', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'IOC lists' }], capability: 'iocLists' },
   { path: '/rules/lookup-tables', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'Lookup Tables' }] },
-  { path: '/rules/ioc-lists', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'IOC Lists' }], capability: 'iocLists' },
   { path: '/rules/lookup-tables/new', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'Lookup Tables', href: '/rules/lookup-tables' }, { label: 'New' }] },
   { path: '/rules/lookup-tables/:name', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'Lookup Tables', href: '/rules/lookup-tables' }, { label: ':dynamic' }] },
 
@@ -96,21 +105,17 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/upload', segments: [{ label: 'Home', href: '/' }, { label: 'Upload' }] },
 
   // Ingestion
-  { path: '/ingestion/pipelines', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Pipelines' }] },
-  { path: '/ingestion/pipelines/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Pipelines', href: '/ingestion/pipelines' }, { label: ':dynamic' }] },
-  { path: '/ingestion/connector-feeds', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Pull feeds' }] },
   { path: '/ingestion/log-sources', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources' }] },
   { path: '/ingestion/log-sources/new', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Add source' }] },
   { path: '/ingestion/log-sources/wizard', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Add source' }] },
   { path: '/ingestion/log-sources/credentials', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Credentials' }] },
-  { path: '/ingestion/log-sources/onboarding', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Source onboarding' }] },
   { path: '/ingestion/log-sources/cloud-pull', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Cloud pull' }] },
+  { path: '/ingestion/log-sources/pull-feeds', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Pull feeds' }] },
+  { path: '/ingestion/log-sources/inputs/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: ':dynamic' }] },
   { path: '/ingestion/log-sources/repositories', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Repositories' }] },
   { path: '/ingestion/log-sources/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: ':dynamic' }] },
-  { path: '/ingestion/source-configurations', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Source Configs' }] },
-  { path: '/ingestion/source-configurations/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Source Configs', href: '/ingestion/source-configurations' }, { label: ':dynamic' }] },
-  { path: '/ingestion/credentials', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Credentials' }] },
-  { path: '/ingestion/credentials/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Credentials' }] },
+  { path: '/ingestion/pipelines', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Pipelines' }] },
+  { path: '/ingestion/pipelines/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Pipelines', href: '/ingestion/pipelines' }, { label: ':dynamic' }] },
 
   // Marketplace (top-level)
   { path: '/marketplace', segments: [{ label: 'Home', href: '/' }, { label: 'Marketplace' }] },
@@ -125,6 +130,7 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/settings/notifications', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Notifications' }] },
   { path: '/settings/source-scopes', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Source Visibility' }] },
   { path: '/settings/airgap-import', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Air-gapped Import' }] },
+  { path: '/settings/license', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Offline License' }] },
   { path: '/settings/cases/queues', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Queues & Routing' }] },
   { path: '/settings/integrations/lookup-url-allowlist', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Lookup URL allowlist' }] },
   { path: '/settings/storage', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Storage' }] },
@@ -148,15 +154,6 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/settings/api-keys', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Access Control', href: '/settings/access-control' }, { label: 'API Keys' }] },
   { path: '/settings/sessions', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Access Control', href: '/settings/access-control' }, { label: 'Sessions' }] },
   { path: '/settings/audit', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Access Control', href: '/settings/access-control' }, { label: 'Audit Log' }] },
-  // NAN-4540: Automation workspace
-  { path: '/automation/runs', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Runs' }], capability: 'soar' },
-  { path: '/automation/runs/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Runs', href: '/automation/runs' }, { label: 'Run' }], capability: 'soar' },
-  { path: '/automation/flows', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Flows' }], capability: 'soar' },
-  { path: '/automation/flows/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Flows', href: '/automation/flows' }, { label: 'Flow' }], capability: 'soar' },
-  { path: '/automation/approvals', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Approvals' }], capability: 'soar' },
-  { path: '/automation/approvals/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Approvals', href: '/automation/approvals' }, { label: 'Approval' }], capability: 'soar' },
-  { path: '/automation/capabilities', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Capabilities' }], capability: 'soar' },
-  { path: '/settings/soar', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'SOAR' }], capability: 'soar' },
   { path: '/settings/gdpr', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'GDPR Anonymization' }] },
   { path: '/settings/user', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'User Settings' }] },
 
@@ -223,8 +220,7 @@ export function AppBreadcrumbs() {
   // (NAN-911 F-16/F-32). If only "Home" remains after the drop we still
   // render — that single breadcrumb gives the user a one-click back to the
   // landing surface from any leaf route.
-  const { pathname } = useLocation();
-  const trail = pathname.endsWith('/ingestion/log-sources/new') ? segments ?? [] : segments?.slice(0, -1) ?? [];
+  const trail = segments?.slice(0, -1) ?? [];
   if (trail.length === 0) return null;
 
   return (

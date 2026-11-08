@@ -247,13 +247,12 @@ fn search_command(input: &str) -> ParseResult<'_, Command> {
 /// a `LIKE`/`NOT LIKE` (the where generator emits case-insensitive `iLike`),
 /// so the piped stage matches what the same term matches before the pipe.
 /// `field=*` stays an existence test, which both scopes already agree on.
-fn search_wildcards_to_like(expr: SearchExpr) -> SearchExpr {
+pub(crate) fn search_wildcards_to_like(expr: SearchExpr) -> SearchExpr {
     match expr {
         SearchExpr::FieldFilter {
             field,
             op: op @ (Comparator::Eq | Comparator::Ne),
             value: Value::String(s),
-            rhs,
         } if s != "*" && (s.contains('*') || s.contains('?')) => SearchExpr::FieldFilter {
             field,
             op: if op == Comparator::Eq {
@@ -262,7 +261,6 @@ fn search_wildcards_to_like(expr: SearchExpr) -> SearchExpr {
                 Comparator::NotLike
             },
             value: Value::String(glob_to_like_pattern(&s)),
-            rhs,
         },
         SearchExpr::And(l, r) => SearchExpr::And(
             Box::new(search_wildcards_to_like(*l)),
@@ -452,8 +450,8 @@ fn tail_command(input: &str) -> ParseResult<'_, Command> {
     ))
 }
 
-/// Parse timechart command: timechart [span=duration|bins=N] [limit=N] agg1, agg2 [by field] [limit=N]
-/// limit can appear before aggregations or after split-by
+/// Parse timechart command: timechart [span=duration|bins=N] [limit=N]
+/// [useother=bool] agg1, agg2 [by field] [limit=N] [useother=bool]
 fn timechart_command(input: &str) -> ParseResult<'_, Command> {
     let (input, _) = tag_no_case("timechart").parse(input)?;
     let (input, _) = multispace1(input)?;
@@ -543,7 +541,7 @@ fn timechart_command(input: &str) -> ParseResult<'_, Command> {
     )
     .parse(input)?;
 
-    // Parse optional trailing params after split-by (limit=, cont=)
+    // Parse optional trailing params after split-by (limit=, cont=, useother=)
     let mut remaining = input;
     loop {
         if let Ok((rest, _)) = multispace1::<_, nom::error::Error<&str>>(remaining) {
@@ -595,8 +593,8 @@ fn timechart_command(input: &str) -> ParseResult<'_, Command> {
             aggregations,
             split_by,
             limit,
-            cont,
             useother,
+            cont,
         },
     ))
 }
@@ -606,6 +604,17 @@ fn span_spec(input: &str) -> ParseResult<'_, Duration> {
     let (input, _) = tag_no_case("span").parse(input)?;
     let (input, _) = char('=').parse(input)?;
     duration_fn(input)
+}
+
+fn timechart_useother(input: &str) -> ParseResult<'_, bool> {
+    preceded(
+        tag_no_case("useother="),
+        alt((
+            value(true, tag_no_case("true")),
+            value(false, tag_no_case("false")),
+        )),
+    )
+    .parse(input)
 }
 
 /// Parse duration: 1h, 5m, 30s, 1d
@@ -711,7 +720,7 @@ fn field_rename(input: &str) -> ParseResult<'_, FieldRename> {
     Ok((input, FieldRename { from, to }))
 }
 
-/// Parse lookup <table> <column> [AS <event>] [OUTPUT|OUTPUTNEW <column> [AS <result>], ...].
+/// Parse lookup command: lookup <table_name> <key_field> [OUTPUT <field1>, <field2>, ...] [CASE_INSENSITIVE]
 /// Examples:
 ///   lookup assets src_ip
 ///   lookup users user OUTPUT name, email
@@ -727,50 +736,56 @@ fn lookup_command(input: &str) -> ParseResult<'_, Command> {
     // Parse key field
     let (input, key_field_local) = field_name(input)?;
 
-    // Parse optional AS event-field clause (legacy order is handled below).
+    // Parse optional "AS" clause.
     let (input, key_field_alias) = opt(preceded(
         delimited(multispace1, tag_no_case("as"), multispace1),
         field_name,
     ))
     .parse(input)?;
 
-    // Splunk order is table-column AS event-field. Retain legacy event-first
-    // queries when the first side is dotted and the second is flat, or only
-    // the first side is a physical UDM event column. Generated inventory
-    // fields like `ip` must not count here. Other pairs use Splunk order.
-    let is_event_field = |field: &str| {
-        use crate::schema::SchemaProfile;
-        field.contains('.')
-            || matches!(crate::schema::UdmProfile::new().resolve(field),
-                crate::schema::FieldResolution::ExplicitColumn(column) if column == field)
-    };
-    let (key_field, event_field) = match key_field_alias {
-        Some(alias) if (key_field_local.contains('.') && !alias.contains('.'))
-            || (is_event_field(&key_field_local) && !is_event_field(&alias)) =>
-            (alias, key_field_local),
+    // dev's deterministic grammar: `lookup <table> <event_field> [AS <lookup_key>]`
+    // (`lookup assets src_ip AS ip` reads the event field `src_ip` and matches
+    // the table column `ip`). Both sides are kept (NAN-4933): dev collapsed
+    // them into the alias, so the event side read a field named like the
+    // table column and any lookup whose names differ enriched nothing. No
+    // schema-based guessing of the direction: it cannot tell computed or
+    // custom fields apart.
+    let (event_field, key_field) = match key_field_alias {
         Some(alias) => (key_field_local, alias),
         None => (key_field_local.clone(), key_field_local),
     };
 
+    // OUTPUT | OUTPUTNEW <column> [AS <result>], ...
     let (input, output) = opt(preceded(
         multispace1,
         pair(
             alt((value(true, tag_no_case("OUTPUTNEW")), value(false, tag_no_case("OUTPUT")))),
-            preceded(multispace1, separated_list1(
-                alt((delimited(multispace0, char(','), multispace0), value(',', multispace1))),
-                |input| {
-                    let (input, from) = alt((quoted_string, field_name)).parse(input)?;
-                    if from.eq_ignore_ascii_case("CASE_INSENSITIVE") {
-                        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
-                    }
-                    let (input, to) = opt(preceded(
-                        delimited(multispace1, tag_no_case("AS"), multispace1), alt((quoted_string, field_name)),
-                    )).parse(input)?;
-                    Ok((input, FieldRename { to: to.unwrap_or_else(|| from.clone()), from }))
-                },
-            )),
+            preceded(
+                multispace1,
+                nom::multi::separated_list1(
+                    alt((delimited(multispace0, char(','), multispace0), value(',', multispace1))),
+                    |input| {
+                        let (input, from) = alt((quoted_string, field_name)).parse(input)?;
+                        if from.eq_ignore_ascii_case("CASE_INSENSITIVE")
+                            || from.eq_ignore_ascii_case("AS")
+                        {
+                            return Err(nom::Err::Error(nom::error::Error::new(
+                                input,
+                                nom::error::ErrorKind::Tag,
+                            )));
+                        }
+                        let (input, to) = opt(preceded(
+                            delimited(multispace1, tag_no_case("AS"), multispace1),
+                            alt((quoted_string, field_name)),
+                        ))
+                        .parse(input)?;
+                        Ok((input, FieldRename { to: to.unwrap_or_else(|| from.clone()), from }))
+                    },
+                ),
+            ),
         ),
-    )).parse(input)?;
+    ))
+    .parse(input)?;
     let (output_new, output_fields, output_renames) = match output {
         Some((new, fields)) => (
             new,
@@ -1123,8 +1138,4 @@ fn output_command(input: &str) -> ParseResult<'_, Command> {
     let (input, _) = multispace1(input)?;
     let (input, destination) = field_name(input)?;
     Ok((input, Command::Output { destination }))
-}
-
-fn timechart_useother(input: &str) -> ParseResult<'_, bool> {
-    preceded(tag_no_case("useother="), alt((value(true, tag_no_case("true")), value(false, tag_no_case("false"))))).parse(input)
 }

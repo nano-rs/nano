@@ -4,6 +4,7 @@ import React, { useCallback, useRef, useState, useEffect } from 'react';
 import { MapPin, Globe, Server, AlertTriangle, ShieldAlert, ArrowLeft } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api } from '@/lib/api';
+import { retryOnAdmissionDenied } from '@/lib/admission-retry';
 import type { CacheMeta } from '@/lib/api';
 import type { CloudUserTimelineResponse } from '@/lib/api/types';
 import { CachedNotice } from '@/components/search/CachedNotice';
@@ -16,12 +17,8 @@ import {
   SheetTitle,
   SheetDescription,
 } from '@/components/ui/sheet';
-import { formatUTCShort, parseTimestampAsUTC } from '@/lib/date-utils';
-import { isPlaceholderValue } from '@/lib/is-placeholder-value';
-import { isAdmissionDenied, retryOnAdmissionDenied } from '@/lib/admission-retry';
+import { formatUTCShort } from '@/lib/date-utils';
 import { CopyableValue } from './CopyableValue';
-import { DurableJobNotice, type DurableProductJobState } from './DurableJobNotice';
-import { waitForDurableProductArtifact } from './durable-product-job';
 import { useIsMobile } from '@/hooks/use-mobile';
 
 // ============================================================================
@@ -66,12 +63,12 @@ interface TimelineEvent {
   event_type: string;
   status: string;
   http_status_code: number;
-  // NAN-2370: OCSF-shaped enrichment. The former UDM keys
-  // (enriched_src_* / ioc_src_ip_*) were never emitted by the lake DTO, so
-  // these badges rendered permanently blank — which reads as "clean IP"
-  // rather than "not evaluated". Both are now supplied by cloud_event_dto.
-  src_endpoint_geo?: { country: string; asn: number; as_name: string } | null;
-  src_endpoint_threat?: { threat_type: string; malware: string; confidence: number } | null;
+  enriched_src_country_code: string;
+  enriched_src_asn: string;
+  enriched_src_as_name: string;
+  ioc_src_ip_threat_type: string;
+  ioc_src_ip_malware: string;
+  ioc_src_ip_confidence: number;
   [key: string]: unknown;
 }
 
@@ -129,17 +126,14 @@ export function CloudUserTimelineSheet({
   const isMobile = useIsMobile();
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<CloudUserTimelineResponse | null>(null);
-  const [durableJob, setDurableJob] = useState<DurableProductJobState | null>(null);
   // Server cache status of the displayed timeline (NAN-1595).
   const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  // NAN-2361 (audit bug 3): a failed timeline load must render visibly — a
-  // swallowed error previously left the sheet blank, reading as "no data".
-  const [loadError, setLoadError] = useState<string | null>(null);
 
+  const reqSeq = useRef(0); // NAN-1595: drop stale out-of-order responses
+  // NAN-3077: a superseded user / window (or close) aborts the in-flight request.
   const requestAbort = useRef<AbortController | null>(null);
   useEffect(() => () => { requestAbort.current?.abort(); ++reqSeq.current; }, []);
-  const reqSeq = useRef(0); // NAN-1595: drop stale out-of-order responses
   const load = useCallback(
     (bypass: boolean) => {
       if (!user) return;
@@ -148,7 +142,6 @@ export function CloudUserTimelineSheet({
       requestAbort.current = controller;
       const signal = controller.signal;
       const seq = ++reqSeq.current;
-      setLoadError(null);
       if (bypass) setRefreshing(true);
       else {
         setLoading(true);
@@ -163,50 +156,12 @@ export function CloudUserTimelineSheet({
           },
           { signal, onMeta: (m) => { if (seq === reqSeq.current) setCacheMeta(m); }, bypass }
         ), signal)
-        .then(async (response) => {
-          if (!response.durable_job) {
-            if (seq === reqSeq.current) {
-              setDurableJob(null);
-              setData(response);
-            }
-            return;
-          }
-          const handle = response.durable_job;
-          if (seq === reqSeq.current) {
-            setData(null);
-            setDurableJob({ jobId: handle.job_id, status: 'queued' });
-          }
-          const artifact = await waitForDurableProductArtifact(
-            handle.job_id,
-            'cloud_user_timeline_v1',
-            (job) => { if (seq === reqSeq.current) setDurableJob(job); },
-            () => seq === reqSeq.current && !signal.aborted,
-            signal,
-          );
-          const result = artifact.row.response;
-          if (
-            artifact.row.operation !== 'cloud_user_timeline'
-            || !result
-            || typeof result !== 'object'
-            || !('events' in result)
-            || !('summary' in result)
-          ) {
-            throw new Error('Durable Cloud user timeline returned an invalid typed artifact');
-          }
-          if (seq === reqSeq.current) {
-            setData(result as CloudUserTimelineResponse);
-            setDurableJob(null);
-          }
+        .then((response) => {
+          if (seq === reqSeq.current) setData(response);
         })
         .catch((err) => {
+          if (signal.aborted) return;
           console.error('Failed to load user timeline:', err);
-          if (seq === reqSeq.current) {
-            setLoadError(
-              isAdmissionDenied(err)
-                ? 'The search service is at its concurrent-query limit — retry in a moment.'
-                : err instanceof Error ? err.message : String(err),
-            );
-          }
         })
         .finally(() => {
           if (seq === reqSeq.current) {
@@ -220,13 +175,12 @@ export function CloudUserTimelineSheet({
 
   useEffect(() => {
     if (!user) {
+      requestAbort.current?.abort();
       reqSeq.current++; // invalidate any in-flight load so it can't write after clear
       setData(null);
-      setDurableJob(null);
       setCacheMeta(null);
       setLoading(false);
       setRefreshing(false);
-      setLoadError(null);
       return;
     }
     load(false);
@@ -244,12 +198,12 @@ export function CloudUserTimelineSheet({
     for (const evt of events) {
       if (evt.src_ip && !map.has(evt.src_ip)) {
         map.set(evt.src_ip, {
-          country: evt.src_endpoint_geo?.country || '',
-          asn: evt.src_endpoint_geo?.asn ? String(evt.src_endpoint_geo.asn) : '',
-          asName: evt.src_endpoint_geo?.as_name || '',
-          iocThreat: evt.src_endpoint_threat?.threat_type || '',
-          iocMalware: evt.src_endpoint_threat?.malware || '',
-          iocConf: evt.src_endpoint_threat?.confidence || 0,
+          country: evt.enriched_src_country_code || '',
+          asn: evt.enriched_src_asn || '',
+          asName: evt.enriched_src_as_name || '',
+          iocThreat: evt.ioc_src_ip_threat_type || '',
+          iocMalware: evt.ioc_src_ip_malware || '',
+          iocConf: evt.ioc_src_ip_confidence || 0,
         });
       }
     }
@@ -299,18 +253,10 @@ export function CloudUserTimelineSheet({
         </SheetHeader>
 
         <div className="overflow-y-auto px-6 pt-4 pb-6" style={{ maxHeight: isMobile ? 'calc(72vh - 5rem)' : 'calc(100vh - 5rem)' }}>
-        {durableJob && <DurableJobNotice job={durableJob} />}
         {loading ? (
           <div className="flex items-center justify-center py-12 text-muted-foreground">
             <LoadingIcon className="h-5 w-5 mr-2" />
             Loading user trace...
-          </div>
-        ) : loadError && !summary ? (
-          <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px] text-destructive flex items-center gap-2">
-            <span className="flex-1">Failed to load user trace: {loadError}</span>
-            <button className="underline hover:no-underline shrink-0" onClick={() => load(false)}>
-              Retry
-            </button>
           </div>
         ) : summary ? (
           <>
@@ -414,11 +360,6 @@ export function CloudUserTimelineSheet({
 
               {events.map((evt, i) => {
                 const dotColor = CHANGE_TYPE_DOT_COLORS[evt.change_type] || CHANGE_TYPE_DOT_COLORS.access;
-                // NAN-2361 (audit bug 2): don't render "-" placeholders as pivots
-                const resourceVal = !isPlaceholderValue(evt.resource_name)
-                  ? evt.resource_name
-                  : !isPlaceholderValue(evt.resource_id) ? evt.resource_id : null;
-                const ipVal = !isPlaceholderValue(evt.src_ip) ? evt.src_ip : null;
 
                 return (
                   <div key={i} className="relative pb-4 last:pb-0">
@@ -428,42 +369,42 @@ export function CloudUserTimelineSheet({
                     <div className="rounded-md border p-2.5 hover:bg-accent/30 transition-colors">
                       <div className="flex items-center gap-2 mb-1.5 flex-wrap">
                         <span className="text-[11px] font-mono text-muted-foreground">
-                          {formatUTCShort(parseTimestampAsUTC(evt.timestamp))}
+                          {formatUTCShort(new Date(evt.timestamp))}
                         </span>
                         <Badge variant="outline" className="text-[10px]">{evt.cloud_service}</Badge>
                         <Badge variant="outline" className="text-[10px]">
                           {evt.change_type || 'access'}
                         </Badge>
                         <StatusBadge code={evt.http_status_code} />
-                        <IocBadge threatType={evt.src_endpoint_threat?.threat_type ?? ''} malware={evt.src_endpoint_threat?.malware ?? ''} confidence={evt.src_endpoint_threat?.confidence ?? 0} />
+                        <IocBadge threatType={evt.ioc_src_ip_threat_type} malware={evt.ioc_src_ip_malware} confidence={evt.ioc_src_ip_confidence} />
                       </div>
                       <div className="text-xs">
                         <span className="font-medium">{evt.event_type || '-'}</span>
-                        {resourceVal ? (
+                        {evt.resource_name || evt.resource_id ? (
                           <span className="text-muted-foreground ml-1.5">
                             {' → '}
                             <CopyableValue
-                              value={resourceVal}
+                              value={evt.resource_name || evt.resource_id}
                               className="text-primary hover:underline"
-                              onClick={() => onEntityClick?.('resource', resourceVal)}
+                              onClick={() => onEntityClick?.('resource', evt.resource_name || evt.resource_id)}
                             />
                           </span>
                         ) : null}
                       </div>
                       <div className="flex items-center gap-3 mt-1 text-[10px] text-muted-foreground">
-                        {!isPlaceholderValue(evt.cloud_region) && <span>{evt.cloud_region}</span>}
-                        {ipVal && (
+                        {evt.cloud_region && <span>{evt.cloud_region}</span>}
+                        {evt.src_ip && (
                           <span className="inline-flex items-center gap-1">
                             <CopyableValue
-                              value={ipVal}
+                              value={evt.src_ip}
                               className="font-mono text-primary hover:underline"
-                              onClick={() => onEntityClick?.('ip', ipVal)}
+                              onClick={() => onEntityClick?.('ip', evt.src_ip)}
                             />
-                            {evt.src_endpoint_geo?.country && (
+                            {evt.enriched_src_country_code && (
                               <span className="text-muted-foreground">
-                                {evt.src_endpoint_geo?.country}
-                                {evt.src_endpoint_geo?.asn ? ` ${evt.src_endpoint_geo.asn}` : ''}
-                                {evt.src_endpoint_geo?.as_name ? ` (${evt.src_endpoint_geo.as_name})` : ''}
+                                {evt.enriched_src_country_code}
+                                {evt.enriched_src_asn ? ` ${evt.enriched_src_asn}` : ''}
+                                {evt.enriched_src_as_name ? ` (${evt.enriched_src_as_name})` : ''}
                               </span>
                             )}
                           </span>

@@ -17,6 +17,17 @@ use std::path::Path;
 static MIGRATION_FILENAME_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^\d+[a-z]*_.+\.sql$").expect("valid regex"));
 
+fn is_redundant_init_database_statement(sql_upper: &str) -> bool {
+    let Some(remainder) = sql_upper.trim_start().strip_prefix("CREATE DATABASE") else {
+        return false;
+    };
+    remainder.is_empty()
+        || remainder
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_whitespace)
+}
+
 /// NAN-1028 default for ON CLUSTER DDL. Real-world data volumes routinely
 /// push a single index drop / materialize past ClickHouse's 180s default.
 /// 900s (15min) is generous enough that index churn on multi-shard prod
@@ -46,8 +57,8 @@ fn ensure_distributed_ddl_timeout(sql: &str) -> String {
         return sql.to_string();
     }
     let trimmed_upper = sql_upper.trim_start();
-    let is_target_ddl =
-        trimmed_upper.starts_with("ALTER TABLE") || trimmed_upper.starts_with("CREATE TABLE");
+    let is_target_ddl = trimmed_upper.starts_with("ALTER TABLE")
+        || trimmed_upper.starts_with("CREATE TABLE");
     if !is_target_ddl {
         return sql.to_string();
     }
@@ -91,7 +102,10 @@ fn ensure_distributed_ddl_timeout(sql: &str) -> String {
             b')' => depth -= 1,
             _ => {}
         }
-        if depth == 0 && i + 10 <= upper_bytes.len() && &upper_bytes[i..i + 10] == b" SETTINGS " {
+        if depth == 0
+            && i + 10 <= upper_bytes.len()
+            && &upper_bytes[i..i + 10] == b" SETTINGS "
+        {
             top_level_settings = Some(i);
         }
         i += 1;
@@ -148,7 +162,8 @@ impl ClickHouseMigrator {
         // NAN-2330: the admin-owned process view reads the local system table on
         // single-node, and fans out only inside its SQL SECURITY DEFINER body on
         // clusters. The runtime user therefore never needs REMOTE.
-        let migration_sql = Self::substitute_system_processes_source(&migration_sql, cluster_name);
+        let migration_sql =
+            Self::substitute_system_processes_source(&migration_sql, cluster_name);
 
         // NAN-2330: access-control DDL places ON CLUSTER immediately after
         // GRANT. Keep that special syntax explicit to this migration instead of
@@ -167,6 +182,9 @@ impl ClickHouseMigrator {
         // Unset, this resolves to the historical literals, so only tenants whose
         // generated .env carries the vars change behavior.
         let migration_sql = Self::substitute_prevalence_cache_cells(&migration_sql);
+        // NAN-4906: drop settings this (older) server does not know yet.
+        let migration_sql =
+            Self::strip_settings_unsupported_by(&migration_sql, self.server_version.flatten());
 
         // Sanitize entire migration SQL for CH Cloud before splitting into statements.
         // This strips incompatible settings/index types so the core DDL executes cleanly.
@@ -187,8 +205,7 @@ impl ClickHouseMigrator {
 
             // Apply cluster transformation if in cluster mode
             let sql = if let Some(cluster) = cluster_name {
-                let transformed =
-                    Self::transform_for_cluster(sql, cluster, &self.database, is_cloud);
+                let transformed = Self::transform_for_cluster(sql, cluster, &self.database, is_cloud);
                 if transformed.trim().is_empty() {
                     continue; // Statement was intentionally skipped (e.g., non_replicated_dedup)
                 }
@@ -255,13 +272,10 @@ impl ClickHouseMigrator {
 
             let full_sql = ensure_distributed_ddl_timeout(&full_sql);
 
-            // Some statements may fail on ClickHouse Cloud:
-            // - CREATE DICTIONARY: CH Cloud can't reach Docker-internal PostgreSQL
-            // - GRANT statements: CH Cloud uses its own permission model
-            // Treat these as non-fatal so the rest of the migration proceeds.
-            let is_soft_fail = sql_upper.starts_with("CREATE DICTIONARY")
-                || sql_upper.starts_with("CREATE OR REPLACE DICTIONARY")
-                || sql_upper.starts_with("GRANT ");
+            // Tolerated failures (see `migration_statement_soft_fails`):
+            // CREATE DICTIONARY only on CH Cloud, GRANT/REVOKE everywhere, and
+            // never a statement marked `nano:fatal` (NAN-4957).
+            let is_soft_fail = Self::migration_statement_soft_fails(&sql, is_cloud);
 
             // NAN-1384: profile-gated tables (e.g. nanosiem.ocsf_logs, which
             // only exists on NANO_SCHEMA_PROFILE=ocsf deployments) cannot be
@@ -386,7 +400,8 @@ impl ClickHouseMigrator {
             tracing::error!(
                 count = rows.len(),
                 "FAILED ClickHouse dictionaries detected — every INSERT into a table with a \
-                 dictGet()-backed MATERIALIZED column on these will be dropped until they load"
+                 dictGet()-backed MATERIALIZED column on these will be dropped until they load \
+                 (NAN-1116)"
             );
             for r in &rows {
                 tracing::error!("  FAILED dict: {}", r);
@@ -420,7 +435,7 @@ impl ClickHouseMigrator {
 
         // Check if the script has changed since last run by comparing SHA-256
         // hashes. The hash is stored in the _migrations table under version_key.
-        use sha2::{Digest, Sha256};
+        use sha2::{Sha256, Digest};
         let hash = hex::encode(Sha256::digest(init_sql.as_bytes()));
 
         self.ensure_migrations_table().await?;
@@ -461,6 +476,8 @@ impl ClickHouseMigrator {
         // init.sql path too — a fresh bootstrap creates these dicts from init.sql,
         // never from the numbered migration.
         let sql = Self::substitute_prevalence_cache_cells(&sql);
+        // NAN-4906: drop settings this (older) server does not know yet.
+        let sql = Self::strip_settings_unsupported_by(&sql, self.detect_server_version().await);
 
         // Sanitize for cloud if needed
         let sql = if is_cloud {
@@ -479,8 +496,7 @@ impl ClickHouseMigrator {
 
             // Apply cluster transformation
             let sql_stmt = if let Some(ref cluster) = cluster_name {
-                let transformed =
-                    Self::transform_for_cluster(sql_stmt, cluster, &self.database, is_cloud);
+                let transformed = Self::transform_for_cluster(sql_stmt, cluster, &self.database, is_cloud);
                 if transformed.trim().is_empty() {
                     continue;
                 }
@@ -490,6 +506,16 @@ impl ClickHouseMigrator {
             };
 
             let sql_upper = sql_stmt.to_uppercase();
+
+            // ensure_migrations_table() just completed the one authoritative,
+            // synchronous database bootstrap (and its all-node visibility
+            // check). Re-enqueuing init.sql's historical CREATE DATABASE here
+            // creates a second distributed-DDL stream that can race the table
+            // statements on blank shards. The init file retains the statement
+            // for other consumers; the migrator deliberately owns and skips it.
+            if is_redundant_init_database_statement(&sql_upper) {
+                continue;
+            }
 
             // Handle SET statements
             if sql_upper.starts_with("SET ") {
@@ -576,7 +602,7 @@ impl ClickHouseMigrator {
                         tracing::warn!(
                             "Init SQL CREATE TABLE failed but the table already exists — \
                              continuing (likely a FAILED dependent dictionary re-validated \
-                             at CREATE time): {} - {}",
+                             at CREATE time; see NAN-1115): {} - {}",
                             &sql_stmt[..sql_stmt.len().min(120)],
                             e
                         );
@@ -619,11 +645,7 @@ impl ClickHouseMigrator {
         // Best-effort: don't fail startup if hash storage fails
         let _ = self.client.query(&delete_sql).execute().await;
         if let Err(e) = self.client.query(&upsert_sql).execute().await {
-            tracing::warn!(
-                "Failed to store {} hash: {} — next startup will re-run it",
-                label,
-                e
-            );
+            tracing::warn!("Failed to store {} hash: {} — next startup will re-run it", label, e);
         }
 
         // Seed baseline migrations on fresh deployments so the runner
@@ -746,9 +768,23 @@ impl ClickHouseMigrator {
         &self,
         migrations_dir: &Path,
     ) -> Result<(), ClickHouseMigrateError> {
+        self.check_schema_up_to_date_with_prefix(migrations_dir, "")
+            .await
+    }
+
+    /// Verify a profile-specific migration directory using a disjoint version
+    /// namespace (for example `ocsf/190`). This lets profile schema migrations
+    /// run after their overlay creates the target tables without colliding with
+    /// the shared migration carrying the same ledger number.
+    pub async fn check_schema_up_to_date_with_prefix(
+        &self,
+        migrations_dir: &Path,
+        version_prefix: &str,
+    ) -> Result<(), ClickHouseMigrateError> {
         use sha2::{Digest, Sha256};
 
-        let expected = Self::load_migrations_from_dir(migrations_dir)?;
+        let mut expected = Self::load_migrations_from_dir(migrations_dir)?;
+        prefix_migration_versions(&mut expected, version_prefix);
         let applied = self.get_applied_migration_checksums().await?;
 
         let mut missing: Vec<String> = Vec::new();
@@ -784,8 +820,19 @@ impl ClickHouseMigrator {
         &mut self,
         migrations_dir: &Path,
     ) -> Result<usize, ClickHouseMigrateError> {
+        self.run_migrations_with_prefix(migrations_dir, "").await
+    }
+
+    /// Run migrations under a disjoint version namespace. Profile migrations
+    /// use this after their init overlay has created profile-only tables.
+    pub async fn run_migrations_with_prefix(
+        &mut self,
+        migrations_dir: &Path,
+        version_prefix: &str,
+    ) -> Result<usize, ClickHouseMigrateError> {
         // Detect if we're on ClickHouse Cloud (affects SQL sanitization)
         let is_cloud = self.detect_cloud().await?;
+        self.detect_server_version().await;
 
         // Detect if we're on a cluster (affects DDL transformation)
         let cluster_name = self.detect_cluster().await?;
@@ -797,7 +844,8 @@ impl ClickHouseMigrator {
         let applied = self.get_applied_migrations().await?;
 
         // Load migrations from directory
-        let migrations = Self::load_migrations_from_dir(migrations_dir)?;
+        let mut migrations = Self::load_migrations_from_dir(migrations_dir)?;
+        prefix_migration_versions(&mut migrations, version_prefix);
 
         let mut applied_count = 0;
 
@@ -822,7 +870,18 @@ impl ClickHouseMigrator {
                 mode_label
             );
 
+            // Validate declarations before executing any migration SQL. A typo
+            // must not leave schema changes applied without a durable refresh
+            // request that the jobs leader can understand.
+            let refresh_directives = crate::db::migration_refresh::parse_directives(&migration.sql)
+                .map_err(|detail| ClickHouseMigrateError::InvalidRefreshDirective {
+                    filename: migration.filename.clone(),
+                    detail,
+                })?;
             self.apply_migration(&migration, is_cloud, cluster_name.as_deref())
+                .await?;
+            let invalidations = self
+                .record_refresh_invalidations(&migration, &refresh_directives)
                 .await?;
             self.record_migration(&migration).await?;
 
@@ -830,10 +889,26 @@ impl ClickHouseMigrator {
                 "ClickHouse migration {} applied successfully",
                 migration.filename
             );
+            if invalidations > 0 {
+                tracing::info!(
+                    migration = %migration.filename,
+                    invalidations,
+                    "Queued post-migration refresh activation"
+                );
+            }
             applied_count += 1;
         }
 
         Ok(applied_count)
+    }
+}
+
+fn prefix_migration_versions(migrations: &mut [Migration], prefix: &str) {
+    if prefix.is_empty() {
+        return;
+    }
+    for migration in migrations {
+        migration.version.insert_str(0, prefix);
     }
 }
 
@@ -842,17 +917,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn init_database_statement_is_owned_by_the_synchronous_bootstrap() {
+        assert!(is_redundant_init_database_statement(
+            "CREATE DATABASE IF NOT EXISTS nanosiem ON CLUSTER 'default'"
+        ));
+        assert!(is_redundant_init_database_statement(
+            "  CREATE DATABASE nanosiem"
+        ));
+        assert!(!is_redundant_init_database_statement(
+            "CREATE TABLE nanosiem.logs (message String) ENGINE = MergeTree ORDER BY tuple()"
+        ));
+        assert!(!is_redundant_init_database_statement(
+            "CREATE DATABASE_ALIAS nanosiem"
+        ));
+    }
+
+    #[test]
     fn non_cluster_ddl_is_unchanged() {
         let sql = "ALTER TABLE nanosiem.logs DROP INDEX IF EXISTS idx_foo";
         assert_eq!(ensure_distributed_ddl_timeout(sql), sql);
     }
 
     #[test]
+    fn profile_migration_versions_have_a_disjoint_namespace() {
+        let mut migrations = vec![Migration {
+            version: "190".into(),
+            name: "future_timestamp_guard".into(),
+            filename: "190_future_timestamp_guard.sql".into(),
+            sql: "SELECT 1".into(),
+        }];
+
+        prefix_migration_versions(&mut migrations, "ocsf/");
+
+        assert_eq!(migrations[0].version, "ocsf/190");
+        assert_eq!(migrations[0].filename, "190_future_timestamp_guard.sql");
+    }
+
+    #[test]
     fn cluster_ddl_without_settings_gets_timeout_appended() {
         // NAN-1028 repro: this exact statement timed out at 180s on Saturn
         // and Hetzner org while dropping a real idx_ext_text.
-        let sql =
-            "ALTER TABLE nanosiem.logs ON CLUSTER 'default' DROP INDEX IF EXISTS idx_ext_text";
+        let sql = "ALTER TABLE nanosiem.logs ON CLUSTER 'default' DROP INDEX IF EXISTS idx_ext_text";
         let out = ensure_distributed_ddl_timeout(sql);
         assert_eq!(
             out,
@@ -863,8 +968,7 @@ mod tests {
 
     #[test]
     fn cluster_ddl_with_existing_settings_gets_timeout_prepended() {
-        let sql =
-            "ALTER TABLE x ON CLUSTER 'default' MODIFY COLUMN y Int32 SETTINGS mutations_sync = 2";
+        let sql = "ALTER TABLE x ON CLUSTER 'default' MODIFY COLUMN y Int32 SETTINGS mutations_sync = 2";
         let out = ensure_distributed_ddl_timeout(sql);
         assert_eq!(
             out,

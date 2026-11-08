@@ -60,8 +60,6 @@ impl SearchHistoryRepository {
         user_id: Uuid,
         entry: &NewSearchHistoryEntry,
     ) -> Result<SearchHistoryEntry, SearchHistoryError> {
-        let mut entry = entry.clone();
-        entry.query = crate::inputlookup::storage_policy::redact_url_credentials(&entry.query);
         // Check if the most recent entry is the same query (dedup)
         let recent = sqlx::query_scalar::<_, String>(
             r#"
@@ -172,9 +170,8 @@ impl SearchHistoryRepository {
     ///
     /// `Some(user)` reads that user's own piped queries (the "Recent" group);
     /// `None` reads every user's piped queries in this deployment (the
-    /// "Popular" group). Open core is one tenant per deployment, so the
-    /// deployment-wide read is the tenant-wide read. Callers keep only field
-    /// names (see `search::field_usage`); query text never leaves the server.
+    /// "Popular" group). Callers keep only field names (see
+    /// `search::field_usage`); query text never leaves the server.
     pub async fn field_usage_rows(
         &self,
         user_id: Option<Uuid>,

@@ -112,10 +112,7 @@ async fn the_first_ever_reload_registers_against_an_absent_counter() {
         .mount(&server)
         .await;
 
-    assert_eq!(
-        probe_for(&server).await_ack(before).await,
-        ReloadAck::Accepted
-    );
+    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Accepted);
 }
 
 // ---------------------------------------------------------------------------
@@ -137,10 +134,7 @@ async fn a_moved_success_counter_is_an_acceptance() {
         reloads: 4.0,
         config_failures: 0.0,
     };
-    assert_eq!(
-        probe_for(&server).await_ack(before).await,
-        ReloadAck::Accepted
-    );
+    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Accepted);
 }
 
 /// Vector answering, staying up, and doing nothing is the exact failure this
@@ -181,10 +175,7 @@ async fn a_moved_failure_counter_is_a_rejection() {
         reloads: 4.0,
         config_failures: 0.0,
     };
-    assert_eq!(
-        probe_for(&server).await_ack(before).await,
-        ReloadAck::Rejected
-    );
+    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Rejected);
 }
 
 /// One promotion writes many files, and a `--watch-config` Vector can fire on a
@@ -211,10 +202,7 @@ async fn a_success_after_a_rejection_wins() {
         reloads: 4.0,
         config_failures: 0.0,
     };
-    assert_eq!(
-        probe_for(&server).await_ack(before).await,
-        ReloadAck::Accepted
-    );
+    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Accepted);
 }
 
 /// Vector ages out counters that stop being updated, and these tick once per
@@ -240,10 +228,7 @@ async fn a_counter_that_aged_out_and_restarted_is_still_an_acceptance() {
         reloads: 3.0,
         config_failures: 0.0,
     };
-    assert_eq!(
-        probe_for(&server).await_ack(before).await,
-        ReloadAck::Accepted
-    );
+    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Accepted);
 }
 
 /// The other half: a series that is alive and unchanged is NOT an
@@ -292,10 +277,7 @@ async fn acknowledgement_is_awaited_across_scrape_lag() {
         reloads: 4.0,
         config_failures: 0.0,
     };
-    assert_eq!(
-        probe_for(&server).await_ack(before).await,
-        ReloadAck::Accepted
-    );
+    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Accepted);
 }
 
 /// An endpoint that stops answering mid-window (Vector died applying the
@@ -344,8 +326,7 @@ async fn an_unreachable_endpoint_reads_as_no_evidence() {
 #[test]
 fn nothing_delivered_and_nothing_observed_is_a_failure() {
     let outcome = reload_outcome(None, ReloadAck::Unverifiable);
-    let err =
-        outcome.expect_err("a reload with no delivery and no evidence must not report success");
+    let err = outcome.expect_err("a reload with no delivery and no evidence must not report success");
     assert!(
         matches!(err, VectorConfigError::ReloadFailed(_)),
         "expected ReloadFailed, got {err:?}"
@@ -473,4 +454,196 @@ impl Drop for EnvRestore {
             }
         }
     }
+}
+
+/// NAN-4936: a reload counter BELOW the snapshot is only presumed to be a
+/// restarted series when no rejection was seen in the window. With a rejection
+/// on record it is not evidence of an acceptance: the NAN-4920 run reported a
+/// parser publish live while every Vector reload was failing.
+#[tokio::test]
+async fn a_lower_reload_counter_after_a_rejection_is_not_an_acceptance() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metrics"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(metrics_body(1, 3)))
+        .mount(&server)
+        .await;
+
+    let before = ReloadCounters {
+        reloads: 3.0,
+        config_failures: 2.0,
+    };
+    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Rejected);
+}
+
+/// The genuine increment still wins over a rejection seen earlier in the
+/// window (a half-written tree rejected, then the complete one accepted).
+#[tokio::test]
+async fn a_real_increment_after_a_rejection_is_still_an_acceptance() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metrics"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(metrics_body(4, 3)))
+        .mount(&server)
+        .await;
+
+    let before = ReloadCounters {
+        reloads: 3.0,
+        config_failures: 2.0,
+    };
+    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Accepted);
+}
+
+// ---------------------------------------------------------------------------
+// NAN-4936: reload signals target one named container, never a name pattern
+// ---------------------------------------------------------------------------
+
+/// The reload signal goes to exactly the configured container's PID 1 via
+/// `docker kill`; no `pkill`/`killall` (which match any process whose NAME
+/// contains "vector": an unrelated `*ingest_tokens*vector*` test binary was
+/// SIGHUP-killed by the old host-wide fallback).
+#[test]
+fn the_reload_signal_targets_the_named_container_only() {
+    assert_eq!(
+        reload_signal_argv("nano-vector"),
+        vec!["kill", "--signal", "HUP", "nano-vector"]
+    );
+    let argv = reload_signal_argv("nano-vector").join(" ");
+    assert!(!argv.contains("pkill") && !argv.contains("killall") && !argv.contains("exec"));
+}
+
+/// An undelivered signal is not silent: a reload Vector never acknowledged
+/// carries the reason no signal reached it. A success stays a success.
+#[test]
+fn an_undelivered_signal_is_reported_in_a_failed_reload() {
+    let failed = with_delivery_reason(
+        reload_outcome(None, ReloadAck::NotAcknowledged),
+        &Err("the Vector container 'nano-vector' did not accept the reload signal: No such container".to_string()),
+    );
+    let message = failed.unwrap_err().to_string();
+    assert!(message.contains("Reload signal not delivered"), "{message}");
+    assert!(message.contains("No such container"), "{message}");
+
+    assert!(with_delivery_reason(
+        reload_outcome(None, ReloadAck::Accepted),
+        &Err("unreachable".to_string()),
+    )
+    .is_ok());
+}
+
+/// Guard: no product code path signals processes by name.
+#[test]
+fn no_product_code_signals_processes_by_name() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && !path.to_string_lossy().ends_with("reload_tests.rs")
+            {
+                let text = std::fs::read_to_string(&path).unwrap();
+                for needle in ["Command::new(\"pkill\")", "Command::new(\"killall\")", "\"pkill\", \"-HUP\""] {
+                    if text.contains(needle) {
+                        offenders.push(format!("{}: {needle}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "name-pattern signalling in product code: {offenders:?}");
+}
+
+// ---------------------------------------------------------------------------
+// NAN-4936 (codex P1): correlated acknowledgement via a per-change marker
+// ---------------------------------------------------------------------------
+
+fn metrics_with_marker(reloads: u64, failures: u64, marker: Option<(&str, u64)>) -> String {
+    let mut body = metrics_body(reloads, failures);
+    if let Some((id, sent)) = marker {
+        body.push_str(&format!(
+            "nanosiem_vector_component_sent_events_total{{component_id=\"{id}\",component_kind=\"source\",component_type=\"demo_logs\",host=\"h\",output=\"_default\"}} {sent}\n"
+        ));
+    }
+    body
+}
+
+#[test]
+fn a_marker_is_live_only_with_its_own_component_id_and_events() {
+    let body = metrics_with_marker(1, 0, Some(("nano_activation_abc", 3)));
+    assert!(marker_is_live(&body, "nano_activation_abc"));
+    assert!(!marker_is_live(&body, "nano_activation_other"));
+    assert!(!marker_is_live(&metrics_with_marker(1, 0, Some(("nano_activation_abc", 0))), "nano_activation_abc"));
+    // A prefix of another marker's id never matches.
+    assert!(!marker_is_live(&body, "nano_activation_ab"));
+}
+
+#[test]
+fn the_marker_file_is_a_valid_standalone_component_pair() {
+    let marker = ActivationMarker {
+        id: "abc".to_string(),
+        path: std::path::PathBuf::from("/x/_nano_activation.toml"),
+    };
+    let parsed: toml::Value = toml::from_str(&marker.toml()).unwrap();
+    assert_eq!(parsed["sources"]["nano_activation_abc"]["type"].as_str(), Some("demo_logs"));
+    assert_eq!(
+        parsed["sinks"]["nano_activation_abc_sink"]["inputs"][0].as_str(),
+        Some("nano_activation_abc")
+    );
+}
+
+/// The concurrent-deploy hazard: another change's reload moves the global
+/// reload counter while THIS change is rejected. The counter protocol calls
+/// that an acceptance; the marker protocol does not.
+#[tokio::test]
+async fn another_changes_reload_cannot_acknowledge_this_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metrics"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(metrics_with_marker(5, 1, None)))
+        .mount(&server)
+        .await;
+    let before = ReloadCounters { reloads: 4.0, config_failures: 0.0 };
+    let probe = probe_for(&server);
+    assert_eq!(probe.await_ack(before).await, ReloadAck::Accepted, "the old, uncorrelated verdict");
+    assert_eq!(
+        probe.await_marker(before, "nano_activation_mine").await,
+        ReloadAck::Rejected,
+        "correlated: this change's marker never ran and a refusal was seen"
+    );
+}
+
+#[tokio::test]
+async fn a_running_marker_is_an_acceptance_and_silence_is_not() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metrics"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(metrics_with_marker(4, 0, Some(("nano_activation_mine", 2)))),
+        )
+        .mount(&server)
+        .await;
+    let before = ReloadCounters { reloads: 4.0, config_failures: 0.0 };
+    let probe = probe_for(&server);
+    assert_eq!(probe.await_marker(before, "nano_activation_mine").await, ReloadAck::Accepted);
+    assert_eq!(
+        probe.await_marker(before, "nano_activation_someone_else").await,
+        ReloadAck::NotAcknowledged
+    );
+}
+
+#[tokio::test]
+async fn a_reload_request_with_no_responder_fails_loudly() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = request_reload_in(dir.path(), std::time::Duration::from_millis(300))
+        .await
+        .unwrap_err();
+    assert!(err.contains("no responder"), "{err}");
+    // The unanswered request is withdrawn, so a late responder cannot act on it.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("reload")).unwrap().flatten().collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }

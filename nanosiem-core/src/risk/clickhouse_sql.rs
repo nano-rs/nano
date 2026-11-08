@@ -20,7 +20,7 @@
 //! generator both build from here, so drift is structurally impossible.
 //!
 //! Semantics deliberately preserved from the pre-extraction inline queries
-//! (`enterprise/src/risk/repository.rs`):
+//! (`nanosiem-enterprise/src/risk/repository.rs`):
 //!
 //! - `round()` (not truncating `toInt64`) on decayed sums so headline scores
 //!   match the per-rule contribution breakdown (NAN-1658 / R3).
@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Duration, Utc};
 
 use super::types::{RiskDecayConfig, RiskTimeWindow};
-use super::watchlist::RiskWatchWeights;
+use super::score_weights::EntityScoreWeights;
 
 /// The one entity type the read-side VALUE inference can never produce
 /// (account ids are opaque strings), so it is honored from the write-side
@@ -161,6 +161,9 @@ const CONTRIB_FINDINGS_WHERE: &str = r#"                FROM __LOGS_TBL__
 
 /// Entity-grain `aggregated` CTE + row projection.
 /// Binds: `(cutoff_24h_us, cutoff_24h_us, cutoff_24h_us)`.
+// NAN-4926: `watch_weight` is wrapped in toFloat64 because a bound
+// sentinel-only weight array (`[0]`) types as Array(UInt8), which the Float64
+// row field rejects ("schema mismatch ... UInt8 as f64").
 const ENTITY_AGGREGATED_SELECT: &str = r#"            aggregated AS (
                 SELECT
                     entity,
@@ -173,10 +176,10 @@ const ENTITY_AGGREGATED_SELECT: &str = r#"            aggregated AS (
                     -- breakdown, which also rounds (NAN-1658 / R3).
                     toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as base_decayed_score_24h,
                     toInt64(round(sum(risk_score * decay_factor))) as base_decayed_score_7d,
-                    -- Watchlist weight (NAN-3228): MAX enabled-list weight for
-                    -- the entity value, 0 when unwatched; the decayed scores
-                    -- below are the EFFECTIVE (weighted) scores.
-                    arrayElement(?, indexOf(?, lower(entity))) as watch_weight,
+                    -- Read-time score weight for the entity value (0 when none
+                    -- applies); the decayed scores below are the EFFECTIVE
+                    -- (weighted) scores.
+                    toFloat64(arrayElement(?, indexOf(?, lower(entity)))) as watch_weight,
                     toInt64(round(base_decayed_score_24h * (1 + watch_weight))) as decayed_score_24h,
                     toInt64(round(base_decayed_score_7d * (1 + watch_weight))) as decayed_score_7d,
                     countIf(ts_micros >= ?) as signal_count_24h,
@@ -222,11 +225,11 @@ const DATASET_AGGREGATED_SELECT: &str = r#"            aggregated AS (
                     entity_type,
                     -- Decayed scores (primary metric) — the same expressions as
                     -- decayed_score_24h/7d in ENTITY_AGGREGATED_SELECT (NAN-1658 / R3),
-                    -- weighted by the entity's watchlist weight (NAN-3228) so a
-                    -- watched entity crosses a notable threshold sooner.
+                    -- weighted by the entity's read-time score weight so a
+                    -- weighted entity crosses a notable threshold sooner.
                     toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as base_score_24h,
                     toInt64(round(sum(risk_score * decay_factor))) as base_score_7d,
-                    arrayElement(?, indexOf(?, lower(entity))) as watch_weight,
+                    toFloat64(arrayElement(?, indexOf(?, lower(entity)))) as watch_weight,
                     toInt64(round(base_score_24h * (1 + watch_weight))) as score_24h,
                     toInt64(round(base_score_7d * (1 + watch_weight))) as score_7d,
                     -- Raw (undecayed) sums — parity with TimeWindowedRiskScore.
@@ -308,7 +311,7 @@ const ENTITY_FINDINGS_WHERE_IN: &str = r#"                FROM __LOGS_TBL__
             ),
 "#;
 
-/// Findings WHERE for the watchlist member scores (NAN-3228):
+/// Findings WHERE for the entity-set scores:
 /// [`ENTITY_FINDINGS_WHERE`] restricted to a set of normalized (lowercased)
 /// member values, matched on `lower(entity)` the same way the weight lookup
 /// matches. Binds: `(values[], cutoff_7d_us, boundaries_micros[], entities[])`.
@@ -322,7 +325,7 @@ const ENTITY_FINDINGS_WHERE_LOWER_IN: &str = r#"                FROM __LOGS_TBL_
             ),
 "#;
 
-/// Tail for the watchlist member scores: hottest first, bounded.
+/// Tail for the entity-set scores: hottest first, bounded.
 /// Binds: `(limit)`.
 const TAIL_ENTITY_SET: &str = r#"            ORDER BY decayed_score_7d DESC, entity ASC
             LIMIT ?
@@ -357,8 +360,8 @@ const LATERAL_AGGREGATED_SELECT: &str = r#"            aggregated AS (
                 SELECT
                     entity,
                     toInt64(round(sum(risk_score * decay_factor))) as base_decayed_score_7d,
-                    -- Watchlist weight (NAN-3228), effective score below.
-                    arrayElement(?, indexOf(?, lower(entity))) as watch_weight,
+                    -- Read-time score weight, effective score below.
+                    toFloat64(arrayElement(?, indexOf(?, lower(entity)))) as watch_weight,
                     toInt64(round(base_decayed_score_7d * (1 + watch_weight))) as decayed_score_7d
                 FROM signal_scores
                 GROUP BY entity
@@ -392,8 +395,8 @@ const OVERVIEW_AGGREGATED_SELECT: &str = r#"            aggregated AS (
                     entity,
                     toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as base_decayed_score_24h,
                     toInt64(round(sum(risk_score * decay_factor))) as base_decayed_score_7d,
-                    -- Watchlist weight (NAN-3228): bands count EFFECTIVE scores.
-                    arrayElement(?, indexOf(?, lower(entity))) as watch_weight,
+                    -- Read-time score weight: bands count EFFECTIVE scores.
+                    toFloat64(arrayElement(?, indexOf(?, lower(entity)))) as watch_weight,
                     toInt64(round(base_decayed_score_24h * (1 + watch_weight))) as decayed_score_24h,
                     toInt64(round(base_decayed_score_7d * (1 + watch_weight))) as decayed_score_7d,
                     countIf(ts_micros >= ?) as signal_count_24h,
@@ -703,7 +706,7 @@ impl RiskFindingsSource {
         }
     }
 
-    fn push_scope_bind(&self, binds: &mut Vec<RiskSqlBind>) {
+    pub fn push_scope_bind(&self, binds: &mut Vec<RiskSqlBind>) {
         if !self.source_deny.is_empty() {
             binds.push(RiskSqlBind::StrList(self.source_deny.clone()));
         }
@@ -725,7 +728,7 @@ impl RiskFindingsSource {
     /// Replace the column/table sentinels in an assembled template.
     /// `__RISK_ENTITY_TYPE__` must substitute BEFORE `__RISK_ENTITY__`
     /// (the former contains the latter as a prefix).
-    fn substitute(&self, template: String) -> String {
+    pub fn substitute(&self, template: String) -> String {
         template
             .replace("__RISK_SOURCE_SCOPE__", self.source_scope_predicate())
             .replace("__ORIGIN_SOURCE_TYPES__", self.origin_source_types_col())
@@ -751,10 +754,9 @@ impl RiskFindingsSource {
 pub struct ClearedBoundaries {
     entities: Vec<String>,
     boundaries_micros: Vec<i64>,
-    /// Watchlist weights (NAN-3228) ride with the clear state: both are the
-    /// per-tenant, PostgreSQL-owned read-time inputs every entity-grain score
-    /// query binds.
-    watch: RiskWatchWeights,
+    /// Read-time score weights ride with the clear state: both are
+    /// PostgreSQL-owned read-time inputs every entity-grain score query binds.
+    weights: EntityScoreWeights,
 }
 
 impl ClearedBoundaries {
@@ -771,24 +773,24 @@ impl ClearedBoundaries {
         Self {
             entities,
             boundaries_micros,
-            watch: RiskWatchWeights::default(),
+            weights: EntityScoreWeights::default(),
         }
     }
 
-    /// Attach the tenant's watchlist weights (NAN-3228).
-    pub fn with_watch(mut self, watch: RiskWatchWeights) -> Self {
-        self.watch = watch;
+    /// Attach the read-time score weights.
+    pub fn with_score_weights(mut self, weights: EntityScoreWeights) -> Self {
+        self.weights = weights;
         self
     }
 
-    pub fn watch(&self) -> &RiskWatchWeights {
-        &self.watch
+    pub fn score_weights(&self) -> &EntityScoreWeights {
+        &self.weights
     }
 
     /// Binds for the `arrayElement(?, indexOf(?, lower(entity)))` weight
     /// lookup, in placeholder order (weights, then entities).
     fn push_watch_binds(&self, binds: &mut Vec<RiskSqlBind>) {
-        let (entities, weights) = self.watch.parallel_arrays();
+        let (entities, weights) = self.weights.parallel_arrays();
         binds.push(RiskSqlBind::F64List(weights));
         binds.push(RiskSqlBind::StrList(entities));
     }
@@ -950,8 +952,6 @@ pub fn risky_entities_query(
     sql.push_str(ENTITY_AGGREGATED_SELECT);
     sql.push_str(TAIL_RISKY_ENTITIES);
     let sql = sql
-        .replace("__DSCORE__", dscore)
-        .replace("__SCOUNT__", scount)
         .replace(
             "__MAX_FILTER__",
             if max_score.is_some() {
@@ -961,6 +961,7 @@ pub fn risky_entities_query(
             },
         )
         .replace("__DSCORE__", dscore)
+        .replace("__SCOUNT__", scount)
         .replace(
             "__TYPE_FILTER__",
             if entity_type.is_some() {
@@ -1038,7 +1039,7 @@ pub fn risk_for_entities_query(
     }
 }
 
-/// Watchlist member scores (NAN-3228): the entity-grain rows (base and
+/// Entity-set scores: the entity-grain rows (base and
 /// effective 24h/7d scores) for a set of normalized member values, matched
 /// case-insensitively. Same projection as [`entity_scores_query`].
 pub fn entity_set_scores_query(
@@ -1072,84 +1073,6 @@ pub fn entity_set_scores_query(
 
     RiskChQuery {
         sql: source.substitute(sql),
-        binds,
-    }
-}
-
-/// Watchlist entity suggestions (NAN-3249, dedicated ClickHouse twin of the
-/// lake worker's `suggest` operation): distinct finding entities over
-/// `[now - SUGGEST_LOOKBACK_DAYS, now)` that match one of the plan's patterns
-/// on the LOWERCASED entity, under the caller's source scope.
-///
-/// Matching uses `=` / `startsWith` / `endsWith` — never `LIKE` — and every
-/// pattern is a bound parameter, so `%`, `_` and quotes in a typed value are
-/// literal. The inner `arrayExists` prunes non-matching entities before the
-/// GROUP BY; the outer `ARRAY JOIN` attributes each entity to its value(s)
-/// and pattern, exact matches first, then newest, at most
-/// [`SUGGEST_ROWS_PER_VALUE`](super::watchlist_suggest::SUGGEST_ROWS_PER_VALUE)
-/// rows per value. Clear boundaries are deliberately NOT applied: a cleared
-/// entity is still an observed value that scores again on its next finding.
-/// Binds: `(start_us, end_us, texts[], ops[][, deny[]], texts[], ops[],
-/// groups[], indexes[], per_value_limit)`.
-pub fn watchlist_suggest_query(
-    source: &RiskFindingsSource,
-    now: DateTime<Utc>,
-    patterns: &[super::watchlist_suggest::RiskSuggestPattern],
-) -> RiskChQuery {
-    use super::watchlist_suggest::{SUGGEST_LOOKBACK_DAYS, SUGGEST_ROWS_PER_VALUE};
-    let sql = r#"
-            SELECT
-                toUInt16(pg) AS value_index,
-                entity,
-                any(observed_type) AS entity_type,
-                toInt64(max(seen_us)) AS last_seen_us,
-                toUInt32(min(pi)) AS pattern_index
-            FROM (
-                SELECT
-                    __RISK_ENTITY__ AS entity,
-                    multiIf(
-                        __RISK_ENTITY_TYPE__ = 'cloud_account', 'cloud_account',
-                        match(__RISK_ENTITY__, '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'), 'ip',
-                        position(__RISK_ENTITY__, '@') > 0, 'email',
-                        position(__RISK_ENTITY__, '.') > 0, 'hostname',
-                        'user'
-                    ) AS observed_type,
-                    max(toUnixTimestamp64Micro(timestamp)) AS seen_us
-                FROM __LOGS_TBL__
-                WHERE source_type = 'findings'
-                  AND __RISK_ENTITY__ != ''
-                  AND __RISK_ENTITY__ != 'unknown'
-                  AND toUnixTimestamp64Micro(timestamp) >= ?
-                  AND toUnixTimestamp64Micro(timestamp) < ?
-                  AND arrayExists((t, o) -> multiIf(o = 0, lower(__RISK_ENTITY__) = t, o = 1, startsWith(lower(__RISK_ENTITY__), t), endsWith(lower(__RISK_ENTITY__), t)), ?, ?)__RISK_SOURCE_SCOPE__
-                GROUP BY entity, observed_type
-            )
-            ARRAY JOIN ? AS pv, ? AS pk, ? AS pg, ? AS pi
-            WHERE multiIf(pk = 0, lower(entity) = pv, pk = 1, startsWith(lower(entity), pv), endsWith(lower(entity), pv))
-            GROUP BY value_index, entity
-            ORDER BY value_index ASC, min(pk) ASC, last_seen_us DESC, entity ASC
-            LIMIT ? BY value_index
-        "#;
-    let texts: Vec<String> = patterns.iter().map(|p| p.text.clone()).collect();
-    let ops: Vec<i64> = patterns.iter().map(|p| i64::from(p.op.code())).collect();
-    let groups: Vec<i64> = patterns.iter().map(|p| i64::from(p.group)).collect();
-    let indexes: Vec<i64> = (1..=patterns.len() as i64).collect();
-    let mut binds = vec![
-        RiskSqlBind::I64((now - Duration::days(SUGGEST_LOOKBACK_DAYS)).timestamp_micros()),
-        RiskSqlBind::I64(now.timestamp_micros()),
-        RiskSqlBind::StrList(texts.clone()),
-        RiskSqlBind::I64List(ops.clone()),
-    ];
-    source.push_scope_bind(&mut binds);
-    binds.extend([
-        RiskSqlBind::StrList(texts),
-        RiskSqlBind::I64List(ops),
-        RiskSqlBind::I64List(groups),
-        RiskSqlBind::I64List(indexes),
-        RiskSqlBind::I64(SUGGEST_ROWS_PER_VALUE as i64),
-    ]);
-    RiskChQuery {
-        sql: source.substitute(sql.to_string()),
         binds,
     }
 }
@@ -1218,7 +1141,7 @@ pub fn lateral_scores_query(
     binds.push(RiskSqlBind::StrList(normalized_ids.to_vec()));
     binds.push(RiskSqlBind::StrList(normalized_ids.to_vec()));
     source.push_scope_bind(&mut binds);
-    // LATERAL_AGGREGATED_SELECT: watchlist weight lookup (NAN-3228).
+    // LATERAL_AGGREGATED_SELECT: score weight lookup.
     cleared.push_watch_binds(&mut binds);
 
     RiskChQuery {
@@ -1261,7 +1184,7 @@ pub fn decayed_overview_query(
     binds.push(RiskSqlBind::StrList(cleared.entities.clone()));
     source.push_scope_bind(&mut binds);
     // OVERVIEW_AGGREGATED_SELECT: 24h bound for the decayed sum, the
-    // watchlist weight lookup (NAN-3228), 24h bound for the count.
+    // score weight lookup, 24h bound for the count.
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
     cleared.push_watch_binds(&mut binds);
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
@@ -1299,66 +1222,6 @@ pub fn rule_contributions_query(
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
 
-    RiskChQuery {
-        sql: source.substitute(sql),
-        binds,
-    }
-}
-
-/// Hour-bucket × rule aggregates for the entity risk timeline (NAN-3225):
-/// bucket `h` = findings with `ts ∈ [anchor-(h+1)h, anchor-h·h)` over the
-/// 14d lookback ([`crate::risk::timeline::TIMELINE_LOOKBACK_HOURS`]), newest
-/// bucket first, capped at [`crate::risk::timeline::TIMELINE_MAX_BUCKET_ROWS`].
-/// Same source, entity set and source-scope predicate as
-/// [`rule_contributions_query`] (no cleared boundary, like it), so
-/// `build_timeline` reproduces the contributions at `anchor`.
-/// Binds: `(anchor_us, entities[], lookback_us, anchor_us[, deny[]])`.
-pub fn rule_timeline_buckets_query(
-    source: &RiskFindingsSource,
-    anchor: DateTime<Utc>,
-    entities: &[String],
-) -> RiskChQuery {
-    use crate::risk::timeline::{TIMELINE_LOOKBACK_HOURS, TIMELINE_MAX_BUCKET_ROWS};
-    let sql = format!(
-        r#"
-            SELECT
-                toUInt32(intDiv(? - 1 - ts_micros, 3600000000)) as hours_ago,
-                rule_id,
-                argMax(rule_name, ts_micros) as rule_name,
-                argMax(severity, ts_micros) as severity,
-                count() as fires,
-                toInt64(sum(risk_score)) as score_sum,
-                max(ts_micros) as last_fire_us,
-                argMax(risk_score, ts_micros) as last_fire_score,
-                arrayDistinct(arrayFlatten(groupArray(tactics))) as mitre_tactics
-            FROM (
-                SELECT
-                    toInt32(__RISK_SCORE__) as risk_score,
-                    toUnixTimestamp64Micro(timestamp) as ts_micros,
-                    __RULE_ID__ as rule_id,
-                    __RULE_NAME__ as rule_name,
-                    __SEVERITY__ as severity,
-                    __MITRE_TACTICS__ as tactics
-                FROM __LOGS_TBL__
-                WHERE source_type = 'findings'
-                  AND __RISK_ENTITY__ IN ?
-                  AND toUnixTimestamp64Micro(timestamp) >= ?
-                  AND toUnixTimestamp64Micro(timestamp) < ?__RISK_SOURCE_SCOPE__
-            )
-            GROUP BY hours_ago, rule_id
-            ORDER BY hours_ago ASC, rule_id ASC
-            LIMIT {TIMELINE_MAX_BUCKET_ROWS}
-        "#
-    );
-    let anchor_us = anchor.timestamp_micros();
-    let lookback_us = (anchor - Duration::hours(i64::from(TIMELINE_LOOKBACK_HOURS))).timestamp_micros();
-    let mut binds = vec![
-        RiskSqlBind::I64(anchor_us),
-        RiskSqlBind::StrList(entities.to_vec()),
-        RiskSqlBind::I64(lookback_us),
-        RiskSqlBind::I64(anchor_us),
-    ];
-    source.push_scope_bind(&mut binds);
     RiskChQuery {
         sql: source.substitute(sql),
         binds,
@@ -1403,7 +1266,7 @@ pub fn risk_dataset_base_query(
     // DATASET_AGGREGATED_SELECT: 24h bounds for decayed sum, raw sum, finding
     // count, distinct rules, distinct tactics.
     binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
-    // Watchlist weight lookup (NAN-3228), then the remaining four bounds.
+    // Score weight lookup, then the remaining four bounds.
     cleared.push_watch_binds(&mut binds);
     for _ in 0..4 {
         binds.push(RiskSqlBind::I64(cutoffs.cutoff_24h_us));
@@ -1425,11 +1288,6 @@ pub fn risk_dataset_base_query(
 pub struct RiskQueryConfig {
     pub decay: RiskDecayConfig,
     pub cleared: ClearedBoundaries,
-    /// Lake-only delta after the immutable clear sidecar's published revision.
-    /// ClickHouse readers continue to use `cleared`, while lake requests send
-    /// this bounded delta plus `lake_minimum_clear_revision`.
-    pub lake_cleared: Option<ClearedBoundaries>,
-    pub lake_minimum_clear_revision: Option<i64>,
     /// Anchor for the decay-bucket cutoffs and the trailing 24h/7d windows —
     /// generation time in production; pinned by tests for deterministic SQL.
     pub now: DateTime<Utc>,
@@ -1445,8 +1303,6 @@ impl Default for RiskQueryConfig {
         Self {
             decay: RiskDecayConfig::default(),
             cleared: ClearedBoundaries::from_map(&HashMap::new()),
-            lake_cleared: None,
-            lake_minimum_clear_revision: None,
             now: Utc::now(),
         }
     }

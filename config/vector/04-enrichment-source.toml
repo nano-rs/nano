@@ -1,0 +1,61 @@
+# =============================================================================
+# Dedicated push-enrichment source (NAN-5004)
+# =============================================================================
+# Enrichment must not share http_ingest's backpressure domain. Every terminal
+# below this source uses a blocking disk buffer; keeping it on its own listener
+# means a full enrichment spool can withhold this source's response without
+# stalling ordinary log requests on :8080.
+[sources.enrichment_ingest]
+type = "http_server"
+address = "0.0.0.0:8090"
+strict_path = true
+path = "/"
+headers = ["Content-Type"]
+keepalive.max_connection_age_secs = 300
+
+[sources.enrichment_ingest.acknowledgements]
+enabled = true
+
+[sources.enrichment_ingest.valid_tokens_file]
+path = "/etc/vector/dynamic/ingest-tokens/tokens.json"
+reload_interval_secs = 2
+
+[sources.enrichment_ingest.auth]
+strategy = "custom"
+source = '''
+expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
+allow_unauthenticated = (get_env_var("VECTOR_ALLOW_UNAUTHENTICATED_INGEST") ?? "") == "true"
+static_fallback = (get_env_var("NANO_INGEST_STATIC_FALLBACK") ?? "") == "true"
+auth_header = to_string(.headers.authorization) ?? ""
+if expected_token == "" {
+    allow_unauthenticated
+} else {
+    static_fallback && auth_header == "Bearer " + expected_token
+}
+'''
+
+[sources.enrichment_ingest.framing]
+method = "newline_delimited"
+
+[sources.enrichment_ingest.decoding]
+codec = "bytes"
+
+[transforms.enrichment_ingest_prepare]
+type = "remap"
+inputs = ["enrichment_ingest"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = true
+source = '''
+raw = to_string(.message) ?? ""
+parsed, err = parse_json(raw)
+if err != null || !is_object(parsed) {
+    log("push-enrichment record is not a JSON object; dead-lettering", level: "warn")
+    abort
+}
+
+. = parsed
+.source_type = "nano_enrich"
+.metadata = {"forwarded_via": "enrichment_http"}
+%nano_durable_ingest = true
+'''

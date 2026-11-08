@@ -17,8 +17,9 @@ mod crud;
 mod deployment;
 mod health;
 mod helpers;
+pub mod pipe;
 mod status;
-pub(crate) mod validation;
+mod validation;
 mod versioning;
 
 #[cfg(test)]
@@ -65,8 +66,6 @@ pub enum LogSourceServiceError {
     VectorConfigError(#[from] VectorConfigError),
     #[error("VRL validation failed: {0}")]
     VrlValidationFailed(String),
-    #[error("OCSF validation failed: {0}")]
-    OcsfValidationFailed(String),
     #[error("Vector validation failed: {0}")]
     VectorValidationFailed(String),
     #[error("Deployment failed: {0}")]

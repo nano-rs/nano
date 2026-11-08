@@ -3,45 +3,48 @@
 # Splunk forwarders / agents can be repointed at nano without rewriting their
 # config. Port 8088 is the standard HEC port.
 #
-# Auth (NAN-3770): named, revocable per-sender tokens from Ingestion ->
-# Credentials, read from `valid_tokens_file` (SHA-256 hashes only, written by
-# nano-api to the shared nano-vector-dynamic volume, re-read every 2 s so a
-# revoke is refused within seconds without a reload). A listed token stamps
-# `%nano_credential_id` / `%nano_credential_name` on its events.
-#
-# NAN-3806: a token decides the source, 100% token based. Every listed token
-# is bound to one log source; its file `name` (stamped as
-# `%nano_credential_name`) is that source's route key, and `hec_normalize`
-# routes on it. The envelope's `sourcetype` never routes (it stays as the raw
-# `splunk_sourcetype` field, and a differing claim also as
-# `claimed_source_type`). The install token is listed too once an admin binds
-# it; nano-api writes `fallback_enabled = false` whenever VECTOR_AUTH_TOKEN is
-# set, so `valid_tokens` below is never consulted and an unbound token gets
-# 401. Requires ghcr.io/nano-rs/vector >= 0.59.0-nano.7.
+# Auth (NAN-4907, port of main NAN-3770 / NAN-3806): named, revocable
+# per-source tokens from Settings -> Ingest tokens, read from
+# `valid_tokens_file` (SHA-256 hashes only, written by nano-api to the shared
+# vector-dynamic volume, re-read every 2 s so a revoke is refused within
+# seconds without a reload). A listed token stamps `%nano_credential_id` /
+# `%nano_credential_name` on its events; the name is the bound source's route
+# key and `hec_normalize` routes on it, not on the envelope's `sourcetype`.
+# nano-api writes `fallback_enabled = false` whenever VECTOR_AUTH_TOKEN is set,
+# so the static `valid_tokens` below is consulted only while the file is
+# missing. That FAILS CLOSED: `hec_normalize` drops (and logs) every event
+# without a credential stamp unless the deployment explicitly sets
+# NANO_INGEST_STATIC_FALLBACK=true on Vector (legacy multiplex install token
+# where the tokens file cannot be delivered).
 
 [sources.splunk_hec_ingest]
 type = "splunk_hec"
 address = "0.0.0.0:8088"
-# nano-rs/vector nano/v0.59: preserve string AND object payloads as .message.
-# The bytes codec serializes object event values to JSON instead of flattening
-# them onto the root, so parsers and the lake retain the complete raw_data.
-event.decoding.codec = "bytes"
 valid_tokens = ["${VECTOR_AUTH_TOKEN}"]
 valid_tokens_file.path = "/etc/vector/dynamic/ingest-tokens/tokens.json"
 valid_tokens_file.reload_interval_secs = 2
-# NAN-2432: HEC 200 allocates an ackId; it is NOT a sink receipt. The Worker
-# polls /services/collector/ack with the same private token and request channel.
-# Keep this enabled together with ocsf_parquet_bronze acknowledgements.
+# Indexer acknowledgements (NAN-4976): an event POST with an
+# `X-Splunk-Request-Channel` (header or `?channel=`) answers an `ackId`;
+# `POST /services/collector/ack` (same token check; gzip-encoded polls need
+# nano-rs/vector 0.61.0-nano.5+) reports it true once every sink the event
+# reached has finalized it. Every ClickHouse event sink is disk-buffered
+# (`_pipeline.toml`, pinned by deploy/hec_ack_contract_tests.rs), so true means
+# "committed to the durable buffer in front of ClickHouse", not the INSERT:
+# acks keep resolving through a ClickHouse outage and the buffer delivers
+# at-least-once after it. Acks live in this Vector process's memory, so a
+# sender must poll the replica that took the event (sticky by channel behind
+# a load balancer) and an ackId outstanding across a Vector restart reads false.
 acknowledgements.enabled = true
-# NAN-3176: Vector keeps one ACK channel object (~4 KiB) per request channel
-# for the process lifetime unless idle cleanup is on (default off, 1M cap).
-# The hosted Worker sends every delivery on its own channel, and senders may
-# randomize channels too, so sweep channels idle for 10 minutes (>6x the
-# Worker's worst ACK-poll gap) and cap the map. A swept channel answers a late
-# poll `false`, the same as after a restart: the delivery is retried, not lost.
+# Bound acknowledgement state so a credential cannot turn outstanding ackIds
+# or idle channels into unbounded listener memory. With acks enabled the source
+# registers an ack before parsing an event request, so max_pending_acks also
+# bounds concurrent/outstanding accepted requests. The source independently
+# enforces its built-in 100 MiB decompressed request cap before event creation.
+acknowledgements.max_pending_acks = 100000
+acknowledgements.max_number_of_ack_channels = 10000
+acknowledgements.max_pending_acks_per_channel = 10000
 acknowledgements.ack_idle_cleanup = true
-acknowledgements.max_idle_time = 600
-acknowledgements.max_number_of_ack_channels = 250000
+acknowledgements.max_idle_time = 300
 
 # =============================================================================
 # HEC Normalization
@@ -54,40 +57,36 @@ acknowledgements.max_number_of_ack_channels = 250000
 type = "remap"
 inputs = ["splunk_hec_ingest"]
 source = '''
-# The source already enforced auth (valid_tokens_file / valid_tokens) — mark and move on.
-.auth_status = "authenticated"
-# NAN-3806: a token Vector matched in `valid_tokens_file` stamped its credential
-# (event metadata: a sender cannot set it). Without one, the event came in
-# through the static `valid_tokens` fallback, which nano-api disables whenever
-# an install token is set: accept it only under the explicit
-# VECTOR_ALLOW_UNAUTHENTICATED_INGEST opt-in with no install token.
-nano_credential_id = to_string(%nano_credential_id) ?? ""
-if nano_credential_id == "" {
-    if (get_env_var("VECTOR_AUTH_TOKEN") ?? "") != "" || (get_env_var("VECTOR_ALLOW_UNAUTHENTICATED_INGEST") ?? "") != "true" {
-        log("Refusing a HEC event: its token is not bound to a source. Bind it in Ingestion -> Credentials.", level: "warn")
-        abort
+# The role-split edge replaces X-Splunk-Request-Channel with the sender's
+# channel plus an authenticated client-address suffix. This is disabled unless
+# the deployment guarantees that Vector is reachable only through that edge;
+# direct HEC listeners must never trust a sender-created suffix.
+if (get_env_var("NANO_HEC_TRUST_EDGE_IDENTITY") ?? "") == "true" {
+    hec_channel = to_string(.splunk_channel) ?? ""
+    hec_edge, hec_edge_err = parse_regex(hec_channel, r'^(?P<channel>.*);nano-client=(?P<client>[^;]+)$')
+    if hec_edge_err == null {
+        hec_client = to_string(hec_edge.client)
+        if !(is_ipv4(hec_client) || is_ipv6(hec_client)) {
+            log("Refusing a HEC event with an invalid edge client identity", level: "error")
+            abort
+        }
+        %nano_ingest_client_ip = hec_client
+        original_channel = to_string(hec_edge.channel)
+        if original_channel == "" {
+            del(.splunk_channel)
+        } else {
+            .splunk_channel = original_channel
+        }
     }
-    .auth_status = "unauthenticated"
 }
 
-# NAN-2992: the edge Worker stamps every envelope with
-# `fields.nano_event_key = "nek1.<receipt sha256>.<mac>.<ordinal>"`, which
-# Vector lifts to the root. The MAC is HMAC-SHA256(delivery token,
-# "nanosiem.event-key.v1:" + digest), so a sender cannot forge another
-# request's keys. A verified key moves into event metadata (which survives
-# parsers) for the lake storage stage's deterministic uid; the field never
-# reaches a parser.
-nano_event_key_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
-nano_event_key = to_string(.nano_event_key) ?? ""
-del(.nano_event_key)
-nano_event_key_parts = split(nano_event_key, ".")
-if nano_event_key_token != "" && length(nano_event_key_parts) == 4 && (string(nano_event_key_parts[0]) ?? "") == "nek1" {
-    nano_event_key_receipt = string(nano_event_key_parts[1]) ?? ""
-    nano_event_key_ordinal = string(nano_event_key_parts[3]) ?? ""
-    nano_event_key_mac = slice(encode_base16(hmac("nanosiem.event-key.v1:" + nano_event_key_receipt, nano_event_key_token)), 0, 32) ?? ""
-    if match(nano_event_key_receipt, r'^[0-9a-f]{64}$') && match(nano_event_key_ordinal, r'^[0-9]{1,9}$') && (string(nano_event_key_parts[2]) ?? "") == nano_event_key_mac {
-        %nano_event_key = nano_event_key_receipt + ":" + nano_event_key_ordinal
-    }
+# The source already enforced auth (valid_tokens_file, else the static
+# valid_tokens fallback while the tokens file is missing) — mark and move on.
+.auth_status = "authenticated"
+nano_credential_id = to_string(%nano_credential_id) ?? ""
+if nano_credential_id == "" && (get_env_var("NANO_INGEST_STATIC_FALLBACK") ?? "") != "true" {
+    log("Refusing a HEC event without an ingest credential: the tokens file is missing and NANO_INGEST_STATIC_FALLBACK is not enabled", level: "error")
+    abort
 }
 
 # Vector's `splunk_hec` source emits the envelope's sourcetype as
@@ -107,20 +106,31 @@ if source_type == "unknown" && exists(.sourcetype) {
         source_type = downcase(st)
     }
 }
-# NAN-3806: the token decides the source. The bound source's route key
-# replaces whatever the envelope declared; a differing claim is kept only as
-# the raw `claimed_source_type`. The platform pull credential (nano-api's own
-# collector integrations) keeps its declared type.
-if nano_credential_id != "" && nano_credential_id != "6e616e6f-0000-4000-8000-000000000002" {
+# NAN-4907 (port of main NAN-3806): the token decides the source. The bound
+# source's route key replaces whatever the envelope declared; a differing claim
+# is kept only as the raw `claimed_source_type`. The route `*` is a multiplex
+# credential (nano-api's own senders, or the install token in legacy multiplex
+# mode) and keeps its declared type; so does an unstamped event (only reached
+# with the explicit static fallback). A listed token without a route is
+# refused.
+del(.claimed_source_type)
+# NAN-4912: the claim is also kept in event METADATA (a sender cannot set it)
+# so it survives a parser that replaces the root; the UDM `_output` and the
+# OCSF `_ocsf_prepare` restore it.
+del(%nano_claimed_source_type)
+if nano_credential_id != "" {
     bound_source_type = to_string(%nano_credential_name) ?? ""
-    if bound_source_type == "" || bound_source_type == "*" {
+    if bound_source_type == "" {
         log("Refusing a HEC event: its ingest token is not bound to a source", level: "warn")
         abort
     }
-    if source_type != "unknown" && source_type != bound_source_type {
-        .claimed_source_type = source_type
+    if bound_source_type != "*" {
+        if source_type != "unknown" && source_type != bound_source_type {
+            .claimed_source_type = source_type
+            %nano_claimed_source_type = source_type
+        }
+        source_type = bound_source_type
     }
-    source_type = bound_source_type
 }
 .source_type = source_type
 
@@ -160,13 +170,11 @@ if exists(.event) {
     del(.event)
 }
 
-# NAN-3646: a sender that posts a structured (object) event can reach this
-# point with no `.message`: a Vector without the bytes codec (or an older
-# fork) spreads the object over the log root instead. Every parser reads
-# `.message`, so an empty one becomes an unparsed row the lake refuses
-# (`raw_data_missing`). Rebuild the payload from the root minus the HEC
-# envelope and pipeline fields. VRL objects are key-sorted, so the JSON is
-# deterministic (a redelivered batch serializes byte-identically). A
+# NAN-3646 (ported): a sender that posts a structured (object) event can reach
+# this point with no `.message`: Vector's splunk_hec source spreads an object
+# event over the log root instead of keeping `.event`. Every parser reads
+# `.message`, so rebuild the payload from the root minus the HEC envelope and
+# pipeline fields. VRL objects are key-sorted, so the JSON is deterministic. A
 # non-string `.message` (an object or number) is serialized the same way.
 if !exists(.message) || .message == null || .message == "" {
     hec_envelope_keys = ["message", "auth_status", "source_type", "claimed_source_type",
@@ -196,23 +204,4 @@ if !is_object(.metadata) {
     .metadata = {}
 }
 .metadata.forwarded_via = "splunk_hec"
-
-# NAN-2370: stash the routing key into Vector EVENT METADATA, exactly as
-# `source_type_extract` does in 00-base.toml. The OCSF parsers replace the event
-# root (`. = {OCSF object}`), which wipes `.source_type`, and the generated
-# `_ocsf_prepare` reads `%source_type` back to stamp `metadata.log_source`.
-#
-# This lane feeds `source_router` DIRECTLY and never passes through
-# `source_type_extract`, so without this every HEC-ingested OCSF row lands with
-# `metadata.log_source = "unknown"` — unsearchable by source and
-# indistinguishable from genuinely unattributed data. Same defect and same fix
-# as the OTLP lane in 03-otlp-source.toml.
-#
-# `.source_type` is assigned a String above, so `to_string` is infallible here:
-# coalescing it is an E651 compile error that fails the whole reload, and Vector
-# restores the old topology so the edit silently looks like a no-op.
-%source_type = downcase(to_string!(.source_type))
-# NAN-2361 wave 8: ingress lane for the lake sink's `metadata.ingress_transport`
-# (see 00-base.toml `source_type_extract`).
-%ingress_transport = "hec"
 '''

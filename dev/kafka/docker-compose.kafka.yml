@@ -1,0 +1,88 @@
+# Local Kafka test stand for NAN-884 (source-config audit + test matrix).
+#
+# Single-node Apache Kafka 3.9 in KRaft mode. Two real listeners exposed to the host
+# and to the nanosiem_default Docker network so Vector (nanosiem-vector) can reach
+# this broker via the hostname `kafka`.
+#
+# Listener map:
+#   PLAINTEXT          host:9092  / docker:kafka:9092   - T-1 anonymous
+#   SASL_PLAINTEXT     host:9093  / docker:kafka:9093   - T-2 / T-5 PLAIN auth
+#   CONTROLLER         internal only on :9094
+#
+# SASL_SSL is intentionally not provisioned here. T-3 / T-4 use Confluent Cloud
+# (real CA) per NAN-884 test plan; standing up self-signed SSL locally is a separate
+# follow-on if Confluent Cloud is unavailable.
+#
+# Bring up:
+#   docker compose -f dev/kafka/docker-compose.kafka.yml up -d
+#
+# Tear down (volumes wiped):
+#   docker compose -f dev/kafka/docker-compose.kafka.yml down -v
+
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: nano-kafka-test
+    hostname: kafka
+    ports:
+      - "9092:9092"   # PLAINTEXT (host)
+      - "9093:9093"   # SASL_PLAINTEXT (host)
+    environment:
+      # --- KRaft (no Zookeeper) ---
+      CLUSTER_ID: kraft-nano-test-cluster
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9094
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # --- Listeners ---
+      # PLAINTEXT_HOST and SASL_PLAINTEXT_HOST are separate listeners that
+      # advertise localhost so host-side clients (kafka-console-producer on
+      # macOS) connect correctly, while the internal listeners advertise the
+      # Docker hostname `kafka` for Vector inside nanosiem_default.
+      KAFKA_LISTENERS: >-
+        CONTROLLER://:9094,PLAINTEXT://:9092,SASL_PLAINTEXT://:9093,PLAINTEXT_HOST://:29092,SASL_PLAINTEXT_HOST://:29093
+      KAFKA_ADVERTISED_LISTENERS: >-
+        PLAINTEXT://kafka:9092,SASL_PLAINTEXT://kafka:9093,PLAINTEXT_HOST://localhost:9092,SASL_PLAINTEXT_HOST://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: >-
+        CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SASL_PLAINTEXT:SASL_PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,SASL_PLAINTEXT_HOST:SASL_PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # --- SASL (PLAIN only for now; SCRAM needs separate metadata setup) ---
+      # The apache/kafka image expects JAAS via -Djava.security.auth.login.config
+      # rather than per-listener KAFKA_LISTENER_NAME_* env vars, because its
+      # env→property translator can't disambiguate underscores in listener names.
+      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_OPTS: -Djava.security.auth.login.config=/etc/kafka/secrets/kafka_server_jaas.conf
+
+      # --- Single-node sensible defaults ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+      - ./jaas/kafka_server_jaas.conf:/etc/kafka/secrets/kafka_server_jaas.conf:ro
+    networks:
+      - nanosiem_default
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  kafka-data:
+    name: nano-kafka-test-data
+
+networks:
+  nanosiem_default:
+    external: true

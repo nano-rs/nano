@@ -9,7 +9,7 @@
 */
 
 import type { CredentialFieldDef } from './marketplace';
-import { resolveJobResult } from './job-result';
+import { resolveJobResult, type JobResultProgress } from './job-result';
 
 // =============================================================================
 // Types
@@ -81,7 +81,7 @@ export type StreamProvisionReport = {
  * Whether a provisioning outcome is worth putting in front of an operator.
  *
  * The TypeScript half of `StreamProvisionReport::needs_attention()` in
- * `enterprise/src/integrations/provisioning.rs` — keep the two in step.
+ * `nanosiem-enterprise/src/integrations/provisioning.rs` — keep the two in step.
  *
  * NAN-2202: `linked` alone is NOT success. A linked-but-undeployed stream looks
  * healthy on every surface and collects into nothing, so it has to count here;
@@ -101,8 +101,7 @@ export interface IntegrationInstance {
   has_credentials: boolean;
   enabled_streams: string[];
   schedule?: string;
-  /** Legacy (NAN-3697): always null for new instances; collectors start at now. */
-  backfill_from?: string | null;
+  backfill_from?: string;
   last_run_at?: string;
   last_run_status?: 'success' | 'partial' | 'failed' | 'running' | 'cancelled';
   last_run_duration_ms?: number;
@@ -123,6 +122,7 @@ export interface CreateInstanceRequest {
   /** Omit to take the manifest's `default: true` streams. */
   enabled_streams?: string[];
   schedule?: string;
+  backfill_from?: string;
   enabled?: boolean;
 }
 
@@ -135,6 +135,7 @@ export interface UpdateInstanceRequest {
   enabled_streams?: string[];
   /** `null` clears the override and falls back to the manifest schedule. */
   schedule?: string | null;
+  backfill_from?: string | null;
 }
 
 export interface ListInstancesResponse {
@@ -321,6 +322,7 @@ export class IntegrationsApi {
   /** NAN-4753: the server answers with a job; this polls it to the code. */
   async generateCustomCollectorCode(
     request: GenerateCustomCollectorCodeRequest,
+    options?: { signal?: AbortSignal; onProgress?: (progress: JobResultProgress) => void },
   ): Promise<GenerateCustomCollectorCodeResponse> {
     const started = await this.request<GenerateCustomCollectorCodeResponse | { job_id: string }>(
       '/api/integrations/custom/generate-code',
@@ -331,6 +333,8 @@ export class IntegrationsApi {
       },
     );
     return resolveJobResult<GenerateCustomCollectorCodeResponse>(started, (path) => this.request(path), {
+      signal: options?.signal,
+      onProgress: options?.onProgress,
       failure: 'pivt could not write the collector. Retry in a moment.',
     });
   }

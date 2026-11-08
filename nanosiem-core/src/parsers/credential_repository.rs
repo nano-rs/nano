@@ -29,8 +29,28 @@ pub enum CredentialRepositoryError {
     DuplicateName(String),
     #[error("Invalid provider: {0}")]
     InvalidProvider(String),
+    /// The payload's shape is wrong for its provider. The message names
+    /// fields only, never secret values (NAN-4935).
+    #[error("Invalid credentials: {0}")]
+    InvalidCredentials(String),
     #[error("Credential version not found: credential={credential_id}, version={version}")]
     VersionNotFound { credential_id: Uuid, version: i32 },
+    /// The credential is still referenced and cannot be deleted. `users` names
+    /// each referencing object (e.g. `source configuration "Okta prod"`).
+    #[error("Credential is in use by {}; remove or re-point them first", users.join(", "))]
+    InUse { users: Vec<String> },
+}
+
+/// Provider-specific payload shape checks shared by create and rotate.
+fn validate_payload(
+    provider: &str,
+    credentials: &serde_json::Value,
+) -> Result<(), CredentialRepositoryError> {
+    if provider == "gcp_pubsub" {
+        super::gcp_credentials::validate_gcp_pubsub_payload(credentials)
+            .map_err(CredentialRepositoryError::InvalidCredentials)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -136,6 +156,7 @@ impl CredentialRepository {
                 req.provider.clone(),
             ));
         }
+        validate_payload(&req.provider, &req.credentials)?;
 
         if let Some(env) = req.environment.as_deref() {
             if env != "prod" && env != "staging" && env != "dev" {
@@ -274,8 +295,10 @@ impl CredentialRepository {
         req: &RotateCloudCredential,
         rotated_by: Option<Uuid>,
     ) -> Result<(CloudCredential, CloudCredentialVersion), CredentialRepositoryError> {
-        // Confirm the credential exists before doing the encrypt work
-        self.get(id).await?;
+        // Confirm the credential exists before doing the encrypt work, and
+        // hold the new payload to the same shape rules as create.
+        let existing = self.get(id).await?;
+        validate_payload(&existing.provider, &req.credentials)?;
 
         let (ciphertext_bytes, nonce) = self.encrypt_payload(&req.credentials)?;
 
@@ -366,7 +389,7 @@ impl CredentialRepository {
         req: &RollbackCloudCredential,
         rolled_back_by: Option<Uuid>,
     ) -> Result<(CloudCredential, CloudCredentialVersion), CredentialRepositoryError> {
-        self.get(id).await?;
+        let existing = self.get(id).await?;
 
         let mut tx = self.pool.begin().await?;
 
@@ -404,6 +427,13 @@ impl CredentialRepository {
         // carrying the current one backwards would pair a restored role with an
         // id its trust policy never referenced.
         let target_external_id: Option<String> = target.get("external_id");
+
+        // NAN-4935 review: a historical version may predate the current shape
+        // rules (e.g. a legacy `{"credentials_json": null}`). Restoring it must
+        // pass the same validation as create/rotate, inside this transaction,
+        // or the next deploy silently runs on ambient credentials.
+        let target_payload = self.decrypt_value(&target_ciphertext, target_nonce.clone())?;
+        validate_payload(&existing.provider, &target_payload)?;
 
         let next_version: i32 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(version_number), 0) + 1 FROM cloud_credential_versions WHERE credential_id = $1",
@@ -511,17 +541,39 @@ impl CredentialRepository {
     /// Get decrypted credentials for a credential ID — reads the active
     /// version's payload from the parent-row mirror so deploy stays a
     /// single-row lookup.
+    /// Decrypt one stored payload (parent row or version row).
+    fn decrypt_value(
+        &self,
+        ciphertext: &[u8],
+        nonce: String,
+    ) -> Result<serde_json::Value, CredentialRepositoryError> {
+        let encrypted = EncryptedData {
+            ciphertext: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                ciphertext,
+            ),
+            nonce,
+        };
+        let plaintext = self
+            .crypto
+            .decrypt(&encrypted)
+            .map_err(|e| CredentialRepositoryError::EncryptionError(e.to_string()))?;
+        serde_json::from_slice(&plaintext)
+            .map_err(|e| CredentialRepositoryError::EncryptionError(e.to_string()))
+    }
+
     pub async fn get_decrypted(
         &self,
         id: Uuid,
     ) -> Result<serde_json::Value, CredentialRepositoryError> {
-        let row = sqlx::query(
-            "SELECT credentials_encrypted, nonce, external_id FROM cloud_credentials WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(CredentialRepositoryError::NotFound(id))?;
+        let row =
+            sqlx::query(
+                "SELECT credentials_encrypted, nonce, external_id FROM cloud_credentials WHERE id = $1",
+            )
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or(CredentialRepositoryError::NotFound(id))?;
 
         let ciphertext: Vec<u8> = row.get("credentials_encrypted");
         let nonce: String = row.get("nonce");
@@ -536,7 +588,6 @@ impl CredentialRepository {
 
         let plaintext = self
             .crypto
-            .with_context(crate::crypto::CredentialScope::Deployment, "cloud.credential", id)
             .decrypt(&encrypted)
             .map_err(|e| CredentialRepositoryError::EncryptionError(e.to_string()))?;
 
@@ -572,21 +623,54 @@ impl CredentialRepository {
         Ok(())
     }
 
-    /// Delete a credential (and cascade its versions via the FK) only when no
-    /// source configuration references it. The reference predicate is part of
-    /// the DELETE statement to avoid a check-then-act gap and return
-    /// a useful in-use error; restrictive foreign keys remain the final guard
-    /// against concurrent and out-of-band writers.
+    /// Delete a credential (and cascade its versions via the FK) only when
+    /// nothing that blocks deletion references it. Source configurations
+    /// and pull feeds (`ON DELETE RESTRICT`) and custom enrichments (`NO ACTION`) block it;
+    /// the reference predicate is part of the DELETE statement to avoid a
+    /// check-then-act gap, and the foreign keys remain the final guard against
+    /// concurrent and out-of-band writers. An in-use credential is reported as
+    /// [`CredentialRepositoryError::InUse`] naming the referencing objects
+    /// (NAN-4902: it used to surface as an "Encryption error" 500).
     pub async fn delete(&self, id: Uuid) -> Result<(), CredentialRepositoryError> {
+        // `custom_enrichments` is an enterprise-overlay table: an open-core
+        // database does not have it, so it is only named when it exists.
+        let enrichments = self.custom_enrichments_exist().await?;
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
+        let sql = if enrichments {
             "DELETE FROM cloud_credentials cc \
              WHERE cc.id = $1 \
-               AND NOT EXISTS (SELECT 1 FROM source_configurations sc WHERE sc.credential_id = cc.id)",
-        )
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+               AND NOT EXISTS (SELECT 1 FROM source_configurations sc WHERE sc.credential_id = cc.id) \
+               AND NOT EXISTS (SELECT 1 FROM connector_feeds cf WHERE cf.credential_id = cc.id) \
+               AND NOT EXISTS (SELECT 1 FROM custom_enrichments ce WHERE ce.credential_id = cc.id)"
+        } else {
+            "DELETE FROM cloud_credentials cc \
+             WHERE cc.id = $1 \
+               AND NOT EXISTS (SELECT 1 FROM source_configurations sc WHERE sc.credential_id = cc.id) \
+               AND NOT EXISTS (SELECT 1 FROM connector_feeds cf WHERE cf.credential_id = cc.id)"
+        };
+        let result = sqlx::query(sql).bind(id).execute(&mut *tx).await;
+        let result = match result {
+            Ok(result) => result,
+            // A referencing row written after the predicate ran (or by a table
+            // the predicate does not know) trips a foreign key instead.
+            // PostgreSQL 18 reports an `ON DELETE RESTRICT` violation as 23001
+            // (restrict_violation); NO ACTION and older majors report 23503
+            // (NAN-4980). Most of these foreign keys are RESTRICT.
+            Err(sqlx::Error::Database(db))
+                if matches!(db.code().as_deref(), Some("23503") | Some("23001")) =>
+            {
+                tx.rollback().await?;
+                let users = self.credential_users(id).await?;
+                return Err(CredentialRepositoryError::InUse {
+                    users: if users.is_empty() {
+                        vec![format!("another object ({})", db.constraint().unwrap_or("foreign key"))]
+                    } else {
+                        users
+                    },
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         if result.rows_affected() == 1 {
             tx.commit().await?;
@@ -594,21 +678,46 @@ impl CredentialRepository {
         }
         tx.rollback().await?;
 
-        let counts = sqlx::query_as::<_, (bool, i64)>(
-            "SELECT EXISTS(SELECT 1 FROM cloud_credentials WHERE id = $1), \
-                    (SELECT COUNT(*) FROM source_configurations WHERE credential_id = $1)",
-        )
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await?;
-        if !counts.0 {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cloud_credentials WHERE id = $1)")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
+        if !exists {
             return Err(CredentialRepositoryError::NotFound(id));
         }
+        Err(CredentialRepositoryError::InUse {
+            users: self.credential_users(id).await?,
+        })
+    }
 
-        Err(CredentialRepositoryError::EncryptionError(format!(
-            "Cannot delete credential: {} source configuration(s) are using it",
-            counts.1
-        )))
+    /// Objects that block deleting this credential, named for the 409 message.
+    async fn credential_users(&self, id: Uuid) -> Result<Vec<String>, CredentialRepositoryError> {
+        let sql = if self.custom_enrichments_exist().await? {
+            "SELECT 'source configuration' AS kind, name FROM source_configurations WHERE credential_id = $1 \
+             UNION ALL \
+             SELECT 'pull feed' AS kind, name FROM connector_feeds WHERE credential_id = $1 \
+             UNION ALL \
+             SELECT 'custom enrichment' AS kind, name FROM custom_enrichments WHERE credential_id = $1 \
+             ORDER BY 1, 2"
+        } else {
+            "SELECT 'source configuration' AS kind, name FROM source_configurations WHERE credential_id = $1 \
+             UNION ALL \
+             SELECT 'pull feed' AS kind, name FROM connector_feeds WHERE credential_id = $1 \
+             ORDER BY 1, 2"
+        };
+        let rows: Vec<(String, String)> = sqlx::query_as(sql).bind(id).fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(kind, name)| format!("{kind} \"{name}\""))
+            .collect())
+    }
+
+    /// Whether the enterprise-overlay `custom_enrichments` table exists.
+    async fn custom_enrichments_exist(&self) -> Result<bool, CredentialRepositoryError> {
+        Ok(sqlx::query_scalar("SELECT to_regclass('public.custom_enrichments') IS NOT NULL")
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     pub async fn exists(&self, id: Uuid) -> Result<bool, CredentialRepositoryError> {
@@ -619,6 +728,10 @@ impl CredentialRepository {
         Ok(count > 0)
     }
 }
+
+#[cfg(test)]
+#[path = "credential_rollback_tests.rs"]
+mod rollback_tests;
 
 #[cfg(test)]
 mod tests {

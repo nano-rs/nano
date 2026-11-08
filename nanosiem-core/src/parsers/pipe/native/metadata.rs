@@ -56,7 +56,6 @@ pub fn trusted_restore(prefix: &str, name: &str, transforms: &toml::Table) -> bo
     };
     for (field, strategy) in [
         ("_nano_pipe_metadata", "discard"),
-        ("_nano_pipe_keys", "array"),
         ("context", "retain"),
         ("count", "sum"),
         ("group_hash", "retain"),
@@ -69,7 +68,6 @@ pub fn trusted_restore(prefix: &str, name: &str, transforms: &toml::Table) -> bo
     if merges.keys().any(|field| {
         ![
             "_nano_pipe_metadata",
-            "_nano_pipe_keys",
             "context",
             "count",
             "group_hash",

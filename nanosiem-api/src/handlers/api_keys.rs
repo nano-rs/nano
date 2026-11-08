@@ -261,7 +261,7 @@ pub struct ApiKeyUsageResponse {
 /// audited actions performed *via* the key (mutations + authorization denials)
 /// rather than raw request volume — read-only GET traffic is not audited, and
 /// admin lifecycle actions taken *on* the key (create/enable/disable) are not
-/// counted here since the key is the target, not the actor. This data moved
+/// counted here since the key is the target, not the actor. NAN-1622 moved this
 /// off the retired PostgreSQL `audit_logs` table.
 ///
 /// GET /api/api-keys/{id}/usage
@@ -379,9 +379,6 @@ pub async fn create_key(
         ));
     }
 
-    // Use IP from ClientContext (populated by auth middleware with ConnectInfo fallback)
-    let ip_address = client.ip_address.clone();
-    let user_agent = client.user_agent.clone();
     // F-32: bind every new key to the human owner. `auth.user_id()` is the
     // owner's user_id even for an api-key principal (AuthContext::from_api_key
     // sets sub = owner), so a key minted VIA another key stays owner-bound and
@@ -390,31 +387,28 @@ pub async fn create_key(
     // creating key resolves to a non-user subject and FK-fails here, which is
     // the intended outcome (orphaned keys must not mint new keys).
     let created_by = Some(auth.user_id());
-    let key_name = request.name.clone();
 
-    let api_key = state
+    // NAN-4954: the key and its `apikey_created` audit record commit in ONE
+    // PostgreSQL transaction — a key can never exist without its record, and a
+    // failed record rolls the key back (explicit failure, not a silent drop).
+    // Only the ClickHouse delivery is detached.
+    let actor_name = state.audit_actor_name(auth.user_id()).await;
+    let (api_key, event) = state
         .api_key_service
-        .create_key(
-            request,
-            created_by,
-            ip_address.as_deref(),
-            user_agent.as_deref(),
-        )
+        .create_key_audited(request, created_by, |key_id, key_name| {
+            AuditEvent::builder(AuditSource::ApiKey, APIKEY_CREATED)
+                .actor(Some(auth.user_id()), actor_name)
+                .api_key(auth.api_key_id, auth.api_key_name.clone())
+                .resource("api_key", Some(key_id), Some(key_name.to_string()))
+                .client_context(&client)
+                .build()
+        })
         .await
         .map_err(|e| {
             let (status, err) = ApiKeyApiError::from_service_error(&e);
             (status, Json(err))
         })?;
-
-    // Emit audit event
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::ApiKey, APIKEY_CREATED)
-            .actor(Some(auth.user_id()), None)
-            .api_key(auth.api_key_id, auth.api_key_name.clone())
-            .resource("api_key", Some(api_key.id), Some(key_name))
-            .client_context(&client)
-            .build(),
-    );
+    state.deliver_recorded_audit(event);
 
     Ok((StatusCode::CREATED, Json(api_key)))
 }
@@ -520,14 +514,14 @@ pub async fn update_key(
         })?;
 
     // Emit audit event
-    state.emit_audit(
+    state.emit_audit_durable(
         AuditEvent::builder(AuditSource::ApiKey, APIKEY_UPDATED)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("api_key", Some(*id), Some(key.name.clone()))
             .client_context(&client)
             .build(),
-    );
+    ).await;
 
     Ok(Json(ApiKeySummary::from(key)))
 }
@@ -570,33 +564,23 @@ pub async fn delete_key(
         .map(|k| k.name)
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // Use IP from ClientContext (populated by auth middleware with ConnectInfo fallback)
-    let ip_address = client.ip_address.clone();
-    let user_agent = client.user_agent.clone();
-    let user_id = if auth.is_api_key {
-        None
-    } else {
-        Some(auth.user_id())
-    };
-
+    // NAN-4954: the delete and its `apikey_deleted` audit record commit in ONE
+    // PostgreSQL transaction; only the ClickHouse delivery is detached.
+    let event = AuditEvent::builder(AuditSource::ApiKey, APIKEY_DELETED)
+        .actor(Some(auth.user_id()), state.audit_actor_name(auth.user_id()).await)
+        .api_key(auth.api_key_id, auth.api_key_name.clone())
+        .resource("api_key", Some(*id), Some(key_name))
+        .client_context(&client)
+        .build();
     state
         .api_key_service
-        .delete_key(*id, user_id, ip_address.as_deref(), user_agent.as_deref())
+        .delete_key_audited(*id, &event)
         .await
         .map_err(|e| {
             let (status, err) = ApiKeyApiError::from_service_error(&e);
             (status, Json(err))
         })?;
-
-    // Emit audit event
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::ApiKey, APIKEY_DELETED)
-            .actor(Some(auth.user_id()), None)
-            .api_key(auth.api_key_id, auth.api_key_name.clone())
-            .resource("api_key", Some(*id), Some(key_name))
-            .client_context(&client)
-            .build(),
-    );
+    state.deliver_recorded_audit(event);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -650,14 +634,14 @@ pub async fn enable_key(
         })?;
 
     // Emit audit event
-    state.emit_audit(
+    state.emit_audit_durable(
         AuditEvent::builder(AuditSource::ApiKey, APIKEY_ENABLED)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("api_key", Some(*id), Some(key.name.clone()))
             .client_context(&client)
             .build(),
-    );
+    ).await;
 
     Ok(Json(ApiKeySummary::from(key)))
 }
@@ -711,14 +695,14 @@ pub async fn disable_key(
         })?;
 
     // Emit audit event
-    state.emit_audit(
+    state.emit_audit_durable(
         AuditEvent::builder(AuditSource::ApiKey, APIKEY_DISABLED)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("api_key", Some(*id), Some(key.name.clone()))
             .client_context(&client)
             .build(),
-    );
+    ).await;
 
     Ok(Json(ApiKeySummary::from(key)))
 }
@@ -772,14 +756,14 @@ pub async fn reset_key(
         })?;
 
     // Emit audit event
-    state.emit_audit(
+    state.emit_audit_durable(
         AuditEvent::builder(AuditSource::ApiKey, APIKEY_RESET)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("api_key", Some(*id), Some(result.name.clone()))
             .client_context(&client)
             .build(),
-    );
+    ).await;
 
     Ok(Json(result))
 }

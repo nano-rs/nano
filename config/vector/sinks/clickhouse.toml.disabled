@@ -1,0 +1,159 @@
+# ClickHouse Sink Configuration for NanoSIEM
+#
+# This configuration sends processed logs directly from Vector to ClickHouse,
+# bypassing the NanoSIEM API. This provides higher throughput for high-volume
+# log ingestion scenarios.
+#
+# USAGE:
+# 1. Rename this file to clickhouse.toml (remove .disabled suffix)
+# 2. Comment out or remove the nanosiem_api sink in 90-sinks.toml
+# 3. Set the required environment variables (see below)
+# 4. Restart Vector or trigger a config reload
+#
+# ENVIRONMENT VARIABLES:
+# - CLICKHOUSE_URL: ClickHouse HTTP interface URL (default: http://clickhouse:8123)
+# - CLICKHOUSE_DATABASE: Database name (default: nanosiem)
+# - CLICKHOUSE_USER: Username (default: nanosiem)
+# - CLICKHOUSE_PASSWORD: Password (default: nanosiem)
+#
+# TRADE-OFFS:
+# - Direct ClickHouse: Higher throughput, lower latency, but bypasses API validation
+# - Via NanoSIEM API: Lower throughput, but includes validation, enrichment, error logging
+#
+# For most deployments, the NanoSIEM API sink (90-sinks.toml) is recommended.
+# Use direct ClickHouse sink only for high-volume scenarios (>10k events/sec).
+
+# =============================================================================
+# Prepare Output for ClickHouse
+# =============================================================================
+# Transform logs into the ClickHouse logs table schema
+
+[transforms.prepare_clickhouse]
+type = "remap"
+inputs = ["prepare_output", "db_parsers_combined"]
+source = '''
+# Generate UUID for the log entry
+id = uuid_v4()
+
+# Get timestamp, default to now if not present
+ts = .timestamp ?? now()
+
+# Build the final output structure matching ClickHouse logs table schema
+. = {
+    "id": id,
+    "timestamp": ts,
+    "raw_content": to_string(.raw_content) ?? "",
+    "metadata": encode_json(.metadata ?? {}),
+    "source_type": to_string(.source_type) ?? "unknown",
+    
+    # UDM Entity fields
+    "src_ip": to_string(.src_ip) ?? "",
+    "dest_ip": to_string(.dest_ip) ?? "",
+    "src_host": to_string(.src_host) ?? "",
+    "dest_host": to_string(.dest_host) ?? "",
+    
+    # UDM Network fields
+    "src_port": to_int(.src_port) ?? 0,
+    "dest_port": to_int(.dest_port) ?? 0,
+    "protocol": to_string(.protocol) ?? "",
+    "bytes_in": to_int(.bytes_in) ?? 0,
+    "bytes_out": to_int(.bytes_out) ?? 0,
+    
+    # UDM User/Action fields
+    "user": to_string(.user) ?? "",
+    "action": to_string(.action) ?? "",
+    "status": to_string(.status) ?? "",
+    
+    # UDM Authentication fields
+    "auth_type": to_string(.auth_type) ?? "",
+    "auth_result": to_string(.auth_result) ?? "",
+    "session_id": to_string(.session_id) ?? "",
+    
+    # UDM Process fields
+    "process_name": to_string(.process_name) ?? "",
+    "process_id": to_int(.process_id) ?? 0,
+    "parent_process": to_string(.parent_process) ?? "",
+    "command_line": to_string(.command_line) ?? "",
+    
+    # UDM File fields
+    "file_path": to_string(.file_path) ?? "",
+    "file_name": to_string(.file_name) ?? "",
+    "file_hash": to_string(.file_hash) ?? "",
+    "file_action": to_string(.file_action) ?? "",
+    
+    # HTTP fields
+    "user_agent": to_string(.user_agent) ?? "",
+    
+    # Enrichment fields (empty by default, populated by enrichment service)
+    "enriched_src_country": "",
+    "enriched_src_country_code": "",
+    "enriched_src_continent": "",
+    "enriched_src_continent_code": "",
+    "enriched_src_asn": "",
+    "enriched_src_as_name": "",
+    "enriched_src_as_domain": "",
+    "enriched_dest_country": "",
+    "enriched_dest_country_code": "",
+    "enriched_dest_continent": "",
+    "enriched_dest_continent_code": "",
+    "enriched_dest_asn": "",
+    "enriched_dest_as_name": "",
+    "enriched_dest_as_domain": "",
+    
+    # Processing timestamps
+    "ingest_time": now()
+}
+'''
+
+# =============================================================================
+# ClickHouse Sink
+# =============================================================================
+# Sends logs directly to ClickHouse using the HTTP interface
+
+[sinks.clickhouse_logs]
+type = "clickhouse"
+inputs = ["prepare_clickhouse"]
+
+# ClickHouse connection settings
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "logs"
+
+# Authentication
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+
+# Encoding - use JSON for flexibility
+encoding.timestamp_format = "rfc3339"
+
+# Disk Buffer Configuration for reliability
+# Ensures no data loss during ClickHouse unavailability
+[sinks.clickhouse_logs.buffer]
+type = "disk"
+max_size = 1073741824  # 1GB
+when_full = "block"
+
+# Batching for optimal ClickHouse performance
+# ClickHouse performs best with larger batches
+[sinks.clickhouse_logs.batch]
+max_bytes = 10485760   # 10MB - larger batches for ClickHouse efficiency
+max_events = 10000     # Up to 10k events per batch
+timeout_secs = 5       # Flush at least every 5 seconds
+
+# Request configuration
+[sinks.clickhouse_logs.request]
+concurrency = 5        # Parallel insert connections
+rate_limit_duration_secs = 1
+rate_limit_num = 100   # Rate limit batches, not individual events
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 300
+timeout_secs = 60      # Longer timeout for large batches
+
+# =============================================================================
+# Health Check Configuration
+# =============================================================================
+# Vector will check ClickHouse health before sending data
+
+[sinks.clickhouse_logs.healthcheck]
+enabled = true

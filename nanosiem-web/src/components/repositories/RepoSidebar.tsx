@@ -45,7 +45,7 @@ export function RepoSidebar({
             key={r.id}
             repo={r}
             active={activeRepoId === r.id}
-            syncing={syncingId === r.id || r.raw.last_sync_status === 'syncing'}
+            syncing={syncingId === r.id}
             onActivate={() => onActivate(r.id)}
             onSyncNow={() => onSyncNow(r.id)}
             onOpenHistory={() => onOpenHistory(r.id)}
@@ -129,22 +129,12 @@ function RepoCard({
             <span
               className={cn('w-1 h-1 rounded-full', repo.lastSync.result === 'failed' ? 'bg-destructive' : 'bg-success')}
             />
-            {repo.raw.managed_by_platform ? 'Managed by nano · last synced' : 'synced'} {repo.lastSync.relative}
+            synced {repo.lastSync.relative}
           </div>
           {repo.autoSync !== 'off' && (
-            <>
-              {repo.lastSync.result === 'failed' ? (
-                <div className="truncate text-destructive" title={repo.raw.last_sync_error ?? undefined}>
-                  sync failed{repo.nextSync.overdue ? ' · overdue' : ''}
-                </div>
-              ) : repo.nextSync.overdue ? (
-                <div className="truncate text-warning">sync overdue · {repo.nextSync.cadence}</div>
-              ) : (
-                <div className="truncate">
-                  next in {repo.nextSync.in} · {repo.nextSync.cadence}
-                </div>
-              )}
-            </>
+            <div className="truncate">
+              next in {repo.nextSync.in} · {repo.nextSync.cadence}
+            </div>
           )}
           {repo.autoSync === 'off' && <div className="truncate">manual sync</div>}
         </div>
@@ -197,10 +187,10 @@ function RepoCard({
               )}
             >
               <RefreshCw className={cn('w-[11px] h-[11px]', syncing && 'animate-spin')} strokeWidth={1.5} />
-              {syncing ? 'Syncing' : repo.raw.managed_by_platform ? 'Sync now' : 'Sync'}
+              {syncing ? 'Syncing' : 'Sync'}
             </button>
           </TooltipTrigger>
-          <TooltipContent>{syncing ? (repo.raw.sync_started_at ? `Syncing since ${new Date(repo.raw.sync_started_at).toLocaleTimeString()}` : 'Syncing…') : 'Sync now'}</TooltipContent>
+          <TooltipContent>{syncing ? 'Syncing…' : 'Sync now'}</TooltipContent>
         </Tooltip>
       </div>
 

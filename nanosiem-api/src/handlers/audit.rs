@@ -71,6 +71,14 @@ pub struct AuditLogListResponse {
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
+    /// NAN-4954: true when ClickHouse could not answer and `logs` / `total`
+    /// come from the PostgreSQL record of SECURITY-CRITICAL events only
+    /// (logins, MFA, password, API-key and credential lifecycle). Routine audit
+    /// events are not in that record, so a degraded page is partial.
+    pub degraded: bool,
+    /// Why the response is degraded (the ClickHouse error), when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
 }
 
 /// Audit log entry (sourced from the ClickHouse audit store)
@@ -140,16 +148,14 @@ impl From<ClickHouseAuditEntry> for AuditLogEntry {
     params(ListAuditLogsQuery),
     responses(
         (status = 200, description = "Successfully retrieved audit logs", body = AuditLogListResponse),
-        (status = 400, description = "Invalid bounded audit query", body = AuditApiError),
         (status = 403, description = "Permission denied", body = AuditApiError),
-        (status = 503, description = "Tenant audit unavailable", body = AuditApiError),
+        (status = 503, description = "Neither ClickHouse nor the PostgreSQL fallback could answer", body = AuditApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
 pub async fn query_audit_logs(
     State(state): State<AppState>,
     auth: axum::Extension<AuthContext>,
-    tenant: Option<axum::Extension<nanosiem_core::auth::TrustedTenantContext>>,
     Query(query): Query<ListAuditLogsQuery>,
 ) -> Result<Json<AuditLogListResponse>, (StatusCode, Json<AuditApiError>)> {
     check_permission(&auth, permissions::AUDIT_VIEW)
@@ -167,14 +173,6 @@ pub async fn query_audit_logs(
         nanosiem_api_lib::Pagination::new(query.limit, query.offset).resolved_capped(50, 1000);
 
     let ch_query = ClickHouseAuditQuery {
-        // Shared SQL validates the original selector before applying own-events scope.
-        #[cfg(feature = "enterprise")]
-        actor_id: if state.config.deployment_mode.is_enterprise_shared() {
-            query.user_id
-        } else {
-            effective_user_id
-        },
-        #[cfg(not(feature = "enterprise"))]
         actor_id: effective_user_id,
         action: query.action,
         source: query.source,
@@ -186,61 +184,63 @@ pub async fn query_audit_logs(
         offset: Some(offset),
     };
 
-    // Shared mode never reaches the global legacy query service, including
-    // when signed context or the runtime is unavailable.
-    #[cfg(feature = "enterprise")]
-    if state.config.deployment_mode.is_enterprise_shared() {
-        #[cfg(feature = "enterprise")]
-        {
-            use nanosiem_core::audit::TenantAuditQueryError;
-            let unavailable=|| (StatusCode::SERVICE_UNAVAILABLE,
-                Json(AuditApiError::new("audit_unavailable","Tenant audit is temporarily unavailable")));
-            let runtime=state.tenant_ai_rls_runtime.as_ref().ok_or_else(unavailable)?;
-            let tenant=tenant.as_ref().ok_or_else(unavailable)?;
-            let page=runtime.tenant_audit_query_service().query(&tenant.0,auth.user_id(),&ch_query)
-                .await.map_err(|e| match e {
-                    TenantAuditQueryError::InvalidInput=>(StatusCode::BAD_REQUEST,
-                        Json(AuditApiError::new("invalid_audit_query","Use a time range of at most 31 days and an offset of at most 10000"))),
-                    TenantAuditQueryError::AccessDenied=>(StatusCode::FORBIDDEN,
-                        Json(AuditApiError::new("forbidden","Tenant audit access denied"))),
-                    TenantAuditQueryError::Unavailable=>unavailable(),
-                })?;
-            return Ok(Json(AuditLogListResponse {logs:page.logs.into_iter().map(Into::into).collect(),
-                total:page.total,limit,offset}));
-        }
-        #[cfg(not(feature = "enterprise"))]
-        return Err((StatusCode::SERVICE_UNAVAILABLE,
-            Json(AuditApiError::new("audit_unavailable","Tenant audit is temporarily unavailable"))));
-    }
-    let _=tenant;
-
-    let logs = state.audit_query_service.query(&ch_query).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(AuditApiError::new("query_error", &e.to_string())),
-        )
-    })?;
-
     let count_query = ClickHouseAuditQuery {
         limit: None,
         offset: None,
-        ..ch_query
+        ..ch_query.clone()
     };
-    let total = state.audit_query_service.count(&count_query).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(AuditApiError::new("query_error", &e.to_string())),
-        )
-    })?;
+    let from_clickhouse = async {
+        let logs = state.audit_query_service.query(&ch_query).await?;
+        let total = state.audit_query_service.count(&count_query).await?;
+        Ok::<_, nanosiem_core::audit::AuditQueryError>((logs, total as i64))
+    }
+    .await;
 
-    let entries: Vec<AuditLogEntry> = logs.into_iter().map(AuditLogEntry::from).collect();
-
-    Ok(Json(AuditLogListResponse {
-        logs: entries,
-        total: total as i64,
-        limit,
-        offset,
-    }))
+    match from_clickhouse {
+        Ok((logs, total)) => Ok(Json(AuditLogListResponse {
+            logs: logs.into_iter().map(AuditLogEntry::from).collect(),
+            total,
+            limit,
+            offset,
+            degraded: false,
+            degraded_reason: None,
+        })),
+        Err(ch_error) => {
+            // NAN-4954: ClickHouse cannot answer (e.g. MEMORY_LIMIT_EXCEEDED).
+            // Serve the PostgreSQL record of security-critical events — the
+            // same filters, the same caller scoping (`actor_id` is already
+            // pinned to the caller for non-admins) — flagged as partial,
+            // instead of a bare 500 exactly when an investigator needs it.
+            tracing::warn!(error = %ch_error,
+                "Audit query failed on ClickHouse; serving security-critical events from PostgreSQL");
+            let (logs, total) = state
+                .audit_emitter
+                .outbox()
+                .query(&ch_query)
+                .await
+                .map_err(|pg_error| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(AuditApiError::new(
+                            "audit_unavailable",
+                            &format!(
+                                "Audit store unavailable (ClickHouse: {ch_error}; PostgreSQL fallback: {pg_error})"
+                            ),
+                        )),
+                    )
+                })?;
+            Ok(Json(AuditLogListResponse {
+                logs: logs.into_iter().map(AuditLogEntry::from).collect(),
+                total,
+                limit,
+                offset,
+                degraded: true,
+                degraded_reason: Some(format!(
+                    "ClickHouse audit store unavailable ({ch_error}); showing security-critical events from PostgreSQL only"
+                )),
+            }))
+        }
+    }
 }
 
 /// Export format for audit logs
@@ -526,13 +526,13 @@ mod tests {
         ClickHouseAuditEntry {
             event_id: "evt_1".to_string(),
             timestamp: Utc::now(),
-            user: Some("Jane Analyst".to_string()),
+            user: Some("Dan Lussier".to_string()),
             action: Some("apikey_disabled".to_string()),
             source: Some("apikey".to_string()),
             src_ip: None,
             user_agent: None,
             status: Some("success".to_string()),
-            message: "[apikey] apikey_disabled on api_key 'foo' by Jane Analyst via API key 'ci-bot'"
+            message: "[apikey] apikey_disabled on api_key 'foo' by Dan Lussier via API key 'ci-bot'"
                 .to_string(),
             metadata: metadata.clone(),
             actor_id: metadata
@@ -586,7 +586,7 @@ mod tests {
             id: "evt_1".to_string(),
             timestamp: Utc::now(),
             user_id: None,
-            user_name: Some("Jane Analyst".to_string()),
+            user_name: Some("Dan Lussier".to_string()),
             action: Some("apikey_disabled".to_string()),
             source: Some("apikey".to_string()),
             resource_type: None,

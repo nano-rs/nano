@@ -11,16 +11,14 @@
 //!   `TimeRange`/`SqlGenError` types)
 
 mod ast;
-pub mod stats_page;
 pub(crate) mod clickhouse_sql_gen;
+pub mod complexity;
 pub(crate) mod command_outputs;
-pub mod migration;
 mod parser;
+pub(crate) use parser::search_wildcards_to_like;
 mod pretty_print;
-pub mod source_alias;
-mod time_bins;
 pub(crate) mod time_modifiers;
-pub(crate) use parser::split_time_modifiers;
+mod time_bins;
 mod sql_gen;
 pub mod validation;
 
@@ -30,7 +28,7 @@ pub(crate) use clickhouse_sql_gen::escape_identifier;
 // native-subcolumn access as `field_access_expr` (NAN-1426 lockstep). This
 // replaced the `escape_string` re-export, whose only external consumer was
 // that arm's hand-rolled JSONExtractString emission.
-pub(crate) use clickhouse_sql_gen::json_tail_access_sql;
+pub(crate) use clickhouse_sql_gen::{json_tail_access_sql, JSON_ARRAY_SEGMENT};
 // Re-exported so `SchemaProfile::column_sql`'s MapKey arm (spans/metrics attribute
 // tail) emits the SAME native `Map` subscript as `field_access_expr` (NAN-1555
 // lockstep — mirrors the json_tail_access_sql lockstep above).
@@ -49,34 +47,30 @@ pub(crate) use clickhouse_sql_gen::{
 };
 // `pub` (not `pub(crate)`): consumed by the DDL↔Rust column drift gate
 // (`tests/logs_ddl_column_consistency.rs`, NAN-1623) — see MATERIALIZED_COLUMNS above.
-/// Coarse indicator classifier (ip/hash/url/cve/user/domain/other). Exported so
-/// enrichment publishers stamp a snapshot's `key_type` with the SAME
-/// classification the IOC hunt uses to scope observables — if the two disagree,
-/// a stored indicator is typed one way and searched another.
-pub use clickhouse_sql_gen::search_expr::classify_indicator;
-pub use clickhouse_sql_gen::search_expr::hostname_equality_expands;
-pub use clickhouse_sql_gen::search_expr::rhs_compiles_as_value;
 pub use clickhouse_sql_gen::EXPLICIT_COLUMNS;
 pub use clickhouse_sql_gen::{ClickHouseSqlGenerator, QueryOptions};
+#[doc(hidden)]
+pub use clickhouse_sql_gen::ioc_feed_indicator_sql;
 // OTLP observability (NAN-1528): dataset selector + trace/metrics fetch SQL the
 // search/api layer calls to target the `otel_spans`/`otel_metrics` tables.
 pub use clickhouse_sql_gen::otel::{
-    metric_names_sql, metric_timeseries_sql, recent_traces_sql, trace_by_id_sql, Dataset,
+    metric_names_sql, metric_names_window_start, metric_timeseries_sql, METRIC_NAMES_CAP,
+    METRIC_NAMES_DEFAULT_WINDOW_HOURS, METRIC_NAMES_MAX_WINDOW_HOURS, recent_traces_sql, trace_by_id_sql, Dataset,
     MetricRollup, TraceListFilters,
 };
 // Observability console (NAN-1536): services overview / service detail RED
 // timeseries + endpoints + exemplars, and SLO spans-based compute.
 pub use clickhouse_sql_gen::otel::{
     service_endpoints_sql, service_exemplars_sql, service_red_timeseries_sql,
-    services_overview_sql, services_sparkline_sql, slo_compute_sql, ServicesOverviewFilters,
+    services_overview_sql, services_sparkline_sql, slo_compute_sql, slo_coverage_complete, slo_coverage_sql, ServicesOverviewFilters,
+    OTEL_SPAN_TTL_SECS, SLO_COVERAGE_MAX_GAP_SECS,
     ServicesSort, SliKind,
 };
 // Observability console (NAN-1537/1538): Infra host inventory, RUM web-vitals /
 // page-views / top-pages / recent-errors, and synthetic-check results summaries.
 pub use clickhouse_sql_gen::otel::{
     infra_hosts_sql, rum_pageviews_series_sql, rum_recent_errors_sql, rum_top_pages_sql,
-    rum_web_vitals_sql, synthetic_history_sql, synthetic_summary_sql, InfraHostsFilters,
-    RumFilters,
+    rum_web_vitals_sql, synthetic_history_sql, synthetic_summary_sql, InfraHostsFilters, RumFilters,
 };
 // Observability ↔ security convergence (NAN-1542): a service's entities + the
 // detection signals firing against them.
@@ -89,15 +83,19 @@ pub use clickhouse_sql_gen::otel::{
     metric_scalar_sql, metric_tag_keys_sql, metric_tag_values_sql, metric_timeseries_v2_sql,
     valid_tag_key, MetricAgg, MetricQuery, MetricTagFilter,
 };
-pub(crate) use parser::{extract_time_modifier_tokens, strip_comments, subsearch_depths};
-pub use parser::{comment_may_start_after, parse_query, ParseError};
-/// Detect outer time overrides with the same comment/quote-aware scanner as
-/// Search execution. Quoted data is not a modifier; nested modifiers are
-/// rejected separately by `parse_query`.
+pub use parser::{parse_query, ParseError};
+pub(crate) use parser::extract_time_modifier_tokens;
+pub(crate) use parser::split_time_modifiers;
+// NAN-4283: the API detection stripper reuses the parser's comment rule.
+pub use parser::strip_comments;
+
+/// Whether `query` carries outer time overrides (`earliest=` / `latest=`),
+/// detected with the same comment- and quote-aware scanner Search execution
+/// uses. Callers that freeze their own window (scheduled automation, durable
+/// jobs) refuse such queries instead of letting the text move the window.
 pub fn has_outer_time_modifiers(query: &str) -> bool {
     !parser::extract_time_modifier_tokens(&parser::strip_comments(query)).is_empty()
 }
-pub(crate) use pretty_print::npl_quoted_literal;
 pub use pretty_print::PrettyPrint;
 pub use sql_gen::{SqlGenError, TimeRange};
 pub use time_bins::{resolve_timechart_bins, round_span_for_bins};
@@ -108,9 +106,7 @@ pub use validation::{
     contains_aggregation,
     contains_join,
     contains_risk_command,
-    extract_comparator_field_candidates,
     is_aggregation_command,
-    mask_query_literals,
     pre_aggregation_subquery,
     suggest_similar_fields,
     validate_field_name,

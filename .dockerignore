@@ -14,7 +14,7 @@
 
 # Documentation
 *.md
-docs/**
+docs/
 docs-site/
 examples/
 samples/
@@ -31,30 +31,6 @@ samples/
 *.log
 logs/
 
-# Local benchmark/evidence artifacts are never runtime build inputs. Keep the
-# source harnesses in the repository, but do not send their generated corpora or
-# result bundles (hundreds of MiB in a normal validation worktree) to BuildKit.
-results/
-benchmarks/**/results/
-.artifacts/
-benchmarks/**/.state/
-benchmarks/
-# NAN-2869: lake_query_compile embeds this tracked corpus at compile time.
-!benchmarks/
-benchmarks/*
-!benchmarks/results/
-benchmarks/results/*
-!benchmarks/results/soc_ir_corpus.json
-# #8435 two_pass_ocsf_native_tests embeds this tracked fixture (compile-time asset gate copies it).
-!benchmarks/agent-query/
-benchmarks/agent-query/*
-!benchmarks/agent-query/hunts.fixture.json
-.wrangler/
-nano-desktop/
-data/
-design-ref/
-docs-internal/
-
 # Environment
 .env
 .env.*
@@ -64,9 +40,6 @@ docs-internal/
 test-*.sh
 *_test.rs
 tests/
-# NAN-4551: the shared sovereign release build explicitly runs this gate.
-!nanosiem-sovereign-contract/tests/
-!nanosiem-sovereign-contract/tests/license_production_ceremony.rs
 
 # CI/CD
 .github/
@@ -80,15 +53,6 @@ Dockerfile*
 # Node / frontend (not needed for Rust builds)
 nanosiem-web/
 deploy/
-# NAN-2604: the parser-bundle builder image ships this one harness script.
-!deploy/
-deploy/*
-!deploy/parser-bundle-build/
-deploy/parser-bundle-build/*
-!deploy/parser-bundle-build/vector-check.sh
-# The hosted ingest Worker source is never a Rust/image build input (the Worker
-# deployer builds from its own sanitized context, scripts/worker-deployer).
-workers/
 
 # Database
 *.db
@@ -103,76 +67,33 @@ clickhouse/config.d/
 cursor_alignment_test.html
 test_syntax_highlighting.html
 scripts/
-config/*
-# The host allocator embeds the same policy that the installer reads.
-!config/lean-startup-memory.json
-# NAN-1156: nanosiem-core embeds these base Vector templates at COMPILE time via
-# include_str! (vector_config/deploy.rs — backpressure guard + default lane), so
-# they MUST be in the Docker build context even though the rest of config/ stays
-# excluded (credentials/, staging/, backup/, and untracked per-source parser
-# noise all remain ignored). Runtime still reads the mounted config_dir — this is
-# build-context only. Keep in sync with the include_str! list in deploy.rs.
-!config/vector/
-config/vector/*
+# NAN-3485 / NAN-4908: the api and jobs stages install the pinned, checksummed Deno.
+!scripts/ci/install-deno.sh
+# NAN-5002: the guarded, TEST-only upgrade rehearsal copies exactly this SQL
+# fixture into a non-release image. Keep every other test/script path excluded.
+!scripts/tests/fixtures/upgrade/clickhouse/999999999lab_upgrade_probe.sql
+config/
+# NAN-1156/NAN-5004: nanosiem-core embeds these Vector templates at COMPILE time
+# via include_str! (vector_config/deploy.rs and its durability contract tests),
+# so they MUST be in the Docker build context even though the rest of config/
+# stays excluded (credentials/, staging/, backup/, and untracked per-source
+# parser noise all remain ignored). Runtime still reads the mounted config_dir —
+# this is build-context only. Keep in sync with those compile-time include lists.
 !config/vector/00-base.toml
 !config/vector/01-vector-source.toml
 !config/vector/02-hec-source.toml
 !config/vector/03-otlp-source.toml
-!config/vector/04-otlp-lake-sink.toml
+!config/vector/04-enrichment-source.toml
 !config/vector/92-metrics.toml
-!config/vector/sources/
-config/vector/sources/*
-!config/vector/sources/parsers/
-config/vector/sources/parsers/*
+!config/vector/disk-buffer-budget.env
 !config/vector/sources/parsers/_router.toml
 !config/vector/sources/parsers/_combiner.toml
 !config/vector/sources/parsers/_enrichment.toml
-# Embedded tenant-bundle sink fixtures, also checked by the context probe.
-!config/vector/sources/parsers/_ocsf_sink.toml
-!config/vector/backup/
-config/vector/backup/*
-!config/vector/backup/_ocsf_sink.toml
+!config/vector/sources/parsers/_pipeline.toml
 
-# Compile-time Rust include_str!/include_bytes! inputs that would otherwise be
-# hidden by the broad documentation, data, desktop, web, and scripts excludes.
-# Keep this exact-file list machine-checked by scripts/check-build-context-includes.sh.
-!docs/
-docs/*
-!docs/architecture/
-docs/architecture/*
-!docs/architecture/enterprise-shared-r2-provider-runtime-boundary.md
-!docs/architecture/enterprise-shared-worker-fleet-rollout-contract.md
-!nanosiem-core/docs/
-!nanosiem-core/docs/udmfields.csv
-!nanosiem-core/docs/ocsf/
-!nanosiem-core/docs/ocsf/1.8.0/
-nanosiem-core/docs/ocsf/1.8.0/*
-!nanosiem-core/docs/ocsf/1.8.0/udm_ocsf_mapping.json
-!nanosiem-core/docs/ocsf/1.8.0/dictionary.json
-!nano-desktop/
-nano-desktop/*
-!nano-desktop/src-tauri/
-nano-desktop/src-tauri/*
-!nano-desktop/src-tauri/Info.plist
-!nano-desktop/src-tauri/src/
-nano-desktop/src-tauri/src/*
-!nano-desktop/src-tauri/src/hunt_runner.rs
-!nanosiem-web/
-nanosiem-web/*
-!nanosiem-web/src/
-nanosiem-web/src/*
-!nanosiem-web/src/lib/
-nanosiem-web/src/lib/*
-!nanosiem-web/src/lib/enterprise-shared-membership-acceptance.ts
-# The src/ inline Rust parity test is conservatively checked by the context probe.
-!nanosiem-web/src/lib/lookup-public-suffixes.txt
-nanosiem-web/Dockerfile
-!scripts/
-scripts/*
-!scripts/validate-enterprise-shared-postgres.sh
-# NAN-3407: the chef stages install the shared-sccache helper.
-!scripts/ci/
-scripts/ci/*
-!scripts/ci/nano-sccache-env.sh
-# NAN-3485: the api and jobs stages install the pinned, checksummed Deno.
-!scripts/ci/install-deno.sh
+# NAN-4905: local-stack tooling is never needed inside an image, and editing it
+# should not invalidate the COPY . . layer (a full release recompile).
+dev/local-stack/
+scripts/local-stack.sh
+**/.env.local
+**/.env.*.local

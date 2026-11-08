@@ -101,10 +101,14 @@ impl ParserService {
             ));
         }
 
+        // NAN-4953: Vector env-interpolation syntax in tenant VRL is refused.
+        crate::vector_env::reject_vrl_interpolation("parser_vrl", &new_parser.parser_vrl)
+            .map_err(ParserServiceError::InvalidVrl)?;
+
         // NAN-1124: reserve the `nano_` source_type namespace for enrichment routing.
         if let Some(claim) = reserved_route_claim(&new_parser.name) {
             return Err(ParserServiceError::InvalidSourceType(format!(
-                "parser name maps to the reserved source_type '{claim}': the 'nano_' prefix is reserved for nano-internal enrichment routing. Rename the parser."
+                "parser name maps to the reserved source_type '{claim}': the 'nano_' prefix is reserved for nano-internal enrichment routing (NAN-1124). Rename the parser."
             )));
         }
 
@@ -162,12 +166,18 @@ impl ParserService {
         id: Uuid,
         update: UpdateParser,
     ) -> Result<Parser, ParserServiceError> {
+        // NAN-4953: Vector env-interpolation syntax in tenant VRL is refused.
+        if let Some(ref vrl) = update.parser_vrl {
+            crate::vector_env::reject_vrl_interpolation("parser_vrl", vrl)
+                .map_err(ParserServiceError::InvalidVrl)?;
+        }
+
         // NAN-1124: reserve the `nano_` source_type namespace (a rename to a
         // nano_* name would otherwise claim the enrichment route).
         if let Some(ref name) = update.name {
             if let Some(claim) = reserved_route_claim(name) {
                 return Err(ParserServiceError::InvalidSourceType(format!(
-                    "parser name maps to the reserved source_type '{claim}': the 'nano_' prefix is reserved for nano-internal enrichment routing. Rename the parser."
+                    "parser name maps to the reserved source_type '{claim}': the 'nano_' prefix is reserved for nano-internal enrichment routing (NAN-1124). Rename the parser."
                 )));
             }
 
@@ -186,10 +196,8 @@ impl ParserService {
                 return Err(ParserServiceError::InvalidSourceType(source_type.clone()));
             }
 
-            if matches!(
-                source_type.as_str(),
-                "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub" | "azure_event_hubs"
-            ) && update.dispatch_source_config_id.is_none()
+            if matches!(source_type.as_str(), "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub" | "azure_event_hubs")
+                && update.dispatch_source_config_id.is_none()
             {
                 let existing = self.get(id).await?;
                 if existing.dispatch_source_config_id.is_none() {

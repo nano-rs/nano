@@ -140,3 +140,24 @@ fn test_prevalence_time_window_as_str() {
     assert_eq!(PrevalenceTimeWindow::SevenDays.as_str(), "7d");
     assert_eq!(PrevalenceTimeWindow::ThirtyDays.as_str(), "30d");
 }
+
+/// NAN-3080: every INTERVAL unit round-trips through pretty-print/re-parse.
+/// Display used to print the SECONDS count with the unit, so `INTERVAL 24 HOUR`
+/// re-parsed as `INTERVAL 86400 HOURS` (~10 years) on every round trip.
+#[test]
+fn nan3080_interval_values_round_trip_through_pretty_print() {
+    use crate::query::{parse_query, PrettyPrint};
+    for (written, printed) in [
+        ("INTERVAL 24 HOUR", "INTERVAL 24 HOURS"),
+        ("INTERVAL 7 DAYS", "INTERVAL 7 DAYS"),
+        ("INTERVAL 90 SECOND", "INTERVAL 90 SECONDS"),
+        ("INTERVAL 15 MINUTE", "INTERVAL 15 MINUTES"),
+        ("INTERVAL 2 WEEK", "INTERVAL 2 WEEKS"),
+    ] {
+        let query = format!("* | where time > now() - {written}");
+        let once = parse_query(&query).unwrap().pretty_print();
+        assert!(once.contains(printed), "{written}: {once}");
+        let twice = parse_query(&once).unwrap().pretty_print();
+        assert_eq!(once, twice, "{written} is stable");
+    }
+}

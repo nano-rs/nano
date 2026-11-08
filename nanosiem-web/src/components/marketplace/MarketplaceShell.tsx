@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input';
 import type { CatalogStats, EnrichmentMarketplaceRepo } from '@/lib/api/marketplace';
 import { formatUTCCompact } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
+import { isFirstPartyRepo } from '@/lib/api/marketplace-inventory';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 
 export type CategoryFilter = 'all' | 'data' | 'agent' | 'identity' | 'collector';
@@ -407,9 +408,14 @@ export function repoCadenceLabel(repos: EnrichmentMarketplaceRepo[]): string {
 interface SourcesMenuProps {
   repos: EnrichmentMarketplaceRepo[];
   syncingId: string | null;
-  onSync: (id: string) => void;
+  /** Omitted for callers without `enrichments:configure`: no sync control. */
+  onSync?: (id: string) => void;
 }
 
+/**
+ * The first-party catalog sources and their sync state (NAN-4946: there is no
+ * way to add a third-party repository; sync now is the only action).
+ */
 export function SourcesMenu({ repos, syncingId, onSync }: SourcesMenuProps) {
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -503,19 +509,14 @@ export function SourcesMenu({ repos, syncingId, onSync }: SourcesMenuProps) {
                             </div>
                           </TooltipContent>
                         </Tooltip>
-                        <span className="shrink-0 rounded border border-primary/30 bg-primary/10 px-1 font-mono text-[9px] uppercase leading-[14px] tracking-[0.1em] text-primary">
-                          official
+                        <span className={cn('shrink-0 rounded border px-1 font-mono text-[9px] uppercase leading-[14px] tracking-[0.1em]', isFirstPartyRepo(repo) ? 'border-primary/30 bg-primary/10 text-primary' : 'border-border text-muted-foreground')}>
+                          {isFirstPartyRepo(repo) ? 'official' : 'retired'}
                         </span>
                         <span className="hidden shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground sm:inline">
                           {repoContentCount(repo)}
                         </span>
                       </div>
                       <div className="mt-0.5 truncate font-mono text-[10.5px] text-muted-foreground">{repo.url}</div>
-                      {repo.managed_by_platform && (
-                        <div className="font-mono text-[10.5px] text-muted-foreground">
-                          Managed by nano · last synced {repo.last_synced_at ? formatUTCCompact(repo.last_synced_at) : 'never'}
-                        </div>
-                      )}
                     </div>
                     <div className="hidden shrink-0 flex-col items-end gap-0.5 sm:flex">
                       <span className="font-mono text-[10.5px] text-muted-foreground">
@@ -526,23 +527,24 @@ export function SourcesMenu({ repos, syncingId, onSync }: SourcesMenuProps) {
                         {repoStatusLabel(repo, syncingId)}
                       </span>
                     </div>
-                    <button
+                    {onSync && <button
                       type="button"
                       onClick={() => onSync(repo.id)}
                       disabled={isSyncing}
-                      aria-label={`${repo.managed_by_platform ? 'Sync now' : 'Sync'} ${repo.name}`}
+                      aria-label={`Sync ${repo.name}`}
                       className="inline-flex h-6 shrink-0 items-center gap-1 rounded px-2 font-mono text-[10.5px] text-muted-foreground hover:bg-primary/10 hover:text-primary disabled:opacity-50"
                     >
                       <RefreshCw className={cn('w-[10px] h-[10px]', isSyncing && 'animate-spin')} />
-                      {repo.managed_by_platform ? 'Sync now' : 'sync'}
-                    </button>
+                      sync
+                    </button>}
                   </div>
                 );
               })}
             </div>
           </TooltipProvider>
 
-          <div className="mt-1 flex items-center justify-end border-t border-border/60 px-2 pt-2 pb-1">
+          <div className="mt-1 flex items-center justify-between border-t border-border/60 px-2 pt-2 pb-1">
+<span />
             <span className="font-mono text-[10px] text-muted-foreground/70">{repoCadenceLabel(repos)}</span>
           </div>
         </div>

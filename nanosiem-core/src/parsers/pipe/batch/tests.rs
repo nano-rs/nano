@@ -130,8 +130,8 @@ fn route_runtime_condition_failures_are_non_matches_and_compile_failures_reject(
     assert!(run(&plan, &[json!({})], None).unwrap()[0].error.is_some());
 }
 
-#[tokio::test]
-async fn validator_sample_chain_runs_native_state_and_separate_extensions() {
+#[test]
+fn batch_runs_native_state_and_separate_extensions() {
     let mut plan = plan("dedupe", json!({"fields":["message"],"cacheEvents":10}));
     plan.steps.insert(
         0,
@@ -147,23 +147,16 @@ async fn validator_sample_chain_runs_native_state_and_separate_extensions() {
                 .clone(),
         },
     );
-    let code = plan.stored().unwrap();
-    let inputs: Vec<_> = [
+    let inputs = [
         json!({"message":"a"}),
         json!({"message":"a"}),
         json!({"message":"b"}),
-    ]
-    .iter()
-    .map(Value::to_string)
-    .collect();
-    let results = crate::parsers::validator::VrlValidator::new()
-        .test_vrl_chain_batch(&[&code, ".extended = true"], &inputs)
-        .await
-        .unwrap();
-    assert!(results.iter().all(|result| result.success));
-    assert_eq!(results[0].output.as_ref().unwrap()["extended"], true);
-    assert_eq!(results[1].output, Some(json!([])));
-    assert_eq!(results[2].output.as_ref().unwrap()["added"], true);
+    ];
+    let rows = run(&plan, &inputs, Some(".extended = true")).unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()));
+    assert_eq!(rows[0].outputs[0]["extended"], true);
+    assert!(rows[1].outputs.is_empty());
+    assert_eq!(rows[2].outputs[0]["added"], true);
 }
 
 #[test]

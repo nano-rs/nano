@@ -12,12 +12,15 @@
 //! `Authorization: Bearer <token>`. The source authenticates the token before
 //! any router claims the event.
 //!
-//! NAN-3806: ingest tokens decide the source, so a sender's `X-Source-Type`
-//! no longer routes. The platform's own pullers (collector integrations) post
-//! many types on one connection, so [`VectorIngestClient::from_env`] and
-//! [`VectorIngestClient::platform_token_from_env`] use the platform pull
-//! credential (`ingest_tokens::platform_pull_token`, derived from
-//! `VECTOR_AUTH_TOKEN`): the one credential whose declared type is kept.
+//! NAN-4907: source-bound ingest tokens decide the source, so a sender's
+//! `X-Source-Type` routes only for a multiplex credential. The platform's own
+//! senders post many types over one client, so they authenticate with the
+//! platform credential (`NANO_PLATFORM_INGEST_TOKEN`, a random secret only
+//! nano-api / nano-jobs hold, never derived from `VECTOR_AUTH_TOKEN`), which
+//! nano-api lists in Vector's tokens file as a multiplex credential. If Vector
+//! refuses it (401: no tokens file on this deployment, which then must opt into
+//! the static install-token fallback) the client retries once with the install
+//! token.
 
 use serde::Serialize;
 use thiserror::Error;
@@ -44,12 +47,13 @@ pub enum VectorIngestError {
 pub struct VectorIngestClient {
     http: reqwest::Client,
     ingest_url: String,
-    /// Bearer token for the Vector ingest source. `None` posts
+    /// Bearer tokens for the Vector ingest source, tried in order on a 401:
+    /// the platform pull credential, then the install token. Empty posts
     /// unauthenticated, which only succeeds against a Vector that is *also*
     /// tokenless **and** has explicitly opted into unauthenticated ingest
-    /// (`VECTOR_ALLOW_UNAUTHENTICATED_INGEST=true`); otherwise `auth_check`
-    /// fails closed and aborts the push (NAN-1351).
-    auth_token: Option<String>,
+    /// (`VECTOR_ALLOW_UNAUTHENTICATED_INGEST=true`); otherwise the source
+    /// refuses the push (NAN-1351).
+    auth_tokens: Vec<String>,
 }
 
 impl VectorIngestClient {
@@ -73,21 +77,40 @@ impl VectorIngestClient {
             ingest_url: ingest_url.into(),
             // Treat an empty token the same as unset so a blank env var doesn't
             // send `Authorization: Bearer ` (which Vector would reject).
-            auth_token: auth_token.filter(|t| !t.is_empty()),
+            auth_tokens: Self::bearer_candidates(
+                crate::ingest_tokens::secret_from_env(crate::ingest_tokens::PLATFORM_TOKEN_ENV),
+                auth_token,
+            ),
         }
     }
 
-    /// Build from the environment: `VECTOR_INGEST_URL` (default
-    /// `http://vector:8080/`) and the platform pull credential derived from
-    /// `VECTOR_AUTH_TOKEN` ([`Self::platform_token_from_env`]).
-    pub fn from_env() -> Self {
-        Self::new(Self::url_from_env(), Self::platform_token_from_env())
+    /// Replaces the platform credential (tests; production reads
+    /// `NANO_PLATFORM_INGEST_TOKEN`).
+    pub fn with_platform_token(mut self, platform: Option<String>, install: Option<String>) -> Self {
+        self.auth_tokens = Self::bearer_candidates(platform, install);
+        self
     }
 
-    /// The bearer a platform puller sends: the platform pull credential
-    /// (NAN-3806), `None` without an install token.
-    pub fn platform_token_from_env() -> Option<String> {
-        crate::ingest_tokens::platform_pull_token_from_env()
+    /// The bearers tried in order: the platform credential, then the install
+    /// token (accepted only where the deployment opted into the static
+    /// fallback, or in legacy multiplex mode).
+    fn bearer_candidates(platform: Option<String>, install: Option<String>) -> Vec<String> {
+        [platform, install]
+            .into_iter()
+            .flatten()
+            .filter(|t| !t.trim().is_empty())
+            .fold(Vec::with_capacity(2), |mut acc, t| {
+                if !acc.contains(&t) {
+                    acc.push(t);
+                }
+                acc
+            })
+    }
+
+    /// Build from the environment: `VECTOR_INGEST_URL` (default
+    /// `http://vector:8080/`) and `VECTOR_AUTH_TOKEN`.
+    pub fn from_env() -> Self {
+        Self::new(Self::url_from_env(), std::env::var("VECTOR_AUTH_TOKEN").ok())
     }
 
     pub fn url_from_env() -> String {
@@ -101,7 +124,7 @@ impl VectorIngestClient {
     /// unauthenticated pushes, so callers should check this before relying on
     /// the lane in a deployment where Vector enforces auth.
     pub fn is_configured(&self) -> bool {
-        self.auth_token.is_some()
+        !self.auth_tokens.is_empty()
     }
 
     /// POST a batch of pre-shaped records as NDJSON under `source_type`.
@@ -128,17 +151,28 @@ impl VectorIngestClient {
         if body.is_empty() {
             return Ok(());
         }
-        let mut req = self
-            .http
-            .post(&self.ingest_url)
-            .header("Content-Type", "application/x-ndjson")
-            .header("X-Source-Type", source_type)
-            .body(body);
-        if let Some(token) = &self.auth_token {
-            req = req.bearer_auth(token);
+        let request = |token: Option<&String>| {
+            let req = self
+                .http
+                .post(&self.ingest_url)
+                .header("Content-Type", "application/x-ndjson")
+                .header("X-Source-Type", source_type)
+                .body(body.clone());
+            match token {
+                Some(token) => req.bearer_auth(token),
+                None => req,
+            }
+        };
+        let mut tokens = self.auth_tokens.iter().peekable();
+        loop {
+            let token = tokens.next();
+            let response = request(token).send().await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && tokens.peek().is_some() {
+                continue;
+            }
+            response.error_for_status()?;
+            return Ok(());
         }
-        req.send().await?.error_for_status()?;
-        Ok(())
     }
 }
 
@@ -172,6 +206,17 @@ mod tests {
     fn to_ndjson_empty_is_empty_string() {
         let recs: Vec<serde_json::Value> = vec![];
         assert_eq!(to_ndjson(&recs).unwrap(), "");
+    }
+
+    #[test]
+    fn platform_credential_is_tried_before_the_install_token() {
+        let client = VectorIngestClient::new("http://vector:8080/", None)
+            .with_platform_token(Some("platform".into()), Some("install".into()));
+        assert_eq!(client.auth_tokens, vec!["platform".to_string(), "install".to_string()]);
+        // Never derived from the install token.
+        let client = VectorIngestClient::new("http://vector:8080/", None)
+            .with_platform_token(None, Some("install".into()));
+        assert_eq!(client.auth_tokens, vec!["install".to_string()]);
     }
 
     #[test]

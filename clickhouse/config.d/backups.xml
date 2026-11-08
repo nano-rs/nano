@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<!--
+  Native backup scratch disk (NAN-4989).
+
+  `scripts/nano backup` copies the completed archive into its encrypted bundle
+  and removes this scratch copy. Operators may configure another allowed disk
+  (for example an S3 disk) and select it with the clickhouse-disk option.
+-->
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <backups>
+                <type>local</type>
+                <path>/var/lib/clickhouse/backups/</path>
+            </backups>
+        </disks>
+    </storage_configuration>
+    <backups>
+        <allowed_disk>backups</allowed_disk>
+        <allowed_path>/var/lib/clickhouse/backups/</allowed_path>
+        <allow_concurrent_backups>false</allow_concurrent_backups>
+        <allow_concurrent_restores>false</allow_concurrent_restores>
+    </backups>
+</clickhouse>

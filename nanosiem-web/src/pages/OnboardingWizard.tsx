@@ -39,13 +39,8 @@ import {
   useSkipOnboardingStep,
   useDismissOnboarding,
   useSystemConfig,
-  useLogSources,
-  useTenantAiSettings,
-  useUserList,
 } from '@/hooks/use-api';
-import { useSharedTenant } from '@/hooks/use-shared-tenant';
 import { useRefetchOnFocus } from '@/hooks/use-refetch-on-focus';
-import { resolveHostedChecklistStatus } from '@/lib/onboarding-status';
 import { useTierContext } from '@/hooks/use-tier';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import type { Capabilities } from '@/hooks/use-capabilities';
@@ -117,18 +112,18 @@ const STEPS: SetupStep[] = [
     label: 'Log Source',
     icon: Activity,
     description: 'Connect your first log source to start ingesting data into nano.',
-    href: '/ingestion/log-sources/wizard',
+    href: '/ingestion/log-sources/new',
     doneHref: '/ingestion/log-sources',
     statusKey: 'has_log_sources',
-    doneLabel: 'Feed connected',
-    todoLabel: 'No feeds yet',
+    doneLabel: 'Source connected',
+    todoLabel: 'No sources yet',
   },
   {
     key: 'create_parser',
     label: 'Log Parser',
     icon: Code,
     description: 'Create a parser to normalize raw logs into the Unified Data Model for searching and detection.',
-    href: '/ingestion/log-sources/wizard',
+    href: '/ingestion/log-sources/new',
     doneHref: '/ingestion/log-sources/repositories',
     statusKey: 'has_parsers',
     doneLabel: 'Parser created',
@@ -155,35 +150,12 @@ const Eyebrow = ({ children }: { children: React.ReactNode }) => (
 export function OnboardingWizard() {
   const navigate = useNavigate();
   const { data: progress, loading: progressLoading, refetch: refetchProgress } = useOnboardingProgress();
-  const { data: probedStatus, refetch: refetchStatus } = useOnboardingStatus();
-  // NAN-3241 / NAN-4779: the hosted-shared status probe cannot see the tenant
-  // source registry, tenant AI guidance or pending invitations; fold in the
-  // tenant APIs the Log Sources, AI Guidance and Access Control pages read.
-  const isSharedTenant = useSharedTenant();
-  const { data: registrySources, refetch: refetchSources } = useLogSources({ skip: !isSharedTenant });
-  const { data: tenantAiSettings, refetch: refetchAiSettings } = useTenantAiSettings({ skip: !isSharedTenant });
-  const { data: tenantUsers, refetch: refetchUsers } = useUserList({ skip: !isSharedTenant });
-  const status = useMemo(
-    () =>
-      isSharedTenant
-        ? resolveHostedChecklistStatus(probedStatus, {
-            sources: registrySources,
-            orgContext: tenantAiSettings?.organizational_context,
-            users: tenantUsers?.users,
-          })
-        : probedStatus,
-    [isSharedTenant, probedStatus, registrySources, tenantAiSettings, tenantUsers],
-  );
-  // NAN-4779: steps are completed on other pages and often in another tab;
-  // re-probe whenever the user comes back to this one.
+  const { data: status, refetch: refetchStatus } = useOnboardingStatus();
+  // NAN-4779: steps are completed on other pages and often in another tab
+  // (Add data, Ingest tokens, Settings); re-probe whenever the user comes back.
   useRefetchOnFocus(() => {
     void refetchStatus();
     void refetchProgress();
-    if (isSharedTenant) {
-      void refetchSources();
-      void refetchAiSettings();
-      void refetchUsers();
-    }
   });
   const { data: systemConfig } = useSystemConfig();
   const { hasSso } = useTierContext();
@@ -217,11 +189,7 @@ export function OnboardingWizard() {
     () =>
       steps.map((s) => {
         const isLocked = s.key === 'sso_setup' && !hasSso;
-        // SSO "done" comes from the live probe only (NAN-3189): a provider
-        // can be disabled or retired after the step was persisted as
-        // complete, and a stale completion must not keep the green check.
-        const liveDone = status?.[s.statusKey] ?? false;
-        const isDone = s.key === 'sso_setup' ? liveDone : liveDone || completedSteps.includes(s.key);
+        const isDone = (status?.[s.statusKey] ?? false) || completedSteps.includes(s.key);
         const isSkipped = skippedSteps.includes(s.key);
         // A locked step counts as "satisfied" for progress purposes so the bar
         // can fill to 100% without forcing the user onto an unavailable tier.
@@ -426,7 +394,7 @@ export function OnboardingWizard() {
                   style={{ textWrap: 'pretty' }}
                 >
                   {isLocked
-                    ? 'SSO is included on every enterprise plan. Ask an administrator to enable the enterprise SSO service.'
+                    ? 'SSO is available on Pro and above. Upgrade to connect your identity provider.'
                     : step.description}
                 </p>
               </div>

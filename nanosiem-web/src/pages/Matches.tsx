@@ -44,16 +44,18 @@ export function Matches() {
   const { toast } = useToast();
   const { hasPermission } = useAuth();
   const canEdit = hasPermission('detections:edit');
+  const canManageLifecycle = hasPermission('detections:promote');
 
   const { data: apiRule, loading: ruleLoading, error: ruleError, refetch: refetchRule } = useDetection(id);
   const { data: matchesData, loading: matchesLoading } = useDetectionMatches(id, { limit: 100 });
   const { data: apiAlerts } = useAlerts({ rule_id: id });
   const { data: statsData } = useDetectionStats(28);
   const { data: todayCounts } = useTodayCounts();
-  const { mutate: pauseDetection } = usePauseDetection();
-  const { mutate: resumeDetection } = useResumeDetection();
-  const { mutate: promoteDetection } = usePromoteDetection();
-  const { mutate: demoteDetection } = useDemoteDetection();
+  const { mutate: pauseDetection, loading: pausing } = usePauseDetection();
+  const { mutate: resumeDetection, loading: resuming } = useResumeDetection();
+  const { mutate: promoteDetection, loading: promoting } = usePromoteDetection();
+  const { mutate: demoteDetection, loading: demoting } = useDemoteDetection();
+  const lifecyclePending = pausing || resuming || promoting || demoting;
 
   useDocumentTitle(apiRule ? `${apiRule.name} Matches` : 'Matches', [apiRule?.id]);
 
@@ -110,40 +112,39 @@ export function Matches() {
   }, [id, statsData, todayCounts]);
 
   const handleTogglePause = useCallback(async () => {
-    if (!apiRule) return;
+    if (!apiRule || !canManageLifecycle || lifecyclePending) return;
     try {
       if (apiRule.mode === 'paused') {
-        await resumeDetection(apiRule.id);
-        toast({ title: 'Rule resumed', description: 'Detection returned to live.' });
+        const updated = await resumeDetection({ id: apiRule.id, expectedMode: apiRule.mode });
+        toast({ title: 'Rule resumed', description: `Detection returned to ${updated.mode}.` });
       } else {
-        await pauseDetection(apiRule.id);
+        await pauseDetection({ id: apiRule.id, expectedMode: apiRule.mode });
         toast({ title: 'Rule paused' });
       }
       refetchRule();
     } catch {
       toast({ title: 'Error', description: 'Failed to update rule.', variant: 'destructive' });
     }
-  }, [apiRule, pauseDetection, resumeDetection, refetchRule, toast]);
+  }, [apiRule, canManageLifecycle, lifecyclePending, pauseDetection, resumeDetection, refetchRule, toast]);
 
   const handleToggleAlerting = useCallback(async () => {
-    if (!apiRule) return;
+    if (!apiRule || !canManageLifecycle || lifecyclePending || apiRule.mode === 'paused') return;
     try {
-      if (apiRule.mode === 'alerting') {
-        await demoteDetection(apiRule.id);
-        toast({ title: 'Alerting disabled', description: 'Rule demoted to live mode.' });
+      const updated = apiRule.mode === 'alerting'
+        ? await demoteDetection({ id: apiRule.id, expectedMode: apiRule.mode })
+        : await promoteDetection({ id: apiRule.id, expectedMode: apiRule.mode });
+      if (updated.mode === 'alerting') {
+        toast({ title: 'Rule mode: alerting', description: 'Alert generation is enabled.' });
+      } else if (updated.mode === 'live') {
+        toast({ title: 'Rule mode: live', description: 'Matches are recorded without generating alerts.' });
       } else {
-        // Promote is one lifecycle step: a staging rule goes live first
-        // (bound to its source), a live rule starts alerting.
-        const updated = await promoteDetection(apiRule.id);
-        toast(updated?.mode === 'alerting'
-          ? { title: 'Alerting enabled' }
-          : { title: `Promoted to ${updated?.mode ?? 'live'}`, description: 'Promote again to enable alerting.' });
+        toast({ title: `Rule mode: ${updated.mode}` });
       }
       refetchRule();
-    } catch (e: unknown) {
-      toast({ title: 'Error', description: e instanceof Error ? e.message : 'Failed to update rule mode.', variant: 'destructive' });
+    } catch {
+      toast({ title: 'Error', description: 'Failed to update rule mode.', variant: 'destructive' });
     }
-  }, [apiRule, promoteDetection, demoteDetection, refetchRule, toast]);
+  }, [apiRule, canManageLifecycle, lifecyclePending, promoteDetection, demoteDetection, refetchRule, toast]);
 
   const handleOpenInSearch = useCallback((view: MatchView) => {
     if (!apiRule) return;
@@ -203,6 +204,8 @@ export function Matches() {
           onTogglePause={handleTogglePause}
           onToggleAlerting={handleToggleAlerting}
           canEdit={canEdit}
+          canManageLifecycle={canManageLifecycle}
+          lifecyclePending={lifecyclePending}
         />
       </div>
 

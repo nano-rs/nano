@@ -12,12 +12,19 @@ use crate::log_sources::types::{
 
 impl LogSourceService {
     /// Publish the current working copy as a new active version, then deploy.
+    ///
+    /// `expected_updated_at` (NAN-4919 release review): when given, the
+    /// working copy must still be the one the caller reviewed. The version is
+    /// created from the row read here, so what is published is exactly what
+    /// was reviewed, or nothing (409).
     pub async fn publish(
         &self,
         id: Uuid,
         user_id: Option<Uuid>,
+        expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<DeploymentResult, LogSourceServiceError> {
         let ls = self.repository().find_by_id(id).await?;
+        ensure_unchanged(id, ls.updated_at, expected_updated_at)?;
 
         // Validate working copy VRL
         let validation = self.validate_vrl(&ls.parser_vrl).await;
@@ -30,6 +37,22 @@ impl LogSourceService {
                 validation_result: Some(validation),
                 deployment_id: None,
             });
+        }
+
+        // NAN-4919: a valid Nano Pipe plan may still use a step the
+        // deployment's Vector image cannot run (Combine needs reduce + lua).
+        // Refuse here, before a version is created, rather than at deploy.
+        if let Ok(Some(plan)) = crate::parsers::pipe::stored_plan(&ls.parser_vrl) {
+            if let Err(message) = crate::parsers::pipe::native::deployable(&plan) {
+                return Ok(DeploymentResult {
+                    success: false,
+                    log_source_id: id,
+                    action: "publish".to_string(),
+                    message,
+                    validation_result: Some(validation),
+                    deployment_id: None,
+                });
+            }
         }
 
         // NAN-874: when the extension is enabled and non-empty, validate it at the
@@ -57,20 +80,19 @@ impl LogSourceService {
             }
         }
 
-        // Create new active version from working copy
-        self.version_repository()
-            .create_version(
-                id,
-                &ls.parser_vrl,
-                ls.output_fields.as_ref(),
-                true,
-                user_id,
-                "publish",
-                None,
-                ls.extension_vrl.as_deref(),
-                ls.extension_enabled,
-            )
-            .await?;
+        // Create the active version from the working copy AT THE REVISION
+        // VALIDATED ABOVE, under the source row lock (NAN-4919): a save that
+        // landed during validation makes this a 409, never a stale publish.
+        if self
+            .version_repository()
+            .publish_revision(id, ls.updated_at, user_id)
+            .await?
+            .is_none()
+        {
+            return Err(LogSourceServiceError::RepositoryError(
+                crate::log_sources::LogSourceRepositoryError::StaleVersion(id),
+            ));
+        }
 
         // Prune old versions (keep 10)
         let _ = self.version_repository().prune_versions(id, 10).await;
@@ -146,39 +168,35 @@ impl LogSourceService {
         Ok(new_version)
     }
 
-    /// Discard draft: reset working copy to the active version's VRL
-    pub async fn discard_draft(&self, id: Uuid) -> Result<LogSource, LogSourceServiceError> {
-        let active = self
+    /// Discard draft: reset working copy to the active version's VRL.
+    /// `expected_updated_at` (NAN-4919): refuse (409) when the draft changed
+    /// since the caller looked at it; the reset itself is a CAS update.
+    pub async fn discard_draft(
+        &self,
+        id: Uuid,
+        expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<LogSource, LogSourceServiceError> {
+        // One transaction (NAN-4919): row lock, revision check, active-version
+        // read and the reset, so a concurrent publish cannot slip between them.
+        match self
             .version_repository()
-            .get_active_version(id)
+            .discard_to_active(id, expected_updated_at)
             .await?
-            .ok_or_else(|| {
-                LogSourceServiceError::DeploymentFailed(
+        {
+            crate::log_sources::DiscardOutcome::Discarded => {}
+            crate::log_sources::DiscardOutcome::Stale => {
+                return Err(LogSourceServiceError::RepositoryError(
+                    crate::log_sources::LogSourceRepositoryError::StaleVersion(id),
+                ))
+            }
+            crate::log_sources::DiscardOutcome::NoActiveVersion => {
+                return Err(LogSourceServiceError::DeploymentFailed(
                     "No active version to discard to".to_string(),
-                )
-            })?;
-
-        // Restore extension state too. None in the snapshot means "no extension on
-        // the active version" — use empty string to drive the repository COALESCE
-        // pattern that clears the column.
-        let extension_vrl_for_update = active.extension_vrl.clone().or_else(|| Some(String::new()));
-
-        let updated = self
-            .repository()
-            .update(
-                id,
-                &UpdateLogSource {
-                    parser_vrl: Some(active.parser_vrl),
-                    output_fields: active.output_fields,
-                    extension_vrl: extension_vrl_for_update,
-                    extension_enabled: Some(active.extension_enabled),
-                    ..Default::default()
-                },
-            )
-            .await?;
-
+                ))
+            }
+        }
         tracing::info!("Discarded draft for log source {}", id);
-        Ok(updated)
+        Ok(self.repository().find_by_id(id).await?)
     }
 
     /// Get version history for a log source
@@ -227,5 +245,19 @@ impl LogSourceService {
             active_version_number,
             active_parser_vrl,
         })
+    }
+}
+
+/// Refuse when a caller-observed `updated_at` no longer matches the row.
+fn ensure_unchanged(
+    id: Uuid,
+    actual: chrono::DateTime<chrono::Utc>,
+    expected: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), LogSourceServiceError> {
+    match expected {
+        Some(expected) if expected != actual => Err(LogSourceServiceError::RepositoryError(
+            crate::log_sources::LogSourceRepositoryError::StaleVersion(id),
+        )),
+        _ => Ok(()),
     }
 }

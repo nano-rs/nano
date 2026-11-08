@@ -48,6 +48,8 @@ pub enum LookupError {
     TableInUse(String),
     #[error("Lookup table is still referenced by related records")]
     ReferenceConflict,
+    #[error("Lookup table was modified concurrently: {0}")]
+    ConcurrentModification(String),
 }
 
 impl From<LookupRepositoryError> for LookupError {
@@ -55,6 +57,10 @@ impl From<LookupRepositoryError> for LookupError {
         match err {
             LookupRepositoryError::TableNotFound(n) => LookupError::TableNotFound(n),
             LookupRepositoryError::ReferenceConflict => LookupError::ReferenceConflict,
+            LookupRepositoryError::TableInUse(rules) => LookupError::TableInUse(rules),
+            LookupRepositoryError::ConcurrentModification(n) => {
+                LookupError::ConcurrentModification(n)
+            }
             LookupRepositoryError::TableAlreadyExists(n) => LookupError::TableAlreadyExists(n),
             LookupRepositoryError::InvalidTableName(n) => LookupError::InvalidTableName(n),
             LookupRepositoryError::InvalidColumnName(n) => LookupError::InvalidColumn(n),
@@ -247,23 +253,51 @@ impl LookupService {
             }
         }
 
+        let _mutation_lock = self.repository.lock_logical_table(&new_table.name).await?;
+        if self.repository.table_exists(&new_table.name).await? {
+            return Err(LookupError::TableAlreadyExists(new_table.name));
+        }
+
         // Generate the actual table name
         let actual_table_name = new_table.generate_table_name();
 
-        // Create the dynamic PostgreSQL table
         self.repository
+            .record_staged_generation(&new_table.name, &actual_table_name)
+            .await?;
+
+        // Create the dynamic PostgreSQL table
+        if let Err(error) = self
+            .repository
             .create_dynamic_table(
                 &actual_table_name,
                 &new_table.columns,
                 new_table.primary_key.as_deref(),
             )
-            .await?;
+            .await
+        {
+            let _ = self.repository.cleanup_generation(&actual_table_name).await;
+            return Err(error.into());
+        }
 
         // Register in the lookup tables registry
-        let table = self
+        let table = match self
             .repository
             .register_table(&new_table, &actual_table_name, created_by_user_id)
-            .await?;
+            .await
+        {
+            Ok(table) => table,
+            Err(error) => {
+                let _ = self.repository.cleanup_generation(&actual_table_name).await;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = self
+            .repository
+            .mark_generation_live(&actual_table_name)
+            .await
+        {
+            tracing::warn!(physical_name = %actual_table_name, %error, "live lookup generation remains in cleanup journal; reconciler will clear it safely");
+        }
 
         Ok(table)
     }
@@ -296,14 +330,18 @@ impl LookupService {
             return Err(LookupError::RowLimitExceeded(MAX_LOOKUP_TABLE_ROWS));
         }
 
+        let _mutation_lock = self.repository.lock_logical_table(&new_table.name).await?;
+
         // The table must already exist for a replace; keep its physical name.
         let existing = self.repository.get_table(&new_table.name).await?;
 
-        // Fresh, uniquely-named staging table. The live table is never touched
-        // until the swap. 42 + "_stg_" + 8 = 55 characters: inside Postgres'
-        // 63-byte identifier limit and the sovereign definer DDL name grammar
-        // `^lookup_[a-z0-9_]{1,48}$` (NAN-4712).
-        let base: String = existing.table_name.chars().take(42).collect();
+        // Fresh, uniquely-named staging table (bounded to Postgres' 63-byte
+        // identifier limit). The live table is never touched until the swap.
+        // The staging name BECOMES the physical name once the registry pointer
+        // switches (NAN-2875 review fix), so derive it from the logical name
+        // rather than the current physical one: repeated replaces must not keep
+        // stacking `_stg_` suffixes.
+        let base: String = new_table.generate_table_name().chars().take(48).collect();
         let staging = format!(
             "{}_stg_{}",
             base,
@@ -312,8 +350,16 @@ impl LookupService {
         let pk = new_table.primary_key.as_deref();
 
         self.repository
-            .create_dynamic_table(&staging, &new_table.columns, pk)
+            .record_staged_generation(&new_table.name, &staging)
             .await?;
+        if let Err(error) = self
+            .repository
+            .create_dynamic_table(&staging, &new_table.columns, pk)
+            .await
+        {
+            let _ = self.repository.cleanup_generation(&staging).await;
+            return Err(error.into());
+        }
 
         // The ClickHouse staging name is not yet in the registry. Its encoder
         // falls back to the first supplied column for key_raw, so put the
@@ -333,7 +379,7 @@ impl LookupService {
             Ok(n) => n,
             Err(e) => {
                 // Clean up staging; the live table + data are untouched.
-                let _ = self.repository.drop_dynamic_table(&staging).await;
+                let _ = self.repository.cleanup_generation(&staging).await;
                 return Err(e.into());
             }
         };
@@ -350,7 +396,7 @@ impl LookupService {
             )
             .await
         {
-            let _ = self.repository.drop_dynamic_table(&staging).await;
+            let _ = self.repository.cleanup_generation(&staging).await;
             return Err(e.into());
         }
 
@@ -362,16 +408,12 @@ impl LookupService {
     /// This removes both the registry entry and the actual PostgreSQL table.
     #[instrument(skip(self))]
     pub async fn drop_table(&self, name: &str) -> Result<(), LookupError> {
-        // Get the table to find the actual table name
+        let _mutation_lock = self.repository.lock_logical_table(name).await?;
         let table = self.repository.get_table(name).await?;
-        let rules = self.repository.find_rules_referencing(name).await?;
-        if !rules.is_empty() {
-            return Err(LookupError::TableInUse(
-                rules.iter().map(|rule| rule.name.as_str()).collect::<Vec<_>>().join(", "),
-            ));
-        }
+        // The reference check (parsed rule queries) and the registry delete run
+        // in one serialized transaction inside the store (NAN-2875 review fix);
+        // a referenced table comes back as `TableInUse`.
         self.repository.delete_table(&table).await?;
-
         Ok(())
     }
 
@@ -382,6 +424,7 @@ impl LookupService {
         table_name: &str,
         records: Vec<HashMap<String, serde_json::Value>>,
     ) -> Result<usize, LookupError> {
+        let _mutation_lock = self.repository.lock_logical_table(table_name).await?;
         let table = self.repository.get_table(table_name).await?;
 
         // Check row limit
@@ -424,6 +467,7 @@ impl LookupService {
         records: Vec<HashMap<String, serde_json::Value>>,
         idempotency_key: Uuid,
     ) -> Result<usize, LookupError> {
+        let _mutation_lock = self.repository.lock_logical_table(table_name).await?;
         let table = self.repository.get_table(table_name).await?;
         let (current_count, missing) = self
             .repository
@@ -461,6 +505,7 @@ impl LookupService {
         table_name: &str,
         records: Vec<HashMap<String, serde_json::Value>>,
     ) -> Result<usize, LookupError> {
+        let _mutation_lock = self.repository.lock_logical_table(table_name).await?;
         let table = self.repository.get_table(table_name).await?;
 
         // Check row limit
@@ -508,15 +553,11 @@ impl LookupService {
         page: i64,
         page_size: i64,
     ) -> Result<LookupRowsPage, LookupError> {
-        let table = self.repository.get_table(table_name).await?;
         let page_size = page_size.clamp(1, 100);
         let page = page.max(1);
         let offset = (page - 1) * page_size;
 
-        let (rows, total) = self
-            .repository
-            .list_rows(&table.table_name, page_size, offset)
-            .await?;
+        let (rows, total) = self.consistent_rows(table_name, page_size, offset).await?;
         let total_pages = if total == 0 {
             1
         } else {
@@ -549,6 +590,32 @@ impl LookupService {
         "lookup_table_name",
     ];
 
+    /// Read one physical generation, then verify that its registry pointer is
+    /// still current. Replace publishes the pointer before retiring the old
+    /// generation, so a reader that overlaps the switch retries against the
+    /// new snapshot instead of surfacing a transient missing table or row set.
+    async fn consistent_rows(
+        &self,
+        table_name: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<HashMap<String, serde_json::Value>>, i64), LookupError> {
+        const MAX_ATTEMPTS: usize = 32;
+        for _ in 0..MAX_ATTEMPTS {
+            let snapshot = self.repository.get_table(table_name).await?;
+            let read = self
+                .repository
+                .list_rows(&snapshot.table_name, &snapshot.columns, limit, offset)
+                .await;
+            let current = self.repository.get_table(table_name).await?;
+            if current.table_name != snapshot.table_name {
+                continue;
+            }
+            return Ok(read?);
+        }
+        Err(LookupError::ConcurrentModification(table_name.to_string()))
+    }
+
     /// Read EVERY live (deduped, non-tombstoned) row of a lookup table as
     /// user-column-only records — the full-table read backing
     /// `| inputlookup <internal_table>` (NAN-1581 Phase 5).
@@ -563,14 +630,9 @@ impl LookupService {
         &self,
         table_name: &str,
     ) -> Result<Vec<HashMap<String, serde_json::Value>>, LookupError> {
-        // Resolve the physical table name via the registry; surfaces
-        // TableNotFound for an unknown logical name.
-        let table = self.repository.get_table(table_name).await?;
-
-        // Single deduped read of the whole table (bounded). offset = 0.
+        // Single generation-consistent read of the whole table (bounded).
         let (mut rows, _total) = self
-            .repository
-            .list_rows(&table.table_name, MAX_LOOKUP_TABLE_ROWS, 0)
+            .consistent_rows(table_name, MAX_LOOKUP_TABLE_ROWS, 0)
             .await?;
 
         for row in &mut rows {
@@ -605,6 +667,7 @@ impl LookupService {
             return Ok(vec![]);
         }
 
+        let _mutation_lock = self.repository.lock_logical_table(table_name).await?;
         let table = self.repository.get_table(table_name).await?;
 
         // Check row limit once for the entire batch
@@ -650,6 +713,7 @@ impl LookupService {
         row_id: i64,
         record: HashMap<String, serde_json::Value>,
     ) -> Result<(), LookupError> {
+        let _mutation_lock = self.repository.lock_logical_table(table_name).await?;
         let table = self.repository.get_table(table_name).await?;
         self.repository
             .update_row(&table.table_name, row_id, &table.columns, &record)
@@ -675,6 +739,7 @@ impl LookupService {
     /// Delete a single row by _row_id
     #[instrument(skip(self))]
     pub async fn delete_row(&self, table_name: &str, row_id: i64) -> Result<(), LookupError> {
+        let _mutation_lock = self.repository.lock_logical_table(table_name).await?;
         let table = self.repository.get_table(table_name).await?;
         self.repository
             .delete_row(&table.table_name, row_id)
@@ -700,6 +765,7 @@ impl LookupService {
     /// Delete multiple rows by _row_id
     #[instrument(skip(self, row_ids))]
     pub async fn delete_rows(&self, table_name: &str, row_ids: &[i64]) -> Result<u64, LookupError> {
+        let _mutation_lock = self.repository.lock_logical_table(table_name).await?;
         let table = self.repository.get_table(table_name).await?;
         let deleted = self
             .repository
@@ -730,18 +796,33 @@ impl LookupService {
     /// Perform a single key lookup
     #[instrument(skip(self))]
     pub async fn lookup(&self, query: LookupQuery) -> Result<LookupResult, LookupError> {
-        let table = self.repository.get_table(&query.table_name).await?;
-
-        let result = self
-            .repository
-            .lookup(
-                &table.table_name,
-                &query.key_field,
-                &query.key_value,
-                query.output_fields.as_deref(),
-                query.case_insensitive,
-            )
-            .await?;
+        const MAX_ATTEMPTS: usize = 32;
+        let mut result = None;
+        let mut stable = false;
+        for _ in 0..MAX_ATTEMPTS {
+            let snapshot = self.repository.get_table(&query.table_name).await?;
+            let read = self
+                .repository
+                .lookup(
+                    &snapshot.table_name,
+                    &snapshot.columns,
+                    &query.key_field,
+                    &query.key_value,
+                    query.output_fields.as_deref(),
+                    query.case_insensitive,
+                )
+                .await;
+            let current = self.repository.get_table(&query.table_name).await?;
+            if current.table_name != snapshot.table_name {
+                continue;
+            }
+            result = read?;
+            stable = true;
+            break;
+        }
+        if !stable {
+            return Err(LookupError::ConcurrentModification(query.table_name));
+        }
 
         match result {
             Some(fields) => Ok(LookupResult::found(fields)),
@@ -755,32 +836,33 @@ impl LookupService {
         &self,
         query: BatchLookupQuery,
     ) -> Result<BatchLookupResult, LookupError> {
-        let table = self.repository.get_table(&query.table_name).await?;
-
-        // Use the table's primary key column for querying, falling back to the provided key_field
-        let lookup_key_field = table.primary_key.as_deref().unwrap_or(&query.key_field);
-
-        // NAN-4287: the tenant lookup store reads at most
-        // MAX_BATCH_LOOKUP_KEYS keys per batch and refuses more. A `| lookup`
-        // over a lake candidate set (up to 50k rows) routinely carries more
-        // distinct keys than that, and the refusal came back as a 503 on every
-        // run. Read the keys in bounded batches instead: at most
-        // ceil(keys / 10k) indexed reads, and the candidate set already
-        // bounds the key count.
-        let mut results = HashMap::new();
-        for keys in query.key_values.chunks(MAX_BATCH_LOOKUP_KEYS) {
-            results.extend(
-                self.repository
-                    .lookup_batch(
-                        &table.table_name,
-                        lookup_key_field,
-                        keys,
-                        query.output_fields.as_deref(),
-                        query.case_insensitive,
-                    )
-                    .await?,
-            );
+        const MAX_ATTEMPTS: usize = 32;
+        let mut results = None;
+        for _ in 0..MAX_ATTEMPTS {
+            let snapshot = self.repository.get_table(&query.table_name).await?;
+            // Use the snapshot's primary key so schema and physical generation
+            // always move together during Replace.
+            let lookup_key_field = snapshot.primary_key.as_deref().unwrap_or(&query.key_field);
+            let read = self
+                .repository
+                .lookup_batch(
+                    &snapshot.table_name,
+                    &snapshot.columns,
+                    lookup_key_field,
+                    &query.key_values,
+                    query.output_fields.as_deref(),
+                    query.case_insensitive,
+                )
+                .await;
+            let current = self.repository.get_table(&query.table_name).await?;
+            if current.table_name != snapshot.table_name {
+                continue;
+            }
+            results = Some(read?);
+            break;
         }
+        let results =
+            results.ok_or_else(|| LookupError::ConcurrentModification(query.table_name.clone()))?;
 
         let matched_count = results.len();
         let total_count = query.key_values.len();
@@ -1005,7 +1087,8 @@ mod tests {
         assert!(input_error_message("23502").is_some()); // not_null_violation
         assert!(input_error_message("54011").is_some()); // too_many_columns
         assert!(input_error_message("42804").is_some()); // datatype_mismatch (NAN-1361 F-4)
-                                                         // ...but the rest of class 42 stays a 500 (real bug, not bad input).
+
+        // ...but the rest of class 42 stays a 500 (real bug, not bad input).
         assert!(input_error_message("42601").is_none()); // syntax_error
         assert!(input_error_message("42P01").is_none()); // undefined_table
     }

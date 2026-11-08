@@ -1,66 +1,66 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Persisted provider policy; evaluated only against validated IdP membership.
+//! SSO admission policy (NAN-3904 / NAN-3908 / NAN-3935).
+//!
+//! Persisted per OIDC provider (`oidc_providers.access_policy`) and evaluated
+//! only against IdP membership that came from a validated ID token, a resolved
+//! Entra groups overage, or a delegated Google Directory lookup.
+//!
+//! The IdP-group -> local-group mappings themselves live in
+//! `oidc_group_mappings`; this policy carries only the admission switch and
+//! the provider-specific verification settings.
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Serialize, Deserialize, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SsoGroupMapping {
-    pub idp_group: String,
-    #[serde(default)]
-    pub group_ids: Vec<Uuid>,
-    #[serde(default)]
-    pub role_ids: Vec<Uuid>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, utoipa::ToSchema)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(default)]
 pub struct SsoAccessPolicy {
+    /// First-time SSO users are created only when the IdP asserts a mapped
+    /// group. `false` means invitation-only; it never opens JIT to everyone.
     pub mapped_groups_only: bool,
-    pub mappings: Vec<SsoGroupMapping>,
+    /// Microsoft Entra ID directory (tenant) id. Entra tokens carry no
+    /// `email_verified`; with this set, an email in an exact
+    /// `verified_domains` entry is trusted for account linking.
     pub entra_tenant_id: Option<Uuid>,
+    /// Exact lowercase domains the Entra tenant has verified.
     pub verified_domains: Vec<String>,
+    /// Google Workspace administrator the service account impersonates to
+    /// read group membership (Google ID tokens carry no groups claim).
     pub google_delegated_admin: Option<String>,
 }
+
 impl Default for SsoAccessPolicy {
     fn default() -> Self {
         Self {
             mapped_groups_only: true,
-            mappings: vec![],
             entra_tenant_id: None,
             verified_domains: vec![],
             google_delegated_admin: None,
         }
     }
 }
+
+/// Validate one IdP group name as a mapping key (exact match, no trimming).
+pub fn validate_idp_group(group: &str) -> Result<(), &'static str> {
+    if group.is_empty()
+        || group.len() > 512
+        || group.trim() != group
+        || group.chars().any(char::is_control)
+    {
+        return Err("Invalid SSO group mapping");
+    }
+    Ok(())
+}
+
 impl SsoAccessPolicy {
-    pub fn validate(&self, hosted: bool) -> Result<(), &'static str> {
-        if self.mappings.len() > 64
-            || self.verified_domains.len() > 64
-            || self.entra_tenant_id.is_some_and(|id| id.is_nil())
-        {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.verified_domains.len() > 64 || self.entra_tenant_id.is_some_and(|id| id.is_nil()) {
             return Err("Invalid SSO policy");
-        }
-        let mut seen = std::collections::HashSet::new();
-        for m in &self.mappings {
-            if m.idp_group.is_empty()
-                || m.idp_group.len() > 512
-                || m.idp_group.trim() != m.idp_group
-                || m.idp_group.chars().any(char::is_control)
-                || !seen.insert(&m.idp_group)
-                || m.group_ids.len() + m.role_ids.len() == 0
-                || m.group_ids.len() + m.role_ids.len() > 64
-                || m.group_ids.iter().chain(&m.role_ids).any(Uuid::is_nil)
-                || (hosted && !m.group_ids.is_empty())
-                || (!hosted && !m.role_ids.is_empty())
-            {
-                return Err("Invalid SSO group mapping");
-            }
         }
         for domain in &self.verified_domains {
             if domain.is_empty()
                 || domain.len() > 253
                 || domain != &domain.to_ascii_lowercase()
+                || domain.split('.').count() < 2
                 || domain.split('.').any(|p| {
                     p.is_empty()
                         || p.len() > 63
@@ -80,23 +80,27 @@ impl SsoAccessPolicy {
                 || v.split('@').count() != 2
                 || v.starts_with('@')
                 || v.ends_with('@')
-                || v.chars().any(char::is_control)
+                || v.chars().any(|c| c.is_control() || c.is_whitespace())
         }) {
             return Err("Invalid delegated administrator");
         }
         Ok(())
     }
-    pub fn matching<'a>(&'a self, groups: &[String]) -> Vec<&'a SsoGroupMapping> {
-        self.mappings
-            .iter()
-            .filter(|m| groups.contains(&m.idp_group))
-            .collect()
+
+    /// Admission decision for one sign-in.
+    ///
+    /// * `invited` — the account already exists and was not created by SSO
+    ///   JIT (local, invited, or pre-dating group admission): always admitted.
+    /// * otherwise the IdP must assert at least one mapped group, membership
+    ///   must be known (no unresolved Entra overage, Google lookup configured),
+    ///   and the provider must be in mapped-group mode.
+    pub fn admits(&self, mapped_groups_asserted: bool, invited: bool, membership_known: bool) -> bool {
+        invited || (self.mapped_groups_only && membership_known && mapped_groups_asserted)
     }
-    /// Turning the gate off keeps invitation-only access; it never opens JIT to everyone.
-    pub fn allows(&self, groups: &[String], invited: bool, membership_known: bool) -> bool {
-        invited
-            || (self.mapped_groups_only && membership_known && !self.matching(groups).is_empty())
-    }
+
+    /// Whether the IdP verified this email, for linking onto an existing
+    /// local account or creating a new one. Only called after signature,
+    /// exact issuer, audience and nonce validation.
     pub fn verifies_email(&self, claims: &super::IdTokenClaims) -> bool {
         if claims.verified_email() {
             return true;
@@ -115,88 +119,5 @@ impl SsoAccessPolicy {
                         .iter()
                         .any(|domain| domain.eq_ignore_ascii_case(parts[1]))
             })
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn policy() -> SsoAccessPolicy {
-        SsoAccessPolicy {
-            mappings: vec![SsoGroupMapping {
-                idp_group: "allowed".into(),
-                group_ids: vec![Uuid::new_v4()],
-                role_ids: vec![],
-            }],
-            ..Default::default()
-        }
-    }
-    #[test]
-    fn admission_is_exact_and_invites_survive() {
-        let mut p = policy();
-        assert!(p.allows(&["allowed".into()], false, true));
-        assert!(!p.allows(&["Allowed".into()], false, true));
-        assert!(!p.allows(&["allowed".into()], false, false));
-        assert!(p.allows(&[], true, false));
-        assert!(!SsoAccessPolicy::default().allows(&[], false, true));
-        p.mapped_groups_only = false;
-        assert!(!p.allows(&["allowed".into()], false, true));
-    }
-    #[test]
-    fn provider_parity_admission_and_lookup_failure() {
-        for (issuer, idp_group) in [
-            ("https://example.okta.com", "nano-analysts"),
-            (
-                "https://login.microsoftonline.com/11111111-1111-4111-8111-111111111111/v2.0",
-                "22222222-2222-4222-8222-222222222222",
-            ),
-            ("https://accounts.google.com", "analysts@example.test"),
-        ] {
-            let mut policy = policy();
-            policy.mappings[0].idp_group = idp_group.into();
-            for (scenario, groups, invited, known, expected) in [
-                ("mapped new user", vec![idp_group.into()], false, true, true),
-                ("outsider", vec!["outsider".into()], false, true, false),
-                ("invited member", vec![], true, true, true),
-                ("removal", vec![], false, true, false),
-                (
-                    "lookup failure",
-                    vec![idp_group.into()],
-                    false,
-                    false,
-                    false,
-                ),
-            ] {
-                assert_eq!(
-                    policy.allows(&groups, invited, known),
-                    expected,
-                    "{issuer}: {scenario}"
-                );
-            }
-            policy.mapped_groups_only = false;
-            assert!(!policy.allows(&[idp_group.into()], false, true));
-        }
-    }
-    #[test]
-    fn tenant_roles_and_dedicated_groups_are_distinct() {
-        assert!(policy().validate(true).is_err());
-        assert!(policy().validate(false).is_ok());
-    }
-    #[test]
-    fn domain_fallback_requires_exact_tenant_and_domain() {
-        let mut p = SsoAccessPolicy::default();
-        let tid = Uuid::new_v4();
-        p.entra_tenant_id = Some(tid);
-        p.verified_domains = vec!["example.com".into()];
-        let mut c: super::super::IdTokenClaims = serde_json::from_value(serde_json::json!({
-            "iss":format!("https://login.microsoftonline.com/{tid}/v2.0"),"tid":tid,
-            "sub":"subject","aud":"client","iat":1,"exp":2,"email":"user@example.com"
-        }))
-        .unwrap();
-        assert!(p.verifies_email(&c));
-        c.email = Some("user@evil.example.com".into());
-        assert!(!p.verifies_email(&c));
-        c.email = Some("user@example.com".into());
-        c.tid = Some(Uuid::new_v4().to_string());
-        assert!(!p.verifies_email(&c));
     }
 }

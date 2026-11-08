@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 //! Profile-driven event generators
 //!
 //! Each generator produces events that match the real format

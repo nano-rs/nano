@@ -55,7 +55,13 @@
         <query>GRANT SELECT(type, query_kind, event_time, tables) ON system.query_log</query>
         <query>GRANT SELECT(event_type, event_time, database, table) ON system.part_log</query>
         <query>GRANT SELECT(name, value, last_error_time) ON system.errors</query>
-        <query>GRANT SELECT(database, name, status, last_exception) ON system.dictionaries</query>
+        <!-- NAN-4957: + type, element_count, bytes_allocated for the SIEM Health
+             dictionary-memory probe (resident dictionaries vs the server limit). -->
+        <query>GRANT SELECT(database, name, status, last_exception, type, element_count, bytes_allocated) ON system.dictionaries</query>
+        <!-- NAN-4957: getServerSetting('max_server_memory_usage') (it checks this
+             grant) — the effective server memory limit sizes the per-search
+             memory ceiling (40%) and the SIEM Health dictionary-memory share. -->
+        <query>GRANT SELECT(name, value) ON system.server_settings</query>
         <!-- NAN-1437: system.dictionaries rows are filtered by SHOW DICTIONARIES
              visibility, and only the GLOBAL scope works (db-scoped showed 0 rows
              on CH 26.4) — without this the FAILED-dict probe above runs without
@@ -68,8 +74,12 @@
              staleness surfaces. Column-scoped. -->
         <!-- NAN-1629: status + next_refresh_time are used in the probe's WHERE
              (status='Disabled', next_refresh_time < now()-1h); without them the
-             column-scoped grant rejects the whole read (ACCESS_DENIED). -->
-        <query>GRANT SELECT(database, view, exception, retry, last_success_time, status, next_refresh_time) ON system.view_refreshes</query>
+             column-scoped grant rejects the whole read (ACCESS_DENIED).
+             NAN-5002: last_refresh_time lets an admin-initiated
+             clusterAllReplicas probe distinguish failures after its trigger;
+             remote_servers deliberately authenticate as this narrow runtime
+             identity, so the remote half also needs that one column. -->
+        <query>GRANT SELECT(database, view, exception, retry, last_success_time, last_refresh_time, status, next_refresh_time) ON system.view_refreshes</query>
         <!-- NAN-1435: search cancel (KILL QUERY WHERE query_id IN …) and the
              query-progress endpoint read system.processes. Table-level on
              purpose: ClickHouse's KILL rejects column-scoped SELECT on
@@ -81,6 +91,47 @@
         <query>GRANT SELECT ON nanosiem.cluster_processes</query>
       </grants>
     </nanosiem>
+
+    <!-- NAN-4988: Vector's dedicated write-only ingest identity. There is no
+         wildcard grant, no migration/journal access, and no SELECT on either
+         stored log table or the OCSF raw landing table. The admin-owned UDM
+         and OCSF DEFINER views cross that boundary; SELECT remains only on
+         the other ENGINE=Null lanes whose existing MVs require invoker reads. -->
+    <nanosiem_vector>
+      <profile>ingestion</profile>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+      <password from_env="CLICKHOUSE_VECTOR_PASSWORD"/>
+      <quota>default</quota>
+      <access_management>0</access_management>
+      <allow_ddl>0</allow_ddl>
+      <grants>
+        <query>GRANT INSERT ON nanosiem.logs_ingest</query>
+        <query>GRANT INSERT ON nanosiem.ocsf_logs_raw</query>
+        <query>GRANT INSERT ON nanosiem.parser_health_ingest</query>
+        <query>GRANT INSERT ON nanosiem.ip_enrichments</query>
+        <query>GRANT INSERT ON nanosiem.user_registry</query>
+        <query>GRANT INSERT ON nanosiem.otel_spans_raw</query>
+        <query>GRANT INSERT ON nanosiem.otel_metrics_raw</query>
+        <query>GRANT INSERT ON nanosiem.collector_errors</query>
+        <query>GRANT INSERT ON nanosiem.ingestion_errors</query>
+        <query>GRANT SELECT ON nanosiem.parser_health_ingest</query>
+        <query>GRANT SELECT ON nanosiem.otel_spans_raw</query>
+        <query>GRANT SELECT ON nanosiem.otel_metrics_raw</query>
+        <query>GRANT dictGet ON nanosiem.custom_enrichment_dict</query>
+        <query>GRANT dictGet ON nanosiem.custom_ioc_enrichment_dict</query>
+        <query>GRANT dictGet ON nanosiem.domain_prevalence_dict</query>
+        <query>GRANT dictGet ON nanosiem.hash_prevalence_dict</query>
+        <query>GRANT dictGet ON nanosiem.ioc_enrichment_dict</query>
+        <!-- NAN-4957: the UDM landing schema uses the split IP geo pair.
+             Never grant the retired monolithic trie to Vector. -->
+        <query>GRANT dictGet ON nanosiem.ip_geo_trie_dict</query>
+        <query>GRANT dictGet ON nanosiem.ip_geo_attrs_dict</query>
+        <query>GRANT dictGet ON nanosiem.ip_prevalence_dict</query>
+        <query>GRANT dictGet ON nanosiem.user_registry_dict</query>
+      </grants>
+    </nanosiem_vector>
 
     <!--
       NAN-1384 (G18): INSERT-only credential for DIRECT OCSF writers (Tenzir /
@@ -103,7 +154,7 @@
           so table-level SELECT exposes no data; it only satisfies the MV
           chain's insert-time grant check.
         * INSERT on ocsf_logs — the ocsf_logs_raw_mv writes the derived row there.
-        * dictGet on the 6 dictionaries its MATERIALIZED enrichment/prevalence
+        * dictGet on the 7 dictionaries its MATERIALIZED enrichment/prevalence
           columns call at insert time (insert fails ACCESS_DENIED otherwise —
           verified on CH 26.4).
         * column-scoped SELECT on ocsf_logs for the columns the OCSF prevalence
@@ -116,7 +167,7 @@
       Contract: docs/user-guide/direct-ocsf-ingestion.md.
     -->
     <nanosiem_ingest>
-      <profile>default</profile>
+      <profile>ingestion</profile>
       <networks>
         <ip>::/0</ip>
       </networks>
@@ -155,7 +206,14 @@
         <query>GRANT dictGet ON nanosiem.domain_prevalence_dict</query>
         <query>GRANT dictGet ON nanosiem.hash_prevalence_dict</query>
         <query>GRANT dictGet ON nanosiem.ioc_enrichment_dict</query>
-        <query>GRANT dictGet ON nanosiem.ip_enrichment_dict</query>
+        <!-- NAN-4982 (migration 188): the OCSF view stamps custom_ioc_* (IOC
+             lists, user IOC enrichments) from this dictionary. -->
+        <query>GRANT dictGet ON nanosiem.custom_ioc_enrichment_dict</query>
+        <!-- NAN-4957 (migration 185): the OCSF geo columns look up the split
+             trie + attrs pair. No dictGet on the retired ip_enrichment_dict:
+             a direct writer could otherwise lazy-load its 1.32 GiB trie. -->
+        <query>GRANT dictGet ON nanosiem.ip_geo_trie_dict</query>
+        <query>GRANT dictGet ON nanosiem.ip_geo_attrs_dict</query>
         <query>GRANT dictGet ON nanosiem.ip_prevalence_dict</query>
         <!-- NAN-1787: same chained-MV class as NAN-1400. An ocsf_logs insert fires
              the OCSF prevalence MVs (ocsf_*_prevalence_summary_*_mv) which write
@@ -169,6 +227,14 @@
         <query>GRANT SELECT ON nanosiem.ip_prevalence_agg</query>
         <query>GRANT SELECT ON nanosiem.hash_prevalence_agg</query>
         <query>GRANT SELECT ON nanosiem.domain_prevalence_agg</query>
+        <!-- NAN-4982: same chained-MV class, one level further. Migration 170's
+             *_prevalence_source_ocsf_mv write INTO *_prevalence_source_agg, whose
+             *_prevalence_source_summary_mv SELECT runs under the inserting user.
+             Without these, every direct OCSF write carrying an IP / hash / domain
+             failed 497 (found while proving IOC stamping through nanosiem_ingest). -->
+        <query>GRANT SELECT ON nanosiem.ip_prevalence_source_agg</query>
+        <query>GRANT SELECT ON nanosiem.hash_prevalence_source_agg</query>
+        <query>GRANT SELECT ON nanosiem.domain_prevalence_source_agg</query>
       </grants>
     </nanosiem_ingest>
 

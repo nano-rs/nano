@@ -23,6 +23,12 @@ impl FileParser {
             .delimiter(config.csv_delimiter as u8)
             .has_headers(config.csv_has_headers)
             .flexible(true); // Allow variable number of fields
+        // A feed that opens with `#` comments (NAN-2878 follow-up) has them
+        // skipped throughout, matching header detection. Files that do not
+        // start with a comment keep `#` as ordinary data.
+        if Self::starts_with_comment(text) {
+            reader_builder.comment(Some(Self::COMMENT_PREFIX as u8));
+        }
 
         let mut reader = reader_builder.from_reader(text.as_bytes());
 
@@ -76,8 +82,11 @@ impl FileParser {
                     // column-shifted records that poison lookup/enrichment
                     // data downstream (NAN-1363).
                     if record.len() != headers.len() {
-                        let msg =
-                            format!("expected {} fields, found {}", headers.len(), record.len());
+                        let msg = format!(
+                            "expected {} fields, found {}",
+                            headers.len(),
+                            record.len()
+                        );
                         if config.skip_invalid {
                             result.add_error(RecordError::new(line_number, msg));
                         } else {

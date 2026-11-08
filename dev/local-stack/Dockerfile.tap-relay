@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.7
+# nano local stack: the Nano Pipe live-tap relay (NAN-4919 / NAN-4945).
+#
+# `nanosiem-api --vector-tap-relay` from THIS checkout, for
+# dev/local-stack/docker-compose.local.yml's `vector-tap` service (the public
+# nano-api image predates the relay). A debug, open-edition build of the one
+# binary: the relay needs nothing else. BuildKit cache mounts keep the cargo
+# registry and target dir between builds, so a rebuild after a pull is
+# incremental. Not a release image; never published.
+FROM rust:1.95-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config mold \
+    && rm -rf /var/lib/apt/lists/*
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold" CARGO_INCREMENTAL=1
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,id=nanoch-tap-relay-cargo,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=nanoch-tap-relay-target,target=/src/target \
+    cargo build -p nanosiem-api --bin nanosiem-api \
+    && cp target/debug/nanosiem-api /nanosiem-api
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /nanosiem-api /usr/local/bin/nanosiem-api
+USER 65534:65534
+ENTRYPOINT []
+CMD ["nanosiem-api", "--vector-tap-relay"]

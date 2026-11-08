@@ -5,41 +5,34 @@
 //! The auth middleware NEVER read the `users` row after validating a JWT — it
 //! trusted the token until natural expiry (default 900s). A disabled user (or a
 //! user whose password was changed) therefore kept a working access token for up
-//! to that window. This resolver gives the middleware a cheap, short-TTL view of
+//! to that window. This resolver gives the middleware a cheap current view of
 //! each user's `status` + `tokens_valid_from` watermark so it can reject:
 //!
 //! - any principal whose account is no longer `active` (disabled / locked /
 //!   deleted), and
 //! - any access token issued BEFORE a forced-revocation watermark
-//!   (`users.tokens_valid_from`, stamped on disable, password change, and bulk
-//!   session revocation/logout).
+//!   (`users.tokens_valid_from`, stamped on disable + password change).
 //!
 //! FAIL-CLOSED: on a PostgreSQL error the resolver returns
 //! [`UserStatusError::Unavailable`] — it NEVER falls through as "active" and
 //! NEVER caches an error-path value. The caller (middleware) turns that into a
-//! 503, mirroring `SourceScopeResolver`'s fail-closed posture. Cross-process
-//! staleness is bounded by [`CACHE_TTL_SECS`] (far better than the 900s token
-//! TTL), which is the accepted trade-off — no cross-process version counter.
+//! 503, mirroring `SourceScopeResolver`'s fail-closed posture.
 //!
-//! Structurally mirrors [`super::permission_cache::PermissionResolver`] (PgPool +
-//! short-TTL `DashMap`) but, like the source-scope resolver, INVERTS its
-//! failure behaviour: permission resolution caches an empty set on error
-//! (safe for an ADD-only permission model); a status gate must never cache a
-//! stale "active".
-
-use crate::request_timing::RequestDb;
-use std::sync::Arc;
-use std::time::Instant;
+//! NAN-3904: the row is read on EVERY request (one primary-key lookup) rather
+//! than cached for 30s. A forced revocation — disable, password change, or an
+//! SSO group shrink that stamps `tokens_valid_from` and bumps
+//! `authz_generation` — therefore takes effect on the next request on every
+//! replica, with no cross-process staleness window.
+//!
+//! Like the source-scope resolver it INVERTS the permission resolver's failure
+//! behaviour: permission resolution caches an empty set on error (safe for an
+//! ADD-only permission model); a status gate must never answer a stale
+//! "active".
 
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Short TTL for cached status snapshots. Bounds how long a just-disabled user's
-/// still-unexpired access token can keep working on a replica whose cache has
-/// not yet expired. Kept small so revocation is near-immediate.
-const CACHE_TTL_SECS: u64 = 30;
 
 /// Errors from user-status resolution.
 #[derive(Debug, thiserror::Error)]
@@ -59,10 +52,8 @@ pub struct UserStatusSnapshot {
     /// `users.tokens_valid_from` — forced-revocation watermark. `None` means no
     /// forced revocation has ever happened for this user.
     pub tokens_valid_from: Option<DateTime<Utc>>,
-    /// NAN-4152: the account is a shared demo identity
-    /// (`demo-<session>@demo.nano.local`), so the demo guard applies to it
-    /// whatever roles it holds.
-    pub demo_identity: bool,
+    /// `users.authz_generation` at read time (NAN-3904).
+    pub authz_generation: Option<i64>,
 }
 
 impl UserStatusSnapshot {
@@ -77,107 +68,66 @@ impl UserStatusSnapshot {
     /// revoked (back-compat for users who were never disabled).
     pub fn token_predates_revocation(&self, iat: i64) -> bool {
         match self.tokens_valid_from {
-            // JWT iat has whole-second precision while PostgreSQL retains
-            // sub-seconds. Revoke the entire watermark second.
-            Some(watermark) => iat <= watermark.timestamp(),
+            Some(watermark) => iat < watermark.timestamp(),
             None => false,
         }
     }
 }
 
-struct Cached {
-    snapshot: UserStatusSnapshot,
-    cached_at: Instant,
-}
 
-/// Cached, fail-closed resolver of per-user status + revocation watermark.
+/// Fail-closed resolver of per-user status + revocation watermark.
 ///
-/// Cheap to clone (Arc-backed) so it can live in `AuthState`.
+/// Cheap to clone so it can live in `AuthState`.
 #[derive(Clone)]
 pub struct UserStatusResolver {
     pool: PgPool,
-    cache: Arc<DashMap<Uuid, Cached>>,
 }
 
 impl UserStatusResolver {
     pub fn new(pool: PgPool) -> Self {
-        Self {
-            pool,
-            cache: Arc::new(DashMap::new()),
-        }
+        Self { pool }
     }
 
-    /// Resolve the [`UserStatusSnapshot`] for a user, serving a cached copy
-    /// within [`CACHE_TTL_SECS`].
+    /// Resolve the current [`UserStatusSnapshot`] for a user (read on every
+    /// call, NAN-3904).
     ///
     /// FAIL-CLOSED: on a PostgreSQL error this returns
-    /// [`UserStatusError::Unavailable`] (caller → 503) and caches nothing. A
-    /// missing user row is a definitive, cacheable "not active".
+    /// [`UserStatusError::Unavailable`] (caller → 503). A missing user row is a
+    /// definitive "not active".
     pub async fn resolve(&self, user_id: Uuid) -> Result<UserStatusSnapshot, UserStatusError> {
-        if let Some(cached) = self.cache.get(&user_id) {
-            if cached.cached_at.elapsed().as_secs() < CACHE_TTL_SECS {
-                return Ok(cached.snapshot.clone());
-            }
-        }
-
-        match sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool)>(
-            "SELECT status, tokens_valid_from,
-                    COALESCE(lower(email) LIKE 'demo-%@demo.nano.local', FALSE) FROM users WHERE id = $1",
+        // NAN-3904: read on every request — see the module docs.
+        match sqlx::query_as::<_, (String, Option<DateTime<Utc>>, i64)>(
+            "SELECT status, tokens_valid_from, authz_generation FROM users WHERE id = $1",
         )
         .bind(user_id)
-        .fetch_optional(&self.pool).request_db()
+        .fetch_optional(&self.pool)
         .await
         {
-            Ok(Some((status, tokens_valid_from, demo_identity))) => {
+            Ok(Some((status, tokens_valid_from, authz_generation))) => {
                 let snapshot = UserStatusSnapshot {
                     status,
                     tokens_valid_from,
-                    demo_identity,
+                    authz_generation: Some(authz_generation),
                 };
-                self.cache.insert(
-                    user_id,
-                    Cached {
-                        snapshot: snapshot.clone(),
-                        cached_at: Instant::now(),
-                    },
-                );
                 Ok(snapshot)
             }
             // Deleted/unknown user holding a still-valid token: definitively not
-            // active. Safe (and cheap) to cache.
+            // active.
             Ok(None) => {
                 let snapshot = UserStatusSnapshot {
                     status: String::new(),
                     tokens_valid_from: None,
-                    demo_identity: false,
+                    authz_generation: None,
                 };
-                self.cache.insert(
-                    user_id,
-                    Cached {
-                        snapshot: snapshot.clone(),
-                        cached_at: Instant::now(),
-                    },
-                );
                 Ok(snapshot)
             }
-            // F-32: FAIL CLOSED — never treat an unreadable status as active,
-            // never cache the error. The middleware turns this into a 503.
+            // F-32: FAIL CLOSED — never treat an unreadable status as active.
+            // The middleware turns this into a 503.
             Err(e) => {
                 tracing::error!(user_id = %user_id, error = %e, "user-status lookup failed — failing closed");
                 Err(UserStatusError::Unavailable)
             }
         }
-    }
-
-    /// Drop a single user's cached snapshot (e.g. right after disabling them, to
-    /// make revocation immediate in this process rather than TTL-bounded).
-    pub fn invalidate_user(&self, user_id: Uuid) {
-        self.cache.remove(&user_id);
-    }
-
-    /// Drop all cached snapshots.
-    pub fn invalidate_all(&self) {
-        self.cache.clear();
     }
 }
 
@@ -189,7 +139,7 @@ mod tests {
         UserStatusSnapshot {
             status: status.to_string(),
             tokens_valid_from: tvf,
-            demo_identity: false,
+            authz_generation: None,
         }
     }
 
@@ -208,8 +158,8 @@ mod tests {
         let s = snap("active", Some(watermark));
         // Issued before the watermark → revoked.
         assert!(s.token_predates_revocation(999));
-        // Issued in the same second is also revoked; only a later second passes.
-        assert!(s.token_predates_revocation(1_000));
+        // Issued exactly at / after the watermark → still valid.
+        assert!(!s.token_predates_revocation(1_000));
         assert!(!s.token_predates_revocation(1_001));
     }
 

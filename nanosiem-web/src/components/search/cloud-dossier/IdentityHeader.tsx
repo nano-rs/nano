@@ -2,6 +2,7 @@
 
 import { Search as SearchIcon, User as UserIcon, Shield, AlertTriangle } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { RiskSheetLauncher } from '@/enterprise/components/risk/RiskSheetLauncher';
 import type { CloudDossierIdentity, CloudDossierRisk } from '@/lib/api/types';
 import {
@@ -32,6 +33,7 @@ export function IdentityHeader({
   onPivotIp,
   onPivotAssumedRole,
 }: IdentityHeaderProps) {
+  const srcIpField = useSchemaFieldMap().field('srcIp');
   const tone = cloudSevTone(risk.band);
   const isRole = identity.principal_type === 'role';
   const assumedRolesLabel = identity.assumed_roles.length
@@ -119,7 +121,7 @@ export function IdentityHeader({
                           key={ip.ip}
                           onClick={() => onPivotIp(ip.ip)}
                           className="font-mono text-[11.5px] hover:text-primary hover:underline tabular-nums"
-                          title={`Filter by src_ip=${ip.ip}`}
+                          title={`Filter by ${srcIpField}=${ip.ip}`}
                         >
                           {ip.ip}
                         </button>

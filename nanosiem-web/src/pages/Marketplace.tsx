@@ -1,319 +1,202 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { lazyWithRetry } from '@/lib/lazyWithRetry';
-
 /**
- * NAN-571 — Marketplace top-level page (Phase 1 of [NAN-570](https://linear.app/nanos-sh/issue/NAN-570)).
+ * Marketplace (NAN-4946): main's redone inventory Marketplace, the one
+ * marketplace for single-tenant open and enterprise installs.
  *
- * Source of truth: design-ref/ui_kits/search/marketplace.html (design system 13).
- * Eyebrow + 20px H1 + meta line; flat 4-tile stats strip; mono-monogram cards
- * with state badges; compact repository-source menu in the
- * filter bar; section grouping (Popular/Security/Cloud);
- * 4-tab drawer (About/Config/Code/Permissions) preserves all existing actions
- * (Sync Now, Export, Disable toggle, Edit-in-wizard, etc.).
+ * Main rendered this inventory only for hosted-shared tenants, projected by
+ * `/api/marketplace/items` from hosted entitlement tables. Here the same UX is
+ * re-backed on this deployment's dedicated APIs:
  *
- * `security` 4th category, coverage hero, and "preview output" land in Phases 2-4.
- * Custom-enrichment wizard at /enrichments/custom/* is intentionally untouched.
+ * - catalog + repositories: `/api/marketplace/catalog`, `/api/marketplace/repos`
+ * - custom providers: `/api/custom-enrichments` (enterprise capability)
+ * - pull collectors: connector specs + feeds (`/api/connector-specs`,
+ *   `/api/connector-feeds`, NAN-4914), including identity directory feeds
+ * - cloud pull: source configurations, deep-linking to Log Sources → Cloud pull
+ * - threat-intel lookup providers: `/api/threat-intel/*` (enterprise, NAN-4931)
+ * - coverage: `/api/marketplace/coverage`
+ *
+ * Hosted entitlements (included/premium, purchase, checkout) have no
+ * single-tenant meaning; what an item can run on comes from
+ * `/api/capabilities`, never from a hosted/shared flag.
  */
-
-import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { lazyWithRetry } from '@/lib/lazyWithRetry';
+import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { DatabaseZap, Package, Plus, TableProperties } from 'lucide-react';
-import { LoadingIcon } from '@/components/icons/LoadingIcon';
+import { ArrowDownToLine, Bot, Box, Cloud, KeyRound, Package, Plus, Users } from 'lucide-react';
+import { api } from '@/lib/api';
+import { useAuth } from '@/contexts/AuthContext';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
-import { useCapabilities } from '@/hooks/use-capabilities';
-import { useAuth } from '@/contexts/AuthContext';
-import { Button } from '@/components/ui/button';
-import { api } from '@/lib/api';
-import type {
-  CatalogStats,
-  EnrichmentMarketplaceRepo,
-  MarketplaceCatalogEntry,
-} from '@/lib/api/marketplace';
 import { useToast } from '@/hooks/use-toast';
-import { IntegrationCard } from '@/components/marketplace/IntegrationCard';
-import {
-  MarketplaceDrawer,
-  type MarketplaceDrawerTab,
-} from '@/components/marketplace/MarketplaceDrawer';
-import { InstallDialog } from '@/components/marketplace/InstallDialog';
+import { Button } from '@/components/ui/button';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
+import type { MarketplaceCatalogEntry } from '@/lib/api/marketplace';
 import { CoverageHero } from '@/components/marketplace/CoverageHero';
-import { PlatformFeedsCard } from '@/components/marketplace/PlatformFeedsCard';
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu';
+import { InstallDialog } from '@/components/marketplace/InstallDialog';
+import { MarketplacePageShell, StatsStrip, Section, SECTIONS, EmptyState, LoadErrorState, SourcesMenu } from '@/components/marketplace/MarketplaceShell';
+import { CloudPullCard } from '@/components/marketplace/CloudPullCard';
+import { cloudPullMatches, useCloudPullEntry } from '@/components/marketplace/useCloudPullEntry';
+import { CollectorCard } from '@/components/marketplace/CollectorCard';
+import { collectorMatches, collectorSection, collectorState, useConnectorCollectors, type CollectorRow } from '@/components/marketplace/useConnectorCollectors';
+import { InventoryCard } from '@/components/marketplace/InventoryCard';
+import { InventoryEntitlement } from '@/components/marketplace/InventoryEntitlement';
+import type { MarketplaceDrawerTab } from '@/components/marketplace/MarketplaceDrawer';
+import type { InventoryEditorMode } from '@/components/marketplace/InventoryEditor';
+import { applyFeedBundle, buildInventory, syncPollInterval, type InventoryItem } from '@/lib/api/marketplace-inventory';
+import { PlatformFeedsPanel } from '@/components/marketplace/PlatformFeedsPanel';
 
-import { AIRGAP_IMPORT_ROUTE, CATEGORY_CHIPS, SECTIONS, SECTIONED_SLUGS, type CategoryFilter, countForCategory, StatsStrip, Section, EmptyState, LoadErrorState, SourcesMenu, MarketplacePageShell } from '@/components/marketplace/MarketplaceShell';
+/** Same key as `PlatformFeedsPanel` (NAN-4948), so the panel and the card markers share one fetch. */
+const PLATFORM_FEEDS_QUERY_KEY = ['enrichment', 'platform-feeds'] as const;
+// Threat-intel lookup providers (enterprise, NAN-4931); the open stub renders nothing.
+import { ThreatIntelProvidersSection } from '@/enterprise/components/threat-intel/ThreatIntelProviders';
+import { useThreatIntelEnabled, useThreatIntelProviders } from '@/enterprise/components/threat-intel/use-threat-intel';
 export { SourcesMenu } from '@/components/marketplace/MarketplaceShell';
 
-const HostedInventory = lazyWithRetry(() => import('./MarketplaceInventory').then(m => ({ default: m.MarketplaceInventory })));
+const InventoryDrawer = lazyWithRetry(() => import('@/components/marketplace/InventoryDrawer').then(m => ({ default: m.InventoryDrawer })));
+const InventoryEditor = lazyWithRetry(() => import('@/components/marketplace/InventoryEditor').then(m => ({ default: m.InventoryEditor })));
+const ConnectionDrawer = lazyWithRetry(() => import('@/components/marketplace/MarketplaceDrawer').then(m => ({ default: m.MarketplaceDrawer })));
+
+type Category = 'all' | 'platform' | 'custom' | 'pull' | 'agent';
+const CATEGORIES: readonly Category[] = ['all', 'platform', 'custom', 'pull', 'agent'];
+const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+const MARKETPLACE_REPOSITORIES_KEY = ['marketplace-repositories'] as const;
+const DRAWER_TABS: readonly MarketplaceDrawerTab[] = ['about', 'config', 'connections', 'code', 'perms'];
 
 export function Marketplace() {
-  const { user } = useAuth();
-  return user?.deployment_mode === 'enterprise_shared'
-    ? <Suspense fallback={<p>Loading marketplace…</p>}><HostedInventory /></Suspense>
-    : <DedicatedMarketplace />;
-}
-
-function DedicatedMarketplace() {
-  useDocumentTitle('Marketplace');
-  useBreadcrumbTitle('Marketplace');
-
-  const { capabilities } = useCapabilities();
-  const { hasAllPermissions, user } = useAuth();
+  useDocumentTitle('Marketplace'); useBreadcrumbTitle('Marketplace');
+  const { user, hasAllPermissions, hasPermission } = useAuth();
+  const { capabilities, edition } = useCapabilities();
   const { toast } = useToast();
-  const navigate = useNavigate();
-  const [searchParams, setSearchParams] = useSearchParams();
-
-  // Air-gap mode (no outbound internet). Drives the honest-marketplace reshape:
-  // connectivity badges on every card, egress actions disabled in favor of
-  // import-from-file, repo controls hidden, and a top-of-page import CTA.
-  // Static for the session, so cache it hard. Defaults to false until resolved
-  // (a transient failure just shows the normal online marketplace).
-  const airGapQuery = useQuery({
-    queryKey: ['system', 'config'],
-    queryFn: () => api.getSystemConfig(),
-    staleTime: Infinity,
-    gcTime: Infinity,
-    retry: 1,
-    refetchOnWindowFocus: false,
-  });
-  const airGap = airGapQuery.data?.air_gap ?? false;
-  const goImport = useCallback(() => navigate(AIRGAP_IMPORT_ROUTE), [navigate]);
-  const [entries, setEntries] = useState<MarketplaceCatalogEntry[]>([]);
-  const [stats, setStats] = useState<CatalogStats | null>(null);
-  const [collectorCount, setCollectorCount] = useState(0);
-  const [repos, setRepos] = useState<EnrichmentMarketplaceRepo[]>([]);
-  const [loading, setLoading] = useState(true);
-  // NAN-3761: the catalog read failed; an empty list is unknown, not empty.
-  const [loadFailed, setLoadFailed] = useState(false);
+  const client = useQueryClient();
+  const [params, setParams] = useSearchParams();
   const [searchQuery, setSearchQuery] = useState('');
+  const [confirm, setConfirm] = useState<{ item: InventoryItem; action: 'toggle' | 'uninstall' } | null>(null);
   const [installEntry, setInstallEntry] = useState<MarketplaceCatalogEntry | null>(null);
-  const [detailSlug, setDetailSlug] = useState<string | null>(null);
-  const [detailTab, setDetailTab] = useState<MarketplaceDrawerTab>('config');
   const [syncingRepo, setSyncingRepo] = useState<string | null>(null);
-
-  const categoryFilter = (searchParams.get('category') as CategoryFilter | null) || 'all';
-  const installedOnly = searchParams.get('installed') === 'true';
-
-  // NAN-1111: legacy deep-link routes (/enrichments/threatfox etc.) redirect
-  // here with `?slug=<slug>` so the drawer opens directly on the right entry
-  // instead of dumping users onto the catalog grid. Strip the param after
-  // opening so a refresh of the marketplace page doesn't keep re-opening it.
-  useEffect(() => {
-    const slug = searchParams.get('slug');
-    if (!slug) return;
-    const requestedTab = searchParams.get('tab');
-    setDetailTab(requestedTab === 'connections' ? 'connections' : 'config');
-    setDetailSlug(slug);
-    const next = new URLSearchParams(searchParams);
-    next.delete('slug');
-    next.delete('tab');
-    setSearchParams(next, { replace: true });
-  }, [searchParams, setSearchParams]);
-
   const mountedRef = useRef(true);
-  useEffect(() => () => { mountedRef.current = false; }, []);
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
 
-  // Coverage is computed by a 12-countIf ClickHouse aggregate over the last 24h
-  // of `logs` — it's the slowest piece on this page. Decouple it from the
-  // catalog/repos load so the grid renders immediately, and cache aggressively
-  // on both sides:
-  //
-  // - Server-side (NAN-609/NAN-2061): a Dragonfly-backed, effective-source-scope
-  //   partitioned cache (6h TTL), shared across replicas. `computed_at` in the
-  //   response stamps the hero with "as of HH:MM".
-  // - Client-side: a long React Query staleTime so navigating between pages
-  //   in the same tab doesn't even hit the (already cheap) GET endpoint.
-  //
-  // The manual-refresh button calls the dedicated POST refresh endpoint —
-  // that invalidates only the caller's effective-scope partition, then writes
-  // the freshly-computed payload back into the React Query cache.
-  const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
-  const queryClient = useQueryClient();
-  // Keep the browser cache caller-bound as well; the server applies the
-  // finer-grained effective-source-scope partition.
-  const COVERAGE_QUERY_KEY = ['marketplace', 'coverage', user?.id] as const;
+  // ── Data ────────────────────────────────────────────────────────────
+  const catalogKey = ['marketplace', 'catalog', user?.id] as const;
+  const syncPollStarted = useRef<number | null>(null);
+  const catalog = useQuery({
+    queryKey: catalogKey,
+    queryFn: () => api.marketplace.listCatalog(),
+    // NAN-1108: while an entry is mid-sync, poll so its card settles without a
+    // reload, capped at two minutes per sync episode (a stuck run stops costing
+    // requests; a manual refresh still works).
+    refetchInterval: query => syncPollInterval(!!query.state.data?.entries.some(entry => entry.is_syncing), syncPollStarted),
+  });
+  const reposKey = [...MARKETPLACE_REPOSITORIES_KEY, user?.id];
+  // A failed repository read is surfaced, and catalog items then read as
+  // unknown provenance (never as first-party).
+  const reposQuery = useQuery({ queryKey: reposKey, queryFn: () => api.marketplace.listRepos(), retry: false });
+  const repos = useMemo(() => reposQuery.data ?? [], [reposQuery.data]);
+  // Custom providers are an enterprise capability; the open build never asks.
+  const canListCustom = capabilities.customEnrichment && hasPermission('enrichments:view');
+  const customs = useQuery({ queryKey: ['custom-enrichments', user?.id], queryFn: () => api.listCustomEnrichments(), enabled: canListCustom, retry: false });
+  // Pull collectors (connector specs) also dedupe their catalog collector twins.
+  const collectors = useConnectorCollectors({ pollFeeds: !['platform', 'custom', 'agent'].includes(params.get('category') ?? '') });
+  const connectorNames = useMemo(() => new Set(collectors.rows.map(row => row.spec.name)), [collectors.rows]);
+  // NAN-4948: nano's signed platform feed bundle (shared query with the panel).
+  // Unavailable (no bundle support, or an error) leaves the cards untouched.
+  const feedBundle = useQuery({ queryKey: PLATFORM_FEEDS_QUERY_KEY, queryFn: () => api.getPlatformFeeds(), enabled: hasPermission('enrichments:view'), staleTime: 60_000, retry: false, refetchOnWindowFocus: false });
+  const items = useMemo(() => applyFeedBundle(buildInventory(catalog.data?.entries ?? [], canListCustom ? customs.data ?? [] : [], repos, capabilities, connectorNames), feedBundle.data),
+    [catalog.data, customs.data, canListCustom, repos, capabilities, connectorNames, feedBundle.data]);
+  const refreshInventory = () => {
+    void client.invalidateQueries({ queryKey: catalogKey });
+    void client.invalidateQueries({ queryKey: ['custom-enrichments', user?.id] });
+  };
+
+  const airGapQuery = useQuery({ queryKey: ['system', 'config'], queryFn: () => api.getSystemConfig(), staleTime: Infinity, gcTime: Infinity, retry: 1, refetchOnWindowFocus: false });
+  const airGap = airGapQuery.data?.air_gap ?? false;
+
+  const coverageKey = ['marketplace', 'coverage', user?.id] as const;
   const canViewCoverage = hasAllPermissions(['enrichments:view', 'search:execute']);
-  // NAN-4759: self-hosted lean installs show the signed platform feed bundle's
-  // freshness. `available: false` (or an error) renders nothing.
-  const platformFeedsQuery = useQuery({
-    queryKey: ['enrichment', 'platform-feeds'],
-    queryFn: () => api.getPlatformFeeds(),
-    enabled: hasAllPermissions(['enrichments:view']),
-    staleTime: 60_000,
-    retry: false,
-    refetchOnWindowFocus: false,
-  });
-  const canCreateIntegration = capabilities.customEnrichment
-    && hasAllPermissions(['log_sources:create', 'enrichments:code']);
-  const coverageQuery = useQuery({
-    queryKey: COVERAGE_QUERY_KEY,
-    queryFn: () => api.marketplace.getCoverage(),
-    enabled: canViewCoverage,
-    staleTime: SIX_HOURS_MS,
-    gcTime: SIX_HOURS_MS,
-    retry: false,
-    refetchOnWindowFocus: false,
-  });
-  const coverageRefreshMutation = useMutation({
+  const coverageQuery = useQuery({ queryKey: coverageKey, queryFn: () => api.marketplace.getCoverage(), enabled: canViewCoverage, staleTime: SIX_HOURS_MS, gcTime: SIX_HOURS_MS, retry: false, refetchOnWindowFocus: false });
+  const coverageRefresh = useMutation({
     mutationFn: () => api.marketplace.refreshCoverage(),
-    onSuccess: (fresh) => {
-      // Skip a second GET — the POST already returned the fresh payload.
-      queryClient.setQueryData(COVERAGE_QUERY_KEY, fresh);
-    },
-    onError: () => {
-      toast({
-        title: 'Refresh failed',
-        description: 'Coverage couldn’t be recomputed. Try again in a moment.',
-        variant: 'destructive',
-      });
-    },
+    onSuccess: fresh => { client.setQueryData(coverageKey, fresh); },
+    onError: () => { toast({ title: 'Refresh failed', description: 'Coverage couldn’t be recomputed. Try again in a moment.', variant: 'destructive' }); },
   });
 
-  const loadAll = useCallback(async () => {
-    try {
-      const filter: Record<string, string | boolean> = {};
-      if (categoryFilter !== 'all') filter.category = categoryFilter;
-      if (installedOnly) filter.installed = true;
+  // ── URL state ───────────────────────────────────────────────────────
+  const requestedCategory = params.get('category');
+  const categoryFilter: Category = CATEGORIES.includes(requestedCategory as Category) ? requestedCategory as Category : 'all';
+  const installedOnly = params.get('installed') === 'true';
+  // `?slug=` is the legacy deep link (NAN-1111 redirects); `?item=` is main's.
+  const selectedId = params.get('item') ?? params.get('slug') ?? '';
+  const selected = selectedId ? items.find(item => item.id === selectedId) : undefined;
+  const unavailable = !!selectedId && catalog.isSuccess && (!canListCustom || customs.isSuccess) && !selected;
+  const author = params.get('author');
+  const requestedTab = params.get('tab');
+  const connectionTab: MarketplaceDrawerTab = DRAWER_TABS.includes(requestedTab as MarketplaceDrawerTab) ? requestedTab as MarketplaceDrawerTab : 'config';
+  const update = (mutate: (next: URLSearchParams) => void) => { const next = new URLSearchParams(params); mutate(next); setParams(next); };
+  const select = (id?: string) => update(next => {
+    for (const key of ['slug', 'tab', 'author', 'mode']) next.delete(key);
+    if (id) next.set('item', id); else next.delete('item');
+  });
+  const openAuthor = (mode: 'new' | 'edit' | 'connect', extra?: Record<string, string>) => update(next => {
+    next.set('author', mode);
+    for (const [key, value] of Object.entries(extra ?? {})) next.set(key, value);
+  });
+  const setCategoryFilter = (value: Category) => update(next => { if (value === 'all') next.delete('category'); else next.set('category', value); });
+  const toggleInstalledOnly = () => update(next => { if (installedOnly) next.delete('installed'); else next.set('installed', 'true'); });
 
-      const [catalog, repoList] = await Promise.all([
-        api.marketplace.listCatalog(filter),
-        api.marketplace.listRepos().catch(() => []),
-      ]);
-      setEntries(catalog.entries);
-      setStats(catalog.stats);
-      // Keep the live page compatible with an API process that predates the
-      // collector_count field. The unfiltered response already has every
-      // collector, so HMR can populate the chip without a service restart.
-      if (typeof catalog.stats.collector_count === 'number') {
-        setCollectorCount(catalog.stats.collector_count);
-      } else if (categoryFilter === 'all') {
-        setCollectorCount(catalog.entries.filter(entry => entry.category === 'collector').length);
-      }
-      setRepos(repoList);
-      setLoadFailed(false);
-    } catch {
-      setLoadFailed(true);
-      toast({ title: 'Error', description: 'Failed to load marketplace', variant: 'destructive' });
-    } finally {
-      setLoading(false);
-    }
-  }, [categoryFilter, installedOnly, toast]);
+  // ── Permissions ─────────────────────────────────────────────────────
+  const canConfigure = hasPermission('enrichments:configure');
+  const canAuthor = capabilities.customEnrichment && hasAllPermissions(['enrichments:view', 'enrichments:configure', 'enrichments:code']);
+  const canOpenCreate = (canAuthor && hasPermission('enrichments:custom:create')) || hasAllPermissions(['lookup:view', 'lookup:create']);
+  const editing = (canOpenCreate && author === 'new')
+    || (canAuthor && author === 'edit' && selected?.source === 'custom_enrichment' && selected.can_edit);
+  const connecting = author === 'connect' && selected?.source === 'catalog' && canConfigure;
 
-  useEffect(() => { void loadAll(); }, [loadAll]);
-
-  // NAN-1108: while any entry is mid-sync, refetch the catalog every ~3.5s
-  // so the card transitions from `syncing…` → `synced just now` without the
-  // user having to refresh. `anySyncing` is a plain boolean so the effect
-  // only re-runs when the syncing-vs-not state itself flips, not on every
-  // catalog refresh. Caps at 2 minutes to avoid burning CPU on a stuck run
-  // — at that point the user can refresh manually.
-  const anySyncing = useMemo(() => entries.some(e => e.is_syncing), [entries]);
-  useEffect(() => {
-    if (!anySyncing) return;
-    const startedAt = Date.now();
-    const MAX_MS = 2 * 60_000;
-    const POLL_MS = 3_500;
-    const interval = setInterval(() => {
-      if (Date.now() - startedAt > MAX_MS) {
-        clearInterval(interval);
-        return;
-      }
-      void loadAll();
-    }, POLL_MS);
-    return () => clearInterval(interval);
-  }, [anySyncing, loadAll]);
-
-  const filtered = useMemo(() => {
-    if (!searchQuery.trim()) return entries;
-    const q = searchQuery.toLowerCase();
-    return entries.filter(e =>
-      e.name.toLowerCase().includes(q) ||
-      e.description?.toLowerCase().includes(q) ||
-      e.tags.some(t => t.toLowerCase().includes(q)),
-    );
-  }, [entries, searchQuery]);
-
-  const grouped = useMemo(() => {
-    const slugMap = new Map(filtered.map(e => [e.slug, e]));
-    const sections = SECTIONS.map(section => ({
-      section,
-      entries: section.slugs
-        .map(s => slugMap.get(s))
-        .filter((e): e is MarketplaceCatalogEntry => !!e),
-    })).filter(s => s.entries.length > 0);
-    const other = filtered.filter(e => !SECTIONED_SLUGS.has(e.slug));
-    return { sections, other };
-  }, [filtered]);
-
-  const showSections = categoryFilter === 'all' && !searchQuery.trim() && !installedOnly;
-
-  const setCategoryFilter = (value: CategoryFilter) => {
-    const params = new URLSearchParams(searchParams);
-    if (value === 'all') params.delete('category');
-    else params.set('category', value);
-    setSearchParams(params);
-  };
-
-  const toggleInstalledOnly = () => {
-    const params = new URLSearchParams(searchParams);
-    if (installedOnly) params.delete('installed');
-    else params.set('installed', 'true');
-    setSearchParams(params);
-  };
-
-  const handleCardOpen = (slug: string) => {
-    setDetailTab('config');
-    setDetailSlug(slug);
-  };
-  const handleInstallClick = (slug: string) => {
-    const entry = entries.find(e => e.slug === slug);
-    if (!entry) return;
-    if (entry.requires_credential !== 'none' && entry.credential_fields.length > 0) {
-      setInstallEntry(entry);
-    } else {
-      void doInstall(slug);
-    }
-  };
-
-  const doInstall = async (slug: string, credentials?: Record<string, string>) => {
+  // ── Mutations ───────────────────────────────────────────────────────
+  const install = async (slug: string, credentials?: Record<string, string>) => {
     try {
       await api.marketplace.installEnrichment(slug, credentials ? { credentials } : undefined);
-      toast({ title: 'Installed', description: 'Enrichment installed and enabled' });
-      void loadAll();
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Failed to install';
-      toast({ title: 'Error', description: msg, variant: 'destructive' });
-      throw e;
+      toast({ title: 'Installed', description: 'Integration installed and enabled' });
+      refreshInventory();
+    } catch (error) {
+      toast({ title: 'Install failed', description: error instanceof Error ? error.message : 'Failed to install', variant: 'destructive' });
+      throw error;
     }
   };
+  const startInstall = (item: InventoryItem) => {
+    const entry = item.entry;
+    if (!entry) return;
+    if (entry.requires_credential !== 'none' && entry.credential_fields.length > 0) setInstallEntry(entry);
+    else void install(entry.slug).catch(() => {});
+  };
+  const mutation = useMutation({
+    mutationFn: async ({ item, action }: { item: InventoryItem; action: 'toggle' | 'uninstall' }) => {
+      if (item.source === 'catalog') {
+        if (action === 'uninstall') await api.marketplace.uninstallEnrichment(item.connector);
+        else await api.marketplace.configureEnrichment(item.connector, { enabled: !item.enabled });
+      } else {
+        const id = item.id.slice('custom:'.length);
+        if (item.enabled) await api.disableCustomEnrichment(id); else await api.deployCustomEnrichment(id);
+      }
+    },
+    onSettled: refreshInventory,
+  });
 
   const handleSyncRepo = async (id: string) => {
     setSyncingRepo(id);
     try {
-      const result = await api.marketplace.syncRepo(id);
-      toast({ title: result.managed_by_platform ? 'Sync requested' : 'Sync started', description: result.managed_by_platform ? 'Platform sync queued; the scheduler checks within 60 seconds' : 'Repository sync running in the background' });
-      // Poll a few times for the row to settle.
-      const delays = result.managed_by_platform ? [2000, 4000, 8000, 16000, 30000, 30000] : [2000, 4000, 8000];
-      for (const ms of delays) {
-        await new Promise(r => setTimeout(r, ms));
+      await api.marketplace.syncRepo(id);
+      toast({ title: 'Sync started', description: 'Repository sync running in the background' });
+      for (const ms of [2000, 4000, 8000]) {
+        await new Promise(resolve => setTimeout(resolve, ms));
         if (!mountedRef.current) return;
-        const list = await api.marketplace.listRepos();
-        if (!mountedRef.current) return;
-        setRepos(list);
+        const list = await client.fetchQuery({ queryKey: reposKey, queryFn: () => api.marketplace.listRepos(), staleTime: 0 });
         const repo = list.find(r => r.id === id);
-        if (!repo || (repo.last_sync_status !== 'syncing' && repo.last_sync_status !== 'pending')) {
-          break;
-        }
+        if (!repo || (repo.last_sync_status !== 'syncing' && repo.last_sync_status !== 'pending')) break;
       }
-      if (mountedRef.current) void loadAll();
+      if (mountedRef.current) refreshInventory();
     } catch (error) {
       if (mountedRef.current) toast({ title: 'Error', description: error instanceof Error ? error.message : 'Failed to start sync', variant: 'destructive' });
     } finally {
@@ -321,165 +204,174 @@ function DedicatedMarketplace() {
     }
   };
 
-  return (
-    <MarketplacePageShell
-      totalCount={stats?.total_entries ?? 0}
-      repos={repos}
-      airGap={airGap}
-      headerActions={<>
-          {(capabilities.customEnrichment || canCreateIntegration) && (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-              <Button
-                size="sm"
-                variant={airGap ? 'outline' : 'default'}
-                className="h-8 rounded-md text-[12px]"
-              >
-                <Plus className="w-3.5 h-3.5" /> Create custom
-              </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-72">
-                <DropdownMenuLabel className="text-[10px] font-mono uppercase tracking-[0.1em] text-muted-foreground">
-                  What are you building?
-                </DropdownMenuLabel>
-                <DropdownMenuSeparator />
-                {capabilities.customEnrichment && (
-                  <DropdownMenuItem
-                    className="items-start gap-2 py-2.5"
-                    onSelect={() => navigate('/enrichments/custom/new')}
-                  >
-                    <TableProperties className="mt-0.5 h-4 w-4 text-primary" />
-                    <div>
-                      <div className="text-[12px] font-medium">Enrichment</div>
-                      <div className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">
-                        Lookup data or on-demand artifact context.
-                      </div>
-                    </div>
-                  </DropdownMenuItem>
-                )}
-                {canCreateIntegration && !airGap && (
-                  <DropdownMenuItem
-                    className="items-start gap-2 py-2.5"
-                    onSelect={() => navigate('/integrations/custom/new')}
-                  >
-                    <DatabaseZap className="mt-0.5 h-4 w-4 text-primary" />
-                    <div>
-                      <div className="text-[12px] font-medium">Scheduled API integration</div>
-                      <div className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">
-                        Harvest bounded API data into raw event streams.
-                      </div>
-                    </div>
-                  </DropdownMenuItem>
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          )}
-      </>}
-      statsStrip={stats && <StatsStrip stats={stats} />}
-      coverage={<>
-      {platformFeedsQuery.data?.available && (
-        <div className="mt-4">
-          <PlatformFeedsCard status={platformFeedsQuery.data} />
-        </div>
-      )}
-      {canViewCoverage && (
-        <div className="mt-4">
-          <CoverageHero
-            coverage={coverageQuery.data ?? null}
-            isLoading={coverageQuery.isLoading}
-            isFetching={coverageQuery.isFetching || coverageRefreshMutation.isPending}
-            isError={coverageQuery.isError}
-            onRefresh={() => {
-              // Don't double-fire while a refresh is already in flight.
-              if (coverageRefreshMutation.isPending) return;
-              coverageRefreshMutation.mutate();
-            }}
-            onAddMissing={(name) => {
-              setSearchQuery(name);
-              document.getElementById('marketplace-search')?.focus();
-            }}
-          />
-        </div>
-      )}
-      </>}
-      chips={CATEGORY_CHIPS.map(chip => ({ ...chip, count: countForCategory(chip.id, stats, collectorCount) }))}
-      categoryFilter={categoryFilter}
-      setCategoryFilter={setCategoryFilter}
-      searchQuery={searchQuery}
-      setSearchQuery={setSearchQuery}
-      installedOnly={installedOnly}
-      toggleInstalledOnly={toggleInstalledOnly}
-      sourcesMenu={<SourcesMenu repos={repos} syncingId={syncingRepo} onSync={handleSyncRepo} />}
-      overlays={<>
-      <InstallDialog
-        entry={installEntry}
-        open={!!installEntry}
-        onOpenChange={(open) => !open && setInstallEntry(null)}
-        onInstall={doInstall}
-      />
+  // ── Collectors, cloud pull ──────────────────────────────────────────
+  const cloudPull = useCloudPullEntry();
 
-      <MarketplaceDrawer
-        slug={detailSlug}
-        open={!!detailSlug}
-        onOpenChange={(open) => {
-          if (!open) {
-            setDetailSlug(null);
-            setDetailTab('config');
-          }
-        }}
-        onUpdated={loadAll}
-        initialTab={detailTab}
+  // ── Filtering + grouping ────────────────────────────────────────────
+  const q = searchQuery.toLowerCase().trim();
+  const matchesItem = (item: InventoryItem) => !q || `${item.name} ${item.id} ${item.description ?? ''} ${item.capabilities.join(' ')}`.toLowerCase().includes(q);
+  const filtered = categoryFilter === 'pull' ? [] : items.filter(item => (!installedOnly || item.enabled)
+    && (categoryFilter === 'all' || (categoryFilter === 'agent' ? item.category === 'agent' : item.kind === categoryFilter))
+    && matchesItem(item));
+  const filteredCollectors = categoryFilter === 'all' || categoryFilter === 'pull'
+    ? collectors.rows.filter(row => (!installedOnly || collectorState(row.feeds, collectors.feedStatus).installed) && collectorMatches(row.spec, searchQuery))
+    : [];
+  const identityCollectors = filteredCollectors.filter(row => collectorSection(row.spec) === 'identity');
+  const otherCollectors = filteredCollectors.filter(row => collectorSection(row.spec) !== 'identity');
+  const showCloudPull = cloudPull.available && (categoryFilter === 'all' || categoryFilter === 'pull')
+    && (!installedOnly || cloudPull.sources.length > 0) && cloudPullMatches(searchQuery);
+  const cloudPullCard = showCloudPull ? <CloudPullCard key="cloud-pull" sources={cloudPull.sources} /> : null;
+  const pullCount = collectors.rows.length + (cloudPull.available ? 1 : 0);
+  const threatIntelEnabled = useThreatIntelEnabled();
+  const threatIntel = capabilities.threatIntel && threatIntelEnabled;
+  const threatIntelCount = useThreatIntelProviders().data?.providers.length ?? 0;
+  const threatIntelSection = threatIntel && (categoryFilter === 'all' || categoryFilter === 'agent')
+    ? <ThreatIntelProvidersSection searchQuery={searchQuery} installedOnly={installedOnly} /> : null;
+
+  const grouped = useMemo(() => {
+    const byId = new Map(items.map(item => [item.id, item]));
+    const assigned = new Set<string>();
+    const sections = SECTIONS.map(section => ({
+      section,
+      items: [...new Set(section.slugs)].flatMap(slug => {
+        const item = byId.get(slug);
+        if (!item || assigned.has(item.id)) return [];
+        assigned.add(item.id);
+        return [item];
+      }),
+    })).filter(group => group.items.length > 0);
+    const custom = items.filter(item => !assigned.has(item.id) && item.kind === 'custom');
+    custom.forEach(item => assigned.add(item.id));
+    const other = items.filter(item => !assigned.has(item.id));
+    return { sections, custom, other };
+  }, [items]);
+  const showSections = categoryFilter === 'all' && !q && !installedOnly;
+  // Cloud pull sits in Cloud infrastructure; keep that group even when no curated item fills it.
+  const sectionGroups = showCloudPull && !grouped.sections.some(group => group.section.key === 'cloud')
+    ? SECTIONS.flatMap(section => section.key === 'cloud' ? [{ section, items: [] as InventoryItem[] }] : grouped.sections.filter(group => group.section.key === section.key))
+    : grouped.sections;
+
+  const platformCount = items.filter(item => item.kind === 'platform').length;
+  const customCount = items.filter(item => item.kind === 'custom').length;
+  const agentCount = items.filter(item => item.category === 'agent').length + (threatIntel ? threatIntelCount : 0);
+  // Live pull: enabled connector feeds plus enabled cloud pull source configurations.
+  const installedPullCount = collectors.rows.reduce((n, row) => n + row.feeds.filter(feed => feed.enabled).length, 0) + cloudPull.sources.filter(source => source.enabled).length;
+  const cards = (list: InventoryItem[]) => list.map(item => <InventoryCard key={item.id} item={item} airGap={airGap} onOpen={() => select(item.id)} />);
+  const collectorCards = (list: CollectorRow[]) => list.map(row => <CollectorCard key={row.spec.name} {...row} feedStatus={collectors.feedStatus}
+    permissions={collectors.permissionsFor(row.spec)} />);
+  const visibleCount = filtered.length + filteredCollectors.length + (showCloudPull ? 1 : 0);
+  const inventoryPending = catalog.isPending || (canListCustom && customs.isPending);
+  // NAN-3761: a failed load is never rendered as "No integrations matched".
+  const loadFailures = [...(catalog.isError ? ['the marketplace catalog'] : []), ...(collectors.isError ? ['pull collectors'] : [])];
+  const retryLoad = () => { if (catalog.isError) void catalog.refetch(); if (collectors.isError) collectors.refetch(); };
+
+  const busy = mutation.isPending;
+  // NAN-4959: a feed the bundle provides (IPinfo Lite, ThreatFox, Tor) has
+  // nothing to configure or toggle here: no direct fetcher. A Deno ThreatFox /
+  // Tor install from before keeps Uninstall (it removes stored credentials).
+  const bundleManaged = !!selected?.provided_by_bundle;
+  const keepsUninstall = !!selected?.installed && selected.entry?.execution_backend !== 'native';
+  const drawerActions = selected ? {
+    onInstall: selected.source === 'catalog' && canConfigure && !airGap && !selected.provided_by_bundle ? () => startInstall(selected) : undefined,
+    onToggle: canConfigure ? () => setConfirm({ item: selected, action: 'toggle' }) : undefined,
+    onConfigure: selected.source === 'catalog' && canConfigure && !bundleManaged ? () => openAuthor('connect', { tab: 'config' }) : undefined,
+    onConnect: selected.source === 'catalog' && selected.category === 'collector' && canConfigure && !selected.requirement ? () => openAuthor('connect', { tab: 'connections' }) : undefined,
+    onEdit: canAuthor && selected.source === 'custom_enrichment' ? () => openAuthor('edit') : undefined,
+    onUninstall: selected.source === 'catalog' && canConfigure && (!bundleManaged || keepsUninstall) ? () => setConfirm({ item: selected, action: 'uninstall' }) : undefined,
+  } : {};
+
+  return <MarketplacePageShell
+    totalCount={items.length + collectors.rows.length + (cloudPull.available ? 1 : 0)} repos={repos} airGap={airGap}
+    headerActions={canOpenCreate && <Button size="sm" variant={airGap ? 'outline' : 'default'} className="h-8 rounded-md text-[12px]" onClick={() => openAuthor('new')}>
+      <Plus className="w-3.5 h-3.5" /> Create / Connect
+    </Button>}
+    statsStrip={<StatsStrip stats={{ total_entries: items.length, installed_count: 0, data_count: 0, agent_count: 0, identity_count: 0, collector_count: 0 }} tiles={[
+      { label: 'Enabled', value: items.filter(item => item.enabled).length },
+      { label: 'Platform', value: platformCount },
+      { label: 'Custom', value: customCount },
+      { label: 'Pull feeds', value: installedPullCount },
+    ]} />}
+    coverage={<>
+      {/* NAN-4948: nano's signed platform feed bundle (IPinfo Lite, ThreatFox, Tor): installed feeds, freshness, check now / air-gap import. */}
+      <PlatformFeedsPanel className="mt-4" />
+      {canViewCoverage && <div className="mt-4">
+      <CoverageHero
+        coverage={coverageQuery.data ?? null}
+        isLoading={coverageQuery.isLoading}
+        isFetching={coverageQuery.isFetching || coverageRefresh.isPending}
+        isError={coverageQuery.isError}
+        onRefresh={() => { if (!coverageRefresh.isPending) coverageRefresh.mutate(); }}
+        onAddMissing={name => { setSearchQuery(name); document.getElementById('marketplace-search')?.focus(); }}
       />
-      </>}
-    >
-      {loading ? (
-        <div className="mt-8 flex items-center justify-center py-12">
-          <LoadingIcon className="w-6 h-6 text-muted-foreground" />
-        </div>
-      ) : filtered.length === 0 ? (
-        loadFailed ? <LoadErrorState what="the marketplace catalog" onRetry={() => { void loadAll(); }} /> : <EmptyState />
-      ) : showSections ? (
-        <div className="mt-5 space-y-6">
-          {grouped.sections.map(({ section, entries: secEntries }) => (
-            <Section
-              key={section.key}
-              icon={section.icon}
-              title={section.title}
-              count={secEntries.length}
-            >
-              {secEntries.map(entry => (
-                <IntegrationCard key={entry.slug} entry={entry} onOpen={handleCardOpen} onInstall={handleInstallClick} airGap={airGap} onImportBundle={goImport} />
-              ))}
-            </Section>
-          ))}
-          {grouped.other.length > 0 && (
-            <Section
-              icon={<Package className="w-[12px] h-[12px] text-muted-foreground" />}
-              title="Other integrations"
-              count={grouped.other.length}
-            >
-              {grouped.other.map(entry => (
-                <IntegrationCard key={entry.slug} entry={entry} onOpen={handleCardOpen} onInstall={handleInstallClick} airGap={airGap} onImportBundle={goImport} />
-              ))}
-            </Section>
-          )}
-        </div>
-      ) : (
-        <div className="mt-5 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-          {filtered.map(entry => (
-            <IntegrationCard
-              key={entry.slug}
-              entry={entry}
-              onOpen={handleCardOpen}
-              onInstall={handleInstallClick}
-              airGap={airGap}
-              onImportBundle={goImport}
-            />
-          ))}
-        </div>
-      )}
-    </MarketplacePageShell>
-  );
+    </div>}
+    </>}
+    chips={[
+      { id: 'all' as const, label: 'All', icon: Box, count: items.length + pullCount + (threatIntel ? threatIntelCount : 0) },
+      { id: 'platform' as const, label: 'Platform', icon: Cloud, count: platformCount },
+      { id: 'custom' as const, label: 'Custom', icon: Users, count: customCount },
+      ...(pullCount ? [{ id: 'pull' as const, label: 'Pull', icon: ArrowDownToLine, count: pullCount }] : []),
+      ...(agentCount || threatIntel ? [{ id: 'agent' as const, label: 'Agent', icon: Bot, count: agentCount }] : []),
+    ]}
+    categoryFilter={categoryFilter} setCategoryFilter={setCategoryFilter}
+    searchQuery={searchQuery} setSearchQuery={setSearchQuery}
+    installedOnly={installedOnly} toggleInstalledOnly={toggleInstalledOnly} toggleLabel="enabled only"
+    sourcesMenu={<SourcesMenu repos={repos} syncingId={syncingRepo} onSync={canConfigure ? id => { void handleSyncRepo(id); } : undefined} />}
+    overlays={<>
+      {editing ? <Suspense fallback={<p role="status">Loading provider editor…</p>}>
+        <InventoryEditor key={`${user?.id}:${author}:${selected?.id ?? 'new'}`}
+          definitionId={author === 'new' ? 'new' : selected!.id.slice('custom:'.length)}
+          initialMode={(params.get('mode') as InventoryEditorMode | null) ?? undefined}
+          onClose={() => { refreshInventory(); select(author === 'new' ? undefined : selected?.id); }}
+          onSaved={id => { refreshInventory(); select(`custom:${id}`); }} />
+      </Suspense>
+      : connecting && selected ? <Suspense fallback={<p role="status">Loading connection…</p>}>
+        <ConnectionDrawer key={`${user?.id}:${selected.id}`} slug={selected.connector} open
+          onOpenChange={open => { if (!open) select(selected.id); }} onUpdated={refreshInventory} initialTab={connectionTab} />
+      </Suspense>
+      : selected && <Suspense fallback={<p role="status">Loading details…</p>}>
+        <InventoryDrawer item={selected} onClose={() => select()} busy={busy}
+          entitlement={selected.requirement ? <InventoryEntitlement requirement={selected.requirement} edition={edition} /> : undefined}
+          actions={drawerActions} />
+      </Suspense>}
+      {/* Keyed by slug: a cancelled secret never survives into another install. */}
+      <InstallDialog key={installEntry?.slug ?? 'closed'} entry={installEntry} open={!!installEntry} onOpenChange={open => { if (!open) setInstallEntry(null); }} onInstall={install} />
+      <ConfirmDialog open={!!confirm} onOpenChange={open => { if (!open) setConfirm(null); }}
+        title={confirm?.action === 'uninstall' ? `Uninstall ${confirm.item.name}?` : `${confirm?.item.enabled ? 'Disable' : 'Enable'} ${confirm?.item.name ?? 'provider'}?`}
+        description={confirm?.action === 'uninstall' ? 'Removes the integration and its stored credentials from this deployment. It stays in the catalog to reinstall.' : 'This changes the provider state for this deployment.'}
+        variant={confirm?.action === 'uninstall' ? 'danger' : undefined}
+        confirmLabel={confirm?.action === 'uninstall' ? 'Uninstall' : confirm?.item.enabled ? 'Disable' : 'Enable'}
+        onConfirm={() => { if (confirm) mutation.mutate(confirm); setConfirm(null); }} loading={mutation.isPending} />
+    </>}
+  >
+    {reposQuery.isError && <p role="alert" className="mt-4 text-[12px] text-destructive">Could not load catalog sources; repository provenance is unknown until they load. <button className="underline" onClick={() => { void reposQuery.refetch(); }}>Retry</button></p>}
+    {catalog.isError && visibleCount > 0 && <p role="alert" className="mt-4 text-[12px] text-destructive">Could not load the catalog. <button className="underline" onClick={() => { void catalog.refetch(); }}>Retry</button></p>}
+    {mutation.isError && <p role="alert" className="mt-4 text-[12px] text-destructive">{mutation.error.message} Reloaded current provider state.</p>}
+    {unavailable && <p className="mt-4 text-[12px] text-muted-foreground">That integration isn't available on this deployment.</p>}
+    {collectors.isError && visibleCount > 0 && <p role="alert" className="mt-4 text-[12px] text-destructive">Could not load pull collectors. <button className="underline" onClick={collectors.refetch}>Retry</button></p>}
+    {categoryFilter === 'agent' && filtered.length === 0 && threatIntelSection ? (
+      <div className="mt-5">{threatIntelSection}</div>
+    ) : inventoryPending && categoryFilter !== 'pull' ? (
+      <div className="mt-8 flex items-center justify-center py-12"><LoadingIcon className="w-6 h-6 text-muted-foreground" /></div>
+    ) : visibleCount === 0 ? (loadFailures.length > 0
+      ? <LoadErrorState what={loadFailures.join(' and ')} retrying={catalog.isFetching || collectors.isRefetching} onRetry={retryLoad} />
+      : <EmptyState />) : showSections ? (
+      <div className="mt-5 space-y-6">
+        {sectionGroups.map(({ section, items: sectionItems }) => {
+          const extra = section.key === 'cloud' ? cloudPullCard : null;
+          return <Section key={section.key} icon={section.icon} title={section.title} count={sectionItems.length + (extra ? 1 : 0)}>{cards(sectionItems)}{extra}</Section>;
+        })}
+        {identityCollectors.length > 0 && <Section icon={<KeyRound className="w-[12px] h-[12px] text-muted-foreground" />} title="Identity" count={identityCollectors.length}>{collectorCards(identityCollectors)}</Section>}
+        {grouped.custom.length > 0 && <Section icon={<Users className="w-[12px] h-[12px] text-muted-foreground" />} title="Custom providers" count={grouped.custom.length}>{cards(grouped.custom)}</Section>}
+        {threatIntelSection}
+        {grouped.other.length + otherCollectors.length > 0 && <Section icon={<Package className="w-[12px] h-[12px] text-muted-foreground" />} title="Other integrations" count={grouped.other.length + otherCollectors.length}>{cards(grouped.other)}{collectorCards(otherCollectors)}</Section>}
+      </div>
+    ) : (
+      <>
+        <div className="mt-5 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">{cards(filtered)}{collectorCards(filteredCollectors)}{cloudPullCard}</div>
+        {threatIntelSection && <div className="mt-6">{threatIntelSection}</div>}
+      </>
+    )}
+  </MarketplacePageShell>;
 }
 
 export default Marketplace;

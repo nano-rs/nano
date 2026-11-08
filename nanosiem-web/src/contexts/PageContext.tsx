@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Per-route context surface that feeds the pivt "Here" card. A page can
+// Per-route context surface that feeds the PIVT "Here" card. A page can
 // either rely on the default pageKey (derived from `useLocation`) and
 // the static `HERE_CARDS` registry in `components/pivt/HereCard.tsx`,
 // or override the card dynamically with `useHereCardOverride` to surface
@@ -48,7 +48,7 @@ interface PageContextValue {
 const PageContextImpl = createContext<PageContextValue | null>(null);
 
 /**
- * Map a pathname to a pivt pageKey. Kept intentionally broad — unknown
+ * Map a pathname to a PIVT pageKey. Kept intentionally broad — unknown
  * routes fall through to `'home'` so the card always has something to
  * render. Tests go in `PageContext.test.ts` alongside this file if a
  * later chunk needs regression coverage.
@@ -67,9 +67,9 @@ export function pageKeyFor(pathname: string): string {
   if (pathname.startsWith('/notebooks')) return 'notebook';
   if (pathname.startsWith('/prevalence')) return 'prevalence';
   if (pathname.startsWith('/risk')) return 'risk';
+  if (pathname.startsWith('/ingestion/log-sources/inputs')) return 'source-configs';
+  if (pathname.startsWith('/ingestion/log-sources/cloud-pull')) return 'credentials';
   if (pathname.startsWith('/ingestion/log-sources')) return 'log-sources';
-  if (pathname.startsWith('/ingestion/source-configurations')) return 'source-configs';
-  if (pathname.startsWith('/ingestion/credentials')) return 'credentials';
   if (pathname.startsWith('/ingestion')) return 'log-sources';
   if (pathname.startsWith('/matches')) return 'matches';
   if (pathname.startsWith('/settings')) return 'settings';
@@ -111,7 +111,7 @@ export function PageContextProvider({ children }: PageContextProviderProps) {
 
 /**
  * Returns the current page context. Safe to call outside the provider —
- * returns a neutral default so pivt doesn't crash on pages that forget
+ * returns a neutral default so PIVT doesn't crash on pages that forget
  * to wrap (which shouldn't happen, but defending the dev loop is cheap).
  */
 export function usePageContext(): PageContextValue {

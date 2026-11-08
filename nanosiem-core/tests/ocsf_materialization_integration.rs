@@ -332,7 +332,9 @@ async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String
     }
 
     // Dual user paths: file fixture has actor.user.name but NO top-level user.
-    let want_actor_user = file["actor"]["user"]["name"].as_str().unwrap().to_lowercase();
+    // NAN-4903: user names are stored case-PRESERVED (searched through the
+    // `lower(col)` text index), not lowered at ingest.
+    let want_actor_user = file["actor"]["user"]["name"].as_str().unwrap().to_string();
     let got_actor_user = select1(client, db, "`actor.user.name`", where_file).await;
     if got_actor_user != want_actor_user {
         return Err(format!(
@@ -349,10 +351,10 @@ async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String
     // timestamp DEFAULT-derives from event.time (epoch ms) — round-trips exactly,
     // guarding the NAN-1123 ms-vs-seconds coercion footgun.
     let want_ms = file["time"].as_u64().unwrap();
-    let got_ms = select1(client, db, "toUnixTimestamp64Milli(time_dt)", where_file).await;
+    let got_ms = select1(client, db, "toUnixTimestamp64Milli(timestamp)", where_file).await;
     if got_ms.parse::<u64>().ok() != Some(want_ms) {
         return Err(format!(
-            "toUnixTimestamp64Milli(time_dt) = {got_ms:?}, expected {want_ms} (ms derivation broken)"
+            "toUnixTimestamp64Milli(timestamp) = {got_ms:?}, expected {want_ms} (ms derivation broken)"
         ));
     }
 
@@ -414,9 +416,10 @@ async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String
     if got_q != want_q {
         return Err(format!("`query.hostname` = {got_q:?}, expected {want_q:?}"));
     }
-    // answers[] is an array; the column takes the FIRST element's rdata.
+    // NAN-4903: answers[] promotes to an Array(String) of every rdata
+    // (positional); the first element is the first answer.
     let want_ans = dns["answers"][0]["rdata"].as_str().unwrap();
-    let got_ans = select1(client, db, "`answers.rdata`", where_dns).await;
+    let got_ans = select1(client, db, "`answers.rdata`[1]", where_dns).await;
     if got_ans != want_ans {
         return Err(format!(
             "`answers.rdata` = {got_ans:?}, expected first answer rdata {want_ans:?}"
@@ -494,4 +497,126 @@ fn enrichment_value(enrichments: &Value, name: &str) -> String {
         })
         .unwrap_or_default()
         .to_string()
+}
+
+/// NAN-4903 (codex P1): `email.to` / `http_request.url.categories` are OCSF
+/// arrays of scalars, but producers send lone scalars too. The MV used to CAST
+/// the subcolumn straight to `Array(Nullable(String))`, which throws on a scalar
+/// ("Array does not start with '['") and rejects the WHOLE insert block,
+/// unrelated events included. One block mixing the array form, the scalar form
+/// and an unrelated event must land all three rows, with the scalar normalized
+/// to a one-element array.
+#[tokio::test]
+async fn ocsf_scalar_array_fields_accept_scalar_and_array_in_one_block() {
+    if std::env::var("SKIP_DB_TESTS").is_ok() {
+        return;
+    }
+    let client = reqwest::Client::new();
+    if !reachable(&client).await {
+        eprintln!("Skipping: ClickHouse not reachable at {}", ch_url());
+        return;
+    }
+    let db = format!(
+        "ocsf_scalar_arr_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    exec(&client, &format!("CREATE DATABASE {db}")).await.expect("create db");
+    let result = async {
+        for stmt in test_table_ddl(&db) {
+            exec(&client, &stmt).await?;
+        }
+        let block = [
+            r#"{"event":{"class_uid":4009,"time":1749081600123,"metadata":{"uid":"arr"},"email":{"to":["Alice@Example.com","bob@example.com"]},"http_request":{"url":{"categories":["News","Tech"]}}}}"#,
+            r#"{"event":{"class_uid":4009,"time":1749081600124,"metadata":{"uid":"scalar"},"email":{"to":"Carol@Example.com"},"http_request":{"url":{"categories":"Malware"}}}}"#,
+            r#"{"event":{"class_uid":1007,"time":1749081600125,"metadata":{"uid":"other"},"process":{"name":"cmd.exe"}}}"#,
+        ]
+        .join("\n");
+        insert_row(&client, &db, &block).await?;
+        let n = select1(&client, &db, "count()", "1").await;
+        if n != "3" {
+            return Err(format!("expected all 3 rows of the block to land, got {n}"));
+        }
+        let to = select1(&client, &db, "arrayStringConcat(`email.to`, ',')", "`metadata.uid` = 'scalar'").await;
+        if to != "carol@example.com" {
+            return Err(format!("scalar email.to must become a one-element array, got {to}"));
+        }
+        let cats = select1(
+            &client,
+            &db,
+            "arrayStringConcat(`http_request.url.categories`, ',')",
+            "`metadata.uid` = 'scalar'",
+        )
+        .await;
+        if cats != "Malware" {
+            return Err(format!("scalar categories must become a one-element array, got {cats}"));
+        }
+        let to = select1(&client, &db, "length(`email.to`)", "`metadata.uid` = 'arr'").await;
+        if to != "2" {
+            return Err(format!("array email.to must keep both elements, got {to}"));
+        }
+        let other = select1(&client, &db, "length(`email.to`)", "`metadata.uid` = 'other'").await;
+        if other != "0" {
+            return Err(format!("absent email.to must be [], got {other}"));
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    let _ = exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    result.expect("scalar/array ingest assertions");
+}
+
+/// NAN-4903: JSON type inference runs per insert block. With ClickHouse's
+/// default `input_format_try_infer_datetimes=1`, one date-looking vendor string
+/// retyped the whole path to DateTime and coerced the other rows of the block
+/// (`"1"` was stored as `2026-01-01 00:00:00`). The server profiles in
+/// `clickhouse/users.d/query_limits.xml` turn date inference off; this pins the
+/// result against a ClickHouse running that config.
+#[tokio::test]
+async fn ocsf_vendor_strings_are_not_retyped_as_dates() {
+    if std::env::var("SKIP_DB_TESTS").is_ok() {
+        return;
+    }
+    let client = reqwest::Client::new();
+    if !reachable(&client).await {
+        eprintln!("Skipping: ClickHouse not reachable at {}", ch_url());
+        return;
+    }
+    let infer = exec(&client, "SELECT getSetting('input_format_try_infer_datetimes')")
+        .await
+        .unwrap_or_default();
+    if infer.trim() != "false" && infer.trim() != "0" {
+        eprintln!("Skipping: server profile is not the repo's users.d (datetime inference on)");
+        return;
+    }
+    let db = format!(
+        "ocsf_nodate_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    exec(&client, &format!("CREATE DATABASE {db}")).await.expect("create db");
+    let result = async {
+        for stmt in test_table_ddl(&db) {
+            exec(&client, &stmt).await?;
+        }
+        let block = [
+            r#"{"event":{"class_uid":0,"time":1749081600123,"metadata":{"uid":"d1"},"unmapped":{"column_21":"2024/10/30 09:46:12"}}}"#,
+            r#"{"event":{"class_uid":0,"time":1749081600124,"metadata":{"uid":"d2"},"unmapped":{"column_21":"1"}}}"#,
+        ]
+        .join("\n");
+        insert_row(&client, &db, &block).await?;
+        let v1 = select1(&client, &db, "toString(unmapped.column_21)", "`metadata.uid` = 'd1'").await;
+        let v2 = select1(&client, &db, "toString(unmapped.column_21)", "`metadata.uid` = 'd2'").await;
+        if v1 != "2024/10/30 09:46:12" || v2 != "1" {
+            return Err(format!("vendor strings were rewritten: d1={v1:?} d2={v2:?}"));
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    let _ = exec(&client, &format!("DROP DATABASE IF EXISTS {db}")).await;
+    result.expect("no date retyping");
 }

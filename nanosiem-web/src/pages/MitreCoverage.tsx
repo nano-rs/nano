@@ -399,14 +399,11 @@ function FilterRow({ filters, onChange, density, onDensity, showIds, onShowIds, 
 // ----------------------------------------------------------------------------
 
 function CatalogEmptyState({ syncState }: { syncState: MitreSyncState | null }) {
+  const neverSynced = syncState == null || syncState.last_success_at == null;
   const failed = syncState?.status === 'failed';
-  // No state row at all is the dedicated first-boot seed window (the row is
-  // written by the very first sync attempt); a row that says `syncing` is a
-  // sync in flight. A row that is idle/succeeded with an empty catalog means
-  // nobody has synced it yet (hosted-shared: the platform sync has not run) —
-  // that is a waiting state, not a spinner, or the page spins forever.
-  const syncing = !failed && (syncState == null || syncState.status === 'syncing');
-  const notSyncedYet = !failed && !syncing;
+  // Treat unknown/never-synced as "syncing" — an empty catalog on first boot is
+  // overwhelmingly the seed window, not a terminal failure.
+  const syncing = !failed && (syncState == null || syncState.status === 'syncing' || neverSynced);
 
   return (
     <div className="flex-1 flex items-center justify-center p-8">
@@ -419,20 +416,6 @@ function CatalogEmptyState({ syncState }: { syncState: MitreSyncState | null }) 
               The MITRE ATT&amp;CK catalog is being fetched and validated. Coverage will appear as soon
               as techniques are available — this usually takes under a minute on first boot.
             </div>
-          </>
-        ) : notSyncedYet ? (
-          <>
-            <AlertTriangle className="w-8 h-8 text-muted-foreground" />
-            <div className="text-[14px] font-semibold text-foreground">ATT&amp;CK catalog not synced yet</div>
-            <div className="text-[11.5px] text-muted-foreground leading-relaxed">
-              The platform has not populated the MITRE ATT&amp;CK catalog yet. Coverage appears once the
-              platform sync completes; nothing on this page needs to change.
-            </div>
-            {syncState?.last_error ? (
-              <div className="text-[10.5px] font-mono text-rose-500/90 break-words max-w-full">
-                {syncState.last_error}
-              </div>
-            ) : null}
           </>
         ) : (
           <>
@@ -560,19 +543,14 @@ export function MitreCoverage() {
   // 0-of-0 matrix. Show the real catalog sync state instead (NAN-1766 / D5).
   if (!loading && techniques.length === 0) {
     return (
-      <div className="flex flex-col min-h-full -m-3">
+      <div className="flex flex-col h-full min-h-0 -m-3">
         <CatalogEmptyState syncState={catalogData?.sync_state ?? null} />
       </div>
     );
   }
 
   return (
-    // NAN-3250: normal document flow inside the app scroller. A fill-height
-    // column (h-full + min-h-0) left the matrix only the height under the
-    // summary strip and filters (79px at a 720px window). The matrix keeps its
-    // own bounded scroll box (sticky tactic headers, horizontal scroll); see
-    // CoverageMatrix.
-    <div className="flex flex-col min-h-full -m-3" data-testid="mitre-coverage-page">
+    <div className="flex flex-col h-full min-h-0 -m-3">
       <DroppedMappingsBanner mappings={droppedMappings} />
       <SummaryStrip
         pct={pct}

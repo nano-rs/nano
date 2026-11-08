@@ -189,6 +189,10 @@ features = [
 ]
 optional = true
 
+[dependencies.socket2]
+version = "0.6"
+features = ["all"]
+
 [dependencies.tokio]
 version = "1"
 features = [

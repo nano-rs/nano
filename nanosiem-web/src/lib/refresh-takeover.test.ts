@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+/// <reference types="node" />
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
-import {
-  broadcastSessionReplacement,
-  coordinateBrowserRefresh,
-  refreshCoordinationNames,
-  tenantCookieSlot,
-} from './refresh-coordinator.ts';
+import { coordinateBrowserRefresh, REFRESH_LOCK_NAME } from './refresh-coordinator.ts';
 import { SessionCredentials } from './session-credentials.ts';
-import { requestCredentials } from './request-credentials.ts';
 
 function mockLocks(t: TestContext, locks: Locks | undefined): void {
   const values = new Map<string, string>();
@@ -31,7 +26,8 @@ function mockLocks(t: TestContext, locks: Locks | undefined): void {
 }
 
 /** Models Web Locks including rejection of the previous request on steal.
- * BroadcastChannel is Node's actual asynchronous channel implementation. */
+ * BroadcastChannel is Node's real asynchronous channel implementation, so
+ * every "tab" below talks over an actual channel. */
 class Locks {
   holders = new Map<string, { reject: (error: Error) => void }>();
   steals = 0;
@@ -45,21 +41,65 @@ class Locks {
     return new Promise((resolve, reject) => {
       const owner = { reject };
       this.holders.set(name, owner);
-      Promise.resolve().then(() => callback({ name, mode: 'exclusive' })).then(resolve, reject).finally(() => {
+      Promise.resolve().then(() => callback({ name, mode: 'exclusive' } as Lock)).then(resolve, reject).finally(() => {
         if (this.holders.get(name) === owner) this.holders.delete(name);
       });
     });
   }
 }
 
+/** The server's single-use refresh cookie: compare-and-swap rotation, so a
+ * second presentation of the same cookie is refused (base auth service). */
+class RotatingCookieServer {
+  private cookie = 'refresh-0';
+  private generation = 0;
+  calls = 0;
+  rejected = 0;
+  async refresh(presented: string): Promise<string> {
+    this.calls++;
+    await new Promise(resolve => setTimeout(resolve, 15));
+    if (presented !== this.cookie) {
+      this.rejected++;
+      throw new Error('401 invalid refresh token');
+    }
+    this.generation++;
+    this.cookie = `refresh-${this.generation}`;
+    return `access-${this.generation}`;
+  }
+  current(): string { return this.cookie; }
+}
+
+test('multi-tab refresh race: one rotation, every tab keeps its session, no logout', async t => {
+  mockLocks(t, new Locks());
+  const server = new RotatingCookieServer();
+  let prompts = 0;
+  // Four tabs, each with its own in-memory bearer and request gate, sharing
+  // the origin's cookie jar. All of their access tokens expire together.
+  const tabs = Array.from({ length: 4 }, () => {
+    let token: string | null = null;
+    const gate = new SessionCredentials(() => token);
+    const refresh = () => gate.runRefresh(async () => {
+      token = await coordinateBrowserRefresh(
+        () => server.refresh(server.current()),
+        { timeoutMs: 500 },
+      );
+      return true;
+    });
+    gate.configure(refresh, () => { prompts++; });
+    return gate;
+  });
+  const credentials = await Promise.all(tabs.flatMap(gate => [gate.credential(), gate.credential()]));
+  assert.equal(server.calls, 1, 'exactly one tab presents the single-use cookie');
+  assert.equal(server.rejected, 0);
+  assert.deepEqual(credentials, Array(8).fill('access-1'));
+  assert.equal(prompts, 0, 'no tab is logged out');
+});
+
 test('dead leader is replaced by one follower; queued API calls use its credential', async t => {
   const locks = new Locks();
   mockLocks(t, locks);
-  const scopeKey = 'enterprise_shared:takeover:user';
-  const lockName = refreshCoordinationNames(scopeKey).lockName;
   // The elected tab is suspended mid-fetch and never publishes or releases.
-  const leader = locks.request(lockName, {}, () => new Promise(() => {})).catch(() => undefined);
-  void leader;
+  void locks.request(REFRESH_LOCK_NAME, {}, () => new Promise(() => {})).catch(() => undefined);
   let calls = 0;
   let token: string | null = null;
   const gate = new SessionCredentials(() => token);
@@ -67,59 +107,51 @@ test('dead leader is replaced by one follower; queued API calls use its credenti
     calls++;
     await new Promise(resolve => setTimeout(resolve, 10));
     return 'fresh';
-  }, { scopeKey, timeoutMs: 80 });
+  }, { timeoutMs: 80 });
   gate.configure(() => gate.runRefresh(async () => { token = await refresh(); return true; }), null);
-  const sent: string[] = [];
   const started = Date.now();
-  const queued = Array.from({ length: 12 }, async () => {
-    const credential = await gate.credential();
-    requestCredentials('/api/dashboards', { Authorization: `Bearer ${credential}` });
-    sent.push(credential);
-  });
+  const queued = Array.from({ length: 12 }, () => gate.credential());
   // Another waiting tab must not steal the replacement leader's lock.
   const sibling = refresh();
-  await Promise.all([...queued, sibling]);
+  const [sent] = await Promise.all([Promise.all(queued), sibling]);
   assert.deepEqual(sent, Array(12).fill('fresh'));
   assert.equal(calls, 1);
   assert.equal(locks.steals, 1);
   assert.ok(Date.now() - started < 1000);
 });
 
-test('BroadcastChannel fallback elects one simultaneous refresh winner without Locks', async t => {
+test('BroadcastChannel fallback (no Web Locks, e.g. http origin) elects one winner', async t => {
   mockLocks(t, undefined);
   let calls = 0;
   const refresh = () => coordinateBrowserRefresh(async () => {
     calls++;
     await new Promise(resolve => setTimeout(resolve, 20));
     return 'fallback-token';
-  }, { scopeKey: 'fallback', requireCoordination: true, timeoutMs: 200 });
+  }, { timeoutMs: 200 });
   assert.deepEqual(await Promise.all([refresh(), refresh()]), ['fallback-token', 'fallback-token']);
   assert.equal(calls, 1);
 });
 
-test('a slow leader timeout is observed and does not emit an unhandled rejection', async t => {
-  const locks = new Locks();
-  mockLocks(t, locks);
+test('a slow leader times out instead of publishing a stale result', async t => {
+  mockLocks(t, new Locks());
   await assert.rejects(coordinateBrowserRefresh(async () => {
     await new Promise(resolve => setTimeout(resolve, 40));
     return 'stale';
-  }, { scopeKey: 'slow', timeoutMs: 20 }), /Timed out/);
+  }, { timeoutMs: 20 }), /Timed out/);
 });
 
-test('a replacement leader can also disappear without holding the election lock', async t => {
+test('a replacement leader can also disappear', async t => {
   const locks = new Locks();
   mockLocks(t, locks);
-  const scopeKey = 'replacement-disappears';
-  const lockName = refreshCoordinationNames(scopeKey).lockName;
-  void locks.request(lockName, {}, () => new Promise(() => {})).catch(() => undefined);
+  void locks.request(REFRESH_LOCK_NAME, {}, () => new Promise(() => {})).catch(() => undefined);
   let started!: () => void;
   const replacing = new Promise<void>(resolve => { started = resolve; });
   const first = coordinateBrowserRefresh(async () => {
     started();
     return new Promise<string>(() => {});
-  }, { scopeKey, timeoutMs: 40 }).catch(error => error);
+  }, { timeoutMs: 40 }).catch(error => error);
   await replacing;
-  const result = await coordinateBrowserRefresh(async () => 'second-takeover', { scopeKey, timeoutMs: 80 });
+  const result = await coordinateBrowserRefresh(async () => 'second-takeover', { timeoutMs: 80 });
   assert.equal(result, 'second-takeover');
   assert.equal(locks.steals, 2);
   assert.equal((await first).name, 'AbortError');
@@ -127,8 +159,7 @@ test('a replacement leader can also disappear without holding the election lock'
 
 test('BroadcastChannel follower takes over an expired, disappeared leader lease', async t => {
   mockLocks(t, undefined);
-  const scopeKey = 'fallback-dead';
-  const channel = new BroadcastChannel(`${refreshCoordinationNames(scopeKey).lockName}:lease`);
+  const channel = new BroadcastChannel(`${REFRESH_LOCK_NAME}:lease`);
   t.after(() => channel.close());
   const expiresAt = Date.now() + 100;
   channel.onmessage = event => {
@@ -141,74 +172,98 @@ test('BroadcastChannel follower takes over an expired, disappeared leader lease'
   assert.equal(await coordinateBrowserRefresh(async () => {
     calls++;
     return 'recovered';
-  }, { scopeKey, timeoutMs: 150 }), 'recovered');
+  }, { timeoutMs: 150 }), 'recovered');
   assert.equal(calls, 1);
 });
 
-test('NAN-3548: a stuck acme refresh never delays or blocks a globex refresh', async t => {
-  const locks = new Locks();
-  mockLocks(t, locks);
-  const acme = { scopeKey: 'enterprise_shared:tenant-acme:user-ann', cookieSlot: tenantCookieSlot('acme') };
-  const globex = { scopeKey: 'enterprise_shared:tenant-globex:user-ann', cookieSlot: tenantCookieSlot('globex') };
-  // acme's leader is suspended mid-rotation and holds acme's cookie lock.
-  void locks.request(
-    refreshCoordinationNames(acme.scopeKey, acme.cookieSlot).lockName,
-    {},
-    () => new Promise(() => {}),
-  ).catch(() => undefined);
-  const started = Date.now();
-  const token = await coordinateBrowserRefresh(async () => 'globex-access', {
-    ...globex, requireCoordination: true, timeoutMs: 5_000,
-  });
-  assert.equal(token, 'globex-access');
-  assert.equal(locks.steals, 0, 'globex must not steal acme\'s lock');
-  assert.ok(Date.now() - started < 1_000, 'no wait on another tenant\'s leader');
+test('only the access token crosses tabs', async () => {
+  const { accessOnlyRefreshResult } = await import('./refresh-coordinator.ts');
+  assert.deepEqual(
+    accessOnlyRefreshResult({ access_token: 'a', expires_in: 900, refresh_token: 'secret' }),
+    { access_token: 'a', expires_in: 900 },
+  );
 });
 
-test("NAN-3548: an acme sign-in/refresh signal does not abort a waiting globex follower", async t => {
-  const locks = new Locks();
-  mockLocks(t, locks);
-  const acme = { scopeKey: 'enterprise_shared:tenant-acme:user-ann', cookieSlot: tenantCookieSlot('acme') };
-  const globex = { scopeKey: 'enterprise_shared:tenant-globex:user-ann', cookieSlot: tenantCookieSlot('globex') };
-  let release!: () => void;
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  let calls = 0;
-  const leader = coordinateBrowserRefresh(async () => {
-    calls++;
-    await gate;
-    return 'globex-access';
-  }, { ...globex, requireCoordination: true, timeoutMs: 2_000 });
-  await new Promise(resolve => setTimeout(resolve, 10));
-  const follower = coordinateBrowserRefresh(async () => {
-    calls++;
-    return 'unexpected-second-rotation';
-  }, { ...globex, requireCoordination: true, timeoutMs: 2_000 });
-  await new Promise(resolve => setTimeout(resolve, 10));
-  // The acme tab signs in / refreshes while globex's refresh is in flight.
-  broadcastSessionReplacement(acme.scopeKey, acme.cookieSlot);
-  await new Promise(resolve => setTimeout(resolve, 20));
-  release();
-  assert.deepEqual(await Promise.all([leader, follower]), ['globex-access', 'globex-access']);
-  assert.equal(calls, 1);
+/** BroadcastChannel whose delivery is delayed past the 50 ms election window
+ * (a busy or throttled renderer): the http-origin election can no longer see
+ * its rival, so both tabs reach the refresh endpoint. */
+function delayBroadcastChannel(t: TestContext, delayMs: number): void {
+  const Original = globalThis.BroadcastChannel;
+  class Delayed extends Original {
+    postMessage(message: unknown): void {
+      setTimeout(() => { try { super.postMessage(message); } catch { /* closed */ } }, delayMs);
+    }
+  }
+  Object.defineProperty(globalThis, 'BroadcastChannel', { configurable: true, writable: true, value: Delayed });
+  t.after(() => Object.defineProperty(globalThis, 'BroadcastChannel', { configurable: true, writable: true, value: Original }));
+}
+
+/** The origin cookie jar plus the server's rotation. `graceMs` models the
+ * server-side tolerance for the immediately previous refresh token
+ * (REFRESH_GRACE_SECS): such a refresh returns an access token and leaves the
+ * cookie alone. A refused refresh clears the cookie (the real 401 response). */
+class CookieJarServer {
+  cookie: string | null = 'refresh-0';
+  private previous: string | null = null;
+  private rotatedAt = 0;
+  private generation = 0;
+  calls = 0;
+  private readonly graceMs: number;
+  constructor(graceMs: number) { this.graceMs = graceMs; }
+  async refresh(): Promise<string> {
+    const presented = this.cookie;
+    this.calls++;
+    await new Promise(resolve => setTimeout(resolve, 10));
+    if (presented !== null && presented === this.cookie) {
+      this.previous = presented;
+      this.rotatedAt = Date.now();
+      this.generation++;
+      this.cookie = `refresh-${this.generation}`;
+      return `access-${this.generation}`;
+    }
+    if (presented !== null && presented === this.previous && Date.now() - this.rotatedAt < this.graceMs) {
+      return `access-${this.generation}-grace`;
+    }
+    this.cookie = null; // 401 + clear-cookie headers
+    throw new Error('401 invalid refresh token');
+  }
+}
+
+async function raceTwoTabs(server: CookieJarServer) {
+  let prompts = 0;
+  const tabs = Array.from({ length: 2 }, () => {
+    let token: string | null = null;
+    const gate = new SessionCredentials(() => token);
+    gate.configure(() => gate.runRefresh(async () => {
+      token = await coordinateBrowserRefresh(() => server.refresh(), { timeoutMs: 1000 });
+      return true;
+    }), () => { prompts++; });
+    return gate;
+  });
+  const results = await Promise.allSettled(tabs.map(gate => gate.credential()));
+  return { results, prompts };
+}
+
+test('http origin, delayed BroadcastChannel: the race reaches the server twice', async t => {
+  // Control: proves the election alone is not mutual exclusion. Against a
+  // strict single-use server one tab is logged out and the cookie is wiped.
+  mockLocks(t, undefined);
+  delayBroadcastChannel(t, 200);
+  const strict = new CookieJarServer(0);
+  const { results, prompts } = await raceTwoTabs(strict);
+  assert.equal(strict.calls, 2);
+  assert.ok(results.some(r => r.status === 'rejected'));
+  assert.ok(prompts >= 1);
+  assert.equal(strict.cookie, null);
 });
 
-test('NAN-3548: a same-tenant replacement still aborts a waiting follower (fail closed)', async t => {
-  const locks = new Locks();
-  mockLocks(t, locks);
-  const slot = tenantCookieSlot('acme');
-  let release!: () => void;
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  const leader = coordinateBrowserRefresh(async () => {
-    await gate;
-    return 'ann-access';
-  }, { scopeKey: 'enterprise_shared:tenant-acme:user-ann', cookieSlot: slot, timeoutMs: 2_000 });
-  await new Promise(resolve => setTimeout(resolve, 10));
-  const follower = coordinateBrowserRefresh(async () => 'never', {
-    scopeKey: 'enterprise_shared:tenant-acme:user-ann', cookieSlot: slot, timeoutMs: 2_000,
-  });
-  await new Promise(resolve => setTimeout(resolve, 10));
-  broadcastSessionReplacement('enterprise_shared:tenant-acme:user-eve', slot);
-  await assert.rejects(follower, /different tenant session replaced/);
-  release();
-  assert.equal(await leader, 'ann-access');
+test('http origin, delayed BroadcastChannel: server grace window keeps both tabs signed in', async t => {
+  mockLocks(t, undefined);
+  delayBroadcastChannel(t, 200);
+  const server = new CookieJarServer(20_000);
+  const { results, prompts } = await raceTwoTabs(server);
+  assert.equal(server.calls, 2, 'both tabs reached the endpoint');
+  assert.deepEqual(results.map(r => r.status), ['fulfilled', 'fulfilled']);
+  assert.equal(prompts, 0, 'no logout');
+  assert.equal(server.cookie, 'refresh-1', "the winner's rotated cookie survives");
 });

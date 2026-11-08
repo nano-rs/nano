@@ -5,15 +5,12 @@
  * Handles search operations, saved searches, query explanations, and asset artifacts
  */
 
-import { abortableDelay } from '../abortable-delay';
-import { normalizeErrorBody, safeErrorMessage } from './http-error';
-import { authenticatedFetch } from '../authenticated-fetch';
-import { SessionExpiredError } from '../request-credentials';
+import { authenticatedFetch } from '../authenticated-fetch.ts';
+import { SessionExpiredError } from '../session-credentials.ts';
 
 import type {
   SearchRequest,
   SearchResponse,
-  SearchJobResultPage,
   RawSqlRequest,
   TimeRange,
   SavedSearch,
@@ -61,43 +58,10 @@ import type {
   ListTracesResponse,
   MetricNamesResponse,
   RetroRequest,
-  SearchHistogramRequest,
-  SearchHistogramResponse,
+  RetroResponse,
+  TreePageRequest,
+  TreePageResponse,
 } from './types';
-import { browserTenantRuntime } from '@/lib/tenant-runtime';
-
-import { retrySearchAuthority, type AuthorityRetryOptions } from './search-authority-retry';
-
-/**
- * NAN-3229: tells `POST /api/search` whether this caller polls an
- * `AsyncSearchResponse`. NAN-3474: the server moves a search still running at
- * its interactive deadline to a job for every caller that does not send `0`;
- * `searchInteractive` follows the job, the atomic `search` (rows only) opts
- * out and keeps the synchronous answer.
- */
-export const ACCEPT_ASYNC_HEADER = 'x-nano-accept-async';
-
-/**
- * NAN-4593: the atomic `search()` callers render `results` only, so a
- * `{job_id, status}` answer (no `results`) would read as "no matches". The
- * server never sends one to an opted-out caller; should one arrive anyway
- * (an older server, a proxy), fail loudly instead of rendering an empty set.
- */
-export class SearchMovedToJobError extends Error {
-  readonly jobId: string;
-  constructor(jobId: string) {
-    super('This search is still running as a background job; open it in Search to see its results.');
-    this.name = 'SearchMovedToJobError';
-    this.jobId = jobId;
-  }
-}
-
-export function requireSyncSearchAnswer(response: SearchResponse | AsyncSearchResponse): SearchResponse {
-  if (response && typeof response === 'object' && 'job_id' in response && !('results' in response)) {
-    throw new SearchMovedToJobError(String((response as AsyncSearchResponse).job_id));
-  }
-  return response as SearchResponse;
-}
 
 export class SearchApi {
   constructor(
@@ -112,44 +76,33 @@ export class SearchApi {
 
   // Core search endpoints
   async search(request: SearchRequest): Promise<SearchResponse> {
-    const response = await this.request<SearchResponse | AsyncSearchResponse>('/api/search', {
-      // Callers render `results` only; never hand them a job id at the deadline.
-      headers: { [ACCEPT_ASYNC_HEADER]: '0' },
+    return this.request('/api/search', {
       method: 'POST',
       body: JSON.stringify(request),
     });
-    return requireSyncSearchAnswer(response);
   }
 
   /**
-   * Interactive admission may escalate to an existing durable job: when the
-   * query is resource-bound, or (NAN-3229, `x-nano-accept-async`) when it is
-   * still running at the server's interactive deadline (45 s), so a slow
-   * search never sits on a request past the 60 s edge.
+   * NAN-3077: the Search page's interactive `/api/search` call. Opts in to
+   * progressive product views (`x-nano-progressive-views: 1`): a terminal
+   * `| tree` answers a pending marker the tree view pages through
+   * `/api/search/tree-page`, and a terminal `| lateral` answers a pending
+   * marker the Lateral view streams hop by hop. Kept separate from `search()`
+   * so dashboards, exports, pivt and every other caller that renders
+   * `results` directly keep receiving the full, atomic result.
    */
   async searchInteractive(
     request: Omit<SearchRequest, 'async_mode'>,
-    retry?: AuthorityRetryOptions,
-    // NAN-3809: a settled re-served job answers `x-nano-cache: hit` + age.
-    onCacheMeta?: (meta: import('./index').CacheMeta) => void,
+    opts?: { acceptAsync?: boolean; signal?: AbortSignal },
   ): Promise<SearchResponse | AsyncSearchResponse> {
-    return retrySearchAuthority(() => this.request<SearchResponse | AsyncSearchResponse>('/api/search', {
-      headers: { 'x-nano-progressive-views': '1', [ACCEPT_ASYNC_HEADER]: '1' },
+    return this.request<SearchResponse | AsyncSearchResponse>('/api/search', {
+      headers: {
+        'x-nano-progressive-views': '1',
+        ...(opts?.acceptAsync ? { 'x-nano-accept-async': '1' } : {}),
+      },
       method: 'POST',
       body: JSON.stringify(request),
-    }, onCacheMeta ? { onMeta: onCacheMeta } : undefined), retry);
-  }
-
-  /**
-   * NAN-3093: the search's timeline alone. The Search page asks for it beside
-   * a rows request sent with `skip_histogram`, so rows paint without waiting
-   * for the histogram companion.
-   */
-  async searchHistogram(request: SearchHistogramRequest, signal?: AbortSignal): Promise<SearchHistogramResponse> {
-    return this.request('/api/search/histogram', {
-      method: 'POST',
-      body: JSON.stringify(request),
-      signal,
+      signal: opts?.signal,
     });
   }
 
@@ -420,7 +373,7 @@ export class SearchApi {
   async getRetro(
     request: RetroRequest,
     cacheOpts?: import('./index').CacheRequestOpts
-  ): Promise<import('./types').RetroResultResponse> {
+  ): Promise<RetroResponse> {
     return this.request(
       '/api/search/retro',
       {
@@ -495,9 +448,13 @@ export class SearchApi {
     });
   }
 
+  // NAN-4928: POST with the query in the body, so the hunt never lands in a
+  // GET URL (server and proxy logs). The GET ?q= form is deprecated.
   async getQueryExplanation(query: string): Promise<QueryExplanationResponse> {
-    const params = new URLSearchParams({ q: query });
-    return this.request(`/api/search/explanation?${params.toString()}`);
+    return this.request('/api/search/explanation/lookup', {
+      method: 'POST',
+      body: JSON.stringify({ q: query }),
+    });
   }
 
   // Query cancellation (server-side)
@@ -513,30 +470,43 @@ export class SearchApi {
    * Start an async search and return immediately with a job ID.
    * Use getSearchJob() to poll for results.
    */
-  async searchAsync(request: Omit<SearchRequest, 'async_mode'>, retry?: AuthorityRetryOptions, signal?: AbortSignal): Promise<AsyncSearchResponse> {
-    return retrySearchAuthority(() => this.request<AsyncSearchResponse>('/api/search', {
-      signal,
+  async searchAsync(request: Omit<SearchRequest, 'async_mode'>, signal?: AbortSignal): Promise<AsyncSearchResponse> {
+    return this.request('/api/search', {
       method: 'POST',
       body: JSON.stringify({ ...request, async_mode: true }),
-    }), signal ? { ...retry, isCancelled: () => signal.aborted || !!retry?.isCancelled?.() } : retry, ms => abortableDelay(ms, signal));
+      signal,
+    });
   }
 
-  async getTreePage(request: import('./types').TreePageRequest, signal?: AbortSignal): Promise<import('./types').TreePageResponse> {
-    return retrySearchAuthority(() => this.request<import('./types').TreePageResponse>('/api/search/tree-page', { method: 'POST', body: JSON.stringify(request), signal }), signal ? { isCancelled: () => signal.aborted } : undefined, ms => abortableDelay(ms, signal));
+  /**
+   * NAN-3077: one page of a progressive `| tree`. `query` + `time_range`
+   * returns the bounded (200-row) provisional first roots page; `job_id` (an
+   * async search job of the same query) pages its exact stored tree by
+   * `parent_path` / `offset`.
+   */
+  async getTreePage(request: TreePageRequest, signal?: AbortSignal): Promise<TreePageResponse> {
+    return this.request<TreePageResponse>('/api/search/tree-page', {
+      method: 'POST',
+      body: JSON.stringify(request),
+      signal,
+    });
   }
 
   /**
    * Get the status of an async search job.
    * Returns progress while running, results when completed.
    */
-  async getSearchJob(jobId: string, retry?: AuthorityRetryOptions, signal?: AbortSignal): Promise<SearchJobStatus> {
-    return retrySearchAuthority(() => this.request<SearchJobStatus>(`/api/search/jobs/${jobId}`, { signal }), signal ? { ...retry, isCancelled: () => signal.aborted || !!retry?.isCancelled?.() } : retry, ms => abortableDelay(ms, signal));
+  async getSearchJob(jobId: string): Promise<SearchJobStatus> {
+    return this.request(`/api/search/jobs/${jobId}`);
   }
 
-  async getSearchJobResultPage(jobId: string, page: number, signal?: AbortSignal): Promise<SearchJobResultPage> {
-    return this.request(
-      `/api/search/jobs/${encodeURIComponent(jobId)}/results/${page}`, { signal }
-    );
+  /**
+   * NAN-4915: page through a COMPLETED background job's stored rows
+   * (continuation — never re-runs the search). 409 while running.
+   */
+  async getSearchJobResults(jobId: string, offset: number, limit: number): Promise<import('./types').JobResultsPage> {
+    const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+    return this.request(`/api/search/jobs/${encodeURIComponent(jobId)}/results?${params}`);
   }
 
   /**
@@ -590,10 +560,9 @@ export class SearchApi {
   searchStreamSSE(
     request: Omit<SearchRequest, 'async_mode'>,
     callbacks: SearchStreamCallbacks,
-    opts?: { bypass?: boolean; follow?: boolean }
+    opts?: { bypass?: boolean; acceptAsync?: boolean; progressive?: boolean }
   ): AbortController {
     const controller = new AbortController();
-    const capturedRuntime = browserTenantRuntime.current();
 
     const baseUrl = this.searchBaseUrl ?? '';
     const headers: Record<string, string> = {
@@ -601,37 +570,32 @@ export class SearchApi {
       'Accept': 'text/event-stream',
       // NAN-1595: refresh forces a live server recompute (bypasses Dragonfly).
       ...(opts?.bypass ? { 'x-nano-cache-bypass': '1' } : {}),
-      ...(opts?.follow ? { 'x-nano-follow': 'true' } : {}),
+      // NAN-4915: accept a hand-off to a durable background job (terminal
+      // `job` event) when the search outruns the interactive budget.
+      ...(opts?.acceptAsync ? { 'x-nano-accept-async': '1' } : {}),
+      // NAN-3077: the interactive Search page (the caller that accepts a job
+      // hand-off) asks for progressive product views: a terminal `| tree` /
+      // `| lateral` streams a pending dispatcher that the view then pages or
+      // streams hop by hop. A view's own stream passes `progressive: false`.
+      ...((opts?.progressive ?? opts?.acceptAsync) ? { 'x-nano-progressive-views': '1' } : {}),
     };
+
+    // NAN-2453: waits for an in-flight refresh, never streams without a
+    // bearer, and reconnects once with the refreshed bearer on 401.
     authenticatedFetch('/api/search/stream', `${baseUrl}/api/search/stream`, {
       method: 'POST',
       headers,
       body: JSON.stringify(request),
       signal: controller.signal,
-    }, () => browserTenantRuntime.assertCurrent(capturedRuntime)).then(async (response) => {
-      if (!browserTenantRuntime.isCurrent(capturedRuntime)) {
-        controller.abort();
-        return;
-      }
+    }).then(async (response) => {
       if (!response.ok) {
         const errorText = await response.text();
-        const errorMsg = normalizeErrorBody(response.status, errorText, response.headers).message || 'Search failed. Retry in a moment.';
-        let errorCode = 'HTTP_ERROR';
-        let coldScan: Partial<import('./types').SearchStreamError> = {};
+        let errorMsg = errorText;
         try {
           const errorJson = JSON.parse(errorText);
-          // NAN-3644: the reader's cold-read ceiling; COLD_BUDGET_EXCEEDED is
-          // the retired per-query refusal a mid-roll service may still send.
-          if (errorJson?.error?.code === 'COLD_SCAN_TOO_LARGE' || errorJson?.error?.code === 'COLD_BUDGET_EXCEEDED') {
-            errorCode = errorJson.error.code;
-            const { reason, needed_bytes, ceiling_bytes, background_ceiling_bytes, budget_bytes, retryable } = errorJson.error;
-            coldScan = { reason, needed_bytes, ceiling_bytes, background_ceiling_bytes, budget_bytes, retryable };
-          }
-        } catch {
-          // NAN-4753: never surface an edge/proxy HTML page.
-          // The normalized message above already covers malformed JSON.
-        }
-        callbacks.onError?.({ ...coldScan, code: errorCode, message: errorMsg });
+          errorMsg = errorJson?.error?.message || errorJson?.message || errorText;
+        } catch { /* use raw text */ }
+        callbacks.onError?.({ code: 'HTTP_ERROR', message: errorMsg });
         return;
       }
 
@@ -657,10 +621,6 @@ export class SearchApi {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (!browserTenantRuntime.isCurrent(capturedRuntime)) {
-          await reader.cancel();
-          return;
-        }
 
         buffer += decoder.decode(value, { stream: true });
 
@@ -675,12 +635,7 @@ export class SearchApi {
         }
 
         for (const line of lines) {
-          if (!browserTenantRuntime.isCurrent(capturedRuntime)) {
-            await reader.cancel();
-            return;
-          }
-          // SSE comment (transport keepalive). Not a follow heartbeat: the
-          // handler writes it even while the follow itself is stuck (NAN-3264).
+          // SSE comment (keepalive)
           if (line.startsWith(':')) continue;
 
           // Event type line
@@ -704,13 +659,11 @@ export class SearchApi {
                 case 'started':
                   callbacks.onStarted?.(parsed.data ?? parsed);
                   break;
-                case 'heartbeat':
-                  callbacks.onHeartbeat?.(parsed.data ?? parsed);
-                  break;
                 case 'progress':
                   callbacks.onProgress?.(parsed.data ?? parsed);
                   break;
                 case 'view_update':
+                  // NAN-3077: cumulative `| lateral` graph after each hop.
                   callbacks.onViewUpdate?.(parsed.data ?? parsed);
                   break;
                 case 'rows':
@@ -723,18 +676,12 @@ export class SearchApi {
                   callbacks.onCompleted?.(parsed.data ?? parsed);
                   return;
                 case 'error':
-                  {
-                    const error = parsed.data ?? parsed;
-                    callbacks.onError?.({ ...error, message: safeErrorMessage(error.message, 'Search failed. Retry in a moment.') });
-                  }
+                  callbacks.onError?.(parsed.data ?? parsed);
+                  return;
+                case 'job':
+                  callbacks.onJob?.(parsed.data ?? parsed);
                   return;
                 case 'done':
-                  // NAN-3244: a follow stream that ends without `completed`
-                  // or `error` must still tell the caller, or the tail
-                  // silently stops while the UI says it is live.
-                  if (opts?.follow && !controller.signal.aborted && browserTenantRuntime.isCurrent(capturedRuntime)) {
-                    callbacks.onError?.({ code: 'NETWORK_ERROR', message: 'Follow stream closed' });
-                  }
                   return;
               }
             } catch (e) {
@@ -745,12 +692,10 @@ export class SearchApi {
           }
         }
       }
-      if (opts?.follow && !controller.signal.aborted && browserTenantRuntime.isCurrent(capturedRuntime)) {
-        callbacks.onError?.({ code: 'NETWORK_ERROR', message: 'Follow stream closed' });
-      }
     }).catch((error) => {
-      if (!(error instanceof SessionExpiredError) && error.name !== 'AbortError' && browserTenantRuntime.isCurrent(capturedRuntime)) {
-        callbacks.onError?.({ code: 'NETWORK_ERROR', message: safeErrorMessage(error.message, 'Search failed. Retry in a moment.') });
+      // A SessionExpiredError was already reported once by AuthContext.
+      if (error.name !== 'AbortError' && !(error instanceof SessionExpiredError)) {
+        callbacks.onError?.({ code: 'NETWORK_ERROR', message: error.message });
       }
     });
 

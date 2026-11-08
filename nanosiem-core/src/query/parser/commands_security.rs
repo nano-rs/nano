@@ -252,7 +252,6 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
             return Ok((
                 remaining,
                 Command::Prevalence {
-                    artifact_fields: vec![],
                     conditions: vec![],
                     time_window,
                     enrich: enrich_value,
@@ -276,10 +275,8 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
 
             // Check if this looks like a window/interval spec or enrich
             let trimmed_lower = trimmed.to_ascii_lowercase();
-            if trimmed_lower.starts_with("window=")
-                || trimmed_lower.starts_with("window ")
-                || trimmed_lower.starts_with("interval=")
-                || trimmed_lower.starts_with("interval ")
+            if trimmed_lower.starts_with("window=") || trimmed_lower.starts_with("window ")
+                || trimmed_lower.starts_with("interval=") || trimmed_lower.starts_with("interval ")
             {
                 remaining = trimmed;
                 break;
@@ -364,7 +361,6 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
         return Ok((
             remaining,
             Command::Prevalence {
-                artifact_fields: vec![],
                 conditions,
                 time_window,
                 enrich,
@@ -392,7 +388,7 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
     for field in &fields {
         if is_prevalence_filter_field_name(field) {
             let at = input
-                .find(field.as_str())
+                .find(&field[..])
                 .map_or(input, |offset| &input[offset..]);
             return Err(nom::Err::Failure(nom::error::Error::new(
                 at,
@@ -426,7 +422,6 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
     Ok((
         remaining,
         Command::Prevalence {
-            artifact_fields: fields,
             conditions: vec![],
             time_window,
             enrich: true,
@@ -474,22 +469,6 @@ fn prevalence_condition(input: &str) -> ParseResult<'_, PrevalenceCondition> {
 /// Parse prevalence field name
 fn prevalence_field(input: &str) -> ParseResult<'_, PrevalenceField> {
     alt((
-        // NAN-4288 (F15): the nPL reference writes the condition with the
-        // prevalence column names (`prevalence prevalence_file_hash < 5`),
-        // which were a parse error. File and process hashes are both hash
-        // artifacts; there is no IP rarity filter, so `prevalence_dest_ip`
-        // stays unsupported here (use `enrich=true | where`).
-        value(
-            PrevalenceField::HashPrevalence,
-            alt((
-                tag_no_case("prevalence_file_hash"),
-                tag_no_case("prevalence_process_hash"),
-            )),
-        ),
-        value(
-            PrevalenceField::DomainPrevalence,
-            tag_no_case("prevalence_dest_domain"),
-        ),
         value(
             PrevalenceField::HashPrevalence,
             tag_no_case("hash_prevalence"),
@@ -505,6 +484,22 @@ fn prevalence_field(input: &str) -> ParseResult<'_, PrevalenceField> {
         value(
             PrevalenceField::DomainFirstSeen,
             tag_no_case("domain_first_seen"),
+        ),
+        // NAN-4288: the nPL reference (and this parser's own error hint)
+        // writes the condition with the prevalence column names
+        // (`prevalence prevalence_file_hash < 5`), which were a parse error.
+        // File and process hashes are both hash artifacts; there is no IP
+        // rarity filter, so `prevalence_dest_ip` stays unsupported here.
+        value(
+            PrevalenceField::HashPrevalence,
+            alt((
+                tag_no_case("prevalence_file_hash"),
+                tag_no_case("prevalence_process_hash"),
+            )),
+        ),
+        value(
+            PrevalenceField::DomainPrevalence,
+            tag_no_case("prevalence_dest_domain"),
         ),
     ))
     .parse(input)
@@ -1141,7 +1136,6 @@ pub(super) fn inputlookup_command(input: &str) -> ParseResult<'_, Command> {
                 break;
             }
             let (input, val) = alt((
-                value(InputLookupFormat::Ndjson, tag_no_case("ndjson")),
                 value(InputLookupFormat::Json, tag_no_case("json")),
                 value(InputLookupFormat::Csv, tag_no_case("csv")),
             ))
@@ -1174,13 +1168,8 @@ pub(super) fn inputlookup_command(input: &str) -> ParseResult<'_, Command> {
                 break;
             }
             let (input, val) = map_res(digit1, |s: &str| s.parse::<usize>()).parse(input)?;
-            if !(1..=100_000).contains(&val) {
-                return Err(nom::Err::Failure(nom::error::Error::new(
-                    input,
-                    nom::error::ErrorKind::Verify,
-                )));
-            }
-            max_rows = Some(val);
+            // Clamp to valid range (1-100000)
+            max_rows = Some(val.clamp(1, 100000));
             remaining = input;
         } else if let Ok((input, _)) =
             tag_no_case::<_, _, nom::error::Error<&str>>("cache_ttl=").parse(remaining)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Byte spans from the guarded compiler, without parsing rendered diagnostics.
-use super::{vrl_functions::safe_vrl_functions, vrl_guard};
+use super::{vrl_functions::parser_vrl_functions, vrl_guard};
 
 #[derive(Debug, Clone)]
 pub struct CompilerSite {
@@ -61,7 +61,7 @@ fn safe_set_abort(source: &str) -> Option<usize> {
 pub async fn compiler_sites(source: &str) -> Vec<CompilerSite> {
     let source = source.to_string();
     tokio::task::spawn_blocking(
-        move || match vrl_guard::compile(&source, &safe_vrl_functions()) {
+        move || match vrl_guard::compile(&source, &parser_vrl_functions()) {
             Err(vrl_guard::VrlCompileError::Diagnostics(list)) => list
                 .iter()
                 .filter_map(|d| {

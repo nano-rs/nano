@@ -1,0 +1,84 @@
+version: '3.8'
+
+# Nginx reverse proxy overlay
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.nginx.yml up -d
+#
+# Before first run:
+#   1. Generate SSL certs: bash config/nginx/generate-ssl.sh
+#   2. Or place your own certs in config/nginx/ssl/
+
+services:
+  nginx:
+    image: nginx:alpine
+    container_name: nanosiem-nginx
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=50m
+      - /var/cache/nginx:noexec,nosuid,size=100m
+      - /var/run:noexec,nosuid,size=10m
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/nginx/ssl:/etc/nginx/ssl:ro
+      - ./config/nginx/certbot:/var/www/certbot:ro
+    depends_on:
+      - nanosiem-api
+      - grafana
+      - prometheus
+      - vector
+      - mkdocs
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - default
+
+  # Override nanosiem-web to not expose port directly
+  # (nginx will proxy to it)
+  nanosiem-web:
+    image: node:20-alpine
+    container_name: nanosiem-web
+    security_opt:
+      - no-new-privileges:true
+    working_dir: /app
+    volumes:
+      - ./nanosiem-web:/app
+      - /app/node_modules
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      - VITE_API_URL=${VITE_API_URL:-https://nano.qsi.net}
+    expose:
+      - "5173"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5173/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Update Grafana to work behind subpath
+  grafana:
+    environment:
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-https://nano.qsi.net/grafana/}
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-nanosiem}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+
+  # Update Prometheus to work behind subpath
+  prometheus:
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+      - '--web.external-url=/prometheus/'
+      - '--web.route-prefix=/prometheus/'

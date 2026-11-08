@@ -299,34 +299,6 @@ macro_rules! typeid_prefix {
                         .collect()
                 }
             }
-
-            /// Serde module for `Option<Vec<Uuid>>` fields (absent / null
-            /// stays `None`; a list is decoded element-wise).
-            pub mod opt_vec {
-                use super::*;
-
-                pub fn serialize<S: Serializer>(
-                    uuids: &Option<Vec<Uuid>>,
-                    s: S,
-                ) -> Result<S::Ok, S::Error> {
-                    match uuids {
-                        Some(uuids) => super::vec::serialize(uuids, s),
-                        None => s.serialize_none(),
-                    }
-                }
-
-                pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<Uuid>>, D::Error> {
-                    let strings = Option::<Vec<String>>::deserialize(d)?;
-                    strings
-                        .map(|strings| {
-                            strings
-                                .into_iter()
-                                .map(|s| decode(PREFIX, &s).map_err(serde::de::Error::custom))
-                                .collect()
-                        })
-                        .transpose()
-                }
-            }
         }
     };
 }
@@ -411,6 +383,8 @@ typeid_prefix!(hunt_rule_idea, "ridea");
 // knowledge row is tenant-wide estate learning shared by every hunt, not a
 // child of the one that happened to learn it.
 typeid_prefix!(hunt_knowledge, "hknow");
+// NAN-4914 connector pull feeds (`connector_feeds`, migration 294).
+typeid_prefix!(connector_feed, "cfeed");
 
 // ============================================================================
 // Tests

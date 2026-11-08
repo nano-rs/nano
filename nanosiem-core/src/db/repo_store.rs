@@ -143,8 +143,8 @@ pub async fn delete(pool: &PgPool, table: &str, id: Uuid) -> Result<(), RepoErro
 /// `UPDATE <table> SET last_sync_status/commit/synced_at/<count_col>/error/...`.
 /// `count_col` is the per-table count column (`parser_count`, `playbook_count`,
 /// `rule_count`).
-pub async fn update_sync_status(
-    pool: &PgPool,
+pub async fn update_sync_status<'e, E: sqlx::PgExecutor<'e>>(
+    pool: E,
     table: &str,
     count_col: &str,
     id: Uuid,
@@ -193,6 +193,31 @@ pub fn slug_from_url(url: &str, name: &str, explicit: Option<&str>) -> String {
     }
 }
 
+/// NAN-4940: open the transaction a repository create runs in. When `url` is
+/// the first-party `catalog` (nano-rs/parsers for the parser table,
+/// nano-rs/rules for the rule table), take the same advisory lock as the boot
+/// reconcile and refuse a second registration, so the two can never both
+/// insert the catalog. Any other URL just gets a plain transaction.
+pub async fn begin_repository_create(
+    pool: &PgPool,
+    url: &str,
+    catalog: crate::content_catalog_defaults::FirstPartyCatalog,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, RepoError> {
+    let mut tx = pool.begin().await?;
+    if catalog.matches_url(url) {
+        crate::content_catalog_defaults::lock_first_party_catalogs(&mut tx).await?;
+        if let Some(existing) = crate::content_catalog_defaults::find_first_party_catalog(&mut tx, catalog.spec()).await? {
+            return Err(RepoError::AlreadyExists(format!(
+                "{} ({} is already registered as '{}')",
+                catalog.name(),
+                catalog.url(),
+                existing.name
+            )));
+        }
+    }
+    Ok(tx)
+}
+
 /// Map a failed INSERT into a duplicate-name/-slug into
 /// `RepoError::AlreadyExists(name)`, checking the `<table>_name_key` /
 /// `<table>_slug_key` unique constraints. Any other error is returned as
@@ -201,8 +226,11 @@ pub fn map_unique_violation(e: sqlx::Error, table: &str, name: &str) -> RepoErro
     if let sqlx::Error::Database(ref db_err) = e {
         let name_key = format!("{table}_name_key");
         let slug_key = format!("{table}_slug_key");
+        // NAN-4940 (migration 302): one row per first-party catalog URL.
+        let first_party_key = format!("{table}_first_party_url_key");
         if db_err.constraint() == Some(name_key.as_str())
             || db_err.constraint() == Some(slug_key.as_str())
+            || db_err.constraint() == Some(first_party_key.as_str())
         {
             return RepoError::AlreadyExists(name.to_string());
         }
@@ -222,19 +250,18 @@ pub async fn count_for_repository(
     table: &str,
     repository_id: Uuid,
 ) -> Result<i64, sqlx::Error> {
-    let count: (i64,) = sqlx::query_as(&format!(
-        "SELECT COUNT(*) FROM {table} WHERE repository_id = $1"
-    ))
-    .bind(repository_id)
-    .fetch_one(pool)
-    .await?;
+    let count: (i64,) =
+        sqlx::query_as(&format!("SELECT COUNT(*) FROM {table} WHERE repository_id = $1"))
+            .bind(repository_id)
+            .fetch_one(pool)
+            .await?;
 
     Ok(count.0)
 }
 
 /// `DELETE FROM <table> WHERE repository_id = $1`, returning the affected count.
-pub async fn delete_by_repository(
-    pool: &PgPool,
+pub async fn delete_by_repository<'e, E: sqlx::PgExecutor<'e>>(
+    pool: E,
     table: &str,
     repository_id: Uuid,
 ) -> Result<i64, sqlx::Error> {
@@ -249,8 +276,8 @@ pub async fn delete_by_repository(
 /// `DELETE FROM <table> WHERE repository_id = $1 AND file_path != ALL($2)`,
 /// returning the affected count. This is the unguarded prune; callers that
 /// special-case empty `paths` should do so themselves before calling.
-pub async fn prune_not_in_paths(
-    pool: &PgPool,
+pub async fn prune_not_in_paths<'e, E: sqlx::PgExecutor<'e>>(
+    pool: E,
     table: &str,
     repository_id: Uuid,
     paths: &[String],
@@ -294,10 +321,7 @@ mod tests {
     #[test]
     fn list_select_sql_byte_identical() {
         assert_eq!(
-            format!(
-                "SELECT * FROM {} ORDER BY name ASC",
-                "playbook_repositories"
-            ),
+            format!("SELECT * FROM {} ORDER BY name ASC", "playbook_repositories"),
             "SELECT * FROM playbook_repositories ORDER BY name ASC"
         );
     }
@@ -387,10 +411,7 @@ mod tests {
     #[test]
     fn slug_from_url_matches_legacy() {
         // Explicit slug is used verbatim.
-        assert_eq!(
-            slug_from_url("https://x", "Name", Some("explicit")),
-            "explicit"
-        );
+        assert_eq!(slug_from_url("https://x", "Name", Some("explicit")), "explicit");
         // Derived from github URL, lowercased, .git and trailing slash stripped.
         assert_eq!(
             slug_from_url("https://github.com/Owner/Repo.git/", "Fallback", None),
@@ -408,17 +429,11 @@ mod tests {
     #[test]
     fn items_sql_byte_identical() {
         assert_eq!(
-            format!(
-                "SELECT COUNT(*) FROM {} WHERE repository_id = $1",
-                "repository_parsers"
-            ),
+            format!("SELECT COUNT(*) FROM {} WHERE repository_id = $1", "repository_parsers"),
             "SELECT COUNT(*) FROM repository_parsers WHERE repository_id = $1"
         );
         assert_eq!(
-            format!(
-                "DELETE FROM {} WHERE repository_id = $1",
-                "repository_rules"
-            ),
+            format!("DELETE FROM {} WHERE repository_id = $1", "repository_rules"),
             "DELETE FROM repository_rules WHERE repository_id = $1"
         );
         assert_eq!(

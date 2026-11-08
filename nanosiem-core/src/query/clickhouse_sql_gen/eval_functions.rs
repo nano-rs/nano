@@ -22,6 +22,111 @@ use crate::query::sql_gen::SqlGenError;
 
 type EvalFieldOverride<'a> = dyn Fn(&str, bool) -> Option<String> + 'a;
 
+/// NAN-4303: the static type of a `+` operand, as far as the compiler can tell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlusOperand {
+    Number,
+    Text,
+    /// A stage alias, rex capture, override-resolved or schema-less field:
+    /// no static type.
+    Unknown,
+}
+
+/// NAN-4303: the static type of one side of `+`. Literals and schema fields
+/// are typed; a nested expression takes the type its operator yields.
+fn plus_operand(
+    gen: &ClickHouseSqlGenerator,
+    expr: &EvalExpression,
+    field_override: Option<&EvalFieldOverride<'_>>,
+) -> PlusOperand {
+    use crate::schema::FieldType;
+    match expr {
+        EvalExpression::Literal(Value::Number(_) | Value::Bool(_)) => PlusOperand::Number,
+        EvalExpression::Literal(Value::String(_) | Value::Ip(_) | Value::Regex(_)) => PlusOperand::Text,
+        EvalExpression::Literal(Value::Interval(..)) => PlusOperand::Unknown,
+        EvalExpression::Field(name) => {
+            if field_override.is_some_and(|resolve| resolve(name, false).is_some())
+                || gen.is_upstream_computed_field(name)
+            {
+                return PlusOperand::Unknown;
+            }
+            let field = gen.canonicalize_field(name);
+            if gen.is_numeric_field(field) {
+                return PlusOperand::Number;
+            }
+            match gen.profile.field_type(field) {
+                Some(
+                    FieldType::Integer
+                    | FieldType::Long
+                    | FieldType::Float
+                    | FieldType::Boolean
+                    | FieldType::Timestamp,
+                ) => PlusOperand::Number,
+                Some(FieldType::String | FieldType::IpAddress | FieldType::Uuid) => PlusOperand::Text,
+                _ => PlusOperand::Unknown,
+            }
+        }
+        EvalExpression::BinaryOp { left, op, right } => match op {
+            BinaryOperator::Add => {
+                let (l, r) = (plus_operand(gen, left, field_override), plus_operand(gen, right, field_override));
+                if l == PlusOperand::Text || r == PlusOperand::Text {
+                    PlusOperand::Text
+                } else if l == PlusOperand::Number && r == PlusOperand::Number {
+                    PlusOperand::Number
+                } else {
+                    PlusOperand::Unknown
+                }
+            }
+            BinaryOperator::Concat => PlusOperand::Text,
+            _ => PlusOperand::Number,
+        },
+        EvalExpression::FunctionCall { name, .. } => match name.to_ascii_lowercase().as_str() {
+            "lower" | "tolower" | "upper" | "toupper" | "substr" | "substring" | "trim" | "ltrim"
+            | "rtrim" | "replace" | "tostring" | "urldecode" | "md5" | "sha1" | "sha256" | "sha512"
+            | "base64_encode" | "base64_decode" | "defang" | "extract_domain" | "printf" | "concat"
+            | "mvjoin" => PlusOperand::Text,
+            "len" | "length" | "tonumber" | "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt"
+            | "pow" | "exp" | "ln" | "log" => PlusOperand::Number,
+            _ => PlusOperand::Unknown,
+        },
+    }
+}
+
+/// NAN-4303: whether `expr` yields text by the same operand-type inference
+/// [`string_plus_sql`] uses to choose concatenation (so the String typing of
+/// an eval output matches the SQL emitted for it).
+pub(super) fn expression_yields_text(gen: &ClickHouseSqlGenerator, expr: &EvalExpression) -> bool {
+    plus_operand(gen, expr, None) == PlusOperand::Text
+}
+
+/// NAN-4303: `+` with a string operand concatenates, as in the familiar pipe
+/// languages: `"a" + "b"` is `"ab"`, `user + "@corp"` and `"port " + 443`
+/// join text. Number + number stays a numeric add. Before, `+` always cast
+/// both sides to Float64, so a string operand failed the whole search
+/// (`Code: 43 … Float64 + String`).
+///
+/// The operation is chosen from the static operand types. An operand with no
+/// static type (a stage alias, a rex capture) keeps the numeric add, which
+/// never errors (a non-numeric value is NULL) and keeps `stats sum(a) as x,
+/// sum(b) as y | eval t = x + y | sort -t` numeric. A NULL operand makes the
+/// result NULL either way.
+fn string_plus_sql(
+    gen: &ClickHouseSqlGenerator,
+    left: &EvalExpression,
+    op: BinaryOperator,
+    right: &EvalExpression,
+    field_override: Option<&EvalFieldOverride<'_>>,
+    raw_side: impl Fn(&EvalExpression) -> Result<String, SqlGenError>,
+) -> Result<Option<String>, SqlGenError> {
+    if op != BinaryOperator::Add
+        || (plus_operand(gen, left, field_override) != PlusOperand::Text
+            && plus_operand(gen, right, field_override) != PlusOperand::Text)
+    {
+        return Ok(None);
+    }
+    Ok(Some(format!("concat(toString({}), toString({}))", raw_side(left)?, raw_side(right)?)))
+}
+
 /// Convert strftime format codes to ClickHouse formatDateTime codes
 /// https://clickhouse.com/docs/en/sql-reference/functions/date-time-functions#formatdatetime
 fn convert_strftime_to_clickhouse(format: &str) -> String {
@@ -147,6 +252,18 @@ fn typed_eval_expression_to_sql_inner(
     numeric_context: bool,
     field_override: Option<&EvalFieldOverride<'_>>,
 ) -> Result<String, SqlGenError> {
+    // NAN-4917: guarded recursion point (one per expression level).
+    crate::query::complexity::ensure_sufficient_stack(|| {
+        typed_eval_expression_to_sql_inner_unguarded(gen, expr, numeric_context, field_override)
+    })
+}
+
+fn typed_eval_expression_to_sql_inner_unguarded(
+    gen: &ClickHouseSqlGenerator,
+    expr: &EvalExpression,
+    numeric_context: bool,
+    field_override: Option<&EvalFieldOverride<'_>>,
+) -> Result<String, SqlGenError> {
     if let Some(sql) = datetime_operand_sql(gen, expr, numeric_context, field_override)? {
         return Ok(sql);
     }
@@ -179,6 +296,11 @@ fn typed_eval_expression_to_sql_inner(
             eval_expression_to_sql_inner(gen, expr, false, field_override)
         }
         EvalExpression::BinaryOp { left, op, right } => {
+            if let Some(sql) = string_plus_sql(gen, left, *op, right, field_override, |side| {
+                typed_eval_expression_to_sql_inner(gen, side, false, field_override)
+            })? {
+                return Ok(sql);
+            }
             let child_numeric_context = matches!(
                 op,
                 BinaryOperator::Add
@@ -192,11 +314,6 @@ fn typed_eval_expression_to_sql_inner(
                     | BinaryOperator::Lte
             );
             if let Some(sql) = datetime_difference_sql(gen, left, *op, right, field_override)? {
-                return Ok(sql);
-            }
-            if let Some(sql) = string_plus_sql(gen, left, *op, right, field_override, |side| {
-                typed_eval_expression_to_sql_inner(gen, side, false, field_override)
-            })? {
                 return Ok(sql);
             }
             if let Some(sql) =
@@ -283,73 +400,7 @@ fn is_datetime_function(name: &str) -> bool {
             | "maketimestamp"
             | "make_date"
             | "makedate"
-            | "strptime"
     )
-}
-
-/// NAN-4286: `relative_time(t, "<modifier>")` with the same modifier grammar as
-/// `earliest=`/`latest=` (see `query::time_modifiers`): an optional signed
-/// offset (`-24h`, `+3d`, `now`) followed by an optional UTC snap (`@d`, `@h`,
-/// `@w1`, `@mon`, `@y`). Resolved at compile time into DateTime64 SQL.
-pub(super) fn relative_time_sql(base: &str, modifier: &str) -> Result<String, SqlGenError> {
-    let invalid = || {
-        SqlGenError::InvalidQuery(format!(
-            "Invalid relative_time() modifier \"{modifier}\": expected a signed offset and/or a \
-             UTC snap, such as \"-24h\", \"+7d\", \"@d\", \"-1d@d\" or \"@w1\""
-        ))
-    };
-    let modifier = modifier.trim();
-    let (offset, snap) = match modifier.split_once('@') {
-        Some((offset, snap)) => (offset, Some(snap.to_ascii_lowercase())),
-        None => (modifier, None),
-    };
-    let mut sql = format!("toDateTime64({base}, 3, 'UTC')");
-    if !(offset.is_empty() || offset.eq_ignore_ascii_case("now")) {
-        let digits_start = offset.find(|c: char| c.is_ascii_digit()).ok_or_else(invalid)?;
-        let (sign, rest) = offset.split_at(digits_start);
-        let negative = match sign {
-            "" | "+" => false,
-            "-" => true,
-            _ => return Err(invalid()),
-        };
-        let unit_start = rest
-            .find(|c: char| !c.is_ascii_digit())
-            .ok_or_else(invalid)?;
-        let (number, unit) = rest.split_at(unit_start);
-        let amount: i64 = number.parse().map_err(|_| invalid())?;
-        let function = match unit {
-            "s" | "sec" | "secs" | "second" | "seconds" => "addSeconds",
-            "m" | "min" | "mins" | "minute" | "minutes" => "addMinutes",
-            "h" | "hr" | "hrs" | "hour" | "hours" => "addHours",
-            "d" | "day" | "days" => "addDays",
-            "w" | "week" | "weeks" => "addWeeks",
-            "M" | "mon" | "month" | "months" => "addMonths",
-            "y" | "year" | "years" => "addYears",
-            _ => return Err(invalid()),
-        };
-        let amount = if negative { -amount } else { amount };
-        sql = format!("{function}({sql}, {amount})");
-    }
-    if let Some(snap) = snap {
-        sql = match snap.as_str() {
-            "s" => format!("toStartOfSecond({sql})"),
-            "m" => format!("toStartOfMinute({sql})"),
-            "h" => format!("toStartOfHour({sql})"),
-            "d" => format!("toStartOfDay({sql})"),
-            "mon" => format!("toStartOfMonth({sql})"),
-            "y" => format!("toStartOfYear({sql})"),
-            "w" | "w0" | "w1" | "w2" | "w3" | "w4" | "w5" | "w6" => {
-                // Most recent given weekday (0 = Sunday) at UTC midnight.
-                let target = snap.as_bytes().get(1).map_or(0, |b| i64::from(b - b'0'));
-                format!(
-                    "subtractDays(toStartOfDay({sql}), (toDayOfWeek({sql}) % 7 - {target} + 7) % 7)"
-                )
-            }
-            _ => return Err(invalid()),
-        };
-        sql = format!("toDateTime64({sql}, 3, 'UTC')");
-    }
-    Ok(sql)
 }
 
 /// The DateTime SQL of a datetime-valued expression, or `None`: the event
@@ -449,6 +500,18 @@ fn eval_expression_to_sql_inner(
     numeric_context: bool,
     field_override: Option<&EvalFieldOverride<'_>>,
 ) -> Result<String, SqlGenError> {
+    // NAN-4917: guarded recursion point (one per expression level).
+    crate::query::complexity::ensure_sufficient_stack(|| {
+        eval_expression_to_sql_inner_unguarded(gen, expr, numeric_context, field_override)
+    })
+}
+
+fn eval_expression_to_sql_inner_unguarded(
+    gen: &ClickHouseSqlGenerator,
+    expr: &EvalExpression,
+    numeric_context: bool,
+    field_override: Option<&EvalFieldOverride<'_>>,
+) -> Result<String, SqlGenError> {
     if let Some(sql) = datetime_operand_sql(gen, expr, numeric_context, field_override)? {
         return Ok(sql);
     }
@@ -502,6 +565,11 @@ fn eval_expression_to_sql_inner(
             }
         }),
         EvalExpression::BinaryOp { left, op, right } => {
+            if let Some(sql) = string_plus_sql(gen, left, *op, right, field_override, |side| {
+                eval_expression_to_sql_inner(gen, side, false, field_override)
+            })? {
+                return Ok(sql);
+            }
             let is_numeric_op = matches!(
                 op,
                 BinaryOperator::Add
@@ -516,11 +584,6 @@ fn eval_expression_to_sql_inner(
             );
 
             if let Some(sql) = datetime_difference_sql(gen, left, *op, right, field_override)? {
-                return Ok(sql);
-            }
-            if let Some(sql) = string_plus_sql(gen, left, *op, right, field_override, |side| {
-                eval_expression_to_sql_inner(gen, side, false, field_override)
-            })? {
                 return Ok(sql);
             }
             if let Some(sql) =
@@ -579,23 +642,10 @@ fn eval_expression_to_sql_inner(
 /// a non-IP string, which failed the whole search when one event carried a
 /// hostname in an IP field; the old `length(x) > 0` guard only caught ''.
 /// The Rust post-processing evaluator implements the same.
-pub(super) fn guarded_ip_predicate(ip: &str, predicate: &str) -> String {
+fn guarded_ip_predicate(ip: &str, predicate: &str) -> String {
     format!(
         "ifNull((isIPv4String(toString({ip})) OR isIPv6String(toString({ip}))) AND ({predicate}), 0)"
     )
-}
-
-/// `x` as a non-Nullable String for functions that build an array
-/// internally (`extractAll`, `splitByChar`, `extractGroups`): ClickHouse
-/// rejects `Nullable(Array)`, and every lean OCSF leaf is Nullable, so these
-/// functions failed the whole search on a real column.
-fn non_null_text(sql: &str) -> String {
-    format!("ifNull(toString({sql}), '')")
-}
-
-/// `value` computed over [`non_null_text`], NULL again when the input is.
-fn null_propagating(input: &str, value: &str) -> String {
-    format!("if(isNull({input}), NULL, {value})")
 }
 
 /// The array leaf a predicate subject names, if any: a raw event field the
@@ -614,8 +664,9 @@ fn array_subject<'e>(
     {
         return None;
     }
-    gen.field_is_array(gen.canonicalize_field(name))
-        .then_some(name.as_str())
+    // Same test as a `stats … by` array field (NAN-4295): a physical
+    // `Array(T)` column, not an upstream stage's column or a JSON-tail read.
+    gen.stats_by_field_is_array(name).then_some(name.as_str())
 }
 
 /// A comparison between an `Array(T)` field and a scalar in eval / `if()` /
@@ -670,20 +721,12 @@ fn array_field_predicate(
             BinaryOperator::Eq | BinaryOperator::Ne,
             EvalExpression::Literal(Value::Regex(pattern)),
         ) => {
-            super::validate_regex_pattern(pattern).map_err(SqlGenError::InvalidQuery)?;
-            let pattern = if pattern.starts_with("(?i)") {
-                pattern.clone()
-            } else {
-                format!("(?i){pattern}")
-            };
-            exists(format!(
-                "match({element}, '{}')",
-                escape_regex_pattern(&pattern)
-            ))
+            // NAN-4943: the canonical regex classification per element.
+            exists(super::search_expr::regex_predicate_sql(element, pattern, false)?)
         }
         (BinaryOperator::Eq | BinaryOperator::Ne, EvalExpression::Literal(literal)) => {
             let needle = match literal {
-                Value::String(text) => text.to_lowercase(),
+                Value::String(text) => super::ch_lower(text),
                 Value::Number(n) => n.to_string(),
                 Value::Bool(b) => b.to_string(),
                 other => other.to_string().to_lowercase(),
@@ -726,17 +769,62 @@ fn array_field_predicate(
 }
 
 /// `CONTAINS` in eval / `if()` (NAN-3041): case-insensitive substring, the
-/// same semantics as `| where f CONTAINS "x"` and search (`iLike '%x%'`).
-/// It used to be `position()`, which is case-SENSITIVE, so a rule condition
+/// same semantics as `| where f CONTAINS "x"` and search. It used to be
+/// `position()`, which is case-SENSITIVE, so a rule condition
 /// `command_line CONTAINS "IEX"` silently missed `iex`.
+///
+/// NAN-4943: a string-literal needle goes through the single nPL lowercase
+/// match, `ci_like` (`lower(..) LIKE '%needle%'`, `%`/`_`/`\` literal). An
+/// expression needle lowers both sides the same way (ClickHouse `lower()`,
+/// ASCII only), so the result never depends on which side is a literal.
 fn contains_sql(haystack: &str, needle: &str) -> String {
-    format!("(positionCaseInsensitiveUTF8(toString({haystack}), toString({needle})) > 0)")
+    match sql_string_literal_body(needle) {
+        Some(body) => format!(
+            "({})",
+            super::ci_like(
+                &format!("toString({haystack})"),
+                &format!("%{}%", super::escape_like_pattern(body)),
+                false
+            )
+        ),
+        None => format!(
+            "(position(lower(toString({haystack})), lower(toString({needle}))) > 0)"
+        ),
+    }
 }
 
 /// `LIKE` / `like()` in eval (NAN-3041): case-insensitive, the same as the
-/// `| where f LIKE "…"` comparator (`iLike`).
+/// `| where f LIKE "…"` comparator. NAN-4943: a literal pattern goes through
+/// `ci_like` (its `%`/`_` stay wildcards); an expression pattern is lowered
+/// with ClickHouse `lower()` on both sides.
 fn like_sql(value: &str, pattern: &str) -> String {
-    format!("(toString({value}) iLike {pattern})")
+    match sql_string_literal_body(pattern) {
+        Some(body) => format!("({})", super::ci_like(&format!("toString({value})"), body, false)),
+        None => format!("(lower(toString({value})) LIKE lower(toString({pattern})))"),
+    }
+}
+
+/// The text between the quotes when `sql` is exactly ONE single-quoted SQL
+/// string literal as `escape_string` renders it (`\` escapes, `''` allowed),
+/// else `None` (a column, a function call, a concatenation, …).
+fn sql_string_literal_body(sql: &str) -> Option<&str> {
+    let body = sql.strip_prefix('\'')?.strip_suffix('\'')?;
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next()?;
+            }
+            '\'' => {
+                // Only a doubled quote may appear inside the literal.
+                if chars.next() != Some('\'') {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(body)
 }
 
 /// `f = /re/[i]` / `f != /re/` in eval (NAN-3041). A regex literal on either
@@ -759,137 +847,15 @@ fn regex_literal_comparison(
         | (EvalExpression::Literal(Value::Regex(pattern)), subject) => (subject, pattern),
         _ => return Ok(None),
     };
-    super::validate_regex_pattern(pattern).map_err(SqlGenError::InvalidQuery)?;
-    let pattern = if pattern.starts_with("(?i)") {
-        pattern.clone()
-    } else {
-        format!("(?i){pattern}")
-    };
+    // NAN-4943: the canonical regex classification — a literal regex is the
+    // nPL lowercase match, anything else a case-insensitive RE2 match.
     let subject_sql = lower_side(subject)?;
-    let matched = format!(
-        "match(toString({subject_sql}), '{}')",
-        escape_regex_pattern(&pattern)
-    );
+    let matched = super::search_expr::regex_predicate_sql(&format!("toString({subject_sql})"), pattern, false)?;
     Ok(Some(if op == BinaryOperator::Ne {
-        format!("(NOT {matched})")
+        format!("(NOT ({matched}))")
     } else {
         format!("({matched})")
     }))
-}
-
-/// The static type of a `+` operand, as far as the compiler can tell.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PlusOperand {
-    Number,
-    Text,
-    /// A stage alias, rex capture, override-resolved or schema-less field:
-    /// no static type.
-    Unknown,
-}
-
-/// NAN-4303: the static type of one side of `+`. Literals and schema fields
-/// are typed; a nested expression takes the type its operator yields.
-fn plus_operand(
-    gen: &ClickHouseSqlGenerator,
-    expr: &EvalExpression,
-    field_override: Option<&EvalFieldOverride<'_>>,
-) -> PlusOperand {
-    use crate::schema::FieldType;
-    match expr {
-        EvalExpression::Literal(Value::Number(_) | Value::Bool(_)) => PlusOperand::Number,
-        EvalExpression::Literal(Value::String(_) | Value::Ip(_) | Value::Regex(_)) => {
-            PlusOperand::Text
-        }
-        EvalExpression::Literal(Value::Interval(..)) => PlusOperand::Unknown,
-        EvalExpression::Field(name) => {
-            if field_override.is_some_and(|resolve| resolve(name, false).is_some())
-                || gen.is_upstream_computed_field(name)
-            {
-                return PlusOperand::Unknown;
-            }
-            let field = gen.canonicalize_field(name);
-            if gen.field_is_numeric(field) {
-                return PlusOperand::Number;
-            }
-            match gen.resolved_field_type(field) {
-                Some(
-                    FieldType::Integer
-                    | FieldType::Long
-                    | FieldType::Float
-                    | FieldType::Boolean
-                    | FieldType::Timestamp,
-                ) => PlusOperand::Number,
-                Some(FieldType::String | FieldType::IpAddress | FieldType::Uuid) => {
-                    PlusOperand::Text
-                }
-                Some(FieldType::Array) | None => PlusOperand::Unknown,
-            }
-        }
-        EvalExpression::BinaryOp { left, op, right } => match op {
-            BinaryOperator::Add => {
-                let (l, r) = (
-                    plus_operand(gen, left, field_override),
-                    plus_operand(gen, right, field_override),
-                );
-                if l == PlusOperand::Text || r == PlusOperand::Text {
-                    PlusOperand::Text
-                } else if l == PlusOperand::Number && r == PlusOperand::Number {
-                    PlusOperand::Number
-                } else {
-                    PlusOperand::Unknown
-                }
-            }
-            BinaryOperator::Concat => PlusOperand::Text,
-            _ => PlusOperand::Number,
-        },
-        EvalExpression::FunctionCall { name, .. } => {
-            let name = name.to_ascii_lowercase();
-            if is_datetime_function(&name) {
-                return PlusOperand::Number;
-            }
-            match name.as_str() {
-                "lower" | "tolower" | "upper" | "toupper" | "substr" | "substring" | "trim"
-                | "ltrim" | "rtrim" | "replace" | "tostring" | "urldecode" | "md5" | "sha1"
-                | "sha256" | "sha512" | "base64_encode" | "base64_decode" | "defang"
-                | "extract_domain" | "printf" | "concat" | "mvjoin" => PlusOperand::Text,
-                "len" | "length" | "tonumber" | "abs" | "round" | "floor" | "ceil"
-                | "ceiling" | "sqrt" | "pow" | "exp" | "ln" | "log" => PlusOperand::Number,
-                _ => PlusOperand::Unknown,
-            }
-        }
-    }
-}
-
-/// NAN-4303: `+` with a string operand concatenates, as in the familiar pipe
-/// languages: `"a" + "b"` is `"ab"`, `user + "@corp"` and `"port " + 443`
-/// join text. Number + number stays a numeric add. Without this `+` always
-/// cast both sides to Float64, so a string literal operand failed the whole
-/// search (`Code: 43 … Float64 + String`) and a string field read as NULL.
-///
-/// The operation is chosen from the static operand types. An operand with no
-/// static type (a stage alias, a rex capture) keeps the numeric add, which
-/// never errors (a non-numeric value is NULL) and keeps `stats sum(a) as x,
-/// sum(b) as y | eval t = x + y | sort -t` numeric. A NULL operand makes the
-/// result NULL either way.
-fn string_plus_sql(
-    gen: &ClickHouseSqlGenerator,
-    left: &EvalExpression,
-    op: BinaryOperator,
-    right: &EvalExpression,
-    field_override: Option<&EvalFieldOverride<'_>>,
-    raw_side: impl Fn(&EvalExpression) -> Result<String, SqlGenError>,
-) -> Result<Option<String>, SqlGenError> {
-    if op != BinaryOperator::Add
-        || (plus_operand(gen, left, field_override) != PlusOperand::Text
-            && plus_operand(gen, right, field_override) != PlusOperand::Text)
-    {
-        return Ok(None);
-    }
-    Ok(Some(format!(
-        "concat(toString({}), toString({}))",
-        raw_side(left)?,
-        raw_side(right)?
-    )))
 }
 
 /// `f = "x"` / `f != "x"` in eval (NAN-3041): case-insensitive against a
@@ -917,7 +883,7 @@ fn string_literal_comparison(
     Ok(Some(format!(
         "(lower(toString({subject_sql})) {} '{}')",
         if op == BinaryOperator::Eq { "=" } else { "!=" },
-        super::escape_string(&literal.to_lowercase())
+        super::escape_string(&super::ch_lower(literal))
     )))
 }
 
@@ -944,7 +910,7 @@ fn in_sql(args: &[EvalExpression], arg_sqls: &[String]) -> Result<String, SqlGen
             .iter()
             .map(|member| match member {
                 EvalExpression::Literal(Value::String(s)) => {
-                    format!("'{}'", super::escape_string(&s.to_lowercase()))
+                    format!("'{}'", super::escape_string(&super::ch_lower(s)))
                 }
                 EvalExpression::Literal(Value::Number(n)) => format!("'{n}'"),
                 EvalExpression::Literal(Value::Bool(b)) => format!("'{b}'"),
@@ -1081,11 +1047,7 @@ fn eval_function_to_sql(
             }
             // Array functions reject Nullable input (every lean OCSF leaf is
             // Nullable): split a NULL to [] instead of failing the search.
-            Ok(format!(
-                "if(isNull({s}), [], splitByString({sep}, ifNull(toString({s}), '')))",
-                s = arg_sqls[0],
-                sep = arg_sqls[1]
-            ))
+            Ok(format!("splitByString({}, {})", arg_sqls[1], arg_sqls[0]))
         }
         "concat" => Ok(format!("concat({})", arg_sqls.join(", "))),
 
@@ -1307,13 +1269,7 @@ fn eval_function_to_sql(
             let arg = arg_sqls
                 .first()
                 .ok_or_else(|| SqlGenError::InvalidQuery("entropy() requires 1 argument".into()))?;
-            Ok(null_propagating(
-                arg,
-                &format!(
-                    "arrayReduce('entropy', extractAll({}, '.'))",
-                    non_null_text(arg)
-                ),
-            ))
+            Ok(format!("arrayReduce('entropy', extractAll({}, '.'))", arg))
         }
 
         // ============================================================
@@ -1338,36 +1294,7 @@ fn eval_function_to_sql(
                     "relative_time() requires 2 arguments".into(),
                 ));
             }
-            // NAN-4286: this was `time + '-1h'` — DateTime64 plus a String,
-            // chDB Code 43 on every call.
-            let EvalExpression::Literal(Value::String(modifier)) = &args[1] else {
-                return Err(SqlGenError::InvalidQuery(
-                    "relative_time() needs a quoted time modifier as its second argument, \
-                     such as \"-24h\", \"@d\" or \"-7d@d\""
-                        .into(),
-                ));
-            };
-            relative_time_sql(&arg_sqls[0], modifier)
-        }
-        "strptime" => {
-            if arg_sqls.len() != 2 {
-                return Err(SqlGenError::InvalidQuery(
-                    "strptime() requires 2 arguments (text, format)".into(),
-                ));
-            }
-            let EvalExpression::Literal(Value::String(format)) = &args[1] else {
-                return Err(SqlGenError::InvalidQuery(
-                    "strptime() needs a quoted format as its second argument, such as \
-                     \"%Y-%m-%d %H:%M:%S\""
-                        .into(),
-                ));
-            };
-            // NULL (not an error) when a value does not match the format.
-            Ok(format!(
-                "toDateTime64(parseDateTimeOrNull(toString({}), '{}', 'UTC'), 3, 'UTC')",
-                arg_sqls[0],
-                super::escape_string(&convert_strftime_to_clickhouse(format))
-            ))
+            Ok(format!("{} + {}", arg_sqls[0], arg_sqls[1]))
         }
         "epoch" | "to_epoch" => {
             let arg = arg_sqls
@@ -1403,9 +1330,9 @@ fn eval_function_to_sql(
             }
             Ok(format!("{} - {}", arg_sqls[0], arg_sqls[1]))
         }
-        // NAN-4284 (searchfuzz F21): the documented `time_diff(t1, t2)` —
-        // seconds from t2 to t1 (`time_diff(time, prev)` is the gap since the
-        // previous event), the two-argument `date_diff`.
+        // NAN-4284: the documented `time_diff(t1, t2)` -- whole seconds from
+        // t2 to t1 (`time_diff(time, prev)` is the gap since the previous
+        // event), the two-argument `date_diff`.
         "time_diff" | "timediff" => {
             if arg_sqls.len() != 2 {
                 return Err(SqlGenError::InvalidQuery(
@@ -1828,16 +1755,6 @@ fn eval_function_to_sql(
             }
             None => in_sql(args, &arg_sqls),
         },
-        "not" => {
-            if arg_sqls.len() != 1 {
-                return Err(SqlGenError::InvalidQuery(
-                    "not() requires 1 argument".into(),
-                ));
-            }
-            // Search semantics (NAN-3037): a NULL (missing) value does not
-            // satisfy the inner predicate, so NOT of it is true.
-            Ok(format!("({})", super::null_safe_not(&arg_sqls[0])))
-        }
         "if" | "iif" => {
             if arg_sqls.len() != 3 {
                 return Err(SqlGenError::InvalidQuery(
@@ -1864,6 +1781,14 @@ fn eval_function_to_sql(
                 ));
             }
             Ok(format!("nullIf({}, {})", arg_sqls[0], arg_sqls[1]))
+        }
+        // Unary `NOT expr` in eval (the parser lowers it to `not(expr)`).
+        // ClickHouse `NOT` is three-valued: NOT NULL is NULL.
+        "not" => {
+            if arg_sqls.len() != 1 {
+                return Err(SqlGenError::InvalidQuery("NOT requires exactly 1 operand".into()));
+            }
+            Ok(format!("(NOT {})", arg_sqls[0]))
         }
         "isnull" | "is_null" => {
             let arg = arg_sqls
@@ -1897,6 +1822,18 @@ fn eval_function_to_sql(
         }
         "isbool" => {
             let arg = single_arg(&arg_sqls, "isbool")?;
+            // NAN-4933: a schema boolean stored as UInt8 (UDM `mfa_used`,
+            // `ioc_matched`) is a boolean by type, not by its ClickHouse
+            // column type (`Bool` only on OCSF).
+            if let [EvalExpression::Field(field)] = args {
+                if !gen.is_upstream_computed_field(field)
+                    && field_override.is_none_or(|resolve| resolve(field, false).is_none())
+                    && gen.profile.field_type(gen.canonicalize_field(field))
+                        == Some(crate::schema::FieldType::Boolean)
+                {
+                    return Ok(format!("isNotNull({arg})"));
+                }
+            }
             Ok(format!(
                 "(isNotNull({arg}) AND match(toTypeName({arg}), '^(Nullable[(])?Bool'))"
             ))
@@ -2075,7 +2012,7 @@ fn eval_function_to_sql(
                         // Use extractGroups to get all groups, then index into the array
                         // ClickHouse arrays are 1-indexed, and extractGroups returns [group1, group2, ...]
                         // So user's group 1 = array[1], group 2 = array[2], etc.
-                        Ok(null_propagating(&arg_sqls[0], &format!("extractGroups({}, {})[{}]", non_null_text(&arg_sqls[0]), arg_sqls[1], arg_sqls[2])))
+                        Ok(format!("extractGroups({}, {})[{}]", arg_sqls[0], arg_sqls[1], arg_sqls[2]))
                     }
                     _ => Err(SqlGenError::InvalidQuery("regex_extract() requires 2 or 3 arguments: regex_extract(string, pattern[, group_num])".into())),
                 }
@@ -2179,12 +2116,9 @@ fn eval_function_to_sql(
             let arg = arg_sqls.first().ok_or_else(|| {
                 SqlGenError::InvalidQuery("domain_depth() requires 1 argument".into())
             })?;
-            Ok(null_propagating(
-                arg,
-                &format!(
-                    "length(splitByChar('.', domainWithoutWWW({})))",
-                    non_null_text(arg)
-                ),
+            Ok(format!(
+                "length(splitByChar('.', domainWithoutWWW({})))",
+                arg
             ))
         }
 
@@ -2214,32 +2148,16 @@ fn eval_function_to_sql(
             }
         }
         "array_contains" | "arraycontains" | "has" => {
+            // Check if array/string contains element
+            // ClickHouse `has()` only works on Array types, but many fields (e.g. ioc_tags)
+            // are stored as comma-separated strings in ext JSON. Use positionCaseInsensitive()
+            // which works on any string type and returns non-zero (truthy) if found.
             if arg_sqls.len() != 2 {
                 return Err(SqlGenError::InvalidQuery(
                     "array_contains() requires 2 arguments (array, element)".into(),
                 ));
             }
-            // Canonical OCSF repeated leaves are real Array(Nullable(String))
-            // columns. Stringifying them and doing a substring search both
-            // fails exact IOC attribution and can produce false positives
-            // ("abc" would match "xabcx"). Preserve the historical fallback
-            // for string-backed fields, but give schema-known arrays exact,
-            // case-insensitive element membership semantics.
-            if let EvalExpression::Field(field) = &args[0] {
-                let field = gen.canonicalize_field(field);
-                if super::is_array_column(field) || gen.profile.is_string_array_field(field) {
-                    return Ok(format!(
-                        "arrayExists(x -> lower(ifNull(x, '')) = lower(toString({})), {})",
-                        arg_sqls[1], arg_sqls[0]
-                    ));
-                }
-            }
-            // Some legacy fields are comma-separated strings rather than
-            // arrays. Keep their existing case-insensitive contains behavior.
-            Ok(format!(
-                "positionCaseInsensitive(toString({}), {})",
-                arg_sqls[0], arg_sqls[1]
-            ))
+            Ok(format!("positionCaseInsensitive(toString({}), {})", arg_sqls[0], arg_sqls[1]))
         }
 
         // ============================================================
@@ -2515,8 +2433,8 @@ mod tests {
     #[test]
     fn date_trunc_legit_units_unchanged() {
         let gen = ClickHouseSqlGenerator::new();
-        let ts =
-            eval_expression_to_sql(&gen, &EvalExpression::Field("timestamp".to_string())).unwrap();
+        let ts = eval_expression_to_sql(&gen, &EvalExpression::Field("timestamp".to_string()))
+            .unwrap();
         for (unit, func) in [
             ("second", "toStartOfSecond"),
             ("minute", "toStartOfMinute"),
@@ -2551,19 +2469,11 @@ mod tests {
         assert!(!udm.contains("source_port"), "{udm}");
         assert!(!udm.contains("destination_port"), "{udm}");
 
-        let canonical_expression = EvalExpression::BinaryOp {
-            left: Box::new(EvalExpression::Field("src_endpoint.port".into())),
-            op: BinaryOperator::Sub,
-            right: Box::new(EvalExpression::Field("dst_endpoint.port".into())),
-        };
         let ocsf = ClickHouseSqlGenerator::new()
-            .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::lake_1_9()));
-        let ocsf_sql = typed_eval_expression_to_sql_with_field_override(
-            &ocsf,
-            &canonical_expression,
-            &no_override,
-        )
-        .unwrap();
+            .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::new()));
+        let ocsf_sql =
+            typed_eval_expression_to_sql_with_field_override(&ocsf, &expression, &no_override)
+                .unwrap();
         assert!(ocsf_sql.contains("src_endpoint.port"), "{ocsf_sql}");
         assert!(ocsf_sql.contains("dst_endpoint.port"), "{ocsf_sql}");
         assert!(!ocsf_sql.contains("source_port"), "{ocsf_sql}");
@@ -2597,25 +2507,5 @@ mod tests {
             &override_first_seen,
         )
         .is_err());
-    }
-
-    #[test]
-    fn array_contains_uses_exact_membership_for_ocsf_repeated_leaves() {
-        let expression = EvalExpression::FunctionCall {
-            name: "array_contains".into(),
-            args: vec![
-                EvalExpression::Field("file.hashes.value".into()),
-                EvalExpression::Literal(Value::String("ABC123".into())),
-            ],
-        };
-        let ocsf = ClickHouseSqlGenerator::new()
-            .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::lake_1_9()));
-        assert!(ocsf.profile.uses_strict_canonical_fields());
-        assert!(ocsf.profile.is_string_array_field("file.hashes.value"));
-        assert!(ocsf.resolves_to_column("file.hashes.value"));
-        let sql = typed_eval_expression_to_sql(&ocsf, &expression).unwrap();
-        assert!(sql.contains("arrayExists"), "{sql}");
-        assert!(sql.contains("file.hashes.value"), "{sql}");
-        assert!(!sql.contains("positionCaseInsensitive"), "{sql}");
     }
 }

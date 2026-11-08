@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState, useCallback, useEffect, useRef } from 'react';
-import { api } from '@/lib/api';
+import { useState, useCallback, useEffect } from 'react';
 import type { TimeRangeValue } from '@/hooks/use-api';
-import { getAccessToken } from '@/lib/auth-token';
-import { requestCredentials } from '@/lib/request-credentials';
+import { authenticatedFetch } from '@/lib/authenticated-fetch';
 import { invalidateFieldUsageCache } from '@/lib/query-autocomplete';
 
 export interface SearchHistoryEntry {
@@ -33,14 +31,9 @@ interface ListHistoryResponse {
 
 const API_BASE = import.meta.env.VITE_API_URL ?? '';
 
+// NAN-2453: the bearer is attached by authenticatedFetch, which waits for an
+// in-flight refresh and never sends these protected requests without one.
 function getAuthHeaders(): HeadersInit {
-  const token = getAccessToken();
-  if (token) {
-    return {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    };
-  }
   return { 'Content-Type': 'application/json' };
 }
 
@@ -68,24 +61,16 @@ function apiEntryToLocal(entry: ApiHistoryEntry): SearchHistoryEntry {
   };
 }
 
-export function useSearchHistory({ enabled = true }: { enabled?: boolean } = {}) {
+export function useSearchHistory() {
   const [searchHistory, setSearchHistory] = useState<SearchHistoryEntry[]>([]);
-  const [historyEnabled, setHistoryEnabled] = useState(enabled);
-  const [isLoading, setIsLoading] = useState(enabled);
-  const firstSearchCompletion = useRef<Promise<unknown> | null>(null);
+  const [historyEnabled, setHistoryEnabled] = useState(true);
+  const [isLoading, setIsLoading] = useState(true);
 
   // Fetch history from API
   const fetchHistory = useCallback(async () => {
-    if (!enabled) {
-      setSearchHistory([]);
-      setHistoryEnabled(false);
-      setIsLoading(false);
-      return;
-    }
     try {
-      const response = await fetch(`${API_BASE}/api/search/history`, {
+      const response = await authenticatedFetch('/api/search/history', `${API_BASE}/api/search/history`, {
         headers: getAuthHeaders(),
-        credentials: requestCredentials('/api/search/history', getAuthHeaders()),
       });
       
       if (response.ok) {
@@ -98,38 +83,34 @@ export function useSearchHistory({ enabled = true }: { enabled?: boolean } = {})
     } finally {
       setIsLoading(false);
     }
-  }, [enabled]);
+  }, []);
 
   // Load history on mount
   useEffect(() => {
     fetchHistory();
   }, [fetchHistory]);
 
-  const toggleHistoryEnabled = useCallback(async (nextEnabled: boolean) => {
-    if (!enabled) return;
+  const toggleHistoryEnabled = useCallback(async (enabled: boolean) => {
     try {
-      const response = await fetch(`${API_BASE}/api/search/history/settings`, {
+      const response = await authenticatedFetch('/api/search/history/settings', `${API_BASE}/api/search/history/settings`, {
         method: 'PUT',
         headers: getAuthHeaders(),
-        credentials: requestCredentials('/api/search/history', getAuthHeaders()),
-        body: JSON.stringify({ enabled: nextEnabled }),
+        body: JSON.stringify({ enabled }),
       });
       
       if (response.ok) {
-        setHistoryEnabled(nextEnabled);
+        setHistoryEnabled(enabled);
       }
     } catch (err) {
       console.error('Failed to toggle history:', err);
     }
-  }, [enabled]);
+  }, []);
 
   const clearSearchHistory = useCallback(async () => {
-    if (!enabled) return;
     try {
-      const response = await fetch(`${API_BASE}/api/search/history`, {
+      const response = await authenticatedFetch('/api/search/history', `${API_BASE}/api/search/history`, {
         method: 'DELETE',
         headers: getAuthHeaders(),
-        credentials: requestCredentials('/api/search/history', getAuthHeaders()),
       });
       
       if (response.ok) {
@@ -139,15 +120,13 @@ export function useSearchHistory({ enabled = true }: { enabled?: boolean } = {})
     } catch (err) {
       console.error('Failed to clear history:', err);
     }
-  }, [enabled]);
+  }, []);
 
   const deleteHistoryEntry = useCallback(async (id: string) => {
-    if (!enabled) return;
     try {
-      const response = await fetch(`${API_BASE}/api/search/history/${id}`, {
+      const response = await authenticatedFetch(`/api/search/history/${id}`, `${API_BASE}/api/search/history/${id}`, {
         method: 'DELETE',
         headers: getAuthHeaders(),
-        credentials: requestCredentials('/api/search/history', getAuthHeaders()),
       });
       
       if (response.ok) {
@@ -157,23 +136,10 @@ export function useSearchHistory({ enabled = true }: { enabled?: boolean } = {})
     } catch (err) {
       console.error('Failed to delete history entry:', err);
     }
-  }, [enabled]);
-
-  const completeFirstSearch = useCallback(async () => {
-    // Persist only the step flag, with no query or time-range data. Share the
-    // request across runs on this page and allow a later run to retry errors.
-    firstSearchCompletion.current ??= api.onboarding.completeStep({ step: 'first_searches' })
-      .catch(() => { firstSearchCompletion.current = null; });
-    await firstSearchCompletion.current;
   }, []);
 
   const addToSearchHistory = useCallback(async (entry: Omit<SearchHistoryEntry, 'id' | 'timestamp'>) => {
-    if (!enabled) return;
-    if (!historyEnabled) {
-      // Running a query still completes First Search when history is disabled.
-      await completeFirstSearch();
-      return;
-    }
+    if (!historyEnabled) return;
     
     // Build request body
     const body: Record<string, unknown> = {
@@ -190,10 +156,9 @@ export function useSearchHistory({ enabled = true }: { enabled?: boolean } = {})
     }
 
     try {
-      const response = await fetch(`${API_BASE}/api/search/history`, {
+      const response = await authenticatedFetch('/api/search/history', `${API_BASE}/api/search/history`, {
         method: 'POST',
         headers: getAuthHeaders(),
-        credentials: requestCredentials('/api/search/history', getAuthHeaders()),
         body: JSON.stringify(body),
       });
       
@@ -209,16 +174,11 @@ export function useSearchHistory({ enabled = true }: { enabled?: boolean } = {})
           const filtered = prev.filter(h => h.id !== localEntry.id);
           return [localEntry, ...filtered];
         });
-      } else {
-        // The first run can race the initial history-settings GET, or history
-        // can be disabled in another tab. A refused history write must not
-        // leave First Search unchecked after a query was run.
-        await completeFirstSearch();
       }
     } catch (err) {
       console.error('Failed to add to history:', err);
     }
-  }, [enabled, historyEnabled, completeFirstSearch]);
+  }, [historyEnabled]);
 
   const refreshHistory = useCallback(() => {
     fetchHistory();

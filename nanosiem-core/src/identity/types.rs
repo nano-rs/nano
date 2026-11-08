@@ -115,6 +115,11 @@ pub struct IdentityProvider {
     pub last_sync_records_synced: Option<i64>,
     #[sqlx(default)]
     pub last_sync_records_dead_lettered: Option<i64>,
+    /// G22: the connector identity feed (`connector_feeds.id`) that owns this
+    /// provider. A feed-managed provider is synced by the connector runner,
+    /// never by the native scheduler, and takes no credentials here.
+    #[sqlx(default)]
+    pub connector_feed_id: Option<uuid::Uuid>,
     #[serde(skip_serializing)]
     pub delta_link: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -163,6 +168,9 @@ pub struct IdentityProviderSummary {
     pub last_sync_records_synced: Option<i64>,
     /// records of the last sync the lane's normalizer dead-letters.
     pub last_sync_records_dead_lettered: Option<i64>,
+    /// `cfeed_...` when a connector identity feed manages this provider (its
+    /// sync, schedule and credential live on the feed).
+    pub connector_feed_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -185,6 +193,9 @@ impl From<IdentityProvider> for IdentityProviderSummary {
             last_sync_records_total: p.last_sync_records_total,
             last_sync_records_synced: p.last_sync_records_synced,
             last_sync_records_dead_lettered: p.last_sync_records_dead_lettered,
+            connector_feed_id: p
+                .connector_feed_id
+                .map(|id| crate::typeid::encode(crate::typeid::connector_feed::PREFIX, &id)),
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -226,7 +237,7 @@ pub struct UpdateIdentityProviderCredentials {
 
 /// A unified user record from any identity provider.
 ///
-/// the `user_registry` payload moved from a PG OLTP table to a CH
+/// NAN-1117: the `user_registry` payload moved from a PG OLTP table to a CH
 /// ReplacingMergeTree. CH has no BIGSERIAL, so the synthetic `id: i64` is
 /// replaced by a stable composite string key `"{provider_id}|{external_id}"`
 /// (see [`UserRecord::composite_id`]) — this is the value `GET

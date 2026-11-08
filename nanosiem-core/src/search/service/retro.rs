@@ -22,63 +22,15 @@
 //! The retro SQL emits a single WHERE (`timestamp BETWEEN … AND (<ioc match>)`),
 //! NO explicit PREWHERE — `optimize_move_to_prewhere` does placement.
 
-use super::lateral::source_scope_sql_predicate;
 use super::*;
+use super::lateral::source_scope_sql_predicate;
 use crate::auth::ScopeSet;
+use crate::query::{IocFeed, IocLookup, RetroAxis, SearchExpr, Value};
 use crate::query::clickhouse_sql_gen::search_expr::{
     classify_indicator, ioc_feed_indicator_subquery, resolve_ioc_observables, scope_observables,
     ResolvedObservable,
 };
-use crate::query::{IocFeed, IocLookup, RetroAxis, SearchExpr, Value};
 use crate::schema::SchemaProfile;
-
-fn required_lake_ioc_client() -> Result<crate::enrichment::ioc::LakeIocClient, SearchError> {
-    crate::enrichment::ioc::LakeIocClient::from_env()
-        .map_err(|error| SearchError::ServiceUnavailable(error.to_string()))?
-        .ok_or_else(|| {
-            SearchError::ServiceUnavailable(
-                "immutable IOC snapshot is not configured for primary lake mode".to_string(),
-            )
-        })
-}
-
-impl SearchService {
-    /// NAN-2361 wave 6: the IOC snapshot reader a retro-hunt feed scan may
-    /// use on a hosted-shared tenant view. Opens the surface that
-    /// `require_dedicated_retention_surface` closed for shared scope, but
-    /// only for a view that (a) carries the current retention identity —
-    /// a tenant-only scope is decoding state, never query authority — and
-    /// (b) had the tenant-pinned reader installed from its own assignment.
-    /// The feed scan itself reads the immutable snapshot, not event data, so
-    /// no retention cutoff applies to it; the hunt half
-    /// (`retro_hunt_over_indicators`) still binds its window to retention.
-    pub(super) fn shared_retro_feed_client(
-        &self,
-        surface: &str,
-    ) -> Result<Option<&crate::enrichment::ioc::LakeIocClient>, SearchError> {
-        #[cfg(feature = "enterprise")]
-        let shared_scope = self.admission_scope.is_enterprise_shared();
-        #[cfg(not(feature = "enterprise"))]
-        let shared_scope = !matches!(self.admission_scope, crate::search::tenant::SearchTenantScope::Dedicated);
-        if !shared_scope {
-            return Ok(None);
-        }
-        self.admission_scope
-            .require_retention_identity()
-            .map_err(|error| SearchError::ServiceUnavailable(error.to_string()))?;
-        let client = self.shared_ioc_client.as_ref().ok_or_else(|| {
-            SearchError::ServiceUnavailable(format!(
-                "enterprise-shared {surface} requires the tenant-pinned IOC snapshot reader"
-            ))
-        })?;
-        if Some(client.tenant_id()) != self.assigned_tenant_id().map(|id| id.to_string()).as_deref() {
-            return Err(SearchError::ServiceUnavailable(format!(
-                "enterprise-shared {surface} IOC reader is pinned to another tenant"
-            )));
-        }
-        Ok(Some(client))
-    }
-}
 
 /// Full-retention floor for retro hunts. The `logs` table carries a 365-day TTL
 /// (CLAUDE.md core architecture); the engine clamps the requested window's floor
@@ -93,527 +45,14 @@ const RETRO_RETENTION_DAYS: i64 = 365;
 /// full-table scan that times out on a real tenant (see `retro_total_hosts`).
 const RETRO_PREVALENCE_WINDOW_HOURS: i64 = 24;
 
-/// Lake denominator window (NAN-2361). The ClickHouse path measures the
-/// population with approximate `uniq()` (HyperLogLog), which is cheap over 24h;
-/// the lake path has no equivalent, so `dc()` over 24h is an unfiltered
-/// full-window scan that exceeds the interactive budget outright — that single
-/// query, with no indicator involved, is what made every retro hunt
-/// "exhaust its scan budget".
-///
-/// The population converges almost immediately because asset inventory does not
-/// change hour to hour — measured locally: 1h → 2306 hosts (67ms), 6h → 2308
-/// (220ms), 24h → 2309 but too expensive to run interactively at all.
-///
-/// 6h rather than 1h deliberately: a shorter window misses hosts that were
-/// quiet (powered-off laptops, overnight, weekends), and a SMALLER denominator
-/// makes every ratio LARGER, biasing verdicts toward `Common` — a false
-/// negative on rarity, which is the dangerous direction for a triage signal.
-/// Raise this for a fleet with long-idle assets; the cost is one bounded scan
-/// per hunt (see `lake_retro_total_hosts` for why it is not memoised).
-///
-/// Note the asymmetry this creates and what absorbs it: the NUMERATOR
-/// (`distinct_hosts`) accumulates over full retention, this denominator over
-/// the recent window, so their quotient can exceed 1. `lake_retro_verdict`
-/// clamps it — see the reasoning there.
-const LAKE_RETRO_DENOMINATOR_WINDOW_HOURS: i64 = 6;
-
-/// Group ceiling for the merged single-indicator summary aggregate. Bounded by
-/// distinct (sighting identity x observable) combinations, NOT by event count,
-/// so it is flat in hits: the worst case measured locally was an indicator on
-/// 2,000 assets. Sized well above that so the fold stays exact; a hunt that
-/// somehow exceeded it would under-report assets, which is why it is generous
-/// rather than tight.
-const LAKE_RETRO_SUMMARY_GROUP_CAP: usize = 20_000;
-
-// NAN-2361: the denominator carries NO Nano-side cache.
-//
-// The worker's own result cache still applies to this query
-// (`execute_lake_view_query` sends `use_cache: true`), which is fine: that key
-// is the exact query text plus the scope deny-set, so it cannot conflate two
-// different windows or leak across scopes the way the removed Nano-side key
-// could. What was removed is the hand-rolled process-global memo below.
-//
-// A process-global cache keyed by (anchor, scope) was tried and removed. It
-// bought ~200ms on a ~660ms hunt and cost three defects, all found in review:
-// bucketing the anchor made two hunts with different six-hour spans share an
-// entry; joining the scope deny-set with a control character let `{"a","b"}`
-// collide with `{"a\u{1}b"}`, so a scoped viewer could read ANOTHER scope's
-// population; and expired entries were never evicted. A rarity denominator
-// that silently belongs to someone else's scope is a worse failure than an
-// extra 220ms query, and the correct key here is genuinely subtle — the query
-// is cheap enough that the simplest correct thing wins.
-
 /// Default page size for list/pivot rollups.
 const RETRO_PAGE_SIZE: usize = 50;
 
 /// Hard cap on indicators expanded from a feed/list before aggregation.
 const RETRO_MAX_INDICATORS: usize = 1_000;
 
-fn retro_indicator_bound_error() -> SearchError {
-    SearchError::SqlValidationError(format!(
-        "retro resolved more than {RETRO_MAX_INDICATORS} distinct indicators; the durable retro task cannot safely represent the complete set yet"
-    ))
-}
-
 /// Sample cap on indicator values surfaced per pivot row.
 const RETRO_PIVOT_INDICATOR_SAMPLE: usize = 8;
-
-/// Maximum number of raw matches fetched by one bounded lake slice for the
-/// multi-indicator/pivot fallback. A full retro hunt has no event-count cap:
-/// saturated slices are bisected on event time and accumulated exactly.
-const LAKE_RETRO_SLICE_ROWS: usize = 50_000;
-
-/// Defense against a corrupt timestamp distribution causing unbounded slice
-/// fan-out. This bounds coordinator work, not the number of matching events.
-const LAKE_RETRO_MAX_SLICES: usize = 4_096;
-
-/// DENOMINATOR identity — "how many assets exist in this environment".
-///
-/// Named hosts ONLY — same rule as the ClickHouse path's `host_expr`
-/// (NAN-1592): a remote endpoint IP is not one of your assets, and an IP
-/// fallback counted every external internet IP as a "host" (measured ~280x
-/// inflation on Saturn — 1.78M "hosts", 99.8% public IPs, vs ~4.3K real
-/// hostnames), making everything read artificially rare. An RFC1918 filter was
-/// rejected because cloud assets run on PUBLIC IPs, so private-only would
-/// wrongly drop them.
-///
-/// NAN-2361: this must NOT be reused as the sighting identity — see
-/// [`LAKE_RETRO_ASSET_FIELDS`]. The two answer different questions and one list
-/// cannot be correct for both.
-const LAKE_RETRO_HOST_FIELDS: &[&str] = &[
-    "device.hostname",
-    "src_endpoint.hostname",
-    "dst_endpoint.hostname",
-];
-
-/// NUMERATOR identity — "which asset touched this indicator".
-///
-/// NAN-2361: SOURCE-side only, with `src_endpoint.ip` as a legitimate fallback.
-/// Two differences from [`LAKE_RETRO_HOST_FIELDS`], each load-bearing:
-///
-/// 1. `dst_endpoint.hostname` is EXCLUDED. On a row matched by a domain/URL
-///    indicator, the destination hostname IS the indicator — it is what the
-///    predicate matched on, not a distinct asset. Including it made
-///    `coalesce()` resolve to the indicator's own name on every row, so every
-///    domain hunt collapsed to a single fake "asset" named after the IOC.
-///    Confirmed live: `ioc="stackoverflow.com"` reported 1 host
-///    (`"stackoverflow.com"`) across 70,924 hits; source-side identity resolves
-///    the same hunt to 2,000 real client assets. 1-of-2309 scores `rare`, so a
-///    domain on the entire fleet read as a rare indicator worth chasing.
-/// 2. `src_endpoint.ip` is INCLUDED. Proxy/HTTP telemetry carries no hostname
-///    at all (`device.hostname` and `src_endpoint.hostname` are both null), so
-///    without it those sightings have no identity and vanish. The NAN-1592
-///    "no IP legs" rule is a DENOMINATOR rule — there an IP leg admits every
-///    external server as a fake asset. Here the source IP is the internal
-///    client that actually touched the indicator, which is precisely the
-///    answer being asked for.
-const LAKE_RETRO_ASSET_FIELDS: &[&str] = &[
-    "device.hostname",
-    "src_endpoint.hostname",
-    "src_endpoint.ip",
-];
-
-const LAKE_RETRO_USER_FIELDS: &[&str] = &["user.name", "actor.user.name"];
-
-/// NAN-4169: extra columns a scheduled retro hunt reads per matching row: the
-/// ingest stamps (`enrichments.value`, to skip events ingest already matched)
-/// and the endpoint ports (`ip:port` indicators).
-const LAKE_RETRO_HUNT_EXTRA_FIELDS: &[&str] = &[
-    "enrichments.type",
-    "enrichments.value",
-    "src_endpoint.port",
-    "dst_endpoint.port",
-];
-
-/// NAN-4169: how a scheduled retro hunt (an auto retro-hunt rule run) differs
-/// from an interactive `| retro`: `ip:port` indicators are scanned by their IP
-/// and matched on the same endpoint's port, and an event ingest already
-/// stamped with the indicator is not counted (it was matched at ingest).
-#[derive(Debug, Default, Clone)]
-pub(crate) struct LakeRetroHuntOptions {
-    /// Values the `ioc in [...]` scan filters on: plain indicators plus the
-    /// bare IP of every `ip:port` indicator.
-    pub scan_values: Vec<String>,
-    /// Lowercased IP -> (`ip:port` indicator, port).
-    pub ip_ports: std::collections::HashMap<String, Vec<(String, String)>>,
-}
-
-impl LakeRetroHuntOptions {
-    /// Split `indicators` (lowercased) into scan values and `ip:port` legs.
-    pub(crate) fn for_indicators(indicators: &[String]) -> Self {
-        let mut options = Self::default();
-        let mut scan = std::collections::BTreeSet::new();
-        for indicator in indicators {
-            let value = indicator.trim().to_lowercase();
-            match split_ip_port(&value) {
-                Some((ip, port)) => {
-                    scan.insert(ip.clone());
-                    options.ip_ports.entry(ip).or_default().push((value, port));
-                }
-                None => {
-                    scan.insert(value);
-                }
-            }
-        }
-        options.scan_values = scan.into_iter().collect();
-        options
-    }
-
-    /// `ip:port` indicators the row matches through this endpoint IP column:
-    /// the same endpoint's port must equal the indicator's port.
-    fn ip_port_matches(&self, row: &serde_json::Value, observable: &str, ip: &str) -> Vec<String> {
-        let Some(legs) = self.ip_ports.get(ip) else {
-            return Vec::new();
-        };
-        let Some(port_path) = lake_retro_endpoint_port_path(observable) else {
-            return Vec::new();
-        };
-        let ports = lake_retro_values(row, port_path);
-        legs.iter()
-            .filter(|(_, port)| ports.iter().any(|value| value.trim() == port))
-            .map(|(indicator, _)| indicator.clone())
-            .collect()
-    }
-}
-
-/// The port column on the same endpoint as an IP observable. The lean scan
-/// reports IP observables under their aliases (`src_ip` / `dest_ip`, NAN-4169
-/// native test) and the canonical paths (`*_endpoint.ip`) elsewhere; the
-/// port is always read from the canonical endpoint column the hunt requests.
-fn lake_retro_endpoint_port_path(observable: &str) -> Option<&'static str> {
-    match observable {
-        "src_ip" | "src_endpoint.ip" => Some("src_endpoint.port"),
-        "dest_ip" | "dst_ip" | "dst_endpoint.ip" => Some("dst_endpoint.port"),
-        _ => None,
-    }
-}
-
-/// `ip:port` (`[v6]:port` for IPv6) -> (lowercased ip, port).
-pub(crate) fn split_ip_port(value: &str) -> Option<(String, String)> {
-    let address: std::net::SocketAddr = value.trim().parse().ok()?;
-    Some((address.ip().to_string().to_lowercase(), address.port().to_string()))
-}
-
-#[derive(Default)]
-struct LakeRetroIndicatorAccum {
-    hits: u64,
-    hosts: std::collections::HashSet<String>,
-    fields: std::collections::BTreeMap<String, u64>,
-    entity_hits: std::collections::HashMap<String, u64>,
-    first_seen: Option<String>,
-    last_seen: Option<String>,
-}
-
-#[derive(Default)]
-struct LakeRetroPivotAccum {
-    indicators: std::collections::HashSet<String>,
-    first_seen: Option<String>,
-    last_seen: Option<String>,
-}
-
-/// The `ioc=` / `ioc in [...]` filter a lake retro scan runs on.
-fn lake_retro_ioc_expr(scan_values: &[String]) -> Result<String, SearchError> {
-    let literal_list = scan_values
-        .iter()
-        .map(|value| {
-            serde_json::to_string(value).map_err(|error| {
-                SearchError::SqlValidationError(format!(
-                    "failed to encode retro indicator: {error}"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .join(",");
-    Ok(if scan_values.len() == 1 {
-        format!("ioc={literal_list}")
-    } else {
-        format!("ioc in [{literal_list}]")
-    })
-}
-
-/// The event-level lake retro scan (`List`/`Pivot`, and the multi-slice
-/// `Summary`): the matching events' identity, user and observable columns,
-/// plus the ingest stamps and endpoint ports for a scheduled hunt.
-fn lake_retro_scan_query(
-    ioc_expr: &str,
-    observables: &[ResolvedObservable],
-    hunt: bool,
-) -> String {
-    let mut fields = vec!["time", "metadata.uid"];
-    fields.extend_from_slice(LAKE_RETRO_ASSET_FIELDS);
-    fields.extend_from_slice(LAKE_RETRO_USER_FIELDS);
-    fields.extend(observables.iter().map(|observable| observable.logical));
-    if hunt {
-        fields.extend_from_slice(LAKE_RETRO_HUNT_EXTRA_FIELDS);
-    }
-    fields.sort_unstable();
-    fields.dedup();
-    format!("{ioc_expr} | table {}", fields.join(","))
-}
-
-/// Per-indicator and per-pivot accumulation over the scanned events: the one
-/// fold shared by the interactive `| retro` and the scheduled retro hunt.
-struct LakeRetroFold {
-    indicator_set: std::collections::HashSet<String>,
-    accumulators: std::collections::BTreeMap<String, LakeRetroIndicatorAccum>,
-    pivots: std::collections::BTreeMap<String, LakeRetroPivotAccum>,
-}
-
-impl LakeRetroFold {
-    fn new(indicators: &[String]) -> Self {
-        Self {
-            indicator_set: indicators
-                .iter()
-                .map(|value| value.trim().to_lowercase())
-                .collect(),
-            accumulators: indicators
-                .iter()
-                .map(|value| (value.to_lowercase(), LakeRetroIndicatorAccum::default()))
-                .collect(),
-            pivots: std::collections::BTreeMap::new(),
-        }
-    }
-
-    /// The indicators one scanned event matches, each with the observable
-    /// fields it matched through. A scheduled hunt also matches `ip:port`
-    /// indicators on the same endpoint's port, and drops an indicator the
-    /// event was already stamped with at ingest (NAN-4169).
-    fn event_matches(
-        &self,
-        row: &serde_json::Value,
-        observables: &[ResolvedObservable],
-        hunt: Option<&LakeRetroHuntOptions>,
-    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
-        let mut event_matches: std::collections::BTreeMap<
-            String,
-            std::collections::BTreeSet<String>,
-        > = std::collections::BTreeMap::new();
-        for observable in observables {
-            for value in lake_retro_values(row, observable.logical) {
-                let normalized = value.trim().to_lowercase();
-                if self.indicator_set.contains(&normalized) {
-                    event_matches
-                        .entry(normalized.clone())
-                        .or_default()
-                        .insert(observable.logical.to_string());
-                }
-                if let Some(hunt) = hunt {
-                    for indicator in hunt.ip_port_matches(row, observable.logical, &normalized) {
-                        event_matches
-                            .entry(indicator)
-                            .or_default()
-                            .insert(observable.logical.to_string());
-                    }
-                }
-            }
-        }
-        // NAN-4169: an event ingest already stamped with the indicator was
-        // matched at ingest; the retro hunt never re-reports it.
-        if hunt.is_some() && !event_matches.is_empty() {
-            let stamped = lake_retro_ioc_stamps(row);
-            event_matches.retain(|indicator, _| !stamped.contains(indicator));
-        }
-        event_matches
-    }
-
-    fn add_row(
-        &mut self,
-        row: &serde_json::Value,
-        axis: RetroAxis,
-        observables: &[ResolvedObservable],
-        hunt: Option<&LakeRetroHuntOptions>,
-    ) {
-        let timestamp = lake_retro_first_value(row, "time");
-        let host = LAKE_RETRO_ASSET_FIELDS
-            .iter()
-            .find_map(|path| lake_retro_first_value(row, path));
-        let pivot_entity = match axis {
-            RetroAxis::User => LAKE_RETRO_USER_FIELDS
-                .iter()
-                .find_map(|path| lake_retro_first_value(row, path)),
-            _ => host.clone(),
-        };
-        for (indicator, matched_fields) in self.event_matches(row, observables, hunt) {
-            let Some(accumulator) = self.accumulators.get_mut(&indicator) else {
-                continue;
-            };
-            accumulator.hits = accumulator.hits.saturating_add(1);
-            for field in matched_fields {
-                *accumulator.fields.entry(field).or_default() += 1;
-            }
-            if let Some(host) = host.as_ref().filter(|value| !value.is_empty()) {
-                accumulator.hosts.insert(host.clone());
-                *accumulator.entity_hits.entry(host.clone()).or_default() += 1;
-            }
-            lake_retro_update_bounds(
-                &mut accumulator.first_seen,
-                &mut accumulator.last_seen,
-                timestamp.as_deref(),
-            );
-            if let Some(entity) = pivot_entity.as_ref().filter(|value| !value.is_empty()) {
-                let pivot = self.pivots.entry(entity.clone()).or_default();
-                pivot.indicators.insert(indicator.clone());
-                lake_retro_update_bounds(
-                    &mut pivot.first_seen,
-                    &mut pivot.last_seen,
-                    timestamp.as_deref(),
-                );
-            }
-        }
-    }
-
-    /// The `List` submode rows (rarest first) and the no-hit indicators.
-    fn into_list_rows(
-        self,
-        indicators: &[String],
-        total_hosts: u64,
-    ) -> (Vec<RetroListRow>, Vec<String>) {
-        let accumulators = self.accumulators;
-        let no_hits = indicators
-            .iter()
-            .filter(|value| {
-                accumulators
-                    .get(&value.to_lowercase())
-                    .is_none_or(|accumulator| accumulator.hits == 0)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut rows = accumulators
-            .into_iter()
-            .filter(|(_, accumulator)| accumulator.hits > 0)
-            .map(|(value, accumulator)| {
-                let hosts = accumulator.hosts.len() as u64;
-                let field = accumulator
-                    .fields
-                    .into_iter()
-                    .max_by(|left, right| {
-                        left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0))
-                    })
-                    .map(|(field, _)| field)
-                    .unwrap_or_default();
-                RetroListRow {
-                    indicator_type: classify_indicator(&value).to_string(),
-                    value,
-                    hits: accumulator.hits,
-                    hosts,
-                    total_hosts,
-                    first_seen: accumulator.first_seen,
-                    last_seen: accumulator.last_seen,
-                    field,
-                    verdict: lake_retro_verdict(hosts, total_hosts).to_string(),
-                }
-            })
-            .collect::<Vec<_>>();
-        rows.sort_by(|left, right| {
-            left.hosts
-                .cmp(&right.hosts)
-                .then_with(|| left.hits.cmp(&right.hits))
-                .then_with(|| left.value.cmp(&right.value))
-        });
-        (rows, no_hits)
-    }
-}
-
-/// The indicator values ingest stamped on an event as threat-intel matches
-/// (`enrichments[]` entries of type `threat_intelligence`), lowercased.
-/// Every other entry is ignored: the ingest `prevalence` / `reputation`
-/// stamp carries the event's own observed artifact as its `value`, so
-/// treating any `enrichments.value` as an IOC match would drop every
-/// retro hit (NAN-4169, caught by the native retro hunt test).
-fn lake_retro_ioc_stamps(row: &serde_json::Value) -> std::collections::HashSet<String> {
-    fn column<'a>(row: &'a serde_json::Value, path: &str) -> Vec<&'a serde_json::Value> {
-        let value = row.get(path).or_else(|| {
-            path.split('.').try_fold(row, |current, segment| current.get(segment))
-        });
-        match value {
-            Some(serde_json::Value::Array(values)) => values.iter().collect(),
-            Some(serde_json::Value::Null) | None => Vec::new(),
-            Some(value) => vec![value],
-        }
-    }
-    let types = column(row, "enrichments.type");
-    let values = column(row, "enrichments.value");
-    if types.len() != values.len() {
-        // Unpaired columns cannot be attributed: stamp nothing (a possible
-        // duplicate alert beats a silently dropped retro hit).
-        return std::collections::HashSet::new();
-    }
-    types
-        .into_iter()
-        .zip(values)
-        .filter(|(kind, _)| {
-            kind.as_str()
-                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("threat_intelligence"))
-        })
-        .filter_map(|(_, value)| value.as_str())
-        .map(|value| value.trim().to_lowercase())
-        .filter(|value| !value.is_empty())
-        .collect()
-}
-
-impl From<RetroListRow> for RetroHuntHit {
-    fn from(row: RetroListRow) -> Self {
-        RetroHuntHit {
-            value: row.value,
-            indicator_type: row.indicator_type,
-            field: row.field,
-            hits: row.hits,
-            hosts: row.hosts,
-            total_hosts: row.total_hosts,
-            first_seen: row.first_seen,
-            last_seen: row.last_seen,
-            verdict: row.verdict,
-        }
-    }
-}
-
-/// NAN-4169: one scheduled retro hunt's lake scan for an indicator group,
-/// exactly as [`SearchService::retro_hunt_over_indicators`] runs it on a
-/// lean tenant: the same scan query, event matching (`ip:port` legs, ingest
-/// stamp dedupe) and per-indicator fold. Exposed so native tests can run the
-/// production scan through a real worker engine over real parts.
-pub struct LakeRetroHuntScan {
-    /// The nPL statement the tenant's worker executes over the lookback.
-    pub query: String,
-    indicators: Vec<String>,
-    observables: Vec<ResolvedObservable>,
-    hunt: LakeRetroHuntOptions,
-}
-
-impl LakeRetroHuntScan {
-    pub fn new(
-        profile: &dyn crate::schema::SchemaProfile,
-        indicators: &[String],
-    ) -> Result<Self, SearchError> {
-        if indicators.is_empty() {
-            return Err(SearchError::SqlValidationError(
-                "retro resolved no indicators".to_string(),
-            ));
-        }
-        let hunt = LakeRetroHuntOptions::for_indicators(indicators);
-        let observables = scope_observables(&resolve_ioc_observables(profile), &hunt.scan_values);
-        let query = lake_retro_scan_query(&lake_retro_ioc_expr(&hunt.scan_values)?, &observables, true);
-        Ok(Self { query, indicators: indicators.to_vec(), observables, hunt })
-    }
-
-    /// Fold the scanned rows into the hunt's hits (indicators with no
-    /// surviving match are absent).
-    pub fn hits<'a>(
-        &self,
-        rows: impl IntoIterator<Item = &'a serde_json::Value>,
-        total_hosts: u64,
-    ) -> Vec<RetroHuntHit> {
-        let mut fold = LakeRetroFold::new(&self.indicators);
-        for row in rows {
-            fold.add_row(row, RetroAxis::Indicator, &self.observables, Some(&self.hunt));
-        }
-        fold.into_list_rows(&self.indicators, total_hosts)
-            .0
-            .into_iter()
-            .map(RetroHuntHit::from)
-            .collect()
-    }
-}
 
 /// Retro submode, derived from the parsed `ioc` term + axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -714,11 +153,9 @@ fn retro_axis(query: &Query) -> Option<RetroAxis> {
 fn find_ioc_match(query: &Query) -> Option<(Vec<Value>, Option<IocFeed>, Option<IocLookup>)> {
     fn walk(expr: &SearchExpr) -> Option<(Vec<Value>, Option<IocFeed>, Option<IocLookup>)> {
         match expr {
-            SearchExpr::IocMatch {
-                values,
-                feed,
-                lookup,
-            } => Some((values.clone(), feed.clone(), lookup.clone())),
+            SearchExpr::IocMatch { values, feed, lookup } => {
+                Some((values.clone(), feed.clone(), lookup.clone()))
+            }
             SearchExpr::And(l, r) | SearchExpr::Or(l, r) => walk(l).or_else(|| walk(r)),
             SearchExpr::Not(inner) | SearchExpr::Group(inner) => walk(inner),
             _ => None,
@@ -745,6 +182,7 @@ pub(crate) fn build_retro_marker(plan: &RetroPlan) -> serde_json::Value {
         "_retro_lookup": plan.lookup.as_ref().map(|l| l.table.clone()),
     })
 }
+
 
 /// The canonical host expression used to count distinct hosts touched and to
 /// pivot by asset. First non-empty of the host/ip identity columns, RESOLVED to
@@ -812,43 +250,8 @@ fn coalesce_identity_expr(profile: &dyn SchemaProfile, legs: &[(&str, bool)]) ->
 impl SearchService {
     /// Resolve the literal indicator set for a retro plan, pulling feed-sourced
     /// indicators from `custom_enrichment_results` when the term is a feed. The
-    /// returned list is lowercased + de-duplicated. Indicator sets above the
-    /// durable task contract are rejected explicitly; silently taking the first
-    /// 1,000 would make a completed retro hunt claim coverage it never had.
-    /// Resolve indicators, then drop any that cannot be expressed as an nPL
-    /// literal.
-    ///
-    /// NAN-2361: indicator values are embedded into generated nPL as
-    /// `"{value}"`, and nPL string literals have NO backslash escape — the
-    /// parser reads to the next `"` (that is what makes `"C:\Windows\"` work).
-    /// A JSON-style escape therefore does not contain anything: a feed- or
-    /// lookup-sourced value like `evil.com" | head 1` closes the literal early
-    /// and the remainder is parsed as further pipeline stages, executed with
-    /// the job's scope. Parser-sourced values cannot carry a `"` (they came out
-    /// of a quoted literal), but feed rows and lookup tables are external input
-    /// and were only lowercased, deduped, and capped.
-    ///
-    /// Dropped rather than rejected: a value containing `"` is unqueryable in
-    /// nPL by construction, so it could never have contributed a hit. Failing
-    /// the whole hunt instead would let one poisoned feed row deny every hunt
-    /// that references the feed.
-    async fn resolve_retro_indicators(&self, plan: &RetroPlan) -> Result<Vec<String>, SearchError> {
-        let resolved = self.resolve_retro_indicators_unchecked(plan).await?;
-        let before = resolved.len();
-        let safe = resolved
-            .into_iter()
-            .filter(|value| !value.contains('"') && !value.contains('\\'))
-            .collect::<Vec<_>>();
-        if safe.len() != before {
-            tracing::warn!(
-                dropped = before - safe.len(),
-                "retro: dropped indicator values that cannot be expressed as nPL literals"
-            );
-        }
-        Ok(safe)
-    }
-
-    async fn resolve_retro_indicators_unchecked(
+    /// returned list is lowercased + de-duplicated + capped.
+    async fn resolve_retro_indicators(
         &self,
         plan: &RetroPlan,
     ) -> Result<Vec<String>, SearchError> {
@@ -860,8 +263,8 @@ impl SearchService {
                 if seen.insert(lv.clone()) {
                     out.push(lv);
                 }
-                if out.len() > RETRO_MAX_INDICATORS {
-                    return Err(retro_indicator_bound_error());
+                if out.len() >= RETRO_MAX_INDICATORS {
+                    break;
                 }
             }
             return Ok(out);
@@ -871,9 +274,11 @@ impl SearchService {
         // internal lookup table via LookupService (backend-agnostic), lowercase +
         // dedup + cap. Mutually exclusive with `feed`.
         if let Some(lookup) = &plan.lookup {
-            let resolved =
-                super::ioc_lookup_resolve::resolve_ioc_lookup(lookup, self.lookup_service.as_ref())
-                    .await?;
+            let resolved = super::ioc_lookup_resolve::resolve_ioc_lookup(
+                lookup,
+                self.lookup_service.as_ref(),
+            )
+            .await?;
             let mut seen = std::collections::HashSet::new();
             let mut out = Vec::new();
             for v in resolved {
@@ -881,8 +286,8 @@ impl SearchService {
                 if !lv.is_empty() && seen.insert(lv.clone()) {
                     out.push(lv);
                 }
-                if out.len() > RETRO_MAX_INDICATORS {
-                    return Err(retro_indicator_bound_error());
+                if out.len() >= RETRO_MAX_INDICATORS {
+                    break;
                 }
             }
             return Ok(out);
@@ -893,36 +298,6 @@ impl SearchService {
             Some(f) => f,
             None => return Ok(Vec::new()),
         };
-        if self.backend() == crate::search::config::SearchBackend::Lake {
-            // NAN-3086: a shared tenant resolves its feed from its own
-            // tenant-pinned IOC snapshot, never the process-global reader.
-            let owned;
-            let client = match self.shared_retro_feed_client("retro feed resolution")? {
-                Some(client) => client,
-                None => {
-                    owned = required_lake_ioc_client()?;
-                    &owned
-                }
-            };
-            let (feeds, name_terms, tag_terms) =
-                super::ioc_lookup_resolve::ioc_feed_snapshot_filters(feed);
-            let (records, count) = client
-                .source_records(
-                    &feeds,
-                    &name_terms,
-                    &tag_terms,
-                    &[],
-                    None,
-                    RETRO_MAX_INDICATORS + 1,
-                    false,
-                )
-                .await
-                .map_err(|error| SearchError::ServiceUnavailable(error.to_string()))?;
-            if records.len() > RETRO_MAX_INDICATORS || count > RETRO_MAX_INDICATORS {
-                return Err(retro_indicator_bound_error());
-            }
-            return Ok(records.into_iter().map(|record| record.value).collect());
-        }
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return Ok(Vec::new()),
@@ -934,19 +309,15 @@ impl SearchService {
             // wrapper on clusters (completeness across shards); single-node emits
             // the local name unchanged.
             ioc_feed_indicator_subquery(feed, self.table_names.is_clustered()),
-            RETRO_MAX_INDICATORS + 1
+            RETRO_MAX_INDICATORS
         );
         match clickhouse.query(&sql).fetch_all::<String>().await {
             Ok(rows) => {
                 let mut seen = std::collections::HashSet::new();
-                let rows = rows
+                Ok(rows
                     .into_iter()
                     .filter(|v| !v.is_empty() && seen.insert(v.clone()))
-                    .collect::<Vec<_>>();
-                if rows.len() > RETRO_MAX_INDICATORS {
-                    return Err(retro_indicator_bound_error());
-                }
-                Ok(rows)
+                    .collect())
             }
             Err(e) => {
                 tracing::warn!("Retro feed indicator resolution failed: {}", e);
@@ -1005,34 +376,10 @@ impl SearchService {
     /// never scans beyond retained history (a >365d request would otherwise widen
     /// the window past what ClickHouse retains). The retention floor is the lower
     /// bound: requests older than retention are capped at the floor.
-    /// Clamp a requested window to what storage retains. The caller's start is
-    /// HONOURED when it sits inside retention — this is the window a SCHEDULED
-    /// hunt asked for and must get.
     fn retro_time_range(requested: &TimeRange) -> TimeRange {
         let floor = chrono::Utc::now() - chrono::Duration::days(RETRO_RETENTION_DAYS);
         let start = requested.start.max(floor);
         TimeRange::new(start, requested.end)
-    }
-
-    /// Window for an INTERACTIVE retro hunt: always full retention.
-    ///
-    /// NAN-2361: an analyst asking "has this indicator ever been seen here"
-    /// must not have that answered by whatever the time picker happened to
-    /// hold. Inheriting the picker made a 1h window report window-scoped hits
-    /// under a tile labelled "events all-time", and — worse — returned the
-    /// WINDOW EDGE as `first_seen`/`last_seen`, which is the novelty signal the
-    /// panel then tells the analyst to reason about. Measured live: at 1h the
-    /// same indicator reported first_seen 20:48; at 24h+ it stabilised at the
-    /// real 00:22:17. Affordable because the hunt is index-driven, so cost
-    /// tracks matching rows rather than window width (flat ~350ms, 1h to 30d).
-    ///
-    /// Deliberately SEPARATE from [`retro_time_range`]: a scheduled hunt passes
-    /// an explicit `lookback_days` and must keep it. Collapsing the two made
-    /// every daily sweep rescan a year and re-emit months-old matches as if
-    /// newly found (caught in review, never shipped).
-    fn retro_interactive_range(requested: &TimeRange) -> TimeRange {
-        let floor = chrono::Utc::now() - chrono::Duration::days(RETRO_RETENTION_DAYS);
-        TimeRange::new(floor, requested.end)
     }
 
     /// The active profile's resolved observable list (NAN-1580 OCSF-awareness).
@@ -1082,7 +429,6 @@ impl SearchService {
         req: RetroRequest,
         scope: &ScopeSet,
     ) -> Result<RetroResponse, SearchError> {
-        self.require_dedicated_retention_surface("retro companion queries")?;
         req.time_range.validate()?;
 
         let (cleaned_query, _earliest, _latest) = super::extract_time_bounds(&req.query)?;
@@ -1114,17 +460,11 @@ impl SearchService {
             };
         }
 
-        let range = Self::retro_interactive_range(&TimeRange::new(
+        let range = Self::retro_time_range(&TimeRange::new(
             req.time_range.start,
             req.time_range.end,
         ));
         let indicators = self.resolve_retro_indicators(&plan).await?;
-
-        if self.backend() == crate::search::config::SearchBackend::Lake {
-            return self
-                .build_lake_retro_view(&plan, &indicators, &range, scope, &req, None)
-                .await;
-        }
 
         // NAN-1801: render the deny-set ONCE; every logs scan below ANDs it.
         // The indicator-set resolution above is deliberately NOT scoped — it
@@ -1168,626 +508,6 @@ impl SearchService {
                 .await
             }
         }
-    }
-
-    /// Admit expensive lake retro forms to the isolated durable lane. `None`
-    /// means the caller should execute that interactive form (or the legacy
-    /// ClickHouse backend) normally.
-    ///
-    /// NAN-2361: single-indicator Summary hunts used to stay inline
-    /// unconditionally — a fixed-cardinality aggregate is cheap on
-    /// ClickHouse, where a bloom-filter/text skip-index lets `ioc=` jump
-    /// straight to matching rows. Lake/chDB has no equivalent skip-index for
-    /// the observable fan-out predicate, so even a single-hash Summary has
-    /// to read every candidate column across the full requested window —
-    /// confirmed live: a one-hash 24h Summary hunt on an environment with a
-    /// few days of accumulated volume blew the 256MB interactive scan
-    /// budget (`RESOURCE_EXHAUSTED`), making retro entirely unusable for any
-    /// real dataset. The durable job runner already has a complete `submode
-    /// == "summary"` branch (`nanosiem-lake-worker/src/main.rs`,
-    /// `execute_retro_job`) and `DurableLakeTask::RetroV1::validate` already
-    /// accepts the `("indicator", "summary", 1)` shape — Summary was fully
-    /// wired end-to-end and simply never admitted here. The frontend
-    /// (`useRetro.ts`) already polls generically on any `job_id` response
-    /// regardless of submode, so this needed no client change.
-    pub async fn enqueue_durable_retro_view(
-        &self,
-        req: &RetroRequest,
-        user_id: uuid::Uuid,
-        scope: &ScopeSet,
-        authority: Option<&crate::search::DurableSearchJobAuthority>,
-    ) -> Result<Option<String>, SearchError> {
-        // NAN-3086: a shared (lean) tenant runs EVERY retro form as a durable
-        // job on its cell, admitted over the retention-bound range below. The
-        // runner signs a moving-cutoff proof over that range, query[T] clamps
-        // every read (indicator rollups, pivot slices, rarity denominator) to
-        // the proof's current cutoff, and every read of the result re-checks
-        // it. Nothing retro computes on a shared tenant is ever returned
-        // inline, so no unproven aggregate reaches a cache or a caller.
-        #[cfg(feature = "enterprise")]
-        let shared = self.admission_scope.is_enterprise_shared();
-        #[cfg(not(feature = "enterprise"))]
-        let shared = !matches!(self.admission_scope, crate::search::tenant::SearchTenantScope::Dedicated);
-        if !shared && self.backend() != crate::search::config::SearchBackend::Lake {
-            return Ok(None);
-        }
-        req.time_range.validate()?;
-        let (cleaned_query, _earliest, _latest) = super::extract_time_bounds(&req.query)?;
-        let query = parse_query(&cleaned_query).map_err(super::convert_parse_error)?;
-        let mut plan = extract_retro_plan(&query).ok_or_else(|| {
-            SearchError::SqlValidationError(
-                "Not a retro query — expected `ioc=… | retro [by asset|user]`.".to_string(),
-            )
-        })?;
-        if let Some(req_axis) = RetroAxis::from_str(&req.axis) {
-            plan.axis = req_axis;
-            plan.submode = match req_axis {
-                RetroAxis::Asset | RetroAxis::User => RetroSubmode::Pivot,
-                RetroAxis::Indicator => {
-                    if plan.feed.is_some() || plan.lookup.is_some() || plan.values.len() > 1 {
-                        RetroSubmode::List
-                    } else {
-                        RetroSubmode::Summary
-                    }
-                }
-            };
-        }
-        // NAN-2361: single-indicator Summary runs INTERACTIVELY again.
-        //
-        // It was escalated here when a one-hash hunt returned
-        // `RESOURCE_EXHAUSTED`, but that diagnosis was wrong: the IOC lookup
-        // itself is ~350ms (the sidecar candidate index prunes it fine, and the
-        // cost tracks matching rows, not window width — measured flat from 1h
-        // to 30d). What actually exceeded the budget was the unfiltered
-        // `retro_total_hosts` fleet scan riding along inside every hunt.
-        // Escalating dragged that cost into a lane that tolerates it instead of
-        // removing it, turning a sub-second question into a 7.3s job
-        // round-trip. With the denominator windowed to a bounded recent span
-        // (and NOT memoised — see `LAKE_RETRO_DENOMINATOR_WINDOW_HOURS`), the
-        // whole hunt fits the interactive lane. List/pivot campaigns stay
-        // durable — those are genuinely unbounded in indicator count, and they
-        // use `retro_interactive_range` too, so a campaign's window matches the
-        // retention-wide window a single-indicator hunt reports.
-        if plan.submode == RetroSubmode::Summary && !shared {
-            return Ok(None);
-        }
-
-        let requested = Self::retro_interactive_range(&TimeRange::new(
-            req.time_range.start,
-            req.time_range.end,
-        ));
-        // NAN-3086: bound to the tenant's retention cutoff (the job result
-        // carries the proof); a shared tenant without its lean cell job
-        // runner is refused here, before any indicator source is read.
-        let (generation_pin, range) = self
-            .durable_view_admission("durable retro jobs", &requested)
-            .await?;
-        let indicators = self.resolve_retro_indicators(&plan).await?;
-        if indicators.is_empty() {
-            return Err(SearchError::SqlValidationError(
-                "retro resolved no indicators".to_string(),
-            ));
-        }
-        let offset = req.offset.unwrap_or(0);
-        let limit = req.limit.unwrap_or(RETRO_PAGE_SIZE).clamp(1, 500);
-        let request = SearchRequest {
-            query: req.query.clone(),
-            time_range: TimeRangeInput::new(range.start, range.end),
-            limit: Some(1),
-            offset: Some(0),
-            include_sql: Some(false),
-            skip_histogram: true,
-            skip_field_stats: true,
-            use_cache: false,
-            table_view: false,
-            request_id: None,
-            async_mode: true,
-            priority: Some("analytics".to_string()),
-            dataset: Some("logs".to_string()),
-        };
-        let job_id = self
-            .job_control()
-            .create_durable_queued(
-                request,
-                &crate::search::DurableLakeTask::RetroV1 {
-                    indicators,
-                    axis: plan.axis.as_str().to_string(),
-                    submode: plan.submode.as_str().to_string(),
-                    offset,
-                    limit,
-                },
-                user_id,
-                crate::search::QueryPriority::Analytics,
-                scope,
-                &generation_pin,
-                authority,
-            )
-            .await
-            .map_err(|error| {
-                SearchError::ServiceUnavailable(format!("durable retro admission failed: {error}"))
-            })?;
-        Ok(Some(job_id))
-    }
-
-    /// Storage-neutral retro implementation for the canonical OCSF lake.
-    ///
-    /// The event scan goes through the same tenant-pinned nPL worker as Search,
-    /// so source-scope enforcement, immutable snapshot binding, byte limits and
-    /// cancellation remain centralized. The common single-indicator summary is
-    /// aggregated in chDB. Multi-indicator list/pivot requests use bounded,
-    /// disjoint time slices and exact Rust accumulation because one event may
-    /// carry the same IOC in several canonical array/scalar paths.
-    async fn build_lake_retro_view(
-        &self,
-        plan: &RetroPlan,
-        indicators: &[String],
-        range: &TimeRange,
-        scope: &ScopeSet,
-        request: &RetroRequest,
-        hunt: Option<&LakeRetroHuntOptions>,
-    ) -> Result<RetroResponse, SearchError> {
-        if indicators.is_empty() {
-            return Err(SearchError::SqlValidationError(
-                "retro resolved no indicators".to_string(),
-            ));
-        }
-
-        // NAN-4169: a scheduled hunt scans by the bare IP of an `ip:port`
-        // indicator (the indexed observable) and matches the port per row.
-        let scan_values: &[String] = hunt.map_or(indicators, |hunt| hunt.scan_values.as_slice());
-        let observables = scope_observables(&self.retro_observables(), scan_values);
-        let ioc_expr = lake_retro_ioc_expr(scan_values)?;
-
-        // A single-indicator retro is the common interactive case. Aggregate
-        // it in chDB instead of materializing every matching event in the
-        // Search service. Conditional counts preserve exact per-observable
-        // attribution (including canonical array fields), while a second small
-        // grouped query produces the top-entity list. The result cardinality is
-        // fixed, so 50k, 5M, and 500M matching events have the same response
-        // shape and no arbitrary event ceiling.
-        if plan.submode == RetroSubmode::Summary {
-            // NAN-2361: ONE grouped aggregate, not two queries plus a
-            // denominator scan.
-            //
-            // This used to issue a scalar summary AND a separate top-entities
-            // query. It also asked chDB for per-observable attribution via
-            // `count(eval(<predicate>))` -- which silently IGNORES its argument
-            // and behaves as a bare `count()`, so EVERY observable reported the
-            // full hit total whether it matched or not. Measured directly:
-            // `count(eval(<always-false predicate>))` returns the row count, and
-            // a hash hunt reported all three hash paths at exactly 35,522 = its
-            // total hits. "Which field did this indicator match on" was noise.
-            //
-            // Grouping by the observable columns answers that exactly instead:
-            // under an `ioc=` filter each observable column is either the
-            // indicator or NULL, so a group's non-empty column IS the match, and
-            // summing that group's hits gives the true per-path attribution.
-            // Same pass yields hits, first/last seen, the asset list and the
-            // distinct-host count, so one query replaces two and fixes a
-            // wrong-answer bug rather than carrying it forward.
-            //
-            // Cardinality is bounded by distinct (identity x observable)
-            // combinations -- NOT by event count -- so it is flat in hits.
-            // DEDUPED: for an IP indicator `src_endpoint.ip` is BOTH a sighting
-            // identity field and a matched observable. Emitting it twice puts a
-            // duplicate alias in the select list and a duplicate key in GROUP BY
-            // — the shape chDB rejects with ILLEGAL_COLUMN ("Cannot add
-            // column"), the same failure the tree command hit (NAN-2361).
-            let mut group_seen = std::collections::BTreeSet::new();
-            let group_fields = LAKE_RETRO_ASSET_FIELDS
-                .iter()
-                .copied()
-                .chain(observables.iter().map(|observable| observable.logical))
-                .filter(|field| group_seen.insert(*field))
-                .collect::<Vec<_>>()
-                .join(",");
-            let summary_query = format!(
-                "{ioc_expr} | stats count() as hits, min(time) as first_seen, max(time) as last_seen by {group_fields}"
-            );
-            let (summary, total_hosts) = tokio::try_join!(
-                self.execute_lake_view_query(
-                    summary_query,
-                    range,
-                    scope,
-                    "retro-summary",
-                    // cap + 1 so a full cap is DISTINGUISHABLE from an overflow:
-                    // asking for exactly the cap makes `len() == cap` ambiguous
-                    // and would reject a legitimate exact-cap result.
-                    LAKE_RETRO_SUMMARY_GROUP_CAP.saturating_add(1),
-                ),
-                self.lake_retro_total_hosts(scope, range),
-            )?;
-            let groups = &summary.results;
-            // NAN-2361: a truncated fold is an EXACT-LOOKING UNDERCOUNT.
-            //
-            // Everything below (hits, first/last seen, distinct hosts, top
-            // entities, and therefore the rarity verdict) is summed from these
-            // groups. If the aggregate hit its ceiling, every one of those
-            // numbers is quietly too small and the panel presents them with no
-            // hint that anything was dropped — an indicator on more assets than
-            // the cap would render as RARER than it is, which is the dangerous
-            // direction for a triage signal. Fail loudly instead.
-            //
-            // NOTE: Summary deliberately does NOT auto-escalate to the durable
-            // lane (`enqueue_durable_retro_view` returns Ok(None) for it), so
-            // this surfaces to the analyst as an error. That is the honest
-            // outcome: no silent undercount, and the message says what to do.
-            if groups.len() > LAKE_RETRO_SUMMARY_GROUP_CAP {
-                return Err(SearchError::ResourceExhausted(format!(
-                    "retro summary exceeded {LAKE_RETRO_SUMMARY_GROUP_CAP} sighting groups for \
-                     this indicator; rerun as `| retro by asset` for a paginated exact rollup"
-                )));
-            }
-            let value = indicators.first().cloned().unwrap_or_default();
-
-            let hits = groups.iter().map(|row| lake_retro_u64(row, "hits")).sum();
-            // Bounds span EVERY group, including those whose sighting identity
-            // could not be resolved -- an unattributable sighting is still a
-            // sighting and must not narrow first/last seen.
-            let mut first_seen: Option<String> = None;
-            let mut last_seen: Option<String> = None;
-            for row in groups {
-                lake_retro_update_bounds(
-                    &mut first_seen,
-                    &mut last_seen,
-                    lake_retro_first_value(row, "first_seen").as_deref(),
-                );
-                lake_retro_update_bounds(
-                    &mut first_seen,
-                    &mut last_seen,
-                    lake_retro_first_value(row, "last_seen").as_deref(),
-                );
-            }
-
-            // True per-path attribution: a group contributes to an observable
-            // only when that column actually carries a value.
-            // A group contributes to an observable only when that column holds
-            // THE HUNTED INDICATOR — not merely when it is populated.
-            //
-            // NAN-2361: "non-empty" is wrong the moment an identity field is
-            // also an observable. For `ioc=<ip>`, a row matched on
-            // `dst_endpoint.ip` still carries an unrelated `src_endpoint.ip`,
-            // so a presence test credited BOTH paths and the per-field
-            // attribution over-reported. Domains hid this (their observable
-            // columns are only ever the indicator or NULL), which is why the
-            // original demo looked right.
-            let indicator_set = indicators
-                .iter()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .collect::<std::collections::BTreeSet<_>>();
-            let matched_fields = observables
-                .iter()
-                .filter_map(|observable| {
-                    let count: u64 = groups
-                        .iter()
-                        .filter(|row| {
-                            lake_retro_values(row, observable.logical)
-                                .iter()
-                                .any(|value| {
-                                    indicator_set.contains(&value.trim().to_ascii_lowercase())
-                                })
-                        })
-                        .map(|row| lake_retro_u64(row, "hits"))
-                        .sum();
-                    (count > 0).then(|| (observable.logical.to_string(), count))
-                })
-                .collect::<Vec<_>>();
-
-            // Fold groups onto the sighting identity. Empty identities are the
-            // "could not attribute" bucket: they still counted toward hits above
-            // but are neither an asset nor a distinct host.
-            let mut per_asset: std::collections::BTreeMap<String, u64> =
-                std::collections::BTreeMap::new();
-            for row in groups {
-                let asset = LAKE_RETRO_ASSET_FIELDS
-                    .iter()
-                    .find_map(|path| {
-                        lake_retro_first_value(row, path).filter(|value| !value.trim().is_empty())
-                    })
-                    .unwrap_or_default();
-                if asset.is_empty() {
-                    continue;
-                }
-                *per_asset.entry(asset).or_default() += lake_retro_u64(row, "hits");
-            }
-            let distinct_hosts = per_asset.len() as u64;
-            let mut ranked = per_asset.into_iter().collect::<Vec<_>>();
-            // Deterministic ordering: hits desc, then id asc so equal-hit
-            // entities do not reshuffle between identical requests.
-            ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-            ranked.truncate(10);
-            let top_entities = ranked
-                .into_iter()
-                .map(|(id, hits)| RetroTopEntity {
-                    id,
-                    hits,
-                    kind: "asset".to_string(),
-                })
-                .collect();
-            // NAN-2361: consult the IOC store so a hunted value that is a
-            // known-bad from an ingested feed is attributed as such. Falls back
-            // to the caller's own provenance when no snapshot/intel exists.
-            let (intel_source, intel_campaign, intel_confidence) = self
-                .retro_indicator_attribution(
-                    &value,
-                    if plan.lookup.is_some() {
-                        "lookup"
-                    } else {
-                        "query"
-                    },
-                )
-                .await;
-            return Ok(RetroResponse {
-                submode: RetroSubmode::Summary.as_str().to_string(),
-                axis: plan.axis.as_str().to_string(),
-                total_hosts,
-                generated_sql: None,
-                indicator: Some(RetroIndicatorSummary {
-                    value: value.clone(),
-                    indicator_type: classify_indicator(&value).to_string(),
-                    source: intel_source,
-                    campaign: intel_campaign,
-                    confidence: intel_confidence,
-                    hits,
-                    first_seen,
-                    last_seen,
-                    matched_fields,
-                    distinct_hosts,
-                    total_hosts,
-                    verdict: lake_retro_verdict(distinct_hosts, total_hosts).to_string(),
-                    top_entities,
-                }),
-                total_indicators: None,
-                rows: None,
-                no_hits: None,
-                pivot_rows: None,
-                offset: None,
-                limit: None,
-                has_more: None,
-            });
-        }
-
-        let scan_query = lake_retro_scan_query(&ioc_expr, &observables, hunt.is_some());
-        let mut fold = LakeRetroFold::new(indicators);
-
-        let mut pending = vec![range.clone()];
-        let mut completed_slices = 0_usize;
-        while let Some(slice) = pending.pop() {
-            if completed_slices.saturating_add(pending.len()) >= LAKE_RETRO_MAX_SLICES {
-                return Err(SearchError::ResourceExhausted("coordinator".to_string()));
-            }
-            let response = self
-                .execute_lake_view_query(
-                    scan_query.clone(),
-                    &slice,
-                    scope,
-                    "retro-events",
-                    LAKE_RETRO_SLICE_ROWS,
-                )
-                .await?;
-            if response.results.len() >= LAKE_RETRO_SLICE_ROWS {
-                let width_us = (slice.end - slice.start)
-                    .num_microseconds()
-                    .unwrap_or_default();
-                if width_us < 2 {
-                    return Err(SearchError::ResourceExhausted("result".to_string()));
-                }
-                let newer_start = slice.start + chrono::Duration::microseconds(width_us / 2);
-                // NAN-4280: half-open slices share `newer_start`.
-                pending.push(TimeRange::new(slice.start, newer_start));
-                pending.push(TimeRange::new(newer_start, slice.end));
-                continue;
-            }
-            completed_slices += 1;
-
-            for row in &response.results {
-                fold.add_row(row, plan.axis, &observables, hunt);
-            }
-        }
-
-        let total_hosts = self.lake_retro_total_hosts(scope, range).await?;
-
-        let offset = request.offset.unwrap_or(0);
-        let limit = request.limit.unwrap_or(RETRO_PAGE_SIZE).clamp(1, 500);
-        match plan.submode {
-            RetroSubmode::Summary => {
-                let value = indicators.first().cloned().unwrap_or_default();
-                let accumulator = fold
-                    .accumulators
-                    .remove(&value.to_lowercase())
-                    .unwrap_or_default();
-                let distinct_hosts = accumulator.hosts.len() as u64;
-                let verdict = lake_retro_verdict(distinct_hosts, total_hosts);
-                let mut matched_fields = accumulator.fields.into_iter().collect::<Vec<_>>();
-                matched_fields
-                    .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-                let mut top_entities = accumulator
-                    .entity_hits
-                    .into_iter()
-                    .map(|(id, hits)| RetroTopEntity {
-                        id,
-                        hits,
-                        kind: "asset".to_string(),
-                    })
-                    .collect::<Vec<_>>();
-                top_entities.sort_by(|left, right| {
-                    right
-                        .hits
-                        .cmp(&left.hits)
-                        .then_with(|| left.id.cmp(&right.id))
-                });
-                top_entities.truncate(10);
-                // NAN-2361: same feed attribution as the single-slice path.
-                let (intel_source, intel_campaign, intel_confidence) = self
-                    .retro_indicator_attribution(
-                        &value,
-                        if plan.lookup.is_some() {
-                            "lookup"
-                        } else {
-                            "query"
-                        },
-                    )
-                    .await;
-                Ok(RetroResponse {
-                    submode: RetroSubmode::Summary.as_str().to_string(),
-                    axis: plan.axis.as_str().to_string(),
-                    total_hosts,
-                    generated_sql: None,
-                    indicator: Some(RetroIndicatorSummary {
-                        value: value.clone(),
-                        indicator_type: classify_indicator(&value).to_string(),
-                        source: intel_source,
-                        campaign: intel_campaign,
-                        confidence: intel_confidence,
-                        hits: accumulator.hits,
-                        first_seen: accumulator.first_seen,
-                        last_seen: accumulator.last_seen,
-                        matched_fields,
-                        distinct_hosts,
-                        total_hosts,
-                        verdict: verdict.to_string(),
-                        top_entities,
-                    }),
-                    total_indicators: None,
-                    rows: None,
-                    no_hits: None,
-                    pivot_rows: None,
-                    offset: None,
-                    limit: None,
-                    has_more: None,
-                })
-            }
-            RetroSubmode::List => {
-                let (rows, no_hits) = fold.into_list_rows(indicators, total_hosts);
-                let total = rows.len();
-                let page = rows.into_iter().skip(offset).take(limit).collect();
-                Ok(RetroResponse {
-                    submode: RetroSubmode::List.as_str().to_string(),
-                    axis: plan.axis.as_str().to_string(),
-                    total_hosts,
-                    generated_sql: None,
-                    indicator: None,
-                    total_indicators: Some(total as u64),
-                    rows: Some(page),
-                    no_hits: Some(no_hits),
-                    pivot_rows: None,
-                    offset: Some(offset),
-                    limit: Some(limit),
-                    has_more: Some(total > offset.saturating_add(limit)),
-                })
-            }
-            RetroSubmode::Pivot => {
-                let verdict_by_indicator = fold
-                    .accumulators
-                    .iter()
-                    .map(|(value, accumulator)| {
-                        (
-                            value.clone(),
-                            if total_hosts == 0 {
-                                RetroVerdict::Rare
-                            } else {
-                                RetroVerdict::from_ratio(
-                                    accumulator.hosts.len() as f64 / total_hosts as f64,
-                                )
-                            },
-                        )
-                    })
-                    .collect::<std::collections::HashMap<_, _>>();
-                let mut rows = fold
-                    .pivots
-                    .into_iter()
-                    .map(|(id, pivot)| {
-                        let mut indicators = pivot.indicators.into_iter().collect::<Vec<_>>();
-                        indicators.sort();
-                        let iocs = indicators.len() as u64;
-                        let worst_verdict = indicators
-                            .iter()
-                            .filter_map(|value| verdict_by_indicator.get(value).copied())
-                            .min_by_key(|verdict| match verdict {
-                                RetroVerdict::Rare => 0,
-                                RetroVerdict::Uncommon => 1,
-                                RetroVerdict::Common => 2,
-                            })
-                            .unwrap_or(RetroVerdict::Rare)
-                            .as_str()
-                            .to_string();
-                        indicators.truncate(RETRO_PIVOT_INDICATOR_SAMPLE);
-                        RetroPivotRow {
-                            name: id.clone(),
-                            id,
-                            sub: None,
-                            iocs,
-                            indicators,
-                            first_seen: pivot.first_seen,
-                            last_seen: pivot.last_seen,
-                            worst_verdict,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                rows.sort_by(|left, right| {
-                    left.first_seen
-                        .cmp(&right.first_seen)
-                        .then_with(|| left.id.cmp(&right.id))
-                });
-                let total = rows.len();
-                let page = rows.into_iter().skip(offset).take(limit).collect();
-                Ok(RetroResponse {
-                    submode: RetroSubmode::Pivot.as_str().to_string(),
-                    axis: plan.axis.as_str().to_string(),
-                    total_hosts,
-                    generated_sql: None,
-                    indicator: None,
-                    total_indicators: None,
-                    rows: None,
-                    no_hits: None,
-                    pivot_rows: Some(page),
-                    offset: Some(offset),
-                    limit: Some(limit),
-                    has_more: Some(total > offset.saturating_add(limit)),
-                })
-            }
-        }
-    }
-
-    async fn lake_retro_total_hosts(
-        &self,
-        scope: &ScopeSet,
-        range: &TimeRange,
-    ) -> Result<u64, SearchError> {
-        let anchor_end = range.end;
-        // Anchored on the REQUEST END over a fixed window, matching the durable
-        // path (lake-worker `execute_retro_job`) exactly. Anchoring one lane on
-        // `now()` and the other on the request end meant the same indicator
-        // under the same scope could report a different population — and
-        // therefore a different rarity verdict — depending on which lane ran it.
-        let end = anchor_end;
-        // NAN-3086: never before the (retention-bound) range start — the
-        // durable lane clips identically (`retro_job::run_retro`).
-        let start = (end - chrono::Duration::hours(LAKE_RETRO_DENOMINATOR_WINDOW_HOURS)).max(range.start);
-        // DENOMINATOR -- named hosts only (NAN-1592): including IP legs here
-        // admits every external internet IP as a fake asset and inflated the
-        // rarity denominator ~414x (956,024 -> 2,309 measured locally). Built
-        // from the constant rather than a hardcoded literal so it cannot drift
-        // from it, and deliberately NOT the sighting identity
-        // (`LAKE_RETRO_ASSET_FIELDS`) -- see both doc comments.
-        let query = format!(
-            "* | eval retro_host=coalesce({}) | stats dc(retro_host) as total_hosts",
-            LAKE_RETRO_HOST_FIELDS.join(",")
-        );
-        let response = self
-            .execute_lake_view_query(query, &TimeRange::new(start, end), scope, "retro-hosts", 1)
-            .await?;
-        // NAN-2361: parse through `lake_retro_u64`, which accepts BOTH a JSON
-        // number and a numeric string. Lake JSONEachRow encodes UInt64 as a
-        // string, so an `as_u64()`-only read silently yielded 0 — and a zero
-        // denominator bands every indicator `rare` (`from_ratio` on a 0 total),
-        // which is the dangerous direction for a triage signal and looks like a
-        // legitimate verdict.
-        Ok(response
-            .results
-            .first()
-            .map(|row| lake_retro_u64(row, "total_hosts"))
-            .unwrap_or(0))
     }
 
     /// Summary submode: a single indicator's environment-wide footprint.
@@ -1921,14 +641,7 @@ impl SearchService {
             .table_names
             .read(Self::logs_table_key(self.active_profile.as_ref()));
         let host = host_expr(self.active_profile.as_ref());
-        let union = union_match_legs(
-            observables,
-            &logs_table,
-            value,
-            range,
-            &host,
-            scope_predicate,
-        );
+        let union = union_match_legs(observables, &logs_table, value, range, &host, scope_predicate);
         let sql = format!(
             "SELECT _host AS id, uniqExact(_rid) AS hits FROM ({union}) \
              WHERE _host != '' GROUP BY _host ORDER BY hits DESC LIMIT 10",
@@ -1950,66 +663,12 @@ impl SearchService {
         }
     }
 
-    /// Threat-intel attribution for one indicator, shaped for the response.
-    ///
-    /// NAN-2361: the lake path used to hardcode `campaign: None, confidence: 0`
-    /// and never consult the IOC store at all, so a hunt for a value that IS a
-    /// known-bad from an ingested feed still reported `source: "query"` — the
-    /// analyst got correct sightings with no indication the indicator was
-    /// flagged, or by whom, or with what confidence. [`retro_indicator_intel`]
-    /// already had a working lake branch; only the ClickHouse summary path ever
-    /// called it.
-    ///
-    /// Deliberately best-effort: a missing/unconfigured IOC snapshot is the
-    /// normal state for an install that ingests no feeds, so it must degrade to
-    /// the caller's own `lookup`/`query` provenance rather than failing the
-    /// hunt. `retro_indicator_intel` itself returns `"query"` for "no intel
-    /// row", which is indistinguishable from "not attributed" — collapse both
-    /// to `None` so the caller keeps its existing labelling.
-    async fn retro_indicator_attribution(
-        &self,
-        value: &str,
-        fallback_source: &str,
-    ) -> (String, Option<String>, u32) {
-        match self.retro_indicator_intel(value).await {
-            Ok((source, campaign, confidence)) if !source.is_empty() && source != "query" => {
-                (source, campaign, confidence)
-            }
-            Ok(_) => (fallback_source.to_string(), None, 0),
-            Err(error) => {
-                tracing::debug!(
-                    indicator = value,
-                    %error,
-                    "retro threat-intel attribution unavailable; using query provenance"
-                );
-                (fallback_source.to_string(), None, 0)
-            }
-        }
-    }
-
     /// Resolve threat-intel metadata (source feed, campaign tag, confidence) for
     /// a single indicator from `custom_enrichment_results`. Best-effort.
     async fn retro_indicator_intel(
         &self,
         value: &str,
     ) -> Result<(String, Option<String>, u32), SearchError> {
-        if self.backend() == crate::search::config::SearchBackend::Lake {
-            let client = required_lake_ioc_client()?;
-            let hit = client
-                .lookup(value)
-                .await
-                .map_err(|error| SearchError::ServiceUnavailable(error.to_string()))?
-                .into_iter()
-                .max_by_key(|hit| hit.confidence_level.unwrap_or_default());
-            return Ok(match hit {
-                Some(hit) => (
-                    hit.source_id.unwrap_or_else(|| "enrichment".to_string()),
-                    hit.tags.into_iter().find(|tag| !tag.trim().is_empty()),
-                    hit.confidence_level.unwrap_or_default().max(0) as u32,
-                ),
-                None => ("query".to_string(), None, 0),
-            });
-        }
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return Ok(("query".to_string(), None, 0)),
@@ -2021,10 +680,14 @@ impl SearchService {
         // single-node → byte-identical. `ORDER BY confidence DESC LIMIT 1` already
         // picks a single best row across shards (best-effort metadata).
         let intel_table = self.table_names.read("custom_enrichment_results");
+        // Uncommitted IOC list rows are not intel (NAN-4902 lane G).
+        let visible = crate::enrichment::ioc::committed_rows_predicate(
+            &self.table_names.read(crate::enrichment::ioc::IOC_LIST_COMMITS_TABLE),
+        );
         let sql = format!(
             "SELECT enrichment_name, arrayStringConcat(tags, ','), toUInt32(confidence) \
              FROM {intel_table} \
-             WHERE is_ioc = 1 AND lower(key_value) = '{escaped}' \
+             WHERE is_ioc = 1 AND lower(key_value) = '{escaped}' AND {visible} \
              ORDER BY confidence DESC LIMIT 1"
         );
         match clickhouse
@@ -2243,6 +906,7 @@ impl SearchService {
             has_more: Some(has_more),
         })
     }
+
 }
 
 // =============================================================================
@@ -2269,12 +933,27 @@ struct RetroFeedCandidateRow {
 
 impl SearchService {
     /// Build the SQL for the delta candidate scan over `custom_enrichment_results`
-    /// (split out for unit testing).
+    /// (split out for unit testing; `pub` so the real-ClickHouse suite runs the
+    /// production SQL).
     ///
-    /// Live IOC rows only (`is_ioc = 1 AND expires_at > now()`), STRICTLY after
-    /// the keyset cursor, optionally narrowed to selected feeds and artifact
-    /// types. Grouped by lowercased value so a ReplacingMergeTree's duplicate
-    /// versions collapse to one candidate carrying its newest `fetched_at`.
+    /// Live IOC rows only, STRICTLY after the keyset cursor, optionally narrowed
+    /// to selected feeds and artifact types, one candidate per lowercased value.
+    ///
+    /// ## Latest version per key (NAN-4902 lane G)
+    ///
+    /// The inner query collapses each ReplacingMergeTree key
+    /// `(namespace, enrichment_name, key_type, key_value)` to its latest row by
+    /// `argMax(…, (version, fetched_at))` BEFORE the liveness and cursor
+    /// filters, the same collapse the IOC dictionary refresh uses (migration
+    /// 161). Without it an unmerged older version would keep a key alive after
+    /// its feed expired it, and the newest attributes would not win.
+    /// Marketplace feeds write `version = 1` on every sync, so for them the
+    /// tuple order picks the newest `fetched_at` — the previous semantics.
+    ///
+    /// The collapsed `fetched_at` is the key's "learned at". IOC lists keep it
+    /// stable across republishes, so after a republish only NEW indicators sit
+    /// above the cursor; feeds that restamp on every sync re-surface their
+    /// whole set, which the per-rule hunted-set anti-join then skips.
     ///
     /// ## Why the cursor is a keyset, not a bare timestamp
     ///
@@ -2286,35 +965,46 @@ impl SearchService {
     /// is never hunted. Ordering by `(fetched_at, value)` and cursoring on the
     /// pair makes the cursor strictly monotonic, guaranteeing forward progress.
     ///
-    /// The cursor predicate is applied at ROW level (both `fetched_at` and
-    /// `lower(key_value)` are row expressions, not aggregates), which is sound
-    /// under the `GROUP BY value`: a group's true newest row always satisfies the
-    /// predicate whenever the group belongs above the cursor, so `max(fetched_at)`
-    /// over the surviving rows equals the group's true `fetched_at`.
-    fn retro_hunt_candidates_sql(
+    /// The cursor predicate runs on the collapsed per-key rows; the outer
+    /// `GROUP BY value` then merges the same value across feeds, keeping its
+    /// newest `fetched_at`. A value whose newest feed row is above the cursor
+    /// is a candidate; its older feed rows below the cursor were filtered out
+    /// before the outer aggregation, so `max(fetched_at)` is exact.
+    ///
+    /// ## Committed rows and the settle bound (NAN-4902 lane G)
+    ///
+    /// Only the active publication of each IOC list is visible (migration
+    /// 182), applied before the collapse. `until_ms` caps `learned_at` from above so the cursor never moves
+    /// past a timestamp whose rows may still be committing: a publication
+    /// stamps new indicators with its start time and commits a few seconds
+    /// later, and a cursor that had already advanced past that stamp would
+    /// skip them forever. Not applied as a row prefilter: dropping a key's
+    /// newest row would let an older version win the collapse.
+    pub fn retro_hunt_candidates_sql(
         table: &str,
         feeds: &[String],
         artifact_types: &[String],
         cursor: Option<(i64, &str)>,
+        until_ms: Option<i64>,
         limit: usize,
     ) -> String {
-        let mut filters = String::from("is_ioc = 1 AND expires_at > now()");
-        if let Some((ms, value)) = cursor {
-            // fromUnixTimestamp64Milli reconstructs the DateTime64(3) bound so the
-            // comparison stays in the column's own type (no coercion surprises).
-            let v = escape_sql_string(&value.to_lowercase());
-            filters.push_str(&format!(
-                " AND (fetched_at > fromUnixTimestamp64Milli({ms}) \
-                 OR (fetched_at = fromUnixTimestamp64Milli({ms}) AND lower(key_value) > '{v}'))"
-            ));
-        }
+        // Row-level pre-filters (cheap, push into the scan): committed IOC rows
+        // of the selected feeds / types. Liveness is decided on the collapsed
+        // row; feed name and type are part of the storage key, so filtering on
+        // them never drops a key's newest row while keeping an older one.
+        let mut inner = format!(
+            "is_ioc = 1 AND {}",
+            crate::enrichment::ioc::committed_rows_predicate(
+                &crate::enrichment::ioc::commits_table_for(table)
+            )
+        );
         if !feeds.is_empty() {
             let list = feeds
                 .iter()
                 .map(|f| format!("'{}'", escape_sql_string(&f.to_lowercase())))
                 .collect::<Vec<_>>()
                 .join(", ");
-            filters.push_str(&format!(" AND lower(enrichment_name) IN ({list})"));
+            inner.push_str(&format!(" AND lower(enrichment_name) IN ({list})"));
         }
         if !artifact_types.is_empty() {
             let list = artifact_types
@@ -2322,16 +1012,47 @@ impl SearchService {
                 .map(|t| format!("'{}'", escape_sql_string(&t.to_lowercase())))
                 .collect::<Vec<_>>()
                 .join(", ");
-            filters.push_str(&format!(" AND key_type IN ({list})"));
+            inner.push_str(&format!(" AND key_type IN ({list})"));
+        }
+        // Distinct aliases (`learned_at`, `live_*`): an alias equal to the
+        // column it aggregates is the CH alias-shadowing trap.
+        let mut outer = String::from("live_expires_at > now()");
+        if let Some((ms, _)) = cursor {
+            // Row-level prefilter that keeps partition pruning (PARTITION BY
+            // toYYYYMM(fetched_at)). Sound because no writer gives a key's later
+            // version an EARLIER fetched_at: IOC lists reuse the key's learned-at
+            // (tombstones included), marketplace feeds restamp forward. So every
+            // row that can decide a key above the cursor survives this filter.
+            inner.push_str(&format!(" AND fetched_at >= fromUnixTimestamp64Milli({ms})"));
+        }
+        if let Some((ms, value)) = cursor {
+            // fromUnixTimestamp64Milli reconstructs the DateTime64(3) bound so the
+            // comparison stays in the column's own type (no coercion surprises).
+            let v = escape_sql_string(&value.to_lowercase());
+            outer.push_str(&format!(
+                " AND (learned_at > fromUnixTimestamp64Milli({ms}) \
+                 OR (learned_at = fromUnixTimestamp64Milli({ms}) AND lower(key_value) > '{v}'))"
+            ));
+        }
+        if let Some(until) = until_ms {
+            outer.push_str(&format!(" AND learned_at <= fromUnixTimestamp64Milli({until})"));
         }
         format!(
             "SELECT lower(key_value) AS value, \
              any(key_type) AS key_type, \
              any(enrichment_name) AS enrichment_name, \
-             toUInt32(max(confidence)) AS confidence, \
-             toInt64(toUnixTimestamp64Milli(max(fetched_at))) AS fetched_at_ms \
-             FROM {table} \
-             WHERE {filters} \
+             toUInt32(max(live_confidence)) AS confidence, \
+             toInt64(toUnixTimestamp64Milli(max(learned_at))) AS fetched_at_ms \
+             FROM ( \
+                 SELECT key_type, key_value, enrichment_name, \
+                        argMax(confidence, (version, fetched_at)) AS live_confidence, \
+                        argMax(expires_at, (version, fetched_at)) AS live_expires_at, \
+                        argMax(fetched_at, (version, fetched_at)) AS learned_at \
+                 FROM {table} \
+                 WHERE {inner} \
+                 GROUP BY namespace, enrichment_name, key_type, key_value \
+             ) \
+             WHERE {outer} \
              GROUP BY value \
              HAVING value != '' \
              ORDER BY fetched_at_ms ASC, value ASC \
@@ -2349,45 +1070,9 @@ impl SearchService {
         feeds: &[String],
         artifact_types: &[String],
         cursor: Option<(i64, &str)>,
+        until_ms: Option<i64>,
         limit: usize,
     ) -> Result<Vec<RetroFeedCandidate>, SearchError> {
-        let shared = self.shared_retro_feed_client("retro feed candidate enumeration")?;
-        if shared.is_none() {
-            self.require_dedicated_retention_surface("retro feed candidate enumeration")?;
-        }
-        if shared.is_some() || self.backend() == crate::search::config::SearchBackend::Lake {
-            let process_client;
-            let client = match shared {
-                Some(client) => client,
-                None => {
-                    process_client = required_lake_ioc_client()?;
-                    &process_client
-                }
-            };
-            let (records, _) = client
-                .source_records(
-                    feeds,
-                    &[],
-                    &[],
-                    artifact_types,
-                    cursor,
-                    limit.clamp(1, 100_000),
-                    false,
-                )
-                .await
-                .map_err(|error| SearchError::ServiceUnavailable(error.to_string()))?;
-            return Ok(records
-                .into_iter()
-                .map(|record| RetroFeedCandidate {
-                    value: record.value,
-                    key_type: record.key_type,
-                    enrichment_name: record.enrichment_name,
-                    confidence: record.confidence.max(0) as u32,
-                    fetched_at_ms: record.published_at_ms,
-                    feed_revision: None,
-                })
-                .collect());
-        }
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return Ok(Vec::new()),
@@ -2395,7 +1080,8 @@ impl SearchService {
         // Reads via the `_distributed` wrapper on clusters (completeness across
         // shards); single-node emits the local name unchanged.
         let table = self.table_names.read("custom_enrichment_results");
-        let sql = Self::retro_hunt_candidates_sql(&table, feeds, artifact_types, cursor, limit);
+        let sql =
+            Self::retro_hunt_candidates_sql(&table, feeds, artifact_types, cursor, until_ms, limit);
         let rows = clickhouse
             .query(&sql)
             .fetch_all::<RetroFeedCandidateRow>()
@@ -2409,45 +1095,8 @@ impl SearchService {
                 enrichment_name: r.enrichment_name,
                 confidence: r.confidence,
                 fetched_at_ms: r.fetched_at_ms,
-                feed_revision: None,
             })
             .collect())
-    }
-
-    /// NAN-4169: the tenant's granted platform IOC feeds (ThreatFox, Tor exit
-    /// nodes...) whose revision moved past `known`, with the rows of each
-    /// changed feed — the platform half of a retro-hunt delta. Lake only: the
-    /// legacy ClickHouse backend has no platform bundle (its feeds land in
-    /// `custom_enrichment_results`, which the keyset candidates already read),
-    /// and a worker without platform mounts (open core) returns no feeds.
-    pub async fn retro_hunt_platform_delta(
-        &self,
-        known: &std::collections::BTreeMap<String, i64>,
-        artifact_types: &[String],
-    ) -> Result<Vec<crate::enrichment::ioc::LakePlatformFeedDelta>, SearchError> {
-        let shared = self.shared_retro_feed_client("retro platform feed delta")?;
-        if shared.is_none() {
-            self.require_dedicated_retention_surface("retro platform feed delta")?;
-        }
-        if shared.is_none() && self.backend() != crate::search::config::SearchBackend::Lake {
-            return Ok(Vec::new());
-        }
-        let process_client;
-        let client = match shared {
-            Some(client) => client,
-            None => {
-                process_client = required_lake_ioc_client()?;
-                &process_client
-            }
-        };
-        client
-            .platform_records(
-                known,
-                artifact_types,
-                crate::enrichment::ioc::MAX_PLATFORM_DELTA_RECORDS,
-            )
-            .await
-            .map_err(|error| SearchError::ServiceUnavailable(error.to_string()))
     }
 
     /// Count distinct candidate indicators still remaining after `cursor` — the
@@ -2459,26 +1108,8 @@ impl SearchService {
         feeds: &[String],
         artifact_types: &[String],
         cursor: Option<(i64, &str)>,
+        until_ms: Option<i64>,
     ) -> Result<u64, SearchError> {
-        let shared = self.shared_retro_feed_client("retro feed candidate counts")?;
-        if shared.is_none() {
-            self.require_dedicated_retention_surface("retro feed candidate counts")?;
-        }
-        if shared.is_some() || self.backend() == crate::search::config::SearchBackend::Lake {
-            let process_client;
-            let client = match shared {
-                Some(client) => client,
-                None => {
-                    process_client = required_lake_ioc_client()?;
-                    &process_client
-                }
-            };
-            let (_, count) = client
-                .source_records(feeds, &[], &[], artifact_types, cursor, 1, true)
-                .await
-                .map_err(|error| SearchError::ServiceUnavailable(error.to_string()))?;
-            return Ok(count as u64);
-        }
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return Ok(0),
@@ -2487,7 +1118,7 @@ impl SearchService {
         // Reuse the candidate SQL as a subquery and count its rows (an unbounded
         // LIMIT via a large ceiling; the feed table is small).
         let inner =
-            Self::retro_hunt_candidates_sql(&table, feeds, artifact_types, cursor, 1_000_000);
+            Self::retro_hunt_candidates_sql(&table, feeds, artifact_types, cursor, until_ms, 1_000_000);
         let sql = format!("SELECT toUInt64(count()) FROM ({inner})");
         clickhouse
             .query(&sql)
@@ -2513,42 +1144,7 @@ impl SearchService {
         }
         let end = chrono::Utc::now();
         let start = end - chrono::Duration::days(lookback_days.clamp(1, RETRO_RETENTION_DAYS));
-        let requested_range = Self::retro_time_range(&TimeRange::new(start, end));
-        let range = self.retention_require_query_range(&requested_range, end)?;
-
-        if self.backend() == crate::search::config::SearchBackend::Lake {
-            let mut hits = Vec::new();
-            for chunk in indicators.chunks(500) {
-                let plan = RetroPlan {
-                    values: chunk.to_vec(),
-                    feed: None,
-                    lookup: None,
-                    axis: RetroAxis::Indicator,
-                    submode: RetroSubmode::List,
-                };
-                let request = RetroRequest {
-                    query: String::new(),
-                    time_range: TimeRangeInput::new(range.start, range.end),
-                    axis: "indicator".to_string(),
-                    offset: Some(0),
-                    limit: Some(500),
-                    sort: None,
-                };
-                let hunt = LakeRetroHuntOptions::for_indicators(chunk);
-                let response = self
-                    .build_lake_retro_view(
-                        &plan,
-                        chunk,
-                        &range,
-                        &ScopeSet::unrestricted(),
-                        &request,
-                        Some(&hunt),
-                    )
-                    .await?;
-                hits.extend(response.rows.unwrap_or_default().into_iter().map(RetroHuntHit::from));
-            }
-            return Ok(hits);
-        }
+        let range = Self::retro_time_range(&TimeRange::new(start, end));
 
         let observables = scope_observables(&self.retro_observables(), indicators);
         let predicate = Self::retro_match_predicate(&observables, indicators);
@@ -2610,53 +1206,57 @@ impl SearchService {
             .collect())
     }
 
+    /// SQL for the retro-hunt feed picker (split out so the real-ClickHouse
+    /// suite can EXPLAIN its partition pruning). `table` is the routed
+    /// `custom_enrichment_results` reference.
+    pub fn ioc_feed_names_sql(table: &str) -> String {
+        let visible = crate::enrichment::ioc::committed_rows_predicate(
+            &crate::enrichment::ioc::commits_table_for(table),
+        );
+        format!(
+            "SELECT name FROM ( \
+                 SELECT arrayJoin(enrichment_names) AS name \
+                 FROM nanosiem.custom_ioc_enrichment_dict_staging \
+                 UNION DISTINCT \
+                 SELECT enrichment_name AS name FROM ( \
+                     SELECT enrichment_name, \
+                            argMax(expires_at, (version, fetched_at)) AS live_expires_at \
+                     FROM {table} \
+                     WHERE is_ioc = 1 AND enrichment_name != '' \
+                       AND {not_list} \
+                       AND fetched_at >= now64(3) - INTERVAL 31 DAY \
+                       AND {visible} \
+                     GROUP BY namespace, enrichment_name, key_type, key_value \
+                 ) \
+                 WHERE live_expires_at > now() \
+             ) \
+             WHERE name != '' \
+             GROUP BY name \
+             ORDER BY name ASC LIMIT 500",
+            not_list = crate::enrichment::ioc::not_ioc_list_row(),
+        )
+    }
+
     /// List the distinct live IOC feed names (`enrichment_name`) available to a
     /// retro-hunt rule's feed picker (NAN-1791). Best-effort: an empty list on
     /// error or no ClickHouse.
     pub async fn list_ioc_feed_names(&self) -> Result<Vec<String>, SearchError> {
-        self.require_dedicated_retention_surface("IOC feed-name enumeration")?;
-        if self.backend() == crate::search::SearchBackend::Lake {
-            let Some(pool) = &self.metadata_pool else {
-                return Ok(Vec::new());
-            };
-            // `custom_enrichments` exists only under the enterprise overlay
-            // (custom enrichment is an enterprise capability). The open
-            // edition lists installed marketplace IOC feeds only (NAN-3463).
-            #[cfg(feature = "enterprise")]
-            const FEED_NAMES_SQL: &str = "SELECT name FROM custom_enrichments \
-                 WHERE enabled = true AND status = 'active' \
-                   AND enrichment_type = 'data' AND config->>'is_ioc' = 'true' \
-                 UNION \
-                 SELECT name FROM marketplace_catalog \
-                 WHERE installed = true AND enabled = true \
-                   AND config->>'is_ioc' = 'true' \
-                 ORDER BY name ASC LIMIT 500";
-            #[cfg(not(feature = "enterprise"))]
-            const FEED_NAMES_SQL: &str = "SELECT name FROM marketplace_catalog \
-                 WHERE installed = true AND enabled = true \
-                   AND config->>'is_ioc' = 'true' \
-                 ORDER BY name ASC LIMIT 500";
-            let rows = sqlx::query_scalar::<_, String>(FEED_NAMES_SQL)
-            .fetch_all(pool)
-            .await
-            .map_err(|error| {
-                SearchError::SqlValidationError(format!(
-                    "retro-hunt feed metadata query failed: {error}"
-                ))
-            })?;
-            return Ok(rows);
-        }
-
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return Ok(Vec::new()),
         };
         let table = self.table_names.read("custom_enrichment_results");
-        let sql = format!(
-            "SELECT DISTINCT enrichment_name FROM {table} \
-             WHERE is_ioc = 1 AND expires_at > now() AND enrichment_name != '' \
-             ORDER BY enrichment_name ASC LIMIT 500"
-        );
+        // Bounded current-state sources only (NAN-4902 lane G) — never a
+        // full-history GROUP BY:
+        // 1. custom_ioc_enrichment_dict_staging: the current user IOC set
+        //    (custom enrichments + committed IOC lists), already collapsed and
+        //    refreshed on every IOC list publish/delete.
+        // 2. Writer-expiring feeds (marketplace + custom enrichments, written by
+        //    store_enrichment_records with a 30-day expiry): a row older than 31
+        //    days cannot be live, so the scan is partition-pruned. The bound is
+        //    safe for the per-key collapse because a writer never gives a later
+        //    version an earlier fetched_at.
+        let sql = Self::ioc_feed_names_sql(&table);
         match clickhouse.query(&sql).fetch_all::<String>().await {
             Ok(rows) => Ok(rows),
             Err(e) => {
@@ -2664,104 +1264,6 @@ impl SearchService {
                 Ok(Vec::new())
             }
         }
-    }
-}
-
-fn lake_retro_values(row: &serde_json::Value, path: &str) -> Vec<String> {
-    fn append(value: &serde_json::Value, output: &mut Vec<String>) {
-        match value {
-            serde_json::Value::String(value) if !value.trim().is_empty() => {
-                output.push(value.clone())
-            }
-            serde_json::Value::Number(value) => output.push(value.to_string()),
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    append(value, output);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut output = Vec::new();
-    if let Some(value) = row.get(path) {
-        append(value, &mut output);
-        return output;
-    }
-    let mut current = row;
-    for segment in path.split('.') {
-        let Some(next) = current.get(segment) else {
-            return output;
-        };
-        current = next;
-    }
-    append(current, &mut output);
-    output
-}
-
-fn lake_retro_first_value(row: &serde_json::Value, path: &str) -> Option<String> {
-    lake_retro_values(row, path).into_iter().next()
-}
-
-fn lake_retro_u64(row: &serde_json::Value, path: &str) -> u64 {
-    row.get(path)
-        .and_then(|value| {
-            value
-                .as_u64()
-                .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
-                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
-        })
-        .unwrap_or_default()
-}
-
-fn lake_retro_update_bounds(
-    first_seen: &mut Option<String>,
-    last_seen: &mut Option<String>,
-    timestamp: Option<&str>,
-) {
-    let Some(timestamp) = timestamp.filter(|value| !value.is_empty()) else {
-        return;
-    };
-    if first_seen
-        .as_deref()
-        .is_none_or(|current| timestamp < current)
-    {
-        *first_seen = Some(timestamp.to_string());
-    }
-    if last_seen
-        .as_deref()
-        .is_none_or(|current| timestamp > current)
-    {
-        *last_seen = Some(timestamp.to_string());
-    }
-}
-
-/// Band an indicator by how much of the fleet it touched.
-///
-/// NAN-2361: the two inputs deliberately measure DIFFERENT spans, and the ratio
-/// is clamped because of it. `hosts` accumulates over the full retention window
-/// (an indicator's whole history is the point of a retro hunt), while
-/// `total_hosts` is the CURRENT fleet size — `dc()` over the recent denominator
-/// window, because counting every host that ever appeared in a year would
-/// include long-decommissioned ones and quietly shrink every indicator toward
-/// `rare`.
-///
-/// The consequence is that a host present in the numerator can be absent from
-/// the denominator (decommissioned, or IP-identified in the numerator and
-/// name-identified in the denominator), so the raw quotient can exceed 1. Left
-/// unclamped it feeds `from_ratio` a value no band was designed for. Clamping
-/// to 1.0 keeps the top band meaning "essentially fleet-wide", which is the
-/// correct reading of "seen on more hosts than are currently active".
-fn lake_retro_verdict(hosts: u64, total_hosts: u64) -> &'static str {
-    if total_hosts == 0 {
-        // Denominator unavailable or genuinely empty (a quiet tenant, or an
-        // `end` whose preceding window holds no events). `rare` is the
-        // fail-safe direction for triage — it surfaces the indicator rather
-        // than burying it — but it is a fallback, not a measurement.
-        RetroVerdict::Rare.as_str()
-    } else {
-        let ratio = (hosts as f64 / total_hosts as f64).min(1.0);
-        RetroVerdict::from_ratio(ratio).as_str()
     }
 }
 
@@ -3082,44 +1584,35 @@ mod tests {
         UdmProfile::new()
     }
 
-    /// NAN-2361: the INTERACTIVE hunt is always retention-wide; the SCHEDULED
-    /// hunt keeps the lookback it asked for. Collapsing these made every daily
-    /// sweep rescan a year and re-emit months-old matches as newly found.
+    /// P2-e: a request older than retention is clamped UP to the retention floor
+    /// (never widened past what ClickHouse retains); end is untouched.
     #[test]
-    fn retro_ranges_separate_interactive_from_scheduled() {
+    fn retro_time_range_clamps_start_to_retention_floor() {
         let now = chrono::Utc::now();
         let floor = now - chrono::Duration::days(RETRO_RETENTION_DAYS);
-        let narrow_start = now - chrono::Duration::hours(1);
 
-        // INTERACTIVE: a 1h picker still hunts full retention, so a short window
-        // cannot make a long-established indicator look newly seen.
-        let widened = SearchService::retro_interactive_range(&TimeRange::new(narrow_start, now));
+        // Request reaching back 2 years — older than the 365-day retention floor.
+        let requested = TimeRange::new(now - chrono::Duration::days(730), now);
+        let clamped = SearchService::retro_time_range(&requested);
+        // Start is pulled UP to ~floor (within a second of the recomputed floor).
         assert!(
-            (widened.start - floor).num_seconds().abs() < 2,
-            "interactive hunt must start at the retention floor, got {}",
-            widened.start
+            (clamped.start - floor).num_seconds().abs() < 2,
+            "start must clamp to the retention floor, got {} vs floor {}",
+            clamped.start,
+            floor
         );
-        assert_eq!(widened.end, now, "end is the caller's");
-
-        // SCHEDULED: an explicit lookback is HONOURED, not widened.
-        let scheduled = SearchService::retro_time_range(&TimeRange::new(narrow_start, now));
-        assert_eq!(
-            scheduled.start, narrow_start,
-            "a scheduled hunt's lookback must survive"
+        assert!(
+            clamped.start > requested.start,
+            "over-retention request must be capped, not widened"
         );
+        // End is preserved.
+        assert_eq!(clamped.end, requested.end);
 
-        // BOTH cap at retention — neither may scan beyond what storage keeps.
-        let over = TimeRange::new(now - chrono::Duration::days(730), now);
-        for capped in [
-            SearchService::retro_time_range(&over),
-            SearchService::retro_interactive_range(&over),
-        ] {
-            assert!(
-                (capped.start - floor).num_seconds().abs() < 2,
-                "over-retention request must clamp to the floor, got {}",
-                capped.start
-            );
-        }
+        // A request already inside retention keeps its (later) start unchanged.
+        let recent_start = now - chrono::Duration::days(10);
+        let recent = TimeRange::new(recent_start, now);
+        let kept = SearchService::retro_time_range(&recent);
+        assert_eq!(kept.start, recent_start);
     }
 
     fn ocsf() -> OcsfProfile {
@@ -3142,48 +1635,6 @@ mod tests {
         assert_eq!(plan.axis, RetroAxis::Indicator);
         assert_eq!(plan.values, vec!["1.2.3.4".to_string()]);
         assert!(plan.feed.is_none());
-    }
-
-    #[test]
-    fn lake_retro_reads_flat_table_columns_and_nested_arrays() {
-        let row = serde_json::json!({
-            "src_endpoint.ip": "198.51.100.25",
-            "file.hashes.value": ["ABCDEF", "123456"],
-            "actor": {"user": {"name": "alice"}}
-        });
-        assert_eq!(
-            lake_retro_values(&row, "src_endpoint.ip"),
-            vec!["198.51.100.25"]
-        );
-        assert_eq!(
-            lake_retro_values(&row, "file.hashes.value"),
-            vec!["ABCDEF", "123456"]
-        );
-        assert_eq!(lake_retro_values(&row, "actor.user.name"), vec!["alice"]);
-    }
-
-    #[test]
-    fn lake_retro_timestamp_bounds_are_stable() {
-        let mut first = None;
-        let mut last = None;
-        lake_retro_update_bounds(&mut first, &mut last, Some("2026-08-10 10:00:00.000000"));
-        lake_retro_update_bounds(&mut first, &mut last, Some("2026-08-10 09:00:00.000000"));
-        lake_retro_update_bounds(&mut first, &mut last, Some("2026-08-10 11:00:00.000000"));
-        assert_eq!(first.as_deref(), Some("2026-08-10 09:00:00.000000"));
-        assert_eq!(last.as_deref(), Some("2026-08-10 11:00:00.000000"));
-    }
-
-    #[test]
-    fn lake_retro_unsigned_count_accepts_numeric_and_wire_string_values() {
-        assert_eq!(
-            lake_retro_u64(&serde_json::json!({"hits": 51_619}), "hits"),
-            51_619
-        );
-        assert_eq!(
-            lake_retro_u64(&serde_json::json!({"hits": "51619"}), "hits"),
-            51_619
-        );
-        assert_eq!(lake_retro_u64(&serde_json::json!({"hits": -1}), "hits"), 0);
     }
 
     #[test]
@@ -3255,15 +1706,9 @@ mod tests {
         // OCSF columns (dotted → backtick-quoted), never the raw UDM names.
         let pred = SearchService::retro_match_predicate(&ocsf_obs(), &["1.2.3.4".to_string()]);
         // src_ip → \"src_endpoint.ip\" (RAW, ingest-lowercased).
-        assert!(
-            pred.contains("\"src_endpoint.ip\" = '1.2.3.4'"),
-            "got: {pred}"
-        );
+        assert!(pred.contains("\"src_endpoint.ip\" = '1.2.3.4'"), "got: {pred}");
         // dest_ip → \"dst_endpoint.ip\".
-        assert!(
-            pred.contains("\"dst_endpoint.ip\" = '1.2.3.4'"),
-            "got: {pred}"
-        );
+        assert!(pred.contains("\"dst_endpoint.ip\" = '1.2.3.4'"), "got: {pred}");
         // file_hash → \"file.hashes.sha256\" (lower()).
         assert!(
             pred.contains("lower(\"file.hashes.sha256\") = '1.2.3.4'"),
@@ -3282,10 +1727,7 @@ mod tests {
         // not a single OR (which can't combine skip indexes across columns).
         let obs = udm_obs();
         let sql = build_summary_sql(&udm(), &obs, "logs", "1.2.3.4", &range(), None);
-        assert!(
-            sql.contains("UNION ALL"),
-            "must be a per-column union: {sql}"
-        );
+        assert!(sql.contains("UNION ALL"), "must be a per-column union: {sql}");
         assert!(sql.contains("WHERE timestamp BETWEEN"));
         assert!(!sql.contains("PREWHERE"));
         // exact hits via row-id dedup (parity with the old count() over the OR).
@@ -3295,15 +1737,9 @@ mod tests {
         assert!(sql.contains("AS field_counts"));
         // one single-column equality leg per observable...
         assert!(sql.contains("AND src_ip = '1.2.3.4'"), "got: {sql}");
-        assert!(
-            sql.contains("AND lower(file_hash) = '1.2.3.4'"),
-            "got: {sql}"
-        );
+        assert!(sql.contains("AND lower(file_hash) = '1.2.3.4'"), "got: {sql}");
         // ...NOT a single OR-ed predicate.
-        assert!(
-            !sql.contains(" OR "),
-            "summary must not OR the columns: {sql}"
-        );
+        assert!(!sql.contains(" OR "), "summary must not OR the columns: {sql}");
         // field counts attributed by the LOGICAL observable name via _mf.
         assert!(sql.contains("countIf(_mf = 'src_ip')"), "got: {sql}");
         assert!(sql.contains("countIf(_mf = 'file_hash')"), "got: {sql}");
@@ -3345,10 +1781,7 @@ mod tests {
         assert!(sql.contains("ARRAY JOIN"));
         assert!(sql.contains("LIMIT 51 OFFSET 0"));
         // UDM attribution tuple keys ARE the column names (identity resolution).
-        assert!(
-            sql.contains("('file_hash', lower(file_hash))"),
-            "got: {sql}"
-        );
+        assert!(sql.contains("('file_hash', lower(file_hash))"), "got: {sql}");
     }
 
     #[test]
@@ -3357,27 +1790,14 @@ mod tests {
         let inds = vec!["a.com".to_string()];
         let obs = ocsf_obs();
         let pred = SearchService::retro_match_predicate(&obs, &inds);
-        let sql = build_list_sql(
-            &ocsf(),
-            &obs,
-            "ocsf_logs",
-            &pred,
-            &inds,
-            &range(),
-            0,
-            51,
-            None,
-        );
+        let sql = build_list_sql(&ocsf(), &obs, "ocsf_logs", &pred, &inds, &range(), 0, 51, None);
         assert!(sql.contains("ARRAY JOIN"));
         // logical label, OCSF physical value expr.
         assert!(
             sql.contains("('file_hash', lower(\"file.hashes.sha256\"))"),
             "got: {sql}"
         );
-        assert!(
-            sql.contains("('src_ip', \"src_endpoint.ip\")"),
-            "got: {sql}"
-        );
+        assert!(sql.contains("('src_ip', \"src_endpoint.ip\")"), "got: {sql}");
         assert!(!sql.contains("lower(file_hash)"), "got: {sql}");
     }
 
@@ -3388,16 +1808,7 @@ mod tests {
         let pred = SearchService::retro_match_predicate(&obs, &inds);
 
         let asset_sql = build_pivot_sql(
-            &udm(),
-            &obs,
-            "logs",
-            RetroAxis::Asset,
-            &pred,
-            &inds,
-            &range(),
-            0,
-            51,
-            None,
+            &udm(), &obs, "logs", RetroAxis::Asset, &pred, &inds, &range(), 0, 51, None,
         );
         assert!(asset_sql.contains("WHERE timestamp BETWEEN") && !asset_sql.contains("PREWHERE"));
         assert!(asset_sql.contains("GROUP BY id"));
@@ -3410,16 +1821,7 @@ mod tests {
         assert!(asset_sql.contains("any('') AS ident_dept"));
 
         let user_sql = build_pivot_sql(
-            &udm(),
-            &obs,
-            "logs",
-            RetroAxis::User,
-            &pred,
-            &inds,
-            &range(),
-            0,
-            51,
-            None,
+            &udm(), &obs, "logs", RetroAxis::User, &pred, &inds, &range(), 0, 51, None,
         );
         // User pivot keys on the user expression.
         assert!(user_sql.contains("lower(\"user\")"));
@@ -3451,35 +1853,14 @@ mod tests {
         let pred = SearchService::retro_match_predicate(&obs, &inds);
 
         let asset_sql = build_pivot_sql(
-            &ocsf(),
-            &obs,
-            "ocsf_logs",
-            RetroAxis::Asset,
-            &pred,
-            &inds,
-            &range(),
-            0,
-            51,
-            None,
+            &ocsf(), &obs, "ocsf_logs", RetroAxis::Asset, &pred, &inds, &range(), 0, 51, None,
         );
         // src_ip identity leg → OCSF column; no bare UDM `nullIf(src_ip`.
-        assert!(
-            asset_sql.contains("\"src_endpoint.ip\""),
-            "got: {asset_sql}"
-        );
+        assert!(asset_sql.contains("\"src_endpoint.ip\""), "got: {asset_sql}");
         assert!(!asset_sql.contains("nullIf(src_ip"), "got: {asset_sql}");
 
         let user_sql = build_pivot_sql(
-            &ocsf(),
-            &obs,
-            "ocsf_logs",
-            RetroAxis::User,
-            &pred,
-            &inds,
-            &range(),
-            0,
-            51,
-            None,
+            &ocsf(), &obs, "ocsf_logs", RetroAxis::User, &pred, &inds, &range(), 0, 51, None,
         );
         // user → user_unified (OCSF class-split column), not bare `user`.
         assert!(user_sql.contains("user_unified"), "got: {user_sql}");
@@ -3498,62 +1879,17 @@ mod tests {
         assert_eq!(classify_indicator("evil.test"), "domain");
     }
 
-    /// NAN-2361: the denominator and the sighting identity answer different
-    /// questions and MUST NOT be unified back into one list.
-    ///
-    /// `dst_endpoint.hostname` in the sighting identity is the bug that made
-    /// every domain hunt report a single asset named after the indicator
-    /// itself: on a row matched by `ioc="stackoverflow.com"` the destination
-    /// hostname IS "stackoverflow.com", so the coalesce resolved to it on every
-    /// row. Live: 70,924 hits -> 1 "asset"; source-side identity -> 2,000 real
-    /// clients. And 1-of-2309 bands `rare`, so a fleet-wide domain read as a
-    /// rare indicator worth chasing.
-    ///
-    /// `src_endpoint.ip` in the denominator is the inverse bug (NAN-1592):
-    /// every external server counted as an asset, inflating the population
-    /// ~414x (956,024 vs 2,309) and making everything read artificially rare.
-    #[test]
-    fn denominator_and_sighting_identity_stay_distinct() {
-        assert!(
-            LAKE_RETRO_HOST_FIELDS.contains(&"dst_endpoint.hostname"),
-            "denominator counts named hosts wherever they appear"
-        );
-        assert!(
-            !LAKE_RETRO_HOST_FIELDS.contains(&"src_endpoint.ip"),
-            "denominator must not admit IP legs (NAN-1592 ~414x inflation)"
-        );
-
-        assert!(
-            !LAKE_RETRO_ASSET_FIELDS.contains(&"dst_endpoint.hostname"),
-            "sighting identity must not resolve to the indicator being hunted"
-        );
-        assert!(
-            LAKE_RETRO_ASSET_FIELDS.contains(&"src_endpoint.ip"),
-            "proxy/HTTP sightings carry no hostname; without the source IP they vanish"
-        );
-        assert!(
-            LAKE_RETRO_ASSET_FIELDS
-                .iter()
-                .all(|field| !field.starts_with("dst_endpoint.")),
-            "sighting identity is source-side only"
-        );
-        assert_ne!(
-            LAKE_RETRO_HOST_FIELDS, LAKE_RETRO_ASSET_FIELDS,
-            "one list cannot be correct for both roles"
-        );
-    }
-
     #[test]
     fn scope_observables_narrows_to_indicator_type() {
         let all = udm_obs();
         // An IP collapses to exactly the 3 raw IP columns — no lower(text) legs.
         let ip = scope_observables(&all, &["37.27.197.191".to_string()]);
         let cols: std::collections::HashSet<&str> = ip.iter().map(|o| o.logical).collect();
-        assert_eq!(cols, ["src_ip", "dest_ip", "dvc_ip"].into_iter().collect());
-        assert!(
-            ip.len() < all.len(),
-            "IP scope must drop the irrelevant legs"
+        assert_eq!(
+            cols,
+            ["src_ip", "dest_ip", "dvc_ip"].into_iter().collect()
         );
+        assert!(ip.len() < all.len(), "IP scope must drop the irrelevant legs");
 
         // A hash collapses to the hash columns.
         let hash = scope_observables(&all, &["44d88612fea8a8f36de82e1278abb02f".to_string()]);
@@ -3564,10 +1900,7 @@ mod tests {
         let pred = SearchService::retro_match_predicate(&ip, &["37.27.197.191".to_string()]);
         assert!(pred.contains("src_ip = '37.27.197.191'"));
         assert!(!pred.contains("file_hash"), "got: {pred}");
-        assert!(
-            !pred.contains("lower("),
-            "IP scope must emit no lower() legs: {pred}"
-        );
+        assert!(!pred.contains("lower("), "IP scope must emit no lower() legs: {pred}");
     }
 
     #[test]
@@ -3629,16 +1962,7 @@ mod tests {
         // Pivot rollup (both axes): single scan, gated once.
         for axis in [RetroAxis::Asset, RetroAxis::User] {
             let pivot = build_pivot_sql(
-                &udm(),
-                &obs,
-                "logs",
-                axis,
-                &pred,
-                &inds,
-                &range(),
-                0,
-                51,
-                scope,
+                &udm(), &obs, "logs", axis, &pred, &inds, &range(), 0, 51, scope,
             );
             assert_eq!(pivot.matches(gate).count(), 1, "axis {axis:?}: {pivot}");
         }
@@ -3646,15 +1970,7 @@ mod tests {
         // Multi-source deny renders the NOT IN form (lexicographic order).
         let multi = source_scope_sql_predicate("source_type", &deny(&["otel", "audit"]));
         let list_multi = build_list_sql(
-            &udm(),
-            &obs,
-            "logs",
-            &pred,
-            &inds,
-            &range(),
-            0,
-            51,
-            multi.as_deref(),
+            &udm(), &obs, "logs", &pred, &inds, &range(), 0, 51, multi.as_deref(),
         );
         assert!(
             list_multi.contains("lower(source_type) NOT IN ('audit', 'otel')"),
@@ -3676,22 +1992,10 @@ mod tests {
         let summary = build_summary_sql(&udm(), &obs, "logs", "1.2.3.4", &range(), None);
         let list = build_list_sql(&udm(), &obs, "logs", &pred, &inds, &range(), 0, 51, None);
         let pivot = build_pivot_sql(
-            &udm(),
-            &obs,
-            "logs",
-            RetroAxis::Asset,
-            &pred,
-            &inds,
-            &range(),
-            0,
-            51,
-            None,
+            &udm(), &obs, "logs", RetroAxis::Asset, &pred, &inds, &range(), 0, 51, None,
         );
         for sql in [&summary, &list, &pivot] {
-            assert!(
-                !sql.contains("source_type"),
-                "unscoped SQL must not gate: {sql}"
-            );
+            assert!(!sql.contains("source_type"), "unscoped SQL must not gate: {sql}");
         }
     }
 
@@ -3706,24 +2010,22 @@ mod tests {
             &[],
             &[],
             None,
+            None,
             501,
         );
-        // Live IOC rows only.
-        assert!(
-            sql.contains("is_ioc = 1 AND expires_at > now()"),
-            "got: {sql}"
-        );
+        // IOC rows, liveness decided on the latest version per key.
+        assert!(sql.contains("WHERE is_ioc = 1 "), "got: {sql}");
+        assert!(sql.contains("argMax(expires_at, (version, fetched_at)) AS live_expires_at"), "got: {sql}");
+        assert!(sql.contains("GROUP BY namespace, enrichment_name, key_type, key_value"), "got: {sql}");
+        assert!(sql.contains("WHERE live_expires_at > now()"), "got: {sql}");
         // Grouped by lowercased value so ReplacingMergeTree dupes collapse.
         assert!(sql.contains("GROUP BY value"), "got: {sql}");
         assert!(sql.contains("lower(key_value) AS value"), "got: {sql}");
         // Oldest-first + value tiebreak = deterministic draining.
-        assert!(
-            sql.contains("ORDER BY fetched_at_ms ASC, value ASC"),
-            "got: {sql}"
-        );
+        assert!(sql.contains("ORDER BY fetched_at_ms ASC, value ASC"), "got: {sql}");
         assert!(sql.contains("LIMIT 501"), "got: {sql}");
         // No cursor / feed / type filters when unset.
-        assert!(!sql.contains("fetched_at >"), "got: {sql}");
+        assert!(!sql.contains("learned_at >"), "got: {sql}");
         assert!(!sql.contains("enrichment_name IN"), "got: {sql}");
         assert!(!sql.contains("key_type IN"), "got: {sql}");
     }
@@ -3735,17 +2037,23 @@ mod tests {
             &["ThreatFox".to_string(), "URLhaus".to_string()],
             &["ip".to_string(), "domain".to_string()],
             Some((1_700_000_000_000, "1.2.3.4")),
+            None,
             51,
         );
         // STRICT keyset cursor: later timestamp, OR same timestamp + later value.
         assert!(
-            sql.contains("fetched_at > fromUnixTimestamp64Milli(1700000000000)"),
+            sql.contains("learned_at > fromUnixTimestamp64Milli(1700000000000)"),
             "got: {sql}"
         );
         assert!(
             sql.contains(
-                "fetched_at = fromUnixTimestamp64Milli(1700000000000) AND lower(key_value) > '1.2.3.4'"
+                "learned_at = fromUnixTimestamp64Milli(1700000000000) AND lower(key_value) > '1.2.3.4'"
             ),
+            "got: {sql}"
+        );
+        // Partition-pruning prefilter on the raw rows.
+        assert!(
+            sql.contains("AND fetched_at >= fromUnixTimestamp64Milli(1700000000000)"),
             "got: {sql}"
         );
         // Feed filter lowercased.
@@ -3757,11 +2065,46 @@ mod tests {
         assert!(sql.contains("key_type IN ('ip', 'domain')"), "got: {sql}");
     }
 
+    /// NAN-4902 lane G: committed rows only, and the settle bound caps
+    /// `learned_at` on the collapsed row (never as a row prefilter).
+    #[test]
+    fn retro_hunt_candidates_sql_committed_rows_and_settle_bound() {
+        let sql = SearchService::retro_hunt_candidates_sql(
+            "nanosiem.custom_enrichment_results_distributed",
+            &[],
+            &[],
+            Some((1_000, "a")),
+            Some(9_000),
+            10,
+        );
+        assert!(
+            sql.contains("version GLOBAL IN (SELECT max(version) FROM nanosiem.ioc_list_commits_distributed GROUP BY list_id)"),
+            "got: {sql}"
+        );
+        let (inner, outer) = sql.split_once("GROUP BY namespace").unwrap();
+        assert!(!inner.contains("9000"), "settle bound must not prefilter rows: {sql}");
+        assert!(outer.contains("learned_at <= fromUnixTimestamp64Milli(9000)"), "got: {sql}");
+    }
+
+    #[test]
+    fn ioc_feed_names_sql_reads_only_bounded_sources() {
+        let sql = SearchService::ioc_feed_names_sql("nanosiem.custom_enrichment_results");
+        assert!(sql.contains("FROM nanosiem.custom_ioc_enrichment_dict_staging"), "got: {sql}");
+        assert!(sql.contains("fetched_at >= now64(3) - INTERVAL 31 DAY"), "got: {sql}");
+        assert!(sql.contains("NOT startsWith(namespace, 'ioc_list/')"), "got: {sql}");
+    }
+
     #[test]
     fn retro_hunt_candidates_sql_cursor_value_is_escaped() {
         // A single quote in the cursor value must not break out of the literal.
-        let sql =
-            SearchService::retro_hunt_candidates_sql("t", &[], &[], Some((1000, "o'brien")), 10);
+        let sql = SearchService::retro_hunt_candidates_sql(
+            "t",
+            &[],
+            &[],
+            Some((1000, "o'brien")),
+            None,
+            10,
+        );
         assert!(sql.contains("lower(key_value) > 'o''brien'"), "got: {sql}");
     }
 
@@ -3776,6 +2119,7 @@ mod tests {
             &["drop'|\\table union".to_string()],
             &[],
             None,
+            None,
             10,
         );
         // `drop'|\table union` → lower → escape → 'drop''|\\table union'
@@ -3787,47 +2131,5 @@ mod tests {
         // The literal closes only at the very end — the quote after `drop` is
         // doubled, so no premature `'drop'|` breakout appears.
         assert!(!sql.contains("'drop'|"), "unescaped breakout in: {sql}");
-    }
-
-    /// NAN-4169: a scheduled hunt scans an `ip:port` indicator by its IP and
-    /// matches only the same endpoint's port.
-    #[test]
-    fn hunt_options_scan_ip_port_by_ip_and_match_the_endpoint_port() {
-        let hunt = LakeRetroHuntOptions::for_indicators(&[
-            "198.51.100.9:443".to_string(),
-            "Evil.Example".to_string(),
-            "[2001:db8::1]:8443".to_string(),
-        ]);
-        assert_eq!(hunt.scan_values, ["198.51.100.9", "2001:db8::1", "evil.example"]);
-        let row = serde_json::json!({
-            "dst_endpoint.ip": "198.51.100.9", "dst_endpoint.port": 443,
-            "src_endpoint.ip": "10.0.0.5", "src_endpoint.port": "51515",
-        });
-        assert_eq!(hunt.ip_port_matches(&row, "dst_endpoint.ip", "198.51.100.9"), ["198.51.100.9:443"]);
-        let other_port = serde_json::json!({"dst_endpoint.ip": "198.51.100.9", "dst_endpoint.port": 80});
-        assert!(hunt.ip_port_matches(&other_port, "dst_endpoint.ip", "198.51.100.9").is_empty());
-        // The port must be on the SAME endpoint as the IP.
-        let crossed = serde_json::json!({"src_endpoint.ip": "198.51.100.9", "dst_endpoint.port": 443});
-        assert!(hunt.ip_port_matches(&crossed, "src_endpoint.ip", "198.51.100.9").is_empty());
-        // The lean scan names IP observables by alias (`dest_ip`).
-        assert_eq!(hunt.ip_port_matches(&row, "dest_ip", "198.51.100.9"), ["198.51.100.9:443"]);
-        assert!(hunt.ip_port_matches(&other_port, "dest_ip", "198.51.100.9").is_empty());
-        assert_eq!(split_ip_port("not-an-endpoint"), None);
-    }
-
-    /// NAN-4169: only `threat_intelligence` stamps dedupe a retro hit; the
-    /// ingest prevalence stamp carries the observed artifact as its value.
-    #[test]
-    fn hunt_options_dedupe_only_threat_intel_stamps() {
-        let row = serde_json::json!({
-            "enrichments.type": ["reputation", "threat_intelligence"],
-            "enrichments.value": ["198.51.100.7", "203.0.113.50"],
-        });
-        let stamps = lake_retro_ioc_stamps(&row);
-        assert!(stamps.contains("203.0.113.50"));
-        assert!(!stamps.contains("198.51.100.7"));
-        let unpaired = serde_json::json!({"enrichments.type": ["threat_intelligence"], "enrichments.value": []});
-        assert!(lake_retro_ioc_stamps(&unpaired).is_empty());
-        assert!(lake_retro_ioc_stamps(&serde_json::json!({})).is_empty());
     }
 }

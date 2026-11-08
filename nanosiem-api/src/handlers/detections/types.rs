@@ -19,37 +19,6 @@ pub struct ListDetectionsQuery {
     /// Include archived (deleted) rules. Default false, same as hosted.
     #[serde(default)]
     pub include_archived: bool,
-    /// Case-insensitive "contains" over rule name or id (max 200 characters).
-    pub search: Option<String>,
-    /// Return at most this many rules (1–50). Omit for the full list.
-    pub limit: Option<i64>,
-}
-
-/// Longest accepted `search` term (characters); same as the hosted listing.
-pub const RULE_SEARCH_MAX_CHARS: usize = 200;
-/// Largest `limit` accepted by `GET /api/rules`.
-pub const RULE_LIST_MAX_LIMIT: i64 = 50;
-
-impl ListDetectionsQuery {
-    /// Apply `search` and `limit` to an already-filtered, ordered listing.
-    pub fn search_and_limit(&self, mut rules: Vec<DetectionRule>) -> Result<Vec<DetectionRule>, String> {
-        if let Some(limit) = self.limit {
-            if !(1..=RULE_LIST_MAX_LIMIT).contains(&limit) {
-                return Err(format!("limit must be between 1 and {RULE_LIST_MAX_LIMIT}"));
-            }
-        }
-        if let Some(term) = self.search.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-            if term.chars().count() > RULE_SEARCH_MAX_CHARS {
-                return Err("search is too long".into());
-            }
-            let needle = term.to_lowercase();
-            rules.retain(|r| r.name.to_lowercase().contains(&needle) || r.id.to_string().contains(&needle));
-        }
-        if let Some(limit) = self.limit {
-            rules.truncate(limit as usize);
-        }
-        Ok(rules)
-    }
 }
 
 /// Request for testing a detection rule
@@ -62,7 +31,7 @@ pub struct TestRuleRequest {
     #[serde(default = "default_test_days")]
     pub days: i64,
     /// Explicit `[start, end]` window. Preferred over `days`. Must be at
-    /// most 14 days wide; longer ranges return a 400.
+    /// most 14 days wide; longer ranges return a 400 (NAN-741).
     pub time_range: Option<TimeRangeRequest>,
     /// Cron expression to step at when testing an ad-hoc query (no saved
     /// rule). Ignored by `/api/rules/{id}/test`, which always uses the saved
@@ -75,7 +44,7 @@ pub struct TestRuleRequest {
     #[serde(default)]
     pub lookback_minutes: Option<i64>,
     /// Dataset to test against: "logs" (default), "spans", or "metrics"
-    /// Used by the ad-hoc `/api/rules/test` path so the rule
+    /// (NAN-1561). Used by the ad-hoc `/api/rules/test` path so the rule
     /// editor can preview spans/metrics rules before save. Ignored by
     /// `/api/rules/{id}/test`, which uses the saved rule's dataset.
     #[serde(default)]
@@ -182,17 +151,17 @@ pub struct DetectionMatch {
     /// Number of events that matched
     pub event_count: i32,
     /// The actual events that triggered this detection. Each event also
-    /// carries a canonical envelope injected by the API:
+    /// carries a canonical envelope injected by the API (NAN-830):
     /// `_match_event_time` (RFC 3339 string, optional), `_match_event_label`
     /// (one-line summary, always present), and `_match_kind` (`"raw"`,
     /// `"aggregate"`, or `"sequence"`, always present). UI clients should prefer these
     /// fields over inferring from the user's free-form rule output.
     pub events: Vec<serde_json::Value>,
-    /// Whether the match has been reviewed by an analyst.
+    /// Whether the match has been reviewed by an analyst (NAN-494).
     /// Null on legacy responses; absent in JSON when false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reviewed: Option<bool>,
-    /// When the match was reviewed, if at all.
+    /// When the match was reviewed, if at all (NAN-494).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -228,7 +197,9 @@ pub struct ValidateDetectionRequest {
     /// The rule being edited, when this validates an update. A mapping equal
     /// to the rule's stored one is not re-checked, mirroring the write
     /// trigger's skip for an UPDATE that leaves the mapping unchanged.
-    #[serde(default)]
+    /// Accepts the TypeID (`rule_…`) the API returns, or a raw UUID.
+    #[serde(default, with = "nanosiem_core::typeid::rule::opt")]
+    #[schema(value_type = Option<String>)]
     pub rule_id: Option<uuid::Uuid>,
 }
 
@@ -243,7 +214,7 @@ pub struct ValidateDetectionResponse {
     pub creates_materialized_view: bool,
     /// Human-readable explanation of mode selection
     pub mode_reason: String,
-    /// whether the query *shape* qualifies for real-time
+    /// NAN-1688: whether the query *shape* qualifies for real-time
     /// (materialized-view) mode, independent of the requested mode. Lets the
     /// editor nudge a scheduled rule that could run real-time. Dataset
     /// (logs-only) and risk-entity gating is applied by the UI, which knows the
@@ -253,7 +224,7 @@ pub struct ValidateDetectionResponse {
     /// when eligible, or why the query is ineligible otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub realtime_eligible_reason: Option<String>,
-    /// whether a `| prevalence` FILTER in the query will push into
+    /// NAN-1691: whether a `| prevalence` FILTER in the query will push into
     /// ClickHouse (memory-safe) vs fall back to an in-memory scan that returns
     /// approximate results and wastes memory on the search/jobs pods. `true`
     /// when there is no prevalence filter or it pushes down.

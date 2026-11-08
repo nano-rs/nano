@@ -15,14 +15,15 @@ pub mod service;
 
 pub use error::PlaybookRepositoryError;
 pub use models::{
-    NewPlaybookRepository, PlaybookBundleImportResult, PlaybookImport, PlaybookImportRequest,
-    PlaybookImportResponse, PlaybookImportType, PlaybookRepository, PlaybookSyncResult,
-    PlaybookSyncStatus, RepositoryPlaybook, RepositoryPlaybookFilter, UpdatePlaybookRepository,
-    ApplyPlaybookUpstreamResult, BulkApplyPlaybookUpstreamResult, PlaybookUpstreamUpdate,
-    PlaybookUpstreamUpdatesResponse,
+    NewPlaybookRepository, PlaybookBundleImportResult, PlaybookImport,
+    PlaybookImportRequest, PlaybookImportResponse, PlaybookImportType, PlaybookRepository,
+    PlaybookSyncResult, PlaybookSyncStatus, RepositoryPlaybook, RepositoryPlaybookFilter,
+    UpdatePlaybookRepository,
 };
 pub use repository::{
     PlaybookImportsRepository, PlaybookImportsRepositoryError, PlaybookRepoRepository,
     PlaybookRepoRepositoryError, RepositoryPlaybooksRepository, RepositoryPlaybooksRepositoryError,
 };
 pub use service::{PlaybookRepositoryService, PlaybookRepositoryServiceConfig};
+#[doc(hidden)]
+pub use service::{staged_row, StagedRow, StagedSync};

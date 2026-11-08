@@ -186,7 +186,7 @@ impl VectorConfigManager {
             let detail = dangling.join("; ");
             tracing::error!(
                 "Refusing to back up the active config: {detail}. The previous backup is kept \
-                 as the rollback target. This is the known failure shape — a stale parser file \
+                 as the rollback target. This is the NAN-2296 shape — a stale parser file \
                  pointing at a route the router no longer emits."
             );
             return Err(VectorConfigError::ValidationFailed(format!(
@@ -344,9 +344,8 @@ impl VectorConfigManager {
     /// workspace. `parsers_dir` is its own bind mount in the Vector container
     /// (`docker-compose.yml`: `./config/vector/sources/parsers` is mounted
     /// separately because the parent is read-only) and its own mount path in the
-    /// Kubernetes pod (the platform `apps/api/src/services/k8s-manifests/
-    /// app-services.ts`). A bind mount follows the inode it was created from,
-    /// so renaming the directory aside would
+    /// Kubernetes pod (`deploy/k8s/rackspace/vector.yaml`). A bind mount follows
+    /// the inode it was created from, so renaming the directory aside would
     /// leave Vector looking at the tree we are about to delete, and deleting it
     /// would empty Vector's config directory outright. Publishing INTO the
     /// existing directory is the only form of this that is safe here.
@@ -495,6 +494,17 @@ const GENERATED_ORCHESTRATION_FILES: &[&str] = &[
     "_ocsf_sink.toml",
 ];
 
+/// Static configs outside the generated parser tree whose components are
+/// legitimate inputs to files inside it.
+///
+/// Derive the component IDs from the shipped TOML rather than duplicating them
+/// here. The enrichment source owns both `enrichment_ingest` and its prepare
+/// transform, and either may be referenced by generated parser-tree files.
+const KNOWN_EXTERNAL_CONFIGS: &[(&str, &str)] = &[(
+    "04-enrichment-source.toml",
+    include_str!("../../../../config/vector/04-enrichment-source.toml"),
+)];
+
 /// Vector substitutes `${VAR:-default}` before it parses the TOML, so the raw
 /// files on disk are NOT valid TOML and must be substituted first.
 ///
@@ -508,29 +518,9 @@ const GENERATED_ORCHESTRATION_FILES: &[&str] = &[
 /// Mirrors `deploy::enrichment_lane_backpressure_violations::substitute_env`,
 /// which solved the same problem for the backpressure lint.
 fn substitute_env(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        match after.find('}') {
-            Some(end) => {
-                let body = &after[..end];
-                // `${VAR:-default}` -> default, `${VAR}` -> empty.
-                if let Some(pos) = body.find(":-") {
-                    out.push_str(&body[pos + 2..]);
-                }
-                rest = &after[end + 1..];
-            }
-            None => {
-                // Unterminated: leave it be and let the parse fail honestly.
-                out.push_str(&rest[start..]);
-                rest = "";
-            }
-        }
-    }
-    out.push_str(rest);
-    out
+    // NAN-4953: one implementation of Vector's grammar, `$$` included (parser
+    // files are escaped, so a tenant `$${X}` must stay literal here too).
+    crate::vector_env::substitute_like_vector(raw)
 }
 
 /// One declared Vector component.
@@ -569,6 +559,8 @@ impl Component {
 #[derive(Default)]
 pub(super) struct ComponentGraph {
     declared: HashMap<String, Component>,
+    /// Components declared by static configs loaded alongside this tree.
+    known_external: HashSet<String>,
     /// `(file, component id, input reference)`
     references: Vec<(String, String, String)>,
     /// Every `*.toml` in the tree parsed, so the declaration set is complete.
@@ -588,6 +580,25 @@ impl ComponentGraph {
             router_readable: true,
             ..Default::default()
         };
+
+        for (file, raw) in KNOWN_EXTERNAL_CONFIGS {
+            let parsed: toml::Table = match toml::from_str(&substitute_env(raw)) {
+                Ok(table) => table,
+                Err(_) => {
+                    // Stay fail-open. A parser mismatch must not invent a new
+                    // reason to deny a rollback target for a config Vector may
+                    // still load.
+                    graph.complete = false;
+                    graph.unparsed.push((*file).to_string());
+                    continue;
+                }
+            };
+            for section in ["sources", "transforms", "sinks"] {
+                if let Some(table) = parsed.get(section).and_then(|v| v.as_table()) {
+                    graph.known_external.extend(table.keys().cloned());
+                }
+            }
+        }
 
         for (file, raw) in docs {
             let parsed: toml::Table = match toml::from_str(&substitute_env(raw)) {
@@ -694,6 +705,7 @@ impl ComponentGraph {
                 // cannot be verified without knowing the transform's semantics.
                 // Accept it.
                 Some(_) => {}
+                None if self.known_external.contains(base) => {}
                 None => {
                     if TREE_OWNED_ROUTERS.contains(&base) {
                         // Only meaningful when we could actually read the router

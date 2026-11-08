@@ -19,8 +19,12 @@ impl ClickHouseSqlGenerator {
         aggregations: &[Aggregation],
         group_by: Option<&[String]>,
         sparkline_span_secs: Option<u64>,
+        // NAN-4279: whether the raw time column is in scope, so
+        // earliest()/latest() can pick by time.
         timestamp_available: bool,
     ) -> Result<String, SqlGenError> {
+        // NAN-4291: an ungrouped stats is one row even over no input rows.
+        let ungrouped = group_by.is_none_or(|fields| fields.is_empty());
         // Pre-compute which aggregation aliases shadow their input field
         // e.g. `min(timestamp) AS timestamp` — ClickHouse inlines CTEs and expands
         // aliases, so downstream stages would see `min(timestamp)` instead of a plain
@@ -95,7 +99,7 @@ impl ClickHouseSqlGenerator {
                         }
                     };
 
-                    let agg_expr = null_when_no_rows(&agg.func, agg_expr, group_by.is_none());
+                    let agg_expr = null_when_no_rows(&agg.func, agg_expr, ungrouped);
                     let alias = agg.alias.as_ref()
                         .map(|a| format!(" AS {}", escape_identifier(a)))
                         .unwrap_or_else(|| format!(" AS {}", agg.func.as_str()));
@@ -134,20 +138,8 @@ impl ClickHouseSqlGenerator {
                     AggFunc::Max => format!("max({})", field_expr),
                     AggFunc::Values => format!("arrayStringConcat(arrayFilter(x -> x != '', groupUniqArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
                     AggFunc::List => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
-                    // Raw events have a physical event time, so first/last are
-                    // chronological. A transformed upstream row set (for
-                    // example `stats ... | append [...] | stats first(x)`) no
-                    // longer carries that column. In that grain, first/last
-                    // mean pipeline order and must not reference a dropped
-                    // physical timestamp.
-                    AggFunc::First if timestamp_available => {
-                        format!("argMin({}, {})", field_expr, self.time_column())
-                    }
-                    AggFunc::First => format!("any({})", field_expr),
-                    AggFunc::Last if timestamp_available => {
-                        format!("argMax({}, {})", field_expr, self.time_column())
-                    }
-                    AggFunc::Last => format!("anyLast({})", field_expr),
+                    AggFunc::First => format!("argMin({}, {})", field_expr, self.time_column()),
+                    AggFunc::Last => format!("argMax({}, {})", field_expr, self.time_column()),
                     AggFunc::Range => format!("(max({}) - min({}))", field_expr, field_expr),
                     AggFunc::Earliest if timestamp_available => self.time_ordered_pick(&field_expr, false),
                     AggFunc::Latest if timestamp_available => self.time_ordered_pick(&field_expr, true),
@@ -164,11 +156,8 @@ impl ClickHouseSqlGenerator {
                         // into time intervals and count per bucket.
                         // Uses sumMap to aggregate counts by time bucket in a single pass.
                         let span = sparkline_span_secs.unwrap_or(1800); // default 30min
-                        // NAN-3325: `tupleElement(…, 2)`, not `(…).2` — the hosted
-                        // stats-page rewrite re-parses this SQL with sqlparser,
-                        // which reads `).2` as a stray decimal literal.
                         format!(
-                            "tupleElement(sumMap([toUInt32(toStartOfInterval({}, toIntervalSecond({})))], [toUInt64(1)]), 2)",
+                            "sumMap([toUInt32(toStartOfInterval({}, toIntervalSecond({})))], [toUInt64(1)]).2",
                             self.time_column(),
                             span
                         )
@@ -202,7 +191,7 @@ impl ClickHouseSqlGenerator {
                 let agg_expr = self
                     .rollup_value_agg(&agg.func, &field_expr, agg.field.as_deref())
                     .unwrap_or(agg_expr);
-                let agg_expr = null_when_no_rows(&agg.func, agg_expr, group_by.is_none());
+                let agg_expr = null_when_no_rows(&agg.func, agg_expr, ungrouped);
 
                 // Output column name. The scheme lives on `Aggregation::output_alias`
                 // so downstream rewrites (auto-sort) can reference the same name.
@@ -239,13 +228,12 @@ impl ClickHouseSqlGenerator {
                         // which keeps its raw name to match the shadowed expr
                         // `field_to_sql_expr` just emitted (NAN-1341).
                         let normalized = by_field_output_name(f, self);
-                        // NAN-4295: an Array leaf groups by EACH element (SPL
+                        // NAN-4295: an Array column groups by EACH element (SPL
                         // multivalue `by`), not by the whole array. NULL
-                        // elements (a repeated object without this leaf) form
-                        // no group; an empty array contributes no row. The
-                        // element takes a private alias: aliased as the field
-                        // itself it would shadow the array column in this
-                        // SELECT's WHERE (`has(privileges, …)` on a scalar).
+                        // elements form no group; an empty array contributes
+                        // no row. The element takes a private alias: aliased
+                        // as the field itself it would shadow the array column
+                        // in this SELECT's WHERE.
                         if self.stats_by_field_is_array(f) {
                             return format!(
                                 "arrayJoin(arrayFilter(x -> x IS NOT NULL, {})) AS {}",
@@ -340,13 +328,19 @@ impl ClickHouseSqlGenerator {
         Ok(sql)
     }
 
-    /// NAN-4295: whether a `stats … by` field is an `Array(T)` schema leaf
-    /// (not a same-named column an upstream stage already produced).
-    fn stats_by_field_is_array(&self, field: &str) -> bool {
+    /// NAN-4295: whether a `stats … by` field is a physical `Array(T)` column
+    /// (UDM `tags`, OCSF repeated leaves such as `resources.type`), not a
+    /// same-named column an upstream stage already produced and not an
+    /// array read out of the JSON tail (cast to text for grouping).
+    pub(super) fn stats_by_field_is_array(&self, field: &str) -> bool {
         // `is_computed_field` is no guard here: it holds every stats by-field
         // of the whole query (field_analysis), including this one.
-        !self.is_upstream_computed_field(field)
-            && super::search_expr::stats_by_schema_field_is_array(self.profile.as_ref(), field)
+        if self.is_upstream_computed_field(field) || self.is_upstream_mvexpanded(field) {
+            return false;
+        }
+        let canonical = self.canonicalize_field(field);
+        (self.profile.is_array_field(canonical) || super::is_array_column(canonical))
+            && !field_to_sql_expr(field, self).1
     }
 
     /// NAN-4279 (F9): `earliest(x)` / `latest(x)` are the value of `x` on the
@@ -371,18 +365,20 @@ impl ClickHouseSqlGenerator {
 
     /// Generate SQL for timechart command
     /// NAN-1555: counter-reset-aware per-second `rate()` for a cumulative metric
-    /// over a group's window. Sums the POSITIVE consecutive deltas of the
-    /// time-ordered values — a counter reset (process restart) produces a negative
-    /// delta which is dropped rather than counted as a huge spike, matching
-    /// Prometheus `rate()` reset semantics — and divides by the observed window
-    /// seconds. For a monotonic counter with no reset this equals
-    /// `(last - first) / secs`. Used only on the metrics dataset; the logs path
-    /// keeps the prior `(max - min) / secs` form (byte-identical).
+    /// over a group's window. Sums the consecutive deltas of the time-ordered
+    /// values and divides by the observed window seconds. A decrease is a counter
+    /// reset (process restart): the counter restarted from zero, so the
+    /// post-reset value itself is the increment — Prometheus `increase`/`rate()`
+    /// semantics, the same rule as the metrics-v2 window delta in `otel.rs`
+    /// (NAN-4902; `100 -> 150 -> 5 -> 20` is `50 + 5 + 15 = 70`, where the old
+    /// form dropped the reset to 0 and read 65). For a monotonic counter with no
+    /// reset this equals `(last - first) / secs`. Used only on the metrics
+    /// dataset; the logs path keeps the prior `(max - min) / secs` form.
     pub(crate) fn metric_rate_expr(&self, field_expr: &str) -> String {
         let ts = self.time_column();
+        let values = format!("arrayMap(p -> p.2, arraySort(p -> p.1, groupArray(({ts}, {field_expr}))))");
         format!(
-            "arraySum(arrayMap(d -> if(d > 0, d, 0), \
-             arrayDifference(arrayMap(p -> p.2, arraySort(p -> p.1, groupArray(({ts}, {field_expr})))))))\
+            "arraySum(arrayMap((d, v) -> if(d >= 0, d, v), arrayDifference({values}), {values}))\
              / greatest(dateDiff('second', min({ts}), max({ts})), 1)"
         )
     }
@@ -488,14 +484,8 @@ impl ClickHouseSqlGenerator {
                     AggFunc::Max => format!("max({})", field_expr),
                     AggFunc::Values => format!("arrayStringConcat(arrayFilter(x -> x != '', groupUniqArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
                     AggFunc::List => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
-                    AggFunc::First if timestamp_available => {
-                        format!("argMin({}, {})", field_expr, self.time_column())
-                    }
-                    AggFunc::First => format!("any({})", field_expr),
-                    AggFunc::Last if timestamp_available => {
-                        format!("argMax({}, {})", field_expr, self.time_column())
-                    }
-                    AggFunc::Last => format!("anyLast({})", field_expr),
+                    AggFunc::First => format!("argMin({}, {})", field_expr, self.time_column()),
+                    AggFunc::Last => format!("argMax({}, {})", field_expr, self.time_column()),
                     AggFunc::Range => format!("(max({}) - min({}))", field_expr, field_expr),
                     AggFunc::Earliest if timestamp_available => self.time_ordered_pick(&field_expr, false),
                     AggFunc::Latest if timestamp_available => self.time_ordered_pick(&field_expr, true),
@@ -511,7 +501,7 @@ impl ClickHouseSqlGenerator {
                         // Sparkline in timechart: use a fraction of the timechart span
                         let sub_span = (span.as_secs() / 10).max(60);
                         format!(
-                            "tupleElement(sumMap([toUInt32(toStartOfInterval({}, toIntervalSecond({})))], [toUInt64(1)]), 2)",
+                            "sumMap([toUInt32(toStartOfInterval({}, toIntervalSecond({})))], [toUInt64(1)]).2",
                             self.time_column(),
                             sub_span
                         )
@@ -666,7 +656,8 @@ impl ClickHouseSqlGenerator {
                         n
                     )
                     .unwrap();
-                    write!(sql, "\n  GROUP BY {}\n  ORDER BY time_bucket", group_clause).unwrap();
+                    write!(sql, "\n  GROUP BY {}\n  ORDER BY time_bucket", group_clause)
+                        .unwrap();
                 } else {
                     // Single-scan top-N (NAN-1430 / audit D1): the old form's rank
                     // subquery (`WHERE x IN (SELECT … FROM stage_0 … LIMIT n)`)
@@ -855,23 +846,15 @@ impl ClickHouseSqlGenerator {
                 }
             }
         }
-        // NAN-4236: several series share a bucket; without the series keys
-        // their order (and any row-limit cut) differed between runs. Every
-        // path above ends `ORDER BY time_bucket [WITH FILL …]`.
-        if !split_by.is_empty() {
-            let series = split_by.iter().map(|field| format!("{} ASC", escape_identifier(field)))
-                .collect::<Vec<_>>().join(", ");
-            write!(sql, ", {series}").unwrap();
-        }
 
         Ok(sql)
     }
 }
 
-/// NAN-4291 (F6): an ungrouped `stats` always returns one row, and over no
-/// input rows ClickHouse gives each aggregate its type's default (`max(time)`
-/// is 1970-01-01, `values(x)` is `''`, `min`/`sum` are 0, `avg` is NaN)
-/// instead of "no value". Over zero rows every aggregate but a count is null:
+/// NAN-4291: an ungrouped `stats` always returns one row, and over no input
+/// rows ClickHouse gives each aggregate its type's default (`max(time)` is
+/// 1970-01-01, `values(x)` is empty, `min` / `max` / `sum` are 0) instead
+/// of "no value". Over zero rows every aggregate but a count is NULL:
 /// `count` / `dc` / `estdc` stay 0 and a sparkline stays an empty array
 /// (arrays cannot be Nullable). Grouped stats over no rows return no rows,
 /// so they are left as they are.

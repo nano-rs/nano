@@ -18,9 +18,15 @@ data_dir = "/var/lib/vector"
 # config validation → crashloop). The GraphQL API stays on for config reload /
 # `vector top`/`vector tap`; the browser playground IDE was a debug-only extra
 # and its port (8686) isn't even published in docker-compose.opensource.yml.
+#
+# NAN-4918: loopback only. The API has no authentication, and on 0.0.0.0 every
+# container on the compose network could read pipeline topology and tap live
+# events. Health checks run inside the container (127.0.0.1); reload
+# acknowledgement uses the internal-metrics exporter (:9598), not this API.
+# `vector top` / `vector tap` work from inside the container (docker exec).
 [api]
 enabled = true
-address = "0.0.0.0:8686"
+address = "127.0.0.1:8686"
 
 # =============================================================================
 # Single HTTP Source - All formats on one port
@@ -31,58 +37,74 @@ type = "http_server"
 address = "0.0.0.0:8080"
 strict_path = false
 path = "/"
-# Credentials are read by source authentication, never copied into events.
-# Forwarding headers are needed by rate_limit_prep.
-headers = ["X-Source-Type", "Content-Type", "X-Forwarded-For", "X-Real-IP"]
-max_body_size = 52428800  # 50MB to match batch size (was 10MB)
+# NAN-4038: capture only what the pipeline reads. Every captured header becomes
+# an event field, and fields that are not UDM columns land in `ext` in
+# ClickHouse, so X-Api-Key / X-Webhook-Secret used to be stored verbatim in
+# searchable rows. NAN-4907: `Authorization` is read by source authentication
+# below and is no longer copied into events either. Forwarding headers are
+# read by rate_limit_prep. X-Nano-Edge-Client-IP is a private assertion from
+# the role-split edge and is ignored unless that edge-only topology is enabled.
+headers = ["X-Source-Type", "Content-Type", "X-Forwarded-For", "X-Real-IP", "X-Nano-Edge-Client-IP"]
+# NAN-4945: the TCP peer that reached this listener (the nginx edge, or a
+# direct sender). rate_limit_prep turns it into the trusted client address.
+host_key = "nano_ingest_peer"
 
 # Keep-alive for better connection reuse from log shippers
 keepalive.max_connection_age_secs = 300  # 5 minutes
 
-# NAN-3770: named, revocable per-sender ingest tokens (Ingestion -> Credentials).
-# nano-api writes SHA-256 hashes of the active tokens to this file (0600, on
-# the shared nano-vector-dynamic volume); the nano-rs/vector fork re-reads it
-# at most every `reload_interval_secs`, so a revoke is refused within seconds
-# with no reload and no listener restart. A listed `Bearer <token>` is
-# authenticated by the source and stamps `%nano_credential_id` /
-# `%nano_credential_name`.
+# NAN-5004: an HTTP success is a durable handoff, not merely admission into
+# Vector's in-process graph. The nano Vector 0.61 fork attaches one batch
+# notifier to every event decoded from the request. Its disk-buffer writer
+# finalizes each event only after `flush_record` accepts the complete record;
+# http_server returns 5xx when a downstream finalizer reports an error.
+# Durable event sinks therefore use disk buffers with `when_full = "block"`:
+# a saturated buffer applies backpressure instead of destroying a finalizer as
+# `Dropped` (which Vector intentionally folds into Delivered). Request admission
+# limits live at the nginx edge, where rejection is an explicit HTTP 429.
+[sources.http_ingest.acknowledgements]
+enabled = true
+
+# NAN-4907 (port of main NAN-3770 / NAN-3806): named, revocable per-source
+# ingest tokens (Settings -> Ingest tokens). nano-api writes the SHA-256 of
+# every accepted token to this file (0600, on the shared vector-dynamic
+# volume); the nano-rs/vector fork re-reads it at most every
+# `reload_interval_secs`, so a revoke is refused within seconds with no reload
+# and no listener restart. A listed `Bearer <token>` is authenticated here and
+# stamps `%nano_credential_id` / `%nano_credential_name` (event metadata: a
+# sender cannot set it). The `name` is the bound source's route key, and
+# `source_type_extract` routes on it, ignoring the sender's X-Source-Type. The
+# route `*` marks a multiplex credential (nano-api's own senders, and the
+# install token in the deprecated legacy multiplex mode): its events keep the
+# type they declare. An unbound token is not listed and gets 401.
 #
-# NAN-3806: a token decides the source, 100% token based. Every listed token
-# is bound to one log source and its `name` in the file is that source's route
-# key, stamped as `%nano_credential_name`; `source_type_extract` routes on it
-# and ignores any X-Source-Type / body `source_type` the sender declares. An
-# unbound token (and the install token until an admin binds it) is not listed
-# and is refused with 401. nano-api writes `fallback_enabled = false` whenever
-# VECTOR_AUTH_TOKEN is set, so nothing falls through to the `auth` below; it
-# is reached only with no install token at all (the explicit
-# VECTOR_ALLOW_UNAUTHENTICATED_INGEST opt-in). A missing file = no tokens.
-# Requires ghcr.io/nano-rs/vector >= 0.59.0-nano.7.
+# nano-api writes `fallback_enabled = false` whenever VECTOR_AUTH_TOKEN is set,
+# so the static `auth` below is consulted only when the file is missing or
+# with no install token at all. A missing file FAILS CLOSED: the static check
+# accepts the install token only when the deployment explicitly sets
+# NANO_INGEST_STATIC_FALLBACK=true on Vector (a deployment that cannot deliver
+# the tokens file and keeps the legacy multiplex install token). With no
+# install token, only the explicit VECTOR_ALLOW_UNAUTHENTICATED_INGEST opt-in.
 [sources.http_ingest.valid_tokens_file]
 path = "/etc/vector/dynamic/ingest-tokens/tokens.json"
 reload_interval_secs = 2
 
-# NAN-3379: authenticate at the source so a bad or missing token gets HTTP 401.
-# The `auth_check` remap below runs after the source has already answered 200,
-# and VRL cannot change the response, so a sender with a typo'd or rotated
-# token used to see success forever while every event was dropped.
-# NAN-3806: this static fallback never accepts a token. With VECTOR_AUTH_TOKEN
-# set, every accepted token (the install token included, once bound) is in
-# `valid_tokens_file` above, so an unlisted one is refused here too even if
-# the file is missing. A blank install token refuses everything unless
-# VECTOR_ALLOW_UNAUTHENTICATED_INGEST is explicitly "true" (NAN-1351).
+# NAN-3379 / NAN-4907: authenticate at the source so a bad or missing token gets
+# HTTP 401. A VRL check after the source cannot change the response: a sender
+# with a revoked or mistyped token would see 200 forever while every event was
+# dropped. Header names are lowercase here.
 [sources.http_ingest.auth]
 strategy = "custom"
 source = '''
 expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
 allow_unauthenticated = (get_env_var("VECTOR_ALLOW_UNAUTHENTICATED_INGEST") ?? "") == "true"
-expected_token == "" && allow_unauthenticated
+static_fallback = (get_env_var("NANO_INGEST_STATIC_FALLBACK") ?? "") == "true"
+auth_header = to_string(.headers.authorization) ?? ""
+if expected_token == "" {
+    allow_unauthenticated
+} else {
+    static_fallback && auth_header == "Bearer " + expected_token
+}
 '''
-
-# A successful HTTP response is a delivery receipt. The lake sink enables
-# acknowledgements and confirms only after the Bronze object PUT completes.
-# Push enrichment has its own listener below, so it cannot stall log delivery.
-[sources.http_ingest.acknowledgements]
-enabled = true
 
 # Split incoming body by newlines - each line becomes a separate event
 # This enables NDJSON batch ingestion from log shippers (Cribl, Fluentd, etc.)
@@ -93,87 +115,6 @@ method = "newline_delimited"
 [sources.http_ingest.decoding]
 codec = "bytes"
 
-# Dedicated push-enrichment ingress. Identity/IP-context synchronization must
-# be allowed to use a durable blocking sink without ever backpressuring the log
-# front door. It shares the install token but has an independent Vector source
-# and topology branch.
-[sources.enrichment_ingest]
-type = "http_server"
-address = "0.0.0.0:8090"
-strict_path = false
-path = "/"
-headers = ["X-Source-Type", "Content-Type"]
-max_body_size = 52428800
-
-# NAN-3379: authenticate at the source so a bad or missing token gets HTTP 401.
-# The `enrichment_prepare` remap below runs after the source has already answered 200,
-# and VRL cannot change the response, so a sender with a typo'd or rotated
-# token used to see success forever while every event was dropped. Same rules
-# as the log ingress: `Bearer <VECTOR_AUTH_TOKEN>`, and
-# a blank token refuses everything unless VECTOR_ALLOW_UNAUTHENTICATED_INGEST
-# is explicitly "true" (NAN-1351). Header names are lowercase here.
-# `enrichment_prepare` still refuses a blank token outright, so the
-# unauthenticated opt-in never reaches the enrichment lane.
-[sources.enrichment_ingest.auth]
-strategy = "custom"
-source = '''
-expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
-allow_unauthenticated = (get_env_var("VECTOR_ALLOW_UNAUTHENTICATED_INGEST") ?? "") == "true"
-auth_header = to_string(.headers.authorization) ?? ""
-if expected_token == "" {
-    allow_unauthenticated
-} else {
-    auth_header == "Bearer " + expected_token
-}
-'''
-
-[sources.enrichment_ingest.framing]
-method = "newline_delimited"
-
-# NAN-3767: end-to-end acknowledgements. A sender (the connector runner's
-# directory sync, provider sync) gets its 200 only once every record was
-# delivered: the lake identity sink keeps a memory buffer, so that is the
-# coordinator's answer. A refused record answers the sender with an error
-# instead of a silent drop.
-[sources.enrichment_ingest.acknowledgements]
-enabled = true
-
-[sources.enrichment_ingest.decoding]
-codec = "bytes"
-
-[transforms.enrichment_prepare]
-type = "remap"
-inputs = ["enrichment_ingest"]
-drop_on_abort = true
-drop_on_error = true
-reroute_dropped = true
-source = '''
-expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
-# The source authenticates the request before decoding. Do not copy its token
-# into the event for a second comparison. A blank token remains forbidden here.
-if expected_token == "" {
-    log("Auth failed on dedicated enrichment ingress", level: "warn")
-    abort
-}
-source_type = downcase(to_string(."X-Source-Type") ?? to_string(."x-source-type") ?? "")
-if source_type != "nano_enrich" {
-    log("Dedicated enrichment ingress requires X-Source-Type: nano_enrich", level: "warn")
-    abort
-}
-raw = to_string(.message) ?? ""
-parsed = parse_json!(raw)
-if !is_object(parsed) {
-    abort
-}
-. = parsed
-.source_type = "nano_enrich"
-'''
-
-[sinks.enrichment_ingest_dead_letter]
-type = "blackhole"
-inputs = ["enrichment_prepare.dropped"]
-print_interval_secs = 0
-
 # =============================================================================
 # Authentication Transform
 # =============================================================================
@@ -181,32 +122,29 @@ print_interval_secs = 0
 type = "remap"
 inputs = ["http_ingest"]
 source = '''
+# The source already authenticated the request (valid_tokens_file, else the
+# static `auth`), and never copies the Authorization header into the event.
+credential_id = to_string(%nano_credential_id) ?? ""
 expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
 allow_unauthenticated = (get_env_var("VECTOR_ALLOW_UNAUTHENTICATED_INGEST") ?? "") == "true"
-# NAN-3770: the source already matched a named ingest token from
-# `valid_tokens_file` and stamped its credential id (event metadata cannot be
-# set by a sender).
-credential_id = to_string(%nano_credential_id) ?? ""
 
 if credential_id != "" {
     .auth_status = "authenticated"
 } else if expected_token == "" {
-    # NAN-1351 (F1): fail closed when no ingest token is configured. Previously
-    # a blank VECTOR_AUTH_TOKEN silently accepted every event, allowing
-    # unauthenticated log injection + nano_enrich enrichment-lane poisoning by
-    # anyone able to reach :8080. Operators on a trusted network (or air-gapped)
-    # can opt back in with VECTOR_ALLOW_UNAUTHENTICATED_INGEST=true.
+    # NAN-1351 (F1): fail closed when no ingest token is configured, unless the
+    # operator explicitly opted into unauthenticated ingest.
     if allow_unauthenticated {
         .auth_status = "unauthenticated"
     } else {
         log("Auth failed: VECTOR_AUTH_TOKEN is not set. Refusing unauthenticated ingest. Set VECTOR_AUTH_TOKEN, or set VECTOR_ALLOW_UNAUTHENTICATED_INGEST=true to explicitly allow it.", level: "error")
         abort
     }
+} else if (get_env_var("NANO_INGEST_STATIC_FALLBACK") ?? "") == "true" {
+    # The explicit static install-token fallback (tokens file missing on a
+    # deployment that opted in): legacy multiplex, routed by X-Source-Type.
+    .auth_status = "authenticated"
 } else {
-    # NAN-3806: with an install token configured, every accepted token is a
-    # listed, source-bound credential. An event without the stamp got in some
-    # other way: refuse it rather than route it by what it declares.
-    log("Auth refused: the token is not bound to a source. Bind it in Ingestion -> Credentials.", level: "warn")
+    log("Refusing an event without an ingest credential: the tokens file is missing and NANO_INGEST_STATIC_FALLBACK is not enabled", level: "error")
     abort
 }
 
@@ -221,71 +159,105 @@ if exists(."X-Source-Type") {
 }
 .source_type = source_type
 .request_path = to_string(.path) ?? "/"
+# NAN-4945: `path` and `X-Source-Type` are transport metadata, read above (and
+# `path` kept as `request_path`). Dropped here, before parse_content merges the
+# JSON body onto the event, so a body field of the same name is never removed.
+del(.path)
+del(."X-Source-Type")
 
+# NAN-4038: no credential header may survive into the stored event. Only
+# Authorization is captured today; the rest are defense in depth in case a
+# header is added back to the source's `headers` list.
 del(.Authorization)
 del(.authorization)
+del(."X-Api-Key")
+del(."x-api-key")
+del(."X-Webhook-Secret")
+del(."x-webhook-secret")
+del(."Cookie")
+del(.cookie)
 '''
 
 # =============================================================================
-# Rate Limiting
+# Trusted client metadata
 # =============================================================================
 [transforms.rate_limit_prep]
 type = "remap"
 inputs = ["auth_check"]
 source = '''
-client_ip = null
-xff = to_string(."X-Forwarded-For") ?? ""
-if xff != "" {
-    parts = split(xff, ",")
-    if length(parts) > 0 {
-        client_ip = strip_whitespace(parts[0]) ?? null
+# NAN-4945: the client address used for the throttle and kept on the event.
+# Only the TCP peer (`nano_ingest_peer`, from the source's host_key) cannot be
+# forged. `X-Real-IP` is believed only when that peer is a trusted proxy: the
+# nginx edge sets it to the peer it saw (remote_addr), replacing what the sender
+# sent. `X-Forwarded-For` is never believed: nginx appends the real peer to
+# the sender's list, so its first entry is attacker-chosen. Proxy trust defaults
+# to NONE. Set NANO_INGEST_TRUSTED_PROXIES to the exact sanitizing proxy
+# addresses/CIDRs (comma-separated) only in a deployment that has such an edge.
+# The role-split Compose edge instead stamps a private header after applying its
+# exact inventory trusted_cidr contract; its existing edge-only flag gates use
+# of that assertion, and Vector is not published directly in that topology.
+peer = to_string(.nano_ingest_peer) ?? ""
+del(.nano_ingest_peer)
+trusted = get_env_var("NANO_INGEST_TRUSTED_PROXIES") ?? ""
+from_proxy = false
+if peer != "" {
+    for_each(split(trusted, ",")) -> |_idx, cidr| {
+        cidr = strip_whitespace(cidr)
+        if cidr != "" && (ip_cidr_contains(cidr, peer) ?? false) {
+            from_proxy = true
+        }
     }
 }
-if client_ip == null {
-    client_ip = to_string(."X-Real-IP") ?? null
+real_ip = strip_whitespace(to_string(."X-Real-IP") ?? "")
+edge_ip = strip_whitespace(to_string(."X-Nano-Edge-Client-IP") ?? "")
+client_ip = peer
+if (get_env_var("NANO_HEC_TRUST_EDGE_IDENTITY") ?? "") == "true" && (is_ipv4(edge_ip) || is_ipv6(edge_ip)) {
+    client_ip = edge_ip
+} else if from_proxy && (is_ipv4(real_ip) || is_ipv6(real_ip)) {
+    client_ip = real_ip
 }
-if client_ip == null {
+if client_ip == "" {
     client_ip = "unknown"
 }
 .client_ip = client_ip
+# Kept in event metadata (a body field cannot overwrite it); parse_content
+# writes them back as `ingest_client_ip` / `ingest_peer` after the body merge.
+%nano_ingest_client_ip = client_ip
+%nano_ingest_peer = peer
+# The raw forwarding headers are transport metadata: dropped before
+# parse_content merges the body, so body fields of those names survive.
+del(."X-Forwarded-For")
+del(."X-Real-IP")
+del(."X-Nano-Edge-Client-IP")
 '''
-
-[transforms.rate_limit]
-type = "throttle"
-inputs = ["rate_limit_route.identified"]
-threshold = ${VECTOR_RATE_LIMIT_PER_CLIENT_EPS:-500000}
-window_secs = 1
-key_field = "client_ip"
-
-[transforms.rate_limit_route]
-type = "route"
-inputs = ["rate_limit_prep"]
-reroute_unmatched = false
-route.identified = '.client_ip != "unknown"'
-route.unidentified = '.client_ip == "unknown"'
-
-# Preserve a separate, configurable aggregate fence for legacy or
-# unidentified senders. This avoids both the retired 5k-EPS shared choke point
-# and an unbounded bypass when forwarding identity is unavailable.
-[transforms.rate_limit_unidentified]
-type = "throttle"
-inputs = ["rate_limit_route.unidentified"]
-threshold = ${VECTOR_RATE_LIMIT_UNIDENTIFIED_EPS:-500000}
-window_secs = 1
 
 # =============================================================================
 # Content-Type Detection & Parsing
 # =============================================================================
 [transforms.parse_content]
 type = "remap"
-inputs = ["rate_limit", "rate_limit_unidentified"]
+inputs = ["rate_limit_prep"]
 source = '''
 content_type = to_string(."Content-Type") ?? to_string(."content-type") ?? ""
 content_type = downcase(content_type)
+# NAN-4945: the request's Content-Type stays on the event for the parsers
+# (format-aware parsers pick parse_xml / parse_csv from it). Its value is also
+# kept in event metadata, and the storage boundary (ingest_transport_strip_vrl!
+# in vector_config/mod.rs) drops the root field when it still holds that
+# header value, so it never lands in `unmapped`/`ext`; a body field of the same
+# name with its own value survives.
+header_content_type = to_string(."Content-Type") ?? to_string(."content-type") ?? ""
+if header_content_type != "" {
+    %nano_content_type = header_content_type
+}
 
 raw = to_string(.message) ?? ""
 .metadata = {}
 .metadata.forwarded_via = "http"
+# Protected event metadata survives a parser that replaces the event root.
+# Per-parser sampling reads this marker and must retain HTTP records covered by
+# the request's durable-success contract (NAN-5004).
+%nano_durable_ingest = true
 .content_format = "unknown"
 
 # Normalize empty source_type to "unknown" for consistent extraction logic
@@ -400,6 +372,13 @@ if contains(content_type, "application/json") {
 if contains(to_string(.request_path) ?? "", "/webhook") {
     .is_webhook = true
 }
+
+# NAN-4945: the trusted client address and the TCP peer, restored after the
+# body merge so a sender cannot overwrite them.
+ingest_client_ip = to_string(%nano_ingest_client_ip) ?? ""
+if ingest_client_ip != "" { .ingest_client_ip = ingest_client_ip }
+ingest_peer = to_string(%nano_ingest_peer) ?? ""
+if ingest_peer != "" { .ingest_peer = ingest_peer }
 '''
 
 # =============================================================================
@@ -437,25 +416,35 @@ if source_type == "unknown" {
 # Source type aliasing is handled dynamically by the router via match_values
 # on each parser — no hardcoded aliases needed here.
 
-# NAN-3806: the token decides the source, 100% token based. A listed token's
-# `%nano_credential_name` is its bound source's route key (event metadata: a
-# sender cannot set it). Whatever the sender declared above (X-Source-Type,
-# a body `source_type`, `metadata.source_type`) never routes; a different
-# claim is kept only as the raw `claimed_source_type` field. A listed token
-# without a route is refused. The platform pull credential (nano-api's own
-# collector integrations, each stream typed by its manifest) is the one
-# credential whose declared type is kept.
+# NAN-4907 (port of main NAN-3806): the token decides the source. A listed
+# token's `%nano_credential_name` is its bound source's route key (event
+# metadata: a sender cannot set it). Whatever the sender declared above
+# (X-Source-Type, a body `source_type`, `metadata.source_type`) never routes; a
+# different claim is kept only as the raw `claimed_source_type` field. The
+# route `*` is a multiplex credential (nano-api's own senders, or the install
+# token in legacy multiplex mode): its declared type is kept. A listed token
+# without a route is refused. An event with no credential stamp came in through
+# the static install-token fallback (tokens file missing) and keeps its
+# declared type, as before per-source tokens.
+del(.claimed_source_type)
+# NAN-4912: the claim is also kept in event METADATA (a sender cannot set it)
+# so it survives a parser that replaces the root; the UDM `_output` and the
+# OCSF `_ocsf_prepare` restore it.
+del(%nano_claimed_source_type)
 nano_credential_id = to_string(%nano_credential_id) ?? ""
-if nano_credential_id != "" && nano_credential_id != "6e616e6f-0000-4000-8000-000000000002" {
+if nano_credential_id != "" {
     bound_source_type = to_string(%nano_credential_name) ?? ""
-    if bound_source_type == "" || bound_source_type == "*" {
+    if bound_source_type == "" {
         log("Refusing an event: its ingest token is not bound to a source", level: "warn")
         abort
     }
-    if source_type != "unknown" && source_type != bound_source_type {
-        .claimed_source_type = source_type
+    if bound_source_type != "*" {
+        if source_type != "unknown" && source_type != bound_source_type {
+            .claimed_source_type = source_type
+            %nano_claimed_source_type = source_type
+        }
+        source_type = bound_source_type
     }
-    source_type = bound_source_type
 }
 
 .source_type = source_type
@@ -466,10 +455,4 @@ if nano_credential_id != "" && nano_credential_id != "6e616e6f-0000-4000-8000-00
 # (which wipes `.source_type`). `%` metadata persists across `.` replacement on
 # Vector 0.54. `ocsf_prepare` reads `%source_type` back onto the ocsf_logs row.
 %source_type = downcase(source_type)
-# NAN-2361 wave 8: the ingress lane, stashed the same way. The lake sink
-# stamps it as `metadata.ingress_transport` so the tenant's per-source
-# ingest counters can attribute rows the edge did not bind to a named source
-# (the conventional `ingest-token` path) to the tenant's default source with
-# the protocol they arrived on. Vocabulary: nano_https | hec | otlp | vector.
-%ingress_transport = "nano_https"
 '''

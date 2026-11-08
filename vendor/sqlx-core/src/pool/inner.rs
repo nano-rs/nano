@@ -343,15 +343,7 @@ impl<DB: Database> PoolInner<DB> {
 
             // result here is `Result<Result<C, Error>, TimeoutError>`
             // if this block does not return, sleep for the backoff timeout and try again
-            let result = crate::rt::timeout(timeout, connect_options.connect()).await;
-            if let Ok(Err(error)) = &result {
-                if let Some(callback) = &self.options.on_connect_error {
-                    let pool = super::Pool(Arc::clone(self));
-                    // Diagnostics share the original acquisition deadline.
-                    let _ = crate::rt::timeout(deadline_as_timeout(deadline)?, callback(&pool, error)).await;
-                }
-            }
-            match result {
+            match crate::rt::timeout(timeout, connect_options.connect()).await {
                 // successfully established connection
                 Ok(Ok(mut raw)) => {
                     // See comment on `PoolOptions::after_connect`

@@ -738,29 +738,9 @@ fn transaction_startswith_endswith_sessionizes() {
         "start/end eviction filters must be applied:\n{sql}"
     );
     // Transactions group per session, not per bare group key.
-    //
-    // The group key is emitted through a stable internal alias
-    // (`__nano_txn_group_0`, projected as `… AS "user"`) rather than the raw
-    // column name: grouping by a name that the same SELECT also aliases is the
-    // ClickHouse alias-shadowing trap. Assert the SEMANTICS — session is part of
-    // the grouping, and the group key is carried — not the spelling, so the next
-    // codegen refactor does not fail a test that is still satisfied.
-    let group_by = sql
-        .split("GROUP BY ")
-        .nth(1)
-        .map(|tail| tail.lines().next().unwrap_or_default().to_string())
-        .unwrap_or_default();
     assert!(
-        group_by.contains("_txn_session"),
+        sql.contains(r#"GROUP BY "user", _txn_session"#),
         "must GROUP BY the session, not just the transaction fields:\n{sql}"
-    );
-    assert!(
-        group_by.contains(r#""user""#) || group_by.contains("__nano_txn_group_"),
-        "must carry the transaction group key into the GROUP BY:\n{sql}"
-    );
-    assert!(
-        sql.contains(r#"AS "user""#),
-        "the group key must still be projected under its user-facing name:\n{sql}"
     );
 }
 
@@ -1245,7 +1225,7 @@ fn eventstats_estdc_uses_uniq_combined64() {
     // absence of the window — since checking only the former would pass on a
     // reverted implementation.
     assert!(
-        sql.contains("uniqCombined64(src_ip)") && sql.contains("groupArrayIf(__nano_k"),
+        sql.contains("uniqCombined64(src_ip)") && sql.contains("groupArray(__nano_k)"),
         "eventstats estdc should be a uniqCombined64 map attach (NAN-1642); got: {sql}"
     );
     assert!(
@@ -1305,7 +1285,7 @@ fn dc_emission_stays_uniq_exact_everywhere() {
     // BY ...)` would satisfy both lines above while restoring exactly the
     // whole-partition window NAN-1642 removed. Pin the shape here too.
     assert!(
-        eventstats.contains("groupArrayIf(__nano_k"),
+        eventstats.contains("groupArray(__nano_k)"),
         "grouped eventstats dc must use the map attach (NAN-1642); got: {eventstats}"
     );
     assert!(
@@ -1371,7 +1351,7 @@ fn eventstats_after_head_scans_its_source_once() {
          scalar (one evaluation via the scalar cache); got:\n{sql}"
     );
     assert!(
-        sql.matches(closure.as_str()).count() == 2 && sql.contains("groupArrayIf(__nano_k"),
+        sql.matches(closure.as_str()).count() == 2 && sql.contains("groupArray(__nano_k)"),
         "constants AND rows must both read the id-closure (`{closure}`); got:\n{sql}"
     );
     assert!(
@@ -1460,7 +1440,7 @@ fn eventstats_after_stable_stages_keeps_bounded_map_attach() {
     ] {
         let sql = npl(query);
         assert!(
-            sql.contains("groupArrayIf(__nano_k") && !sql.contains("OVER (PARTITION BY"),
+            sql.contains("groupArray(__nano_k)") && !sql.contains("OVER (PARTITION BY"),
             "`{query}` must keep the bounded map attach (NAN-1642); got:\n{sql}"
         );
     }
@@ -1480,7 +1460,7 @@ fn eventstats_after_every_subset_selector_takes_the_snapshot_shape() {
         let sql = npl(query);
         assert!(
             sql.contains("WHERE id IN (SELECT arrayJoin((SELECT groupArray(id) FROM ")
-                && sql.contains("groupArrayIf(__nano_k"),
+                && sql.contains("groupArray(__nano_k)"),
             "`{query}` must take the id-closure shape; got:\n{sql}"
         );
         assert!(
@@ -1505,7 +1485,7 @@ fn eventstats_after_non_selector_unstable_stages_falls_back_to_window() {
     ] {
         let sql = npl(query);
         assert!(
-            !sql.contains("groupArrayIf(__nano_k") && !sql.contains("groupArray(id)"),
+            !sql.contains("groupArray(__nano_k)") && !sql.contains("groupArray(id)"),
             "`{query}` has no identity-preserving selector suffix — neither \
              the map attach nor the id-closure may be used; got:\n{sql}"
         );
@@ -1597,7 +1577,7 @@ fn anomaly_after_head_scans_its_source_once() {
     ] {
         let sql = npl(query);
         assert!(
-            !sql.contains("groupArrayIf(__nano_k") && !sql.contains("__nano_stats") && !sql.contains("__nano_med"),
+            !sql.contains("groupArray(__nano_k)") && !sql.contains("__nano_stats") && !sql.contains("__nano_med"),
             "`{query}` must not compute anomaly constants from a second scan; got:\n{sql}"
         );
         assert!(
@@ -1627,12 +1607,12 @@ fn subsearch_eventstats_follows_the_same_stability_rule() {
     // the subsearch LIMIT, which is applied to the finished body).
     let stable = npl("* | join user [search error | eventstats avg(bytes_out) by user]");
     assert!(
-        stable.contains("groupArrayIf(__nano_k") && !stable.contains("OVER (PARTITION BY"),
+        stable.contains("groupArray(__nano_k)") && !stable.contains("OVER (PARTITION BY"),
         "eventstats over a stable subsearch body must keep the map attach; got:\n{stable}"
     );
     let unstable = npl("* | join user [search error | head 100 | eventstats avg(bytes_out) by user]");
     assert!(
-        !unstable.contains("groupArrayIf(__nano_k") && unstable.contains("OVER (PARTITION BY"),
+        !unstable.contains("groupArray(__nano_k)") && unstable.contains("OVER (PARTITION BY"),
         "eventstats after a head INSIDE a subsearch must not double-scan it; got:\n{unstable}"
     );
 }
@@ -1640,7 +1620,7 @@ fn subsearch_eventstats_follows_the_same_stability_rule() {
 #[test]
 fn anomaly_after_stable_stages_keeps_bounded_map_attach() {
     for (query, expected) in [
-        ("* | anomaly bytes_out by dest_ip", "groupArrayIf(__nano_k"),
+        ("* | anomaly bytes_out by dest_ip", "groupArray(__nano_k)"),
         ("* | where bytes_out > 0 | anomaly bytes_out by dest_ip method=mad", "__nano_med"),
         ("* | where bytes_out > 0 | anomaly process_name by user", "__nano_cnt"),
         ("* | where bytes_out > 0 | anomaly count() by user", "__nano_stats"),

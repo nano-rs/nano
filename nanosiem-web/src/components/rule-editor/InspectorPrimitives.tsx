@@ -2,7 +2,7 @@
 
 // NAN-3023 — shared building blocks for the rule editor's right-side
 // Inspector (pivt / Cases / Versions). One visual vocabulary across the three
-// tabs, from the "Rules pivt Panel" design handoff, mapped onto the app's
+// tabs, from the "Rules Pivt Panel" design handoff, mapped onto the app's
 // type scale: 11.5–12px body, 10.5px mono meta, 24–28px controls, single 1px
 // borders, no icons in section headings.
 

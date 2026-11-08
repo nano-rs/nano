@@ -21,16 +21,10 @@ struct FieldDef {
     data_type: String,
 }
 
-#[path = "src/parsers/vrl_functions.rs"]
-mod vrl_functions;
-
 fn main() {
-    generate_vrl_catalog();
-    println!("cargo:rerun-if-env-changed=WORKER_REVISION");
+    enforce_content_acceptance_composition();
     println!("cargo:rerun-if-changed=docs/udmfields.csv");
-    // sqlx::migrate! embeds migrations at compile time. Watch the directories
-    // so a new SQL file invalidates cached test binaries on a warm CI runner.
-    println!("cargo:rerun-if-changed=../migrations/postgres");
+    track_embedded_migrations();
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("generated_fields.rs");
@@ -50,56 +44,50 @@ fn main() {
 
     // Air-gap bundle signing public-key injection (NAN-1210).
     generate_airgap_pubkey(&out_dir);
-
-    // NAN-3767: the Vector config renderer's code identity.
-    generate_vector_renderer_source_hash();
 }
 
-/// Source trees whose code decides the rendered Vector configuration.
-const VECTOR_RENDERER_SOURCES: [&str; 2] = ["src/parsers/vector_config", "src/source_configs"];
+/// `sqlx::migrate!` embeds the directory at compile time, but Cargo only
+/// notices newly-added files when the owning crate tells it to watch that
+/// directory. This build script already emits a narrow rerun directive for
+/// the UDM CSV, which disables Cargo's default whole-package tracking.
+fn track_embedded_migrations() {
+    println!("cargo:rerun-if-changed=../migrations/postgres");
+    // Integration tests in this crate embed the private overlay. The path is
+    // absent from the stripped open-core mirror, where those tests are also
+    // removed, so do not create a permanently-dirty missing-path watch there.
+    if Path::new("../migrations/postgres-enterprise").is_dir() {
+        println!("cargo:rerun-if-changed=../migrations/postgres-enterprise");
+    }
+}
 
-/// NAN-3767: a content hash of the Vector config renderer's own source,
-/// exported as `NANO_VECTOR_RENDERER_SOURCE_HASH` and folded into the
-/// publication's renderer fingerprint. Since NAN-3511 the crate version is
-/// frozen at 1.x, so without it an upgrade whose renderer emits different
-/// TOML for the same database revision kept serving the generation the old
-/// binary rendered (a new identity lane never reached Vector until someone
-/// redeployed a source). FNV-1a 64 over sorted relative paths and bytes:
-/// deterministic across hosts and toolchains.
-fn generate_vector_renderer_source_hash() {
-    fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect(&path, out);
-            } else {
-                out.push(path);
-            }
-        }
+/// The public acceptance root is deliberately not a Cargo feature: routine
+/// `--all-features` release builds must never add it to the active trust ring.
+/// Acceptance is an explicitly non-shippable debug composition selected with
+/// `--cfg nano_content_acceptance` plus the opt-in environment marker below.
+fn enforce_content_acceptance_composition() {
+    const CFG: &str = "nano_content_acceptance";
+    const OPT_IN: &str = "NANO_NON_RELEASE_BUILD";
+
+    println!("cargo:rustc-check-cfg=cfg({CFG})");
+    println!("cargo:rerun-if-env-changed={OPT_IN}");
+    println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+
+    let flags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    let parts: Vec<&str> = flags.split('\u{1f}').collect();
+    let requested = parts.iter().any(|part| {
+        *part == CFG
+            || *part == "--cfg=nano_content_acceptance"
+            || *part == "cfg=nano_content_acceptance"
+    });
+    if !requested {
+        return;
     }
-    let mut files = Vec::new();
-    for root in VECTOR_RENDERER_SOURCES {
-        println!("cargo:rerun-if-changed={root}");
-        collect(Path::new(root), &mut files);
+    if env::var("PROFILE").as_deref() == Ok("release") {
+        panic!("{CFG} is a test-only trust composition and is forbidden in release builds");
     }
-    files.sort();
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut feed = |bytes: &[u8]| {
-        for b in bytes {
-            hash ^= u64::from(*b);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    };
-    for file in &files {
-        feed(file.to_string_lossy().replace('\\', "/").as_bytes());
-        feed(&[0]);
-        feed(&std::fs::read(file).unwrap_or_default());
-        feed(&[0]);
+    if env::var(OPT_IN).as_deref() != Ok("1") {
+        panic!("{CFG} requires explicit {OPT_IN}=1");
     }
-    println!("cargo:rustc-env=NANO_VECTOR_RENDERER_SOURCE_HASH={hash:016x}");
 }
 
 /// Env var carrying the 64-char hex encoding of the 32-byte production air-gap
@@ -131,7 +119,7 @@ const AIRGAP_PUBKEY_ENV: &str = "AIRGAP_BUNDLE_PUBLIC_KEY_HEX";
 ///   AIRGAP_BUNDLE_PUBLIC_KEY_HEX=<64 hex chars> cargo build --release --features enterprise
 /// ```
 ///
-/// The matching PRIVATE signing seed lives ONLY in the offline platform signer
+/// The matching PRIVATE signing seed lives ONLY in the offline nano-main signer
 /// / key-store and is never present in this repo or any build environment.
 fn generate_airgap_pubkey(out_dir: &str) {
     // Re-run only when the injection variable changes (not on every build).
@@ -551,23 +539,4 @@ fn generate_code(fields: &[FieldDef]) -> String {
     code.push_str("}\n");
 
     code
-}
-
-/// Build the prompt reference from the exact stdlib used by the compiler.
-fn generate_vrl_catalog() {
-    println!("cargo:rerun-if-changed=src/parsers/vrl_functions.rs");
-    let mut entries = vrl_functions::safe_vrl_functions().into_iter().map(|f| {
-        let args = f.parameters().iter().map(|p| {
-            format!("{}{}:{}", p.keyword, if p.required { "" } else { "?" }, p.kind())
-        }).collect::<Vec<_>>().join(",");
-        let closure = f.closure().and_then(|definition| definition.inputs.first().map(|input| {
-            let variables = (1..=input.variables.len()).map(|n| format!("arg{n}")).collect::<Vec<_>>().join(",");
-            format!(" -> |{variables}| {{ ... }}")
-        })).unwrap_or_default();
-        let result = vrl::compiler::Parameter::required("result", f.return_kind(), "").kind();
-        format!("{}({}){} : {}", f.identifier(), args, closure, result)
-    }).collect::<Vec<_>>();
-    entries.sort();
-    std::fs::write(Path::new(&env::var("OUT_DIR").unwrap()).join("vrl-functions.txt"), entries.join("\n"))
-        .expect("write pinned VRL function catalog");
 }

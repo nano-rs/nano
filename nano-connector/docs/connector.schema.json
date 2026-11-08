@@ -377,88 +377,6 @@
         },
         {
           "additionalProperties": false,
-          "description": "Keyless Google domain-wide delegation: the platform pull broker signs the assertion for the tenant's own service account (hosted only), cached, refreshed on 401",
-          "properties": {
-            "scope": {
-              "description": "The OAuth scope(s) requested, space-separated (the broker allowlists\neach).",
-              "type": "string"
-            },
-            "subject": {
-              "description": "The admin user to impersonate; a template such as `{{config.ADMIN_EMAIL}}`.",
-              "type": "string"
-            },
-            "token_url": {
-              "description": "Google's token endpoint (`https://oauth2.googleapis.com/token`); must\nbe in the spec allowlist.",
-              "type": "string"
-            },
-            "type": {
-              "const": "google_dwd_broker"
-            }
-          },
-          "required": [
-            "token_url",
-            "scope",
-            "subject",
-            "type"
-          ],
-          "title": "GoogleDwdBrokerParams",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "Keyless Microsoft Entra (Graph): the platform pull broker mints a Graph access token for the tenant's app registration with nano's federated identity credential (hosted only), cached, refreshed on 401",
-          "properties": {
-            "client_id": {
-              "description": "The tenant's app registration (client) id that trusts nano's\nfederated credential, a GUID; a template such as `{{config.CLIENT_ID}}`.",
-              "type": "string"
-            },
-            "directory_id": {
-              "description": "The tenant's Entra directory (tenant) id, a GUID; a template such as\n`{{config.DIRECTORY_ID}}`.",
-              "type": "string"
-            },
-            "type": {
-              "const": "entra_fic_broker"
-            }
-          },
-          "required": [
-            "directory_id",
-            "client_id",
-            "type"
-          ],
-          "title": "EntraFicBrokerParams",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "Keyless Okta (API Services app, private_key_jwt): the platform pull broker signs the client assertion with the tenant's broker-held key; the runner trades it for an access token (hosted only), cached, refreshed on 401",
-          "properties": {
-            "client_id": {
-              "description": "The API Services app's client id; a template such as `{{config.CLIENT_ID}}`.",
-              "type": "string"
-            },
-            "okta_domain": {
-              "description": "The Okta org host (`acme.okta.com`); a template such as\n`{{config.OKTA_DOMAIN}}`. The token endpoint is\n`https://<okta_domain>/oauth2/v1/token` and must be in the allowlist.",
-              "type": "string"
-            },
-            "scope": {
-              "description": "Okta scopes, space-separated (`okta.users.read okta.groups.read`).",
-              "type": "string"
-            },
-            "type": {
-              "const": "okta_broker_jwt"
-            }
-          },
-          "required": [
-            "okta_domain",
-            "client_id",
-            "scope",
-            "type"
-          ],
-          "title": "OktaBrokerJwtParams",
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
           "description": "Credential POST login; cached token or origin-scoped cookie, refreshed once on 401",
           "properties": {
             "credential_fields": {
@@ -945,7 +863,7 @@
     },
     "IdentityConfig": {
       "additionalProperties": false,
-      "description": "`kind: identity` settings (NAN-3503).",
+      "description": "`kind: identity` settings (NAN-3503, ported to ClickHouse dev in G22).",
       "properties": {
         "full_every_secs": {
           "default": 86400,
@@ -962,7 +880,7 @@
       "oneOf": [
         {
           "const": "full",
-          "description": "Every run is a complete snapshot that replaces the feed.",
+          "description": "Every run is a complete snapshot that replaces the feed's users.",
           "type": "string"
         },
         {
@@ -982,7 +900,7 @@
         },
         {
           "const": "memberships",
-          "description": "`{member, group, privileged?}` pairs, aggregated by the engine into\none row per member on the `<feed>:groups` sub-feed. Always full.",
+          "description": "`{member, group, privileged?}` pairs, aggregated by the engine into\neach member's `groups`. Always full.",
           "type": "string"
         }
       ]
@@ -1022,7 +940,7 @@
         },
         {
           "const": "identity",
-          "description": "Directory sync (users, group memberships) into the tenant's identity\ndirectory through its enrichment coordinator. No ingest, no parser.",
+          "description": "Directory sync (users, group memberships) into the user directory\n(`user_registry`). No ingest, no parser.",
           "type": "string"
         }
       ]

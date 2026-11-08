@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, HashMap};
 // response — serde/utoipa derives are not required.
 // ============================================================================
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[derive(Debug, Default, Clone)]
 pub struct CloudDossierFacetFilters {
     pub services: Vec<String>,
     pub regions: Vec<String>,
@@ -91,6 +91,9 @@ fn build_facet_clause(
             for v in values {
                 binds.push(v.to_lowercase());
             }
+        } else if column.contains("resources.") {
+            // OCSF `resources.type` is Array(String): match any element.
+            clauses.push(format!("hasAny({column}, [{placeholders}])"));
         } else {
             clauses.push(format!("{column} IN ({placeholders})"));
             for v in values {
@@ -117,9 +120,6 @@ fn build_facet_clause(
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CloudDossier {
-    /// Only the newest bounded event page; aggregate fields are not window totals.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub bounded_preview: bool,
     pub identity: CloudDossierIdentity,
     pub risk: CloudDossierRisk,
     pub facets: CloudDossierFacets,
@@ -132,10 +132,6 @@ pub struct CloudDossier {
     pub error_rate: CloudDossierErrorRate,
     pub stream: Vec<CloudDossierStreamEvent>,
     pub window_label: String,
-    /// Present when the exact dossier exceeded the interactive resource
-    /// envelope and was admitted to the isolated durable query lane.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub durable_job: Option<crate::search::AsyncSearchResponse>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
@@ -537,25 +533,6 @@ impl SearchService {
         time_range: &TimeRange,
         scope: &ScopeSet,
     ) -> Result<CloudDossier, SearchError> {
-        let Some(retention_time_range) =
-            self.retention_bound_query_range(time_range, chrono::Utc::now())?
-        else {
-            return Ok(CloudDossier::default());
-        };
-        let time_range = &retention_time_range;
-
-        if self.backend() == crate::search::config::SearchBackend::Lake {
-            return self
-                .query_lake_cloud_dossier(
-                    principal,
-                    account_filter,
-                    provider_filter,
-                    facet_filters,
-                    time_range,
-                    scope,
-                )
-                .await;
-        }
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return Ok(CloudDossier::default()),
@@ -588,9 +565,9 @@ impl SearchService {
         let cloud_region_opt = profile.udm_column_sql("cloud_region");
         let cloud_provider_opt = profile.udm_column_sql("cloud_provider");
         let cloud_account_id_opt = profile.udm_column_sql("cloud_account_id");
-        let resource_type_opt = profile.udm_column_sql("resource_type");
-        let resource_id_opt = profile.udm_column_sql("resource_id");
-        let resource_name_opt = profile.udm_column_sql("resource_name");
+        let resource_type_opt = profile.udm_column_sql("resource_type").map(super::cloud_overview::scalar_resource_column);
+        let resource_id_opt = profile.udm_column_sql("resource_id").map(super::cloud_overview::scalar_resource_column);
+        let resource_name_opt = profile.udm_column_sql("resource_name").map(super::cloud_overview::scalar_resource_column);
         let change_type_opt = profile.udm_column_sql("change_type");
         let mfa_used_opt = profile.udm_column_sql("mfa_used");
 
@@ -647,8 +624,10 @@ impl SearchService {
         // (byte-identical projection), OCSF emits a transform() back to the UDM
         // label. The value-literal predicates that COMPARE change_type are built
         // separately below.
-        let change_type_select =
-            format!("{} AS change_type", Self::change_type_label_expr(profile));
+        let change_type_select = format!(
+            "{} AS change_type",
+            Self::change_type_label_expr(profile)
+        );
 
         // Value-literal predicate `change_type = 'permission_change'` is built
         // inline in the key-actions and posture predicates below, gated to the
@@ -735,7 +714,8 @@ impl SearchService {
         // Every query binds: start, end, principal, [provider], [account]
         // in that order. Identity clause matches either exact `user` or the
         // trailing component of a `role/session` compound user string.
-        let identity_match = format!("({user_col} = ? OR splitByChar('/', {user_col})[1] = ?)");
+        let identity_match =
+            format!("({user_col} = ? OR splitByChar('/', {user_col})[1] = ?)");
         let identity_match = identity_match.as_str();
 
         // --- 1. Identity query ---------------------------------------------
@@ -904,6 +884,24 @@ impl SearchService {
                 } else {
                     col.to_string()
                 };
+                // NAN-4928 review P2: resource types count per resource
+                // element on OCSF's array column.
+                if *dim == "resource_type" {
+                    if let Some(raw) = profile
+                        .udm_column_sql("resource_type")
+                        .filter(|raw| raw.contains("resources."))
+                    {
+                        return Some(format!(
+                            r#"(
+                SELECT '{dim}' AS dim, __rt AS value, count() AS cnt FROM {logs_table} ARRAY JOIN {raw} AS __rt
+                PREWHERE timestamp BETWEEN ? AND ? AND {identity_match}
+                  {provider_clause}{facet_clause} {account_clause}{scope_and}
+                WHERE __rt != ''
+                GROUP BY value ORDER BY cnt DESC LIMIT {limit}
+            )"#
+                        ));
+                    }
+                }
                 Some(format!(
                     r#"(
                 SELECT '{dim}' AS dim, {value_expr} AS value, count() AS cnt FROM {logs_table}
@@ -915,7 +913,10 @@ impl SearchService {
             })
             .collect();
         let facet_dim_count = facet_dim_blocks.len();
-        let facets_sql = format!("SELECT * FROM {}", facet_dim_blocks.join(" UNION ALL "));
+        let facets_sql = format!(
+            "SELECT * FROM {}",
+            facet_dim_blocks.join(" UNION ALL ")
+        );
 
         // --- 5. AssumeRole chain --------------------------------------------
         // Rows where the principal is the one CALLING AssumeRole. We return
@@ -1098,6 +1099,21 @@ impl SearchService {
         // name columns the schema maps; the existence predicate narrows on the
         // same set. For UDM both map, so this is byte-identical to the original
         // coalesce(nullIf(resource_id,''), resource_name).
+        // NAN-4928 review P2: top resources count per resource element. On
+        // OCSF the (uid, name, type) tuples are ARRAY JOINed, so a
+        // multi-resource event counts once per resource with its own type,
+        // never as a synthetic joined resource. UDM is byte-identical.
+        let resource_tuple = super::cloud_overview::resource_rows(profile);
+        let res_joined = !resource_tuple.array_join.is_empty();
+        let (resource_id_opt, resource_name_opt, resource_type_opt) = if res_joined {
+            (
+                Some(resource_tuple.id.clone()),
+                Some(resource_tuple.name.clone()),
+                Some(resource_tuple.ty.clone()),
+            )
+        } else {
+            (resource_id_opt.clone(), resource_name_opt.clone(), resource_type_opt.clone())
+        };
         let res_arn = match (&resource_id_opt, &resource_name_opt) {
             (Some(id), Some(name)) => format!("coalesce(nullIf({id}, ''), {name})"),
             (Some(id), None) => format!("nullIf({id}, '')"),
@@ -1112,11 +1128,20 @@ impl SearchService {
             Some(c) => format!("any({c}) AS account"),
             None => "'' AS account".to_string(),
         };
-        let res_exists_clause = match (&resource_id_opt, &resource_name_opt) {
-            (Some(id), Some(name)) => format!("AND ({id} != '' OR {name} != '')\n              "),
-            (Some(id), None) => format!("AND {id} != ''\n              "),
-            (None, Some(name)) => format!("AND {name} != ''\n              "),
+        let res_exists = match (&resource_id_opt, &resource_name_opt) {
+            (Some(id), Some(name)) => format!("({id} != '' OR {name} != '')"),
+            (Some(id), None) => format!("{id} != ''"),
+            (None, Some(name)) => format!("{name} != ''"),
             (None, None) => String::new(),
+        };
+        // ARRAY JOIN columns cannot be read in PREWHERE: the joined form
+        // filters in WHERE, the scalar form keeps its PREWHERE term.
+        let (res_exists_clause, res_where, res_join) = if res_joined {
+            (String::new(), format!("\n            WHERE {res_exists}"), resource_tuple.array_join.clone())
+        } else if res_exists.is_empty() {
+            (String::new(), String::new(), String::new())
+        } else {
+            (format!("AND {res_exists}\n              "), String::new(), String::new())
         };
         // `touched` collects distinct action names (→ `activity` on OCSF);
         // project an empty array when the schema lacks an action column.
@@ -1132,11 +1157,11 @@ impl SearchService {
                 count() AS changes,
                 toString(max(timestamp)) AS last_at,
                 {res_touched}
-            FROM {logs_table}
+            FROM {logs_table}{res_join}
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
               {res_exists_clause}{provider_clause}{facet_clause}
-              {account_clause}{scope_and}
+              {account_clause}{scope_and}{res_where}
             GROUP BY arn
             ORDER BY changes DESC
             LIMIT {TOP_RESOURCES_LIMIT}"#,
@@ -1298,8 +1323,7 @@ impl SearchService {
             for _ in 0..facet_dim_count {
                 q = q.bind(start_str.clone()).bind(end_str.clone());
                 q = q.bind(principal_bind.clone()).bind(principal_bind.clone());
-                if let (true, Some(p)) = (bind_provider, provider_filter.filter(|p| !p.is_empty()))
-                {
+                if let (true, Some(p)) = (bind_provider, provider_filter.filter(|p| !p.is_empty())) {
                     q = q.bind(p.to_string());
                 }
                 for v in &facet_binds {
@@ -1322,31 +1346,19 @@ impl SearchService {
             )
         };
 
-        let identity_fut = fetch_rows(
-            bind_principal_query(&identity_sql),
-            "cloud_dossier.identity",
-        );
+        let identity_fut = fetch_rows(bind_principal_query(&identity_sql), "cloud_dossier.identity");
         let ua_fut = fetch_rows(bind_principal_query(&ua_sql), "cloud_dossier.user_agents");
         let ip_fut = fetch_rows(bind_principal_query(&ip_sql), "cloud_dossier.ips");
         let facets_fut = fetch_rows(bind_facets_query(), "cloud_dossier.facets");
         let chain_fut = fetch_rows(bind_principal_query(&chain_sql), "cloud_dossier.chain");
-        let key_actions_fut = fetch_rows(
-            bind_principal_query(&key_actions_sql),
-            "cloud_dossier.key_actions",
-        );
-        let timeline_fut = fetch_rows(
-            bind_principal_query(&timeline_sql),
-            "cloud_dossier.timeline",
-        );
+        let key_actions_fut =
+            fetch_rows(bind_principal_query(&key_actions_sql), "cloud_dossier.key_actions");
+        let timeline_fut = fetch_rows(bind_principal_query(&timeline_sql), "cloud_dossier.timeline");
         let actions_fut = fetch_rows(bind_principal_query(&actions_sql), "cloud_dossier.actions");
-        let resources_fut = fetch_rows(
-            bind_principal_query(&resources_sql),
-            "cloud_dossier.resources",
-        );
-        let error_rate_fut = fetch_rows(
-            bind_principal_query(&error_rate_sql),
-            "cloud_dossier.error_rate",
-        );
+        let resources_fut =
+            fetch_rows(bind_principal_query(&resources_sql), "cloud_dossier.resources");
+        let error_rate_fut =
+            fetch_rows(bind_principal_query(&error_rate_sql), "cloud_dossier.error_rate");
         let error_codes_fut = fetch_rows(
             bind_principal_query(&error_codes_sql),
             "cloud_dossier.error_codes",
@@ -1446,7 +1458,6 @@ impl SearchService {
         let stream = build_stream(&stream_rows);
 
         Ok(CloudDossier {
-            bounded_preview: false,
             identity,
             risk,
             facets,
@@ -1459,7 +1470,6 @@ impl SearchService {
             error_rate,
             stream,
             window_label: window_label(time_range),
-            durable_job: None,
         })
     }
 }
@@ -1615,8 +1625,8 @@ fn build_identity(
         })
         .collect();
 
-    let is_role =
-        principal.to_ascii_lowercase().contains("role") || principal.starts_with("arn:aws:sts::");
+    let is_role = principal.to_ascii_lowercase().contains("role")
+        || principal.starts_with("arn:aws:sts::");
 
     // MFA tri-state: None for roles (N/A), Some(true) if we've ever seen an
     // MFA-yes call, Some(false) otherwise.
@@ -1644,11 +1654,7 @@ fn build_identity(
 
     CloudDossierIdentity {
         id: principal.to_string(),
-        principal_type: if is_role {
-            "role".into()
-        } else {
-            "iam_user".into()
-        },
+        principal_type: if is_role { "role".into() } else { "iam_user".into() },
         arn: None, // ARN backfill is a follow-up — would require parsing message / user_identity JSON
         account: account.clone(),
         account_name: None,
@@ -1788,7 +1794,10 @@ fn build_assume_chain(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let at_raw = row.get("at").and_then(|v| v.as_str()).unwrap_or("");
+            let at_raw = row
+                .get("at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let severity = classify_action_severity(&action);
             Some(CloudDossierKeyAction {
                 at: format_hhmm(at_raw),
@@ -1933,18 +1942,17 @@ fn build_timeline(
         .take(4)
         .filter_map(|row| {
             let at = row.get("at").and_then(|v| v.as_str()).unwrap_or("");
-            let ts =
-                chrono::DateTime::parse_from_str(&format!("{at} +0000"), "%Y-%m-%d %H:%M:%S%.f %z")
+            let ts = chrono::DateTime::parse_from_str(
+                &format!("{at} +0000"),
+                "%Y-%m-%d %H:%M:%S%.f %z",
+            )
+            .ok()
+            .map(|dt| dt.timestamp() as u64)
+            .or_else(|| {
+                chrono::DateTime::parse_from_str(&format!("{at} +0000"), "%Y-%m-%d %H:%M:%S %z")
                     .ok()
                     .map(|dt| dt.timestamp() as u64)
-                    .or_else(|| {
-                        chrono::DateTime::parse_from_str(
-                            &format!("{at} +0000"),
-                            "%Y-%m-%d %H:%M:%S %z",
-                        )
-                        .ok()
-                        .map(|dt| dt.timestamp() as u64)
-                    })?;
+            })?;
             let bucket = if ts > unix_start {
                 ((ts - unix_start) / bucket_secs) as u32
             } else {
@@ -2099,7 +2107,8 @@ fn build_auth_posture(rows: &[serde_json::Value], principal: &str) -> CloudDossi
                 .get("is_role")
                 .and_then(|v| v.as_bool())
                 .unwrap_or_else(|| {
-                    name.to_ascii_lowercase().contains("role") || name.starts_with("arn:aws:sts::")
+                    name.to_ascii_lowercase().contains("role")
+                        || name.starts_with("arn:aws:sts::")
                 });
             let mfa = if is_role {
                 None
@@ -2115,7 +2124,10 @@ fn build_auth_posture(rows: &[serde_json::Value], principal: &str) -> CloudDossi
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty() && !s.starts_with("1970"))
                 .map(|s| format_hhmm(s));
-            let priv_calls = row.get("priv_calls").and_then(|v| v.as_u64()).unwrap_or(0);
+            let priv_calls = row
+                .get("priv_calls")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             let anomaly = name == principal;
             Some(CloudDossierPosturePrincipal {
                 name,
@@ -2131,8 +2143,14 @@ fn build_auth_posture(rows: &[serde_json::Value], principal: &str) -> CloudDossi
         .collect();
 
     let total = principals.len() as u64;
-    let with_mfa = principals.iter().filter(|p| p.mfa == Some(true)).count() as u64;
-    let without_mfa = principals.iter().filter(|p| p.mfa == Some(false)).count() as u64;
+    let with_mfa = principals
+        .iter()
+        .filter(|p| p.mfa == Some(true))
+        .count() as u64;
+    let without_mfa = principals
+        .iter()
+        .filter(|p| p.mfa == Some(false))
+        .count() as u64;
     let privileged_without_mfa = principals
         .iter()
         .filter(|p| p.privileged && p.mfa == Some(false))

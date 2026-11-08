@@ -41,7 +41,9 @@ use super::repository::{
 
 /// Allowed repository sources (owner/repo format, lowercase for comparison)
 /// Only these repositories can be added - prevents arbitrary external code sync
-pub(crate) const ALLOWED_REPOSITORIES: &[&str] = &["nano-rs/rules", "sigmahq/sigma"];
+const ALLOWED_REPOSITORIES: &[&str] = &["nano-rs/rules"];
+/// Synthetic repository signed air-gap rule bundles are applied to.
+const AIRGAP_RULES_URL: &str = "airgap://rules";
 
 /// Configuration for the rule repository service
 #[derive(Debug, Clone)]
@@ -74,9 +76,6 @@ pub struct RuleRepositoryService {
     imports_repository: RuleImportsRepository,
     github_client: GitHubClient,
     coverage_analyzer: Arc<RwLock<CoverageAnalyzer>>,
-    /// NAN-2361: needed only under the lake backend, where the coverage
-    /// inventory is read through search instead of a ClickHouse table scan.
-    search_service: Option<Arc<crate::search::SearchService>>,
     detection_service: Option<Arc<DetectionService>>,
     config: RuleRepositoryServiceConfig,
     pg_pool: PgPool,
@@ -94,7 +93,6 @@ impl RuleRepositoryService {
             imports_repository: RuleImportsRepository::new(pg_pool.clone()),
             github_client: GitHubClient::new(),
             coverage_analyzer: Arc::new(RwLock::new(CoverageAnalyzer::new(dual_pool.clone()))),
-            search_service: None,
             detection_service: None,
             config: RuleRepositoryServiceConfig::default(),
             pg_pool,
@@ -102,26 +100,9 @@ impl RuleRepositoryService {
         }
     }
 
-    /// Supply the search service the coverage analyzer needs under the lake
-    /// backend, where there is no ClickHouse logs table to scan (NAN-2361).
-    /// Ignored on ClickHouse deployments.
-    pub fn with_search_service(
-        mut self,
-        search_service: Arc<crate::search::SearchService>,
-    ) -> Self {
-        self.search_service = Some(search_service);
-        self
-    }
-
     /// Set the detection service for importing rules
     pub fn with_detection_service(mut self, detection_service: Arc<DetectionService>) -> Self {
         self.detection_service = Some(detection_service);
-        self
-    }
-
-    /// Use a specific GitHub client (local fixtures in tests).
-    pub fn with_github_client(mut self, github_client: GitHubClient) -> Self {
-        self.github_client = github_client;
         self
     }
 

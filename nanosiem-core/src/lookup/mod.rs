@@ -9,7 +9,9 @@
 
 pub mod backfill;
 pub mod clickhouse_repository;
+pub mod generation_cleanup;
 pub mod postgres_repository;
+pub mod references;
 pub mod repository;
 pub mod sanitize;
 pub mod service;
@@ -20,6 +22,7 @@ pub use backfill::{
     backfill_pg_to_clickhouse, is_backfill_in_progress, BackfillReport, TableBackfillResult,
 };
 pub use clickhouse_repository::ClickHouseLookupRepository;
+pub use generation_cleanup::{LookupCleanupReport, LookupGenerationReconciler};
 pub use postgres_repository::PostgresLookupRepository;
 pub use repository::{
     LookupRepository, LookupRepositoryError, LookupStorageBackend, LookupStore, RuleReferenceRow,
@@ -29,5 +32,5 @@ pub use service::{LookupError, LookupService};
 pub use types::{
     BatchLookupQuery, BatchLookupResult, ColumnTypeOverride, LookupColumn, LookupHistoryEntry,
     LookupHistoryKind, LookupQuery, LookupResult, LookupRowsPage, LookupTable, LookupTableCreator,
-    LookupUsage, NewLookupTable, LOOKUP_TABLE_PREFIX, MAX_BATCH_LOOKUP_KEYS, MAX_LOOKUP_TABLE_ROWS,
+    LookupUsage, NewLookupTable, LOOKUP_TABLE_PREFIX, MAX_LOOKUP_TABLE_ROWS,
 };

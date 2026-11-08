@@ -10,9 +10,8 @@
  *
  * Row shape (FE-normalised onto `.fields`):
  *   { entity, entity_type, dimension, value, count, first_seen, coverage,
- *     baseline_unknown, incomplete }  — plus, when nothing is new, a single
- *   summary row { entity, entity_type, coverage, count:0, note, incomplete }.
- *   Rows arrive newest first sighting first; the order is kept.
+ *     baseline_unknown }  — plus, when nothing is new, a single summary row
+ *   { entity, entity_type, coverage, count:0, note }.
  *
  * Populated layout: header → finding band (what/how many/how much to trust it)
  * → per-dimension sections. Every value row is a drill-down into the search.
@@ -33,8 +32,8 @@ import {
   ArrowUpRight,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { parseTimestampAsUTC } from '@/lib/date-utils';
-import { baselineVerdict, type BaselineVerdict } from './baseline-verdict';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import type { SemanticField } from '@/lib/schema-fields';
 
 interface SearchResult {
   id: string;
@@ -67,40 +66,40 @@ const num = (v: unknown): number => {
  */
 const DIM_META: Record<
   string,
-  { field: string; singular: string; icon: typeof Globe; desc: (subj: string) => string }
+  { key: SemanticField; singular: string; icon: typeof Globe; desc: (subj: string) => string }
 > = {
   processes: {
-    field: 'process_name',
+    key: 'processName',
     singular: 'process',
     icon: Terminal,
     desc: (s) => `programs ${s} ran for the first time`,
   },
   'destination IPs': {
-    field: 'dest_ip',
+    key: 'destIp',
     singular: 'destination IP',
     icon: Globe,
     desc: (s) => `addresses ${s} reached out to for the first time`,
   },
   'source IPs': {
-    field: 'src_ip',
+    key: 'srcIp',
     singular: 'source IP',
     icon: Network,
     desc: (s) => `addresses that connected to ${s} for the first time`,
   },
   users: {
-    field: 'user',
+    key: 'user',
     singular: 'user',
     icon: User,
     desc: (s) => `accounts active on ${s} for the first time`,
   },
   hosts: {
-    field: 'src_host',
+    key: 'srcHost',
     singular: 'host',
     icon: Server,
     desc: (s) => `hosts ${s} appeared on for the first time`,
   },
   ports: {
-    field: 'dest_port',
+    key: 'destPort',
     singular: 'port',
     icon: Plug,
     desc: (s) => `destination ports ${s} used for the first time`,
@@ -143,52 +142,22 @@ const BAND_LABEL: Record<string, string> = {
   no_history: 'no prior history',
 };
 
-const CAVEAT = {
-  cls: 'text-amber-600 dark:text-amber-400 border-amber-500/40 bg-amber-500/10',
-  dot: 'bg-amber-500',
-  text: 'text-amber-600 dark:text-amber-400',
-};
-
-/** Pill label, band label, hover hint and band body for each verdict. */
-const VERDICT: Record<
-  BaselineVerdict,
-  { label: string; band: string; cls: string; dot: string; text: string; hint: string; body: string }
-> = {
-  sufficient: { ...COVERAGE.sufficient, band: BAND_LABEL.sufficient },
-  thin: { ...COVERAGE.thin, band: BAND_LABEL.thin },
-  no_history: { ...COVERAGE.no_history, band: BAND_LABEL.no_history },
-  unknown: {
-    ...CAVEAT,
-    label: 'baseline unknown',
-    band: 'baseline unknown',
-    hint: 'The comparison filled entirely with new values, so a baseline could not be established.',
-    body: 'no prior value was visible to compare against — treat these as unconfirmed, not proven first sightings.',
-  },
-  incomplete: {
-    ...CAVEAT,
-    label: 'incomplete',
-    band: 'baseline incomplete',
-    hint: 'The search window held more distinct values than one baseline reads.',
-    body: 'every value listed was checked against recent history, but the search window held more distinct values than one baseline reads, so some first sightings may be missing — narrow the time range.',
-  },
-};
-
 const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-/** "Jul 11 15:13" (UTC — matches every sibling view). Tolerant of null/empty. */
+/** "Jul 11 15:13". Tolerant of null/empty. */
 function fmtSeen(iso: string): string {
   if (!iso) return '—';
-  const d = parseTimestampAsUTC(iso);
+  const d = new Date(iso);
   if (isNaN(d.getTime())) return '—';
-  const hh = String(d.getUTCHours()).padStart(2, '0');
-  const mm = String(d.getUTCMinutes()).padStart(2, '0');
-  return `${MON[d.getUTCMonth()]} ${d.getUTCDate()} ${hh}:${mm}`;
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${MON[d.getMonth()]} ${d.getDate()} ${hh}:${mm}`;
 }
 
 /** Relative age ("41m" / "3h" / "2d") for a first-seen timestamp; '' if unusable. */
 function fmtAge(iso: string): string {
   if (!iso) return '';
-  const d = parseTimestampAsUTC(iso);
+  const d = new Date(iso);
   if (isNaN(d.getTime())) return '';
   const ms = Date.now() - d.getTime();
   if (ms < 0) return '';
@@ -223,7 +192,8 @@ export function BaselineView({
   fieldsCount,
   onExpandFields,
 }: BaselineViewProps) {
-  const { entity, entityType, coverage, note, partialNote, groups, anyUnknown, anyIncomplete, total } = useMemo(() => {
+  const fieldMap = useSchemaFieldMap();
+  const { entity, entityType, coverage, note, groups, anyUnknown, total } = useMemo(() => {
     const first = results[0]?.fields ?? {};
     const entity = str(first.entity);
     const entityType = str(first.entity_type);
@@ -254,20 +224,11 @@ export function BaselineView({
     }
     const groups = order.map((dim) => ({ dim, rows: byDim.get(dim)! }));
     const anyUnknown = rows.some((r) => r.baselineUnknown);
-    // NAN-3256: a dimension whose window read hit its bound marks its rows
-    // (or a summary row) `incomplete`.
-    const anyIncomplete = results.some((r) => r.fields?.incomplete === true);
 
-    // NAN-3059: a partial baseline (some dimensions not evaluated within the
-    // interactive budget) carries a marker row with `partial` + `note`.
-    const partialRow = results.find((r) => r.fields?.partial === true && !str(r.fields?.dimension));
-    const partialNote = partialRow ? str(partialRow.fields.note) : '';
-
-    return { entity, entityType, coverage, note, partialNote, groups, anyUnknown, anyIncomplete, total: rows.length };
+    return { entity, entityType, coverage, note, groups, anyUnknown, total: rows.length };
   }, [results]);
 
-  const verdict = baselineVerdict(coverage, anyUnknown, anyIncomplete);
-  const cov = VERDICT[verdict];
+  const cov = COVERAGE[coverage] ?? COVERAGE.no_history;
   const isEmpty = groups.length === 0;
 
   const subj =
@@ -298,13 +259,13 @@ export function BaselineView({
         >
           {cov.label}
         </span>
-        {partialNote && (
+        {anyUnknown && (
           <span
             className="flex items-center gap-1 text-amber-600 dark:text-amber-400 normal-case tracking-normal"
-            title={partialNote}
+            title="The lookback filled entirely with new values, so a baseline could not be established — these are unconfirmed, not proven first-sightings."
           >
             <TriangleAlert className="w-[11px] h-[11px]" />
-            <span className="text-[10px]">partial</span>
+            <span className="text-[10px]">baseline unknown</span>
           </span>
         )}
         {fieldsCollapsed && onExpandFields && (
@@ -329,17 +290,13 @@ export function BaselineView({
           <div className="text-[13px] text-foreground">
             {coverage === 'no_history'
               ? 'No history to baseline against'
-              : coverage === 'unknown'
-                ? 'Baseline could not be completed'
-                : `Nothing new for ${entity || 'this entity'}`}
+              : `Nothing new for ${entity || 'this entity'}`}
           </div>
           <div className="text-[11px] max-w-md">
             {note ||
               (coverage === 'no_history'
                 ? 'This entity has no prior activity in the lookback window, so "new" cannot be judged.'
-                : coverage === 'unknown'
-                  ? 'The lookback history was not fully read, so what is new cannot be judged yet — rerun or narrow the window.'
-                  : 'Every value in this window was already seen for this entity in the lookback window.')}
+                : 'Every value in this window was already seen for this entity in the lookback window.')}
           </div>
         </div>
       ) : (
@@ -372,16 +329,21 @@ export function BaselineView({
                 </span>
               </div>
               <div className="flex items-center gap-1.5 text-[11px] leading-snug">
-                {verdict === 'unknown' || verdict === 'incomplete' ? (
-                  <TriangleAlert className="w-[11px] h-[11px] text-amber-500 shrink-0" aria-hidden />
-                ) : (
-                  <span className={cn('w-[6px] h-[6px] rounded-full shrink-0', cov.dot)} aria-hidden />
-                )}
+                <span className={cn('w-[6px] h-[6px] rounded-full shrink-0', cov.dot)} aria-hidden />
                 <span>
-                  <span className={cn('font-medium', cov.text)}>{cov.band}</span>
+                  <span className={cn('font-medium', cov.text)}>{BAND_LABEL[coverage] ?? cov.label}</span>
                   <span className="text-muted-foreground"> — {cov.body}</span>
                 </span>
               </div>
+              {anyUnknown && (
+                <div className="flex items-center gap-1.5 text-[11px] leading-snug">
+                  <TriangleAlert className="w-[11px] h-[11px] text-amber-500 shrink-0" />
+                  <span className="text-muted-foreground">
+                    <span className="font-medium text-amber-600 dark:text-amber-400">baseline incomplete</span>
+                    {' — the comparison cap filled entirely with new values, so some items may not be true first sightings.'}
+                  </span>
+                </div>
+              )}
             </div>
             {onAddToQuery && (
               <span className="hidden sm:flex items-center gap-1 shrink-0 font-mono text-[10px] text-muted-foreground/70 pt-px">
@@ -395,8 +357,10 @@ export function BaselineView({
           <div className="flex-1 min-h-0 overflow-y-auto">
             {groups.map((g) => {
               const meta = DIM_META[g.dim];
+              const metaField = meta ? fieldMap.field(meta.key) : '';
               const Icon = meta?.icon ?? Box;
-              const clickable = !!(meta && onAddToQuery);
+              // NAN-4903: value pivots need the resolved schema profile.
+              const clickable = !!(meta && onAddToQuery && fieldMap.ready);
               const maxCount = Math.max(1, ...g.rows.map((r) => r.count));
               const showBars = g.rows.length > 1 && maxCount > 1;
               return (
@@ -413,7 +377,7 @@ export function BaselineView({
                     <span className="flex-1" aria-hidden />
                     {meta && (
                       <span className="font-mono text-[10px] text-muted-foreground/60 shrink-0">
-                        {meta.field}
+                        {metaField}
                       </span>
                     )}
                   </div>
@@ -422,8 +386,8 @@ export function BaselineView({
                       key={`${g.dim}:${r.value}:${i}`}
                       type="button"
                       disabled={!clickable}
-                      onClick={() => clickable && onAddToQuery!(meta!.field, r.value, false)}
-                      title={clickable ? `Filter search to ${meta!.field}="${r.value}"` : undefined}
+                      onClick={() => clickable && onAddToQuery!(metaField, r.value, false)}
+                      title={clickable ? `Filter search to ${metaField}="${r.value}"` : undefined}
                       className={cn(
                         'group flex w-full items-center gap-3 px-3 h-[26px] text-[12px] text-left border-t border-border/50 first:border-t-0',
                         clickable ? 'cursor-pointer hover:bg-muted/40' : 'cursor-default',

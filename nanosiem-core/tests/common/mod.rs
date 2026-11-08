@@ -118,3 +118,30 @@ pub async fn migrated_pool() -> PgPool {
         .await;
     pool
 }
+
+/// A pool whose sessions declare `key` as their credential write key, like
+/// every api/jobs pool (NAN-4933 write fence). Secret writes through it are
+/// fenced on `key` (registered, not retired), and stay allowed once the fence
+/// is enforced for undeclared sessions.
+#[allow(dead_code)]
+pub async fn declared_pool(key: &str) -> PgPool {
+    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
+    assert_destructive_opt_in(&url);
+    nanosiem_core::crypto::rotation::declare_write_key(
+        sqlx::postgres::PgPoolOptions::new().max_connections(4),
+        key.to_owned(),
+    )
+    .connect(&url)
+    .await
+    .expect("connect declared pool")
+}
+
+/// Put the write fence back in rollout mode after a test that retired a key
+/// (retirement enforces it), so later suites' undeclared fixtures still write.
+#[allow(dead_code)]
+pub async fn reset_write_fence(pool: &PgPool) {
+    sqlx::query("UPDATE credential_write_fence_state SET enforce = FALSE, enforced_at = NULL, enforced_by = NULL")
+        .execute(pool)
+        .await
+        .ok();
+}

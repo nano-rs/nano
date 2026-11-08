@@ -110,7 +110,7 @@ const TRANSPORT_META: Record<RepoTransport, { Icon: typeof Database; label: stri
   pubsub: { Icon: Download, label: 'Pub/Sub' },
   syslog: { Icon: GitBranch, label: 'Syslog' },
   kafka: { Icon: Tally1, label: 'Kafka' },
-  splunk_hec: { Icon: Package, label: 'HEC' },
+  splunk_hec: { Icon: Package, label: 'Splunk HEC' },
 };
 
 export function TransportChip({ t }: { t: RepoTransport | null | undefined }) {

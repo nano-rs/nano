@@ -2,17 +2,16 @@
 
 import type {
   EnrichmentSource,
-  IpinfoConfig,
-  AutoSyncConfig,
   IpLookupResult,
   AgentEnrichmentProvider,
   ListAgentEnrichmentProvidersResponse,
   CreateAgentEnrichmentProviderRequest,
   UpdateAgentEnrichmentProviderRequest,
-  AsyncSyncResponse,
 } from './types';
+import { authenticatedFetch } from '../authenticated-fetch';
+import { getServiceUrl } from './utils';
 
-/** NAN-4759: freshness of one installed platform feed (GET /api/enrichment/platform-feeds). */
+/** NAN-4759 / NAN-4948: freshness of one installed platform feed (GET /api/enrichment/platform-feeds). */
 export type PlatformFeedState = 'fresh' | 'stale' | 'expired';
 export interface PlatformFeedStatus {
   feed_id: string;
@@ -24,136 +23,91 @@ export interface PlatformFeedStatus {
   state: PlatformFeedState;
   license_id: string | null;
   terms_revision: string | null;
+  /** Records the signed descriptor states for the feed. */
   records: number | null;
+  /** NAN-4948: the feed stamps new events from the bundle now. */
+  active?: boolean;
+  /** NAN-4948: rows loaded into ClickHouse. */
+  loaded?: number | null;
+  /** NAN-4948: why the feed is not active, when it is not. */
+  detail?: string | null;
 }
 export interface PlatformFeedsStatus {
-  /** This deployment keeps a local feed bundle (self-hosted lean). */
+  /** This deployment consumes the signed platform feed bundle. */
   available: boolean;
-  /** A real feed bundle (not the empty placeholder) is installed. */
+  /** A verified bundle is installed. */
   installed: boolean;
   bundle_sha256: string | null;
+  /** `online` or `offline`. */
   source: string | null;
   installed_at: string | null;
   stale_after_days: number;
   feeds: PlatformFeedStatus[];
+  /** Attribution shown with the data (IPinfo CC BY-SA 4.0). */
   notice: string | null;
+  /** NAN-4948 (additive): installed descriptor sequence. */
+  sequence?: number | null;
+  /** NAN-4948: `open`, `sovereign`, `mirror` or `file`. */
+  channel?: string | null;
+  /** NAN-4948: the scheduled online check runs (false in air-gap mode). */
+  auto_update?: boolean;
+  last_check_at?: string | null;
+  /** NAN-4948: `installed`, `current`, `checking`, `busy`, `refused` or `failed`. */
+  last_check_status?: string | null;
+  /** NAN-4948: why the latest check did not install (the installed bundle is kept). */
+  last_error?: string | null;
+  last_error_at?: string | null;
+  /** NAN-4959: when the scheduled online check is next due (null in air-gap or before the first check). */
+  next_check_at?: string | null;
+}
+/** NAN-4948: result of a platform feed import. */
+export interface PlatformFeedInstallResponse {
+  result: { outcome: 'installed'; sequence: number; loaded: Record<string, number> } | { outcome: 'current'; sequence: number };
+  status: PlatformFeedsStatus;
 }
 
-/** Result of starting an async sync operation */
-export interface SyncStartResult {
-  /** Whether this was a new sync (202) or already in progress (409) */
-  started: boolean;
-  /** Response from the server */
-  response: AsyncSyncResponse;
+/**
+ * NAN-4948: import nano's signed platform feed bundle (`.nanfeed`), for
+ * air-gapped installs. Multipart, so it bypasses the JSON `request` helper.
+ * Verified server-side before anything is written; a refused file keeps the
+ * installed bundle.
+ */
+export async function importPlatformFeedBundle(file: File): Promise<PlatformFeedInstallResponse> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const endpoint = '/api/enrichment/platform-feeds/import';
+  const response = await authenticatedFetch(endpoint, `${getServiceUrl(endpoint)}${endpoint}`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ error: { message: response.statusText } }));
+    const error = body.error || body;
+    throw new Error(error.message || 'Feed bundle import failed');
+  }
+  return response.json();
 }
-
-/** Sleep utility for polling */
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export class EnrichmentApi {
   constructor(
     private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>
   ) {}
 
-  /**
-   * Start an async sync operation
-   * Returns SyncStartResult with started=true for 202, started=false for 409
-   */
-  private async startAsyncSync(endpoint: string): Promise<SyncStartResult> {
-    try {
-      // Request will return the JSON body for 202 (success)
-      const response = await this.request<AsyncSyncResponse>(endpoint, {
-        method: 'POST',
-      });
-      return { started: true, response };
-    } catch (error: unknown) {
-      // Check if it's a 409 Conflict (sync already in progress)
-      // The error message from the API will contain the response body
-      if (error instanceof Error && error.message.includes('already in progress')) {
-        // Parse the response from the error if possible
-        return {
-          started: false,
-          response: {
-            source_id: '',
-            status: 'in_progress',
-            message: error.message,
-          },
-        };
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Wait for an enrichment source sync to complete
-   * @param sourceId The source ID to wait for
-   * @param maxWaitMs Maximum time to wait (default: 30 minutes)
-   * @param pollIntervalMs Time between polls (default: 5 seconds)
-   * @returns The final EnrichmentSource state, or null if timeout
-   */
-  async waitForSync(
-    sourceId: string,
-    maxWaitMs: number = 1800000,
-    pollIntervalMs: number = 5000,
-  ): Promise<EnrichmentSource | null> {
-    const startTime = Date.now();
-
-    while (Date.now() - startTime < maxWaitMs) {
-      const sources = await this.listEnrichmentSources();
-      const source = sources.find(s => s.id === sourceId);
-
-      if (!source) {
-        throw new Error(`Source not found: ${sourceId}`);
-      }
-
-      // Check if sync is complete (not in_progress)
-      if (source.last_sync_status !== 'in_progress') {
-        return source;
-      }
-
-      // Wait before next poll
-      await sleep(pollIntervalMs);
-    }
-
-    // Timeout - return null
-    return null;
-  }
-
   // Basic Enrichment Sources
 
-  /** NAN-4759: self-hosted platform feed bundle and per-feed freshness. */
+  /** NAN-4948: installed platform feed bundle and per-feed freshness. */
   async getPlatformFeeds(): Promise<PlatformFeedsStatus> {
     return this.request<PlatformFeedsStatus>('/api/enrichment/platform-feeds');
+  }
+
+  /** NAN-4948: check nano's feed endpoint now (runs in the background; poll getPlatformFeeds). */
+  async checkPlatformFeeds(): Promise<{ accepted: boolean }> {
+    return this.request<{ accepted: boolean }>('/api/enrichment/platform-feeds/check', { method: 'POST' });
   }
 
   async listEnrichmentSources(): Promise<EnrichmentSource[]> {
     const response = await this.request<{ sources: EnrichmentSource[] }>('/api/enrichment/sources');
     return response.sources;
-  }
-
-  async configureIpinfo(config: IpinfoConfig): Promise<{ success: boolean; message: string }> {
-    return this.request('/api/enrichment/ipinfo/configure', {
-      method: 'POST',
-      body: JSON.stringify(config),
-    });
-  }
-
-  /**
-   * Start an async IPinfo sync
-   * Returns immediately with 202 Accepted or 409 Conflict
-   */
-  async syncIpinfo(): Promise<SyncStartResult> {
-    return this.startAsyncSync('/api/enrichment/ipinfo/sync');
-  }
-
-  /**
-   * Start IPinfo sync and wait for completion (convenience method)
-   * @param maxWaitMs Maximum time to wait (default: 30 minutes)
-   * @returns The final EnrichmentSource state
-   */
-  async syncIpinfoAndWait(maxWaitMs: number = 1800000): Promise<EnrichmentSource | null> {
-    await this.startAsyncSync('/api/enrichment/ipinfo/sync');
-    return this.waitForSync('ipinfo_lite', maxWaitMs);
   }
 
   async enableEnrichmentSource(sourceId: string): Promise<{ success: boolean; message: string }> {
@@ -176,23 +130,12 @@ export class EnrichmentApi {
     return this.request(`/api/enrichment/lookup/ip/${encodeURIComponent(ip)}`);
   }
 
-  async getAutoSyncConfig(sourceId: string = 'ipinfo_lite'): Promise<AutoSyncConfig> {
-    return this.request(`/api/enrichment/sources/${encodeURIComponent(sourceId)}/auto-sync`);
-  }
-
-  async configureAutoSync(config: { enabled: boolean; interval_hours?: number }, sourceId: string = 'ipinfo_lite'): Promise<AutoSyncConfig> {
-    return this.request(`/api/enrichment/sources/${encodeURIComponent(sourceId)}/auto-sync`, {
-      method: 'POST',
-      body: JSON.stringify(config),
-    });
-  }
-
   // NAN-1111: ThreatFox and TOR Exit Nodes configure / sync methods,
   // plus the shared `/api/enrichment/ioc/{lookup,stats}` endpoints,
   // lived here. Both providers moved to the marketplace + Deno
   // (nano-rs/nano-enrichments); the IOC lookup endpoints had no
-  // remaining UI callers. See project_ipinfo_lite_stays_native for
-  // why IPinfo Lite (above) stays native instead.
+  // remaining UI callers. IPinfo Lite comes from nano's signed platform
+  // feed bundle (NAN-4959 removed its configure / sync / auto-sync calls).
 
   // Agent Enrichment Providers (AI-powered)
 

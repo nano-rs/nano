@@ -6,6 +6,54 @@ describes the engine crate (`nano-connector/`). The service around it
 (scheduler, PG checkpoints, Vector HEC sink) is a separate lane, and the
 brief notes where that lane must hold up its end.
 
+## 0. ClickHouse product port (NAN-4914): what differs from the rest of this brief
+
+This brief was written for the hosted multi-tenant platform. The crate in
+this repository is the engine library only, ported for the single-tenant
+ClickHouse product. Where the sections below disagree with this list, this
+list wins:
+
+- **No service lane yet.** The runner, PG checkpoints, HEC sink and their
+  `CONNECTOR_*` runner environment arrive with pull feeds (NAN-4914 phase
+  4). References to `bin/nano-connector-runner.rs` and `service/*` describe
+  that future lane.
+- **No hosted brokers.** The `google_dwd_broker`, `entra_fic_broker` and
+  `okta_broker_jwt` auth plugins and the platform pull broker are removed;
+  there is no platform broker host to deny.
+- **No `kind: identity`.** The lake identity sink is removed; specs with it
+  fail to parse. Directory sync is native (`nanosiem-core` identity/sync).
+- **Egress.** Default: `DirectDialer` to the pinned address. Every resolved
+  address passes the connector's reserved-range list **and** the shared SSRF
+  validator (`nanosiem_core::inputlookup::SsrfValidator`, secure defaults).
+  There is no private-network scope in this crate. An operator may set
+  `CONNECTOR_EGRESS_PROXY_URL` to tunnel through a forward proxy
+  (`egress.rs`), fail-closed, no direct fallback. `CONNECTOR_EGRESS_PROXY_MODE`
+  picks what CONNECT names (NAN-4918):
+  - `pinned_ip` (default, also when unset): CONNECT to the verified pinned
+    address, never the name. DNS-rebinding safe; every address check above
+    runs in process.
+  - `hostname` (opt-in, for hostname-allowlist proxies such as Zscaler or
+    Squid `dstdomain`): CONNECT `host:port`. **The proxy enforces egress.**
+    The proxy resolves the name, so the connector does not resolve it and
+    does not apply its reserved-range / SSRF address checks to that hop.
+    It still applies the spec allowlist and deny list to the host name,
+    refuses literal-IP destinations (private and public), and keeps TLS
+    end to end. Use it only when the proxy blocks internal destinations.
+  - Any other value refuses every connection (`EngineConfig::new`) or fails
+    startup (`try_new`). Without a proxy URL the mode has no effect. The hosted HMAC-granted egress proxy
+  (NAN-4369) is not implemented.
+- **No SOAR surface.** Request sequences, their `steps`/`poll`/`run`/`alert`/
+  `case` template namespaces, the SOAR proxy variable and any self-managed
+  (private-network) authority live in `nanosiem-enterprise::soar_engine`, built
+  on this crate's generic primitives (`engine::compile_with_namespaces`,
+  `template::Scope::host`, `egress::dialer_from_env`).
+- **Platforms.** seccomp and the other Linux layers are compiled only on
+  Linux, unchanged. Other targets (macOS dev) get a limited sandbox; seccomp
+  is reported `unavailable` (degraded) under `prefer` and refuses to run VRL
+  under `require` / `NANO_CONNECTOR_SANDBOX=strict`. See `src/sandbox.rs`.
+- **Template helpers.** `notification_body` (SOAR notification formatting)
+  is not included until its core formatters are ported (NAN-4911).
+
 ## 1. What the engine does
 
 A connector is a YAML spec plus an optional VRL `program`. One run, for one

@@ -193,9 +193,7 @@ fn walk_search_expr(
             negated,
             connector: connector.map(String::from),
         }),
-        SearchExpr::FieldFilter {
-            field, op, value, ..
-        } => out.push(Predicate {
+        SearchExpr::FieldFilter { field, op, value } => out.push(Predicate {
             kind: PredicateKind::FieldFilter,
             field: Some(field.clone()),
             operator: Some(op.as_str().to_string()),

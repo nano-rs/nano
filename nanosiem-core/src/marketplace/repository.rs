@@ -9,43 +9,10 @@ use uuid::Uuid;
 use super::error::MarketplaceError;
 use super::types::*;
 
-/// NAN-3490 item 5: the live-validation connector rows that
-/// `nano-connector-runner catalog put-mock` writes carry this key in
-/// `config`. They are operator fixtures, not marketplace entries: the
-/// listings and lookups skip them, the custom-collector API cannot edit or
-/// delete them, and a repository sync never overwrites them.
-pub const VALIDATION_MOCK_CONFIG_KEY: &str = "validation_mock";
-/// Slugs reserved for those rows. A repository manifest using one is skipped.
-pub const VALIDATION_MOCK_SLUG_SUFFIX: &str = "_mock";
-
-/// Whether `slug` is reserved for a live-validation mock row.
-pub fn is_validation_mock_slug(slug: &str) -> bool {
-    slug.ends_with(VALIDATION_MOCK_SLUG_SUFFIX)
-}
-
-/// Refuse a caller-supplied config that carries the mock marker: only the
-/// operator CLI may stamp it.
-fn refuse_validation_mock_marker(config: &serde_json::Value) -> Result<(), MarketplaceError> {
-    if config.get(VALIDATION_MOCK_CONFIG_KEY).is_some() {
-        return Err(MarketplaceError::ReservedValidationMock(format!("config.{VALIDATION_MOCK_CONFIG_KEY}")));
-    }
-    Ok(())
-}
-
-/// SQL predicate: this `marketplace_catalog` row is not a validation mock
-/// (a NULL config counts as not one). Table-qualified so it also reads the
-/// existing row inside `ON CONFLICT DO UPDATE ... WHERE`.
-macro_rules! not_validation_mock {
-    () => {
-        "NOT (COALESCE(marketplace_catalog.config, '{}'::jsonb) ? 'validation_mock')"
-    };
-}
-
 /// Repository for marketplace catalog and enrichment repo CRUD
 #[derive(Clone)]
 pub struct MarketplaceRepository {
     pool: PgPool,
-    platform_lease: Option<(Uuid, Uuid)>,
 }
 
 /// Live sync state for a native enrichment, read from `enrichment_sources`
@@ -62,23 +29,7 @@ struct NativeSyncState {
 
 impl MarketplaceRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, platform_lease: None }
-    }
-
-    pub(super) fn with_platform_lease(&self, id: Uuid, token: Uuid) -> Self {
-        Self { pool: self.pool.clone(), platform_lease: Some((id, token)) }
-    }
-
-    async fn catalog_write(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, MarketplaceError> {
-        let mut tx = self.pool.begin().await?;
-        if let Some((id, token)) = self.platform_lease {
-            let owned = sqlx::query_scalar::<_, Uuid>("SELECT id FROM enrichment_marketplace_repos
-                WHERE id=$1 AND sync_lease_token=$2 AND last_sync_status='syncing'
-                AND sync_lease_expires_at > clock_timestamp() FOR UPDATE")
-                .bind(id).bind(token).fetch_optional(&mut *tx).await?;
-            if owned.is_none() { return Err(MarketplaceError::SyncInProgress(id)); }
-        }
-        Ok(tx)
+        Self { pool }
     }
 
     /// Populate cheap row-local computed fields (only `has_credentials`
@@ -188,7 +139,6 @@ impl MarketplaceRepository {
         &self,
         mut entry: MarketplaceCatalogEntry,
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
-        if self.platform_lease.is_some() { return Ok(entry); }
         if let Some(ce_id) = entry.custom_enrichment_id {
             // Deno path: in-flight custom_enrichment_runs.
             let exists: bool = sqlx::query_scalar(
@@ -229,7 +179,9 @@ impl MarketplaceRepository {
         &self,
         filter: &CatalogFilter,
     ) -> Result<Vec<MarketplaceCatalogEntry>, MarketplaceError> {
-        let mut query = String::from(concat!("SELECT * FROM marketplace_catalog WHERE ", not_validation_mock!()));
+        // NAN-4946: entries hidden by migration 307 (uninstalled content of a
+        // disabled third-party repository) are not listed.
+        let mut query = String::from("SELECT * FROM marketplace_catalog WHERE hidden_reason IS NULL");
         let mut bind_idx = 1u32;
 
         if filter.category.is_some() {
@@ -290,7 +242,7 @@ impl MarketplaceRepository {
     /// Get catalog stats
     #[instrument(skip(self))]
     pub async fn get_catalog_stats(&self) -> Result<CatalogStats, MarketplaceError> {
-        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64)>(concat!(
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64)>(
             r#"
             SELECT
                 COUNT(*) as total_entries,
@@ -300,9 +252,9 @@ impl MarketplaceRepository {
                 COUNT(*) FILTER (WHERE category = 'identity') as identity_count,
                 COUNT(*) FILTER (WHERE category = 'collector') as collector_count
             FROM marketplace_catalog
-            WHERE "#,
-            not_validation_mock!()
-        ))
+            WHERE hidden_reason IS NULL
+            "#,
+        )
         .fetch_one(&self.pool)
         .await?;
 
@@ -323,7 +275,7 @@ impl MarketplaceRepository {
         slug: &str,
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
         let entry = sqlx::query_as::<_, MarketplaceCatalogEntry>(
-            concat!("SELECT * FROM marketplace_catalog WHERE slug = $1 AND ", not_validation_mock!()),
+            "SELECT * FROM marketplace_catalog WHERE slug = $1",
         )
         .bind(slug)
         .fetch_optional(&self.pool)
@@ -341,7 +293,7 @@ impl MarketplaceRepository {
         id: Uuid,
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
         let entry = sqlx::query_as::<_, MarketplaceCatalogEntry>(
-            concat!("SELECT * FROM marketplace_catalog WHERE id = $1 AND ", not_validation_mock!()),
+            "SELECT * FROM marketplace_catalog WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -358,12 +310,19 @@ impl MarketplaceRepository {
         &self,
         entry: &MarketplaceCatalogEntry,
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
-        if is_validation_mock_slug(&entry.slug) {
-            return Err(MarketplaceError::ReservedValidationMock(entry.slug.clone()));
-        }
-        refuse_validation_mock_marker(&entry.config.0)?;
-        let mut tx = self.catalog_write().await?;
-        let result = sqlx::query_as::<_, MarketplaceCatalogEntry>(concat!(
+        let result = Self::upsert_catalog_row(&self.pool, entry).await?;
+        self.hydrate_with_run_state(Self::hydrate(result)).await
+    }
+
+    /// The catalog upsert on any executor (pool or transaction), unhydrated.
+    async fn upsert_catalog_row<'e, E>(
+        executor: E,
+        entry: &MarketplaceCatalogEntry,
+    ) -> Result<MarketplaceCatalogEntry, MarketplaceError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        let result = sqlx::query_as::<_, MarketplaceCatalogEntry>(
             r#"
             INSERT INTO marketplace_catalog (
                 slug, name, description, category, tags, icon, author,
@@ -391,12 +350,14 @@ impl MarketplaceRepository {
                 config = EXCLUDED.config,
                 changelog = EXCLUDED.changelog,
                 updated_at = NOW()
-            WHERE "#,
-            not_validation_mock!(),
-            r#"
+            -- NAN-4946: an existing slug is updated only by the repository
+            -- that owns it; another repository or a system row never has its
+            -- code swapped under retained provenance.
+            WHERE marketplace_catalog.source_type = EXCLUDED.source_type
+              AND marketplace_catalog.repository_id IS NOT DISTINCT FROM EXCLUDED.repository_id
             RETURNING *
             "#,
-        ))
+        )
         .bind(&entry.slug)
         .bind(&entry.name)
         .bind(&entry.description)
@@ -418,21 +379,59 @@ impl MarketplaceRepository {
         .bind(&entry.allowed_domains)
         .bind(&entry.config)
         .bind(&entry.changelog)
-        .fetch_optional(&mut *tx)
+        .fetch_one(executor)
         .await
         .map_err(|e| {
+            // The owner guard on the conflict update matched no row.
+            if matches!(e, sqlx::Error::RowNotFound) {
+                return MarketplaceError::SlugAlreadyExists(entry.slug.clone());
+            }
             if let sqlx::Error::Database(ref db_err) = e {
                 if db_err.constraint() == Some("marketplace_catalog_slug_key") {
                     return MarketplaceError::SlugAlreadyExists(entry.slug.clone());
                 }
             }
             MarketplaceError::Database(e)
-        })?
-        // The DO UPDATE guard matched nothing: the slug is a validation mock row.
-        .ok_or_else(|| MarketplaceError::ReservedValidationMock(entry.slug.clone()))?;
+        })?;
 
+        Ok(result)
+    }
+
+    /// Apply one repository sync's catalog changes atomically (NAN-4930):
+    /// every upsert and the stale-entry cleanup commit together or not at all,
+    /// so a failure leaves the previous catalog intact and the sync fails
+    /// (the caller then does not stamp `last_sync_schema_version`, and the
+    /// next sync retries). Returns the number of stale entries removed.
+    #[instrument(skip(self, entries, keep_slugs))]
+    pub async fn apply_repo_sync(
+        &self,
+        repo_id: Uuid,
+        entries: &[MarketplaceCatalogEntry],
+        keep_slugs: &[String],
+    ) -> Result<i32, MarketplaceError> {
+        let mut tx = self.pool.begin().await?;
+        // NAN-4946: a manifest whose slug belongs to another repository or a
+        // system row is skipped (and logged), never merged into that row.
+        let slugs: Vec<String> = entries.iter().map(|e| e.slug.clone()).collect();
+        let foreign: Vec<(String,)> = sqlx::query_as(
+            "SELECT slug FROM marketplace_catalog WHERE slug = ANY($1) \
+             AND (source_type <> 'repository' OR repository_id IS DISTINCT FROM $2)",
+        )
+        .bind(&slugs)
+        .bind(repo_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let foreign: std::collections::HashSet<String> = foreign.into_iter().map(|(s,)| s).collect();
+        for entry in entries {
+            if foreign.contains(&entry.slug) {
+                tracing::warn!(repo_id = %repo_id, slug = %entry.slug, "marketplace sync: slug belongs to another repository or a system entry; skipped");
+                continue;
+            }
+            Self::upsert_catalog_row(&mut *tx, entry).await?;
+        }
+        let removed = Self::remove_stale_rows(&mut *tx, repo_id, keep_slugs).await?;
         tx.commit().await?;
-        self.hydrate_with_run_state(Self::hydrate(result)).await
+        Ok(removed)
     }
 
     /// Create a marketplace catalog entry for a user-created custom enrichment
@@ -525,7 +524,6 @@ impl MarketplaceRepository {
         credential_fields: &serde_json::Value,
         config: &serde_json::Value,
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
-        refuse_validation_mock_marker(config)?;
         let slug = custom_slug(name);
         let requires_credential = if credential_fields
             .as_array()
@@ -581,7 +579,6 @@ impl MarketplaceRepository {
         credential_fields: &serde_json::Value,
         config: &serde_json::Value,
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
-        refuse_validation_mock_marker(config)?;
         let slug = custom_slug(name);
         let requires_credential = if credential_fields
             .as_array()
@@ -593,7 +590,7 @@ impl MarketplaceRepository {
             "required"
         };
 
-        let result = sqlx::query_as::<_, MarketplaceCatalogEntry>(concat!(
+        let result = sqlx::query_as::<_, MarketplaceCatalogEntry>(
             r#"
             UPDATE marketplace_catalog SET
                 slug = $2,
@@ -611,12 +608,9 @@ impl MarketplaceRepository {
               AND source_type = 'custom'
               AND category = 'collector'
               AND execution_backend = 'collector'
-              AND "#,
-            not_validation_mock!(),
-            r#"
             RETURNING *
             "#,
-        ))
+        )
         .bind(id)
         .bind(&slug)
         .bind(name)
@@ -643,12 +637,11 @@ impl MarketplaceRepository {
         &self,
         id: Uuid,
     ) -> Result<(), MarketplaceError> {
-        let result = sqlx::query(concat!(
+        let result = sqlx::query(
             "DELETE FROM marketplace_catalog \
              WHERE id = $1 AND source_type = 'custom' \
-             AND category = 'collector' AND execution_backend = 'collector' AND ",
-            not_validation_mock!()
-        ))
+             AND category = 'collector' AND execution_backend = 'collector'",
+        )
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -681,7 +674,7 @@ impl MarketplaceRepository {
         credentials_encrypted: Option<&[u8]>,
         credentials_nonce: Option<&str>,
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
-        let result = sqlx::query_as::<_, MarketplaceCatalogEntry>(concat!(
+        let result = sqlx::query_as::<_, MarketplaceCatalogEntry>(
             r#"
             UPDATE marketplace_catalog SET
                 installed = $2,
@@ -690,12 +683,10 @@ impl MarketplaceRepository {
                 enabled = $2,
                 credentials_encrypted = COALESCE($3, credentials_encrypted),
                 credentials_nonce = COALESCE($4, credentials_nonce)
-            WHERE slug = $1 AND "#,
-            not_validation_mock!(),
-            r#"
+            WHERE slug = $1
             RETURNING *
             "#,
-        ))
+        )
         .bind(slug)
         .bind(installed)
         .bind(credentials_encrypted)
@@ -704,6 +695,19 @@ impl MarketplaceRepository {
         .await?
         .ok_or_else(|| MarketplaceError::CatalogEntryNotFound(slug.to_string()))?;
 
+        self.hydrate_with_run_state(Self::hydrate(result)).await
+    }
+
+    /// NAN-4946: drop a catalog entry's stored credentials (uninstall).
+    #[instrument(skip(self))]
+    pub async fn clear_credentials(&self, slug: &str) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
+        let result = sqlx::query_as::<_, MarketplaceCatalogEntry>(
+            "UPDATE marketplace_catalog SET credentials_encrypted = NULL, credentials_nonce = NULL WHERE slug = $1 RETURNING *",
+        )
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| MarketplaceError::CatalogEntryNotFound(slug.to_string()))?;
         self.hydrate_with_run_state(Self::hydrate(result)).await
     }
 
@@ -745,9 +749,6 @@ impl MarketplaceRepository {
         // stored credential. Resolve against the current row first. `COALESCE`
         // below already preserves an omitted `config` outright; this handles
         // the supplied-but-masked case.
-        if let Some(incoming) = config {
-            refuse_validation_mock_marker(incoming)?;
-        }
         let merged;
         let config = match config {
             Some(incoming) => {
@@ -761,19 +762,17 @@ impl MarketplaceRepository {
             None => None,
         };
 
-        let result = sqlx::query_as::<_, MarketplaceCatalogEntry>(concat!(
+        let result = sqlx::query_as::<_, MarketplaceCatalogEntry>(
             r#"
             UPDATE marketplace_catalog SET
                 config = COALESCE($2, config),
                 enabled = COALESCE($3, enabled),
                 credentials_encrypted = COALESCE($4, credentials_encrypted),
                 credentials_nonce = COALESCE($5, credentials_nonce)
-            WHERE slug = $1 AND "#,
-            not_validation_mock!(),
-            r#"
+            WHERE slug = $1
             RETURNING *
             "#,
-        ))
+        )
         .bind(slug)
         .bind(config)
         .bind(enabled)
@@ -822,7 +821,17 @@ impl MarketplaceRepository {
         repo_id: Uuid,
         keep_slugs: &[String],
     ) -> Result<i32, MarketplaceError> {
-        let mut tx = self.catalog_write().await?;
+        Self::remove_stale_rows(&self.pool, repo_id, keep_slugs).await
+    }
+
+    async fn remove_stale_rows<'e, E>(
+        executor: E,
+        repo_id: Uuid,
+        keep_slugs: &[String],
+    ) -> Result<i32, MarketplaceError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
         let result = sqlx::query(
             r#"
             DELETE FROM marketplace_catalog
@@ -833,10 +842,9 @@ impl MarketplaceRepository {
         )
         .bind(repo_id)
         .bind(keep_slugs)
-        .execute(&mut *tx)
+        .execute(executor)
         .await?;
 
-        tx.commit().await?;
         Ok(result.rows_affected() as i32)
     }
 
@@ -888,9 +896,6 @@ impl MarketplaceRepository {
     pub async fn list_repos_for_auto_sync(
         &self,
     ) -> Result<Vec<EnrichmentMarketplaceRepo>, MarketplaceError> {
-        use tracing::Instrument;
-        let mut connection = self.pool.acquire()
-            .instrument(tracing::info_span!("db.postgresql.connection.acquire")).await?;
         let repos = sqlx::query_as::<_, EnrichmentMarketplaceRepo>(
             r#"
             SELECT
@@ -925,8 +930,7 @@ impl MarketplaceRepository {
             ORDER BY r.last_synced_at NULLS FIRST
             "#,
         )
-        .fetch_all(&mut *connection)
-        .instrument(tracing::info_span!("db.postgresql.execute"))
+        .fetch_all(&self.pool)
         .await?;
 
         Ok(repos)
@@ -978,13 +982,9 @@ impl MarketplaceRepository {
         request: &CreateMarketplaceRepo,
         created_by: Option<Uuid>,
     ) -> Result<EnrichmentMarketplaceRepo, MarketplaceError> {
-        // Validate URL — only HTTPS allowed
-        let url_lower = request.url.trim().to_lowercase();
-        if !url_lower.starts_with("https://") {
-            return Err(MarketplaceError::InvalidUrl(
-                "Only HTTPS URLs are allowed for enrichment repositories".to_string(),
-            ));
-        }
+        // NAN-4946: only nano's first-party catalogs (exact scheme / host /
+        // owner; no embedded credentials). No third-party repositories.
+        super::first_party::validate_first_party_repo_url(&request.url)?;
 
         // H3: SSRF validation — block private IPs, localhost, cloud metadata
         let ssrf_validator = crate::inputlookup::SsrfValidator::default_secure();
@@ -1048,6 +1048,10 @@ impl MarketplaceRepository {
         id: Uuid,
         request: &UpdateMarketplaceRepo,
     ) -> Result<EnrichmentMarketplaceRepo, MarketplaceError> {
+        // NAN-4946: a third-party row (disabled by migration 307) cannot be
+        // edited or re-enabled.
+        let existing = self.get_repo(id).await?;
+        super::first_party::validate_first_party_repo_url(&existing.url)?;
         let result = sqlx::query_as::<_, EnrichmentMarketplaceRepo>(
             r#"
             UPDATE enrichment_marketplace_repos SET
@@ -1163,168 +1167,4 @@ fn map_custom_collector_write_error(error: sqlx::Error, slug: &str) -> Marketpla
         }
     }
     MarketplaceError::Database(error)
-}
-
-#[cfg(test)]
-mod validation_mock_tests {
-    use super::*;
-
-    #[test]
-    fn mock_slugs_and_markers_are_reserved() {
-        assert!(is_validation_mock_slug("okta_system_log_mock"));
-        assert!(!is_validation_mock_slug("okta_system_log"));
-        assert!(!is_validation_mock_slug("mock_okta"));
-        assert!(refuse_validation_mock_marker(&serde_json::json!({"runtime": "connector"})).is_ok());
-        assert!(matches!(
-            refuse_validation_mock_marker(&serde_json::json!({"validation_mock": "x"})),
-            Err(MarketplaceError::ReservedValidationMock(_))
-        ));
-        // custom_slug can never produce a reserved slug (it drops `_`).
-        assert!(!is_validation_mock_slug(&custom_slug("Okta System Log_mock")));
-        assert_eq!(not_validation_mock!(), "NOT (COALESCE(marketplace_catalog.config, '{}'::jsonb) ? 'validation_mock')");
-    }
-
-    /// nano-red M1/M2 (#6025 addendum): a live-validation mock row is hidden
-    /// from every catalog read, cannot be edited or deleted through the
-    /// custom-collector API or installed, and a repository sync never
-    /// overwrites it or creates a `_mock` slug.
-    #[tokio::test]
-    #[ignore = "requires a disposable NANOSIEM_TEST_DATABASE_URL"]
-    async fn validation_mock_rows_are_hidden_and_never_overwritten() {
-        let url = std::env::var("NANOSIEM_TEST_DATABASE_URL").expect("disposable PostgreSQL URL");
-        let admin = PgPool::connect(&url).await.unwrap();
-        let schema = format!("validation_mock_{}", Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}")).execute(&admin).await.unwrap();
-        let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect_with(options.options([("search_path", schema.as_str())]))
-            .await
-            .unwrap();
-        sqlx::raw_sql("CREATE TABLE users (id UUID PRIMARY KEY); CREATE TABLE custom_enrichments (id UUID PRIMARY KEY);")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let catalog_ddl = include_str!("../../../migrations/postgres/101_marketplace_catalog.sql")
-            .split("-- Seed IPinfo Lite")
-            .next()
-            .unwrap();
-        sqlx::raw_sql(catalog_ddl).execute(&pool).await.unwrap();
-        // Collectors are an enterprise category (9000049 widens the checks).
-        sqlx::raw_sql(
-            "ALTER TABLE marketplace_catalog ADD COLUMN changelog TEXT;
-             ALTER TABLE marketplace_catalog DROP CONSTRAINT IF EXISTS marketplace_catalog_category_check,
-                 ADD CONSTRAINT marketplace_catalog_category_check CHECK (category IN ('data', 'agent', 'identity', 'collector'));
-             ALTER TABLE marketplace_catalog DROP CONSTRAINT IF EXISTS marketplace_catalog_execution_backend_check,
-                 ADD CONSTRAINT marketplace_catalog_execution_backend_check
-                 CHECK (execution_backend IN ('deno', 'native', 'identity', 'collector'));",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // The row `nano-connector-runner catalog put-mock` writes, and a
-        // plain custom collector next to it.
-        let mock_config = serde_json::json!({"runtime": "connector", "validation_mock": "nano-connector-runner:validation-mock"});
-        let mock_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO marketplace_catalog (slug, name, category, source_type, execution_backend, author, config, enabled, installed)
-             VALUES ('okta_system_log_mock', 'okta_system_log_mock', 'collector', 'custom', 'collector',
-                     'nano-connector-runner:validation-mock', $1, false, false) RETURNING id",
-        )
-        .bind(&mock_config)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        // A row with the default config is not a mock (the predicate must
-        // not hide it). (A NULL config does not decode into the entry type
-        // at all; the predicate COALESCEs it anyway.)
-        sqlx::query(
-            "INSERT INTO marketplace_catalog (slug, name, category, source_type, execution_backend)
-             VALUES ('plain-config', 'Plain config', 'data', 'system', 'native')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let repository = MarketplaceRepository::new(pool.clone());
-        let collector = repository
-            .create_catalog_for_custom_collector("My Collector", None, "code", &[], &serde_json::json!([]), &serde_json::json!({}))
-            .await
-            .unwrap();
-
-        // M2: hidden from listings, stats and lookups.
-        let listed: Vec<String> =
-            repository.list_catalog(&CatalogFilter::default()).await.unwrap().into_iter().map(|e| e.slug).collect();
-        assert_eq!(listed.len(), 2, "{listed:?}");
-        assert!(listed.contains(&"plain-config".to_string()) && listed.contains(&collector.slug), "{listed:?}");
-        let filtered = CatalogFilter { category: Some("collector".into()), source_type: Some("custom".into()), ..Default::default() };
-        assert_eq!(repository.list_catalog(&filtered).await.unwrap().len(), 1);
-        let stats = repository.get_catalog_stats().await.unwrap();
-        assert_eq!((stats.total_entries, stats.collector_count), (2, 1));
-        assert!(matches!(repository.get_catalog_entry("okta_system_log_mock").await, Err(MarketplaceError::CatalogEntryNotFound(_))));
-        assert!(matches!(repository.get_catalog_entry_by_id(mock_id).await, Err(MarketplaceError::CatalogEntryNotFound(_))));
-        repository.get_catalog_entry("plain-config").await.unwrap();
-        #[cfg(feature = "enterprise")]
-        {
-            let shared = crate::enterprise_shared_marketplace::read_catalog(&pool, &CatalogFilter::default(), false).await.unwrap();
-            assert!(shared.iter().all(|e| e.slug != "okta_system_log_mock") && shared.len() == 2);
-            assert!(crate::enterprise_shared_marketplace::read_catalog_entry(&pool, "okta_system_log_mock", false).await.unwrap().is_none());
-        }
-
-        // M2: the custom-collector API (and install / config writes) cannot
-        // touch it, nor stamp the marker on another row.
-        let edit = repository
-            .update_catalog_for_custom_collector(mock_id, "Hijack", None, "code", &[], &serde_json::json!([]), &serde_json::json!({}))
-            .await;
-        assert!(matches!(edit, Err(MarketplaceError::CatalogEntryNotFound(_))), "{edit:?}");
-        assert!(matches!(repository.delete_catalog_for_custom_collector(mock_id).await, Err(MarketplaceError::CatalogEntryNotFound(_))));
-        assert!(matches!(
-            repository.set_installed("okta_system_log_mock", true, None, None).await,
-            Err(MarketplaceError::CatalogEntryNotFound(_))
-        ));
-        assert!(matches!(
-            repository.update_catalog_config("okta_system_log_mock", None, Some(true), None, None).await,
-            Err(MarketplaceError::CatalogEntryNotFound(_))
-        ));
-        let stamp = repository
-            .update_catalog_for_custom_collector(collector.id, "My Collector", None, "code", &[], &serde_json::json!([]), &mock_config)
-            .await;
-        assert!(matches!(stamp, Err(MarketplaceError::ReservedValidationMock(_))), "{stamp:?}");
-        let created = repository
-            .create_catalog_for_custom_collector("Other", None, "code", &[], &serde_json::json!([]), &mock_config)
-            .await;
-        assert!(matches!(created, Err(MarketplaceError::ReservedValidationMock(_))), "{created:?}");
-
-        // M1: a repository entry with a `_mock` slug is refused before any
-        // write; one carrying the marker too; and the DO UPDATE guard holds
-        // even if a writer reached the conflict.
-        let entry = MarketplaceCatalogEntry {
-            slug: "okta_system_log_mock".into(),
-            name: "Synced".into(),
-            category: "collector".into(),
-            source_type: "repository".into(),
-            execution_backend: "collector".into(),
-            requires_credential: "none".into(),
-            ..Default::default()
-        };
-        assert!(matches!(repository.upsert_catalog_entry(&entry).await, Err(MarketplaceError::ReservedValidationMock(_))));
-        let marked = MarketplaceCatalogEntry { slug: "marked".into(), config: sqlx::types::Json(mock_config.clone()), ..entry.clone() };
-        assert!(matches!(repository.upsert_catalog_entry(&marked).await, Err(MarketplaceError::ReservedValidationMock(_))));
-        // The guard itself, as the upsert issues it, against the mock row.
-        let guarded = sqlx::query_scalar::<_, Uuid>(concat!(
-            "INSERT INTO marketplace_catalog (slug, name, category, source_type, execution_backend, config)
-             VALUES ('okta_system_log_mock', 'Synced', 'collector', 'repository', 'collector', '{}'::jsonb)
-             ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name, config = EXCLUDED.config WHERE ",
-            not_validation_mock!(),
-            " RETURNING id"
-        ))
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
-        assert_eq!(guarded, None);
-        let (name, config): (String, serde_json::Value) =
-            sqlx::query_as("SELECT name, config FROM marketplace_catalog WHERE id = $1").bind(mock_id).fetch_one(&pool).await.unwrap();
-        assert_eq!((name.as_str(), config), ("okta_system_log_mock", mock_config));
-
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
-    }
 }

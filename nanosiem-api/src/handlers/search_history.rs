@@ -16,8 +16,8 @@ use nanosiem_core::audit::{
 use nanosiem_core::auth::permissions;
 use nanosiem_core::db::repository::{NewSearchHistoryEntry, SearchHistoryRepository};
 use nanosiem_core::search::field_usage::{
-    rank_field_usage, SearchFieldUsage, FIELD_USAGE_CACHE, HISTORY_WINDOW_DAYS, TENANT_ROW_LIMIT,
-    USER_ROW_LIMIT,
+    rank_field_usage, SearchFieldUsage, FIELD_USAGE_CACHE, HISTORY_WINDOW_DAYS, USER_ROW_LIMIT,
+    WORKSPACE_ROW_LIMIT,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -191,7 +191,7 @@ pub async fn add_history(
         .add(user_id, &new_entry)
         .await
         .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
-    FIELD_USAGE_CACHE.invalidate(OPEN_CORE_TENANT, user_id);
+    FIELD_USAGE_CACHE.invalidate(user_id);
 
     Ok(Json(SearchHistoryResponse {
         id: entry.id,
@@ -350,20 +350,13 @@ pub async fn set_history_enabled(
     Ok(Json(serde_json::json!({"enabled": request.enabled})))
 }
 
-// =============================================================================
-// OpenAPI Documentation
-// =============================================================================
-
-/// Open core is one tenant per deployment; the field-usage cache keys it as nil.
-const OPEN_CORE_TENANT: Uuid = Uuid::nil();
-
-// NAN-3812: ranking source for the search-bar Ctrl+Space field list.
+// NAN-3812: ranking source for the search-bar field suggestions.
 /// Search-autocomplete field ranking for the current user
 ///
 /// `recent`: fields from the caller's own search history, recency-weighted.
-/// `popular`: fields most used by every user of this deployment (open core is
-/// one tenant per deployment). Derived from stored history by re-parsing each
-/// query; only field names are returned, never values. Cached for 60 s.
+/// `popular`: fields most used by every user of this deployment. Derived from
+/// stored history by re-parsing each query; only field names are returned,
+/// never values. Cached for 60 s.
 #[utoipa::path(
     get,
     path = "/api/me/field-usage",
@@ -382,12 +375,14 @@ pub async fn get_field_usage(
     ensure_permission(&auth, permissions::SEARCH_VIEW)?;
 
     let user_id = auth.user_id();
-    let cached = FIELD_USAGE_CACHE.lookup(OPEN_CORE_TENANT, user_id);
+    let cached = FIELD_USAGE_CACHE.lookup(user_id);
     if let Some(usage) = cached.complete() {
         return Ok(Json(usage));
     }
     let repo = SearchHistoryRepository::new(state.pool.clone());
-    let db = |e: nanosiem_core::db::repository::SearchHistoryError| ApiError::DatabaseError(e.to_string());
+    let db = |e: nanosiem_core::db::repository::SearchHistoryError| {
+        ApiError::DatabaseError(e.to_string())
+    };
     let user_rows = if cached.needs_user_rows() {
         repo.field_usage_rows(Some(user_id), USER_ROW_LIMIT, HISTORY_WINDOW_DAYS)
             .await
@@ -395,16 +390,20 @@ pub async fn get_field_usage(
     } else {
         Vec::new()
     };
-    let tenant_rows = if cached.needs_tenant_rows() {
-        repo.field_usage_rows(None, TENANT_ROW_LIMIT, HISTORY_WINDOW_DAYS)
+    let workspace_rows = if cached.needs_workspace_rows() {
+        repo.field_usage_rows(None, WORKSPACE_ROW_LIMIT, HISTORY_WINDOW_DAYS)
             .await
             .map_err(db)?
     } else {
         Vec::new()
     };
-    let computed = rank_field_usage(user_id, &user_rows, &tenant_rows, Utc::now());
-    Ok(Json(FIELD_USAGE_CACHE.fill(OPEN_CORE_TENANT, user_id, cached, computed)))
+    let computed = rank_field_usage(user_id, &user_rows, &workspace_rows, Utc::now());
+    Ok(Json(FIELD_USAGE_CACHE.fill(user_id, cached, computed)))
 }
+
+// =============================================================================
+// OpenAPI Documentation
+// =============================================================================
 
 #[derive(OpenApi)]
 #[openapi(

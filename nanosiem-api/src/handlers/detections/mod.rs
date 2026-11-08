@@ -49,70 +49,25 @@ use crate::handlers::AuditExt;
 /// - Multi-line comments: /* comment */
 ///
 /// Returns the query with comments removed and extra whitespace cleaned up.
+///
+/// NAN-4283: comments are recognized by the query parser's own rule
+/// (`nanosiem_core::query::strip_comments`): an opener only counts at a token
+/// boundary, outside quotes. This stripper used to treat any `//` as a
+/// comment, so a saved rule `url=https://host/x | stats count by src_ip` was
+/// stored as `url=https:` -- the rest of the rule silently dropped.
 pub(crate) fn strip_comments(query: &str) -> String {
-    let mut result = String::new();
-    let mut chars = query.chars().peekable();
-    let mut in_string = false;
-    let mut string_char = '"';
-
-    while let Some(c) = chars.next() {
-        // Track string state to avoid stripping inside strings
-        if !in_string && (c == '"' || c == '\'') {
-            in_string = true;
-            string_char = c;
-            result.push(c);
-            continue;
-        }
-
-        if in_string {
-            result.push(c);
-            if c == string_char && result.chars().last() != Some('\\') {
-                in_string = false;
-            }
-            continue;
-        }
-
-        // Check for comments (NAN-4283: only at a token boundary, so a URL
-        // value such as `url=https://host/x` is never a comment).
-        if c == '/' && nanosiem_core::query::comment_may_start_after(result.chars().next_back()) {
-            if let Some(&next) = chars.peek() {
-                if next == '/' {
-                    // Single-line comment - skip until newline
-                    chars.next(); // consume the second /
-                    while let Some(&ch) = chars.peek() {
-                        if ch == '\n' {
-                            break;
-                        }
-                        chars.next();
-                    }
-                    continue;
-                } else if next == '*' {
-                    // Multi-line comment - skip until */
-                    chars.next(); // consume the *
-                    while let Some(ch) = chars.next() {
-                        if ch == '*' {
-                            if let Some(&'/') = chars.peek() {
-                                chars.next(); // consume the /
-                                break;
-                            }
-                        }
-                    }
-                    continue;
-                }
-            }
-        }
-
-        result.push(c);
-    }
-
     // Clean up empty lines (e.g. from stripped comments) but preserve intentional newlines
-    result
+    nanosiem_core::query::strip_comments(query)
         .lines()
         .map(|line| line.trim_end())
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+#[cfg(test)]
+#[path = "strip_comments_tests.rs"]
+mod strip_comments_tests;
 
 // =============================================================================
 // OPENAPI DOCUMENTATION
@@ -177,6 +132,7 @@ impl utoipa::OpenApi for DetectionsApiDoc {
                 FormatQueryResponse,
                 ValidateDetectionRequest,
                 ValidateDetectionResponse,
+                RuleLifecycleTransitionRequest,
                 BulkUpdateRulesRequest,
                 BulkUpdateRulesResponse,
                 BulkRuleFailure,
@@ -209,3 +165,7 @@ impl utoipa::OpenApi for DetectionsApiDoc {
         ApiDoc::openapi()
     }
 }
+
+#[cfg(test)]
+#[path = "strip_comments_save_tests.rs"]
+mod strip_comments_save_tests;

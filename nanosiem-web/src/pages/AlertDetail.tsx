@@ -40,21 +40,18 @@ import { AssociateCaseButton } from '@/components/alerts/AssociateCaseButton';
 import { EventViewer } from '@/components/matches/EventViewer';
 import { retroMatchOf, retroSearchUrl, type RetroMatch } from '@/components/search/retro/links';
 import { RiskNotableBreakdown } from '@/enterprise/components/risk/RiskNotableBreakdown';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import { riskNotableEntity } from '@/lib/risk-notable';
 
 type TabId = 'events' | 'rule' | 'timeline';
-
-// NAN-2361: the router basename carries the tenant prefix, so every mode links
-// to the same in-app paths.
-function useTenantRuleLink() {
-  return (id: string) => `/rules/${id}`;
-}
 
 function fmtUTC(d: Date): string {
   return d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
 }
 
 export function AlertDetail() {
+  // The risk-notable breakdown is enterprise; the open stub renders nothing.
+  const { capabilities } = useCapabilities();
   const { id } = useParams();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -236,7 +233,7 @@ export function AlertDetail() {
               (enterprise; self-gates). Works for detection + monitor alerts. */}
           <AssociateCaseButton alertId={alert.id} onAssociated={refetchAlert} />
         </div>
-        {riskNotable && (
+        {capabilities.risk && riskNotable && (
           <div className="mt-3">
             <RiskNotableBreakdown
               entity={riskNotable.entity}
@@ -436,7 +433,6 @@ function RuleTab({
 }: {
   apiRule: ReturnType<typeof useDetection>['data'];
 }) {
-  const tenantRuleLink = useTenantRuleLink();
   const ruleNarrative = apiRule?.narrative;
   if (!apiRule) {
     return (
@@ -539,7 +535,7 @@ function RuleTab({
         </div>
 
         <Link
-          to={tenantRuleLink(apiRule.id)}
+          to={`/rules/${apiRule.id}`}
           className="h-8 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 inline-flex items-center justify-center gap-1.5"
         >
           Open rule

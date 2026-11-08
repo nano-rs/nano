@@ -52,6 +52,13 @@ export interface PipePivtContext {
   skipped: string[];
 }
 
+const DRAFT_REQUEST = /^\s*(draft|add|insert|create|append|new)\b|\b(new|another|extra) step\b|\badd (a|another) step\b/i;
+/** "Draft a step …", "add a step that …" draft a new step; anything else works on the selected step. */
+export function inferPipeMode(request: string, stepCount: number): PipePivtMode {
+  if (stepCount === 0) return 'draft';
+  return DRAFT_REQUEST.test(request) ? 'draft' : 'edit';
+}
+
 export const PIPE_PIVT_MAX_SAMPLES = 5;
 const MAX_SAMPLE_BYTES = 8 * 1024;
 const MAX_ISSUE_CHARS = 2000;

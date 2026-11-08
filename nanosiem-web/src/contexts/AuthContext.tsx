@@ -18,46 +18,8 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { api } from '../lib/api';
 import { sessionCredentials } from '../lib/session-credentials';
-import { requestCredentials } from '../lib/request-credentials';
+import { accessOnlyRefreshResult, coordinateBrowserRefresh } from '../lib/refresh-coordinator';
 import { setAccessToken, getAccessToken, clearAccessToken, persistDemoSession, restoreDemoSession, getDemoRefreshToken } from '../lib/auth-token';
-import {
-  accessOnlyRefreshResult,
-  broadcastSessionInvalidation,
-  broadcastSessionReplacement,
-  broadcastTenantSessionRevocation,
-  cookieMutationStillOwnsSession,
-  cookieSlotForScope,
-  coordinateBrowserRefresh,
-  isRefreshSessionMessage,
-  logoutMessageAffectsSlot,
-  ORIGIN_COOKIE_SLOT,
-  REFRESH_SESSION_CHANNEL_NAME,
-  refreshSessionMessageReplacesScope,
-  tenantCookieSlot,
-  withBrowserCookieMutationLock,
-} from '../lib/refresh-coordinator';
-import {
-  browserTenantRuntime,
-  authenticatedRuntimeScope,
-  type ActiveTenant,
-  type DeploymentMode,
-  type TenantRuntimeSnapshot,
-} from '../lib/tenant-runtime';
-import {
-  canonicalTenantSlug,
-  loginRequestBody,
-  rememberActiveTenant,
-  safeReturnPath,
-  tenantContinuationBody,
-  tenantSlugForAuthContinuation,
-  verifyServerAuthIdentity,
-} from '../lib/tenant-auth-shell';
-import {
-  isDemoIdentity,
-  sharedDemoClaimBody,
-  SHARED_DEMO_CLAIM_PATH,
-  type SharedDemoState,
-} from '../lib/shared-demo';
 
 // ============================================================================
 // Types
@@ -84,16 +46,6 @@ export interface User {
   default_time_range?: TimeRangePreset;
   landing_page?: LandingPage;
   isApiKey?: boolean;
-  deployment_mode: DeploymentMode;
-  active_tenant?: ActiveTenant;
-  /** NAN-4152: present only for a live demo analyst on the shared runtime. */
-  demo?: SharedDemoState;
-}
-
-/** The login / claim success body (`AuthResponse`). */
-interface AuthSuccessResponse {
-  user: User;
-  tokens: { access_token: string; refresh_token: string; expires_in: number };
 }
 
 /**
@@ -114,35 +66,20 @@ export interface AuthState {
   isAuthenticated: boolean;
   isLoading: boolean;
   error: string | null;
-  tenantRuntime: TenantRuntimeSnapshot;
 }
 
 export interface AuthContextType extends AuthState {
   permissions: string[];
   isDemoUser: boolean;
-  login: (email: string, password: string, tenantSlug?: string) => Promise<void>;
+  login: (email: string, password: string) => Promise<void>;
   loginAsDemo: (displayName?: string) => Promise<void>;
   claimDemoToken: (token: string) => Promise<void>;
-  /**
-   * NAN-4152: claim a shared demo link for the CANONICAL tenant slug. Same
-   * session establishment as a shared login (cookies + in-memory bearer).
-   * Rejects with the server's status/code (401 `invalid_demo_link`).
-   */
-  claimSharedDemo: (tenantSlug: string, token: string) => Promise<void>;
   loginWithOidc: (providerSlug: string, currentPath?: string) => Promise<void>;
   handleOidcCallback: (
     providerSlug: string,
     code: string,
     state: string,
   ) => Promise<string>;
-  /** Activate a cookies-only hosted-shared OIDC session after exact bootstrap proof. */
-  acceptSharedOidcSession: (
-    user: User,
-    expectedTenantSlug: string,
-    session?: { accessToken: string; expiresIn: number },
-  ) => Promise<void>;
-  /** Clear local authority after a callback changed cookies but later proof failed. */
-  discardFailedSharedOidcSession: () => void;
   logout: () => Promise<void>;
   hasPermission: (permission: string) => boolean;
   hasAnyPermission: (permissions: string[]) => boolean;
@@ -153,17 +90,8 @@ export interface AuthContextType extends AuthState {
   mfaPending: boolean;
   mfaSetupPending: boolean;
   challengeToken: string | null;
-  pendingTenantSlug: string | null;
   verifyMfa: (code: string) => Promise<void>;
   cancelMfa: () => void;
-  /**
-   * Hosted-shared step-up (NAN-2361 wave 5): re-prove TOTP on the current
-   * tenant session so fresh-MFA admin surfaces (SSO provider administration)
-   * work without signing in again. Sent with this tab's bearer only
-   * (NAN-3905); replaces the tab's bearer, the session itself (its
-   * authentication fence) is kept.
-   */
-  stepUpMfa: (code: string) => Promise<void>;
 }
 
 // ============================================================================
@@ -198,10 +126,56 @@ function clearOidcState(): void {
 }
 
 /**
+ * Validates that a return path is safe for redirection.
+ * Prevents open redirect vulnerabilities by ensuring the path:
+ * - Starts with a single forward slash (relative path)
+ * - Does not contain protocol indicators
+ * - Does not use protocol-relative URLs (//example.com)
+ */
+function isValidReturnPath(path: string): boolean {
+  // Must start with exactly one forward slash (not //)
+  if (!path.startsWith('/') || path.startsWith('//')) {
+    return false;
+  }
+
+  // #7030: validate the navigation path only. The search and fragment carry
+  // values (ISO timestamps, URLs inside a hunt query) that legitimately hold
+  // ':' and must survive the login round trip; they cannot change the origin.
+  const pathname = path.split(/[?#]/, 1)[0];
+
+  // No control characters or whitespace in the path
+  if (/[\u0000-\u0020\u007f]/.test(pathname)) {
+    return false;
+  }
+
+  // Must not contain protocol indicators
+  if (pathname.includes(':')) {
+    return false;
+  }
+
+  // Must not contain backslashes (Windows path or encoding tricks)
+  if (pathname.includes('\\')) {
+    return false;
+  }
+
+  // Must not contain encoded characters that could bypass validation
+  // Check for %2f (/) %5c (\) %3a (:) encoded
+  const lowerPath = pathname.toLowerCase();
+  if (lowerPath.includes('%2f') || lowerPath.includes('%5c') || lowerPath.includes('%3a')) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
  * Sanitizes a return path, returning '/' if invalid
  */
 function sanitizeReturnPath(path: string | undefined): string {
-  return safeReturnPath(path);
+  if (!path || !isValidReturnPath(path)) {
+    return '/';
+  }
+  return path;
 }
 
 // ============================================================================
@@ -215,7 +189,6 @@ async function apiRequest<T>(
   options: RequestInit = {},
   accessToken?: string
 ): Promise<T> {
-  const capturedRuntime = browserTenantRuntime.current();
   const headers: HeadersInit = {
     'Content-Type': 'application/json',
     ...options.headers,
@@ -228,7 +201,7 @@ async function apiRequest<T>(
   const response = await fetch(`${API_BASE_URL}${endpoint}`, {
     ...options,
     headers,
-    credentials: requestCredentials(endpoint, headers, capturedRuntime.scope.kind === 'enterprise_shared'),
+    credentials: 'include',
   });
 
   if (!response.ok) {
@@ -242,13 +215,10 @@ async function apiRequest<T>(
 
   // Handle 204 No Content
   if (response.status === 204) {
-    browserTenantRuntime.assertCurrent(capturedRuntime);
     return {} as T;
   }
 
-  const value = await response.json();
-  browserTenantRuntime.assertCurrent(capturedRuntime);
-  return value;
+  return response.json();
 }
 
 class AuthError extends Error {
@@ -269,41 +239,10 @@ class AuthError extends Error {
 
 const AUTH_CHANNEL_NAME = 'nanosiem-auth';
 
-function refreshScopeKey(
-  scope: TenantRuntimeSnapshot['scope'],
-  routeTenantSlug?: string,
-): string {
-  if (scope.kind === 'enterprise_shared' && scope.tenant.slug === routeTenantSlug) {
-    return `enterprise_shared:${scope.tenant.id}:${scope.userId}`;
-  }
-  if (routeTenantSlug) return `enterprise_shared_slug:${routeTenantSlug}`;
-  if (scope.kind === 'anonymous') return 'anonymous';
-  if (scope.kind === 'enterprise_shared') {
-    return `enterprise_shared:${scope.tenant.id}:${scope.userId}`;
-  }
-  return `${scope.kind}:${scope.userId}`;
-}
-
-function currentRouteTenantSlug(): string | undefined {
-  return typeof window === 'undefined'
-    ? undefined
-    : tenantSlugForAuthContinuation(window.location.pathname);
-}
-
-/** This tab's cookie slot right now (NAN-3548). */
-function currentCookieSlot(): string {
-  return cookieSlotForScope(browserTenantRuntime.current().scope, currentRouteTenantSlug());
-}
-
-/** Cookie slot of a freshly authenticated identity. */
-function authenticatedCookieSlot(state: AuthState): string {
-  return cookieSlotForScope(state.tenantRuntime.scope);
-}
-
-function broadcastLogout(cookieSlot: string): void {
+function broadcastLogout(): void {
   try {
     const channel = new BroadcastChannel(AUTH_CHANNEL_NAME);
-    channel.postMessage({ type: 'logout', cookieSlot });
+    channel.postMessage({ type: 'logout' });
     channel.close();
   } catch {
     // BroadcastChannel not supported — single-tab fallback
@@ -330,42 +269,12 @@ export function AuthProvider({ children }: AuthProviderProps) {
     isAuthenticated: false,
     isLoading: true,
     error: null,
-    tenantRuntime: browserTenantRuntime.current(),
   });
-
-  const authenticatedState = useCallback((user: User, expectedTenantSlug?: string): AuthState => {
-    const verified = verifyServerAuthIdentity(user, expectedTenantSlug);
-    // NAN-4800: remember the tenant so a tenant-less deep link on this
-    // pooled host can be sent back under `/t/<tenant>` (a hint, never authority).
-    if (verified.activeTenant) rememberActiveTenant(verified.activeTenant.slug);
-    const scope = authenticatedRuntimeScope({
-      userId: user.id,
-      roles: user.roles,
-      activeTenant: user.active_tenant,
-      deploymentMode: verified.deploymentMode,
-    });
-    return {
-      user,
-      isAuthenticated: true,
-      isLoading: false,
-      error: null,
-      tenantRuntime: browserTenantRuntime.activate(scope),
-    };
-  }, []);
-
-  const anonymousState = useCallback((error: string | null = null): AuthState => ({
-    user: null,
-    isAuthenticated: false,
-    isLoading: false,
-    error,
-    tenantRuntime: browserTenantRuntime.activate({ kind: 'anonymous' }),
-  }), []);
 
   // MFA state
   const [mfaPending, setMfaPending] = useState(false);
   const [mfaSetupPending, setMfaSetupPending] = useState(false);
   const [challengeToken, setChallengeToken] = useState<string | null>(null);
-  const [pendingTenantSlug, setPendingTenantSlug] = useState<string | null>(null);
 
   const refreshTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Deduplication: concurrent callers wait on the same promise
@@ -382,96 +291,103 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
     if (refreshMs > 0) {
       refreshTimeoutRef.current = setTimeout(async () => {
-        await refreshAuth().catch(() => false);
+        await refreshAuth();
       }, refreshMs);
     }
   }, []);
 
-  // Refresh authentication via HttpOnly refresh_token cookie (or demo refresh token)
-  const refreshAuth = useCallback(async (): Promise<boolean> => {
+  // Refresh authentication via HttpOnly refresh_token cookie (or demo refresh token).
+  //
+  // NAN-2453: the cookie refresh is coordinated across tabs. Exactly one tab
+  // calls /api/auth/refresh (the rotating, single-use cookie); the others
+  // receive its access token. All of this tab's protected requests wait on
+  // the same refresh (sessionCredentials) and a failure notifies once.
+  // `silent` is the page-load probe of a visitor who may never have signed
+  // in: a failure there is "not signed in", not "session expired".
+  const refreshAuth = useCallback(async (silent = false): Promise<boolean> => {
     // Dedup: if a refresh is already in-flight, return the same promise
     if (refreshPromiseRef.current) return refreshPromiseRef.current;
 
     const doRefresh = async (): Promise<boolean> => {
       try {
-        // Demo users: send refresh token in body (no HttpOnly cookie)
-        // Regular users: empty body, refresh token is in the HttpOnly cookie
+        // Demo users: send refresh token in body (no HttpOnly cookie), per tab.
+        // Regular users: empty body, refresh token is in the HttpOnly cookie.
         const demoRefreshToken = getDemoRefreshToken();
-        const runtimeScope = browserTenantRuntime.current().scope;
-        const pathTenantSlug = currentRouteTenantSlug();
-        const refreshTenantSlug = pathTenantSlug
-          ?? (runtimeScope.kind === 'enterprise_shared' ? runtimeScope.tenant.slug : undefined);
-        const currentRefreshScopeKey = refreshScopeKey(runtimeScope, refreshTenantSlug);
-        const refreshCookieSlot = cookieSlotForScope(runtimeScope, refreshTenantSlug);
-        const body = demoRefreshToken
-          ? JSON.stringify({ refresh_token: demoRefreshToken })
-          : JSON.stringify(tenantContinuationBody(refreshTenantSlug));
-
-        const refreshOperation = () => apiRequest<{
+        const callRefresh = () => apiRequest<{
           access_token: string;
           refresh_token: string;
           expires_in: number;
         }>('/api/auth/refresh', {
           method: 'POST',
-          body,
+          body: demoRefreshToken
+            ? JSON.stringify({ refresh_token: demoRefreshToken })
+            : JSON.stringify({}),
           signal: AbortSignal.timeout(10_000),
         });
-        // Demo sessions intentionally retain their existing per-tab refresh
-        // contract. Regular rotating HttpOnly cookies get one cross-tab winner.
-        const response = demoRefreshToken
-          ? await refreshOperation()
-          : await coordinateBrowserRefresh(async () => {
-              const refreshed = await refreshOperation();
-              // Never put the rotating refresh credential on BroadcastChannel.
-              return accessOnlyRefreshResult(refreshed);
-            }, {
-              requireCoordination:
-                browserTenantRuntime.current().scope.kind === 'enterprise_shared'
-                || (typeof window !== 'undefined' && window.location.pathname.startsWith('/t/')),
-              scopeKey: currentRefreshScopeKey,
-              cookieSlot: refreshCookieSlot,
-            });
 
-        // Verify the winner token against the expected route/tenant before it
-        // can replace this tab's in-memory bearer credential.
-        const userInfo = await apiRequest<User>('/api/auth/me', { signal: AbortSignal.timeout(10_000) }, response.access_token);
-        const nextState = authenticatedState(userInfo, refreshTenantSlug);
-        setAccessToken(response.access_token, response.expires_in);
+        let accessToken: string;
+        let expiresIn: number;
+        let demoRotated: string | null = null;
+        if (demoRefreshToken) {
+          const response = await callRefresh();
+          accessToken = response.access_token;
+          expiresIn = response.expires_in;
+          // An empty refresh_token is a grace refresh (the token was rotated a
+          // moment ago by a concurrent tab): keep whatever that tab persisted.
+          demoRotated = response.refresh_token || getDemoRefreshToken() || demoRefreshToken;
+        } else {
+          // Only the access token crosses tabs; the refresh token stays in
+          // the HttpOnly cookie.
+          const shared = await coordinateBrowserRefresh(
+            async () => accessOnlyRefreshResult(await callRefresh()),
+          );
+          accessToken = shared.access_token;
+          expiresIn = shared.expires_in;
+        }
+
+        // Get current user info with the new bearer before adopting it.
+        const userInfo = await apiRequest<User>(
+          '/api/auth/me',
+          { signal: AbortSignal.timeout(10_000) },
+          accessToken,
+        );
+        setAccessToken(accessToken, expiresIn);
 
         // Update demo session with new tokens
-        if (
-          demoRefreshToken
-          && 'refresh_token' in response
-          && typeof response.refresh_token === 'string'
-        ) {
-          persistDemoSession(response.access_token, response.refresh_token, response.expires_in, userInfo);
+        if (demoRefreshToken && demoRotated) {
+          persistDemoSession(accessToken, demoRotated, expiresIn, userInfo);
         }
 
-        setState(nextState);
+        setState({
+          user: userInfo,
+          isAuthenticated: true,
+          isLoading: false,
+          error: null,
+        });
 
-        // A route-slug-only refresh scope is not an authenticated identity.
-        // Announce only after /auth/me and exact tenant validation succeeded.
-        if (!demoRefreshToken) {
-          broadcastSessionReplacement(
-            refreshScopeKey(nextState.tenantRuntime.scope),
-            authenticatedCookieSlot(nextState),
-          );
-        }
-
-        scheduleTokenRefresh(response.expires_in);
+        scheduleTokenRefresh(expiresIn);
         return true;
       } catch {
         clearAccessToken();
-        // The shared request gate invokes handleAuthFailure once for the queue.
+        setState(prev => ({
+          ...prev,
+          user: null,
+          isAuthenticated: false,
+          isLoading: false,
+        }));
         return false;
-      } finally {
-        refreshPromiseRef.current = null;
       }
     };
 
-    refreshPromiseRef.current = sessionCredentials.runRefresh(doRefresh);
-    return refreshPromiseRef.current;
-  }, [anonymousState, authenticatedState, scheduleTokenRefresh]);
+    // runRefresh rejects (once-latched SessionExpiredError) on failure; the
+    // public contract stays boolean.
+    const pending = sessionCredentials
+      .runRefresh(doRefresh, !silent)
+      .catch(() => false)
+      .finally(() => { refreshPromiseRef.current = null; });
+    refreshPromiseRef.current = pending;
+    return pending;
+  }, [scheduleTokenRefresh]);
 
   // Handle auth failure from API client (401 that couldn't be refreshed)
   const handleAuthFailure = useCallback(() => {
@@ -482,11 +398,15 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }
 
     clearAccessToken();
-    setPendingTenantSlug(null);
 
     // Update state to logged out
-    setState(anonymousState('Session expired — sign in again'));
-  }, [anonymousState]);
+    setState({
+      user: null,
+      isAuthenticated: false,
+      isLoading: false,
+      error: 'Session expired. Please log in again.',
+    });
+  }, []);
 
   // Initialize auth state on mount
   useEffect(() => {
@@ -506,10 +426,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       // Skip silent refresh on OIDC callback pages — the callback component
       // will authenticate via handleOidcCallback, and racing with refreshAuth
       // would use a stale cookie and fail.
-      if (
-        window.location.pathname.startsWith('/auth/callback')
-        || window.location.pathname.startsWith('/auth/shared/oidc/')
-      ) {
+      if (window.location.pathname.startsWith('/auth/callback')) {
         setState(prev => ({ ...prev, isLoading: false }));
         return;
       }
@@ -517,59 +434,41 @@ export function AuthProvider({ children }: AuthProviderProps) {
       // Restore demo session from localStorage (survives page reloads)
       const demoSession = restoreDemoSession();
       if (demoSession) {
-        const restoredDemoUser = {
-          ...(demoSession.user as Omit<User, 'deployment_mode'>),
-          deployment_mode: 'demo' as const,
-        };
         setAccessToken(demoSession.accessToken, 900); // re-set in memory
-        setState(authenticatedState(restoredDemoUser));
+        setState({
+          user: demoSession.user as User,
+          isAuthenticated: true,
+          isLoading: false,
+          error: null,
+        });
         scheduleTokenRefresh(900);
         return;
       }
 
       // Attempt silent refresh via HttpOnly cookie
-      await refreshAuth().catch(() => false);
+      await refreshAuth(true);
     };
 
     initAuth();
 
-    // Listen for logout and origin-wide session replacement events from other
-    // tabs. A different tenant/user owns the one rotating cookie, so this tab
-    // must discard its in-memory bearer and scheduled refresh immediately.
+    // Listen for logout events from other tabs
     let channel: BroadcastChannel | null = null;
-    let sessionChannel: BroadcastChannel | null = null;
     try {
       channel = new BroadcastChannel(AUTH_CHANNEL_NAME);
       channel.onmessage = (event) => {
-        if (logoutMessageAffectsSlot(event.data, currentCookieSlot())) {
+        if (event.data?.type === 'logout') {
           clearAccessToken();
           if (refreshTimeoutRef.current) {
             clearTimeout(refreshTimeoutRef.current);
             refreshTimeoutRef.current = null;
           }
-          setPendingTenantSlug(null);
-          setState(anonymousState());
+          setState({
+            user: null,
+            isAuthenticated: false,
+            isLoading: false,
+            error: null,
+          });
         }
-      };
-      sessionChannel = new BroadcastChannel(REFRESH_SESSION_CHANNEL_NAME);
-      sessionChannel.onmessage = (event) => {
-        if (!isRefreshSessionMessage(event.data)) return;
-        const currentScopeKey = refreshScopeKey(browserTenantRuntime.current().scope);
-        // NAN-3548: only a mutation of THIS tab's cookie pair can end it. A
-        // sign-in or refresh for another tenant on the pooled host wrote a
-        // different pair and must not log this tab out.
-        if (!refreshSessionMessageReplacesScope(event.data, currentScopeKey, currentCookieSlot())) return;
-        clearAccessToken();
-        if (refreshTimeoutRef.current) {
-          clearTimeout(refreshTimeoutRef.current);
-          refreshTimeoutRef.current = null;
-        }
-        setPendingTenantSlug(null);
-        setState(anonymousState(
-          event.data.kind === 'session-replaced'
-            ? 'Another organization session replaced this browser session.'
-            : 'This browser session is no longer valid. Please sign in again.',
-        ));
       };
     } catch {
       // BroadcastChannel not supported
@@ -580,81 +479,55 @@ export function AuthProvider({ children }: AuthProviderProps) {
         clearTimeout(refreshTimeoutRef.current);
       }
       channel?.close();
-      sessionChannel?.close();
     };
-  }, [anonymousState, authenticatedState, refreshAuth, handleAuthFailure]);
-
-  // A successful AuthResponse (login or shared demo claim): bearer in memory,
-  // identity verified through /me against the selector, session broadcast.
-  const establishSession = useCallback(async (
-    authResponse: AuthSuccessResponse,
-    selectedTenant: string | undefined,
-  ): Promise<void> => {
-    setAccessToken(authResponse.tokens.access_token, authResponse.tokens.expires_in);
-    const userInfo = await apiRequest<User>(
-      '/api/auth/me', {}, authResponse.tokens.access_token,
-    );
-
-    const nextState = authenticatedState(userInfo, selectedTenant);
-    setState(nextState);
-    broadcastSessionReplacement(
-      refreshScopeKey(nextState.tenantRuntime.scope),
-      authenticatedCookieSlot(nextState),
-    );
-    setPendingTenantSlug(null);
-
-    scheduleTokenRefresh(authResponse.tokens.expires_in);
-  }, [authenticatedState, scheduleTokenRefresh]);
+  }, [refreshAuth, handleAuthFailure]);
 
   // Login with email and password (may return MFA challenge)
-  const login = useCallback(async (
-    email: string,
-    password: string,
-    tenantSlug?: string,
-  ): Promise<void> => {
-    const selectedTenant = tenantSlug === undefined
-      ? undefined
-      : canonicalTenantSlug(tenantSlug);
-    setPendingTenantSlug(selectedTenant ?? null);
+  const login = useCallback(async (email: string, password: string): Promise<void> => {
     setState(prev => ({ ...prev, isLoading: true, error: null }));
     setMfaPending(false);
     setMfaSetupPending(false);
     setChallengeToken(null);
 
     try {
-      await withBrowserCookieMutationLock(async () => {
-        // Use raw fetch to inspect the response shape (may be MFA challenge).
-        // The endpoint can write auth cookies on its success path, so it owns
-        // the same origin-wide mutation lock as refresh.
-        const response = await apiRequest<Record<string, unknown>>('/api/auth/login', {
-          method: 'POST',
-          body: JSON.stringify(loginRequestBody(email, password, selectedTenant)),
-        });
-
-        // Check if MFA is required
-        if (response.mfa_required) {
-          setChallengeToken(response.challenge_token as string);
-          setMfaPending(true);
-          setState(prev => ({ ...prev, isLoading: false, error: null }));
-          return; // Don't navigate — Login page will show MFA form
-        }
-
-        // Check if MFA setup is required (admin-enforced)
-        if (response.mfa_setup_required) {
-          setChallengeToken(response.challenge_token as string);
-          setMfaSetupPending(true);
-          setState(prev => ({ ...prev, isLoading: false, error: null }));
-          return; // Don't navigate — Login page will redirect to MFA setup
-        }
-
-        // Normal login success
-        await establishSession(response as unknown as AuthSuccessResponse, selectedTenant);
-      }, {
-        requireCoordination: selectedTenant !== undefined,
-        cookieSlot: selectedTenant === undefined ? ORIGIN_COOKIE_SLOT : tenantCookieSlot(selectedTenant),
+      // Use raw fetch to inspect the response shape (may be MFA challenge)
+      const response = await apiRequest<Record<string, unknown>>('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ email, password }),
       });
+
+      // Check if MFA is required
+      if (response.mfa_required) {
+        setChallengeToken(response.challenge_token as string);
+        setMfaPending(true);
+        setState(prev => ({ ...prev, isLoading: false, error: null }));
+        return; // Don't navigate — Login page will show MFA form
+      }
+
+      // Check if MFA setup is required (admin-enforced)
+      if (response.mfa_setup_required) {
+        setChallengeToken(response.challenge_token as string);
+        setMfaSetupPending(true);
+        setState(prev => ({ ...prev, isLoading: false, error: null }));
+        return; // Don't navigate — Login page will redirect to MFA setup
+      }
+
+      // Normal login success
+      const authResponse = response as unknown as {
+        user: User;
+        tokens: { access_token: string; refresh_token: string; expires_in: number };
+      };
+      setAccessToken(authResponse.tokens.access_token, authResponse.tokens.expires_in);
+
+      setState({
+        user: authResponse.user,
+        isAuthenticated: true,
+        isLoading: false,
+        error: null,
+      });
+
+      scheduleTokenRefresh(authResponse.tokens.expires_in);
     } catch (error) {
-      clearAccessToken();
       const message = error instanceof AuthError
         ? error.message
         : 'An unexpected error occurred';
@@ -666,29 +539,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       }));
       throw error;
     }
-  }, [establishSession]);
-
-  // NAN-4152: claim a shared demo link. The answer is a login AuthResponse
-  // (+ the tenant's session cookies), so the session is established exactly
-  // as a successful shared login: same cookie-mutation lock, same /me
-  // verification against the canonical slug, same refresh scheduling.
-  const claimSharedDemo = useCallback(async (tenantSlug: string, token: string): Promise<void> => {
-    const body = sharedDemoClaimBody(tenantSlug, token);
-    setState(prev => ({ ...prev, isLoading: true, error: null }));
-    try {
-      await withBrowserCookieMutationLock(async () => {
-        const response = await apiRequest<AuthSuccessResponse>(SHARED_DEMO_CLAIM_PATH, {
-          method: 'POST',
-          body: JSON.stringify(body),
-        });
-        await establishSession(response, body.tenant_slug);
-      }, { requireCoordination: true, cookieSlot: tenantCookieSlot(body.tenant_slug) });
-    } catch (error) {
-      clearAccessToken();
-      setState(prev => ({ ...prev, isLoading: false, error: null }));
-      throw error;
-    }
-  }, [establishSession]);
+  }, [scheduleTokenRefresh]);
 
   // Verify MFA challenge (TOTP code or backup code)
   const verifyMfa = useCallback(async (code: string): Promise<void> => {
@@ -697,42 +548,28 @@ export function AuthProvider({ children }: AuthProviderProps) {
     setState(prev => ({ ...prev, isLoading: true, error: null }));
 
     try {
-      await withBrowserCookieMutationLock(async () => {
-        const response = await apiRequest<{
-          user: User;
-          tokens: { access_token: string; refresh_token: string; expires_in: number };
-        }>('/api/auth/mfa/challenge', {
-          method: 'POST',
-          body: JSON.stringify({
-            challenge_token: challengeToken,
-            code,
-            ...tenantContinuationBody(pendingTenantSlug ?? undefined),
-          }),
-        });
-
-        setAccessToken(response.tokens.access_token, response.tokens.expires_in);
-        const userInfo = await apiRequest<User>(
-          '/api/auth/me', {}, response.tokens.access_token,
-        );
-        setMfaPending(false);
-        setMfaSetupPending(false);
-        setChallengeToken(null);
-
-        const nextState = authenticatedState(userInfo, pendingTenantSlug ?? undefined);
-        setState(nextState);
-        broadcastSessionReplacement(
-          refreshScopeKey(nextState.tenantRuntime.scope),
-          authenticatedCookieSlot(nextState),
-        );
-        setPendingTenantSlug(null);
-
-        scheduleTokenRefresh(response.tokens.expires_in);
-      }, {
-        requireCoordination: pendingTenantSlug !== null,
-        cookieSlot: pendingTenantSlug === null ? ORIGIN_COOKIE_SLOT : tenantCookieSlot(pendingTenantSlug),
+      const response = await apiRequest<{
+        user: User;
+        tokens: { access_token: string; refresh_token: string; expires_in: number };
+      }>('/api/auth/mfa/challenge', {
+        method: 'POST',
+        body: JSON.stringify({ challenge_token: challengeToken, code }),
       });
+
+      setAccessToken(response.tokens.access_token, response.tokens.expires_in);
+      setMfaPending(false);
+      setMfaSetupPending(false);
+      setChallengeToken(null);
+
+      setState({
+        user: response.user,
+        isAuthenticated: true,
+        isLoading: false,
+        error: null,
+      });
+
+      scheduleTokenRefresh(response.tokens.expires_in);
     } catch (error) {
-      clearAccessToken();
       const message = error instanceof AuthError
         ? error.message
         : 'Invalid code — please try again';
@@ -744,41 +581,13 @@ export function AuthProvider({ children }: AuthProviderProps) {
       }));
       throw error;
     }
-  }, [authenticatedState, challengeToken, pendingTenantSlug, scheduleTokenRefresh]);
-
-  // Hosted-shared MFA step-up on the current session. NAN-3905: the request
-  // carries this tab's in-memory bearer with `credentials: 'omit'` (the
-  // ApiClient rule). It used to be cookie-only, which sent every tenant's
-  // `access_token__<d>` cookie on the pooled host; the shared extractor then
-  // refused it with "Provide exactly one authentication credential" as soon
-  // as a second tenant was signed in. The answer's Set-Cookie is ignored
-  // under 'omit': the stepped-up access bearer is taken from the JSON, and
-  // the cookie session keeps its existing refresh pair.
-  const stepUpMfa = useCallback(async (code: string): Promise<void> => {
-    // Waits for an in-flight refresh and refreshes a missing bearer, like
-    // every ApiClient call; throws SessionExpiredError when there is none.
-    const bearer = await sessionCredentials.credential();
-    await withBrowserCookieMutationLock(async () => {
-      const response = await apiRequest<{
-        user: User;
-        tokens: { access_token: string; refresh_token: string; expires_in: number };
-      }>('/api/auth/shared/mfa/step-up', {
-        method: 'POST',
-        body: JSON.stringify({ code }),
-      }, bearer);
-      setAccessToken(response.tokens.access_token, response.tokens.expires_in);
-      const userInfo = await apiRequest<User>('/api/auth/me', {}, response.tokens.access_token);
-      setState(prev => ({ ...prev, user: userInfo, error: null }));
-      scheduleTokenRefresh(response.tokens.expires_in);
-    }, { requireCoordination: false, cookieSlot: currentCookieSlot() });
-  }, [scheduleTokenRefresh]);
+  }, [challengeToken, scheduleTokenRefresh]);
 
   // Cancel MFA challenge (go back to login)
   const cancelMfa = useCallback(() => {
     setMfaPending(false);
     setMfaSetupPending(false);
     setChallengeToken(null);
-    setPendingTenantSlug(null);
     setState(prev => ({ ...prev, error: null }));
   }, []);
 
@@ -797,13 +606,17 @@ export function AuthProvider({ children }: AuthProviderProps) {
         name: response.auth.user.name,
         roles: response.auth.user.roles,
         permissions: response.auth.user.permissions,
-        deployment_mode: 'demo' as const,
       };
 
       // Persist demo session in sessionStorage for page reload survival
       persistDemoSession(response.auth.access_token, response.auth.refresh_token, response.auth.expires_in, demoUser);
 
-      setState(authenticatedState(demoUser));
+      setState({
+        user: demoUser,
+        isAuthenticated: true,
+        isLoading: false,
+        error: null,
+      });
 
       scheduleTokenRefresh(response.auth.expires_in);
     } catch (error) {
@@ -811,7 +624,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       setState(prev => ({ ...prev, isLoading: false, error: message }));
       throw error;
     }
-  }, [authenticatedState, scheduleTokenRefresh]);
+  }, [scheduleTokenRefresh]);
 
   // Claim a demo session by one-time token (from unique link)
   const claimDemoToken = useCallback(async (token: string): Promise<void> => {
@@ -828,12 +641,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
         name: response.auth.user.name,
         roles: response.auth.user.roles,
         permissions: response.auth.user.permissions,
-        deployment_mode: 'demo' as const,
       };
 
       persistDemoSession(response.auth.access_token, response.auth.refresh_token, response.auth.expires_in, demoUser);
 
-      setState(authenticatedState(demoUser));
+      setState({
+        user: demoUser,
+        isAuthenticated: true,
+        isLoading: false,
+        error: null,
+      });
 
       scheduleTokenRefresh(response.auth.expires_in);
     } catch (error) {
@@ -841,7 +658,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       setState(prev => ({ ...prev, isLoading: false, error: message }));
       throw error;
     }
-  }, [authenticatedState, scheduleTokenRefresh]);
+  }, [scheduleTokenRefresh]);
 
   // Initiate OIDC login
   const loginWithOidc = useCallback(async (providerSlug: string, currentPath?: string): Promise<void> => {
@@ -908,46 +725,40 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }
 
     try {
-      return await withBrowserCookieMutationLock(async () => {
-        const response = await apiRequest<{
-          user: User;
-          tokens: {
-            access_token: string;
-            refresh_token: string;
-            expires_in: number;
-          };
-        }>(`/api/auth/oidc/${providerSlug}/callback`, {
-          method: 'POST',
-          body: JSON.stringify({
-            code,
-            state,
-            redirect_uri: storedState.redirectUri,
-          }),
-        });
-
-        // Access token in memory; refresh token already set as HttpOnly cookie by backend
-        setAccessToken(response.tokens.access_token, response.tokens.expires_in);
-        const userInfo = await apiRequest<User>(
-          '/api/auth/me', {}, response.tokens.access_token,
-        );
-
-        const nextState = authenticatedState(userInfo);
-        setState(nextState);
-        broadcastSessionReplacement(
-          refreshScopeKey(nextState.tenantRuntime.scope),
-          authenticatedCookieSlot(nextState),
-        );
-
-        scheduleTokenRefresh(response.tokens.expires_in);
-
-        clearOidcState();
-
-        // Return the redirect path instead of navigating. Re-validate returnTo
-        // even though it was sanitized on storage (defense in depth).
-        return sanitizeReturnPath(storedState.returnTo);
+      const response = await apiRequest<{
+        user: User;
+        tokens: {
+          access_token: string;
+          refresh_token: string;
+          expires_in: number;
+        };
+      }>(`/api/auth/oidc/${providerSlug}/callback`, {
+        method: 'POST',
+        body: JSON.stringify({
+          code,
+          state,
+          redirect_uri: storedState.redirectUri,
+        }),
       });
+
+      // Access token in memory; refresh token already set as HttpOnly cookie by backend
+      setAccessToken(response.tokens.access_token, response.tokens.expires_in);
+
+      setState({
+        user: response.user,
+        isAuthenticated: true,
+        isLoading: false,
+        error: null,
+      });
+
+      scheduleTokenRefresh(response.tokens.expires_in);
+
+      clearOidcState();
+
+      // Return the redirect path instead of navigating
+      // Re-validate returnTo even though it was sanitized on storage (defense in depth)
+      return sanitizeReturnPath(storedState.returnTo);
     } catch (error) {
-      clearAccessToken();
       const message = error instanceof AuthError
         ? error.message
         : 'SSO authentication failed';
@@ -960,91 +771,39 @@ export function AuthProvider({ children }: AuthProviderProps) {
       clearOidcState();
       throw error;
     }
-  }, [authenticatedState, scheduleTokenRefresh]);
+  }, [scheduleTokenRefresh]);
 
   // Logout - returns true when complete, caller handles navigation
   const logout = useCallback(async (): Promise<void> => {
     const token = getAccessToken();
-    const runtimeScope = browserTenantRuntime.current().scope;
-    const logoutScopeKey = refreshScopeKey(runtimeScope);
-    const logoutCookieSlot = cookieSlotForScope(runtimeScope);
-    let logoutFailure: unknown;
-    let localCleanupComplete = false;
-
-    const clearLocalSession = (notifyOtherTabs = true) => {
-      if (refreshTimeoutRef.current) {
-        clearTimeout(refreshTimeoutRef.current);
-        refreshTimeoutRef.current = null;
-      }
-      clearAccessToken();
-      setPendingTenantSlug(null);
-      const nextState = anonymousState();
-      setState(logoutFailure
-        ? {
-            ...nextState,
-            error: logoutFailure instanceof AuthError
-              ? logoutFailure.message
-              : 'Logout could not be completed safely. Your local credentials were cleared.',
-          }
-        : nextState);
-      if (notifyOtherTabs) {
-        if (runtimeScope.kind === 'enterprise_shared') {
-          broadcastTenantSessionRevocation(logoutScopeKey);
-        } else {
-          broadcastLogout(logoutCookieSlot);
-          broadcastSessionInvalidation(logoutScopeKey, logoutCookieSlot);
-        }
-      }
-      localCleanupComplete = true;
-    };
 
     try {
-      await withBrowserCookieMutationLock(async () => {
-        const currentScopeKey = refreshScopeKey(browserTenantRuntime.current().scope);
-        if (!cookieMutationStillOwnsSession(
-          logoutScopeKey,
-          token,
-          currentScopeKey,
-          getAccessToken(),
-        )) {
-          return;
-        }
-        try {
-          // Shared mode revokes this tab's tenant namespace by bearer, with no
-          // cookie mutation. Dedicated mode retains its HttpOnly-cookie flow.
-          await apiRequest('/api/auth/logout', {
-            method: 'POST',
-            body: JSON.stringify({}),
-          }, token ?? undefined);
-        } catch (error) {
-          // The server proves the origin-wide cookie now belongs to another
-          // authenticated session. This is a stale completion from the old
-          // tab, not a logout failure: clearing/broadcasting here would evict
-          // the replacement tenant session that correctly won the cookie
-          // mutation race.
-          if (error instanceof AuthError && error.code === 'session_replaced') {
-            clearLocalSession(false);
-            return;
-          }
-          logoutFailure = error;
-        }
-        // Signal invalidation before releasing the cookie lock so no waiting
-        // refresh can rotate or resurrect the just-cleared session.
-        clearLocalSession();
-      }, {
-        requireCoordination: runtimeScope.kind === 'enterprise_shared',
-        cookieSlot: logoutCookieSlot,
-      });
-    } catch (error) {
-      logoutFailure = logoutFailure ?? error;
-      if (!localCleanupComplete) clearLocalSession();
+      // Empty body — refresh token is in the HttpOnly cookie
+      await apiRequest('/api/auth/logout', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      }, token ?? undefined);
+    } catch {
+      // Ignore logout errors, clear local state anyway
     }
 
-    if (logoutFailure) {
-      throw logoutFailure;
+    if (refreshTimeoutRef.current) {
+      clearTimeout(refreshTimeoutRef.current);
     }
-    // Navigation handled by caller on success
-  }, [anonymousState]);
+
+    clearAccessToken();
+    setState({
+      user: null,
+      isAuthenticated: false,
+      isLoading: false,
+      error: null,
+    });
+
+    // Notify other tabs
+    broadcastLogout();
+
+    // Navigation handled by caller
+  }, []);
 
   // Permission helpers
   const hasPermission = useCallback((permission: string): boolean => {
@@ -1070,52 +829,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     setState(prev => ({ ...prev, error: null }));
   }, []);
 
-  const acceptSharedOidcSession = useCallback(async (
-    _callbackUser: User,
-    expectedTenantSlug: string,
-    session?: { accessToken: string; expiresIn: number },
-  ): Promise<void> => {
-    // The callback itself exposes no credential. While its cookie mutation
-    // lock is still held, rotate the new HttpOnly refresh cookie once and keep
-    // only the returned short-lived access bearer in this tab's memory. Search
-    // is a separate service and intentionally accepts tenant-bound bearer auth,
-    // not generic cookie POSTs. NAN-3905: the callback proof already did that
-    // rotation (it needs the bearer to prove /auth/me with one credential);
-    // adopt its bearer instead of rotating twice.
-    const response = session
-      ? { access_token: session.accessToken, expires_in: session.expiresIn }
-      : await apiRequest<{
-        access_token: string;
-        refresh_token: string;
-        expires_in: number;
-      }>('/api/auth/refresh', {
-        method: 'POST',
-        body: JSON.stringify(tenantContinuationBody(expectedTenantSlug)),
-      });
-    const user = await apiRequest<User>('/api/auth/me', {}, response.access_token);
-    setAccessToken(response.access_token, response.expires_in);
-    setPendingTenantSlug(null);
-    const nextState = authenticatedState(user, canonicalTenantSlug(expectedTenantSlug));
-    setState(nextState);
-    broadcastSessionReplacement(
-      refreshScopeKey(nextState.tenantRuntime.scope),
-      authenticatedCookieSlot(nextState),
-    );
-    scheduleTokenRefresh(response.expires_in);
-  }, [authenticatedState, scheduleTokenRefresh]);
-
-  const discardFailedSharedOidcSession = useCallback((): void => {
-    if (refreshTimeoutRef.current) {
-      clearTimeout(refreshTimeoutRef.current);
-      refreshTimeoutRef.current = null;
-    }
-    clearAccessToken();
-    setPendingTenantSlug(null);
-    setState(anonymousState());
-  }, [anonymousState]);
-
-  // Saturn demo role, or a live shared demo session (`demo.active` on /me).
-  const isDemoUser = isDemoIdentity(state.user);
+  const isDemoUser = state.user?.roles?.includes('demo_analyst') ?? false;
 
   const value: AuthContextType = {
     ...state,
@@ -1124,11 +838,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
     login,
     loginAsDemo,
     claimDemoToken,
-    claimSharedDemo,
     loginWithOidc,
     handleOidcCallback,
-    acceptSharedOidcSession,
-    discardFailedSharedOidcSession,
     logout,
     hasPermission,
     hasAnyPermission,
@@ -1138,10 +849,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
     mfaPending,
     mfaSetupPending,
     challengeToken,
-    pendingTenantSlug,
     verifyMfa,
     cancelMfa,
-    stepUpMfa,
   };
 
   return (

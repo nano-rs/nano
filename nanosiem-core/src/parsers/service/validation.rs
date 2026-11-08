@@ -22,6 +22,15 @@ impl ParserService {
             };
         }
 
+        // NAN-4953: Vector env-interpolation syntax (`${NAME}` / `$NAME`).
+        if let Err(msg) = crate::vector_env::reject_vrl_interpolation("parser_vrl", vrl_code) {
+            return VrlValidationResult {
+                valid: false,
+                error: Some(msg),
+                warnings,
+            };
+        }
+
         // SECURITY: Check for TOML injection attempts
         // VRL code is wrapped in ''' blocks, so we need to prevent breaking out
         if vrl_code.contains("'''") {
@@ -170,6 +179,14 @@ impl ParserService {
     /// - Syntax validation
     /// - Docker-based VRL compilation (when available)
     pub async fn validate_vrl_async(&self, vrl_code: &str) -> VrlValidationResult {
+        // NAN-4953: Vector env-interpolation syntax (`${NAME}` / `$NAME`).
+        if let Err(msg) = crate::vector_env::reject_vrl_interpolation("parser_vrl", vrl_code) {
+            return VrlValidationResult {
+                valid: false,
+                error: Some(msg),
+                warnings: vec![],
+            };
+        }
         match self.vrl_validator.validate_vrl(vrl_code).await {
             Ok(result) => result,
             Err(e) => VrlValidationResult {
@@ -195,59 +212,21 @@ impl ParserService {
     pub fn validate_parser_fields(&self, vrl_code: &str) -> VrlValidationResult {
         let mut warnings = Vec::new();
 
-        // Extract the fields this parser WRITES.
-        //
-        // NAN-2361: the previous pattern (`\.(name)(?:\s*=|\s*\[)`) scanned
-        // anywhere in the line and captured a single segment, which produced
-        // two classes of false positive — both reported as "not in UDM schema…
-        // will be preserved in metadata", about fields that are neither:
-        //
-        //   `.src_ip[0] = .source_ips[0]`   warned about `source_ips`, the
-        //       SOURCE field being READ. A parser reads arbitrary input fields
-        //       by definition; only its assignment targets are UDM's business.
-        //       (Bare `.a = .b` escaped it only because the RHS lacked a `[`.)
-        //   `.metadata.event_id = 4624`     warned about `event_id`, because
-        //       the capture took the segment after `metadata.` and the
-        //       metadata/udm guard only ever saw a single segment.
-        //
-        // So: anchor to the start of a statement, capture the WHOLE dotted
-        // path, and judge it by its ROOT segment.
-        let field_pattern = regex::Regex::new(
-            r"(?m)^\s*\.([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)(?:\[[^\]]*\])*\s*=(?:[^=]|$)",
-        )
-        .unwrap();
+        // Extract field assignments from VRL code
+        // Look for patterns like: .field_name = ...
+        let field_pattern = regex::Regex::new(r"\.([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*=|\s*\[)").unwrap();
 
         let mut found_fields = std::collections::HashSet::new();
         let mut unknown_fields = Vec::new();
 
         for cap in field_pattern.captures_iter(vrl_code) {
             if let Some(field_match) = cap.get(1) {
-                let path = field_match.as_str();
-                let mut segments = path.split('.');
-                let root = segments.next().unwrap_or(path);
+                let field_name = field_match.as_str();
 
-                // `.metadata.*` is the documented SPILL: arbitrary producer keys
-                // live there by design, so nothing under it is "unknown".
-                if root == "metadata" {
+                // Skip special fields that are not UDM fields
+                if field_name == "metadata" || field_name == "udm" {
                     continue;
                 }
-
-                // `.udm.*` is the UDM namespace itself, so validate the LEAF.
-                //
-                // Skipping the whole subtree (as the root-only rule did) turns
-                // validation off for any parser that writes this way — measured
-                // on the shipped Windows Event Log parser, that is 452 of its
-                // assignments, i.e. all of them. The leaf is exactly the field
-                // name UDM knows.
-                let field_name = if root == "udm" {
-                    match segments.next() {
-                        // A bare `.udm = {}` container init writes no field.
-                        None => continue,
-                        Some(leaf) => leaf,
-                    }
-                } else {
-                    root
-                };
 
                 // Skip fields we've already checked
                 if found_fields.contains(field_name) {

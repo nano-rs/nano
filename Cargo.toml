@@ -5,23 +5,16 @@ members = [
     "nanosiem-api",
     "nanosiem-api-lib",
     "nanosiem-search",
-    "nanosiem-lake-worker",
-    "nanosiem-lake-cell",
     "tools/log-blaster",
     "tools/event-core",
     "tools/injector",
-    # NAN-3490 PoC: not a default member, so default builds are unaffected.
+    # NAN-4914: declarative connector engine (open core). Library + operator
+    # CLI only; not built into any release image yet (phase 4 adds the runner).
     "nano-connector",
 ]
 
-default-members = [
-    "nanosiem-core", "nanosiem-api", "nanosiem-api-lib",
-    "nanosiem-search", "nanosiem-lake-worker", "nanosiem-lake-cell",
-    "tools/log-blaster", "tools/event-core", "tools/injector",
-]
-
 [workspace.package]
-version = "1.0.19"
+version = "2.0.0"
 edition = "2021"
 authors = ["NanoSIEM Team"]
 license = "AGPL-3.0-or-later"
@@ -32,7 +25,7 @@ tokio = { version = "1.48", features = ["full"] }
 
 # Database
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "rust_decimal", "migrate", "macros"] }
-clickhouse = { version = "0.14", features = ["uuid", "time", "native-tls"] }
+clickhouse = { version = "0.14", features = ["uuid", "time", "rustls-tls-aws-lc", "rustls-tls-webpki-roots"] }
 rust_decimal = { version = "1.36", features = ["serde"] }
 
 # Serialization
@@ -80,14 +73,6 @@ utoipa = { version = "5", features = ["chrono", "uuid", "axum_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
 [patch.crates-io]
-# NAN-2441: opt-in idle background polling for the UID ledger.
-slatedb = { path = "vendor/slatedb" }
-# NAN-2407: expose connect refusals before sqlx retries them.
+# NAN-4949 / NAN-4955: opt-in client TCP keepalive (NANO_SQLX_TCP_KEEPALIVE_SECS,
+# unset = upstream behaviour). See vendor/README.md.
 sqlx-core = { path = "vendor/sqlx-core" }
-# NAN-2446: cache capacity zero must use unnamed protocol statements.
-sqlx-postgres = { path = "vendor/sqlx-postgres" }
-
-# NAN-2441: instrument Iceberg FileIO at its provider HTTP boundary.
-iceberg-storage-opendal = { path = "vendor/iceberg-storage-opendal" }
-# NAN-3401: admit dotted field names under an explicit parent (OCSF `unmapped`).
-iceberg = { path = "vendor/iceberg" }

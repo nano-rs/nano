@@ -7,7 +7,8 @@ use super::PrettyPrint;
 
 impl PrettyPrint for EvalExpression {
     fn pretty_print(&self) -> String {
-        match self {
+        // NAN-4917: guarded recursion point.
+        crate::query::complexity::ensure_sufficient_stack(|| match self {
             EvalExpression::Field(name) => name.clone(),
             EvalExpression::Literal(value) => {
                 // Always quote string literals to distinguish from field names.
@@ -37,7 +38,7 @@ impl PrettyPrint for EvalExpression {
                     .join(", ");
                 format!("{}({})", name, arg_strs)
             }
-        }
+        })
     }
 }
 
@@ -113,12 +114,9 @@ mod nan2361_tests {
     #[test]
     fn nan2361_conditional_aggregation_round_trips_its_predicate() {
         let printed = parse_query(r#"* | stats count(eval(status="error")) as errors"#)
-            .expect("parses")
-            .pretty_print();
+            .expect("parses").pretty_print();
         assert!(printed.contains("eval("), "predicate dropped: {printed}");
-        let plain = parse_query("* | stats count() as c")
-            .expect("parses")
-            .pretty_print();
+        let plain = parse_query("* | stats count() as c").expect("parses").pretty_print();
         assert!(!plain.contains("eval("));
     }
 }

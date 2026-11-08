@@ -6,16 +6,15 @@
 //! shared links, page refreshes, and repeat queries return instantly
 //! without re-executing SQL or calling the LLM.
 
+use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
 use nanosiem_core::auth::ScopeSet;
-use nanosiem_core::search::{SearchTenantScope, ServingGenerationKey};
 use nanosiem_core::{SearchRequest, SearchResponse};
-use nanosiem_core::redis_transport::ReconnectingConnection as ConnectionManager;
-use redis::AsyncCommands;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
+use redis::AsyncCommands;
+use redis::aio::ConnectionManager;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use tracing::{debug, info, warn};
@@ -53,7 +52,7 @@ const MAX_CACHEABLE_ROWS: usize = 10_000;
 /// an empty query is trivial vs. the correctness risk.
 fn skip_cache_reason(response: &SearchResponse) -> Option<&'static str> {
     if response.results.is_empty() {
-        return Some("empty result set");
+        return Some("empty result set (NAN-1027)");
     }
     if response.results.len() > MAX_CACHEABLE_ROWS {
         return Some("result row count exceeds MAX_CACHEABLE_ROWS");
@@ -101,8 +100,7 @@ pub fn normalize_query(query: &str) -> std::borrow::Cow<'_, str> {
     }
     // The lexical pass above guesses where strings are. The parser is the
     // authority: collapse only when the collapsed text parses to exactly the
-    // same query (an apostrophe or quote inside a bare word, or anything the
-    // lexer misreads, keeps the trimmed text, which never merges meanings).
+    // same query; otherwise keep the trimmed text, which never merges meanings.
     if parses_identically(trimmed, &out) {
         std::borrow::Cow::Owned(out)
     } else {
@@ -111,7 +109,7 @@ pub fn normalize_query(query: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// Whether two nPL texts parse to the same AST (both must parse).
-fn parses_identically(a: &str, b: &str) -> bool {
+pub(crate) fn parses_identically(a: &str, b: &str) -> bool {
     matches!(
         (nanosiem_core::query::parse_query(a), nanosiem_core::query::parse_query(b)),
         (Ok(left), Ok(right)) if left == right
@@ -120,13 +118,48 @@ fn parses_identically(a: &str, b: &str) -> bool {
 
 /// NAN-4664: whether this request may READ the Redis result cache.
 /// `use_cache` is tri-state on the wire: absent keeps the historical
-/// behavior (read, for API keys, agents and sessions alike), an explicit
-/// `true` reads, an explicit `false` skips the read (a fresh run that still
-/// writes the cache and still shares an identical in-flight run). The
-/// `x-nano-cache-bypass` header (and the handler's other bypasses) always
-/// skip the read.
+/// behavior (read), an explicit `true` reads, an explicit `false` skips the
+/// read (a fresh run that still writes the cache and still shares an
+/// identical in-flight run). The `x-nano-cache-bypass` header always skips
+/// the read.
 pub fn reads_result_cache(bypass: bool, explicit_use_cache: Option<bool>) -> bool {
     !bypass && explicit_use_cache.unwrap_or(true)
+}
+
+/// Whether an nPL query reads state outside its window's events: lookup
+/// tables, IOC lookup/feed sources, or `| ai` (billed per member). An
+/// unparseable query counts as reading such state.
+pub(crate) fn reads_state_outside_the_events(query: &str) -> bool {
+    use nanosiem_core::query::{Command, Query, SearchExpr};
+    fn expr(e: &SearchExpr) -> bool {
+        match e {
+            SearchExpr::IocMatch { feed, lookup, .. } => feed.is_some() || lookup.is_some(),
+            SearchExpr::And(l, r) | SearchExpr::Or(l, r) => expr(l) || expr(r),
+            SearchExpr::Not(i) | SearchExpr::Group(i) => expr(i),
+            SearchExpr::InSubsearch { subsearch, .. } => node(subsearch),
+            _ => false,
+        }
+    }
+    fn node(q: &Query) -> bool {
+        match q {
+            Query::Search(e) => expr(e),
+            Query::Piped { source, command } => {
+                node(source)
+                    || matches!(
+                        command,
+                        Command::Lookup { .. } | Command::InputLookup { .. } | Command::Ai { .. }
+                    )
+                    || match command {
+                        Command::Append { subsearch, .. } | Command::Join { subsearch, .. } => {
+                            node(subsearch)
+                        }
+                        Command::Where { condition } => expr(condition),
+                        _ => false,
+                    }
+            }
+        }
+    }
+    nanosiem_core::query::parse_query(query).map_or(true, |parsed| node(&parsed))
 }
 
 /// Search result cache backed by Dragonfly/Redis
@@ -136,11 +169,9 @@ pub struct SearchResultCache {
 }
 
 impl SearchResultCache {
-    const ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX: &'static str =
-        "enterprise-shared-retention-cache-disabled:";
     /// Connect to Dragonfly/Redis. Returns None if connection fails (graceful degradation).
     pub async fn connect(redis_url: &str) -> Option<Self> {
-        let client = match nanosiem_core::redis_transport::client_from_url(redis_url) {
+        let client = match redis::Client::open(redis_url) {
             Ok(c) => c,
             Err(e) => {
                 warn!("Search result cache: failed to create Redis client: {}", e);
@@ -150,13 +181,13 @@ impl SearchResultCache {
 
         match ConnectionManager::new(client).await {
             Ok(conn) => {
-                info!("Search result cache connected");
+                info!("Search result cache connected to {}", redis_url);
                 Some(Self { conn })
             }
             Err(e) => {
                 warn!(
-                    "Search result cache: failed to connect (caching disabled): {}",
-                    e
+                    "Search result cache: failed to connect to {} (caching disabled): {}",
+                    redis_url, e
                 );
                 None
             }
@@ -176,61 +207,29 @@ impl SearchResultCache {
     /// be part of result identity or two users collide on one key and one is
     /// served the other's rows from cache (cross-user data leak).
     pub fn cache_key(request: &SearchRequest, scope: &ScopeSet) -> String {
-        Self::cache_key_for(SearchTenantScope::dedicated(), request, scope, None)
-    }
-
-    /// Tenant-pinned cache identity for enterprise-shared search. Callers must
-    /// already hold a server-resolved [`SearchTenantScope`]; a raw slug/header
-    /// cannot reach this boundary. `generation` is the tenant's serving
-    /// generation (NAN-2361 wave 6): folding it makes an erasure or retention
-    /// swap — a new generation on a new Iceberg snapshot — miss every entry
-    /// cached under the predecessor at once.
-    pub fn cache_key_for(
-        tenant: SearchTenantScope,
-        request: &SearchRequest,
-        scope: &ScopeSet,
-        generation: Option<&ServingGenerationKey>,
-    ) -> String {
-        Self::search_identity_key(tenant, "search", request, scope, generation, &[])
+        Self::search_identity_key("search", request, scope, &[])
     }
 
     /// NAN-4664: the identity of one in-flight search run, shared by every
-    /// identical concurrent request: everything [`Self::cache_key_for`] folds
-    /// (tenant, serving generation, effective source and artifact deny sets,
-    /// perf overrides, normalized query, exact time bounds, limit, offset,
-    /// result-shaping flags, dataset) plus `include_sql`, which shapes the
-    /// response too.
-    ///
-    /// Also `use_cache` (an explicit `true` lets ClickHouse serve its own
-    /// query cache, so a `false` caller never follows such a run) and
-    /// `authority`: the caller's server-resolved authority fingerprint
-    /// (plan/entitlement, prevalence and retention revisions, admission
-    /// priority; see the search handler), so nothing that can shape a result
-    /// differs between a leader and its followers.
-    pub fn inflight_key_for(
-        tenant: SearchTenantScope,
-        request: &SearchRequest,
-        scope: &ScopeSet,
-        generation: Option<&ServingGenerationKey>,
-        authority: &[u8],
-    ) -> String {
+    /// identical concurrent request: everything [`Self::cache_key`] folds
+    /// (effective source and artifact deny sets, normalized query, exact time
+    /// bounds, limit, offset, result-shaping flags, dataset) plus
+    /// `include_sql`, which shapes the response too, `use_cache` (an explicit
+    /// `true` lets ClickHouse serve its own query cache, so a `false` caller
+    /// never follows such a run) and `authority`, the caller's server-resolved
+    /// authority fingerprint (admission priority, i.e. its ClickHouse budgets).
+    pub fn inflight_key_for(request: &SearchRequest, scope: &ScopeSet, authority: &[u8]) -> String {
         let include_sql: &[u8] = if request.include_sql.unwrap_or(false) { b"sql1" } else { b"sql0" };
         let use_cache: &[u8] = if request.use_cache { b"uc1" } else { b"uc0" };
-        Self::search_identity_key(tenant, "inflight", request, scope, generation, &[include_sql, use_cache, authority])
+        Self::search_identity_key("inflight", request, scope, &[include_sql, use_cache, authority])
     }
 
     fn search_identity_key(
-        tenant: SearchTenantScope,
         prefix: &str,
         request: &SearchRequest,
         scope: &ScopeSet,
-        generation: Option<&ServingGenerationKey>,
         extra: &[&[u8]],
     ) -> String {
-        let mut generation_bytes = Vec::new();
-        if let Some(generation) = generation {
-            generation.fold_identity(&mut generation_bytes);
-        }
         let query = normalize_query(&request.query);
         let start = request.time_range.start.timestamp_micros().to_string();
         let end = request.time_range.end.timestamp_micros().to_string();
@@ -239,66 +238,28 @@ impl SearchResultCache {
         // Length-prefixed components (see `companion_key`): the query is
         // free-form and contains `|`, so a delimiter join is collision-prone.
         let mut components: Vec<&[u8]> = vec![
-                generation_bytes.as_slice(),
-                query.as_bytes(),
-                start.as_bytes(),
-                end.as_bytes(),
-                limit.as_bytes(),
-                offset.as_bytes(),
-                if request.table_view { b"tv1" } else { b"tv0" },
-                if request.skip_histogram { b"sh1" } else { b"sh0" },
-                if request.skip_field_stats { b"sf1" } else { b"sf0" },
-                // NAN-1569: the same nPL string runs against different physical
-                // tables per dataset (logs / otel_spans / otel_metrics). Without
-                // this, a query cached for one dataset is served for another →
-                // cross-dataset cache poisoning.
-                request.dataset.as_deref().unwrap_or("logs").as_bytes(),
+            query.as_bytes(),
+            start.as_bytes(),
+            end.as_bytes(),
+            limit.as_bytes(),
+            offset.as_bytes(),
+            if request.table_view { b"tv1" } else { b"tv0" },
+            if request.skip_histogram { b"sh1" } else { b"sh0" },
+            if request.skip_field_stats { b"sf1" } else { b"sf0" },
+            // NAN-1569: the same nPL string runs against different physical
+            // tables per dataset (logs / otel_spans / otel_metrics). Without
+            // this, a query cached for one dataset is served for another →
+            // cross-dataset cache poisoning.
+            request.dataset.as_deref().unwrap_or("logs").as_bytes(),
         ];
         components.extend_from_slice(extra);
-        Self::companion_key_with_generation(tenant, prefix, &components, scope, generation.is_some())
+        Self::companion_key(prefix, &components, scope)
     }
 
     /// Try to get a cached search response for this request under the
     /// caller's effective scope (NAN-1799 — see [`Self::cache_key`]).
     pub async fn get(&self, request: &SearchRequest, scope: &ScopeSet) -> Option<SearchResponse> {
-        self.get_for(SearchTenantScope::dedicated(), request, scope, None)
-            .await
-    }
-
-    /// Whether a shared tenant's request may touch the result cache at all.
-    /// NAN-2922: a query that reads tenant lookup tables, IOC sources or the
-    /// tenant-billed `| ai` pipe is never cached, because the serving
-    /// generation does not change when that state does, and a cached `| ai`
-    /// answer would bypass per-member billing.
-    ///
-    /// NAN-2361 wave 6: the key must carry the serving generation (so a
-    /// swap invalidates it) and the requested window must lie entirely
-    /// inside retention at this instant (so a fixed-TTL entry can never
-    /// cross the moving cutoff). Dedicated deployments are unconditional.
-    fn shared_cache_admitted(
-        tenant: SearchTenantScope,
-        request: &SearchRequest,
-        generation: Option<&ServingGenerationKey>,
-    ) -> bool {
-        if !crate::is_shared_scope(tenant) {
-            return true;
-        }
-        generation.is_some()
-            && tenant.cacheable_window(request.time_range.start, chrono::Utc::now())
-            && !reads_state_outside_the_generation(&request.query)
-    }
-
-    pub async fn get_for(
-        &self,
-        tenant: SearchTenantScope,
-        request: &SearchRequest,
-        scope: &ScopeSet,
-        generation: Option<&ServingGenerationKey>,
-    ) -> Option<SearchResponse> {
-        if !Self::shared_cache_admitted(tenant, request, generation) {
-            return None;
-        }
-        let key = Self::cache_key_for(tenant, request, scope, generation);
+        let key = Self::cache_key(request, scope);
         let mut conn = self.conn.clone();
 
         let data: Option<Vec<u8>> = match conn.get::<_, Option<Vec<u8>>>(&key).await {
@@ -382,31 +343,22 @@ impl SearchResultCache {
     /// Store a search response in the cache under the caller's effective
     /// scope (NAN-1799 — see [`Self::cache_key`]).
     pub async fn set(&self, request: &SearchRequest, response: &SearchResponse, scope: &ScopeSet) {
-        self.set_for(SearchTenantScope::dedicated(), request, response, scope, None)
-            .await;
-    }
-
-    pub async fn set_for(
-        &self,
-        tenant: SearchTenantScope,
-        request: &SearchRequest,
-        response: &SearchResponse,
-        scope: &ScopeSet,
-        generation: Option<&ServingGenerationKey>,
-    ) {
-        if !Self::shared_cache_admitted(tenant, request, generation) {
-            return;
-        }
         if let Some(reason) = skip_cache_reason(response) {
             debug!("Skipping cache: {}", reason);
             return;
         }
 
-        let key = Self::cache_key_for(tenant, request, scope, generation);
+        let key = Self::cache_key(request, scope);
         let mut conn = self.conn.clone();
 
+        // Request timing belongs to the current caller. Never replay the
+        // original caller's queue wait or handler wall time from cache.
+        let mut cached_response = response.clone();
+        cached_response.server_wall_ms = None;
+        cached_response.queue_wait_ms = None;
+
         // Serialize
-        let json_bytes = match serde_json::to_vec(response) {
+        let json_bytes = match serde_json::to_vec(&cached_response) {
             Ok(b) => b,
             Err(e) => {
                 debug!("Cache serialization error: {}", e);
@@ -515,29 +467,6 @@ impl SearchResultCache {
     /// the key match result identity again; the added component rotates every
     /// existing key once on deploy (a cold cache, not a correctness event).
     pub fn companion_key(prefix: &str, components: &[&[u8]], scope: &ScopeSet) -> String {
-        Self::companion_key_for(SearchTenantScope::dedicated(), prefix, components, scope)
-    }
-
-    pub fn companion_key_for(
-        tenant: SearchTenantScope,
-        prefix: &str,
-        components: &[&[u8]],
-        scope: &ScopeSet,
-    ) -> String {
-        Self::companion_key_with_generation(tenant, prefix, components, scope, false)
-    }
-
-    /// `generation_bound` is true only for the main search key, whose
-    /// components carry the serving generation; companion keys stay
-    /// release-closed for shared tenants (their payloads are not
-    /// generation-keyed).
-    fn companion_key_with_generation(
-        tenant: SearchTenantScope,
-        prefix: &str,
-        components: &[&[u8]],
-        scope: &ScopeSet,
-        generation_bound: bool,
-    ) -> String {
         fn fold(hasher: &mut Sha256, denied: &std::collections::BTreeSet<String>) {
             let mut bytes: Vec<u8> = Vec::new();
             for value in denied {
@@ -548,39 +477,19 @@ impl SearchResultCache {
             hasher.update(&bytes);
         }
 
-        let mut identity = Vec::new();
-        tenant.fold_identity(&mut identity);
         let mut hasher = Sha256::new();
-        hasher.update(identity);
         for c in components {
             hasher.update((c.len() as u64).to_le_bytes());
             hasher.update(c);
         }
         fold(&mut hasher, scope.deny_set());
         fold(&mut hasher, scope.artifact_deny_set());
-        // NAN-3406: a request running with authorized per-request perf
-        // overrides keys its entries apart, so an A/B mode's answer is never
-        // served to an ordinary request (or to the other mode). Without
-        // overrides the key is unchanged.
-        if let Some(overrides) = nanosiem_core::search::lake_debug::perf_overrides() {
-            hasher.update(b"nan3406-perf-overrides");
-            hasher.update((overrides.len() as u64).to_le_bytes());
-            hasher.update(overrides.as_bytes());
-        }
-        let key = format!("{}:{}", prefix, hex::encode(hasher.finalize()));
-        if crate::is_shared_scope(tenant) && !generation_bound {
-            format!("{}{}", Self::ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX, key)
-        } else {
-            key
-        }
+        format!("{}:{}", prefix, hex::encode(hasher.finalize()))
     }
 
     /// Fetch and decompress a cached companion response. Returns `None` on
     /// miss, connection error, or any decode failure (graceful degradation).
     pub async fn get_cached<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
-        if key.starts_with(Self::ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX) {
-            return None;
-        }
         let mut conn = self.conn.clone();
         let compressed: Vec<u8> = match conn.get::<_, Option<Vec<u8>>>(key).await {
             Ok(Some(d)) => d,
@@ -619,9 +528,6 @@ impl SearchResultCache {
 
     /// Compress and store a companion response under `key` with the shared TTL.
     pub async fn set_cached<T: Serialize>(&self, key: &str, value: &T) {
-        if key.starts_with(Self::ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX) {
-            return;
-        }
         let mut conn = self.conn.clone();
         let json_bytes = match serde_json::to_vec(value) {
             Ok(b) => b,
@@ -676,9 +582,6 @@ impl SearchResultCache {
     /// shared-link follower whose client cache is cold) can show how stale a
     /// served-from-cache result is (NAN-1595).
     pub async fn age_secs(&self, key: &str) -> Option<u64> {
-        if key.starts_with(Self::ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX) {
-            return None;
-        }
         let mut conn = self.conn.clone();
         let pttl_ms: i64 = conn.pttl(key).await.ok()?;
         if pttl_ms < 0 {
@@ -708,10 +611,7 @@ pub fn cache_status_headers(hit: bool, age_secs: Option<u64>) -> axum::http::Hea
         HeaderValue::from_static(if hit { "hit" } else { "miss" }),
     );
     if let Some(age) = age_secs {
-        headers.insert(
-            HeaderName::from_static(HEADER_CACHE_AGE),
-            HeaderValue::from(age),
-        );
+        headers.insert(HeaderName::from_static(HEADER_CACHE_AGE), HeaderValue::from(age));
     }
     headers
 }
@@ -752,11 +652,11 @@ mod tests {
             .map(|i| serde_json::json!({ "id": format!("row-{}", i) }))
             .collect();
         SearchResponse {
-            server_wall_ms: None,
             results,
             total_count: rows as u64,
-            total_count_exact: true,
             execution_time_ms: 10,
+            server_wall_ms: None,
+            queue_wait_ms: None,
             fields: Vec::new(),
             generated_sql: None,
             histogram: None,
@@ -764,7 +664,6 @@ mod tests {
             cost_score: None,
             display_type: None,
             column_order: None,
-            completeness: None,
         }
     }
 
@@ -775,7 +674,7 @@ mod tests {
         let resp = make_response(0);
         assert_eq!(
             skip_cache_reason(&resp),
-            Some("empty result set")
+            Some("empty result set (NAN-1027)")
         );
     }
 
@@ -783,7 +682,11 @@ mod tests {
     fn non_empty_response_is_cached() {
         for n in [1, 2, 3, 5, 100, MAX_CACHEABLE_ROWS] {
             let resp = make_response(n);
-            assert_eq!(skip_cache_reason(&resp), None, "n={n} should be cacheable");
+            assert_eq!(
+                skip_cache_reason(&resp),
+                None,
+                "n={n} should be cacheable"
+            );
         }
     }
 
@@ -880,38 +783,17 @@ mod tests {
         );
     }
 
-    /// NAN-3406: keys computed under per-request perf overrides are their
-    /// own (per mode); a debug request without overrides keys as before.
-    #[tokio::test]
-    async fn perf_overrides_separate_cache_keys_per_mode() {
-        use nanosiem_core::search::lake_debug::{collect, collect_with_perf_overrides};
-        let scope = ScopeSet::unrestricted();
-        let key = || SearchResultCache::companion_key("fstats", &[b"q", b"100"], &scope);
-        let plain = key();
-        let (debug, _) = collect(async { key() }).await;
-        let (flat_on, _) = collect_with_perf_overrides(Some("flat_filter_leaves=1".into()), async { key() }).await;
-        let (flat_off, _) = collect_with_perf_overrides(Some("flat_filter_leaves=0".into()), async { key() }).await;
-        assert_eq!(plain, debug, "no overrides: the ordinary key");
-        assert_ne!(plain, flat_on);
-        assert_ne!(plain, flat_off);
-        assert_ne!(flat_on, flat_off);
-        assert!(flat_on.starts_with("fstats:"));
-    }
-
     #[test]
     fn companion_key_is_deterministic_and_keyspace_isolated() {
         let scope = ScopeSet::unrestricted();
 
         // NAN-1593: same prefix + same components → identical key.
-        let a =
-            SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"], &scope);
-        let b =
-            SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"], &scope);
+        let a = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"], &scope);
+        let b = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"], &scope);
         assert_eq!(a, b);
 
         // A changed component → different key.
-        let c =
-            SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"201"], &scope);
+        let c = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"201"], &scope);
         assert_ne!(a, c);
 
         // Different keyspace prefixes never collide, even with identical
@@ -936,124 +818,6 @@ mod tests {
             SearchResultCache::companion_key("retro", &[b"ioc=x | retro", b"100"], &scope),
             SearchResultCache::companion_key("retro", &[b"ioc=x", b" retro|100"], &scope),
         );
-    }
-
-    #[cfg(feature = "enterprise")]
-    #[test]
-    fn enterprise_shared_cache_identity_is_tenant_pinned() {
-        let scope = ScopeSet::unrestricted();
-        let tenant_a = SearchTenantScope::EnterpriseShared(uuid::Uuid::from_u128(1));
-        let tenant_b = SearchTenantScope::EnterpriseShared(uuid::Uuid::from_u128(2));
-        let components: &[&[u8]] = &[b"same-query", b"same-window"];
-
-        let a = SearchResultCache::companion_key_for(tenant_a, "search", components, &scope);
-        let b = SearchResultCache::companion_key_for(tenant_b, "search", components, &scope);
-        assert_ne!(a, b, "identical queries must not collide across tenants");
-
-        assert_eq!(
-            SearchResultCache::companion_key("search", components, &scope),
-            SearchResultCache::companion_key_for(
-                SearchTenantScope::dedicated(),
-                "search",
-                components,
-                &scope,
-            ),
-            "dedicated cache identity must remain byte-compatible"
-        );
-    }
-
-    /// NAN-2711: `| risk` results are cached under the caller's tenant only.
-    /// Tenant B issuing A's exact RBA query (same text, same window) can never
-    /// be served A's scored rows from the result cache.
-    #[cfg(feature = "enterprise")]
-    #[test]
-    fn risk_projection_results_are_cached_per_tenant() {
-        let scope = ScopeSet::unrestricted();
-        let request: SearchRequest = serde_json::from_value(serde_json::json!({
-            "query": "metadata.log_source=windows_sysmon | risk score=80 entity=device.hostname",
-            "time_range": {"start": "2026-09-23T00:00:00Z", "end": "2026-09-23T01:00:00Z"},
-        }))
-        .unwrap();
-        let key = |tenant: u128| {
-            SearchResultCache::cache_key_for(
-                SearchTenantScope::EnterpriseShared(uuid::Uuid::from_u128(tenant)),
-                &request,
-                &scope,
-                None,
-            )
-        };
-        assert_ne!(key(0xa), key(0xb));
-        assert_eq!(key(0xa), key(0xa));
-    }
-
-    /// NAN-2361 wave 6: a shared tenant's result identity carries the serving
-    /// generation, so an erasure / retention swap (new generation, new
-    /// snapshot) misses every entry cached under the predecessor; and a
-    /// shared tenant is admitted to the cache only when the requested window
-    /// lies inside retention at delivery.
-    #[cfg(feature = "enterprise")]
-    #[test]
-    fn shared_cache_identity_is_generation_keyed_and_retention_fenced() {
-        let scope = ScopeSet::unrestricted();
-        let now = chrono::Utc::now();
-        let tenant = SearchTenantScope::enterprise_shared_retained(
-            uuid::Uuid::from_u128(7),
-            3,
-            30,
-            0,
-        )
-        .unwrap();
-        let request = SearchRequest {
-            query: "error".into(),
-            time_range: TimeRangeInput {
-                start: now - chrono::Duration::hours(2),
-                end: now,
-            },
-            limit: Some(100),
-            offset: None,
-            include_sql: None,
-            skip_histogram: false,
-            skip_field_stats: false,
-            use_cache: false,
-            table_view: false,
-            request_id: None,
-            async_mode: false,
-            priority: None,
-            dataset: None,
-        };
-        let before = ServingGenerationKey {
-            generation_id: "gen-1".into(),
-            snapshot_id: 100,
-        };
-        let after = ServingGenerationKey {
-            generation_id: "gen-2".into(),
-            snapshot_id: 101,
-        };
-        let key_before = SearchResultCache::cache_key_for(tenant, &request, &scope, Some(&before));
-        let key_after = SearchResultCache::cache_key_for(tenant, &request, &scope, Some(&after));
-        assert_ne!(key_before, key_after, "a generation swap rotates the key");
-        assert!(
-            !key_before.starts_with(SearchResultCache::ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX),
-            "a generation-bound shared key is live"
-        );
-        assert!(
-            SearchResultCache::cache_key_for(tenant, &request, &scope, None)
-                .starts_with(SearchResultCache::ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX),
-            "without a generation the shared key stays release-closed"
-        );
-        assert!(SearchResultCache::shared_cache_admitted(tenant, &request, Some(&before)));
-        assert!(!SearchResultCache::shared_cache_admitted(tenant, &request, None));
-        // A window that reaches past the 30-day cutoff is never cached for
-        // a shared tenant, whatever the generation.
-        let mut stale = request.clone();
-        stale.time_range.start = now - chrono::Duration::days(31);
-        assert!(!SearchResultCache::shared_cache_admitted(tenant, &stale, Some(&before)));
-        // Dedicated identity is unchanged and unconditional.
-        assert_eq!(
-            SearchResultCache::cache_key(&request, &scope),
-            SearchResultCache::cache_key_for(SearchTenantScope::dedicated(), &request, &scope, None)
-        );
-        assert!(SearchResultCache::shared_cache_admitted(SearchTenantScope::dedicated(), &stale, None));
     }
 
     fn scope_of(items: &[&str]) -> ScopeSet {
@@ -1187,142 +951,6 @@ mod tests {
     }
 }
 
-/// Whether an nPL query reads tenant state that the serving generation does
-/// not version: lookup tables, IOC lookup/feed sources, or `| ai` (NAN-2922).
-/// An unparseable query is treated as uncacheable.
-pub(crate) fn reads_state_outside_the_generation(query: &str) -> bool {
-    use nanosiem_core::query::{Command, Query, SearchExpr};
-    fn expr(e: &SearchExpr) -> bool {
-        match e {
-            SearchExpr::IocMatch { feed, lookup, .. } => feed.is_some() || lookup.is_some(),
-            SearchExpr::And(l, r) | SearchExpr::Or(l, r) => expr(l) || expr(r),
-            SearchExpr::Not(i) | SearchExpr::Group(i) => expr(i),
-            SearchExpr::InSubsearch { subsearch, .. } => node(subsearch),
-            _ => false,
-        }
-    }
-    fn node(q: &Query) -> bool {
-        match q {
-            Query::Search(e) => expr(e),
-            Query::Piped { source, command } => {
-                node(source)
-                    || matches!(
-                        command,
-                        Command::Lookup { .. } | Command::InputLookup { .. } | Command::Ai { .. }
-                    )
-                    || match command {
-                        Command::Append { subsearch, .. } | Command::Join { subsearch, .. } => {
-                            node(subsearch)
-                        }
-                        Command::Where { condition } => expr(condition),
-                        _ => false,
-                    }
-            }
-        }
-    }
-    nanosiem_core::query::parse_query(query).map_or(true, |parsed| node(&parsed))
-}
-
 #[cfg(test)]
-mod shared_state_cache_tests {
-    use super::reads_state_outside_the_generation as uncacheable;
-
-    #[test]
-    fn tenant_state_reads_are_never_cached_on_shared() {
-        for query in [
-            "* | lookup assets user.name OUTPUT owner",
-            "* | inputlookup assets",
-            "* | ai prompt=\"x\"",
-            "ioc in lookup(\"threats\")",
-            "ioc in threatfox(\"apt29\")",
-            "user.name=a | append [* | lookup assets user.name OUTPUT owner]",
-        ] {
-            assert!(uncacheable(query), "{query}");
-        }
-        for query in ["* | stats count() by user.name", "* | output x", "ioc=\"1.2.3.4\""] {
-            assert!(!uncacheable(query), "{query}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod nan4664_cache_identity_tests {
-    use super::*;
-
-    #[test]
-    fn normalization_trims_and_collapses_only_outside_strings() {
-        assert_eq!(normalize_query("  class_uid=1007   |  stats count by  process.name \t"), "class_uid=1007 | stats count by process.name");
-        // Inside quotes whitespace is data.
-        assert_eq!(normalize_query(r#"message="a   b"  |  head 5"#), r#"message="a   b" | head 5"#);
-        assert_eq!(normalize_query("user='x  y'   | head"), "user='x  y' | head");
-        // Newlines are kept: a `//` comment ends at one.
-        assert_eq!(normalize_query("a\n  | head 5"), "a\n | head 5");
-    }
-
-    #[test]
-    fn normalization_is_conservative_where_meaning_could_change() {
-        // Regex literals, comments, division: only trimmed.
-        for query in ["user=/admin  .*/i", "a // note  x\n| head", "eval r=a/b  | head", r#"message="a\"  b""#, "x=`y  z`"] {
-            assert_eq!(normalize_query(&format!("  {query}  ")), query);
-        }
-        // An unbalanced quote: only trimmed.
-        assert_eq!(normalize_query(r#" message="a   b "#), r#"message="a   b"#);
-        // Different meanings never collapse together.
-        assert_ne!(normalize_query(r#"message="a b""#), normalize_query(r#"message="a  b""#));
-    }
-
-    /// Review (NAN-4664): whatever the lexer guesses, a normalized query is
-    /// either the trimmed text or parses to exactly the original's AST, so
-    /// two queries of different meaning can never share an identity.
-    #[test]
-    fn normalization_never_changes_the_parsed_query() {
-        let corpus = [
-            "class_uid=1007   |  stats count by  process.name",
-            r#"x=a"b m="p   q" y=c"d"#,
-            r#"user=O'Brien   m="x  ' y   z"   n='w'"#,
-            r#"* | eval label="a   b"  |  table label"#,
-            r#"* | rex field=message "(?<user>\w+)  logged"  | head 5"#,
-            "* | where  count  >  10\n  | head  5",
-            "process.name=cmd.exe\t\t| stats  count",
-            r#"message="unterminated   | head"#,
-        ];
-        for query in corpus {
-            let normalized = normalize_query(query);
-            if normalized.as_ref() != query.trim() {
-                assert!(
-                    parses_identically(query.trim(), &normalized),
-                    "{query:?} normalized to {normalized:?} with a different meaning"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn use_cache_tri_state_read_decision() {
-        // Absent: today's behavior (read) for every caller.
-        assert!(reads_result_cache(false, None));
-        assert!(reads_result_cache(false, Some(true)));
-        // Explicit false: a fresh run (it still writes and still shares).
-        assert!(!reads_result_cache(false, Some(false)));
-        // The bypass header always wins.
-        assert!(!reads_result_cache(true, None));
-        assert!(!reads_result_cache(true, Some(true)));
-    }
-
-    #[test]
-    fn cache_key_uses_the_normalized_query() {
-        let request = |query: &str| -> SearchRequest {
-            serde_json::from_value(serde_json::json!({"query": query,
-                "time_range": {"start": "2026-10-26T00:00:00Z", "end": "2026-10-27T00:00:00Z"}})).unwrap()
-        };
-        let scope = ScopeSet::default();
-        assert_eq!(
-            SearchResultCache::cache_key(&request(" class_uid=1007  | head 5 "), &scope),
-            SearchResultCache::cache_key(&request("class_uid=1007 | head 5"), &scope),
-        );
-        assert_ne!(
-            SearchResultCache::cache_key(&request(r#"m="a  b""#), &scope),
-            SearchResultCache::cache_key(&request(r#"m="a b""#), &scope),
-        );
-    }
-}
+#[path = "cache_identity_tests.rs"]
+mod cache_identity_tests;

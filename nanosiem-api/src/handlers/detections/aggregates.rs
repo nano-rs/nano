@@ -48,8 +48,7 @@ const RECENT_METRICS_WINDOW_HOURS: i32 = 24;
 /// Detection health summary for the Home page "Detection health" pulse card.
 ///
 /// Three aggregate counts over existing tables:
-/// - `needs_tuning`: unread `tuning_notifications` rows (`read_at IS NULL`);
-///   always 0 in the open edition, which has no AI tuning
+/// - `needs_tuning`: unread `tuning_notifications` rows (`read_at IS NULL`)
 /// - `noisy_count`: rules whose 7-day `match_count` sum exceeds [`NOISY_WEEKLY_THRESHOLD`]
 /// - `silent_count`: rules in Live/Alerting mode with no matches in the last 7 days
 #[utoipa::path(
@@ -68,17 +67,11 @@ pub async fn get_detection_health_summary(
 ) -> Result<Json<DetectionHealthSummary>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
-    // `tuning_notifications` is an AI-tuning table that exists only under the
-    // enterprise overlay; the open edition has no tuning notifications to
-    // count (NAN-3463: this was a 500 on the Home "Detection health" card).
-    #[cfg(feature = "enterprise")]
     let needs_tuning: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*)::bigint FROM tuning_notifications WHERE read_at IS NULL"#,
     )
     .fetch_one(&state.pool)
     .await?;
-    #[cfg(not(feature = "enterprise"))]
-    let needs_tuning: i64 = 0;
 
     let noisy_count: i64 = sqlx::query_scalar(
         r#"
@@ -311,7 +304,7 @@ pub async fn get_fleet_health(
     }))
 }
 
-/// Detection scheduling lag over the schedulable fleet: rules
+/// Detection scheduling lag (NAN-3064) over the schedulable fleet: rules
 /// behind schedule, max / p95 lag (`now - next_run_at` once due), and
 /// `degraded` when any rule lags more than twice its own interval.
 #[utoipa::path(

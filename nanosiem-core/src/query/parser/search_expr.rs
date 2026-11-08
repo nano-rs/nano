@@ -250,9 +250,9 @@ fn primary_expr(input: &str) -> ParseResult<'_, SearchExpr> {
 /// index-aware variant; only the previously mis-split predicates change.
 fn unparenthesized_arithmetic_or_leaf(input: &str) -> ParseResult<'_, SearchExpr> {
     let leaf = primary_leaf_expr(input);
-    let predicate = eval_predicate_expression(input)
-        .ok()
-        .filter(|(_, e)| eval_is_boolean(e));
+    let arithmetic = eval_predicate_expression(input).ok().filter(|(_, e)| {
+        eval_contains_arithmetic(e) && eval_is_boolean(e)
+    });
     // The leaf must have stopped AT an arithmetic operator; a `-term` after a
     // filter stays what it was (a separate term), never a subtraction.
     let stopped_at_operator = |rest: &str| {
@@ -264,27 +264,13 @@ fn unparenthesized_arithmetic_or_leaf(input: &str) -> ParseResult<'_, SearchExpr
             _ => false,
         }
     };
-    // NAN-4286 (F29): written without spaces (`a-b=0`, `c+d>10`) the bare
-    // keyword grammar swallowed `a-b` as ONE term, and with a literal or an
-    // expression on the left (`1000 < a + b`) it took `1000` as a keyword;
-    // either way it then stopped AT the comparator, a syntax error. A keyword
-    // is never followed by a comparator, so the eval reading of the whole
-    // comparison only ever replaces an error.
-    let keyword_stopped_at_comparator = |leaf: &SearchExpr, rest: &str| {
-        matches!(leaf, SearchExpr::Keyword(_))
-            && rest.trim_start().starts_with(['=', '!', '<', '>'])
-    };
-    match (leaf, predicate) {
-        (Ok((leaf_rest, leaf_expr)), Some((rest, expression)))
-            if rest.len() < leaf_rest.len()
-                && ((eval_contains_arithmetic(&expression) && stopped_at_operator(leaf_rest))
-                    || keyword_stopped_at_comparator(&leaf_expr, leaf_rest)) =>
+    match (leaf, arithmetic) {
+        (Ok((leaf_rest, _)), Some((rest, expression)))
+            if rest.len() < leaf_rest.len() && stopped_at_operator(leaf_rest) =>
         {
             Ok((rest, SearchExpr::EvalPredicate(expression)))
         }
-        (Err(_), Some((rest, expression))) if eval_contains_arithmetic(&expression) => {
-            Ok((rest, SearchExpr::EvalPredicate(expression)))
-        }
+        (Err(_), Some((rest, expression))) => Ok((rest, SearchExpr::EvalPredicate(expression))),
         (leaf, _) => leaf,
     }
 }
@@ -543,6 +529,11 @@ fn boolean_function_expr(input: &str) -> ParseResult<'_, SearchExpr> {
 
 /// Parse grouped expression in parentheses
 fn grouped_expr(input: &str) -> ParseResult<'_, SearchExpr> {
+    // NAN-4917: one guarded recursion point per nesting level.
+    crate::query::complexity::ensure_sufficient_stack(|| grouped_expr_unguarded(input))
+}
+
+fn grouped_expr_unguarded(input: &str) -> ParseResult<'_, SearchExpr> {
     let _guard = super::enter_nesting(input)?;
     map(
         delimited(
@@ -556,6 +547,11 @@ fn grouped_expr(input: &str) -> ParseResult<'_, SearchExpr> {
 }
 
 fn grouped_where_expr(input: &str) -> ParseResult<'_, SearchExpr> {
+    // NAN-4917: one guarded recursion point per nesting level.
+    crate::query::complexity::ensure_sufficient_stack(|| grouped_where_expr_unguarded(input))
+}
+
+fn grouped_where_expr_unguarded(input: &str) -> ParseResult<'_, SearchExpr> {
     let _guard = super::enter_nesting(input)?;
     map(
         delimited(
@@ -595,7 +591,6 @@ fn regex_match_operator_filter(input: &str) -> ParseResult<'_, SearchExpr> {
             field,
             op,
             value: Value::Regex(pattern),
-            rhs: RhsSyntax::Literal,
         },
     ))
 }
@@ -767,7 +762,6 @@ fn regex_filter(input: &str) -> ParseResult<'_, SearchExpr> {
             field,
             op,
             value: Value::Regex(pattern),
-            rhs: RhsSyntax::Literal,
         },
     ))
 }
@@ -862,11 +856,11 @@ fn in_list_filter(input: &str) -> ParseResult<'_, SearchExpr> {
 
     Ok((
         input,
-        crate::query::source_alias::expand_source_alias(SearchExpr::InList {
+        SearchExpr::InList {
             field,
             values,
             negated,
-        }),
+        },
     ))
 }
 
@@ -874,9 +868,7 @@ fn in_list_filter(input: &str) -> ParseResult<'_, SearchExpr> {
 ///   - `ioc = <value>`             -> IocMatch { values: [value] }
 ///   - `ioc in [v1, v2, ...]`      -> IocMatch { values } (also `( )`)
 ///   - `ioc in <feed>("arg")`      -> IocMatch { feed: Some(..) }
-///     where feed in {feed, threatfox, misp, otx, feodo, abuse}. The generic
-///     `feed("source")` form addresses a tenant-defined enrichment source by
-///     its exact source ID or display name.
+///     where feed in {threatfox, misp, otx, feodo, abuse}.
 ///   - `ioc in lookup("name")`     -> IocMatch { lookup: Some(..) }
 ///   - `ioc in lookup("name","col")` -> IocMatch { lookup: Some(.. column) }
 ///   - `ioc in [inputlookup name]` -> IocMatch { lookup: Some(..) } (alias)
@@ -907,7 +899,12 @@ fn ioc_list_value(input: &str) -> ParseResult<'_, Value> {
         map(quoted_string, Value::String),
         map(
             take_while1(|c: char| {
-                !c.is_whitespace() && c != ',' && c != ']' && c != ')' && c != '[' && c != '('
+                !c.is_whitespace()
+                    && c != ','
+                    && c != ']'
+                    && c != ')'
+                    && c != '['
+                    && c != '('
             }),
             |s: &str| Value::String(s.to_string()),
         ),
@@ -999,7 +996,8 @@ fn ioc_filter(input: &str) -> ParseResult<'_, SearchExpr> {
     }
 
     // Form 4: ioc in lookup("name") / ioc in lookup("name", "column")
-    if let Ok((rest, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("lookup").parse(input)
+    if let Ok((rest, _)) =
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("lookup").parse(input)
     {
         // Guard against a feed/identifier that merely starts with "lookup".
         if !rest
@@ -1032,10 +1030,12 @@ fn ioc_filter(input: &str) -> ParseResult<'_, SearchExpr> {
     }
 
     // Form 3: ioc in <feed>("arg")
-    let (input, feed_name) = take_while1(|c: char| c.is_alphanumeric() || c == '_').parse(input)?;
+    let (input, feed_name) =
+        take_while1(|c: char| c.is_alphanumeric() || c == '_').parse(input)?;
     let lower = feed_name.to_lowercase();
     if !matches!(
         lower.as_str(),
+        // `feed("name")`: exact feed / IOC list name (NAN-4902 lane G).
         "feed" | "threatfox" | "misp" | "otx" | "feodo" | "abuse"
     ) {
         return Err(nom::Err::Error(nom::error::Error::new(
@@ -1054,7 +1054,10 @@ fn ioc_filter(input: &str) -> ParseResult<'_, SearchExpr> {
         input,
         SearchExpr::IocMatch {
             values: vec![],
-            feed: Some(IocFeed { name: lower, arg }),
+            feed: Some(IocFeed {
+                name: lower,
+                arg,
+            }),
             lookup: None,
         },
     ))
@@ -1121,7 +1124,6 @@ fn word_comparator_filter(input: &str) -> ParseResult<'_, SearchExpr> {
             field,
             op,
             value: val,
-            rhs: RhsSyntax::Literal,
         },
     ))
 }
@@ -1211,14 +1213,22 @@ fn field_filter(input: &str) -> ParseResult<'_, SearchExpr> {
         if let Some(c) = first_char {
             // Must start with letter or underscore (not a digit, not a quote)
             if c.is_alphabetic() || c == '_' {
-                // Extract the identifier
+                // Extract the identifier. NAN-3329: a DOTTED path
+                // (`src_endpoint.port > dst_endpoint.port`) is a field too; it
+                // used to stop at the first `.` and fall through to a string
+                // literal 'dst_endpoint.port' (a ClickHouse type error on a
+                // numeric column). Every segment must start like an identifier.
                 let id: String = trimmed
                     .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
                     .collect();
+                let well_formed = !id.ends_with('.')
+                    && id.split('.').all(|seg| {
+                        seg.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                    });
                 // Check it's not a boolean keyword or interval
                 let upper = id.to_uppercase();
-                if upper == "TRUE" || upper == "FALSE" || upper.starts_with("INTERVAL") {
+                if !well_formed || upper == "TRUE" || upper == "FALSE" || upper.starts_with("INTERVAL") {
                     false
                 } else {
                     // Check what follows - should be end of input or whitespace/pipe/paren/logical operator
@@ -1252,54 +1262,16 @@ fn field_filter(input: &str) -> ParseResult<'_, SearchExpr> {
         ));
     }
 
-    // NAN-2380: an EXPLICIT column reference, written in backticks —
-    // `| where src_ip != `dest_ip``. Backticks have no other meaning in nPL
-    // (and are ClickHouse's own identifier quoting), so this is the one RHS
-    // form that says "column, not value" with no ambiguity at all. It lowers to
-    // the same `FieldFunctionFilter` node `first_seen > time_threshold`
-    // already produces, on every operator and every schema profile.
-    if let Some(rest) = trimmed.strip_prefix('`') {
-        let (rest, referenced) = field_name(rest)?;
-        let (rest, _) = char('`').parse(rest)?;
-        return Ok((
-            rest,
-            SearchExpr::FieldFunctionFilter {
-                field: field_str,
-                op,
-                function: EvalExpression::Field(referenced),
-            },
-        ));
-    }
-
-    // Was the RHS written with quotes? The tokenizer throws that away
-    // (`= x` and `= "x"` both yield `Value::String("x")`), which is precisely
-    // why `| where src_ip != dest_ip` could compile to `src_ip != 'dest_ip'`
-    // — true for every row — with nothing downstream able to notice. Record it
-    // (NAN-2380) so the SQL generator, which also knows the active schema, can
-    // tell a field reference from a literal that happens to spell a column name.
-    let rhs_written_bare = !matches!(first_char, Some('"') | Some('\''));
-
     // Otherwise, parse as a simple filter value (number, IP, bool, interval, quoted string)
     let (input, value) = filter_value(input)?;
 
-    let rhs = match &value {
-        Value::String(text) if rhs_written_bare && is_bareword_identifier(text) => {
-            RhsSyntax::Bareword
-        }
-        _ => RhsSyntax::Literal,
-    };
-
-    // NAN-3224: `metadata.log_source=risk` is a query-time alias of the
-    // findings that added risk; expand it here so every consumer (SQL, hints,
-    // rollups, source-visibility gates) only ever sees `findings`.
     Ok((
         input,
-        crate::query::source_alias::expand_source_alias(SearchExpr::FieldFilter {
+        SearchExpr::FieldFilter {
             field: field_str,
             op,
             value,
-            rhs,
-        }),
+        },
     ))
 }
 
@@ -1363,6 +1335,11 @@ fn function_word_comparator_filter(input: &str) -> ParseResult<'_, SearchExpr> {
 
 /// Parse IN [search ...] subsearch filter: field IN [search ...] or field NOT IN [search ...]
 fn in_subsearch_filter(input: &str) -> ParseResult<'_, SearchExpr> {
+    // NAN-4917: one guarded recursion point per nesting level.
+    crate::query::complexity::ensure_sufficient_stack(|| in_subsearch_filter_unguarded(input))
+}
+
+fn in_subsearch_filter_unguarded(input: &str) -> ParseResult<'_, SearchExpr> {
     // NAN-2010 (F10): a nested `field IN [ field IN [ … ] ]` chain recurses
     // through `query` once per bracket. Count it toward MAX_NESTING_DEPTH — the
     // guard otherwise only wraps parenthesized groups, so bracket nesting drove
@@ -1458,7 +1435,17 @@ fn in_cidr_filter(input: &str) -> ParseResult<'_, SearchExpr> {
 
 /// Parse a keyword (for keyword search)
 fn keyword_search(input: &str) -> ParseResult<'_, SearchExpr> {
-    map(keyword, SearchExpr::Keyword).parse(input)
+    // NAN-4933: an all-`*` keyword (`**`, `***`) is the match-all `*`, so it
+    // gets the same SQL (`1`), cost warning and admission treatment instead of
+    // a `LIKE '%%'` read of every body column.
+    map(keyword, |kw: String| {
+        if !kw.is_empty() && kw.chars().all(|c| c == '*') {
+            SearchExpr::Keyword("*".to_string())
+        } else {
+            SearchExpr::Keyword(kw)
+        }
+    })
+    .parse(input)
 }
 
 /// Parse a single keyword

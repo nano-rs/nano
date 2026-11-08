@@ -54,7 +54,8 @@ const STAGING_COMPLETE_MARKER: &str = ".staging-complete";
 /// differ per deployment and some of these do not exist everywhere; staging
 /// creates all of them regardless, because a `--config-dir` pointing at a
 /// missing path is itself a Vector startup error.
-pub(super) const STAGED_CONFIG_SUBDIRS: &[&str] = &["sources/parsers", "sources/configs", "sinks"];
+pub(super) const STAGED_CONFIG_SUBDIRS: &[&str] =
+    &["sources/parsers", "sources/configs", "sinks"];
 
 /// The subset of [`STAGED_CONFIG_SUBDIRS`] copied verbatim out of the active
 /// tree. `sources/parsers` is deliberately absent: staging GENERATES it from the
@@ -115,7 +116,7 @@ impl VectorConfigManager {
         fs::create_dir_all(&self.staging_dir).await?;
 
         // Generate and write config to staging
-        let config = self.generate_parser_config(parser);
+        let config = self.guarded_parser_config(parser)?;
         let filename = format!("{}.toml", Self::safe_name(&parser.name));
         let filepath = self.staging_dir.join(&filename);
 
@@ -161,6 +162,10 @@ impl VectorConfigManager {
             .filter(|p| p.kind != "enrichment")
             .cloned()
             .collect();
+        // NAN-4956: a fetch parser whose source-config route is not on disk
+        // is rendered as disabled (no file, no claim), never as a filter on a
+        // missing component.
+        let log_parsers = self.without_unroutable_parsers(&log_parsers).await;
 
         // NAN-2247: the same claim check the active writer runs
         // (deploy.rs::deploy_parsers). Staging exists to catch a bad config
@@ -210,7 +215,7 @@ impl VectorConfigManager {
         let staging_parsers_dir = self.staged_parsers_dir();
 
         for parser in log_parsers.iter().filter(|p| p.enabled) {
-            let config = self.generate_parser_config(parser);
+            let config = self.guarded_parser_config(parser)?;
             let filename = format!("{}.toml", Self::safe_name(&parser.name));
             let filepath = staging_parsers_dir.join(&filename);
             fs::write(&filepath, &config).await?;
@@ -246,7 +251,11 @@ impl VectorConfigManager {
         // completed. `promote_staged` refuses to touch the active tree without
         // it — an interrupted or corrupt stage now fails loudly instead of
         // promoting nothing and reporting success.
-        fs::write(self.staging_dir.join(STAGING_COMPLETE_MARKER), "staged\n").await?;
+        fs::write(
+            self.staging_dir.join(STAGING_COMPLETE_MARKER),
+            "staged\n",
+        )
+        .await?;
 
         let enabled_count = log_parsers.iter().filter(|p| p.enabled).count();
         tracing::info!(
@@ -278,7 +287,11 @@ impl VectorConfigManager {
             return Ok(());
         }
 
-        fs::write(&sink_path, Self::ocsf_sink_content(&inputs)).await?;
+        let content = Self::shard_route_clickhouse_sinks(
+            Self::ocsf_sink_content(&inputs),
+            &Self::clickhouse_shard_endpoints(),
+        );
+        fs::write(&sink_path, content).await?;
         Ok(())
     }
 
@@ -331,11 +344,7 @@ impl VectorConfigManager {
                 continue;
             }
             let copied = Self::copy_toml_files(&source, &self.staging_dir.join(subdir)).await?;
-            tracing::debug!(
-                "Copied {} config file(s) from {} to staging",
-                copied,
-                subdir
-            );
+            tracing::debug!("Copied {} config file(s) from {} to staging", copied, subdir);
         }
 
         Ok(())
@@ -362,11 +371,7 @@ impl VectorConfigManager {
             if path.extension().map(|ext| ext == "toml") != Some(true) {
                 continue;
             }
-            if !fs::metadata(&path)
-                .await
-                .map(|m| m.is_file())
-                .unwrap_or(false)
-            {
+            if !fs::metadata(&path).await.map(|m| m.is_file()).unwrap_or(false) {
                 continue;
             }
             let filename = entry.file_name();
@@ -395,12 +400,9 @@ impl VectorConfigManager {
         fs::create_dir_all(&staging_parsers_dir).await?;
         let router_path = staging_parsers_dir.join("_router.toml");
 
-        // Get all enabled parsers that take input from the router
-        // "routed" = HTTP ingestion, "vector" = Vector-to-Vector native protocol
-        let routed_parsers: Vec<_> = log_parsers
-            .iter()
-            .filter(|p| p.enabled && (p.source_type == "routed" || p.source_type == "vector"))
-            .collect();
+        // NAN-4952: the same set the active writer and the parser-file emitter
+        // use (see `source_router_parsers`).
+        let routed_parsers = self.source_router_parsers(log_parsers);
 
         let (source_type_extract_covered, hec_normalize_covered, otlp_logs_prep_covered) =
             self.source_config_intermediary_coverage().await;
@@ -447,48 +449,9 @@ impl VectorConfigManager {
             inputs_formatted
         );
 
-        // Add routes for deployed parsers (use match_values for condition when available)
-        for parser in &routed_parsers {
-            let safe_name = Self::safe_name(&parser.name);
-            let route_condition = Self::build_route_condition(parser);
-            config.push_str(&format!("{} = '{}'\n", safe_name, route_condition));
-        }
-
-        // Add routes for built-in types (that don't have deployed parsers)
-        for source_type in BUILTIN_TYPES {
-            let has_parser = routed_parsers
-                .iter()
-                .any(|p| Self::parser_handles_source_type(p, source_type));
-            if !has_parser {
-                config.push_str(&format!(
-                    "{} = '.source_type == \"{}\"'\n",
-                    source_type, source_type
-                ));
-            }
-        }
-
-        // Generic catch-all
-        let mut all_known_types: Vec<String> = routed_parsers
-            .iter()
-            .flat_map(|p| Self::parser_source_types(p))
-            .collect();
-        for source_type in BUILTIN_TYPES {
-            if !all_known_types.contains(&source_type.to_string()) {
-                all_known_types.push(source_type.to_string());
-            }
-        }
-        let exclusion_list = all_known_types
-            .iter()
-            .map(|s| format!("\"{}\"", s))
-            .collect::<Vec<_>>()
-            .join(", ");
-        // NAN-1124: also exclude `nano_enrich` (push-enrichment) from the generic
-        // log route — kept in lockstep with router.rs::write_router_config, since
+        // Parser routes + generic catch-all: the active writer's helper, since
         // promote_staged copies this file over the active _router.toml.
-        config.push_str(&format!(
-            "generic = '!includes([{}], .source_type) && !starts_with(downcase(to_string(.source_type) ?? \"\"), \"nano_enrich\")'\n\n",
-            exclusion_list
-        ));
+        config.push_str(&Self::source_router_route_lines(&routed_parsers));
 
         // NAN-1124 / NAN-1151: enrichment lane router. Built via the SAME shared
         // helper as the active writer (router.rs) so the staged file can't
@@ -498,7 +461,7 @@ impl VectorConfigManager {
             enrichment_parsers.iter().filter(|p| p.enabled).collect();
         config.push_str(&super::router::enrichment_router_block(
             &enabled_enrichment,
-            "\"enrichment_prepare\"",
+            super::router::ENRICHMENT_ROUTER_INPUT,
         ));
 
         // Add placeholder transforms for built-in types without parsers
@@ -539,7 +502,9 @@ impl VectorConfigManager {
             config.push_str("source = '''\n.routed = true\n'''\n");
         }
 
-        fs::write(&router_path, &config).await?;
+        // NAN-4953: tenant match_values and names; escaped against Vector's
+        // env interpolation (see crate::vector_env).
+        fs::write(&router_path, crate::vector_env::escape_file(&config)).await?;
         Ok(())
     }
 
@@ -587,12 +552,15 @@ impl VectorConfigManager {
         // reverted dynamic enrichment parsers to the committed static lane).
         // NAN-2305: the split now happens once in `stage_parsers`, so this lane
         // and the logs lane can never disagree about which parsers are which.
-        let content =
-            Self::enrichment_lane_config_for_backend(enrichment_parsers, Self::lake_mode());
+        let content = Self::enrichment_lane_config(enrichment_parsers);
         // NAN-1150: same deploy-time guardrails as the active writer, so a
         // malformed enrichment parser is rejected at the stage→validate→promote
         // path too — never promoted to the active lane.
         Self::guard_enrichment_lane(enrichment_parsers, &content)?;
+        let content = Self::shard_route_clickhouse_sinks(
+            content,
+            &Self::clickhouse_shard_endpoints(),
+        );
         fs::write(&enrichment_path, content).await?;
         Ok(())
     }
@@ -797,13 +765,12 @@ impl VectorConfigManager {
         fs::create_dir_all(&batch).await?;
 
         for (path, file_name) in strays {
-            // Suffixed so the copy is no longer a `.toml`. An S3 config sync
-            // that walks the whole config root and uploads every `.toml` it
-            // finds, skipping only `backup` and `staging` by name (the old
-            // `deploy/src/s3.js::syncDirectory`, removed in NAN-3491; see tag
-            // `nan3491-pre-benchmarks-delete`), would replicate a quarantined
-            // parser that kept its extension to every Vector pod's config
-            // bundle, which is the opposite of quarantining it.
+            // Suffixed so the copy is no longer a `.toml`. The S3 config sync
+            // (`deploy/src/s3.js::syncDirectory`) walks the whole config root
+            // and uploads every `.toml` it finds, skipping only `backup` and
+            // `staging` by name — a quarantined parser keeping its extension
+            // would be replicated to every Vector pod's config bundle, which is
+            // the opposite of quarantining it.
             let dest = batch.join(format!("{}{}", file_name, QUARANTINE_SUFFIX));
             // `rename` is atomic but only within a filesystem, and in K8s the
             // config root and the dynamic parsers dir can be different volumes.

@@ -22,6 +22,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Activity, ChevronDown, ChevronRight, Search } from 'lucide-react';
 
 import { useLogSourceHealthSeries, useLogSourcesHealthSeries } from '@/hooks/use-log-source-health';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import type {
   BucketAssessment,
   HealthSeriesPoint,
@@ -424,11 +425,13 @@ function SegmentRow({
   onToggle: () => void;
 }) {
   const navigate = useNavigate();
+  const sourceField = useSchemaFieldMap().field('logSource');
   const key = segmentKey(segment);
   // The out-of-top-K bucket has no single value to filter on.
   const searchable = !segment.other;
   const hrefFor = (idx?: number) =>
     healthSearchHref(source.source_slugs, {
+      sourceField,
       field: segment.search_field,
       value: segment.value,
       ...hourWindow(segment.points, idx),
@@ -582,6 +585,7 @@ function SourceRow({
   onToggle: () => void;
 }) {
   const navigate = useNavigate();
+  const sourceField = useSchemaFieldMap().field('logSource');
   const [expandedSegs, setExpandedSegs] = useState<Set<string>>(() => new Set());
   const total = source.points.reduce((a, p) => a + p.events, 0);
   const drops = source.segments.filter((s) => !s.other && s.state === 'segment_drop').length;
@@ -633,7 +637,7 @@ function SourceRow({
             height={22}
             compact
             label={`${source.log_source_name} volume`}
-            onBucketClick={(i) => navigate(healthSearchHref(source.source_slugs, hourWindow(source.points, i)))}
+            onBucketClick={(i) => navigate(healthSearchHref(source.source_slugs, { sourceField, ...hourWindow(source.points, i) }))}
           />
         </div>
         <span className="w-[64px] shrink-0 text-right font-mono text-[10.5px] tabular-nums text-foreground">
@@ -741,6 +745,7 @@ export function LogSourceHealthView({
   highlightSegment?: string | null;
 }) {
   const navigate = useNavigate();
+  const sourceField = useSchemaFieldMap().field('logSource');
   const [expandedSegs, setExpandedSegs] = useState<Set<string>>(() =>
     highlightSegment ? new Set([highlightSegment]) : new Set(),
   );
@@ -777,7 +782,7 @@ export function LogSourceHealthView({
           points={source.points}
           height={150}
           label={`${source.log_source_name} volume against expected band`}
-          onBucketClick={(i) => navigate(healthSearchHref(source.source_slugs, hourWindow(source.points, i)))}
+          onBucketClick={(i) => navigate(healthSearchHref(source.source_slugs, { sourceField, ...hourWindow(source.points, i) }))}
         />
       </div>
       <div className="px-3 py-1.5">

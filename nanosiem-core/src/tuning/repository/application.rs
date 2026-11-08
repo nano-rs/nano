@@ -333,6 +333,13 @@ impl TuningRepository {
         }
 
         if request.target_status == TuningStatus::Promoted {
+            // NAN-4929 (codex P1): the deployment-wide AI tuning mode is part
+            // of the autonomous policy, read in THIS transaction. FOR SHARE on
+            // the settings row serializes against a mode change (which takes
+            // FOR UPDATE): an apply either commits before the switch or sees
+            // the new mode and routes the proposal to review.
+            let mode = lock_deployment_ai_tuning_mode(&mut tx).await?;
+            ensure_deployment_allows_autonomy(mode, request.proposal_id)?;
             ensure_autonomous_policy(&locked, &request.mutation, request.proposal_id)?;
         }
 
@@ -512,7 +519,11 @@ impl TuningRepository {
                 ensure_query_base(&locked, request.proposal_id)?;
                 let updated = sqlx::query(
                     "UPDATE detection_rules \
-                     SET mode = 'paused', updated_at = NOW() \
+                     SET paused_from_mode = CASE \
+                             WHEN mode IN ('staging', 'live', 'alerting') THEN mode \
+                             ELSE paused_from_mode \
+                         END, \
+                         mode = 'paused', updated_at = NOW() \
                      WHERE id = $1 AND query = $2",
                 )
                 .bind(locked.rule_id)
@@ -544,7 +555,7 @@ impl TuningRepository {
         let runtime_sync_claimed = runtime_sync_required && runtime_sync_owner.is_some();
         if runtime_sync_required {
             sqlx::query(
-                concat!(r#"
+                r#"
                 INSERT INTO detection_rule_runtime_sync_jobs (
                     rule_id, desired_version_id, status, attempts,
                     claimed_by, claimed_at, last_error
@@ -554,7 +565,7 @@ impl TuningRepository {
                     CASE WHEN $3::TEXT IS NULL THEN NULL ELSE NOW() END,
                     NULL
                 )
-                ON CONFLICT ("#, crate::tenant_key!(), r#"rule_id) DO UPDATE SET
+                ON CONFLICT (rule_id) DO UPDATE SET
                     desired_version_id = EXCLUDED.desired_version_id,
                     status = 'pending',
                     attempts = 0,
@@ -562,7 +573,7 @@ impl TuningRepository {
                     claimed_at = EXCLUDED.claimed_at,
                     last_error = NULL,
                     updated_at = NOW()
-                "#),
+                "#,
             )
             .bind(locked.rule_id)
             .bind(version_id.expect("runtime sync requires a created version"))
@@ -926,6 +937,39 @@ fn ensure_query_base(
     Ok(())
 }
 
+/// The deployment AI tuning mode, locked FOR SHARE for the rest of the
+/// transaction. A missing row or column (open edition) reads as `on`, the
+/// migration default.
+async fn lock_deployment_ai_tuning_mode(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<crate::tuning::AiTuningMode, sqlx::Error> {
+    let stored: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT to_jsonb(s) ->> 'ai_tuning_mode' FROM system_settings s WHERE s.id = 'default' FOR SHARE",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(stored
+        .flatten()
+        .as_deref()
+        .and_then(crate::tuning::AiTuningMode::parse)
+        .unwrap_or_default())
+}
+
+/// Only `on` allows an autonomous apply; `manual` and `off` route to review.
+fn ensure_deployment_allows_autonomy(
+    mode: crate::tuning::AiTuningMode,
+    proposal_id: Uuid,
+) -> Result<(), AtomicProposalApplyError> {
+    if mode.automatic_proposals() {
+        Ok(())
+    } else {
+        Err(AtomicProposalApplyError::AutonomousPolicyRejected {
+            proposal_id,
+            reason: format!("the deployment AI tuning mode is {mode}"),
+        })
+    }
+}
+
 fn ensure_autonomous_policy(
     locked: &LockedProposalRule,
     mutation: &ProposalRuleMutation,
@@ -1001,6 +1045,19 @@ fn stale_error(proposal_id: Uuid, rule_id: Uuid) -> AtomicProposalApplyError {
 mod tests {
     use super::*;
     use chrono::{Duration, TimeZone, Utc};
+
+    #[test]
+    fn only_deployment_mode_on_allows_an_autonomous_apply() {
+        use crate::tuning::AiTuningMode;
+        let id = Uuid::now_v7();
+        assert!(ensure_deployment_allows_autonomy(AiTuningMode::On, id).is_ok());
+        for mode in [AiTuningMode::Manual, AiTuningMode::Off] {
+            assert!(matches!(
+                ensure_deployment_allows_autonomy(mode, id),
+                Err(AtomicProposalApplyError::AutonomousPolicyRejected { .. })
+            ));
+        }
+    }
 
     fn locked_fixture(status: &str, current: &str, original: &str) -> LockedProposalRule {
         LockedProposalRule {

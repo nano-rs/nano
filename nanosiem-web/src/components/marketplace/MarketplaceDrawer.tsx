@@ -27,6 +27,8 @@ import { ConnectionsTab } from './ConnectionsTab';
 import { MonoSwatch, getCategoryTone } from './MonoSwatch';
 import { humanizeEnum } from '@/lib/marketplace-labels';
 import { StateBadge, getIntegrationState, IpInfoCredit } from './IntegrationCard';
+import { BundleFeedStatus } from './BundleFeedStatus';
+import { bundleFeedForSlug, bundleProvisions, type BundleProvision } from '@/lib/api/marketplace-inventory';
 
 const TABS = [
   { id: 'about',  label: 'About',       icon: Info },
@@ -82,6 +84,17 @@ export function MarketplaceDrawer({
     refetchOnWindowFocus: false,
   });
   const airGap = airGapQuery.data?.air_gap ?? false;
+  // NAN-4959: IPinfo Lite is served from nano's signed platform feed bundle;
+  // its drawer shows the bundle status instead of credentials and sync. Same
+  // query key as the catalog page and PlatformFeedsPanel (one fetch).
+  const feedBundle = useQuery({
+    queryKey: ['enrichment', 'platform-feeds'],
+    queryFn: () => api.getPlatformFeeds(),
+    enabled: open && hasPermission('enrichments:view'),
+    staleTime: 60_000,
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
   const [entry, setEntry] = useState<MarketplaceCatalogEntry | null>(null);
   const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState<TabId>('config');
@@ -112,50 +125,10 @@ export function MarketplaceDrawer({
     setDeleteOpen(false);
     setTab(initialTab);
     api.marketplace.getCatalogEntry(slug)
-      .then(loaded => {
-        setEntry(loaded);
-        void hydrateReadableCredentials(loaded);
-      })
+      .then(loaded => setEntry(loaded))
       .catch(() => toast({ title: 'Error', description: 'Failed to load details', variant: 'destructive' }))
       .finally(() => setLoading(false));
-    // hydrateReadableCredentials is stable for a given render pass and depends
-    // only on setters; including it would re-run this loader on every render.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug, open, toast, initialTab]);
-
-  // Show the operator what is actually stored, for credential fields that are
-  // not secrets.
-  //
-  // NAN-2343: unmasking `download_url` (migration 285) is only half the fix —
-  // the input's value comes from `credentials`, which starts empty, so a
-  // configured entry still rendered a placeholder and the saved string stayed
-  // unreadable. That was the whole reason the legacy /enrichments/ipinfo_lite
-  // page had to exist, and this PR retires it.
-  //
-  // Native sources keep their operational values in their own tables, not in
-  // `marketplace_catalog.credentials_encrypted` (which is deliberately never
-  // serialized), so read them from the enrichment sources API. Fields still
-  // declared `secret` are intentionally NOT hydrated — those stay write-only.
-  const hydrateReadableCredentials = async (loaded: MarketplaceCatalogEntry) => {
-    const readable = (loaded.credential_fields ?? []).filter(f => f.field_type !== 'secret');
-    if (!loaded.native_source_id || readable.length === 0) return;
-    try {
-      const sources = await api.listEnrichmentSources();
-      const source = sources.find(s => s.id === loaded.native_source_id);
-      if (!source) return;
-      const stored: Record<string, string> = {};
-      if (readable.some(f => f.name === 'download_url') && source.download_url) {
-        stored.download_url = source.download_url;
-      }
-      if (Object.keys(stored).length === 0) return;
-      setPristineCredentials(stored);
-      setCredentials(prev => ({ ...stored, ...prev }));
-    } catch {
-      // Requires enrichments:view, which a marketplace-only operator may lack.
-      // Falling back to an empty field is the pre-existing behaviour, so this
-      // degrades rather than breaking the drawer.
-    }
-  };
 
   // Re-read this drawer's own entry. `onUpdated()` only refreshes the parent
   // catalog list, which the drawer does not read from (NAN-2343).
@@ -381,11 +354,7 @@ export function MarketplaceDrawer({
     if (!entry) return;
     setSavingCreds(true);
     try {
-      // Submit only what the operator actually changed. `credentials` is now
-      // pre-filled with readable stored values (see `hydrateReadableCredentials`),
-      // so posting it wholesale would re-send an untouched download URL and
-      // re-queue a multi-million-row sync for a save that changed nothing
-      // (NAN-2343).
+      // Submit only what the operator actually changed (NAN-2343).
       const changed = Object.fromEntries(
         Object.entries(credentials).filter(([k, v]) => v !== (pristineCredentials[k] ?? '')),
       );
@@ -406,10 +375,8 @@ export function MarketplaceDrawer({
       onUpdated();
       toast({ title: 'Credentials saved', description: 'Credentials have been encrypted and stored' });
     } catch (err) {
-      // NAN-2343: the server now rejects a malformed download URL with 422 and
-      // names the field and reason. Swallowing that into a generic "Failed to
-      // save" was the difference between the operator fixing a typo in seconds
-      // and filing a support ticket, so show what the server said.
+      // NAN-2343: a rejected value comes back as 422 naming the field and the
+      // reason; show what the server said rather than a generic failure.
       const description = err instanceof Error && err.message
         ? err.message
         : 'Failed to save credentials';
@@ -462,6 +429,7 @@ export function MarketplaceDrawer({
               savingCreds={savingCreds}
               canPreview={canPreview}
               onOpenPreview={() => setPreviewOpen(true)}
+              bundleProvision={bundleFeedForSlug(entry.slug) ? bundleProvisions(feedBundle.data).get(entry.slug) ?? null : null}
             />
           )}
         </SheetContent>
@@ -522,6 +490,8 @@ interface DrawerInnerProps {
   savingCreds: boolean;
   canPreview: boolean;
   onOpenPreview: () => void;
+  /** NAN-4959: the bundle status of a bundle-only feed (IPinfo Lite); null when unknown. */
+  bundleProvision: BundleProvision | null;
 }
 
 function DrawerInner(props: DrawerInnerProps) {
@@ -533,7 +503,7 @@ function DrawerInner(props: DrawerInnerProps) {
     handleUpdate, handleExport, handleSaveCredentials,
     syncing, updating, exporting, savingCreds,
     canPreview, canDeleteCustomCollector, checkingDelete,
-    onOpenPreview,
+    onOpenPreview, bundleProvision,
   } = props;
 
   const state = getIntegrationState(entry);
@@ -606,7 +576,10 @@ function DrawerInner(props: DrawerInnerProps) {
       {/* Body */}
       <div className="flex-1 overflow-y-auto scrollbar-thin">
         {tab === 'about' && <AboutTab entry={entry} />}
-        {tab === 'config' && (
+        {tab === 'config' && bundleFeedForSlug(entry.slug) && (
+          <BundleOnlyConfig provision={bundleProvision} ipinfo={isIpInfoEntry(entry)} />
+        )}
+        {tab === 'config' && !bundleFeedForSlug(entry.slug) && (
           <ConfigTab
             entry={entry}
             airGap={airGap}
@@ -645,6 +618,28 @@ function DrawerInner(props: DrawerInnerProps) {
         <span>{entry.slug}@v{entry.manifest_version}</span>
       </div>
     </>
+  );
+}
+
+/**
+ * NAN-4959: the config tab of a platform-feed-bundle feed (IPinfo Lite,
+ * ThreatFox, Tor). No credential inputs and no sync: the feed comes only from
+ * nano's signed platform feed bundle.
+ */
+function BundleOnlyConfig({ provision, ipinfo }: { provision: BundleProvision | null; ipinfo: boolean }) {
+  return (
+    <div className="p-5 space-y-4" data-testid="bundle-only-config">
+      <Eyebrow>Provided by nano · signed bundle</Eyebrow>
+      {provision ? (
+        <BundleFeedStatus provision={provision} />
+      ) : (
+        <p className="text-[12px] text-muted-foreground" data-testid="inventory-bundle-note">
+          This feed is provided by nano's signed feed bundle from app.nano.rs and stamped at ingest. There is no
+          download URL or token to configure. Feed status is under Platform feeds on the Marketplace page.
+        </p>
+      )}
+      {ipinfo && <IpInfoCredit />}
+    </div>
   );
 }
 
@@ -693,7 +688,7 @@ function AboutTab({ entry }: { entry: MarketplaceCatalogEntry }) {
         </code>{' '}
         on matching artifact types.
       </p>
-      {/* CC BY-SA 4.0 redistribution credit for the native IPinfo Lite feed. */}
+      {/* CC BY-SA 4.0 redistribution credit for the IPinfo Lite feed (platform feed bundle). */}
       {isIpInfoEntry(entry) && (
         <div className="pt-1 border-t border-border/60">
           <IpInfoCredit className="pt-3" />

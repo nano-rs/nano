@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { TelemetrySetupHint } from '@/components/observability/TelemetryUnavailable';
+import { TelemetrySetupHint } from '@/components/observability/TelemetrySetupHint';
 
 // RumTab (NAN-1538) — real-user-monitoring: web vitals, page views, JS errors.
 //
@@ -24,6 +24,7 @@ import type { CacheMeta } from '@/lib/api';
 import { toApiTimeRange } from '@/hooks/use-api';
 import { parseUTCTimestamp } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { CachedNotice } from '@/components/search/CachedNotice';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { REDChart } from '@/components/observability/charts';
@@ -44,11 +45,13 @@ function ErrorEntityPivots({
   e: RumRecentError;
   onPivot: (query: string) => void;
 }) {
+  // NAN-4903: pivot columns from the profile-aware field map.
+  const fieldMap = useSchemaFieldMap();
   const chips: Array<{ label: string; value: string; query: string }> = [];
-  if (e.user) chips.push({ label: 'user', value: e.user, query: `user="${e.user}"` });
-  if (e.src_ip) chips.push({ label: 'ip', value: e.src_ip, query: `src_ip="${e.src_ip}"` });
+  if (e.user) chips.push({ label: 'user', value: e.user, query: fieldMap.filter('user', e.user) });
+  if (e.src_ip) chips.push({ label: 'ip', value: e.src_ip, query: fieldMap.filter('srcIp', e.src_ip) });
   if (e.session)
-    chips.push({ label: 'session', value: e.session, query: `session_id="${e.session}"` });
+    chips.push({ label: 'session', value: e.session, query: fieldMap.filter('sessionId', e.session) });
   if (chips.length === 0) return null;
   return (
     <div className="flex items-center gap-1.5 mt-1 flex-wrap">
@@ -56,7 +59,7 @@ function ErrorEntityPivots({
         <button
           key={c.label}
           type="button"
-          onClick={() => onPivot(c.query)}
+          onClick={fieldMap.guard(() => onPivot(c.query))}
           title={`Investigate this ${c.label} in search`}
           className="inline-flex items-center gap-1 h-[18px] px-1.5 rounded-sm border border-border bg-foreground/[0.02] font-mono text-[9.5px] hover:border-brand/50 hover:text-brand cursor-pointer"
         >

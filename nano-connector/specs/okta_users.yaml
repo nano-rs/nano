@@ -1,6 +1,6 @@
-# nano-connector identity spec (NAN-3503): Okta directory users and group
-# memberships, synced into nano's identity snapshot (kind: identity; no HEC,
-# no parser, no log source). Replaces the v1 nano_enrich collector.
+# nano-connector identity spec (NAN-3503, G22 on the ClickHouse product): Okta
+# directory users and group memberships, synced into nano's user directory
+# (`user_registry`; kind: identity; no HEC, no parser, no log source).
 #
 # users (mode delta): a full run walks GET /api/v1/users?search=<every status>
 #   by Okta's rel="next" links and is a complete snapshot. The plain list (no
@@ -20,10 +20,7 @@
 #   /api/v1/iam/assignees/users, okta.roles.read), GET /api/v1/users/{id}/roles,
 #   emitting {member: <user id>, group: "role:<type>", privileged: true}.
 #
-# Auth: this self-hosted spec uses an SSWS API token. The hosted twin
-# (connector.hosted.yaml) is keyless: an Okta API Services app trusts nano's
-# pull broker JWKS (private_key_jwt client credentials, scoped
-# okta.users.read okta.groups.read okta.roles.read).
+# Auth: an SSWS API token (read-only admin) held in the credentials store.
 version: 1
 name: okta_users
 kind: identity

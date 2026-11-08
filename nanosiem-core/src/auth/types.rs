@@ -403,19 +403,6 @@ pub struct Session {
     #[serde(with = "typeid::user")]
     #[schema(value_type = String)]
     pub user_id: Uuid,
-    /// Bound tenant for enterprise-shared sessions. Dedicated/demo sessions
-    /// remain NULL and preserve their existing behavior.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<String>)]
-    pub tenant_id: Option<Uuid>,
-    /// Immutable interactive authentication time for enterprise-shared
-    /// sessions. Dedicated/demo sessions preserve their legacy NULL value.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub authenticated_at: Option<DateTime<Utc>>,
-    /// Immutable local-MFA completion time. OIDC-authenticated sessions do not
-    /// claim local MFA and therefore leave this NULL.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mfa_authenticated_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing)]
     pub refresh_token_hash: String,
     pub ip_address: Option<String>,
@@ -450,8 +437,10 @@ pub struct OidcProvider {
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// NAN-3904: SSO admission policy (enterprise migration 9000078).
     #[sqlx(json)]
     pub access_policy: super::SsoAccessPolicy,
+    /// NAN-3935: encrypted Google Workspace service-account key; never serialized.
     #[serde(skip_serializing)]
     pub google_service_account_encrypted: Option<Vec<u8>>,
 }
@@ -466,11 +455,10 @@ pub struct CreateOidcProviderRequest {
     pub client_secret: String,
     pub scopes: Option<Vec<String>>,
     pub group_claim: Option<String>,
+    /// NAN-3904: admission policy; omitted = mapped-group admission.
     pub access_policy: Option<super::SsoAccessPolicy>,
+    /// NAN-3935: Google Workspace service-account JSON key (write-only).
     pub google_service_account: Option<String>,
-    #[serde(default)]
-    pub clear_google_service_account: bool,
-    pub mfa_code: Option<String>,
 }
 
 /// Request to update an OIDC provider
@@ -483,11 +471,13 @@ pub struct UpdateOidcProviderRequest {
     pub scopes: Option<Vec<String>>,
     pub group_claim: Option<String>,
     pub enabled: Option<bool>,
+    /// NAN-3904: replaces the admission policy when present.
     pub access_policy: Option<super::SsoAccessPolicy>,
+    /// NAN-3935: replaces the Google service-account key when present.
     pub google_service_account: Option<String>,
+    /// NAN-3935: removes the stored Google service-account key.
     #[serde(default)]
     pub clear_google_service_account: bool,
-    pub mfa_code: Option<String>,
 }
 
 /// OIDC group mapping
@@ -627,10 +617,6 @@ impl TokenPair {
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
-    /// Tenant selector used only by the hosted shared deployment mode.
-    /// The server resolves membership; this value never grants access.
-    #[serde(default)]
-    pub tenant_slug: Option<String>,
 }
 
 /// Authentication response
@@ -677,23 +663,12 @@ pub struct UpdateUserPreferencesRequest {
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 pub struct RefreshTokenRequest {
     pub refresh_token: Option<String>,
-    /// Canonical tenant slug selected by the shared browser route. This is a
-    /// selector only: enterprise-shared refresh still derives authority from
-    /// the signed tenant UUID and an authoritative membership lookup, then
-    /// requires the resolved slug to match. Dedicated/demo callers omit it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tenant_slug: Option<String>,
 }
 
 /// Password reset request
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 pub struct PasswordResetRequest {
     pub email: String,
-    /// Tenant selector used only by the hosted shared deployment mode:
-    /// identities are tenant-scoped there, so the reset targets that
-    /// tenant's identity (legacy global row as fallback). Never grants access.
-    #[serde(default)]
-    pub tenant_slug: Option<String>,
 }
 
 /// Password reset completion
@@ -734,7 +709,7 @@ pub struct MfaSetupResponse {
 /// Request to start MFA setup. Body is optional — only required when the
 /// caller is mid-forced-enrollment (no Bearer session yet) and needs to
 /// authenticate via the short-lived `mfa_challenge` token from the prior
-/// login response. Bearer-authenticated calls (voluntary enrollment from
+/// login response. Bearer-authenticated calls (voluntary enrolment from
 /// User Settings) leave the body empty.
 #[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
 pub struct MfaSetupRequest {
@@ -744,11 +719,6 @@ pub struct MfaSetupRequest {
     /// present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub challenge_token: Option<String>,
-    /// Canonical shared-tenant route selector. Required by the exact
-    /// hosted-shared profile and checked against the tenant-bound token;
-    /// it never grants membership by itself.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tenant_slug: Option<String>,
 }
 
 /// Request to verify MFA setup with first TOTP code
@@ -759,9 +729,6 @@ pub struct MfaVerifySetupRequest {
     /// MFA challenge token — same role as on `MfaSetupRequest`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub challenge_token: Option<String>,
-    /// Same non-authoritative selector contract as [`MfaSetupRequest`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tenant_slug: Option<String>,
 }
 
 /// Response after MFA setup is complete
@@ -778,10 +745,6 @@ pub struct MfaChallengeRequest {
     pub challenge_token: String,
     /// TOTP code or backup code
     pub code: String,
-    /// Canonical shared-tenant route selector. Enterprise-shared challenge
-    /// completion requires an exact match with the server-resolved tenant.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tenant_slug: Option<String>,
 }
 
 /// MFA status for a user

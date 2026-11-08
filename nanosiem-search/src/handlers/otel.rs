@@ -27,19 +27,19 @@
 //! alone (a valid token) must not read observability data.
 
 use axum::{
-    extract::{Path, Query, State},
     Json,
-};
-use nanosiem_core::query::{
-    valid_tag_key, InfraHostsFilters, MetricAgg, MetricQuery, MetricTagFilter, RumFilters,
-    ServicesOverviewFilters, ServicesSort, TimeRange, TraceListFilters,
+    extract::{Path, Query, State},
 };
 use nanosiem_core::TimeRangeInput;
+use nanosiem_core::query::{
+    InfraHostsFilters, MetricAgg, MetricQuery, MetricTagFilter, RumFilters, ServicesOverviewFilters,
+    ServicesSort, TimeRange, TraceListFilters, valid_tag_key,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 use crate::error::ErrorResponse;
-use crate::{error::SearchError, metrics::record_search_query, SearchState};
+use crate::{SearchState, error::SearchError, metrics::record_search_query};
 
 // ============================================================================
 // Trace by id (ordered spans for the waterfall)
@@ -73,11 +73,10 @@ pub struct TraceResponse {
 /// Fetch a distributed trace by id.
 ///
 /// Returns every span of the trace, time-ordered (`start_time ASC`), ready for
-/// the trace-waterfall view. The legacy backend uses its compact per-trace
-/// index; the native OTLP route uses the tenant-pinned Iceberg query service.
-/// Returns an empty span list (200) when the trace id is unknown rather than
-/// 404, so the UI can render an "unknown trace" state without special-casing
-/// the error path.
+/// the trace-waterfall view. Two-step partition-pruned fetch under the hood
+/// (compact per-trace index → in-window span scan). Returns an empty span list
+/// (200) when the trace id is unknown rather than 404, so the UI can render an
+/// "unknown trace" state without special-casing the error path.
 #[utoipa::path(
     get,
     path = "/api/search/trace/{trace_id}",
@@ -87,7 +86,6 @@ pub struct TraceResponse {
     ),
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Ordered spans for the trace (empty if unknown)", body = TraceResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -102,14 +100,6 @@ pub async fn get_trace(
 ) -> Result<(axum::http::HeaderMap, Json<TraceResponse>), SearchError> {
     // NAN-2030: authN is not authZ — gate on search:execute before any work.
     super::require_search_execute(&auth)?;
-    // NAN-2361 wave 6: a shared request re-proves membership/entitlement
-    // before telemetry is released; dedicated requests are a no-op.
-    super::require_current_shared_authority(&state, &auth).await?;
-    if trace_id.len() != 32 || !trace_id.chars().all(|value| value.is_ascii_hexdigit()) {
-        return Err(SearchError::QueryError(
-            "Trace id must contain exactly 32 hexadecimal characters".to_string(),
-        ));
-    }
 
     let start = Instant::now();
 
@@ -118,8 +108,7 @@ pub async fn get_trace(
     // NAN-1801 (resolved in P3): otel_spans has no source_type, so this read is
     // out of the per-source scope's reach by design — the unrestricted key is
     // correct, not a gap (see module doc).
-    let cache_key = crate::cache::SearchResultCache::companion_key_for(
-        auth.tenant_scope,
+    let cache_key = crate::cache::SearchResultCache::companion_key(
         "trace",
         &[trace_id.to_ascii_lowercase().as_bytes()],
         &nanosiem_core::auth::ScopeSet::unrestricted(),
@@ -134,20 +123,15 @@ pub async fn get_trace(
         }
     }
 
-    let result = if let Some(client) = state.otel_lake_for(&auth)? {
-        client
-            .trace(&trace_id)
-            .await
-            .map_err(|error| error.into_search_error())
-    } else {
-        state.search.query_otel_trace_by_id(&trace_id).await
-    };
+    let result = state.search.query_otel_trace_by_id(&trace_id).await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("otel_trace", duration_ms, result.is_ok());
 
-    let mut spans =
-        result.map_err(|e| crate::error::mask_query_failure(e, "Failed to fetch trace"))?;
+    let mut spans = result.map_err(|e| {
+        tracing::error!(error = %e, "OTEL trace fetch failed");
+        SearchError::QueryError("Failed to fetch trace".to_string())
+    })?;
 
     // O41: the SQL fetches TRACE_SPAN_CAP + 1 rows. If the extra row came back
     // the trace is larger than we return — trim to the cap and flag it so the
@@ -177,17 +161,14 @@ pub async fn get_trace(
         }
     }
 
-    Ok((
-        crate::cache::cache_status_headers(false, None),
-        Json(response),
-    ))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
 // Metric time series
 // ============================================================================
 
-/// A single tag/attribute equality filter for a metric query.
+/// A single tag/attribute equality filter for a metric query (NAN-1540).
 /// Matched over the metric's `attributes` / `resource_attributes` maps.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct MetricFilterInput {
@@ -197,7 +178,7 @@ pub struct MetricFilterInput {
     pub value: String,
 }
 
-/// Request for an OTLP metric time series.
+/// Request for an OTLP metric time series (NAN-1540 metrics v2).
 ///
 /// Back-compatible with the v1 single-series request: omit `agg`/`group_by`/
 /// `filters` and you get one `avg(value)` series (label `""`). Adding `agg`
@@ -243,7 +224,7 @@ pub struct MetricSeries {
     pub points: Vec<serde_json::Value>,
 }
 
-/// Response for a metric time series: one or more labelled series.
+/// Response for a metric time series: one or more labelled series (NAN-1540).
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MetricTimeseriesResponse {
     /// The metric name that was queried.
@@ -272,7 +253,6 @@ pub struct MetricTimeseriesResponse {
     request_body = MetricTimeseriesRequest,
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Labelled metric time series", body = MetricTimeseriesResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -287,9 +267,6 @@ pub async fn get_metric_timeseries(
 ) -> Result<(axum::http::HeaderMap, Json<MetricTimeseriesResponse>), SearchError> {
     // NAN-2030: authN is not authZ — gate on search:execute before any work.
     super::require_search_execute(&auth)?;
-    // NAN-2361 wave 6: a shared request re-proves membership/entitlement
-    // before telemetry is released; dedicated requests are a no-op.
-    super::require_current_shared_authority(&state, &auth).await?;
 
     let start = Instant::now();
 
@@ -353,24 +330,13 @@ pub async fn get_metric_timeseries(
             .collect::<Vec<_>>(),
     )
     .unwrap_or_default();
-    let cache_key = crate::cache::SearchResultCache::companion_key_for(
-        auth.tenant_scope,
+    let cache_key = crate::cache::SearchResultCache::companion_key(
         "mts",
         &[
             request.metric_name.as_bytes(),
             service.unwrap_or("").as_bytes(),
-            request
-                .time_range
-                .start
-                .timestamp_micros()
-                .to_string()
-                .as_bytes(),
-            request
-                .time_range
-                .end
-                .timestamp_micros()
-                .to_string()
-                .as_bytes(),
+            request.time_range.start.timestamp_micros().to_string().as_bytes(),
+            request.time_range.end.timestamp_micros().to_string().as_bytes(),
             request.step_secs.to_string().as_bytes(),
             agg.as_str().as_bytes(),
             group_by.unwrap_or("").as_bytes(),
@@ -391,31 +357,18 @@ pub async fn get_metric_timeseries(
         }
     }
 
-    let result = if let Some(client) = state.otel_lake_for(&auth)? {
-        client
-            .metric_timeseries(
-                &request.metric_name,
-                service,
-                &time_range,
-                request.step_secs,
-                agg,
-                group_by,
-                &filters,
-            )
-            .await
-            .map_err(|error| error.into_search_error())
-    } else {
-        state
-            .search
-            .query_otel_metric_timeseries_v2(&query, &time_range)
-            .await
-    };
+    let result = state
+        .search
+        .query_otel_metric_timeseries_v2(&query, &time_range)
+        .await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("otel_metric_timeseries", duration_ms, result.is_ok());
 
-    let series = result
-        .map_err(|e| crate::error::mask_query_failure(e, "Failed to fetch metric time series"))?;
+    let series = result.map_err(|e| {
+        tracing::error!(error = %e, "OTEL metric timeseries query failed");
+        SearchError::QueryError("Failed to fetch metric time series".to_string())
+    })?;
 
     let response = MetricTimeseriesResponse {
         metric_name: request.metric_name,
@@ -432,10 +385,7 @@ pub async fn get_metric_timeseries(
         });
     }
 
-    Ok((
-        crate::cache::cache_status_headers(false, None),
-        Json(response),
-    ))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -485,7 +435,6 @@ pub struct MetricTagsResponse {
     params(MetricTagsParams),
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Tag keys (no key) or tag values (key given)", body = MetricTagsResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -500,9 +449,6 @@ pub async fn list_metric_tags(
 ) -> Result<(axum::http::HeaderMap, Json<MetricTagsResponse>), SearchError> {
     // NAN-2030: authN is not authZ — gate on search:execute before any work.
     super::require_search_execute(&auth)?;
-    // NAN-2361 wave 6: a shared request re-proves membership/entitlement
-    // before telemetry is released; dedicated requests are a no-op.
-    super::require_current_shared_authority(&state, &auth).await?;
 
     let start = Instant::now();
 
@@ -513,18 +459,11 @@ pub async fn list_metric_tags(
     }
 
     let time_range = resolve_window(params.start, params.end, params.window_hours)?;
-    let tag_key = params.key.as_deref().filter(|value| !value.is_empty());
-    if let Some(key) = tag_key {
-        if !valid_tag_key(key) {
-            return Err(SearchError::BadRequest(format!("invalid tag key: {key}")));
-        }
-    }
 
     // NAN-1593: the group-by / filter-value pickers re-fetch on every metrics
     // explorer load — cache through the same Dragonfly layer. Keyed on the
     // metric name, the optional tag key, and the resolved window.
-    let cache_key = crate::cache::SearchResultCache::companion_key_for(
-        auth.tenant_scope,
+    let cache_key = crate::cache::SearchResultCache::companion_key(
         "mtags",
         &[
             params.metric_name.as_bytes(),
@@ -544,53 +483,40 @@ pub async fn list_metric_tags(
         }
     }
 
-    let response = if let Some(client) = state.otel_lake_for(&auth)? {
-        let result = client
-            .metric_tags(&params.metric_name, tag_key, &time_range)
-            .await;
-        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-        record_search_query("otel_metric_tags", duration_ms, result.is_ok());
-        let result = result.map_err(|error| {
-            crate::error::mask_query_failure(
-                error.into_search_error(),
-                "Failed to list metric tags",
-            )
-        })?;
-        MetricTagsResponse {
-            tag_keys: result.tag_keys,
-            tag_values: result.tag_values,
-        }
-    } else {
-        match tag_key {
-            None => {
-                let result = state
-                    .search
-                    .list_otel_metric_tag_keys(&params.metric_name, &time_range)
-                    .await;
-                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-                record_search_query("otel_metric_tag_keys", duration_ms, result.is_ok());
-                let tag_keys = result.map_err(|e| {
-                    crate::error::mask_query_failure(e, "Failed to list metric tag keys")
-                })?;
-                MetricTagsResponse {
-                    tag_keys: Some(tag_keys),
-                    tag_values: None,
-                }
+    let response = match params.key.as_deref().filter(|s| !s.is_empty()) {
+        None => {
+            let result = state
+                .search
+                .list_otel_metric_tag_keys(&params.metric_name, &time_range)
+                .await;
+            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+            record_search_query("otel_metric_tag_keys", duration_ms, result.is_ok());
+            let tag_keys = result.map_err(|e| {
+                tracing::error!(error = %e, "OTEL metric tag-keys query failed");
+                SearchError::QueryError("Failed to list metric tag keys".to_string())
+            })?;
+            MetricTagsResponse {
+                tag_keys: Some(tag_keys),
+                tag_values: None,
             }
-            Some(key) => {
-                let result = state
-                    .search
-                    .list_otel_metric_tag_values(&params.metric_name, key, &time_range)
-                    .await;
-                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-                record_search_query("otel_metric_tag_values", duration_ms, result.is_ok());
-                let tag_values = result.map_err(|e| {
-                    crate::error::mask_query_failure(e, "Failed to list metric tag values")
-                })?;
-                MetricTagsResponse {
-                    tag_keys: None,
-                    tag_values: Some(tag_values),
-                }
+        }
+        Some(key) => {
+            if !valid_tag_key(key) {
+                return Err(SearchError::BadRequest(format!("invalid tag key: {key}")));
+            }
+            let result = state
+                .search
+                .list_otel_metric_tag_values(&params.metric_name, key, &time_range)
+                .await;
+            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+            record_search_query("otel_metric_tag_values", duration_ms, result.is_ok());
+            let tag_values = result.map_err(|e| {
+                tracing::error!(error = %e, "OTEL metric tag-values query failed");
+                SearchError::QueryError("Failed to list metric tag values".to_string())
+            })?;
+            MetricTagsResponse {
+                tag_keys: None,
+                tag_values: Some(tag_values),
             }
         }
     };
@@ -603,10 +529,7 @@ pub async fn list_metric_tags(
         });
     }
 
-    Ok((
-        crate::cache::cache_status_headers(false, None),
-        Json(response),
-    ))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -639,7 +562,7 @@ pub struct ListTracesParams {
     pub min_duration_ns: Option<u64>,
     /// Max traces to return (clamped to 1000 by the SQL builder; default 200).
     pub limit: Option<u32>,
-    /// Keyset pagination cursor (RFC3339): return only traces whose
+    /// Keyset pagination cursor (NAN-1539, RFC3339): return only traces whose
     /// `start_time` is strictly before this instant. Pass the previous page's
     /// last `start_time` to fetch the next page (the list is most-recent-first).
     pub before: Option<chrono::DateTime<chrono::Utc>>,
@@ -671,7 +594,6 @@ pub struct ListTracesResponse {
     params(ListTracesParams),
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Recent traces, most-recent-first", body = ListTracesResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -686,9 +608,6 @@ pub async fn list_traces(
 ) -> Result<(axum::http::HeaderMap, Json<ListTracesResponse>), SearchError> {
     // NAN-2030: authN is not authZ — gate on search:execute before any work.
     super::require_search_execute(&auth)?;
-    // NAN-2361 wave 6: a shared request re-proves membership/entitlement
-    // before telemetry is released; dedicated requests are a no-op.
-    super::require_current_shared_authority(&state, &auth).await?;
 
     let start = Instant::now();
 
@@ -721,8 +640,7 @@ pub async fn list_traces(
     // NAN-1593: the Traces explorer list re-fetches on every load / paging /
     // shared-link follow — cache through the same Dragonfly layer. Keyed on the
     // resolved window plus every filter + the keyset cursor that shapes the page.
-    let cache_key = crate::cache::SearchResultCache::companion_key_for(
-        auth.tenant_scope,
+    let cache_key = crate::cache::SearchResultCache::companion_key(
         "traces",
         &[
             time_range.start.timestamp_micros().to_string().as_bytes(),
@@ -734,11 +652,7 @@ pub async fn list_traces(
                 .map(|v| v.to_string())
                 .unwrap_or_default()
                 .as_bytes(),
-            params
-                .limit
-                .map(|v| v.to_string())
-                .unwrap_or_default()
-                .as_bytes(),
+            params.limit.map(|v| v.to_string()).unwrap_or_default().as_bytes(),
             params
                 .before
                 .map(|t| t.timestamp_micros().to_string())
@@ -757,27 +671,15 @@ pub async fn list_traces(
         }
     }
 
-    let result = if let Some(client) = state.otel_lake_for(&auth)? {
-        client
-            .recent_traces(
-                &time_range,
-                service,
-                params.errors_only,
-                params.min_duration_ns,
-                params.before,
-                params.limit.unwrap_or(200),
-            )
-            .await
-            .map_err(|error| error.into_search_error())
-    } else {
-        state.search.list_otel_traces(&time_range, &filters).await
-    };
+    let result = state.search.list_otel_traces(&time_range, &filters).await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("otel_traces_list", duration_ms, result.is_ok());
 
-    let traces =
-        result.map_err(|e| crate::error::mask_query_failure(e, "Failed to list traces"))?;
+    let traces = result.map_err(|e| {
+        tracing::error!(error = %e, "OTEL recent-traces query failed");
+        SearchError::QueryError("Failed to list traces".to_string())
+    })?;
 
     let response = ListTracesResponse {
         count: traces.len(),
@@ -791,10 +693,7 @@ pub async fn list_traces(
         });
     }
 
-    Ok((
-        crate::cache::cache_status_headers(false, None),
-        Json(response),
-    ))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -806,6 +705,9 @@ pub async fn list_traces(
 pub struct MetricNamesParams {
     /// Optional single `service.name` filter (omit / empty for all services).
     pub service: Option<String>,
+    /// Catalog window in hours (default 24, clamped to 1..=168). Names that
+    /// did not report inside it are not listed (NAN-4098).
+    pub window_hours: Option<u32>,
 }
 
 /// Response for the metric-names list.
@@ -815,23 +717,29 @@ pub struct MetricNamesResponse {
     pub names: Vec<serde_json::Value>,
     /// Number of distinct metric names returned.
     pub count: usize,
-    /// Start of the time window the names cover (end is now). Absent when
-    /// the backend does not report one (ClickHouse rollup path).
+    /// Start of the time window the names cover (end is now).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_start: Option<chrono::DateTime<chrono::Utc>>,
-    /// True while the catalog is still warming (covers less than its full
-    /// window) or was capped. The UI says so and still allows typed names.
+    /// True when the catalog was capped at 10 000 names. The UI says so and
+    /// still allows typed names.
     #[serde(default)]
     pub partial: bool,
 }
 
+/// The process-wide metric-catalog cache (NAN-4098).
+static METRIC_CATALOG: std::sync::LazyLock<
+    crate::metric_catalog::SingleFlightCache<MetricNamesResponse>,
+> = std::sync::LazyLock::new(|| {
+    crate::metric_catalog::SingleFlightCache::new(crate::metric_catalog::CATALOG_TTL)
+});
+
 /// List distinct metric names.
 ///
-/// Returns the distinct `metric_name` values in `otel_metrics`, optionally
-/// restricted to a single `service`. Name-ordered, bounded by an internal
-/// `LIMIT 10000` — populates the Metrics explorer dropdown. On lake tenants
-/// the names come from the lake's per-tenant catalog of the last 24 h;
-/// `window_start` / `partial` describe its coverage.
+/// Returns the distinct `metric_name` values that reported in the last
+/// `window_hours` (default 24, at most 7 days), optionally restricted to a
+/// single `service`. Name-ordered, at most 10 000 (`partial` when capped) —
+/// populates the Metrics explorer dropdown. Bounded and cached (NAN-4098): a
+/// 60 s in-process single-flight cache sits under the shared result cache.
 #[utoipa::path(
     get,
     path = "/api/search/metrics/names",
@@ -839,7 +747,6 @@ pub struct MetricNamesResponse {
     params(MetricNamesParams),
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Distinct metric names", body = MetricNamesResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -854,20 +761,21 @@ pub async fn list_metric_names(
 ) -> Result<(axum::http::HeaderMap, Json<MetricNamesResponse>), SearchError> {
     // NAN-2030: authN is not authZ — gate on search:execute before any work.
     super::require_search_execute(&auth)?;
-    // NAN-2361 wave 6: a shared request re-proves membership/entitlement
-    // before telemetry is released; dedicated requests are a no-op.
-    super::require_current_shared_authority(&state, &auth).await?;
 
     let start = Instant::now();
 
     let service = params.service.as_deref().filter(|s| !s.is_empty());
+    let window_hours = params
+        .window_hours
+        .unwrap_or(nanosiem_core::query::METRIC_NAMES_DEFAULT_WINDOW_HOURS)
+        .clamp(1, nanosiem_core::query::METRIC_NAMES_MAX_WINDOW_HOURS);
+    let window_key = window_hours.to_string();
 
     // NAN-1593: the metrics-explorer dropdown re-fetches on every load — cache
-    // through the same Dragonfly layer. Keyed on the optional service filter.
-    let cache_key = crate::cache::SearchResultCache::companion_key_for(
-        auth.tenant_scope,
+    // through the same Dragonfly layer. Keyed on the service filter + window.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
         "mnames",
-        &[service.unwrap_or("").as_bytes()],
+        &[service.unwrap_or("").as_bytes(), window_key.as_bytes()],
         &nanosiem_core::auth::ScopeSet::unrestricted(),
     );
     if !bypass {
@@ -880,46 +788,40 @@ pub async fn list_metric_names(
         }
     }
 
-    let result = if let Some(client) = state.otel_lake_for(&auth)? {
-        client
-            .metric_names(service)
-            .await
-            .map(|lake| (lake.names, lake.window_start, lake.partial))
-            .map_err(|error| error.into_search_error())
-    } else if !state.dual_pool.clickhouse_required() {
-        Ok((Vec::new(), None, false))
-    } else {
-        state
-            .search
-            .list_otel_metric_names(service)
-            .await
-            .map(|names| (names, None, false))
-    };
+    // NAN-4098: concurrent loads share one bounded scan; reuse for 60 s.
+    let local_key = format!("{}\u{1f}{window_hours}", service.unwrap_or(""));
+    let result = METRIC_CATALOG
+        .get_or_load(&local_key, bypass, || async {
+            let (names, window_start, partial) =
+                state.search.list_otel_metric_names(service, window_hours).await?;
+            Ok::<_, SearchError>(MetricNamesResponse {
+                count: names.len(),
+                names,
+                window_start: Some(window_start),
+                partial,
+            })
+        })
+        .await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("otel_metric_names", duration_ms, result.is_ok());
 
-    let (names, window_start, partial) =
-        result.map_err(|e| crate::error::mask_query_failure(e, "Failed to list metric names"))?;
+    let (response, from_local_cache) = result.map_err(|e| {
+        tracing::error!(error = %e, "OTEL metric-names query failed");
+        SearchError::QueryError("Failed to list metric names".to_string())
+    })?;
 
-    let response = MetricNamesResponse {
-        count: names.len(),
-        names,
-        window_start,
-        partial,
-    };
-    if let Some(cache) = state.result_cache.as_ref() {
-        let cache = cache.clone();
-        let resp = response.clone();
-        tokio::spawn(async move {
-            cache.set_cached(&cache_key, &resp).await;
-        });
+    if !from_local_cache {
+        if let Some(cache) = state.result_cache.as_ref() {
+            let cache = cache.clone();
+            let resp = response.clone();
+            tokio::spawn(async move {
+                cache.set_cached(&cache_key, &resp).await;
+            });
+        }
     }
 
-    Ok((
-        crate::cache::cache_status_headers(false, None),
-        Json(response),
-    ))
+    Ok((crate::cache::cache_status_headers(from_local_cache, None), Json(response)))
 }
 
 // ============================================================================
@@ -991,17 +893,17 @@ pub struct ServicesParams {
     /// Lookback window in hours used when `start` is omitted. Default 1.
     #[serde(default = "default_services_window_hours")]
     pub window_hours: i64,
-    /// Case-insensitive substring filter on the service name.
+    /// Case-insensitive substring filter on the service name (NAN-1543).
     pub q: Option<String>,
-    /// Health filter: `good` | `warn` | `bad`. Applied
+    /// Health filter: `good` | `warn` | `bad` (NAN-1543). Applied
     /// post-aggregation; rejected with 400 if outside the allowlist.
     pub health: Option<String>,
-    /// Sort key: `error_rate` | `p95` | `rate` | `name`. Default
+    /// Sort key: `error_rate` | `p95` | `rate` | `name` (NAN-1543). Default
     /// `rate` (busiest first); rejected with 400 if outside the allowlist.
     pub sort: Option<String>,
-    /// Max services to return after filtering. Omit for all.
+    /// Max services to return after filtering (NAN-1543). Omit for all.
     pub limit: Option<u32>,
-    /// Row offset for paging. Default 0.
+    /// Row offset for paging (NAN-1543). Default 0.
     #[serde(default)]
     pub offset: u32,
 }
@@ -1014,7 +916,7 @@ pub struct ServicesOverviewResponse {
     /// (`good`|`warn`|`bad`), and a `sparkline: [{t, v}]` of per-bucket volume.
     pub services: Vec<serde_json::Value>,
     /// Total matching services AFTER the q/health filters but BEFORE the
-    /// offset/limit slice (the has-more signal source).
+    /// offset/limit slice (NAN-1543 — the has-more signal source).
     pub total: usize,
     /// Whether more rows exist past this page (`offset + returned < total`).
     pub has_more: bool,
@@ -1034,7 +936,6 @@ pub struct ServicesOverviewResponse {
     params(ServicesParams),
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Per-service RED overview", body = ServicesOverviewResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -1049,9 +950,6 @@ pub async fn list_services(
 ) -> Result<(axum::http::HeaderMap, Json<ServicesOverviewResponse>), SearchError> {
     // NAN-2030: authN is not authZ — gate on search:execute before any work.
     super::require_search_execute(&auth)?;
-    // NAN-2361 wave 6: a shared request re-proves membership/entitlement
-    // before telemetry is released; dedicated requests are a no-op.
-    super::require_current_shared_authority(&state, &auth).await?;
 
     let start = Instant::now();
 
@@ -1082,8 +980,7 @@ pub async fn list_services(
     // NAN-1593: the Services tab re-fetches on every console load / filter /
     // paging — cache through the same Dragonfly layer. Keyed on the resolved
     // window, bucket width, and every filter/sort/paging param.
-    let cache_key = crate::cache::SearchResultCache::companion_key_for(
-        auth.tenant_scope,
+    let cache_key = crate::cache::SearchResultCache::companion_key(
         "svcs",
         &[
             time_range.start.timestamp_micros().to_string().as_bytes(),
@@ -1093,11 +990,7 @@ pub async fn list_services(
             health.as_deref().unwrap_or("").as_bytes(),
             params.sort.as_deref().unwrap_or("").as_bytes(),
             params.offset.to_string().as_bytes(),
-            params
-                .limit
-                .map(|v| v.to_string())
-                .unwrap_or_default()
-                .as_bytes(),
+            params.limit.map(|v| v.to_string()).unwrap_or_default().as_bytes(),
         ],
         &nanosiem_core::auth::ScopeSet::unrestricted(),
     );
@@ -1114,46 +1007,27 @@ pub async fn list_services(
         }
     }
 
-    let result = if let Some(client) = state.otel_lake_for(&auth)? {
-        client
-            .services(
-                &time_range,
-                step,
-                filters.q,
-                params.sort.as_deref(),
-                health.as_deref(),
-                params.offset,
-                params.limit,
-            )
-            .await
-            .map(|response| (response.services, response.total, response.has_more))
-            .map_err(|error| error.into_search_error())
-    } else if !state.dual_pool.clickhouse_required() {
-        Ok((Vec::new(), 0, false))
-    } else {
-        state
-            .search
-            .observability_services_overview(
-                &time_range,
-                step,
-                &filters,
-                health.as_deref(),
-                params.offset,
-                params.limit,
-            )
-            .await
-            .map(|(services, total)| {
-                let has_more = (params.offset as usize) + services.len() < total;
-                (services, total, has_more)
-            })
-    };
+    let result = state
+        .search
+        .observability_services_overview(
+            &time_range,
+            step,
+            &filters,
+            health.as_deref(),
+            params.offset,
+            params.limit,
+        )
+        .await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("otel_services_overview", duration_ms, result.is_ok());
 
-    let (services, total, has_more) =
-        result.map_err(|e| crate::error::mask_query_failure(e, "Failed to list services"))?;
+    let (services, total) = result.map_err(|e| {
+        tracing::error!(error = %e, "OTEL services-overview query failed");
+        SearchError::QueryError("Failed to list services".to_string())
+    })?;
 
+    let has_more = (params.offset as usize) + services.len() < total;
     let response = ServicesOverviewResponse {
         services,
         total,
@@ -1167,10 +1041,7 @@ pub async fn list_services(
         });
     }
 
-    Ok((
-        crate::cache::cache_status_headers(false, None),
-        Json(response),
-    ))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 /// Default exemplar sample size for the service detail.
@@ -1221,7 +1092,6 @@ pub struct ServiceDetailResponse {
     ),
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Service detail (red/endpoints/exemplars)", body = ServiceDetailResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -1240,9 +1110,6 @@ pub async fn get_service_detail(
     // reads only `otel_spans` (no source_type — unscoped by design, see module
     // doc); the security-signals panel lives on the api crate's scoped endpoint.
     super::require_search_execute(&auth)?;
-    // NAN-2361 wave 6: a shared request re-proves membership/entitlement
-    // before telemetry is released; dedicated requests are a no-op.
-    super::require_current_shared_authority(&state, &auth).await?;
 
     let start = Instant::now();
 
@@ -1258,8 +1125,7 @@ pub async fn get_service_detail(
     // NAN-1593: the service-detail drill-in re-fetches on every open / shared-link
     // follow — cache through the same Dragonfly layer. Keyed on the service name,
     // resolved window, bucket width, and exemplar sample cap.
-    let cache_key = crate::cache::SearchResultCache::companion_key_for(
-        auth.tenant_scope,
+    let cache_key = crate::cache::SearchResultCache::companion_key(
         "svcdetail",
         &[
             service.as_bytes(),
@@ -1280,23 +1146,18 @@ pub async fn get_service_detail(
         }
     }
 
-    let result = if let Some(client) = state.otel_lake_for(&auth)? {
-        client
-            .service_detail(&service, &time_range, step, params.exemplar_limit)
-            .await
-            .map_err(|error| error.into_search_error())
-    } else {
-        state
-            .search
-            .observability_service_detail(&service, &time_range, step, Some(params.exemplar_limit))
-            .await
-    };
+    let result = state
+        .search
+        .observability_service_detail(&service, &time_range, step, Some(params.exemplar_limit))
+        .await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("otel_service_detail", duration_ms, result.is_ok());
 
-    let detail = result
-        .map_err(|e| crate::error::mask_query_failure(e, "Failed to fetch service detail"))?;
+    let detail = result.map_err(|e| {
+        tracing::error!(error = %e, "OTEL service-detail query failed");
+        SearchError::QueryError("Failed to fetch service detail".to_string())
+    })?;
 
     let response = ServiceDetailResponse { detail };
     if let Some(cache) = state.result_cache.as_ref() {
@@ -1307,10 +1168,7 @@ pub async fn get_service_detail(
         });
     }
 
-    Ok((
-        crate::cache::cache_status_headers(false, None),
-        Json(response),
-    ))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -1330,27 +1188,28 @@ pub struct InfraHostsParams {
     /// Lookback window in hours used when `start` is omitted. Default 1.
     #[serde(default = "default_services_window_hours")]
     pub window_hours: i64,
-    /// Case-insensitive substring filter on the host name.
+    /// Case-insensitive substring filter on the host name (NAN-1543).
     pub q: Option<String>,
-    /// Exact match on `host.group` resource attribute.
+    /// Exact match on `host.group` resource attribute (NAN-1543).
     pub group: Option<String>,
-    /// Exact match on `deployment.environment` resource attribute.
+    /// Exact match on `deployment.environment` resource attribute (NAN-1543).
     pub env: Option<String>,
-    /// Status filter: `good` | `warn` | `bad`. Applied
+    /// Status filter: `good` | `warn` | `bad` (NAN-1543). Applied
     /// post-aggregation; rejected with 400 if outside the allowlist.
     pub status: Option<String>,
-    /// Max hosts to return after filtering. Omit for all (capped at
+    /// Max hosts to return after filtering (NAN-1543). Omit for all (capped at
     /// the internal LIMIT 10000).
     pub limit: Option<u32>,
-    /// Row offset for paging. Default 0.
+    /// Row offset for paging (NAN-1543). Default 0.
     #[serde(default)]
     pub offset: u32,
 }
 
-/// Response for infrastructure inventory: one row per cluster-scoped node or pod.
-/// Additive fields include kind, cluster/region, node_name, pod_name, namespace,
-/// workload, phase, instance_type, CPU cores, memory bytes and pod restarts.
-/// Unknown health is explicit when neither readiness nor utilization was reported.
+/// Response for infrastructure inventory: one row per host, Kubernetes node or
+/// pod (NAN-3972). Additive fields include kind, cluster/region, node_name,
+/// pod_name, namespace, workload, phase, instance_type, CPU cores, memory bytes
+/// and pod restarts. Unknown health is explicit when neither readiness nor
+/// utilization was reported.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct InfraHostsResponse {
     /// One object per host with `host`, `group` (`host.group` or service
@@ -1359,7 +1218,7 @@ pub struct InfraHostsResponse {
     /// a `status` (`good`|`warn`|`bad`) derived from the CPU/memory thresholds.
     pub hosts: Vec<serde_json::Value>,
     /// Total matching hosts AFTER the q/group/env/status filters but BEFORE the
-    /// offset/limit slice (the has-more signal source).
+    /// offset/limit slice (NAN-1543 — the has-more signal source).
     pub total: usize,
     /// Whether more rows exist past this page (`offset + returned < total`).
     pub has_more: bool,
@@ -1381,7 +1240,6 @@ pub struct InfraHostsResponse {
     params(InfraHostsParams),
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "Per-host latest-metric overview", body = InfraHostsResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -1396,9 +1254,6 @@ pub async fn list_infra_hosts(
 ) -> Result<(axum::http::HeaderMap, Json<InfraHostsResponse>), SearchError> {
     // NAN-2030: authN is not authZ — gate on search:execute before any work.
     super::require_search_execute(&auth)?;
-    // NAN-2361 wave 6: a shared request re-proves membership/entitlement
-    // before telemetry is released; dedicated requests are a no-op.
-    super::require_current_shared_authority(&state, &auth).await?;
 
     let start = Instant::now();
 
@@ -1422,8 +1277,7 @@ pub async fn list_infra_hosts(
     // NAN-1593: the Infra tab re-fetches on every console load / filter / paging
     // — cache through the same Dragonfly layer. Keyed on the resolved window plus
     // every filter/status/paging param.
-    let cache_key = crate::cache::SearchResultCache::companion_key_for(
-        auth.tenant_scope,
+    let cache_key = crate::cache::SearchResultCache::companion_key(
         "infra",
         &[
             time_range.start.timestamp_micros().to_string().as_bytes(),
@@ -1433,11 +1287,7 @@ pub async fn list_infra_hosts(
             filters.env.unwrap_or("").as_bytes(),
             status.as_deref().unwrap_or("").as_bytes(),
             params.offset.to_string().as_bytes(),
-            params
-                .limit
-                .map(|v| v.to_string())
-                .unwrap_or_default()
-                .as_bytes(),
+            params.limit.map(|v| v.to_string()).unwrap_or_default().as_bytes(),
         ],
         &nanosiem_core::auth::ScopeSet::unrestricted(),
     );
@@ -1451,43 +1301,20 @@ pub async fn list_infra_hosts(
         }
     }
 
-    let result = if let Some(client) = state.otel_lake_for(&auth)? {
-        client
-            .infra_hosts(
-                &time_range,
-                filters.q,
-                filters.group,
-                filters.env,
-                status.as_deref(),
-                params.offset,
-                params.limit,
-            )
-            .await
-            .map(|response| (response.hosts, response.total, response.has_more))
-            .map_err(|error| error.into_search_error())
-    } else {
-        state
-            .search
-            .observability_infra_hosts(
-                &time_range,
-                &filters,
-                status.as_deref(),
-                params.offset,
-                params.limit,
-            )
-            .await
-            .map(|(hosts, total)| {
-                let has_more = (params.offset as usize) + hosts.len() < total;
-                (hosts, total, has_more)
-            })
-    };
+    let result = state
+        .search
+        .observability_infra_hosts(&time_range, &filters, status.as_deref(), params.offset, params.limit)
+        .await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("otel_infra_hosts", duration_ms, result.is_ok());
 
-    let (hosts, total, has_more) =
-        result.map_err(|e| crate::error::mask_query_failure(e, "Failed to list infra hosts"))?;
+    let (hosts, total) = result.map_err(|e| {
+        tracing::error!(error = %e, "OTEL infra-hosts query failed");
+        SearchError::QueryError("Failed to list infra hosts".to_string())
+    })?;
 
+    let has_more = (params.offset as usize) + hosts.len() < total;
     let response = InfraHostsResponse {
         hosts,
         total,
@@ -1501,10 +1328,7 @@ pub async fn list_infra_hosts(
         });
     }
 
-    Ok((
-        crate::cache::cache_status_headers(false, None),
-        Json(response),
-    ))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -1521,12 +1345,12 @@ pub struct RumParams {
     /// Lookback window in hours used when `start` is omitted. Default 1.
     #[serde(default = "default_services_window_hours")]
     pub window_hours: i64,
-    /// Case-insensitive substring filter on the page URL / route.
+    /// Case-insensitive substring filter on the page URL / route (NAN-1543).
     pub page: Option<String>,
-    /// Exact match on the `browser.name` span attribute.
+    /// Exact match on the `browser.name` span attribute (NAN-1543).
     pub browser: Option<String>,
     /// Exact match on the `deployment.environment` resource attribute
-    /// Also scopes the metrics-sourced web vitals.
+    /// (NAN-1543). Also scopes the metrics-sourced web vitals.
     pub env: Option<String>,
 }
 
@@ -1556,7 +1380,6 @@ pub struct RumSummaryResponse {
     params(RumParams),
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
         (status = 200, description = "RUM summary (vitals/page-views/errors/top-pages)", body = RumSummaryResponse),
         (status = 400, description = "Query error", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
@@ -1571,9 +1394,6 @@ pub async fn get_rum_summary(
 ) -> Result<(axum::http::HeaderMap, Json<RumSummaryResponse>), SearchError> {
     // NAN-2030: authN is not authZ — gate on search:execute before any work.
     super::require_search_execute(&auth)?;
-    // NAN-2361 wave 6: a shared request re-proves membership/entitlement
-    // before telemetry is released; dedicated requests are a no-op.
-    super::require_current_shared_authority(&state, &auth).await?;
 
     let start = Instant::now();
 
@@ -1589,8 +1409,7 @@ pub async fn get_rum_summary(
     // NAN-1593: the RUM tab re-fetches on every console load / filter / shared-link
     // follow — cache through the same Dragonfly layer. Keyed on the resolved
     // window, bucket width, and every filter param.
-    let cache_key = crate::cache::SearchResultCache::companion_key_for(
-        auth.tenant_scope,
+    let cache_key = crate::cache::SearchResultCache::companion_key(
         "rum",
         &[
             time_range.start.timestamp_micros().to_string().as_bytes(),
@@ -1612,38 +1431,18 @@ pub async fn get_rum_summary(
         }
     }
 
-    let result = if let Some(client) = state.otel_lake_for(&auth)? {
-        client
-            .rum(
-                &time_range,
-                step,
-                filters.page,
-                filters.browser,
-                filters.env,
-            )
-            .await
-            .map_err(|error| error.into_search_error())
-    } else if !state.dual_pool.clickhouse_required() {
-        Ok(serde_json::json!({
-            "web_vitals": { "lcp_ms": null, "inp_ms": null, "cls": null },
-            "page_views": 0,
-            "page_views_series": [],
-            "js_errors": 0,
-            "top_pages": [],
-            "recent_errors": [],
-        }))
-    } else {
-        state
-            .search
-            .observability_rum_summary(&time_range, step, &filters)
-            .await
-    };
+    let result = state
+        .search
+        .observability_rum_summary(&time_range, step, &filters)
+        .await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("otel_rum_summary", duration_ms, result.is_ok());
 
-    let rum =
-        result.map_err(|e| crate::error::mask_query_failure(e, "Failed to fetch RUM summary"))?;
+    let rum = result.map_err(|e| {
+        tracing::error!(error = %e, "OTEL RUM-summary query failed");
+        SearchError::QueryError("Failed to fetch RUM summary".to_string())
+    })?;
 
     let response = RumSummaryResponse { rum };
     if let Some(cache) = state.result_cache.as_ref() {
@@ -1654,499 +1453,5 @@ pub async fn get_rum_summary(
         });
     }
 
-    Ok((
-        crate::cache::cache_status_headers(false, None),
-        Json(response),
-    ))
-}
-
-// ============================================================================
-// Observability ↔ Security convergence — service security signals (NAN-2361)
-// ============================================================================
-
-/// Cap on the number of entity alternates OR'd into the OCSF signals query.
-///
-/// Each resolved span host becomes one anchored-regex alternate on
-/// `observables.value`; an unbounded service (thousands of hosts) must not
-/// produce an unbounded predicate. 50 keeps the generated nPL well inside the
-/// planner's comfort zone while covering every realistic service footprint.
-/// `host_count` still reports the full resolved-entity count, so a capped query
-/// is visible to the caller as `host_count > SERVICE_SIGNAL_ENTITY_CAP`.
-const SERVICE_SIGNAL_ENTITY_CAP: usize = 50;
-
-/// Row cap for the Step-1 spans `stats count by host.name` aggregation.
-const SERVICE_SIGNAL_HOST_RESOLUTION_LIMIT: usize = 200;
-
-/// Default signal-sample size when `limit` is omitted.
-const SERVICE_SIGNAL_DEFAULT_LIMIT: u32 = 100;
-
-/// Query parameters for the service security-signals cross-link (NAN-2361).
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub struct ServiceSecuritySignalsParams {
-    /// Window start (RFC3339). Defaults to `now - window_hours`.
-    pub start: Option<chrono::DateTime<chrono::Utc>>,
-    /// Window end (RFC3339). Defaults to `now`.
-    pub end: Option<chrono::DateTime<chrono::Utc>>,
-    /// Lookback window in hours used when `start` is omitted. Default 1.
-    #[serde(default = "default_services_window_hours")]
-    pub window_hours: i64,
-    /// Max signals to sample (clamped `[1, 1000]`; default 100).
-    pub limit: Option<u32>,
-}
-
-/// Response for the service security-signals cross-link.
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct ServiceSecuritySignalsResponse {
-    /// Number of distinct entities (span hosts) resolved for the service.
-    pub host_count: usize,
-    /// Number of security signals in the returned sample (bounded by `limit`).
-    pub signal_count: usize,
-    /// True total number of matching signals in the range (unbounded count),
-    /// which may exceed `signal_count` when the sample is `limit`-capped.
-    pub signal_total: u64,
-    /// The bounded signal sample, most recent first.
-    pub signals: Vec<serde_json::Value>,
-}
-
-/// The planned OCSF-signals reads for one service: ONE scoped search request.
-///
-/// NAN-1801 invariant, by construction: the bounded signal sample and its count
-/// companion (`SearchResponse::total_count`, exact at offset 0) execute as a
-/// single `SearchService` search under a single `ScopeSet`, so the caller's
-/// source-scope deny-set gates BOTH reads predicate-identically —
-/// `signal_total` can never leak the existence of signals from sources the
-/// caller may not see. There is deliberately no second scope field to diverge.
-pub(crate) struct ScopedSignalReads {
-    /// The one nPL request (query + window + limit, offset 0).
-    pub request: nanosiem_core::SearchRequest,
-    /// The one scope both reads execute under.
-    pub scope: nanosiem_core::auth::ScopeSet,
-    /// The capped, lowercased entity list the query alternates were built from
-    /// (used to stamp each returned row with its matched entity).
-    pub entities: Vec<String>,
-}
-
-impl ScopedSignalReads {
-    /// The scope the bounded sample read executes under.
-    pub(crate) fn sample_scope(&self) -> &nanosiem_core::auth::ScopeSet {
-        &self.scope
-    }
-
-    /// The scope the count companion executes under — the SAME object as
-    /// [`Self::sample_scope`]; the accessors exist so tests can pin the
-    /// NAN-1801 "predicate-identical reads" contract.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn count_scope(&self) -> &nanosiem_core::auth::ScopeSet {
-        &self.scope
-    }
-}
-
-/// Build the OCSF Detection-Finding query for a set of resolved span hosts.
-///
-/// Span hosts arrive bare and often uppercase (`SRV-CI07`); signal observables
-/// are lowercase FQDNs (`srv-ci07.corp.local`). Each host is therefore
-/// lowercased and matched with an ANCHORED regex accepting the bare label or
-/// any FQDN extension: `/^srv-ci07(\..*)?$/`. The anchor matters — a trailing
-/// wildcard alone would also match `ws-ops-0650`.
-///
-/// Hosts are deduped, restricted to the hostname charset `[a-z0-9._-]`
-/// (anything else cannot be a matched observable and would need regex-escaping
-/// beyond `.` — skipped, injection-safe), and capped at
-/// [`SERVICE_SIGNAL_ENTITY_CAP`]. Returns `None` when no usable entity remains.
-pub(crate) fn build_signals_npl(entity_hosts: &[String]) -> Option<(String, Vec<String>)> {
-    let mut seen = std::collections::BTreeSet::new();
-    let entities: Vec<String> = entity_hosts
-        .iter()
-        .map(|host| host.trim().to_ascii_lowercase())
-        .filter(|host| {
-            !host.is_empty()
-                && host
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
-        })
-        .filter(|host| seen.insert(host.clone()))
-        .take(SERVICE_SIGNAL_ENTITY_CAP)
-        .collect();
-    if entities.is_empty() {
-        return None;
-    }
-    let alternates: Vec<String> = entities
-        .iter()
-        .map(|host| {
-            // Only `.` is a regex metacharacter within the allowed charset.
-            let escaped = host.replace('.', "\\.");
-            format!("observables.value=/^{escaped}(\\..*)?$/")
-        })
-        .collect();
-    Some((
-        format!("class_uid=2004 AND ({})", alternates.join(" OR ")),
-        entities,
-    ))
-}
-
-/// Map one OCSF Detection-Finding row from the lake into the compact wire DTO
-/// the Service-detail strip renders: `{ts, rule_name, severity, matched_entity,
-/// matched_entity_type}`.
-///
-/// Verified against live lake rows (NAN-2361): `time` is a zone-less UTC string
-/// (`"2026-08-17 18:55:07.470000"` — the web `parseUTCTimestamp` reads exactly
-/// this form as UTC), the rule identity is `finding_info.title` (falling back
-/// to `finding_info.analytic.name`), `severity` is the OCSF Title-case string,
-/// and `observables` is an array of `{name, type, type_id, value}` objects.
-/// The matched entity is the OBSERVED value (usually the FQDN) whose bare
-/// label or full form equals one of the capped span-host entities — the FQDN is
-/// what appears in logs, so it is what the drill-down should query.
-pub(crate) fn signal_row_to_dto(row: &serde_json::Value, entities: &[String]) -> serde_json::Value {
-    let ts = row
-        .get("time")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let rule_name = row
-        .pointer("/finding_info/title")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            row.pointer("/finding_info/analytic/name")
-                .and_then(serde_json::Value::as_str)
-        })
-        .unwrap_or_default();
-    let severity = row.get("severity").and_then(serde_json::Value::as_str);
-    let matched = row
-        .get("observables")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|observable| observable.get("value").and_then(serde_json::Value::as_str))
-        .find_map(|value| {
-            let lowered = value.trim().to_ascii_lowercase();
-            entities
-                .iter()
-                .find(|entity| {
-                    lowered == **entity
-                        || lowered
-                            .strip_prefix(entity.as_str())
-                            .is_some_and(|rest| rest.starts_with('.'))
-                })
-                .map(|entity| {
-                    let kind = if entity.parse::<std::net::IpAddr>().is_ok() {
-                        "ip"
-                    } else {
-                        "hostname"
-                    };
-                    (lowered, kind)
-                })
-        });
-    serde_json::json!({
-        "ts": ts,
-        "rule_name": rule_name,
-        "severity": severity,
-        "matched_entity": matched.as_ref().map(|(value, _)| value.as_str()),
-        "matched_entity_type": matched.as_ref().map(|(_, kind)| *kind),
-    })
-}
-
-/// Plan the scoped signal reads for the resolved entities. `None` when no
-/// usable entity remains (the handler short-circuits to zeros without touching
-/// the signals lane, matching the original endpoint's behavior).
-pub(crate) fn plan_signal_reads(
-    entity_hosts: &[String],
-    time_range: &TimeRange,
-    limit: u32,
-    scope: nanosiem_core::auth::ScopeSet,
-) -> Option<ScopedSignalReads> {
-    let (query, entities) = build_signals_npl(entity_hosts)?;
-    let request = nanosiem_core::SearchRequest {
-        query,
-        time_range: TimeRangeInput::new(time_range.start, time_range.end),
-        limit: Some(limit.clamp(1, 1_000) as usize),
-        // Offset 0 is load-bearing: the first page fires the EXACT count
-        // companion (NAN-1645), which is what `signal_total` reports.
-        offset: None,
-        include_sql: None,
-        skip_histogram: true,
-        skip_field_stats: true,
-        use_cache: false,
-        table_view: false,
-        request_id: None,
-        async_mode: false,
-        priority: None,
-        // Detection Findings live in the default events lane.
-        dataset: None,
-    };
-    Some(ScopedSignalReads {
-        request,
-        scope,
-        entities,
-    })
-}
-
-/// Security signals firing against a service's hosts.
-///
-/// Step 1 resolves the service's entities from SPANS via the OCSF/Iceberg lake
-/// (`host.name` — OTLP semconv, not legacy UDM columns). Step 2 finds OCSF
-/// Detection Findings (`class_uid=2004`) whose `observables.value` matches one
-/// of those hosts (anchored bare-or-FQDN regex), executed through the scoped
-/// nPL search path. Requires `search:execute`; the caller's source-scope
-/// deny-set gates both the sample and the count.
-#[utoipa::path(
-    get,
-    path = "/api/search/services/{service}/security-signals",
-    tag = "search",
-    params(
-        ("service" = String, Path, description = "service.name to cross-link"),
-        ServiceSecuritySignalsParams,
-    ),
-    security(("bearer_auth" = []), ("api_key" = [])),
-    responses(
-        (status = 503, description = "Search authority temporarily unavailable (search_authority_unavailable); Retry-After: 2", body = crate::error::ErrorResponse),
-        (status = 200, description = "Security signals against the service's hosts", body = ServiceSecuritySignalsResponse),
-        (status = 400, description = "Query error", body = ErrorResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Missing search:execute permission", body = ErrorResponse),
-    )
-)]
-pub async fn get_service_security_signals(
-    State(state): State<SearchState>,
-    axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
-    Path(service): Path<String>,
-    Query(params): Query<ServiceSecuritySignalsParams>,
-) -> Result<Json<ServiceSecuritySignalsResponse>, SearchError> {
-    // NAN-2030: authN is not authZ — gate on search:execute before any work.
-    super::require_search_execute(&auth)?;
-    // NAN-2361 wave 6: a shared request re-proves membership/entitlement
-    // before telemetry is released; dedicated requests are a no-op.
-    super::require_current_shared_authority(&state, &auth).await?;
-
-    let start = Instant::now();
-
-    if service.trim().is_empty() {
-        return Err(SearchError::BadRequest(
-            "service must not be empty".to_string(),
-        ));
-    }
-
-    let time_range = resolve_window(params.start, params.end, params.window_hours)?;
-    let limit = params.limit.unwrap_or(SERVICE_SIGNAL_DEFAULT_LIMIT);
-
-    // NAN-1801: compose the caller's effective deny-set ONCE; the same scope
-    // gates the bounded sample and the count companion (see ScopedSignalReads).
-    let scope = super::search::effective_scope(&auth);
-
-    let Some(client) = state.otel_lake_for(&auth)? else {
-        // Legacy ClickHouse (UDM) deployments keep the retained core glue,
-        // which threads the same scope into both of its signal reads.
-        let (host_count, signal_count, signal_total, signals) = state
-            .search
-            .observability_service_security_signals(&service, &time_range, params.limit, &scope)
-            .await
-            .map_err(|e| {
-                crate::error::mask_query_failure(e, "Failed to fetch service security signals")
-            })?;
-        return Ok(Json(ServiceSecuritySignalsResponse {
-            host_count,
-            signal_count,
-            signal_total,
-            signals,
-        }));
-    };
-
-    // Step 1 — resolve the service's entities from spans (OTLP semconv).
-    let hosts = client
-        .service_span_hosts(&service, &time_range, SERVICE_SIGNAL_HOST_RESOLUTION_LIMIT)
-        .await
-        .map_err(|error| {
-            crate::error::mask_query_failure(
-                error.into_search_error(),
-                "Failed to resolve service entities",
-            )
-        })?;
-    // Distinct resolved entities (case-insensitive) — reported as host_count.
-    let host_count = hosts
-        .iter()
-        .map(|host| host.to_ascii_lowercase())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
-
-    // Step 2 — scoped OCSF Detection-Finding reads. No entities → zeros,
-    // without querying the signals lane (matches the original short-circuit).
-    let Some(reads) = plan_signal_reads(&hosts, &time_range, limit, scope) else {
-        record_search_query(
-            "otel_service_security_signals",
-            start.elapsed().as_secs_f64() * 1000.0,
-            true,
-        );
-        return Ok(Json(ServiceSecuritySignalsResponse {
-            host_count,
-            signal_count: 0,
-            signal_total: 0,
-            signals: Vec::new(),
-        }));
-    };
-
-    // NAN-3286: the Detection-Finding read runs on the caller's own
-    // tenant-pinned runtime, never the process singleton `state.search`. A
-    // shared request resolves its tenant view (or a typed 503); dedicated
-    // deployments keep the historical singleton through the same call.
-    let search = state.search_for_auth(&auth)?;
-    let result = search
-        .search_with_admission(
-            reads.request.clone(),
-            auth.claims.sub,
-            nanosiem_core::search::QueryPriority::Interactive,
-            reads.sample_scope(),
-        )
-        .await;
-
-    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-    record_search_query("otel_service_security_signals", duration_ms, result.is_ok());
-
-    let response = result.map_err(|e| {
-        crate::error::mask_query_failure(e, "Failed to fetch service security signals")
-    })?;
-
-    // Compact each OCSF finding row into the wire DTO, stamped with the
-    // entity it matched on (the drill-down target).
-    let signals: Vec<serde_json::Value> = response
-        .results
-        .iter()
-        .map(|row| signal_row_to_dto(row, &reads.entities))
-        .collect();
-
-    Ok(Json(ServiceSecuritySignalsResponse {
-        host_count,
-        signal_count: signals.len(),
-        signal_total: response.total_count,
-        signals,
-    }))
-}
-
-#[cfg(test)]
-mod service_security_signals_tests {
-    use super::*;
-
-    fn hosts(n: usize) -> Vec<String> {
-        (0..n).map(|i| format!("SRV-CI{i:03}")).collect()
-    }
-
-    /// The OR'd entity list is capped at [`SERVICE_SIGNAL_ENTITY_CAP`] so an
-    /// unbounded service footprint cannot produce an unbounded predicate.
-    #[test]
-    fn entity_list_is_capped() {
-        let (query, entities) = build_signals_npl(&hosts(120)).expect("query");
-        assert_eq!(entities.len(), SERVICE_SIGNAL_ENTITY_CAP);
-        assert_eq!(
-            query.matches("observables.value=").count(),
-            SERVICE_SIGNAL_ENTITY_CAP
-        );
-        // The cap keeps the FIRST 50 resolved entities, lowercased + anchored.
-        assert!(query.starts_with("class_uid=2004 AND (observables.value=/^srv-ci000(\\..*)?$/"));
-        assert!(!query.contains("srv-ci050"));
-    }
-
-    /// Hosts are lowercased, deduped, matched bare-or-FQDN with an ANCHORED
-    /// regex (no trailing-wildcard prefix matches), and hostile input is
-    /// dropped rather than interpolated.
-    #[test]
-    fn entities_are_normalized_anchored_and_injection_safe() {
-        let (query, entities) = build_signals_npl(&[
-            "SRV-CI07".to_string(),
-            "srv-ci07".to_string(),              // dupe post-lowercase
-            "ws-fin-071.corp.local".to_string(), // FQDN — dot escaped
-            "evil/ OR class_uid=1$".to_string(), // regex/nPL breakout — dropped
-            "  ".to_string(),                    // blank — dropped
-        ])
-        .expect("query");
-        assert_eq!(entities, vec!["srv-ci07", "ws-fin-071.corp.local"]);
-        assert_eq!(
-            query,
-            "class_uid=2004 AND (observables.value=/^srv-ci07(\\..*)?$/ OR observables.value=/^ws-fin-071\\.corp\\.local(\\..*)?$/)"
-        );
-    }
-
-    /// The wire DTO carries the matched entity (the OBSERVED value) plus its
-    /// kind, and pulls rule identity/severity/time from the OCSF finding shape
-    /// verified against live lake rows (NAN-2361). No UDM names on the wire.
-    #[test]
-    fn dto_stamps_matched_entity_from_observables() {
-        let row = serde_json::json!({
-            "class_uid": 2004,
-            "time": "2026-08-17 18:55:07.470000",
-            "severity": "Informational",
-            "finding_info": {
-                "title": "NAN-2361 Lake Realtime Product Gate",
-                "analytic": { "name": "NAN-2361 Lake Realtime Product Gate" }
-            },
-            "observables": [
-                { "name": "resources[0].hostname", "type": "Hostname", "type_id": 1,
-                  "value": "ws-fin-071.corp.local" }
-            ],
-        });
-        // Bare span host matches the FQDN observable; the FQDN is returned.
-        let dto = signal_row_to_dto(&row, &["ws-fin-071".to_string()]);
-        assert_eq!(
-            dto,
-            serde_json::json!({
-                "ts": "2026-08-17 18:55:07.470000",
-                "rule_name": "NAN-2361 Lake Realtime Product Gate",
-                "severity": "Informational",
-                "matched_entity": "ws-fin-071.corp.local",
-                "matched_entity_type": "hostname",
-            })
-        );
-        // An entity that parses as an IP is typed "ip"; no prefix stretching
-        // (entity "10.0.0.1" must not match observable "10.0.0.10").
-        let ip_row = serde_json::json!({
-            "time": "2026-08-17 00:00:00.000000",
-            "severity": "High",
-            "finding_info": { "title": "r" },
-            "observables": [{ "value": "10.0.0.10" }, { "value": "10.0.0.1" }],
-        });
-        let dto = signal_row_to_dto(&ip_row, &["10.0.0.1".to_string()]);
-        assert_eq!(dto["matched_entity"], "10.0.0.1");
-        assert_eq!(dto["matched_entity_type"], "ip");
-        // Unmatched rows keep null entity fields (the strip renders without a
-        // drill-down rather than guessing).
-        let dto = signal_row_to_dto(&ip_row, &["other-host".to_string()]);
-        assert_eq!(dto["matched_entity"], serde_json::Value::Null);
-    }
-
-    /// NAN-1801: the bounded sample and the count companion are ONE search
-    /// under ONE scope — the deny-set gates both reads predicate-identically,
-    /// and offset 0 makes the companion count exact.
-    #[test]
-    fn sample_and_count_reads_share_the_same_scope() {
-        let scope = nanosiem_core::auth::ScopeSet::from_denied(
-            ["restricted_source".to_string()].into_iter().collect(),
-        );
-        let time_range = TimeRange::new(
-            chrono::Utc::now() - chrono::Duration::hours(1),
-            chrono::Utc::now(),
-        );
-        let reads = plan_signal_reads(&hosts(120), &time_range, 100, scope.clone()).expect("plan");
-        assert_eq!(reads.sample_scope(), reads.count_scope());
-        assert_eq!(reads.sample_scope(), &scope);
-        // Offset 0 → the count companion fires and total_count is exact.
-        assert_eq!(reads.request.offset, None);
-        assert_eq!(reads.request.limit, Some(100));
-        // Cap applies to the single request both numbers come from.
-        assert_eq!(reads.entities.len(), SERVICE_SIGNAL_ENTITY_CAP);
-    }
-
-    /// No usable entity → no signals query at all (the handler returns zeros).
-    #[test]
-    fn no_entities_short_circuits() {
-        assert!(build_signals_npl(&[]).is_none());
-        assert!(build_signals_npl(&["///".to_string()]).is_none());
-        let time_range = TimeRange::new(
-            chrono::Utc::now() - chrono::Duration::hours(1),
-            chrono::Utc::now(),
-        );
-        assert!(plan_signal_reads(
-            &[],
-            &time_range,
-            100,
-            nanosiem_core::auth::ScopeSet::unrestricted()
-        )
-        .is_none());
-    }
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }

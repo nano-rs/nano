@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Protect a plaintext lab Keeper root with nano's digest identity.
+
+This intentionally implements only the small ZooKeeper protocol surface needed
+for the lab-only installer guard. It has no third-party dependencies and never
+prints the supplied password.
+"""
+
+from __future__ import annotations
+
+import argparse
+import secrets
+import socket
+import struct
+import sys
+import time
+
+
+ZOK = 0
+ZNOAUTH = -102
+PERM_ALL = 31
+AUTH_XID = -4
+
+
+class KeeperError(RuntimeError):
+    pass
+
+
+def _int(value: int) -> bytes:
+    return struct.pack(">i", value)
+
+
+def _long(value: int) -> bytes:
+    return struct.pack(">q", value)
+
+
+def _string(value: str | bytes) -> bytes:
+    encoded = value.encode() if isinstance(value, str) else value
+    return _int(len(encoded)) + encoded
+
+
+def _read_exact(connection: socket.socket, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = connection.recv(size - len(chunks))
+        if not chunk:
+            raise KeeperError("Keeper closed the connection")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _send_frame(connection: socket.socket, body: bytes) -> None:
+    connection.sendall(_int(len(body)) + body)
+
+
+def _read_frame(connection: socket.socket) -> bytes:
+    size = struct.unpack(">i", _read_exact(connection, 4))[0]
+    if size < 0 or size > 1024 * 1024:
+        raise KeeperError(f"Keeper returned an invalid frame size: {size}")
+    return _read_exact(connection, size)
+
+
+def _parse_endpoint(endpoint: str) -> tuple[str, int]:
+    if endpoint.startswith("["):
+        closing = endpoint.find("]")
+        if closing < 0 or endpoint[closing + 1 : closing + 2] != ":":
+            raise KeeperError(f"invalid Keeper endpoint: {endpoint}")
+        host = endpoint[1:closing]
+        raw_port = endpoint[closing + 2 :]
+    else:
+        host, separator, raw_port = endpoint.rpartition(":")
+        if not separator or ":" in host:
+            raise KeeperError(f"invalid Keeper endpoint: {endpoint}")
+    try:
+        port = int(raw_port)
+    except ValueError as error:
+        raise KeeperError(f"invalid Keeper endpoint port: {endpoint}") from error
+    if not host or not 1 <= port <= 65535:
+        raise KeeperError(f"invalid Keeper endpoint: {endpoint}")
+    return host, port
+
+
+class KeeperConnection:
+    def __init__(self, endpoint: str, timeout: float = 5.0):
+        self.endpoint = endpoint
+        self.host, self.port = _parse_endpoint(endpoint)
+        self.timeout = timeout
+        self.socket: socket.socket | None = None
+
+    def __enter__(self) -> "KeeperConnection":
+        connection = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        connection.settimeout(self.timeout)
+        # protocolVersion, lastZxidSeen, timeout, sessionId, 16-byte passwd,
+        # readOnly. The ZooKeeper connect-request body is exactly 45 bytes.
+        handshake = _int(0) + _long(0) + _int(30_000) + _long(0) + _string(bytes(16)) + b"\x00"
+        _send_frame(connection, handshake)
+        response = _read_frame(connection)
+        if len(response) not in (36, 37):
+            connection.close()
+            raise KeeperError(f"Keeper returned an invalid handshake length: {len(response)}")
+        protocol, negotiated_timeout, session_id, password_size = struct.unpack_from(">iiqi", response)
+        if protocol != 0 or negotiated_timeout <= 0 or session_id == 0 or password_size != 16:
+            connection.close()
+            raise KeeperError("Keeper rejected the session handshake")
+        self.socket = connection
+        return self
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        if self.socket is not None:
+            self.socket.close()
+            self.socket = None
+
+    def request(self, xid: int, opcode: int, payload: bytes) -> tuple[int, bytes]:
+        if self.socket is None:
+            raise KeeperError("Keeper connection is not open")
+        _send_frame(self.socket, _int(xid) + _int(opcode) + payload)
+        response = _read_frame(self.socket)
+        if len(response) < 16:
+            raise KeeperError("Keeper returned a truncated response")
+        response_xid, _zxid, error = struct.unpack_from(">iqi", response)
+        if response_xid != xid:
+            raise KeeperError(f"Keeper response xid mismatch: expected {xid}, got {response_xid}")
+        return error, response[16:]
+
+    def authenticate(self, identity: bytes) -> None:
+        error, _ = self.request(AUTH_XID, 100, _int(0) + _string("digest") + _string(identity))
+        if error != ZOK:
+            raise KeeperError(f"Keeper digest authentication failed with error {error}")
+
+
+def _parse_string(buffer: bytes, offset: int) -> tuple[str, int]:
+    if offset + 4 > len(buffer):
+        raise KeeperError("Keeper returned a truncated string")
+    size = struct.unpack_from(">i", buffer, offset)[0]
+    offset += 4
+    if size < 0 or offset + size > len(buffer):
+        raise KeeperError("Keeper returned an invalid string")
+    return buffer[offset : offset + size].decode(errors="strict"), offset + size
+
+
+def _set_root_acl(connection: KeeperConnection) -> None:
+    acl = _int(PERM_ALL) + _string("auth") + _string("")
+    payload = _string("/") + _int(1) + acl + _int(-1)
+    error, _ = connection.request(1, 7, payload)
+    if error != ZOK:
+        raise KeeperError(f"setting the Keeper root ACL failed with error {error}")
+
+
+def _verify_root_acl(connection: KeeperConnection) -> None:
+    error, payload = connection.request(2, 6, _string("/"))
+    if error != ZOK:
+        raise KeeperError(f"reading the Keeper root ACL failed with error {error}")
+    if len(payload) < 4:
+        raise KeeperError("Keeper returned a truncated root ACL")
+    count = struct.unpack_from(">i", payload)[0]
+    offset = 4
+    if count != 1 or offset + 4 > len(payload):
+        raise KeeperError("Keeper root ACL is not the single authenticated nano identity")
+    permissions = struct.unpack_from(">i", payload, offset)[0]
+    scheme, offset = _parse_string(payload, offset + 4)
+    identity, _ = _parse_string(payload, offset)
+    if permissions != PERM_ALL or scheme != "digest" or not identity.startswith("nano:"):
+        raise KeeperError("Keeper root ACL is not the authenticated nano digest identity")
+
+
+def _remove_probe(connection: KeeperConnection, path: str) -> None:
+    error, _ = connection.request(3, 2, _string(path) + _int(-1))
+    if error != ZOK:
+        raise KeeperError(f"anonymous root probe unexpectedly succeeded and cleanup failed with error {error}")
+
+
+def _verify_anonymous_create_refused(endpoint: str, authenticated: KeeperConnection) -> None:
+    path = f"/nano-root-guard-probe-{secrets.token_hex(12)}"
+    world_acl = _int(PERM_ALL) + _string("world") + _string("anyone")
+    payload = _string(path) + _string(b"") + _int(1) + world_acl + _int(0)
+    with KeeperConnection(endpoint) as anonymous:
+        error, _ = anonymous.request(1, 1, payload)
+    if error == ZOK:
+        _remove_probe(authenticated, path)
+        raise KeeperError("Keeper accepted anonymous znode creation at the protected root")
+    if error != ZNOAUTH:
+        raise KeeperError(f"anonymous Keeper root probe returned unexpected error {error}")
+
+
+def guard(endpoint: str, password: bytes) -> None:
+    identity = b"nano:" + password
+    with KeeperConnection(endpoint) as authenticated:
+        authenticated.authenticate(identity)
+        _set_root_acl(authenticated)
+        _verify_root_acl(authenticated)
+        _verify_anonymous_create_refused(endpoint, authenticated)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--endpoint", action="append", required=True, help="Keeper host:port; may be repeated")
+    parser.add_argument("--password-stdin", action="store_true", help="read the nano Keeper password from stdin")
+    parser.add_argument("--timeout", type=int, default=120, help="overall retry timeout in seconds")
+    args = parser.parse_args()
+    if not args.password_stdin:
+        parser.error("--password-stdin is required")
+    password = sys.stdin.buffer.read()
+    if not password or b"\n" in password or b"\x00" in password:
+        print("nano-keeper-root-guard: invalid password input", file=sys.stderr)
+        return 2
+    deadline = time.monotonic() + args.timeout
+    last_error = "Keeper quorum was unavailable"
+    while time.monotonic() < deadline:
+        for endpoint in args.endpoint:
+            try:
+                guard(endpoint, password)
+                print("Keeper root now requires the authenticated nano identity")
+                return 0
+            except (KeeperError, OSError, UnicodeError) as error:
+                last_error = str(error)
+        time.sleep(2)
+    print(f"nano-keeper-root-guard: {last_error}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

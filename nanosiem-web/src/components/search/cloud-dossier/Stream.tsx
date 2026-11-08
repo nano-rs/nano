@@ -3,8 +3,9 @@
 import { useMemo, useState } from 'react';
 import { List, Search, Filter as FilterIcon, Copy, Check } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { formatCellValue } from '@/lib/format-cell-value';
 import type { CloudDossierStreamEvent } from '@/lib/api/types';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import type { SchemaFieldMap, SchemaProfileId } from '@/lib/schema-fields';
 
 interface StreamProps {
   events: CloudDossierStreamEvent[];
@@ -14,29 +15,41 @@ interface StreamProps {
   onPivotField?: (field: string, value: string) => void;
 }
 
-// UDM field that each stream-row or detail key should map to when the user
-// clicks. Keys NOT in this map are shown as read-only.
-const STREAM_FIELD_MAP: Record<string, string> = {
-  user: 'user',
-  account: 'cloud_account_id',
-  region: 'cloud_region',
-  source_ip: 'src_ip',
-  sourceIP: 'src_ip',
-  sourceIPAddress: 'src_ip',
-  resource: 'resource_name',
-  service: 'cloud_service',
-  eventName: 'action',
-  error_code: 'status',
-  status: 'status',
-  error: 'status',
-  secret: 'resource_name',
-  secretId: 'resource_name',
-  target: 'resource_name',
-  bucket: 'resource_name',
-  policy: 'resource_name',
-  awsRegion: 'cloud_region',
-  role: 'user',
-};
+// Column each stream-row or detail key maps to when the user clicks, resolved
+// through the profile-aware field map (NAN-4903). Keys NOT in the map are shown
+// read-only. Concepts the shared map does not carry (resource name, API
+// operation) use the per-profile pair below.
+const CLOUD_RESOURCE_NAME: Record<SchemaProfileId, string> = { udm: 'resource_name', ocsf: 'resources.name' };
+const CLOUD_API_ACTION: Record<SchemaProfileId, string> = { udm: 'action', ocsf: 'api.operation' };
+
+function streamFieldMap(map: SchemaFieldMap): Record<string, string> {
+  const user = map.field('user');
+  const srcIp = map.field('srcIp');
+  const region = map.field('cloudRegion');
+  const resource = CLOUD_RESOURCE_NAME[map.profile];
+  const status = map.field('status');
+  return {
+    user,
+    account: map.field('cloudAccountId'),
+    region,
+    source_ip: srcIp,
+    sourceIP: srcIp,
+    sourceIPAddress: srcIp,
+    resource,
+    service: map.field('cloudService'),
+    eventName: CLOUD_API_ACTION[map.profile],
+    error_code: status,
+    status,
+    error: status,
+    secret: resource,
+    secretId: resource,
+    target: resource,
+    bucket: resource,
+    policy: resource,
+    awsRegion: region,
+    role: user,
+  };
+}
 
 const CLOUD_ACCENT_KEYS = new Set([
   'user',
@@ -94,9 +107,7 @@ function serviceAccent(service: string): string {
 }
 
 function truncateVal(v: unknown): string {
-  // NAN-2361 (audit bug 4): comma-join scalar arrays instead of leaking
-  // `["value"]` JSON into the stream; nested shapes still fall through to JSON.
-  const s = formatCellValue(v);
+  const s = typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '');
   if (s.length > 52) return s.slice(0, 48) + '…';
   return s;
 }
@@ -338,6 +349,8 @@ function EventRow({
   onPivotField?: (field: string, value: string) => void;
 }) {
   const [copied, setCopied] = useState<string | null>(null);
+  const fieldMap = useSchemaFieldMap();
+  const pivotFields = useMemo(() => streamFieldMap(fieldMap), [fieldMap]);
   const rawJson = JSON.stringify(
     {
       ts: ev.ts,
@@ -403,9 +416,9 @@ function EventRow({
         <span className="text-muted-foreground/70 shrink-0">|</span>
         <div className="flex-1 min-w-0 flex items-center gap-x-3 overflow-hidden whitespace-nowrap">
           {summaryEntries.slice(0, 4).map(([k, v]) => {
-            const udmField = STREAM_FIELD_MAP[k];
-            // NAN-2361 (audit bug 4): scalar arrays comma-join, not JSON
-            const rawValue = formatCellValue(v);
+            const udmField = pivotFields[k];
+            const rawValue =
+              typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '');
             const clickable = !!onPivotField && !!udmField && rawValue.length > 0;
             return (
               <span key={k} className="inline-flex items-baseline gap-1 whitespace-nowrap">
@@ -475,9 +488,8 @@ function EventRow({
           <div className="pl-[100px] pr-4 grid grid-cols-[150px_1fr] gap-y-[3px] gap-x-4 font-mono text-[11.5px]">
             {Object.entries(ev.detail ?? {}).map(([k, v]) => {
               const isAccent = CLOUD_ACCENT_KEYS.has(k);
-              // NAN-2361 (audit bug 4): scalar arrays comma-join, not JSON
-              const display = formatCellValue(v);
-              const udmField = STREAM_FIELD_MAP[k];
+              const display = typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '');
+              const udmField = pivotFields[k];
               const clickable = !!onPivotField && !!udmField && display.length > 0;
               return (
                 <div key={k} className="contents">

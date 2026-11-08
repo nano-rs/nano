@@ -8,18 +8,12 @@
 // hidden — see issue NAN-504 for the full carve-out.
 
 import { useEffect, useMemo, useState } from 'react';
+import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
+import { contentBranchFor } from '@/lib/schema-fields';
 import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, ArrowUpRight, GitPullRequest } from 'lucide-react';
 import { useSyncCompleteEffect } from '@/hooks/use-sync-complete';
-import {
-  PLATFORM_CATALOG_SETUP_POLL_MS,
-  platformCatalogSettingUp,
-  platformCatalogSetupBlocksPage,
-  repositorySyncPollInterval,
-} from '@/hooks/repository-sync-state';
-import { useSharedTenant } from '@/hooks/use-shared-tenant';
-import { PlatformCatalogSettingUp } from '@/components/repositories/PlatformCatalogSettingUp';
 import { useAuth } from '@/contexts/AuthContext';
 import { DetectionCodeTargetsDrawer } from '@/components/repositories/DetectionCodeTargetsDrawer';
 import { ImportBundleButton } from '@/components/airgap/ImportBundleButton';
@@ -45,7 +39,6 @@ import {
   FilterRow,
 } from '@/components/repositories/ReposTable';
 import {
-  AddRepoDrawer,
   BulkImportDrawer,
   FolderSelectionDrawer,
   SyncHistoryDrawer,
@@ -130,7 +123,6 @@ export function RuleRepositories() {
 
   const [historyOpen, setHistoryOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
-  const [addOpen, setAddOpen] = useState(false);
   const [foldersRepoId, setFoldersRepoId] = useState<string | null>(null);
   const [deleteRepoId, setDeleteRepoId] = useState<string | null>(null);
 
@@ -138,18 +130,12 @@ export function RuleRepositories() {
   // Queries
   // ----------------------------------------------------------------
 
-  const [syncAcceptedAt, setSyncAcceptedAt] = useState<number | null>(null);
-  const sharedTenant = useSharedTenant();
-
   const { data: reposData, isLoading: reposLoading } = useQuery({
     queryKey: ['rule-repositories'],
     queryFn: () => api.ruleRepositories.listRepositories(),
     refetchInterval: (q) => {
       const repos = q.state.data?.repositories ?? [];
-      if (syncAcceptedAt && Date.now() - syncAcceptedAt < 65 * 60_000) return 1500;
-      // NAN-3436: keep checking while the platform catalog is being set up.
-      if (platformCatalogSettingUp(sharedTenant, repos, 'nano-rs/rules')) return PLATFORM_CATALOG_SETUP_POLL_MS;
-      return repositorySyncPollInterval(repos);
+      return repos.some((r) => r.last_sync_status === 'syncing') ? 1500 : false;
     },
   });
 
@@ -173,8 +159,7 @@ export function RuleRepositories() {
 
   // When the active repo finishes syncing, refetch its rule list and surface a
   // toast so the user sees fresh data + completion confirmation without reload.
-  const markSyncAccepted = useSyncCompleteEffect(repositories, activeRepoId, (repo) => {
-    setSyncAcceptedAt(null);
+  useSyncCompleteEffect(repositories, activeRepoId, (repo) => {
     refetchRules();
     queryClient.invalidateQueries({ queryKey: ['rule-repository-upstream', repo.id] });
     if (repo.last_sync_status === 'failed') {
@@ -318,14 +303,18 @@ export function RuleRepositories() {
   // Mutations
   // ----------------------------------------------------------------
 
+  const schemaMap = useSchemaFieldMap();
   const createMutation = useMutation({
     mutationFn: (req: CreateRepositoryRequest) => api.ruleRepositories.createRepository(req),
     onSuccess: (repo: RuleRepository) => {
       queryClient.invalidateQueries({ queryKey: ['rule-repositories'] });
       setActiveRepoId(repo.id);
-      setAddOpen(false);
       toast({ title: `${repo.name} added — syncing…` });
-      syncMutation.mutate(repo.id);
+      // Kick off the first sync immediately so the rule list populates.
+      api.ruleRepositories
+        .syncRepository(repo.id)
+        .then(() => queryClient.invalidateQueries({ queryKey: ['rule-repositories'] }))
+        .catch(() => {});
     },
     onError: (err: Error) => {
       toast({
@@ -338,23 +327,8 @@ export function RuleRepositories() {
 
   const syncMutation = useMutation({
     mutationFn: (id: string) => api.ruleRepositories.syncRepository(id),
-    onSuccess: (result, repoId) => {
-      if (result.status === 'syncing') {
-        markSyncAccepted(repoId, result.sync_started_at ?? undefined);
-        setSyncAcceptedAt(Date.now());
-      }
+    onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: ['rule-repositories'] });
-      if (result.status !== 'syncing') {
-        // Refresh immediately when a deployment returns a terminal result.
-        queryClient.invalidateQueries({ queryKey: ['rule-repository-rules', result.repository_id] });
-        queryClient.invalidateQueries({ queryKey: ['rule-repository-upstream', result.repository_id] });
-        toast({
-          title: result.status === 'success' ? 'Sync complete' : 'Sync failed',
-          description: result.message,
-          variant: result.status === 'success' ? 'default' : 'destructive',
-        });
-        return;
-      }
       toast({ title: 'Sync started', description: result.message });
     },
     onError: (err: Error) => {
@@ -551,27 +525,11 @@ export function RuleRepositories() {
     );
   }
 
-  // NAN-3436: a new hosted-shared workspace's rule catalog is still being
-  // copied in the background; not "no repositories" (and no connect button
-  // racing the platform).
-  if (platformCatalogSetupBlocksPage(sharedTenant, repositories, 'nano-rs/rules')) {
-    return (
-      <div className="-m-3 flex min-h-[calc(100%+1.5rem)] flex-col" data-testid="rule-repositories-page">
-        <div className="border-b border-border bg-card/30 px-5 py-3.5">
-          <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground">Rule repositories</div>
-        </div>
-        <div className="flex-1 flex items-center justify-center">
-          <PlatformCatalogSettingUp content="detection rules" catalog="nano-rs/rules" />
-        </div>
-      </div>
-    );
-  }
-
   // Empty state — first-run with no repos.
   if (!activeRepo) {
     return (
       <TooltipProvider>
-        <div className="-m-3 flex min-h-[calc(100%+1.5rem)] flex-col" data-testid="rule-repositories-page">
+        <div className="-m-3 flex h-[calc(100%+1.5rem)] overflow-hidden min-h-0 flex-col [contain:layout]">
         <div className="border-b border-border bg-card/30 px-5 py-3.5 flex items-start gap-4">
           <div className="flex-1 min-w-0">
             <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground">
@@ -591,15 +549,7 @@ export function RuleRepositories() {
                 onUpload={importRulesBundle}
                 onSynced={refetchCatalog}
               />
-            ) : (
-              <button
-                type="button"
-                onClick={() => setAddOpen(true)}
-                className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium"
-              >
-                Connect a repo
-              </button>
-            )}
+            ) : null}
           </div>
         </div>
         <div className="flex-1 flex items-center justify-center p-8 text-center">
@@ -625,8 +575,8 @@ export function RuleRepositories() {
             ) : (
               <>
                 <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
-                  Connect a Git repository to sync detection rules. Start with the official{' '}
-                  <code className="font-mono text-foreground/80">nano-rs/rules</code> repo or bring your own.
+                  Detection content comes from nano&apos;s first-party catalog. Follow the official{' '}
+                  <code className="font-mono text-foreground/80">nano-rs/rules</code> catalog to sync it.
                 </div>
                 <div className="flex items-center justify-center gap-2">
                   <button
@@ -636,46 +586,26 @@ export function RuleRepositories() {
                         name: 'nano rules',
                         url: 'https://github.com/nano-rs/rules',
                         description: 'Official nano detection rules in native nPL format',
-                        branch: 'main',
+                        // NAN-4903: OCSF installs follow `main`; UDM installs
+                        // stay on the frozen `legacy/clickhouse` channel.
+                        branch: contentBranchFor(schemaMap.profile),
                         rules_path: '',
                         rule_format: 'nanosiem',
+                        // NAN-4940: the first-party catalogs follow upstream hourly.
                         auto_sync_enabled: true,
+                        sync_interval_hours: 1,
                       })
                     }
-                    disabled={createMutation.isPending}
+                    disabled={createMutation.isPending || !schemaMap.ready}
                     className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium"
                   >
                     {createMutation.isPending ? 'Adding…' : 'Add nano rules'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setAddOpen(true)}
-                    className="h-[28px] px-3 rounded-md border border-border bg-card hover:bg-muted text-[11.5px] font-medium text-foreground/80"
-                  >
-                    Connect custom repo
                   </button>
                 </div>
               </>
             )}
           </div>
         </div>
-
-        <AddRepoDrawer
-          open={addOpen}
-          onClose={() => setAddOpen(false)}
-          submitting={createMutation.isPending}
-          onSubmit={async (req) => {
-            await createMutation.mutateAsync({
-              name: req.name,
-              url: req.url,
-              branch: req.branch,
-              rules_path: req.rules_path || undefined,
-              rule_format: req.rule_format,
-              auto_sync_enabled: req.auto_sync_enabled,
-              sync_interval_hours: req.sync_interval_hours,
-            });
-          }}
-        />
 
         <DetectionCodeTargetsDrawer
           open={dacOpen}
@@ -689,17 +619,12 @@ export function RuleRepositories() {
 
   return (
     <TooltipProvider>
-      {/* NAN-3250: the page flows in the app scroller instead of a fill-height
-          column. The master-detail grid (sidebar, rule list with a sticky
-          header, preview) keeps a bounded box, sized to the app scroller but
-          never below 36rem, so the rule list can't be squeezed to a sliver
-          under the header and filters (was 240px at a 720px window). */}
-      <div className="-m-3 flex min-h-[calc(100%+1.5rem)] flex-col" data-testid="rule-repositories-page">
+      <div className="-m-3 flex h-[calc(100%+1.5rem)] overflow-hidden min-h-0 flex-col [contain:layout]">
         <ReposHeader
         repo={activeRepo}
         onSyncNow={() => syncMutation.mutate(activeRepo.id)}
         onOpenHistory={() => setHistoryOpen(true)}
-        syncing={activeRepo.raw.last_sync_status === 'syncing' || (syncMutation.isPending && syncMutation.variables === activeRepo.id)}
+        syncing={syncMutation.isPending && syncMutation.variables === activeRepo.id}
         pushTargetsSlot={pushTargetsButton}
         airgapSlot={
           airGap ? (
@@ -713,8 +638,7 @@ export function RuleRepositories() {
       />
 
       <div
-        className="grid h-[max(36rem,calc(100dvh-4rem))]"
-        data-testid="rule-repositories-grid"
+        className="flex-1 min-h-0 grid"
         style={{
           gridTemplateColumns: showPreview ? '240px 1fr 420px' : '240px 1fr',
         }}
@@ -824,7 +748,7 @@ export function RuleRepositories() {
         open={historyOpen}
         onClose={() => setHistoryOpen(false)}
         repo={activeRepo}
-        syncing={activeRepo.raw.last_sync_status === 'syncing' || (syncMutation.isPending && syncMutation.variables === activeRepo.id)}
+        syncing={syncMutation.isPending && syncMutation.variables === activeRepo.id}
         onSyncNow={(id) => syncMutation.mutate(id)}
       />
 
@@ -849,23 +773,6 @@ export function RuleRepositories() {
         onSyncStarted={() => {
           queryClient.invalidateQueries({ queryKey: ['rule-repositories'] });
           setFoldersRepoId(null);
-        }}
-      />
-
-      <AddRepoDrawer
-        open={addOpen}
-        onClose={() => setAddOpen(false)}
-        submitting={createMutation.isPending}
-        onSubmit={async (req) => {
-          await createMutation.mutateAsync({
-            name: req.name,
-            url: req.url,
-            branch: req.branch,
-            rules_path: req.rules_path || undefined,
-            rule_format: req.rule_format,
-            auto_sync_enabled: req.auto_sync_enabled,
-            sync_interval_hours: req.sync_interval_hours,
-          });
         }}
       />
 

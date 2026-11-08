@@ -26,7 +26,6 @@ fn test_pretty_print_field_filter() {
         field: "status".to_string(),
         op: Comparator::Eq,
         value: Value::Number(500.0),
-        rhs: RhsSyntax::Literal,
     });
     assert_eq!(query.pretty_print(), "status=500");
 }
@@ -37,7 +36,6 @@ fn test_pretty_print_field_filter_ip() {
         field: "src_ip".to_string(),
         op: Comparator::Eq,
         value: Value::Ip(std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
-        rhs: RhsSyntax::Literal,
     });
     assert_eq!(query.pretty_print(), "src_ip=192.168.1.1");
 }
@@ -50,7 +48,6 @@ fn test_pretty_print_and() {
             field: "status".to_string(),
             op: Comparator::Eq,
             value: Value::Number(500.0),
-            rhs: RhsSyntax::Literal,
         }),
     ));
     assert_eq!(query.pretty_print(), "error status=500");
@@ -119,7 +116,6 @@ fn test_pretty_print_where() {
                 field: "status".to_string(),
                 op: Comparator::Gte,
                 value: Value::Number(400.0),
-                rhs: RhsSyntax::Literal,
             },
         },
     };
@@ -131,10 +127,7 @@ fn test_pretty_print_sort_desc() {
     let query = Query::Piped {
         source: Box::new(Query::Search(SearchExpr::Keyword("error".to_string()))),
         command: Command::Sort {
-            fields: vec![SortField {
-                field: "timestamp".to_string(),
-                descending: true,
-            }],
+            fields: vec![SortField { field: "timestamp".to_string(), descending: true }],
             limit: None,
         },
     };
@@ -146,10 +139,7 @@ fn test_pretty_print_sort_asc() {
     let query = Query::Piped {
         source: Box::new(Query::Search(SearchExpr::Keyword("error".to_string()))),
         command: Command::Sort {
-            fields: vec![SortField {
-                field: "timestamp".to_string(),
-                descending: false,
-            }],
+            fields: vec![SortField { field: "timestamp".to_string(), descending: false }],
             limit: None,
         },
     };
@@ -186,8 +176,8 @@ fn test_pretty_print_timechart() {
             aggregations: vec![Aggregation::new(AggFunc::Count, None)],
             split_by: vec!["src_ip".to_string()],
             limit: None,
-            cont: false,
             useother: true,
+            cont: false,
         },
     };
     assert_eq!(
@@ -295,10 +285,7 @@ fn test_pretty_print_multiple_pipes() {
                 },
             }),
             command: Command::Sort {
-                fields: vec![SortField {
-                    field: "count".to_string(),
-                    descending: true,
-                }],
+                fields: vec![SortField { field: "count".to_string(), descending: true }],
                 limit: None,
             },
         }),
@@ -335,7 +322,6 @@ fn test_pretty_print_all_comparators() {
             field: "field".to_string(),
             op,
             value: Value::String("value".to_string()),
-            rhs: RhsSyntax::Literal,
         });
         assert!(query.pretty_print().contains(expected));
     }
@@ -345,7 +331,6 @@ fn test_pretty_print_all_comparators() {
         field: "field".to_string(),
         op: Comparator::Regex,
         value: Value::Regex("pattern".to_string()),
-        rhs: RhsSyntax::Literal,
     });
     assert!(regex_query.pretty_print().contains("/pattern/"));
 }
@@ -356,11 +341,11 @@ fn test_pretty_print_lookup_basic() {
         source: Box::new(Query::Search(SearchExpr::Keyword("*".to_string()))),
         command: Command::Lookup {
             table_name: "assets".to_string(),
-            event_field: "src_ip".to_string(),
             key_field: "src_ip".to_string(),
-            output_fields: None,
-            output_renames: Vec::new(),
+            event_field: "src_ip".to_string(),
+            output_renames: vec![],
             output_new: false,
+            output_fields: None,
             case_insensitive: false,
         },
     };
@@ -373,11 +358,11 @@ fn test_pretty_print_lookup_with_output() {
         source: Box::new(Query::Search(SearchExpr::Keyword("error".to_string()))),
         command: Command::Lookup {
             table_name: "users".to_string(),
-            event_field: "user".to_string(),
             key_field: "user".to_string(),
-            output_fields: Some(vec!["name".to_string(), "email".to_string()]),
-            output_renames: Vec::new(),
+            event_field: "user".to_string(),
+            output_renames: vec![],
             output_new: false,
+            output_fields: Some(vec!["name".to_string(), "email".to_string()]),
             case_insensitive: false,
         },
     };
@@ -393,11 +378,11 @@ fn test_pretty_print_lookup_case_insensitive() {
         source: Box::new(Query::Search(SearchExpr::Keyword("*".to_string()))),
         command: Command::Lookup {
             table_name: "threats".to_string(),
-            event_field: "ip".to_string(),
             key_field: "ip".to_string(),
-            output_fields: None,
-            output_renames: Vec::new(),
+            event_field: "ip".to_string(),
+            output_renames: vec![],
             output_new: false,
+            output_fields: None,
             case_insensitive: true,
         },
     };
@@ -413,37 +398,17 @@ fn test_pretty_print_lookup_full() {
         source: Box::new(Query::Search(SearchExpr::Keyword("*".to_string()))),
         command: Command::Lookup {
             table_name: "threat_intel".to_string(),
-            event_field: "src_ip".to_string(),
             key_field: "src_ip".to_string(),
-            output_fields: Some(vec!["threat_level".to_string(), "category".to_string()]),
-            output_renames: Vec::new(),
+            event_field: "src_ip".to_string(),
+            output_renames: vec![],
             output_new: false,
+            output_fields: Some(vec!["threat_level".to_string(), "category".to_string()]),
             case_insensitive: true,
         },
     };
     assert_eq!(
         query.pretty_print(),
         "* | lookup threat_intel src_ip OUTPUT threat_level, category CASE_INSENSITIVE"
-    );
-}
-
-#[test]
-fn test_pretty_print_lookup_with_distinct_table_key() {
-    let query = Query::Piped {
-        source: Box::new(Query::Search(SearchExpr::Keyword("*".to_string()))),
-        command: Command::Lookup {
-            table_name: "assets".to_string(),
-            event_field: "src_endpoint.ip".to_string(),
-            key_field: "ip".to_string(),
-            output_fields: Some(vec!["owner".to_string()]),
-            output_renames: Vec::new(),
-            output_new: false,
-            case_insensitive: false,
-        },
-    };
-    assert_eq!(
-        query.pretty_print(),
-        "* | lookup assets ip AS src_endpoint.ip OUTPUT owner"
     );
 }
 
@@ -568,16 +533,12 @@ fn round_trip_value(raw: &str) -> String {
         field: "file_path".to_string(),
         op: Comparator::Eq,
         value: Value::String(raw.to_string()),
-        rhs: RhsSyntax::Literal,
     });
     let printed = q.pretty_print();
     let reparsed = parse_query(&printed)
         .unwrap_or_else(|e| panic!("pretty_print produced unparseable nPL {printed:?}: {e:?}"));
     match reparsed {
-        Query::Search(SearchExpr::FieldFilter {
-            value: Value::String(s),
-            ..
-        }) => s,
+        Query::Search(SearchExpr::FieldFilter { value: Value::String(s), .. }) => s,
         other => panic!("round trip changed structure for {raw:?}: {other:?}"),
     }
 }
@@ -585,23 +546,14 @@ fn round_trip_value(raw: &str) -> String {
 #[test]
 fn unc_path_survives_round_trip() {
     // Before NAN-2184 this came back as `\fileserver\share` — one backslash lost.
-    assert_eq!(
-        round_trip_value(r"\\fileserver\share"),
-        r"\\fileserver\share"
-    );
+    assert_eq!(round_trip_value(r"\\fileserver\share"), r"\\fileserver\share");
 }
 
 #[test]
 fn lone_backslash_path_still_round_trips() {
     // Regression guard: the case that always worked must keep working.
-    assert_eq!(
-        round_trip_value(r"C:\Windows\System32"),
-        r"C:\Windows\System32"
-    );
-    assert_eq!(
-        round_trip_value(r"C:\Windows\System32\"),
-        r"C:\Windows\System32\"
-    );
+    assert_eq!(round_trip_value(r"C:\Windows\System32"), r"C:\Windows\System32");
+    assert_eq!(round_trip_value(r"C:\Windows\System32\"), r"C:\Windows\System32\");
 }
 
 #[test]
@@ -631,16 +583,12 @@ fn round_trip_value_with_text(raw: &str) -> (String, String) {
         field: "file_path".to_string(),
         op: Comparator::Eq,
         value: Value::String(raw.to_string()),
-        rhs: RhsSyntax::Literal,
     });
     let printed = q.pretty_print();
     let reparsed = parse_query(&printed)
         .unwrap_or_else(|e| panic!("pretty_print produced unparseable nPL {printed:?}: {e:?}"));
     match reparsed {
-        Query::Search(SearchExpr::FieldFilter {
-            value: Value::String(s),
-            ..
-        }) => (printed, s),
+        Query::Search(SearchExpr::FieldFilter { value: Value::String(s), .. }) => (printed, s),
         other => panic!("round trip changed structure for {raw:?}: {other:?}"),
     }
 }
@@ -726,14 +674,8 @@ fn rex_pattern_with_double_quotes_round_trips_intact() {
     );
     match parse_query(&printed).unwrap_or_else(|e| panic!("{printed} must re-parse: {e:?}")) {
         Query::Piped { source, .. } => match *source {
-            Query::Piped {
-                command: Command::Rex { pattern: p, .. },
-                ..
-            } => {
-                assert_eq!(
-                    p, pattern,
-                    "the character class `[^\"]+` must not be mangled"
-                );
+            Query::Piped { command: Command::Rex { pattern: p, .. }, .. } => {
+                assert_eq!(p, pattern, "the character class `[^\"]+` must not be mangled");
             }
             other => panic!("expected a rex stage, got {other:?}"),
         },
@@ -760,39 +702,14 @@ fn sed_mode_rex_round_trips_with_a_quote_bearing_pattern() {
 }
 
 #[test]
-fn spath_punctuation_paths_round_trip_as_literals() {
-    use crate::query::parse_query;
-
-    for npl in [
-        r#"* | spath input=unmapped path="Content-Type" output=content_type"#,
-        r#"* | spath input=unmapped path="metadata.tags{}" output=tags"#,
-    ] {
-        let parsed = parse_query(npl).unwrap_or_else(|error| panic!("{npl}: {error:?}"));
-        let printed = parsed.pretty_print();
-        assert!(
-            printed.contains("path=\""),
-            "spath path lost quoting: {printed}"
-        );
-        assert_eq!(
-            parse_query(&printed).unwrap_or_else(|error| panic!("{printed}: {error:?}")),
-            parsed
-        );
-    }
-}
-
-#[test]
 fn newlines_are_stripped_so_the_query_stays_one_line() {
     let printed = Query::Search(SearchExpr::FieldFilter {
         field: "message".to_string(),
         op: Comparator::Eq,
         value: Value::String("evil\n| head 1".to_string()),
-        rhs: RhsSyntax::Literal,
     })
     .pretty_print();
-    assert!(
-        !printed.contains('\n'),
-        "pretty_print leaked a newline: {printed:?}"
-    );
+    assert!(!printed.contains('\n'), "pretty_print leaked a newline: {printed:?}");
     assert_eq!(round_trip_value("evil\n| head 1"), "evil| head 1");
 }
 
@@ -800,19 +717,6 @@ fn newlines_are_stripped_so_the_query_stays_one_line() {
 fn inert_characters_are_preserved() {
     assert_eq!(round_trip_value("cmd|powershell"), "cmd|powershell");
     assert_eq!(round_trip_value("(foo|bar)[1]"), "(foo|bar)[1]");
-}
-
-#[test]
-fn positional_prevalence_fields_survive_round_trip() {
-    use crate::query::parse_query;
-
-    let original = parse_query(
-        r#"* | sequence by user.name maxspan=5m fields(file.hashes.value) [class_uid=1001] [class_uid=1007] | prevalence step2_file_hashes_value window=24h"#,
-    )
-    .unwrap();
-    let printed = original.pretty_print();
-    assert!(printed.contains("prevalence step2_file_hashes_value window=24h"));
-    assert_eq!(parse_query(&printed).unwrap(), original);
 }
 
 /// NAN-3335 / NAN-3329: hosted search re-prints every query through

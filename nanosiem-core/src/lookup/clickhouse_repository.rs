@@ -29,11 +29,13 @@
 
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 
 use super::postgres_repository::PostgresLookupRepository;
-use super::repository::{LookupRepositoryError, LookupStore, RuleReferenceRow};
+use super::repository::{
+    LookupMutationGuard, LookupRepositoryError, LookupStore, RuleReferenceRow,
+};
 use super::snowflake;
 use super::types::*;
 use crate::db::dual_pool::{on_cluster_clause, TableNames};
@@ -448,6 +450,13 @@ fn json_u64(v: &serde_json::Value) -> Option<u64> {
 
 #[async_trait]
 impl LookupStore for ClickHouseLookupRepository {
+    async fn lock_logical_table(
+        &self,
+        name: &str,
+    ) -> Result<LookupMutationGuard, LookupRepositoryError> {
+        self.registry.lock_logical_table(name).await
+    }
+
     // ---- Registry: delegate to Postgres ----
     async fn list_tables(&self) -> Result<Vec<LookupTable>, LookupRepositoryError> {
         self.registry.list_tables().await
@@ -540,6 +549,25 @@ impl LookupStore for ClickHouseLookupRepository {
             .map_err(Self::ch_err)
     }
 
+    async fn record_staged_generation(
+        &self,
+        logical_name: &str,
+        physical_name: &str,
+    ) -> Result<(), LookupRepositoryError> {
+        self.registry
+            .record_staged_generation(logical_name, physical_name, "clickhouse")
+            .await
+    }
+
+    async fn mark_generation_live(&self, physical_name: &str) -> Result<(), LookupRepositoryError> {
+        self.registry.mark_generation_live(physical_name).await
+    }
+
+    async fn cleanup_generation(&self, physical_name: &str) -> Result<(), LookupRepositoryError> {
+        self.drop_dynamic_table(physical_name).await?;
+        self.registry.mark_generation_live(physical_name).await
+    }
+
     #[instrument(skip(self))]
     async fn truncate_dynamic_table(&self, table_name: &str) -> Result<(), LookupRepositoryError> {
         // Same as drop at the data level — remove all rows for this logical table.
@@ -556,57 +584,47 @@ impl LookupStore for ClickHouseLookupRepository {
         primary_key: Option<&str>,
         row_count: i64,
     ) -> Result<(), LookupRepositoryError> {
-        // Version-generation swap. The service has already inserted the new
-        // generation under `staging_physical`. Re-key those staged rows to the
-        // live name `old_physical` at a fresh swap-version generation, then drop
-        // the prior generation (version < swap_version). If the re-key INSERT
-        // fails, we skip the DELETE so the old generation stays intact.
+        // NAN-2875 review fix: pointer switch, not re-key + delete.
+        //
+        // The service staged every new row under `staging_physical`, which no
+        // reader resolves (reads go through the registry's `table_name`). The
+        // registry pointer then moves from `old_physical` to `staging_physical`
+        // in one locked PostgreSQL transaction with a CAS on `old_physical`, so
+        // readers see the whole old generation or the whole new one, never the
+        // union. A PostgreSQL failure leaves the pointer, and so the old data
+        // and schema, untouched. The old rows are purged only after commit.
         if !Self::is_valid_identifier(old_physical) || !Self::is_valid_identifier(staging_physical)
         {
             return Err(LookupRepositoryError::InvalidTableName(
                 old_physical.to_string(),
             ));
         }
-        let swap_version = snowflake::next_id();
-
-        // Re-key the deduped staged rows onto the live name at versions >=
-        // swap_version. snowflake() advances per call so each row's version is
-        // unique and >= swap_version.
-        let staged = self.read_live_rows(staging_physical, None, false).await?;
-        let rekeyed: Vec<InsertTuple> = staged
-            .into_iter()
-            .map(|r| InsertTuple {
-                row_id: r.row_id,
-                key_raw: r.key_raw,
-                cols_json: r.cols_json,
-                deleted: 0,
-            })
-            .collect();
-        // Insert under the LIVE name. On failure, bail before deleting.
-        self.insert_tuples(old_physical, &rekeyed).await?;
-
-        // Drop the prior live generation (everything older than this swap).
-        // ON CLUSTER so the prior generation is purged on every shard (per-shard
-        // table, NAN-1728); empty clause on single-node → identical DDL.
-        let drop_sql = format!(
-            "ALTER TABLE nanosiem.lookup_rows{on_cluster} DELETE \
-             WHERE lookup_table_name = ? AND version < ? SETTINGS mutations_sync = 2",
-            on_cluster = on_cluster_clause()
-        );
-        self.ch
-            .query(&drop_sql)
-            .bind(old_physical)
-            .bind(swap_version)
-            .execute()
-            .await
-            .map_err(Self::ch_err)?;
-
         self.registry
-            .publish_replaced_table(registry_name, columns, primary_key, row_count)
+            .publish_staged_table(
+                registry_name,
+                old_physical,
+                staging_physical,
+                columns,
+                primary_key,
+                row_count,
+                "clickhouse",
+            )
             .await?;
+        if let Err(error) = self.cleanup_generation(old_physical).await {
+            warn!(old_physical, %error, "replaced lookup generation not purged; registry already points at the new one");
+        }
+        Ok(())
+    }
 
-        // Clean up the staging generation (best-effort; data is already live).
-        let _ = self.drop_dynamic_table(staging_physical).await;
+    async fn delete_table(&self, table: &LookupTable) -> Result<(), LookupRepositoryError> {
+        // Registry first, under the reference guard; rows are purged after
+        // commit, so a refused delete leaves the data intact.
+        self.registry
+            .delete_table_guarded(table, false, "clickhouse")
+            .await?;
+        if let Err(error) = self.cleanup_generation(&table.table_name).await {
+            warn!(table = %table.table_name, %error, "deleted lookup's rows not purged; no registry entry references them");
+        }
         Ok(())
     }
 
@@ -751,6 +769,7 @@ impl LookupStore for ClickHouseLookupRepository {
     async fn lookup(
         &self,
         table_name: &str,
+        columns: &[LookupColumn],
         key_field: &str,
         key_value: &serde_json::Value,
         output_fields: Option<&[String]>,
@@ -759,6 +778,7 @@ impl LookupStore for ClickHouseLookupRepository {
         let results = self
             .lookup_batch(
                 table_name,
+                columns,
                 key_field,
                 std::slice::from_ref(key_value),
                 output_fields,
@@ -772,6 +792,7 @@ impl LookupStore for ClickHouseLookupRepository {
     async fn lookup_batch(
         &self,
         table_name: &str,
+        columns: &[LookupColumn],
         key_field: &str,
         key_values: &[serde_json::Value],
         output_fields: Option<&[String]>,
@@ -780,7 +801,6 @@ impl LookupStore for ClickHouseLookupRepository {
         if key_values.is_empty() {
             return Ok(HashMap::new());
         }
-        let columns = self.registry.get_columns_for_physical(table_name).await?;
         // The stored key columns (key_raw/key_lc) hold the FIRST registry
         // column's value. Only push the indexed `key_lc/key_raw IN (...)` filter
         // down to ClickHouse when the requested key matches that column;
@@ -811,7 +831,7 @@ impl LookupStore for ClickHouseLookupRepository {
 
         let mut out = HashMap::new();
         for r in &rows {
-            let decoded = Self::decode_row(r, key_field, &columns, output_fields);
+            let decoded = Self::decode_row(r, key_field, columns, output_fields);
             // The lookup value of the requested key field, normalized for matching.
             let cmp_val = decoded
                 .get(key_field)
@@ -857,10 +877,10 @@ impl LookupStore for ClickHouseLookupRepository {
     async fn list_rows(
         &self,
         table_name: &str,
+        columns: &[LookupColumn],
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<HashMap<String, serde_json::Value>>, i64), LookupRepositoryError> {
-        let columns = self.registry.get_columns_for_physical(table_name).await?;
         let key_field = columns.first().map(|c| c.name.clone()).unwrap_or_default();
         let mut rows = self.read_live_rows(table_name, None, false).await?;
         // Stable order by the immutable surrogate, matching the PG `_row_id` order.
@@ -871,7 +891,7 @@ impl LookupStore for ClickHouseLookupRepository {
             .skip(offset.max(0) as usize)
             .take(limit.max(0) as usize)
             .map(|r| {
-                let mut m = Self::decode_row(r, &key_field, &columns, None);
+                let mut m = Self::decode_row(r, &key_field, columns, None);
                 // Expose the surrogate as `_row_id` so edit/delete targeting works,
                 // matching the Postgres list_rows contract.
                 m.insert(

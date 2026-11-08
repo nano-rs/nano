@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-or-later
-
 #
 # scan-mirror-secrets.sh <tree>
 #
-# Fail if <tree> contains anything that looks like a live credential, a real
-# AWS account id (NAN-2361), or a hosted identifier (NAN-3861).
+# Fail if <tree> contains anything that looks like a live credential.
 #
 # NAN-2228: a working Cloudflare AI Gateway token sat in
 # `scripts/start-microservices-dev.sh` for ~80 days, published to the public
@@ -23,12 +20,9 @@
 # change.
 #
 # Consequence: running it against the SOURCE tree flags synthetic AWS key ids in
-# `design-ref/` sample CloudTrail data, and both key ids and account ids in the
-# `benchmarks/security-lake-chdb/` evidence tree. The design-ref and benchmark
-# key ids are synthetic mockups; the benchmark ACCOUNT id is real. All three
-# paths are stripped (sync-to-nano-mirror.sh) and absent from the published
-# mirror, so the authoritative run — the stripped tree — is clean. Do not add
-# any of them to ALLOW.
+# `design-ref/` sample CloudTrail data. Those are mockups, `design-ref` is
+# stripped (sync-to-nano-mirror.sh) and absent from the published mirror, so the
+# authoritative run — the stripped tree — is clean. Do not add them to ALLOW.
 #
 # Usage:
 #   tools/scan-mirror-secrets.sh /tmp/nano-mirror
@@ -63,216 +57,144 @@ PATTERNS+='|-----BEGIN [A-Z ]*PRIVATE KEY-----[[:space:]]*[A-Za-z0-9+/]{40,}'
 #
 #   AKIAIOSFODNN7EXAMPLE — AWS's own published documentation example key,
 #                          used as a test fixture in nanosiem-core/src/crypto.rs.
-#   tools/log-blaster/tenzir/fixtures/{raw,mapped}.ndjson AKIA<16 hex> —
-#                          synthetic CloudTrail access key ids from the
-#                          log-blaster corpus generators (NAN-4679). AWS key
-#                          ids are base32 (A-Z, 2-7); these are hex and every
-#                          one carries a 0/1/8/9, so none can be a real key.
-#                          Scoped to those two files and to a hex id that
-#                          holds a non-base32 digit.
 ALLOW='AKIAIOSFODNN7EXAMPLE'
-ALLOW+='|/tools/log-blaster/tenzir/fixtures/(raw|mapped)\.ndjson:[0-9]+:.*AKIA[0-9A-F]{0,15}[0189][0-9A-F]{0,15}([^0-9A-Z]|$)'
-
-# Real AWS account ids. Not a credential, but an identifier that pins the
-# published tree to a live account: it names S3 buckets, and every ARN built
-# from it is a valid target for enumeration or a confused-deputy attempt.
-#
-# NAN-2361 nearly shipped one: the security-lake benchmark evidence baked a
-# live account id into ~120 files, and nothing here would have said a word.
-# `sync-to-nano-mirror.sh` now strips that subtree, but the strip list is a
-# per-incident fix — this is the rule that catches the CLASS.
-#
-# Anchored on the positions an account id actually occupies, NOT on a bare
-# `\b[0-9]{12}\b`. Measured on this repo, the bare form matches 30+ distinct
-# values that are not account ids at all — UUID tails (…-446655440000),
-# zero-padded fixture ids (000000000002), byte constants (107374182400 =
-# 100GiB). A gate that noisy gets switched off, and a gate that is switched off
-# catches nothing.
-ACCOUNT_PATTERNS='arn:aws[a-zA-Z0-9-]*:[a-z0-9-]*:[a-z0-9-]*:[0-9]{12}:'
-ACCOUNT_PATTERNS+='|[0-9]{12}\.dkr\.ecr\.'
-# Spelled out per-character rather than with a case-insensitive grep: the token
-# PATTERNS above are case-SENSITIVE by design (`AKIA` must not match `akia`),
-# and both alternations share one grep invocation.
-ACCOUNT_PATTERNS+='|[Aa][Cc][Cc][Oo][Uu][Nn][Tt][_-]?([IiUu][Dd])?"?[[:space:]]*[:=][[:space:]]*"?[0-9]{12}([^0-9]|$)'
-# Account-id-suffixed bucket / resource names, the shape NAN-2361 used
-# (nanosiem-nan-2361-chdb-<acct>-us-east-1).
-ACCOUNT_PATTERNS+='|-[0-9]{12}-(us|eu|ap|sa|ca|me|af|il|cn)-[a-z]+-[0-9]'
-# Bare path segment in an AWS service URL. SQS queue URLs, execute-api
-# endpoints and Lambda function URLs carry the account id as a plain path
-# component — no `arn:`, no region suffix, no assignment — so none of the
-# shapes above see it. This was a measured miss: an SQS queue URL in the
-# NAN-2361 benchmark tree (`sqs.us-east-1.amazonaws.com/<acct>/<queue>`).
-ACCOUNT_PATTERNS+='|amazonaws\.com/[0-9]{12}([^0-9]|$)'
-# Prose form: "AWS account `123456789012`, region us-east-1" in a README.
-# The `[:=]` shape above requires an assignment; prose separates the word from
-# the id with spaces and (in markdown) a backtick. The optional ID/NO/# word
-# covers "account id 4458…". Bounded to two non-alphanumeric separator chars so
-# the match stays anchored on the word `account` and cannot bridge across an
-# intervening word into an unrelated 12-digit number.
-ACCOUNT_PATTERNS+='|[Aa][Cc][Cc][Oo][Uu][Nn][Tt]([[:space:]]+([Ii][Dd]|[Nn][Oo]\.?|#))?[[:space:]]*[^0-9A-Za-z]{0,2}[0-9]{12}([^0-9]|$)'
-
-# Reserved / obviously-fake ids that the repo already uses as examples. Held
-# separate from ALLOW on purpose: both allowlists are LINE-scoped (grep -v
-# drops the whole matching line), so folding these into ALLOW would let a real
-# token hide on any line that also mentions a placeholder account.
-#
-#   000000000000, 123456789012 — AWS's documentation-reserved placeholders.
-#   210987654321 — descending-sequence fixture in the credential /
-#                  source-config assume-role tests.
-#   234567890123 — ascending-sequence fixture in the nPL parser tests
-#                  (`account=234567890123`) and the synthetic CloudTrail corpus.
-#   345678901234, 456789012345 — the next two steps of that ascending
-#                  sequence, used by the same synthetic CloudTrail generators;
-#                  allowed only in the two log-blaster Tenzir fixtures that
-#                  carry them (NAN-4679).
-ACCOUNT_ALLOW='000000000000|123456789012|210987654321|234567890123'
-ACCOUNT_ALLOW+='|/tools/log-blaster/tenzir/fixtures/(raw|mapped)\.ndjson:[0-9]+:.*(345678901234|456789012345)'
-
-# Hosted identifiers (NAN-3861): the hosted Cloudflare account id and the
-# internal lean tenant ids. Neither is a credential, but the account id pins
-# the published tree to the live hosted account (R2 endpoints, Worker and
-# Container API paths, registry refs), and the tenant ids name real tenants.
-#
-# Matched by SHA-256 so this script, which is itself published, never carries
-# the values. The account id is 128 random bits, so its digest reveals nothing;
-# the tenant ids are 8-hex prefixes, so their digests hide nothing from a
-# determined reader — they are hashed only so the scanner does not flag itself.
-#
-#   HOSTED_ACCOUNT_SHA256: any 32-hex window of a hex run (any case), so it
-#     also catches `<acct>.r2.cloudflarestorage.com`, `<acct>_<bucket>`
-#     warehouses and ids inside longer hex strings.
-#   HOSTED_TENANT_SHA256: a hex run of exactly 8 (a UUID's first group,
-#     `cell-…-<prefix>`, a bare prefix in prose) or the leading 8 digits of an
-#     `0x…` integer literal (`Uuid::from_u128(0x…_…)`).
-#
-# gzip members are decompressed and scanned too: NAN-3861 found the account id
-# inside a gzipped test corpus that every plain-text grep missed.
-#
-#   HOSTED_WORKERS_SUBDOMAIN_SHA256: the account's workers.dev subdomain, the
-#     label right before `.workers.dev` (`<worker>.<subdomain>.workers.dev`).
-#     It names the hosted account as surely as the account id does. Like the
-#     tenant ids it is short, so the digest only keeps the scanner from
-#     flagging itself.
-#
-# Extra digests for the self-test only: NANO_SCAN_EXTRA_ACCOUNT_SHA256 /
-# NANO_SCAN_EXTRA_TENANT_SHA256 / NANO_SCAN_EXTRA_WORKERS_SHA256 (space-separated).
-HOSTED_ACCOUNT_SHA256='75205cc50094432f740d7c1c75cb7318a77c9ad0706deec488082beea8506331'
-HOSTED_TENANT_SHA256='9ef7797594ba696bf8a95584c53ebd4fd91655c495c8f5b214b6b34aa093f180'
-HOSTED_TENANT_SHA256+=' 7fb7b4d6b3ad09798415b3fc57882629142ee12f1abb871f14b676cd0fd6eccb'
-HOSTED_WORKERS_SUBDOMAIN_SHA256='2a7e304a6bac1f6f84367e3514364abadd68745837b7f9e1b6b4d44707bfbdbe'
-# Files that may keep a tenant id, each because it cannot change:
-#   migrations/postgres/346_*.sql — an applied sqlx migration; editing even its
-#   comment changes the checksum every existing database verifies at boot.
-HOSTED_TENANT_ALLOW_PATHS='migrations/postgres/346_lean_finding_outbox_completion.sql'
-
-hosted_scan() {
-    python3 -I - "$TREE" "$HOSTED_ACCOUNT_SHA256 ${NANO_SCAN_EXTRA_ACCOUNT_SHA256:-}" \
-        "$HOSTED_TENANT_SHA256 ${NANO_SCAN_EXTRA_TENANT_SHA256:-}" "$HOSTED_TENANT_ALLOW_PATHS" \
-        "$HOSTED_WORKERS_SUBDOMAIN_SHA256 ${NANO_SCAN_EXTRA_WORKERS_SHA256:-}" <<'PY'
-import gzip, hashlib, os, re, sys
-
-tree, accounts, tenants, allow, workers = sys.argv[1], *(set(a.split()) for a in sys.argv[2:6])
-for digest in accounts | tenants | workers:
-    if not re.fullmatch(r"[0-9a-f]{64}", digest):
-        sys.exit(f"scan-mirror-secrets: malformed digest {digest!r}")
-SKIP_DIRS = {".git", "node_modules", "target", "dist"}
-HEX = re.compile(rb"[0-9A-Fa-f]+")
-INT = re.compile(rb"(?<![0-9A-Za-z_])0[xX]([0-9A-Fa-f_]+)")
-WORKERS = re.compile(rb"([0-9A-Za-z-]+)\.workers\.dev(?![0-9A-Za-z-])", re.I)
-MAX_GUNZIP = 256 << 20
-
-def sha(b):
-    return hashlib.sha256(b.lower()).hexdigest()
-
-def hit(line, tenant_ok):
-    for m in WORKERS.finditer(line):
-        if sha(m.group(1)) in workers:
-            return True
-    for m in HEX.finditer(line):
-        run = m.group(0)
-        if len(run) >= 32 and any(sha(run[i:i + 32]) in accounts for i in range(len(run) - 31)):
-            return True
-        if not tenant_ok and len(run) == 8 and sha(run) in tenants:
-            return True
-    if not tenant_ok:
-        for m in INT.finditer(line):
-            digits = m.group(1).replace(b"_", b"")
-            if len(digits) >= 8 and sha(digits[:8]) in tenants:
-                return True
-    return False
-
-def scan(label, data, tenant_ok):
-    for number, line in enumerate(data.split(b"\n"), 1):
-        if hit(line, tenant_ok):
-            print(f"{label}:{number}: [match withheld]")
-
-for root, dirs, files in os.walk(tree):
-    dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-    for name in files:
-        path = os.path.join(root, name)
-        if os.path.islink(path) or not os.path.isfile(path):
-            continue
-        rel = os.path.relpath(path, tree)
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except OSError:
-            continue
-        tenant_ok = rel in allow
-        if data[:2] == b"\x1f\x8b":
-            try:
-                with gzip.open(path, "rb") as g:
-                    inner = g.read(MAX_GUNZIP + 1)
-            except (OSError, EOFError):
-                continue
-            if len(inner) > MAX_GUNZIP:
-                print(f"{path}(gunzip):0: [too large to scan]")
-            else:
-                scan(f"{path}(gunzip)", inner, tenant_ok)
-        elif b"\0" not in data[:8192]:
-            scan(path, data, tenant_ok)
-PY
-}
 
 echo "Scanning $TREE for credential-shaped strings..."
 
-scan() {
-    grep -rInE "$1" "$TREE" \
+hits=$(grep -rInE "$PATTERNS" "$TREE" \
         --exclude-dir=.git \
         --exclude-dir=node_modules \
         --exclude-dir=target \
         --exclude-dir=dist \
-      2>/dev/null | grep -vE "$2" || true
-}
+      2>/dev/null | grep -vE "$ALLOW" || true)
 
-hits=$(scan "$PATTERNS" "$ALLOW")
-account_hits=$(scan "$ACCOUNT_PATTERNS" "$ACCOUNT_ALLOW")
-[ -n "$account_hits" ] && hits="${hits:+$hits$'\n'}$account_hits"
-hosted_hits=$(hosted_scan) || { echo "hosted identifier scan failed" >&2; exit 2; }
-[ -n "$hosted_hits" ] && hits="${hits:+$hits$'\n'}$hosted_hits"
+# PEM private keys span lines, which the line-oriented PATTERNS above cannot
+# see: the BEGIN header and the base64 body sit on different lines. This
+# file-level check flags any file holding a private-key header that is
+#   - a PEM block (the header starts its line: what openssl and ssh-keygen write),
+#   - followed on the same line by an escaped newline and a key body (a key
+#     pasted into a JSON/TOML/code string), or
+#   - followed on the next line by a key body.
+# A "body" is 40+ base64 characters, so short placeholders such as
+# "-----BEGIN PRIVATE KEY-----\nMIIE..." in tests and UI hints do not trip it.
+# Only PATHS are reported, never content.
+pem_files=""
+pem_candidates=$(grep -rlIE -e '-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----' "$TREE" \
+        --exclude-dir=.git \
+        --exclude-dir=node_modules \
+        --exclude-dir=target \
+        --exclude-dir=dist \
+      2>/dev/null || true)
+if [ -n "$pem_candidates" ]; then
+    pem_files=$(printf '%s\n' "$pem_candidates" | while IFS= read -r f; do
+        # No {n,} intervals: mawk (Debian's default awk) may not support them.
+        awk '
+          BEGIN {
+            hdr = "-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----"
+            b64 = ""; for (i = 0; i < 40; i++) b64 = b64 "[A-Za-z0-9+/=]"
+            body = "^[ \t]*" b64
+            escaped = "^(\\\\r)?\\\\n" b64
+          }
+          pending && $0 ~ body { found = 1; exit }
+          { pending = 0 }
+          $0 ~ hdr {
+            if ($0 ~ ("^[ \t]*" hdr)) { found = 1; exit }
+            rest = $0; sub(".*" hdr, "", rest)
+            if (rest ~ escaped) { found = 1; exit }
+            pending = 1
+          }
+          END { exit found ? 0 : 1 }
+        ' "$f" && printf '%s\n' "$f"
+    done || true)
+fi
 
-if [ -z "$hits" ]; then
+artifact_files=$(NANO_MIRROR_TREE="$TREE" python3 -I - <<'PY'
+import json
+import os
+from pathlib import Path
+
+tree = Path(os.environ["NANO_MIRROR_TREE"])
+skip = {".git", "node_modules", "target", "dist"}
+suffixes = (".license.json", ".issuance.json", ".body.json")
+found = set()
+
+for base, directories, files in os.walk(tree):
+    directories[:] = [name for name in directories if name not in skip]
+    for name in files:
+        path = Path(base, name)
+        if name.endswith(suffixes):
+            found.add(path)
+            continue
+        try:
+            if path.stat().st_size > 256 * 1024:
+                continue
+            value = json.loads(path.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        claims = value.get("claims")
+        signature = value.get("signature")
+        if (
+            isinstance(claims, dict)
+            and isinstance(value.get("key_id"), str)
+            and isinstance(value.get("key_version"), int)
+            and isinstance(signature, list)
+            and len(signature) == 64
+            and all(isinstance(byte, int) and 0 <= byte <= 255 for byte in signature)
+            and {"schema_version", "issuer", "order_id", "purchaser_id", "expires_at", "entitlement"} <= claims.keys()
+            and isinstance(claims.get("entitlement"), dict)
+        ):
+            found.add(path)
+
+for path in sorted(found):
+    print(path)
+PY
+)
+
+if [ -z "$hits" ] && [ -z "$pem_files" ] && [ -z "$artifact_files" ]; then
     echo "OK — no credential-shaped strings found."
     exit 0
+fi
+
+if [ -n "$artifact_files" ]; then
+    echo ""
+    echo "FAIL — C05 licence artifacts found in files that would be published:"
+    echo ""
+    printf '%s\n' "$artifact_files"
+fi
+if [ -n "$pem_files" ]; then
+    echo ""
+    echo "FAIL — private keys (PEM) found in files that would be published:"
+    echo ""
+    printf '%s\n' "$pem_files"
+fi
+if [ -z "$hits" ]; then
+    echo ""
+    echo "Remove the artifact or key, then ROTATE/REVOKE it — assume anything that reached this point is compromised."
+    exit 1
 fi
 
 echo ""
 echo "FAIL — credential-shaped strings found in the tree that would be published:"
 echo ""
-# Never print matched lines. Prefix-specific masking is easy to miss when
-# adding a new provider pattern; file/line coordinates suffice for triage.
-printf '%s\n' "$hits" | awk -F: '{print $1 ":" $2 ": [match withheld]"}'
-
+# Mask the matched value so the gate does not itself print the secret into
+# public CI logs.
+printf '%s\n' "$hits" | sed -E \
+    -e 's/(cfut_[A-Za-z0-9]{6})[A-Za-z0-9]*/\1…REDACTED/g' \
+    -e 's/(sk-[A-Za-z0-9]{4})[A-Za-z0-9]*/\1…REDACTED/g' \
+    -e 's/(sk_live_[A-Za-z0-9]{4})[A-Za-z0-9]*/\1…REDACTED/g' \
+    -e 's/(ghp_[A-Za-z0-9]{4})[A-Za-z0-9]*/\1…REDACTED/g' \
+    -e 's/(github_pat_[A-Za-z0-9_]{6})[A-Za-z0-9_]*/\1…REDACTED/g' \
+    -e 's/(glpat-[A-Za-z0-9_-]{4})[A-Za-z0-9_-]*/\1…REDACTED/g' \
+    -e 's/(xox[baprs]-[A-Za-z0-9-]{4})[A-Za-z0-9-]*/\1…REDACTED/g' \
+    -e 's/(AIza[0-9A-Za-z_-]{4})[0-9A-Za-z_-]*/\1…REDACTED/g' \
+    -e 's/(AKIA[0-9A-Z]{4})[0-9A-Z]*/\1…REDACTED/g' \
+    -e 's/(dop_v1_[a-f0-9]{6})[a-f0-9]*/\1…REDACTED/g' \
+    -e 's/(pul-[a-f0-9]{6})[a-f0-9]*/\1…REDACTED/g' \
+    -e 's/(PRIVATE KEY-----[[:space:]]*)[A-Za-z0-9+\/]+/\1…REDACTED/g'
 echo ""
 echo "Remove the credential, then ROTATE it — assume anything that reached this"
 echo "point is compromised. If a match is a genuine false positive, add it to"
 echo "ALLOW in tools/scan-mirror-secrets.sh with a comment justifying it."
-echo ""
-echo "For an AWS account id there is nothing to rotate: either strip the path in"
-echo "sync-to-nano-mirror.sh, or replace the id with 123456789012. Do NOT add a"
-echo "real account id to ACCOUNT_ALLOW."
-echo ""
-echo "For the hosted Cloudflare account, its workers.dev subdomain or a lean tenant id: use a"
-echo "placeholder (e.g. 0123456789abcdef0123456789abcdef, aaaaaaaa-aaaa-4aaa-8aaa-"
-echo "aaaaaaaaaaaa) or read the real value from config."
 exit 1

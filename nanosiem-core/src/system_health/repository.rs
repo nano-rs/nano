@@ -4,15 +4,6 @@ use sqlx::{PgPool, Postgres, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-
-// NAN-2361: the outbox unique index leads with the security tenant column only
-// under the enterprise overlay (9000213); the open edition keeps core 282's
-// shape. Selected at compile time by the feature.
-#[cfg(feature = "enterprise")]
-const OUTBOX_CONFLICT_TARGET: &str =
-    "ON CONFLICT (security_tenant_id, tenant_id, event_id, webhook_id, event_action) DO NOTHING";
-#[cfg(not(feature = "enterprise"))]
-const OUTBOX_CONFLICT_TARGET: &str = "ON CONFLICT (tenant_id, event_id, webhook_id, event_action) DO NOTHING";
 use super::types::{
     ClaimedHealthDelivery, HealthBusSummary, HealthDelivery, PublishHealthEvent, SystemHealthEvent,
     DEFAULT_TENANT_ID, SYSTEM_HEALTH_EVENT_TYPE,
@@ -457,7 +448,7 @@ async fn enqueue_matching_destinations(
         // incident opened, not whatever routes happen to match now. This avoids
         // orphan recoveries on newly-created channels and preserves PagerDuty
         // incident closure after severity/category filters change.
-        sqlx::query(&format!(
+        sqlx::query(
             r#"
             INSERT INTO system_health_outbox
                 (tenant_id, event_id, webhook_id, event_action)
@@ -466,9 +457,9 @@ async fn enqueue_matching_destinations(
             WHERE prior.tenant_id = $1
               AND prior.event_id = $2
               AND prior.event_action IN ('triggered', 'reminder')
-            {OUTBOX_CONFLICT_TARGET}
+            ON CONFLICT (tenant_id, event_id, webhook_id, event_action) DO NOTHING
             "#,
-        ))
+        )
         .bind(&event.tenant_id)
         .bind(event.id)
         .bind(event_action)
@@ -477,7 +468,7 @@ async fn enqueue_matching_destinations(
         return Ok(());
     }
 
-    sqlx::query(&format!(
+    sqlx::query(
         r#"
         INSERT INTO system_health_outbox
             (tenant_id, event_id, webhook_id, event_action)
@@ -491,9 +482,9 @@ async fn enqueue_matching_destinations(
                OR $6 = ANY(w.health_category_filter))
           AND (w.health_resource_filter IS NULL OR cardinality(w.health_resource_filter) = 0
                OR $7 = ANY(w.health_resource_filter))
-        {OUTBOX_CONFLICT_TARGET}
+        ON CONFLICT (tenant_id, event_id, webhook_id, event_action) DO NOTHING
         "#,
-    ))
+    )
     .bind(&event.tenant_id)
     .bind(event.id)
     .bind(event_action)

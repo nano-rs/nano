@@ -26,7 +26,6 @@ use nanosiem_core::audit::{
 #[cfg(feature = "enterprise")]
 use nanosiem_core::audit::MARKETPLACE_PREVIEW_EXECUTED;
 use nanosiem_core::auth::permissions;
-use nanosiem_core::marketplace::platform_sync::SyncNowAccepted;
 use nanosiem_core::marketplace::{
     ArtifactCoverage, CatalogFilter, CatalogStats, CollectorManifestFields, ConfigureRequest,
     CoverageState, CreateMarketplaceRepo, CredentialFieldDef, EnrichmentMarketplaceRepo,
@@ -91,10 +90,6 @@ pub struct ExportResponse {
     pub manifest_yaml: String,
     /// code.ts content
     pub code: String,
-    /// connector.yaml content, for entries that ship a nano
-    /// connector spec. The manifest names it as `connector_spec`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub connector_spec: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -207,7 +202,7 @@ pub async fn get_catalog_entry(
         // NAN-2343: both of these are ApiError::ValidationError, which renders
         // 422 — "Credential required" was documented as 400 and never was.
         (status = 422, description = "Credential required, or a credential value failed validation"),
-        (status = 409, description = "Already installed"),
+        (status = 409, description = "Already installed, or provided by nano's signed platform feed bundle (NAN-4959)"),
     ),
     security(("api_key" = []))
 )]
@@ -220,7 +215,7 @@ pub async fn install_enrichment(
 ) -> Result<Json<MarketplaceCatalogEntry>, ApiError> {
     ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
-    let service = MarketplaceInstallService::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
+    let service = MarketplaceInstallService::new(state.pool.clone());
     let entry = service.install(&slug, &request, auth.user_id()).await?;
 
     state.emit_audit(
@@ -257,7 +252,7 @@ pub async fn uninstall_enrichment(
 ) -> Result<Json<MarketplaceCatalogEntry>, ApiError> {
     ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
-    let service = MarketplaceInstallService::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
+    let service = MarketplaceInstallService::new(state.pool.clone());
     let entry = service.uninstall(&slug).await?;
 
     state.emit_audit(
@@ -287,6 +282,7 @@ pub async fn uninstall_enrichment(
         // download_url that is not a parseable http/https URL) is rejected
         // here rather than persisted and surfaced later as a sync failure.
         (status = 422, description = "A credential value failed validation"),
+        (status = 409, description = "Enabling or crediting a feed nano's signed platform feed bundle provides (NAN-4959)"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -302,10 +298,18 @@ pub async fn configure_enrichment(
 
     let repo = MarketplaceRepository::new(state.pool.clone());
 
+    // NAN-4959: a feed nano's signed platform feed bundle provides cannot be
+    // enabled as a direct fetcher (disabling stays allowed).
+    if request.enabled == Some(true)
+        && nanosiem_core::marketplace::platform_feed::bundle_feed_for_slug(&slug).is_some()
+    {
+        return Err(nanosiem_core::MarketplaceError::ProvidedByPlatformFeed(slug).into());
+    }
+
     // Handle credential update if provided
     let creds_updated = request.credentials.is_some();
     if let Some(ref credentials) = request.credentials {
-        let install_service = MarketplaceInstallService::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
+        let install_service = MarketplaceInstallService::new(state.pool.clone());
         install_service
             .update_credentials(&slug, credentials)
             .await?;
@@ -393,7 +397,7 @@ pub async fn update_enrichment(
 ) -> Result<Json<MarketplaceCatalogEntry>, ApiError> {
     ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
-    let service = MarketplaceInstallService::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
+    let service = MarketplaceInstallService::new(state.pool.clone());
     let entry = service.update(&slug).await?;
 
     state.emit_audit(
@@ -420,6 +424,7 @@ pub async fn update_enrichment(
     responses(
         (status = 200, description = "Sync triggered", body = MessageResponse),
         (status = 400, description = "Not installed"),
+        (status = 409, description = "Provided by nano's signed platform feed bundle (IPinfo Lite, ThreatFox, Tor): refresh under Platform feeds (NAN-4959)"),
     ),
     security(("api_key" = []))
 )]
@@ -439,6 +444,12 @@ pub async fn sync_enrichment(
     let repo = MarketplaceRepository::new(state.pool.clone());
     let entry = repo.get_catalog_entry(&slug).await?;
 
+    // NAN-4959: IPinfo Lite, ThreatFox and Tor refresh only from nano's signed
+    // platform feed bundle (Check now / Import file), never a direct pull.
+    if nanosiem_core::marketplace::platform_feed::bundle_feed_for_slug(&entry.slug).is_some() {
+        return Err(nanosiem_core::MarketplaceError::ProvidedByPlatformFeed(entry.slug).into());
+    }
+
     if !entry.installed {
         return Err(ApiError::BadRequest(
             "Enrichment is not installed".to_string(),
@@ -457,25 +468,14 @@ pub async fn sync_enrichment(
 
     match entry.execution_backend.as_str() {
         "native" => {
-            // Only IPinfo Lite is native — everything else is Deno via the GitHub repo
-            let enrichment = state.enrichment.clone();
-            let slug_owned = slug.clone();
-
-            tokio::spawn(async move {
-                let service = enrichment.read().await;
-                let result = service.sync_ipinfo_lite().await;
-                match result {
-                    Ok(r) if r.success => {
-                        tracing::info!(slug = %slug_owned, records = r.records_loaded, "IPinfo Lite sync completed");
-                    }
-                    Ok(r) => {
-                        tracing::warn!(slug = %slug_owned, error = ?r.error, "IPinfo Lite sync completed with errors");
-                    }
-                    Err(e) => {
-                        tracing::error!(slug = %slug_owned, error = %e, "IPinfo Lite sync failed");
-                    }
-                }
-            });
+            // NAN-4959: the only native data entry is IPinfo Lite, which is
+            // served from nano's signed platform feed bundle. There is no
+            // native download to trigger; the bundle has its own check / import.
+            return Err(ApiError::BadRequest(
+                "IPinfo Lite is provided by nano's signed platform feed bundle; refresh it with \
+                 Check now (POST /api/enrichment/platform-feeds/check) or import a bundle file"
+                    .to_string(),
+            ));
         }
         "deno" => {
             // Deno-backed marketplace entries delegate to
@@ -526,7 +526,7 @@ pub async fn sync_enrichment(
         "identity" => {
             // Same fire-and-forget treatment as the deno path (NAN-1113):
             // don't block the HTTP response on the provider sync.
-            let install_service = MarketplaceInstallService::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
+            let install_service = MarketplaceInstallService::new(state.pool.clone());
             let slug_spawn = slug.clone();
             tokio::spawn(async move {
                 if let Err(e) = install_service.trigger_sync(&slug_spawn).await {
@@ -630,7 +630,6 @@ pub async fn export_enrichment(
     // `config` — leaving them nested would produce a manifest that re-imports
     // as an enrichment with no streams.
     let collector = CollectorManifestFields::take_from(&entry.config.0);
-    let connector_spec = collector.connector_spec.clone();
 
     // Build manifest struct
     let manifest = MarketplaceManifest {
@@ -670,16 +669,6 @@ pub async fn export_enrichment(
         config_fields: collector.config_fields,
         allowed_domain_suffixes: collector.allowed_domain_suffixes,
         streams: collector.streams,
-        runtime: collector.runtime,
-        connector_spec: connector_spec
-            .as_ref()
-            .map(|_| CollectorManifestFields::CONNECTOR_SPEC_FILE.to_string()),
-        // Platform-only; the export carries the portable spec.
-        hosted_connector_spec: None,
-        // NAN-3503: platform marketplace layout; component specs are stored
-        // as text and are not exported.
-        categories: Vec::new(),
-        components: Vec::new(),
     };
 
     let manifest_yaml = serde_yaml::to_string(&manifest)
@@ -698,7 +687,6 @@ pub async fn export_enrichment(
         directory,
         manifest_yaml,
         code,
-        connector_spec,
     }))
 }
 
@@ -723,7 +711,7 @@ pub async fn list_repos(
     ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let repo = MarketplaceRepository::new(state.pool.clone());
-    let repos = repo.list_repos().await?;
+    let repos = repo.list_repos().await?.into_iter().map(redact_repo).collect();
     Ok(Json(ListReposResponse { repos }))
 }
 
@@ -735,6 +723,7 @@ pub async fn list_repos(
     request_body = CreateMarketplaceRepo,
     responses(
         (status = 201, description = "Repo created", body = EnrichmentMarketplaceRepo),
+        (status = 422, description = "Not a first-party nano catalog URL (https://github.com/nano-rs/<repo>, no credentials); third-party repositories are not supported (NAN-4946)"),
         (status = 409, description = "Already exists"),
     ),
     security(("api_key" = []))
@@ -774,7 +763,14 @@ pub async fn create_repo(
             .build(),
     );
 
-    Ok(Json(created))
+    Ok(Json(redact_repo(created)))
+}
+
+/// NAN-4946: never return credentials embedded in a stored repository URL
+/// (rows created before first-party enforcement could carry userinfo).
+fn redact_repo(mut repo: EnrichmentMarketplaceRepo) -> EnrichmentMarketplaceRepo {
+    repo.url = nanosiem_core::marketplace::redact_repo_url(&repo.url);
+    repo
 }
 
 /// Update a repo
@@ -811,7 +807,7 @@ pub async fn update_repo(
             .build(),
     );
 
-    Ok(Json(updated))
+    Ok(Json(redact_repo(updated)))
 }
 
 /// Delete a repo
@@ -848,9 +844,8 @@ pub async fn delete_repo(
     params(("id" = String, Path, description = "Repository ID")),
     responses(
         (status = 200, description = "Sync started", body = MessageResponse),
-        (status = 202, description = "Shared platform repository sync queued", body = SyncNowAccepted),
-        (status = 429, description = "Shared platform sync request rate limit", headers(("Retry-After" = i64, description = "Seconds until another request is allowed"))),
         (status = 409, description = "Sync already in progress"),
+        (status = 422, description = "Not a first-party nano catalog (NAN-4946)"),
     ),
     security(("api_key" = []))
 )]
@@ -984,7 +979,6 @@ trait MarketplacePreviewRuntime: Send + Sync {
 
     fn decrypt_credentials(
         &self,
-        catalog_id: uuid::Uuid,
         ciphertext: &[u8],
         nonce: &str,
     ) -> Result<std::collections::HashMap<String, String>, String>;
@@ -1019,12 +1013,10 @@ impl MarketplacePreviewRuntime for AppState {
 
     fn decrypt_credentials(
         &self,
-        catalog_id: uuid::Uuid,
         ciphertext: &[u8],
         nonce: &str,
     ) -> Result<std::collections::HashMap<String, String>, String> {
         self.encryption_service
-            .with_context(nanosiem_core::crypto::CredentialScope::Deployment, "marketplace.credentials", catalog_id)
             .decrypt_credentials_bytea(ciphertext, nonce)
             .map_err(|error| error.to_string())
     }
@@ -1246,7 +1238,7 @@ async fn run_marketplace_preview<R: MarketplacePreviewRuntime>(
         entry.credentials_encrypted.as_deref(),
         entry.credentials_nonce.as_deref(),
     ) {
-        (Some(ciphertext), Some(nonce)) => match runtime.decrypt_credentials(entry.id, ciphertext, nonce) {
+        (Some(ciphertext), Some(nonce)) => match runtime.decrypt_credentials(ciphertext, nonce) {
             Ok(credentials) => credentials,
             Err(error) => {
                 tracing::warn!(
@@ -1471,7 +1463,6 @@ mod preview_tests {
 
         fn decrypt_credentials(
             &self,
-            _catalog_id: uuid::Uuid,
             _ciphertext: &[u8],
             _nonce: &str,
         ) -> Result<HashMap<String, String>, String> {
@@ -1635,7 +1626,7 @@ mod preview_tests {
 // =============================================================================
 
 /// Get marketplace coverage by artifact type. Backed by a 6h
-/// Dragonfly-shared cache — `computed_at` in the response is the
+/// Dragonfly-shared cache (NAN-609) — `computed_at` in the response is the
 /// time the SQL was last *actually* run, not the time this request was
 /// served. Use `POST /api/marketplace/coverage/refresh` to force a
 /// recompute from the UI.
@@ -1704,7 +1695,7 @@ fn build_coverage_service(
         state.pool.clone(),
         state.dual_pool.clickhouse().clone(),
         (*state.marketplace_coverage_cache).clone(),
-        state.schema_profile(),
+        state.config.schema_profile(),
         denied_sources,
     )
 }
@@ -1833,7 +1824,6 @@ mod coverage_authz_tests {
     components(schemas(
         ListCatalogResponse,
         ListReposResponse,
-        SyncNowAccepted,
         BrowseRepoResponse,
         MessageResponse,
         ExportResponse,

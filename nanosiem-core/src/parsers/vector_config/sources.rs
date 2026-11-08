@@ -30,11 +30,7 @@ impl VectorConfigManager {
                 let router_input = format!("source_router.{}", safe_name);
                 (String::new(), router_input)
             }
-            st if matches!(
-                super::router::transport_of(st),
-                super::router::Transport::Fetch
-            ) =>
-            {
+            st if matches!(super::router::transport_of(st), super::router::Transport::Fetch) => {
                 // NAN-928: fetch-source parser bound to a deployed source
                 // configuration via the "DISPATCH FROM" picker. Mirror the
                 // HEC shape — `filter` on the source-config's routing
@@ -63,11 +59,7 @@ impl VectorConfigManager {
                 );
                 (config, filter_name)
             }
-            st if matches!(
-                super::router::transport_of(st),
-                super::router::Transport::SplunkHec
-            ) =>
-            {
+            st if matches!(super::router::transport_of(st), super::router::Transport::SplunkHec) => {
                 // NAN-921: HEC events arrive on the OOTB splunk_hec_ingest
                 // source (`:8088`) declared in `config/vector/02-hec-source.toml`.
                 // Per-parser HEC source declarations collided on the port and
@@ -81,11 +73,7 @@ impl VectorConfigManager {
                     self.generate_splunk_hec_filter(&filter_name, match_values, &parser.name);
                 (config, filter_name)
             }
-            st if matches!(
-                super::router::transport_of(st),
-                super::router::Transport::Otlp
-            ) =>
-            {
+            st if matches!(super::router::transport_of(st), super::router::Transport::Otlp) => {
                 // NAN-1528: OTLP events arrive on the OOTB `otlp_ingest` source
                 // (gRPC :4317 / HTTP :4318) declared in
                 // `config/vector/03-otlp-source.toml`. Like Splunk HEC (:8088),
@@ -153,9 +141,20 @@ impl VectorConfigManager {
         match_values: &[String],
         parser_name: &str,
     ) -> String {
+        // NAN-4902: the filter always names `splunk_hec_route`, so the route
+        // must exist before any HEC parser is rendered (fresh install: the HEC
+        // source config is disabled and nothing has written it yet).
+        let configs_dir = self.config_dir.join("sources").join("configs");
+        if let Err(err) = super::hec_route::ensure_hec_route(&configs_dir) {
+            tracing::error!(
+                error = %err,
+                dir = %configs_dir.display(),
+                "could not write the splunk_hec_route passthrough; HEC parsers will not load"
+            );
+        }
         self.generate_dispatch_route_filter(
             filter_name,
-            "splunk_hec_route",
+            super::hec_route::SPLUNK_HEC_ROUTE,
             match_values,
             parser_name,
         )
@@ -175,12 +174,16 @@ impl VectorConfigManager {
         parser_name: &str,
     ) -> String {
         let condition = build_hec_filter_condition(match_values, parser_name);
+        // NAN-4953 audit: a TOML basic string, so a `'` in a tenant match value
+        // cannot end the literal (it used to be `condition = '...'`).
         format!(
             "[transforms.{}]\n\
              type = \"filter\"\n\
              inputs = [\"{}\"]\n\
-             condition = '{}'\n",
-            filter_name, route_name, condition,
+             condition = {}\n",
+            filter_name,
+            route_name,
+            super::parser_config::toml_basic_string(&condition),
         )
     }
 }
@@ -459,10 +462,12 @@ mod dispatch_source_tests {
     fn dispatch_filter_condition_matches_source_type_against_match_values() {
         let parser = make_parser("kafka", Some("kafka_route_x"));
         let (config, _input) = run_generator(&parser);
-        assert!(
-            config.contains(
-                r#"includes(["apache_access", "apache"], to_string(.source_type) ?? "")"#
-            ),
+        // NAN-4953 audit: emitted as a TOML basic string; read it back.
+        let doc: toml::Table = toml::from_str(&config).expect("valid TOML");
+        let condition = doc["transforms"]["apache_http_server_filter"]["condition"].as_str().unwrap();
+        assert_eq!(
+            condition,
+            r#"includes(["apache_access", "apache"], to_string(.source_type) ?? "")"#,
             "expected source_type filter condition, got:\n{config}",
         );
     }

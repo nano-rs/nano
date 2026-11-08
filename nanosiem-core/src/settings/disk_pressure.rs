@@ -209,8 +209,24 @@ pub enum DiskPressureError {
 // ---------------------------------------------------------------------------
 
 /// Tables that use daily partitions and are candidates for pressure-based drops.
+///
+/// NAN-4982: `ocsf_logs` is the main event store on the OCSF profile (the v2
+/// default) and `ocsf_logs_legacy_v179` is the OCSF 1.8 store that migration
+/// 180 renamed aside on upgraded installs. Both partition by
+/// `toYYYYMMDD(timestamp)` exactly like `logs`. Without them an OCSF box under
+/// disk pressure reclaimed space only from the small side tables.
+///
+/// Only LOCAL MergeTree tables are listed, never a `*_distributed` wrapper: a
+/// wrapper holds no parts (it never appears in `system.parts`), and the drop
+/// runs `ON CLUSTER` against each shard's local table. A table that does not
+/// exist on this deployment (`ocsf_logs` on a UDM-only box, the legacy table on
+/// a fresh install) has no active parts, so [`DiskPressureService`] never
+/// issues a DROP against it: drops target only the tables that hold the
+/// partition being evicted.
 const DAILY_TABLES: &[&str] = &[
     "logs",
+    "ocsf_logs",
+    "ocsf_logs_legacy_v179",
     "signals",
     "ingestion_errors",
     "identity_observations",
@@ -219,6 +235,11 @@ const DAILY_TABLES: &[&str] = &[
 
 /// Tables where warm deletion TTL should be applied when cold storage is enabled.
 /// These are the core data tables that get tiered to S3/GCS.
+///
+/// NAN-4982 deliberately leaves `ocsf_logs` out: `MODIFY TTL` replaces the
+/// store's own `TTL ... DELETE WHERE timestamp > '2000-01-01'` and, with
+/// `materialize_ttl_after_modify`, rewrites every part of the main event store
+/// at boot. Warm retention on the OCSF store needs its own change.
 const WARM_TTL_TABLES: &[(&str, &str)] = &[
     ("logs", "timestamp"),
     ("signals", "timestamp"),
@@ -227,6 +248,171 @@ const WARM_TTL_TABLES: &[(&str, &str)] = &[
 
 /// Maximum partition-dates to drop in a single check cycle.
 const MAX_DROPS_PER_CYCLE: usize = 5;
+
+/// One `system.parts` snapshot of the daily tables, taken immediately before
+/// a drop: the oldest partition strictly before `today` and the newest
+/// partition of any date (future-dated ones included).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartitionSnapshot {
+    pub oldest_before_today: Option<String>,
+    pub newest: Option<String>,
+}
+
+/// The partition the evictor may drop given ONE snapshot, or `None`.
+///
+/// NAN-4982 (review P1s): the candidate must be strictly before the current
+/// UTC partition AND strictly before the newest partition in the same
+/// snapshot. Today's partition, and any future-dated one (a skewed source, or
+/// one event stamped 2099), is never a candidate and never counts as "older"
+/// data: a future partition cannot make today's evictable, and a partition that
+/// TTL or an operator removed between two reads cannot turn the last remaining
+/// partition into the candidate, because there is only one read.
+pub fn evictable_partition(snapshot: &PartitionSnapshot, today: &str) -> Option<String> {
+    let candidate = snapshot.oldest_before_today.as_deref()?;
+    let newest = snapshot.newest.as_deref()?;
+    let is_date = |d: &str| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit());
+    (is_date(candidate) && is_date(today) && candidate < today && candidate < newest).then(|| candidate.to_string())
+}
+
+/// The current UTC partition value (`toYYYYMMDD` of now, UTC).
+pub fn utc_today_partition() -> String {
+    chrono::Utc::now().format("%Y%m%d").to_string()
+}
+
+/// The partition operations the FIFO drop loop needs (a seam so the
+/// fencing of the loop is testable without ClickHouse).
+#[async_trait::async_trait]
+pub trait PartitionDropper: Send + Sync {
+    /// Snapshot of the daily tables' partitions relative to `today`.
+    async fn partition_snapshot(&self, today: &str) -> Result<PartitionSnapshot, DiskPressureError>;
+    /// Current disk usage, 0.0..=1.0.
+    async fn usage(&self) -> Result<f64, DiskPressureError>;
+    /// Drop partition `date` from every daily table that holds it; returns the
+    /// tables it was dropped from (empty when no table held it any more).
+    async fn drop_partition(&self, date: &str) -> Result<Vec<String>, DiskPressureError>;
+    /// Called after each successful drop (audit, notification, counters) with
+    /// the tables the partition was dropped from.
+    async fn dropped(&self, _date: &str, _tables: &[String]) {}
+}
+
+/// How a FIFO drop pass ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropLoopOutcome {
+    /// Usage is at or below the low watermark.
+    Relieved,
+    /// Only today's (or future-dated) partitions are left: never dropped.
+    Floor,
+    NothingToDrop,
+    /// This instance no longer holds the jobs lease epoch.
+    Superseded,
+    Failed,
+    MaxDrops,
+}
+
+/// What one guarded step did.
+enum Step {
+    Dropped(String, Vec<String>),
+    Vanished(String),
+    Floor,
+    Nothing,
+}
+
+/// Drop oldest partitions until usage reaches `low_watermark`.
+///
+/// NAN-4933 (review P1): before EVERY drop the loop re-measures pressure and
+/// runs the drop under [`crate::leader::LeaderFence::run_guarded`]: a leader
+/// that was paused mid-loop and superseded is refused before it drops another
+/// partition, and a takeover cannot complete while a drop is in flight.
+///
+/// NAN-4982: the candidate is chosen from ONE partition snapshot taken inside
+/// that guarded operation, and only [`evictable_partition`] may name it, so
+/// the current UTC partition (`today`) and anything after it are never dropped.
+pub async fn fifo_drop_loop(
+    dropper: &dyn PartitionDropper,
+    fence: &crate::leader::LeaderFence,
+    pool: &PgPool,
+    low_watermark: f64,
+    max_drops: usize,
+    settle: std::time::Duration,
+    today: &str,
+) -> DropLoopOutcome {
+    for i in 0..max_drops {
+        match dropper.usage().await {
+            Ok(usage) if usage <= low_watermark => return DropLoopOutcome::Relieved,
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Failed to recheck disk usage: {}", e);
+                return DropLoopOutcome::Failed;
+            }
+        }
+        let step = fence
+            .run_guarded(pool, || async {
+                let snapshot = dropper.partition_snapshot(today).await?;
+                let Some(date) = evictable_partition(&snapshot, today) else {
+                    return Ok::<_, DiskPressureError>(if snapshot.newest.is_some() { Step::Floor } else { Step::Nothing });
+                };
+                info!(partition_date = %date, iteration = i + 1, "Dropping partition");
+                let tables = dropper.drop_partition(&date).await?;
+                Ok(if tables.is_empty() {
+                    Step::Vanished(date)
+                } else {
+                    Step::Dropped(date, tables)
+                })
+            })
+            .await;
+        match step {
+            Err(fence_error) => {
+                warn!(error = %fence_error, "Partition drop refused by the leader fence");
+                return DropLoopOutcome::Superseded;
+            }
+            Ok(Err(e)) => {
+                error!("Failed to drop partition: {}", e);
+                return DropLoopOutcome::Failed;
+            }
+            Ok(Ok(Step::Floor)) => {
+                warn!(today = %today, "Only today's (or future-dated) partitions remain — cannot drop further");
+                return DropLoopOutcome::Floor;
+            }
+            Ok(Ok(Step::Nothing)) => {
+                info!("No partitions to drop");
+                return DropLoopOutcome::NothingToDrop;
+            }
+            Ok(Ok(Step::Vanished(date))) => {
+                info!(
+                    partition_date = %date,
+                    "Partition candidate vanished before table discovery — skipping"
+                );
+                continue;
+            }
+            Ok(Ok(Step::Dropped(date, tables))) => dropper.dropped(&date, &tables).await,
+        }
+        tokio::time::sleep(settle).await;
+    }
+    DropLoopOutcome::MaxDrops
+}
+
+#[async_trait::async_trait]
+impl PartitionDropper for DiskPressureService {
+    async fn partition_snapshot(&self, today: &str) -> Result<PartitionSnapshot, DiskPressureError> {
+        self.read_partition_snapshot(today).await
+    }
+    async fn usage(&self) -> Result<f64, DiskPressureError> {
+        let (total, free) = self.get_disk_usage().await?;
+        Ok(if total > 0 {
+            total.saturating_sub(free) as f64 / total as f64
+        } else {
+            0.0
+        })
+    }
+    async fn drop_partition(&self, date: &str) -> Result<Vec<String>, DiskPressureError> {
+        self.drop_partitions_for_date(date).await
+    }
+    async fn dropped(&self, date: &str, tables: &[String]) {
+        self.partitions_dropped.fetch_add(1, Ordering::Relaxed);
+        self.emit_drop_audit(date, tables).await;
+        self.notify_partition_dropped(date, tables).await;
+    }
+}
 
 /// Disk pressure management service.
 ///
@@ -251,6 +437,11 @@ pub struct DiskPressureService {
     ingestion_paused: Arc<AtomicBool>,
     /// Running counter of dropped partition-dates
     partitions_dropped: std::sync::atomic::AtomicU64,
+    /// NAN-4933: the jobs lease epoch, set by `start`. Every partition drop
+    /// runs under its strict guard.
+    fence: std::sync::OnceLock<crate::leader::LeaderFence>,
+    /// The admin client's database, read once from the server.
+    database: std::sync::OnceLock<String>,
 }
 
 impl DiskPressureService {
@@ -274,6 +465,8 @@ impl DiskPressureService {
             config,
             ingestion_paused,
             partitions_dropped: std::sync::atomic::AtomicU64::new(0),
+            fence: std::sync::OnceLock::new(),
+            database: std::sync::OnceLock::new(),
         }
     }
 
@@ -325,7 +518,7 @@ impl DiskPressureService {
     /// 1. Postgres `system_settings.tiering_enabled` — set by the in-app tiering
     ///    workflow when a user configures S3/R2 from the UI.
     /// 2. ClickHouse `system.storage_policies` / `system.disks` — set when the
-    ///    platform layer (e.g. The platform provisioning) bootstraps a multi-volume
+    ///    platform layer (e.g. nano-main provisioning) bootstraps a multi-volume
     ///    policy without going through the app. The Postgres flag may never be
     ///    set in that case, but the storage layer is the authoritative truth.
     ///
@@ -349,56 +542,80 @@ impl DiskPressureService {
 
     /// Detect tiering from the ClickHouse storage layer directly.
     ///
-    /// True if any storage policy has more than one volume (a hot/cold split)
-    /// OR any disk is non-Local (S3, Wasabi, GCS, R2 — `ObjectStorage` types).
-    /// On query error, returns false and logs — we'd rather drop partitions
-    /// at high watermark than wedge the daemon if ClickHouse is flaky.
+    /// True if a storage policy that a daily table actually USES has more than
+    /// one volume (a hot/cold split) or a non-Local disk (S3, Wasabi, GCS, R2 —
+    /// `ObjectStorage` types). On query error, returns false and logs — we'd
+    /// rather drop partitions at high watermark than wedge the daemon if
+    /// ClickHouse is flaky.
+    ///
+    /// NAN-4982: this used to answer true when ANY policy in the server config
+    /// had a second volume. The Compose deployments mount
+    /// `clickhouse/config.d/storage.xml`, which declares a `tiered` policy
+    /// (two Local disks on the same filesystem) that no table uses, so every
+    /// self-hosted Compose box counted as tiered and the evictor never dropped
+    /// a partition from any table. Only a policy the event stores are on can
+    /// move their parts off the local disk.
     async fn clickhouse_tiering_configured(&self) -> bool {
-        // NAN-1728 H1: tiering may be configured on any node — scan every node
-        // (`clusterAllReplicas`) so detection isn't blind to shards the LB'd
-        // connection didn't land on. Plain `system.*` on single-node.
-        let storage_policies_src = all_replicas_system("storage_policies");
-        let disks_src = all_replicas_system("disks");
-        match self
-            .ch_admin
-            .query(&format!(
-                "SELECT count() FROM {storage_policies_src} WHERE volume_priority > 1"
-            ))
-            .fetch_one::<u64>()
-            .await
-        {
-            Ok(n) if n > 0 => {
-                info!("Tiering detected via ClickHouse multi-volume storage policy");
-                return true;
+        match self.tiering_rows().await {
+            Ok((used, policies, remote_disks)) => {
+                let tiered = tiering_applies(&used, &policies, &remote_disks);
+                if tiered {
+                    info!(
+                        policies = ?used,
+                        "Tiering detected: a daily table uses a multi-volume or object-storage policy"
+                    );
+                }
+                tiered
             }
-            Ok(_) => {}
-            Err(e) => warn!(
-                error = %e,
-                "Failed to query system.storage_policies for tiering detection",
-            ),
-        }
-
-        match self
-            .ch_admin
-            .query(&format!(
-                "SELECT count() FROM {disks_src} WHERE type != 'Local'"
-            ))
-            .fetch_one::<u64>()
-            .await
-        {
-            Ok(n) if n > 0 => {
-                info!("Tiering detected via ClickHouse non-Local disk (object storage)");
-                true
-            }
-            Ok(_) => false,
             Err(e) => {
-                warn!(
-                    error = %e,
-                    "Failed to query system.disks for tiering detection",
-                );
+                warn!(error = %e, "Failed to read storage policies for tiering detection");
                 false
             }
         }
+    }
+
+    /// (policies used by daily tables, every policy volume row, non-Local
+    /// disks), read from every node (`clusterAllReplicas`) so detection is not
+    /// blind to the shards the LB'd connection didn't land on (NAN-1728 H1).
+    async fn tiering_rows(
+        &self,
+    ) -> Result<(Vec<String>, Vec<(String, u64, Vec<String>)>, Vec<String>), DiskPressureError> {
+        let db = self.database().await?;
+        let ch = |e: clickhouse::error::Error| DiskPressureError::ClickHouse(e.to_string());
+        let used: Vec<String> = self
+            .ch_admin
+            .query(&used_policies_sql(&all_replicas_system("tables"), &db))
+            .fetch_all::<String>()
+            .await
+            .map_err(ch)?;
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct PolicyRow {
+            policy_name: String,
+            volume_priority: u64,
+            disks: Vec<String>,
+        }
+        let policies = self
+            .ch_admin
+            .query(&format!(
+                "SELECT DISTINCT policy_name, toUInt64(volume_priority) AS volume_priority, disks FROM {}",
+                all_replicas_system("storage_policies")
+            ))
+            .fetch_all::<PolicyRow>()
+            .await
+            .map_err(ch)?
+            .into_iter()
+            .map(|r| (r.policy_name, r.volume_priority, r.disks))
+            .collect();
+        let remote_disks: Vec<String> = self
+            .ch_admin
+            .query(&format!(
+                "SELECT DISTINCT name FROM {} WHERE type != 'Local'",
+                all_replicas_system("disks")
+            ))
+            .fetch_all::<String>()
+            .await
+            .map_err(ch)?;
+        Ok((used, policies, remote_disks))
     }
 
     // -- Queries -----------------------------------------------------------
@@ -473,114 +690,90 @@ impl DiskPressureService {
         })
     }
 
-    /// Find the oldest partition date across all daily tables.
-    async fn find_oldest_partition_date(&self) -> Result<Option<String>, DiskPressureError> {
-        // system.parts stores partition values; for toYYYYMMDD partitions these are date strings like "20250101"
-        let tables_list = DAILY_TABLES
-            .iter()
-            .map(|t| format!("'{}'", t))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        // NAN-1728 H1: oldest partition = MIN across all shards. `min(partition)`
-        // is replica-invariant, so scan every node via `clusterAllReplicas`.
-        // Plain `system.parts` on single-node (byte-identical).
-        let parts_src = all_replicas_system("parts");
-        let query = format!(
-            "SELECT min(partition) AS oldest FROM {} WHERE table IN ({}) AND active = 1 AND partition != ''",
-            parts_src, tables_list
-        );
-
+    /// One snapshot of the daily tables' partitions: the oldest strictly
+    /// before `today` and the newest overall. NAN-1728 H1: `min`/`max` of the
+    /// partition value are replica-invariant, so scan every node via
+    /// `clusterAllReplicas`; plain `system.parts` on single-node.
+    async fn read_partition_snapshot(&self, today: &str) -> Result<PartitionSnapshot, DiskPressureError> {
+        let query = partition_snapshot_sql(&all_replicas_system("parts"), &self.database().await?, today)?;
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
             oldest: String,
+            newest: String,
         }
-
-        let row = self
-            .ch_admin
-            .query(&query)
-            .fetch_optional::<Row>()
-            .await
-            .map_err(|e| DiskPressureError::ClickHouse(e.to_string()))?;
-
-        match row {
-            Some(r) if !r.oldest.is_empty() => Ok(Some(r.oldest)),
-            _ => Ok(None),
-        }
-    }
-
-    /// Count distinct partition dates across daily tables.
-    async fn count_daily_partitions(&self) -> Result<u64, DiskPressureError> {
-        let tables_list = DAILY_TABLES
-            .iter()
-            .map(|t| format!("'{}'", t))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        // NAN-1728 H1: distinct partition dates across all shards.
-        // `count(DISTINCT partition)` dedupes the replica rows, so scanning every
-        // node via `clusterAllReplicas` yields the true cluster-wide date count.
-        // Plain `system.parts` on single-node (byte-identical).
-        let parts_src = all_replicas_system("parts");
-        let query = format!(
-            "SELECT count(DISTINCT partition) AS cnt FROM {} WHERE table IN ({}) AND active = 1 AND partition != ''",
-            parts_src, tables_list
-        );
-
-        #[derive(clickhouse::Row, serde::Deserialize)]
-        struct Row {
-            cnt: u64,
-        }
-
         let row = self
             .ch_admin
             .query(&query)
             .fetch_one::<Row>()
             .await
             .map_err(|e| DiskPressureError::ClickHouse(e.to_string()))?;
-
-        Ok(row.cnt)
+        let some = |v: String| (!v.is_empty()).then_some(v);
+        Ok(PartitionSnapshot { oldest_before_today: some(row.oldest), newest: some(row.newest) })
     }
 
-    /// Drop a specific partition date from all daily tables.
-    async fn drop_partitions_for_date(&self, date: &str) -> Result<(), DiskPressureError> {
+    /// The admin client's database, read once (NAN-4982: scopes the
+    /// `system.parts` reads to the database the unqualified DROPs act on).
+    async fn database(&self) -> Result<String, DiskPressureError> {
+        if let Some(db) = self.database.get() {
+            return Ok(db.clone());
+        }
+        let db = self
+            .ch_admin
+            .query("SELECT currentDatabase()")
+            .fetch_one::<String>()
+            .await
+            .map_err(|e| DiskPressureError::ClickHouse(e.to_string()))?;
+        Ok(self.database.get_or_init(|| db).clone())
+    }
+
+    /// Daily tables holding an active part of partition `date` on any node.
+    async fn tables_with_partition(&self, date: &str) -> Result<Vec<String>, DiskPressureError> {
+        self.ch_admin
+            .query(&tables_with_partition_sql(&all_replicas_system("parts"), &self.database().await?))
+            .bind(date)
+            .fetch_all::<String>()
+            .await
+            .map_err(|e| DiskPressureError::ClickHouse(e.to_string()))
+    }
+
+    /// Drop a specific partition date from every daily table that holds it.
+    ///
+    /// NAN-4982: only the tables that actually hold the partition are altered
+    /// (the OCSF store on an OCSF box, `logs` on a UDM box, the 1.8 legacy
+    /// table while its rows age out), so a table missing on this deployment is
+    /// never named in a DROP. Returns the tables the partition was dropped from.
+    async fn drop_partitions_for_date(&self, date: &str) -> Result<Vec<String>, DiskPressureError> {
         // NAN-1728 H1: DROP PARTITION runs on the LOCAL MergeTree; `ON CLUSTER`
         // fans it out to every shard (empty clause → byte-identical on
         // single-node) so the emergency valve relieves the whole cluster, not
         // just the node the LB'd connection landed on.
+        // NAN-4982: never today's or a future partition, whatever the caller.
+        let today = utc_today_partition();
+        if date >= today.as_str() {
+            return Err(DiskPressureError::ClickHouse(format!(
+                "refusing to drop partition {date}: not before today ({today})"
+            )));
+        }
         let on_cluster = on_cluster_clause();
-        for table in DAILY_TABLES {
-            let stmt = format!(
-                "ALTER TABLE {}{} DROP PARTITION '{}'",
-                table, on_cluster, date
-            );
+        let tables = self.tables_with_partition(date).await?;
+        for table in &tables {
+            let stmt = drop_partition_sql(table, &on_cluster, date)?;
             self.ch_admin
                 .query(&stmt)
                 .execute()
                 .await
                 .map_err(|e| DiskPressureError::ClickHouse(format!("{}: {}", table, e)))?;
         }
-        Ok(())
+        Ok(tables)
     }
 
     /// Estimate how many days of data can still fit on disk, based on average partition size.
     async fn estimate_retention_days(&self, free_bytes: u64) -> Result<f64, DiskPressureError> {
-        let tables_list = DAILY_TABLES
-            .iter()
-            .map(|t| format!("'{}'", t))
-            .collect::<Vec<_>>()
-            .join(",");
-
         // NAN-1728 H1: average partition size across the whole cluster. Dedupe
         // replicas to one per shard (`cluster(...)`) so `sum(bytes_on_disk)` is
         // not doubled by the replica; `countDistinct(partition)` is date-count.
-        // Plain `system.parts` on single-node (byte-identical).
-        let parts_src = parts_source_dedup();
-        let query = format!(
-            "SELECT sum(bytes_on_disk) / countDistinct(partition) AS avg_partition_bytes \
-             FROM {} WHERE table IN ({}) AND active = 1 AND partition != ''",
-            parts_src, tables_list
-        );
+        // Plain `system.parts` on single-node.
+        let query = avg_partition_bytes_sql(&parts_source_dedup(), &self.database().await?);
 
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct Row {
@@ -740,76 +933,37 @@ impl DiskPressureService {
         }
 
         // Tiering not active — single-volume deployment, FIFO retention.
-        for i in 0..MAX_DROPS_PER_CYCLE {
-            // Safety: never drop below 1 partition (today's data)
-            match self.count_daily_partitions().await {
-                Ok(count) if count <= 1 => {
-                    warn!("Only 1 partition remaining — cannot drop further");
-                    return;
-                }
-                Err(e) => {
-                    warn!("Failed to count partitions: {}", e);
-                    return;
-                }
-                _ => {}
+        let fence = self
+            .fence
+            .get()
+            .cloned()
+            .unwrap_or_else(crate::leader::LeaderFence::disabled);
+        let outcome = fifo_drop_loop(
+            self,
+            &fence,
+            &self.pg_pool,
+            self.config.low_watermark,
+            MAX_DROPS_PER_CYCLE,
+            std::time::Duration::from_secs(2),
+            &utc_today_partition(),
+        )
+        .await;
+        match outcome {
+            DropLoopOutcome::Relieved => {
+                info!("Disk usage below low watermark — stopping drops");
+                // Un-pause ingestion now that we have headroom
+                self.ingestion_paused.store(false, Ordering::SeqCst);
+                self.set_ingestion_paused_db(false).await;
             }
-
-            let date = match self.find_oldest_partition_date().await {
-                Ok(Some(d)) => d,
-                Ok(None) => {
-                    info!("No partitions to drop");
-                    return;
-                }
-                Err(e) => {
-                    warn!("Failed to find oldest partition: {}", e);
-                    return;
-                }
-            };
-
-            info!(partition_date = %date, iteration = i + 1, "Dropping partition");
-
-            if let Err(e) = self.drop_partitions_for_date(&date).await {
-                error!(partition_date = %date, "Failed to drop partition: {}", e);
-                return;
+            DropLoopOutcome::MaxDrops => warn!(
+                "Reached max drops per cycle ({}) — will continue next cycle",
+                MAX_DROPS_PER_CYCLE
+            ),
+            DropLoopOutcome::Superseded => {
+                warn!("No longer the jobs leader — stopping partition drops")
             }
-
-            self.partitions_dropped.fetch_add(1, Ordering::Relaxed);
-            self.emit_drop_audit(&date).await;
-            self.notify_partition_dropped(&date).await;
-
-            // Brief pause to let ClickHouse settle
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-            // Recheck — stop if below low watermark
-            match self.get_disk_usage().await {
-                Ok((total, free)) => {
-                    let usage = if total > 0 {
-                        total.saturating_sub(free) as f64 / total as f64
-                    } else {
-                        0.0
-                    };
-                    if usage <= self.config.low_watermark {
-                        info!(
-                            usage_pct = format!("{:.1}%", usage * 100.0),
-                            "Disk usage below low watermark — stopping drops"
-                        );
-                        // Un-pause ingestion now that we have headroom
-                        self.ingestion_paused.store(false, Ordering::SeqCst);
-                        self.set_ingestion_paused_db(false).await;
-                        return;
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to recheck disk usage: {}", e);
-                    return;
-                }
-            }
+            DropLoopOutcome::Floor | DropLoopOutcome::NothingToDrop | DropLoopOutcome::Failed => {}
         }
-
-        warn!(
-            "Reached max drops per cycle ({}) — will continue next cycle",
-            MAX_DROPS_PER_CYCLE
-        );
     }
 
     // -- PostgreSQL persistence (multi-node visibility) --------------------
@@ -828,13 +982,10 @@ impl DiskPressureService {
 
     // -- Audit -------------------------------------------------------------
 
-    async fn emit_drop_audit(&self, date: &str) {
+    async fn emit_drop_audit(&self, date: &str, tables: &[String]) {
         let event = AuditEvent::builder(AuditSource::Storage, "partition_dropped")
             .resource("partition", None, Some(date.to_string()))
-            .details(serde_json::json!({
-                "tables": DAILY_TABLES,
-                "partition_date": date,
-            }))
+            .details(drop_audit_details(date, tables))
             .build();
 
         if let Err(e) = self.audit_emitter.emit(&event).await {
@@ -994,7 +1145,7 @@ impl DiskPressureService {
     }
 
     /// Notify admins that a partition was dropped.
-    async fn notify_partition_dropped(&self, date: &str) {
+    async fn notify_partition_dropped(&self, date: &str, tables: &[String]) {
         let admin_ids = match self.health_repo.get_admin_user_ids().await {
             Ok(ids) => ids,
             Err(e) => {
@@ -1012,15 +1163,12 @@ impl DiskPressureService {
                 notification_type: NotificationType::DiskPressurePartitionDropped,
                 title: format!("Partition {} dropped due to disk pressure", date),
                 message: Some(format!(
-                    "The daily partition for {} was dropped from {} tables to relieve disk pressure.",
+                    "The daily partition for {} was dropped from {} to relieve disk pressure.",
                     date,
-                    DAILY_TABLES.len()
+                    tables.join(", ")
                 )),
                 link: Some("/settings/storage".to_string()),
-                metadata: serde_json::json!({
-                    "partition_date": date,
-                    "tables": DAILY_TABLES,
-                }),
+                metadata: drop_audit_details(date, tables),
             };
 
             if let Err(e) = self.notification_repo.create(&notification).await {
@@ -1032,7 +1180,10 @@ impl DiskPressureService {
     // -- Scheduler ---------------------------------------------------------
 
     /// Start the background scheduler. Returns a `JoinHandle` for shutdown management.
-    pub fn start(self: Arc<Self>) -> JoinHandle<()> {
+    /// `fence` is the jobs lease epoch: each partition drop runs under its
+    /// strict guard (NAN-4933), so a superseded leader never drops another.
+    pub fn start(self: Arc<Self>, fence: crate::leader::LeaderFence) -> JoinHandle<()> {
+        let _ = self.fence.set(fence);
         tokio::spawn(async move {
             info!(
                 interval_secs = self.config.check_interval_secs,
@@ -1062,3 +1213,97 @@ impl DiskPressureService {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// SQL builders (pure; NAN-4982 tests in disk_pressure_tests.rs)
+// ---------------------------------------------------------------------------
+
+/// `table IN (...)` filter over [`DAILY_TABLES`], scoped to `db`, the admin
+/// client's database (the one the unqualified DROPs resolve in), so a
+/// same-named table in another database (a test database, a restored copy) is
+/// never counted or chosen. `db` is a literal read once from the server, not
+/// `currentDatabase()`, so a `clusterAllReplicas(...)` read filters on the same
+/// database on every node.
+fn daily_tables_filter(db: &str) -> String {
+    let list = DAILY_TABLES
+        .iter()
+        .map(|t| format!("'{}'", t))
+        .collect::<Vec<_>>()
+        .join(",");
+    let db = db.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("database = '{db}' AND table IN ({list}) AND active = 1 AND partition != ''")
+}
+
+/// The oldest partition strictly before `today` and the newest of any date,
+/// in one read (empty strings when there is none).
+fn partition_snapshot_sql(parts_src: &str, db: &str, today: &str) -> Result<String, DiskPressureError> {
+    if today.len() != 8 || !today.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(DiskPressureError::ClickHouse(format!("invalid today partition '{today}'")));
+    }
+    Ok(format!(
+        "SELECT minIf(partition, partition < '{today}') AS oldest, max(partition) AS newest FROM {parts_src} WHERE {}",
+        daily_tables_filter(db)
+    ))
+}
+
+fn avg_partition_bytes_sql(parts_src: &str, db: &str) -> String {
+    format!(
+        "SELECT sum(bytes_on_disk) / countDistinct(partition) AS avg_partition_bytes FROM {parts_src} WHERE {}",
+        daily_tables_filter(db)
+    )
+}
+
+/// Tables holding partition `?`; `DISTINCT` collapses replicas and parts.
+fn tables_with_partition_sql(parts_src: &str, db: &str) -> String {
+    format!(
+        "SELECT DISTINCT table FROM {parts_src} WHERE {} AND partition = ? ORDER BY table",
+        daily_tables_filter(db)
+    )
+}
+
+/// `ALTER TABLE <t> [ON CLUSTER] DROP PARTITION '<date>'`. Refuses anything
+/// that is not a daily table or not a `YYYYMMDD` partition value, so a value
+/// read back from `system.parts` can never smuggle SQL into the DDL.
+fn drop_partition_sql(table: &str, on_cluster: &str, date: &str) -> Result<String, DiskPressureError> {
+    if !DAILY_TABLES.contains(&table) {
+        return Err(DiskPressureError::ClickHouse(format!("{table}: not a daily table")));
+    }
+    if date.len() != 8 || !date.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(DiskPressureError::ClickHouse(format!("{table}: invalid partition '{date}'")));
+    }
+    Ok(format!("ALTER TABLE {table}{on_cluster} DROP PARTITION '{date}'"))
+}
+
+/// Storage policies of the daily tables (any node).
+fn used_policies_sql(tables_src: &str, db: &str) -> String {
+    let list = DAILY_TABLES
+        .iter()
+        .map(|t| format!("'{}'", t))
+        .collect::<Vec<_>>()
+        .join(",");
+    let db = db.replace('\\', "\\\\").replace('\'', "\\'");
+    format!(
+        "SELECT DISTINCT storage_policy FROM {tables_src} WHERE database = '{db}' AND name IN ({list}) AND storage_policy != ''"
+    )
+}
+
+/// Whether a policy a daily table uses can move parts off the local disk: it
+/// has a second volume, or one of its disks is not Local.
+fn tiering_applies(used: &[String], policies: &[(String, u64, Vec<String>)], remote_disks: &[String]) -> bool {
+    policies.iter().any(|(name, priority, disks)| {
+        used.contains(name) && (*priority > 1 || disks.iter().any(|d| remote_disks.contains(d)))
+    })
+}
+
+/// Audit / notification details of one evicted partition date.
+fn drop_audit_details(date: &str, tables: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "tables": tables,
+        "partition_date": date,
+        "candidate_tables": DAILY_TABLES,
+    })
+}
+
+#[cfg(test)]
+#[path = "disk_pressure_tests.rs"]
+mod tests;

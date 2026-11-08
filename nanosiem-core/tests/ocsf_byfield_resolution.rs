@@ -121,21 +121,26 @@ fn ocsf_user_maps_to_unified_user_column() {
     );
 }
 
-/// An UNMAPPED UDM field under OCSF degrades to a read from the `event` tail
-/// (graceful empty result), NOT a bare reference that 500s. `status_code`
-/// has no OCSF mapping — the manifest maps `http_status_code` → `http_response.code`.
-/// NAN-1426: the tail read is native subcolumn access (the ''-defaulting
-/// multiIf string form), no longer `JSONExtractString(event, …)` which
-/// re-serialized the whole event per row.
+/// A name that is neither an OCSF attribute, a promoted column nor a UDM alias
+/// degrades to a read from the `unmapped` vendor spill (graceful empty result),
+/// NOT a bare reference that 500s. NAN-1426: the tail read is native subcolumn
+/// access (the ''-defaulting multiIf string form), not `JSONExtractString`.
+/// NAN-4903: `status_code` (the old probe) now maps to `http_response.code` via
+/// the manifest `udm_fields`, so the probe uses a vendor-only name.
 #[test]
 fn ocsf_unmapped_field_degrades_to_json_extract() {
-    let sql = ocsf("* | stats count by status_code");
+    let sql = ocsf("* | stats count by vendor_widget_id");
     assert!(
         sql.contains(
-            "multiIf(isNotNull(unmapped.\"status_code\"), toString(unmapped.\"status_code\"), \
-             toJSONString(unmapped.^\"status_code\") != '{}', toJSONString(unmapped.^\"status_code\"), '')"
+            "multiIf(isNotNull(unmapped.\"vendor_widget_id\"), toString(unmapped.\"vendor_widget_id\"), \
+             toJSONString(unmapped.^\"vendor_widget_id\") != '{}', toJSONString(unmapped.^\"vendor_widget_id\"), '')"
         ) && !sql.contains("JSONExtractString(unmapped"),
-        "OCSF unmapped `status_code` must read the `unmapped` spill tail via subcolumn access (NAN-1443; graceful), not emit a bare 500.\nSQL:\n{sql}"
+        "an unknown name must read the `unmapped` spill tail via subcolumn access (NAN-1443; graceful), not emit a bare 500.\nSQL:\n{sql}"
+    );
+    let sql = ocsf("* | stats count by status_code");
+    assert!(
+        sql.contains("\"http_response.code\""),
+        "UDM `status_code` must resolve to the promoted `http_response.code` (NAN-4903).\nSQL:\n{sql}"
     );
 }
 

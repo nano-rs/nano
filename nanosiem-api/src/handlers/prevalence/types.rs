@@ -2,7 +2,7 @@
 
 //! Request/response types for prevalence endpoints
 
-use nanosiem_core::prevalence::PrevalenceData;
+use nanosiem_core::prevalence::{PrevalenceData, PrevalenceProductState};
 use serde::{Deserialize, Serialize};
 
 /// Query parameters for single artifact prevalence endpoints
@@ -61,10 +61,6 @@ pub struct BulkPrevalenceRequest {
     pub artifacts: Vec<String>,
     /// Time window for prevalence calculation
     pub window: Option<String>,
-    /// Absolute half-open bounds (RFC3339, millisecond precision); paired, at most 30 days.
-    /// Cannot be combined with the legacy preset window.
-    pub start: Option<String>,
-    pub end: Option<String>,
 }
 
 /// Request body for query artifacts endpoint
@@ -88,14 +84,17 @@ pub struct QueryArtifactsResponse {
     /// in one pass" (audit P8) — previously an over-cap result was silently
     /// swallowed into an empty 200.
     #[serde(default)]
-    pub artifacts_truncated: bool,
+    pub artifacts_truncated: bool,    /// Coverage of the lookup window (a miss is unknown unless `ready`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_state: Option<PrevalenceProductState>,
 }
 
 /// Single artifact point for scatter/chart visualization
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ArtifactPoint {
     pub artifact: String,
-    pub host_count: u64,
+    /// `null` = unknown (prevalence does not cover the window yet).
+    pub host_count: Option<u64>,
     pub first_seen: String,
     pub last_seen: String,
     pub total_occurrences: u64,
@@ -130,6 +129,9 @@ pub struct ScatterArtifacts {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PrevalenceResponse {
     pub data: PrevalenceData,
+    /// Coverage of the lookup window (a miss is unknown unless `ready`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_state: Option<PrevalenceProductState>,
 }
 
 /// Response for bulk prevalence lookup
@@ -137,12 +139,9 @@ pub struct PrevalenceResponse {
 pub struct BulkPrevalenceResponse {
     pub data: Vec<PrevalenceData>,
     pub total: usize,
+    /// Coverage of the lookup window (a miss is unknown unless `ready`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub requested_window: Option<nanosiem_core::prevalence::ExactPrevalenceWindow>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_window: Option<nanosiem_core::prevalence::ExactPrevalenceWindow>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
+    pub product_state: Option<PrevalenceProductState>,
 }
 
 /// Response for rare/new artifacts
@@ -156,6 +155,9 @@ pub struct ArtifactListResponse {
     pub limit: i64,
     pub offset: i64,
     pub has_more: bool,
+    /// Coverage and freshness of the snapshot the list reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_state: Option<PrevalenceProductState>,
 }
 
 /// Query parameters for artifact explorer endpoint
@@ -174,12 +176,6 @@ pub struct ArtifactExplorerQuery {
     pub limit: Option<i64>,
     /// Offset for pagination
     pub offset: Option<i64>,
-    /// Last-seen component of the stable lake continuation cursor.
-    pub cursor_last_seen: Option<String>,
-    /// Internal artifact-kind component of the stable continuation cursor.
-    pub cursor_kind: Option<String>,
-    /// Artifact-value component of the stable continuation cursor.
-    pub cursor_artifact: Option<String>,
 }
 
 /// Query parameters for artifact detail endpoint
@@ -205,6 +201,7 @@ mod tests {
             domain_points: vec![],
             rarity_threshold: 3,
             artifacts_truncated: true,
+            product_state: None,
         };
         let json = serde_json::to_value(&truncated).unwrap();
         assert_eq!(json["artifacts_truncated"], serde_json::json!(true));
@@ -216,6 +213,7 @@ mod tests {
             domain_points: vec![],
             rarity_threshold: 3,
             artifacts_truncated: false,
+            product_state: None,
         };
         let json = serde_json::to_value(&empty).unwrap();
         assert_eq!(json["artifacts_truncated"], serde_json::json!(false));

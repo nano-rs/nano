@@ -1,114 +1,65 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // @vitest-environment jsdom
-// SPDX-License-Identifier: AGPL-3.0-or-later
-/** NAN-2597: "credentials that can write S" on Log Source detail and Source Visibility. */
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen, within } from '@testing-library/react';
+/** NAN-4922 (main's NAN-2597 / NAN-2946 tests): the tokens that can write a source, revoke, and inline issuance. */
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import type { TenantSourceWriters } from '@/lib/api/types';
-import { addDataLink, revokeLink } from '@/lib/add-data-sources';
-import { INGEST_CREDENTIALS_PATH } from './LogSourcesTabs';
+
+const calls = vi.hoisted(() => ({ getStatus: vi.fn(), revoke: vi.fn(), endpoint: vi.fn() }));
+vi.mock('@/hooks/use-toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
+vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ hasPermission: () => true }) }));
+vi.mock('@/lib/api', () => ({
+  ApiClientError: class extends Error { status?: number },
+  api: { logSourceConnect: { getStatus: calls.getStatus }, ingestTokens: { revoke: calls.revoke, create: vi.fn() }, getIngestEndpoint: calls.endpoint },
+}));
 import { SourceWritersCard } from './SourceWritersCard';
 
-const mocks = vi.hoisted(() => ({ byLogSource: vi.fn(), bySlug: vi.fn() }));
-vi.mock('@/lib/api', () => ({
-  ApiClientError: class extends Error {},
-  api: { getLogSourceCredentials: mocks.byLogSource, getSourceWriters: mocks.bySlug },
-}));
-
-const base = {
-  protocol: 'hec', state: 'active', cell_name: 'cell', created_at: '2026-09-22T00:00:00Z', revocable: true,
-  source_aliases: {}, request_id: null, requested_by: null, requested_at: null, revealed_at: null,
-};
-const writers: TenantSourceWriters = {
-  source_slugs: ['palo_alto_traffic'],
-  writers: [
-    { ...base, credential_id: 'c-direct', kind: 'source', label: 'fw-direct', source_slugs: ['palo_alto_traffic'], routes: [],
-      writes: ['palo_alto_traffic'], declared_names: [], implicit: false },
-    { ...base, credential_id: 'c-cribl', kind: 'collector', label: 'cribl', source_slugs: ['okta', 'palo_alto_traffic'], routes: [],
-      source_aliases: { 'pan:traffic': 'palo_alto_traffic' }, writes: ['palo_alto_traffic'],
-      declared_names: ['palo_alto_traffic', 'pan:traffic'], implicit: false },
-  ],
-};
-
-function renderCard(props: Parameters<typeof SourceWritersCard>[0]) {
+function renderCard(entry = '/ingestion/log-sources/lsrc_1') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <MemoryRouter>
-        <SourceWritersCard {...props} />
+      <MemoryRouter initialEntries={[entry]}>
+        <SourceWritersCard logSourceId="lsrc_1" canRevoke canIssue />
       </MemoryRouter>
     </QueryClientProvider>,
   );
 }
+beforeEach(() => {
+  calls.getStatus.mockReset().mockResolvedValue({ source_id: 'lsrc_1', route_key: 'acme', state: 'receiving', deployed: true, lifecycle_status: 'active',
+    push_capable: true, events_24h: 10, active_tokens: 1,
+    tokens: [
+      { credential_id: 'c1', name: 'acme-hec', token_prefix: 'nit_aaaa1111', state: 'active', created_at: '', last_used_at: null, request_count: 7, revocable: true },
+      { credential_id: 'c0', name: 'old', token_prefix: 'nit_bbbb', state: 'revoked', created_at: '', revocable: false },
+    ] });
+  calls.revoke.mockReset().mockResolvedValue({ name: 'acme-hec' });
+  calls.endpoint.mockReset().mockResolvedValue({ base_url: 'http://h', hostname: 'h', scheme: 'http', hec_url: 'http://h:8088', hec_event_url: 'http://h:8088/services/collector/event',
+    hec_health_url: '', nano_https_url: 'http://h/ingest', otlp_logs_url: '', otlp_traces_url: '', otlp_metrics_url: '', configured: false });
+});
+afterEach(cleanup);
 
-afterEach(() => {
-  cleanup();
-  mocks.byLogSource.mockReset();
-  mocks.bySlug.mockReset();
+it('lists active writers (never revoked ones or secrets) and revokes after confirmation', async () => {
+  renderCard();
+  const table = await screen.findByTestId('source-writers-table');
+  expect(table.textContent).toContain('acme-hec');
+  expect(table.textContent).toContain('nit_aaaa1111…');
+  expect(table.textContent).not.toContain('old');
+  fireEvent.click(screen.getByRole('button', { name: /Revoke/ }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Revoke token' }));
+  await waitFor(() => expect(calls.revoke).toHaveBeenCalledWith('c1'));
 });
 
-describe('SourceWritersCard (NAN-2597)', () => {
-  it('lists every writer of a log source with how events declare it and a revoke link', async () => {
-    mocks.byLogSource.mockResolvedValue(writers);
-    renderCard({ logSourceId: 'lsrc_1', canRevoke: true });
-    const table = await screen.findByTestId('source-writers-table');
-    expect(mocks.byLogSource).toHaveBeenCalledWith('lsrc_1');
-    const rows = within(table).getAllByRole('row').slice(1);
-    expect(rows[0].textContent).toContain('fixed by the token');
-    expect(rows[1].textContent).toContain('pan:traffic');
-    const link = within(rows[1]).getByRole('link', { name: /revoke/i });
-    expect(link.getAttribute('href')).toBe(revokeLink('c-cribl'));
-    expect(revokeLink('c-cribl')).toBe(`${INGEST_CREDENTIALS_PATH}?revoke=c-cribl`);
-  });
+it('opens inline issuance from ?action=add-credential', async () => {
+  renderCard('/ingestion/log-sources/lsrc_1?action=add-credential');
+  expect(await screen.findByTestId('source-writers-issue-panel')).toBeTruthy();
+  expect(await screen.findByTestId('issue-credential-panel')).toBeTruthy();
+});
 
-  it('shows collectors that write Unattributed through undeclared events, without revoke when not allowed', async () => {
-    mocks.bySlug.mockResolvedValue({
-      source_slugs: ['unknown'],
-      writers: [{ ...writers.writers[1], writes: ['unknown'], declared_names: [], implicit: true }],
-    });
-    renderCard({ sourceSlug: 'unknown', canRevoke: false });
-    const table = await screen.findByTestId('source-writers-table');
-    expect(mocks.bySlug).toHaveBeenCalledWith('unknown');
-    expect(table.textContent).toContain('undeclared events (unknown)');
-    expect(within(table).queryByRole('link')).toBeNull();
-  });
-
-  it('offers Issue credential with the source preselected, including from the empty state (NAN-2946)', async () => {
-    mocks.byLogSource.mockResolvedValue({ source_slugs: ['apache_access'], writers: [] });
-    renderCard({ logSourceId: 'lsrc_1', canRevoke: true, canIssue: true });
-    const header = await screen.findByTestId('source-writers-issue');
-    expect(header.getAttribute('href')).toBe(addDataLink('apache_access'));
-    const empty = await screen.findByRole('link', { name: 'Issue one' });
-    expect(empty.getAttribute('href')).toBe(addDataLink('apache_access'));
-  });
-
-  it('opens the collector connection for several labels and hides the action without permission (NAN-2946)', async () => {
-    mocks.byLogSource.mockResolvedValue({ source_slugs: ['a', 'b'], writers: [] });
-    renderCard({ logSourceId: 'lsrc_2', canRevoke: true, canIssue: true });
-    expect((await screen.findByTestId('source-writers-issue')).getAttribute('href')).toBe(`${addDataLink()}?sources=a%2Cb`);
-    cleanup();
-    mocks.byLogSource.mockResolvedValue({ source_slugs: ['a'], writers: [] });
-    renderCard({ logSourceId: 'lsrc_3', canRevoke: true });
-    await screen.findByText('No active credential can write this source.');
-    expect(screen.queryByTestId('source-writers-issue')).toBeNull();
-  });
-
-  it('offers nothing for the Unattributed labels (NAN-2946)', async () => {
-    mocks.bySlug.mockResolvedValue({ source_slugs: ['unknown'], writers: [] });
-    renderCard({ sourceSlug: 'unknown', canRevoke: true, canIssue: true });
-    await screen.findByText('No active credential can write this source.');
-    expect(screen.queryByRole('link')).toBeNull();
-  });
-
-  it('hides audit issuance while retaining revocation of an existing user credential', async () => {
-    mocks.bySlug.mockResolvedValue({ source_slugs: ['audit'], writers: [{ ...writers.writers[0],
-      source_slugs: ['audit'], writes: ['audit'] }] });
-    renderCard({ sourceSlug: 'audit', canRevoke: true, canIssue: true });
-    const table = await screen.findByTestId('source-writers-table');
-    expect(screen.queryByTestId('source-writers-issue')).toBeNull();
-    expect(within(table).getByRole('link', { name: /revoke/i }).getAttribute('href')).toBe(revokeLink('c-direct'));
-  });
+it('renders nothing for a source with no push path', async () => {
+  calls.getStatus.mockResolvedValue({ source_id: 'lsrc_1', route_key: 'k', state: 'receiving', deployed: true, lifecycle_status: 'active',
+    push_capable: false, events_24h: 0, active_tokens: 0, tokens: [] });
+  const { container } = renderCard();
+  await waitFor(() => expect(calls.getStatus).toHaveBeenCalled());
+  await waitFor(() => expect(container.querySelector('[data-testid="source-writers"]')).toBeNull());
 });

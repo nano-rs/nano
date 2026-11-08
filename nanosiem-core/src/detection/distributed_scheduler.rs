@@ -22,9 +22,8 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::db::repository::detection_rules::{DetectionRuleRepository, LateReplayReleaseOutcome};
-use crate::models::detection_rule::DetectionMode;
-use crate::models::DetectionRule;
+use crate::db::repository::detection_rules::{DetectionCoverageGap, DetectionRuleRepository};
+use crate::models::{DetectionMode, DetectionRule};
 use crate::search::TimeRangeInput;
 use crate::settings::DeveloperSettingsRepository;
 use crate::shutdown::ShutdownToken;
@@ -53,45 +52,21 @@ pub struct DistributedSchedulerConfig {
     pub phase_max_secs: u64,
     /// Default lookback period for first-run rules (minutes)
     pub default_lookback_minutes: i64,
-    /// Upper bound on the catch-up window derived from `last_run_at` (minutes).
+    /// Upper bound on one catch-up slice derived from `last_run_at` (minutes).
     ///
-    /// Caps how far back a long-dormant rule scans on its first run after being
-    /// resumed/reclaimed (audit D22). Without this, a rule idle for months would
-    /// build a multi-month window that times out — and, with the D1 fix leaving
-    /// `last_run_at` untouched on failure, would then retry that giant window
-    /// forever. The cap bounds the scan so it succeeds and progresses. Explicit
-    /// `lookback_minutes` rules are unaffected (their window is intentional).
+    /// Bounds how much a long-dormant rule scans per execution (audit D22) so
+    /// a multi-day backlog never builds one giant window that times out and
+    /// retries forever. NAN-4910: the backlog is worked OLDEST-FIRST in slices
+    /// of at most this size, starting at `last_run_at` — the older interval is
+    /// never skipped (it used to be floored at `now - max_catchup_minutes`,
+    /// silently dropping everything older after a > 24 h outage). Each
+    /// successful slice is followed immediately by the next. A slice that
+    /// fails for a size reason is retried smaller (see
+    /// [`catchup_chunk_minutes`]). Explicit `lookback_minutes` rules are
+    /// unaffected (their window is intentional).
     pub max_catchup_minutes: i64,
     /// Maximum seconds a single rule execution may run before being timed out (default: 300s)
     pub execution_timeout_secs: u64,
-    /// Event-time delay applied to lake log-rule windows.
-    ///
-    /// The object writer publishes a small batch after its oldest event was
-    /// observed. Holding the rule watermark slightly behind wall clock keeps
-    /// ordinary batching on the normal scheduler path; genuinely older events
-    /// still enter durable late-arrival reconciliation.
-    pub lake_event_time_delay_secs: i64,
-    /// Independent poll cadence for committed-object late-arrival repair.
-    pub late_replay_poll_interval_secs: u64,
-    /// Maximum committed-object publications planned per poll.
-    ///
-    /// Publication planning is metadata-only and must be able to outrun object
-    /// creation, including a migration/backfill. Keep this independent from
-    /// the much smaller execution claim batch so draining publication metadata
-    /// cannot launch an unbounded number of detection queries at once.
-    pub late_replay_publication_batch_size: usize,
-    /// Maximum repair jobs claimed per poll.
-    pub late_replay_batch_size: usize,
-    /// Maximum concurrently executing late-arrival repair windows per node.
-    pub late_replay_max_concurrent: usize,
-    /// Oldest event age eligible for automatic repair.
-    pub late_replay_horizon_hours: i64,
-    /// Attempts before a persistently failing repair is dead-lettered.
-    pub late_replay_max_attempts: i32,
-    /// Durable alert side effects claimed per one-second dispatcher tick.
-    pub alert_post_create_batch_size: usize,
-    /// Maximum finding/case/webhook items executed concurrently per node.
-    pub alert_post_create_max_concurrent: usize,
 }
 
 impl Default for DistributedSchedulerConfig {
@@ -105,15 +80,6 @@ impl Default for DistributedSchedulerConfig {
             default_lookback_minutes: 15,
             max_catchup_minutes: 1440,
             execution_timeout_secs: 300,
-            lake_event_time_delay_secs: 10,
-            late_replay_poll_interval_secs: 10,
-            late_replay_publication_batch_size: 100,
-            late_replay_batch_size: 5,
-            late_replay_max_concurrent: 2,
-            late_replay_horizon_hours: 168,
-            late_replay_max_attempts: 8,
-            alert_post_create_batch_size: 100,
-            alert_post_create_max_concurrent: 16,
         }
     }
 }
@@ -130,27 +96,6 @@ impl DistributedSchedulerConfig {
             default_lookback_minutes: parse_env("NRT_DEFAULT_LOOKBACK_MINUTES", 15) as i64,
             max_catchup_minutes: parse_env("NRT_MAX_CATCHUP_MINUTES", 1440) as i64,
             execution_timeout_secs: parse_env("DETECTION_EXECUTION_TIMEOUT_SECS", 300),
-            lake_event_time_delay_secs: parse_env("DETECTION_LAKE_EVENT_TIME_DELAY_SECS", 10)
-                as i64,
-            late_replay_poll_interval_secs: parse_env(
-                "DETECTION_LATE_REPLAY_POLL_INTERVAL_SECS",
-                10,
-            ),
-            late_replay_publication_batch_size: parse_env(
-                "DETECTION_LATE_REPLAY_PUBLICATION_BATCH_SIZE",
-                100,
-            ) as usize,
-            late_replay_batch_size: parse_env("DETECTION_LATE_REPLAY_BATCH_SIZE", 5) as usize,
-            late_replay_max_concurrent: parse_env("DETECTION_LATE_REPLAY_MAX_CONCURRENT", 2)
-                as usize,
-            late_replay_horizon_hours: parse_env("DETECTION_LATE_REPLAY_HORIZON_HOURS", 168) as i64,
-            late_replay_max_attempts: parse_env("DETECTION_LATE_REPLAY_MAX_ATTEMPTS", 8) as i32,
-            alert_post_create_batch_size: parse_env("DETECTION_ALERT_POST_CREATE_BATCH_SIZE", 100)
-                as usize,
-            alert_post_create_max_concurrent: parse_env(
-                "DETECTION_ALERT_POST_CREATE_MAX_CONCURRENT",
-                16,
-            ) as usize,
         }
     }
 }
@@ -162,13 +107,6 @@ pub struct DistributedDetectionScheduler {
     config: DistributedSchedulerConfig,
     node_id: String,
     developer_settings: Option<DeveloperSettingsRepository>,
-    /// In the canonical lake profile, real-time rules are durable short-window
-    /// micro-batches. Legacy ClickHouse profiles leave this false because their
-    /// materialized views own real-time execution.
-    include_realtime_microbatches: bool,
-    /// Enabled only for the canonical object-lake profile. ClickHouse tenants
-    /// have no committed-object publication ledger to reconcile.
-    late_arrival_reconciliation: bool,
     /// NAN-3064: pool for the once-a-minute scheduling-lag health read.
     pool: PgPool,
 }
@@ -186,23 +124,8 @@ impl DistributedDetectionScheduler {
             config,
             node_id,
             developer_settings: None,
-            include_realtime_microbatches: false,
-            late_arrival_reconciliation: false,
             pool,
         }
-    }
-
-    /// Route real-time rules through the same durable scheduler as scheduled
-    /// rules. This is enabled only for the lake profile, where there is no
-    /// server-side materialized-view runtime.
-    pub fn with_realtime_microbatches(mut self, enabled: bool) -> Self {
-        self.include_realtime_microbatches = enabled;
-        self
-    }
-
-    pub fn with_late_arrival_reconciliation(mut self, enabled: bool) -> Self {
-        self.late_arrival_reconciliation = enabled;
-        self
     }
 
     /// Enable developer settings check (scheduler enable/disable toggle)
@@ -216,10 +139,7 @@ impl DistributedDetectionScheduler {
     /// Called once on startup to handle rules created before the migration,
     /// or rules whose next_run_at was cleared by a bug.
     pub async fn backfill_next_run_at(&self) -> anyhow::Result<usize> {
-        let rules = self
-            .rule_repo
-            .list_missing_next_run_at(self.include_realtime_microbatches)
-            .await?;
+        let rules = self.rule_repo.list_missing_next_run_at().await?;
         if rules.is_empty() {
             return Ok(0);
         }
@@ -311,7 +231,7 @@ impl DistributedDetectionScheduler {
                 if lag_checked_at.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60)) {
                     lag_checked_at = Some(std::time::Instant::now());
                     match super::schedule_lag::read_dedicated_schedule_lag(&scheduler.pool).await {
-                        Ok(lag) => super::schedule_lag::record_schedule_lag(&lag, None),
+                        Ok(lag) => super::schedule_lag::record_schedule_lag(&lag),
                         Err(e) => warn!("Detection scheduling-lag check failed: {}", e),
                     }
                 }
@@ -353,273 +273,6 @@ impl DistributedDetectionScheduler {
         })
     }
 
-    /// Start the independent late-arrival repair lane.
-    ///
-    /// It deliberately does not share the normal cron loop: a slow historical
-    /// repair must never delay fresh scheduled or real-time micro-batch rules.
-    pub fn start_late_arrival_with_shutdown(
-        self: Arc<Self>,
-        shutdown: ShutdownToken,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            if !self.late_arrival_reconciliation {
-                return;
-            }
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
-                self.config.late_replay_poll_interval_secs.max(1),
-            ));
-            info!(
-                node_id = %self.node_id,
-                horizon_hours = self.config.late_replay_horizon_hours,
-                max_concurrent = self.config.late_replay_max_concurrent,
-                "Late-arrival detection reconciliation started"
-            );
-            loop {
-                if shutdown
-                    .run_until_cancelled(interval.tick())
-                    .await
-                    .is_none()
-                {
-                    break;
-                }
-                if let Some(ref settings_repo) = self.developer_settings {
-                    match shutdown
-                        .run_until_cancelled(settings_repo.is_detection_scheduler_enabled())
-                        .await
-                    {
-                        None => break,
-                        Some(Ok(false)) => continue,
-                        Some(Err(error)) => warn!(
-                            %error,
-                            "Failed to check scheduler state for late-arrival reconciliation"
-                        ),
-                        Some(Ok(true)) => {}
-                    }
-                }
-                match self.poll_late_arrivals(&shutdown).await {
-                    Ok(executed) if executed > 0 => debug!(
-                        node_id = %self.node_id,
-                        executed,
-                        "Executed late-arrival detection repairs"
-                    ),
-                    Ok(_) => {}
-                    Err(error) => error!(
-                        node_id = %self.node_id,
-                        %error,
-                        "Late-arrival detection reconciliation failed"
-                    ),
-                }
-            }
-            info!(node_id = %self.node_id, "Late-arrival detection reconciliation stopped");
-        })
-    }
-
-    /// Start the independent durable alert side-effect lane. Alert rows and
-    /// matched-event checkpoints stay on the rule executor's critical path;
-    /// risk publication, case grouping, and webhook fanout drain here.
-    pub fn start_alert_post_create_with_shutdown(
-        self: Arc<Self>,
-        shutdown: ShutdownToken,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-            info!(
-                node_id = %self.node_id,
-                batch_size = self.config.alert_post_create_batch_size,
-                max_concurrent = self.config.alert_post_create_max_concurrent,
-                "Alert post-create outbox dispatcher started"
-            );
-            loop {
-                if shutdown
-                    .run_until_cancelled(interval.tick())
-                    .await
-                    .is_none()
-                {
-                    break;
-                }
-                let drain = self.detection_service.drain_alert_post_create_outbox(
-                    &self.node_id,
-                    self.config.alert_post_create_batch_size,
-                    self.config.alert_post_create_max_concurrent,
-                );
-                let result = shutdown.run_until_cancelled(drain).await;
-                let Some(result) = result else {
-                    match self
-                        .detection_service
-                        .release_alert_post_create_claims(&self.node_id)
-                        .await
-                    {
-                        Ok(released) if released > 0 => info!(
-                            node_id = %self.node_id,
-                            released,
-                            "Released alert post-create claims during shutdown"
-                        ),
-                        Ok(_) => {}
-                        Err(error) => error!(
-                            node_id = %self.node_id,
-                            %error,
-                            "Failed to release alert post-create claims during shutdown"
-                        ),
-                    }
-                    break;
-                };
-                match result {
-                    Ok(drained) if drained > 0 => debug!(
-                        node_id = %self.node_id,
-                        drained,
-                        "Drained alert post-create outbox items"
-                    ),
-                    Ok(_) => {}
-                    Err(error) => error!(
-                        node_id = %self.node_id,
-                        %error,
-                        "Alert post-create outbox dispatch failed"
-                    ),
-                }
-            }
-            info!(node_id = %self.node_id, "Alert post-create outbox dispatcher stopped");
-        })
-    }
-
-    async fn poll_late_arrivals(&self, shutdown: &ShutdownToken) -> anyhow::Result<usize> {
-        let plan = self
-            .rule_repo
-            .plan_late_replays(
-                self.config.late_replay_publication_batch_size.max(1),
-                Duration::hours(self.config.late_replay_horizon_hours.max(1)),
-                Duration::minutes(self.config.default_lookback_minutes.max(1)),
-            )
-            .await?;
-        if plan.publications > 0 {
-            counter!("nanosiem_detection_late_publications_total")
-                .increment(plan.publications as u64);
-            counter!("nanosiem_detection_late_replay_jobs_planned_total")
-                .increment(plan.jobs as u64);
-            counter!("nanosiem_detection_late_replay_jobs_coalesced_total")
-                .increment(plan.coalesced as u64);
-            counter!("nanosiem_detection_late_publications_expired_total")
-                .increment(plan.expired as u64);
-        }
-        counter!("nanosiem_detection_late_publications_pruned_total")
-            .increment(plan.pruned_publications as u64);
-        counter!("nanosiem_detection_late_replay_jobs_pruned_total")
-            .increment(plan.pruned_jobs as u64);
-
-        const STALE_CLAIM_EXEC_BUFFER_SECS: i64 = 60;
-        let timeout_secs = self.config.execution_timeout_secs.max(1);
-        let stale_secs = self
-            .config
-            .stale_claim_timeout_secs
-            .max(timeout_secs as i64 + STALE_CLAIM_EXEC_BUFFER_SECS);
-        let claims = self
-            .rule_repo
-            .claim_late_replays(
-                self.config.late_replay_batch_size.max(1),
-                &self.node_id,
-                Duration::seconds(stale_secs),
-                Duration::seconds(stale_secs),
-            )
-            .await?;
-        let count = claims.len();
-        stream::iter(claims)
-            .for_each_concurrent(self.config.late_replay_max_concurrent.max(1), |claim| {
-                let detection_service = self.detection_service.clone();
-                let rule_repo = self.rule_repo.clone();
-                let node_id = self.node_id.clone();
-                let shutdown = shutdown.clone();
-                let max_attempts = self.config.late_replay_max_attempts.max(1);
-                let retry_horizon = Duration::hours(self.config.late_replay_horizon_hours.max(1));
-                async move {
-                    let execution = tokio::time::timeout(
-                        tokio::time::Duration::from_secs(timeout_secs),
-                        detection_service.execute_rule(&claim.rule, Some(claim.time_range.clone())),
-                    );
-                    let result = shutdown.run_until_cancelled(execution).await;
-                    let drain_pending = matches!(
-                        &result,
-                        Some(Ok(Err(error))) if error.is_window_drain_pending()
-                    );
-                    let error = match result {
-                        None => Some("late-arrival repair cancelled during shutdown".to_string()),
-                        Some(Err(_)) => Some(format!(
-                            "late-arrival repair timed out after {timeout_secs}s"
-                        )),
-                        Some(Ok(Err(error))) => Some(error.to_string()),
-                        Some(Ok(Ok(_))) => None,
-                    };
-                    let release = if drain_pending {
-                        rule_repo
-                            .release_late_replay_progress(
-                                &claim,
-                                &node_id,
-                                error.as_deref().unwrap_or("detection window drain pending"),
-                            )
-                            .await
-                    } else {
-                        rule_repo
-                            .release_late_replay(
-                                &claim,
-                                &node_id,
-                                error.as_deref(),
-                                max_attempts,
-                                retry_horizon,
-                            )
-                            .await
-                    };
-                    match release {
-                        Ok(LateReplayReleaseOutcome::Completed) => {
-                            counter!(
-                                "nanosiem_detection_late_replay_executions_total",
-                                "outcome" => "completed"
-                            )
-                            .increment(1);
-                        }
-                        Ok(LateReplayReleaseOutcome::Draining) => {
-                            counter!(
-                                "nanosiem_detection_late_replay_executions_total",
-                                "outcome" => "draining"
-                            )
-                            .increment(1);
-                        }
-                        Ok(LateReplayReleaseOutcome::Retry) => {
-                            counter!(
-                                "nanosiem_detection_late_replay_executions_total",
-                                "outcome" => "retry"
-                            )
-                            .increment(1);
-                        }
-                        Ok(LateReplayReleaseOutcome::DeadLetter) => {
-                            counter!(
-                                "nanosiem_detection_late_replay_executions_total",
-                                "outcome" => "dead_letter"
-                            )
-                            .increment(1);
-                            error!(
-                                job_id = %claim.job_id,
-                                rule_id = %claim.rule.id,
-                                attempts = claim.attempt,
-                                last_error = error.as_deref().unwrap_or("unknown"),
-                                "Late-arrival detection repair exhausted its retry horizon"
-                            );
-                        }
-                        Ok(LateReplayReleaseOutcome::LostClaim) => warn!(
-                            job_id = %claim.job_id,
-                            rule_id = %claim.rule.id,
-                            "Late-arrival repair lost its claim fence before release"
-                        ),
-                        Err(release_error) => error!(
-                            job_id = %claim.job_id,
-                            rule_id = %claim.rule.id,
-                            %release_error,
-                            "Failed to release late-arrival repair claim"
-                        ),
-                    }
-                }
-            })
-            .await;
-        Ok(count)
-    }
-
     /// One poll cycle: claim due rules, execute them concurrently, release claims.
     async fn poll_and_execute(&self, shutdown: &ShutdownToken) -> anyhow::Result<usize> {
         // Audit D21: never let another node reclaim a rule before the node
@@ -640,7 +293,6 @@ impl DistributedDetectionScheduler {
             self.config.batch_size,
             &self.node_id,
             effective_stale_timeout,
-            self.include_realtime_microbatches,
         );
         let Some(claimed) = shutdown.run_until_cancelled(claim).await else {
             return Ok(0);
@@ -675,10 +327,29 @@ impl DistributedDetectionScheduler {
                         &rule,
                         &node_id,
                         &config,
-                        self.include_realtime_microbatches,
                     );
                     if AssertUnwindSafe(execution).catch_unwind().await.is_err() {
-                        error!(%rule_id, "Rule execution task panicked");
+                        // NAN-3080: release panics now unwind (they used to
+                        // abort the whole jobs process), so one rule's panic
+                        // is isolated here. Release the claim with a back-off
+                        // and WITHOUT advancing last_run_at, so the window is
+                        // re-scanned instead of the rule waiting out the
+                        // stale-claim timeout.
+                        error!(%rule_id, "Rule execution task panicked; releasing claim with back-off");
+                        counter!("nanosiem_detection_execution_panics_total").increment(1);
+                        let retry_at = Utc::now() + Duration::seconds(PANIC_RETRY_BACKOFF_SECS);
+                        // A panic is not a size failure (NAN-4910): keep the
+                        // rule's current catch-up slice size unchanged.
+                        let size_failures = rule_repo
+                            .get_catchup_size_failures(rule_id)
+                            .await
+                            .unwrap_or(0);
+                        if let Err(e) = rule_repo
+                            .release_claim(rule_id, &node_id, retry_at, None, size_failures, None)
+                            .await
+                        {
+                            error!(%rule_id, "Failed to release claim after panic: {}", e);
+                        }
                     }
                 }
             })
@@ -704,6 +375,21 @@ impl DistributedDetectionScheduler {
     }
 }
 
+/// Back-off before a rule whose execution panicked is claimed again (NAN-3080).
+const PANIC_RETRY_BACKOFF_SECS: i64 = 300;
+
+/// Back-off for a rule whose query fails deterministically (NAN-4031).
+const DETERMINISTIC_FAILURE_BACKOFF_SECS: i64 = 3600;
+
+/// A failure that retrying the same window cannot fix (NAN-4031).
+fn is_deterministic_failure<T>(result: &Result<T, crate::detection::DetectionError>) -> bool {
+    matches!(
+        result,
+        Err(crate::detection::DetectionError::InvalidQuery(_)
+            | crate::detection::DetectionError::QueryParseError(_))
+    )
+}
+
 /// Execute a single claimed rule and release the claim afterward.
 ///
 /// Always releases the claim, even on execution failure (to avoid permanent stuckness).
@@ -713,34 +399,35 @@ async fn execute_and_release(
     rule: &DetectionRule,
     node_id: &str,
     config: &DistributedSchedulerConfig,
-    lake_backend: bool,
 ) {
     let mode_str = format!("{:?}", rule.mode).to_lowercase();
 
     // Calculate time range. `end` is captured *before* the query so that, on
     // success, `last_run_at` can be stamped to exactly this value (audit D2) —
-    // see `compute_window_start` for the start-of-window precedence rules.
-    let wall_now = Utc::now();
-    let now = detection_evaluation_now(
-        wall_now,
-        rule.dataset.as_deref(),
-        lake_backend,
-        config.lake_event_time_delay_secs,
-    );
-    let end = compute_window_end(
-        rule.lookback_minutes,
-        rule.last_run_at,
-        now,
-        config.max_catchup_minutes,
-    );
+    // see `compute_window_start` / `compute_window_end` for the precedence
+    // rules. NAN-4910: a backlog is worked oldest-first in bounded slices; the
+    // slice shrinks after consecutive size-class failures.
+    let marker_driven = is_marker_driven(rule);
+    let prior_size_failures = if marker_driven {
+        rule_repo
+            .get_catchup_size_failures(rule.id)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(rule_id = %rule.id, "Failed to read catch-up size failures: {}", e);
+                0
+            })
+    } else {
+        0
+    };
+    let chunk_minutes = catchup_chunk_minutes(config.max_catchup_minutes, prior_size_failures);
+    let now = Utc::now();
+    let end = compute_window_end(rule.lookback_minutes, rule.last_run_at, now, chunk_minutes);
     let start = compute_window_start(
         rule.lookback_minutes,
         rule.last_run_at,
         end,
         config.default_lookback_minutes,
-        config.max_catchup_minutes,
     );
-    let backlog_remaining = end < now;
     let time_range = TimeRangeInput::new(start, end);
 
     debug!(
@@ -748,23 +435,17 @@ async fn execute_and_release(
         rule_name = %rule.name,
         start = %start,
         end = %end,
+        chunk_minutes,
+        backlog_remaining = end < now,
         "Executing claimed rule"
     );
 
     // Execute with timing and timeout
     let exec_start = std::time::Instant::now();
-    // Lake real-time rules are deliberately simple and should never occupy a
-    // rule lane for the full analytical timeout. A failure keeps the watermark
-    // unchanged, so the next durable run safely retries the same window.
-    let execution_timeout_secs = if rule.detection_mode == DetectionMode::RealTime {
-        config.execution_timeout_secs.min(30)
-    } else {
-        config.execution_timeout_secs
-    };
-    let timeout_duration = tokio::time::Duration::from_secs(execution_timeout_secs);
+    let timeout_duration = tokio::time::Duration::from_secs(config.execution_timeout_secs);
     let result = match tokio::time::timeout(
         timeout_duration,
-        detection_service.execute_scheduled_window(rule, time_range.clone()),
+        detection_service.execute_rule(rule, Some(time_range)),
     )
     .await
     {
@@ -773,39 +454,19 @@ async fn execute_and_release(
             error!(
                 rule_id = %rule.id,
                 rule_name = %rule.name,
-                timeout_secs = execution_timeout_secs,
+                timeout_secs = config.execution_timeout_secs,
                 "Rule execution timed out"
             );
             Err(crate::detection::DetectionError::QueryExecutionError(
-                format!("Rule execution timed out after {}s", execution_timeout_secs),
+                format!(
+                    "Rule execution timed out after {}s",
+                    config.execution_timeout_secs
+                ),
             ))
         }
     };
     let duration_secs = exec_start.elapsed().as_secs_f64();
 
-    let drain_pending = matches!(
-        &result,
-        Err(error) if error.is_window_drain_pending()
-    );
-    let drain_owned = if drain_pending && lake_backend && !rule.is_retro_hunt() {
-        match rule_repo.enqueue_window_drain(rule.id, &time_range).await {
-            Ok(()) => {
-                counter!("nanosiem_detection_window_drains_enqueued_total").increment(1);
-                true
-            }
-            Err(error) => {
-                error!(
-                    rule_id = %rule.id,
-                    rule_name = %rule.name,
-                    %error,
-                    "Failed to hand the partially committed window to the durable drain lane"
-                );
-                false
-            }
-        }
-    } else {
-        false
-    };
     let success = result.is_ok();
     histogram!(
         "nanosiem_detection_execution_duration_seconds",
@@ -830,24 +491,6 @@ async fn execute_and_release(
             );
         }
         Ok(None) => {}
-        Err(e) if drain_pending => {
-            counter!("nanosiem_detection_window_drain_batches_total").increment(1);
-            if drain_owned {
-                info!(
-                    rule_id = %rule.id,
-                    rule_name = %rule.name,
-                    "{}; exact window handed to the durable drain lane",
-                    e
-                );
-            } else {
-                info!(
-                    rule_id = %rule.id,
-                    rule_name = %rule.name,
-                    "{}; retrying without advancing the watermark",
-                    e
-                );
-            }
-        }
         Err(e) => {
             error!(rule_id = %rule.id, rule_name = %rule.name, "Rule execution failed: {}", e);
         }
@@ -863,11 +506,26 @@ async fn execute_and_release(
         .ok()
         .flatten()
         .or_else(|| rule.schedule_cron.clone());
-    let next_run_at = if (drain_pending && !drain_owned) || (success && backlog_remaining) {
-        // Drain an old outage as bounded, contiguous slices instead of waiting
-        // for another full cron interval between each day of backlog. A
-        // partially committed per-event batch likewise retains this exact
-        // watermark and is immediately reclaimable.
+    let outcome = match &result {
+        Ok(_) => ExecutionOutcome::Success,
+        Err(e) if e.is_window_size_dependent() => ExecutionOutcome::SizeFailure,
+        Err(_) => ExecutionOutcome::OtherFailure,
+    };
+    let decision = decide_release(
+        outcome,
+        marker_driven,
+        rule.last_run_at,
+        prior_size_failures,
+        start,
+        end,
+        now,
+        config.max_catchup_minutes,
+    );
+
+    // A bounded slice left backlog behind (or a size failure can retry a
+    // strictly smaller slice): claim again right away instead of waiting a
+    // full cron interval per slice, or a multi-day backlog never catches up.
+    let mut next_run_at = if decision.reclaim_immediately {
         Utc::now() + Duration::seconds(1)
     } else {
         current_cron
@@ -882,20 +540,65 @@ async fn execute_and_release(
             })
             .unwrap_or_else(|| Utc::now() + Duration::hours(1))
     };
+    // NAN-4031: a deterministic query failure (the generated SQL fails
+    // validation) fails identically on every tick. Back it off to at most
+    // once an hour; last_run_at is not advanced (below), so the failed window
+    // is still re-scanned once the rule is fixed.
+    if is_deterministic_failure(&result) {
+        next_run_at = next_run_at.max(Utc::now() + Duration::seconds(DETERMINISTIC_FAILURE_BACKOFF_SECS));
+    }
+
+    let coverage_gap = decision.coverage_gap.map(|(window_start, window_end)| {
+        let error_message: String = result
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+            .chars()
+            .take(1000)
+            .collect();
+        DetectionCoverageGap {
+            window_start,
+            window_end,
+            attempts: i32::from(prior_size_failures) + 1,
+            error_message,
+        }
+    });
+    if let Some(gap) = &coverage_gap {
+        counter!("nanosiem_detection_coverage_gaps_total").increment(1);
+        warn!(
+            rule_id = %rule.id,
+            rule_name = %rule.name,
+            window_start = %gap.window_start,
+            window_end = %gap.window_end,
+            attempts = gap.attempts,
+            error = %gap.error_message,
+            "Detection window could not be evaluated at the minimum slice; recorded a coverage gap and moved past it"
+        );
+    } else if outcome == ExecutionOutcome::SizeFailure && marker_driven {
+        info!(
+            rule_id = %rule.id,
+            rule_name = %rule.name,
+            failed_chunk_minutes = chunk_minutes,
+            next_chunk_minutes =
+                catchup_chunk_minutes(config.max_catchup_minutes, decision.catchup_size_failures),
+            "Detection window failed on size; retrying a smaller slice"
+        );
+    }
 
     // Decide how last_run_at advances (audit D1). Success stamps the executed
     // window end; a normal failure leaves the high-water mark untouched so the
-    // failed window is re-scanned next cycle instead of being silently dropped.
-    // Once the exact interval is durably owned by the repair queue, advancing
-    // the normal watermark is safe. The pending job fences normal claims for
-    // this rule and replay execution never mutates the watermark.
-    let advance_last_run_to = if drain_owned {
-        Some(end)
-    } else {
-        next_last_run_at(success, rule.last_run_at, start, end)
-    };
+    // failed window is re-scanned next cycle instead of being silently dropped;
+    // a recorded coverage gap moves it past the gap (NAN-4910).
     if let Err(e) = rule_repo
-        .release_claim(rule.id, node_id, next_run_at, advance_last_run_to)
+        .release_claim(
+            rule.id,
+            node_id,
+            next_run_at,
+            decision.advance_last_run_to,
+            decision.catchup_size_failures,
+            coverage_gap.as_ref(),
+        )
         .await
     {
         error!(
@@ -906,19 +609,120 @@ async fn execute_and_release(
     }
 }
 
-fn detection_evaluation_now(
-    wall_now: DateTime<Utc>,
-    dataset: Option<&str>,
-    lake_backend: bool,
-    delay_secs: i64,
-) -> DateTime<Utc> {
-    let is_log_rule = dataset
-        .map(|value| value.eq_ignore_ascii_case("logs"))
-        .unwrap_or(true);
-    if lake_backend && is_log_rule {
-        wall_now - Duration::seconds(delay_secs.max(0))
-    } else {
-        wall_now
+/// How one execution attempt ended, for the release decision (NAN-4910).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionOutcome {
+    Success,
+    /// Failed because of the window's size ([`crate::detection::DetectionError::is_window_size_dependent`]).
+    SizeFailure,
+    OtherFailure,
+}
+
+/// What `release_claim` should write after an attempt (NAN-4910).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseDecision {
+    advance_last_run_to: Option<DateTime<Utc>>,
+    catchup_size_failures: i16,
+    /// `[start, end]` of a window recorded as not evaluated.
+    coverage_gap: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    reclaim_immediately: bool,
+}
+
+/// Smallest catch-up slice (minutes). A slice of this size that keeps failing
+/// for a size reason is recorded as a coverage gap (NAN-4910).
+const MIN_CATCHUP_CHUNK_MINUTES: i64 = 5;
+
+/// Consecutive size-class failures OF THE MINIMUM SLICE before it is recorded
+/// as a coverage gap. More than one, so a single transient timeout at the
+/// minimum slice does not cost coverage.
+const MIN_CHUNK_ATTEMPTS: i16 = 3;
+
+/// A rule whose window is driven by its `last_run_at` high-water mark (no
+/// sliding `lookback_minutes`, has run before, not a retro hunt). Only these
+/// get shrinking slices and recorded gaps: a sliding-lookback rule never
+/// advances a marker, and a retro hunt evaluates its own historical window.
+fn is_marker_driven(rule: &DetectionRule) -> bool {
+    rule.lookback_minutes.is_none() && rule.last_run_at.is_some() && !rule.is_retro_hunt()
+}
+
+/// Maximum slice (minutes) after `size_failures` consecutive size-class
+/// failures: `max_catchup_minutes` divided by 4 per failure, floored at
+/// [`MIN_CATCHUP_CHUNK_MINUTES`] (1440 → 360 → 90 → 22 → 5).
+fn catchup_chunk_minutes(max_catchup_minutes: i64, size_failures: i16) -> i64 {
+    let mut chunk = max_catchup_minutes.max(MIN_CATCHUP_CHUNK_MINUTES);
+    for _ in 0..size_failures.max(0) {
+        chunk /= 4;
+        if chunk <= MIN_CATCHUP_CHUNK_MINUTES {
+            return MIN_CATCHUP_CHUNK_MINUTES;
+        }
+    }
+    chunk
+}
+
+/// Number of consecutive size failures after which the slice is the minimum.
+fn size_failures_at_min_chunk(max_catchup_minutes: i64) -> i16 {
+    let mut failures = 0i16;
+    while catchup_chunk_minutes(max_catchup_minutes, failures) > MIN_CATCHUP_CHUNK_MINUTES {
+        failures += 1;
+    }
+    failures
+}
+
+/// Decide the release writes for one attempt (NAN-4910). `now` is the
+/// evaluation time the window was derived from.
+#[allow(clippy::too_many_arguments)]
+fn decide_release(
+    outcome: ExecutionOutcome,
+    marker_driven: bool,
+    prior_last_run_at: Option<DateTime<Utc>>,
+    prior_size_failures: i16,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    now: DateTime<Utc>,
+    max_catchup_minutes: i64,
+) -> ReleaseDecision {
+    let keep_marker = ReleaseDecision {
+        advance_last_run_to: next_last_run_at(false, prior_last_run_at, start, end),
+        catchup_size_failures: prior_size_failures,
+        coverage_gap: None,
+        reclaim_immediately: false,
+    };
+    match outcome {
+        ExecutionOutcome::Success => ReleaseDecision {
+            advance_last_run_to: next_last_run_at(true, prior_last_run_at, start, end),
+            catchup_size_failures: 0,
+            coverage_gap: None,
+            reclaim_immediately: end < now,
+        },
+        ExecutionOutcome::OtherFailure => keep_marker,
+        ExecutionOutcome::SizeFailure if !marker_driven => keep_marker,
+        ExecutionOutcome::SizeFailure => {
+            let failures = prior_size_failures.max(0);
+            let first_min = size_failures_at_min_chunk(max_catchup_minutes);
+            if failures >= first_min && failures - first_min + 1 >= MIN_CHUNK_ATTEMPTS {
+                // The minimum slice failed MIN_CHUNK_ATTEMPTS times in a row
+                // for a size reason: a smaller retry does not exist and the
+                // same slice will not succeed. Record it and move past it
+                // rather than pinning the rule on it forever.
+                ReleaseDecision {
+                    advance_last_run_to: Some(end),
+                    catchup_size_failures: 0,
+                    coverage_gap: Some((start, end)),
+                    reclaim_immediately: end < now,
+                }
+            } else {
+                let next = failures.saturating_add(1);
+                let next_chunk = Duration::minutes(catchup_chunk_minutes(max_catchup_minutes, next));
+                ReleaseDecision {
+                    advance_last_run_to: None,
+                    catchup_size_failures: next,
+                    coverage_gap: None,
+                    // Retry right away only when the next slice is actually
+                    // smaller than the window that just failed.
+                    reclaim_immediately: next_chunk < end - start,
+                }
+            }
+        }
     }
 }
 
@@ -967,15 +771,15 @@ fn next_last_run_at(
 ///    overlap; bounded by the rule's own lookback cap). Not capped here.
 /// 2. `last_run_at` → contiguous catch-up from the last successfully-scanned
 ///    window end, minus a 5s overlap buffer for ingestion lag / clock skew.
-///    [`compute_window_end`] bounds long outages into oldest-first slices; the
-///    start must never jump forward or an outage becomes permanent data loss.
+///    [`compute_window_end`] bounds a long backlog into oldest-first slices;
+///    the start never jumps forward, or an outage becomes permanent data loss
+///    (NAN-4910 — it used to be floored at `end - max_catchup_minutes`).
 /// 3. First run (no lookback, never run) → `end - default_lookback_minutes`.
-pub fn compute_window_start(
+fn compute_window_start(
     lookback_minutes: Option<i32>,
     last_run_at: Option<DateTime<Utc>>,
     end: DateTime<Utc>,
     default_lookback_minutes: i64,
-    _max_catchup_minutes: i64,
 ) -> DateTime<Utc> {
     if let Some(lookback_minutes) = lookback_minutes {
         end - Duration::minutes(lookback_minutes as i64)
@@ -986,20 +790,24 @@ pub fn compute_window_start(
     }
 }
 
-/// Bound catch-up cost without discarding the oldest unprocessed interval.
-/// A successful slice advances `last_run_at` to this end; the scheduler then
-/// immediately claims the next slice until it reaches `now`.
-pub fn compute_window_end(
+/// Compute the end of the query window (NAN-4910).
+///
+/// Bounds catch-up cost without discarding the oldest unprocessed interval: a
+/// marker-driven rule scans at most `chunk_minutes` past `last_run_at`. A
+/// successful slice advances `last_run_at` to this end and the scheduler
+/// immediately claims the next slice until it reaches `now`. Sliding-lookback
+/// and first-run rules always end at `now`.
+fn compute_window_end(
     lookback_minutes: Option<i32>,
     last_run_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
-    max_catchup_minutes: i64,
+    chunk_minutes: i64,
 ) -> DateTime<Utc> {
     if lookback_minutes.is_some() {
         return now;
     }
     last_run_at
-        .map(|last_run| (last_run + Duration::minutes(max_catchup_minutes)).min(now))
+        .map(|last_run| (last_run + Duration::minutes(chunk_minutes)).min(now))
         .unwrap_or(now)
 }
 
@@ -1019,3 +827,6 @@ fn parse_env(key: &str, default: u64) -> u64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod catchup_tests;

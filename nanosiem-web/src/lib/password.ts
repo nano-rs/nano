@@ -104,25 +104,6 @@ export const PASSWORD_REQUIREMENT_LABELS: readonly string[] = PASSWORD_RULES.fil
   (rule) => rule !== MAX_LENGTH_RULE,
 ).map((rule) => rule.label);
 
-/**
- * The policy as a live checklist: one short chip label per rule, ticked as the
- * password satisfies it. Derived from `PASSWORD_RULES` like the labels above;
- * the max-length rule is omitted because it cannot be "unmet by not typing".
- */
-export function passwordChecklist(password: string): { label: string; ok: boolean }[] {
-  const short: Record<string, string> = {
-    [PASSWORD_RULES[0]!.label]: `${PASSWORD_MIN_BYTES}+ chars`,
-    'At least one uppercase letter': 'uppercase',
-    'At least one lowercase letter': 'lowercase',
-    'At least one digit': 'digit',
-    'At least one special character': 'special',
-  };
-  return PASSWORD_RULES.filter((rule) => rule !== MAX_LENGTH_RULE).map((rule) => ({
-    label: short[rule.label] ?? rule.label,
-    ok: rule.satisfied(password),
-  }));
-}
-
 /** Mirrors `validate_password`; returns a sentence per unmet requirement. */
 export function validatePassword(password: string): string[] {
   if (password.length === 0) return ['Enter a password.'];
