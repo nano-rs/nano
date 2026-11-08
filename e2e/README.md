@@ -670,7 +670,7 @@ env-gated `#[ignore]` suites, without rewriting them. Run them with:
 scripts/e2e.sh legacy list
 scripts/e2e.sh legacy ingest-tokens onboarding    # self-contained scripts (own containers)
 scripts/e2e.sh legacy upgrade-180                 # migration 180 on an infra-only ocsf stack
-scripts/e2e.sh legacy upgrade-from-v01            # v0.1.703 install -> this checkout, both editions (v2.0.0 gate)
+scripts/e2e.sh legacy upgrade-from-v01            # oldest supported v0.1 source -> this checkout, both editions (v2.0.0 gate)
 scripts/e2e.sh legacy all                         # stack lanes get a fresh stack's stack.env
 ```
 

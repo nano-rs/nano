@@ -27,6 +27,7 @@ fi
 
 MANIFEST_TOOL="$SCRIPT_DIR/nano-manifest.py"
 GENERATED_SECRETS_LIB="$SCRIPT_DIR/lib/generated-secrets.sh"
+LEGACY_LAYOUT_RESOLVER="$SCRIPT_DIR/lib/nano_legacy_layout.py"
 [[ -f "$GENERATED_SECRETS_LIB" ]] || {
     printf 'nano: metadata helper is missing: %s\n' "$GENERATED_SECRETS_LIB" >&2
     exit 1
@@ -67,6 +68,8 @@ PG_BACKUP_SNAPSHOT=""
 PG_BACKUP_MIGRATION=0
 PG_BACKUP_BYTES=0
 CH_LOCAL_FILES=()
+CH_LOCAL_DISK_PATH=""
+CH_LEGACY_BACKUP_CONFIG=0
 CH_VERIFY_DB=""
 CH_MERGES_STOPPED=0
 CH_REFRESH_VIEWS_STOPPED=()
@@ -74,6 +77,7 @@ CH_TARGET_SCHEMA_PRESENT=0
 COMPOSE_ARGS=()
 COMPOSE_FILE=""
 COMPOSE_PROJECT_DIR=""
+COMPOSE_OVERRIDE=""
 DOCKER_BIN=""
 TOPOLOGY_MODE=single
 ROLE_LIST="app,ingest,clickhouse,keeper,postgres"
@@ -86,6 +90,13 @@ SHARD_COUNT=1
 CURRENT_VERSION=""
 CURRENT_EDITION=""
 CURRENT_SCHEMA_PROFILE=""
+LEGACY_LAYOUT=0
+LEGACY_PROJECT_NAME=""
+LEGACY_COMPOSE_FILES=()
+LEGACY_DATA_SOURCES=()
+LEGACY_BACKUP_RECOVERY=""
+LEGACY_BACKUP_SERVICES=()
+LEGACY_RESTORE_CONTEXT=0
 
 log() { printf '==> %s\n' "$*" >&2; }
 ok() { printf 'ok: %s\n' "$*" >&2; }
@@ -106,13 +117,17 @@ Usage:
   scripts/nano backup-set --inventory FILE --backup-key-file KEY.pem
                           [--backup-output DIR] [--clickhouse-disk DISK]
                           [--remote-install-dir DIR]
+                      [--compose-override FILE]
   scripts/nano recovery-set-create --key-file KEY.pem --output DIR
                       --bundle PG_BACKUP --bundle SHARD_BACKUP [...]
   scripts/nano restore --key-file KEY.pem --from BACKUP [--base FULL_BACKUP]
                        [--recovery-set SET_DIR] [--force]
+                       [--restore-layout legacy]
                        [--clickhouse-disk DISK] [--install-dir DIR]
+                       [--compose-override FILE]
   scripts/nano upgrade [--bundle FILE | --version VERSION] [--dry-run]
-                       [--skip-backup-I-understand] [--resume]
+                       [--backup-key-file KEY.pem] [--backup-output DIR]
+                       [--install-dir DIR] [--skip-backup-I-understand] [--resume]
                        [--allow-siem-health-regression REASON]
   scripts/nano upgrade --abandon-incomplete RUN_ID --abandon-reason REASON
   scripts/nano rollback [--inventory FILE]
@@ -215,6 +230,12 @@ cleanup() {
         pg_unfence_target >/dev/null 2>&1
     fi
     if [[ -n "$CH_CONTAINER" ]]; then
+        if ((CH_LEGACY_BACKUP_CONFIG)); then
+            "$DOCKER_BIN" exec "$CH_CONTAINER" rm -f -- \
+                /etc/clickhouse-server/config.d/zz-nano-legacy-backup.xml >/dev/null 2>&1
+            printf 'SYSTEM RELOAD CONFIG\n' | ch_query >/dev/null 2>&1
+            CH_LEGACY_BACKUP_CONFIG=0
+        fi
         if ((${#CH_REFRESH_VIEWS_STOPPED[@]} > 0)) && ((!(rc != 0 && MUTATION_STARTED))); then
             start_ch_refreshable_views >/dev/null 2>&1
         fi
@@ -225,9 +246,15 @@ cleanup() {
             printf 'DROP DATABASE IF EXISTS %s SYNC\n' "$CH_VERIFY_DB" | ch_query >/dev/null 2>&1
         fi
         for path in "${CH_LOCAL_FILES[@]}"; do
-            [[ "$path" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.zip$ ]] || continue
-            "$DOCKER_BIN" exec "$CH_CONTAINER" rm -f -- "/var/lib/clickhouse/backups/$path" >/dev/null 2>&1
+            [[ "$path" =~ ^/var/lib/clickhouse/(backups/)?[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.zip$ ]] || continue
+            "$DOCKER_BIN" exec "$CH_CONTAINER" rm -f -- "$path" >/dev/null 2>&1
         done
+    fi
+    if [[ -n "$LEGACY_BACKUP_RECOVERY" \
+        && ( -e "$LEGACY_BACKUP_RECOVERY" || -L "$LEGACY_BACKUP_RECOVERY" ) ]]; then
+        if ! legacy_backup_recovery_restart >/dev/null 2>&1; then
+            warn "legacy backup service recovery remains pending: $LEGACY_BACKUP_RECOVERY"
+        fi
     fi
     if ((!(rc != 0 && MUTATION_STARTED))) && [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then
         dc start "${STOPPED_SERVICES[@]}" >/dev/null 2>&1
@@ -309,6 +336,7 @@ init_context() {
     require_cmd mv "install mv"
     require_cmd rm "install rm"
     require_cmd sort "install sort"
+    require_cmd mktemp "install mktemp"
     DOCKER_BIN="$(type -P docker)" || die "cannot resolve docker executable"
     [[ -f "$MANIFEST_TOOL" ]] || die "manifest helper is missing: $MANIFEST_TOOL"
     "$DOCKER_BIN" compose version >/dev/null 2>&1 || die "docker compose v2 is required"
@@ -316,7 +344,44 @@ init_context() {
     INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd -P)"
     [[ -f "$INSTALL_DIR/.env" ]] || die "$INSTALL_DIR/.env is missing; run install.sh first"
     validate_regular_0600 "$INSTALL_DIR/.env" ".env"
-    if [[ -f "$INSTALL_DIR/.nano-role.env" ]]; then
+    local restore_journal="$INSTALL_DIR/.nano-legacy-restore.json" restore_context_file
+    local restore_context=()
+    if [[ -f "$restore_journal" && ! -L "$restore_journal" ]]; then
+        validate_regular_0600 "$restore_journal" "legacy restore journal"
+        restore_context_file="$(mktemp "${TMPDIR:-/tmp}/nano-restore-context.XXXXXX")"
+        python3 -I - "$restore_journal" > "$restore_context_file" <<'PY'
+import json,pathlib,sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if value.get("format")!="nano-legacy-restore-v2":raise SystemExit(0)
+state=value.get("state")
+if state not in {"controls-publishing","controls-published","verifying"}:raise SystemExit(0)
+files=value.get("compose_files")
+if files not in (["docker-compose.yml"],["docker-compose.yml","docker-compose.override.yml"]):
+ raise SystemExit("invalid legacy restore Compose journal")
+fields=["1",state,value.get("version",""),value.get("edition",""),value.get("schema_profile",""),*files]
+sys.stdout.buffer.write(b"\0".join(str(item).encode() for item in fields)+b"\0")
+PY
+        mapfile -d '' -t restore_context < "$restore_context_file"
+        rm -f -- "$restore_context_file"
+    fi
+    if [[ ${restore_context[0]:-} == 1 ]]; then
+        [[ ${#restore_context[@]} -ge 6 ]] || die "legacy restore context journal is invalid"
+        CURRENT_VERSION=${restore_context[2]}
+        CURRENT_EDITION=${restore_context[3]}
+        CURRENT_SCHEMA_PROFILE=${restore_context[4]}
+        COMPOSE_PROJECT_DIR=$INSTALL_DIR
+        COMPOSE_ARGS=(--env-file "$INSTALL_DIR/.env")
+        local restore_compose
+        for restore_compose in "${restore_context[@]:5}"; do
+            [[ "$restore_compose" == docker-compose.yml \
+                || "$restore_compose" == docker-compose.override.yml ]] \
+                || die "legacy restore context names an unsafe Compose file"
+            COMPOSE_ARGS+=(-f "$INSTALL_DIR/$restore_compose")
+        done
+        COMPOSE_FILE="$INSTALL_DIR/${restore_context[5]}"
+        LEGACY_LAYOUT=1
+        LEGACY_RESTORE_CONTEXT=1
+    elif [[ -f "$INSTALL_DIR/.nano-role.env" ]]; then
         validate_regular_0600 "$INSTALL_DIR/.nano-role.env" ".nano-role.env"
         COMPOSE_FILE="$INSTALL_DIR/deploy/compose/docker-compose.enterprise.yml"
         [[ -f "$COMPOSE_FILE" && ! -L "$COMPOSE_FILE" ]] || die "enterprise role compose file is missing"
@@ -363,25 +428,85 @@ print(shard, replica, max(1, len(shards)))
 PY
             )
         fi
-    else
+    elif [[ -f "$INSTALL_DIR/docker-compose.opensource.yml" \
+        && -n "$(env_value "$INSTALL_DIR/.env" NANO_VERSION)" \
+        && ! -f "$INSTALL_DIR/.nano-legacy-layout-restored" ]]; then
         COMPOSE_FILE="$INSTALL_DIR/docker-compose.opensource.yml"
         [[ -f "$COMPOSE_FILE" && ! -L "$COMPOSE_FILE" ]] || die "docker-compose.opensource.yml is missing"
         COMPOSE_PROJECT_DIR="$(cd "$(dirname "$COMPOSE_FILE")" && pwd -P)"
         COMPOSE_ARGS=(--env-file "$INSTALL_DIR/.env" -f "$COMPOSE_FILE")
+        local overlay overlay_list
+        overlay_list="$(env_value "$INSTALL_DIR/.env" NANO_COMPOSE_OVERLAYS)"
+        read -r -a NANO_OVERLAY_LIST <<< "$overlay_list"
+        for overlay in ${NANO_OVERLAY_LIST[@]+"${NANO_OVERLAY_LIST[@]}"}; do
+            [[ "$overlay" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$ ]] \
+                || die "NANO_COMPOSE_OVERLAYS contains an invalid file name"
+            [[ -f "$INSTALL_DIR/$overlay" && ! -L "$INSTALL_DIR/$overlay" ]] \
+                || die "NANO_COMPOSE_OVERLAYS file is missing or symbolic: $overlay"
+            COMPOSE_ARGS+=(-f "$INSTALL_DIR/$overlay")
+        done
+    else
+        [[ -f "$LEGACY_LAYOUT_RESOLVER" && ! -L "$LEGACY_LAYOUT_RESOLVER" ]] \
+            || die "legacy layout resolver is missing"
+        local resolution_file resolution_count data_count data_offset
+        local resolution_fields=()
+        resolution_file="$(mktemp "${TMPDIR:-/tmp}/nano-legacy-resolution.XXXXXX")"
+        if ! python3 -I "$LEGACY_LAYOUT_RESOLVER" \
+            --install-dir "$INSTALL_DIR" --lock-dir "$SCRIPT_DIR/../deploy/release/legacy" \
+            --nul > "$resolution_file"; then
+            rm -f -- "$resolution_file"
+            die "legacy managed layout qualification failed"
+        fi
+        mapfile -d '' -t resolution_fields < "$resolution_file"
+        rm -f -- "$resolution_file"
+        [[ ${#resolution_fields[@]} -ge 7 ]] || die "legacy resolver returned an invalid result"
+        CURRENT_VERSION=${resolution_fields[0]}
+        CURRENT_EDITION=${resolution_fields[1]}
+        CURRENT_SCHEMA_PROFILE=${resolution_fields[2]}
+        LEGACY_PROJECT_NAME=${resolution_fields[3]}
+        resolution_count=${resolution_fields[4]}
+        [[ "$resolution_count" =~ ^[12]$ ]] \
+            || die "legacy resolver returned an invalid Compose file set"
+        LEGACY_COMPOSE_FILES=("${resolution_fields[@]:5:resolution_count}")
+        data_offset=$((5 + resolution_count))
+        data_count=${resolution_fields[$data_offset]:-}
+        [[ "$data_count" =~ ^[1-9][0-9]*$ \
+            && ${#resolution_fields[@]} -eq $((data_offset + 1 + data_count)) ]] \
+            || die "legacy resolver returned an invalid persistent data set"
+        LEGACY_DATA_SOURCES=("${resolution_fields[@]:data_offset+1:data_count}")
+        COMPOSE_FILE=${LEGACY_COMPOSE_FILES[0]}
+        COMPOSE_PROJECT_DIR=$INSTALL_DIR
+        COMPOSE_ARGS=(--env-file "$INSTALL_DIR/.env")
+        for overlay in "${LEGACY_COMPOSE_FILES[@]}"; do COMPOSE_ARGS+=(-f "$overlay"); done
+        LEGACY_LAYOUT=1
     fi
-    "$DOCKER_BIN" compose --project-directory "$COMPOSE_PROJECT_DIR" "${COMPOSE_ARGS[@]}" config --quiet >/dev/null \
-        || die "Compose configuration preflight failed for $COMPOSE_FILE"
-    CURRENT_VERSION="$(env_value "$INSTALL_DIR/.env" NANO_VERSION)"
-    if [[ -z "$CURRENT_VERSION" && -f "$INSTALL_DIR/images.lock" ]]; then
-        CURRENT_VERSION="$(sed -n 's/^# Release: v\{0,1\}//p' "$INSTALL_DIR/images.lock" | head -1)"
+    if [[ -n "$COMPOSE_OVERRIDE" ]]; then
+        COMPOSE_OVERRIDE="$(cd "$(dirname "$COMPOSE_OVERRIDE")" && pwd -P)/$(basename "$COMPOSE_OVERRIDE")"
+        [[ "$COMPOSE_OVERRIDE" == "$INSTALL_DIR/"* && -f "$COMPOSE_OVERRIDE" && ! -L "$COMPOSE_OVERRIDE" ]] \
+            || die "compose override must be a regular file inside the install directory"
+        COMPOSE_ARGS+=(-f "$COMPOSE_OVERRIDE")
+    fi
+    if ((!LEGACY_RESTORE_CONTEXT)); then
+        "$DOCKER_BIN" compose --project-directory "$COMPOSE_PROJECT_DIR" "${COMPOSE_ARGS[@]}" config --quiet >/dev/null \
+            || die "Compose configuration preflight failed for $COMPOSE_FILE"
+    fi
+    if ((!LEGACY_LAYOUT)); then
+        CURRENT_VERSION="$(env_value "$INSTALL_DIR/.env" NANO_VERSION)"
+        if [[ -z "$CURRENT_VERSION" && -f "$INSTALL_DIR/images.lock" ]]; then
+            CURRENT_VERSION="$(sed -n 's/^# Release: v\{0,1\}//p' "$INSTALL_DIR/images.lock" | head -1)"
+        fi
     fi
     [[ "$CURRENT_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "cannot determine semantic NANO_VERSION"
     CURRENT_VERSION="${CURRENT_VERSION#v}"
-    CURRENT_EDITION="$(env_value "$INSTALL_DIR/.env" NANO_EDITION)"
-    [[ -n "$CURRENT_EDITION" || ! -f "$INSTALL_DIR/.nano-edition" ]] || CURRENT_EDITION="$(tr -d '[:space:]' < "$INSTALL_DIR/.nano-edition")"
+    if ((!LEGACY_LAYOUT)); then
+        CURRENT_EDITION="$(env_value "$INSTALL_DIR/.env" NANO_EDITION)"
+        [[ -n "$CURRENT_EDITION" || ! -f "$INSTALL_DIR/.nano-edition" ]] || CURRENT_EDITION="$(tr -d '[:space:]' < "$INSTALL_DIR/.nano-edition")"
+    fi
     [[ "$CURRENT_EDITION" == open || "$CURRENT_EDITION" == enterprise ]] || die "cannot determine NANO_EDITION=open|enterprise"
-    CURRENT_SCHEMA_PROFILE="$(env_value "$INSTALL_DIR/.env" NANO_SCHEMA_PROFILE)"
-    CURRENT_SCHEMA_PROFILE="${CURRENT_SCHEMA_PROFILE:-udm}"
+    if ((!LEGACY_LAYOUT)); then
+        CURRENT_SCHEMA_PROFILE="$(env_value "$INSTALL_DIR/.env" NANO_SCHEMA_PROFILE)"
+        CURRENT_SCHEMA_PROFILE="${CURRENT_SCHEMA_PROFILE:-udm}"
+    fi
     [[ "$CURRENT_SCHEMA_PROFILE" == udm || "$CURRENT_SCHEMA_PROFILE" == ocsf ]] || die "cannot determine NANO_SCHEMA_PROFILE=udm|ocsf"
     [[ "$HOST_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || die "invalid host identity"
     [[ "$DEPLOYMENT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ ]] || die "invalid deployment id"
@@ -494,14 +619,21 @@ EOF
 ch_query() { ch_query_params; }
 
 dc_with_env() {
-    local env_file="$1"; shift
-    if [[ "$TOPOLOGY_MODE" == role-split ]]; then
-        "$DOCKER_BIN" compose --project-directory "$COMPOSE_PROJECT_DIR" \
-            --env-file "$env_file" --env-file "$INSTALL_DIR/.nano-role.env" -f "$COMPOSE_FILE" "$@"
-    else
-        "$DOCKER_BIN" compose --project-directory "$COMPOSE_PROJECT_DIR" \
-            --env-file "$env_file" -f "$COMPOSE_FILE" "$@"
-    fi
+    local env_file="$1" argument index=0; shift
+    local args=()
+    while ((index < ${#COMPOSE_ARGS[@]})); do
+        argument=${COMPOSE_ARGS[index]}
+        if [[ "$argument" == --env-file \
+            && $((index + 1)) -lt ${#COMPOSE_ARGS[@]} \
+            && "${COMPOSE_ARGS[index + 1]}" == "$INSTALL_DIR/.env" ]]; then
+            args+=(--env-file "$env_file")
+            index=$((index + 2))
+        else
+            args+=("$argument")
+            index=$((index + 1))
+        fi
+    done
+    "$DOCKER_BIN" compose --project-directory "$COMPOSE_PROJECT_DIR" "${args[@]}" "$@"
 }
 
 preflight_restore_runtime() {
@@ -539,26 +671,200 @@ assert_ch_locator() {
 }
 
 validate_clickhouse_disk() {
-    local disk="$1" type
+    local disk="$1" result type path extra
     [[ "$disk" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,63}$ ]] || die "invalid ClickHouse disk"
-    type="$(printf 'SELECT lower(type) FROM system.disks WHERE name={disk:String} FORMAT TSVRaw\n' \
-        | ch_query_params "--param_disk=$disk" | tr -d '[:space:]')"
+    result="$(printf 'SELECT lower(type), path FROM system.disks WHERE name={disk:String} FORMAT TSVRaw\n' \
+        | ch_query_params "--param_disk=$disk")"
+    [[ "$result" != *$'\n'* ]] || die "ClickHouse returned an ambiguous disk definition: $disk"
+    IFS=$'\t' read -r type path extra <<< "$result"
     [[ -n "$type" ]] || die "ClickHouse disk is not configured: $disk"
-    if [[ "$disk" != backups && "$type" != encrypted ]]; then
+    [[ -z "$extra" && "$type" =~ ^[a-z0-9_]+$ && "$path" == /* ]] \
+        || die "ClickHouse returned an invalid disk definition: $disk"
+    CH_LOCAL_DISK_PATH=""
+    if [[ "$disk" == backups ]]; then
+        [[ "$type" == local ]] \
+            || die "reserved ClickHouse disk backups has type $type; expected local"
+        [[ "$path" == /var/lib/clickhouse/backups/ ]] \
+            || die "ClickHouse backups disk has an unexpected path: $path"
+        CH_LOCAL_DISK_PATH="${path%/}"
+    elif ((LEGACY_LAYOUT)) && [[ "$disk" == default && "$type" == local ]]; then
+        [[ "$path" == /var/lib/clickhouse/ ]] \
+            || die "legacy ClickHouse default disk has an unexpected path: $path"
+        CH_LOCAL_DISK_PATH="${path%/}"
+    elif [[ "$type" != encrypted ]]; then
         die "external ClickHouse disk $disk has type $type; only explicitly encrypted disks are allowed"
     fi
+}
+
+install_legacy_clickhouse_backup_config() {
+    local source="$WORK_DIR/zz-nano-legacy-backup.xml"
+    ((LEGACY_LAYOUT)) || return 0
+    [[ "$CH_LOCAL_DISK_PATH" == /var/lib/clickhouse ]] \
+        || die "legacy ClickHouse backup requires its qualified default disk"
+    "$DOCKER_BIN" exec "$CH_CONTAINER" test ! -e \
+        /etc/clickhouse-server/config.d/zz-nano-legacy-backup.xml \
+        || die "legacy ClickHouse backup config path already exists"
+    printf '%s\n' \
+        '<clickhouse><backups><allowed_disk>default</allowed_disk></backups></clickhouse>' \
+        > "$source"
+    chmod 600 "$source"
+    "$DOCKER_BIN" cp "$source" \
+        "$CH_CONTAINER:/etc/clickhouse-server/config.d/zz-nano-legacy-backup.xml"
+    CH_LEGACY_BACKUP_CONFIG=1
+    "$DOCKER_BIN" exec "$CH_CONTAINER" chmod 0444 \
+        /etc/clickhouse-server/config.d/zz-nano-legacy-backup.xml
+    printf 'SYSTEM RELOAD CONFIG\n' | ch_query >/dev/null \
+        || die "cannot enable the temporary legacy ClickHouse backup disk"
+}
+
+remove_legacy_clickhouse_backup_config() {
+    ((CH_LEGACY_BACKUP_CONFIG)) || return 0
+    "$DOCKER_BIN" exec "$CH_CONTAINER" rm -f -- \
+        /etc/clickhouse-server/config.d/zz-nano-legacy-backup.xml \
+        || die "cannot remove the temporary legacy ClickHouse backup config"
+    printf 'SYSTEM RELOAD CONFIG\n' | ch_query >/dev/null \
+        || die "cannot reload ClickHouse after legacy backup"
+    CH_LEGACY_BACKUP_CONFIG=0
+}
+
+legacy_clickhouse_backup_exclusions() {
+    local name extra item result="" separator=""
+    ((LEGACY_LAYOUT)) || return 0
+    while IFS=$'\t' read -r name extra; do
+        [[ -z "$extra" && "$name" =~ ^\.tmp\.inner_id\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+            || die "unsupported hidden ClickHouse table blocks legacy backup"
+        printf -v item 'nanosiem.\140%s\140' "$name"
+        result+="$separator$item"
+        separator=", "
+    done < <(printf "SELECT name FROM system.tables WHERE database='nanosiem' AND name LIKE '.%%' ORDER BY name FORMAT TSVRaw\n" \
+        | ch_query)
+    [[ -z "$result" ]] || printf ' EXCEPT TABLES %s' "$result"
+}
+
+legacy_backup_recovery_begin() {
+    ((LEGACY_LAYOUT)) || return 0
+    LEGACY_BACKUP_RECOVERY="$INSTALL_DIR/.nano-legacy-backup-recovery.json"
+    [[ ! -e "$LEGACY_BACKUP_RECOVERY" && ! -L "$LEGACY_BACKUP_RECOVERY" ]] \
+        || die "legacy backup recovery is pending; resume the interrupted upgrade"
+    mapfile -t LEGACY_BACKUP_SERVICES < <(dc ps --status running --services 2>/dev/null)
+    [[ ${#LEGACY_BACKUP_SERVICES[@]} -gt 0 ]] \
+        || die "legacy backup recovery plan found no running services"
+    local service compose
+    for service in "${LEGACY_BACKUP_SERVICES[@]}"; do
+        [[ "$service" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] \
+            || die "legacy backup recovery plan found an unsafe service name"
+    done
+    for compose in "${LEGACY_COMPOSE_FILES[@]}"; do
+        [[ "$compose" == "$INSTALL_DIR/"* && ! -L "$compose" && -f "$compose" ]] \
+            || die "legacy backup recovery plan found an unsafe Compose file"
+    done
+    python3 -I - "$LEGACY_BACKUP_RECOVERY" "$INSTALL_DIR" "$LEGACY_PROJECT_NAME" \
+        "${#LEGACY_COMPOSE_FILES[@]}" "${LEGACY_COMPOSE_FILES[@]}" \
+        "${#LEGACY_BACKUP_SERVICES[@]}" "${LEGACY_BACKUP_SERVICES[@]}" <<'PY'
+import json,os,pathlib,sys
+out,install_dir,project,count,*values=sys.argv[1:]
+count=int(count); compose=values[:count]; del values[:count]
+service_count=int(values.pop(0)); services=values[:service_count]; del values[:service_count]
+if values or count not in (1,2) or not services:
+ raise SystemExit("invalid legacy backup recovery plan")
+path=pathlib.Path(out); temporary=path.with_name(f".{path.name}.tmp")
+value={
+ "format":"nano-legacy-backup-recovery-v1","phase":"planned",
+ "install_dir":install_dir,"project_name":project,
+ "compose_files":compose,"services":services,
+}
+with temporary.open("x",encoding="utf-8") as handle:
+ handle.write(json.dumps(value,sort_keys=True,indent=2)+"\n")
+ handle.flush();os.fsync(handle.fileno())
+temporary.chmod(0o600);os.replace(temporary,path)
+directory=os.open(path.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+try:os.fsync(directory)
+finally:os.close(directory)
+PY
+}
+
+legacy_backup_recovery_phase() {
+    local phase="$1"
+    [[ -n "$LEGACY_BACKUP_RECOVERY" ]] || return 0
+    python3 -I - "$LEGACY_BACKUP_RECOVERY" "$phase" <<'PY'
+import json,os,pathlib,sys
+path=pathlib.Path(sys.argv[1]);phase=sys.argv[2]
+value=json.loads(path.read_text(encoding="utf-8"))
+if value.get("format")!="nano-legacy-backup-recovery-v1":
+ raise SystemExit("invalid legacy backup recovery journal")
+value["phase"]=phase
+temporary=path.with_name(f".{path.name}.tmp")
+with temporary.open("w",encoding="utf-8") as handle:
+ handle.write(json.dumps(value,sort_keys=True,indent=2)+"\n")
+ handle.flush();os.fsync(handle.fileno())
+temporary.chmod(0o600);os.replace(temporary,path)
+PY
+}
+
+legacy_backup_recovery_restart() {
+    [[ -n "$LEGACY_BACKUP_RECOVERY" ]] || return 0
+    [[ -f "$LEGACY_BACKUP_RECOVERY" && ! -L "$LEGACY_BACKUP_RECOVERY" ]] \
+        || die "legacy backup recovery journal is missing or unsafe"
+    [[ ${#LEGACY_BACKUP_SERVICES[@]} -gt 0 ]] \
+        || die "legacy backup recovery service plan is empty"
+    log "restarting the exact pre-backup legacy service set: ${LEGACY_BACKUP_SERVICES[*]}"
+    dc start "${LEGACY_BACKUP_SERVICES[@]}" >/dev/null
+    local running service
+    running="$(dc ps --status running --services 2>/dev/null || true)"
+    for service in "${LEGACY_BACKUP_SERVICES[@]}"; do
+        grep -qx "$service" <<<"$running" \
+            || die "legacy backup recovery could not restart service: $service"
+    done
+    python3 -I - "$LEGACY_BACKUP_RECOVERY" <<'PY'
+import json,os,pathlib,sys
+path=pathlib.Path(sys.argv[1]);value=json.loads(path.read_text(encoding="utf-8"))
+if value.get("format")!="nano-legacy-backup-recovery-v1":
+ raise SystemExit("invalid legacy backup recovery journal")
+path.unlink();directory=os.open(path.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+try:os.fsync(directory)
+finally:os.close(directory)
+PY
+    LEGACY_BACKUP_RECOVERY=""
+    LEGACY_BACKUP_SERVICES=()
+    STOPPED_SERVICES=()
+}
+
+stop_legacy_vector_gracefully() {
+    local container state
+    container="$(dc ps -q vector)"
+    [[ "$container" =~ ^[0-9a-f]{12,64}$ ]] \
+        || die "legacy Vector container identity is invalid before drain"
+    log "stopping legacy Vector with its bounded acknowledged-event drain"
+    dc stop --timeout 300 vector >/dev/null
+    state="$("$DOCKER_BIN" inspect --format \
+        '{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}}' \
+        "$container" 2>/dev/null || true)"
+    [[ "$state" == "exited 0 false" ]] \
+        || die "legacy Vector did not complete a clean acknowledged-event drain"
+    ok "legacy Vector completed its SIGTERM drain and exited cleanly"
 }
 
 quiesce_local_writers() {
     local running service candidates=()
     running="$(dc ps --status running --services 2>/dev/null || true)"
-    for service in vector connector-runner nano-api nano-jobs nano-search; do
+    local writer_services=(vector connector-runner nano-api nano-jobs nano-search)
+    if ((LEGACY_LAYOUT)); then
+        writer_services=(nginx api jobs search)
+        legacy_backup_recovery_phase ingress-quiescing
+    fi
+    for service in "${writer_services[@]}"; do
         grep -qx "$service" <<<"$running" && candidates+=("$service")
     done
     if [[ ${#candidates[@]} -gt 0 ]]; then
         log "quiescing local writers: ${candidates[*]}"
-        dc stop "${candidates[@]}" >/dev/null
+        dc stop --timeout 60 "${candidates[@]}" >/dev/null
         STOPPED_SERVICES=("${candidates[@]}")
+    fi
+    if ((LEGACY_LAYOUT)) && grep -qx vector <<<"$running"; then
+        legacy_backup_recovery_phase vector-stopping
+        stop_legacy_vector_gracefully
+        legacy_backup_recovery_phase vector-drained
+        STOPPED_SERVICES+=(vector)
     fi
 }
 
@@ -568,6 +874,121 @@ resume_local_writers() {
         dc start "${STOPPED_SERVICES[@]}" >/dev/null
         STOPPED_SERVICES=()
     fi
+}
+
+validate_legacy_physical_archive() {
+    local archive="$1" expected_bytes="${2:-}"
+    python3 -I - "$archive" "$expected_bytes" <<'PY'
+import pathlib,posixpath,sys,tarfile
+
+archive=pathlib.Path(sys.argv[1]);expected=sys.argv[2]
+if archive.is_symlink() or not archive.is_file():
+ raise SystemExit("legacy physical archive is missing or symbolic")
+if expected:
+ if not expected.isdigit() or int(expected)<=0 or archive.stat().st_size!=int(expected):
+  raise SystemExit("legacy physical archive size changed")
+
+def normalize(raw):
+ if not raw or "\0" in raw or pathlib.PurePosixPath(raw).is_absolute():
+  raise SystemExit("legacy physical archive contains an unsafe path")
+ parts=[part for part in pathlib.PurePosixPath(raw).parts if part not in ("", ".")]
+ if ".." in parts:
+  raise SystemExit("legacy physical archive contains path traversal")
+ return "/".join(parts) or "."
+
+def ancestors(name, include_self=False):
+ if name==".":return []
+ parts=name.split("/");limit=len(parts)+(1 if include_self else 0)
+ return ["/".join(parts[:index]) for index in range(1,limit)]
+
+with tarfile.open(archive,"r:") as data:
+ members={}
+ for member in data.getmembers():
+  name=normalize(member.name)
+  if name in members:raise SystemExit("legacy physical archive contains duplicate paths")
+  if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+   raise SystemExit("legacy physical archive contains an unsupported entry")
+  members[name]=member
+ symlinks={name for name,member in members.items() if member.issym()}
+ for name,member in members.items():
+  if any(parent in symlinks for parent in ancestors(name)):
+   raise SystemExit("legacy physical archive nests content below a symbolic link")
+  if member.issym():
+   link=member.linkname
+   if not link or "\0" in link or pathlib.PurePosixPath(link).is_absolute():
+    raise SystemExit("legacy physical archive contains an unsafe symbolic link")
+   target=posixpath.normpath(posixpath.join(posixpath.dirname(name),link))
+   if target==".." or target.startswith("../"):
+    raise SystemExit("legacy physical archive symbolic link escapes its root")
+   target=normalize(target)
+   if target not in members or any(
+    parent in symlinks for parent in ancestors(target,include_self=True)
+   ):
+    raise SystemExit("legacy physical archive symbolic link target is unsafe")
+  elif member.islnk():
+   target=normalize(member.linkname)
+   if target not in members or not members[target].isfile():
+    raise SystemExit("legacy physical archive hard link target is unsafe")
+PY
+}
+
+snapshot_legacy_data() {
+    local legacy_payload="$1" source archive service index=0
+    local running=() desired=() archives=() archive_bytes=()
+    mapfile -t running < <(dc ps --status running --services 2>/dev/null)
+    desired=("${LEGACY_BACKUP_SERVICES[@]}")
+    [[ ${#desired[@]} -gt 0 ]] || die "legacy physical snapshot found no running services"
+    for service in "${desired[@]}"; do
+        [[ "$service" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] \
+            || die "legacy physical snapshot found an unsafe service name"
+    done
+    if [[ ${#running[@]} -gt 0 ]]; then
+        legacy_backup_recovery_phase physical-snapshot-stopping
+        log "stopping qualified legacy services for the physical recovery snapshot"
+        dc stop --timeout 60 "${running[@]}" >/dev/null
+    fi
+    STOPPED_SERVICES=("${desired[@]}")
+    legacy_backup_recovery_phase physical-snapshot
+    for source in "${LEGACY_DATA_SOURCES[@]}"; do
+        [[ "$source" = /* && -d "$source" && ! -L "$source" ]] \
+            || die "qualified legacy data source changed before snapshot"
+        archive="data-$(printf '%03d' "$index").tar"
+        log "capturing quiesced legacy data source $((index + 1))/${#LEGACY_DATA_SOURCES[@]}"
+        tar -C "$source" -cpf "$legacy_payload/$archive" . \
+            || die "legacy physical data snapshot failed"
+        validate_legacy_physical_archive "$legacy_payload/$archive" \
+            || die "legacy physical data contains an unsafe archive entry"
+        chmod 600 "$legacy_payload/$archive"
+        archives+=("$archive")
+        archive_bytes+=("$(file_size "$legacy_payload/$archive")")
+        index=$((index + 1))
+    done
+    python3 -I - "$legacy_payload/layout.json" "${#desired[@]}" "${desired[@]}" \
+        "${#archives[@]}" "${archives[@]}" "${archive_bytes[@]}" <<'PY'
+import json,pathlib,sys
+path=pathlib.Path(sys.argv[1]); values=sys.argv[2:]
+service_count=int(values.pop(0)); services=values[:service_count]; del values[:service_count]
+archive_count=int(values.pop(0)); archives=values[:archive_count]; del values[:archive_count]
+archive_bytes=values[:archive_count]; del values[:archive_count]
+if values or not services or archive_count < 1 or not all(item.isdigit() for item in archive_bytes):
+ raise SystemExit("invalid legacy physical snapshot metadata")
+value=json.loads(path.read_text(encoding="utf-8"))
+sources=value.get("data_sources", [])
+if archive_count != len(sources):
+ raise SystemExit("legacy physical snapshot source count changed")
+value["physical_snapshot"]={
+ "format":"nano-legacy-physical-v1",
+ "archives":archives,
+ "entries":[
+  {"path":source,"archive":archive,"bytes":int(size)}
+  for source,archive,size in zip(sources,archives,archive_bytes)
+ ],
+ "running_services":services,
+}
+path.write_text(json.dumps(value,sort_keys=True,indent=2)+"\n",encoding="utf-8")
+PY
+    legacy_backup_recovery_phase restarting
+    legacy_backup_recovery_restart
 }
 
 monotonic_ms() {
@@ -904,15 +1325,19 @@ backup_keygen() {
 }
 
 copy_local_archive() {
-    local source="$1" archive="$2"
+    local source="$1" archive="$2" target
     assert_ch_locator backups "$archive"
+    [[ "$CH_LOCAL_DISK_PATH" == /var/lib/clickhouse/backups \
+        || "$CH_LOCAL_DISK_PATH" == /var/lib/clickhouse ]] \
+        || die "ClickHouse local archive path is unavailable"
+    target="$CH_LOCAL_DISK_PATH/$archive"
     [[ -f "$source/$archive" && ! -L "$source/$archive" ]] || die "encrypted payload lacks $archive"
-    "$DOCKER_BIN" exec "$CH_CONTAINER" test ! -e "/var/lib/clickhouse/backups/$archive" \
+    "$DOCKER_BIN" exec "$CH_CONTAINER" test ! -e "$target" \
         || die "ClickHouse scratch archive already exists: $archive"
-    "$DOCKER_BIN" cp "$source/$archive" "$CH_CONTAINER:/var/lib/clickhouse/backups/$archive"
-    "$DOCKER_BIN" exec "$CH_CONTAINER" chown clickhouse:clickhouse "/var/lib/clickhouse/backups/$archive"
-    "$DOCKER_BIN" exec "$CH_CONTAINER" chmod 600 "/var/lib/clickhouse/backups/$archive"
-    CH_LOCAL_FILES+=("$archive")
+    "$DOCKER_BIN" cp "$source/$archive" "$CH_CONTAINER:$target"
+    "$DOCKER_BIN" exec "$CH_CONTAINER" chown clickhouse:clickhouse "$target"
+    "$DOCKER_BIN" exec "$CH_CONTAINER" chmod 600 "$target"
+    CH_LOCAL_FILES+=("$target")
 }
 
 validate_ch_counts_file() {
@@ -983,7 +1408,7 @@ start_ch_refreshable_views() {
 write_ch_schema_inventory() {
     local output="$1" validation_db
     validation_db="nano_schema_check_$(openssl rand -hex 6)"
-    printf "SELECT toJSONString(map('name',t.name,'engine',t.engine,'engine_full',t.engine_full,'sorting_key',t.sorting_key,'column_name',c.name,'column_type',c.type)) FROM system.tables AS t INNER JOIN system.columns AS c ON c.database=t.database AND c.table=t.name WHERE t.database='nanosiem' AND t.engine LIKE '%%MergeTree' ORDER BY t.name,c.position FORMAT TSVRaw\n" \
+    printf "SELECT toJSONString(map('name',t.name,'engine',t.engine,'engine_full',t.engine_full,'sorting_key',t.sorting_key,'column_name',c.name,'column_type',c.type)) FROM system.tables AS t INNER JOIN system.columns AS c ON c.database=t.database AND c.table=t.name WHERE t.database='nanosiem' AND t.engine LIKE '%%MergeTree' AND t.name NOT LIKE '.%%' ORDER BY t.name,c.position FORMAT TSVRaw\n" \
         | ch_query > "$output" || die "cannot capture ClickHouse table schema"
     [[ -s "$output" ]] || die "ClickHouse table schema inventory is empty"
     chmod 600 "$output"
@@ -1013,9 +1438,15 @@ verify_ch_archive_contents() {
             || die "cannot create isolated ClickHouse verification table: $table"
         printf '%s\t%s\n' "$table" "$engine" >> "$schema_inventory"
     done
-    printf 'RESTORE DATABASE nanosiem AS %s FROM Disk({disk:String}, {archive:String}) SETTINGS allow_different_table_def=1, restore_replace_external_dictionary_source_to_null=1, restore_replace_external_engines_to_null=1, restore_replace_external_table_functions_to_null=1\n' "$CH_VERIFY_DB" \
-        | ch_query_params "--param_disk=$disk" "--param_archive=$archive" >/dev/null \
-        || die "ClickHouse archive data verification failed for $disk/$archive"
+    while IFS=$'\t' read -r table engine extra; do
+        [[ -z "$extra" && "$table" =~ ^[A-Za-z0-9_.-]{1,200}$ \
+            && "$CH_VERIFY_DB" =~ ^nano_archive_check_[0-9a-f]{12}$ ]] \
+            || die "unsafe ClickHouse archive table at restore boundary"
+        printf 'RESTORE TABLE nanosiem.\140%s\140 AS \140%s\140.\140%s\140 FROM Disk({disk:String}, {archive:String}) SETTINGS allow_different_table_def=1\n' \
+            "$table" "$CH_VERIFY_DB" "$table" \
+            | ch_query_params "--param_disk=$disk" "--param_archive=$archive" >/dev/null \
+            || die "ClickHouse archive data verification failed for table: $table"
+    done < "$schema_inventory"
     printf "SELECT name,engine FROM system.tables WHERE database={database:String} AND engine LIKE '%%MergeTree' ORDER BY name FORMAT TSVRaw\n" \
         | ch_query_params "--param_database=$CH_VERIFY_DB" > "$restored_tables" \
         || die "cannot enumerate verified ClickHouse archive"
@@ -1105,7 +1536,7 @@ prune_backups() {
 }
 
 backup_command() {
-    local key_file="" output="" base_bundle="" keep=0 ch_disk=backups on_cluster=0 set_id="" quiesce_epoch="" snapshot_gate="" component=auto
+    local key_file="" output="" base_bundle="" keep=0 ch_disk="" on_cluster=0 set_id="" quiesce_epoch="" snapshot_gate="" component=auto
     local backup_id created payload pg_in=false pg_mig=0 pg_bytes=0 ch_in=false ch_mig=0 ch_bytes=0 archive=""
     local external=false external_encrypted=false scope=host base_id="" base_sha="" result fingerprint base_snapshot="" base_payload=""
     local manifest_disk="" backup_started_ms writer_down_started_ms writer_down_ms=0 total_ms
@@ -1117,13 +1548,18 @@ backup_command() {
         --recovery-set-id) set_id="$2"; shift 2 ;; --quiesce-epoch) quiesce_epoch="$2"; shift 2 ;;
         --snapshot-gate) snapshot_gate="$2"; shift 2 ;;
         --component) component="$2"; shift 2 ;;
-        --install-dir) INSTALL_DIR="$2"; shift 2 ;; *) usage ;;
+        --install-dir) INSTALL_DIR="$2"; shift 2 ;;
+        --compose-override) COMPOSE_OVERRIDE="$2"; shift 2 ;; *) usage ;;
     esac; done
     [[ -n "$key_file" ]] || usage
     [[ "$keep" =~ ^[0-9]+$ ]] || die "--keep must be a non-negative integer"
-    [[ "$ch_disk" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,63}$ ]] || die "invalid ClickHouse disk"
     [[ "$component" =~ ^(auto|postgres|clickhouse)$ ]] || die "--component must be postgres or clickhouse"
     init_context; validate_key_file "$key_file"
+    if [[ -z "$ch_disk" ]]; then
+        if ((LEGACY_LAYOUT)); then ch_disk=default; else ch_disk=backups; fi
+    fi
+    [[ "$ch_disk" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,63}$ ]] || die "invalid ClickHouse disk"
+    ((!LEGACY_LAYOUT)) || require_cmd tar "install tar"
     backup_started_ms="$(monotonic_ms)"
     ((!on_cluster)) || die "--on-cluster cannot produce per-shard signed recovery components; run on replica 1 of each shard"
     if [[ "$TOPOLOGY_MODE" == role-split ]]; then
@@ -1137,6 +1573,9 @@ backup_command() {
         [[ -z "$snapshot_gate" ]] || die "--snapshot-gate requires role-split topology"
     fi
     [[ -z "$snapshot_gate" ]] || validate_snapshot_gate "$snapshot_gate"
+    if ((LEGACY_LAYOUT)) && [[ -n "$base_bundle" ]]; then
+        die "legacy layout transition requires a full backup; --base is unsupported"
+    fi
     if ((on_cluster)); then
         [[ "$TOPOLOGY_MODE" == role-split && "$ch_disk" != backups ]] || die "--on-cluster requires role-split plus a shared external disk"
         has_role clickhouse || die "run --on-cluster on a ClickHouse host"
@@ -1154,6 +1593,27 @@ backup_command() {
     cp "$INSTALL_DIR/.env" "$payload/.env"
     [[ ! -f "$INSTALL_DIR/.nano-host-identity" ]] || cp "$INSTALL_DIR/.nano-host-identity" "$payload/.nano-host-identity"
     [[ ! -f "$INSTALL_DIR/.nano-role.env" ]] || cp "$INSTALL_DIR/.nano-role.env" "$payload/.nano-role.env"
+    if ((LEGACY_LAYOUT)); then
+        local legacy_payload="$payload/legacy-layout" legacy_file
+        mkdir -p "$legacy_payload"; chmod 700 "$legacy_payload"
+        for legacy_file in "${LEGACY_COMPOSE_FILES[@]}"; do
+            cp "$legacy_file" "$legacy_payload/$(basename "$legacy_file")"
+        done
+        python3 -I - "$legacy_payload/layout.json" "$CURRENT_VERSION" "$CURRENT_EDITION" \
+            "$CURRENT_SCHEMA_PROFILE" "$LEGACY_PROJECT_NAME" "${#LEGACY_COMPOSE_FILES[@]}" \
+            "${#LEGACY_DATA_SOURCES[@]}" "${LEGACY_DATA_SOURCES[@]}" <<'PY'
+import json,pathlib,sys
+out,version,edition,schema,project,count,data_count,*sources=sys.argv[1:]
+if len(sources) != int(data_count):raise SystemExit("invalid legacy data source count")
+pathlib.Path(out).write_text(json.dumps({
+ "format":"nano-legacy-layout-v1","version":version,"edition":edition,
+ "schema_profile":schema,"project_name":project,
+ "compose_files":["docker-compose.yml"] + (["docker-compose.override.yml"] if count == "2" else []),
+ "data_sources":sources,
+},sort_keys=True,indent=2)+"\n",encoding="utf-8")
+PY
+        chmod 600 "$legacy_payload"/*
+    fi
     if [[ "$component" == postgres || "$component" == auto ]] && has_role postgres; then
         prepare_pg; pg_in=true
     fi
@@ -1164,6 +1624,7 @@ backup_command() {
         || die "PostgreSQL backup component requested on a host without the postgres role"
     [[ "$component" != clickhouse || "$ch_in" == true ]] \
         || die "ClickHouse backup component requested on a host without the clickhouse role"
+    [[ "$ch_in" != true ]] || install_legacy_clickhouse_backup_config
     if [[ -n "$base_bundle" ]]; then
         base_snapshot="$(snapshot_bundle "$base_bundle" base)" || die "base backup is incomplete"
         load_snapshot "$base_snapshot" "$key_file" base || die "base backup signature/schema/digest verification failed"
@@ -1181,14 +1642,19 @@ backup_command() {
     if [[ "$ch_in" == true ]]; then
         manifest_disk="$ch_disk"
         archive="$backup_id.zip"; assert_ch_locator "$ch_disk" "$archive"
-        if [[ -n "$base_bundle" && "$ch_disk" == backups ]]; then copy_local_archive "$base_payload" "$B_ARCHIVE"; fi
+        if [[ -n "$base_bundle" && -n "$CH_LOCAL_DISK_PATH" ]]; then copy_local_archive "$base_payload" "$B_ARCHIVE"; fi
         if ((on_cluster)); then
             cluster="$(role_env_value CLICKHOUSE_CLUSTER)"
             [[ "$cluster" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,63}$ ]] || die "invalid cluster"
             cluster_clause=" ON CLUSTER '$cluster'"
         fi
-        query="BACKUP DATABASE nanosiem${cluster_clause} TO Disk({disk:String}, {archive:String}) SETTINGS fsync_backup_files=1"
+        query="BACKUP DATABASE nanosiem${cluster_clause}"
+        query+="$(legacy_clickhouse_backup_exclusions)"
+        query+=" TO Disk({disk:String}, {archive:String})"
         params=("--param_disk=$ch_disk" "--param_archive=$archive")
+        if ((!LEGACY_LAYOUT)); then
+            query+=" SETTINGS fsync_backup_files=1"
+        fi
         if [[ -n "$base_bundle" ]]; then
             assert_ch_locator "$B_DISK" "$B_ARCHIVE"
             query+=", base_backup = Disk({base_disk:String}, {base_archive:String})"
@@ -1201,7 +1667,10 @@ backup_command() {
     # An external coordinator owns the cluster-wide mutation fence and exact
     # writer plan. Component workers must not stop co-located API or ingest
     # services behind its back.
-    [[ -n "$snapshot_gate" ]] || quiesce_local_writers
+    if [[ -z "$snapshot_gate" ]]; then
+        ((LEGACY_LAYOUT)) && legacy_backup_recovery_begin
+        quiesce_local_writers
+    fi
     if [[ "$pg_in" == true ]]; then
         start_pg_exported_snapshot
         pg_mig="$PG_BACKUP_MIGRATION"
@@ -1220,7 +1689,9 @@ backup_command() {
         [[ "$ch_backup_status" == BACKUP_CREATED ]] || wait_ch_backup_snapshot "$ch_backup_id"
     fi
     created="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    [[ -n "$snapshot_gate" ]] || resume_local_writers
+    if ((!LEGACY_LAYOUT)) && [[ -z "$snapshot_gate" ]]; then
+        resume_local_writers
+    fi
     writer_down_ms=$(( $(monotonic_ms) - writer_down_started_ms ))
     mark_snapshot_ready "$snapshot_gate"
     if [[ "$pg_in" == true ]]; then
@@ -1235,12 +1706,22 @@ backup_command() {
         verify_ch_archive_contents "$ch_disk" "$archive" "$payload/clickhouse-row-counts.tsv" "" \
             "$payload/clickhouse-table-schema.jsonl"
         ch_mig="$MEASURED_CH_MIG"
-        if [[ "$ch_disk" == backups ]]; then
-            "$DOCKER_BIN" cp "$CH_CONTAINER:/var/lib/clickhouse/backups/$archive" "$payload/$archive"
-            CH_LOCAL_FILES+=("$archive")
+        if [[ -n "$CH_LOCAL_DISK_PATH" ]]; then
+            local local_archive="$CH_LOCAL_DISK_PATH/$archive"
+            "$DOCKER_BIN" cp "$CH_CONTAINER:$local_archive" "$payload/$archive"
+            CH_LOCAL_FILES+=("$local_archive")
         else
             external=true; external_encrypted=true
         fi
+    fi
+    if ((LEGACY_LAYOUT)); then
+        if [[ "$ch_in" == true && -n "$CH_LOCAL_DISK_PATH" ]]; then
+            "$DOCKER_BIN" exec "$CH_CONTAINER" rm -f -- "$CH_LOCAL_DISK_PATH/$archive" >/dev/null
+            CH_LOCAL_FILES=()
+        fi
+        remove_legacy_clickhouse_backup_config
+        snapshot_legacy_data "$payload/legacy-layout"
+        writer_down_ms=$(( $(monotonic_ms) - writer_down_started_ms ))
     fi
     log "encrypting payload with AES-256-GCM"
     encrypt_payload "$payload" "$BUNDLE_TMP/payload.cms" "$key_file"
@@ -1290,12 +1771,15 @@ recovery_set_create_command() {
 }
 
 ensure_target_compatible() {
+    local restore_layout="${1:-}"
     [[ "$M_EDITION" == "$CURRENT_EDITION" ]] || die "edition mismatch"
     [[ "$M_SCHEMA" == "$CURRENT_SCHEMA_PROFILE" ]] || die "schema profile mismatch ($M_SCHEMA backup, $CURRENT_SCHEMA_PROFILE target)"
     [[ "$M_MODE" == "$TOPOLOGY_MODE" ]] || die "backup topology $M_MODE cannot restore onto $TOPOLOGY_MODE"
     version_ge "$CURRENT_VERSION" "$M_VERSION" || die "refusing backup from nano $M_VERSION on older nano $CURRENT_VERSION"
-    (( $(available_pg_migration) >= M_PG_MIG )) || die "current PostgreSQL migrations are older than backup migration $M_PG_MIG"
-    (( $(available_ch_migration) >= M_CH_MIG )) || die "current ClickHouse migrations are older than backup migration $M_CH_MIG"
+    if [[ "$restore_layout" != legacy ]]; then
+        (( $(available_pg_migration) >= M_PG_MIG )) || die "current PostgreSQL migrations are older than backup migration $M_PG_MIG"
+        (( $(available_ch_migration) >= M_CH_MIG )) || die "current ClickHouse migrations are older than backup migration $M_CH_MIG"
+    fi
     if [[ "$M_MODE" == role-split ]]; then
         [[ "$M_DEPLOYMENT" == "$DEPLOYMENT_ID" && "$M_IDENTITY" == "$DEPLOYMENT_IDENTITY" ]] || die "deployment identity mismatch"
         [[ "$M_SCOPE" == cluster || "$M_HOST" == "$HOST_ID" ]] || die "backup host mismatch"
@@ -1503,28 +1987,422 @@ raise SystemExit(0 if values(sys.argv[1])==values(sys.argv[2]) else 1)
 PY
 }
 
+load_legacy_physical_snapshot() {
+    local payload="$1"
+    local metadata="$payload/legacy-layout/layout.json"
+    local model="$WORK_DIR/legacy-restore-model.json" fields_file="$WORK_DIR/legacy-restore-fields.bin"
+    local compose_args=(--env-file "$payload/.env" -f "$payload/legacy-layout/docker-compose.yml")
+    [[ -f "$payload/legacy-layout/docker-compose.override.yml" ]] \
+        && compose_args+=(-f "$payload/legacy-layout/docker-compose.override.yml")
+    "$DOCKER_BIN" compose --project-directory "$INSTALL_DIR" "${compose_args[@]}" \
+        config --format json > "$model" \
+        || die "signed legacy Compose snapshot does not render"
+    chmod 600 "$model"
+    python3 -I - "$metadata" "$model" "$payload/legacy-layout" "$INSTALL_DIR" > "$fields_file" <<'PY'
+import json,pathlib,sys
+metadata_path,model_path,payload_root,install_dir=map(pathlib.Path,sys.argv[1:])
+value=json.loads(metadata_path.read_text(encoding="utf-8"))
+model=json.loads(model_path.read_text(encoding="utf-8"))
+sources=value.get("data_sources")
+physical=value.get("physical_snapshot")
+if not isinstance(sources,list) or not sources or not all(isinstance(v,str) for v in sources):
+ raise SystemExit("legacy snapshot has invalid data sources")
+if not isinstance(physical,dict) or physical.get("format") != "nano-legacy-physical-v1":
+ raise SystemExit("legacy backup lacks a physical recovery snapshot")
+archives=physical.get("archives"); entries=physical.get("entries"); running=physical.get("running_services")
+if not isinstance(archives,list) or len(archives) != len(sources):
+ raise SystemExit("legacy physical archive count is invalid")
+if not isinstance(entries,list) or len(entries) != len(sources):
+ raise SystemExit("legacy physical archive inventory is invalid")
+if not isinstance(running,list) or not running or not all(isinstance(v,str) for v in running):
+ raise SystemExit("legacy physical running-service set is invalid")
+services=model.get("services")
+if not isinstance(services,dict) or not set(running) <= set(services):
+ raise SystemExit("legacy physical running-service set does not match Compose")
+if not {"postgres","clickhouse","vector","api","jobs","search"} <= set(running):
+ raise SystemExit("legacy physical snapshot lacks required running services")
+targets={
+ ("postgres","/var/lib/postgresql/data"),("clickhouse","/var/lib/clickhouse"),
+ ("vector","/etc/vector/dynamic"),("vector","/var/lib/vector"),
+ ("api","/app/data"),("api","/etc/vector/dynamic"),("api","/app/config/vector"),
+ ("jobs","/app/data"),("prometheus","/prometheus"),
+}
+rendered=set()
+for service_name,service in services.items():
+ if not isinstance(service,dict):raise SystemExit("legacy Compose service is invalid")
+ for volume in service.get("volumes") or []:
+  if not isinstance(volume,dict):raise SystemExit("legacy Compose volume is invalid")
+  if (service_name,str(volume.get("target",""))) not in targets:continue
+  source=volume.get("source")
+  if volume.get("type") != "bind" or not isinstance(source,str) or not pathlib.Path(source).is_absolute():
+   raise SystemExit("legacy persistent Compose mount is invalid")
+  rendered.add(str(pathlib.Path(source).resolve()))
+if sorted(sources) != sorted(rendered) or len(set(sources)) != len(sources):
+ raise SystemExit("signed legacy data sources do not match rendered Compose")
+for index,(source,archive_name,entry) in enumerate(zip(sources,archives,entries)):
+ if archive_name != f"data-{index:03d}.tar":raise SystemExit("legacy physical archive name is invalid")
+ if not isinstance(entry,dict) or entry != {
+  "path":source,"archive":archive_name,"bytes":entry.get("bytes")
+ } or not isinstance(entry.get("bytes"),int) or entry["bytes"] <= 0:
+  raise SystemExit("legacy physical archive inventory entry is invalid")
+ source_path=pathlib.Path(source)
+ if not source_path.is_absolute() or source_path in {pathlib.Path('/'),pathlib.Path('/mnt'),pathlib.Path('/var')}:
+  raise SystemExit("legacy physical data source is unsafe")
+ if source_path==install_dir or source_path in install_dir.parents or install_dir in source_path.parents:
+  raise SystemExit("legacy physical data source overlaps the installation control tree")
+ archive=payload_root/archive_name
+ if archive.is_symlink() or not archive.is_file():raise SystemExit("legacy physical archive is missing")
+ if archive.stat().st_size != entry["bytes"]:raise SystemExit("legacy physical archive size changed")
+fields=[str(len(sources)),*sources,*archives,*(str(entry["bytes"]) for entry in entries),str(len(running)),*running]
+sys.stdout.buffer.write(b"\0".join(v.encode() for v in fields)+b"\0")
+PY
+    local fields=() count running_offset running_count
+    mapfile -d '' -t fields < "$fields_file"
+    count=${fields[0]:-}
+    [[ "$count" =~ ^[1-9][0-9]*$ && ${#fields[@]} -ge $((1 + count * 3 + 2)) ]] \
+        || die "legacy physical snapshot metadata is invalid"
+    LEGACY_RESTORE_SOURCES=("${fields[@]:1:count}")
+    LEGACY_RESTORE_ARCHIVES=("${fields[@]:1+count:count}")
+    LEGACY_RESTORE_ARCHIVE_BYTES=("${fields[@]:1+count*2:count}")
+    for index in "${!LEGACY_RESTORE_ARCHIVES[@]}"; do
+        validate_legacy_physical_archive \
+            "$payload/legacy-layout/${LEGACY_RESTORE_ARCHIVES[$index]}" \
+            "${LEGACY_RESTORE_ARCHIVE_BYTES[$index]}" \
+            || die "legacy physical archive validation failed: ${LEGACY_RESTORE_ARCHIVES[$index]}"
+    done
+    running_offset=$((1 + count * 3))
+    running_count=${fields[$running_offset]:-}
+    [[ "$running_count" =~ ^[1-9][0-9]*$ \
+        && ${#fields[@]} -eq $((running_offset + 1 + running_count)) ]] \
+        || die "legacy physical snapshot running-service metadata is invalid"
+    LEGACY_RESTORE_SERVICES=("${fields[@]:running_offset+1:running_count}")
+}
+
+wait_legacy_restored_services() {
+    local deadline=$((SECONDS + 300)) status all_ready service container
+    while :; do
+        all_ready=1
+        for service in "$@"; do
+            container="$(service_container "$service" 2>/dev/null || true)"
+            if [[ -z "$container" ]]; then all_ready=0; continue; fi
+            status="$("$DOCKER_BIN" inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container")"
+            [[ "$status" != unhealthy && "$status" != exited && "$status" != dead ]] \
+                || die "restored legacy service failed its health gate: $service ($status)"
+            [[ "$status" == healthy || "$status" == running ]] || all_ready=0
+        done
+        ((all_ready)) && return 0
+        ((SECONDS < deadline)) || die "restored legacy services did not become healthy within 300 seconds"
+        sleep 2
+    done
+}
+
+legacy_restore_journal_update() {
+    local journal="$1" kind="$2" value="$3" index="${4:-}"
+    python3 -I - "$journal" "$kind" "$value" "$index" <<'PY'
+import json,os,pathlib,sys
+path=pathlib.Path(sys.argv[1]);kind,value,index=sys.argv[2:]
+document=json.loads(path.read_text(encoding="utf-8"))
+if document.get("format")!="nano-legacy-restore-v2":
+ raise SystemExit("invalid legacy restore journal")
+if kind=="state":document["state"]=value
+elif kind=="root":document["roots"][int(index)]["phase"]=value
+else:raise SystemExit("invalid legacy restore journal update")
+temporary=path.with_name(f".{path.name}.tmp")
+with temporary.open("w",encoding="utf-8") as handle:
+ handle.write(json.dumps(document,sort_keys=True,indent=2)+"\n")
+ handle.flush();os.fsync(handle.fileno())
+temporary.chmod(0o600);os.replace(temporary,path)
+directory=os.open(path.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+try:os.fsync(directory)
+finally:os.close(directory)
+PY
+}
+
+legacy_restore_journal_read() {
+    local journal="$1" kind="$2" index="${3:-}"
+    python3 -I - "$journal" "$kind" "$index" <<'PY'
+import json,pathlib,sys
+value=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if value.get("format")!="nano-legacy-restore-v2":raise SystemExit("invalid legacy restore journal")
+if sys.argv[2]=="state":print(value["state"])
+elif sys.argv[2]=="root":print(value["roots"][int(sys.argv[3])]["phase"])
+else:raise SystemExit("invalid legacy restore journal read")
+PY
+}
+
+restore_legacy_physical() {
+    local payload="$1" force="$2" index source archive quarantine stage phase state
+    local metadata="$payload/legacy-layout/layout.json"
+    ((force)) || die "legacy physical restore replaces current data; use --force after verifying the mandatory backup"
+    [[ -z "$M_BASE_ID" ]] || die "legacy layout restore requires the full mandatory backup"
+    [[ "$M_EXTERNAL" != true ]] || die "legacy layout restore requires a self-contained local ClickHouse backup"
+    require_cmd tar "install tar"
+    LEGACY_RESTORE_SOURCES=(); LEGACY_RESTORE_ARCHIVES=(); LEGACY_RESTORE_ARCHIVE_BYTES=(); LEGACY_RESTORE_SERVICES=()
+    load_legacy_physical_snapshot "$payload"
+    local legacy_name legacy_tmp legacy_count
+    legacy_count="$(python3 -I - "$metadata" <<'PY'
+import json,sys
+print(len(json.load(open(sys.argv[1],encoding="utf-8"))["compose_files"]))
+PY
+    )"
+    [[ "$legacy_count" =~ ^[12]$ ]] || die "legacy restore Compose metadata is invalid"
+    local quarantines=() stages=()
+    for index in "${!LEGACY_RESTORE_SOURCES[@]}"; do
+        source=${LEGACY_RESTORE_SOURCES[$index]}
+        quarantine="$source.nano-v2-rollback-$M_BACKUP_ID"
+        stage="$source.nano-v2-restore-stage-$M_BACKUP_ID"
+        quarantines+=("$quarantine")
+        stages+=("$stage")
+    done
+    local restore_journal="$INSTALL_DIR/.nano-legacy-restore.json"
+    [[ ! -L "$restore_journal" ]] || die "legacy restore journal must not be symbolic"
+    [[ ! -e "$restore_journal" ]] \
+        || validate_regular_0600 "$restore_journal" "legacy restore journal"
+    python3 -I - "$restore_journal" "$M_BACKUP_ID" "$M_PAYLOAD_SHA" \
+        "$M_VERSION" "$M_EDITION" "$M_SCHEMA" "$legacy_count" \
+        "${#LEGACY_RESTORE_SOURCES[@]}" "${LEGACY_RESTORE_SOURCES[@]}" \
+        "${LEGACY_RESTORE_ARCHIVES[@]}" "${LEGACY_RESTORE_ARCHIVE_BYTES[@]}" \
+        "${quarantines[@]}" "${stages[@]}" \
+        "${#LEGACY_RESTORE_SERVICES[@]}" "${LEGACY_RESTORE_SERVICES[@]}" <<'PY'
+import json,os,pathlib,sys
+out,backup_id,payload_sha,version,edition,schema,compose_count,count,*values=sys.argv[1:]
+compose_count=int(compose_count);count=int(count)
+sources=values[:count];del values[:count]
+archives=values[:count];del values[:count]
+sizes=values[:count];del values[:count]
+quarantines=values[:count];del values[:count]
+stages=values[:count];del values[:count]
+service_count=int(values.pop(0));services=values[:service_count];del values[:service_count]
+if values or compose_count not in (1,2) or not all(size.isdigit() for size in sizes):
+ raise SystemExit("invalid legacy restore journal input")
+compose_files=["docker-compose.yml"]+(["docker-compose.override.yml"] if compose_count==2 else [])
+roots=[{
+ "source":source,"archive":archive,"archive_bytes":int(size),
+ "quarantine":quarantine,"stage":stage,"phase":"pending",
+} for source,archive,size,quarantine,stage in zip(sources,archives,sizes,quarantines,stages)]
+expected={
+ "format":"nano-legacy-restore-v2","backup_id":backup_id,"payload_sha256":payload_sha,
+ "version":version,"edition":edition,"schema_profile":schema,
+ "compose_files":compose_files,"running_services":services,"roots":roots,
+}
+path=pathlib.Path(out)
+if path.exists():
+ value=json.loads(path.read_text(encoding="utf-8"))
+ for key,expected_value in expected.items():
+  if key=="roots":
+   actual=[{name:item.get(name) for name in expected_value[0] if name!="phase"} for item in value.get("roots",[])] if expected_value else []
+   wanted=[{name:item[name] for name in item if name!="phase"} for item in expected_value]
+   if actual!=wanted:raise SystemExit("legacy restore journal root identity changed")
+  elif value.get(key)!=expected_value:raise SystemExit(f"legacy restore journal {key} changed")
+ state=value.get("state")
+ if state=="complete":raise SystemExit("legacy restore is already complete")
+ if state not in {"prepared","roots-complete","controls-publishing","controls-published","verifying"}:
+  raise SystemExit("legacy restore journal state is invalid")
+else:
+ value={**expected,"state":"prepared"}
+ temporary=path.with_name(f".{path.name}.tmp")
+ with temporary.open("x",encoding="utf-8") as handle:
+  handle.write(json.dumps(value,sort_keys=True,indent=2)+"\n")
+  handle.flush();os.fsync(handle.fileno())
+ temporary.chmod(0o600);os.replace(temporary,path)
+ directory=os.open(path.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0))
+ try:os.fsync(directory)
+ finally:os.close(directory)
+PY
+    chmod 600 "$restore_journal"
+    python3 -I - "$restore_journal" "$payload/legacy-layout" <<'PY'
+import json,os,pathlib,shutil,sys
+journal=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"));payload=pathlib.Path(sys.argv[2])
+devices={}
+for root in journal["roots"]:
+ source=pathlib.Path(root["source"]);quarantine=pathlib.Path(root["quarantine"]);stage=pathlib.Path(root["stage"])
+ if quarantine.is_symlink() or stage.is_symlink():raise SystemExit("legacy restore recovery path is symbolic")
+ phase=root["phase"]
+ if phase not in {"pending","moved","ready","complete"}:raise SystemExit("legacy restore root phase is invalid")
+ if phase=="pending" and not ((source.is_dir() and not quarantine.exists()) or (not source.exists() and quarantine.is_dir())):
+  raise SystemExit(f"legacy restore pending root is inconsistent: {source}")
+ if phase in {"moved","ready","complete"} and not quarantine.is_dir():
+  raise SystemExit(f"legacy restore quarantine is missing: {quarantine}")
+ if phase=="complete" and (not source.is_dir() or stage.exists()):
+  raise SystemExit(f"legacy restore completed root is inconsistent: {source}")
+ if phase in {"ready","complete"}:continue
+ parent=source.parent;device=os.stat(parent).st_dev
+ free=shutil.disk_usage(parent).free
+ reclaim=0
+ if phase=="moved" and stage.is_dir():
+  for base,dirs,files in os.walk(stage,followlinks=False):
+   for name in dirs+files:
+    reclaim+=os.lstat(pathlib.Path(base)/name).st_blocks*512
+ required=(payload/root["archive"]).stat().st_size+128*1024*1024
+ entry=devices.setdefault(device,[free+reclaim,128*1024*1024])
+ entry[0]=min(entry[0],free+reclaim);entry[1]+=required-128*1024*1024
+for available,required in devices.values():
+ if available<required:raise SystemExit("insufficient aggregate free space to resume legacy physical restore")
+PY
+    STOPPED_SERVICES=("${LEGACY_RESTORE_SERVICES[@]}")
+    start_mutation
+    state="$(legacy_restore_journal_read "$restore_journal" state)"
+    if [[ "$state" == prepared ]]; then
+        log "stopping canonical services before restoring the quiesced legacy filesystem"
+        dc down --remove-orphans >/dev/null
+    fi
+    for index in "${!LEGACY_RESTORE_SOURCES[@]}"; do
+        source=${LEGACY_RESTORE_SOURCES[$index]}
+        archive="$payload/legacy-layout/${LEGACY_RESTORE_ARCHIVES[$index]}"
+        quarantine=${quarantines[$index]}
+        stage=${stages[$index]}
+        phase="$(legacy_restore_journal_read "$restore_journal" root "$index")"
+        if [[ "$phase" == pending ]]; then
+            if [[ -d "$source" && ! -L "$source" \
+                && ! -e "$quarantine" && ! -L "$quarantine" ]]; then
+                mv -- "$source" "$quarantine"
+            elif [[ ! -e "$source" && ! -L "$source" \
+                && -d "$quarantine" && ! -L "$quarantine" ]]; then
+                : # SIGKILL after the atomic move but before its phase update.
+            else
+                die "legacy restore cannot reconcile pending root: $source"
+            fi
+            legacy_restore_journal_update "$restore_journal" root moved "$index"
+            phase=moved
+        fi
+        if [[ "$phase" == moved ]]; then
+            [[ -d "$quarantine" && ! -L "$quarantine" \
+                && ! -e "$source" && ! -L "$source" ]] \
+                || die "legacy restore cannot reconcile moved root: $source"
+            if [[ -e "$stage" || -L "$stage" ]]; then
+                [[ -d "$stage" && ! -L "$stage" \
+                    && "$stage" == "$source.nano-v2-restore-stage-$M_BACKUP_ID" ]] \
+                    || die "legacy restore staging path is unsafe: $stage"
+                rm -rf -- "$stage"
+            fi
+            mkdir -m 0700 -- "$stage"
+            tar -C "$stage" -xpf "$archive" \
+                || die "legacy physical archive extraction failed: ${LEGACY_RESTORE_ARCHIVES[$index]}"
+            legacy_restore_journal_update "$restore_journal" root ready "$index"
+            phase=ready
+        fi
+        if [[ "$phase" == ready ]]; then
+            [[ -d "$quarantine" && ! -L "$quarantine" ]] \
+                || die "legacy restore quarantine disappeared: $quarantine"
+            if [[ -d "$stage" && ! -L "$stage" \
+                && ! -e "$source" && ! -L "$source" ]]; then
+                mv -- "$stage" "$source"
+            elif [[ -d "$source" && ! -L "$source" \
+                && ! -e "$stage" && ! -L "$stage" ]]; then
+                : # SIGKILL after atomic publication but before its phase update.
+            else
+                die "legacy restore cannot reconcile ready root: $source"
+            fi
+            legacy_restore_journal_update "$restore_journal" root complete "$index"
+            phase=complete
+        fi
+        [[ "$phase" == complete && -d "$source" && ! -L "$source" \
+            && -d "$quarantine" && ! -L "$quarantine" \
+            && ! -e "$stage" && ! -L "$stage" ]] \
+            || die "legacy restore root did not reach a durable complete state: $source"
+    done
+    legacy_restore_journal_update "$restore_journal" state roots-complete
+    legacy_restore_journal_update "$restore_journal" state controls-publishing
+    legacy_name=docker-compose.yml
+    legacy_tmp="$INSTALL_DIR/.${legacy_name}.restore.$$"
+    install -m 0600 "$payload/legacy-layout/$legacy_name" "$legacy_tmp"
+    mv "$legacy_tmp" "$INSTALL_DIR/$legacy_name"
+    if [[ "$legacy_count" == 2 ]]; then
+        legacy_name=docker-compose.override.yml
+        legacy_tmp="$INSTALL_DIR/.${legacy_name}.restore.$$"
+        install -m 0600 "$payload/legacy-layout/$legacy_name" "$legacy_tmp"
+        mv "$legacy_tmp" "$INSTALL_DIR/$legacy_name"
+    elif [[ -e "$INSTALL_DIR/docker-compose.override.yml" || -L "$INSTALL_DIR/docker-compose.override.yml" ]]; then
+        die "an unjournaled legacy override blocks exact layout restore"
+    fi
+    install -m 0600 "$payload/.env" "$INSTALL_DIR/.env.restore"
+    mv "$INSTALL_DIR/.env.restore" "$INSTALL_DIR/.env"
+    install -m 0600 /dev/null "$INSTALL_DIR/.nano-legacy-layout-restored"
+    legacy_restore_journal_update "$restore_journal" state controls-published
+    COMPOSE_PROJECT_DIR=$INSTALL_DIR
+    COMPOSE_ARGS=(--env-file "$INSTALL_DIR/.env" -f "$INSTALL_DIR/docker-compose.yml")
+    [[ "$legacy_count" == 1 ]] || COMPOSE_ARGS+=(-f "$INSTALL_DIR/docker-compose.override.yml")
+    LEGACY_LAYOUT=1
+    dc config --quiet >/dev/null || die "restored legacy Compose configuration is invalid"
+    legacy_restore_journal_update "$restore_journal" state verifying
+    local verification_services=() remaining_services=() service
+    for service in "${LEGACY_RESTORE_SERVICES[@]}"; do
+        case "$service" in
+            postgres|clickhouse) verification_services+=("$service") ;;
+            *) remaining_services+=("$service") ;;
+        esac
+    done
+    [[ ${#verification_services[@]} -eq 2 ]] \
+        || die "legacy physical snapshot lacks the database verification services"
+    # Start no application writer until both physical database snapshots match
+    # the independently signed counts. Old API/jobs processes can write as soon
+    # as they become healthy, which would make an exact snapshot look corrupt.
+    dc up -d "${verification_services[@]}" >/dev/null
+    wait_legacy_restored_services "${verification_services[@]}"
+    if [[ "$M_PG" == true ]]; then
+        prepare_pg
+        pg_table_counts "$PG_DB" > "$WORK_DIR/legacy-postgres-counts.tsv"
+        cmp -s "$payload/postgres-row-counts.tsv" "$WORK_DIR/legacy-postgres-counts.tsv" \
+            || die "restored legacy PostgreSQL counts do not match the signed backup"
+    fi
+    if [[ "$M_CH" == true ]]; then
+        prepare_ch
+        actual_ch_signed_counts "$payload/clickhouse-row-counts.tsv" "$WORK_DIR/legacy-clickhouse-counts.tsv"
+        cmp -s "$payload/clickhouse-row-counts.tsv" "$WORK_DIR/legacy-clickhouse-counts.tsv" \
+            || die "restored legacy ClickHouse counts do not match the signed backup"
+    fi
+    if [[ ${#remaining_services[@]} -gt 0 ]]; then
+        dc up -d "${remaining_services[@]}" >/dev/null
+    fi
+    wait_legacy_restored_services "${LEGACY_RESTORE_SERVICES[@]}"
+    local transition_record="$INSTALL_DIR/.nano-legacy-transition.json"
+    local restored_transition="$INSTALL_DIR/.nano-legacy-transition.restored-$M_BACKUP_ID.json"
+    if [[ -e "$transition_record" || -L "$transition_record" ]]; then
+        [[ -f "$transition_record" && ! -L "$transition_record" \
+            && ! -e "$restored_transition" && ! -L "$restored_transition" ]] \
+            || die "legacy transition audit record cannot be archived safely"
+        mv "$transition_record" "$restored_transition"
+    elif [[ -e "$restored_transition" || -L "$restored_transition" ]]; then
+        [[ -f "$restored_transition" && ! -L "$restored_transition" ]] \
+            || die "restored legacy transition audit record is unsafe"
+    fi
+    legacy_restore_journal_update "$restore_journal" state complete
+    STOPPED_SERVICES=(); MUTATION_STARTED=0
+    [[ ! -f "$RECOVERY_MARKER" ]] || rm -f -- "$RECOVERY_MARKER"
+    ok "legacy layout and quiesced data restored; newer data remains in journaled quarantine directories"
+}
+
 start_mutation() {
     MUTATION_STARTED=1
     write_recovery_marker
 }
 
 restore_command() {
-    local key="" bundle="" base="" recovery_set="" force=0 override="" on_cluster=0
+    local key="" bundle="" base="" recovery_set="" force=0 override="" on_cluster=0 restore_layout=""
     while [[ $# -gt 0 ]]; do case "$1" in
         --key-file) key="$2"; shift 2 ;; --from) bundle="$2"; shift 2 ;; --base) base="$2"; shift 2 ;;
         --recovery-set) recovery_set="$2"; shift 2 ;; --force) force=1; shift ;; --clickhouse-disk) override="$2"; shift 2 ;;
-        --on-cluster) on_cluster=1; shift ;; --install-dir) INSTALL_DIR="$2"; shift 2 ;; *) usage ;;
+        --restore-layout) restore_layout="$2"; shift 2 ;;
+        --on-cluster) on_cluster=1; shift ;; --install-dir) INSTALL_DIR="$2"; shift 2 ;;
+        --compose-override) COMPOSE_OVERRIDE="$2"; shift 2 ;; *) usage ;;
     esac; done
     [[ -n "$key" && -n "$bundle" ]] || usage
+    [[ -z "$restore_layout" || "$restore_layout" == legacy ]] || die "--restore-layout accepts only legacy"
     init_context; validate_key_file "$key"
     ((!on_cluster)) || die "--on-cluster cannot validate a per-shard signed recovery component; restore each shard separately"
-    [[ ! -e "$RECOVERY_MARKER" && ! -L "$RECOVERY_MARKER" ]] || die "unresolved restore marker exists: $RECOVERY_MARKER"
+    if [[ -e "$RECOVERY_MARKER" || -L "$RECOVERY_MARKER" ]]; then
+        [[ "$restore_layout" == legacy \
+            && -f "$INSTALL_DIR/.nano-legacy-restore.json" \
+            && ! -L "$INSTALL_DIR/.nano-legacy-restore.json" ]] \
+            || die "unresolved restore marker exists: $RECOVERY_MARKER"
+        warn "resuming the journaled legacy physical restore"
+    fi
     WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nano-restore.XXXXXX")"; chmod 700 "$WORK_DIR"
     RESTORE_SOURCE_LABEL="$bundle"
     local primary_snapshot base_snapshot="" payload="$WORK_DIR/payload" base_payload="$WORK_DIR/base-payload" restored="$WORK_DIR/restored.env"
     primary_snapshot="$(snapshot_bundle "$bundle" primary)" || die "backup bundle is incomplete"
     load_snapshot "$primary_snapshot" "$key" primary || die "backup signature/schema/payload digest verification failed"
-    save_primary_fields; ensure_target_compatible
+    save_primary_fields; ensure_target_compatible "$restore_layout"
     if [[ -n "$M_BASE_ID" ]]; then
         [[ -n "$base" ]] || die "incremental requires --base before any target write"
         base_snapshot="$(snapshot_bundle "$base" base)" || die "base bundle is incomplete"
@@ -1553,6 +2431,25 @@ restore_command() {
     decrypt_snapshot "$primary_snapshot" "$key" "$payload" "$M_CHECKSUMS"
     [[ -z "$base_snapshot" ]] || decrypt_snapshot "$base_snapshot" "$key" "$base_payload" "$B_CHECKSUMS"
     [[ -f "$payload/.env" ]] || die "encrypted payload lacks .env"
+    if [[ "$restore_layout" == legacy ]]; then
+        [[ "$M_MODE" == single ]] || die "legacy layout restore supports only single-node backups"
+        [[ -f "$payload/legacy-layout/layout.json" \
+            && -f "$payload/legacy-layout/docker-compose.yml" ]] \
+            || die "signed backup does not contain a legacy layout"
+        python3 -I - "$payload/legacy-layout/layout.json" "$M_VERSION" "$M_EDITION" "$M_SCHEMA" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1],encoding="utf-8"))
+expected=("nano-legacy-layout-v1",sys.argv[2],sys.argv[3],sys.argv[4])
+actual=(value.get("format"),value.get("version"),value.get("edition"),value.get("schema_profile"))
+files=value.get("compose_files")
+if actual != expected or files not in (["docker-compose.yml"],["docker-compose.yml","docker-compose.override.yml"]):
+ raise SystemExit("legacy layout metadata does not match the signed backup identity")
+if len(files)==2 and not __import__("pathlib").Path(sys.argv[1]).with_name("docker-compose.override.yml").is_file():
+ raise SystemExit("legacy layout metadata names a missing override")
+PY
+        restore_legacy_physical "$payload" "$force"
+        return
+    fi
     merge_restored_env "$payload/.env" "$restored"
     [[ "$M_PG" != true ]] || prepare_pg
     [[ "$M_CH" != true ]] || prepare_ch
@@ -1560,6 +2457,7 @@ restore_command() {
     if [[ "$M_CH" == true ]]; then
         [[ -z "$override" || "$override" == "$M_DISK" ]] || die "ClickHouse disk override does not match signed manifest"
         if ((on_cluster)); then [[ "$M_SCOPE" == cluster ]] || die "host backup cannot use --on-cluster"; else [[ "$M_SCOPE" != cluster ]] || die "cluster backup requires --on-cluster"; fi
+        bootstrap_legacy_backup_disk "$M_DISK"
         validate_clickhouse_disk "$M_DISK"
         [[ "$M_EXTERNAL" != true || "$M_EXTERNAL_ENCRYPTED" == true ]] || die "external backup lacks encrypted-disk attestation"
         ensure_clickhouse_space
@@ -1644,7 +2542,9 @@ restore_command() {
         wait_pg_admin
         pg_unfence_target
     fi
-    if [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then dc up -d "${STOPPED_SERVICES[@]}" >/dev/null; fi
+    if [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then
+        dc up -d "${STOPPED_SERVICES[@]}" >/dev/null
+    fi
     [[ "$M_PG" != true ]] || drop_pg_rollback || warn "validated restore succeeded but old PostgreSQL database remains: $PG_ROLLBACK_DB"
     STOPPED_SERVICES=(); MUTATION_STARTED=0
     [[ ! -f "$RECOVERY_MARKER" ]] || rm -f -- "$RECOVERY_MARKER"

@@ -1,4 +1,4 @@
-"""NAN-4972 upgrade lane: seed a v0.1.703 install through ITS API, verify after
+"""NAN-4972 upgrade lane: seed a retained v0.1 source through ITS API, verify after
 the upgrade through the new one (driven by scripts/e2e/lanes/upgrade-from-v01.sh).
 
     python -I -m nano_e2e.upgrade_v01 seed   --manifest <run>/upgrade-manifest.json
@@ -462,13 +462,13 @@ def seed(manifest: Path) -> int:
 
     def mk_playbook() -> None:
         if admin.status("GET", "/api/playbooks") == 403 or "playbooks:manage" not in admin_perms:
-            m["skipped"] = m.get("skipped", []) + ["playbook: the v0.1.703 admin role lacks playbooks:manage"]
+            m["skipped"] = m.get("skipped", []) + ["playbook: the v0.1 source admin role lacks playbooks:manage"]
             return
         p = admin.post("/api/playbooks", {"title": f"{TAG} playbook", "category": "endpoint", "doc": "# Steps\n1. Isolate host\n"})
         o["playbook"] = {"id": p["id"], "title": p.get("title")}
     step("playbook", mk_playbook)
 
-    # ---- the answers v0.1.703 gives
+    # ---- the answers the selected v0.1 source gives
     if "window" in m:
         for label, q in SEARCHES:
             try:
@@ -588,7 +588,7 @@ def verify(manifest: Path, *, compat_old_api: bool = False) -> int:
         assert (usage.get("scanned") or 0) >= want, f"scanned {usage.get('scanned')} < {want} seeded secrets"
         return f"{usage.get('scanned')} stored secrets open with ring key {body.get('active_key_id')}, 0 undecryptable"
     if compat_old_api:
-        print("note credential key ring scan skipped (endpoint was added after v0.1.703)", flush=True)
+        print("note credential key ring scan skipped (endpoint was added after the retained v0.1 sources)", flush=True)
     else:
         check("every pre-upgrade secret decrypts (credential key ring scan)", ring)
     if "cloud_credential" in o:
@@ -649,7 +649,7 @@ def verify(manifest: Path, *, compat_old_api: bool = False) -> int:
         check("dashboard panels", lambda: len(obj_of(admin.get(f"/api/dashboards/{o['dashboard']['id']}")).get("panels") or []) == o["dashboard"]["panels"])
     if "saved_search" in o:
         # Read as the owner's session: an API key's principal is the key, so it
-        # never sees its owner's private searches (NAN-2145; same in v0.1.703).
+        # never sees its owner's private searches (NAN-2145; same in retained v0.1 sources).
         def saved() -> str:
             tok = login(env("NANO_ADMIN_EMAIL"), env("NANO_ADMIN_PASSWORD"))["tokens"]["access_token"]
             owner = Api(env("NANOSIEM_SEARCH_URL"), {"Authorization": f"Bearer {tok}"})
@@ -700,8 +700,12 @@ def verify(manifest: Path, *, compat_old_api: bool = False) -> int:
     post_start = datetime.now(UTC) - timedelta(minutes=1)
     def ingest_post() -> str:
         prefix = "nminusone" if compat_old_api else "upg_post"
-        assert ingest_http(env("VECTOR_AUTH_TOKEN"), f"{prefix}_http", [{"message": f"{prefix} http"}]) == 200
-        assert ingest_hec(env("VECTOR_AUTH_TOKEN"), f"{prefix}_hec", [{"message": f"{prefix} hec"}]) == 200
+        # This verifier intentionally runs more than once in the backup/restore
+        # bridge lane. Keep each continuity event unique so Vector's persistent
+        # dedupe state does not turn a healthy second run into a false timeout.
+        nonce = uuid.uuid4().hex
+        assert ingest_http(env("VECTOR_AUTH_TOKEN"), f"{prefix}_http", [{"message": f"{prefix} http {nonce}"}]) == 200
+        assert ingest_hec(env("VECTOR_AUTH_TOKEN"), f"{prefix}_hec", [{"message": f"{prefix} hec {nonce}"}]) == 200
         routes = [f"{prefix}_http", f"{prefix}_hec"]
         if not compat_old_api and "upg_parsed" in SOURCES:
             assert ingest_http(env("VECTOR_AUTH_TOKEN"), "upg_parsed", [{"message": f"{TAG} post parsed", "user": "dave"}]) == 200

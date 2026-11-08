@@ -38,6 +38,23 @@ SEMVER_RE = re.compile(r"^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
 ROLES = {"keeper", "clickhouse", "postgres", "ingest", "app"}
+
+_LEGACY_SPEC = importlib.util.spec_from_file_location(
+    "nano_legacy_layout", SCRIPT_DIR / "lib/nano_legacy_layout.py"
+)
+if _LEGACY_SPEC is None or _LEGACY_SPEC.loader is None:
+    raise RuntimeError("cannot load the legacy layout resolver")
+nano_legacy_layout = importlib.util.module_from_spec(_LEGACY_SPEC)
+sys.modules[_LEGACY_SPEC.name] = nano_legacy_layout
+_LEGACY_SPEC.loader.exec_module(nano_legacy_layout)
+_LEGACY_BRIDGE_SPEC = importlib.util.spec_from_file_location(
+    "nano_legacy_bridge", SCRIPT_DIR / "lib/nano_legacy_bridge.py"
+)
+if _LEGACY_BRIDGE_SPEC is None or _LEGACY_BRIDGE_SPEC.loader is None:
+    raise RuntimeError("cannot load the legacy bridge policy")
+nano_legacy_bridge = importlib.util.module_from_spec(_LEGACY_BRIDGE_SPEC)
+sys.modules[_LEGACY_BRIDGE_SPEC.name] = nano_legacy_bridge
+_LEGACY_BRIDGE_SPEC.loader.exec_module(nano_legacy_bridge)
 ROLE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "keeper": (),
     "clickhouse": ("keeper",),
@@ -93,6 +110,9 @@ APP_SERVICES = (
 )
 INGEST_SERVICES = ("vector", "vector-config-consumer", "vector-tap", "ingest-edge", "clickhouse-proxy")
 APP_EDGE_SERVICES = ("nginx", "app-internal-edge")
+LEGACY_MANAGED_OTLP_CONFIG_SHA256 = (
+    "1a14ffd1d41df60fa7e414593ae430c1bf6e0a3b0ecab0905e322b943b9521a7"
+)
 # Background app processes can create cross-store work while a recovery set is
 # captured. Current API images reject/drain unsafe methods through the shared
 # PostgreSQL mutation fence, so only the two background producers are stopped.
@@ -704,6 +724,27 @@ def gate_siem_health_regressions(
     }
 
 
+def legacy_backup_retention_check(
+    backup_output: str | None, install_dir: pathlib.Path,
+) -> Check:
+    backup_value = str(backup_output or "")
+    if not backup_value:
+        return Check(
+            "legacy-backup-retention", False,
+            "legacy transition requires an explicit independent --backup-output",
+            "single",
+        )
+    backup_path = pathlib.Path(backup_value).expanduser().resolve()
+    install_root = install_dir.resolve()
+    independent = backup_path != install_root and install_root not in backup_path.parents
+    detail = (
+        "explicit backup destination is outside the mutable install tree"
+        if independent else
+        "legacy transition backup destination must be outside the install tree"
+    )
+    return Check("legacy-backup-retention", independent, detail, "single")
+
+
 def read_json(path: pathlib.Path) -> dict[str, Any]:
     try:
         return json_object(json.loads(secure_read_text(path, str(path))), str(path))
@@ -782,7 +823,6 @@ class ManualBackupFence:
             os.close(directory)
         self.value = None
 
-
 def secure_read_text(
     path: pathlib.Path, label: str, *, maximum_bytes: int | None = None,
 ) -> str:
@@ -806,6 +846,81 @@ def secure_read_text(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def recover_legacy_backup_services(
+    install_dir: pathlib.Path, runner: Runner,
+) -> bool:
+    """Restart the exact service set journaled before a legacy physical backup."""
+    path = install_dir / ".nano-legacy-backup-recovery.json"
+    if not (path.exists() or path.is_symlink()):
+        return False
+    try:
+        value = json.loads(secure_read_text(
+            path, "legacy backup recovery journal", maximum_bytes=65536,
+        ))
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise UpgradeError("legacy backup recovery journal is invalid") from error
+    if (
+        value.get("format") != "nano-legacy-backup-recovery-v1"
+        or value.get("install_dir") != str(install_dir)
+    ):
+        raise UpgradeError("legacy backup recovery journal identity is invalid")
+    raw_compose = value.get("compose_files")
+    if not isinstance(raw_compose, list) or len(raw_compose) not in {1, 2}:
+        raise UpgradeError("legacy backup recovery Compose plan is invalid")
+    expected_names = ["docker-compose.yml"]
+    if len(raw_compose) == 2:
+        expected_names.append("docker-compose.override.yml")
+    compose_files: list[pathlib.Path] = []
+    for raw, expected_name in zip(raw_compose, expected_names, strict=True):
+        if not isinstance(raw, str):
+            raise UpgradeError("legacy backup recovery Compose plan is invalid")
+        compose = pathlib.Path(raw)
+        if (
+            compose != install_dir / expected_name
+            or compose.is_symlink()
+            or not compose.is_file()
+        ):
+            raise UpgradeError("legacy backup recovery Compose file is unsafe")
+        compose_files.append(compose)
+    services = value.get("services")
+    if (
+        not isinstance(services, list) or not services
+        or len(set(services)) != len(services)
+        or not all(
+            isinstance(service, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}", service)
+            for service in services
+        )
+    ):
+        raise UpgradeError("legacy backup recovery service plan is invalid")
+    env_file = install_dir / ".env"
+    if env_file.is_symlink() or not env_file.is_file():
+        raise UpgradeError("legacy backup recovery environment is unsafe")
+    compose = [
+        "docker", "compose", "--project-directory", str(install_dir),
+        "--env-file", str(env_file),
+    ]
+    for compose_file in compose_files:
+        compose.extend(("-f", str(compose_file)))
+    runner.run([*compose, "start", *services], timeout=300)
+    running = set(runner.run(
+        [*compose, "ps", "--status", "running", "--services"], timeout=60,
+    ).stdout.splitlines())
+    missing = sorted(set(services) - running)
+    if missing:
+        raise UpgradeError(
+            "legacy backup recovery could not restart the exact service set: "
+            + ", ".join(missing)
+        )
+    path.unlink()
+    directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return True
 
 
 def test_compose_override_arguments(install_dir: pathlib.Path) -> list[str]:
@@ -845,7 +960,9 @@ def embedded_test_root_key_id(install_dir: pathlib.Path) -> str:
     return expected_key_id
 
 
-def vector_validation_arguments(current_layout: bool) -> list[str]:
+def vector_validation_arguments(
+    current_layout: bool, *, managed_legacy_layout: bool = False,
+) -> list[str]:
     """Keep the v2 and v0.1.703 Vector CLI contracts independently testable."""
     if current_layout:
         return [
@@ -858,7 +975,7 @@ def vector_validation_arguments(current_layout: bool) -> list[str]:
         ]
     return [
         "exec", "-T", "vector", "vector", "validate", "--no-environment",
-        "--config-dir", "/etc/vector",
+        "--config-dir", "/etc/vector/config" if managed_legacy_layout else "/etc/vector",
         "--config-dir", "/etc/vector/dynamic/sources/parsers",
         "--config-dir", "/etc/vector/dynamic/sources/configs",
     ]
@@ -917,13 +1034,20 @@ class EnvFile:
         return result
 
     def replace(self, key: str, value: str) -> None:
-        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
-            raise UpgradeError("unsafe environment key")
-        if "\n" in value or "\r" in value:
-            raise UpgradeError("unsafe environment value")
+        self.replace_many({key: value})
+
+    def replace_many(self, replacements: dict[str, str]) -> None:
+        if not replacements:
+            return
+        for key, value in replacements.items():
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+                raise UpgradeError("unsafe environment key")
+            if "\n" in value or "\r" in value:
+                raise UpgradeError("unsafe environment value")
         lines = secure_read_text(self.path, "environment file").splitlines()
-        kept = [line for line in lines if not line.startswith(f"{key}=")]
-        kept.append(f"{key}={value}")
+        prefixes = tuple(f"{key}=" for key in replacements)
+        kept = [line for line in lines if not line.startswith(prefixes)]
+        kept.extend(f"{key}={value}" for key, value in replacements.items())
         descriptor, temporary = tempfile.mkstemp(prefix=".env.upgrade.", dir=self.path.parent)
         try:
             os.fchmod(descriptor, 0o600)
@@ -1087,6 +1211,30 @@ class Journal:
 
 
 class Runner:
+    @staticmethod
+    def _safe_command_label(argv: Sequence[str]) -> str:
+        """Identify a failed operation without echoing paths, SQL, or secrets."""
+        program = pathlib.Path(argv[0]).name
+        if program != "docker" or len(argv) < 2:
+            return program
+        if argv[1] == "compose":
+            operations = {
+                "config", "down", "exec", "logs", "ps", "rm", "run", "stop", "up",
+            }
+            operation = next((value for value in argv[2:] if value in operations), "operation")
+            label = f"docker compose {operation}"
+            if operation in {"run", "up"}:
+                safe_services = set().union(*ROLE_SERVICES.values(), {"clickhouse-migrate"})
+                selected = sorted({value for value in argv[2:] if value in safe_services})
+                if selected:
+                    label += f" ({','.join(selected)})"
+            return label
+        if argv[1] == "image" and len(argv) >= 3 and argv[2] in {"inspect", "load", "tag"}:
+            return f"docker image {argv[2]}"
+        if argv[1] in {"inspect", "load", "tag"}:
+            return f"docker {argv[1]}"
+        return "docker"
+
     def run(
         self,
         argv: Sequence[str],
@@ -1108,11 +1256,17 @@ class Runner:
                 check=False,
             )
         except subprocess.TimeoutExpired as error:
-            raise UpgradeError(f"command timed out after {timeout}s: {pathlib.Path(argv[0]).name}") from error
+            raise UpgradeError(
+                f"command timed out after {timeout}s: {self._safe_command_label(argv)}"
+            ) from error
         except OSError as error:
-            raise UpgradeError(f"cannot execute required command: {pathlib.Path(argv[0]).name}") from error
+            raise UpgradeError(
+                f"cannot execute required command: {self._safe_command_label(argv)}"
+            ) from error
         if check and result.returncode != 0:
-            raise UpgradeError(f"command failed (exit {result.returncode}): {pathlib.Path(argv[0]).name}")
+            raise UpgradeError(
+                f"command failed (exit {result.returncode}): {self._safe_command_label(argv)}"
+            )
         return result
 
 
@@ -1145,12 +1299,55 @@ class LocalOps:
         self.env_file = EnvFile(self.install_dir / ".env")
         self.env = self.env_file.values()
         self.role_env = parse_role_env(self.install_dir / ".nano-role.env")
+        self.legacy_layout: Any | None = None
+        self._legacy_transition_rollout = False
+        self._legacy_bridge_rollout = False
+        self.transition_record = self.install_dir / ".nano-legacy-transition.json"
+        self.bridge_record = self.install_dir / ".nano-legacy-bridge.json"
+        transition = read_json(self.transition_record) if self.transition_record.is_file() else {}
+        bridge = read_json(self.bridge_record) if self.bridge_record.is_file() else {}
+        if (
+            bridge.get("format") == "nano-legacy-bridge-v1"
+            and bridge.get("state") in {"started", "image-tag-published"}
+        ):
+            self._legacy_bridge_rollout = True
+        canonical_version_value = self.env.get("NANO_VERSION", "")
+        canonical_ready = bool(
+            canonical_version_value
+            and (self.install_dir / "docker-compose.opensource.yml").is_file()
+        )
+        if not self.role_env and not canonical_ready:
+            try:
+                self.legacy_layout = nano_legacy_layout.resolve_legacy_layout(
+                    self.install_dir,
+                    self.nano_cli.parent.parent / "deploy/release/legacy",
+                    self.runner,
+                )
+            except nano_legacy_layout.LegacyLayoutError as error:
+                if transition.get("format") == "nano-legacy-transition-v1":
+                    raise UpgradeError(
+                        "incomplete legacy transition cannot resolve either its source or target layout"
+                    ) from error
+                raise UpgradeError(str(error)) from error
         self.roles = frozenset(filter(None, self.role_env.get("NANO_ROLE_PROFILES", "").split(",")))
         if not self.roles:
             self.roles = frozenset({"clickhouse", "postgres", "ingest", "app"})
         self.host_name = self.role_env.get("NANO_HOST_NAME", "single")
-        self.edition = self.env.get("NANO_EDITION", "open")
-        self.version = canonical_version(self.env.get("NANO_VERSION", ""))
+        if self.legacy_layout is not None:
+            self.edition = self.legacy_layout.edition
+            qualified_version = canonical_version(self.legacy_layout.version)
+            try:
+                self.version = nano_legacy_bridge.effective_runtime_version(
+                    qualified_version, self.env.get("IMAGE_TAG", ""), bridge,
+                    edition=self.edition,
+                )
+            except nano_legacy_bridge.LegacyBridgeError as error:
+                raise UpgradeError(str(error)) from error
+            self.schema_profile = self.legacy_layout.schema_profile
+        else:
+            self.edition = self.env.get("NANO_EDITION", "open")
+            self.version = canonical_version(self.env.get("NANO_VERSION", ""))
+            self.schema_profile = self.env.get("NANO_SCHEMA_PROFILE", "udm")
         self.compose_args = self._compose_args()
 
     def _resource_roles(self) -> frozenset[str]:
@@ -1204,8 +1401,40 @@ class LocalOps:
             "edition": self.edition,
         }
 
+    def legacy_physical_archive_inputs(
+        self,
+    ) -> tuple[nano_legacy_layout.LegacyArchiveInput, ...]:
+        """Expose qualified bind roots and conservative bytes to disk planning."""
+        if getattr(self, "legacy_layout", None) is None:
+            return ()
+        return self.legacy_layout.archive_inputs
+
+    def _legacy_compose_args(self) -> list[str]:
+        if self.legacy_layout is None:
+            raise UpgradeError("legacy Compose arguments requested for a canonical layout")
+        arguments = [
+            "docker", "compose", "--project-directory", str(self.install_dir),
+            "--env-file", str(self.install_dir / ".env"),
+        ]
+        for compose in self.legacy_layout.compose_files:
+            arguments.extend(("-f", str(compose)))
+        return arguments
+
+    def _with_preserved_compose_overlays(self, arguments: list[str]) -> list[str]:
+        overlays = self.env.get("NANO_COMPOSE_OVERLAYS", "").split()
+        for overlay in overlays:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml", overlay):
+                raise UpgradeError("NANO_COMPOSE_OVERLAYS contains an invalid file name")
+            path = self.install_dir / overlay
+            if path.is_symlink() or not path.is_file():
+                raise UpgradeError(f"NANO_COMPOSE_OVERLAYS file is missing or symbolic: {overlay}")
+            arguments.extend(("-f", str(path)))
+        return arguments
+
     def _compose_args(self) -> list[str]:
-        if self.role_env:
+        if self.legacy_layout is not None:
+            arguments = self._legacy_compose_args()
+        elif self.role_env:
             compose = self.install_dir / "deploy/compose/docker-compose.enterprise.yml"
             if not compose.is_file():
                 raise UpgradeError("role-split compose file is missing")
@@ -1223,10 +1452,10 @@ class LocalOps:
             compose = self.install_dir / "docker-compose.opensource.yml"
             if not compose.is_file():
                 raise UpgradeError("single-node compose file is missing")
-            arguments = [
+            arguments = self._with_preserved_compose_overlays([
                 "docker", "compose", "--project-directory", str(compose.parent),
                 "--env-file", str(self.install_dir / ".env"), "-f", str(compose),
-            ]
+            ])
 
         # Kept separate from layout selection so the legacy-layout lane can
         # compose its production overlays without replacing this N-1 seam.
@@ -1242,6 +1471,26 @@ class LocalOps:
             [*self.compose_args, *arguments], timeout=timeout,
             input_text=input_text, check=check, env=env,
         )
+
+    def _safe_service_failure(self, result: subprocess.CompletedProcess[str]) -> str:
+        """Return one bounded child diagnostic after removing configured secrets."""
+        output = "\n".join((result.stdout or "", result.stderr or ""))
+        for key, value in self.env.items():
+            if value and re.search(r"PASSWORD|SECRET|TOKEN|KEY|CREDENTIAL", key, re.I):
+                output = output.replace(value, "[REDACTED]")
+        output = re.sub(r"(://[^:/\s]+:)[^@\s]+(@)", r"\1[REDACTED]\2", output)
+        output = re.sub(
+            r"(?i)(password|secret|token|credential)(\s*[=:]\s*)[^\s,;]+",
+            r"\1\2[REDACTED]",
+            output,
+        )
+        lines = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+                 for line in output.splitlines() if line.strip()]
+        actionable = [
+            line for line in lines
+            if "DB::Exception:" in line or re.search(r"\b(error|failed|failure)\b", line, re.I)
+        ]
+        return (actionable[-1] if actionable else f"process exited {result.returncode}")[:500]
 
     def _service_exists(self, service: str) -> bool:
         result = self.compose(["config", "--services"], timeout=30)
@@ -1337,7 +1586,9 @@ class LocalOps:
             self._wait_container(service, timeout)
         return selected
 
-    def _ch_query(self, query: str, timeout: int = 60) -> str:
+    def _ch_query(
+        self, query: str, timeout: int = 60, *, retry_memory_pressure: bool = False,
+    ) -> str:
         if not self._service_exists("clickhouse"):
             raise UpgradeError("ClickHouse service is not present")
         port = self.role_env.get("NANO_CLICKHOUSE_NATIVE_PORT", "9000")
@@ -1382,14 +1633,42 @@ printf '<clickhouse><password>%s</password></clickhouse>\n' "$escaped" >"$config
 exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
   --user nanosiem_admin --format TSVRaw --query "$3"
 '''
-        result = self.compose(
-            ["exec", "-T", "clickhouse", "env", "-u", "CLICKHOUSE_ADMIN_PASSWORD",
-             "bash", "-ec", script, "nano-upgrade", host, port, query,
-             str(secure).lower(), server_name],
-            timeout=timeout,
-            input_text=password + "\n",
-        )
-        return result.stdout.strip()
+        arguments = [
+            "exec", "-T", "clickhouse", "env", "-u", "CLICKHOUSE_ADMIN_PASSWORD",
+            "bash", "-ec", script, "nano-upgrade", host, port, query,
+            str(secure).lower(), server_name,
+        ]
+        if not retry_memory_pressure:
+            result = self.compose(
+                arguments, timeout=timeout, input_text=password + "\n",
+            )
+            return result.stdout.strip()
+
+        # Immediately after migration/app rollout, the managed legacy memory
+        # profile can transiently reject even this tiny ledger SELECT with
+        # ClickHouse code 241 while async-insert flushes release their memory.
+        # Only the read-only ledger caller enables this bounded retry; no
+        # mutation or general ClickHouse command is ever replayed here.
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise UpgradeError(
+                    f"read-only ClickHouse ledger remained memory constrained for {timeout}s"
+                )
+            result = self.compose(
+                arguments,
+                timeout=max(1, int(remaining)),
+                input_text=password + "\n",
+                check=False,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+            if result.returncode != 241:
+                raise UpgradeError(
+                    f"command failed (exit {result.returncode}): docker compose exec"
+                )
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
 
     def _pg_query(self, query: str, timeout: int = 60) -> str:
         user = self.env.get("POSTGRES_USER", "nanosiem")
@@ -1544,10 +1823,16 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 self._ch_query("SELECT path FROM system.disks WHERE name='default'"),
                 "ClickHouse default disk",
             )
-            backup_path = self._container_path(
-                self._ch_query("SELECT path FROM system.disks WHERE name='backups'"),
-                "ClickHouse backups disk",
-            )
+            if getattr(self, "legacy_layout", None) is not None:
+                # v0.1.703 has no dedicated backups disk. The mandatory
+                # native archive is created briefly on the qualified default
+                # bind mount before it is copied into the encrypted payload.
+                backup_path = data_path
+            else:
+                backup_path = self._container_path(
+                    self._ch_query("SELECT path FROM system.disks WHERE name='backups'"),
+                    "ClickHouse backups disk",
+                )
             stores["clickhouse"] = DatabaseStorage(
                 "clickhouse", int(raw),
                 self._service_filesystem_space("clickhouse", data_path),
@@ -1557,9 +1842,8 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             )
         return stores, clickhouse_backup
 
-    @staticmethod
     def _backup_archive_inputs(
-        stores: dict[str, DatabaseStorage],
+        self, stores: dict[str, DatabaseStorage],
     ) -> tuple[BackupArchiveInput, ...]:
         """Describe every item the backup command will place in its payload.
 
@@ -1574,9 +1858,18 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             ))
         clickhouse = stores.get("clickhouse")
         if clickhouse is not None:
+            destination = (
+                "clickhouse-data"
+                if getattr(self, "legacy_layout", None) is not None
+                else "clickhouse-backups"
+            )
             archives.append(BackupArchiveInput(
                 "clickhouse-archive", clickhouse.source_bytes,
-                "backup_clickhouse_ratio", "clickhouse-backups",
+                "backup_clickhouse_ratio", destination,
+            ))
+        for index, item in enumerate(self.legacy_physical_archive_inputs()):
+            archives.append(BackupArchiveInput(
+                f"legacy-physical-{index:03d}", item.archive_bytes_upper_bound,
             ))
         return tuple(archives)
 
@@ -1645,7 +1938,10 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 "backup-payload+tar", FilesystemSpace(tmp_identity, tmp_free),
                 plan.backup_tmp_peak_bytes,
             )
-        native_clickhouse = plan.native_backup_bytes("clickhouse-backups")
+        native_clickhouse = (
+            plan.native_backup_bytes("clickhouse-backups")
+            + plan.native_backup_bytes("clickhouse-data")
+        )
         if native_clickhouse:
             if clickhouse_backup is None:
                 raise UpgradeError("cannot resolve ClickHouse backups disk")
@@ -1829,11 +2125,22 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         fields = row.split("\t")
         if len(fields) != 3 or fields[0] not in {"active", "grace_period"} or fields[1:] != ["true", "true"]:
             raise UpgradeError("C05 cached licence is not active and unexpired")
-        c05 = self._pg_query(
-            "SELECT CASE WHEN to_regclass('sovereign_license_state') IS NULL THEN 'legacy' "
-            "WHEN EXISTS (SELECT 1 FROM sovereign_license_state WHERE singleton=TRUE "
-            "AND grace_until > clock_timestamp()) THEN 'valid' ELSE 'invalid' END"
+        sovereign = self._pg_query(
+            "SELECT (to_regclass('sovereign_license_state') IS NOT NULL)::text"
         )
+        c05 = "legacy"
+        if sovereign == "true":
+            c05 = self._pg_query(
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM sovereign_license_state "
+                "WHERE singleton=TRUE AND grace_until > clock_timestamp()) "
+                "THEN 'valid' ELSE 'invalid' END"
+            )
+        elif sovereign == "invalid":
+            # Preserve the isolated preflight-test contract from the C05 gate;
+            # production's to_regclass probe returns only true/false.
+            c05 = "invalid"
+        elif sovereign != "false":
+            raise UpgradeError("cannot determine C05 licence schema state")
         if c05 == "invalid":
             if test_rehearsal:
                 key_id = embedded_test_root_key_id(self.install_dir)
@@ -1955,7 +2262,10 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             # Pre-2.0 used an upstream Vector whose interpolation opt-in flag
             # did not exist. Keep both exact CLI contracts in the standalone
             # helper so a layout adapter cannot accidentally merge them.
-            arguments = vector_validation_arguments(current_layout.returncode == 0)
+            arguments = vector_validation_arguments(
+                current_layout.returncode == 0,
+                managed_legacy_layout=getattr(self, "legacy_layout", None) is not None,
+            )
             self.compose(arguments, timeout=120)
             validated.append("Vector")
         edge = "nginx" if "app" in self.roles else "ingest-edge" if "ingest" in self.roles else ""
@@ -1996,7 +2306,11 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         if self.roles.intersection({"app", "ingest"}):
             check(
                 "enrichment-control-tree",
-                lambda: check_enrichment_control_tree(self.install_dir),
+                lambda: check_enrichment_control_tree(
+                    self.nano_cli.parent.parent
+                    if getattr(self, "legacy_layout", None) is not None
+                    else self.install_dir
+                ),
             )
         if "postgres" in self.roles:
             check("postgres", self._check_postgres)
@@ -2025,7 +2339,8 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             result["postgres"] = [line.split("\t", 1) for line in rows.splitlines() if line]
         if "clickhouse" in self.roles:
             rows = self._ch_query(
-                "SELECT version,argMax(checksum,applied_at) FROM nanosiem._migrations GROUP BY version ORDER BY version"
+                "SELECT version,argMax(checksum,applied_at) FROM nanosiem._migrations GROUP BY version ORDER BY version",
+                retry_memory_pressure=True,
             )
             result["clickhouse"] = [line.split("\t", 1) for line in rows.splitlines() if line]
         return result
@@ -2110,9 +2425,698 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             # final bounded line so a remote coordinator can identify the
             # failed safety gate without copying an unbounded child log.
             lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
-            detail = lines[-1][:500] if lines else "backup CLI returned no diagnostic"
+            database_errors = [line for line in lines if "DB::Exception:" in line]
+            actionable = database_errors or [line for line in lines if line.startswith("nano:")]
+            detail = (actionable[-1] if actionable else lines[-1])[:500] \
+                if lines else "backup CLI returned no diagnostic"
             raise UpgradeError(f"backup failed (exit {result.returncode}): {detail}")
         return str(output)
+
+    @staticmethod
+    def _volume_entries(service: dict[str, Any], label: str) -> list[dict[str, Any]]:
+        raw = service.get("volumes") or []
+        if not isinstance(raw, list):
+            raise UpgradeError(f"{label} volumes are not a list")
+        entries: list[dict[str, Any]] = []
+        for value in raw:
+            if not isinstance(value, dict):
+                raise UpgradeError(f"{label} volume is not a rendered long-syntax mount")
+            source = value.get("source")
+            target = value.get("target")
+            mount_type = value.get("type")
+            if not isinstance(source, str) or not isinstance(target, str) or not isinstance(mount_type, str):
+                raise UpgradeError(f"{label} volume lacks source, target, or type")
+            entries.append(value)
+        return entries
+
+    @staticmethod
+    def _portable_volume(value: dict[str, Any], source: pathlib.Path | None = None) -> dict[str, Any]:
+        allowed = {"type", "source", "target", "read_only", "consistency", "bind", "volume", "tmpfs"}
+        result = {key: item for key, item in value.items() if key in allowed}
+        if source is not None:
+            result["source"] = str(source)
+        return result
+
+    def _legacy_override_semantics(self) -> list[str]:
+        assert self.legacy_layout is not None
+        if len(self.legacy_layout.compose_files) == 1:
+            return []
+        base_services = json_object(
+            self.legacy_layout.base_model.get("services"), "base legacy services"
+        )
+        merged_services = json_object(
+            self.legacy_layout.merged_model.get("services"), "merged legacy services"
+        )
+        if set(base_services) != set(merged_services):
+            raise UpgradeError("legacy override adds or removes services; no safe v2 translation exists")
+        normalized: list[str] = []
+        image_services = {"api", "jobs", "search", "web", "clickhouse-migrate"}
+        for service_name in sorted(base_services):
+            base = json_object(base_services[service_name], f"base legacy service {service_name}")
+            merged = json_object(merged_services[service_name], f"merged legacy service {service_name}")
+            changed = sorted(
+                key for key in set(base) | set(merged) if base.get(key) != merged.get(key)
+            )
+            if not changed:
+                continue
+            if changed != ["image"] or service_name not in image_services:
+                raise UpgradeError(
+                    f"legacy override changes unsupported {service_name} semantics: {', '.join(changed)}"
+                )
+            image = str(merged.get("image", ""))
+            if "/nano-rs/nanosiem/nanosiem-" not in image:
+                raise UpgradeError(
+                    f"legacy override image for {service_name} is not the managed enterprise repository"
+                )
+            normalized.append(f"{service_name}:enterprise-image-selection")
+        if not normalized:
+            raise UpgradeError("legacy override exists but has no qualified semantic difference")
+        return normalized
+
+    def _canonical_image_prefix(self, control_root: pathlib.Path, target: str) -> str:
+        lock = control_root / "images.enterprise.lock"
+        if lock.is_symlink() or not lock.is_file():
+            raise UpgradeError("authenticated enterprise control package lacks images.enterprise.lock")
+        release = ""
+        prefixes: set[str] = set()
+        found: set[str] = set()
+        required = {"api", "search", "jobs", "connector-runner", "web"}
+        for line in lock.read_text(encoding="utf-8").splitlines():
+            if line.startswith("# Release:"):
+                release = line.split(":", 1)[1].strip().removeprefix("v")
+            fields = line.split()
+            if not fields or line.startswith("#"):
+                continue
+            if len(fields) != 2 or not re.fullmatch(r"sha256:[0-9a-f]{64}", fields[1]):
+                raise UpgradeError("authenticated enterprise image lock contains an invalid entry")
+            reference = fields[0]
+            tail = reference.rsplit("/", 1)[-1]
+            repository = reference.rsplit(":", 1)[0] if ":" in tail else reference
+            matches = [name for name in required if repository.endswith(f"-{name}")]
+            if len(matches) == 1:
+                name = matches[0]
+                if name in found:
+                    raise UpgradeError("authenticated enterprise image lock contains a duplicate app image")
+                found.add(name)
+                prefixes.add(repository[: -(len(name) + 1)])
+        if release != target or found != required or len(prefixes) != 1:
+            raise UpgradeError("authenticated enterprise image lock does not match the target release")
+        prefix = next(iter(prefixes))
+        if prefix == "ghcr.io/nano-rs/nano":
+            raise UpgradeError("authenticated enterprise image lock resolves to the open image prefix")
+        return prefix
+
+    def _copy_authenticated_control(
+        self, control_root: pathlib.Path, destination: pathlib.Path, run_id: str,
+        expected_bundle_sha256: str,
+    ) -> None:
+        marker = destination / ".nano-transition-control.json"
+        if destination.exists():
+            value = read_json(marker)
+            if value != {
+                "format": "nano-v2-control-v1", "run_id": run_id,
+                "bundle_sha256": expected_bundle_sha256,
+            }:
+                raise UpgradeError("staged authenticated control tree does not match this transition")
+            return
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        stage = destination.parent / f".{destination.name}.{run_id}.tmp"
+        if stage.exists():
+            intent = read_json(self.transition_record)
+            if intent.get("run_id") != run_id or intent.get("bundle_sha256") != expected_bundle_sha256:
+                raise UpgradeError("stale control staging directory is not owned by this transition")
+            shutil.rmtree(stage)
+        for path in control_root.rglob("*"):
+            if path.is_symlink():
+                raise UpgradeError("authenticated control package contains a symbolic link")
+        ignored = shutil.ignore_patterns(".git", "target", ".nano-bundle-scratch", "backups", "upgrade-journal")
+        shutil.copytree(control_root, stage, ignore=ignored)
+        write_json_atomic(stage / marker.name, {
+            "format": "nano-v2-control-v1", "run_id": run_id,
+            "bundle_sha256": expected_bundle_sha256,
+        })
+        os.replace(stage, destination)
+
+    def _build_legacy_transition_overlay(
+        self, control_dir: pathlib.Path, transition_env: pathlib.Path,
+        semantics: list[str],
+    ) -> dict[str, Any]:
+        assert self.legacy_layout is not None
+        canonical_compose = control_dir / "docker-compose.opensource.yml"
+        result = self.runner.run([
+            "docker", "compose", "--project-directory", str(control_dir),
+            "--env-file", str(transition_env),
+            "-f", str(canonical_compose), "config", "--format", "json",
+        ], timeout=60)
+        try:
+            canonical = json_object(json.loads(result.stdout), "canonical Compose render")
+        except json.JSONDecodeError as error:
+            raise UpgradeError("canonical Compose render did not return JSON") from error
+        canonical_services = json_object(canonical.get("services"), "canonical services")
+        legacy_services = json_object(
+            self.legacy_layout.merged_model.get("services"), "legacy services"
+        )
+        overlay_services: dict[str, Any] = {}
+
+        # Every bundle-owned bind is made absolute so the root canonical file
+        # can be published atomically without replacing the legacy config tree.
+        for service_name, raw_service in canonical_services.items():
+            service = json_object(raw_service, f"canonical service {service_name}")
+            mounts: list[dict[str, Any]] = []
+            for volume in self._volume_entries(service, f"canonical service {service_name}"):
+                if volume.get("type") != "bind":
+                    continue
+                source = pathlib.Path(str(volume["source"])).resolve()
+                if control_dir == source or control_dir in source.parents:
+                    mounts.append(self._portable_volume(volume, source))
+            if mounts:
+                overlay_services.setdefault(service_name, {})["volumes"] = mounts
+
+        data_targets: dict[tuple[str, str], tuple[str, str]] = {
+            ("postgres", "/var/lib/postgresql/data"): ("postgres", "/var/lib/postgresql/data"),
+            ("clickhouse", "/var/lib/clickhouse"): ("clickhouse", "/var/lib/clickhouse"),
+            ("clickhouse", "/var/log/clickhouse-server"): ("clickhouse", "/var/log/clickhouse-server"),
+            ("vector", "/var/lib/vector"): ("vector", "/var/lib/vector"),
+            ("vector", "/etc/vector/dynamic"): ("vector", "/etc/vector/dynamic"),
+            ("api", "/app/data"): ("nano-api", "/app/data"),
+            ("api", "/etc/vector/dynamic"): ("nano-api", "/etc/vector/dynamic"),
+            ("api", "/app/config/vector"): ("nano-api", "/app/config/vector"),
+            ("jobs", "/app/data"): ("nano-jobs", "/app/data"),
+            ("jobs", "/etc/vector/dynamic"): ("nano-jobs", "/etc/vector/dynamic"),
+            ("jobs", "/app/config/vector"): ("nano-jobs", "/app/config/vector"),
+        }
+        required = {
+            ("postgres", "/var/lib/postgresql/data"),
+            ("clickhouse", "/var/lib/clickhouse"),
+            ("vector", "/var/lib/vector"),
+            ("api", "/app/data"),
+        }
+        found: set[tuple[str, str]] = set()
+        for legacy_service_name, raw_service in legacy_services.items():
+            service = json_object(raw_service, f"legacy service {legacy_service_name}")
+            for volume in self._volume_entries(service, f"legacy service {legacy_service_name}"):
+                key = (legacy_service_name, str(volume["target"]))
+                mapped = data_targets.get(key)
+                if mapped is None:
+                    continue
+                if volume.get("type") != "bind":
+                    raise UpgradeError(
+                        f"legacy persistent mount is not a bind mount: {legacy_service_name}:{volume['target']}"
+                    )
+                source = pathlib.Path(str(volume["source"]))
+                if not source.is_absolute():
+                    raise UpgradeError("legacy rendered data mount is not absolute")
+                try:
+                    resolved_source = source.resolve(strict=True)
+                except OSError as error:
+                    raise UpgradeError("legacy persistent data source disappeared before transition") from error
+                if (
+                    source.is_symlink()
+                    or not resolved_source.is_dir()
+                    or resolved_source not in self.legacy_layout.data_sources
+                ):
+                    raise UpgradeError("legacy persistent data source changed before transition")
+                target_service, target_path = mapped
+                translated = self._portable_volume(volume, resolved_source)
+                translated["target"] = target_path
+                mounts = overlay_services.setdefault(target_service, {}).setdefault("volumes", [])
+                mounts[:] = [item for item in mounts if item.get("target") != target_path]
+                mounts.append(translated)
+                found.add(key)
+        missing = sorted(required - found)
+        if missing:
+            detail = ", ".join(f"{service}:{target}" for service, target in missing)
+            raise UpgradeError(f"legacy layout lacks required persistent bind mounts: {detail}")
+        return {
+            "x-nano-legacy-transition": {
+                "format": "nano-legacy-transition-overlay-v1",
+                "override_semantics": semantics,
+            },
+            "services": overlay_services,
+        }
+
+    def _publish_control_entry(self, source: pathlib.Path, destination: pathlib.Path) -> None:
+        if not source.exists():
+            return
+        if source.is_symlink():
+            raise UpgradeError(f"authenticated control entry is symbolic: {source}")
+        if source.is_dir():
+            if destination.exists() and (destination.is_symlink() or not destination.is_dir()):
+                raise UpgradeError(f"installed control path conflicts with a directory: {destination}")
+            destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+            for child in sorted(source.iterdir(), key=lambda path: path.name):
+                self._publish_control_entry(child, destination / child.name)
+            return
+        if destination.exists():
+            if destination.is_symlink() or not destination.is_file():
+                raise UpgradeError(f"installed control path conflicts with a file: {destination}")
+            if sha256_path(source) == sha256_path(destination):
+                return
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = destination.parent / f".{destination.name}.legacy-transition.tmp"
+        if temporary.exists():
+            if temporary.is_dir():
+                shutil.rmtree(temporary)
+            else:
+                temporary.unlink()
+        shutil.copy2(source, temporary)
+        os.chmod(temporary, source.stat().st_mode & 0o777)
+        os.replace(temporary, destination)
+
+    def _retire_legacy_orphans(self, record: dict[str, Any]) -> None:
+        if record.get("legacy_services_retired") is True:
+            return
+        source = json_object(record.get("source"), "legacy transition source")
+        raw_files = source.get("compose_files")
+        if raw_files not in (["docker-compose.yml"], ["docker-compose.yml", "docker-compose.override.yml"]):
+            raise UpgradeError("legacy transition has an invalid source Compose set")
+        arguments = [
+            "docker", "compose", "--project-directory", str(self.install_dir),
+            "--env-file", str(self.install_dir / ".env"),
+        ]
+        for name in raw_files:
+            path = self.install_dir / name
+            if path.is_symlink() or not path.is_file():
+                raise UpgradeError("legacy source Compose file disappeared during transition")
+            arguments.extend(("-f", str(path)))
+        # These legacy-only application/monitoring services would otherwise
+        # keep writing beside nano-api/nano-jobs/nano-search after canonical
+        # Compose takes ownership of the project.  Same-name infrastructure,
+        # Vector, migrator, and nginx are deliberately left for the normal
+        # dependency-ordered rollout to recreate in place.
+        retired = ["api", "jobs", "search", "web", "node-exporter", "prometheus"]
+        for action in (["stop", *retired], ["rm", "-f", "-s", *retired]):
+            result = self.runner.run([*arguments, *action], timeout=180, check=False)
+            if result.returncode != 0:
+                detail = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+                suffix = detail[-1][:300] if detail else "Docker Compose failed"
+                raise UpgradeError(f"cannot retire legacy-only services: {suffix}")
+        record["legacy_services_retired"] = True
+        write_json_atomic(self.transition_record, record)
+
+    @staticmethod
+    def _image_repository(reference: str) -> str:
+        without_digest = reference.split("@", 1)[0]
+        tail = without_digest.rsplit("/", 1)[-1]
+        return without_digest.rsplit(":", 1)[0] if ":" in tail else without_digest
+
+    def _docker_architecture(self) -> str:
+        raw = self.runner.run(
+            ["docker", "info", "--format", "{{.Architecture}}"], timeout=30,
+        ).stdout.strip()
+        aliases = {"amd64": "amd64", "x86_64": "amd64", "arm64": "arm64", "aarch64": "arm64"}
+        try:
+            return aliases[raw]
+        except KeyError as error:
+            raise UpgradeError(f"unsupported Docker host architecture: {raw or 'missing'}") from error
+
+    def _legacy_bridge_environment_digest(self) -> str:
+        values = self.env_file.values()
+        values.pop("IMAGE_TAG", None)
+        encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _legacy_bridge_control_hashes(self) -> dict[str, str]:
+        if self.legacy_layout is None:
+            raise UpgradeError("legacy bridge control hashes require a qualified legacy layout")
+        return {
+            path.name: sha256_path(path)
+            for path in self.legacy_layout.compose_files
+        }
+
+    def _render_legacy_image_tag(self, version: str) -> dict[str, Any]:
+        if self.legacy_layout is None:
+            raise UpgradeError("legacy bridge rendering requires a qualified legacy layout")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".env.legacy-bridge.", dir=self.install_dir,
+        )
+        temporary = pathlib.Path(temporary_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as output, self.env_file.path.open("rb") as source:
+                shutil.copyfileobj(source, output)
+                output.flush()
+                os.fsync(output.fileno())
+            EnvFile(temporary).replace("IMAGE_TAG", version)
+            arguments = [
+                "docker", "compose", "--project-directory", str(self.install_dir),
+                "--env-file", str(temporary),
+            ]
+            for compose_file in self.legacy_layout.compose_files:
+                arguments.extend(("-f", str(compose_file)))
+            result = self.runner.run(
+                [*arguments, "config", "--format", "json"], timeout=60,
+            )
+            try:
+                return json_object(json.loads(result.stdout), "legacy bridge Compose render")
+            except json.JSONDecodeError as error:
+                raise UpgradeError("legacy bridge Compose render did not return JSON") from error
+        finally:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+
+    def _legacy_bridge_target_lock(
+        self, architecture: str, images: dict[str, Any],
+    ) -> pathlib.Path:
+        if self.legacy_layout is None:
+            raise UpgradeError("legacy bridge target lock requires a qualified legacy layout")
+        suffix = "open" if self.legacy_layout.edition == "open" else f"enterprise-{architecture}"
+        lock = self.nano_cli.parent.parent / "deploy/release/legacy" / f"v0.1.703-{suffix}.lock"
+        try:
+            nano_legacy_layout._regular_owned(lock, "legacy bridge target lock")
+            version, edition, lock_arch, locked = nano_legacy_layout._parse_lock(lock)
+        except nano_legacy_layout.LegacyLayoutError as error:
+            raise UpgradeError("retained legacy bridge target lock is invalid") from error
+        if not (
+            version == nano_legacy_bridge.TARGET_VERSION
+            and edition == self.legacy_layout.edition
+            and lock_arch in {"multiarch", architecture}
+        ):
+            raise UpgradeError("retained legacy bridge target lock has the wrong identity")
+        for service in nano_legacy_bridge.APP_SERVICES:
+            image = images[service]
+            if (
+                locked[service].repository != self._image_repository(image.ref)
+                or locked[service].digest != image.digest
+            ):
+                raise UpgradeError(
+                    f"signed bridge image {service} differs from its retained target lock"
+                )
+        return lock
+
+    def _claim_legacy_bridge(
+        self, bundle: pathlib.Path, run_id: str, expected_bundle_sha256: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        if self.legacy_layout is None:
+            raise UpgradeError("legacy bridge requires the qualified legacy Compose layout")
+        if self.legacy_layout.version not in {
+            nano_legacy_bridge.SOURCE_VERSION, nano_legacy_bridge.TARGET_VERSION,
+        }:
+            raise UpgradeError("legacy bridge resolver selected an unsupported source release")
+        manifest = verify_manifest(self.nano_cli, bundle, self.runner)
+        architecture = self._docker_architecture()
+        try:
+            images = nano_legacy_bridge.validate_manifest(
+                manifest, edition=self.legacy_layout.edition,
+                architecture=architecture,
+            )
+        except nano_legacy_bridge.LegacyBridgeError as error:
+            raise UpgradeError(str(error)) from error
+        if self.legacy_layout.architecture not in {"multiarch", architecture}:
+            raise UpgradeError("qualified legacy source lock does not match the Docker host architecture")
+        source_model = self._render_legacy_image_tag(nano_legacy_bridge.SOURCE_VERSION)
+        target_model = self._render_legacy_image_tag(nano_legacy_bridge.TARGET_VERSION)
+        try:
+            nano_legacy_bridge.validate_rendered_transition(
+                source_model, target_model, images,
+            )
+        except nano_legacy_bridge.LegacyBridgeError as error:
+            raise UpgradeError(str(error)) from error
+
+        existing = read_json(self.bridge_record) if self.bridge_record.is_file() else {}
+        source_lock_name = (
+            str(existing.get("source_lock", ""))
+            if existing else self.legacy_layout.lock_file.name
+        )
+        source_lock = self.nano_cli.parent.parent / "deploy/release/legacy" / source_lock_name
+        try:
+            nano_legacy_layout._regular_owned(source_lock, "legacy bridge source lock")
+            source_version, source_edition, source_arch, _ = nano_legacy_layout._parse_lock(source_lock)
+        except nano_legacy_layout.LegacyLayoutError as error:
+            raise UpgradeError("retained legacy bridge source lock is invalid") from error
+        if not (
+            source_version == nano_legacy_bridge.SOURCE_VERSION
+            and source_edition == self.legacy_layout.edition
+            and source_arch in {"multiarch", architecture}
+        ):
+            raise UpgradeError("retained legacy bridge source lock has the wrong identity")
+        target_lock = self._legacy_bridge_target_lock(architecture, images)
+        stable = {
+            "format": "nano-legacy-bridge-v1",
+            "run_id": run_id,
+            "bundle_sha256": expected_bundle_sha256,
+            "source_version": nano_legacy_bridge.SOURCE_VERSION,
+            "target_version": nano_legacy_bridge.TARGET_VERSION,
+            "edition": self.legacy_layout.edition,
+            "architecture": architecture,
+            "project_name": self.legacy_layout.project_name,
+            "compose_files": [path.name for path in self.legacy_layout.compose_files],
+            "source_lock": source_lock.name,
+            "target_lock": target_lock.name,
+            "environment_without_image_tag_sha256": self._legacy_bridge_environment_digest(),
+            "control_sha256": self._legacy_bridge_control_hashes(),
+            "images": [images[name].safe_record() for name in nano_legacy_bridge.APP_SERVICES],
+        }
+        if existing:
+            if existing.get("state") not in {"started", "image-tag-published", "complete"}:
+                raise UpgradeError("legacy bridge intent has an invalid state")
+            comparable = {key: value for key, value in existing.items() if key not in {"state", "source"}}
+            if comparable != stable:
+                raise UpgradeError("legacy bridge intent does not match this signed upgrade")
+            record = existing
+        else:
+            if self.legacy_layout.version != nano_legacy_bridge.SOURCE_VERSION:
+                raise UpgradeError("target legacy images exist without a durable bridge intent")
+            record = {
+                **stable,
+                "state": "started",
+                "source": self.legacy_layout.safe_record(),
+            }
+            write_json_atomic(self.bridge_record, record)
+        self._legacy_bridge_rollout = True
+        return manifest, images, record
+
+    def _bridge_images_from_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        manifest = {
+            "version": record.get("target_version"),
+            "edition": record.get("edition"),
+            "architecture": record.get("architecture"),
+            "requires": {"mandatory_backup": True},
+            "images": record.get("images"),
+        }
+        try:
+            return nano_legacy_bridge.validate_manifest(
+                manifest,
+                edition=str(record.get("edition", "")),
+                architecture=str(record.get("architecture", "")),
+            )
+        except nano_legacy_bridge.LegacyBridgeError as error:
+            raise UpgradeError("legacy bridge audit record is invalid") from error
+
+    def _verify_loaded_bridge_images(self, images: dict[str, Any]) -> None:
+        for service in nano_legacy_bridge.APP_SERVICES:
+            image = images[service]
+            result = self.runner.run([
+                "docker", "image", "inspect", "--format",
+                "{{.Id}}", image.ref,
+            ], timeout=30)
+            # The classic Docker image store exposes the archive's signed
+            # config digest as .Id.  The containerd image store exposes the
+            # signed registry/platform manifest digest for the same loaded
+            # archive.  nano_bundle.load_bundle already binds both identities
+            # to the SHA-verified archive before it publishes this tag.
+            if result.stdout.strip() not in {image.platform_digest, image.digest}:
+                raise UpgradeError(
+                    f"loaded bridge image {service} does not match its signed platform identity"
+                )
+
+    def _publish_legacy_bridge(
+        self, images: dict[str, Any], record: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._verify_loaded_bridge_images(images)
+        values = self.env_file.values()
+        if values.get("NANO_VERSION") or values.get("NANO_EDITION"):
+            raise UpgradeError("legacy bridge refuses canonical identity fields")
+        if values.get("IMAGE_TAG") not in {
+            nano_legacy_bridge.SOURCE_VERSION, nano_legacy_bridge.TARGET_VERSION,
+        }:
+            raise UpgradeError("legacy bridge environment has an unexpected IMAGE_TAG")
+        if values.get("IMAGE_TAG") != nano_legacy_bridge.TARGET_VERSION:
+            self.env_file.replace("IMAGE_TAG", nano_legacy_bridge.TARGET_VERSION)
+        if self._legacy_bridge_environment_digest() != record.get(
+            "environment_without_image_tag_sha256"
+        ):
+            raise UpgradeError("legacy bridge changed environment fields other than IMAGE_TAG")
+        if self._legacy_bridge_control_hashes() != record.get("control_sha256"):
+            raise UpgradeError("legacy bridge changed the legacy Compose control files")
+        record["state"] = "image-tag-published"
+        write_json_atomic(self.bridge_record, record)
+        self.env = self.env_file.values()
+        self.version = nano_legacy_bridge.TARGET_VERSION
+        self._legacy_bridge_rollout = True
+        return record
+
+    def _canonicalize_legacy_layout(
+        self, target: str, run_id: str, expected_bundle_sha256: str,
+    ) -> dict[str, Any]:
+        if self.legacy_layout is None:
+            record = read_json(self.transition_record)
+            if (
+                record.get("format") == "nano-legacy-transition-v1"
+                and record.get("run_id") == run_id
+                and record.get("bundle_sha256") == expected_bundle_sha256
+            ):
+                if record.get("state") in {"started", "canonical-published"}:
+                    if self.version != target:
+                        raise UpgradeError("legacy transition target environment was not atomically published")
+                    self.compose(["config", "--quiet"], timeout=60)
+                    record["state"] = "canonical-published"
+                    write_json_atomic(self.transition_record, record)
+                    self._retire_legacy_orphans(record)
+                    record["state"] = "complete"
+                    write_json_atomic(self.transition_record, record)
+                elif record.get("state") != "complete":
+                    raise UpgradeError("legacy transition has an invalid journal state")
+                staged_environment = (
+                    self.install_dir / ".nano-v2-control" / expected_bundle_sha256 / ".env.transition"
+                )
+                if staged_environment.exists():
+                    if staged_environment.is_symlink() or not staged_environment.is_file():
+                        raise UpgradeError("legacy transition staged environment is unsafe")
+                    staged_environment.unlink()
+                self._legacy_transition_rollout = True
+                return record
+            raise UpgradeError("legacy transition intent is missing while resuming canonical prepare")
+        control_root = self.nano_cli.parent.parent
+        if (
+            control_root == self.install_dir
+            or control_root in self.install_dir.parents
+            or self.install_dir in control_root.parents
+        ):
+            raise UpgradeError(
+                "authenticated v2 control package must be extracted outside the legacy install tree"
+            )
+        marker = control_root / ".nano-edition"
+        if marker.is_symlink() or not marker.is_file() or marker.read_text(encoding="utf-8").strip() != "enterprise":
+            raise UpgradeError("authenticated control package is not the enterprise edition")
+        bundle_marker = control_root / ".nano-bundle"
+        if bundle_marker.is_symlink() or not bundle_marker.is_file():
+            raise UpgradeError("authenticated control package marker is missing")
+        prefix = self._canonical_image_prefix(control_root, target)
+        semantics = self._legacy_override_semantics()
+        record: dict[str, Any] = {
+            "format": "nano-legacy-transition-v1",
+            "state": "started",
+            "run_id": run_id,
+            "bundle_sha256": expected_bundle_sha256,
+            "source": self.legacy_layout.safe_record(),
+            "target_version": target,
+            "overlay": "docker-compose.legacy-preserved.yml",
+            "override_semantics": semantics,
+        }
+        if self.transition_record.exists():
+            existing = read_json(self.transition_record)
+            comparable = json.loads(json.dumps(existing))
+            candidate = json.loads(json.dumps(record))
+            for value in (comparable, candidate):
+                value["state"] = "started"
+                source = value.get("source")
+                if isinstance(source, dict):
+                    archives = source.get("physical_archives")
+                    if isinstance(archives, list):
+                        source["physical_archives"] = [
+                            item.get("path") if isinstance(item, dict) else None
+                            for item in archives
+                        ]
+            if comparable != candidate:
+                raise UpgradeError("legacy transition intent does not match this upgrade")
+            record = existing
+        else:
+            write_json_atomic(self.transition_record, record)
+
+        control_dir = self.install_dir / ".nano-v2-control" / expected_bundle_sha256
+        self._copy_authenticated_control(
+            control_root, control_dir, run_id, expected_bundle_sha256,
+        )
+        generated = control_dir / "scripts/lib/generated-secrets.sh"
+        if not generated.is_file():
+            raise UpgradeError("authenticated control package lacks generated-secret backfill")
+        transition_env = control_dir / ".env.transition"
+        if not transition_env.exists():
+            shutil.copy2(self.install_dir / ".env", transition_env)
+            os.chmod(transition_env, 0o600)
+        self.runner.run([
+            "bash", "-c",
+            'set -euo pipefail; source "$1"; nano_backfill_generated_secrets "$2" generate',
+            "nano-legacy-transition", str(generated), str(transition_env),
+        ], timeout=120)
+        transition_env_file = EnvFile(transition_env)
+        transition_env_file.replace_many({
+            "NANO_VERSION": target,
+            "NANO_EDITION": "enterprise",
+            "NANO_IMAGE_PREFIX": prefix,
+            "NANO_SCHEMA_PROFILE": self.legacy_layout.schema_profile,
+            "COMPOSE_PROJECT_NAME": self.legacy_layout.project_name,
+            "NANO_COMPOSE_OVERLAYS": "docker-compose.legacy-preserved.yml",
+        })
+        overlay = self._build_legacy_transition_overlay(
+            control_dir, transition_env, semantics,
+        )
+        write_json_atomic(
+            self.install_dir / "docker-compose.legacy-preserved.yml", overlay,
+        )
+
+        for name in (
+            "scripts", "deploy", "migrations", "migrations/postgres-enterprise",
+            "clickhouse", "clickhouse-enterprise", "config",
+        ):
+            source = control_dir / name
+            destination = self.install_dir / name
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._publish_control_entry(source, destination)
+        # Publish the full signed control tree, not just files referenced by
+        # Compose.  A resume starts a fresh LocalOps instance and its preflight
+        # validates enrichment listeners from install_dir/config before any
+        # rollout can continue.
+        for name in (".nano-bundle", ".nano-edition", "images.enterprise.lock"):
+            self._publish_control_entry(control_dir / name, self.install_dir / name)
+        self._publish_control_entry(
+            control_dir / "docker-compose.opensource.yml",
+            self.install_dir / "docker-compose.opensource.yml",
+        )
+        canonical = [
+            "docker", "compose", "--project-directory", str(self.install_dir),
+            "--env-file", str(self.install_dir / ".env"),
+            "-f", str(self.install_dir / "docker-compose.opensource.yml"),
+            "-f", str(self.install_dir / "docker-compose.legacy-preserved.yml"),
+        ]
+        canonical_validation = list(canonical)
+        canonical_validation[canonical_validation.index(str(self.install_dir / ".env"))] = str(transition_env)
+        self.runner.run([*canonical_validation, "config", "--quiet"], timeout=60)
+        descriptor, environment_tmp = tempfile.mkstemp(
+            prefix=".env.legacy-transition.", dir=self.install_dir,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as output, transition_env.open("rb") as source:
+                shutil.copyfileobj(source, output)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(environment_tmp, self.install_dir / ".env")
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            with contextlib.suppress(OSError):
+                os.unlink(environment_tmp)
+            raise
+        self.runner.run([*canonical, "config", "--quiet"], timeout=60)
+        record["state"] = "canonical-published"
+        write_json_atomic(self.transition_record, record)
+        self._retire_legacy_orphans(record)
+        restored_marker = self.install_dir / ".nano-legacy-layout-restored"
+        if restored_marker.exists():
+            restored_marker.unlink()
+        record["state"] = "complete"
+        write_json_atomic(self.transition_record, record)
+        transition_env.unlink()
+        self.env = self.env_file.values()
+        self.edition = "enterprise"
+        self.version = target
+        self.schema_profile = self.env.get("NANO_SCHEMA_PROFILE", "udm")
+        self.legacy_layout = None
+        self._legacy_transition_rollout = True
+        self.compose_args = canonical
+        return record
 
     def prepare(
         self, bundle: pathlib.Path, source: str, target: str, run_id: str,
@@ -2120,7 +3124,19 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
     ) -> dict[str, Any]:
         if sha256_path(bundle) != expected_bundle_sha256:
             raise UpgradeError("bundle digest changed after coordinator verification")
-        current = canonical_version(self.env_file.values().get("NANO_VERSION", ""))
+        legacy_bridge = nano_legacy_bridge.is_legacy_bridge(source, target)
+        bridge_images: dict[str, Any] = {}
+        bridge_record: dict[str, Any] = {}
+        if legacy_bridge:
+            # Manifest identity and host architecture are checked before even
+            # the retained-image tags are created. A wrong-architecture bridge
+            # therefore cannot load, tag, or select an image on this host.
+            _, bridge_images, bridge_record = self._claim_legacy_bridge(
+                bundle, run_id, expected_bundle_sha256,
+            )
+        current = getattr(self, "version", None)
+        if current is None:
+            current = canonical_version(self.env_file.values().get("NANO_VERSION", ""))
         if current not in {source, target}:
             raise UpgradeError(
                 f"cannot resume prepare on {self.host_name}: installed {current}, "
@@ -2204,6 +3220,23 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             timeout=7200,
             env=load_environment,
         )
+        if legacy_bridge:
+            bridge_record = self._publish_legacy_bridge(
+                bridge_images, bridge_record,
+            )
+            return {
+                "retained_images": str(retained_file), "count": len(retained),
+                "legacy_bridge": bridge_record,
+            }
+        transition: dict[str, Any] | None = None
+        transition_record = getattr(
+            self, "transition_record", self.install_dir / ".nano-legacy-transition.json",
+        )
+        if getattr(self, "legacy_layout", None) is not None or transition_record.is_file():
+            transition = self._canonicalize_legacy_layout(
+                target, run_id, expected_bundle_sha256,
+            )
+            current = self.version
         if current != target:
             self.env_file.replace("NANO_VERSION", target)
         verified = canonical_version(self.env_file.values().get("NANO_VERSION", ""))
@@ -2211,7 +3244,10 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             raise UpgradeError("prepare did not persist the verified target version")
         self.env["NANO_VERSION"] = target
         self.version = target
-        return {"retained_images": str(retained_file), "count": len(retained)}
+        return {
+            "retained_images": str(retained_file), "count": len(retained),
+            "legacy_transition": transition,
+        }
 
     def _up_existing(
         self, services: Iterable[str], timeout: int, *, exact: bool = False,
@@ -2276,6 +3312,151 @@ printf '%s\n' "$metrics" | awk '$0 !~ /^#/ &&
                 return
             time.sleep(2)
         raise UpgradeError(f"Vector buffers did not drain within {timeout}s")
+
+    def _stop_legacy_vector_gracefully(self, container: str, timeout: int) -> None:
+        """Require Vector to finish its SIGTERM drain instead of being SIGKILLed."""
+        if not re.fullmatch(r"[0-9a-f]{12,64}", container):
+            raise UpgradeError("journaled legacy Vector container identity is invalid")
+        running = self._running_services(("vector",))
+        if running:
+            if running != ["vector"] or self._service_container("vector") != container:
+                raise UpgradeError("legacy Vector container changed during its drain")
+            stop_timeout = min(timeout, 300)
+            self.compose(
+                ["stop", "--timeout", str(stop_timeout), "vector"],
+                timeout=stop_timeout + 30,
+            )
+        result = self.runner.run(
+            [
+                "docker", "inspect", "--format",
+                "{{.State.Status}}\t{{.State.ExitCode}}\t{{.State.OOMKilled}}",
+                container,
+            ],
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0 or result.stdout.strip() != "exited\t0\tfalse":
+            raise UpgradeError(
+                "legacy Vector did not complete a clean acknowledged-event drain"
+            )
+
+    def _quiesce_legacy_vector_for_transition(self, timeout: int) -> None:
+        """Drain and stop the old same-name Vector exactly once before conversion."""
+        record = read_json(self.transition_record)
+        if record.get("format") != "nano-legacy-transition-v1":
+            raise UpgradeError("legacy transition audit record is invalid")
+        phase = record.get("legacy_vector_quiesce")
+        if phase == "complete":
+            return
+        if phase not in (None, "stopping"):
+            raise UpgradeError("legacy Vector quiesce journal state is invalid")
+        if phase is None:
+            container = self._service_container("vector")
+            record["legacy_vector_container"] = container
+            record["legacy_vector_quiesce"] = "stopping"
+            write_json_atomic(self.transition_record, record)
+        else:
+            container = record.get("legacy_vector_container")
+            if not isinstance(container, str):
+                raise UpgradeError("legacy Vector quiesce journal lacks its container identity")
+        self._stop_legacy_vector_gracefully(container, timeout)
+        record["legacy_vector_quiesce"] = "complete"
+        write_json_atomic(self.transition_record, record)
+
+    def _retire_legacy_managed_vector_config(self) -> dict[str, Any]:
+        """Archive the old managed OTLP fragment before v2 Vector loads the bind."""
+        record = read_json(self.transition_record)
+        if record.get("format") != "nano-legacy-transition-v1":
+            raise UpgradeError("legacy transition audit record is invalid")
+        rendered = json_object(
+            json.loads(self.compose(["config", "--format", "json"], timeout=60).stdout),
+            "canonical Compose render",
+        )
+        services = json_object(rendered.get("services"), "canonical services")
+        vector = json_object(services.get("vector"), "canonical vector service")
+        roots = [
+            pathlib.Path(str(volume["source"]))
+            for volume in self._volume_entries(vector, "canonical vector service")
+            if volume.get("type") == "bind" and volume.get("target") == "/etc/vector/dynamic"
+        ]
+        if len(roots) != 1:
+            raise UpgradeError("canonical Vector does not have exactly one dynamic bind root")
+        root = roots[0]
+        try:
+            resolved_root = root.resolve(strict=True)
+        except OSError as error:
+            raise UpgradeError("legacy Vector dynamic bind root disappeared") from error
+        source = json_object(record.get("source"), "legacy transition source")
+        qualified_roots = source.get("data_sources")
+        if not isinstance(qualified_roots, list) or str(resolved_root) not in qualified_roots:
+            raise UpgradeError("canonical Vector dynamic bind is not a qualified legacy data root")
+        if root.is_symlink() or not resolved_root.is_dir():
+            raise UpgradeError("legacy Vector dynamic bind root is unsafe")
+
+        relative = pathlib.Path("sources/configs/03-otlp-source.toml")
+        candidate = resolved_root / relative
+        archive_dir = resolved_root / ".nano-v2-transition-managed"
+        archived = archive_dir / relative.name
+        marker = archive_dir / "manifest.json"
+        marker_value = {
+            "format": "nano-v2-retired-managed-vector-v1",
+            "source": str(relative),
+            "archive": str(pathlib.Path(archive_dir.name) / archived.name),
+            "sha256": LEGACY_MANAGED_OTLP_CONFIG_SHA256,
+        }
+
+        candidate_present = candidate.exists() or candidate.is_symlink()
+        if candidate_present:
+            if candidate.is_symlink() or not candidate.is_file():
+                raise UpgradeError("legacy managed Vector config is not a regular file")
+            if sha256_path(candidate) != LEGACY_MANAGED_OTLP_CONFIG_SHA256:
+                raise UpgradeError(
+                    "legacy 03-otlp-source.toml differs from the qualified managed artifact"
+                )
+            size = candidate.stat().st_size
+        elif not (archive_dir.exists() or archive_dir.is_symlink()):
+            result = {"state": "absent", "source": str(relative)}
+            record["legacy_managed_vector_config"] = result
+            write_json_atomic(self.transition_record, record)
+            return result
+
+        if archive_dir.exists() or archive_dir.is_symlink():
+            if archive_dir.is_symlink() or not archive_dir.is_dir():
+                raise UpgradeError("legacy managed Vector archive path is unsafe")
+            if marker.is_file() and not marker.is_symlink():
+                if read_json(marker) != marker_value:
+                    raise UpgradeError("legacy managed Vector archive marker is invalid")
+            elif any(archive_dir.iterdir()) or not candidate_present:
+                raise UpgradeError("legacy managed Vector archive directory is not owned by this transition")
+            else:
+                write_json_atomic(marker, marker_value)
+        else:
+            archive_dir.mkdir(mode=0o700)
+            write_json_atomic(marker, marker_value)
+
+        if candidate_present:
+            if archived.exists() or archived.is_symlink():
+                raise UpgradeError("legacy managed Vector config exists at both live and archive paths")
+            os.replace(candidate, archived)
+        elif archived.is_file() and not archived.is_symlink():
+            if sha256_path(archived) != LEGACY_MANAGED_OTLP_CONFIG_SHA256:
+                raise UpgradeError("archived legacy managed Vector config digest changed")
+            size = archived.stat().st_size
+        elif archived.exists() or archived.is_symlink():
+            raise UpgradeError("archived legacy managed Vector config is unsafe")
+        else:
+            raise UpgradeError("legacy managed Vector archive marker lacks its artifact")
+
+        result = {
+            "state": "archived",
+            "source": str(relative),
+            "archive": str(pathlib.Path(archive_dir.name) / archived.name),
+            "sha256": LEGACY_MANAGED_OTLP_CONFIG_SHA256,
+            "bytes": size,
+        }
+        record["legacy_managed_vector_config"] = result
+        write_json_atomic(self.transition_record, record)
+        return result
 
     def _lb_hook(self, kind: str, required: bool) -> None:
         variable = f"NANO_UPGRADE_LB_{kind.upper()}_COMMAND"
@@ -2540,12 +3721,140 @@ printf 'consumer generation %s ready\n' "$generation"
     def backup_mutation_lock(self, timeout: int = 600) -> Any:
         return PgMigrationLock(self, "backup-mutation", acquire_timeout=timeout)
 
+    def _rollout_legacy_bridge(self, role: str, timeout: int) -> dict[str, Any]:
+        record = read_json(self.bridge_record)
+        if (
+            record.get("format") != "nano-legacy-bridge-v1"
+            or record.get("state") not in {"image-tag-published", "complete"}
+        ):
+            raise UpgradeError("legacy bridge rollout has no durable prepared intent")
+        if role in {"keeper", "clickhouse", "postgres", "ingest"}:
+            preserved = {
+                "keeper": (),
+                "clickhouse": ("clickhouse",),
+                "postgres": ("postgres",),
+                "ingest": ("vector",),
+            }[role]
+            services = [service for service in preserved if self._service_exists(service)]
+            self._wait_services(services, timeout)
+            return {"services": services, "legacy_bridge_preserved": True}
+        if role == "migration":
+            migration = self.compose(
+                ["run", "--rm", "--no-deps", "--pull", "never", "clickhouse-migrate"],
+                timeout=timeout,
+                check=False,
+            )
+            if migration.returncode != 0:
+                raise UpgradeError(
+                    f"ClickHouse migration failed: {self._safe_service_failure(migration)}"
+                )
+            return {"services": ["clickhouse-migrate"]}
+        if role != "app":
+            raise UpgradeError(f"unsupported legacy bridge rollout role: {role}")
+        applications = list(nano_legacy_bridge.APP_SERVICES)
+        self.compose(
+            [
+                "up", "-d", "--no-deps", "--pull", "never", "--force-recreate",
+                *applications,
+            ],
+            timeout=timeout,
+        )
+        self._wait_services(applications, timeout)
+        services = list(applications)
+        if self._service_exists("nginx"):
+            # Compose's legacy nginx resolves application container addresses
+            # at startup. Recreate it only after all four signed apps are up.
+            self.compose(
+                [
+                    "up", "-d", "--no-deps", "--pull", "never",
+                    "--force-recreate", "nginx",
+                ],
+                timeout=timeout,
+            )
+            # A healthy nginx process can briefly reset a request while its
+            # newly resolved upstream becomes ready.  Use the existing
+            # deadline-bounded dependency readiness gate so a transient reset
+            # retries, while a persistently broken route still fails rollout.
+            self._wait_app_readiness(["nginx"], timeout)
+            services.append("nginx")
+        return {"services": services, "legacy_bridge_recreated": applications}
+
+    def _post_verify_legacy_bridge(self, target: str, timeout: int) -> dict[str, Any]:
+        record = read_json(self.bridge_record)
+        if (
+            record.get("format") != "nano-legacy-bridge-v1"
+            or record.get("state") not in {"image-tag-published", "complete"}
+            or record.get("target_version") != target
+        ):
+            raise UpgradeError("legacy bridge post-verification intent is invalid")
+        values = self.env_file.values()
+        if values.get("IMAGE_TAG") != target:
+            raise UpgradeError("legacy bridge target IMAGE_TAG is not published")
+        if values.get("NANO_VERSION") or values.get("NANO_EDITION"):
+            raise UpgradeError("legacy bridge unexpectedly canonicalized the environment")
+        if self._legacy_bridge_environment_digest() != record.get(
+            "environment_without_image_tag_sha256"
+        ):
+            raise UpgradeError("legacy bridge changed environment fields other than IMAGE_TAG")
+        if self._legacy_bridge_control_hashes() != record.get("control_sha256"):
+            raise UpgradeError("legacy bridge changed the legacy Compose control files")
+        images = self._bridge_images_from_record(record)
+        source_model = self._render_legacy_image_tag(nano_legacy_bridge.SOURCE_VERSION)
+        target_model = self._render_legacy_image_tag(nano_legacy_bridge.TARGET_VERSION)
+        try:
+            nano_legacy_bridge.validate_rendered_transition(
+                source_model, target_model, images,
+            )
+        except nano_legacy_bridge.LegacyBridgeError as error:
+            raise UpgradeError(str(error)) from error
+        self._verify_loaded_bridge_images(images)
+        for service in nano_legacy_bridge.APP_SERVICES:
+            container = self._service_container(service)
+            running = self.runner.run(
+                ["docker", "inspect", "--format", "{{.Image}}", container],
+                timeout=30,
+            ).stdout.strip()
+            if running not in {
+                images[service].platform_digest, images[service].digest,
+            }:
+                raise UpgradeError(
+                    f"legacy bridge service {service} is not running its signed platform image"
+                )
+        expected = [
+            service for service in (
+                "postgres", "clickhouse", "dragonfly", "vector",
+                *nano_legacy_bridge.APP_SERVICES, "nginx",
+            )
+            if self._service_exists(service)
+        ]
+        health = self._wait_app_readiness(expected, timeout)
+        record["state"] = "complete"
+        write_json_atomic(self.bridge_record, record)
+        self.version = target
+        return {
+            "release": target,
+            "service_version": str(health.get("version", "unavailable")),
+            "first_party_images": [images[name].ref for name in nano_legacy_bridge.APP_SERVICES],
+            "legacy_bridge": True,
+        }
+
     def rollout(self, role: str, timeout: int, require_lb_hooks: bool = False) -> dict[str, Any]:
+        if getattr(self, "_legacy_bridge_rollout", False):
+            return self._rollout_legacy_bridge(role, timeout)
         try:
             candidates = ROLE_SERVICES[role]
         except KeyError as error:
             raise UpgradeError(f"unsupported rollout role: {role}") from error
-        selected = self._running_services(candidates)
+        legacy_transition_rollout = getattr(self, "_legacy_transition_rollout", False)
+        if legacy_transition_rollout:
+            # Legacy application services use different names (api -> nano-api,
+            # and so on), and are deliberately retired before dependency-
+            # ordered rollout. Select every service rendered by the canonical
+            # target for this one transition instead of mistaking the absent
+            # target containers for an operator-disabled service.
+            selected = [service for service in candidates if self._service_expected(service)]
+        else:
+            selected = self._running_services(candidates)
         selected = self._exact_role_services(role, selected)
         if role == "keeper":
             services = self._up_existing(selected, timeout, exact=True)
@@ -2567,14 +3876,38 @@ printf 'consumer generation %s ready\n' "$generation"
         elif role == "migration":
             proxies = self._up_existing(selected, timeout, exact=True)
             self._wait_services(proxies, timeout)
-            self.compose(["run", "--rm", "--no-deps", "--pull", "never", "clickhouse-migrate"], timeout=timeout)
+            migration = self.compose(
+                ["run", "--rm", "--no-deps", "--pull", "never", "clickhouse-migrate"],
+                timeout=timeout,
+                check=False,
+            )
+            if migration.returncode != 0:
+                raise UpgradeError(
+                    f"ClickHouse migration failed: {self._safe_service_failure(migration)}"
+                )
             services = [*proxies, "clickhouse-migrate"]
         elif role == "ingest":
             if "ingest-edge" in selected:
                 self._lb_hook("drain", require_lb_hooks)
             try:
                 if "vector" in selected:
-                    self._drain_vector(min(timeout, 300))
+                    if legacy_transition_rollout:
+                        self._quiesce_legacy_vector_for_transition(min(timeout, 300))
+                        self._retire_legacy_managed_vector_config()
+                        # The legacy topology has no stable Vector namespace
+                        # anchor. Canonical Vector and its tap both use
+                        # network_mode: service:vector-netns, while the normal
+                        # ingest rollout deliberately uses --no-deps. Create
+                        # and gate that new dependency after the old Vector is
+                        # drained, before either canonical process can start.
+                        if self._service_exists("vector-netns"):
+                            self.compose([
+                                "up", "-d", "--no-deps", "--pull", "never",
+                                "vector-netns",
+                            ], timeout=timeout)
+                            self._wait_container("vector-netns", timeout)
+                    else:
+                        self._drain_vector(min(timeout, 300))
                 services = self._up_ingest_services(selected, timeout, exact=True)
                 if "ingest-edge" in services:
                     route_probe = self.smoke_ingest(f"nano-rollout-{uuid.uuid4()}")
@@ -2597,6 +3930,8 @@ printf 'consumer generation %s ready\n' "$generation"
         return result
 
     def post_verify(self, target: str, timeout: int) -> dict[str, Any]:
+        if getattr(self, "_legacy_bridge_rollout", False):
+            return self._post_verify_legacy_bridge(target, timeout)
         prefix = self.env.get("NANO_IMAGE_PREFIX", "ghcr.io/nano-rs/nano")
         images = self.compose(["config", "--images"], timeout=60).stdout.split()
         first_party = [image for image in images if image.startswith(f"{prefix}-")]
@@ -2623,8 +3958,14 @@ printf 'consumer generation %s ready\n' "$generation"
 
     def _probe_app_route(self) -> dict[str, Any]:
         internal_scheme = "https" if self.role_env.get("NANO_PRIVATE_TLS") == "true" else "http"
+        legacy_bridge = getattr(self, "_legacy_bridge_rollout", False)
+        nginx_url = (
+            "https://127.0.0.1:443/api/users/me"
+            if legacy_bridge
+            else "http://127.0.0.1:80/api/health"
+        )
         routes = [
-            ("nginx", "http://127.0.0.1:80/api/health"),
+            ("nginx", nginx_url),
             ("app-internal-edge", f"{internal_scheme}://127.0.0.1:3000/health"),
         ]
         routes = [(service, url) for service, url in routes if self._service_exists(service)]
@@ -2632,19 +3973,32 @@ printf 'consumer generation %s ready\n' "$generation"
             raise UpgradeError("app role has no routable application edge")
         results: dict[str, dict[str, Any]] = {}
         for service, url in routes:
+            if legacy_bridge and service == "nginx":
+                # The preserved legacy nginx has no routed health endpoint.
+                # Its authenticated /api/users/me route deterministically
+                # returns 401 without a session, proving nginx -> API routing
+                # without putting credentials into a process argument.
+                probe = (
+                    'response="$(wget -S -O /dev/null --no-check-certificate "$1" 2>&1 || true)"; '
+                    'if ! printf "%s\\n" "$response" | grep -Eq '
+                    "'HTTP/[0-9.]+ 401 Unauthorized'; then "
+                    'printf "%s\\n" "$response" >&2; exit 1; fi; '
+                    "printf '%s\\n' '{\"status\":\"healthy\",\"route_status\":401}'"
+                )
+            else:
+                probe = (
+                    'case "$1" in https://*) insecure=true ;; *) insecure=false ;; esac; '
+                    'if command -v wget >/dev/null 2>&1; then '
+                    '  if [ "$insecure" = true ]; then wget -qO- --no-check-certificate "$1"; '
+                    '  else wget -qO- "$1"; fi; '
+                    'elif command -v curl >/dev/null 2>&1; then '
+                    '  if [ "$insecure" = true ]; then curl -kfsS "$1"; '
+                    '  else curl -fsS "$1"; fi; '
+                    'else echo "app edge has no HTTP client" >&2; exit 127; fi'
+                )
             result = self.compose(
-                ["exec", "-T", service, "sh", "-ec",
-                 'case "$1" in https://*) insecure=true ;; *) insecure=false ;; esac; '
-                 'if command -v wget >/dev/null 2>&1; then '
-                 '  if [ "$insecure" = true ]; then wget -qO- --no-check-certificate "$1"; '
-                 '  else wget -qO- "$1"; fi; '
-                 'elif command -v curl >/dev/null 2>&1; then '
-                 '  if [ "$insecure" = true ]; then curl -kfsS "$1"; '
-                 '  else curl -fsS "$1"; fi; '
-                 'else echo "app edge has no HTTP client" >&2; exit 127; fi',
-                 "nano-upgrade", url],
-                timeout=30,
-                check=False,
+                ["exec", "-T", service, "sh", "-ec", probe, "nano-upgrade", url],
+                timeout=30, check=False,
             )
             if result.returncode != 0:
                 lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
@@ -2665,6 +4019,10 @@ printf 'consumer generation %s ready\n' "$generation"
         token = self.env.get("NANO_PLATFORM_INGEST_TOKEN", "")
         if not token and self.env.get("NANO_INGEST_STATIC_FALLBACK") == "true":
             token = self.env.get("VECTOR_AUTH_TOKEN", "")
+        if not token and getattr(self, "_legacy_bridge_rollout", False):
+            # The preserved 0.1.703 layout predates the v2 platform-token
+            # fields; its authenticated ingest contract is VECTOR_AUTH_TOKEN.
+            token = self.env.get("VECTOR_AUTH_TOKEN", "")
         if not token:
             raise UpgradeError(
                 "smoke ingest requires NANO_PLATFORM_INGEST_TOKEN, or VECTOR_AUTH_TOKEN "
@@ -2682,9 +4040,18 @@ auth_file=$(mktemp)
 trap 'rm -f "$auth_file"' EXIT HUP INT TERM
 printf 'Authorization: Bearer %s\n' "$nano_smoke_token" >"$auth_file"
 if command -v curl >/dev/null 2>&1; then
-  env -u NANO_PLATFORM_INGEST_TOKEN -u VECTOR_AUTH_TOKEN curl -fsS \
-    -H @"$auth_file" -H "Content-Type: application/json" --data "$1" "$2" >/dev/null
+  case "$2" in
+    https://*)
+      env -u NANO_PLATFORM_INGEST_TOKEN -u VECTOR_AUTH_TOKEN curl -kfsS \
+        -H @"$auth_file" -H "Content-Type: application/json" --data "$1" "$2" >/dev/null
+      ;;
+    *)
+      env -u NANO_PLATFORM_INGEST_TOKEN -u VECTOR_AUTH_TOKEN curl -fsS \
+        -H @"$auth_file" -H "Content-Type: application/json" --data "$1" "$2" >/dev/null
+      ;;
+  esac
 elif command -v nc >/dev/null 2>&1; then
+  case "$2" in https://*) echo "ingest edge has no TLS HTTP client" >&2; exit 127 ;; esac
   response=$(
     printf "POST /ingest HTTP/1.0\r\nHost: 127.0.0.1\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s" \
       "$nano_smoke_token" "${#1}" "$1" | \
@@ -2693,6 +4060,7 @@ elif command -v nc >/dev/null 2>&1; then
   status=$(printf '%s\n' "$response" | sed -n '1p')
   case "$status" in *" 2"??*) ;; *) echo "ingest edge smoke returned: $status" >&2; exit 1 ;; esac
 elif command -v bash >/dev/null 2>&1; then
+  case "$2" in https://*) echo "ingest edge has no TLS HTTP client" >&2; exit 127 ;; esac
   printf '%s\n%s\n' "$nano_smoke_token" "$1" | \
     env -u NANO_PLATFORM_INGEST_TOKEN -u VECTOR_AUTH_TOKEN bash -ec '
 IFS= read -r token
@@ -2708,9 +4076,14 @@ else
   exit 127
 fi
 '''
+        ingest_url = (
+            "https://127.0.0.1:443/ingest/"
+            if getattr(self, "_legacy_bridge_rollout", False)
+            else "http://127.0.0.1:80/ingest"
+        )
         self.compose(
             ["exec", "-T", edge_service, "sh", "-ec", script, "nano-upgrade", payload,
-             "http://127.0.0.1:80/ingest"],
+             ingest_url],
             timeout=30, input_text=token + "\n",
         )
         return {"marker": marker, "accepted": True}
@@ -3475,6 +4848,26 @@ def check_version_path(
     else:
         checks.append(Check("version-path", True, f"{installed} -> {target}; no required stop skipped", "coordinator"))
     return checks
+
+
+def enforce_signed_backup_policy(
+    manifest: dict[str, Any], *, skip_requested: bool = False, journal_skipped: bool = False
+) -> bool:
+    requires = json_object(manifest.get("requires", {}), "manifest requirements")
+    mandatory = requires.get("mandatory_backup", False)
+    if not isinstance(mandatory, bool):
+        raise UpgradeError("manifest mandatory_backup requirement is invalid")
+    if mandatory and skip_requested:
+        raise UpgradeError(
+            "this signed upgrade requires a backup; "
+            "--skip-backup-I-understand is forbidden"
+        )
+    if mandatory and journal_skipped:
+        raise UpgradeError(
+            "the signed upgrade requires a backup, but the journal records "
+            "a skipped backup"
+        )
+    return mandatory
 
 
 def print_checks(checks: Sequence[Check]) -> None:
@@ -4439,6 +5832,15 @@ def upgrade_command(args: argparse.Namespace) -> int:
     install_dir = pathlib.Path(args.install_dir).expanduser().resolve()
     nano_cli = pathlib.Path(args.nano_cli or SCRIPT_DIR / "nano").expanduser().resolve()
     runner = Runner()
+    recovery_path = install_dir / ".nano-legacy-backup-recovery.json"
+    if recovery_path.exists() or recovery_path.is_symlink():
+        if not args.resume:
+            raise UpgradeError(
+                "an interrupted legacy physical backup is pending; rerun with --resume"
+            )
+        with acquire_process_lock(install_dir):
+            recover_legacy_backup_services(install_dir, runner)
+        eprint("Recovered the exact legacy service set stopped by the interrupted backup.")
     ops = LocalOps(install_dir, nano_cli, runner)
     if args.test_license_rehearsal:
         if ops.edition != "enterprise":
@@ -4489,11 +5891,16 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     args.remote_install_dir = str(started["remote_install_dir"])
                 if not args.remote_bundle and started.get("remote_bundle"):
                     args.remote_bundle = str(started["remote_bundle"])
+                if not args.backup_output and started.get("backup_output"):
+                    args.backup_output = str(started["backup_output"])
             bundle, temporary = bundle_for_version(args, ops, runner)
             bundle_digest = sha256_path(bundle)
             manifest = verify_manifest(nano_cli, bundle, runner)
             require_bundle_digest(bundle, bundle_digest)
             target = canonical_version(str(manifest["version"]))
+            mandatory_backup = enforce_signed_backup_policy(
+                manifest, skip_requested=args.skip_backup_I_understand
+            )
             nodes, executors, role_split = make_executors(args, ops, runner)
             preflight_backup_root = pathlib.Path(
                 args.backup_output or install_dir / "backups"
@@ -4516,7 +5923,9 @@ def upgrade_command(args: argparse.Namespace) -> int:
                 eprint(
                     "Recovered an incomplete manual backup fence before starting the upgrade."
                 )
-            schema_profile = ops.env.get("NANO_SCHEMA_PROFILE", "udm")
+            schema_profile = getattr(
+                ops, "schema_profile", ops.env.get("NANO_SCHEMA_PROFILE", "udm")
+            )
 
             if state is not None:
                 expected_digest = (state.latest("run_started") or {}).get("bundle_sha256")
@@ -4525,6 +5934,14 @@ def upgrade_command(args: argparse.Namespace) -> int:
             started = state.latest("run_started") if state is not None else None
             started = started or {}
             source_version = canonical_version(str(started.get("installed_version", ops.version)))
+            legacy_transition = (
+                getattr(ops, "legacy_layout", None) is not None
+                or bool(started.get("legacy_layout"))
+            )
+            if legacy_transition and role_split:
+                raise UpgradeError("legacy managed layout transition supports only single-node Compose")
+            if legacy_transition and args.skip_backup_I_understand:
+                raise UpgradeError("legacy managed layout transition never permits the backup override")
             if state is not None and started.get("deployment") != normalized_deployment:
                 raise UpgradeError("normalized inventory/deployment identity differs from the journal")
             runtime_identities = {
@@ -4534,6 +5951,8 @@ def upgrade_command(args: argparse.Namespace) -> int:
             if not isinstance(recorded_workers, dict):
                 raise UpgradeError("journaled worker identities are invalid")
             checks = check_version_path(ops.version, manifest, ops.edition, resuming=state is not None)
+            if legacy_transition:
+                checks.append(legacy_backup_retention_check(args.backup_output, install_dir))
             for node in nodes:
                 recorded = recorded_workers.get(node.name)
                 checks.extend(runtime_identity_checks(
@@ -4697,6 +6116,8 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     "remote_install_dir": str(remote_install), "remote_bundle": str(remote_bundle),
                     "deployment": normalized_deployment, "workers": runtime_identities,
                     "backup_skip_override": args.skip_backup_I_understand,
+                    "legacy_layout": legacy_transition,
+                    "backup_output": str(args.backup_output or ""),
                 })
                 journal.append(
                     state, "preflight_passed",
@@ -4716,6 +6137,8 @@ def upgrade_command(args: argparse.Namespace) -> int:
             recovery_set_result = ""
             backup_nodes = backup_nodes_for(nodes, role_split)
             skipped_before = "backup-skipped" in state.done_steps
+            if mandatory_backup:
+                enforce_signed_backup_policy(manifest, journal_skipped=skipped_before)
             skip_backup = args.skip_backup_I_understand or skipped_before
             if skip_backup:
                 eprint("WARNING: BACKUP SKIPPED BY EXPLICIT OPERATOR OVERRIDE --skip-backup-I-understand")
@@ -4757,6 +6180,9 @@ def upgrade_command(args: argparse.Namespace) -> int:
                         epoch=epoch, role_split=role_split, timeout=args.timeout,
                         require_lb_hooks=require_lb_hooks,
                         nano_cli=nano_cli, runner=runner,
+                        clickhouse_disk=(
+                            "default" if legacy_transition else "backups"
+                        ),
                         # A coordinator SIGKILL can leave the prior workers
                         # waiting on their old gates. A retry uses a distinct
                         # private gate while retaining the journaled recovery
@@ -4993,13 +6419,24 @@ def rollback_command(args: argparse.Namespace) -> int:
         ))
         print_checks(checks)
         backups = completed.get("backups") or []
-        compatible = live_matches_completed and ledgers_equal(before_ledgers, live_ledgers)
+        legacy_layout = bool(started.get("legacy_layout"))
+        compatible = (
+            live_matches_completed
+            and ledgers_equal(before_ledgers, live_ledgers)
+            and not legacy_layout
+        )
         if not compatible:
             key = args.backup_key_file or "$NANO_BACKUP_KEY_FILE"
-            eprint(
-                "Rollback refused: live all-node migration ledgers are not exactly the "
-                "pre-upgrade schema. Signed bundle schema v1 declares no image-rollback exception."
-            )
+            if legacy_layout:
+                eprint(
+                    "Rollback refused: this run transitioned a signed legacy layout. "
+                    "Return with the journal-bound backup and explicit legacy layout restore."
+                )
+            else:
+                eprint(
+                    "Rollback refused: live all-node migration ledgers are not exactly the "
+                    "pre-upgrade schema. Signed bundle schema v1 declares no image-rollback exception."
+                )
             recovery_set = str(completed.get("recovery_set") or "")
             if backups and recovery_set:
                 eprint("Restore every role-split component with the signed recovery set:")
@@ -5009,9 +6446,10 @@ def rollback_command(args: argparse.Namespace) -> int:
                         f"--recovery-set {recovery_set} --force"
                     )
             elif backups:
+                layout_option = " --restore-layout legacy" if legacy_layout else ""
                 eprint(
                     f"Restore the mandatory backup instead: scripts/nano restore --key-file {key} "
-                    f"--from {backups[0]} --force"
+                    f"--from {backups[0]} --force{layout_option}"
                 )
             else:
                 eprint("No upgrade backup was recorded; restore the separately proven backup used for the override.")

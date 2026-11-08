@@ -51,7 +51,12 @@
 # NANO_FLUENT_BIND_ADDRESS / NANO_TENZIR_BIND_ADDRESS (persisted to .env).
 
 set -euo pipefail
-umask 077
+# The checkout and generated runtime configuration are bind-mounted into
+# containers that intentionally run as non-root.  Keep those non-secret paths
+# traversable/readable even when the caller (notably root) starts with umask
+# 077.  Secret files are created atomically with explicit 0600/0640 modes
+# below and in generated-secrets.sh / render-inventory.py.
+umask 022
 
 INSTALLER_SOURCE_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then

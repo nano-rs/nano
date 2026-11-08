@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -40,6 +41,7 @@ MIGRATION_GROUPS = (
 )
 ROLES = frozenset({"app", "ingest", "clickhouse", "keeper", "postgres"})
 RESOURCE_ROLES = ROLES | {"tenzir"}
+ARCHITECTURES = frozenset({"amd64", "arm64"})
 
 _SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 _STABLE_VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
@@ -200,6 +202,20 @@ def _semver(value: Any, label: str) -> str:
     return _text(value, label, _SEMVER)
 
 
+def _architecture(value: Any, label: str) -> str:
+    checked = _text(value, label)
+    aliases = {
+        "amd64": "amd64",
+        "x86_64": "amd64",
+        "arm64": "arm64",
+        "aarch64": "arm64",
+    }
+    normalized = aliases.get(checked.lower())
+    if normalized not in ARCHITECTURES:
+        raise BundleError(f"{label} must be amd64 or arm64")
+    return normalized
+
+
 def _validate_manifest(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise BundleError("manifest must be a JSON object")
@@ -207,6 +223,7 @@ def _validate_manifest(value: Any) -> dict[str, Any]:
         "schema_version",
         "version",
         "edition",
+        "architecture",
         "created_at",
         "git_sha",
         "images",
@@ -222,6 +239,7 @@ def _validate_manifest(value: Any) -> dict[str, Any]:
     _semver(value["version"], "manifest.version")
     if value["edition"] not in {"open", "enterprise"}:
         raise BundleError("manifest.edition must be open or enterprise")
+    _architecture(value["architecture"], "manifest.architecture")
     created = _text(value["created_at"], "manifest.created_at")
     if not created.endswith("Z"):
         raise BundleError("manifest.created_at must be UTC RFC3339")
@@ -323,13 +341,16 @@ def _validate_manifest(value: Any) -> dict[str, Any]:
     requires = value["requires"]
     if not isinstance(requires, dict):
         raise BundleError("manifest.requires must be an object")
+    if "mandatory_backup" in requires and type(requires["mandatory_backup"]) is not bool:
+        raise BundleError("manifest.requires.mandatory_backup must be a boolean")
     legacy_keys = {"cpu_features_by_role", "min_disk_bytes", "min_ram_bytes"}
     derived_keys = {"cpu_features_by_role", "disk", "ram"}
-    if set(requires) == legacy_keys:
+    requirement_keys = set(requires) - {"mandatory_backup"}
+    if requirement_keys == legacy_keys:
         for field in ("min_disk_bytes", "min_ram_bytes"):
             if type(requires[field]) is not int or requires[field] <= 0:
                 raise BundleError(f"manifest.requires.{field} must be a positive integer")
-    elif set(requires) == derived_keys:
+    elif requirement_keys == derived_keys:
         disk = requires["disk"]
         if not isinstance(disk, dict):
             raise BundleError("manifest.requires.disk must be an object")
@@ -686,8 +707,8 @@ def _digest_matches(ref: str, digest: str, image_id: str, repo_digests: Iterable
     return any(item == f"{repo}@{digest}" or item.endswith(f"@{digest}") for item in repo_digests)
 
 
-def _docker_archive_config_digest(path: Path, ref: str) -> str:
-    """Return the content-addressed config identity docker load will expose.
+def _docker_archive_metadata(path: Path, ref: str) -> tuple[str, str]:
+    """Return the content identity and architecture docker load will expose.
 
     Docker's containerd image store reports an OCI manifest/index digest as
     ``image inspect .Id``, while the classic image store reports the config
@@ -734,11 +755,44 @@ def _docker_archive_config_digest(path: Path, ref: str) -> str:
             actual, _ = _stream_hash(tf, config_member)
             if actual != expected:
                 raise BundleError("docker image archive config digest does not match its content")
-            return f"sha256:{actual}"
+            config_value = _unique_json(
+                _read_member(
+                    tf,
+                    config_member,
+                    maximum=MAX_MANIFEST_BYTES,
+                    label="docker image config",
+                ),
+                "docker image config",
+            )
+            if not isinstance(config_value, dict):
+                raise BundleError("docker image config must be an object")
+            architecture = _architecture(
+                config_value.get("architecture"), "docker image architecture"
+            )
+            if config_value.get("os") != "linux":
+                raise BundleError("docker image operating system must be linux")
+            return f"sha256:{actual}", architecture
     except BundleError:
         raise
     except (OSError, tarfile.TarError) as exc:
         raise BundleError("docker image archive is invalid or truncated") from exc
+
+
+def _docker_archive_config_digest(path: Path, ref: str) -> str:
+    """Compatibility helper for callers that only need the config identity."""
+    return _docker_archive_metadata(path, ref)[0]
+
+
+def _docker_host_architecture(docker: Sequence[str]) -> str:
+    proc = _run(
+        [*docker, "info", "--format", "{{.Architecture}}"],
+        error="cannot determine Docker host architecture",
+    )
+    try:
+        value = proc.stdout.decode("utf-8", "strict").strip()
+    except UnicodeDecodeError as exc:
+        raise BundleError("Docker host architecture is not valid UTF-8") from exc
+    return _architecture(value, "Docker host architecture")
 
 
 def load_bundle(
@@ -749,6 +803,15 @@ def load_bundle(
     docker: Sequence[str] = ("docker",),
 ) -> list[str]:
     verified = verify_bundle(path, roots)
+    bundle_architecture = _architecture(
+        verified.manifest["architecture"], "manifest.architecture"
+    )
+    host_architecture = _docker_host_architecture(docker)
+    if host_architecture != bundle_architecture:
+        raise BundleError(
+            f"bundle architecture {bundle_architecture} does not match "
+            f"Docker host architecture {host_architecture}"
+        )
     chosen_roles = selected_roles() if roles is None else roles
     selected = [
         image for image in verified.manifest["images"] if _selected_image(image["name"], chosen_roles)
@@ -767,10 +830,16 @@ def load_bundle(
                 sha, size = _stream_hash(tf, members[image["file"]], output)
             if sha != image["sha256"] or size != image["size"]:
                 raise BundleError(f"image payload {image['file']} changed during load")
-            config_digest = _docker_archive_config_digest(target, image["archive_ref"])
+            config_digest, image_architecture = _docker_archive_metadata(
+                target, image["archive_ref"]
+            )
             if config_digest != image["platform_digest"]:
                 raise BundleError(
                     f"image payload {image['file']} platform digest does not match manifest"
+                )
+            if image_architecture != bundle_architecture:
+                raise BundleError(
+                    f"image payload {image['file']} architecture does not match manifest"
                 )
             _run([*docker, "load", "--input", str(target)], error=f"docker load failed for {image['name']}")
             image_id, _ = _docker_identity(docker, image["archive_ref"])
@@ -835,6 +904,7 @@ def create_bundle(
     *,
     version: str,
     edition: str,
+    architecture: str,
     created_at: str,
     git_sha: str,
     images: Sequence[ImageSource],
@@ -847,6 +917,7 @@ def create_bundle(
     verification_root: Root,
     force: bool = False,
 ) -> Path:
+    architecture = _architecture(architecture, "bundle architecture")
     if output.exists() and not force:
         raise BundleError(f"refusing to overwrite existing bundle {output}")
     image_manifest = []
@@ -854,12 +925,16 @@ def create_bundle(
         _text(image.name, "image name", _IDENTIFIER)
         if not image.archive.is_file():
             raise BundleError(f"image archive is missing: {image.archive}")
-        archived_platform = _docker_archive_config_digest(
+        archived_platform, archived_architecture = _docker_archive_metadata(
             image.archive, image.archive_ref
         )
         if archived_platform != image.platform_digest:
             raise BundleError(
                 f"image archive {image.archive} does not match its platform digest"
+            )
+        if archived_architecture != architecture:
+            raise BundleError(
+                f"image archive {image.archive} architecture does not match bundle"
             )
         image_manifest.append(
             {
@@ -878,6 +953,7 @@ def create_bundle(
             "schema_version": SCHEMA_VERSION,
             "version": version,
             "edition": edition,
+            "architecture": architecture,
             "created_at": created_at,
             "git_sha": git_sha,
             "images": image_manifest,
@@ -1041,6 +1117,7 @@ def load_policy(
         "schema_version": 1,
         "version": version,
         "edition": "open",
+        "architecture": "amd64",
         "created_at": "2000-01-01T00:00:00Z",
         "git_sha": "0" * 40,
         "images": [
@@ -1126,23 +1203,43 @@ def _docker_sources(
     directory: Path,
     *,
     pull: bool,
+    architecture: str,
+    source_specs: dict[str, tuple[str, str]] | None = None,
     docker: Sequence[str] = ("docker",),
 ) -> list[ImageSource]:
+    architecture = _architecture(architecture, "bundle architecture")
     sources = []
     names: set[str] = set()
     for name, ref, expected in specs:
         if name in names:
             raise BundleError(f"duplicate image name {name!r}")
         names.add(name)
-        immutable_ref = f"{ref}@{expected}" if expected else ref
+        source_ref = ref
+        if source_specs is not None:
+            try:
+                source_ref, source_digest = source_specs[name]
+            except KeyError as exc:
+                raise BundleError(f"source image lock has no image {name!r}") from exc
+            if expected != source_digest:
+                raise BundleError(
+                    f"source and delivery image locks disagree on digest for {name!r}"
+                )
+        immutable_ref = f"{source_ref}@{expected}" if expected else source_ref
         if pull:
-            _run([*docker, "pull", immutable_ref], error=f"cannot pull {immutable_ref}")
+            _run(
+                [*docker, "pull", "--platform", f"linux/{architecture}", immutable_ref],
+                error=f"cannot pull {immutable_ref} for linux/{architecture}",
+            )
         image_id, repo_digests = _docker_identity(docker, immutable_ref)
         digest = expected or image_id
         if not _SHA256.fullmatch(digest):
             raise BundleError(f"docker returned invalid digest for {ref}")
-        if expected and not _digest_matches(ref, expected, image_id, repo_digests):
-            raise BundleError(f"local image {ref} does not match locked digest {expected}")
+        if expected and not _digest_matches(
+            source_ref, expected, image_id, repo_digests
+        ):
+            raise BundleError(
+                f"local image {source_ref} does not match locked digest {expected}"
+            )
         archive_ref = f"nano-bundle.invalid/{name}:{uuid.uuid4().hex}"
         archive = directory / f"{name}.tar"
         tag_created = False
@@ -1171,10 +1268,18 @@ def _docker_sources(
             if source_after != image_id or tagged_after != image_id:
                 raise BundleError(f"image {ref} changed while its archive was saved")
             if expected and not _digest_matches(
-                ref, expected, source_after, source_repo_digests
+                source_ref, expected, source_after, source_repo_digests
             ):
-                raise BundleError(f"image {ref} lost its locked digest while saving")
-            platform_digest = _docker_archive_config_digest(archive, archive_ref)
+                raise BundleError(
+                    f"image {source_ref} lost its locked digest while saving"
+                )
+            platform_digest, archived_architecture = _docker_archive_metadata(
+                archive, archive_ref
+            )
+            if archived_architecture != architecture:
+                raise BundleError(
+                    f"image {ref} architecture does not match requested {architecture}"
+                )
             sources.append(
                 ImageSource(
                     name=name,
@@ -1250,6 +1355,9 @@ def build_command(
 ) -> Path:
     root = Path(args.repo_root).resolve()
     version = _semver(args.version, "--version")
+    architecture = _architecture(
+        args.architecture or platform.machine(), "--architecture"
+    )
     key_id = _text(args.key_id, "--key-id", _IDENTIFIER)
     if (signer is None) != (verification_root is None):
         raise BundleError("builder signer and verification root must be supplied together")
@@ -1276,6 +1384,8 @@ def build_command(
     output = Path(args.output or f"nano-{version}-{args.edition}.tar")
     if args.image_lock and args.image:
         raise BundleError("use --image-lock or --image, not both")
+    if args.source_image_lock and not args.image_lock:
+        raise BundleError("--source-image-lock requires --image-lock")
     if args.image_lock:
         specs = [(name, ref, digest) for name, ref, digest in _lock_images(Path(args.image_lock), version)]
     else:
@@ -1285,11 +1395,29 @@ def build_command(
     scratch_parent = Path(os.environ.get("NANO_BUNDLE_TMPDIR", output.parent or Path.cwd()))
     scratch_parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="nano-bundle-build-", dir=scratch_parent) as tmp:
-        sources = _docker_sources(specs, Path(tmp), pull=args.pull)
+        source_specs = None
+        if args.source_image_lock:
+            source_entries = _lock_images(Path(args.source_image_lock), version)
+            source_specs = {
+                name: (ref, digest) for name, ref, digest in source_entries
+            }
+            delivery_names = {name for name, _, _ in specs}
+            if not delivery_names <= set(source_specs):
+                raise BundleError(
+                    "source image lock does not contain every delivery image name"
+                )
+            source_specs = {
+                name: source_specs[name] for name in delivery_names
+            }
+        sources = _docker_sources(
+            specs, Path(tmp), pull=args.pull, architecture=architecture,
+            source_specs=source_specs,
+        )
         return create_bundle(
             output,
             version=version,
             edition=args.edition,
+            architecture=architecture,
             created_at=created_at,
             git_sha=git_sha,
             images=sources,
