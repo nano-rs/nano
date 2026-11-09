@@ -172,6 +172,22 @@ pub async fn run_health_check_with_trigger(
     };
     // NAN-4954: audit-trail holes surface on every path (AI, fallback, Fresh).
     analyzer::ensure_audit_durability_findings(&mut analysis, &metrics);
+    // NAN-5032: sources stored under a platform-owned source type.
+    analyzer::ensure_reserved_source_name_findings(&mut analysis, &metrics);
+    // Security review 2026-11-08: insecure-but-accepted deployment settings.
+    analyzer::ensure_deployment_posture_findings(
+        &mut analysis,
+        &crate::deployment_posture::PostureInputs::from_env(),
+    );
+    // NAN-5077: IP allowlist rule loads that failed (fail-closed enforcement),
+    // as published to the system-health bus by nanosiem-api / nanosiem-search.
+    match crate::system_health::SystemHealthRepository::new(pool.clone())
+        .list(None, Some(crate::system_health::HealthCategory::Service.as_str()), None, 200, 0)
+        .await
+    {
+        Ok((events, _)) => analyzer::ensure_ip_allowlist_findings(&mut analysis, &events),
+        Err(e) => warn!("Failed to read IP allowlist health events: {}", e),
+    }
 
     let duration_ms = start.elapsed().as_millis() as i32;
     let status = HealthStatus::from_score(analysis.overall_score);

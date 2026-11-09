@@ -14,7 +14,7 @@
   "time": 1749081722345,
   "message": "powershell.exe launched encoded command on WS-JSMITH-01",
   "metadata": {
-    "version": "1.8.0",
+    "version": "1.9.0",
     "product": {
       "name": "Sysmon",
       "vendor_name": "Microsoft",

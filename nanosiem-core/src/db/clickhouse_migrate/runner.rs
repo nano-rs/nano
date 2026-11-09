@@ -580,7 +580,7 @@ impl ClickHouseMigrator {
                 Err(e) if is_soft_fail => {
                     tracing::warn!(
                         "Init SQL statement failed (non-fatal): {} - {}",
-                        &sql_stmt[..sql_stmt.len().min(80)],
+                        crate::text_bounds::prefix_at_most(&sql_stmt, 80),
                         e
                     );
                 }
@@ -603,13 +603,13 @@ impl ClickHouseMigrator {
                             "Init SQL CREATE TABLE failed but the table already exists — \
                              continuing (likely a FAILED dependent dictionary re-validated \
                              at CREATE time; see NAN-1115): {} - {}",
-                            &sql_stmt[..sql_stmt.len().min(120)],
+                            crate::text_bounds::prefix_at_most(&sql_stmt, 120),
                             e
                         );
                     } else {
                         return Err(ClickHouseMigrateError::ClickHouse(format!(
                             "Failed to execute init SQL: {} - Error: {}",
-                            &sql_stmt[..sql_stmt.len().min(120)],
+                            crate::text_bounds::prefix_at_most(&sql_stmt, 120),
                             e
                         )));
                     }

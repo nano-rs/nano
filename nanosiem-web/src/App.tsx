@@ -2,7 +2,7 @@
 
 import { BrowserRouter, Routes, Route, useLocation, Navigate, useParams, Link } from 'react-router-dom';
 import { PivtSessionGuard } from '@/enterprise/components/pivt/PivtSessionGuard';
-import { useCapabilities } from '@/hooks/use-capabilities';
+import { useCapabilities, type Capabilities } from '@/hooks/use-capabilities';
 import { useTier, TierProvider } from '@/hooks/use-tier';
 import { useState, useEffect, lazy, Suspense, ComponentType } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -312,16 +312,45 @@ function SetupRedirect({ children }: { children: React.ReactNode }) {
 function PermissionRoute({
   element,
   permission,
-  anyPermission
+  anyPermission,
+  capability,
 }: {
   element: React.ReactNode;
   permission?: string;
   anyPermission?: string[];
+  capability?: keyof Capabilities;
 }) {
+  const guarded = capability ? (
+    <CapabilityRoute capability={capability}>{element}</CapabilityRoute>
+  ) : element;
   return (
     <ProtectedRoute permission={permission} anyPermission={anyPermission}>
-      {element}
+      {guarded}
     </ProtectedRoute>
+  );
+}
+
+function CapabilityRoute({
+  capability,
+  children,
+}: {
+  capability: keyof Capabilities;
+  children: React.ReactNode;
+}) {
+  const { capabilities } = useCapabilities();
+  if (capabilities[capability]) return <>{children}</>;
+
+  return (
+    <div data-testid="licensed-feature-unavailable" className="flex h-full flex-col items-center justify-center px-8 text-center">
+      <h1 className="text-xl font-semibold text-foreground">Licensed feature unavailable</h1>
+      <p className="mt-2 max-w-lg text-sm text-muted-foreground">
+        This surface is not admitted by the current licence. Open/core features,
+        ingest, search, and stored data remain available.
+      </p>
+      <Link className="mt-5 text-sm font-medium text-primary hover:underline" to="/">
+        Return to Home
+      </Link>
+    </div>
   );
 }
 
@@ -641,14 +670,14 @@ function ProtectedAppRoutes() {
 
           {/* AI Detection Tuning */}
           <Route path="/rules/tuning" element={
-            <PermissionRoute permission="detections:view" element={
+            <PermissionRoute permission="detections:view" capability="aiTuning" element={
               <Suspense fallback={<ChartPageLoadingFallback />}>
                 <TuningDashboard key={resetKey} />
               </Suspense>
             } />
           } />
           <Route path="/rules/tuning/:id" element={
-            <PermissionRoute permission="detections:view" element={
+            <PermissionRoute permission="detections:view" capability="aiTuning" element={
               <Suspense fallback={<DetailPageLoadingFallback />}>
                 <TuningDetail key={resetKey} />
               </Suspense>
@@ -657,7 +686,7 @@ function ProtectedAppRoutes() {
 
           {/* Risk */}
           <Route path="/risk" element={
-            <PermissionRoute permission="risk:view" element={
+            <PermissionRoute permission="risk:view" capability="risk" element={
               <Suspense fallback={<ChartPageLoadingFallback />}>
                 <Risk key={resetKey} />
               </Suspense>
@@ -677,7 +706,7 @@ function ProtectedAppRoutes() {
             ['/automation/capabilities', AutomationCapabilitiesRoute],
           ] as const).map(([path, Page]) => (
             <Route key={path} path={path} element={
-              <PermissionRoute permission="soar:view" element={
+              <PermissionRoute permission="soar:view" capability="soar" element={
                 <Suspense fallback={<ListPageLoadingFallback />}>
                   <Page key={resetKey} />
                 </Suspense>
@@ -685,7 +714,7 @@ function ProtectedAppRoutes() {
             } />
           ))}
           <Route path="/settings/soar" element={
-            <PermissionRoute anyPermission={['settings:system', 'soar:view']} element={
+            <PermissionRoute anyPermission={['settings:system', 'soar:view']} capability="soar" element={
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <SoarSettings key={resetKey} />
               </Suspense>
@@ -693,14 +722,14 @@ function ProtectedAppRoutes() {
           } />
           {/* NAN-3228: risk watchlists */}
           <Route path="/risk/watchlists" element={
-            <PermissionRoute permission="risk:watchlists" element={
+            <PermissionRoute permission="risk:watchlists" capability="risk" element={
               <Suspense fallback={<ChartPageLoadingFallback />}>
                 <RiskWatchlists key={resetKey} />
               </Suspense>
             } />
           } />
           <Route path="/settings/risk" element={
-            <PermissionRoute permission="risk:configure" element={
+            <PermissionRoute permission="risk:configure" capability="risk" element={
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <RiskSettings key={resetKey} />
               </Suspense>
@@ -753,7 +782,7 @@ function ProtectedAppRoutes() {
               SignalInbox visible + an empty Thread pane. /cases stays as
               the table/kanban surface, reachable via the Browse-all link. */}
           <Route path="/inbox" element={
-            <PermissionRoute permission="cases:view" element={
+            <PermissionRoute permission="cases:view" capability="cases" element={
               <Suspense fallback={<DetailPageLoadingFallback />}>
                 <CaseInvestigate />
               </Suspense>
@@ -762,7 +791,7 @@ function ProtectedAppRoutes() {
           {/* NAN-1071: Case search — cross-cutting query surface. Must
               come before the /cases redirect so /cases/search matches first. */}
           <Route path="/cases/search" element={
-            <PermissionRoute permission="cases:view" element={
+            <PermissionRoute permission="cases:view" capability="cases" element={
               <Suspense fallback={<ListPageLoadingFallback />}>
                 <CaseSearch key={resetKey} />
               </Suspense>
@@ -776,7 +805,7 @@ function ProtectedAppRoutes() {
           <Route path="/cases" element={<Navigate to="/inbox" replace />} />
           {/* NAN-443: Playbooks library (Phase 2 — read-only) */}
           <Route path="/playbooks" element={
-            <PermissionRoute permission="playbooks:view" element={
+            <PermissionRoute permission="playbooks:view" capability="playbooks" element={
               <Suspense fallback={<ListPageLoadingFallback />}>
                 <Playbooks key={resetKey} />
               </Suspense>
@@ -784,7 +813,7 @@ function ProtectedAppRoutes() {
           } />
           {/* NAN-444: Playbook authoring wizard — /playbooks/new (Phase 3). */}
           <Route path="/playbooks/new" element={
-            <PermissionRoute permission="playbooks:manage" element={
+            <PermissionRoute permission="playbooks:manage" capability="playbooks" element={
               <Suspense fallback={<DetailPageLoadingFallback />}>
                 <PlaybookNew key={resetKey} />
               </Suspense>
@@ -792,7 +821,7 @@ function ProtectedAppRoutes() {
           } />
           {/* NAN-470: Playbook Repositories admin page. */}
           <Route path="/playbooks/repositories" element={
-            <PermissionRoute permission="playbooks:view" element={
+            <PermissionRoute permission="playbooks:view" capability="playbooks" element={
               <Suspense fallback={<ListPageLoadingFallback />}>
                 <PlaybookRepositories />
               </Suspense>
@@ -800,21 +829,21 @@ function ProtectedAppRoutes() {
           } />
 
           <Route path="/settings/cases" element={
-            <PermissionRoute permission="settings:system" element={
+            <PermissionRoute permission="settings:system" capability="cases" element={
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <CaseSettings key={resetKey} />
               </Suspense>
             } />
           } />
           <Route path="/settings/cases/queues" element={
-            <PermissionRoute permission="settings:system" element={
+            <PermissionRoute permission="settings:system" capability="cases" element={
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <QueueSettings key={resetKey} />
               </Suspense>
             } />
           } />
           <Route path="/cases/:id" element={
-            <PermissionRoute permission="cases:view" element={
+            <PermissionRoute permission="cases:view" capability="cases" element={
               <Suspense fallback={<DetailPageLoadingFallback />}>
                 <CaseDetail key={resetKey} />
               </Suspense>
@@ -823,14 +852,14 @@ function ProtectedAppRoutes() {
 
           {/* Notebooks */}
           <Route path="/notebooks" element={
-            <PermissionRoute permission="notebooks:view" element={
+            <PermissionRoute permission="notebooks:view" capability="notebooks" element={
               <Suspense fallback={<ListPageLoadingFallback />}>
                 <Notebooks key={resetKey} />
               </Suspense>
             } />
           } />
           <Route path="/notebooks/:id" element={
-            <PermissionRoute permission="notebooks:view" element={
+            <PermissionRoute permission="notebooks:view" capability="notebooks" element={
               <Suspense fallback={<DetailPageLoadingFallback />}>
                 <NotebookDetail key={resetKey} />
               </Suspense>
@@ -861,14 +890,14 @@ function ProtectedAppRoutes() {
 
           {/* Custom Enrichments */}
           <Route path="/enrichments/custom/new" element={
-            <PermissionRoute permission="enrichments:custom:create" element={
+            <PermissionRoute permission="enrichments:custom:create" capability="customEnrichment" element={
               <Suspense fallback={<EditorLoadingFallback />}>
                 <CustomEnrichmentWizard key={resetKey} />
               </Suspense>
             } />
           } />
           <Route path="/enrichments/custom/:id" element={
-            <PermissionRoute permission="enrichments:view" element={
+            <PermissionRoute permission="enrichments:view" capability="customEnrichment" element={
               <Suspense fallback={<EditorLoadingFallback />}>
                 <CustomEnrichmentWizard key={resetKey} />
               </Suspense>
@@ -877,14 +906,14 @@ function ProtectedAppRoutes() {
 
           {/* Custom scheduled API integrations */}
           <Route path="/integrations/custom/new" element={
-            <PermissionRoute permission="log_sources:create" element={
+            <PermissionRoute permission="log_sources:create" capability="customEnrichment" element={
               <Suspense fallback={<EditorLoadingFallback />}>
                 <CustomIntegrationWizard key={resetKey} />
               </Suspense>
             } />
           } />
           <Route path="/integrations/custom/:id" element={
-            <PermissionRoute permission="log_sources:view" element={
+            <PermissionRoute permission="log_sources:view" capability="customEnrichment" element={
               <Suspense fallback={<EditorLoadingFallback />}>
                 <CustomIntegrationWizard key={resetKey} />
               </Suspense>
@@ -979,7 +1008,7 @@ function ProtectedAppRoutes() {
             } />
           } />
           <Route path="/rules/ioc-lists" element={
-            <PermissionRoute permission="enrichments:view" element={
+            <PermissionRoute permission="enrichments:view" capability="iocLists" element={
               <Suspense fallback={<ListPageLoadingFallback />}>
                 <IocLists key={resetKey} />
               </Suspense>
@@ -1047,7 +1076,7 @@ function ProtectedAppRoutes() {
             } />
           } />
           <Route path="/settings/ai" element={
-            <PermissionRoute anyPermission={['settings:ai', 'settings:ai_providers', 'settings:agent_models']} element={
+            <PermissionRoute anyPermission={['settings:ai', 'settings:ai_providers', 'settings:agent_models']} capability="melod" element={
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <MelodSettings key={resetKey} />
               </Suspense>
@@ -1067,7 +1096,7 @@ function ProtectedAppRoutes() {
             } />
           } />
           <Route path="/settings/airgap-import" element={
-            <PermissionRoute permission="settings:system" element={
+            <PermissionRoute permission="settings:system" capability="customEnrichment" element={
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <AirgapImportPage key={resetKey} />
               </Suspense>
@@ -1161,7 +1190,7 @@ function ProtectedAppRoutes() {
           {/* NAN-3378: gated on capabilities.sso — open builds have no
               OIDC API, so render a notice instead of a page that 404s. */}
           <Route path="/settings/oidc" element={
-            <PermissionRoute permission="settings:system" element={
+            <PermissionRoute permission="settings:system" capability="sso" element={
               <SsoRouteGate>
                 <Suspense fallback={<ListPageLoadingFallback />}>
                   <OidcProvidersPage key={resetKey} />
@@ -1249,7 +1278,9 @@ function App() {
                 <Route path="/d/:token" element={<DemoClaim />} />
                 <Route path="/denied" element={<Denied />} />
                 <Route path="/setup" element={<Setup />} />
-                <Route path="/auth/callback/:provider" element={<AuthCallback />} />
+                <Route path="/auth/callback/:provider" element={
+                  <CapabilityRoute capability="sso"><AuthCallback /></CapabilityRoute>
+                } />
 
                 {/* Protected routes - require authentication */}
                 <Route

@@ -140,7 +140,7 @@ fn sanitize_value(s: &str) -> String {
         .collect();
     let trimmed = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
     if trimmed.len() > 280 {
-        format!("{}…", &trimmed[..280])
+        format!("{}…", crate::text_bounds::prefix_at_most(&trimmed, 280))
     } else {
         trimmed
     }

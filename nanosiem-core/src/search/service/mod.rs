@@ -599,6 +599,10 @@ pub(crate) fn apply_time_bounds(
             adjusted.end.to_rfc3339(),
         )));
     }
+    // NAN-5026: `earliest=-100000y` resolves (chrono is checked) to a year far
+    // outside anything storable; the request's own range was validated, the
+    // token-adjusted one must be too.
+    crate::search::types::check_storable_bounds(adjusted.start, adjusted.end)?;
     Ok(adjusted)
 }
 
@@ -1275,6 +1279,18 @@ mod time_bounds_override_tests;
 #[cfg(test)]
 #[path = "cloud_resource_column_tests.rs"]
 mod cloud_resource_column_tests;
+
+#[cfg(test)]
+#[path = "npl_golden_corpus_tests.rs"]
+pub(crate) mod npl_golden_corpus_tests;
+
+#[cfg(test)]
+#[path = "npl_injection_canary_tests.rs"]
+pub(crate) mod npl_injection_canary_tests;
+
+#[cfg(test)]
+#[path = "npl_scoped_golden_tests.rs"]
+mod npl_scoped_golden_tests;
 
 #[cfg(test)]
 mod tests {

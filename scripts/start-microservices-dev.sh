@@ -44,12 +44,26 @@ export CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD="${CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD:
 # JWT_SECRET must be the same across all services for token validation
 # For development, we use a secure 64-character random secret
 # IMPORTANT: In production, set JWT_SECRET environment variable before running
-if [ -z "$JWT_SECRET" ]; then
-    # Generate a secure development JWT secret (64 characters)
-    export JWT_SECRET="dev-e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8"
-    echo -e "${YELLOW}⚠️  Using generated development JWT_SECRET${NC}"
-    echo -e "${YELLOW}   For production, set JWT_SECRET environment variable${NC}"
+# Unset JWT_SECRET / VECTOR_AUTH_TOKEN are generated once per checkout and kept
+# in the gitignored .nano-dev-secrets (0600), so sessions survive restarts and
+# no shared secret ships in the repo (nano refuses its old public dev values).
+DEV_SECRETS_FILE="${NANO_DEV_SECRETS_FILE:-$(pwd)/.nano-dev-secrets}"
+if [ -z "$JWT_SECRET" ] || [ -z "$VECTOR_AUTH_TOKEN" ]; then
+    if [ ! -f "$DEV_SECRETS_FILE" ]; then
+        (umask 077; {
+            printf 'DEV_JWT_SECRET=%s\n' "$(openssl rand -hex 32)"
+            printf 'DEV_VECTOR_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)"
+        } > "$DEV_SECRETS_FILE")
+        echo -e "${YELLOW}⚠️  Generated development secrets in $DEV_SECRETS_FILE${NC}"
+    fi
+    # shellcheck disable=SC1090
+    . "$DEV_SECRETS_FILE"
+    [ -n "$JWT_SECRET" ] || export JWT_SECRET="$DEV_JWT_SECRET"
+    [ -n "$VECTOR_AUTH_TOKEN" ] || export VECTOR_AUTH_TOKEN="$DEV_VECTOR_AUTH_TOKEN"
 fi
+# Native dev: Vector reads its config from the shared directory, so the HTTP
+# config delivery has no consumer.
+export NANO_VECTOR_CONFIG_DELIVERY="${NANO_VECTOR_CONFIG_DELIVERY:-off}"
 # NAN-1355: allow the built-in public dev encryption key when none is set, so local
 # dev boots even if a credential-encryption path initializes. Production never sets
 # this (real secrets are required and the boot fails closed without them).
@@ -74,11 +88,6 @@ else
     export NANOSIEM_DEV_MODE="${NANOSIEM_DEV_MODE:-false}"
     echo -e "${GREEN}✓${NC} Using NANOSIEM_ENCRYPTION_KEY from environment"
 fi
-
-# CORS settings
-# For development, allow localhost origins. In production, set specific origins.
-# Organization tier restriction (unrestricted = no limits, hobby/startup/growth/team/starter/pro/enterprise)
-export NANO_TIER="${NANO_TIER:-unrestricted}"
 
 # Deployment mode (selfhosted, managed, demo)
 export DEPLOYMENT_MODE="${DEPLOYMENT_MODE:-selfhosted}"
@@ -188,12 +197,14 @@ export NANOSIEM_ANTHROPIC_NATIVE="${NANOSIEM_ANTHROPIC_NATIVE:-1}"
 #   parked until we have a reason to re-evaluate. Set to `1` to opt in.
 export NANOSIEM_PARSER_TOOL_LOOP="${NANOSIEM_PARSER_TOOL_LOOP:-0}"
 
-# Docs RAG (product-doc retrieval for AI chat) — reaches the internet, so SKIP
-# in air-gap. docs_rag.rs no-ops gracefully when DOCS_RAG_URL is unset.
-if [ "$AIRGAP_MODE" != "true" ]; then
-    export DOCS_RAG_URL="${DOCS_RAG_URL:-https://siem-rag.nano.rs}"
-    export DOCS_RAG_TOKEN="${DOCS_RAG_TOKEN:-nsiem-docs-ca25fd841aa2213987887249055be498}"
-fi
+# Docs search (NAN-4103 / NAN-5058): pivt grounds product answers on the
+# nano-docs-public AI Search instance via the docs-search Worker. DOCS_SEARCH_TOKEN
+# is the Worker caller token (NOT a Cloudflare token); it has no default, so docs
+# grounding stays off locally unless you export it (e.g. via `doppler run`).
+# Off under AIRGAP_MODE. This script is published to the open-core mirror, so a
+# default token here would be a public credential.
+export DOCS_SEARCH_URL="${DOCS_SEARCH_URL:-https://docs-search.nano.rs}"
+export DOCS_SEARCH_TOKEN="${DOCS_SEARCH_TOKEN:-}"
 
 # Log directory
 LOG_DIR="./logs"
@@ -403,12 +414,11 @@ DISK_PRESSURE_EMERGENCY_THRESHOLD="$DISK_PRESSURE_EMERGENCY_THRESHOLD" \
 DISK_PRESSURE_PAUSE_INGESTION="$DISK_PRESSURE_PAUSE_INGESTION" \
 DEPLOYMENT_MODE="$DEPLOYMENT_MODE" \
 AIRGAP_MODE="$AIRGAP_MODE" \
-NANO_TIER="$NANO_TIER" \
 JOBS_PORT=3003 \
 LEADER_ELECTION_ENABLED=true \
 VECTOR_INGEST_URL="${VECTOR_INGEST_URL:-http://localhost:8080/}" \
 VECTOR_ENRICH_URL="${VECTOR_ENRICH_URL:-http://localhost:8090/}" \
-VECTOR_AUTH_TOKEN="${VECTOR_AUTH_TOKEN:-nanosiem-default-token}" \
+VECTOR_AUTH_TOKEN="$VECTOR_AUTH_TOKEN" \
 RUST_LOG="${RUST_LOG:-info}" \
 ./target/$TARGET_DIR/nanosiem-jobs 2>&1 | tee "$LOG_DIR/jobs.log" &
 JOBS_PID=$!
@@ -441,8 +451,8 @@ CLOUDFLARE_AI_GATEWAY_URL="$CLOUDFLARE_AI_GATEWAY_URL" \
 CF_AIG_AUTH_TOKEN="$CF_AIG_AUTH_TOKEN" \
 NANOSIEM_ANTHROPIC_NATIVE="$NANOSIEM_ANTHROPIC_NATIVE" \
 NANOSIEM_PARSER_TOOL_LOOP="$NANOSIEM_PARSER_TOOL_LOOP" \
-DOCS_RAG_URL="$DOCS_RAG_URL" \
-DOCS_RAG_TOKEN="$DOCS_RAG_TOKEN" \
+DOCS_SEARCH_URL="$DOCS_SEARCH_URL" \
+DOCS_SEARCH_TOKEN="$DOCS_SEARCH_TOKEN" \
 DISK_PRESSURE_CHECK_INTERVAL_SECS="$DISK_PRESSURE_CHECK_INTERVAL_SECS" \
 DISK_PRESSURE_HIGH_WATERMARK="$DISK_PRESSURE_HIGH_WATERMARK" \
 DISK_PRESSURE_LOW_WATERMARK="$DISK_PRESSURE_LOW_WATERMARK" \
@@ -451,11 +461,10 @@ DISK_PRESSURE_EMERGENCY_THRESHOLD="$DISK_PRESSURE_EMERGENCY_THRESHOLD" \
 DISK_PRESSURE_PAUSE_INGESTION="$DISK_PRESSURE_PAUSE_INGESTION" \
 DEPLOYMENT_MODE="$DEPLOYMENT_MODE" \
 AIRGAP_MODE="$AIRGAP_MODE" \
-NANO_TIER="$NANO_TIER" \
 SKIP_VECTOR_VALIDATION="${SKIP_VECTOR_VALIDATION:-false}" \
 VECTOR_INGEST_URL="${VECTOR_INGEST_URL:-http://localhost:8080/}" \
 VECTOR_ENRICH_URL="${VECTOR_ENRICH_URL:-http://localhost:8090/}" \
-VECTOR_AUTH_TOKEN="${VECTOR_AUTH_TOKEN:-nanosiem-default-token}" \
+VECTOR_AUTH_TOKEN="$VECTOR_AUTH_TOKEN" \
 RUST_LOG="${RUST_LOG:-nanosiem_core::melod=debug,info}" \
 ./target/$TARGET_DIR/nanosiem-api 2>&1 | tee "$LOG_DIR/api.log" &
 API_PID=$!

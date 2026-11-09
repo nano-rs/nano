@@ -71,20 +71,7 @@ impl PermissionResolver {
         }
 
         // Query DB
-        let permissions = match sqlx::query_scalar::<_, String>(
-            r#"
-            SELECT DISTINCT rp.permission_id
-            FROM user_groups ug
-            INNER JOIN group_roles gr ON ug.group_id = gr.group_id
-            INNER JOIN role_permissions rp ON gr.role_id = rp.role_id
-            WHERE ug.user_id = $1
-            ORDER BY rp.permission_id
-            "#,
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
-        {
+        let permissions = match Self::load(&self.pool, user_id).await {
             Ok(perms) => perms,
             Err(e) => {
                 tracing::warn!(user_id = %user_id, error = %e, "Failed to resolve permissions from DB — user will have no permissions until cache expires");
@@ -103,5 +90,49 @@ impl PermissionResolver {
         );
 
         permissions
+    }
+
+    /// Like [`Self::resolve`] but FAIL-CLOSED and honest about failure: a
+    /// database error is returned (never cached, never an empty set that the
+    /// caller could mistake for "holds nothing"). Used to clamp API-key
+    /// permissions to the owner's current set (NAN-5044), where an empty set
+    /// on error would silently strip every key and a cached error would hide
+    /// the outage.
+    pub async fn resolve_checked(&self, user_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
+        let generation = super::authz_generation::current_authz_generation(&self.pool, user_id).await;
+        if let Some(cached) = self.cache.get(&user_id) {
+            if cached.cached_at.elapsed().as_secs() < CACHE_TTL_SECS
+                && super::authz_generation::generation_still_current(cached.generation, &generation)
+            {
+                return Ok(cached.permissions.clone());
+            }
+        }
+        let generation = generation?;
+        let permissions = Self::load(&self.pool, user_id).await?;
+        self.cache.insert(
+            user_id,
+            CachedPermissions {
+                permissions: permissions.clone(),
+                cached_at: Instant::now(),
+                generation,
+            },
+        );
+        Ok(permissions)
+    }
+
+    async fn load(pool: &PgPool, user_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT DISTINCT rp.permission_id
+            FROM user_groups ug
+            INNER JOIN group_roles gr ON ug.group_id = gr.group_id
+            INNER JOIN role_permissions rp ON gr.role_id = rp.role_id
+            WHERE ug.user_id = $1
+            ORDER BY rp.permission_id
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
     }
 }

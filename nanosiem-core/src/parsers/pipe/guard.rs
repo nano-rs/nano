@@ -126,11 +126,80 @@ pub fn check_document(
                         "{name} must compile with event metadata read-only (it writes metadata or is not valid pipeline VRL)"
                     ));
                 }
+                // NAN-5057: the tenant-authored remaps of a plain parser
+                // (`_parse`, `_extension`) run in Vector with its full
+                // stdlib, so they must compile against the parser allowlist
+                // here too, not only in the write paths that may or may not
+                // have run for this row.
+                let tenant_remap = name == &format!("{prefix}_parse")
+                    || name == &format!("{prefix}_extension");
+                if tenant_remap && !plan_parse {
+                    // Memoized: every publication re-renders every source, and
+                    // the verdict is a pure function of the source text and
+                    // the allowlist (see vrl_verdict_memo).
+                    let verdict = crate::parsers::vrl_verdict_memo::verdict(
+                        "guard-tenant-remap",
+                        source,
+                        || {
+                            crate::parsers::vrl_guard::compile(
+                                source,
+                                &crate::parsers::vrl_functions::parser_vrl_functions(),
+                            )
+                            .map(|_| ())
+                            .map_err(|error| error.render(source).trim_end().to_string())
+                        },
+                    );
+                    if let Err(rendered) = verdict {
+                        return refuse(format!(
+                            "{name} does not compile against the parser function allowlist: {rendered}"
+                        ));
+                    }
+                }
+            }
+            // NAN-5012: conditions run with Vector's full stdlib too. Every
+            // condition in a parser document (the sampling exclude, the
+            // generated dispatch filters, a plan's gates and route branches)
+            // must be a read-only predicate over the parser allowlist.
+            "sample" => check_conditions(name, body.get("exclude"))?,
+            "filter" => check_conditions(name, body.get("condition"))?,
+            "route" => {
+                if let Some(routes) = body.get("route").and_then(toml::Value::as_table) {
+                    for value in routes.values() {
+                        check_conditions(name, Some(value))?;
+                    }
+                }
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// A condition value is either VRL shorthand (a string) or a table carrying
+/// `source`. Each must compile read-only against the parser allowlist.
+fn check_conditions(name: &str, value: Option<&toml::Value>) -> Result<(), String> {
+    let source = match value {
+        None => return Ok(()),
+        Some(toml::Value::String(source)) => source.as_str(),
+        Some(toml::Value::Table(table)) => match table.get("source").and_then(toml::Value::as_str) {
+            Some(source) => source,
+            None => return Ok(()),
+        },
+        Some(_) => return refuse(format!("{name} has a condition that is not VRL")),
+    };
+    crate::parsers::vrl_verdict_memo::verdict("guard-condition", source, || {
+        crate::parsers::vrl_guard::compile_read_only(
+            source,
+            &crate::parsers::vrl_functions::parser_vrl_functions(),
+        )
+        .map(|_| ())
+        .map_err(|error| error.render(source).trim_end().to_string())
+    })
+    .map_err(|rendered| {
+        format!(
+            "{name} has a condition that is not a read-only predicate over the parser function allowlist: {rendered}"
+        )
+    })
 }
 
 #[cfg(test)]

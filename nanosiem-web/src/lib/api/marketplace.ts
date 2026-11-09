@@ -344,7 +344,7 @@ export class MarketplaceApi {
   }
 
   /**
-   * Force a recompute of the coverage hero, bypassing the 6h Dragonfly
+   * Force a recompute of the coverage hero, bypassing the 6h Valkey
    * cache. Returns the freshly-computed payload (which is also re-cached
    * server-side). Used by the manual-refresh button in the hero header.
    */

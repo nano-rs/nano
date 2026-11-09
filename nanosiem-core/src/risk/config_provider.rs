@@ -31,7 +31,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+#[cfg(feature = "enterprise")]
+use chrono::DateTime;
+use chrono::Utc;
 use sqlx::{PgPool, Row};
 use tracing::{debug, warn};
 
@@ -45,6 +47,7 @@ pub const RISK_CONFIG_CACHE_TTL: Duration = Duration::from_secs(60);
 /// Cleared-boundary lookback, mirroring the enterprise
 /// `CLEAR_BOUNDARY_LOOKBACK_DAYS` (`repository.rs`): only the trailing 7 days
 /// can affect a 7-day decay horizon.
+#[cfg(feature = "enterprise")]
 const CLEAR_BOUNDARY_LOOKBACK_DAYS: i64 = 7;
 
 #[derive(Clone)]
@@ -202,6 +205,7 @@ impl RiskQueryConfigProvider {
     /// (7-day lookback, per-entity max `cleared_at` from the slim
     /// `risk_clears` table, NAN-1810), tolerant of the open-core schema
     /// (no `risk_clears` table → nothing cleared).
+    #[cfg(feature = "enterprise")]
     async fn fetch_cleared_boundaries(&self) -> Option<ClearedBoundaries> {
         let cutoff = Utc::now() - chrono::Duration::days(CLEAR_BOUNDARY_LOOKBACK_DAYS);
         let result = sqlx::query(
@@ -233,6 +237,13 @@ impl RiskQueryConfigProvider {
                 None
             }
         }
+    }
+
+    /// Open-core has no `risk_clears` relation, so its cleared-boundary set is
+    /// empty without issuing a query that is guaranteed to fail.
+    #[cfg(not(feature = "enterprise"))]
+    async fn fetch_cleared_boundaries(&self) -> Option<ClearedBoundaries> {
+        Some(ClearedBoundaries::from_map(&HashMap::new()))
     }
 }
 

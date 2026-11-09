@@ -157,7 +157,10 @@ impl LogSourceService {
                 diagnostics: vec![diagnostic_from_error(&msg)],
             };
         }
-        match self.vrl_validator.validate_vrl(vrl_code).await {
+        // NAN-5057: validate the text the renderer writes (a lone `\r`
+        // becomes a line break there, ending a VRL comment early).
+        let rendered = crate::parsers::vrl_safety::as_rendered(vrl_code);
+        match self.vrl_validator.validate_vrl(&rendered).await {
             Ok(result) => {
                 let mut errors = Vec::new();
                 let mut diagnostics = Vec::new();

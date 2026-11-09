@@ -30,6 +30,10 @@ const ARTIFACT_BODY_LIMIT: usize = 12 * 1024 * 1024;
 #[cfg(feature = "enterprise")]
 const MAX_AIRGAP_BUNDLE_SIZE: usize = 1024 * 1024 * 1024;
 
+#[cfg(feature = "enterprise")]
+use crate::middleware::rate_limit::{
+    dry_resolve_rate_limit_middleware, marketplace_preview_rate_limit_middleware,
+};
 use crate::{
     config::ApiConfig,
     handlers,
@@ -37,10 +41,9 @@ use crate::{
         auth::{auth_middleware, AuthState},
         ip_allowlist::{ip_allowlist_middleware, IpAllowlistState},
         rate_limit::{
-            detection_code_probe_rate_limit_middleware, dry_resolve_rate_limit_middleware,
-            kafka_probe_rate_limit_middleware, login_rate_limit_middleware,
-            mfa_setup_rate_limit_middleware, password_reset_rate_limit_middleware,
-            upload_rate_limit_middleware, RateLimitState,
+            detection_code_probe_rate_limit_middleware, kafka_probe_rate_limit_middleware,
+            login_rate_limit_middleware, mfa_setup_rate_limit_middleware,
+            password_reset_rate_limit_middleware, upload_rate_limit_middleware, RateLimitState,
         },
         request_id_middleware, request_logging_layer, BackupMutationFence,
     },
@@ -48,7 +51,6 @@ use crate::{
     state::AppState,
 };
 #[cfg(feature = "enterprise")]
-use crate::middleware::rate_limit::marketplace_preview_rate_limit_middleware;
 use nanosiem_core::hunts::recon::PROFILE_BODY_LIMIT_BYTES;
 use nanosiem_core::ip_allowlist::IpAllowlistScope;
 
@@ -62,8 +64,7 @@ pub fn create_router(state: AppState) -> Router {
     // All in-flight mutations on this process share one cluster drain lock.
     // Their brief admission checks use the normal pool; request duration no
     // longer consumes one extra PostgreSQL connection per request.
-    let backup_mutation_fence =
-        BackupMutationFence::new(state.pool.clone(), &config.database_url);
+    let backup_mutation_fence = BackupMutationFence::new(state.pool.clone(), &config.database_url);
 
     // Build CORS layer
     let cors = build_cors_layer(&config);
@@ -167,7 +168,10 @@ pub fn create_router(state: AppState) -> Router {
     let artifact_routes = Router::new()
         .route("/api/artifacts", get(handlers::artifacts::list_artifacts))
         .route("/api/artifacts", post(handlers::artifacts::create_artifact))
-        .route("/api/artifacts/{id}", get(handlers::artifacts::get_artifact))
+        .route(
+            "/api/artifacts/{id}",
+            get(handlers::artifacts::get_artifact),
+        )
         .route(
             "/api/artifacts/{id}",
             put(handlers::artifacts::update_artifact),
@@ -223,6 +227,8 @@ pub fn create_router(state: AppState) -> Router {
     // NAN-474: dry-resolve is rate-limited per authenticated user because
     // templating cost scales with `{{...}}` token count. The middleware
     // runs inside the outer auth layer, so `AuthContext` is available.
+    // Playbooks are enterprise-only (their tables ship in the enterprise overlay).
+    #[cfg(feature = "enterprise")]
     let dry_resolve_routes = Router::new()
         .route(
             "/api/playbooks/dry-resolve",
@@ -352,7 +358,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health/detailed", get(handlers::health_check_detailed))
         // Build edition + capability flags (public; the SPA hits this on boot
         // before login to decide which surfaces to render). NAN-745.
-        .route("/api/capabilities", get(handlers::capabilities::get_capabilities))
+        .route(
+            "/api/capabilities",
+            get(handlers::capabilities::get_capabilities),
+        )
         // Internal Vector config generation delivery (NAN-1931). Exempt from
         // user-session auth (middleware::auth::is_public_endpoint) — the
         // handlers enforce the in-cluster VECTOR_AUTH_TOKEN bearer themselves
@@ -484,6 +493,11 @@ pub fn create_router(state: AppState) -> Router {
             "/api/api-keys/{id}/reset",
             post(handlers::api_keys::reset_key),
         )
+        // NAN-5044: one-release owner-clamp escape hatch (enforce | audit).
+        .route(
+            "/api/settings/api-keys/owner-clamp",
+            get(handlers::api_keys::get_owner_clamp).put(handlers::api_keys::update_owner_clamp),
+        )
         // Session management endpoints
         .route("/api/sessions", get(handlers::sessions::list_all_sessions))
         .route(
@@ -614,11 +628,11 @@ pub fn create_router(state: AppState) -> Router {
             "/api/rules/health-summary",
             get(handlers::get_detection_health_summary),
         )
+        .route("/api/rules/fleet-health", get(handlers::get_fleet_health))
         .route(
-            "/api/rules/fleet-health",
-            get(handlers::get_fleet_health),
+            "/api/rules/scheduling-lag",
+            get(handlers::get_scheduling_lag),
         )
-        .route("/api/rules/scheduling-lag", get(handlers::get_scheduling_lag))
         .route("/api/rules/noisy", get(handlers::get_noisy_rules))
         // Per-match review state (NAN-494)
         .route(
@@ -653,12 +667,24 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/alerts/{id}/close", post(handlers::close_alert))
         .route("/api/alerts/{id}/assign", post(handlers::assign_alert));
 
+    // Enterprise-only registrations accumulate on a separate router. The
+    // single route layer applied before merge is the runtime equivalent of the
+    // open-build boundary: at hard stop these paths are denied while every
+    // shared route above/below remains available.
+    #[cfg(feature = "enterprise")]
+    let mut licensed_app: Router<AppState> = Router::new();
+
     // License status (exempt from license guard so the frontend can check it).
     // Enterprise-only: the open edition ships no license handler (NAN-1193).
     #[cfg(feature = "enterprise")]
     {
         app = app
             .route("/api/license", get(handlers::license::get_license_status))
+            // NAN-5114: admin "Update available" banner (settings:system).
+            .route(
+                "/api/license/update",
+                get(handlers::license::get_update_status),
+            )
             .route(
                 "/api/license/import",
                 post(handlers::license::import_license),
@@ -678,13 +704,22 @@ pub fn create_router(state: AppState) -> Router {
     // lifted nanosiem-core/src/cases/ + incidents/ to nanosiem-enterprise.
     #[cfg(feature = "enterprise")]
     {
-        app = app
+        licensed_app = licensed_app
             // Cases
-            .route("/api/cases/events", get(handlers::cases::case_events_stream::<AppState>))
+            .route(
+                "/api/cases/events",
+                get(handlers::cases::case_events_stream::<AppState>),
+            )
             .route("/api/cases", get(handlers::cases::list_cases::<AppState>))
             .route("/api/cases", post(handlers::cases::create_case::<AppState>))
-            .route("/api/cases/my", get(handlers::cases::get_my_cases::<AppState>))
-            .route("/api/cases/stats", get(handlers::cases::get_case_stats::<AppState>))
+            .route(
+                "/api/cases/my",
+                get(handlers::cases::get_my_cases::<AppState>),
+            )
+            .route(
+                "/api/cases/stats",
+                get(handlers::cases::get_case_stats::<AppState>),
+            )
             // NAN-1093: Signal Inbox aggregation — per-tab counts + incident pills.
             .route(
                 "/api/cases/inbox-counts",
@@ -702,9 +737,18 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/cases/bulk/assign",
                 post(handlers::cases::bulk_assign_cases::<AppState>),
             )
-            .route("/api/cases/{id}", get(handlers::cases::get_case::<AppState>))
-            .route("/api/cases/{id}", put(handlers::cases::update_case::<AppState>))
-            .route("/api/cases/{id}", delete(handlers::cases::delete_case::<AppState>))
+            .route(
+                "/api/cases/{id}",
+                get(handlers::cases::get_case::<AppState>),
+            )
+            .route(
+                "/api/cases/{id}",
+                put(handlers::cases::update_case::<AppState>),
+            )
+            .route(
+                "/api/cases/{id}",
+                delete(handlers::cases::delete_case::<AppState>),
+            )
             .route(
                 "/api/cases/{id}/alerts",
                 post(handlers::cases::add_alert_to_case::<AppState>),
@@ -713,12 +757,18 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/cases/{id}/alerts/{alert_id}",
                 delete(handlers::cases::remove_alert_from_case::<AppState>),
             )
-            .route("/api/cases/{id}/wall", get(handlers::cases::get_case_wall::<AppState>))
+            .route(
+                "/api/cases/{id}/wall",
+                get(handlers::cases::get_case_wall::<AppState>),
+            )
             .route(
                 "/api/cases/{id}/wall",
                 post(handlers::cases::add_case_wall_entry::<AppState>),
             )
-            .route("/api/cases/{id}/assign", post(handlers::cases::assign_case::<AppState>))
+            .route(
+                "/api/cases/{id}/assign",
+                post(handlers::cases::assign_case::<AppState>),
+            )
             .route(
                 "/api/cases/{id}/escalate",
                 post(handlers::cases::escalate_case::<AppState>),
@@ -740,8 +790,14 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/cases/{id}/duplicates",
                 get(handlers::cases::get_duplicate_candidates::<AppState>),
             )
-            .route("/api/cases/{id}/share", post(handlers::cases::share_case::<AppState>))
-            .route("/api/cases/{id}/merge", post(handlers::cases::merge_cases::<AppState>))
+            .route(
+                "/api/cases/{id}/share",
+                post(handlers::cases::share_case::<AppState>),
+            )
+            .route(
+                "/api/cases/{id}/merge",
+                post(handlers::cases::merge_cases::<AppState>),
+            )
             // Case handoffs (NAN-415)
             .route(
                 "/api/cases/{id}/handoff",
@@ -804,11 +860,26 @@ pub fn create_router(state: AppState) -> Router {
             )
             // Queues (NAN-426)
             .route("/api/queues", get(handlers::cases::list_queues::<AppState>))
-            .route("/api/queues", post(handlers::cases::create_queue::<AppState>))
-            .route("/api/queues/mine", get(handlers::cases::list_my_queues::<AppState>))
-            .route("/api/queues/{id}", get(handlers::cases::get_queue::<AppState>))
-            .route("/api/queues/{id}", put(handlers::cases::update_queue::<AppState>))
-            .route("/api/queues/{id}", delete(handlers::cases::delete_queue::<AppState>))
+            .route(
+                "/api/queues",
+                post(handlers::cases::create_queue::<AppState>),
+            )
+            .route(
+                "/api/queues/mine",
+                get(handlers::cases::list_my_queues::<AppState>),
+            )
+            .route(
+                "/api/queues/{id}",
+                get(handlers::cases::get_queue::<AppState>),
+            )
+            .route(
+                "/api/queues/{id}",
+                put(handlers::cases::update_queue::<AppState>),
+            )
+            .route(
+                "/api/queues/{id}",
+                delete(handlers::cases::delete_queue::<AppState>),
+            )
             // Queue routing rules (NAN-427)
             .route(
                 "/api/queue-routing-rules",
@@ -835,7 +906,10 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/incidents",
                 post(handlers::incidents::create_incident::<AppState>),
             )
-            .route("/api/incidents", get(handlers::incidents::list_incidents::<AppState>))
+            .route(
+                "/api/incidents",
+                get(handlers::incidents::list_incidents::<AppState>),
+            )
             .route(
                 "/api/incidents/{id}",
                 get(handlers::incidents::get_incident::<AppState>),
@@ -852,7 +926,7 @@ pub fn create_router(state: AppState) -> Router {
 
     #[cfg(feature = "enterprise")]
     {
-        app = app.merge(marketplace_preview_routes);
+        licensed_app = licensed_app.merge(marketplace_preview_routes);
     }
 
     // Generic enterprise extension routes: enterprise-only surfaces register
@@ -860,7 +934,8 @@ pub fn create_router(state: AppState) -> Router {
     // so the open-core tree carries no reference to them.
     #[cfg(feature = "enterprise")]
     {
-        app = app.merge(nanosiem_enterprise::handlers::extension_routes::<AppState>());
+        licensed_app =
+            licensed_app.merge(nanosiem_enterprise::handlers::extension_routes::<AppState>());
     }
 
     app = app
@@ -908,20 +983,21 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/enrichment/stats", get(handlers::get_enrichment_stats))
         .route("/api/enrichment/lookup/{ip}", get(handlers::lookup_ip));
-        // NAN-1111 sunset: ThreatFox + TOR Exit Nodes per-provider configure
-        // and sync routes lived here; both moved to the marketplace + Deno
-        // (nano-rs/nano-enrichments). The `/api/enrichment/ioc/{lookup,stats}`
-        // endpoints lived in `threatfox.rs` and had no remaining UI callers
-        // — deleted with the rest. NAN-4959 removed the IPinfo Lite
-        // configure / sync / auto-sync routes too: IPinfo comes only from
-        // the signed platform feed bundle above.
+    // NAN-1111 sunset: ThreatFox + TOR Exit Nodes per-provider configure
+    // and sync routes lived here; both moved to the marketplace + Deno
+    // (nano-rs/nano-enrichments). The `/api/enrichment/ioc/{lookup,stats}`
+    // endpoints lived in `threatfox.rs` and had no remaining UI callers
+    // — deleted with the rest. NAN-4959 removed the IPinfo Lite
+    // configure / sync / auto-sync routes too: IPinfo comes only from
+    // the signed platform feed bundle above.
 
     // Agent enrichment lookup (Deno providers — VirusTotal, AbuseIPDB, etc.)
     // — enterprise only, depends on the lifted agent_enrichment +
     // custom_enrichment::sandbox modules.
     #[cfg(feature = "enterprise")]
     {
-        app = app.route("/api/enrichment/agent/lookup", post(handlers::agent_lookup));
+        licensed_app =
+            licensed_app.route("/api/enrichment/agent/lookup", post(handlers::agent_lookup));
     }
 
     app = app
@@ -1201,7 +1277,7 @@ pub fn create_router(state: AppState) -> Router {
     // meloD AI assistant endpoints — enterprise only.
     #[cfg(feature = "enterprise")]
     {
-        app = app
+        licensed_app = licensed_app
             .route("/api/melod/chat", post(handlers::melod_chat::<AppState>))
             .route(
                 "/api/melod/chat/stream",
@@ -1316,7 +1392,7 @@ pub fn create_router(state: AppState) -> Router {
     // with).
     #[cfg(feature = "enterprise")]
     {
-        app = app
+        licensed_app = licensed_app
             // OIDC authentication endpoints (public)
             .route(
                 "/api/auth/oidc/providers",
@@ -1446,7 +1522,7 @@ pub fn create_router(state: AppState) -> Router {
     // thin editor over the seeded default dataset=risk detection rule).
     #[cfg(feature = "enterprise")]
     {
-        app = app
+        licensed_app = licensed_app
             .route(
                 "/api/settings/risk-decay",
                 get(handlers::get_risk_decay_config),
@@ -1474,7 +1550,7 @@ pub fn create_router(state: AppState) -> Router {
     // surfaces are part of the cases lift to enterprise.
     #[cfg(feature = "enterprise")]
     {
-        app = app
+        licensed_app = licensed_app
             // Case settings (global auto-grouping config)
             .route(
                 "/api/settings/cases",
@@ -1576,7 +1652,7 @@ pub fn create_router(state: AppState) -> Router {
     // enrichment surface are enterprise capabilities).
     #[cfg(feature = "enterprise")]
     {
-        app = app
+        licensed_app = licensed_app
             // Agent enrichment settings (AI-powered threat intel providers)
             .route(
                 "/api/settings/agent-enrichments",
@@ -1673,7 +1749,7 @@ pub fn create_router(state: AppState) -> Router {
     // and scheduler that back these live in nanosiem-enterprise.
     #[cfg(feature = "enterprise")]
     {
-        app = app
+        licensed_app = licensed_app
             .route(
                 "/api/integrations/custom/generate-code",
                 post(handlers::integration_generation::generate_collector_code::<AppState>),
@@ -1801,7 +1877,7 @@ pub fn create_router(state: AppState) -> Router {
     // feature gate.
     #[cfg(feature = "enterprise")]
     {
-        app = app
+        licensed_app = licensed_app
             .route(
                 "/api/settings/ai-availability",
                 get(handlers::get_ai_availability),
@@ -1821,6 +1897,10 @@ pub fn create_router(state: AppState) -> Router {
             .route(
                 "/api/settings/ai-providers/{provider}/validate",
                 post(handlers::validate_ai_provider),
+            )
+            .route(
+                "/api/settings/ai-providers/{provider}/discover-models",
+                post(handlers::discover_provider_models),
             )
             // Agent model configuration
             .route(
@@ -1912,10 +1992,7 @@ pub fn create_router(state: AppState) -> Router {
             put(handlers::update_tier_limits),
         )
         .route("/api/settings/tier/usage", get(handlers::get_usage_history))
-        .route(
-            "/api/settings/ai-usage",
-            get(handlers::get_ai_usage_detail),
-        )
+        .route("/api/settings/ai-usage", get(handlers::get_ai_usage_detail))
         // Webhook settings
         .route("/api/settings/webhooks", get(handlers::list_webhooks))
         .route("/api/settings/webhooks", post(handlers::create_webhook))
@@ -2068,7 +2145,7 @@ pub fn create_router(state: AppState) -> Router {
     // Risk analytics (RiskAnalyticsService) — enterprise only.
     #[cfg(feature = "enterprise")]
     {
-        app = app
+        licensed_app = licensed_app
             .route(
                 "/api/risk/entities",
                 get(handlers::risk::get_risky_entities::<AppState>),
@@ -2136,7 +2213,7 @@ pub fn create_router(state: AppState) -> Router {
     // Entity context — enterprise only (depends on RiskAnalyticsService).
     #[cfg(feature = "enterprise")]
     {
-        app = app
+        licensed_app = licensed_app
             .route(
                 "/api/entities/{entity_type}/{entity_value}/context",
                 get(handlers::entity_context::get_entity_context::<AppState>),
@@ -2378,312 +2455,323 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/parser-repositories/{id}/apply-all-upstream-updates",
             post(handlers::parser_repositories::apply_all_upstream_updates),
-        )
-        // Playbooks library
-        .route(
-            "/api/playbooks",
-            get(handlers::playbooks::list_playbooks),
-        )
-        .route(
-            "/api/playbooks",
-            post(handlers::playbooks::create_playbook),
-        )
-        .route(
-            "/api/playbooks/{id}",
-            get(handlers::playbooks::get_playbook),
-        )
-        .route(
-            "/api/playbooks/{id}",
-            patch(handlers::playbooks::update_playbook),
-        )
-        .route(
-            "/api/playbooks/{id}",
-            delete(handlers::playbooks::archive_playbook),
-        )
-        .route(
-            "/api/playbooks/{id}/fork",
-            post(handlers::playbooks::fork_playbook),
-        )
-        .route(
-            "/api/playbooks/{id}/permanent",
-            delete(handlers::playbooks::delete_playbook_permanent),
-        )
-        .route(
-            "/api/playbooks/{id}/versions",
-            get(handlers::playbooks::list_versions),
-        )
-        .route(
-            "/api/playbooks/{id}/runs",
-            get(handlers::playbooks::list_runs),
-        )
-        .route(
-            "/api/playbooks/{id}/permissions",
-            get(handlers::playbooks::list_permissions),
-        )
-        .route(
-            "/api/playbooks/{id}/approvals",
-            get(handlers::playbooks::list_approvals),
-        )
-        // NAN-445: Phase 4 — suggest + runs (rule/case auto-attach)
-        .route(
-            "/api/playbooks/suggest-for-rule/{rule_id}",
-            get(handlers::playbooks::suggest_for_rule),
-        )
-        // NAN-473: dry-resolve mounted separately below (rate-limited sub-router).
-        .route(
-            "/api/playbooks/{id}/runs",
-            post(handlers::playbooks::attach_to_case),
-        )
-        .route(
-            "/api/playbook-runs/{id}",
-            patch(handlers::playbooks::finish_run),
-        )
-        .route(
-            "/api/cases/{case_id}/playbook-runs",
-            get(handlers::playbooks::list_runs_for_case),
-        )
-        // NAN-462: resolve a run against its run_context snapshot
-        .route(
-            "/api/playbook-runs/{id}/resolved",
-            get(handlers::playbooks::resolve_run),
-        )
-        // NAN-463: per-step completion upsert (active-run surface)
-        .route(
-            "/api/playbook-runs/{run_id}/steps/{step_id}",
-            patch(handlers::playbooks::update_step_completion),
-        )
-        // NAN-446: Phase 5 — adaptive → library promote
-        .route(
-            "/api/playbooks/{id}/promote",
-            post(handlers::playbooks::promote_playbook),
-        )
-        // NAN-447: Phase 6 — approval workflow + permissions
-        .route(
-            "/api/playbooks/{id}/submit-for-review",
-            post(handlers::playbooks::submit_for_review),
-        )
-        .route(
-            "/api/playbook-approvals/{id}/approve",
-            post(handlers::playbooks::approve_playbook),
-        )
-        .route(
-            "/api/playbook-approvals/{id}/reject",
-            post(handlers::playbooks::reject_playbook),
-        )
-        .route(
-            "/api/playbooks/{id}/permissions/{role}",
-            axum::routing::put(handlers::playbooks::set_permission),
-        )
-        .route(
-            "/api/playbooks/{id}/permissions/{role}",
-            axum::routing::delete(handlers::playbooks::delete_permission),
-        )
-        // NAN-448: Phase 7 — real analytics
-        .route(
-            "/api/playbooks/{id}/analytics",
-            get(handlers::playbooks::get_analytics),
-        )
-        // NAN-449: Phase 5b — compose adaptive playbook from case
-        .route(
-            "/api/cases/{case_id}/compose-adaptive-playbook",
-            post(handlers::playbooks::compose_adaptive_from_case),
-        )
-        // NAN-2238 Active Hunter.
-        //
-        // The static collections (`runners`, `sweeps`, `leads`, `suppressions`,
-        // `profile`, `rule-ideas`, `summary`) sit beside the `{id}` parameter at
-        // the same position. matchit gives a static segment priority, which is
-        // the same shape `/api/playbooks/suggest-for-rule/{rule_id}` already
-        // relies on — but it does mean a hunt whose TypeID rendered as one of
-        // those words would be unreachable, and TypeIDs are prefixed base32 so
-        // that cannot happen.
-        .route("/api/hunts/summary", get(handlers::hunts::hunts_summary))
-        .route("/api/hunts", get(handlers::hunts::list_hunts))
-        .route("/api/hunts", post(handlers::hunts::create_hunt))
-        .route(
-            "/api/hunts/source-capability-bindings",
-            get(handlers::hunts::list_source_capability_bindings)
-                .put(handlers::hunts::set_source_capability_binding),
-        )
-        .route(
-            "/api/hunts/source-capability-bindings/reset",
-            post(handlers::hunts::reset_source_capability_binding),
-        )
-        .route("/api/hunts/runners", get(handlers::hunts::list_runners))
-        .route("/api/hunts/runners", post(handlers::hunts::register_runner))
-        .route(
-            "/api/hunts/runners/{id}/heartbeat",
-            post(handlers::hunts::runner_heartbeat),
-        )
-        .route(
-            "/api/hunts/runners/{id}/claim",
-            post(handlers::hunts::claim_sweep),
-        )
-        // The Antigravity sweep waiver (NAN-2264). `hunts:manage` on both
-        // verbs — a runner cannot widen its own authority.
-        .route(
-            "/api/hunts/runners/{id}/agy-waiver",
-            post(handlers::hunts::grant_runner_agy_waiver)
-                .delete(handlers::hunts::revoke_runner_agy_waiver),
-        )
-        .route("/api/hunts/sweeps/{id}", get(handlers::hunts::get_sweep))
-        // The only endpoint `hunts:report` reaches that writes leads.
-        .route(
-            "/api/hunts/sweeps/{id}/report",
-            post(handlers::hunts::report_sweep),
-        )
-        .route("/api/hunts/leads", get(handlers::hunts::list_leads))
-        .route("/api/hunts/leads/{id}", get(handlers::hunts::get_lead))
-        .route(
-            "/api/hunts/leads/{id}/promote",
-            post(handlers::hunts::promote_lead),
-        )
-        .route(
-            "/api/hunts/leads/{id}/dismiss",
-            post(handlers::hunts::dismiss_lead),
-        )
-        // NAN-2239 knowledge. Recall is `hunts:view`; recording is the one
-        // write a sweep key can make besides its report; revocation is
-        // `hunts:triage`. Nothing here suppresses — see handlers/hunts/knowledge.rs.
-        .route(
-            "/api/hunts/knowledge",
-            get(handlers::hunts::list_knowledge).post(handlers::hunts::record_knowledge),
-        )
-        .route(
-            "/api/hunts/knowledge/{id}/revoke",
-            post(handlers::hunts::revoke_knowledge),
-        )
-        .route(
-            "/api/hunts/suppressions",
-            get(handlers::hunts::list_suppressions)
-                // POST is the RUNNER's (`hunts:report`), not the analyst's and
-                // not the agent's. Sharing the path with the list keeps the two
-                // halves of the suppression story in one place.
-                .post(handlers::hunts::record_suppression),
-        )
-        .route(
-            "/api/hunts/suppressions/{id}",
-            delete(handlers::hunts::revoke_suppression),
-        )
-        .route("/api/hunts/profile", get(handlers::hunts::get_latest_profile))
-        // Recon's whole write surface is `hunts:manage` rather than
-        // `hunts:run`: it creates hunt DEFINITIONS. See handlers/hunts/recon.rs.
-        //
-        // The save carries a census, a full ATT&CK surface and model-written
-        // prose, so its body limit is stated rather than inherited — a change
-        // to axum's 2 MB default must not silently widen what a model may push
-        // into a shared JSONB column. Layered on this one route so the rest of
-        // the hunts surface keeps the global limit.
-        .route(
-            "/api/hunts/profile",
-            post(handlers::hunts::save_recon_profile)
-                .layer(DefaultBodyLimit::max(PROFILE_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/api/hunts/profile/census",
-            post(handlers::hunts::recon_census),
-        )
-        .route(
-            "/api/hunts/profile/surface",
-            post(handlers::hunts::recon_surface),
-        )
-        .route(
-            "/api/hunts/profile/run",
-            post(handlers::hunts::run_recon_profile),
-        )
-        .route("/api/hunts/drafts", post(handlers::hunts::create_hunt_drafts))
-        .route("/api/hunts/rule-ideas", get(handlers::hunts::list_rule_ideas))
-        // The report itself and the sanitized logo remain device-local. These
-        // static receipts carry hashes and bounded presentation metadata only.
-        .route(
-            "/api/hunts/report-branding-events",
-            post(handlers::hunts::record_hunt_report_branding),
-        )
-        .route(
-            "/api/hunts/rule-ideas/{id}/send",
-            post(handlers::hunts::send_rule_idea),
-        )
-        .route(
-            "/api/hunts/rule-ideas/{id}/reject",
-            post(handlers::hunts::reject_rule_idea),
-        )
-        .route("/api/hunts/{id}", get(handlers::hunts::get_hunt))
-        .route("/api/hunts/{id}", patch(handlers::hunts::update_hunt))
-        .route("/api/hunts/{id}", delete(handlers::hunts::archive_hunt))
-        .route(
-            "/api/hunts/{id}/sweeps",
-            get(handlers::hunts::list_hunt_sweeps),
-        )
-        .route(
-            "/api/hunts/{id}/sweeps",
-            post(handlers::hunts::trigger_sweep),
-        )
-        .route("/api/hunts/{id}/toggle", post(handlers::hunts::toggle_hunt))
-        .route(
-            "/api/hunts/{id}/report-exports",
-            post(handlers::hunts::record_hunt_report_export),
-        )
-        // Its own route rather than a PATCH field, like the toggle beside it:
-        // `update_hunt` COALESCEs every column, so "manual only" — a real choice
-        // — is inexpressible there and clearing a cadence was a silent no-op.
-        .route(
-            "/api/hunts/{id}/schedule",
-            post(handlers::hunts::set_hunt_schedule),
-        )
-        // Playbook repositories (external sync)
-        .route(
-            "/api/playbook-repositories",
-            get(handlers::playbook_repositories::list_playbook_repositories),
-        )
-        .route(
-            "/api/playbook-repositories",
-            post(handlers::playbook_repositories::create_playbook_repository),
-        )
-        .route(
-            "/api/playbook-repositories/{id}",
-            get(handlers::playbook_repositories::get_playbook_repository),
-        )
-        .route(
-            "/api/playbook-repositories/{id}",
-            patch(handlers::playbook_repositories::update_playbook_repository),
-        )
-        .route(
-            "/api/playbook-repositories/{id}",
-            delete(handlers::playbook_repositories::delete_playbook_repository),
-        )
-        .route(
-            "/api/playbook-repositories/{id}/sync",
-            post(handlers::playbook_repositories::sync_playbook_repository),
-        )
-        .route(
-            "/api/playbook-repositories/{id}/sync/status",
-            get(handlers::playbook_repositories::get_playbook_sync_status),
-        )
-        .route(
-            "/api/playbook-repositories/{id}/playbooks",
-            get(handlers::playbook_repositories::list_repository_playbooks),
-        )
-        // NAN-611: bulk import — promotes every parseable cached playbook into
-        // the library. Must be registered before the `import/{*path}` catch-all
-        // below so axum doesn't route "import-all" as a path parameter.
-        .route(
-            "/api/playbook-repositories/{id}/playbooks/import-all",
-            post(handlers::playbook_repositories::import_all_repository_playbooks),
-        )
-        // NAN-611: combined sync + bulk import — backs the "Sync now" button on
-        // the Playbooks library so users get one toast per click instead of
-        // polling sync status from the browser.
-        .route(
-            "/api/playbook-repositories/{id}/sync-and-import",
-            post(handlers::playbook_repositories::sync_and_import_repository),
-        )
-        // NAN-453: axum requires catch-all params `{*path}` to be the last
-        // segment. Matches the rule_repositories pattern at line 1537:
-        // `/rule-repositories/{id}/rules/import/{*path}`.
-        .route(
-            "/api/playbook-repositories/{id}/playbooks/import/{*path}",
-            post(handlers::playbook_repositories::import_repository_playbook),
-        )
+        );
+
+    // Playbooks, their repository sync and Active Hunter share the playbook
+    // schema, which ships only in the enterprise migration overlay.
+    #[cfg(feature = "enterprise")]
+    {
+        app = app
+            // NAN-474: rate-limited dry-resolve sub-router
+            .merge(dry_resolve_routes)
+            // Playbooks library
+            .route(
+                "/api/playbooks",
+                get(handlers::playbooks::list_playbooks),
+            )
+            .route(
+                "/api/playbooks",
+                post(handlers::playbooks::create_playbook),
+            )
+            .route(
+                "/api/playbooks/{id}",
+                get(handlers::playbooks::get_playbook),
+            )
+            .route(
+                "/api/playbooks/{id}",
+                patch(handlers::playbooks::update_playbook),
+            )
+            .route(
+                "/api/playbooks/{id}",
+                delete(handlers::playbooks::archive_playbook),
+            )
+            .route(
+                "/api/playbooks/{id}/fork",
+                post(handlers::playbooks::fork_playbook),
+            )
+            .route(
+                "/api/playbooks/{id}/permanent",
+                delete(handlers::playbooks::delete_playbook_permanent),
+            )
+            .route(
+                "/api/playbooks/{id}/versions",
+                get(handlers::playbooks::list_versions),
+            )
+            .route(
+                "/api/playbooks/{id}/runs",
+                get(handlers::playbooks::list_runs),
+            )
+            .route(
+                "/api/playbooks/{id}/permissions",
+                get(handlers::playbooks::list_permissions),
+            )
+            .route(
+                "/api/playbooks/{id}/approvals",
+                get(handlers::playbooks::list_approvals),
+            )
+            // NAN-445: Phase 4 — suggest + runs (rule/case auto-attach)
+            .route(
+                "/api/playbooks/suggest-for-rule/{rule_id}",
+                get(handlers::playbooks::suggest_for_rule),
+            )
+            // NAN-473: dry-resolve mounted separately below (rate-limited sub-router).
+            .route(
+                "/api/playbooks/{id}/runs",
+                post(handlers::playbooks::attach_to_case),
+            )
+            .route(
+                "/api/playbook-runs/{id}",
+                patch(handlers::playbooks::finish_run),
+            )
+            .route(
+                "/api/cases/{case_id}/playbook-runs",
+                get(handlers::playbooks::list_runs_for_case),
+            )
+            // NAN-462: resolve a run against its run_context snapshot
+            .route(
+                "/api/playbook-runs/{id}/resolved",
+                get(handlers::playbooks::resolve_run),
+            )
+            // NAN-463: per-step completion upsert (active-run surface)
+            .route(
+                "/api/playbook-runs/{run_id}/steps/{step_id}",
+                patch(handlers::playbooks::update_step_completion),
+            )
+            // NAN-446: Phase 5 — adaptive → library promote
+            .route(
+                "/api/playbooks/{id}/promote",
+                post(handlers::playbooks::promote_playbook),
+            )
+            // NAN-447: Phase 6 — approval workflow + permissions
+            .route(
+                "/api/playbooks/{id}/submit-for-review",
+                post(handlers::playbooks::submit_for_review),
+            )
+            .route(
+                "/api/playbook-approvals/{id}/approve",
+                post(handlers::playbooks::approve_playbook),
+            )
+            .route(
+                "/api/playbook-approvals/{id}/reject",
+                post(handlers::playbooks::reject_playbook),
+            )
+            .route(
+                "/api/playbooks/{id}/permissions/{role}",
+                axum::routing::put(handlers::playbooks::set_permission),
+            )
+            .route(
+                "/api/playbooks/{id}/permissions/{role}",
+                axum::routing::delete(handlers::playbooks::delete_permission),
+            )
+            // NAN-448: Phase 7 — real analytics
+            .route(
+                "/api/playbooks/{id}/analytics",
+                get(handlers::playbooks::get_analytics),
+            )
+            // NAN-449: Phase 5b — compose adaptive playbook from case
+            .route(
+                "/api/cases/{case_id}/compose-adaptive-playbook",
+                post(handlers::playbooks::compose_adaptive_from_case),
+            )
+            // NAN-2238 Active Hunter.
+            //
+            // The static collections (`runners`, `sweeps`, `leads`, `suppressions`,
+            // `profile`, `rule-ideas`, `summary`) sit beside the `{id}` parameter at
+            // the same position. matchit gives a static segment priority, which is
+            // the same shape `/api/playbooks/suggest-for-rule/{rule_id}` already
+            // relies on — but it does mean a hunt whose TypeID rendered as one of
+            // those words would be unreachable, and TypeIDs are prefixed base32 so
+            // that cannot happen.
+            .route("/api/hunts/summary", get(handlers::hunts::hunts_summary))
+            .route("/api/hunts", get(handlers::hunts::list_hunts))
+            .route("/api/hunts", post(handlers::hunts::create_hunt))
+            .route(
+                "/api/hunts/source-capability-bindings",
+                get(handlers::hunts::list_source_capability_bindings)
+                    .put(handlers::hunts::set_source_capability_binding),
+            )
+            .route(
+                "/api/hunts/source-capability-bindings/reset",
+                post(handlers::hunts::reset_source_capability_binding),
+            )
+            .route("/api/hunts/runners", get(handlers::hunts::list_runners))
+            .route("/api/hunts/runners", post(handlers::hunts::register_runner))
+            .route(
+                "/api/hunts/runners/{id}/heartbeat",
+                post(handlers::hunts::runner_heartbeat),
+            )
+            .route(
+                "/api/hunts/runners/{id}/claim",
+                post(handlers::hunts::claim_sweep),
+            )
+            // The Antigravity sweep waiver (NAN-2264). `hunts:manage` on both
+            // verbs — a runner cannot widen its own authority.
+            .route(
+                "/api/hunts/runners/{id}/agy-waiver",
+                post(handlers::hunts::grant_runner_agy_waiver)
+                    .delete(handlers::hunts::revoke_runner_agy_waiver),
+            )
+            .route("/api/hunts/sweeps/{id}", get(handlers::hunts::get_sweep))
+            // The only endpoint `hunts:report` reaches that writes leads.
+            .route(
+                "/api/hunts/sweeps/{id}/report",
+                post(handlers::hunts::report_sweep),
+            )
+            .route("/api/hunts/leads", get(handlers::hunts::list_leads))
+            .route("/api/hunts/leads/{id}", get(handlers::hunts::get_lead))
+            .route(
+                "/api/hunts/leads/{id}/promote",
+                post(handlers::hunts::promote_lead),
+            )
+            .route(
+                "/api/hunts/leads/{id}/dismiss",
+                post(handlers::hunts::dismiss_lead),
+            )
+            // NAN-2239 knowledge. Recall is `hunts:view`; recording is the one
+            // write a sweep key can make besides its report; revocation is
+            // `hunts:triage`. Nothing here suppresses — see handlers/hunts/knowledge.rs.
+            .route(
+                "/api/hunts/knowledge",
+                get(handlers::hunts::list_knowledge).post(handlers::hunts::record_knowledge),
+            )
+            .route(
+                "/api/hunts/knowledge/{id}/revoke",
+                post(handlers::hunts::revoke_knowledge),
+            )
+            .route(
+                "/api/hunts/suppressions",
+                get(handlers::hunts::list_suppressions)
+                    // POST is the RUNNER's (`hunts:report`), not the analyst's and
+                    // not the agent's. Sharing the path with the list keeps the two
+                    // halves of the suppression story in one place.
+                    .post(handlers::hunts::record_suppression),
+            )
+            .route(
+                "/api/hunts/suppressions/{id}",
+                delete(handlers::hunts::revoke_suppression),
+            )
+            .route("/api/hunts/profile", get(handlers::hunts::get_latest_profile))
+            // Recon's whole write surface is `hunts:manage` rather than
+            // `hunts:run`: it creates hunt DEFINITIONS. See handlers/hunts/recon.rs.
+            //
+            // The save carries a census, a full ATT&CK surface and model-written
+            // prose, so its body limit is stated rather than inherited — a change
+            // to axum's 2 MB default must not silently widen what a model may push
+            // into a shared JSONB column. Layered on this one route so the rest of
+            // the hunts surface keeps the global limit.
+            .route(
+                "/api/hunts/profile",
+                post(handlers::hunts::save_recon_profile)
+                    .layer(DefaultBodyLimit::max(PROFILE_BODY_LIMIT_BYTES)),
+            )
+            .route(
+                "/api/hunts/profile/census",
+                post(handlers::hunts::recon_census),
+            )
+            .route(
+                "/api/hunts/profile/surface",
+                post(handlers::hunts::recon_surface),
+            )
+            .route(
+                "/api/hunts/profile/run",
+                post(handlers::hunts::run_recon_profile),
+            )
+            .route("/api/hunts/drafts", post(handlers::hunts::create_hunt_drafts))
+            .route("/api/hunts/rule-ideas", get(handlers::hunts::list_rule_ideas))
+            // The report itself and the sanitized logo remain device-local. These
+            // static receipts carry hashes and bounded presentation metadata only.
+            .route(
+                "/api/hunts/report-branding-events",
+                post(handlers::hunts::record_hunt_report_branding),
+            )
+            .route(
+                "/api/hunts/rule-ideas/{id}/send",
+                post(handlers::hunts::send_rule_idea),
+            )
+            .route(
+                "/api/hunts/rule-ideas/{id}/reject",
+                post(handlers::hunts::reject_rule_idea),
+            )
+            .route("/api/hunts/{id}", get(handlers::hunts::get_hunt))
+            .route("/api/hunts/{id}", patch(handlers::hunts::update_hunt))
+            .route("/api/hunts/{id}", delete(handlers::hunts::archive_hunt))
+            .route(
+                "/api/hunts/{id}/sweeps",
+                get(handlers::hunts::list_hunt_sweeps),
+            )
+            .route(
+                "/api/hunts/{id}/sweeps",
+                post(handlers::hunts::trigger_sweep),
+            )
+            .route("/api/hunts/{id}/toggle", post(handlers::hunts::toggle_hunt))
+            .route(
+                "/api/hunts/{id}/report-exports",
+                post(handlers::hunts::record_hunt_report_export),
+            )
+            // Its own route rather than a PATCH field, like the toggle beside it:
+            // `update_hunt` COALESCEs every column, so "manual only" — a real choice
+            // — is inexpressible there and clearing a cadence was a silent no-op.
+            .route(
+                "/api/hunts/{id}/schedule",
+                post(handlers::hunts::set_hunt_schedule),
+            )
+            // Playbook repositories (external sync)
+            .route(
+                "/api/playbook-repositories",
+                get(handlers::playbook_repositories::list_playbook_repositories),
+            )
+            .route(
+                "/api/playbook-repositories",
+                post(handlers::playbook_repositories::create_playbook_repository),
+            )
+            .route(
+                "/api/playbook-repositories/{id}",
+                get(handlers::playbook_repositories::get_playbook_repository),
+            )
+            .route(
+                "/api/playbook-repositories/{id}",
+                patch(handlers::playbook_repositories::update_playbook_repository),
+            )
+            .route(
+                "/api/playbook-repositories/{id}",
+                delete(handlers::playbook_repositories::delete_playbook_repository),
+            )
+            .route(
+                "/api/playbook-repositories/{id}/sync",
+                post(handlers::playbook_repositories::sync_playbook_repository),
+            )
+            .route(
+                "/api/playbook-repositories/{id}/sync/status",
+                get(handlers::playbook_repositories::get_playbook_sync_status),
+            )
+            .route(
+                "/api/playbook-repositories/{id}/playbooks",
+                get(handlers::playbook_repositories::list_repository_playbooks),
+            )
+            // NAN-611: bulk import — promotes every parseable cached playbook into
+            // the library. Must be registered before the `import/{*path}` catch-all
+            // below so axum doesn't route "import-all" as a path parameter.
+            .route(
+                "/api/playbook-repositories/{id}/playbooks/import-all",
+                post(handlers::playbook_repositories::import_all_repository_playbooks),
+            )
+            // NAN-611: combined sync + bulk import — backs the "Sync now" button on
+            // the Playbooks library so users get one toast per click instead of
+            // polling sync status from the browser.
+            .route(
+                "/api/playbook-repositories/{id}/sync-and-import",
+                post(handlers::playbook_repositories::sync_and_import_repository),
+            )
+            // NAN-453: axum requires catch-all params `{*path}` to be the last
+            // segment. Matches the rule_repositories pattern at line 1537:
+            // `/rule-repositories/{id}/rules/import/{*path}`.
+            .route(
+                "/api/playbook-repositories/{id}/playbooks/import/{*path}",
+                post(handlers::playbook_repositories::import_repository_playbook),
+            );
+    }
+
+    app = app
         // Query library
         .route("/api/query-library", get(handlers::list_queries))
         .route("/api/query-library", post(handlers::create_query))
@@ -2738,8 +2826,6 @@ pub fn create_router(state: AppState) -> Router {
         .merge(platform_feed_import_routes)
         // NAN-4955: content channel bundle import — body-limited sub-router
         .merge(content_import_routes)
-        // NAN-474: rate-limited dry-resolve sub-router
-        .merge(dry_resolve_routes)
         // NAN-939: rate-limited Kafka broker-probe sub-router
         .merge(kafka_probe_routes)
         // NAN-2064: rate-limited stored-credential GitHub probe
@@ -2851,8 +2937,14 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/reports/{id}", get(handlers::reports::get_report))
         .route("/api/reports/{id}", put(handlers::reports::update_report))
-        .route("/api/reports/{id}", delete(handlers::reports::delete_report))
-        .route("/api/reports/{id}/run", post(handlers::reports::trigger_report))
+        .route(
+            "/api/reports/{id}",
+            delete(handlers::reports::delete_report),
+        )
+        .route(
+            "/api/reports/{id}/run",
+            post(handlers::reports::trigger_report),
+        )
         .route(
             "/api/reports/{id}/runs",
             get(handlers::reports::list_report_runs),
@@ -2861,7 +2953,7 @@ pub fn create_router(state: AppState) -> Router {
     // Notebook endpoints — enterprise only (cases-coupled).
     #[cfg(feature = "enterprise")]
     {
-        app = app
+        licensed_app = licensed_app
             .route(
                 "/api/notebooks",
                 get(handlers::notebooks::list_notebooks::<AppState>),
@@ -3068,27 +3160,62 @@ pub fn create_router(state: AppState) -> Router {
             "/api/observability/metric-monitors/{id}",
             put(handlers::observability_metric_monitors::update_metric_monitor)
                 .delete(handlers::observability_metric_monitors::delete_metric_monitor),
-        )
-        // Tuning endpoints
-        .route(
-            "/api/tuning/baselines/{rule_id}",
-            get(handlers::get_baseline),
-        )
-        .route("/api/tuning/metrics/{rule_id}", get(handlers::get_metrics))
-        .route(
-            "/api/tuning/breaches/{rule_id}",
-            get(handlers::get_breaches),
-        )
-        .route("/api/tuning/proposals", get(handlers::list_proposals))
-        .route("/api/tuning/proposals/{id}", get(handlers::get_proposal))
-        .route(
-            "/api/tuning/proposals/{id}/approve",
-            post(handlers::approve_proposal),
-        )
-        .route(
-            "/api/tuning/proposals/{id}/reject",
-            post(handlers::reject_proposal),
-        )
+        );
+
+    // AI tuning reads the enterprise-only tuning tables.
+    #[cfg(feature = "enterprise")]
+    {
+        app = app
+            // Tuning endpoints
+            .route(
+                "/api/tuning/baselines/{rule_id}",
+                get(handlers::get_baseline),
+            )
+            .route("/api/tuning/metrics/{rule_id}", get(handlers::get_metrics))
+            .route(
+                "/api/tuning/breaches/{rule_id}",
+                get(handlers::get_breaches),
+            )
+            .route("/api/tuning/proposals", get(handlers::list_proposals))
+            .route("/api/tuning/proposals/{id}", get(handlers::get_proposal))
+            .route(
+                "/api/tuning/proposals/{id}/approve",
+                post(handlers::approve_proposal),
+            )
+            .route(
+                "/api/tuning/proposals/{id}/reject",
+                post(handlers::reject_proposal),
+            )
+            .route("/api/tuning/logs", get(handlers::list_logs))
+            .route("/api/tuning/logs/{id}", get(handlers::get_log))
+            .route(
+                "/api/tuning/logs/{id}/revert",
+                post(handlers::revert_tuning),
+            )
+            .route(
+                "/api/tuning/notifications",
+                get(handlers::tuning::list_tuning_notifications),
+            )
+            .route(
+                "/api/tuning/notifications/{id}/read",
+                post(handlers::tuning::mark_tuning_notification_read),
+            )
+            .route(
+                "/api/tuning/notifications/read-all",
+                post(handlers::tuning::mark_all_tuning_notifications_read),
+            )
+            .route(
+                "/api/tuning/settings/{rule_id}",
+                get(handlers::get_tuning_settings),
+            )
+            .route(
+                "/api/tuning/settings/{rule_id}",
+                put(handlers::update_tuning_settings),
+            );
+    }
+
+    app = app
+        // Rule-version history and rollback use only the open detection schema.
         .route(
             "/api/tuning/versions/{rule_id}",
             get(handlers::list_versions),
@@ -3100,32 +3227,6 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/tuning/versions/{rule_id}/{version_id}/activate",
             post(handlers::activate_version),
-        )
-        .route("/api/tuning/logs", get(handlers::list_logs))
-        .route("/api/tuning/logs/{id}", get(handlers::get_log))
-        .route(
-            "/api/tuning/logs/{id}/revert",
-            post(handlers::revert_tuning),
-        )
-        .route(
-            "/api/tuning/notifications",
-            get(handlers::tuning::list_tuning_notifications),
-        )
-        .route(
-            "/api/tuning/notifications/{id}/read",
-            post(handlers::tuning::mark_tuning_notification_read),
-        )
-        .route(
-            "/api/tuning/notifications/read-all",
-            post(handlers::tuning::mark_all_tuning_notifications_read),
-        )
-        .route(
-            "/api/tuning/settings/{rule_id}",
-            get(handlers::get_tuning_settings),
-        )
-        .route(
-            "/api/tuning/settings/{rule_id}",
-            put(handlers::update_tuning_settings),
         )
         // Cacheable routes (with Cache-Control headers)
         .merge(cached_metadata)
@@ -3139,7 +3240,7 @@ pub fn create_router(state: AppState) -> Router {
     // hides the strip via the `observabilityConvergence` capability flag.
     #[cfg(feature = "enterprise")]
     {
-        app = app.route(
+        licensed_app = licensed_app.route(
             "/api/observability/services/{service}/security-signals",
             get(handlers::observability_service_signals::get_service_security_signals),
         );
@@ -3153,7 +3254,15 @@ pub fn create_router(state: AppState) -> Router {
     // layer below so parser/enrichment imports require a valid license.
     #[cfg(feature = "enterprise")]
     {
-        app = app.merge(airgap_import_routes);
+        licensed_app = licensed_app.merge(airgap_import_routes);
+    }
+    #[cfg(feature = "enterprise")]
+    {
+        licensed_app = licensed_app.route_layer(axum_middleware::from_fn_with_state(
+            state.license_status.clone(),
+            crate::middleware::licensed_surface_guard,
+        ));
+        app = app.merge(licensed_app);
     }
     // Per-source RBAC scope administration (NAN-1799) — restricted source_type
     // registry + per-group grants. Core surface (not enterprise-gated); the
@@ -3201,17 +3310,10 @@ pub fn create_router(state: AppState) -> Router {
             auth_middleware,
         ));
 
-    // License enforcement (runs before auth — locked deployments get 403
-    // immediately). Enterprise-only: the open edition has no license guard, so
-    // requests are never gated on license state (NAN-1193). Kept at this exact
-    // point in the layer sequence so the enterprise stack is byte-for-byte
-    // identical to before.
+    // Publish grace/hard-stop headers on all responses. Licensed-only denial
+    // is attached directly to `licensed_app`; shared/open routes continue.
     #[cfg(feature = "enterprise")]
     {
-        app = app.layer(axum_middleware::from_fn_with_state(
-            state.offline_license_snapshot.clone(),
-            crate::middleware::component_guard,
-        ));
         app = app.layer(axum_middleware::from_fn_with_state(
             state.license_status.clone(),
             crate::middleware::license_guard,
@@ -3239,7 +3341,14 @@ pub fn create_router(state: AppState) -> Router {
         ))
         // NAN-4753: SSE answers opt out of reverse-proxy buffering, or NGINX
         // holds them (headers included) until the edge times out.
-        .layer(axum_middleware::from_fn(nanosiem_api_lib::sse::sse_unbuffered))
+        .layer(axum_middleware::from_fn(
+            nanosiem_api_lib::sse::sse_unbuffered,
+        ))
+        // NAN-5102: a panic anywhere below (auth, guards, handlers) answers
+        // 500 for that request instead of tearing down the connection (a 502
+        // at the edge). Outside it: the security headers, CORS (so the browser
+        // can read the 500), logging and the request id (so it is correlated).
+        .layer(nanosiem_api_lib::panic_isolation::catch_panic_layer())
         // Add middleware
         .layer(CompressionLayer::new().gzip(true))
         .layer(SetResponseHeaderLayer::overriding(

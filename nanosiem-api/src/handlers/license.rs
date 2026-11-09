@@ -6,7 +6,8 @@ use axum::{body::Bytes, extract::State, Extension, Json};
 use chrono::{DateTime, Utc};
 use nanosiem_core::auth::permissions;
 use nanosiem_enterprise::sovereign_license::{
-    ClockRecoveryRequest, EntitlementError, LicenseStateView, MAX_LICENSE_BYTES,
+    verify_production, ClockRecoveryRequest, EntitlementError, EntitlementOperator,
+    LicenseStateView, MAX_LICENSE_BYTES,
 };
 use serde::Serialize;
 use utoipa::OpenApi;
@@ -56,11 +57,56 @@ pub struct LicenseStatusResponse {
     pub components: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entitlement: Option<LicenseEntitlementResponse>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct LicenseEntitlementResponse {
+    pub license_id: String,
+    pub edition: String,
+    pub operator: String,
+    pub offering: String,
+    pub kind: String,
+    pub capacity_gb_per_day: Option<u64>,
+    pub starts_at: String,
+    pub expires_at: String,
+    pub grace_ends_at: String,
+    pub revision: u64,
+    pub days_remaining: i64,
+    /// Present only inside a 14/7/1/0-day warning step; omitted (never
+    /// `null`) otherwise so clients do not render an empty warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning_days: Option<i64>,
+}
+
+impl LicenseEntitlementResponse {
+    fn from_status(
+        status: &nanosiem_core::license::LicenseStatus,
+        now: DateTime<Utc>,
+    ) -> Option<Self> {
+        let entitlement = status.entitlement.as_ref()?;
+        Some(Self {
+            license_id: entitlement.license_id.clone(),
+            edition: entitlement.edition.clone(),
+            operator: entitlement.operator.clone(),
+            offering: entitlement.offering.clone(),
+            kind: entitlement.kind.clone(),
+            capacity_gb_per_day: entitlement.capacity_gb_per_day,
+            starts_at: entitlement.starts_at.to_rfc3339(),
+            expires_at: entitlement.expires_at.to_rfc3339(),
+            grace_ends_at: entitlement.grace_ends_at.to_rfc3339(),
+            revision: entitlement.revision,
+            days_remaining: status.trial_days_remaining(now).unwrap_or(0),
+            warning_days: status.trial_warning_days(now),
+        })
+    }
 }
 
 impl LicenseStatusResponse {
-    fn offline(view: &LicenseStateView) -> Self {
+    fn offline(view: &LicenseStateView, airgap: bool) -> Self {
         let allowed = api_allowed(view);
+        let cached = cache_status(view);
         let state = match (allowed, view.state.as_str()) {
             (false, _) => "locked",
             (true, "running" | "renewal_due") => "active",
@@ -75,15 +121,11 @@ impl LicenseStatusResponse {
             locked_reason: view
                 .refusal
                 .clone()
-                .or_else(|| (!view.valid).then(|| view.notice.clone()).flatten())
-                .or_else(|| {
-                    (!view.components.iter().any(|component| component == "api"))
-                        .then(|| "The licence does not include the API component.".into())
-                }),
+                .or_else(|| (!view.valid).then(|| view.notice.clone()).flatten()),
             grace_ends_at: view.grace_until.clone(),
             expires_at: view.expires_at.clone(),
             enforcement_enabled: true,
-            airgap: true,
+            airgap,
             mode: "offline".into(),
             runtime_state: Some(view.state.clone()),
             installation_id: Some(view.installation_id.clone()),
@@ -97,12 +139,13 @@ impl LicenseStatusResponse {
             recovery_required: view.recovery_required,
             components: view.components.clone(),
             notice: view.notice.clone(),
+            entitlement: LicenseEntitlementResponse::from_status(&cached, Utc::now()),
         }
     }
 
-    fn cached_offline(snapshot: &OfflineLicenseSnapshot) -> Self {
+    fn cached_offline(snapshot: &OfflineLicenseSnapshot, airgap: bool) -> Self {
         if let Some(view) = snapshot.c05_view() {
-            return Self::offline(view);
+            return Self::offline(view, airgap);
         }
         if let Some(grace) = snapshot.legacy_grace() {
             return Self {
@@ -113,7 +156,7 @@ impl LicenseStatusResponse {
                 grace_ends_at: Some(iso(grace.grace_until)),
                 expires_at: grace.expires_at.map(iso),
                 enforcement_enabled: true,
-                airgap: true,
+                airgap,
                 mode: "offline".into(),
                 runtime_state: Some("legacy_upgrade_grace".into()),
                 installation_id: Some(grace.identity.installation_id.clone()),
@@ -127,6 +170,7 @@ impl LicenseStatusResponse {
                 recovery_required: false,
                 components: Vec::new(),
                 notice: snapshot.notice().map(str::to_owned),
+                entitlement: None,
             };
         }
         Self {
@@ -137,8 +181,8 @@ impl LicenseStatusResponse {
             grace_ends_at: None,
             expires_at: None,
             enforcement_enabled: true,
-            airgap: true,
-            mode: "offline".into(),
+            airgap,
+            mode: "unconfigured".into(),
             runtime_state: Some("refused".into()),
             installation_id: None,
             organization_id: None,
@@ -151,6 +195,7 @@ impl LicenseStatusResponse {
             recovery_required: false,
             components: Vec::new(),
             notice: None,
+            entitlement: None,
         }
     }
 }
@@ -159,7 +204,7 @@ impl LicenseStatusResponse {
 /// cache is only an admission mirror; the PostgreSQL + ClickHouse authority
 /// remains the source of truth and refreshes it every 30 seconds.
 pub fn cache_status(view: &LicenseStateView) -> nanosiem_core::license::LicenseStatus {
-    use nanosiem_core::license::{LicenseState, LicenseStatus};
+    use nanosiem_core::license::{LicenseEntitlement, LicenseState, LicenseStatus};
 
     let allowed = api_allowed(view);
     let state = match (allowed, view.state.as_str()) {
@@ -169,6 +214,45 @@ pub fn cache_status(view: &LicenseStateView) -> nanosiem_core::license::LicenseS
         (true, "shut_off" | "refused") => LicenseState::Locked,
         (true, _) => LicenseState::Locked,
     };
+    let entitlement = if view.license_type.as_deref() == Some("evaluation") {
+        match (
+            view.license_id.as_ref(),
+            view.revision,
+            parse_time(view.valid_from.as_deref()),
+            parse_time(view.expires_at.as_deref()),
+            parse_time(view.grace_until.as_deref()),
+        ) {
+            (
+                Some(license_id),
+                Some(revision),
+                Some(starts_at),
+                Some(expires_at),
+                Some(grace_ends_at),
+            ) => Some(LicenseEntitlement {
+                license_id: license_id.clone(),
+                edition: "licensed".into(),
+                operator: "self-run".into(),
+                offering: "self-run".into(),
+                kind: "trial".into(),
+                capacity_gb_per_day: view.capacity_gb_per_day,
+                starts_at,
+                expires_at,
+                grace_ends_at,
+                state: match view.state.as_str() {
+                    "running" | "renewal_due" => "active",
+                    "grace" => "grace",
+                    "shut_off" => "expired",
+                    _ => "revoked",
+                }
+                .into(),
+                days_remaining: 0,
+                revision,
+            }),
+            _ => None,
+        }
+    } else {
+        None
+    };
     LicenseStatus {
         state,
         valid: allowed,
@@ -176,11 +260,7 @@ pub fn cache_status(view: &LicenseStateView) -> nanosiem_core::license::LicenseS
         locked_reason: view
             .refusal
             .clone()
-            .or_else(|| (!view.valid).then(|| view.notice.clone()).flatten())
-            .or_else(|| {
-                (!view.components.iter().any(|component| component == "api"))
-                    .then(|| "The licence does not include the API component.".into())
-            }),
+            .or_else(|| (!view.valid).then(|| view.notice.clone()).flatten()),
         grace_ends_at: parse_time(view.grace_until.as_deref()),
         // The legacy middleware locks at `expires_at`; for C05 that boundary
         // is the hard grace limit, not the beginning of production grace.
@@ -188,11 +268,12 @@ pub fn cache_status(view: &LicenseStateView) -> nanosiem_core::license::LicenseS
         last_checked_at: parse_time(view.observed_at.as_deref()),
         last_heartbeat_at: None,
         offline: true,
+        entitlement,
     }
 }
 
 fn api_allowed(view: &LicenseStateView) -> bool {
-    view.valid && view.components.iter().any(|component| component == "api")
+    view.valid
 }
 
 fn parse_time(value: Option<&str>) -> Option<DateTime<Utc>> {
@@ -216,17 +297,20 @@ fn parse_time(value: Option<&str>) -> Option<DateTime<Utc>> {
 pub async fn get_license_status(
     State(state): State<AppState>,
 ) -> Result<Json<LicenseStatusResponse>, ApiError> {
-    if state.config.airgap && !state.config.is_license_enabled() {
+    if !state.config.is_license_enabled() {
         let snapshot = state.offline_license_snapshot.read().await.clone();
-        return Ok(Json(LicenseStatusResponse::cached_offline(&snapshot)));
+        return Ok(Json(LicenseStatusResponse::cached_offline(
+            &snapshot,
+            state.config.airgap,
+        )));
     }
 
+    let now = chrono::Utc::now();
     let status = state
         .license_status
         .read()
         .await
-        .effective(chrono::Utc::now());
-    let enforcement_enabled = state.config.is_license_enabled();
+        .effective(now);
     Ok(Json(LicenseStatusResponse {
         state: status.state.as_str().to_string(),
         valid: status.valid,
@@ -234,14 +318,9 @@ pub async fn get_license_status(
         locked_reason: status.locked_reason.clone(),
         grace_ends_at: status.grace_ends_at.map(|dt| dt.to_rfc3339()),
         expires_at: status.expires_at.map(|dt| dt.to_rfc3339()),
-        enforcement_enabled,
+        enforcement_enabled: true,
         airgap: state.config.airgap,
-        mode: if enforcement_enabled {
-            "hosted"
-        } else {
-            "unconfigured"
-        }
-        .into(),
+        mode: "hosted".into(),
         runtime_state: None,
         installation_id: None,
         organization_id: None,
@@ -254,6 +333,7 @@ pub async fn get_license_status(
         recovery_required: false,
         components: Vec::new(),
         notice: None,
+        entitlement: LicenseEntitlementResponse::from_status(&status, now),
     }))
 }
 
@@ -307,14 +387,38 @@ async fn install(state: &AppState, body: &[u8]) -> Result<Json<LicenseStatusResp
             "C05 licence files must be 1 to {MAX_LICENSE_BYTES} bytes"
         )));
     }
+    // Read the canonical v2 fields from the same signed artifact the stateful
+    // authority admits. `import` repeats signature verification and owns the
+    // binding/revision/clock transition; this first pass only makes the signed
+    // commercial identity available to the shared TierSettings repository.
+    let verified = verify_production(body)
+        .map_err(|_| ApiError::BadRequest("Invalid or untrusted C05 licence file".into()))?;
+    let entitlement = nanosiem_core::Entitlement {
+        edition: nanosiem_core::EntitlementEdition::Licensed,
+        operator: match verified.policy.operator {
+            EntitlementOperator::SelfRun => nanosiem_core::EntitlementOperator::SelfRun,
+            EntitlementOperator::Hosted => nanosiem_core::EntitlementOperator::Hosted,
+        },
+        capacity_gb_per_day: verified
+            .policy
+            .capacity
+            .gb_per_day
+            .map(|value| value as f64),
+    };
     let view = state
         .sovereign_license
         .import(body)
         .await
         .map_err(entitlement_error)?;
+    nanosiem_core::TierSettings::new(state.pool.clone())
+        .set_entitlement(entitlement)
+        .await?;
     *state.license_status.write().await = cache_status(&view);
     *state.offline_license_snapshot.write().await = OfflineLicenseSnapshot::C05(view.clone());
-    Ok(Json(LicenseStatusResponse::offline(&view)))
+    Ok(Json(LicenseStatusResponse::offline(
+        &view,
+        state.config.airgap,
+    )))
 }
 
 #[utoipa::path(
@@ -367,14 +471,20 @@ pub async fn apply_clock_recovery(
         .map_err(entitlement_error)?;
     *state.license_status.write().await = cache_status(&view);
     *state.offline_license_snapshot.write().await = OfflineLicenseSnapshot::C05(view.clone());
-    Ok(Json(LicenseStatusResponse::offline(&view)))
+    Ok(Json(LicenseStatusResponse::offline(
+        &view,
+        state.config.airgap,
+    )))
 }
 
 fn ensure_offline_admin(state: &AppState, auth: &AuthContext) -> Result<(), ApiError> {
     ensure_permission(auth, permissions::SETTINGS_SYSTEM)?;
-    if !state.config.airgap || state.config.is_license_enabled() {
+    // Since v2, every enterprise install without an online licence tuple is
+    // admitted only by C05; requiring AIRGAP_MODE here left self-run installs
+    // locked with no way to install the licence that unlocks them (NAN-5086).
+    if !state.config.uses_c05_authority() {
         return Err(ApiError::Conflict(
-            "C05 files are accepted only by an offline AIRGAP_MODE deployment".into(),
+            "C05 files are accepted only by a deployment without an online licence".into(),
         ));
     }
     Ok(())
@@ -399,16 +509,103 @@ fn entitlement_error(error: EntitlementError) -> ApiError {
     }
 }
 
+/// NAN-5114: whether a newer nano release is available, from the last
+/// successful online licence check-in. Public facts only (version, links,
+/// security flag). Offline / air-gapped installs make no check-in, so they
+/// always answer `update_available: false` with no latest version.
+#[derive(Debug, Serialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct UpdateStatusResponse {
+    /// The version this API runs.
+    pub current_version: String,
+    pub update_available: bool,
+    pub latest_version: Option<String>,
+    /// The newest release includes security fixes; upgrading is recommended.
+    pub security_release: bool,
+    pub release_notes_url: Option<String>,
+    pub upgrade_url: Option<String>,
+}
+
+impl UpdateStatusResponse {
+    pub fn from_notice(
+        current_version: &str,
+        notice: Option<nanosiem_core::license::ReleaseNotice>,
+    ) -> Self {
+        let available = notice
+            .as_ref()
+            .is_some_and(|notice| notice.is_newer_than(current_version));
+        match notice.filter(|_| available) {
+            Some(notice) => Self {
+                current_version: current_version.into(),
+                update_available: true,
+                latest_version: Some(notice.latest_version),
+                security_release: notice.security_release,
+                release_notes_url: Some(notice.release_notes_url),
+                upgrade_url: Some(notice.upgrade_url),
+            },
+            None => Self {
+                current_version: current_version.into(),
+                update_available: false,
+                latest_version: None,
+                security_release: false,
+                release_notes_url: None,
+                upgrade_url: None,
+            },
+        }
+    }
+}
+
+/// Update availability for the admin "Update available" banner (NAN-5114).
+/// Exempt from the licence guard: a locked deployment must still learn that
+/// an upgrade exists.
+#[utoipa::path(
+    get,
+    path = "/api/license/update",
+    tag = "license",
+    responses(
+        (status = 200, description = "Update availability", body = UpdateStatusResponse),
+        (status = 403, description = "Requires settings:system", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn get_update_status(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<UpdateStatusResponse>, ApiError> {
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
+    let notice = if state.config.is_license_enabled() {
+        nanosiem_core::license::LicenseRepository::new(state.pool.clone())
+            .get_release_notice()
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "Release notice unavailable");
+                None
+            })
+    } else {
+        None
+    };
+    Ok(Json(UpdateStatusResponse::from_notice(
+        env!("CARGO_PKG_VERSION"),
+        notice,
+    )))
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
         get_license_status,
+        get_update_status,
         import_license,
         renew_license,
         create_clock_recovery_request,
         apply_clock_recovery
     ),
-    components(schemas(LicenseStatusResponse, ClockRecoveryRequest, ErrorResponse))
+    components(schemas(
+        LicenseStatusResponse,
+        LicenseEntitlementResponse,
+        UpdateStatusResponse,
+        ClockRecoveryRequest,
+        ErrorResponse
+    ))
 )]
 pub struct LicenseApiDoc;
 

@@ -651,6 +651,173 @@ pub fn ensure_audit_durability_findings(analysis: &mut AnalysisResult, metrics: 
     }
 }
 
+/// Security review 2026-11-08 (group B): insecure deployment settings that
+/// are still accepted in v2.0.x (a public install token, config delivery on
+/// the install token, development keys on a public deployment). Deterministic
+/// and emitted on every report path, like the audit-durability findings, and
+/// they cap the score the same way.
+pub fn ensure_deployment_posture_findings(
+    analysis: &mut AnalysisResult,
+    inputs: &crate::deployment_posture::PostureInputs,
+) {
+    for finding in crate::deployment_posture::posture_findings(inputs) {
+        let cap = match finding.priority {
+            "critical" => Some(49),
+            "high" => Some(79),
+            _ => None,
+        };
+        if let Some(cap) = cap {
+            analysis.overall_score = analysis.overall_score.min(cap);
+        }
+        if !analysis.recommendations.iter().any(|r| r.title == finding.title) {
+            analysis.recommendations.insert(
+                0,
+                Recommendation {
+                    title: finding.title,
+                    description: finding.description,
+                    priority: finding.priority.to_string(),
+                },
+            );
+        }
+    }
+}
+
+/// NAN-5032: surface log sources whose events are stored under a
+/// platform-owned source type. Deterministic; emitted on every report path
+/// (AI, fallback, Fresh), like the audit-durability findings.
+pub fn ensure_reserved_source_name_findings(
+    analysis: &mut AnalysisResult,
+    metrics: &CollectedMetrics,
+) {
+    for rec in reserved_source_name_recommendations(&metrics.reserved_source_names) {
+        if !analysis.recommendations.iter().any(|r| r.title == rec.title) {
+            analysis.recommendations.push(rec);
+        }
+    }
+}
+
+/// NAN-5032: findings for [`super::types::ReservedSourceNames`].
+pub fn reserved_source_name_recommendations(
+    names: &super::types::ReservedSourceNames,
+) -> Vec<Recommendation> {
+    let mut recs = Vec::new();
+    if !names.enforced.is_empty() {
+        recs.push(Recommendation {
+            title: format!(
+                "{} log source(s) use a source type reserved for nano's own records",
+                names.enforced.len()
+            ),
+            description: format!(
+                "Log source route key(s) {} collide with source types nano writes itself \
+                 (audit / findings records). Since v2.0.1 their events are stored as \
+                 `reserved_spoof` (the original value is kept as `claimed_source_type`) so \
+                 they can no longer appear as audit entries or detection findings. Rename \
+                 the source(s) and update their senders.",
+                names.enforced.join(", ")
+            ),
+            priority: "high".to_string(),
+        });
+    }
+    if !names.warn_only.is_empty() {
+        recs.push(Recommendation {
+            title: format!(
+                "{} log source(s) use a source type reserved for future platform use",
+                names.warn_only.len()
+            ),
+            description: format!(
+                "Log source route key(s) {} use a name nano reserves (`signal(s)`, `nano_*`). \
+                 They are still accepted in this release and will be rejected in a future \
+                 one. Rename the source(s) and update their senders.",
+                names.warn_only.join(", ")
+            ),
+            priority: "medium".to_string(),
+        });
+    }
+    recs
+}
+
+/// NAN-5077: IP allowlist rule-load failures, read from the system-health
+/// event bus (nanosiem-api / nanosiem-search publish them; this report runs
+/// in nanosiem-jobs). A failed load no longer opens the allowlist — it
+/// enforces the last-known rules, or refuses every non-loopback client when
+/// none were ever loaded — so the operator needs to know either way.
+/// Deterministic, on every report path.
+pub fn ip_allowlist_load_recommendations(
+    events: &[crate::system_health::SystemHealthEvent],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<Recommendation> {
+    let mut recs = Vec::new();
+    for event in events
+        .iter()
+        .filter(|e| e.dedup_key.starts_with(crate::ip_allowlist::LOAD_FAILED_DEDUP_PREFIX))
+    {
+        let component = match &event.resource_id {
+            Some(instance) => format!(
+                "{} ({instance})",
+                event.resource_name.as_deref().unwrap_or(&event.source)
+            ),
+            None => event.resource_name.clone().unwrap_or_else(|| event.source.clone()),
+        };
+        // A producer heartbeats an ongoing condition; one not seen for
+        // LOAD_FAILED_STALE_SECS belongs to a process that died mid-outage.
+        let live = event.status == "active"
+            && now.signed_duration_since(event.last_seen_at)
+                <= chrono::Duration::seconds(crate::ip_allowlist::LOAD_FAILED_STALE_SECS);
+        let (title, priority) = if live {
+            if event.severity == "critical" {
+                (
+                    format!("{component}: IP allowlist rules cannot be loaded — protected routes are refusing clients"),
+                    "critical",
+                )
+            } else {
+                (
+                    format!("{component}: IP allowlist rules cannot be refreshed — the last-known rules are enforced"),
+                    "high",
+                )
+            }
+        } else if now.signed_duration_since(event.last_seen_at) <= chrono::Duration::hours(24) {
+            (
+                format!("{component}: IP allowlist rule loading failed in the last 24 hours"),
+                "medium",
+            )
+        } else {
+            continue;
+        };
+        let mut description = event.summary.clone();
+        if let Some(remediation) = &event.remediation {
+            description.push(' ');
+            description.push_str(remediation);
+        }
+        recs.push(Recommendation {
+            title,
+            description,
+            priority: priority.into(),
+        });
+    }
+    recs
+}
+
+/// Insert the NAN-5077 allowlist findings and cap the score like the other
+/// deterministic security findings.
+pub fn ensure_ip_allowlist_findings(
+    analysis: &mut AnalysisResult,
+    events: &[crate::system_health::SystemHealthEvent],
+) {
+    for rec in ip_allowlist_load_recommendations(events, chrono::Utc::now()) {
+        let cap = match rec.priority.as_str() {
+            "critical" => Some(49),
+            "high" => Some(79),
+            _ => None,
+        };
+        if let Some(cap) = cap {
+            analysis.overall_score = analysis.overall_score.min(cap);
+        }
+        if !analysis.recommendations.iter().any(|r| r.title == rec.title) {
+            analysis.recommendations.insert(0, rec);
+        }
+    }
+}
+
 /// NAN-4954: security-critical audit events that are recorded in PostgreSQL
 /// but not yet in ClickHouse, and inline ClickHouse audit-write failures.
 /// Deterministic (no AI needed) and emitted on every report path, because an
@@ -862,6 +1029,16 @@ mod dict_memory_tests;
 #[cfg(test)]
 #[path = "audit_durability_tests.rs"]
 mod audit_durability_tests;
+#[cfg(test)]
+#[path = "reserved_source_names_tests.rs"]
+mod reserved_source_names_tests;
+#[cfg(test)]
+#[path = "deployment_posture_findings_tests.rs"]
+mod deployment_posture_findings_tests;
+
+#[cfg(test)]
+#[path = "ip_allowlist_findings_tests.rs"]
+mod ip_allowlist_findings_tests;
 
 #[cfg(test)]
 #[path = "analyzer_ingest_watchdog_tests.rs"]
@@ -1001,6 +1178,7 @@ mod tests {
                 coverage_gaps_7d_total: 0,
             },
             audit_durability: None,
+            reserved_source_names: Default::default(),
             alerting: AlertingMetrics {
                 total_alerts_24h: 0,
                 total_alerts_prior_24h: 0,

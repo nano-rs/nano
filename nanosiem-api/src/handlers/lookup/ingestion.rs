@@ -15,6 +15,7 @@ use tracing::info;
 use utoipa::ToSchema;
 
 use nanosiem_core::auth::permissions;
+use nanosiem_core::scheduler::MAX_CRON_PREVIEW_COUNT;
 use nanosiem_core::upload::{LookupMode, ParserConfig, UploadDestination};
 use nanosiem_core::{
     calculate_next_runs, describe_cron, merge_auth_headers, redact_auth_headers, validate_cron,
@@ -44,12 +45,16 @@ pub struct UpsertLookupIngestionRequest {
     pub mode: Option<LookupMode>,
 }
 
+/// Longest cron expression accepted for validation. Real expressions are
+/// under 100 bytes (six fields plus optional names and lists).
+pub const MAX_CRON_EXPRESSION_BYTES: usize = 1024;
+
 /// Request body for validating a cron expression
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ValidateCronRequest {
     /// Cron expression to validate
     pub expression: String,
-    /// Number of next run times to return (default: 5)
+    /// Number of next run times to return (default: 5, max: 100)
     pub preview_count: Option<usize>,
 }
 
@@ -383,13 +388,30 @@ pub async fn disable_lookup_ingestion(
     request_body = ValidateCronRequest,
     responses(
         (status = 200, description = "Validation result", body = ValidateCronResponse),
+        (status = 400, description = "preview_count above the maximum, or expression too long"),
+        (status = 403, description = "Missing lookup:view permission"),
     ),
     security(("api_key" = []))
 )]
 pub async fn validate_cron_expression(
+    Extension(auth): Extension<AuthContext>,
     Json(request): Json<ValidateCronRequest>,
 ) -> Result<Json<ValidateCronResponse>, ApiError> {
+    // Security review 2026-11-08 (NAN-5020): this was reachable by any
+    // authenticated principal with an unbounded `preview_count` driving a
+    // synchronous `upcoming().take(n).collect()` on an API worker.
+    ensure_permission(&auth, permissions::LOOKUP_VIEW)?;
     let preview_count = request.preview_count.unwrap_or(5);
+    if preview_count > MAX_CRON_PREVIEW_COUNT {
+        return Err(ApiError::BadRequest(format!(
+            "preview_count must be at most {MAX_CRON_PREVIEW_COUNT}"
+        )));
+    }
+    if request.expression.len() > MAX_CRON_EXPRESSION_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "Cron expression must be at most {MAX_CRON_EXPRESSION_BYTES} bytes"
+        )));
+    }
 
     match validate_cron(&request.expression) {
         Ok(()) => {
@@ -595,3 +617,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ingestion_cron_tests.rs"]
+mod cron_tests;

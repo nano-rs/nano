@@ -17,7 +17,14 @@
 # Collects metrics from all Vector components (sources, transforms, sinks)
 [sources.internal_metrics]
 type = "internal_metrics"
-scrape_interval_secs = 10      # More frequent scraping (was 15s)
+# NAN-5132: 1s. Every parser deploy/publish waits for nano-api (and, in role
+# split, each ingest host's config consumer) to see the reload's activation
+# marker in these metrics, and they are only exported when this source
+# scrapes: at 10s that added 1-11s to every deploy after Vector had already
+# reloaded. The only consumer is the pull-based prometheus_exporter below
+# (in memory, nothing is written or shipped per scrape), so a faster scrape
+# adds no rows or traffic anywhere.
+scrape_interval_secs = 1
 namespace = "nanosiem_vector"
 
 # Tags are added automatically by Vector

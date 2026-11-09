@@ -234,27 +234,38 @@ impl RetentionService {
             total_records: i64,
         }
 
-        let metadata = sqlx::query_as::<_, MetadataStats>(
-            r#"
+        // `detections` (a pre-ClickHouse table) no longer exists in any
+        // schema, and `cases` is enterprise-only; naming a missing relation
+        // failed the whole statement and the stats silently read as zero.
+        #[cfg(feature = "enterprise")]
+        let metadata_sql = r#"
             SELECT
                 LEAST(
                     (SELECT MIN(created_at) FROM alerts),
-                    (SELECT MIN(created_at) FROM detections),
                     (SELECT MIN(created_at) FROM cases)
                 ) as oldest,
                 GREATEST(
                     (SELECT MAX(created_at) FROM alerts),
-                    (SELECT MAX(created_at) FROM detections),
                     (SELECT MAX(created_at) FROM cases)
                 ) as newest,
                 (
                     (SELECT COUNT(*) FROM alerts) +
-                    (SELECT COUNT(*) FROM detections) +
                     (SELECT COUNT(*) FROM cases) +
                     (SELECT COUNT(*) FROM dashboards)
                 )::bigint as total_records
-            "#,
-        )
+            "#;
+        #[cfg(not(feature = "enterprise"))]
+        let metadata_sql = r#"
+            SELECT
+                (SELECT MIN(created_at) FROM alerts) as oldest,
+                (SELECT MAX(created_at) FROM alerts) as newest,
+                (
+                    (SELECT COUNT(*) FROM alerts) +
+                    (SELECT COUNT(*) FROM dashboards)
+                )::bigint as total_records
+            "#;
+
+        let metadata = sqlx::query_as::<_, MetadataStats>(metadata_sql)
         .fetch_one(&self.pool)
         .await
         .unwrap_or(MetadataStats {

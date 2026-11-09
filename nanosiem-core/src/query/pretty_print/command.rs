@@ -3,7 +3,7 @@
 //! Pretty-print implementation for commands.
 
 use super::super::ast::*;
-use super::helpers::{dataset_selector_str, format_duration};
+use super::helpers::{dataset_selector_str, format_duration, npl_name, npl_quoted_literal};
 use super::PrettyPrint;
 
 impl PrettyPrint for Command {
@@ -140,8 +140,8 @@ impl PrettyPrint for Command {
                 let field_strs = fields
                     .iter()
                     .map(|f| match &f.alias {
-                        Some(alias) => format!("{} as {}", f.name, alias),
-                        None => f.name.clone(),
+                        Some(alias) => format!("{} as {}", npl_name(&f.name), npl_name(alias)),
+                        None => npl_name(&f.name),
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -150,7 +150,7 @@ impl PrettyPrint for Command {
             Command::Rename { mappings } => {
                 let renames = mappings
                     .iter()
-                    .map(|m| format!("{} as {}", m.from, m.to))
+                    .map(|m| format!("{} as {}", npl_name(&m.from), npl_name(&m.to)))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("rename {}", renames)
@@ -193,7 +193,7 @@ impl PrettyPrint for Command {
             Command::Eval { assignments } => {
                 let assigns = assignments
                     .iter()
-                    .map(|a| format!("{} = {}", a.field, a.expression.pretty_print()))
+                    .map(|a| format!("{} = {}", npl_name(&a.field), a.expression.pretty_print()))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("eval {}", assigns)
@@ -382,7 +382,7 @@ impl PrettyPrint for Command {
                 result
             }
             Command::Fillnull { value, fields } => {
-                let mut result = format!("fillnull value=\"{}\"", value);
+                let mut result = format!("fillnull value={}", npl_quoted_literal(value));
                 if let Some(f) = fields {
                     result.push_str(&format!(" {}", f.join(", ")));
                 }
@@ -617,7 +617,7 @@ impl PrettyPrint for Command {
                 max_rows,
                 cache_ttl_secs,
             } => {
-                let mut parts = vec![format!("inputlookup url=\"{}\"", url.template)];
+                let mut parts = vec![format!("inputlookup url={}", npl_quoted_literal(&url.template))];
                 if *format != InputLookupFormat::Json {
                     parts.push(format!("format={}", format.as_str()));
                 }
@@ -650,7 +650,7 @@ impl PrettyPrint for Command {
                 if parent_field.is_empty() {
                     let mut parts = vec![format!("tree {}", child_field)];
                     if let Some(root) = root_filter {
-                        parts.push(format!("root=\"{}\"", root));
+                        parts.push(format!("root={}", npl_quoted_literal(root)));
                     }
                     return parts.join(" ");
                 }
@@ -667,7 +667,7 @@ impl PrettyPrint for Command {
                     parts.push(format!("prevalence={}", prevalence));
                 }
                 if let Some(root) = root_filter {
-                    parts.push(format!("root=\"{}\"", root));
+                    parts.push(format!("root={}", npl_quoted_literal(root)));
                 }
                 parts.join(" ")
             }
@@ -730,10 +730,10 @@ impl PrettyPrint for Command {
                     parts.push("show_mfa=true".to_string());
                 }
                 if let Some(p) = principal {
-                    parts.push(format!("principal=\"{}\"", p));
+                    parts.push(format!("principal={}", npl_quoted_literal(p)));
                 }
                 if let Some(a) = account {
-                    parts.push(format!("account=\"{}\"", a));
+                    parts.push(format!("account={}", npl_quoted_literal(a)));
                 }
                 parts.join(" ")
             }
@@ -794,7 +794,7 @@ impl PrettyPrint for Command {
             } => {
                 let mut parts = vec!["baseline".to_string()];
                 if let (Some(t), Some(v)) = (entity_type, entity_value) {
-                    parts.push(format!("{}=\"{}\"", t, v));
+                    parts.push(format!("{}={}", t, npl_quoted_literal(v)));
                 }
                 let default_window = std::time::Duration::from_secs(7 * 24 * 3600);
                 if *window != default_window {

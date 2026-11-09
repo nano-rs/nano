@@ -26,6 +26,8 @@ pub mod cookies;
 pub mod grant_authz;
 pub mod headers;
 pub mod pagination;
+pub mod panic_isolation;
+pub mod request_id;
 pub mod source_inventory;
 pub mod sse;
 
@@ -39,7 +41,9 @@ pub use cookies::{
     build_access_token_cookie, build_refresh_token_cookie, clear_access_token_cookie,
     clear_refresh_token_cookie, extract_refresh_token_cookie,
 };
-pub use headers::{extract_client_ip, extract_user_agent};
+pub use headers::{
+    extract_client_ip, extract_client_ip_origin, extract_user_agent, ClientIp, ClientIpHeader,
+};
 pub use pagination::Pagination;
 pub use source_inventory::{
     ensure_source_inventory_access, permits_source_inventory, SOURCE_INVENTORY_CAPS,

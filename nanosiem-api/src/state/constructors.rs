@@ -5,35 +5,35 @@ use super::{AppState, TaskRegistry};
 
 use nanosiem_core::audit::{AuditEmitter, AuditQueryService};
 use nanosiem_core::auth::source_scope_resolver::SourceScopeResolver;
+#[cfg(feature = "enterprise")]
 use nanosiem_core::auth::{OidcRepository, OidcService};
 use nanosiem_core::db::repository::SourceScopeRepository;
-#[cfg(feature = "enterprise")]
-use nanosiem_enterprise::cases::ShadowInvestigationService;
 use nanosiem_core::db::{ClickHouseMigrator, DualPool, DualPoolConfig, DualPoolError};
-use nanosiem_core::detection::{
-    MaterializedViewGenerator, SignalProcessor, SignalProcessorConfig,
-};
+use nanosiem_core::detection::{MaterializedViewGenerator, SignalProcessor, SignalProcessorConfig};
 use nanosiem_core::enrichment::{EnrichmentRepository, EnrichmentService};
 use nanosiem_core::identity::{IdentityRepository, IdentitySyncService};
 use nanosiem_core::inputlookup::{InputLookupConfig, InputLookupService};
 use nanosiem_core::lookup::LookupService;
+use nanosiem_core::onboarding::OnboardingRepository;
+use nanosiem_core::prevalence::PrevalenceService;
+#[cfg(feature = "enterprise")]
+use nanosiem_core::tuning::{NotificationService, TuningRepository};
+use nanosiem_core::{
+    generate_node_id, DetectionService, DiskPressureConfig, DiskPressureService, FeedService,
+    IpAllowlistService, LogSourceService, LogTelemetryService, ParserService,
+    QueryLibraryRepository, SearchService, SourceConfigService,
+};
+#[cfg(feature = "enterprise")]
+use nanosiem_enterprise::cases::ShadowInvestigationService;
 #[cfg(feature = "enterprise")]
 use nanosiem_enterprise::melod::{
     AgentConfigRegistry, MelodJobRepository, MelodService, MelodSessionRepository,
     WizardSessionRepository,
 };
-use nanosiem_core::onboarding::OnboardingRepository;
-use nanosiem_core::prevalence::PrevalenceService;
-use nanosiem_core::tuning::{NotificationService, TuningRepository};
-use nanosiem_core::{
-    DetectionService, DiskPressureConfig, DiskPressureService, FeedService, IpAllowlistService,
-    LogSourceService, LogTelemetryService, ParserService, QueryLibraryRepository, SearchService,
-    SourceConfigService, generate_node_id,
-};
 #[cfg(feature = "enterprise")]
 use nanosiem_enterprise::risk::RiskAnalyticsService;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::config::ApiConfig;
@@ -55,6 +55,9 @@ impl AppState {
                 dual_pool.clickhouse().clone(),
             ),
         );
+        #[cfg(feature = "enterprise")]
+        let license_status =
+            Arc::new(RwLock::new(nanosiem_core::license::LicenseStatus::default()));
         // NAN-4955: first-party repository reads (GitHubClient, marketplace
         // sync) are served from installed nano content channels in this
         // process, never from GitHub.
@@ -70,8 +73,10 @@ impl AppState {
         // feed (the dict payload + browse/lookup/stats reads + soft-delete
         // writes) is ClickHouse-backed, so the repo needs the CH client. PG is
         // retained for identity_providers config/creds.
-        let identity_repo =
-            IdentityRepository::new_with_clickhouse(pg_pool.clone(), dual_pool.clickhouse().clone());
+        let identity_repo = IdentityRepository::new_with_clickhouse(
+            pg_pool.clone(),
+            dual_pool.clickhouse().clone(),
+        );
         // NAN-1151: the identity-sync scheduler runs in this service, so the
         // enrichment-lane client is built from this process's env
         // (VECTOR_ENRICH_URL / VECTOR_AUTH_TOKEN — provisioned in api.yaml +
@@ -132,18 +137,22 @@ impl AppState {
         let local_auth_settings =
             nanosiem_core::settings::local_auth::LocalAuthSettings::new(pg_pool.clone());
 
-        // Create OIDC repository and service
+        // Create OIDC repository and service.
+        #[cfg(feature = "enterprise")]
         let oidc_repo = OidcRepository::new(pg_pool.clone());
+        #[cfg(feature = "enterprise")]
         let oidc_service = Arc::new(OidcService::new(
             oidc_repo.clone(),
             user_repo.clone(),
             group_repo.clone(),
         ));
 
-        // Create notification service for tuning alerts
+        // Create notification service for tuning alerts.
+        #[cfg(feature = "enterprise")]
         let notification_service = Arc::new(NotificationService::new(pg_pool.clone()));
 
         // Create tuning repository for proposal management
+        #[cfg(feature = "enterprise")]
         let tuning_repository = Arc::new(TuningRepository::new(pg_pool.clone()));
 
         // Create detection service with prevalence support (needed for materialized views).
@@ -213,14 +222,21 @@ impl AppState {
         #[cfg(feature = "enterprise")]
         let risk_service = RiskAnalyticsService::with_dual_pool(&dual_pool);
         #[cfg(feature = "enterprise")]
-        search_service.set_cloud_risk(Arc::new(risk_service.clone()));
+        search_service.set_cloud_risk(Arc::new(
+            crate::license_admission::LicensedCloudRiskProvider::new(
+                Arc::new(risk_service.clone()),
+                license_status.clone(),
+            ),
+        ));
         // NAN-4926: `dataset=risk` binds the watchlist weights (enterprise).
         #[cfg(feature = "enterprise")]
         search_service.set_risk_score_weights_source(
             dual_pool.postgres().clone(),
-            Arc::new(nanosiem_enterprise::risk::score_weights_source::WatchlistScoreWeights::new(
-                dual_pool.postgres().clone(),
-            )),
+            Arc::new(
+                nanosiem_enterprise::risk::score_weights_source::WatchlistScoreWeights::new(
+                    dual_pool.postgres().clone(),
+                ),
+            ),
         );
 
         // Create melod_service Arc (initialized as None, reloaded later in reload_melod_service).
@@ -247,12 +263,11 @@ impl AppState {
         // detection_service.
         #[cfg(feature = "enterprise")]
         let shadow_investigation = {
-            let shadow_ai_client: Arc<dyn nanosiem_core::extensions::AiClient> = Arc::new(
-                nanosiem_enterprise::melod::MelodAiClientBridge::live(
+            let shadow_ai_client: Arc<dyn nanosiem_core::extensions::AiClient> =
+                Arc::new(nanosiem_enterprise::melod::MelodAiClientBridge::live(
                     melod_service.clone(),
                     agent_config_registry.clone(),
-                ),
-            );
+                ));
             let svc = Arc::new(
                 ShadowInvestigationService::new(
                     pg_pool.clone(),
@@ -262,18 +277,6 @@ impl AppState {
                 )
                 .with_audit_emitter(AuditEmitter::new(dual_pool.clone())),
             );
-
-            // NAN-1490: on boot, sweep for shadow investigations that were
-            // `running` when the previous process died and resume them from
-            // their last checkpoint (no credit re-charge). NAN-1488: also sweep
-            // re-triage coordination rows that were left DUE across the restart
-            // (orphaned with no further alert adds) and spawn a worker per due
-            // case. Both are fire-and-forget so startup isn't blocked on them.
-            let sweep = svc.clone();
-            tokio::spawn(async move {
-                sweep.resume_interrupted().await;
-                sweep.sweep_due_coordination().await;
-            });
 
             svc
         };
@@ -285,10 +288,24 @@ impl AppState {
         // (case_id stayed NULL). NAN-872 restores the wiring. Open-core
         // builds keep `NoopCaseGroupingHook` on all three services.
         #[cfg(feature = "enterprise")]
-        let case_grouping_hook = nanosiem_enterprise::cases::case_grouping_hook(
-            pg_pool.clone(),
-            dual_pool.clone(),
-            shadow_investigation.clone(),
+        let case_grouping_hook: Arc<dyn nanosiem_core::extensions::CaseGroupingHook> =
+            Arc::new(crate::license_admission::LicensedCaseGroupingHook::new(
+                nanosiem_enterprise::cases::case_grouping_hook(
+                    pg_pool.clone(),
+                    dual_pool.clone(),
+                    shadow_investigation.clone(),
+                ),
+                license_status.clone(),
+            ));
+
+        #[cfg(feature = "enterprise")]
+        let licensed_shadow_investigation: Arc<
+            dyn nanosiem_core::extensions::ShadowInvestigationHook,
+        > = Arc::new(
+            crate::license_admission::LicensedShadowInvestigationHook::new(
+                shadow_investigation.clone(),
+                license_status.clone(),
+            ),
         );
 
         // Create signal processor; in enterprise also wire shadow investigation
@@ -306,7 +323,7 @@ impl AppState {
                 ));
             #[cfg(feature = "enterprise")]
             let sp = sp
-                .with_shadow_investigation(shadow_investigation.clone())
+                .with_shadow_investigation(licensed_shadow_investigation.clone())
                 .with_case_grouping(case_grouping_hook.clone());
             Arc::new(sp)
         };
@@ -315,7 +332,7 @@ impl AppState {
         // (enterprise only).
         #[cfg(feature = "enterprise")]
         let detection_service = detection_service
-            .with_shadow_investigation(shadow_investigation.clone())
+            .with_shadow_investigation(licensed_shadow_investigation.clone())
             .with_case_grouping(case_grouping_hook.clone());
 
         // Trait-object form of the shadow hook stored on AppState so handler-
@@ -325,7 +342,7 @@ impl AppState {
         let shadow_investigation_hook: Arc<dyn nanosiem_core::extensions::ShadowInvestigationHook> = {
             #[cfg(feature = "enterprise")]
             {
-                shadow_investigation
+                licensed_shadow_investigation
             }
             #[cfg(not(feature = "enterprise"))]
             {
@@ -356,15 +373,11 @@ impl AppState {
         // read-mutate-write of `_router.toml` can interleave and the
         // later writer clobbers the earlier one's changes.
         let vector_config_dir = get_vector_config_dir();
-        let parser_service = ParserService::with_vector_config_dir(
-            pg_pool.clone(),
-            &vector_config_dir,
-        );
-        let source_config_service = SourceConfigService::with_vector_config_dir(
-            pg_pool.clone(),
-            &vector_config_dir,
-        )
-        .with_deploy_lock(parser_service.deploy_lock());
+        let parser_service =
+            ParserService::with_vector_config_dir(pg_pool.clone(), &vector_config_dir);
+        let source_config_service =
+            SourceConfigService::with_vector_config_dir(pg_pool.clone(), &vector_config_dir)
+                .with_deploy_lock(parser_service.deploy_lock());
 
         // NAN-2297: taken before the struct literal below moves `parser_service`.
         let shared_vector_config = parser_service.vector_config();
@@ -432,7 +445,9 @@ impl AppState {
             wizard_session_repo: WizardSessionRepository::new(pg_pool.clone()),
             #[cfg(feature = "enterprise")]
             melod_session_repo: MelodSessionRepository::new(pg_pool.clone()),
-            ip_allowlist_service: Arc::new(IpAllowlistService::new(pg_pool.clone())),
+            ip_allowlist_service: Arc::new(
+                IpAllowlistService::new(pg_pool.clone()).with_component("nanosiem-api"),
+            ),
             ingest_token_service: Arc::new(nanosiem_core::ingest_tokens::IngestTokenService::new(
                 pg_pool.clone(),
             )),
@@ -454,10 +469,14 @@ impl AppState {
             role_repo,
             source_scope_repo,
             source_scope_resolver,
+            #[cfg(feature = "enterprise")]
             oidc_repo,
+            #[cfg(feature = "enterprise")]
             oidc_service,
             auth_enabled,
+            #[cfg(feature = "enterprise")]
             notification_service,
+            #[cfg(feature = "enterprise")]
             tuning_repository,
             task_registry: TaskRegistry::default(),
             // Audit emitter and query service for ClickHouse audit logging
@@ -474,7 +493,7 @@ impl AppState {
             identity_service,
             demo_service: None,
             #[cfg(feature = "enterprise")]
-            license_status: Arc::new(RwLock::new(nanosiem_core::license::LicenseStatus::default())),
+            license_status,
             #[cfg(feature = "enterprise")]
             offline_license_snapshot: Arc::new(RwLock::new(
                 crate::license_admission::OfflineLicenseSnapshot::default(),
@@ -486,6 +505,8 @@ impl AppState {
             case_events_tx,
             #[cfg(feature = "enterprise")]
             presence_tracker: Arc::new(nanosiem_enterprise::PresenceTracker::new()),
+            #[cfg(feature = "enterprise")]
+            shadow_investigation_service: shadow_investigation,
             marketplace_coverage_cache: Arc::new(
                 nanosiem_core::marketplace::MarketplaceCoverageCache::new(),
             ),
@@ -526,32 +547,93 @@ impl AppState {
                 &overlay_migrator,
                 "enterprise overlay",
             )
-                .await
-                .map_err(|error| DualPoolError::PostgresSchemaBehind(error.to_string()))?;
+            .await
+            .map_err(|error| DualPoolError::PostgresSchemaBehind(error.to_string()))?;
         }
         tracing::info!("PostgreSQL schema version OK");
 
-        // Apply tier from NANO_TIER environment variable if set
-        if let Ok(tier_str) = std::env::var("NANO_TIER") {
-            if let Ok(tier) = tier_str.parse::<nanosiem_core::OrganizationTier>() {
-                let tier_settings = nanosiem_core::TierSettings::new(pg_pool.clone());
-                match tier_settings.set_tier(tier).await {
-                    Ok(limits) => tracing::info!(
-                        tier = %tier,
-                        max_data_sources = ?limits.max_data_sources,
-                        max_detection_rules = ?limits.max_detection_rules,
-                        max_team_members = ?limits.max_team_members,
-                        "Organization tier set from NANO_TIER env var"
-                    ),
-                    Err(e) => tracing::warn!(error = %e, "Failed to apply NANO_TIER env var"),
+        // Reconcile the persisted row to the v2 product identity on every boot.
+        // NANO_TIER remains a compatibility input during the support window;
+        // its retired name contributes only historical capacity metadata.
+        let tier_settings = nanosiem_core::TierSettings::new(pg_pool.clone());
+        let stored = tier_settings
+            .get_tier_limits()
+            .await
+            .map_err(|error| DualPoolError::PostgresHealthCheckError(error.to_string()))?;
+        let legacy_capacity = match std::env::var("NANO_TIER") {
+            Ok(value) => match value.parse::<nanosiem_core::OrganizationTier>() {
+                Ok(tier) => {
+                    nanosiem_core::Entitlement::from_legacy_tier(
+                        tier,
+                        nanosiem_core::EntitlementOperator::SelfRun,
+                    )
+                    .capacity_gb_per_day
                 }
+                Err(_) => {
+                    tracing::warn!(
+                        tier = %value,
+                        "Ignoring invalid compatibility NANO_TIER value"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        let provisioned_capacity = match std::env::var(nanosiem_core::CAPACITY_GB_PER_DAY_ENV) {
+            Ok(value) if value.trim().is_empty() => None,
+            Ok(value) => match nanosiem_core::parse_capacity_gb_per_day(&value) {
+                Some(capacity) => Some(capacity),
+                None => {
+                    tracing::warn!(
+                        value = %value,
+                        "Ignoring invalid NANO_CAPACITY_GB_PER_DAY; expected a positive finite number"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        let entitlement = nanosiem_core::Entitlement {
+            edition: if cfg!(feature = "enterprise") {
+                nanosiem_core::EntitlementEdition::Licensed
             } else {
-                tracing::warn!(
-                    tier = %tier_str,
-                    "Invalid NANO_TIER value. Valid options: unrestricted, hobby, startup, growth, team, starter, pro, enterprise"
-                );
-            }
+                nanosiem_core::EntitlementEdition::Open
+            },
+            // A signed air-gap licence is authoritative for its operator. All
+            // other installs derive the value from platform provisioning; an
+            // API caller cannot rewrite it later to evade hosted AI metering.
+            operator: if !cfg!(feature = "enterprise") {
+                nanosiem_core::EntitlementOperator::SelfRun
+            } else if config.airgap {
+                stored.entitlement.operator
+            } else {
+                config.deployment_mode.entitlement_operator()
+            },
+            capacity_gb_per_day: provisioned_capacity
+                .or(legacy_capacity)
+                .or(stored.entitlement.capacity_gb_per_day),
+        };
+        let limits = tier_settings
+            .set_entitlement(entitlement)
+            .await
+            .map_err(|error| DualPoolError::PostgresHealthCheckError(error.to_string()))?;
+        // NAN-5055: only the online licence check-in may grant an AI
+        // allowance. When it is not the admission authority (open build,
+        // C05/air-gap, no or partial tuple), clear any grant a previous
+        // online configuration left behind so it cannot outlive its source.
+        if !cfg!(feature = "enterprise") || !matches!(config.online_license_config(), Ok(Some(_))) {
+            tier_settings
+                .set_granted_ai_credits(None)
+                .await
+                .map_err(|error| DualPoolError::PostgresHealthCheckError(error.to_string()))?;
         }
+        tracing::info!(
+            offering = limits.entitlement.offering_name(),
+            edition = %limits.entitlement.edition,
+            operator = %limits.entitlement.operator,
+            capacity_gb_per_day = ?limits.entitlement.capacity_gb_per_day,
+            "Reconciled v2 entitlement"
+        );
 
         // ClickHouse schema is managed out-of-process by the clickhouse_migrator
         // binary (NAN-607): K8s pre-deploy Job, or the docker-compose
@@ -679,8 +761,12 @@ impl AppState {
                 )
                 .await
                 {
-                    Ok(n) => tracing::info!(table = %local_table, live_hints = n, "OCSF event JSON type hints detected"),
-                    Err(e) => tracing::warn!(table = %local_table, error = %e, "OCSF event JSON hint probe failed; using the parity form"),
+                    Ok(n) => {
+                        tracing::info!(table = %local_table, live_hints = n, "OCSF event JSON type hints detected")
+                    }
+                    Err(e) => {
+                        tracing::warn!(table = %local_table, error = %e, "OCSF event JSON hint probe failed; using the parity form")
+                    }
                 }
             }
         }
@@ -698,7 +784,7 @@ impl AppState {
 
         // Swap the in-process presence tracker + marketplace coverage cache
         // for Redis-backed versions so cross-replica state is consistent.
-        // Dragonfly is deployed alongside the API in prod; both fall back
+        // Valkey is deployed alongside the API in prod; both fall back
         // to their disabled/in-memory variants if Redis is unreachable.
         //
         // - PresenceTracker — see NAN-420.
@@ -718,7 +804,7 @@ impl AppState {
                     )
                     .await,
                 );
-                // NAN-702: same Dragonfly powers the panel-query result cache
+                // NAN-702: same Valkey powers the panel-query result cache
                 // so dashboard refreshes hit the same compressed responses the
                 // search HTTP handler caches.
                 state.search_result_cache =
@@ -730,7 +816,7 @@ impl AppState {
                     "Cross-replica caches and rule-test admission initialized with Redis"
                 );
 
-                // NAN-682: wire the same Dragonfly into the JWT JTI denylist
+                // NAN-682: wire the same Valkey into the JWT JTI denylist
                 // so logout-driven revocations propagate across API replicas.
                 // Both `token_service` and the AuthService's internal copy
                 // share the local DashMap denylist already; here we additionally

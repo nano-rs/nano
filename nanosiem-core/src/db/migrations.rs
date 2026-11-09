@@ -951,4 +951,60 @@ mod tests {
             available.extend(created);
         }
     }
+
+    /// NAN-5056: a table that a post-baseline OPEN migration creates is, by
+    /// definition, open schema. If the snapshot splitter still lists it in
+    /// `ENTERPRISE_TABLES`, the next `000_open_init.sql` regeneration strips it
+    /// again while the creating migration stays marked applied — the exact
+    /// drift that hid `match_reviews` and `siem_health_finding_suppressions`
+    /// from every fresh open install.
+    ///
+    /// The splitter is stripped from the public mirror, so only a genuinely
+    /// absent file skips the check.
+    #[test]
+    fn tables_created_by_open_migrations_are_not_split_as_enterprise() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/nan749_split_open_overlay.py");
+        let splitter = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping: snapshot splitter absent (stripped mirror)");
+                return;
+            }
+            Err(err) => panic!("read {path}: {err}"),
+        };
+        let start = splitter
+            .find("ENTERPRISE_TABLES = {")
+            .expect("splitter declares ENTERPRISE_TABLES");
+        let end = start + splitter[start..].find("\n}").expect("ENTERPRISE_TABLES set closes");
+        let block: String = splitter[start..end]
+            .lines()
+            .map(|line| line.split('#').next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let enterprise: std::collections::HashSet<String> = regex::Regex::new(r#""([a-z_][a-z0-9_]*)""#)
+            .unwrap()
+            .captures_iter(&block)
+            .map(|c| c[1].to_string())
+            .collect();
+        assert!(
+            enterprise.contains("tuning_notifications"),
+            "ENTERPRISE_TABLES parse returned an implausible set: {enterprise:?}"
+        );
+
+        let migrator = sqlx::migrate!("../migrations/postgres");
+        let mut restored = std::collections::BTreeSet::new();
+        for m in migrator.iter().filter(|m| m.version > OPEN_INIT_BASELINE_VERSION) {
+            for table in created_tables(&m.sql) {
+                if enterprise.contains(&table) {
+                    restored.insert(format!("{} (core {})", table, m.version));
+                }
+            }
+        }
+        assert!(
+            restored.is_empty(),
+            "open migrations create tables the snapshot splitter would strip as enterprise: \
+             {restored:?}. Remove them from ENTERPRISE_TABLES in \
+             tools/nan749_split_open_overlay.py."
+        );
+    }
 }

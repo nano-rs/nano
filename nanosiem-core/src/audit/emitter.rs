@@ -550,7 +550,9 @@ impl AuditEmitter {
         client: &clickhouse::Client,
         events: &[AuditEvent],
     ) -> Result<(), AuditEmitError> {
-        let ocsf_table = self.dual_pool.table_names().local("ocsf_logs_raw");
+        // NAN-5032: the platform-only landing (ocsf/193). `ocsf_logs_raw`, the
+        // INGEST landing, rewrites `audit` to `reserved_spoof`.
+        let ocsf_table = self.dual_pool.table_names().local("ocsf_logs_system_raw");
         // NAN-4939: omit the storage timestamp. Migration ocsf/190 derives and
         // clamps it from event.time, while the OCSF payload keeps the exact
         // occurred_at value for audit semantics and provenance.

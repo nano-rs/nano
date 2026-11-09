@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use super::LogSourceService;
 use super::LogSourceServiceError;
+use crate::parsers::vector_config_remote_delivery::with_delivery_note;
 use crate::parsers::VrlValidator;
 use crate::log_sources::types::{
     DeploymentAction, DeploymentResult, DeploymentStatus, LogSourceDeployment, VrlValidationResult,
@@ -381,6 +382,32 @@ impl LogSourceService {
             // failed, which is the one outcome that needs a human. Preserved as
             // a hard error (it was `RollbackFailed` before) rather than folded
             // into the generic failure result.
+            // NAN-5133 review M2: role split, published but no ingest host
+            // confirmed it. Nothing to roll back; report it as not live.
+            let unconfirmed = matches!(
+                failure.error,
+                crate::parsers::VectorConfigError::ReloadUnconfirmed(_)
+            );
+            if unconfirmed {
+                let _ = self
+                    .repository()
+                    .record_deployment(
+                        id,
+                        DeploymentAction::Deploy.as_str(),
+                        DeploymentStatus::Failed.as_str(),
+                        Some(&error_msg),
+                        None,
+                    )
+                    .await;
+                return Ok(DeploymentResult {
+                    success: false,
+                    log_source_id: id,
+                    action: DeploymentAction::Deploy.as_str().to_string(),
+                    message: error_msg.clone(),
+                    validation_result: None,
+                    deployment_id: None,
+                });
+            }
             if !failure.rolled_back && backup.is_some() {
                 let error_msg = format!("Reload failed and rollback also failed: {}", error_msg);
                 let _ = self
@@ -468,7 +495,10 @@ impl LogSourceService {
             success: true,
             log_source_id: id,
             action: DeploymentAction::Deploy.as_str().to_string(),
-            message: format!("Log source '{}' deployed successfully", log_source.name),
+            message: with_delivery_note(format!(
+                "Log source '{}' deployed successfully",
+                log_source.name
+            )),
             validation_result: None,
             deployment_id: Some(deployment_id),
         })

@@ -16,10 +16,26 @@ import type {
   NamespaceValidationResult,
 } from './types';
 
+/**
+ * NAN-5131: deploy/undeploy/publish render the Vector config synchronously and
+ * take 90 s+ on a small host. The edge gives these routes 300 s; the client
+ * waits a little longer so the edge's answer (not a client abort) is shown.
+ */
+export const DEPLOY_REQUEST_TIMEOUT_MS = 310_000;
+/** A request with an explicit client timeout. */
+export type LongRequest = <T>(endpoint: string, options: RequestInit, timeoutMs: number) => Promise<T>;
+
 export class LogSourcesApi {
   constructor(
-    private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>
+    private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>,
+    private longRequest?: LongRequest,
   ) {}
+
+  private deployRequest<T>(endpoint: string, options: RequestInit): Promise<T> {
+    return this.longRequest
+      ? this.longRequest<T>(endpoint, options, DEPLOY_REQUEST_TIMEOUT_MS)
+      : this.request<T>(endpoint, options);
+  }
 
   async listLogSources(): Promise<LogSource[]> {
     return this.request('/api/log-sources');
@@ -94,19 +110,19 @@ export class LogSourcesApi {
   }
 
   async deployLogSource(id: string): Promise<EnhancedDeploymentResponse> {
-    return this.request(`/api/log-sources/${id}/deploy`, {
+    return this.deployRequest(`/api/log-sources/${id}/deploy`, {
       method: 'POST',
     });
   }
 
   async undeployLogSource(id: string): Promise<EnhancedDeploymentResponse> {
-    return this.request(`/api/log-sources/${id}/undeploy`, {
+    return this.deployRequest(`/api/log-sources/${id}/undeploy`, {
       method: 'POST',
     });
   }
 
   async deployAllLogSources(): Promise<{ deployed: boolean }> {
-    return this.request('/api/log-sources/deploy-all', {
+    return this.deployRequest('/api/log-sources/deploy-all', {
       method: 'POST',
     });
   }
@@ -150,7 +166,7 @@ export class LogSourcesApi {
    * refuse with 409 unless the working copy is still the reviewed revision.
    */
   async publishLogSource(id: string, expectedUpdatedAt?: string): Promise<EnhancedDeploymentResponse> {
-    return this.request(`/api/log-sources/${id}/publish`, {
+    return this.deployRequest(`/api/log-sources/${id}/publish`, {
       method: 'POST',
       ...(expectedUpdatedAt
         ? { body: JSON.stringify({ expected_updated_at: expectedUpdatedAt }) }

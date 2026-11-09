@@ -213,7 +213,10 @@ async fn parser_and_router_files_are_env_escaped() {
     // escaped, `$` intact after substitution) and is valid TOML.
     let router = load(&mgr.parsers_dir().join("_router.toml"));
     let cond = router["transforms"]["source_router"]["route"]["leaky"].as_str().unwrap();
-    assert_eq!(cond, ".source_type == \"k'ey$HOME\\\"x\"");
+    // NAN-5033: the shared VRL literal escape also writes `'` as `\'` (a run
+    // of three would close a triple-quoted remap literal); VRL unescapes it
+    // back to `'`, so the matched value is unchanged.
+    assert_eq!(cond, ".source_type == \"k\\'ey$HOME\\\"x\"");
 }
 
 /// The staged writer escapes exactly like the active one (promotion copies the

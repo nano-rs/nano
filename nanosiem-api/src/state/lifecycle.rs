@@ -57,10 +57,9 @@ async fn shutdown_task_handles(
 }
 
 impl AppState {
-    /// Keep a licensed worker group aligned with the current signed component
-    /// set. C05 renewals are hot, so a one-time startup check is insufficient:
-    /// workers must stop when their component is removed and start when it is
-    /// subsequently granted.
+    /// Keep a licensed-only worker group aligned with live admission. C05
+    /// renewals and online checks are hot, so a one-time startup decision is
+    /// insufficient: workers stop at hard expiry and resume after renewal.
     #[cfg(feature = "enterprise")]
     pub fn start_component_worker_supervisor<F>(
         &self,
@@ -87,17 +86,16 @@ impl AppState {
                     _ = interval.tick() => {}
                 }
 
-                let allowed = state
-                    .offline_license_snapshot
-                    .read()
-                    .await
-                    .allows_worker(capability);
+                let allowed = crate::license_admission::licensed_features_available(
+                    &*state.license_status.read().await,
+                    chrono::Utc::now(),
+                );
                 if !allowed {
                     if !workers.is_empty() {
                         tracing::warn!(
                             worker_group = name,
                             ?capability,
-                            "Stopping workers removed by signed licence components"
+                            "Stopping licensed workers at licence hard stop"
                         );
                         abort_component_workers(&mut workers).await;
                     }
@@ -308,6 +306,28 @@ impl AppState {
         })
     }
 
+    /// Recover case investigations that were interrupted by a prior process
+    /// and sweep due re-triage coordination rows. This is a licensed worker:
+    /// callers must place it inside the case component supervisor so it never
+    /// starts before admission and is aborted at hard expiry.
+    #[cfg(feature = "enterprise")]
+    pub fn start_shadow_investigation_recovery(&self) -> tokio::task::JoinHandle<()> {
+        let service = self.shadow_investigation_service.clone();
+
+        tokio::spawn(async move {
+            // NAN-1490: resume from the durable checkpoint without recharging
+            // credit. NAN-1488: also recover orphaned DUE coordination rows.
+            service.resume_interrupted().await;
+            service.sweep_due_coordination().await;
+
+            // The component supervisor owns persistent worker handles and
+            // treats an early return as a crashed group. Recovery is one-shot,
+            // but its admitted task stays alive until hard stop/shutdown aborts
+            // the whole case group.
+            std::future::pending::<()>().await;
+        })
+    }
+
     /// Start leader-only schedulers (signal processor, enrichment, tuning, disk pressure).
     ///
     /// Detection rules and scheduled jobs are now distributed (SKIP LOCKED) and
@@ -375,23 +395,32 @@ impl AppState {
             // sandbox runtime + scheduler live in nanosiem-enterprise).
             #[cfg(feature = "enterprise")]
             {
-                handles.push(self.start_custom_enrichment_scheduler());
-                tracing::info!("Custom enrichment scheduler started (leader-only)");
-
-                // Collector scheduler (NAN-2189) — pulls SaaS events into the
-                // ingest lane. Sits under the egress gate deliberately: a
-                // collector's whole job is reaching a vendor API, so it has no
-                // meaning in an air-gapped install.
                 handles.push(self.start_component_worker_supervisor(
-                    crate::license_admission::WorkerCapability::Ingest,
-                    "leader_ingest",
+                    crate::license_admission::WorkerCapability::Collectors,
+                    "leader_custom_enrichment",
+                    |state| vec![state.start_custom_enrichment_scheduler()],
+                ));
+
+                // Collector execution is enterprise-only even though its
+                // output is delivered into the open ingest lane.
+                handles.push(self.start_component_worker_supervisor(
+                    crate::license_admission::WorkerCapability::Collectors,
+                    "leader_collectors",
                     |state| vec![state.start_collector_scheduler()],
                 ));
             }
 
-            // Identity provider sync scheduler
+            // Identity-provider sync is licensed in enterprise builds. Keep
+            // the open-build scheduler wiring unchanged for its core stubs.
+            #[cfg(feature = "enterprise")]
+            handles.push(self.start_component_worker_supervisor(
+                crate::license_admission::WorkerCapability::Sso,
+                "leader_sso",
+                |state| vec![state.start_identity_sync_scheduler()],
+            ));
+            #[cfg(not(feature = "enterprise"))]
             handles.push(self.start_identity_sync_scheduler());
-            tracing::info!("Identity sync scheduler started (leader-only)");
+            tracing::info!("Identity sync scheduler registered (leader-only)");
 
             // Repository auto-sync schedulers. Both reconcile the first-party
             // nano-rs catalogs (NAN-4940) and sync at once; rules are staggered
@@ -492,11 +521,6 @@ impl AppState {
             "leader_pivt",
             AppState::start_tuning_scheduler,
         ));
-        #[cfg(not(feature = "enterprise"))]
-        {
-            handles.extend(self.start_tuning_scheduler());
-            tracing::info!("Tuning scheduler started (leader-only)");
-        }
 
         // Disk pressure scheduler
         handles.push(Arc::clone(&self.disk_pressure_service).start(self.leader_fence.clone()));
@@ -546,28 +570,47 @@ impl AppState {
         // runners that died holding a lease. PostgreSQL-only, so it is NOT
         // egress-gated and keeps working air-gapped; see
         // `start_hunt_scheduler` for why leadership is load-bearing here.
-        handles.push(self.start_hunt_scheduler());
-        tracing::info!("Hunt scheduler started (leader-only, 60s tick)");
+        #[cfg(feature = "enterprise")]
+        {
+            handles.push(self.start_hunt_scheduler());
+            tracing::info!("Hunt scheduler started (leader-only, 60s tick)");
+        }
 
         // Cleanup tasks (leader-only to avoid duplicate work across nodes).
         // Job store / wizard session / melod session cleanups are enterprise-only —
         // the underlying repos live in nanosiem-enterprise::melod.
         #[cfg(feature = "enterprise")]
         {
-            handles.push(self.start_job_store_cleanup());
-            handles.push(self.start_wizard_session_cleanup());
-            handles.push(self.start_melod_session_cleanup());
+            handles.push(self.start_component_worker_supervisor(
+                crate::license_admission::WorkerCapability::Melod,
+                "leader_melod_cleanup",
+                |state| {
+                    vec![
+                        state.start_job_store_cleanup(),
+                        state.start_wizard_session_cleanup(),
+                        state.start_melod_session_cleanup(),
+                    ]
+                },
+            ));
             // Agent enrichment cache cleanup is enterprise-only after
             // Phase 3.3 (the agent_enrichment module + repository live in
             // nanosiem-enterprise).
-            handles.push(self.start_enrichment_cache_cleanup());
+            handles.push(self.start_component_worker_supervisor(
+                crate::license_admission::WorkerCapability::Collectors,
+                "leader_enrichment_cleanup",
+                |state| vec![state.start_enrichment_cache_cleanup()],
+            ));
             // G2 (NAN-1749): reconciliation sweep that re-groups alerting-mode
             // alerts left `case_id NULL` by a grouping failure/timeout. Gated to
             // enterprise because open-core uses the no-op grouping hook, so its
             // alerts are caseless by design and the sweep would scan them
             // pointlessly every pass.
-            handles.push(self.start_ungrouped_alert_reconciliation());
-            tracing::info!("Ungrouped-alert reconciliation sweep started (leader-only, 5m tick)");
+            handles.push(self.start_component_worker_supervisor(
+                crate::license_admission::WorkerCapability::Cases,
+                "leader_cases_cleanup",
+                |state| vec![state.start_ungrouped_alert_reconciliation()],
+            ));
+            tracing::info!("Licensed cleanup supervisors registered (leader-only)");
         }
         handles.push(self.start_rate_limit_cleanup());
         handles.push(self.start_query_tracker_cleanup());

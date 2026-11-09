@@ -5,6 +5,11 @@
 //! Blocks requests from IPs not on the allowlist.
 //! Runs before auth middleware so denied IPs never hit authentication.
 //! Bypasses health/ready endpoints so infrastructure probes always work.
+//!
+//! NAN-5077: when the rules cannot be loaded and none were loaded before,
+//! protected routes answer 503 `IP_ALLOWLIST_UNAVAILABLE` (fail closed). A
+//! TCP-loopback peer and `NANO_IP_ALLOWLIST_DISABLED=true` remain the
+//! break-glass paths (docs/administration/ip-allowlist.md).
 
 use axum::{
     extract::{ConnectInfo, Request, State},
@@ -17,7 +22,7 @@ use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use nanosiem_core::ip_allowlist::{IpAllowlistScope, IpAllowlistService};
+use nanosiem_core::ip_allowlist::{AllowlistDecision, IpAllowlistScope, IpAllowlistService};
 
 /// Endpoints that bypass IP allowlist checks (infrastructure probes)
 const BYPASS_ENDPOINTS: &[&str] = &["/health", "/ready", "/livez", "/metrics"];
@@ -80,10 +85,12 @@ pub async fn ip_allowlist_middleware(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0);
     let headers = request.headers();
-    let client_ip = crate::utils::extract_client_ip(headers, connect_info.as_ref());
+    // NAN-5015: keep WHERE the address came from — only a socket-derived
+    // loopback address gets the local pass.
+    let client_ip = nanosiem_api_lib::extract_client_ip_origin(headers, connect_info.as_ref());
 
-    let ip_str = match client_ip {
-        Some(ref ip) => ip.as_str(),
+    let (ip_str, from_socket) = match client_ip {
+        Some(ref ip) => (ip.ip.as_str(), ip.from_socket),
         None => {
             // If we can't determine the client IP, deny by default when allowlist is active
             tracing::warn!(
@@ -95,14 +102,27 @@ pub async fn ip_allowlist_middleware(
     };
 
     // Check against the allowlist
-    if !state.service.is_allowed(ip_str, state.scope).await {
-        tracing::info!(
-            ip = %ip_str,
-            path = %path,
-            scope = %state.scope,
-            "IP denied by allowlist"
-        );
-        return ip_denied_response(ip_str);
+    match state
+        .service
+        .is_allowed_client(ip_str, from_socket, state.scope)
+        .await
+    {
+        AllowlistDecision::Allowed => {}
+        AllowlistDecision::Denied => {
+            tracing::info!(
+                ip = %ip_str,
+                path = %path,
+                scope = %state.scope,
+                "IP denied by allowlist"
+            );
+            return ip_denied_response(ip_str);
+        }
+        // NAN-5077: rules could not be loaded — fail closed (the service
+        // logs the load error once per retry window, not per request).
+        AllowlistDecision::Unavailable => {
+            tracing::debug!(ip = %ip_str, path = %path, scope = %state.scope, "IP allowlist unavailable — refusing");
+            return ip_allowlist_unavailable_response();
+        }
     }
 
     next.run(request).await
@@ -121,3 +141,27 @@ fn ip_denied_response(ip: &str) -> Response {
 
     (StatusCode::FORBIDDEN, Json(body)).into_response()
 }
+
+/// NAN-5077: the allowlist rules could not be loaded, so the request is
+/// refused without claiming the client is unlisted. 503 + Retry-After: the
+/// condition clears by itself once PostgreSQL is reachable again.
+fn ip_allowlist_unavailable_response() -> Response {
+    let body = IpDeniedResponse {
+        error: IpDeniedError {
+            code: "IP_ALLOWLIST_UNAVAILABLE",
+            message: "The IP allowlist could not be loaded, so access is refused until it can be. \
+                      Retry shortly; if this persists, contact your administrator."
+                .to_string(),
+        },
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "5")],
+        Json(body),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+#[path = "ip_allowlist_tests.rs"]
+mod tests;

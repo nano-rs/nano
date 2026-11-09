@@ -100,7 +100,7 @@ pub async fn create_retro_hunt(
             rule_count,
             tier_limits.max_detection_rules,
             tier_limits.tier,
-            "Upgrade to Starter for unlimited detection rules.",
+            "Detection rule capacity has been reached.",
         )?;
     }
 
@@ -215,6 +215,9 @@ pub async fn list_retro_hunt_runs(
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<Vec<RetroHuntRun>>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
-    let runs = state.detection_service.list_retro_hunt_runs(*id, 50).await?;
+    let runs = state
+        .detection_service
+        .list_retro_hunt_runs(*id, 50)
+        .await?;
     Ok(Json(runs))
 }

@@ -6,13 +6,25 @@
 //! observations. Request handlers and background-worker startup consume this
 //! in-memory snapshot; jobs may populate it through the read-only inspector.
 
-use std::collections::BTreeSet;
-
 use chrono::{DateTime, Utc};
 use nanosiem_core::license::{LicenseState, LicenseStatus};
+use nanosiem_core::{
+    auth::ScopeSet,
+    extensions::{
+        AlertCasePermissions, AlertGrouped, CaseGroupingHook, CloudRiskProvider, ExtensionError,
+        ShadowInvestigationHook, SiemHealthAiAnalyzer,
+    },
+    models::Alert,
+    risk::{EntityRiskSummary, RiskFilter, RiskTimeWindow},
+    siem_health::{
+        analyzer::SuppressedFinding,
+        types::{AnalysisResult, CollectedMetrics},
+    },
+};
 use nanosiem_enterprise::sovereign_license::{
     EntitlementError, LegacyUpgradeGrace, LicenseStateView,
 };
+use std::sync::Arc;
 
 use crate::state::AppState;
 
@@ -21,9 +33,6 @@ const LEGACY_NOTICE: &str =
 
 #[derive(Debug, Clone)]
 pub enum OfflineLicenseSnapshot {
-    /// Hosted licensing or a non-air-gap deployment: component checks do not
-    /// apply here.
-    Bypass,
     C05(LicenseStateView),
     LegacyGrace(LegacyUpgradeGrace),
     Unavailable(String),
@@ -31,7 +40,7 @@ pub enum OfflineLicenseSnapshot {
 
 impl Default for OfflineLicenseSnapshot {
     fn default() -> Self {
-        Self::Bypass
+        Self::Unavailable("Licence admission has not been initialized.".into())
     }
 }
 
@@ -59,7 +68,6 @@ impl OfflineLicenseSnapshot {
 
     pub fn cached_status(&self) -> LicenseStatus {
         match self {
-            Self::Bypass => LicenseStatus::default(),
             Self::C05(view) => crate::handlers::license::cache_status(view),
             Self::LegacyGrace(grace) => LicenseStatus {
                 state: LicenseState::GracePeriod,
@@ -71,120 +79,185 @@ impl OfflineLicenseSnapshot {
                 last_checked_at: None,
                 last_heartbeat_at: None,
                 offline: true,
+                entitlement: None,
             },
-            Self::Unavailable(reason) => LicenseStatus {
-                state: LicenseState::Locked,
-                valid: false,
-                locked_reason: Some(reason.clone()),
-                offline: true,
-                ..LicenseStatus::default()
-            },
+            Self::Unavailable(reason) => {
+                let mut status = LicenseStatus::unavailable(reason.clone());
+                status.offline = true;
+                status
+            }
         }
     }
 
     pub fn notice(&self) -> Option<&'static str> {
         matches!(self, Self::LegacyGrace(_)).then_some(LEGACY_NOTICE)
     }
-
-    fn signed_components(&self) -> Option<BTreeSet<&str>> {
-        match self {
-            Self::C05(view) => Some(view.components.iter().map(String::as_str).collect()),
-            _ => None,
-        }
-    }
-
-    pub fn allows_component(&self, component: &str) -> bool {
-        match self {
-            Self::Bypass | Self::LegacyGrace(_) => true,
-            Self::C05(_) => self
-                .signed_components()
-                .is_some_and(|components| components.contains(component)),
-            Self::Unavailable(_) => false,
-        }
-    }
-
-    pub fn allows_worker(&self, worker: WorkerCapability) -> bool {
-        let Some(component) = component_for_worker(worker) else {
-            return false;
-        };
-        self.allows_component(component)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerCapability {
+    Cases,
     Soar,
-    Risk,
     Melod,
     Pivt,
-    Ingest,
+    Collectors,
+    Sso,
 }
 
-/// One authoritative mapping for signed component admission. Routes and
-/// workers must be named here; worker capabilities absent from this table fail
-/// closed. More-specific route prefixes precede their parent prefix.
-#[derive(Debug)]
-pub struct ComponentRule {
-    pub component: &'static str,
-    pub route_prefixes: &'static [&'static str],
-    pub workers: &'static [WorkerCapability],
+/// One live decision shared by licensed route, worker and capability gates.
+pub fn licensed_features_available(status: &LicenseStatus, now: DateTime<Utc>) -> bool {
+    status.effective(now).state != LicenseState::Locked
 }
 
-pub const COMPONENT_RULES: &[ComponentRule] = &[
-    ComponentRule {
-        component: "ai_tuning",
-        route_prefixes: &[
-            "/api/melod/detection/tune",
-            "/api/melod/settings/ai-tuning",
-            "/api/tuning",
-        ],
-        workers: &[WorkerCapability::Pivt],
-    },
-    ComponentRule {
-        component: "soar",
-        route_prefixes: &["/api/soar"],
-        workers: &[WorkerCapability::Soar],
-    },
-    ComponentRule {
-        component: "risk",
-        route_prefixes: &["/api/risk", "/api/entities", "/api/settings/risk"],
-        workers: &[WorkerCapability::Risk],
-    },
-    ComponentRule {
-        component: "melod",
-        route_prefixes: &["/api/melod", "/api/settings/ai"],
-        workers: &[WorkerCapability::Melod],
-    },
-    ComponentRule {
-        component: "ingest",
-        route_prefixes: &[
-            "/api/internal/otlp-auth",
-            "/api/internal/vector-config",
-            "/api/ingest-tokens",
-            "/api/connector-specs",
-            "/api/connector-feeds",
-            "/api/log-sources",
-            "/api/source-configurations",
-            "/api/integrations",
-        ],
-        workers: &[WorkerCapability::Ingest],
-    },
-];
-
-pub fn required_component_for_route(path: &str) -> Option<&'static str> {
-    COMPONENT_RULES.iter().find_map(|rule| {
-        rule.route_prefixes
-            .iter()
-            .any(|prefix| path.starts_with(prefix))
-            .then_some(rule.component)
-    })
+async fn live_admission(status: &tokio::sync::RwLock<LicenseStatus>) -> bool {
+    licensed_features_available(&*status.read().await, Utc::now())
 }
 
-pub fn component_for_worker(worker: WorkerCapability) -> Option<&'static str> {
-    COMPONENT_RULES
-        .iter()
-        .find(|rule| rule.workers.contains(&worker))
-        .map(|rule| rule.component)
+/// Dynamic adapter for licensed behavior invoked from shared detection workers.
+pub struct LicensedCaseGroupingHook {
+    inner: Arc<dyn CaseGroupingHook>,
+    status: Arc<tokio::sync::RwLock<LicenseStatus>>,
+}
+
+impl LicensedCaseGroupingHook {
+    pub fn new(
+        inner: Arc<dyn CaseGroupingHook>,
+        status: Arc<tokio::sync::RwLock<LicenseStatus>>,
+    ) -> Self {
+        Self { inner, status }
+    }
+}
+
+#[async_trait::async_trait]
+impl CaseGroupingHook for LicensedCaseGroupingHook {
+    async fn group_alert(
+        &self,
+        alert: &Alert,
+        rule_name: Option<&str>,
+        permissions: Option<AlertCasePermissions>,
+    ) -> Result<Option<AlertGrouped>, ExtensionError> {
+        if !live_admission(&self.status).await {
+            return Ok(None);
+        }
+        self.inner.group_alert(alert, rule_name, permissions).await
+    }
+}
+
+/// Dynamic adapter for shadow-investigation calls from shared alert paths.
+pub struct LicensedShadowInvestigationHook {
+    inner: Arc<dyn ShadowInvestigationHook>,
+    status: Arc<tokio::sync::RwLock<LicenseStatus>>,
+}
+
+impl LicensedShadowInvestigationHook {
+    pub fn new(
+        inner: Arc<dyn ShadowInvestigationHook>,
+        status: Arc<tokio::sync::RwLock<LicenseStatus>>,
+    ) -> Self {
+        Self { inner, status }
+    }
+}
+
+#[async_trait::async_trait]
+impl ShadowInvestigationHook for LicensedShadowInvestigationHook {
+    async fn on_case_created(
+        &self,
+        case_id: uuid::Uuid,
+        alert: &Alert,
+        notebook_id: Option<uuid::Uuid>,
+    ) -> Result<(), ExtensionError> {
+        if !live_admission(&self.status).await {
+            return Ok(());
+        }
+        self.inner
+            .on_case_created(case_id, alert, notebook_id)
+            .await
+    }
+
+    async fn on_alerts_added(
+        &self,
+        case_id: uuid::Uuid,
+        new_alert_ids: Vec<uuid::Uuid>,
+    ) -> Result<(), ExtensionError> {
+        if !live_admission(&self.status).await {
+            return Ok(());
+        }
+        self.inner.on_alerts_added(case_id, new_alert_ids).await
+    }
+}
+
+/// Remove enterprise risk decoration from otherwise-open search surfaces at
+/// hard stop without disabling those search surfaces themselves.
+pub struct LicensedCloudRiskProvider {
+    inner: Arc<dyn CloudRiskProvider>,
+    status: Arc<tokio::sync::RwLock<LicenseStatus>>,
+}
+
+impl LicensedCloudRiskProvider {
+    pub fn new(
+        inner: Arc<dyn CloudRiskProvider>,
+        status: Arc<tokio::sync::RwLock<LicenseStatus>>,
+    ) -> Self {
+        Self { inner, status }
+    }
+}
+
+#[async_trait::async_trait]
+impl CloudRiskProvider for LicensedCloudRiskProvider {
+    async fn risky_entities(
+        &self,
+        window: RiskTimeWindow,
+        filter: &RiskFilter,
+        scope: &ScopeSet,
+    ) -> Result<Vec<EntityRiskSummary>, ExtensionError> {
+        if !live_admission(&self.status).await {
+            return Ok(Vec::new());
+        }
+        self.inner.risky_entities(window, filter, scope).await
+    }
+
+    async fn risk_for_entities(
+        &self,
+        entities: &[String],
+        scope: &ScopeSet,
+    ) -> Result<Option<EntityRiskSummary>, ExtensionError> {
+        if !live_admission(&self.status).await {
+            return Ok(None);
+        }
+        self.inner.risk_for_entities(entities, scope).await
+    }
+}
+
+/// Keep core SIEM-health checks running while replacing their licensed AI
+/// analysis with the existing deterministic fallback at hard stop.
+pub struct LicensedSiemHealthAiAnalyzer {
+    inner: Arc<dyn SiemHealthAiAnalyzer>,
+    status: Arc<tokio::sync::RwLock<LicenseStatus>>,
+}
+
+impl LicensedSiemHealthAiAnalyzer {
+    pub fn new(
+        inner: Arc<dyn SiemHealthAiAnalyzer>,
+        status: Arc<tokio::sync::RwLock<LicenseStatus>>,
+    ) -> Self {
+        Self { inner, status }
+    }
+}
+
+#[async_trait::async_trait]
+impl SiemHealthAiAnalyzer for LicensedSiemHealthAiAnalyzer {
+    async fn analyze_with_ai(
+        &self,
+        metrics: &CollectedMetrics,
+        suppressions: &[SuppressedFinding],
+    ) -> Result<AnalysisResult, ExtensionError> {
+        if !live_admission(&self.status).await {
+            return Err(ExtensionError::Unavailable(
+                "SIEM Health AI is unavailable at the licence hard stop",
+            ));
+        }
+        self.inner.analyze_with_ai(metrics, suppressions).await
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,6 +334,7 @@ mod tests {
             installation_fingerprint: "00".repeat(32),
             license_id: Some("licence-one".into()),
             license_type: Some("production".into()),
+            capacity_gb_per_day: None,
             revision: Some(1),
             valid_from: None,
             expires_at: None,
@@ -275,37 +349,11 @@ mod tests {
     }
 
     #[test]
-    fn omitting_each_mapped_component_denies_its_routes_and_workers() {
-        let all: BTreeSet<&str> = COMPONENT_RULES.iter().map(|rule| rule.component).collect();
-        for rule in COMPONENT_RULES {
-            let snapshot = c05_with(all.iter().copied().filter(|name| *name != rule.component));
-            for path in rule.route_prefixes {
-                assert_eq!(required_component_for_route(path), Some(rule.component));
-                assert!(
-                    !snapshot.allows_component(rule.component),
-                    "{path} was admitted"
-                );
-            }
-            for worker in rule.workers {
-                assert!(!snapshot.allows_worker(*worker), "{worker:?} was admitted");
-            }
-        }
-    }
-
-    #[test]
-    fn every_worker_capability_is_mapped() {
-        for worker in [
-            WorkerCapability::Soar,
-            WorkerCapability::Risk,
-            WorkerCapability::Melod,
-            WorkerCapability::Pivt,
-            WorkerCapability::Ingest,
-        ] {
-            assert!(
-                component_for_worker(worker).is_some(),
-                "{worker:?} is unmapped"
-            );
-        }
+    fn signed_components_are_provenance_not_v2_feature_selectors() {
+        let snapshot = c05_with(["api"]);
+        let view = snapshot.c05_view().expect("fixture is C05");
+        assert!(view.valid);
+        assert_eq!(view.components, ["api"]);
     }
 
     #[test]
@@ -318,5 +366,27 @@ mod tests {
             offline_authority_source(false, true),
             OfflineAuthoritySource::LegacyGrace
         );
+    }
+
+    #[test]
+    fn default_admission_is_fail_closed() {
+        let snapshot = OfflineLicenseSnapshot::default();
+        assert_eq!(snapshot.cached_status().state, LicenseState::Locked);
+    }
+
+    #[test]
+    fn licensed_features_follow_effective_hard_stop() {
+        let now = Utc::now();
+        let active = LicenseStatus {
+            state: LicenseState::Active,
+            valid: true,
+            locked_reason: None,
+            ..LicenseStatus::default()
+        };
+        assert!(licensed_features_available(&active, now));
+        assert!(!licensed_features_available(
+            &LicenseStatus::unavailable("expired"),
+            now
+        ));
     }
 }

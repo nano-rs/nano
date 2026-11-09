@@ -723,8 +723,8 @@ async fn promotion_quarantines_a_toml_it_did_not_generate() {
     );
 }
 
-/// The quarantined copy must stop being a `.toml`. `deploy/src/s3.js`'s config
-/// sync walks the whole config root and uploads every `.toml` it finds, skipping
+/// The quarantined copy must stop being a `.toml`. A directory-walking config
+/// sync (as the retired S3 uploader did) walks the whole config root and uploads every `.toml` it finds, skipping
 /// only `backup` and `staging` by name — a quarantined parser that kept its
 /// extension would be replicated back out to every Vector pod, undoing the
 /// quarantine.

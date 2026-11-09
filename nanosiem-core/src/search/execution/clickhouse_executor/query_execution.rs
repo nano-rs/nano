@@ -343,7 +343,7 @@ impl ClickHouseExecutor {
             "Executing ClickHouse query with query_id {} and settings (timeout={}s, mem={:?}B, threads={}, priority={}): {}",
             query_id, settings.max_execution_time, settings.max_memory_usage_bytes,
             settings.max_threads, settings.priority,
-            &escaped_sql[..escaped_sql.len().min(200)]
+            crate::text_bounds::prefix_at_most(&escaped_sql, 200)
         );
 
         let mut query = self

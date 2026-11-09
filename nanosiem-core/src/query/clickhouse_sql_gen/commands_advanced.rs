@@ -969,10 +969,10 @@ impl ClickHouseSqlGenerator {
                 // condition field (`action`) maps to its OCSF column instead of a raw
                 // reference that 500s.
                 layer0_cols.push(format!(
-                    "argMinIf({}, {time_column}, {}) AS step1_{}",
+                    "argMinIf({}, {time_column}, {}) AS {}",
                     by_field_sql(f, self),
                     cond1,
-                    f.replace('.', "_")
+                    step_capture_alias(1, f)
                 ));
             }
             layer0_cols.push("count() AS sequence_count".to_string());
@@ -1117,7 +1117,7 @@ impl ClickHouseSqlGenerator {
             outer_cols.push("step1_time".to_string());
             outer_cols.push("step1_event_id".to_string());
             for f in &per_step_captures[0] {
-                outer_cols.push(format!("step1_{}", f.replace('.', "_")));
+                outer_cols.push(step_capture_alias(1, f));
             }
         }
         let first_step = if n_conds == 1 { 1 } else { 0 };
@@ -1130,9 +1130,9 @@ impl ClickHouseSqlGenerator {
             outer_cols.push(format!("tupleElement({tup}, 2) AS step{step_num}_event_id"));
             for f in &per_step_captures[k_idx] {
                 outer_cols.push(format!(
-                    "tupleElement({tup}, {pos}) AS step{step_num}_{f}",
+                    "tupleElement({tup}, {pos}) AS {alias}",
                     pos = field_pos(f),
-                    f = f.replace('.', "_")
+                    alias = step_capture_alias(step_num, f)
                 ));
             }
         }
@@ -1526,20 +1526,32 @@ impl ClickHouseSqlGenerator {
         // `traffic.bytes_in` → `Code 47 Unknown identifier 'bytes_in'`. `stats` /
         // `streamstats` already resolve agg fields; anomaly's aggregation-first path
         // did not. `count()` (empty inner) and computed aliases pass through unchanged.
-        let func_mapped = agg_expr
-            .replace("dc(", "uniq(")
-            .replace("distinct_count(", "uniq(");
-        let ch_agg = match (func_mapped.find('('), func_mapped.rfind(')')) {
-            (Some(lp), Some(rp)) if rp > lp => {
-                let func = &func_mapped[..lp];
-                let inner = func_mapped[lp + 1..rp].trim();
-                if inner.is_empty() {
-                    func_mapped.clone()
-                } else {
-                    format!("{}({})", func, by_field_sql(inner, self))
-                }
+        //
+        // Security review 2026-11-08 (NAN-5034): the function NAME is never
+        // emitted from user text. It must be on the anomaly allowlist (the parser
+        // already enforces this; checked again here for any AST built another
+        // way), and the generator emits the fixed ClickHouse name it maps to.
+        let (lp, rp) = match (agg_expr.find('('), agg_expr.rfind(')')) {
+            (Some(lp), Some(rp)) if rp > lp => (lp, rp),
+            _ => {
+                return Err(SqlGenError::InvalidQuery(format!(
+                    "anomaly aggregation must look like func(field), got '{agg_expr}'"
+                )))
             }
-            _ => func_mapped.clone(),
+        };
+        let func_name = agg_expr[..lp].trim();
+        let ch_func = crate::query::parser::anomaly_aggregation_function(func_name).ok_or_else(
+            || {
+                SqlGenError::InvalidQuery(format!(
+                    "anomaly does not support the function '{func_name}()'"
+                ))
+            },
+        )?;
+        let inner = agg_expr[lp + 1..rp].trim();
+        let ch_agg = if inner.is_empty() {
+            format!("{ch_func}()")
+        } else {
+            format!("{}({})", ch_func, by_field_sql(inner, self))
         };
 
         let agg_source = format!(
@@ -1582,4 +1594,14 @@ impl ClickHouseSqlGenerator {
             }
         }
     }
+}
+
+/// Output alias for a `sequence` step capture: `step<N>_<field>` with dots
+/// flattened to underscores (NAN-1294), quoted by
+/// [`crate::sql_hygiene::quote_identifier`]. The captured field can be a quoted
+/// filter LHS or an earlier quoted eval name, so it is untrusted text (security
+/// review 2026-11-08). Bareword captures are byte-identical to the old output.
+/// Use this for BOTH the definition and every reference so they cannot drift.
+fn step_capture_alias(step_num: usize, field: &str) -> String {
+    crate::sql_hygiene::quote_identifier(&format!("step{step_num}_{}", field.replace('.', "_")))
 }

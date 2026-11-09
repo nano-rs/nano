@@ -15,6 +15,10 @@
 //! the sibling DB suites; the `pg-integration-tests` lane runs them with
 //! `-- --ignored`.
 
+// AI tuning (notifications, baselines) is enterprise-only: its tables ship in
+// the enterprise migration overlay, so this suite builds only with the feature.
+#![cfg(feature = "enterprise")]
+
 mod common;
 
 use chrono::{DateTime, Utc};

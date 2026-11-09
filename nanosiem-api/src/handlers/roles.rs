@@ -300,16 +300,34 @@ pub async fn update_role(
     // NAN-2121: deny unless the caller holds every permission it is assigning to
     // the role (roles:edit is not authority to grant arbitrary privileges).
     let grant_stamp = if let Some(ref permissions) = request.permissions {
-        Some(
-            crate::handlers::grant_authz::ensure_can_grant_permissions(
-                &auth,
-                &state.pool,
-                perm_constants::ROLES_EDIT,
-                permissions,
-            )
-            .await
-            .map_err(|g| (g.status, Json(RoleApiError::new(g.code, &g.message))))?,
+        let stamp = crate::handlers::grant_authz::ensure_can_grant_permissions(
+            &auth,
+            &state.pool,
+            perm_constants::ROLES_EDIT,
+            permissions,
         )
+        .await
+        .map_err(|g| (g.status, Json(RoleApiError::new(g.code, &g.message))))?;
+        // NAN-5027 (sweep): replacing the permission set also removes the
+        // current one from every holder of the role — the caller must hold it.
+        let revoke = crate::handlers::grant_authz::ensure_can_revoke_role(
+            &auth,
+            &state.pool,
+            perm_constants::ROLES_EDIT,
+            *id,
+        )
+        .await
+        .map_err(|g| (g.status, Json(RoleApiError::new(g.code, &g.message))))?;
+        if revoke != stamp {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(RoleApiError::new(
+                    "grant_authority_changed",
+                    "Authorization changed while the request was being validated; retry",
+                )),
+            ));
+        }
+        Some(stamp)
     } else {
         None
     };
@@ -379,6 +397,17 @@ pub async fn delete_role(
 ) -> Result<StatusCode, (StatusCode, Json<RoleApiError>)> {
     check_permission(&auth, perm_constants::ROLES_DELETE)
         .map_err(|(s, j)| (s, Json(RoleApiError::new(&j.error, &j.message))))?;
+
+    // NAN-5027 (sweep): deleting a role strips its permissions from every
+    // holder — the caller must currently hold them.
+    crate::handlers::grant_authz::ensure_can_revoke_role(
+        &auth,
+        &state.pool,
+        perm_constants::ROLES_DELETE,
+        *id,
+    )
+    .await
+    .map_err(|g| (g.status, Json(RoleApiError::new(g.code, &g.message))))?;
 
     // Get role name for audit before deleting
     let role_name = state

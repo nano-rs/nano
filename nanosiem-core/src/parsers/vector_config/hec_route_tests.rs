@@ -75,7 +75,12 @@ fn rendering_an_hec_parser_on_a_fresh_install_writes_the_passthrough() {
     std::fs::create_dir_all(configs(&dir)).unwrap();
     let mgr = VectorConfigManager::new(dir.path());
     let (config, _) = mgr.generate_source_config(&hec_parser());
-    assert!(config.contains("inputs = [\"splunk_hec_route\"]"), "{config}");
+    // NAN-5071: plus the token-bound route for HTTP-ingested events of this source.
+    let inputs = format!(
+        "inputs = [\"splunk_hec_route\", \"source_router.{}\"]",
+        VectorConfigManager::token_bound_route(&hec_parser().name)
+    );
+    assert!(config.contains(&inputs), "{config}");
     let written = std::fs::read_to_string(configs(&dir).join(SPLUNK_HEC_ROUTE_FILE)).unwrap();
     assert_eq!(written, passthrough_route_toml());
 }
@@ -89,7 +94,12 @@ fn ensure_never_overwrites_the_source_configs_routing_rules() {
     assert_eq!(std::fs::read_to_string(configs(&dir).join(SPLUNK_HEC_ROUTE_FILE)).unwrap(), RULES_FILE);
     let mgr = VectorConfigManager::new(dir.path());
     let (config, _) = mgr.generate_source_config(&hec_parser());
-    assert!(config.contains("inputs = [\"splunk_hec_route\"]"), "{config}");
+    // NAN-5071: plus the token-bound route for HTTP-ingested events of this source.
+    let inputs = format!(
+        "inputs = [\"splunk_hec_route\", \"source_router.{}\"]",
+        VectorConfigManager::token_bound_route(&hec_parser().name)
+    );
+    assert!(config.contains(&inputs), "{config}");
     assert_eq!(std::fs::read_to_string(configs(&dir).join(SPLUNK_HEC_ROUTE_FILE)).unwrap(), RULES_FILE);
 }
 

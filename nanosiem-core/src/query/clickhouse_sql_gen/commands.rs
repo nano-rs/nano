@@ -490,7 +490,12 @@ impl ClickHouseSqlGenerator {
                                 // `start_time` on spans).
                                 let time_col = self.time_column();
                                 let bucket_expr = if field_name.as_str() != time_col {
-                                    time_bucket_expr.replace(time_col, field_name.as_str())
+                                    // Security review 2026-11-08: quote anything that is
+                                    // not a plain (possibly dotted) column name.
+                                    time_bucket_expr.replace(
+                                        time_col,
+                                        &crate::sql_hygiene::column_reference(&field_name),
+                                    )
                                 } else {
                                     time_bucket_expr
                                 };
@@ -532,13 +537,16 @@ impl ClickHouseSqlGenerator {
                                 Ok(format!(
                                     "  SELECT * EXCEPT ({field}), \
                                     toDateTime(toInt64(toDateTime({field})) - toInt64(toDateTime({field})) % {advance} + window_offset) AS {alias}, \
-                                    toDateTime(toInt64(toDateTime({field})) - toInt64(toDateTime({field})) % {advance} + window_offset + {span}) AS {alias}_end \
+                                    toDateTime(toInt64(toDateTime({field})) - toInt64(toDateTime({field})) % {advance} + window_offset + {span}) AS {alias_end} \
                                     FROM {source} \
                                     ARRAY JOIN arrayMap(x -> -x * {advance}, range(0, {num_windows})) AS window_offset",
                                     field = escape_identifier(&field_name),
                                     advance = advance_seconds,
                                     span = span_seconds,
                                     alias = escape_identifier(&alias_name),
+                                    // Quote the whole `<alias>_end` name; `"x"_end`
+                                    // was invalid SQL (security review 2026-11-08).
+                                    alias_end = escape_identifier(&format!("{alias_name}_end")),
                                     source = source,
                                     num_windows = num_windows
                                 ))
@@ -550,11 +558,12 @@ impl ClickHouseSqlGenerator {
                                 Ok(format!(
                                     "  SELECT *, \
                                     {field} AS {alias}, \
-                                    toDateTime(toInt64(toDateTime({field})) + {span}) AS {alias}_end \
+                                    toDateTime(toInt64(toDateTime({field})) + {span}) AS {alias_end} \
                                     FROM {source}",
                                     field = escape_identifier(&field_name),
                                     span = span_seconds,
                                     alias = escape_identifier(&alias_name),
+                                    alias_end = escape_identifier(&format!("{alias_name}_end")),
                                     source = source
                                 ))
                             }

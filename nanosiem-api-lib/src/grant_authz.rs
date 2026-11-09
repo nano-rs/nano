@@ -121,6 +121,47 @@ impl GrantErr {
         }
     }
 
+    /// NAN-5027: the target principal holds permissions the caller does not.
+    fn target_exceeds(missing: &[String]) -> Self {
+        GrantErr {
+            status: StatusCode::FORBIDDEN,
+            code: "target_privilege_exceeds_caller",
+            message: format!(
+                "You cannot manage a user who holds permission(s) you do not hold: {}",
+                missing.join(", ")
+            ),
+        }
+    }
+
+    /// NAN-5027: the target can see a source the caller is denied. Generic for
+    /// the same no-oracle reason as [`Self::denied_source_scope`].
+    fn target_exceeds_source_scope() -> Self {
+        GrantErr {
+            status: StatusCode::FORBIDDEN,
+            code: "target_privilege_exceeds_caller",
+            message: "You cannot manage a user whose source-visibility scope exceeds your own."
+                .to_string(),
+        }
+    }
+
+    fn target_not_found() -> Self {
+        GrantErr {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: "User not found".to_string(),
+        }
+    }
+
+    /// `system` service accounts are owned by the platform, not by tenants.
+    fn system_account() -> Self {
+        GrantErr {
+            status: StatusCode::CONFLICT,
+            code: "system_account",
+            message: "System service accounts cannot be modified through the user API."
+                .to_string(),
+        }
+    }
+
     /// A repository/database failure. The underlying error is logged
     /// server-side but NOT returned to the client — serializing the raw sqlx/
     /// repo error would leak schema, constraint, or connection details.
@@ -204,13 +245,27 @@ async fn authority_snapshot<'a>(
     let permissions: Vec<String> = if let Some(api_key_id) = auth.api_key_id {
         sqlx::query_scalar(
             r#"
-            SELECT unnest(ak.permissions)
+            SELECT p.permission
               FROM api_keys ak
               JOIN users owner ON owner.id = ak.created_by
+              CROSS JOIN LATERAL unnest(ak.permissions) AS p(permission)
              WHERE ak.id = $1
                AND ak.enabled
                AND (ak.expires_at IS NULL OR ak.expires_at > NOW())
                AND owner.status = 'active'
+               -- NAN-5044: a key's grant authority is its stored set CLAMPED to
+               -- what its owner holds NOW, so a key minted before the owner was
+               -- demoted cannot use the old authority to re-promote the owner.
+               -- Always enforced here (privilege administration), independent
+               -- of the request-path audit/enforce switch.
+               AND EXISTS (
+                   SELECT 1
+                     FROM user_groups ug
+                     JOIN group_roles gr ON gr.group_id = ug.group_id
+                     JOIN role_permissions rp ON rp.role_id = gr.role_id
+                    WHERE ug.user_id = owner.id
+                      AND rp.permission_id = p.permission
+               )
             "#,
         )
         .bind(api_key_id)
@@ -475,6 +530,17 @@ pub async fn ensure_can_grant_groups_exact(
         &snapshot.permissions,
         &BTreeSet::from([required_permission.to_string()]),
     )?;
+    check_group_grants_in(&mut snapshot, group_ids).await?;
+    snapshot.commit().await
+}
+
+/// The group-grant half of [`ensure_can_grant_groups_exact`], on an open
+/// authority snapshot so it can share one repeatable-read view (and one
+/// [`GrantAuthorityStamp`]) with [`ensure_can_manage_principal`].
+async fn check_group_grants_in(
+    snapshot: &mut AuthoritySnapshot<'_>,
+    group_ids: &[Uuid],
+) -> Result<(), GrantErr> {
     let group_ids = dedup_capped(group_ids)?;
     // First pass: resolve the group→role edges into a set of DISTINCT roles (by
     // id) and the union of source grants. Deduplicating roles globally means a
@@ -540,6 +606,177 @@ pub async fn ensure_can_grant_groups_exact(
 
     ensure_holds_current(&snapshot.permissions, &granted_perms)?;
     ensure_holds_source_scope_current(&snapshot.denied_sources, &granted_sources)?;
+    Ok(())
+}
+
+/// NAN-5027: authority over ANOTHER principal.
+///
+/// Changing someone's password, email or MFA, disabling, enabling, unlocking or
+/// deleting them, or signing them out confers (or destroys) that principal's
+/// entire effective authority — taking over an account IS a grant of every
+/// permission it holds. So the NAN-2121 invariant applies to the target as a
+/// whole: the caller must currently hold every effective permission the target
+/// holds, and must not be denied any source the target can see. Admin's set is
+/// a superset of every other, so only an Admin-equivalent caller can act on an
+/// Admin, while a delegated role can still manage principals it covers.
+///
+/// - A SESSION acting on itself is always allowed (it already holds itself).
+///   An API key is never "self": a key acting on its owner must cover the owner.
+/// - `system` service accounts are not manageable through the user API.
+/// - `group_ids`, when given, are validated in the SAME snapshot (an update that
+///   also replaces memberships needs both checks under one stamp).
+///
+/// Returns the authoritative stamp the writer must lock and re-verify in the
+/// mutating transaction, so a target promoted after this check is refused.
+pub async fn ensure_can_manage_principal(
+    auth: &AuthContext,
+    pool: &PgPool,
+    required_permission: &str,
+    target_user_id: Uuid,
+    group_ids: Option<&[Uuid]>,
+) -> Result<GrantAuthorityStamp, GrantErr> {
+    let mut snapshot = authority_snapshot(pool, auth).await?;
+    ensure_holds_current(
+        &snapshot.permissions,
+        &BTreeSet::from([required_permission.to_string()]),
+    )?;
+
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM users WHERE id = $1")
+        .bind(target_user_id)
+        .fetch_optional(&mut *snapshot.tx)
+        .await
+        .map_err(GrantErr::repo)?;
+    let Some(status) = status else {
+        return Err(GrantErr::target_not_found());
+    };
+    if status == "system" {
+        return Err(GrantErr::system_account());
+    }
+
+    let is_self = !auth.is_api_key && auth.user_id() == target_user_id;
+    if !is_self {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT r.name, rp.permission_id
+              FROM user_groups ug
+              JOIN group_roles gr ON gr.group_id = ug.group_id
+              JOIN roles r ON r.id = gr.role_id
+              LEFT JOIN role_permissions rp ON rp.role_id = r.id
+             WHERE ug.user_id = $1
+            "#,
+        )
+        .bind(target_user_id)
+        .fetch_all(&mut *snapshot.tx)
+        .await
+        .map_err(GrantErr::repo)?;
+        let mut by_role: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (role_name, permission) in rows {
+            let entry = by_role.entry(role_name).or_default();
+            if let Some(permission) = permission {
+                entry.push(permission);
+            }
+        }
+        let mut target_perms = BTreeSet::new();
+        for (role_name, stored) in by_role {
+            target_perms.extend(effective_role_permissions(&role_name, stored));
+        }
+        let missing: Vec<String> = target_perms
+            .iter()
+            .filter(|p| !snapshot.permissions.contains(*p))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return Err(GrantErr::target_exceeds(&missing));
+        }
+
+        let target_sources: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT stg.source_type
+              FROM source_type_grants stg
+              JOIN user_groups ug ON ug.group_id = stg.group_id
+             WHERE ug.user_id = $1
+            "#,
+        )
+        .bind(target_user_id)
+        .fetch_all(&mut *snapshot.tx)
+        .await
+        .map_err(GrantErr::repo)?;
+        let target_sources: BTreeSet<String> = target_sources
+            .iter()
+            .map(|s| normalize_source_type(s))
+            .collect();
+        if target_sources
+            .iter()
+            .any(|source| snapshot.denied_sources.contains(source))
+        {
+            return Err(GrantErr::target_exceeds_source_scope());
+        }
+    }
+
+    if let Some(group_ids) = group_ids {
+        let explicit = strip_implicit_everyone(group_ids);
+        check_group_grants_in(&mut snapshot, &explicit).await?;
+    }
+    snapshot.commit().await
+}
+
+/// NAN-5027 (sweep): taking authority AWAY from other principals is also a
+/// privilege operation. Replacing a group's roles or deleting a group removes
+/// what that group currently confers from every member; the caller must
+/// currently hold all of it (and not be denied any source it grants), or a
+/// narrow `groups:edit` / `groups:delete` holder could strip the Admin role
+/// from an admins group and then manage its former members.
+pub async fn ensure_can_revoke_group(
+    auth: &AuthContext,
+    pool: &PgPool,
+    required_permission: &str,
+    group_id: Uuid,
+) -> Result<GrantAuthorityStamp, GrantErr> {
+    let mut snapshot = authority_snapshot(pool, auth).await?;
+    ensure_holds_current(
+        &snapshot.permissions,
+        &BTreeSet::from([required_permission.to_string()]),
+    )?;
+    // An unknown group is reported by the writer (404); nothing to revoke here.
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM groups WHERE id = $1)")
+        .bind(group_id)
+        .fetch_one(&mut *snapshot.tx)
+        .await
+        .map_err(GrantErr::repo)?;
+    if exists {
+        check_group_grants_in(&mut snapshot, &[group_id]).await?;
+    }
+    snapshot.commit().await
+}
+
+/// NAN-5027 (sweep): changing or deleting a role removes its current
+/// permissions from every holder; the caller must currently hold them.
+pub async fn ensure_can_revoke_role(
+    auth: &AuthContext,
+    pool: &PgPool,
+    required_permission: &str,
+    role_id: Uuid,
+) -> Result<GrantAuthorityStamp, GrantErr> {
+    let snapshot = authority_snapshot(pool, auth).await?;
+    ensure_holds_current(
+        &snapshot.permissions,
+        &BTreeSet::from([required_permission.to_string()]),
+    )?;
+    let mut snapshot = snapshot;
+    let name: Option<String> = sqlx::query_scalar("SELECT name FROM roles WHERE id = $1")
+        .bind(role_id)
+        .fetch_optional(&mut *snapshot.tx)
+        .await
+        .map_err(GrantErr::repo)?;
+    if let Some(name) = name {
+        let stored: Vec<String> =
+            sqlx::query_scalar("SELECT permission_id FROM role_permissions WHERE role_id = $1")
+                .bind(role_id)
+                .fetch_all(&mut *snapshot.tx)
+                .await
+                .map_err(GrantErr::repo)?;
+        ensure_holds_current(&snapshot.permissions, &effective_role_permissions(&name, stored))?;
+    }
     snapshot.commit().await
 }
 

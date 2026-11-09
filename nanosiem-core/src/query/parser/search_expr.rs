@@ -206,7 +206,10 @@ fn implicit_and_separator(input: &str) -> ParseResult<'_, &str> {
     // Check what comes after the whitespace - don't consume implicit AND
     // if the next thing is a pipe or OR operator
     let next = remaining.trim_start();
-    if next.starts_with('|') || next.to_uppercase().starts_with("OR ") || next.starts_with("||") {
+    if next.starts_with('|')
+        || super::starts_with_ignore_ascii_case(next, "OR ")
+        || next.starts_with("||")
+    {
         // Fail the parse - this whitespace should not be treated as implicit AND
         Err(nom::Err::Error(nom::error::Error::new(
             input,

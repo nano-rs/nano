@@ -64,6 +64,7 @@ pub const AI_PROVIDER_CONFIGURED_SQL: &str = "SELECT EXISTS(SELECT 1 FROM provid
      WHERE enabled = true \
        AND (credentials_encrypted IS NOT NULL OR COALESCE(config->>'base_url', '') <> ''))";
 
+#[cfg(feature = "enterprise")]
 pub const SSO_PROVIDER_SQL: &str =
     "SELECT EXISTS(SELECT 1 FROM oidc_providers WHERE enabled = true)";
 
@@ -124,7 +125,10 @@ pub async fn probe_dedicated_onboarding_status(
             0
         });
 
+    #[cfg(feature = "enterprise")]
     let has_sso = inputs.sso_available && probe_bool(pool, "sso", SSO_PROVIDER_SQL).await;
+    #[cfg(not(feature = "enterprise"))]
+    let has_sso = false;
 
     let has_log_sources =
         probe_bool_excluding_seeded(pool, "log_sources", USER_LOG_SOURCE_SQL).await;

@@ -4,12 +4,15 @@
 
 use uuid::Uuid;
 
-use crate::models::{DetectionRule, SharedGroup, UpdateRuleCasePermissionsRequest};
+use crate::models::SharedGroup;
+#[cfg(feature = "enterprise")]
+use crate::models::{DetectionRule, UpdateRuleCasePermissionsRequest};
 
 use super::types::{DetectionRuleRepository, DetectionRuleRepositoryError};
 
 impl DetectionRuleRepository {
     /// Get groups that cases from this rule will be shared with
+    #[cfg(feature = "enterprise")]
     pub async fn get_case_groups(
         &self,
         rule_id: Uuid,
@@ -31,6 +34,7 @@ impl DetectionRuleRepository {
     }
 
     /// Update case permissions for a rule
+    #[cfg(feature = "enterprise")]
     pub async fn update_case_permissions(
         &self,
         id: Uuid,
@@ -90,5 +94,15 @@ impl DetectionRuleRepository {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(not(feature = "enterprise"))]
+impl DetectionRuleRepository {
+    pub async fn get_case_groups(
+        &self,
+        _rule_id: Uuid,
+    ) -> Result<Vec<SharedGroup>, DetectionRuleRepositoryError> {
+        Ok(Vec::new())
     }
 }

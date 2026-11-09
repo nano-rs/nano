@@ -63,6 +63,25 @@ impl AppState {
         result
     }
 
+    /// NAN-5133: in the role-split topology (`NANO_VECTOR_CONFIG_DELIVERY=generation`)
+    /// a deploy's reload is "publish this generation and wait for the ingest
+    /// hosts' consumers to acknowledge it". Installed after boot-time source
+    /// sync so that sync does not wait on consumers that are still starting.
+    pub fn install_generation_delivery(&self) {
+        use nanosiem_core::parsers::vector_config_remote_delivery as remote;
+        if !remote::generation_delivery_configured() {
+            return;
+        }
+        let publisher: std::sync::Arc<dyn remote::GenerationPublisher> =
+            std::sync::Arc::new(StatePublisher(self.clone()));
+        if remote::install_generation_publisher(publisher) {
+            tracing::info!(
+                relays = remote::relay_urls().len(),
+                "Vector config generation delivery active: deploys are graded by ingest-host acknowledgement"
+            );
+        }
+    }
+
     /// Per-instance reconciliation is intentional: a restarted API pod has a
     /// fresh emptyDir and must rematerialize the committed generation for its
     /// own upload sidecar. Reusing a committed hash does not allocate a new
@@ -147,6 +166,36 @@ impl AppState {
                     ),
                 }
             }
+        })
+    }
+}
+
+/// [`AppState`] as the generation publisher for role-split deploys.
+struct StatePublisher(AppState);
+
+impl nanosiem_core::parsers::vector_config_remote_delivery::GenerationPublisher for StatePublisher {
+    fn publish_current(&self) -> futures::future::BoxFuture<'_, Result<i64, String>> {
+        Box::pin(async move {
+            // A render that raced another revision bump is Stale: render again.
+            for _ in 0..5 {
+                match self.0.reconcile_vector_config_publication().await {
+                    Ok(PublicationOutcome::Published { generation, .. })
+                    | Ok(PublicationOutcome::Reused { generation, .. }) => return Ok(generation),
+                    Ok(PublicationOutcome::Stale { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    Ok(PublicationOutcome::SupersededRenderer {
+                        committed_version, ..
+                    }) => {
+                        return Err(format!(
+                            "a newer renderer ({committed_version}) owns the committed generation; \
+                             upgrade this API or advance VECTOR_CONFIG_RENDERER_EPOCH"
+                        ));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Err("the configuration kept changing while it was rendered; retry the deploy".to_string())
         })
     }
 }

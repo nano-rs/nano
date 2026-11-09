@@ -15,6 +15,8 @@ import type {
   UpdateRoleRequest,
   PermissionInfo,
   ApiKeySummary,
+  ApiKeyOwnerClampMode,
+  ApiKeyOwnerClampSettings,
   ApiKeyListResponse,
   CreateApiKeyRequest,
   UpdateApiKeyRequest,
@@ -164,6 +166,17 @@ export class AccessControlApi {
 
   async getApiKeyUsage(id: string, days = 14): Promise<ApiKeyUsageResponse> {
     return this.request(`/api/api-keys/${id}/usage?days=${days}`);
+  }
+
+  async getApiKeyOwnerClamp(): Promise<ApiKeyOwnerClampSettings> {
+    return this.request('/api/settings/api-keys/owner-clamp');
+  }
+
+  async setApiKeyOwnerClamp(mode: ApiKeyOwnerClampMode): Promise<ApiKeyOwnerClampSettings> {
+    return this.request('/api/settings/api-keys/owner-clamp', {
+      method: 'PUT',
+      body: JSON.stringify({ mode }),
+    });
   }
 
   async updateApiKey(id: string, request: UpdateApiKeyRequest): Promise<ApiKeySummary> {

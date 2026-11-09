@@ -105,6 +105,17 @@ if is_object(ocsf_event) {
 . = { "event": ocsf_event, "timestamp": format_timestamp!(ts, "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type, "future_timestamp_skew_seconds": skew_seconds }"#
 );
 
+/// NAN-5070: OCSF parsers report a failed parse in `unmapped.parse_error` (the
+/// OCSF home for vendor data that has no schema field) and still emit a
+/// `class_uid` (0) so the raw record lands in `ocsf_logs`. Root `.parse_error`
+/// / `.metadata.parse_error` never reach this lane (the split sends them to
+/// the UDM recovery path), so this is the only failure signal on the OCSF
+/// lane. Each event takes exactly one of `_ocsf_prepare` / `_output`, so the
+/// health branch counts it once. Runs after [`OCSF_PREPARE_VRL`], which nests
+/// the OCSF object under `.event`.
+pub(super) const OCSF_PARSER_FAILURE_VRL: &str =
+    "._nano_parser_failure = !is_nullish(.event.unmapped.parse_error)";
+
 /// NAN-4963: suffix of the per-parser OCSF lane-stamp remap.
 pub(super) const OCSF_LANE_STAMP_SUFFIX: &str = "_source_lane";
 
@@ -369,9 +380,10 @@ impl VectorConfigManager {
              # Protected identity for the pre-sampling parser-health branch.\n\
              # The OCSF ClickHouse sink ignores this internal field.\n\
              ._nano_parser_id = \"{parser_id}\"\n\
-             ._nano_parser_failure = false\n\
+             {failure}\n\
              '''\n",
-            vrl = OCSF_PREPARE_VRL
+            vrl = OCSF_PREPARE_VRL,
+            failure = OCSF_PARSER_FAILURE_VRL
         )
     }
 
@@ -426,13 +438,23 @@ impl VectorConfigManager {
         let output_name = format!("{}_output", safe_name);
         let sample_name = format!("{}_sample", safe_name);
 
-        let user_exclude = parser.sampling_exclude_condition.as_deref().unwrap_or("");
+        let user_exclude = parser
+            .sampling_exclude_condition
+            .as_deref()
+            .unwrap_or("")
+            .trim();
         let durable_bypass = "(to_bool(._nano_durable_ingest) ?? false)";
+        // NAN-5012: the tenant condition is embedded only in its checked,
+        // self-contained form (`vrl_safety::render_condition`). The deploy
+        // render runs `vrl_safety::quarantine` first, which turns sampling
+        // off for a condition that fails the allowlist / read-only check, and
+        // the deploy guard re-compiles the whole `exclude`.
         let exclude_condition = if user_exclude.is_empty() {
             format!("{durable_bypass} || (to_bool(._nano_parser_failure) ?? false)")
         } else {
             format!(
-                "{durable_bypass} || (to_bool(._nano_parser_failure) ?? false) || ({user_exclude})"
+                "{durable_bypass} || (to_bool(._nano_parser_failure) ?? false) || {}",
+                crate::parsers::vrl_safety::render_condition(user_exclude)
             )
         };
         // NAN-4953 audit: a full TOML basic-string escape. Escaping `"` alone
@@ -649,7 +671,10 @@ impl VectorConfigManager {
                 .unwrap_or_default(),
             parser.id,
             escape_vrl_string(&parser.name),
-            output_source_type,
+            // NAN-5033: `source_type` reaches this literal from any writer
+            // (repository import stored it unvalidated), so it is escaped
+            // like every other scalar here.
+            escape_vrl_string(&output_source_type),
             // NAN-942: metadata fields are admin-controlled string scalars
             // that flow into VRL double-quoted literals (`.vendor = "{}"`).
             // Without escape, a value containing `"`, `\`, or `\n` would
@@ -864,7 +889,7 @@ mod tests {
             sample_block.contains(
                 "exclude = \"(to_bool(._nano_durable_ingest) ?? false) || \
                  (to_bool(._nano_parser_failure) ?? false) || \
-                 (.severity == \\\"critical\\\")\""
+                 ((.severity == \\\"critical\\\") == true)\""
             ),
             "durable HTTP/OTLP events and parse failures must bypass sampling while preserving the user's exclusion: \
              {sample_block}"
@@ -883,7 +908,7 @@ mod tests {
         );
         assert!(
             vrl::compiler::compile(
-                r#"(to_bool(._nano_durable_ingest) ?? false) || (to_bool(._nano_parser_failure) ?? false) || (.severity == "critical")"#,
+                r#"(to_bool(._nano_durable_ingest) ?? false) || (to_bool(._nano_parser_failure) ?? false) || ((.severity == "critical") == true)"#,
                 &vrl::stdlib::all(),
             )
             .is_ok(),

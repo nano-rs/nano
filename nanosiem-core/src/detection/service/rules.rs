@@ -675,11 +675,13 @@ impl DetectionService {
 
             // Transitioning FROM Real-Time
             (DetectionMode::RealTime, DetectionMode::Scheduled) => {
-                let view_name = existing_rule.materialized_view_name.clone().unwrap_or_else(|| {
+                // Security review 2026-11-08 (NAN-5018): always derive the view
+                // name from the rule id. The stored column is client-influenced and
+                // must never name a DDL object.
+                let view_name =
                     super::super::materialized_view::MaterializedViewGenerator::view_name_for_rule_id(
                         existing_rule.id,
-                    )
-                });
+                    );
                 // Persist the repair intent before destructive DDL. If DROP succeeds but
                 // the following PostgreSQL update fails, the real-time rule remains the
                 // source of truth and the worker recreates its missing view.
@@ -787,11 +789,11 @@ impl DetectionService {
         }
 
         if rule.detection_mode == DetectionMode::RealTime {
-            let view_name = rule.materialized_view_name.clone().unwrap_or_else(|| {
+            // Security review 2026-11-08 (NAN-5018): derive, never read the stored name.
+            let view_name =
                 super::super::materialized_view::MaterializedViewGenerator::view_name_for_rule_id(
                     rule.id,
-                )
-            });
+                );
             // The reconciliation job survives a successful DROP; if archiving
             // then fails, the worker sees a non-archived rule and restores it.
             self.require_runtime_reconciliation(rule.id).await?;

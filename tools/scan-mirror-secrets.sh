@@ -50,6 +50,7 @@ PATTERNS+='|AIza[0-9A-Za-z_-]{35}'
 PATTERNS+='|AKIA[0-9A-Z]{16}'
 PATTERNS+='|dop_v1_[a-f0-9]{60,}'
 PATTERNS+='|pul-[a-f0-9]{40}'
+PATTERNS+='|nsiem-docs-[A-Za-z0-9]{20,}'   # docs RAG worker tokens (NAN-5025)
 PATTERNS+='|-----BEGIN [A-Z ]*PRIVATE KEY-----[[:space:]]*[A-Za-z0-9+/]{40,}'
 
 # Known-benign literals. Keep this list SHORT and justified — every entry is a
@@ -192,6 +193,7 @@ printf '%s\n' "$hits" | sed -E \
     -e 's/(AKIA[0-9A-Z]{4})[0-9A-Z]*/\1…REDACTED/g' \
     -e 's/(dop_v1_[a-f0-9]{6})[a-f0-9]*/\1…REDACTED/g' \
     -e 's/(pul-[a-f0-9]{6})[a-f0-9]*/\1…REDACTED/g' \
+    -e 's/(nsiem-docs-)[A-Za-z0-9]*/\1…REDACTED/g' \
     -e 's/(PRIVATE KEY-----[[:space:]]*)[A-Za-z0-9+\/]+/\1…REDACTED/g'
 echo ""
 echo "Remove the credential, then ROTATE it — assume anything that reached this"

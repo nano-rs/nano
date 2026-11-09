@@ -21,6 +21,7 @@
 //! - Unified audit logging to ClickHouse
 
 pub mod ai_provider;
+pub mod ai_provider_safety;
 // Air-gapped signed bundle format + Ed25519 verification (NAN-1201) — enterprise
 // only. Gated to match the api-side `#[cfg(feature = "enterprise")] pub mod airgap;`
 // so the open edition excludes the source, and the open-core mirror can strip the
@@ -38,7 +39,7 @@ pub mod crypto;
 pub mod csv_safe;
 pub mod db;
 pub mod demo;
-pub mod internal_domains;
+pub mod deployment_posture;
 pub mod detection;
 pub mod detection_code_target;
 pub mod enrichment;
@@ -47,14 +48,18 @@ pub mod extensions;
 pub mod feeds;
 pub mod gdpr;
 pub mod health;
+pub mod http_body;
+#[cfg(feature = "enterprise")]
 pub mod hunts;
 pub mod identity;
-pub mod ingestion;
 /// Named, revocable per-source ingest tokens (NAN-4907, ported from NAN-3770/3806).
 pub mod ingest_tokens;
 pub mod ingest_watchdog;
+pub mod ingestion;
 pub mod inputlookup;
+pub mod internal_domains;
 pub mod ip_allowlist;
+pub mod known_public_secrets;
 pub mod leader;
 // Enterprise-only: license / phone-home machinery is stripped from the open
 // edition entirely (NAN-1193), not merely runtime-disabled.
@@ -72,9 +77,13 @@ pub mod onboarding;
 pub mod parser_repository;
 pub mod parsers;
 pub mod platform_enrichment;
+#[cfg(feature = "enterprise")]
 pub mod playbook_repository;
+#[cfg(feature = "enterprise")]
 pub mod playbooks;
 pub mod prevalence;
+pub mod principal_gate;
+pub mod process_supervision;
 pub mod query;
 pub mod query_library;
 pub mod reports;
@@ -84,13 +93,16 @@ pub mod scheduler;
 pub mod schema;
 pub mod search;
 pub mod settings;
-pub mod process_supervision;
 pub mod shutdown;
 pub mod siem_health;
-pub mod system_health;
 pub mod source_configs;
 pub mod sql_hygiene;
+#[cfg(test)]
+#[path = "sql_interpolation_lint_tests.rs"]
+mod sql_interpolation_lint_tests;
+pub mod system_health;
 pub mod telemetry;
+pub mod text_bounds;
 pub mod timezone;
 pub mod tuning;
 pub mod typeid;
@@ -180,35 +192,35 @@ pub use auth::{
     },
     types::{
         builtin_groups, builtin_roles, config_defaults, config_keys, ApiKey, ApiKeyCreated,
-        AuthResponse, CreateApiKeyRequest,
-        CreateGroupRequest, CreateOidcProviderRequest, CreateRoleRequest, CreateUserRequest, Group,
-        GroupSummary, GroupWithDetails, LoginRequest, OidcGroupMapping, OidcProvider,
-        PasswordResetCompletion, PasswordResetRequest, Permission, RefreshTokenRequest, Role,
-        RoleSummary, RoleWithPermissions, Session, SessionResponse, SystemConfig, TokenClaims,
-        TokenPair, UpdateGroupRequest, UpdateOidcProviderRequest, UpdateRoleRequest,
-        UpdateUserRequest, User, UserInfo, UserStatus, UserWithGroups,
+        AuthResponse, CreateApiKeyRequest, CreateGroupRequest, CreateOidcProviderRequest,
+        CreateRoleRequest, CreateUserRequest, Group, GroupSummary, GroupWithDetails, LoginRequest,
+        OidcGroupMapping, OidcProvider, PasswordResetCompletion, PasswordResetRequest, Permission,
+        RefreshTokenRequest, Role, RoleSummary, RoleWithPermissions, Session, SessionResponse,
+        SystemConfig, TokenClaims, TokenPair, UpdateGroupRequest, UpdateOidcProviderRequest,
+        UpdateRoleRequest, UpdateUserRequest, User, UserInfo, UserStatus, UserWithGroups,
     },
 };
-pub use entity_extraction::{EntityExtractor, ExtractedEntity};
 pub use crypto::{CryptoError, EncryptedData, EncryptionService};
 pub use db::{
     ArtifactRepository, ArtifactRepositoryError, DashboardRepository, DashboardRepositoryError,
     Database, DatabaseConfig, DualPool, DualPoolConfig, DualPoolError, HealthStatus,
-    NotebookRepository, NotebookRepositoryError, TableNames,
+    TableNames,
 };
+pub use entity_extraction::{EntityExtractor, ExtractedEntity};
 // Cases & incidents repositories are enterprise-only (NAN-1298). Re-exported at
 // the crate root only when the `enterprise` feature is on; gated out of the open
 // edition alongside the modules themselves in db/repository.rs.
 #[cfg(feature = "enterprise")]
 pub use db::{
     CaseRepository, CaseRepositoryError, IncidentRepository, IncidentRepositoryError,
+    NotebookRepository, NotebookRepositoryError,
 };
 pub use detection::{
-    calculate_next_run_phased, generate_node_id, DailyMatchCount, DetectionError,
-    DetectionService, DistributedDetectionScheduler, DistributedSchedulerConfig,
-    HistoricalAnalysisResult, MaterializedViewError, MaterializedViewGenerator,
-    RiskError, RiskModifier, RiskResult, RuleTestAdmission, RuleTestAdmissionError,
-    RuleTestPermit, ScoreCalculator, SignalProcessor, SignalProcessorConfig, TimeBucket,
+    calculate_next_run_phased, generate_node_id, DailyMatchCount, DetectionError, DetectionService,
+    DistributedDetectionScheduler, DistributedSchedulerConfig, HistoricalAnalysisResult,
+    MaterializedViewError, MaterializedViewGenerator, RiskError, RiskModifier, RiskResult,
+    RuleTestAdmission, RuleTestAdmissionError, RuleTestPermit, ScoreCalculator, SignalProcessor,
+    SignalProcessorConfig, TimeBucket,
 };
 pub use enrichment::{
     EnrichmentError, EnrichmentRepository, EnrichmentService, IpEnrichmentResult, LogEnrichment,
@@ -236,11 +248,6 @@ pub use leader::LeaderElection;
 pub use license::{
     LicenseChecker, LicenseRepository, LicenseResponse, LicenseState, LicenseStatus,
 };
-pub use log_telemetry::{
-    BucketSize as LogTelemetryBucketSize, HourlyPoint as LogTelemetryHourlyPoint,
-    LogTelemetryError, LogTelemetryRepository, LogTelemetryService,
-    SourceTypeStats as LogTelemetrySourceTypeStats,
-};
 pub use log_sources::{
     AiSuggestions, HealthStatus as LogSourceHealthStatus, HistoryPoint, IngestionTrend,
     ListParams as LogSourceListParams, LogSource, LogSourceCategory, LogSourceDeployment,
@@ -248,6 +255,11 @@ pub use log_sources::{
     LogSourceService, LogSourceServiceError, LogSourceVersion, LogSourceVersionError,
     LogSourceVersionRepository, LogSourceWithDraftStatus, NewLogSource, SourceType,
     UpdateLogSource, WizardEntry, WizardProgressEvent, WizardSession, WizardStep,
+};
+pub use log_telemetry::{
+    BucketSize as LogTelemetryBucketSize, HourlyPoint as LogTelemetryHourlyPoint,
+    LogTelemetryError, LogTelemetryRepository, LogTelemetryService,
+    SourceTypeStats as LogTelemetrySourceTypeStats,
 };
 pub use lookup::{
     sanitize_identifier, sanitize_identifiers, BatchLookupQuery, BatchLookupResult,
@@ -274,23 +286,6 @@ pub use parser_repository::{
     SyncResult as ParserSyncResult, SyncStatus as ParserSyncStatus,
     UpdateParserRepository as UpdateParserRepo, UpstreamParserDiff,
 };
-pub use playbook_repository::{
-    NewPlaybookRepository, PlaybookImport, PlaybookImportRequest, PlaybookImportResponse,
-    PlaybookImportType, PlaybookImportsRepository,
-    PlaybookRepoRepository as PlaybookRepositoryRepository, PlaybookRepository as PlaybookRepo,
-    PlaybookRepositoryError, PlaybookRepositoryService, PlaybookRepositoryServiceConfig,
-    PlaybookSyncResult, PlaybookSyncStatus, RepositoryPlaybook, RepositoryPlaybookFilter,
-    RepositoryPlaybooksRepository, UpdatePlaybookRepository,
-};
-pub use playbooks::{
-    eval_when, normalize_answer, parse_playbook, parse_step_body, parse_when_clause,
-    AdaptiveSource, CreatePlaybookRequest, DangerPolicy as PlaybookDangerPolicy,
-    ForkPlaybookRequest, ListPlaybooksQuery, ParsedStepTree, Playbook, PlaybookApproval,
-    PlaybookCategory, PlaybookError, PlaybookFrontmatter, PlaybookListResponse,
-    PlaybookPermission, PlaybookPhase, PlaybookRepository, PlaybookRun, PlaybookScope,
-    PlaybookService, PlaybookStatus, PlaybookStep, PlaybookVersion, UpdatePlaybookRequest,
-    WhenClause, WhenOp, WhenResult,
-};
 pub use parsers::{
     AwsS3Credentials, CloudCredential, CloudProvider, CreateCloudCredential, CredentialRepository,
     CredentialRepositoryError, DeploymentAction, DeploymentResult, DeploymentStatus,
@@ -299,15 +294,38 @@ pub use parsers::{
     UpdateCloudCredential, UpdateParser, ValidationResult, VectorConfigPublicationError,
     VectorConfigPublisher, VrlValidationResult,
 };
+#[cfg(feature = "enterprise")]
+pub use playbook_repository::{
+    NewPlaybookRepository, PlaybookImport, PlaybookImportRequest, PlaybookImportResponse,
+    PlaybookImportType, PlaybookImportsRepository,
+    PlaybookRepoRepository as PlaybookRepositoryRepository, PlaybookRepository as PlaybookRepo,
+    PlaybookRepositoryError, PlaybookRepositoryService, PlaybookRepositoryServiceConfig,
+    PlaybookSyncResult, PlaybookSyncStatus, RepositoryPlaybook, RepositoryPlaybookFilter,
+    RepositoryPlaybooksRepository, UpdatePlaybookRepository,
+};
+#[cfg(feature = "enterprise")]
+pub use playbooks::{
+    eval_when, normalize_answer, parse_playbook, parse_step_body, parse_when_clause,
+    AdaptiveSource, CreatePlaybookRequest, DangerPolicy as PlaybookDangerPolicy,
+    ForkPlaybookRequest, ListPlaybooksQuery, ParsedStepTree, Playbook, PlaybookApproval,
+    PlaybookCategory, PlaybookError, PlaybookFrontmatter, PlaybookListResponse, PlaybookPermission,
+    PlaybookPhase, PlaybookRepository, PlaybookRun, PlaybookScope, PlaybookService, PlaybookStatus,
+    PlaybookStep, PlaybookVersion, UpdatePlaybookRequest, WhenClause, WhenOp, WhenResult,
+};
 pub use prevalence::{
     ArtifactType, BulkPrevalenceRequest, ExportFormat, PrevalenceConfig, PrevalenceData,
-    PrevalenceError, PrevalenceRepository, PrevalenceScatterData,
-    PrevalenceScatterPoint, PrevalenceService, TimeWindow, MAX_BULK_ARTIFACTS,
+    PrevalenceError, PrevalenceRepository, PrevalenceScatterData, PrevalenceScatterPoint,
+    PrevalenceService, TimeWindow, MAX_BULK_ARTIFACTS,
 };
 pub use query::{collect_derived_fields, parse_query, ParseError, PrettyPrint, Query};
 pub use query_library::{
     CategoryCount, LibraryFilter, LibraryQuery, NewLibraryQuery, QueryDifficulty,
     QueryLibraryRepository,
+};
+pub use reports::{
+    NewReportDefinition, ReportArtifactContent, ReportArtifactMeta, ReportDefinition, ReportError,
+    ReportRepository, ReportRepositoryError, ReportRun, ReportRunStatus, ReportService,
+    ReportSourceType, UpdateReportDefinition,
 };
 pub use risk::{
     EntityActivityResponse, EntityDailyCount, EntityRiskScore, EntityRiskSummary,
@@ -323,11 +341,6 @@ pub use rule_repository::{
     SigmaLogsource, SigmaParseError, SigmaRule, SyncResult, SyncStatus, UpdateRuleRepository,
     UpdatedRule,
 };
-pub use reports::{
-    NewReportDefinition, ReportArtifactContent, ReportArtifactMeta, ReportDefinition, ReportError,
-    ReportRepository, ReportRepositoryError, ReportRun, ReportRunStatus, ReportService,
-    ReportSourceType, UpdateReportDefinition,
-};
 pub use scheduler::{
     calculate_next_run, calculate_next_runs, describe_cron, merge_auth_headers,
     redact_auth_headers, validate_cron, JobExecution, JobFilter, JobStats, JobStatus,
@@ -339,15 +352,16 @@ pub use search::{
     SearchService, TimeRangeInput, UdmFieldQueryRequest, UdmQueryOperator,
 };
 pub use settings::{
-    ai_request_cost, credits_for_cost_tier, resolve_ai_request_cost, check_api_access,
-    check_api_write_access, check_limit, check_model_access, check_sso_access, generate_warnings,
-    AgentUsage, AiModelTier, AiUsage, AiUsageEvent,
-    ApiAccessLevel, DailyAiUsage, DailyUsage,
-    DeveloperSettingsError, DeveloperSettingsRepository, DiskPressureConfig, DiskPressureError,
-    DiskPressureLevel, DiskPressureService, DiskPressureStatus, OrganizationTier, RetentionConfig,
-    RetentionError, RetentionService, SchedulerSettings, StorageStats, SystemSettings, TierError,
-    TierLimitExceeded, TierLimits, TierSettings, TierStatus, TierUsage, TierWarning,
-    UpdateTierLimits, AI_CREDIT_FULL, AI_CREDIT_LITE,
+    ai_request_cost, check_api_access, check_api_write_access, check_limit, check_model_access,
+    check_sso_access, credits_for_cost_tier, generate_warnings, parse_capacity_gb_per_day,
+    full_request_cost, resolve_ai_request_cost, AgentUsage, AiModelTier, AiUsage, AiUsageEvent, ApiAccessLevel,
+    DailyAiUsage, DailyUsage, DeveloperSettingsError, DeveloperSettingsRepository,
+    DiskPressureConfig, DiskPressureError, DiskPressureLevel, DiskPressureService,
+    DiskPressureStatus, Entitlement, EntitlementEdition, EntitlementOperator, OrganizationTier,
+    RetentionConfig, RetentionError, RetentionService, SchedulerSettings, StorageStats,
+    SystemSettings, TierError, TierLimitExceeded, TierLimits, TierSettings, TierStatus, TierUsage,
+    TierWarning, UpdateTierLimits, AI_CREDITS_CEILING_ENV, AI_CREDIT_FULL, AI_CREDIT_LITE, AI_CREDIT_NONE,
+    CAPACITY_GB_PER_DAY_ENV,
 };
 pub use source_configs::{
     DeploymentResult as SourceConfigDeploymentResult, ListParams as SourceConfigListParams,

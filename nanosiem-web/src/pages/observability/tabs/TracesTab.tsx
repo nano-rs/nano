@@ -179,7 +179,7 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
     return `/search#dataset=spans${q ? `&q=${encodeURIComponent(q)}` : ''}`;
   }, [svc, errOnly, minDurMs]);
 
-  // NAN-1721 (O36): the trace fetch is Dragonfly-cached like every other obs
+  // NAN-1721 (O36): the trace fetch is Valkey-cached like every other obs
   // read, so the drill-in surfaces the same "cached · refresh" badge. Its cache
   // state is separate from the list's — a refresh flips the bypass flag then
   // refetches live, bypassing the server cache for that one fetch.

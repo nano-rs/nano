@@ -157,6 +157,43 @@ impl SystemHealthRepository {
             .await
     }
 
+    /// Resolve every active condition whose dedup key starts with `prefix`
+    /// and that has not been seen since `stale_before` — conditions whose
+    /// producer died without resolving them (for example a replaced pod).
+    /// Each resolution fans out to the matching destinations like any other.
+    pub async fn resolve_stale_by_prefix(
+        &self,
+        prefix: &str,
+        stale_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<SystemHealthEvent>, SystemHealthError> {
+        let mut tx = self.pool.begin().await?;
+        // `left(...) = $2`, not LIKE: dedup keys contain `_`, a LIKE wildcard.
+        let events = sqlx::query_as::<_, SystemHealthEvent>(
+            r#"
+            UPDATE system_health_events
+            SET status = 'resolved', resolved_at = NOW(), updated_at = NOW()
+            WHERE tenant_id = $1 AND status = 'active'
+              AND left(dedup_key, length($2)) = $2
+              AND last_seen_at < $3
+            RETURNING id, tenant_id, dedup_key, category, severity, status, title, summary,
+                      resource_type, resource_id, resource_name, diagnostic_context,
+                      remediation, source, occurrence_count, first_seen_at, last_seen_at,
+                      last_notified_at, acknowledged_at, acknowledged_by, resolved_at,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(DEFAULT_TENANT_ID)
+        .bind(prefix)
+        .bind(stale_before)
+        .fetch_all(&mut *tx)
+        .await?;
+        for event in &events {
+            enqueue_matching_destinations(&mut tx, event, "resolved").await?;
+        }
+        tx.commit().await?;
+        Ok(events)
+    }
+
     pub async fn resolve_by_id(&self, id: Uuid) -> Result<SystemHealthEvent, SystemHealthError> {
         self.resolve_active(DEFAULT_TENANT_ID, None, Some(id))
             .await?

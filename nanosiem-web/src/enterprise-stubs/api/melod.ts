@@ -21,6 +21,8 @@ import type {
   AiAvailability,
   ProviderCredentials,
   UpdateProviderCredentialsRequest,
+  DiscoverModelsRequest,
+  DiscoverModelsResponse,
   AgentModelConfig,
   UpdateAgentModelConfigRequest,
   AvailableModel,
@@ -141,6 +143,12 @@ export class MelodApi {
     return ENTERPRISE_ONLY();
   }
   validateAiProvider(_provider: string): Promise<{ success: boolean; message: string }> {
+    return ENTERPRISE_ONLY();
+  }
+  discoverProviderModels(
+    _provider: string,
+    _request?: DiscoverModelsRequest,
+  ): Promise<DiscoverModelsResponse> {
     return ENTERPRISE_ONLY();
   }
   listAgentModelConfigs(): Promise<AgentModelConfig[]> {

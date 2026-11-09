@@ -15,7 +15,7 @@ once via the GitHub OAuth flow, and you're set for all future PRs.
 **Why a CLA, not DCO?** nano is open-core: the engine is AGPL-3.0, the
 enterprise add-ons (Cases, pivt, meloD, risk) live in a separate proprietary
 crate. To accept community patches into the engine and still ship the
-enterprise build, Nano LLC needs the right to sublicense your contribution.
+enterprise build, nano, LLC needs the right to sublicense your contribution.
 DCO grants too little; an ICLA is the smallest tool that does the job. The
 text is adapted from the Apache ICLA — it gives you a copyright, doesn't
 take it away.
@@ -119,5 +119,5 @@ issues go to [conduct@nano.rs](mailto:conduct@nano.rs).
 ## License
 
 By contributing, you agree your contribution is licensed under AGPL-3.0
-(matching the rest of the engine) and that the ICLA grants Nano LLC the
+(matching the rest of the engine) and that the ICLA grants nano, LLC the
 sublicensing rights described therein.

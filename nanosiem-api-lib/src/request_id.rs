@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Request ID middleware for the Main API
+//! Request ID middleware shared by the Main API and the Search service
 //!
 //! Provides request ID extraction/generation for distributed tracing.
 //! Propagates request IDs to downstream services (Ingest, Search).
@@ -13,6 +13,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use tracing::Instrument;
 use uuid::Uuid;
 
 /// Header name for request ID
@@ -82,22 +83,24 @@ pub async fn request_id_middleware(mut request: Request, next: Next) -> Response
     // Add request ID to extensions for use in handlers
     request.extensions_mut().insert(request_id.clone());
 
-    // Process the request within the span, measuring duration
+    // NAN-5102: instrument the inner future; never hold `span.enter()`
+    // across `.await`. An entered guard stays on the worker thread's span
+    // stack while the task is parked, so every request polled on that thread
+    // meanwhile runs inside this span and parents its own spans to it. Under
+    // load that chained requests into `request{A}:request{B}:…`, tripped
+    // tracing-subscriber's registry assertions, and the recursive close of the
+    // ever-deeper chain overflowed the stack, aborting the whole process.
     let start = std::time::Instant::now();
-    let response = {
-        let _guard = span.enter();
-        next.run(request).await
-    };
+    let response = next.run(request).instrument(span.clone()).await;
     let duration_ms = start.elapsed().as_millis() as u64;
     let status = response.status().as_u16();
-    {
-        let _guard = span.enter();
+    span.in_scope(|| {
         tracing::info!(
             status = status,
             duration_ms = duration_ms,
             "Request completed"
         );
-    }
+    });
 
     // Add request ID to response headers
     let mut response = response;
@@ -109,3 +112,7 @@ pub async fn request_id_middleware(mut request: Request, next: Next) -> Response
 
     response
 }
+
+#[cfg(test)]
+#[path = "request_id_tests.rs"]
+mod tests;

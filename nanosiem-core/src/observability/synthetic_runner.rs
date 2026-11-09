@@ -311,7 +311,9 @@ impl SyntheticRunner {
 
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("nano-synthetic-monitor");
+            .user_agent("nano-synthetic-monitor")
+            // An env proxy re-resolves the host and undoes the pin below.
+            .no_proxy();
 
         // IP-literal hosts return an empty Vec (reqwest dials the literal,
         // already validated). DNS-name hosts: pin reqwest to the pre-validated
@@ -349,7 +351,7 @@ impl SyntheticRunner {
             match Self::ssrf_checked_client(&check.target_url).await {
                 Err(reason) => {
                     let mut msg = reason;
-                    msg.truncate(500);
+                    crate::text_bounds::truncate_in_place(&mut msg, 500);
                     // Blocked before any request left the box — no round-trip to time.
                     (0u16, msg, 0.0_f64)
                 }
@@ -364,7 +366,7 @@ impl SyntheticRunner {
                             // The elapsed send() time is still meaningful latency
                             // (e.g. a timeout at the configured deadline).
                             let mut msg = e.to_string();
-                            msg.truncate(500);
+                            crate::text_bounds::truncate_in_place(&mut msg, 500);
                             (0u16, msg, latency_ms)
                         }
                     }

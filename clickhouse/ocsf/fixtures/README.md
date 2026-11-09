@@ -21,7 +21,7 @@ These fixtures are vendored against the OCSF classes captured under
 | `dns_activity_4003_query.json` | DNS Activity | 4003 | 4 (Network) | 2 (Response) | 400302 |
 
 Every fixture satisfies the OCSF taxonomy invariant
-`type_uid == class_uid * 100 + activity_id`, carries `metadata.version = "1.8.0"`,
+`type_uid == class_uid * 100 + activity_id`, carries `metadata.version = "1.9.0"`,
 and `time` is **epoch milliseconds** (13 digits, `timestamp_t`) — convert with
 `fromUnixTimestamp64Milli(time)`, never compare the raw int to a `DateTime64`
 (coerces as seconds → far future; cf. NAN-1123).

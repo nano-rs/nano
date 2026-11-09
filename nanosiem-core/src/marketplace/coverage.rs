@@ -523,7 +523,7 @@ pub struct MarketplaceCoverageService {
 
 impl MarketplaceCoverageService {
     /// Construct a service that consults `cache` before recomputing. In
-    /// production the cache is Dragonfly-backed (see
+    /// production the cache is Valkey-backed (see
     /// [`MarketplaceCoverageCache::with_redis`]), so a slow recompute on
     /// one replica warms the hero for callers with the same effective source
     /// visibility on every replica for the next 6 hours.

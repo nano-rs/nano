@@ -725,7 +725,11 @@ impl SearchService {
                         if let Some(hash) = &found_hash {
                             // Truncate long hashes for display
                             let display_hash = if hash.len() > 16 {
-                                format!("{}...{}", &hash[..8], &hash[hash.len() - 8..])
+                                format!(
+                                    "{}...{}",
+                                    crate::text_bounds::prefix_at_most(hash, 8),
+                                    &hash[hash.floor_char_boundary(hash.len() - 8)..]
+                                )
                             } else {
                                 hash.clone()
                             };

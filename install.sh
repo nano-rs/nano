@@ -22,6 +22,11 @@
 #
 # Non-interactive use: set the prompt values as env vars before running.
 #   NANO_ADMIN_EMAIL, NANO_ADMIN_NAME, NANO_ADMIN_PASSWORD, NANO_BASE_URL
+#   NANO_HTTPS_PROXY (http://host:port), NANO_PROXY_USERNAME / NANO_PROXY_PASSWORD
+#   (raw; the installer percent-encodes them) and NANO_NO_PROXY — outbound proxy for
+#   nano's own calls; asked once, kept in .env as HTTPS_PROXY/HTTP_PROXY/NO_PROXY.
+#   NANO_ALLOW_PRIVATE_AI_ENDPOINTS (true | false, default false) — allow AI
+#   providers on private addresses (a local LLM); asked once, kept in .env.
 #   NANO_SCHEMA_PROFILE (ocsf | udm | ocsf+tenzir, default ocsf) — chosen at
 #   first install and immutable afterward; see the prompt below. New installs
 #   are OCSF-first (NAN-4903); an existing install keeps the profile recorded in
@@ -156,6 +161,21 @@ esac
 # nano-api / nano-search ports are not exposed to the host by default.
 HOST_PORT="${NANO_HOST_PORT:-80}"
 API_BASE="http://localhost:${HOST_PORT}"
+# Extra curl flags for installer -> edge calls (see the TLS overlay below).
+API_CURL_ARGS=()
+
+# NAN-5124: an installer -> edge call succeeds only on a 2xx. `curl -f` fails
+# only on 4xx/5xx, so a redirect (the TLS overlay's :80 -> https 301) used to
+# read as success and the installer printed "Admin user created" with no admin.
+# Usage: api_call <body-file|/dev/null> <curl args...>; prints the HTTP status.
+api_call() {
+    local out="$1" code
+    shift
+    code=$(curl -sS --max-redirs 0 -o "$out" -w '%{http_code}' \
+        ${API_CURL_ARGS[@]+"${API_CURL_ARGS[@]}"} "$@" </dev/null 2>/dev/null) || code="${code:-000}"
+    printf '%s' "${code:-000}"
+    [[ "$code" == 2[0-9][0-9] ]]
+}
 
 c_reset='\033[0m'
 c_bold='\033[1m'
@@ -234,6 +254,172 @@ prompt_tty() {
 
 have_controlling_tty() {
     (exec 9<>/dev/tty) 2>/dev/null
+}
+
+# Yes/no answer -> true/false; empty output for anything else.
+normalize_bool() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+        y|yes|true|1|on)   printf 'true' ;;
+        n|no|false|0|off)  printf 'false' ;;
+    esac
+}
+
+# Outbound proxy URL: http(s)://[user[:pass]@]host:port[/]. No quotes,
+# whitespace or newlines can reach .env.
+valid_proxy_url() {
+    [[ "${1:-}" =~ ^https?://([A-Za-z0-9._~%-]+(:[A-Za-z0-9._~%-]+)?@)?([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\]):[0-9]{1,5}/?$ ]]
+}
+
+# A proxy URL for output: any user[:pass]@ is replaced by ***@ so credentials
+# never reach the terminal or a captured install log.
+redact_proxy_url() {
+    printf '%s' "${1:-}" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1***@#'
+}
+
+# The same shape without credentials: what the interactive prompt accepts.
+valid_proxy_hostport() {
+    [[ "${1:-}" =~ ^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\]):[0-9]{1,5}/?$ ]]
+}
+
+strip_proxy_userinfo() {
+    printf '%s' "${1:-}" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@#\1#'
+}
+
+# Percent-encode every byte outside RFC 3986 unreserved (A-Z a-z 0-9 - . _ ~).
+pct_encode() {
+    local LC_ALL=C value="${1:-}" out="" char hex i
+    for ((i = 0; i < ${#value}; i++)); do
+        char="${value:i:1}"
+        case "$char" in
+            [A-Za-z0-9._~-]) out+="$char" ;;
+            *) printf -v hex '%%%02X' "'$char"; out+="$hex" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# ask_yes_no <question> <Y|N default> -> true/false; re-asks on anything else.
+ask_yes_no() {
+    local answer hint="[y/N]"
+    [[ "$2" == "Y" ]] && hint="[Y/n]"
+    while :; do
+        answer=$(prompt_tty "$1 $hint")
+        [[ -z "$answer" ]] && answer="$2"
+        answer=$(normalize_bool "$answer")
+        [[ -n "$answer" ]] && { printf '%s' "$answer"; return 0; }
+        warn "Answer y or n."
+    done
+}
+
+# Extra NO_PROXY entries: comma-separated host / domain / IP / CIDR tokens.
+valid_no_proxy() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9.*:/_-]+(,[A-Za-z0-9.*:/_-]+)*$ ]]
+}
+
+# Corporate egress proxy for nano's own outbound calls (licence check-in,
+# feeds, content, OIDC/identity sync, S3 tiering). Asked once, only while
+# .env has neither HTTPS_PROXY nor a recorded answer; a re-run or upgrade
+# never asks again. Unattended installs pass NANO_HTTPS_PROXY (and
+# NANO_NO_PROXY). No TTY and no input means no proxy. A proxy already
+# exported in the installer's shell is offered as the default.
+configure_outbound_proxy() {
+    local answer url extra auth="" user="" pass="" confirm default_answer="N"
+    local shell_proxy="${HTTPS_PROXY:-${https_proxy:-}}"
+    if [[ -n "$(env_value HTTPS_PROXY)" || -n "$(env_value NANO_OUTBOUND_PROXY_ASKED)" ]]; then
+        return 0
+    fi
+    url="" extra=""
+    if [[ -n "${NANO_HTTPS_PROXY:-}" ]]; then
+        url="$NANO_HTTPS_PROXY" extra="${NANO_NO_PROXY:-}"
+        user="${NANO_PROXY_USERNAME:-}" pass="${NANO_PROXY_PASSWORD:-}"
+    elif have_controlling_tty; then
+        # Offer an exported proxy as the default, without any credentials it
+        # carries (they would be shown in the prompt).
+        shell_proxy=$(strip_proxy_userinfo "$shell_proxy")
+        valid_proxy_hostport "$shell_proxy" || shell_proxy=""
+        [[ -n "$shell_proxy" ]] && default_answer="Y"
+        answer=$(ask_yes_no "Does this server reach the internet through an HTTP(S) proxy?" "$default_answer")
+        if [[ "$answer" == "true" ]]; then
+            while :; do
+                url=$(prompt_tty "Proxy URL (http://host:port)" "$shell_proxy")
+                valid_proxy_hostport "$url" && break
+                warn "Enter the proxy as http://host:port or https://host:port (no credentials, quotes or spaces)."
+            done
+            auth=$(ask_yes_no "Does the proxy require a username and password?" "N")
+            if [[ "$auth" == "true" ]]; then
+                while :; do
+                    user=$(prompt_tty "Proxy username (DOMAIN\\user is fine)")
+                    [[ -n "$user" ]] && break
+                    warn "Enter the proxy username."
+                done
+                while :; do
+                    pass=$(prompt_tty "Proxy password" "" secret)
+                    confirm=$(prompt_tty "Confirm proxy password" "" secret)
+                    if [[ -z "$pass" ]]; then
+                        warn "Enter the proxy password."
+                    elif [[ "$pass" != "$confirm" ]]; then
+                        warn "The passwords do not match. Enter them again."
+                    else
+                        break
+                    fi
+                done
+            fi
+            while :; do
+                extra=$(prompt_tty "Extra hosts that bypass the proxy, comma-separated (blank = none)" "${NO_PROXY:-${no_proxy:-}}")
+                [[ -z "$extra" ]] && break
+                valid_no_proxy "$extra" && break
+                warn "Enter comma-separated host names, domains, IPs or CIDRs (no spaces)."
+            done
+        fi
+    fi
+    if [[ -n "$url" && -n "$user" ]]; then
+        # RFC 3986 userinfo: everything outside the unreserved set is
+        # percent-encoded (DOMAIN\user, p@ss:w/rd!# ...). reqwest decodes it.
+        url="${url%%://*}://$(pct_encode "$user"):$(pct_encode "$pass")@${url#*://}"
+    fi
+    user="" pass="" confirm=""
+    # Append the effective assignments so a symlinked .env remains a link
+    # (and keeps its 0600 mode).
+    if [[ -n "$url" ]]; then
+        printf 'HTTPS_PROXY=%s\nHTTP_PROXY=%s\n' "$url" "$url" >> .env
+        [[ -n "$extra" ]] && printf 'NO_PROXY=%s\n' "$extra" >> .env
+        log "nano's outbound calls use the proxy $(redact_proxy_url "$url") (HTTPS_PROXY in .env; internal services and private ranges bypass it)"
+        log "Docker image pulls use the Docker daemon's own proxy settings (a systemd drop-in for docker.service), not nano's: https://nano.rs/docs/getting-started/self-run#corporate-proxy"
+    fi
+    printf 'NANO_OUTBOUND_PROXY_ASKED=true\n' >> .env
+}
+
+# Private-address AI providers (a BYO local LLM on 10.x / 192.168.x). The AI
+# base-URL validator refuses private addresses unless
+# NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS is on (cloud-metadata stays blocked
+# either way). Asked once, only while .env has no value; the answer is kept in
+# .env so a re-run or upgrade never asks again. Unattended installs pass
+# NANO_ALLOW_PRIVATE_AI_ENDPOINTS=true|false; with no TTY the default is false.
+configure_private_ai_endpoints() {
+    local recorded answer
+    recorded=$(env_value NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS)
+    if [[ -n "$recorded" ]]; then
+        PRIVATE_AI_ENDPOINTS="$recorded"
+        return 0
+    fi
+    if [[ -n "${NANO_ALLOW_PRIVATE_AI_ENDPOINTS:-}" ]]; then
+        PRIVATE_AI_ENDPOINTS=$(normalize_bool "$NANO_ALLOW_PRIVATE_AI_ENDPOINTS")
+    elif have_controlling_tty; then
+        while :; do
+            answer=$(prompt_tty "Will nano use an AI model hosted on your own network (e.g. a local LLM on 192.168.x / 10.x)? This allows the AI provider URL to point at private addresses (cloud-metadata stays blocked). [y/N]")
+            [[ -z "$answer" ]] && answer=n
+            PRIVATE_AI_ENDPOINTS=$(normalize_bool "$answer")
+            [[ -n "$PRIVATE_AI_ENDPOINTS" ]] && break
+            warn "Answer y or n."
+        done
+    else
+        PRIVATE_AI_ENDPOINTS=false
+    fi
+    # Append the effective assignment so a symlinked .env remains a link.
+    printf 'NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS=%s\n' "$PRIVATE_AI_ENDPOINTS" >> .env
+    if [[ "$PRIVATE_AI_ENDPOINTS" == "true" ]]; then
+        log "AI providers on private addresses are allowed (NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS=true in .env)"
+    fi
 }
 
 gen_secret() { openssl rand -hex 32 </dev/null; }
@@ -678,6 +864,74 @@ if [[ -e .env || -L .env ]]; then
     validate_env_file "$NANO_INSTALL_DIR/.env"
 fi
 
+# NAN-5126: a rerun never narrows this host's installed roles. Every run
+# republishes the whole `.nano-generated` tree, but compose recreates only the
+# services of the profiles it is given. A service left out (ClickHouse on a
+# `--role ingest` rerun) keeps its directory bind mounts on the retired inode,
+# hot-reloads an empty config.d and falls back to loopback-only listeners while
+# the installer reports success. So the effective role set is the requested
+# roles plus every role this host already runs (the last run's recorded
+# profiles, and roles whose containers are running now), and all of them are
+# recreated onto the new tree. NANO_ROLE_NARROW=1 deliberately removes roles.
+if [[ -n "$ROLE_ARG" && "${NANO_ROLE_NARROW:-0}" != "1" ]]; then
+    installed_roles=""
+    installed_project=""
+    installed_host=""
+    if [[ -f .nano-role.env ]]; then
+        IFS=$'\t' read -r installed_roles installed_project installed_host < <(
+            python3 -I - .nano-role.env <<'PY_ROLES' || true
+import json
+import sys
+
+values = {}
+with open(sys.argv[1], encoding="utf-8") as role_env:
+    for line in role_env:
+        key, _, encoded = line.rstrip("\n").partition("=")
+        try:
+            values[key] = json.loads(encoded)
+        except ValueError:
+            continue
+roles = values.get("NANO_ROLE_PROFILES") or values.get("COMPOSE_PROFILES") or ""
+project = values.get("COMPOSE_PROJECT_NAME") or ""
+host = values.get("NANO_HOST_NAME") or ""
+print(*(v if isinstance(v, str) else "" for v in (roles, project, host)), sep="\t")
+PY_ROLES
+        )
+    fi
+    # Only this host's own record counts: a bundle copied from another host
+    # carries that host's role env.
+    current_host_name="${NANO_HOST_NAME:-$(hostname -s 2>/dev/null || hostname)}"
+    if [[ -z "$installed_host" || "$installed_host" != "$current_host_name" ]]; then
+        installed_roles=""
+        installed_project=""
+    fi
+    running_roles=""
+    if [[ -n "$installed_project" ]] && command -v docker >/dev/null 2>&1; then
+        while IFS= read -r running_service; do
+            case "$running_service" in
+                postgres) running_roles+=",postgres" ;;
+                clickhouse) running_roles+=",clickhouse" ;;
+                keeper) running_roles+=",keeper" ;;
+                vector|vector-config-consumer|vector-tap|ingest-edge) running_roles+=",ingest" ;;
+                nano-api|nano-jobs|nano-search|nano-web|nginx|app-internal-edge) running_roles+=",app" ;;
+            esac
+        done < <(docker ps --filter "label=com.docker.compose.project=$installed_project" \
+            --format '{{.Label "com.docker.compose.service"}}' </dev/null 2>/dev/null || true)
+    fi
+    effective_roles=""
+    for canonical_role in app ingest clickhouse keeper postgres; do
+        if [[ ",${ROLE_ARG},${installed_roles},${running_roles}," == *,"$canonical_role",* ]]; then
+            effective_roles+="${effective_roles:+,}$canonical_role"
+        fi
+    done
+    requested_sorted=$(printf '%s' "$ROLE_ARG" | tr ',' '\n' | sort -u | paste -sd, -)
+    effective_sorted=$(printf '%s' "$effective_roles" | tr ',' '\n' | sort -u | paste -sd, -)
+    if [[ -n "$effective_roles" && "$effective_sorted" != "$requested_sorted" ]]; then
+        warn "Requested role(s) '$ROLE_ARG', but this host already runs '${effective_sorted}'. A rerun never narrows a host's roles (NAN-5126): installing and recreating '$effective_roles' so every service attaches the newly published configuration. To remove a role deliberately, rerun with NANO_ROLE_NARROW=1."
+        ROLE_ARG="$effective_roles"
+    fi
+fi
+
 if [[ ! -f "$COMPOSE_FILE" ]]; then
     fail "$COMPOSE_FILE not found in $NANO_INSTALL_DIR. Branch '$NANO_BRANCH' may not include the OSS quickstart yet."
 fi
@@ -954,6 +1208,27 @@ if [[ -n "$RECORDED_PREFIX" && "$RECORDED_PREFIX" != "$NANO_IMAGE_PREFIX" ]]; th
 fi
 ok "Edition $NANO_EDITION (from $EDITION_FROM), release $NANO_VERSION ($NANO_IMAGE_PREFIX-*)"
 
+if [[ -n "${NANO_ALLOW_PRIVATE_AI_ENDPOINTS:-}" && -z "$(normalize_bool "$NANO_ALLOW_PRIVATE_AI_ENDPOINTS")" ]]; then
+    fail "NANO_ALLOW_PRIVATE_AI_ENDPOINTS must be true or false (got '$NANO_ALLOW_PRIVATE_AI_ENDPOINTS')."
+fi
+
+if [[ -n "${NANO_HTTPS_PROXY:-}" ]] && ! valid_proxy_url "$NANO_HTTPS_PROXY"; then
+    fail "NANO_HTTPS_PROXY must look like http://host:port or https://host:port (got '$(redact_proxy_url "$NANO_HTTPS_PROXY")')."
+fi
+if [[ -n "${NANO_NO_PROXY:-}" ]] && ! valid_no_proxy "$NANO_NO_PROXY"; then
+    fail "NANO_NO_PROXY must be comma-separated host names, domains, IPs or CIDRs without spaces."
+fi
+if [[ -n "${NANO_NO_PROXY:-}" && -z "${NANO_HTTPS_PROXY:-}" ]]; then
+    fail "NANO_NO_PROXY needs NANO_HTTPS_PROXY."
+fi
+if [[ -n "${NANO_PROXY_USERNAME:-}${NANO_PROXY_PASSWORD:-}" ]]; then
+    [[ -n "${NANO_HTTPS_PROXY:-}" ]] || fail "NANO_PROXY_USERNAME/NANO_PROXY_PASSWORD need NANO_HTTPS_PROXY."
+    [[ -n "${NANO_PROXY_USERNAME:-}" && -n "${NANO_PROXY_PASSWORD:-}" ]] \
+        || fail "Set both NANO_PROXY_USERNAME and NANO_PROXY_PASSWORD, or neither."
+    valid_proxy_hostport "$NANO_HTTPS_PROXY" \
+        || fail "With NANO_PROXY_USERNAME/NANO_PROXY_PASSWORD, NANO_HTTPS_PROXY must not carry credentials (got '$(redact_proxy_url "$NANO_HTTPS_PROXY")')."
+fi
+
 if [[ "${NANO_CHECK_ONLY:-0}" == "1" ]]; then
     printf 'edition=%s\nversion=%s\nimage_prefix=%s\nlock=%s\n' "$NANO_EDITION" "$NANO_VERSION" "$NANO_IMAGE_PREFIX" "$IMAGES_LOCK"
     exit 0
@@ -990,6 +1265,27 @@ if [[ -f .env ]]; then
         || fail "Could not validate/backfill required generated secrets in $NANO_INSTALL_DIR/.env."
     if [[ -n "$NANO_BACKFILLED_SECRET_KEYS" ]]; then
         log "Backfilled required generated secrets in .env: $NANO_BACKFILLED_SECRET_KEYS"
+    fi
+    # Security review 2026-11-08: values nano once shipped as defaults or
+    # examples are public. They are replaced here, before any service starts.
+    if [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,JWT_SECRET,* ]]; then
+        warn "JWT_SECRET was a publicly known example value; replaced it with a generated one. Everyone signs in again; API keys keep working."
+    fi
+    if [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,NANOSIEM_ENCRYPTION_KEY,* ]]; then
+        warn "NANOSIEM_ENCRYPTION_KEY was a publicly known example key. Moved .env to a key ring: a new generated active key, with the old key kept decrypt-only (legacy-0) so every stored credential still opens."
+        warn "nano re-encrypts stored credentials in the background. Check progress with: docker compose -f $COMPOSE_FILE exec nano-jobs nanosiem-jobs credential-keys status"
+        warn "When it reports nothing pending, and no backup older than today still needs restoring, retire the old key: ... credential-keys retire legacy-0"
+    fi
+    if [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,NANO_VECTOR_CONFIG_DELIVERY_TOKEN,* ]]; then
+        warn "NANO_VECTOR_CONFIG_DELIVERY_TOKEN was a placeholder; replaced it with a generated one."
+    fi
+    if [[ -n "${NANO_PUBLIC_DB_PASSWORD_KEYS:-}" ]]; then
+        warn "Database password(s) $NANO_PUBLIC_DB_PASSWORD_KEYS are publicly known defaults. They are not changed automatically: PostgreSQL and ClickHouse keep the password their data was created with."
+        warn "These services are reachable only on the internal Docker network, but change them: see 'Changing a database password' in docs/getting-started/docker-deployment.md."
+    fi
+    if [[ ",${NANO_PUBLIC_SECRET_KEYS// /}," == *,VECTOR_AUTH_TOKEN,* ]]; then
+        warn "VECTOR_AUTH_TOKEN (the forwarder install token) is a publicly known default, so anyone can send events. It is kept because your forwarders use it."
+        warn "Issue a named ingest token per sender in $BASE_URL/ingestion/ingest-tokens, move the senders over, then turn the install token off. From v2.1 nano refuses a public install token."
     fi
     VECTOR_AUTH_TOKEN_PRESENT=0
     grep -qE '^VECTOR_AUTH_TOKEN=.' .env && VECTOR_AUTH_TOKEN_PRESENT=1
@@ -1089,6 +1385,9 @@ BASE_URL=$BASE_URL
 NANOSIEM_DEV_MODE=$DEV_MODE
 NANO_SCHEMA_PROFILE=$SCHEMA_PROFILE
 RUST_LOG=info
+# Fresh install: every host gets NANO_VECTOR_CONFIG_DELIVERY_TOKEN from this
+# file, so config delivery refuses the forwarder install token from day one.
+NANO_VECTOR_CONFIG_DELIVERY_STRICT=true
 EOF
     nano_backfill_generated_secrets "$ENV_TEMP_FILE" generate "$PWD/.env" \
         || fail "Could not generate required secrets for $NANO_INSTALL_DIR/.env."
@@ -1118,6 +1417,8 @@ EOF
 
     ok "Wrote .env (mode 600)"
 fi
+configure_outbound_proxy
+configure_private_ai_endpoints
 
 # Resolve overlays before sizing as well as startup: an overlay can replace the
 # Vector data volume with a host bind/external driver, whose capacity cannot be
@@ -1366,11 +1667,50 @@ else
 fi
 ch_mem_feeds_note
 
+# Security review 2026-11-08: ClickHouse's passwordless `default` user now only
+# accepts connections from inside the ClickHouse container
+# (clickhouse/users.d/default-user.xml). Before restarting an existing
+# single-host stack, look for clients that logged in as `default` from another
+# address in the last 7 days. They stop working with this release, so say who
+# they are and require an explicit acknowledgement. Role-split installs never
+# had a reachable `default` (the inventory renderer removes it).
+clickhouse_default_user_preflight() {
+    local query remote
+    [[ "${REUSE_ENV:-0}" == "1" && "$MULTI_NODE" != "1" ]] || return 0
+    docker compose "${COMPOSE_ARGS[@]}" ps --status running --services 2>/dev/null </dev/null \
+        | grep -qx clickhouse || return 0
+    query="SELECT IPv6NumToString(address) AS client, count() AS queries, max(event_time) AS last_seen FROM system.query_log WHERE user = 'default' AND event_date >= today() - 7 AND type = 'QueryStart' AND NOT (address = toIPv6('::1') OR isIPAddressInRange(IPv6NumToString(address), '::ffff:127.0.0.0/104')) GROUP BY address ORDER BY queries DESC LIMIT 20 FORMAT TSV"
+    # The admin password is already in the ClickHouse container's environment;
+    # it never appears on this host's command line.
+    # shellcheck disable=SC2016
+    remote=$(docker compose "${COMPOSE_ARGS[@]}" exec -T clickhouse sh -c \
+        'clickhouse-client --user nanosiem_admin --password "$CLICKHOUSE_ADMIN_PASSWORD" --query "$1"' \
+        sh "$query" </dev/null 2>/dev/null) || return 0
+    [[ -n "$remote" ]] || return 0
+    warn "ClickHouse's passwordless 'default' user is now reachable only from inside the ClickHouse container."
+    warn "These clients logged in as 'default' over the network in the last 7 days (address, queries, last seen):"
+    printf '%s\n' "$remote" | sed 's/^/      /' >&2
+    warn "Move each one to its own password-protected user before relying on it: nanosiem_ingest (INSERT-only, CLICKHOUSE_INGEST_PASSWORD in .env) for event writers, nanosiem_rawsql (read-only, CLICKHOUSE_RAWSQL_PASSWORD) for queries and BI tools."
+    if [[ "${NANO_ACK_CH_DEFAULT_LOCALHOST:-0}" != "1" ]]; then
+        fail "Stopping before restarting the stack. Re-run with NANO_ACK_CH_DEFAULT_LOCALHOST=1 once those clients are moved (or to accept that they stop working)."
+    fi
+    warn "NANO_ACK_CH_DEFAULT_LOCALHOST=1: continuing; the clients above can no longer log in as 'default'."
+}
+clickhouse_default_user_preflight
+
 # Optional root-level compose overlays, ported from the sovereign single-host
 # installer. The list was validated before sizing so a storage override affects
 # both the capacity contract and the graph that starts below.
 for overlay in ${NANO_OVERLAY_LIST[@]+"${NANO_OVERLAY_LIST[@]}"}; do
     COMPOSE_ARGS+=(-f "$overlay")
+    # NAN-5124: the TLS overlay 301-redirects :80 to https, so the installer's
+    # own calls go straight to the HTTPS edge on loopback. The certificate is
+    # issued for the public name, not localhost, so verification is skipped for
+    # this loopback-only connection.
+    if [[ "$overlay" == "docker-compose.tls.yml" && "$MULTI_NODE" != "1" ]]; then
+        API_BASE="https://localhost:443"
+        API_CURL_ARGS=(--insecure)
+    fi
 done
 
 # ----------------------------------------------------------------------------
@@ -1490,14 +1830,14 @@ if [[ "$HAS_APP" == "1" ]]; then
     HEALTH_URL="${API_BASE}/api/health"
     deadline=$(( $(date +%s) + 300 ))
     while (( $(date +%s) < deadline )); do
-        if curl -fsS -o /dev/null "$HEALTH_URL" </dev/null; then
+        if api_call /dev/null "$HEALTH_URL" >/dev/null; then
             ok "API healthy"
             break
         fi
         sleep 3
     done
-    if ! curl -fsS -o /dev/null "$HEALTH_URL" </dev/null; then
-        fail "API did not become healthy within 5 min. Check 'docker compose ${COMPOSE_ARGS[*]} logs nano-api nginx clickhouse-migrate'."
+    if ! health_code=$(api_call /dev/null "$HEALTH_URL"); then
+        fail "API did not become healthy within 5 min (HTTP $health_code from $HEALTH_URL). Check 'docker compose ${COMPOSE_ARGS[*]} logs nano-api nginx clickhouse-migrate'."
     fi
     if [[ "$MULTI_NODE" == "1" ]]; then
         log "Waiting for every ClickHouse asynchronous-loader object to become OK"
@@ -1535,7 +1875,13 @@ fi
 if [[ "$HAS_APP" != "1" ]]; then
     ok "Admin initialization belongs to the app role; skipped on this host"
 else
-    STATUS_JSON=$(curl -fsS "${API_BASE}/api/setup/status" </dev/null || echo '{}')
+    STATUS_FILE=$(mktemp)
+    if ! status_code=$(api_call "$STATUS_FILE" "${API_BASE}/api/setup/status"); then
+        rm -f "$STATUS_FILE"
+        fail "Could not read setup status (HTTP $status_code from ${API_BASE}/api/setup/status). Check 'docker compose ${COMPOSE_ARGS[*]} logs nano-api nginx'."
+    fi
+    STATUS_JSON=$(cat "$STATUS_FILE")
+    rm -f "$STATUS_FILE"
     if echo "$STATUS_JSON" | grep -q '"initialized":true'; then
         warn "System is already initialized — skipping admin creation."
     else
@@ -1553,11 +1899,11 @@ else
             "$(json_escape "$ADMIN_EMAIL")" \
             "$(json_escape "$ADMIN_NAME")" \
             "$(json_escape "$ADMIN_PASSWORD")")
-        if ! curl -fsS -X POST \
+        if ! init_code=$(api_call /dev/null -X POST \
             -H "Content-Type: application/json" \
             -d "$payload" \
-            "${API_BASE}/api/setup/initialize" </dev/null > /dev/null; then
-            fail "Admin initialization failed. Check 'docker compose -f $COMPOSE_FILE logs nano-api'."
+            "${API_BASE}/api/setup/initialize"); then
+            fail "Admin initialization failed (HTTP $init_code from ${API_BASE}/api/setup/initialize). Check 'docker compose ${COMPOSE_ARGS[*]} logs nano-api nginx'."
         fi
         ok "Admin user created"
     fi

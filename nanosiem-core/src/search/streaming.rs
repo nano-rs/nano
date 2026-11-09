@@ -76,7 +76,7 @@ pub enum SearchStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         column_order: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        generated_sql: Option<String>,
+        generated_sql: Option<crate::search::display_sql::DisplaySql>,
     },
 
     /// Cumulative product graph. Replaces the previous snapshot, not raw rows
@@ -168,12 +168,26 @@ pub fn is_query_streamable(
     true
 }
 
+/// Most chunks one streamed search is split into (security review 2026-11-08,
+/// NAN-5026). Each chunk is one sequential ClickHouse query, and the chunk
+/// list was sized by the raw request span (a 400-year range meant ~146k
+/// queries; a year-262143 range allocated gigabytes before any SQL ran).
+/// 400 covers the default 365-day retention one day per partition with room
+/// to spare; anything older collapses into the final chunk.
+pub const MAX_DAILY_CHUNKS: usize = 400;
+
 /// Split a time range into daily chunks ordered newest-first.
 ///
 /// Each chunk aligns to day boundaries (`00:00:00 UTC`) except the first and last
 /// which use the original `start`/`end` timestamps. This matches ClickHouse's
 /// `toYYYYMMDD(timestamp)` daily partitioning so each chunk targets a single
 /// partition, enabling fast per-partition sorts.
+///
+/// At most [`MAX_DAILY_CHUNKS`] chunks are produced. When the range spans more
+/// days than that, the final (oldest) chunk covers everything from `start` to
+/// the oldest daily boundary, so the chunks still tile the whole range and
+/// return exactly the same rows; only the oldest stretch is read as one
+/// multi-partition query.
 ///
 /// Returns an empty vec if `start >= end`.
 pub fn compute_daily_chunks(
@@ -202,8 +216,13 @@ pub fn compute_daily_chunks(
             day_start -= chrono::Duration::days(1);
         }
 
-        // Chunk start is the later of the day boundary and the overall start
-        let chunk_start = day_start.max(start);
+        // Chunk start is the later of the day boundary and the overall start.
+        // The last permitted chunk takes the whole remaining span.
+        let chunk_start = if chunks.len() + 1 >= MAX_DAILY_CHUNKS {
+            start
+        } else {
+            day_start.max(start)
+        };
 
         chunks.push((chunk_start, chunk_end));
 
@@ -350,3 +369,7 @@ mod tests {
         assert_eq!(chunks.last().unwrap().0, start);
     }
 }
+
+#[cfg(test)]
+#[path = "streaming_bounds_tests.rs"]
+mod bounds_tests;

@@ -30,6 +30,8 @@ mod eval_chain_guard_tests;
 // Audit D13: the real-time SignalProcessor shares the scheduled path's
 // finding-emission dedup (candidate type + store helpers in `helpers`).
 pub(crate) use alerts::ClaimedFinding;
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(unused_imports))]
 pub(crate) use analysis::tuning_test_windows;
 
 use serde::{Deserialize, Serialize};
@@ -46,12 +48,20 @@ const SETTINGS_CACHE_TTL_SECS: u64 = 300;
 /// Autonomous tuning replays are intentionally tighter than the interactive
 /// rule tester because they can run without an analyst explicitly admitting
 /// the ClickHouse workload.
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 pub(crate) const MAX_AUTONOMOUS_TUNING_WINDOWS: usize = 500;
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 pub(crate) const AUTONOMOUS_TUNING_REPLAY_QUERY_COUNT: i64 = 2;
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 pub(crate) const MAX_AUTONOMOUS_TUNING_TOTAL_SCAN_SECONDS: i64 = 7 * 24 * 60 * 60;
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 pub(crate) const MAX_AUTONOMOUS_TUNING_ROWS_PER_WINDOW: u64 = 10_000;
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 pub(crate) const MAX_AUTONOMOUS_TUNING_BYTES_PER_WINDOW: u64 = 8 * 1024 * 1024;
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 pub(crate) const MAX_AUTONOMOUS_TUNING_TOTAL_ROWS: u64 = 100_000;
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 pub(crate) const MAX_AUTONOMOUS_TUNING_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 use crate::db::repository::{AlertRepository, DetectionRuleRepository};
@@ -156,6 +166,8 @@ pub struct TimeBucket {
 /// Exact evidence from replaying one identity-preserving query over fixed
 /// production schedule/lookback windows.
 #[derive(Debug, Clone, Default)]
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 pub(crate) struct TuningWindowEvidence {
     pub total_matches: u64,
     pub source_ids: std::collections::HashSet<Uuid>,
@@ -169,12 +181,16 @@ pub(crate) struct TuningWindowEvidence {
 }
 
 #[derive(Debug, Clone, Copy)]
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 pub(crate) struct TuningReplayBudget {
     pub rows: u64,
     pub bytes: u64,
 }
 
 #[derive(Debug)]
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 pub(crate) struct TuningWindowPlan {
     pub schedule_cron: String,
     pub lookback_minutes: i64,

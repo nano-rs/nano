@@ -9,7 +9,9 @@
 //! - Manages credential encryption/storage during install
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(feature = "enterprise")]
+use tracing::warn;
 use uuid::Uuid;
 
 use super::error::MarketplaceError;
@@ -46,7 +48,7 @@ impl MarketplaceInstallService {
         &self,
         slug: &str,
         request: &InstallRequest,
-        user_id: Uuid,
+        #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))] user_id: Uuid,
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
         let entry = self.repository.get_catalog_entry(slug).await?;
 
@@ -71,6 +73,13 @@ impl MarketplaceInstallService {
             .execution_backend
             .parse()
             .map_err(|e: String| MarketplaceError::Internal(e))?;
+
+        // Open edition: refuse enterprise-only backends first — ahead of the
+        // credential checks, so the caller learns the entry needs the
+        // enterprise edition, and before anything is enabled or marked
+        // installed, so a refusal leaves no partial install.
+        #[cfg(not(feature = "enterprise"))]
+        self.refuse_enterprise_only_backend(&entry, backend).await?;
 
         // Check credential requirements
         let req: CredentialRequirement = entry
@@ -105,9 +114,17 @@ impl MarketplaceInstallService {
         };
 
         match backend {
+            #[cfg(feature = "enterprise")]
             ExecutionBackend::Deno => {
                 self.install_deno_enrichment(&entry, request, user_id)
                     .await?;
+            }
+            // Refused above by `refuse_enterprise_only_backend`.
+            #[cfg(not(feature = "enterprise"))]
+            ExecutionBackend::Deno => {
+                return Err(MarketplaceError::EnterpriseRequired(
+                    "Custom enrichments".to_string(),
+                ));
             }
             ExecutionBackend::Native => {
                 self.install_native_enrichment(&entry).await?;
@@ -115,11 +132,19 @@ impl MarketplaceInstallService {
             ExecutionBackend::Identity => {
                 self.install_identity_enrichment(&entry).await?;
             }
+            #[cfg(feature = "enterprise")]
             ExecutionBackend::Collector => {
                 // Nothing to provision. Unlike the other backends, a collector
                 // has no shadow row in a subsystem table — the catalog row
                 // already carries its code and manifest config, and the
                 // operator creates `integration_instances` rows afterwards.
+            }
+            // Refused above by `refuse_enterprise_only_backend`.
+            #[cfg(not(feature = "enterprise"))]
+            ExecutionBackend::Collector => {
+                return Err(MarketplaceError::EnterpriseRequired(
+                    "Integration collectors".to_string(),
+                ));
             }
         }
 
@@ -157,6 +182,7 @@ impl MarketplaceInstallService {
             .map_err(|e: String| MarketplaceError::Internal(e))?;
 
         match backend {
+            #[cfg(feature = "enterprise")]
             ExecutionBackend::Deno => {
                 // Disable the custom enrichment
                 if let Some(ce_id) = entry.custom_enrichment_id {
@@ -178,9 +204,15 @@ impl MarketplaceInstallService {
                     .await?;
                 }
             }
+            #[cfg(not(feature = "enterprise"))]
+            ExecutionBackend::Deno => {
+                return Err(MarketplaceError::EnterpriseRequired(
+                    "Custom enrichments".to_string(),
+                ));
+            }
             ExecutionBackend::Native => {
                 if let Some(ref source_id) = entry.native_source_id {
-                    // Try agent_enrichment_providers first, then enrichment_sources
+                    #[cfg(feature = "enterprise")]
                     let rows = sqlx::query(
                         "UPDATE agent_enrichment_providers SET enabled = false, api_key_encrypted = NULL WHERE id = $1",
                     )
@@ -188,6 +220,9 @@ impl MarketplaceInstallService {
                     .execute(&self.pool)
                     .await?
                     .rows_affected();
+
+                    #[cfg(not(feature = "enterprise"))]
+                    let rows = 0;
 
                     if rows == 0 {
                         // A download URL carrying a provider token (IPinfo
@@ -207,6 +242,7 @@ impl MarketplaceInstallService {
                         .await?;
                 }
             }
+            #[cfg(feature = "enterprise")]
             ExecutionBackend::Collector => {
                 // Disable every configured instance rather than deleting it:
                 // an uninstall is reversible, and the instances hold the
@@ -219,6 +255,12 @@ impl MarketplaceInstallService {
                 .bind(entry.id)
                 .execute(&self.pool)
                 .await?;
+            }
+            #[cfg(not(feature = "enterprise"))]
+            ExecutionBackend::Collector => {
+                return Err(MarketplaceError::EnterpriseRequired(
+                    "Integration collectors".to_string(),
+                ));
             }
         }
 
@@ -251,6 +293,7 @@ impl MarketplaceInstallService {
             .map_err(|e: String| MarketplaceError::Internal(e))?;
 
         match backend {
+            #[cfg(feature = "enterprise")]
             ExecutionBackend::Deno => {
                 if let Some(ce_id) = entry.custom_enrichment_id {
                     // Trigger a run via custom_enrichment_runs
@@ -264,6 +307,12 @@ impl MarketplaceInstallService {
                     .execute(&self.pool)
                     .await?;
                 }
+            }
+            #[cfg(not(feature = "enterprise"))]
+            ExecutionBackend::Deno => {
+                return Err(MarketplaceError::EnterpriseRequired(
+                    "Custom enrichments".to_string(),
+                ));
             }
             ExecutionBackend::Native => {
                 // Native enrichments are synced via the enrichment scheduler,
@@ -289,6 +338,7 @@ impl MarketplaceInstallService {
                     .await?;
                 }
             }
+            #[cfg(feature = "enterprise")]
             ExecutionBackend::Collector => {
                 // Clearing `last_run_at` makes every enabled instance due on
                 // the scheduler's next tick. Deliberately not spawning runs
@@ -305,6 +355,12 @@ impl MarketplaceInstallService {
                 .bind(entry.id)
                 .execute(&self.pool)
                 .await?;
+            }
+            #[cfg(not(feature = "enterprise"))]
+            ExecutionBackend::Collector => {
+                return Err(MarketplaceError::EnterpriseRequired(
+                    "Integration collectors".to_string(),
+                ));
             }
         }
 
@@ -325,6 +381,7 @@ impl MarketplaceInstallService {
             .map_err(|e: String| MarketplaceError::Internal(e))?;
 
         match backend {
+            #[cfg(feature = "enterprise")]
             ExecutionBackend::Deno => {
                 // Re-deploy code from catalog to custom_enrichments
                 if let Some(ce_id) = entry.custom_enrichment_id {
@@ -347,15 +404,28 @@ impl MarketplaceInstallService {
                     .await?;
                 }
             }
+            #[cfg(not(feature = "enterprise"))]
+            ExecutionBackend::Deno => {
+                return Err(MarketplaceError::EnterpriseRequired(
+                    "Custom enrichments".to_string(),
+                ));
+            }
             ExecutionBackend::Native | ExecutionBackend::Identity => {
                 // Native/identity enrichments don't have deployable code to update
             }
+            #[cfg(feature = "enterprise")]
             ExecutionBackend::Collector => {
                 // The runtime reads code and manifest config straight off the
                 // catalog row at run time, so repo sync has already applied the
                 // update. Instances keep their credentials, config and cursors
                 // across a version bump — which is the point of storing them
                 // separately.
+            }
+            #[cfg(not(feature = "enterprise"))]
+            ExecutionBackend::Collector => {
+                return Err(MarketplaceError::EnterpriseRequired(
+                    "Integration collectors".to_string(),
+                ));
             }
         }
 
@@ -410,6 +480,17 @@ impl MarketplaceInstallService {
             return Ok(());
         }
 
+        // Open edition: refuse before anything is persisted when the entry's
+        // backend table is enterprise-only.
+        #[cfg(not(feature = "enterprise"))]
+        {
+            let backend: ExecutionBackend = entry
+                .execution_backend
+                .parse()
+                .map_err(|e: String| MarketplaceError::Internal(e))?;
+            self.refuse_enterprise_only_backend(&entry, backend).await?;
+        }
+
         // Encrypt and store on marketplace_catalog
         let (ciphertext, nonce) = self.encrypt_credentials(credentials)?;
         self.repository
@@ -448,6 +529,7 @@ impl MarketplaceInstallService {
     /// supplied in the install dialog reaches the backend's table and not only
     /// the catalog ciphertext. Callers must have run
     /// [`validate_credential_values`] first.
+    #[cfg(feature = "enterprise")]
     async fn push_native_credentials(
         &self,
         entry: &MarketplaceCatalogEntry,
@@ -487,6 +569,55 @@ impl MarketplaceInstallService {
         Ok(())
     }
 
+    /// Open core: the only backend table `push_native_credentials` writes
+    /// (`agent_enrichment_providers`) is enterprise-only, and entries backed by
+    /// it are refused up front by [`Self::refuse_enterprise_only_backend`], so
+    /// there is nothing to push.
+    #[cfg(not(feature = "enterprise"))]
+    async fn push_native_credentials(
+        &self,
+        _entry: &MarketplaceCatalogEntry,
+        _credentials: &serde_json::Value,
+    ) -> Result<(), MarketplaceError> {
+        Ok(())
+    }
+
+    /// Open core: refuse catalog entries whose backend lives in an
+    /// enterprise-only table — Deno custom enrichments, integration
+    /// collectors, and native entries backed by an agent enrichment provider
+    /// (any native source that is not an `enrichment_sources` row). The web
+    /// UI hides these entries in the open edition; this is the server-side
+    /// guarantee. Called once per install / credential update, before any
+    /// write.
+    #[cfg(not(feature = "enterprise"))]
+    async fn refuse_enterprise_only_backend(
+        &self,
+        entry: &MarketplaceCatalogEntry,
+        backend: ExecutionBackend,
+    ) -> Result<(), MarketplaceError> {
+        let surface = match backend {
+            ExecutionBackend::Deno => Some("Custom enrichments"),
+            ExecutionBackend::Collector => Some("Integration collectors"),
+            ExecutionBackend::Identity => None,
+            ExecutionBackend::Native => match entry.native_source_id.as_deref() {
+                None => None,
+                Some(source_id) => {
+                    let open_source: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM enrichment_sources WHERE id = $1)",
+                    )
+                    .bind(source_id)
+                    .fetch_one(&self.pool)
+                    .await?;
+                    (!open_source).then_some("Agent enrichment providers")
+                }
+            },
+        };
+        match surface {
+            Some(surface) => Err(MarketplaceError::EnterpriseRequired(surface.to_string())),
+            None => Ok(()),
+        }
+    }
+
     /// Encrypt credentials JSON and return (ciphertext_bytes, nonce_string)
     fn encrypt_credentials(
         &self,
@@ -511,6 +642,7 @@ impl MarketplaceInstallService {
     }
 
     /// Install a Deno-backed enrichment by creating a custom_enrichments row
+    #[cfg(feature = "enterprise")]
     async fn install_deno_enrichment(
         &self,
         entry: &MarketplaceCatalogEntry,
@@ -591,6 +723,7 @@ impl MarketplaceInstallService {
     }
 
     /// Install a native-backed enrichment by enabling the underlying source
+    #[cfg(feature = "enterprise")]
     async fn install_native_enrichment(
         &self,
         entry: &MarketplaceCatalogEntry,
@@ -626,6 +759,29 @@ impl MarketplaceInstallService {
                         source_id
                     )));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    async fn install_native_enrichment(
+        &self,
+        entry: &MarketplaceCatalogEntry,
+    ) -> Result<(), MarketplaceError> {
+        if let Some(ref source_id) = entry.native_source_id {
+            let rows = sqlx::query(
+                "UPDATE enrichment_sources SET enabled = true, last_sync_status = NULL, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(source_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            if rows == 0 {
+                return Err(MarketplaceError::Internal(format!(
+                    "No enrichment source found with id '{}'",
+                    source_id
+                )));
             }
         }
         Ok(())

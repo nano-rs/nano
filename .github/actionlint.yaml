@@ -9,3 +9,6 @@ self-hosted-runner:
     - proxmox-builder
     - avx2
     - macy
+    # NAN-5050 runner trust pools (docs-internal/ci-runner-pools.md)
+    - nano-release
+    - nano-pr

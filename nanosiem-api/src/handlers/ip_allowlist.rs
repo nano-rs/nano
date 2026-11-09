@@ -29,7 +29,6 @@ use crate::error::ApiError;
 use crate::handlers::AuditExt;
 use crate::middleware::{check_permission, AuthContext};
 use crate::state::AppState;
-use crate::utils::extract_client_ip;
 use nanosiem_core::typeid::TypeIdParam;
 
 /// Query parameters for listing IP allowlist entries
@@ -116,7 +115,10 @@ pub async fn get_ip_allowlist_status(
 pub async fn create_ip_allowlist(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-    headers: axum::http::HeaderMap,
+    // NAN-5015: the trusted-proxy-gated client address the auth middleware
+    // resolved. `extract_client_ip(&headers, None)` had no socket, so it
+    // returned None: the self-lockout check never ran and audit rows had no IP.
+    Extension(client): Extension<ClientContext>,
     Json(body): Json<CreateIpAllowlistEntry>,
 ) -> Result<(axum::http::StatusCode, Json<IpAllowlistEntry>), ApiError> {
     check_permission(&auth, permissions::SETTINGS_SYSTEM)
@@ -144,7 +146,7 @@ pub async fn create_ip_allowlist(
         })?;
 
     // Self-lockout check: after creating the rule, verify the admin's IP is still allowed
-    let admin_ip = extract_client_ip(&headers, None);
+    let admin_ip = client.ip_address.clone();
     if let Some(ref ip) = admin_ip {
         if let Err(e) = state
             .ip_allowlist_service
@@ -158,7 +160,6 @@ pub async fn create_ip_allowlist(
     }
 
     // Audit log
-    let client = ClientContext::new(admin_ip, crate::utils::extract_user_agent(&headers));
     state.emit_audit(
         AuditEvent::builder(AuditSource::Settings, IP_ALLOWLIST_CREATED)
             .actor(Some(auth.user_id()), None)
@@ -189,7 +190,10 @@ pub async fn create_ip_allowlist(
 pub async fn update_ip_allowlist(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-    headers: axum::http::HeaderMap,
+    // NAN-5015: the trusted-proxy-gated client address the auth middleware
+    // resolved. `extract_client_ip(&headers, None)` had no socket, so it
+    // returned None: the self-lockout check never ran and audit rows had no IP.
+    Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
     Json(body): Json<UpdateIpAllowlistEntry>,
 ) -> Result<Json<IpAllowlistEntry>, ApiError> {
@@ -218,7 +222,7 @@ pub async fn update_ip_allowlist(
         })?;
 
     // Self-lockout check
-    let admin_ip = extract_client_ip(&headers, None);
+    let admin_ip = client.ip_address.clone();
     if let Some(ref ip) = admin_ip {
         if let Err(_) = state
             .ip_allowlist_service
@@ -232,7 +236,6 @@ pub async fn update_ip_allowlist(
     }
 
     // Audit log
-    let client = ClientContext::new(admin_ip, crate::utils::extract_user_agent(&headers));
     state.emit_audit(
         AuditEvent::builder(AuditSource::Settings, IP_ALLOWLIST_UPDATED)
             .actor(Some(auth.user_id()), None)
@@ -261,7 +264,10 @@ pub async fn update_ip_allowlist(
 pub async fn delete_ip_allowlist(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-    headers: axum::http::HeaderMap,
+    // NAN-5015: the trusted-proxy-gated client address the auth middleware
+    // resolved. `extract_client_ip(&headers, None)` had no socket, so it
+    // returned None: the self-lockout check never ran and audit rows had no IP.
+    Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     check_permission(&auth, permissions::SETTINGS_SYSTEM)
@@ -286,10 +292,6 @@ pub async fn delete_ip_allowlist(
         .map_err(|e| ApiError::InternalError(e.to_string()))?;
 
     // Audit log
-    let client = ClientContext::new(
-        extract_client_ip(&headers, None),
-        crate::utils::extract_user_agent(&headers),
-    );
     state.emit_audit(
         AuditEvent::builder(AuditSource::Settings, IP_ALLOWLIST_DELETED)
             .actor(Some(auth.user_id()), None)

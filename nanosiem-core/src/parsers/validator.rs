@@ -26,6 +26,9 @@ use thiserror::Error;
 
 use super::types::{ParserTestResult, VrlValidationResult};
 
+#[path = "validator_exec_bounds.rs"]
+pub mod exec_bounds;
+
 #[derive(Error, Debug)]
 pub enum VrlValidatorError {
     #[error("IO error: {0}")]
@@ -590,10 +593,19 @@ impl VrlValidator {
             .collect();
         if !inputs.is_empty() {
             let extension = extension.map(str::to_owned);
+            // NAN-5040: the native batch engine runs tenant VRL too; it gets
+            // the same per-request budget as the plain-VRL path.
             let rows = tokio::task::spawn_blocking(move || {
                 tracing::subscriber::with_default(
                     tracing::subscriber::NoSubscriber::default(),
-                    || crate::parsers::pipe::batch::run(&plan, &inputs, extension.as_deref()),
+                    || {
+                        crate::parsers::pipe::batch::run_bounded(
+                            &plan,
+                            &inputs,
+                            extension.as_deref(),
+                            exec_bounds::ExecutionBudget::new(exec_bounds::TEST_EXECUTION_BUDGET),
+                        )
+                    },
                 )
             })
             .await
@@ -827,6 +839,7 @@ impl VrlValidator {
                 .pop()
                 .ok_or_else(|| VrlValidatorError::ExecutionError("no result".into()));
         }
+        exec_bounds::check_samples(&[sample_input])?;
         let start = Instant::now();
 
         // First validate the VRL code (the stored form: plan-aware gates)
@@ -856,8 +869,26 @@ impl VrlValidator {
             }
         };
 
-        // Execute VRL natively
-        match self.execute_vrl(vrl_code, &input_json) {
+        // Execute VRL natively, off the tokio workers and under a time budget
+        // (NAN-5040).
+        let program = match self.compile_program(vrl_code) {
+            Ok(program) => program,
+            Err(e) => {
+                return Ok(ParserTestResult {
+                    success: false,
+                    input: sample_input.to_string(),
+                    output: None,
+                    error: Some(format!("Execution error: {}", e)),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+        };
+        let code = vrl_code.clone();
+        let executed = exec_bounds::run_blocking(move |budget| {
+            exec_bounds::run_program(&code, &program, &input_json, budget)
+        })
+        .await?;
+        match executed {
             Ok(output) => Ok(ParserTestResult {
                 success: true,
                 input: sample_input.to_string(),
@@ -889,6 +920,7 @@ impl VrlValidator {
         if let PlanSource::Native(plan) = resolve_plan(vrl_code) {
             return self.test_native_pipe(plan, None, sample_inputs).await;
         }
+        exec_bounds::check_samples(sample_inputs)?;
         // Validation below still sees the stored form (plan-aware gates);
         // execution runs the compiled program.
         let start = Instant::now();
@@ -912,40 +944,48 @@ impl VrlValidator {
             .compile_program(vrl_code)
             .map_err(VrlValidatorError::ExecutionError)?;
 
-        Ok(sample_inputs
-            .iter()
-            .map(|sample_input| {
-                let input_json: serde_json::Value = match serde_json::from_str(sample_input) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return ParserTestResult {
-                            success: false,
-                            input: sample_input.clone(),
-                            output: None,
-                            error: Some(format!("Invalid JSON input: {}", error)),
-                            duration_ms: start.elapsed().as_millis() as u64,
-                        };
-                    }
-                };
+        // NAN-5040: every sample runs on the blocking pool under ONE request
+        // budget, so a slow program cannot multiply its cost by the sample
+        // count.
+        let code = vrl_code.clone();
+        let inputs = sample_inputs.to_vec();
+        exec_bounds::run_blocking(move |budget| {
+            inputs
+                .into_iter()
+                .map(|sample_input| {
+                    let input_json: serde_json::Value = match serde_json::from_str(&sample_input) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return ParserTestResult {
+                                success: false,
+                                input: sample_input,
+                                output: None,
+                                error: Some(format!("Invalid JSON input: {}", error)),
+                                duration_ms: start.elapsed().as_millis() as u64,
+                            };
+                        }
+                    };
 
-                match self.execute_program(vrl_code, &program, &input_json) {
-                    Ok(output) => ParserTestResult {
-                        success: true,
-                        input: sample_input.clone(),
-                        output: Some(output),
-                        error: None,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                    },
-                    Err(error) => ParserTestResult {
-                        success: false,
-                        input: sample_input.clone(),
-                        output: None,
-                        error: Some(format!("Execution error: {}", error)),
-                        duration_ms: start.elapsed().as_millis() as u64,
-                    },
-                }
-            })
-            .collect())
+                    match exec_bounds::run_program(&code, &program, &input_json, budget) {
+                        Ok(output) => ParserTestResult {
+                            success: true,
+                            input: sample_input,
+                            output: Some(output),
+                            error: None,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        },
+                        Err(error) => ParserTestResult {
+                            success: false,
+                            input: sample_input,
+                            output: None,
+                            error: Some(format!("Execution error: {}", error)),
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        },
+                    }
+                })
+                .collect()
+        })
+        .await
     }
 
     /// Test a chain of VRL stages against sample input (NAN-874).
@@ -991,6 +1031,7 @@ impl VrlValidator {
                 .pop()
                 .ok_or_else(|| VrlValidatorError::ExecutionError("no result".into()));
         }
+        exec_bounds::check_samples(&[sample_input])?;
         let resolved: Vec<String> = vrl_stages.iter().map(|s| resolved_program(s)).collect();
         let start = Instant::now();
 
@@ -1041,9 +1082,12 @@ impl VrlValidator {
             Err(_) => serde_json::json!({ "message": sample_input }),
         };
 
+        // Compile every stage here; execute them off the tokio workers under
+        // one request budget (NAN-5040).
+        let mut compiled = Vec::with_capacity(stages.len());
         for (idx, _) in &stages {
-            match self.execute_vrl(&resolved[*idx], &current) {
-                Ok(output) => current = output,
+            match self.compile_program(&resolved[*idx]) {
+                Ok(program) => compiled.push((*idx, resolved[*idx].clone(), program)),
                 Err(e) => {
                     return Ok(ParserTestResult {
                         success: false,
@@ -1055,24 +1099,33 @@ impl VrlValidator {
                 }
             }
         }
-
-        Ok(ParserTestResult {
-            success: true,
-            input: sample_input.to_string(),
-            output: Some(current),
-            error: None,
-            duration_ms: start.elapsed().as_millis() as u64,
+        let executed = exec_bounds::run_blocking(move |budget| {
+            for (idx, code, program) in &compiled {
+                match exec_bounds::run_program(code, program, &current, budget) {
+                    Ok(output) => current = output,
+                    Err(e) => return Err(format!("stage {}: execution error: {}", idx, e)),
+                }
+            }
+            Ok(current)
         })
-    }
+        .await?;
 
-    /// Execute VRL code against input using the native VRL runtime
-    fn execute_vrl(
-        &self,
-        vrl_code: &str,
-        input: &serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        let program = self.compile_program(vrl_code)?;
-        self.execute_program(vrl_code, &program, input)
+        match executed {
+            Ok(current) => Ok(ParserTestResult {
+                success: true,
+                input: sample_input.to_string(),
+                output: Some(current),
+                error: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            }),
+            Err(error) => Ok(ParserTestResult {
+                success: false,
+                input: sample_input.to_string(),
+                output: None,
+                error: Some(error),
+                duration_ms: start.elapsed().as_millis() as u64,
+            }),
+        }
     }
 
     /// Compile an executable VRL program. Kept separate from execution so batch
@@ -1082,48 +1135,6 @@ impl VrlValidator {
         super::vrl_guard::compile_formatted(vrl_code, &fns)
             .map(|result| result.program)
             .map_err(|errors| errors.join("\n"))
-    }
-
-    /// Execute a precompiled VRL program against one event.
-    fn execute_program(
-        &self,
-        vrl_code: &str,
-        program: &vrl::compiler::Program,
-        input: &serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        use vrl::compiler::TargetValue;
-        use vrl::value::{Secrets, Value};
-
-        // Convert JSON input to VRL Value
-        let vrl_input = json_to_vrl_value(input);
-
-        // Create runtime and execute
-        let mut target = TargetValue {
-            value: vrl_input,
-            metadata: Value::Object(BTreeMap::new()),
-            secrets: Secrets::default(),
-        };
-
-        let timezone = vrl::compiler::TimeZone::Local;
-        let mut runtime = vrl::compiler::runtime::Runtime::default();
-
-        // NAN-4912 P3 (defense in depth): parser registries have no `log`,
-        // but nothing a tested program does may reach the service logs.
-        let resolved = tracing::subscriber::with_default(
-            tracing::subscriber::NoSubscriber::default(),
-            || runtime.resolve(&mut target, program, &timezone),
-        );
-        match resolved {
-            Ok(_) => {
-                // Convert the transformed value back to JSON
-                let output_json = vrl_value_to_json(&target.value);
-                Ok(output_json)
-            }
-            Err(e) => Err(format!(
-                "VRL runtime error: {}",
-                humanize_runtime_spans(vrl_code, &e.to_string())
-            )),
-        }
     }
 }
 

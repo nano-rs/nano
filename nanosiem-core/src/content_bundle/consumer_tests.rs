@@ -53,7 +53,6 @@ fn subscriptions_follow_the_profile_and_edition() {
         vec![
             "parsers.main",
             "rules.main",
-            "playbooks.main",
             "enrichments.main",
             "mitre-attack.v19-1",
         ]

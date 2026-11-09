@@ -419,8 +419,38 @@ impl TimeRangeInput {
         if self.start >= self.end {
             return Err(SearchError::InvalidTimeRange);
         }
-        Ok(())
+        check_storable_bounds(self.start, self.end)
     }
+}
+
+/// Earliest instant a search window may name: the bottom of ClickHouse's
+/// `DateTime64` range (1900-01-01). Security review 2026-11-08 (NAN-5026).
+pub const SEARCH_TIME_MIN_YEAR: i32 = 1900;
+/// A search window must end before this year: the top of ClickHouse's
+/// `DateTime64` range is 2299-12-31.
+pub const SEARCH_TIME_END_YEAR: i32 = 2300;
+
+/// Reject a window that names instants no log row can carry. chrono accepts
+/// years up to +/-262143, and per-day work sized from such a window (the
+/// streaming path's daily chunks) allocated gigabytes before any SQL ran.
+/// Every real window (including the UI's "All time", which starts at 2020)
+/// is far inside these bounds.
+pub fn check_storable_bounds(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<(), SearchError> {
+    use chrono::Datelike;
+    let ok = |t: DateTime<Utc>| (SEARCH_TIME_MIN_YEAR..SEARCH_TIME_END_YEAR).contains(&t.year());
+    if ok(start) && ok(end) {
+        return Ok(());
+    }
+    Err(SearchError::SqlValidationError(format!(
+        "Invalid time range: {} to {} is outside the searchable range \
+         ({SEARCH_TIME_MIN_YEAR}-01-01 to {}-12-31)",
+        start.to_rfc3339(),
+        end.to_rfc3339(),
+        SEARCH_TIME_END_YEAR - 1
+    )))
 }
 
 /// A single bucket in the event histogram
@@ -458,8 +488,10 @@ pub struct SearchResponse {
     pub queue_wait_ms: Option<u64>,
     /// Field information with statistics
     pub fields: Vec<FieldInfo>,
-    /// The generated SQL (if requested)
-    pub generated_sql: Option<String>,
+    /// The generated SQL (if requested). Deny-set literals are redacted for
+    /// the caller it was rendered for (NAN-5043).
+    #[schema(value_type = Option<String>)]
+    pub generated_sql: Option<crate::search::display_sql::DisplaySql>,
     /// Event histogram for timeline visualization.
     ///
     /// Omitted when `skip_histogram` was set, when the display type renders no
@@ -1073,9 +1105,11 @@ pub struct RetroResponse {
     pub axis: String,
     /// Total distinct hosts in the environment (verdict denominator).
     pub total_hosts: u64,
-    /// The generated rollup SQL (always included for transparency).
+    /// The generated rollup SQL (always included for transparency), with
+    /// deny-set literals redacted for the caller (NAN-5043).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub generated_sql: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub generated_sql: Option<crate::search::display_sql::DisplaySql>,
 
     // ── summary submode ──
     /// Single-indicator summary (summary submode only).

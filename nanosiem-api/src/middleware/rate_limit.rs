@@ -732,6 +732,25 @@ pub async fn marketplace_preview_rate_limit_middleware(
     }
 }
 
+/// The upload bucket for a request: the authenticated principal (API key id
+/// for a key, user id otherwise), falling back to the client address only
+/// when no AuthContext is present.
+///
+/// Security review 2026-11-08: this used to be keyed on the client address
+/// alone. Upload is an authenticated route, and many analysts legitimately
+/// share one egress address (corporate NAT, a SOC proxy, and every request
+/// behind the bundled reverse proxy until trusted-proxy resolution is
+/// configured), so one busy user exhausted everyone's allowance.
+fn upload_bucket(req: &Request) -> (&'static str, String) {
+    match req.extensions().get::<crate::middleware::AuthContext>() {
+        Some(auth) => match auth.api_key_id {
+            Some(api_key_id) if auth.is_api_key => ("upload_api_key", api_key_id.to_string()),
+            _ => ("upload_user", auth.user_id().to_string()),
+        },
+        None => ("upload_ip", extract_client_ip(req)),
+    }
+}
+
 /// Middleware for rate limiting upload requests
 /// SECURITY: Prevents DoS attacks via repeated large file uploads
 pub async fn upload_rate_limit_middleware(
@@ -739,12 +758,12 @@ pub async fn upload_rate_limit_middleware(
     req: Request,
     next: Next,
 ) -> Response<Body> {
-    let ip = extract_client_ip(&req);
+    let (category, key) = upload_bucket(&req);
 
     match state
         .check(
-            "upload_ip",
-            &ip,
+            category,
+            &key,
             state.config.upload_window_seconds,
             state.config.upload_max_requests,
         )
@@ -752,7 +771,7 @@ pub async fn upload_rate_limit_middleware(
     {
         Ok(_) => next.run(req).await,
         Err(retry_after) => {
-            tracing::warn!(ip = %ip, "Upload rate limit exceeded");
+            tracing::warn!(category, %key, "Upload rate limit exceeded");
 
             let error = RateLimitError {
                 error: "Too many upload requests. Please try again later.".to_string(),
@@ -836,6 +855,36 @@ mod tests {
         assert_eq!(config.marketplace_preview_principal_max_requests, 6);
         assert_eq!(config.marketplace_preview_provider_max_requests, 30);
         assert_eq!(config.marketplace_preview_window_seconds, 60);
+    }
+
+    /// Dan's shared-egress rule (security review 2026-11-08): distinct
+    /// principals arriving from the SAME client address get distinct upload
+    /// buckets, so they never throttle each other.
+    #[test]
+    fn upload_buckets_are_per_principal_not_per_ip() {
+        let from_shared_ip = |auth: crate::middleware::AuthContext| {
+            let mut req = Request::builder()
+                .uri("/api/upload/preview")
+                .header("X-Forwarded-For", "203.0.113.7")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(auth);
+            upload_bucket(&req)
+        };
+        let buckets: std::collections::HashSet<_> = (0..20)
+            .map(|_| from_shared_ip(session(&[])))
+            .chain((0..20).map(|_| from_shared_ip(api_key(&[]))))
+            .collect();
+        assert_eq!(buckets.len(), 40, "every principal gets its own bucket");
+        assert!(buckets.iter().all(|(category, _)| *category != "upload_ip"));
+
+        // The same user is one bucket however many requests they make.
+        let user = session(&[]);
+        assert_eq!(from_shared_ip(user.clone()), from_shared_ip(user));
+
+        // Without an AuthContext the address remains the fallback.
+        let anonymous = Request::builder().body(Body::empty()).unwrap();
+        assert_eq!(upload_bucket(&anonymous).0, "upload_ip");
     }
 
     #[test]

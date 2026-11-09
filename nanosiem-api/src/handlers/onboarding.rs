@@ -240,8 +240,7 @@ pub async fn get_onboarding_status(
         DedicatedProbeInputs {
             ai_available,
             ai_service_loaded,
-            // `oidc_providers` ships in the base schema on this product.
-            sso_available: true,
+            sso_available: cfg!(feature = "enterprise"),
         },
     )
     .await;

@@ -80,6 +80,7 @@ impl DetectionRuleRepository {
         .map_err(map_rule_write_error)?;
 
         // If case_visibility is 'group', add the group associations (batch insert)
+        #[cfg(feature = "enterprise")]
         if rule.case_visibility.as_deref() == Some("group") {
             if let Some(ref group_ids) = rule.case_group_ids {
                 if !group_ids.is_empty() {
@@ -250,6 +251,7 @@ impl DetectionRuleRepository {
 
         // If case_group_ids is provided, update the group associations atomically
         // Uses a CTE to delete and insert in a single atomic operation (race-condition safe)
+        #[cfg(feature = "enterprise")]
         if let Some(ref group_ids) = update.case_group_ids {
             let visibility = update
                 .case_visibility

@@ -164,6 +164,18 @@ impl AuthContext {
         )
     }
 
+    /// The caller as a typed case/notebook read principal (NAN-5019 / NAN-5028):
+    /// the ACL user together with the live-data deny set, so a repository that
+    /// gates on case visibility receives both halves or neither.
+    ///
+    /// The ACL principal is `user_id()` (the key OWNER for an API key, exactly
+    /// what case ACLs have always been evaluated against); the scope is
+    /// [`effective_viewer_scope`](Self::effective_viewer_scope), which an API
+    /// key resolves against its own principal.
+    pub fn viewer(&self) -> nanosiem_core::auth::ViewerScope {
+        nanosiem_core::auth::ViewerScope::new(self.user_id(), self.effective_viewer_scope())
+    }
+
     /// Check if the context has any of the specified permissions
     pub fn has_any_permission(&self, permissions: &[&str]) -> bool {
         self.claims.has_any_permission(permissions)

@@ -125,7 +125,7 @@ const EXT_FIELD_NAMES_ROWS_PER_SOURCE: usize = 5_000;
 /// while keeping UDM identical (NAN-1241).
 fn field_stats_quote_ident(name: &str) -> String {
     if name.contains('.') {
-        format!("\"{}\"", name.replace('"', "\"\""))
+        crate::sql_hygiene::quote_identifier_always(name)
     } else {
         name.to_string()
     }
@@ -449,7 +449,7 @@ impl ClickHouseExecutor {
         );
         info!(
             "Field stats SQL (first 500 chars): {}",
-            &sql[..sql.len().min(500)]
+            crate::text_bounds::prefix_at_most(&sql, 500)
         );
 
         let escaped_sql = escape_question_marks_in_strings(sql);
@@ -510,7 +510,7 @@ impl ClickHouseExecutor {
                     "Failed to parse field stats JSON: {} - response was: {}",
                     e,
                     if response_str.len() > 200 {
-                        &response_str[..200]
+                        crate::text_bounds::prefix_at_most(&response_str, 200)
                     } else {
                         &response_str
                     }

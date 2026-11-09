@@ -971,15 +971,56 @@ pub async fn admin_reset_mfa(
         )
     })?;
 
-    state.user_repo.disable_mfa(*user_id).await.map_err(|e| {
+    // NAN-5027: `users:edit` is not authority over a more-privileged account —
+    // clearing an Admin's second factor was the first step of a takeover.
+    let stamp = crate::handlers::grant_authz::ensure_can_manage_principal(
+        &auth,
+        &state.pool,
+        ADMIN_RESET_MFA_PERMISSION,
+        *user_id,
+        None,
+    )
+    .await
+    .map_err(|g| {
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            g.status,
             Json(MfaApiError {
-                error: "db_error".into(),
-                message: e.to_string(),
+                error: g.code.into(),
+                message: g.message,
             }),
         )
     })?;
+
+    // NAN-5014: removing a second factor is a credential change — revoke every
+    // token and session already issued to the target in the same transaction.
+    state
+        .user_repo
+        .apply_principal_action_authorized(
+            *user_id,
+            nanosiem_core::auth::PrincipalAction::ResetMfa,
+            stamp,
+        )
+        .await
+        .map_err(|e| match e {
+            nanosiem_core::auth::UserRepositoryError::GrantAuthorityChanged => (
+                StatusCode::CONFLICT,
+                Json(MfaApiError {
+                    error: "grant_authority_changed".into(),
+                    message: "Authorization changed while the request was being validated; retry"
+                        .into(),
+                }),
+            ),
+            e => {
+                tracing::error!(error = %e, "admin MFA reset failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(MfaApiError {
+                        error: "db_error".into(),
+                        message: "Failed to reset MFA".into(),
+                    }),
+                )
+            }
+        })?;
 
     state.emit_audit_durable(
         AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_ADMIN_RESET)

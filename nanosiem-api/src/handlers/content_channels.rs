@@ -108,7 +108,11 @@ impl AppContentApplier {
         let table = match channel.kind {
             Kind::Parsers => "parser_repositories",
             Kind::Rules => "rule_repositories",
+            #[cfg(feature = "enterprise")]
             Kind::Playbooks => "playbook_repositories",
+            // Playbooks are enterprise-only; the open schema has no table.
+            #[cfg(not(feature = "enterprise"))]
+            Kind::Playbooks => return Ok(0),
             Kind::MarketplaceCatalog => "enrichment_marketplace_repos",
             Kind::ModelCatalog | Kind::MitreCatalog | Kind::Extension => return Ok(0),
         };
@@ -128,11 +132,14 @@ impl AppContentApplier {
                         .await
                         .map(|_| ())
                         .map_err(|e| e.to_string()),
+                    #[cfg(feature = "enterprise")]
                     Kind::Playbooks => nanosiem_core::playbook_repository::PlaybookRepositoryService::new(state.pool.clone())
                         .sync_repository(id)
                         .await
                         .map(|_| ())
                         .map_err(|e| e.to_string()),
+                    #[cfg(not(feature = "enterprise"))]
+                    Kind::Playbooks => Ok(()),
                     Kind::MarketplaceCatalog => nanosiem_core::marketplace::MarketplaceSyncService::new(state.pool.clone())
                         .sync_repository(id)
                         .await

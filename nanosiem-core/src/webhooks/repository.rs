@@ -543,7 +543,7 @@ impl WebhookRepository {
         // Truncate response body to 1KB
         let truncated_body = response_body.map(|b| {
             if b.len() > 1024 {
-                format!("{}...(truncated)", &b[..1024])
+                format!("{}...(truncated)", crate::text_bounds::prefix_at_most(b, 1024))
             } else {
                 b.to_string()
             }

@@ -1,7 +1,7 @@
 # nano: local single-tenant ENTERPRISE dev stack, infrastructure only (NAN-4905)
 #
 # Overlay on docker-compose.opensource.yml (the validated single-host template).
-# Docker runs ONLY the infrastructure: ClickHouse, PostgreSQL, Dragonfly and
+# Docker runs ONLY the infrastructure: ClickHouse, PostgreSQL, Valkey and
 # Vector. The app (nano-api, nano-search, nano-jobs, the ClickHouse migrator)
 # runs natively from this checkout via scripts/start-microservices-dev.sh, and
 # the web UI runs on the Vite dev server (Dan, 11-02).
@@ -21,7 +21,7 @@
 #   ClickHouse HTTP                 ${NANOCH_CH_HTTP_PORT:-8123}
 #   ClickHouse native               ${NANOCH_CH_NATIVE_PORT:-9010}
 #   PostgreSQL                      ${NANOCH_PG_PORT:-15432}
-#   Dragonfly (Redis protocol)      ${NANOCH_REDIS_PORT:-16379}
+#   Valkey (Redis protocol)         ${NANOCH_REDIS_PORT:-16379}
 #   nginx ingest edge               ${NANOCH_EDGE_PORT:-18090}  (/ingest, /otlp/v1/*, API, UI)
 #   Nano Pipe tap relay             ${NANOCH_VECTOR_TAP_PORT:-18687}  (Bearer NANO_VECTOR_TAP_TOKEN)
 #   Vector OTLP/HTTP (loopback)     ${NANOCH_VECTOR_OTLP_PORT:-14318}  (unauthenticated; the edge's /otlp target on Linux)
@@ -44,7 +44,7 @@ services:
       - "127.0.0.1:${NANOCH_CH_NATIVE_PORT:-9010}:9000"
 
   dragonfly:
-    container_name: ${NANOCH_PROJECT:-nanoch}-dragonfly
+    container_name: ${NANOCH_PROJECT:-nanoch}-valkey
     ports: !override
       - "127.0.0.1:${NANOCH_REDIS_PORT:-16379}:6379"
 

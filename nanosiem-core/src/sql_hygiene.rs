@@ -34,8 +34,10 @@
 //! whatever follows — including a security predicate appended to the same line.
 //! This module offered only value escaping, which is exactly why the identifier
 //! class kept recurring. Use [`is_safe_sql_identifier`] to reject, or
-//! [`escape_sql_identifier`] to quote, ANY identifier that is not a
-//! compile-time constant.
+//! [`quote_identifier`] to quote, ANY identifier that is not a compile-time
+//! constant. [`alias_expr`], [`qualified_column`] and [`string_literal`] build
+//! the common fragments from those primitives. [`escape_sql_identifier`]
+//! (backtick form) remains for callers that already emit backticks.
 
 use chrono::{DateTime, Utc};
 
@@ -96,6 +98,138 @@ pub fn escape_sql_identifier(s: impl AsRef<str>) -> String {
         "`{}`",
         s.as_ref().replace('\\', "\\\\").replace('`', "\\`")
     )
+}
+
+// ---------------------------------------------------------------------------
+// Identifier quoting and SQL-fragment builders (security review 2026-11-08)
+//
+// These are THE helpers for putting user- or database-derived text into
+// generated ClickHouse SQL. Every name goes through `quote_identifier`, every
+// value through `string_literal` / `escape_sql_string`. Never build an alias,
+// a column reference or a DDL object name with a bare `format!("{}", name)`;
+// the `sql_interpolation_lint` test rejects the common shapes of that.
+// ---------------------------------------------------------------------------
+
+/// Quote a ClickHouse identifier (column, alias, table) for generated SQL.
+///
+/// - A plain bareword (`^[A-Za-z_][A-Za-z0-9_]*$`) that is not a reserved word
+///   is returned unchanged. This keeps the generated SQL byte-identical for the
+///   overwhelming majority of names.
+/// - Everything else (reserved words, dotted, spaced, or anything containing
+///   a comma, parenthesis, quote, backslash or comment introducer) is wrapped in
+///   double quotes. Backslashes are doubled FIRST, then `"` is doubled.
+///   ClickHouse honours C-style backslash escapes inside `"…"` identifiers
+///   (`"a\", 2 AS b"` parses as one identifier), so quote-doubling alone is
+///   not enough.
+///
+/// The result always occupies exactly one identifier token, whatever the input.
+///
+/// Dotted names: `quote_identifier("a.b")` yields `"a.b"`, a single column
+/// literally named `a.b`. That is NOT the same as the bare compound reference
+/// `a.b` (an OCSF nested column or a `table.column` qualifier). Use
+/// [`qualified_column`] when the dots are structural.
+pub fn quote_identifier(name: &str) -> String {
+    if is_bareword_identifier(name) && !is_reserved_identifier(name) {
+        name.to_string()
+    } else {
+        quote_identifier_always(name)
+    }
+}
+
+/// Always double-quote `name` (backslash then quote escaped), even when it is a
+/// bareword. Use this only where existing SQL already quotes every name, so the
+/// output shape is preserved. Otherwise prefer [`quote_identifier`].
+pub fn quote_identifier_always(name: &str) -> String {
+    format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\"\""))
+}
+
+/// True when `name` is a plain SQL bareword: a leading ASCII letter or
+/// underscore followed only by ASCII letters, digits or underscores. Such a name
+/// needs no quoting and cannot carry a SQL breakout.
+pub fn is_bareword_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// True for the ClickHouse keywords that must be quoted even though they are
+/// barewords (case-insensitive). [`quote_identifier`] quotes them; the column
+/// they name is unchanged (`AS "user"` and `AS user` both name `user`).
+pub fn is_reserved_identifier(word: &str) -> bool {
+    matches!(
+        word.to_uppercase().as_str(),
+        "USER"
+            | "ORDER"
+            | "GROUP"
+            | "SELECT"
+            | "FROM"
+            | "WHERE"
+            | "AND"
+            | "OR"
+            | "NOT"
+            | "NULL"
+            | "TRUE"
+            | "FALSE"
+            | "AS"
+            | "BY"
+            | "ASC"
+            | "DESC"
+            | "LIMIT"
+            | "OFFSET"
+            | "DATABASE"
+            | "TABLE"
+            | "INDEX"
+            | "KEY"
+            | "PRIMARY"
+            | "ENGINE"
+            | "PARTITION"
+    )
+}
+
+/// Render `<expr> AS <alias>` with the alias quoted by [`quote_identifier`].
+///
+/// `expr` must already be valid SQL produced by the generator; only `alias`
+/// is treated as untrusted.
+pub fn alias_expr(expr: &str, alias: &str) -> String {
+    format!("{expr} AS {}", quote_identifier(alias))
+}
+
+/// Render a column reference qualified by a table/CTE alias: `<qualifier>.<name>`.
+///
+/// - A name that passes [`is_safe_sql_identifier`] (ASCII alphanumerics, `_`
+///   and structural `.` for OCSF nested columns) is emitted bare, exactly as
+///   before: `l.src_ip`, `l.src_endpoint.ip`.
+/// - Anything else is quoted with [`quote_identifier`]: `l."p95 latency"`.
+///   Such names (quoted eval/rename aliases) used to produce broken or
+///   injectable SQL; now they reference the quoted column.
+///
+/// `qualifier` must be a compile-time constant (for example `"l"`).
+pub fn qualified_column(qualifier: &str, name: &str) -> String {
+    format!("{qualifier}.{}", column_reference(name))
+}
+
+/// Render an unqualified column reference.
+///
+/// Same rule as [`qualified_column`]: a name that passes
+/// [`is_safe_sql_identifier`] (including structural dots) is emitted bare,
+/// exactly as before; anything else is quoted with [`quote_identifier`].
+/// Use this where existing SQL emits a field name bare and OCSF dotted names
+/// must keep working.
+pub fn column_reference(name: &str) -> String {
+    if is_safe_sql_identifier(name) {
+        name.to_string()
+    } else {
+        quote_identifier(name)
+    }
+}
+
+/// Render `s` as a complete single-quoted ClickHouse string literal, escaped
+/// with [`escape_sql_string`].
+pub fn string_literal(s: &str) -> String {
+    format!("'{}'", escape_sql_string(s))
 }
 
 /// Escape a raw string for use in a ClickHouse `LIKE`/`ILIKE` pattern.
@@ -496,3 +630,7 @@ mod tests {
         assert_eq!(expand_sql_time_macros(sql, &s, &e), sql);
     }
 }
+
+#[cfg(test)]
+#[path = "sql_hygiene_identifier_tests.rs"]
+mod identifier_tests;

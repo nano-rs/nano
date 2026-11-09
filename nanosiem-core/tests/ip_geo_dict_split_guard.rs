@@ -163,6 +163,8 @@ fn ocsf_view_body_in_185_matches_the_generated_overlay() {
     fn without_ioc(body: &str) -> String {
         body.lines()
             .filter(|l| !l.contains("AS `enrichments.ioc_") && !l.contains("AS `enrichments.custom_ioc_"))
+            // ocsf/193 (NAN-5032) redefined the source_type line afterwards.
+            .filter(|l| !l.trim_end().ends_with("AS source_type,"))
             .collect::<Vec<_>>()
             .join("\n")
     }

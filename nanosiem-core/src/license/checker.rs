@@ -12,11 +12,12 @@ use tokio::time::{interval, Duration};
 
 use super::repository::LicenseRepository;
 use super::types::{LicenseResponse, LicenseState, LicenseStatus};
+use crate::TierSettings;
 
 /// Maximum time without a successful license check before auto-locking.
 /// Prevents the "block the license server DNS" bypass attack.
 /// 14 days = enough to survive extended outages, short enough to enforce.
-const STALE_LICENSE_DAYS: i64 = 14;
+pub(crate) const STALE_LICENSE_DAYS: i64 = 14;
 
 /// Configuration for the license checker
 #[derive(Debug, Clone)]
@@ -56,6 +57,7 @@ pub struct LicenseChecker {
     config: LicenseCheckerConfig,
     http_client: reqwest::Client,
     repo: LicenseRepository,
+    tier_settings: TierSettings,
     license_status: Arc<RwLock<LicenseStatus>>,
 }
 
@@ -73,7 +75,8 @@ impl LicenseChecker {
         Self {
             config,
             http_client,
-            repo: LicenseRepository::new(pool),
+            repo: LicenseRepository::new(pool.clone()),
+            tier_settings: TierSettings::new(pool),
             license_status,
         }
     }
@@ -83,7 +86,7 @@ impl LicenseChecker {
     /// Also checks staleness to prevent restart-after-long-downtime bypass.
     pub async fn load_cached_status(&self) {
         match self.repo.get_status().await {
-            Ok(cached) => {
+            Ok(cached) if !cached.offline && cached.last_checked_at.is_some() => {
                 tracing::info!(
                     state = %cached.state,
                     valid = cached.valid,
@@ -91,14 +94,32 @@ impl LicenseChecker {
                     "Loaded cached license status from database"
                 );
                 let mut status = self.license_status.write().await;
-                *status = cached;
+                *status = cached.for_online_admission();
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    "Cached licence has no successful online observation; failing closed"
+                );
+                *self.license_status.write().await = LicenseStatus::unavailable(
+                    "Online licence has not completed its first successful check.",
+                );
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to load cached license status, defaulting to active");
+                tracing::warn!(error = %e, "Failed to load cached licence status; failing closed");
+                *self.license_status.write().await =
+                    LicenseStatus::unavailable("Cached online licence status is unavailable.");
             }
         }
         // Check staleness immediately on boot
         self.check_staleness().await;
+    }
+
+    /// Establish online admission before licensed routes or workers start.
+    /// A fresh install remains locked unless this first request succeeds; a
+    /// previously observed, non-stale cache remains the bounded outage fallback.
+    pub async fn initialize(&self) -> Result<(), LicenseCheckError> {
+        self.load_cached_status().await;
+        self.check_license().await
     }
 
     /// Start the license check loop. Returns a task handle.
@@ -110,7 +131,6 @@ impl LicenseChecker {
             tokio::time::sleep(offset).await;
 
             let mut ticker = interval(Duration::from_secs(self.config.interval_secs));
-            ticker.tick().await; // skip immediate tick
 
             loop {
                 ticker.tick().await;
@@ -161,12 +181,16 @@ impl LicenseChecker {
         }
     }
 
-    async fn check_license(&self) -> Result<(), LicenseCheckError> {
+    pub async fn check_license(&self) -> Result<(), LicenseCheckError> {
         tracing::debug!(url = %self.config.license_url, "Checking license status");
 
+        // NAN-5114: report the running version so nano-main can show it on
+        // the deployment page and decide who still needs a new-version email.
         let url = format!(
-            "{}?deploymentId={}",
-            self.config.license_url, self.config.deployment_id
+            "{}?deploymentId={}&version={}",
+            self.config.license_url,
+            self.config.deployment_id,
+            env!("CARGO_PKG_VERSION")
         );
         let resp = self
             .http_client
@@ -187,7 +211,41 @@ impl LicenseChecker {
             .await
             .map_err(|e| LicenseCheckError::ParseError(e.to_string()))?;
 
-        let new_status = self.compute_new_status(&license_resp);
+        let mut new_status = Self::compute_new_status(&license_resp);
+
+        if new_status.state != LicenseState::Locked {
+            if let Some(tier) = new_status.tier.as_deref().map(online_tier_claim) {
+                // The legacy online response carries only a tier string. The
+                // deployment operator is authoritative local provisioning;
+                // never turn a Hosted install into uncapped Self-run while
+                // normalizing that old claim.
+                let operator = self
+                    .tier_settings
+                    .get_tier_limits()
+                    .await
+                    .map_err(|error| LicenseCheckError::Entitlement(error.to_string()))?
+                    .entitlement
+                    .operator;
+                let limits = self
+                    .tier_settings
+                    .admit_license_tier(tier, operator)
+                    .await
+                    .map_err(|error| LicenseCheckError::Entitlement(error.to_string()))?;
+                new_status.tier = Some(limits.tier.to_string());
+            }
+        }
+
+        // NAN-5055: an audited deployment grant (e.g. a grandfathered original
+        // tenant's AI allowance) is honoured only from this authenticated,
+        // successfully parsed check-in, and only while it admits licensed
+        // features. Every other outcome (no grant, malformed/unhonoured
+        // grant, locked) clears it, so the meter falls back to the
+        // provisioned env ceiling and a grant can never escalate.
+        let granted_ai_credits = admitted_grant_ai_credits(&new_status, &license_resp);
+        self.tier_settings
+            .set_granted_ai_credits(granted_ai_credits)
+            .await
+            .map_err(|error| LicenseCheckError::Entitlement(error.to_string()))?;
 
         // Log state transitions
         {
@@ -212,12 +270,21 @@ impl LicenseChecker {
         if let Err(e) = self.repo.update_status(&new_status).await {
             tracing::warn!(error = %e, "Failed to persist license status to database");
         }
+        // NAN-5114: the "Update available" facts ride on the same successful
+        // check-in. A failure here never affects admission.
+        if let Err(e) = self
+            .repo
+            .update_release_notice(license_resp.release.as_ref())
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to persist release notice");
+        }
 
         tracing::debug!(state = %new_status.state, valid = new_status.valid, "License check complete");
         Ok(())
     }
 
-    fn compute_new_status(&self, resp: &LicenseResponse) -> LicenseStatus {
+    fn compute_new_status(resp: &LicenseResponse) -> LicenseStatus {
         let now = Utc::now();
 
         let grace_ends_at = resp
@@ -270,8 +337,39 @@ impl LicenseChecker {
             last_heartbeat_at: None, // legacy field, no longer updated
             // Online check-in result: never an air-gap import.
             offline: false,
+            entitlement: resp.entitlement.clone(),
         }
     }
+}
+
+/// The online check-in response carries only a legacy `tier` string; nano-main
+/// never sends the v2 edition/operator/capacity tuple on the paid/subscription
+/// path. Admission is decided by `valid`/`locked`, and in v2 a tier never
+/// selects features, so an authenticated admitted response with a tier string
+/// this build does not recognize (a future platform plan name, for example)
+/// still normalizes to `licensed` instead of failing the whole check. Failing
+/// it would leave a fresh install locked and let a cached install age into the
+/// 14-day outage lock while its subscription is in good standing.
+fn online_tier_claim(tier: &str) -> &str {
+    if tier.parse::<crate::OrganizationTier>().is_ok() {
+        tier
+    } else {
+        tracing::warn!(
+            tier,
+            "Unrecognized online licence tier claim; admitting as licensed"
+        );
+        "licensed"
+    }
+}
+
+/// NAN-5055: the AI allowance this check-in grants, or `None`. A grant is
+/// honoured only while the observation admits licensed features; a locked
+/// response (or one carrying no honoured grant) yields `None`, which clears
+/// any previous grant.
+fn admitted_grant_ai_credits(status: &LicenseStatus, resp: &LicenseResponse) -> Option<u32> {
+    (status.state != LicenseState::Locked)
+        .then(|| resp.granted_ai_credits_per_month())
+        .flatten()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -282,4 +380,10 @@ pub enum LicenseCheckError {
     ServerError(String),
     #[error("Parse error: {0}")]
     ParseError(String),
+    #[error("Entitlement error: {0}")]
+    Entitlement(String),
 }
+
+#[cfg(test)]
+#[path = "checker_tests.rs"]
+mod tests;

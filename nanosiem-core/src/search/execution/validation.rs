@@ -43,7 +43,7 @@ use sqlparser::tokenizer::{Token, Whitespace};
 /// already rejected by the single-SELECT parse below, and ClickHouse `readonly`
 /// + SELECT-only grants deny them at execution — listing them only caused
 /// false-positives on log content (`message LIKE '%delete%'`).
-const DISALLOWED_FUNCTIONS: &[&str] = &[
+pub(crate) const DISALLOWED_FUNCTIONS: &[&str] = &[
     // Sleep / DoS
     "SLEEP",
     "SLEEPEACHROW",

@@ -23,9 +23,16 @@ chrono.workspace = true
 tracing.workspace = true
 utoipa.workspace = true
 tokio.workspace = true
+tower-http.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }
 futures = "0.3"
 tracing-subscriber.workspace = true
+
+[features]
+default = []
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("enterprise"))'] }

@@ -112,18 +112,15 @@ fn old_bytes(input: &[u8]) -> Zeroizing<[u8; 32]> {
     out
 }
 
-const PUBLIC_VALUES: [&str; 4] = [
-    "nanosiem-default-key-32bytes!!",
-    "CHANGE_ME",
-    "CHANGE_ME_GENERATE_WITH_OPENSSL_RAND_HEX_32",
-    "your-encryption-key-change-in-production",
-];
-
+/// Known public key material: all-zero, the built-in dev key, or any value
+/// nano shipped as an encryption-key default or example (the shared list in
+/// `crate::known_public_secrets`, which includes the concrete key the old
+/// `.env.example` carried).
 fn public_material(key: &[u8; 32]) -> bool {
+    use crate::known_public_secrets::{known_public_values, SecretKind};
     key.iter().all(|b| *b == 0)
         || key.starts_with(b"nanosiem-default-key-32bytes!!")
-        || PUBLIC_VALUES
-            .iter()
+        || known_public_values(SecretKind::EncryptionKey)
             .any(|value| old_bytes(value.as_bytes()).as_ref() == key)
 }
 

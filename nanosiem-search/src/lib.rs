@@ -8,8 +8,8 @@
 //! Requirements: 1.3, 3.1, 3.2, 3.3
 
 pub mod cache;
-pub mod denied_source_audit;
 pub mod config;
+pub mod denied_source_audit;
 pub mod error;
 pub mod handlers;
 pub(crate) mod inflight;
@@ -18,14 +18,15 @@ pub mod metrics;
 pub mod middleware;
 pub mod openapi;
 
-use axum::http::{HeaderName, HeaderValue};
 use axum::http::{
-    Method,
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
+    Method,
 };
+use axum::http::{HeaderName, HeaderValue};
 use axum::{
-    Router, middleware as axum_middleware,
+    middleware as axum_middleware,
     routing::{delete, get, post, put},
+    Router,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,26 +38,26 @@ use tower_http::trace::TraceLayer;
 
 use nanosiem_core::audit::{AuditEmitter, AuditEvent};
 use nanosiem_core::{
-    DualPool, InputLookupConfig, InputLookupService, IpAllowlistService, LookupService,
-    PrevalenceService, SearchService,
     ip_allowlist::IpAllowlistScope,
     search::{
-        AdmissionConfig, AdmissionController, RedisJobStore,
         background::{
             BackgroundJobConfig, BackgroundSearchJobs, SearchJobRepository, SearchJobResultStore,
         },
+        AdmissionConfig, AdmissionController, RedisJobStore,
     },
     settings::{SearchAdmissionSettings, SearchQueryLimitsSettings},
+    DualPool, InputLookupConfig, InputLookupService, IpAllowlistService, LookupService,
+    PrevalenceService, SearchService,
 };
 #[cfg(feature = "enterprise")]
 use nanosiem_enterprise::melod::{AgentConfigRegistry, AgentConfigRegistryConfig, AiPipeAgent};
 
 pub use config::SearchConfig;
 pub use error::SearchError;
-pub use metrics::{SearchMetrics, record_search_query};
+pub use metrics::{record_search_query, SearchMetrics};
 pub use middleware::{
-    AuthContext, AuthState, IpAllowlistState, REQUEST_ID_HEADER, RequestId, auth_middleware,
-    ip_allowlist_middleware, request_id_middleware, sanitize_error_responses,
+    auth_middleware, ip_allowlist_middleware, request_id_middleware, sanitize_error_responses,
+    AuthContext, AuthState, IpAllowlistState, RequestId, REQUEST_ID_HEADER,
 };
 
 /// Shared application state for the Search Service
@@ -84,7 +85,7 @@ pub struct SearchState {
     pub start_time: Instant,
     /// Leader election status (None = election disabled, always serve)
     leader_rx: Option<watch::Receiver<bool>>,
-    /// Search result cache (Dragonfly/Redis — None if unavailable)
+    /// Search result cache (Valkey/Redis — None if unavailable)
     pub result_cache: Option<cache::SearchResultCache>,
     /// Shared request ownership used to authorize cancellation on any search replica.
     query_owner_redis: Option<redis::aio::ConnectionManager>,
@@ -148,9 +149,18 @@ impl SearchState {
         // `schema::is_event_json_hint`); otherwise keep the parity form.
         if schema_profile.id() == nanosiem_core::schema::SchemaId::Ocsf {
             let local_table = dual_pool.table_names().local("ocsf_logs");
-            match nanosiem_core::schema::refresh_live_event_json_hints(dual_pool.clickhouse(), &local_table).await {
-                Ok(n) => tracing::info!(table = %local_table, live_hints = n, "OCSF event JSON type hints detected"),
-                Err(e) => tracing::warn!(table = %local_table, error = %e, "OCSF event JSON hint probe failed; using the parity form"),
+            match nanosiem_core::schema::refresh_live_event_json_hints(
+                dual_pool.clickhouse(),
+                &local_table,
+            )
+            .await
+            {
+                Ok(n) => {
+                    tracing::info!(table = %local_table, live_hints = n, "OCSF event JSON type hints detected")
+                }
+                Err(e) => {
+                    tracing::warn!(table = %local_table, error = %e, "OCSF event JSON hint probe failed; using the parity form")
+                }
             }
         }
         let mut search_svc = SearchService::with_dual_pool_lookup_and_prevalence_and_profile(
@@ -215,25 +225,26 @@ impl SearchState {
                 // "AI unavailable in this build") and retry lazily, so a config
                 // fix in Postgres doesn't need a restart.
                 let pool = dual_pool.clone();
-                let factory: nanosiem_core::extensions::AiClientFactory =
-                    Arc::new(move || {
-                        let pool = pool.clone();
-                        Box::pin(async move {
-                            Self::create_ai_pipe_agent(&pool).await.map(|agent| {
-                                Arc::new(agent) as Arc<dyn nanosiem_core::extensions::AiClient>
-                            })
+                let factory: nanosiem_core::extensions::AiClientFactory = Arc::new(move || {
+                    let pool = pool.clone();
+                    Box::pin(async move {
+                        Self::create_ai_pipe_agent(&pool).await.map(|agent| {
+                            Arc::new(agent) as Arc<dyn nanosiem_core::extensions::AiClient>
                         })
-                    });
-                search_svc.set_ai_client(Arc::new(nanosiem_core::extensions::DeferredAiClient::new(
-                    "AI not configured for search service",
-                    e,
-                    std::time::Duration::from_secs(60),
-                    factory,
-                )));
+                    })
+                });
+                search_svc.set_ai_client(Arc::new(
+                    nanosiem_core::extensions::DeferredAiClient::new(
+                        "AI not configured for search service",
+                        e,
+                        std::time::Duration::from_secs(60),
+                        factory,
+                    ),
+                ));
             }
         }
 
-        // Connect to Dragonfly/Redis for job store, cancellation ownership, and
+        // Connect to Valkey/Redis for job store, cancellation ownership, and
         // result caching (optional).
         let redis_url = std::env::var("REDIS_URL").ok();
         let query_owner_redis = match redis_url.as_deref() {
@@ -295,7 +306,7 @@ impl SearchState {
         // Create audit emitter for logging sharing events
         let audit_emitter = Arc::new(AuditEmitter::new(dual_pool.clone()));
 
-        // Connect to Dragonfly/Redis for search result caching (optional)
+        // Connect to Valkey/Redis for search result caching (optional)
         let result_cache = match redis_url {
             Some(ref url) => cache::SearchResultCache::connect(url).await,
             None => {
@@ -305,7 +316,9 @@ impl SearchState {
         };
 
         // Create IP allowlist service for access control
-        let ip_allowlist_service = Arc::new(IpAllowlistService::new(dual_pool.postgres().clone()));
+        let ip_allowlist_service = Arc::new(
+            IpAllowlistService::new(dual_pool.postgres().clone()).with_component("nanosiem-search"),
+        );
 
         // Share the middleware's fail-closed source-scope resolver (NAN-1797)
         // so handler-side resolution hits the same Arc-backed registry cache.
@@ -347,19 +360,26 @@ impl SearchState {
         let key = Self::query_owner_key(request_id);
         let owner = user_id.to_string();
         let inserted: Option<String> = redis::cmd("SET")
-            .arg(&key).arg(&owner).arg("NX").arg("EX").arg(OWNER_TTL_SECS)
-            .query_async(&mut conn).await?;
+            .arg(&key)
+            .arg(&owner)
+            .arg("NX")
+            .arg("EX")
+            .arg(OWNER_TTL_SECS)
+            .query_async(&mut conn)
+            .await?;
         if inserted.is_some() {
             return Ok(true);
         }
-        let existing: Option<String> = redis::cmd("GET")
-            .arg(&key).query_async(&mut conn).await?;
+        let existing: Option<String> = redis::cmd("GET").arg(&key).query_async(&mut conn).await?;
         if existing.as_deref() != Some(owner.as_str()) {
             return Ok(false);
         }
         // Companion queries reuse the main request id. Keep the proof alive.
         let _: bool = redis::cmd("EXPIRE")
-            .arg(&key).arg(OWNER_TTL_SECS).query_async(&mut conn).await?;
+            .arg(&key)
+            .arg(OWNER_TTL_SECS)
+            .query_async(&mut conn)
+            .await?;
         Ok(true)
     }
 
@@ -372,7 +392,9 @@ impl SearchState {
             return Ok(None);
         };
         let owner: Option<String> = redis::cmd("GET")
-            .arg(Self::query_owner_key(request_id)).query_async(&mut conn).await?;
+            .arg(Self::query_owner_key(request_id))
+            .query_async(&mut conn)
+            .await?;
         Ok(owner.and_then(|value| uuid::Uuid::parse_str(&value).ok()))
     }
 
@@ -432,8 +454,9 @@ impl SearchState {
                 // P1 audit: refresh prevalence config so runtime admin changes
                 // (rarity_threshold, tracking toggles) take effect here without a
                 // restart. update_config also invalidates the prevalence cache.
-                let prevalence_settings =
-                    nanosiem_core::prevalence::PrevalenceSettings::new(dual_pool.postgres().clone());
+                let prevalence_settings = nanosiem_core::prevalence::PrevalenceSettings::new(
+                    dual_pool.postgres().clone(),
+                );
                 match prevalence_settings.get_config().await {
                     Ok(cfg) => {
                         // NAN-1691 (P3): only hot-reload when the DB config
@@ -564,13 +587,20 @@ impl SearchState {
         let cf_aig_metadata = {
             let org_id = std::env::var("NANO_ORG_ID").unwrap_or_default();
             let deployment_id = std::env::var("NANO_DEPLOYMENT_ID").unwrap_or_default();
-            let tier = std::env::var("NANO_TIER").unwrap_or_else(|_| "unrestricted".to_string());
+            let operator = nanosiem_core::TierSettings::new(dual_pool.postgres().clone())
+                .get_tier_limits()
+                .await
+                .map_err(|error| format!("failed to read v2 entitlement: {error}"))?
+                .entitlement
+                .operator
+                .to_string();
             if !org_id.is_empty() || !deployment_id.is_empty() {
                 Some(
                     serde_json::json!({
                         "org_id": org_id,
                         "deployment_id": deployment_id,
-                        "tier": tier
+                        "edition": if cfg!(feature = "enterprise") { "licensed" } else { "open" },
+                        "operator": operator
                     })
                     .to_string(),
                 )
@@ -772,10 +802,7 @@ pub fn create_router(
         )
         // Metrics v2 (NAN-1540): tag-key / tag-value enumeration for the
         // group-by / filter pickers.
-        .route(
-            "/api/search/metrics/tags",
-            get(handlers::list_metric_tags),
-        )
+        .route("/api/search/metrics/tags", get(handlers::list_metric_tags))
         // Observability console (NAN-1536): services overview + service detail
         .route("/api/search/services", get(handlers::list_services))
         .route(
@@ -882,10 +909,14 @@ pub fn create_router(
         // M9: Limit request body size to 256KB to prevent DoS via oversized payloads
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         // M10: Catch panics to prevent search service crashes from taking down the process
-        .layer(tower_http::catch_panic::CatchPanicLayer::new())
+        // NAN-5102: shared panic responder (JSON INTERNAL_ERROR, panic text
+        // logged server-side only).
+        .layer(nanosiem_api_lib::panic_isolation::catch_panic_layer())
         .layer(axum_middleware::from_fn(sanitize_error_responses))
         // NAN-4753: streamed search answers opt out of proxy buffering.
-        .layer(axum_middleware::from_fn(nanosiem_api_lib::sse::sse_unbuffered))
+        .layer(axum_middleware::from_fn(
+            nanosiem_api_lib::sse::sse_unbuffered,
+        ))
         .layer(CompressionLayer::new().gzip(true))
         // Security headers (match nanosiem-api)
         .layer(SetResponseHeaderLayer::overriding(
@@ -912,7 +943,9 @@ pub fn create_router(
         .layer(cors)
         .layer(prometheus_layer)
         // NAN-3282: per-request + process-wide memory budget for product views.
-        .layer(axum_middleware::from_fn(middleware::product_view_memory_middleware))
+        .layer(axum_middleware::from_fn(
+            middleware::product_view_memory_middleware,
+        ))
         // NAN-3222: audit searches naming a source the caller cannot see
         // (inside auth: needs AuthContext; response untouched).
         .layer(axum_middleware::from_fn_with_state(
@@ -921,7 +954,9 @@ pub fn create_router(
         ))
         // NAN-4664 / NAN-4703: the caller's admission wait budget and query
         // class for every search (inside auth: needs the AuthContext).
-        .layer(axum_middleware::from_fn(middleware::admission_wait_budget_middleware))
+        .layer(axum_middleware::from_fn(
+            middleware::admission_wait_budget_middleware,
+        ))
         // Add auth middleware
         .layer(axum_middleware::from_fn_with_state(
             auth_state,
@@ -946,6 +981,9 @@ pub fn create_router(
 mod admission_wiring_tests;
 
 #[cfg(test)]
+mod ip_allowlist_wiring_tests;
+
+#[cfg(test)]
 mod view_memory_wiring_tests;
 
 #[cfg(test)]
@@ -955,7 +993,10 @@ mod query_owner_tests {
     #[test]
     fn query_owner_keys_are_stable_and_do_not_embed_client_ids() {
         let key = SearchState::query_owner_key("customer-visible-request-id");
-        assert_eq!(key, SearchState::query_owner_key("customer-visible-request-id"));
+        assert_eq!(
+            key,
+            SearchState::query_owner_key("customer-visible-request-id")
+        );
         assert_ne!(key, SearchState::query_owner_key("other-request-id"));
         assert!(!key.contains("customer-visible-request-id"));
     }

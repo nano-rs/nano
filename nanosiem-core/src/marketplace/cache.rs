@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shared Dragonfly/Redis-backed cache for the marketplace coverage hero
+//! Shared Valkey/Redis-backed cache for the marketplace coverage hero
 //! (NAN-609).
 //!
 //! ## Why
@@ -111,7 +111,7 @@ impl MarketplaceCoverageCache {
         Self::default()
     }
 
-    /// Cache backed by an existing Dragonfly/Redis `ConnectionManager`.
+    /// Cache backed by an existing Valkey/Redis `ConnectionManager`.
     pub fn with_redis(conn: ConnectionManager) -> Self {
         Self {
             redis: Some(Arc::new(Mutex::new(conn))),

@@ -673,7 +673,7 @@ pub(crate) fn json_tail_access_sql(col: &str, path: &[String], json_type: &str) 
     }
     let segments: Vec<String> = path
         .iter()
-        .map(|p| format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\"\"")))
+        .map(|p| crate::sql_hygiene::quote_identifier_always(p))
         .collect();
     let sub = format!("{}.{}", col, segments.join("."));
     // CH-2610 adoption: a JSON type hint (`json_hints.json`) stores the path as
@@ -753,7 +753,7 @@ pub(crate) const JSON_ARRAY_SEGMENT: &str = "[]";
 /// `''`. `toString()` of the result renders `['a','b']`, the shape rule evals
 /// such as `tostring(module.file.signatures.state) CONTAINS "'valid'"` expect.
 fn json_array_access_sql(col: &str, path: &[String], json_type: &str) -> String {
-    let quote = |p: &str| format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\"\""));
+    let quote = |p: &str| crate::sql_hygiene::quote_identifier_always(p);
     let leaf_array = path.last().map(String::as_str) == Some(JSON_ARRAY_SEGMENT);
     let body = if leaf_array { &path[..path.len() - 1] } else { path };
     let mut expr = col.to_string();
@@ -1764,77 +1764,18 @@ pub(crate) fn sanitize_json_path(name: &str) -> String {
 
 /// Escape an identifier (column/table name) for ClickHouse.
 ///
-/// A plain SQL bareword (`^[A-Za-z_][A-Za-z0-9_]*$`) that is not a reserved word
-/// is emitted verbatim — this keeps the generated SQL (and its golden tests)
-/// byte-identical for the overwhelming majority of column/alias names. EVERY
-/// other name — reserved words, dotted (`ext.foo`), spaced, or carrying any
-/// SQL-significant character (comma, parenthesis, quote, backslash) — is
-/// double-quoted with full escaping so it can never break out of the identifier
-/// position.
+/// Thin alias over [`crate::sql_hygiene::quote_identifier`], the canonical
+/// identifier sink (moved there in the 2026-11-08 security review so code
+/// outside the generator can use it). Plain non-reserved barewords are emitted
+/// verbatim, so generated SQL stays byte-identical; everything else is
+/// double-quoted with backslash-then-quote escaping. See that function for the
+/// full contract.
 ///
-/// This is the shared sink for every generated alias and column reference.
-/// Hardened for NAN-1992: the previous "quote only when it has a dot, a space,
-/// or is reserved" check let a `rex` capture-group name like `a,version()`
-/// (comma/parens, `/**/` for whitespace, no dot) pass through RAW into
-/// `... AS <injection> FROM ...`, yielding SQL injection as the lowest-priv role.
-///
-/// Escaping order matters: backslashes are doubled BEFORE quotes. ClickHouse
-/// honours C-style backslash escapes inside double-quoted identifiers (verified
-/// against the server: `"a\", 2 AS b"` parses as a SINGLE identifier), so a
-/// trailing/embedded backslash would otherwise defeat plain quote-doubling. The
-/// generated SQL is validated with sqlparser's `ClickHouseDialect`, which accepts
-/// this quoting (the old code comment referencing PostgreSqlDialect was stale).
+/// Generated nPL SQL is NOT parsed or validated after generation (only the raw
+/// SQL surface runs `validate_sql_query`), so this escaping is the guarantee,
+/// not a backstop.
 pub(crate) fn escape_identifier(name: &str) -> String {
-    if is_bareword_identifier(name) && !is_reserved_word(name) {
-        name.to_string()
-    } else {
-        format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\"\""))
-    }
-}
-
-/// True when `name` is a plain SQL bareword — a leading ASCII letter or
-/// underscore followed only by ASCII letters, digits, or underscores. Such a
-/// name needs no quoting and cannot carry a SQL breakout; anything else routes
-/// through the quoted+escaped branch of [`escape_identifier`].
-fn is_bareword_identifier(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Check if a word is a ClickHouse reserved word
-pub(crate) fn is_reserved_word(word: &str) -> bool {
-    matches!(
-        word.to_uppercase().as_str(),
-        "USER"
-            | "ORDER"
-            | "GROUP"
-            | "SELECT"
-            | "FROM"
-            | "WHERE"
-            | "AND"
-            | "OR"
-            | "NOT"
-            | "NULL"
-            | "TRUE"
-            | "FALSE"
-            | "AS"
-            | "BY"
-            | "ASC"
-            | "DESC"
-            | "LIMIT"
-            | "OFFSET"
-            | "DATABASE"
-            | "TABLE"
-            | "INDEX"
-            | "KEY"
-            | "PRIMARY"
-            | "ENGINE"
-            | "PARTITION"
-    )
+    crate::sql_hygiene::quote_identifier(name)
 }
 
 #[cfg(test)]

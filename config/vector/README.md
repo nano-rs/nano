@@ -78,7 +78,7 @@ curl -X POST http://localhost:8080/ \
 
 ## Environment Variables
 
-- `VECTOR_AUTH_TOKEN` - Bearer token for authentication (default: `nanosiem-default-token`)
+- `VECTOR_AUTH_TOKEN` - Bearer token for authentication (generated per install; there is no default)
 - `NANOSIEM_INGESTION_URL` - API endpoint for log delivery (default: `http://host.docker.internal:3000/api/ingest`)
 - `VECTOR_DATA_DIR` - Directory for disk buffer persistence
 

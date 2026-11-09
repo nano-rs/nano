@@ -408,7 +408,9 @@ fn clickhouse_admin_from_env() -> Result<(clickhouse::Client, String)> {
     ) {
         (Some(u), Some(p)) => (u, p),
         _ => (
-            var("CLICKHOUSE_USER").unwrap_or_else(|| "default".to_string()),
+            // Same fallback as DualPool::from_env; never the container-local
+            // `default` user.
+            var("CLICKHOUSE_USER").unwrap_or_else(|| "nanosiem".to_string()),
             var("CLICKHOUSE_PASSWORD").unwrap_or_default(),
         ),
     };

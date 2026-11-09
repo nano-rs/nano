@@ -842,7 +842,9 @@ impl FindingLogger {
             // distributed wrapper, so it resolves to the local name (same as the
             // audit emitter) — but route it through the resolver rather than a
             // bare literal so the `nanosiem.` qualification is consistent.
-            let ocsf_raw_table = dual_pool.table_names().local("ocsf_logs_raw");
+            // NAN-5032: the platform-only landing (ocsf/193). `ocsf_logs_raw`,
+            // the INGEST landing, rewrites `findings` to `reserved_spoof`.
+            let ocsf_raw_table = dual_pool.table_names().local("ocsf_logs_system_raw");
             // NAN-4939: omit the storage timestamp so migration ocsf/190 clamps
             // the value derived from event.time. The OCSF payload retains the
             // exact finding time for evidence/provenance semantics.
@@ -980,6 +982,8 @@ impl FindingLogger {
             "metadata": {
                 "product": { "name": "nano", "vendor_name": "nano" },
                 "log_name": "findings",
+                // NAN-5079: required by OCSF; the contract this row is written for.
+                "version": crate::parsers::ocsf_validation_version(),
                 "uid": cloned("alert_id", serde_json::Value::Null),
             },
             "finding_info": {

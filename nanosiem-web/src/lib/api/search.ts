@@ -568,7 +568,7 @@ export class SearchApi {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'Accept': 'text/event-stream',
-      // NAN-1595: refresh forces a live server recompute (bypasses Dragonfly).
+      // NAN-1595: refresh forces a live server recompute (bypasses Valkey).
       ...(opts?.bypass ? { 'x-nano-cache-bypass': '1' } : {}),
       // NAN-4915: accept a hand-off to a durable background job (terminal
       // `job` event) when the search outruns the interactive budget.

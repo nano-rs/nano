@@ -214,3 +214,102 @@ async fn axum_router_rejects_path_traversal_on_wildcard_capture() {
         "positive control returned the wrong file bytes",
     );
 }
+
+/// Security review 2026-11-08 (NAN-5042): config delivery has its own
+/// credential. Once it is provisioned, the forwarder install token, which
+/// every forwarder holds, no longer opens /api/internal/vector-config/*.
+mod delivery_credential {
+    use super::*;
+    use nanosiem_core::deployment_posture::{
+        resolve_vector_config_delivery, DeliveryDisabledReason,
+        VectorConfigDeliveryCredential as C,
+    };
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    /// The exact role-split upgrade order: the app host is upgraded first and
+    /// gets NANO_VECTOR_CONFIG_DELIVERY_TOKEN; an ingest host still runs with
+    /// its older copied .env, so its consumer presents the install token.
+    /// During v2.0.x that consumer must keep receiving config (parser
+    /// publishes, new and REVOKED ingest tokens). An upgraded consumer uses the
+    /// dedicated token. A caller with neither is refused.
+    #[test]
+    fn app_host_upgraded_first_still_serves_an_ingest_host_with_an_older_env() {
+        let app_host =
+            resolve_vector_config_delivery(None, Some("delivery-secret"), Some("install-token"), false);
+        let peer: SocketAddr = "10.30.0.21:40000".parse().unwrap();
+        // Ingest host not upgraded yet: consumer falls back to the install token.
+        assert_eq!(
+            authorize_with(&bearer("install-token"), Some(&peer), app_host.clone()),
+            Ok(())
+        );
+        // Ingest host upgraded: consumer presents the dedicated token.
+        assert_eq!(
+            authorize_with(&bearer("delivery-secret"), Some(&peer), app_host.clone()),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_with(&bearer("forwarder-guess"), Some(&peer), app_host),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    #[test]
+    fn strict_mode_refuses_the_install_token_once_the_delivery_token_exists() {
+        let credential =
+            resolve_vector_config_delivery(None, Some("delivery-secret"), Some("install-token"), true);
+        assert_eq!(
+            authorize_with(&bearer("install-token"), None, credential.clone()),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            authorize_with(&bearer("delivery-secret"), None, credential),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn delivery_switched_off_is_404_for_every_token() {
+        let credential =
+            resolve_vector_config_delivery(Some("off"), Some("delivery-secret"), Some("install-token"), false);
+        for token in ["install-token", "delivery-secret", "anything"] {
+            assert_eq!(
+                authorize_with(&bearer(token), None, credential.clone()),
+                Err(StatusCode::NOT_FOUND),
+                "{token}"
+            );
+        }
+        assert_eq!(
+            authorize_with(
+                &bearer("x"),
+                None,
+                C::Disabled(DeliveryDisabledReason::NoCredential)
+            ),
+            Err(StatusCode::NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn deprecated_install_token_fallback_still_serves_an_unprovisioned_deployment() {
+        // v2.0.x compatibility: a deployment that has not provisioned the
+        // delivery token yet (an old shared .env, an existingSecret without the
+        // key) keeps its consumers working, with a warning.
+        let credential = resolve_vector_config_delivery(None, None, Some("install-token"), false);
+        let peer: SocketAddr = "10.20.0.7:51515".parse().unwrap();
+        assert_eq!(
+            authorize_with(&bearer("install-token"), Some(&peer), credential.clone()),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_with(&bearer("wrong"), Some(&peer), credential),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+    }
+}

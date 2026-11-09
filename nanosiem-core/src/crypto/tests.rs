@@ -522,3 +522,49 @@ fn every_new_ring_key_must_be_exactly_32_bytes() {
     let cfg = json!({"version":1,"active":"legacy-0","keys":[{"id":"legacy-0","legacy":"old-16-byte-key!!"}]});
     assert!(EncryptionService::from_config(&cfg.to_string()).is_err());
 }
+
+/// Security review 2026-11-08 (NAN-5037): `.env.example` used to ship a
+/// concrete 64-hex key that the ring accepted as a real secret. It is now known
+/// public material, so it can no longer be the active key, and an install that
+/// copied it must keep decrypting every credential it already stored. This is
+/// the exact ring shape `scripts/lib/generated-secrets.sh` writes on upgrade: a
+/// generated active key plus the old value as decrypt-only `legacy-0`.
+#[test]
+fn example_env_key_is_refused_as_active_but_its_ciphertext_survives_the_upgrade() {
+    let example = "29131984fc00b782da58a3dfed607c3394506e9d11d01264719d91ec2fa8f7fd";
+    // Before the upgrade: the plain key encrypted credentials (pre-ring
+    // interpretation: first 32 UTF-8 bytes, which is what `new` reproduces).
+    let stored = EncryptionService::new(example.as_bytes())
+        .encrypt(b"{\"sasl_password\":\"kafka-secret\"}")
+        .unwrap();
+    // After the upgrade the plain value no longer boots...
+    let err = EncryptionService::from_config(example).err().expect("public key refused");
+    assert!(err.to_string().contains("public placeholder"), "{err}");
+    // ...and the migrated ring still opens the old credential.
+    let new_root = STANDARD.encode(OTHER);
+    let migrated = json!({
+        "version": 1,
+        "active": "k-20261108",
+        "keys": [
+            {"id": "k-20261108", "key": new_root},
+            {"id": "legacy-0", "legacy": example},
+        ],
+        "legacy_decrypt_ids": ["legacy-0"],
+    })
+    .to_string();
+    let ring = EncryptionService::from_config(&migrated).unwrap();
+    assert_eq!(
+        ring.decrypt(&stored).unwrap(),
+        b"{\"sasl_password\":\"kafka-secret\"}"
+    );
+    // The background re-wrap moves it onto the generated key; the public key
+    // can then no longer read it.
+    let (rewrapped, from) = ring.rewrap(&stored).unwrap().expect("needs rewrap");
+    assert_eq!(from, "legacy-0");
+    assert_eq!(
+        ring.decrypt(&rewrapped).unwrap(),
+        b"{\"sasl_password\":\"kafka-secret\"}"
+    );
+    assert!(EncryptionService::new(example.as_bytes()).decrypt(&rewrapped).is_err());
+    assert!(ring.rewrap(&rewrapped).unwrap().is_none(), "already on the active key");
+}

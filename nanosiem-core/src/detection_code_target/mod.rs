@@ -20,6 +20,7 @@
 
 mod github_write;
 mod models;
+#[cfg(feature = "enterprise")]
 mod push_service;
 mod repository;
 mod serializer;
@@ -27,6 +28,7 @@ mod validation;
 
 pub use github_write::{GitHubWriteClient, GitHubWriteError, OpenedPr};
 pub use models::{DetectionCodeTarget, NewDetectionCodeTarget, UpdateDetectionCodeTarget};
+#[cfg(feature = "enterprise")]
 pub use push_service::{DetectionCodePushService, PrExecutionError, PushError};
 pub use repository::{
     acquire_autonomous_tuning_dac_lock, DetectionCodeTargetError, DetectionCodeTargetRepository,

@@ -152,11 +152,22 @@ impl VectorConfigManager {
                 "could not write the splunk_hec_route passthrough; HEC parsers will not load"
             );
         }
-        self.generate_dispatch_route_filter(
+        // NAN-5071: the token decides the source, whatever the transport. A
+        // token bound to this HEC source that is presented on HTTP /ingest
+        // (or another token-authenticated push lane) reaches `source_router`,
+        // whose `<name>-token_bound` route hands it to this parser instead of
+        // the raw `generic` catch-all (see
+        // `VectorConfigManager::source_router_route_lines`).
+        let condition = build_hec_filter_condition(match_values, parser_name);
+        format!(
+            "[transforms.{}]\n\
+             type = \"filter\"\n\
+             inputs = [\"{}\", \"source_router.{}\"]\n\
+             condition = {}\n",
             filter_name,
             super::hec_route::SPLUNK_HEC_ROUTE,
-            match_values,
-            parser_name,
+            Self::token_bound_route(parser_name),
+            super::parser_config::toml_basic_string(&condition),
         )
     }
 
@@ -188,19 +199,13 @@ impl VectorConfigManager {
     }
 }
 
-/// Build the VRL condition for a HEC parser's filter transform. Falls
-/// back to the parser's name when no `match_values` are declared (rare —
-/// imports post-NAN-920 always have at least the parser name in the list).
+/// Build the VRL condition for a HEC parser's filter transform. With no
+/// `match_values` the claim falls back to the parser's safe name, exactly as
+/// the router and the token route key do ([`crate::vector_naming::claim_keys`]).
 /// Each match value is escaped for safe interpolation into a VRL string
 /// literal.
 fn build_hec_filter_condition(match_values: &[String], parser_name: &str) -> String {
-    let fallback: [String; 1];
-    let values: &[String] = if match_values.is_empty() {
-        fallback = [parser_name.to_string()];
-        &fallback
-    } else {
-        match_values
-    };
+    let values = crate::vector_naming::claim_keys(Some(match_values), parser_name);
     let list = values
         .iter()
         .map(|v| format!("\"{}\"", escape_vrl_string(v)))
@@ -212,23 +217,10 @@ fn build_hec_filter_condition(match_values: &[String], parser_name: &str) -> Str
     format!("includes([{}], to_string(.source_type) ?? \"\")", list)
 }
 
-/// Escape backslashes, double-quotes, and control characters for safe
-/// interpolation into a VRL double-quoted string literal.
+/// Escape a value for a VRL double-quoted string literal; one implementation
+/// for every generator (`crate::parsers::vrl_safety::vrl_string_body`, NAN-5033).
 pub(super) fn escape_vrl_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {
-                out.push_str(&format!("\\u{:04x}", c as u32))
-            }
-            _ => out.push(ch),
-        }
-    }
-    out
+    crate::parsers::vrl_safety::vrl_string_body(s)
 }
 
 #[cfg(test)]

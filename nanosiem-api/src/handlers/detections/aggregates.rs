@@ -67,11 +67,14 @@ pub async fn get_detection_health_summary(
 ) -> Result<Json<DetectionHealthSummary>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
+    #[cfg(feature = "enterprise")]
     let needs_tuning: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*)::bigint FROM tuning_notifications WHERE read_at IS NULL"#,
     )
     .fetch_one(&state.pool)
     .await?;
+    #[cfg(not(feature = "enterprise"))]
+    let needs_tuning: i64 = 0;
 
     let noisy_count: i64 = sqlx::query_scalar(
         r#"

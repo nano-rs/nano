@@ -418,7 +418,7 @@ pub(super) async fn run_sync(
     // Skip only when neither the content (commit) nor the sync code
     // (SYNC_SCHEMA_VERSION) changed since the last successful sync.
     if is_up_to_date(repo, &commit) {
-        info!(repo_id = %repo.id, "No changes since last sync (commit {})", &commit[..8.min(commit.len())]);
+        info!(repo_id = %repo.id, "No changes since last sync (commit {})", crate::text_bounds::prefix_at_most(&commit, 8));
         return Ok(RepoSyncResult {
             repository_id: repo.id,
             status: "success".to_string(),
@@ -440,7 +440,7 @@ pub(super) async fn run_sync(
             stored_version = repo.last_sync_schema_version,
             current_version = SYNC_SCHEMA_VERSION,
             "Sync schema version changed; re-parsing at unchanged commit {}",
-            &commit[..8.min(commit.len())]
+            crate::text_bounds::prefix_at_most(&commit, 8)
         );
     }
 

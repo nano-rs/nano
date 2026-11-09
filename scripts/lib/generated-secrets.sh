@@ -19,6 +19,36 @@
 #     Other role hosts never generate. A missing cluster-shared value fails
 #     with the instruction to copy the canonical host's updated shared .env.
 #
+# Known public values (security review 2026-11-08):
+#   A value nano itself shipped as a default or example
+#   (config/known-public-secrets.txt, kept identical to
+#   nanosiem-core/src/known_public_secrets.rs by a unit test) protects nothing.
+#   In generate mode it is replaced before any service starts:
+#     JWT_SECRET, NANO_VECTOR_CONFIG_DELIVERY_TOKEN  regenerated (logins sign in
+#                                                    again; consumers get the
+#                                                    new token from this .env)
+#     NANOSIEM_ENCRYPTION_KEY                        migrated to a key ring: a
+#                                                    generated active key plus
+#                                                    the old value as decrypt-only
+#                                                    legacy-0, so every stored
+#                                                    credential still decrypts
+#                                                    and is re-encrypted in the
+#                                                    background
+#     VECTOR_AUTH_TOKEN                              never rotated (field
+#                                                    forwarders hold it); reported
+#   CHANGE_ME* placeholders are always regenerated (nothing real holds one),
+#   except database passwords. Known database passwords are reported only
+#   (NANO_PUBLIC_DB_PASSWORD_KEYS): the databases keep the password their data
+#   was initialised with, and ClickHouse dictionaries embed it.
+#   NANO_ROTATED_SECRET_KEYS and NANO_PUBLIC_SECRET_KEYS name what was replaced
+#   and what is still public. In validate-only mode a public cluster-shared
+#   value fails like a missing one (copy the canonical host's .env).
+#
+# Transitional keys (nano_transitional_secret_keys) are generated like the
+# others, but a role host whose copied .env predates them only gets a warning:
+# the services fall back to their v2.0.x behaviour until the updated shared
+# .env is copied over.
+#
 # The helper resolves a symlinked ENV_FILE to its final target and atomically
 # replaces that target in its own directory, leaving the link intact. Existing
 # uid, gid, and mode are preserved. A metadata-preservation failure is reported
@@ -42,7 +72,111 @@ nano_cluster_shared_secret_keys() {
         NANO_OTLP_EDGE_KEY \
         NANO_VECTOR_TAP_TOKEN \
         NANO_KEEPER_PASSWORD \
-        NANO_KEEPER_SUPER_DIGEST
+        NANO_KEEPER_SUPER_DIGEST \
+        NANO_VECTOR_CONFIG_DELIVERY_TOKEN
+}
+
+# Cluster-shared keys added after v2.0.0. A role host missing one warns
+# instead of failing; see the contract above.
+nano_transitional_secret_keys() {
+    printf '%s\n' NANO_VECTOR_CONFIG_DELIVERY_TOKEN
+}
+
+nano_secret_is_transitional() {
+    local wanted="$1" key
+    while IFS= read -r key; do
+        [[ "$key" == "$wanted" ]] && return 0
+    done < <(nano_transitional_secret_keys)
+    return 1
+}
+
+# The known-public kind tag for an env key, or failure if none applies.
+nano_secret_public_kind() {
+    case "$1" in
+        JWT_SECRET) printf 'jwt' ;;
+        NANOSIEM_ENCRYPTION_KEY) printf 'encryption_key' ;;
+        VECTOR_AUTH_TOKEN) printf 'vector_install_token' ;;
+        NANO_VECTOR_CONFIG_DELIVERY_TOKEN) printf 'vector_config_delivery_token' ;;
+        POSTGRES_PASSWORD|CLICKHOUSE_PASSWORD|CLICKHOUSE_ADMIN_PASSWORD|CLICKHOUSE_VECTOR_PASSWORD \
+            | CLICKHOUSE_INGEST_PASSWORD|CLICKHOUSE_RAWSQL_PASSWORD|CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD)
+            printf 'db_password' ;;
+        *) return 1 ;;
+    esac
+}
+
+nano_known_public_secrets_file() {
+    if [[ -n "${NANO_KNOWN_PUBLIC_SECRETS_FILE:-}" ]]; then
+        printf '%s\n' "$NANO_KNOWN_PUBLIC_SECRETS_FILE"
+        return 0
+    fi
+    local lib_dir
+    lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)" || return 1
+    printf '%s\n' "$lib_dir/../../config/known-public-secrets.txt"
+}
+
+# The effective (last) single-line value of KEY in FILE, surrounding quotes
+# removed. Only used to compare against known public values, which are all
+# simple single-line strings; never printed by callers.
+nano_secret_effective_value() {
+    local file="$1" key="$2"
+    awk -v wanted="$key" '
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            sub(/^[ \t]*export[ \t]+/, "", line)
+            if (match(line, "^[ \t]*" wanted "[ \t]*=")) {
+                value = substr(line, RLENGTH + 1)
+                sub(/^[ \t]+/, "", value)
+                sub(/[ \t]+$/, "", value)
+                if (value ~ /^".*"$/ || value ~ /^\047.*\047$/) {
+                    value = substr(value, 2, length(value) - 2)
+                }
+                found = 1
+            }
+        }
+        END { if (found) print value }
+    ' "$file"
+}
+
+# Success when KEY's effective value in FILE is a known public value.
+# The comparison runs in this shell: the value is never passed to another
+# process's command line (where /proc/<pid>/cmdline would show it).
+nano_secret_is_known_public() {
+    local file="$1" key="$2" kind list value line
+    kind="$(nano_secret_public_kind "$key")" || return 1
+    list="$(nano_known_public_secrets_file)" || return 1
+    [[ -r "$list" ]] || return 1
+    value="$(nano_secret_effective_value "$file" "$key")"
+    [[ -n "$value" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == "$kind $value" ]] && { value=""; return 0; }
+    done < "$list"
+    value=""
+    return 1
+}
+
+# Success when KEY's effective value in FILE is a CHANGE_ME* placeholder.
+# Nothing real can hold one, so it is regenerated outright.
+nano_secret_is_placeholder() {
+    local value
+    value="$(nano_secret_effective_value "$1" "$2")"
+    case "$value" in
+        CHANGE_ME|CHANGE_ME_GENERATED|CHANGE_ME_GENERATE_WITH_OPENSSL_RAND_HEX_32) return 0 ;;
+    esac
+    return 1
+}
+
+# Print a key-ring JSON whose active key is freshly generated and which keeps
+# OLD as the explicit decrypt-only `legacy-0` entry (the shape the credential
+# key ring accepts for public legacy material).
+nano_secret_encryption_ring_json() {
+    local old="$1" new_key id
+    [[ "$old" =~ ^[A-Za-z0-9_.!-]+$ ]] || return 1
+    new_key="$(openssl rand -base64 32 | tr -d '\n')" || return 1
+    [[ -n "$new_key" ]] || return 1
+    id="k-$(date -u +%Y%m%d)"
+    printf '{"version":1,"active":"%s","keys":[{"id":"%s","key":"%s"},{"id":"legacy-0","legacy":"%s"}],"legacy_decrypt_ids":["legacy-0"]}' \
+        "$id" "$id" "$new_key" "$old"
 }
 
 nano_host_local_secret_keys() {
@@ -380,9 +514,13 @@ nano_backfill_generated_secrets() {
     local lock_basis="" lock_file="" locked=0 tmp="" uid="" gid="" perms=""
     local actual_metadata="" key="" secret="" shared_missing="" local_missing="" missing=""
     local old_ifs="" last_is_newline="" keeper_password=""
+    local rotate="" public_kept="" public_db="" kind="" old_value="" transitional_missing=""
 
     case "$-" in *x*) had_xtrace=1; set +x ;; esac
     NANO_BACKFILLED_SECRET_KEYS=""
+    NANO_ROTATED_SECRET_KEYS=""
+    NANO_PUBLIC_SECRET_KEYS=""
+    NANO_PUBLIC_DB_PASSWORD_KEYS=""
 
     while :; do
         if [[ -z "$env_file" || ! "$mode" =~ ^(generate|validate-only)$ ]]; then
@@ -410,15 +548,36 @@ nano_backfill_generated_secrets() {
 
         if [[ "$mode" == validate-only ]]; then
             while IFS= read -r key; do
-                nano_secret_effective_nonempty "$target" "$key" \
-                    || shared_missing="$(nano_secret_add_missing "$shared_missing" "$key")"
+                if ! nano_secret_effective_nonempty "$target" "$key" \
+                    || nano_secret_is_known_public "$target" "$key"; then
+                    if nano_secret_effective_nonempty "$target" "$key" \
+                        && [[ "$(nano_secret_public_kind "$key")" == db_password ]]; then
+                        public_db="$(nano_secret_add_missing "$public_db" "$key")"
+                    elif [[ "$key" == VECTOR_AUTH_TOKEN ]] \
+                        && nano_secret_effective_nonempty "$target" "$key" \
+                        && ! nano_secret_is_placeholder "$target" "$key"; then
+                        public_kept="$(nano_secret_add_missing "$public_kept" "$key")"
+                    elif nano_secret_is_transitional "$key"; then
+                        transitional_missing="$(nano_secret_add_missing "$transitional_missing" "$key")"
+                    else
+                        shared_missing="$(nano_secret_add_missing "$shared_missing" "$key")"
+                    fi
+                fi
             done < <(nano_cluster_shared_secret_keys)
+            if [[ -n "$transitional_missing" ]]; then
+                printf 'generated-secrets: warning: this host'"'"'s .env predates %s. Services keep their v2.0.x fallback until you copy the updated shared .env from the canonical app/prepare host to this host.\n' \
+                    "${transitional_missing//:/, }" >&2
+            fi
+            # shellcheck disable=SC2034
+            NANO_PUBLIC_SECRET_KEYS="${public_kept//:/, }"
+            # shellcheck disable=SC2034
+            NANO_PUBLIC_DB_PASSWORD_KEYS="${public_db//:/, }"
             while IFS= read -r key; do
                 nano_secret_effective_nonempty "$target" "$key" \
                     || local_missing="$(nano_secret_add_missing "$local_missing" "$key")"
             done < <(nano_host_local_secret_keys)
             if [[ -n "$shared_missing" ]]; then
-                printf 'generated-secrets: missing cluster-shared generated secret(s): %s. Copy the updated shared .env from the canonical app/prepare host to this host, then retry.\n' \
+                printf 'generated-secrets: missing or publicly known cluster-shared generated secret(s): %s. Copy the updated shared .env from the canonical app/prepare host to this host, then retry.\n' \
                     "${shared_missing//:/, }" >&2
                 status=1
             elif [[ -n "$local_missing" ]]; then
@@ -481,17 +640,34 @@ nano_backfill_generated_secrets() {
         }
 
         while IFS= read -r key; do
-            nano_secret_effective_nonempty "$target" "$key" \
-                || shared_missing="$(nano_secret_add_missing "$shared_missing" "$key")"
+            if ! nano_secret_effective_nonempty "$target" "$key"; then
+                shared_missing="$(nano_secret_add_missing "$shared_missing" "$key")"
+            elif nano_secret_is_known_public "$target" "$key"; then
+                kind="$(nano_secret_public_kind "$key")"
+                if [[ "$kind" == db_password ]]; then
+                    # The database keeps the password it was initialised with,
+                    # so .env cannot change alone: report it.
+                    public_db="$(nano_secret_add_missing "$public_db" "$key")"
+                elif [[ "$key" == VECTOR_AUTH_TOKEN ]] && ! nano_secret_is_placeholder "$target" "$key"; then
+                    # A shipped literal forwarders may hold: keep and report.
+                    public_kept="$(nano_secret_add_missing "$public_kept" "$key")"
+                else
+                    rotate="$(nano_secret_add_missing "$rotate" "$key")"
+                fi
+            fi
         done < <(nano_cluster_shared_secret_keys)
         while IFS= read -r key; do
             nano_secret_effective_nonempty "$target" "$key" \
                 || local_missing="$(nano_secret_add_missing "$local_missing" "$key")"
         done < <(nano_host_local_secret_keys)
+        # shellcheck disable=SC2034
+        NANO_PUBLIC_SECRET_KEYS="${public_kept//:/, }"
+        # shellcheck disable=SC2034
+        NANO_PUBLIC_DB_PASSWORD_KEYS="${public_db//:/, }"
 
         missing="$shared_missing"
         [[ -z "$local_missing" ]] || missing="${missing}${missing:+:}${local_missing}"
-        [[ -n "$missing" ]] || break
+        [[ -n "$missing" || -n "$rotate" ]] || break
         if [[ ":$missing:" == *:NANO_KEEPER_PASSWORD:* \
             && ":$missing:" != *:NANO_KEEPER_SUPER_DIGEST:* ]] \
             || [[ ":$missing:" != *:NANO_KEEPER_PASSWORD:* \
@@ -501,7 +677,26 @@ nano_backfill_generated_secrets() {
             break
         fi
 
-        if ! cat "$target" > "$tmp"; then
+        if [[ -n "$rotate" ]]; then
+            # Drop every assignment of a rotated key; the replacement is
+            # appended below, so exactly one assignment remains.
+            if ! awk -v keys=":$rotate:" '
+                {
+                    line = $0
+                    sub(/^[ \t]*export[ \t]+/, "", line)
+                    if (match(line, /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*=/)) {
+                        name = substr(line, 1, RLENGTH)
+                        sub(/[ \t]*=$/, "", name)
+                        gsub(/[ \t]/, "", name)
+                        if (index(keys, ":" name ":")) next
+                    }
+                    print
+                }
+            ' "$target" > "$tmp"; then
+                status=1
+                break
+            fi
+        elif ! cat "$target" > "$tmp"; then
             status=1
             break
         fi
@@ -530,6 +725,37 @@ nano_backfill_generated_secrets() {
         done
         IFS="$old_ifs"
         (( status == 0 )) || break
+        old_ifs="$IFS"
+        IFS=:
+        for key in $rotate; do
+            if [[ "$key" == NANOSIEM_ENCRYPTION_KEY ]] && ! nano_secret_is_placeholder "$target" "$key"; then
+                # A real shipped key may have encrypted credentials: keep it
+                # decrypt-only. (A placeholder never encrypted anything and
+                # is plain-regenerated below.)
+                old_value="$(nano_secret_effective_value "$target" "$key")"
+                if ! secret="$(nano_secret_encryption_ring_json "$old_value")" || [[ -z "$secret" ]]; then
+                    status=1
+                    break
+                fi
+                # Single quotes: Compose reads the JSON literally.
+                if ! printf "%s='%s'\n" "$key" "$secret" >> "$tmp"; then
+                    status=1
+                    break
+                fi
+                continue
+            fi
+            if ! secret="$(openssl rand -hex 32)" || [[ -z "$secret" ]]; then
+                status=1
+                break
+            fi
+            if ! printf '%s=%s\n' "$key" "$secret" >> "$tmp"; then
+                status=1
+                break
+            fi
+        done
+        IFS="$old_ifs"
+        old_value=""
+        (( status == 0 )) || break
         if ! nano_secret_atomic_replace "$tmp" "$target" "$uid" "$gid" "$perms"; then
             status=1
             break
@@ -539,10 +765,13 @@ nano_backfill_generated_secrets() {
         # cannot see those consumers.
         # shellcheck disable=SC2034
         NANO_BACKFILLED_SECRET_KEYS="${missing//:/, }"
+        # shellcheck disable=SC2034
+        NANO_ROTATED_SECRET_KEYS="${rotate//:/, }"
         break
     done
 
     secret=""
+    old_value=""
     keeper_password=""
     [[ -z "$tmp" ]] || rm -f "$tmp"
     (( locked == 0 )) || nano_secret_lock_release

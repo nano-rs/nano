@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { DEPLOY_REQUEST_TIMEOUT_MS, type LongRequest } from './log-sources';
 import type {
   SourceConfiguration,
   SourceConfigurationWithRules,
@@ -17,8 +18,16 @@ import type {
 
 export class SourceConfigsApi {
   constructor(
-    private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>
+    private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>,
+    private longRequest?: LongRequest,
   ) {}
+
+  /** NAN-5131: deploys render the Vector config synchronously (see log-sources.ts). */
+  private deployRequest<T>(endpoint: string, options: RequestInit): Promise<T> {
+    return this.longRequest
+      ? this.longRequest<T>(endpoint, options, DEPLOY_REQUEST_TIMEOUT_MS)
+      : this.request<T>(endpoint, options);
+  }
 
   // =========================================================================
   // Source Configurations CRUD
@@ -106,21 +115,21 @@ export class SourceConfigsApi {
   // =========================================================================
 
   async deploySourceConfig(id: string): Promise<SourceConfigDeploymentResult> {
-    return this.request<SourceConfigDeploymentResult>(
+    return this.deployRequest<SourceConfigDeploymentResult>(
       `/api/source-configurations/${id}/deploy`,
       { method: 'POST' }
     );
   }
 
   async undeploySourceConfig(id: string): Promise<SourceConfigDeploymentResult> {
-    return this.request<SourceConfigDeploymentResult>(
+    return this.deployRequest<SourceConfigDeploymentResult>(
       `/api/source-configurations/${id}/undeploy`,
       { method: 'POST' }
     );
   }
 
   async deployAllSourceConfigs(): Promise<SourceConfigDeploymentResult[]> {
-    return this.request<SourceConfigDeploymentResult[]>(
+    return this.deployRequest<SourceConfigDeploymentResult[]>(
       '/api/source-configurations/deploy-all',
       { method: 'POST' }
     );

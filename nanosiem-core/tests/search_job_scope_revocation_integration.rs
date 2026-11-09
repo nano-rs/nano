@@ -9,7 +9,7 @@
 //! HMGET decode that must tolerate a nil `scope_deny` on a pre-upgrade job, and
 //! `list_all` / `active_count` behavior against the Redis implementation.
 //!
-//! Run with a live Redis/Dragonfly:
+//! Run with a live Redis/Valkey:
 //!   `NANOSIEM_TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test -p nanosiem-core \
 //!    --test search_job_scope_revocation_integration -- --ignored`
 
@@ -54,14 +54,14 @@ fn request(query: &str) -> SearchRequest {
 async fn store() -> RedisJobStore {
     RedisJobStore::connect(&redis_url())
         .await
-        .expect("live Redis/Dragonfly required — set NANOSIEM_TEST_REDIS_URL")
+        .expect("live Redis/Valkey required — set NANOSIEM_TEST_REDIS_URL")
 }
 
 /// The reported repro end-to-end against Redis: a job runs while a source is
 /// visible, the source is then restricted, and the completed result must stop
 /// being readable — while an unchanged scope still reads it.
 #[tokio::test]
-#[ignore = "requires a live Redis/Dragonfly (NANOSIEM_TEST_REDIS_URL); run with --ignored"]
+#[ignore = "requires a live Redis/Valkey (NANOSIEM_TEST_REDIS_URL); run with --ignored"]
 async fn redis_job_result_hidden_after_source_restriction() {
     let store = store().await;
     let user = uuid::Uuid::now_v7();
@@ -99,7 +99,7 @@ async fn redis_job_result_hidden_after_source_restriction() {
 /// nil slot when the target is `Vec<String>`), and the missing stamp must read
 /// back as unknown → hidden from every restricted caller.
 #[tokio::test]
-#[ignore = "requires a live Redis/Dragonfly (NANOSIEM_TEST_REDIS_URL); run with --ignored"]
+#[ignore = "requires a live Redis/Valkey (NANOSIEM_TEST_REDIS_URL); run with --ignored"]
 async fn redis_legacy_job_without_stamp_still_loads_and_fails_closed() {
     let store = store().await;
     let user = uuid::Uuid::now_v7();
@@ -146,7 +146,7 @@ async fn redis_legacy_job_without_stamp_still_loads_and_fails_closed() {
 /// `active_count` — internal admission accounting — must keep counting every
 /// job. A regression here would silently under-count concurrency.
 #[tokio::test]
-#[ignore = "requires a live Redis/Dragonfly (NANOSIEM_TEST_REDIS_URL); run with --ignored"]
+#[ignore = "requires a live Redis/Valkey (NANOSIEM_TEST_REDIS_URL); run with --ignored"]
 async fn redis_admin_list_filters_by_viewer_scope_without_breaking_counts() {
     let store = store().await;
     let marker = format!("nan2096_{}", uuid::Uuid::now_v7().simple());

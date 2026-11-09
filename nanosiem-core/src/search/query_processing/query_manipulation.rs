@@ -368,6 +368,75 @@ pub fn enforce_source_scope(
     Ok(enforced)
 }
 
+/// A parsed nPL query whose every scan carries the caller's source-scope gate
+/// (NAN-5021).
+///
+/// [`enforce_source_scope`] works text → text: it parses, injects, PRETTY-
+/// PRINTS and re-parses, then hands back a `String`. Two things went wrong
+/// with that shape. A caller could discard the `Err` and keep the raw text
+/// (the cloud endpoints did, `unwrap_or_else(|_| query)`), and the
+/// pretty-printer sat on the security path, so a valid query it could not
+/// round-trip (`fillnull value='a"b'`) produced exactly that `Err`.
+///
+/// `ScopedQuery` is the AST form: parse ONCE, inject at the AST, and prove the
+/// gate on the SAME tree the SQL generator consumes. There is no text in
+/// between to lose or to mis-serialize, and no way to construct one without
+/// the deny set. The only way to get the `Query` out is [`Self::query`] /
+/// [`Self::into_query`], after the proof.
+#[derive(Debug, Clone)]
+pub struct ScopedQuery {
+    query: Query,
+}
+
+impl ScopedQuery {
+    /// Parse `text` and gate it under `deny_set`. A parse failure is returned
+    /// as [`crate::SearchError::ParseError`] so callers with a scoped fallback
+    /// scan for unparseable text (cloud, field queries) can still take it.
+    pub fn parse(text: &str, deny_set: &BTreeSet<String>) -> Result<Self, crate::SearchError> {
+        let parsed = crate::query::parse_query(text)
+            .map_err(|e| crate::SearchError::ParseError(format!("Invalid query: {}", e)))?;
+        if !deny_set.is_empty() {
+            // NAN-3222: record (never alter) an explicit reference to a denied
+            // source, exactly as the text path does.
+            crate::search::denied_source_audit::observe_gated_query(text, &parsed, deny_set);
+        }
+        Self::from_ast(parsed, deny_set)
+    }
+
+    /// Gate an already-parsed query (e.g. one rebuilt from an AST).
+    pub fn from_ast(query: Query, deny_set: &BTreeSet<String>) -> Result<Self, crate::SearchError> {
+        if deny_set.is_empty() {
+            return Ok(Self { query });
+        }
+        // Idempotent: text a scoped entry point already gated (and the client
+        // echoed back unchanged) carries a proven gate on every scan; wrapping
+        // it again would only duplicate the predicate.
+        if all_scans_gated(&query, deny_set) {
+            return Ok(Self { query });
+        }
+        let gated = inject_source_type_exclusion_recursive(&query, deny_set);
+        // Same structural proof the text path runs after its re-parse
+        // (NAN-2006): every scan is ANDed at top level with the exclusion.
+        if !all_scans_gated(&gated, deny_set) {
+            return Err(crate::SearchError::SqlValidationError(
+                "source-scope enforcement could not be verified for this query; \
+                 refusing to run it (NAN-2006)"
+                    .to_string(),
+            ));
+        }
+        Ok(Self { query: gated })
+    }
+
+    /// The gated query.
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
+
+    pub fn into_query(self) -> Query {
+        self.query
+    }
+}
+
 /// Apply the mandatory exclusion to every scan in `query`, recursing through
 /// piped sources AND into every subsearch-bearing command.
 ///
@@ -568,6 +637,21 @@ fn all_scans_gated(query: &Query, deny_set: &BTreeSet<String>) -> bool {
             all_scans_gated(source, deny_set) && command_subsearches_gated(command, deny_set)
         }
     }
+}
+
+/// A deny value no real source can carry: probing the gate check with it
+/// answers "does this node carry ANY subsearch?" (an absent subsearch is
+/// vacuously gated; a present one never carries this exclusion).
+const SUBSEARCH_PROBE: &str = "__nano:subsearch_probe__";
+
+/// Does `expr` contain an `IN [ subsearch ]` at any depth? (NAN-5039)
+pub(crate) fn search_expr_has_subsearch(expr: &SearchExpr) -> bool {
+    !expr_subsearches_gated(expr, &BTreeSet::from([SUBSEARCH_PROBE.to_string()]))
+}
+
+/// Does `command` carry a subsearch (its own or inside a condition)? (NAN-5039)
+pub(crate) fn command_has_subsearch(command: &Command) -> bool {
+    !command_subsearches_gated(command, &BTreeSet::from([SUBSEARCH_PROBE.to_string()]))
 }
 
 /// True iff `expr` is exactly the conjunct [`mandatory_exclusion`] emits for

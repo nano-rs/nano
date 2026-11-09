@@ -116,7 +116,9 @@ fn disk_buffer_component_count(content: &str) -> usize {
 /// two implementations of this protocol cannot drift.
 ///
 /// It must stay comfortably above `scrape_interval_secs` on
-/// `[sources.internal_metrics]` (10s in 92-metrics.toml): the counters below are
+/// `[sources.internal_metrics]` (1s in 92-metrics.toml since NAN-5132, 10s
+/// before; Vector's own reload, O(deployed parsers), is what this mostly
+/// waits for now): the counters below are
 /// only *exported* when that source next scrapes, so a timeout near the scrape
 /// interval reports "Vector never acknowledged" for reloads that in fact
 /// succeeded — and the caller reacts to that by rolling back a good config.
@@ -601,6 +603,18 @@ impl ReloadWatch {
     }
 
     pub async fn outcome(self) -> ActivationOutcome {
+        // NAN-5133: role split. No Vector reads this tree; the ingest hosts'
+        // consumers install the published generation and report on it.
+        if let Some(publisher) = super::remote_delivery::active_publisher() {
+            let result = super::remote_delivery::deliver(publisher.as_ref()).await;
+            return match super::remote_delivery::grade_delivery(&result) {
+                super::remote_delivery::Graded::Live => ActivationOutcome::Accepted,
+                super::remote_delivery::Graded::Rejected(_) => ActivationOutcome::Rejected,
+                super::remote_delivery::Graded::Unconfirmed(message) => {
+                    ActivationOutcome::Unconfirmed(message)
+                }
+            };
+        }
         if let Some(marker) = self.marker.as_ref() {
             if let Err(error) = write_marker(marker).await {
                 return ActivationOutcome::Unconfirmed(format!(
@@ -1150,6 +1164,12 @@ impl VectorConfigManager {
     /// Each parser gets its own file, disabled parsers have their files removed
     /// Also generates the dynamic router config for routed parsers
     pub async fn deploy_parsers(&self, parsers: &[Parser]) -> Result<(), VectorConfigError> {
+        // NAN-5012 / NAN-5033 / NAN-5057: degrade any source whose stored VRL
+        // fails the allowlist check BEFORE anything is rendered, so one bad
+        // row costs only its own sampling / extension / parsing, never the
+        // whole publication.
+        let safe_parsers = self.render_safe_parsers(parsers);
+        let parsers = safe_parsers.as_slice();
         // Ensure directories exist
         fs::create_dir_all(&self.parsers_dir).await?;
         fs::create_dir_all(&self.credentials_dir).await?;
@@ -1786,6 +1806,7 @@ del(._nano_durable_ingest)
 "#,
             credential_field_redaction_vrl!(),
             ingest_transport_strip_vrl!(),
+            reserved_source_type_guard_vrl!(),
             r#"# Protected transport identity survives parser/root rebuilds in
 # metadata. Remove every event-supplied copy now; the canonical values are
 # inserted into ext at the storage boundary below.
@@ -2197,7 +2218,9 @@ raw_record = remove!(raw_record, ["ingest_client_ip"])
 raw_record = remove!(raw_record, ["ingest_peer"])
 src_type = downcase(to_string(.metadata.original_source_type) ?? to_string(.source_type) ?? "unknown")
 if src_type == "" { src_type = "unknown" }
-msg = to_string(.message) ?? ""
+"#,
+        reserved_ocsf_source_type_guard_vrl!(),
+        r#"msg = to_string(.message) ?? ""
 if msg == "" { msg = encode_json(raw_record) }
 # NAN-4903: the unparsed record is vendor data, not OCSF — it goes under
 # `unmapped` (queried as `unmapped.<key>` or the bare key) so arbitrary keys
@@ -2867,6 +2890,23 @@ if skew_seconds < 0 { skew_seconds = 86400 }
     /// the baseline is taken, so a reload the watcher already attempted on the
     /// promoted files does not count either way: only the marker's reload does.
     async fn reload_vector_graded(&self) -> (ReloadAck, Result<(), VectorConfigError>) {
+        // NAN-5133: role split grades by the ingest hosts, never by a local
+        // signal (there is no local Vector to signal or scrape).
+        if let Some(publisher) = super::remote_delivery::active_publisher() {
+            let result = super::remote_delivery::deliver(publisher.as_ref()).await;
+            return match super::remote_delivery::grade_delivery(&result) {
+                super::remote_delivery::Graded::Live => (ReloadAck::Accepted, Ok(())),
+                super::remote_delivery::Graded::Rejected(message) => {
+                    (ReloadAck::Rejected, Err(VectorConfigError::ReloadFailed(message)))
+                }
+                // Not a success, and not a rollback either: the generation is
+                // published and hosts may still apply it.
+                super::remote_delivery::Graded::Unconfirmed(message) => (
+                    ReloadAck::NotAcknowledged,
+                    Err(VectorConfigError::ReloadUnconfirmed(message)),
+                ),
+            };
+        }
         let probe = ReloadAckProbe::from_env();
         let marker = activation_marker_enabled().then(|| ActivationMarker {
             id: uuid::Uuid::new_v4().simple().to_string(),
@@ -3012,6 +3052,68 @@ if skew_seconds < 0 { skew_seconds = 86400 }
         super::config_lock::DeployGuard::acquire(self.deploy_lock.clone(), &self.config_dir).await
     }
 
+    /// Every source as it is safe to render, logging each degraded part
+    /// ([`Self::render_safe_parser`]). Persisting the operator-facing note is
+    /// the caller's job (it owns the database; see `ParserService`).
+    pub(crate) fn render_safe_parsers(&self, parsers: &[Parser]) -> Vec<Parser> {
+        parsers
+            .iter()
+            .map(|parser| {
+                let (safe, notes) = self.render_safe_parser(parser);
+                for note in &notes {
+                    tracing::warn!(
+                        target: "security",
+                        log_source_id = %parser.id,
+                        log_source = %parser.name,
+                        "{note}"
+                    );
+                }
+                safe
+            })
+            .collect()
+    }
+
+    /// One source as it is safe to render, plus the operator-facing notes.
+    ///
+    /// Two layers, so the deploy guard can never fail the whole render because
+    /// of one tenant source (NAN-5057):
+    ///
+    /// 1. [`crate::parsers::vrl_safety::quarantine`] checks the STORED text
+    ///    (allowlist compile, read-only condition) and degrades the failing
+    ///    part.
+    /// 2. The result is RENDERED and run through the same deploy guard the
+    ///    writer uses. Anything the guard still refuses (a pattern the guard
+    ///    rejects that the validator accepts, a plan the runtime cannot run,
+    ///    a renderer rewrite) quarantines the whole source; if even that
+    ///    document is refused, the source is not rendered at all.
+    pub(crate) fn render_safe_parser(&self, parser: &Parser) -> (Parser, Vec<String>) {
+        use crate::parsers::vrl_safety::{quarantine, quarantined_whole, shorten};
+        let (safe, mut notes) = quarantine(parser);
+        if safe.kind == "enrichment" || !safe.enabled {
+            return (safe, notes);
+        }
+        let Err(reason) = self.guarded_parser_config(&safe) else {
+            return (safe, notes);
+        };
+        let whole = quarantined_whole(&safe);
+        notes.push(format!(
+            "Parser quarantined: the generated config failed the deploy check ({}). Events are stored unparsed as parse failures until the source is fixed and published.",
+            shorten(&reason.to_string())
+        ));
+        match self.guarded_parser_config(&whole) {
+            Ok(_) => (whole, notes),
+            Err(reason) => {
+                let mut off = whole;
+                off.enabled = false;
+                notes.push(format!(
+                    "Source not deployed: even its quarantined config failed the deploy check ({}).",
+                    shorten(&reason.to_string())
+                ));
+                (off, notes)
+            }
+        }
+    }
+
     /// Render a complete parser tree without signaling a live Vector process.
     /// Used by the DB-backed publication reconciler, which renders into an
     /// isolated directory before the revision CAS makes it visible.
@@ -3142,6 +3244,15 @@ if skew_seconds < 0 { skew_seconds = 86400 }
         // This used to `?` straight out, leaving the new tree live while the
         // caller recorded a rollback that never ran.
         if let Err(reload_err) = self.reload_vector().await {
+            // NAN-5133 review M2: role split, published but unconfirmed. The
+            // API's own tree is not what Vector runs, so restoring it would
+            // change nothing on the hosts; report it as not live instead.
+            if matches!(reload_err, VectorConfigError::ReloadUnconfirmed(_)) {
+                return Err(VerifyFailure {
+                    error: reload_err,
+                    rolled_back: false,
+                });
+            }
             tracing::error!("Vector reload failed — rolling back to previous config");
             let Some(backup) = backup else {
                 tracing::error!(
@@ -3172,10 +3283,27 @@ if skew_seconds < 0 { skew_seconds = 86400 }
             });
         }
 
-        // Post-deploy health polling: check every 500ms for 10 seconds
+        // NAN-5133: in role split the consumers already proved Vector loaded
+        // the generation on each ingest host; there is no local Vector to poll,
+        // and polling one would "fail" and roll back an installed deploy.
+        if super::remote_delivery::active_publisher().is_some() {
+            return Ok(());
+        }
+
+        // Post-deploy health polling: check every 500ms for 10 seconds.
+        //
+        // NAN-5132: the first check runs immediately. The reload was just
+        // acknowledged through Vector's own metrics endpoint (with the
+        // activation marker, only after the new topology had run long enough
+        // to emit an event), so a live Vector answers at once and the fixed
+        // 500ms sleep before the first check only added latency to every
+        // deploy. As before, the loop ends at the first healthy answer and a
+        // Vector that is down keeps failing it until the rollback below.
         let mut healthy = false;
         for attempt in 0..20 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            if attempt > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
             if self.check_vector_health().await {
                 healthy = true;
                 tracing::debug!("Vector health check passed (attempt {})", attempt + 1);
@@ -3261,6 +3389,8 @@ mod transport_header_tests;
 #[cfg(test)]
 mod render_contract_tests;
 #[cfg(test)]
+mod render_safety_tests;
+#[cfg(test)]
 mod route_prune_tests;
 #[cfg(test)]
 mod hec_ack_contract_tests;
@@ -3270,3 +3400,5 @@ mod http_durability_contract_tests;
 mod buffer_budget_contract_tests;
 #[cfg(test)]
 mod json_ingest_contract_tests;
+#[cfg(test)]
+mod metrics_scrape_contract_tests;

@@ -9,7 +9,7 @@
  * "missing" chips that prefill the marketplace search when clicked.
  *
  * NAN-609 / NAN-2061 — Decoupled from page load. Backed by a 6h
- * Dragonfly cache partitioned by effective source visibility, so the slow
+ * Valkey cache partitioned by effective source visibility, so the slow
  * ~10s coverage SQL only runs once per 6h for equivalent scopes across all
  * replicas; caller still gets a permissive React Query staleTime so in-tab
  * navigations don't even re-issue the GET. While the hero is loading or

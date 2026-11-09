@@ -262,6 +262,15 @@ async fn load_owned_definition(
 // Handlers
 // ============================================================================
 
+/// NAN-5039: the caller as a report query editor — `Some` only when its
+/// per-source scope (the artifact half: registry restrictions, not the audit
+/// gate) is non-empty. An unrestricted caller's edit narrows nothing.
+fn restricted_editor(auth: &AuthContext) -> Option<uuid::Uuid> {
+    auth.effective_viewer_scope()
+        .is_artifact_restricted()
+        .then(|| auth.user_id())
+}
+
 /// Create a scheduled report.
 #[utoipa::path(
     post,
@@ -475,7 +484,9 @@ pub async fn update_report(
     };
 
     let report = service
-        .update_definition(*id, update)
+        // NAN-5039: a source-restricted editor narrows future runs of this
+        // query to what both they and the owner may see.
+        .update_definition(*id, update, restricted_editor(&auth))
         .await
         .map_err(map_report_err)?;
 
@@ -984,7 +995,7 @@ mod authorization_tests {
         );
         assert!(
             position(update, "ensure_report_search_sql_permission(")
-                < position(update, "update_definition(*id, update)"),
+                < position(update, "update_definition(*id, update, restricted_editor(&auth))"),
             "SQL-panel capability must precede report update"
         );
 

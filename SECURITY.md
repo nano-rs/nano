@@ -53,18 +53,17 @@ profiles. Pick the right one:
 - **`docker-compose.opensource.yml`** — the supported deployment, what
   `install.sh` (`curl … | bash` from get.nano.rs) brings up. It publishes only
   the **nginx entrypoint** (`:80`, add TLS with `docker-compose.tls.yml`) and the
-  **Vector ingest ports**. Postgres, ClickHouse, Dragonfly, and the api / search /
+  **Vector ingest ports**. Postgres, ClickHouse, Valkey, and the api / search /
   jobs services have **no published host ports** — they are reachable only on the
   internal Docker network. There is no Prometheus, Grafana, or exporter in this
   file. A default install does **not** expose a database or monitoring/control
   plane to the host.
 
-- **`docker-compose.yml`** — **local development only.** It binds internal
-  services (Postgres, ClickHouse HTTP/native, Prometheus with
-  `--web.enable-admin-api`, Grafana with default credentials, the exporters) to
-  `0.0.0.0`. **Do not run it on a public host** — on a machine with a public IP
-  those services are reachable, unauthenticated, from the internet. This is by
-  design for loopback development; it is not a supported production posture.
+- **`docker-compose.yml`** — **local development only.** It runs internal
+  services (Postgres, ClickHouse HTTP/native, Prometheus, Grafana, the
+  exporters) with development credentials and binds every published port to
+  `127.0.0.1`. Use an SSH tunnel to reach them from another machine; never widen
+  a binding. It is not a supported production posture.
 
 ### Ingest ports and authentication
 
@@ -118,7 +117,7 @@ so up front and we'll be honest about whether it's a fit.
 ## Safe harbour
 
 Good-faith security research conducted under this policy will not result in
-legal action from Nano LLC. We ask you to:
+legal action from nano, LLC. We ask you to:
 
 - Avoid privacy violations, destruction of data, and interruption of
   service during testing.

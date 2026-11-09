@@ -7,7 +7,7 @@
 
 use uuid::Uuid;
 
-use super::{identity_conflict, reserved_route_claim};
+use super::{enforced_reserved_claim, identity_conflict, reserved_route_claim};
 
 /// One `(id, name)` row as `ParserRepository::list_identities` returns it.
 fn parser(id: u128, name: &str) -> (Uuid, String) {
@@ -44,6 +44,17 @@ fn reserves_nano_prefixed_route_claims() {
             reserved_route_claim(name).is_none(),
             "expected '{name}' to be allowed (safe_name does not start nano_)"
         );
+    }
+}
+
+/// NAN-5032: parser names that would store platform records are refused.
+#[test]
+fn refuses_platform_owned_source_type_names() {
+    for name in ["audit", "Audit", "findings", "FINDINGS"] {
+        assert!(enforced_reserved_claim(name).is_some(), "{name} must be refused");
+    }
+    for name in ["Linux Audit", "auditd", "audit trail", "okta"] {
+        assert!(enforced_reserved_claim(name).is_none(), "{name} must be allowed");
     }
 }
 

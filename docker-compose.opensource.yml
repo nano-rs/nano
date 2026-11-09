@@ -48,6 +48,41 @@ x-logging-verbose: &verbose-logging
     max-size: "100m"
     max-file: "3"
 
+# NAN-5130: operator egress and update settings in .env. A Compose .env only
+# interpolates this file, so every key a service reads must be mapped here or
+# it never reaches the container. The role-split enterprise compose inherits
+# these through `extends`.
+#
+# Proxy keys with no value pass through only when set (in .env or the shell);
+# unset, they stay absent, because an empty HTTPS_PROXY is not "no proxy" to
+# every reader. NO_PROXY always exempts the internal service names, loopback
+# and the private ranges (role-split hosts talk over inventory addresses), and
+# appends the operator's own NO_PROXY. Feeds, content channels, the licence
+# check-in, OIDC and identity sync use the proxy. Clients whose destination a
+# user controls (lookup url=, AI provider base URLs, webhooks, scheduled
+# fetches, synthetic checks) never do: a proxy re-resolves the host and would
+# undo their SSRF pin.
+x-nano-egress-env: &nano-egress-env
+  HTTPS_PROXY:
+  HTTP_PROXY:
+  NO_PROXY: "localhost,127.0.0.1,::1,postgres,clickhouse,clickhouse-proxy,dragonfly,vector,vector-tap,ingest-proxy,ingest-edge,app-internal-edge,nginx,nano-api,nano-search,nano-jobs,nano-web,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16${NO_PROXY:+,${NO_PROXY}}"
+  AIRGAP_MODE: ${AIRGAP_MODE:-}
+  # BYO AI on a private address (docs/administration/direct-ai-endpoint.md).
+  # Read by the shared AI base-URL validator in api, jobs and search.
+  NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS: ${NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS:-false}
+
+# Feed/content update and integration-egress settings read by nano-api and
+# nano-jobs. Empty keeps each built-in default (auto-update on, nano.rs URLs).
+x-nano-update-env: &nano-update-env
+  PLATFORM_FEEDS_AUTO_UPDATE: ${PLATFORM_FEEDS_AUTO_UPDATE:-}
+  PLATFORM_FEEDS_URL: ${PLATFORM_FEEDS_URL:-}
+  CONTENT_CHANNELS_AUTO_UPDATE: ${CONTENT_CHANNELS_AUTO_UPDATE:-}
+  CONTENT_CHANNELS_URL: ${CONTENT_CHANNELS_URL:-}
+  CONNECTOR_EGRESS_PROXY_URL:
+  CONNECTOR_EGRESS_PROXY_MODE:
+  SOAR_EGRESS_PROXY_URL:
+  SOAR_EGRESS_PROXY_MODE:
+
 services:
   postgres:
     # Pinned by digest (NAN-1258): a tag alone (`postgres:17`) can be silently
@@ -126,9 +161,9 @@ services:
       # NAN-809: do NOT set CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT here. The upstream
       # entrypoint reacts to that env by writing a generated default-user.xml into
       # /etc/clickhouse-server/users.d/, which conflicts with our :ro bind mount and
-      # puts the container in a restart loop. Our users.d/default-user.xml already
-      # sets <access_management>1</access_management> directly, so the env is
-      # redundant.
+      # puts the container in a restart loop. Our users.d/default-user.xml owns
+      # the `default` user instead: container-local only, no access management
+      # (nanosiem_admin manages users).
       # Pass per-deployment passwords into users.d/*.xml via from_env="..." (NAN-807 bug #2).
       CLICKHOUSE_NANOSIEM_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
@@ -163,7 +198,9 @@ services:
         soft: 262144
         hard: 262144
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- 'http://127.0.0.1:8123/?query=SELECT+1' 2>/dev/null | grep -q 1"]
+      # /ping needs no user: the passwordless `default` user is container-local
+      # (users.d/default-user.xml) and must not be what readiness depends on.
+      test: ["CMD-SHELL", "wget -qO- 'http://127.0.0.1:8123/ping' 2>/dev/null | grep -q Ok"]
       interval: 5s
       timeout: 5s
       retries: 40
@@ -185,31 +222,45 @@ services:
           cpus: ${CLICKHOUSE_CPU_LIMIT:-2}
 
   dragonfly:
-    # Was a floating tag (NAN-1258), the easiest silent-mutation vector on a
-    # security product. Pinned to a concrete version + digest.
-    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.1@sha256:baf70ba7ad182a992b988497cfa31a488978c8fab7712079784c2401f447e402
-    container_name: nano-dragonfly
+    # NAN-5082: Valkey (BSD-3-Clause, Linux Foundation) replaced Dragonfly,
+    # which left open source (BUSL-1.1, then DSAL from v2.1.0). The Compose
+    # service key stays `dragonfly` on purpose: it is the stable network name
+    # in REDIS_URL and the service identity the upgrade rollouts select, so an
+    # upgrade recreates this one container in place with the new image instead
+    # of orphaning it. Pinned to a concrete version + digest (NAN-1258).
+    image: valkey/valkey:9.1.2@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+    container_name: nano-valkey
     restart: unless-stopped
     logging: *default-logging
     security_opt:
       - no-new-privileges:true
-    command: ["--maxmemory", "${DRAGONFLY_MAXMEMORY:-512mb}", "--proactor_threads", "${DRAGONFLY_PROACTOR_THREADS:-2}"]
-    # No `ulimits: memlock: -1` — unlimited memlock can't be set in an
-    # unprivileged LXC (Docker can't exceed the container's 8MB memlock hard
-    # cap → "error setting rlimit type 8: operation not permitted", container
-    # won't start). Dragonfly runs fine without it at this maxmemory cap; the
-    # ulimit was only relevant for io_uring on pre-5.12 kernels (no longer
-    # charged against RLIMIT_MEMLOCK since Linux 5.12).
+    # Cache / coordination store only: nothing here must survive a restart
+    # (Dragonfly never persisted either), so RDB and AOF stay off. noeviction
+    # matches Dragonfly's default: a full store rejects writes instead of
+    # silently evicting search-job state or JWT revocations. The legacy
+    # DRAGONFLY_* sizing keys still apply to installs whose .env predates them.
+    command:
+      - valkey-server
+      - --maxmemory
+      - ${VALKEY_MAXMEMORY:-${DRAGONFLY_MAXMEMORY:-512mb}}
+      - --maxmemory-policy
+      - noeviction
+      - --io-threads
+      - ${VALKEY_IO_THREADS:-${DRAGONFLY_PROACTOR_THREADS:-2}}
+      - --save
+      - ""
+      - --appendonly
+      - "no"
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 10
     deploy:
       resources:
         limits:
-          memory: ${DRAGONFLY_MEM_LIMIT:-512M}
-          cpus: ${DRAGONFLY_CPU_LIMIT:-1}
+          memory: ${VALKEY_MEM_LIMIT:-${DRAGONFLY_MEM_LIMIT:-512M}}
+          cpus: ${VALKEY_CPU_LIMIT:-${DRAGONFLY_CPU_LIMIT:-1}}
 
   # NAN-4968: first-party images are `${NANO_IMAGE_PREFIX}-<component>:${NANO_VERSION}`.
   # install.sh sets both from the edition's images lock (open core:
@@ -311,6 +362,11 @@ services:
       CONNECTOR_VRL_MAX_WORKERS: "4"
       CONNECTOR_VRL_WORKER_AS_BYTES: "268435456"
       CONNECTOR_HEALTH_FILE: /run/nano-connector/healthy
+      # NAN-5130: the connector's own egress proxy (pinned-IP CONNECT). The
+      # generic HTTPS_PROXY is deliberately not forwarded here: it would
+      # bypass the connector's SSRF-pinned dialer.
+      CONNECTOR_EGRESS_PROXY_URL:
+      CONNECTOR_EGRESS_PROXY_MODE:
       NANO_CONNECTOR_SECCOMP: prefer
       NANO_CONNECTOR_CGROUP: prefer
       RUST_LOG: ${RUST_LOG:-info}
@@ -488,6 +544,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
+      <<: [*nano-egress-env, *nano-update-env]
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
       PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-20}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}
@@ -510,6 +567,11 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY}
       CORS_ORIGINS: ${BASE_URL:-http://localhost}
+      # NAN-5015: only nginx (on this private network) may vouch for a client
+      # address, and only via X-Forwarded-For (rightmost entry). Without these
+      # every request looked like it came from the nginx container.
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      TRUSTED_CLIENT_IP_HEADERS: ${TRUSTED_CLIENT_IP_HEADERS:-x-forwarded-for}
       AUTH_ENABLED: "true"
       # install.sh flips this to "true" when BASE_URL is http:// so the refresh
       # cookie is set without the Secure flag (NAN-807 bug #12).
@@ -544,6 +606,10 @@ services:
       # fallback off, and derive the platform pull credential for its own
       # senders. Same value Vector gets.
       VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN}
+      # Single host: Vector gets its config and ingest tokens on the shared
+      # volume, so the HTTP config delivery (/api/internal/vector-config/*) has
+      # no consumer and stays off (security review 2026-11-08).
+      NANO_VECTOR_CONFIG_DELIVERY: "off"
       VECTOR_INGEST_URL: http://vector:8080/
       VECTOR_ENRICH_URL: http://vector:8090/
       # NAN-4907: the shared nano-vector-dynamic volume delivers the tokens
@@ -567,14 +633,29 @@ services:
       HOT_RETENTION_DAYS: ${HOT_RETENTION_DAYS:-90}
       WARM_RETENTION_DAYS: ${WARM_RETENTION_DAYS:-30}
       COLD_STORAGE_ENABLED: "false"
-      NANO_TIER: ${NANO_TIER:-unrestricted}
+      NANO_CAPACITY_GB_PER_DAY: ${NANO_CAPACITY_GB_PER_DAY:-}
       NANO_AI_CREDITS_PER_MONTH: ${NANO_AI_CREDITS_PER_MONTH:-}
       NANO_MAX_DETECTION_RULES: ${NANO_MAX_DETECTION_RULES:-}
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-}
+      # Online licence check-in (enterprise only; the open binary has no checker).
+      # Empty on self-run installs, which use the C05 authority. Managed tenants
+      # transitioned from the v0.1.x platform layout keep their .env tuple:
+      # LICENSE_URL, DEPLOYMENT_TOKEN (the legacy name of LICENSE_TOKEN) and
+      # NANO_DEPLOYMENT_ID. The deployment id alone never selects online admission.
+      LICENSE_URL: ${LICENSE_URL:-}
+      LICENSE_TOKEN: ${LICENSE_TOKEN:-${DEPLOYMENT_TOKEN:-}}
+      NANO_DEPLOYMENT_ID: ${NANO_DEPLOYMENT_ID:-}
       REDIS_URL: redis://dragonfly:6379
       LOG_FORMAT: ${LOG_FORMAT:-}
       SIEM_FORWARD_URL: ${SIEM_FORWARD_URL:-}
       SIEM_FORWARD_TOKEN: ${SIEM_FORWARD_TOKEN:-}
+      # pivt docs grounding (enterprise image only; NAN-5058): caller token for
+      # the docs-search Worker (https://docs-search.nano.rs, public product docs
+      # only). Empty = off, and AIRGAP_MODE turns it off too. The open-core
+      # image has no docs client and ignores both. The role-split enterprise
+      # compose inherits this through `extends`.
+      DOCS_SEARCH_TOKEN: ${DOCS_SEARCH_TOKEN:-}
+      DOCS_SEARCH_URL: ${DOCS_SEARCH_URL:-https://docs-search.nano.rs}
     volumes:
       - nano-api-data:/app/data
       - nano-vector-dynamic:/etc/vector/dynamic
@@ -595,7 +676,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 15s
+      # Boot renders and publishes the Vector config for every deployed source
+      # before the listener binds; on an upgraded install that can take minutes,
+      # and probe failures during start_period do not count (release validation 2026-11-09).
+      start_period: 300s
     deploy:
       resources:
         limits:
@@ -610,6 +694,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
+      <<: [*nano-egress-env, *nano-update-env]
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
       PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-20}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}
@@ -648,6 +733,10 @@ services:
       # Identity sync is scheduled here, not only in nano-api.
       VECTOR_ENRICH_URL: http://vector:8090/
       VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN}
+      # Single host: Vector gets its config and ingest tokens on the shared
+      # volume, so the HTTP config delivery (/api/internal/vector-config/*) has
+      # no consumer and stays off (security review 2026-11-08).
+      NANO_VECTOR_CONFIG_DELIVERY: "off"
       # NAN-4907: in-process senders authenticate with the platform credential.
       NANO_PLATFORM_INGEST_TOKEN: ${NANO_PLATFORM_INGEST_TOKEN:-}
       NANOSIEM_DATA_DIR: /app/data
@@ -656,10 +745,13 @@ services:
       HOT_RETENTION_DAYS: ${HOT_RETENTION_DAYS:-90}
       WARM_RETENTION_DAYS: ${WARM_RETENTION_DAYS:-30}
       COLD_STORAGE_ENABLED: "false"
-      NANO_TIER: ${NANO_TIER:-unrestricted}
+      NANO_CAPACITY_GB_PER_DAY: ${NANO_CAPACITY_GB_PER_DAY:-}
       NANO_AI_CREDITS_PER_MONTH: ${NANO_AI_CREDITS_PER_MONTH:-}
       NANO_MAX_DETECTION_RULES: ${NANO_MAX_DETECTION_RULES:-}
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-}
+      # Online licence check-in; see nano-api. NANO_DEPLOYMENT_ID is set below.
+      LICENSE_URL: ${LICENSE_URL:-}
+      LICENSE_TOKEN: ${LICENSE_TOKEN:-${DEPLOYMENT_TOKEN:-}}
       REDIS_URL: redis://dragonfly:6379
       LOG_FORMAT: ${LOG_FORMAT:-}
       # Enterprise tenant-health export is default-off. The same base compose
@@ -709,6 +801,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
+      <<: *nano-egress-env
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
       PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-20}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}
@@ -727,6 +820,11 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY}
       CORS_ORIGINS: ${BASE_URL:-http://localhost}
+      # NAN-5015: only nginx (on this private network) may vouch for a client
+      # address, and only via X-Forwarded-For (rightmost entry). Without these
+      # every request looked like it came from the nginx container.
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      TRUSTED_CLIENT_IP_HEADERS: ${TRUSTED_CLIENT_IP_HEADERS:-x-forwarded-for}
       AUTH_ENABLED: "true"
       NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
       # Storage schema profile (udm | ocsf). Must match nano-api (above).
@@ -785,6 +883,8 @@ services:
       - no-new-privileges:true
     volumes:
       - ./config/nginx/nginx.opensource.conf:/etc/nginx/nginx.conf:ro
+      # NAN-5015: edge client-IP mode (none = strip CDN headers; cdn = forward them).
+      - ./config/nginx/client-ip/${NANO_EDGE_CDN_CLIENT_IP:-none}.conf:/etc/nginx/nano-client-ip.d/edge.conf:ro
     ports:
       - "80:80"
     depends_on:

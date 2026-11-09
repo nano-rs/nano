@@ -958,7 +958,7 @@ impl LogSourceRepository {
         // If match_pattern is set, use case-insensitive regex
         if let Some(ref pattern) = log_source.match_pattern {
             if !pattern.is_empty() {
-                let escaped_pattern = pattern.replace('\\', "\\\\").replace('\'', "''");
+                let escaped_pattern = crate::sql_hygiene::escape_sql_string(pattern);
                 return format!("match(lower({}), lower('{}'))", field, escaped_pattern);
             }
         }

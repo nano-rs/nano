@@ -19,7 +19,6 @@ pub mod ip_allowlist;
 pub mod license_guard;
 pub mod logging;
 pub mod rate_limit;
-pub mod request_id;
 pub mod sanitize_errors;
 pub mod tier_guard;
 
@@ -33,9 +32,7 @@ pub use backup_mutation_fence::{backup_mutation_fence, BackupMutationFence};
 pub use demo_guard::demo_guard;
 pub use ip_allowlist::{ip_allowlist_middleware, IpAllowlistState};
 #[cfg(feature = "enterprise")]
-pub use license_guard::component_guard;
-#[cfg(feature = "enterprise")]
-pub use license_guard::license_guard;
+pub use license_guard::{license_guard, licensed_surface_guard};
 pub use logging::request_logging_layer;
 pub use nanosiem_api_lib::api_cache_control::api_default_cache_control;
 pub use rate_limit::{
@@ -44,6 +41,7 @@ pub use rate_limit::{
     password_reset_rate_limit_middleware, upload_rate_limit_middleware, RateLimitConfig,
     RateLimitState,
 };
-pub use request_id::{request_id_middleware, RequestId, REQUEST_ID_HEADER};
+// NAN-5102: shared with nanosiem-search (one implementation, one fix).
+pub use nanosiem_api_lib::request_id::{request_id_middleware, RequestId, REQUEST_ID_HEADER};
 pub use sanitize_errors::sanitize_error_responses;
 pub use tier_guard::api_write_guard;

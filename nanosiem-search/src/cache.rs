@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Search Result Cache — Dragonfly/Redis-backed full result caching
+//! Search Result Cache — Valkey/Redis-backed full result caching
 //!
 //! Caches complete search responses (including AI enrichment) so that
 //! shared links, page refreshes, and repeat queries return instantly
@@ -162,14 +162,14 @@ pub(crate) fn reads_state_outside_the_events(query: &str) -> bool {
     nanosiem_core::query::parse_query(query).map_or(true, |parsed| node(&parsed))
 }
 
-/// Search result cache backed by Dragonfly/Redis
+/// Search result cache backed by Valkey/Redis
 #[derive(Clone)]
 pub struct SearchResultCache {
     conn: ConnectionManager,
 }
 
 impl SearchResultCache {
-    /// Connect to Dragonfly/Redis. Returns None if connection fails (graceful degradation).
+    /// Connect to Valkey/Redis. Returns None if connection fails (graceful degradation).
     pub async fn connect(redis_url: &str) -> Option<Self> {
         let client = match redis::Client::open(redis_url) {
             Ok(c) => c,

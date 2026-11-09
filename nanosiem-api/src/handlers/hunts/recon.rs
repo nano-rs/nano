@@ -145,7 +145,12 @@ pub async fn run_recon_profile(
 ) -> Result<Json<ReconRunSummary>, ApiError> {
     ensure_recon_write(&auth)?;
 
-    let summary = recon_service(&state).await.run(Some(auth.user_id())).await?;
+    // NAN-5049: the stored profile is complete (system gather); the returned
+    // copy is redacted to what this caller could read via GET /api/hunts/profile.
+    let summary = recon_service(&state)
+        .await
+        .run(Some(auth.user_id()), &super::artifact_scope(&auth))
+        .await?;
 
     // The audit record carries what the run CONCLUDED, not merely that it ran:
     // draft creation is the part with a lasting effect, and the degraded flag is
@@ -204,7 +209,14 @@ pub async fn recon_census(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<CensusReport>, ApiError> {
     ensure_recon_write(&auth)?;
-    Ok(Json(recon_service(&state).await.census().await?))
+    // NAN-5049: the census goes straight back to the caller — narrow it to the
+    // sources the caller may see (live-data scope, including the audit gate).
+    Ok(Json(
+        recon_service(&state)
+            .await
+            .census(&auth.effective_viewer_scope())
+            .await?,
+    ))
 }
 
 /// How much of the surface to return.
@@ -274,7 +286,11 @@ pub async fn recon_surface(
     Query(query): Query<SurfaceQuery>,
 ) -> Result<Json<SurfaceResponse>, ApiError> {
     ensure_recon_write(&auth)?;
-    let report = recon_service(&state).await.surface().await?;
+    // NAN-5049: narrowed to the caller's live-data scope, like the census.
+    let report = recon_service(&state)
+        .await
+        .surface(&auth.effective_viewer_scope())
+        .await?;
     Ok(Json(match query.detail {
         SurfaceDetail::Summary => SurfaceResponse::Summary(Box::new(report.into_summary())),
         SurfaceDetail::Full => SurfaceResponse::Full(Box::new(report)),
@@ -363,6 +379,11 @@ pub async fn save_recon_profile(
             .build(),
     );
 
+    // NAN-5049: the audit record above keeps the full manifest (an access
+    // review needs it); the RESPONSE is redacted to what this caller could
+    // read through GET /api/hunts/profile.
+    let mut profile = profile;
+    nanosiem_core::hunts::recon::redact_profile_for(&mut profile, &super::artifact_scope(&auth));
     Ok((StatusCode::CREATED, Json(profile)))
 }
 

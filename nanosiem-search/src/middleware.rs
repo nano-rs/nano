@@ -11,7 +11,7 @@
 use axum::{
     Json,
     extract::{ConnectInfo, Request, State},
-    http::{HeaderName, HeaderValue, StatusCode, header},
+    http::{StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -24,43 +24,10 @@ use nanosiem_core::auth::{
     ApiKeyInfo, ApiKeyService, ApiKeyServiceError, PermissionResolver, SourceScopeResolver,
     TokenClaims, TokenConfig, TokenService, UserStatusResolver,
 };
-use nanosiem_core::ip_allowlist::{IpAllowlistScope, IpAllowlistService};
+use nanosiem_core::ip_allowlist::{AllowlistDecision, IpAllowlistScope, IpAllowlistService};
 
-/// Header name for request ID
-pub const REQUEST_ID_HEADER: &str = "X-Request-ID";
-
-/// Extension type for storing request ID in request extensions
-#[derive(Clone, Debug)]
-pub struct RequestId(pub String);
-
-impl RequestId {
-    /// Create a new random request ID
-    pub fn new() -> Self {
-        Self(Uuid::now_v7().to_string())
-    }
-
-    /// Create from an existing ID string
-    pub fn from_string(id: String) -> Self {
-        Self(id)
-    }
-
-    /// Get the request ID as a string slice
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Default for RequestId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for RequestId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+// NAN-5102: shared with nanosiem-api (one implementation, one fix).
+pub use nanosiem_api_lib::request_id::{RequestId, REQUEST_ID_HEADER, request_id_middleware};
 
 /// Public endpoints that don't require authentication
 const PUBLIC_ENDPOINTS: &[&str] = &["/health", "/ready", "/livez", "/metrics"];
@@ -215,57 +182,16 @@ fn extract_api_key(request: &Request) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// SECURITY: Extract client IP address from request headers with socket fallback.
+/// Client IP for audit / API-key IP restrictions (NAN-5015).
 ///
-/// Priority order matches `nanosiem-api/src/utils.rs::extract_client_ip`:
-/// 1. CF-Connecting-IP  — set by Cloudflare edge, not client-controlled
-/// 2. True-Client-IP    — set by Cloudflare Enterprise / Akamai edge
-/// 3. X-Forwarded-For   — **rightmost** entry only (appended by trusted LB)
-/// 4. X-Real-IP         — set by nginx reverse proxy
-/// 5. Socket address    — direct connection, no proxy
-///
-/// IMPORTANT: The leftmost X-Forwarded-For entry is client-controlled and trivially
-/// spoofable. We use `rsplit` to take the rightmost entry, which is appended by
-/// the last trusted proxy (e.g., GKE load balancer).
+/// Delegates to the ONE trusted-proxy-gated extractor shared with nanosiem-api
+/// (`nanosiem_api_lib::extract_client_ip`): forwarded headers are believed only
+/// from a `TRUSTED_PROXY_CIDRS` peer, and only the headers named in
+/// `TRUSTED_CLIENT_IP_HEADERS` (default `X-Forwarded-For`, rightmost entry).
+/// This used to trust `CF-Connecting-IP` / `True-Client-IP` / `X-Forwarded-For`
+/// / `X-Real-IP` from ANY peer.
 pub(crate) fn extract_ip_address(request: &Request, connect_info: Option<&SocketAddr>) -> Option<String> {
-    // Prefer CF-Connecting-IP (Cloudflare sets this to the true client IP)
-    if let Some(cf_ip) = request.headers().get("CF-Connecting-IP") {
-        if let Ok(value) = cf_ip.to_str() {
-            let ip = value.trim();
-            if !ip.is_empty() {
-                return Some(ip.to_string());
-            }
-        }
-    }
-    // True-Client-IP (Cloudflare Enterprise / Akamai — also edge-set)
-    if let Some(true_ip) = request.headers().get("True-Client-IP") {
-        if let Ok(value) = true_ip.to_str() {
-            let ip = value.trim();
-            if !ip.is_empty() {
-                return Some(ip.to_string());
-            }
-        }
-    }
-    // X-Forwarded-For: use the rightmost (last) entry — appended by trusted LB
-    if let Some(forwarded) = request.headers().get("X-Forwarded-For") {
-        if let Ok(value) = forwarded.to_str() {
-            let ip = value.rsplit(',').next().unwrap_or(value).trim();
-            if !ip.is_empty() {
-                return Some(ip.to_string());
-            }
-        }
-    }
-    // Try X-Real-IP (nginx default)
-    if let Some(real_ip) = request.headers().get("X-Real-IP") {
-        if let Ok(value) = real_ip.to_str() {
-            let ip = value.trim();
-            if !ip.is_empty() {
-                return Some(ip.to_string());
-            }
-        }
-    }
-    // Fall back to connection socket address
-    connect_info.map(|addr| addr.ip().to_string())
+    nanosiem_api_lib::extract_client_ip(request.headers(), connect_info)
 }
 
 /// Authentication state that holds the services needed for auth
@@ -583,6 +509,11 @@ pub async fn auth_middleware(
                         ApiKeyServiceError::RateLimitExceeded => {
                             (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded")
                         }
+                        // NAN-5044: owner permissions unknown → fail closed, retryable.
+                        ApiKeyServiceError::OwnerPermissionsUnavailable => (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "API key permissions are temporarily unavailable; retry shortly",
+                        ),
                         _ => (StatusCode::UNAUTHORIZED, "Invalid API key"),
                     };
 
@@ -659,65 +590,6 @@ pub async fn sanitize_error_responses(request: Request, next: Next) -> Response 
     }
 
     sanitized
-}
-
-/// Middleware that extracts or generates a request ID
-///
-/// If the incoming request has an X-Request-ID header, it will be used.
-/// Otherwise, a new UUID will be generated.
-///
-/// The request ID is:
-/// 1. Added to request extensions for use in handlers
-/// 2. Added to the tracing span for log correlation
-/// 3. Added to the response headers
-///
-/// Requirements: 7.3
-pub async fn request_id_middleware(mut request: Request, next: Next) -> Response {
-    // Extract existing request ID or generate a new one
-    let request_id = request
-        .headers()
-        .get(REQUEST_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| RequestId::from_string(s.to_string()))
-        .unwrap_or_else(RequestId::new);
-
-    // Create a tracing span with the request ID
-    let span = tracing::info_span!(
-        "request",
-        request_id = %request_id,
-        method = %request.method(),
-        uri = %request.uri(),
-    );
-
-    // Add request ID to extensions for use in handlers
-    request.extensions_mut().insert(request_id.clone());
-
-    // Process the request within the span, measuring duration
-    let start = std::time::Instant::now();
-    let response = {
-        let _guard = span.enter();
-        next.run(request).await
-    };
-    let duration_ms = start.elapsed().as_millis() as u64;
-    let status = response.status().as_u16();
-    {
-        let _guard = span.enter();
-        tracing::info!(
-            status = status,
-            duration_ms = duration_ms,
-            "Request completed"
-        );
-    }
-
-    // Add request ID to response headers
-    let mut response = response;
-    if let Ok(header_value) = HeaderValue::from_str(request_id.as_str()) {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static("x-request-id"), header_value);
-    }
-
-    response
 }
 
 /// NAN-4664: every HTTP search runs with an admission wait budget: the
@@ -845,10 +717,13 @@ pub async fn ip_allowlist_middleware(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0);
-    let client_ip = extract_ip_address(&request, connect_info.as_ref());
+    // NAN-5015: the shared trusted-proxy gate, keeping where the address came
+    // from so only a socket-derived loopback address gets the local pass.
+    let client_ip =
+        nanosiem_api_lib::extract_client_ip_origin(request.headers(), connect_info.as_ref());
 
-    let ip_str = match client_ip {
-        Some(ref ip) => ip.as_str(),
+    let (ip_str, from_socket) = match client_ip {
+        Some(ref ip) => (ip.ip.as_str(), ip.from_socket),
         None => {
             tracing::warn!(
                 "Could not extract client IP for allowlist check — denying request to {}",
@@ -858,9 +733,22 @@ pub async fn ip_allowlist_middleware(
         }
     };
 
-    if !state.service.is_allowed(ip_str, state.scope).await {
-        tracing::info!(ip = %ip_str, path = %path, scope = %state.scope, "IP denied by allowlist");
-        return ip_denied_response(ip_str);
+    match state
+        .service
+        .is_allowed_client(ip_str, from_socket, state.scope)
+        .await
+    {
+        AllowlistDecision::Allowed => {}
+        AllowlistDecision::Denied => {
+            tracing::info!(ip = %ip_str, path = %path, scope = %state.scope, "IP denied by allowlist");
+            return ip_denied_response(ip_str);
+        }
+        // NAN-5077: rules could not be loaded — fail closed (the service
+        // logs the load error once per retry window, not per request).
+        AllowlistDecision::Unavailable => {
+            tracing::debug!(ip = %ip_str, path = %path, scope = %state.scope, "IP allowlist unavailable — refusing");
+            return ip_allowlist_unavailable_response();
+        }
     }
 
     next.run(request).await
@@ -877,6 +765,26 @@ fn ip_denied_response(ip: &str) -> Response {
         },
     };
     (StatusCode::FORBIDDEN, Json(body)).into_response()
+}
+
+/// NAN-5077: the allowlist rules could not be loaded, so the request is
+/// refused without claiming the client is unlisted. 503 + Retry-After: the
+/// condition clears by itself once PostgreSQL is reachable again.
+fn ip_allowlist_unavailable_response() -> Response {
+    let body = IpDeniedResponse {
+        error: IpDeniedError {
+            code: "IP_ALLOWLIST_UNAVAILABLE",
+            message: "The IP allowlist could not be loaded, so access is refused until it can be. \
+                      Retry shortly; if this persists, contact your administrator."
+                .to_string(),
+        },
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "5")],
+        Json(body),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

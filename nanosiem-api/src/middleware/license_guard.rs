@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! License enforcement middleware
+//! V2 licence enforcement middleware.
 //!
-//! Blocks all API requests when the deployment's license is in locked state.
-//! During grace period, requests are allowed but a header is added to signal
-//! the frontend to show a warning banner.
-//!
-//! Self-hosted deployments without heartbeat configured are never blocked.
+//! Enterprise-only routes receive [`licensed_surface_guard`]. Shared routes
+//! are intentionally outside that layer and remain available at hard stop,
+//! matching the open build boundary. [`license_guard`] only publishes grace /
+//! hard-stop response headers across the shared router.
 
 use axum::{
     extract::{Request, State},
@@ -21,54 +20,31 @@ use tokio::sync::RwLock;
 
 use crate::error::{ErrorDetail, ErrorResponse};
 
-#[cfg(feature = "enterprise")]
-pub async fn component_guard(
-    State(snapshot): State<Arc<RwLock<crate::license_admission::OfflineLicenseSnapshot>>>,
+pub async fn licensed_surface_guard(
+    State(license_status): State<Arc<RwLock<LicenseStatus>>>,
     request: Request,
     next: Next,
 ) -> Result<Response, Response> {
-    let path = request.uri().path();
-    let Some(component) = crate::license_admission::required_component_for_route(path) else {
-        return Ok(next.run(request).await);
-    };
-    if snapshot.read().await.allows_component(component) {
+    let status = license_status.read().await.effective(chrono::Utc::now());
+    if status.state != LicenseState::Locked {
         return Ok(next.run(request).await);
     }
 
     let body = ErrorResponse {
         error: ErrorDetail {
-            code: "LICENSE_COMPONENT_REQUIRED".to_string(),
-            message: format!("The installed licence does not include the '{component}' component."),
+            code: "LICENSE_REQUIRED".to_string(),
+            message: "This licensed feature is unavailable at the licence hard stop. Open/core features and stored data remain available.".to_string(),
             details: None,
         },
     };
     Err((StatusCode::FORBIDDEN, Json(body)).into_response())
 }
 
-/// Endpoints that are never blocked by license enforcement.
-/// Health check must remain accessible for monitoring, and the license
-/// status endpoint must be readable so the frontend can show the right UI.
-const LICENSE_EXEMPT_PREFIXES: &[&str] = &[
-    "/health",
-    "/api/license",
-    "/api/auth/login",
-    "/api/auth/refresh",
-    "/api/setup",
-    "/swagger-ui",
-    "/api-docs",
-    "/metrics",
-    // Build edition + capability flags. The SPA hits this on boot to decide
-    // which surfaces to render (incl. whether to show the license lockout
-    // overlay at all); a Locked install that 403'd it would render blank with
-    // no recovery path (NAN-1222).
-    "/api/capabilities",
-];
-
-/// Middleware that enforces license status on all API requests.
+/// Publish the current licence state on responses from the whole API.
 ///
 /// - Active: pass through
 /// - Grace period: pass through with X-License-State header
-/// - Locked: return 403 with clear error message
+/// - Locked: shared/open routes continue with `X-License-State: locked`
 ///
 /// Must be layered **before** auth middleware (outer to it) so it runs first.
 pub async fn license_guard(
@@ -76,20 +52,6 @@ pub async fn license_guard(
     request: Request,
     next: Next,
 ) -> Result<Response, Response> {
-    let path = request.uri().path();
-
-    // Always allow exempt endpoints
-    if LICENSE_EXEMPT_PREFIXES
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
-    {
-        return Ok(next.run(request).await);
-    }
-
-    // Compute the effective status: read-time `expires_at` enforcement degrades
-    // an expired (incl. offline air-gap) license to Locked with no network
-    // (NAN-1206 / WS4). Online installs never carry a past `expires_at` while
-    // Active, so this is a no-op for them.
     let status = license_status.read().await.effective(chrono::Utc::now());
 
     match status.state {
@@ -111,14 +73,15 @@ pub async fn license_guard(
         }
 
         LicenseState::Locked => {
-            let body = ErrorResponse {
-                error: ErrorDetail {
-                    code: "LICENSE_EXPIRED".to_string(),
-                    message: "Your subscription has expired. Data is preserved but inaccessible. Resubscribe at app.nano.rs to restore access.".to_string(),
-                    details: None,
-                },
-            };
-            Err((StatusCode::FORBIDDEN, Json(body)).into_response())
+            let mut response = next.run(request).await;
+            response
+                .headers_mut()
+                .insert("X-License-State", "locked".parse().unwrap());
+            Ok(response)
         }
     }
 }
+
+#[cfg(test)]
+#[path = "license_guard_tests.rs"]
+mod tests;

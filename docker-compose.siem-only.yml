@@ -126,9 +126,9 @@ services:
       # NAN-809: do NOT set CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT here. The upstream
       # entrypoint reacts to that env by writing a generated default-user.xml into
       # /etc/clickhouse-server/users.d/, which conflicts with our :ro bind mount and
-      # puts the container in a restart loop. Our users.d/default-user.xml already
-      # sets <access_management>1</access_management> directly, so the env is
-      # redundant.
+      # puts the container in a restart loop. Our users.d/default-user.xml owns
+      # the `default` user instead: container-local only, no access management
+      # (nanosiem_admin manages users).
       # Pass per-deployment passwords into users.d/*.xml via from_env="..." (NAN-807 bug #2).
       CLICKHOUSE_NANOSIEM_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
@@ -152,8 +152,10 @@ services:
     #
     # SECURITY: the nanosiem_ingest (INSERT-only), nanosiem (app r/w), and
     # nanosiem_admin (DDL) users all accept connections from any network
-    # (users.d/nanosiem-users.xml, <ip>::/0</ip>) — only `default` is
-    # localhost-only. So if your aggregator is on ANOTHER host and you must widen
+    # (users.d/nanosiem-users.xml, <ip>::/0</ip>). `default` has no password and
+    # accepts connections from inside the ClickHouse container only
+    # (users.d/default-user.xml), so it is never reachable through this port,
+    # not even from this host. If your aggregator is on ANOTHER host and you must widen
     # this bind (e.g. "8123:8123"), you are exposing the admin + app users too,
     # not just the ingest user. Widen ONLY behind a firewall / IP-allowlist; never
     # leave :8123 open to the internet.
@@ -171,7 +173,9 @@ services:
         soft: 262144
         hard: 262144
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- 'http://127.0.0.1:8123/?query=SELECT+1' 2>/dev/null | grep -q 1"]
+      # /ping needs no user: the passwordless `default` user is container-local
+      # (users.d/default-user.xml) and must not be what readiness depends on.
+      test: ["CMD-SHELL", "wget -qO- 'http://127.0.0.1:8123/ping' 2>/dev/null | grep -q Ok"]
       interval: 5s
       timeout: 5s
       retries: 40
@@ -184,31 +188,45 @@ services:
           cpus: ${CLICKHOUSE_CPU_LIMIT:-2}
 
   dragonfly:
-    # Was a floating tag (NAN-1258), the easiest silent-mutation vector on a
-    # security product. Pinned to a concrete version + digest.
-    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.1@sha256:baf70ba7ad182a992b988497cfa31a488978c8fab7712079784c2401f447e402
-    container_name: nano-dragonfly
+    # NAN-5082: Valkey (BSD-3-Clause, Linux Foundation) replaced Dragonfly,
+    # which left open source (BUSL-1.1, then DSAL from v2.1.0). The Compose
+    # service key stays `dragonfly` on purpose: it is the stable network name
+    # in REDIS_URL and the service identity the upgrade rollouts select, so an
+    # upgrade recreates this one container in place with the new image instead
+    # of orphaning it. Pinned to a concrete version + digest (NAN-1258).
+    image: valkey/valkey:9.1.2@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+    container_name: nano-valkey
     restart: unless-stopped
     logging: *default-logging
     security_opt:
       - no-new-privileges:true
-    command: ["--maxmemory", "${DRAGONFLY_MAXMEMORY:-512mb}", "--proactor_threads", "${DRAGONFLY_PROACTOR_THREADS:-2}"]
-    # No `ulimits: memlock: -1` — unlimited memlock can't be set in an
-    # unprivileged LXC (Docker can't exceed the container's 8MB memlock hard
-    # cap → "error setting rlimit type 8: operation not permitted", container
-    # won't start). Dragonfly runs fine without it at this maxmemory cap; the
-    # ulimit was only relevant for io_uring on pre-5.12 kernels (no longer
-    # charged against RLIMIT_MEMLOCK since Linux 5.12).
+    # Cache / coordination store only: nothing here must survive a restart
+    # (Dragonfly never persisted either), so RDB and AOF stay off. noeviction
+    # matches Dragonfly's default: a full store rejects writes instead of
+    # silently evicting search-job state or JWT revocations. The legacy
+    # DRAGONFLY_* sizing keys still apply to installs whose .env predates them.
+    command:
+      - valkey-server
+      - --maxmemory
+      - ${VALKEY_MAXMEMORY:-${DRAGONFLY_MAXMEMORY:-512mb}}
+      - --maxmemory-policy
+      - noeviction
+      - --io-threads
+      - ${VALKEY_IO_THREADS:-${DRAGONFLY_PROACTOR_THREADS:-2}}
+      - --save
+      - ""
+      - --appendonly
+      - "no"
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 10
     deploy:
       resources:
         limits:
-          memory: ${DRAGONFLY_MEM_LIMIT:-512M}
-          cpus: ${DRAGONFLY_CPU_LIMIT:-1}
+          memory: ${VALKEY_MEM_LIMIT:-${DRAGONFLY_MEM_LIMIT:-512M}}
+          cpus: ${VALKEY_CPU_LIMIT:-${DRAGONFLY_CPU_LIMIT:-1}}
 
   clickhouse-migrate:
     image: ${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-api:${NANO_VERSION:?NANO_VERSION is required (install.sh sets it from the images lock)}
@@ -289,6 +307,11 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY}
       CORS_ORIGINS: ${BASE_URL:-http://localhost}
+      # NAN-5015: only nginx (on this private network) may vouch for a client
+      # address, and only via X-Forwarded-For (rightmost entry). Without these
+      # every request looked like it came from the nginx container.
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      TRUSTED_CLIENT_IP_HEADERS: ${TRUSTED_CLIENT_IP_HEADERS:-x-forwarded-for}
       AUTH_ENABLED: "true"
       # install.sh flips this to "true" when BASE_URL is http:// so the refresh
       # cookie is set without the Secure flag (NAN-807 bug #12).
@@ -318,7 +341,7 @@ services:
       HOT_RETENTION_DAYS: ${HOT_RETENTION_DAYS:-90}
       WARM_RETENTION_DAYS: ${WARM_RETENTION_DAYS:-30}
       COLD_STORAGE_ENABLED: "false"
-      NANO_TIER: ${NANO_TIER:-unrestricted}
+      NANO_CAPACITY_GB_PER_DAY: ${NANO_CAPACITY_GB_PER_DAY:-}
       NANO_AI_CREDITS_PER_MONTH: ${NANO_AI_CREDITS_PER_MONTH:-}
       NANO_MAX_DETECTION_RULES: ${NANO_MAX_DETECTION_RULES:-}
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-}
@@ -344,7 +367,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 15s
+      # Boot renders and publishes the Vector config for every deployed source
+      # before the listener binds; on an upgraded install that can take minutes,
+      # and probe failures during start_period do not count (release validation 2026-11-09).
+      start_period: 300s
     deploy:
       resources:
         limits:
@@ -393,7 +419,7 @@ services:
       HOT_RETENTION_DAYS: ${HOT_RETENTION_DAYS:-90}
       WARM_RETENTION_DAYS: ${WARM_RETENTION_DAYS:-30}
       COLD_STORAGE_ENABLED: "false"
-      NANO_TIER: ${NANO_TIER:-unrestricted}
+      NANO_CAPACITY_GB_PER_DAY: ${NANO_CAPACITY_GB_PER_DAY:-}
       NANO_AI_CREDITS_PER_MONTH: ${NANO_AI_CREDITS_PER_MONTH:-}
       NANO_MAX_DETECTION_RULES: ${NANO_MAX_DETECTION_RULES:-}
       DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-}
@@ -446,6 +472,11 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY}
       CORS_ORIGINS: ${BASE_URL:-http://localhost}
+      # NAN-5015: only nginx (on this private network) may vouch for a client
+      # address, and only via X-Forwarded-For (rightmost entry). Without these
+      # every request looked like it came from the nginx container.
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      TRUSTED_CLIENT_IP_HEADERS: ${TRUSTED_CLIENT_IP_HEADERS:-x-forwarded-for}
       AUTH_ENABLED: "true"
       NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
       # Storage schema profile (udm | ocsf). Must match nano-api (above).
@@ -508,6 +539,8 @@ services:
     # don't use it (your aggregator writes straight to ClickHouse :8123).
     volumes:
       - ./config/nginx/nginx.opensource.conf:/etc/nginx/nginx.conf:ro
+      # NAN-5015: edge client-IP mode (none = strip CDN headers; cdn = forward them).
+      - ./config/nginx/client-ip/${NANO_EDGE_CDN_CLIENT_IP:-none}.conf:/etc/nginx/nano-client-ip.d/edge.conf:ro
     ports:
       - "80:80"
     depends_on:

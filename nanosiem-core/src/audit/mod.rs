@@ -425,6 +425,8 @@ impl AuditEvent {
             "metadata": {
                 "product": { "name": "nano", "vendor_name": "nano" },
                 "log_name": "audit",
+                // NAN-5079: required by OCSF; the contract this row is written for.
+                "version": crate::parsers::ocsf_validation_version(),
             },
             "actor": {
                 "user": {

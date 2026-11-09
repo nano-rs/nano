@@ -1028,14 +1028,21 @@ pub fn parse_lookback(raw: &str) -> Duration {
     }
     // Clamped: a hunt configured with `3650d` would open with a decade-wide
     // window, which is neither a hunt nor survivable.
-    let duration = match unit.trim().to_ascii_lowercase().as_str() {
-        "m" | "min" | "minutes" => Duration::minutes(value),
-        "h" | "hr" | "hours" => Duration::hours(value),
-        "d" | "days" => Duration::days(value),
-        "w" | "weeks" => Duration::weeks(value),
-        _ => Duration::hours(24),
+    //
+    // Security review 2026-11-08: clamp the COUNT before building the
+    // duration. `Duration::minutes(i64)` panics past ~1.5e14, and this runs
+    // inline in the supervised hunt scheduler, so `lookback_window =
+    // "200000000000000m"` crash-looped the jobs process.
+    const MAX_MINUTES: i64 = 90 * 24 * 60;
+    let minutes_per_unit: i64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "m" | "min" | "minutes" => 1,
+        "h" | "hr" | "hours" => 60,
+        "d" | "days" => 24 * 60,
+        "w" | "weeks" => 7 * 24 * 60,
+        _ => return Duration::hours(24),
     };
-    duration.clamp(Duration::minutes(1), Duration::days(90))
+    let minutes = value.saturating_mul(minutes_per_unit).min(MAX_MINUTES);
+    Duration::minutes(minutes).clamp(Duration::minutes(1), Duration::days(90))
 }
 
 #[cfg(test)]

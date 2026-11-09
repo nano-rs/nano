@@ -18,10 +18,12 @@ mod vector_config;
 use nanosiem_core::audit::{AuditEmitter, AuditQueryService};
 use nanosiem_core::auth::source_scope_resolver::SourceScopeResolver;
 use nanosiem_core::auth::{
-    ApiKeyRepository, ApiKeyService, AuthConfig, AuthService, GroupRepository, OidcRepository,
-    OidcService, PermissionService, RoleRepository, SessionConfig, SessionRepository,
-    SessionService, TokenConfig, TokenService, UserRepository,
+    ApiKeyRepository, ApiKeyService, AuthConfig, AuthService, GroupRepository, PermissionService,
+    RoleRepository, SessionConfig, SessionRepository, SessionService, TokenConfig, TokenService,
+    UserRepository,
 };
+#[cfg(feature = "enterprise")]
+use nanosiem_core::auth::{OidcRepository, OidcService};
 use nanosiem_core::db::repository::{RateLimitRepository, SourceScopeRepository};
 use nanosiem_core::db::DualPool;
 use nanosiem_core::detection::{MaterializedViewGenerator, SignalProcessor};
@@ -29,6 +31,7 @@ use nanosiem_core::enrichment::EnrichmentService;
 use nanosiem_core::identity::IdentitySyncService;
 use nanosiem_core::onboarding::OnboardingRepository;
 use nanosiem_core::settings::local_auth::LocalAuthSettings;
+#[cfg(feature = "enterprise")]
 use nanosiem_core::tuning::{NotificationService, TuningRepository};
 use nanosiem_core::{
     DetectionService, DiskPressureService, DistributedDetectionScheduler, FeedService,
@@ -259,14 +262,18 @@ pub struct AppState {
     /// auth middleware; invalidated after any registry/grant mutation.
     pub source_scope_resolver: SourceScopeResolver,
     /// OIDC repository
+    #[cfg(feature = "enterprise")]
     pub oidc_repo: OidcRepository,
     /// OIDC service
+    #[cfg(feature = "enterprise")]
     oidc_service: Arc<OidcService>,
     /// Whether authentication is enabled
     pub auth_enabled: bool,
     /// Notification service for tuning alerts
+    #[cfg(feature = "enterprise")]
     pub notification_service: Arc<NotificationService>,
     /// Tuning repository for proposal management
+    #[cfg(feature = "enterprise")]
     pub tuning_repository: Arc<TuningRepository>,
     /// Atomic task registration and cooperative shutdown state.
     task_registry: TaskRegistry,
@@ -326,18 +333,24 @@ pub struct AppState {
     /// Phase 3.2 (NAN-744): cases::PresenceTracker is enterprise-only.
     #[cfg(feature = "enterprise")]
     pub presence_tracker: Arc<nanosiem_enterprise::PresenceTracker>,
-    /// Shared Dragonfly-backed cache for the marketplace coverage hero
+    /// Concrete shadow-investigation service retained for its licensed
+    /// recovery worker. Request-time hooks use the dynamically gated trait
+    /// object below; recovery itself is started only by the case worker
+    /// supervisor after initial licence admission succeeds.
+    #[cfg(feature = "enterprise")]
+    pub shadow_investigation_service: Arc<nanosiem_enterprise::cases::ShadowInvestigationService>,
+    /// Shared Valkey-backed cache for the marketplace coverage hero
     /// (NAN-609). Disabled (no-op) when `REDIS_URL` is unset, in which case
     /// every request runs the full ClickHouse aggregate.
     pub marketplace_coverage_cache: Arc<nanosiem_core::marketplace::MarketplaceCoverageCache>,
-    /// Shared Dragonfly-backed cache for full search responses (NAN-702).
+    /// Shared Valkey-backed cache for full search responses (NAN-702).
     /// Mirrors `nanosiem-search`'s `state.result_cache` so dashboard panel
     /// queries — which call `search_with_admission` directly instead of
     /// going through the search HTTP handler — also benefit from the 7-day
     /// compressed result cache. `None` when `REDIS_URL` is unset.
     pub search_result_cache: Option<nanosiem_search::cache::SearchResultCache>,
     /// Cross-replica per-user admission for the rule live tester. Each test
-    /// fans out up to 16 ClickHouse queries, so production uses a Dragonfly
+    /// fans out up to 16 ClickHouse queries, so production uses a Valkey
     /// lease instead of multiplying the cap by API replica count.
     pub rule_test_admission: Arc<nanosiem_core::RuleTestAdmission>,
     /// Shared shadow-investigation hook. On enterprise this is the live
@@ -381,14 +394,10 @@ impl AppState {
             let secret = std::env::var("JWT_SECRET")
                 .expect("CRITICAL SECURITY ERROR: JWT_SECRET environment variable must be set when authentication is enabled");
 
-            // Validate that the secret is not the old insecure default
-            if secret == "nanosiem-dev-secret-change-in-production" {
-                panic!("CRITICAL SECURITY ERROR: JWT_SECRET is set to the insecure default value. Please generate a secure random secret.");
-            }
-
-            // Validate minimum length (at least 32 characters for security)
-            if secret.len() < 32 {
-                panic!("CRITICAL SECURITY ERROR: JWT_SECRET must be at least 32 characters long. Current length: {}", secret.len());
+            // Refuse short secrets and every publicly known default/example
+            // value (shared rule with search and jobs).
+            if let Err(message) = nanosiem_core::auth::token::validate_jwt_secret(&secret) {
+                panic!("{message}");
             }
 
             tracing::info!(
@@ -448,10 +457,11 @@ impl AppState {
         ));
 
         // Create API key service
-        let api_key_service = Arc::new(ApiKeyService::new(
-            api_key_repo,
-            RateLimitRepository::new(pool.clone()),
-        ));
+        // NAN-5044: keys run with stored ∩ owner's CURRENT permissions.
+        let api_key_service = Arc::new(
+            ApiKeyService::new(api_key_repo, RateLimitRepository::new(pool.clone()))
+                .with_permission_resolver(nanosiem_core::auth::PermissionResolver::new(pool.clone())),
+        );
 
         // Create session service
         let session_config = SessionConfig::default();
@@ -497,6 +507,7 @@ impl AppState {
     }
 
     /// Get the OIDC service
+    #[cfg(feature = "enterprise")]
     pub fn get_oidc_service(&self) -> Arc<OidcService> {
         self.oidc_service.clone()
     }

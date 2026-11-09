@@ -293,7 +293,7 @@ impl ReqwestFeedHttp {
             .redirect(reqwest::redirect::Policy::none())
             .no_gzip();
         SsrfValidator::default_secure()
-            .build_pinned_client(url, builder)
+            .build_pinned_client(url, builder, crate::inputlookup::ProxyPolicy::Environment)
             .await
             .map_err(|e| format!("URL refused: {e}"))
     }

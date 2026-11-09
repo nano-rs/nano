@@ -72,6 +72,16 @@ import { PipelinesApi } from './pipelines';
 // Re-export types
 export * from './types';
 
+/** NAN-5114: `GET /api/license/update` (enterprise, `settings:system`). */
+export interface UpdateStatusResponse {
+  current_version: string;
+  update_available: boolean;
+  latest_version: string | null;
+  security_release: boolean;
+  release_notes_url: string | null;
+  upgrade_url: string | null;
+}
+
 export interface LicenseStatusResponse {
   state: 'active' | 'grace_period' | 'locked';
   valid: boolean;
@@ -80,11 +90,7 @@ export interface LicenseStatusResponse {
   grace_ends_at?: string;
   expires_at?: string;
   enforcement_enabled: boolean;
-  /**
-   * Air-gapped deployment (AIRGAP_MODE on). Air-gap installs enforce a signed
-   * offline license but have no phone-home, so `enforcement_enabled` is false
-   * here; treat `airgap || enforcement_enabled` as "enforced" (NAN-1222).
-   */
+  /** Air-gapped deployment (AIRGAP_MODE on); recovery uses a signed C05 file. */
   airgap?: boolean;
   mode: 'hosted' | 'offline' | 'unconfigured';
   runtime_state?: 'running' | 'renewal_due' | 'grace' | 'shut_off' | 'refused' | 'legacy_upgrade_grace';
@@ -99,6 +105,20 @@ export interface LicenseStatusResponse {
   recovery_required: boolean;
   components: string[];
   notice?: string;
+  entitlement?: {
+    license_id: string;
+    edition: 'licensed';
+    operator: 'self-run' | 'hosted';
+    offering: 'self-run' | 'hosted';
+    kind: 'trial' | 'paid';
+    capacity_gb_per_day: number | null;
+    starts_at: string;
+    expires_at: string;
+    grace_ends_at: string;
+    revision: number;
+    days_remaining: number;
+    warning_days?: 14 | 7 | 1 | 0 | null;
+  };
 }
 
 export interface ClockRecoveryRequest {
@@ -294,8 +314,11 @@ class ApiClient {
       this.getAccessToken.bind(this),
       this.baseUrl
     );
-    this._logSources = new LogSourcesApi(this.request.bind(this));
-    this._sourceConfigs = new SourceConfigsApi(this.request.bind(this));
+    // NAN-5131: deploys outlast the default 60 s client timeout.
+    const longRequest = <T,>(endpoint: string, options: RequestInit, timeoutMs: number) =>
+      this.request<T>(endpoint, options, { timeoutMs });
+    this._logSources = new LogSourcesApi(this.request.bind(this), longRequest);
+    this._sourceConfigs = new SourceConfigsApi(this.request.bind(this), longRequest);
     this._sourceScopes = new SourceScopesApi(this.request.bind(this));
     this._accessControl = new AccessControlApi(this.request.bind(this));
     this._dashboards = new DashboardsApi(this.request.bind(this));
@@ -501,7 +524,7 @@ class ApiClient {
     const url = `${serviceUrl}${endpoint}`;
     const headers: HeadersInit = {
       'Content-Type': 'application/json',
-      // NAN-1595: refresh forces a live server recompute (bypasses Dragonfly).
+      // NAN-1595: refresh forces a live server recompute (bypasses Valkey).
       ...(cacheOpts?.bypass ? { 'x-nano-cache-bypass': '1' } : {}),
       ...options.headers,
     };
@@ -1212,6 +1235,13 @@ class ApiClient {
 
   async validateAiProvider(provider: string): Promise<{ success: boolean; message: string }> {
     return this._melod.validateAiProvider(provider);
+  }
+
+  async discoverProviderModels(
+    provider: string,
+    request?: import('./types').DiscoverModelsRequest,
+  ): Promise<import('./types').DiscoverModelsResponse> {
+    return this._melod.discoverProviderModels(provider, request);
   }
 
   // Agent Model Configuration
@@ -1993,6 +2023,14 @@ class ApiClient {
     return this._accessControl.updateApiKey(id, request);
   }
 
+  async getApiKeyOwnerClamp(): Promise<import('./types').ApiKeyOwnerClampSettings> {
+    return this._accessControl.getApiKeyOwnerClamp();
+  }
+
+  async setApiKeyOwnerClamp(mode: import('./types').ApiKeyOwnerClampMode): Promise<import('./types').ApiKeyOwnerClampSettings> {
+    return this._accessControl.setApiKeyOwnerClamp(mode);
+  }
+
   async resetApiKey(id: string): Promise<import('./types').ApiKeyCreatedResponse> {
     return this._accessControl.resetApiKey(id);
   }
@@ -2688,6 +2726,11 @@ class ApiClient {
   // License status
   async getLicenseStatus(): Promise<LicenseStatusResponse> {
     return this.request('/api/license');
+  }
+
+  // NAN-5114: whether a newer nano release is available (last licence check-in)
+  async getUpdateStatus(): Promise<UpdateStatusResponse> {
+    return this.request('/api/license/update');
   }
 
   async importOfflineLicense(file: File, renewal: boolean): Promise<LicenseStatusResponse> {

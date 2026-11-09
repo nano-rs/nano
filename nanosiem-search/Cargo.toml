@@ -42,7 +42,7 @@ metrics-exporter-prometheus.workspace = true
 utoipa.workspace = true
 utoipa-swagger-ui.workspace = true
 
-# Search result cache (Dragonfly/Redis)
+# Search result cache (Valkey/Redis)
 redis = { version = "1.2", features = ["tokio-comp", "connection-manager"] }
 sha2 = "0.11"
 hex = "0.4"

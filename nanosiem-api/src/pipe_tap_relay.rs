@@ -10,6 +10,16 @@
 //! verdict requires Vector's own loopback health API, a fresh consumer marker,
 //! its acknowledged generation and a valid installed token document.
 //!
+//! NAN-5134: a host that is installing a NEW generation is still ready. While
+//! the consumer waits for Vector's ack, `current` names the candidate (recorded
+//! in `.nano-installing`) and Vector keeps serving the acknowledged topology,
+//! so the readiness verdict accepts that pointer. Before this, every ingest
+//! host reported 503 for the whole install window at the same time.
+//!
+//! NAN-5133: `GET /v1/generation` (same bearer token as `/v1/tap`) reports this
+//! host's installed, installing and last-failed generation so nano-api can
+//! grade a role-split deploy by the ingest hosts' own acknowledgement.
+//!
 //! `POST /v1/tap` uses
 //! `Authorization: Bearer $NANO_VECTOR_TAP_TOKEN` and a [`TapRequest`] naming
 //! one exact component. It captures at most the requested events for at most
@@ -119,10 +129,7 @@ fn installed_files_are_ready(readiness: &Readiness) -> bool {
             .join("generations")
             .join(generation)
             .is_dir()
-        || std::fs::read_link(readiness.runtime_dir.join("current"))
-            .ok()
-            .as_deref()
-            != Some(std::path::Path::new(&format!("generations/{generation}")))
+        || !pointer_is_installed_or_installing(&readiness.runtime_dir, generation)
     {
         return false;
     }
@@ -136,6 +143,87 @@ fn installed_files_are_ready(readiness: &Readiness) -> bool {
         && tokens
             .get("tokens")
             .is_some_and(serde_json::Value::is_array)
+}
+
+/// `current` must name the acknowledged generation, or the candidate the
+/// consumer is installing right now (NAN-5134). Vector keeps the acknowledged
+/// topology running until a reload succeeds, so both mean "accepts events".
+fn pointer_is_installed_or_installing(runtime_dir: &std::path::Path, installed: &str) -> bool {
+    let Ok(pointer) = std::fs::read_link(runtime_dir.join("current")) else {
+        return false;
+    };
+    if pointer == std::path::Path::new(&format!("generations/{installed}")) {
+        return true;
+    }
+    let Some(installing) = read_generation_file(&runtime_dir.join(".nano-installing")) else {
+        return false;
+    };
+    pointer == std::path::Path::new(&format!("generations/{installing}"))
+        && runtime_dir.join("generations").join(&installing).is_dir()
+}
+
+/// First whitespace token of a marker file, when it is a positive 20-digit
+/// generation directory name.
+fn read_generation_file(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let token = text.split_whitespace().next()?;
+    (token.len() == 20
+        && token.bytes().all(|byte| byte.is_ascii_digit())
+        && !token.bytes().all(|byte| byte == b'0'))
+    .then(|| token.to_string())
+}
+
+/// This host's generation state for nano-api's role-split deploy grading.
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct GenerationStatus {
+    /// Generation Vector acknowledged (0 = bootstrap / none).
+    pub installed: u64,
+    /// Candidate the consumer is installing right now.
+    pub installing: Option<u64>,
+    /// Last generation this host refused, saw rejected, or rolled back.
+    pub failed: Option<u64>,
+    /// Why `failed` failed: `refused`, `rejected` or `unacknowledged`.
+    pub failed_reason: Option<String>,
+}
+
+fn generation_status(runtime_dir: &std::path::Path) -> GenerationStatus {
+    let as_number = |value: Option<String>| value.and_then(|v| v.parse::<u64>().ok());
+    let installed = as_number(read_generation_file(&runtime_dir.join(".nano-generation"))).unwrap_or(0);
+    let installing = as_number(read_generation_file(&runtime_dir.join(".nano-installing")));
+    let failed_text = std::fs::read_to_string(runtime_dir.join(".nano-failed-generation")).unwrap_or_default();
+    let mut failed_fields = failed_text.split_whitespace();
+    let failed = failed_fields
+        .next()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0);
+    let failed_reason = failed
+        .and(failed_fields.next())
+        .filter(|reason| matches!(*reason, "refused" | "rejected" | "unacknowledged"))
+        .map(str::to_string);
+    GenerationStatus {
+        installed,
+        installing,
+        failed,
+        failed_reason,
+    }
+}
+
+async fn generation(
+    State(relay): State<Relay>,
+    headers: HeaderMap,
+) -> Result<Json<GenerationStatus>, (StatusCode, String)> {
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if !tap::token_matches(&relay.token, presented) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
+    }
+    let Some(readiness) = &relay.readiness else {
+        return Err((StatusCode::NOT_FOUND, "no runtime directory".into()));
+    };
+    Ok(Json(generation_status(&readiness.runtime_dir)))
 }
 
 async fn readiness(State(relay): State<Relay>) -> Result<&'static str, StatusCode> {
@@ -161,6 +249,7 @@ async fn readiness(State(relay): State<Relay>) -> Result<&'static str, StatusCod
 fn build_router(token: &str, vector_api: &str, readiness_config: Option<Readiness>) -> Router {
     Router::new()
         .route("/v1/tap", post(handle))
+        .route("/v1/generation", get(generation))
         .route("/health", get(|| async { "ok" }))
         .route("/healthz", get(readiness))
         .with_state(Relay {
@@ -264,6 +353,89 @@ mod readiness_tests {
         assert!(installed_files_are_ready(&config));
         std::fs::write(&ready, format!("{generation} {}\n", now - 30)).unwrap();
         assert!(!installed_files_are_ready(&config));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "nano-vector-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// NAN-5134: mid-install the pointer names the candidate while Vector still
+    /// serves the acknowledged generation. That host is ready; an unrecorded
+    /// pointer move (or one to a missing directory) is not.
+    #[test]
+    fn readiness_holds_through_an_install_window() {
+        let root = scratch("install-window");
+        let runtime = root.join("runtime");
+        let dynamic = root.join("dynamic");
+        let installed = "00000000000000000042";
+        let candidate = "00000000000000000043";
+        std::fs::create_dir_all(runtime.join("generations").join(installed)).unwrap();
+        std::fs::create_dir_all(runtime.join("generations").join(candidate)).unwrap();
+        std::fs::create_dir_all(&dynamic).unwrap();
+        std::fs::write(runtime.join(".nano-generation"), format!("{installed}\n")).unwrap();
+        symlink(format!("generations/{candidate}"), runtime.join("current")).unwrap();
+        let tokens = dynamic.join("tokens.json");
+        std::fs::write(&tokens, r#"{"version":1,"tokens":[]}"#).unwrap();
+        let ready = runtime.join(".nano-ready");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(&ready, format!("{installed} {now}\n")).unwrap();
+        let config = Readiness {
+            runtime_dir: runtime.clone(),
+            tokens_file: tokens,
+            ready_file: ready,
+            max_age: Duration::from_secs(15),
+        };
+        // Pointer moved with no install recorded: not ready (unknown state).
+        assert!(!installed_files_are_ready(&config));
+        // Install recorded: ready, Vector still serves generation 42.
+        std::fs::write(runtime.join(".nano-installing"), format!("{candidate}\n")).unwrap();
+        assert!(installed_files_are_ready(&config));
+        // Candidate directory gone (rolled back and pruned): not ready.
+        std::fs::remove_dir_all(runtime.join("generations").join(candidate)).unwrap();
+        assert!(!installed_files_are_ready(&config));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generation_status_reports_installed_installing_and_failed() {
+        let root = scratch("generation-status");
+        assert_eq!(
+            generation_status(&root),
+            GenerationStatus {
+                installed: 0,
+                installing: None,
+                failed: None,
+                failed_reason: None
+            }
+        );
+        std::fs::write(root.join(".nano-generation"), "00000000000000000007\n").unwrap();
+        std::fs::write(root.join(".nano-installing"), "00000000000000000008\n").unwrap();
+        std::fs::write(root.join(".nano-failed-generation"), "8 rejected\n").unwrap();
+        assert_eq!(
+            generation_status(&root),
+            GenerationStatus {
+                installed: 7,
+                installing: Some(8),
+                failed: Some(8),
+                failed_reason: Some("rejected".into())
+            }
+        );
+        // The bootstrap marker is "nothing installed", never generation 0 acked.
+        std::fs::write(root.join(".nano-generation"), "00000000000000000000\n").unwrap();
+        assert_eq!(generation_status(&root).installed, 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -386,7 +386,11 @@ pub struct UpdateDetectionRule {
     pub realtime_enabled: Option<bool>,
     /// Detection execution mode (real-time or scheduled)
     pub detection_mode: Option<DetectionMode>,
-    /// Materialized view name for real-time rules (auto-generated)
+    /// Materialized view name for real-time rules. Server-managed: always
+    /// derived from the rule id. Ignored when sent by a client (security review
+    /// 2026-11-08, NAN-5018); only server code sets it.
+    #[serde(skip_deserializing)]
+    #[schema(read_only)]
     pub materialized_view_name: Option<Option<String>>,
     /// Base risk score (0-100), defaults based on severity if not set
     pub risk_score: Option<i32>,
@@ -464,6 +468,9 @@ pub enum FieldValidationError {
     InvalidCaseVisibility(String),
     /// case_visibility is "group" but no group_ids provided
     GroupVisibilityWithoutGroups,
+    /// case_visibility "group" / case_group_ids sent to the open edition,
+    /// which has no case groups (cases are enterprise-only)
+    CaseGroupsRequireEnterprise,
     /// lookback_minutes is out of valid range (must be 1-10080, i.e., 1 minute to 7 days)
     LookbackMinutesOutOfBounds(i32),
     /// folder has an invalid value
@@ -532,6 +539,12 @@ impl std::fmt::Display for FieldValidationError {
                 write!(
                     f,
                     "case_visibility is 'group' but no case_group_ids provided"
+                )
+            }
+            FieldValidationError::CaseGroupsRequireEnterprise => {
+                write!(
+                    f,
+                    "case_visibility 'group' and case_group_ids require the enterprise edition"
                 )
             }
             FieldValidationError::LookbackMinutesOutOfBounds(minutes) => {
@@ -643,6 +656,15 @@ impl NewDetectionRule {
     ///
     /// Returns Ok(()) if all fields are valid, or an error describing the validation failure.
     pub fn validate_fields(&self) -> Result<(), FieldValidationError> {
+        // The open edition has no case groups: refuse rather than silently
+        // dropping the group associations (NAN-5056).
+        #[cfg(not(feature = "enterprise"))]
+        if self.case_visibility.as_deref() == Some("group")
+            || self.case_group_ids.as_ref().is_some_and(|ids| !ids.is_empty())
+        {
+            return Err(FieldValidationError::CaseGroupsRequireEnterprise);
+        }
+
         // Validate case_visibility enum
         if let Some(ref visibility) = self.case_visibility {
             if !VALID_CASE_VISIBILITIES.contains(&visibility.as_str()) {
@@ -766,6 +788,15 @@ impl UpdateDetectionRule {
     ///
     /// Returns Ok(()) if all fields are valid, or an error describing the validation failure.
     pub fn validate_fields(&self) -> Result<(), FieldValidationError> {
+        // The open edition has no case groups: refuse rather than silently
+        // dropping the group associations (NAN-5056).
+        #[cfg(not(feature = "enterprise"))]
+        if self.case_visibility.as_deref() == Some("group")
+            || self.case_group_ids.as_ref().is_some_and(|ids| !ids.is_empty())
+        {
+            return Err(FieldValidationError::CaseGroupsRequireEnterprise);
+        }
+
         // Validate case_visibility enum
         if let Some(ref visibility) = self.case_visibility {
             if !VALID_CASE_VISIBILITIES.contains(&visibility.as_str()) {
@@ -867,6 +898,10 @@ pub struct UpdateRuleCasePermissionsRequest {
     /// Group to assign cases to (queue routing). Overrides system default.
     pub case_assigned_group: Option<Uuid>,
 }
+
+#[cfg(all(test, not(feature = "enterprise")))]
+#[path = "detection_rule_open_edition_tests.rs"]
+mod open_edition_tests;
 
 #[cfg(test)]
 mod tests {

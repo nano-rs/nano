@@ -505,6 +505,7 @@ impl OidcService {
             .build_pinned_client(
                 &discovery_url,
                 Client::builder().redirect(crate::inputlookup::restricted_redirect_policy()),
+                crate::inputlookup::ProxyPolicy::Environment,
             )
             .await
             .map_err(|e| {
@@ -548,6 +549,7 @@ impl OidcService {
             .build_pinned_client(
                 jwks_uri,
                 Client::builder().redirect(crate::inputlookup::restricted_redirect_policy()),
+                crate::inputlookup::ProxyPolicy::Environment,
             )
             .await
             .map_err(|e| {
@@ -840,6 +842,7 @@ impl OidcService {
             .build_pinned_client(
                 token_endpoint,
                 Client::builder().redirect(crate::inputlookup::restricted_redirect_policy()),
+                crate::inputlookup::ProxyPolicy::Environment,
             )
             .await
             .map_err(|e| {
@@ -1090,6 +1093,25 @@ impl OidcService {
         }
         let newly_created = existing.is_none();
         let user = if let Some(existing) = existing {
+            if !linked {
+                // NAN-5027: first SSO link of an existing account. A local
+                // password set by whoever created the row (e.g. a delegated
+                // `users:create` holder) must not survive into an account the
+                // IdP may now map to privileged groups — that would be a local
+                // side door around the IdP and its MFA. Drop it (unless an
+                // administrator set the audited break-glass flag beforehand)
+                // and revoke everything issued to the row before the link.
+                if !existing.local_login_break_glass {
+                    sqlx::query("UPDATE users SET password_hash = NULL WHERE id = $1")
+                        .bind(existing.id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|_| failed())?;
+                }
+                crate::auth::repository::revoke_credentials_in(&mut *tx, existing.id)
+                    .await
+                    .map_err(|_| failed())?;
+            }
             sqlx::query_as::<_, User>(
                 "UPDATE users SET oidc_provider_id=$2, oidc_subject=$3, last_login_at=NOW(), \
                  last_oidc_groups=$4, updated_at=NOW() WHERE id=$1 RETURNING *",
@@ -1241,14 +1263,7 @@ async fn reconcile_groups(
     .map_err(|_| failed())?
     .rows_affected();
     if removed > 0 {
-        sqlx::query("UPDATE users SET tokens_valid_from=clock_timestamp() WHERE id=$1")
-            .bind(user_id)
-            .execute(&mut **tx)
-            .await
-            .map_err(|_| failed())?;
-        sqlx::query("DELETE FROM sessions WHERE user_id=$1")
-            .bind(user_id)
-            .execute(&mut **tx)
+        crate::auth::repository::revoke_credentials_in(&mut **tx, user_id)
             .await
             .map_err(|_| failed())?;
     }
@@ -1292,14 +1307,7 @@ pub(crate) async fn revoke_unmapped_sso_grants(
         .await?
         .rows_affected();
         if removed > 0 {
-            sqlx::query("UPDATE users SET tokens_valid_from=clock_timestamp() WHERE id=$1")
-                .bind(user_id)
-                .execute(&mut **tx)
-                .await?;
-            sqlx::query("DELETE FROM sessions WHERE user_id=$1")
-                .bind(user_id)
-                .execute(&mut **tx)
-                .await?;
+            crate::auth::repository::revoke_credentials_in(&mut **tx, user_id).await?;
             affected.push(user_id);
         }
     }

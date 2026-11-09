@@ -123,7 +123,7 @@ impl SearchService {
             server_wall_ms: None,
             queue_wait_ms: None,
             fields,
-            generated_sql: Some(sql.to_string()),
+            generated_sql: Some(crate::search::display_sql::DisplaySql::user_authored(sql)),
             histogram,
             warnings: None,
             cost_score: None,

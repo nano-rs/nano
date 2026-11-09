@@ -294,14 +294,20 @@ impl SearchService {
     /// Returns `Ok(cte_string)` where cte_string is `"cloud_base AS (SELECT ...)"`,
     /// or `Err(SearchError)` if SQL generation fails.
     ///
-    /// `scope` (NAN-1797/NAN-1799) gates ONLY the parse-failure fallback scan:
-    /// the generated path derives from the nPL text, which the scoped search
-    /// entry point has already run through `enforce_source_scope` — the
-    /// injected exclusion lands inside the generated SQL, and it is never
-    /// re-gated here (no double gating). The fallback is a hand-built
-    /// `SELECT * FROM logs` that bypasses the text injection entirely, so the
-    /// deny-set predicate is ANDed in directly. Empty deny set → byte-identical
+    /// `scope` gates BOTH branches, here, by construction (NAN-5021):
+    ///
+    /// - the text parses → it is gated at the AST ([`ScopedQuery`]) and the
+    ///   SQL is generated from the gated tree. A query whose gate cannot be
+    ///   proven is an error, never an unscoped scan.
+    /// - the text does not parse → the hand-built fallback scan with the
+    ///   deny-set predicate ANDed in directly (NAN-1797).
+    ///
+    /// Callers pass the CLIENT's text. They used to pre-enforce it and fall
+    /// back to the raw text on any enforcement error, which turned every
+    /// NAN-2006 refusal into an unscoped query. Empty deny set → byte-identical
     /// SQL.
+    ///
+    /// [`ScopedQuery`]: crate::search::query_processing::ScopedQuery
     fn build_cloud_base_cte(
         &self,
         query_str: &str,
@@ -309,13 +315,20 @@ impl SearchService {
         scope: &ScopeSet,
     ) -> Result<String, SearchError> {
         let base_sql = match parse_query(query_str) {
-            Ok(query) => match self.ch_sql_generator.generate(&query, time_range) {
-                Ok(sql) => sql,
-                Err(e) => {
-                    tracing::warn!("Cloud CTE SQL gen failed: {}", e);
-                    return Err(SearchError::SqlGenError(e.to_string()));
+            Ok(_) => {
+                // Gate at the AST. A gate that cannot be proven fails closed.
+                let scoped = crate::search::query_processing::ScopedQuery::parse(
+                    query_str,
+                    scope.deny_set(),
+                )?;
+                match self.ch_sql_generator.generate(scoped.query(), time_range) {
+                    Ok(sql) => sql,
+                    Err(e) => {
+                        tracing::warn!("Cloud CTE SQL gen failed: {}", e);
+                        return Err(SearchError::SqlGenError(e.to_string()));
+                    }
                 }
-            },
+            }
             Err(_) => {
                 // Fallback: just use time range filter (NAN-1797: with the
                 // caller's source-scope gate ANDed in — this scan does not go
@@ -890,19 +903,17 @@ impl SearchService {
         };
 
         // Build base CTE using shared helper.
-        // NAN-1801: the nPL text is echoed back BY THE CLIENT, so the exclusion
-        // the scoped `| cloud` search injected cannot be trusted to still be
-        // present — a scoped caller could strip it. Re-run the injection here
-        // with the caller's real scope (idempotent for honest frontends: the
-        // duplicate predicate is semantically identical, and an empty deny set
-        // returns the text verbatim). If the text doesn't parse, pass it
-        // through unchanged: `build_cloud_base_cte`'s parse-failure fallback
-        // scan is gated by the same scope directly.
-        let enforced_query =
-            crate::search::query_processing::enforce_source_scope(query_str, scope.deny_set())
-                .unwrap_or_else(|_| query_str.to_string());
-        let base_cte = match self.build_cloud_base_cte(&enforced_query, time_range, scope) {
+        // NAN-1801 / NAN-5021: the nPL text is echoed back BY THE CLIENT, so the
+        // exclusion the scoped `| cloud` search injected cannot be trusted to
+        // still be present. `build_cloud_base_cte` gates the client's text
+        // itself under the caller's real scope, on both its branches; an
+        // enforcement error is an error here, never the raw text.
+        let base_cte = match self.build_cloud_base_cte(query_str, time_range, scope) {
             Ok(cte) => cte,
+            // NAN-5021: a query whose source-scope gate cannot be proven is
+            // refused (400), not answered with an empty page that reads as
+            // "no events".
+            Err(e @ SearchError::SqlValidationError(_)) => return Err(e),
             Err(e) => {
                 tracing::warn!("Cloud paginated CTE build failed: {}", e);
                 return Ok((Vec::new(), 0, CloudFacets::default(), None, None));
@@ -1397,10 +1408,8 @@ impl SearchService {
         // NAN-1801: client-echoed nPL — re-run the scope injection with the
         // caller's real scope (see query_cloud_events_paginated for rationale).
         // Unparseable text falls through to the scope-gated fallback scan.
-        let enforced_query =
-            crate::search::query_processing::enforce_source_scope(query_str, scope.deny_set())
-                .unwrap_or_else(|_| query_str.to_string());
-        let base_cte = self.build_cloud_base_cte(&enforced_query, time_range, scope)?;
+        // NAN-5021: gated inside `build_cloud_base_cte` (both branches).
+        let base_cte = self.build_cloud_base_cte(query_str, time_range, scope)?;
         let user_bind = user.to_string();
         let profile = self.active_profile.as_ref();
 
@@ -1630,10 +1639,8 @@ impl SearchService {
         // NAN-1801: client-echoed nPL — re-run the scope injection with the
         // caller's real scope (see query_cloud_events_paginated for rationale).
         // Unparseable text falls through to the scope-gated fallback scan.
-        let enforced_query =
-            crate::search::query_processing::enforce_source_scope(query_str, scope.deny_set())
-                .unwrap_or_else(|_| query_str.to_string());
-        let base_cte = self.build_cloud_base_cte(&enforced_query, time_range, scope)?;
+        // NAN-5021: gated inside `build_cloud_base_cte` (both branches).
+        let base_cte = self.build_cloud_base_cte(query_str, time_range, scope)?;
         let entity_val = entity_value.to_string();
         let profile = self.active_profile.as_ref();
 
@@ -2060,3 +2067,7 @@ mod source_scope_tests {
 #[cfg(test)]
 #[path = "cloud_user_activity_scope_tests.rs"]
 mod cloud_user_activity_scope_tests;
+
+#[cfg(test)]
+#[path = "cloud_scope_construction_tests.rs"]
+mod cloud_scope_construction_tests;

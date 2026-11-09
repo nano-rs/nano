@@ -248,7 +248,16 @@ async fn realtime_grouped_dedups_per_entity_window_per_event_unchanged() {
     // `entity_finding_count`).
 
     // ---- DualPool: scratch PG + the LIVE local ClickHouse ----
-    let config = DualPoolConfig::with_auth(scratch_url.clone(), CH_URL, "nanosiem", "default", "");
+    // The admin identity, not `default`: nano's users.d keeps the passwordless
+    // `default` user container-local, so it cannot log in through the
+    // published port.
+    let config = DualPoolConfig::with_auth(
+        scratch_url.clone(),
+        CH_URL,
+        "nanosiem",
+        std::env::var("CLICKHOUSE_ADMIN_USER").unwrap_or_else(|_| "nanosiem_admin".into()),
+        std::env::var("CLICKHOUSE_ADMIN_PASSWORD").unwrap_or_default(),
+    );
     let dual_pool = DualPool::new(&config).await.expect("dual pool");
 
     // Start the watermark at NOW so the processor only drains signals this test

@@ -730,6 +730,7 @@ impl SearchService {
                         *limit,
                         *useother,
                         *cont,
+                        scope,
                     )
                     .await;
             }
@@ -1134,6 +1135,7 @@ impl SearchService {
                     offset,
                     start_time,
                     &auto_sort_decision,
+                    scope,
                 )
                 .await;
         }
@@ -2008,7 +2010,8 @@ impl SearchService {
             queue_wait_ms: None,
             fields,
             generated_sql: if request.include_sql.unwrap_or(false) {
-                Some(sql)
+                // NAN-5043: never echo the caller's deny list.
+                Some(crate::search::display_sql::DisplaySql::for_scope(sql, scope))
             } else {
                 None
             },

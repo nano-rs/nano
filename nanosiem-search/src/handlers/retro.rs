@@ -57,7 +57,7 @@ pub async fn retro(
     let scope = super::search::effective_scope(&auth);
 
     // NAN-1593: dedupe page refreshes / shared-link follows through the same
-    // Dragonfly cache regular search uses. Without this, every load re-ran the
+    // Valkey cache regular search uses. Without this, every load re-ran the
     // full environment-wide rollup (multi-second UNION scans + host denominator).
     // NAN-1595: skip the read on an explicit refresh (CacheBypass), and stamp
     // x-nano-cache hit/age so the UI can show "cached Ns ago · refresh".

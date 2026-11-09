@@ -31,7 +31,7 @@ Anything after `--` goes to pytest.
 
 1. It creates the compose project `nanoe2e-<runid>` (`runid` = `<user>-<8 hex>`)
    from `docker-compose.opensource.yml` plus `dev/e2e/compose.e2e.yml`. The
-   stack runs PostgreSQL 17, ClickHouse 26.10 (single node), Dragonfly and the
+   stack runs PostgreSQL 17, ClickHouse 26.10 (single node), Valkey and the
    Vector 0.61 fork. Every port is an ephemeral `127.0.0.1` port. Containers
    are named `nanoe2e-<runid>-*`. It never touches `nanoch-*` or any other
    project.
@@ -116,7 +116,7 @@ behaves the same way in native and docker mode. Scenarios call it through
 | ui: search URLs (NAN-4927) | a legacy `?q=` link migrates the hunt into the fragment and a reload never sends it in a page URL; a relative range stays relative through run and reload; `view=rarity` opens rarity; hunt in API GET query strings is an xfail finding | runs (ocsf) |
 | ui: Nano Pipe (NAN-4919) | Add step > Filter, Save draft (nano-pipe-v2 plan in the API), paste sample + Run preview == `/pipe-preview`, publish twice, History > Rollback == versions API | runs (`NANO_PIPE_PREVIEW_ENABLED`) |
 | ui: audit (NAN-4930) | API-key actor label == audit API; Action filter round-trips the URL; Export CSV == rows on screen, every cell quoted, a formula-shaped name neutralized | runs |
-| ui: SSO (NAN-4930) | login shows no SSO without providers; open build says the deployment lacks SSO; enterprise: hobby plan withholds it (providers API `[]`), unrestricted mounts the provider page | runs |
+| ui: SSO (v2 entitlements) | login shows no SSO without providers; open build says the deployment lacks SSO; enterprise: every licensed capacity mounts the provider page, including retired tier inputs normalized to `licensed` | runs |
 | ui: lookups (NAN-4924) | delete of a table a rule uses is refused naming the rule; Replace data swaps schema and rows (rows API + table page); delete succeeds once the rule is gone | runs |
 | ui: IPinfo bundle-only (NAN-4959) | catalog entry has no credential field and the configure API refuses a BYO `download_url` (422); retired IPinfo configure / sync / auto-sync endpoints 404; the IPinfo Lite inventory drawer and the connection drawer Config tab show the bundle status (revision == platform feed status, last update, next refresh) with no inputs and no Configure / Uninstall | runs |
 | ui: edition affordances | open: every enterprise route shows the entitlement panel or redirects (5 answer "Access Denied": xfail finding), every rail link opens a page, no uncaught page errors; enterprise: none of those routes serves the open placeholder | runs |

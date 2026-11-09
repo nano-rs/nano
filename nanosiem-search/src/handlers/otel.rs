@@ -104,7 +104,7 @@ pub async fn get_trace(
     let start = Instant::now();
 
     // NAN-1593: the trace waterfall re-fetches on every load / shared-link
-    // follow — cache it through the same Dragonfly layer as the main search.
+    // follow — cache it through the same Valkey layer as the main search.
     // NAN-1801 (resolved in P3): otel_spans has no source_type, so this read is
     // out of the per-source scope's reach by design — the unrestricted key is
     // correct, not a gap (see module doc).
@@ -316,7 +316,7 @@ pub async fn get_metric_timeseries(
     };
 
     // NAN-1593: metric panels re-query on every dashboard render / shared-link
-    // follow — cache through the same Dragonfly layer. Keyed on the metric name,
+    // follow — cache through the same Valkey layer. Keyed on the metric name,
     // service, time range, bucket width, canonical aggregate, group_by, and the
     // exact filter set (all of which change the series output). The filter set is
     // JSON-encoded as ordered (key, value) pairs — `MetricTagFilter` isn't
@@ -461,7 +461,7 @@ pub async fn list_metric_tags(
     let time_range = resolve_window(params.start, params.end, params.window_hours)?;
 
     // NAN-1593: the group-by / filter-value pickers re-fetch on every metrics
-    // explorer load — cache through the same Dragonfly layer. Keyed on the
+    // explorer load — cache through the same Valkey layer. Keyed on the
     // metric name, the optional tag key, and the resolved window.
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "mtags",
@@ -638,7 +638,7 @@ pub async fn list_traces(
     };
 
     // NAN-1593: the Traces explorer list re-fetches on every load / paging /
-    // shared-link follow — cache through the same Dragonfly layer. Keyed on the
+    // shared-link follow — cache through the same Valkey layer. Keyed on the
     // resolved window plus every filter + the keyset cursor that shapes the page.
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "traces",
@@ -772,7 +772,7 @@ pub async fn list_metric_names(
     let window_key = window_hours.to_string();
 
     // NAN-1593: the metrics-explorer dropdown re-fetches on every load — cache
-    // through the same Dragonfly layer. Keyed on the service filter + window.
+    // through the same Valkey layer. Keyed on the service filter + window.
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "mnames",
         &[service.unwrap_or("").as_bytes(), window_key.as_bytes()],
@@ -978,7 +978,7 @@ pub async fn list_services(
     };
 
     // NAN-1593: the Services tab re-fetches on every console load / filter /
-    // paging — cache through the same Dragonfly layer. Keyed on the resolved
+    // paging — cache through the same Valkey layer. Keyed on the resolved
     // window, bucket width, and every filter/sort/paging param.
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "svcs",
@@ -1123,7 +1123,7 @@ pub async fn get_service_detail(
     let step = step_for_window(&time_range);
 
     // NAN-1593: the service-detail drill-in re-fetches on every open / shared-link
-    // follow — cache through the same Dragonfly layer. Keyed on the service name,
+    // follow — cache through the same Valkey layer. Keyed on the service name,
     // resolved window, bucket width, and exemplar sample cap.
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "svcdetail",
@@ -1275,7 +1275,7 @@ pub async fn list_infra_hosts(
     };
 
     // NAN-1593: the Infra tab re-fetches on every console load / filter / paging
-    // — cache through the same Dragonfly layer. Keyed on the resolved window plus
+    // — cache through the same Valkey layer. Keyed on the resolved window plus
     // every filter/status/paging param.
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "infra",
@@ -1407,7 +1407,7 @@ pub async fn get_rum_summary(
     };
 
     // NAN-1593: the RUM tab re-fetches on every console load / filter / shared-link
-    // follow — cache through the same Dragonfly layer. Keyed on the resolved
+    // follow — cache through the same Valkey layer. Keyed on the resolved
     // window, bucket width, and every filter param.
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "rum",

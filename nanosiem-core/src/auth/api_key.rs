@@ -87,7 +87,78 @@ pub enum ApiKeyServiceError {
 
     #[error("Invalid API key format")]
     InvalidFormat,
+
+    /// The owner's current permissions could not be resolved, so the key's
+    /// effective permissions are unknown. Fail closed (callers answer 503).
+    #[error("API key owner permissions are temporarily unavailable")]
+    OwnerPermissionsUnavailable,
 }
+
+/// How a human-owned API key's stored permissions are reconciled with what its
+/// owner holds NOW (NAN-5044).
+///
+/// `Enforce` (default): effective = stored ∩ owner's current permissions.
+/// `Audit`: the stored set is used unchanged, and every permission the clamp
+/// would withhold is logged. `Audit` is a ONE-RELEASE escape hatch for an
+/// automation outage after the v2.0.1 upgrade; it is scheduled for removal.
+/// Privilege administration (`grant_authz`) always clamps, in either mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum OwnerClampMode {
+    Enforce,
+    Audit,
+}
+
+impl OwnerClampMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OwnerClampMode::Enforce => "enforce",
+            OwnerClampMode::Audit => "audit",
+        }
+    }
+
+    /// Unknown / missing values fail closed to `Enforce`.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some("audit") => OwnerClampMode::Audit,
+            _ => OwnerClampMode::Enforce,
+        }
+    }
+}
+
+/// The result of clamping a key's stored permissions to its owner (pure).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClampOutcome {
+    /// Permissions the request runs with.
+    pub effective: Vec<String>,
+    /// Stored permissions the owner no longer holds (sorted).
+    pub withheld: Vec<String>,
+}
+
+/// NAN-5044: effective = stored ∩ owner (pure). `withheld` is reported in both
+/// modes; `effective` keeps the stored set in `Audit`.
+pub fn clamp_to_owner(stored: &[String], owner: &[String], mode: OwnerClampMode) -> ClampOutcome {
+    let owner: std::collections::HashSet<&str> = owner.iter().map(String::as_str).collect();
+    let mut withheld: Vec<String> = stored
+        .iter()
+        .filter(|p| !owner.contains(p.as_str()))
+        .cloned()
+        .collect();
+    withheld.sort();
+    withheld.dedup();
+    let effective = match mode {
+        OwnerClampMode::Enforce => stored
+            .iter()
+            .filter(|p| owner.contains(p.as_str()))
+            .cloned()
+            .collect(),
+        OwnerClampMode::Audit => stored.to_vec(),
+    };
+    ClampOutcome { effective, withheld }
+}
+
+/// How long the clamp mode read from `system_settings` is reused.
+const CLAMP_MODE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Information about a validated API key
 #[derive(Debug, Clone)]
@@ -115,6 +186,13 @@ impl From<&ApiKey> for ApiKeyInfo {
 pub struct ApiKeyService {
     repo: ApiKeyRepository,
     rate_limit_repo: RateLimitRepository,
+    /// NAN-5044: resolves the owner's CURRENT permissions (generation-checked
+    /// cache shared with the JWT path). `None` only in minimal test wiring.
+    permission_resolver: Option<crate::auth::PermissionResolver>,
+    clamp_mode: std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, OwnerClampMode)>>>,
+    /// Last withheld set reported per key, so the warning + audit fire once
+    /// per change instead of on every request.
+    reported: std::sync::Arc<dashmap::DashMap<Uuid, Vec<String>>>,
 }
 
 impl ApiKeyService {
@@ -122,7 +200,123 @@ impl ApiKeyService {
         Self {
             repo,
             rate_limit_repo,
+            permission_resolver: None,
+            clamp_mode: Default::default(),
+            reported: Default::default(),
         }
+    }
+
+    /// Clamp every human-owned key to its owner's current permissions
+    /// (NAN-5044). Production wiring (api AND search) must call this.
+    pub fn with_permission_resolver(mut self, resolver: crate::auth::PermissionResolver) -> Self {
+        self.permission_resolver = Some(resolver);
+        self
+    }
+
+    /// The configured owner-clamp mode (30 s cache; errors fail closed to
+    /// `Enforce`).
+    pub async fn owner_clamp_mode(&self) -> OwnerClampMode {
+        if let Ok(guard) = self.clamp_mode.lock() {
+            if let Some((at, mode)) = *guard {
+                if at.elapsed() < CLAMP_MODE_TTL {
+                    return mode;
+                }
+            }
+        }
+        let mode = match self.repo.owner_clamp_mode_setting().await {
+            Ok(raw) => OwnerClampMode::parse(raw.as_deref()),
+            Err(e) => {
+                tracing::warn!(error = %e, "api-key owner clamp mode unreadable — enforcing");
+                OwnerClampMode::Enforce
+            }
+        };
+        if let Ok(mut guard) = self.clamp_mode.lock() {
+            *guard = Some((std::time::Instant::now(), mode));
+        }
+        mode
+    }
+
+    /// Persist the owner-clamp mode and drop the cached value.
+    pub async fn set_owner_clamp_mode(&self, mode: OwnerClampMode) -> Result<(), ApiKeyServiceError> {
+        self.repo.set_owner_clamp_mode_setting(mode.as_str()).await?;
+        if let Ok(mut guard) = self.clamp_mode.lock() {
+            *guard = None;
+        }
+        Ok(())
+    }
+
+    /// The permissions `key`'s owner withholds from it right now (NAN-5044) —
+    /// stored permissions the owner no longer holds. Empty for `system`-owned
+    /// and ownerless keys (nothing to clamp against) and when no resolver is
+    /// wired. Used by the key listing so the UI can show what is withheld.
+    pub async fn withheld_permissions(&self, key: &ApiKey) -> Result<Vec<String>, ApiKeyServiceError> {
+        let (Some(resolver), Some(owner_id)) = (&self.permission_resolver, key.created_by) else {
+            return Ok(Vec::new());
+        };
+        match self.repo.owner_status(owner_id).await? {
+            Some(status) if status == "active" => {}
+            _ => return Ok(Vec::new()),
+        }
+        let owner = resolver
+            .resolve_checked(owner_id)
+            .await
+            .map_err(|_| ApiKeyServiceError::OwnerPermissionsUnavailable)?;
+        Ok(clamp_to_owner(&key.permissions, &owner, OwnerClampMode::Enforce).withheld)
+    }
+
+    /// NAN-5044: reconcile a validated key's stored permissions with its owner.
+    async fn effective_permissions(
+        &self,
+        api_key: &ApiKey,
+        owner_status: Option<&str>,
+    ) -> Result<Vec<String>, ApiKeyServiceError> {
+        let Some(resolver) = &self.permission_resolver else {
+            return Ok(api_key.permissions.clone());
+        };
+        let Some(owner_id) = api_key.created_by else {
+            // Ownerless legacy key: nothing to clamp against. Audit-only in
+            // v2.0.1 (warn once); rejected from v2.1 unless reassigned.
+            if self.reported.insert(api_key.id, vec!["<ownerless>".to_string()]).is_none() {
+                tracing::warn!(
+                    api_key_id = %api_key.id,
+                    api_key_name = %api_key.name,
+                    metric = "api_key_ownerless_used",
+                    "ownerless legacy API key used; it will be rejected in v2.1 unless reassigned to an owner"
+                );
+            }
+            return Ok(api_key.permissions.clone());
+        };
+        if owner_status == Some("system") {
+            // Platform service account: no human to demote; stored set stands.
+            return Ok(api_key.permissions.clone());
+        }
+        let owner = resolver.resolve_checked(owner_id).await.map_err(|e| {
+            tracing::error!(api_key_id = %api_key.id, error = %e, "api-key owner permission resolution failed — failing closed");
+            ApiKeyServiceError::OwnerPermissionsUnavailable
+        })?;
+        let mode = self.owner_clamp_mode().await;
+        let outcome = clamp_to_owner(&api_key.permissions, &owner, mode);
+        let changed = self
+            .reported
+            .get(&api_key.id)
+            .map(|prev| *prev != outcome.withheld)
+            .unwrap_or(!outcome.withheld.is_empty());
+        if changed {
+            self.reported.insert(api_key.id, outcome.withheld.clone());
+            if !outcome.withheld.is_empty() {
+                tracing::warn!(
+                    api_key_id = %api_key.id,
+                    api_key_name = %api_key.name,
+                    owner_id = %owner_id,
+                    withheld = ?outcome.withheld,
+                    mode = mode.as_str(),
+                    metric = "api_key_permissions_clamped",
+                    "API key holds permissions its owner no longer holds; {}",
+                    if mode == OwnerClampMode::Enforce { "they are withheld" } else { "audit mode: NOT withheld" }
+                );
+            }
+        }
+        Ok(outcome.effective)
     }
 
     /// Generate a cryptographically secure API key
@@ -367,12 +561,20 @@ impl ApiKeyService {
                 // (users repo), so the two paths that previously produced orphaned
                 // NULL-owner keys are closed. Pre-existing legacy NULL-owner keys
                 // should be audited separately (see the red-team handoff note).
-                if let Some(owner_id) = api_key.created_by {
-                    match self.repo.owner_status(owner_id).await? {
-                        Some(status) if status == "active" || status == "system" => {}
+                let owner_status = match api_key.created_by {
+                    Some(owner_id) => match self.repo.owner_status(owner_id).await? {
+                        Some(status) if status == "active" || status == "system" => Some(status),
                         _ => return Err(ApiKeyServiceError::Disabled),
-                    }
-                }
+                    },
+                    None => None,
+                };
+
+                // NAN-5044: the key runs with stored ∩ the owner's CURRENT
+                // permissions, so demoting the owner demotes the key on the
+                // next request (generation-checked cache, every replica).
+                let effective = self
+                    .effective_permissions(&api_key, owner_status.as_deref())
+                    .await?;
 
                 // Atomic increment — every authed call consumes a token
                 // regardless of audit emission (NAN-675).
@@ -398,7 +600,9 @@ impl ApiKeyService {
                 // Record usage
                 let _ = self.repo.record_usage(api_key.id, ip_address).await;
 
-                return Ok(ApiKeyInfo::from(&api_key));
+                let mut info = ApiKeyInfo::from(&api_key);
+                info.permissions = effective;
+                return Ok(info);
             }
         }
 

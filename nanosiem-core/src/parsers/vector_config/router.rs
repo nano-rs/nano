@@ -381,15 +381,12 @@ pub(super) fn describe_collisions(collisions: &[SourceTypeCollision]) -> String 
 fn build_unclaimed_filter_condition(claimants: &[&Parser]) -> String {
     let mut values: Vec<String> = Vec::new();
     for parser in claimants {
-        if let Some(match_values) = &parser.match_values {
-            if !match_values.is_empty() {
-                values.extend(match_values.iter().cloned());
-                continue;
-            }
-        }
-        // No match_values configured → claim falls back to the parser name
-        // (same fallback `build_hec_filter_condition` uses).
-        values.push(parser.name.clone());
+        // NAN-5071 review: the one shared claim (match_values, else the
+        // parser's safe name) the parser filter and the router also use.
+        values.extend(crate::vector_naming::claim_keys(
+            parser.match_values.as_deref(),
+            &parser.name,
+        ));
     }
     values.sort();
     values.dedup();
@@ -401,24 +398,17 @@ fn build_unclaimed_filter_condition(claimants: &[&Parser]) -> String {
     format!("!includes([{}], to_string(.source_type) ?? \"\")", list)
 }
 
-/// Minimal VRL string escape — backslashes, quotes, and control characters.
-/// Duplicated from `sources::escape_vrl_string` (private) to keep the router
-/// module standalone; sub-50-char helper, not worth lifting yet.
+/// The `_unclaimed` filter condition for `claimants` (tests outside this
+/// module run it on the VRL runtime).
+#[cfg(test)]
+pub(super) fn build_unclaimed_filter_condition_for_tests(claimants: &[&Parser]) -> String {
+    build_unclaimed_filter_condition(claimants)
+}
+
+/// VRL string-literal escape; one implementation for every generator
+/// (`crate::parsers::vrl_safety::vrl_string_body`, NAN-5033).
 fn escape_vrl_string_for_router(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {
-                out.push_str(&format!("\\u{:04x}", c as u32))
-            }
-            _ => out.push(ch),
-        }
-    }
-    out
+    crate::parsers::vrl_safety::vrl_string_body(s)
 }
 
 /// NAN-930: shared between `router.rs::write_router_config` (active path)
@@ -1051,7 +1041,7 @@ impl VectorConfigManager {
         // Routes for deployed parsers (match_values, falling back to safe_name)
         // and the generic catch-all. Shared with the staged writer. BUILTIN_TYPES
         // is empty since NAN-1083, so it contributes no routes.
-        config.push_str(&Self::source_router_route_lines(&routed_parsers));
+        config.push_str(&Self::source_router_route_lines(&routed_parsers, parsers));
 
         // NAN-1124/NAN-5004: enrichment has its own acknowledged HTTP source and
         // therefore its own backpressure domain. Never reuse source_router's

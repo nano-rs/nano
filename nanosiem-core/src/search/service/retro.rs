@@ -478,7 +478,7 @@ impl SearchService {
         let offset = req.offset.unwrap_or(0);
         let limit = req.limit.unwrap_or(RETRO_PAGE_SIZE).clamp(1, 500);
 
-        match plan.submode {
+        let response = match plan.submode {
             RetroSubmode::Summary => {
                 self.retro_summary(&plan, &indicators, &range, total_hosts, scope_predicate)
                     .await
@@ -507,7 +507,13 @@ impl SearchService {
                 )
                 .await
             }
-        }
+        };
+        // NAN-5043: the rollup SQL is "always included for transparency", and
+        // it carries the caller's deny list — redact it for this caller.
+        response.map(|mut r| {
+            r.generated_sql = r.generated_sql.map(|s| s.redacted_for(scope));
+            r
+        })
     }
 
     /// Summary submode: a single indicator's environment-wide footprint.
@@ -577,7 +583,7 @@ impl SearchService {
             submode: RetroSubmode::Summary.as_str().to_string(),
             axis: plan.axis.as_str().to_string(),
             total_hosts,
-            generated_sql: Some(sql),
+            generated_sql: Some(crate::search::display_sql::DisplaySql::pending_redaction(sql)),
             indicator: Some(indicator),
             total_indicators: None,
             rows: None,
@@ -796,7 +802,7 @@ impl SearchService {
             submode: RetroSubmode::List.as_str().to_string(),
             axis: plan.axis.as_str().to_string(),
             total_hosts,
-            generated_sql: Some(sql),
+            generated_sql: Some(crate::search::display_sql::DisplaySql::pending_redaction(sql)),
             indicator: None,
             total_indicators: Some(indicators.len() as u64),
             rows: Some(rows),
@@ -895,7 +901,7 @@ impl SearchService {
             submode: RetroSubmode::Pivot.as_str().to_string(),
             axis: plan.axis.as_str().to_string(),
             total_hosts,
-            generated_sql: Some(sql),
+            generated_sql: Some(crate::search::display_sql::DisplaySql::pending_redaction(sql)),
             indicator: None,
             total_indicators: None,
             rows: None,

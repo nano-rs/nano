@@ -77,7 +77,7 @@ impl DataSourceCap {
             source_count as u32,
             self.max,
             self.tier,
-            "Upgrade to Starter for unlimited data sources.",
+            "Data source capacity has been reached.",
         )
     }
 }

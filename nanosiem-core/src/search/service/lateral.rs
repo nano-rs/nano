@@ -857,11 +857,7 @@ fn dedup_edges(edges: Vec<LateralEdge>) -> Vec<LateralEdge> {
 
     for edge in edges {
         // Truncate timestamp to minute for dedup
-        let ts_minute = if edge.timestamp.len() >= 16 {
-            &edge.timestamp[..16]
-        } else {
-            &edge.timestamp
-        };
+        let ts_minute = crate::text_bounds::prefix_at_most(&edge.timestamp, 16);
         // Use hostname if available, fall back to IP for dedup key. FQDN
         // gets stripped so chain events (`ws-sales-002.corp.local`) and
         // ambient events (`ws-sales-002`) dedupe against each other.

@@ -221,6 +221,11 @@ pub enum MaterializedViewError {
 
     #[error("View not found: {0}")]
     ViewNotFound(String),
+
+    /// A view name that is not a real-time rule view (`mv_rt_detection_<32 hex>`).
+    /// Raised before any DDL is sent (security review 2026-11-08, NAN-5018).
+    #[error("Refusing to drop '{0}': not a real-time rule view name")]
+    InvalidViewName(String),
 }
 
 /// Materialized View Generator
@@ -305,6 +310,25 @@ impl MaterializedViewGenerator {
     /// Deterministic view name used by durable reconciliation and delete cleanup.
     pub fn view_name_for_rule_id(rule_id: Uuid) -> String {
         format!("mv_rt_detection_{}", rule_id.to_string().replace('-', ""))
+    }
+
+    /// True only for names [`Self::view_name_for_rule_id`] can produce:
+    /// `mv_rt_detection_` followed by exactly 32 lowercase hex digits.
+    pub fn is_rule_view_name(name: &str) -> bool {
+        name.strip_prefix("mv_rt_detection_").is_some_and(|hex| {
+            hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+    }
+
+    /// `DROP VIEW IF EXISTS <name>[ ON CLUSTER …]` for a rule view, or
+    /// [`MaterializedViewError::InvalidViewName`]. The name is validated, never
+    /// trusted: it has been read from a client-writable column before (NAN-5018).
+    fn drop_view_ddl(view_name: &str, on_cluster: &str) -> Result<String, MaterializedViewError> {
+        if !Self::is_rule_view_name(view_name) {
+            return Err(MaterializedViewError::InvalidViewName(view_name.to_string()));
+        }
+        // sql-lint: allow(view_name validated by is_rule_view_name above)
+        Ok(format!("DROP VIEW IF EXISTS {view_name}{on_cluster}"))
     }
 
     /// Bare logs-table name the MV reads `FROM` for the active profile.
@@ -392,11 +416,11 @@ impl MaterializedViewGenerator {
         info!("Dropping materialized view {}", view_name);
 
         // Audit D8: drop ON CLUSTER too, or the view lingers on other nodes.
-        let ddl = format!(
-            "DROP VIEW IF EXISTS {}{}",
-            view_name,
-            Self::on_cluster_clause()
-        );
+        // Security review 2026-11-08 (NAN-5018): only rule view names reach DDL.
+        let ddl = Self::drop_view_ddl(view_name, &Self::on_cluster_clause()).map_err(|e| {
+            error!("Refusing to drop materialized view {:?}: {}", view_name, e);
+            e
+        })?;
 
         self.clickhouse_client
             .query(&ddl)
@@ -596,6 +620,7 @@ impl MaterializedViewGenerator {
         // supervised regeneration rollout — nothing here triggers one.
         let on_cluster = Self::on_cluster_clause();
         let ddl = format!(
+            // sql-lint: allow(view name derived from the rule id)
             r#"CREATE MATERIALIZED VIEW {}{} TO signals AS
 SELECT
     generateUUIDv4() AS id,
@@ -1342,3 +1367,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "materialized_view_name_tests.rs"]
+mod view_name_tests;

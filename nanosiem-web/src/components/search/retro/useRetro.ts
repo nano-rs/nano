@@ -14,7 +14,7 @@
  * pivoting is instant. The cache is module-level (not React state) on purpose:
  * the view switcher pivots by rewriting the `| retro` query and re-running the
  * whole search, which unmounts + remounts RetroView — component state wouldn't
- * survive that, but this cache (and the warmed Dragonfly entry behind it) does.
+ * survive that, but this cache (and the warmed Valkey entry behind it) does.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';

@@ -75,6 +75,8 @@ impl From<sqlx::Error> for VersionManagerError {
     }
 }
 
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 fn tuning_log_is_revertible(status: &str, already_reverted: bool, proposal_type: &str) -> bool {
     proposal_type == "query_tuning"
         && !already_reverted
@@ -454,6 +456,7 @@ impl RuleVersionManager {
     /// preceding the version applied by that log. This check runs again under
     /// the commit transaction; the preflight lets handlers reject a bad target
     /// before doing any external runtime work.
+    #[cfg(feature = "enterprise")]
     pub async fn plan_tuning_revert(
         &self,
         rule_id: Uuid,
@@ -533,6 +536,7 @@ impl RuleVersionManager {
         Ok(TuningRevertPlan::Ready)
     }
 
+    #[cfg(feature = "enterprise")]
     async fn tuning_predecessor_id(
         &self,
         rule_id: Uuid,
@@ -563,6 +567,7 @@ impl RuleVersionManager {
     }
 
     /// Revert a rule and mark its tuning log in the same transaction.
+    #[cfg(feature = "enterprise")]
     pub async fn revert_tuning_log(
         &self,
         rule_id: Uuid,
@@ -586,6 +591,7 @@ impl RuleVersionManager {
     }
 
     /// Revert a tuning log and claim any runtime reconciliation for this node.
+    #[cfg(feature = "enterprise")]
     pub async fn revert_tuning_log_claimed(
         &self,
         rule_id: Uuid,
@@ -616,6 +622,8 @@ impl RuleVersionManager {
         rule_id: Uuid,
         version_id: i32,
         reverted_by: Uuid,
+        // Only enterprise AI tuning passes a tuning log to mark reverted.
+        #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
         tuning_log: Option<(Uuid, String)>,
         runtime_sync_owner: Option<&str>,
         expected_modes: Option<(&str, &str)>,
@@ -655,6 +663,7 @@ impl RuleVersionManager {
             }
         }
 
+        #[cfg(feature = "enterprise")]
         if let Some((log_id, _)) = tuning_log.as_ref() {
             let log_state: Option<(
                 Uuid,
@@ -914,6 +923,7 @@ impl RuleVersionManager {
             (revert_version_id, true)
         };
 
+        #[cfg(feature = "enterprise")]
         if let Some((log_id, reason)) = tuning_log {
             sqlx::query(
                 r#"

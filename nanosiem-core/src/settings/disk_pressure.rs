@@ -899,8 +899,8 @@ impl DiskPressureService {
 
     /// Drop oldest partitions until usage is below the target watermark.
     ///
-    /// **Tiered deployments (Team / Business / Pro / Enterprise — multi-volume
-    /// storage policy with cold object storage):** never drop. ClickHouse's
+    /// **Storage-tiered deployments (multi-volume storage policy with cold
+    /// object storage):** never drop. ClickHouse's
     /// `move_factor` is what bleeds parts off to warm storage, and the upstream
     /// classifier in `run_check_cycle` already emits `disk_pressure_critical`
     /// audit + notification at Critical/Emergency for ops visibility. Dropping
@@ -908,8 +908,8 @@ impl DiskPressureService {
     /// to retain — the part may not yet be in warm storage. Local-disk pressure
     /// here is a safety/alerting concern, not a data-loss concern.
     ///
-    /// **Non-tiered deployments (Hobby / Startup / Growth — single Local
-    /// volume on Hetzner):** existing FIFO drop loop is the retention mechanism.
+    /// **Single-volume deployments (local storage only):** the existing FIFO
+    /// drop loop is the retention mechanism.
     /// Drop oldest daily partitions until usage falls below the low watermark.
     async fn relieve_pressure(&self, current_usage: f64) {
         if self.is_tiering_active().await {
@@ -1230,7 +1230,7 @@ fn daily_tables_filter(db: &str) -> String {
         .map(|t| format!("'{}'", t))
         .collect::<Vec<_>>()
         .join(",");
-    let db = db.replace('\\', "\\\\").replace('\'', "\\'");
+    let db = crate::sql_hygiene::escape_sql_string(db);
     format!("database = '{db}' AND table IN ({list}) AND active = 1 AND partition != ''")
 }
 
@@ -1281,7 +1281,7 @@ fn used_policies_sql(tables_src: &str, db: &str) -> String {
         .map(|t| format!("'{}'", t))
         .collect::<Vec<_>>()
         .join(",");
-    let db = db.replace('\\', "\\\\").replace('\'', "\\'");
+    let db = crate::sql_hygiene::escape_sql_string(db);
     format!(
         "SELECT DISTINCT storage_policy FROM {tables_src} WHERE database = '{db}' AND name IN ({list}) AND storage_policy != ''"
     )

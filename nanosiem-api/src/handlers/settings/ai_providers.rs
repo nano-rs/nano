@@ -11,10 +11,20 @@ use nanosiem_core::audit::{
     AI_PROVIDER_VALIDATED, AVAILABLE_MODEL_CREATED, AVAILABLE_MODEL_DELETED,
     AVAILABLE_MODEL_UPDATED, MODEL_CATALOG_SYNCED,
 };
-use nanosiem_core::ai_provider::{direct_endpoint, DirectApiStyle};
+use nanosiem_core::ai_provider::{
+    direct_base_url, direct_endpoint, ollama_tags_url, openai_models_url, parse_ollama_tags,
+    parse_openai_model_list, DirectApiStyle, SELF_HOSTED_PROVIDER,
+};
+use nanosiem_core::ai_provider_safety::{
+    azure_chat_url, config_url, request_error, summarize_upstream_error,
+    validate_config_scalars, AI_PROVIDER_URL_KEYS, DEFAULT_AZURE_API_VERSION,
+    DEFAULT_AZURE_DEPLOYMENT,
+};
 use nanosiem_core::auth::permissions;
 use nanosiem_core::crypto::EncryptionService;
-use nanosiem_core::inputlookup::ai_base_url_validator;
+use nanosiem_core::inputlookup::{
+    ai_base_url_validator, describe_ai_base_url_error, private_ai_endpoints_allowed,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use utoipa::ToSchema;
@@ -95,6 +105,32 @@ pub struct UpdateProviderCredentialsRequest {
     pub config: Option<serde_json::Value>,
     /// Whether to enable this provider
     pub enabled: Option<bool>,
+}
+
+/// Request to list the models a provider's own endpoint serves (NAN-5136).
+///
+/// Both fields are optional overrides so the admin can discover models before
+/// saving. When omitted, the stored `base_url` and key are used.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct DiscoverModelsRequest {
+    /// Base URL including the API version segment, e.g.
+    /// `http://ollama.lan:11434/v1`. SSRF-validated like a saved `base_url`.
+    pub base_url: Option<String>,
+    /// API key to send as `Authorization: Bearer`. Blank means none.
+    pub api_key: Option<String>,
+}
+
+/// Models discovered on a provider's own endpoint (NAN-5136).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DiscoverModelsResponse {
+    /// Model ids exactly as the server names them (no `provider/` prefix).
+    pub models: Vec<String>,
+    /// Which listing answered: `openai` (`GET {base_url}/models`) or `ollama`
+    /// (`GET /api/tags`, the fallback).
+    pub source: String,
+    /// Whether private, loopback and link-local endpoints are allowed on this
+    /// deployment (`NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS` or `AIRGAP_MODE`).
+    pub private_endpoints_allowed: bool,
 }
 
 // ============================================================================
@@ -229,14 +265,16 @@ pub async fn get_ai_availability(
                 SELECT 1
                 FROM provider_credentials
                 WHERE enabled = true
-                  AND credentials_encrypted IS NOT NULL
+                  AND (credentials_encrypted IS NOT NULL
+                       OR COALESCE(config->>'base_url', '') <> '')
             ) AS connected,
             EXISTS (
                 SELECT 1
                 FROM available_models m
                 JOIN provider_credentials p ON p.provider = m.provider
                 WHERE p.enabled = true
-                  AND p.credentials_encrypted IS NOT NULL
+                  AND (p.credentials_encrypted IS NOT NULL
+                       OR COALESCE(p.config->>'base_url', '') <> '')
                   AND m.deprecated = false
             ) AS model_available
         "#,
@@ -393,7 +431,7 @@ pub async fn update_ai_provider(
     // cloud-metadata base_url before it is ever persisted, so neither the
     // validate path nor runtime inference can later post to it. On-prem
     // operators opt private endpoints in via NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS.
-    validate_config_base_url(request.config.as_ref()).await?;
+    validate_config_urls(request.config.as_ref()).await?;
 
     // NAN-2355: api_key is tri-state — absent keeps the stored key, a blank
     // string removes it, anything else replaces it. Removal also resets the
@@ -402,6 +440,19 @@ pub async fn update_ai_provider(
     // Test-connection gate requires one) could never be evicted, and a stale
     // key poisons credential-less providers like workers-ai on the managed path.
     let clear_credentials = matches!(request.api_key.as_deref(), Some(k) if k.trim().is_empty());
+
+    // NAN-5136: the provider form sends `enabled` on every save, so
+    // `enabled: false` alone does not mean "disable". A base-URL edit on a row
+    // that was never enabled used to run the disable migration and move every
+    // agent on that provider. Only a real enabled → disabled transition counts.
+    let was_enabled: bool =
+        sqlx::query_scalar("SELECT enabled FROM provider_credentials WHERE provider = $1")
+            .bind(&provider)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| ApiError::InternalError(e.to_string()))?
+            .ok_or_else(|| ApiError::NotFound(format!("Provider '{}' not found", provider)))?;
+    let provider_being_disabled = was_enabled && request.enabled == Some(false);
 
     // Encrypt the API key if provided using AES-256-GCM
     let encrypted_creds: Option<Vec<u8>> = match request.api_key.as_deref() {
@@ -487,8 +538,18 @@ pub async fn update_ai_provider(
             }
         }
 
+        // NAN-5136: first give back any agent models an earlier disable
+        // displaced, then move whatever is still unservable.
+        if let Err(e) =
+            restore_displaced_agent_models(&state.pool, managed_gateway_configured()).await
+        {
+            tracing::warn!(provider = %provider, error = %e, "Failed to restore displaced agent models");
+        }
         // Auto-migrate agents that reference models from disabled/unavailable providers.
-        if let Err(e) = migrate_agents_from_unavailable_providers(&state.pool).await {
+        if let Err(e) =
+            migrate_agents_from_unavailable_providers(&state.pool, managed_gateway_configured())
+                .await
+        {
             tracing::warn!(provider = %provider, error = %e, "Failed to migrate agents to enabled provider");
         } else {
             // Reload agent configs in registry to pick up the changes
@@ -552,8 +613,14 @@ pub async fn update_ai_provider(
     }
 
     // If provider was disabled, migrate agents using its models to a fallback
-    if request.enabled == Some(false) {
-        if let Err(e) = migrate_agents_from_disabled_provider(&state.pool, &provider).await {
+    if provider_being_disabled {
+        if let Err(e) = migrate_agents_from_disabled_provider(
+            &state.pool,
+            &provider,
+            managed_gateway_configured(),
+        )
+        .await
+        {
             tracing::warn!(provider = %provider, error = %e, "Failed to migrate agents from disabled provider");
         }
 
@@ -579,44 +646,96 @@ pub async fn update_ai_provider(
     get_ai_provider(State(state), Extension(auth), Path(provider)).await
 }
 
-/// Migrate agents from a disabled provider to the cheapest available model
+/// SQL predicate over a `provider_credentials` row aliased `p`: can it serve
+/// a request right now? (NAN-5136.) `gateway_param` is the bind placeholder
+/// (e.g. `$1`) carrying whether the managed AI gateway URL is configured.
+///
+/// `enabled` alone is not enough. A provider row with no direct `base_url`
+/// goes through the managed gateway, so it needs that gateway URL, plus a
+/// stored key unless it is Workers AI (same-account gateway auth). A row with
+/// a direct `base_url` serves on its own; its key is optional.
+///
+/// The fallback picker, the unavailable-provider sweep and the restore all
+/// use this one definition, so they can never disagree about which provider
+/// is usable.
+fn servable_provider_sql(gateway_param: &str) -> String {
+    format!(
+        "p.enabled = true AND ( \
+            COALESCE(p.config->>'base_url', '') <> '' \
+            OR ({gateway_param} AND (p.credentials_encrypted IS NOT NULL OR p.provider = 'workers-ai')) \
+        )"
+    )
+}
+
+/// Whether the managed Cloudflare AI gateway URL is configured for this
+/// process, the same variable the meloD bootstrap reads.
+fn managed_gateway_configured() -> bool {
+    std::env::var("CLOUDFLARE_AI_GATEWAY_URL").is_ok_and(|v| !v.trim().is_empty())
+}
+
+/// Cheapest non-deprecated model on a provider that can actually serve it.
+/// `None` when no provider qualifies.
+async fn servable_fallback_model(
+    pool: &PgPool,
+    gateway_configured: bool,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(&format!(
+        "SELECT m.model_id \
+         FROM available_models m \
+         JOIN provider_credentials p ON m.provider = p.provider \
+         WHERE {servable} AND m.deprecated = false \
+         ORDER BY COALESCE(m.input_price_per_million, 999999) ASC, m.model_id ASC \
+         LIMIT 1",
+        servable = servable_provider_sql("$1")
+    ))
+    .bind(gateway_configured)
+    .fetch_optional(pool)
+    .await
+}
+
+/// `LIKE` patterns for the model ids routed to `provider`. Google's catalog
+/// ids use the `gemini/` prefix (see `CredentialResolver::parse_provider`).
+fn provider_model_patterns(provider: &str) -> Vec<String> {
+    let mut patterns = vec![format!("{provider}/%")];
+    if provider == "google" {
+        patterns.push("gemini/%".to_string());
+    }
+    patterns
+}
+
+/// Move agents off a provider that was just disabled.
+///
+/// NAN-5136: the agent's own choice is kept in `displaced_model_id`, and
+/// [`restore_displaced_agent_models`] puts it back when the provider is enabled
+/// again. Before this, one disable silently and permanently rewrote every
+/// agent. The fallback must also be servable, not merely enabled: the old
+/// picker chose an enabled Workers AI row on a deployment with no gateway URL,
+/// and every agent then failed. With no servable fallback nothing moves; the
+/// agents keep their model and report the disabled provider when called.
 async fn migrate_agents_from_disabled_provider(
     pool: &PgPool,
     disabled_provider: &str,
-) -> Result<(), sqlx::Error> {
-    // Find the cheapest model from an enabled provider
-    let fallback_model: Option<String> = sqlx::query_scalar(
-        r#"
-        SELECT m.model_id
-        FROM available_models m
-        JOIN provider_credentials p ON m.provider = p.provider
-        WHERE p.enabled = true
-        ORDER BY COALESCE(m.input_price_per_million, 999999) ASC
-        LIMIT 1
-        "#,
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    let fallback_model = match fallback_model {
-        Some(m) => m,
-        None => {
-            tracing::warn!("No enabled providers with models available for fallback");
-            return Ok(());
-        }
+    gateway_configured: bool,
+) -> Result<u64, sqlx::Error> {
+    let Some(fallback_model) = servable_fallback_model(pool, gateway_configured).await? else {
+        tracing::warn!(
+            disabled_provider = %disabled_provider,
+            "No servable provider to move agents to; leaving agent models unchanged"
+        );
+        return Ok(0);
     };
 
-    // Update all agents using models from the disabled provider
-    let provider_prefix = format!("{}/", disabled_provider);
     let result = sqlx::query(
         r#"
         UPDATE agent_model_config
-        SET model_id = $1, updated_at = NOW()
-        WHERE model_id LIKE $2
+        SET displaced_model_id = COALESCE(displaced_model_id, model_id),
+            model_id = $1,
+            updated_at = NOW()
+        WHERE model_id LIKE ANY($2)
         "#,
     )
     .bind(&fallback_model)
-    .bind(format!("{}%", provider_prefix))
+    .bind(provider_model_patterns(disabled_provider))
     .execute(pool)
     .await?;
 
@@ -625,52 +744,44 @@ async fn migrate_agents_from_disabled_provider(
             disabled_provider = %disabled_provider,
             fallback_model = %fallback_model,
             agents_migrated = result.rows_affected(),
-            "Migrated agents from disabled provider to fallback model"
+            "Moved agents off disabled provider (original model kept for restore)"
         );
     }
 
-    Ok(())
+    Ok(result.rows_affected())
 }
 
-/// Migrate agents that reference models from disabled (or non-existent) providers
-/// to the cheapest available model from any enabled provider.
-async fn migrate_agents_from_unavailable_providers(pool: &PgPool) -> Result<(), sqlx::Error> {
-    // Find the cheapest non-deprecated model from an enabled provider
-    let fallback_model: Option<String> = sqlx::query_scalar(
-        r#"
-        SELECT m.model_id
-        FROM available_models m
-        JOIN provider_credentials p ON m.provider = p.provider
-        WHERE p.enabled = true AND m.deprecated = false
-        ORDER BY COALESCE(m.input_price_per_million, 999999) ASC
-        LIMIT 1
-        "#,
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    let fallback_model = match fallback_model {
-        Some(m) => m,
-        None => {
-            tracing::debug!("No enabled providers with models available for agent migration");
-            return Ok(());
-        }
+/// Move agents whose model is on a disabled (or missing) provider to the
+/// cheapest servable model, keeping each agent's own choice in
+/// `displaced_model_id` (NAN-5136). Moves nothing when no provider can serve.
+async fn migrate_agents_from_unavailable_providers(
+    pool: &PgPool,
+    gateway_configured: bool,
+) -> Result<u64, sqlx::Error> {
+    let Some(fallback_model) = servable_fallback_model(pool, gateway_configured).await? else {
+        tracing::debug!("No servable provider for agent migration");
+        return Ok(0);
     };
 
-    // Update agents whose current model belongs to a disabled (or missing) provider.
-    let result = sqlx::query(
+    // An agent stays put only while its model is on a provider that can
+    // serve; "enabled" alone would leave it on a dead row.
+    let result = sqlx::query(&format!(
         r#"
         UPDATE agent_model_config amc
-        SET model_id = $1, updated_at = NOW()
+        SET displaced_model_id = COALESCE(amc.displaced_model_id, amc.model_id),
+            model_id = $1,
+            updated_at = NOW()
         WHERE NOT EXISTS (
             SELECT 1
             FROM available_models m
-            JOIN provider_credentials p ON m.provider = p.provider AND p.enabled = true
-            WHERE m.model_id = amc.model_id AND m.deprecated = false
+            JOIN provider_credentials p ON m.provider = p.provider
+            WHERE m.model_id = amc.model_id AND m.deprecated = false AND {servable}
         )
         "#,
-    )
+        servable = servable_provider_sql("$2")
+    ))
     .bind(&fallback_model)
+    .bind(gateway_configured)
     .execute(pool)
     .await?;
 
@@ -678,11 +789,53 @@ async fn migrate_agents_from_unavailable_providers(pool: &PgPool) -> Result<(), 
         tracing::info!(
             fallback_model = %fallback_model,
             agents_migrated = result.rows_affected(),
-            "Migrated agents from unavailable/disabled providers to enabled provider model"
+            "Moved agents off unavailable providers (original model kept for restore)"
         );
     }
 
-    Ok(())
+    Ok(result.rows_affected())
+}
+
+/// Put back every agent model that a provider disable displaced, once that
+/// model's provider can serve again (NAN-5136). Runs before the
+/// unavailable-provider sweep, so a restored agent is not moved again.
+///
+/// Servable, not merely enabled: re-enabling a row that still cannot answer
+/// (no base URL and no gateway, or no key) must leave the agent on its working
+/// fallback with `displaced_model_id` kept, rather than restore it onto a
+/// dead provider and lose the record.
+async fn restore_displaced_agent_models(
+    pool: &PgPool,
+    gateway_configured: bool,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(&format!(
+        r#"
+        UPDATE agent_model_config amc
+        SET model_id = amc.displaced_model_id,
+            displaced_model_id = NULL,
+            updated_at = NOW()
+        WHERE amc.displaced_model_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM available_models m
+            JOIN provider_credentials p ON m.provider = p.provider
+            WHERE m.model_id = amc.displaced_model_id AND m.deprecated = false AND {servable}
+          )
+        "#,
+        servable = servable_provider_sql("$1")
+    ))
+    .bind(gateway_configured)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() > 0 {
+        tracing::info!(
+            agents_restored = result.rows_affected(),
+            "Restored agent models displaced by an earlier provider disable"
+        );
+    }
+
+    Ok(result.rows_affected())
 }
 
 /// Test provider connection
@@ -710,8 +863,6 @@ pub async fn validate_ai_provider(
     Extension(client): Extension<ClientContext>,
     Path(provider): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    use nanosiem_core::crypto::EncryptedData;
-
     require_ai_settings_surface(&auth, AiSettingsSurface::Providers)?;
     // Defence in depth (NAN-2231): a managed tenant can't persist a `base_url`
     // — `update_ai_provider` rejects the write — so the probe can't be aimed at
@@ -735,38 +886,21 @@ pub async fn validate_ai_provider(
     let encrypted_bytes: Option<Vec<u8>> = row.get("credentials_encrypted");
     let config: Option<serde_json::Value> = row.get("config");
 
-    // Check if credentials exist
-    let encrypted_bytes = encrypted_bytes.ok_or_else(|| {
-        ApiError::BadRequest("No credentials configured for this provider".to_string())
-    })?;
-
-    // Decrypt credentials
-    let encryption = EncryptionService::from_env();
-    let encrypted_json: serde_json::Value = serde_json::from_slice(&encrypted_bytes)
-        .map_err(|e| ApiError::InternalError(format!("Invalid encrypted data: {}", e)))?;
-
-    let ciphertext = encrypted_json["ciphertext"]
-        .as_str()
-        .ok_or_else(|| ApiError::InternalError("Missing ciphertext".to_string()))?;
-    let nonce = encrypted_json["nonce"]
-        .as_str()
-        .ok_or_else(|| ApiError::InternalError("Missing nonce".to_string()))?;
-
-    let encrypted_data = EncryptedData {
-        ciphertext: ciphertext.to_string(),
-        nonce: nonce.to_string(),
+    // NAN-5136: a self-hosted model server usually runs without a key
+    // (Ollama never has one), so the probe runs keyless there. Every vendor
+    // row still needs a stored key.
+    let api_key = match encrypted_bytes {
+        Some(bytes) => decrypt_stored_api_key(&bytes)?,
+        None if provider == SELF_HOSTED_PROVIDER => String::new(),
+        None => {
+            return Err(ApiError::BadRequest(
+                "No credentials configured for this provider".to_string(),
+            ))
+        }
     };
 
-    let creds: serde_json::Value = encryption
-        .decrypt_json(&encrypted_data)
-        .map_err(|e| ApiError::InternalError(format!("Decryption failed: {}", e)))?;
-
-    let api_key = creds["api_key"]
-        .as_str()
-        .ok_or_else(|| ApiError::InternalError("No API key in credentials".to_string()))?;
-
     // Test the provider with a real API call
-    let test_result = test_provider_connection(&provider, api_key, config.as_ref()).await;
+    let test_result = test_provider_connection(&provider, &api_key, config.as_ref()).await;
 
     match test_result {
         Ok(_) => {
@@ -852,6 +986,186 @@ pub async fn validate_ai_provider(
     }
 }
 
+/// List the models a provider's own OpenAI-compatible endpoint serves
+///
+/// POST /api/settings/ai-providers/:provider/discover-models
+///
+/// NAN-5136: populates the self-hosted model picker. Tries
+/// `GET {base_url}/models` first and falls back to Ollama's `GET /api/tags`.
+/// Nothing is written: the admin picks which models to add to the catalog.
+#[utoipa::path(
+    post,
+    path = "/api/settings/ai-providers/{provider}/discover-models",
+    tag = "settings",
+    params(
+        ("provider" = String, Path, description = "Provider name")
+    ),
+    request_body = DiscoverModelsRequest,
+    responses(
+        (status = 200, description = "Models the endpoint serves", body = DiscoverModelsResponse),
+        (status = 400, description = "No base URL, URL blocked by the SSRF guard, or the endpoint did not answer", body = ErrorResponse),
+        (status = 403, description = "Missing permission", body = ErrorResponse),
+        (status = 404, description = "Provider not found", body = ErrorResponse),
+        (status = 500, description = "Internal error", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn discover_provider_models(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(provider): Path<String>,
+    body: Option<Json<DiscoverModelsRequest>>,
+) -> Result<Json<DiscoverModelsResponse>, ApiError> {
+    require_ai_settings_surface(&auth, AiSettingsSurface::Providers)?;
+    // Same posture as validate: a managed tenant cannot aim nano at a host.
+    check_not_managed(&state)?;
+    let request = body.map(|Json(b)| b).unwrap_or_default();
+
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT credentials_encrypted, config FROM provider_credentials WHERE provider = $1",
+    )
+    .bind(&provider)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::InternalError(e.to_string()))?
+    .ok_or_else(|| ApiError::NotFound(format!("Provider '{}' not found", provider)))?;
+    let encrypted_bytes: Option<Vec<u8>> = row.get("credentials_encrypted");
+    let config: serde_json::Value = row
+        .get::<Option<serde_json::Value>, _>("config")
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let saved_base_url = direct_base_url(&config);
+    let base_url = request
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .or_else(|| saved_base_url.clone())
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "Set the server's base URL first, e.g. http://<host>:11434/v1 for Ollama"
+                    .to_string(),
+            )
+        })?;
+
+    // The stored key is only ever sent to the stored base URL. An override
+    // URL gets the key supplied with it, or none, so this endpoint cannot be
+    // used to post the saved key to an arbitrary host.
+    let api_key = match request.api_key.as_deref().map(str::trim) {
+        Some(key) if !key.is_empty() => key.to_string(),
+        _ if saved_base_url.as_deref() == Some(base_url.as_str()) => match encrypted_bytes {
+            Some(bytes) => decrypt_stored_api_key(&bytes)?,
+            None => String::new(),
+        },
+        _ => String::new(),
+    };
+
+    let (models, source) = discover_models(&base_url, &api_key)
+        .await
+        .map_err(ApiError::BadRequest)?;
+
+    Ok(Json(DiscoverModelsResponse {
+        models,
+        source: source.to_string(),
+        private_endpoints_allowed: private_ai_endpoints_allowed(),
+    }))
+}
+
+/// Model ids served at `base_url`, and which listing produced them
+/// (NAN-5136). SSRF-validated and IP-pinned exactly like the connection test;
+/// redirects are not followed.
+async fn discover_models(
+    base_url: &str,
+    api_key: &str,
+) -> Result<(Vec<String>, &'static str), String> {
+    let (client, validated) = ai_base_url_validator()
+        .build_pinned_client(
+            base_url,
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(15)),
+            // Same as the connection probe: an operator's own model server is
+            // reached directly, never through the outbound proxy.
+            nanosiem_core::inputlookup::ProxyPolicy::Direct,
+        )
+        .await
+        .map_err(|e| format!("base_url rejected: {}", describe_ai_base_url_error(&e)))?;
+    let host = host_label(&validated);
+
+    let get = |url: String| {
+        let mut req = client.get(url);
+        if !api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {api_key}"));
+        }
+        req.send()
+    };
+
+    // 1. OpenAI-compatible listing. Every server in scope serves it.
+    let first_failure = match get(openai_models_url(base_url)).await {
+        Ok(resp) if resp.status().is_success() => {
+            match read_json_capped(resp).await {
+                Some(body) => {
+                    let models = parse_openai_model_list(&body);
+                    if !models.is_empty() {
+                        return Ok((models, "openai"));
+                    }
+                    format!("{host} listed no models at /models")
+                }
+                None => format!("{host} answered /models with a body that is not a model list"),
+            }
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            if status == 401 || status == 403 {
+                // Auth failure: the fallback would fail the same way.
+                return Err(upstream_failure(resp, Some(&host)).await);
+            }
+            upstream_failure(resp, Some(&host)).await
+        }
+        Err(e) => {
+            return Err(format!("Could not reach {host}: {}", request_error(e)));
+        }
+    };
+
+    // 2. Ollama's native listing: older Ollama builds, or a /v1 list that came
+    //    back empty. Same host, so the pinned client still applies.
+    if let Ok(resp) = get(ollama_tags_url(base_url)).await {
+        if resp.status().is_success() {
+            if let Some(body) = read_json_capped(resp).await {
+                let models = parse_ollama_tags(&body);
+                if !models.is_empty() {
+                    return Ok((models, "ollama"));
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "{first_failure}. Check the base URL includes the API version segment (/v1), \
+         and that the server has at least one model loaded"
+    ))
+}
+
+/// Largest model-list body discovery will read. A LiteLLM proxy listing a few
+/// hundred models is well under 1 MiB.
+const MAX_DISCOVERY_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// A JSON body read in chunks and abandoned past
+/// [`MAX_DISCOVERY_BODY_BYTES`], so an operator-set server cannot make the API
+/// buffer an unbounded response.
+async fn read_json_capped(mut resp: reqwest::Response) -> Option<serde_json::Value> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if buf.len() + chunk.len() > MAX_DISCOVERY_BODY_BYTES {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).ok()
+}
+
 /// Adapter exposing the canonical, on-prem-`base_url`-aware provider
 /// connectivity test ([`test_provider_connection`]) to the `nanosiem-core`
 /// health monitor.
@@ -876,27 +1190,82 @@ impl nanosiem_core::health::AiProviderConnectivityChecker for ApiAiProviderCheck
     }
 }
 
-/// Test a provider connection by making a minimal API call
-/// SSRF-guard the `base_url` carried in an AI provider config before it is
-/// stored. No-op when no `base_url` is set (the provider then uses the managed
-/// gateway). Returns a 400 on a blocked target (NAN-1368).
-async fn validate_config_base_url(config: Option<&serde_json::Value>) -> Result<(), ApiError> {
-    let base_url = config
-        .and_then(|c| c.get("base_url"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+/// Decrypt the `api_key` from a `provider_credentials.credentials_encrypted`
+/// blob (`{"ciphertext","nonce"}` JSON over AES-256-GCM).
+fn decrypt_stored_api_key(encrypted_bytes: &[u8]) -> Result<String, ApiError> {
+    use nanosiem_core::crypto::EncryptedData;
 
-    if let Some(base_url) = base_url {
-        ai_base_url_validator()
-            .validate_with_dns(base_url.trim_end_matches('/'))
-            .await
-            .map_err(|e| ApiError::BadRequest(format!("Invalid AI provider base_url: {}", e)))?;
-    }
-
-    Ok(())
+    let encrypted_json: serde_json::Value = serde_json::from_slice(encrypted_bytes)
+        .map_err(|e| ApiError::InternalError(format!("Invalid encrypted data: {}", e)))?;
+    let ciphertext = encrypted_json["ciphertext"]
+        .as_str()
+        .ok_or_else(|| ApiError::InternalError("Missing ciphertext".to_string()))?;
+    let nonce = encrypted_json["nonce"]
+        .as_str()
+        .ok_or_else(|| ApiError::InternalError("Missing nonce".to_string()))?;
+    let creds: serde_json::Value = EncryptionService::from_env()
+        .decrypt_json(&EncryptedData {
+            ciphertext: ciphertext.to_string(),
+            nonce: nonce.to_string(),
+        })
+        .map_err(|e| ApiError::InternalError(format!("Decryption failed: {}", e)))?;
+    creds["api_key"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::InternalError("No API key in credentials".to_string()))
 }
 
+/// SSRF-guard every URL an AI provider config carries before it is stored
+/// (NAN-1368 for `base_url`; NAN-5022 extends it to every URL-bearing key, so
+/// the Azure `api_base` is no longer an unchecked side door), and shape-check
+/// the scalars that become URL parts. Returns a 400 on a blocked target.
+async fn validate_config_urls(config: Option<&serde_json::Value>) -> Result<(), ApiError> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    for key in AI_PROVIDER_URL_KEYS {
+        if let Some(url) = config_url(config, key) {
+            ai_base_url_validator()
+                .validate_with_dns(&url)
+                .await
+                .map_err(|e| {
+                    ApiError::BadRequest(format!(
+                        "Invalid AI provider {key}: {}",
+                        describe_ai_base_url_error(&e)
+                    ))
+                })?;
+        }
+    }
+    validate_config_scalars(config)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid AI provider config: {e}")))
+}
+
+/// A non-2xx answer as the message the caller (and `validation_error`) sees.
+/// The body is logged server-side, truncated, never returned for an
+/// operator-set target (NAN-5022).
+async fn upstream_failure(resp: reqwest::Response, operator_host: Option<&str>) -> String {
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    let snippet: String = body.chars().take(512).collect();
+    tracing::warn!(
+        status,
+        target_host = operator_host.unwrap_or("vendor"),
+        body = %snippet,
+        "AI provider connection test failed"
+    );
+    summarize_upstream_error(status, &body, operator_host)
+}
+
+/// `host[:port]` of a URL, for messages.
+fn host_label(url: &reqwest::Url) -> String {
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_string(),
+        _ => "endpoint".to_string(),
+    }
+}
+
+/// Test a provider connection by making a minimal API call
 async fn test_provider_connection(
     provider: &str,
     api_key: &str,
@@ -931,13 +1300,15 @@ async fn test_provider_connection(
         // NAN-2018: validate AND pin the client to the validated IP so a DNS
         // rebind between the check and the connect can't reach loopback /
         // private / metadata after the check passed.
-        let (pinned_client, _base) = ai_base_url_validator()
+        let (pinned_client, validated_base) = ai_base_url_validator()
             .build_pinned_client(
                 &base_url,
                 reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+                nanosiem_core::inputlookup::ProxyPolicy::Direct,
             )
             .await
-            .map_err(|e| format!("base_url rejected: {}", e))?;
+            .map_err(|e| format!("base_url rejected: {}", describe_ai_base_url_error(&e)))?;
+        let target_host = host_label(&validated_base);
 
         // `test_model` is the explicit override; `model` is what the
         // direct-endpoint card writes, and before NAN-2231 the probe ignored
@@ -953,6 +1324,16 @@ async fn test_provider_connection(
                     .filter(|s| !s.is_empty())
             })
             .map(str::to_string);
+
+        // NAN-5136: the self-hosted probe proves a real answer from a real
+        // model, so it needs one. Discovery fills this in.
+        let self_hosted = provider == SELF_HOSTED_PROVIDER;
+        if self_hosted && model.is_none() {
+            return Err(
+                "Choose a model first: Test connection sends one small chat completion to it"
+                    .to_string(),
+            );
+        }
 
         let mut req = pinned_client
             .post(endpoint.chat_url())
@@ -993,7 +1374,7 @@ async fn test_provider_connection(
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("Request to direct endpoint failed: {}", e))?;
+            .map_err(|e| format!("Request to direct endpoint failed: {}", request_error(e)))?;
 
         // 2xx is a clean success. A 4xx that is NOT an auth failure (e.g. 404
         // unknown model, 422 bad model id) still proves the endpoint is
@@ -1005,15 +1386,16 @@ async fn test_provider_connection(
             return Ok(());
         }
         if status.as_u16() == 401 || status.as_u16() == 403 {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Authentication failed ({}): {}", status, body));
+            return Err(upstream_failure(resp, Some(&target_host)).await);
         }
-        if status.is_client_error() {
+        if status.is_client_error() && !self_hosted {
             // Reachable + authorized, just an upstream request-shape quibble.
+            // Not for self-hosted (NAN-5136): there a 404 means the chosen
+            // model is not loaded, which is exactly what the admin needs to
+            // know before agents start failing on it.
             return Ok(());
         }
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Direct endpoint error ({}): {}", status, body));
+        return Err(upstream_failure(resp, Some(&target_host)).await);
     }
 
     match provider {
@@ -1030,22 +1412,20 @@ async fn test_provider_connection(
                 }))
                 .send()
                 .await
-                .map_err(|e| format!("Request failed: {}", e))?;
+                .map_err(|e| format!("Request failed: {}", request_error(e)))?;
 
             if resp.status().is_success() {
                 Ok(())
             } else {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                Err(format!("API error ({}): {}", status, body))
+                Err(upstream_failure(resp, None).await)
             }
         }
         "google" => {
             let resp = client
-                .post(format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={}",
-                    api_key
-                ))
+                // NAN-5022: the key goes in a header, not the query string,
+                // so no request error text can carry it.
+                .post("https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent")
+                .header("x-goog-api-key", api_key)
                 .header("content-type", "application/json")
                 .json(&serde_json::json!({
                     "contents": [{"parts": [{"text": "Hi"}]}],
@@ -1053,14 +1433,12 @@ async fn test_provider_connection(
                 }))
                 .send()
                 .await
-                .map_err(|e| format!("Request failed: {}", e))?;
+                .map_err(|e| format!("Request failed: {}", request_error(e)))?;
 
             if resp.status().is_success() {
                 Ok(())
             } else {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                Err(format!("API error ({}): {}", status, body))
+                Err(upstream_failure(resp, None).await)
             }
         }
         "openai" => {
@@ -1075,32 +1453,45 @@ async fn test_provider_connection(
                 }))
                 .send()
                 .await
-                .map_err(|e| format!("Request failed: {}", e))?;
+                .map_err(|e| format!("Request failed: {}", request_error(e)))?;
 
             if resp.status().is_success() {
                 Ok(())
             } else {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                Err(format!("API error ({}): {}", status, body))
+                Err(upstream_failure(resp, None).await)
             }
         }
         "azure" => {
+            // NAN-5022: `api_base` is an operator-set URL like `base_url`:
+            // SSRF-validated and pinned to its validated address, with no
+            // redirects; `deployment` / `api_version` become URL parts only
+            // through the segment / query builders.
             let api_base = config
-                .and_then(|c| c["api_base"].as_str())
+                .and_then(|c| config_url(c, "api_base"))
                 .ok_or_else(|| "Azure requires api_base in config".to_string())?;
-            let api_version = config
-                .and_then(|c| c["api_version"].as_str())
-                .unwrap_or("2024-10-21");
-            let deployment = config
-                .and_then(|c| c["deployment"].as_str())
-                .unwrap_or("gpt-5-nano");
+            let pick = |key: &str| {
+                config
+                    .and_then(|c| c[key].as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            };
+            let api_version = pick("api_version").unwrap_or(DEFAULT_AZURE_API_VERSION);
+            let deployment = pick("deployment").unwrap_or(DEFAULT_AZURE_DEPLOYMENT);
 
-            let resp = client
-                .post(format!(
-                    "{}/openai/deployments/{}/chat/completions?api-version={}",
-                    api_base, deployment, api_version
-                ))
+            let (pinned_client, validated_base) = ai_base_url_validator()
+                .build_pinned_client(
+                    &api_base,
+                    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+                    nanosiem_core::inputlookup::ProxyPolicy::Direct,
+                )
+                .await
+                .map_err(|e| format!("api_base rejected: {}", describe_ai_base_url_error(&e)))?;
+            let url = azure_chat_url(&validated_base, deployment, api_version)
+                .map_err(|e| format!("Invalid Azure config: {e}"))?;
+            let target_host = host_label(&validated_base);
+
+            let resp = pinned_client
+                .post(url)
                 .header("api-key", api_key)
                 .header("content-type", "application/json")
                 .json(&serde_json::json!({
@@ -1109,14 +1500,12 @@ async fn test_provider_connection(
                 }))
                 .send()
                 .await
-                .map_err(|e| format!("Request failed: {}", e))?;
+                .map_err(|e| format!("Request failed: {}", request_error(e)))?;
 
             if resp.status().is_success() {
                 Ok(())
             } else {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                Err(format!("API error ({}): {}", status, body))
+                Err(upstream_failure(resp, Some(&target_host)).await)
             }
         }
         "bedrock" => {
@@ -1166,14 +1555,12 @@ async fn test_provider_connection(
             let resp = req
                 .send()
                 .await
-                .map_err(|e| format!("Request failed: {}", e))?;
+                .map_err(|e| format!("Request failed: {}", request_error(e)))?;
 
             if resp.status().is_success() {
                 Ok(())
             } else {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                Err(format!("API error ({}): {}", status, body))
+                Err(upstream_failure(resp, None).await)
             }
         }
         _ => Err(format!("Unknown provider: {}", provider)),
@@ -1377,7 +1764,10 @@ pub async fn update_agent_model_config(
         sqlx::query(
             r#"
             UPDATE agent_model_config
-            SET model_id = COALESCE($2, model_id),
+            SET displaced_model_id = CASE
+                    WHEN $2 IS NOT NULL AND $2 IS DISTINCT FROM model_id THEN NULL
+                    ELSE displaced_model_id END,
+                model_id = COALESCE($2, model_id),
                 max_tokens = COALESCE($3, max_tokens),
                 temperature = COALESCE($4, temperature),
                 timeout_seconds = COALESCE($5, timeout_seconds),
@@ -1596,6 +1986,7 @@ pub async fn create_available_model(
         "openai",
         "azure",
         "workers-ai",
+        SELF_HOSTED_PROVIDER,
     ];
     if !VALID_PROVIDERS.contains(&provider.as_str()) {
         return Err(ApiError::ValidationError(format!(
@@ -1621,6 +2012,18 @@ pub async fn create_available_model(
             "model_id must follow provider/model-name format (e.g., anthropic/claude-sonnet-4-5)"
                 .to_string(),
         ));
+    }
+
+    // NAN-5136: requests are routed to a provider row by the model id's
+    // prefix, not by this `provider` column. A self-hosted model filed under
+    // any other prefix would be sent to that vendor (or the reverse), so the
+    // two must agree.
+    let self_hosted_id = nanosiem_core::ai_provider::is_self_hosted_model(&model_id);
+    if (provider == SELF_HOSTED_PROVIDER) != self_hosted_id {
+        return Err(ApiError::ValidationError(format!(
+            "Self-hosted models must use the {SELF_HOSTED_PROVIDER}/ prefix (e.g. \
+             {SELF_HOSTED_PROVIDER}/qwen2.5:7b), and only self-hosted models may use it"
+        )));
     }
 
     if let Some(ctx) = request.context_window {
@@ -2212,3 +2615,15 @@ mod authorization_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ai_providers_ssrf_tests.rs"]
+mod ssrf_tests;
+
+#[cfg(test)]
+#[path = "ai_providers_agent_migration_tests.rs"]
+mod agent_migration_tests;
+
+#[cfg(test)]
+#[path = "ai_providers_self_hosted_tests.rs"]
+mod self_hosted_tests;

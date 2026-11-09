@@ -214,7 +214,7 @@ pub async fn create_detection(
             rule_count,
             tier_limits.max_detection_rules,
             tier_limits.tier,
-            "Upgrade to Starter for unlimited detection rules.",
+            "Detection rule capacity has been reached.",
         )?;
     }
 

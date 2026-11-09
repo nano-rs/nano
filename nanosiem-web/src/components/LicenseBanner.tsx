@@ -4,12 +4,12 @@
  * License enforcement banners
  *
  * Grace period: dismissable warning banner at top of content area
- * Locked: full-page lockout overlay (cannot be dismissed)
+ * Locked: persistent warning; open/core surfaces remain usable
  */
 
 import { useEffect, useState } from 'react';
-import { Link, useLocation } from 'react-router-dom';
-import { AlertTriangle, Lock, X, KeyRound } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { AlertTriangle, X, KeyRound } from 'lucide-react';
 import { api } from '../lib/api';
 import type { LicenseStatusResponse } from '../lib/api';
 import { useCapabilities } from '@/hooks/use-capabilities';
@@ -23,7 +23,6 @@ export function LicenseBanner() {
 
   const [status, setStatus] = useState<LicenseStatusResponse | null>(null);
   const [dismissed, setDismissed] = useState(false);
-  const location = useLocation();
 
   useEffect(() => {
     if (!isEnterprise) return;
@@ -38,34 +37,59 @@ export function LicenseBanner() {
     };
 
     fetchStatus();
-    // Re-check every 5 minutes
-    const interval = setInterval(fetchStatus, 5 * 60_000);
+    // Keep recovery and hard-stop presentation aligned with live admission.
+    const interval = setInterval(fetchStatus, 60_000);
     return () => clearInterval(interval);
   }, [isEnterprise]);
 
-  // Air-gap installs enforce a signed offline license but have no phone-home,
-  // so `enforcement_enabled` (which tracks LICENSE_URL) is false; treat air-gap
-  // as enforced too (NAN-1222).
+  // All enterprise admission modes are enforced. Keep the air-gap fallback for
+  // compatibility with an older API response during rolling upgrades.
   const enforced = !!status?.enforcement_enabled || !!status?.airgap;
+
+  const trial = status?.entitlement?.kind === 'trial' ? status.entitlement : null;
+  if (isEnterprise && status && enforced && trial) {
+    const warning = trial.warning_days;
+    // An older API serialized `warning_days: null` outside a warning step.
+    if (status.state === 'active' && (warning === undefined || warning === null)) return null;
+    if (dismissed && status.state !== 'locked') return null;
+    return (
+      <div className={`mx-6 mt-3 flex items-center justify-between gap-3 rounded-lg border px-4 py-2.5 text-sm ${status.state === 'locked'
+        ? 'border-red-200 bg-red-50/80 dark:border-red-500/30 dark:bg-red-500/10'
+        : 'border-amber-200 bg-amber-50/80 dark:border-amber-500/30 dark:bg-amber-500/10'}`}>
+        <div className="flex items-center gap-3">
+          <AlertTriangle className={`h-4 w-4 ${status.state === 'locked' ? 'text-red-600 dark:text-red-400' : 'text-amber-600 dark:text-amber-400'}`} />
+          <span className="font-medium">Trial — {trial.days_remaining} days left</span>
+          <span className="text-muted-foreground">
+            {status.state === 'locked'
+              ? 'The seven-day grace period ended. Licensed-only features are disabled; search, ingest, and all stored data remain available.'
+              : status.state === 'grace_period'
+                ? `The trial ended; licensed features remain available during grace until ${new Date(trial.grace_ends_at).toLocaleDateString()}.`
+                : `${warning}-day expiry warning. Contact nano to continue licensed features.`}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <a href="https://app.nano.rs" target="_blank" rel="noopener noreferrer"
+            className="inline-flex items-center rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700">
+            Contact nano
+          </a>
+          {status.state !== 'locked' && (
+            <button onClick={() => setDismissed(true)} className="rounded p-1 text-amber-500 hover:bg-amber-100" aria-label="Dismiss trial warning">
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   // Don't show anything if not enforced, active, or no status yet
   if (!isEnterprise || !status || !enforced || status.state === 'active') {
     return null;
   }
 
-  // Full lockout page
+  // A hard stop removes licensed-only surfaces, not the open/core product.
   if (status.state === 'locked') {
-    // Air-gapped: the only recovery is importing a signed offline license, so
-    // point at the import surface (app.nano.rs is unreachable across the gap).
-    // Suppress the overlay while the operator is on the import page itself so
-    // the dropzone underneath stays usable.
-    if (status.airgap) {
-      if (location.pathname.startsWith('/settings/license')) {
-        return null;
-      }
-      return <AirgapLockoutOverlay reason={status.locked_reason} />;
-    }
-    return <LicenseLockoutOverlay reason={status.locked_reason} />;
+    return <LicenseHardStopBanner status={status} />;
   }
 
   // Grace period warning (dismissable)
@@ -126,72 +150,40 @@ export function LicenseBanner() {
   return null;
 }
 
-function LicenseLockoutOverlay({ reason }: { reason?: string }) {
+function LicenseHardStopBanner({ status }: { status: LicenseStatusResponse }) {
+  const offline = status.mode === 'offline' || status.airgap;
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-background/95 backdrop-blur-sm">
-      <div className="mx-auto max-w-md text-center space-y-6 p-8">
-        <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-red-100 dark:bg-red-500/10">
-          <Lock className="h-8 w-8 text-red-600 dark:text-red-400" />
+    <div className="mx-6 mt-3 flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50/80 px-4 py-3 text-sm dark:border-red-500/30 dark:bg-red-500/10">
+      <div className="flex items-start gap-3">
+        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
+        <div>
+          <div className="font-medium text-red-700 dark:text-red-300">
+            Licensed features are unavailable
+          </div>
+          <div className="text-red-700/90 dark:text-red-300/90">
+            {status.locked_reason || 'This licence reached its hard-stop boundary.'}{' '}
+            Open/core features, ingest, search, and stored data remain available.
+          </div>
         </div>
-        <div className="space-y-2">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Subscription Expired
-          </h1>
-          <p className="text-muted-foreground">
-            {reason || 'Your subscription has expired. Data is preserved but inaccessible until you resubscribe.'}
-          </p>
-        </div>
+      </div>
+      {offline ? (
+        <Link
+          to="/settings/license"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-red-700"
+        >
+          <KeyRound className="h-3.5 w-3.5" />
+          Import licence
+        </Link>
+      ) : (
         <a
           href="https://app.nano.rs"
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center justify-center rounded-md bg-primary px-6 py-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+          className="inline-flex shrink-0 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-red-700"
         >
-          Resubscribe at app.nano.rs
+          Renew licence
         </a>
-        <p className="text-xs text-muted-foreground">
-          Your data is safe. Full access will be restored within 5 minutes of resubscribing.
-        </p>
-      </div>
-    </div>
-  );
-}
-
-/**
- * Air-gapped lockout (NAN-1222). An air-gapped deployment without a valid,
- * non-expired signed offline license fails closed. There is no outbound network
- * to resubscribe over, so recovery uses an exact signed C05 file or a
- * nonce-bound signed clock-recovery response. The CTA routes to the in-app C05
- * surface (which is license-guard-exempt server-side and un-overlaid client-side).
- */
-function AirgapLockoutOverlay({ reason }: { reason?: string }) {
-  return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-background/95 backdrop-blur-sm">
-      <div className="mx-auto max-w-md text-center space-y-6 p-8">
-        <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-red-100 dark:bg-red-500/10">
-          <Lock className="h-8 w-8 text-red-600 dark:text-red-400" />
-        </div>
-        <div className="space-y-2">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            License Required
-          </h1>
-          <p className="text-muted-foreground">
-            {reason ||
-              'This air-gapped deployment requires a signed C05 license file. Install or recover the license to unlock access.'}
-          </p>
-        </div>
-        <Link
-          to="/settings/license"
-          className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-6 py-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
-        >
-          <KeyRound className="h-4 w-4" />
-          Import offline license
-        </Link>
-        <p className="text-xs text-muted-foreground">
-          Your data is safe. Access is restored as soon as a valid signed
-          C05 file or matching clock-recovery response is accepted.
-        </p>
-      </div>
+      )}
     </div>
   );
 }

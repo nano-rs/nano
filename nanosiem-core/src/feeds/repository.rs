@@ -81,7 +81,7 @@ impl FeedRepository {
         if let Some(ref pattern) = feed.match_pattern {
             if !pattern.is_empty() {
                 // Use ClickHouse's match() function for regex
-                let escaped_pattern = pattern.replace('\\', "\\\\").replace('\'', "''");
+                let escaped_pattern = crate::sql_hygiene::escape_sql_string(pattern);
                 return format!("match(source_type, '{}')", escaped_pattern);
             }
         }
@@ -362,8 +362,23 @@ impl FeedRepository {
             self.get_stats_clickhouse(ch_client, &feeds, &BTreeSet::new())
                 .await
         } else {
-            // Legacy: use PostgreSQL
-            self.get_stats_postgres(&feeds).await
+            #[cfg(feature = "enterprise")]
+            {
+                // Legacy enterprise installs may still retain PostgreSQL logs.
+                self.get_stats_postgres(&feeds).await
+            }
+            #[cfg(not(feature = "enterprise"))]
+            {
+                Ok(feeds
+                    .iter()
+                    .map(|feed| FeedStats {
+                        feed_id: feed.id,
+                        feed_name: feed.name.clone(),
+                        event_count: 0,
+                        last_event_at: None,
+                    })
+                    .collect())
+            }
         }
     }
 
@@ -445,6 +460,7 @@ impl FeedRepository {
     }
 
     /// Get feed statistics from PostgreSQL (legacy)
+    #[cfg(feature = "enterprise")]
     async fn get_stats_postgres(
         &self,
         _feeds: &[Feed],
@@ -493,8 +509,36 @@ impl FeedRepository {
             self.get_health_metrics_clickhouse(ch_client, &feed, &BTreeSet::new())
                 .await
         } else {
-            // Legacy: use PostgreSQL
-            self.get_health_metrics_postgres(&feed).await
+            #[cfg(feature = "enterprise")]
+            {
+                // Legacy enterprise installs may still retain PostgreSQL logs.
+                self.get_health_metrics_postgres(&feed).await
+            }
+            #[cfg(not(feature = "enterprise"))]
+            {
+                Ok(FeedHealthMetrics {
+                    feed_id: feed.id,
+                    feed_name: feed.name,
+                    total_events: 0,
+                    events_last_24h: 0,
+                    events_last_hour: 0,
+                    avg_events_per_hour: 0.0,
+                    last_event_at: None,
+                    first_event_at: None,
+                    data_freshness_hours: None,
+                    ingestion_rate_trend: "no_data".to_string(),
+                    health_status: if feed.enabled {
+                        "no_data".to_string()
+                    } else {
+                        "disabled".to_string()
+                    },
+                    total_size_bytes: 0,
+                    avg_event_size_bytes: 0.0,
+                    error_rate_24h: 0.0,
+                    parse_errors_24h: 0,
+                    storage_errors_24h: 0,
+                })
+            }
         }
     }
 
@@ -682,6 +726,7 @@ impl FeedRepository {
     }
 
     /// Get health metrics from PostgreSQL (legacy)
+    #[cfg(feature = "enterprise")]
     async fn get_health_metrics_postgres(
         &self,
         feed: &Feed,
@@ -824,8 +869,15 @@ impl FeedRepository {
             self.get_ingestion_history_clickhouse(ch_client, &feed, &BTreeSet::new())
                 .await
         } else {
-            // Legacy: use PostgreSQL
-            self.get_ingestion_history_postgres(&feed).await
+            #[cfg(feature = "enterprise")]
+            {
+                // Legacy enterprise installs may still retain PostgreSQL logs.
+                self.get_ingestion_history_postgres(&feed).await
+            }
+            #[cfg(not(feature = "enterprise"))]
+            {
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -895,6 +947,7 @@ impl FeedRepository {
     }
 
     /// Get ingestion history from PostgreSQL (legacy)
+    #[cfg(feature = "enterprise")]
     async fn get_ingestion_history_postgres(
         &self,
         feed: &Feed,
@@ -944,8 +997,15 @@ impl FeedRepository {
             self.get_discovered_sourcetypes_clickhouse(ch_client, &BTreeSet::new())
                 .await
         } else {
-            // Legacy: use PostgreSQL
-            self.get_discovered_sourcetypes_postgres().await
+            #[cfg(feature = "enterprise")]
+            {
+                // Legacy enterprise installs may still retain PostgreSQL logs.
+                self.get_discovered_sourcetypes_postgres().await
+            }
+            #[cfg(not(feature = "enterprise"))]
+            {
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -1016,6 +1076,7 @@ impl FeedRepository {
     }
 
     /// Get discovered sourcetypes from PostgreSQL (legacy)
+    #[cfg(feature = "enterprise")]
     async fn get_discovered_sourcetypes_postgres(
         &self,
     ) -> Result<Vec<(String, i64)>, FeedRepositoryError> {

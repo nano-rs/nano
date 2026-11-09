@@ -79,6 +79,9 @@ impl ApiKeyApiError {
             ApiKeyServiceError::RepositoryError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "database_error")
             }
+            ApiKeyServiceError::OwnerPermissionsUnavailable => {
+                (StatusCode::SERVICE_UNAVAILABLE, "owner_permissions_unavailable")
+            }
         };
 
         // NAN-2266: 5xx detail goes to the log (the request id is on the
@@ -133,6 +136,11 @@ pub struct ApiKeySummary {
     #[schema(value_type = Option<String>)]
     pub created_by: Option<Uuid>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// NAN-5044: stored permissions the key's owner no longer holds. They are
+    /// withheld at request time (owner-clamp `enforce`), or only reported
+    /// (`audit`). Always empty for ownerless and `system`-owned keys.
+    #[serde(default)]
+    pub withheld_permissions: Vec<String>,
 }
 
 impl From<ApiKey> for ApiKeySummary {
@@ -150,6 +158,7 @@ impl From<ApiKey> for ApiKeySummary {
             last_used_ip: key.last_used_ip,
             created_by: key.created_by,
             created_at: key.created_at,
+            withheld_permissions: Vec::new(),
         }
     }
 }
@@ -184,7 +193,20 @@ pub async fn list_keys(
     })?;
 
     let total = keys.len() as i64;
-    let api_keys: Vec<ApiKeySummary> = keys.into_iter().map(ApiKeySummary::from).collect();
+    let mut api_keys = Vec::with_capacity(keys.len());
+    for key in keys {
+        // NAN-5044: surface what the owner clamp withholds. Best-effort — a
+        // resolution failure must not break the listing (the request path
+        // fails closed on its own).
+        let withheld = state
+            .api_key_service
+            .withheld_permissions(&key)
+            .await
+            .unwrap_or_default();
+        let mut summary = ApiKeySummary::from(key);
+        summary.withheld_permissions = withheld;
+        api_keys.push(summary);
+    }
 
     Ok(Json(ApiKeyListResponse { api_keys, total }))
 }
@@ -474,14 +496,40 @@ pub async fn update_key(
     check_permission(&auth, permissions::APIKEYS_EDIT)
         .map_err(|(s, j)| (s, Json(ApiKeyApiError::new(&j.error, &j.message))))?;
 
-    // Prevent privilege escalation: caller cannot grant permissions they don't hold
+    let current = state.api_key_service.get_key(*id).await.map_err(|e| {
+        let (status, err) = ApiKeyApiError::from_service_error(&e);
+        (status, Json(err))
+    })?;
+
+    // NAN-5029: a key managing ITSELF may only tighten itself. A leaked key
+    // must not be able to clear its own expiry or rate limit and persist.
+    if auth.is_api_key {
+        if let Err(reason) = self_update_is_tightening(
+            current.expires_at,
+            current.rate_limit,
+            request.expires_at,
+            request.rate_limit,
+        ) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ApiKeyApiError::new("interactive_session_required", reason)),
+            ));
+        }
+    }
+
+    // NAN-5029 (cross-user): editing ANOTHER user's key is managing that user —
+    // the editor needs authority over the owner (NAN-5027).
+    ensure_can_manage_key_owner(&state, &auth, &current).await?;
+
+    // Prevent privilege escalation. NAN-5044: the new set is bounded by what
+    // the key's OWNER holds now (not by the editor), so a key can never be
+    // raised above its owner. Ownerless legacy keys fall back to the editor.
     if let Some(ref perms) = request.permissions {
-        let caller_perms: std::collections::HashSet<&str> =
-            auth.claims.permissions.iter().map(|s| s.as_str()).collect();
+        let bound = key_permission_bound(&state, &auth, &current).await?;
         let invalid: Vec<&str> = perms
             .iter()
             .map(|s| s.as_str())
-            .filter(|p| !caller_perms.contains(p))
+            .filter(|p| !bound.contains(*p))
             .collect();
         if !invalid.is_empty() {
             return Err((
@@ -489,7 +537,7 @@ pub async fn update_key(
                 Json(ApiKeyApiError::new(
                     "permission_escalation",
                     &format!(
-                        "Cannot grant permissions you don't hold: {}",
+                        "Cannot grant permissions the key's owner doesn't hold: {}",
                         invalid.join(", ")
                     ),
                 )),
@@ -524,6 +572,106 @@ pub async fn update_key(
     ).await;
 
     Ok(Json(ApiKeySummary::from(key)))
+}
+
+/// NAN-5029: may a key's self-update be applied? Only changes that TIGHTEN it
+/// are allowed: an earlier (or first) expiry and a lower (or first) rate
+/// limit. Clearing either (`null`), extending the expiry or raising the limit
+/// needs an interactive session. Absent fields are unchanged and always pass.
+pub(crate) fn self_update_is_tightening(
+    current_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    current_rate_limit: Option<i32>,
+    requested_expires_at: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    requested_rate_limit: Option<Option<i32>>,
+) -> Result<(), &'static str> {
+    match requested_expires_at {
+        None => {}
+        Some(None) => return Err("An API key cannot remove its own expiry; use an interactive session."),
+        Some(Some(new)) => {
+            if let Some(cur) = current_expires_at {
+                if new > cur {
+                    return Err("An API key cannot extend its own expiry; use an interactive session.");
+                }
+            }
+        }
+    }
+    match requested_rate_limit {
+        None => {}
+        Some(None) => {
+            return Err("An API key cannot remove its own rate limit; use an interactive session.")
+        }
+        Some(Some(new)) => {
+            if let Some(cur) = current_rate_limit {
+                if new > cur {
+                    return Err("An API key cannot raise its own rate limit; use an interactive session.");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The key's owner, when it is a principal other than the caller.
+fn foreign_owner(auth: &AuthContext, key: &ApiKey) -> Option<Uuid> {
+    match key.created_by {
+        Some(owner) if auth.is_api_key || owner != auth.user_id() => Some(owner),
+        _ => None,
+    }
+}
+
+/// NAN-5029: changing, re-enabling or re-secreting ANOTHER user's key is
+/// managing that user — require authority over the owner (NAN-5027).
+/// A key acting on itself, and a session acting on its own keys, pass.
+async fn ensure_can_manage_key_owner(
+    state: &AppState,
+    auth: &AuthContext,
+    key: &ApiKey,
+) -> Result<(), (StatusCode, Json<ApiKeyApiError>)> {
+    let Some(owner) = foreign_owner(auth, key) else {
+        return Ok(());
+    };
+    if auth.api_key_id == Some(key.id) {
+        return Ok(());
+    }
+    crate::handlers::grant_authz::ensure_can_manage_principal(
+        auth,
+        &state.pool,
+        permissions::APIKEYS_EDIT,
+        owner,
+        None,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|g| (g.status, Json(ApiKeyApiError::new(g.code, &g.message))))
+}
+
+/// The permissions a key's permission set may contain (NAN-5044): what its
+/// owner holds NOW, further bounded by the caller. Ownerless legacy keys are
+/// bounded by the caller alone.
+async fn key_permission_bound(
+    state: &AppState,
+    auth: &AuthContext,
+    key: &ApiKey,
+) -> Result<std::collections::HashSet<String>, (StatusCode, Json<ApiKeyApiError>)> {
+    let caller: std::collections::HashSet<String> =
+        auth.claims.permissions.iter().cloned().collect();
+    let Some(owner) = key.created_by else {
+        return Ok(caller);
+    };
+    let owner_perms = nanosiem_core::auth::PermissionResolver::new(state.pool.clone())
+        .resolve_checked(owner)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "api-key owner permission resolution failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiKeyApiError::new(
+                    "owner_permissions_unavailable",
+                    "The key owner's permissions are temporarily unavailable; retry shortly.",
+                )),
+            )
+        })?;
+    Ok(owner_perms.into_iter().filter(|p| caller.contains(p)).collect())
 }
 
 /// Delete an API key
@@ -614,6 +762,14 @@ pub async fn enable_key(
         .map_err(|(s, j)| (s, Json(ApiKeyApiError::new(&j.error, &j.message))))?;
     check_permission(&auth, permissions::APIKEYS_EDIT)
         .map_err(|(s, j)| (s, Json(ApiKeyApiError::new(&j.error, &j.message))))?;
+
+    // NAN-5029: re-enabling or re-secreting ANOTHER user's key is managing that
+    // user (a reset hands the caller a working secret with the owner's authority).
+    let current = state.api_key_service.get_key(*id).await.map_err(|e| {
+        let (status, err) = ApiKeyApiError::from_service_error(&e);
+        (status, Json(err))
+    })?;
+    ensure_can_manage_key_owner(&state, &auth, &current).await?;
 
     // Use IP from ClientContext (populated by auth middleware with ConnectInfo fallback)
     let ip_address = client.ip_address.clone();
@@ -735,6 +891,14 @@ pub async fn reset_key(
     check_permission(&auth, permissions::APIKEYS_EDIT)
         .map_err(|(s, j)| (s, Json(ApiKeyApiError::new(&j.error, &j.message))))?;
 
+    // NAN-5029: re-enabling or re-secreting ANOTHER user's key is managing that
+    // user (a reset hands the caller a working secret with the owner's authority).
+    let current = state.api_key_service.get_key(*id).await.map_err(|e| {
+        let (status, err) = ApiKeyApiError::from_service_error(&e);
+        (status, Json(err))
+    })?;
+    ensure_can_manage_key_owner(&state, &auth, &current).await?;
+
     let user_id = if auth.is_api_key {
         None
     } else {
@@ -768,6 +932,96 @@ pub async fn reset_key(
     Ok(Json(result))
 }
 
+/// Owner-clamp mode for API keys (NAN-5044).
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct OwnerClampSettings {
+    /// `enforce` (default): keys run with stored ∩ owner's current permissions.
+    /// `audit`: stored permissions are used unchanged and withheld ones are only
+    /// logged — a one-release escape hatch, scheduled for removal in v2.1.
+    pub mode: nanosiem_core::auth::OwnerClampMode,
+}
+
+/// Get the API-key owner-clamp mode
+///
+/// GET /api/settings/api-keys/owner-clamp
+#[utoipa::path(
+    get,
+    path = "/api/settings/api-keys/owner-clamp",
+    tag = "api_keys",
+    responses(
+        (status = 200, description = "Current owner-clamp mode", body = OwnerClampSettings),
+        (status = 403, description = "Permission denied", body = ApiKeyApiError),
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn get_owner_clamp(
+    State(state): State<AppState>,
+    auth: axum::Extension<AuthContext>,
+) -> Result<Json<OwnerClampSettings>, (StatusCode, Json<ApiKeyApiError>)> {
+    check_permission(&auth, permissions::APIKEYS_VIEW)
+        .map_err(|(s, j)| (s, Json(ApiKeyApiError::new(&j.error, &j.message))))?;
+    Ok(Json(OwnerClampSettings {
+        mode: state.api_key_service.owner_clamp_mode().await,
+    }))
+}
+
+/// Set the API-key owner-clamp mode
+///
+/// Switching to `audit` lets keys keep permissions their owners no longer
+/// hold, so it is session-only and needs both `settings:system` and
+/// `apikeys:edit`.
+///
+/// PUT /api/settings/api-keys/owner-clamp
+#[utoipa::path(
+    put,
+    path = "/api/settings/api-keys/owner-clamp",
+    tag = "api_keys",
+    request_body = OwnerClampSettings,
+    responses(
+        (status = 200, description = "Updated owner-clamp mode", body = OwnerClampSettings),
+        (status = 403, description = "Permission denied — session-only endpoint", body = ApiKeyApiError),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_owner_clamp(
+    State(state): State<AppState>,
+    auth: axum::Extension<AuthContext>,
+    client: axum::Extension<ClientContext>,
+    Json(request): Json<OwnerClampSettings>,
+) -> Result<Json<OwnerClampSettings>, (StatusCode, Json<ApiKeyApiError>)> {
+    require_session_auth(&auth)
+        .map_err(|(s, j)| (s, Json(ApiKeyApiError::new(&j.error, &j.message))))?;
+    check_permission(&auth, permissions::SETTINGS_SYSTEM)
+        .map_err(|(s, j)| (s, Json(ApiKeyApiError::new(&j.error, &j.message))))?;
+    check_permission(&auth, permissions::APIKEYS_EDIT)
+        .map_err(|(s, j)| (s, Json(ApiKeyApiError::new(&j.error, &j.message))))?;
+
+    state
+        .api_key_service
+        .set_owner_clamp_mode(request.mode)
+        .await
+        .map_err(|e| {
+            let (status, err) = ApiKeyApiError::from_service_error(&e);
+            (status, Json(err))
+        })?;
+
+    state.emit_audit_durable(
+        AuditEvent::builder(AuditSource::ApiKey, APIKEY_UPDATED)
+            .actor(Some(auth.user_id()), None)
+            .api_key(auth.api_key_id, auth.api_key_name.clone())
+            .resource("settings", None, Some("api_key_owner_clamp".to_string()))
+            .client_context(&client)
+            .details(serde_json::json!({ "owner_clamp_mode": request.mode.as_str() }))
+            .build(),
+    ).await;
+
+    Ok(Json(OwnerClampSettings { mode: request.mode }))
+}
+
+#[cfg(test)]
+#[path = "api_keys_self_update_tests.rs"]
+mod self_update_tests;
+
 /// OpenAPI documentation for API key management endpoints
 #[derive(utoipa::OpenApi)]
 #[openapi(
@@ -781,9 +1035,13 @@ pub async fn reset_key(
         enable_key,
         disable_key,
         reset_key,
+        get_owner_clamp,
+        update_owner_clamp,
     ),
     components(schemas(
         ApiKeyApiError,
+        OwnerClampSettings,
+        nanosiem_core::auth::OwnerClampMode,
         ApiKeyListResponse,
         ApiKeySummary,
         ApiKeyUsagePoint,

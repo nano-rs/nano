@@ -46,7 +46,7 @@ jobs:
     # The cargo container joins the host network so it reaches the Postgres port
     # published on 127.0.0.1, and writes its target dir to an in-container path
     # so no root-owned build artifacts land in the workspace.
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, nano-pr]
     timeout-minutes: 45
     env:
       PG_CONTAINER: nan1272-pgit-${{ github.run_id }}
@@ -206,17 +206,24 @@ jobs:
             -e DATABASE_URL="$DATABASE_URL" \
             -e TEST_DATABASE_URL="$DATABASE_URL" \
             -e NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 \
+            -e NANOSIEM_REQUIRE_RELATION_INVENTORY=1 \
             "$RUST_IMAGE" \
             bash -euo pipefail -c '
               cargo test --workspace --lib --tests --no-fail-fast -- --test-threads=1
+              # NAN-5056: --workspace builds nanosiem-api WITHOUT its enterprise
+              # feature, so the enterprise-only OpenAPI contract tests (hunts
+              # recon surface, desktop wire spec) need their own run.
+              cargo test -p nanosiem-api --features enterprise --lib openapi::tests
               cargo test -p nanosiem-core --test migration_seed_parity -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test api_key_rate_limit_integration -- --ignored
+              cargo test -p nanosiem-core --test entitlement_grant_ai_credits_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-api-lib --test grant_authority_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test source_scope_integration -- --ignored
+              cargo test -p nanosiem-core --test ip_allowlist_fail_closed_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test webhook_delivery_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-core --test detection_delete_quiesce_integration -- --ignored
-              cargo test -p nanosiem-core --test tuning_atomic_state_integration -- --ignored --test-threads=1
-              NANOSIEM_ENCRYPTION_KEY="$CREDENTIAL_SUITE_ENCRYPTION_KEY" cargo test -p nanosiem-core --test credential_delete_in_use_integration -- --ignored --test-threads=1
+              cargo test -p nanosiem-core --features enterprise --test tuning_atomic_state_integration -- --ignored --test-threads=1
+              NANOSIEM_ENCRYPTION_KEY="$CREDENTIAL_SUITE_ENCRYPTION_KEY" cargo test -p nanosiem-core --features enterprise --test credential_delete_in_use_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test notebook_tab_revocation_integration -- --ignored --test-threads=1
               cargo test -p nanosiem-enterprise --test settings_integration -- --ignored
               cargo test -p nanosiem-enterprise --test playbook_acl_integration -- --ignored --test-threads=1

@@ -28,7 +28,61 @@ impl ParserService {
             .await
             .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
         self.vector_config.render_parsers(&parsers).await?;
+        self.record_render_quarantine(&parsers).await;
         Ok(())
+    }
+
+    /// NAN-5012 / NAN-5057: tell the operator when the render degraded a
+    /// source (`vrl_safety::quarantine`), on the source's existing validation
+    /// banner. Only notes this check wrote (prefix
+    /// [`crate::parsers::vrl_safety::QUARANTINE_NOTE_PREFIX`]) are ever
+    /// replaced or cleared, so a real validation error is never overwritten.
+    /// Best-effort: the rendered config is already correct without it.
+    /// `validation_error` is not a publication-trigger column, so this does
+    /// not cause another render.
+    async fn record_render_quarantine(&self, parsers: &[crate::parsers::types::Parser]) {
+        use crate::parsers::vrl_safety::{quarantine_note, QUARANTINE_NOTE_PREFIX};
+        let like = format!("{QUARANTINE_NOTE_PREFIX}%");
+        for parser in parsers {
+            // The same verdict the render applied (stored-text check, then
+            // the rendered-document guard).
+            let note = quarantine_note(&self.vector_config.render_safe_parser(parser).1);
+            let current = parser.validation_error.as_deref();
+            let ours = current.is_some_and(|e| e.starts_with(QUARANTINE_NOTE_PREFIX));
+            let result = match &note {
+                Some(note) if current != Some(note.as_str()) && (current.is_none() || ours) => {
+                    tracing::warn!(
+                        target: "security",
+                        log_source_id = %parser.id,
+                        log_source = %parser.name,
+                        "log source degraded by the deploy safety check: {note}"
+                    );
+                    sqlx::query(
+                        "UPDATE log_sources SET validation_error = $2 \
+                         WHERE id = $1 AND (validation_error IS NULL OR validation_error LIKE $3)",
+                    )
+                    .bind(parser.id)
+                    .bind(note)
+                    .bind(&like)
+                    .execute(&self.pool)
+                    .await
+                }
+                None if ours => {
+                    sqlx::query(
+                        "UPDATE log_sources SET validation_error = NULL \
+                         WHERE id = $1 AND validation_error LIKE $2",
+                    )
+                    .bind(parser.id)
+                    .bind(&like)
+                    .execute(&self.pool)
+                    .await
+                }
+                _ => continue,
+            };
+            if let Err(e) = result {
+                tracing::warn!(log_source_id = %parser.id, "could not record the deploy safety note: {e}");
+            }
+        }
     }
 
     /// Deploy all enabled parsers to Vector
@@ -44,6 +98,7 @@ impl ParserService {
             .await
             .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
         self.vector_config.deploy_and_reload(&parsers).await?;
+        self.record_render_quarantine(&parsers).await;
         Ok(())
     }
 
@@ -416,7 +471,10 @@ impl ParserService {
             success: true,
             parser_id,
             action: DeploymentAction::Deploy.as_str().to_string(),
-            message: format!("Parser '{}' deployed successfully", parser.name),
+            message: crate::parsers::vector_config_remote_delivery::with_delivery_note(format!(
+                "Parser '{}' deployed successfully",
+                parser.name
+            )),
             validation_result: Some(validate_result),
             deployment_id: Some(deployment.id),
         })

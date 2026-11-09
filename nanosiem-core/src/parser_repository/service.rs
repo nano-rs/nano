@@ -897,7 +897,10 @@ impl ParserRepositoryService {
         if let Some(id) = req.dispatch_source_config_id {
             return Ok(Some(id));
         }
-        let ingestion_method = req.ingestion_method.as_deref().unwrap_or("routed");
+        let raw = req.ingestion_method.as_deref().unwrap_or("routed");
+        // NAN-5033: resolve on the canonical name (case / alias), the same
+        // value the import stores.
+        let ingestion_method = crate::log_sources::ingest_transport::canonical(raw).unwrap_or(raw);
         let config_type = Self::config_type_for_ingestion_method(ingestion_method);
         sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM source_configurations WHERE config_type = $1 \
@@ -996,10 +999,22 @@ impl ParserRepositoryService {
         );
 
         // ingestion_method: how logs arrive (routed, kafka, aws_s3, etc.)
-        let ingestion_method = req
-            .ingestion_method
-            .clone()
-            .unwrap_or_else(|| "routed".to_string());
+        // NAN-5033: this becomes `log_sources.source_type`, which picks the
+        // Vector input lane and is embedded in generated VRL. Accept only a
+        // known ingestion method, stored in its canonical form.
+        let ingestion_method = match req.ingestion_method.as_deref() {
+            None => "routed".to_string(),
+            Some(method) => crate::log_sources::ingest_transport::canonical(method)
+                .ok_or_else(|| {
+                    ParserRepositoryError::InvalidRequest(
+                        crate::log_sources::ingest_transport::unsupported_message(
+                            "ingestion_method",
+                            method,
+                        ),
+                    )
+                })?
+                .to_string(),
+        };
 
         // NAN-1270: resolve the dispatch source-configuration. The single-import
         // UI pins one (and creates the routing rule); batch import / raw API
@@ -1114,6 +1129,18 @@ impl ParserRepositoryService {
             .then(|| parser.normalize_vrl.clone())
             .flatten();
 
+        // NAN-5057: a repository parser's VRL was stored `validated = true`
+        // without ever being compiled. Record the real verdict (the parser
+        // allowlist); an invalid import still lands, but is quarantined at
+        // render instead of shipping to Vector. Enrichment imports carry their
+        // logic in `normalize_vrl`, checked by `validate_enrichment_import` and
+        // the enrichment lane guard.
+        let import_validation: Result<(), String> = if is_enrichment {
+            Ok(())
+        } else {
+            Self::repository_vrl_verdict(&new_log_source.parser_vrl)
+        };
+
         let mut tx = self
             .pg_pool
             .begin()
@@ -1148,7 +1175,7 @@ impl ParserRepositoryService {
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                     $13, $14, $15, $16,
-                    true, NULL,
+                    $25, $26,
                     $17, $18, $19,
                     $20, $21, $22, $23, $24)
             RETURNING id
@@ -1178,6 +1205,8 @@ impl ParserRepositoryService {
         .bind(&enrich_source)
         .bind(&target_table)
         .bind(&normalize_vrl)
+        .bind(import_validation.is_ok())
+        .bind(import_validation.as_ref().err())
         .fetch_one(&mut *tx)
         .await
         .map_err(ParserRepositoryError::Database)?;
@@ -1270,6 +1299,18 @@ impl ParserRepositoryService {
             log_source_name: new_log_source.name,
             routing_rule_id,
         })
+    }
+
+    /// The validation verdict for repository-supplied parser VRL: the same
+    /// env-interpolation refusal and parser-allowlist check a save through the
+    /// log-source service applies (NAN-5057). Blank VRL is left as it was
+    /// (valid) — a stub carries no code to check.
+    fn repository_vrl_verdict(vrl: &str) -> Result<(), String> {
+        if vrl.trim().is_empty() {
+            return Ok(());
+        }
+        crate::vector_env::reject_vrl_interpolation("parser_vrl", vrl)?;
+        crate::parsers::vrl_safety::check_program("parser_vrl", vrl)
     }
 
     /// Map a parser `ingestion_method` to the `source_configurations.config_type`
@@ -1597,6 +1638,16 @@ impl ParserRepositoryService {
             .update(log_source_id, &update)
             .await
             .map_err(|e| ParserRepositoryError::LogSourceService(e.to_string()))?;
+
+        // NAN-5057: the upstream VRL replaces the parser without passing the
+        // log-source service, so record its real verdict here.
+        if let Some(ref vrl) = update.parser_vrl {
+            let verdict = Self::repository_vrl_verdict(vrl);
+            ls_repo
+                .set_validation_status(log_source_id, verdict.is_ok(), verdict.err().as_deref())
+                .await
+                .map_err(|e| ParserRepositoryError::LogSourceService(e.to_string()))?;
+        }
 
         // NAN-2268: union the routing values in one statement, after the field
         // update. Appending to the stored array rather than replacing it means

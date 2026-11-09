@@ -558,6 +558,7 @@ impl SearchService {
         limit: Option<usize>,
         useother: bool,
         cont: bool,
+        scope: &ScopeSet,
     ) -> Result<SearchResponse, SearchError> {
         let started = Instant::now();
         let skip_field_stats = request.skip_field_stats;
@@ -594,9 +595,13 @@ impl SearchService {
         request.skip_field_stats = true;
         let mut warnings = Vec::new();
 
-        // `source` already contains the caller's structurally injected source
-        // gate. Re-enter with an unrestricted ScopeSet so it is applied once.
-        let inner_scope = ScopeSet::unrestricted();
+        // NAN-5021 (C-S7): re-enter under the CALLER's scope. `source` already
+        // carries the structurally injected gate, but the re-entry queries are
+        // pretty-printed, re-parsed and extended with filters built from RESULT
+        // values, so the gate must be re-proven rather than trusted to survive
+        // serialization. Re-gating an already-gated scan only repeats the
+        // predicate; it cannot change which rows match.
+        let inner_scope = scope.clone();
         // Estimating only the leading field is unsafe for tuple splits such as
         // `by low_card, high_card`. Until the query AST supports a tuple-valued
         // uniq expression, all multi-field splits start with the bounded

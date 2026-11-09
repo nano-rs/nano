@@ -177,6 +177,20 @@ impl SessionRepository {
         Ok(result.rows_affected())
     }
 
+    /// NAN-5014: revoke every session AND outstanding access token of
+    /// `user_id` (stamps `tokens_valid_from` via the shared F-32 primitive).
+    /// Returns the number of sessions deleted.
+    pub async fn revoke_user_credentials(&self, user_id: Uuid) -> Result<u64, SessionRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        crate::auth::repository::revoke_credentials_in(&mut tx, user_id).await?;
+        tx.commit().await?;
+        Ok(count as u64)
+    }
+
     /// M6: Delete oldest sessions for a user, keeping the most recent ones
     pub async fn delete_oldest_user_sessions(
         &self,

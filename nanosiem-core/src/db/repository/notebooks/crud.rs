@@ -5,6 +5,8 @@
 use chrono::Utc;
 use uuid::Uuid;
 
+use crate::auth::ViewerScope;
+
 use crate::models::notebook::{
     NewNotebook, Notebook, NotebookSummary, NotebookWithOwner, UpdateNotebook,
 };
@@ -80,9 +82,9 @@ impl NotebookRepository {
     pub async fn find_by_id_for_user(
         &self,
         id: Uuid,
-        user_id: Uuid,
+        viewer: &ViewerScope,
     ) -> Result<NotebookWithOwner, NotebookRepositoryError> {
-        let result = sqlx::query_as::<_, NotebookWithOwner>(&format!(
+        let sql = format!(
             r#"
             SELECT DISTINCT n.*, u.name as owner_name
             FROM notebooks n
@@ -91,63 +93,29 @@ impl NotebookRepository {
             LEFT JOIN user_groups ug ON ug.group_id = ns.shared_with_group_id AND ug.user_id = $2
             WHERE n.id = $1 AND {visible}
             "#,
-            visible = notebook_visible_to_user_at(2),
-        ))
-        .bind(id)
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(NotebookRepositoryError::AccessDenied(id))?;
+            visible = notebook_visible_to_user_at(2, viewer.deny_param(3)),
+        );
+        let mut query = sqlx::query_as::<_, NotebookWithOwner>(&sql)
+            .bind(id)
+            .bind(viewer.user_id());
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let result = query
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(NotebookRepositoryError::AccessDenied(id))?;
 
         Ok(result)
-    }
-
-    /// Whether `user_id` can see the given case, mirroring
-    /// `CaseRepository::check_user_access` visibility rules
-    /// (created_by / assigned_to / public / group-membership).
-    ///
-    /// NAN-1739: used to gate access to case-linked notebooks so a notebook
-    /// can never expose or accept mutations beyond the underlying case's
-    /// visibility. Kept in the notebook repo (nanosiem-core) which can query
-    /// the `cases` / `case_groups` / `user_groups` tables directly.
-    pub async fn user_can_access_case(
-        &self,
-        case_id: Uuid,
-        user_id: Uuid,
-    ) -> Result<bool, NotebookRepositoryError> {
-        let has_access = sqlx::query_scalar::<_, bool>(
-            r#"
-            SELECT EXISTS (
-                SELECT 1 FROM cases c
-                WHERE c.id = $1
-                  AND (
-                      c.created_by = $2
-                      OR c.assigned_to = $2
-                      OR c.visibility = 'public'
-                      OR (c.visibility = 'group' AND EXISTS (
-                          SELECT 1 FROM case_groups cg
-                          JOIN user_groups ug ON ug.group_id = cg.group_id
-                          WHERE cg.case_id = c.id AND ug.user_id = $2
-                      ))
-                  )
-            )
-            "#,
-        )
-        .bind(case_id)
-        .bind(user_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(has_access)
     }
 
     /// Check if user can edit a notebook (owner or has edit permission)
     pub async fn can_user_edit(
         &self,
         notebook_id: Uuid,
-        user_id: Uuid,
+        viewer: &ViewerScope,
     ) -> Result<bool, NotebookRepositoryError> {
-        let result = sqlx::query_scalar::<_, bool>(&format!(
+        let sql = format!(
             r#"
             SELECT EXISTS(
                 SELECT 1 FROM notebooks n
@@ -161,12 +129,15 @@ impl NotebookRepository {
                   )
             )
             "#,
-            case_visible = notebook_case_visible_to_user(2),
-        ))
-        .bind(notebook_id)
-        .bind(user_id)
-        .fetch_one(&self.pool)
-        .await?;
+            case_visible = notebook_case_visible_to_user(2, viewer.deny_param(3)),
+        );
+        let mut query = sqlx::query_scalar::<_, bool>(&sql)
+            .bind(notebook_id)
+            .bind(viewer.user_id());
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let result = query.fetch_one(&self.pool).await?;
 
         Ok(result)
     }
@@ -174,9 +145,9 @@ impl NotebookRepository {
     /// List notebooks accessible to a user with entry counts
     pub async fn list_for_user(
         &self,
-        user_id: Uuid,
+        viewer: &ViewerScope,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
+        let sql = format!(
             r#"
             SELECT DISTINCT
                 n.*,
@@ -194,11 +165,14 @@ impl NotebookRepository {
             WHERE {visible}
             ORDER BY n.updated_at DESC
             "#,
-            visible = notebook_visible_to_user_at(1),
-        ))
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
+            visible = notebook_visible_to_user_at(1, viewer.deny_param(2)),
+        );
+        let mut query = sqlx::query_as::<_, NotebookSummary>(&sql)
+            .bind(viewer.user_id());
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let results = query.fetch_all(&self.pool).await?;
 
         Ok(results)
     }
@@ -206,12 +180,12 @@ impl NotebookRepository {
     /// One updated-at-ordered page of every notebook visible to the user.
     pub async fn list_for_user_page(
         &self,
-        user_id: Uuid,
+        viewer: &ViewerScope,
         status: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
+        let sql = format!(
             r#"
             SELECT DISTINCT
                 n.*,
@@ -231,14 +205,17 @@ impl NotebookRepository {
             ORDER BY n.updated_at DESC, n.id DESC
             LIMIT $3 OFFSET $4
             "#,
-            visible = notebook_visible_to_user_at(1),
-        ))
-        .bind(user_id)
-        .bind(status)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            visible = notebook_visible_to_user_at(1, viewer.deny_param(5)),
+        );
+        let mut query = sqlx::query_as::<_, NotebookSummary>(&sql)
+            .bind(viewer.user_id())
+            .bind(status)
+            .bind(limit)
+            .bind(offset);
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let results = query.fetch_all(&self.pool).await?;
 
         Ok(results)
     }
@@ -246,9 +223,9 @@ impl NotebookRepository {
     /// List only the user's own notebooks
     pub async fn list_owned_by_user(
         &self,
-        user_id: Uuid,
+        viewer: &ViewerScope,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
+        let sql = format!(
             r#"
             SELECT
                 n.*,
@@ -264,11 +241,14 @@ impl NotebookRepository {
             WHERE {case_visible} AND n.owner_id = $1
             ORDER BY n.updated_at DESC
             "#,
-            case_visible = notebook_case_visible_to_user(1),
-        ))
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
+            case_visible = notebook_case_visible_to_user(1, viewer.deny_param(2)),
+        );
+        let mut query = sqlx::query_as::<_, NotebookSummary>(&sql)
+            .bind(viewer.user_id());
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let results = query.fetch_all(&self.pool).await?;
 
         Ok(results)
     }
@@ -276,12 +256,12 @@ impl NotebookRepository {
     /// One updated-at-ordered page of notebooks owned by the user.
     pub async fn list_owned_by_user_page(
         &self,
-        user_id: Uuid,
+        viewer: &ViewerScope,
         status: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
+        let sql = format!(
             r#"
             SELECT
                 n.*,
@@ -299,14 +279,17 @@ impl NotebookRepository {
             ORDER BY n.updated_at DESC, n.id DESC
             LIMIT $3 OFFSET $4
             "#,
-            case_visible = notebook_case_visible_to_user(1),
-        ))
-        .bind(user_id)
-        .bind(status)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            case_visible = notebook_case_visible_to_user(1, viewer.deny_param(5)),
+        );
+        let mut query = sqlx::query_as::<_, NotebookSummary>(&sql)
+            .bind(viewer.user_id())
+            .bind(status)
+            .bind(limit)
+            .bind(offset);
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let results = query.fetch_all(&self.pool).await?;
 
         Ok(results)
     }
@@ -314,9 +297,9 @@ impl NotebookRepository {
     /// List notebooks shared with a user
     pub async fn list_shared_with_user(
         &self,
-        user_id: Uuid,
+        viewer: &ViewerScope,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
+        let sql = format!(
             r#"
             SELECT DISTINCT
                 n.*,
@@ -335,11 +318,14 @@ impl NotebookRepository {
               AND (ns.shared_with_user_id = $1 OR ug.user_id IS NOT NULL)
             ORDER BY n.updated_at DESC
             "#,
-            case_visible = notebook_case_visible_to_user(1),
-        ))
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
+            case_visible = notebook_case_visible_to_user(1, viewer.deny_param(2)),
+        );
+        let mut query = sqlx::query_as::<_, NotebookSummary>(&sql)
+            .bind(viewer.user_id());
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let results = query.fetch_all(&self.pool).await?;
 
         Ok(results)
     }
@@ -347,12 +333,12 @@ impl NotebookRepository {
     /// One updated-at-ordered page of notebooks shared with the user.
     pub async fn list_shared_with_user_page(
         &self,
-        user_id: Uuid,
+        viewer: &ViewerScope,
         status: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
+        let sql = format!(
             r#"
             SELECT DISTINCT
                 n.*,
@@ -373,14 +359,17 @@ impl NotebookRepository {
             ORDER BY n.updated_at DESC, n.id DESC
             LIMIT $3 OFFSET $4
             "#,
-            case_visible = notebook_case_visible_to_user(1),
-        ))
-        .bind(user_id)
-        .bind(status)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            case_visible = notebook_case_visible_to_user(1, viewer.deny_param(5)),
+        );
+        let mut query = sqlx::query_as::<_, NotebookSummary>(&sql)
+            .bind(viewer.user_id())
+            .bind(status)
+            .bind(limit)
+            .bind(offset);
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let results = query.fetch_all(&self.pool).await?;
 
         Ok(results)
     }
@@ -388,9 +377,9 @@ impl NotebookRepository {
     /// Get active notebook for user (if any)
     pub async fn get_active_for_user(
         &self,
-        user_id: Uuid,
+        viewer: &ViewerScope,
     ) -> Result<Option<NotebookWithOwner>, NotebookRepositoryError> {
-        let result = sqlx::query_as::<_, NotebookWithOwner>(&format!(
+        let sql = format!(
             r#"
             SELECT n.*, u.name as owner_name
             FROM notebooks n
@@ -399,11 +388,14 @@ impl NotebookRepository {
             ORDER BY n.updated_at DESC
             LIMIT 1
             "#,
-            case_visible = notebook_case_visible_to_user(1),
-        ))
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await?;
+            case_visible = notebook_case_visible_to_user(1, viewer.deny_param(2)),
+        );
+        let mut query = sqlx::query_as::<_, NotebookWithOwner>(&sql)
+            .bind(viewer.user_id());
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let result = query.fetch_optional(&self.pool).await?;
 
         Ok(result)
     }
@@ -471,7 +463,7 @@ impl NotebookRepository {
     pub async fn update_owned(
         &self,
         id: Uuid,
-        user_id: Uuid,
+        viewer: &ViewerScope,
         update: &UpdateNotebook,
     ) -> Result<Notebook, NotebookRepositoryError> {
         let visibility = update.visibility.as_ref().map(|v| match v {
@@ -485,7 +477,7 @@ impl NotebookRepository {
             crate::models::notebook::NotebookStatus::Closed => "closed",
             crate::models::notebook::NotebookStatus::Merged => "merged",
         });
-        sqlx::query_as::<_, Notebook>(&format!(r#"
+        let sql = format!(r#"
             UPDATE notebooks n SET title = COALESCE($3, title),
                 visibility = COALESCE($4, visibility), status = COALESCE($5, status),
                 summary = COALESCE($6, summary),
@@ -498,10 +490,15 @@ impl NotebookRepository {
                   WHERE ns.notebook_id = n.id AND ns.permission = 'edit'
                     AND (ns.shared_with_user_id = $2 OR ug.user_id IS NOT NULL)
               )) RETURNING n.*
-        "#, visible = notebook_visible_to_user_at(2)))
-        .bind(id).bind(user_id).bind(&update.title).bind(visibility).bind(status).bind(&update.summary)
-        .fetch_optional(&self.pool).await?
-        .ok_or(NotebookRepositoryError::AccessDenied(id))
+        "#, visible = notebook_visible_to_user_at(2, viewer.deny_param(7)));
+        let mut query = sqlx::query_as::<_, Notebook>(&sql)
+            .bind(id).bind(viewer.user_id()).bind(&update.title).bind(visibility).bind(status).bind(&update.summary);
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        query
+            .fetch_optional(&self.pool).await?
+            .ok_or(NotebookRepositoryError::AccessDenied(id))
     }
 
     /// Delete a notebook
@@ -522,16 +519,19 @@ impl NotebookRepository {
     pub async fn delete_owned(
         &self,
         id: Uuid,
-        user_id: Uuid,
+        viewer: &ViewerScope,
     ) -> Result<(), NotebookRepositoryError> {
-        let result = sqlx::query(&format!(
+        let sql = format!(
             "DELETE FROM notebooks n WHERE id = $1 AND owner_id = $2 AND {}",
-            notebook_case_visible_to_user(2)
-        ))
-        .bind(id)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await?;
+            notebook_case_visible_to_user(2, viewer.deny_param(3))
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(id)
+            .bind(viewer.user_id());
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let result = query.execute(&self.pool).await?;
 
         if result.rows_affected() == 0 {
             return Err(NotebookRepositoryError::AccessDenied(id));

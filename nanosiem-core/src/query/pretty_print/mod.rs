@@ -11,6 +11,9 @@ mod helpers;
 mod search_expr;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "requote_roundtrip_tests.rs"]
+mod requote_roundtrip_tests;
 
 use super::ast::*;
 

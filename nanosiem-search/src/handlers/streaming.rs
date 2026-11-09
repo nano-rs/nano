@@ -116,7 +116,7 @@ pub async fn search_stream(
     // Create event channel
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<SearchStreamEvent>(64);
 
-    // Check search result cache (Dragonfly/Redis) — on hit, replay as SSE events via channel.
+    // Check search result cache (Valkey/Redis) — on hit, replay as SSE events via channel.
     // Rows are chunked into batches of 1000 to avoid SSE buffer overflow.
     // NAN-1595: skip the read on an explicit refresh (bypass), and capture the
     // entry age so the response can carry `x-nano-cache: hit` + age for the UI.
@@ -329,7 +329,7 @@ pub async fn search_stream(
         let mut meta_histogram: Option<Vec<nanosiem_core::search::HistogramBucket>> = None;
         let mut meta_display_type: Option<nanosiem_core::search::DisplayType> = None;
         let mut meta_column_order: Option<Vec<String>> = None;
-        let mut meta_generated_sql: Option<String> = None;
+        let mut meta_generated_sql: Option<nanosiem_core::search::display_sql::DisplaySql> = None;
         let mut completed_ok = false;
         // The branch always ends the stream, so it fires at most once.
         let handoff_armed = handoff_armed_initially;

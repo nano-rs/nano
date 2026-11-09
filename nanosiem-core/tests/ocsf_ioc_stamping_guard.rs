@@ -100,9 +100,17 @@ fn migration_188_view_body_is_the_generated_overlay_body() {
         .nth(1)
         .and_then(|rest| rest.split(";\n").next())
         .expect("188 MODIFY QUERY body");
+    // ocsf/193 (NAN-5032) redefined the `source_type` line afterwards; its own
+    // body is pinned to the overlay in tests/ocsf_reserved_source_type_guard.rs.
+    fn without_source_type(body: &str) -> String {
+        body.lines()
+            .filter(|l| !l.trim_end().ends_with("AS source_type,"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
     assert_eq!(
-        migration,
-        overlay_view_body(),
+        without_source_type(migration),
+        without_source_type(overlay_view_body()),
         "rerun scripts/gen-ocsf-ddl.py and regenerate 188's MODIFY QUERY"
     );
 }

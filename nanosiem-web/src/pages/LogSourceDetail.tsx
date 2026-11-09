@@ -297,8 +297,8 @@ export function LogSourceDetail() {
 
   const handleDeploy = async () => {
     try {
-      await deployLogSource(logSource.id);
-      toast({ title: 'Deployed', description: `"${logSource.name}" has been deployed to Vector.` });
+      const result = await deployLogSource(logSource.id);
+      toast({ title: 'Deployed', description: result?.message || `"${logSource.name}" has been deployed to Vector.` });
       setDeployDialogOpen(false);
       refetch();
       refetchHealth();
@@ -315,8 +315,8 @@ export function LogSourceDetail() {
 
   const handleUndeploy = async () => {
     try {
-      await undeployLogSource(logSource.id);
-      toast({ title: 'Undeployed', description: `"${logSource.name}" has been removed from Vector.` });
+      const result = await undeployLogSource(logSource.id);
+      toast({ title: 'Undeployed', description: result?.message || `"${logSource.name}" has been removed from Vector.` });
       setUndeployDialogOpen(false);
       refetch();
       refetchHealth();
@@ -1812,7 +1812,10 @@ function ConfigurationTab({
                 <Input
                   value={formData.sampling_exclude_condition ?? source.sampling_exclude_condition ?? ''}
                   onChange={(e) =>
-                    setFormData({ ...formData, sampling_exclude_condition: e.target.value || null })
+                    // NAN-5012: an empty string clears the condition. `null` means
+                    // "unchanged" to the API (COALESCE), so a cleared field never
+                    // reached the server and the input snapped back to the old value.
+                    setFormData({ ...formData, sampling_exclude_condition: e.target.value })
                   }
                   placeholder='.action != "allow"'
                   className="h-8 text-[12px] bg-card font-mono"

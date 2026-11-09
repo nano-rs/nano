@@ -68,6 +68,7 @@ pub async fn collect_metrics(
     let detection = collect_detection_metrics(pool).await;
     let alerting = collect_alerting_metrics(pool).await;
     let audit_durability = collect_audit_durability(pool).await;
+    let reserved_source_names = collect_reserved_source_names(pool).await;
 
     CollectedMetrics {
         ingestion,
@@ -76,8 +77,49 @@ pub async fn collect_metrics(
         detection,
         alerting,
         audit_durability,
+        reserved_source_names,
         collected_at: Utc::now(),
     }
+}
+
+/// NAN-5032: configured log sources whose route key (the value their events
+/// are stored under) is a platform-owned source type. PostgreSQL-only.
+async fn collect_reserved_source_names(pool: &PgPool) -> super::types::ReservedSourceNames {
+    let rows: Vec<(String, Option<Vec<String>>)> =
+        match sqlx::query_as("SELECT name, match_values FROM log_sources")
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "Failed to scan log sources for reserved source types");
+                return Default::default();
+            }
+        };
+    classify_reserved_source_names(
+        rows.iter()
+            .map(|(name, values)| crate::ingest_tokens::route_key(values.as_deref(), name)),
+    )
+}
+
+/// Pure half of [`collect_reserved_source_names`].
+pub(crate) fn classify_reserved_source_names(
+    route_keys: impl Iterator<Item = String>,
+) -> super::types::ReservedSourceNames {
+    use crate::auth::reserved_source_types::{classify, Reservation};
+    let mut out = super::types::ReservedSourceNames::default();
+    for key in route_keys {
+        match classify(&key) {
+            Reservation::Enforced => out.enforced.push(key),
+            Reservation::WarnOnly => out.warn_only.push(key),
+            Reservation::None => {}
+        }
+    }
+    out.enforced.sort();
+    out.enforced.dedup();
+    out.warn_only.sort();
+    out.warn_only.dedup();
+    out
 }
 
 /// NAN-4954: backlog and failure picture of the security-critical audit
@@ -1259,6 +1301,8 @@ async fn collect_enrichment_metrics(
 /// "never scheduled" as "a scheduled feed that never ran" and invent an outage
 /// (NAN-1994). Scheduled `data` feeds keep their real status untouched, so a
 /// genuine `failed` still surfaces.
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 fn normalize_provider_run_status(
     enrichment_type: &str,
     last_run_status: Option<String>,
@@ -1312,7 +1356,8 @@ fn native_provider_run_status(
 async fn collect_enrichment_providers(pool: &PgPool) -> Vec<EnrichmentProviderStatus> {
     let mut providers = Vec::new();
 
-    // Installed Deno data/agent enrichments.
+    // Installed Deno data/agent enrichments (enterprise overlay).
+    #[cfg(feature = "enterprise")]
     match sqlx::query_as::<_, (String, String, bool, Option<String>)>(
         "SELECT name, enrichment_type, enabled, last_run_status \
          FROM custom_enrichments \
@@ -1664,11 +1709,14 @@ async fn collect_alerting_metrics(pool: &PgPool) -> AlertingMetrics {
             }
         };
 
+    #[cfg(feature = "enterprise")]
     let active_routing_rules: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM queue_routing_rules WHERE enabled = true")
             .fetch_one(pool)
             .await
             .unwrap_or(0);
+    #[cfg(not(feature = "enterprise"))]
+    let active_routing_rules: i64 = 0;
 
     info!(
         "Collected alerting metrics: {} alerts (24h, prior {}), MTTA {:?}m, {} webhooks, {} routing rules",
@@ -2025,8 +2073,21 @@ mod tests {
             .with_password("nanosiem")
             .with_database("nanosiem");
         let table = format!("nan2153_health_scope_{}", uuid::Uuid::now_v7().simple());
+        // The runtime `nanosiem` user cannot CREATE TABLE (security review
+        // 2026-11-08), so the fixture table is created and dropped as the admin.
+        let admin = ClickHouseClient::default()
+            .with_url(
+                std::env::var("CLICKHOUSE_TEST_URL")
+                    .unwrap_or_else(|_| "http://localhost:8123".to_string()),
+            )
+            .with_user("nanosiem_admin")
+            .with_password(
+                std::env::var("CLICKHOUSE_TEST_ADMIN_PASSWORD")
+                    .unwrap_or_else(|_| "nanosiem_admin_secret".to_string()),
+            )
+            .with_database("nanosiem");
 
-        ch.query(&format!(
+        admin.query(&format!(
             "CREATE TABLE {table} (source_type String, timestamp DateTime) ENGINE = Memory"
         ))
         .execute()
@@ -2051,7 +2112,7 @@ mod tests {
             .await
             .expect("execute production ingestion query");
 
-        ch.query(&format!("DROP TABLE {table}"))
+        admin.query(&format!("DROP TABLE {table}"))
             .execute()
             .await
             .expect("drop isolated health-scope table");

@@ -954,6 +954,7 @@ impl SearchService {
         // degrade to '' when unmapped (build_anomalies tolerates empty keys);
         // the cloud-context WHERE ORs whichever of service/provider/account map.
         let anomaly_account_outer = match &cloud_account_id_col {
+            // sql-lint: allow(profile column constant)
             Some(col) => format!("l.{col} AS account_id"),
             None => "'' AS account_id".to_string(),
         };
@@ -965,6 +966,7 @@ impl SearchService {
             let terms: Vec<String> =
                 [&cloud_service_col, &cloud_provider_col, &cloud_account_id_col]
                     .into_iter()
+                    // sql-lint: allow(profile column constants)
                     .filter_map(|c| c.as_ref().map(|col| format!("l.{col} != ''")))
                     .collect();
             if terms.is_empty() {

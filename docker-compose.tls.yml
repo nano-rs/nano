@@ -18,6 +18,8 @@ services:
   nginx:
     volumes:
       - ./config/nginx/nginx.opensource-tls.conf:/etc/nginx/nginx.conf:ro
+      # NAN-5015: edge client-IP mode (none = strip CDN headers; cdn = forward them).
+      - ./config/nginx/client-ip/${NANO_EDGE_CDN_CLIENT_IP:-none}.conf:/etc/nginx/nano-client-ip.d/edge.conf:ro
       - ./config/nginx/ssl:/etc/nginx/ssl:ro
     ports:
       - "80:80"

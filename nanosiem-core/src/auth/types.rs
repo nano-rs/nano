@@ -257,6 +257,13 @@ pub struct User {
     pub backup_codes_nonce: Option<String>,
     #[serde(skip_serializing)]
     pub mfa_setup_pending: bool,
+    /// NAN-5027: an SSO-linked account may still sign in with a local password
+    /// only when this audited break-glass flag is set (migration 323). Without
+    /// it, the first SSO link clears the local password and local login is
+    /// refused for the linked account.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub local_login_break_glass: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -281,6 +288,16 @@ pub struct UpdateUserRequest {
     pub status: Option<String>,
     /// Group IDs to set (replaces current non-Everyone groups). Omit to leave unchanged.
     pub group_ids: Option<Vec<String>>,
+    /// Also delete every API key the user owns, in the same transaction
+    /// (NAN-5014). Opt-in: a password reset never silently breaks the
+    /// target's automation. Ignored unless `true`.
+    #[serde(default)]
+    pub revoke_api_keys: Option<bool>,
+    /// Keep (true) or drop (false) local password sign-in for an account that
+    /// is, or will be, linked to SSO (NAN-5027). Session-only and requires
+    /// `settings:system`; audited.
+    #[serde(default)]
+    pub local_login_break_glass: Option<bool>,
 }
 
 /// User with groups for API responses

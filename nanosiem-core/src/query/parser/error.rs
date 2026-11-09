@@ -296,6 +296,42 @@ fn escaped_double_quote_diagnostic(
     Some((message, suggestions))
 }
 
+/// Security review 2026-11-08 (NAN-5034): `anomaly <func>(…)` only accepts the
+/// allowlisted aggregation functions. Name the supported set instead of the
+/// generic "Unexpected token".
+fn anomaly_diagnostic(
+    input: &str,
+    position: usize,
+) -> Option<(String, Vec<String>, Vec<ErrorSuggestion>)> {
+    let stage = input.get(..position)?.rsplit('|').next()?.trim_start();
+    if !stage.get(..7)?.eq_ignore_ascii_case("anomaly") {
+        return None;
+    }
+    let rest = input.get(position..)?;
+    let word: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if word.is_empty()
+        || !rest[word.len()..].starts_with('(')
+        || super::commands_security::anomaly_aggregation_function(&word).is_some()
+    {
+        return None;
+    }
+    let supported = super::commands_security::ANOMALY_AGGREGATION_FUNCTIONS.join(", ");
+    Some((
+        format!("`anomaly` does not support the function `{word}()`. Supported: {supported}"),
+        super::commands_security::ANOMALY_AGGREGATION_FUNCTIONS
+            .iter()
+            .map(|f| format!("{f}()"))
+            .collect(),
+        vec![ErrorSuggestion {
+            description: "count events per group".to_string(),
+            replacement: "count()".to_string(),
+        }],
+    ))
+}
+
 /// Analyze error context and generate helpful messages and suggestions
 /// NAN-4372: the `prevalence` positional shorthand refuses filter field names
 /// and `threshold=` (both used to be silent pass-throughs). Name the filter
@@ -369,6 +405,9 @@ fn analyze_error_context(
     }
 
     if let Some(diagnostic) = prevalence_diagnostic(input, position) {
+        return diagnostic;
+    }
+    if let Some(diagnostic) = anomaly_diagnostic(input, position) {
         return diagnostic;
     }
 

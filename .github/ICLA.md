@@ -2,7 +2,7 @@
 
 # Individual Contributor License Agreement ("Agreement") V1.0
 
-Thank you for your interest in nano (the "Project"), maintained by Nano LLC
+Thank you for your interest in nano (the "Project"), maintained by nano, LLC
 (the "Company"). To clarify the intellectual property license granted with
 Contributions from any person or entity, the Company must have on file a
 signed Contributor License Agreement ("CLA") from each Contributor,
@@ -193,7 +193,7 @@ sign-off.
 *Adapted from the Apache Software Foundation Individual Contributor License
 Agreement V2.2. Copyright (c) The Apache Software Foundation. The original
 text is licensed under terms that permit derivative works for use as a CLA;
-this adaptation substitutes "Nano LLC" for "Apache Software Foundation",
+this adaptation substitutes "nano, LLC" for "Apache Software Foundation",
 "the Company" for "the Foundation", reframes the reciprocal commitment to
 match the open-core model, and updates the signing flow to reference
 [cla-assistant.io](https://cla-assistant.io). Material changes are

@@ -37,36 +37,52 @@ describe('marketplace inventory projection', () => {
     ]) expect(isFirstPartyRepo({ url }), url).toBe(false);
     expect(isFirstPartyRepo(null)).toBe(false);
     // A repository entry whose repository metadata is missing is untrusted.
-    expect(catalogItem(entry({}), [], ENT).kind).toBe('custom');
-    expect(catalogItem(entry({}), [official, thirdParty], ENT).kind).toBe('platform');
-    expect(catalogItem(entry({ repository_id: 'r2' }), [official, thirdParty], ENT).kind).toBe('custom');
+    expect(catalogItem(entry({}), [], ENT, 'enterprise').kind).toBe('custom');
+    expect(catalogItem(entry({}), [official, thirdParty], ENT, 'enterprise').kind).toBe('platform');
+    expect(catalogItem(entry({ repository_id: 'r2' }), [official, thirdParty], ENT, 'enterprise').kind).toBe('custom');
   });
 
   it('gates deno and collector backends on build capabilities, never a hosted flag', () => {
-    const agent = catalogItem(entry({}), [official], OPEN);
-    expect(agent.requirement).toEqual({ capability: 'agentEnrichment', label: 'Enterprise edition' });
+    const agent = catalogItem(entry({}), [official], OPEN, 'open');
+    expect(agent.requirement).toEqual({ capability: 'agentEnrichment', cause: 'edition', label: 'Enterprise edition' });
     expect(inventoryAction(agent)).toBe('Enterprise edition');
     expect(inventoryReason(agent)).toBe('Requires the Enterprise edition.');
-    expect(catalogItem(entry({ category: 'collector', execution_backend: 'collector' }), [official], OPEN).requirement?.capability).toBe('customEnrichment');
-    expect(catalogItem(entry({ execution_backend: 'native', category: 'data' }), [official], OPEN).requirement).toBeNull();
-    expect(catalogItem(entry({}), [official], ENT).requirement).toBeNull();
+    expect(catalogItem(entry({ category: 'collector', execution_backend: 'collector' }), [official], OPEN, 'open').requirement?.capability).toBe('customEnrichment');
+    expect(catalogItem(entry({ execution_backend: 'native', category: 'data' }), [official], OPEN, 'open').requirement).toBeNull();
+    // NAN-5056: a native agent provider needs agentEnrichment (open server refuses it).
+    expect(catalogItem(entry({ execution_backend: 'native', category: 'agent' }), [official], OPEN, 'open').requirement?.capability).toBe('agentEnrichment');
+    expect(catalogItem(entry({}), [official], ENT, 'enterprise').requirement).toBeNull();
+  });
+
+  it('NAN-5088: an enterprise build without an active licence asks for a licence, not the edition', () => {
+    // Licensed flags are all false on an enterprise build whose licence is not active.
+    const agent = catalogItem(entry({}), [official], OPEN, 'enterprise');
+    expect(agent.requirement).toEqual({ capability: 'agentEnrichment', cause: 'licence', label: 'Active licence' });
+    expect(inventoryAction(agent)).toBe('Active licence');
+    expect(inventoryReason(agent)).toBe('Requires an active licence.');
+    expect(inventoryReason(agent)).not.toMatch(/edition/i);
+    expect(catalogItem(entry({ category: 'collector', execution_backend: 'collector' }), [official], OPEN, 'enterprise').requirement?.cause).toBe('licence');
+    expect(catalogItem(entry({ execution_backend: 'native', category: 'agent' }), [official], OPEN, 'enterprise').requirement?.cause).toBe('licence');
+    expect(catalogItem(entry({ execution_backend: 'native', category: 'data' }), [official], OPEN, 'enterprise').requirement).toBeNull();
+    // Licensed enterprise: nothing required.
+    expect(catalogItem(entry({}), [official], ENT, 'enterprise').requirement).toBeNull();
   });
 
   it('derives install/enable state, reason and stage', () => {
-    const available = catalogItem(entry({}), [official], ENT);
+    const available = catalogItem(entry({}), [official], ENT, 'enterprise');
     expect(inventoryAction(available)).toBe('Install');
     expect(available.effective_health).toBe('available');
     expect(executionStageLabel(available.execution_stage)).toBe('On demand · pivt');
-    const installed = catalogItem(entry({ installed: true, enabled: true, has_credentials: true }), [official], ENT);
+    const installed = catalogItem(entry({ installed: true, enabled: true, has_credentials: true }), [official], ENT, 'enterprise');
     expect(inventoryAction(installed)).toBe('Disable');
     expect(installed.reason).toBeNull();
-    const missing = catalogItem(entry({ installed: true, enabled: true }), [official], ENT);
+    const missing = catalogItem(entry({ installed: true, enabled: true }), [official], ENT, 'enterprise');
     expect(missing.reason).toBe('missing_credentials');
-    const feed = catalogItem(entry({ slug: 'tor', category: 'data', execution_backend: 'native', installed: true, enabled: true, requires_credential: 'none', last_sync_status: 'failed' }), [official], OPEN);
+    const feed = catalogItem(entry({ slug: 'tor', category: 'data', execution_backend: 'native', installed: true, enabled: true, requires_credential: 'none', last_sync_status: 'failed' }), [official], OPEN, 'open');
     expect(feed.reason).toBe('bundle_inactive');
     expect(inventoryAction(feed)).toBe('Feed bundle');
     expect(executionStageLabel(feed.execution_stage)).toBe('Built in · at ingest');
-    expect(executionStageLabel(catalogItem(entry({ category: 'identity', execution_backend: 'identity' }), [], OPEN).execution_stage)).toBe('Directory sync');
+    expect(executionStageLabel(catalogItem(entry({ category: 'identity', execution_backend: 'identity' }), [], OPEN, 'open').execution_stage)).toBe('Directory sync');
   });
 
   it('lists a catalog-installed custom enrichment once', () => {
@@ -76,7 +92,7 @@ describe('marketplace inventory projection', () => {
         { id: 'c1', namespace_id: 'n', name: 'AbuseIPDB', description: null, enrichment_type: 'agent', enabled: true, status: 'active', last_run_at: null, last_run_status: null, created_at: '' },
         { id: 'c2', namespace_id: 'n', name: 'Asset CMDB', description: null, enrichment_type: 'data', enabled: true, status: 'draft', last_run_at: null, last_run_status: null, created_at: '' },
       ],
-      [official], ENT,
+      [official], ENT, 'enterprise',
     );
     expect(items.map(i => i.id)).toEqual(['abuseipdb', 'custom:c2']);
     expect(items[1]).toMatchObject({ kind: 'custom', reason: 'not_deployed', can_edit: true });
@@ -112,9 +128,9 @@ describe('platform feed bundle (NAN-4948)', () => {
   };
   it('marks covered cards, clears the edition requirement, and leaves others alone', () => {
     const items = [
-      catalogItem(entry({ slug: 'tor-exit-nodes', category: 'data', requires_credential: 'none' }), [official], OPEN),
-      catalogItem(entry({ slug: 'threatfox', category: 'data' }), [official], OPEN),
-      catalogItem(entry({}), [official], OPEN),
+      catalogItem(entry({ slug: 'tor-exit-nodes', category: 'data', requires_credential: 'none' }), [official], OPEN, 'open'),
+      catalogItem(entry({ slug: 'threatfox', category: 'data' }), [official], OPEN, 'open'),
+      catalogItem(entry({}), [official], OPEN, 'open'),
     ];
     const [tor, fox, abuse] = applyFeedBundle(items, status);
     expect(tor.provided_by_bundle).toMatchObject({ feed_id: 'tor_exit_nodes', revision: 4, active: true });
@@ -127,7 +143,7 @@ describe('platform feed bundle (NAN-4948)', () => {
     expect(abuse.requirement?.label).toBe('Enterprise edition');
   });
   it('marks bundle-only feeds not installed without an installed bundle, and leaves other cards alone (NAN-4959)', () => {
-    const items = [catalogItem(entry({ slug: 'threatfox', category: 'data' }), [official], OPEN), catalogItem(entry({}), [official], OPEN)];
+    const items = [catalogItem(entry({ slug: 'threatfox', category: 'data' }), [official], OPEN, 'open'), catalogItem(entry({}), [official], OPEN, 'open')];
     const [fox, abuse] = applyFeedBundle(items, { ...status, installed: false });
     expect(fox.provided_by_bundle).toMatchObject({ feed_id: 'threatfox', revision: null, state: 'not_installed' });
     expect(fox.requirement).toBeNull();
@@ -144,7 +160,7 @@ describe('IPinfo Lite is bundle-only (NAN-4959)', () => {
       { feed_id: 'ipinfo_lite', name: 'IPinfo Lite', revision: 12, produced_at: '2026-11-04T07:00:00Z', hard_expiry: '2026-11-20T00:00:00Z', age_seconds: 60, state: 'fresh' as const, license_id: null, terms_revision: null, records: 500, active: true, loaded: 480 },
     ],
   };
-  const ipinfo = () => catalogItem(entry({ slug: 'ipinfo_lite', category: 'data', execution_backend: 'native', native_source_id: 'ipinfo_lite' }), [official], OPEN);
+  const ipinfo = () => catalogItem(entry({ slug: 'ipinfo_lite', category: 'data', execution_backend: 'native', native_source_id: 'ipinfo_lite' }), [official], OPEN, 'open');
 
   it('carries revision, last update and next refresh from the platform feed status', () => {
     const [item] = applyFeedBundle([ipinfo()], base);
@@ -192,7 +208,7 @@ describe('bundle feed slugs (NAN-4959)', () => {
       slug: 'catalog-tor',
       platform_feed_id: 'tor_exit_nodes',
       category: 'data',
-    }), [official], OPEN);
+    }), [official], OPEN, 'open');
 
     expect(platformFeedForEntry(owned.entry!)).toBe('tor_exit_nodes');
     expect(owned.provided_by_bundle).toMatchObject({ feed_id: 'tor_exit_nodes' });

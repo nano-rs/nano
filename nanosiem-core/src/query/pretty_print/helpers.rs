@@ -56,6 +56,30 @@
 /// which is why Windows paths looked fine and this went unnoticed.
 ///
 /// Callers must NOT add their own quotes — the result already carries them.
+/// A NAME slot (eval target, rename source/target, table field/alias): the
+/// bare form when the field-name grammar would read it back unchanged, else a
+/// quoted literal (NAN-5021).
+///
+/// Printing `"p95 latency"` bare produced `eval p95 latency = …`, which no
+/// longer parses, so the source-scope gate refused a valid query for every
+/// scoped analyst. Bare names (the overwhelming case, `*` wildcards included)
+/// print exactly as before.
+pub(crate) fn npl_name(name: &str) -> String {
+    let mut chars = name.chars();
+    let bare = match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' || c == '*' => chars
+            .clone()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '*'),
+        _ => false,
+    } && !name.contains("..")
+        && !name.ends_with('.');
+    if bare {
+        name.to_string()
+    } else {
+        npl_quoted_literal(name)
+    }
+}
+
 pub(crate) fn npl_quoted_literal(s: &str) -> String {
     let delimiter = if !s.contains('"') {
         '"'

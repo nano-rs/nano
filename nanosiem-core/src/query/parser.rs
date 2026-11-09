@@ -18,6 +18,7 @@ pub(crate) use commands_core::search_wildcards_to_like;
 mod commands_enrichment;
 mod commands_extended;
 mod commands_security;
+pub(crate) use commands_security::anomaly_aggregation_function;
 mod error;
 mod eval_expr;
 mod search_expr;
@@ -123,6 +124,21 @@ impl Drop for NestingGuard {
     fn drop(&mut self) {
         NESTING_DEPTH.with(|d| d.set(d.get() - 1));
     }
+}
+
+/// `s` starts with ASCII `prefix`, ignoring ASCII case, without allocating.
+///
+/// Security review 2026-11-08 (NAN-5024): lookahead checks used to call
+/// `remaining.to_uppercase()` / `to_ascii_lowercase()` on the WHOLE rest of the
+/// query to test a 3-7 byte keyword. Done once per term inside a `many0`
+/// chain that is O(n^2) in query length. Equivalent for every input: only the
+/// first `prefix.len()` bytes are compared, and a non-ASCII byte there can
+/// never equal an ASCII prefix byte under either the old or the new test.
+#[inline]
+pub(super) fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
 /// Reject an over-long operator/term chain (see [`MAX_CHAIN_LEN`]) at parse time,

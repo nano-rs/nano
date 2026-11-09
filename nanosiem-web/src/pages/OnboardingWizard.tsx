@@ -507,7 +507,7 @@ function StatusPill({ isDone, isSkipped, isLocked, step }: StatusPillProps) {
     : 'bg-amber-500/10 border-amber-500/30 text-amber-500';
 
   const label = isLocked
-    ? 'Pro tier'
+    ? 'Not included'
     : isDone
     ? step.doneLabel
     : isSkipped

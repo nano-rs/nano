@@ -347,6 +347,7 @@ pub async fn configure_enrichment(
                 tracing::warn!(provider_id = %provider_id, error = %e, "Failed to propagate enabled flag to identity_providers");
             }
         }
+        #[cfg(feature = "enterprise")]
         if let Some(ref ce_id) = entry.custom_enrichment_id {
             if let Err(e) = sqlx::query("UPDATE custom_enrichments SET enabled = $2 WHERE id = $1")
                 .bind(ce_id)
@@ -1626,7 +1627,7 @@ mod preview_tests {
 // =============================================================================
 
 /// Get marketplace coverage by artifact type. Backed by a 6h
-/// Dragonfly-shared cache (NAN-609) — `computed_at` in the response is the
+/// Valkey-shared cache (NAN-609) — `computed_at` in the response is the
 /// time the SQL was last *actually* run, not the time this request was
 /// served. Use `POST /api/marketplace/coverage/refresh` to force a
 /// recompute from the UI.
@@ -1652,7 +1653,7 @@ pub async fn get_coverage(
 }
 
 /// Force a recompute of the marketplace coverage hero. Invalidates the
-/// shared Dragonfly cache, runs the SQL fresh, returns the new payload
+/// shared Valkey cache, runs the SQL fresh, returns the new payload
 /// (which is also `set()` back into the cache by `compute()`). Same
 /// permission as the GET endpoint.
 #[utoipa::path(

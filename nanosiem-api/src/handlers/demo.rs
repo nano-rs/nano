@@ -85,15 +85,14 @@ fn demo_err(status: StatusCode, msg: impl ToString) -> (StatusCode, Json<DemoErr
     )
 }
 
-/// Extract client IP from X-Forwarded-For or X-Real-IP headers
-fn extract_ip(headers: &HeaderMap) -> Option<String> {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        return Some(xff.split(',').next().unwrap_or(xff).trim().to_string());
-    }
-    headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
+/// Client IP for the per-IP demo-session rate limit (NAN-5015): the shared
+/// trusted-proxy-gated extractor. This used to take the LEFTMOST
+/// `X-Forwarded-For` entry from any peer — the one value a client controls.
+fn extract_ip(
+    headers: &HeaderMap,
+    connect_info: Option<&axum::extract::ConnectInfo<std::net::SocketAddr>>,
+) -> Option<String> {
+    nanosiem_api_lib::extract_client_ip(headers, connect_info.map(|ci| &ci.0))
 }
 
 /// Create a new demo session
@@ -113,6 +112,7 @@ fn extract_ip(headers: &HeaderMap) -> Option<String> {
 )]
 pub async fn create_demo_session(
     State(state): State<AppState>,
+    connect_info: Option<Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
     Json(body): Json<CreateDemoSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateDemoSessionResponse>), (StatusCode, Json<DemoErrorResponse>)> {
@@ -121,7 +121,7 @@ pub async fn create_demo_session(
         .as_ref()
         .ok_or_else(|| demo_err(StatusCode::SERVICE_UNAVAILABLE, "Demo mode is not enabled"))?;
 
-    let ip_address = extract_ip(&headers);
+    let ip_address = extract_ip(&headers, connect_info.as_ref().map(|Extension(ci)| ci));
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())

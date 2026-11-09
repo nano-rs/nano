@@ -265,7 +265,6 @@ gen_secrets() {
             put CLICKHOUSE_MEM_LIMIT "${E2E_CLICKHOUSE_MEM_LIMIT:-8G}"  # 4G/6G hit 241s under the UI suite once feed bundles load (NAN-4937)
             put NANO_SCHEMA_PROFILE "${NANO_SCHEMA_PROFILE:-udm}"
             put NANOSIEM_DEV_MODE true
-            put NANO_TIER unrestricted
             put RUST_LOG "${E2E_RUST_LOG:-info}"
             # No floating tag is published: default to this checkout's release.
             put NANO_VERSION "${E2E_IMAGE_TAG:-$(sed -n 's/^# Release: v//p' "$ROOT/images.lock" | head -1)}"
@@ -424,7 +423,7 @@ write_app_env() {
                 POSTGRES_DICT_HOST=postgres "POSTGRES_DICT_PASSWORD=$POSTGRES_PASSWORD" \
                 "REDIS_URL=redis://127.0.0.1:${redis}" \
                 "JWT_SECRET=$JWT_SECRET" "NANOSIEM_ENCRYPTION_KEY=$NANOSIEM_ENCRYPTION_KEY" \
-                AUTH_ENABLED=true NANOSIEM_DEV_MODE=true NANO_TIER=unrestricted DEPLOYMENT_MODE=selfhosted \
+                AUTH_ENABLED=true NANOSIEM_DEV_MODE=true DEPLOYMENT_MODE=selfhosted \
                 "NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS=$(env_get "$RUN_DIR/compose.env" E2E_ALLOW_PRIVATE_AI_ENDPOINTS)" \
                 "EDITION=$EDITION" "NANO_SCHEMA_PROFILE=$NANO_SCHEMA_PROFILE" AIRGAP_MODE=false \
                 "VECTOR_AUTH_TOKEN=$VECTOR_AUTH_TOKEN" "VECTOR_INGEST_URL=http://127.0.0.1:${vhttp}/" \
@@ -445,7 +444,7 @@ write_app_env() {
                 "SEARCH_SERVICE_URL=http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_SEARCH_PORT)/health" \
                 LEADER_ELECTION_ENABLED=true CORS_ORIGINS=http://localhost \
                 "RUST_LOG=$RUST_LOG" NANOSIEM_INVESTIGATION_TOOL_LOOP=false \
-                CLOUDFLARE_AI_GATEWAY_URL= CF_AIG_AUTH_TOKEN= DOCS_RAG_URL=; do
+                CLOUDFLARE_AI_GATEWAY_URL= CF_AIG_AUTH_TOKEN= DOCS_SEARCH_TOKEN=; do
                 printf 'export %s=%q\n' "${kv%%=*}" "${kv#*=}"
             done
             if [[ "$(env_get "$RUN_DIR/run.env" E2E_CONTENT_ACCEPTANCE)" == 1 ]]; then
@@ -948,7 +947,7 @@ write_stack_env() {
             put POSTGRES_DICT_HOST postgres; put POSTGRES_DICT_PASSWORD "$(env_get "$c" POSTGRES_PASSWORD)"
             put NANO_SCHEMA_PROFILE "$(env_get "$c" NANO_SCHEMA_PROFILE)"
             put SKIP_DB_TESTS 0
-            # Redis / Dragonfly
+            # Redis protocol (Valkey)
             put NANOSIEM_TEST_REDIS_URL "redis://127.0.0.1:$redis"; put REDIS_URL "redis://127.0.0.1:$redis"
             # Guards + images
             put NANOSIEM_ALLOW_DESTRUCTIVE_TESTS 1

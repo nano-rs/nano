@@ -228,6 +228,7 @@ pub(crate) async fn guarded_client(
             reqwest::Client::builder()
                 .timeout(timeout)
                 .redirect(restricted_redirect_policy()),
+            crate::inputlookup::ProxyPolicy::Environment,
         )
         .await
         .map_err(|e| match e {

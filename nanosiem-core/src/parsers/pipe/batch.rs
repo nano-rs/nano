@@ -34,6 +34,10 @@ pub struct ResultRow {
 struct Vm {
     /// Keyed by (program, metadata read-only).
     programs: HashMap<(String, bool), Program>,
+    /// Per-request wall-clock budget for in-process parser tests (security
+    /// review 2026-11-08, NAN-5040). `None` for the sandboxed preview worker,
+    /// which is bounded by its process limits instead.
+    budget: Option<crate::parsers::validator::exec_bounds::ExecutionBudget>,
 }
 impl Vm {
     /// Plan programs compile with event metadata read-only (NAN-4919); the
@@ -72,13 +76,27 @@ impl Vm {
             },
             secrets: Secrets::new(),
         };
-        Runtime::default()
-            .resolve(
-                &mut target,
-                &self.programs[&(code.to_string(), plan)],
-                &TimeZone::parse("UTC").expect("UTC timezone"),
-            )
-            .map_err(|e| e.to_string())?;
+        let program = &self.programs[&(code.to_string(), plan)];
+        let timezone = TimeZone::parse("UTC").expect("UTC timezone");
+        match self.budget.as_mut() {
+            Some(budget) => {
+                if budget.is_exhausted() {
+                    return Err(budget.exhausted_message());
+                }
+                match Runtime::default().resolve_with_control(&mut target, program, &timezone, budget) {
+                    Ok(_) => {}
+                    Err(vrl::compiler::runtime::Terminate::Interrupted) => {
+                        return Err(budget.exhausted_message())
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            None => {
+                Runtime::default()
+                    .resolve(&mut target, program, &timezone)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         Ok((
             serde_json::to_value(target.value).map_err(|e| e.to_string())?,
             serde_json::to_value(target.metadata).map_err(|e| e.to_string())?,
@@ -90,6 +108,10 @@ impl Vm {
         // Vector treats a condition's runtime failure as a non-match. Compile
         // failures still reject the preview rather than becoming false.
         let Ok((value, _)) = self.run(&code, true, input, metadata) else {
+            // An exhausted test budget is not a non-match: stop the test.
+            if let Some(budget) = self.budget.as_ref().filter(|b| b.is_exhausted()) {
+                return Err(budget.exhausted_message());
+            }
             return Ok(false);
         };
         value
@@ -305,6 +327,27 @@ pub fn run_from(
     extension: Option<&str>,
     sources: Option<&[Option<String>]>,
 ) -> Result<Vec<ResultRow>, String> {
+    run_inner(plan, inputs, extension, sources, None)
+}
+
+/// [`run`] for an in-process parser test: every VRL program (plan steps,
+/// conditions, the source extension) runs under `budget` (NAN-5040).
+pub fn run_bounded(
+    plan: &Plan,
+    inputs: &[Value],
+    extension: Option<&str>,
+    budget: crate::parsers::validator::exec_bounds::ExecutionBudget,
+) -> Result<Vec<ResultRow>, String> {
+    run_inner(plan, inputs, extension, None, Some(budget))
+}
+
+fn run_inner(
+    plan: &Plan,
+    inputs: &[Value],
+    extension: Option<&str>,
+    sources: Option<&[Option<String>]>,
+    budget: Option<crate::parsers::validator::exec_bounds::ExecutionBudget>,
+) -> Result<Vec<ResultRow>, String> {
     plan.validate()?;
     if inputs.is_empty() || inputs.len() > 100 {
         return Err("Batch preview requires 1–100 inputs".into());
@@ -344,6 +387,7 @@ pub fn run_from(
         .collect();
     let mut vm = Vm {
         programs: HashMap::new(),
+        budget,
     };
     let mut group_inputs = frames.clone();
     let mut group = Vec::new();

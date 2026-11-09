@@ -26,6 +26,16 @@ fn reserved_route_claim(name: &str) -> Option<String> {
         .then_some(claim)
 }
 
+/// NAN-5032: a parser may not be NAMED with a source type nano writes itself
+/// (`audit`, `findings`) — its events would be stored as, and read back as,
+/// platform records. Returns the offending route key.
+fn enforced_reserved_claim(name: &str) -> Option<String> {
+    let claim = VectorConfigManager::safe_name(name);
+    (crate::auth::reserved_source_types::classify(&claim)
+        == crate::auth::reserved_source_types::Reservation::Enforced)
+        .then_some(claim)
+}
+
 /// NAN-2305: decide whether `name` would take a generated Vector identifier
 /// that another log source already holds.
 ///
@@ -105,6 +115,11 @@ impl ParserService {
         crate::vector_env::reject_vrl_interpolation("parser_vrl", &new_parser.parser_vrl)
             .map_err(ParserServiceError::InvalidVrl)?;
 
+        if let Some(claim) = enforced_reserved_claim(&new_parser.name) {
+            return Err(ParserServiceError::InvalidSourceType(
+                crate::auth::reserved_source_types::enforced_name_error(&claim),
+            ));
+        }
         // NAN-1124: reserve the `nano_` source_type namespace for enrichment routing.
         if let Some(claim) = reserved_route_claim(&new_parser.name) {
             return Err(ParserServiceError::InvalidSourceType(format!(
@@ -175,6 +190,11 @@ impl ParserService {
         // NAN-1124: reserve the `nano_` source_type namespace (a rename to a
         // nano_* name would otherwise claim the enrichment route).
         if let Some(ref name) = update.name {
+            if let Some(claim) = enforced_reserved_claim(name) {
+                return Err(ParserServiceError::InvalidSourceType(
+                    crate::auth::reserved_source_types::enforced_name_error(&claim),
+                ));
+            }
             if let Some(claim) = reserved_route_claim(name) {
                 return Err(ParserServiceError::InvalidSourceType(format!(
                     "parser name maps to the reserved source_type '{claim}': the 'nano_' prefix is reserved for nano-internal enrichment routing (NAN-1124). Rename the parser."

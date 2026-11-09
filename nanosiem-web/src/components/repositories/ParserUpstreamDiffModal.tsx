@@ -190,10 +190,10 @@ export function ParserUpstreamDiffModal({
 
   const handleDeployNow = async () => {
     try {
-      await deployLogSource(logSourceId);
+      const result = await deployLogSource(logSourceId);
       queryClient.invalidateQueries({ queryKey: ['log-sources'] });
       queryClient.invalidateQueries({ queryKey: ['log-source-deployments', logSourceId] });
-      toast({ title: 'Deployed', description: 'Parser updated and deployed to Vector.' });
+      toast({ title: 'Deployed', description: result?.message || 'Parser updated and deployed to Vector.' });
       setAppliedNeedsDeploy(false);
       onOpenChange(false);
     } catch (err) {

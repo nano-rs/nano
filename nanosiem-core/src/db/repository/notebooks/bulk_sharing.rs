@@ -4,6 +4,8 @@
 
 use uuid::Uuid;
 
+use crate::auth::ViewerScope;
+
 use crate::models::notebook::{
     NotebookAffectedUser, NotebookShareResult, NotebookSharedGroup, NotebookSummary,
     ShareNotebookRequest,
@@ -67,10 +69,11 @@ impl NotebookRepository {
         &self,
         id: Uuid,
         request: &ShareNotebookRequest,
-        user_id: Uuid,
+        viewer: &ViewerScope,
     ) -> Result<NotebookShareResult, NotebookRepositoryError> {
         // Get the notebook and verify ownership
-        let notebook = self.find_by_id_for_user(id, user_id).await?;
+        let notebook = self.find_by_id_for_user(id, viewer).await?;
+        let user_id = viewer.user_id();
 
         if notebook.owner_id != user_id {
             return Err(NotebookRepositoryError::AccessDenied(id));

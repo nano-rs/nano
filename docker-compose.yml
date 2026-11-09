@@ -1,11 +1,12 @@
 # =============================================================================
 # DEV ONLY — DO NOT RUN ON A PUBLIC HOST
 # =============================================================================
-# This compose file is for local development. It binds internal services —
-# Postgres (5432), ClickHouse HTTP/native (8123/9000), Prometheus (9090, started
-# with --web.enable-admin-api), Grafana (3001, default creds), Dragonfly, and the
-# exporters — to 0.0.0.0. On a machine with a public IP they are reachable,
-# unauthenticated, from the internet.
+# This compose file is for local development. Every published port is bound to
+# 127.0.0.1, including the internal services: Postgres (5432), ClickHouse
+# HTTP/native (8123/9000), Prometheus (9090), Grafana (3001), Dragonfly and the
+# exporters. Use an SSH tunnel to reach them from another machine. Never widen a
+# binding to 0.0.0.0: these services are unauthenticated or use dev credentials.
+# scripts/tests/compose-published-ports.sh enforces the loopback-only rule.
 #
 # To deploy nano, use the open-core stack instead: docker-compose.opensource.yml
 # (via install.sh / get.nano.rs). That file publishes only the nginx entrypoint
@@ -26,7 +27,7 @@ services:
       POSTGRES_PASSWORD: nanosiem
       POSTGRES_DB: nanosiem
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - nanosiem-data:/var/lib/postgresql
     healthcheck:
@@ -110,7 +111,9 @@ services:
       # directly. Token must match the Vector service's VECTOR_AUTH_TOKEN.
       VECTOR_INGEST_URL: http://vector:8080/
       VECTOR_ENRICH_URL: http://vector:8090/
-      VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN:-nanosiem-default-token}
+      VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN:-}
+      # Vector reads its config from the shared directory: no HTTP delivery.
+      NANO_VECTOR_CONFIG_DELIVERY: "off"
       # NAN-4907: nano-api writes the hashed ingest tokens file into the
       # mounted config dir Vector reads (/etc/vector/dynamic/ingest-tokens).
       NANO_INGEST_TOKENS_DELIVERY: shared_volume
@@ -139,7 +142,7 @@ services:
       # ClickHouse self-referencing dictionary user (must exist — 'default' is removed)
       CLICKHOUSE_SELF_USER: nanosiem
       # Authentication
-      JWT_SECRET: ${JWT_SECRET:-nanosiem-dev-secret-change-in-production}
+      JWT_SECRET: ${JWT_SECRET:-}
       # NAN-2042: shared service credential for private routes (/metrics).
       # Dev default only; Prometheus below presents the same value.
       NANO_SERVICE_TOKEN: ${NANO_SERVICE_TOKEN:-nanosiem-dev-service-token}
@@ -164,8 +167,11 @@ services:
       # Cloudflare AI Gateway (for multi-provider AI support)
       CLOUDFLARE_AI_GATEWAY_URL: ${CLOUDFLARE_AI_GATEWAY_URL:-}
       CF_AIG_AUTH_TOKEN: ${CF_AIG_AUTH_TOKEN:-}
+      # pivt docs grounding (NAN-5058): docs-search Worker caller token; empty = off.
+      DOCS_SEARCH_TOKEN: ${DOCS_SEARCH_TOKEN:-}
+      DOCS_SEARCH_URL: ${DOCS_SEARCH_URL:-https://docs-search.nano.rs}
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -231,7 +237,7 @@ services:
       CLICKHOUSE_RAWSQL_PASSWORD: ${CLICKHOUSE_RAWSQL_PASSWORD:-${CLICKHOUSE_PASSWORD}}
       CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD: ${CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD:-${CLICKHOUSE_PASSWORD}}
       # Authentication (same as API)
-      JWT_SECRET: ${JWT_SECRET:-nanosiem-dev-secret-change-in-production}
+      JWT_SECRET: ${JWT_SECRET:-}
       # NAN-2042: shared service credential for private routes (/metrics).
       # Dev default only; Prometheus below presents the same value.
       NANO_SERVICE_TOKEN: ${NANO_SERVICE_TOKEN:-nanosiem-dev-service-token}
@@ -251,10 +257,10 @@ services:
       # AI Pipe agent (optional — queries with | ai require Cloudflare AI Gateway)
       CLOUDFLARE_AI_GATEWAY_URL: ${CLOUDFLARE_AI_GATEWAY_URL:-}
       CF_AIG_AUTH_TOKEN: ${CF_AIG_AUTH_TOKEN:-}
-      # Dragonfly/Redis cache for search result caching (optional — graceful degradation)
+      # Valkey (Redis-compatible) cache for search result caching (optional — graceful degradation)
       REDIS_URL: redis://dragonfly:6379
     ports:
-      - "3002:3002"
+      - "127.0.0.1:3002:3002"
     depends_on:
       postgres:
         condition: service_healthy
@@ -303,8 +309,9 @@ services:
       CLICKHOUSE_SELF_USER: nanosiem
       # Identity sync runs in jobs; use the dedicated durable enrichment source.
       VECTOR_ENRICH_URL: http://vector:8090/
-      VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN:-nanosiem-default-token}
-      JWT_SECRET: ${JWT_SECRET:-nanosiem-dev-secret-change-in-production}
+      VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN:-}
+      NANO_VECTOR_CONFIG_DELIVERY: "off"
+      JWT_SECRET: ${JWT_SECRET:-}
       # NAN-2042: shared service credential for private routes (/metrics).
       # Dev default only; Prometheus below presents the same value.
       NANO_SERVICE_TOKEN: ${NANO_SERVICE_TOKEN:-nanosiem-dev-service-token}
@@ -416,15 +423,15 @@ services:
         aliases:
           - vector
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
       - "127.0.0.1:8090:8090"
-      - "9598:9598"
-      - "514:514/udp"
-      - "514:514/tcp"
-      - "8088:8088"
-      - "4317:4317"
-      - "4318:4318"
-      - "24224:24224"
+      - "127.0.0.1:9598:9598"
+      - "127.0.0.1:514:514/udp"
+      - "127.0.0.1:514:514/tcp"
+      - "127.0.0.1:8088:8088"
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:24224:24224"
 
   vector:
     # Pinned, not `latest-alpine`: a floating tag silently drifts local dev away
@@ -453,7 +460,7 @@ services:
       - no-new-privileges:true
     environment:
       # Authentication token for HTTP ingestion endpoint
-      VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN:-nanosiem-default-token}
+      VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN:-}
       # NAN-4907: OTLP edge assertion key; explicit static-fallback state
       # (a missing tokens file fails closed unless "true").
       NANO_OTLP_EDGE_KEY: ${NANO_OTLP_EDGE_KEY:-}
@@ -562,11 +569,11 @@ services:
       CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD: ${CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD:-${CLICKHOUSE_PASSWORD}}
     ports:
       # Native protocol (for clickhouse-rs client)
-      - "9000:9000"
+      - "127.0.0.1:9000:9000"
       # HTTP interface (for debugging/admin)
-      - "8123:8123"
+      - "127.0.0.1:8123:8123"
       # Prometheus metrics endpoint (configured in config.d/monitoring.xml)
-      - "9363:9363"
+      - "127.0.0.1:9363:9363"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - clickhouse-logs:/var/log/clickhouse-server
@@ -592,21 +599,17 @@ services:
   # =============================================================================
 
   dragonfly:
-    image: docker.dragonflydb.io/dragonflydb/dragonfly
-    container_name: nanosiem-dragonfly
-    command: ["--maxmemory", "512mb", "--proactor_threads", "2"]
+    # NAN-5082: Valkey replaced Dragonfly (relicensed off open source). The
+    # service key stays `dragonfly`: it is the hostname in REDIS_URL.
+    image: valkey/valkey:9.1.2@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+    container_name: nanosiem-valkey
+    command: ["valkey-server", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction", "--io-threads", "2", "--save", "", "--appendonly", "no"]
     security_opt:
       - no-new-privileges:true
     ports:
-      - "6379:6379"
-    # No `ulimits: memlock: -1` — unlimited memlock can't be set in an
-    # unprivileged LXC (Docker can't exceed the container's 8MB memlock hard
-    # cap → "error setting rlimit type 8: operation not permitted", container
-    # won't start). Dragonfly runs fine without it at this maxmemory cap; the
-    # ulimit was only relevant for io_uring on pre-5.12 kernels (no longer
-    # charged against RLIMIT_MEMLOCK since Linux 5.12).
+      - "127.0.0.1:6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -622,7 +625,7 @@ services:
     security_opt:
       - no-new-privileges:true
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     environment:
       NANO_SERVICE_TOKEN: ${NANO_SERVICE_TOKEN:-nanosiem-dev-service-token}
     volumes:
@@ -637,7 +640,7 @@ services:
       - |
         umask 077
         printf '%s' "$${NANO_SERVICE_TOKEN}" > /tmp/nano-service-token
-        exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=30d --web.enable-lifecycle --web.enable-admin-api
+        exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=30d --web.enable-lifecycle
     depends_on:
       - postgres
       - clickhouse
@@ -654,15 +657,28 @@ services:
     container_name: nanosiem-grafana
     security_opt:
       - no-new-privileges:true
+    # No shipped admin password. GRAFANA_PASSWORD from .env wins; without it a
+    # random one is generated and logged once (`docker compose logs grafana`).
+    # Grafana applies it only when it first creates its database, so an
+    # existing grafana-data volume keeps the password it already has.
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        if [ -z "$${GRAFANA_PASSWORD:-}" ]; then
+          GRAFANA_PASSWORD="$$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "Grafana admin password (generated, first start only): $${GRAFANA_PASSWORD}"
+        fi
+        export GF_SECURITY_ADMIN_PASSWORD="$${GRAFANA_PASSWORD}"
+        exec /run.sh
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-nanosiem}
+      GRAFANA_PASSWORD: ${GRAFANA_PASSWORD:-}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_INSTALL_PLUGINS: grafana-piechart-panel
-      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-https://nano.qsi.net/grafana/}
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3001/grafana/}
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     volumes:
       - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
@@ -685,7 +701,7 @@ services:
     environment:
       DATA_SOURCE_NAME: "postgresql://nanosiem:nanosiem@postgres:5432/nanosiem?sslmode=disable"
     ports:
-      - "9187:9187"
+      - "127.0.0.1:9187:9187"
     depends_on:
       postgres:
         condition: service_healthy
@@ -703,7 +719,7 @@ services:
       - '--path.sysfs=/host/sys'
       - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
     ports:
-      - "9100:9100"
+      - "127.0.0.1:9100:9100"
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
@@ -727,7 +743,7 @@ services:
     tmpfs:
       - /tmp:noexec,nosuid,size=50m
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/"]
       interval: 30s

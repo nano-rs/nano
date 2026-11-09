@@ -96,6 +96,17 @@ jobs:
             echo "release-version.sh not in this tree (public mirror); skipping"
           fi
 
+      # NAN-5050: every self-hosted job names exactly one runner trust pool
+      # (nano-release / nano-pr), and PR workflows never name nano-release.
+      - name: Runner pools
+        run: |
+          if [ -f scripts/ci/check-runner-pools.sh ]; then
+            bash scripts/ci/check-runner-pools.sh
+            bash scripts/tests/ci-runner-pools.sh
+          else
+            echo "check-runner-pools.sh not in this tree (public mirror); skipping"
+          fi
+
       - name: Run actionlint
         run: |
           set -euo pipefail

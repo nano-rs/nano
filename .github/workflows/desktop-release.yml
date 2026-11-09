@@ -29,36 +29,37 @@ jobs:
   build:
     strategy:
       fail-fast: false
+      # NAN-2283: self-hosted Apple Silicon instead of `macos-latest` (no 10x
+      # billing multiplier); Windows is still GitHub-hosted (2x), no
+      # self-hosted Windows runner exists yet.
+      # NAN-5050: a main release builds on the release-pool Mac (its hook
+      # admits main only); a branch build on the PR-pool Mac user, and only
+      # once that runner exists (vars.NANO_PR_MACOS_POOL == 'true'; the
+      # Windows leg posts a notice otherwise). Never the release Mac off main.
       matrix:
-        include:
-          # NAN-2283: self-hosted Apple Silicon (`mac-studio`, M1 Max) instead
-          # of `macos-latest`. Same arm64 .dmg/.app, without the 10x billing
-          # multiplier GitHub-hosted macOS carries on private repos.
-          - platform: '["self-hosted", "macOS", "ARM64"]'
-            rust_target: aarch64-apple-darwin
-          # Still GitHub-hosted (2x) — no self-hosted Windows runner exists yet.
-          - platform: '["windows-latest"]'
-            rust_target: x86_64-pc-windows-msvc
-    # JSON-encoded so a multi-label self-hosted target survives the matrix;
-    # `runs-on` takes the decoded array.
-    runs-on: ${{ fromJSON(matrix.platform) }}
+        include: ${{ fromJSON(github.ref == 'refs/heads/main' && '[{"platform":["self-hosted", "macOS", "ARM64", "nano-release"], "rust_target":"aarch64-apple-darwin"}, {"platform":["windows-latest"], "rust_target":"x86_64-pc-windows-msvc"}]' || (vars.NANO_PR_MACOS_POOL == 'true' && '[{"platform":["self-hosted", "macOS", "ARM64", "nano-pr"], "rust_target":"aarch64-apple-darwin"}, {"platform":["windows-latest"], "rust_target":"x86_64-pc-windows-msvc"}]' || '[{"platform":["windows-latest"], "rust_target":"x86_64-pc-windows-msvc"}]')) }}
+    runs-on: ${{ matrix.platform }} # runner-pool: matrix.platform lists above name their pool
     timeout-minutes: 45
     steps:
+      - name: Runner pool notice
+        if: matrix.rust_target == 'x86_64-pc-windows-msvc' && github.ref != 'refs/heads/main' && vars.NANO_PR_MACOS_POOL != 'true'
+        run: echo "::notice title=macOS skipped::No macOS PR-pool runner yet (vars.NANO_PR_MACOS_POOL != 'true'); this branch build is Windows-only. See docs-internal/ci-runner-pools.md."
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.95
+        uses: dtolnay/rust-toolchain@035fceb3c12fb0c6a9461b52775e16473133e591 # 1.95
         with:
           targets: ${{ matrix.rust_target }}
 
       - name: Cache Rust build
-        uses: swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: nano-desktop/src-tauri
 
@@ -76,7 +77,7 @@ jobs:
         working-directory: nano-desktop
 
       - name: Build + draft release (tauri-action)
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:

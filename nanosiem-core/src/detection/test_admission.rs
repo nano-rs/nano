@@ -81,7 +81,7 @@ impl RuleTestAdmission {
         if let Err(error) = backend.connection().await {
             // Keep the configured backend and reconnect on later requests. This
             // is fail-closed while Redis is down without requiring an API restart
-            // when Dragonfly becomes ready after this pod.
+            // when Valkey becomes ready after this pod.
             warn!(%error, "Distributed rule-test admission will retry Redis lazily");
         }
         Self {

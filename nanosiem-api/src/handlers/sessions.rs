@@ -336,6 +336,20 @@ pub async fn terminate_user_sessions(
         ));
     }
 
+    // NAN-5027: signing ANOTHER user out (which now also revokes their access
+    // tokens, NAN-5014) requires authority over that user.
+    if *user_id != requesting_user_id || auth.is_api_key {
+        crate::handlers::grant_authz::ensure_can_manage_principal(
+            &auth,
+            &state.pool,
+            permissions::USERS_EDIT,
+            *user_id,
+            None,
+        )
+        .await
+        .map_err(|g| (g.status, Json(SessionApiError::new(g.code, &g.message))))?;
+    }
+
     let count = state
         .session_service
         .terminate_all_user_sessions(

@@ -107,6 +107,22 @@ enterprise = true
 timeout_min = 180
 
 [[lane]]
+name = "upgrade-from-v2-installsh"
+issue = "NAN-5135"
+# v2.0.x gate: the open-core customer upgrade from v2.0.0 through install.sh
+# both times, inside one isolated DinD: v2.0.0 from the public mirror with
+# published images, seeded by the acceptance harness (5 sources, events, a
+# rule, an alert), then this checkout's stripped tree + locally built images
+# and install.sh again. Asserts install.sh exits 0, counts preserved, PG head
+# advanced, no existing .env value changed, and acceptance on the result.
+kind = "script"
+cmd = ["scripts/e2e/lanes/upgrade-from-v2-installsh.sh"]
+stack = false
+needs = ["docker"]
+enterprise = false
+timeout_min = 90
+
+[[lane]]
 name = "backup-restore"
 issue = "NAN-4989"
 # Customer disaster-recovery drill: for open and enterprise, seeds events,

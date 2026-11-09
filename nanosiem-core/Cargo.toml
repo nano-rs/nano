@@ -114,6 +114,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"
 proptest.workspace = true
 wiremock = "0.6"
 tokio = { workspace = true, features = ["test-util"] }
+# tests/open_core_relation_inventory.rs parses the Rust sources an open build
+# compiles to find the SQL relations they name.
+proc-macro2 = "1"
+syn = { version = "2", features = ["full", "parsing", "visit"] }
 # NAN-1546: recompute/verify the webhook HMAC signature in the delivery
 # integration test (these are non-dev deps too, but integration-test crates
 # only link the crate-under-test + dev-deps, so they must be listed here).

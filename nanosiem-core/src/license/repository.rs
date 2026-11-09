@@ -5,6 +5,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
+use super::release_notice::ReleaseNotice;
 use super::types::{LicenseState, LicenseStatus};
 
 /// Repository for reading/writing cached license status in PostgreSQL
@@ -21,7 +22,7 @@ impl LicenseRepository {
     /// Load the cached license status. Returns default (active) if no row exists.
     pub async fn get_status(&self) -> Result<LicenseStatus, sqlx::Error> {
         let row = sqlx::query_as::<_, LicenseRow>(
-            "SELECT status, valid, tier, locked_reason, grace_ends_at, expires_at, last_checked_at, last_heartbeat_at, COALESCE(offline, FALSE) AS offline
+            "SELECT status, valid, tier, locked_reason, grace_ends_at, expires_at, last_checked_at, last_heartbeat_at, COALESCE(offline, FALSE) AS offline, raw_response
              FROM license_status WHERE id = TRUE"
         )
         .fetch_optional(&self.pool)
@@ -34,7 +35,7 @@ impl LicenseRepository {
     pub async fn update_status(&self, status: &LicenseStatus) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO license_status (id, status, valid, tier, locked_reason, grace_ends_at, expires_at, last_checked_at, raw_response, updated_at)
-             VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7, NULL, NOW())
+             VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7, $8, NOW())
              ON CONFLICT (id) DO UPDATE SET
                 status = EXCLUDED.status,
                 valid = EXCLUDED.valid,
@@ -43,6 +44,9 @@ impl LicenseRepository {
                 grace_ends_at = EXCLUDED.grace_ends_at,
                 expires_at = EXCLUDED.expires_at,
                 last_checked_at = EXCLUDED.last_checked_at,
+                -- Merge: keys this write does not own (the NAN-5114
+                -- `release` notice) survive a status update.
+                raw_response = COALESCE(license_status.raw_response, '{}'::jsonb) || EXCLUDED.raw_response,
                 updated_at = NOW()"
         )
         .bind(status.state.as_str())
@@ -52,10 +56,43 @@ impl LicenseRepository {
         .bind(status.grace_ends_at)
         .bind(status.expires_at)
         .bind(status.last_checked_at)
+        .bind(serde_json::json!({ "entitlement": status.entitlement }))
         .execute(&self.pool)
         .await?;
 
         Ok(())
+    }
+
+    /// NAN-5114: record the newest-release facts from a successful online
+    /// check-in (`None` clears them). Only the `release` key is touched.
+    pub async fn update_release_notice(
+        &self,
+        notice: Option<&ReleaseNotice>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE license_status
+             SET raw_response = COALESCE(raw_response, '{}'::jsonb) || jsonb_build_object('release', $1::jsonb),
+                 updated_at = NOW()
+             WHERE id = TRUE",
+        )
+        .bind(serde_json::to_value(notice).unwrap_or(serde_json::Value::Null))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// NAN-5114: the newest-release facts from the last successful online
+    /// check-in, or `None` (no row, never reported, air-gapped, malformed).
+    pub async fn get_release_notice(&self) -> Result<Option<ReleaseNotice>, sqlx::Error> {
+        let raw: Option<Option<serde_json::Value>> = sqlx::query_scalar(
+            "SELECT raw_response -> 'release' FROM license_status WHERE id = TRUE",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(raw
+            .flatten()
+            .filter(|value| !value.is_null())
+            .and_then(|value| serde_json::from_value(value).ok()))
     }
 }
 
@@ -70,6 +107,7 @@ struct LicenseRow {
     last_checked_at: Option<DateTime<Utc>>,
     last_heartbeat_at: Option<DateTime<Utc>>,
     offline: bool,
+    raw_response: Option<serde_json::Value>,
 }
 
 impl LicenseRow {
@@ -84,6 +122,10 @@ impl LicenseRow {
             last_checked_at: self.last_checked_at,
             last_heartbeat_at: self.last_heartbeat_at,
             offline: self.offline,
+            entitlement: self
+                .raw_response
+                .and_then(|raw| raw.get("entitlement").cloned())
+                .and_then(|value| serde_json::from_value(value).ok()),
         }
     }
 }

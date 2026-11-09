@@ -51,6 +51,7 @@ impl SearchService {
         offset: usize,
         start_time: Instant,
         auto_sort_decision: &crate::search::query_processing::AutoSortDecision,
+        scope: &crate::auth::ScopeSet,
     ) -> Result<SearchResponse, SearchError> {
         // Get rarity threshold from prevalence service config
         let rarity_threshold = if let Some(ref prev_svc) = self.prevalence_service {
@@ -357,7 +358,8 @@ impl SearchService {
             queue_wait_ms: None,
             fields,
             generated_sql: if request.include_sql.unwrap_or(false) {
-                Some(sql)
+                // NAN-5043: never echo the caller's deny list.
+                Some(crate::search::display_sql::DisplaySql::for_scope(sql, scope))
             } else {
                 None
             },
@@ -791,6 +793,29 @@ impl SearchService {
         rarity_threshold: u64,
         rescue: &PrevalenceRescue,
     ) -> Result<(String, usize), SearchError> {
+        let (sql, pushed) = self.generate_prevalence_pushdown_sql_unobserved(
+            query,
+            prevalence_commands,
+            post_prevalence_commands,
+            time_range,
+            rarity_threshold,
+            rescue,
+        )?;
+        // Security review 2026-11-08 (layer 2): this template is a second SQL
+        // generator, so its output gets the same log-only tripwire.
+        crate::query::generated_sql_tripwire::observe(&sql, "prevalence_pushdown");
+        Ok((sql, pushed))
+    }
+
+    fn generate_prevalence_pushdown_sql_unobserved(
+        &self,
+        query: &Query,
+        prevalence_commands: &[PrevalenceCommandInfo],
+        post_prevalence_commands: &[Command],
+        time_range: &TimeRange,
+        rarity_threshold: u64,
+        rescue: &PrevalenceRescue,
+    ) -> Result<(String, usize), SearchError> {
         let time_window = Self::resolve_prevalence_window(prevalence_commands)?;
 
         let base_sql = self.generate_prevalence_base_sql(query, time_range)?;
@@ -1030,7 +1055,12 @@ impl SearchService {
         } else {
             let cols: Vec<String> = eval_expressions
                 .iter()
-                .map(|(name, expr)| format!("    ({}) AS {}", expr, name))
+                .map(|(name, expr)| {
+                    // Security review 2026-11-08 (NAN-5009): the eval target is an
+                    // OUTPUT alias the parser accepts with arbitrary quoted text, so
+                    // it is quoted exactly like `commands.rs` quotes the same alias.
+                    format!("    {}", crate::sql_hygiene::alias_expr(&format!("({})", expr), name))
+                })
                 .collect();
             format!(",\n{}", cols.join(",\n"))
         };
@@ -1189,6 +1219,18 @@ impl SearchService {
         // Priority for convenience fields: domain > IP > hash
         // Sentinel value 9999 = "common or not tracked" (dicts only load entities with
         // host_count < 1000).
+        //
+        // Template notes (kept here, not as SQL comments: generated SQL carries no
+        // comments so the layer-2 tripwire can treat any comment as suspicious,
+        // security review 2026-11-08):
+        // - `_domain_lookup`: first non-empty domain field (IPs excluded).
+        // - `_ip_lookup`: first non-empty IP field (or dest_host if it is an IP).
+        // - `_hash_lookup`: first non-empty hash field, lowercased.
+        // - `_*_host_count` is masked to 9999 when last_seen is outside the window;
+        //   this is how NAN-364 serves sub-30d windows from the 30d dict.
+        // - NAN-366: `host_count` is the rarest entity (lowest count). Ties break
+        //   domain → ip → hash only after the minimum is established, so a rare IP
+        //   is not hidden behind a common domain.
         let sql = format!(
             r#"WITH raw_logs AS (
     SELECT * FROM (
@@ -1197,18 +1239,13 @@ impl SearchService {
 ),
 logs_with_keys AS (
     SELECT *,
-        -- Domain lookup: first non-empty domain field (exclude IPs)
         {domain_lookup_expr} AS _domain_lookup,
-        -- IP lookup: first non-empty IP field (or dest_host if it's an IP)
         {ip_lookup_expr} AS _ip_lookup,
-        -- Hash lookup: first non-empty hash field (lowercased for case-insensitive matching)
         {hash_lookup_expr} AS _hash_lookup
     FROM raw_logs
 ),
 base_logs AS (
     SELECT *,
-        -- Mask host_count to 9999 (sentinel) when last_seen is outside the requested window.
-        -- This is how NAN-364 serves sub-30d windows from the 30d dict without per-window dicts.
         {dp_host_count_expr} AS _dp_host_count,
         {dp_first_seen_expr} AS _dp_first_seen,
         {dp_last_seen_expr} AS _dp_last_seen,
@@ -1225,9 +1262,6 @@ base_logs AS (
 )
 SELECT
     l.*,
-    -- NAN-366: winner = rarest entity (lowest host_count). Ties break domain → ip → hash
-    -- only as a last resort, after the min has been established, so "rare IP + common domain"
-    -- no longer hides behind the domain.
     CASE
         WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) >= 9999 THEN NULL
         ELSE least(_dp_host_count, _ip_host_count, _hp_host_count)
@@ -1354,7 +1388,7 @@ ORDER BY l.timestamp DESC"#,
 
         tracing::debug!(
             "Generated prevalence SQL (first 2000 chars): {}",
-            &sql[..sql.len().min(2000)]
+            crate::text_bounds::prefix_at_most(&sql, 2000)
         );
         Ok((sql, num_commands_pushed))
     }
@@ -1415,8 +1449,8 @@ pub(crate) fn prevalence_condition_sql(
                 // Check if the field is an eval-created field
                 let (sql_field, needs_null_check): (std::borrow::Cow<'_, str>, bool) =
                     if eval_field_names.contains(field.as_ref()) {
-                        // Eval-created field - reference directly
-                        (field.into_owned().into(), false)
+                        // Eval-created field: reference the quoted alias (NAN-5009).
+                        (crate::sql_hygiene::quote_identifier(field.as_ref()).into(), false)
                     } else {
                         // Use prevalence field mapping
                         match field.as_ref() {
@@ -1438,7 +1472,7 @@ pub(crate) fn prevalence_condition_sql(
                         "first_seen" | "prevalence_first_seen" => ("CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_first_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_first_seen WHEN _hp_host_count < 9999 THEN _hp_first_seen ELSE NULL END".into(), true),
                         "last_seen" | "prevalence_last_seen" => ("CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_last_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_last_seen WHEN _hp_host_count < 9999 THEN _hp_last_seen ELSE NULL END".into(), true),
                         "total_occurrences" => ("CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_total_occurrences WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_total_occurrences WHEN _hp_host_count < 9999 THEN _hp_total_occurrences ELSE NULL END".into(), true),
-                        other => (format!("l.{}", other).into(), false),
+                        other => (crate::sql_hygiene::qualified_column("l", other).into(), false),
                     }
                     };
 
@@ -1611,14 +1645,14 @@ pub(crate) fn prevalence_condition_sql(
                 // Check if the field is an eval-created field
                 let (sql_field, needs_null_check): (std::borrow::Cow<'_, str>, bool) =
                     if eval_field_names.contains(field.as_ref()) {
-                        (field.into_owned().into(), false)
+                        (crate::sql_hygiene::quote_identifier(field.as_ref()).into(), false)
                     } else {
                         match field.as_ref() {
                         // NAN-366: match SELECT-side rarest-wins semantics.
                         "host_count" => ("CASE WHEN least(_dp_host_count, _ip_host_count, _hp_host_count) >= 9999 THEN NULL ELSE least(_dp_host_count, _ip_host_count, _hp_host_count) END".into(), true),
                         "first_seen" | "prevalence_first_seen" => ("CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_first_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_first_seen WHEN _hp_host_count < 9999 THEN _hp_first_seen ELSE NULL END".into(), true),
                         "last_seen" | "prevalence_last_seen" => ("CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_last_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_last_seen WHEN _hp_host_count < 9999 THEN _hp_last_seen ELSE NULL END".into(), true),
-                        other => (format!("l.{}", other).into(), false),
+                        other => (crate::sql_hygiene::qualified_column("l", other).into(), false),
                     }
                     };
 
@@ -1641,8 +1675,8 @@ pub(crate) fn prevalence_condition_sql(
                 // If it's a field reference and that field is an eval-created field, use it directly
                 let func_sql = match function {
                     EvalExpression::Field(name) if eval_field_names.contains(name) => {
-                        // Eval-created field reference - use directly
-                        name.clone()
+                        // Eval-created field reference: the quoted alias (NAN-5009).
+                        crate::sql_hygiene::quote_identifier(name)
                     }
                     _ => prevalence_eval_sql(gen, function, false, &std::collections::HashSet::new())?,
                 };
@@ -1722,10 +1756,13 @@ pub(crate) fn prevalence_condition_sql(
                 let field = normalize_prevalence_field(field);
                 let field_name = field.as_ref().to_string();
                 let is_eval_field = eval_field_names.contains(field.as_ref());
+                // Security review 2026-11-08: both forms are quoted. A quoted
+                // eval/rename name made before `| prevalence` is "derived", so it
+                // skips field-name validation and must not reach SQL raw.
                 let sql_field: std::borrow::Cow<'_, str> = if is_eval_field {
-                    field.into_owned().into()
+                    crate::sql_hygiene::quote_identifier(field.as_ref()).into()
                 } else {
-                    format!("l.{}", field).into()
+                    crate::sql_hygiene::qualified_column("l", field.as_ref()).into()
                 };
                 if !is_eval_field {
                     if let Some(sql) = gen
@@ -1768,6 +1805,7 @@ pub(crate) fn prevalence_condition_sql(
                 // boundaries for one-sided wildcards) over the profile's body
                 // columns of the joined row.
                 let cols: Vec<String> =
+                    // sql-lint: allow(profile column constants)
                     gen.keyword_search_columns().iter().map(|c| format!("l.{c}")).collect();
                 let cols: Vec<&str> = cols.iter().map(String::as_str).collect();
                 Ok(crate::query::clickhouse_sql_gen::keyword_predicate(kw, &cols))

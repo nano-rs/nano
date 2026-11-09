@@ -166,6 +166,8 @@ BUNDLE_IMAGE_ROLES: dict[str, frozenset[str]] = {
     "postgres": frozenset({"postgres"}),
     "clickhouse-server": frozenset({"clickhouse"}),
     "clickhouse-keeper": frozenset({"keeper"}),
+    "valkey": frozenset({"app"}),
+    # Pre-NAN-5082 releases (legacy N-1 locks) still carry Dragonfly.
     "dragonfly": frozenset({"app"}),
     "vector": frozenset({"ingest"}),
     "curl": frozenset({"ingest"}),
@@ -1270,6 +1272,11 @@ class Runner:
         return result
 
 
+# The online checker auto-locks a cache older than this (nanosiem-core
+# license/checker.rs STALE_LICENSE_DAYS); the preflight uses the same bound.
+ONLINE_LICENSE_STALE_DAYS = 14
+
+
 def parse_role_env(path: pathlib.Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
@@ -2115,9 +2122,82 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             raise UpgradeError(f"{blocked or 'unknown'} PostgreSQL session(s) have long-running lock waits")
         return "reachable; no lock wait older than 60 seconds"
 
+    def _online_license_tuple(self) -> str:
+        """Classify the licence tuple nano-api boots with (NAN-5121).
+
+        Mirrors ``ApiConfig::online_license_config``: AIRGAP_MODE, or no URL and no token, is the
+        C05 authority (``"none"``); URL, token and deployment id all populated
+        is the online authority (``"complete"``); anything else is a partial
+        tuple the API refuses (``"partial"``). The values are resolved the way
+        Compose hands them to nano-api: ``LICENSE_TOKEN`` falls back to the
+        legacy ``DEPLOYMENT_TOKEN``, and on a role-split host the rendered
+        licence deployment id (NAN-5120) or the inventory deployment id stands
+        in for ``NANO_DEPLOYMENT_ID``.
+        """
+        env = getattr(self, "env", None) or {}
+        role_env = getattr(self, "role_env", None) or {}
+        # ApiConfig selects C05 under AIRGAP_MODE whatever tuple is left over
+        # (nanosiem-api config.rs online_license_config; "true" or "1" only).
+        if env.get("AIRGAP_MODE", "") in {"true", "1"}:
+            return "none"
+
+        def value(*candidates: str) -> str:
+            for candidate in candidates:
+                text = candidate.strip()
+                if text:
+                    return text
+            return ""
+
+        url = value(env.get("LICENSE_URL", ""))
+        token = value(env.get("LICENSE_TOKEN", ""), env.get("DEPLOYMENT_TOKEN", ""))
+        if not url and not token:
+            return "none"
+        deployment = value(
+            role_env.get("NANO_LICENSE_DEPLOYMENT_ID", ""),
+            role_env.get("NANO_DEPLOYMENT_ID", ""),
+            env.get("NANO_DEPLOYMENT_ID", ""),
+        )
+        return "complete" if url and token and deployment else "partial"
+
     def _check_license(self, test_rehearsal: bool = False) -> str:
         if self.edition != "enterprise":
             return "open edition does not require a C05 licence"
+        tuple_state = self._online_license_tuple()
+        if tuple_state == "partial":
+            raise UpgradeError(
+                "online licence tuple is incomplete: LICENSE_URL, LICENSE_TOKEN and "
+                "NANO_DEPLOYMENT_ID must all be set (or none, for a C05 licence)"
+            )
+        if tuple_state == "complete":
+            # Online authority: the API admits on the cached check-in, never on
+            # C05 state, which an online install does not have (NAN-5121).
+            row = self._pg_query(
+                "SELECT status || E'\\t' || valid::text || E'\\t' || "
+                "COALESCE((expires_at > clock_timestamp())::text,'true') || E'\\t' || "
+                "COALESCE(offline, FALSE)::text || E'\\t' || "
+                "COALESCE((last_checked_at > clock_timestamp() - "
+                f"interval '{ONLINE_LICENSE_STALE_DAYS} days')::text,'false') "
+                "FROM license_status WHERE id=TRUE"
+            )
+            fields = row.split("\t")
+            if (
+                len(fields) != 5
+                or fields[0] not in {"active", "grace_period"}
+                or fields[1:3] != ["true", "true"]
+            ):
+                raise UpgradeError("online licence check-in is not active and unexpired")
+            if fields[3] != "false":
+                raise UpgradeError(
+                    "licence cache was written by an offline import, but this install "
+                    "is configured for online licensing"
+                )
+            if fields[4] != "true":
+                raise UpgradeError(
+                    "online licence has not checked in successfully within "
+                    f"{ONLINE_LICENSE_STALE_DAYS} days; restore reachability to the "
+                    "licence server before upgrading"
+                )
+            return f"licence status {fields[0]}; authority online"
         row = self._pg_query(
             "SELECT status || E'\\t' || valid::text || E'\\t' || "
             "COALESCE((expires_at > clock_timestamp())::text,'true') FROM license_status WHERE id=TRUE"

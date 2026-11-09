@@ -1,0 +1,27 @@
+name: release preflight
+
+# Fast check of release packaging tooling on every PR that touches it, so a broken
+# release script fails here instead of at the end of a 45-minute build-and-push.
+on:
+  pull_request:
+    paths:
+      - "scripts/release/**"
+      - "scripts/tests/customer-images.test.sh"
+      - "deploy/release/**"
+      - ".github/workflows/build-and-push.yml"
+      - ".github/workflows/publish-customer-images.yml"
+      - ".github/workflows/release-notify.yml"
+      - ".github/workflows/release-bundle.yml"
+      - ".github/workflows/release-preflight.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: [self-hosted, Linux, X64, nano-pr]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Release preflight
+        run: bash scripts/release/preflight.sh

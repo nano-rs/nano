@@ -71,6 +71,11 @@ pub fn init_tracing(service_name: &str) -> TracingGuard {
         deployment_id = %deployment_id,
         version = version,
     );
+    // NAN-5102 audit: this is the one entered guard held across `.await` that
+    // is sound. Every caller holds it in the future passed to the runtime's
+    // `block_on`, which polls only on the calling thread and never migrates,
+    // and the span outlives every request. Do NOT copy this into a spawned or
+    // per-request future: there, use `.instrument(span)`.
     let guard = root_span.entered();
 
     TracingGuard {

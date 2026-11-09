@@ -239,7 +239,7 @@ class Nano:
             **extra,
         }
         # x-nano-cache-bypass: a polled query must never be answered from the
-        # Dragonfly result cache (the first, empty answer would repeat).
+        # Valkey result cache (the first, empty answer would repeat).
         return expect(
             self.search_http.post("/api/search", json=body, headers={"x-nano-cache-bypass": "1"}), 200
         )

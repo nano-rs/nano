@@ -12,10 +12,9 @@ pub mod artifacts;
 // against columns its database doesn't have.
 #[cfg(feature = "enterprise")]
 pub mod cases;
-// NAN-2075/2077: the case-visibility predicate itself is NOT gated. Open-core
-// surfaces (playbooks, notebooks) legitimately need to answer "can this user see
-// this case?" without depending on the enterprise-gated `CaseRepository` type,
-// and having ONE definition is the whole point — see the module docs.
+// Cases, playbooks, and notebooks are all enterprise surfaces. Keep their
+// shared ACL SQL out of the open binary along with the repositories that use it.
+#[cfg(feature = "enterprise")]
 pub mod case_visibility;
 pub mod dashboards;
 pub mod detection_rules;
@@ -23,6 +22,7 @@ pub mod feedback;
 pub mod folder_settings;
 #[cfg(feature = "enterprise")]
 pub mod incidents;
+#[cfg(feature = "enterprise")]
 pub mod notebooks;
 pub mod notifications;
 pub mod query_explanations;
@@ -47,6 +47,7 @@ pub use feedback::{
 pub use folder_settings::{FolderSetting, FolderSettingsError, FolderSettingsRepository};
 #[cfg(feature = "enterprise")]
 pub use incidents::{IncidentRepository, IncidentRepositoryError};
+#[cfg(feature = "enterprise")]
 pub use notebooks::{NotebookRepository, NotebookRepositoryError};
 pub use notifications::{NotificationError, NotificationRepository};
 pub use retro_hunt::{RetroHuntRepository, RetroHuntRepositoryError};

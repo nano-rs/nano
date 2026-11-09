@@ -737,7 +737,7 @@ impl ClickHouseLoader {
             "''".to_string()
         } else {
             keep.iter()
-                .map(|k| format!("'{}'", k.replace('\\', "\\\\").replace('\'', "\\'")))
+                .map(|k| crate::sql_hygiene::string_literal(k))
                 .collect::<Vec<_>>()
                 .join(", ")
         };

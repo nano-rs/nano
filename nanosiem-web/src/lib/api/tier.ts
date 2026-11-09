@@ -19,7 +19,7 @@ export class TierApi {
     return this.request('/api/settings/tier');
   }
 
-  /** Set the organization tier */
+  /** Compatibility setter for pre-v2 callers. */
   async setTier(tier: string): Promise<TierLimits> {
     return this.request('/api/settings/tier', {
       method: 'PUT',
@@ -27,7 +27,15 @@ export class TierApi {
     });
   }
 
-  /** Update specific tier limit overrides (Enterprise) */
+  /** Update the canonical v2 entitlement identity. */
+  async setEntitlement(entitlement: SetTierRequest): Promise<TierLimits> {
+    return this.request('/api/settings/tier', {
+      method: 'PUT',
+      body: JSON.stringify(entitlement),
+    });
+  }
+
+  /** Compatibility endpoint; max_daily_gb maps to v2 capacity metadata. */
   async updateLimits(limits: UpdateTierLimitsRequest): Promise<TierLimits> {
     return this.request('/api/settings/tier/limits', {
       method: 'PUT',

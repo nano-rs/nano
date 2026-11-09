@@ -31,6 +31,8 @@ use super::types::{
 /// This is a valid bcrypt hash that will always fail verification
 /// but takes the same time as a real verification
 const DUMMY_BCRYPT_HASH: &str = "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4.VTtYA/pWrZ5Wiq";
+#[cfg(test)]
+pub(crate) const DUMMY_BCRYPT_HASH_FOR_TESTS: &str = DUMMY_BCRYPT_HASH;
 
 /// Authentication service errors
 /// NAN-2453: how long the immediately previous refresh token stays usable
@@ -255,10 +257,7 @@ impl AuthService {
             Err(UserRepositoryError::NotFoundByEmail(_)) => {
                 // SECURITY: Perform dummy password verification to prevent timing attacks
                 // This ensures the response time is similar whether user exists or not
-                let pwd = password.to_string();
-                let _ =
-                    tokio::task::spawn_blocking(move || verify_password(&pwd, DUMMY_BCRYPT_HASH))
-                        .await;
+                let _ = verify_or_burn(password, None).await;
 
                 // Return generic error (Requirement 1.3)
                 return Err(AuthError::InvalidCredentials);
@@ -266,44 +265,46 @@ impl AuthService {
             Err(e) => return Err(e.into()),
         };
 
-        // Check if account is disabled
-        if user.status == "disabled" {
-            // SECURITY: Still perform password verification to prevent timing attacks
-            if let Some(hash) = user.password_hash.as_ref() {
-                let pwd = password.to_string();
-                let h = hash.clone();
-                let _ = tokio::task::spawn_blocking(move || verify_password(&pwd, &h)).await;
-            }
+        // NAN-5036: every rejection below costs exactly one bcrypt verification
+        // (real hash when usable, DUMMY_BCRYPT_HASH otherwise). A passwordless
+        // SSO/JIT account, a `system` service account (empty hash) and a
+        // disabled/locked one must be indistinguishable by latency from an
+        // unknown email or a wrong password.
 
+        // Only `active` and `locked` accounts can sign in with a password;
+        // `disabled`, `system` and any unknown status are rejected generically.
+        if user.status != "active" && user.status != "locked" {
+            let _ = verify_or_burn(password, user.password_hash.as_deref()).await;
             // SECURITY: Return generic error to prevent account status enumeration
             return Err(AuthError::InvalidCredentials);
         }
 
         // Check if account is locked (Requirement 1.5)
         if self.is_account_locked(&user).await? {
-            // SECURITY: Still perform password verification to prevent timing attacks
-            if let Some(hash) = user.password_hash.as_ref() {
-                let pwd = password.to_string();
-                let h = hash.clone();
-                let _ = tokio::task::spawn_blocking(move || verify_password(&pwd, &h)).await;
-            }
-
+            let _ = verify_or_burn(password, user.password_hash.as_deref()).await;
             // SECURITY: Return generic error to prevent account status enumeration
             return Err(AuthError::InvalidCredentials);
         }
 
-        // Verify password
-        let password_hash = user
-            .password_hash
-            .as_ref()
-            .ok_or(AuthError::InvalidCredentials)?;
+        // NAN-5027: an SSO-linked account signs in through its IdP. A leftover
+        // local password (set before the link, or on a tenant upgraded from a
+        // build that kept it) is not a second way in unless an administrator
+        // set the audited break-glass flag on the account.
+        if user.oidc_provider_id.is_some() && !user.local_login_break_glass {
+            let _ = verify_or_burn(password, None).await;
+            return Err(AuthError::InvalidCredentials);
+        }
 
-        let pwd = password.to_string();
-        let h = password_hash.clone();
-        let password_valid = tokio::task::spawn_blocking(move || verify_password(&pwd, &h))
-            .await
-            .map_err(|e| AuthError::InternalError(e.to_string()))?
-            .map_err(|_| AuthError::InvalidCredentials)?;
+        // A passwordless account (SSO/JIT) burns the dummy and fails WITHOUT
+        // touching the failed-attempt counter: password spraying must not be
+        // able to throttle or lock an account that has no password at all.
+        if !user.password_hash.as_deref().is_some_and(is_usable_bcrypt_hash) {
+            let _ = verify_or_burn(password, None).await;
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        // Verify password
+        let password_valid = verify_or_burn(password, user.password_hash.as_deref()).await?;
 
         if !password_valid {
             // Increment failed attempts and potentially lock account (Requirement 1.6)
@@ -662,6 +663,15 @@ impl AuthService {
         // Get the user
         let user = self.user_repo.get_user_by_id(claims.sub).await?;
 
+        // NAN-5014 defense in depth: a session created before the user's
+        // forced-revocation watermark is dead even if its row survived (every
+        // revocation path deletes it, but the watermark is authoritative).
+        if let Some(watermark) = self.user_repo.tokens_valid_from(user.id).await? {
+            if session.created_at < watermark {
+                return Err(AuthError::SessionNotFound);
+            }
+        }
+
         // Check if account is still active
         if user.status == "disabled" {
             return Err(AuthError::AccountDisabled);
@@ -794,13 +804,12 @@ impl AuthService {
         // Find user by reset token (this also validates expiration)
         let user = self.user_repo.get_user_by_reset_token(token).await?;
 
-        // Update the password
+        // Update the password. `update_password` revokes every token and
+        // session in the same transaction (NAN-5014: this path used to delete
+        // sessions but leave access tokens valid until expiry).
         self.user_repo
             .update_password(user.id, new_password)
             .await?;
-
-        // Invalidate all existing sessions for security
-        self.session_repo.delete_user_sessions(user.id).await?;
 
         Ok(())
     }
@@ -840,18 +849,13 @@ impl AuthService {
         // bound before scheduling the bcrypt hash.
         validate_password(new_password)?;
 
-        // Update the password
+        // Update the password. F-32: `update_password` stamps the revocation
+        // watermark and deletes every session in the SAME transaction as the
+        // hash write (previously three separate statements, so a concurrent
+        // refresh between them could mint a post-change access token).
         self.user_repo
             .update_password(user_id, new_password)
             .await?;
-
-        // F-32: stamp the forced-revocation watermark so already-issued access
-        // tokens (the account stays `active` across a password change, so the
-        // status gate alone would not catch them) are rejected by the middleware.
-        self.user_repo.stamp_tokens_valid_from(user_id).await?;
-
-        // Invalidate all existing sessions for security
-        self.session_repo.delete_user_sessions(user_id).await?;
 
         Ok(())
     }
@@ -921,6 +925,28 @@ impl AuthService {
 
         Ok(token_pair)
     }
+}
+
+/// True when `hash` is a bcrypt hash `verify_password` can actually check.
+fn is_usable_bcrypt_hash(hash: &str) -> bool {
+    hash.starts_with("$2") && hash.len() == 60
+}
+
+/// NAN-5036: verify `password` with exactly ONE bcrypt run, whatever the
+/// account looks like. A missing or unusable hash (SSO/JIT user, `system`
+/// service account with an empty hash) is verified against
+/// [`DUMMY_BCRYPT_HASH`] and always yields `false`, so every login rejection
+/// costs the same.
+pub(crate) async fn verify_or_burn(password: &str, hash: Option<&str>) -> Result<bool, AuthError> {
+    let real = hash.filter(|h| is_usable_bcrypt_hash(h)).map(str::to_string);
+    let is_real = real.is_some();
+    let target = real.unwrap_or_else(|| DUMMY_BCRYPT_HASH.to_string());
+    let pwd = password.to_string();
+    let ok = tokio::task::spawn_blocking(move || verify_password(&pwd, &target))
+        .await
+        .map_err(|e| AuthError::InternalError(e.to_string()))?
+        .unwrap_or(false);
+    Ok(is_real && ok)
 }
 
 /// Hash a token using SHA-256 for storage.

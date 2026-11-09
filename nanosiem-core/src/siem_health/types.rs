@@ -197,6 +197,10 @@ pub struct CollectedMetrics {
     /// this field existed.
     #[serde(default)]
     pub audit_durability: Option<crate::audit::AuditOutboxStats>,
+    /// NAN-5032: configured log sources whose route key is a platform-owned
+    /// source type. Empty on reports written before this field existed.
+    #[serde(default)]
+    pub reserved_source_names: ReservedSourceNames,
     pub collected_at: DateTime<Utc>,
 }
 
@@ -745,4 +749,13 @@ pub struct DimensionDetails {
     pub enrichment: String,
     pub detection: String,
     pub alerting: String,
+}
+
+/// NAN-5032: log sources whose route key collides with a source type nano
+/// writes itself. `enforced` names are rewritten to `reserved_spoof` at ingest
+/// from v2.0.1; `warn_only` names will be in a future release.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReservedSourceNames {
+    pub enforced: Vec<String>,
+    pub warn_only: Vec<String>,
 }

@@ -336,6 +336,13 @@ pub fn aliases() -> &'static [AliasEntry] {
     &registry().aliases
 }
 
+/// The embedded `(version, gzip contract)` pairs, oldest first. The offline
+/// event validator (`parsers::ocsf_validation`) decodes the same files with
+/// the requirement, constraint and data-type detail this registry ignores.
+pub fn embedded_contracts() -> &'static [(&'static str, &'static [u8])] {
+    CONTRACTS
+}
+
 /// Embedded OCSF versions, oldest first.
 pub fn versions() -> Vec<&'static str> {
     registry().versions.iter().map(|v| v.version).collect()

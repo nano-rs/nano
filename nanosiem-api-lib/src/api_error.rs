@@ -803,6 +803,9 @@ impl From<nanosiem_core::MarketplaceError> for ApiError {
             MarketplaceError::CredentialRequired => {
                 ApiError::ValidationError("Credential required for this enrichment".to_string())
             }
+            MarketplaceError::EnterpriseRequired(surface) => {
+                ApiError::Forbidden(format!("{surface} requires the enterprise edition"))
+            }
             MarketplaceError::SyncInProgress(id) => {
                 ApiError::Conflict(format!("Sync already in progress for repository: {}", id))
             }
@@ -873,6 +876,7 @@ impl From<nanosiem_core::ParserRepositoryError> for ApiError {
     }
 }
 
+#[cfg(feature = "enterprise")]
 impl From<nanosiem_core::PlaybookRepositoryError> for ApiError {
     fn from(err: nanosiem_core::PlaybookRepositoryError) -> Self {
         use nanosiem_core::PlaybookRepositoryError;
@@ -927,6 +931,7 @@ impl From<nanosiem_core::PlaybookRepositoryError> for ApiError {
 /// authorized, its work simply belongs to a generation that no longer exists.
 /// A 403 would read as "fix your credentials" and invite a retry loop; a 409
 /// tells the runner to stop.
+#[cfg(feature = "enterprise")]
 impl From<nanosiem_core::hunts::HuntError> for ApiError {
     fn from(err: nanosiem_core::hunts::HuntError) -> Self {
         use nanosiem_core::hunts::HuntError;
@@ -962,6 +967,7 @@ impl From<nanosiem_core::hunts::HuntError> for ApiError {
     }
 }
 
+#[cfg(feature = "enterprise")]
 impl From<nanosiem_core::playbooks::PlaybookError> for ApiError {
     fn from(err: nanosiem_core::playbooks::PlaybookError) -> Self {
         use nanosiem_core::playbooks::PlaybookError;
@@ -994,6 +1000,7 @@ impl From<nanosiem_core::playbooks::PlaybookError> for ApiError {
     }
 }
 
+#[cfg(feature = "enterprise")]
 impl From<nanosiem_core::db::repository::NotebookRepositoryError> for ApiError {
     fn from(err: nanosiem_core::db::repository::NotebookRepositoryError) -> Self {
         use nanosiem_core::db::repository::NotebookRepositoryError;
@@ -1138,6 +1145,7 @@ mod tests {
     // same generic envelope every other database fault produces.
 
     #[test]
+    #[cfg(feature = "enterprise")]
     fn hunt_database_errors_keep_the_driver_detail_out_of_the_body() {
         let error = ApiError::from(nanosiem_core::hunts::HuntError::Database(
             sqlx::Error::PoolTimedOut,
@@ -1148,6 +1156,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "enterprise")]
     fn hunt_log_store_errors_keep_the_exception_text_out_of_the_body() {
         let error = ApiError::from(nanosiem_core::hunts::HuntError::LogStore(
             "Code: 47. DB::Exception: Unknown expression or function identifier `email_sender`"
@@ -1162,6 +1171,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "enterprise")]
     fn hunt_lease_and_validation_outcomes_keep_their_specific_bodies() {
         // The 4xx paths carry operator-facing detail on purpose; the NAN-2266
         // genericisation must not have swallowed them.

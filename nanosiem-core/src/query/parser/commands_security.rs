@@ -274,14 +274,16 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
             }
 
             // Check if this looks like a window/interval spec or enrich
-            let trimmed_lower = trimmed.to_ascii_lowercase();
-            if trimmed_lower.starts_with("window=") || trimmed_lower.starts_with("window ")
-                || trimmed_lower.starts_with("interval=") || trimmed_lower.starts_with("interval ")
+            // NAN-5024: compare the keyword prefix in place; lowercasing the
+            // whole remaining query per condition was O(n^2).
+            use super::starts_with_ignore_ascii_case as starts_ci;
+            if starts_ci(trimmed, "window=") || starts_ci(trimmed, "window ")
+                || starts_ci(trimmed, "interval=") || starts_ci(trimmed, "interval ")
             {
                 remaining = trimmed;
                 break;
             }
-            if trimmed.to_ascii_lowercase().starts_with("enrich=") {
+            if starts_ci(trimmed, "enrich=") {
                 remaining = trimmed;
                 break;
             }
@@ -919,6 +921,33 @@ pub(super) fn funnel_command(input: &str) -> ParseResult<'_, Command> {
     ))
 }
 
+/// Aggregation functions `anomaly <func>(<field>) by …` accepts, mapped to the
+/// ClickHouse function the generator emits (security review 2026-11-08,
+/// NAN-5034). Case-insensitive. `dc` / `distinct_count` / `uniq` keep the
+/// approximate `uniq` anomaly has always used; `mean` is an alias of `avg`.
+/// Returns `None` for anything else, which is a parse error.
+pub(crate) fn anomaly_aggregation_function(name: &str) -> Option<&'static str> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "count" => "count",
+        "sum" => "sum",
+        "avg" | "mean" => "avg",
+        "min" => "min",
+        "max" => "max",
+        "dc" | "distinct_count" | "uniq" => "uniq",
+        "estdc" => "uniqCombined64",
+        "median" => "median",
+        "stdev" => "stddevPop",
+        "var" => "varPop",
+        _ => return None,
+    })
+}
+
+/// The names [`anomaly_aggregation_function`] accepts, for error messages.
+pub(crate) const ANOMALY_AGGREGATION_FUNCTIONS: &[&str] = &[
+    "count", "sum", "avg", "mean", "min", "max", "dc", "distinct_count", "uniq", "estdc",
+    "median", "stdev", "var",
+];
+
 pub(super) fn anomaly_command(input: &str) -> ParseResult<'_, Command> {
     let (input, _) = tag_no_case("anomaly").parse(input)?;
     let (input, _) = multispace1(input)?;
@@ -945,6 +974,17 @@ pub(super) fn anomaly_command(input: &str) -> ParseResult<'_, Command> {
         ))
         .parse(input)
     {
+        // Security review 2026-11-08 (NAN-5034): only allowlisted aggregation
+        // functions. Any other name (`filesystemAvailable()`, `hostName()`, …)
+        // used to reach ClickHouse verbatim. Fail at the name so `convert_error`
+        // can list the supported set.
+        let func_name = agg_name.split('(').next().unwrap_or_default();
+        if anomaly_aggregation_function(func_name).is_none() {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
         // Keep full expression like "count()" or "sum(bytes_out)"
         (agg_name.to_string(), agg_name_end)
     }

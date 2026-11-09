@@ -49,7 +49,7 @@ jobs:
   # this workflow exists to end. Wasting a run costs minutes; not running the
   # tests costs a shipped bug.
   changes:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, nano-pr]
     permissions:
       contents: read
       # Required, and NOT optional the way it is in build-and-push.yml's copy of
@@ -63,6 +63,10 @@ jobs:
       desktop: ${{ steps.filter.outputs.desktop }}
       web: ${{ steps.filter.outputs.web }}
     steps:
+      - name: Runner pool notice
+        if: vars.NANO_PR_MACOS_POOL != 'true'
+        run: echo "::notice title=macOS skipped::No macOS PR-pool runner yet (vars.NANO_PR_MACOS_POOL != 'true'); the desktop (macOS) job is skipped. See docs-internal/ci-runner-pools.md."
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -82,7 +86,7 @@ jobs:
     needs: [changes]
     if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
     # Self-hosted only (repo rule — never ubuntu-latest).
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, nano-pr]
     # Raised from 15 for the open-edition build step added at the end (NAN-2356).
     timeout-minutes: 25
     steps:
@@ -168,7 +172,7 @@ jobs:
     # `tsc`), so a web-only change can break this typecheck. Cheap to run — it
     # is on the self-hosted X64 box — so err toward running it.
     if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.web == 'true') }}
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, nano-pr]
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -223,8 +227,10 @@ jobs:
     # The `changes` gate above is what the old comment here claimed but did not
     # do: `nanosiem-web`-only PRs no longer start this job at all.
     needs: [changes]
-    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.desktop == 'true') }}
-    runs-on: [self-hosted, macOS, ARM64]
+    # NAN-5050: only once the macOS PR-pool runner (mac-studio-pr) exists;
+    # never on the release-pool Mac. `changes` posts a notice meanwhile.
+    if: ${{ !cancelled() && vars.NANO_PR_MACOS_POOL == 'true' && (github.event_name == 'workflow_dispatch' || needs.changes.result != 'success' || needs.changes.outputs.desktop == 'true') }}
+    runs-on: [self-hosted, macOS, ARM64, nano-pr]
     timeout-minutes: 30
     steps:
       - name: Checkout

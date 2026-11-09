@@ -14,7 +14,7 @@
   "time": 1749081788901,
   "message": "GET /admin/config.php returned 403 from 10.20.30.40",
   "metadata": {
-    "version": "1.8.0",
+    "version": "1.9.0",
     "product": {
       "name": "Conduit Proxy",
       "vendor_name": "nano",

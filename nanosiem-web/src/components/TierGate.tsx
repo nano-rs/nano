@@ -6,7 +6,7 @@ import { Lock } from 'lucide-react';
 interface TierGateProps {
   /** Return true if the feature is available */
   check: (tier: ReturnType<typeof useTierContext>) => boolean;
-  /** Tier name needed for the upgrade message */
+  /** Deprecated compatibility prop; v2 has no feature-tier upgrades. */
   requiredTier: string;
   /** Feature name for the upgrade message */
   featureName: string;
@@ -14,13 +14,13 @@ interface TierGateProps {
 }
 
 /**
- * Gates content behind a tier check. Shows an upgrade prompt
- * when the feature isn't available on the current plan.
+ * Gates content on an edition/build capability.
  */
 export function TierGate({ check, requiredTier, featureName, children }: TierGateProps) {
   const tierCtx = useTierContext();
+  void requiredTier;
 
-  if (tierCtx.loading || !tierCtx.isEnforced) {
+  if (tierCtx.loading) {
     return <>{children}</>;
   }
 
@@ -31,10 +31,10 @@ export function TierGate({ check, requiredTier, featureName, children }: TierGat
           <Lock className="w-6 h-6 text-muted-foreground" />
         </div>
         <h3 className="text-lg font-semibold text-foreground mb-2">
-          {featureName} is not available on your plan
+          {featureName} is not included in this build
         </h3>
         <p className="text-sm text-muted-foreground max-w-md">
-          Upgrade to {requiredTier} or higher to access {featureName.toLowerCase()}.
+          This deployment does not include {featureName.toLowerCase()}.
         </p>
       </div>
     );

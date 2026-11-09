@@ -28,8 +28,8 @@ use nanosiem_core::audit::{
     USER_ENABLED, USER_GROUPS_UPDATED, USER_UNLOCKED, USER_UPDATED,
 };
 use nanosiem_core::auth::{
-    permissions, CreateUserRequest, UpdateUserPreferencesRequest, UpdateUserRequest,
-    UserPreferences, UserRepositoryError, UserWithGroups,
+    permissions, CreateUserRequest, PrincipalAction, UpdateUserPreferencesRequest,
+    UpdateUserRequest, UserPreferences, UserRepositoryError, UserWithGroups,
 };
 use nanosiem_core::typeid::TypeIdParam;
 
@@ -348,53 +348,99 @@ pub async fn update_user(
     check_permission(&auth, permissions::USERS_EDIT)
         .map_err(|(s, j)| (s, Json(UserApiError::new(&j.error, &j.message))))?;
 
-    // NAN-2121 P1 #4: decode + authorize the requested group grants BEFORE any
-    // write. `update_user` commits email/password/name/status, so running the
-    // grant check afterwards left a denied request returning 403 while the
-    // profile change had already persisted (and the success audit was skipped).
-    // Decode once and reuse for both the check and the write so they cannot
-    // diverge.
+    // NAN-5014: your OWN password / email go through the self-service flow,
+    // which re-authenticates with the current password and is session-only.
+    // `users:edit` on yourself is not a way around that re-auth.
+    if *id == auth.user_id() && (request.password.is_some() || request.email.is_some()) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(UserApiError::new(
+                "use_self_service",
+                "Change your own password or email from your profile (PUT /api/auth/password).",
+            )),
+        ));
+    }
+
+    // NAN-5027: the SSO break-glass flag keeps a local password usable on an
+    // IdP-managed account. It is tenant-level security policy, not account
+    // administration: interactive session + `settings:system` only.
+    if request.local_login_break_glass.is_some() {
+        if auth.is_api_key {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(UserApiError::new(
+                    "interactive_session_required",
+                    "Changing local_login_break_glass requires an interactive session.",
+                )),
+            ));
+        }
+        check_permission(&auth, permissions::SETTINGS_SYSTEM)
+            .map_err(|(s, j)| (s, Json(UserApiError::new(&j.error, &j.message))))?;
+    }
+
+    // NAN-5027: `status` is limited to the two values an administrator may set.
+    // `locked` is owned by the login throttle and `system` marks platform
+    // service accounts (exempt from the API-key owner checks) — neither may be
+    // assigned through this endpoint.
+    if let Some(ref status) = request.status {
+        if status != "active" && status != "disabled" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(UserApiError::new(
+                    "invalid_status",
+                    "status must be \"active\" or \"disabled\"",
+                )),
+            ));
+        }
+    }
+
+    // NAN-5027: an SSO-linked account's email and password belong to the
+    // identity provider. Writing a local password would open a side door around
+    // the IdP (and its MFA); rewriting the email re-targets SSO account linking.
+    if request.password.is_some() || request.email.is_some() {
+        let target = state.user_repo.get_user_by_id(*id).await.map_err(|e| {
+            let (status, err) = UserApiError::from_repo_error(&e);
+            (status, Json(err))
+        })?;
+        if target.oidc_provider_id.is_some() {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(UserApiError::new(
+                    "sso_managed",
+                    "Email and password of an SSO user are managed by the identity provider.",
+                )),
+            ));
+        }
+    }
+
+    // NAN-2121 P1 #4: decode + authorize BEFORE any write. Decode once and
+    // reuse for both the check and the write so they cannot diverge.
     let group_uuids: Option<Vec<uuid::Uuid>> = request.group_ids.as_ref().map(|group_id_strings| {
         group_id_strings
             .iter()
             .filter_map(|s| nanosiem_core::typeid::decode("group", s).ok())
             .collect()
     });
-    let grant_stamp = if let Some(ref group_uuids) = group_uuids {
-        // deny unless the caller holds every permission the requested groups
-        // confer (users:edit is not authority to add someone to Admins).
-        Some(
-            crate::handlers::grant_authz::ensure_can_grant_groups(
-                &auth,
-                &state.pool,
-                permissions::USERS_EDIT,
-                group_uuids,
-            )
-            .await
-            .map_err(|g| (g.status, Json(UserApiError::new(g.code, &g.message))))?,
-        )
-    } else {
-        None
-    };
+    // NAN-5027: authority over the TARGET runs for EVERY field (it used to run
+    // only when `group_ids` was present, so `{"password": ..}` alone rewrote an
+    // Admin's credential). The requested group grants are validated in the
+    // same snapshot, under one stamp.
+    let grant_stamp = crate::handlers::grant_authz::ensure_can_manage_principal(
+        &auth,
+        &state.pool,
+        permissions::USERS_EDIT,
+        *id,
+        group_uuids.as_deref(),
+    )
+    .await
+    .map_err(|g| (g.status, Json(UserApiError::new(g.code, &g.message))))?;
 
     // NAN-2121: commit the profile change and the (already-authorized) group
-    // membership replacement in ONE transaction so a downstream membership
-    // failure rolls back the profile write too (no partial commit, no skipped
-    // success audit).
-    let user = match grant_stamp {
-        Some(stamp) => {
-            state
-                .user_repo
-                .update_user_with_groups_authorized(*id, &request, group_uuids.as_deref(), stamp)
-                .await
-        }
-        None => {
-            state
-                .user_repo
-                .update_user_with_groups(*id, &request, None)
-                .await
-        }
-    }
+    // membership replacement in ONE transaction, under the verified stamp.
+    let user = state
+        .user_repo
+        .update_user_with_groups_authorized(*id, &request, group_uuids.as_deref(), grant_stamp)
+        .await
     .map_err(|e| {
         let (status, err) = UserApiError::from_repo_error(&e);
         (status, Json(err))
@@ -413,10 +459,42 @@ pub async fn update_user(
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("user", Some(user.id), Some(user.email.clone()))
             .client_context(&client)
+            // NAN-5014/5027: say WHICH fields changed (never their values) so an
+            // administrator setting someone else's password is distinguishable
+            // from a rename in the audit trail.
+            .details(serde_json::json!({
+                "fields_changed": update_user_fields_changed(&request),
+                "credential_reset": request.password.is_some() || request.email.is_some(),
+                "api_keys_revoked": request.revoke_api_keys == Some(true),
+            }))
             .build(),
     );
 
     Ok(Json(UserWithGroups { user, groups }))
+}
+
+/// Names (never values) of the profile fields an update request touches.
+fn update_user_fields_changed(request: &UpdateUserRequest) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if request.email.is_some() {
+        fields.push("email");
+    }
+    if request.name.is_some() {
+        fields.push("name");
+    }
+    if request.password.is_some() {
+        fields.push("password");
+    }
+    if request.status.is_some() {
+        fields.push("status");
+    }
+    if request.group_ids.is_some() {
+        fields.push("group_ids");
+    }
+    if request.local_login_break_glass.is_some() {
+        fields.push("local_login_break_glass");
+    }
+    fields
 }
 
 /// Delete a user
@@ -453,10 +531,25 @@ pub async fn delete_user(
         .map(|u| u.email)
         .unwrap_or_else(|_| "unknown".to_string());
 
-    state.user_repo.delete_user(*id).await.map_err(|e| {
-        let (status, err) = UserApiError::from_repo_error(&e);
-        (status, Json(err))
-    })?;
+    // NAN-5027: authority over the target, re-verified in the write transaction.
+    let stamp = crate::handlers::grant_authz::ensure_can_manage_principal(
+        &auth,
+        &state.pool,
+        permissions::USERS_DELETE,
+        *id,
+        None,
+    )
+    .await
+    .map_err(|g| (g.status, Json(UserApiError::new(g.code, &g.message))))?;
+
+    state
+        .user_repo
+        .apply_principal_action_authorized(*id, PrincipalAction::Delete, stamp)
+        .await
+        .map_err(|e| {
+            let (status, err) = UserApiError::from_repo_error(&e);
+            (status, Json(err))
+        })?;
 
     // Emit audit event
     state.emit_audit(
@@ -511,11 +604,15 @@ pub async fn update_user_groups(
 
     // NAN-2121: deny unless the caller holds every permission the requested
     // groups confer (users:edit is not authority to add a user to Admins).
-    let grant_stamp = crate::handlers::grant_authz::ensure_can_grant_groups(
+    // NAN-5027: AND authority over the target — replacing an Admin's groups
+    // with `[]` demotes them, after which a narrow caller could manage them.
+    // Same check as `update_user`, in one snapshot under one stamp.
+    let grant_stamp = crate::handlers::grant_authz::ensure_can_manage_principal(
         &auth,
         &state.pool,
         permissions::USERS_EDIT,
-        &request.group_ids,
+        *id,
+        Some(&request.group_ids),
     )
     .await
     .map_err(|g| (g.status, Json(UserApiError::new(g.code, &g.message))))?;
@@ -582,10 +679,25 @@ pub async fn unlock_user(
     check_permission(&auth, permissions::USERS_EDIT)
         .map_err(|(s, j)| (s, Json(UserApiError::new(&j.error, &j.message))))?;
 
-    state.user_repo.unlock_user(*id).await.map_err(|e| {
-        let (status, err) = UserApiError::from_repo_error(&e);
-        (status, Json(err))
-    })?;
+    // NAN-5027: authority over the target, re-verified in the write transaction.
+    let stamp = crate::handlers::grant_authz::ensure_can_manage_principal(
+        &auth,
+        &state.pool,
+        permissions::USERS_EDIT,
+        *id,
+        None,
+    )
+    .await
+    .map_err(|g| (g.status, Json(UserApiError::new(g.code, &g.message))))?;
+
+    state
+        .user_repo
+        .apply_principal_action_authorized(*id, PrincipalAction::Unlock, stamp)
+        .await
+        .map_err(|e| {
+            let (status, err) = UserApiError::from_repo_error(&e);
+            (status, Json(err))
+        })?;
 
     let user = state.user_repo.get_user_by_id(*id).await.map_err(|e| {
         let (status, err) = UserApiError::from_repo_error(&e);
@@ -637,24 +749,27 @@ pub async fn disable_user(
     check_permission(&auth, permissions::USERS_EDIT)
         .map_err(|(s, j)| (s, Json(UserApiError::new(&j.error, &j.message))))?;
 
-    // F-32: `disable_user` stamps `status='disabled'` + `tokens_valid_from=NOW()`
-    // atomically, so outstanding access tokens are rejected by the middleware
-    // status gate and refresh already rejects disabled users.
-    state.user_repo.disable_user(*id).await.map_err(|e| {
-        let (status, err) = UserApiError::from_repo_error(&e);
-        (status, Json(err))
-    })?;
+    // F-32 / NAN-5014: the disable flips the status, stamps the revocation
+    // watermark and deletes every session in ONE transaction.
+    // NAN-5027: authority over the target, re-verified in the write transaction.
+    let stamp = crate::handlers::grant_authz::ensure_can_manage_principal(
+        &auth,
+        &state.pool,
+        permissions::USERS_EDIT,
+        *id,
+        None,
+    )
+    .await
+    .map_err(|g| (g.status, Json(UserApiError::new(g.code, &g.message))))?;
 
-    // F-32: also revoke every active session so refresh tokens die immediately.
-    // Best-effort — the status gate + refresh disabled-check are the primary
-    // controls, so a session-delete hiccup must not fail the disable itself.
-    if let Err(e) = state
-        .session_service
-        .terminate_all_user_sessions(*id, auth.user_id(), true, None, None)
+    state
+        .user_repo
+        .apply_principal_action_authorized(*id, PrincipalAction::Disable, stamp)
         .await
-    {
-        tracing::warn!(user_id = %*id, error = %e, "failed to revoke sessions on user disable");
-    }
+        .map_err(|e| {
+            let (status, err) = UserApiError::from_repo_error(&e);
+            (status, Json(err))
+        })?;
 
     let user = state.user_repo.get_user_by_id(*id).await.map_err(|e| {
         let (status, err) = UserApiError::from_repo_error(&e);
@@ -706,10 +821,25 @@ pub async fn enable_user(
     check_permission(&auth, permissions::USERS_EDIT)
         .map_err(|(s, j)| (s, Json(UserApiError::new(&j.error, &j.message))))?;
 
-    state.user_repo.enable_user(*id).await.map_err(|e| {
-        let (status, err) = UserApiError::from_repo_error(&e);
-        (status, Json(err))
-    })?;
+    // NAN-5027: authority over the target, re-verified in the write transaction.
+    let stamp = crate::handlers::grant_authz::ensure_can_manage_principal(
+        &auth,
+        &state.pool,
+        permissions::USERS_EDIT,
+        *id,
+        None,
+    )
+    .await
+    .map_err(|g| (g.status, Json(UserApiError::new(g.code, &g.message))))?;
+
+    state
+        .user_repo
+        .apply_principal_action_authorized(*id, PrincipalAction::Enable, stamp)
+        .await
+        .map_err(|e| {
+            let (status, err) = UserApiError::from_repo_error(&e);
+            (status, Json(err))
+        })?;
 
     let user = state.user_repo.get_user_by_id(*id).await.map_err(|e| {
         let (status, err) = UserApiError::from_repo_error(&e);

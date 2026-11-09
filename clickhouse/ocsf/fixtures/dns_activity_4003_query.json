@@ -14,7 +14,7 @@
   "time": 1749081722345,
   "message": "DNS A response for malware-c2.example.net resolved to 203.0.113.66",
   "metadata": {
-    "version": "1.8.0",
+    "version": "1.9.0",
     "product": {
       "name": "Conduit Proxy",
       "vendor_name": "nano"

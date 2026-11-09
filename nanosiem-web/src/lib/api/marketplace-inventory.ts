@@ -11,22 +11,45 @@
  *   created is already represented by its catalog entry and is not repeated.
  *
  * Hosted entitlements (baseline / premium, purchase, checkout) have no
- * single-tenant meaning. What still gates an item is the build: an entry whose
- * execution backend this edition does not ship carries a `requirement` derived
- * from `/api/capabilities`, never from a hosted/shared flag.
+ * single-tenant meaning. What still gates an item is the build and its licence:
+ * an entry whose execution backend is unavailable here carries a `requirement`
+ * derived from `/api/capabilities`, never from a hosted/shared flag. On an open
+ * build the cause is the edition; on an enterprise build a licensed flag is
+ * false only because licence admission failed (NAN-5088), so the cause is the
+ * licence.
  */
 import type { MarketplaceCatalogEntry, EnrichmentMarketplaceRepo } from './marketplace';
-import type { Capabilities } from '@/hooks/use-capabilities';
+import type { BuildEdition, Capabilities } from '@/hooks/use-capabilities';
 import type { CustomEnrichmentSummary } from '@/enterprise/api/custom-enrichment';
 import type { PlatformFeedsStatus } from './enrichment';
 
 /** `platform`: first-party nano content. `custom`: hand-authored or third-party repository content. */
 export type InventoryKind = 'platform' | 'custom';
 
-/** A capability this build lacks that the item needs to run. */
+/**
+ * Why an item cannot run here. `edition`: this build does not ship the runtime
+ * (open). `licence`: the enterprise build ships it but licence admission is
+ * not active, so every licensed capability reads false (NAN-5088).
+ */
+export type InventoryRequirementCause = 'edition' | 'licence';
+
+/** A capability this deployment lacks that the item needs to run. */
 export interface InventoryRequirement {
   capability: keyof Capabilities;
+  cause: InventoryRequirementCause;
+  /** Short label for card footers: "Enterprise edition" / "Active licence". */
   label: string;
+}
+
+/** Sentence form of a requirement: "Requires the Enterprise edition" / "Requires an active licence". */
+export function requirementSentence(requirement: InventoryRequirement): string {
+  return requirement.cause === 'licence' ? 'Requires an active licence' : `Requires the ${requirement.label}`;
+}
+
+function requirementFor(capability: keyof Capabilities, edition: BuildEdition): InventoryRequirement {
+  return edition === 'enterprise'
+    ? { capability, cause: 'licence', label: 'Active licence' }
+    : { capability, cause: 'edition', label: 'Enterprise edition' };
 }
 
 export interface InventoryItem {
@@ -200,14 +223,19 @@ export function isFirstPartyRepo(repo: Pick<EnrichmentMarketplaceRepo, 'url'> | 
   return FIRST_PARTY_OWNERS.includes(owner.toLowerCase()) && /^[A-Za-z0-9._-]+$/.test(name.replace(/\.git$/, ''));
 }
 
-/** Which build capability an entry's execution backend needs, if this build lacks it. */
-export function entryRequirement(entry: MarketplaceCatalogEntry, caps: Capabilities): InventoryRequirement | null {
+/** Which capability an entry's execution backend needs, if this deployment lacks it. */
+export function entryRequirement(entry: MarketplaceCatalogEntry, caps: Capabilities, edition: BuildEdition): InventoryRequirement | null {
   if (entry.execution_backend === 'deno') {
     const capability: keyof Capabilities = entry.category === 'agent' ? 'agentEnrichment' : 'customEnrichment';
-    return caps[capability] ? null : { capability, label: 'Enterprise edition' };
+    return caps[capability] ? null : requirementFor(capability, edition);
   }
   if (entry.execution_backend === 'collector') {
-    return caps.customEnrichment ? null : { capability: 'customEnrichment', label: 'Enterprise edition' };
+    return caps.customEnrichment ? null : requirementFor('customEnrichment', edition);
+  }
+  // A native agent entry is backed by an agent enrichment provider, which only
+  // the enterprise edition ships; the open server refuses its install (403).
+  if (entry.execution_backend === 'native' && entry.category === 'agent') {
+    return caps.agentEnrichment ? null : requirementFor('agentEnrichment', edition);
   }
   return null;
 }
@@ -243,10 +271,10 @@ export function healthFor(reason: string | null, syncing = false): string {
   }
 }
 
-export function catalogItem(entry: MarketplaceCatalogEntry, repos: EnrichmentMarketplaceRepo[], caps: Capabilities): InventoryItem {
+export function catalogItem(entry: MarketplaceCatalogEntry, repos: EnrichmentMarketplaceRepo[], caps: Capabilities, edition: BuildEdition): InventoryItem {
   const repo = entry.repository_id ? repos.find(r => r.id === entry.repository_id) ?? null : null;
   const platformFeedId = platformFeedForEntry(entry);
-  const requirement = platformFeedId ? null : entryRequirement(entry, caps);
+  const requirement = platformFeedId ? null : entryRequirement(entry, caps, edition);
   const reason = platformFeedId ? 'bundle_inactive' : entryReason(entry, requirement);
   // Unknown provenance (repository metadata missing or failed to load) is untrusted.
   const firstParty = entry.source_type === 'system' || (entry.source_type === 'repository' && isFirstPartyRepo(repo));
@@ -328,11 +356,11 @@ export function customItem(def: CustomEnrichmentSummary): InventoryItem {
  * card (connector feeds, NAN-4914) and is left out unless it was installed on
  * the older collector runtime.
  */
-export function buildInventory(entries: MarketplaceCatalogEntry[], customs: CustomEnrichmentSummary[], repos: EnrichmentMarketplaceRepo[], caps: Capabilities, connectorNames: ReadonlySet<string> = new Set()): InventoryItem[] {
+export function buildInventory(entries: MarketplaceCatalogEntry[], customs: CustomEnrichmentSummary[], repos: EnrichmentMarketplaceRepo[], caps: Capabilities, edition: BuildEdition, connectorNames: ReadonlySet<string> = new Set()): InventoryItem[] {
   const fromCatalog = new Set(entries.map(e => e.custom_enrichment_id).filter((id): id is string => !!id));
   const visible = entries.filter(e => !(e.category === 'collector' && connectorNames.has(e.slug) && !e.installed));
   return [
-    ...visible.map(entry => catalogItem(entry, repos, caps)),
+    ...visible.map(entry => catalogItem(entry, repos, caps, edition)),
     ...customs.filter(def => !fromCatalog.has(def.id)).map(customItem),
   ];
 }
@@ -362,7 +390,7 @@ const REASONS: Record<string, string> = {
 
 export function inventoryReason(item: InventoryItem): string {
   if (!item.reason) return item.provided_by_bundle ? 'Provided by the nano feed bundle; stamped at ingest.' : 'Healthy';
-  if (item.reason === 'requires_capability' && item.requirement) return `Requires the ${item.requirement.label}.`;
+  if (item.reason === 'requires_capability' && item.requirement) return `${requirementSentence(item.requirement)}.`;
   return Object.prototype.hasOwnProperty.call(REASONS, item.reason) ? REASONS[item.reason] : 'Status is unknown.';
 }
 

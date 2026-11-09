@@ -96,6 +96,9 @@ async fn async_main() -> Result<()> {
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("nanosiem-jobs");
 
     tracing::info!("Starting NanoSIEM Jobs Service");
+    // Security review 2026-11-08: surface insecure-but-accepted deployment
+    // settings (public install token, config delivery on the install token).
+    nanosiem_core::deployment_posture::log_posture_at_boot("nano-jobs");
 
     // Load configuration (reuses API config — same env vars)
     let config = ApiConfig::from_env();
@@ -145,15 +148,11 @@ async fn async_main() -> Result<()> {
     // Enterprise-only: the open edition ships no license / phone-home machinery
     // (NAN-1193). The checker (and its 24h GET /license/status call) is absent.
     #[cfg(feature = "enterprise")]
-    if state.config.is_license_enabled() {
-        let license_url = state.config.license_url.clone().unwrap();
-        let license_token = state.config.license_token.clone().unwrap();
-        let deployment_id = state.config.deployment_id.clone().unwrap();
-
+    if let Ok(Some(online)) = state.config.online_license_config() {
         let license_checker_config = LicenseCheckerConfig::from_license_url(
-            &license_url,
-            license_token,
-            deployment_id,
+            &online.url,
+            online.token,
+            online.deployment_id,
             86400, // 24 hours
         );
         let license_checker = Arc::new(LicenseChecker::new(
@@ -161,12 +160,14 @@ async fn async_main() -> Result<()> {
             state.pool.clone(),
             state.license_status.clone(),
         ));
-        license_checker.load_cached_status().await;
+        if let Err(error) = license_checker.initialize().await {
+            tracing::error!(%error, "Initial online licence check failed; licensed workers remain fail-closed without a successful bounded cache");
+        }
 
         let lc_handle = license_checker.start();
         state.add_task_handle(lc_handle).await;
         tracing::info!("License checker started (24h interval)");
-    } else if state.config.airgap {
+    } else if state.config.online_license_config().is_ok() {
         match nanosiem_api::license_admission::refresh_offline_snapshot(&state, false).await {
             Ok(snapshot) if snapshot.legacy_grace().is_some() => tracing::warn!(
                 "Legacy offline licence upgrade grace active in jobs; import a C05 licence"
@@ -184,9 +185,17 @@ async fn async_main() -> Result<()> {
             run_read_only_sovereign_license_refresh(refresh_state).await;
         });
         state.add_task_handle(refresh_handle).await;
-        tracing::info!("Read-only C05 jobs admission refresh started (30s interval)");
+        tracing::info!("Read-only C05/legacy jobs admission refresh started (30s interval)");
     } else {
-        tracing::info!("License enforcement not configured (LICENSE_URL not set)");
+        let error = state
+            .config
+            .online_license_config()
+            .expect_err("branch checked incomplete configuration");
+        tracing::error!(%error, "Incomplete online licence configuration; failing closed");
+        let snapshot =
+            nanosiem_api::license_admission::OfflineLicenseSnapshot::Unavailable(error.to_string());
+        *state.license_status.write().await = snapshot.cached_status();
+        *state.offline_license_snapshot.write().await = snapshot;
     }
 
     // NAN-4933: credential key ring registration + membership (every node).
@@ -236,8 +245,17 @@ async fn async_main() -> Result<()> {
     // the enterprise feature is enabled.
     #[cfg(feature = "enterprise")]
     {
-        let case_listener_handle = state.start_case_change_listener();
-        state.add_task_handle(case_listener_handle).await;
+        let supervisor = state.start_component_worker_supervisor(
+            nanosiem_api::license_admission::WorkerCapability::Cases,
+            "jobs_cases",
+            |state| {
+                vec![
+                    state.start_case_change_listener(),
+                    state.start_shadow_investigation_recovery(),
+                ]
+            },
+        );
+        state.add_task_handle(supervisor).await;
     }
 
     // === Leader-only tasks ===
@@ -279,6 +297,7 @@ async fn async_main() -> Result<()> {
     // OIDC auth-transaction cleanup task. Each /authorize creates a row that's
     // consumed (or expires) within ~10 minutes; without sweeping, expired rows
     // accumulate forever.
+    #[cfg(feature = "enterprise")]
     {
         let oidc_repo = state.oidc_repo.clone();
         let oidc_handle = tokio::spawn(async move {

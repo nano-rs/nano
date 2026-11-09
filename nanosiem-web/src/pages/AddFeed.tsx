@@ -92,6 +92,7 @@ import { DeployGatePanel } from '@/components/add-data/DeployGatePanel';
 import { computeDeployGate, type GateAction } from '@/components/add-data/deploy-gate';
 import { connectDetailQueryKey } from '@/lib/api/log-source-connect';
 import { describeSampleSplit, detectWrappedLines, joinWrappedLines } from '@/lib/sample-wrap';
+import { isIncompleteDraftStatus, parserDraftIncomplete } from '@/lib/parser-draft-verdict';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { useToast } from '@/hooks/use-toast';
@@ -686,7 +687,7 @@ export function AddFeed() {
       setVrl(draft.parser.vrl_code);
       setGenState('done');
       setGenStatus(draft.message);
-      if (!draft.parser.validation_result.valid) {
+      if (parserDraftIncomplete(draft)) {
         toast({ title: 'Draft incomplete', description: draft.message, variant: 'destructive' });
       }
     } catch (err) {
@@ -1052,10 +1053,14 @@ export function AddFeed() {
           });
         }
       }
+      let parserDeployFailed = false;
       if (createdId) {
         try {
-          await api.deployLogSource(createdId);
+          const deployed = await api.deployLogSource(createdId);
+          // NAN-5133: a 200 with success:false did not go live; say so.
+          if (deployed && deployed.success === false) throw new Error(deployed.message || 'Log source created but parser not yet deployed.');
         } catch (err) {
+          parserDeployFailed = true;
           toast({
             title: 'Log source deploy failed',
             description: err instanceof Error ? err.message : 'Log source created but parser not yet deployed.',
@@ -1064,7 +1069,7 @@ export function AddFeed() {
         }
       }
 
-      toast({ title: 'Source published', description: `${name} is now parsed.` });
+      if (!parserDeployFailed) toast({ title: 'Source published', description: `${name} is now parsed.` });
       if (createdId) {
         navigate(`/ingestion/log-sources/${createdId}`);
       } else {
@@ -2953,6 +2958,20 @@ function VrlPanel(props: VrlPanelProps) {
           <div className="text-[10.5px] font-mono text-muted-foreground/70 mt-1">{genStatus}</div>
           <div className="text-[10px] text-muted-foreground/60 mt-0.5">
             Drafts can take several minutes. You can keep this page open; the job runs on the server.
+          </div>
+        </div>
+      )}
+
+      {/* NAN-5079: an incomplete draft stays visible, with what is left. */}
+      {canUseParserAi && genState === 'done' && isIncompleteDraftStatus(genStatus) && (
+        <div
+          data-testid="parser-draft-incomplete"
+          className="shrink-0 border-b border-border bg-destructive/[0.06] px-3 py-2 flex items-start gap-2"
+        >
+          <AlertTriangle className="w-3 h-3 mt-0.5 text-destructive shrink-0" />
+          <div className="min-w-0">
+            <div className="text-[11px] text-foreground">Draft incomplete: review the failing samples before publishing</div>
+            <div className="text-[10.5px] font-mono text-muted-foreground mt-0.5 break-words">{genStatus}</div>
           </div>
         </div>
       )}

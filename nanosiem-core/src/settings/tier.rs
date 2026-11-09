@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Organization tier-based restrictions
+//! v2 offering entitlements and legacy tier compatibility.
 //!
-//! Defines plan tiers (Unrestricted, Hobby, Startup, Growth, Team, Starter, Pro, Enterprise)
-//! and enforces limits on data sources, detection rules, team members, API access,
-//! AI request volume, and model tier. Default tier is Unrestricted (no limits) for
-//! dev/self-hosted/internal deployments.
+//! v2 has three independent axes: edition (`open` or `licensed`), operator
+//! (`self-run` or `hosted`), and GB/day capacity. Capacity never selects
+//! features. The retired plan names remain accepted at configuration and
+//! licence boundaries, but normalize to the licensed offering with the full
+//! feature set.
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -14,6 +15,9 @@ use sqlx::PgPool;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OrganizationTier {
+    Open,
+    Licensed,
+    /// Compatibility-only aliases accepted from pre-v2 rows, env and licences.
     Unrestricted,
     Hobby,
     Startup,
@@ -33,6 +37,8 @@ impl Default for OrganizationTier {
 impl std::fmt::Display for OrganizationTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Open => write!(f, "open"),
+            Self::Licensed => write!(f, "licensed"),
             Self::Unrestricted => write!(f, "unrestricted"),
             Self::Hobby => write!(f, "hobby"),
             Self::Startup => write!(f, "startup"),
@@ -50,16 +56,140 @@ impl std::str::FromStr for OrganizationTier {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "open" | "open_source" | "opensource" => Ok(Self::Open),
+            "licensed" => Ok(Self::Licensed),
             "unrestricted" => Ok(Self::Unrestricted),
             "hobby" => Ok(Self::Hobby),
             "startup" => Ok(Self::Startup),
             "growth" => Ok(Self::Growth),
             "team" => Ok(Self::Team),
             "starter" => Ok(Self::Starter),
+            "business" => Ok(Self::Starter),
             "pro" => Ok(Self::Pro),
             "enterprise" => Ok(Self::Enterprise),
             _ => Err(TierError::InvalidTier(s.to_string())),
         }
+    }
+}
+
+/// Product edition. Open source is enforced by the build split; licensed
+/// deployments receive every feature shipped in the enterprise build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum EntitlementEdition {
+    Open,
+    Licensed,
+}
+
+impl std::fmt::Display for EntitlementEdition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Open => "open",
+            Self::Licensed => "licensed",
+        })
+    }
+}
+
+impl std::str::FromStr for EntitlementEdition {
+    type Err = TierError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "open" | "open_source" | "opensource" => Ok(Self::Open),
+            "licensed" | "enterprise" => Ok(Self::Licensed),
+            _ => Err(TierError::Validation(format!(
+                "Invalid entitlement edition: {s}"
+            ))),
+        }
+    }
+}
+
+/// Who operates the deployment. This axis controls nano-provided AI credits;
+/// it does not change product features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub enum EntitlementOperator {
+    #[serde(rename = "self-run")]
+    #[schema(rename = "self-run")]
+    SelfRun,
+    #[serde(rename = "hosted")]
+    Hosted,
+}
+
+impl std::fmt::Display for EntitlementOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::SelfRun => "self-run",
+            Self::Hosted => "hosted",
+        })
+    }
+}
+
+impl std::str::FromStr for EntitlementOperator {
+    type Err = TierError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "self-run" | "self_run" | "selfhosted" | "self-hosted" | "byoc" | "sovereign" => {
+                Ok(Self::SelfRun)
+            }
+            "hosted" | "managed" => Ok(Self::Hosted),
+            _ => Err(TierError::Validation(format!(
+                "Invalid entitlement operator: {s}"
+            ))),
+        }
+    }
+}
+
+/// Canonical v2 entitlement identity.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct Entitlement {
+    pub edition: EntitlementEdition,
+    pub operator: EntitlementOperator,
+    /// Contracted ingest capacity in decimal GB/day. `None` means the contract
+    /// does not state a numeric capacity (for example open source or custom).
+    pub capacity_gb_per_day: Option<f64>,
+}
+
+impl Entitlement {
+    pub fn from_legacy_tier(tier: OrganizationTier, operator: EntitlementOperator) -> Self {
+        let edition = if tier == OrganizationTier::Open {
+            EntitlementEdition::Open
+        } else {
+            EntitlementEdition::Licensed
+        };
+        let capacity_gb_per_day = match tier {
+            OrganizationTier::Hobby => Some(2.0),
+            OrganizationTier::Startup => Some(5.0),
+            OrganizationTier::Growth => Some(10.0),
+            OrganizationTier::Team => Some(25.0),
+            OrganizationTier::Starter => Some(50.0),
+            OrganizationTier::Pro => Some(100.0),
+            OrganizationTier::Open
+            | OrganizationTier::Licensed
+            | OrganizationTier::Unrestricted
+            | OrganizationTier::Enterprise => None,
+        };
+        Self {
+            edition,
+            operator,
+            capacity_gb_per_day,
+        }
+    }
+
+    pub fn offering_name(&self) -> &'static str {
+        match (self.edition, self.operator) {
+            (EntitlementEdition::Open, _) => "Open source",
+            (EntitlementEdition::Licensed, EntitlementOperator::SelfRun) => "nano Self-run",
+            (EntitlementEdition::Licensed, EntitlementOperator::Hosted) => "nano Hosted",
+        }
+    }
+
+    /// Normalize the string carried by online and legacy air-gap licences.
+    pub fn from_license_tier_claim(
+        claim: &str,
+        operator: EntitlementOperator,
+    ) -> Result<Self, TierError> {
+        Ok(Self::from_legacy_tier(claim.parse()?, operator))
     }
 }
 
@@ -139,11 +269,16 @@ impl std::str::FromStr for AiModelTier {
     }
 }
 
-/// Tier limits configuration
+/// Compatibility response carrying the canonical v2 entitlement plus the
+/// retired limit fields older clients understand.
 ///
-/// `None` values mean unlimited (no restriction).
+/// Feature-count fields are always `None` in v2. `max_daily_gb` mirrors the
+/// contracted capacity for old clients, but is not a feature gate.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TierLimits {
+    pub entitlement: Entitlement,
+    /// Canonical compatibility value (`open` or `licensed`). Retired tier names
+    /// are accepted as inputs but are never emitted here.
     pub tier: OrganizationTier,
     /// Maximum number of data sources (None = unlimited)
     pub max_data_sources: Option<u32>,
@@ -157,14 +292,16 @@ pub struct TierLimits {
     pub max_eps: Option<u32>,
     /// API access level
     pub api_access: ApiAccessLevel,
-    /// Whether SSO/SAML is enabled
+    /// Whether SSO/SAML is present in this edition/build.
     pub sso_enabled: bool,
     /// Whether HA (high availability) is enabled
     pub ha_enabled: bool,
-    /// Maximum AI credits per month (None = unlimited).
+    /// Hosted monthly AI allowance. `None` means customer-provided, uncapped AI.
+    /// Hosted deployments with no provisioned allowance report zero and refuse
+    /// AI calls rather than silently running unmetered.
     /// Lite models cost 2 credits, full models cost 10 credits.
     pub ai_credits_per_month: Option<u32>,
-    /// AI model tier — controls which models are available
+    /// Compatibility field. All configured models are available in v2.
     pub ai_model_tier: AiModelTier,
     /// Maximum number of Observability metric monitors (None = unlimited). (NAN-1544)
     pub max_metric_monitors: Option<u32>,
@@ -177,25 +314,20 @@ pub struct TierLimits {
 /// Env var carrying a contractual monthly AI credit ceiling (NAN-2347).
 pub const AI_CREDITS_CEILING_ENV: &str = "NANO_AI_CREDITS_PER_MONTH";
 
-/// Parse a ceiling value: a positive integer number of credits.
-///
-/// Zero and garbage are treated as unset rather than as "block all AI" — a
-/// platform typo must degrade to today's unlimited behavior, not take every
-/// AI feature down. Parsed through `i32` because `increment_ai_credits`
+/// Parse a provisioned ceiling as a positive integer number of credits.
+/// Missing, zero, and malformed hosted values resolve to the constructor's
+/// fail-closed zero allowance. Parsed through `i32` because `increment_ai_credits`
 /// compares and stores the counter as PostgreSQL INTEGER — a value past
 /// `i32::MAX` would wrap negative there and reject the very first request.
 fn parse_ai_credits_ceiling(raw: &str) -> Option<u32> {
-    raw.trim().parse::<i32>().ok().filter(|v| *v > 0).map(|v| v as u32)
+    raw.trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|v| *v > 0)
+        .map(|v| v as u32)
 }
 
-/// Contractual AI credit ceiling for the otherwise-unlimited tiers.
-///
-/// Managed enterprise deployments are sold with a monthly AI request ceiling
-/// (10 credits = one full-model request), but Enterprise/Unrestricted default
-/// to `ai_credits_per_month: None`, which makes `increment_ai_credits` a
-/// no-op — the contract was unenforceable. The platform sets this env var at
-/// provision time; it applies only to tiers whose default is unlimited, since
-/// the metered tiers already carry their own caps.
+/// Contractual Hosted AI allowance. Self-run and open constructors ignore it.
 ///
 /// **Test pollution warning**: reads process-wide env state — see the note on
 /// `allow_local()` in `tiering/validation.rs`. Tests cover the pure pieces
@@ -207,252 +339,90 @@ fn env_ai_credits_ceiling() -> Option<u32> {
         .and_then(|v| parse_ai_credits_ceiling(&v))
 }
 
-/// Env var carrying a per-deployment detection-rule ceiling (NAN-2366).
-pub const MAX_DETECTION_RULES_ENV: &str = "NANO_MAX_DETECTION_RULES";
+/// Provisioning override for the contracted GB/day capacity.
+pub const CAPACITY_GB_PER_DAY_ENV: &str = "NANO_CAPACITY_GB_PER_DAY";
 
-/// Parse a detection-rule ceiling override.
-///
-/// Tri-state, because `max_detection_rules: None` already means "unlimited"
-/// and so cannot double as "no override":
-///
-/// - `None` — absent or unusable; keep whatever the tier/DB resolved to
-/// - `Some(None)` — the explicit `unlimited` sentinel
-/// - `Some(Some(n))` — a concrete ceiling
-///
-/// Zero, negatives and garbage degrade to "no override" rather than to a zero
-/// ceiling: a platform typo must not leave a tenant unable to create a single
-/// detection rule. Parsed through `i32` because `tier_max_detection_rules` is
-/// a PostgreSQL INTEGER — `set_tier` binds it as `i32`, so a value past
-/// `i32::MAX` would wrap negative on the way to the column.
-fn parse_max_detection_rules(raw: &str) -> Option<Option<u32>> {
-    let raw = raw.trim();
-    if raw.eq_ignore_ascii_case("unlimited") || raw.eq_ignore_ascii_case("none") {
-        return Some(None);
-    }
-    raw.parse::<i32>()
+pub fn parse_capacity_gb_per_day(raw: &str) -> Option<f64> {
+    raw.trim()
+        .parse::<f64>()
         .ok()
-        .filter(|v| *v > 0)
-        .map(|v| Some(v as u32))
-}
-
-/// Per-deployment detection-rule ceiling, set by the platform at provision
-/// time (FRO-704).
-///
-/// Lets one tenant carry a different rule ceiling without moving its tier —
-/// which on compose tenants would also rewrite the ClickHouse memory caps to
-/// match a box size it may not actually have.
-///
-/// **Test pollution warning**: reads process-wide env state — see the note on
-/// `env_ai_credits_ceiling`. Tests cover the pure pieces
-/// (`parse_max_detection_rules`, `with_rule_override`) instead of toggling
-/// the var.
-fn env_max_detection_rules() -> Option<Option<u32>> {
-    std::env::var(MAX_DETECTION_RULES_ENV)
-        .ok()
-        .and_then(|v| parse_max_detection_rules(&v))
+        .filter(|value| value.is_finite() && *value > 0.0)
 }
 
 impl TierLimits {
-    /// Get the default limits for a given tier.
-    /// These are the hardcoded defaults; DB values can override for Enterprise.
+    /// Compatibility constructor. Every retired paid tier normalizes to the
+    /// licensed, self-run offering; only its historical GB/day value survives
+    /// as capacity metadata.
     pub fn for_tier(tier: OrganizationTier) -> Self {
         Self::for_tier_with_ceiling(tier, env_ai_credits_ceiling())
-            .with_rule_override(env_max_detection_rules())
     }
 
-    /// Tier defaults with no env overrides applied.
-    ///
-    /// Use this wherever the result is *persisted* rather than merely resolved.
-    /// An env-derived override written into `tier_max_detection_rules` would
-    /// outlive the env var that produced it: clearing the override on the
-    /// platform would leave the stale cap sitting in the tenant's own row, and
-    /// the DB merge prefers that column over the tier default.
+    /// Compatibility constructor without process-wide env state.
     pub fn for_tier_unoverridden(tier: OrganizationTier) -> Self {
         Self::for_tier_with_ceiling(tier, None)
     }
 
-    /// `for_tier` with the env ceiling passed explicitly.
-    ///
-    /// Applied here rather than at the enforcement callsites so every path
-    /// that resolves limits — the DB-merge in `get_limits`, the no-row
-    /// fallback, direct `for_tier` callers — inherits the ceiling.
     fn for_tier_with_ceiling(tier: OrganizationTier, ceiling: Option<u32>) -> Self {
-        let mut limits = Self::tier_defaults(tier);
-        if limits.ai_credits_per_month.is_none() {
-            limits.ai_credits_per_month = ceiling;
-        }
-        limits
+        let entitlement = Entitlement::from_legacy_tier(tier, EntitlementOperator::SelfRun);
+        Self::for_entitlement_with_ceiling(entitlement, ceiling)
     }
 
-    /// Apply the detection-rule override, replacing whatever was resolved.
-    ///
-    /// Unlike the AI credit ceiling this is an unconditional replace, not a
-    /// fill-if-none: the whole point is to raise a concrete tier default
-    /// (hobby's 15) without moving the tenant's tier.
-    ///
-    /// It must also be re-applied *after* the DB merge in `get_tier_limits`,
-    /// not just here. `tier_max_detection_rules` is a real column that
-    /// `set_tier` rewrites with the tier default on every boot, and the merge
-    /// prefers the column over the defaults — so an override left only in
-    /// `for_tier` would be shadowed the moment the tenant restarts. The AI
-    /// ceiling has no such column, which is why it gets away with one
-    /// application.
-    fn with_rule_override(mut self, max_rules: Option<Option<u32>>) -> Self {
-        if let Some(rules) = max_rules {
-            self.max_detection_rules = rules;
-        }
-        self
+    pub fn for_entitlement(entitlement: Entitlement) -> Self {
+        Self::for_entitlement_with_ceiling(entitlement, env_ai_credits_ceiling())
     }
 
-    fn tier_defaults(tier: OrganizationTier) -> Self {
-        match tier {
-            OrganizationTier::Unrestricted => Self {
-                tier,
-                max_data_sources: None,
-                max_detection_rules: None,
-                max_team_members: None,
-                max_daily_gb: None,
-                max_eps: None,
-                api_access: ApiAccessLevel::Full,
-                sso_enabled: true,
-                ha_enabled: true,
-                ai_credits_per_month: None,
-                ai_model_tier: AiModelTier::Full,
-                max_metric_monitors: None,
-                max_synthetic_checks: None,
-                max_slos: None,
-            },
-            OrganizationTier::Hobby => Self {
-                tier,
-                max_data_sources: Some(10),
-                max_detection_rules: Some(15),
-                max_team_members: Some(3),
-                max_daily_gb: Some(2.0),
-                max_eps: Some(30),
-                // NAN-1472: API access is available on all tiers (not plan-gated).
-                api_access: ApiAccessLevel::Full,
-                sso_enabled: false,
-                ha_enabled: false,
-                ai_credits_per_month: Some(3_000),
-                ai_model_tier: AiModelTier::Economy,
-                // NAN-1544: open/hobby tier gets 5 of each observability monitor type.
-                max_metric_monitors: Some(5),
-                max_synthetic_checks: Some(5),
-                max_slos: Some(5),
-            },
-            OrganizationTier::Startup => Self {
-                tier,
-                max_data_sources: Some(20),
-                max_detection_rules: Some(30),
-                max_team_members: Some(8),
-                max_daily_gb: Some(5.0),
-                max_eps: Some(75),
-                // NAN-1472: API access is available on all tiers (not plan-gated).
-                api_access: ApiAccessLevel::Full,
-                sso_enabled: false,
-                ha_enabled: false,
-                ai_credits_per_month: Some(10_000),
-                ai_model_tier: AiModelTier::Standard,
-                max_metric_monitors: Some(5),
-                max_synthetic_checks: Some(5),
-                max_slos: Some(5),
-            },
-            OrganizationTier::Growth => Self {
-                tier,
-                max_data_sources: Some(30),
-                max_detection_rules: Some(50),
-                max_team_members: Some(12),
-                max_daily_gb: Some(10.0),
-                max_eps: Some(155),
-                api_access: ApiAccessLevel::Full,
-                sso_enabled: false,
-                ha_enabled: false,
-                ai_credits_per_month: Some(25_000),
-                ai_model_tier: AiModelTier::Full,
-                // NAN-1544: mid tiers get a wider 25-each allowance.
-                max_metric_monitors: Some(25),
-                max_synthetic_checks: Some(25),
-                max_slos: Some(25),
-            },
-            OrganizationTier::Team => Self {
-                tier,
-                max_data_sources: None,
-                max_detection_rules: None,
-                max_team_members: Some(15),
-                max_daily_gb: Some(25.0),
-                max_eps: Some(385),
-                api_access: ApiAccessLevel::Full,
-                sso_enabled: false,
-                ha_enabled: true,
-                ai_credits_per_month: Some(50_000),
-                ai_model_tier: AiModelTier::Full,
-                max_metric_monitors: Some(25),
-                max_synthetic_checks: Some(25),
-                max_slos: Some(25),
-            },
-            // "Business" tier (canonical `tiers.ts` key `starter`). Sells at
-            // 50 GB/day / 770 EPS — double Team. Do not copy Team's 25/385 here.
-            OrganizationTier::Starter => Self {
-                tier,
-                max_data_sources: None,
-                max_detection_rules: None,
-                max_team_members: None,
-                max_daily_gb: Some(50.0),
-                max_eps: Some(770),
-                api_access: ApiAccessLevel::Full,
-                sso_enabled: true,
-                ha_enabled: true,
-                ai_credits_per_month: Some(150_000),
-                ai_model_tier: AiModelTier::Full,
-                // NAN-1544: top tiers are uncapped on observability monitors.
-                max_metric_monitors: None,
-                max_synthetic_checks: None,
-                max_slos: None,
-            },
-            OrganizationTier::Pro => Self {
-                tier,
-                max_data_sources: None,
-                max_detection_rules: None,
-                max_team_members: None,
-                max_daily_gb: Some(100.0),
-                max_eps: Some(1_550),
-                api_access: ApiAccessLevel::Full,
-                sso_enabled: true,
-                ha_enabled: true,
-                ai_credits_per_month: Some(400_000),
-                ai_model_tier: AiModelTier::Full,
-                max_metric_monitors: None,
-                max_synthetic_checks: None,
-                max_slos: None,
-            },
-            OrganizationTier::Enterprise => Self {
-                tier,
-                max_data_sources: None,
-                max_detection_rules: None,
-                max_team_members: None,
-                max_daily_gb: None,
-                max_eps: None,
-                api_access: ApiAccessLevel::Full,
-                sso_enabled: true,
-                ha_enabled: true,
-                ai_credits_per_month: None,
-                ai_model_tier: AiModelTier::Full,
-                max_metric_monitors: None,
-                max_synthetic_checks: None,
-                max_slos: None,
-            },
+    /// NAN-5055: a check-in grant replaces the provisioned env ceiling for a
+    /// hosted licensed deployment. Self-run/open stay uncapped (`None`).
+    pub fn for_entitlement_with_granted_ai_credits(
+        entitlement: Entitlement,
+        granted: Option<u32>,
+    ) -> Self {
+        Self::for_entitlement_with_ceiling(entitlement, granted.or_else(env_ai_credits_ceiling))
+    }
+
+    pub fn for_entitlement_unoverridden(entitlement: Entitlement) -> Self {
+        Self::for_entitlement_with_ceiling(entitlement, None)
+    }
+
+    fn for_entitlement_with_ceiling(entitlement: Entitlement, ceiling: Option<u32>) -> Self {
+        let tier = match entitlement.edition {
+            EntitlementEdition::Open => OrganizationTier::Open,
+            EntitlementEdition::Licensed => OrganizationTier::Licensed,
+        };
+        let licensed = entitlement.edition == EntitlementEdition::Licensed;
+        let ai_credits_per_month = match (licensed, entitlement.operator) {
+            (true, EntitlementOperator::Hosted) => Some(ceiling.unwrap_or(0)),
+            _ => None,
+        };
+        Self {
+            entitlement,
+            tier,
+            max_data_sources: None,
+            max_detection_rules: None,
+            max_team_members: None,
+            max_daily_gb: entitlement.capacity_gb_per_day,
+            max_eps: None,
+            api_access: ApiAccessLevel::Full,
+            sso_enabled: licensed,
+            ha_enabled: true,
+            ai_credits_per_month,
+            ai_model_tier: AiModelTier::Full,
+            max_metric_monitors: None,
+            max_synthetic_checks: None,
+            max_slos: None,
         }
     }
 
-    /// Check if any limit is enforced (i.e., not Unrestricted)
+    /// Whether a legacy feature-count cap remains. V2 constructors always
+    /// return false; callers retain this for rolling-upgrade compatibility.
     pub fn is_enforced(&self) -> bool {
-        // Unrestricted normally means "no limits at all". An explicit
-        // detection-rule override is a cap the platform deliberately set,
-        // though, and skipping enforcement for it would have the API report a
-        // ceiling while letting rule creation sail past it. Every other limit
-        // on this tier is None, and `check_limit` treats None as unlimited, so
-        // enforcing here caps rules only (NAN-2366).
-        self.tier != OrganizationTier::Unrestricted || self.max_detection_rules.is_some()
+        self.max_data_sources.is_some()
+            || self.max_detection_rules.is_some()
+            || self.max_team_members.is_some()
+            || self.max_metric_monitors.is_some()
+            || self.max_synthetic_checks.is_some()
+            || self.max_slos.is_some()
+            || self.api_access != ApiAccessLevel::Full
     }
 }
 
@@ -502,175 +472,164 @@ impl TierSettings {
         Self { pool }
     }
 
-    /// Get current tier configuration, merging DB overrides with tier defaults
+    /// Resolve the canonical v2 entitlement. Retired `tier_max_*` columns are
+    /// deliberately ignored: they remain only so an N-1 binary can roll beside
+    /// this release without a missing-column or write-contract failure.
     pub async fn get_tier_limits(&self) -> Result<TierLimits, TierError> {
-        let row = sqlx::query_as::<
-            _,
-            (
-                String,                        // tier
-                Option<i32>,                   // tier_max_data_sources
-                Option<i32>,                   // tier_max_detection_rules
-                Option<i32>,                   // tier_max_team_members
-                Option<rust_decimal::Decimal>, // tier_max_daily_gb
-                Option<i32>,                   // tier_max_eps
-                String,                        // tier_api_access
-                Option<bool>,                  // tier_sso_enabled (NULL = use tier default)
-                Option<serde_json::Value>,     // tier_limits_override
-            ),
-        >(
+        let row = sqlx::query_as::<_, (String, String, Option<rust_decimal::Decimal>, Option<i32>)>(
             r#"
             SELECT
-                tier,
-                tier_max_data_sources,
-                tier_max_detection_rules,
-                tier_max_team_members,
-                tier_max_daily_gb,
-                tier_max_eps,
-                tier_api_access,
-                tier_sso_enabled,
-                tier_limits_override
+                entitlement_edition,
+                entitlement_operator,
+                entitlement_capacity_gb_per_day,
+                entitlement_ai_credits_per_month
             FROM system_settings
             WHERE id = 'default'
             "#,
         )
         .fetch_optional(&self.pool)
         .await?;
-
-        match row {
-            Some((
-                tier_str,
-                max_data_sources,
-                max_detection_rules,
-                max_team_members,
-                max_daily_gb,
-                max_eps,
-                api_access_str,
-                sso_enabled,
-                _limits_override,
-            )) => {
-                let tier: OrganizationTier = tier_str.parse()?;
-                let defaults = TierLimits::for_tier(tier);
-
-                // DB columns override tier defaults when explicitly set (non-NULL)
-                Ok(TierLimits {
-                    tier,
-                    max_data_sources: max_data_sources
-                        .map(|v| v as u32)
-                        .or(defaults.max_data_sources),
-                    max_detection_rules: max_detection_rules
-                        .map(|v| v as u32)
-                        .or(defaults.max_detection_rules),
-                    max_team_members: max_team_members
-                        .map(|v| v as u32)
-                        .or(defaults.max_team_members),
-                    max_daily_gb: max_daily_gb
-                        .map(|v| {
-                            use rust_decimal::prelude::ToPrimitive;
-                            v.to_f64().unwrap_or(0.0)
-                        })
-                        .or(defaults.max_daily_gb),
-                    max_eps: max_eps.map(|v| v as u32).or(defaults.max_eps),
-                    api_access: api_access_str.parse().unwrap_or(defaults.api_access),
-                    sso_enabled: sso_enabled.unwrap_or(defaults.sso_enabled),
-                    ha_enabled: defaults.ha_enabled,
-                    ai_credits_per_month: defaults.ai_credits_per_month,
-                    ai_model_tier: defaults.ai_model_tier,
-                    // NAN-1544: observability monitor caps follow the tier
-                    // default (no per-org DB override column today).
-                    max_metric_monitors: defaults.max_metric_monitors,
-                    max_synthetic_checks: defaults.max_synthetic_checks,
-                    max_slos: defaults.max_slos,
+        let mut granted_ai_credits = None;
+        let entitlement = match row {
+            Some((edition, operator, capacity, granted)) => {
+                granted_ai_credits = granted.and_then(|value| u32::try_from(value).ok()).filter(|value| *value > 0);
+                use rust_decimal::prelude::ToPrimitive;
+                Entitlement {
+                    edition: edition.parse()?,
+                    operator: operator.parse()?,
+                    capacity_gb_per_day: capacity.and_then(|value| value.to_f64()),
                 }
-                // Re-applied after the merge, not just inside `for_tier`:
-                // `tier_max_detection_rules` is non-NULL for every metered
-                // tier once `set_tier` has run at boot, and the merge above
-                // prefers the column over the defaults. Without this the
-                // platform's override would work exactly once and then be
-                // shadowed by the tenant's own DB row (NAN-2366).
-                .with_rule_override(env_max_detection_rules()))
             }
-            // `for_tier` already applies the override on this path.
-            None => Ok(TierLimits::for_tier(OrganizationTier::default())),
-        }
+            None => Entitlement {
+                edition: EntitlementEdition::Open,
+                operator: EntitlementOperator::SelfRun,
+                capacity_gb_per_day: None,
+            },
+        };
+        Ok(TierLimits::for_entitlement_with_granted_ai_credits(
+            entitlement,
+            granted_ai_credits,
+        ))
     }
 
-    /// Update the organization tier
-    pub async fn set_tier(&self, tier: OrganizationTier) -> Result<TierLimits, TierError> {
-        // Persist pristine tier defaults, not the env-resolved ones: this runs
-        // on every boot, and writing an override into tier_max_detection_rules
-        // would make it survive the removal of the env var that set it.
-        let defaults = TierLimits::for_tier_unoverridden(tier);
-
+    /// NAN-5055: record (or clear) the AI allowance granted by an admitted,
+    /// authenticated online licence check-in. The online checker is the only
+    /// writer; boot reconciliation clears it whenever online licensing is not
+    /// the admission authority, so a grant cannot outlive its source.
+    pub async fn set_granted_ai_credits(&self, credits: Option<u32>) -> Result<(), TierError> {
+        let persisted = match credits {
+            Some(value) => Some(
+                i32::try_from(value)
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        TierError::Validation(
+                            "granted AI credits must be a positive PostgreSQL INTEGER".into(),
+                        )
+                    })?,
+            ),
+            None => None,
+        };
         sqlx::query(
             r#"
             UPDATE system_settings SET
-                tier = $1,
-                tier_max_data_sources = $2,
-                tier_max_detection_rules = $3,
-                tier_max_team_members = $4,
-                tier_max_daily_gb = $5,
-                tier_max_eps = $6,
-                tier_api_access = $7,
-                tier_sso_enabled = $8,
+                entitlement_ai_credits_per_month = $1,
+                updated_at = NOW()
+            WHERE id = 'default'
+              AND entitlement_ai_credits_per_month IS DISTINCT FROM $1
+            "#,
+        )
+        .bind(persisted)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Persist a canonical entitlement while keeping the old tier columns safe
+    /// for rolling N-1 readers. `unrestricted` is the only legacy value that
+    /// gives an older binary the v2 full-feature behavior.
+    pub async fn set_entitlement(&self, entitlement: Entitlement) -> Result<TierLimits, TierError> {
+        if entitlement
+            .capacity_gb_per_day
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err(TierError::Validation(
+                "capacity_gb_per_day must be a positive finite number".into(),
+            ));
+        }
+        let persisted_capacity = match entitlement.capacity_gb_per_day {
+            Some(value) => Some(rust_decimal::Decimal::from_f64_retain(value).ok_or_else(
+                || {
+                    TierError::Validation(
+                        "capacity_gb_per_day cannot be represented by PostgreSQL NUMERIC".into(),
+                    )
+                },
+            )?),
+            None => None,
+        };
+        sqlx::query(
+            r#"
+            UPDATE system_settings SET
+                entitlement_edition = $1,
+                entitlement_operator = $2,
+                entitlement_capacity_gb_per_day = $3,
+                tier = 'unrestricted',
+                tier_max_data_sources = NULL,
+                tier_max_detection_rules = NULL,
+                tier_max_team_members = NULL,
+                tier_max_daily_gb = NULL,
+                tier_max_eps = NULL,
+                tier_api_access = 'full',
+                tier_sso_enabled = TRUE,
                 tier_limits_override = NULL,
                 updated_at = NOW()
             WHERE id = 'default'
             "#,
         )
-        .bind(tier.to_string())
-        .bind(defaults.max_data_sources.map(|v| v as i32))
-        .bind(defaults.max_detection_rules.map(|v| v as i32))
-        .bind(defaults.max_team_members.map(|v| v as i32))
-        .bind(
-            defaults
-                .max_daily_gb
-                .map(rust_decimal::Decimal::from_f64_retain),
-        )
-        .bind(defaults.max_eps.map(|v| v as i32))
-        .bind(defaults.api_access.to_string())
-        .bind(defaults.sso_enabled)
+        .bind(entitlement.edition.to_string())
+        .bind(entitlement.operator.to_string())
+        .bind(persisted_capacity)
         .execute(&self.pool)
         .await?;
-
-        // Return the *effective* limits, not the persisted ones — this is what
-        // boot logs, and it should show the ceiling the tenant will really get.
-        Ok(TierLimits::for_tier(tier))
+        // Re-read so callers (admin responses, boot log) see the same
+        // allowance the meter enforces, including a check-in grant (NAN-5055).
+        self.get_tier_limits().await
     }
 
-    /// Update specific tier limit overrides (for Enterprise customization)
-    pub async fn update_limits(&self, limits: UpdateTierLimits) -> Result<TierLimits, TierError> {
-        if let Some(max_ds) = limits.max_data_sources {
-            sqlx::query("UPDATE system_settings SET tier_max_data_sources = $1, updated_at = NOW() WHERE id = 'default'")
-                .bind(max_ds as i32)
-                .execute(&self.pool)
-                .await?;
+    /// Retired setter retained for API/env/licence compatibility.
+    pub async fn set_tier(&self, tier: OrganizationTier) -> Result<TierLimits, TierError> {
+        let current = self.get_tier_limits().await?;
+        let mut entitlement = Entitlement::from_legacy_tier(tier, current.entitlement.operator);
+        if entitlement.capacity_gb_per_day.is_none() {
+            entitlement.capacity_gb_per_day = current.entitlement.capacity_gb_per_day;
         }
-        if let Some(max_rules) = limits.max_detection_rules {
-            sqlx::query("UPDATE system_settings SET tier_max_detection_rules = $1, updated_at = NOW() WHERE id = 'default'")
-                .bind(max_rules as i32)
-                .execute(&self.pool)
-                .await?;
-        }
-        if let Some(max_members) = limits.max_team_members {
-            sqlx::query("UPDATE system_settings SET tier_max_team_members = $1, updated_at = NOW() WHERE id = 'default'")
-                .bind(max_members as i32)
-                .execute(&self.pool)
-                .await?;
-        }
-        if let Some(max_gb) = limits.max_daily_gb {
-            sqlx::query("UPDATE system_settings SET tier_max_daily_gb = $1, updated_at = NOW() WHERE id = 'default'")
-                .bind(rust_decimal::Decimal::from_f64_retain(max_gb))
-                .execute(&self.pool)
-                .await?;
-        }
-        if let Some(max_eps) = limits.max_eps {
-            sqlx::query("UPDATE system_settings SET tier_max_eps = $1, updated_at = NOW() WHERE id = 'default'")
-                .bind(max_eps as i32)
-                .execute(&self.pool)
-                .await?;
-        }
+        self.set_entitlement(entitlement).await
+    }
 
-        self.get_tier_limits().await
+    /// Map an old or new licence tier claim onto v2. Unknown claim values are
+    /// rejected; all accepted pre-v2 paid names gain the full licensed feature
+    /// set and retain only their historical capacity metadata.
+    pub async fn admit_license_tier(
+        &self,
+        claim: &str,
+        operator: EntitlementOperator,
+    ) -> Result<TierLimits, TierError> {
+        let current = self.get_tier_limits().await?;
+        let mut entitlement = Entitlement::from_license_tier_claim(claim, operator)?;
+        if entitlement.capacity_gb_per_day.is_none() {
+            entitlement.capacity_gb_per_day = current.entitlement.capacity_gb_per_day;
+        }
+        self.set_entitlement(entitlement).await
+    }
+
+    /// Compatibility endpoint. Feature-count overrides are retired; only the
+    /// old `max_daily_gb` input is interpreted, as v2 capacity metadata.
+    pub async fn update_limits(&self, limits: UpdateTierLimits) -> Result<TierLimits, TierError> {
+        let mut entitlement = self.get_tier_limits().await?.entitlement;
+        if let Some(capacity) = limits.max_daily_gb {
+            entitlement.capacity_gb_per_day = Some(capacity);
+        }
+        self.set_entitlement(entitlement).await
     }
 
     /// Get daily usage for a specific date
@@ -758,6 +717,13 @@ impl TierSettings {
         cost: i32,
         limit: Option<u32>,
     ) -> Result<i32, TierError> {
+        // NAN-5136: a zero-cost call (a self-hosted model) is not metered, so
+        // it is not gated by the monthly allowance either. Without this, a
+        // tenant already at its ceiling could not use its own model server.
+        if cost <= 0 {
+            return self.get_ai_credits_used().await;
+        }
+
         let current_month = chrono::Utc::now().format("%Y-%m").to_string();
 
         let count: i32 = sqlx::query_scalar(
@@ -775,14 +741,7 @@ impl TierSettings {
         .fetch_one(&self.pool)
         .await?;
 
-        if let Some(max) = limit {
-            if count > max as i32 {
-                return Err(TierError::AiRateLimitExceeded(format!(
-                    "AI credit limit reached ({}/month). Upgrade your plan for more.",
-                    max
-                )));
-            }
-        }
+        enforce_ai_allowance(count, limit)?;
 
         Ok(count)
     }
@@ -962,6 +921,17 @@ impl TierSettings {
     }
 }
 
+fn enforce_ai_allowance(count: i32, limit: Option<u32>) -> Result<(), TierError> {
+    if let Some(max) = limit {
+        if count > max as i32 {
+            return Err(TierError::AiRateLimitExceeded(format!(
+                "Hosted AI allowance reached ({max}/month)."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Request to update specific tier limits
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 pub struct UpdateTierLimits {
@@ -1059,6 +1029,20 @@ pub struct AiUsageEvent {
 pub const AI_CREDIT_LITE: i32 = 2;
 /// Cost of an AI request using a standard/full model (1.0 request)
 pub const AI_CREDIT_FULL: i32 = 10;
+/// Cost of an AI request answered by the operator's own self-hosted model
+/// (NAN-5136): nothing. Self-run AI is bring-your-own.
+pub const AI_CREDIT_NONE: i32 = 0;
+
+/// The full-request charge for call sites that bill a flat
+/// [`AI_CREDIT_FULL`] (closure summary, shadow investigation), except when the
+/// model is self-hosted, which costs nothing (NAN-5136).
+pub fn full_request_cost(model_id: &str) -> i32 {
+    if crate::ai_provider::is_self_hosted_model(model_id) {
+        AI_CREDIT_NONE
+    } else {
+        AI_CREDIT_FULL
+    }
+}
 
 /// Name-heuristic credit cost for an AI request — the **fallback** used only
 /// when the model carries no catalog tier (see [`resolve_ai_request_cost`],
@@ -1070,6 +1054,11 @@ pub const AI_CREDIT_FULL: i32 = 10;
 /// in the model catalog (`available_models.cost_tier`, synced from
 /// `models.yaml`'s `tier:`), not in this list.
 pub fn ai_request_cost(model_id: &str) -> i32 {
+    // NAN-5136: the operator's own model server is BYO AI — nano provides no
+    // inference, so it consumes no nano AI credits.
+    if crate::ai_provider::is_self_hosted_model(model_id) {
+        return AI_CREDIT_NONE;
+    }
     let model_lower = model_id.to_lowercase();
     // "glm" (Zhipu GLM family) is very cheap — bill it as lite. Insurance for
     // custom GLM entries that aren't in the upstream catalog with a tier.
@@ -1088,6 +1077,9 @@ pub fn ai_request_cost(model_id: &str) -> i32 {
 /// (single lookup) and the usage recorder's batched lookup so both classify
 /// identically.
 pub fn credits_for_cost_tier(cost_tier: Option<&str>, model_id: &str) -> i32 {
+    if crate::ai_provider::is_self_hosted_model(model_id) {
+        return AI_CREDIT_NONE;
+    }
     match cost_tier {
         Some(t) if t.eq_ignore_ascii_case("economy") => AI_CREDIT_LITE,
         Some(_) => AI_CREDIT_FULL,
@@ -1101,6 +1093,7 @@ pub fn credits_for_cost_tier(cost_tier: Option<&str>, model_id: &str) -> i32 {
 /// by `model_catalog_sync`) and maps it via [`credits_for_cost_tier`]. Falls
 /// back to the name heuristic when the model is absent/has no tier or on any DB
 /// error — usage billing must never fail the AI call.
+#[cfg(feature = "enterprise")]
 pub async fn resolve_ai_request_cost(pool: &PgPool, model_id: &str) -> i32 {
     let row: Result<Option<Option<String>>, sqlx::Error> =
         sqlx::query_scalar("SELECT cost_tier FROM available_models WHERE model_id = $1")
@@ -1114,6 +1107,13 @@ pub async fn resolve_ai_request_cost(pool: &PgPool, model_id: &str) -> i32 {
         _ => None,
     };
     credits_for_cost_tier(cost_tier.as_deref(), model_id)
+}
+
+/// Open core has no model catalog, so model billing always uses the stable
+/// name-based fallback.
+#[cfg(not(feature = "enterprise"))]
+pub async fn resolve_ai_request_cost(_pool: &PgPool, model_id: &str) -> i32 {
+    ai_request_cost(model_id)
 }
 
 /// Proactive warning when a resource is approaching its tier limit
@@ -1159,12 +1159,11 @@ pub fn generate_warnings(limits: &TierLimits, usage: &TierUsage) -> Vec<TierWarn
                         limit: *max,
                         percent_used: percent,
                         message: format!(
-                            "You're using {}/{} {} ({:.0}% of your {} plan limit)",
+                            "You're using {}/{} {} ({:.0}% of the configured deployment limit)",
                             current,
                             max,
                             resource.replace('_', " "),
-                            percent,
-                            limits.tier
+                            percent
                         ),
                     });
                 }
@@ -1175,7 +1174,7 @@ pub fn generate_warnings(limits: &TierLimits, usage: &TierUsage) -> Vec<TierWarn
     // Check daily volume
     if let Some(max_gb) = limits.max_daily_gb {
         if max_gb > 0.0 {
-            let used_gb = usage.today.bytes_ingested as f64 / 1_073_741_824.0;
+            let used_gb = usage.today.bytes_ingested as f64 / 1_000_000_000.0;
             let percent = ((used_gb / max_gb) * 100.0).min(100.0) as u8;
             if percent >= WARNING_THRESHOLD_PERCENT {
                 warnings.push(TierWarning {
@@ -1184,8 +1183,8 @@ pub fn generate_warnings(limits: &TierLimits, usage: &TierUsage) -> Vec<TierWarn
                     limit: (max_gb * 100.0) as u32,
                     percent_used: percent,
                     message: format!(
-                        "Daily ingestion at {:.1}/{:.1} GB ({:.0}% of your {} plan limit)",
-                        used_gb, max_gb, percent, limits.tier
+                        "Daily ingestion at {:.1}/{:.1} GB ({:.0}% of contracted capacity)",
+                        used_gb, max_gb, percent
                     ),
                 });
             }
@@ -1214,11 +1213,11 @@ pub fn check_limit(
     Ok(())
 }
 
-/// Check if API access is allowed on the current tier (any level above None)
+/// Compatibility guard for a rolling-upgrade row carrying an old API limit.
 pub fn check_api_access(limits: &TierLimits) -> Result<(), TierError> {
     if limits.api_access == ApiAccessLevel::None {
         return Err(TierError::ApiAccessRestricted(
-            "API access is not available on your plan. Upgrade to Growth or higher.".into(),
+            "API access is disabled for this deployment.".into(),
         ));
     }
     Ok(())
@@ -1228,398 +1227,231 @@ pub fn check_api_access(limits: &TierLimits) -> Result<(), TierError> {
 pub fn check_api_write_access(limits: &TierLimits) -> Result<(), TierError> {
     match limits.api_access {
         ApiAccessLevel::None => Err(TierError::ApiAccessRestricted(
-            "API access is not available on your plan. Upgrade to Growth or higher.".into(),
+            "API access is disabled for this deployment.".into(),
         )),
         ApiAccessLevel::Readonly => Err(TierError::ApiAccessRestricted(
-            "Write API access is not available on your plan. Upgrade to Growth or higher.".into(),
+            "Write API access is disabled for this deployment.".into(),
         )),
         ApiAccessLevel::Full => Ok(()),
     }
 }
 
-/// Check if SSO is available on the current tier
+/// Check whether SSO is shipped by the current edition/build.
 pub fn check_sso_access(limits: &TierLimits) -> Result<(), TierError> {
     if !limits.sso_enabled {
         return Err(TierError::FeatureNotAvailable(
-            "SSO/SAML is not available on your plan. Upgrade to Starter or higher.".into(),
+            "SSO/SAML is not included in this build.".into(),
         ));
     }
     Ok(())
 }
 
-/// Validate that a model is accessible on the given AI model tier
-pub fn check_model_access(model: &str, model_tier: &AiModelTier) -> Result<(), TierError> {
-    let economy_models = ["haiku", "flash-lite", "claude-haiku", "gemini-flash", "glm"];
-    let standard_models = ["sonnet", "claude-sonnet", "gemini-pro", "gpt-4o-mini"];
-
-    match model_tier {
-        AiModelTier::Full => Ok(()),
-        AiModelTier::Standard => {
-            let model_lower = model.to_lowercase();
-            if economy_models.iter().any(|m| model_lower.contains(m))
-                || standard_models.iter().any(|m| model_lower.contains(m))
-            {
-                Ok(())
-            } else {
-                Err(TierError::AiModelNotAvailable(format!(
-                    "Model '{}' requires the Growth plan or higher.",
-                    model
-                )))
-            }
-        }
-        AiModelTier::Economy => {
-            let model_lower = model.to_lowercase();
-            if economy_models.iter().any(|m| model_lower.contains(m)) {
-                Ok(())
-            } else {
-                Err(TierError::AiModelNotAvailable(format!(
-                    "Model '{}' requires the Startup plan or higher.",
-                    model
-                )))
-            }
-        }
-    }
+/// Compatibility API: v2 never selects models by plan. Provider configuration
+/// decides which models exist, while hosted allowance enforcement is separate.
+pub fn check_model_access(_model: &str, _model_tier: &AiModelTier) -> Result<(), TierError> {
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // NAN-2347: the contractual AI credit ceiling for unlimited tiers.
+    fn entitlement(operator: EntitlementOperator) -> Entitlement {
+        Entitlement {
+            edition: EntitlementEdition::Licensed,
+            operator,
+            capacity_gb_per_day: Some(25.0),
+        }
+    }
 
     #[test]
-    fn test_ai_ceiling_parse_accepts_positive_integers_only() {
+    fn ai_ceiling_parse_accepts_positive_postgres_integers_only() {
         assert_eq!(parse_ai_credits_ceiling("5000000"), Some(5_000_000));
         assert_eq!(parse_ai_credits_ceiling(" 42 "), Some(42));
-        // Zero and garbage degrade to unset, never to "block all AI".
         assert_eq!(parse_ai_credits_ceiling("0"), None);
-        assert_eq!(parse_ai_credits_ceiling(""), None);
         assert_eq!(parse_ai_credits_ceiling("unlimited"), None);
         assert_eq!(parse_ai_credits_ceiling("-1"), None);
-        assert_eq!(parse_ai_credits_ceiling("5e6"), None);
-        // The counter is a PostgreSQL INTEGER — past-i32 values would wrap
-        // negative in increment_ai_credits and reject the first request.
         assert_eq!(parse_ai_credits_ceiling("2147483647"), Some(2_147_483_647));
         assert_eq!(parse_ai_credits_ceiling("2147483648"), None);
-        assert_eq!(parse_ai_credits_ceiling("4294967295"), None);
     }
 
     #[test]
-    fn test_ai_ceiling_caps_only_the_unlimited_tiers() {
-        let ceiling = Some(5_000_000);
-        // Enterprise and Unrestricted default to unlimited — they get the cap.
-        for tier in [OrganizationTier::Enterprise, OrganizationTier::Unrestricted] {
-            let limits = TierLimits::for_tier_with_ceiling(tier, ceiling);
-            assert_eq!(limits.ai_credits_per_month, Some(5_000_000), "{tier:?}");
+    fn capacity_parse_accepts_only_positive_finite_values() {
+        assert_eq!(parse_capacity_gb_per_day(" 25.5 "), Some(25.5));
+        assert_eq!(parse_capacity_gb_per_day("0"), None);
+        assert_eq!(parse_capacity_gb_per_day("-1"), None);
+        assert_eq!(parse_capacity_gb_per_day("NaN"), None);
+        assert_eq!(parse_capacity_gb_per_day("inf"), None);
+        assert_eq!(parse_capacity_gb_per_day("nope"), None);
+    }
+
+    #[test]
+    fn every_legacy_paid_tier_maps_to_full_licensed_features() {
+        let legacy = [
+            OrganizationTier::Hobby,
+            OrganizationTier::Startup,
+            OrganizationTier::Growth,
+            OrganizationTier::Team,
+            OrganizationTier::Starter,
+            OrganizationTier::Pro,
+            OrganizationTier::Enterprise,
+            OrganizationTier::Unrestricted,
+        ];
+        for tier in legacy {
+            let limits = TierLimits::for_tier_unoverridden(tier);
+            assert_eq!(
+                limits.entitlement.edition,
+                EntitlementEdition::Licensed,
+                "{tier:?}"
+            );
+            assert_eq!(limits.tier, OrganizationTier::Licensed, "{tier:?}");
+            assert_eq!(limits.api_access, ApiAccessLevel::Full, "{tier:?}");
+            assert!(limits.sso_enabled, "{tier:?}");
+            assert!(limits.ha_enabled, "{tier:?}");
+            assert_eq!(limits.max_data_sources, None, "{tier:?}");
+            assert_eq!(limits.max_detection_rules, None, "{tier:?}");
+            assert_eq!(limits.max_team_members, None, "{tier:?}");
+            assert_eq!(limits.max_eps, None, "{tier:?}");
+            assert_eq!(limits.max_metric_monitors, None, "{tier:?}");
+            assert_eq!(limits.max_synthetic_checks, None, "{tier:?}");
+            assert_eq!(limits.max_slos, None, "{tier:?}");
+            assert_eq!(limits.ai_model_tier, AiModelTier::Full, "{tier:?}");
+            assert!(!limits.is_enforced(), "{tier:?}");
         }
-        // Metered tiers keep their own tier caps.
-        let hobby = TierLimits::for_tier_with_ceiling(OrganizationTier::Hobby, ceiling);
-        assert_eq!(hobby.ai_credits_per_month, Some(3_000));
-        let pro = TierLimits::for_tier_with_ceiling(OrganizationTier::Pro, ceiling);
-        assert_eq!(pro.ai_credits_per_month, Some(400_000));
     }
 
     #[test]
-    fn test_ai_ceiling_unset_preserves_unlimited() {
-        let limits = TierLimits::for_tier_with_ceiling(OrganizationTier::Enterprise, None);
-        assert_eq!(limits.ai_credits_per_month, None);
-    }
-
-    // NAN-2366: the per-deployment detection-rule override.
-
-    #[test]
-    fn test_rule_override_parse_is_tri_state() {
-        assert_eq!(parse_max_detection_rules("50"), Some(Some(50)));
-        assert_eq!(parse_max_detection_rules(" 50 "), Some(Some(50)));
-        // `None` means "no override", which is distinct from an explicit
-        // unlimited — the limit field already uses None for unlimited.
-        assert_eq!(parse_max_detection_rules("unlimited"), Some(None));
-        assert_eq!(parse_max_detection_rules("UNLIMITED"), Some(None));
-        assert_eq!(parse_max_detection_rules("none"), Some(None));
-        // Zero, negatives and garbage degrade to "no override" rather than to
-        // a zero ceiling that would block every rule create.
-        assert_eq!(parse_max_detection_rules("0"), None);
-        assert_eq!(parse_max_detection_rules("-1"), None);
-        assert_eq!(parse_max_detection_rules(""), None);
-        assert_eq!(parse_max_detection_rules("fifty"), None);
-        assert_eq!(parse_max_detection_rules("5e1"), None);
-        // tier_max_detection_rules is a PostgreSQL INTEGER.
-        assert_eq!(parse_max_detection_rules("2147483647"), Some(Some(2_147_483_647)));
-        assert_eq!(parse_max_detection_rules("2147483648"), None);
-    }
-
-    #[test]
-    fn test_rule_override_replaces_a_concrete_tier_default() {
-        // The case that motivated this: raise hobby's 15 without moving tier.
-        let hobby = TierLimits::for_tier_with_ceiling(OrganizationTier::Hobby, None)
-            .with_rule_override(Some(Some(50)));
-        assert_eq!(hobby.max_detection_rules, Some(50));
-        // Unlike the AI ceiling this is not fill-if-none, so it can lower too.
-        let growth = TierLimits::for_tier_with_ceiling(OrganizationTier::Growth, None)
-            .with_rule_override(Some(Some(5)));
-        assert_eq!(growth.max_detection_rules, Some(5));
-        // ...and can grant unlimited to a metered tier.
-        let unlimited = TierLimits::for_tier_with_ceiling(OrganizationTier::Hobby, None)
-            .with_rule_override(Some(None));
-        assert_eq!(unlimited.max_detection_rules, None);
-    }
-
-    #[test]
-    fn test_rule_override_absent_preserves_tier_default() {
-        let hobby = TierLimits::for_tier_with_ceiling(OrganizationTier::Hobby, None)
-            .with_rule_override(None);
-        assert_eq!(hobby.max_detection_rules, Some(15));
-        let team = TierLimits::for_tier_with_ceiling(OrganizationTier::Team, None)
-            .with_rule_override(None);
-        assert_eq!(team.max_detection_rules, None);
-    }
-
-    #[test]
-    fn test_rule_override_switches_enforcement_on_for_unrestricted() {
-        // Unrestricted skips every limit check, so an override there would be
-        // reported by the API and then never applied. A numeric override has to
-        // turn enforcement back on; an "unlimited" one must not.
-        let base = TierLimits::for_tier_unoverridden(OrganizationTier::Unrestricted);
-        assert!(!base.is_enforced());
-
-        let capped = TierLimits::for_tier_unoverridden(OrganizationTier::Unrestricted)
-            .with_rule_override(Some(Some(50)));
-        assert!(capped.is_enforced());
-        assert_eq!(capped.max_detection_rules, Some(50));
-        // Every other limit stays None, and check_limit treats None as
-        // unlimited — so flipping enforcement on caps rules and nothing else.
-        assert_eq!(capped.max_data_sources, None);
-        assert_eq!(capped.max_eps, None);
-        assert!(check_limit("data sources", 9_999, capped.max_data_sources, capped.tier, "").is_ok());
-        assert!(check_limit("detection rules", 50, capped.max_detection_rules, capped.tier, "").is_err());
-
-        let unlimited = TierLimits::for_tier_unoverridden(OrganizationTier::Unrestricted)
-            .with_rule_override(Some(None));
-        assert!(!unlimited.is_enforced());
-    }
-
-    #[test]
-    fn test_rule_override_touches_nothing_else() {
-        // The override exists so a tenant can gain rules without gaining the
-        // ingest allowance and AI spend a tier move would bring.
-        let base = TierLimits::for_tier_with_ceiling(OrganizationTier::Hobby, None);
-        let overridden = TierLimits::for_tier_with_ceiling(OrganizationTier::Hobby, None)
-            .with_rule_override(Some(Some(50)));
-        assert_eq!(overridden.tier, base.tier);
-        assert_eq!(overridden.max_daily_gb, base.max_daily_gb);
-        assert_eq!(overridden.max_eps, base.max_eps);
-        assert_eq!(overridden.max_data_sources, base.max_data_sources);
-        assert_eq!(overridden.ai_credits_per_month, base.ai_credits_per_month);
-        assert_eq!(overridden.ai_model_tier, base.ai_model_tier);
-        assert_eq!(overridden.sso_enabled, base.sso_enabled);
-        assert_eq!(overridden.ha_enabled, base.ha_enabled);
-    }
-
-    #[test]
-    fn test_unrestricted_has_no_limits() {
-        // via for_tier_with_ceiling(None): a NANO_AI_CREDITS_PER_MONTH set in
-        // the test environment must not flip the default-limit assertions.
-        let limits = TierLimits::for_tier_with_ceiling(OrganizationTier::Unrestricted, None);
-        assert_eq!(limits.max_data_sources, None);
-        assert_eq!(limits.max_detection_rules, None);
-        assert_eq!(limits.max_team_members, None);
-        assert_eq!(limits.max_daily_gb, None);
-        assert_eq!(limits.max_eps, None);
-        assert_eq!(limits.api_access, ApiAccessLevel::Full);
+    fn old_tier_licence_claim_is_admitted_and_mapped() {
+        let entitlement =
+            Entitlement::from_license_tier_claim("starter", EntitlementOperator::SelfRun).unwrap();
+        let limits = TierLimits::for_entitlement_unoverridden(entitlement);
+        assert_eq!(limits.tier, OrganizationTier::Licensed);
+        assert_eq!(limits.entitlement.capacity_gb_per_day, Some(50.0));
         assert!(limits.sso_enabled);
         assert!(limits.ha_enabled);
+        assert!(Entitlement::from_license_tier_claim(
+            "unknown-future-plan",
+            EntitlementOperator::SelfRun,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_tier_capacity_is_metadata_not_a_feature_selector() {
+        let cases = [
+            (OrganizationTier::Hobby, Some(2.0)),
+            (OrganizationTier::Startup, Some(5.0)),
+            (OrganizationTier::Growth, Some(10.0)),
+            (OrganizationTier::Team, Some(25.0)),
+            (OrganizationTier::Starter, Some(50.0)),
+            (OrganizationTier::Pro, Some(100.0)),
+            (OrganizationTier::Enterprise, None),
+        ];
+        for (tier, expected) in cases {
+            let limits = TierLimits::for_tier_unoverridden(tier);
+            assert_eq!(limits.entitlement.capacity_gb_per_day, expected);
+            assert_eq!(limits.max_daily_gb, expected);
+            assert!(limits.sso_enabled);
+        }
+    }
+
+    #[test]
+    fn hosted_allowance_is_enforced_independently_of_capacity() {
+        let limits = TierLimits::for_entitlement_with_ceiling(
+            entitlement(EntitlementOperator::Hosted),
+            Some(5_000_000),
+        );
+        assert_eq!(limits.ai_credits_per_month, Some(5_000_000));
+        assert_eq!(limits.ai_model_tier, AiModelTier::Full);
+        assert!(limits.sso_enabled);
+        assert!(enforce_ai_allowance(5_000_000, limits.ai_credits_per_month).is_ok());
+        assert!(matches!(
+            enforce_ai_allowance(5_000_001, limits.ai_credits_per_month),
+            Err(TierError::AiRateLimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn hosted_without_a_provisioned_allowance_fails_closed() {
+        let limits = TierLimits::for_entitlement_with_ceiling(
+            entitlement(EntitlementOperator::Hosted),
+            None,
+        );
+        assert_eq!(limits.ai_credits_per_month, Some(0));
+    }
+
+    #[test]
+    fn self_run_byo_ai_is_uncapped() {
+        let limits = TierLimits::for_entitlement_with_ceiling(
+            entitlement(EntitlementOperator::SelfRun),
+            Some(5_000_000),
+        );
         assert_eq!(limits.ai_credits_per_month, None);
         assert_eq!(limits.ai_model_tier, AiModelTier::Full);
-        // NAN-1544: observability monitor caps unlimited on Unrestricted.
-        assert_eq!(limits.max_metric_monitors, None);
-        assert_eq!(limits.max_synthetic_checks, None);
-        assert_eq!(limits.max_slos, None);
+        assert!(check_model_access("customer/model", &AiModelTier::Economy).is_ok());
+        assert!(enforce_ai_allowance(i32::MAX, limits.ai_credits_per_month).is_ok());
+    }
+
+    #[test]
+    fn open_edition_is_identified_without_paid_plan_limits() {
+        let limits = TierLimits::for_entitlement_unoverridden(Entitlement {
+            edition: EntitlementEdition::Open,
+            operator: EntitlementOperator::SelfRun,
+            capacity_gb_per_day: None,
+        });
+        assert_eq!(limits.tier, OrganizationTier::Open);
+        assert!(!limits.sso_enabled);
+        assert!(limits.ha_enabled);
+        assert_eq!(limits.api_access, ApiAccessLevel::Full);
         assert!(!limits.is_enforced());
     }
 
     #[test]
-    fn test_hobby_limits() {
-        let limits = TierLimits::for_tier_unoverridden(OrganizationTier::Hobby);
-        assert_eq!(limits.max_data_sources, Some(10));
-        assert_eq!(limits.max_detection_rules, Some(15));
-        assert_eq!(limits.max_team_members, Some(3));
-        assert_eq!(limits.max_daily_gb, Some(2.0));
-        assert_eq!(limits.max_eps, Some(30));
-        assert_eq!(limits.api_access, ApiAccessLevel::Full); // NAN-1472: API access on all tiers
-        assert!(!limits.sso_enabled);
-        assert!(!limits.ha_enabled);
-        assert_eq!(limits.ai_credits_per_month, Some(3_000));
-        assert_eq!(limits.ai_model_tier, AiModelTier::Economy);
-        // NAN-1544: open/hobby tier gets 5 of each observability monitor type.
-        assert_eq!(limits.max_metric_monitors, Some(5));
-        assert_eq!(limits.max_synthetic_checks, Some(5));
-        assert_eq!(limits.max_slos, Some(5));
-        assert!(limits.is_enforced());
+    fn model_names_are_never_plan_gated() {
+        for model_tier in [
+            AiModelTier::Economy,
+            AiModelTier::Standard,
+            AiModelTier::Full,
+        ] {
+            assert!(check_model_access("claude-opus", &model_tier).is_ok());
+            assert!(check_model_access("private-gateway/model", &model_tier).is_ok());
+        }
     }
 
     #[test]
-    fn test_startup_limits() {
-        let limits = TierLimits::for_tier_unoverridden(OrganizationTier::Startup);
-        assert_eq!(limits.max_data_sources, Some(20));
-        assert_eq!(limits.max_detection_rules, Some(30));
-        assert_eq!(limits.max_team_members, Some(8));
-        assert_eq!(limits.max_daily_gb, Some(5.0));
-        assert_eq!(limits.max_eps, Some(75));
-        assert_eq!(limits.api_access, ApiAccessLevel::Full); // NAN-1472: API access on all tiers
-        assert!(!limits.sso_enabled);
-        assert!(!limits.ha_enabled);
-        assert_eq!(limits.ai_credits_per_month, Some(10_000));
-        assert_eq!(limits.ai_model_tier, AiModelTier::Standard);
+    fn check_limit_remains_compatible_with_old_rows() {
+        assert!(check_limit("rules", 10, Some(50), OrganizationTier::Hobby, "").is_ok());
+        assert!(check_limit("rules", 50, Some(50), OrganizationTier::Hobby, "").is_err());
+        assert!(check_limit("rules", u32::MAX, None, OrganizationTier::Licensed, "").is_ok());
     }
 
     #[test]
-    fn test_growth_limits() {
-        let limits = TierLimits::for_tier_unoverridden(OrganizationTier::Growth);
-        assert_eq!(limits.max_data_sources, Some(30));
-        assert_eq!(limits.max_detection_rules, Some(50));
-        assert_eq!(limits.max_team_members, Some(12));
-        assert_eq!(limits.max_daily_gb, Some(10.0));
-        assert_eq!(limits.max_eps, Some(155));
-        assert_eq!(limits.api_access, ApiAccessLevel::Full);
-        assert!(!limits.sso_enabled);
-        assert!(!limits.ha_enabled);
-        assert_eq!(limits.ai_credits_per_month, Some(25_000));
-        assert_eq!(limits.ai_model_tier, AiModelTier::Full);
-    }
-
-    #[test]
-    fn test_team_limits() {
-        let limits = TierLimits::for_tier_unoverridden(OrganizationTier::Team);
-        assert_eq!(limits.max_team_members, Some(15));
-        assert_eq!(limits.max_daily_gb, Some(25.0));
-        assert_eq!(limits.max_eps, Some(385));
-        assert_eq!(limits.api_access, ApiAccessLevel::Full);
-        assert!(!limits.sso_enabled);
-        assert!(limits.ha_enabled);
-        assert_eq!(limits.ai_credits_per_month, Some(50_000));
-        assert_eq!(limits.ai_model_tier, AiModelTier::Full);
-        // NAN-1544: Team gets the wider 25-each allowance.
-        assert_eq!(limits.max_metric_monitors, Some(25));
-        assert_eq!(limits.max_synthetic_checks, Some(25));
-        assert_eq!(limits.max_slos, Some(25));
-    }
-
-    #[test]
-    fn test_starter_limits() {
-        let limits = TierLimits::for_tier_unoverridden(OrganizationTier::Starter);
-        assert_eq!(limits.max_data_sources, None);
-        assert_eq!(limits.max_detection_rules, None);
-        assert_eq!(limits.max_team_members, None);
-        assert_eq!(limits.max_daily_gb, Some(50.0));
-        assert_eq!(limits.max_eps, Some(770));
-        assert_eq!(limits.api_access, ApiAccessLevel::Full);
-        assert!(limits.sso_enabled);
-        assert!(limits.ha_enabled);
-        assert_eq!(limits.ai_credits_per_month, Some(150_000));
-    }
-
-    #[test]
-    fn test_pro_limits() {
-        let limits = TierLimits::for_tier_unoverridden(OrganizationTier::Pro);
-        assert_eq!(limits.max_team_members, None);
-        assert_eq!(limits.max_daily_gb, Some(100.0));
-        assert_eq!(limits.max_eps, Some(1_550));
-        assert!(limits.sso_enabled);
-        assert!(limits.ha_enabled);
-        assert_eq!(limits.ai_credits_per_month, Some(400_000));
-        assert_eq!(limits.ai_model_tier, AiModelTier::Full);
-    }
-
-    #[test]
-    fn test_enterprise_unlimited() {
-        // via for_tier_with_ceiling(None) — same env-independence as above.
-        let limits = TierLimits::for_tier_with_ceiling(OrganizationTier::Enterprise, None);
-        assert_eq!(limits.max_data_sources, None);
-        assert_eq!(limits.max_team_members, None);
-        assert!(limits.sso_enabled);
-        assert!(limits.ha_enabled);
-        assert_eq!(limits.ai_credits_per_month, None);
-    }
-
-    #[test]
-    fn test_check_limit_within() {
-        assert!(check_limit("rules", 10, Some(50), OrganizationTier::Hobby, "Upgrade").is_ok());
-    }
-
-    #[test]
-    fn test_check_limit_exceeded() {
-        assert!(check_limit("rules", 50, Some(50), OrganizationTier::Hobby, "Upgrade").is_err());
-    }
-
-    #[test]
-    fn test_check_limit_unlimited() {
-        assert!(check_limit("rules", 999999, None, OrganizationTier::Unrestricted, "").is_ok());
-    }
-
-    #[test]
-    fn test_api_access() {
-        // NAN-1472: API access is available on all tiers, including Hobby.
-        let hobby = TierLimits::for_tier_unoverridden(OrganizationTier::Hobby);
-        assert!(check_api_write_access(&hobby).is_ok());
-        assert!(check_api_access(&hobby).is_ok());
-
-        let growth = TierLimits::for_tier_unoverridden(OrganizationTier::Growth);
-        assert!(check_api_write_access(&growth).is_ok());
-        assert!(check_api_access(&growth).is_ok());
-
-        let starter = TierLimits::for_tier_unoverridden(OrganizationTier::Starter);
-        assert!(check_api_write_access(&starter).is_ok());
-    }
-
-    #[test]
-    fn test_sso_access() {
-        assert!(check_sso_access(&TierLimits::for_tier_unoverridden(OrganizationTier::Hobby)).is_err());
-        assert!(check_sso_access(&TierLimits::for_tier_unoverridden(OrganizationTier::Growth)).is_err());
-        assert!(check_sso_access(&TierLimits::for_tier_unoverridden(OrganizationTier::Starter)).is_ok());
-        assert!(check_sso_access(&TierLimits::for_tier_unoverridden(OrganizationTier::Pro)).is_ok());
-    }
-
-    #[test]
-    fn test_model_access() {
-        // Economy tier: only economy models
-        assert!(check_model_access("claude-haiku-3", &AiModelTier::Economy).is_ok());
-        assert!(check_model_access("gemini-flash-2", &AiModelTier::Economy).is_ok());
-        assert!(check_model_access("claude-sonnet-4", &AiModelTier::Economy).is_err());
-        assert!(check_model_access("claude-opus-4", &AiModelTier::Economy).is_err());
-
-        // Standard tier: economy + standard models
-        assert!(check_model_access("claude-haiku-3", &AiModelTier::Standard).is_ok());
-        assert!(check_model_access("claude-sonnet-4", &AiModelTier::Standard).is_ok());
-        assert!(check_model_access("gpt-4o-mini", &AiModelTier::Standard).is_ok());
-        assert!(check_model_access("claude-opus-4", &AiModelTier::Standard).is_err());
-
-        // Full tier: everything
-        assert!(check_model_access("claude-opus-4", &AiModelTier::Full).is_ok());
-        assert!(check_model_access("claude-sonnet-4", &AiModelTier::Full).is_ok());
-
-        // GLM (Zhipu) is economy-tier (NAN-1521).
-        assert!(check_model_access("glm-4.6", &AiModelTier::Economy).is_ok());
-        assert!(check_model_access("z-ai/glm-4-flash", &AiModelTier::Economy).is_ok());
-    }
-
-    #[test]
-    fn test_ai_request_cost() {
-        // Economy/lite models cost AI_CREDIT_LITE.
+    fn ai_request_cost_is_provider_agnostic() {
         assert_eq!(ai_request_cost("claude-haiku-4-5"), AI_CREDIT_LITE);
         assert_eq!(ai_request_cost("gemini-2.0-flash-lite"), AI_CREDIT_LITE);
-        // GLM is lite — it's very cheap (NAN-1521).
         assert_eq!(ai_request_cost("glm-4.6"), AI_CREDIT_LITE);
         assert_eq!(ai_request_cost("z-ai/GLM-4-Flash"), AI_CREDIT_LITE);
-        // Full models cost AI_CREDIT_FULL.
         assert_eq!(ai_request_cost("claude-sonnet-4-6"), AI_CREDIT_FULL);
         assert_eq!(ai_request_cost("claude-opus-4-8"), AI_CREDIT_FULL);
     }
 
     #[test]
-    fn test_tier_parse() {
+    fn old_and_new_tier_names_parse_during_the_support_window() {
+        assert_eq!(
+            "open".parse::<OrganizationTier>().unwrap(),
+            OrganizationTier::Open
+        );
+        assert_eq!(
+            "licensed".parse::<OrganizationTier>().unwrap(),
+            OrganizationTier::Licensed
+        );
         assert_eq!(
             "hobby".parse::<OrganizationTier>().unwrap(),
             OrganizationTier::Hobby
+        );
+        assert_eq!(
+            "business".parse::<OrganizationTier>().unwrap(),
+            OrganizationTier::Starter
         );
         assert_eq!(
             "growth".parse::<OrganizationTier>().unwrap(),
@@ -1630,19 +1462,5 @@ mod tests {
             OrganizationTier::Unrestricted
         );
         assert!("invalid".parse::<OrganizationTier>().is_err());
-    }
-
-    #[test]
-    fn test_ai_model_tier_parse() {
-        assert_eq!(
-            "economy".parse::<AiModelTier>().unwrap(),
-            AiModelTier::Economy
-        );
-        assert_eq!(
-            "standard".parse::<AiModelTier>().unwrap(),
-            AiModelTier::Standard
-        );
-        assert_eq!("full".parse::<AiModelTier>().unwrap(), AiModelTier::Full);
-        assert!("invalid".parse::<AiModelTier>().is_err());
     }
 }

@@ -45,6 +45,29 @@ pub(super) fn validate_match_field(match_field: Option<&str>) -> Result<(), LogS
     Ok(())
 }
 
+/// NAN-5012: a non-blank sampling exclude condition must pass
+/// [`crate::parsers::vrl_safety::check_condition`]. Blank means "no condition".
+pub(super) fn check_sampling_condition(
+    condition: Option<&str>,
+) -> Result<(), LogSourceServiceError> {
+    match condition.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(condition) => {
+            crate::parsers::vrl_safety::check_condition("sampling_exclude_condition", condition)
+                .map_err(LogSourceServiceError::InvalidVrl)
+        }
+        None => Ok(()),
+    }
+}
+
+/// NAN-5057: an enabled, non-blank extension must pass the same allowlist
+/// check as the parser it runs after.
+pub(super) fn check_extension(enabled: bool, extension_vrl: Option<&str>) -> Result<(), String> {
+    match extension_vrl.filter(|v| enabled && !v.trim().is_empty()) {
+        Some(vrl) => crate::parsers::vrl_safety::check_program("extension_vrl", vrl),
+        None => Ok(()),
+    }
+}
+
 /// NAN-4953: refuse Vector env-interpolation syntax in every tenant-authored
 /// VRL field a save writes (see [`crate::vector_env::reject_vrl_interpolation`]).
 /// `None` means "not being written" and is not checked.
@@ -154,6 +177,7 @@ impl LogSourceService {
             ("parser_vrl", Some(new.parser_vrl.as_str())),
             ("sampling_exclude_condition", new.sampling_exclude_condition.as_deref()),
         ])?;
+        check_sampling_condition(new.sampling_exclude_condition.as_deref())?;
 
         // NAN-2311: UNIQUE(name) accepts `my-source` beside `My Source`; the
         // generated Vector namespace does not.
@@ -183,6 +207,31 @@ impl LogSourceService {
 
         // Return the updated log source with correct validation status.
         Ok(self.repository().find_by_id(log_source.id).await?)
+    }
+
+    /// The parser half of a source's validity. An enrichment source carries
+    /// its logic in `normalize_vrl` (checked on its own path), and a stub
+    /// source (blank parser, logic in an enabled extension) has no parser to
+    /// check. Errors are the validator's messages.
+    async fn parser_part_valid(
+        &self,
+        kind: &str,
+        parser_vrl: &str,
+        extension_enabled: bool,
+        extension_vrl: Option<&str>,
+    ) -> Result<(), Vec<String>> {
+        let stub = parser_vrl.trim().is_empty()
+            && extension_enabled
+            && extension_vrl.is_some_and(|v| !v.trim().is_empty());
+        if kind == "enrichment" || stub {
+            return Ok(());
+        }
+        let validation = self.validate_vrl(parser_vrl).await;
+        if validation.valid {
+            Ok(())
+        } else {
+            Err(validation.errors)
+        }
     }
 
     /// Update a log source
@@ -219,6 +268,40 @@ impl LogSourceService {
             ("sampling_exclude_condition", update.sampling_exclude_condition.as_deref()),
         ])?;
 
+        // NAN-5012: the exclude condition is VRL that Vector runs with its
+        // full stdlib; it must be a read-only predicate over the parser
+        // allowlist.
+        check_sampling_condition(update.sampling_exclude_condition.as_deref())?;
+
+        // NAN-5057: enabling a source in the same PUT that saves its VRL must
+        // not skip the `enable()` gate. Only the disabled -> enabled
+        // transition is checked, so re-sending `enabled: true` for a source
+        // that is already enabled keeps working.
+        if update.enabled == Some(true) {
+            let current = self.repository().find_by_id(id).await?;
+            if !current.enabled {
+                let parser_vrl = update
+                    .parser_vrl
+                    .as_deref()
+                    .unwrap_or(current.parser_vrl.as_str());
+                let extension_vrl = update
+                    .extension_vrl
+                    .as_deref()
+                    .or(current.extension_vrl.as_deref());
+                let extension_enabled =
+                    update.extension_enabled.unwrap_or(current.extension_enabled);
+                let parser_ok = self
+                    .parser_part_valid(&current.kind, parser_vrl, extension_enabled, extension_vrl)
+                    .await
+                    .is_ok();
+                if !parser_ok
+                    || check_extension(extension_enabled, extension_vrl).is_err()
+                {
+                    return Err(LogSourceServiceError::NotValidated);
+                }
+            }
+        }
+
         if let Some(ref nvrl) = update.normalize_vrl {
             if !nvrl.trim().is_empty() {
                 if let Err(e) = crate::parsers::VrlValidator::new().check_normalize_vrl_safety(nvrl)
@@ -247,17 +330,34 @@ impl LogSourceService {
         validate_match_field(update.match_field.as_deref())?;
         let log_source = self.repository().update(id, &update).await?;
 
-        // If VRL was updated, validate and set the correct status
-        if update.parser_vrl.is_some() {
-            let validation = self.validate_vrl(&log_source.parser_vrl).await;
-            let error_msg = if validation.valid {
-                None
-            } else {
-                Some(validation.errors.join("; "))
-            };
+        // If VRL was updated, validate and set the correct status. NAN-5057:
+        // the extension runs in the same Vector remap chain, so it is part of
+        // the source's validity (an extension-only edit used to leave
+        // `validated` untouched).
+        let extension_changed =
+            update.extension_vrl.is_some() || update.extension_enabled.is_some();
+        if update.parser_vrl.is_some() || extension_changed {
+            let mut errors = self
+                .parser_part_valid(
+                    &log_source.kind,
+                    &log_source.parser_vrl,
+                    log_source.extension_enabled,
+                    log_source.extension_vrl.as_deref(),
+                )
+                .await
+                .err()
+                .unwrap_or_default();
+            if let Err(e) = check_extension(
+                log_source.extension_enabled,
+                log_source.extension_vrl.as_deref(),
+            ) {
+                errors.push(e);
+            }
+            let valid = errors.is_empty();
+            let error_msg = (!valid).then(|| errors.join("; "));
 
             self.repository()
-                .set_validation_status(id, validation.valid, error_msg.as_deref())
+                .set_validation_status(id, valid, error_msg.as_deref())
                 .await?;
         }
 

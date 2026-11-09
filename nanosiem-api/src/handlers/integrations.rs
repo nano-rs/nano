@@ -532,6 +532,16 @@ fn validate_definition_shape(request: &CustomCollectorDefinitionRequest) -> Vec<
                 stream.id
             ));
         }
+        // NAN-5032: a manifest cannot deliver events as platform records.
+        if nanosiem_core::auth::reserved_source_types::classify(&stream.source_type)
+            == nanosiem_core::auth::reserved_source_types::Reservation::Enforced
+        {
+            errors.push(format!(
+                "stream {:?}: {}",
+                stream.id,
+                nanosiem_core::auth::reserved_source_types::enforced_name_error(&stream.source_type)
+            ));
+        }
         if stream.label.trim().is_empty() {
             errors.push(format!("stream {:?} needs a label", stream.id));
         }

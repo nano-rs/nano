@@ -115,6 +115,8 @@ struct ChangedFile {
     previous_filename: Option<String>,
 }
 #[derive(Debug, Deserialize)]
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 struct CompareResponse {
     #[serde(default)]
     files: Vec<ChangedFile>,
@@ -302,6 +304,8 @@ impl GitHubWriteClient {
         )))
     }
 
+    // Only the enterprise AI-tuning / DaC push paths call this.
+    #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
     async fn verify_branch_diff(
         &self,
         owner: &str,
@@ -562,6 +566,8 @@ impl GitHubWriteClient {
     /// base tip or already contains the exact frozen payload. This prevents a
     /// coincidentally named divergent branch from being overwritten and later
     /// attached to a tuning PR.
+    // Only the enterprise AI-tuning / DaC push paths call this.
+    #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
     pub(crate) async fn ensure_operation_branch(
         &self,
         repo_url: &str,
@@ -681,6 +687,8 @@ impl GitHubWriteClient {
     /// still contains the frozen file. This is read-only: remote drift after a
     /// checkpoint must stop reconciliation instead of silently adding it to the
     /// pull request.
+    // Only the enterprise AI-tuning / DaC push paths call this.
+    #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
     pub(crate) async fn verify_commit(
         &self,
         repo_url: &str,
@@ -725,6 +733,8 @@ impl GitHubWriteClient {
     /// after a merged PR's branch is deleted, so recovery does not need to
     /// recreate remote state merely to finish its database checkpoint.
     #[allow(clippy::too_many_arguments)]
+    // Only the enterprise AI-tuning / DaC push paths call this.
+    #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
     pub(crate) async fn find_existing_pull_request(
         &self,
         repo_url: &str,

@@ -183,11 +183,6 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         handlers::rule_repositories::RuleRepositoriesApiDoc::openapi(),
         handlers::detection_code_targets::DetectionCodeTargetsApiDoc::openapi(),
         handlers::parser_repositories::ParserRepositoriesApiDoc::openapi(),
-        handlers::playbooks::PlaybooksApiDoc::openapi(),
-        // NAN-2238 Active Hunter. Registered alongside playbooks because a hunt
-        // definition IS a playbooks row; the runtime is what splits.
-        handlers::hunts::HuntsApiDoc::openapi(),
-        handlers::playbook_repositories::PlaybookRepositoriesApiDoc::openapi(),
         handlers::marketplace::MarketplaceApiDoc::openapi(),
         #[cfg(feature = "enterprise")]
         handlers::integrations::IntegrationsApiDoc::openapi(),
@@ -222,6 +217,9 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         sub_docs.push(handlers::cases::CasesApiDoc::openapi());
         sub_docs.push(handlers::incidents::IncidentsApiDoc::openapi());
         sub_docs.push(handlers::notebooks::NotebooksApiDoc::openapi());
+        sub_docs.push(handlers::playbooks::PlaybooksApiDoc::openapi());
+        sub_docs.push(handlers::hunts::HuntsApiDoc::openapi());
+        sub_docs.push(handlers::playbook_repositories::PlaybookRepositoriesApiDoc::openapi());
         sub_docs.push(handlers::melod::MelodApiDoc::openapi());
         sub_docs.push(handlers::risk::RiskApiDoc::openapi());
         sub_docs.push(handlers::risk_watchlists::RiskWatchlistsApiDoc::openapi());
@@ -297,6 +295,7 @@ pub fn swagger_ui() -> utoipa_swagger_ui::SwaggerUi {
 /// one repository action the desktop exposes. Keeping the repository's edit,
 /// catalog and per-file import surfaces out of this contract avoids turning a
 /// focused drift gate into a second copy of the full OpenAPI document.
+#[cfg(feature = "enterprise")]
 fn is_desktop_wire_path(path: &str) -> bool {
     path.starts_with("/api/hunts")
         || matches!(
@@ -319,6 +318,7 @@ fn is_desktop_wire_path(path: &str) -> bool {
 ///
 /// They are pulled in explicitly so the desktop can type those fields against
 /// the shapes the server actually stores and serves.
+#[cfg(feature = "enterprise")]
 const DESKTOP_WIRE_EXTRA_SCHEMAS: &[&str] = &["ParsedStepTree", "OrgFingerprint"];
 
 /// The scoped OpenAPI document the desktop's generated TypeScript wire types
@@ -330,15 +330,17 @@ const DESKTOP_WIRE_EXTRA_SCHEMAS: &[&str] = &["ParsedStepTree", "OrgFingerprint"
 ///
 /// * The full spec differs between the open and enterprise editions (meloD,
 ///   notebooks, cases…), so a committed copy of it could never be asserted
-///   from both test matrices. The hunts surface is registered ungated and its
-///   playbook models live in `nanosiem-core`, so this seam is identical in both —
-///   which is what lets the drift test run under either feature set.
+///   from both test matrices. The hunts surface ships only in the enterprise
+///   edition (its tables live in the enterprise migration overlay), so this
+///   spec, its export (`export_openapi --desktop-wire`) and its drift test are
+///   enterprise-only; CI runs `openapi::tests` under `--features enterprise`.
 /// * The committed `docs/api/openapi.json` is refreshed on a different cadence
 ///   and for a different consumer (the docs RAG); coupling the desktop's
 ///   compile-time guarantee to it would make that refresh a breaking change.
 ///
 /// Paths and schemas are emitted through `BTreeMap` so the output is sorted
 /// and byte-stable regardless of `serde_json`'s `preserve_order` feature.
+#[cfg(feature = "enterprise")]
 pub fn desktop_wire_spec() -> serde_json::Value {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -860,14 +862,28 @@ mod tests {
         // NAN-4987 replaces the legacy offline-bundle licence import with four
         // C05 path templates: import, renew, recovery request and recovery apply.
         // `/api/license` already existed. Enterprise 655 + 4 = 659.
+        // NAN-5044 adds /api/settings/api-keys/owner-clamp (GET + PUT) to both
+        // editions; NAN-5114 adds the enterprise `/api/license/update` banner
+        // feed. Enterprise 659 + 1 + 1 = 661; open 481 + 1 = 482.
+        // NAN-5136 adds ENTERPRISE POST
+        // /api/settings/ai-providers/{provider}/discover-models (self-hosted
+        // model discovery). Enterprise 661 + 1 = 662.
         #[cfg(feature = "enterprise")]
-        let min_paths = 659;
+        let min_paths = 662;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 481;
+        // Open core excludes the hunts, playbooks and AI tuning surfaces along
+        // with their enterprise-only relations (481 -> 415), plus NAN-5044's
+        // owner-clamp path: 415 + 1 = 416.
+        let min_paths = 416;
 
         assert!(
             path_count >= min_paths,
             "Expected at least {min_paths} paths, got {path_count}"
+        );
+        #[cfg(feature = "enterprise")]
+        assert!(
+            !spec.paths.paths.contains_key("/api/airgap/license/import"),
+            "generic content-bundle keys must not be exposed as a licence authority"
         );
     }
 
@@ -959,6 +975,7 @@ mod tests {
     ///   2. `census` and `huntable_surface` are not required on a save. They are
     ///      the deterministic halves; the agent authors neither, and requiring
     ///      them is what made it shuttle them back through its own context.
+    #[cfg(feature = "enterprise")]
     #[test]
     fn verify_recon_surface_is_bounded_by_default_and_the_save_needs_no_echo() {
         let spec = serde_json::to_value(build_openapi()).expect("serialize OpenAPI");
@@ -1166,6 +1183,7 @@ mod tests {
     /// `verify_log_source_transport_ownership_contract` (NAN-2169) — the file
     /// is read at RUNTIME and only a genuinely absent file skips the
     /// comparison. Any other IO error stays loud.
+    #[cfg(feature = "enterprise")]
     #[test]
     fn verify_desktop_wire_spec_is_current() {
         let generated = desktop_wire_spec();

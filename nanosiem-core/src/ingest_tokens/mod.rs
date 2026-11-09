@@ -190,10 +190,7 @@ pub fn is_push_capable(source_type: &str) -> bool {
 /// published, no route claims it and the event lands in `logs` through the
 /// router's `generic` catch-all, still searchable as `source_type=<key>`.
 pub fn route_key(match_values: Option<&[String]>, name: &str) -> String {
-    match match_values {
-        Some([first, ..]) => first.clone(),
-        _ => crate::vector_naming::safe_name(name),
-    }
+    crate::vector_naming::claim_keys(match_values, name).swap_remove(0)
 }
 
 /// Audience of an OTLP identity assertion: only Vector's OTLP lane accepts it.

@@ -67,6 +67,7 @@ pub use nanosiem_api_lib::grant_authz;
 pub mod groups;
 pub mod health;
 // NAN-2238 Active Hunter: hunt definitions, runners, sweeps, leads, triage.
+#[cfg(feature = "enterprise")]
 pub mod hunts;
 pub mod identity;
 // Incidents handlers — lifted to nanosiem-enterprise in NAN-752 (Phase 2 of
@@ -120,9 +121,12 @@ pub mod observability_synthetics;
 pub use nanosiem_enterprise::handlers::oidc;
 pub mod onboarding;
 pub mod parser_repositories;
+#[cfg(feature = "enterprise")]
 pub mod playbook_repositories;
+#[cfg(feature = "enterprise")]
 pub mod playbooks;
 pub mod prevalence;
+pub mod principal_admission;
 pub mod query_library;
 pub mod recent_activity;
 pub mod reports;

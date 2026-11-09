@@ -1968,6 +1968,22 @@ export interface ProviderCredentials {
   validation_error?: string;
 }
 
+/** NAN-5136: list the models a provider's own endpoint serves. */
+export interface DiscoverModelsRequest {
+  /** Override the stored base URL (discover before saving). */
+  base_url?: string;
+  /** Override the stored key. Blank means none. */
+  api_key?: string;
+}
+
+export interface DiscoverModelsResponse {
+  /** Model ids exactly as the server names them (no provider prefix). */
+  models: string[];
+  /** `openai` (GET {base_url}/models) or `ollama` (GET /api/tags). */
+  source: 'openai' | 'ollama';
+  private_endpoints_allowed: boolean;
+}
+
 export interface UpdateProviderCredentialsRequest {
   /** Omit to keep the stored key; empty string removes it (NAN-2355). */
   api_key?: string;
@@ -3589,6 +3605,8 @@ export interface UpdateUserRequest {
   name?: string;
   password?: string;
   group_ids?: string[];
+  /** Also delete every API key the user owns (opt-in, NAN-5014). */
+  revoke_api_keys?: boolean;
 }
 
 // Group Management Types
@@ -3679,6 +3697,19 @@ export interface ApiKeySummary {
   rate_limit?: number;
   last_used_at?: string;
   created_at: string;
+  /** Owning user (typeid); null for a legacy ownerless key. */
+  created_by?: string | null;
+  /**
+   * Stored scopes the owner no longer holds (NAN-5044). Withheld at request
+   * time when the owner clamp is `enforce`; only reported in `audit` mode.
+   */
+  withheld_permissions?: string[];
+}
+
+export type ApiKeyOwnerClampMode = 'enforce' | 'audit';
+
+export interface ApiKeyOwnerClampSettings {
+  mode: ApiKeyOwnerClampMode;
 }
 
 export interface ApiKeyListResponse {
@@ -6024,6 +6055,12 @@ export interface DraftedParser {
   }>;
   /** Advisory findings from the post-compile draft checks, for review. */
   review_notes?: string[];
+  /**
+   * The agent's "Draft incomplete: …" verdict (NAN-5079): set when the draft
+   * does not compile or its sample outputs still fail OCSF validation.
+   * Absent means the agent reported success.
+   */
+  incomplete?: string | null;
 }
 
 // Legacy aliases (kept for backward compat with dashboard wizard)
@@ -6745,11 +6782,21 @@ export interface GdprAnonymizationListResponse {
 // Organization Tier Types
 // ============================================================================
 
-export type OrganizationTier = 'unrestricted' | 'hobby' | 'startup' | 'growth' | 'team' | 'starter' | 'pro' | 'enterprise';
+/** Compatibility names remain accepted as inputs during the v2 support window. */
+export type OrganizationTier = 'open' | 'licensed' | 'unrestricted' | 'hobby' | 'startup' | 'growth' | 'team' | 'starter' | 'pro' | 'enterprise';
+export type EntitlementEdition = 'open' | 'licensed';
+export type EntitlementOperator = 'self-run' | 'hosted';
 export type ApiAccessLevel = 'none' | 'readonly' | 'full';
 export type AiModelTier = 'economy' | 'standard' | 'full';
 
+export interface Entitlement {
+  edition: EntitlementEdition;
+  operator: EntitlementOperator;
+  capacity_gb_per_day: number | null;
+}
+
 export interface TierLimits {
+  entitlement: Entitlement;
   tier: OrganizationTier;
   max_data_sources: number | null;
   max_detection_rules: number | null;
@@ -6842,7 +6889,10 @@ export interface TierStatus {
 }
 
 export interface SetTierRequest {
-  tier: string;
+  tier?: string;
+  edition?: EntitlementEdition;
+  operator?: EntitlementOperator;
+  capacity_gb_per_day?: number;
 }
 
 export interface UpdateTierLimitsRequest {

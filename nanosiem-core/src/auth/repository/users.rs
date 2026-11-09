@@ -53,6 +53,52 @@ impl From<PasswordError> for UserRepositoryError {
     }
 }
 
+/// A security-relevant action an administrator applies to another principal
+/// (NAN-5027). See [`UserRepository::apply_principal_action_authorized`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrincipalAction {
+    Disable,
+    Enable,
+    Unlock,
+    Delete,
+    /// Clear every MFA field and revoke the target's tokens and sessions.
+    ResetMfa,
+}
+
+/// F-32 invariant, in ONE place: everything issued for `user_id` before now
+/// stops working.
+///
+/// - `tokens_valid_from = clock_timestamp()` — the auth middleware (api AND
+///   search) rejects every access token whose `iat` predates it, and
+///   `refresh_token` rejects every session created before it;
+/// - every session row is deleted (current AND grace refresh hash);
+/// - any outstanding password-reset token is cleared.
+///
+/// Runs on the CALLER's connection so it commits atomically with the
+/// credential / status mutation that triggered it. Keyed on the TARGET user —
+/// the acting administrator's own tokens and sessions are never touched.
+///
+/// Every path that changes a password, email, MFA enrolment or disables an
+/// account must call this; do not re-implement it inline.
+pub async fn revoke_credentials_in(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE users SET tokens_valid_from = clock_timestamp(), \
+         password_reset_token = NULL, password_reset_expires = NULL, updated_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// Reject a plaintext that does not satisfy the single authoritative policy
 /// (`PasswordRequirements::default()` plus `MAX_PASSWORD_BYTES`).
 ///
@@ -347,15 +393,32 @@ impl UserRepository {
         let email = request.email.as_ref().unwrap_or(&existing.email);
         let name = request.name.as_ref().unwrap_or(&existing.name);
         let status = request.status.as_ref().unwrap_or(&existing.status);
+        let break_glass = request
+            .local_login_break_glass
+            .unwrap_or(existing.local_login_break_glass);
+        // NAN-5027: withdrawing break-glass from an SSO-linked account drops its
+        // local password (local login is refused for it from now on anyway).
+        let drop_local_password =
+            existing.oidc_provider_id.is_some() && existing.local_login_break_glass && !break_glass;
+        let password_hash = if drop_local_password { None } else { password_hash };
+
+        // F-32 / NAN-5014: a password set, an email change (OIDC links an
+        // existing local account BY EMAIL, so the email is a credential) or a
+        // move out of `active` revokes everything already issued to the target.
+        let revoke = request.password.is_some()
+            || drop_local_password
+            || email != &existing.email
+            || (status != &existing.status && status != "active");
 
         // Rely on unique constraint for email uniqueness (race-condition safe)
-        sqlx::query_as::<_, User>(
+        let user = sqlx::query_as::<_, User>(
             r#"
             UPDATE users SET
                 email = $2,
                 name = $3,
                 status = $4,
                 password_hash = $5,
+                local_login_break_glass = $6,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -366,6 +429,7 @@ impl UserRepository {
         .bind(name)
         .bind(status)
         .bind(password_hash)
+        .bind(break_glass)
         .fetch_one(&mut *conn)
         .await
         .map_err(|e| {
@@ -376,13 +440,33 @@ impl UserRepository {
                 }
             }
             UserRepositoryError::DatabaseError(e)
-        })
+        })?;
+
+        if revoke {
+            revoke_credentials_in(conn, id).await?;
+        }
+        if request.revoke_api_keys == Some(true) {
+            sqlx::query("DELETE FROM api_keys WHERE created_by = $1")
+                .bind(id)
+                .execute(&mut *conn)
+                .await?;
+        }
+        Ok(user)
     }
 
     /// Delete a user
     pub async fn delete_user(&self, id: Uuid) -> Result<(), UserRepositoryError> {
         let mut tx = self.pool.begin().await?;
+        Self::delete_user_in(&mut tx, id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
 
+    /// Delete a user within a caller-provided transaction.
+    async fn delete_user_in(
+        tx: &mut sqlx::PgConnection,
+        id: Uuid,
+    ) -> Result<(), UserRepositoryError> {
         // Serialize assignment with deletion before touching any dependent
         // rows. A concurrent approval insert takes a foreign-key key-share lock
         // on this row: it either commits before this lock (and is withdrawn
@@ -395,7 +479,6 @@ impl UserRepository {
                 .fetch_optional(&mut *tx)
                 .await?;
         if locked.is_none() {
-            tx.rollback().await?;
             return Err(UserRepositoryError::NotFound(id));
         }
 
@@ -418,10 +501,14 @@ impl UserRepository {
         //
         // Keep this repository usable against minimal/auth-only schemas used by
         // tests and tooling, where the enterprise playbook tables may not exist.
+        // The open edition has no playbook tables at all, so it compiles no
+        // statement naming them.
+        #[cfg(feature = "enterprise")]
         let approvals_exist: bool =
             sqlx::query_scalar("SELECT to_regclass('public.playbook_approvals') IS NOT NULL")
                 .fetch_one(&mut *tx)
                 .await?;
+        #[cfg(feature = "enterprise")]
         if approvals_exist {
             sqlx::query(
                 r#"UPDATE playbook_approvals
@@ -446,6 +533,71 @@ impl UserRepository {
 
         debug_assert_eq!(result.rows_affected(), 1);
 
+        Ok(())
+    }
+
+    /// NAN-5027: apply a security-relevant action to ANOTHER principal only
+    /// while the privilege-grant generation validated by
+    /// `ensure_can_manage_principal` is still current. Every user, group, role
+    /// and api-key change bumps that generation (migration 272), so a target
+    /// promoted between the check and this write is refused
+    /// ([`UserRepositoryError::GrantAuthorityChanged`] → 409), never mutated.
+    pub async fn apply_principal_action_authorized(
+        &self,
+        id: Uuid,
+        action: PrincipalAction,
+        stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<(), UserRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+            return Err(UserRepositoryError::GrantAuthorityChanged);
+        }
+        match action {
+            PrincipalAction::Delete => Self::delete_user_in(&mut tx, id).await?,
+            PrincipalAction::Disable | PrincipalAction::Enable | PrincipalAction::Unlock => {
+                let sql = match action {
+                    PrincipalAction::Disable => {
+                        "UPDATE users SET status = 'disabled', updated_at = NOW() WHERE id = $1"
+                    }
+                    PrincipalAction::Enable => {
+                        "UPDATE users SET status = 'active', updated_at = NOW() WHERE id = $1"
+                    }
+                    _ => {
+                        "UPDATE users SET status = 'active', locked_until = NULL, \
+                         failed_login_attempts = 0, updated_at = NOW() WHERE id = $1"
+                    }
+                };
+                let result = sqlx::query(sql).bind(id).execute(&mut *tx).await?;
+                if result.rows_affected() == 0 {
+                    return Err(UserRepositoryError::NotFound(id));
+                }
+                if action == PrincipalAction::Disable {
+                    revoke_credentials_in(&mut tx, id).await?;
+                }
+            }
+            PrincipalAction::ResetMfa => {
+                let result = sqlx::query(
+                    r#"
+                    UPDATE users SET
+                        mfa_enabled = FALSE,
+                        totp_secret_encrypted = NULL,
+                        totp_secret_nonce = NULL,
+                        backup_codes_encrypted = NULL,
+                        backup_codes_nonce = NULL,
+                        mfa_setup_pending = FALSE,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+                if result.rows_affected() == 0 {
+                    return Err(UserRepositoryError::NotFound(id));
+                }
+                revoke_credentials_in(&mut tx, id).await?;
+            }
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -536,6 +688,10 @@ impl UserRepository {
 
     /// Set password reset token
     /// Requirements: 1.7
+    ///
+    /// NAN-5048: only the SHA-256 digest (`hash_token`) is stored, exactly like
+    /// refresh tokens, so a reader of the `users` table (SQL read primitive,
+    /// leaked backup) cannot redeem a pending reset. Callers pass the plaintext.
     pub async fn set_password_reset_token(
         &self,
         id: Uuid,
@@ -552,7 +708,7 @@ impl UserRepository {
             "#,
         )
         .bind(id)
-        .bind(token)
+        .bind(crate::auth::service::hash_token(token))
         .bind(expires_at)
         .execute(&self.pool)
         .await?;
@@ -566,8 +722,9 @@ impl UserRepository {
 
     /// Get user by password reset token
     pub async fn get_user_by_reset_token(&self, token: &str) -> Result<User, UserRepositoryError> {
+        // NAN-5048: look up by digest; a stored value can never be replayed.
         let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE password_reset_token = $1")
-            .bind(token)
+            .bind(crate::auth::service::hash_token(token))
             .fetch_optional(&self.pool)
             .await?
             .ok_or(UserRepositoryError::InvalidResetToken)?;
@@ -592,6 +749,9 @@ impl UserRepository {
     ) -> Result<(), UserRepositoryError> {
         let password_hash = validate_and_hash_password(new_password).await?;
 
+        // F-32 / NAN-5014: the hash write and the revocation commit together,
+        // so no refresh can slip in between and mint a post-change token.
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"
             UPDATE users SET
@@ -604,13 +764,15 @@ impl UserRepository {
         )
         .bind(id)
         .bind(password_hash)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
             return Err(UserRepositoryError::NotFound(id));
         }
 
+        revoke_credentials_in(&mut tx, id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -712,18 +874,22 @@ impl UserRepository {
     /// predates this watermark. Flipping `status` alone left outstanding JWTs
     /// working until natural expiry (default 900s).
     pub async fn disable_user(&self, id: Uuid) -> Result<(), UserRepositoryError> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE users SET status = 'disabled', tokens_valid_from = NOW(), updated_at = NOW() \
-             WHERE id = $1",
+            "UPDATE users SET status = 'disabled', updated_at = NOW() WHERE id = $1",
         )
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
             return Err(UserRepositoryError::NotFound(id));
         }
 
+        // NAN-5014: watermark + session delete in the SAME transaction (was a
+        // best-effort second call from the handler).
+        revoke_credentials_in(&mut tx, id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -958,6 +1124,20 @@ impl UserRepository {
             return Err(UserRepositoryError::NotFound(user_id));
         }
         Ok(())
+    }
+
+    /// The user's forced-revocation watermark (`tokens_valid_from`), if any.
+    pub async fn tokens_valid_from(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<DateTime<Utc>>, UserRepositoryError> {
+        Ok(sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT tokens_valid_from FROM users WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
     }
 
     /// Set MFA setup pending flag (for admin-enforced enrollment)

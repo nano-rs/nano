@@ -77,7 +77,7 @@ pub async fn get_cloud_dossier(
 
     // NAN-1593: the cloud principal dossier fires on every load / shared-link
     // follow and runs many parallel ClickHouse aggregates — cache it through
-    // the same Dragonfly layer. Every narrowing facet vec is applied to each
+    // the same Valkey layer. Every narrowing facet vec is applied to each
     // subquery, so they all change the result and MUST be part of the key
     // alongside the principal / account / provider scope, the time range, and
     // the caller's effective source scope.

@@ -196,6 +196,23 @@ fn convert_strftime_to_clickhouse(format: &str) -> String {
     result
 }
 
+/// A strftime-style format argument rendered as a ClickHouse string literal:
+/// the RAW AST literal, converted to ClickHouse `formatDateTime` codes, then
+/// escaped with [`crate::sql_hygiene::string_literal`]. Returns `None` when the
+/// argument is not a string literal (the caller rejects it).
+///
+/// Byte-identical to the old strip-and-rewrap output for every literal:
+/// conversion only rewrites `%X` pairs (unknown pairs pass through), and
+/// escaping only touches `\` and `'`, so the two steps commute.
+fn strftime_format_literal_sql(arg: &EvalExpression) -> Option<String> {
+    match arg {
+        EvalExpression::Literal(Value::String(raw)) => Some(crate::sql_hygiene::string_literal(
+            &convert_strftime_to_clickhouse(raw),
+        )),
+        _ => None,
+    }
+}
+
 // Helper function to get field SQL expression
 fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (String, bool) {
     super::field_to_sql_expr(field, gen)
@@ -540,7 +557,7 @@ fn eval_expression_to_sql_inner_unguarded(
             }
         }
         EvalExpression::Literal(value) => Ok(match value {
-            Value::String(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")),
+            Value::String(s) => crate::sql_hygiene::string_literal(s),
             Value::Number(n) => n.to_string(),
             Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
             Value::Ip(ip) => format!("'{}'", ip),
@@ -808,6 +825,7 @@ fn like_sql(value: &str, pattern: &str) -> String {
 /// string literal as `escape_string` renders it (`\` escapes, `''` allowed),
 /// else `None` (a column, a function call, a concatenation, …).
 fn sql_string_literal_body(sql: &str) -> Option<&str> {
+    // sql-lint: allow(the body is grammar-checked below and only reused as an already-escaped literal body)
     let body = sql.strip_prefix('\'')?.strip_suffix('\'')?;
     let mut chars = body.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1282,11 +1300,15 @@ fn eval_function_to_sql(
                     "strftime() requires 2 arguments (timestamp, format)".into(),
                 ));
             }
-            // Convert strftime format codes to ClickHouse formatDateTime codes
-            // arg_sqls[1] is the format string (with quotes)
-            let format_str = arg_sqls[1].trim_matches('\'');
-            let ch_format = convert_strftime_to_clickhouse(format_str);
-            Ok(format!("formatDateTime({}, '{}')", arg_sqls[0], ch_format))
+            // Security review 2026-11-08 (NAN-5010): read the RAW format literal
+            // from the AST and escape it; never strip quotes off lowered SQL and
+            // re-wrap it. ClickHouse needs a constant format anyway.
+            let format_sql = strftime_format_literal_sql(&args[1]).ok_or_else(|| {
+                SqlGenError::InvalidQuery(
+                    "strftime() format (2nd argument) must be a string literal".into(),
+                )
+            })?;
+            Ok(format!("formatDateTime({}, {})", arg_sqls[0], format_sql))
         }
         "relative_time" | "relativetime" => {
             if arg_sqls.len() != 2 {
@@ -1368,6 +1390,7 @@ fn eval_function_to_sql(
                 ));
             }
             // The unit is the first arg, clean it up (remove quotes if present)
+            // sql-lint: allow(the unit is matched against a fixed allowlist and never emitted)
             let unit = arg_sqls[0].trim_matches('\'').to_lowercase();
             let ts = &arg_sqls[1];
             match unit.as_str() {
@@ -1539,23 +1562,17 @@ fn eval_function_to_sql(
                 // dates — NAN-1144). args[1] must be a string literal so we can statically
                 // translate strftime codes to ClickHouse codes via the shared helper.
                 // Read the RAW literal from `args` (arg_sqls[1] is the already-quoted SQL form).
-                let format_str = match &args[1] {
-                    EvalExpression::Literal(Value::String(s)) => s,
-                    _ => {
-                        return Err(SqlGenError::InvalidQuery(
-                            "to_date() format (2nd argument) must be a string literal".into(),
-                        ))
-                    }
-                };
-                let ch_format = convert_strftime_to_clickhouse(format_str);
-                // Escape exactly as a SQL string literal (mirrors Literal(Value::String) lowering).
-                let escaped_format = ch_format.replace('\\', "\\\\").replace('\'', "''");
+                let format_sql = strftime_format_literal_sql(&args[1]).ok_or_else(|| {
+                    SqlGenError::InvalidQuery(
+                        "to_date() format (2nd argument) must be a string literal".into(),
+                    )
+                })?;
                 // parseDateTimeOrNull honors the explicit format and returns NULL on rows that
                 // don't match (no whole-query failure); wrap in toDate so the 2-arg form returns
                 // a Date like the 1-arg form. Result type is Nullable(Date).
                 Ok(format!(
-                    "toDate(parseDateTimeOrNull({}, '{}'))",
-                    arg_sqls[0], escaped_format
+                    "toDate(parseDateTimeOrNull({}, {}))",
+                    arg_sqls[0], format_sql
                 ))
             }
             _ => Err(SqlGenError::InvalidQuery(
@@ -1713,12 +1730,17 @@ fn eval_function_to_sql(
             // but migrating users routinely conflate the two; honor an strftime-style
             // format (contains `%`) by delegating to the strftime path. This is a
             // strict superset of Splunk behavior (Splunk would return the raw value).
-            match arg_sqls.get(1) {
-                Some(fmt_sql) if fmt_sql.trim_matches('\'').contains('%') => {
-                    let ch_format = convert_strftime_to_clickhouse(fmt_sql.trim_matches('\''));
-                    Ok(format!("formatDateTime({}, '{}')", arg, ch_format))
+            // Security review 2026-11-08 (NAN-5010): only a string LITERAL that
+            // contains `%` takes the strftime path, built from the raw literal.
+            let strftime_format = match args.get(1) {
+                Some(fmt @ EvalExpression::Literal(Value::String(raw))) if raw.contains('%') => {
+                    strftime_format_literal_sql(fmt)
                 }
-                _ => Ok(format!("toString({})", arg)),
+                _ => None,
+            };
+            match strftime_format {
+                Some(format_sql) => Ok(format!("formatDateTime({}, {})", arg, format_sql)),
+                None => Ok(format!("toString({})", arg)),
             }
         }
         "toint" | "to_int" => {

@@ -35,7 +35,10 @@ use nanosiem_core::log_sources::{
     ParserTestResult,
     UpdateLogSource, VrlDiagnostic, VrlValidationResult,
 };
+use nanosiem_core::principal_gate::PrincipalGate;
 use nanosiem_core::typeid::TypeIdParam;
+use super::principal_admission::{principal_key, refused, run_admitted};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use utoipa::{IntoParams, ToSchema};
 
@@ -632,7 +635,9 @@ pub struct TestVrlRequest {
     request_body = TestVrlRequest,
     responses(
         (status = 200, description = "VRL test result", body = ParserTestResult),
+        (status = 400, description = "Sample larger than the per-event limit"),
         (status = 403, description = "Forbidden"),
+        (status = 429, description = "Too many parser tests running for this caller or server; retry after Retry-After"),
     ),
     security(("api_key" = []))
 )]
@@ -640,17 +645,24 @@ pub async fn test_vrl(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<TestVrlRequest>,
-) -> Result<Json<ParserTestResult>, ApiError> {
-    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
+) -> Result<Json<ParserTestResult>, Response> {
+    ensure_permission(&auth, LOG_SOURCES_VIEW).map_err(IntoResponse::into_response)?;
+    check_test_sample(&request.sample_log).map_err(IntoResponse::into_response)?;
+    let permit = parser_test_gate()
+        .try_acquire(&principal_key(&auth))
+        .map_err(refused)?;
 
-    let result = state
-        .log_source_service
-        .test_vrl_chain(
-            &request.vrl_code,
-            request.extension_vrl.as_deref(),
-            &request.sample_log,
-        )
-        .await;
+    let service = state.log_source_service.clone();
+    let result = run_admitted(permit, async move {
+        service
+            .test_vrl_chain(
+                &request.vrl_code,
+                request.extension_vrl.as_deref(),
+                &request.sample_log,
+            )
+            .await
+    })
+    .await?;
     Ok(Json(result))
 }
 
@@ -675,6 +687,7 @@ pub struct TestVrlLiveRequest {
     responses(
         (status = 200, description = "VRL test results comparing current vs new parse", body = Vec<LiveTestResult>),
         (status = 403, description = "Missing log_sources:view or search:execute permission"),
+        (status = 429, description = "Too many parser tests running for this caller or server; retry after Retry-After"),
     ),
     security(("api_key" = []))
 )]
@@ -682,8 +695,17 @@ pub async fn test_vrl_live(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<TestVrlLiveRequest>,
-) -> Result<Json<Vec<LiveTestResult>>, ApiError> {
-    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
+) -> Result<Json<Vec<LiveTestResult>>, Response> {
+    test_vrl_live_inner(state, auth, request).await
+}
+
+async fn test_vrl_live_inner(
+    state: AppState,
+    auth: AuthContext,
+    request: TestVrlLiveRequest,
+) -> Result<Json<Vec<LiveTestResult>>, Response> {
+    let api = |e: ApiError| e.into_response();
+    ensure_permission(&auth, LOG_SOURCES_VIEW).map_err(api)?;
 
     // NAN-2058: this returns UNREDACTED raw events in `LiveTestResult.input`,
     // for any caller-supplied `source_type`. It is an alternate raw-log read
@@ -697,21 +719,76 @@ pub async fn test_vrl_live(
     // a "strongly consider", but parity with canonical search is the principled
     // line, and ReadOnly analysts legitimately use the test lab. The disclosure
     // is now exactly what `/api/search` would give the same caller.
-    ensure_permission(&auth, nanosiem_core::auth::permissions::SEARCH_EXECUTE)?;
+    ensure_permission(&auth, nanosiem_core::auth::permissions::SEARCH_EXECUTE).map_err(api)?;
+    let permit = parser_test_gate()
+        .try_acquire(&principal_key(&auth))
+        .map_err(refused)?;
 
     let limit = request.limit.unwrap_or(10);
-    let results = state
-        .log_source_service
-        .test_vrl_live(
-            &request.vrl_code,
-            request.current_vrl.as_deref(),
-            &request.source_type,
-            limit,
-            &auth.effective_viewer_scope(),
-        )
-        .await
-        .map_err(|e| ApiError::InternalError(format!("Live test failed: {}", e)))?;
+    let service = state.log_source_service.clone();
+    let scope = auth.effective_viewer_scope();
+    let results = run_admitted(permit, async move {
+        service
+            .test_vrl_live(
+                &request.vrl_code,
+                request.current_vrl.as_deref(),
+                &request.source_type,
+                limit,
+                &scope,
+            )
+            .await
+    })
+    .await?
+    .map_err(|e| api(ApiError::InternalError(format!("Live test failed: {}", e))))?;
     Ok(Json(results))
+}
+
+/// Retry-After for a refused parser test. Each test is bounded to a few
+/// seconds (`exec_bounds::TEST_EXECUTION_BUDGET`).
+const PARSER_TEST_RETRY_AFTER_SECS: u64 = 1;
+
+/// Parser-test admission sizing: `(per_principal, global)`.
+///
+/// The global ceiling is at least 16 and twice the CPU count, and one
+/// principal may hold at most a quarter of it (at least 2), so a single caller
+/// can never lock everyone else out, even on a 2-CPU compose replica
+/// (16 global / 4 per principal). The Parser Test Lab runs 4 at a time and
+/// retries a 429 after `Retry-After`.
+pub fn parser_test_gate_sizing(cpus: usize) -> (usize, usize) {
+    let global = (cpus.saturating_mul(2)).max(16);
+    ((global / 4).max(2), global)
+}
+
+/// Security review 2026-11-08 (NAN-5040): parser tests execute tenant VRL.
+/// Execution is time-bounded and off the tokio workers; this gate also caps
+/// how many run at once, per principal (never per source address) and per
+/// replica.
+fn parser_test_gate() -> &'static PrincipalGate {
+    static GATE: std::sync::OnceLock<PrincipalGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let (per_principal, global) = parser_test_gate_sizing(cpus);
+        PrincipalGate::new(
+            "Parser test",
+            per_principal,
+            global,
+            PARSER_TEST_RETRY_AFTER_SECS,
+        )
+    })
+}
+
+/// Largest raw `sample_log` accepted by test-vrl. Real events are tens of KiB.
+pub const MAX_TEST_SAMPLE_BYTES: usize = 1024 * 1024;
+
+/// Reject an oversized test sample with a 400 before any work is done.
+fn check_test_sample(sample: &str) -> Result<(), ApiError> {
+    if sample.len() > MAX_TEST_SAMPLE_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "sample_log is {} bytes; a parser test accepts at most {MAX_TEST_SAMPLE_BYTES} bytes",
+            sample.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Deploy all enabled log sources

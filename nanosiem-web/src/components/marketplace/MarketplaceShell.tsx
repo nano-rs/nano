@@ -150,7 +150,7 @@ export function MarketplacePageShell<Filter extends string>({
       {statsStrip}
 
       {/* Coverage hero — fetched independently from catalog/repos. The
-          server returns a 6h effective-scope-partitioned Dragonfly cache
+          server returns a 6h effective-scope-partitioned Valkey cache
           hit, so the typical load is sub-millisecond; the manual-refresh
           button invalidates only the caller's partition. Skeleton renders
           while the first fetch is in flight so the catalog grid is unblocked. */}

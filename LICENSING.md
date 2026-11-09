@@ -22,7 +22,7 @@ AGPL-3.0-or-later via the [contributor license agreement](./.github/ICLA.md).
 
 ## What's proprietary
 
-Two paths in this repository contain proprietary code owned by Nano LLC.
+Two paths in this repository contain proprietary code owned by nano, LLC.
 They are **not** licensed under AGPL-3.0. They are conditionally compiled —
 only included in the enterprise build (`cargo build --features enterprise`,
 `VITE_EDITION=enterprise`):
@@ -50,7 +50,7 @@ license is available. Contact <hello@nano.rs>.
 ## Contributions
 
 Community contributions are accepted under the AGPL portions only. The CLA
-([`.github/ICLA.md`](./.github/ICLA.md)) grants Nano LLC the right to
+([`.github/ICLA.md`](./.github/ICLA.md)) grants nano, LLC the right to
 sublicense your contribution under the proprietary terms used by the
 enterprise build. We commit not to relicense the AGPL portions away from
 AGPL-3.0-or-later (or successor at least as permissive). See the CLA for

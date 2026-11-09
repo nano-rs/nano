@@ -38,7 +38,7 @@ use uuid::Uuid;
 use crate::auth::ScopeSet;
 use crate::db::repository::SourceScopeRepository;
 use crate::models::{NewNotification, NotificationType};
-use crate::query::{parse_query, PrettyPrint, Query};
+use crate::query::{parse_query, Command, PrettyPrint, Query};
 use crate::scheduler::{calculate_next_run, calculate_next_runs, validate_cron};
 use crate::search::query_processing::enforce_non_audit_query;
 use crate::shutdown::ShutdownToken;
@@ -315,10 +315,15 @@ impl ReportService {
         Ok(self.repository.list_definitions(owner_id).await?)
     }
 
+    /// `restricted_editor` is the authenticated caller when that caller is
+    /// source-RESTRICTED (`None` for an unrestricted caller). A query change by
+    /// a restricted non-owner is recorded (NAN-5039) so later runs execute
+    /// under the union of both principals' deny sets.
     pub async fn update_definition(
         &self,
         id: Uuid,
         update: UpdateReportDefinition,
+        restricted_editor: Option<Uuid>,
     ) -> Result<ReportDefinition, ReportError> {
         // Query edits mirror validate_source: only a search report has a query,
         // and it can never be blanked — an empty query would make every future
@@ -350,7 +355,7 @@ impl ReportService {
             None
         };
         self.repository
-            .update_definition(id, &update, next_run_at)
+            .update_definition(id, &update, next_run_at, restricted_editor)
             .await
             .map_err(|e| match e {
                 ReportRepositoryError::DefinitionNotFound(id) => ReportError::NotFound(id),
@@ -668,16 +673,38 @@ impl ReportService {
     /// FAIL-CLOSED: any resolution error surfaces as a run-failing
     /// [`ReportError::Execution`] — never an unrestricted fallback. The error
     /// message is what analysts see on the failed run, so keep it legible.
+    /// The execution scope of a report run: the owner's deny set, UNIONED with
+    /// the deny set of the last non-owner who changed the query (NAN-5039).
+    ///
+    /// Without the union, a scoped admin who may edit any report could rewrite
+    /// another user's query and have it run under the owner's wider scope.
+    /// Either resolution failing fails the run closed.
     async fn owner_scope(&self, def: &ReportDefinition) -> Result<ScopeSet, ReportError> {
-        let denied = SourceScopeRepository::new(self.pool.clone())
+        let repo = SourceScopeRepository::new(self.pool.clone());
+        let fail = |who: &str, e: &dyn std::fmt::Display| {
+            ReportError::Execution(format!(
+                "could not resolve the report {who}'s source access ({e}); \
+                 failing closed — the report was not run"
+            ))
+        };
+        let mut denied = repo
             .denied_for_user(def.owner_id)
             .await
-            .map_err(|e| {
-                ReportError::Execution(format!(
-                    "could not resolve the report owner's source access ({e}); \
-                     failing closed — the report was not run"
-                ))
-            })?;
+            .map_err(|e| fail("owner", &e))?;
+        let editor: Option<Uuid> =
+            sqlx::query_scalar("SELECT query_edited_by FROM report_definitions WHERE id = $1")
+                .bind(def.id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| fail("query editor", &e))?
+                .flatten();
+        if let Some(editor) = editor.filter(|e| *e != def.owner_id) {
+            denied.extend(
+                repo.denied_for_user(editor)
+                    .await
+                    .map_err(|e| fail("query editor", &e))?,
+            );
+        }
         let deny: BTreeSet<String> = denied
             .into_iter()
             .map(|s| s.trim().to_lowercase())
@@ -711,15 +738,14 @@ impl ReportService {
     /// F-31: derive `(source_types, complete)` for ONE rendered result set.
     ///
     /// - No rows → `({}, true)`: an empty artifact has nothing to protect.
-    /// - Every row carries a non-empty `source_type` → the row-derived DISTINCT
-    ///   set, `complete = true` (raw / grouped-raw / vendor pass-through).
-    /// - Some/all rows LACK `source_type` (aggregates, `table`/`fields`
-    ///   projections that dropped the column, SQL panels) → run the OWNER-scoped
-    ///   companion `<base search> | stats count by source_type` to recover the
-    ///   window's true source types. A trustworthy non-empty companion result →
-    ///   `(row ∪ companion, true)`. If the query is not companionable (no nPL
-    ///   base / SQL panel) or the companion fails/empties → `(row-derived, false)`
-    ///   so the download gate denies every restricted requester.
+    /// - Otherwise (NAN-5039) run one OWNER-scoped companion
+    ///   `<scan> | stats count by source_type` for EVERY scan in the query
+    ///   ([`report_companion_queries`]) and return `(rows ∪ companions, true)`.
+    ///   Row values alone never prove completeness: they are writable by the
+    ///   query itself. A scan no companion can express, a non-nPL result set, or
+    ///   a failed/untrustworthy companion → `(…, false)`, so the download gate
+    ///   denies every restricted requester. Over-approximation (a later `where`
+    ///   dropping rows) is fail-closed.
     ///
     /// `companion_query` is the ORIGINAL nPL base (not audit-stripped); `None`
     /// for non-nPL (SQL) result sets, which are never companionable.
@@ -735,65 +761,61 @@ impl ReportService {
             return (BTreeSet::new(), true);
         }
 
-        let lacks_source_type = |event: &Value| {
-            event
-                .get("source_type")
-                .and_then(|v| v.as_str())
-                .map_or(true, |s| s.trim().is_empty())
-        };
-        // Derive DIRECTLY over the slice — never clone up to REPORT_RESULT_ROW_CAP
-        // (50k) rows just to read their source_type values.
+        // Row values are an ADDITION to the manifest, never its proof: nPL can
+        // overwrite `source_type` (`eval source_type="syslog"`, `rename`, a
+        // stats alias), and raw SQL can project any literal under that name.
+        // Treating "every row carries a source_type" as complete let a forged
+        // column pass the download gate (NAN-5039). Derived over the slice so
+        // up to REPORT_RESULT_ROW_CAP rows are never cloned.
         let direct = distinct_source_types_over(rows);
 
-        // Fast path: every row already carries a per-event source_type.
-        if !rows.iter().any(lacks_source_type) {
-            return (direct, true);
-        }
-
-        // Rows dropped source_type — recover it via the owner-scoped companion.
-        let base = match companion_query.and_then(|q| report_companion_query(q)) {
-            Some(base) => base,
+        // The manifest comes from the PLAN: one owner-scoped companion per scan
+        // in the query. A query with a scan no companion can express (lateral,
+        // asset/cloud/retro pivots, subsearch filters) or a non-nPL result set
+        // is incomplete, so the gate denies every restricted requester.
+        let bases = match companion_query.and_then(report_companion_queries) {
+            Some(bases) => bases,
             None => return (direct, false),
         };
-        // Audit-strip the companion exactly as the main query is stripped; a
-        // strip error means we can't trust it → incomplete.
-        let safe = match enforce_non_audit_query(&base) {
-            Ok(q) => q,
-            Err(_) => return (direct, false),
-        };
-        let req = SearchRequest {
-            query: safe,
-            time_range: TimeRangeInput::new(start, end),
-            limit: Some(REPORT_PANEL_ROW_CAP),
-            offset: None,
-            include_sql: Some(false),
-            skip_histogram: true,
-            skip_field_stats: true,
-            use_cache: false,
-            table_view: false,
-            request_id: None,
-            async_mode: false,
-            priority: None,
-            dataset: None,
-        };
-        match self.search_service.search(req, scope).await {
-            Ok(resp) => {
-                // NAN-2155: one classification, whose precedence rules live (and
-                // are tested) in `companion_provenance`. `trustworthy` false =>
-                // the window was not fully attributed, so the manifest is
-                // incomplete and the download gate denies every restricted
-                // requester — even if some groups DID name real sources
-                // (codex round 7).
-                let (companion_types, trustworthy) = companion_provenance(&resp.results);
-                if !trustworthy {
-                    return (direct, false);
+        let mut union = direct;
+        for base in bases {
+            // Audit-strip the companion exactly as the main query is stripped; a
+            // strip error means we can't trust it → incomplete.
+            let safe = match enforce_non_audit_query(&base) {
+                Ok(q) => q,
+                Err(_) => return (union, false),
+            };
+            let req = SearchRequest {
+                query: safe,
+                time_range: TimeRangeInput::new(start, end),
+                limit: Some(REPORT_PANEL_ROW_CAP),
+                offset: None,
+                include_sql: Some(false),
+                skip_histogram: true,
+                skip_field_stats: true,
+                use_cache: false,
+                table_view: false,
+                request_id: None,
+                async_mode: false,
+                priority: None,
+                dataset: None,
+            };
+            match self.search_service.search(req, scope).await {
+                Ok(resp) => {
+                    // NAN-2155: one classification, whose precedence rules live
+                    // (and are tested) in `companion_provenance`. `trustworthy`
+                    // false => the window was not fully attributed, so the
+                    // manifest is incomplete (codex round 7).
+                    let (companion_types, trustworthy) = companion_provenance(&resp.results);
+                    if !trustworthy {
+                        return (union, false);
+                    }
+                    union.extend(companion_types);
                 }
-                let mut union = direct;
-                union.extend(companion_types);
-                (union, true)
+                Err(_) => return (union, false),
             }
-            Err(_) => (direct, false),
         }
+        (union, true)
     }
 
     async fn produce(
@@ -1416,26 +1438,56 @@ pub(crate) fn companion_provenance(rows: &[Value]) -> (BTreeSet<String>, bool) {
     (types, true)
 }
 
-/// F-31: derive the companion query that lists the DISTINCT `source_type`
-/// values feeding an nPL query's BASE search over a window — mirrors the
-/// detection engine's `source_type_companion_query` (NAN-1800). Aggregate /
-/// projection commands collapse or drop the per-row `source_type`, so the base
-/// search is re-run piped into `stats count by source_type`. Dropping the
-/// intermediate commands is deliberately OVER-inclusive (pre-aggregation filters
-/// could only narrow the set) — over-stamping hides the artifact from MORE
-/// scoped viewers, never fewer (the fail-closed direction). `None` when the
-/// query cannot be parsed.
-fn report_companion_query(query: &str) -> Option<String> {
-    let parsed = parse_query(query).ok()?;
-    let mut node: &Query = &parsed;
-    loop {
+/// NAN-5039: the companion `<scan> | stats count by source_type` for EVERY
+/// scan in `query` — the leading search and each `join` / `append`
+/// subsearch — or `None` when any scan cannot be expressed that way, which
+/// makes the manifest incomplete (fail closed):
+///
+/// - an `IN [ subsearch ]` filter or a subsearch inside `where` / `transaction`
+///   / `sequence` / `funnel` (the companion would have to reproduce the
+///   subsearch's own filtering);
+/// - commands that run their OWN scans of the log table rather than
+///   transforming the piped rows: `lateral`, `asset`, `cloud`, `retro`,
+///   `baseline`, `tree`, `resolve_identity`, `risk`, and the OTLP page
+///   commands.
+pub(crate) fn report_companion_queries(query: &str) -> Option<Vec<String>> {
+    fn collect(node: &Query, out: &mut Vec<String>) -> Option<()> {
         match node {
-            Query::Piped { source, .. } => node = source,
             Query::Search(expr) => {
-                return Some(format!("{} | stats count by source_type", expr.pretty_print()));
+                if crate::search::query_processing::query_manipulation::search_expr_has_subsearch(expr) {
+                    return None;
+                }
+                out.push(format!("{} | stats count by source_type", expr.pretty_print()));
+                Some(())
+            }
+            Query::Piped { source, command } => {
+                collect(source, out)?;
+                match command {
+                    Command::Join { subsearch, .. } | Command::Append { subsearch, .. } => {
+                        collect(subsearch, out)
+                    }
+                    Command::Lateral { .. }
+                    | Command::Asset { .. }
+                    | Command::Cloud { .. }
+                    | Command::Retro { .. }
+                    | Command::Baseline { .. }
+                    | Command::Tree { .. }
+                    | Command::ResolveIdentity { .. }
+                    | Command::Risk { .. }
+                    | Command::Services
+                    | Command::Service { .. }
+                    | Command::Trace { .. }
+                    | Command::Metric { .. } => None,
+                    other if crate::search::query_processing::query_manipulation::command_has_subsearch(other) => None,
+                    _ => Some(()),
+                }
             }
         }
     }
+    let parsed = parse_query(query).ok()?;
+    let mut out = Vec::new();
+    collect(&parsed, &mut out)?;
+    Some(out)
 }
 
 /// Build a filesystem-safe artifact basename: `<slug>-<YYYYmmdd-HHMMSS>`.
@@ -1456,3 +1508,7 @@ fn artifact_basename(name: &str, at: DateTime<Utc>) -> String {
     let slug: String = slug.chars().take(60).collect();
     format!("{}-{}", slug, at.format("%Y%m%d-%H%M%S"))
 }
+
+#[cfg(test)]
+#[path = "manifest_plan_tests.rs"]
+mod manifest_plan_tests;

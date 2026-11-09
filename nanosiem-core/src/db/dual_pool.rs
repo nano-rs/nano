@@ -109,7 +109,9 @@ impl Default for DualPoolConfig {
             postgres_url: "postgres://localhost/nanosiem".to_string(),
             clickhouse_url: "http://localhost:8123".to_string(),
             clickhouse_database: "nanosiem".to_string(),
-            clickhouse_user: "default".to_string(),
+            // Never the passwordless `default` user: nano's users.d keeps it
+            // container-local, so a network client cannot log in as it.
+            clickhouse_user: "nanosiem".to_string(),
             clickhouse_password: String::new(),
             clickhouse_admin_user: None,
             clickhouse_admin_password: None,
@@ -1278,6 +1280,28 @@ impl DualPool {
         TableNames::new(self.is_clustered)
     }
 
+    /// Test-only pool that never connects. The PostgreSQL pool is lazy and
+    /// points at a closed port; the ClickHouse clients are unconfigured. Use it
+    /// for SQL-generation tests (`explain`, golden corpus) that must build a
+    /// real `SearchService` but never execute a query.
+    #[cfg(test)]
+    pub(crate) fn for_sql_generation_tests(is_clustered: bool) -> Self {
+        let postgres = PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("lazy pool never connects");
+        Self {
+            postgres,
+            clickhouse: ClickHouseClient::default(),
+            clickhouse_admin: ClickHouseClient::default(),
+            clickhouse_rawsql: ClickHouseClient::default(),
+            clickhouse_rawsql_noaudit: ClickHouseClient::default(),
+            is_clustered,
+            logs_table: if is_clustered { "logs_distributed" } else { "logs" },
+            server_memory_limit_bytes: 0,
+            query_memory_ceiling_bytes: None,
+        }
+    }
+
     /// Re-detect cluster state after migrations create distributed tables.
     /// Call this after `ensure_distributed_tables()` to pick up newly created tables.
     pub async fn refresh_cluster_state(&mut self, database: &str) {
@@ -1373,6 +1397,8 @@ mod tests {
         assert_eq!(config.postgres_url, "postgres://localhost/nanosiem");
         assert_eq!(config.clickhouse_url, "http://localhost:8123");
         assert_eq!(config.clickhouse_database, "nanosiem");
+        // Never the container-local passwordless `default` user.
+        assert_eq!(config.clickhouse_user, "nanosiem");
         assert_eq!(config.pg_max_connections, 20);
         assert_eq!(config.pg_min_connections, 2);
         assert_eq!(config.ch_max_connections, 10);
@@ -1521,6 +1547,20 @@ mod tests {
             !users_runtime.contains("GRANT REMOTE"),
             "users.d must not grant REMOTE to the runtime user"
         );
+        // Security review 2026-11-08: any CREATE TABLE grant implies CREATE
+        // TEMPORARY TABLE, which is what ClickHouse checks for `executable()`.
+        // The runtime user must not hold it (a bare `CREATE` includes it).
+        for grant in users_runtime.lines().filter(|l| l.contains("<query>")) {
+            assert!(
+                !grant.contains("CREATE TABLE")
+                    && !grant.contains("CREATE TEMPORARY TABLE")
+                    && !grant.contains(", CREATE,")
+                    && !grant.contains("GRANT CREATE ON")
+                    && !grant.contains("GRANT ALL"),
+                "users.d must not grant CREATE TABLE (implies CREATE TEMPORARY TABLE) \
+                 to the runtime user: {grant}"
+            );
+        }
 
         let (Some(generic), Some(aws), Some(rackspace)) = (
             enterprise_deploy_surface("deploy/k8s/clickhouse/clickhouse.yaml"),

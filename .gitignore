@@ -85,3 +85,6 @@ config/vector/dynamic/ingest-tokens/
 
 # NAN-4953: cross-process Vector config lock (nano-api <-> Vector entrypoint)
 .nano-config.lock
+
+# Per-checkout development secrets (scripts/start-microservices-dev.sh)
+.nano-dev-secrets

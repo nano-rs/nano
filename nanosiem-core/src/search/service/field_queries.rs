@@ -321,7 +321,7 @@ impl SearchService {
         info!(field = %field, "Executing field values query");
         debug!(
             "Field values SQL: {}",
-            &field_values_sql[..field_values_sql.len().min(200)]
+            crate::text_bounds::prefix_at_most(&field_values_sql, 200)
         );
 
         // Execute and return
@@ -478,7 +478,8 @@ impl SearchService {
             queue_wait_ms: None,
             fields,
             generated_sql: if request.include_sql.unwrap_or(false) {
-                Some(sql)
+                // NAN-5043: never echo the caller's deny list.
+                Some(crate::search::display_sql::DisplaySql::for_scope(sql, scope))
             } else {
                 None
             },

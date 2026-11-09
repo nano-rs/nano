@@ -74,11 +74,13 @@ impl MarketplaceRepository {
         mut entries: Vec<MarketplaceCatalogEntry>,
     ) -> Result<Vec<MarketplaceCatalogEntry>, MarketplaceError> {
         // --- Deno path: in-flight custom_enrichment_runs ---
+        #[cfg(feature = "enterprise")]
         let ce_ids: Vec<Uuid> = entries
             .iter()
             .filter_map(|e| e.custom_enrichment_id)
             .collect();
 
+        #[cfg(feature = "enterprise")]
         if !ce_ids.is_empty() {
             let running: Vec<(Uuid,)> = sqlx::query_as(
                 "SELECT DISTINCT enrichment_id FROM custom_enrichment_runs \
@@ -141,6 +143,7 @@ impl MarketplaceRepository {
         &self,
         mut entry: MarketplaceCatalogEntry,
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
+        #[cfg(feature = "enterprise")]
         if let Some(ce_id) = entry.custom_enrichment_id {
             // Deno path: in-flight custom_enrichment_runs.
             let exists: bool = sqlx::query_scalar(
@@ -151,7 +154,10 @@ impl MarketplaceRepository {
             .fetch_one(&self.pool)
             .await?;
             entry.is_syncing = exists;
-        } else if let Some(src_id) = entry.native_source_id.clone() {
+            return Ok(entry);
+        }
+
+        if let Some(src_id) = entry.native_source_id.clone() {
             // Native path: enrichment_sources.last_sync_status (NAN-1122).
             let source: Option<NativeSyncState> = sqlx::query_as(
                 "SELECT id, last_sync_status, last_sync_at, last_sync_error, record_count \

@@ -104,8 +104,8 @@ export function Marketplace() {
   // NAN-4948: nano's signed platform feed bundle (shared query with the panel).
   // Unavailable (no bundle support, or an error) leaves the cards untouched.
   const feedBundle = useQuery({ queryKey: PLATFORM_FEEDS_QUERY_KEY, queryFn: () => api.getPlatformFeeds(), enabled: hasPermission('enrichments:view'), staleTime: 60_000, retry: false, refetchOnWindowFocus: false });
-  const items = useMemo(() => applyFeedBundle(buildInventory(catalog.data?.entries ?? [], canListCustom ? customs.data ?? [] : [], repos, capabilities, connectorNames), feedBundle.data),
-    [catalog.data, customs.data, canListCustom, repos, capabilities, connectorNames, feedBundle.data]);
+  const items = useMemo(() => applyFeedBundle(buildInventory(catalog.data?.entries ?? [], canListCustom ? customs.data ?? [] : [], repos, capabilities, edition, connectorNames), feedBundle.data),
+    [catalog.data, customs.data, canListCustom, repos, capabilities, edition, connectorNames, feedBundle.data]);
   const refreshInventory = () => {
     void client.invalidateQueries({ queryKey: catalogKey });
     void client.invalidateQueries({ queryKey: ['custom-enrichments', user?.id] });
@@ -272,9 +272,11 @@ export function Marketplace() {
   const bundleManaged = !!selected?.provided_by_bundle;
   const keepsUninstall = !!selected?.installed && selected.entry?.execution_backend !== 'native';
   const drawerActions = selected ? {
-    onInstall: selected.source === 'catalog' && canConfigure && !airGap && !selected.provided_by_bundle ? () => startInstall(selected) : undefined,
+    // An entry whose backend this edition lacks (requirement) gets no Install /
+    // Configure: the server refuses it, so the buttons would be dead (NAN-5056).
+    onInstall: selected.source === 'catalog' && canConfigure && !airGap && !selected.provided_by_bundle && !selected.requirement ? () => startInstall(selected) : undefined,
     onToggle: canConfigure ? () => setConfirm({ item: selected, action: 'toggle' }) : undefined,
-    onConfigure: selected.source === 'catalog' && canConfigure && !bundleManaged ? () => openAuthor('connect', { tab: 'config' }) : undefined,
+    onConfigure: selected.source === 'catalog' && canConfigure && !bundleManaged && !selected.requirement ? () => openAuthor('connect', { tab: 'config' }) : undefined,
     onConnect: selected.source === 'catalog' && selected.category === 'collector' && canConfigure && !selected.requirement ? () => openAuthor('connect', { tab: 'connections' }) : undefined,
     onEdit: canAuthor && selected.source === 'custom_enrichment' ? () => openAuthor('edit') : undefined,
     onUninstall: selected.source === 'catalog' && canConfigure && (!bundleManaged || keepsUninstall) ? () => setConfirm({ item: selected, action: 'uninstall' }) : undefined,
@@ -330,7 +332,7 @@ export function Marketplace() {
       </Suspense>
       : selected && <Suspense fallback={<p role="status">Loading details…</p>}>
         <InventoryDrawer item={selected} onClose={() => select()} busy={busy}
-          entitlement={selected.requirement ? <InventoryEntitlement requirement={selected.requirement} edition={edition} /> : undefined}
+          entitlement={selected.requirement ? <InventoryEntitlement requirement={selected.requirement} edition={edition} canManageLicence={hasPermission('settings:system')} /> : undefined}
           actions={drawerActions} />
       </Suspense>}
       {/* Keyed by slug: a cancelled secret never survives into another install. */}

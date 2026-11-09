@@ -251,10 +251,10 @@ export function LogSources() {
   const handleDeploy = async () => {
     if (!logSourceToAction) return;
     try {
-      await deployLogSource(logSourceToAction.id);
+      const result = await deployLogSource(logSourceToAction.id);
       toast({
         title: 'Deployed',
-        description: `"${logSourceToAction.name}" has been deployed to Vector.`,
+        description: result?.message || `"${logSourceToAction.name}" has been deployed to Vector.`,
       });
       setDeployDialogOpen(false);
       setLogSourceToAction(null);

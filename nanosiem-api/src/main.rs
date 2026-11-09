@@ -8,6 +8,10 @@
 
 use anyhow::Result;
 use nanosiem_api::{create_router, ApiConfig, AppMetrics, AppState};
+#[cfg(feature = "enterprise")]
+use nanosiem_core::license::checker::LicenseCheckerConfig;
+#[cfg(feature = "enterprise")]
+use nanosiem_core::LicenseChecker;
 use std::net::SocketAddr;
 
 fn main() -> Result<()> {
@@ -39,6 +43,9 @@ async fn async_main() -> Result<()> {
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("nanosiem-api");
 
     tracing::info!("Starting NanoSIEM API server");
+    // Security review 2026-11-08: surface insecure-but-accepted deployment
+    // settings (public install token, config delivery on the install token).
+    nanosiem_core::deployment_posture::log_posture_at_boot("nano-api");
 
     // Load configuration
     let config = ApiConfig::from_env();
@@ -64,22 +71,11 @@ async fn async_main() -> Result<()> {
         }
     };
 
-    // Establish licence admission before any licensed background worker can
-    // start. The initial C05 observation belongs to the same single authority
-    // path as the 30-second refresher below.
+    // Establish one explicit admission authority before any licensed route or
+    // worker starts. A partial online tuple and a never-checked fresh install
+    // fail closed; no configuration falls through to C05/legacy authority.
     #[cfg(feature = "enterprise")]
-    if state.config.is_license_enabled() {
-        let license_repo = nanosiem_core::LicenseRepository::new(state.pool.clone());
-        match license_repo.get_status().await {
-            Ok(status) => {
-                *state.license_status.write().await = status;
-                tracing::info!("Loaded cached license status from database");
-            }
-            Err(error) => tracing::warn!(%error, "Failed to load cached license status"),
-        }
-    } else if state.config.airgap {
-        refresh_sovereign_license_status(&state).await;
-    }
+    initialize_license_admission(&state).await;
 
     // Initialize demo service if DEPLOYMENT_MODE=demo
     if let Err(e) = state.init_demo_if_enabled().await {
@@ -245,6 +241,7 @@ async fn async_main() -> Result<()> {
                 "Initial Vector config publication failed; the background reconciler will retry"
             ),
         }
+        state.install_generation_delivery();
         let vector_config_handle = state.start_vector_config_publication_reconciler();
         state.add_task_handle(vector_config_handle).await;
         tracing::info!("Vector config publication reconciler started");
@@ -260,17 +257,14 @@ async fn async_main() -> Result<()> {
     }
     #[cfg(feature = "enterprise")]
     {
-        let supervisor = state.start_component_worker_supervisor(
-            nanosiem_api::license_admission::WorkerCapability::Ingest,
-            "api_ingest",
-            |state| {
-                vec![
-                    state.start_vector_config_publication_reconciler(),
-                    state.ingest_token_service.clone().spawn_reconcile(),
-                ]
-            },
-        );
-        state.add_task_handle(supervisor).await;
+        // Ingest is part of the open/core continuity boundary and remains
+        // available after a commercial licence hard stop.
+        state.install_generation_delivery();
+        let vector_config_handle = state.start_vector_config_publication_reconciler();
+        state.add_task_handle(vector_config_handle).await;
+        let ingest_tokens_handle = state.ingest_token_service.clone().spawn_reconcile();
+        state.add_task_handle(ingest_tokens_handle).await;
+        tracing::info!("Open/core ingest reconcilers started");
     }
 
     // === License status poller (reads cached status from PG, written by nanosiem-jobs) ===
@@ -288,7 +282,7 @@ async fn async_main() -> Result<()> {
                 let repo = nanosiem_core::LicenseRepository::new(poll_state.pool.clone());
                 match repo.get_status().await {
                     Ok(status) => {
-                        *poll_state.license_status.write().await = status;
+                        *poll_state.license_status.write().await = status.for_online_admission();
                     }
                     Err(e) => tracing::debug!("License status poll failed: {}", e),
                 }
@@ -296,7 +290,7 @@ async fn async_main() -> Result<()> {
         });
         state.add_task_handle(poll_handle).await;
         tracing::info!("License status poller started (5m interval, reads from PG)");
-    } else if state.config.airgap {
+    } else if state.config.online_license_config().is_ok() {
         // The single C05 authority task durably observes every 30 seconds.
         // Request handlers consume only its cached snapshot.
         let refresh_state = state.clone();
@@ -304,11 +298,9 @@ async fn async_main() -> Result<()> {
             run_sovereign_license_refresh(refresh_state).await;
         });
         state.add_task_handle(refresh_handle).await;
-        tracing::info!("C05 offline licence refresh started (30s interval)");
+        tracing::info!("C05/legacy licence refresh started (30s interval)");
     } else {
-        tracing::info!(
-            "License enforcement not configured (LICENSE_URL not set) — running unrestricted"
-        );
+        tracing::error!("Incomplete online licence configuration remains locked until restart");
     }
 
     // === Per-instance tasks (API-specific) ===
@@ -337,10 +329,17 @@ async fn async_main() -> Result<()> {
     // only spins up when the enterprise feature is enabled.
     #[cfg(feature = "enterprise")]
     {
-        tracing::info!("Starting case change listener...");
-        let case_listener_handle = state.start_case_change_listener();
-        state.add_task_handle(case_listener_handle).await;
-        tracing::info!("Case change listener started");
+        let supervisor = state.start_component_worker_supervisor(
+            nanosiem_api::license_admission::WorkerCapability::Cases,
+            "api_cases",
+            |state| {
+                vec![
+                    state.start_case_change_listener(),
+                    state.start_shadow_investigation_recovery(),
+                ]
+            },
+        );
+        state.add_task_handle(supervisor).await;
     }
 
     // Initialize metrics
@@ -387,6 +386,36 @@ async fn async_main() -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(feature = "enterprise")]
+async fn initialize_license_admission(state: &AppState) {
+    match state.config.online_license_config() {
+        Ok(Some(online)) => {
+            let checker = LicenseChecker::new(
+                LicenseCheckerConfig::from_license_url(
+                    &online.url,
+                    online.token,
+                    online.deployment_id,
+                    86_400,
+                ),
+                state.pool.clone(),
+                state.license_status.clone(),
+            );
+            if let Err(error) = checker.initialize().await {
+                tracing::error!(%error, "Initial online licence check failed; using only a previously successful bounded cache");
+            }
+        }
+        Ok(None) => refresh_sovereign_license_status(state).await,
+        Err(error) => {
+            tracing::error!(%error, "Incomplete online licence configuration; failing closed");
+            let snapshot = nanosiem_api::license_admission::OfflineLicenseSnapshot::Unavailable(
+                error.to_string(),
+            );
+            *state.license_status.write().await = snapshot.cached_status();
+            *state.offline_license_snapshot.write().await = snapshot;
+        }
+    }
 }
 
 #[cfg(feature = "enterprise")]

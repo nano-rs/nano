@@ -157,7 +157,7 @@ pub fn check(source: &str) -> Result<(), VrlGuardError> {
 /// large-stack thread. The only sanctioned way to compile VRL that a tenant
 /// (or an AI acting for one) can influence.
 pub fn compile(source: &str, fns: &[Box<dyn Function>]) -> Result<Compiled, VrlCompileError> {
-    compile_inner(source, fns, false)
+    compile_inner(source, fns, ReadOnly::Nothing)
 }
 
 /// [`compile`] with Vector event METADATA (`%…`) read-only: any assignment
@@ -170,13 +170,32 @@ pub fn compile_metadata_read_only(
     source: &str,
     fns: &[Box<dyn Function>],
 ) -> Result<Compiled, VrlCompileError> {
-    compile_inner(source, fns, true)
+    compile_inner(source, fns, ReadOnly::Metadata)
+}
+
+/// [`compile`] with the event AND its metadata read-only: any assignment to
+/// `.…` or `%…` and any `del` of either is a compile error. Tenant
+/// conditions (a sampling exclude predicate) compile this way: a condition
+/// must observe the event, never change it.
+pub fn compile_read_only(
+    source: &str,
+    fns: &[Box<dyn Function>],
+) -> Result<Compiled, VrlCompileError> {
+    compile_inner(source, fns, ReadOnly::EventAndMetadata)
+}
+
+/// Which target roots a compile treats as read-only.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadOnly {
+    Nothing,
+    Metadata,
+    EventAndMetadata,
 }
 
 fn compile_inner(
     source: &str,
     fns: &[Box<dyn Function>],
-    metadata_read_only: bool,
+    read_only: ReadOnly,
 ) -> Result<Compiled, VrlCompileError> {
     check(source)?;
     std::thread::scope(|scope| {
@@ -185,8 +204,11 @@ fn compile_inner(
             .stack_size(COMPILE_STACK_BYTES)
             .spawn_scoped(scope, || {
                 let mut config = vrl::compiler::CompileConfig::default();
-                if metadata_read_only {
+                if read_only != ReadOnly::Nothing {
                     config.set_read_only_path(vrl::path::OwnedTargetPath::metadata_root(), true);
+                }
+                if read_only == ReadOnly::EventAndMetadata {
+                    config.set_read_only_path(vrl::path::OwnedTargetPath::event_root(), true);
                 }
                 vrl::compiler::compile_with_external(
                     source,

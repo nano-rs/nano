@@ -335,7 +335,7 @@ fn sort_command(input: &str) -> ParseResult<'_, Command> {
         let space: Result<(&str, &str), nom::Err<nom::error::Error<&str>>> = multispace1(input);
         if let Ok((rest, _)) = space {
             // Stop if this is limit=N (not a sort field)
-            if rest.to_ascii_lowercase().starts_with("limit=") {
+            if super::starts_with_ignore_ascii_case(rest, "limit=") {
                 break;
             }
             let looks_like_sort_field = rest.chars().next().map_or(false, |c| {

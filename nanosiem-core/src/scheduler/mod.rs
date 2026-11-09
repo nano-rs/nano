@@ -16,7 +16,7 @@ pub use repository::{JobStats, SchedulerRepository, SchedulerRepositoryError};
 pub use secrets::{merge_auth_headers, redact_auth_headers};
 pub use service::{
     calculate_next_run, calculate_next_runs, describe_cron, normalize_cron, validate_cron,
-    SchedulerError, SchedulerService,
+    SchedulerError, MAX_CRON_PREVIEW_COUNT, SchedulerService,
 };
 pub use types::{
     JobExecution, JobFilter, JobStatus, NewScheduledJob, RetryPolicy, ScheduledJob,

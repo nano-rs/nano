@@ -334,7 +334,7 @@ pub async fn search(
         }
     }
 
-    // Check search result cache (Dragonfly/Redis). NAN-1595: skip on refresh
+    // Check search result cache (Valkey/Redis). NAN-1595: skip on refresh
     // bypass; stamp x-nano-cache hit/age so the UI can show the cached notice.
     // NAN-1799: the effective deny-set is folded into the cache key (computed
     // above, BEFORE this lookup) so differently-scoped users never share an
@@ -639,8 +639,10 @@ pub struct ExplainRequest {
 /// Response for explain endpoint
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ExplainResponse {
-    /// The generated SQL query
-    pub sql: String,
+    /// The generated SQL query. Literals naming sources the caller is denied
+    /// are redacted (NAN-5043); the executed SQL is unchanged.
+    #[schema(value_type = String)]
+    pub sql: nanosiem_core::search::display_sql::DisplaySql,
     /// Whether table_view field pruning was applied
     pub table_view: bool,
 }
@@ -718,7 +720,7 @@ pub async fn explain(
         SearchError::QueryError("Query processing failed".to_string())
     })?;
     Ok(Json(ExplainResponse {
-        sql,
+        sql: nanosiem_core::search::display_sql::DisplaySql::for_scope(sql, &scope),
         table_view: request.table_view,
     }))
 }
@@ -832,7 +834,7 @@ pub async fn prevalence_artifacts(
 
     // NAN-1593: the prevalence-artifacts scatter fires on every search-page
     // load / shared-link follow, separately from the main search — cache it
-    // through the same Dragonfly layer so reloads don't re-extract artifacts
+    // through the same Valkey layer so reloads don't re-extract artifacts
     // and re-run their prevalence lookups. Keyed on the raw `query` plus the
     // time range and dataset, with the caller's effective deny-set folded in
     // by `companion_key` (NAN-1799 — the scope changes the executed SQL, so
@@ -919,7 +921,7 @@ pub async fn field_stats_for_query(
 
     // NAN-1593: the field-stats panel fires on every search-page load and
     // shared-link follow, separately from the main search — cache it through
-    // the same Dragonfly layer so reloads don't re-run the aggregation. Keyed
+    // the same Valkey layer so reloads don't re-run the aggregation. Keyed
     // on the raw `query` plus the time range / column subset / dataset, with
     // the caller's effective deny-set folded in by `companion_key` (NAN-1799);
     // `request_id` is excluded since it's a per-request cancellation handle,
@@ -1026,7 +1028,7 @@ pub async fn field_values(
 
     // NAN-1593: drill-in field values are re-requested whenever the user
     // re-expands a field, and re-fetched on shared-link follow — cache them
-    // through the same Dragonfly layer. Keyed on the raw `query` plus the
+    // through the same Valkey layer. Keyed on the raw `query` plus the
     // field, time range, limit, and dataset, with the caller's effective
     // deny-set folded in by `companion_key` (NAN-1799).
     let cache_key = crate::cache::SearchResultCache::companion_key(

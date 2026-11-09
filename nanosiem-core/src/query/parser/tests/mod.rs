@@ -2,6 +2,7 @@
 
 mod dos_limits;
 mod error_messages;
+mod linear_lookahead;
 mod eval_not;
 mod leading_command;
 mod quoting;

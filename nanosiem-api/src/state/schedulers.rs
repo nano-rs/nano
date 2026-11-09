@@ -167,13 +167,6 @@ impl AppState {
                 "AIRGAP_MODE: skipping distributed scheduled jobs loop (remote inputlookup feed ingestion)"
             );
         } else {
-            #[cfg(feature = "enterprise")]
-            handles.push(self.start_component_worker_supervisor(
-                crate::license_admission::WorkerCapability::Ingest,
-                "jobs_distributed_ingest",
-                AppState::start_distributed_ingest_scheduler,
-            ));
-            #[cfg(not(feature = "enterprise"))]
             handles.extend(self.start_distributed_ingest_scheduler());
         }
 
@@ -474,6 +467,7 @@ impl AppState {
     /// until shutdown in an open deployment where enterprise migration 9000054
     /// never created the tables (returning would trip the leader-scheduler
     /// supervisor and exit the jobs process, NAN-3376).
+    #[cfg(feature = "enterprise")]
     pub fn start_hunt_scheduler(&self) -> tokio::task::JoinHandle<()> {
         nanosiem_core::hunts::HuntScheduler::from_env(self.pool.clone())
             .with_fence(self.leader_fence.clone())
@@ -789,6 +783,7 @@ impl AppState {
     /// - Notification batching (every 5 minutes)
     ///
     /// Returns a vector of JoinHandles for all spawned tasks
+    #[cfg(feature = "enterprise")]
     pub fn start_tuning_scheduler(&self) -> Vec<tokio::task::JoinHandle<()>> {
         use nanosiem_core::tuning::{
             BaselineMonitor, MetricsCollector, NotificationService, ThresholdDetector, TuningCache,
@@ -955,7 +950,13 @@ impl AppState {
                         as Arc<dyn AiClient>
                 })
                 .unwrap_or_else(|| Arc::new(nanosiem_core::extensions::NoopAiClient));
-            Arc::new(nanosiem_enterprise::siem_health::AiPoweredSiemHealthAnalyzer::new(ai_client))
+            let analyzer: Arc<dyn SiemHealthAiAnalyzer> = Arc::new(
+                nanosiem_enterprise::siem_health::AiPoweredSiemHealthAnalyzer::new(ai_client),
+            );
+            Arc::new(crate::license_admission::LicensedSiemHealthAiAnalyzer::new(
+                analyzer,
+                self.license_status.clone(),
+            ))
         };
         #[cfg(not(feature = "enterprise"))]
         let ai_analyzer: Arc<dyn SiemHealthAiAnalyzer> = Arc::new(NoopSiemHealthAiAnalyzer);

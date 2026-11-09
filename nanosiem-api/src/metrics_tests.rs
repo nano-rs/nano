@@ -123,7 +123,6 @@ fn every_prometheus_manifest_scrapes_with_the_service_credential() {
         "deploy/k8s/prometheus/prometheus.yaml",
         "deploy/k8s/rackspace/monitoring.yaml",
         "ludus/roles/nanosiem_stack/templates/prometheus.yml.j2",
-        "deploy/src/deploy.js",
     ];
     let mut checked = 0;
     for rel in manifests {

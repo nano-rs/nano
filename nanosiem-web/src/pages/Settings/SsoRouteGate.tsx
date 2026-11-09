@@ -8,7 +8,7 @@
  * the SSO surface. Without this gate a deep link mounts the providers page
  * against an API that 404s. A notice is rendered instead of a redirect so a
  * shared-tenant deep link survives the brief fail-closed window before the
- * tenant plan loads.
+ * entitlement loads.
  */
 
 import type { ReactNode } from 'react';
@@ -18,11 +18,8 @@ import { useCapabilities } from '@/hooks/use-capabilities';
 import { useTierContext } from '@/hooks/use-tier';
 
 /**
- * NAN-4930: fail closed on BOTH the build capability and the live plan.
- * `capabilities.sso` only says the binary contains SSO; the plan
- * (`limits.sso_enabled`) can still withhold it, e.g. after a downgrade. Until
- * the tier has loaded and says yes, the provider page does not mount. The
- * server enforces the same plan check on every provider and sign-in path.
+ * Fail closed on both build capability and live edition. Every licensed v2
+ * deployment receives SSO; open builds do not ship the handlers.
  */
 export function SsoRouteGate({ children }: { children: ReactNode }) {
   const { capabilities } = useCapabilities();
@@ -30,10 +27,10 @@ export function SsoRouteGate({ children }: { children: ReactNode }) {
   if (!capabilities.sso) return <SsoUnavailable reason="build" />;
   if (status?.limits?.sso_enabled === true) return <>{children}</>;
   if (loading && !status) return null;
-  return <SsoUnavailable reason="plan" />;
+  return <SsoUnavailable reason="edition" />;
 }
 
-function SsoUnavailable({ reason }: { reason: 'build' | 'plan' }) {
+function SsoUnavailable({ reason }: { reason: 'build' | 'edition' }) {
   return (
     <div className="flex h-full flex-col items-center justify-center px-8 text-center">
       <KeyRound className="mb-3 h-5 w-5 text-muted-foreground" strokeWidth={1.5} />
@@ -41,7 +38,7 @@ function SsoUnavailable({ reason }: { reason: 'build' | 'plan' }) {
       <p className="mb-4 max-w-md text-[12px] text-muted-foreground">
         {reason === 'build'
           ? 'This deployment does not include SAML / OIDC providers. Local accounts and MFA are unaffected.'
-          : 'Your plan does not include SAML / OIDC providers. Local accounts and MFA are unaffected.'}
+          : 'This edition does not include SAML / OIDC providers. Local accounts and MFA are unaffected.'}
       </p>
       <Link
         to="/settings"

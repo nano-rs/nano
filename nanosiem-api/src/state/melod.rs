@@ -220,13 +220,19 @@ impl AppState {
         let cf_aig_metadata = {
             let org_id = std::env::var("NANO_ORG_ID").unwrap_or_default();
             let deployment_id = std::env::var("NANO_DEPLOYMENT_ID").unwrap_or_default();
-            let tier = std::env::var("NANO_TIER").unwrap_or_else(|_| "unrestricted".to_string());
+            let operator = nanosiem_core::TierSettings::new(self.pool.clone())
+                .get_tier_limits()
+                .await?
+                .entitlement
+                .operator
+                .to_string();
             if !org_id.is_empty() || !deployment_id.is_empty() {
                 Some(
                     serde_json::json!({
                         "org_id": org_id,
                         "deployment_id": deployment_id,
-                        "tier": tier
+                        "edition": "licensed",
+                        "operator": operator
                     })
                     .to_string(),
                 )

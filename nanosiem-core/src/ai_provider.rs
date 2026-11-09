@@ -156,6 +156,83 @@ fn is_anthropic_host(base_url: &str) -> bool {
         .is_some_and(|host| host == ANTHROPIC_API_HOST || host.ends_with(".anthropic.com"))
 }
 
+// ============================================================================
+// Self-hosted (OpenAI-compatible) provider (NAN-5136)
+// ============================================================================
+
+/// Provider key for the operator's own OpenAI-compatible model server
+/// (Ollama, vLLM, LM Studio, LiteLLM, …).
+///
+/// It gets its own `provider_credentials` row, so its models carry their own
+/// `self-hosted/` id prefix. Before NAN-5136 a local model had to borrow a
+/// vendor row (usually `openai`), which redirected every `openai/*` model to
+/// the local server.
+pub const SELF_HOSTED_PROVIDER: &str = "self-hosted";
+
+/// Whether a model id belongs to the self-hosted provider (`self-hosted/<id>`).
+///
+/// The rest of the id is passed to the server verbatim, so it may contain
+/// further slashes (vLLM serves `Qwen/Qwen2.5-7B-Instruct`). Only the first
+/// segment is the provider.
+pub fn is_self_hosted_model(model_id: &str) -> bool {
+    model_id
+        .split_once('/')
+        .is_some_and(|(prefix, rest)| prefix == SELF_HOSTED_PROVIDER && !rest.is_empty())
+}
+
+/// `GET {base_url}/models`: the OpenAI-compatible model list. Every server in
+/// scope (Ollama, vLLM, LM Studio, LiteLLM) serves it.
+pub fn openai_models_url(base_url: &str) -> String {
+    format!("{}/models", base_url.trim_end_matches('/'))
+}
+
+/// Ollama's native model list, `GET {root}/api/tags`, where `root` is the
+/// base URL without its trailing `/v1`. This is the fallback when `/v1/models`
+/// is missing (older Ollama builds) or empty.
+pub fn ollama_tags_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    format!("{root}/api/tags")
+}
+
+/// Model ids from an OpenAI-compatible `/models` body (`{"data":[{"id":…}]}`).
+/// Blank ids are dropped and duplicates removed, keeping the server's order.
+pub fn parse_openai_model_list(body: &serde_json::Value) -> Vec<String> {
+    collect_ids(body.get("data"), "id")
+}
+
+/// Model names from an Ollama `/api/tags` body (`{"models":[{"name":…}]}`).
+pub fn parse_ollama_tags(body: &serde_json::Value) -> Vec<String> {
+    collect_ids(body.get("models"), "name")
+}
+
+/// Upper bound on discovered models we return. A LiteLLM proxy can front
+/// hundreds of models; this keeps the picker and the response bounded.
+pub const MAX_DISCOVERED_MODELS: usize = 500;
+
+fn collect_ids(list: Option<&serde_json::Value>, key: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in list.and_then(|v| v.as_array()).into_iter().flatten() {
+        let Some(id) = item.get(key).and_then(|v| v.as_str()).map(str::trim) else {
+            continue;
+        };
+        if id.is_empty() || id.len() > 200 || id.chars().any(char::is_control) {
+            continue;
+        }
+        if !out.iter().any(|existing| existing == id) {
+            out.push(id.to_string());
+        }
+        if out.len() >= MAX_DISCOVERED_MODELS {
+            break;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[path = "ai_provider_self_hosted_tests.rs"]
+mod self_hosted_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

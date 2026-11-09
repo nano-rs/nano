@@ -115,6 +115,8 @@ pub fn serialize_rule_to_npl(rule: &DetectionRule, query: &str) -> Result<String
 /// Replace just the query body of an existing nPL file, keeping its frontmatter
 /// byte-for-byte. Returns `None` if `existing` isn't in `---\n<yaml>\n---\n<body>`
 /// form (caller then falls back to [`serialize_rule_to_npl`]).
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 pub fn splice_query(existing: &str, new_query: &str) -> Option<String> {
     let trimmed = existing.trim_start();
     let after_open = trimmed.strip_prefix("---")?;

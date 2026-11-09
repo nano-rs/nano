@@ -14,7 +14,7 @@
   "time": 1749081661789,
   "message": "Outbound HTTPS connection from 10.20.30.40:51820 to 93.184.216.34:443 (example.com)",
   "metadata": {
-    "version": "1.8.0",
+    "version": "1.9.0",
     "product": {
       "name": "Conduit Proxy",
       "vendor_name": "nano"

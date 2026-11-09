@@ -138,6 +138,7 @@ impl ReportRepository {
         id: Uuid,
         update: &UpdateReportDefinition,
         next_run_at: Option<DateTime<Utc>>,
+        restricted_editor: Option<Uuid>,
     ) -> Result<ReportDefinition, ReportRepositoryError> {
         // COALESCE keeps unchanged fields; next_run_at only advances when a new
         // cron was supplied (caller passes Some).
@@ -154,6 +155,14 @@ impl ReportRepository {
                 enabled = COALESCE($8, enabled),
                 retention_runs = COALESCE($9, retention_runs),
                 next_run_at = COALESCE($10, next_run_at),
+                -- NAN-5039: a query change by a source-RESTRICTED non-owner
+                -- records them; a change by the owner or an unrestricted caller
+                -- resets it; edits that leave the query alone keep it.
+                query_edited_by = CASE
+                    WHEN $5::text IS NULL THEN query_edited_by
+                    WHEN $11::uuid IS NULL OR $11 = owner_id THEN NULL
+                    ELSE $11
+                END,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *, NULL::text AS owner_name
@@ -169,6 +178,7 @@ impl ReportRepository {
         .bind(update.enabled)
         .bind(update.retention_runs)
         .bind(next_run_at)
+        .bind(restricted_editor)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(ReportRepositoryError::DefinitionNotFound(id))?;

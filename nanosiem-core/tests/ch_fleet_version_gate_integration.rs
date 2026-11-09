@@ -8,7 +8,11 @@
 //! - a 26.8.36.3 node and a 26.10.3.7 node, both replicas of one cluster in
 //!   `remote_servers` (no Keeper needed for `clusterAllReplicas`);
 //! - an HTTP round-robin in front of both (nginx `upstream`), passed as
-//!   `CH_MIXED_FLEET_URL`, user `default` with no password.
+//!   `CH_MIXED_FLEET_URL`. The client logs in as `CH_MIXED_FLEET_USER`
+//!   (default `nanosiem_admin`) with `CH_MIXED_FLEET_PASSWORD` (default
+//!   `CLICKHOUSE_ADMIN_PASSWORD`). Not `default`: with nano's users.d the
+//!   passwordless `default` user is container-local (security review
+//!   2026-11-08) and the round-robin reaches it over the network.
 //!
 //! Skips unless `CH_MIXED_FLEET_URL` is set. Optionally `CLICKHOUSE_TEST_URL`
 //! (a single 26.10 node) checks the single-node fallback.
@@ -32,7 +36,14 @@ async fn gated_settings_stay_off_while_any_replica_is_old() {
         eprintln!("Skipping: CH_MIXED_FLEET_URL not set");
         return;
     };
-    let ch = client().with_url(&url).with_user("default");
+    let ch = client()
+        .with_url(&url)
+        .with_user(std::env::var("CH_MIXED_FLEET_USER").unwrap_or_else(|_| "nanosiem_admin".into()))
+        .with_password(
+            std::env::var("CH_MIXED_FLEET_PASSWORD")
+                .or_else(|_| std::env::var("CLICKHOUSE_ADMIN_PASSWORD"))
+                .unwrap_or_default(),
+        );
 
     // The pre-fix gate: one `SELECT version()` lands on either pod.
     let mut sampled = BTreeSet::new();
@@ -78,7 +89,8 @@ async fn single_node_falls_back_to_its_own_version() {
         eprintln!("Skipping: CLICKHOUSE_TEST_URL not set");
         return;
     };
-    let user = std::env::var("CLICKHOUSE_ADMIN_USER").unwrap_or_else(|_| "default".into());
+    // Never `default`: nano's users.d keeps it container-local.
+    let user = std::env::var("CLICKHOUSE_ADMIN_USER").unwrap_or_else(|_| "nanosiem_admin".into());
     let mut ch = client().with_url(&url).with_user(&user);
     if let Ok(pw) = std::env::var("CLICKHOUSE_ADMIN_PASSWORD") {
         if !pw.is_empty() {

@@ -148,7 +148,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::auth::SourceProvenance;
+use crate::auth::{ArtifactScope, ScopeSet, SourceProvenance};
 use crate::db::TableNames;
 use crate::extensions::{AiClient, AiMessage};
 use crate::hunts::capabilities::{infer_source_capabilities, FieldObservation};
@@ -497,6 +497,60 @@ pub struct CensusInputs {
     pub sparklines: HashMap<String, Vec<u64>>,
     pub deep: Option<HashMap<String, DeepSourceFacts>>,
     pub history: Option<HashMap<String, DateTime<Utc>>>,
+}
+
+fn source_is_denied(source: &str, deny: &BTreeSet<String>) -> bool {
+    !deny.is_empty() && deny.contains(&source.trim().to_lowercase())
+}
+
+impl CensusInputs {
+    /// Drop every per-source fact about a source in `deny` (NAN-5049).
+    ///
+    /// The census universe is `configured ∪ observed ∪ hunt-required`, and each
+    /// of those can name a restricted source, so all of them are narrowed — a
+    /// configured-but-silent restricted source must not appear as a row either.
+    /// An empty `deny` is a no-op (unrestricted caller: byte-identical output).
+    pub fn retain_visible(&mut self, deny: &BTreeSet<String>) {
+        if deny.is_empty() {
+            return;
+        }
+        let keep = |s: &String| !source_is_denied(s, deny);
+        self.configured.retain(keep);
+        self.required_by_hunts.retain(keep);
+        if let Some(stats) = self.stats.as_mut() {
+            stats.retain(|k, _| keep(k));
+        }
+        self.events_24h.retain(|k, _| keep(k));
+        self.sparklines.retain(|k, _| keep(k));
+        if let Some(deep) = self.deep.as_mut() {
+            deep.retain(|k, _| keep(k));
+        }
+        if let Some(history) = self.history.as_mut() {
+            history.retain(|k, _| keep(k));
+        }
+    }
+}
+
+/// Withhold a stored profile's body from a caller who could not read it via
+/// `GET /api/hunts/profile` (NAN-5049).
+///
+/// Same rule as `HuntRepository::latest_profile`: an unrestricted caller sees
+/// everything; a restricted caller sees the profile only when its manifest is
+/// complete and disjoint from the caller's artifact deny set. Otherwise the
+/// per-source bodies are cleared and the manifest is emptied — the id and the
+/// run metadata stay, so a write path can still report what it stored.
+pub fn redact_profile_for(profile: &mut HuntProfile, caller: &ArtifactScope) {
+    if caller.allows(&profile.source_types, profile.source_types_complete) {
+        return;
+    }
+    profile.census = serde_json::Value::Array(Vec::new());
+    profile.fingerprint = serde_json::Value::Object(Default::default());
+    profile.huntable_surface = serde_json::Value::Object(Default::default());
+    profile.actor_weighting = serde_json::Value::Object(Default::default());
+    profile.degraded_detail = None;
+    profile.agent_notes = None;
+    profile.source_types = Vec::new();
+    profile.source_types_complete = false;
 }
 
 /// Per-source output of the deep probe over the log table.
@@ -2504,13 +2558,25 @@ impl ReconService {
     /// desktop calls headlessly. An agent should be driving [`Self::census`],
     /// [`Self::surface`], [`Self::save_profile`] and [`Self::create_drafts`]
     /// instead — see the module docs for which layers are its to decide.
-    pub async fn run(&self, generated_by: Option<Uuid>) -> Result<ReconRunSummary, HuntError> {
+    ///
+    /// NAN-5049: the PERSISTED profile is the tenant's shared artifact, so it is
+    /// gathered under the unrestricted SYSTEM scope (every reader is filtered by
+    /// `latest_profile`'s manifest gate). The RETURNED copy is passed through
+    /// [`redact_profile_for`] with the caller's artifact scope, so the response
+    /// never shows a caller more than `GET /api/hunts/profile` would.
+    pub async fn run(
+        &self,
+        generated_by: Option<Uuid>,
+        caller: &ArtifactScope,
+    ) -> Result<ReconRunSummary, HuntError> {
         let observed_at = Utc::now();
         let deadline = Deadline::new(RECON_WALL_BUDGET);
         let mut degraded = DegradedLog::default();
 
+        // SYSTEM: persisted shared artifact (see above).
+        let system = ScopeSet::unrestricted();
         let gathered = self
-            .gather(observed_at, deadline, &mut degraded, CensusDepth::Full)
+            .gather(observed_at, deadline, &mut degraded, CensusDepth::Full, &system)
             .await?;
 
         // Provisional census. Only its FACTS are used below — health states and
@@ -2565,8 +2631,16 @@ impl ReconService {
             .generate_drafts(&surface, &tactics, &volumes, generated_by)
             .await?;
 
+        let mut profile = profile;
+        redact_profile_for(&mut profile, caller);
+        let census_rows = if profile.census.is_null() || profile.census.as_array().is_some_and(Vec::is_empty) {
+            0
+        } else {
+            census.len()
+        };
+
         Ok(ReconRunSummary {
-            census_rows: census.len(),
+            census_rows,
             covered: surface.covered,
             gaps: surface.gaps,
             blind: surface.blind,
@@ -2589,13 +2663,17 @@ impl ReconService {
     /// A model re-deriving these counts gives approximately-right numbers that
     /// move between runs, so this is server code behind whatever tool the agent
     /// reaches it through.
-    pub async fn census(&self) -> Result<CensusReport, HuntError> {
+    ///
+    /// NAN-5049: `scope` is the CALLER's live-data scope. The census is returned
+    /// straight to the caller, so every input is narrowed to the sources it may
+    /// see before anything is derived from it (rows, manifest, degraded detail).
+    pub async fn census(&self, scope: &ScopeSet) -> Result<CensusReport, HuntError> {
         let observed_at = Utc::now();
         let deadline = Deadline::new(RECON_WALL_BUDGET);
         let mut degraded = DegradedLog::default();
 
         let gathered = self
-            .gather(observed_at, deadline, &mut degraded, CensusDepth::Full)
+            .gather(observed_at, deadline, &mut degraded, CensusDepth::Full, scope)
             .await?;
         let provisional = build_census(&gathered.inputs, false);
         note_unhealthy_required(&provisional, &mut degraded);
@@ -2626,13 +2704,15 @@ impl ReconService {
     /// the rollup's `last_event_at` and nothing else, so the field-population
     /// and history probes would cost a full-retention scan to produce a byte of
     /// input this call never reads.
-    pub async fn surface(&self) -> Result<SurfaceReport, HuntError> {
+    ///
+    /// NAN-5049: like [`Self::census`], narrowed to the caller's `scope`.
+    pub async fn surface(&self, scope: &ScopeSet) -> Result<SurfaceReport, HuntError> {
         let observed_at = Utc::now();
         let deadline = Deadline::new(RECON_WALL_BUDGET);
         let mut degraded = DegradedLog::default();
 
         let gathered = self
-            .gather(observed_at, deadline, &mut degraded, CensusDepth::Inventory)
+            .gather(observed_at, deadline, &mut degraded, CensusDepth::Inventory, scope)
             .await?;
         let census = build_census(&gathered.inputs, false);
         note_unhealthy_required(&census, &mut degraded);
@@ -2726,7 +2806,9 @@ impl ReconService {
             CensusDepth::Full
         };
         let gathered = self
-            .gather(observed_at, deadline, &mut degraded, depth)
+            // SYSTEM: the stored profile is the shared artifact; the response
+            // is redacted for the caller by the handler (NAN-5049).
+            .gather(observed_at, deadline, &mut degraded, depth, &ScopeSet::unrestricted())
             .await?;
         // Provisional: only its FACTS are used for the manifest and the
         // live-source set, neither of which depends on the degraded stamp. The
@@ -2908,7 +2990,9 @@ impl ReconService {
         deadline: Deadline,
         degraded: &mut DegradedLog,
         depth: CensusDepth,
+        scope: &ScopeSet,
     ) -> Result<GatheredInputs, HuntError> {
+        let deny = scope.deny_set();
         let mitre = MitreRepository::new(self.pool.clone());
         let configured: BTreeSet<String> = mitre
             .configured_source_types()
@@ -2937,6 +3021,7 @@ impl ReconService {
         };
 
         if depth == CensusDepth::Inventory {
+            inputs.retain_visible(deny);
             return Ok(GatheredInputs {
                 inputs,
                 rollup_read,
@@ -2967,11 +3052,11 @@ impl ReconService {
         let sources: Vec<String> = universe
             .into_iter()
             .filter(|source| is_safe_source_type(source))
+            .filter(|source| !source_is_denied(source, deny))
             .collect();
 
-        let empty_deny = BTreeSet::new();
         inputs.sparklines = probe(
-            telemetry.buckets(&sources, SPARKLINE_HOURS, BucketSize::Hour, &empty_deny),
+            telemetry.buckets(&sources, SPARKLINE_HOURS, BucketSize::Hour, deny),
             "24h ingestion buckets",
             deadline,
             degraded,
@@ -2982,6 +3067,9 @@ impl ReconService {
 
         inputs.deep = self.probe_deep(observed_at, deadline, degraded).await;
         inputs.history = self.probe_history(observed_at, deadline, degraded).await;
+        // NAN-5049: one narrowing point for every per-source input, applied
+        // before any row, manifest or degraded note is derived from them.
+        inputs.retain_visible(deny);
 
         Ok(GatheredInputs {
             inputs,
@@ -3862,3 +3950,7 @@ fn sanitize_multiline(raw: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 #[path = "recon_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "recon_scope_tests.rs"]
+mod recon_scope_tests;

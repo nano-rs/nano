@@ -20,33 +20,53 @@
 //! `nanosiem-core::extensions::tuning_proposal_generator`) so it stays
 //! decoupled from the enterprise concrete types.
 
+#[cfg(feature = "enterprise")]
 pub mod baseline;
+#[cfg(feature = "enterprise")]
 pub mod cache;
+#[cfg(feature = "enterprise")]
 pub mod metrics;
 pub mod mode;
+#[cfg(feature = "enterprise")]
 pub mod notifications;
+#[cfg(feature = "enterprise")]
 pub mod rate_limiter;
+#[cfg(feature = "enterprise")]
 pub mod repository;
+#[cfg(feature = "enterprise")]
 pub mod scheduler;
 pub mod scope;
+#[cfg(feature = "enterprise")]
 pub mod silent_actions;
+#[cfg(feature = "enterprise")]
 pub mod test_engine;
+#[cfg(feature = "enterprise")]
 pub mod threshold;
 pub mod types;
 pub mod versions;
 
 // Open-core surface: data types + version history + base-rate scheduler.
+#[cfg(feature = "enterprise")]
 pub use baseline::*;
+#[cfg(feature = "enterprise")]
 pub use cache::*;
+#[cfg(feature = "enterprise")]
 pub use metrics::*;
 pub use mode::*;
+#[cfg(feature = "enterprise")]
 pub use notifications::*;
+#[cfg(feature = "enterprise")]
 pub use rate_limiter::*;
+#[cfg(feature = "enterprise")]
 pub use repository::*;
+#[cfg(feature = "enterprise")]
 pub use scheduler::*;
 pub use scope::*;
+#[cfg(feature = "enterprise")]
 pub use silent_actions::*;
+#[cfg(feature = "enterprise")]
 pub use test_engine::*;
+#[cfg(feature = "enterprise")]
 pub use threshold::*;
 pub use types::*;
 pub use versions::*;

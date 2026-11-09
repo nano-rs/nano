@@ -300,7 +300,7 @@ impl ClickHouseExecutor {
         debug!(
             "Executing streaming ClickHouse query with query_id {}: {}",
             query_id,
-            &escaped_sql[..escaped_sql.len().min(200)]
+            crate::text_bounds::prefix_at_most(&escaped_sql, 200)
         );
 
         // Build the query with options

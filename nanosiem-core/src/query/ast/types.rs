@@ -346,7 +346,27 @@ impl std::fmt::Display for Value {
             }
             Value::Bool(b) => write!(f, "{}", b),
             Value::Ip(ip) => write!(f, "{}", ip),
-            Value::Regex(pattern) => write!(f, "/{}/", pattern.replace('/', "\\/")),
+            // NAN-5021: escape only UNESCAPED slashes. The parser keeps `\/`
+            // and `\\` verbatim, so re-escaping every `/` turned `/a\//`
+            // into `/a\\//`, which no longer parses and made the source-scope
+            // gate refuse a valid query.
+            Value::Regex(pattern) => {
+                let mut out = String::with_capacity(pattern.len() + 2);
+                let mut chars = pattern.chars();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => {
+                            out.push(c);
+                            if let Some(next) = chars.next() {
+                                out.push(next);
+                            }
+                        }
+                        '/' => out.push_str("\\/"),
+                        _ => out.push(c),
+                    }
+                }
+                write!(f, "/{}/", out)
+            }
             Value::Interval(duration, unit) => {
                 // NAN-3080: print the value IN ITS UNIT. Printing the seconds
                 // count with the unit multiplied the interval on every

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# NAN-4968: tests for tools/scan-mirror-secrets.sh's PEM private-key check.
+# NAN-4968: tests for tools/scan-mirror-secrets.sh's PEM private-key check
+# (plus NAN-5025 docs RAG token shape).
 # Generates REAL keys at run time (never committed) into throwaway trees under
 # paths the mirror strip keeps (config/), and asserts the scanner fails, reports
 # the path, and never prints key material. Also asserts the short placeholders
@@ -105,6 +106,20 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
     }, handle)
 PY
 expect "renamed C05 signature structure -> fail" "$t" 1 "config/renamed.json"
+
+# NAN-5025: docs RAG worker bearer tokens (nsiem-docs-<hex>) in a mirrored
+# script. Generated at run time; the scanner must fail and must not echo it.
+t=$(new_tree docs-rag-token)
+mkdir -p "$t/scripts"
+tok="nsiem-docs-$(openssl rand -hex 16)"
+printf 'export DOCS_RAG_TOKEN="${DOCS_RAG_TOKEN:-%s}"\n' "$tok" > "$t/scripts/start-dev.sh"
+printf '%s\n' "$tok" > "$WORK/docs-rag-token.txt"
+expect "docs RAG token default in a script -> fail, value masked" "$t" 1 "scripts/start-dev.sh" "$WORK/docs-rag-token.txt"
+
+t=$(new_tree docs-rag-env-only)
+mkdir -p "$t/scripts"
+printf 'export DOCS_RAG_TOKEN="${DOCS_RAG_TOKEN:-}"\n' > "$t/scripts/start-dev.sh"
+expect "docs RAG token read from env only -> clean" "$t" 0
 
 echo "$pass passed, $failed failed"
 [[ "$failed" == 0 ]]

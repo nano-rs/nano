@@ -13,6 +13,7 @@
 mod ast;
 pub(crate) mod clickhouse_sql_gen;
 pub mod complexity;
+pub mod generated_sql_tripwire;
 pub(crate) mod command_outputs;
 mod parser;
 pub(crate) use parser::search_wildcards_to_like;

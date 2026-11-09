@@ -310,10 +310,22 @@ async fn insert_user(pool: &PgPool, id: Uuid, email: &str) {
     .unwrap();
 }
 
-/// An API key whose grant authority is EXACTLY `perms` — the frozen
-/// `api_keys.permissions` array is the only thing the validator reads for a key
-/// principal, never its owner's roles.
+/// An API key whose grant authority is EXACTLY `perms`. The validator reads the
+/// key's `api_keys.permissions` array, never its owner's wider roles — but since
+/// NAN-5044 that array is clamped to what the owner holds NOW, so (as every key
+/// minted through the API is) the owner is given `perms` too.
 async fn insert_api_key(pool: &PgPool, id: Uuid, owner: Uuid, suffix: Uuid, perms: &[&str]) {
+    let owner_role = Uuid::now_v7();
+    let owner_group = Uuid::now_v7();
+    insert_role(pool, owner_role, &format!("nan2223-owner-{owner_role}"), perms).await;
+    insert_group(pool, owner_group, &format!("nan2223-owner-{owner_group}"), Some(owner_role)).await;
+    sqlx::query("INSERT INTO user_groups (user_id, group_id) VALUES ($1, $2)")
+        .bind(owner)
+        .bind(owner_group)
+        .execute(pool)
+        .await
+        .unwrap();
+
     sqlx::query(
         r#"
         INSERT INTO api_keys (id, name, key_hash, key_prefix, permissions, enabled, created_by)

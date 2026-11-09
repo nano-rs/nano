@@ -195,3 +195,18 @@ fn known_key_activity_is_uncapped_and_escaped() {
     assert!(known.contains("source_type IN ('acme_vpn', 'o''brien')"), "{known}");
     assert!(!known.to_uppercase().contains("PREWHERE"));
 }
+
+/// NAN-5032: platform-owned source types (and the rewrite marker) are never
+/// offered for conversion and cannot become a source's route key.
+#[test]
+fn platform_owned_source_types_are_system_route_keys() {
+    for key in ["audit", "findings", "reserved_spoof"] {
+        assert!(validate_route_key(key).is_err(), "{key} must not name a source");
+    }
+    let rows = vec![activity("audit", 100), activity("reserved_spoof", 9), activity("legacy_fw", 40)];
+    let out = unassigned_sources(&[], &rows);
+    let keys: Vec<&str> = out.iter().map(|u| u.route_key.as_str()).collect();
+    assert_eq!(keys, vec!["legacy_fw"]);
+    // Legitimate look-alikes still convert.
+    assert!(validate_route_key("linux_audit").is_ok());
+}

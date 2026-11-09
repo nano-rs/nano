@@ -109,53 +109,119 @@ fn is_trusted_proxy(addr: Option<&SocketAddr>) -> bool {
     }
 }
 
-/// SECURITY: Extract client IP from headers with optional socket address fallback.
+/// The forwarded-client headers an operator may choose to trust, in the order
+/// they are consulted. Parsed once from `TRUSTED_CLIENT_IP_HEADERS`
+/// (comma-separated, case-insensitive). NAN-5015.
 ///
-/// **Trust model**: Proxy headers (`CF-Connecting-IP`, `True-Client-IP`,
-/// `X-Forwarded-For`) are only consulted when the direct connection originates
-/// from a trusted proxy CIDR (see `TRUSTED_PROXY_CIDRS` env var). If no
-/// trusted CIDRs are configured, all proxy headers are trusted for backward
-/// compatibility.
-///
-/// Priority order (when proxy headers are trusted):
-/// 1. CF-Connecting-IP  — set by Cloudflare edge, not client-controlled
-/// 2. True-Client-IP    — set by Cloudflare Enterprise / Akamai edge
-/// 3. X-Forwarded-For   — **rightmost** entry only (appended by trusted LB)
-/// 4. Socket address    — direct connection, no proxy
-///
-/// IMPORTANT: The leftmost X-Forwarded-For entry is client-controlled and
-/// trivially spoofable. We use the rightmost entry (appended by the trusted
-/// GKE LB).
-pub fn extract_client_ip(headers: &HeaderMap, connect_info: Option<&SocketAddr>) -> Option<String> {
-    // Only trust proxy headers if the connection comes from a known proxy
-    if is_trusted_proxy(connect_info) {
-        // Prefer CF-Connecting-IP (Cloudflare sets this to the true client IP)
-        if let Some(cf_ip) = headers.get("CF-Connecting-IP") {
-            if let Ok(value) = cf_ip.to_str() {
-                let ip = value.trim();
-                if !ip.is_empty() {
-                    return Some(ip.to_string());
-                }
-            }
-        }
+/// Default: `x-forwarded-for` only. `CF-Connecting-IP` / `True-Client-IP` are
+/// set by a CDN edge, and nano's own nginx edges pass them through from the
+/// client untouched, so trusting them by default let anyone reaching a trusted
+/// proxy claim any address (`CF-Connecting-IP: 127.0.0.1` got the loopback
+/// allowlist pass and escaped per-IP lockout). A deployment that really sits
+/// behind Cloudflare / Akamai opts in with e.g.
+/// `TRUSTED_CLIENT_IP_HEADERS=cf-connecting-ip,x-forwarded-for`.
+static TRUSTED_CLIENT_IP_HEADERS: LazyLock<Vec<ClientIpHeader>> =
+    LazyLock::new(|| parse_trusted_client_ip_headers(std::env::var("TRUSTED_CLIENT_IP_HEADERS").ok().as_deref()));
 
-        // True-Client-IP (Cloudflare Enterprise / Akamai — also edge-set)
-        if let Some(true_ip) = headers.get("True-Client-IP") {
-            if let Ok(value) = true_ip.to_str() {
-                let ip = value.trim();
-                if !ip.is_empty() {
-                    return Some(ip.to_string());
-                }
-            }
-        }
+/// A forwarded-client header [`extract_client_ip`] can be configured to trust.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientIpHeader {
+    CfConnectingIp,
+    TrueClientIp,
+    /// Rightmost entry only (the one the trusted proxy appended).
+    XForwardedFor,
+    XRealIp,
+}
 
-        // X-Forwarded-For: use the rightmost (last) entry — appended by trusted GKE LB
-        if let Some(forwarded) = headers.get("X-Forwarded-For") {
-            if let Ok(value) = forwarded.to_str() {
-                let ip = value.rsplit(',').next().unwrap_or(value).trim();
-                if !ip.is_empty() {
-                    return Some(ip.to_string());
-                }
+impl ClientIpHeader {
+    fn name(self) -> &'static str {
+        match self {
+            ClientIpHeader::CfConnectingIp => "CF-Connecting-IP",
+            ClientIpHeader::TrueClientIp => "True-Client-IP",
+            ClientIpHeader::XForwardedFor => "X-Forwarded-For",
+            ClientIpHeader::XRealIp => "X-Real-IP",
+        }
+    }
+}
+
+/// Parse a `TRUSTED_CLIENT_IP_HEADERS` value. Unknown names are logged and
+/// skipped; an unset or empty value (or one with no valid names) yields the
+/// default, `x-forwarded-for` only.
+pub fn parse_trusted_client_ip_headers(raw: Option<&str>) -> Vec<ClientIpHeader> {
+    let mut out = Vec::new();
+    for name in raw.unwrap_or_default().split(',') {
+        let name = name.trim().to_ascii_lowercase();
+        let header = match name.as_str() {
+            "" => continue,
+            "cf-connecting-ip" => ClientIpHeader::CfConnectingIp,
+            "true-client-ip" => ClientIpHeader::TrueClientIp,
+            "x-forwarded-for" => ClientIpHeader::XForwardedFor,
+            "x-real-ip" => ClientIpHeader::XRealIp,
+            other => {
+                tracing::error!("Unknown header in TRUSTED_CLIENT_IP_HEADERS: {other:?} — skipping");
+                continue;
+            }
+        };
+        if !out.contains(&header) {
+            out.push(header);
+        }
+    }
+    if out.is_empty() {
+        out.push(ClientIpHeader::XForwardedFor);
+    }
+    out
+}
+
+/// Where a client address came from (NAN-5015).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientIp {
+    pub ip: String,
+    /// `true` when the address is the TCP peer itself, `false` when it was
+    /// read from a forwarded header (an address a proxy vouched for, not one
+    /// this process observed). Only a socket-derived loopback address is
+    /// "local".
+    pub from_socket: bool,
+}
+
+/// SECURITY: Extract the client IP (NAN-5015).
+///
+/// **Trust model**: forwarded-client headers are consulted only when the TCP
+/// peer is inside `TRUSTED_PROXY_CIDRS`, and only the headers listed in
+/// `TRUSTED_CLIENT_IP_HEADERS` (default: `X-Forwarded-For`), in that order.
+/// With no trusted proxy CIDRs configured, no header is trusted and the
+/// socket address is used — the secure default.
+///
+/// For `X-Forwarded-For` the RIGHTMOST entry is used: the leftmost entries are
+/// client-controlled; the rightmost is the one the trusted proxy appended.
+pub fn extract_client_ip_origin(
+    headers: &HeaderMap,
+    connect_info: Option<&SocketAddr>,
+) -> Option<ClientIp> {
+    extract_client_ip_with(headers, connect_info, &TRUSTED_CLIENT_IP_HEADERS, is_trusted_proxy(connect_info))
+}
+
+/// [`extract_client_ip_origin`] with explicit configuration (unit-testable).
+pub fn extract_client_ip_with(
+    headers: &HeaderMap,
+    connect_info: Option<&SocketAddr>,
+    trusted_headers: &[ClientIpHeader],
+    peer_is_trusted_proxy: bool,
+) -> Option<ClientIp> {
+    if peer_is_trusted_proxy {
+        for header in trusted_headers {
+            let Some(value) = headers.get(header.name()).and_then(|v| v.to_str().ok()) else {
+                continue;
+            };
+            let candidate = match header {
+                ClientIpHeader::XForwardedFor => value.rsplit(',').next().unwrap_or(value),
+                _ => value,
+            }
+            .trim();
+            if !candidate.is_empty() {
+                return Some(ClientIp {
+                    ip: candidate.to_string(),
+                    from_socket: false,
+                });
             }
         }
     } else {
@@ -164,8 +230,17 @@ pub fn extract_client_ip(headers: &HeaderMap, connect_info: Option<&SocketAddr>)
         );
     }
 
-    // Fall back to connection socket address (direct connection without proxy)
-    connect_info.map(|addr| addr.ip().to_string())
+    connect_info.map(|addr| ClientIp {
+        ip: addr.ip().to_string(),
+        from_socket: true,
+    })
+}
+
+/// The client IP as a string (see [`extract_client_ip_origin`] for the trust
+/// model). Kept for the many audit / rate-limit callers that need only the
+/// address.
+pub fn extract_client_ip(headers: &HeaderMap, connect_info: Option<&SocketAddr>) -> Option<String> {
+    extract_client_ip_origin(headers, connect_info).map(|c| c.ip)
 }
 
 /// Extract user agent string from request headers.
@@ -175,3 +250,7 @@ pub fn extract_user_agent(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
 }
+
+#[cfg(test)]
+#[path = "headers_tests.rs"]
+mod headers_tests;

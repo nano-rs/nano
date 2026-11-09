@@ -3020,15 +3020,8 @@ impl SourceConfigService {
     /// `\` → `\\`, `"` → `\"`. The surrounding TOML basic-string literal
     /// applies its own escaping on top.
     fn vrl_escape(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        for ch in s.chars() {
-            match ch {
-                '\\' => out.push_str("\\\\"),
-                '"' => out.push_str("\\\""),
-                _ => out.push(ch),
-            }
-        }
-        out
+        // One VRL string-literal escape for every generator (NAN-5033).
+        crate::parsers::vrl_safety::vrl_string_body(s)
     }
 
     /// Update the dynamic router to include all source configuration routes

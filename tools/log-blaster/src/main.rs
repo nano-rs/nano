@@ -286,13 +286,17 @@ async fn main() -> Result<()> {
     );
 
     // Auth token resolution (matches scripts/generate-*.py convention):
-    //   --token flag  >  VECTOR_AUTH_TOKEN env  >  "nanosiem-default-token"
+    //   --token flag  >  VECTOR_AUTH_TOKEN env  (no built-in default: nano
+    //   refuses its old public default token)
     // The token field is shared across the Vector and HEC transports — the
     // OOTB HEC listener also reads `VECTOR_AUTH_TOKEN` (one token to
     // rotate). The Tenzir listener has no auth, so skip resolution there.
     if args.token.is_none() && args.tenzir.is_none() {
         let resolved = std::env::var("VECTOR_AUTH_TOKEN")
-            .unwrap_or_else(|_| "nanosiem-default-token".to_string());
+            .unwrap_or_else(|_| {
+                eprintln!("set --token or VECTOR_AUTH_TOKEN (an ingest token or the install token)");
+                std::process::exit(2)
+            });
         info!(
             "Using {} auth token: ***{}",
             if args.hec { "HEC" } else { "Vector" },

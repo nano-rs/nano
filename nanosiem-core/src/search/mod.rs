@@ -15,8 +15,11 @@ pub mod background;
 pub mod classification;
 mod config;
 pub mod denied_source_audit;
+pub mod display_sql;
 mod evaluator;
 mod execution;
+/// Shared with the generated-SQL tripwire (`crate::query::generated_sql_tripwire`).
+pub(crate) use execution::validation::DISALLOWED_FUNCTIONS;
 pub mod field_usage;
 pub mod field_utils;
 pub mod jobs;

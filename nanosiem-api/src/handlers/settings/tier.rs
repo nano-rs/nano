@@ -37,11 +37,24 @@ pub struct TierUsageResponse {
     pub today: nanosiem_core::DailyUsage,
 }
 
-/// Request to set the organization tier
+/// Request to update the v2 entitlement identity. `tier` is accepted only for
+/// pre-v2 clients and normalizes to licensed plus historical capacity.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetTierRequest {
-    /// Tier name: unrestricted, hobby, startup, growth, team, starter, pro, enterprise
-    pub tier: String,
+    /// Compatibility tier name: hobby, startup, growth, team, starter, pro,
+    /// enterprise, unrestricted, open, or licensed.
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// Product edition. It must match the running open/enterprise build.
+    #[serde(default)]
+    pub edition: Option<nanosiem_core::EntitlementEdition>,
+    /// Deployment operator. It may be echoed by clients but is controlled by
+    /// provisioning or a signed licence and cannot be changed here.
+    #[serde(default)]
+    pub operator: Option<nanosiem_core::EntitlementOperator>,
+    /// Contracted decimal GB/day capacity. Capacity never selects features.
+    #[serde(default)]
+    pub capacity_gb_per_day: Option<f64>,
 }
 
 /// Query params for usage history
@@ -91,15 +104,38 @@ pub struct AiUsageDetailResponse {
 // Handler Functions
 // ============================================================================
 
-/// Clamp stored tier entitlements to what this build can actually serve.
+/// Clamp stored entitlements to what this build can actually serve.
 ///
-/// The tier row says what the plan *allows*; it cannot grant a surface the
-/// binary does not contain. Open-core builds have no OIDC/SAML handlers, so
+/// The row cannot grant a surface the binary does not contain. Open-core
+/// builds have no OIDC/SAML handlers, so
 /// reporting `sso_enabled: true` there contradicts `/api/capabilities` and the
 /// 404s from `/api/settings/oidc` (NAN-3378).
 pub(crate) fn clamp_to_build(mut limits: nanosiem_core::TierLimits) -> nanosiem_core::TierLimits {
-    limits.sso_enabled &= crate::handlers::capabilities::SSO_AVAILABLE;
+    limits.entitlement.edition = if cfg!(feature = "enterprise") {
+        nanosiem_core::EntitlementEdition::Licensed
+    } else {
+        nanosiem_core::EntitlementEdition::Open
+    };
+    limits.tier = if cfg!(feature = "enterprise") {
+        nanosiem_core::OrganizationTier::Licensed
+    } else {
+        nanosiem_core::OrganizationTier::Open
+    };
+    limits.sso_enabled = crate::handlers::capabilities::SSO_AVAILABLE
+        && limits.entitlement.edition == nanosiem_core::EntitlementEdition::Licensed;
     limits
+}
+
+fn validate_operator_provenance(
+    requested: Option<nanosiem_core::EntitlementOperator>,
+    current: nanosiem_core::EntitlementOperator,
+) -> Result<(), ApiError> {
+    if requested.is_some_and(|operator| operator != current) {
+        return Err(ApiError::ValidationError(
+            "operator is controlled by deployment provisioning or the signed licence".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Get current organization tier, limits, and usage
@@ -179,7 +215,8 @@ pub async fn get_tier_status(
     }))
 }
 
-/// Update the organization tier
+/// Update entitlement capacity or accept a legacy tier input. Operator is
+/// read-only provenance controlled by provisioning or the signed licence.
 #[utoipa::path(
     put,
     path = "/api/settings/tier",
@@ -200,25 +237,59 @@ pub async fn set_tier(
 ) -> Result<Json<nanosiem_core::TierLimits>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
-    let tier: nanosiem_core::OrganizationTier = req
-        .tier
-        .parse()
-        .map_err(|e: nanosiem_core::TierError| ApiError::ValidationError(e.to_string()))?;
-
     let tier_settings = nanosiem_core::TierSettings::new(state.pool.clone());
-    let limits = clamp_to_build(tier_settings.set_tier(tier).await?);
+    let current = tier_settings.get_tier_limits().await?;
+    let mut entitlement = current.entitlement;
+    let build_edition = if cfg!(feature = "enterprise") {
+        nanosiem_core::EntitlementEdition::Licensed
+    } else {
+        nanosiem_core::EntitlementEdition::Open
+    };
+    if let Some(tier_name) = req.tier.as_deref() {
+        let tier: nanosiem_core::OrganizationTier = tier_name
+            .parse()
+            .map_err(|e: nanosiem_core::TierError| ApiError::ValidationError(e.to_string()))?;
+        entitlement = nanosiem_core::Entitlement::from_legacy_tier(tier, entitlement.operator);
+        entitlement.edition = build_edition;
+        if entitlement.capacity_gb_per_day.is_none() {
+            entitlement.capacity_gb_per_day = current.entitlement.capacity_gb_per_day;
+        }
+    }
+    if let Some(edition) = req.edition {
+        entitlement.edition = edition;
+    }
+    validate_operator_provenance(req.operator, current.entitlement.operator)?;
+    if let Some(capacity) = req.capacity_gb_per_day {
+        entitlement.capacity_gb_per_day = Some(capacity);
+    }
+    if entitlement.edition != build_edition {
+        return Err(ApiError::ValidationError(format!(
+            "edition must match this {} build",
+            build_edition
+        )));
+    }
+    let limits = clamp_to_build(tier_settings.set_entitlement(entitlement).await?);
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::Settings, nanosiem_core::audit::TIER_UPDATED)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("settings", None, Some("tier".to_string()))
-            .details(serde_json::json!({ "tier": req.tier }))
+            .details(serde_json::json!({
+                "legacy_tier": req.tier,
+                "entitlement": limits.entitlement,
+            }))
             .client_context(&client)
             .build(),
     );
 
-    tracing::info!(tier = %req.tier, user_id = %auth.user_id(), "Organization tier updated");
+    tracing::info!(
+        edition = %limits.entitlement.edition,
+        operator = %limits.entitlement.operator,
+        capacity_gb_per_day = ?limits.entitlement.capacity_gb_per_day,
+        user_id = %auth.user_id(),
+        "Entitlement updated"
+    );
 
     Ok(Json(limits))
 }
@@ -341,7 +412,9 @@ pub async fn get_ai_usage_detail(
     // Headline billed-credit figure degrades to 0 rather than failing the whole
     // request — the ledger breakdowns below are the primary payload here.
     let credits_used = tier_settings.get_ai_credits_used().await.unwrap_or(0);
-    let by_agent = tier_settings.get_ai_usage_by_agent(from_ts, to_excl).await?;
+    let by_agent = tier_settings
+        .get_ai_usage_by_agent(from_ts, to_excl)
+        .await?;
     let daily = tier_settings.get_ai_usage_daily(from_ts, to_excl).await?;
     let recent = tier_settings.get_recent_ai_events(limit).await?;
 

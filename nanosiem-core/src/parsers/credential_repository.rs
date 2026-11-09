@@ -633,15 +633,15 @@ impl CredentialRepository {
     /// (NAN-4902: it used to surface as an "Encryption error" 500).
     pub async fn delete(&self, id: Uuid) -> Result<(), CredentialRepositoryError> {
         // `custom_enrichments` is an enterprise-overlay table: an open-core
-        // database does not have it, so it is only named when it exists.
+        // database does not have it, so it is only named when it exists, and
+        // the open build never compiles a statement that names it.
+        #[cfg(feature = "enterprise")]
         let enrichments = self.custom_enrichments_exist().await?;
+        #[cfg(not(feature = "enterprise"))]
+        let enrichments = false;
         let mut tx = self.pool.begin().await?;
         let sql = if enrichments {
-            "DELETE FROM cloud_credentials cc \
-             WHERE cc.id = $1 \
-               AND NOT EXISTS (SELECT 1 FROM source_configurations sc WHERE sc.credential_id = cc.id) \
-               AND NOT EXISTS (SELECT 1 FROM connector_feeds cf WHERE cf.credential_id = cc.id) \
-               AND NOT EXISTS (SELECT 1 FROM custom_enrichments ce WHERE ce.credential_id = cc.id)"
+            ENTERPRISE_DELETE_SQL
         } else {
             "DELETE FROM cloud_credentials cc \
              WHERE cc.id = $1 \
@@ -693,13 +693,12 @@ impl CredentialRepository {
 
     /// Objects that block deleting this credential, named for the 409 message.
     async fn credential_users(&self, id: Uuid) -> Result<Vec<String>, CredentialRepositoryError> {
-        let sql = if self.custom_enrichments_exist().await? {
-            "SELECT 'source configuration' AS kind, name FROM source_configurations WHERE credential_id = $1 \
-             UNION ALL \
-             SELECT 'pull feed' AS kind, name FROM connector_feeds WHERE credential_id = $1 \
-             UNION ALL \
-             SELECT 'custom enrichment' AS kind, name FROM custom_enrichments WHERE credential_id = $1 \
-             ORDER BY 1, 2"
+        #[cfg(feature = "enterprise")]
+        let enrichments = self.custom_enrichments_exist().await?;
+        #[cfg(not(feature = "enterprise"))]
+        let enrichments = false;
+        let sql = if enrichments {
+            ENTERPRISE_USERS_SQL
         } else {
             "SELECT 'source configuration' AS kind, name FROM source_configurations WHERE credential_id = $1 \
              UNION ALL \
@@ -714,6 +713,7 @@ impl CredentialRepository {
     }
 
     /// Whether the enterprise-overlay `custom_enrichments` table exists.
+    #[cfg(feature = "enterprise")]
     async fn custom_enrichments_exist(&self) -> Result<bool, CredentialRepositoryError> {
         Ok(sqlx::query_scalar("SELECT to_regclass('public.custom_enrichments') IS NOT NULL")
             .fetch_one(&self.pool)
@@ -744,3 +744,24 @@ mod tests {
         assert!(!valid_providers.contains(&"azure_blob"));
     }
 }
+
+/// Credential delete that also honours enterprise custom-enrichment references.
+#[cfg(feature = "enterprise")]
+const ENTERPRISE_DELETE_SQL: &str = "DELETE FROM cloud_credentials cc \
+     WHERE cc.id = $1 \
+       AND NOT EXISTS (SELECT 1 FROM source_configurations sc WHERE sc.credential_id = cc.id) \
+       AND NOT EXISTS (SELECT 1 FROM connector_feeds cf WHERE cf.credential_id = cc.id) \
+       AND NOT EXISTS (SELECT 1 FROM custom_enrichments ce WHERE ce.credential_id = cc.id)";
+#[cfg(not(feature = "enterprise"))]
+const ENTERPRISE_DELETE_SQL: &str = "";
+
+/// Credential users including enterprise custom enrichments.
+#[cfg(feature = "enterprise")]
+const ENTERPRISE_USERS_SQL: &str = "SELECT 'source configuration' AS kind, name FROM source_configurations WHERE credential_id = $1 \
+     UNION ALL \
+     SELECT 'pull feed' AS kind, name FROM connector_feeds WHERE credential_id = $1 \
+     UNION ALL \
+     SELECT 'custom enrichment' AS kind, name FROM custom_enrichments WHERE credential_id = $1 \
+     ORDER BY 1, 2";
+#[cfg(not(feature = "enterprise"))]
+const ENTERPRISE_USERS_SQL: &str = "";

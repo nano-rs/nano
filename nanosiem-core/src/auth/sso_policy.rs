@@ -101,6 +101,7 @@ impl SsoAccessPolicy {
     /// Whether the IdP verified this email, for linking onto an existing
     /// local account or creating a new one. Only called after signature,
     /// exact issuer, audience and nonce validation.
+    #[cfg(feature = "enterprise")]
     pub fn verifies_email(&self, claims: &super::IdTokenClaims) -> bool {
         if claims.verified_email() {
             return true;

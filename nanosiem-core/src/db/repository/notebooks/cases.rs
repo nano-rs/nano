@@ -4,6 +4,8 @@
 
 use uuid::Uuid;
 
+use crate::auth::ViewerScope;
+
 use crate::models::notebook::{Notebook, NotebookSummary, NotebookWithOwner};
 
 use super::{notebook_visible_to_user, NotebookRepository, NotebookRepositoryError};
@@ -275,7 +277,7 @@ impl NotebookRepository {
     pub async fn find_notebooks_with_entities(
         &self,
         entity_values: &[String],
-        user_id: Uuid,
+        viewer: &ViewerScope,
         exclude_case_notebooks: bool,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
         if entity_values.is_empty() {
@@ -317,14 +319,16 @@ impl NotebookRepository {
             LIMIT 20
             "#,
             case_notebook_filter,
-            visible = notebook_visible_to_user(),
+            visible = notebook_visible_to_user(viewer.deny_param(3)),
         );
 
-        let results = sqlx::query_as::<_, NotebookSummary>(&query)
+        let mut q = sqlx::query_as::<_, NotebookSummary>(&query)
             .bind(entity_values)
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await?;
+            .bind(viewer.user_id());
+        if let Some(deny) = viewer.deny_bind() {
+            q = q.bind(deny);
+        }
+        let results = q.fetch_all(&self.pool).await?;
 
         Ok(results)
     }

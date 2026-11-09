@@ -32,6 +32,9 @@ pub enum MarketplaceError {
     #[error("Credential required for this enrichment")]
     CredentialRequired,
 
+    #[error("{0} requires the enterprise edition")]
+    EnterpriseRequired(String),
+
     /// A supplied credential field failed validation before being persisted.
     ///
     /// NAN-2343: carries the field name so the UI can attach the message to the
@@ -74,6 +77,7 @@ impl MarketplaceError {
             MarketplaceError::AlreadyInstalled(_) => 409,
             MarketplaceError::InvalidUrl(_) => 400,
             MarketplaceError::CredentialRequired => 400,
+            MarketplaceError::EnterpriseRequired(_) => 403,
             MarketplaceError::InvalidCredential { .. } => 422,
             MarketplaceError::ProvidedByPlatformFeed(_) => 409,
             MarketplaceError::GitError(_) => 502,

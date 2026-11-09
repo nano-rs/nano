@@ -35,7 +35,7 @@ jobs:
     # toolchain available on the runner for the image build. Assumes a dedicated
     # runner: the compose services use fixed container_names (nanosiem-*), so
     # this must not run on a host that already has a nanosiem compose stack up.
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, nano-pr]
     timeout-minutes: 45
     env:
       # Isolate this run's containers/network from anything else on the runner.
@@ -45,6 +45,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # The dev compose ships no install token (security review 2026-11-08):
+      # generate one per run for Vector and the gate script.
+      - name: Generate a per-run Vector install token
+        run: echo "VECTOR_AUTH_TOKEN=$(openssl rand -hex 24)" >> "$GITHUB_ENV"
 
       - name: Apply ClickHouse schema (build api image + run clickhouse_migrator)
         # The compose `clickhouse-migrate` service builds nanosiem-api from this

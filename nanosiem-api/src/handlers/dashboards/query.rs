@@ -346,7 +346,7 @@ fn format_piped_value(value: &str, preceding: Option<char>) -> String {
 /// Escape a value for safe SQL interpolation.
 /// Escapes single quotes by doubling them, and escapes backslashes.
 fn escape_sql_value(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('\'', "''")
+    nanosiem_core::sql_hygiene::escape_sql_string(value)
 }
 
 #[cfg(test)]

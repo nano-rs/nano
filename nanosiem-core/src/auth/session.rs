@@ -257,8 +257,15 @@ impl SessionService {
             return Err(SessionError::PermissionDenied);
         }
 
-        // Delete all sessions for the user
-        let count = self.session_repo.delete_user_sessions(user_id).await?;
+        // Signing ANOTHER user out (an admin action, typically on a suspected
+        // compromise) must kill their access tokens too, not just refresh
+        // tokens (NAN-5014). Signing yourself out of every device deletes the
+        // sessions only, so the tab that asked keeps working.
+        let count = if user_id != requesting_user_id {
+            self.session_repo.revoke_user_credentials(user_id).await?
+        } else {
+            self.session_repo.delete_user_sessions(user_id).await?
+        };
 
         Ok(count)
     }

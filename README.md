@@ -294,7 +294,7 @@ Self-hosting nano with these features requires a commercial license —
 We accept community contributions under a CLA — see
 [CONTRIBUTING.md](./CONTRIBUTING.md) and
 [.github/ICLA.md](./.github/ICLA.md). DCO is not sufficient because nano is
-open-core; the CLA grants Nano LLC the sublicensing right needed to keep
+open-core; the CLA grants nano, LLC the sublicensing right needed to keep
 parts of the platform proprietary while still accepting your patches.
 
 Bug reports and feature requests:

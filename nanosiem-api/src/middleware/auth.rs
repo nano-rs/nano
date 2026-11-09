@@ -502,6 +502,11 @@ pub async fn auth_middleware(
                         ApiKeyServiceError::RateLimitExceeded => {
                             (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded")
                         }
+                        // NAN-5044: owner permissions unknown → fail closed, retryable.
+                        ApiKeyServiceError::OwnerPermissionsUnavailable => (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "API key permissions are temporarily unavailable; retry shortly",
+                        ),
                         _ => (StatusCode::UNAUTHORIZED, "Invalid API key"),
                     };
 

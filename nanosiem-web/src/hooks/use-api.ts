@@ -662,12 +662,29 @@ export function useTestLogSourceVrlLive() {
   );
 }
 
+/**
+ * NAN-5133: a deploy the server did not put live answers 200 with
+ * `success: false`. Surface that as an error so no caller toasts "Deployed"
+ * for it; a successful result's `message` names what went live (on a
+ * role-split install, the published generation and how many ingest hosts
+ * acknowledged it).
+ */
+async function requireDeploySuccess(
+  pending: Promise<import('@/lib/api/types').EnhancedDeploymentResponse>
+): Promise<import('@/lib/api/types').EnhancedDeploymentResponse> {
+  const result = await pending;
+  if (result && result.success === false) {
+    throw new ApiClientError(result.message || 'The deploy did not go live.', 'DEPLOY_FAILED', result);
+  }
+  return result;
+}
+
 export function useDeployLogSource() {
-  return useMutation((id: string) => api.deployLogSource(id));
+  return useMutation((id: string) => requireDeploySuccess(api.deployLogSource(id)));
 }
 
 export function useUndeployLogSource() {
-  return useMutation((id: string) => api.undeployLogSource(id));
+  return useMutation((id: string) => requireDeploySuccess(api.undeployLogSource(id)));
 }
 
 export function useDeployAllLogSources() {
@@ -1243,6 +1260,14 @@ export function useUpdateAiProvider() {
 
 export function useValidateAiProvider() {
   return useMutation((provider: string) => api.validateAiProvider(provider));
+}
+
+/** NAN-5136: models served by a provider's own endpoint. */
+export function useDiscoverProviderModels() {
+  return useMutation(
+    ({ provider, request }: { provider: string; request?: Parameters<typeof api.discoverProviderModels>[1] }) =>
+      api.discoverProviderModels(provider, request),
+  );
 }
 
 // ============================================================================

@@ -4,6 +4,8 @@
 
 use uuid::Uuid;
 
+use crate::auth::ViewerScope;
+
 use crate::models::notebook::{NotebookTab, NotebookTabWithDetails};
 
 use super::{notebook_visible_to_user, NotebookRepository, NotebookRepositoryError};
@@ -22,7 +24,7 @@ impl NotebookRepository {
     /// notebook's title/status/entry-count/`case_id` visible indefinitely.
     pub async fn list_tabs_for_user(
         &self,
-        user_id: Uuid,
+        viewer: &ViewerScope,
     ) -> Result<Vec<NotebookTabWithDetails>, NotebookRepositoryError> {
         // First, cleanup stale tabs (unpinned tabs not accessed in 7 days)
         self.cleanup_stale_tabs(7).await?;
@@ -30,9 +32,10 @@ impl NotebookRepository {
         // Defense in depth only: the SELECT below is filtered independently, so
         // a failure here cannot leak. It makes revocation self-healing instead
         // of leaving a row that a future query might forget to filter.
-        self.prune_inaccessible_tabs(user_id).await?;
+        self.prune_inaccessible_tabs(viewer).await?;
 
-        let results = sqlx::query_as::<_, NotebookTabWithDetails>(&format!(
+        let user_id = viewer.user_id();
+        let sql = format!(
             r#"
             SELECT
                 t.id,
@@ -58,15 +61,18 @@ impl NotebookRepository {
               AND {predicate}
             ORDER BY t.tab_order ASC
             "#,
-            predicate = notebook_visible_to_user(),
-        ))
-        .bind(user_id)
-        // $2 — the access predicate's user id. Same value as $1; bound
-        // separately so the shared predicate keeps ONE placeholder contract
-        // across every query that embeds it.
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
+            predicate = notebook_visible_to_user(viewer.deny_param(3)),
+        );
+        let mut query = sqlx::query_as::<_, NotebookTabWithDetails>(&sql)
+            .bind(user_id)
+            // $2 — the access predicate's user id. Same value as $1; bound
+            // separately so the shared predicate keeps ONE placeholder contract
+            // across every query that embeds it.
+            .bind(user_id);
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let results = query.fetch_all(&self.pool).await?;
 
         Ok(results)
     }
@@ -76,8 +82,12 @@ impl NotebookRepository {
     /// Share revocation, a visibility tightening, group removal and case-access
     /// loss all leave `notebook_tabs` rows behind; nothing else removes them.
     /// Scoped to one user so a caller can only ever prune their own rows.
-    async fn prune_inaccessible_tabs(&self, user_id: Uuid) -> Result<u64, NotebookRepositoryError> {
-        let result = sqlx::query(&format!(
+    async fn prune_inaccessible_tabs(
+        &self,
+        viewer: &ViewerScope,
+    ) -> Result<u64, NotebookRepositoryError> {
+        let user_id = viewer.user_id();
+        let sql = format!(
             r#"
             DELETE FROM notebook_tabs t
             WHERE t.user_id = $1
@@ -87,12 +97,13 @@ impl NotebookRepository {
                     AND {predicate}
               )
             "#,
-            predicate = notebook_visible_to_user(),
-        ))
-        .bind(user_id)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await?;
+            predicate = notebook_visible_to_user(viewer.deny_param(3)),
+        );
+        let mut query = sqlx::query(&sql).bind(user_id).bind(user_id);
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let result = query.execute(&self.pool).await?;
 
         Ok(result.rows_affected())
     }
@@ -101,11 +112,12 @@ impl NotebookRepository {
     /// Sets the tab as active and updates last_accessed_at
     pub async fn open_tab(
         &self,
-        user_id: Uuid,
+        viewer: &ViewerScope,
         notebook_id: Uuid,
     ) -> Result<NotebookTab, NotebookRepositoryError> {
-        // Verify user has access to this notebook
-        self.find_by_id_for_user(notebook_id, user_id).await?;
+        // Verify user has access to this notebook (case ACL + source scope).
+        self.find_by_id_for_user(notebook_id, viewer).await?;
+        let user_id = viewer.user_id();
 
         // Get max tab_order for this user
         let max_order = sqlx::query_scalar::<_, Option<i32>>(
@@ -185,10 +197,11 @@ impl NotebookRepository {
     /// when the target is not visible, so nothing is deactivated on refusal.
     pub async fn set_active_tab(
         &self,
-        user_id: Uuid,
+        viewer: &ViewerScope,
         notebook_id: Uuid,
     ) -> Result<NotebookTab, NotebookRepositoryError> {
-        let result = sqlx::query_as::<_, NotebookTab>(&format!(
+        let user_id = viewer.user_id();
+        let sql = format!(
             r#"
             WITH target AS (
                 SELECT t.id
@@ -213,14 +226,19 @@ impl NotebookRepository {
             )
             SELECT * FROM switched WHERE id IN (SELECT id FROM target)
             "#,
-            predicate = notebook_visible_to_user(),
-        ))
-        .bind(user_id)
-        .bind(user_id)
-        .bind(notebook_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(NotebookRepositoryError::NotFound(notebook_id))?;
+            predicate = notebook_visible_to_user(viewer.deny_param(4)),
+        );
+        let mut query = sqlx::query_as::<_, NotebookTab>(&sql)
+            .bind(user_id)
+            .bind(user_id)
+            .bind(notebook_id);
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let result = query
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(NotebookRepositoryError::NotFound(notebook_id))?;
 
         Ok(result)
     }
@@ -239,10 +257,10 @@ impl NotebookRepository {
     pub async fn update_tab(
         &self,
         tab_id: Uuid,
-        user_id: Uuid,
+        viewer: &ViewerScope,
         is_pinned: Option<bool>,
     ) -> Result<NotebookTab, NotebookRepositoryError> {
-        let result = sqlx::query_as::<_, NotebookTab>(&format!(
+        let sql = format!(
             r#"
             UPDATE notebook_tabs t
             SET is_pinned = COALESCE($3, t.is_pinned)
@@ -254,14 +272,19 @@ impl NotebookRepository {
               )
             RETURNING t.*
             "#,
-            predicate = notebook_visible_to_user(),
-        ))
-        .bind(tab_id)
-        .bind(user_id)
-        .bind(is_pinned)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(NotebookRepositoryError::TabNotFound(tab_id))?;
+            predicate = notebook_visible_to_user(viewer.deny_param(4)),
+        );
+        let mut query = sqlx::query_as::<_, NotebookTab>(&sql)
+            .bind(tab_id)
+            .bind(viewer.user_id())
+            .bind(is_pinned);
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let result = query
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(NotebookRepositoryError::TabNotFound(tab_id))?;
 
         Ok(result)
     }

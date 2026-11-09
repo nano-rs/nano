@@ -667,6 +667,8 @@ _IMAGE_ROLES: dict[str, frozenset[str]] = {
     "postgres": frozenset({"postgres"}),
     "clickhouse-server": frozenset({"clickhouse"}),
     "clickhouse-keeper": frozenset({"keeper"}),
+    "valkey": frozenset({"app"}),
+    # Pre-NAN-5082 releases (legacy N-1 locks) still carry Dragonfly.
     "dragonfly": frozenset({"app"}),
     "vector": frozenset({"ingest"}),
     "curl": frozenset({"ingest"}),

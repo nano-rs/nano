@@ -353,6 +353,17 @@ pub async fn delete_group(
     check_permission(&auth, permissions::GROUPS_DELETE)
         .map_err(|(s, j)| (s, Json(GroupApiError::new(&j.error, &j.message))))?;
 
+    // NAN-5027 (sweep): deleting a group strips what it confers from every
+    // member — the caller must currently hold all of it.
+    crate::handlers::grant_authz::ensure_can_revoke_group(
+        &auth,
+        &state.pool,
+        permissions::GROUPS_DELETE,
+        *id,
+    )
+    .await
+    .map_err(|g| (g.status, Json(GroupApiError::new(g.code, &g.message))))?;
+
     // Get group name for audit before deleting
     let group_name = state
         .group_repo
@@ -377,6 +388,17 @@ pub async fn delete_group(
     );
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 409 when two authority checks of one request saw different generations.
+fn grant_authority_changed() -> (StatusCode, Json<GroupApiError>) {
+    (
+        StatusCode::CONFLICT,
+        Json(GroupApiError::new(
+            "grant_authority_changed",
+            "Authorization changed while the request was being validated; retry",
+        )),
+    )
 }
 
 /// Update group roles request
@@ -428,6 +450,20 @@ pub async fn update_group_roles(
     )
     .await
     .map_err(|g| (g.status, Json(GroupApiError::new(g.code, &g.message))))?;
+    // NAN-5027 (sweep): replacing the roles also REMOVES what the group confers
+    // today from every member — the caller must hold that too. Both checks
+    // must observe the same authority generation.
+    let revoke_stamp = crate::handlers::grant_authz::ensure_can_revoke_group(
+        &auth,
+        &state.pool,
+        permissions::GROUPS_EDIT,
+        *id,
+    )
+    .await
+    .map_err(|g| (g.status, Json(GroupApiError::new(g.code, &g.message))))?;
+    if revoke_stamp != grant_stamp {
+        return Err(grant_authority_changed());
+    }
 
     state
         .group_repo

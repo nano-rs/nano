@@ -73,7 +73,7 @@ pub async fn get_asset_dossier(
 
     // NAN-1593: the asset dossier fires on every Asset-view load / shared-link
     // follow and runs 8 parallel ClickHouse aggregates — cache it through the
-    // same Dragonfly layer so reloads return instantly. Keyed on the
+    // same Valkey layer so reloads return instantly. Keyed on the
     // identifier, the resolved identities (they widen the match set), the
     // time range, and the caller's effective scope.
     let cache_key = crate::cache::SearchResultCache::companion_key(

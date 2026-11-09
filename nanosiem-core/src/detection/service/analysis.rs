@@ -38,6 +38,8 @@ const STEPPED_TESTER_CONCURRENCY: usize = 16;
 
 /// Autonomous validation is background work and must leave ClickHouse capacity
 /// for live hunting and scheduled detections.
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 const AUTONOMOUS_TUNING_CONCURRENCY: usize = 2;
 
 /// Lookback used when a rule has no `lookback_minutes` set. Matches the
@@ -478,6 +480,8 @@ impl DetectionService {
     /// Counts are exact only when every window succeeds, no autonomous row or
     /// byte budget is reached, and every returned row carries the physical
     /// source `id`. Callers persist those conditions and fail closed otherwise.
+    // Only the enterprise AI-tuning / DaC push paths call this.
+    #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
     pub(crate) async fn evaluate_tuning_windows(
         &self,
         query: &str,
@@ -609,6 +613,8 @@ impl DetectionService {
     /// Explicitly kill every possible query ID for one or more replay lanes.
     /// Used by the outer timeout, whose cancellation drops the replay future
     /// before its normal error cleanup can run.
+    // Only the enterprise AI-tuning / DaC push paths call this.
+    #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
     pub(crate) async fn cancel_tuning_replays(
         &self,
         query_id_prefixes: &[&str],
@@ -829,6 +835,8 @@ impl DetectionService {
 }
 
 #[derive(Default)]
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 struct JsonByteCounter(u64);
 
 impl Write for JsonByteCounter {
@@ -845,12 +853,16 @@ impl Write for JsonByteCounter {
     }
 }
 
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 fn serialized_json_size(value: &serde_json::Value) -> Option<u64> {
     let mut counter = JsonByteCounter::default();
     serde_json::to_writer(&mut counter, value).ok()?;
     Some(counter.0)
 }
 
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 fn replay_batch_usage(
     rows: &[serde_json::Value],
     rows_examined: u64,
@@ -874,14 +886,20 @@ fn replay_batch_usage(
     (next_bytes <= budget.bytes).then_some((next_rows, next_bytes))
 }
 
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 fn autonomous_window_is_truncated(row_count: usize) -> bool {
     u64::try_from(row_count).unwrap_or(u64::MAX) > MAX_AUTONOMOUS_TUNING_ROWS_PER_WINDOW
 }
 
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 fn autonomous_window_bytes_exceeded(byte_count: u64) -> bool {
     byte_count > MAX_AUTONOMOUS_TUNING_BYTES_PER_WINDOW
 }
 
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 fn tuning_replay_query_ids(prefix: &str, window_count: usize) -> Vec<String> {
     (0..window_count)
         .map(|index| format!("{prefix}-{index}"))
@@ -940,6 +958,8 @@ pub fn enumerate_test_windows(
 
 /// Build the exact production cadence/lookback windows used by autonomous
 /// tuning validation while enforcing its tighter unattended-workload limits.
+// Only the enterprise AI-tuning / DaC push paths call this.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 pub(crate) fn tuning_test_windows(
     range: &TimeRangeInput,
     schedule_cron: Option<&str>,

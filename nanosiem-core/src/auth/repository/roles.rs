@@ -464,6 +464,7 @@ impl RoleRepository {
     /// The ACL tables are enterprise-only, so open-edition schemas legitimately
     /// return an empty set. Ordering prevents two simultaneous role edits from
     /// deadlocking when their ACL footprints overlap.
+    #[cfg(feature = "enterprise")]
     async fn lock_playbook_acls_for_role_permission_change(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         role_id: Uuid,
@@ -489,6 +490,15 @@ impl RoleRepository {
         .await?)
     }
 
+    #[cfg(not(feature = "enterprise"))]
+    async fn lock_playbook_acls_for_role_permission_change(
+        _tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        _role_id: Uuid,
+    ) -> Result<Vec<Uuid>, RoleRepositoryError> {
+        Ok(Vec::new())
+    }
+
+    #[cfg(feature = "enterprise")]
     async fn assert_affected_playbook_acls_still_administrable(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         affected: &[Uuid],
@@ -519,6 +529,14 @@ impl RoleRepository {
         if orphaned.is_some() {
             return Err(RoleRepositoryError::WouldOrphanPlaybookAcl);
         }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    async fn assert_affected_playbook_acls_still_administrable(
+        _tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        _affected: &[Uuid],
+    ) -> Result<(), RoleRepositoryError> {
         Ok(())
     }
 

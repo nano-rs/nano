@@ -29,6 +29,23 @@ pub fn safe_name(name: &str) -> String {
         .to_lowercase()
 }
 
+/// The `.source_type` values a log source claims: its `match_values`, else
+/// its [`safe_name`].
+///
+/// One definition for every writer that keys on a source's claim: the
+/// `source_router` routes, the token route key a source-bound ingest token
+/// stamps (`ingest_tokens::route_key`, the first value), and the HEC /
+/// dispatch / `_unclaimed` filters. They used to disagree for a source with
+/// no `match_values`: the router and the token used `safe_name(name)`, the
+/// filters the raw name, so `Palo Alto FW` was stamped `palo_alto_fw` and then
+/// dropped by its own filter (`includes(["Palo Alto FW"], "palo_alto_fw")`).
+pub fn claim_keys(match_values: Option<&[String]>, name: &str) -> Vec<String> {
+    match match_values {
+        Some(values) if !values.is_empty() => values.to_vec(),
+        _ => vec![safe_name(name)],
+    }
+}
+
 /// The `vector.component_id` a generated pull-source carries in its internal
 /// log events.
 ///

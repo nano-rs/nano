@@ -601,7 +601,7 @@ export class ObservabilityApi {
    *
    * Threads `cacheOpts` so the trace surfaces (Traces-tab waterfall, TracePage,
    * the `| trace` command page) can render the "cached · refresh" badge and
-   * force a live refetch — the GET is Dragonfly-cached (`x-nano-cache*`) like
+   * force a live refetch — the GET is Valkey-cached (`x-nano-cache*`) like
    * every other obs read. Goes through `this.request` directly (rather than the
    * `getTraceImpl` passthrough, which can't forward cacheOpts) so the cache
    * headers reach the `onMeta` callback; the URL/behavior is identical to the

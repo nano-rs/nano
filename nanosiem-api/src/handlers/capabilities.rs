@@ -13,19 +13,19 @@
 //! a soft handle for staging environments where one bundle talks to either
 //! backend.
 
-use axum::Json;
+use axum::{extract::State, Json};
 use serde::Serialize;
 use utoipa::OpenApi;
 
+use crate::state::AppState;
+
 /// Per-surface capability flags.
 ///
-/// In this commit every flag toggles with the `enterprise` Cargo feature so
-/// they're effectively redundant with `edition`. The shape exists so that
-/// later phases can gate individual capabilities behind license tier or
-/// org-level config without changing the wire format — e.g., a "starter"
-/// enterprise tier without `aiTuning`. Until that lands, treat the flags as
-/// the canonical per-surface check (`capabilities.cases`) rather than reading
-/// edition directly.
+/// Licensed-only flags require both the enterprise build and live licence
+/// admission. The shape exists so that
+/// clients can use one canonical per-surface check (`capabilities.cases`)
+/// rather than inferring code availability from commercial metadata. V2 does
+/// not vary these flags by licensed capacity.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Capabilities {
@@ -71,6 +71,8 @@ pub struct Capabilities {
     /// Code-free IOC lists (`/api/ioc-lists`, NAN-4902 lane G): paste or upload
     /// indicators and publish them into the ClickHouse IOC store. Enterprise.
     pub ioc_lists: bool,
+    /// Governed SOAR execution and approval surfaces.
+    pub soar: bool,
     /// Threat-intel lookups and the Enrich flyout (`/api/threat-intel/*`,
     /// NAN-4931): external providers through the connector engine plus the
     /// install's own IOC feeds and lists. Enterprise.
@@ -117,32 +119,51 @@ pub(crate) const SSO_AVAILABLE: bool = ENTERPRISE;
     ),
     security(())
 )]
-pub async fn get_capabilities() -> Json<CapabilitiesResponse> {
-    Json(CapabilitiesResponse {
+pub async fn get_capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
+    #[cfg(feature = "enterprise")]
+    let licensed = crate::license_admission::licensed_features_available(
+        &*state.license_status.read().await,
+        chrono::Utc::now(),
+    );
+    #[cfg(not(feature = "enterprise"))]
+    let licensed = {
+        let _ = state;
+        false
+    };
+
+    Json(capabilities_response(licensed))
+}
+
+pub(crate) fn capabilities_response(licensed: bool) -> CapabilitiesResponse {
+    CapabilitiesResponse {
         edition: EDITION,
         version: env!("CARGO_PKG_VERSION"),
         capabilities: Capabilities {
-            cases: ENTERPRISE,
-            notebooks: ENTERPRISE,
-            risk: ENTERPRISE,
-            melod: ENTERPRISE,
-            custom_enrichment: ENTERPRISE,
-            agent_enrichment: ENTERPRISE,
-            ai_tuning: ENTERPRISE,
-            playbooks: ENTERPRISE,
-            incidents: ENTERPRISE,
+            cases: licensed,
+            notebooks: licensed,
+            risk: licensed,
+            melod: licensed,
+            custom_enrichment: licensed,
+            agent_enrichment: licensed,
+            ai_tuning: licensed,
+            playbooks: licensed,
+            incidents: licensed,
             // Both editions — see the field doc. Deliberately not ENTERPRISE.
             siem_health: true,
-            sso: SSO_AVAILABLE,
-            observability_convergence: ENTERPRISE,
-            ioc_lists: ENTERPRISE,
-            threat_intel: ENTERPRISE,
+            sso: licensed,
+            observability_convergence: licensed,
+            ioc_lists: licensed,
+            soar: licensed,
+            threat_intel: licensed,
         },
-    })
+    }
 }
 
 #[derive(OpenApi)]
-#[openapi(paths(get_capabilities), components(schemas(CapabilitiesResponse, Capabilities)))]
+#[openapi(
+    paths(get_capabilities),
+    components(schemas(CapabilitiesResponse, Capabilities))
+)]
 pub struct CapabilitiesApiDoc;
 
 #[cfg(test)]
@@ -151,7 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_known_edition() {
-        let Json(body) = get_capabilities().await;
+        let body = capabilities_response(ENTERPRISE);
         assert!(matches!(body.edition, "open" | "enterprise"));
         assert!(!body.version.is_empty());
     }
@@ -165,5 +186,28 @@ mod tests {
             assert_eq!(EDITION, "open");
             assert!(!ENTERPRISE);
         }
+    }
+
+    #[test]
+    fn hard_stop_matches_open_capability_boundary() {
+        let body = capabilities_response(false);
+        let licensed_flags = [
+            body.capabilities.cases,
+            body.capabilities.notebooks,
+            body.capabilities.risk,
+            body.capabilities.melod,
+            body.capabilities.custom_enrichment,
+            body.capabilities.agent_enrichment,
+            body.capabilities.ai_tuning,
+            body.capabilities.playbooks,
+            body.capabilities.incidents,
+            body.capabilities.sso,
+            body.capabilities.observability_convergence,
+            body.capabilities.ioc_lists,
+            body.capabilities.soar,
+            body.capabilities.threat_intel,
+        ];
+        assert!(licensed_flags.into_iter().all(|available| !available));
+        assert!(body.capabilities.siem_health);
     }
 }

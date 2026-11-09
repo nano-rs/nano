@@ -52,8 +52,22 @@ fn staleness_cutoff(
     multiplier: u64,
 ) -> chrono::DateTime<Utc> {
     let mult = multiplier.max(2);
-    now - chrono::Duration::hours((sync_interval_hours.max(1) * mult) as i64)
+    // Security review 2026-11-08: `sync_interval_hours` is tenant JSON with no
+    // validation, and this runs inline in the supervised identity scheduler.
+    // An unchecked `hours(n * mult)` / `now - d` panicked for large n (chrono
+    // range) and crash-looped the jobs process. Saturate instead: a cutoff
+    // that far back simply never marks anyone stale.
+    let hours = sync_interval_hours
+        .max(1)
+        .saturating_mul(mult)
+        .min(MAX_STALENESS_HOURS);
+    now.checked_sub_signed(chrono::Duration::hours(hours as i64))
+        .unwrap_or(chrono::DateTime::<Utc>::UNIX_EPOCH)
 }
+
+/// Upper bound on the staleness window (100 years): far beyond any real sync
+/// interval, and well inside chrono's `TimeDelta` range.
+const MAX_STALENESS_HOURS: u64 = 100 * 365 * 24;
 
 pub struct IdentitySyncScheduler {
     service: Arc<IdentitySyncService>,
@@ -231,6 +245,19 @@ mod tests {
         let now = Utc.timestamp_opt(1_717_000_000, 0).unwrap();
         assert_eq!(staleness_cutoff(now, 6, 1), now - Duration::hours(12));
         assert_eq!(staleness_cutoff(now, 6, 0), now - Duration::hours(12));
+    }
+
+    #[test]
+    fn staleness_cutoff_never_panics_on_huge_tenant_intervals() {
+        // Security review 2026-11-08: tenant JSON reaches this inline in the
+        // supervised scheduler; these values panicked chrono before.
+        let now = Utc::now();
+        for hours in [800_000_000u64, 1_000_000_000_000_000, u64::MAX] {
+            let cutoff = staleness_cutoff(now, hours, 3);
+            assert!(cutoff < now);
+        }
+        // A normal interval is unchanged.
+        assert_eq!(staleness_cutoff(now, 24, 3), now - Duration::hours(72));
     }
 
     #[test]

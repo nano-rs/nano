@@ -72,9 +72,11 @@ pub fn choose_keeper(rows: &[IncidentWorkflow]) -> Option<usize> {
 struct LinkSchema {
     case_id: bool,
     incident_id: bool,
+    #[cfg(feature = "enterprise")]
     case_alerts: bool,
 }
 
+#[cfg(feature = "enterprise")]
 async fn link_schema(tx: &mut Transaction<'_, Postgres>) -> Result<LinkSchema, sqlx::Error> {
     let (case_id, incident_id, case_alerts): (bool, bool, bool) = sqlx::query_as(
         "SELECT \
@@ -90,6 +92,14 @@ async fn link_schema(tx: &mut Transaction<'_, Postgres>) -> Result<LinkSchema, s
         case_id,
         incident_id,
         case_alerts,
+    })
+}
+
+#[cfg(not(feature = "enterprise"))]
+async fn link_schema(_tx: &mut Transaction<'_, Postgres>) -> Result<LinkSchema, sqlx::Error> {
+    Ok(LinkSchema {
+        case_id: false,
+        incident_id: false,
     })
 }
 
@@ -132,11 +142,14 @@ async fn consolidate(
 ) -> Result<(), sqlx::Error> {
     let case_col = if links.case_id { "case_id IS NOT NULL" } else { "false" };
     let incident_col = if links.incident_id { "incident_id IS NOT NULL" } else { "false" };
+    #[cfg(feature = "enterprise")]
     let link_col = if links.case_alerts {
         "EXISTS (SELECT 1 FROM case_alerts ca WHERE ca.alert_id = alerts.id)"
     } else {
         "false"
     };
+    #[cfg(not(feature = "enterprise"))]
+    let link_col = "false";
     let mut q = QueryBuilder::<Postgres>::new(format!(
         "SELECT id, created_at, status = 'acknowledged', assigned_to IS NOT NULL, \
          ({case_col} OR {incident_col} OR {link_col}) \
@@ -204,6 +217,7 @@ async fn consolidate(
         .execute(&mut **tx)
         .await?;
 
+    #[cfg(feature = "enterprise")]
     if links.case_alerts {
         // Repoint the duplicates' case links to the keeper (one link per
         // case; primary if any duplicate was primary), then drop theirs.

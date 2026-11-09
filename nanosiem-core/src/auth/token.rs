@@ -76,6 +76,35 @@ pub struct TokenConfig {
     pub audience: String,
 }
 
+/// Reject a `JWT_SECRET` that cannot protect anything: shorter than 32
+/// characters, or a value nano itself shipped as a default or an example
+/// (security review 2026-11-08). Anyone can sign tokens with a public value.
+///
+/// Shared by every service that verifies or mints JWTs (api, search, jobs), so
+/// they accept and refuse exactly the same secrets. The error is the
+/// operator-facing boot message and names the fix; it never contains the
+/// secret.
+pub fn validate_jwt_secret(secret: &str) -> Result<(), String> {
+    use crate::known_public_secrets::{is_known_public, SecretKind};
+    if is_known_public(SecretKind::Jwt, secret) {
+        return Err(
+            "SECURITY ERROR: JWT_SECRET is a publicly known default or example value, so anyone \
+             can forge login tokens. Generate a new one (`openssl rand -hex 32`), put it in \
+             JWT_SECRET for every nano service, and restart. Running install.sh again does this \
+             automatically. Existing sessions sign in again; API keys are unaffected."
+                .to_string(),
+        );
+    }
+    if secret.len() < 32 {
+        return Err(format!(
+            "SECURITY ERROR: JWT_SECRET must be at least 32 characters (got {}). Generate one \
+             with `openssl rand -hex 32`.",
+            secret.len()
+        ));
+    }
+    Ok(())
+}
+
 impl Default for TokenConfig {
     /// Creates a TokenConfig from environment variables.
     ///
@@ -85,11 +114,8 @@ impl Default for TokenConfig {
     fn default() -> Self {
         let secret = match std::env::var("JWT_SECRET") {
             Ok(secret) => {
-                if secret.len() < 32 {
-                    panic!(
-                        "SECURITY ERROR: JWT_SECRET must be at least 32 characters. \
-                         Set JWT_SECRET to a secure random value."
-                    );
+                if let Err(message) = validate_jwt_secret(&secret) {
+                    panic!("{message}");
                 }
                 secret
             }
@@ -511,7 +537,7 @@ impl TokenService {
     /// (cheap) and falls through to the shared Redis denylist on miss.
     /// Returns `true` only when revocation is positively confirmed; if
     /// Redis is unreachable we conservatively log and return the local
-    /// result to avoid locking out users during a Dragonfly outage.
+    /// result to avoid locking out users during a Valkey outage.
     async fn is_revoked_async(&self, jti: &Uuid) -> bool {
         if self.is_revoked(jti) {
             return true;
@@ -635,6 +661,10 @@ pub struct RefreshTokenClaims {
     /// Token type identifier
     pub token_type: String,
 }
+
+#[cfg(test)]
+#[path = "token_secret_policy_tests.rs"]
+mod secret_policy_tests;
 
 #[cfg(test)]
 mod tests {

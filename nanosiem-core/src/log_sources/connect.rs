@@ -169,6 +169,11 @@ fn is_system_route_key(key: &str) -> bool {
     SYSTEM_ROUTE_KEYS.contains(&key)
         || key.starts_with("nano_enrich")
         || crate::auth::scope::is_reserved_source_type(key)
+        // NAN-5032: `audit` / `findings` (and the rewrite marker) are written by
+        // nano itself; they never name a sender's source.
+        || crate::auth::reserved_source_types::classify(key)
+            == crate::auth::reserved_source_types::Reservation::Enforced
+        || key == crate::auth::reserved_source_types::SPOOF_MARKER
 }
 
 /// Derives a source's state from what it is and what arrived for it.

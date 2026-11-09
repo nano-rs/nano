@@ -122,16 +122,16 @@ test('SSO provider route renders the page when sso is available', () => {
   expect(screen.getByText('providers page')).toBeTruthy();
 });
 
-test('SSO provider route is refused on a plan without SSO even in an SSO build', () => {
+test('SSO provider route is refused for an edition without SSO even in an SSO build', () => {
   mock.sso = true;
   mock.hasSso = false;
   renderAt(<SsoRouteGate><div>providers page</div></SsoRouteGate>);
   expect(screen.queryByText('providers page')).toBeNull();
   expect(screen.getByText('Single sign-on is not available')).toBeTruthy();
-  expect(screen.getByText(/Your plan does not include/)).toBeTruthy();
+  expect(screen.getByText(/This edition does not include/)).toBeTruthy();
 });
 
-test('SSO provider route does not mount while the plan is still loading', () => {
+test('SSO provider route does not mount while the entitlement is still loading', () => {
   mock.sso = true;
   mock.tierLoading = true;
   mock.tierLoaded = false;
@@ -139,7 +139,7 @@ test('SSO provider route does not mount while the plan is still loading', () => 
   expect(screen.queryByText('providers page')).toBeNull();
 });
 
-test('SSO provider route fails closed when the plan could not be read', () => {
+test('SSO provider route fails closed when the entitlement could not be read', () => {
   mock.sso = true;
   mock.tierLoaded = false;
   renderAt(<SsoRouteGate><div>providers page</div></SsoRouteGate>);

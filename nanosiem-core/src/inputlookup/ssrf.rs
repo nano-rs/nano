@@ -289,9 +289,10 @@ impl SsrfValidator {
         &self,
         url: &str,
         builder: reqwest::ClientBuilder,
+        proxy: ProxyPolicy,
     ) -> Result<(reqwest::Client, Url), SsrfError> {
         let (validated, addrs) = self.validate_and_resolve(url).await?;
-        let client = pin_resolved_addrs(builder, &validated, &addrs)?
+        let client = pin_resolved_addrs(builder, &validated, &addrs, proxy)?
             .build()
             .map_err(|e| SsrfError::ClientBuildFailed(e.to_string()))?;
         Ok((client, validated))
@@ -662,6 +663,64 @@ pub fn ai_base_url_validator() -> SsrfValidator {
     })
 }
 
+/// Whether a pinned client may use the operator's env proxy
+/// (`HTTPS_PROXY` / `HTTP_PROXY`). Every pinned call site chooses.
+///
+/// A proxy re-resolves the hostname and reqwest ignores `resolve_to_addrs`
+/// for proxied requests, so a proxied request is not pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyPolicy {
+    /// A user controls the destination (lookup `url=`, AI provider
+    /// `base_url`, scheduled fetch URLs, SOAR/catalog targets, URL fetch
+    /// tools). Never proxied, so the pin (and the DNS-rebind guard) holds
+    /// and private targets are not routed through the corporate proxy.
+    Direct,
+    /// The destination is operator configuration or a fixed host (feeds,
+    /// OIDC IdP, identity directories). Honors the env proxy, because on
+    /// many self-run installs the proxy is the only egress.
+    Environment,
+}
+
+/// How an admin enables private AI endpoints, appended to the rejection a
+/// user sees when the opt-in would have allowed the address.
+pub const PRIVATE_AI_ENDPOINTS_HINT: &str = "An admin can allow private AI endpoints: \
+re-run the installer, or set NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS=true and restart.";
+
+/// The message for an AI provider URL the validator rejected. When the
+/// address is one [`private_ai_endpoints_allowed`] would admit (private,
+/// loopback, link-local; never cloud metadata or the always-blocked ranges)
+/// and the opt-in is off, it says how to turn the opt-in on.
+pub fn describe_ai_base_url_error(error: &SsrfError) -> String {
+    describe_ai_base_url_error_with(error, private_ai_endpoints_allowed())
+}
+
+fn describe_ai_base_url_error_with(error: &SsrfError, private_allowed: bool) -> String {
+    let opt_in_would_allow = match error {
+        SsrfError::LocalhostBlocked | SsrfError::LinkLocalBlocked(_) => true,
+        SsrfError::PrivateIpBlocked(ip) => SsrfValidator::new(SsrfConfig {
+            allow_http: true,
+            allow_private_networks: true,
+            ..Default::default()
+        })
+        .validate_ip_address(*ip)
+        .is_ok(),
+        _ => false,
+    };
+    if opt_in_would_allow && !private_allowed {
+        format!("{error}. {PRIVATE_AI_ENDPOINTS_HINT}")
+    } else {
+        error.to_string()
+    }
+}
+
+#[cfg(test)]
+#[path = "ssrf_ai_hint_tests.rs"]
+mod ai_hint_tests;
+
+#[cfg(test)]
+#[path = "ssrf_pin_no_proxy_tests.rs"]
+mod pin_no_proxy_tests;
+
 /// Shared redirect policy for outbound clients (NAN-1369): follow at most a few
 /// hops, and refuse to follow a redirect to a non-https target or to a
 /// private/metadata IP literal — the common SSRF-via-redirect bypass of a
@@ -703,14 +762,19 @@ pub fn restricted_redirect_policy() -> reqwest::redirect::Policy {
 /// [`SsrfValidator::build_pinned_client`]):
 /// ```ignore
 /// let (url, addrs) = validator.validate_and_resolve(raw).await?;
-/// let client = pin_resolved_addrs(reqwest::Client::builder().timeout(t), &url, &addrs)?
+/// let client = pin_resolved_addrs(reqwest::Client::builder().timeout(t), &url, &addrs, ProxyPolicy::Direct)?
 ///     .build()?;
 /// ```
 pub fn pin_resolved_addrs(
     builder: reqwest::ClientBuilder,
     validated: &Url,
     addrs: &[SocketAddr],
+    proxy: ProxyPolicy,
 ) -> Result<reqwest::ClientBuilder, SsrfError> {
+    let builder = match proxy {
+        ProxyPolicy::Direct => builder.no_proxy(),
+        ProxyPolicy::Environment => builder,
+    };
     if addrs.is_empty() {
         return Ok(builder);
     }
@@ -1319,7 +1383,7 @@ mod tests {
     fn pin_resolved_addrs_empty_is_noop_and_builds() {
         // IP-literal host path: no addrs to pin, builder must still build.
         let url = Url::parse("https://93.184.216.34/").unwrap();
-        let builder = pin_resolved_addrs(reqwest::Client::builder(), &url, &[]).unwrap();
+        let builder = pin_resolved_addrs(reqwest::Client::builder(), &url, &[], ProxyPolicy::Direct).unwrap();
         assert!(builder.build().is_ok());
     }
 
@@ -1328,7 +1392,7 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let url = Url::parse("https://example.com/").unwrap();
         let addrs = [SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443)];
-        let builder = pin_resolved_addrs(reqwest::Client::builder(), &url, &addrs).unwrap();
+        let builder = pin_resolved_addrs(reqwest::Client::builder(), &url, &addrs, ProxyPolicy::Direct).unwrap();
         assert!(builder.build().is_ok());
     }
 
@@ -1338,11 +1402,11 @@ mod tests {
         // literal before any client is built (no DNS needed).
         let v = validator();
         assert!(v
-            .build_pinned_client("https://169.254.169.254/", reqwest::Client::builder())
+            .build_pinned_client("https://169.254.169.254/", reqwest::Client::builder(), ProxyPolicy::Direct)
             .await
             .is_err());
         assert!(v
-            .build_pinned_client("https://127.0.0.1/", reqwest::Client::builder())
+            .build_pinned_client("https://127.0.0.1/", reqwest::Client::builder(), ProxyPolicy::Direct)
             .await
             .is_err());
     }

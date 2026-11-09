@@ -10,43 +10,33 @@ import {
 
 // Fallback used when the fetch hasn't resolved or has errored.
 //
-// It is EDITION-AWARE (NAN-2356). The old fallback claimed every capability
-// unconditionally, on the reasoning that rendering a feature the API lacks just
-// 404s. That reasoning does not hold inside an OPEN bundle: there,
-// `@/enterprise/*` resolves to stubs that render nothing, so an optimistic
-// `melod: true` makes callers mount a null component instead of their working
-// core path. The result is the exact dead affordance this issue fixes —
-// briefly on every load, and permanently if `/api/capabilities` fails (the
-// query retries once, then `data` stays undefined forever).
-//
-// The bundle already knows what it is: `__EDITION__` is baked in at build time
-// by vite.config.ts. An open bundle can never have enterprise surfaces, so
-// false is not a guess — it is the only correct answer. The enterprise bundle
-// keeps the optimistic fallback so a real enterprise user doesn't lose nav
-// during a transient outage. Runtime data still overrides either.
-const ENTERPRISE_BUNDLE = __EDITION__ === 'enterprise';
+// Runtime admission can change without a browser reload (online renewal or a
+// C05 import). Until the public endpoint answers, fail closed for every
+// licensed-only surface even in an enterprise bundle. Core SIEM Health stays
+// available in both editions.
 
 const FALLBACK_CAPABILITIES: CapabilitiesContextValue = {
   edition: __EDITION__,
   version: 'unknown',
+  fallback: true,
   capabilities: {
-    cases: ENTERPRISE_BUNDLE,
-    notebooks: ENTERPRISE_BUNDLE,
-    risk: ENTERPRISE_BUNDLE,
-    melod: ENTERPRISE_BUNDLE,
-    customEnrichment: ENTERPRISE_BUNDLE,
-    agentEnrichment: ENTERPRISE_BUNDLE,
-    aiTuning: ENTERPRISE_BUNDLE,
-    playbooks: ENTERPRISE_BUNDLE,
-    incidents: ENTERPRISE_BUNDLE,
+    cases: false,
+    notebooks: false,
+    risk: false,
+    melod: false,
+    customEnrichment: false,
+    agentEnrichment: false,
+    aiTuning: false,
+    playbooks: false,
+    incidents: false,
     // Core in both editions (NAN-2357) — an open bundle that falls back to
     // false would hide the nav and breadcrumb for a page it genuinely has.
     siemHealth: true,
-    sso: ENTERPRISE_BUNDLE,
-    observabilityConvergence: ENTERPRISE_BUNDLE,
-    iocLists: ENTERPRISE_BUNDLE,
-    soar: ENTERPRISE_BUNDLE,
-    threatIntel: ENTERPRISE_BUNDLE,
+    sso: false,
+    observabilityConvergence: false,
+    iocLists: false,
+    soar: false,
+    threatIntel: false,
   },
 };
 
@@ -59,31 +49,29 @@ async function fetchCapabilities(): Promise<CapabilitiesContextValue> {
   if (body.edition !== 'open' && body.edition !== 'enterprise') {
     throw new Error(`Unexpected build edition: ${body.edition}`);
   }
-  // `soar` was added after the server contract; an API that predates it is
-  // the same edition as its bundle, so derive it from the edition rather than
-  // reading undefined as "on" or "off" by accident.
+  // Older APIs did not publish these flags. Absence is fail-closed because
+  // bundle edition alone says nothing about current licence admission.
   if (typeof body.capabilities?.soar !== 'boolean') {
-    body.capabilities = { ...body.capabilities, soar: body.edition === 'enterprise' };
+    body.capabilities = { ...body.capabilities, soar: false };
   }
   // Same for `threatIntel` (NAN-4931): an older API answers without it.
   if (typeof body.capabilities?.threatIntel !== 'boolean') {
-    body.capabilities = { ...body.capabilities, threatIntel: body.edition === 'enterprise' };
+    body.capabilities = { ...body.capabilities, threatIntel: false };
   }
   return body;
 }
 
 export function CapabilitiesProvider({ children }: { children: ReactNode }) {
-  // staleTime/gcTime infinity: build edition is static for the session.
-  // While the fetch is in flight we render with FALLBACK_CAPABILITIES so the
-  // login + setup + onboarding flows aren't blocked on a no-auth GET. Open
-  // users may briefly see enterprise nav before items disappear — acceptable
-  // because the route gates use the same flag and the bundle-level exclusion
-  // (Phase 5.10+) makes this code load-bearing only on staging.
+  // Admission is live, so refetch in the background and on focus. This hides
+  // licensed navigation shortly after hard stop and restores it after renewal
+  // without disturbing open/core pages.
   const { data } = useQuery({
     queryKey: ['capabilities'],
     queryFn: fetchCapabilities,
-    staleTime: Infinity,
+    staleTime: 30_000,
     gcTime: Infinity,
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: true,
     retry: 1,
   });
 

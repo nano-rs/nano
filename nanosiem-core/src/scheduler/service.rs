@@ -27,6 +27,11 @@ const SCHEDULER_MAX_RESPONSE_SIZE: usize = 500 * 1024 * 1024;
 /// Longer than typical since large feeds may take time to download
 const SCHEDULER_FETCH_TIMEOUT_SECS: u64 = 30 * 60;
 
+/// How much of a non-2xx feed response is kept for the run error. The read is
+/// capped a little higher so the character-boundary cut has room.
+const ERROR_EXCERPT_BYTES: usize = 200;
+const ERROR_EXCERPT_READ_BYTES: usize = 4 * 1024;
+
 #[derive(Error, Debug)]
 pub enum SchedulerError {
     #[error("Repository error: {0}")]
@@ -345,7 +350,7 @@ impl SchedulerService {
             .timeout(std::time::Duration::from_secs(SCHEDULER_FETCH_TIMEOUT_SECS))
             .redirect(crate::inputlookup::restricted_redirect_policy());
         let (client, url) = SsrfValidator::http_allowed_validator()
-            .build_pinned_client(&job.url, builder)
+            .build_pinned_client(&job.url, builder, crate::inputlookup::ProxyPolicy::Direct)
             .await
             .map_err(|e| SchedulerError::SsrfBlocked(e.to_string()))?;
 
@@ -371,16 +376,7 @@ impl SchedulerService {
 
         let status = response.status();
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
-            return Err(SchedulerError::FetchError(format!(
-                "HTTP error {}: {}",
-                status,
-                if error_body.len() > 200 {
-                    format!("{}...", &error_body[..200])
-                } else {
-                    error_body
-                }
-            )));
+            return Err(http_status_error(status, response).await);
         }
 
         // Check Content-Length header before downloading (if available)
@@ -410,9 +406,20 @@ impl SchedulerService {
             );
         }
 
-        let content = response.bytes().await.map_err(|e| {
-            SchedulerError::FetchError(format!("Failed to read response body: {}", e))
-        })?;
+        // Stream with a running byte count: the Content-Length check above
+        // does nothing for a chunked response (security review 2026-11-08).
+        let content = crate::http_body::read_capped(response, SCHEDULER_MAX_RESPONSE_SIZE)
+            .await
+            .map_err(|e| match e {
+                crate::http_body::BodyReadError::TooLarge { limit, .. } => {
+                    SchedulerError::FetchError(format!(
+                        "Response too large: exceeds maximum of {limit} bytes"
+                    ))
+                }
+                crate::http_body::BodyReadError::Transport(e) => {
+                    SchedulerError::FetchError(format!("Failed to read response body: {}", e))
+                }
+            })?;
 
         info!(
             job_id = %job.id,
@@ -821,7 +828,15 @@ pub fn calculate_next_run(expression: &str) -> Result<Option<DateTime<Utc>>, Sch
     Ok(schedule.upcoming(Utc).next())
 }
 
-/// Calculate the next N run times from a cron expression
+/// Most run times a cron preview returns (security review 2026-11-08,
+/// NAN-5020). The UI asks for 5; 100 covers any reasonable preview.
+pub const MAX_CRON_PREVIEW_COUNT: usize = 100;
+
+/// Calculate the next N run times from a cron expression.
+///
+/// `count` is clamped to [`MAX_CRON_PREVIEW_COUNT`]: the iterator is
+/// synchronous and an unbounded `take(count)` let one request allocate
+/// gigabytes on an API worker.
 pub fn calculate_next_runs(
     expression: &str,
     count: usize,
@@ -830,7 +845,10 @@ pub fn calculate_next_runs(
     let schedule = cron::Schedule::from_str(&expr)
         .map_err(|e| SchedulerError::InvalidCron(format!("{}: {}", expression, e)))?;
 
-    Ok(schedule.upcoming(Utc).take(count).collect())
+    Ok(schedule
+        .upcoming(Utc)
+        .take(count.min(MAX_CRON_PREVIEW_COUNT))
+        .collect())
 }
 
 /// Get a human-readable description of a cron expression
@@ -887,6 +905,22 @@ fn is_content_type_compatible(
                 || ct_lower.is_empty()
         }
     }
+}
+
+/// The run error for a non-2xx feed response.
+///
+/// Security review 2026-11-08 (NAN-5017): reads a bounded excerpt (not the
+/// whole body) and cuts it on a character boundary. The old
+/// `&error_body[..200]` panicked when a multi-byte character straddled byte
+/// 200, and this runs inline in the supervised scheduler loop, so one feed
+/// response exited nanosiem-jobs (and again on every reclaim).
+async fn http_status_error(status: reqwest::StatusCode, response: reqwest::Response) -> SchedulerError {
+    let excerpt = crate::http_body::read_prefix_lossy(response, ERROR_EXCERPT_READ_BYTES).await;
+    SchedulerError::FetchError(format!(
+        "HTTP error {}: {}",
+        status,
+        crate::text_bounds::truncate_with(&excerpt, ERROR_EXCERPT_BYTES, "...")
+    ))
 }
 
 /// Validate that the content appears to be the expected format
@@ -1032,3 +1066,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "service_error_excerpt_tests.rs"]
+mod error_excerpt_tests;

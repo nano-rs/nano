@@ -673,3 +673,7 @@ pub fn runtime_program(source: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "pipe/budget_tests.rs"]
+mod budget_tests;

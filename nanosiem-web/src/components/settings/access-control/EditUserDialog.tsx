@@ -15,6 +15,7 @@ import { User as UserIcon, Shield, RefreshCw, Copy, Check, AlertCircle } from 'l
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
+import { useAuth } from '@/contexts/AuthContext';
 import { api, type UserDetail, type GroupDetail, type UpdateUserRequest } from '@/lib/api';
 import { generateSecurePassword } from '@/lib/password';
 import { Button } from '@/components/ui/button';
@@ -43,8 +44,14 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
   const [groupIds, setGroupIds] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
   const [pwCopied, setPwCopied] = useState(false);
+  const [revokeKeys, setRevokeKeys] = useState(false);
+  const { user: currentUser } = useAuth();
 
   const ssoLocked = !!user?.oidc_provider;
+  // Your own password / email change through the profile flow, which
+  // re-authenticates with the current password (the API answers 409 here).
+  const isSelf = !!user && !!currentUser && currentUser.id === user.id;
+  const credentialsLocked = ssoLocked || isSelf;
 
   useEffect(() => {
     if (!open || !user) return;
@@ -53,6 +60,7 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
     setPassword('');
     setGroupIds(new Set(user.groups.map(g => g.id)));
     setPwCopied(false);
+    setRevokeKeys(false);
   }, [open, user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const sortedGroups = useMemo(() => {
@@ -81,7 +89,7 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
   };
 
   const nameValid = name.trim().length >= 1;
-  const emailValid = ssoLocked || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  const emailValid = credentialsLocked || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
   const canSubmit = !!user && nameValid && emailValid && !saving;
 
   const handleSave = async () => {
@@ -90,9 +98,10 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
     try {
       const request: UpdateUserRequest = {
         name: name.trim() !== user.name ? name.trim() : undefined,
-        email: !ssoLocked && email.trim() !== user.email ? email.trim() : undefined,
-        password: !ssoLocked && password ? password : undefined,
+        email: !credentialsLocked && email.trim() !== user.email ? email.trim() : undefined,
+        password: !credentialsLocked && password ? password : undefined,
         group_ids: [...groupIds],
+        revoke_api_keys: !credentialsLocked && password && revokeKeys ? true : undefined,
       };
       await api.updateUser(user.id, request);
       toast({ title: 'User updated', description: `${name.trim()} has been updated.` });
@@ -153,14 +162,20 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
                 type="email"
                 value={email}
                 onChange={e => setEmail(e.target.value)}
-                disabled={ssoLocked}
+                disabled={credentialsLocked}
                 placeholder="jane@example.com"
                 className="w-full h-8 px-2.5 rounded-md border border-border bg-card text-[12px] text-foreground placeholder:text-muted-foreground/70 outline-none focus:border-primary/60 disabled:opacity-60 disabled:cursor-not-allowed font-mono"
               />
             </div>
           </div>
 
-          {!ssoLocked && (
+          {isSelf && !ssoLocked && (
+            <p className="text-[10.5px] text-muted-foreground/70">
+              Change your own email or password from your profile.
+            </p>
+          )}
+
+          {!credentialsLocked && (
             <div>
               <div className="flex items-center gap-2 mb-1.5">
                 <label className="text-[11px] font-medium text-foreground/80">Password</label>
@@ -182,7 +197,7 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
                     <AlertCircle className="w-[12px] h-[12px] text-yellow-500 shrink-0 mt-0.5" />
                     <div className="flex-1 min-w-0">
                       <div className="text-[11.5px] text-foreground/80">
-                        Copy this password now — it won't be shown again. Share it via your usual secure channel; the user will replace it on first sign-in.
+                        Copy this password now — it won't be shown again. Share it via your usual secure channel. Saving ends all of this user's sessions.
                       </div>
                       <div className="mt-2 rounded-md border border-border bg-card p-2 flex items-center gap-2 font-mono text-[11.5px] text-foreground break-all">
                         <span className="flex-1">{password}</span>
@@ -206,12 +221,21 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
                         </button>
                         <button
                           type="button"
-                          onClick={() => { setPassword(''); setPwCopied(false); }}
+                          onClick={() => { setPassword(''); setPwCopied(false); setRevokeKeys(false); }}
                           className="text-[10.5px] text-muted-foreground hover:text-foreground"
                         >
                           Cancel reset
                         </button>
                       </div>
+                      <label className="mt-2 flex items-center gap-2 text-[11px] text-foreground/80 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={revokeKeys}
+                          onChange={e => setRevokeKeys(e.target.checked)}
+                          className="h-3 w-3"
+                        />
+                        Also revoke this user&apos;s API keys
+                      </label>
                     </div>
                   </div>
                 </div>

@@ -526,16 +526,16 @@ vector_memory_buffer_events=$(clamp "$(( vector_batch_events * 2 ))" 50000 50000
 api_mib=$(( app_mib * 35 / 100 ))
 search_mib=$(( app_mib * 25 / 100 ))
 jobs_mib=$(( app_mib * 15 / 100 ))
-dragonfly_mib=$(( app_mib * 12 / 100 ))
+valkey_mib=$(( app_mib * 12 / 100 ))
 web_mib=$(( app_mib * 8 / 100 ))
-nginx_mib=$(( app_mib - api_mib - search_mib - jobs_mib - dragonfly_mib - web_mib ))
+nginx_mib=$(( app_mib - api_mib - search_mib - jobs_mib - valkey_mib - web_mib ))
 (( api_mib < 160 )) && api_mib=160
 (( search_mib < 128 )) && search_mib=128
 (( jobs_mib < 96 )) && jobs_mib=96
-(( dragonfly_mib < 320 )) && dragonfly_mib=320
+(( valkey_mib < 320 )) && valkey_mib=320
 (( web_mib < 64 )) && web_mib=64
 (( nginx_mib < 32 )) && nginx_mib=32
-app_service_total=$(( api_mib + search_mib + jobs_mib + dragonfly_mib + web_mib + nginx_mib ))
+app_service_total=$(( api_mib + search_mib + jobs_mib + valkey_mib + web_mib + nginx_mib ))
 app_service_excess=$(( app_service_total - app_mib ))
 if (( app_service_excess > 0 )); then
     take=$(( api_mib - 160 )); (( take > app_service_excess )) && take=$app_service_excess
@@ -548,16 +548,16 @@ if (( app_service_excess > 0 )); then
     nginx_mib=$(( nginx_mib - take )); app_service_excess=$(( app_service_excess - take ))
 fi
 (( app_service_excess <= 0 )) || fail "app role RAM is below service minimums"
-api_mib=$(( api_mib + (app_mib - api_mib - search_mib - jobs_mib - dragonfly_mib - web_mib - nginx_mib) ))
+api_mib=$(( api_mib + (app_mib - api_mib - search_mib - jobs_mib - valkey_mib - web_mib - nginx_mib) ))
 
 api_mcpu=$(( app_mcpu * 35 / 100 )); (( api_mcpu < 100 )) && api_mcpu=100
 search_mcpu=$(( app_mcpu * 25 / 100 )); (( search_mcpu < 75 )) && search_mcpu=75
 jobs_mcpu=$(( app_mcpu * 15 / 100 )); (( jobs_mcpu < 50 )) && jobs_mcpu=50
-dragonfly_mcpu=$(( app_mcpu * 12 / 100 )); (( dragonfly_mcpu < 50 )) && dragonfly_mcpu=50
+valkey_mcpu=$(( app_mcpu * 12 / 100 )); (( valkey_mcpu < 50 )) && valkey_mcpu=50
 web_mcpu=$(( app_mcpu * 8 / 100 )); (( web_mcpu < 25 )) && web_mcpu=25
-nginx_mcpu=$(( app_mcpu - api_mcpu - search_mcpu - jobs_mcpu - dragonfly_mcpu - web_mcpu ))
+nginx_mcpu=$(( app_mcpu - api_mcpu - search_mcpu - jobs_mcpu - valkey_mcpu - web_mcpu ))
 (( nginx_mcpu < 25 )) && nginx_mcpu=25
-app_cpu_excess=$(( api_mcpu + search_mcpu + jobs_mcpu + dragonfly_mcpu + web_mcpu + nginx_mcpu - app_mcpu ))
+app_cpu_excess=$(( api_mcpu + search_mcpu + jobs_mcpu + valkey_mcpu + web_mcpu + nginx_mcpu - app_mcpu ))
 if (( app_cpu_excess > 0 )); then
     take=$(( api_mcpu - 100 )); (( take > app_cpu_excess )) && take=$app_cpu_excess
     api_mcpu=$(( api_mcpu - take )); app_cpu_excess=$(( app_cpu_excess - take ))
@@ -565,7 +565,7 @@ if (( app_cpu_excess > 0 )); then
     search_mcpu=$(( search_mcpu - take )); app_cpu_excess=$(( app_cpu_excess - take ))
 fi
 (( app_cpu_excess <= 0 )) || fail "app role CPUs are below service minimums"
-api_mcpu=$(( api_mcpu + (app_mcpu - api_mcpu - search_mcpu - jobs_mcpu - dragonfly_mcpu - web_mcpu - nginx_mcpu) ))
+api_mcpu=$(( api_mcpu + (app_mcpu - api_mcpu - search_mcpu - jobs_mcpu - valkey_mcpu - web_mcpu - nginx_mcpu) ))
 if [[ "$topology" == role ]] && has_role app; then
     # The role compose runs two app edges and, unless ingest is co-located, an
     # app-side ClickHouse proxy. Fund every 25m nginx floor inside app_mcpu
@@ -644,13 +644,15 @@ NANO_SEARCH_MEM_LIMIT=$(memory_string "$search_mib")
 NANO_SEARCH_CPU_LIMIT=$(cpu_string "$search_mcpu")
 NANO_JOBS_MEM_LIMIT=$(memory_string "$jobs_mib")
 NANO_JOBS_CPU_LIMIT=$(cpu_string "$jobs_mcpu")
-DRAGONFLY_MEM_LIMIT=$(memory_string "$dragonfly_mib")
-DRAGONFLY_CPU_LIMIT=$(cpu_string "$dragonfly_mcpu")
-dragonfly_maxmemory_mib=$(max 64 "$(( dragonfly_mib * 80 / 100 ))")
-DRAGONFLY_MAXMEMORY="${dragonfly_maxmemory_mib}mb"
-DRAGONFLY_PROACTOR_THREADS=$(clamp "$(ceil_div "$dragonfly_mcpu" 1000)" 1 8)
-dragonfly_memory_threads=$(max 1 "$(( dragonfly_maxmemory_mib / 256 ))")
-DRAGONFLY_PROACTOR_THREADS=$(min "$DRAGONFLY_PROACTOR_THREADS" "$dragonfly_memory_threads")
+VALKEY_MEM_LIMIT=$(memory_string "$valkey_mib")
+VALKEY_CPU_LIMIT=$(cpu_string "$valkey_mcpu")
+# maxmemory counts the dataset only; the remaining 20% covers client buffers,
+# fragmentation and the I/O threads' working memory.
+valkey_maxmemory_mib=$(max 64 "$(( valkey_mib * 80 / 100 ))")
+VALKEY_MAXMEMORY="${valkey_maxmemory_mib}mb"
+# io-threads counts the main thread; 1 disables I/O threading. Valkey only
+# offloads socket I/O to them, so beyond 4 there is nothing left to gain here.
+VALKEY_IO_THREADS=$(clamp "$(ceil_div "$valkey_mcpu" 1000)" 1 4)
 NANO_WEB_MEM_LIMIT=$(memory_string "$web_mib")
 NANO_WEB_CPU_LIMIT=$(cpu_string "$web_mcpu")
 nginx_instance_mib=$nginx_mib
@@ -702,7 +704,7 @@ NANO_DETECTED_CPU_CORES=$cpu_cores
 NANO_DETECTED_MEMORY_MIB=$memory_mib
 NANO_SIZING_TOPOLOGY=$topology
 
-SIZING_KEYS='CLICKHOUSE_MEM_LIMIT CLICKHOUSE_CPU_LIMIT CLICKHOUSE_MAX_THREADS CLICKHOUSE_ANALYTICS_MAX_THREADS CLICKHOUSE_REALTIME_MAX_THREADS CLICKHOUSE_INGEST_MAX_THREADS CLICKHOUSE_MAX_INSERT_THREADS CLICKHOUSE_BACKGROUND_POOL_SIZE CLICKHOUSE_BACKGROUND_MERGES_MUTATIONS_CONCURRENCY_RATIO CLICKHOUSE_BACKGROUND_SCHEDULE_POOL_SIZE CLICKHOUSE_BACKGROUND_FETCHES_POOL_SIZE CLICKHOUSE_BACKGROUND_MOVE_POOL_SIZE CLICKHOUSE_BACKGROUND_COMMON_POOL_SIZE CLICKHOUSE_MAX_CONCURRENT_QUERIES CLICKHOUSE_MAX_CONCURRENT_INSERT_QUERIES CLICKHOUSE_MAX_CONCURRENT_SELECT_QUERIES CLICKHOUSE_ASYNC_INSERT_THREADS CLICKHOUSE_MARK_CACHE_SIZE CLICKHOUSE_UNCOMPRESSED_CACHE_SIZE CLICKHOUSE_INDEX_MARK_CACHE_SIZE CLICKHOUSE_INDEX_UNCOMPRESSED_CACHE_SIZE CLICKHOUSE_MAX_MEMORY_USAGE CLICKHOUSE_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_INGEST_MAX_MEMORY_USAGE CLICKHOUSE_INGEST_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE_FOR_USER POSTGRES_MEM_LIMIT POSTGRES_CPU_LIMIT POSTGRES_MAX_CONNECTIONS POSTGRES_SHARED_BUFFERS POSTGRES_EFFECTIVE_CACHE_SIZE POSTGRES_WORK_MEM PG_MAX_CONNECTIONS PG_MIN_CONNECTIONS VECTOR_MEM_LIMIT VECTOR_CPU_LIMIT VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES_PER_SHARD VECTOR_DISK_BUFFER_TOTAL_BUDGET_BYTES VECTOR_DISK_BUFFER_COUNT VECTOR_DISK_BUFFER_MAX_BYTES VECTOR_DATA_CAPACITY_BYTES VECTOR_DISK_HEADROOM_BYTES VECTOR_BATCH_MAX_BYTES VECTOR_BATCH_MAX_EVENTS VECTOR_MEMORY_BUFFER_MAX_EVENTS NANO_API_MEM_LIMIT NANO_API_CPU_LIMIT NANO_SEARCH_MEM_LIMIT NANO_SEARCH_CPU_LIMIT NANO_JOBS_MEM_LIMIT NANO_JOBS_CPU_LIMIT DRAGONFLY_MEM_LIMIT DRAGONFLY_CPU_LIMIT DRAGONFLY_MAXMEMORY DRAGONFLY_PROACTOR_THREADS NANO_WEB_MEM_LIMIT NANO_WEB_CPU_LIMIT NANO_NGINX_MEM_LIMIT NANO_NGINX_CPU_LIMIT CONNECTOR_MEM_LIMIT CONNECTOR_CPU_LIMIT NANO_MIGRATE_MEM_LIMIT NANO_MIGRATE_CPU_LIMIT NANO_VECTOR_TAP_MEM_LIMIT NANO_VECTOR_TAP_CPU_LIMIT NANO_VECTOR_CONSUMER_MEM_LIMIT NANO_VECTOR_CONSUMER_CPU_LIMIT NANO_INGEST_EDGE_MEM_LIMIT NANO_INGEST_EDGE_CPU_LIMIT NANO_CLICKHOUSE_PROXY_MEM_LIMIT NANO_CLICKHOUSE_PROXY_CPU_LIMIT KEEPER_MEM_LIMIT KEEPER_CPU_LIMIT TENZIR_MEM_LIMIT TENZIR_CPU_LIMIT NANO_SIZING_DIR NANO_DETECTED_CPU_CORES NANO_DETECTED_MEMORY_MIB NANO_SIZING_TOPOLOGY'
+SIZING_KEYS='CLICKHOUSE_MEM_LIMIT CLICKHOUSE_CPU_LIMIT CLICKHOUSE_MAX_THREADS CLICKHOUSE_ANALYTICS_MAX_THREADS CLICKHOUSE_REALTIME_MAX_THREADS CLICKHOUSE_INGEST_MAX_THREADS CLICKHOUSE_MAX_INSERT_THREADS CLICKHOUSE_BACKGROUND_POOL_SIZE CLICKHOUSE_BACKGROUND_MERGES_MUTATIONS_CONCURRENCY_RATIO CLICKHOUSE_BACKGROUND_SCHEDULE_POOL_SIZE CLICKHOUSE_BACKGROUND_FETCHES_POOL_SIZE CLICKHOUSE_BACKGROUND_MOVE_POOL_SIZE CLICKHOUSE_BACKGROUND_COMMON_POOL_SIZE CLICKHOUSE_MAX_CONCURRENT_QUERIES CLICKHOUSE_MAX_CONCURRENT_INSERT_QUERIES CLICKHOUSE_MAX_CONCURRENT_SELECT_QUERIES CLICKHOUSE_ASYNC_INSERT_THREADS CLICKHOUSE_MARK_CACHE_SIZE CLICKHOUSE_UNCOMPRESSED_CACHE_SIZE CLICKHOUSE_INDEX_MARK_CACHE_SIZE CLICKHOUSE_INDEX_UNCOMPRESSED_CACHE_SIZE CLICKHOUSE_MAX_MEMORY_USAGE CLICKHOUSE_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_MAX_SERVER_MEMORY_USAGE_TO_RAM_RATIO CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE CLICKHOUSE_ANALYTICS_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE CLICKHOUSE_REALTIME_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_INGEST_MAX_MEMORY_USAGE CLICKHOUSE_INGEST_MAX_MEMORY_USAGE_FOR_USER CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE CLICKHOUSE_ADMIN_MAX_MEMORY_USAGE_FOR_USER POSTGRES_MEM_LIMIT POSTGRES_CPU_LIMIT POSTGRES_MAX_CONNECTIONS POSTGRES_SHARED_BUFFERS POSTGRES_EFFECTIVE_CACHE_SIZE POSTGRES_WORK_MEM PG_MAX_CONNECTIONS PG_MIN_CONNECTIONS VECTOR_MEM_LIMIT VECTOR_CPU_LIMIT VECTOR_CLICKHOUSE_REQUEST_CONCURRENCY VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES_PER_SHARD VECTOR_DISK_BUFFER_TOTAL_BUDGET_BYTES VECTOR_DISK_BUFFER_COUNT VECTOR_DISK_BUFFER_MAX_BYTES VECTOR_DATA_CAPACITY_BYTES VECTOR_DISK_HEADROOM_BYTES VECTOR_BATCH_MAX_BYTES VECTOR_BATCH_MAX_EVENTS VECTOR_MEMORY_BUFFER_MAX_EVENTS NANO_API_MEM_LIMIT NANO_API_CPU_LIMIT NANO_SEARCH_MEM_LIMIT NANO_SEARCH_CPU_LIMIT NANO_JOBS_MEM_LIMIT NANO_JOBS_CPU_LIMIT VALKEY_MEM_LIMIT VALKEY_CPU_LIMIT VALKEY_MAXMEMORY VALKEY_IO_THREADS NANO_WEB_MEM_LIMIT NANO_WEB_CPU_LIMIT NANO_NGINX_MEM_LIMIT NANO_NGINX_CPU_LIMIT CONNECTOR_MEM_LIMIT CONNECTOR_CPU_LIMIT NANO_MIGRATE_MEM_LIMIT NANO_MIGRATE_CPU_LIMIT NANO_VECTOR_TAP_MEM_LIMIT NANO_VECTOR_TAP_CPU_LIMIT NANO_VECTOR_CONSUMER_MEM_LIMIT NANO_VECTOR_CONSUMER_CPU_LIMIT NANO_INGEST_EDGE_MEM_LIMIT NANO_INGEST_EDGE_CPU_LIMIT NANO_CLICKHOUSE_PROXY_MEM_LIMIT NANO_CLICKHOUSE_PROXY_CPU_LIMIT KEEPER_MEM_LIMIT KEEPER_CPU_LIMIT TENZIR_MEM_LIMIT TENZIR_CPU_LIMIT NANO_SIZING_DIR NANO_DETECTED_CPU_CORES NANO_DETECTED_MEMORY_MIB NANO_SIZING_TOPOLOGY'
 
 is_sizing_key() {
     case " $SIZING_KEYS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
@@ -719,7 +721,7 @@ validate_override() {
                 || fail "$key must be a positive CPU count" ;;
         *_MEM_LIMIT)
             [[ "$value" =~ ^[1-9][0-9]*([KMGT]i?[Bb]?|[kmgt])$ ]] || fail "$key must be a Docker memory value such as 4G or 512M" ;;
-        POSTGRES_SHARED_BUFFERS|POSTGRES_EFFECTIVE_CACHE_SIZE|POSTGRES_WORK_MEM|DRAGONFLY_MAXMEMORY)
+        POSTGRES_SHARED_BUFFERS|POSTGRES_EFFECTIVE_CACHE_SIZE|POSTGRES_WORK_MEM|VALKEY_MAXMEMORY)
             [[ "$value" =~ ^[1-9][0-9]*(kB|MB|GB|mb)$ ]] || fail "$key has an invalid memory setting" ;;
         NANO_SIZING_DIR|NANO_SIZING_TOPOLOGY|NANO_DETECTED_CPU_CORES|NANO_DETECTED_MEMORY_MIB|\
         VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES|VECTOR_CLICKHOUSE_BUFFER_MAX_BYTES_PER_SHARD|\
@@ -738,8 +740,52 @@ apply_override() {
     printf -v "$key" '%s' "$value"
 }
 
+# NAN-5082: Valkey replaced Dragonfly. An operator override written under the
+# old Dragonfly key still applies to its Valkey successor. A Valkey key always
+# wins over its legacy spelling, whatever order they appear in.
+legacy_sizing_key() {
+    case "$1" in
+        DRAGONFLY_MEM_LIMIT) printf 'VALKEY_MEM_LIMIT' ;;
+        DRAGONFLY_CPU_LIMIT) printf 'VALKEY_CPU_LIMIT' ;;
+        DRAGONFLY_MAXMEMORY) printf 'VALKEY_MAXMEMORY' ;;
+        DRAGONFLY_PROACTOR_THREADS) printf 'VALKEY_IO_THREADS' ;;
+        *) return 1 ;;
+    esac
+}
+
+apply_legacy_overrides() {
+    local legacy successor value
+    for legacy in DRAGONFLY_MEM_LIMIT DRAGONFLY_CPU_LIMIT DRAGONFLY_MAXMEMORY DRAGONFLY_PROACTOR_THREADS; do
+        successor=$(legacy_sizing_key "$legacy")
+        value=$("$@" "$legacy" "$successor") || continue
+        [[ -n "$value" ]] && apply_override "$successor" "$value"
+    done
+    return 0
+}
+
+# Prints the legacy key's last value from the override env, unless the same
+# file also sets the Valkey key (which the main loop below then applies).
+legacy_value_from_file() {
+    awk -F= -v legacy="$1" -v successor="$2" '
+        { sub(/\r$/, "") }
+        $1 == successor { has_successor = 1 }
+        $1 == legacy { value = substr($0, length(legacy) + 2) }
+        END {
+            if (has_successor || value == "") exit 1
+            gsub(/^["\047]|["\047]$/, "", value)
+            print value
+        }
+    ' "$override_env"
+}
+
+legacy_value_from_environment() {
+    [[ -z "$(printenv "$2" 2>/dev/null || true)" ]] || return 1
+    printenv "$1" 2>/dev/null
+}
+
 if [[ -n "$override_env" ]]; then
     [[ -f "$override_env" ]] || fail "override env does not exist: $override_env"
+    apply_legacy_overrides legacy_value_from_file
     while IFS= read -r line || [[ -n "$line" ]]; do
         line=${line%$'\r'}
         [[ "$line" == *=* ]] || continue
@@ -758,6 +804,7 @@ fi
 
 # The invoking environment is the normal one-shot override path. It wins over
 # .env, matching Docker Compose interpolation semantics.
+apply_legacy_overrides legacy_value_from_environment
 for key in $SIZING_KEYS; do
     case "$key" in
         NANO_SIZING_DIR|NANO_SIZING_TOPOLOGY|NANO_DETECTED_CPU_CORES|NANO_DETECTED_MEMORY_MIB|\

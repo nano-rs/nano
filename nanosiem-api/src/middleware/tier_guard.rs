@@ -62,7 +62,8 @@ pub async fn api_write_guard(
                 let body = ErrorResponse {
                     error: ErrorDetail {
                         code: "API_WRITE_RESTRICTED".to_string(),
-                        message: "Write API access is not available on your plan. Upgrade to Growth or higher.".to_string(),
+                        message: "Write API access is not available for the current entitlement."
+                            .to_string(),
                         details: None,
                     },
                 };

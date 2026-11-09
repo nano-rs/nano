@@ -63,7 +63,7 @@ services:
           memory: ${CLICKHOUSE_MEM_LIMIT:-4G}
 
   dragonfly:
-    container_name: ${E2E_PROJECT}-dragonfly
+    container_name: ${E2E_PROJECT}-valkey
     labels: *e2e-labels
     restart: "no"
     ports: !override
@@ -156,7 +156,6 @@ services:
     environment:
       VECTOR_CONTAINER_NAME: ${E2E_PROJECT}-vector
       NANOSIEM_DEV_MODE: "true"
-      NANO_TIER: unrestricted
       DEPLOYMENT_MODE: selfhosted
       NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS: "${E2E_ALLOW_PRIVATE_AI_ENDPOINTS:-false}"
       SEARCH_SERVICE_URL: http://nano-search:3002/health
@@ -180,7 +179,6 @@ services:
       VECTOR_ENRICH_URL: http://vector:8090/
       VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN}
       NANOSIEM_DEV_MODE: "true"
-      NANO_TIER: unrestricted
       DEPLOYMENT_MODE: selfhosted
       # NAN-2042: the jobs listener binds container loopback by default, which
       # the published port below cannot reach (the runner's health wait and

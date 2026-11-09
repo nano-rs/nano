@@ -14,7 +14,7 @@
   "time": 1749081788901,
   "message": "ransom.exe deleted shadow copy script C:\\\\Users\\\\jsmith\\\\AppData\\\\Local\\\\Temp\\\\vss.bat on WS-JSMITH-01",
   "metadata": {
-    "version": "1.8.0",
+    "version": "1.9.0",
     "product": {
       "name": "Sysmon",
       "vendor_name": "Microsoft",
@@ -49,6 +49,8 @@
       "file": {
         "name": "ransom.exe",
         "path": "C:\\\\Users\\\\jsmith\\\\AppData\\\\Local\\\\Temp\\\\ransom.exe",
+        "type_id": 1,
+        "type": "Regular File",
         "hashes": [
           {
             "algorithm_id": 3,

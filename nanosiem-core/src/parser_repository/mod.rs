@@ -32,4 +32,4 @@ pub use repository::{
 pub use service::{
     ParserImportPlan, ParserImportResult, ParserRepositoryService, ParserRepositoryServiceConfig,
 };
-pub use yaml_parser::{parse_parser_yaml, ParserYaml, ParserYamlError};
+pub use yaml_parser::{parse_parser_yaml, ParserSample, ParserYaml, ParserYamlError};

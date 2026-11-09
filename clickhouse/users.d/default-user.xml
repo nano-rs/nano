@@ -1,18 +1,29 @@
 <clickhouse>
   <!-- Docs: <https://clickhouse.com/docs/operations/settings/settings_users/> -->
-  <users>
-    <!-- Remove default user -->
-    <default remove="remove">
-    </default>
+  <!--
+    The built-in `default` user is reachable from inside the ClickHouse
+    container only (security review 2026-11-08). It has no password, so it must
+    never accept a network connection: every nano service, Vector and the
+    migrator use their own password-protected users (users.d/nanosiem-users.xml).
 
+    It is kept, rather than removed, for local tooling that runs inside the
+    container (`docker exec ... clickhouse-client`) and because the upstream
+    entrypoint expects it. This file deliberately has the same name as the one
+    the entrypoint writes to lock `default` to localhost, and does the same.
+
+    No access management: creating users or grants is done as nanosiem_admin.
+    Healthchecks use the unauthenticated /ping endpoint and need no user.
+  -->
+  <users>
     <default>
       <profile>default</profile>
-      <networks>
-        <ip>::/0</ip>
+      <networks replace="replace">
+        <ip>::1</ip>
+        <ip>127.0.0.1</ip>
       </networks>
       <password><![CDATA[]]></password>
       <quota>default</quota>
-      <access_management>1</access_management>
+      <access_management>0</access_management>
     </default>
   </users>
 </clickhouse>

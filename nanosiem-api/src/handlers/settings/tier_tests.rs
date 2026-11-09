@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! NAN-3378: `/api/settings/tier` clamps SSO to the build.
+//! V2: `/api/settings/tier` derives SSO from the licensed build, never a plan.
 
 use super::*;
 use nanosiem_core::{OrganizationTier, TierLimits};
 
-/// NAN-3378: the tier row grants SSO on `unrestricted`, but an open build
-/// has no OIDC handlers. `/api/settings/tier` must agree with
-/// `/api/capabilities` instead of advertising a surface that 404s.
 #[test]
 fn tier_sso_enabled_follows_build_availability() {
     let stored = TierLimits::for_tier_unoverridden(OrganizationTier::Unrestricted);
@@ -26,22 +23,41 @@ fn tier_sso_enabled_follows_build_availability() {
     #[cfg(feature = "enterprise")]
     assert!(
         reported.sso_enabled,
-        "enterprise build keeps the plan grant"
+        "every licensed enterprise build grants SSO"
     );
 }
 
 #[test]
-fn clamp_never_grants_sso_the_plan_withheld() {
+fn stale_pre_v2_sso_false_cannot_withhold_a_licensed_feature() {
     let mut stored = TierLimits::for_tier_unoverridden(OrganizationTier::Unrestricted);
     stored.sso_enabled = false;
-    assert!(!clamp_to_build(stored).sso_enabled);
+    assert_eq!(
+        clamp_to_build(stored).sso_enabled,
+        crate::handlers::capabilities::SSO_AVAILABLE
+    );
+}
+
+#[test]
+fn settings_cannot_change_hosted_operator_to_evade_ai_allowance() {
+    assert!(validate_operator_provenance(
+        Some(nanosiem_core::EntitlementOperator::SelfRun),
+        nanosiem_core::EntitlementOperator::Hosted,
+    )
+    .is_err());
+    assert!(validate_operator_provenance(
+        Some(nanosiem_core::EntitlementOperator::Hosted),
+        nanosiem_core::EntitlementOperator::Hosted,
+    )
+    .is_ok());
 }
 
 #[test]
 fn capabilities_and_tier_agree_on_sso() {
-    let caps = futures::executor::block_on(crate::handlers::capabilities::get_capabilities());
+    let caps = crate::handlers::capabilities::capabilities_response(
+        crate::handlers::capabilities::SSO_AVAILABLE,
+    );
     let tier = clamp_to_build(TierLimits::for_tier_unoverridden(
         OrganizationTier::Unrestricted,
     ));
-    assert_eq!(caps.0.capabilities.sso, tier.sso_enabled);
+    assert_eq!(caps.capabilities.sso, tier.sso_enabled);
 }

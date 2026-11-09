@@ -75,6 +75,57 @@ if nano_transport_ct != "" {
     };
 }
 
+/// NAN-5032: platform-owned `source_type` values are rewritten at the UDM
+/// storage boundary, whatever lane an event arrived on.
+///
+/// Keep the literal lists identical to
+/// `nanosiem_core::auth::reserved_source_types` (`ENFORCED`, `WARN_ONLY`,
+/// `WARN_ONLY_PREFIXES`, `PLATFORM_LANES`, `SPOOF_MARKER`); a unit test checks
+/// them. Spliced into `clickhouse_mapping`, which both the generic lane
+/// (`prepare_output`) and every deployed parser (`db_parsers_combined`) feed,
+/// so no lane — HTTP, HEC, OTLP, upstream Vector, or a parser's own VRL — can
+/// store `audit` / `findings`. The declared value is kept as
+/// `claimed_source_type` (stored in `ext`) so a forgery stays visible.
+/// ClickHouse's `logs_ingest_mv` applies the same rewrite as a backstop.
+macro_rules! reserved_source_type_guard_vrl {
+    () => {
+        r#"# NAN-5032: reserved source types; see reserved_source_type_guard_vrl! in
+# vector_config/mod.rs and nanosiem_core::auth::reserved_source_types.
+nano_reserved_st = downcase(to_string(.source_type) ?? "")
+if includes(["audit", "findings"], nano_reserved_st) {
+    if (to_string(.claimed_source_type) ?? "") == "" { .claimed_source_type = .source_type }
+    .source_type = "reserved_spoof"
+    log("Rewrote a reserved source_type declared at ingest to reserved_spoof", level: "warn", rate_limit_secs: 60)
+} else if !starts_with(nano_reserved_st, "nano_enrich") && !starts_with(nano_reserved_st, "nano_operational") && (includes(["signal", "signals"], nano_reserved_st) || starts_with(nano_reserved_st, "nano_") || starts_with(nano_reserved_st, "__nano:")) {
+    log("Ingested event declares a reserved source_type (accepted in this release; rejected in a future one)", level: "warn", rate_limit_secs: 300)
+}
+"#
+    };
+}
+
+#[cfg(test)]
+pub(crate) const RESERVED_SOURCE_TYPE_GUARD_VRL: &str = reserved_source_type_guard_vrl!();
+
+/// NAN-5032 (review): the OCSF generic lane stamps the row's `source_type`
+/// from `src_type` and never passes `clickhouse_mapping`, so it carries its own
+/// copy of the rewrite. The record (including the declared value) stays under
+/// `unmapped`. `ocsf_logs_raw_mv` (ocsf/193) applies the same rule as the
+/// database backstop.
+macro_rules! reserved_ocsf_source_type_guard_vrl {
+    () => {
+        r#"# NAN-5032: reserved source types on the OCSF generic lane; see
+# reserved_ocsf_source_type_guard_vrl! in vector_config/mod.rs.
+if includes(["audit", "findings"], src_type) {
+    log("Rewrote a reserved source_type declared at OCSF ingest to reserved_spoof", level: "warn", rate_limit_secs: 60)
+    src_type = "reserved_spoof"
+}
+"#
+    };
+}
+
+#[cfg(test)]
+pub(crate) const RESERVED_OCSF_SOURCE_TYPE_GUARD_VRL: &str = reserved_ocsf_source_type_guard_vrl!();
+
 #[cfg(test)]
 pub(crate) const INGEST_TRANSPORT_STRIP_VRL: &str = ingest_transport_strip_vrl!();
 
@@ -92,8 +143,17 @@ mod claim_metadata_tests;
 #[path = "hec_route_tests.rs"]
 mod hec_route_tests;
 #[cfg(test)]
+#[path = "reserved_source_type_guard_tests.rs"]
+mod reserved_source_type_guard_tests;
+#[cfg(test)]
 #[path = "ocsf_lane_stamp_tests.rs"]
 mod ocsf_lane_stamp_tests;
+#[cfg(test)]
+#[path = "ocsf_parser_health_tests.rs"]
+mod ocsf_parser_health_tests;
+#[cfg(test)]
+#[path = "token_bound_route_tests.rs"]
+mod token_bound_route_tests;
 mod credentials;
 pub mod delivery;
 mod deploy;
@@ -101,6 +161,7 @@ pub mod hec_route;
 mod parser_config;
 mod publication;
 pub mod redaction;
+pub mod remote_delivery;
 mod router;
 mod sources;
 mod staging;
@@ -131,6 +192,9 @@ pub enum VectorConfigError {
     IoError(#[from] std::io::Error),
     #[error("Failed to reload Vector: {0}")]
     ReloadFailed(String),
+    /// Role split (NAN-5133): published, but no ingest host confirmed it.
+    #[error("Not confirmed live: {0}")]
+    ReloadUnconfirmed(String),
     #[error("Invalid config directory: {0}")]
     InvalidConfigDir(String),
     #[error("No backup available for restore")]
@@ -253,7 +317,13 @@ impl VectorConfigManager {
     /// routed parsers plus the `generic` catch-all, shared by the active and the
     /// staged router writers so the two files cannot drift. `routed` must come
     /// from [`Self::source_router_parsers`].
-    pub(super) fn source_router_route_lines(routed: &[&Parser]) -> String {
+    ///
+    /// NAN-5071: `log_parsers` is the full deploy set. Every enabled Splunk
+    /// HEC parser also gets a `<name>-token_bound` route (its filter always
+    /// reads it, [`Self::token_bound_route`]): an event whose source a bound
+    /// ingest token decided, presented on a non-HEC lane (HTTP `/ingest`), goes
+    /// to that source's parser instead of being stored raw by `generic`.
+    pub(super) fn source_router_route_lines(routed: &[&Parser], log_parsers: &[Parser]) -> String {
         let mut lines = String::new();
         for parser in routed {
             lines.push_str(&format!(
@@ -268,18 +338,42 @@ impl VectorConfigManager {
                 known.push(value);
             }
         }
-        let exclusion_list = known
-            .iter()
-            .map(|s| format!("\"{}\"", sources::escape_vrl_string(s)))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut token_bound: Vec<String> = Vec::new();
+        for parser in Self::token_bound_lane_parsers(log_parsers) {
+            // A key a routed parser claims already reaches that parser on
+            // this lane; claiming it twice would double-write the event.
+            let keys: Vec<String> = Self::parser_source_types(parser)
+                .into_iter()
+                .filter(|k| !known.contains(k))
+                .collect();
+            let condition = if keys.is_empty() {
+                "false".to_string()
+            } else {
+                for k in &keys {
+                    if !token_bound.contains(k) {
+                        token_bound.push(k.clone());
+                    }
+                }
+                Self::token_bound_condition(&keys)
+            };
+            lines.push_str(&format!(
+                "{} = {}\n",
+                Self::token_bound_route(&parser.name),
+                parser_config::toml_basic_string(&condition)
+            ));
+        }
+        let exclusion_list = Self::vrl_string_list(&known);
         // NAN-1124: also exclude `nano_enrich` so push-enrichment records never
         // fall through to the generic log parser (they're claimed by
         // enrichment_router). Matches the downcased source_type so a mixed-case
         // body value can't leak into the logs pipeline.
-        let generic = format!(
+        let mut generic = format!(
             "!includes([{exclusion_list}], .source_type) && !starts_with(downcase(to_string(.source_type) ?? \"\"), \"nano_enrich\")"
         );
+        // NAN-5071: an event a `-token_bound` route claims is not ALSO raw.
+        if !token_bound.is_empty() {
+            generic.push_str(&format!(" && !({})", Self::token_bound_condition(&token_bound)));
+        }
         lines.push_str(&format!(
             "generic = {}\n\n",
             parser_config::toml_basic_string(&generic)
@@ -287,15 +381,50 @@ impl VectorConfigManager {
         lines
     }
 
+    /// NAN-5071: the `source_router` route a Splunk HEC parser's filter reads
+    /// besides `splunk_hec_route`. The `-` can never appear in a
+    /// [`crate::vector_naming::safe_name`] (alphanumerics and `_` only), so
+    /// this can never equal a routed parser's route key (its safe name):
+    /// a duplicate key would make `_router.toml` unparseable and fail every
+    /// reload. Vector accepts `-` in a route output name.
+    pub(super) fn token_bound_route(parser_name: &str) -> String {
+        format!("{}-token_bound", Self::safe_name(parser_name))
+    }
+
+    /// NAN-5071: the parsers that get a `-token_bound` route: exactly the
+    /// enabled log parsers whose rendered file is a Splunk HEC filter.
+    pub(super) fn token_bound_lane_parsers(log_parsers: &[Parser]) -> Vec<&Parser> {
+        log_parsers
+            .iter()
+            .filter(|p| p.enabled && p.kind != "enrichment")
+            .filter(|p| matches!(router::transport_of(&p.source_type), router::Transport::SplunkHec))
+            .collect()
+    }
+
+    /// NAN-5071: the event's source was decided by a source-bound ingest
+    /// token (the lane set `.source_type` to the credential's route key) and
+    /// is one of `keys`. A multiplex credential (`*`: the platform credential
+    /// and the legacy-multiplex install token) and an unauthenticated event
+    /// never match, so their declared-type routing is unchanged.
+    fn token_bound_condition(keys: &[String]) -> String {
+        format!(
+            "includes([{}], .source_type) && (to_string(%nano_credential_name) ?? \"\") == .source_type",
+            Self::vrl_string_list(keys)
+        )
+    }
+
+    fn vrl_string_list(values: &[String]) -> String {
+        values
+            .iter()
+            .map(|s| format!("\"{}\"", sources::escape_vrl_string(s)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Get the source_type values a parser handles.
     /// Returns match_values if set, otherwise falls back to [safe_name].
-    fn parser_source_types(parser: &Parser) -> Vec<String> {
-        if let Some(ref mv) = parser.match_values {
-            if !mv.is_empty() {
-                return mv.clone();
-            }
-        }
-        vec![Self::safe_name(&parser.name)]
+    pub(super) fn parser_source_types(parser: &Parser) -> Vec<String> {
+        crate::vector_naming::claim_keys(parser.match_values.as_deref(), &parser.name)
     }
 
     /// Check if a parser handles a given source_type value.

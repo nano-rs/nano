@@ -109,7 +109,7 @@ async fn async_main() -> Result<()> {
         let token_config = TokenConfig::default();
         let token_service = TokenService::new(token_config);
 
-        // NAN-682: wire the shared Dragonfly-backed JTI denylist so logout-driven
+        // NAN-682: wire the shared Valkey-backed JTI denylist so logout-driven
         // revocations issued on any API replica are visible to every search pod
         // before the access token's natural 15-min expiry. Falls back to a
         // per-pod denylist (current behaviour, blind to API revocations) when
@@ -131,7 +131,10 @@ async fn async_main() -> Result<()> {
         // Create API key service for validating X-API-Key headers
         let api_key_repo = ApiKeyRepository::new(dual_pool.postgres().clone());
         let rate_limit_repo = RateLimitRepository::new(dual_pool.postgres().clone());
-        let api_key_service = ApiKeyService::new(api_key_repo, rate_limit_repo);
+        // NAN-5044: keys run with stored ∩ owner's CURRENT permissions — the
+        // same chokepoint as the api service.
+        let api_key_service = ApiKeyService::new(api_key_repo, rate_limit_repo)
+            .with_permission_resolver(PermissionResolver::new(dual_pool.postgres().clone()));
 
         let permission_resolver = PermissionResolver::new(dual_pool.postgres().clone());
         // NAN-1797: fail-closed per-user source-scope resolver. Shares the same

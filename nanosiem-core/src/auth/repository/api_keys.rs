@@ -141,6 +141,33 @@ impl ApiKeyRepository {
         Ok(status)
     }
 
+    /// NAN-5044: the raw `system_settings.api_key_owner_clamp` value (`None`
+    /// when the singleton row is absent).
+    pub async fn owner_clamp_mode_setting(&self) -> Result<Option<String>, ApiKeyRepositoryError> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT api_key_owner_clamp FROM system_settings WHERE id = 'default'",
+        )
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// NAN-5044: persist the owner-clamp mode (`enforce` | `audit`).
+    pub async fn set_owner_clamp_mode_setting(&self, mode: &str) -> Result<(), ApiKeyRepositoryError> {
+        sqlx::query(
+            r#"
+            INSERT INTO system_settings (id, api_key_owner_clamp)
+            VALUES ('default', $1)
+            ON CONFLICT (id) DO UPDATE
+                SET api_key_owner_clamp = EXCLUDED.api_key_owner_clamp,
+                    updated_at = now()
+            "#,
+        )
+        .bind(mode)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Get an API key by its hash
     pub async fn get_key_by_hash(&self, key_hash: &str) -> Result<ApiKey, ApiKeyRepositoryError> {
         let api_key = sqlx::query_as::<_, ApiKey>("SELECT * FROM api_keys WHERE key_hash = $1")

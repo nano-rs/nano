@@ -1,8 +1,8 @@
-"""SSO visibility by edition and plan (NAN-4930, on clickhouse/dev).
+"""SSO visibility by edition (NAN-4930, on clickhouse/dev).
 
 - open edition: Settings > SSO says the deployment does not include SSO, and
   the providers API lists none;
-- enterprise: the build is never the reason SSO is missing (the plan check
+- enterprise: every licensed entitlement includes SSO (the compatibility check
   is tests/enterprise/ui/test_sso_plan.py).
 
 The login page never shows an SSO button when no provider is configured

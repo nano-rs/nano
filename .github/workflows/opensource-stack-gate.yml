@@ -22,11 +22,15 @@ on:
       - config/vector/**
       - scripts/check-opensource-pins.sh
       - clickhouse/preflight/**
+      - clickhouse/users.d/**
+      - scripts/tests/clickhouse-default-user.live.sh
+      - scripts/tests/test_install_clickhouse_default_preflight.py
       - nanosiem-web/**
       - tools/sync-to-nano-mirror.sh
       - tools/scan-mirror-secrets.sh
       - tools/tests/**
       - scripts/tests/install-edition.test.sh
+      - scripts/tests/install-api-call.test.sh
       - scripts/tests/install-umask.test.sh
       - scripts/tests/install-umask.live.sh
       - scripts/tests/install-resource-sizing.test.sh
@@ -34,6 +38,23 @@ on:
       - scripts/tests/clickhouse-sizing-mount.test.sh
       - scripts/tests/fixtures/resource-sizing.snap
       - scripts/check-opencore-web-build.sh
+      - docker-compose.yml
+      - docker-compose.tls.yml
+      - config/nginx/**
+      - deploy/compose/**
+      - deploy/helm/nano/templates/edge/**
+      - ludus/roles/nanosiem_stack/files/nginx/**
+      - scripts/tests/compose-published-ports.sh
+      - scripts/tests/fixtures/compose-published-ports.allow
+      - scripts/tests/nginx-internal-404.sh
+      # Open-core relation inventory (relation-inventory job): any Rust or
+      # schema change can make open code name a relation the open schema lacks.
+      - "**/*.rs"
+      - migrations/postgres/**
+      - migrations/postgres-open/**
+      - nanosiem-core/src/db/migrations.rs
+      - nanosiem-core/tests/open_core_relation_inventory.rs
+      - "**/Cargo.toml"
       - .github/workflows/opensource-stack-gate.yml
   workflow_dispatch:
 
@@ -45,7 +66,7 @@ jobs:
   gate:
     # Self-hosted only (repo rule — never ubuntu-latest). Needs docker +
     # docker compose v2 on the runner (same as enrichment-lane-gate).
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, nano-pr]
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -80,6 +101,16 @@ jobs:
             echo "install-edition test not in this tree (public mirror); skipping"
           fi
 
+      # NAN-5124: installer -> edge calls succeed only on a 2xx (a TLS-overlay
+      # 301 used to read as "Admin user created").
+      - name: install.sh edge calls are 2xx-only
+        run: |
+          if [ -f scripts/tests/install-api-call.test.sh ]; then
+            bash scripts/tests/install-api-call.test.sh
+          else
+            echo "install api-call test not in this tree (public mirror); skipping"
+          fi
+
       # NAN-5006: prove the documented streamed installer cannot lose its
       # remaining source to Compose stdin, while retaining hostile-umask mode
       # coverage. DinD isolates fixed compose names from every runner stack.
@@ -101,6 +132,27 @@ jobs:
             echo "resource-sizing tests not in this tree (public mirror); skipping"
           fi
 
+      # Security review 2026-11-08 (NAN-5008/NAN-5038): the full published-port
+      # set of every shipped stack matches the reviewed allowlist, and the dev
+      # stack is loopback-only. Render only; nothing is started.
+      - name: Compose published-port allowlist
+        run: |
+          if [ -f scripts/tests/compose-published-ports.sh ]; then
+            bash scripts/tests/compose-published-ports.sh
+          else
+            echo "published-port test not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5013/NAN-5042: every nginx edge 404s /api/internal/*, proven live
+      # against the open-core edge config.
+      - name: nginx edges refuse /api/internal
+        run: |
+          if [ -f scripts/tests/nginx-internal-404.sh ]; then
+            bash scripts/tests/nginx-internal-404.sh
+          else
+            echo "nginx /api/internal test not in this tree (public mirror); skipping"
+          fi
+
       - name: Mirror credential scan tests
         run: bash tools/tests/scan-mirror-secrets.test.sh
 
@@ -108,6 +160,18 @@ jobs:
       # elements) gates every compose stack's server start.
       - name: ClickHouse preflight script tests
         run: sh clickhouse/preflight/test-clickhouse-preflight.sh
+
+      # Security review 2026-11-08 (NAN-5011): the passwordless `default` user
+      # is container-local on the pinned image with the shipped users.d, and
+      # install.sh's upgrade pre-flight reports remote `default` clients.
+      - name: ClickHouse default user is container-local
+        run: |
+          if [ -f scripts/tests/clickhouse-default-user.live.sh ]; then
+            bash scripts/tests/clickhouse-default-user.live.sh
+            python3 -I scripts/tests/test_install_clickhouse_default_preflight.py
+          else
+            echo "ClickHouse default-user tests not in this tree (public mirror); skipping"
+          fi
 
       # NAN-4902: the open web edition must build from the STRIPPED tree. In
       # the private tree `@/enterprise/*` still resolves to the real sources
@@ -128,3 +192,75 @@ jobs:
               fi
               bash scripts/check-opencore-web-build.sh
             '
+
+  relation-inventory:
+    # A compile-only mirror check cannot catch SQL that names a table omitted
+    # from the fresh-open migration snapshot. Run the inventory against both
+    # the exact stripped source tree and an isolated PostgreSQL 18 instance.
+    runs-on: [self-hosted, Linux, X64, nano-pr]
+    timeout-minutes: 45
+    env:
+      PG_CONTAINER: opencore-relations-${{ github.run_id }}
+      RUST_IMAGE: rust:1.95-bookworm
+    steps:
+      - name: Reclaim workspace before checkout (NAN-773)
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/ws" -w /ws alpine \
+            chown -R "$(id -u):$(id -g)" .
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start throwaway PostgreSQL 18
+        run: |
+          docker run -d --rm --name "$PG_CONTAINER" \
+            -e POSTGRES_USER=nanosiem \
+            -e POSTGRES_PASSWORD=nanosiem \
+            -e POSTGRES_DB=postgres \
+            -p 127.0.0.1::5432 \
+            postgres:18
+          host_port="$(docker port "$PG_CONTAINER" 5432/tcp | head -1 | sed 's/.*://')"
+          echo "TEST_DATABASE_URL=postgres://nanosiem:nanosiem@localhost:${host_port}/postgres" >> "$GITHUB_ENV"
+          for i in $(seq 1 60); do
+            if docker exec "$PG_CONTAINER" pg_isready -U nanosiem -d postgres >/dev/null 2>&1; then
+              echo "PostgreSQL ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$PG_CONTAINER" --tail 50 || true
+          exit 1
+
+      - name: Fresh stripped open-core relation inventory
+        run: |
+          docker run --rm --network host \
+            -v "$PWD:/source:ro" \
+            -v nanosiem-opencore-relations-cargo-registry:/usr/local/cargo/registry \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            -e TEST_DATABASE_URL="$TEST_DATABASE_URL" \
+            -e NANOSIEM_ALLOW_DESTRUCTIVE_TESTS=1 \
+            -e NANOSIEM_REQUIRE_RELATION_INVENTORY=1 \
+            "$RUST_IMAGE" \
+            bash -euo pipefail -c '
+              apt-get update
+              apt-get install -y --no-install-recommends rsync
+              # The private tree is stripped first; the public mirror deletes the
+              # strip script and IS the stripped tree, so it is copied as-is.
+              if [ -f /source/tools/sync-to-nano-mirror.sh ]; then
+                /source/tools/sync-to-nano-mirror.sh /source /tmp/open-core
+              else
+                rsync -a --exclude .git --exclude target /source/ /tmp/open-core/
+              fi
+              cd /tmp/open-core
+              cargo test -p nanosiem-core --test open_core_relation_inventory -- --nocapture
+            '
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: docker stop "$PG_CONTAINER" || true
+
+      - name: Reclaim workspace (NAN-773)
+        if: always()
+        run: |
+          docker run --rm -v "$PWD:/ws" -w /ws alpine \
+            chown -R "$(id -u):$(id -g)" . 2>/dev/null || true

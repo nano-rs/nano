@@ -59,7 +59,7 @@ impl AnonymizationService {
     /// — so UDM output is byte-identical.
     fn quote_anon_col(col: &str) -> String {
         if col.contains('.') {
-            format!("\"{}\"", col.replace('"', "\"\""))
+            crate::sql_hygiene::quote_identifier_always(col)
         } else if col == "user" {
             "`user`".to_string()
         } else {
@@ -399,7 +399,7 @@ impl AnonymizationService {
     /// Escape a value for safe interpolation in a ClickHouse single-quoted string.
     /// Escapes backslashes and single quotes.
     fn escape_ch_string(value: &str) -> String {
-        value.replace('\\', "\\\\").replace('\'', "\\'")
+        crate::sql_hygiene::escape_sql_string(value)
     }
 
     // =========================================================================

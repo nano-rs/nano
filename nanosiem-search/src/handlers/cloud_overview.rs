@@ -75,7 +75,7 @@ pub async fn get_cloud_overview(
 
     // NAN-1593: the cloud overview landing aggregate fires on every load /
     // shared-link follow and runs many parallel ClickHouse aggregates — cache
-    // it through the same Dragonfly layer. Keyed on the provider / account
+    // it through the same Valkey layer. Keyed on the provider / account
     // scope, the time range, and the caller's effective source scope.
     let cache_key = crate::cache::SearchResultCache::companion_key(
         "coverview",

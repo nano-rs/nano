@@ -35,6 +35,7 @@ import {
   api,
   type ApiKeySummary,
   type ApiKeyCreatedResponse,
+  type ApiKeyOwnerClampMode,
   type PermissionInfo,
 } from '@/lib/api';
 import { Button } from '@/components/ui/button';
@@ -260,6 +261,23 @@ function ApiKeyDetail({ apiKey, permissions, onEdit, onRotate, onRevoke, onEnabl
           )}
         </div>
 
+        {/* NAN-5044: scopes the owner no longer holds */}
+        {(apiKey.withheld_permissions?.length ?? 0) > 0 && (
+          <OwnerClampNotice withheld={apiKey.withheld_permissions ?? []} />
+        )}
+
+        {/* NAN-5044: legacy key without an owner */}
+        {apiKey.created_by === null && (
+          <div className="rounded-md border border-yellow-500/25 bg-yellow-500/5 p-3 flex items-center gap-3">
+            <AlertCircle className="w-[13px] h-[13px] text-yellow-500 shrink-0" />
+            <div className="flex-1 text-[11.5px] text-foreground/80">
+              Legacy key with no owner. Its scopes cannot follow an owner&apos;s role changes, and
+              ownerless keys stop working in v2.1. Replace it with a key created by the account that
+              should own it.
+            </div>
+          </div>
+        )}
+
         {/* Unused warning */}
         {status === 'unused' && (
           <div className="rounded-md border border-yellow-500/25 bg-yellow-500/5 p-3 flex items-center gap-3">
@@ -279,6 +297,83 @@ function ApiKeyDetail({ apiKey, permissions, onEdit, onRotate, onRevoke, onEnabl
             </div>
             <button onClick={onDelete} className="text-[11px] text-red-500 hover:underline shrink-0">
               Delete key
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * NAN-5044: an API key runs with its stored scopes intersected with what its
+ * owner holds now. This card lists the scopes the owner has lost and, for an
+ * administrator, the tenant-wide one-release escape hatch (`audit` keeps the
+ * stored scopes and only logs).
+ */
+function OwnerClampNotice({ withheld }: { withheld: string[] }) {
+  const { hasPermission } = useAuth();
+  const { toast } = useToast();
+  const canSwitch = hasPermission('settings:system') && hasPermission('apikeys:edit');
+  const [mode, setMode] = useState<ApiKeyOwnerClampMode | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getApiKeyOwnerClamp()
+      .then(r => { if (!cancelled) setMode(r.mode); })
+      .catch(() => { /* best-effort; the notice still renders */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  const toggle = async () => {
+    if (!mode) return;
+    const next: ApiKeyOwnerClampMode = mode === 'enforce' ? 'audit' : 'enforce';
+    setSaving(true);
+    try {
+      const r = await api.setApiKeyOwnerClamp(next);
+      setMode(r.mode);
+    } catch (err) {
+      toast({
+        title: 'Error',
+        description: err instanceof Error ? err.message : 'Failed to change owner clamp',
+        variant: 'destructive',
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const enforced = mode !== 'audit';
+  return (
+    <div className="rounded-md border border-yellow-500/25 bg-yellow-500/5 p-3 flex items-start gap-3">
+      <AlertCircle className="w-[13px] h-[13px] text-yellow-500 shrink-0 mt-0.5" />
+      <div className="flex-1 min-w-0 text-[11.5px] text-foreground/80">
+        <div>
+          {withheld.length} scope{withheld.length === 1 ? '' : 's'}{' '}
+          {enforced ? 'withheld' : 'not held by the owner (audit mode — still granted)'}: the key&apos;s
+          owner no longer holds {withheld.length === 1 ? 'it' : 'them'}.
+        </div>
+        <div className="mt-1.5 flex flex-wrap gap-1.5">
+          {withheld.map(p => (
+            <span
+              key={p}
+              className="inline-flex items-center h-5 px-1.5 rounded-sm border border-border bg-card text-[10.5px] font-mono text-muted-foreground line-through"
+            >
+              {p}
+            </span>
+          ))}
+        </div>
+        {canSwitch && mode && (
+          <div className="mt-2 flex items-center gap-2 text-[10.5px] text-muted-foreground">
+            <span className="font-mono">owner clamp: {mode}</span>
+            <button
+              type="button"
+              onClick={toggle}
+              disabled={saving}
+              className="text-primary hover:text-primary/90 disabled:opacity-60"
+            >
+              {enforced ? 'Switch to audit (temporary, all keys)' : 'Switch back to enforce'}
             </button>
           </div>
         )}

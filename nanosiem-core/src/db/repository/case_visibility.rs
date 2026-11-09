@@ -193,6 +193,67 @@ pub fn case_entity_source_predicate(alias: &str, deny_param: u16) -> String {
     )
 }
 
+/// Audience-containment predicate (NAN-5023): TRUE when every principal who can
+/// see the DESTINATION case `dest` can also see the RELATED case `rel`, on both
+/// halves of visibility.
+///
+/// For SYSTEM jobs that copy content from one case into another case's
+/// user-visible surfaces (shadow investigation's related-case history, closure
+/// comments and disposition precedent). The job itself reads unscoped, so the
+/// copy is only safe when the related case's audience is a SUPERSET of the
+/// destination's — otherwise a viewer of the new case reads a private case's
+/// title and comments.
+///
+/// ACL half (`cases.visibility` is `public` / `group` / `private`):
+/// - a `public` related case covers every destination;
+/// - otherwise the destination must not be `public`, each of its individual
+///   principals (creator, assignee) must be able to see the related case, and
+///   a `group` destination's groups must all be groups of a `group` related
+///   case.
+///
+/// Source half: the related case may carry NO restricted source at all —
+/// nothing in the CURRENT `restricted_source_types` registry, no `audit`
+/// (every viewer without `audit:view` is denied it, yet it is never in the
+/// registry) and no unresolved-provenance sentinel.
+///
+/// It is not enough for the destination to carry the same restricted source:
+/// a case is visible when ANY of its alerts is visible, so a destination with
+/// `sysmon` + `hr_payroll` alerts is visible to an analyst denied
+/// `hr_payroll`, while a related `hr_payroll`-only case is not (NAN-5023
+/// review). Requiring the related case to be restriction-free is the only
+/// rule that holds for every viewer of the destination.
+pub fn case_audience_covers_predicate(rel: &str, dest: &str) -> String {
+    let r = safe_alias(rel);
+    let d = safe_alias(dest);
+    let user_sees_rel = |user: &str| {
+        format!(
+            "({d}.{user} IS NULL OR {d}.{user} = {r}.created_by OR {d}.{user} = {r}.assigned_to \
+             OR ({r}.visibility = 'group' AND EXISTS (SELECT 1 FROM case_groups acg \
+             JOIN user_groups aug ON aug.group_id = acg.group_id \
+             WHERE acg.case_id = {r}.id AND aug.user_id = {d}.{user})))"
+        )
+    };
+    format!(
+        "(\n    ({r}.visibility = 'public'\n     OR ({d}.visibility <> 'public'\n         \
+         AND {creator}\n         AND {assignee}\n         \
+         AND ({d}.visibility <> 'group' OR ({r}.visibility = 'group' AND NOT EXISTS (\n             \
+             SELECT 1 FROM case_groups adg WHERE adg.case_id = {d}.id\n               \
+               AND NOT EXISTS (SELECT 1 FROM case_groups arg WHERE arg.case_id = {r}.id AND arg.group_id = adg.group_id)\n         \
+         )))))\n  \
+         AND NOT EXISTS (\n        \
+             SELECT 1 FROM case_alerts rca\n        \
+             JOIN alerts ral ON ral.id = rca.alert_id\n        \
+             CROSS JOIN LATERAL unnest(ral.source_types) AS rst(st)\n        \
+             WHERE rca.case_id = {r}.id\n          \
+               AND (lower(rst.st) IN (SELECT lower(rs.source_type) FROM restricted_source_types rs)\n                \
+                    OR lower(rst.st) IN ('audit', '{sentinel}'))\n  \
+         )\n)",
+        creator = user_sees_rel("created_by"),
+        assignee = user_sees_rel("assigned_to"),
+        sentinel = crate::auth::UNRESOLVED_SOURCE_SENTINEL,
+    )
+}
+
 /// [`case_visible_predicate`] driven by the deny set itself: the source half is
 /// emitted iff `deny` normalizes to a non-empty array. Returns the predicate
 /// plus the normalized array the caller must bind at `$deny_param` (`None` =

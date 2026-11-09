@@ -92,6 +92,9 @@ impl UrlFetcher {
             .redirect(Policy::none())
             .timeout(Duration::from_secs(config.default_timeout_secs as u64))
             .connect_timeout(Duration::from_secs(10))
+            // Never through an env proxy: it re-resolves the host and would
+            // undo the SSRF pin below (DNS rebind to an internal address).
+            .no_proxy()
     }
 
     pub fn new(config: InputLookupConfig) -> Self {
@@ -272,32 +275,28 @@ impl UrlFetcher {
             .map_err(FetchError::HttpError)
     }
 
-    /// Read response body with size limit
+    /// Read response body with size limit.
+    ///
+    /// Streams the body with a running byte count (security review
+    /// 2026-11-08): the old `Content-Length` check did nothing for a chunked
+    /// response, which was then buffered whole before its size was checked.
     async fn read_body_limited(&self, response: Response) -> Result<String, FetchError> {
-        // Check Content-Length header if available
-        if let Some(content_length) = response.content_length() {
-            if content_length as usize > self.config.max_response_size {
-                return Err(FetchError::ResponseTooLarge {
-                    size: content_length as usize,
-                    limit: self.config.max_response_size,
-                });
-            }
-        }
-
-        // Read body in chunks with size tracking
-        let bytes = response
-            .bytes()
+        let limit = self.config.max_response_size;
+        let bytes = crate::http_body::read_capped(response, limit)
             .await
-            .map_err(|e| FetchError::BodyReadError(e.to_string()))?;
+            .map_err(|e| match e {
+                crate::http_body::BodyReadError::TooLarge { limit, observed } => {
+                    FetchError::ResponseTooLarge {
+                        size: usize::try_from(observed).unwrap_or(usize::MAX),
+                        limit,
+                    }
+                }
+                crate::http_body::BodyReadError::Transport(e) => {
+                    FetchError::BodyReadError(e.to_string())
+                }
+            })?;
 
-        if bytes.len() > self.config.max_response_size {
-            return Err(FetchError::ResponseTooLarge {
-                size: bytes.len(),
-                limit: self.config.max_response_size,
-            });
-        }
-
-        String::from_utf8(bytes.to_vec())
+        String::from_utf8(bytes)
             .map_err(|e| FetchError::BodyReadError(format!("Invalid UTF-8: {}", e)))
     }
 
@@ -458,3 +457,7 @@ mod tests {
         assert!(fetcher.pinned_client(&url, &[]).is_ok());
     }
 }
+
+#[cfg(test)]
+#[path = "fetcher_body_cap_tests.rs"]
+mod body_cap_tests;

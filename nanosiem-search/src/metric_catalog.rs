@@ -6,7 +6,7 @@
 //! [`CATALOG_TTL`]; concurrent misses for one key share a single ClickHouse
 //! scan instead of each running it. A failed refresh serves the last good
 //! entry (stale-but-serving) rather than failing the dropdown. Process-local:
-//! the shared Dragonfly result cache still fronts it across replicas.
+//! the shared Valkey result cache still fronts it across replicas.
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};

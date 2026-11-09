@@ -95,7 +95,14 @@ impl FeedMonitor {
         let last_event_at = if let Some(ref ch_client) = self.ch_client {
             self.get_last_event_clickhouse(ch_client, source).await
         } else {
-            self.get_last_event_postgres(&source.name).await
+            #[cfg(feature = "enterprise")]
+            {
+                self.get_last_event_postgres(&source.name).await
+            }
+            #[cfg(not(feature = "enterprise"))]
+            {
+                None
+            }
         };
 
         let now = Utc::now();
@@ -188,6 +195,7 @@ impl FeedMonitor {
     }
 
     /// Get last event timestamp from PostgreSQL
+    #[cfg(feature = "enterprise")]
     async fn get_last_event_postgres(&self, feed_name: &str) -> Option<chrono::DateTime<Utc>> {
         let row = sqlx::query(
             r#"
@@ -230,7 +238,7 @@ impl LogSourceInfo {
         // If match_pattern is set, use regex match
         if let Some(ref pattern) = self.match_pattern {
             if !pattern.is_empty() {
-                let escaped_pattern = pattern.replace('\\', "\\\\").replace('\'', "''");
+                let escaped_pattern = crate::sql_hygiene::escape_sql_string(pattern);
                 return format!("match(source_type, '{}')", escaped_pattern);
             }
         }

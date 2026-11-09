@@ -118,7 +118,8 @@ fn dotted_fields(npl: &str) -> Vec<String> {
 
 async fn exec(sql: &str) -> Result<String, String> {
     let url = std::env::var("CLICKHOUSE_TEST_URL").unwrap_or_else(|_| "http://localhost:8123".into());
-    let user = std::env::var("CLICKHOUSE_ADMIN_USER").unwrap_or_else(|_| "default".into());
+    // Never `default`: nano's users.d keeps it container-local.
+    let user = std::env::var("CLICKHOUSE_ADMIN_USER").unwrap_or_else(|_| "nanosiem_admin".into());
     let pass = std::env::var("CLICKHOUSE_ADMIN_PASSWORD").unwrap_or_default();
     let url = format!("{}/?default_format=TSV&max_execution_time=60", url.trim_end_matches('/'));
     let resp = reqwest::Client::new()

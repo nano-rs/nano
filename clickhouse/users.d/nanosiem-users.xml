@@ -31,7 +31,14 @@
       <allow_ddl>0</allow_ddl>
       <!-- Grant access to nanosiem database -->
       <grants>
-        <query>GRANT SELECT, INSERT, ALTER, CREATE, DROP ON nanosiem.*</query>
+        <!-- Security review 2026-11-08: CREATE TABLE is deliberately NOT
+             granted. Any CREATE TABLE grant implicitly allows CREATE TEMPORARY
+             TABLE, which is the privilege ClickHouse checks for the
+             executable() table function, so the runtime user could run any
+             script in user_scripts/ from a query (verified on CH 26.10). The
+             runtime services never create tables (the migrator runs as
+             nanosiem_admin), and the k8s runtime user never had it. -->
+        <query>GRANT SELECT, INSERT, ALTER, CREATE DATABASE, CREATE VIEW, CREATE DICTIONARY, DROP ON nanosiem.*</query>
         <query>GRANT dictGet ON nanosiem.*</query>
         <!-- NAN-1399: the enrichment scheduler hot-reloads dictionaries after
              auto-sync so fresh data applies immediately instead of waiting out

@@ -30,6 +30,23 @@ pub struct ParserYaml {
     pub target_table: Option<String>,
     #[serde(default)]
     pub normalize_vrl: Option<String>,
+    /// Representative raw events shipped with the parser (`samples:` block).
+    ///
+    /// The OCSF deploy gate needs evidence bound to the exact parser
+    /// generation. First-party parsers carry these samples, the same ones the
+    /// content repository's `validate-ocsf.sh` certifies, so they must not be
+    /// parsed away (serde ignores unknown fields).
+    #[serde(default)]
+    pub samples: Option<Vec<ParserSample>>,
+}
+
+/// One bundled sample. `expect` (the class_uid/activity_id assertions the
+/// content repository checks) is deliberately not modelled: the deploy gate
+/// re-runs the parser and validates the emitted event against the OCSF
+/// contract itself, so only the raw input is needed here.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ParserSample {
+    pub raw: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +72,28 @@ pub fn parse_parser_yaml(content: &str) -> Result<ParserYaml, ParserYamlError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_samples_survive_the_parse() {
+        let yaml = r#"
+name: conduit_proxy
+parser_vrl: |
+  .message = .message
+samples:
+  - raw: '{"id":"01J8ZR","client_ip":"10.10.4.32"}'
+    expect:
+      class_uid: 4002
+      activity_id: 1
+  - raw: '2026-08-12T09:15:30Z conduit-proxy INFO reload complete'
+    expect:
+      class_uid: 0
+"#;
+        let result = parse_parser_yaml(yaml).unwrap();
+        let samples = result.samples.expect("samples must be retained");
+        assert_eq!(samples.len(), 2);
+        assert!(samples[0].raw.contains("10.10.4.32"));
+        assert!(samples[1].raw.contains("reload complete"));
+    }
 
     #[test]
     fn test_parse_parser_yaml() {

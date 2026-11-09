@@ -4,6 +4,8 @@
 
 use uuid::Uuid;
 
+use crate::auth::ViewerScope;
+
 use crate::models::notebook::{NewNotebookReference, NotebookReference, NotebookSummary};
 
 use super::{notebook_visible_to_user_at, NotebookRepository, NotebookRepositoryError};
@@ -128,9 +130,9 @@ impl NotebookRepository {
         &self,
         reference_type: &str,
         reference_id: Uuid,
-        user_id: Uuid,
+        viewer: &ViewerScope,
     ) -> Result<Vec<NotebookSummary>, NotebookRepositoryError> {
-        let results = sqlx::query_as::<_, NotebookSummary>(&format!(
+        let sql = format!(
             r#"
             SELECT DISTINCT
                 n.*,
@@ -150,13 +152,16 @@ impl NotebookRepository {
               AND {visible}
             ORDER BY n.updated_at DESC
             "#,
-            visible = notebook_visible_to_user_at(3),
-        ))
-        .bind(reference_type)
-        .bind(reference_id)
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
+            visible = notebook_visible_to_user_at(3, viewer.deny_param(4)),
+        );
+        let mut query = sqlx::query_as::<_, NotebookSummary>(&sql)
+            .bind(reference_type)
+            .bind(reference_id)
+            .bind(viewer.user_id());
+        if let Some(deny) = viewer.deny_bind() {
+            query = query.bind(deny);
+        }
+        let results = query.fetch_all(&self.pool).await?;
 
         Ok(results)
     }

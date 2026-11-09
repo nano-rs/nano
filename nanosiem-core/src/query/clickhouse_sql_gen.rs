@@ -2670,9 +2670,13 @@ impl ClickHouseSqlGenerator {
         // NAN-4917: generation runs a dozen recursive AST walks (field analysis,
         // gate strip, stage collection, …). Give the whole pass a guaranteed
         // stack budget instead of depending on the caller's (2 MiB tokio worker).
-        super::complexity::with_query_stack(|| {
+        let sql = super::complexity::with_query_stack(|| {
             self.generate_with_options_unguarded(query, time_range, options)
-        })
+        })?;
+        // Security review 2026-11-08 (layer 2): log-only check of the output.
+        // Never fails the query; see `generated_sql_tripwire`.
+        super::generated_sql_tripwire::observe(&sql, "npl_codegen");
+        Ok(sql)
     }
 
     fn generate_with_options_unguarded(

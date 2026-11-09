@@ -72,7 +72,7 @@ fn audit_details_name_the_tables_actually_dropped() {
 
 #[test]
 fn database_literal_is_escaped() {
-    assert!(daily_tables_filter("a'b").starts_with("database = 'a\\'b' AND"));
+    assert!(daily_tables_filter("a'b").starts_with("database = 'a''b' AND"));
 }
 
 #[test]

@@ -394,6 +394,13 @@ fn lookback_windows_are_parsed_and_clamped() {
 
     // A decade-wide window is not a hunt.
     assert_eq!(parse_lookback("3650d"), Duration::days(90));
+
+    // Security review 2026-11-08: values past chrono's TimeDelta range used to
+    // panic inside the supervised hunt scheduler; they clamp like any other
+    // over-long window.
+    for huge in ["200000000000000m", "200000000000d", "9223372036854775807w", "99999999999999999h"] {
+        assert_eq!(parse_lookback(huge), Duration::days(90), "{huge}");
+    }
 }
 
 /// The Profile matrix and the rail badge must be counted from the SAME stored

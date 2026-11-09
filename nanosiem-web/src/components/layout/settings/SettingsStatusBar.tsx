@@ -6,9 +6,20 @@
  */
 
 import { useSiemHealthLatest } from '@/hooks/use-api';
+import { useQuery } from '@tanstack/react-query';
+import { api } from '@/lib/api';
+import { useCapabilities } from '@/hooks/use-capabilities';
 
 export function SettingsStatusBar() {
   const { data: health } = useSiemHealthLatest();
+  const { edition } = useCapabilities();
+  const { data: license } = useQuery({
+    queryKey: ['license-status'],
+    queryFn: () => api.getLicenseStatus(),
+    staleTime: 60_000,
+    retry: false,
+    enabled: edition === 'enterprise',
+  });
 
   // Audit health is wedged into the unified health row; for now treat as healthy
   // unless the platform health endpoint signals a problem.
@@ -30,6 +41,11 @@ export function SettingsStatusBar() {
         ● {healthy ? 'audit log healthy' : 'audit log degraded'}
       </span>
       <span>changes replicated</span>
+      {license?.entitlement?.kind === 'trial' && (
+        <span className={license.state === 'locked' ? 'text-red-500' : license.state === 'grace_period' ? 'text-yellow-500' : 'text-foreground'}>
+          Trial — {license.entitlement.days_remaining} days left
+        </span>
+      )}
       <span className="flex-1" />
       <span className="text-right">{trailText}</span>
     </div>

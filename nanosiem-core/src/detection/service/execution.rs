@@ -239,6 +239,8 @@ impl DetectionService {
 
     /// Autonomous counterpart with an evaluator-owned query ID, no interactive
     /// count companion, and ClickHouse-enforced result row/byte ceilings.
+    // Only the enterprise AI-tuning / DaC push paths call this.
+    #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
     pub(crate) async fn evaluate_tuning_window(
         &self,
         query: &str,

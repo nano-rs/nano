@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useTestLogSourceVrl, useTestLogSourceVrlLive } from '@/hooks/use-api';
+import { runParserTests } from '@/lib/parser-test-pool';
 import { useToast } from '@/hooks/use-toast';
 import { extractFields } from './TestResultRow';
 import type { LiveTestResult } from '@/lib/api/types';
@@ -214,6 +215,14 @@ function EventRowHeader({
   );
 }
 
+/** One pasted line's parser-test outcome. */
+interface PasteResult {
+  input: string;
+  success: boolean;
+  output?: Record<string, unknown>;
+  error?: string;
+}
+
 export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensionVrl }: ParserTestLabProps) {
   const { toast } = useToast();
   const { mutate: testVrl, loading: testLoading } = useTestLogSourceVrl();
@@ -221,12 +230,7 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensi
 
   // Paste test state — each non-blank line is tested as a separate event.
   const [pasteInput, setPasteInput] = useState('');
-  const [pasteResults, setPasteResults] = useState<Array<{
-    input: string;
-    success: boolean;
-    output?: Record<string, unknown>;
-    error?: string;
-  }> | null>(null);
+  const [pasteResults, setPasteResults] = useState<PasteResult[] | null>(null);
 
   // Live events state
   const [liveResults, setLiveResults] = useState<LiveTestResult[] | null>(null);
@@ -254,16 +258,17 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensi
       });
     }
     try {
-      const results = await Promise.all(
-        capped.map((line) =>
-          testVrl({ vrlCode, sampleLog: line, extensionVrl }).then((r) => ({
-            input: line,
-            success: r.success,
-            output: r.output as Record<string, unknown> | undefined,
-            error: r.error ?? undefined,
-          })),
-        ),
-      );
+      // Bounded concurrency with 429 retry: the server admits a bounded number
+      // of concurrent parser tests per user and answers 429 + Retry-After.
+      const results: PasteResult[] = await runParserTests(capped, async (line) => {
+        const r = await testVrl({ vrlCode, sampleLog: line, extensionVrl });
+        return {
+          input: line,
+          success: r.success,
+          output: r.output as Record<string, unknown> | undefined,
+          error: r.error ?? undefined,
+        };
+      });
       setPasteResults(results);
     } catch (err) {
       toast({ title: 'Test error', description: err instanceof Error ? err.message : 'Failed to test', variant: 'destructive' });

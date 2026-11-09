@@ -11,18 +11,28 @@
 //! - `notifications` — tuning notification management
 //! - `settings` — per-rule tuning configuration
 
+#[cfg(feature = "enterprise")]
 mod baselines;
+#[cfg(feature = "enterprise")]
 mod logs;
+#[cfg(feature = "enterprise")]
 mod notifications;
+#[cfg(feature = "enterprise")]
 mod proposals;
+#[cfg(feature = "enterprise")]
 mod settings;
 mod types;
 mod versions;
 
+#[cfg(feature = "enterprise")]
 pub use baselines::*;
+#[cfg(feature = "enterprise")]
 pub use logs::*;
+#[cfg(feature = "enterprise")]
 pub use notifications::*;
+#[cfg(feature = "enterprise")]
 pub use proposals::*;
+#[cfg(feature = "enterprise")]
 pub use settings::*;
 pub use types::*;
 pub use versions::*;
@@ -49,6 +59,9 @@ pub use versions::*;
 /// made every non-Admin "restricted" and blanked `/api/tuning/*` on tenants
 /// with no source scoping configured, because that column ships `DEFAULT FALSE`
 /// and was never backfilled.
+// The scope composition is open (and unit-tested there); only the AI tuning
+// routes that call it are enterprise.
+#[cfg(any(test, feature = "enterprise"))]
 pub(crate) fn effective_tuning_scope(
     auth: &crate::middleware::AuthContext,
 ) -> nanosiem_core::tuning::scope::TuningScope {
@@ -66,39 +79,18 @@ impl utoipa::OpenApi for TuningApiDoc {
     fn openapi() -> utoipa::openapi::OpenApi {
         use utoipa::OpenApi;
 
+        // Rule-version history and rollback use only the open detection schema.
         #[derive(OpenApi)]
         #[openapi(
             paths(
-                get_baseline,
-                get_metrics,
-                get_breaches,
-                list_proposals,
-                get_proposal,
-                approve_proposal,
-                reject_proposal,
                 list_versions,
                 get_version,
                 activate_version,
-                list_logs,
-                get_log,
-                revert_tuning,
-                list_tuning_notifications,
-                mark_tuning_notification_read,
-                mark_all_tuning_notifications_read,
-                get_tuning_settings,
-                update_tuning_settings,
                 get_rule_versions,
                 revert_to_version,
             ),
             components(schemas(
-                ApproveProposalRequest,
-                RejectProposalRequest,
-                RevertRequest,
-                MarkReadRequest,
-                TuningSettings,
-                ApprovalOutcome,
                 ApprovalResponse,
-                RejectionResponse,
                 RuleVersionResponse,
             )),
             tags(
@@ -107,7 +99,48 @@ impl utoipa::OpenApi for TuningApiDoc {
         )]
         struct ApiDoc;
 
-        ApiDoc::openapi()
+        #[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
+        let mut document = ApiDoc::openapi();
+
+        // AI tuning (baselines, proposals, logs, notifications, settings) reads
+        // the enterprise-only tuning tables.
+        #[cfg(feature = "enterprise")]
+        {
+            #[derive(OpenApi)]
+            #[openapi(
+                paths(
+                    get_baseline,
+                    get_metrics,
+                    get_breaches,
+                    list_proposals,
+                    get_proposal,
+                    approve_proposal,
+                    reject_proposal,
+                    list_logs,
+                    get_log,
+                    revert_tuning,
+                    list_tuning_notifications,
+                    mark_tuning_notification_read,
+                    mark_all_tuning_notifications_read,
+                    get_tuning_settings,
+                    update_tuning_settings,
+                ),
+                components(schemas(
+                    ApproveProposalRequest,
+                    RejectProposalRequest,
+                    RevertRequest,
+                    MarkReadRequest,
+                    TuningSettings,
+                    ApprovalOutcome,
+                    RejectionResponse,
+                ))
+            )]
+            struct EnterpriseApiDoc;
+
+            document.merge(EnterpriseApiDoc::openapi());
+        }
+
+        document
     }
 }
 
@@ -118,11 +151,8 @@ mod tests {
     #[test]
     fn apply_and_rollback_routes_publish_complete_failure_contracts() {
         let document = serde_json::to_value(<TuningApiDoc as utoipa::OpenApi>::openapi()).unwrap();
-        let expected = [
-            (
-                "/api/tuning/proposals/{id}/approve",
-                &["200", "403", "404", "409", "422", "500"][..],
-            ),
+        #[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
+        let mut expected = vec![
             (
                 "/api/tuning/versions/{rule_id}/{version_id}/activate",
                 &["200", "403", "404", "409", "422", "503", "500"][..],
@@ -131,11 +161,18 @@ mod tests {
                 "/api/rules/{id}/versions/{version_id}/revert",
                 &["200", "403", "404", "409", "422", "503", "500"][..],
             ),
+        ];
+        #[cfg(feature = "enterprise")]
+        expected.extend([
+            (
+                "/api/tuning/proposals/{id}/approve",
+                &["200", "403", "404", "409", "422", "500"][..],
+            ),
             (
                 "/api/tuning/logs/{id}/revert",
                 &["200", "400", "403", "404", "409", "422", "503", "500"][..],
             ),
-        ];
+        ]);
 
         for (path, statuses) in expected {
             let responses = &document["paths"][path]["post"]["responses"];

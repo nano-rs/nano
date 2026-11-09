@@ -12,7 +12,7 @@ interface TierUsageBarProps {
 
 /**
  * Compact usage indicator showing current/max with a colored progress bar.
- * Only renders when there's a limit (non-null). Hidden on Unrestricted tier.
+ * Only renders when a compatibility deployment limit is non-null.
  *
  * Colors: green (0-79%), yellow (80-94%), red (95-100%)
  */
@@ -34,10 +34,10 @@ export function TierUsageBar({ label, current, limit, className }: TierUsageBarP
     : 'text-muted-foreground/70';
 
   const tooltipText = percent >= 95
-    ? `You've reached your ${label} limit. Upgrade your plan for more.`
+    ? `You've reached the configured ${label} limit.`
     : percent >= 80
-    ? `You're approaching your ${label} limit. Upgrade your plan for more.`
-    : `Using ${current} of ${limit} ${label}. Upgrade your plan for more.`;
+    ? `You're approaching the configured ${label} limit.`
+    : `Using ${current} of ${limit} configured ${label}.`;
 
   return (
     <TooltipProvider>

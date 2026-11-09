@@ -10,6 +10,7 @@ pub mod connect;
 #[path = "connect_tests.rs"]
 mod connect_tests;
 pub mod health_series;
+pub mod ingest_transport;
 #[cfg(test)]
 #[path = "health_series_tests.rs"]
 mod health_series_tests;

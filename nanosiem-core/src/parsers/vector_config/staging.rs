@@ -131,6 +131,9 @@ impl VectorConfigManager {
     /// This copies all base config files to staging along with the parser configs,
     /// ensuring that `vector validate` runs against a complete configuration.
     pub async fn stage_parsers(&self, parsers: &[Parser]) -> Result<(), VectorConfigError> {
+        // Validate what the active writer would write (NAN-5057).
+        let safe_parsers = self.render_safe_parsers(parsers);
+        let parsers = safe_parsers.as_slice();
         // NAN-2298: invalidate any previous completion marker FIRST — before the
         // collision check below, which returns early and would otherwise leave a
         // finished prior stage looking current. `cleanup_staging` further down
@@ -451,7 +454,7 @@ impl VectorConfigManager {
 
         // Parser routes + generic catch-all: the active writer's helper, since
         // promote_staged copies this file over the active _router.toml.
-        config.push_str(&Self::source_router_route_lines(&routed_parsers));
+        config.push_str(&Self::source_router_route_lines(&routed_parsers, log_parsers));
 
         // NAN-1124 / NAN-1151: enrichment lane router. Built via the SAME shared
         // helper as the active writer (router.rs) so the staged file can't
@@ -765,8 +768,8 @@ impl VectorConfigManager {
         fs::create_dir_all(&batch).await?;
 
         for (path, file_name) in strays {
-            // Suffixed so the copy is no longer a `.toml`. The S3 config sync
-            // (`deploy/src/s3.js::syncDirectory`) walks the whole config root
+            // Suffixed so the copy is no longer a `.toml`. A directory-walking
+            // config sync (as the retired S3 uploader did) walks the whole config root
             // and uploads every `.toml` it finds, skipping only `backup` and
             // `staging` by name — a quarantined parser keeping its extension
             // would be replicated to every Vector pod's config bundle, which is

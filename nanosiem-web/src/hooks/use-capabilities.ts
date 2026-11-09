@@ -3,8 +3,9 @@
 /**
  * Build capabilities — which surfaces are available in this deployment.
  *
- * Fetched once on app boot from `/api/capabilities`. The endpoint is public
- * (no auth) so the SPA can render correctly before login. In open-core builds
+ * Fetched on app boot and refreshed from `/api/capabilities`. The endpoint is
+ * public (no auth) so the SPA can render correctly before login and react to
+ * licence hard stops or renewals without a reload. In open-core builds
  * (`VITE_EDITION=open` / `cargo build` with no `enterprise` feature), the
  * enterprise pages are physically excluded from the bundle anyway via the
  * `@/enterprise` alias swap; capabilities is the runtime mirror used by:
@@ -13,14 +14,12 @@
  *     backend
  *   - observability ("which edition is this deployment running")
  *
- * Distinct from `useTier` (org plan tier — starter / pro / unrestricted, AI
- * credits, SSO entitlement). useTier sits *inside* enterprise and may further
- * restrict capabilities; useCapabilities answers the prior question of
- * whether the surface ships at all.
+ * Distinct from `useTier` (edition, operator, capacity, and hosted AI
+ * allowance). `useCapabilities` is the live route/surface admission boundary.
  *
  * Prefer specific capability flags (`useCapabilities().capabilities.cases`)
- * over edition-level checks — a "starter" enterprise tier may eventually drop
- * a single capability without changing the edition.
+ * over edition-level checks so future per-capability grants can evolve without
+ * changing the edition.
  */
 
 import { createContext, useContext } from 'react';
@@ -66,6 +65,13 @@ export interface CapabilitiesContextValue {
   edition: BuildEdition;
   version: string;
   capabilities: Capabilities;
+  /**
+   * Set only on the fail-closed fallback used before `/api/capabilities`
+   * answers (or when it errors). The flags are then a guess, not a licence
+   * verdict, so copy that explains WHY a flag is off (NAN-5088: "needs an
+   * active licence") must not render on it.
+   */
+  fallback?: true;
 }
 
 export const CapabilitiesContext = createContext<CapabilitiesContextValue | null>(null);

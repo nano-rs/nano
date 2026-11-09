@@ -86,7 +86,8 @@ pub const CHANNELS: &[Channel] = &[
     Channel { id: "parsers.legacy-clickhouse", kind: Kind::Parsers, repo: "nano-rs/parsers", branch: LEGACY_UDM_CONTENT_BRANCH, artifact_path: None, route: Route::Open, subscribers: Subscribers::All },
     Channel { id: "rules.main", kind: Kind::Rules, repo: "nano-rs/rules", branch: "main", artifact_path: None, route: Route::Open, subscribers: Subscribers::All },
     Channel { id: "rules.legacy-clickhouse", kind: Kind::Rules, repo: "nano-rs/rules", branch: LEGACY_UDM_CONTENT_BRANCH, artifact_path: None, route: Route::Open, subscribers: Subscribers::All },
-    Channel { id: "playbooks.main", kind: Kind::Playbooks, repo: "nano-rs/playbooks", branch: "main", artifact_path: None, route: Route::Open, subscribers: Subscribers::All },
+    // Playbooks are an enterprise surface: the open schema has no playbook tables.
+    Channel { id: "playbooks.main", kind: Kind::Playbooks, repo: "nano-rs/playbooks", branch: "main", artifact_path: None, route: Route::Open, subscribers: Subscribers::EnterpriseOnly },
     Channel { id: "enrichments.main", kind: Kind::MarketplaceCatalog, repo: "nano-rs/nano-enrichments", branch: "main", artifact_path: None, route: Route::Open, subscribers: Subscribers::All },
     Channel { id: "integrations.main", kind: Kind::MarketplaceCatalog, repo: "nano-rs/nano-integrations", branch: "main", artifact_path: None, route: Route::Open, subscribers: Subscribers::EnterpriseOnly },
     Channel { id: "models.main", kind: Kind::ModelCatalog, repo: "nano-rs/models", branch: "main", artifact_path: None, route: Route::Open, subscribers: Subscribers::EnterpriseOnly },

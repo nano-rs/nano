@@ -366,7 +366,7 @@ DEFINER = CURRENT_USER
 SQL SECURITY DEFINER
 AS SELECT
     timestamp,
-    if(source_type IN ('', 'unknown'), lower(ifNull(toString(event.metadata.log_source), 'unknown')), lower(source_type)) AS source_type,
+    if((if(source_type IN ('', 'unknown'), lower(ifNull(toString(event.metadata.log_source), 'unknown')), lower(source_type))) AS `_nano_st` IN ('audit', 'findings'), 'reserved_spoof', `_nano_st`) AS source_type,
     id,
     ifNull(accurateCastOrNull(event.`class_uid`, 'UInt32'), 0) AS `class_uid`,
     ifNull(accurateCastOrNull(event.`category_uid`, 'UInt16'), 0) AS `category_uid`,
