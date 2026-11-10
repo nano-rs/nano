@@ -52,6 +52,7 @@ on:
       - scripts/tests/test_otlp_edge_content_type.py
       - deploy/helm/nano/templates/ingest/**
       - scripts/tests/test_nano_deploy_fetch_bundle.py
+      - scripts/tests/test_valkey_ha_entrypoint.py
       - scripts/tests/fixtures/nano-deploy-plan/**
       - scripts/check-opencore-web-build.sh
       - docker-compose.yml
@@ -187,6 +188,16 @@ jobs:
             python3 -I scripts/tests/test_nano_deploy_fetch_bundle.py -v
           else
             echo "nano-deploy planner tests not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5248: the Valkey HA entrypoint acts only on a Sentinel majority
+      # (fake valkey-cli; no containers).
+      - name: Valkey HA entrypoint
+        run: |
+          if [ -f scripts/tests/test_valkey_ha_entrypoint.py ]; then
+            python3 -I scripts/tests/test_valkey_ha_entrypoint.py -v
+          else
+            echo "Valkey HA entrypoint test not in this tree (public mirror); skipping"
           fi
 
       # Security review 2026-11-08 (NAN-5008/NAN-5038): the full published-port
