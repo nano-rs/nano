@@ -818,6 +818,54 @@ pub fn ensure_ip_allowlist_findings(
     }
 }
 
+/// NAN-5149: sign-in failures for one email, across source addresses,
+/// reached the alert threshold in the last 24 hours, as published to the
+/// system-health bus by the auth service (one grouped condition). It does not
+/// cap the score: an attack is not a platform fault.
+pub fn login_guessing_recommendations(
+    events: &[crate::system_health::SystemHealthEvent],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<Recommendation> {
+    events
+        .iter()
+        .filter(|e| {
+            e.dedup_key == crate::auth::login_throttle::GUESSING_DEDUP_KEY
+                && e.status != "resolved"
+                && now.signed_duration_since(e.last_seen_at) <= chrono::Duration::hours(24)
+        })
+        .max_by_key(|e| e.last_seen_at)
+        .map(|e| Recommendation {
+            title: "Accounts had repeated failed sign-ins in the last 24 hours".into(),
+            description: format!(
+                "Failed password or MFA-code attempts for an email reached {} within an hour \
+                 {} time(s) since {} (latest: {}), possibly from many source addresses. nano \
+                 locks each source address after repeated failures and delays further attempts \
+                 for the email, but does not lock the account. Review the \
+                 login_account_throttled and login_failed audit events, confirm the accounts \
+                 use MFA or SSO, and block the source addresses.",
+                crate::auth::login_throttle::ACCOUNT_ALERT_THRESHOLD,
+                e.occurrence_count,
+                e.first_seen_at.format("%Y-%m-%d %H:%M UTC"),
+                e.resource_name.as_deref().unwrap_or("unknown"),
+            ),
+            priority: "high".into(),
+        })
+        .into_iter()
+        .collect()
+}
+
+/// Insert the NAN-5149 sign-in guessing finding (idempotent).
+pub fn ensure_login_guessing_findings(
+    analysis: &mut AnalysisResult,
+    events: &[crate::system_health::SystemHealthEvent],
+) {
+    for rec in login_guessing_recommendations(events, chrono::Utc::now()) {
+        if !analysis.recommendations.iter().any(|r| r.title == rec.title) {
+            analysis.recommendations.insert(0, rec);
+        }
+    }
+}
+
 /// NAN-4954: security-critical audit events that are recorded in PostgreSQL
 /// but not yet in ClickHouse, and inline ClickHouse audit-write failures.
 /// Deterministic (no AI needed) and emitted on every report path, because an
@@ -1039,6 +1087,10 @@ mod deployment_posture_findings_tests;
 #[cfg(test)]
 #[path = "ip_allowlist_findings_tests.rs"]
 mod ip_allowlist_findings_tests;
+
+#[cfg(test)]
+#[path = "login_guessing_findings_tests.rs"]
+mod login_guessing_findings_tests;
 
 #[cfg(test)]
 #[path = "analyzer_ingest_watchdog_tests.rs"]

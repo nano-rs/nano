@@ -24,7 +24,7 @@ export function TierWarningBanner({ warnings, className }: TierWarningBannerProp
           <AlertDescription className="flex items-center justify-between">
             <span>{warning.message}</span>
             <span className="text-xs font-medium ml-4 whitespace-nowrap">
-              {warning.percent_used}% used
+              {warning.percent_used.toLocaleString('en-US')}% used
             </span>
           </AlertDescription>
         </Alert>

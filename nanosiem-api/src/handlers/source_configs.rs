@@ -73,6 +73,7 @@ fn authorize_source_config_operation(
 
     Ok(if auth.has_permission(permissions::CREDENTIALS_USE) {
         CredentialUseGrant::granted()
+            .with_credential_edit(auth.has_permission(permissions::CREDENTIALS_EDIT))
     } else {
         CredentialUseGrant::none()
     })
@@ -493,7 +494,7 @@ pub async fn create_source_config(
     request_body = UpdateSourceConfiguration,
     responses(
         (status = 200, description = "Source configuration updated", body = SourceConfiguration),
-        (status = 403, description = "Requires source_configs:edit and credentials:use when the request or saved configuration references a credential"),
+        (status = 403, description = "Requires source_configs:edit and credentials:use when the request or saved configuration references a credential; binding a different credential, or changing the connection host (Kafka brokers, AWS endpoint/queue URL, Azure namespace/checkpoint account) of such a configuration, also requires credentials:edit"),
         (status = 404, description = "Not found"),
         (status = 409, description = "expected_updated_at is stale; reload before retrying"),
     ),

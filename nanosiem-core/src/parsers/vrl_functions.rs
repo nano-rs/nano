@@ -29,8 +29,8 @@ use std::sync::LazyLock;
 pub const PARSER_VRL_FUNCTIONS: &[&str] = &[
     "abs", "append", "array", "assert", "assert_eq", "basename", "bool", "camelcase",
     "ceil", "chunks", "community_id", "compact", "contains", "contains_all", "crc", "decode_base16",
-    "decode_base64", "decode_charset", "decode_gzip", "decode_lz4", "decode_mime_q", "decode_percent", "decode_punycode", "decode_snappy",
-    "decode_zlib", "decode_zstd", "decrypt", "decrypt_ip", "del", "dirname", "downcase", "encode_base16",
+    "decode_base64", "decode_charset", "decode_mime_q", "decode_percent", "decode_punycode",
+    "decrypt", "decrypt_ip", "del", "dirname", "downcase", "encode_base16",
     "encode_base64", "encode_charset", "encode_csv", "encode_gzip", "encode_json", "encode_key_value", "encode_logfmt", "encode_lz4",
     "encode_percent", "encode_punycode", "encode_snappy", "encode_zlib", "encode_zstd", "encrypt", "encrypt_ip", "ends_with",
     "exists", "filter", "find", "flatten", "float", "floor", "for_each", "format_int",
@@ -82,6 +82,15 @@ pub const PARSER_EXCLUDED_VRL_FUNCTIONS: &[&str] = &[
     "parse_etld",
     // compiler introspection, not data transformation
     "type_def",
+    // unbounded decompression: output size is attacker-chosen and a single
+    // call cannot be interrupted by the execution budget, so one small
+    // sample can exhaust API memory in the in-process test/preview paths
+    // (matches nano-connector's refusal list)
+    "decode_gzip",
+    "decode_zlib",
+    "decode_zstd",
+    "decode_snappy",
+    "decode_lz4",
 ];
 
 /// Extra functions enrichment normalize programs need on top of the parser

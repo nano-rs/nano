@@ -213,6 +213,8 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         // License / phone-home (NAN-1193): stripped from the open edition, so
         // the open spec omits the /api/license path entirely.
         sub_docs.push(handlers::license::LicenseApiDoc::openapi());
+        // NAN-5170: "Usage reported to nano" + offline usage-record export.
+        sub_docs.push(handlers::license_usage::LicenseUsageApiDoc::openapi());
         // Phase 3.2 (NAN-744): cases + incidents lifted to enterprise.
         sub_docs.push(handlers::cases::CasesApiDoc::openapi());
         sub_docs.push(handlers::incidents::IncidentsApiDoc::openapi());
@@ -868,8 +870,10 @@ mod tests {
         // NAN-5136 adds ENTERPRISE POST
         // /api/settings/ai-providers/{provider}/discover-models (self-hosted
         // model discovery). Enterprise 661 + 1 = 662.
+        // NAN-5170 adds ENTERPRISE GET /api/license/usage and
+        // /api/license/usage/export. Enterprise 662 + 2 = 664.
         #[cfg(feature = "enterprise")]
-        let min_paths = 662;
+        let min_paths = 664;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's

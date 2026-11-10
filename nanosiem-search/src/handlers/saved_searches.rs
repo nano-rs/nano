@@ -55,6 +55,29 @@ fn ownership_user_id(auth: &crate::AuthContext) -> Result<uuid::Uuid, SearchErro
     })
 }
 
+/// NAN-5162: map a saved-search repository failure to a client error.
+/// Database failures are logged and masked (raw PostgreSQL text names tables
+/// and constraints); validation failures are a 400 with their own message.
+fn repo_error(
+    e: nanosiem_core::db::repository::SavedSearchRepositoryError,
+    id: Option<uuid::Uuid>,
+    denied: &str,
+) -> SearchError {
+    use nanosiem_core::db::repository::SavedSearchRepositoryError as E;
+    match e {
+        E::NotFound(missing) => SearchError::NotFound(format!(
+            "Saved search not found: {}",
+            id.unwrap_or(missing)
+        )),
+        E::AccessDenied => SearchError::Forbidden(denied.to_string()),
+        E::InvalidInput(msg) => SearchError::BadRequest(msg),
+        E::DatabaseError(err) => {
+            tracing::error!(error = %err, "Saved search database error");
+            SearchError::InternalError("A database error occurred".to_string())
+        }
+    }
+}
+
 /// List all saved searches visible to user
 #[utoipa::path(
     get,
@@ -85,7 +108,7 @@ pub async fn list_saved_searches(
     let searches = repo
         .list_for_user(claims.sub)
         .await
-        .map_err(|e| SearchError::InternalError(e.to_string()))?;
+        .map_err(|e| repo_error(e, None, "Access denied"))?;
 
     // Demo isolation: hide saved searches created by other demo users
     let searches = if claims.roles.contains(&"demo_analyst".to_string()) {
@@ -140,7 +163,7 @@ pub async fn list_shared_searches(
     let searches = repo
         .list_shared_with_user(claims.sub)
         .await
-        .map_err(|e| SearchError::InternalError(e.to_string()))?;
+        .map_err(|e| repo_error(e, None, "Access denied"))?;
 
     // Demo isolation: hide saved searches created by other demo users
     let searches = if claims.roles.contains(&"demo_analyst".to_string()) {
@@ -194,7 +217,7 @@ pub async fn list_my_saved_searches(
     let searches = repo
         .list_owned_by_user(claims.sub)
         .await
-        .map_err(|e| SearchError::InternalError(e.to_string()))?;
+        .map_err(|e| repo_error(e, None, "Access denied"))?;
     Ok(Json(searches))
 }
 
@@ -223,7 +246,7 @@ pub async fn get_saved_search(
     // repository's per-record ownership/visibility check below.
     require_capability(&claims, permissions::SEARCH_VIEW)?;
 
-    use nanosiem_core::db::repository::{SavedSearchRepository, SavedSearchRepositoryError};
+    use nanosiem_core::db::repository::SavedSearchRepository;
 
     let repo = SavedSearchRepository::new(state.dual_pool.postgres().clone());
     // NAN-2145: visibility keys off `claims.sub` (the key principal), so a key
@@ -231,15 +254,7 @@ pub async fn get_saved_search(
     let search = repo
         .find_by_id_for_user(*id, claims.sub)
         .await
-        .map_err(|e| match e {
-            SavedSearchRepositoryError::NotFound(_) => {
-                SearchError::NotFound(format!("Saved search not found: {}", *id))
-            }
-            SavedSearchRepositoryError::AccessDenied => {
-                SearchError::Forbidden("You don't have access to this saved search".to_string())
-            }
-            _ => SearchError::InternalError(e.to_string()),
-        })?;
+        .map_err(|e| repo_error(e, Some(*id), "You don't have access to this saved search"))?;
     Ok(Json(search))
 }
 
@@ -252,6 +267,7 @@ pub async fn get_saved_search(
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
         (status = 200, description = "Created saved search", body = SavedSearch),
+        (status = 400, description = "Invalid visibility or unknown group_ids", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Missing permission: search:save", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
@@ -279,7 +295,7 @@ pub async fn create_saved_search(
     let search = repo
         .create(&request, user_id)
         .await
-        .map_err(|e| SearchError::InternalError(e.to_string()))?;
+        .map_err(|e| repo_error(e, None, "Access denied"))?;
 
     // Track for demo session cleanup
     if auth.claims.roles.contains(&"demo_analyst".to_string()) {
@@ -323,22 +339,14 @@ pub async fn update_saved_search(
     // repository's owner-only enforcement below.
     require_capability(&claims, permissions::SEARCH_SAVE)?;
 
-    use nanosiem_core::db::repository::{SavedSearchRepository, SavedSearchRepositoryError};
+    use nanosiem_core::db::repository::SavedSearchRepository;
 
     let repo = SavedSearchRepository::new(state.dual_pool.postgres().clone());
     // NAN-2145: owner-only enforcement keys off `claims.sub` (the key principal).
     let search = repo
         .update(*id, &request, claims.sub)
         .await
-        .map_err(|e| match e {
-            SavedSearchRepositoryError::NotFound(_) => {
-                SearchError::NotFound(format!("Saved search not found: {}", *id))
-            }
-            SavedSearchRepositoryError::AccessDenied => {
-                SearchError::Forbidden("Only the owner can update this saved search".to_string())
-            }
-            _ => SearchError::InternalError(e.to_string()),
-        })?;
+        .map_err(|e| repo_error(e, Some(*id), "Only the owner can update this saved search"))?;
     Ok(Json(search))
 }
 
@@ -367,19 +375,13 @@ pub async fn delete_saved_search(
     // repository's owner-only enforcement below.
     require_capability(&claims, permissions::SEARCH_SAVE)?;
 
-    use nanosiem_core::db::repository::{SavedSearchRepository, SavedSearchRepositoryError};
+    use nanosiem_core::db::repository::SavedSearchRepository;
 
     let repo = SavedSearchRepository::new(state.dual_pool.postgres().clone());
     // NAN-2145: owner-only enforcement keys off `claims.sub` (the key principal).
-    repo.delete(*id, claims.sub).await.map_err(|e| match e {
-        SavedSearchRepositoryError::NotFound(_) => {
-            SearchError::NotFound(format!("Saved search not found: {}", *id))
-        }
-        SavedSearchRepositoryError::AccessDenied => {
-            SearchError::Forbidden("Only the owner can delete this saved search".to_string())
-        }
-        _ => SearchError::InternalError(e.to_string()),
-    })?;
+    repo.delete(*id, claims.sub)
+        .await
+        .map_err(|e| repo_error(e, Some(*id), "Only the owner can delete this saved search"))?;
     Ok(Json(serde_json::json!({"deleted": true})))
 }
 
@@ -395,6 +397,7 @@ pub async fn delete_saved_search(
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
         (status = 200, description = "Updated saved search with sharing context", body = SavedSearchWithContext),
+        (status = 400, description = "Invalid visibility or unknown group_ids", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Only the owner can share", body = ErrorResponse),
         (status = 404, description = "Saved search not found", body = ErrorResponse),
@@ -410,24 +413,14 @@ pub async fn share_saved_search(
     // repository's owner-only enforcement below.
     require_capability(&claims, permissions::SEARCH_SHARE)?;
 
-    use nanosiem_core::db::repository::{
-        NotificationRepository, SavedSearchRepository, SavedSearchRepositoryError,
-    };
+    use nanosiem_core::db::repository::{NotificationRepository, SavedSearchRepository};
 
     let repo = SavedSearchRepository::new(state.dual_pool.postgres().clone());
     // NAN-2145: owner-only enforcement keys off `claims.sub` (the key principal).
     let share_result = repo
         .share(*id, &request, claims.sub)
         .await
-        .map_err(|e| match e {
-            SavedSearchRepositoryError::NotFound(_) => {
-                SearchError::NotFound(format!("Saved search not found: {}", *id))
-            }
-            SavedSearchRepositoryError::AccessDenied => {
-                SearchError::Forbidden("Only the owner can share this saved search".to_string())
-            }
-            _ => SearchError::InternalError(e.to_string()),
-        })?;
+        .map_err(|e| repo_error(e, Some(*id), "Only the owner can share this saved search"))?;
 
     // Emit audit event (actor name omitted - JWT no longer contains PII)
     state.emit_audit(
@@ -490,6 +483,10 @@ pub async fn share_saved_search(
 
     Ok(Json(share_result.search))
 }
+
+#[cfg(test)]
+#[path = "saved_searches_error_tests.rs"]
+mod error_tests;
 
 #[cfg(test)]
 mod tests {

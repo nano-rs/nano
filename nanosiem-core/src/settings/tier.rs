@@ -679,6 +679,67 @@ impl TierSettings {
         Ok(())
     }
 
+    /// NAN-5170: record the metered total for one UTC day. Idempotent and
+    /// monotonic: a re-meter of the same day only ever raises the stored
+    /// value, so the rollup's TTL eroding an old day can never shrink it.
+    pub async fn upsert_metered_usage(
+        &self,
+        date: chrono::NaiveDate,
+        bytes: u64,
+        events: u64,
+    ) -> Result<(), TierError> {
+        sqlx::query(
+            r#"
+            INSERT INTO daily_usage (date, bytes_ingested, events_ingested, peak_eps, updated_at)
+            VALUES ($1, $2, $3, 0, NOW())
+            ON CONFLICT (date) DO UPDATE SET
+                bytes_ingested = GREATEST(daily_usage.bytes_ingested, EXCLUDED.bytes_ingested),
+                events_ingested = GREATEST(daily_usage.events_ingested, EXCLUDED.events_ingested),
+                updated_at = NOW()
+            "#,
+        )
+        .bind(date)
+        .bind(i64::try_from(bytes).unwrap_or(i64::MAX))
+        .bind(i64::try_from(events).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// NAN-5170: the earliest day ever metered, if any. Only fully metered
+    /// days are written, so every later day is fully metered too.
+    pub async fn earliest_metered_day(&self) -> Result<Option<chrono::NaiveDate>, TierError> {
+        Ok(sqlx::query_scalar::<_, Option<chrono::NaiveDate>>("SELECT min(date) FROM daily_usage")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    /// NAN-5170: metered days in `[from, to]` (ascending) with the time each
+    /// was last metered, so a reporter can tell a finished day from one that
+    /// was last measured before it ended.
+    pub async fn get_metered_days(
+        &self,
+        from: chrono::NaiveDate,
+        to: chrono::NaiveDate,
+    ) -> Result<Vec<MeteredDay>, TierError> {
+        let rows = sqlx::query_as::<_, (chrono::NaiveDate, i64, chrono::DateTime<chrono::Utc>)>(
+            "SELECT date, bytes_ingested, updated_at FROM daily_usage
+             WHERE date >= $1 AND date <= $2 ORDER BY date ASC",
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(date, bytes, metered_at)| MeteredDay {
+                date,
+                bytes_ingested: u64::try_from(bytes).unwrap_or(0),
+                metered_at,
+            })
+            .collect())
+    }
+
     /// Get usage history for a date range
     pub async fn get_usage_range(
         &self,
@@ -951,6 +1012,31 @@ pub struct DailyUsage {
     pub peak_eps: u32,
 }
 
+/// One metered UTC day (NAN-5170): total bytes and when it was last metered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeteredDay {
+    pub date: chrono::NaiveDate,
+    pub bytes_ingested: u64,
+    pub metered_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Hours a finished UTC day is held back before its total counts as final
+/// (NAN-5170): in-flight batches buffered before midnight have landed by then.
+pub const FINAL_HOLD_HOURS: i64 = 3;
+
+impl MeteredDay {
+    /// True once the day was metered at least [`FINAL_HOLD_HOURS`] after it
+    /// ended (UTC), i.e. its total is final rather than a running snapshot.
+    pub fn is_final(&self) -> bool {
+        self.date
+            .succ_opt()
+            .and_then(|next| next.and_hms_opt(0, 0, 0))
+            .is_some_and(|end| {
+                self.metered_at.naive_utc() >= end + chrono::Duration::hours(FINAL_HOLD_HOURS)
+            })
+    }
+}
+
 /// Full tier status response (tier + limits + current usage)
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TierStatus {
@@ -1125,14 +1211,42 @@ pub struct TierWarning {
     pub current: u32,
     /// Maximum allowed
     pub limit: u32,
-    /// Percentage used (0-100)
-    pub percent_used: u8,
+    /// Percentage used. Not capped: a deployment ingesting 38x its
+    /// contracted capacity reports 3846 (NAN-5170).
+    pub percent_used: u32,
     /// Human-readable message
     pub message: String,
 }
 
 /// Warning threshold: emit warnings at 80%+ usage
-const WARNING_THRESHOLD_PERCENT: u8 = 80;
+const WARNING_THRESHOLD_PERCENT: u32 = 80;
+
+/// True (uncapped) whole percentage of `used` against `limit`, floored.
+/// NAN-5170: the old `.min(100.0) as u8` hid real overage at "100%".
+pub fn true_percent(used: f64, limit: f64) -> u32 {
+    if !(limit > 0.0) || !used.is_finite() || used <= 0.0 {
+        return 0;
+    }
+    let percent = (used / limit) * 100.0;
+    if percent >= u32::MAX as f64 {
+        u32::MAX
+    } else {
+        percent.floor() as u32
+    }
+}
+
+/// `3846` -> `"3,846"`.
+pub fn group_thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
 
 /// Generate proactive warnings for resources approaching tier limits
 pub fn generate_warnings(limits: &TierLimits, usage: &TierUsage) -> Vec<TierWarning> {
@@ -1151,7 +1265,7 @@ pub fn generate_warnings(limits: &TierLimits, usage: &TierUsage) -> Vec<TierWarn
     for (resource, current, limit) in checks {
         if let Some(max) = limit {
             if *max > 0 {
-                let percent = ((*current as f64 / *max as f64) * 100.0).min(100.0) as u8;
+                let percent = true_percent(*current as f64, *max as f64);
                 if percent >= WARNING_THRESHOLD_PERCENT {
                     warnings.push(TierWarning {
                         resource: resource.to_string(),
@@ -1159,11 +1273,11 @@ pub fn generate_warnings(limits: &TierLimits, usage: &TierUsage) -> Vec<TierWarn
                         limit: *max,
                         percent_used: percent,
                         message: format!(
-                            "You're using {}/{} {} ({:.0}% of the configured deployment limit)",
+                            "You're using {}/{} {} ({}% of the configured deployment limit)",
                             current,
                             max,
                             resource.replace('_', " "),
-                            percent
+                            group_thousands(percent.into())
                         ),
                     });
                 }
@@ -1175,16 +1289,19 @@ pub fn generate_warnings(limits: &TierLimits, usage: &TierUsage) -> Vec<TierWarn
     if let Some(max_gb) = limits.max_daily_gb {
         if max_gb > 0.0 {
             let used_gb = usage.today.bytes_ingested as f64 / 1_000_000_000.0;
-            let percent = ((used_gb / max_gb) * 100.0).min(100.0) as u8;
+            let percent = true_percent(used_gb, max_gb);
             if percent >= WARNING_THRESHOLD_PERCENT {
                 warnings.push(TierWarning {
                     resource: "daily_volume".to_string(),
-                    current: (used_gb * 100.0) as u32, // store as centibytes for precision
-                    limit: (max_gb * 100.0) as u32,
+                    // Hundredths of a GB for precision (saturating).
+                    current: (used_gb * 100.0).min(u32::MAX as f64) as u32,
+                    limit: (max_gb * 100.0).min(u32::MAX as f64) as u32,
                     percent_used: percent,
                     message: format!(
-                        "Daily ingestion at {:.1}/{:.1} GB ({:.0}% of contracted capacity)",
-                        used_gb, max_gb, percent
+                        "Today's ingest is {:.1} GB against {:.1} GB/day ({}% of contracted capacity). Ingest is never blocked.",
+                        used_gb,
+                        max_gb,
+                        group_thousands(percent.into())
                     ),
                 });
             }
@@ -1273,6 +1390,56 @@ mod tests {
         assert_eq!(parse_ai_credits_ceiling("-1"), None);
         assert_eq!(parse_ai_credits_ceiling("2147483647"), Some(2_147_483_647));
         assert_eq!(parse_ai_credits_ceiling("2147483648"), None);
+    }
+
+    fn usage_with_bytes(bytes: u64) -> TierUsage {
+        TierUsage {
+            data_sources: 0,
+            detection_rules: 0,
+            team_members: 0,
+            today: DailyUsage {
+                date: chrono::NaiveDate::from_ymd_opt(2026, 11, 9).unwrap(),
+                bytes_ingested: bytes,
+                events_ingested: 0,
+                peak_eps: 0,
+            },
+        }
+    }
+
+    fn limits_with_capacity(gb: f64) -> TierLimits {
+        let mut limits = TierLimits::for_tier_unoverridden(OrganizationTier::Licensed);
+        limits.max_daily_gb = Some(gb);
+        limits
+    }
+
+    #[test]
+    fn capacity_warning_reports_true_overage_not_capped_at_100() {
+        // 38.46 GB against 1 GB/day.
+        let warnings = generate_warnings(&limits_with_capacity(1.0), &usage_with_bytes(38_460_000_000));
+        let volume = warnings.iter().find(|w| w.resource == "daily_volume").unwrap();
+        assert_eq!(volume.percent_used, 3846);
+        assert!(volume.message.contains("3,846% of contracted capacity"), "{}", volume.message);
+        assert!(volume.message.contains("never blocked"));
+    }
+
+    #[test]
+    fn capacity_warning_starts_at_80_percent() {
+        let limits = limits_with_capacity(10.0);
+        assert!(generate_warnings(&limits, &usage_with_bytes(7_990_000_000)).is_empty());
+        let at = generate_warnings(&limits, &usage_with_bytes(8_000_000_000));
+        assert_eq!(at[0].percent_used, 80);
+    }
+
+    #[test]
+    fn true_percent_and_grouping_edges() {
+        assert_eq!(true_percent(0.0, 10.0), 0);
+        assert_eq!(true_percent(5.0, 0.0), 0);
+        assert_eq!(true_percent(f64::NAN, 1.0), 0);
+        assert_eq!(true_percent(1e30, 1.0), u32::MAX);
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1000), "1,000");
+        assert_eq!(group_thousands(1234567), "1,234,567");
     }
 
     #[test]

@@ -488,7 +488,12 @@ def seed(manifest: Path) -> int:
 
 
 # ------------------------------------------------------------------ verify
-def verify(manifest: Path, *, compat_old_api: bool = False) -> int:
+def verify(manifest: Path, *, compat_old_api: bool = False, no_clickhouse_data: bool = False) -> int:
+    """``no_clickhouse_data``: the stack was restored from a default backup
+    (NAN-5202), which carries PostgreSQL + configuration + lookup-table rows
+    but no other ClickHouse data. PostgreSQL objects and lookup rows must be
+    intact; event answers must be empty (the schema exists, the rows do not),
+    and the stack must work."""
     f = Failures()
     m = json.loads(manifest.read_text())
     o, sec = m["objects"], m["secrets"]
@@ -655,7 +660,16 @@ def verify(manifest: Path, *, compat_old_api: bool = False) -> int:
             owner = Api(env("NANOSIEM_SEARCH_URL"), {"Authorization": f"Bearer {tok}"})
             return same("saved search", o["saved_search"], obj_of(owner.get(f"/api/search/saved/{o['saved_search']['id']}")), ["name", "query"])
         check("saved search kept", saved)
-    if "lookup" in o:
+    if "lookup" in o and no_clickhouse_data:
+        # NAN-5202: the default backup keeps the lookup-table rows (the only
+        # ClickHouse table it carries); a delete here would change the
+        # baseline the full-restore verify compares against.
+        def lookup_rows_kept() -> str:
+            rows = items_of(admin.get("/api/lookup-tables/upg_lookup/rows", params={"limit": 100}), "rows")
+            assert len(rows) == o["lookup"]["rows"], f"{len(rows)} rows != {o['lookup']['rows']}"
+            return f"{len(rows)} rows restored from the default backup"
+        check("lookup table rows survive a default backup/restore", lookup_rows_kept)
+    elif "lookup" in o:
         def lookup() -> str:
             rows = items_of(admin.get("/api/lookup-tables/upg_lookup/rows", params={"limit": 100}), "rows")
             assert len(rows) == o["lookup"]["rows"], f"{len(rows)} rows != {o['lookup']['rows']}"
@@ -684,6 +698,14 @@ def verify(manifest: Path, *, compat_old_api: bool = False) -> int:
     searches = m.get("searches") or {}
     if m.get("profile") == "ocsf":
         print(f"note {len(searches)} pre-upgrade search answers not compared (OCSF profile: no backfill by design)", flush=True)
+        searches = {}
+    if no_clickhouse_data:
+        for label, want in searches.items():
+            def empty(label: str = label, want: dict[str, Any] = want) -> str:
+                got = run_search(search, want["query"], m["window"])
+                assert (got.get("total_count") or 0) == 0, f"{got.get('total_count')} events survived"
+                return f"0 (was {want['total_count']} before backup)"
+            check(f"search '{label}' is empty: event data not in the backup", empty)
         searches = {}
     for label, want in searches.items():
         def cmp(label: str = label, want: dict[str, Any] = want) -> str:
@@ -759,8 +781,15 @@ def main() -> int:
         action="store_true",
         help="verify the N-1 binary on the migrated schema without newer-only or destructive checks",
     )
+    ap.add_argument(
+        "--no-clickhouse-data",
+        action="store_true",
+        help="the stack was restored from a default backup: lookup rows only, no other ClickHouse data (NAN-5202)",
+    )
     a = ap.parse_args()
-    return seed(a.manifest) if a.phase == "seed" else verify(a.manifest, compat_old_api=a.compat_old_api)
+    if a.phase == "seed":
+        return seed(a.manifest)
+    return verify(a.manifest, compat_old_api=a.compat_old_api, no_clickhouse_data=a.no_clickhouse_data)
 
 
 if __name__ == "__main__":

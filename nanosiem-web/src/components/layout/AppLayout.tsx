@@ -64,6 +64,7 @@ import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext';
 import { DemoBanner } from '@/components/DemoBanner';
 import { LicenseBanner } from '@/components/LicenseBanner';
 import { UpdateAvailableBanner } from '@/components/UpdateAvailableBanner';
+import { CapacityWarningBanner } from '@/components/CapacityWarningBanner';
 import { AppBreadcrumbs, useCurrentPageTitle } from '@/components/layout/AppBreadcrumbs';
 import { useNotebookOptional } from '@/enterprise/contexts/NotebookContext';
 import { usePivtState, type PivtState } from '@/enterprise/hooks/use-pivt-state';
@@ -1161,6 +1162,7 @@ function MainAppShell({ children }: AppLayoutProps) {
                 <main className="flex-1 flex flex-col min-w-0 overflow-x-hidden md:[overflow-x:clip]">
                   <LicenseBanner />
                   <UpdateAvailableBanner />
+                  <CapacityWarningBanner />
                   <DemoBanner />
                   <div
                     ref={scrollContainerRef}

@@ -923,6 +923,36 @@ impl AppState {
     }
 
     /// Start the SIEM health check scheduler (leader-only, every 12 hours)
+    /// NAN-5170: meter daily customer ingest into `daily_usage` (leader-only,
+    /// every 15 minutes). Local only: it feeds the in-app capacity warning and
+    /// the licensed usage report / offline export. Never touches ingest.
+    pub fn start_usage_meter(&self) -> tokio::task::JoinHandle<()> {
+        use nanosiem_core::settings::usage_meter::{meter_once, METER_INTERVAL_SECS};
+        let telemetry = self.log_telemetry_service.clone();
+        let tier = nanosiem_core::TierSettings::new(self.pool.clone());
+        let shutdown = self.shutdown_token();
+        tokio::spawn(async move {
+            // Let boot settle before the first rollup read.
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+            }
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(METER_INTERVAL_SECS));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = ticker.tick() => {}
+                }
+                let today = chrono::Utc::now().date_naive();
+                match meter_once(&telemetry, &tier, today).await {
+                    Ok(days) => tracing::debug!(days, "Daily usage metered"),
+                    Err(error) => tracing::warn!(%error, "Daily usage metering failed; will retry"),
+                }
+            }
+        })
+    }
+
     pub fn start_siem_health_check_scheduler(&self) -> tokio::task::JoinHandle<()> {
         #[cfg(not(feature = "enterprise"))]
         use nanosiem_core::extensions::NoopSiemHealthAiAnalyzer;

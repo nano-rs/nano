@@ -185,8 +185,25 @@ pub async fn run_health_check_with_trigger(
         .list(None, Some(crate::system_health::HealthCategory::Service.as_str()), None, 200, 0)
         .await
     {
-        Ok((events, _)) => analyzer::ensure_ip_allowlist_findings(&mut analysis, &events),
-        Err(e) => warn!("Failed to read IP allowlist health events: {}", e),
+        Ok((events, _)) => {
+            analyzer::ensure_ip_allowlist_findings(&mut analysis, &events);
+            // NAN-5149: repeated failed sign-ins for one email.
+            analyzer::ensure_login_guessing_findings(&mut analysis, &events);
+        }
+        Err(e) => warn!("Failed to read service health events: {}", e),
+    }
+    // NAN-5194: the licence server refused this deployment's token.
+    // Enterprise only (the licence module is not in the open edition).
+    #[cfg(feature = "enterprise")]
+    match crate::license::LicenseRepository::new(pool.clone())
+        .get_token_rejected_notice()
+        .await
+    {
+        Ok(notice) => crate::license::token_rejection::ensure_token_rejected_finding(
+            &mut analysis,
+            notice.as_ref(),
+        ),
+        Err(e) => warn!("Failed to read licence token rejection: {}", e),
     }
 
     let duration_ms = start.elapsed().as_millis() as i32;

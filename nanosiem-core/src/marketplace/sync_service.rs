@@ -878,7 +878,7 @@ fn find_manifests(dir: &PathBuf, depth: usize) -> Vec<(PathBuf, MarketplaceManif
                 }
 
                 match std::fs::read_to_string(&path) {
-                    Ok(content) => match serde_yaml::from_str::<MarketplaceManifest>(&content) {
+                    Ok(content) => match crate::yaml_budget::from_str::<MarketplaceManifest>(&content) {
                         Ok(manifest) => {
                             manifests.push((path, manifest));
                         }

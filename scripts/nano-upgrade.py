@@ -635,6 +635,53 @@ class UpgradeError(RuntimeError):
     """An operator-safe failure (never contains secret values)."""
 
 
+# Values nano shipped as defaults or examples (config/known-public-secrets.txt,
+# kinds vector_install_token and vector_config_delivery_token; a test keeps
+# them in sync). nano-api refuses them for Vector config delivery (NAN-5148).
+PUBLIC_VECTOR_INSTALL_TOKENS = frozenset({
+    "CHANGE_ME", "CHANGE_ME_GENERATED", "CHANGE_ME_GENERATE_WITH_OPENSSL_RAND_HEX_32",
+    "nanosiem-default-token", "your-secret-token",
+})
+PUBLIC_VECTOR_CONFIG_DELIVERY_TOKENS = frozenset({
+    "CHANGE_ME", "CHANGE_ME_GENERATED", "CHANGE_ME_GENERATE_WITH_OPENSSL_RAND_HEX_32",
+})
+
+
+def check_vector_config_delivery_credential(env: dict[str, str]) -> str:
+    """Refuse an upgrade after which this role-split host's Vector config
+    delivery would be off (NAN-5148).
+
+    nano-api checks NANO_VECTOR_CONFIG_DELIVERY_TOKEN and, before v2.1, falls
+    back to the forwarder install token, but never to a publicly known one.
+    The ingest host's consumer presents the delivery token, else the install
+    token. `nano upgrade` does not change .env, so what is here now is what the
+    upgraded services get. Values are compared, never reported.
+    """
+    dedicated = env.get("NANO_VECTOR_CONFIG_DELIVERY_TOKEN", "").strip()
+    install = env.get("VECTOR_AUTH_TOKEN", "").strip()
+    if dedicated and dedicated not in PUBLIC_VECTOR_CONFIG_DELIVERY_TOKENS:
+        return "dedicated Vector config delivery token present"
+    if not dedicated and install and install not in PUBLIC_VECTOR_INSTALL_TOKENS:
+        return (
+            "Vector config delivery uses the install-token fallback (deprecated, "
+            "refused from v2.1): add NANO_VECTOR_CONFIG_DELIVERY_TOKEN to the shared .env"
+        )
+    problem = (
+        "NANO_VECTOR_CONFIG_DELIVERY_TOKEN in .env is a placeholder"
+        if dedicated else
+        "this host's .env has no NANO_VECTOR_CONFIG_DELIVERY_TOKEN and its "
+        "VECTOR_AUTH_TOKEN is publicly known, which nano-api refuses"
+    )
+    raise UpgradeError(
+        f"Vector config delivery would stop after this upgrade: {problem}. "
+        "Fix: on the app host run `NANO_PREPARE_ONLY=1 ./install.sh --inventory "
+        "<inventory> --role <its roles>` (it generates the token into .env; or "
+        "append NANO_VECTOR_CONFIG_DELIVERY_TOKEN=$(openssl rand -hex 32) to .env "
+        "yourself), securely copy that .env to every inventory host, then re-run "
+        "nano upgrade. See docs/getting-started/docker-deployment.md"
+    )
+
+
 def eprint(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
@@ -1864,7 +1911,12 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 "postgres-dump", postgres.source_bytes, "backup_postgres_ratio",
             ))
         clickhouse = stores.get("clickhouse")
-        if clickhouse is not None:
+        # NAN-5202: the default backup holds no ClickHouse data, so it needs
+        # no native-archive space. The legacy transition still captures it.
+        if clickhouse is not None and (
+            getattr(self, "legacy_layout", None) is not None
+            or getattr(self, "include_clickhouse_data", False)
+        ):
             destination = (
                 "clickhouse-data"
                 if getattr(self, "legacy_layout", None) is not None
@@ -2383,6 +2435,13 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         check("rendered-config", self._check_compose)
         check("runtime-config", self._check_runtime_config)
         check("ports", self._check_ports)
+        # Role-split only: a single-node stack serves Vector its config from a
+        # shared volume (NANO_VECTOR_CONFIG_DELIVERY=off), never over HTTP.
+        if getattr(self, "role_env", None) and self.roles.intersection({"app", "ingest"}):
+            check(
+                "vector-config-delivery",
+                lambda: check_vector_config_delivery_credential(self.env_file.values()),
+            )
         if self.roles.intersection({"app", "ingest"}):
             check(
                 "enrichment-control-tree",
@@ -2489,8 +2548,11 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         self, key_file: pathlib.Path, output: pathlib.Path, run_id: str,
         epoch: str, role_split: bool, snapshot_gate: pathlib.Path | None = None,
         clickhouse_disk: str = "backups", component: str | None = None,
+        include_clickhouse_data: bool = False,
     ) -> str:
         arguments = [str(self.nano_cli), "backup", "--key-file", str(key_file), "--output", str(output), "--install-dir", str(self.install_dir)]
+        if include_clickhouse_data:
+            arguments.append("--include-clickhouse-data")
         if role_split:
             arguments.extend(["--recovery-set-id", run_id, "--quiesce-epoch", epoch])
         if snapshot_gate is not None:
@@ -4484,6 +4546,7 @@ class NodeExecutor:
         self.remote_install_dir = remote_install_dir
         self.local = node.name == local_name or node.name == "single"
         self.backup_output = remote_install_dir / "backups"
+        self.include_clickhouse_data = False
 
     def _remote(self, action: str, arguments: Sequence[str], timeout: int) -> Any:
         ssh, target, command = self._remote_command(action, arguments)
@@ -4619,6 +4682,7 @@ class NodeExecutor:
             if sha256_path(bundle) != expected_bundle_sha256:
                 raise UpgradeError("local bundle digest differs from the coordinator-verified bundle")
             self.local_ops.backup_output = self.backup_output
+            self.local_ops.include_clickhouse_data = self.include_clickhouse_data
             return self.local_ops.preflight(
                 manifest, bundle, require_lb_hooks, prepared,
                 test_license_rehearsal,
@@ -4630,6 +4694,8 @@ class NodeExecutor:
         ]
         if prepared:
             arguments.append("--prepared")
+        if self.include_clickhouse_data:
+            arguments.append("--include-clickhouse-data")
         if require_lb_hooks:
             arguments.append("--require-lb-hooks")
             for kind in ("DRAIN", "REJOIN"):
@@ -4663,16 +4729,19 @@ class NodeExecutor:
         self, key: pathlib.Path, output: pathlib.Path, run_id: str, epoch: str,
         role_split: bool, snapshot_gate: pathlib.Path | None = None,
         clickhouse_disk: str = "backups", component: str | None = None,
+        include_clickhouse_data: bool = False,
     ) -> str:
         if self.local:
             return self.local_ops.backup(
                 key, output, run_id, epoch, role_split, snapshot_gate,
-                clickhouse_disk, component,
+                clickhouse_disk, component, include_clickhouse_data,
             )
         arguments = [
             "--backup-key-file", str(key), "--backup-output", str(output),
             "--run-id", run_id, "--quiesce-epoch", epoch,
         ]
+        if include_clickhouse_data:
+            arguments.append("--include-clickhouse-data")
         if snapshot_gate is not None:
             arguments.extend(["--snapshot-gate", str(snapshot_gate)])
         if component is not None:
@@ -5149,8 +5218,10 @@ class BackupComponent:
 
 
 def backup_components_for(
-    nodes: Sequence[Node], role_split: bool,
+    nodes: Sequence[Node], role_split: bool, include_clickhouse_data: bool = True,
 ) -> list[BackupComponent]:
+    """Hosts that write a bundle. Without ClickHouse data (the NAN-5202
+    default) a role-split set is the PostgreSQL component alone."""
     if not role_split:
         if len(nodes) != 1:
             raise UpgradeError("single-node backup requires exactly one host")
@@ -5169,6 +5240,8 @@ def backup_components_for(
     if shards != expected:
         raise UpgradeError("consistent backup requires replica 1 for every ClickHouse shard")
     components = [BackupComponent("postgres", "postgres", postgres[0])]
+    if not include_clickhouse_data:
+        return components
     components.extend(
         BackupComponent(f"clickhouse-shard-{node.clickhouse_shard}", "clickhouse", node)
         for node in clickhouse
@@ -5176,9 +5249,14 @@ def backup_components_for(
     return components
 
 
-def backup_nodes_for(nodes: Sequence[Node], role_split: bool) -> list[Node]:
+def backup_nodes_for(
+    nodes: Sequence[Node], role_split: bool, include_clickhouse_data: bool = True,
+) -> list[Node]:
     """Compatibility view for callers that only need the selected hosts."""
-    return [component.node for component in backup_components_for(nodes, role_split)]
+    return [
+        component.node
+        for component in backup_components_for(nodes, role_split, include_clickhouse_data)
+    ]
 
 
 def create_consistent_backup_set(
@@ -5192,11 +5270,17 @@ def create_consistent_backup_set(
     manual_deployment: dict[str, Any] | None = None,
     manual_inventory: str = "",
     boundary_hook: Callable[[str], None] | None = None,
+    include_clickhouse_data: bool = False,
 ) -> dict[str, Any]:
-    """Capture one recovery set while the live ingest data plane stays online."""
+    """Capture one recovery set while the live ingest data plane stays online.
+
+    By default (NAN-5202) no ClickHouse data is captured: PostgreSQL plus
+    configuration only, and the ClickHouse schema is rebuilt from migrations
+    on restore. ``include_clickhouse_data`` restores the full ClickHouse
+    capture."""
     started = time.monotonic()
     emit = record_event or (lambda *_args, **_fields: None)
-    components = backup_components_for(nodes, role_split)
+    components = backup_components_for(nodes, role_split, include_clickhouse_data)
     writer_resume_pairs = role_node_pairs(nodes, ("app",)) if role_split else []
     writer_quiesce_pairs = (
         role_node_pairs(nodes, ("app",), dependents_first=True)
@@ -5307,6 +5391,7 @@ def create_consistent_backup_set(
                 key, output, run_id, epoch, role_split,
                 gates.get(component.component_id), clickhouse_disk,
                 component.kind if role_split else None,
+                include_clickhouse_data,
             )
             emit(
                 "component_backup_started", node=component.node.name,
@@ -5846,6 +5931,7 @@ def backup_set_command(args: argparse.Namespace) -> int:
                     require_lb_hooks=require_lb_hooks,
                     nano_cli=nano_cli, runner=runner,
                     clickhouse_disk=args.clickhouse_disk,
+                    include_clickhouse_data=getattr(args, "include_clickhouse_data", False),
                     manual_fence=manual_fence,
                     manual_deployment=normalized_deployment,
                     manual_inventory=str(pathlib.Path(args.inventory).expanduser().resolve()),
@@ -5973,6 +6059,10 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     args.remote_bundle = str(started["remote_bundle"])
                 if not args.backup_output and started.get("backup_output"):
                     args.backup_output = str(started["backup_output"])
+                # The backup scope is part of the run: `--resume` keeps the
+                # original choice even when the flag is not repeated.
+                if started.get("include_clickhouse_data") is True:
+                    args.include_clickhouse_data = True
             bundle, temporary = bundle_for_version(args, ops, runner)
             bundle_digest = sha256_path(bundle)
             manifest = verify_manifest(nano_cli, bundle, runner)
@@ -5989,6 +6079,7 @@ def upgrade_command(args: argparse.Namespace) -> int:
                 executors[node.name].backup_output = (
                     preflight_backup_root / node.name if role_split else preflight_backup_root
                 )
+                executors[node.name].include_clickhouse_data = getattr(args, "include_clickhouse_data", False)
             remote_bundle = pathlib.Path(args.remote_bundle or str(bundle))
             remote_install = pathlib.Path(args.remote_install_dir or str(ops.install_dir))
             normalized_deployment = deployment_identity(
@@ -6198,6 +6289,7 @@ def upgrade_command(args: argparse.Namespace) -> int:
                     "backup_skip_override": args.skip_backup_I_understand,
                     "legacy_layout": legacy_transition,
                     "backup_output": str(args.backup_output or ""),
+                    "include_clickhouse_data": bool(getattr(args, "include_clickhouse_data", False)),
                 })
                 journal.append(
                     state, "preflight_passed",
@@ -6215,7 +6307,7 @@ def upgrade_command(args: argparse.Namespace) -> int:
             ).expanduser().resolve()
             backup_results: list[str] = []
             recovery_set_result = ""
-            backup_nodes = backup_nodes_for(nodes, role_split)
+            backup_nodes = backup_nodes_for(nodes, role_split, getattr(args, "include_clickhouse_data", False))
             skipped_before = "backup-skipped" in state.done_steps
             if mandatory_backup:
                 enforce_signed_backup_policy(manifest, journal_skipped=skipped_before)
@@ -6269,6 +6361,7 @@ def upgrade_command(args: argparse.Namespace) -> int:
                         # set ID and common epoch, so it cannot collide with
                         # or release an abandoned attempt.
                         gate_run_id=f"{run_id}-attempt-{attempts}",
+                        include_clickhouse_data=getattr(args, "include_clickhouse_data", False),
                         record_event=lambda event, **fields: journal.append(
                             state, event, **fields,
                         ),
@@ -6588,6 +6681,7 @@ def worker_command(args: argparse.Namespace) -> int:
         assert bundle is not None
         if args.backup_output:
             ops.backup_output = pathlib.Path(args.backup_output).expanduser()
+        ops.include_clickhouse_data = getattr(args, "include_clickhouse_data", False)
         require_bundle_digest(bundle, args.expected_bundle_sha256)
         manifest = verify_manifest(nano_cli, bundle, runner)
         require_bundle_digest(bundle, args.expected_bundle_sha256)
@@ -6614,6 +6708,7 @@ def worker_command(args: argparse.Namespace) -> int:
             args.run_id, args.quiesce_epoch, True,
             pathlib.Path(args.snapshot_gate) if args.snapshot_gate else None,
             args.clickhouse_disk, args.component or None,
+            getattr(args, "include_clickhouse_data", False),
         )}
     elif args.worker_action == "running-writers":
         value = ops.running_writers(args.role)
@@ -6684,6 +6779,11 @@ def parser() -> argparse.ArgumentParser:
     backup_set.add_argument(
         "--install-dir", default=os.environ.get("NANO_INSTALL_DIR", str(DEFAULT_INSTALL_DIR)),
     )
+    backup_set.add_argument(
+        "--include-clickhouse-data", "--include-events", dest="include_clickhouse_data",
+        action="store_true",
+        help="also back up every ClickHouse table (default: PostgreSQL and configuration only)",
+    )
     backup_set.add_argument("--remote-install-dir")
     backup_set.add_argument("--lb-drain-command")
     backup_set.add_argument("--lb-rejoin-command")
@@ -6705,6 +6805,11 @@ def parser() -> argparse.ArgumentParser:
     upgrade.add_argument("--remote-bundle")
     upgrade.add_argument("--backup-key-file")
     upgrade.add_argument("--backup-output")
+    upgrade.add_argument(
+        "--include-clickhouse-data", "--include-events", dest="include_clickhouse_data",
+        action="store_true",
+        help="also back up every ClickHouse table (default: PostgreSQL and configuration only)",
+    )
     upgrade.add_argument("--lb-drain-command")
     upgrade.add_argument("--lb-rejoin-command")
     upgrade.add_argument(
@@ -6753,6 +6858,7 @@ def parser() -> argparse.ArgumentParser:
     worker.add_argument("--backup-key-file", default="")
     worker.add_argument("--backup-output", default="")
     worker.add_argument("--clickhouse-disk", default="backups")
+    worker.add_argument("--include-clickhouse-data", action="store_true")
     worker.add_argument("--role", default="")
     worker.add_argument("--service", action="append", default=[])
     worker.add_argument(

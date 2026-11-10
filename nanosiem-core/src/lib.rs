@@ -112,6 +112,7 @@ pub mod upload;
 pub mod vector_env;
 pub mod vector_naming;
 pub mod webhooks;
+pub mod yaml_budget;
 
 pub use audit::{
     AuditEmitError,
@@ -343,6 +344,7 @@ pub use rule_repository::{
 };
 pub use scheduler::{
     calculate_next_run, calculate_next_runs, describe_cron, merge_auth_headers,
+    merge_auth_headers_for_url, AuthHeadersOriginChanged,
     redact_auth_headers, validate_cron, JobExecution, JobFilter, JobStats, JobStatus,
     NewScheduledJob, RetryPolicy, ScheduledJob, SchedulerError, SchedulerRepository,
     SchedulerRepositoryError, SchedulerService, UpdateScheduledJob,

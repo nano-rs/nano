@@ -19,6 +19,7 @@ pub mod credential_use;
 #[cfg(feature = "enterprise")]
 pub mod google_sso;
 pub mod grant_authority;
+pub mod login_throttle;
 pub mod mfa;
 #[cfg(feature = "enterprise")]
 pub mod oidc;

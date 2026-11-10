@@ -65,6 +65,57 @@ pub(crate) const DISALLOWED_FUNCTIONS: &[&str] = &[
     "FILESYSTEMAVAILABLE",
     "GETOSKERNELVERSION",
     "GETMACRO",
+    // NAN-5163: ClickHouse aliases / siblings of the identity functions above.
+    // Matched only as `NAME(` with a word boundary, so a `user` / `version` /
+    // `timezone` COLUMN and `toTimeZone(` / `toTimezone(` / `timeZoneOf(` are
+    // unaffected. Names are case-insensitive (the scan uppercases), so
+    // `serverTimeZone` is covered by SERVERTIMEZONE.
+    "USER",
+    "CURRENT_USER",
+    "SESSION_USER",
+    "DATABASE",
+    "CURRENT_DATABASE",
+    "SCHEMA",
+    "CURRENTSCHEMAS",
+    "CURRENT_SCHEMAS",
+    "VERSION",
+    "REVISION",
+    "UPTIME",
+    "TIMEZONE",
+    "SERVERTIMEZONE",
+    "CURRENTROLES",
+    "DEFAULTROLES",
+    "ENABLEDPROFILES",
+    "DEFAULTPROFILES",
+    "GETSERVERPORT",
+    "FULLHOSTNAME",
+    "QUERYID",
+    "QUERY_ID",
+    "INITIALQUERYID",
+    "INITIAL_QUERY_ID",
+    // Remaining identity / settings / session scalars and their aliases,
+    // diffed against `system.functions` on ClickHouse 26.10.
+    "CURRENT_SCHEMA",
+    "CURRENT_TIMEZONE",
+    "AUTHENTICATEDUSER",
+    "AUTHUSER",
+    "PGGETUSERBYID",
+    "PG_GET_USERBYID",
+    "GETSETTINGORDEFAULT",
+    "GETSERVERSETTING",
+    "GETMERGETREESETTING",
+    "CURRENT_SETTING",
+    "CURRENTQUERYID",
+    "CURRENT_QUERY_ID",
+    "CONNECTIONID",
+    "CONNECTION_ID",
+    "INITIALQUERYSTARTTIME",
+    "INITIAL_QUERY_START_TIME",
+    "GETCLIENTHTTPHEADER",
+    "SHARDNUM",
+    "SHARDCOUNT",
+    "ZOOKEEPERSESSIONUPTIME",
+    "FILESYSTEMUNRESERVED",
     // Postgres-oriented file / process functions (harmless on CH, kept for parity)
     "PG_READ_FILE",
     "PG_READ_BINARY_FILE",
@@ -229,6 +280,10 @@ fn reject_disallowed_functions(code: &str) -> Result<(), SearchError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "validation_alias_tests.rs"]
+mod alias_tests;
 
 #[cfg(test)]
 mod tests {

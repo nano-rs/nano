@@ -574,6 +574,17 @@ impl UserRepository {
                 if action == PrincipalAction::Disable {
                     revoke_credentials_in(&mut tx, id).await?;
                 }
+                if action == PrincipalAction::Unlock {
+                    // NAN-5149: also forget the sign-in throttle state for
+                    // this email (every per-address lock and the account
+                    // delay), in the same transaction.
+                    let email: String =
+                        sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+                            .bind(id)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                    crate::auth::login_throttle::clear_account_in(&mut *tx, &email).await?;
+                }
             }
             PrincipalAction::ResetMfa => {
                 let result = sqlx::query(
@@ -600,26 +611,6 @@ impl UserRepository {
         }
         tx.commit().await?;
         Ok(())
-    }
-
-    /// Increment failed login attempts
-    /// Requirements: 1.6
-    pub async fn increment_failed_attempts(&self, id: Uuid) -> Result<i32, UserRepositoryError> {
-        let user = sqlx::query_as::<_, User>(
-            r#"
-            UPDATE users SET
-                failed_login_attempts = failed_login_attempts + 1,
-                updated_at = NOW()
-            WHERE id = $1
-            RETURNING *
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(UserRepositoryError::NotFound(id))?;
-
-        Ok(user.failed_login_attempts)
     }
 
     /// Reset failed login attempts (on successful login)

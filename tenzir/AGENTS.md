@@ -16,6 +16,15 @@ Ground truth for field mappings is the parser set in the **parsers repo**
 1. **Sink is fixed. Do not change it.** Write with the native `to_clickhouse`
    operator into `nanosiem.ocsf_logs_raw`, `tls=false`, `mode="append"`,
    native port `9000`. Editing the table name or sink will break ingestion.
+   **Exception — more than one ClickHouse shard:** write
+   `nanosiem.ocsf_logs_raw_distributed` instead (NAN-5203). That write-only
+   Distributed wrapper splits each batch by `cityHash64(event, source_type)`
+   across shards; the plain `ocsf_logs_raw` keeps every row on the node Tenzir
+   connects to. It carries only `event`, `source_type` and
+   `future_timestamp_skew_seconds`, so each shard mints `id` and `timestamp`
+   itself and an identical retried batch deduplicates exactly as a direct
+   insert does. The wrapper exists only on clustered installs, and
+   `nanosiem_ingest` is granted INSERT on it.
 2. **Requires Tenzir ≥ 6.6.0.** The first release whose `to_clickhouse` accepts
    `ocsf_logs_raw`'s column types AND omits server-derived columns it doesn't
    send. On Tenzir 6.4.0–6.5.x, target the legacy `nanosiem.ocsf_logs_native_raw`

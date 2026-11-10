@@ -122,6 +122,13 @@ def validate_bundle(value: dict[str, Any]) -> dict[str, Any]:
     else:
         need(disk is None and archive is None and not ch["external"] and not ch["external_disk_encrypted"], "excluded ClickHouse component has storage")
         disk = archive = ""
+    # NAN-5202: the default backup carries no ClickHouse data at all; the
+    # schema is rebuilt from migrations. Bundles written before the field
+    # existed always held the full ClickHouse database.
+    clickhouse_data = value.get("clickhouse_data", "included")
+    # "lookups": PostgreSQL + configuration + the lookup-table rows only.
+    need(clickhouse_data in {"included", "lookups", "excluded"}, "invalid clickhouse_data scope")
+    need(clickhouse_data == "included" or not ch["included"], "bundle excludes ClickHouse data but carries a ClickHouse archive")
     base_id = ch.get("base_backup_id")
     base_sha = ch.get("base_payload_sha256")
     if base_id is None and base_sha is None:
@@ -182,6 +189,7 @@ def validate_bundle(value: dict[str, Any]) -> dict[str, Any]:
         "external": ch["external"],
         "external_encrypted": ch["external_disk_encrypted"],
         "scope": ch["scope"],
+        "clickhouse_data": clickhouse_data,
         "base_id": base_id,
         "base_sha": base_sha,
         "set_id": set_id,
@@ -196,7 +204,7 @@ FIELD_ORDER = (
     "backup_id", "created_at", "version", "edition", "schema", "mode", "deployment", "identity", "host", "roles",
     "shard", "replica", "shard_count", "pg_included", "pg_migration", "pg_bytes", "ch_included", "ch_migration",
     "ch_bytes", "disk", "archive", "external", "external_encrypted", "scope", "base_id", "base_sha", "set_id",
-    "quiesce_epoch", "payload_sha", "fingerprint", "manifest_sha",
+    "quiesce_epoch", "payload_sha", "fingerprint", "manifest_sha", "clickhouse_data",
 )
 
 
@@ -372,14 +380,21 @@ def create_set_command(args: argparse.Namespace) -> None:
     need(len(pg) == 1, "recovery set requires exactly one PostgreSQL bundle")
     need(all(not fields["ch_included"] for fields in pg), "PostgreSQL bundle also contains ClickHouse")
     need(all(not fields["pg_included"] and fields["replica"] == 1 for fields in ch), "invalid ClickHouse component bundle")
-    need(ch, "recovery set has no ClickHouse bundles")
-    shard_count = ch[0]["shard_count"]
-    need(all(fields["shard_count"] == shard_count for fields in ch), "ClickHouse shard-count mismatch")
-    cluster = [fields for fields in ch if fields["scope"] == "cluster"]
-    if cluster:
-        need(len(cluster) == 1 and len(ch) == 1, "cluster bundle cannot be mixed with shard bundles")
+    scopes = {fields["clickhouse_data"] for _, fields in parsed}
+    need(len(scopes) == 1, "recovery set mixes ClickHouse data scopes")
+    clickhouse_data = scopes.pop()
+    if clickhouse_data != "included":
+        need(not ch, "recovery set excludes ClickHouse data but contains ClickHouse bundles")
+        shard_count = pg[0]["shard_count"]
     else:
-        need(sorted(fields["shard"] for fields in ch) == list(range(1, shard_count + 1)), "recovery set lacks a shard or contains duplicates")
+        need(ch, "recovery set has no ClickHouse bundles")
+        shard_count = ch[0]["shard_count"]
+        need(all(fields["shard_count"] == shard_count for fields in ch), "ClickHouse shard-count mismatch")
+        cluster = [fields for fields in ch if fields["scope"] == "cluster"]
+        if cluster:
+            need(len(cluster) == 1 and len(ch) == 1, "cluster bundle cannot be mixed with shard bundles")
+        else:
+            need(sorted(fields["shard"] for fields in ch) == list(range(1, shard_count + 1)), "recovery set lacks a shard or contains duplicates")
     created = [parse_time(fields["created_at"], "created_at") for _, fields in parsed]
     skew = int((max(created) - min(created)).total_seconds())
     need(skew <= args.max_skew, f"snapshot skew {skew}s exceeds {args.max_skew}s")
@@ -395,6 +410,7 @@ def create_set_command(args: argparse.Namespace) -> None:
         "edition": first["edition"],
         "schema_profile": first["schema"],
         "clickhouse_shard_count": shard_count,
+        "clickhouse_data": clickhouse_data,
         "components": [recovery_component(fields, hashlib.sha256(raw).hexdigest()) for raw, fields in parsed],
     }
     args.output.write_text(json.dumps(document, sort_keys=True, indent=2) + "\n", encoding="utf-8")
@@ -416,8 +432,10 @@ def validate_set_document(value: dict[str, Any]) -> dict[str, Any]:
     need(value.get("schema_profile") in {"udm", "ocsf"}, "invalid recovery set schema")
     shard_count = value.get("clickhouse_shard_count")
     need(uint(shard_count) and shard_count > 0, "invalid recovery set shard count")
+    clickhouse_data = value.get("clickhouse_data", "included")
+    need(clickhouse_data in {"included", "lookups", "excluded"}, "invalid recovery set ClickHouse data scope")
     components = value.get("components")
-    need(isinstance(components, list) and len(components) >= 2, "invalid recovery set components")
+    need(isinstance(components, list) and len(components) >= (2 if clickhouse_data == "included" else 1), "invalid recovery set components")
     seen_ids: set[str] = set()
     pg_count = 0
     shards: list[int] = []
@@ -449,7 +467,8 @@ def validate_set_document(value: dict[str, Any]) -> dict[str, Any]:
                 need(component_shards == list(range(1, shard_count + 1)), "cluster component is incomplete")
             shards.extend(component_shards)
             need(not component["postgres"], "combined recovery component")
-    need(pg_count == 1 and sorted(shards) == list(range(1, shard_count + 1)), "incomplete recovery set")
+    expected_shards = list(range(1, shard_count + 1)) if clickhouse_data == "included" else []
+    need(pg_count == 1 and sorted(shards) == expected_shards, "incomplete recovery set")
     return {
         "set_id": set_id,
         "epoch": epoch,
@@ -459,6 +478,7 @@ def validate_set_document(value: dict[str, Any]) -> dict[str, Any]:
         "edition": value["edition"],
         "schema": value["schema_profile"],
         "shard_count": shard_count,
+        "clickhouse_data": clickhouse_data,
         "components": components,
     }
 

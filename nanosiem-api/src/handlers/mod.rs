@@ -86,6 +86,10 @@ pub mod ingest_tokens;
 pub mod ip_allowlist;
 #[cfg(feature = "enterprise")]
 pub mod license;
+// NAN-5170: usage reported to nano + offline usage export (enterprise only;
+// stripped from the open-core mirror).
+#[cfg(feature = "enterprise")]
+pub mod license_usage;
 pub mod log_source_connect;
 pub mod log_source_health_series;
 pub mod log_sources;

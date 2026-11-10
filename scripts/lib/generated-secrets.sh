@@ -564,6 +564,21 @@ nano_backfill_generated_secrets() {
                     fi
                 fi
             done < <(nano_cluster_shared_secret_keys)
+            # NAN-5148: the v2.0.x fallback for a host without the delivery
+            # token is its install token, and nano-api never accepts a public
+            # one. A present-but-public delivery token is sent as is and is
+            # refused too. Either way this host's Vector would get no config
+            # after the upgrade, so refuse here instead of warning. A host
+            # with no Vector config consumer (data roles) sets
+            # NANO_SECRETS_HOST_CONSUMES_VECTOR_CONFIG=0 and only gets the warning.
+            if [[ "${NANO_SECRETS_HOST_CONSUMES_VECTOR_CONFIG:-1}" != 0 ]] \
+                && [[ ":$transitional_missing:" == *:NANO_VECTOR_CONFIG_DELIVERY_TOKEN:* ]] \
+                && { nano_secret_effective_nonempty "$target" NANO_VECTOR_CONFIG_DELIVERY_TOKEN \
+                    || [[ ":$public_kept:" == *:VECTOR_AUTH_TOKEN:* ]]; }; then
+                printf 'generated-secrets: this host'"'"'s .env has no usable NANO_VECTOR_CONFIG_DELIVERY_TOKEN, and VECTOR_AUTH_TOKEN cannot stand in for it (nano-api refuses a publicly known install token for Vector config delivery), so Vector on this host would stop receiving config. Fix: on the canonical app/prepare host run install.sh (or NANO_PREPARE_ONLY=1 install.sh) so it generates NANO_VECTOR_CONFIG_DELIVERY_TOKEN in its .env, securely copy that updated shared .env to this host, then retry.\n' >&2
+                status=1
+                break
+            fi
             if [[ -n "$transitional_missing" ]]; then
                 printf 'generated-secrets: warning: this host'"'"'s .env predates %s. Services keep their v2.0.x fallback until you copy the updated shared .env from the canonical app/prepare host to this host.\n' \
                     "${transitional_missing//:/, }" >&2

@@ -109,13 +109,15 @@ Usage:
   scripts/nano bundle verify <nano-<version>-<edition>.tar> [--json]
   scripts/nano bundle load <nano-<version>-<edition>.tar>
   scripts/nano backup-keygen --output KEY.pem
-  scripts/nano backup --key-file KEY.pem [--output DIR] [--base FULL_BACKUP]
+  scripts/nano backup --key-file KEY.pem [--output DIR]
+                      [--include-clickhouse-data [--base FULL_BACKUP]]
                       [--keep N] [--clickhouse-disk DISK]
                       [--recovery-set-id ID --quiesce-epoch UTC]
                       [--snapshot-gate 0700_DIR]
                       [--component postgres|clickhouse] [--install-dir DIR]
   scripts/nano backup-set --inventory FILE --backup-key-file KEY.pem
                           [--backup-output DIR] [--clickhouse-disk DISK]
+                          [--include-clickhouse-data]
                           [--remote-install-dir DIR]
                       [--compose-override FILE]
   scripts/nano recovery-set-create --key-file KEY.pem --output DIR
@@ -128,6 +130,7 @@ Usage:
   scripts/nano upgrade [--bundle FILE | --version VERSION] [--dry-run]
                        [--backup-key-file KEY.pem] [--backup-output DIR]
                        [--install-dir DIR] [--skip-backup-I-understand] [--resume]
+                       [--include-clickhouse-data]
                        [--allow-siem-health-regression REASON]
   scripts/nano upgrade --abandon-incomplete RUN_ID --abandon-reason REASON
   scripts/nano rollback [--inventory FILE]
@@ -136,6 +139,11 @@ Usage:
 Local ClickHouse archives are inside the AES-256-GCM encrypted payload.
 External disks are accepted only when ClickHouse reports disk type `encrypted`;
 their encryption key must be protected independently from the backup store.
+By default a backup holds PostgreSQL, configuration and secrets, and no
+ClickHouse data: restore rebuilds the ClickHouse schema from the migrations,
+IOCs/lookups/enrichment re-sync from their sources and feeds, and event data
+is protected by ClickHouse replicas and object storage. --include-clickhouse-data
+(alias --include-events) also captures every ClickHouse table.
 Role-split backups require a common recovery-set ID/quiesce epoch and restore
 requires the signed recovery-set manifest created after all components finish.
 EOF
@@ -670,6 +678,80 @@ assert_ch_locator() {
     [[ "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.zip$ ]] || die "unsafe ClickHouse archive at SQL boundary"
 }
 
+# Restored from the v0.1.702 bridge (d0d1d30d5): the squash merge kept the
+# call in restore_command but dropped this definition (NAN-5202 found it).
+bootstrap_legacy_backup_disk() {
+    local disk="$1" clickhouse_dir config_dir config tmp type="" reloaded=0 attempt
+    [[ "$disk" == backups ]] || return 0
+    type="$(printf 'SELECT lower(type) FROM system.disks WHERE name={disk:String} FORMAT TSVRaw\n' \
+        | ch_query_params "--param_disk=$disk" 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ -z "$type" ]] || return 0
+    [[ "$TOPOLOGY_MODE" == single && "$CURRENT_VERSION" =~ ^0\.1\.(702|703)$ ]] \
+        || die "ClickHouse disk backups is missing and cannot be bootstrapped for this deployment"
+
+    clickhouse_dir="$INSTALL_DIR/clickhouse"
+    config_dir="$clickhouse_dir/config.d"
+    [[ -d "$clickhouse_dir" && ! -L "$clickhouse_dir" ]] \
+        || die "legacy ClickHouse config root is not a real directory"
+    config="$config_dir/backups.xml"
+    [[ -d "$config_dir" && ! -L "$config_dir" && -w "$config_dir" ]] \
+        || die "legacy ClickHouse config directory is not a writable real directory"
+    if [[ -e "$config" || -L "$config" ]]; then
+        [[ -f "$config" && ! -L "$config" ]] \
+            || die "legacy backup disk config is not a regular file: $config"
+    else
+        tmp="$(mktemp "$config_dir/.backups.xml.XXXXXX")" \
+            || die "cannot create legacy backup disk staging file"
+        cat > "$tmp" <<'XML'
+<?xml version="1.0"?>
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <backups>
+                <type>local</type>
+                <path>/var/lib/clickhouse/backups/</path>
+            </backups>
+        </disks>
+    </storage_configuration>
+    <backups>
+        <allowed_disk>backups</allowed_disk>
+        <allowed_path>/var/lib/clickhouse/backups/</allowed_path>
+        <allow_concurrent_backups>false</allow_concurrent_backups>
+        <allow_concurrent_restores>false</allow_concurrent_restores>
+    </backups>
+</clickhouse>
+XML
+        chmod 0644 "$tmp"
+        mv "$tmp" "$config"
+        warn "installed the local backup disk config required by legacy $CURRENT_VERSION"
+    fi
+
+    if printf 'SYSTEM RELOAD CONFIG\n' | ch_query >/dev/null 2>&1; then
+        for attempt in {1..20}; do
+            : "$attempt"
+            type="$(printf 'SELECT lower(type) FROM system.disks WHERE name={disk:String} FORMAT TSVRaw\n' \
+                | ch_query_params "--param_disk=$disk" 2>/dev/null | tr -d '[:space:]' || true)"
+            [[ -z "$type" ]] || { reloaded=1; break; }
+            sleep 1
+        done
+    fi
+    if (( ! reloaded )); then
+        warn "restarting legacy ClickHouse once to activate its local backup disk"
+        dc restart clickhouse >/dev/null || die "cannot restart legacy ClickHouse for backup disk activation"
+        for attempt in {1..90}; do
+            : "$attempt"
+            if printf 'SELECT 1\n' | ch_query >/dev/null 2>&1; then
+                type="$(printf 'SELECT lower(type) FROM system.disks WHERE name={disk:String} FORMAT TSVRaw\n' \
+                    | ch_query_params "--param_disk=$disk" 2>/dev/null | tr -d '[:space:]' || true)"
+                [[ -z "$type" ]] || break
+            fi
+            sleep 1
+        done
+    fi
+    [[ "$type" == local ]] \
+        || die "legacy ClickHouse did not activate the reserved local backup disk"
+}
+
 validate_clickhouse_disk() {
     local disk="$1" result type path extra
     [[ "$disk" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,63}$ ]] || die "invalid ClickHouse disk"
@@ -1063,14 +1145,14 @@ load_snapshot() {
     verify_signature "$snapshot/manifest.json" "$snapshot/manifest.sig" "$key" || return 1
     python3 -I "$MANIFEST_TOOL" parse-bundle "$snapshot/manifest.json" "$checksums" > "$fields_file" || return 1
     mapfile -d '' -t fields < "$fields_file"
-    [[ ${#fields[@]} -eq 31 ]] || return 1
+    [[ ${#fields[@]} -eq 32 ]] || return 1
     L_BACKUP_ID=${fields[0]}; L_VERSION=${fields[2]}; L_EDITION=${fields[3]}; L_SCHEMA=${fields[4]}
     L_MODE=${fields[5]}; L_DEPLOYMENT=${fields[6]}; L_IDENTITY=${fields[7]}; L_HOST=${fields[8]}
     L_SHARD=${fields[10]}; L_REPLICA=${fields[11]}; L_SHARD_COUNT=${fields[12]}; L_PG=${fields[13]}; L_PG_MIG=${fields[14]}
     L_PG_BYTES=${fields[15]}; L_CH=${fields[16]}; L_CH_MIG=${fields[17]}; L_CH_BYTES=${fields[18]}; L_DISK=${fields[19]}
     L_ARCHIVE=${fields[20]}; L_EXTERNAL=${fields[21]}; L_EXTERNAL_ENCRYPTED=${fields[22]}; L_SCOPE=${fields[23]}
     L_BASE_ID=${fields[24]}; L_BASE_SHA=${fields[25]}; L_SET_ID=${fields[26]}; L_QUIESCE_EPOCH=${fields[27]}
-    L_PAYLOAD_SHA=${fields[28]}; L_MANIFEST_SHA=${fields[30]}; L_CHECKSUMS=$checksums
+    L_PAYLOAD_SHA=${fields[28]}; L_MANIFEST_SHA=${fields[30]}; L_CH_DATA=${fields[31]}; L_CHECKSUMS=$checksums
     [[ "$(sha256_file "$snapshot/payload.cms")" == "$L_PAYLOAD_SHA" ]] || return 1
     printf '%s' "$label" >/dev/null
 }
@@ -1082,14 +1164,14 @@ save_primary_fields() {
     M_PG_BYTES=$L_PG_BYTES; M_CH=$L_CH; M_CH_MIG=$L_CH_MIG; M_CH_BYTES=$L_CH_BYTES; M_DISK=$L_DISK
     M_ARCHIVE=$L_ARCHIVE; M_EXTERNAL=$L_EXTERNAL; M_EXTERNAL_ENCRYPTED=$L_EXTERNAL_ENCRYPTED; M_SCOPE=$L_SCOPE
     M_BASE_ID=$L_BASE_ID; M_BASE_SHA=$L_BASE_SHA; M_SET_ID=$L_SET_ID; M_QUIESCE_EPOCH=$L_QUIESCE_EPOCH
-    M_PAYLOAD_SHA=$L_PAYLOAD_SHA; M_MANIFEST_SHA=$L_MANIFEST_SHA; M_CHECKSUMS=$L_CHECKSUMS
+    M_PAYLOAD_SHA=$L_PAYLOAD_SHA; M_MANIFEST_SHA=$L_MANIFEST_SHA; M_CHECKSUMS=$L_CHECKSUMS; M_CH_DATA=$L_CH_DATA
 }
 
 save_base_fields() {
     B_BACKUP_ID=$L_BACKUP_ID; B_EDITION=$L_EDITION; B_SCHEMA=$L_SCHEMA; B_MODE=$L_MODE
     B_DEPLOYMENT=$L_DEPLOYMENT; B_IDENTITY=$L_IDENTITY; B_DISK=$L_DISK; B_ARCHIVE=$L_ARCHIVE
     B_BASE_ID=$L_BASE_ID; B_PAYLOAD_SHA=$L_PAYLOAD_SHA
-    B_SET_ID=$L_SET_ID; B_QUIESCE_EPOCH=$L_QUIESCE_EPOCH; B_CHECKSUMS=$L_CHECKSUMS
+    B_SET_ID=$L_SET_ID; B_QUIESCE_EPOCH=$L_QUIESCE_EPOCH; B_CHECKSUMS=$L_CHECKSUMS; B_CH_DATA=$L_CH_DATA
 }
 
 decrypt_snapshot() {
@@ -1252,11 +1334,11 @@ SQL
 write_manifest() {
     python3 -I - "$1" "$2" "$3" "$4" "$CURRENT_VERSION" "$CURRENT_EDITION" "$CURRENT_SCHEMA_PROFILE" "$TOPOLOGY_MODE" \
         "$DEPLOYMENT_ID" "$DEPLOYMENT_IDENTITY" "$HOST_ID" "$ROLE_LIST" "$CURRENT_SHARD" "$CURRENT_REPLICA" "$SHARD_COUNT" \
-        "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" "${18}" "${19}" "${20}" "${21}" <<'PY'
+        "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" "${18}" "${19}" "${20}" "${21}" "${22}" <<'PY'
 import hashlib, json, pathlib, sys
 (out, payload_dir, payload_sha, bid, version, edition, schema, topology, deployment, identity, host, roles, shard, replica, shard_count,
  pg_in, pg_mig, pg_bytes, ch_in, ch_mig, ch_bytes, disk, archive, external, external_encrypted, scope, base_id, base_sha,
- created, fingerprint, set_id, quiesce_epoch) = sys.argv[1:]
+ created, fingerprint, set_id, quiesce_epoch, clickhouse_data) = sys.argv[1:]
 root = pathlib.Path(payload_dir)
 def digest_file(path):
     digest = hashlib.sha256()
@@ -1268,7 +1350,7 @@ checksums = {str(p.relative_to(root)): digest_file(p) for p in sorted(root.rglob
 recovery = {"id": set_id, "quiesce_epoch": quiesce_epoch} if topology == "role-split" else None
 document = {
  "format":"nano-backup-v2", "backup_id":bid, "created_at":created, "nano_version":version, "edition":edition,
- "schema_profile":schema, "recovery_set":recovery,
+ "schema_profile":schema, "recovery_set":recovery, "clickhouse_data":clickhouse_data,
  "topology":{"mode":topology,"deployment_id":deployment,"deployment_identity_sha256":identity or None,"host_id":host,
              "roles":[r for r in roles.split(',') if r],"clickhouse_shard":int(shard),"clickhouse_replica":int(replica),
              "clickhouse_shard_count":int(shard_count)},
@@ -1535,15 +1617,80 @@ prune_backups() {
     done < "$plan"
 }
 
+# NAN-5202: user-uploaded lookup-table rows (`| lookup`, `| inputlookup`) are
+# the one ClickHouse table a default backup keeps. Their definitions live in
+# PostgreSQL, the rows in nanosiem.lookup_rows (clickhouse/146); restoring the
+# definitions with no rows would silently break every detection that joins
+# them. The table is small and config-like. It is exported in ClickHouse Native
+# format inside the writer-quiesced snapshot window and re-imported after the
+# migrator rebuilds the schema on restore.
+LOOKUP_ROWS_TABLE=lookup_rows
+LOOKUP_ROWS_FILE=clickhouse-lookup-rows.native
+LOOKUP_ROWS_COUNT_FILE=clickhouse-lookup-rows.count
+LOOKUP_ROWS_LIVE_COUNT_SQL="SELECT count() FROM (SELECT argMax(deleted, version) AS d FROM nanosiem.lookup_rows GROUP BY lookup_table_name, row_id HAVING d = 0) FORMAT TSVRaw"
+
+# The export and import go through a server-side file() in ClickHouse's
+# user_files directory: the format is set by the server, so the client's
+# default output format (TSVRaw in ch_query) cannot rewrite the bytes.
+lookup_user_files_dir() {
+    local dir
+    dir="$(printf "SELECT value FROM system.server_settings WHERE name = 'user_files_path' FORMAT TSVRaw\n" \
+        | ch_query | tr -d '[:space:]')"
+    [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "cannot resolve the ClickHouse user_files path"
+    printf '%s' "${dir%/}"
+}
+
+export_lookup_rows() {
+    local payload="$1" name dir rows
+    name="nano-lookup-rows-$(openssl rand -hex 8).native"
+    dir="$(lookup_user_files_dir)"
+    rows="$(printf '%s\n' "$LOOKUP_ROWS_LIVE_COUNT_SQL" | ch_query | tr -d '[:space:]')"
+    [[ "$rows" =~ ^[0-9]+$ ]] || die "cannot count ClickHouse lookup rows"
+    printf "INSERT INTO FUNCTION file('%s', 'Native') SELECT * FROM nanosiem.%s\n" "$name" "$LOOKUP_ROWS_TABLE" \
+        | ch_query >/dev/null || die "cannot export ClickHouse lookup rows"
+    "$DOCKER_BIN" cp "$CH_CONTAINER:$dir/$name" "$payload/$LOOKUP_ROWS_FILE" >/dev/null \
+        || die "cannot copy the ClickHouse lookup-row export"
+    "$DOCKER_BIN" exec "$CH_CONTAINER" rm -f -- "$dir/$name" >/dev/null 2>&1 || true
+    chmod 600 "$payload/$LOOKUP_ROWS_FILE"
+    printf '%s\n' "$rows" > "$payload/$LOOKUP_ROWS_COUNT_FILE"
+    chmod 600 "$payload/$LOOKUP_ROWS_COUNT_FILE"
+    log "captured $rows lookup-table row(s) from ClickHouse"
+}
+
+import_lookup_rows() {
+    local payload="$1" name dir expected actual
+    [[ -f "$payload/$LOOKUP_ROWS_FILE" && -f "$payload/$LOOKUP_ROWS_COUNT_FILE" ]] \
+        || die "signed backup records lookup rows but its payload lacks them"
+    expected="$(tr -d '[:space:]' < "$payload/$LOOKUP_ROWS_COUNT_FILE")"
+    [[ "$expected" =~ ^[0-9]+$ ]] || die "signed lookup-row count is invalid"
+    prepare_ch
+    name="nano-lookup-rows-$(openssl rand -hex 8).native"
+    dir="$(lookup_user_files_dir)"
+    "$DOCKER_BIN" cp "$payload/$LOOKUP_ROWS_FILE" "$CH_CONTAINER:$dir/$name" >/dev/null \
+        || post_cutover_fail "cannot stage lookup rows in ClickHouse"
+    "$DOCKER_BIN" exec "$CH_CONTAINER" chown clickhouse:clickhouse "$dir/$name" >/dev/null 2>&1 || true
+    # The restored PostgreSQL lookup registry is authoritative: replace the
+    # target's rows with exactly the backed-up ones.
+    printf "TRUNCATE TABLE nanosiem.%s;\nINSERT INTO nanosiem.%s SELECT * FROM file('%s', 'Native');\n" \
+        "$LOOKUP_ROWS_TABLE" "$LOOKUP_ROWS_TABLE" "$name" | ch_query >/dev/null \
+        || post_cutover_fail "ClickHouse lookup-row import failed"
+    "$DOCKER_BIN" exec "$CH_CONTAINER" rm -f -- "$dir/$name" >/dev/null 2>&1 || true
+    actual="$(printf '%s\n' "$LOOKUP_ROWS_LIVE_COUNT_SQL" | ch_query | tr -d '[:space:]')"
+    [[ "$actual" == "$expected" ]] \
+        || post_cutover_fail "restored lookup rows ($actual) do not match the signed backup ($expected)"
+    log "restored $actual lookup-table row(s) into ClickHouse"
+}
+
 backup_command() {
     local key_file="" output="" base_bundle="" keep=0 ch_disk="" on_cluster=0 set_id="" quiesce_epoch="" snapshot_gate="" component=auto
     local backup_id created payload pg_in=false pg_mig=0 pg_bytes=0 ch_in=false ch_mig=0 ch_bytes=0 archive=""
     local external=false external_encrypted=false scope=host base_id="" base_sha="" result fingerprint base_snapshot="" base_payload=""
     local manifest_disk="" backup_started_ms writer_down_started_ms writer_down_ms=0 total_ms
     local ch_backup_id="" ch_backup_status="" cluster_clause="" cluster="" query=""
-    local params=()
+    local params=() include_ch_data=0 ch_data=excluded
     while [[ $# -gt 0 ]]; do case "$1" in
         --key-file) key_file="$2"; shift 2 ;; --output) output="$2"; shift 2 ;; --base) base_bundle="$2"; shift 2 ;;
+        --include-clickhouse-data|--include-events) include_ch_data=1; shift ;;
         --keep) keep="$2"; shift 2 ;; --clickhouse-disk) ch_disk="$2"; shift 2 ;; --on-cluster) on_cluster=1; shift ;;
         --recovery-set-id) set_id="$2"; shift 2 ;; --quiesce-epoch) quiesce_epoch="$2"; shift 2 ;;
         --snapshot-gate) snapshot_gate="$2"; shift 2 ;;
@@ -1555,6 +1702,22 @@ backup_command() {
     [[ "$keep" =~ ^[0-9]+$ ]] || die "--keep must be a non-negative integer"
     [[ "$component" =~ ^(auto|postgres|clickhouse)$ ]] || die "--component must be postgres or clickhouse"
     init_context; validate_key_file "$key_file"
+    # A legacy-layout transition backup also captures a physical snapshot of
+    # every data volume, so its ClickHouse data is in the bundle regardless.
+    ((!LEGACY_LAYOUT)) || include_ch_data=1
+    ((include_ch_data)) && ch_data=included
+    # The default scope keeps lookup rows when this host reaches ClickHouse
+    # (single node, or a role host that owns both PostgreSQL and ClickHouse).
+    local capture_lookups=0
+    [[ -z "$base_bundle" ]] || ((include_ch_data)) \
+        || die "--base builds a ClickHouse incremental; it requires --include-clickhouse-data"
+    [[ "$component" != clickhouse ]] || ((include_ch_data)) \
+        || die "--component clickhouse requires --include-clickhouse-data"
+    if ((include_ch_data)); then
+        log "backup scope: PostgreSQL, configuration and ClickHouse data"
+    else
+        log "backup scope: PostgreSQL, configuration and ClickHouse lookup tables; other ClickHouse data not included (schema rebuilds from migrations)"
+    fi
     if [[ -z "$ch_disk" ]]; then
         if ((LEGACY_LAYOUT)); then ch_disk=default; else ch_disk=backups; fi
     fi
@@ -1617,19 +1780,25 @@ PY
     if [[ "$component" == postgres || "$component" == auto ]] && has_role postgres; then
         prepare_pg; pg_in=true
     fi
-    if [[ "$component" == clickhouse || "$component" == auto ]] && has_role clickhouse; then
+    if ((include_ch_data)) && [[ "$component" == clickhouse || "$component" == auto ]] && has_role clickhouse; then
         prepare_ch; ch_in=true; validate_clickhouse_disk "$ch_disk"
     fi
     [[ "$component" != postgres || "$pg_in" == true ]] \
         || die "PostgreSQL backup component requested on a host without the postgres role"
     [[ "$component" != clickhouse || "$ch_in" == true ]] \
         || die "ClickHouse backup component requested on a host without the clickhouse role"
+    [[ "$pg_in" == true || "$ch_in" == true ]] \
+        || die "nothing to back up on this host: ClickHouse data is excluded by default; pass --include-clickhouse-data"
+    if ((!include_ch_data)) && [[ "$pg_in" == true ]] && has_role clickhouse; then
+        prepare_ch; capture_lookups=1; ch_data=lookups
+    fi
     [[ "$ch_in" != true ]] || install_legacy_clickhouse_backup_config
     if [[ -n "$base_bundle" ]]; then
         base_snapshot="$(snapshot_bundle "$base_bundle" base)" || die "base backup is incomplete"
         load_snapshot "$base_snapshot" "$key_file" base || die "base backup signature/schema/digest verification failed"
         save_base_fields
         [[ -z "$B_BASE_ID" ]] || die "incremental-on-incremental is unsupported; provide a full base"
+        [[ "$B_CH_DATA" == included ]] || die "base backup has no ClickHouse data; take the base with --include-clickhouse-data"
         [[ "$B_EDITION" == "$CURRENT_EDITION" && "$B_SCHEMA" == "$CURRENT_SCHEMA_PROFILE" && "$B_MODE" == "$TOPOLOGY_MODE" ]] || die "base backup is incompatible"
         [[ "$B_DEPLOYMENT" == "$DEPLOYMENT_ID" && "$B_IDENTITY" == "$DEPLOYMENT_IDENTITY" && "$B_DISK" == "$ch_disk" ]] || die "base deployment or disk mismatch"
         if [[ "$TOPOLOGY_MODE" == role-split ]]; then
@@ -1676,6 +1845,9 @@ PY
         pg_mig="$PG_BACKUP_MIGRATION"
         pg_bytes="$PG_BACKUP_BYTES"
     fi
+    # Same writer-quiesced window as the PostgreSQL snapshot, so the lookup
+    # rows match the restored lookup registry.
+    ((!capture_lookups)) || export_lookup_rows "$payload"
     if [[ "$ch_in" == true ]]; then
         ch_bytes="$(printf "SELECT coalesce(sum(bytes_on_disk),0) FROM system.parts WHERE active AND database='nanosiem' FORMAT TSVRaw\n" | ch_query | tr -d '[:space:]')"
         [[ "$ch_bytes" =~ ^[0-9]+$ ]] || die "cannot read ClickHouse backup metadata"
@@ -1728,11 +1900,11 @@ PY
     fingerprint="$(openssl x509 -in "$key_file" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':')"
     write_manifest "$BUNDLE_TMP/manifest.json" "$payload" "$(sha256_file "$BUNDLE_TMP/payload.cms")" "$backup_id" \
         "$pg_in" "$pg_mig" "$pg_bytes" "$ch_in" "$ch_mig" "$ch_bytes" "$manifest_disk" "$archive" "$external" \
-        "$external_encrypted" "$scope" "$base_id" "$base_sha" "$created" "$fingerprint" "$set_id" "$quiesce_epoch"
+        "$external_encrypted" "$scope" "$base_id" "$base_sha" "$created" "$fingerprint" "$set_id" "$quiesce_epoch" "$ch_data"
     openssl dgst -sha256 -sign "$key_file" -out "$BUNDLE_TMP/manifest.sig" "$BUNDLE_TMP/manifest.json"
     chmod 600 "$BUNDLE_TMP/manifest.sig"; chmod 700 "$BUNDLE_TMP"
     mv "$BUNDLE_TMP" "$output"; BUNDLE_TMP=""
-    ok "backup complete: $output"
+    ok "backup complete: $output (ClickHouse data: $ch_data)"
     prune_backups "$(cd "$(dirname "$output")" && pwd -P)" "$keep" "$key_file"
     total_ms=$(( $(monotonic_ms) - backup_started_ms ))
     ok "backup timing: writers_down_ms=$writer_down_ms total_ms=$total_ms"
@@ -1745,7 +1917,7 @@ recovery_set_create_command() {
         --key-file) key="$2"; shift 2 ;; --output) output="$2"; shift 2 ;; --bundle) bundles+=("$2"); shift 2 ;;
         --max-skew) max_skew="$2"; shift 2 ;; *) usage ;;
     esac; done
-    [[ -n "$key" && -n "$output" && ${#bundles[@]} -ge 2 ]] || usage
+    [[ -n "$key" && -n "$output" && ${#bundles[@]} -ge 1 ]] || usage
     [[ "$max_skew" =~ ^[0-9]+$ ]] || die "--max-skew must be a non-negative integer"
     require_cmd python3 "install Python 3"; require_cmd openssl "install OpenSSL"; validate_key_file "$key"
     [[ -f "$MANIFEST_TOOL" ]] || die "manifest helper is missing: $MANIFEST_TOOL"
@@ -2372,6 +2544,47 @@ PY
     ok "legacy layout and quiesced data restored; newer data remains in journaled quarantine directories"
 }
 
+# NAN-5202: a default backup carries no ClickHouse data. The restored
+# PostgreSQL state runs against whatever ClickHouse this host has, so make sure
+# the full schema exists (a wiped volume gets every table, empty) by running
+# the same idempotent migrator the stack runs at start-up.
+rebuild_clickhouse_schema() {
+    local services
+    has_role clickhouse || return 0
+    # Every profile: an install may place the migrator behind one (an
+    # explicitly named service still runs without enabling its profile).
+    services="$(dc --profile '*' config --services 2>/dev/null)" || services=""
+    if [[ $'\n'"$services"$'\n' != *$'\n'"clickhouse-migrate"$'\n'* ]]; then
+        warn "no clickhouse-migrate service; the ClickHouse schema is rebuilt when the stack starts"
+        return 0
+    fi
+    log "rebuilding the ClickHouse schema from migrations (ClickHouse data not included in this backup)"
+    dc up -d clickhouse >/dev/null || post_cutover_fail "cannot start ClickHouse to rebuild its schema"
+    dc run --rm clickhouse-migrate >/dev/null \
+        || post_cutover_fail "ClickHouse migrations failed after restore"
+}
+
+# PostgreSQL and .env are already cut over when the ClickHouse schema rebuild
+# or the lookup-row import runs. A failure there must not leave the stack
+# stopped with no way forward: restart the writers (their Compose dependency
+# on clickhouse-migrate retries the migrator) and print the exact commands.
+post_cutover_fail() {
+    local reason="$1" compose
+    compose="$(compose_command_text)"
+    warn "$reason; PostgreSQL and .env were already restored"
+    if [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then
+        dc up -d "${STOPPED_SERVICES[@]}" >/dev/null 2>&1 \
+            || warn "could not restart: ${STOPPED_SERVICES[*]}"
+        STOPPED_SERVICES=()
+    fi
+    MUTATION_STARTED=0
+    rm -f -- "$RECOVERY_MARKER"
+    printf 'Recover with:\n  %s run --rm clickhouse-migrate\n  %s up -d\n' "$compose" "$compose" >&2
+    [[ "$M_CH_DATA" != lookups ]] \
+        || printf 'then re-run this restore to load the lookup-table rows.\n' >&2
+    die "restore incomplete: $reason"
+}
+
 start_mutation() {
     MUTATION_STARTED=1
     write_recovery_marker
@@ -2403,6 +2616,15 @@ restore_command() {
     primary_snapshot="$(snapshot_bundle "$bundle" primary)" || die "backup bundle is incomplete"
     load_snapshot "$primary_snapshot" "$key" primary || die "backup signature/schema/payload digest verification failed"
     save_primary_fields; ensure_target_compatible "$restore_layout"
+    if [[ "$M_CH_DATA" == included ]]; then
+        log "backup scope: PostgreSQL, configuration and ClickHouse data"
+    elif [[ "$M_CH_DATA" == lookups ]]; then
+        warn "ClickHouse data: lookup tables only. Event history, signals, IOCs, enrichment and prevalence are not in this backup"
+        warn "existing ClickHouse event data on this target is left untouched; the schema is rebuilt from migrations and the lookup rows are restored"
+    else
+        warn "ClickHouse data not included in this backup: event history, IOCs, lookups, enrichment/prevalence and other ClickHouse tables are not restored"
+        warn "existing ClickHouse data on this target is left untouched; the ClickHouse schema is rebuilt from migrations and IOC/lookup/enrichment data re-syncs from its sources"
+    fi
     if [[ -n "$M_BASE_ID" ]]; then
         [[ -n "$base" ]] || die "incremental requires --base before any target write"
         base_snapshot="$(snapshot_bundle "$base" base)" || die "base bundle is incomplete"
@@ -2526,7 +2748,10 @@ PY
         start_ch_refreshable_views
     fi
     local recreate_ch=0
-    if [[ "$M_CH" == true ]] && ! clickhouse_passwords_match "$INSTALL_DIR/.env" "$restored"; then recreate_ch=1; fi
+    # A ClickHouse host takes the restored ClickHouse credentials even when
+    # the bundle carries no ClickHouse data (NAN-5202).
+    if { [[ "$M_CH" == true ]] || has_role clickhouse; } \
+        && ! clickhouse_passwords_match "$INSTALL_DIR/.env" "$restored"; then recreate_ch=1; fi
     if [[ "$M_PG" == true ]]; then
         rotate_postgres_password "$restored" "$PG_STAGE_DB"
         pg_cutover
@@ -2542,6 +2767,10 @@ PY
         wait_pg_admin
         pg_unfence_target
     fi
+    [[ "$M_CH_DATA" == included ]] || rebuild_clickhouse_schema
+    if [[ "$M_CH_DATA" == lookups ]] && has_role clickhouse; then
+        import_lookup_rows "$payload"
+    fi
     if [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then
         dc up -d "${STOPPED_SERVICES[@]}" >/dev/null
     fi
@@ -2549,6 +2778,11 @@ PY
     STOPPED_SERVICES=(); MUTATION_STARTED=0
     [[ ! -f "$RECOVERY_MARKER" ]] || rm -f -- "$RECOVERY_MARKER"
     ok "restore complete from immutable snapshot of $bundle"
+    case "$M_CH_DATA" in
+        included) : ;;
+        lookups) warn "ClickHouse data: lookup tables only were restored; event history was not in this backup" ;;
+        *) warn "ClickHouse data not included: event history was not restored from this backup" ;;
+    esac
 }
 
 case "$COMMAND" in

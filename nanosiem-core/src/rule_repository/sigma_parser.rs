@@ -170,7 +170,7 @@ impl StringOrList {
 
 /// Parse a Sigma rule from YAML
 pub fn parse_sigma(yaml: &str) -> Result<SigmaRule, SigmaParseError> {
-    let raw: RawSigmaRule = serde_yaml::from_str(yaml)?;
+    let raw: RawSigmaRule = crate::yaml_budget::from_str(yaml)?;
 
     // Parse selections from the detection block
     let mut selections = HashMap::new();

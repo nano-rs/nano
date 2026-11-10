@@ -1,7 +1,7 @@
 {
   "name": "vite-react-typescript-starter",
   "private": true,
-  "version": "2.0.4",
+  "version": "2.0.5",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -37,6 +37,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
     "test:deadlinks": "node tests/e2e/check-dead-links.mjs",
     "test:e2e:404": "node tests/e2e/crawl-404.mjs",
+    "e2e:security-update": "bash tests/e2e/ui/playbooks/run-security-update.sh",
     "test:csv-safe": "node --test src/lib/csv-safe.test.ts",
     "test:session-auth": "node --test src/lib/session-credentials.test.ts src/lib/authenticated-fetch.test.ts src/lib/refresh-takeover.test.ts src/lib/raw-fetch-credentials.test.ts && tsx --test src/lib/api/search-refresh.test.ts",
     "test:theme-parity": "node --test src/lib/theme-parity.test.ts",

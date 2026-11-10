@@ -10,7 +10,7 @@ use clickhouse::Client as ClickHouseClient;
 use std::collections::HashMap;
 
 use super::repository::{LogTelemetryRepository, RepoError};
-use super::types::{BucketSize, HourlyPoint, SourceTypeStats};
+use super::types::{BucketSize, DailyIngestTotal, HourlyPoint, SourceTypeStats};
 use crate::db::TableNames;
 
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +43,22 @@ impl LogTelemetryService {
             .repo
             .stats_by_source_type(source_types, window_hours, deny_set)
             .await?)
+    }
+
+    /// NAN-5170: per-UTC-day (arrival) customer ingest totals over `[from, to]`.
+    pub async fn daily_ingest_totals(
+        &self,
+        from: chrono::NaiveDate,
+        to: chrono::NaiveDate,
+    ) -> Result<Vec<DailyIngestTotal>, LogTelemetryError> {
+        Ok(self.repo.daily_ingest_totals(from, to).await?)
+    }
+
+    /// NAN-5170: first hour arrival metering observed anything.
+    pub async fn ingest_meter_start(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, LogTelemetryError> {
+        Ok(self.repo.ingest_meter_start().await?)
     }
 
     pub async fn stats_all(

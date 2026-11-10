@@ -485,6 +485,15 @@ pub async fn verify_mfa_challenge(
     let user_agent = extract_user_agent(&headers);
     let client_ctx = ClientContext::new(ip_address.clone(), user_agent.clone());
 
+    // Resolve the actor BEFORE completing: a wrong code that exhausts the
+    // per-account budget revokes the challenge, after which it no longer
+    // validates. This only feeds the audit actor; the service re-validates.
+    let challenge_actor = state
+        .token_service
+        .validate_mfa_challenge_token(&request.challenge_token)
+        .ok()
+        .map(|c| c.sub);
+
     let outcome = match state
         .auth_service
         .complete_mfa_login(
@@ -505,14 +514,10 @@ pub async fn verify_mfa_challenge(
             // that occurs AFTER a correct code during login completion — is NOT
             // an MFA verification failure and must not be mis-audited as one, so
             // it is left unaudited on this path.
-            if matches!(e, AuthError::InvalidCredentials) {
-                // The challenge token validated (we got past its check), so the
-                // actor resolves from it.
-                let actor_id = state
-                    .token_service
-                    .validate_mfa_challenge_token(&request.challenge_token)
-                    .ok()
-                    .map(|c| c.sub);
+            // NAN-5150: a wrong code that crossed a throttle threshold is
+            // still a failed challenge; the crossing is audited once.
+            if matches!(e, AuthError::InvalidCredentials | AuthError::LoginThrottled { .. }) {
+                let actor_id = challenge_actor;
                 state.emit_audit(
                     AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_CHALLENGE_FAILED)
                         .actor(actor_id, None)
@@ -522,6 +527,33 @@ pub async fn verify_mfa_challenge(
                         .details(serde_json::json!({ "reason": "invalid_mfa_code" }))
                         .build(),
                 );
+                if let AuthError::LoginThrottled {
+                    ip_locked,
+                    account_alert,
+                } = e
+                {
+                    let crossings = [
+                        (ip_locked, audit_actions::USER_LOCKED, "failed_mfa_threshold_exceeded"),
+                        (
+                            account_alert,
+                            audit_actions::LOGIN_ACCOUNT_THROTTLED,
+                            "account_failure_alert_threshold",
+                        ),
+                    ];
+                    for (crossed, action, reason) in crossings {
+                        if crossed {
+                            state.emit_audit_durable(
+                                AuditEvent::builder(AuditSource::Auth, action)
+                                    .actor(actor_id, None)
+                                    .resource("user", actor_id, None)
+                                    .client_context(&client_ctx)
+                                    .success(false)
+                                    .details(serde_json::json!({ "reason": reason }))
+                                    .build(),
+                            ).await;
+                        }
+                    }
+                }
             }
             return Err((
                 StatusCode::UNAUTHORIZED,

@@ -191,9 +191,18 @@ pub fn parse_clickhouse_error(error_msg: &str) -> SearchError {
     // Pattern: Syntax error
     if error_msg.contains("Syntax error") || error_msg.contains("SYNTAX_ERROR") {
         // Try to extract position info
-        let message = if let Some(pos) = error_msg.find("at position") {
-            let snippet = &error_msg[pos..].chars().take(50).collect::<String>();
-            format!("Query syntax error {}. Check for missing commas, parentheses, or invalid keywords.", snippet)
+        // NAN-5161: keep only "at position N". ClickHouse follows it with a
+        // quoted excerpt of the executed statement, which for a source-scoped
+        // caller carries the injected deny-list literals.
+        let position = error_msg.find("at position ").and_then(|pos| {
+            let digits: String = error_msg[pos + "at position ".len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            (!digits.is_empty()).then_some(digits)
+        });
+        let message = if let Some(position) = position {
+            format!("Query syntax error at position {position}. Check for missing commas, parentheses, or invalid keywords.")
         } else {
             "Query syntax error. Check for missing commas, parentheses, or invalid keywords."
                 .to_string()
@@ -263,6 +272,52 @@ pub fn parse_clickhouse_error(error_msg: &str) -> SearchError {
     // Default: return as DatabaseError but with cleaned up message
     let cleaned_msg = clean_clickhouse_error(error_msg);
     SearchError::DatabaseError(sqlx::Error::Protocol(cleaned_msg))
+}
+
+/// The message safe to show the caller for a search failure (NAN-5161).
+///
+/// Mirrors the HTTP batch mapping (`nanosiem-search` `From<SearchError>`):
+/// user-actionable errors (parse, unknown field, the friendly rewrites
+/// [`parse_clickhouse_error`] produces, generation guardrails) keep their
+/// message; database and internal failures are masked, because raw
+/// ClickHouse text can echo the executed statement, including a scoped
+/// caller's source deny-list. Streamed `Error` events and async job failures
+/// use this so they never carry more than the batch path returns. Callers
+/// log the full error server-side.
+pub fn client_error_message(error: &SearchError) -> String {
+    match error {
+        SearchError::FieldNotFound {
+            message,
+            suggestions,
+            ..
+        } => {
+            if suggestions.is_empty() {
+                message.clone()
+            } else {
+                format!("{message}. Did you mean: {}", suggestions.join(", "))
+            }
+        }
+        SearchError::SqlGenError(msg) => {
+            if msg.starts_with("Invalid query:") || msg.starts_with("Unsupported operation:") {
+                msg.clone()
+            } else {
+                "Query processing failed".to_string()
+            }
+        }
+        SearchError::ParseError(_)
+        | SearchError::StructuredParseError { .. }
+        | SearchError::InvalidTimeRange
+        | SearchError::SqlValidationError(_)
+        | SearchError::Timeout(_)
+        | SearchError::ResponseTooLarge(..)
+        | SearchError::AdmissionDenied(_)
+        | SearchError::Cancelled
+        | SearchError::JobResultsUnavailable(_)
+        | SearchError::ViewTooLarge { .. }
+        | SearchError::ViewMemoryBusy { .. } => error.to_string(),
+        SearchError::DatabaseError(_) => "A database error occurred".to_string(),
+        SearchError::PrevalenceError(_) => "An internal error occurred".to_string(),
+    }
 }
 
 /// Extract the elapsed milliseconds from a ClickHouse timeout message so the

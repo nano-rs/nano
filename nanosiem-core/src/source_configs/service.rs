@@ -189,6 +189,11 @@ pub enum SourceConfigServiceError {
     CredentialError(String),
     #[error("Missing permission: credentials:use")]
     CredentialUseRequired,
+    /// NAN-5147: the request binds a stored credential (create, or a
+    /// different credential on update) or moves a bound credential to a
+    /// different connection host, which requires credential-owner permission.
+    #[error("Missing permission: credentials:edit")]
+    CredentialRetargetRequired,
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
     #[error("Credentials backend error: {0}")]
@@ -384,6 +389,11 @@ impl SourceConfigService {
         // Authorization precedes validation and credential metadata lookup so
         // an under-scoped caller cannot probe whether a credential ID exists.
         Self::ensure_credential_use(request.credential_id, credential_use)?;
+        // NAN-5147: binding a stored credential decides where it is sent;
+        // that is credential-owner level, not just credentials:use.
+        if request.credential_id.is_some() {
+            Self::ensure_credential_retarget(credential_use)?;
+        }
 
         // NAN-2067: a client that copied a redacted read (or a UI that echoes
         // the mask on a "save as new") would otherwise persist the literal
@@ -425,6 +435,14 @@ impl SourceConfigService {
         // NAN-1919: a caller-supplied default_source_type is interpolated into
         // the generated routing VRL — validate it before persistence.
         Self::validate_default_source_type(request.default_source_type.as_deref())?;
+
+        // NAN-5152: inline initial routing rules get the same write-time
+        // validation as rules added one at a time, before anything is stored.
+        if let Some(rules) = request.routing_rules.as_mut() {
+            for rule in rules.iter_mut() {
+                Self::validate_new_routing_rule(&request.config_type, rule)?;
+            }
+        }
 
         // NAN-883: single-instance drivers (currently `splunk_hec`) share an
         // OOTB Vector listener; a second config would emit a colliding
@@ -602,6 +620,37 @@ impl SourceConfigService {
             Self::validate_connection_config(&effective_type, &merged)?;
 
             request.connection_config = Some(merged);
+        }
+
+        // NAN-5147: a bound stored credential is presented to whatever host the
+        // config points at. Binding a different credential, or moving a bound
+        // one to a different broker/endpoint, needs credential-owner
+        // permission, not just credentials:use.
+        if request
+            .credential_id
+            .is_some_and(|c| existing.credential_id != Some(c))
+        {
+            Self::ensure_credential_retarget(credential_use)?;
+        }
+        if request.credential_id.or(existing.credential_id).is_some()
+            && (request.connection_config.is_some() || request.config_type.is_some())
+        {
+            let effective_type = request
+                .config_type
+                .as_deref()
+                .unwrap_or(&existing.config_type);
+            let effective_conn = request
+                .connection_config
+                .as_ref()
+                .unwrap_or(&existing.connection_config);
+            if moves_credential_destination(
+                &existing.config_type,
+                &existing.connection_config,
+                effective_type,
+                effective_conn,
+            ) {
+                Self::ensure_credential_retarget(credential_use)?;
+            }
         }
 
         // NAN-1919: a patched default_source_type is interpolated into the
@@ -1015,21 +1064,43 @@ impl SourceConfigService {
         source_configuration_id: Uuid,
         mut request: NewRoutingRule,
     ) -> Result<RoutingRule, SourceConfigServiceError> {
-        // Validate match type
-        if super::types::MatchType::from_str(&request.match_type).is_none() {
+        // Reject an unknown match type before the parent lookup.
+        Self::validate_match_type(&request.match_type)?;
+        let parent = self.repository.get(source_configuration_id).await?;
+        Self::validate_new_routing_rule(&parent.config_type, &mut request)?;
+
+        Ok(self
+            .repository
+            .create_rule(source_configuration_id, request)
+            .await?)
+    }
+
+    fn validate_match_type(match_type: &str) -> Result<(), SourceConfigServiceError> {
+        if super::types::MatchType::from_str(match_type).is_none() {
             return Err(SourceConfigServiceError::InvalidConfig(format!(
                 "Invalid match type: {}",
-                request.match_type
+                match_type
             )));
         }
+        Ok(())
+    }
+
+    /// Write-time validation for a new routing rule under a parent of
+    /// `config_type`. Shared by [`Self::create_rule`] and the inline initial
+    /// rules on [`Self::create`] (NAN-5152), since the router renderer
+    /// interpolates the validated field path into generated VRL.
+    pub(crate) fn validate_new_routing_rule(
+        config_type: &str,
+        request: &mut NewRoutingRule,
+    ) -> Result<(), SourceConfigServiceError> {
+        Self::validate_match_type(&request.match_type)?;
 
         // Coerce + validate match_field/match_type for the parent's
         // config_type. Pull sources collapse non-default source_type rules to
         // default; everything non-default then has its match_field run through
         // the safe-VRL-path validator.
-        let parent = self.repository.get(source_configuration_id).await?;
         Self::coerce_and_validate_match(
-            &parent.config_type,
+            config_type,
             &request.match_field,
             &mut request.match_type,
         )?;
@@ -1047,12 +1118,7 @@ impl SourceConfigService {
             &request.match_type,
             request.match_value.as_deref(),
             &request.target_source_type,
-        )?;
-
-        Ok(self
-            .repository
-            .create_rule(source_configuration_id, request)
-            .await?)
+        )
     }
 
     /// Update a routing rule
@@ -1996,6 +2062,13 @@ impl SourceConfigService {
         let now = normalize_for_secret_compare(&redact_config_snapshot(&rendered), Some(new));
         let then = normalize_for_secret_compare(&snapshot, previous);
         Ok(if now == then { SecretOnly::Yes } else { SecretOnly::PendingEdits })
+    }
+
+    /// NAN-5147: require credential-owner permission (`credentials:edit`).
+    fn ensure_credential_retarget(grant: CredentialUseGrant) -> Result<(), SourceConfigServiceError> {
+        grant
+            .ensure_retarget()
+            .map_err(|_| SourceConfigServiceError::CredentialRetargetRequired)
     }
 
     /// Require explicit credential-use authorization only when a source
@@ -3304,3 +3377,97 @@ mod tests;
 #[cfg(test)]
 #[path = "service/pull_start_tests.rs"]
 mod pull_start_tests;
+
+#[cfg(test)]
+#[path = "service/create_routing_validation_tests.rs"]
+mod create_routing_validation_tests;
+
+#[cfg(test)]
+#[path = "service/credential_retarget_tests.rs"]
+mod credential_retarget_tests;
+
+/// NAN-5147: the hosts a stored credential is presented to, per driver, as
+/// `(field, normalized value)`. Kafka: the broker list (order-, case- and
+/// whitespace-insensitive). AWS S3/SQS: the custom endpoint and queue URL
+/// origins (scheme, host, port). GCP Pub/Sub: a custom endpoint. Azure Event
+/// Hubs: the namespace and checkpoint storage account. System-level drivers
+/// (`http`, `vector`, `splunk_hec`, `otlp`) dial nothing. `None` for a driver
+/// not listed here, which callers treat as a move (fail closed).
+fn connection_destination(
+    config_type: &str,
+    conn: &serde_json::Value,
+) -> Option<Vec<(&'static str, String)>> {
+    fn origin(raw: &str) -> String {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return String::new();
+        }
+        match url::Url::parse(raw) {
+            Ok(u) => format!(
+                "{}://{}:{}",
+                u.scheme(),
+                u.host_str().unwrap_or_default().to_ascii_lowercase(),
+                u.port_or_known_default().map(|p| p.to_string()).unwrap_or_default()
+            ),
+            Err(_) => raw.to_ascii_lowercase(),
+        }
+    }
+    let field = |key: &str| conn.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    let lower = |key: &str| field(key).trim().trim_end_matches('.').to_ascii_lowercase();
+    use super::types::SourceConfigType as T;
+    // Exhaustive over the enum so a new driver must decide its host fields.
+    Some(match T::from_str(config_type)? {
+        T::Kafka => {
+            let mut servers: Vec<String> = field("bootstrap_servers")
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            servers.sort();
+            servers.dedup();
+            vec![("bootstrap_servers", servers.join(","))]
+        }
+        T::AwsS3 => vec![
+            ("endpoint", origin(field("endpoint"))),
+            ("sqs_queue_url", origin(field("sqs_queue_url"))),
+        ],
+        T::AwsSqs => vec![
+            ("endpoint", origin(field("endpoint"))),
+            ("queue_url", origin(field("queue_url"))),
+        ],
+        T::GcpPubSub => vec![("endpoint", origin(field("endpoint")))],
+        T::AzureEventHubs => vec![
+            (
+                "namespace",
+                azure_event_hubs::azure_namespace_host(field("namespace"))
+                    .unwrap_or_else(|| lower("namespace")),
+            ),
+            ("checkpoint_account", lower("checkpoint_account")),
+        ],
+        T::Http | T::Vector | T::SplunkHec | T::Otlp => Vec::new(),
+    })
+}
+
+/// NAN-5147: whether an update sends a bound credential somewhere new: a
+/// driver change, an unknown driver, or any changed host field (including
+/// first setting one that was empty).
+fn moves_credential_destination(
+    old_type: &str,
+    old_conn: &serde_json::Value,
+    new_type: &str,
+    new_conn: &serde_json::Value,
+) -> bool {
+    let canonical = |t: &str| {
+        super::types::SourceConfigType::from_str(t).map_or_else(|| t.to_string(), |c| c.as_str().to_string())
+    };
+    if canonical(old_type) != canonical(new_type) {
+        return true;
+    }
+    match (
+        connection_destination(old_type, old_conn),
+        connection_destination(new_type, new_conn),
+    ) {
+        (Some(old), Some(new)) => old != new,
+        _ => true,
+    }
+}

@@ -66,3 +66,118 @@ is **DOM/marker-based** — `response.status()` is 200 even for a dead SPA route
 > Known tuning item: against `vite dev`, on-demand lazy-chunk compilation can make
 > later navigations slow (20s timeouts). Prefer running it against `vite preview`
 > (a production build) or bump `NAV_TIMEOUT_MS`.
+
+## `ui/playbooks/security-update.mjs` — full UI walk across roles (NAN-5085)
+
+A re-runnable playbook that checks the web UI still works as designed after a
+batch of security fixes (built for a `security/<version>` integration
+branch, usable for any branch). It brings up a **throwaway** e2e stack from a
+checkout (`scripts/e2e.sh up`, compose project `nanoe2e-<id>`, its own free
+127.0.0.1 ports, never the `nanoch-*` dev stack), publishes that checkout's
+web build into the stack's nginx edge (the shipped `nginx.opensource.conf`),
+seeds data, runs the playbook, writes the report and tears the stack down.
+
+**One command** (from the repo root; `--checkout` is the tree under test, both
+its backend and its web UI):
+
+```bash
+git worktree add --detach ../sec-ui origin/security/<version>
+nanosiem-web/tests/e2e/ui/playbooks/run-security-update.sh --checkout ../sec-ui --compare <baseline-out>/report.json
+# via npm (runs from nanosiem-web/, so give absolute paths):
+npm --prefix nanosiem-web run e2e:security-update -- --checkout "$PWD/../sec-ui"
+```
+
+Run it once on the **baseline** and once on the branch. Pass the baseline's
+`report.json` to `--compare`. `diff-reports.mjs` then lists:
+
+- **regressions**: pass on the baseline, fail on the branch
+- denied-source leaks that only the branch has
+- new heuristic warnings, such as dead buttons
+- pre-existing failures (fail on both) and fixes
+
+Use the branch's fork point as the baseline (`git merge-base origin/main
+<branch>`), not the moving `origin/main`. Commits that land on main after the
+cut change behaviour on their own. For example, the v2 entitlements change on
+main (#8862) locks cases, notebooks and AI on an unlicensed e2e stack. The fork
+point compares like with like.
+
+On a shared machine, wrap the runner in the codex Docker gate
+(`CODEX/docker-slot.sh <lane> -- …`). It refuses to start with less than
+100 GiB free and tears its stack down on exit unless you pass `--keep`.
+
+**Licensing.** e2e stacks carry no licence. When `/api/capabilities` reports a
+surface as unlicensed (cases, notebooks, shadow investigation, AI providers),
+its flows are recorded as SKIP with the reason. Its routes are still walked:
+they must render the "Licensed feature unavailable" gate, not crash.
+
+| Option | Meaning |
+|---|---|
+| `--checkout DIR` | tree to test (default: this checkout) |
+| `--edition enterprise\|open` | default: enterprise when `nanosiem-enterprise/` exists |
+| `--stack-env FILE` | reuse a live `scripts/e2e.sh up` stack (no up/down) |
+| `--keep` | leave the stack up afterwards |
+| `--compare REPORT` | diff against an earlier report → `diff.md` |
+| `--out DIR` | report dir (default `target/e2e/security-update/<label>-<edition>-<ts>`) |
+
+Env knobs: `PLAYBOOK_ROLES=admin,analyst` (subset), `PLAYBOOK_ONLY=<regex on
+check id>`, `PLAYBOOK_WALK=0` (flows only), `PLAYBOOK_BUTTONS=0` (no
+dead-button probe) or `=all` (also as the analyst; default admin only), `E2E_UI_HEADED=1` (watch it), `CHROME_PATH`.
+
+**Users** (created through the API by the bootstrap admin):
+
+| role | permissions |
+|---|---|
+| `admin` | the bootstrap Admin |
+| `analyst` | search, saved searches, dashboards, alerts, cases, notebooks, detections:view, hunts (incl. recon) — granted the restricted source |
+| `helpdesk` | `users:view` + `users:edit` only |
+| `scoped` | the analyst permissions, but NOT granted the restricted source |
+
+Every user is also in the built-in Everyone group (ReadOnly role).
+
+**What it checks**
+
+- *Route walk*: every route in `App.tsx` (read at run time, so new routes are
+  covered automatically) as every user. Each page must not render NotFound, go
+  blank, bounce to `/login`, or log console/page errors. It must not get an
+  unexpected 4xx/5xx. A route must not render for a user who lacks its `PermissionRoute`
+  permission. Entitlement is judged on the route the browser lands on, so
+  redirects count. Access Denied fails the check for the Admin. For other users
+  it is a warning, because some pages gate tabs inside the page. As admin the playbook also clicks each
+  non-destructive button in `main`. A click with no effect (no DOM change,
+  request, dialog or navigation) is reported as a dead button.
+- *Flows*:
+  - search: nPL with eval/strftime, anomaly, prevalence, sequence, bin,
+    fillnull and reserved-word aliases; Inspect SQL; saved searches
+  - detections: UI create (real-time), UI edit, UI promote, real-time delete,
+    and scheduled alerting rules whose alerts must fire
+  - alerts
+  - cases, case notebooks and shadow investigation (enterprise)
+  - dashboards
+  - reports: generate, run and download
+  - log sources: sampling exclude condition, Test VRL, publish, deploy and
+    parser repository import
+  - ingest tokens
+  - AI provider Test connection with a bad URL and a private URL
+  - users, roles and groups: invite, edit, disable/enable, password reset,
+    MFA reset
+  - API keys: create, edit expiry, rotate
+  - SIEM health, audit log export, licence, marketplace
+- *Denied source*: the `scoped` user must never see the restricted source's
+  events or `source_type` in search results, explain/SQL, alerts, cases,
+  notebooks, report artifacts or recon. Every `/api` response body of that
+  user's browser session is scanned.
+- *`sec` checks*: hardening expectations from the 2026-11-08 security review,
+  e.g. a `users:edit` holder cannot take over an Admin, or a password reset
+  ends the user's sessions. They fail on a branch without the fix. The diff
+  reports them as fixed, never as regressions.
+
+**Known issues**: `ui/playbooks/known-issues.mjs` lists pre-existing defects the
+playbook still sees on main. Each entry has a narrow pattern and a Linear ID.
+A match downgrades the check to a warning and is reported once under "Known
+pre-existing issues". Delete the entry when its issue is fixed.
+
+**Output**: `report.json`, `report.md` (coverage routes × roles, failures with
+url/problems/screenshot, warnings, leaks, observed 403/404 per role),
+`screenshots/` on failure, and `diff.md` with `--compare`. Secrets (passwords,
+tokens, API keys) are scrubbed from every artifact and masked before any
+screenshot. Exit code 1 on any failure or leak.

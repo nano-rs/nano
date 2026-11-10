@@ -85,6 +85,14 @@ For non-interactive installs, pre-set `NANO_ADMIN_EMAIL`,
 before piping. See [`.env.opensource.example`](./.env.opensource.example) for
 the full env-var surface.
 
+### Deploy with your AI agent (nano Self-run)
+
+The [`nano-deploy`](skills/nano-deploy/SKILL.md) agent skill lets Claude Code,
+Codex or another coding agent size, install, verify and operate nano Self-run
+(the licensed enterprise edition) on your own hosts: single node, 3-node HA or
+Helm. It runs a read-only preflight first, asks before every change and never
+prints secrets. See [`skills/`](skills/README.md) for install lines.
+
 ### HTTPS / TLS
 
 The default stack serves plain HTTP on port 80. To serve HTTPS, bring your

@@ -1819,6 +1819,98 @@ mod tests {
         assert_eq!(sharding_key_for("synthetic_check_results"), "rand()");
     }
 
+    /// NAN-5203: the write-only ingest landing wrappers are content-keyed, never
+    /// in the read-routing set (a Null source reads back empty), and their key
+    /// text matches ClickHouse's own `create_table_query` formatting (captured
+    /// from 26.10.3.7) so the drift check does not recreate them every migrate.
+    #[test]
+    fn ingest_write_wrappers_are_content_keyed_and_write_only() {
+        use crate::db::clickhouse_migrate::distributed::{
+            sharding_key_for, wrapper_sharding_key_matches,
+        };
+        assert_eq!(
+            ClickHouseMigrator::INGEST_WRITE_WRAPPER_SOURCES,
+            &["otel_spans_raw", "otel_metrics_raw", "ocsf_logs_raw"]
+        );
+        for table in ClickHouseMigrator::INGEST_WRITE_WRAPPER_SOURCES {
+            assert!(
+                !ClickHouseMigrator::DISTRIBUTED_TABLES.contains(table),
+                "{table} wrapper is write-only and must not route reads"
+            );
+            assert_ne!(sharding_key_for(table), "rand()", "{table} needs a content key");
+            assert!(
+                ClickHouseMigrator::wrapper_sources().any(|t| t == *table),
+                "{table} must be created and reconciled with the other wrappers"
+            );
+        }
+        assert_eq!(sharding_key_for("otel_metrics_raw"), "cityHash64(event)");
+        assert_eq!(sharding_key_for("ocsf_logs_raw"), "cityHash64(event, source_type)");
+        let spans_created = "CREATE TABLE nanosiem.otel_spans_raw_distributed \
+            (`event` String DEFAULT '{}') ENGINE = Distributed('default', 'nanosiem', \
+            'otel_spans_raw', cityHash64(if(JSONExtractString(event, 'traceId') != '', \
+            lower(JSONExtractString(event, 'traceId')), event)))";
+        assert!(wrapper_sharding_key_matches(
+            spans_created,
+            sharding_key_for("otel_spans_raw")
+        ));
+    }
+
+    fn spec(name: &str, typ: &str, kind: &str, expr: &str) -> (String, String, String, String) {
+        (name.into(), typ.into(), kind.into(), expr.into())
+    }
+
+    /// NAN-5203 M1: the OCSF write wrapper must never carry `id` or `timestamp`
+    /// (per-row random DEFAULTs evaluated by the wrapper would make every retry
+    /// a different block). Reconcile filters source specs through the same
+    /// allowlist, so its ADD pass can never put them back.
+    #[test]
+    fn ocsf_write_wrapper_allowlist_excludes_random_defaults() {
+        use crate::db::clickhouse_migrate::distributed::{
+            columns_to_add, narrow_wrapper_create_sql, wrapper_source_specs,
+            write_wrapper_columns,
+        };
+        let source = vec![
+            spec("event", "JSON(max_dynamic_paths = 1024)", "DEFAULT", "'{}'"),
+            spec("future_timestamp_skew_seconds", "UInt64", "DEFAULT", "86400"),
+            spec("timestamp", "DateTime64(3, 'UTC')", "DEFAULT", "now64(3, 'UTC')"),
+            spec("source_type", "LowCardinality(String)", "DEFAULT", "'unknown'"),
+            spec("id", "UUID", "DEFAULT", "generateUUIDv7()"),
+        ];
+        let narrowed = wrapper_source_specs("ocsf_logs_raw", source.clone());
+        let names: Vec<&str> = narrowed.iter().map(|(n, ..)| n.as_str()).collect();
+        assert_eq!(names, ["event", "future_timestamp_skew_seconds", "source_type"]);
+        // A reconcile against the narrow wrapper adds nothing, least of all id/timestamp.
+        let wrapper_cols: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        assert!(columns_to_add(&wrapper_cols, &narrowed).is_empty());
+        // Full-width wrappers are untouched by the allowlist.
+        assert_eq!(write_wrapper_columns("otel_spans_raw"), None);
+        assert_eq!(wrapper_source_specs("otel_spans_raw", source.clone()).len(), 5);
+
+        let sql = narrow_wrapper_create_sql(
+            "nanosiem", "ocsf_logs_raw_distributed", " ON CLUSTER 'default'", "default",
+            "ocsf_logs_raw", "cityHash64(event, source_type)", &narrowed,
+        );
+        assert!(!sql.contains(" id ") && !sql.contains("timestamp DateTime64"), "{sql}");
+        assert!(!sql.contains(" AS nanosiem."), "narrow wrapper must not copy the source: {sql}");
+        assert!(sql.contains("ENGINE = Distributed('default', 'nanosiem', 'ocsf_logs_raw', cityHash64(event, source_type))"), "{sql}");
+    }
+
+    /// NAN-5203 M2: a DEFAULT change on a column the write wrapper carries is
+    /// drift (the wrapper evaluates it); presence-only and type-equal columns are not.
+    #[test]
+    fn write_wrapper_default_drift_is_detected() {
+        use crate::db::clickhouse_migrate::distributed::columns_default_drift;
+        let source = vec![spec("source_type", "LowCardinality(String)", "DEFAULT", "lower(x)")];
+        let same = vec![spec("source_type", "LowCardinality(String)", "DEFAULT", "lower(x)")];
+        let changed = vec![spec("source_type", "LowCardinality(String)", "DEFAULT", "'unknown'")];
+        let kind_changed = vec![spec("source_type", "LowCardinality(String)", "", "")];
+        let other = vec![spec("event", "String", "", "")];
+        assert!(!columns_default_drift(&same, &source));
+        assert!(columns_default_drift(&changed, &source));
+        assert!(columns_default_drift(&kind_changed, &source));
+        assert!(!columns_default_drift(&other, &source));
+    }
+
     #[test]
     fn wrapper_sharding_key_matches_detects_drift() {
         use crate::db::clickhouse_migrate::distributed::wrapper_sharding_key_matches;

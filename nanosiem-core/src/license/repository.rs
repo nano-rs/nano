@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use super::release_notice::ReleaseNotice;
+use super::token_rejection::{TokenRejectedNotice, TokenRejection};
 use super::types::{LicenseState, LicenseStatus};
 
 /// Repository for reading/writing cached license status in PostgreSQL
@@ -79,6 +80,69 @@ impl LicenseRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// NAN-5194: record that the licence server refused the token. Only the
+    /// `token_rejected` key is touched, and its `first_rejected_at` survives
+    /// repeated rejections. A fresh install with no row gets a locked
+    /// placeholder row (never a successful observation: `last_checked_at`
+    /// stays NULL, so admission still fails closed).
+    pub async fn record_token_rejection(
+        &self,
+        rejection: &TokenRejection,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO license_status (id, status, valid, raw_response, updated_at)
+             VALUES (TRUE, 'locked', FALSE, jsonb_build_object('token_rejected', $1::jsonb), NOW())
+             ON CONFLICT (id) DO UPDATE SET
+                raw_response = COALESCE(license_status.raw_response, '{}'::jsonb)
+                    || jsonb_build_object('token_rejected', $1::jsonb || jsonb_build_object(
+                        'first_rejected_at',
+                        COALESCE(
+                            license_status.raw_response -> 'token_rejected' -> 'first_rejected_at',
+                            $1::jsonb -> 'first_rejected_at'
+                        )
+                    )),
+                updated_at = NOW()",
+        )
+        .bind(serde_json::to_value(rejection).unwrap_or(serde_json::Value::Null))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// NAN-5194: forget a token rejection (after a successful check-in).
+    pub async fn clear_token_rejection(&self) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE license_status
+             SET raw_response = raw_response - 'token_rejected', updated_at = NOW()
+             WHERE id = TRUE AND raw_response ? 'token_rejected'",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// NAN-5194: the recorded token rejection with its lock date (14 days
+    /// after the last successful check-in), or `None` (never rejected,
+    /// cleared, air-gapped, malformed).
+    pub async fn get_token_rejected_notice(
+        &self,
+    ) -> Result<Option<TokenRejectedNotice>, sqlx::Error> {
+        let row: Option<(Option<serde_json::Value>, Option<DateTime<Utc>>, bool)> =
+            sqlx::query_as(
+                "SELECT raw_response -> 'token_rejected', last_checked_at, COALESCE(offline, FALSE)
+                 FROM license_status WHERE id = TRUE",
+            )
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|(raw, last_checked_at, offline)| {
+            if offline {
+                return None;
+            }
+            let rejection: TokenRejection = serde_json::from_value(raw?).ok()?;
+            Some(TokenRejectedNotice::new(rejection, last_checked_at))
+        }))
     }
 
     /// NAN-5114: the newest-release facts from the last successful online

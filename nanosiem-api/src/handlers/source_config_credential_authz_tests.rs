@@ -148,3 +148,28 @@ fn saved_credential_reference_is_checked_by_the_service_grant() {
         assert!(grant.allows());
     }
 }
+
+/// NAN-5147: the grant carries credentials:edit so the service can require it
+/// before a bound credential is moved to a new connection host.
+#[test]
+fn credential_edit_is_carried_for_host_changes() {
+    for auth in both_principals(&[SOURCE_CONFIGS_EDIT, permissions::CREDENTIALS_USE]) {
+        let grant = authorize_source_config_operation(&auth, SOURCE_CONFIGS_EDIT, false).unwrap();
+        assert!(grant.allows());
+        assert_eq!(grant.ensure_retarget(), Err(permissions::CREDENTIALS_EDIT));
+    }
+    for auth in both_principals(&[
+        SOURCE_CONFIGS_EDIT,
+        permissions::CREDENTIALS_USE,
+        permissions::CREDENTIALS_EDIT,
+    ]) {
+        let grant = authorize_source_config_operation(&auth, SOURCE_CONFIGS_EDIT, false).unwrap();
+        assert!(grant.ensure_retarget().is_ok());
+    }
+    // credentials:edit without credentials:use grants nothing.
+    for auth in both_principals(&[SOURCE_CONFIGS_EDIT, permissions::CREDENTIALS_EDIT]) {
+        let grant = authorize_source_config_operation(&auth, SOURCE_CONFIGS_EDIT, false).unwrap();
+        assert!(!grant.allows());
+        assert!(grant.ensure_retarget().is_err());
+    }
+}

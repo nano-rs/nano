@@ -25,6 +25,17 @@
 #   NANO_HTTPS_PROXY (http://host:port), NANO_PROXY_USERNAME / NANO_PROXY_PASSWORD
 #   (raw; the installer percent-encodes them) and NANO_NO_PROXY — outbound proxy for
 #   nano's own calls; asked once, kept in .env as HTTPS_PROXY/HTTP_PROXY/NO_PROXY.
+#   Enterprise licence (NAN-5172), asked once on a TTY and kept in .env:
+#   LICENSE_URL, LICENSE_TOKEN (or the older DEPLOYMENT_TOKEN) and
+#   NANO_DEPLOYMENT_ID from the deployment's page in app.nano.rs, or
+#   NANO_LICENSE_MODE=offline with an optional NANO_LICENSE_FILE (imported
+#   after install), or AIRGAP_MODE=true. An unattended first install without
+#   any of these fails closed. A new LICENSE_TOKEN given to a re-run replaces
+#   the recorded one. NANO_ADMIN_EMAIL / NANO_ADMIN_NAME are kept in .env (the
+#   password never is), so a prepare-then-install second run needs neither.
+#   Single-node in one command:
+#     NANO_IMAGES_LOCK=images.enterprise.customer.lock LICENSE_URL=… \
+#       LICENSE_TOKEN=… NANO_DEPLOYMENT_ID=… ./install.sh
 #   NANO_ALLOW_PRIVATE_AI_ENDPOINTS (true | false, default false) — allow AI
 #   providers on private addresses (a local LLM); asked once, kept in .env.
 #   NANO_SCHEMA_PROFILE (ocsf | udm | ocsf+tenzir, default ocsf) — chosen at
@@ -137,6 +148,15 @@ if [[ -n "$TOPOLOGY_MIGRATION_SHA" && ! "$TOPOLOGY_MIGRATION_SHA" =~ ^[0-9a-f]{6
     exit 2
 fi
 ROLE_ARG=$(printf '%s' "$ROLE_ARG" | tr -d '[:space:]')
+# NAN-5172: licence inputs from the invoking environment, captured before
+# anything else can reuse these names. The role-split renderer later exports
+# NANO_DEPLOYMENT_ID as cluster.deployment_id (volume/project identity); the
+# app.nano.rs-issued id given here is the licence id and never that.
+LICENSE_URL_INPUT="${LICENSE_URL:-}"
+LICENSE_TOKEN_INPUT="${LICENSE_TOKEN:-${DEPLOYMENT_TOKEN:-}}"
+LICENSE_DEPLOYMENT_ID_INPUT="${NANO_DEPLOYMENT_ID:-}"
+LICENSE_MODE_INPUT="${NANO_LICENSE_MODE:-}"
+LICENSE_FILE_INPUT="${NANO_LICENSE_FILE:-}"
 # Lowest major this installer may deploy. Mirrors LINE_FLOOR_MAJOR in
 # scripts/ci/release-version.sh (not shipped in the public tree).
 RELEASE_FLOOR_MAJOR=2
@@ -420,6 +440,284 @@ configure_private_ai_endpoints() {
     if [[ "$PRIVATE_AI_ENDPOINTS" == "true" ]]; then
         log "AI providers on private addresses are allowed (NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS=true in .env)"
     fi
+}
+
+# ----------------------------------------------------------------------------
+# Licence (NAN-5172): asked once on first install, recorded in .env.
+# ----------------------------------------------------------------------------
+# Enterprise api/jobs either check in online with the three values from the
+# deployment's page in app.nano.rs (LICENSE_URL, LICENSE_TOKEN,
+# NANO_DEPLOYMENT_ID) or are admitted by an offline C05 licence file imported
+# after install. NANO_LICENSE_MODE in .env records the choice
+# (online | offline | airgap) so a re-run or upgrade never asks again;
+# "pending" marks a prepared .env whose values are still to be added.
+LICENSE_DEFAULT_URL="https://api.nano.rs/api/license/status"
+LICENSE_PAGE_HINT="https://app.nano.rs → Deployments → your Self-run deployment → Licence"
+# nanosiem-enterprise/src/sovereign_license/wire.rs MAX_LICENSE_BYTES.
+OFFLINE_LICENSE_MAX_BYTES=262144
+
+valid_license_url() {
+    [[ "${1:-}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]]
+}
+# app.nano.rs issues 32 random bytes as base64url (43 characters); older
+# platform tokens are 64 hex characters. Either fits this shape.
+valid_license_token() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9_-]{32,255}$ ]]
+}
+# A nano-main typeid: deploy_ + 26 lowercase Crockford base32 characters.
+valid_deployment_id() {
+    [[ "${1:-}" =~ ^deploy_[0-9a-hjkmnp-tv-z]{26}$ ]]
+}
+is_truthy() {
+    [[ "$(normalize_bool "${1:-}")" == "true" ]]
+}
+
+# A value pasted with its KEY= prefix ("LICENSE_TOKEN=abc", as the deployment
+# page shows it) is accepted as the bare value; surrounding quotes and
+# whitespace are dropped.
+strip_license_paste() {
+    local value="${1:-}" key="$2"
+    value=$(printf '%s' "$value" | tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    value="${value#export }"
+    value="${value#"$key"=}"
+    [[ "$key" == "LICENSE_TOKEN" ]] && value="${value#DEPLOYMENT_TOKEN=}"
+    value="${value#\"}"; value="${value%\"}"
+    value="${value#\'}"; value="${value%\'}"
+    printf '%s' "$value"
+}
+
+# Offline licence file to import after install: a readable regular file of
+# 1..OFFLINE_LICENSE_MAX_BYTES bytes holding a JSON object. Prints the
+# absolute path. The signature is verified by nano-api at import.
+resolve_offline_license_file() {
+    local path="$1" size first
+    [[ -f "$path" && -r "$path" ]] || { warn "Offline licence file not found or not readable: $path"; return 1; }
+    size=$(wc -c < "$path" | tr -d '[:space:]')
+    if (( size < 1 || size > OFFLINE_LICENSE_MAX_BYTES )); then
+        warn "Offline licence file must be 1 to $OFFLINE_LICENSE_MAX_BYTES bytes (got $size): $path"
+        return 1
+    fi
+    first=$(tr -d ' \t\r\n' < "$path" | head -c 1)
+    [[ "$first" == "{" ]] || { warn "Offline licence file is not a signed licence JSON file: $path"; return 1; }
+    printf '%s/%s' "$(cd "$(dirname "$path")" && pwd -P)" "$(basename "$path")"
+}
+
+# Validate the licence values given in the environment. Runs before anything
+# is written, including under NANO_CHECK_ONLY. Never prints the token.
+validate_license_inputs() {
+    [[ "$NANO_EDITION" == "enterprise" ]] || return 0
+    case "$LICENSE_MODE_INPUT" in
+        ""|online|offline) ;;
+        *) fail "NANO_LICENSE_MODE must be online or offline (got '$LICENSE_MODE_INPUT')." ;;
+    esac
+    if [[ -n "$LICENSE_URL_INPUT" ]] && ! valid_license_url "$LICENSE_URL_INPUT"; then
+        fail "LICENSE_URL must be an https:// URL such as $LICENSE_DEFAULT_URL (got '$LICENSE_URL_INPUT'). Copy it from $LICENSE_PAGE_HINT."
+    fi
+    if [[ -n "$LICENSE_TOKEN_INPUT" ]] && ! valid_license_token "$LICENSE_TOKEN_INPUT"; then
+        fail "LICENSE_TOKEN is not an enrollment token (expected 32+ letters, digits, '-' or '_'; value not shown). Copy it from $LICENSE_PAGE_HINT."
+    fi
+    # NANO_DEPLOYMENT_ID alone is not a licence input: older role-split
+    # guides exported it for other purposes. It is checked with a token.
+    if [[ -n "$LICENSE_TOKEN_INPUT" && -n "$LICENSE_DEPLOYMENT_ID_INPUT" ]] \
+        && ! valid_deployment_id "$LICENSE_DEPLOYMENT_ID_INPUT"; then
+        fail "NANO_DEPLOYMENT_ID must be the deployment ID from app.nano.rs, like deploy_01h2x3y4z5... (got '$LICENSE_DEPLOYMENT_ID_INPUT')."
+    fi
+    # A re-run may still export LICENSE_URL alone; the recorded token covers it.
+    if [[ -z "$LICENSE_TOKEN_INPUT" && -n "$LICENSE_URL_INPUT" && "$LICENSE_MODE_INPUT" != "online" ]] \
+        && [[ -n "$(env_value LICENSE_TOKEN)$(env_value DEPLOYMENT_TOKEN)" ]]; then
+        return 0
+    fi
+    if [[ -n "$LICENSE_URL_INPUT$LICENSE_TOKEN_INPUT" || "$LICENSE_MODE_INPUT" == "online" ]]; then
+        [[ -n "$LICENSE_TOKEN_INPUT" && -n "$LICENSE_DEPLOYMENT_ID_INPUT" ]] \
+            || fail "Set LICENSE_TOKEN and NANO_DEPLOYMENT_ID together (LICENSE_URL defaults to $LICENSE_DEFAULT_URL). Copy them from $LICENSE_PAGE_HINT."
+        [[ "$LICENSE_MODE_INPUT" != "offline" && -z "$LICENSE_FILE_INPUT" ]] \
+            || fail "Choose one licence: the online values (LICENSE_TOKEN, NANO_DEPLOYMENT_ID) or an offline licence (NANO_LICENSE_MODE=offline / NANO_LICENSE_FILE), not both."
+        is_truthy "${AIRGAP_MODE:-}" \
+            && fail "AIRGAP_MODE=true never checks in online; leave out LICENSE_URL/LICENSE_TOKEN and import an offline licence after install."
+    fi
+    if [[ -n "$LICENSE_FILE_INPUT" ]]; then
+        resolve_offline_license_file "$LICENSE_FILE_INPUT" >/dev/null \
+            || fail "NANO_LICENSE_FILE is not usable; nothing was written."
+    fi
+    return 0
+}
+
+# Decide the licence for this install. Sets LICENSE_ENV_LINES (assignments to
+# append to .env, possibly empty), LICENSE_MODE and LICENSE_IMPORT_FILE. $1 is
+# 1 on first install (no .env yet), 0 when an .env is reused.
+# Prompts at most once, only with a controlling TTY.
+LICENSE_ENV_LINES="" LICENSE_MODE="" LICENSE_IMPORT_FILE="" LICENSE_DEPLOYMENT_ID=""
+resolve_license() {
+    local first_install="$1" recorded_mode recorded_url recorded_token recorded_id choice default_choice
+    local url token deployment_id path
+    LICENSE_ENV_LINES="" LICENSE_MODE="" LICENSE_IMPORT_FILE="" LICENSE_DEPLOYMENT_ID=""
+    if [[ "$NANO_EDITION" != "enterprise" ]]; then
+        if [[ -n "$LICENSE_TOKEN_INPUT$LICENSE_FILE_INPUT" ]]; then
+            warn "Open edition has no licence check; LICENSE_TOKEN / NANO_LICENSE_FILE are ignored."
+        fi
+        LICENSE_MODE=none
+        return 0
+    fi
+    # Only the app role runs nano-api / nano-jobs. Data and ingest hosts get
+    # the values in the shared .env copied from the app host.
+    if [[ "$MULTI_NODE" == "1" && ",${ROLE_ARG}," != *,app,* ]]; then
+        LICENSE_MODE=app-host
+        return 0
+    fi
+    recorded_mode=$(env_value NANO_LICENSE_MODE)
+    recorded_url=$(env_value LICENSE_URL)
+    recorded_token=$(env_value LICENSE_TOKEN)
+    [[ -n "$recorded_token" ]] || recorded_token=$(env_value DEPLOYMENT_TOKEN)
+    recorded_id=$(env_value NANO_DEPLOYMENT_ID)
+
+    # 1. Values given to this run (first install, a prepared .env, or a new
+    #    token after "Regenerate licence token" on the deployment page).
+    if [[ -n "$LICENSE_TOKEN_INPUT" ]]; then
+        url="${LICENSE_URL_INPUT:-${recorded_url:-$LICENSE_DEFAULT_URL}}"
+        LICENSE_MODE=online LICENSE_DEPLOYMENT_ID="$LICENSE_DEPLOYMENT_ID_INPUT"
+        [[ "$url" == "$recorded_url" ]] || LICENSE_ENV_LINES+="LICENSE_URL=$url"$'\n'
+        [[ "$LICENSE_TOKEN_INPUT" == "$recorded_token" ]] || LICENSE_ENV_LINES+="LICENSE_TOKEN=$LICENSE_TOKEN_INPUT"$'\n'
+        [[ "$LICENSE_DEPLOYMENT_ID_INPUT" == "$recorded_id" ]] || LICENSE_ENV_LINES+="NANO_DEPLOYMENT_ID=$LICENSE_DEPLOYMENT_ID_INPUT"$'\n'
+        if [[ "$first_install" == "0" && -n "$recorded_token" && "$LICENSE_TOKEN_INPUT" != "$recorded_token" ]]; then
+            log "Replacing the licence token recorded in .env with the one given to this run (value not shown)"
+        fi
+    elif [[ "$LICENSE_MODE_INPUT" == "offline" || -n "$LICENSE_FILE_INPUT" ]]; then
+        LICENSE_MODE=offline
+        [[ -z "$LICENSE_FILE_INPUT" ]] || LICENSE_IMPORT_FILE=$(resolve_offline_license_file "$LICENSE_FILE_INPUT") \
+            || fail "NANO_LICENSE_FILE is not usable; nothing was written."
+    elif is_truthy "${AIRGAP_MODE:-}" || is_truthy "$(env_value AIRGAP_MODE)"; then
+        LICENSE_MODE=airgap
+    # 2. Already recorded: a re-run, an upgrade, or values appended by hand to
+    #    a prepared .env. Never asks again.
+    elif [[ -n "$recorded_token" && -n "$recorded_id" ]]; then
+        LICENSE_MODE=online LICENSE_DEPLOYMENT_ID="$recorded_id"
+        [[ -n "$recorded_url" ]] || LICENSE_ENV_LINES+="LICENSE_URL=$LICENSE_DEFAULT_URL"$'\n'
+    elif [[ "$recorded_mode" == "offline" || "$recorded_mode" == "airgap" ]]; then
+        LICENSE_MODE="$recorded_mode"
+    # 3. Nothing known: ask once.
+    elif have_controlling_tty; then
+        # A pre-2.0.5 install that reaches here was admitted by an offline
+        # licence imported in the UI (or not licensed yet): keep that default.
+        default_choice=online
+        [[ "$first_install" == "0" && -z "$recorded_mode" ]] && default_choice=offline
+        while :; do
+            choice=$(prompt_tty "Licence: online check-in (paste the 3 values from app.nano.rs) or offline file (path)? [online/offline]" "$default_choice")
+            choice=$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+            case "$choice" in
+                online|on|1) choice=online; break ;;
+                offline|off|file|2) choice=offline; break ;;
+                *) warn "Answer online or offline." ;;
+            esac
+        done
+        if [[ "$choice" == "online" ]]; then
+            while :; do
+                url=$(strip_license_paste "$(prompt_tty "LICENSE_URL" "$LICENSE_DEFAULT_URL")" LICENSE_URL)
+                valid_license_url "$url" && break
+                warn "Enter the https:// licence URL shown on the deployment page."
+            done
+            while :; do
+                token=$(strip_license_paste "$(prompt_tty "LICENSE_TOKEN (input hidden)" "" secret)" LICENSE_TOKEN)
+                valid_license_token "$token" && break
+                warn "That is not an enrollment token (value not shown). Paste LICENSE_TOKEN from the deployment page; if it was lost, regenerate it there."
+            done
+            while :; do
+                deployment_id=$(strip_license_paste "$(prompt_tty "NANO_DEPLOYMENT_ID")" NANO_DEPLOYMENT_ID)
+                valid_deployment_id "$deployment_id" && break
+                warn "Enter the deployment ID from the deployment page (deploy_ followed by 26 characters)."
+            done
+            LICENSE_MODE=online LICENSE_DEPLOYMENT_ID="$deployment_id"
+            LICENSE_ENV_LINES="LICENSE_URL=$url"$'\n'"LICENSE_TOKEN=$token"$'\n'"NANO_DEPLOYMENT_ID=$deployment_id"$'\n'
+            token=""
+        else
+            LICENSE_MODE=offline
+            while :; do
+                path=$(prompt_tty "Offline licence file path (blank = import it after install under Settings → Licence)")
+                [[ -z "$path" ]] && break
+                LICENSE_IMPORT_FILE=$(resolve_offline_license_file "$path") && break
+            done
+        fi
+    elif [[ "$first_install" == "0" && -z "$recorded_mode" ]]; then
+        # Unattended upgrade of an install from before this choice existed:
+        # it runs on the offline (C05) licence it already has. Don't block it.
+        LICENSE_MODE=offline
+    elif [[ "${NANO_PREPARE_ONLY:-0}" == "1" ]]; then
+        LICENSE_MODE=pending
+        [[ "$recorded_mode" == "pending" ]] || LICENSE_ENV_LINES="NANO_LICENSE_MODE=pending"$'\n'
+        warn "No licence values yet. Before running ./install.sh, add LICENSE_URL, LICENSE_TOKEN and NANO_DEPLOYMENT_ID to .env (from $LICENSE_PAGE_HINT), or pass them to ./install.sh, or set NANO_LICENSE_MODE=offline."
+        return 0
+    else
+        fail "No licence for this unattended enterprise install (no TTY to ask). Pass LICENSE_URL, LICENSE_TOKEN and NANO_DEPLOYMENT_ID from $LICENSE_PAGE_HINT, for example: NANO_IMAGES_LOCK=images.enterprise.customer.lock LICENSE_URL=$LICENSE_DEFAULT_URL LICENSE_TOKEN=<token> NANO_DEPLOYMENT_ID=<deployment id> ./install.sh. Without access to api.nano.rs, set NANO_LICENSE_MODE=offline (import the licence file after install) or AIRGAP_MODE=true. Nothing was started."
+    fi
+    [[ "$LICENSE_MODE" == "$recorded_mode" ]] || LICENSE_ENV_LINES+="NANO_LICENSE_MODE=$LICENSE_MODE"$'\n'
+    return 0
+}
+
+# Append LICENSE_ENV_LINES to $1 and say what was decided (token redacted).
+record_license() {
+    local target="$1"
+    [[ -z "$LICENSE_ENV_LINES" ]] || printf '%s' "$LICENSE_ENV_LINES" >> "$target"
+    LICENSE_ENV_LINES=""
+    case "$LICENSE_MODE" in
+        online)
+            ok "Licence: online check-in for deployment $LICENSE_DEPLOYMENT_ID (LICENSE_TOKEN ******** in .env)" ;;
+        offline)
+            if [[ -n "$LICENSE_IMPORT_FILE" ]]; then
+                ok "Licence: offline; $LICENSE_IMPORT_FILE is imported after the admin account is created"
+            else
+                ok "Licence: offline; import the licence file after install under Settings → Licence"
+            fi ;;
+        airgap) ok "Licence: air-gapped (AIRGAP_MODE); import the offline licence after install" ;;
+    esac
+}
+
+# Admin email / display name are kept in .env so a re-run (prepare, then
+# install; or a retry after a failed start) can still create the account.
+# Single-quoted for Compose, which would otherwise interpolate '$'. A value
+# that cannot be single-quoted safely is not persisted. Never the password.
+persistable_env_value() {
+    [[ -n "${1:-}" && "$1" != *[\'\"\\\`\$]* && "$1" != *[[:cntrl:]]* ]]
+}
+
+# Import the offline licence file chosen at install (NANO_LICENSE_FILE or the
+# prompt) as the admin, once the account exists. Best effort: nano is already
+# up, so a refusal is reported with the manual path instead of failing.
+# Secrets go to curl through 0600 files, never its command line.
+import_offline_license() {
+    [[ -n "${LICENSE_IMPORT_FILE:-}" ]] || return 0
+    local manual="Import $LICENSE_IMPORT_FILE under Settings → Licence ($BASE_URL/settings/license)."
+    local scratch code access_token
+    if [[ -z "${ADMIN_PASSWORD:-}" ]]; then
+        warn "$manual The installer needs the admin password (NANO_ADMIN_PASSWORD) to import it."
+        return 0
+    fi
+    scratch=$(mktemp -d) || { warn "$manual"; return 0; }
+    chmod 700 "$scratch"
+    printf '{"email":%s,"password":%s}' "$(json_escape "$ADMIN_EMAIL")" "$(json_escape "$ADMIN_PASSWORD")" > "$scratch/login"
+    if ! code=$(api_call "$scratch/session" -X POST -H "Content-Type: application/json" \
+        --data-binary "@$scratch/login" "${API_BASE}/api/auth/login"); then
+        rm -rf "$scratch"
+        warn "Could not sign in as $ADMIN_EMAIL to import the offline licence (HTTP $code). $manual"
+        return 0
+    fi
+    access_token=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tokens"]["access_token"])' "$scratch/session" </dev/null 2>/dev/null \
+        || node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).tokens.access_token)' -- "$scratch/session" </dev/null 2>/dev/null) \
+        || access_token=""
+    if [[ -z "$access_token" ]]; then
+        rm -rf "$scratch"
+        warn "Could not read the sign-in response to import the offline licence. $manual"
+        return 0
+    fi
+    printf 'Authorization: Bearer %s\n' "$access_token" > "$scratch/auth"
+    access_token=""
+    if code=$(api_call /dev/null -X POST -H "@$scratch/auth" -H "Content-Type: application/json" \
+        --data-binary "@$LICENSE_IMPORT_FILE" "${API_BASE}/api/license/import"); then
+        ok "Offline licence imported from $LICENSE_IMPORT_FILE"
+    elif [[ "$code" == "409" ]]; then
+        warn "The offline licence was refused (HTTP 409): it is bound to another installation, superseded or out of term. On your deployment's page in app.nano.rs, enter this install's installation and organization IDs (Settings → Licence) and download a new file. $manual"
+    else
+        warn "The offline licence was not imported (HTTP $code). $manual"
+    fi
+    rm -rf "$scratch"
 }
 
 gen_secret() { openssl rand -hex 32 </dev/null; }
@@ -944,6 +1242,10 @@ fi
     || fail "scripts/lib/async-loader-readiness.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
 # shellcheck source=scripts/lib/async-loader-readiness.sh
 . scripts/lib/async-loader-readiness.sh
+[[ -r scripts/lib/image-pull.sh ]] \
+    || fail "scripts/lib/image-pull.sh not found in $NANO_INSTALL_DIR. The source tree or release bundle is incomplete."
+# shellcheck source=scripts/lib/image-pull.sh
+. scripts/lib/image-pull.sh
 
 nano_async_loader_query() {
     local admin_password curl_password endpoint query resolve_address url_address
@@ -1229,6 +1531,8 @@ if [[ -n "${NANO_PROXY_USERNAME:-}${NANO_PROXY_PASSWORD:-}" ]]; then
         || fail "With NANO_PROXY_USERNAME/NANO_PROXY_PASSWORD, NANO_HTTPS_PROXY must not carry credentials (got '$(redact_proxy_url "$NANO_HTTPS_PROXY")')."
 fi
 
+validate_license_inputs
+
 if [[ "${NANO_CHECK_ONLY:-0}" == "1" ]]; then
     printf 'edition=%s\nversion=%s\nimage_prefix=%s\nlock=%s\n' "$NANO_EDITION" "$NANO_VERSION" "$NANO_IMAGE_PREFIX" "$IMAGES_LOCK"
     exit 0
@@ -1241,6 +1545,16 @@ ADMIN_EMAIL="${NANO_ADMIN_EMAIL:-}"
 ADMIN_NAME="${NANO_ADMIN_NAME:-}"
 ADMIN_PASSWORD="${NANO_ADMIN_PASSWORD:-}"
 BASE_URL="${NANO_BASE_URL:-http://localhost}"
+# NAN-5172: a reused .env (prepared earlier, or a retry after a failed start)
+# remembers the admin email/name and base URL from the first run, so the
+# second run no longer needs them exported again.
+if [[ -f .env ]]; then
+    [[ -n "$ADMIN_EMAIL" ]] || ADMIN_EMAIL=$(env_value NANO_ADMIN_EMAIL)
+    [[ -n "$ADMIN_NAME" ]] || ADMIN_NAME=$(env_value NANO_ADMIN_NAME)
+    if [[ -z "${NANO_BASE_URL:-}" && -n "$(env_value BASE_URL)" ]]; then
+        BASE_URL=$(env_value BASE_URL)
+    fi
+fi
 
 if [[ "$MULTI_NODE" == "1" && ! -f .env && ",${ROLE_ARG}," != *,app,* ]]; then
     fail "A role-split cluster's shared .env must be created on an app-role host first (use NANO_PREPARE_ONLY=1), then copied securely to this host before installing role(s) $ROLE_ARG."
@@ -1261,7 +1575,13 @@ if [[ -f .env ]]; then
     if [[ "$MULTI_NODE" == "1" && ",${ROLE_ARG}," != *,app,* ]]; then
         secret_mode=validate-only
     fi
-    nano_backfill_generated_secrets .env "$secret_mode" \
+    # NAN-5148: only an ingest host runs a Vector config consumer.
+    NANO_SECRETS_HOST_CONSUMES_VECTOR_CONFIG=1
+    if [[ "$MULTI_NODE" == "1" && ",${ROLE_ARG}," != *,ingest,* ]]; then
+        NANO_SECRETS_HOST_CONSUMES_VECTOR_CONFIG=0
+    fi
+    NANO_SECRETS_HOST_CONSUMES_VECTOR_CONFIG="$NANO_SECRETS_HOST_CONSUMES_VECTOR_CONFIG" \
+        nano_backfill_generated_secrets .env "$secret_mode" \
         || fail "Could not validate/backfill required generated secrets in $NANO_INSTALL_DIR/.env."
     if [[ -n "$NANO_BACKFILLED_SECRET_KEYS" ]]; then
         log "Backfilled required generated secrets in .env: $NANO_BACKFILLED_SECRET_KEYS"
@@ -1278,6 +1598,18 @@ if [[ -f .env ]]; then
     fi
     if [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,NANO_VECTOR_CONFIG_DELIVERY_TOKEN,* ]]; then
         warn "NANO_VECTOR_CONFIG_DELIVERY_TOKEN was a placeholder; replaced it with a generated one."
+    fi
+    # NAN-5148: on a role-split app host, a delivery token generated just now
+    # exists only in this .env. Ingest hosts still present their old value or
+    # the install token; nano-api refuses a placeholder and a public install
+    # token, so starting the API now would stop config delivery to them.
+    # Stop before anything starts. The token is saved in .env, so the re-run
+    # after the copy goes ahead.
+    if [[ "$MULTI_NODE" == "1" && "$secret_mode" == generate && "${NANO_PREPARE_ONLY:-0}" != "1" ]] \
+        && { [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,NANO_VECTOR_CONFIG_DELIVERY_TOKEN,* ]] \
+            || { [[ ",${NANO_BACKFILLED_SECRET_KEYS// /}," == *,NANO_VECTOR_CONFIG_DELIVERY_TOKEN,* ]] \
+                && [[ ",${NANO_PUBLIC_SECRET_KEYS// /}," == *,VECTOR_AUTH_TOKEN,* ]]; }; }; then
+        fail "Generated NANO_VECTOR_CONFIG_DELIVERY_TOKEN in $NANO_INSTALL_DIR/.env. Ingest hosts need it before nano-api starts: their install token is publicly known (or their delivery token was a placeholder), which nano-api refuses for Vector config delivery. Securely copy $NANO_INSTALL_DIR/.env to every inventory host, then re-run this command here and install.sh on each ingest host. Nothing was started."
     fi
     if [[ -n "${NANO_PUBLIC_DB_PASSWORD_KEYS:-}" ]]; then
         warn "Database password(s) $NANO_PUBLIC_DB_PASSWORD_KEYS are publicly known defaults. They are not changed automatically: PostgreSQL and ClickHouse keep the password their data was created with."
@@ -1301,6 +1633,10 @@ if [[ -f .env ]]; then
         echo "NANO_SCHEMA_PROFILE=udm" >> .env
         log "Pinned NANO_SCHEMA_PROFILE=udm in .env (this install predates the schema choice)"
     fi
+    # Appended (symlink-safe; the last assignment wins) only when this run
+    # adds or changes a licence value.
+    resolve_license 0
+    record_license .env
 else
     REUSE_ENV=0
     log "Configuring first-time admin account"
@@ -1311,14 +1647,18 @@ else
     [[ -z "$ADMIN_NAME" ]]     && ADMIN_NAME=$(prompt_tty "Admin display name" "Admin")
     [[ -z "$ADMIN_NAME" ]]     && fail "Admin name is required."
 
-    if [[ -z "$ADMIN_PASSWORD" ]]; then
+    if [[ -z "$ADMIN_PASSWORD" && "${NANO_PREPARE_ONLY:-0}" == "1" ]]; then
+        # The password is never written to .env, so a prepare run does not
+        # ask for it: ./install.sh asks when it creates the account.
+        :
+    elif [[ -z "$ADMIN_PASSWORD" ]]; then
         ADMIN_PASSWORD=$(prompt_tty "Admin password (blank = autogenerate)" "" secret)
         if [[ -z "$ADMIN_PASSWORD" ]]; then
             ADMIN_PASSWORD="N!a1$(gen_secret | cut -c1-20)"
             GENERATED_PASSWORD=1
         fi
     fi
-    validate_admin_password "$ADMIN_PASSWORD"
+    [[ -z "$ADMIN_PASSWORD" ]] || validate_admin_password "$ADMIN_PASSWORD"
 
     # An explicit environment value makes the documented non-interactive
     # install path fully non-interactive.
@@ -1374,6 +1714,10 @@ else
         fail "The bundled Tenzir profile is single-node only; role-split installs must use the ocsf or udm schema profile without bundled Tenzir."
     fi
 
+    # Licence: asked here, before anything is written, and fails closed for an
+    # unattended install without one.
+    resolve_license 1
+
     log "Generating secrets and writing .env"
     ENV_TEMP_FILE=$(mktemp .env.tmp.XXXXXX)
     chmod 600 "$ENV_TEMP_FILE"
@@ -1400,6 +1744,16 @@ EOF
     if [[ "${BUNDLE_TENZIR:-0}" == "1" ]]; then
         echo "COMPOSE_PROFILES=tenzir" >> "$ENV_TEMP_FILE"
     fi
+    # NAN-5172: the admin identity (never its password) survives to the run
+    # that creates the account; see persistable_env_value.
+    for kv in "NANO_ADMIN_EMAIL=$ADMIN_EMAIL" "NANO_ADMIN_NAME=$ADMIN_NAME"; do
+        if persistable_env_value "${kv#*=}"; then
+            printf "%s='%s'\n" "${kv%%=*}" "${kv#*=}" >> "$ENV_TEMP_FILE"
+        else
+            warn "${kv%%=*} contains quotes, '\\', '\$' or '\`', so it is not kept in .env; set it again if a later run must create the admin account."
+        fi
+    done
+    record_license "$ENV_TEMP_FILE"
     # Persist the autogenerated admin password BEFORE the docker pull so a
     # mid-install failure doesn't lose it (NAN-807 bug #9). User-supplied
     # passwords are already known to the user — only stash the generated ones.
@@ -1743,16 +2097,30 @@ if [[ "${NANO_PREPARE_ONLY:-0}" == "1" ]]; then
     exit 0
 fi
 
-log "Pulling images from ${NANO_IMAGE_PREFIX%/*} (this may take a minute on first run)"
-if ! docker compose "${COMPOSE_ARGS[@]}" pull </dev/null; then
-    if [[ "$NANO_EDITION" == "enterprise" ]]; then
-        fail "docker compose pull failed. Enterprise images are in a private registry: log in to ${NANO_IMAGE_PREFIX%%/*} with the pull credential nano issued you, then re-run."
-    fi
-    fail "docker compose pull failed. If you see '401 Unauthorized', the GHCR packages may still be private — run 'docker login ghcr.io' or wait for nano-rs to flip them public."
-fi
-
 ACTIVE_IMAGES=$(docker compose "${COMPOSE_ARGS[@]}" config --images </dev/null)
 
+# NAN-5197: every active image is pinned (third-party by @sha256 in the Compose
+# files, first-party by the images lock), so only images whose pinned digest
+# is not already local are pulled, by digest, each attempt bounded by
+# NANO_PULL_TIMEOUT. A stale local tag counts as missing and is re-pulled. The
+# lock pins first-party tags only when it describes this release.
+log "Checking images from ${NANO_IMAGE_PREFIX%/*} (pulling only what is missing)"
+NANO_PULL_LOCK=""
+if [[ -f "$IMAGES_LOCK" && "$(lock_release "$IMAGES_LOCK")" == "${NANO_VERSION#v}" ]]; then
+    NANO_PULL_LOCK="$IMAGES_LOCK"
+fi
+# NANO_SKIP_IMAGE_VERIFY=1 is the escape hatch for a store whose digest
+# readback is unusable; presence then falls back to a plain inspect.
+if ! NANO_PULL_LOCK="$NANO_PULL_LOCK" NANO_PULL_TRUST_TAGS="${NANO_SKIP_IMAGE_VERIFY:-0}" \
+    nano_pull_images "$ACTIVE_IMAGES"; then
+    if [[ "$NANO_EDITION" == "enterprise" ]]; then
+        fail "Image pull failed. Enterprise images are in a private registry: log in to ${NANO_IMAGE_PREFIX%%/*} with the pull credential nano issued you, then re-run."
+    fi
+    fail "Image pull failed. If you see '401 Unauthorized', the GHCR packages may still be private — run 'docker login ghcr.io' or wait for nano-rs to flip them public."
+fi
+
+# Runs whether or not anything was pulled: every active image is re-checked
+# against the lock before anything starts.
 verify_image_digests
 
 if [[ -n "${NANO_PRE_START_HOOK:-}" ]]; then
@@ -1886,12 +2254,37 @@ else
         warn "System is already initialized — skipping admin creation."
     else
         if [[ "$REUSE_ENV" == "1" ]]; then
-            [[ -n "$ADMIN_EMAIL" ]] || fail "The prepared multi-node cluster is not initialized. Re-run the app role with NANO_ADMIN_EMAIL, NANO_ADMIN_NAME and NANO_ADMIN_PASSWORD set."
-            [[ -n "$ADMIN_NAME" ]] || fail "The prepared multi-node cluster is not initialized. Re-run the app role with NANO_ADMIN_EMAIL, NANO_ADMIN_NAME and NANO_ADMIN_PASSWORD set."
+            # NAN-5172: email/name come from .env (kept by the first run) or
+            # the environment; with a TTY anything still missing is asked.
+            # The password is never in .env unless it was autogenerated.
+            not_initialized="This install has no admin account yet. Set NANO_ADMIN_EMAIL, NANO_ADMIN_NAME and NANO_ADMIN_PASSWORD, or run ./install.sh in a terminal to be asked, then re-run"
+            [[ "$MULTI_NODE" == "1" ]] && not_initialized+=" the app role"
+            not_initialized+="."
+            if [[ -z "$ADMIN_EMAIL" ]]; then
+                have_controlling_tty || fail "$not_initialized"
+                ADMIN_EMAIL=$(prompt_tty "Admin email")
+                [[ -n "$ADMIN_EMAIL" ]] || fail "Admin email is required."
+                persistable_env_value "$ADMIN_EMAIL" && printf "NANO_ADMIN_EMAIL='%s'\n" "$ADMIN_EMAIL" >> .env
+            fi
+            if [[ -z "$ADMIN_NAME" ]]; then
+                have_controlling_tty || fail "$not_initialized"
+                ADMIN_NAME=$(prompt_tty "Admin display name" "Admin")
+                [[ -n "$ADMIN_NAME" ]] || fail "Admin name is required."
+                persistable_env_value "$ADMIN_NAME" && printf "NANO_ADMIN_NAME='%s'\n" "$ADMIN_NAME" >> .env
+            fi
             if [[ -z "$ADMIN_PASSWORD" ]]; then
                 ADMIN_PASSWORD=$(env_value INITIAL_ADMIN_PASSWORD)
+                [[ -n "$ADMIN_PASSWORD" ]] && GENERATED_PASSWORD=1
             fi
-            [[ -n "$ADMIN_PASSWORD" ]] || fail "The prepared multi-node cluster is not initialized. Set NANO_ADMIN_PASSWORD (or use the autogenerated INITIAL_ADMIN_PASSWORD in .env) and re-run the app role."
+            if [[ -z "$ADMIN_PASSWORD" ]]; then
+                have_controlling_tty || fail "$not_initialized"
+                ADMIN_PASSWORD=$(prompt_tty "Admin password (blank = autogenerate)" "" secret)
+                if [[ -z "$ADMIN_PASSWORD" ]]; then
+                    ADMIN_PASSWORD="N!a1$(gen_secret | cut -c1-20)"
+                    GENERATED_PASSWORD=1
+                    printf '\n# Autogenerated initial admin password — printed by install.sh on success.\n# Safe to delete once you have signed in and confirmed the credentials.\nINITIAL_ADMIN_PASSWORD=%s\n' "$ADMIN_PASSWORD" >> .env
+                fi
+            fi
             validate_admin_password "$ADMIN_PASSWORD"
         fi
         log "Creating admin user $ADMIN_EMAIL"
@@ -1907,6 +2300,7 @@ else
         fi
         ok "Admin user created"
     fi
+    import_offline_license
 fi
 
 # ----------------------------------------------------------------------------

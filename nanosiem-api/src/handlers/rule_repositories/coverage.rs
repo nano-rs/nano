@@ -319,6 +319,33 @@ detection:
         }
     }
 
+    /// NAN-5142: a YAML alias fan-out through the convert path is a 400,
+    /// rejected before anything large is built.
+    #[test]
+    fn sigma_alias_fanout_is_a_bad_request() {
+        let mut bomb = String::from("title: t\nlogsource: {product: windows}\nx0: &a0 [l, l, l, l, l, l, l, l, l]\n");
+        for level in 1..=9 {
+            let prev = format!("*a{}", level - 1);
+            bomb.push_str(&format!("x{level}: &a{level} [{}]\n", vec![prev.as_str(); 9].join(", ")));
+        }
+        bomb.push_str("detection:\n  condition: selection\n  selection:\n    CommandLine: *a9\n");
+        let started = std::time::Instant::now();
+        for auth in both_principals(&[permissions::MELOD_DETECTION]) {
+            match preflight_sigma_conversion(&auth, &bomb) {
+                Err(ApiError::BadRequest(message)) => {
+                    assert!(message.contains("aliases are not supported"), "{message}")
+                }
+                Err(other) => panic!("expected BadRequest, got {other:?}"),
+                Ok(_) => panic!("alias fan-out parsed"),
+            }
+            assert_eq!(
+                preflight_sigma_conversion(&auth, VALID_SIGMA).unwrap().title,
+                "Suspicious PowerShell"
+            );
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
     fn region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         let tail = source
             .split_once(start)

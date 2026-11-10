@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 
 use super::repository::LicenseRepository;
+use super::token_rejection::{is_credential_rejection, is_intermediary_refusal, TokenRejection};
 use super::types::{LicenseResponse, LicenseState, LicenseStatus};
 use crate::TierSettings;
 
@@ -59,6 +60,10 @@ pub struct LicenseChecker {
     repo: LicenseRepository,
     tier_settings: TierSettings,
     license_status: Arc<RwLock<LicenseStatus>>,
+    /// NAN-5170: optional daily usage report, sent only after a successful
+    /// check-in. Enterprise-only; never affects admission.
+    #[cfg(feature = "enterprise")]
+    usage_reporter: Option<super::usage_report::UsageReporter>,
 }
 
 impl LicenseChecker {
@@ -78,7 +83,39 @@ impl LicenseChecker {
             repo: LicenseRepository::new(pool.clone()),
             tier_settings: TierSettings::new(pool),
             license_status,
+            #[cfg(feature = "enterprise")]
+            usage_reporter: None,
         }
+    }
+
+    /// NAN-5170: after each successful check-in, report the completed days'
+    /// total ingested GB to nano (see [`super::usage_report`]). Only the
+    /// jobs singleton opts in. Never call this for an air-gapped install.
+    #[cfg(feature = "enterprise")]
+    pub fn with_usage_reporting(
+        mut self,
+        pool: sqlx::PgPool,
+        audit: Option<Arc<crate::audit::AuditEmitter>>,
+    ) -> Self {
+        match super::usage_report::usage_url(&self.config.license_url) {
+            Some(url) => {
+                self.usage_reporter = Some(super::usage_report::UsageReporter::new(
+                    super::usage_report::UsageReportTarget {
+                        url,
+                        token: self.config.token.clone(),
+                        deployment_id: self.config.deployment_id.clone(),
+                    },
+                    self.http_client.clone(),
+                    pool,
+                    audit,
+                ));
+            }
+            None => tracing::warn!(
+                url = %self.config.license_url,
+                "Licence URL is not a /license/status endpoint; usage reporting disabled"
+            ),
+        }
+        self
     }
 
     /// Load cached license status from Postgres on startup.
@@ -135,7 +172,13 @@ impl LicenseChecker {
             loop {
                 ticker.tick().await;
                 if let Err(e) = self.check_license().await {
-                    tracing::warn!(error = %e, "License check failed (will retry next interval)");
+                    if matches!(e, LicenseCheckError::TokenRejected(_)) {
+                        // NAN-5194: already recorded for SIEM Health and the
+                        // admin banner; keep retrying under the same bound.
+                        tracing::error!(error = %e, "Licence token rejected (will retry next interval)");
+                    } else {
+                        tracing::warn!(error = %e, "License check failed (will retry next interval)");
+                    }
                     // On network failure, keep last known status for transient issues.
                     // But if we haven't reached the license server in STALE_LICENSE_DAYS,
                     // auto-lock to prevent DNS-blocking bypass attacks.
@@ -203,13 +246,38 @@ impl LicenseChecker {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(LicenseCheckError::ServerError(format!("{status}: {body}")));
+            if is_intermediary_refusal(status, &body) {
+                // NAN-5194: not nano-main's answer, so not a token problem.
+                tracing::warn!(
+                    %status,
+                    "Licence check-in refused by a proxy, WAF or CDN between this install and \
+                     the licence server (not a token rejection); check the outbound proxy \
+                     configuration. Will retry next interval."
+                );
+            }
+            let error = classify_failure(status, &body);
+            if let LicenseCheckError::TokenRejected(http_status) = error {
+                // NAN-5194: a refused credential never fixes itself. Record it
+                // (SIEM Health finding + admin banner); admission is unchanged
+                // and the 14-day bound still applies.
+                let rejection = TokenRejection::new(http_status, Utc::now());
+                if let Err(e) = self.repo.record_token_rejection(&rejection).await {
+                    tracing::warn!(error = %e, "Failed to persist licence token rejection");
+                }
+            }
+            return Err(error);
         }
 
         let license_resp: LicenseResponse = resp
             .json()
             .await
             .map_err(|e| LicenseCheckError::ParseError(e.to_string()))?;
+
+        // NAN-5194: a parsed 200 proves the token was accepted. Clear the
+        // rejection now, before any later admission step can return early.
+        if let Err(e) = self.repo.clear_token_rejection().await {
+            tracing::warn!(error = %e, "Failed to clear licence token rejection");
+        }
 
         let mut new_status = Self::compute_new_status(&license_resp);
 
@@ -281,6 +349,13 @@ impl LicenseChecker {
         }
 
         tracing::debug!(state = %new_status.state, valid = new_status.valid, "License check complete");
+
+        // NAN-5170: the usage report is a separate request made only after the
+        // check-in has fully completed; its outcome is recorded, never returned.
+        #[cfg(feature = "enterprise")]
+        if let Some(reporter) = self.usage_reporter.as_ref() {
+            reporter.report(Utc::now().date_naive()).await;
+        }
         Ok(())
     }
 
@@ -372,12 +447,26 @@ fn admitted_grant_ai_credits(status: &LicenseStatus, resp: &LicenseResponse) -> 
         .flatten()
 }
 
+/// NAN-5194: a 401 (or a 403 in nano-main's JSON error shape) means the
+/// licence server refused the token (never retried away); anything else
+/// non-2xx is transient. The rejection carries no response body.
+pub(crate) fn classify_failure(status: reqwest::StatusCode, body: &str) -> LicenseCheckError {
+    if is_credential_rejection(status, body) {
+        LicenseCheckError::TokenRejected(status.as_u16())
+    } else {
+        LicenseCheckError::ServerError(format!("{status}: {body}"))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LicenseCheckError {
     #[error("Network error: {0}")]
     Network(String),
     #[error("Server error: {0}")]
     ServerError(String),
+    /// nano-main refused the token (401, or a 403 with its JSON error body).
+    #[error("Licence token rejected by the licence server (HTTP {0})")]
+    TokenRejected(u16),
     #[error("Parse error: {0}")]
     ParseError(String),
     #[error("Entitlement error: {0}")]

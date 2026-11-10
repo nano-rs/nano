@@ -2612,6 +2612,7 @@ impl ReconService {
         let profile = self
             .insert_profile(
                 &census,
+                Some(&census),
                 &surface,
                 &fingerprint,
                 &[],
@@ -2751,7 +2752,9 @@ impl ReconService {
     /// the surface's live-source set and the health classification need only the
     /// rollup. So a save that has to produce the census pays for
     /// [`CensusDepth::Full`], and one that was handed a census stays at
-    /// `Inventory` exactly as before.
+    /// `Inventory` plus the field-population probe alone: inferred capability
+    /// bindings are refreshed from that server-observed census, never from the
+    /// one in the body (NAN-5153).
     ///
     /// # Provenance is not negotiable
     ///
@@ -2805,11 +2808,21 @@ impl ReconService {
         } else {
             CensusDepth::Full
         };
-        let gathered = self
+        let mut gathered = self
             // SYSTEM: the stored profile is the shared artifact; the response
             // is redacted for the caller by the handler (NAN-5049).
             .gather(observed_at, deadline, &mut degraded, depth, &ScopeSet::unrestricted())
             .await?;
+        // NAN-5153: inferred capability bindings are an input to autonomous
+        // hunt readiness, so they are refreshed from SERVER-observed field
+        // population only — never from a census the caller submitted. An
+        // `Inventory` gather has no field-population facts, so probe them
+        // here. Held aside and folded in only for the binding census below, so
+        // the inventory, manifest and surface are computed exactly as before.
+        let server_deep = match depth {
+            CensusDepth::Inventory => self.probe_deep(observed_at, deadline, &mut degraded).await,
+            CensusDepth::Full => gathered.inputs.deep.clone(),
+        };
         // Provisional: only its FACTS are used for the manifest and the
         // live-source set, neither of which depends on the degraded stamp. The
         // stamp is not known until the surface has been built.
@@ -2862,13 +2875,21 @@ impl ReconService {
         // the profile's, exactly as `run` does it. Merged rather than
         // server-only: the flag is monotonic toward the warning, and a row that
         // understates a source is the error worth being loud about.
-        let census = match submission.census {
-            Some(rows) => rows,
-            None => build_census(&gathered.inputs, profile_degraded),
-        };
+        let submitted_census = submission.census;
+        // `server_deep` is None only when the field-population probe failed or
+        // was skipped. Then there is nothing server-observed to infer from, so
+        // the existing bindings are left as they are rather than wiped.
+        let deep_observed = server_deep.is_some();
+        gathered.inputs.deep = server_deep;
+        let server_census = build_census(&gathered.inputs, profile_degraded);
+        let binding_census = deep_observed.then_some(server_census.as_slice());
+        // A submitted census is still what the profile displays; it only
+        // annotates the profile and never drives bindings.
+        let census = submitted_census.unwrap_or_else(|| server_census.clone());
 
         self.insert_profile(
             &census,
+            binding_census,
             &huntable_surface,
             &submission.fingerprint,
             &submission.actor_weighting,
@@ -3446,6 +3467,9 @@ impl ReconService {
     async fn insert_profile(
         &self,
         census: &[CensusRow],
+        // The server-observed census inferred bindings are refreshed from
+        // (NAN-5153). `None` leaves the existing bindings untouched.
+        binding_census: Option<&[CensusRow]>,
         surface: &HuntableSurface,
         fingerprint: &OrgFingerprint,
         actor_weighting: &[ActorWeight],
@@ -3492,7 +3516,9 @@ impl ReconService {
         .fetch_one(&mut *tx)
         .await?;
 
-        refresh_inferred_source_capabilities(&mut tx, census).await?;
+        if let Some(binding_census) = binding_census {
+            refresh_inferred_source_capabilities(&mut tx, binding_census).await?;
+        }
         tx.commit().await?;
 
         Ok(HuntProfile {

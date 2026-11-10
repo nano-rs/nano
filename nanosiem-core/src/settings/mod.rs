@@ -17,6 +17,7 @@ pub mod search_admission;
 pub mod search_query_limits;
 mod service;
 pub mod tier;
+pub mod usage_meter;
 mod tiering;
 
 pub use developer_repository::*;

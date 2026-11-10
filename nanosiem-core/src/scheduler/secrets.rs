@@ -72,6 +72,76 @@ pub fn merge_auth_headers(
     Some(Some(merged))
 }
 
+/// NAN-5146: an update moved the job to a different origin while stored auth
+/// headers would have been carried over unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "The URL origin (scheme, host or port) changed, so stored auth headers are not carried over. \
+     Re-enter the auth headers for the new URL, or send an empty auth_headers object to clear them."
+)]
+pub struct AuthHeadersOriginChanged;
+
+/// True when `a` and `b` share scheme, host and port. A URL that fails to
+/// parse never matches, so an unparseable stored URL fails closed.
+pub fn same_url_origin(a: &str, b: &str) -> bool {
+    match (url::Url::parse(a), url::Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            let (oa, ob) = (a.origin(), b.origin());
+            oa.is_tuple() && oa == ob
+        }
+        _ => false,
+    }
+}
+
+/// Scheme, host, port and path of a URL, for audit records: userinfo, query
+/// and fragment can carry secrets and are dropped.
+pub fn redact_url_for_audit(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(mut u) => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        }
+        Err(_) => "<unparseable>".to_string(),
+    }
+}
+
+/// [`merge_auth_headers`] for an update that may also change the job's URL.
+///
+/// Stored header values are bound to the origin they were entered for. When
+/// `new_url`'s origin differs from `existing_url`'s and stored headers exist,
+/// a request that would carry any stored value over (headers omitted, or a
+/// redacted placeholder echoed back for a stored key) is rejected, so the
+/// caller re-supplies the headers for the new destination or clears them.
+/// Same-origin edits resolve exactly like [`merge_auth_headers`].
+pub fn merge_auth_headers_for_url(
+    incoming: Option<HashMap<String, String>>,
+    existing: Option<&HashMap<String, String>>,
+    existing_url: Option<&str>,
+    new_url: &str,
+) -> Result<Option<Option<HashMap<String, String>>>, AuthHeadersOriginChanged> {
+    let stored = existing.filter(|h| !h.is_empty());
+    let origin_changed = existing_url.is_some_and(|old| !same_url_origin(old, new_url));
+    if let (Some(stored), true) = (stored, origin_changed) {
+        let carries_stored = match incoming.as_ref() {
+            None => true,
+            Some(map) => map
+                .iter()
+                .any(|(k, v)| v == REDACTED_PLACEHOLDER && stored.contains_key(k)),
+        };
+        if carries_stored {
+            return Err(AuthHeadersOriginChanged);
+        }
+    }
+    Ok(merge_auth_headers(incoming, existing))
+}
+
+#[cfg(test)]
+#[path = "secrets_origin_tests.rs"]
+mod secrets_origin_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

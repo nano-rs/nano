@@ -13,6 +13,7 @@ import { AlertTriangle, X, KeyRound } from 'lucide-react';
 import { api } from '../lib/api';
 import type { LicenseStatusResponse } from '../lib/api';
 import { useCapabilities } from '@/hooks/use-capabilities';
+import { useAuth } from '@/contexts/AuthContext';
 
 export function LicenseBanner() {
   // License enforcement is enterprise-only — the open edition strips the
@@ -20,6 +21,8 @@ export function LicenseBanner() {
   // 404s it would otherwise generate) and never render in open builds.
   const { edition } = useCapabilities();
   const isEnterprise = edition === 'enterprise';
+  const { hasPermission } = useAuth();
+  const isAdmin = hasPermission('settings:system');
 
   const [status, setStatus] = useState<LicenseStatusResponse | null>(null);
   const [dismissed, setDismissed] = useState(false);
@@ -45,6 +48,14 @@ export function LicenseBanner() {
   // All enterprise admission modes are enforced. Keep the air-gap fallback for
   // compatibility with an older API response during rolling upgrades.
   const enforced = !!status?.enforcement_enabled || !!status?.airgap;
+
+  // NAN-5194: the licence server refused the token. Only an admin can fix
+  // it (.env + install.sh), and it outranks the other licence banners because
+  // it is the cause of any lock that follows. Not dismissable; it clears after
+  // the next successful check-in.
+  if (isEnterprise && isAdmin && status?.token_rejected) {
+    return <LicenseTokenRejectedBanner rejection={status.token_rejected} />;
+  }
 
   const trial = status?.entitlement?.kind === 'trial' ? status.entitlement : null;
   if (isEnterprise && status && enforced && trial) {
@@ -184,6 +195,20 @@ function LicenseHardStopBanner({ status }: { status: LicenseStatusResponse }) {
           Renew licence
         </a>
       )}
+    </div>
+  );
+}
+
+function LicenseTokenRejectedBanner({ rejection }: { rejection: NonNullable<LicenseStatusResponse['token_rejected']> }) {
+  return (
+    <div role="alert" className="mx-6 mt-3 flex items-start gap-3 rounded-md border border-red-200 bg-red-50/80 px-3 py-2 text-[12px] dark:border-red-500/30 dark:bg-red-500/10">
+      <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" strokeWidth={1.5} />
+      <div className="min-w-0">
+        <div className="font-medium text-red-700 dark:text-red-300">
+          Licence token rejected <span className="font-mono text-[10.5px]">HTTP {rejection.http_status}</span>
+        </div>
+        <div className="text-red-700/90 dark:text-red-300/90">{rejection.message}</div>
+      </div>
     </div>
   );
 }

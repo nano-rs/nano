@@ -24,6 +24,8 @@ pub mod materialized_view;
 pub mod query_enrichment;
 pub mod risk;
 pub mod rule_transfer;
+#[cfg(test)]
+mod rule_transfer_tests;
 pub mod schedule_lag;
 pub mod scheduler;
 pub mod service;

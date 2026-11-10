@@ -14,15 +14,20 @@ use std::collections::HashMap;
 use tracing::info;
 use utoipa::ToSchema;
 
+use nanosiem_core::audit::{
+    AuditEvent, AuditSource, ClientContext, LOOKUP_INGESTION_URL_CHANGED,
+};
 use nanosiem_core::auth::permissions;
 use nanosiem_core::scheduler::MAX_CRON_PREVIEW_COUNT;
 use nanosiem_core::upload::{LookupMode, ParserConfig, UploadDestination};
 use nanosiem_core::{
-    calculate_next_runs, describe_cron, merge_auth_headers, redact_auth_headers, validate_cron,
+    calculate_next_runs, describe_cron, merge_auth_headers_for_url, redact_auth_headers,
+    validate_cron,
     JobExecution, NewScheduledJob, ScheduledJob, SchedulerError,
     SchedulerService, SsrfError, SsrfValidator, UpdateScheduledJob,
 };
 
+use super::AuditExt;
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
@@ -129,7 +134,7 @@ pub async fn get_lookup_ingestion(
     request_body = UpsertLookupIngestionRequest,
     responses(
         (status = 200, description = "Ingestion config created or updated", body = ScheduledJob),
-        (status = 400, description = "Bad request"),
+        (status = 400, description = "Bad request, including a URL origin change that would carry stored auth headers over (re-supply or clear them)"),
         (status = 403, description = "Forbidden"),
     ),
     security(("api_key" = []))
@@ -137,6 +142,7 @@ pub async fn get_lookup_ingestion(
 pub async fn upsert_lookup_ingestion(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
+    Extension(client): Extension<ClientContext>,
     Path(name): Path<String>,
     Json(request): Json<UpsertLookupIngestionRequest>,
 ) -> Result<Json<ScheduledJob>, ApiError> {
@@ -168,10 +174,27 @@ pub async fn upsert_lookup_ingestion(
     // NAN-1358: resolve auth headers so a read-modify-write round-trip can't wipe
     // stored secrets. Omitted headers are preserved; the redacted placeholder
     // echoed back keeps the stored value; only real values overwrite.
-    let merged_auth = merge_auth_headers(
+    // NAN-5146: stored values are bound to the origin they were entered for; a
+    // change of scheme/host/port must re-supply (or clear) them.
+    let existing_headers = existing.as_ref().and_then(|j| j.auth_headers.as_ref());
+    let merged_auth = merge_auth_headers_for_url(
         request.auth_headers,
-        existing.as_ref().and_then(|j| j.auth_headers.as_ref()),
-    );
+        existing_headers,
+        existing.as_ref().map(|j| j.url.as_str()),
+        &request.url,
+    )
+    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let url_change_audit = existing.as_ref().and_then(|j| {
+        let had_headers = j.auth_headers.as_ref().is_some_and(|h| !h.is_empty());
+        (had_headers && j.url != request.url).then(|| {
+            serde_json::json!({
+                "job_id": j.id,
+                "previous_url": nanosiem_core::scheduler::secrets::redact_url_for_audit(&j.url),
+                "new_url": nanosiem_core::scheduler::secrets::redact_url_for_audit(&request.url),
+                "same_origin": nanosiem_core::scheduler::same_url_origin(&j.url, &request.url),
+            })
+        })
+    });
 
     let mut job = if let Some(existing_job) = existing {
         // Update existing job
@@ -209,6 +232,18 @@ pub async fn upsert_lookup_ingestion(
             .await
             .map_err(scheduler_error_to_api)?
     };
+
+    if let Some(details) = url_change_audit {
+        state.emit_audit(
+            AuditEvent::builder(AuditSource::Lookup, LOOKUP_INGESTION_URL_CHANGED)
+                .actor(Some(auth.user_id()), None)
+                .api_key(auth.api_key_id, auth.api_key_name.clone())
+                .resource("lookup_table", None, Some(name.clone()))
+                .client_context(&client)
+                .details(details)
+                .build(),
+        );
+    }
 
     info!(lookup_table = %name, job_id = %job.id, "Lookup ingestion upserted");
     // NAN-1358: don't echo the stored secrets back in the response.

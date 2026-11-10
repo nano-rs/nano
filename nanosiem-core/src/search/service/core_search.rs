@@ -272,7 +272,12 @@ impl SearchService {
                 }
                 Err(e) => {
                     tracing::error!("Async job {} failed: {}", job_id_clone, e);
-                    service.job_store.fail(&job_id_clone, e.to_string()).await;
+                    // NAN-5161: the job error is shown to its owner; mask it
+                    // like the batch path does.
+                    service
+                        .job_store
+                        .fail(&job_id_clone, crate::search::client_error_message(&e))
+                        .await;
                 }
             }
         })));
@@ -365,9 +370,12 @@ impl SearchService {
                     service.job_store.complete(&job_id_clone, response).await;
                 }
                 Err(e) => {
-                    let error_msg = e.to_string();
-                    tracing::error!("Async job {} failed: {}", job_id_clone, error_msg);
-                    service.job_store.fail(&job_id_clone, error_msg).await;
+                    tracing::error!("Async job {} failed: {}", job_id_clone, e);
+                    // NAN-5161: masked like the batch path (see above).
+                    service
+                        .job_store
+                        .fail(&job_id_clone, crate::search::client_error_message(&e))
+                        .await;
                 }
             }
             // Step 5: _permit drops here, freeing the admission slot

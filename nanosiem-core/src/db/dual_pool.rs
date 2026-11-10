@@ -446,6 +446,8 @@ pub(crate) const DISTRIBUTED_TABLES: &[&str] = &[
     // Profile-aware successor to logs_per_source_5m (NAN-2154). Both UDM and
     // OCSF MVs write lane-discriminated rows; readers select exactly one lane.
     "logs_per_source_5m_v2",
+    // NAN-5170: arrival-time hourly ingest volume (Self-run usage metering).
+    "ingest_volume_1h",
     "parser_health_5m",
     // Observability / OTLP native-storage tables (NAN-1721 O1). Their READ SQL
     // (traces, RED charts, metrics, synthetics) routes to the `_distributed`

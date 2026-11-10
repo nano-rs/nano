@@ -7,12 +7,23 @@ on:
     paths:
       - "scripts/release/**"
       - "scripts/tests/customer-images.test.sh"
+      - "scripts/tests/helm-chart-package.test.sh"
+      - "scripts/tests/release-notes-preflight.test.sh"
+      - "deploy/helm/nano/**"
       - "deploy/release/**"
       - ".github/workflows/build-and-push.yml"
       - ".github/workflows/publish-customer-images.yml"
       - ".github/workflows/release-notify.yml"
       - ".github/workflows/release-bundle.yml"
       - ".github/workflows/release-preflight.yml"
+      # NAN-5196: the compose bundle allowlist is checked against what these reference.
+      - "install.sh"
+      - "docker-compose*.yml"
+      - "scripts/nano"
+      - "scripts/nano-*"
+      - "scripts/lib/**"
+      - "deploy/compose/**"
+      - "tools/sync-to-nano-mirror.sh"
 
 permissions:
   contents: read
@@ -23,5 +34,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # NAN-5172: preflight packages the Helm chart (scripts/release/package-chart.sh).
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v4.3.1
+
       - name: Release preflight
         run: bash scripts/release/preflight.sh
+
+      # Preflight check 5b: remove the next version's notes file and preflight must fail.
+      - name: Release notes gate (mutation test)
+        if: ${{ !cancelled() }}
+        run: bash scripts/tests/release-notes-preflight.test.sh

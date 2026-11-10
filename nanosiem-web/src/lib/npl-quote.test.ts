@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { nplQuotedBody, nplQuoted, nplFieldEquals } from './npl-quote.ts';
+import { nplQuotedBody, nplQuoted, nplFieldEquals, nplRegexBody } from './npl-quote.ts';
 
 // The parser's contract, mirrored here so these tests assert against the real
 // grammar rather than against the helper's own implementation:
@@ -90,4 +90,75 @@ test('unicode and empty input are handled', () => {
   assertRoundTrip('', '');
   assertRoundTrip('höst-über', 'höst-über');
   assertRoundTrip('日本語', '日本語');
+});
+
+// --- NAN-5159: `/…/` regex literal bodies (tree pivot `root=/…/`) -----------
+
+// Mirror of `parse_pattern_value` in
+// nanosiem-core/src/query/parser/commands_enrichment.rs: a backslash escapes the
+// next char, the first unescaped `/` closes the literal. Returns the body as the
+// server hands it to the regex engine, plus whatever the parser would treat as
+// further pipeline.
+function parseNplRegexLiteral(emitted: string): { body: string; trailing: string } {
+  assert.equal(emitted[0], '/', 'emitted literal must open with a slash');
+  let escaped = false;
+  for (let i = 1; i < emitted.length; i++) {
+    const c = emitted[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (c === '\\') escaped = true;
+    else if (c === '/') return { body: emitted.slice(1, i), trailing: emitted.slice(i + 1) };
+  }
+  assert.fail(`regex literal ${JSON.stringify(emitted)} never closes`);
+}
+
+/** The value must stay inside one `/…/` literal: nothing left over for the
+ * parser to read as more pipeline. */
+function assertRegexContained(raw: string) {
+  const { body, trailing } = parseNplRegexLiteral(`/${nplRegexBody(raw)}/`);
+  assert.equal(trailing, '', `input ${JSON.stringify(raw)} escaped its regex literal`);
+  return body;
+}
+
+/** For values free of other regex metacharacters, the body must also match the
+ * raw value literally (JS regex agrees with Rust `regex` on `\/` and `\\`). The
+ * root filter is a regex by design, so `|`, `.` etc. keep regex meaning. */
+function assertRegexRoundTrip(raw: string) {
+  const body = assertRegexContained(raw);
+  const flat = raw.replace(/[\r\n]/g, '');
+  assert.ok(new RegExp(`^${body}$`).test(flat), `body ${body} must match ${JSON.stringify(flat)}`);
+}
+
+test('nplRegexBody escapes `/` so the value cannot close the literal', () => {
+  assert.equal(nplRegexBody('a/b | head 1/x'), 'a\\/b | head 1\\/x');
+  assertRegexRoundTrip('/usr/bin/curl');
+  assertRegexContained('x/ | stats count by user | where count>0 | eval y=/');
+});
+
+test('nplRegexBody doubles backslashes so a trailing `\\` cannot escape the close', () => {
+  assert.equal(nplRegexBody('C:\\Windows\\'), 'C:\\\\Windows\\\\');
+  assertRegexRoundTrip('C:\\Windows\\');
+  assertRegexRoundTrip('\\\\fileserver\\share');
+  // A value pre-escaping its own slash must not pair up with ours.
+  assertRegexContained('a\\/ | head 1');
+  assertRegexRoundTrip('a\\/b');
+});
+
+test('nplRegexBody strips newlines and keeps pipes and quotes inert', () => {
+  assert.equal(nplRegexBody('a\r\nb'), 'ab');
+  assertRegexContained('line1\n| head 1');
+  assertRegexContained('cmd|powershell "x"');
+});
+
+test('nplRegexBody leaves ordinary process / web names untouched', () => {
+  assert.equal(nplRegexBody('powershell'), 'powershell');
+  assert.equal(nplRegexBody('nginx-worker'), 'nginx-worker');
+});
+
+test('regression: the double-quote body escaper does NOT contain a regex literal', () => {
+  // Why the tree pivots had to stop using nplQuotedBody for `root=/…/`.
+  const { trailing } = parseNplRegexLiteral(`/${nplQuotedBody('a/ | head 1')}/`);
+  assert.notEqual(trailing, '');
 });

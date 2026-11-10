@@ -101,7 +101,7 @@ pub fn parse_npl(content: &str) -> Result<NplRule, NplParseError> {
     let query = rest[end_idx + 4..].trim().to_string();
 
     // Parse the YAML frontmatter
-    let frontmatter: RawNplFrontmatter = serde_yaml::from_str(yaml_content)?;
+    let frontmatter: RawNplFrontmatter = crate::yaml_budget::from_str(yaml_content)?;
 
     // Extract source types from the query
     let source_types = extract_source_types(&query);

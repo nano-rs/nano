@@ -13,7 +13,10 @@ pub mod service;
 pub mod types;
 
 pub use repository::{JobStats, SchedulerRepository, SchedulerRepositoryError};
-pub use secrets::{merge_auth_headers, redact_auth_headers};
+pub use secrets::{
+    merge_auth_headers, merge_auth_headers_for_url, redact_auth_headers, same_url_origin,
+    AuthHeadersOriginChanged,
+};
 pub use service::{
     calculate_next_run, calculate_next_runs, describe_cron, normalize_cron, validate_cron,
     SchedulerError, MAX_CRON_PREVIEW_COUNT, SchedulerService,

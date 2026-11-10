@@ -75,6 +75,10 @@ pub enum DeliveryDisabledReason {
     /// The dedicated token is a publicly known value (it is new in v2.0.1, so
     /// there is nothing to stay compatible with: refused outright).
     PublicDedicatedToken,
+    /// No dedicated token and the install token is a publicly known value
+    /// (NAN-5148). The v2.0.x install-token fallback is for private install
+    /// tokens only: a public one would let anyone download rendered configs.
+    PublicInstallToken,
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
@@ -96,7 +100,9 @@ pub fn resolve_vector_config_delivery(
         if is_known_public(SecretKind::VectorConfigDeliveryToken, token) {
             return C::Disabled(DeliveryDisabledReason::PublicDedicatedToken);
         }
-        return match nonempty(install) {
+        // NAN-5148: the v2.0.x install-token fallback never extends to a
+        // publicly known install token, in strict or compatibility mode.
+        return match nonempty(install).filter(|i| !is_known_public(SecretKind::VectorInstallToken, i)) {
             Some(install) if !strict && install != token => C::DedicatedOrInstallToken {
                 dedicated: token.to_string(),
                 install: install.to_string(),
@@ -105,6 +111,9 @@ pub fn resolve_vector_config_delivery(
         };
     }
     match nonempty(install) {
+        Some(token) if is_known_public(SecretKind::VectorInstallToken, token) => {
+            C::Disabled(DeliveryDisabledReason::PublicInstallToken)
+        }
         Some(token) => C::LegacyInstallToken(token.to_string()),
         None => C::Disabled(DeliveryDisabledReason::NoCredential),
     }
@@ -286,6 +295,23 @@ pub fn posture_findings(inputs: &PostureInputs) -> Vec<PostureFinding> {
                      Set it to a generated value (`openssl rand -hex 32`) everywhere it is used."
                 ),
                 priority: "high",
+            });
+        }
+        VectorConfigDeliveryCredential::Disabled(DeliveryDisabledReason::PublicInstallToken) => {
+            findings.push(PostureFinding {
+                title: "Vector config delivery is off: only a public install token is configured"
+                    .into(),
+                description: format!(
+                    "{DELIVERY_TOKEN_ENV} is not set and VECTOR_AUTH_TOKEN is a public default \
+                     value, so /api/internal/vector-config/* refuses every request: a public \
+                     token would let anyone download rendered Vector configs. Vector config \
+                     consumers cannot pick up new parser versions or ingest-token changes \
+                     until {DELIVERY_TOKEN_ENV} is set to a generated value \
+                     (`openssl rand -hex 32`) on nano-api, nano-jobs and every Vector config \
+                     consumer (install.sh and the Helm chart do this), or set \
+                     {DELIVERY_SWITCH_ENV}=off when nothing pulls config over HTTP."
+                ),
+                priority: "critical",
             });
         }
         _ => {}

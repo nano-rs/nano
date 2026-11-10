@@ -63,6 +63,31 @@ export function nplQuotedBody(value: string): string {
 }
 
 /**
+ * Body of an nPL `/…/` regex literal (e.g. `tree … root=/<body>/`, NAN-5159).
+ *
+ * A different grammar from the double-quoted string: the regex scanner
+ * (`parse_pattern_value` in `query/parser/commands_enrichment.rs`) treats a
+ * backslash as escaping the NEXT character and ends the literal at the first
+ * unescaped `/`. So a `/` in the value must become `\/` or everything after it
+ * is parsed as more pipeline. The escaped pair reaches the Rust `regex` crate
+ * unchanged, where `\/` is a literal `/`.
+ *
+ * Backslashes are doubled so a value ending in `\` cannot escape the
+ * closing slash, and so a literal backslash stays literal in the regex (`\\`).
+ * `"` needs no handling here (it is inert inside `/…/`); newlines are stripped
+ * so the query stays one line.
+ */
+export function nplRegexBody(value: string): string {
+  let out = '';
+  for (const ch of value) {
+    if (ch === '\n' || ch === '\r') continue;
+    if (ch === '\\' || ch === '/') out += '\\';
+    out += ch;
+  }
+  return out;
+}
+
+/**
  * [`nplQuotedBody`] wrapped in the double quotes it is designed for.
  *
  * Prefer this over hand-writing `` `"${nplQuotedBody(v)}"` `` so the quoting

@@ -7,6 +7,7 @@ mod eval_not;
 mod leading_command;
 mod quoting;
 mod syntax_fixes;
+mod tree_root_regex;
 
 use crate::query::{parse_query, Command, Query};
 // NAN-1580 retro-hunt parser tests use these AST types directly.

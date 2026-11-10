@@ -16,6 +16,33 @@ impl ClickHouseMigrator {
     pub(super) const DISTRIBUTED_TABLES: &'static [&'static str] =
         crate::db::dual_pool::DISTRIBUTED_TABLES;
 
+    /// NAN-5203: write-only Distributed wrappers over the shard-local
+    /// `ENGINE=Null` landing tables. A writer that cannot pick a shard itself
+    /// (the static OTLP Vector sinks, Tenzir's single native connection) inserts
+    /// `<raw>_distributed`; ClickHouse splits each batch by the content key in
+    /// [`sharding_key_for`] and forwards each slice to that shard's raw table,
+    /// whose materialized view then writes shard-local storage. Inserting the
+    /// raw table directly instead leaves every row on whichever node received
+    /// the batch. Reading these wrappers returns nothing (Null underneath), so
+    /// they are deliberately NOT in the read-routing `DISTRIBUTED_TABLES`.
+    /// Created and column-reconciled by the same cluster-gated passes; absent on
+    /// single-node, and a missing source (UDM profile has no `ocsf_logs_raw`)
+    /// is skipped. A wrapper fills omitted columns from its OWN defaults on the
+    /// receiving node before splitting, so [`write_wrapper_columns`] narrows a
+    /// wrapper to the columns writers send when the source has per-row random
+    /// defaults, and default drift recreates these wrappers (NAN-5203 M2).
+    pub(super) const INGEST_WRITE_WRAPPER_SOURCES: &'static [&'static str] =
+        &["otel_spans_raw", "otel_metrics_raw", "ocsf_logs_raw"];
+
+    /// Every table that gets a `<table>_distributed` wrapper: the read-routing
+    /// set plus the write-only ingest landing wrappers.
+    pub(super) fn wrapper_sources() -> impl Iterator<Item = &'static str> {
+        Self::DISTRIBUTED_TABLES
+            .iter()
+            .chain(Self::INGEST_WRITE_WRAPPER_SOURCES)
+            .copied()
+    }
+
     /// ALIAS / MATERIALIZED columns that must be re-applied to Distributed
     /// wrappers after they've been added to the underlying local table.
     ///
@@ -373,7 +400,7 @@ impl ClickHouseMigrator {
 
         let mut created = 0;
 
-        for table in Self::DISTRIBUTED_TABLES {
+        for table in Self::wrapper_sources() {
             let dist_name = format!("{}_distributed", table);
 
             // Check if distributed table already exists. NOTE: this is a
@@ -416,14 +443,28 @@ impl ClickHouseMigrator {
                 continue;
             }
 
-            let sql = Self::distributed_create_sql(
-                &self.database,
-                &dist_name,
-                &on_cluster,
-                &cluster_name,
-                table,
-                sharding_key_for(table),
-            );
+            let sql = match write_wrapper_columns(table) {
+                None => Self::distributed_create_sql(
+                    &self.database,
+                    &dist_name,
+                    &on_cluster,
+                    &cluster_name,
+                    table,
+                    sharding_key_for(table),
+                ),
+                Some(_) => {
+                    let specs = self.column_specs(table).await?;
+                    narrow_wrapper_create_sql(
+                        &self.database,
+                        &dist_name,
+                        &on_cluster,
+                        &cluster_name,
+                        table,
+                        sharding_key_for(table),
+                        &wrapper_source_specs(table, specs),
+                    )
+                }
+            };
 
             match self.client.query(&sql).execute().await {
                 Ok(_) => {
@@ -476,6 +517,24 @@ impl ClickHouseMigrator {
             table = table,
             key = sharding_key,
         )
+    }
+
+    /// `(name, type, default_kind, default_expression)` for every column of
+    /// `table`, in position order.
+    async fn column_specs(
+        &mut self,
+        table: &str,
+    ) -> Result<Vec<(String, String, String, String)>, ClickHouseMigrateError> {
+        self.client
+            .query(&format!(
+                "SELECT name, type, default_kind, default_expression \
+                 FROM system.columns WHERE database = '{}' AND \"table\" = '{}' \
+                 ORDER BY position",
+                self.database, table
+            ))
+            .fetch_all()
+            .await
+            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))
     }
 
     /// Sync ALIAS / MATERIALIZED columns from local tables onto their existing
@@ -636,7 +695,7 @@ impl ClickHouseMigrator {
         };
 
         let mut changed = 0;
-        for table in Self::DISTRIBUTED_TABLES {
+        for table in Self::wrapper_sources() {
             let dist_name = format!("{}_distributed", table);
 
             // Wrapper must exist (created by ensure_distributed_tables in
@@ -675,6 +734,9 @@ impl ClickHouseMigrator {
             if source_specs.is_empty() {
                 continue;
             }
+            // NAN-5203: a narrow write wrapper only ever carries its allowlist,
+            // so the ADD pass below can never put `id`/`timestamp` back.
+            let source_specs = wrapper_source_specs(table, source_specs);
 
             // ── Drift repair: DROP + recreate the wrapper (M-1/D4 + C4/W2) ──
             // Wrappers are metadata-only, so a recreate is cheap and, because it
@@ -713,8 +775,13 @@ impl ClickHouseMigrator {
                 .map(|cq| !wrapper_sharding_key_matches(cq, intended_key))
                 .unwrap_or(false);
             let type_drift = columns_type_drift(&dist_specs, &source_specs);
+            // NAN-5203 M2: a write wrapper evaluates DEFAULTs itself for the
+            // columns a writer omits, so a raw-table `MODIFY COLUMN ... DEFAULT`
+            // must reach it. Read wrappers keep ignoring expressions (above).
+            let default_drift = Self::INGEST_WRITE_WRAPPER_SOURCES.contains(&table)
+                && columns_default_drift(&dist_specs, &source_specs);
 
-            if key_drift || type_drift {
+            if key_drift || type_drift || default_drift {
                 let drop_sql = format!(
                     "DROP TABLE IF EXISTS {db}.{dist}{on_cluster}{sync}",
                     db = self.database,
@@ -724,14 +791,26 @@ impl ClickHouseMigrator {
                     // node's wrapper is gone before we recreate.
                     sync = if on_cluster.is_empty() { "" } else { " SYNC" },
                 );
-                let create_sql = Self::distributed_create_sql(
-                    &self.database,
-                    &dist_name,
-                    &on_cluster,
-                    &cluster_name,
-                    table,
-                    intended_key,
-                );
+                let create_sql = if write_wrapper_columns(table).is_some() {
+                    narrow_wrapper_create_sql(
+                        &self.database,
+                        &dist_name,
+                        &on_cluster,
+                        &cluster_name,
+                        table,
+                        intended_key,
+                        &source_specs,
+                    )
+                } else {
+                    Self::distributed_create_sql(
+                        &self.database,
+                        &dist_name,
+                        &on_cluster,
+                        &cluster_name,
+                        table,
+                        intended_key,
+                    )
+                };
                 let drop_res = self
                     .client
                     .query(&drop_sql)
@@ -750,11 +829,12 @@ impl ClickHouseMigrator {
                 match recreate_res {
                     Ok(_) => {
                         tracing::info!(
-                            "Recreated distributed wrapper {}.{} (key_drift={}, type_drift={}, sharding key {})",
+                            "Recreated distributed wrapper {}.{} (key_drift={}, type_drift={}, default_drift={}, sharding key {})",
                             self.database,
                             dist_name,
                             key_drift,
                             type_drift,
+                            default_drift,
                             intended_key
                         );
                         changed += 1;
@@ -1120,6 +1200,80 @@ pub(super) fn build_add_column_clause(
     }
 }
 
+/// Columns a write-only ingest wrapper forwards, or `None` for every source
+/// column (NAN-5203).
+///
+/// A Distributed table fills the columns an INSERT omits from its own DEFAULTs
+/// on the receiving node, before it splits the batch. `ocsf_logs_raw` defaults
+/// `id` to `generateUUIDv7()` and `timestamp` to `now64()` when an event has no
+/// `time`, so a wrapper carrying them forwards a different block on every retry
+/// and the target shard's insert dedup misses (measured: an identical batch
+/// sent twice stored 2x rows). Leaving them off the wrapper lets each shard's
+/// raw table mint them after its dedup hash, exactly like a direct insert. The
+/// allowlist is what writers send: Tenzir/direct `{event, source_type}` plus
+/// Vector's `future_timestamp_skew_seconds`.
+pub(super) fn write_wrapper_columns(table: &str) -> Option<&'static [&'static str]> {
+    match table {
+        "ocsf_logs_raw" => Some(&["event", "source_type", "future_timestamp_skew_seconds"]),
+        _ => None,
+    }
+}
+
+/// Restrict source column specs to a narrow write wrapper's allowlist (no-op
+/// for every other table). Keeps source order.
+pub(super) fn wrapper_source_specs(
+    table: &str,
+    specs: Vec<(String, String, String, String)>,
+) -> Vec<(String, String, String, String)> {
+    match write_wrapper_columns(table) {
+        None => specs,
+        Some(allowed) => specs
+            .into_iter()
+            .filter(|(name, ..)| allowed.contains(&name.as_str()))
+            .collect(),
+    }
+}
+
+/// `CREATE TABLE ... (<explicit columns>) ENGINE = Distributed(...)` for a
+/// narrow write wrapper, from the (already allowlisted) source specs.
+pub(super) fn narrow_wrapper_create_sql(
+    db: &str,
+    dist_name: &str,
+    on_cluster: &str,
+    cluster_name: &str,
+    table: &str,
+    sharding_key: &str,
+    specs: &[(String, String, String, String)],
+) -> String {
+    let columns = specs
+        .iter()
+        .map(|(name, typ, kind, expr)| build_add_column_clause(name, typ, kind, expr))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CREATE TABLE IF NOT EXISTS {db}.{dist_name}{on_cluster} ({columns}) \
+         ENGINE = Distributed('{cluster_name}', '{db}', '{table}', {sharding_key})"
+    )
+}
+
+/// True when a column present on both sides has a different DEFAULT kind or
+/// expression (NAN-5203 M2). Only meaningful for write wrappers, which evaluate
+/// those defaults themselves.
+pub(super) fn columns_default_drift(
+    wrapper_specs: &[(String, String, String, String)],
+    source_specs: &[(String, String, String, String)],
+) -> bool {
+    let source: std::collections::HashMap<&str, (&str, &str)> = source_specs
+        .iter()
+        .map(|(n, _, k, e)| (n.as_str(), (k.as_str(), e.as_str())))
+        .collect();
+    wrapper_specs.iter().any(|(n, _, k, e)| {
+        source
+            .get(n.as_str())
+            .is_some_and(|(sk, se)| *sk != k.as_str() || *se != e.as_str())
+    })
+}
+
 /// The Distributed-wrapper sharding key for `table` (NAN-1728 C4/W2).
 ///
 /// The sharding key is evaluated per row only for INSERTs routed **through** the
@@ -1147,10 +1301,25 @@ pub(super) fn build_add_column_clause(
 ///     table (by a materialized view or a single-writer scheduler), never through
 ///     the wrapper, so the wrapper's sharding key is never exercised. Keep
 ///     `rand()`; there is no cross-connection retry-dedup hazard to defend.
+///   - NAN-5203 write-only landing wrappers ([`ClickHouseMigrator::INGEST_WRITE_WRAPPER_SOURCES`]),
+///     which ARE written through: `otel_spans_raw` keeps a whole trace on one
+///     shard (`traceId`, falling back to the event so trace-less spans don't
+///     pile onto one shard); `otel_metrics_raw` hashes the event for balance
+///     (metric rollups re-aggregate across shards on read, so locality is not
+///     a correctness concern); `ocsf_logs_raw` hashes what the writer sent
+///     (`event`, `source_type`). Each is a pure function of the sent row, so a
+///     retried batch splits the same way and each shard's slice is byte-equal.
 pub(super) fn sharding_key_for(table: &str) -> &'static str {
     match table {
         "logs" | "ocsf_logs" | "signals" | "ingestion_errors" => "cityHash64(id)",
+        "ocsf_logs_raw" => "cityHash64(event, source_type)",
         "otel_spans" | "otel_spans_trace_id_ts" => "cityHash64(trace_id)",
+        // Byte-identical to ClickHouse's own formatting of the expression, so
+        // `wrapper_sharding_key_matches` sees no drift on the next migrate.
+        "otel_spans_raw" => {
+            "cityHash64(if(JSONExtractString(event, 'traceId') != '', lower(JSONExtractString(event, 'traceId')), event))"
+        }
+        "otel_metrics_raw" => "cityHash64(event)",
         _ => "rand()",
     }
 }

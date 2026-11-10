@@ -59,6 +59,38 @@ pub struct LicenseStatusResponse {
     pub notice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entitlement: Option<LicenseEntitlementResponse>,
+    /// NAN-5194: the licence server refused this deployment's token (HTTP
+    /// 401/403) at the last check-in attempt. Hosted (online) mode only;
+    /// omitted otherwise, and cleared by the next successful check-in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_rejected: Option<TokenRejectedResponse>,
+}
+
+/// NAN-5194: admin banner data for a rejected licence token. Never contains
+/// the token.
+#[derive(Debug, Serialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct TokenRejectedResponse {
+    /// HTTP status the licence server answered (401 or 403).
+    pub http_status: u16,
+    pub first_rejected_at: String,
+    pub last_rejected_at: String,
+    /// When the install locks (14 days after the last successful check-in);
+    /// omitted when it never checked in successfully.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locks_at: Option<String>,
+    pub message: String,
+}
+
+impl From<nanosiem_core::license::TokenRejectedNotice> for TokenRejectedResponse {
+    fn from(notice: nanosiem_core::license::TokenRejectedNotice) -> Self {
+        Self {
+            http_status: notice.http_status,
+            first_rejected_at: notice.first_rejected_at.to_rfc3339(),
+            last_rejected_at: notice.last_rejected_at.to_rfc3339(),
+            locks_at: notice.locks_at.map(|at| at.to_rfc3339()),
+            message: notice.message,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -140,6 +172,7 @@ impl LicenseStatusResponse {
             components: view.components.clone(),
             notice: view.notice.clone(),
             entitlement: LicenseEntitlementResponse::from_status(&cached, Utc::now()),
+            token_rejected: None,
         }
     }
 
@@ -171,6 +204,7 @@ impl LicenseStatusResponse {
                 components: Vec::new(),
                 notice: snapshot.notice().map(str::to_owned),
                 entitlement: None,
+                token_rejected: None,
             };
         }
         Self {
@@ -196,6 +230,7 @@ impl LicenseStatusResponse {
             components: Vec::new(),
             notice: None,
             entitlement: None,
+            token_rejected: None,
         }
     }
 }
@@ -311,6 +346,16 @@ pub async fn get_license_status(
         .read()
         .await
         .effective(now);
+    // NAN-5194: the check-in loop runs in nanosiem-jobs, so the rejection is
+    // read from the shared cached row. A read failure only hides the banner.
+    let token_rejected = nanosiem_core::license::LicenseRepository::new(state.pool.clone())
+        .get_token_rejected_notice()
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "Licence token rejection unavailable");
+            None
+        })
+        .map(TokenRejectedResponse::from);
     Ok(Json(LicenseStatusResponse {
         state: status.state.as_str().to_string(),
         valid: status.valid,
@@ -334,6 +379,7 @@ pub async fn get_license_status(
         components: Vec::new(),
         notice: None,
         entitlement: LicenseEntitlementResponse::from_status(&status, now),
+        token_rejected,
     }))
 }
 
@@ -602,6 +648,7 @@ pub async fn get_update_status(
     components(schemas(
         LicenseStatusResponse,
         LicenseEntitlementResponse,
+        TokenRejectedResponse,
         UpdateStatusResponse,
         ClockRecoveryRequest,
         ErrorResponse

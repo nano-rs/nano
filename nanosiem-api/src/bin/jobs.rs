@@ -155,11 +155,20 @@ async fn async_main() -> Result<()> {
             online.deployment_id,
             86400, // 24 hours
         );
-        let license_checker = Arc::new(LicenseChecker::new(
+        let license_checker = LicenseChecker::new(
             license_checker_config,
             state.pool.clone(),
             state.license_status.clone(),
-        ));
+        );
+        // NAN-5170: the jobs checker (the 24h loop) sends the daily usage
+        // report after each successful check-in. Air-gapped installs never
+        // reach this branch (no online licence), and are guarded regardless.
+        let license_checker = Arc::new(if state.config.airgap {
+            license_checker
+        } else {
+            license_checker
+                .with_usage_reporting(state.pool.clone(), Some(state.audit_emitter.clone()))
+        });
         if let Err(error) = license_checker.initialize().await {
             tracing::error!(%error, "Initial online licence check failed; licensed workers remain fail-closed without a successful bounded cache");
         }

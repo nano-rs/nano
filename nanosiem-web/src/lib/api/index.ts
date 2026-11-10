@@ -82,6 +82,32 @@ export interface UpdateStatusResponse {
   upgrade_url: string | null;
 }
 
+/** NAN-5170: one completed UTC day of total ingest, decimal GB rounded to 0.1. */
+export interface UsageDay {
+  day: string;
+  gb: number;
+}
+
+/** NAN-5170: one transmission of daily totals to nano. */
+export interface UsageReportRecord {
+  sent_at: string;
+  days: UsageDay[];
+  outcome: 'accepted' | 'not_supported' | 'rejected' | 'failed';
+  http_status?: number;
+}
+
+/** NAN-5170: `GET /api/license/usage` (enterprise, `settings:system`). */
+export interface LicenseUsageResponse {
+  mode: 'online' | 'offline' | 'airgap';
+  reporting_enabled: boolean;
+  explanation: string;
+  last_reported_day: string | null;
+  reports: UsageReportRecord[];
+  pending: UsageDay[];
+  local_days: UsageDay[];
+  capacity_gb_per_day: number | null;
+}
+
 export interface LicenseStatusResponse {
   state: 'active' | 'grace_period' | 'locked';
   valid: boolean;
@@ -118,6 +144,15 @@ export interface LicenseStatusResponse {
     revision: number;
     days_remaining: number;
     warning_days?: 14 | 7 | 1 | 0 | null;
+  };
+  /** NAN-5194: the licence server refused the token at the last check-in. */
+  token_rejected?: {
+    http_status: number;
+    first_rejected_at: string;
+    last_rejected_at: string;
+    /** 14 days after the last successful check-in; absent if there never was one. */
+    locks_at?: string;
+    message: string;
   };
 }
 
@@ -2731,6 +2766,16 @@ class ApiClient {
   // NAN-5114: whether a newer nano release is available (last licence check-in)
   async getUpdateStatus(): Promise<UpdateStatusResponse> {
     return this.request('/api/license/update');
+  }
+
+  // NAN-5170: what this deployment reported to nano + its local daily record
+  async getLicenseUsage(): Promise<LicenseUsageResponse> {
+    return this.request('/api/license/usage');
+  }
+
+  // NAN-5170: hashed daily usage record for an offline licence renewal
+  async exportLicenseUsage(): Promise<unknown> {
+    return this.request('/api/license/usage/export');
   }
 
   async importOfflineLicense(file: File, renewal: boolean): Promise<LicenseStatusResponse> {

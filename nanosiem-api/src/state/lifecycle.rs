@@ -526,6 +526,10 @@ impl AppState {
         handles.push(Arc::clone(&self.disk_pressure_service).start(self.leader_fence.clone()));
         tracing::info!("Disk pressure scheduler started (leader-only)");
 
+        // NAN-5170: daily ingest metering (local `daily_usage` record).
+        handles.push(self.start_usage_meter());
+        tracing::info!("Daily usage meter started (leader-only, 15m interval)");
+
         // SIEM health check (AI-driven data quality analysis, every 12 hours)
         handles.push(self.start_siem_health_check_scheduler());
         tracing::info!("SIEM health check scheduler started (leader-only, 12h interval)");

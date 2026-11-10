@@ -70,6 +70,9 @@ pub const USER_DELETED: &str = "user_deleted";
 pub const USER_LOCKED: &str = "user_locked";
 /// User was unlocked
 pub const USER_UNLOCKED: &str = "user_unlocked";
+/// Failed sign-ins for one email across source addresses reached the alert
+/// threshold; further attempts for it are delayed (NAN-5149)
+pub const LOGIN_ACCOUNT_THROTTLED: &str = "login_account_throttled";
 /// User was disabled
 pub const USER_DISABLED: &str = "user_disabled";
 /// User was enabled
@@ -864,6 +867,8 @@ pub const LOOKUP_ROWS_ADDED: &str = "lookup_rows_added";
 pub const LOOKUP_ROW_UPDATED: &str = "lookup_row_updated";
 /// Lookup rows were deleted
 pub const LOOKUP_ROWS_DELETED: &str = "lookup_rows_deleted";
+/// A lookup ingestion job's fetch URL changed while it held stored auth headers
+pub const LOOKUP_INGESTION_URL_CHANGED: &str = "lookup_ingestion_url_changed";
 
 // =============================================================================
 // MFA Actions
@@ -1038,6 +1043,9 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
     MFA_ENFORCED_GLOBALLY,
     // Account lockout — once per lock transition, inherently low-volume.
     USER_LOCKED,
+    // Distributed sign-in failures for one email (NAN-5149) — once per
+    // episode, when the account-wide counter reaches the alert threshold.
+    LOGIN_ACCOUNT_THROTTLED,
     // API-key lifecycle — all authenticated, low-volume state changes
     // (create/delete/reset/enable/disable + permission/expiry/rate-limit
     // updates).
@@ -1099,6 +1107,7 @@ mod durable_classifier_tests {
             "mfa_backup_codes_regenerated",
             "mfa_enforced_globally",
             "user_locked",
+            "login_account_throttled",
             "apikey_created",
             "apikey_deleted",
             "apikey_reset",

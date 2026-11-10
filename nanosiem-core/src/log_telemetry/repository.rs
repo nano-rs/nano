@@ -14,13 +14,17 @@ use tracing::warn;
 
 use crate::search::service::source_scope_sql_predicate;
 
-use super::types::{BucketSize, HourlyPoint, SourceTypeStats};
+use super::types::{BucketSize, DailyIngestTotal, HourlyPoint, SourceTypeStats};
 use crate::db::TableNames;
 
 /// Name of the rollup table (passed through `TableNames::read` so it picks
 /// the `_distributed` wrapper in cluster mode).
 const ROLLUP_TABLE: &str = "logs_per_source_5m_v2";
 const ROLLUP_RETENTION_HOURS: i64 = 7 * 24;
+
+/// NAN-5170: arrival-time hourly ingest volume (clickhouse/194). Read through
+/// `TableNames::read` so a cluster reads the `_distributed` wrapper.
+const INGEST_VOLUME_TABLE: &str = "ingest_volume_1h";
 
 #[derive(Clone)]
 pub struct LogTelemetryRepository {
@@ -206,6 +210,38 @@ impl LogTelemetryRepository {
     }
 }
 
+impl LogTelemetryRepository {
+    /// NAN-5170: customer ingest per UTC calendar day of ARRIVAL over
+    /// `[from, to]` (inclusive), from `ingest_volume_1h` (platform-written
+    /// rows excluded). Days with no rows are absent.
+    pub async fn daily_ingest_totals(
+        &self,
+        from: chrono::NaiveDate,
+        to: chrono::NaiveDate,
+    ) -> Result<Vec<DailyIngestTotal>, RepoError> {
+        let sql = build_daily_ingest_sql(
+            &self.table_names.read(INGEST_VOLUME_TABLE),
+            crate::schema::active_log_telemetry_profile(),
+            from,
+            to,
+        );
+        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        Ok(parse_daily_totals(&rows))
+    }
+
+    /// NAN-5170: the first hour arrival metering observed anything (platform
+    /// rows included, which arrive continuously), or `None` when it has seen
+    /// nothing yet. The day containing it is only partly metered.
+    pub async fn ingest_meter_start(&self) -> Result<Option<DateTime<Utc>>, RepoError> {
+        let sql = build_ingest_meter_start_sql(
+            &self.table_names.read(INGEST_VOLUME_TABLE),
+            crate::schema::active_log_telemetry_profile(),
+        );
+        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        Ok(parse_ingest_meter_start(&rows))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RepoError {
     #[error("ClickHouse query failed: {0}")]
@@ -299,6 +335,74 @@ pub fn build_stats_all_sql(table: &str, profile: &str, window_hours: i64) -> Str
          GROUP BY source_type",
         profile = crate::sql_hygiene::escape_sql_string(profile),
     )
+}
+
+/// SQL for `daily_ingest_totals`. One WHERE (no explicit PREWHERE) carrying
+/// the UTC bounds; dates are rendered by chrono (never user input).
+pub fn build_daily_ingest_sql(
+    table: &str,
+    profile: &str,
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+) -> String {
+    let end = to.succ_opt().unwrap_or(to);
+    format!(
+        "SELECT \
+            toString(toDate(received_hour, 'UTC')) AS day, \
+            sum(events) AS events, \
+            sum(bytes) AS bytes \
+         FROM {table} \
+         WHERE received_hour >= toDateTime('{from} 00:00:00', 'UTC') \
+           AND received_hour < toDateTime('{end} 00:00:00', 'UTC') \
+           AND schema_profile = '{profile}' \
+           AND platform = 0 \
+         GROUP BY day \
+         ORDER BY day",
+        from = from.format("%Y-%m-%d"),
+        end = end.format("%Y-%m-%d"),
+        profile = crate::sql_hygiene::escape_sql_string(profile),
+    )
+}
+
+/// SQL for `ingest_meter_start`.
+pub fn build_ingest_meter_start_sql(table: &str, profile: &str) -> String {
+    format!(
+        "SELECT count() AS rows, toString(min(received_hour)) AS first_hour \
+         FROM {table} \
+         WHERE schema_profile = '{profile}'",
+        profile = crate::sql_hygiene::escape_sql_string(profile),
+    )
+}
+
+/// Parse `ingest_meter_start`; an empty table yields `None`.
+pub fn parse_ingest_meter_start(body: &str) -> Option<DateTime<Utc>> {
+    let json = body
+        .lines()
+        .find(|line| !line.is_empty())
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())?;
+    if parse_u64(&json, "rows") == 0 {
+        return None;
+    }
+    parse_clickhouse_datetime(&json, "first_hour")
+}
+
+/// Parse `daily_ingest_totals` JSONEachRow rows; malformed lines are skipped.
+pub fn parse_daily_totals(body: &str) -> Vec<DailyIngestTotal> {
+    body.lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|json| {
+            let day = json
+                .get("day")
+                .and_then(|v| v.as_str())
+                .and_then(|v| chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").ok())?;
+            Some(DailyIngestTotal {
+                day,
+                events: parse_u64(&json, "events"),
+                bytes: parse_u64(&json, "bytes"),
+            })
+        })
+        .collect()
 }
 
 /// SQL for `buckets`. Server-side rebucketing via `bucket.group_expr()`.

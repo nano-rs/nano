@@ -60,7 +60,7 @@ pub enum ParserYamlError {
 
 /// Parse a parser.yaml string into a ParserYaml struct
 pub fn parse_parser_yaml(content: &str) -> Result<ParserYaml, ParserYamlError> {
-    let parsed: ParserYaml = serde_yaml::from_str(content)?;
+    let parsed: ParserYaml = crate::yaml_budget::from_str(content)?;
 
     if parsed.name.is_empty() {
         return Err(ParserYamlError::MissingField("name".to_string()));

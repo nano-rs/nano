@@ -598,6 +598,12 @@ impl From<nanosiem_core::SourceConfigServiceError> for ApiError {
             nanosiem_core::SourceConfigServiceError::CredentialUseRequired => {
                 ApiError::Forbidden("Missing permission: credentials:use".to_string())
             }
+            nanosiem_core::SourceConfigServiceError::CredentialRetargetRequired => {
+                ApiError::Forbidden(
+                    "Missing permission: credentials:edit (required to bind a stored credential to a source, or to change the connection host of a source that uses one)"
+                        .to_string(),
+                )
+            }
             nanosiem_core::SourceConfigServiceError::IoError(e) => {
                 ApiError::InternalError(format!("IO error: {}", e))
             }

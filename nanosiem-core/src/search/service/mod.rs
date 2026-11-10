@@ -86,6 +86,8 @@ pub(crate) const FIELD_STATS_ROW_CAP: usize = 100_000;
 /// page from within that bounded output.
 pub(super) const AGGREGATE_OUTPUT_CAP: usize = 1_000_000;
 mod histogram;
+#[cfg(test)]
+mod histogram_tests;
 mod ioc_lookup_resolve;
 mod lateral;
 mod metrics_routing;

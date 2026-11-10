@@ -31,6 +31,8 @@ on:
       - tools/tests/**
       - scripts/tests/install-edition.test.sh
       - scripts/tests/install-api-call.test.sh
+      - scripts/tests/install-image-pull.test.sh
+      - scripts/lib/image-pull.sh
       - scripts/tests/install-umask.test.sh
       - scripts/tests/install-umask.live.sh
       - scripts/tests/install-resource-sizing.test.sh
@@ -109,6 +111,16 @@ jobs:
             bash scripts/tests/install-api-call.test.sh
           else
             echo "install api-call test not in this tree (public mirror); skipping"
+          fi
+
+      # NAN-5197: present images are never pulled; missing ones are bounded,
+      # retried, and fail naming the image and registry.
+      - name: install.sh bounded image pull
+        run: |
+          if [ -f scripts/tests/install-image-pull.test.sh ]; then
+            bash scripts/tests/install-image-pull.test.sh
+          else
+            echo "install-image-pull test not in this tree (public mirror); skipping"
           fi
 
       # NAN-5006: prove the documented streamed installer cannot lose its

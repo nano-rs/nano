@@ -22,9 +22,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer-core';
 
-const BASE = (process.env.E2E_UI_BASE || '').replace(/\/$/, '');
+// Mutable so an in-process importer (ui/playbooks/*) can point it at a stack.
+let BASE = (process.env.E2E_UI_BASE || '').replace(/\/$/, '');
+export function setBase(url) { BASE = String(url || '').replace(/\/$/, ''); }
 const TIMEOUT = 20_000;
 const VIEWPORT = { width: 1600, height: 2400 }; // tall: result lists are virtualized
 
@@ -717,7 +720,20 @@ const OPS = {
   },
 };
 
+// In-process use (ui/playbooks/*): the same ops and DOM helpers, no stdin loop.
+export { OPS, sess, find, count, texts, click, waitText, waitUrl, until, sleep, inject, addSecret, scrub, maskSecrets, chromePath };
+export async function closeBrowser() {
+  for (const { ctx } of sessions.values()) await ctx.close().catch(() => {});
+  sessions.clear();
+  if (browser) await browser.close().catch(() => {});
+  browser = undefined;
+}
+
+const IS_MAIN = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (IS_MAIN) runProtocol();
+
 // ------------------------------------------------------------------ loop
+function runProtocol() {
 const rl = readline.createInterface({ input: process.stdin });
 const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
 let chain = Promise.resolve();
@@ -759,3 +775,4 @@ process.once('unhandledRejection', (error) => {
   process.stderr.write(`${scrub(error?.stack || error)}\n`);
   void shutdown(1);
 });
+}

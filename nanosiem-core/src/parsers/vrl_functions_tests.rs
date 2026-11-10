@@ -210,3 +210,47 @@ async fn content_repo_parsers_compile_against_the_allowlist() {
     }
     assert!(checked > 0, "no parser.yaml found");
 }
+
+const DECOMPRESSORS: [&str; 5] = ["decode_gzip", "decode_zlib", "decode_zstd", "decode_snappy", "decode_lz4"];
+
+/// NAN-5141: the in-process test/preview paths run VRL inside the API
+/// process, where an unbounded decompression call cannot be interrupted.
+/// Every decompressor is refused at compile time (both registries), so a
+/// test request is a validation failure that never executes.
+#[tokio::test]
+async fn decompression_functions_are_refused_in_every_in_process_path() {
+    let enrichment: Vec<_> = VrlRegistry::Enrichment.functions().iter().map(|f| f.identifier()).collect();
+    for name in DECOMPRESSORS {
+        assert!(PARSER_EXCLUDED_VRL_FUNCTIONS.contains(&name), "{name}");
+        assert!(!enrichment.contains(&name), "{name} offered to enrichment lanes");
+        let code = format!(".udm = {{}}\n.udm.body = {name}!(decode_base64!(.message))\n");
+        let sample = r#"{"message":"KLUv/QBYAQAAeA=="}"#;
+        let validator = super::VrlValidator::new();
+        let validated = validator.validate_vrl(&code).await.unwrap();
+        assert!(!validated.valid, "{name}: {validated:?}");
+        assert!(validated.error.as_deref().unwrap_or("").contains("E105"), "{validated:?}");
+        let tested = validator.test_vrl(&code, sample).await.unwrap();
+        assert!(!tested.success && tested.output.is_none(), "{name}: {tested:?}");
+        let chained = validator.test_vrl_chain(&[&code], sample).await.unwrap();
+        assert!(!chained.success && chained.output.is_none(), "{name}: {chained:?}");
+        assert!(super::vrl_guard::compile(&code, &parser_vrl_functions()).is_err(), "{name}");
+        assert!(
+            super::VrlValidator::for_enrichment().test_vrl(&code, sample).await.map(|r| !r.success).unwrap_or(true),
+            "{name} ran under the enrichment registry"
+        );
+        assert!(!vrl_function_catalog().lines().any(|l| l.starts_with(&format!("{name}("))), "{name}");
+    }
+}
+
+/// The legitimate shape on the same path still compiles and runs.
+#[tokio::test]
+async fn ordinary_parser_still_runs_on_the_test_path() {
+    let code = ".udm = {}\n.udm.user = downcase(string!(.user))\n.udm.raw = decode_base64!(.b64)\n";
+    let sample = r#"{"user":"ALICE","b64":"aGVsbG8="}"#;
+    let validator = super::VrlValidator::new();
+    let tested = validator.test_vrl_chain(&[code], sample).await.unwrap();
+    assert!(tested.success, "{tested:?}");
+    let output = tested.output.expect("output");
+    assert_eq!(output["udm"]["user"], "alice");
+    assert_eq!(output["udm"]["raw"], "hello");
+}

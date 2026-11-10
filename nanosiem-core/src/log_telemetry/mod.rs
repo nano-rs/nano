@@ -16,4 +16,4 @@ pub mod types;
 
 pub use repository::LogTelemetryRepository;
 pub use service::{LogTelemetryError, LogTelemetryService};
-pub use types::{BucketSize, HourlyPoint, SourceTypeStats};
+pub use types::{BucketSize, DailyIngestTotal, HourlyPoint, SourceTypeStats};

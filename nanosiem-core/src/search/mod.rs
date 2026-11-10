@@ -29,6 +29,8 @@ mod query_tracking;
 pub mod request_actor;
 #[cfg(test)]
 mod request_timing_tests;
+#[cfg(test)]
+mod client_error_message_tests;
 pub mod settled_reuse;
 pub mod service;
 pub mod streaming;
@@ -81,7 +83,7 @@ pub use service::{RawSqlAuditAccess, SearchService};
 pub use service::prevalence_where_sql;
 pub use streaming::{is_query_streamable, SearchStreamEvent, StreamingChunk};
 pub use types::{
-    parse_clickhouse_error, AssetEventFilters, AssetFacets, AssetPagination, CloudEventFilters,
+    client_error_message, parse_clickhouse_error, AssetEventFilters, AssetFacets, AssetPagination, CloudEventFilters,
     CloudFacets, CloudUserActivity, CloudUserSessionSummary, DisplayType, EntityCrossReference,
     FieldInfo, FieldStatistics, FieldValueInfo, HistogramBucket, QueryWarningOutput, RawSqlRequest,
     RetroFeedCandidate, RetroHuntHit, RetroIndicatorSummary, RetroListRow, RetroPivotRow,

@@ -6877,6 +6877,7 @@ export interface TierWarning {
   resource: string;
   current: number;
   limit: number;
+  /** True percentage, not capped at 100 (NAN-5170): 3846 means 3,846%. */
   percent_used: number;
   message: string;
 }

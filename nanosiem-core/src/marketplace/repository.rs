@@ -442,6 +442,34 @@ impl MarketplaceRepository {
         Ok(removed)
     }
 
+    /// NAN-5145: true when the catalog slug derived from `name` is held by a
+    /// row the given custom enrichment does not own (any non-custom row, or a
+    /// custom row linked to a different enrichment, a custom collector, or an
+    /// unlinked custom row that still holds stored credentials). `custom_enrichment_id` is
+    /// `None` on create, before the enrichment exists. Lets callers reject a
+    /// colliding name before writing anything.
+    #[instrument(skip(self))]
+    pub async fn custom_enrichment_slug_taken(
+        &self,
+        name: &str,
+        custom_enrichment_id: Option<Uuid>,
+    ) -> Result<bool, MarketplaceError> {
+        let slug = custom_slug(name);
+        let taken: Option<(i32,)> = sqlx::query_as(
+            "SELECT 1 FROM marketplace_catalog WHERE slug = $1 \
+             AND NOT (source_type = 'custom' \
+                      AND execution_backend = 'deno' \
+                      AND category IN ('data', 'agent') \
+                      AND ((custom_enrichment_id IS NULL AND credentials_encrypted IS NULL) \
+                           OR COALESCE(custom_enrichment_id = $2, false)))",
+        )
+        .bind(&slug)
+        .bind(custom_enrichment_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(taken.is_some())
+    }
+
     /// Create a marketplace catalog entry for a user-created custom enrichment
     #[instrument(skip(self))]
     pub async fn create_catalog_for_custom_enrichment(
@@ -455,10 +483,7 @@ impl MarketplaceRepository {
         config: &serde_json::Value,
         credential_id: Option<Uuid>,
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
-        let slug = name
-            .to_lowercase()
-            .replace(' ', "-")
-            .replace(|c: char| !c.is_alphanumeric() && c != '-', "");
+        let slug = custom_slug(name);
         let category = match enrichment_type {
             "data" => "data",
             _ => "agent",
@@ -500,6 +525,23 @@ impl MarketplaceRepository {
                 config = EXCLUDED.config,
                 custom_enrichment_id = EXCLUDED.custom_enrichment_id,
                 updated_at = NOW()
+            -- NAN-5145: a custom enrichment only ever rewrites its own catalog
+            -- row. A marketplace/repository/system row (which may be installed
+            -- and hold stored credentials) or another custom enrichment's row
+            -- is never touched; the guard then matches nothing, RETURNING is
+            -- empty, and the caller gets SlugAlreadyExists.
+            -- An unlinked custom row (its enrichment was deleted, which
+            -- SET NULLs the link) is adoptable only while it holds no stored
+            -- credentials.
+            -- Only deno data/agent rows (what this function writes) qualify:
+            -- custom collectors are also unlinked and credential-less here
+            -- (their credentials live on connections) but are never adoptable.
+            WHERE marketplace_catalog.source_type = 'custom'
+              AND marketplace_catalog.execution_backend = 'deno'
+              AND marketplace_catalog.category IN ('data', 'agent')
+              AND ((marketplace_catalog.custom_enrichment_id IS NULL
+                    AND marketplace_catalog.credentials_encrypted IS NULL)
+                   OR marketplace_catalog.custom_enrichment_id = EXCLUDED.custom_enrichment_id)
             RETURNING *
             "#,
         )
@@ -512,9 +554,10 @@ impl MarketplaceRepository {
         .bind(code)
         .bind(allowed_domains)
         .bind(&catalog_config)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .map_err(MarketplaceError::Database)?;
+        .map_err(MarketplaceError::Database)?
+        .ok_or_else(|| MarketplaceError::SlugAlreadyExists(slug.clone()))?;
 
         self.hydrate_with_run_state(Self::hydrate(result)).await
     }

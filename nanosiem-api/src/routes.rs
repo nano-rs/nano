@@ -697,6 +697,17 @@ pub fn create_router(state: AppState) -> Router {
             .route(
                 "/api/license/clock-recovery",
                 post(handlers::license::apply_clock_recovery),
+            )
+            // NAN-5170: usage reported to nano + offline usage export
+            // (settings:system). Guard-exempt so a locked deployment can
+            // still see and export its record for renewal.
+            .route(
+                "/api/license/usage",
+                get(handlers::license_usage::get_license_usage),
+            )
+            .route(
+                "/api/license/usage/export",
+                get(handlers::license_usage::export_license_usage),
             );
     }
 

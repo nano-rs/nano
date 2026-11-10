@@ -51,3 +51,13 @@ impl BucketSize {
         }
     }
 }
+
+/// One UTC calendar day of ingested volume, by arrival time (NAN-5170).
+/// Platform-written rows (`audit`, `findings`) are excluded: they are not
+/// customer ingest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DailyIngestTotal {
+    pub day: chrono::NaiveDate,
+    pub events: u64,
+    pub bytes: u64,
+}

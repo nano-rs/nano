@@ -34,6 +34,41 @@ pub enum SavedSearchRepositoryError {
     NotFound(Uuid),
     #[error("Access denied")]
     AccessDenied,
+    /// Caller-supplied input the schema would reject (unknown visibility,
+    /// nonexistent group id). Safe to show the caller verbatim: it never
+    /// carries database text (NAN-5162).
+    #[error("{0}")]
+    InvalidInput(String),
+}
+
+/// The visibility values `saved_searches.visibility` accepts (migration 036
+/// CHECK constraint).
+pub const SAVED_SEARCH_VISIBILITIES: [&str; 3] = ["private", "public", "group"];
+
+/// Reject a visibility outside [`SAVED_SEARCH_VISIBILITIES`] before it reaches
+/// the CHECK constraint (NAN-5162).
+pub fn validate_saved_search_visibility(visibility: &str) -> Result<(), SavedSearchRepositoryError> {
+    if SAVED_SEARCH_VISIBILITIES.contains(&visibility) {
+        Ok(())
+    } else {
+        Err(SavedSearchRepositoryError::InvalidInput(format!(
+            "Invalid visibility '{}': must be one of private, public, group",
+            visibility.chars().take(32).collect::<String>()
+        )))
+    }
+}
+
+/// A group-id foreign-key violation raced past [`SavedSearchRepository::ensure_groups_exist`]
+/// (the group was deleted in between) maps to the same 400 as the up-front check.
+fn map_group_fk(e: sqlx::Error) -> SavedSearchRepositoryError {
+    if let sqlx::Error::Database(ref db) = e {
+        if db.constraint() == Some("saved_search_groups_group_id_fkey") {
+            return SavedSearchRepositoryError::InvalidInput(
+                "One or more group_ids do not exist".to_string(),
+            );
+        }
+    }
+    SavedSearchRepositoryError::DatabaseError(e)
 }
 
 /// Repository for saved search operations
@@ -54,6 +89,12 @@ impl SavedSearchRepository {
         user_id: Uuid,
     ) -> Result<SavedSearch, SavedSearchRepositoryError> {
         let visibility = search.visibility.as_deref().unwrap_or("private");
+        validate_saved_search_visibility(visibility)?;
+        if visibility == "group" {
+            if let Some(ref group_ids) = search.group_ids {
+                self.ensure_groups_exist(group_ids).await?;
+            }
+        }
 
         let result = sqlx::query_as::<_, SavedSearch>(
             r#"
@@ -84,12 +125,32 @@ impl SavedSearchRepository {
                     .bind(result.id)
                     .bind(group_id)
                     .execute(&self.pool)
-                    .await?;
+                    .await
+                    .map_err(map_group_fk)?;
                 }
             }
         }
 
         Ok(result)
+    }
+
+    /// Reject group ids that do not exist (NAN-5162). Existence only: which
+    /// groups an owner may share with is unchanged.
+    pub async fn ensure_groups_exist(&self, group_ids: &[Uuid]) -> Result<(), SavedSearchRepositoryError> {
+        if group_ids.is_empty() {
+            return Ok(());
+        }
+        let found: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM groups WHERE id = ANY($1)")
+            .bind(group_ids)
+            .fetch_all(&self.pool)
+            .await?;
+        if group_ids.iter().all(|id| found.contains(id)) {
+            Ok(())
+        } else {
+            Err(SavedSearchRepositoryError::InvalidInput(
+                "One or more group_ids do not exist".to_string(),
+            ))
+        }
     }
 
     /// Find a saved search by ID with access check
@@ -396,6 +457,15 @@ impl SavedSearchRepository {
             return Err(SavedSearchRepositoryError::AccessDenied);
         }
 
+        // NAN-5162: validate before any write, so a bad request neither leaks
+        // constraint text nor leaves the search half-updated.
+        validate_saved_search_visibility(&request.visibility)?;
+        if request.visibility == "group" {
+            if let Some(ref group_ids) = request.group_ids {
+                self.ensure_groups_exist(group_ids).await?;
+            }
+        }
+
         // Get current groups BEFORE the change (to track who loses access)
         let old_groups = self.get_shared_groups(id).await?;
         let old_group_ids: std::collections::HashSet<Uuid> =
@@ -457,7 +527,8 @@ impl SavedSearchRepository {
                     .bind(id)
                     .bind(group_id)
                     .execute(&self.pool)
-                    .await?;
+                    .await
+                    .map_err(map_group_fk)?;
                 }
             }
         }

@@ -82,6 +82,9 @@ x-nano-update-env: &nano-update-env
   CONNECTOR_EGRESS_PROXY_MODE:
   SOAR_EGRESS_PROXY_URL:
   SOAR_EGRESS_PROXY_MODE:
+  # Custom enrichment / collector sandbox egress (enterprise). Unset: direct
+  # and pinned; HTTPS_PROXY is never used for user-code destinations.
+  ENRICHMENT_EGRESS_PROXY_URL:
 
 services:
   postgres:

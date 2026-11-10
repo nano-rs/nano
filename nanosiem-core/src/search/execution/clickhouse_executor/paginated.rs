@@ -14,7 +14,7 @@ use super::sql_helpers::{
     wrap_aggregation_with_pagination, wrap_query_for_count, BoundedCountInput,
 };
 use super::types::ClickHouseExecutor;
-use crate::search::{parse_clickhouse_error, SearchError, StreamingChunk};
+use crate::search::{client_error_message, parse_clickhouse_error, SearchError, StreamingChunk};
 
 /// NAN-1645 (finding 3.5): companion queries (count / histogram) only run for
 /// the FIRST page of a paginated search.
@@ -416,10 +416,13 @@ impl ClickHouseExecutor {
                 Err(e) => {
                     let error_str = e.to_string();
                     tracing::error!("Error reading streaming ClickHouse chunk: {}", error_str);
+                    let parsed = parse_clickhouse_error(&error_str);
+                    // NAN-5161: the chunk error reaches the client as a stream
+                    // event; send the masked message, never the raw text.
                     let _ = chunk_tx
-                        .send(StreamingChunk::Error(error_str.clone()))
+                        .send(StreamingChunk::Error(client_error_message(&parsed)))
                         .await;
-                    return Err(parse_clickhouse_error(&error_str));
+                    return Err(parsed);
                 }
             }
         }

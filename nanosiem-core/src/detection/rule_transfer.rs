@@ -56,7 +56,16 @@ pub enum RuleImportParseError {
     Shape,
     #[error("Rule #{index} is invalid: {message}")]
     Rule { index: usize, message: String },
+    #[error("Rule file is too large ({size} bytes; the limit is {limit} bytes)")]
+    TooLarge { size: usize, limit: usize },
+    #[error("Invalid YAML rule file: it expands to far more content than it contains; YAML aliases are not supported in rule files")]
+    Expansion,
 }
+
+/// Largest rule file accepted for import, in bytes. Matches the API's
+/// default request-body limit, so a file the server can receive is never
+/// silently truncated, and nothing bigger is ever parsed.
+pub const MAX_RULE_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Resolve an import request's two accepted shapes to the rules to create.
 pub fn resolve_import_rules(
@@ -77,12 +86,16 @@ pub fn parse_rule_file(
     data: &str,
     format: RuleTransferFormat,
 ) -> Result<Vec<NewDetectionRule>, RuleImportParseError> {
+    if data.len() > MAX_RULE_FILE_BYTES {
+        return Err(RuleImportParseError::TooLarge { size: data.len(), limit: MAX_RULE_FILE_BYTES });
+    }
     let document: serde_json::Value = match format {
         RuleTransferFormat::Json => serde_json::from_str(data).map_err(|e| RuleImportParseError::Syntax {
             format: "JSON",
             message: e.to_string(),
         })?,
         RuleTransferFormat::Yaml => {
+            crate::yaml_budget::check(data).map_err(|_| RuleImportParseError::Expansion)?;
             let yaml: serde_yaml::Value = serde_yaml::from_str(data).map_err(|e| RuleImportParseError::Syntax {
                 format: "YAML",
                 message: e.to_string(),

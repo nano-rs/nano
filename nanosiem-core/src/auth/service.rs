@@ -20,6 +20,7 @@ use super::repository::{
     GroupRepository, GroupRepositoryError, SessionRepository, SessionRepositoryError,
     UserRepository, UserRepositoryError,
 };
+use super::login_throttle::{self, Claim, LoginThrottle};
 use super::token::{TokenError, TokenService};
 use crate::settings::local_auth::LocalAuthSettings;
 use super::types::{
@@ -56,6 +57,14 @@ pub enum AuthError {
 
     #[error("Account is locked. Please try again later.")]
     AccountLocked,
+
+    /// A failed password or MFA-code attempt that crossed a sign-in throttle
+    /// threshold (NAN-5149): `ip_locked` when it locked this (email, source
+    /// address) pair, `account_alert` when the account-wide failures reached
+    /// the alert threshold. Reported once per crossing so the handler can
+    /// audit it; clients see the same generic 401 as `InvalidCredentials`.
+    #[error("Invalid credentials")]
+    LoginThrottled { ip_locked: bool, account_alert: bool },
 
     #[error("Account is disabled")]
     AccountDisabled,
@@ -251,97 +260,68 @@ impl AuthService {
             return Err(AuthError::LocalPasswordDisabled);
         }
 
-        // Try to find the user by email
-        let user = match self.user_repo.get_user_by_email(email).await {
-            Ok(user) => user,
-            Err(UserRepositoryError::NotFoundByEmail(_)) => {
-                // SECURITY: Perform dummy password verification to prevent timing attacks
-                // This ensures the response time is similar whether user exists or not
+        // NAN-5149 / NAN-5150 / NAN-5066: credential-guessing throttle (see
+        // `login_throttle`). Everything is keyed on the normalised email
+        // STRING and runs before the account lookup, identically for known
+        // and unknown emails:
+        //  - a reservation in the (email, source address) lock bucket, then
+        //  - the per-email reserved-slot delay (atomic, so a concurrent burst
+        //    cannot all verify at once; never a hard account lock).
+        // A locked pair, or a slot too far ahead, burns the same single bcrypt
+        // as every other rejection and returns the same generic error, so a
+        // correct guess made while throttled is not confirmed.
+        let throttle = self.login_throttle();
+        let ip_key = login_throttle::account_ip_key(email, ip_address);
+        let ip_locks_on_failure = match throttle
+            .claim(
+                login_throttle::CATEGORY_ACCOUNT_IP,
+                &ip_key,
+                self.config.lockout_threshold,
+                self.config.lockout_duration,
+            )
+            .await
+            .map_err(throttle_db)?
+        {
+            Claim::Locked => {
                 let _ = verify_or_burn(password, None).await;
-
-                // Return generic error (Requirement 1.3)
                 return Err(AuthError::InvalidCredentials);
             }
-            Err(e) => return Err(e.into()),
+            Claim::Allowed { locks_on_failure } => locks_on_failure,
+        };
+        // The per-email delay reservation runs only for an address that is
+        // still within its lock budget, so a locked address cannot keep
+        // pushing the queue forward for everyone (NAN-5149 review).
+        if self.await_account_slot(&throttle, email).await? == SlotWait::BeyondHorizon {
+            let _ = verify_or_burn(password, None).await;
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        let user = match self.verify_local_password(email, password).await {
+            Ok(user) => user,
+            Err(AuthError::InvalidCredentials) => {
+                return Err(self.record_login_failure(email, ip_locks_on_failure).await);
+            }
+            Err(e) => return Err(e),
         };
 
-        // NAN-5036: every rejection below costs exactly one bcrypt verification
-        // (real hash when usable, DUMMY_BCRYPT_HASH otherwise). A passwordless
-        // SSO/JIT account, a `system` service account (empty hash) and a
-        // disabled/locked one must be indistinguishable by latency from an
-        // unknown email or a wrong password.
-
-        // Only `active` and `locked` accounts can sign in with a password;
-        // `disabled`, `system` and any unknown status are rejected generically.
-        if user.status != "active" && user.status != "locked" {
-            let _ = verify_or_burn(password, user.password_hash.as_deref()).await;
-            // SECURITY: Return generic error to prevent account status enumeration
-            return Err(AuthError::InvalidCredentials);
+        if user.mfa_enabled {
+            // NAN-5150: the password was right but a second factor is still
+            // owed. Give back this address's reservation without clearing it,
+            // and keep the account-wide counter, so code failures keep
+            // counting across challenges. Both clear once the code verifies.
+            throttle
+                .refund(
+                    login_throttle::CATEGORY_ACCOUNT_IP,
+                    &ip_key,
+                    self.config.lockout_threshold,
+                )
+                .await
+                .map_err(throttle_db)?;
+        } else {
+            // Successful login - reset failed attempts and update last login
+            self.user_repo.reset_failed_attempts(user.id).await?;
+            self.clear_throttle_after_success(email, &ip_key).await;
         }
-
-        // Check if account is locked (Requirement 1.5)
-        if self.is_account_locked(&user).await? {
-            let _ = verify_or_burn(password, user.password_hash.as_deref()).await;
-            // SECURITY: Return generic error to prevent account status enumeration
-            return Err(AuthError::InvalidCredentials);
-        }
-
-        // NAN-5027: an SSO-linked account signs in through its IdP. A leftover
-        // local password (set before the link, or on a tenant upgraded from a
-        // build that kept it) is not a second way in unless an administrator
-        // set the audited break-glass flag on the account.
-        if user.oidc_provider_id.is_some() && !user.local_login_break_glass {
-            let _ = verify_or_burn(password, None).await;
-            return Err(AuthError::InvalidCredentials);
-        }
-
-        // A passwordless account (SSO/JIT) burns the dummy and fails WITHOUT
-        // touching the failed-attempt counter: password spraying must not be
-        // able to throttle or lock an account that has no password at all.
-        if !user.password_hash.as_deref().is_some_and(is_usable_bcrypt_hash) {
-            let _ = verify_or_burn(password, None).await;
-            return Err(AuthError::InvalidCredentials);
-        }
-
-        // Verify password
-        let password_valid = verify_or_burn(password, user.password_hash.as_deref()).await?;
-
-        if !password_valid {
-            // Increment failed attempts and potentially lock account (Requirement 1.6)
-            let failed_attempts = self.user_repo.increment_failed_attempts(user.id).await?;
-
-            // M1: Use exponential backoff instead of hard lockout to prevent
-            // DoS via locking out admin accounts during active incidents.
-            // After 5+ failed attempts, delay doubles each time (max 5 min).
-            if failed_attempts >= self.config.lockout_threshold {
-                let exponent = (failed_attempts as u32)
-                    .saturating_sub(self.config.lockout_threshold as u32)
-                    .min(8);
-                let backoff_secs = std::cmp::min(2u64.pow(exponent), 300);
-                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-
-                // Signal the lock ONLY on the crossing attempt — the one whose
-                // increment first reaches the threshold — so the login handler
-                // audits user_locked exactly once per lock episode (the counter
-                // resets to 0 on the next successful login). Subsequent attempts
-                // against the already-throttled account still back off but fall
-                // through to the generic InvalidCredentials below, so they are not
-                // re-audited as fresh locks. `increment_failed_attempts` is an
-                // atomic DB increment returning the new value, so concurrent
-                // failures each see a distinct count and exactly one hits `==`.
-                // `from_auth_error` normalizes AccountLocked to the same generic
-                // 401 as InvalidCredentials (no account enumeration).
-                if failed_attempts == self.config.lockout_threshold {
-                    return Err(AuthError::AccountLocked);
-                }
-            }
-
-            // Return generic error (Requirement 1.3)
-            return Err(AuthError::InvalidCredentials);
-        }
-
-        // Successful login - reset failed attempts and update last login
-        self.user_repo.reset_failed_attempts(user.id).await?;
 
         // === MFA Check ===
         // If user has MFA enabled, issue a challenge token instead of full auth
@@ -489,6 +469,63 @@ impl AuthService {
         let secret = super::mfa::decrypt_secret(totp_encrypted, totp_nonce, encryption)
             .map_err(|e| AuthError::InternalError(e.to_string()))?;
 
+        // NAN-5150: every code attempt goes through the same throttle as the
+        // password step: the account-wide delay, the (email, source IP) lock,
+        // and a per-challenge budget so one challenge cannot be guessed from
+        // many addresses. A locked bucket revokes the challenge without
+        // checking the code.
+        let throttle = self.login_throttle();
+        let ip_key = login_throttle::account_ip_key(&user.email, ip_address);
+        let challenge_key = claims.jti.to_string();
+        let ip_locks_on_failure = match throttle
+            .claim(
+                login_throttle::CATEGORY_ACCOUNT_IP,
+                &ip_key,
+                self.config.lockout_threshold,
+                self.config.lockout_duration,
+            )
+            .await
+            .map_err(throttle_db)?
+        {
+            Claim::Locked => {
+                self.token_service.revoke_token(claims.jti, claims.exp).await;
+                return Err(AuthError::InvalidCredentials);
+            }
+            Claim::Allowed { locks_on_failure } => locks_on_failure,
+        };
+        // No per-email reserved-slot delay here: the code step is already
+        // bounded by the (email, address) lock above and the per-challenge
+        // budget below, and getting fresh code attempts needs a fresh
+        // challenge, which costs a password login that IS slot-delayed. Adding
+        // the delay here too would reject a legitimate user who fumbles codes
+        // and re-enters their password a few times.
+        let challenge_spent_on_failure = match throttle
+            .claim(
+                login_throttle::CATEGORY_MFA_CHALLENGE,
+                &challenge_key,
+                self.config.lockout_threshold,
+                login_throttle::MFA_CHALLENGE_WINDOW_SECS,
+            )
+            .await
+            .map_err(throttle_db)?
+        {
+            Claim::Locked => {
+                self.token_service.revoke_token(claims.jti, claims.exp).await;
+                return Err(AuthError::InvalidCredentials);
+            }
+            Claim::Allowed { locks_on_failure } => locks_on_failure,
+        };
+        // A wrong code: count it, and burn the challenge once this address or
+        // the challenge itself has used its budget.
+        let reject_code = || async {
+            if ip_locks_on_failure || challenge_spent_on_failure {
+                self.token_service.revoke_token(claims.jti, claims.exp).await;
+            }
+            Err(self
+                .record_login_failure(&user.email, ip_locks_on_failure)
+                .await)
+        };
+
         // Try TOTP verification first
         let totp_valid = super::mfa::verify_totp(&secret, &user.email, code).unwrap_or(false);
 
@@ -517,16 +554,24 @@ impl AuthService {
                         .await;
                 } else {
                     // Neither TOTP nor backup code matched
-                    return Err(AuthError::InvalidCredentials);
+                    return reject_code().await;
                 }
             } else {
                 // No backup codes, TOTP failed
-                return Err(AuthError::InvalidCredentials);
+                return reject_code().await;
             }
         }
 
         // Revoke the challenge token (single-use)
         self.token_service.revoke_token(claims.jti, claims.exp).await;
+
+        // Fully authenticated: record the sign-in and clear the throttle
+        // state for this address, the account and the challenge.
+        self.user_repo.reset_failed_attempts(user_id).await?;
+        self.clear_throttle_after_success(&user.email, &ip_key).await;
+        let _ = throttle
+            .clear(login_throttle::CATEGORY_MFA_CHALLENGE, &challenge_key)
+            .await;
 
         // MFA verified — now complete login (same flow as non-MFA)
         let roles = self.group_repo.get_user_roles(user_id).await?;
@@ -860,6 +905,175 @@ impl AuthService {
         Ok(())
     }
 
+    fn login_throttle(&self) -> LoginThrottle {
+        LoginThrottle::new(self.user_repo.pool().clone())
+    }
+
+    /// Reserve the per-email delay slot and either sleep until it or, if it is
+    /// too far ahead, report `BeyondHorizon` so the caller rejects the attempt
+    /// generically without verifying. Keeps worker tasks from piling up asleep
+    /// during a burst while never blocking an honest attempt longer than the
+    /// horizon.
+    async fn await_account_slot(
+        &self,
+        throttle: &LoginThrottle,
+        email: &str,
+    ) -> Result<SlotWait, AuthError> {
+        let wait = throttle
+            .reserve_account_slot(email)
+            .await
+            .map_err(throttle_db)?;
+        if wait > std::time::Duration::from_secs(login_throttle::ACCOUNT_DELAY_HORIZON_SECS) {
+            return Ok(SlotWait::BeyondHorizon);
+        }
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        Ok(SlotWait::Ready)
+    }
+
+    /// The account checks and the password verification of [`Self::login`].
+    /// Every rejection is `InvalidCredentials` after exactly one bcrypt.
+    async fn verify_local_password(&self, email: &str, password: &str) -> Result<User, AuthError> {
+        // Try to find the user by email
+        let user = match self.user_repo.get_user_by_email(email).await {
+            Ok(user) => user,
+            Err(UserRepositoryError::NotFoundByEmail(_)) => {
+                // SECURITY: Perform dummy password verification to prevent timing attacks
+                // This ensures the response time is similar whether user exists or not
+                let _ = verify_or_burn(password, None).await;
+
+                // Return generic error (Requirement 1.3)
+                return Err(AuthError::InvalidCredentials);
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // NAN-5036: every rejection below costs exactly one bcrypt verification
+        // (real hash when usable, DUMMY_BCRYPT_HASH otherwise). A passwordless
+        // SSO/JIT account, a `system` service account (empty hash) and a
+        // disabled/locked one must be indistinguishable by latency from an
+        // unknown email or a wrong password.
+
+        // Only `active` and `locked` accounts can sign in with a password;
+        // `disabled`, `system` and any unknown status are rejected generically.
+        if user.status != "active" && user.status != "locked" {
+            let _ = verify_or_burn(password, user.password_hash.as_deref()).await;
+            // SECURITY: Return generic error to prevent account status enumeration
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        // Check if account is locked (Requirement 1.5)
+        if self.is_account_locked(&user).await? {
+            let _ = verify_or_burn(password, user.password_hash.as_deref()).await;
+            // SECURITY: Return generic error to prevent account status enumeration
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        // NAN-5027: an SSO-linked account signs in through its IdP. A leftover
+        // local password (set before the link, or on a tenant upgraded from a
+        // build that kept it) is not a second way in unless an administrator
+        // set the audited break-glass flag on the account.
+        if user.oidc_provider_id.is_some() && !user.local_login_break_glass {
+            let _ = verify_or_burn(password, None).await;
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        // A passwordless account (SSO/JIT) burns the dummy and fails. Its
+        // failures count toward the throttle like any other email string (no
+        // existence oracle), which only ever slows or locks PASSWORD sign-in,
+        // a path this account cannot use: its SSO sign-in is unaffected.
+        if !user.password_hash.as_deref().is_some_and(is_usable_bcrypt_hash) {
+            let _ = verify_or_burn(password, None).await;
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        if verify_or_burn(password, user.password_hash.as_deref()).await? {
+            Ok(user)
+        } else {
+            Err(AuthError::InvalidCredentials)
+        }
+    }
+
+    /// Count one failed password or MFA-code attempt against the account-wide
+    /// counter and turn a threshold crossing into the signal the handlers
+    /// audit. Crossing [`login_throttle::ACCOUNT_ALERT_THRESHOLD`] also
+    /// publishes a health event (once per episode).
+    async fn record_login_failure(&self, email: &str, ip_locked: bool) -> AuthError {
+        let failures = match self.login_throttle().record_account_failure(email).await {
+            Ok(n) => n,
+            Err(e) => return throttle_db(e),
+        };
+        let account_alert = failures == login_throttle::ACCOUNT_ALERT_THRESHOLD;
+        if account_alert {
+            self.publish_guessing_event(email, failures).await;
+        }
+        if ip_locked || account_alert {
+            AuthError::LoginThrottled {
+                ip_locked,
+                account_alert,
+            }
+        } else {
+            AuthError::InvalidCredentials
+        }
+    }
+
+    /// Health-bus event for distributed guessing against one email. Best
+    /// effort: a failed publish is logged, never turned into a login error.
+    async fn publish_guessing_event(&self, email: &str, failures: i32) {
+        use crate::system_health::{
+            HealthCategory, HealthSeverity, PublishHealthEvent, SystemHealthRepository,
+        };
+        let email = login_throttle::normalize_email(email);
+        let mut event = PublishHealthEvent::new(
+            login_throttle::GUESSING_DEDUP_KEY,
+            HealthCategory::Service,
+            HealthSeverity::High,
+            "Repeated failed sign-ins for one or more accounts",
+            format!(
+                "{failures} password or MFA-code attempts for {email} (the latest account to \
+                 reach the threshold) failed within an hour. Each source address is locked \
+                 after {} failures, and every further attempt for the email is delayed (up to \
+                 {} s), but the attempts may be coming from many addresses.",
+                self.config.lockout_threshold,
+                login_throttle::ACCOUNT_DELAY_MAX_SECS,
+            ),
+            "user",
+            "nanosiem-api",
+        );
+        event.resource_name = Some(email.clone());
+        event.diagnostic_context = serde_json::json!({ "failures": failures });
+        event.remediation = Some(
+            "Review the login_failed and login_account_throttled audit events for this email \
+             and their source addresses. If the account exists, confirm it uses MFA or SSO and \
+             rotate its password if it may be exposed. Block the source addresses at the edge \
+             or with the IP allowlist."
+                .to_string(),
+        );
+        if let Err(e) = SystemHealthRepository::new(self.user_repo.pool().clone())
+            .publish(&event)
+            .await
+        {
+            tracing::warn!(error = %e, "failed to publish the login-guessing health event");
+        }
+    }
+
+    /// After a full sign-in: forget this address's lock bucket and the
+    /// account-wide delay. Best effort (the sign-in already succeeded).
+    async fn clear_throttle_after_success(&self, email: &str, ip_key: &str) {
+        let throttle = self.login_throttle();
+        let email_key = login_throttle::normalize_email(email);
+        for (category, key) in [
+            (login_throttle::CATEGORY_ACCOUNT_IP, ip_key.to_string()),
+            (login_throttle::CATEGORY_ACCOUNT, email_key.clone()),
+            (login_throttle::CATEGORY_ACCOUNT_SLOT, email_key),
+        ] {
+            if let Err(e) = throttle.clear(category, &key).await {
+                tracing::warn!(error = %e, category, "failed to clear sign-in throttle state");
+            }
+        }
+    }
+
     /// Check if an account is currently locked
     async fn is_account_locked(&self, user: &User) -> Result<bool, AuthError> {
         if user.status != "locked" {
@@ -947,6 +1161,19 @@ pub(crate) async fn verify_or_burn(password: &str, hash: Option<&str>) -> Result
         .map_err(|e| AuthError::InternalError(e.to_string()))?
         .unwrap_or(false);
     Ok(is_real && ok)
+}
+
+/// Whether a reserved per-email delay slot can be waited out or is too far
+/// ahead to bother a worker task with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotWait {
+    Ready,
+    BeyondHorizon,
+}
+
+/// A throttle-state database error, as an auth error.
+fn throttle_db(e: sqlx::Error) -> AuthError {
+    AuthError::DatabaseError(e.to_string())
 }
 
 /// Hash a token using SHA-256 for storage.

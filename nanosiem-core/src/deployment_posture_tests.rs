@@ -152,7 +152,10 @@ fn public_install_token_is_critical_and_its_delivery_fallback_too() {
     assert_eq!(findings.len(), 2, "{findings:?}");
     assert!(findings.iter().all(|f| f.priority == "critical"));
     assert!(findings[0].title.contains("install token is a public default"));
-    assert!(findings[1].title.contains("config delivery still accepts"));
+    // NAN-5148: a public install token is never a delivery credential, so the
+    // second finding is that delivery is off, not that it accepts the token.
+    assert!(findings[1].title.contains("config delivery is off"), "{findings:?}");
+    assert!(findings[1].description.contains(DELIVERY_TOKEN_ENV));
     // No finding ever echoes the value.
     assert!(findings
         .iter()
@@ -194,4 +197,41 @@ fn default_keys_allowed_only_flags_non_local_deployments() {
         assert_eq!(t.len(), 1, "{url}");
         assert!(t[0].contains("development keys"), "{url}");
     }
+}
+
+/// NAN-5148: a known-public install token never authorizes config delivery,
+/// whether or not a dedicated token exists and in either fallback mode.
+#[test]
+fn public_install_token_is_never_a_delivery_credential() {
+    for public in ["nanosiem-default-token", "your-secret-token", " nanosiem-default-token \n"] {
+        // No dedicated token: delivery is off rather than open to a public value.
+        for strict in [false, true] {
+            assert_eq!(
+                resolve_vector_config_delivery(None, None, Some(public), strict),
+                C::Disabled(DeliveryDisabledReason::PublicInstallToken),
+                "{public:?} strict={strict}"
+            );
+        }
+        // Dedicated token present: only the dedicated token is accepted.
+        for strict in [false, true] {
+            assert_eq!(
+                resolve_vector_config_delivery(None, Some("dedicated-x"), Some(public), strict),
+                C::Dedicated("dedicated-x".into()),
+                "{public:?} strict={strict}"
+            );
+        }
+    }
+}
+
+#[test]
+fn public_install_token_beside_a_dedicated_token_has_no_delivery_finding() {
+    let inputs = PostureInputs {
+        install_token: Some("nanosiem-default-token".into()),
+        delivery_token: Some("4be1-random-delivery".into()),
+        ..Default::default()
+    };
+    let findings = posture_findings(&inputs);
+    // Only the ingest-side finding: delivery no longer accepts the install token.
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(findings[0].title.contains("install token is a public default"));
 }

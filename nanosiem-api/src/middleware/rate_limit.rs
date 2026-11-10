@@ -349,11 +349,16 @@ pub async fn login_rate_limit_middleware(
     next: Next,
 ) -> Response<Body> {
     let ip = extract_client_ip(&req);
+    // NAN-5149: key the per-IP login bucket on the canonical address (IPv6
+    // reduced to its /64, IPv4-mapped unwrapped) so rotating within one /64
+    // cannot multiply the login budget. This middleware guards both the
+    // password login and the MFA challenge routes.
+    let ip_bucket = nanosiem_core::auth::login_throttle::canonical_ip_key(Some(&ip));
 
     match state
         .check(
             "login_ip",
-            &ip,
+            &ip_bucket,
             state.config.login_window_seconds,
             state.config.login_max_requests,
         )

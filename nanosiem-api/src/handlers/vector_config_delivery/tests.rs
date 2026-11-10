@@ -312,4 +312,55 @@ mod delivery_credential {
             Err(StatusCode::UNAUTHORIZED)
         );
     }
+
+    /// NAN-5148: the v2.0.x install-token fallback covers private install
+    /// tokens only. A known-public install token is refused for delivery in
+    /// both fallback modes, while a private install token keeps working and
+    /// the dedicated token is always accepted.
+    #[test]
+    fn public_install_token_is_refused_for_delivery() {
+        let public = "nanosiem-default-token";
+        let peer: SocketAddr = "10.20.0.7:51515".parse().unwrap();
+        // No dedicated token: delivery is off (404), even for the public value.
+        let legacy = resolve_vector_config_delivery(None, None, Some(public), false);
+        assert_eq!(
+            authorize_with(&bearer(public), Some(&peer), legacy),
+            Err(StatusCode::NOT_FOUND)
+        );
+        // Dedicated token beside a public install token: install refused,
+        // dedicated accepted.
+        for strict in [false, true] {
+            let both =
+                resolve_vector_config_delivery(None, Some("delivery-secret"), Some(public), strict);
+            assert_eq!(
+                authorize_with(&bearer(public), Some(&peer), both.clone()),
+                Err(StatusCode::UNAUTHORIZED),
+                "strict={strict}"
+            );
+            assert_eq!(
+                authorize_with(&bearer("delivery-secret"), Some(&peer), both),
+                Ok(()),
+                "strict={strict}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_install_token_fallback_is_unchanged() {
+        let peer: SocketAddr = "10.20.0.7:51515".parse().unwrap();
+        for credential in [
+            resolve_vector_config_delivery(None, None, Some("9f2c-private-install"), false),
+            resolve_vector_config_delivery(
+                None,
+                Some("delivery-secret"),
+                Some("9f2c-private-install"),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                authorize_with(&bearer("9f2c-private-install"), Some(&peer), credential),
+                Ok(())
+            );
+        }
+    }
 }

@@ -117,7 +117,7 @@ interface SearchResult {
 }
 
 import type { DisplayType } from '@/lib/api/types';
-import { nplQuotedBody } from '@/lib/npl-quote';
+import { nplQuotedBody, nplRegexBody } from '@/lib/npl-quote';
 // NAN-2209: the single regex-aware base-search extractor. SearchResults
 // previously carried a quote-only copy that split inside `field=/re|gex/`.
 import { getBaseSearch, buildGroupByQuery } from '@/lib/npl-pipeline';
@@ -575,7 +575,7 @@ export function FieldValueMenu({
               onClick: () => {
                 if (onSetQuery) {
                   const scopeFilters = extractScopeFilters(query, 'web');
-                  onSetQuery(`${scopeFilters} | tree web root=/${escapeValue(stringValue)}/`);
+                  onSetQuery(`${scopeFilters} | tree web root=/${nplRegexBody(stringValue)}/`);
                 }
               },
             });
@@ -639,7 +639,7 @@ export function FieldValueMenu({
             onClick: () => {
               if (onSetQuery) {
                 const scopeFilters = extractScopeFilters(query, 'web');
-                onSetQuery(`${scopeFilters} | tree web root=/${escapeValue(stringValue)}/`);
+                onSetQuery(`${scopeFilters} | tree web root=/${nplRegexBody(stringValue)}/`);
               }
             },
           });
@@ -663,7 +663,7 @@ export function FieldValueMenu({
             onClick: () => {
               if (onSetQuery) {
                 const scopeFilters = extractScopeFilters(query, 'process');
-                onSetQuery(`${scopeFilters} | tree process root=/${escapeValue(stringValue)}/`);
+                onSetQuery(`${scopeFilters} | tree process root=/${nplRegexBody(stringValue)}/`);
               }
             },
           });
@@ -678,7 +678,7 @@ export function FieldValueMenu({
             onClick: () => {
               if (onSetQuery) {
                 const scopeFilters = extractScopeFilters(query, 'web');
-                onSetQuery(`${scopeFilters} | tree web root=/${escapeValue(stringValue)}/`);
+                onSetQuery(`${scopeFilters} | tree web root=/${nplRegexBody(stringValue)}/`);
               }
             },
           });

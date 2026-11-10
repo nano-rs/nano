@@ -403,6 +403,12 @@ if is_object(.attributes) { tail = merge(tail, object!(.attributes)) }
 # (metric identity, timeUnixNano) for metrics in clickhouse/138 & 140 — tracked
 # outside this file (see O24 in OBSERVABILITY_AUDIT_FINDINGS.md).
 # =============================================================================
+# NAN-5203: this sink has one endpoint. On more than one ClickHouse shard the
+# deployment (compose renderer, Helm) sets CLICKHOUSE_OTEL_SPANS_TABLE /
+# CLICKHOUSE_OTEL_METRICS_TABLE to the write-only `*_raw_distributed` wrappers,
+# which split each batch by a content key (trace id / event) and commit on the
+# target shard before acknowledging. A direct `*_raw` write on a cluster would
+# keep every row on whichever node received the batch.
 [sinks.clickhouse_otel_spans]
 type = "clickhouse"
 inputs = ["otlp_traces_prep"]

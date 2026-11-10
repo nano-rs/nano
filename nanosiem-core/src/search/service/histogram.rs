@@ -101,20 +101,8 @@ impl SearchService {
         let tc = dataset.time_column();
 
         // Determine the time bucket function and interval based on duration
-        // Use finer granularity for better visualization
-        let (time_bucket_func, interval_secs) = match duration_secs {
-            d if d <= 300 => (format!("toStartOfInterval({tc}, INTERVAL 5 SECOND)"), 5),
-            d if d <= 900 => (format!("toStartOfInterval({tc}, INTERVAL 10 SECOND)"), 10),
-            d if d <= 1800 => (format!("toStartOfInterval({tc}, INTERVAL 30 SECOND)"), 30),
-            d if d <= 3600 => (format!("toStartOfMinute({tc})"), 60),
-            d if d <= 7200 => (format!("toStartOfMinute({tc})"), 60),
-            d if d <= 21600 => (format!("toStartOfFiveMinutes({tc})"), 300),
-            d if d <= 43200 => (format!("toStartOfFiveMinutes({tc})"), 300),
-            d if d <= 86400 => (format!("toStartOfFiveMinutes({tc})"), 300),
-            d if d <= 172800 => (format!("toStartOfTenMinutes({tc})"), 600),
-            d if d <= 604800 => (format!("toStartOfInterval({tc}, INTERVAL 30 MINUTE)"), 1800),
-            _ => (format!("toStartOfHour({tc})"), 3600),
-        };
+        // (finer granularity for short windows; NAN-5144 caps the count).
+        let (time_bucket_func, interval_secs) = npl_histogram_bucket(duration_secs, tc);
 
         let histogram_sql = format!(
             r#"
@@ -136,7 +124,7 @@ impl SearchService {
             .await?;
 
         // Fill in missing buckets with zero counts to show the complete time range
-        histogram = self.fill_histogram_gaps(histogram, time_range, interval_secs);
+        histogram = Self::fill_histogram_gaps(histogram, time_range, interval_secs);
 
         Ok(histogram)
     }
@@ -266,31 +254,7 @@ impl SearchService {
             )));
         }
 
-        let (time_bucket_func, interval_secs) = match duration_secs {
-            d if d <= 300 => (
-                "toStartOfInterval(timestamp, INTERVAL 5 SECOND)".to_string(),
-                5,
-            ),
-            d if d <= 900 => (
-                "toStartOfInterval(timestamp, INTERVAL 10 SECOND)".to_string(),
-                10,
-            ),
-            d if d <= 1800 => (
-                "toStartOfInterval(timestamp, INTERVAL 30 SECOND)".to_string(),
-                30,
-            ),
-            d if d <= 3600 => ("toStartOfMinute(timestamp)".to_string(), 60),
-            d if d <= 7200 => ("toStartOfMinute(timestamp)".to_string(), 60),
-            d if d <= 21600 => ("toStartOfFiveMinutes(timestamp)".to_string(), 300),
-            d if d <= 43200 => ("toStartOfTenMinutes(timestamp)".to_string(), 600),
-            d if d <= 86400 => ("toStartOfFifteenMinutes(timestamp)".to_string(), 900),
-            d if d <= 172800 => (
-                "toStartOfInterval(timestamp, INTERVAL 30 MINUTE)".to_string(),
-                1800,
-            ),
-            d if d <= 604800 => ("toStartOfHour(timestamp)".to_string(), 3600),
-            _ => ("toStartOfDay(timestamp)".to_string(), 86400),
-        };
+        let (time_bucket_func, interval_secs) = raw_histogram_bucket(duration_secs);
 
         let logs_table = self
             .table_names
@@ -325,40 +289,32 @@ impl SearchService {
             start: time_range.start,
             end: time_range.end,
         };
-        histogram = self.fill_histogram_gaps(histogram, &tr, interval_secs);
+        histogram = Self::fill_histogram_gaps(histogram, &tr, interval_secs);
 
         Ok(histogram)
     }
 
     /// Fill in missing histogram buckets with zero counts to show complete time range
-    /// This ensures the histogram spans the entire requested time range, not just where events exist
-    fn fill_histogram_gaps(
-        &self,
+    /// This ensures the histogram spans the entire requested time range, not just where events exist.
+    ///
+    /// NAN-5144: never emits more than [`MAX_HISTOGRAM_BUCKETS`] buckets. The
+    /// interval selection already keeps a window under that; this is the
+    /// backstop so no caller can make the fill allocate without bound.
+    pub(crate) fn fill_histogram_gaps(
         mut histogram: Vec<HistogramBucket>,
         time_range: &TimeRange,
         interval_secs: i64,
     ) -> Vec<HistogramBucket> {
-        // Align start time to bucket boundary (floor to interval)
+        if interval_secs <= 0 {
+            return histogram;
+        }
+        // Align start time to bucket boundary (floor to interval; euclidean so
+        // a pre-1970 start still lands on a boundary instead of past it)
         let start_ts = time_range.start.timestamp();
-        let aligned_start_ts = (start_ts / interval_secs) * interval_secs;
+        let aligned_start_ts = start_ts.div_euclid(interval_secs) * interval_secs;
         let aligned_start =
             chrono::DateTime::from_timestamp(aligned_start_ts, 0).unwrap_or(time_range.start);
-
-        if histogram.is_empty() {
-            // If no events at all, create empty buckets for the entire range
-            let mut current = aligned_start;
-            let mut result = Vec::new();
-
-            while current < time_range.end {
-                result.push(HistogramBucket {
-                    time: current,
-                    count: 0,
-                });
-                current = current + chrono::Duration::seconds(interval_secs);
-            }
-
-            return result;
-        }
+        let step = chrono::Duration::seconds(interval_secs);
 
         // Build a map of bucket timestamp -> count for O(1) lookup
         let bucket_map: std::collections::HashMap<i64, u64> = histogram
@@ -370,15 +326,96 @@ impl SearchService {
         let mut current = aligned_start;
 
         // Iterate through the entire time range, filling gaps
-        while current < time_range.end {
+        while current < time_range.end && result.len() < MAX_HISTOGRAM_BUCKETS {
             let count = bucket_map.get(&current.timestamp()).copied().unwrap_or(0);
             result.push(HistogramBucket {
                 time: current,
                 count,
             });
-            current = current + chrono::Duration::seconds(interval_secs);
+            current = current + step;
         }
 
         result
     }
+}
+
+/// Upper bound on histogram buckets for one search (NAN-5144). The finest
+/// interval is kept for normal windows; longer windows coarsen so the
+/// bucket count stays at or under this, in both the SQL and the gap-fill.
+pub(crate) const MAX_HISTOGRAM_BUCKETS: usize = 10_000;
+
+/// Coarser intervals a long window steps up to, smallest first: hour,
+/// 6 hours, day, week, 30 days, 365 days.
+const COARSE_INTERVALS_SECS: &[i64] = &[3_600, 21_600, 86_400, 604_800, 2_592_000, 31_536_000];
+
+/// `base_secs` unless the window would need more than
+/// [`MAX_HISTOGRAM_BUCKETS`] of them; then the smallest coarser interval
+/// that fits (falling back to a whole number of days for anything longer).
+pub(crate) fn capped_histogram_interval(duration_secs: i64, base_secs: i64) -> i64 {
+    let max = MAX_HISTOGRAM_BUCKETS as i64;
+    // Strictly under: an unaligned start adds one partial leading bucket.
+    let fits = |interval: i64| duration_secs.max(0) / interval < max;
+    if fits(base_secs) {
+        return base_secs;
+    }
+    COARSE_INTERVALS_SECS
+        .iter()
+        .copied()
+        .find(|&interval| interval > base_secs && fits(interval))
+        .unwrap_or_else(|| {
+            let days = duration_secs.max(0) / (max - 1) / 86_400 + 1;
+            days * 86_400
+        })
+}
+
+/// Bucket expression + interval for the nPL histogram companion.
+pub(crate) fn npl_histogram_bucket(duration_secs: i64, tc: &str) -> (String, i64) {
+    let (func, base) = match duration_secs {
+        d if d <= 300 => (format!("toStartOfInterval({tc}, INTERVAL 5 SECOND)"), 5),
+        d if d <= 900 => (format!("toStartOfInterval({tc}, INTERVAL 10 SECOND)"), 10),
+        d if d <= 1800 => (format!("toStartOfInterval({tc}, INTERVAL 30 SECOND)"), 30),
+        d if d <= 3600 => (format!("toStartOfMinute({tc})"), 60),
+        d if d <= 7200 => (format!("toStartOfMinute({tc})"), 60),
+        d if d <= 21600 => (format!("toStartOfFiveMinutes({tc})"), 300),
+        d if d <= 43200 => (format!("toStartOfFiveMinutes({tc})"), 300),
+        d if d <= 86400 => (format!("toStartOfFiveMinutes({tc})"), 300),
+        d if d <= 172800 => (format!("toStartOfTenMinutes({tc})"), 600),
+        d if d <= 604800 => (format!("toStartOfInterval({tc}, INTERVAL 30 MINUTE)"), 1800),
+        _ => (format!("toStartOfHour({tc})"), 3600),
+    };
+    cap_bucket(duration_secs, tc, func, base)
+}
+
+/// Bucket expression + interval for the raw-SQL / field-stats histogram.
+pub(crate) fn raw_histogram_bucket(duration_secs: i64) -> (String, i64) {
+    let tc = "timestamp";
+    let (func, base) = match duration_secs {
+        d if d <= 300 => (format!("toStartOfInterval({tc}, INTERVAL 5 SECOND)"), 5),
+        d if d <= 900 => (format!("toStartOfInterval({tc}, INTERVAL 10 SECOND)"), 10),
+        d if d <= 1800 => (format!("toStartOfInterval({tc}, INTERVAL 30 SECOND)"), 30),
+        d if d <= 3600 => (format!("toStartOfMinute({tc})"), 60),
+        d if d <= 7200 => (format!("toStartOfMinute({tc})"), 60),
+        d if d <= 21600 => (format!("toStartOfFiveMinutes({tc})"), 300),
+        d if d <= 43200 => (format!("toStartOfTenMinutes({tc})"), 600),
+        d if d <= 86400 => (format!("toStartOfFifteenMinutes({tc})"), 900),
+        d if d <= 172800 => (format!("toStartOfInterval({tc}, INTERVAL 30 MINUTE)"), 1800),
+        d if d <= 604800 => (format!("toStartOfHour({tc})"), 3600),
+        _ => (format!("toStartOfDay({tc})"), 86400),
+    };
+    cap_bucket(duration_secs, tc, func, base)
+}
+
+/// Keep `func` when its interval fits the cap; otherwise bucket on the
+/// capped interval by plain epoch-second division, the same floor the
+/// gap-fill uses, rendered as a second-precision UTC DateTime so the bucket
+/// keys parse and match exactly.
+fn cap_bucket(duration_secs: i64, tc: &str, func: String, base: i64) -> (String, i64) {
+    let interval = capped_histogram_interval(duration_secs, base);
+    if interval == base {
+        return (func, base);
+    }
+    (
+        format!("toDateTime(intDiv(toUnixTimestamp({tc}), {interval}) * {interval}, 'UTC')"),
+        interval,
+    )
 }

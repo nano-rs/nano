@@ -640,10 +640,14 @@ impl SearchService {
             ) {
                 Ok(s) => s,
                 Err(e) => {
+                    // NAN-5161: same guardrail-vs-internal rule as the batch path.
+                    tracing::error!(error = %e, "Streaming chunk SQL generation failed");
                     let _ = event_tx
                         .send(SearchStreamEvent::Error {
                             code: "SQL_GEN_ERROR".to_string(),
-                            message: e.to_string(),
+                            message: crate::search::client_error_message(
+                                &SearchError::SqlGenError(e.to_string()),
+                            ),
                         })
                         .await;
                     return;
@@ -768,10 +772,12 @@ impl SearchService {
                 return;
             }
             if let Ok(Err(e)) = exec_handle.await {
+                // NAN-5161: masked like the batch path; full detail logged.
+                tracing::error!(error = %e, "Streaming search chunk failed");
                 let _ = event_tx
                     .send(SearchStreamEvent::Error {
                         code: "QUERY_ERROR".to_string(),
-                        message: e.to_string(),
+                        message: crate::search::client_error_message(&e),
                     })
                     .await;
                 return;
@@ -965,10 +971,12 @@ impl SearchService {
                     .await;
             }
             Err(e) => {
+                // NAN-5161: masked like the batch path; full detail logged.
+                tracing::error!(error = %e, "Buffered streaming search failed");
                 let _ = event_tx
                     .send(SearchStreamEvent::Error {
                         code: "QUERY_ERROR".to_string(),
-                        message: e.to_string(),
+                        message: crate::search::client_error_message(&e),
                     })
                     .await;
             }
