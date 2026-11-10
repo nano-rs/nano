@@ -268,6 +268,9 @@ gen_secrets() {
             put RUST_LOG "${E2E_RUST_LOG:-info}"
             # No floating tag is published: default to this checkout's release.
             put NANO_VERSION "${E2E_IMAGE_TAG:-$(sed -n 's/^# Release: v//p' "$ROOT/images.lock" | head -1)}"
+            # NAN-5204: enables POST /api/internal/backup-status (the
+            # nano-backup service's report) on every e2e stack.
+            put NANO_BACKUP_STATUS_TOKEN "$(openssl rand -hex 32)"
         } > "$f"
         nano_backfill_generated_secrets "$f" generate
     )
@@ -438,6 +441,7 @@ write_app_env() {
                 "NANO_INGEST_PUBLIC_BASE_URL=http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_EDGE_PORT)" \
                 "NANO_INGEST_HEC_PORT=$(env_get "$RUN_DIR/run.env" E2E_HEC_PORT)" \
                 NANO_PIPE_PREVIEW_ENABLED=true \
+                "NANO_BACKUP_STATUS_TOKEN=${NANO_BACKUP_STATUS_TOKEN:-}" \
                 API_HOST=127.0.0.1 "API_PORT=$(env_get "$RUN_DIR/run.env" E2E_API_PORT)" \
                 "SEARCH_PORT=$(env_get "$RUN_DIR/run.env" E2E_SEARCH_PORT)" \
                 "JOBS_PORT=$(env_get "$RUN_DIR/run.env" E2E_JOBS_PORT)" \

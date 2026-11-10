@@ -43,6 +43,9 @@ const PUBLIC_ENDPOINTS: &[&str] = &[
     // NAN-4907: nginx auth_request for the OTLP edge. Authenticates the
     // sender's source-bound ingest token itself, without a user session.
     "/api/internal/otlp-auth",
+    // NAN-5204: the nano-backup sidecar's status report. The handler gates on
+    // its own NANO_BACKUP_STATUS_TOKEN bearer and 404s when none is set.
+    "/api/internal/backup-status",
     "/health",
     // Kubernetes readiness probe (HA8, NAN-1777). Probes are unauthenticated;
     // without this the auth middleware 401s /ready before the handler's
@@ -738,6 +741,9 @@ mod tests {
         // ...but nothing else under /api/internal/ inherits the exemption.
         assert!(!is_public_endpoint("/api/internal/vector-config"));
         assert!(!is_public_endpoint("/api/internal/other"));
+        // NAN-5204: exact path only.
+        assert!(is_public_endpoint("/api/internal/backup-status"));
+        assert!(!is_public_endpoint("/api/internal/backup-status/x"));
 
         assert!(!is_public_endpoint("/api/search"));
         assert!(!is_public_endpoint("/api/rules"));

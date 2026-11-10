@@ -11,6 +11,8 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::known_public_secrets::{is_known_public, SecretKind};
+
 use super::{
     generate_token, normalize_name, otlp_identity_assertion, parse_credential_request_counts,
     render_tokens_file, secret_from_env, TokenDelivery, OTLP_ASSERTION_TTL_SECS,
@@ -194,6 +196,10 @@ impl IngestTokenService {
             .as_deref()
             .is_some_and(|install| constant_time_eq(sha256_hex(install).as_bytes(), hash.as_bytes()))
         {
+            // NAN-5013: a publicly known install token never authenticates.
+            if self.install_token_is_public() {
+                return Ok(None);
+            }
             let settings = self.settings().await?;
             if settings.install_token_enabled
                 && settings.install_token_mode == InstallTokenMode::Strict
@@ -225,6 +231,15 @@ impl IngestTokenService {
     /// Whether an install token is configured (`VECTOR_AUTH_TOKEN` non-blank).
     pub fn install_token_configured(&self) -> bool {
         self.install_token.is_some()
+    }
+
+    /// Whether the install token is a value nano shipped as a default or
+    /// example (NAN-5013). Such a token is refused on every ingest lane:
+    /// it is never listed in Vector's tokens file and never authenticates OTLP.
+    pub fn install_token_is_public(&self) -> bool {
+        self.install_token
+            .as_deref()
+            .is_some_and(|token| is_known_public(SecretKind::VectorInstallToken, token))
     }
 
     /// The log sources a token can be bound to.
@@ -556,7 +571,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// The entries nano adds beside the named tokens:
 /// * the install token while enabled, routed on its bound source in strict
-///   mode, or listed as a multiplex credential in legacy multiplex mode;
+///   mode, or listed as a multiplex credential in legacy multiplex mode. A
+///   publicly known install token (`nanosiem-default-token`, a `CHANGE_ME*`
+///   placeholder, ...) is never listed in either mode (NAN-5013): anyone can
+///   send it. The sources' static fallback stays off too (the caller passes
+///   `fallback_enabled = false` whenever an install token is set), so Vector
+///   answers it with 401;
 /// * the platform credential (its own random secret, never derived from the
 ///   install token) whenever one is configured.
 pub fn file_extra_entries(
@@ -566,7 +586,9 @@ pub fn file_extra_entries(
     install_source: Option<&BindableSource>,
 ) -> Vec<TokenFileEntry> {
     let mut entries = Vec::with_capacity(2);
-    if let (Some(install_token), true) = (install_token, settings.install_token_enabled) {
+    let listable_install =
+        install_token.filter(|token| !is_known_public(SecretKind::VectorInstallToken, token));
+    if let (Some(install_token), true) = (listable_install, settings.install_token_enabled) {
         let route = match (settings.install_token_mode, install_source) {
             (InstallTokenMode::LegacyMultiplex, _) => Some(MULTIPLEX_ROUTE.to_string()),
             (InstallTokenMode::Strict, Some(source)) => Some(source.route_key.clone()),

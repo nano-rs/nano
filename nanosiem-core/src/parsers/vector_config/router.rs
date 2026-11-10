@@ -259,9 +259,8 @@ pub(super) fn transport_of(source_type: &str) -> Transport {
     match source_type {
         "splunk_hec" | "splunk" | "hec" => Transport::SplunkHec,
         "opentelemetry" | "otlp" => Transport::Otlp,
-        "kafka" | "aws_s3" | "aws_sqs" | "s3" | "gcp_pubsub" | "pubsub" | "azure_event_hubs" => {
-            Transport::Fetch
-        }
+        "kafka" | "aws_s3" | "aws_sqs" | "crowdstrike_fdr" | "s3" | "gcp_pubsub" | "pubsub"
+        | "azure_event_hubs" => Transport::Fetch,
         // "routed", "vector", and unknown labels alike: `generate_source_config`
         // defaults unrecognized source types to the router, so they share it.
         _ => Transport::Routed,
@@ -1412,7 +1411,7 @@ source = ".source_type = \"foo\""
     /// Fetch-source parser bound via DISPATCH FROM claims that route.
     #[test]
     fn parser_claimed_route_returns_dispatch_route_for_bound_fetch_parser() {
-        for source_type in ["kafka", "aws_s3", "aws_sqs", "gcp_pubsub"] {
+        for source_type in ["kafka", "aws_s3", "aws_sqs", "crowdstrike_fdr", "gcp_pubsub"] {
             let p = parser_for_claim_tests(source_type, Some("nan884_smoke_route"));
             assert_eq!(parser_claimed_route(&p), Some("nan884_smoke_route"));
         }
@@ -1692,6 +1691,7 @@ source = ".source_type = \"foo\""
             ("kafka", Fetch),
             ("aws_s3", Fetch),
             ("aws_sqs", Fetch),
+            ("crowdstrike_fdr", Fetch),
             ("s3", Fetch),
             ("gcp_pubsub", Fetch),
             ("pubsub", Fetch),

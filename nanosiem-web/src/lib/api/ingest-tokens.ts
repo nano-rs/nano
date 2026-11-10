@@ -53,9 +53,10 @@ export interface InstallTokenState {
   /**
    * `legacy_multiplex` = accepted, routed by what the sender declares
    * (deprecated); `active` = strict and bound; `unbound` = strict, refused
-   * until bound.
+   * until bound; `public_refused` = `VECTOR_AUTH_TOKEN` is a publicly known
+   * default and is refused for ingest (NAN-5013).
    */
-  state: 'legacy_multiplex' | 'active' | 'unbound' | 'disabled' | 'not_configured';
+  state: 'legacy_multiplex' | 'active' | 'unbound' | 'disabled' | 'public_refused' | 'not_configured';
   deprecated: boolean;
   source_id?: string | null;
   source_name?: string | null;

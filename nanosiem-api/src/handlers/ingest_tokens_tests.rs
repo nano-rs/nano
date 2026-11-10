@@ -99,13 +99,22 @@ fn listed_token_schema_has_no_secret_fields() {
 #[test]
 fn install_token_state_labels() {
     let mut settings = IngestTokenSettings::default();
-    assert_eq!(install_state_label(false, &settings, true), "not_configured");
-    assert_eq!(install_state_label(true, &settings, false), "unbound");
-    assert_eq!(install_state_label(true, &settings, true), "active");
+    assert_eq!(install_state_label(false, false, &settings, true), "not_configured");
+    assert_eq!(install_state_label(true, false, &settings, false), "unbound");
+    assert_eq!(install_state_label(true, false, &settings, true), "active");
     settings.install_token_mode = InstallTokenMode::LegacyMultiplex;
-    assert_eq!(install_state_label(true, &settings, false), "legacy_multiplex");
+    assert_eq!(install_state_label(true, false, &settings, false), "legacy_multiplex");
     settings.install_token_enabled = false;
-    assert_eq!(install_state_label(true, &settings, false), "disabled");
+    assert_eq!(install_state_label(true, false, &settings, false), "disabled");
+    // NAN-5013: a public install token is refused whatever its settings say.
+    for enabled in [true, false] {
+        for mode in [InstallTokenMode::LegacyMultiplex, InstallTokenMode::Strict] {
+            settings.install_token_enabled = enabled;
+            settings.install_token_mode = mode;
+            assert_eq!(install_state_label(true, true, &settings, true), "public_refused");
+        }
+    }
+    assert_eq!(install_state_label(false, true, &settings, true), "not_configured");
 }
 
 #[test]

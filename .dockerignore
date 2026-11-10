@@ -72,6 +72,9 @@ scripts/
 # NAN-5002: the guarded, TEST-only upgrade rehearsal copies exactly this SQL
 # fixture into a non-release image. Keep every other test/script path excluded.
 !scripts/tests/fixtures/upgrade/clickhouse/999999999lab_upgrade_probe.sql
+# NAN-5204: the `backup` target copies exactly these two scripts.
+!scripts/nano-backup-scheduler.py
+!scripts/nano-manifest.py
 config/
 # NAN-1156/NAN-5004: nanosiem-core embeds these Vector templates at COMPILE time
 # via include_str! (vector_config/deploy.rs and its durability contract tests),

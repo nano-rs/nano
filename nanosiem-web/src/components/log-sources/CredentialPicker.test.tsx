@@ -42,6 +42,8 @@ function renderPicker(value?: string) {
 
 it('maps source configuration types to the credential provider they read with', () => {
   expect(credentialProviderFor('aws_sqs')).toBe('aws_s3');
+  // NAN-5005: FDR reads with the same AWS credential (keys or a role to assume).
+  expect(credentialProviderFor('crowdstrike_fdr')).toBe('aws_s3');
   expect(credentialProviderFor('azure_event_hubs')).toBe('azure_event_hubs');
   expect(credentialProviderFor('http')).toBeNull();
 });

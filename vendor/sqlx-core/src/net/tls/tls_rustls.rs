@@ -306,7 +306,12 @@ impl ServerCertVerifier for NoHostnameTlsVerifier {
             ocsp_response,
             now,
         ) {
-            Err(TlsError::InvalidCertificate(CertificateError::NotValidForName)) => {
+            // rustls >= 0.23.2x reports a name mismatch as NotValidForNameContext;
+            // matching only the old variant made verify-ca behave like
+            // verify-full (NAN-5214).
+            Err(TlsError::InvalidCertificate(
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+            )) => {
                 Ok(ServerCertVerified::assertion())
             }
             res => res,

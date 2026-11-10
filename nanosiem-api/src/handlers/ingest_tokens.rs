@@ -109,8 +109,9 @@ pub struct InstallTokenState {
     pub mode: InstallTokenMode,
     /// `legacy_multiplex` (accepted, routed by what the sender declares;
     /// deprecated), `active` (strict and bound), `unbound` (strict, refused
-    /// until it is bound), `disabled`, or `not_configured` (no
-    /// `VECTOR_AUTH_TOKEN`).
+    /// until it is bound), `disabled`, `public_refused` (`VECTOR_AUTH_TOKEN`
+    /// is a publicly known default, refused for ingest: NAN-5013), or
+    /// `not_configured` (no `VECTOR_AUTH_TOKEN`).
     pub state: String,
     /// Whether the current state is deprecated (legacy multiplex).
     pub deprecated: bool,
@@ -266,11 +267,14 @@ async fn audit(
 /// The install token's state label (see [`InstallTokenState::state`]).
 pub(crate) fn install_state_label(
     configured: bool,
+    public: bool,
     settings: &IngestTokenSettings,
     bound: bool,
 ) -> &'static str {
     if !configured {
         "not_configured"
+    } else if public {
+        "public_refused"
     } else if !settings.install_token_enabled {
         "disabled"
     } else if settings.install_token_mode == InstallTokenMode::LegacyMultiplex {
@@ -292,6 +296,7 @@ async fn install_token_state(
         .map_err(service_error)?;
     let state = install_state_label(
         service.install_token_configured(),
+        service.install_token_is_public(),
         &settings,
         source.is_some(),
     );

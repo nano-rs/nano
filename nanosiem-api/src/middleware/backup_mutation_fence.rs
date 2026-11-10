@@ -189,7 +189,14 @@ fn is_fence_exempt(method: &Method, path: &str) -> bool {
     // are append-only records with no PG-to-CH pointer invariant. Landing
     // those writes on either side of a snapshot boundary cannot create a torn
     // business object in the recovery set.
-    is_safe_method(method) || is_authentication_lifecycle(method, path)
+    //
+    // NAN-5204: the backup sidecar's status report writes only the PG-only
+    // `backup_status` singleton (no PG-to-CH pointer). It must get through
+    // even when a failed backup left the fence active, or the failure report
+    // that would surface the problem is itself refused.
+    is_safe_method(method)
+        || is_authentication_lifecycle(method, path)
+        || (*method == Method::POST && path == "/api/internal/backup-status")
 }
 
 async fn fence_active_on_pool(pool: &PgPool) -> Result<bool, sqlx::Error> {
@@ -280,6 +287,13 @@ mod tests {
         ] {
             assert!(is_fence_exempt(&method, path), "{method} {path}");
         }
+    }
+
+    #[test]
+    fn backup_status_report_bypasses_the_fence_exactly() {
+        assert!(is_fence_exempt(&Method::POST, "/api/internal/backup-status"));
+        assert!(!is_fence_exempt(&Method::PUT, "/api/internal/backup-status"));
+        assert!(!is_fence_exempt(&Method::POST, "/api/internal/backup-status/x"));
     }
 
     #[test]

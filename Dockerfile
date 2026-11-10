@@ -372,3 +372,29 @@ COPY --from=connector-builder /app/target/release/nano-connector-runner /usr/loc
 USER 999
 ENV RUST_LOG=info
 ENTRYPOINT ["/usr/local/bin/nano-connector-runner"]
+
+# -----------------------------------------------------------------------------
+# nano-backup: scheduled backups (NAN-5204), opt-in `backup` Compose profile.
+# -----------------------------------------------------------------------------
+# Based on the exact PostgreSQL image the stack runs (same digest as
+# docker-compose.opensource.yml), so pg_dump matches the server major. The
+# service has no Docker socket: it dumps PostgreSQL over the network as the
+# dedicated read-only `nano_backup` role, reads the lookup-table rows through
+# ClickHouse SQL as the least-privilege `nano_backup` ClickHouse user, and
+# reads .env / certificates from a read-only mount of the install directory.
+FROM postgres:17@sha256:0027bef26712baaee437a4ea48fdf3d2d2e2bc5f0d81615374408ca320f3c7e3 AS backup
+
+LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
+      org.opencontainers.image.description="nano scheduled backups: PostgreSQL + configuration + lookup tables to a path or S3-compatible bucket"
+
+RUN apt-get update && apt-get install -y --no-install-recommends python3 openssl ca-certificates tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/nano-backup-scheduler.py scripts/nano-manifest.py /opt/nano-backup/
+RUN printf '#!/bin/sh\nexec python3 -I /opt/nano-backup/nano-backup-scheduler.py "$@"\n' > /usr/local/bin/nano-backup \
+    && chmod 0755 /usr/local/bin/nano-backup /opt/nano-backup/*.py
+
+# Compose runs it as the install owner's uid:gid (it must read the 0600 .env).
+USER 999
+ENTRYPOINT ["/usr/local/bin/nano-backup"]
+CMD ["--install-dir", "/install", "serve"]

@@ -34,15 +34,22 @@
 #                                                    credential still decrypts
 #                                                    and is re-encrypted in the
 #                                                    background
-#     VECTOR_AUTH_TOKEN                              never rotated (field
-#                                                    forwarders hold it); reported
+#     VECTOR_AUTH_TOKEN                              regenerated (NAN-5013, v2.0.6:
+#                                                    nano-api refuses a public
+#                                                    install token on every lane,
+#                                                    so keeping it protects
+#                                                    nothing and accepts nothing;
+#                                                    named per-source tokens are
+#                                                    unaffected)
 #   CHANGE_ME* placeholders are always regenerated (nothing real holds one),
 #   except database passwords. Known database passwords are reported only
 #   (NANO_PUBLIC_DB_PASSWORD_KEYS): the databases keep the password their data
 #   was initialised with, and ClickHouse dictionaries embed it.
-#   NANO_ROTATED_SECRET_KEYS and NANO_PUBLIC_SECRET_KEYS name what was replaced
-#   and what is still public. In validate-only mode a public cluster-shared
-#   value fails like a missing one (copy the canonical host's .env).
+#   NANO_ROTATED_SECRET_KEYS names what was replaced. NANO_PUBLIC_SECRET_KEYS
+#   names a public VECTOR_AUTH_TOKEN a validate-only data host kept (warned:
+#   nothing there reads it); generate mode never keeps one since v2.0.6. In
+#   validate-only mode any other public cluster-shared value fails like a
+#   missing one (copy the canonical host's .env).
 #
 # Transitional keys (nano_transitional_secret_keys) are generated like the
 # others, but a role host whose copied .env predates them only gets a warning:
@@ -554,8 +561,11 @@ nano_backfill_generated_secrets() {
                         && [[ "$(nano_secret_public_kind "$key")" == db_password ]]; then
                         public_db="$(nano_secret_add_missing "$public_db" "$key")"
                     elif [[ "$key" == VECTOR_AUTH_TOKEN ]] \
-                        && nano_secret_effective_nonempty "$target" "$key" \
-                        && ! nano_secret_is_placeholder "$target" "$key"; then
+                        && [[ "${NANO_SECRETS_HOST_CONSUMES_VECTOR_CONFIG:-1}" == 0 ]] \
+                        && nano_secret_effective_nonempty "$target" "$key"; then
+                        # NAN-5013: a data-only host runs nothing that reads
+                        # the install token. Warn, so the documented
+                        # data-roles-first upgrade order still works.
                         public_kept="$(nano_secret_add_missing "$public_kept" "$key")"
                     elif nano_secret_is_transitional "$key"; then
                         transitional_missing="$(nano_secret_add_missing "$transitional_missing" "$key")"
@@ -564,20 +574,21 @@ nano_backfill_generated_secrets() {
                     fi
                 fi
             done < <(nano_cluster_shared_secret_keys)
-            # NAN-5148: the v2.0.x fallback for a host without the delivery
-            # token is its install token, and nano-api never accepts a public
-            # one. A present-but-public delivery token is sent as is and is
-            # refused too. Either way this host's Vector would get no config
-            # after the upgrade, so refuse here instead of warning. A host
-            # with no Vector config consumer (data roles) sets
+            # NAN-5148: a present-but-public delivery token is sent as is and
+            # nano-api refuses it, so this host's Vector would get no config
+            # after the upgrade: refuse here instead of warning. (A public
+            # install token is itself a shared_missing failure since NAN-5013.)
+            # A host with no Vector config consumer (data roles) sets
             # NANO_SECRETS_HOST_CONSUMES_VECTOR_CONFIG=0 and only gets the warning.
             if [[ "${NANO_SECRETS_HOST_CONSUMES_VECTOR_CONFIG:-1}" != 0 ]] \
                 && [[ ":$transitional_missing:" == *:NANO_VECTOR_CONFIG_DELIVERY_TOKEN:* ]] \
-                && { nano_secret_effective_nonempty "$target" NANO_VECTOR_CONFIG_DELIVERY_TOKEN \
-                    || [[ ":$public_kept:" == *:VECTOR_AUTH_TOKEN:* ]]; }; then
-                printf 'generated-secrets: this host'"'"'s .env has no usable NANO_VECTOR_CONFIG_DELIVERY_TOKEN, and VECTOR_AUTH_TOKEN cannot stand in for it (nano-api refuses a publicly known install token for Vector config delivery), so Vector on this host would stop receiving config. Fix: on the canonical app/prepare host run install.sh (or NANO_PREPARE_ONLY=1 install.sh) so it generates NANO_VECTOR_CONFIG_DELIVERY_TOKEN in its .env, securely copy that updated shared .env to this host, then retry.\n' >&2
+                && nano_secret_effective_nonempty "$target" NANO_VECTOR_CONFIG_DELIVERY_TOKEN; then
+                printf 'generated-secrets: this host'"'"'s .env has no usable NANO_VECTOR_CONFIG_DELIVERY_TOKEN (it is a placeholder, which nano-api refuses for Vector config delivery), so Vector on this host would stop receiving config. Fix: on the canonical app/prepare host run install.sh (or NANO_PREPARE_ONLY=1 install.sh) so it generates NANO_VECTOR_CONFIG_DELIVERY_TOKEN in its .env, securely copy that updated shared .env to this host, then retry.\n' >&2
                 status=1
                 break
+            fi
+            if [[ -n "$public_kept" ]]; then
+                printf 'generated-secrets: warning: this host'"'"'s .env holds a publicly known VECTOR_AUTH_TOKEN, which nano refuses since v2.0.6. Copy the updated shared .env from the canonical app/prepare host (whose install.sh run replaces it) to this host.\n' >&2
             fi
             if [[ -n "$transitional_missing" ]]; then
                 printf 'generated-secrets: warning: this host'"'"'s .env predates %s. Services keep their v2.0.x fallback until you copy the updated shared .env from the canonical app/prepare host to this host.\n' \
@@ -663,10 +674,10 @@ nano_backfill_generated_secrets() {
                     # The database keeps the password it was initialised with,
                     # so .env cannot change alone: report it.
                     public_db="$(nano_secret_add_missing "$public_db" "$key")"
-                elif [[ "$key" == VECTOR_AUTH_TOKEN ]] && ! nano_secret_is_placeholder "$target" "$key"; then
-                    # A shipped literal forwarders may hold: keep and report.
-                    public_kept="$(nano_secret_add_missing "$public_kept" "$key")"
                 else
+                    # NAN-5013: a public VECTOR_AUTH_TOKEN is rotated too. nano
+                    # refuses it on every lane, so senders holding it are cut
+                    # off either way; named per-source tokens keep working.
                     rotate="$(nano_secret_add_missing "$rotate" "$key")"
                 fi
             fi

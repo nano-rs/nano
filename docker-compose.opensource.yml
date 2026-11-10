@@ -394,6 +394,56 @@ services:
           memory: ${CONNECTOR_MEM_LIMIT:-2G}
           cpus: ${CONNECTOR_CPU_LIMIT:-2}
 
+  # NAN-5204: automatic backups. Opt-in profile written to COMPOSE_PROFILES
+  # by `scripts/nano backup-schedule --configure` (install.sh asks once).
+  # No Docker socket: PostgreSQL is dumped over the network as the read-only
+  # `nano_backup` role and the lookup-table rows are read through ClickHouse
+  # SQL as the SELECT-only `nano_backup` user. The service (re)provisions both
+  # identities with the admin credentials from .env on every run, so a
+  # restored or rebuilt database heals itself. The install directory (.env,
+  # recipient certificate, signing key) is mounted READ-ONLY; only the state
+  # directory and a path destination are writable. The recipient PRIVATE key
+  # never lives on this host.
+  nano-backup:
+    profiles: ["backup"]
+    image: ${NANO_IMAGE_PREFIX:-ghcr.io/nano-rs/nano}-backup:${NANO_VERSION:?NANO_VERSION is required (install.sh sets it from the images lock)}
+    container_name: nano-backup
+    restart: unless-stopped
+    logging: *default-logging
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    # The install owner's uid:gid: the 0600 .env must stay readable.
+    user: "${NANO_BACKUP_UID:-1000}:${NANO_BACKUP_GID:-1000}"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    command: ["--install-dir", "/install", "serve"]
+    environment:
+      HOME: /tmp
+      TZ: ${NANO_BACKUP_TZ:-UTC}
+      NANO_BACKUP_STATE_DIR: /var/lib/nano-backup
+      NANO_BACKUP_PG_HOST: ${NANO_BACKUP_PG_HOST:-postgres}
+      NANO_BACKUP_PG_PORT: ${NANO_BACKUP_PG_PORT:-5432}
+      NANO_BACKUP_CLICKHOUSE_URL: ${NANO_BACKUP_CLICKHOUSE_URL:-http://clickhouse:8123}
+      NANO_BACKUP_REPORT_URL: http://nano-api:3000/api/internal/backup-status
+    volumes:
+      - ${NANO_INSTALL_DIR:-/opt/nano}:/install:ro
+      - ${NANO_INSTALL_DIR:-/opt/nano}/.nano-backup/state:/var/lib/nano-backup
+      # A path destination is mounted at its host path; an S3 destination
+      # mounts nothing writable here.
+      - ${NANO_BACKUP_PATH:-${NANO_INSTALL_DIR:-/opt/nano}/.nano-backup/state}:${NANO_BACKUP_PATH:-/run/nano-backup-path-unused}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${NANO_BACKUP_MEM_LIMIT:-512M}
+          cpus: ${NANO_BACKUP_CPU_LIMIT:-1}
+
   # Stable network namespace for Vector and its loopback-only API clients.
   # Replacing only the Vector container must not retire the namespace underneath
   # vector-tap (or role-split's config consumer). The pinned, inert anchor owns
@@ -430,7 +480,7 @@ services:
 
   vector:
     # Digest-pinned — see the note on the postgres service (NAN-1258).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.5-debian@sha256:fa72643eedb261ad7814709b228c1cad6c90e5140689733cbcdadc993b406b4d
+    image: ghcr.io/nano-rs/vector:0.61.0-nano.7-debian@sha256:119dc25de7b6840285ac80d5c027ea7308513a334d0a0713b3352b5b30328c9c
     container_name: nano-vector
     network_mode: "service:vector-netns"
     restart: unless-stopped
@@ -551,6 +601,9 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
       PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-20}
       PG_MIN_CONNECTIONS: ${PG_MIN_CONNECTIONS:-2}
+      # NAN-5204: the nano-backup service reports each run with this token.
+      # Unset (automatic backups never configured) disables the endpoint.
+      NANO_BACKUP_STATUS_TOKEN: ${NANO_BACKUP_STATUS_TOKEN:-}
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DATABASE: nanosiem
       CLICKHOUSE_CLUSTER: ""

@@ -72,6 +72,8 @@ where
 }
 
 fn main() -> Result<()> {
+    // NAN-5214: before anything can negotiate TLS with PostgreSQL.
+    nanosiem_core::db::tls_provider::install_default_crypto_provider();
     // NAN-4917: query parsing/compilation/evaluation walk the nPL AST
     // recursively on runtime threads. Size worker + blocking stacks for the
     // depth the query complexity budget admits, so a hostile query can never

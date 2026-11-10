@@ -235,3 +235,45 @@ fn public_install_token_beside_a_dedicated_token_has_no_delivery_finding() {
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert!(findings[0].title.contains("install token is a public default"));
 }
+
+/// NAN-5042: strict is opt-in (`true` only). An upgraded install without the
+/// variable keeps accepting a private install token beside the dedicated one,
+/// so ingest hosts whose .env predates the token stay in the load balancer.
+#[test]
+fn strict_delivery_is_opt_in() {
+    for (value, strict) in [
+        (None, false),
+        (Some(""), false),
+        (Some("false"), false),
+        (Some("yes"), false),
+        (Some("true"), true),
+        (Some(" TRUE "), true),
+    ] {
+        assert_eq!(strict_from_value(value), strict, "{value:?}");
+    }
+    let upgraded = resolve_vector_config_delivery(
+        None,
+        Some("4be1-random-delivery"),
+        Some("9f2c-random-install"),
+        strict_from_value(None),
+    );
+    assert!(
+        matches!(upgraded, VectorConfigDeliveryCredential::DedicatedOrInstallToken { .. }),
+        "{upgraded:?}"
+    );
+    let strict = resolve_vector_config_delivery(
+        None,
+        Some("4be1-random-delivery"),
+        Some("9f2c-random-install"),
+        strict_from_value(Some("true")),
+    );
+    assert!(matches!(strict, VectorConfigDeliveryCredential::Dedicated(_)), "{strict:?}");
+    // A public install token is refused either way (NAN-5148).
+    let public = resolve_vector_config_delivery(
+        None,
+        Some("4be1-random-delivery"),
+        Some("nanosiem-default-token"),
+        strict_from_value(None),
+    );
+    assert!(matches!(public, VectorConfigDeliveryCredential::Dedicated(_)), "{public:?}");
+}

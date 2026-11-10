@@ -179,6 +179,13 @@ pub async fn run_health_check_with_trigger(
         &mut analysis,
         &crate::deployment_posture::PostureInputs::from_env(),
     );
+    // NAN-5204: automatic backups enabled but none succeeded in 36 hours.
+    match crate::backup_status::BackupStatusRepository::new(pool.clone()).get().await {
+        Ok(status) => {
+            analyzer::ensure_backup_findings(&mut analysis, status.as_ref(), chrono::Utc::now())
+        }
+        Err(e) => warn!("Failed to read backup status: {}", e),
+    }
     // NAN-5077: IP allowlist rule loads that failed (fail-closed enforcement),
     // as published to the system-health bus by nanosiem-api / nanosiem-search.
     match crate::system_health::SystemHealthRepository::new(pool.clone())

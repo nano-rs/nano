@@ -26,6 +26,7 @@ pub struct Database {
 impl Database {
     /// Create a new database connection pool
     pub async fn new(config: &DatabaseConfig) -> Result<Self, DatabaseError> {
+        super::tls_provider::install_default_crypto_provider();
         let mut pool_options = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .min_connections(config.min_connections)

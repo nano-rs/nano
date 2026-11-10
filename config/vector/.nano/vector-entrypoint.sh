@@ -214,4 +214,22 @@ exec 9<&-
     done
 ) &
 
+# --- public install token (NAN-5013) -----------------------------------------------------
+# nano refuses a publicly known VECTOR_AUTH_TOKEN on every ingest lane: nano-api never lists
+# it in the tokens file. The static fallback (NANO_INGEST_STATIC_FALLBACK=true, an explicit
+# opt-in for a missing tokens file) compares against ${VECTOR_AUTH_TOKEN} directly, so it is
+# switched off here for such a value. Keep this list identical to the vector_install_token
+# rows of config/known-public-secrets.txt (scripts/tests/test_vector_entrypoint_public_token.py).
+# BEGIN nano-public-install-token
+if [ "${NANO_INGEST_STATIC_FALLBACK:-}" = true ]; then
+    case "${VECTOR_AUTH_TOKEN:-}" in
+        CHANGE_ME|CHANGE_ME_GENERATED|CHANGE_ME_GENERATE_WITH_OPENSSL_RAND_HEX_32|nanosiem-default-token|your-secret-token)
+            echo "nano-vector: ignoring NANO_INGEST_STATIC_FALLBACK=true: VECTOR_AUTH_TOKEN is a publicly known default, which nano refuses. Set a generated token (re-run install.sh) or deliver the ingest tokens file." >&2
+            NANO_INGEST_STATIC_FALLBACK=false
+            export NANO_INGEST_STATIC_FALLBACK
+            ;;
+    esac
+fi
+# END nano-public-install-token
+
 exec "$VECTOR" "$@"

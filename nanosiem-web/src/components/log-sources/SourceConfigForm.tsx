@@ -97,6 +97,17 @@ export function SourceConfigForm({
         />
       );
 
+    case 'crowdstrike_fdr':
+      return (
+        <CrowdstrikeFdrConfigForm
+          config={config}
+          onChange={onConfigChange}
+          credentialId={credentialId}
+          onCredentialChange={onCredentialChange}
+          disabled={disabled}
+        />
+      );
+
     case 'aws_s3':
       return (
         <S3ConfigForm
@@ -439,6 +450,174 @@ function SqsConfigForm({ config, onChange, credentialId, onCredentialChange, dis
       </details>
 
       <IncludeBacklogToggle config={config} onChange={onChange} disabled={disabled} />
+
+      <CredentialPicker
+        provider="aws_s3"
+        value={credentialId}
+        onChange={onCredentialChange}
+        disabled={disabled}
+      />
+    </div>
+  );
+}
+
+/**
+ * NAN-5005: CrowdStrike Falcon Data Replicator on the Vector fork's
+ * `crowdstrike_fdr` source. The queue carries batch manifests; the source
+ * fetches the listed objects from S3 and deletes a message only once every
+ * event of its batch is delivered. Keys come from the bound AWS credential
+ * (static keys, or a role to assume); the region is read from the queue URL
+ * when left blank.
+ */
+const FDR_START_FROM = [
+  { value: 'beginning', label: 'Everything on the queue (default)' },
+  { value: 'now', label: 'Only batches after the first start' },
+  { value: 'cursor', label: 'Resume after the last delivered batch' },
+];
+
+const FDR_CHECKSUM = [
+  { value: 'verify', label: 'Verify (default): a bad file is retried' },
+  { value: 'warn', label: 'Warn: log and keep the events' },
+  { value: 'off', label: 'Off' },
+];
+
+function optionalNumber(value: string): number | undefined {
+  return value ? Number(value) : undefined;
+}
+
+function CrowdstrikeFdrConfigForm({ config, onChange, credentialId, onCredentialChange, disabled }: FormWithCredentialsProps) {
+  return (
+    <div className="space-y-3">
+      <div className="space-y-1.5">
+        <Label className={FIELD_LABEL}>FDR SQS Queue URL *</Label>
+        <Input
+          value={(config.queue_url as string) || ''}
+          onChange={(e) => onChange({ ...config, queue_url: e.target.value })}
+          placeholder="https://sqs.us-west-2.amazonaws.com/123456789012/cs-mav-cannon-queue"
+          disabled={disabled}
+          className={INPUT_MONO}
+        />
+        <p className={HELP_TEXT}>
+          The queue URL from the Falcon console (Data Replicator). Bind the FDR access key
+          below as an AWS credential.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div className="space-y-1.5">
+          <Label className={FIELD_LABEL}>AWS Region</Label>
+          <Select
+            value={(config.region as string) || 'auto'}
+            onValueChange={(v) => onChange({ ...config, region: v === 'auto' ? undefined : v })}
+            disabled={disabled}
+          >
+            <SelectTrigger className={INPUT_MONO}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="auto" className={SELECT_ITEM}>
+                From queue URL
+              </SelectItem>
+              {AWS_REGIONS.map((r) => (
+                <SelectItem key={r} value={r} className={SELECT_ITEM}>
+                  {r}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="space-y-1.5">
+          <Label className={FIELD_LABEL}>Start from</Label>
+          <Select
+            value={(config.start_from as string) || 'beginning'}
+            onValueChange={(v) => onChange({ ...config, start_from: v })}
+            disabled={disabled}
+          >
+            <SelectTrigger className={INPUT_MONO}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {FDR_START_FROM.map((o) => (
+                <SelectItem key={o.value} value={o.value} className={SELECT_ITEM}>
+                  {o.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <details className="group">
+        <summary className="cursor-pointer select-none text-[11.5px] text-muted-foreground hover:text-fg">
+          Advanced tuning
+        </summary>
+        <div className="mt-2.5 space-y-3 border-l border-border pl-3">
+          <div className="space-y-1.5">
+            <Label className={FIELD_LABEL}>Checksum</Label>
+            <Select
+              value={(config.checksum as string) || 'verify'}
+              onValueChange={(v) => onChange({ ...config, checksum: v })}
+              disabled={disabled}
+            >
+              <SelectTrigger className={INPUT_MONO}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {FDR_CHECKSUM.map((o) => (
+                  <SelectItem key={o.value} value={o.value} className={SELECT_ITEM}>
+                    {o.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label className={FIELD_LABEL}>File concurrency</Label>
+              <Input
+                type="number"
+                min={1}
+                max={64}
+                value={(config.file_concurrency as number | undefined) ?? ''}
+                onChange={(e) => onChange({ ...config, file_concurrency: optionalNumber(e.target.value) })}
+                placeholder="4"
+                disabled={disabled}
+                className={INPUT_MONO}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className={FIELD_LABEL}>Max in-flight batches</Label>
+              <Input
+                type="number"
+                min={1}
+                value={(config.max_inflight_manifests as number | undefined) ?? ''}
+                onChange={(e) => onChange({ ...config, max_inflight_manifests: optionalNumber(e.target.value) })}
+                placeholder="64"
+                disabled={disabled}
+                className={INPUT_MONO}
+              />
+            </div>
+          </div>
+          <p className={HELP_TEXT}>
+            Each object (about 30-35 MB) is held in memory while it is verified, so memory
+            grows with file concurrency.
+          </p>
+
+          <div className="space-y-1.5">
+            <Label className={FIELD_LABEL}>Custom Endpoint (optional)</Label>
+            <Input
+              value={(config.endpoint as string) || ''}
+              onChange={(e) => onChange({ ...config, endpoint: e.target.value || undefined })}
+              placeholder="http://localstack:4566"
+              disabled={disabled}
+              className={INPUT_MONO}
+            />
+            <p className={HELP_TEXT}>Testing only (LocalStack). Leave blank for CrowdStrike's AWS.</p>
+          </div>
+        </div>
+      </details>
 
       <CredentialPicker
         provider="aws_s3"

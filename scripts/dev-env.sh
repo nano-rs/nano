@@ -10,7 +10,8 @@
 #   once shipped as public defaults or examples (config/known-public-secrets.txt)
 #   exactly like install.sh does on upgrade. A public NANOSIEM_ENCRYPTION_KEY is
 #   moved to a key ring that keeps the old key decrypt-only, so stored
-#   credentials still open. A public VECTOR_AUTH_TOKEN is reported, not rotated.
+#   credentials still open. A public VECTOR_AUTH_TOKEN is rotated too (nano
+#   refuses it since v2.0.6, NAN-5013).
 #
 # Production installs do not use this: install.sh generates every secret.
 set -euo pipefail
@@ -37,7 +38,6 @@ if [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,NANOSIEM_ENCRYPTION_KEY,* ]]; the
     echo "NANOSIEM_ENCRYPTION_KEY is now a key ring; the old key stays decrypt-only (legacy-0) until"
     echo "'nanosiem-jobs credential-keys status' shows nothing pending, then: credential-keys retire legacy-0"
 fi
-if [[ -n "$NANO_PUBLIC_SECRET_KEYS" ]]; then
-    echo "WARNING: $NANO_PUBLIC_SECRET_KEYS is a publicly known default and was kept (senders use it)."
-    echo "         Issue named ingest tokens, move senders over, then disable the install token."
+if [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,VECTOR_AUTH_TOKEN,* ]]; then
+    echo "VECTOR_AUTH_TOKEN was a publicly known default (refused since v2.0.6); senders using it need a named ingest token."
 fi

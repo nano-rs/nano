@@ -92,6 +92,7 @@ const TRANSPORTS: TransportSpec[] = [
   { value: 'otlp', label: 'OpenTelemetry (OTLP)', icon: Plug, description: 'OTLP logs over gRPC (:4317) / HTTP (:4318).', popular: true },
   { value: 'aws_s3', label: 'AWS S3', icon: Cloud, description: 'Ingest objects from S3 via SQS notifications.', popular: true },
   { value: 'aws_sqs', label: 'AWS SQS', icon: Cloud, description: 'Consume an SQS queue directly, where the message body is the log.', popular: false },
+  { value: 'crowdstrike_fdr', label: 'CrowdStrike FDR', icon: Cloud, description: 'Falcon Data Replicator feed: SQS batch manifests and gzipped events in S3.' },
   { value: 'gcp_pubsub', label: 'GCP Pub/Sub', icon: Cloud, description: 'Subscribe to a Google Cloud Pub/Sub topic.' },
   { value: 'azure_event_hubs', label: 'Azure Event Hubs', icon: Cloud, description: 'Consume an Event Hub with a consumer group, checkpointed in Blob Storage.' },
   { value: 'kafka', label: 'Kafka', icon: Database, description: 'Consume events from one or more Kafka topics.' },

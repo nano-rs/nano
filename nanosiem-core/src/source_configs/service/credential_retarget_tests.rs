@@ -62,8 +62,8 @@ fn system_level_drivers_have_no_destination_and_unknown_drivers_fail_closed() {
 #[test]
 fn every_known_driver_is_listed_explicitly() {
     for t in [
-        "http", "kafka", "aws_s3", "aws_sqs", "gcp_pubsub", "azure_event_hubs", "splunk_hec",
-        "vector", "otlp",
+        "http", "kafka", "aws_s3", "aws_sqs", "crowdstrike_fdr", "gcp_pubsub", "azure_event_hubs",
+        "splunk_hec", "vector", "otlp",
     ] {
         assert!(
             crate::source_configs::types::SourceConfigType::from_str(t).is_some(),
@@ -101,4 +101,29 @@ fn aws_same_host_edits_are_not_moves() {
 fn driver_change_is_a_move() {
     let conn = json!({"bootstrap_servers": "kafka-1.corp:9092"});
     assert!(moves_credential_destination("kafka", &conn, "aws_sqs", &json!({})));
+}
+
+/// NAN-5005: an FDR source presents its AWS keys to the queue and to S3 in its
+/// region, so the queue host, a custom endpoint and the region are its
+/// destination; tuning knobs are not.
+#[test]
+fn crowdstrike_fdr_queue_endpoint_and_region_changes_are_moves() {
+    let old = json!({"queue_url": "https://sqs.us-west-2.amazonaws.com/1/cs-queue", "region": "us-west-2"});
+    let tuned = json!({
+        "queue_url": "https://sqs.us-west-2.amazonaws.com/1/cs-queue-2", "region": "US-WEST-2",
+        "start_from": "now", "checksum": "warn", "file_concurrency": 8
+    });
+    assert!(!moves_credential_destination("crowdstrike_fdr", &old, "crowdstrike_fdr", &tuned));
+    let queue = json!({"queue_url": "https://sqs.eu-west-1.amazonaws.com/1/cs-queue", "region": "us-west-2"});
+    assert!(moves_credential_destination("crowdstrike_fdr", &old, "crowdstrike_fdr", &queue), "queue host");
+    let region = json!({"queue_url": "https://sqs.us-west-2.amazonaws.com/1/cs-queue", "region": "eu-west-1"});
+    assert!(moves_credential_destination("crowdstrike_fdr", &old, "crowdstrike_fdr", &region), "region");
+    let endpoint = json!({
+        "queue_url": "https://sqs.us-west-2.amazonaws.com/1/cs-queue", "region": "us-west-2",
+        "endpoint": "https://s3.elsewhere.example"
+    });
+    assert!(moves_credential_destination("crowdstrike_fdr", &old, "crowdstrike_fdr", &endpoint), "endpoint");
+    assert!(moves_credential_destination("crowdstrike_fdr", &json!({}), "crowdstrike_fdr", &old), "first configuration");
+    assert!(moves_credential_destination("aws_sqs", &old, "crowdstrike_fdr", &old), "driver change");
+    assert!(!moves_credential_destination("fdr", &old, "crowdstrike_fdr", &old), "alias");
 }

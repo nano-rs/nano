@@ -18,6 +18,29 @@ case "${1:-}" in
         shift
         exec "$SCRIPT_DIR/nano-feeds" "$@"
         ;;
+    backup-schedule)
+        # NAN-5204: automatic backups (the nano-backup Compose service).
+        shift
+        scheduler="$SCRIPT_DIR/nano-backup-scheduler.py"
+        case "${1:---status}" in
+            --configure) shift; exec python3 -I "$scheduler" "$@" configure ;;
+            --disable) shift; exec python3 -I "$scheduler" "$@" disable ;;
+            --status) [[ $# -eq 0 ]] || shift; exec python3 -I "$scheduler" "$@" status ;;
+            --run-now)
+                # The backup runs inside the service (network credentials, no socket).
+                printf 'Run: docker compose exec nano-backup nano-backup --install-dir /install run-once\n' >&2
+                exit 2 ;;
+            --list) shift; exec python3 -I "$scheduler" "$@" list ;;
+            --probe) shift; exec python3 -I "$scheduler" "$@" probe ;;
+            --fetch)
+                [[ $# -ge 4 && "$3" == "--to" ]] \
+                    || { printf 'usage: scripts/nano backup-schedule --fetch NAME|latest --to DIR\n' >&2; exit 2; }
+                exec python3 -I "$scheduler" fetch "$2" --to "$4" ;;
+            *)
+                printf 'usage: scripts/nano backup-schedule [--status|--configure|--disable|--run-now|--list|--probe|--fetch NAME --to DIR]\n' >&2
+                exit 2 ;;
+        esac
+        ;;
 esac
 
 if ((BASH_VERSINFO[0] < 4)); then
@@ -108,7 +131,7 @@ usage() {
 Usage:
   scripts/nano bundle verify <nano-<version>-<edition>.tar> [--json]
   scripts/nano bundle load <nano-<version>-<edition>.tar>
-  scripts/nano backup-keygen --output KEY.pem
+  scripts/nano backup-keygen --output KEY.pem | --split DIR
   scripts/nano backup --key-file KEY.pem [--output DIR]
                       [--include-clickhouse-data [--base FULL_BACKUP]]
                       [--keep N] [--clickhouse-disk DISK]
@@ -135,6 +158,8 @@ Usage:
   scripts/nano upgrade --abandon-incomplete RUN_ID --abandon-reason REASON
   scripts/nano rollback [--inventory FILE]
   scripts/nano feeds <status | update [--file FILE]>
+  scripts/nano backup-schedule [--status | --configure | --disable | --run-now
+                               | --list | --probe | --fetch NAME|latest --to DIR]
 
 Local ClickHouse archives are inside the AES-256-GCM encrypted payload.
 External disks are accepted only when ClickHouse reports disk type `encrypted`;
@@ -1112,10 +1137,49 @@ mark_snapshot_ready() {
     [[ -z "$gate" ]] || install -m 0600 /dev/null "$gate/snapshot-ready"
 }
 
+# Key custody (NAN-5204). A backup only needs PUBLIC material on the host:
+#   --key-file          the recipient certificate the payload is encrypted to
+#                       (a legacy combined key+certificate PEM still works);
+#   --signing-key       the host's signing key + certificate (or
+#                       NANO_BACKUP_SIGNING_KEY); a combined key file signs
+#                       with its own key.
+# The recipient PRIVATE key is needed only to restore (and to decrypt an
+# incremental base). `backup-keygen --split` writes the off-host recovery key
+# file: recipient key, recipient certificate and signing certificate, so one
+# file both decrypts and verifies every bundle.
+SIGNING_KEY="${NANO_BACKUP_SIGNING_KEY:-}"
+SIGNER=""
+
+has_private_key() { openssl pkey -in "$1" -noout >/dev/null 2>&1; }
+
 validate_key_file() {
-    validate_regular_0600 "$1" "backup key"
-    openssl x509 -in "$1" -noout >/dev/null 2>&1 || die "backup key has no PEM certificate"
-    openssl pkey -in "$1" -noout >/dev/null 2>&1 || die "backup key has no usable PEM private key"
+    local file="$1" purpose="${2:-decrypt}"
+    validate_regular_0600 "$file" "backup key"
+    openssl x509 -in "$file" -noout >/dev/null 2>&1 || die "backup key has no PEM certificate"
+    if [[ "$purpose" == decrypt ]]; then
+        has_private_key "$file" \
+            || die "backup key has no usable PEM private key; restoring needs the off-host recovery key file"
+    fi
+}
+
+resolve_signer() {
+    local key_file="$1"
+    if [[ -n "$SIGNING_KEY" ]]; then
+        validate_regular_0600 "$SIGNING_KEY" "backup signing key"
+        has_private_key "$SIGNING_KEY" || die "backup signing key has no usable PEM private key"
+        openssl x509 -in "$SIGNING_KEY" -noout >/dev/null 2>&1 || die "backup signing key lacks its PEM certificate"
+        SIGNER="$SIGNING_KEY"
+    elif has_private_key "$key_file"; then
+        SIGNER="$key_file"
+    else
+        die "a certificate-only backup key needs --signing-key (create both with: scripts/nano backup-keygen --split DIR)"
+    fi
+}
+
+trust_args() {
+    local key="$1"
+    printf -- '--trust\0%s\0' "$key"
+    [[ -z "$SIGNING_KEY" ]] || printf -- '--trust\0%s\0' "$SIGNING_KEY"
 }
 
 snapshot_bundle() {
@@ -1133,9 +1197,9 @@ snapshot_bundle() {
 }
 
 verify_signature() {
-    local manifest="$1" signature="$2" key="$3"
-    openssl x509 -in "$key" -pubkey -noout 2>/dev/null \
-        | openssl dgst -sha256 -verify /dev/stdin -signature "$signature" "$manifest" >/dev/null 2>&1
+    local manifest="$1" signature="$2" key="$3" trust=()
+    mapfile -d '' -t trust < <(trust_args "$key")
+    python3 -I "$MANIFEST_TOOL" verify-signature "${trust[@]}" --signature "$signature" "$manifest" >/dev/null 2>&1
 }
 
 load_snapshot() {
@@ -1332,39 +1396,11 @@ SQL
 }
 
 write_manifest() {
-    python3 -I - "$1" "$2" "$3" "$4" "$CURRENT_VERSION" "$CURRENT_EDITION" "$CURRENT_SCHEMA_PROFILE" "$TOPOLOGY_MODE" \
-        "$DEPLOYMENT_ID" "$DEPLOYMENT_IDENTITY" "$HOST_ID" "$ROLE_LIST" "$CURRENT_SHARD" "$CURRENT_REPLICA" "$SHARD_COUNT" \
-        "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" "${18}" "${19}" "${20}" "${21}" "${22}" <<'PY'
-import hashlib, json, pathlib, sys
-(out, payload_dir, payload_sha, bid, version, edition, schema, topology, deployment, identity, host, roles, shard, replica, shard_count,
- pg_in, pg_mig, pg_bytes, ch_in, ch_mig, ch_bytes, disk, archive, external, external_encrypted, scope, base_id, base_sha,
- created, fingerprint, set_id, quiesce_epoch, clickhouse_data) = sys.argv[1:]
-root = pathlib.Path(payload_dir)
-def digest_file(path):
-    digest = hashlib.sha256()
-    with path.open('rb') as source:
-        for block in iter(lambda: source.read(1024 * 1024), b''):
-            digest.update(block)
-    return digest.hexdigest()
-checksums = {str(p.relative_to(root)): digest_file(p) for p in sorted(root.rglob('*')) if p.is_file()}
-recovery = {"id": set_id, "quiesce_epoch": quiesce_epoch} if topology == "role-split" else None
-document = {
- "format":"nano-backup-v2", "backup_id":bid, "created_at":created, "nano_version":version, "edition":edition,
- "schema_profile":schema, "recovery_set":recovery, "clickhouse_data":clickhouse_data,
- "topology":{"mode":topology,"deployment_id":deployment,"deployment_identity_sha256":identity or None,"host_id":host,
-             "roles":[r for r in roles.split(',') if r],"clickhouse_shard":int(shard),"clickhouse_replica":int(replica),
-             "clickhouse_shard_count":int(shard_count)},
- "components":{"postgres":{"included":pg_in=="true","migration_version":int(pg_mig or 0),"source_bytes":int(pg_bytes or 0)},
-               "clickhouse":{"included":ch_in=="true","migration_version":int(ch_mig or 0),"source_bytes":int(ch_bytes or 0),
-                 "disk":disk or None,"archive":archive or None,"external":external=="true",
-                 "external_disk_encrypted":external_encrypted=="true","scope":scope,
-                 "base_backup_id":base_id or None,"base_payload_sha256":base_sha or None},
-               "configuration":{"included":True}},
- "encryption":{"format":"CMS AuthEnvelopedData","cipher":"AES-256-GCM","recipient_certificate_sha256":fingerprint},
- "payload":{"file":"payload.cms","sha256":payload_sha,"plaintext_sha256":checksums}}
-pathlib.Path(out).write_text(json.dumps(document, sort_keys=True, indent=2)+'\n', encoding='utf-8')
-PY
-    chmod 600 "$1"
+    python3 -I "$MANIFEST_TOOL" write-manifest "$1" "$2" "$3" "$4" "$CURRENT_VERSION" "$CURRENT_EDITION" \
+        "$CURRENT_SCHEMA_PROFILE" "$TOPOLOGY_MODE" "$DEPLOYMENT_ID" "$DEPLOYMENT_IDENTITY" "$HOST_ID" "$ROLE_LIST" \
+        "$CURRENT_SHARD" "$CURRENT_REPLICA" "$SHARD_COUNT" \
+        "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" "${18}" "${19}" \
+        "${20}" "${21}" "${22}" || die "cannot write the backup manifest"
 }
 
 available_pg_migration() {
@@ -1386,11 +1422,17 @@ PY
 }
 
 backup_keygen() {
-    local output="" tmp key cert
+    local output="" split="" tmp key cert
     while [[ $# -gt 0 ]]; do case "$1" in
         --output) [[ $# -ge 2 ]] || usage; output="$2"; shift 2 ;;
+        --split) [[ $# -ge 2 ]] || usage; split="$2"; shift 2 ;;
         *) usage ;;
     esac; done
+    if [[ -n "$split" ]]; then
+        [[ -z "$output" ]] || usage
+        backup_keygen_split "$split"
+        return
+    fi
     [[ -n "$output" ]] || usage
     require_cmd openssl "install OpenSSL"
     [[ ! -e "$output" && ! -L "$output" ]] || die "refusing to overwrite $output"
@@ -1603,12 +1645,11 @@ actual_ch_signed_counts() {
 }
 
 prune_backups() {
-    local parent="$1" keep="$2" key="$3" public_key="$WORK_DIR/operator.pub" plan="$WORK_DIR/retention-plan.bin" candidate
+    local parent="$1" keep="$2" key="$3" plan="$WORK_DIR/retention-plan.bin" candidate trust=()
     ((keep > 0)) || return 0
-    openssl x509 -in "$key" -pubkey -noout > "$public_key"
-    chmod 600 "$public_key"
+    mapfile -d '' -t trust < <(trust_args "$key")
     python3 -I "$MANIFEST_TOOL" retention --parent "$parent" --keep "$keep" --edition "$CURRENT_EDITION" \
-        --identity "$DEPLOYMENT_IDENTITY" --host "$HOST_ID" --public-key "$public_key" > "$plan" \
+        --identity "$DEPLOYMENT_IDENTITY" --host "$HOST_ID" "${trust[@]}" > "$plan" \
         || die "retention verification failed; no bundle was pruned"
     while IFS= read -r -d '' candidate; do
         [[ "$(dirname "$candidate")" == "$parent" && -d "$candidate" && ! -L "$candidate" ]] || die "unsafe retention target"
@@ -1627,7 +1668,26 @@ prune_backups() {
 LOOKUP_ROWS_TABLE=lookup_rows
 LOOKUP_ROWS_FILE=clickhouse-lookup-rows.native
 LOOKUP_ROWS_COUNT_FILE=clickhouse-lookup-rows.count
-LOOKUP_ROWS_LIVE_COUNT_SQL="SELECT count() FROM (SELECT argMax(deleted, version) AS d FROM nanosiem.lookup_rows GROUP BY lookup_table_name, row_id HAVING d = 0) FORMAT TSVRaw"
+# NAN-1728: a multi-shard cluster spreads the rows across shards and reads
+# them through `lookup_rows_distributed`; export and count through it there.
+lookup_read_table() {
+    local exists
+    exists="$(printf 'EXISTS TABLE nanosiem.lookup_rows_distributed FORMAT TSVRaw\n' | ch_query | tr -d '[:space:]')"
+    if [[ "$exists" == 1 ]]; then printf 'lookup_rows_distributed'; else printf 'lookup_rows'; fi
+}
+
+lookup_live_count() {
+    printf 'SELECT count() FROM (SELECT argMax(deleted, version) AS d FROM nanosiem.%s GROUP BY lookup_table_name, row_id HAVING d = 0) FORMAT TSVRaw\n' \
+        "$(lookup_read_table)" | ch_query | tr -d '[:space:]'
+}
+
+lookup_cluster_clause() {
+    local cluster
+    [[ "$TOPOLOGY_MODE" == role-split ]] || return 0
+    cluster="$(role_env_value CLICKHOUSE_CLUSTER)"; cluster="${cluster:-default}"
+    [[ "$cluster" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,63}$ ]] || die "invalid ClickHouse cluster name"
+    printf " ON CLUSTER '%s'" "$cluster"
+}
 
 # The export and import go through a server-side file() in ClickHouse's
 # user_files directory: the format is set by the server, so the client's
@@ -1640,29 +1700,61 @@ lookup_user_files_dir() {
     printf '%s' "${dir%/}"
 }
 
+# NAN-5204 review M1: the signed count is derived from the exported file
+# itself (one export, no second query a concurrent write could skew), and a
+# truncated file fails to parse.
+lookup_file_live_count() {
+    python3 -I "$SCRIPT_DIR/nano-backup-scheduler.py" --install-dir "$INSTALL_DIR" lookup-count --file "$1"
+}
+
 export_lookup_rows() {
     local payload="$1" name dir rows
     name="nano-lookup-rows-$(openssl rand -hex 8).native"
     dir="$(lookup_user_files_dir)"
-    rows="$(printf '%s\n' "$LOOKUP_ROWS_LIVE_COUNT_SQL" | ch_query | tr -d '[:space:]')"
-    [[ "$rows" =~ ^[0-9]+$ ]] || die "cannot count ClickHouse lookup rows"
-    printf "INSERT INTO FUNCTION file('%s', 'Native') SELECT * FROM nanosiem.%s\n" "$name" "$LOOKUP_ROWS_TABLE" \
+    printf "INSERT INTO FUNCTION file('%s', 'Native') SELECT %s FROM nanosiem.%s SETTINGS low_cardinality_allow_in_native_format = 0\n" \
+        "$name" "lookup_table_name, row_id, key_raw, key_lc, cols_json, version, deleted" "$(lookup_read_table)" \
         | ch_query >/dev/null || die "cannot export ClickHouse lookup rows"
     "$DOCKER_BIN" cp "$CH_CONTAINER:$dir/$name" "$payload/$LOOKUP_ROWS_FILE" >/dev/null \
         || die "cannot copy the ClickHouse lookup-row export"
     "$DOCKER_BIN" exec "$CH_CONTAINER" rm -f -- "$dir/$name" >/dev/null 2>&1 || true
     chmod 600 "$payload/$LOOKUP_ROWS_FILE"
+    rows="$(lookup_file_live_count "$payload/$LOOKUP_ROWS_FILE")" || die "the lookup-row export is not readable"
+    [[ "$rows" =~ ^[0-9]+$ ]] || die "cannot count the exported lookup rows"
     printf '%s\n' "$rows" > "$payload/$LOOKUP_ROWS_COUNT_FILE"
     chmod 600 "$payload/$LOOKUP_ROWS_COUNT_FILE"
     log "captured $rows lookup-table row(s) from ClickHouse"
 }
 
-import_lookup_rows() {
-    local payload="$1" name dir expected actual
+network_lookup_rows() {
+    local action="$1" payload="$2" rows
+    rows="$(python3 -I "$SCRIPT_DIR/nano-backup-scheduler.py" --install-dir "$INSTALL_DIR" \
+        "lookup-$action" --payload "$payload")" || return 1
+    [[ "$rows" =~ ^[0-9]+$ ]] || return 1
+    if [[ "$action" == export ]]; then
+        log "captured $rows lookup-table row(s) from ClickHouse over the network"
+    else
+        log "restored $rows lookup-table row(s) into ClickHouse over the network"
+    fi
+}
+
+# Run before any target mutation: the export must hold exactly the signed
+# number of live rows, or the restore stops with nothing changed (review M1).
+validate_lookup_payload() {
+    local payload="$1" expected live
     [[ -f "$payload/$LOOKUP_ROWS_FILE" && -f "$payload/$LOOKUP_ROWS_COUNT_FILE" ]] \
         || die "signed backup records lookup rows but its payload lacks them"
     expected="$(tr -d '[:space:]' < "$payload/$LOOKUP_ROWS_COUNT_FILE")"
     [[ "$expected" =~ ^[0-9]+$ ]] || die "signed lookup-row count is invalid"
+    live="$(lookup_file_live_count "$payload/$LOOKUP_ROWS_FILE")" \
+        || die "the backed-up lookup-row export is unreadable; nothing was changed"
+    [[ "$live" == "$expected" ]] \
+        || die "the backed-up lookup-row export holds $live live rows, the signed count is $expected; nothing was changed"
+}
+
+import_lookup_rows() {
+    local payload="$1" name dir expected actual
+    validate_lookup_payload "$payload"
+    expected="$(tr -d '[:space:]' < "$payload/$LOOKUP_ROWS_COUNT_FILE")"
     prepare_ch
     name="nano-lookup-rows-$(openssl rand -hex 8).native"
     dir="$(lookup_user_files_dir)"
@@ -1671,11 +1763,11 @@ import_lookup_rows() {
     "$DOCKER_BIN" exec "$CH_CONTAINER" chown clickhouse:clickhouse "$dir/$name" >/dev/null 2>&1 || true
     # The restored PostgreSQL lookup registry is authoritative: replace the
     # target's rows with exactly the backed-up ones.
-    printf "TRUNCATE TABLE nanosiem.%s;\nINSERT INTO nanosiem.%s SELECT * FROM file('%s', 'Native');\n" \
-        "$LOOKUP_ROWS_TABLE" "$LOOKUP_ROWS_TABLE" "$name" | ch_query >/dev/null \
+    printf "TRUNCATE TABLE nanosiem.%s%s;\nINSERT INTO nanosiem.%s SELECT * FROM file('%s', 'Native');\n" \
+        "$LOOKUP_ROWS_TABLE" "$(lookup_cluster_clause)" "$LOOKUP_ROWS_TABLE" "$name" | ch_query >/dev/null \
         || post_cutover_fail "ClickHouse lookup-row import failed"
     "$DOCKER_BIN" exec "$CH_CONTAINER" rm -f -- "$dir/$name" >/dev/null 2>&1 || true
-    actual="$(printf '%s\n' "$LOOKUP_ROWS_LIVE_COUNT_SQL" | ch_query | tr -d '[:space:]')"
+    actual="$(lookup_live_count)"
     [[ "$actual" == "$expected" ]] \
         || post_cutover_fail "restored lookup rows ($actual) do not match the signed backup ($expected)"
     log "restored $actual lookup-table row(s) into ClickHouse"
@@ -1691,6 +1783,7 @@ backup_command() {
     while [[ $# -gt 0 ]]; do case "$1" in
         --key-file) key_file="$2"; shift 2 ;; --output) output="$2"; shift 2 ;; --base) base_bundle="$2"; shift 2 ;;
         --include-clickhouse-data|--include-events) include_ch_data=1; shift ;;
+        --signing-key) SIGNING_KEY="$2"; shift 2 ;;
         --keep) keep="$2"; shift 2 ;; --clickhouse-disk) ch_disk="$2"; shift 2 ;; --on-cluster) on_cluster=1; shift ;;
         --recovery-set-id) set_id="$2"; shift 2 ;; --quiesce-epoch) quiesce_epoch="$2"; shift 2 ;;
         --snapshot-gate) snapshot_gate="$2"; shift 2 ;;
@@ -1701,7 +1794,9 @@ backup_command() {
     [[ -n "$key_file" ]] || usage
     [[ "$keep" =~ ^[0-9]+$ ]] || die "--keep must be a non-negative integer"
     [[ "$component" =~ ^(auto|postgres|clickhouse)$ ]] || die "--component must be postgres or clickhouse"
-    init_context; validate_key_file "$key_file"
+    init_context; validate_key_file "$key_file" encrypt; resolve_signer "$key_file"
+    [[ -z "$base_bundle" ]] || has_private_key "$key_file" \
+        || die "--base decrypts the base backup; pass the recovery key file as --key-file"
     # A legacy-layout transition backup also captures a physical snapshot of
     # every data volume, so its ClickHouse data is in the bundle regardless.
     ((!LEGACY_LAYOUT)) || include_ch_data=1
@@ -1789,8 +1884,15 @@ PY
         || die "ClickHouse backup component requested on a host without the clickhouse role"
     [[ "$pg_in" == true || "$ch_in" == true ]] \
         || die "nothing to back up on this host: ClickHouse data is excluded by default; pass --include-clickhouse-data"
-    if ((!include_ch_data)) && [[ "$pg_in" == true ]] && has_role clickhouse; then
-        prepare_ch; capture_lookups=1; ch_data=lookups
+    if ((!include_ch_data)) && [[ "$pg_in" == true ]]; then
+        if has_role clickhouse; then
+            prepare_ch; capture_lookups=1
+        else
+            # A role-split PostgreSQL host reads the lookup rows over the
+            # network as the SELECT-only `nano_backup` ClickHouse user.
+            capture_lookups=2
+        fi
+        ch_data=lookups
     fi
     [[ "$ch_in" != true ]] || install_legacy_clickhouse_backup_config
     if [[ -n "$base_bundle" ]]; then
@@ -1847,7 +1949,17 @@ PY
     fi
     # Same writer-quiesced window as the PostgreSQL snapshot, so the lookup
     # rows match the restored lookup registry.
-    ((!capture_lookups)) || export_lookup_rows "$payload"
+    case "$capture_lookups" in
+        1) export_lookup_rows "$payload" ;;
+        2)
+            # Review M4: ClickHouse unreachable must not cost the PostgreSQL
+            # backup. The bundle records clickhouse_data=excluded instead.
+            if ! network_lookup_rows export "$payload"; then
+                rm -f -- "$payload/$LOOKUP_ROWS_FILE" "$payload/$LOOKUP_ROWS_COUNT_FILE"
+                ch_data=excluded
+                warn "LOOKUP ROWS NOT INCLUDED: ClickHouse was not reachable from this host (NANO_CLICKHOUSE_REMOTE_ADDRESS); the backup holds PostgreSQL and configuration only"
+            fi ;;
+    esac
     if [[ "$ch_in" == true ]]; then
         ch_bytes="$(printf "SELECT coalesce(sum(bytes_on_disk),0) FROM system.parts WHERE active AND database='nanosiem' FORMAT TSVRaw\n" | ch_query | tr -d '[:space:]')"
         [[ "$ch_bytes" =~ ^[0-9]+$ ]] || die "cannot read ClickHouse backup metadata"
@@ -1901,7 +2013,7 @@ PY
     write_manifest "$BUNDLE_TMP/manifest.json" "$payload" "$(sha256_file "$BUNDLE_TMP/payload.cms")" "$backup_id" \
         "$pg_in" "$pg_mig" "$pg_bytes" "$ch_in" "$ch_mig" "$ch_bytes" "$manifest_disk" "$archive" "$external" \
         "$external_encrypted" "$scope" "$base_id" "$base_sha" "$created" "$fingerprint" "$set_id" "$quiesce_epoch" "$ch_data"
-    openssl dgst -sha256 -sign "$key_file" -out "$BUNDLE_TMP/manifest.sig" "$BUNDLE_TMP/manifest.json"
+    openssl dgst -sha256 -sign "$SIGNER" -out "$BUNDLE_TMP/manifest.sig" "$BUNDLE_TMP/manifest.json"
     chmod 600 "$BUNDLE_TMP/manifest.sig"; chmod 700 "$BUNDLE_TMP"
     mv "$BUNDLE_TMP" "$output"; BUNDLE_TMP=""
     ok "backup complete: $output (ClickHouse data: $ch_data)"
@@ -1910,16 +2022,50 @@ PY
     ok "backup timing: writers_down_ms=$writer_down_ms total_ms=$total_ms"
 }
 
+# NAN-5204: three files from two key pairs. Only the first two stay on the
+# host; the recovery key file must be moved off it.
+#   recipient.crt     certificate every backup is encrypted to
+#   signing.pem       host signing key + certificate (signs manifests)
+#   recovery-key.pem  recipient private key + recipient certificate +
+#                     signing certificate: decrypts and verifies on restore
+backup_keygen_split() {
+    local dir="$1" tmp name
+    require_cmd openssl "install OpenSSL"
+    mkdir -p "$dir"; chmod 700 "$dir"
+    for name in recipient.crt signing.pem recovery-key.pem; do
+        [[ ! -e "$dir/$name" && ! -L "$dir/$name" ]] || die "refusing to overwrite $dir/$name"
+    done
+    tmp="$(mktemp -d "$dir/.nano-key.XXXXXX")"; WORK_DIR="$tmp"
+    log "generating the backup recipient and signing key pairs"
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$tmp/recipient.key" >/dev/null 2>&1
+    openssl req -x509 -new -sha256 -days 36500 -key "$tmp/recipient.key" -subj /CN=nano-backup-recipient \
+        -out "$tmp/recipient.crt" >/dev/null 2>&1
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$tmp/signing.key" >/dev/null 2>&1
+    openssl req -x509 -new -sha256 -days 36500 -key "$tmp/signing.key" -subj /CN=nano-backup-signing \
+        -out "$tmp/signing.crt" >/dev/null 2>&1
+    cat "$tmp/recipient.crt" > "$tmp/out-recipient.crt"
+    { cat "$tmp/signing.crt"; cat "$tmp/signing.key"; } > "$tmp/out-signing.pem"
+    { cat "$tmp/recipient.crt"; cat "$tmp/recipient.key"; cat "$tmp/signing.crt"; } > "$tmp/out-recovery.pem"
+    chmod 600 "$tmp"/out-*
+    mv "$tmp/out-recipient.crt" "$dir/recipient.crt"
+    mv "$tmp/out-signing.pem" "$dir/signing.pem"
+    mv "$tmp/out-recovery.pem" "$dir/recovery-key.pem"
+    WORK_DIR=""; rm -rf -- "$tmp"
+    ok "wrote $dir/recipient.crt and $dir/signing.pem (stay on this host)"
+    warn "MOVE $dir/recovery-key.pem OFF this host now; restores need it and nothing else can decrypt your backups"
+}
+
 recovery_set_create_command() {
     local key="" output="" max_skew=300 bundle set_id="" epoch="" snapshot temp
     local bundles=() manifests=()
     while [[ $# -gt 0 ]]; do case "$1" in
         --key-file) key="$2"; shift 2 ;; --output) output="$2"; shift 2 ;; --bundle) bundles+=("$2"); shift 2 ;;
-        --max-skew) max_skew="$2"; shift 2 ;; *) usage ;;
+        --max-skew) max_skew="$2"; shift 2 ;; --signing-key) SIGNING_KEY="$2"; shift 2 ;; *) usage ;;
     esac; done
     [[ -n "$key" && -n "$output" && ${#bundles[@]} -ge 1 ]] || usage
     [[ "$max_skew" =~ ^[0-9]+$ ]] || die "--max-skew must be a non-negative integer"
-    require_cmd python3 "install Python 3"; require_cmd openssl "install OpenSSL"; validate_key_file "$key"
+    require_cmd python3 "install Python 3"; require_cmd openssl "install OpenSSL"
+    validate_key_file "$key" encrypt; resolve_signer "$key"
     [[ -f "$MANIFEST_TOOL" ]] || die "manifest helper is missing: $MANIFEST_TOOL"
     [[ ! -e "$output" && ! -L "$output" ]] || die "recovery set output exists: $output"
     mkdir -p "$(dirname "$output")"
@@ -1936,7 +2082,7 @@ recovery_set_create_command() {
     temp="$(mktemp -d "$(dirname "$output")/.nano-recovery-set.XXXXXX")"; BUNDLE_TMP="$temp"
     python3 -I "$MANIFEST_TOOL" create-set --set-id "$set_id" --quiesce-epoch "$epoch" --max-skew "$max_skew" \
         --output "$temp/recovery-set.json" "${manifests[@]}" >/dev/null
-    openssl dgst -sha256 -sign "$key" -out "$temp/recovery-set.sig" "$temp/recovery-set.json"
+    openssl dgst -sha256 -sign "$SIGNER" -out "$temp/recovery-set.sig" "$temp/recovery-set.json"
     chmod 600 "$temp/recovery-set.json" "$temp/recovery-set.sig"; chmod 700 "$temp"
     mv "$temp" "$output"; BUNDLE_TMP=""
     ok "signed recovery set complete: $output"
@@ -2653,6 +2799,9 @@ restore_command() {
     decrypt_snapshot "$primary_snapshot" "$key" "$payload" "$M_CHECKSUMS"
     [[ -z "$base_snapshot" ]] || decrypt_snapshot "$base_snapshot" "$key" "$base_payload" "$B_CHECKSUMS"
     [[ -f "$payload/.env" ]] || die "encrypted payload lacks .env"
+    # Review M1: a lookup export that does not match its signed count stops
+    # the restore here, before writers stop or any database is touched.
+    [[ "$M_CH_DATA" != lookups ]] || validate_lookup_payload "$payload"
     if [[ "$restore_layout" == legacy ]]; then
         [[ "$M_MODE" == single ]] || die "legacy layout restore supports only single-node backups"
         [[ -f "$payload/legacy-layout/layout.json" \
@@ -2768,8 +2917,13 @@ PY
         pg_unfence_target
     fi
     [[ "$M_CH_DATA" == included ]] || rebuild_clickhouse_schema
-    if [[ "$M_CH_DATA" == lookups ]] && has_role clickhouse; then
-        import_lookup_rows "$payload"
+    if [[ "$M_CH_DATA" == lookups ]]; then
+        if has_role clickhouse; then
+            import_lookup_rows "$payload"
+        elif [[ "$TOPOLOGY_MODE" == role-split ]]; then
+            network_lookup_rows import "$payload" \
+                || post_cutover_fail "ClickHouse lookup-row import over the network failed"
+        fi
     fi
     if [[ ${#STOPPED_SERVICES[@]} -gt 0 ]]; then
         dc up -d "${STOPPED_SERVICES[@]}" >/dev/null

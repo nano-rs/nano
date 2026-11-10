@@ -15,6 +15,7 @@ export const SOURCE_TYPE_LABELS: Record<string, string> = {
   kafka: 'Kafka',
   aws_s3: 'AWS S3',
   aws_sqs: 'AWS SQS',
+  crowdstrike_fdr: 'CrowdStrike FDR',
   gcp_pubsub: 'GCP Pub/Sub',
   azure_event_hubs: 'Azure Event Hubs',
   splunk_hec: 'Splunk HEC',

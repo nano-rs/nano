@@ -687,7 +687,14 @@ pub(crate) fn apply_resolved_dispatch_routes(
         } else if parser.kind != "enrichment"
             && matches!(
                 parser.source_type.as_str(),
-                "kafka" | "aws_s3" | "aws_sqs" | "s3" | "gcp_pubsub" | "pubsub" | "azure_event_hubs"
+                "kafka"
+                    | "aws_s3"
+                    | "aws_sqs"
+                    | "crowdstrike_fdr"
+                    | "s3"
+                    | "gcp_pubsub"
+                    | "pubsub"
+                    | "azure_event_hubs"
             )
         {
             tracing::error!(

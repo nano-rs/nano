@@ -95,6 +95,7 @@ const TRANSPORT_ICON: Record<string, React.ComponentType<{ className?: string }>
   aws_s3: Cloud,
   gcp_pubsub: Cloud,
   azure_event_hubs: Cloud,
+  crowdstrike_fdr: Cloud,
   kafka: Database,
   splunk_hec: Zap,
 };
@@ -105,6 +106,7 @@ const TRANSPORT_LABEL: Record<string, string> = {
   aws_s3: 'AWS S3',
   gcp_pubsub: 'GCP Pub/Sub',
   azure_event_hubs: 'Azure Event Hubs',
+  crowdstrike_fdr: 'CrowdStrike FDR',
   kafka: 'Kafka',
   splunk_hec: 'Splunk HEC',
 };
@@ -138,6 +140,7 @@ const CANONICAL_MATCH_FIELD: Partial<Record<SourceConfigType, { field: string; h
   aws_s3: { field: 'bucket', hint: 'S3 bucket name.' },
   gcp_pubsub: { field: 'subscription', hint: 'GCP Pub/Sub subscription name.' },
   azure_event_hubs: { field: 'message', hint: 'Event body (Azure Monitor batches are split per record after routing).' },
+  crowdstrike_fdr: { field: 'message', hint: 'One FDR event line. Unmatched events go to the CrowdStrike Falcon parser (crowdstrike_falcon).' },
 };
 
 // NAN-649: pull-source drivers (broker-bound). The detail page renders the
@@ -150,7 +153,7 @@ const CANONICAL_MATCH_FIELD: Partial<Record<SourceConfigType, { field: string; h
 // `splunk_hec_ingest` listener (:8088) with `sourcetype` in the JSON
 // envelope. A user `splunk_hec` source config is a routing profile, not a
 // new socket, so it shares HTTP's "one config, N rules" model.
-const PULL_SOURCE_TYPES: SourceConfigType[] = ['kafka', 'aws_s3', 'aws_sqs', 'gcp_pubsub', 'azure_event_hubs'];
+const PULL_SOURCE_TYPES: SourceConfigType[] = ['kafka', 'aws_s3', 'aws_sqs', 'crowdstrike_fdr', 'gcp_pubsub', 'azure_event_hubs'];
 const isPullSource = (t: string): boolean =>
   PULL_SOURCE_TYPES.includes(t as SourceConfigType);
 
@@ -179,6 +182,12 @@ const BINDING_CALLOUT: Partial<
       'This Event Hubs source binds to one consumer group on one Event Hub. To ingest from another hub, create a separate Source Configuration. Give each its own consumer group — readers sharing one compete for partitions.',
     multipleHint:
       'To split one hub into multiple source types, switch to Multiple-source-types mode below (e.g. by an application property).',
+  },
+  crowdstrike_fdr: {
+    binding:
+      'This FDR source binds to one CrowdStrike FDR queue. Lookup snapshots (fdrv2-*: aidmaster, managedassets) are dropped; every other event goes to the CrowdStrike Falcon parser unless a rule says otherwise.',
+    multipleHint:
+      'FDR events are all Falcon telemetry; splitting them is rarely needed.',
   },
   aws_s3: {
     binding:

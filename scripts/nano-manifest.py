@@ -523,13 +523,8 @@ def retention_command(args: argparse.Namespace) -> None:
                 snap_manifest, snap_signature = temp_path / "manifest.json", temp_path / "manifest.sig"
                 shutil.copyfile(manifest, snap_manifest)
                 shutil.copyfile(signature, snap_signature)
-                result = subprocess.run(
-                    ["openssl", "dgst", "-sha256", "-verify", str(args.public_key), "-signature", str(snap_signature), str(snap_manifest)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-                need(result.returncode == 0, "signature verification failed")
+                verify_signature_command(argparse.Namespace(
+                    trust=args.trust, signature=snap_signature, file=snap_manifest))
                 _, value = read_json_once(snap_manifest)
                 fields = validate_bundle(value)
             need(sha256_file(payload) == fields["payload_sha"], "payload digest mismatch")
@@ -550,6 +545,76 @@ def retention_command(args: argparse.Namespace) -> None:
     for _, child, fields in verified:
         if fields["backup_id"] not in kept:
             sys.stdout.buffer.write(os.fsencode(child) + b"\0")
+
+
+PEM_CERT = re.compile(r"-----BEGIN CERTIFICATE-----\n.*?\n-----END CERTIFICATE-----", re.S)
+
+
+def pem_certificates(paths: list[pathlib.Path]) -> list[str]:
+    """Every certificate in the given PEM files. A recovery key file holds the
+    recipient key, the recipient certificate and the signing certificate."""
+    found: list[str] = []
+    for path in paths:
+        found.extend(match.group(0) + "\n" for match in PEM_CERT.finditer(path.read_text(encoding="utf-8")))
+    return found
+
+
+def verify_signature_command(args: argparse.Namespace) -> None:
+    """NAN-5204: a bundle is signed by the host's signing key, which is no
+    longer always the recipient key. It verifies when ANY certificate in the
+    operator-supplied trust files verifies it; the bundle never supplies its
+    own trust anchor."""
+    certificates = pem_certificates(args.trust)
+    need(certificates, "no certificate in the backup key files")
+    with tempfile.TemporaryDirectory(prefix="nano-verify-") as temp:
+        for index, certificate in enumerate(certificates):
+            cert = pathlib.Path(temp) / f"{index}.crt"
+            cert.write_text(certificate, encoding="utf-8")
+            pub = pathlib.Path(temp) / f"{index}.pub"
+            extracted = subprocess.run(["openssl", "x509", "-in", str(cert), "-pubkey", "-noout", "-out", str(pub)],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if extracted.returncode != 0:
+                continue
+            result = subprocess.run(["openssl", "dgst", "-sha256", "-verify", str(pub), "-signature",
+                                     str(args.signature), str(args.file)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if result.returncode == 0:
+                return
+    fail("signature does not verify against any trusted backup certificate")
+
+
+def write_manifest_command(args: argparse.Namespace) -> None:
+    """The one writer of `nano-backup-v2` manifests, shared by `scripts/nano
+    backup` and the nano-backup service (NAN-5204)."""
+    (out, payload_dir, payload_sha, bid, version, edition, schema, topology, deployment, identity, host, roles, shard,
+     replica, shard_count, pg_in, pg_mig, pg_bytes, ch_in, ch_mig, ch_bytes, disk, archive, external,
+     external_encrypted, scope, base_id, base_sha, created, fingerprint, set_id, quiesce_epoch,
+     clickhouse_data) = args.values
+    root = pathlib.Path(payload_dir)
+    checksums = {str(path.relative_to(root)): sha256_file(path) for path in sorted(root.rglob("*")) if path.is_file()}
+    recovery = {"id": set_id, "quiesce_epoch": quiesce_epoch} if topology == "role-split" else None
+    document = {
+        "format": "nano-backup-v2", "backup_id": bid, "created_at": created, "nano_version": version,
+        "edition": edition, "schema_profile": schema, "recovery_set": recovery, "clickhouse_data": clickhouse_data,
+        "topology": {"mode": topology, "deployment_id": deployment, "deployment_identity_sha256": identity or None,
+                     "host_id": host, "roles": [role for role in roles.split(",") if role],
+                     "clickhouse_shard": int(shard), "clickhouse_replica": int(replica),
+                     "clickhouse_shard_count": int(shard_count)},
+        "components": {
+            "postgres": {"included": pg_in == "true", "migration_version": int(pg_mig or 0),
+                         "source_bytes": int(pg_bytes or 0)},
+            "clickhouse": {"included": ch_in == "true", "migration_version": int(ch_mig or 0),
+                           "source_bytes": int(ch_bytes or 0), "disk": disk or None, "archive": archive or None,
+                           "external": external == "true", "external_disk_encrypted": external_encrypted == "true",
+                           "scope": scope, "base_backup_id": base_id or None, "base_payload_sha256": base_sha or None},
+            "configuration": {"included": True}},
+        "encryption": {"format": "CMS AuthEnvelopedData", "cipher": "AES-256-GCM",
+                       "recipient_certificate_sha256": fingerprint},
+        "payload": {"file": "payload.cms", "sha256": payload_sha, "plaintext_sha256": checksums},
+    }
+    validate_bundle(json.loads(json.dumps(document)))
+    pathlib.Path(out).write_text(json.dumps(document, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    os.chmod(out, 0o600)
 
 
 def main() -> int:
@@ -592,13 +657,21 @@ def main() -> int:
     validate.add_argument("--ch", action="store_true")
     validate.add_argument("--shard", type=int, default=0)
     validate.set_defaults(func=validate_set_command)
+    signature = sub.add_parser("verify-signature")
+    signature.add_argument("--trust", type=pathlib.Path, action="append", required=True)
+    signature.add_argument("--signature", type=pathlib.Path, required=True)
+    signature.add_argument("file", type=pathlib.Path)
+    signature.set_defaults(func=verify_signature_command)
+    writer = sub.add_parser("write-manifest")
+    writer.add_argument("values", nargs=33)
+    writer.set_defaults(func=write_manifest_command)
     retention = sub.add_parser("retention")
     retention.add_argument("--parent", type=pathlib.Path, required=True)
     retention.add_argument("--keep", type=int, required=True)
     retention.add_argument("--edition", required=True)
     retention.add_argument("--identity", required=True)
     retention.add_argument("--host", required=True)
-    retention.add_argument("--public-key", type=pathlib.Path, required=True)
+    retention.add_argument("--trust", type=pathlib.Path, action="append", required=True)
     retention.set_defaults(func=retention_command)
     args = parser.parse_args()
     try:

@@ -202,6 +202,7 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         handlers::system::SystemApiDoc::openapi(),
         handlers::vector_config_delivery::VectorConfigDeliveryApiDoc::openapi(),
         handlers::credential_keys::CredentialKeysApiDoc::openapi(),
+        handlers::backup_status::BackupStatusApiDoc::openapi(),
     ];
 
     // Enterprise-only sub-docs. Their handler modules (`melod`, `notebooks`,
@@ -872,13 +873,17 @@ mod tests {
         // model discovery). Enterprise 661 + 1 = 662.
         // NAN-5170 adds ENTERPRISE GET /api/license/usage and
         // /api/license/usage/export. Enterprise 662 + 2 = 664.
+        // NAN-5204 adds 2 shared (open core) templates: POST
+        // /api/internal/backup-status (sidecar report) and GET
+        // /api/system/backup-status. Enterprise 664 + 2 = 666; open 416 + 2 = 418.
         #[cfg(feature = "enterprise")]
-        let min_paths = 664;
+        let min_paths = 666;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's
-        // owner-clamp path: 415 + 1 = 416.
-        let min_paths = 416;
+        // owner-clamp path: 415 + 1 = 416; NAN-5204's two backup-status
+        // paths: 416 + 2 = 418.
+        let min_paths = 418;
 
         assert!(
             path_count >= min_paths,

@@ -58,9 +58,11 @@ function StateBadge({ state }: { state: string }) {
   const tone =
     state === 'active' || state === 'enabled'
       ? 'text-emerald-500 border-emerald-500/40'
-      : state === 'disabled' || state === 'unbound' || state === 'legacy multiplex'
-        ? 'text-amber-500 border-amber-500/40'
-        : 'text-muted-foreground border-border';
+      : state === 'public refused'
+        ? 'text-red-500 border-red-500/40'
+        : state === 'disabled' || state === 'unbound' || state === 'legacy multiplex'
+          ? 'text-amber-500 border-amber-500/40'
+          : 'text-muted-foreground border-border';
   return <span className={cn('inline-flex items-center h-4 px-1.5 rounded-sm border font-mono text-[10px]', tone)}>{state}</span>;
 }
 
@@ -565,6 +567,7 @@ export function IngestTokensPanel() {
   const unbound = count('unbound');
   const installUnbound = installToken.state === 'unbound';
   const installLegacy = installToken.state === 'legacy_multiplex';
+  const installPublic = installToken.state === 'public_refused';
   const undelivered = list.data.delivery === 'none';
 
   return (
@@ -592,6 +595,22 @@ export function IngestTokensPanel() {
             Token delivery to Vector is not configured for this deployment (
             <span className="font-mono">NANO_INGEST_TOKENS_DELIVERY</span>), so named tokens cannot be issued: Vector
             would never see them.
+          </span>
+        </div>
+      )}
+
+      {installPublic && (
+        <div
+          className="flex items-start gap-2 border border-red-500/40 px-2.5 py-2 text-[11.5px] text-red-500"
+          role="alert"
+          data-testid="public-install-token-alert"
+        >
+          <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" strokeWidth={1.5} />
+          <span>
+            The install token (<span className="font-mono">VECTOR_AUTH_TOKEN</span>) is a publicly known default, so
+            nano refuses it (HTTP 401). Re-run <span className="font-mono">install.sh</span> or{' '}
+            <span className="font-mono">nano upgrade</span> to replace it with a generated value, and move each sender
+            to a named token.
           </span>
         </div>
       )}
@@ -673,13 +692,13 @@ export function IngestTokensPanel() {
             </td>
             <td className="px-2 font-mono text-[10.5px] text-muted-foreground">VECTOR_AUTH_TOKEN</td>
             <td className="px-2">
-              <StateBadge state={installToken.state === 'active' ? 'enabled' : installToken.state.replace('_', ' ')} />
+              <StateBadge state={installToken.state === 'active' ? 'enabled' : installToken.state.replace(/_/g, ' ')} />
             </td>
             <td className="px-2 text-right font-mono text-[10.5px] text-muted-foreground">—</td>
             <td className="px-2 font-mono text-[10.5px] text-muted-foreground">—</td>
             <td className="px-2 font-mono text-[10.5px] text-muted-foreground">install</td>
             <td className="px-2 text-right whitespace-nowrap">
-              {canManage && (installUnbound || installLegacy) && (
+              {canManage && !installPublic && (installUnbound || installLegacy) && (
                 <Button
                   variant="ghost"
                   size="sm"
@@ -689,7 +708,7 @@ export function IngestTokensPanel() {
                   Bind
                 </Button>
               )}
-              {canManage && installToken.state !== 'not_configured' && (
+              {canManage && installToken.state !== 'not_configured' && !installPublic && (
                 <Button
                   variant="ghost"
                   size="sm"

@@ -23,6 +23,9 @@ pub enum SourceConfigType {
     AwsS3,
     /// AWS SQS consumed directly — the log payload IS the message body
     AwsSqs,
+    /// CrowdStrike Falcon Data Replicator: SQS batch manifests pointing at
+    /// gzipped NDJSON objects in S3 (NAN-5005; Vector fork `crowdstrike_fdr`)
+    CrowdstrikeFdr,
     /// GCP Pub/Sub subscription
     GcpPubSub,
     /// Azure Event Hubs consumer group, checkpointed in Azure Blob Storage
@@ -43,6 +46,7 @@ impl SourceConfigType {
             Self::Kafka => "kafka",
             Self::AwsS3 => "aws_s3",
             Self::AwsSqs => "aws_sqs",
+            Self::CrowdstrikeFdr => "crowdstrike_fdr",
             Self::GcpPubSub => "gcp_pubsub",
             Self::AzureEventHubs => "azure_event_hubs",
             Self::SplunkHec => "splunk_hec",
@@ -57,6 +61,7 @@ impl SourceConfigType {
             "kafka" => Some(Self::Kafka),
             "aws_s3" | "s3" => Some(Self::AwsS3),
             "aws_sqs" | "sqs" => Some(Self::AwsSqs),
+            "crowdstrike_fdr" | "fdr" => Some(Self::CrowdstrikeFdr),
             "gcp_pubsub" | "pubsub" => Some(Self::GcpPubSub),
             "azure_event_hubs" | "event_hubs" | "eventhubs" => Some(Self::AzureEventHubs),
             "splunk_hec" | "splunk" | "hec" => Some(Self::SplunkHec),
@@ -70,7 +75,12 @@ impl SourceConfigType {
     pub fn requires_credentials(&self) -> bool {
         matches!(
             self,
-            Self::AwsS3 | Self::AwsSqs | Self::GcpPubSub | Self::AzureEventHubs | Self::Kafka
+            Self::AwsS3
+                | Self::AwsSqs
+                | Self::CrowdstrikeFdr
+                | Self::GcpPubSub
+                | Self::AzureEventHubs
+                | Self::Kafka
         )
     }
 
@@ -81,6 +91,7 @@ impl SourceConfigType {
             Self::Kafka => "Kafka",
             Self::AwsS3 => "AWS S3",
             Self::AwsSqs => "AWS SQS",
+            Self::CrowdstrikeFdr => "CrowdStrike FDR",
             Self::GcpPubSub => "GCP Pub/Sub",
             Self::AzureEventHubs => "Azure Event Hubs",
             Self::SplunkHec => "Splunk HEC",
@@ -98,6 +109,10 @@ impl SourceConfigType {
             Self::AwsSqs => {
                 "Ingest logs directly from an SQS queue, where the message body is the log \
                  itself rather than an S3 notification"
+            }
+            Self::CrowdstrikeFdr => {
+                "Consume a CrowdStrike Falcon Data Replicator feed (SQS batch manifests and \
+                 gzipped NDJSON in S3); each message is deleted only after its events are delivered"
             }
             Self::GcpPubSub => "Subscribe to GCP Pub/Sub with attribute-based routing",
             Self::AzureEventHubs => {
@@ -119,6 +134,7 @@ impl SourceConfigType {
             Self::Kafka,
             Self::AwsS3,
             Self::AwsSqs,
+            Self::CrowdstrikeFdr,
             Self::GcpPubSub,
             Self::AzureEventHubs,
             Self::SplunkHec,
@@ -137,6 +153,8 @@ impl SourceConfigType {
             // literal "aws_sqs" on every message, so it cannot discriminate
             // between log types. Content sniffing is the only option here.
             Self::AwsSqs => "message",
+            // One FDR feed carries every Falcon event type; the line is the event.
+            Self::CrowdstrikeFdr => "message",
             Self::GcpPubSub => "subscription",
             // One hub routinely carries mixed categories, so the hub name
             // rarely discriminates; the body is what does.
@@ -162,6 +180,7 @@ impl SourceConfigType {
             Self::Kafka
                 | Self::AwsS3
                 | Self::AwsSqs
+                | Self::CrowdstrikeFdr
                 | Self::GcpPubSub
                 | Self::AzureEventHubs
                 | Self::SplunkHec
@@ -259,6 +278,26 @@ impl SourceConfigType {
                      producer cannot label events out-of-band the way Kafka headers allow."
                         .to_string(),
             }],
+            // Fields the fork's `crowdstrike_fdr` source emits on every event
+            // (`message` = one NDJSON line, `fdr.file` = its S3 key). Lookup
+            // snapshots (`fdrv2-*`) never reach the route: they leave on the
+            // source's separate `lookups` output.
+            Self::CrowdstrikeFdr => vec![
+                MatchFieldPreset {
+                    label: "Message body field (default)".to_string(),
+                    path: "message".to_string(),
+                    description:
+                        "Content sniffing on the FDR event line. Usually unnecessary: every FDR \
+                         event goes to the CrowdStrike Falcon parser by default."
+                            .to_string(),
+                },
+                MatchFieldPreset {
+                    label: "S3 object key".to_string(),
+                    path: "fdr.file".to_string(),
+                    description: "Match on the S3 key of the FDR object the line came from."
+                        .to_string(),
+                },
+            ],
             Self::Kafka => vec![
                 MatchFieldPreset {
                     label: "Header (recommended)".to_string(),
@@ -608,7 +647,17 @@ impl SourceConfigurationWithRules {
 pub struct NewSourceConfiguration {
     pub name: String,
     pub description: Option<String>,
+    /// Driver: `http`, `kafka`, `aws_s3`, `aws_sqs`, `crowdstrike_fdr`,
+    /// `gcp_pubsub`, `azure_event_hubs`, `splunk_hec`, `vector` or `otlp`
+    /// (`GET /api/source-configurations/types` lists them with labels).
     pub config_type: String,
+    /// Driver-specific connection settings. `crowdstrike_fdr` (NAN-5005):
+    /// `queue_url` (required to deploy), `region` (default: from the queue
+    /// URL), `start_from` (`beginning` (default) | `now` | `cursor` | RFC 3339),
+    /// `checksum` (`verify` (default) | `warn` | `off`), `file_concurrency`,
+    /// `max_inflight_manifests`, `max_inflight_bytes`, `visibility_timeout_secs`,
+    /// `max_hold_secs`, `endpoint` (testing). Keys or a role to assume come from
+    /// the bound `aws_s3` credential, never from this object.
     pub connection_config: serde_json::Value,
     #[serde(default, with = "typeid::cloud_credential::opt")]
     #[schema(value_type = Option<String>)]

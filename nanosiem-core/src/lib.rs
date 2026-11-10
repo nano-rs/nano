@@ -30,6 +30,7 @@ pub mod ai_provider_safety;
 pub mod airgap;
 pub mod audit;
 pub mod auth;
+pub mod backup_status;
 pub mod baseline;
 pub(crate) mod config_safety;
 pub mod config_secrets;

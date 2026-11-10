@@ -141,6 +141,7 @@ impl ParserRepositoryService {
     /// | kafka         | kafka            | yes                  |
     /// | aws_s3 / s3   | aws_s3           | yes                  |
     /// | gcp_pubsub    | gcp_pubsub       | yes                  |
+    /// | crowdstrike_fdr | crowdstrike_fdr | yes                  |
     /// | splunk_hec    | splunk_hec       | yes                  |
     /// | otlp          | otlp             | yes                  |
     /// | http          | routed           | no (always-on)       |
@@ -158,6 +159,7 @@ impl ParserRepositoryService {
             // defense-in-depth.
             "s3" => "aws_s3",
             "pubsub" => "gcp_pubsub",
+            "fdr" => "crowdstrike_fdr",
             "splunk" | "hec" => "splunk_hec",
             "opentelemetry" | "otel" => "otlp",
             other => other,
@@ -171,6 +173,7 @@ impl ParserRepositoryService {
             ("kafka", "kafka")
                 | ("aws_s3", "aws_s3")
                 | ("gcp_pubsub", "gcp_pubsub")
+                | ("crowdstrike_fdr", "crowdstrike_fdr")
                 | ("azure_event_hubs", "azure_event_hubs")
                 | ("splunk_hec", "splunk_hec")
                 | ("otlp", "otlp")

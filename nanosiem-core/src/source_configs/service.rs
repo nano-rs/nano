@@ -10,7 +10,7 @@ use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use super::creds_backend::{CredsBackend, CredsBackendError};
-use super::{azure_event_hubs, point_forward};
+use super::{azure_event_hubs, crowdstrike_fdr, point_forward};
 use super::repository::{
     SourceConfigIdentity, SourceConfigRepository, SourceConfigRepositoryError,
 };
@@ -819,6 +819,7 @@ impl SourceConfigService {
             "kafka" => Self::validate_kafka_conn(conn)?,
             "aws_s3" => Self::validate_aws_s3_conn(conn)?,
             "aws_sqs" => Self::validate_aws_sqs_conn(conn)?,
+            "crowdstrike_fdr" => crowdstrike_fdr::validate_conn(conn)?,
             "gcp_pubsub" => Self::validate_gcp_pubsub_conn(conn)?,
             "azure_event_hubs" => azure_event_hubs::validate_conn(conn)?,
             "splunk_hec" => Self::validate_splunk_hec_conn(conn)?,
@@ -2380,6 +2381,14 @@ impl SourceConfigService {
             ),
             "aws_s3" => Self::generate_aws_s3_source(&source_name, conn, creds.as_ref()),
             "aws_sqs" => Self::generate_aws_sqs_source(&source_name, conn, creds.as_ref()),
+            "crowdstrike_fdr" => {
+                let mut block = format!("# NAN-5005: {}.\n", crowdstrike_fdr::LOOKUPS_POLICY);
+                block.push_str(&Self::wrap_source_table(
+                    &source_name,
+                    crowdstrike_fdr::source_table(&source_name, conn, creds.as_ref())?,
+                ));
+                block
+            }
             "gcp_pubsub" => {
                 Self::generate_gcp_pubsub_source(&source_name, conn, gcp_creds_path.as_deref())
             }
@@ -2634,7 +2643,7 @@ impl SourceConfigService {
     /// tenant's role ARN leaking plus a system that can be induced to assume an
     /// arbitrary ARN is a cross-tenant access path. It is meaningless without a
     /// role, so it is only emitted alongside one.
-    fn aws_auth_table(
+    pub(crate) fn aws_auth_table(
         creds: Option<&serde_json::Value>,
         region: &str,
         source_name: &str,
@@ -3014,6 +3023,10 @@ impl SourceConfigService {
                     .or(coalesced_rule)
                     .map(|r| r.target_source_type.as_str())
                     .or(config_default)
+                    // NAN-5005: an FDR feed is CrowdStrike Falcon telemetry;
+                    // without a rule it goes to the Falcon parser.
+                    .or((config.config.config_type == "crowdstrike_fdr")
+                        .then_some(crowdstrike_fdr::FDR_DEFAULT_SOURCE_TYPE))
                     .unwrap_or("unknown"),
             )
         };
@@ -3232,6 +3245,7 @@ impl SourceConfigService {
             "kafka" => Some("kafka"),
             "aws_s3" => Some("aws_s3"),
             "aws_sqs" => Some("aws_sqs"),
+            "crowdstrike_fdr" => Some("crowdstrike_fdr"),
             "gcp_pubsub" => Some("gcp_pubsub"),
             "azure_event_hubs" => Some("azure_event_hubs"),
             _ => None,
@@ -3386,6 +3400,10 @@ mod create_routing_validation_tests;
 #[path = "service/credential_retarget_tests.rs"]
 mod credential_retarget_tests;
 
+#[cfg(test)]
+#[path = "service/crowdstrike_fdr_render_tests.rs"]
+mod crowdstrike_fdr_render_tests;
+
 /// NAN-5147: the hosts a stored credential is presented to, per driver, as
 /// `(field, normalized value)`. Kafka: the broker list (order-, case- and
 /// whitespace-insensitive). AWS S3/SQS: the custom endpoint and queue URL
@@ -3434,6 +3452,13 @@ fn connection_destination(
         T::AwsSqs => vec![
             ("endpoint", origin(field("endpoint"))),
             ("queue_url", origin(field("queue_url"))),
+        ],
+        // The keys go to the queue (its origin names the region) and to S3 in
+        // the same region; `region` alone can retarget S3, so it counts too.
+        T::CrowdstrikeFdr => vec![
+            ("endpoint", origin(field("endpoint"))),
+            ("queue_url", origin(field("queue_url"))),
+            ("region", lower("region")),
         ],
         T::GcpPubSub => vec![("endpoint", origin(field("endpoint")))],
         T::AzureEventHubs => vec![

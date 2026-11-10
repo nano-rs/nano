@@ -2,6 +2,7 @@
 
 //! Database connection and pool management
 
+pub mod tls_provider;
 pub mod clickhouse_migrate;
 pub mod clickhouse_transport;
 pub mod config;

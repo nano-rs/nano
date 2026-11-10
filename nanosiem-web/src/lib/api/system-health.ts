@@ -59,6 +59,32 @@ export interface SystemHealthDelivery {
   updated_at: string;
 }
 
+/** NAN-5204: `GET /api/system/backup-status` (`settings:system`). */
+export interface BackupStatusResponse {
+  /** False when automatic backups never reported (every other field null). */
+  configured: boolean;
+  enabled: boolean | null;
+  enabled_since: string | null;
+  last_attempt_at: string | null;
+  last_outcome: 'success' | 'partial' | 'failure' | null;
+  last_success_at: string | null;
+  last_success_backup_id: string | null;
+  last_success_size_bytes: number | null;
+  last_failure_at: string | null;
+  last_failure_error: string | null;
+  consecutive_failures: number | null;
+  destination_kind: 'path' | 's3' | null;
+  destination: string | null;
+  clickhouse_data: 'included' | 'excluded' | null;
+  schedule: string | null;
+  keep: number | null;
+  next_run_at: string | null;
+  updated_at: string | null;
+  /** Enabled and no successful backup within `stale_after_hours`. */
+  stale: boolean;
+  stale_after_hours: number;
+}
+
 export class SystemHealthApi {
   constructor(private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>) {}
 
@@ -91,6 +117,11 @@ export class SystemHealthApi {
 
   listDeliveries(id: string, limit = 50): Promise<SystemHealthDelivery[]> {
     return this.request(`/api/system-health/events/${id}/deliveries?limit=${limit}`);
+  }
+
+  /** NAN-5204: automatic backup status reported by the nano-backup sidecar. */
+  getBackupStatus(): Promise<BackupStatusResponse> {
+    return this.request('/api/system/backup-status');
   }
 }
 

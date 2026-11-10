@@ -193,6 +193,21 @@ impl AppState {
         // open consumer's registry (an open build registers none).
         #[cfg(feature = "enterprise")]
         nanosiem_enterprise::content_channels::install(pg_pool.clone(), audit_emitter.clone());
+        // NAN-5220: those channels (and the sovereign feed route) present this
+        // install's licence: the online token, else the installed C05 file,
+        // looked up on every check (a partial online tuple presents only an
+        // installed file, which nano verifies itself).
+        #[cfg(feature = "enterprise")]
+        nanosiem_enterprise::content_licence::install(
+            pg_pool.clone(),
+            config.online_license_config().ok().flatten().map(|online| {
+                nanosiem_enterprise::content_licence::OnlineEnrollment {
+                    licence_url: online.url,
+                    token: online.token,
+                    deployment_id: online.deployment_id,
+                }
+            }),
+        );
         let audit_query_service = AuditQueryService::new(dual_pool.clone());
 
         // Create inputlookup service for URL-based enrichment. The internal

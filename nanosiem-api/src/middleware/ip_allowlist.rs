@@ -79,6 +79,13 @@ pub async fn ip_allowlist_middleware(
         return next.run(request).await;
     }
 
+    // NAN-5204: the nano-backup sidecar is host infrastructure on the compose
+    // network; a UI/API allowlist must not silence backup failure reports.
+    // The endpoint carries its own NANO_BACKUP_STATUS_TOKEN bearer gate.
+    if path == "/api/internal/backup-status" {
+        return next.run(request).await;
+    }
+
     // Extract ConnectInfo from request extensions (set by into_make_service_with_connect_info)
     let connect_info = request
         .extensions()

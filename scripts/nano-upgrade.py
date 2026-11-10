@@ -16,6 +16,7 @@ import os
 import pathlib
 import platform
 import re
+import secrets
 import selectors
 import shlex
 import shutil
@@ -107,6 +108,9 @@ ROLE_ORDER = dependency_order(ROLE_DEPENDENCIES)
 APP_SERVICES = (
     "dragonfly", "clickhouse-proxy", "nano-api", "nano-jobs", "connector-runner",
     "nano-search", "nano-web", "nginx", "app-internal-edge",
+    # NAN-5204: the opt-in automatic-backup service runs the api image; a
+    # rollout recreates it only when it is running.
+    "nano-backup",
 )
 INGEST_SERVICES = ("vector", "vector-config-consumer", "vector-tap", "ingest-edge", "clickhouse-proxy")
 APP_EDGE_SERVICES = ("nginx", "app-internal-edge")
@@ -163,6 +167,7 @@ BUNDLE_IMAGE_ROLES: dict[str, frozenset[str]] = {
     "jobs": frozenset({"app"}),
     "web": frozenset({"app"}),
     "connector-runner": frozenset({"app"}),
+    "backup": frozenset({"app"}),
     "postgres": frozenset({"postgres"}),
     "clickhouse-server": frozenset({"clickhouse"}),
     "clickhouse-keeper": frozenset({"keeper"}),
@@ -661,17 +666,28 @@ def check_vector_config_delivery_credential(env: dict[str, str]) -> str:
     install = env.get("VECTOR_AUTH_TOKEN", "").strip()
     if dedicated and dedicated not in PUBLIC_VECTOR_CONFIG_DELIVERY_TOKENS:
         return "dedicated Vector config delivery token present"
-    if not dedicated and install and install not in PUBLIC_VECTOR_INSTALL_TOKENS:
+    # NAN-5042: strict delivery is opt-in. nano-api (the app host) enforces
+    # it, from the shared .env this host also carries a copy of; `prepare`
+    # pins an upgraded role-split .env without the key to false, so only an
+    # operator's explicit `true` makes the private fallback unusable.
+    strict = env.get("NANO_VECTOR_CONFIG_DELIVERY_STRICT", "").strip().lower() == "true"
+    if not dedicated and install and install not in PUBLIC_VECTOR_INSTALL_TOKENS and not strict:
         return (
             "Vector config delivery uses the install-token fallback (deprecated, "
             "refused from v2.1): add NANO_VECTOR_CONFIG_DELIVERY_TOKEN to the shared .env"
         )
-    problem = (
-        "NANO_VECTOR_CONFIG_DELIVERY_TOKEN in .env is a placeholder"
-        if dedicated else
-        "this host's .env has no NANO_VECTOR_CONFIG_DELIVERY_TOKEN and its "
-        "VECTOR_AUTH_TOKEN is publicly known, which nano-api refuses"
-    )
+    if dedicated:
+        problem = "NANO_VECTOR_CONFIG_DELIVERY_TOKEN in .env is a placeholder"
+    elif install and install not in PUBLIC_VECTOR_INSTALL_TOKENS:
+        problem = (
+            "this host's .env has no NANO_VECTOR_CONFIG_DELIVERY_TOKEN and sets "
+            "NANO_VECTOR_CONFIG_DELIVERY_STRICT=true, so nano-api refuses its install token"
+        )
+    else:
+        problem = (
+            "this host's .env has no NANO_VECTOR_CONFIG_DELIVERY_TOKEN and its "
+            "VECTOR_AUTH_TOKEN is publicly known, which nano-api refuses"
+        )
     raise UpgradeError(
         f"Vector config delivery would stop after this upgrade: {problem}. "
         "Fix: on the app host run `NANO_PREPARE_ONLY=1 ./install.sh --inventory "
@@ -680,6 +696,62 @@ def check_vector_config_delivery_credential(env: dict[str, str]) -> str:
         "yourself), securely copy that .env to every inventory host, then re-run "
         "nano upgrade. See docs/getting-started/docker-deployment.md"
     )
+
+
+def check_vector_install_token(env: dict[str, str], role_split: bool) -> str:
+    """Refuse a role-split upgrade whose .env still holds a publicly known
+    VECTOR_AUTH_TOKEN (NAN-5013).
+
+    nano-api refuses a public install token on every ingest lane since v2.0.6.
+    A single-node prepare replaces it with a generated value
+    ([`rotate_public_install_token`]); a role-split cluster must share one
+    value, so it is generated once on the app host and copied, never per host.
+    Values are compared, never reported.
+    """
+    install = env.get("VECTOR_AUTH_TOKEN", "").strip()
+    if not install or install not in PUBLIC_VECTOR_INSTALL_TOKENS:
+        return "VECTOR_AUTH_TOKEN is not a known public value"
+    if not role_split:
+        return (
+            "VECTOR_AUTH_TOKEN is publicly known; prepare replaces it with a generated "
+            "value (senders still using the public token get HTTP 401)"
+        )
+    raise UpgradeError(
+        "VECTOR_AUTH_TOKEN in this host's .env is publicly known, which nano refuses for "
+        "ingest from v2.0.6. Fix, on the app host: replace the VECTOR_AUTH_TOKEN line in "
+        ".env with a generated value (`openssl rand -hex 32`), or run the install.sh from "
+        "the NEW release bundle (the installed one keeps the public token) as "
+        "`NANO_PREPARE_ONLY=1 ./install.sh --inventory <inventory> --role <its roles>`; "
+        "then securely copy that .env to every inventory host and re-run nano upgrade. "
+        "Senders using named ingest tokens keep working; senders still sending the public "
+        "token get HTTP 401"
+    )
+
+
+def rotate_public_install_token(env_file: "EnvFile") -> bool:
+    """Replace a publicly known VECTOR_AUTH_TOKEN with a generated one
+    (single-node prepare, NAN-5013). Idempotent: a generated value is never
+    public, so a resumed prepare changes nothing. The services recreated by
+    the rollout read the new value; nano-api republishes Vector's tokens file
+    from it, and named per-source tokens (hashes in PostgreSQL) are untouched."""
+    install = env_file.values().get("VECTOR_AUTH_TOKEN", "").strip()
+    if install not in PUBLIC_VECTOR_INSTALL_TOKENS:
+        return False
+    env_file.replace("VECTOR_AUTH_TOKEN", secrets.token_hex(32))
+    return True
+
+
+def pin_compatible_delivery_mode(env_file: "EnvFile") -> bool:
+    """Write NANO_VECTOR_CONFIG_DELIVERY_STRICT=false into an upgraded
+    role-split .env that has no such key (NAN-5042). Strict delivery refuses
+    the install token once the dedicated token exists; a consumer whose .env
+    predates the token is then refused, stops refreshing its readiness, and
+    the load balancer drops that ingest host. Fresh installs write true.
+    Idempotent; an operator's explicit value is never changed."""
+    if "NANO_VECTOR_CONFIG_DELIVERY_STRICT" in env_file.values():
+        return False
+    env_file.replace("NANO_VECTOR_CONFIG_DELIVERY_STRICT", "false")
+    return True
 
 
 def eprint(message: str) -> None:
@@ -2444,6 +2516,13 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
             )
         if self.roles.intersection({"app", "ingest"}):
             check(
+                "vector-install-token",
+                lambda: check_vector_install_token(
+                    self.env_file.values(), bool(getattr(self, "role_env", None)),
+                ),
+            )
+        if self.roles.intersection({"app", "ingest"}):
+            check(
                 "enrichment-control-tree",
                 lambda: check_enrichment_control_tree(
                     self.nano_cli.parent.parent
@@ -3379,6 +3458,30 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
                 target, run_id, expected_bundle_sha256,
             )
             current = self.version
+        # NAN-5013: single-node only (preflight refuses a public token on a
+        # role-split host, whose cluster must share one generated value).
+        rotated_install_token = False
+        pinned_delivery_mode = False
+        if getattr(self, "role_env", None):
+            pinned_delivery_mode = pin_compatible_delivery_mode(self.env_file)
+            if pinned_delivery_mode:
+                self.env["NANO_VECTOR_CONFIG_DELIVERY_STRICT"] = "false"
+                eprint(
+                    "note: pinned NANO_VECTOR_CONFIG_DELIVERY_STRICT=false in .env (this "
+                    "cluster predates strict Vector config delivery). Once every ingest "
+                    "host's .env has NANO_VECTOR_CONFIG_DELIVERY_TOKEN, set it to true on "
+                    "the app host and restart nano-api; v2.1 enforces it regardless."
+                )
+        else:
+            rotated_install_token = rotate_public_install_token(self.env_file)
+            if rotated_install_token:
+                self.env["VECTOR_AUTH_TOKEN"] = self.env_file.values()["VECTOR_AUTH_TOKEN"]
+                eprint(
+                    "warning: VECTOR_AUTH_TOKEN was a publicly known default, which nano now "
+                    "refuses; replaced it with a generated value in .env. Senders using named "
+                    "ingest tokens keep working; senders still sending the public token get "
+                    "HTTP 401 and need a named token (Ingestion > Ingest tokens)."
+                )
         if current != target:
             self.env_file.replace("NANO_VERSION", target)
         verified = canonical_version(self.env_file.values().get("NANO_VERSION", ""))
@@ -3389,6 +3492,8 @@ exec clickhouse-client --config-file "$config" --host "$1" --port "$2" \
         return {
             "retained_images": str(retained_file), "count": len(retained),
             "legacy_transition": transition,
+            "rotated_public_install_token": rotated_install_token,
+            "pinned_compatible_delivery_mode": pinned_delivery_mode,
         }
 
     def _up_existing(

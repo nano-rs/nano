@@ -387,6 +387,14 @@ pub fn create_router(state: AppState) -> Router {
             "/api/internal/otlp-auth",
             get(handlers::ingest_tokens::authenticate_otlp),
         )
+        // NAN-5204: the nano-backup sidecar's status report. Exempt from
+        // user-session auth (PUBLIC_ENDPOINTS), the IP allowlist and the
+        // backup mutation fence; the handler enforces the
+        // NANO_BACKUP_STATUS_TOKEN bearer itself and 404s without one.
+        .route(
+            "/api/internal/backup-status",
+            post(handlers::backup_status::report_backup_status),
+        )
         // Setup endpoints (public - for first-run setup)
         .route("/api/setup/status", get(handlers::setup::get_setup_status))
         .route(
@@ -2815,6 +2823,11 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/system/config",
             get(handlers::system::get_system_config),
+        )
+        // NAN-5204: automatic backup status (settings:system).
+        .route(
+            "/api/system/backup-status",
+            get(handlers::backup_status::get_backup_status),
         )
         // NAN-4933: credential key ring status / re-wrap / retire.
         .route(

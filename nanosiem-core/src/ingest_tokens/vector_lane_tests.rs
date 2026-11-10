@@ -459,6 +459,43 @@ fn install_token_entries_by_mode() {
     assert!(entries.is_empty());
 }
 
+/// NAN-5013: a publicly known install token is never listed, in any mode or
+/// binding state, so Vector refuses it (the static fallback is off whenever an
+/// install token is set). The platform credential is unaffected, and one equal
+/// to the public install token is still refused.
+#[test]
+fn public_install_token_is_never_listed() {
+    let bound = source("apache_access");
+    for public in ["nanosiem-default-token", "your-secret-token", "CHANGE_ME_GENERATED", " nanosiem-default-token "] {
+        for (mode, install_source) in [
+            (InstallTokenMode::LegacyMultiplex, None),
+            (InstallTokenMode::LegacyMultiplex, Some(&bound)),
+            (InstallTokenMode::Strict, Some(&bound)),
+        ] {
+            let entries = file_extra_entries(Some(public), Some("platform"), &settings(true, mode), install_source);
+            assert_eq!(entries.len(), 1, "{public:?} {mode:?}");
+            assert_eq!(entries[0].id, PLATFORM_PULL_CREDENTIAL_ID);
+            assert!(entries.iter().all(|e| e.id != INSTALL_CREDENTIAL_ID));
+        }
+        let entries = file_extra_entries(
+            Some(public),
+            Some(public),
+            &settings(true, InstallTokenMode::LegacyMultiplex),
+            None,
+        );
+        assert!(entries.is_empty(), "{public:?}: platform equal to the public install token");
+    }
+    // A generated (rotated) install token keeps working exactly as before.
+    let entries = file_extra_entries(
+        Some("4f9a0c1d2e3b"),
+        Some("platform"),
+        &settings(true, InstallTokenMode::LegacyMultiplex),
+        None,
+    );
+    assert_eq!(entries[0].id, INSTALL_CREDENTIAL_ID);
+    assert_eq!(entries[0].route, MULTIPLEX_ROUTE);
+}
+
 /// Line numbers of every bare `$name` Vector would env-interpolate in `text`.
 fn bare_env_refs(text: &str) -> Vec<(usize, String)> {
     let mut hits = Vec::new();

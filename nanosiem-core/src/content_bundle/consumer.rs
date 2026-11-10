@@ -14,7 +14,9 @@
 //!    bundle_sha256}`. `<base>` is `https://api.nano.rs/api/content/v1` or an
 //!    operator mirror (`CONTENT_CHANNELS_URL`). Open channels use the open
 //!    route; enterprise channels use the license-authenticated route with
-//!    the signed license artifact and are skipped without one.
+//!    the install's licence ([`credential`]: the env file override, else the
+//!    online enrollment token or the installed signed licence, resolved on
+//!    every check) and are skipped, with the reason recorded, without one.
 //! 2. The descriptor is verified against the compiled-in content ring and must
 //!    name the channel that was asked for. Identical to the installed one: done
 //!    (`current`), no download.
@@ -41,6 +43,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use super::channels::{self, Channel, Route};
+use super::credential::{self, CredentialLookup, CredentialOrigin, CredentialSource, DistributionCredential};
 use super::contract::{self, ContentError, SignedContentDescriptor, VerifiedContent, MAX_CONTAINER_BYTES};
 use super::store::{installed_from, ChannelRow, ContentStore};
 use crate::leader::LeaderFence;
@@ -69,6 +72,9 @@ pub struct ContentConfig {
     pub base_url: String,
     /// `base_url` is an operator mirror (reported as route `mirror`).
     pub mirror: bool,
+    /// Explicit signed licence override (`CONTENT_CHANNELS_LICENSE_FILE`).
+    /// Without it, enterprise channels use the registered [`credential`]
+    /// source.
     pub license: Option<Vec<u8>>,
     pub work_dir: PathBuf,
     pub poll_interval: Duration,
@@ -159,7 +165,13 @@ fn dev_insecure_http() -> bool {
 #[cfg(feature = "enterprise")]
 fn read_license(path: Option<String>) -> Option<Vec<u8>> {
     let path = PathBuf::from(path?);
-    let meta = std::fs::symlink_metadata(&path).ok()?;
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "content channel license file unreadable; using the installed licence instead");
+            return None;
+        }
+    };
     if !meta.file_type().is_file() || meta.len() == 0 || meta.len() > MAX_LICENSE_BYTES {
         tracing::warn!(path = %path.display(), "content channel license file must be a regular file of at most 9 KiB");
         return None;
@@ -395,6 +407,33 @@ impl FeedHttp for DevHttp {
         Ok(crate::platform_enrichment::consumer::MetadataResponse { status, body: body.to_vec() })
     }
 
+    async fn metadata_enrolled(
+        &self,
+        url: &str,
+        deployment_id: &str,
+        token: &str,
+    ) -> Result<crate::platform_enrichment::consumer::MetadataResponse, String> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let resp = client
+            .get(url)
+            .header("accept", "application/json")
+            .header(crate::platform_enrichment::consumer::ENROLLMENT_DEPLOYMENT_HEADER, deployment_id)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(http_error)?;
+        let status = resp.status().as_u16();
+        let body = resp.bytes().await.map_err(http_error)?;
+        if body.len() as u64 > MAX_METADATA_BYTES {
+            return Err("metadata response exceeds 128 KiB".into());
+        }
+        Ok(crate::platform_enrichment::consumer::MetadataResponse { status, body: body.to_vec() })
+    }
+
     async fn download(&self, url: &str, dest: &Path, cap: u64) -> Result<String, String> {
         use sha2::Digest;
         use std::os::unix::fs::OpenOptionsExt;
@@ -464,7 +503,30 @@ pub struct ChannelsStatus {
     /// `production`, or `production+acceptance` in the non-shippable proof build.
     pub trust: String,
     pub poll_interval_secs: u64,
+    /// The licence enterprise channels present (`null` when this install
+    /// subscribes to none, e.g. the open edition).
+    pub license: Option<LicenseAvailability>,
     pub channels: Vec<ChannelStatus>,
+}
+
+/// Whether enterprise channels have a licence to present at the next check
+/// (NAN-5220). Never carries the licence or the token.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+pub struct LicenseAvailability {
+    pub available: bool,
+    /// `file`, `online` or `installed` when available.
+    pub origin: Option<CredentialOrigin>,
+    /// Why not, and what to do, when unavailable.
+    pub reason: Option<String>,
+}
+
+impl LicenseAvailability {
+    fn of(resolved: &Result<(DistributionCredential, CredentialOrigin), String>) -> Self {
+        match resolved {
+            Ok((_, origin)) => Self { available: true, origin: Some(*origin), reason: None },
+            Err(reason) => Self { available: false, origin: None, reason: Some(reason.clone()) },
+        }
+    }
 }
 
 fn status_of(ch: &'static Channel, row: Option<&ChannelRow>, now: chrono::DateTime<Utc>) -> ChannelStatus {
@@ -506,12 +568,61 @@ pub struct ContentConsumer {
     http: Arc<dyn FeedHttp>,
     applier: Arc<dyn ContentApplier>,
     fence: LeaderFence,
+    credentials: Option<Arc<dyn CredentialSource>>,
 }
 
 impl ContentConsumer {
     pub fn new(store: ContentStore, config: ContentConfig, applier: Arc<dyn ContentApplier>) -> Self {
         let http: Arc<dyn FeedHttp> = if config.insecure_http { Arc::new(DevHttp) } else { Arc::new(ReqwestFeedHttp) };
-        Self { store, config, ring: contract::content_key_ring(), http, applier, fence: LeaderFence::disabled() }
+        Self {
+            store,
+            config,
+            ring: contract::content_key_ring(),
+            http,
+            applier,
+            fence: LeaderFence::disabled(),
+            credentials: credential::credential_source(),
+        }
+    }
+
+    /// Use this credential source instead of the registered one (tests).
+    pub fn with_credential_source(mut self, source: Option<Arc<dyn CredentialSource>>) -> Self {
+        self.credentials = source;
+        self
+    }
+
+    fn has_enterprise_channels(&self) -> bool {
+        self.config.channels.iter().any(|c| c.route == Route::Enterprise)
+    }
+
+    /// The credential enterprise channels present now: the explicit file
+    /// override, else the registered source (looked up on every call, so a
+    /// renewed or newly installed licence is used at the next check).
+    pub async fn enterprise_credential(&self) -> Result<(DistributionCredential, CredentialOrigin), String> {
+        if let Some(license) = &self.config.license {
+            return Ok((DistributionCredential::SignedLicense(license.clone()), CredentialOrigin::File));
+        }
+        let Some(source) = &self.credentials else {
+            return Err(credential::NO_LICENCE_REASON.into());
+        };
+        match source.lookup().await {
+            CredentialLookup::Found { credential, origin } => {
+                if let DistributionCredential::Enrollment { licence_origin, .. } = &credential {
+                    // The enrollment token is a bearer credential for the
+                    // licence server: never send it to a mirror or any host
+                    // other than the LICENSE_URL origin.
+                    if credential::url_origin(&self.config.base_url).as_deref() != Some(licence_origin.as_str()) {
+                        return Err(format!(
+                            "the online licence token is sent only to its licence server ({licence_origin}), and content \
+                             checks go to {}; set CONTENT_CHANNELS_LICENSE_FILE or import a licence file under Settings → License",
+                            self.config.base_url
+                        ));
+                    }
+                }
+                Ok((credential, origin))
+            }
+            CredentialLookup::Missing { reason } => Err(reason),
+        }
     }
 
     pub fn with_fence(mut self, fence: LeaderFence) -> Self {
@@ -542,6 +653,11 @@ impl ContentConsumer {
             auto_update: self.config.auto_update,
             trust: contract::trust_label().into(),
             poll_interval_secs: self.config.poll_interval.as_secs(),
+            license: if self.has_enterprise_channels() {
+                Some(LicenseAvailability::of(&self.enterprise_credential().await))
+            } else {
+                None
+            },
             channels: self
                 .config
                 .channels
@@ -585,8 +701,18 @@ impl ContentConsumer {
     /// Check every subscribed channel under an already-held lease.
     pub async fn check_all_with(&self, lease: InstallLease) -> Vec<(String, Result<ChannelOutcome, String>)> {
         let mut out = Vec::new();
+        let credential = if self.has_enterprise_channels() {
+            let resolved = self.enterprise_credential().await;
+            match &resolved {
+                Ok((_, origin)) => tracing::debug!(?origin, "enterprise content channels: licence available"),
+                Err(reason) => tracing::warn!(%reason, "enterprise content channels skipped: no licence to present"),
+            }
+            Some(resolved)
+        } else {
+            None
+        };
         for ch in self.config.channels.clone() {
-            let result = self.check_channel_locked(ch).await;
+            let result = self.check_channel_locked(ch, credential.as_ref()).await;
             self.record(ch, &result).await;
             out.push((ch.id.to_string(), result.map_err(|e| e.to_string())));
         }
@@ -625,24 +751,38 @@ impl ContentConsumer {
         format!("{}/{}/{}/current", self.config.base_url, ch.route.as_str(), ch.id)
     }
 
-    async fn check_channel_locked(&self, ch: &'static Channel) -> Result<ChannelOutcome, ChannelError> {
+    async fn check_channel_locked(
+        &self,
+        ch: &'static Channel,
+        credential: Option<&Result<(DistributionCredential, CredentialOrigin), String>>,
+    ) -> Result<ChannelOutcome, ChannelError> {
         let row = self.store.get(ch.id).await.map_err(db)?;
         if row.as_ref().is_some_and(|r| !r.enabled) {
             return Ok(ChannelOutcome::Skipped { reason: "opted out on this install".into() });
         }
-        let license = match ch.route {
+        let credential = match ch.route {
             Route::Open => None,
-            Route::Enterprise => match self.config.license.as_deref() {
-                Some(l) => Some(l),
+            Route::Enterprise => match credential {
+                Some(Ok((credential, _))) => Some(credential),
+                Some(Err(reason)) => {
+                    return Ok(ChannelOutcome::Skipped { reason: format!("enterprise channel: {reason}") })
+                }
                 None => {
                     return Ok(ChannelOutcome::Skipped {
-                        reason: "enterprise channel: no signed license artifact configured (CONTENT_CHANNELS_LICENSE_FILE)".into(),
+                        reason: format!("enterprise channel: {}", credential::NO_LICENCE_REASON),
                     })
                 }
             },
         };
         let url = self.metadata_url(ch);
-        let response = self.http.metadata(&url, license).await.map_err(ChannelError::Fetch)?;
+        let response = match credential {
+            None => self.http.metadata(&url, None).await,
+            Some(DistributionCredential::SignedLicense(license)) => self.http.metadata(&url, Some(license)).await,
+            Some(DistributionCredential::Enrollment { deployment_id, token, .. }) => {
+                self.http.metadata_enrolled(&url, deployment_id, token).await
+            }
+        }
+        .map_err(ChannelError::Fetch)?;
         if response.status == 404 {
             return Ok(ChannelOutcome::Unpublished);
         }
@@ -835,6 +975,15 @@ impl ContentConsumer {
             if !self.config.auto_update {
                 return;
             }
+            if self.has_enterprise_channels() {
+                match self.enterprise_credential().await {
+                    Ok((_, origin)) => tracing::info!(?origin, "enterprise content channels will use this install's licence"),
+                    Err(reason) => tracing::warn!(
+                        %reason,
+                        "enterprise content channels (soar-catalog) will be skipped until a licence is installed"
+                    ),
+                }
+            }
             let mut next = tokio::time::Instant::now() + Duration::from_secs(FIRST_CHECK_SECS);
             loop {
                 tokio::select! {
@@ -912,3 +1061,7 @@ impl Drop for RemoveOnDrop {
 #[cfg(test)]
 #[path = "consumer_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "consumer_credential_tests.rs"]
+mod credential_tests;

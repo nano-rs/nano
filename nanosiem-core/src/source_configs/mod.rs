@@ -7,6 +7,7 @@
 //! Log Sources become pure parsers activated by source_type match.
 
 pub(crate) mod azure_event_hubs;
+pub(crate) mod crowdstrike_fdr;
 pub(crate) mod creds_backend;
 pub(crate) mod isolation;
 pub(crate) mod point_forward;

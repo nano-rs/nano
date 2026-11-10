@@ -330,6 +330,29 @@ it('flags the deprecated legacy multiplex install token and can end it', async (
   await waitFor(() => expect(calls.setInstallTokenStrict).toHaveBeenCalled());
 });
 
+it('flags a publicly known install token as refused and offers no install-token actions', async () => {
+  calls.list.mockResolvedValue({
+    tokens: [ACTIVE],
+    install_token: {
+      name: 'Install token (legacy)',
+      enabled: true,
+      mode: 'legacy_multiplex',
+      deprecated: false,
+      state: 'public_refused',
+    },
+    sources: [APACHE],
+  });
+  renderPage();
+  const alert = await screen.findByTestId('public-install-token-alert');
+  expect(alert.textContent).toContain('publicly known default');
+  expect(alert.textContent).toContain('HTTP 401');
+  expect(screen.queryByTestId('legacy-multiplex-alert')).toBeNull();
+  const row = screen.getByTestId('install-token-row');
+  expect(within(row).getByText('public refused')).toBeTruthy();
+  expect(within(row).queryByRole('button', { name: 'Bind' })).toBeNull();
+  expect(within(row).queryByRole('button', { name: /Disable|Enable/ })).toBeNull();
+});
+
 it('refuses to offer token issuing when delivery to Vector is not configured', async () => {
   calls.list.mockResolvedValue({
     tokens: [ACTIVE],

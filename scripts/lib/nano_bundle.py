@@ -664,6 +664,7 @@ _IMAGE_ROLES: dict[str, frozenset[str]] = {
     "jobs": frozenset({"app"}),
     "web": frozenset({"app"}),
     "connector-runner": frozenset({"app"}),
+    "backup": frozenset({"app"}),
     "postgres": frozenset({"postgres"}),
     "clickhouse-server": frozenset({"clickhouse"}),
     "clickhouse-keeper": frozenset({"keeper"}),

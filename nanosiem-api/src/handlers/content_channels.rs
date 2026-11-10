@@ -464,6 +464,8 @@ pub async fn update_content_channel(
     components(schemas(
         ChannelsStatus,
         nanosiem_core::content_bundle::consumer::ChannelStatus,
+        nanosiem_core::content_bundle::consumer::LicenseAvailability,
+        nanosiem_core::content_bundle::credential::CredentialOrigin,
         ChannelOutcome,
         ContentCheckAccepted,
         ContentImportResponse,

@@ -81,6 +81,8 @@ pub use nanosiem_enterprise::handlers::incidents;
 pub mod integrations;
 #[cfg(feature = "enterprise")]
 pub use nanosiem_enterprise::handlers::integration_generation;
+// NAN-5204: automatic backup status (sidecar report + admin read). Open core.
+pub mod backup_status;
 pub mod credential_keys;
 pub mod ingest_tokens;
 pub mod ip_allowlist;

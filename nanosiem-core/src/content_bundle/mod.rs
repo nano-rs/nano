@@ -11,6 +11,8 @@
 //! - [`store`]: installed snapshots in PostgreSQL (migration 309).
 //! - [`source`]: first-party repository reads served from the snapshots
 //!   (`GitHubClient` and the marketplace sync call it instead of GitHub).
+//! - [`credential`]: the licence credential seam for licence-authenticated
+//!   routes (an enterprise build registers the source; the open edition none).
 //! - [`consumer`]: fetch → verify → accept → install → apply; leader-only
 //!   schedule, check now, air-gap import.
 //!
@@ -22,6 +24,7 @@ pub mod consumer;
 #[cfg(nano_content_acceptance)]
 mod content_acceptance_root;
 pub mod contract;
+pub mod credential;
 pub mod source;
 pub mod store;
 pub mod tree;

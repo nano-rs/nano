@@ -15,6 +15,8 @@ use nanosiem_core::LicenseChecker;
 use std::net::SocketAddr;
 
 fn main() -> Result<()> {
+    // NAN-5214: before anything can negotiate TLS with PostgreSQL.
+    nanosiem_core::db::tls_provider::install_default_crypto_provider();
     // NAN-4919: the Nano Pipe preview worker. It must run before tracing,
     // configuration, pools or the server exist, with nothing inherited.
     if std::env::args().nth(1).as_deref()

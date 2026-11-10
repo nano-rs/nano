@@ -175,6 +175,7 @@ pub fn is_push_capable(source_type: &str) -> bool {
         "kafka"
             | "aws_s3"
             | "aws_sqs"
+            | "crowdstrike_fdr"
             | "s3"
             | "gcp_pubsub"
             | "pubsub"

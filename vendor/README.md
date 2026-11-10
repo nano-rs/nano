@@ -7,3 +7,7 @@
   `NANO_SQLX_TCP_KEEPALIVE_SECS` (NAN-4949, ported by NAN-4955), plus the
   `socket2` dependency it needs. With the variable unset (every service but
   the platform feed publisher) behaviour is identical to upstream.
+  Also `src/net/tls/tls_rustls.rs::NoHostnameTlsVerifier` accepts rustls's
+  newer `NotValidForNameContext` name-mismatch error as well as
+  `NotValidForName`, so `sslmode=verify-ca` verifies the chain without the
+  host name as documented (NAN-5214).

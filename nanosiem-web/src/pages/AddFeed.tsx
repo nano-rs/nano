@@ -253,7 +253,7 @@ function formatEventsCount(n: number | null | undefined): string | null {
 
 const SOURCE_ICON_FOR_TYPE = (type: string) => {
   if (type === 'http' || type === 'vector') return Globe;
-  if (type === 'aws_s3' || type === 'aws_sqs' || type === 'gcp_pubsub' || type === 'azure_event_hubs') return Cloud;
+  if (type === 'aws_s3' || type === 'aws_sqs' || type === 'crowdstrike_fdr' || type === 'gcp_pubsub' || type === 'azure_event_hubs') return Cloud;
   if (type === 'kafka') return Database;
   return Rss;
 };
@@ -266,6 +266,7 @@ const SOURCE_TYPE_LABEL: Record<string, string> = {
   splunk_hec: 'Splunk HEC',
   vector: 'Vector',
   aws_sqs: 'AWS SQS',
+  crowdstrike_fdr: 'CrowdStrike FDR',
   azure_event_hubs: 'Azure Event Hubs',
 };
 

@@ -682,6 +682,92 @@ pub fn ensure_deployment_posture_findings(
     }
 }
 
+/// Title of the NAN-5204 stale-backup finding (stable: suppressions key on it).
+pub const BACKUP_STALE_TITLE: &str = "No successful backup in the last 36 hours";
+
+/// NAN-5204: automatic backups are enabled but nothing succeeded within
+/// [`crate::backup_status::STALE_AFTER_HOURS`]. Uses the one staleness rule
+/// ([`crate::backup_status::is_stale`]); no row or a disabled schedule adds
+/// nothing.
+pub fn backup_recommendations(
+    status: Option<&crate::backup_status::BackupStatus>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<Recommendation> {
+    let Some(status) = status else {
+        return Vec::new();
+    };
+    if !crate::backup_status::is_stale(status, now) {
+        // NAN-5204 review M4: a fresh but partial backup (lookup rows
+        // missing) must not read as healthy either.
+        if status.enabled && status.last_outcome.as_deref() == Some("partial") {
+            let reason = status.last_failure_error.as_deref().unwrap_or("no detail");
+            return vec![Recommendation {
+                title: "Last backup is missing the ClickHouse lookup tables".to_string(),
+                description: format!(
+                    "The last automatic backup stored PostgreSQL and the configuration, but not \
+                     the lookup-table rows: {reason}. Detections that join a lookup would lose \
+                     those rows on a restore from it. Check that the backup service reaches \
+                     ClickHouse (see \"Automatic backups\" in the backup documentation)."
+                ),
+                priority: "high".to_string(),
+            }];
+        }
+        return Vec::new();
+    }
+    let last_success = match status.last_success_at {
+        Some(at) => format!(
+            "{} ({}h ago)",
+            at.format("%Y-%m-%d %H:%M UTC"),
+            (now - at).num_hours()
+        ),
+        None => "never".to_string(),
+    };
+    let mut description = format!(
+        "Automatic backups are enabled but the last successful backup was: {last_success}."
+    );
+    if status.consecutive_failures > 0 {
+        description.push_str(&format!(
+            " {} consecutive attempt(s) failed.",
+            status.consecutive_failures
+        ));
+    }
+    if let Some(error) = status.last_failure_error.as_deref().filter(|e| !e.is_empty()) {
+        let at = status
+            .last_failure_at
+            .map(|t| format!(" at {}", t.format("%Y-%m-%d %H:%M UTC")))
+            .unwrap_or_default();
+        description.push_str(&format!(" Last error{at}: {error}"));
+        if !description.ends_with('.') {
+            description.push('.');
+        }
+    }
+    description.push_str(
+        " Check the schedule and the last run with `scripts/nano backup-schedule --status` \
+         on the host, and see \"Automatic backups\" in the backup documentation. Without a \
+         recent backup a host or disk loss loses the configuration (rules, users, cases).",
+    );
+    vec![Recommendation {
+        title: BACKUP_STALE_TITLE.to_string(),
+        description,
+        priority: "high".to_string(),
+    }]
+}
+
+/// NAN-5204: append the stale-backup finding on every report path (AI,
+/// fallback, Fresh), capping the score like other high findings (<= 79).
+pub fn ensure_backup_findings(
+    analysis: &mut AnalysisResult,
+    status: Option<&crate::backup_status::BackupStatus>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    for rec in backup_recommendations(status, now) {
+        analysis.overall_score = analysis.overall_score.min(79);
+        if !analysis.recommendations.iter().any(|r| r.title == rec.title) {
+            analysis.recommendations.insert(0, rec);
+        }
+    }
+}
+
 /// NAN-5032: surface log sources whose events are stored under a
 /// platform-owned source type. Deterministic; emitted on every report path
 /// (AI, fallback, Fresh), like the audit-durability findings.
@@ -1083,6 +1169,10 @@ mod reserved_source_names_tests;
 #[cfg(test)]
 #[path = "deployment_posture_findings_tests.rs"]
 mod deployment_posture_findings_tests;
+
+#[cfg(test)]
+#[path = "backup_findings_tests.rs"]
+mod backup_findings_tests;
 
 #[cfg(test)]
 #[path = "ip_allowlist_findings_tests.rs"]

@@ -442,6 +442,31 @@ configure_private_ai_endpoints() {
     fi
 }
 
+# Automatic backups (NAN-5204). Asked once on a TTY, only while .env records
+# no answer; a re-run or upgrade never asks again, and
+# `scripts/nano backup-schedule --configure` changes it later. Unattended
+# installs pass NANO_BACKUP_ENABLED=true plus NANO_BACKUP_* (no TTY and no
+# input means off). The prompts, the destination probe (write + delete a test
+# object) and the .env update live in scripts/nano-backup-scheduler.py so the
+# installer and the later reconfigure share one implementation.
+configure_automatic_backups() {
+    [[ "$(env_value NANO_BACKUP_ASKED)" == "true" ]] && return 0
+    if [[ "$MULTI_NODE" == "1" ]]; then
+        if [[ ",${ROLE_ARG}," == *,app,* ]]; then
+            log "Automatic backups for a role-split cluster run from the app host: scripts/nano backup-schedule --configure"
+        fi
+        return 0
+    fi
+    # A release without the scheduler (or a trimmed fixture) has nothing to set up.
+    [[ -f scripts/nano-backup-scheduler.py ]] || return 0
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "Automatic backups need python3 on this host; install it, then run scripts/nano backup-schedule --configure."
+        return 0
+    fi
+    python3 -I scripts/nano-backup-scheduler.py --install-dir "$PWD" configure --from-installer \
+        || fail "Automatic backup setup failed (see above). Fix the destination, or set NANO_BACKUP_ENABLED=false, and re-run."
+}
+
 # ----------------------------------------------------------------------------
 # Licence (NAN-5172): asked once on first install, recorded in .env.
 # ----------------------------------------------------------------------------
@@ -1599,25 +1624,52 @@ if [[ -f .env ]]; then
     if [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,NANO_VECTOR_CONFIG_DELIVERY_TOKEN,* ]]; then
         warn "NANO_VECTOR_CONFIG_DELIVERY_TOKEN was a placeholder; replaced it with a generated one."
     fi
+    # NAN-5013 (v2.0.6): nano refuses a publicly known install token on every
+    # ingest lane, so it is replaced here. The services started below read the
+    # new value: nano-api republishes Vector's tokens file and Vector's static
+    # config picks it up when it is recreated. Named per-source tokens are
+    # stored as hashes in PostgreSQL and keep working unchanged.
+    if [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,VECTOR_AUTH_TOKEN,* ]]; then
+        warn "VECTOR_AUTH_TOKEN (the forwarder install token) was a publicly known default, which nano now refuses; replaced it with a generated one."
+        warn "Senders using named ingest tokens keep working. Senders that still send the old public token get HTTP 401: issue each one a named token in $BASE_URL/ingestion/ingest-tokens."
+        if [[ "$MULTI_NODE" == "1" ]]; then
+            warn "Securely copy $NANO_INSTALL_DIR/.env to every inventory host before re-running install.sh there: their copy still holds the public token, which they now refuse."
+        fi
+    fi
+    # NAN-5042: strict Vector config delivery (refuse the install token once
+    # the dedicated token exists) is never inferred on an upgraded role-split
+    # cluster. An ingest host whose .env predates the delivery token presents
+    # the install token; refused, its consumer stops refreshing readiness and
+    # the load balancer drops the host. Pin the compatible mode explicitly and
+    # say how to finish. Fresh installs write true (below).
+    if [[ "$MULTI_NODE" == "1" ]] && ! grep -qE '^[[:space:]]*NANO_VECTOR_CONFIG_DELIVERY_STRICT=' .env; then
+        # Appended (symlink-safe; the last assignment wins).
+        echo "NANO_VECTOR_CONFIG_DELIVERY_STRICT=false" >> .env
+        warn "Pinned NANO_VECTOR_CONFIG_DELIVERY_STRICT=false in .env: this cluster predates strict Vector config delivery, so nano-api still accepts a private install token from an ingest host whose .env lacks NANO_VECTOR_CONFIG_DELIVERY_TOKEN (warned per host)."
+        warn "To finish: copy the app host's .env to every inventory host and re-run install.sh there, then set NANO_VECTOR_CONFIG_DELIVERY_STRICT=true in the app host's .env and re-run install.sh on it. v2.1 enforces strict delivery regardless."
+    fi
     # NAN-5148: on a role-split app host, a delivery token generated just now
     # exists only in this .env. Ingest hosts still present their old value or
     # the install token; nano-api refuses a placeholder and a public install
-    # token, so starting the API now would stop config delivery to them.
-    # Stop before anything starts. The token is saved in .env, so the re-run
-    # after the copy goes ahead.
-    if [[ "$MULTI_NODE" == "1" && "$secret_mode" == generate && "${NANO_PREPARE_ONLY:-0}" != "1" ]] \
-        && { [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,NANO_VECTOR_CONFIG_DELIVERY_TOKEN,* ]] \
-            || { [[ ",${NANO_BACKFILLED_SECRET_KEYS// /}," == *,NANO_VECTOR_CONFIG_DELIVERY_TOKEN,* ]] \
-                && [[ ",${NANO_PUBLIC_SECRET_KEYS// /}," == *,VECTOR_AUTH_TOKEN,* ]]; }; }; then
-        fail "Generated NANO_VECTOR_CONFIG_DELIVERY_TOKEN in $NANO_INSTALL_DIR/.env. Ingest hosts need it before nano-api starts: their install token is publicly known (or their delivery token was a placeholder), which nano-api refuses for Vector config delivery. Securely copy $NANO_INSTALL_DIR/.env to every inventory host, then re-run this command here and install.sh on each ingest host. Nothing was started."
+    # token (rotated just now, NAN-5013), and a private one too in strict
+    # mode, so starting the API now would stop config delivery to them. Stop
+    # before anything starts. The token is saved in .env, so the re-run after
+    # the copy goes ahead.
+    delivery_token_new=0
+    if [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,NANO_VECTOR_CONFIG_DELIVERY_TOKEN,* ]]; then
+        delivery_token_new=1
+    elif [[ ",${NANO_BACKFILLED_SECRET_KEYS// /}," == *,NANO_VECTOR_CONFIG_DELIVERY_TOKEN,* ]] \
+        && { [[ ",${NANO_ROTATED_SECRET_KEYS// /}," == *,VECTOR_AUTH_TOKEN,* ]] \
+            || [[ "$(env_value NANO_VECTOR_CONFIG_DELIVERY_STRICT)" == true ]]; }; then
+        delivery_token_new=1
+    fi
+    if [[ "$MULTI_NODE" == "1" && "$secret_mode" == generate && "${NANO_PREPARE_ONLY:-0}" != "1" \
+        && "$delivery_token_new" == 1 ]]; then
+        fail "Generated NANO_VECTOR_CONFIG_DELIVERY_TOKEN in $NANO_INSTALL_DIR/.env. Ingest hosts need it before nano-api starts: nano-api refuses their install token for Vector config delivery (a publicly known one always, a private one with NANO_VECTOR_CONFIG_DELIVERY_STRICT=true), and a placeholder delivery token too. Securely copy $NANO_INSTALL_DIR/.env to every inventory host, then re-run this command here and install.sh on each ingest host. Nothing was started."
     fi
     if [[ -n "${NANO_PUBLIC_DB_PASSWORD_KEYS:-}" ]]; then
         warn "Database password(s) $NANO_PUBLIC_DB_PASSWORD_KEYS are publicly known defaults. They are not changed automatically: PostgreSQL and ClickHouse keep the password their data was created with."
         warn "These services are reachable only on the internal Docker network, but change them: see 'Changing a database password' in docs/getting-started/docker-deployment.md."
-    fi
-    if [[ ",${NANO_PUBLIC_SECRET_KEYS// /}," == *,VECTOR_AUTH_TOKEN,* ]]; then
-        warn "VECTOR_AUTH_TOKEN (the forwarder install token) is a publicly known default, so anyone can send events. It is kept because your forwarders use it."
-        warn "Issue a named ingest token per sender in $BASE_URL/ingestion/ingest-tokens, move the senders over, then turn the install token off. From v2.1 nano refuses a public install token."
     fi
     VECTOR_AUTH_TOKEN_PRESENT=0
     grep -qE '^VECTOR_AUTH_TOKEN=.' .env && VECTOR_AUTH_TOKEN_PRESENT=1
@@ -1773,6 +1825,7 @@ EOF
 fi
 configure_outbound_proxy
 configure_private_ai_endpoints
+configure_automatic_backups
 
 # Resolve overlays before sizing as well as startup: an overlay can replace the
 # Vector data volume with a host bind/external driver, whose capacity cannot be
@@ -2077,7 +2130,13 @@ done
 # fails. Re-export the *resolved* profile (and the compose profile) so the value
 # the containers see matches what we wrote to .env in both fresh and re-run paths.
 export NANO_SCHEMA_PROFILE="$SCHEMA_PROFILE"
-[[ "${BUNDLE_TENZIR:-0}" == "1" ]] && export COMPOSE_PROFILES=tenzir
+# Export the recorded profiles: the shell environment wins over .env, and
+# .env may also carry the `backup` profile (NAN-5204).
+COMPOSE_PROFILES_RECORDED=$(env_value COMPOSE_PROFILES)
+if [[ "${BUNDLE_TENZIR:-0}" == "1" && ",$COMPOSE_PROFILES_RECORDED," != *",tenzir,"* ]]; then
+    COMPOSE_PROFILES_RECORDED="${COMPOSE_PROFILES_RECORDED:+$COMPOSE_PROFILES_RECORDED,}tenzir"
+fi
+[[ -n "$COMPOSE_PROFILES_RECORDED" ]] && export COMPOSE_PROFILES="$COMPOSE_PROFILES_RECORDED"
 
 # Record the resolved release + image source in .env (a re-run upgrades an
 # existing install to this checkout's release) and export them, since the shell

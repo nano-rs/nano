@@ -65,6 +65,8 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // NAN-5214: before anything can negotiate TLS with PostgreSQL.
+    nanosiem_core::db::tls_provider::install_default_crypto_provider();
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("clickhouse-migrator");
 
     let args: Vec<String> = std::env::args().skip(1).collect();

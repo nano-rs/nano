@@ -54,7 +54,7 @@ impl SourceType {
         match s.to_lowercase().as_str() {
             "routed" | "http" => Some(Self::Routed),
             "kafka" => Some(Self::Kafka),
-            "aws_s3" | "aws_sqs" | "s3" => Some(Self::AwsS3),
+            "aws_s3" | "aws_sqs" | "crowdstrike_fdr" | "s3" => Some(Self::AwsS3),
             "gcp_pubsub" | "pubsub" => Some(Self::GcpPubSub),
             "azure_event_hubs" => Some(Self::AzureEventHubs),
             "splunk_hec" | "splunk" | "hec" => Some(Self::SplunkHec),

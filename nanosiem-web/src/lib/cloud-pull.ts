@@ -11,11 +11,12 @@ import type { SourceConfigType } from '@/lib/api/types';
 export const CLOUD_PULL_PATH = '/ingestion/log-sources/cloud-pull';
 
 /** Source configuration types that pull from a cloud queue or broker. */
-export const PULL_CONFIG_TYPES: readonly SourceConfigType[] = ['aws_s3', 'aws_sqs', 'gcp_pubsub', 'azure_event_hubs', 'kafka'] as SourceConfigType[];
+export const PULL_CONFIG_TYPES: readonly SourceConfigType[] = ['aws_s3', 'aws_sqs', 'crowdstrike_fdr', 'gcp_pubsub', 'azure_event_hubs', 'kafka'] as SourceConfigType[];
 
 export const PROVIDER_LABEL: Record<string, string> = {
   aws_s3: 'AWS S3 + SQS',
   aws_sqs: 'AWS SQS',
+  crowdstrike_fdr: 'CrowdStrike FDR',
   gcp_pubsub: 'GCP Pub/Sub',
   azure_event_hubs: 'Azure Event Hubs',
   kafka: 'Kafka',

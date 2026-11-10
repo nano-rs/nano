@@ -21,7 +21,7 @@
 //! Needs docker:
 //!
 //! ```text
-//! NANOSIEM_TEST_VECTOR_IMAGE=ghcr.io/nano-rs/vector:0.61.0-nano.5-debian \
+//! NANOSIEM_TEST_VECTOR_IMAGE=ghcr.io/nano-rs/vector:0.61.0-nano.7-debian \
 //!   cargo test -p nanosiem-core --test draft_parser_env_vector -- --ignored --test-threads=1
 //! ```
 

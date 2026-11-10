@@ -41,6 +41,8 @@ fn usage() -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // NAN-5214: one rustls provider before any PostgreSQL / HTTPS client.
+    nanosiem_core::db::tls_provider::install_default_crypto_provider();
     // Before arguments, credentials or any child: the host process holds
     // credentials, so it must not be dumpable or ptrace-able by a same-uid
     // worker that escaped a degraded sandbox, nor write a core file.

@@ -176,6 +176,19 @@ impl ConsumerConfig {
     }
 }
 
+/// NAN-5220: the install's signed licence from the registered credential
+/// source (enterprise builds; resolved on every check, so a renewal is used at
+/// the next one). The sovereign feed route accepts only a signed licence, so an
+/// online enrollment credential is not used here: those installs take the open
+/// feed route, as before.
+async fn installed_signed_license() -> Option<Vec<u8>> {
+    use crate::content_bundle::credential::{credential_source, CredentialLookup, DistributionCredential};
+    match credential_source()?.lookup().await {
+        CredentialLookup::Found { credential: DistributionCredential::SignedLicense(bytes), .. } => Some(bytes),
+        _ => None,
+    }
+}
+
 /// The signed license artifact, enterprise builds only. Open builds have no
 /// license machinery (NAN-1193) and always use the open route.
 #[cfg(feature = "enterprise")]
@@ -269,6 +282,13 @@ pub struct MetadataResponse {
 pub trait FeedHttp: Send + Sync {
     /// GET the metadata route (no redirects). `license` is the raw artifact.
     async fn metadata(&self, url: &str, license: Option<&[u8]>) -> Result<MetadataResponse, String>;
+    /// GET the metadata route with an online enrollment credential
+    /// (`Authorization: Bearer <token>` + `X-Nano-Deployment-Id`; NAN-5220).
+    /// Clients that cannot present one refuse.
+    async fn metadata_enrolled(&self, url: &str, deployment_id: &str, token: &str) -> Result<MetadataResponse, String> {
+        let _ = (url, deployment_id, token);
+        Err("this HTTP client cannot present an enrollment credential".into())
+    }
     /// Download `url` into `dest` (created 0600), at most `cap` bytes. Returns
     /// the SHA-256 of the bytes written.
     async fn download(&self, url: &str, dest: &Path, cap: u64) -> Result<String, String>;
@@ -280,6 +300,25 @@ pub trait FeedHttp: Send + Sync {
 /// Covers send and body-stream errors alike.
 pub fn http_error(error: reqwest::Error) -> String {
     error.without_url().to_string()
+}
+
+/// Header naming the deployment an enrollment token belongs to (NAN-5220).
+pub const ENROLLMENT_DEPLOYMENT_HEADER: &str = "X-Nano-Deployment-Id";
+
+/// Send a metadata request and read its body (at most 128 KiB).
+async fn read_metadata(request: reqwest::RequestBuilder) -> Result<MetadataResponse, String> {
+    let response = request.send().await.map_err(http_error)?;
+    let status = response.status().as_u16();
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(http_error)?;
+        if body.len() + chunk.len() > MAX_METADATA_BYTES {
+            return Err("metadata response exceeds 128 KiB".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(MetadataResponse { status, body })
 }
 
 /// Production HTTP: https only, SSRF-validated and pinned, no redirects.
@@ -311,18 +350,17 @@ impl FeedHttp for ReqwestFeedHttp {
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(license),
             );
         }
-        let response = request.send().await.map_err(http_error)?;
-        let status = response.status().as_u16();
-        let mut body = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(http_error)?;
-            if body.len() + chunk.len() > MAX_METADATA_BYTES {
-                return Err("metadata response exceeds 128 KiB".to_string());
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(MetadataResponse { status, body })
+        read_metadata(request).await
+    }
+
+    async fn metadata_enrolled(&self, url: &str, deployment_id: &str, token: &str) -> Result<MetadataResponse, String> {
+        let (client, url) = Self::client(url, Duration::from_secs(60)).await?;
+        let request = client
+            .get(url)
+            .header("accept", "application/json")
+            .header(ENROLLMENT_DEPLOYMENT_HEADER, deployment_id)
+            .bearer_auth(token);
+        read_metadata(request).await
     }
 
     async fn download(&self, url: &str, dest: &Path, cap: u64) -> Result<String, String> {
@@ -711,31 +749,45 @@ impl PlatformFeedConsumer {
 
     /// Resolve the distribution endpoint and fetch + verify its metadata.
     async fn fetch_release(&self) -> Result<(CurrentRelease, Channel), ConsumerError> {
+        let installed = if self.config.mirror_url.is_none() && self.config.license.is_none() {
+            installed_signed_license().await
+        } else {
+            None
+        };
         let mut attempts: Vec<(Channel, String, Option<&[u8]>)> = Vec::new();
         if let Some(mirror) = &self.config.mirror_url {
             attempts.push((Channel::Mirror, mirror.clone(), None));
         } else {
-            if let Some(license) = self.config.license.as_deref() {
+            if let Some(license) = self.config.license.as_deref().or(installed.as_deref()) {
                 attempts.push((Channel::Sovereign, self.config.sovereign_url.clone(), Some(license)));
             }
             attempts.push((Channel::Open, self.config.open_url.clone(), None));
         }
         let mut refused = Vec::new();
         for (channel, url, license) in attempts {
-            let response = self
-                .http
-                .metadata(&url, license)
-                .await
-                .map_err(ConsumerError::Fetch)?;
-            if channel == Channel::Sovereign && matches!(response.status, 401 | 403) {
-                let code = serde_json::from_slice::<serde_json::Value>(&response.body)
-                    .ok()
-                    .and_then(|v| v["code"].as_str().map(str::to_string))
-                    .unwrap_or_else(|| format!("HTTP {}", response.status));
-                tracing::warn!(%code, "sovereign feed route refused the license; using the open route");
-                refused.push(code);
-                continue;
+            let result = self.http.metadata(&url, license).await;
+            // NAN-5220 review M1: the sovereign route is an upgrade, never a
+            // single point of failure. Any refusal (401/403), budget (429),
+            // outage (503 license_verification_unavailable, other non-200) or
+            // transport error there falls through to the open route.
+            if channel == Channel::Sovereign {
+                let reason = match &result {
+                    Ok(response) if response.status == 200 => None,
+                    Ok(response) => Some(
+                        serde_json::from_slice::<serde_json::Value>(&response.body)
+                            .ok()
+                            .and_then(|v| v["code"].as_str().map(str::to_string))
+                            .unwrap_or_else(|| format!("HTTP {}", response.status)),
+                    ),
+                    Err(error) => Some(format!("transport: {error}")),
+                };
+                if let Some(reason) = reason {
+                    tracing::warn!(%reason, "sovereign feed route unavailable for this licence; using the open route");
+                    refused.push(reason);
+                    continue;
+                }
             }
+            let response = result.map_err(ConsumerError::Fetch)?;
             if response.status != 200 {
                 return Err(ConsumerError::Fetch(format!(
                     "{} returned HTTP {}",

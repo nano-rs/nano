@@ -128,11 +128,12 @@ impl FeedHttp for FakeHttp {
     async fn metadata(&self, url: &str, license: Option<&[u8]>) -> Result<MetadataResponse, String> {
         self.seen.lock().unwrap().push((url.to_string(), license.is_some()));
         let responses = self.responses.lock().unwrap();
-        responses
-            .iter()
-            .find(|(u, _)| u == url)
-            .map(|(_, r)| r.clone())
-            .ok_or_else(|| "unexpected url".to_string())
+        let (_, r) = responses.iter().find(|(u, _)| u == url).ok_or_else(|| "unexpected url".to_string())?;
+        // Status 0 stands for a transport (connect) error.
+        if r.status == 0 {
+            return Err("error sending request: connection refused".into());
+        }
+        Ok(r.clone())
     }
     async fn download(&self, _url: &str, _dest: &Path, _cap: u64) -> Result<String, String> {
         Err("not used".into())
@@ -261,4 +262,49 @@ fn next_check_follows_the_leader_schedule() {
     assert_eq!(next_check_at(&status, hour), Some(now + chrono::Duration::seconds(RETRY_SECS as i64)));
     status.auto_update = false;
     assert_eq!(next_check_at(&status, hour), None, "air-gap: no scheduled check");
+}
+
+/// NAN-5220 review M1: a sovereign outage, budget refusal or connect error
+/// never stops feed updates; the open route is used.
+#[tokio::test]
+async fn a_sovereign_outage_budget_or_connect_error_falls_back_to_the_open_route() {
+    let now = Utc::now();
+    let s = sealed(now, 9);
+    for sovereign in [
+        MetadataResponse { status: 503, body: br#"{"code":"license_verification_unavailable"}"#.to_vec() },
+        MetadataResponse { status: 429, body: br#"{"code":"feed_budget_exhausted"}"#.to_vec() },
+        MetadataResponse { status: 0, body: Vec::new() },
+    ] {
+        let label = sovereign.status;
+        let http = Arc::new(FakeHttp {
+            responses: Mutex::new(vec![
+                ("https://feeds.example/sovereign".into(), sovereign),
+                ("https://feeds.example/open".into(), MetadataResponse { status: 200, body: metadata(&s.signed, "https://b.example/x") }),
+            ]),
+            seen: Mutex::new(Vec::new()),
+        });
+        let c = consumer(config(Some(b"H01-license".to_vec()), None), http.clone());
+        let (release, channel) = c.fetch_release().await.unwrap_or_else(|e| panic!("sovereign {label}: {e}"));
+        assert_eq!(channel, Channel::Open, "sovereign {label}");
+        assert_eq!(release.signed, s.signed);
+        assert_eq!(
+            *http.seen.lock().unwrap(),
+            vec![("https://feeds.example/sovereign".to_string(), true), ("https://feeds.example/open".to_string(), false)],
+            "sovereign {label}"
+        );
+    }
+}
+
+/// The open route itself failing is still an error (nothing to fall back to).
+#[tokio::test]
+async fn an_open_route_failure_after_a_sovereign_failure_is_reported() {
+    let http = Arc::new(FakeHttp {
+        responses: Mutex::new(vec![
+            ("https://feeds.example/sovereign".into(), MetadataResponse { status: 503, body: Vec::new() }),
+            ("https://feeds.example/open".into(), MetadataResponse { status: 0, body: Vec::new() }),
+        ]),
+        seen: Mutex::new(Vec::new()),
+    });
+    let c = consumer(config(Some(b"H01-license".to_vec()), None), http);
+    assert!(matches!(c.fetch_release().await, Err(ConsumerError::Fetch(_))));
 }

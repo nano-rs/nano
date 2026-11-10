@@ -23,6 +23,8 @@ pub enum SourceType {
     AwsS3,
     /// AWS SQS consumed directly — the message body IS the log (NAN-2187)
     AwsSqs,
+    /// CrowdStrike Falcon Data Replicator feed (NAN-5005)
+    CrowdstrikeFdr,
     /// GCP Pub/Sub subscription
     GcpPubSub,
     /// Azure Event Hubs consumer group (NAN-3764, ported in NAN-4914)
@@ -40,6 +42,7 @@ impl SourceType {
             Self::Routed => "routed",
             Self::AwsS3 => "aws_s3",
             Self::AwsSqs => "aws_sqs",
+            Self::CrowdstrikeFdr => "crowdstrike_fdr",
             Self::GcpPubSub => "gcp_pubsub",
             Self::AzureEventHubs => "azure_event_hubs",
         }
@@ -55,6 +58,7 @@ impl SourceType {
             "routed" => Some(Self::Routed),
             "aws_s3" | "s3" => Some(Self::AwsS3),
             "aws_sqs" | "sqs" => Some(Self::AwsSqs),
+            "crowdstrike_fdr" | "fdr" => Some(Self::CrowdstrikeFdr),
             "gcp_pubsub" | "pubsub" => Some(Self::GcpPubSub),
             "azure_event_hubs" => Some(Self::AzureEventHubs),
             _ => None,
@@ -72,6 +76,7 @@ impl SourceType {
             "routed",
             "aws_s3",
             "aws_sqs",
+            "crowdstrike_fdr",
             "gcp_pubsub",
             "azure_event_hubs",
         ]

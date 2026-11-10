@@ -29,6 +29,7 @@ export function credentialProviderFor(configType: string): CredentialPickerProvi
   switch (configType) {
     case 'aws_s3':
     case 'aws_sqs':
+    case 'crowdstrike_fdr':
       return 'aws_s3';
     case 'gcp_pubsub':
       return 'gcp_pubsub';

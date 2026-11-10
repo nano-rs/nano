@@ -18,6 +18,7 @@ pub const SUPPORTED: &[&str] = &[
     "kafka",
     "aws_s3",
     "aws_sqs",
+    "crowdstrike_fdr",
     "gcp_pubsub",
     "azure_event_hubs",
     "file",
@@ -39,6 +40,7 @@ pub fn canonical(method: &str) -> Option<&'static str> {
         "kafka" => "kafka",
         "aws_s3" | "s3" => "aws_s3",
         "aws_sqs" => "aws_sqs",
+        "crowdstrike_fdr" | "fdr" => "crowdstrike_fdr",
         "gcp_pubsub" | "pubsub" => "gcp_pubsub",
         "azure_event_hubs" => "azure_event_hubs",
         // Legacy labels from the parser-service vocabulary

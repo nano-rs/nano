@@ -663,6 +663,7 @@ impl DualPool {
     /// If either connection fails, an error is returned with a clear message.
     pub async fn new(config: &DualPoolConfig) -> Result<Self, DualPoolError> {
         // Initialize PostgreSQL connection pool with enhanced configuration
+        super::tls_provider::install_default_crypto_provider();
         let mut pg_options = PgPoolOptions::new()
             .max_connections(config.pg_max_connections)
             .min_connections(config.pg_min_connections)

@@ -14,9 +14,14 @@
 //!    upgraded first, and ingest hosts whose copied `.env` predates the token
 //!    keep pulling parser publishes and ingest-token changes (including
 //!    revocations) until their `.env` is updated. v2.1 removes that fallback;
-//!    `NANO_VECTOR_CONFIG_DELIVERY_STRICT=true` enforces it now (fresh
-//!    installs set it). Single-host stacks have no delivery consumer and
-//!    switch it off with `NANO_VECTOR_CONFIG_DELIVERY=off`.
+//!    `NANO_VECTOR_CONFIG_DELIVERY_STRICT=true` enforces it now. Fresh
+//!    installs and the Helm chart set it (NAN-5042); install.sh and
+//!    `nano upgrade` pin an upgraded install to `false` until every ingest
+//!    host carries the delivery token, because a refused consumer stops
+//!    refreshing its readiness and the load balancer drops that ingest host.
+//!    A publicly known install token is never accepted (NAN-5148).
+//!    Single-host stacks have no delivery consumer and switch it off with
+//!    `NANO_VECTOR_CONFIG_DELIVERY=off`.
 //! 2. Produce the deterministic findings that boot logs and the SIEM health
 //!    report surface for insecure-but-still-accepted configurations, so an
 //!    operator sees them before the v2.1 enforcement.
@@ -32,8 +37,8 @@ pub const DELIVERY_TOKEN_ENV: &str = "NANO_VECTOR_CONFIG_DELIVERY_TOKEN";
 pub const DELIVERY_SWITCH_ENV: &str = "NANO_VECTOR_CONFIG_DELIVERY";
 /// The forwarder install token.
 pub const INSTALL_TOKEN_ENV: &str = "VECTOR_AUTH_TOKEN";
-/// `true` refuses the install token on delivery even when a dedicated token
-/// exists (the v2.1 behaviour, available now).
+/// `true` refuses the install token on delivery whenever a dedicated token
+/// exists (the v2.1 behaviour). Opt-in: fresh installs and Helm set it.
 pub const DELIVERY_STRICT_ENV: &str = "NANO_VECTOR_CONFIG_DELIVERY_STRICT";
 
 /// Which credential the internal Vector config delivery accepts.
@@ -126,12 +131,19 @@ pub fn vector_config_delivery_from_env() -> VectorConfigDeliveryCredential {
         var(DELIVERY_SWITCH_ENV).as_deref(),
         var(DELIVERY_TOKEN_ENV).as_deref(),
         var(INSTALL_TOKEN_ENV).as_deref(),
-        env_flag(DELIVERY_STRICT_ENV),
+        strict_from_env(),
     )
 }
 
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| v.trim().eq_ignore_ascii_case("true"))
+/// [`DELIVERY_STRICT_ENV`]: strict only when explicitly `true`. Never inferred:
+/// strict on an upgraded cluster whose ingest hosts lack the delivery token
+/// takes those hosts out of the load balancer (NAN-5042).
+pub fn strict_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+}
+
+fn strict_from_env() -> bool {
+    strict_from_value(std::env::var(DELIVERY_STRICT_ENV).ok().as_deref())
 }
 
 /// One deterministic posture finding.
@@ -164,7 +176,7 @@ impl PostureInputs {
             install_token: var(INSTALL_TOKEN_ENV),
             delivery_switch: var(DELIVERY_SWITCH_ENV),
             delivery_token: var(DELIVERY_TOKEN_ENV),
-            delivery_strict: env_flag(DELIVERY_STRICT_ENV),
+            delivery_strict: strict_from_env(),
             allow_default_keys: var("NANOSIEM_ALLOW_DEFAULT_KEYS")
                 .is_some_and(|v| v.eq_ignore_ascii_case("true")),
             base_url: var("BASE_URL"),
@@ -217,10 +229,11 @@ pub fn posture_findings(inputs: &PostureInputs) -> Vec<PostureFinding> {
         findings.push(PostureFinding {
             title: "The Vector install token is a public default value".into(),
             description: "VECTOR_AUTH_TOKEN is set to a value nano shipped as a default or example \
-                 (for example `nanosiem-default-token`), so anyone can use it to send events. \
-                 Issue a named ingest token for each sender (Ingestion > Ingest tokens), move \
-                 the senders to them, then turn the install token off. From v2.1 a public \
-                 install token is refused."
+                 (for example `nanosiem-default-token`). Since v2.0.6 nano refuses it on every \
+                 ingest lane and for Vector config delivery, so senders still using it get \
+                 HTTP 401. Re-run install.sh or `nano upgrade`, which replace it with a \
+                 generated value, or set VECTOR_AUTH_TOKEN to `openssl rand -hex 32` yourself. \
+                 Move each sender to a named ingest token (Ingestion > Ingest tokens)."
                 .into(),
             priority: "critical",
         });
@@ -265,9 +278,8 @@ pub fn posture_findings(inputs: &PostureInputs) -> Vec<PostureFinding> {
                      whose .env predates the new token keeps receiving parser publishes and \
                      ingest-token changes. nano-api logs each caller that still uses the \
                      install token, with its IP address: copy the updated shared .env to that \
-                     host and re-run install.sh there. Then set \
-                     {DELIVERY_STRICT_ENV}=true on nano-api to refuse the install token now; \
-                     v2.1 refuses it regardless."
+                     host and re-run install.sh there. Then set {DELIVERY_STRICT_ENV}=true on \
+                     nano-api to refuse the install token now; v2.1 refuses it regardless."
                 ),
                 priority: if install_public { "critical" } else { "medium" },
             })

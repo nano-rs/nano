@@ -63,6 +63,8 @@ fn env_num<T: FromStr>(name: &str, default: T) -> Result<T, String> {
 }
 
 fn main() -> ExitCode {
+    // NAN-5214: one rustls provider for PostgreSQL TLS (see tls_provider).
+    nanosiem_core::db::tls_provider::install_default_crypto_provider();
     // Before anything else: the host process holds credentials, so it must
     // not be dumpable or ptrace-able by a same-uid worker that escaped a
     // degraded sandbox, nor write a core file.

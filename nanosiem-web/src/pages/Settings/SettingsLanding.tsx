@@ -25,6 +25,7 @@ import { useCapabilities } from '@/hooks/use-capabilities';
 import { useSystemConfig } from '@/hooks/use-api';
 import { useRecentAuditChanges } from '@/hooks/use-api';
 import { auditActorLabel } from '@/lib/audit-feed';
+import { LastBackupCard } from '@/components/settings/LastBackupCard';
 import {
   SETTINGS_GROUPS,
   SETTINGS_SECTIONS,
@@ -367,7 +368,11 @@ export function SettingsLanding() {
 
         <div className="grid grid-cols-[1fr_360px] gap-6">
           <SettingsGrid visibleSections={visibleSections} />
-          <RecentChangesPreview />
+          <div className="flex flex-col gap-6">
+            {/* NAN-5204: open core, admins only (the endpoint needs settings:system). */}
+            {hasPermission('settings:system') && <LastBackupCard />}
+            <RecentChangesPreview />
+          </div>
         </div>
 
         <div className="h-4" />
