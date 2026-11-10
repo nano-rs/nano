@@ -16,6 +16,7 @@ pub mod artifact_provenance;
 pub mod authz_generation;
 pub mod content_repo;
 pub mod credential_use;
+pub mod first_admin;
 #[cfg(feature = "enterprise")]
 pub mod google_sso;
 pub mod grant_authority;
@@ -23,6 +24,7 @@ pub mod login_throttle;
 pub mod mfa;
 #[cfg(feature = "enterprise")]
 pub mod oidc;
+pub mod oidc_trust;
 pub mod password;
 pub mod permission;
 pub mod permission_cache;
@@ -44,6 +46,8 @@ pub mod viewer_scope;
 #[cfg(test)]
 mod credential_hardening_tests;
 #[cfg(test)]
+mod first_admin_tests;
+#[cfg(test)]
 mod group_membership_tests;
 #[cfg(test)]
 mod service_credential_tests;
@@ -64,6 +68,7 @@ pub use grant_authority::*;
 pub use mfa::*;
 #[cfg(feature = "enterprise")]
 pub use oidc::*;
+pub use oidc_trust::OidcTrustChange;
 pub use password::*;
 pub use permission::*;
 pub use permission_cache::*;

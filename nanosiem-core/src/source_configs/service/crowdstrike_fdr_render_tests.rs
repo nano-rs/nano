@@ -113,7 +113,7 @@ fn fdr_is_a_pull_source_reading_with_aws_credentials() {
 /// The rendered source plus its routing transform (lookups output left
 /// unconsumed) must pass `vector validate` on the pinned image. Ignored by
 /// default (needs docker); run with
-/// `NANOSIEM_TEST_VECTOR_IMAGE=ghcr.io/nano-rs/vector:0.61.0-nano.7-debian
+/// `NANOSIEM_TEST_VECTOR_IMAGE=ghcr.io/nano-rs/vector:0.61.0-nano.8-debian
 ///  cargo test -p nanosiem-core --lib fdr_generated_config_passes_vector_validate -- --ignored`.
 /// `NANOSIEM_TEST_VECTOR_BIN=<path to a fork vector binary>` runs it without docker.
 #[test]

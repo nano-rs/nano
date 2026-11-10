@@ -30,7 +30,11 @@ on:
       - tools/scan-mirror-secrets.sh
       - tools/tests/**
       - scripts/tests/install-edition.test.sh
+      - scripts/tests/install-env-set-keys.test.sh
+      - scripts/lib/generated-secrets.sh
       - scripts/tests/install-api-call.test.sh
+      - scripts/tests/install-bind-address-probes.test.sh
+      - scripts/tests/test_nano_upgrade_bind_address.py
       - scripts/tests/install-image-pull.test.sh
       - scripts/lib/image-pull.sh
       - scripts/tests/install-umask.test.sh
@@ -42,6 +46,12 @@ on:
       - skills/nano-deploy/**
       - scripts/tests/nano_deploy_plan_support.py
       - scripts/tests/test_nano_deploy_plan*.py
+      - scripts/tests/test_nano_deploy_customer_run.py
+      - scripts/tests/test_nano_deploy_health_checks.py
+      - scripts/tests/fixtures/nano-deploy-health/**
+      - scripts/tests/test_otlp_edge_content_type.py
+      - deploy/helm/nano/templates/ingest/**
+      - scripts/tests/test_nano_deploy_fetch_bundle.py
       - scripts/tests/fixtures/nano-deploy-plan/**
       - scripts/check-opencore-web-build.sh
       - docker-compose.yml
@@ -103,6 +113,7 @@ jobs:
         run: |
           if [ -f scripts/tests/install-edition.test.sh ]; then
             bash scripts/tests/install-edition.test.sh
+            bash scripts/tests/install-env-set-keys.test.sh
           else
             echo "install-edition test not in this tree (public mirror); skipping"
           fi
@@ -115,6 +126,18 @@ jobs:
             bash scripts/tests/install-api-call.test.sh
           else
             echo "install api-call test not in this tree (public mirror); skipping"
+          fi
+
+      # A private inventory bind_address: install.sh's health/readiness probes
+      # use the address the edges are published on, not localhost; nano-upgrade
+      # post-verify probes stay inside the edge containers.
+      - name: install.sh probes honour bind_address
+        run: |
+          if [ -f scripts/tests/install-bind-address-probes.test.sh ]; then
+            bash scripts/tests/install-bind-address-probes.test.sh
+            python3 -m unittest scripts/tests/test_nano_upgrade_bind_address.py
+          else
+            echo "install bind-address test not in this tree (public mirror); skipping"
           fi
 
       # NAN-5197: present images are never pulled; missing ones are bounded,
@@ -158,6 +181,10 @@ jobs:
             python3 -I scripts/tests/test_nano_deploy_plan.py -v
             python3 -I scripts/tests/test_nano_deploy_plan_ha.py -v
             python3 -I scripts/tests/test_nano_deploy_plan_inventory.py -v
+            python3 -I scripts/tests/test_nano_deploy_customer_run.py -v
+            python3 -I scripts/tests/test_nano_deploy_health_checks.py -v
+            python3 -I scripts/tests/test_otlp_edge_content_type.py -v
+            python3 -I scripts/tests/test_nano_deploy_fetch_bundle.py -v
           else
             echo "nano-deploy planner tests not in this tree (public mirror); skipping"
           fi

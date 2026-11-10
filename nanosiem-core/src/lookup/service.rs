@@ -258,14 +258,19 @@ impl LookupService {
             return Err(LookupError::TableAlreadyExists(new_table.name));
         }
 
-        // Generate the actual table name
-        let actual_table_name = new_table.generate_table_name();
+        // NAN-5230: a fresh, unique physical name. The sanitized
+        // `lookup_<name>` is shared by logical names that differ only in case
+        // or punctuation, so reusing it would adopt (and on a later failure
+        // drop) another lookup's table.
+        let actual_table_name = new_table.generate_unique_table_name();
 
         self.repository
             .record_staged_generation(&new_table.name, &actual_table_name)
             .await?;
 
-        // Create the dynamic PostgreSQL table
+        // Create the dynamic table. The PostgreSQL store refuses an existing
+        // name (`TableAlreadyExists`) rather than reusing it; that table is not
+        // this call's to clean up, so only a table this call created is dropped.
         if let Err(error) = self
             .repository
             .create_dynamic_table(
@@ -275,7 +280,9 @@ impl LookupService {
             )
             .await
         {
-            let _ = self.repository.cleanup_generation(&actual_table_name).await;
+            if !matches!(error, LookupRepositoryError::TableAlreadyExists(_)) {
+                let _ = self.repository.cleanup_generation(&actual_table_name).await;
+            }
             return Err(error.into());
         }
 
@@ -341,7 +348,7 @@ impl LookupService {
         // switches (NAN-2875 review fix), so derive it from the logical name
         // rather than the current physical one: repeated replaces must not keep
         // stacking `_stg_` suffixes.
-        let base: String = new_table.generate_table_name().chars().take(48).collect();
+        let base = new_table.physical_name_base();
         let staging = format!(
             "{}_stg_{}",
             base,

@@ -14,7 +14,7 @@
 
 import { useState, FormEvent, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Mail, Lock, User, CircleAlert, CircleCheck, ChevronRight } from 'lucide-react';
+import { Mail, Lock, User, KeyRound, CircleAlert, CircleCheck, ChevronRight } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -28,6 +28,8 @@ const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
 interface SetupStatus {
   initialized: boolean;
   has_users: boolean;
+  /** NAN-5237: initialize needs the installer's NANO_SETUP_TOKEN as a bearer. */
+  setup_token_required?: boolean;
 }
 
 export function Setup() {
@@ -38,6 +40,8 @@ export function Setup() {
   const [name, setName] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [setupToken, setSetupToken] = useState('');
+  const [setupTokenRequired, setSetupTokenRequired] = useState(false);
   
   // UI state
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -59,6 +63,7 @@ export function Setup() {
             // System already initialized, redirect to login
             navigate('/login', { replace: true });
           }
+          setSetupTokenRequired(status.setup_token_required === true);
         }
       } catch {
         // If we can't check status, show the setup form anyway
@@ -80,13 +85,18 @@ export function Setup() {
   // Clear error when inputs change
   useEffect(() => {
     if (error) setError(null);
-  }, [email, name, password, confirmPassword]);
+  }, [email, name, password, confirmPassword, setupToken]);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
 
     // Validate inputs
+    if (setupTokenRequired && !setupToken.trim()) {
+      setError('Setup token is required');
+      return;
+    }
+
     if (!email.trim()) {
       setError('Email is required');
       return;
@@ -115,11 +125,11 @@ export function Setup() {
     setIsSubmitting(true);
 
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (setupTokenRequired) headers.Authorization = `Bearer ${setupToken.trim()}`;
       const response = await fetch(`${API_BASE_URL}/api/setup/initialize`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers,
         body: JSON.stringify({
           email: email.trim(),
           name: name.trim(),
@@ -195,6 +205,32 @@ export function Setup() {
         {/* Setup Card */}
         <div className="bg-card rounded-2xl border border-border p-8">
           <form onSubmit={handleSubmit} className="space-y-6">
+            {/* Setup token (NAN-5237): only when the server requires one */}
+            {setupTokenRequired && (
+              <div className="space-y-2">
+                <Label htmlFor="setupToken" className="text-foreground">
+                  Setup token
+                </Label>
+                <div className="relative">
+                  <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
+                  <Input
+                    id="setupToken"
+                    type="password"
+                    value={setupToken}
+                    onChange={(e) => setSetupToken(e.target.value)}
+                    className="pl-10 font-mono bg-background border-border text-foreground placeholder:text-muted-foreground focus:border-blue-500"
+                    disabled={isSubmitting}
+                    autoComplete="off"
+                    spellCheck={false}
+                    autoFocus
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Printed by the installer; also in <span className="font-mono">NANO_SETUP_TOKEN</span> in the install directory's <span className="font-mono">.env</span>
+                </p>
+              </div>
+            )}
+
             {/* Name Field */}
             <div className="space-y-2">
               <Label htmlFor="name" className="text-foreground">
@@ -211,7 +247,7 @@ export function Setup() {
                   className="pl-10 bg-background border-border text-foreground placeholder:text-muted-foreground focus:border-blue-500"
                   disabled={isSubmitting}
                   autoComplete="name"
-                  autoFocus
+                  autoFocus={!setupTokenRequired}
                 />
               </div>
             </div>

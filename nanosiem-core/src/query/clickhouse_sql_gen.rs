@@ -29,6 +29,7 @@ mod eval_functions;
 // (NAN-1396 drift test).
 pub(crate) mod field_analysis;
 mod helpers;
+pub(crate) use helpers::extract_named_groups;
 mod keyword_terms;
 // pub(crate): `query::validation::derived_fields` mirrors the resolve_identity
 // output registration from the IDENTITY_*_FIELDS tables (NAN-1380).
@@ -1056,7 +1057,7 @@ pub(super) fn has_selective_indexed_eq(expr: &SearchExpr, profile: &dyn SchemaPr
 /// exist (see that function for the authoritative emitted AST):
 ///
 ///  * NAN-704 legacy audit gate — a deny set of exactly `{"audit"}` emits
-///    `source_type != "audit"` (case-insensitive on both sides).
+///    `source_type != "audit"` (matched exactly, as the injector emits it).
 ///  * NAN-1799 per-source RBAC scoping — any other non-empty deny set emits
 ///    ONE negated IN-list, `source_type NOT IN ("a", "b", …)`
 ///    (`SearchExpr::InList { negated: true, .. }`).
@@ -1067,8 +1068,8 @@ pub(super) fn has_selective_indexed_eq(expr: &SearchExpr, profile: &dyn SchemaPr
 /// span a tenant tagged with a denied `source_type` value (perf + correctness
 /// on spans; the logs dataset never strips, so there is no leak either way).
 ///
-/// The field-name check is the same relaxed normalization for both arms
-/// (`eq_ignore_ascii_case("source_type")`); values are NOT inspected for the
+/// The field-name check is the injector's exact spelling for both arms
+/// (`is_gate_field`, NAN-5226); values are NOT inspected for the
 /// IN-list arm — the injector is the only producer of the
 /// `And(Group(inner), <gate>)` wrap this matcher is applied under, and its
 /// value set is exactly the caller's deny set.
@@ -1078,12 +1079,12 @@ fn is_injected_audit_gate_filter(expr: &SearchExpr) -> bool {
             field,
             op: Comparator::Ne,
             value: Value::String(s),
-        } => field.eq_ignore_ascii_case("source_type") && s.eq_ignore_ascii_case("audit"),
+        } => crate::search::query_processing::query_manipulation::is_gate_field(field) && s == "audit",
         SearchExpr::InList {
             field,
             negated: true,
             values: _,
-        } => field.eq_ignore_ascii_case("source_type"),
+        } => crate::search::query_processing::query_manipulation::is_gate_field(field),
         _ => false,
     }
 }

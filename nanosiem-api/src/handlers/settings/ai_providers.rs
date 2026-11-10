@@ -16,9 +16,9 @@ use nanosiem_core::ai_provider::{
     parse_openai_model_list, DirectApiStyle, SELF_HOSTED_PROVIDER,
 };
 use nanosiem_core::ai_provider_safety::{
-    azure_chat_url, config_url, request_error, summarize_upstream_error,
-    validate_config_scalars, AI_PROVIDER_URL_KEYS, DEFAULT_AZURE_API_VERSION,
-    DEFAULT_AZURE_DEPLOYMENT,
+    ai_destination_changed, azure_chat_url, config_url, ensure_api_key_follows_destination,
+    request_error, summarize_upstream_error, validate_config_scalars, AI_PROVIDER_URL_KEYS,
+    DEFAULT_AZURE_API_VERSION, DEFAULT_AZURE_DEPLOYMENT,
 };
 use nanosiem_core::auth::permissions;
 use nanosiem_core::crypto::EncryptionService;
@@ -411,6 +411,7 @@ pub async fn get_ai_provider(
     request_body = UpdateProviderCredentialsRequest,
     responses(
         (status = 200, description = "Provider updated", body = ProviderCredentialsResponse),
+        (status = 400, description = "Invalid config (blocked URL / bad scalar), or an endpoint change while a key is stored without re-supplying api_key (send a new key, or blank to remove it)", body = ErrorResponse),
         (status = 403, description = "Missing permission", body = ErrorResponse),
         (status = 404, description = "Provider not found", body = ErrorResponse),
         (status = 500, description = "Internal error", body = ErrorResponse)
@@ -445,14 +446,35 @@ pub async fn update_ai_provider(
     // `enabled: false` alone does not mean "disable". A base-URL edit on a row
     // that was never enabled used to run the disable migration and move every
     // agent on that provider. Only a real enabled → disabled transition counts.
-    let was_enabled: bool =
-        sqlx::query_scalar("SELECT enabled FROM provider_credentials WHERE provider = $1")
-            .bind(&provider)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|e| ApiError::InternalError(e.to_string()))?
-            .ok_or_else(|| ApiError::NotFound(format!("Provider '{}' not found", provider)))?;
+    let (was_enabled, stored_config, has_stored_key): (bool, Option<serde_json::Value>, bool) =
+        sqlx::query_as(
+            "SELECT enabled, config, credentials_encrypted IS NOT NULL \
+             FROM provider_credentials WHERE provider = $1",
+        )
+        .bind(&provider)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalError(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("Provider '{}' not found", provider)))?;
     let provider_being_disabled = was_enabled && request.enabled == Some(false);
+
+    // NAN-5225: `config = COALESCE($3, config)` replaces the endpoint but keeps
+    // `credentials_encrypted`. The stored key belongs to the endpoint it was
+    // entered for, so a destination change must re-supply it (or blank it).
+    ensure_api_key_follows_destination(
+        stored_config.as_ref(),
+        request.config.as_ref(),
+        has_stored_key,
+        request.api_key.is_some(),
+    )
+    .map_err(|msg| ApiError::BadRequest(msg.to_string()))?;
+    let destination_changed = request
+        .config
+        .as_ref()
+        .is_some_and(|new| {
+            let empty = serde_json::json!({});
+            ai_destination_changed(stored_config.as_ref().unwrap_or(&empty), new)
+        });
 
     // Encrypt the API key if provided using AES-256-GCM
     let encrypted_creds: Option<Vec<u8>> = match request.api_key.as_deref() {
@@ -639,6 +661,10 @@ pub async fn update_ai_provider(
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("settings", None, Some(provider.to_string()))
             .client_context(&client)
+            .details(serde_json::json!({
+                "credential_destination_changed": destination_changed && has_stored_key,
+                "endpoint_changed": destination_changed,
+            }))
             .build(),
     );
 

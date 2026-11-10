@@ -2141,11 +2141,27 @@ export interface DiskPressureStatus {
   emergency_threshold: number;
 }
 
+/** NAN-5217: the cluster-wide ingestion pause (read from PostgreSQL). */
+export interface IngestionPauseStatus {
+  paused: boolean;
+  /** `disk_pressure` lifts itself when disk usage recovers; `manual` only by an admin. */
+  source: 'disk_pressure' | 'manual' | null;
+  reason: string | null;
+  paused_at: string | null;
+  paused_by: string | null;
+  /** Whether ClickHouse currently refuses writes by the ingest users. */
+  clickhouse_guard: 'applied' | 'absent' | 'unknown';
+  clickhouse_users: string[];
+  auto_pause_enabled: boolean;
+}
+
 export interface StorageOverview {
   clickhouse_enabled: boolean;
   postgres: StorageStats | null;
   clickhouse: ClickHouseStorageStats | null;
   disk_pressure: DiskPressureStatus | null;
+  /** null only when the pause state could not be read. */
+  ingestion: IngestionPauseStatus | null;
 }
 
 export interface UpdateClickHouseRetentionRequest {

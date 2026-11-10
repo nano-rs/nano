@@ -128,10 +128,7 @@ impl ImportLifecycle {
         let severity = parse_severity(&severity_str);
 
         let (detection_mode, schedule_cron, lookback_minutes) = if let Some(npl) = npl {
-            let det_mode = match npl.detection_mode.as_deref() {
-                Some("realtime") => crate::models::DetectionMode::RealTime,
-                _ => crate::models::DetectionMode::Scheduled,
-            };
+            let det_mode = parse_rule_file_detection_mode(npl.detection_mode.as_deref());
             let schedule = npl
                 .schedule
                 .clone()
@@ -960,5 +957,16 @@ fn map_rule_mitre_write_error(error: sqlx::Error) -> RuleRepositoryError {
     match crate::mitre::mapping::database_mapping_violation(&error) {
         Some(message) => RuleRepositoryError::ConversionFailed(message),
         None => RuleRepositoryError::Database(error),
+    }
+}
+
+/// `detection_mode` in a rule file. The API and the detection-as-code exporter
+/// write `real-time`; older rule files and the docs used `realtime`. Accept both
+/// (any case, `_` too) so an exported real-time rule never re-imports as
+/// scheduled; anything else stays scheduled, as before.
+pub(crate) fn parse_rule_file_detection_mode(value: Option<&str>) -> crate::models::DetectionMode {
+    match value.map(|v| v.trim().to_ascii_lowercase().replace(['-', '_'], "")) {
+        Some(v) if v == "realtime" => crate::models::DetectionMode::RealTime,
+        _ => crate::models::DetectionMode::Scheduled,
     }
 }

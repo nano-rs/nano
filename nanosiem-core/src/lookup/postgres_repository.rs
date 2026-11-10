@@ -544,13 +544,28 @@ impl PostgresLookupRepository {
             ));
         }
 
+        // NAN-5230: plain CREATE TABLE. Every caller asks for a fresh
+        // generation; `IF NOT EXISTS` silently handed back another lookup's
+        // table when two names collided, and the caller's failure cleanup then
+        // dropped it. A collision is reported, never adopted.
         let create_sql = format!(
-            "CREATE TABLE IF NOT EXISTS \"{}\" ({})",
+            "CREATE TABLE \"{}\" ({})",
             table_name,
             column_defs.join(", ")
         );
 
-        sqlx::query(&create_sql).execute(&self.pool).await?;
+        if let Err(error) = sqlx::query(&create_sql).execute(&self.pool).await {
+            let duplicate = error
+                .as_database_error()
+                .and_then(|db| db.code())
+                .is_some_and(|code| code == "42P07");
+            if duplicate {
+                return Err(LookupRepositoryError::TableAlreadyExists(
+                    table_name.to_string(),
+                ));
+            }
+            return Err(error.into());
+        }
 
         // Create index on primary key if specified
         if let Some(pk) = primary_key {

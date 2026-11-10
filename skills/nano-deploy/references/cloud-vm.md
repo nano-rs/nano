@@ -48,7 +48,8 @@ vm-2   10.20.0.12  8    32      1600          rack-b
 
 Also ask **how users and log senders will reach nano**: a managed cloud load
 balancer, two small HAProxy hosts with a floating address (keepalived, needs
-VRRP on the network), or one HAProxy host (see [load balancer](#7-load-balancer)).
+VRRP on the network), two HAProxy hosts behind health-checked DNS, or one
+HAProxy host (see [load balancer](#7-load-balancer)).
 
 ## 2. Plan the layout
 
@@ -56,8 +57,8 @@ VRRP on the network), or one HAProxy host (see [load balancer](#7-load-balancer)
 # Existing VMs: roles laid out on them
 python3 scripts/plan.py --hosts ./nano-deploy-work/hosts.txt --gb-per-day <GB> [--eps <EPS>] \
   --avg-event-bytes <B> --retention-days <D> [--hot-days <D>] --growth <x> --analysts <N> \
-  --lb cloud|haproxy-pair|haproxy-single [--lb-address <ip>]... [--lb-vip <ip>] \
-  [--trusted-proxy-cidr <managed LB source range>] > ./nano-deploy-work/plan.txt
+  --lb cloud|haproxy-pair|haproxy-dns|haproxy-single [--lb-address <ip>]... [--lb-vip <ip>] \
+  [--trusted-proxy-cidr <managed LB source range>] [--lab] > ./nano-deploy-work/plan.txt
 
 # New cloud VMs: the planner picks them
 python3 scripts/plan.py --cloud aws|azure|gcp [--region <r>] --gb-per-day <GB> ... \
@@ -79,7 +80,8 @@ The plan is deterministic and offline. It contains:
 - the load balancer: backends, health checks, and whether it is a single
   point of failure;
 - tuned settings for the volume (inventory `resources.overrides` where the
-  installer accepts them; otherwise the NAN issue that will);
+  installer accepts them; otherwise marked "not settable from the inventory
+  yet");
 - for cloud plans, a dated monthly cost estimate, with anything unverified listed.
 
 **How roles are placed on existing VMs.** The planner tries the least-stacked
@@ -92,10 +94,33 @@ full-HA layout that fits, then stacks roles only as far as needed:
 | 4 | as above, with the third PostgreSQL + Keeper on a ClickHouse host |
 | 3 or fewer | refused: full HA is not possible; offer [multi-node-ha.md](multi-node-ha.md) and say what it loses |
 
-Every stacked host must carry the sum of its roles; the planner refuses a VM
-that is too small and names the shortfall. Ingest never shares a host with the
-app. Spare VMs are listed: one can carry a single HAProxy, or become another
-ingest host for headroom.
+Every stacked host must carry the sum of its roles. The production sizes per
+role are the High availability guide's
+[Server sizing](https://nano.rs/docs/getting-started/high-availability#server-sizing)
+table; the planner computes the same numbers and raises them with volume. A
+VM sold as 16 GB reports about 15 GiB and counts as 16 GB.
+
+**When the hosts are too small**, the planner refuses and names the binding
+constraint and the fix, for example:
+
+```text
+plan: these 7 hosts cannot carry a production full-HA layout at 12.5 GB/day. Binding constraint(s) for the ClickHouse hosts:
+  - RAM: the largest host has 15 GiB; a ClickHouse host needs 32 GB ...
+  - data disk: ... needs 100 GiB fixed (Docker images, logs, system tables) plus hot data ...
+    No --hot-days value fixes this: the fixed 100 GiB alone is more than the disk
+```
+
+Quote it to the operator. `--hot-days` helps only when the message says hot
+data is what does not fit. For an **evaluation or test cluster** the operator
+names as one, re-run with `--lab` (alias `--allow-undersized`). The plan, the
+inventory and the firewall script then carry a `LAB PLAN - NOT FOR
+PRODUCTION` banner and list every shortfall, and the plan estimates how many
+days of events the ClickHouse disks hold. Record the lab exception in the
+work log. Never use `--lab` for production.
+
+The planner keeps ingest off the app hosts: that is supported (2.0.4 and
+later), but sender load would then compete with the UI. Spare VMs are listed:
+use them for HAProxy, or as more ingest hosts for headroom.
 
 How it sizes: [sizing.md](sizing.md#cloud-planner-model).
 
@@ -114,7 +139,9 @@ Present `plan.txt` and say plainly:
 - every `EXTRAPOLATED` warning: above ~5,300 EPS the ratios come from an
   external estate, not from nano measurements;
 - the cost range (cloud plans), its date, and that it is not a quote;
-- the settings that cannot be applied yet at this volume, with their issues.
+- the settings that cannot be applied yet at this volume;
+- with `--lab`: that the plan is **NOT FOR PRODUCTION**, every shortfall it
+  lists, and how many days of events fit locally.
 
 Write the confirmed plan to `./nano-deploy-work/plan.md`. **Do not continue
 without an explicit "yes".**
@@ -127,19 +154,22 @@ plan's types, zones, addresses and disks), load balancers, DNS. The loops read
 the plan: `python3 scripts/plan.py <same flags> --nodes-tsv`.
 
 For existing VMs, check instead that they match the plan (`lsblk`, `nproc`,
-`free -g` over SSH, read-only) and apply the same firewall flows with the
-operator's tooling: `python3 scripts/plan.py --firewall-tsv` prints every rule
-(port, target group, source group). A VM joins the group of every role it runs;
-`lb-app` and `lb-ingest` are the load balancer's source addresses (the HAProxy
-host or hosts, when you use HAProxy).
+`free -g` over SSH, read-only). Firewall flows: `python3 scripts/plan.py
+--firewall-tsv` prints every rule (port, target group, source group) for the
+operator's tooling. A VM joins the group of every role it runs; `lb-app` and
+`lb-ingest` are the load balancer's source addresses (the HAProxy host or
+hosts, when you use HAProxy). For the host firewall itself, see step 5.
 
 ## 5. Prepare each VM (mutating, per host)
 
 - **OS:** Ubuntu 24.04 LTS (x86-64, AVX2). Preflight checks it.
 - **Data disk first, Docker second.** Mount the data disk at
-  `/var/lib/docker` *before* installing Docker, so ClickHouse, PostgreSQL,
-  Keeper, etcd and the Vector buffers land on it. Use ext4 with `noatime`
-  (ClickHouse's recommended filesystem). Mount by UUID with `nofail`.
+  `/var/lib/docker` *before* installing Docker, so the Docker volumes
+  (ClickHouse, PostgreSQL, Keeper, etcd and the Vector buffers) land on it. Use
+  ext4 with `noatime` (ClickHouse's recommended filesystem). Mount by UUID
+  with `nofail`. Docker 29 keeps **images** in the containerd image store at
+  `/var/lib/containerd`, on the root disk: leave ~30 GB free there for images
+  (or bind-mount `/var/lib/containerd` from the data disk too).
 - **Local NVMe (ClickHouse `local-nvme` cloud plans):** RAID 0 the devices
   with `mdadm`, ext4, at `/var/lib/docker`. It is ephemeral: a stop, resize or
   host failure wipes it, and the other replica re-seeds it. Never stop both
@@ -149,8 +179,40 @@ host or hosts, when you use HAProxy).
   PostgreSQL hosts) is a two-host failure. Say so if the operator uses them.
 - **Time sync:** chrony on the cloud's or site's time source.
   `scripts/nano upgrade` refuses unsynchronized clocks.
-- **Docker Engine** from Docker's apt repository, Compose 2.24.4 or newer.
+- **Docker Engine 24 or newer with Compose 2.24.4 or newer.** Docker's own
+  apt repository is the tested path. A distribution package (for example
+  Ubuntu's `docker.io` with `docker-compose-v2`) is fine when it meets those
+  versions; preflight checks them.
 - **SSH user:** a non-root sudo user; its key from the operator's agent.
+- **Host firewall, before the first install** (security, required on any host
+  with a public address). Docker-published ports (app and ingest 80, 3000,
+  8687, PostgreSQL 5432, Patroni 8008, etcd 2379/2380, Valkey 6379, Sentinel
+  26379) **bypass UFW**: with only UFW, they are reachable from the internet.
+  ClickHouse and Keeper (8123, 9000, 9009, 9363, 9181, 9234) use host
+  networking, so UFW covers them. With the operator's approval, apply the
+  DOCKER-USER and UFW rules for this plan's addresses on every host. The
+  planner prints them; review them with the operator first:
+
+     ```bash
+     python3 scripts/plan.py <same flags> --firewall-script > ./nano-deploy-work/firewall.sh
+     ssh $H 'MGMT_CIDR=<where the operator SSHes from> bash -s' < ./nano-deploy-work/firewall.sh
+     ```
+
+  The script refuses to run without `MGMT_CIDR`, so it can't lock the
+  operator out of SSH. It installs `/usr/local/sbin/nano-docker-firewall`
+  and `nano-docker-firewall.service`, which re-apply the `DOCKER-USER` rules
+  at boot (before Docker) and after every Docker start. The rules drop only
+  NEW connections to a published port that arrive from outside the host and
+  from outside the cluster. This host's containers, talking to each other or
+  connecting out on the same ports, are never filtered. Run the same script
+  on the HAProxy hosts: it opens 443 there (and VRRP from the keepalived
+  peer). Do **not** install `iptables-persistent`: on Ubuntu/Debian it
+  uninstalls `ufw`. Do not try to
+  close the ports with the inventory's `bind_address` instead: the installer
+  health-checks the app and ingest edges on `localhost`, so a private-only
+  bind fails the install. The public guide's
+  [Host firewall](https://nano.rs/docs/getting-started/high-availability#host-firewall)
+  section is the authority.
 
 ```bash
 ssh $H 'set -e; lsblk -o NAME,SIZE,TYPE,MOUNTPOINT'
@@ -162,22 +224,27 @@ ssh $H "set -e; DEV=/dev/nvme1n1
   sudo mount /var/lib/docker && df -h /var/lib/docker"
 ```
 
-Then preflight every host ([preflight.md](preflight.md)) with its roles from
-the plan, `--peers` the other addresses and the plan's minimums. Zero `FAIL`.
+Then preflight every host ([preflight.md](preflight.md)) with the flags
+`python3 scripts/plan.py <same flags> --preflight-args` prints for it: its
+roles (with `lb` on an HAProxy host), the other addresses and its exact
+requirement in this plan (`--lab` is added for a lab plan). Zero `FAIL`, and
+no `exposure` WARN left unexplained.
 
 ## 6. Licence, download, verify, install
 
-1. **Licence and download (operator, in app.nano.rs → Deployments → the
-   Self-run deployment):** the three enrollment values (`LICENSE_URL`,
-   `LICENSE_TOKEN`, `NANO_DEPLOYMENT_ID`) saved to a `0600` file whose path
-   they give you; the enterprise compose bundle **and its `.sha256`** (the
-   links last 15 minutes); a registry pull credential (lasts one hour, so get
-   it just before installing) saved to a file.
-2. **Verify before anything is extracted:** `sha256sum -c
-   nano-compose-enterprise-<V>.tar.gz.sha256` must print `OK`; on a mismatch
-   stop. If nano published a signature for the checksum, verify it with nano's
-   bootstrap verifier and the release key fingerprint nano gave you, never with
-   a key taken from inside the archive. The installer then verifies every image
+1. **Licence (operator, in app.nano.rs → Deployments → the Self-run
+   deployment):** the three enrollment values (`LICENSE_URL`, `LICENSE_TOKEN`,
+   `NANO_DEPLOYMENT_ID`) saved to a `0600` file whose path they give you.
+   Nothing else is needed from the portal.
+2. **Download and verify before anything is extracted:**
+   `bash scripts/fetch-bundle.sh --enrollment <file> --version <V> --out
+   ./nano-deploy-work/bundle` downloads the bundle, `.sha256` and `.sha256.sig`
+   with the licence values and must print `VERIFIED`. It checks the pinned
+   release-signing-v1 key, the signature, that the signed `.sha256` names
+   exactly this bundle, and the bundle's hash; on any failure it keeps nothing.
+   Never use `sha256sum -c` or a key taken from inside the archive. Just before
+   installing, get the one-hour registry credential the same way with
+   `--registry-cred <file>`. The installer then verifies every image
    against the digest lock (`NANO_IMAGES_LOCK=images.enterprise.customer.lock`;
    never set `NANO_SKIP_IMAGE_VERIFY`). For an air-gapped site, the signed image
    bundle is checked with `scripts/nano bundle verify <bundle>` before it is
@@ -242,18 +309,28 @@ Pick one:
 
 | Option | When | HA |
 |---|---|---|
-| Managed cloud LB (`--lb cloud`) | AWS, Azure, GCP | survives a zone loss; see the cloud file |
+| Managed cloud LB (`--lb cloud`) | any cloud (recommended) | survives a zone loss; see the cloud file |
 | Two HAProxy hosts + keepalived (`--lb haproxy-pair --lb-vip <ip>`) | your own network with VRRP (IP protocol 112) allowed and L2 adjacency | survives either HAProxy host (~3 s failover) |
-| One HAProxy host (`--lb haproxy-single`) | no managed LB and no VRRP, for example spot VMs in a cloud without one | **single point of failure at the edge** |
+| Two HAProxy hosts + health-checked DNS (`--lb haproxy-dns`) | no managed LB and no VRRP; a DNS provider with health checks, TTL 60 s or less | survives either HAProxy host once DNS drops it (TTL + check interval, roughly 1-2 min; not measured by nano). Senders must retry and re-resolve DNS; clients that cache DNS forever do not fail over |
+| One HAProxy host (`--lb haproxy-single`) | nothing above is possible | **single point of failure at the edge** |
 
 For HAProxy, copy `deploy/compose/examples/load-balancer/haproxy.cfg` (and
 `keepalived.conf` for a pair) from the installed bundle onto the LB host(s),
 replace the certificate paths, hostnames and the `server` lines with the ones
-in the plan, install HAProxy 3.2+ from the OS packages, and validate with
-`haproxy -c -f /etc/haproxy/haproxy.cfg` before starting it. With
-`--lb haproxy-single` and no `--lb-address`, the planner puts HAProxy on a
-spare VM. HAProxy may share only a PostgreSQL host (it binds 443; app and
-ingest edges own port 80), and then losing that host also takes the edge down.
+in the plan, install HAProxy 2.6 or later from the OS packages (Debian 12 ships
+2.6, Ubuntu 24.04 ships 2.8), and validate with
+`haproxy -c -f /etc/haproxy/haproxy.cfg` before starting it. For
+`haproxy-dns`, give both HAProxy hosts the same `haproxy.cfg` and put both
+addresses in DNS for both hostnames, with the provider's health check on
+`https://<name>/healthz` through each address.
+
+Where HAProxy goes: with no `--lb-address`, the planner puts it on spare VMs.
+With no spare, it puts it on PostgreSQL-only hosts and says so: they are the
+lightest-loaded role, while app, ingest and ClickHouse hosts carry the request
+path (and the app and ingest edges own port 80). Losing such a host then also
+costs a PostgreSQL member (a short write pause: seconds, up to about 30 s). Recommend a small
+spare VM (2 vCPU / 2 GB) per HAProxy host instead. With one HAProxy host,
+losing it takes the edge down whatever it shares.
 
 Tell the operator, for the single-HAProxy option: the cluster behind it keeps
 running through any one VM loss, but while the HAProxy host is down nobody can
@@ -280,17 +357,68 @@ for h in <every host>; do ssh $h 'python3 -I - --install-dir ~/nano' < scripts/c
 Expect one Keeper leader and two followers, every ClickHouse replica active,
 Patroni with one `Leader` and one `Sync Standby`, and exactly one jobs leader
 (`docker logs` of `nano-jobs` on the app hosts: one `Jobs leader elected`).
+`cluster-health.py` must print `PASS` for every `gw:` row on every host: each
+row is one of the host's own HAProxy gateways (clickhouse-proxy, app-api-proxy,
+ingest-proxy, postgres-router, valkey-router), read from its runtime socket.
+A `gw:clickhouse-proxy` FAIL that names **this host's own replica** means the
+host's containers cannot reach the host's own address (a host firewall
+blocking Docker bridges): with it, losing the other replica stops every
+write. Fix it (step 5: allow `docker0`/`br-+`) before go-live. On PostgreSQL
+hosts the `pg-patroni`, `pg-etcd` and `pg-sentinel` rows check the failover
+stack. The smoke test's `latency` row must show the write landing within its
+bound (default 60 s).
 
-**Failover check (with the operator's approval, one VM at a time):** for one
-VM of each role group (an app host, the Patroni leader, a ClickHouse replica,
-an ingest host, and one HAProxy host of a pair) stop it with
-`ssh $H 'sudo systemctl stop docker.socket docker'`, re-run the smoke test
-through the load balancer, show it passes, then `sudo systemctl start docker`
-and wait for `cluster-health.py` to return to `PASS` before the next one.
-Record each result (error window, smoke test, recovery time) in the work
-log. Expect a PostgreSQL leader loss to fail in-flight requests for about
-15-20 s. Never stop two VMs at once, and never stop a single HAProxy host
-during the check: that outage is expected and already stated.
+After the install, log every host out of the registry: the pull credential is
+stored unencrypted in `~/.docker/config.json`
+(`ssh $H 'docker logout us-central1-docker.pkg.dev'`). Log in again for every
+installer re-run or upgrade.
+
+From the workstation (outside the cluster), prove nothing but the load
+balancer answers from outside. Use the public addresses, if the hosts have
+them:
+
+```bash
+bash scripts/preflight.sh --exposure-probe <every host address, comma-separated>
+```
+
+Every row must be `PASS`. A `WARN` on a database or cluster port is a go-live
+blocker: fix the firewall (step 5) and probe again.
+
+**Failover check (with the operator's approval, one VM at a time):** first
+run `cluster-health.py` on every host: every `gw:` row must be `PASS` (a check
+that starts with a gateway already DOWN proves nothing). Then, for one VM of
+each role group (an app host, the Patroni leader, a ClickHouse replica, an
+ingest host, and one HAProxy host of a pair), stop it. A hard power-off from
+the hypervisor or cloud console is the real test; if the operator has none,
+`ssh $H 'sudo systemctl stop docker.socket docker'` is a softer substitute:
+say which you used. During the outage:
+
+- run the smoke test through the load balancer from a surviving app host. It
+  must PASS **including its `latency` row**: it fails when the test event takes
+  longer than `--write-sla` (default 60 s) to become searchable, even if it
+  lands later. Never pass `--redeploy` during a drill (a redeploy pushes a new
+  Vector configuration to every ingest host mid-outage);
+- run `cluster-health.py` on the surviving hosts: only gateway backends that
+  point at the stopped VM may be DOWN;
+- for the most honest result, also send a numbered event every second from
+  outside through the LB and count them in search afterwards (the HA guide's
+  "Test failover").
+
+Then start the VM and wait for `cluster-health.py` to return to `PASS` on every
+host before the next one. Record each result (error window, write latency,
+recovery time) in the work log. What must hold, per the High availability
+guide's full-HA failover test:
+
+| VM stopped | Must keep working |
+|---|---|
+| an app host | UI, search and ingest, once the LB's `/readyz` checks drop it |
+| the Patroni leader | writes, sign-ins and searches see a short pause, typically a few seconds and up to about 30 s, while a standby is promoted (a 7-host test measured ~3 s of failed sign-ins), then resume; nothing acknowledged is lost; HEC/HTTP ingest continues |
+| a ClickHouse replica | search and ingest on the other replica |
+| an ingest host | ingest on the others |
+| one HAProxy host | keepalived pair: about 3 s; DNS pair: after the TTL and health check (about 1-2 min) |
+
+Never stop two VMs at once, and never stop a single HAProxy host during the
+check: that outage is expected and already stated.
 
 ## Teardown
 

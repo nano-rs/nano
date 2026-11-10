@@ -52,6 +52,14 @@ pub trait FeedStore: Send + Sync {
     /// cannot change it until `op` is done. `Err` (lease lost) without
     /// running `op` otherwise.
     async fn fenced<'a>(&self, claim: &ClaimedFeed, op: crate::identity::FencedWrite<'a>) -> Result<(), String>;
+
+    /// NAN-5217: whether nano's cluster-wide ingestion pause is on
+    /// (`system_settings.ingestion_paused`). While it is, the runner claims no
+    /// feed run, so pull feeds stop pulling. A store that cannot tell answers
+    /// `false`: the ClickHouse guard still refuses the writes.
+    async fn ingestion_paused(&self) -> bool {
+        false
+    }
 }
 
 /// The message a fenced write fails with when the run lost its lease.
@@ -82,6 +90,7 @@ pub struct MemoryFeedStore {
 
 #[derive(Default)]
 struct MemInner {
+    ingestion_paused: bool,
     feeds: Vec<MemFeed>,
     checkpoints: HashMap<(Uuid, String), Value>,
     commits: Vec<CommitLog>,
@@ -162,6 +171,11 @@ impl MemoryFeedStore {
         self.inner.lock().expect("store").feeds.iter().find(|f| f.def.feed_id == feed_id).map(|f| f.next_run_at)
     }
 
+    /// NAN-5217: set the cluster-wide ingestion pause.
+    pub fn set_ingestion_paused(&self, paused: bool) {
+        self.inner.lock().expect("store").ingestion_paused = paused;
+    }
+
     pub fn set_enabled(&self, feed_id: Uuid, enabled: bool) {
         let mut g = self.inner.lock().expect("store");
         if let Some(f) = g.feeds.iter_mut().find(|f| f.def.feed_id == feed_id) {
@@ -180,6 +194,10 @@ impl MemoryFeedStore {
 
 #[async_trait::async_trait]
 impl FeedStore for MemoryFeedStore {
+    async fn ingestion_paused(&self) -> bool {
+        self.inner.lock().expect("store").ingestion_paused
+    }
+
     async fn claim_due(
         &self,
         node: &str,

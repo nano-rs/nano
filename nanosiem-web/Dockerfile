@@ -40,6 +40,8 @@ LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
 COPY --from=builder /app/dist /usr/share/nginx/html
 
 # Copy nginx config for SPA routing (use port 5173 to match dev server)
+# NAN-5235: Cross-Origin-Opener-Policy same-origin on documents, so a page on
+# another origin that opens the app gets no window handle to navigate it.
 # Configure nginx to run as non-root (pid in /tmp, no access log to file)
 RUN echo 'pid /tmp/nginx.pid; \
 events { worker_connections 1024; } \
@@ -58,6 +60,7 @@ http { \
         root /usr/share/nginx/html; \
         index index.html; \
         add_header Cache-Control "no-cache" always; \
+        add_header Cross-Origin-Opener-Policy "same-origin" always; \
         location = /index.html { \
             try_files $uri =404; \
         } \

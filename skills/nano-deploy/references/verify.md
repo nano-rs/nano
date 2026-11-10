@@ -13,7 +13,10 @@ ssh $H 'python3 -I - --app-url http://localhost' < scripts/smoke-test.py
 
 `smoke-test.py` checks health, admin login, the licence state, ingest of a
 uniquely marked JSON event through `/ingest/` with a short-lived source-bound
-token (revoked afterwards), and search for that marker. Then check from
+token (revoked afterwards), and search for that marker. It reports the write
+latency and FAILS when the event takes longer than `--write-sla` (default
+60 s) to become searchable. It deploys its log source only the first time
+(`--redeploy` forces it; never during a failover drill). Then check from
 outside the host, through the real public path:
 
 ```bash
@@ -38,7 +41,11 @@ done
 
 Expect one Keeper `leader` with 2 synced followers and two `follower`s, both
 replicas in `system.clusters` (seen from `nano-2` and `nano-3`), no read-only replicated tables, and a
-replica delay of 30 seconds or less. `cluster-health.py` exits 3 with
+replica delay of 30 seconds or less, and a `PASS` on every `gw:` row: each is
+one of the host's own HAProxy gateways read from its runtime socket. A
+`gw:clickhouse-proxy` FAIL naming the local replica means the host's
+containers cannot reach the host's own address (host firewall blocking
+Docker bridges); fix it before go-live. `cluster-health.py` exits 3 with
 `INCONCLUSIVE` when `system.replicas` does not answer in time (it can block
 behind table locks on a busy, small host). That is not a pass: wait a few
 minutes and re-run it. If it persists, report it with `system.processes`
@@ -52,6 +59,16 @@ ssh $H1 'curl -s -o /dev/null -w "%{http_code}\n" http://localhost/api/internal/
 ssh $H2 'curl -fsS http://localhost/healthz'                                       # 200: ingest on nano-2 ready
 ssh $H3 'curl -fsS http://localhost/healthz'                                       # 200: ingest on nano-3 ready
 ```
+
+From the workstation, outside the cluster, nothing but the load balancer may
+answer:
+
+```bash
+bash scripts/preflight.sh --exposure-probe <ip1>,<ip2>,<ip3>   # every row PASS
+```
+
+Use the public addresses when the hosts have them. A `WARN` on PostgreSQL,
+Valkey, etcd, Patroni, Sentinel, ClickHouse or Keeper is a go-live blocker.
 
 Optional failover drill, with operator approval: stop ClickHouse on `nano-3`
 (`docker stop` its clickhouse container), re-run the smoke test, then start it

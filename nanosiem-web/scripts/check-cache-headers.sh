@@ -39,6 +39,10 @@ check() {
 for path in / /index.html /cache-check/deep/route; do
     check "$path" no-cache
     cmp "$scratch/index.html" "$scratch/body"
+    # NAN-5235: every app document isolates its browsing context from other origins.
+    coop=$(awk 'tolower($1) == "cross-origin-opener-policy:" {sub(/^[^:]*: */, ""); sub(/\r$/, ""); print}' "$scratch/headers")
+    [ "$coop" = same-origin ] || { echo "FAIL $path: Cross-Origin-Opener-Policy='$coop' (expected same-origin)" >&2; exit 1; }
+    echo "PASS $path: Cross-Origin-Opener-Policy: same-origin"
 done
 # Check every shipped non-hashed entry (includes manifest / service worker if added).
 find /usr/share/nginx/html -type f ! -path '*/assets/*' | while IFS= read -r file; do

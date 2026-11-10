@@ -327,6 +327,7 @@ pub struct LogoutRequest {
         (status = 204, description = "Logout successful"),
         (status = 401, description = "Invalid token", body = AuthApiError),
         (status = 403, description = "Forbidden — interactive session required (API keys have no session)", body = AuthApiError),
+        (status = 503, description = "HA only: the revocation could not be persisted to PostgreSQL; retry", body = AuthApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -381,18 +382,36 @@ pub async fn logout(
             .await;
     }
 
-    // Revoke the current access token so it cannot be reused before expiry
-    state
-        .token_service
-        .revoke_token(auth.claims.jti, auth.claims.exp)
-        .await;
-    // H8: Persist revocation to PostgreSQL so it survives restarts
-    nanosiem_core::auth::token::persist_revoked_token(
+    // H8 / NAN-5243: persist the revocation to PostgreSQL first. It is the
+    // durable record (synchronously replicated in HA) that every API/search
+    // process re-reads (spawn_revocation_sync), so a revocation the shared
+    // Valkey later loses is still enforced.
+    let persisted = nanosiem_core::auth::token::persist_revoked_token(
         &state.pool,
         auth.claims.jti,
         auth.claims.exp,
     )
     .await;
+    // Revoke the current access token so it cannot be reused before expiry.
+    // A Valkey replica not confirming it is logged, not fatal: HA must
+    // survive one host down (a two-member Valkey set then has no replica).
+    if let Err(error) = state
+        .token_service
+        .revoke_token_durable(auth.claims.jti, auth.claims.exp)
+        .await
+    {
+        tracing::warn!(jti = %auth.claims.jti, %error, "logout revocation not confirmed on a Valkey replica; PostgreSQL holds it");
+    }
+    if state.token_service.revocation_fail_closed() && persisted.is_err() {
+        // Never report a logout whose revocation is not durable; the client retries.
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AuthApiError::new(
+                "revocation_unavailable",
+                "Logout could not be confirmed; retry.",
+            )),
+        ));
+    }
 
     // Emit logout audit event
     state.emit_audit(

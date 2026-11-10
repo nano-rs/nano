@@ -701,6 +701,48 @@ async fn validate_definition(
     }
 }
 
+/// NAN-5223: whether a definition edit changes where its code can send a
+/// connection's stored credentials: the code itself, the allowed host set
+/// (domains and suffixes, compared as case-insensitive sets) or the auth
+/// settings (`auth_type`, and the `auth` block with its token URL).
+fn collector_destination_changed(
+    existing: &CustomCollectorDefinitionResponse,
+    request: &CustomCollectorDefinitionRequest,
+) -> bool {
+    fn host_set(hosts: &[String]) -> std::collections::BTreeSet<String> {
+        hosts.iter().map(|h| h.trim().to_ascii_lowercase()).collect()
+    }
+    // An auth block that cannot be serialized compares as changed (fail closed).
+    let auth_json = |auth: &Option<ManifestAuth>| serde_json::to_value(auth).ok();
+    let (old_auth, new_auth) = (auth_json(&existing.auth), auth_json(&request.auth));
+    existing.code != request.code
+        || host_set(&existing.allowed_domains) != host_set(&request.allowed_domains)
+        || host_set(&existing.allowed_domain_suffixes)
+            != host_set(&request.allowed_domain_suffixes)
+        || existing.auth_type != request.auth_type
+        || old_auth.is_none()
+        || old_auth != new_auth
+}
+
+/// NAN-5223: a destination change on a definition whose connections hold
+/// stored credentials needs credential-owner rights (`credentials:edit`), the
+/// same bar as repointing a bound source credential (NAN-5147).
+fn ensure_collector_retarget(
+    destination_changed: bool,
+    has_stored_credentials: bool,
+    can_edit_credentials: bool,
+) -> Result<(), ApiError> {
+    if destination_changed && has_stored_credentials && !can_edit_credentials {
+        return Err(ApiError::Forbidden(format!(
+            "Changing this integration's code, allowed domains or auth settings would send its \
+             connections' stored credentials to new code or hosts; that requires the {} \
+             permission. Ask a credential owner, or remove the connections' credentials first.",
+            permissions::CREDENTIALS_EDIT
+        )));
+    }
+    Ok(())
+}
+
 fn definition_manifest(request: &CustomCollectorDefinitionRequest) -> serde_json::Value {
     serde_json::json!({
         "streams": request.streams,
@@ -1223,7 +1265,13 @@ pub async fn get_custom_collector(
     tag = "integrations",
     params(("id" = String, Path, description = "Custom integration catalog id")),
     request_body = CustomCollectorDefinitionRequest,
-    responses((status = 200, body = CustomCollectorDefinitionResponse), (status = 400), (status = 404), (status = 409)),
+    responses(
+        (status = 200, body = CustomCollectorDefinitionResponse),
+        (status = 400),
+        (status = 403, description = "Missing permission, including credentials:edit for a code / allowed-domain / auth change while connections hold stored credentials"),
+        (status = 404),
+        (status = 409)
+    ),
     security(("api_key" = []))
 )]
 pub async fn update_custom_collector(
@@ -1241,6 +1289,22 @@ pub async fn update_custom_collector(
         return Err(ApiError::ValidationError(validation.errors.join("; ")));
     }
     let repository = MarketplaceRepository::new(state.pool.clone());
+    // NAN-5223: connections keep `credentials_encrypted` across a definition
+    // edit, so a change to where the code may send them is a credential
+    // retarget. Loading the stored definition also 404s a non-custom id.
+    let existing = custom_definition_response(repository.get_catalog_entry_by_id(id).await?)?;
+    let destination_changed = collector_destination_changed(&existing, &request);
+    let has_stored_credentials = destination_changed
+        && IntegrationRepository::new(state.pool.clone())
+            .list_instances(Some(id))
+            .await?
+            .iter()
+            .any(|instance| instance.has_credentials());
+    ensure_collector_retarget(
+        destination_changed,
+        has_stored_credentials,
+        auth.has_permission(permissions::CREDENTIALS_EDIT),
+    )?;
     let credential_fields = serde_json::to_value(&request.credential_fields)
         .map_err(|e| ApiError::InternalError(format!("serialize credential fields: {e}")))?;
     let entry = repository
@@ -1265,6 +1329,10 @@ pub async fn update_custom_collector(
                 Some(entry.name.clone()),
             )
             .client_context(&client)
+            .details(serde_json::json!({
+                "destination_changed": destination_changed,
+                "credential_destination_changed": destination_changed && has_stored_credentials,
+            }))
             .build(),
     );
     Ok(Json(custom_definition_response(entry)?))
@@ -1792,6 +1860,10 @@ pub async fn trigger_run(
     ))
 )]
 pub struct IntegrationsApiDoc;
+
+#[cfg(test)]
+#[path = "integrations_retarget_tests.rs"]
+mod integrations_retarget_tests;
 
 #[cfg(test)]
 mod tests {

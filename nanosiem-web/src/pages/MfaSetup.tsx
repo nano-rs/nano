@@ -38,6 +38,7 @@ import { api } from '@/lib/api';
 import type { MfaSetupResponse, MfaSetupCompleteResponse } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
 import { Checkbox } from '@/components/ui/checkbox';
+import { OUTSIDE_ARRIVAL_STATE } from '@/lib/search-auto-run';
 
 type Step = 'scan' | 'verify' | 'backup';
 
@@ -145,7 +146,7 @@ export function MfaSetup() {
         description: 'Two-factor authentication has been set up. Please sign in again.',
       });
     } else {
-      navigate(returnTo, { replace: true });
+      navigate(returnTo, { replace: true, state: OUTSIDE_ARRIVAL_STATE });
       toast({
         title: 'MFA enabled',
         description: 'Two-factor authentication is now active on your account.',

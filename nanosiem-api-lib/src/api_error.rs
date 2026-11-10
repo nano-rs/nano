@@ -488,6 +488,10 @@ impl From<nanosiem_core::LogSourceServiceError> for ApiError {
             nanosiem_core::LogSourceServiceError::InvalidVrl(msg) => {
                 ApiError::ValidationError(format!("Invalid VRL code: {}", msg))
             }
+            // NAN-5234: every parser-test worker is busy.
+            nanosiem_core::LogSourceServiceError::ParserTestBusy(msg) => {
+                ApiError::TooManyRequests(msg.clone())
+            }
             nanosiem_core::LogSourceServiceError::InvalidSourceType(t) => {
                 ApiError::ValidationError(format!("Invalid source type: {}", t))
             }
@@ -601,6 +605,12 @@ impl From<nanosiem_core::SourceConfigServiceError> for ApiError {
             nanosiem_core::SourceConfigServiceError::CredentialRetargetRequired => {
                 ApiError::Forbidden(
                     "Missing permission: credentials:edit (required to bind a stored credential to a source, or to change the connection host of a source that uses one)"
+                        .to_string(),
+                )
+            }
+            nanosiem_core::SourceConfigServiceError::DeployPermissionRequired => {
+                ApiError::Forbidden(
+                    "Missing permission: source_configs:deploy (required to change the rendered configuration or routing rules of a deployed source)"
                         .to_string(),
                 )
             }

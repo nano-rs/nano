@@ -8,6 +8,7 @@ on:
       - "scripts/release/**"
       - "scripts/tests/customer-images.test.sh"
       - "scripts/tests/helm-chart-package.test.sh"
+      - "scripts/tests/lock-provenance.test.sh"
       - "scripts/tests/release-notes-preflight.test.sh"
       - "deploy/helm/nano/**"
       - "deploy/release/**"

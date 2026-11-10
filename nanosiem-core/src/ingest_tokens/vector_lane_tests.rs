@@ -30,7 +30,7 @@ fn parse(config: &str) -> toml::Table {
     substituted.parse().expect("config parses")
 }
 
-fn transform_source(config: &str, name: &str) -> String {
+pub(super) fn transform_source(config: &str, name: &str) -> String {
     let table = parse(config);
     table["transforms"][name]["source"]
         .as_str()
@@ -46,13 +46,13 @@ fn with_env(program: &str, name: &str, value: &str) -> String {
     program.replace(&lookup, &format!("{value:?}"))
 }
 
-enum Outcome {
+pub(super) enum Outcome {
     Kept { event: Value, metadata: Value },
     Aborted,
 }
 
 /// Runs `program` over `event` with the fork's credential stamp in metadata.
-fn run(program: &str, event: Value, stamp: Option<(&str, &str)>) -> Outcome {
+pub(super) fn run(program: &str, event: Value, stamp: Option<(&str, &str)>) -> Outcome {
     let compiled = vrl::compiler::compile(program, &vrl::stdlib::all())
         .unwrap_or_else(|diagnostics| panic!("VRL compiles: {diagnostics:?}"))
         .program;
@@ -78,17 +78,17 @@ fn run(program: &str, event: Value, stamp: Option<(&str, &str)>) -> Outcome {
     }
 }
 
-fn kept(outcome: Outcome) -> (Value, Value) {
+pub(super) fn kept(outcome: Outcome) -> (Value, Value) {
     match outcome {
         Outcome::Kept { event, metadata } => (event, metadata),
         Outcome::Aborted => panic!("event was refused"),
     }
 }
 
-const TOKEN: &str = "0b9a3c34-4cbb-4c1e-9d0f-6a3bd1f0f7e1";
+pub(super) const TOKEN: &str = "0b9a3c34-4cbb-4c1e-9d0f-6a3bd1f0f7e1";
 
 /// The route the fork stamps is what nano renders into the file.
-fn stamped_route(route: &str) -> String {
+pub(super) fn stamped_route(route: &str) -> String {
     let entry = TokenFileEntry {
         sha256: "0".repeat(64),
         id: Uuid::parse_str(TOKEN).unwrap(),
@@ -386,7 +386,7 @@ fn otlp_logs_use_edge_identity_and_bound_route() {
     assert_eq!(event["auth_status"], "otlp");
 }
 
-fn source(route: &str) -> BindableSource {
+pub(super) fn source(route: &str) -> BindableSource {
     BindableSource {
         source_id: Uuid::from_u128(7),
         name: "Apache".into(),
@@ -397,7 +397,7 @@ fn source(route: &str) -> BindableSource {
     }
 }
 
-fn settings(enabled: bool, mode: InstallTokenMode) -> IngestTokenSettings {
+pub(super) fn settings(enabled: bool, mode: InstallTokenMode) -> IngestTokenSettings {
     IngestTokenSettings {
         install_token_enabled: enabled,
         install_token_mode: mode,

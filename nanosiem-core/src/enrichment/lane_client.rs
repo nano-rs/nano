@@ -12,8 +12,11 @@
 //!
 //! Wire contract (see `config/vector/04-enrichment-source.toml`): POST NDJSON
 //! to the dedicated Vector enrichment source (`:8090`) with
-//! `X-Source-Type: nano_enrich` and
-//! `Authorization: Bearer <VECTOR_AUTH_TOKEN>`. The source validates the
+//! `X-Source-Type: nano_enrich` and a bearer credential: the platform
+//! credential (`NANO_PLATFORM_INGEST_TOKEN`), then `VECTOR_AUTH_TOKEN` on a 401
+//! (see [`VectorIngestClient`]). NAN-5233: the lane accepts only a multiplex
+//! credential (tokens-file route `*`) or the source's explicit static
+//! fallback; a per-source ingest token is dead-lettered. The source validates the
 //! bearer token and stamps every decoded object as `nano_enrich`; the
 //! `enrichment_router` routes by `.source` to the per-source normalize
 //! transforms. Public edges reject this source type on generic `/ingest` so

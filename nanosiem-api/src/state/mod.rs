@@ -47,7 +47,6 @@ use nanosiem_enterprise::melod::{
 use nanosiem_enterprise::risk::RiskAnalyticsService;
 use sqlx::PgPool;
 use std::future::Future;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -297,8 +296,9 @@ pub struct AppState {
     pub signal_processor: Arc<SignalProcessor>,
     /// Disk pressure service for automatic partition eviction
     pub disk_pressure_service: Arc<DiskPressureService>,
-    /// Shared flag: set to true by disk pressure service to pause ingestion
-    pub ingestion_paused: Arc<AtomicBool>,
+    /// NAN-5217: the cluster-wide ingestion pause (PostgreSQL flag + its
+    /// ClickHouse guard), shared with the disk pressure service.
+    pub ingestion_pause: Arc<nanosiem_core::settings::IngestionPauseService>,
     /// Identity sync service for provider management and user directory
     pub identity_service: Arc<IdentitySyncService>,
     /// IP allowlist service for access control

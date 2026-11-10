@@ -10,6 +10,15 @@ use super::LogSourceServiceError;
 use crate::log_sources::types::{
     LiveTestResult, ParserTestResult, VrlDiagnostic, VrlValidationResult,
 };
+use crate::parsers::VrlValidatorError;
+
+/// A live test's execution error: busy workers stay distinguishable (429).
+fn live_test_error(error: VrlValidatorError) -> LogSourceServiceError {
+    match error {
+        VrlValidatorError::Busy(message) => LogSourceServiceError::ParserTestBusy(message),
+        other => LogSourceServiceError::InvalidVrl(format!("VRL execution error: {}", other)),
+    }
+}
 
 /// `test-live` is an interactive endpoint behind a 30-second upstream
 /// deadline. A one-day window keeps the raw-message read on recent partitions
@@ -189,21 +198,27 @@ impl LogSourceService {
         }
     }
 
-    /// Test VRL against a sample log
-    pub async fn test_vrl(&self, vrl_code: &str, sample_log: &str) -> ParserTestResult {
+    /// Test VRL against a sample log. `Err` only when every parser-test
+    /// worker is busy ([`LogSourceServiceError::ParserTestBusy`], a 429).
+    pub async fn test_vrl(
+        &self,
+        vrl_code: &str,
+        sample_log: &str,
+    ) -> Result<ParserTestResult, LogSourceServiceError> {
         self.test_vrl_chain(vrl_code, None, sample_log).await
     }
 
     /// Test a parser VRL plus an optional extension overlay (NAN-874) against a
     /// sample log. When `extension_vrl` is `None` or blank, this is identical
     /// to the single-stage `test_vrl`. When provided, the chain mirrors the
-    /// production pipeline: parse → extension → (downstream).
+    /// production pipeline: parse → extension → (downstream). `Err` only when
+    /// every parser-test worker is busy (NAN-5234).
     pub async fn test_vrl_chain(
         &self,
         parser_vrl: &str,
         extension_vrl: Option<&str>,
         sample_log: &str,
-    ) -> ParserTestResult {
+    ) -> Result<ParserTestResult, LogSourceServiceError> {
         let input_json = serde_json::json!({
             "message": sample_log
         });
@@ -220,7 +235,7 @@ impl LogSourceService {
             _ => self.vrl_validator.test_vrl(parser_vrl, &input_str).await,
         };
 
-        match result {
+        Ok(match result {
             Ok(result) => {
                 let extracted_field_count = count_extracted_fields(&result.output);
                 ParserTestResult {
@@ -231,6 +246,9 @@ impl LogSourceService {
                     extracted_field_count,
                 }
             }
+            Err(VrlValidatorError::Busy(message)) => {
+                return Err(LogSourceServiceError::ParserTestBusy(message))
+            }
             Err(e) => ParserTestResult {
                 input: truncate(sample_log, 200),
                 success: false,
@@ -238,7 +256,7 @@ impl LogSourceService {
                 error: Some(format!("VRL execution error: {}", e)),
                 extracted_field_count: 0,
             },
-        }
+        })
     }
 
     /// Test VRL against real events from ClickHouse, comparing current vs new parse.
@@ -278,9 +296,7 @@ impl LogSourceService {
             .vrl_validator
             .test_vrl_batch(new_vrl, &sample_inputs)
             .await
-            .map_err(|e| {
-                LogSourceServiceError::InvalidVrl(format!("VRL execution error: {}", e))
-            })?;
+            .map_err(live_test_error)?;
 
         // The editor sends the deployed parser even when it is byte-identical
         // to the edited parser. Avoid compiling and running the same program
@@ -290,9 +306,7 @@ impl LogSourceService {
                 self.vrl_validator
                     .test_vrl_batch(vrl, &sample_inputs)
                     .await
-                    .map_err(|e| {
-                        LogSourceServiceError::InvalidVrl(format!("VRL execution error: {}", e))
-                    })?,
+                    .map_err(live_test_error)?,
             ),
             _ => None,
         };

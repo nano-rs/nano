@@ -11,9 +11,20 @@ import {
   Gauge,
   Trash2,
   Activity,
+  PauseCircle,
+  PlayCircle,
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
-import { api, StorageOverview, ClickHouseStorageStats, DiskPressureStatus } from '@/lib/api';
+import {
+  api,
+  StorageOverview,
+  ClickHouseStorageStats,
+  DiskPressureStatus,
+  IngestionPauseStatus,
+} from '@/lib/api';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { formatUTC } from '@/lib/date-utils';
 import { useToast } from '@/hooks/use-toast';
 import { SettingsSubsectionShell, type SubsectionTab } from '@/components/settings/SettingsSubsectionShell';
@@ -95,6 +106,24 @@ export function RetentionSettings() {
         <div className="px-6 py-5 space-y-5">
           {/* ClickHouse */}
           <div style={{ display: activeTab === 'clickhouse' ? 'block' : 'none' }} className="space-y-5">
+            {overview?.ingestion && (
+              <IngestionPausePanel
+                status={overview.ingestion}
+                onChange={(ingestion) =>
+                  setOverview((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          ingestion,
+                          disk_pressure: prev.disk_pressure
+                            ? { ...prev.disk_pressure, ingestion_paused: ingestion.paused }
+                            : prev.disk_pressure,
+                        }
+                      : prev,
+                  )
+                }
+              />
+            )}
             {overview?.disk_pressure && <DiskPressurePanel status={overview.disk_pressure} />}
 
             {overview?.clickhouse ? (
@@ -346,3 +375,139 @@ function DiskPressurePanel({ status }: { status: DiskPressureStatus }) {
   );
 }
 
+/** NAN-5217: the cluster-wide ingestion pause, its provenance and the admin control. */
+function IngestionPausePanel({
+  status,
+  onChange,
+}: {
+  status: IngestionPauseStatus;
+  onChange: (status: IngestionPauseStatus) => void;
+}) {
+  const { toast } = useToast();
+  const [confirm, setConfirm] = useState<'pause' | 'resume' | null>(null);
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const run = async (action: 'pause' | 'resume') => {
+    setBusy(true);
+    try {
+      const next =
+        action === 'pause' ? await api.pauseIngestion(reason.trim()) : await api.resumeIngestion();
+      onChange(next);
+      setReason('');
+      toast({ title: action === 'pause' ? 'Ingestion paused' : 'Ingestion resumed' });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Request failed';
+      toast({ title: 'Error', description: message, variant: 'destructive' });
+    } finally {
+      setBusy(false);
+      setConfirm(null);
+    }
+  };
+
+  const sourceLabel =
+    status.source === 'manual'
+      ? 'manual'
+      : status.source === 'disk_pressure' || status.paused
+        ? 'automatic · disk pressure'
+        : null;
+  const guardLabel: Record<IngestionPauseStatus['clickhouse_guard'], string> = {
+    applied: 'ClickHouse refusing ingest writes',
+    absent: status.paused ? 'ClickHouse guard pending' : 'ClickHouse accepting ingest writes',
+    unknown: 'ClickHouse guard state unknown',
+  };
+
+  return (
+    <section className="space-y-2 pb-4 border-b border-border/60">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <Activity className={`w-4 h-4 shrink-0 ${status.paused ? 'text-red-400' : 'text-emerald-400'}`} />
+          <div className="min-w-0">
+            <p className="text-[12.5px] font-medium text-foreground">
+              Ingestion{' '}
+              <span className={`font-mono ${status.paused ? 'text-red-400' : 'text-emerald-400'}`}>
+                {status.paused ? 'Paused' : 'Active'}
+              </span>
+            </p>
+            <p className="font-mono text-[10.5px] text-muted-foreground mt-0.5 truncate">
+              {status.paused
+                ? [
+                    sourceLabel,
+                    status.paused_at ? `since ${formatUTC(status.paused_at)}` : null,
+                    guardLabel[status.clickhouse_guard],
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')
+                : `auto-pause at emergency disk level: ${status.auto_pause_enabled ? 'on' : 'off'} · ${guardLabel[status.clickhouse_guard]}`}
+            </p>
+            {status.paused && status.reason && (
+              <p className="text-[11.5px] text-muted-foreground mt-0.5 truncate">{status.reason}</p>
+            )}
+          </div>
+        </div>
+        {status.paused ? (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 text-[11.5px] shrink-0"
+            disabled={busy}
+            onClick={() => setConfirm('resume')}
+          >
+            <PlayCircle className="w-3.5 h-3.5 mr-1" />
+            Resume ingestion
+          </Button>
+        ) : (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 text-[11.5px] shrink-0"
+            disabled={busy}
+            onClick={() => setConfirm('pause')}
+          >
+            <PauseCircle className="w-3.5 h-3.5 mr-1" />
+            Pause ingestion
+          </Button>
+        )}
+      </div>
+
+      <ConfirmDialog
+        open={confirm === 'pause'}
+        onOpenChange={(open) => !open && setConfirm(null)}
+        title="Pause ingestion?"
+        description={
+          <>
+            Every ingest path stops within seconds. HTTP, HEC and OTLP senders get{' '}
+            <span className="text-foreground font-medium font-mono">503</span> with Retry-After and keep their
+            data; Vector holds what it already accepted; pull feeds stop pulling. Nothing is written until you
+            resume.
+          </>
+        }
+        confirmLabel="Pause ingestion"
+        variant="danger"
+        loading={busy}
+        onConfirm={() => run('pause')}
+      >
+        <Input
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="Reason (shown here and in the audit log)"
+          maxLength={500}
+          className="h-8 text-[12px]"
+        />
+      </ConfirmDialog>
+      <ConfirmDialog
+        open={confirm === 'resume'}
+        onOpenChange={(open) => !open && setConfirm(null)}
+        title="Resume ingestion?"
+        description={
+          status.source === 'manual'
+            ? 'Senders retrying their refused requests and buffered events are delivered.'
+            : 'This lifts an automatic disk-pressure pause. If disk usage is still at the emergency level, it pauses again on the next check.'
+        }
+        confirmLabel="Resume ingestion"
+        loading={busy}
+        onConfirm={() => run('resume')}
+      />
+    </section>
+  );
+}

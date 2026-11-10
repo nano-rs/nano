@@ -14,6 +14,11 @@ You are deploying a security product on hosts that belong to the operator. Work
 like a careful SRE: plan first, read before you write, ask before every change,
 and never trade security for a green check.
 
+The public guides at nano.rs/docs (Self-run install, High availability,
+Custom multi-node layouts, Upgrade) are the authority. This skill follows them.
+If the two ever differ, follow the guide and tell the operator about the
+difference.
+
 ## Safety rules (always apply)
 
 1. **Secrets never appear in your output, in files you commit, or on a command
@@ -71,9 +76,11 @@ them, and skip what the operator has already told you. Record the answers in
   a non-root user with `sudo`;
 - expected volume: EPS and/or GB/day, retention days;
 - public hostnames, TLS approach and DNS;
-- release version, bundle location and its SHA-256, registry credential file,
-  enrollment (licence) values file. All of these come from app.nano.rs
-  (Deployments, then your Self-run deployment) or your nano contact.
+- enrollment (licence) values file (`LICENSE_URL`, `LICENSE_TOKEN`,
+  `NANO_DEPLOYMENT_ID`), from app.nano.rs (Deployments, then your Self-run
+  deployment). With it you download and verify the bundle and get a registry
+  credential yourself ([scripts/fetch-bundle.sh](scripts/fetch-bundle.sh)); ask
+  for a release version only if the operator pins one.
 
 Size the deployment with `python3 scripts/size.py` (see
 [references/sizing.md](references/sizing.md)) and show the result.
@@ -84,26 +91,35 @@ from start to end, in this order:
 
 1. **Intake**, including section E: the list of VMs (name, address, vCPU, RAM,
    data disk, failure domain) or the cloud and region, the data volume, and how
-   users and senders reach nano (managed LB, HAProxy pair, or one HAProxy).
+   users and senders reach nano: a managed LB, an HAProxy pair with a floating
+   IP, two HAProxy hosts behind health-checked DNS, or one HAProxy (a single
+   point of failure).
 2. **Layout:** `python3 scripts/plan.py --hosts hosts.txt ...` places the roles
    on the operator's VMs (stacking only as far as needed), or `--cloud ...`
    picks new VMs. It checks that losing any one VM keeps every quorum and a
-   replica of everything.
+   replica of everything. If the hosts are too small, it names the binding
+   constraint (RAM, vCPU or disk) and refuses. `--lab` plans them anyway for an
+   evaluation or test cluster, labelled NOT FOR PRODUCTION. Use it only when
+   the operator names the cluster as one.
 3. **Review the plan** with the operator: VM count and spares, the nano 2.0.7
    requirement, any `EXTRAPOLATED` figure, the load balancer, and, with one
    HAProxy host, that **the edge is a single point of failure**.
 4. **Provision** (new cloud VMs only), **prepare** each VM (data disk at
-   `/var/lib/docker`, time sync, Docker), **preflight** every host.
-5. **Licence and download** from app.nano.rs; `sha256sum -c` the bundle before
-   extracting it; images are verified by digest at install.
+   `/var/lib/docker`, time sync, Docker, and the **host firewall before the
+   first install**: `plan.py ... --firewall-script`), **preflight** every host.
+5. **Licence and download:** the enrollment values file from app.nano.rs, then
+   `scripts/fetch-bundle.sh` downloads the bundle with them and verifies the
+   release signature and checksum before anything is extracted; images are
+   verified by digest at install.
 6. **Install** in the order `plan.py --install-order` prints (PostgreSQL hosts,
    ClickHouse, app hosts one by one, ingest) with the plan's inventory, one
    private certificate for every address, and one shared `.env`.
 7. **Load balancer:** both hostnames to the app and ingest backends with the
    plan's health checks.
 8. **Verify:** smoke test through the load balancer, cluster health on every
-   host, then the **failover check**: one VM of each role stopped in turn while
-   the smoke test still passes.
+   host, `preflight.sh --exposure-probe` from a machine outside the cluster
+   (no database or cluster port may answer), then the **failover check**: one
+   VM of each role stopped in turn while the smoke test still passes.
 
 **Gate:** confirm the intake summary and sizing (or the N-VM plan) with the
 operator. For N VMs, nothing is created or installed before this "yes".
@@ -119,8 +135,11 @@ ssh -o BatchMode=yes USER@HOST 'bash -s' -- --topology single \
 ```
 
 It checks the OS, CPU and AVX2, RAM, disk, Docker and Compose versions, tools,
-sudo, time sync, busy ports and peer reachability, and prints one
-`PASS`/`WARN`/`FAIL` row per check. Collect all hosts into one table.
+sudo, time sync, busy ports, peer reachability, registry egress and, on a role
+split (`--topology ha`), whether Docker-published ports would be exposed on a
+public address. It prints one `PASS`/`WARN`/`FAIL` row per check. Collect all
+hosts into one table. After the install, run it once more from the
+workstation with `--exposure-probe <every host address>`.
 
 **Gate:** any `FAIL` means stop. Propose fixes (for example, install Docker
 Engine from Docker's apt repository), and apply them only after the operator
@@ -143,8 +162,33 @@ Check [references/known-issues.md](references/known-issues.md) for the release
 you are installing before you start.
 
 Each reference lists its steps with the gate before each mutating step. The
-Self-run order is always: **stage the bundle → prepare (no services start) →
-add enrollment values → install → verify.**
+Self-run order is always: **fetch and verify the bundle → stage it → prepare
+(no services start) → add enrollment values → install → verify.**
+
+**Get the bundle with the licence values.** Run
+[scripts/fetch-bundle.sh](scripts/fetch-bundle.sh) on the workstation (it needs
+curl, python3 and OpenSSL 3; on macOS `brew install openssl@3`):
+
+```bash
+bash scripts/fetch-bundle.sh --enrollment ./nano-deploy-work/enrollment.env \
+  --out ./nano-deploy-work/bundle [--version <V>] [--registry-cred ./nano-deploy-work/registry.cred]
+```
+
+It downloads `nano-compose-enterprise-<V>.tar.gz`, `.sha256` and `.sha256.sig`
+through `GET /api/license/self-run/bundle` with the licence token (never in
+argv, never sent to the download host), then checks the pinned
+release-signing-v1 key fingerprint, the signature on the `.sha256`, that the
+signed `.sha256` is one line naming this bundle, and that line against the
+bundle's own hash. It prints `VERIFIED` or exits non-zero and keeps nothing.
+Never install a bundle it did not print `VERIFIED` for, and never substitute
+`sha256sum -c`: it checks whichever file the `.sha256` names. With
+`--registry-cred` it also writes a one-hour pull credential (password only,
+`0600`); fetch it just before installing. A `401` means the licence values are
+wrong or the token was regenerated; a `402` names the billing reason (cancelled,
+unpaid, trial over). A `404` on every request means the licence API does not
+offer this route yet: ask the operator for the three files. Without the licence values, the operator downloads the
+three files from the deployment's page instead; verify them the same way
+(see the Self-run docs, "Get the bundle").
 
 ### 4. Verify
 
@@ -182,8 +226,14 @@ Stop and tell the operator, quoting the exact error, when:
   services on required ports);
 - a cloud call fails on permissions or quota: report it, never widen IAM
   yourself;
-- `plan.py` refuses the VMs or a limit because full HA does not fit: explain,
-  never drop a replica or a quorum member to fit.
+- `plan.py` refuses the VMs or a limit because full HA does not fit: quote the
+  binding constraint it names (RAM, vCPU, disk or host count) and what would
+  fix it. Never drop a replica or a quorum member to fit. Offer `--lab` only
+  for a cluster the operator names as evaluation or test;
+- you have no bundle: only someone with an app.nano.rs owner or admin login
+  can fetch it;
+- `preflight.sh --exposure-probe` shows a database or cluster port reachable
+  from outside: stop the go-live until the firewall is fixed.
 
 Suggest contacting nano support (nano.rs/docs/support) with the deployment ID,
 the failing command, the time with timezone, and a redacted support bundle.

@@ -876,14 +876,18 @@ mod tests {
         // NAN-5204 adds 2 shared (open core) templates: POST
         // /api/internal/backup-status (sidecar report) and GET
         // /api/system/backup-status. Enterprise 664 + 2 = 666; open 416 + 2 = 418.
+        // NAN-5217 adds 3 shared (open core) templates: GET/POST
+        // /api/settings/ingestion/pause, POST /api/settings/ingestion/resume and
+        // GET /api/internal/ingest-admission. Enterprise 666 + 3 = 669; open
+        // 418 + 3 = 421.
         #[cfg(feature = "enterprise")]
-        let min_paths = 666;
+        let min_paths = 669;
         #[cfg(not(feature = "enterprise"))]
         // Open core excludes the hunts, playbooks and AI tuning surfaces along
         // with their enterprise-only relations (481 -> 415), plus NAN-5044's
         // owner-clamp path: 415 + 1 = 416; NAN-5204's two backup-status
-        // paths: 416 + 2 = 418.
-        let min_paths = 418;
+        // paths: 416 + 2 = 418; NAN-5217's three ingestion-pause paths: 421.
+        let min_paths = 421;
 
         assert!(
             path_count >= min_paths,

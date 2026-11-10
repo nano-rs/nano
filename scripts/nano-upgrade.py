@@ -4349,6 +4349,13 @@ printf 'consumer generation %s ready\n' "$generation"
             # major would leave the member refusing to start.
             self.postgres_major_check()
         services: list[str] = []
+        if any(name in selected for name in ("etcd", "valkey-sentinel", "valkey-ha")):
+            # NAN-5243: move the Valkey master off this host BEFORE touching
+            # any of its HA services. Recreating etcd/Sentinel first can leave
+            # this host's master unreachable to its peers (but not to the app
+            # routers): Sentinel then promotes elsewhere while it keeps taking
+            # writes that the resync later discards.
+            self._move_valkey_master_away(timeout)
         if "etcd" in selected:
             services += self._up_existing(["etcd"], timeout, exact=True)
             self._wait_container("etcd", timeout)
@@ -4356,7 +4363,6 @@ printf 'consumer generation %s ready\n' "$generation"
             services += self._up_existing(["valkey-sentinel"], timeout, exact=True)
             self._wait_container("valkey-sentinel", timeout)
         if "valkey-ha" in selected:
-            self._move_valkey_master_away(timeout)
             services += self._up_existing(["valkey-ha"], timeout, exact=True)
             self._wait_container("valkey-ha", timeout)
         if "postgres-ha" in selected:

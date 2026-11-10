@@ -128,7 +128,7 @@ gcloud storage buckets add-iam-policy-binding gs://$NAME-cold \
 
 The HMAC secret is shown once; it goes straight into nano, never into chat.
 RustFS is the self-hosted S3-compatible alternative. Tiering moves are
-free-space driven today (TTL-driven is NAN-5183).
+free-space driven today (TTL-driven moves are planned).
 
 ## Identity for the VMs and the operator
 

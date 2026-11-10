@@ -79,6 +79,11 @@ pub async fn ip_allowlist_middleware(
         return next.run(request).await;
     }
 
+    // NAN-5217: the ingest edge's pause-admission auth_request, likewise.
+    if path == "/api/internal/ingest-admission" {
+        return next.run(request).await;
+    }
+
     // NAN-5204: the nano-backup sidecar is host infrastructure on the compose
     // network; a UI/API allowlist must not silence backup failure reports.
     // The endpoint carries its own NANO_BACKUP_STATUS_TOKEN bearer gate.

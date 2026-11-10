@@ -24,6 +24,10 @@ mod sync;
 #[path = "import_authz_tests.rs"]
 mod import_authz_tests;
 
+#[cfg(test)]
+#[path = "import_detection_mode_tests.rs"]
+mod import_detection_mode_tests;
+
 pub use import::{RuleImportAction, RuleImportPlan};
 
 use sqlx::PgPool;

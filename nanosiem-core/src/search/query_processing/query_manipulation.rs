@@ -654,6 +654,18 @@ pub(crate) fn command_has_subsearch(command: &Command) -> bool {
     !command_subsearches_gated(command, &BTreeSet::from([SUBSEARCH_PROBE.to_string()]))
 }
 
+/// The field name [`mandatory_exclusion`] emits, matched EXACTLY (NAN-5226).
+///
+/// The SQL generator resolves only the canonical spelling to the
+/// `source_type` column; any other spelling (`SOURCE_TYPE`, `Source_Type`)
+/// compiles to an ext JSON path, which is not a gate. A case-folded match let a
+/// user-written `SOURCE_TYPE!="audit"` pass as the gate and skip injection.
+/// Requiring the injector's exact form is fail-safe: anything else is simply
+/// gated again.
+pub(crate) fn is_gate_field(field: &str) -> bool {
+    field == "source_type"
+}
+
 /// True iff `expr` is exactly the conjunct [`mandatory_exclusion`] emits for
 /// `deny_set`: the legacy `source_type != "audit"` FieldFilter when the deny set
 /// is exactly `{"audit"}`, else a negated `source_type NOT IN (…)` whose string
@@ -666,7 +678,7 @@ fn is_mandatory_exclusion(expr: &SearchExpr, deny_set: &BTreeSet<String>) -> boo
                 field,
                 op: Comparator::Ne,
                 value: Value::String(s),
-            } if field.eq_ignore_ascii_case("source_type") && s.eq_ignore_ascii_case("audit")
+            } if is_gate_field(field) && s == "audit"
         );
     }
     match expr {
@@ -674,7 +686,7 @@ fn is_mandatory_exclusion(expr: &SearchExpr, deny_set: &BTreeSet<String>) -> boo
             field,
             values,
             negated: true,
-        } if field.eq_ignore_ascii_case("source_type") => {
+        } if is_gate_field(field) => {
             let got: BTreeSet<String> = values
                 .iter()
                 .filter_map(|v| match v {
@@ -836,3 +848,7 @@ fn strip_ai_and_after_recursive(query: &Query, parent_found: bool) -> (Query, bo
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "query_manipulation/scope_gate_spelling_tests.rs"]
+mod scope_gate_spelling_tests;

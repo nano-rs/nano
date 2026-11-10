@@ -14,12 +14,14 @@ mod repository;
 mod service;
 mod types;
 pub mod pipe;
+pub mod test_sandbox;
 mod validator;
 mod vector_config;
 pub mod vrl_diagnostics;
 pub mod vrl_functions;
 pub mod vrl_guard;
 pub mod vrl_safety;
+pub mod worker_process;
 pub(crate) mod vrl_verdict_memo;
 #[cfg(test)]
 mod vrl_functions_tests;
@@ -36,7 +38,9 @@ pub use repository::{
 };
 pub use service::{ParserService, ParserServiceError};
 pub use types::*;
-pub use validator::exec_bounds::{MAX_TEST_SAMPLES, MAX_TEST_SAMPLE_BYTES, TEST_EXECUTION_BUDGET};
+pub use validator::exec_bounds::{
+    MAX_TEST_SAMPLES, MAX_TEST_SAMPLE_BYTES, MAX_TEST_TOTAL_SAMPLE_BYTES, TEST_EXECUTION_BUDGET,
+};
 pub use validator::{CompiledNormalizer, VrlValidator, VrlValidatorError};
 #[cfg(test)]
 pub(crate) use validator::validate_enrichment_encoding_contract;

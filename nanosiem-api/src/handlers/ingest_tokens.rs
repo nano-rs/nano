@@ -50,6 +50,7 @@ use crate::state::AppState;
     description = "Requires an active source-bound ingestion Bearer credential, not a user session. No positive cache.",
     responses((status = 204, description = "Active OTLP credential; identity in X-Nano-Credential-Id, X-Nano-Source-Route and a signed, short-lived X-Nano-Identity-Assertion. Served to the nginx edge's subrequest; nginx returns 404 for direct requests"),
               (status = 401, description = "Invalid or inactive credential"),
+              (status = 403, description = "Ingestion is paused (NAN-5217); the edge answers 503 with Retry-After"),
               (status = 503, description = "Credential state unavailable")),
     security(("bearer_auth" = [])))]
 pub async fn authenticate_otlp(
@@ -66,6 +67,12 @@ pub async fn authenticate_otlp(
     };
     match state.ingest_token_service.authenticate_otlp(token).await {
         Ok(Some(credential)) => {
+            // NAN-5217: a valid credential while ingestion is paused gets 403,
+            // which the edge turns into 503 + Retry-After (an invalid one
+            // still gets 401, so a paused install reveals nothing to it).
+            if state.ingestion_pause.admission_paused().await {
+                return crate::handlers::settings::otlp_paused_response();
+            }
             let Ok(route) = HeaderValue::from_str(&credential.route) else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };

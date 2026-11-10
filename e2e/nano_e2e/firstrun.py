@@ -79,7 +79,7 @@ def ensure_admin() -> FirstRun:
             except Exception as exc:  # noqa: BLE001 - recorded; the UI scenario fails on it
                 RESULT.ui_error = f"{type(exc).__name__}: {exc}"
         if not c.get("/api/setup/status").json().get("initialized"):
-            bootstrap.initialize(c, email, password)
+            bootstrap.initialize(c, email, password, os.environ.get("NANO_SETUP_TOKEN", ""))
             RESULT.via = RESULT.via or "api"
         RESULT.status_after = c.get("/api/setup/status").json()
         key = bootstrap.mint_admin_key(c, email, password)
@@ -106,7 +106,7 @@ def _setup_in_browser(dist: Path, api: str, search: str, email: str, password: s
     try:
         driver = ui.Driver(web.url, out / "ui-driver.log")
         page = ui.UiPage.open(driver, out / "ui", name="first-run setup")
-        ui.first_run_setup(page, "e2e admin", email, password)
+        ui.first_run_setup(page, "e2e admin", email, password, os.environ.get("NANO_SETUP_TOKEN", ""))
         # The success screen redirects to /login; the admin can log in.
         ui.login(page, email, password)
         failed = False

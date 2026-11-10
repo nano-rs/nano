@@ -494,7 +494,7 @@ pub async fn create_source_config(
     request_body = UpdateSourceConfiguration,
     responses(
         (status = 200, description = "Source configuration updated", body = SourceConfiguration),
-        (status = 403, description = "Requires source_configs:edit and credentials:use when the request or saved configuration references a credential; binding a different credential, or changing the connection host (Kafka brokers, AWS endpoint/queue URL, Azure namespace/checkpoint account) of such a configuration, also requires credentials:edit"),
+        (status = 403, description = "Requires source_configs:edit and credentials:use when the request or saved configuration references a credential; binding a different credential, or changing the connection host (Kafka brokers, AWS endpoint/queue URL, Azure namespace/checkpoint account) of such a configuration, also requires credentials:edit; changing a render-affecting field (name, config_type, connection_config, credential_id, default_source_type) of a deployed configuration requires source_configs:deploy"),
         (status = 404, description = "Not found"),
         (status = 409, description = "expected_updated_at is stale; reload before retrying"),
     ),
@@ -515,7 +515,7 @@ pub async fn update_source_config(
 
     let config = state
         .source_config_service
-        .update(*id, request, credential_use)
+        .update(*id, request, credential_use, auth.has_permission(SOURCE_CONFIGS_DEPLOY))
         .await?;
 
     state.emit_audit(
@@ -812,7 +812,7 @@ pub async fn list_routing_rules(
     request_body = NewRoutingRule,
     responses(
         (status = 200, description = "Routing rule created", body = RoutingRule),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Requires source_configs:edit; on a deployed source configuration also source_configs:deploy"),
         (status = 404, description = "Not found"),
         (status = 400, description = "Bad request"),
     ),
@@ -829,7 +829,7 @@ pub async fn create_routing_rule(
 
     let rule = state
         .source_config_service
-        .create_rule(*source_config_id, request)
+        .create_rule(*source_config_id, request, auth.has_permission(SOURCE_CONFIGS_DEPLOY))
         .await?;
 
     state.emit_audit(
@@ -871,7 +871,7 @@ pub struct RulePath {
     request_body = UpdateRoutingRule,
     responses(
         (status = 200, description = "Routing rule updated", body = RoutingRule),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Requires source_configs:edit; on a deployed source configuration also source_configs:deploy"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -887,7 +887,7 @@ pub async fn update_routing_rule(
 
     let rule = state
         .source_config_service
-        .update_rule(path.rule_id, request)
+        .update_rule(path.rule_id, request, auth.has_permission(SOURCE_CONFIGS_DEPLOY))
         .await?;
 
     state.emit_audit(
@@ -913,7 +913,7 @@ pub async fn update_routing_rule(
     ),
     responses(
         (status = 200, description = "Routing rule deleted"),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Requires source_configs:edit; on a deployed source configuration also source_configs:deploy"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -928,7 +928,7 @@ pub async fn delete_routing_rule(
 
     state
         .source_config_service
-        .delete_rule(path.rule_id)
+        .delete_rule(path.rule_id, auth.has_permission(SOURCE_CONFIGS_DEPLOY))
         .await?;
 
     state.emit_audit(
@@ -963,7 +963,7 @@ pub struct ReorderRulesRequest {
     request_body = ReorderRulesRequest,
     responses(
         (status = 200, description = "Routing rules reordered", body = Vec<RoutingRule>),
-        (status = 403, description = "Forbidden"),
+        (status = 403, description = "Requires source_configs:edit; on a deployed source configuration also source_configs:deploy"),
         (status = 404, description = "Not found"),
     ),
     security(("api_key" = []))
@@ -980,7 +980,7 @@ pub async fn reorder_routing_rules(
     let rule_order = request.rule_order.clone();
     let rules = state
         .source_config_service
-        .reorder_rules(*source_config_id, request.rule_order)
+        .reorder_rules(*source_config_id, request.rule_order, auth.has_permission(SOURCE_CONFIGS_DEPLOY))
         .await?;
 
     state.emit_audit(

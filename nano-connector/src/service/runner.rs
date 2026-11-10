@@ -84,6 +84,8 @@ impl RunnerConfig {
 pub struct TickSummary {
     pub claimed: usize,
     pub budget_full: bool,
+    /// NAN-5217: nano's ingestion pause is on; nothing was claimed.
+    pub ingestion_paused: bool,
 }
 
 pub struct Runner {
@@ -110,12 +112,18 @@ impl Runner {
             let mut tasks = self.tasks.lock().await;
             while tasks.try_join_next().is_some() {}
         }
+        // NAN-5217: while ingestion is paused, claim nothing: pull feeds stop
+        // pulling, and their checkpoints stay where they are so the next run
+        // after resume picks up exactly where the last one stopped.
+        if self.store.ingestion_paused().await {
+            return Ok(TickSummary { ingestion_paused: true, ..TickSummary::default() });
+        }
         let mut permits: Vec<OwnedSemaphorePermit> = Vec::new();
         while let Ok(p) = self.budget.clone().try_acquire_owned() {
             permits.push(p);
         }
         if permits.is_empty() {
-            return Ok(TickSummary { claimed: 0, budget_full: true });
+            return Ok(TickSummary { budget_full: true, ..TickSummary::default() });
         }
         let lease = {
             let cfg = self.cfg.clone();
@@ -159,9 +167,16 @@ impl Runner {
     pub async fn run_until(self: Arc<Self>, shutdown: impl std::future::Future<Output = ()>) {
         tokio::pin!(shutdown);
         tracing::info!(node = %self.cfg.node_id, poll_secs = self.cfg.poll_interval.as_secs(), "connector feed runner started");
+        let mut paused_logged = false;
         loop {
             match self.tick().await {
                 Ok(s) => {
+                    if s.ingestion_paused && !paused_logged {
+                        tracing::warn!("ingestion is paused: no connector feed runs are claimed until it is resumed");
+                    } else if !s.ingestion_paused && paused_logged {
+                        tracing::info!("ingestion resumed: connector feed runs are claimed again");
+                    }
+                    paused_logged = s.ingestion_paused;
                     if s.claimed > 0 {
                         tracing::debug!(?s, "connector runner tick");
                     }

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! NAN-4919: preview isolation bounds. The worker is exercised end to end by
 //! `nanosiem-api/tests/pipe_preview_worker.rs` (the real binary); these tests
-//! drive the exchange with stand-in commands.
+//! drive the exchange with stand-in commands. The shared process machinery
+//! (deadline, output bound, cleared environment) is covered by
+//! `parsers/worker_process_tests.rs`.
 use super::*;
 use serde_json::json;
 
@@ -35,40 +37,9 @@ fn requests_are_bounded() {
 }
 
 #[tokio::test]
-async fn a_hung_worker_is_killed_at_the_deadline() {
-    let mut command = Command::new("/bin/sh");
-    command.args(["-c", "sleep 30"]);
-    let started = std::time::Instant::now();
-    let result = exchange(command, b"{}", Duration::from_millis(300), 1024).await;
-    assert!(matches!(result, Err(PreviewSandboxError::Deadline)));
-    assert!(started.elapsed() < Duration::from_secs(5));
-}
-
-#[tokio::test]
-async fn oversized_output_is_refused() {
-    let mut command = Command::new("/bin/sh");
-    command.args(["-c", "head -c 4096 /dev/zero"]);
-    let result = exchange(command, b"", Duration::from_secs(5), 1024).await;
-    assert!(matches!(result, Err(PreviewSandboxError::OutputLimit)));
-}
-
-#[tokio::test]
-async fn the_worker_sees_no_parent_environment() {
-    std::env::set_var("NANO_PIPE_SANDBOX_SECRET_PROBE", "leak");
-    let mut command = Command::new("/usr/bin/env");
-    command.args(Vec::<String>::new());
-    let output = exchange(command, b"", Duration::from_secs(5), 64 * 1024)
-        .await
-        .unwrap();
-    let env = String::from_utf8(output).unwrap();
-    assert!(!env.contains("NANO_PIPE_SANDBOX_SECRET_PROBE"), "{env}");
-    assert!(env.contains("TZ=UTC"));
-}
-
-#[tokio::test]
 async fn one_running_preview_per_user_then_429() {
     let user = Uuid::new_v4();
-    let _held = UserSlot::acquire(user).unwrap();
+    let _held = gate().try_admit(Some(user)).unwrap();
     let refused = preview_with_executable(&request(), user, Path::new("/bin/true"), &[])
         .await
         .unwrap_err();

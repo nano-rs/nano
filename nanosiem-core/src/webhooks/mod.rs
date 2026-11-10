@@ -10,6 +10,7 @@
 //! per-type [`channels::ChannelFormatter`] renders the body (NAN-1790).
 
 pub mod channels;
+pub mod destination;
 pub mod models;
 pub mod repository;
 pub mod service;

@@ -123,7 +123,8 @@ pub struct DiskPressureStatusResponse {
     pub estimated_retention_days: Option<f64>,
     /// Number of partition-dates dropped since service started
     pub partitions_dropped: u64,
-    /// Whether ingestion is currently paused
+    /// Whether ingestion is currently paused (cluster-wide, from PostgreSQL;
+    /// see `StorageOverviewResponse.ingestion` for who paused it and why)
     pub ingestion_paused: bool,
     /// Configured high watermark
     pub high_watermark: f64,
@@ -146,6 +147,10 @@ pub struct StorageOverviewResponse {
     pub clickhouse: Option<ClickHouseStorageStatsResponse>,
     /// Disk pressure status (only when ClickHouse is enabled)
     pub disk_pressure: Option<DiskPressureStatusResponse>,
+    /// NAN-5217: the cluster-wide ingestion pause, read from PostgreSQL (the
+    /// same answer on every app host). `null` only when PostgreSQL could not
+    /// be read.
+    pub ingestion: Option<super::ingestion::IngestionPauseStatusResponse>,
 }
 
 /// Request to update ClickHouse retention
@@ -360,11 +365,20 @@ pub async fn get_storage_overview(
         }
     };
 
+    let ingestion = match state.ingestion_pause.state().await {
+        Ok(pause) => Some(super::ingestion::build_status(&state, pause).await),
+        Err(e) => {
+            tracing::warn!("Failed to read the ingestion pause state: {}", e);
+            None
+        }
+    };
+
     Ok(Json(StorageOverviewResponse {
         clickhouse_enabled: true,
         postgres: postgres_stats,
         clickhouse: clickhouse_stats,
         disk_pressure,
+        ingestion,
     }))
 }
 

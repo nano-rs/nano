@@ -25,6 +25,16 @@ fn main() -> Result<()> {
         return nanosiem_core::parsers::pipe::sandbox::worker_main()
             .map_err(|error| anyhow::anyhow!("{error}"));
     }
+    // NAN-5234: the parser-test worker (tenant VRL over sample events). Same
+    // rule: dispatched before anything else exists.
+    if std::env::args().nth(1).as_deref()
+        == Some(nanosiem_core::parsers::test_sandbox::WORKER_ARGUMENT)
+    {
+        return nanosiem_core::parsers::test_sandbox::worker_main()
+            .map_err(|error| anyhow::anyhow!("{error}"));
+    }
+    // Parser tests in this process run in workers of this executable.
+    nanosiem_core::parsers::test_sandbox::register_current_executable();
     // NAN-4919: the Vector tap relay sidecar (the only client of Vector's
     // loopback API). No database, no server state.
     if std::env::args().nth(1).as_deref() == Some(nanosiem_api::pipe_tap_relay::RELAY_ARGUMENT) {

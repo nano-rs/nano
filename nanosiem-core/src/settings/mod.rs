@@ -10,6 +10,7 @@
 
 mod developer_repository;
 pub mod disk_pressure;
+pub mod ingestion_pause;
 pub mod local_auth;
 mod organizational_context;
 mod retention;
@@ -22,6 +23,7 @@ mod tiering;
 
 pub use developer_repository::*;
 pub use disk_pressure::*;
+pub use ingestion_pause::*;
 pub use local_auth::*;
 pub use organizational_context::*;
 pub use retention::*;

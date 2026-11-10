@@ -74,6 +74,16 @@ where
 fn main() -> Result<()> {
     // NAN-5214: before anything can negotiate TLS with PostgreSQL.
     nanosiem_core::db::tls_provider::install_default_crypto_provider();
+    // NAN-5234: jobs that test parser drafts (AI parser loops) run the VRL in
+    // a resource-limited worker of this executable, dispatched before
+    // configuration, tracing or pools exist.
+    if std::env::args().nth(1).as_deref()
+        == Some(nanosiem_core::parsers::test_sandbox::WORKER_ARGUMENT)
+    {
+        return nanosiem_core::parsers::test_sandbox::worker_main()
+            .map_err(|error| anyhow::anyhow!("{error}"));
+    }
+    nanosiem_core::parsers::test_sandbox::register_current_executable();
     // NAN-4917: query parsing/compilation/evaluation walk the nPL AST
     // recursively on runtime threads. Size worker + blocking stacks for the
     // depth the query complexity budget admits, so a hostile query can never

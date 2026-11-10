@@ -9,9 +9,11 @@ use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::auth::oidc_trust::OidcTrustChange;
 use crate::auth::types::{
     CreateOidcProviderRequest, OidcGroupMapping, OidcProvider, UpdateOidcProviderRequest,
 };
+use crate::auth::GrantAuthorityStamp;
 use crate::crypto::EncryptionService;
 
 /// Server-side OIDC authorization transaction.
@@ -47,6 +49,102 @@ pub enum OidcRepositoryError {
     AuthTransactionInvalid,
     #[error("grant authority changed during validation; retry the request")]
     GrantAuthorityChanged,
+    /// NAN-5238: the update makes a trust change (see
+    /// [`crate::auth::oidc_trust`]) and the caller was not checked for
+    /// administrator authority.
+    #[error("changing SSO trust settings requires administrator authority")]
+    TrustChangeRequiresAdmin,
+}
+
+/// The authority an OIDC provider update was checked for (NAN-5238). The
+/// repository re-verifies the stamp and re-derives the trust-anchor changes
+/// against the locked row, so the handler's pre-read cannot be raced.
+#[derive(Debug, Clone, Copy)]
+pub enum ProviderWriteAuthority {
+    /// No authority stamp: only valid for an update that disables the
+    /// provider. Trust-anchor changes are refused.
+    Unfenced,
+    /// `settings:system` checked against current state. Trust-anchor changes
+    /// are refused.
+    Settings(GrantAuthorityStamp),
+    /// Administrator authority checked against current state (see
+    /// `grant_authz::ensure_admin_authority`). Every change is allowed.
+    Admin(GrantAuthorityStamp),
+}
+
+impl ProviderWriteAuthority {
+    fn stamp(&self) -> Option<GrantAuthorityStamp> {
+        match self {
+            Self::Unfenced => None,
+            Self::Settings(stamp) | Self::Admin(stamp) => Some(*stamp),
+        }
+    }
+
+    fn is_admin(&self) -> bool {
+        matches!(self, Self::Admin(_))
+    }
+}
+
+/// Result of [`OidcRepository::update_provider_guarded`].
+#[derive(Debug)]
+pub struct OidcProviderUpdate {
+    pub provider: OidcProvider,
+    /// The trust-anchor changes the update made, as computed on the locked row.
+    pub trust: OidcTrustChange,
+    /// Accounts unlinked because the issuer changed.
+    pub unlinked_accounts: u64,
+}
+
+/// NAN-5238: after a provider's issuer changes, detach every account linked to
+/// it, inside the updating transaction.
+///
+/// - `oidc_provider_id` / `oidc_subject` / `last_oidc_groups` are cleared, so
+///   no subject minted by the new issuer resolves to an account linked under
+///   the old one. A detached account can be linked again through the normal
+///   first-sign-in path (verified email, admission policy).
+/// - Group memberships granted by this provider's IdP-group mappings are
+///   removed (grant sources `sso_group:<provider>:*`); manual grants stay.
+/// - Every token and session issued to the account is revoked, so an SSO
+///   session from the old IdP does not outlive the change.
+///
+/// Returns the number of accounts detached.
+async fn unlink_provider_accounts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    provider_id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let users: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE users SET oidc_provider_id = NULL, oidc_subject = NULL, \
+         last_oidc_groups = NULL, updated_at = NOW() \
+         WHERE oidc_provider_id = $1 RETURNING id",
+    )
+    .bind(provider_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if users.is_empty() {
+        return Ok(0);
+    }
+    let prefix = format!("sso_group:{provider_id}:");
+    // Set-based: a provider can have thousands of linked accounts.
+    sqlx::query(
+        "DELETE FROM oidc_group_grant_sources \
+         WHERE user_id = ANY($1) AND starts_with(source, $2)",
+    )
+    .bind(&users)
+    .bind(&prefix)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM user_groups g WHERE g.user_id = ANY($1) AND NOT EXISTS ( \
+         SELECT 1 FROM oidc_group_grant_sources s \
+         WHERE s.user_id = g.user_id AND s.group_id = g.group_id)",
+    )
+    .bind(&users)
+    .execute(&mut **tx)
+    .await?;
+    for user_id in &users {
+        crate::auth::repository::revoke_credentials_in(&mut **tx, *user_id).await?;
+    }
+    Ok(users.len() as u64)
 }
 
 /// Repository for OIDC provider operations
@@ -303,81 +401,32 @@ impl OidcRepository {
         Ok(provider)
     }
 
-    /// Update an OIDC provider
-    /// Requirements: 11.4
-    pub async fn update_provider(
+    /// Update a provider under the authority the caller was checked for
+    /// (NAN-5238).
+    ///
+    /// Runs in ONE transaction with the provider row held `FOR UPDATE`:
+    ///
+    /// 1. a stamped authority is re-verified against the grant generation;
+    /// 2. the trust-anchor changes ([`OidcTrustChange`]) are recomputed against
+    ///    the LOCKED row, so a concurrent edit cannot turn a request that was
+    ///    checked as "no trust change" into one (e.g. a disable racing a
+    ///    `PUT {enabled: true}`); anything but [`ProviderWriteAuthority::Admin`]
+    ///    is refused with [`OidcRepositoryError::TrustChangeRequiresAdmin`];
+    /// 3. when the issuer changes, every account linked to this provider is
+    ///    unlinked (see [`unlink_provider_accounts`]) — subjects are only
+    ///    unique per issuer, so a link made under the old IdP must not resolve
+    ///    under the new one.
+    pub async fn update_provider_guarded(
         &self,
         id: Uuid,
         request: &UpdateOidcProviderRequest,
-    ) -> Result<OidcProvider, OidcRepositoryError> {
-        let existing = self.get_provider(id).await?;
-
-        let name = request.name.as_ref().unwrap_or(&existing.name);
-        let issuer = request.issuer.as_ref().unwrap_or(&existing.issuer);
-        let client_id = request.client_id.as_ref().unwrap_or(&existing.client_id);
-        let scopes = request.scopes.as_ref().unwrap_or(&existing.scopes);
-        let group_claim = request.group_claim.clone().or(existing.group_claim);
-        let enabled = request.enabled.unwrap_or(existing.enabled);
-
-        // Handle client secret update
-        let encrypted_secret = if let Some(ref new_secret) = request.client_secret {
-            self.encrypt_secret(new_secret)?
-        } else {
-            existing.client_secret_encrypted
-        };
-
-        let provider = sqlx::query_as::<_, OidcProvider>(
-            r#"
-            UPDATE oidc_providers SET
-                name = $2,
-                issuer = $3,
-                client_id = $4,
-                client_secret_encrypted = $5,
-                scopes = $6,
-                group_claim = $7,
-                enabled = $8,
-                access_policy = COALESCE($9, access_policy),
-                google_service_account_encrypted = CASE WHEN $11 THEN NULL
-                    ELSE COALESCE($10, google_service_account_encrypted) END,
-                updated_at = NOW()
-            WHERE id = $1
-            RETURNING *
-            "#,
-        )
-        .bind(id)
-        .bind(name)
-        .bind(issuer)
-        .bind(client_id)
-        .bind(&encrypted_secret)
-        .bind(scopes)
-        .bind(&group_claim)
-        .bind(enabled)
-        .bind(request.access_policy.as_ref().map(sqlx::types::Json))
-        .bind(
-            request
-                .google_service_account
-                .as_deref()
-                .map(|k| self.encrypt_secret(k))
-                .transpose()?,
-        )
-        .bind(request.clear_google_service_account)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(provider)
-    }
-
-    /// Update a provider while holding the grant generation that approved an
-    /// enabled/JIT-capable final state.
-    pub async fn update_provider_authorized(
-        &self,
-        id: Uuid,
-        request: &UpdateOidcProviderRequest,
-        stamp: crate::auth::GrantAuthorityStamp,
-    ) -> Result<OidcProvider, OidcRepositoryError> {
+        authority: ProviderWriteAuthority,
+    ) -> Result<OidcProviderUpdate, OidcRepositoryError> {
         let mut tx = self.pool.begin().await?;
-        if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
-            return Err(OidcRepositoryError::GrantAuthorityChanged);
+        if let Some(stamp) = authority.stamp() {
+            if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
+                return Err(OidcRepositoryError::GrantAuthorityChanged);
+            }
         }
         let existing = sqlx::query_as::<_, OidcProvider>(
             "SELECT * FROM oidc_providers WHERE id = $1 FOR UPDATE",
@@ -386,6 +435,10 @@ impl OidcRepository {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(OidcRepositoryError::NotFound(id))?;
+        let trust = OidcTrustChange::of_update(&existing, request);
+        if trust.requires_admin() && !authority.is_admin() {
+            return Err(OidcRepositoryError::TrustChangeRequiresAdmin);
+        }
         let name = request.name.as_ref().unwrap_or(&existing.name);
         let issuer = request.issuer.as_ref().unwrap_or(&existing.issuer);
         let client_id = request.client_id.as_ref().unwrap_or(&existing.client_id);
@@ -430,8 +483,25 @@ impl OidcRepository {
         .bind(request.clear_google_service_account)
         .fetch_one(&mut *tx)
         .await?;
+        if trust.issuer || trust.client_id {
+            // A login started against the old IdP / client must not complete
+            // against the new one.
+            sqlx::query("DELETE FROM oidc_auth_transactions WHERE provider_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let unlinked_accounts = if trust.issuer {
+            unlink_provider_accounts(&mut tx, id).await?
+        } else {
+            0
+        };
         tx.commit().await?;
-        Ok(provider)
+        Ok(OidcProviderUpdate {
+            provider,
+            trust,
+            unlinked_accounts,
+        })
     }
 
     /// Delete an OIDC provider
@@ -449,8 +519,20 @@ impl OidcRepository {
         Ok(())
     }
 
-    /// Enable an OIDC provider
-    pub async fn enable_provider(&self, id: Uuid) -> Result<OidcProvider, OidcRepositoryError> {
+    /// Enable an OIDC provider (NAN-5238: administrator authority only).
+    ///
+    /// `admin_stamp` must come from the administrator-authority check; it is
+    /// re-verified in the enabling transaction so a caller demoted after the
+    /// check cannot turn the provider on.
+    pub async fn enable_provider_authorized(
+        &self,
+        id: Uuid,
+        admin_stamp: crate::auth::GrantAuthorityStamp,
+    ) -> Result<OidcProvider, OidcRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        if !crate::auth::lock_and_verify_grant_authority(&mut tx, admin_stamp).await? {
+            return Err(OidcRepositoryError::GrantAuthorityChanged);
+        }
         let provider = sqlx::query_as::<_, OidcProvider>(
             r#"
             UPDATE oidc_providers SET enabled = TRUE, updated_at = NOW()
@@ -459,10 +541,10 @@ impl OidcRepository {
             "#,
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or(OidcRepositoryError::NotFound(id))?;
-
+        tx.commit().await?;
         Ok(provider)
     }
 

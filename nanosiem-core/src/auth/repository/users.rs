@@ -157,11 +157,32 @@ impl UserRepository {
         &self,
         request: &CreateUserRequest,
     ) -> Result<User, UserRepositoryError> {
-        // Validate against the authoritative policy, then hash (spawn_blocking:
-        // bcrypt is CPU-intensive). Rejected before any row is written.
-        let password_hash = validate_and_hash_password(&request.password).await?;
+        let mut conn = self.pool.acquire().await?;
+        Self::create_user_in(&mut conn, request).await
+    }
 
-        // Create the user - rely on unique constraint for email uniqueness (race-condition safe)
+    /// [`create_user`](Self::create_user) on the CALLER's connection, so the
+    /// new user commits (or rolls back) with the rest of the caller's
+    /// transaction (NAN-5237: the first-admin claim).
+    ///
+    /// The password is validated against the authoritative policy, then
+    /// hashed, before any row is written.
+    pub async fn create_user_in(
+        conn: &mut sqlx::PgConnection,
+        request: &CreateUserRequest,
+    ) -> Result<User, UserRepositoryError> {
+        let password_hash = validate_and_hash_password(&request.password).await?;
+        Self::insert_user_in(conn, request, &password_hash).await
+    }
+
+    /// Insert the user row and the requested memberships. The caller has
+    /// already validated and hashed the password.
+    async fn insert_user_in(
+        conn: &mut sqlx::PgConnection,
+        request: &CreateUserRequest,
+        password_hash: &str,
+    ) -> Result<User, UserRepositoryError> {
+        // Rely on the unique constraint for email uniqueness (race-condition safe)
         let user = sqlx::query_as::<_, User>(
             r#"
             INSERT INTO users (email, name, password_hash, status)
@@ -171,11 +192,10 @@ impl UserRepository {
         )
         .bind(&request.email)
         .bind(&request.name)
-        .bind(&password_hash)
-        .fetch_one(&self.pool)
+        .bind(password_hash)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| {
-            // Check for unique constraint violation
             if let sqlx::Error::Database(ref db_err) = e {
                 if db_err.constraint() == Some("users_email_key") {
                     return UserRepositoryError::EmailExists(request.email.clone());
@@ -184,16 +204,15 @@ impl UserRepository {
             UserRepositoryError::DatabaseError(e)
         })?;
 
-        // Add user to specified groups (if any)
         for group_id in &request.group_ids {
             // Skip the Everyone group as it's auto-added by trigger
             if *group_id != builtin_groups::EVERYONE_ID {
                 sqlx::query(
-                    "INSERT INTO user_groups (user_id, group_id) VALUES ($1, $2) ON CONFLICT DO NOTHING"
+                    "INSERT INTO user_groups (user_id, group_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
                 )
                 .bind(user.id)
                 .bind(group_id)
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
             }
         }
@@ -214,38 +233,7 @@ impl UserRepository {
         if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
             return Err(UserRepositoryError::GrantAuthorityChanged);
         }
-        let user = sqlx::query_as::<_, User>(
-            r#"
-            INSERT INTO users (email, name, password_hash, status)
-            VALUES ($1, $2, $3, 'active')
-            RETURNING *
-            "#,
-        )
-        .bind(&request.email)
-        .bind(&request.name)
-        .bind(&password_hash)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| {
-            if let sqlx::Error::Database(ref db_err) = e {
-                if db_err.constraint() == Some("users_email_key") {
-                    return UserRepositoryError::EmailExists(request.email.clone());
-                }
-            }
-            UserRepositoryError::DatabaseError(e)
-        })?;
-
-        for group_id in &request.group_ids {
-            if *group_id != builtin_groups::EVERYONE_ID {
-                sqlx::query(
-                    "INSERT INTO user_groups (user_id, group_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                )
-                .bind(user.id)
-                .bind(group_id)
-                .execute(&mut *tx)
-                .await?;
-            }
-        }
+        let user = Self::insert_user_in(&mut tx, request, &password_hash).await?;
         tx.commit().await?;
         Ok(user)
     }
@@ -811,8 +799,9 @@ impl UserRepository {
     /// Replace a user's non-Everyone group memberships within a caller-provided
     /// transaction. Everyone (built-in) is deliberately preserved (`group_id !=
     /// EVERYONE_ID`), so every user always retains baseline membership. Shared by
-    /// `set_user_groups` and `update_user_with_groups` so the two stay in lock-step.
-    async fn replace_user_groups_in(
+    /// `set_user_groups`, `update_user_with_groups` and the first-admin claim
+    /// so they stay in lock-step.
+    pub(crate) async fn replace_user_groups_in(
         conn: &mut sqlx::PgConnection,
         user_id: Uuid,
         group_ids: &[Uuid],

@@ -30,6 +30,7 @@ use nanosiem_core::audit::{
     LOG_SOURCE_TOGGLED, LOG_SOURCE_UNDEPLOYED, LOG_SOURCE_UPDATED,
 };
 use nanosiem_core::log_sources::{
+    LogSourceServiceError,
     DeploymentResult, IngestionHistoryPoint, LiveTestResult, LogSource, LogSourceDeployment,
     CollectorError, LogSourceHealth, LogSourceVersion, LogSourceWithDraftStatus, NewLogSource,
     ParserTestResult,
@@ -37,7 +38,7 @@ use nanosiem_core::log_sources::{
 };
 use nanosiem_core::principal_gate::PrincipalGate;
 use nanosiem_core::typeid::TypeIdParam;
-use super::principal_admission::{principal_key, refused, run_admitted};
+use super::principal_admission::{principal_key, refused, run_admitted, too_many_requests};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use utoipa::{IntoParams, ToSchema};
@@ -662,8 +663,20 @@ pub async fn test_vrl(
             )
             .await
     })
-    .await?;
+    .await?
+    .map_err(parser_test_error)?;
     Ok(Json(result))
+}
+
+/// A parser-test service error: busy workers are a 429 with `Retry-After`
+/// (NAN-5234); anything else a 500.
+fn parser_test_error(error: LogSourceServiceError) -> Response {
+    match error {
+        LogSourceServiceError::ParserTestBusy(message) => {
+            too_many_requests(message, PARSER_TEST_RETRY_AFTER_SECS)
+        }
+        other => ApiError::InternalError(format!("Parser test failed: {}", other)).into_response(),
+    }
 }
 
 /// Test VRL against real events from ClickHouse
@@ -739,12 +752,13 @@ async fn test_vrl_live_inner(
             .await
     })
     .await?
-    .map_err(|e| api(ApiError::InternalError(format!("Live test failed: {}", e))))?;
+    .map_err(parser_test_error)?;
     Ok(Json(results))
 }
 
 /// Retry-After for a refused parser test. Each test is bounded to a few
-/// seconds (`exec_bounds::TEST_EXECUTION_BUDGET`).
+/// seconds (`exec_bounds::TEST_EXECUTION_BUDGET`) and runs in a worker process
+/// (`parsers::test_sandbox`).
 const PARSER_TEST_RETRY_AFTER_SECS: u64 = 1;
 
 /// Parser-test admission sizing: `(per_principal, global)`.

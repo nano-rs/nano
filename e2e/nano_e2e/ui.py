@@ -327,9 +327,10 @@ def login_attempt(page: UiPage, email: str, password: str) -> None:
     page.op("login_attempt", email=email, password=password)
 
 
-def first_run_setup(page: UiPage, name: str, email: str, password: str) -> None:
-    """/setup: the first-run admin form, through to the redirect to /login."""
-    page.op("first_run_setup", name=name, email=email, password=password)
+def first_run_setup(page: UiPage, name: str, email: str, password: str, setup_token: str = "") -> None:
+    """/setup: the first-run admin form, through to the redirect to /login.
+    `setup_token` fills the setup-token field when the page shows it (NAN-5237)."""
+    page.op("first_run_setup", name=name, email=email, password=password, setupToken=setup_token)
 
 
 def run_search(page: UiPage, query: str, extra: str = "") -> str:

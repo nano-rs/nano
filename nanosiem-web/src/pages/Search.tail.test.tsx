@@ -7,6 +7,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { MemoryRouter } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Search } from './Search';
+import { grantSearchAutoRun } from '@/lib/search-auto-run';
 
 const mocks = vi.hoisted(() => ({
   stream: vi.fn(), async: vi.fn(), fields: vi.fn(), legacy: vi.fn(),
@@ -105,7 +106,7 @@ it('live tail prepends new events without re-running the search', async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={['/search#q=error&time=Last+15+minutes&run=true']}><Search /></MemoryRouter>
+      <MemoryRouter initialEntries={[`/search#q=error&time=Last+15+minutes&run=${grantSearchAutoRun('error')}`]}><Search /></MemoryRouter>
     </QueryClientProvider>,
   );
   await waitFor(() => expect(screen.getByTestId('rows').textContent).toBe('e2,e1'));

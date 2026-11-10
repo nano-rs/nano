@@ -51,6 +51,7 @@ import {
   showSsoPanel,
   type SsoSurface,
 } from './login-auth-methods';
+import { OUTSIDE_ARRIVAL_STATE } from '@/lib/search-auto-run';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
 
@@ -615,7 +616,8 @@ export function Login() {
   useEffect(() => {
     if (isAuthenticated && !authLoading) {
       const returnTo = (location.state as { from?: string })?.from || '/';
-      navigate(returnTo, { replace: true });
+      // NAN-5235: the original URL was an arrival from outside the app.
+      navigate(returnTo, { replace: true, state: OUTSIDE_ARRIVAL_STATE });
     }
   }, [isAuthenticated, authLoading, navigate, location.state]);
 

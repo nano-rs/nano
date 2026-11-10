@@ -480,7 +480,7 @@ services:
 
   vector:
     # Digest-pinned — see the note on the postgres service (NAN-1258).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.7-debian@sha256:119dc25de7b6840285ac80d5c027ea7308513a334d0a0713b3352b5b30328c9c
+    image: ghcr.io/nano-rs/vector:0.61.0-nano.8-debian@sha256:da4473df93316e11ede7417f521c734c42defe11134cfe591bf815a54b19355f
     container_name: nano-vector
     network_mode: "service:vector-netns"
     restart: unless-stopped
@@ -621,6 +621,11 @@ services:
       POSTGRES_DICT_HOST: postgres
       POSTGRES_DICT_PASSWORD: ${POSTGRES_PASSWORD}
       JWT_SECRET: ${JWT_SECRET}
+      # NAN-5237: first-admin setup (POST /api/setup/initialize) requires
+      # this bearer while the system is uninitialized. install.sh generates
+      # it into .env. Unset: setup is accepted only from loopback on the API
+      # host itself, which no request through nginx is.
+      NANO_SETUP_TOKEN: ${NANO_SETUP_TOKEN:-}
       NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY}
       CORS_ORIGINS: ${BASE_URL:-http://localhost}
       # NAN-5015: only nginx (on this private network) may vouch for a client

@@ -46,6 +46,9 @@ pub enum LogSourceServiceError {
     RepositoryError(#[from] LogSourceRepositoryError),
     #[error("Invalid VRL: {0}")]
     InvalidVrl(String),
+    /// Every parser-test worker is busy (NAN-5234): retry shortly (HTTP 429).
+    #[error("{0}")]
+    ParserTestBusy(String),
     #[error("Invalid source type: {0}")]
     InvalidSourceType(String),
     #[error("Invalid source config: {0}")]

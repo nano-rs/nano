@@ -32,7 +32,6 @@ use nanosiem_enterprise::melod::{
 };
 #[cfg(feature = "enterprise")]
 use nanosiem_enterprise::risk::RiskAnalyticsService;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -366,7 +365,10 @@ impl AppState {
         };
 
         // Create disk pressure service for automatic partition eviction
-        let ingestion_paused = Arc::new(AtomicBool::new(false));
+        let ingestion_pause = Arc::new(nanosiem_core::settings::IngestionPauseService::new(
+            pg_pool.clone(),
+            dual_pool.clickhouse_admin().clone(),
+        ));
         let disk_pressure_service = {
             let dp_config = DiskPressureConfig::default();
             let dp_audit = AuditEmitter::new(dual_pool.clone());
@@ -375,7 +377,7 @@ impl AppState {
                 pg_pool.clone(),
                 dp_audit,
                 dp_config,
-                ingestion_paused.clone(),
+                ingestion_pause.clone(),
             ))
         };
 
@@ -504,7 +506,7 @@ impl AppState {
             signal_processor,
             // Disk pressure service for automatic partition eviction
             disk_pressure_service,
-            ingestion_paused,
+            ingestion_pause,
             identity_service,
             demo_service: None,
             #[cfg(feature = "enterprise")]
@@ -865,6 +867,15 @@ impl AppState {
                 "REDIS_URL not set — distributed caches are disabled and rule-test admission is local (single-node mode)"
             );
         }
+
+        // NAN-5243: PostgreSQL is the durable record of logout revocations;
+        // re-read it periodically so one the shared Valkey lost (resync after
+        // a Sentinel failover, restart) is enforced again within seconds.
+        // Both token services share this DashMap.
+        nanosiem_core::auth::token::spawn_revocation_sync(
+            state.pool.clone(),
+            state.token_service.revoked_jtis_handle(),
+        );
 
         Ok(state)
     }

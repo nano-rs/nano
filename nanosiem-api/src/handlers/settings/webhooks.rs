@@ -146,6 +146,7 @@ pub async fn get_webhook(
     request_body = nanosiem_core::webhooks::UpdateWebhookRequest,
     responses(
         (status = 200, description = "Webhook updated", body = nanosiem_core::webhooks::WebhookResponse),
+        (status = 400, description = "Invalid request, a PagerDuty URL other than the pinned Events endpoint, or a URL origin change that would carry stored headers / secret over (re-supply or clear them)", body = ErrorResponse),
         (status = 403, description = "Missing permission", body = ErrorResponse),
         (status = 404, description = "Webhook not found", body = ErrorResponse),
     ),
@@ -188,10 +189,14 @@ pub async fn update_webhook(
         }
     }
 
-    // PagerDuty's Events endpoint is pinned server-side.
-    if request.channel_type.as_deref() == Some("pagerduty") {
-        request.url = Some(PAGERDUTY_EVENTS_URL.to_string());
-    }
+    // NAN-5224: PagerDuty's Events endpoint is pinned by the STORED channel
+    // type, and a URL origin change must re-supply (or clear) any stored
+    // headers / secret rather than carrying them to the new destination.
+    let destination = nanosiem_core::webhooks::destination::resolve_update_destination(
+        &existing,
+        &mut request,
+    )
+    .map_err(ApiError::BadRequest)?;
 
     if let Some(ref url) = request.url {
         nanosiem_core::webhooks::WebhookService::validate_url(url)
@@ -218,6 +223,9 @@ pub async fn update_webhook(
         .actor(Some(auth.user_id()), None)
         .api_key(auth.api_key_id, auth.api_key_name.clone())
         .resource("webhook", Some(webhook.id), Some(webhook.name.clone()))
+        .details(serde_json::json!({
+            "destination_origin_changed": destination.origin_changed,
+        }))
         .build(),
     );
 

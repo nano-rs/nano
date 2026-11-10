@@ -82,16 +82,19 @@ nano_cluster_shared_secret_keys() {
         NANO_KEEPER_SUPER_DIGEST \
         NANO_VECTOR_CONFIG_DELIVERY_TOKEN \
         NANO_PG_REPLICATION_PASSWORD \
-        NANO_PATRONI_API_PASSWORD
+        NANO_PATRONI_API_PASSWORD \
+        NANO_SETUP_TOKEN
 }
 
 # Cluster-shared keys added after v2.0.0. A role host missing one warns
 # instead of failing; see the contract above.
+# NANO_SETUP_TOKEN (NAN-5237) gates first-admin setup on nano-api; only app
+# hosts read it, and an initialized install never needs it.
 nano_transitional_secret_keys() {
     # NAN-5214: the PostgreSQL HA credentials are generated once by the
     # canonical app host. Only HA services read them (and refuse to start
     # without them), so an older copied .env warns instead of failing.
-    printf '%s\n' NANO_VECTOR_CONFIG_DELIVERY_TOKEN NANO_PG_REPLICATION_PASSWORD NANO_PATRONI_API_PASSWORD
+    printf '%s\n' NANO_VECTOR_CONFIG_DELIVERY_TOKEN NANO_PG_REPLICATION_PASSWORD NANO_PATRONI_API_PASSWORD NANO_SETUP_TOKEN
 }
 
 nano_secret_is_transitional() {
@@ -509,6 +512,32 @@ nano_replace_managed_env_block() {
     local env_file="$1" content="$2" begin_marker="$3" end_marker="$4"
     nano_env_atomic_rewrite_locked "$env_file" "$env_file" nano_env_managed_block_writer \
         "$content" "$begin_marker" "$end_marker"
+}
+
+# Set KEY=VALUE pairs in an env file: every earlier line for each key is
+# dropped and one assignment per key is appended, so re-runs never pile up
+# duplicates (hosts that copy .env stay byte-identical) and the last-wins
+# meaning is unchanged. Atomic, locked, metadata-preserving, symlink-safe.
+nano_env_set_keys_writer() {
+    local target="$1" tmp="$2" line key kv drop
+    shift 2
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        drop=0
+        for kv in "$@"; do
+            key="${kv%%=*}"
+            [[ "$line" == "$key="* ]] && { drop=1; break; }
+        done
+        (( drop )) || printf '%s\n' "$line" >> "$tmp" || return 1
+    done < "$target"
+    for kv in "$@"; do
+        printf '%s\n' "$kv" >> "$tmp" || return 1
+    done
+}
+
+nano_env_set_keys() {
+    local env_file="$1"
+    shift
+    nano_env_atomic_rewrite_locked "$env_file" "$env_file" nano_env_set_keys_writer "$@"
 }
 
 nano_secret_add_missing() {

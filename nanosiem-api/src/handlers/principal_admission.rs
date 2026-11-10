@@ -23,8 +23,12 @@ pub fn principal_key(auth: &AuthContext) -> String {
 
 /// HTTP 429 naming the limit, with `Retry-After`.
 pub fn refused(refusal: GateRefused) -> Response {
-    let seconds = refusal.retry_after_secs;
-    let mut response = ApiError::TooManyRequests(refusal.to_string()).into_response();
+    too_many_requests(refusal.to_string(), refusal.retry_after_secs)
+}
+
+/// HTTP 429 with `message` and `Retry-After: seconds`.
+pub fn too_many_requests(message: String, seconds: u64) -> Response {
+    let mut response = ApiError::TooManyRequests(message).into_response();
     if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
         response.headers_mut().insert(RETRY_AFTER, value);
     }

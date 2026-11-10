@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Bounded in-process execution of tenant-authored VRL for parser tests
-//! (security review 2026-11-08, NAN-5040).
+//! Bounded execution of tenant-authored VRL for parser tests (security review
+//! 2026-11-08, NAN-5040; process isolation NAN-5234).
 //!
 //! `test-vrl`, `test-live` and the AI parser loops run a draft program against
 //! sample events. That used to call `Runtime::resolve` synchronously on a tokio
@@ -9,14 +9,16 @@
 //! pinned the worker until it finished, and about `nproc` such requests
 //! stalled every other handler on the replica. Now:
 //!
-//! - execution runs on the blocking pool ([`run_blocking`]), never on a
-//!   tokio worker;
+//! - execution runs in a one-shot, resource-limited worker process
+//!   ([`crate::parsers::test_sandbox`], NAN-5234), never in the API process,
+//!   so a program that allocates without limit is stopped by the worker's
+//!   memory bound instead of exhausting the replica;
 //! - every resolve carries an [`ExecutionBudget`]: VRL checks it between
 //!   expressions (closure bodies included), and once the request's wall-clock
 //!   budget is spent the program stops with a clear error;
-//! - sample size and count are capped ([`check_samples`]), which bounds the
-//!   single non-preemptible function calls (one regex / grok over one sample)
-//!   that a checkpoint cannot interrupt.
+//! - sample size, count and total size are capped ([`check_samples`]), which
+//!   bounds the single non-preemptible function calls (one regex / grok over
+//!   one sample) that a checkpoint cannot interrupt, and the worker request.
 //!
 //! Limits are far above real parser tests: the editor sends up to ~20 events
 //! of a few KiB, and a production parser resolves one event in well under a
@@ -35,6 +37,11 @@ use super::{humanize_runtime_spans, json_to_vrl_value, vrl_value_to_json, VrlVal
 pub const MAX_TEST_SAMPLE_BYTES: usize = 4 * 1024 * 1024;
 /// Most sample events in one parser test request.
 pub const MAX_TEST_SAMPLES: usize = 100;
+/// Total bytes of every sample in one parser test request. Real requests are
+/// far smaller (test-live sends at most 20 events; test-vrl's whole body is
+/// under 2 MiB); this keeps the worker request, and so the worker's memory
+/// need, bounded well inside its limits.
+pub const MAX_TEST_TOTAL_SAMPLE_BYTES: usize = 16 * 1024 * 1024;
 /// Wall-clock budget for executing every sample (and every stage) of one test
 /// request.
 pub const TEST_EXECUTION_BUDGET: Duration = Duration::from_secs(5);
@@ -103,21 +110,14 @@ pub fn check_samples<S: AsRef<str>>(samples: &[S]) -> Result<(), VrlValidatorErr
             MAX_TEST_SAMPLE_BYTES
         )));
     }
+    let total: usize = samples.iter().map(|s| s.as_ref().len()).sum();
+    if total > MAX_TEST_TOTAL_SAMPLE_BYTES {
+        return Err(VrlValidatorError::InvalidInput(format!(
+            "Sample events total {total} bytes; a parser test accepts at most \
+             {MAX_TEST_TOTAL_SAMPLE_BYTES} bytes in all"
+        )));
+    }
     Ok(())
-}
-
-/// Run `f` on the blocking pool with a fresh [`ExecutionBudget`].
-pub async fn run_blocking<T, F>(f: F) -> Result<T, VrlValidatorError>
-where
-    T: Send + 'static,
-    F: FnOnce(&mut ExecutionBudget) -> T + Send + 'static,
-{
-    tokio::task::spawn_blocking(move || {
-        let mut budget = ExecutionBudget::new(TEST_EXECUTION_BUDGET);
-        f(&mut budget)
-    })
-    .await
-    .map_err(|e| VrlValidatorError::ExecutionError(format!("parser test task failed: {e}")))
 }
 
 /// Execute a compiled program against one event under `budget`.

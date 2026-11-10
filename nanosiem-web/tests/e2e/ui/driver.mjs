@@ -600,11 +600,16 @@ const OPS = {
     try { await OPS.login({ sid, email, password }); } finally { s.wantFail = false; }
     return true;
   },
-  async first_run_setup({ sid, name, email, password }) {
+  async first_run_setup({ sid, name, email, password, setupToken = '' }) {
     const { page } = sess(sid);
     addSecret(password);
+    if (setupToken) addSecret(setupToken);
     await page.goto(`${BASE}/setup`, { waitUntil: 'domcontentloaded' });
-    for (const [id, v] of [['#name', name], ['#email', email], ['#password', password], ['#confirmPassword', password]]) {
+    await find(page, { css: '#name' });
+    // NAN-5237: the token field is shown only when the API requires it.
+    const fields = [['#name', name], ['#email', email], ['#password', password], ['#confirmPassword', password]];
+    if (setupToken && (await page.$('#setupToken'))) fields.unshift(['#setupToken', setupToken]);
+    for (const [id, v] of fields) {
       const el = await find(page, { css: id }); await el.click(); await el.type(v);
     }
     await click(page, { role: 'button', name: 'Create Admin Account' });

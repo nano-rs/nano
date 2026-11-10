@@ -1,9 +1,10 @@
-# Full HA: no single point of failure (NAN-5215)
+# Full HA: no single point of failure (nano 2.0.7+)
 
 Use this when the operator wants every component to survive the loss of any
 one host: UI, API, search, detections, alerting and ingest. It builds on
-[multi-node-ha.md](multi-node-ha.md) (several app hosts, NAN-5213) and the
-PostgreSQL/Valkey failover lane (NAN-5214).
+[multi-node-ha.md](multi-node-ha.md) (several app hosts) and
+[postgres-ha.md](postgres-ha.md) (PostgreSQL and Valkey failover). Both ship
+in nano 2.0.7.
 
 ## Layout
 
@@ -12,11 +13,11 @@ Minimum shape, one role group per failure domain (separate physical hosts):
 | Hosts | Roles | Why |
 | -- | -- | -- |
 | 2+ | `app` | api, search, web, jobs active/active behind the LB; jobs singletons on a PostgreSQL lease |
-| 3 | `postgres` | Patroni + etcd, Valkey + Sentinel (NAN-5214). Until it ships: one `postgres` host = the one remaining single point of failure |
+| 3 | `postgres` | Patroni + etcd, Valkey + Sentinel. With only one `postgres` host, PostgreSQL is a single point of failure |
 | 2 x N | `clickhouse` | N shards x 2 replicas (`internal_replication`) |
 | 3 | `keeper` | Raft quorum; may share hosts with ClickHouse or postgres |
 | 2+ | `ingest` | Vector behind the LB |
-| 2 | load balancer | operator-owned; managed LB or HAProxy + keepalived |
+| 2 | load balancer | operator-owned and itself redundant: a managed LB, an HAProxy pair with keepalived, or two HAProxy hosts behind health-checked DNS |
 
 Small installs may stack roles (for example `clickhouse,keeper,ingest` on
 three hosts). Losing a stacked host loses all its roles at once, which is
@@ -37,9 +38,18 @@ Ship the tested examples in the bundle:
   have applied the request, and the LB would apply it twice.
 - Replace `X-Forwarded-For` with the client address; put the LB's private
   address in `cluster.trusted_proxy_cidrs`.
-- No managed LB: two small hosts with OS-package HAProxy + keepalived and the
-  floating IP from `keepalived.conf` (nopreempt; ~3 s failover). Needs L2
-  adjacency, VRRP (IP protocol 112) allowed, `net.ipv4.ip_nonlocal_bind=1`.
+- No managed LB: two small hosts with OS-package HAProxy (2.6 or later) +
+  keepalived and the floating IP from `keepalived.conf` (nopreempt; ~3 s
+  failover). Needs L2 adjacency, VRRP (IP protocol 112) allowed,
+  `net.ipv4.ip_nonlocal_bind=1`.
+- No managed LB and no VRRP: two HAProxy hosts, both addresses as A records
+  for both hostnames, with the DNS provider's health-checked failover (TTL 60 s
+  or less; `plan.py --lb haproxy-dns`). Failover takes the TTL plus the check
+  interval, roughly 1-2 minutes, and nano has not measured it. HEC, OTLP and
+  HTTP senders must retry and re-resolve DNS; clients that cache DNS forever
+  do not fail over.
+- Only if none of these is possible: one HAProxy host, a single point of
+  failure at the edge. Say so plainly. See [cloud-vm.md](cloud-vm.md#7-load-balancer).
 
 ## Inside the cluster (rendered, nothing to configure)
 
@@ -57,7 +67,7 @@ Ship the tested examples in the bundle:
 
 - Opt-ins in the shared `.env` now apply on EVERY app host:
   `COMPOSE_PROFILES=...,pull-feeds` (connector-runner) and
-  `backup-schedule --configure` (nano-backup). Before NAN-5215 neither ever
+  `backup-schedule --configure` (nano-backup). Before 2.0.7 neither ever
   started on a role-split host. Re-run each app host's install after changing
   them.
 - Backups: every app host runs the scheduler; a PostgreSQL lock plus a
@@ -73,17 +83,17 @@ Ship the tested examples in the bundle:
 
 | Situation | Customer-visible effect |
 | -- | -- |
-| An ingest host dies | Events still in its Vector disk buffer arrive when it returns (not lost while its disk survives; lost if the disk is). HEC ackIds it issued can't be polled; senders resend, so duplicates are possible. NAN-5178 (end-to-end acks), NAN-5208 |
+| An ingest host dies | Events still in its Vector disk buffer arrive when it returns (not lost while its disk survives; lost if the disk is). HEC ackIds it issued can't be polled; senders resend, so duplicates are possible. End-to-end acknowledgements are planned |
 | Both replicas of one shard down | Writes to that shard block, and Vector's per-shard route back-pressures ALL ingest; searches error. Not a one-host failure |
 | 2 of 3 Keepers down | Replicated tables go read-only: inserts fail, Vector buffers fill and block |
 | A ClickHouse replica down > ~40 min | Its prevalence verdicts for keys that changed meanwhile stay stale until the key is seen again |
-| The load balancer | Operator-owned; must be redundant itself (managed LB or keepalived pair) |
+| The load balancer | Operator-owned; must be redundant itself (managed LB, keepalived pair, or DNS failover across two HAProxy hosts) |
 | `scripts/nano upgrade`, `backup-set` | Refuse while any host is unreachable (by design). Replace or restore the host first. Per-host `scripts/nano backup` still works |
-| Single `postgres` host (before NAN-5214) | Logins, rules and alerting stop while it is down; ingest keeps accepting for up to 300 s, then senders get 503 |
+| A PostgreSQL primary dies (three `postgres` hosts) | Writes, sign-ins and searches see a short pause, typically a few seconds and up to about 30 s, while a standby is promoted. No acknowledged write is lost |
+| A layout with one `postgres` host | Logins, rules and alerting stop while it is down; ingest keeps accepting for up to 300 s, then senders get 503 |
 
 ## Proof
 
-The kill-any-node chaos gate (`NANO_LIVE_SCENARIO=ha-chaos
-scripts/tests/sovereign-role-installer.live.sh`, 14 emulated hosts): every
-host SIGKILLed for 3 minutes in turn under a steady mixed workload. See the
-NAN-5215 PR for the per-node results table.
+nano tests this layout by killing every host in turn for 3 minutes under a
+steady mixed workload. Run the operator's own failover check after the install
+([cloud-vm.md](cloud-vm.md#8-verify-and-prove-failover)).

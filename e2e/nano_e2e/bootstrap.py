@@ -23,12 +23,20 @@ class BootstrapError(RuntimeError):
     pass
 
 
-def initialize(c: httpx.Client, email: str, password: str) -> bool:
-    """Run first-run setup through the API. True when this call initialized it."""
+def initialize(c: httpx.Client, email: str, password: str, setup_token: str = "") -> bool:
+    """Run first-run setup through the API. True when this call initialized it.
+
+    `setup_token` is the stack's NANO_SETUP_TOKEN (NAN-5237); a native app
+    run has none and is admitted as a direct loopback caller."""
     status = c.get("/api/setup/status").json()
     if status.get("initialized"):
         return False
-    r = c.post("/api/setup/initialize", json={"email": email, "name": "e2e admin", "password": password})
+    headers = {"Authorization": f"Bearer {setup_token}"} if setup_token else {}
+    r = c.post(
+        "/api/setup/initialize",
+        json={"email": email, "name": "e2e admin", "password": password},
+        headers=headers,
+    )
     if r.status_code not in (200, 409):
         raise BootstrapError(f"setup/initialize -> {r.status_code}: {r.text[:500]}")
     return r.status_code == 200
@@ -71,7 +79,7 @@ def main() -> int:
     out = Path(os.environ["E2E_OUT"])
     c = httpx.Client(base_url=api, timeout=60)
     try:
-        initialize(c, email, password)
+        initialize(c, email, password, os.environ.get("E2E_SETUP_TOKEN", ""))
         key = mint_admin_key(c, email, password)
     except BootstrapError as exc:
         print(str(exc), file=sys.stderr)

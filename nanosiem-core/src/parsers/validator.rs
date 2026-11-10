@@ -43,6 +43,9 @@ pub enum VrlValidatorError {
     ExecutionError(String),
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::Error),
+    /// Every parser-test worker slot is taken (HTTP 429, NAN-5234).
+    #[error("{0}")]
+    Busy(String),
 }
 
 /// Dangerous patterns that should be blocked in VRL code
@@ -154,6 +157,19 @@ pub struct VrlValidator {
     /// The function registry programs compile against (NAN-4912 P3): the
     /// event-parser allowlist unless built with [`Self::for_enrichment`].
     registry: VrlRegistry,
+    /// Where sample tests execute (NAN-5234): a resource-limited worker
+    /// process unless this validator is itself running inside one.
+    isolation: Isolation,
+}
+
+/// Where a [`VrlValidator`] executes test programs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Isolation {
+    /// A one-shot worker process ([`super::test_sandbox`]).
+    #[default]
+    WorkerProcess,
+    /// The calling process: only for code already inside a worker.
+    InProcess,
 }
 
 impl VrlValidator {
@@ -161,6 +177,39 @@ impl VrlValidator {
     pub fn new() -> Self {
         Self {
             registry: VrlRegistry::Parser,
+            isolation: Isolation::WorkerProcess,
+        }
+    }
+
+    /// This validator, executing tests in the calling process. Only for code
+    /// that already runs inside a resource-limited worker (Nano Pipe
+    /// previews, NAN-4919).
+    pub(crate) fn inside_worker(mut self) -> Self {
+        self.isolation = Isolation::InProcess;
+        self
+    }
+
+    /// Execute a parser-test job (NAN-5234). `Ok(Err(_))` is a bound the
+    /// program hit (deadline, memory/CPU, output size): the caller reports it
+    /// as the test's failure. `Err(_)` is a refusal (busy, invalid, no
+    /// isolation available).
+    async fn execute_job(
+        &self,
+        work: super::test_sandbox::Work,
+    ) -> Result<Result<super::test_sandbox::Outcome, String>, VrlValidatorError> {
+        use super::test_sandbox::{self, ParserTestJob};
+        let job = ParserTestJob {
+            registry: self.registry,
+            work,
+        };
+        let executed = match self.isolation {
+            Isolation::WorkerProcess => test_sandbox::run(&job).await,
+            Isolation::InProcess => test_sandbox::run_in_process(job).await,
+        };
+        match executed {
+            Ok(outcome) => Ok(Ok(outcome)),
+            Err(error) if error.is_execution_bound() => Ok(Err(error.to_string())),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -169,6 +218,7 @@ impl VrlValidator {
     pub fn for_enrichment() -> Self {
         Self {
             registry: VrlRegistry::Enrichment,
+            isolation: Isolation::WorkerProcess,
         }
     }
 
@@ -592,25 +642,33 @@ impl VrlValidator {
             })
             .collect();
         if !inputs.is_empty() {
-            let extension = extension.map(str::to_owned);
-            // NAN-5040: the native batch engine runs tenant VRL too; it gets
-            // the same per-request budget as the plain-VRL path.
-            let rows = tokio::task::spawn_blocking(move || {
-                tracing::subscriber::with_default(
-                    tracing::subscriber::NoSubscriber::default(),
-                    || {
-                        crate::parsers::pipe::batch::run_bounded(
-                            &plan,
-                            &inputs,
-                            extension.as_deref(),
-                            exec_bounds::ExecutionBudget::new(exec_bounds::TEST_EXECUTION_BUDGET),
-                        )
-                    },
-                )
-            })
-            .await
-            .map_err(|error| VrlValidatorError::ExecutionError(error.to_string()))?
-            .map_err(VrlValidatorError::ExecutionError)?;
+            // NAN-5040 / NAN-5234: the native batch engine runs tenant VRL
+            // too; it gets the same worker process and request budget as the
+            // plain-VRL path.
+            let rows = match self
+                .execute_job(super::test_sandbox::Work::Native {
+                    plan,
+                    extension: extension.map(str::to_owned),
+                    inputs,
+                })
+                .await?
+            {
+                Ok(super::test_sandbox::Outcome::Native(rows)) => {
+                    rows.map_err(VrlValidatorError::ExecutionError)?
+                }
+                Ok(_) => {
+                    return Err(VrlValidatorError::ExecutionError(
+                        "Invalid parser test worker response".into(),
+                    ))
+                }
+                Err(bound) => vec![
+                    super::test_sandbox::NativeRow {
+                        outputs: vec![],
+                        error: Some(bound),
+                    };
+                    indices.len()
+                ],
+            };
             for (index, row) in indices.into_iter().zip(rows) {
                 results[index].success = row.error.is_none();
                 results[index].error = row.error;
@@ -869,25 +927,22 @@ impl VrlValidator {
             }
         };
 
-        // Execute VRL natively, off the tokio workers and under a time budget
-        // (NAN-5040).
-        let program = match self.compile_program(vrl_code) {
-            Ok(program) => program,
-            Err(e) => {
-                return Ok(ParserTestResult {
-                    success: false,
-                    input: sample_input.to_string(),
-                    output: None,
-                    error: Some(format!("Execution error: {}", e)),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                })
-            }
+        // Execute in a resource-limited worker process under a time budget
+        // (NAN-5040, NAN-5234).
+        let executed = match self
+            .execute_job(super::test_sandbox::Work::Each {
+                code: vrl_code.clone(),
+                inputs: vec![input_json],
+            })
+            .await?
+        {
+            Ok(super::test_sandbox::Outcome::Each(Ok(mut rows))) => rows
+                .pop()
+                .unwrap_or_else(|| Err("no result".to_string())),
+            Ok(super::test_sandbox::Outcome::Each(Err(compile_error))) => Err(compile_error),
+            Ok(_) => Err("Invalid parser test worker response".to_string()),
+            Err(bound) => Err(bound),
         };
-        let code = vrl_code.clone();
-        let executed = exec_bounds::run_blocking(move |budget| {
-            exec_bounds::run_program(&code, &program, &input_json, budget)
-        })
-        .await?;
         match executed {
             Ok(output) => Ok(ParserTestResult {
                 success: true,
@@ -939,53 +994,65 @@ impl VrlValidator {
                 .collect());
         }
 
-        let vrl_code = &resolved_program(vrl_code);
-        let program = self
-            .compile_program(vrl_code)
-            .map_err(VrlValidatorError::ExecutionError)?;
-
-        // NAN-5040: every sample runs on the blocking pool under ONE request
-        // budget, so a slow program cannot multiply its cost by the sample
-        // count.
-        let code = vrl_code.clone();
-        let inputs = sample_inputs.to_vec();
-        exec_bounds::run_blocking(move |budget| {
-            inputs
-                .into_iter()
-                .map(|sample_input| {
-                    let input_json: serde_json::Value = match serde_json::from_str(&sample_input) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            return ParserTestResult {
-                                success: false,
-                                input: sample_input,
-                                output: None,
-                                error: Some(format!("Invalid JSON input: {}", error)),
-                                duration_ms: start.elapsed().as_millis() as u64,
-                            };
-                        }
-                    };
-
-                    match exec_bounds::run_program(&code, &program, &input_json, budget) {
-                        Ok(output) => ParserTestResult {
-                            success: true,
-                            input: sample_input,
-                            output: Some(output),
-                            error: None,
-                            duration_ms: start.elapsed().as_millis() as u64,
-                        },
-                        Err(error) => ParserTestResult {
-                            success: false,
-                            input: sample_input,
-                            output: None,
-                            error: Some(format!("Execution error: {}", error)),
-                            duration_ms: start.elapsed().as_millis() as u64,
-                        },
-                    }
+        // NAN-5040 / NAN-5234: every sample runs in ONE resource-limited
+        // worker under ONE request budget, so a slow program cannot multiply
+        // its cost by the sample count. Invalid JSON samples never leave this
+        // process.
+        let vrl_code = resolved_program(vrl_code);
+        let mut results: Vec<ParserTestResult> = Vec::with_capacity(sample_inputs.len());
+        let mut indices = Vec::new();
+        let mut inputs = Vec::new();
+        for (index, sample_input) in sample_inputs.iter().enumerate() {
+            let error = match serde_json::from_str::<serde_json::Value>(sample_input) {
+                Ok(value) => {
+                    indices.push(index);
+                    inputs.push(value);
+                    None
+                }
+                Err(error) => Some(format!("Invalid JSON input: {}", error)),
+            };
+            results.push(ParserTestResult {
+                success: false,
+                input: sample_input.clone(),
+                output: None,
+                error,
+                duration_ms: 0,
+            });
+        }
+        if !inputs.is_empty() {
+            let rows = match self
+                .execute_job(super::test_sandbox::Work::Each {
+                    code: vrl_code,
+                    inputs,
                 })
-                .collect()
-        })
-        .await
+                .await?
+            {
+                Ok(super::test_sandbox::Outcome::Each(Ok(rows))) => rows,
+                Ok(super::test_sandbox::Outcome::Each(Err(compile_error))) => {
+                    return Err(VrlValidatorError::ExecutionError(compile_error))
+                }
+                Ok(_) => {
+                    return Err(VrlValidatorError::ExecutionError(
+                        "Invalid parser test worker response".into(),
+                    ))
+                }
+                Err(bound) => vec![Err(bound); indices.len()],
+            };
+            for (index, row) in indices.into_iter().zip(rows) {
+                let result = &mut results[index];
+                match row {
+                    Ok(output) => {
+                        result.success = true;
+                        result.output = Some(output);
+                    }
+                    Err(error) => result.error = Some(format!("Execution error: {}", error)),
+                }
+            }
+        }
+        for result in &mut results {
+            result.duration_ms = start.elapsed().as_millis() as u64;
+        }
+        Ok(results)
     }
 
     /// Test a chain of VRL stages against sample input (NAN-874).
@@ -1077,38 +1144,25 @@ impl VrlValidator {
 
         // Parse the sample as JSON; if it isn't JSON, fall through with the raw
         // string as `.message` — same forgiving behavior the Vector pipeline has.
-        let mut current: serde_json::Value = match serde_json::from_str(sample_input) {
+        let current: serde_json::Value = match serde_json::from_str(sample_input) {
             Ok(v) => v,
             Err(_) => serde_json::json!({ "message": sample_input }),
         };
 
-        // Compile every stage here; execute them off the tokio workers under
-        // one request budget (NAN-5040).
-        let mut compiled = Vec::with_capacity(stages.len());
-        for (idx, _) in &stages {
-            match self.compile_program(&resolved[*idx]) {
-                Ok(program) => compiled.push((*idx, resolved[*idx].clone(), program)),
-                Err(e) => {
-                    return Ok(ParserTestResult {
-                        success: false,
-                        input: sample_input.to_string(),
-                        output: None,
-                        error: Some(format!("stage {}: execution error: {}", idx, e)),
-                        duration_ms: start.elapsed().as_millis() as u64,
-                    });
-                }
-            }
-        }
-        let executed = exec_bounds::run_blocking(move |budget| {
-            for (idx, code, program) in &compiled {
-                match exec_bounds::run_program(code, program, &current, budget) {
-                    Ok(output) => current = output,
-                    Err(e) => return Err(format!("stage {}: execution error: {}", idx, e)),
-                }
-            }
-            Ok(current)
-        })
-        .await?;
+        // Every stage compiles and executes in one resource-limited worker
+        // under one request budget (NAN-5040, NAN-5234).
+        let work = super::test_sandbox::Work::Chain {
+            stages: stages
+                .iter()
+                .map(|(idx, _)| (*idx, resolved[*idx].clone()))
+                .collect(),
+            input: current,
+        };
+        let executed = match self.execute_job(work).await? {
+            Ok(super::test_sandbox::Outcome::Chain(result)) => result,
+            Ok(_) => Err("Invalid parser test worker response".to_string()),
+            Err(bound) => Err(bound),
+        };
 
         match executed {
             Ok(current) => Ok(ParserTestResult {
@@ -1128,8 +1182,10 @@ impl VrlValidator {
         }
     }
 
-    /// Compile an executable VRL program. Kept separate from execution so batch
-    /// callers can reuse the same program across multiple independent events.
+    /// Compile an executable VRL program against this validator's registry
+    /// (unit tests of the execution bounds; service code compiles inside the
+    /// parser-test worker, [`super::test_sandbox::execute`]).
+    #[cfg(test)]
     fn compile_program(&self, vrl_code: &str) -> Result<vrl::compiler::Program, String> {
         let fns = self.registry.functions();
         super::vrl_guard::compile_formatted(vrl_code, &fns)

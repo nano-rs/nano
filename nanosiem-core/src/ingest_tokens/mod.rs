@@ -31,6 +31,11 @@
 //!   [`InstallTokenMode::LegacyMultiplex`] mode, so an upgraded deployment's
 //!   existing senders keep working unchanged.
 //!
+//! **The push-enrichment lane** (`04-enrichment-source.toml`, NAN-5233) reads
+//! the same file but accepts only the multiplex route: a source-bound token
+//! (named, or the strict install token) is dead-lettered there, so a log
+//! sender's credential cannot write enrichment.
+//!
 //! In [`InstallTokenMode::Strict`] the install token is accepted only once an
 //! admin binds it to a source (then it behaves like a named token), and the
 //! sources' static install-token fallback is off (`fallback_enabled = false`).
@@ -53,6 +58,8 @@ mod mod_tests;
 mod repository_tests;
 #[cfg(test)]
 mod vector_lane_tests;
+#[cfg(test)]
+mod enrichment_lane_auth_tests;
 
 pub use file::{
     render_tokens_file, write_tokens_file, TokenFileEntry, DEFAULT_TOKENS_FILE, MULTIPLEX_ROUTE,

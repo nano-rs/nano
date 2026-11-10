@@ -19,7 +19,7 @@ fn is_gate(expr: &SearchExpr, excluded: &str) -> bool {
             field,
             op: Comparator::Ne,
             value: Value::String(s),
-        } if field.eq_ignore_ascii_case("source_type") && s.eq_ignore_ascii_case(excluded)
+        } if field == "source_type" && s == excluded
     )
 }
 
@@ -38,7 +38,7 @@ fn is_scope_gate(expr: &SearchExpr, deny: &BTreeSet<String>) -> bool {
             field,
             values,
             negated: true,
-        } if field.eq_ignore_ascii_case("source_type") => {
+        } if field == "source_type" => {
             let got: BTreeSet<String> = values
                 .iter()
                 .filter_map(|v| match v {

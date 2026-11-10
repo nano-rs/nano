@@ -13,10 +13,19 @@ What it does, like the product's Add-source flow:
   2. POST /api/auth/login as the admin from --creds (default ~/.nano-admin-credentials)
   3. GET  /api/license and reports state / validity / expiry
   4. imports the first-party json_generic parser as a linked log source (reused if present),
-     deploys it, and issues a short-lived source-bound ingest token
+     deploys it only if it is not deployed yet (--redeploy forces it), and issues a
+     short-lived source-bound ingest token
   5. POSTs one JSON event with a unique marker to <ingest-url>/ingest/
-  6. polls POST /api/search until the marker is found
+  6. polls POST /api/search until the marker is found, and measures the write latency:
+     the time from the accepted POST to the event being searchable. It FAILS when that
+     exceeds --write-sla (default 60 s) even if the event arrives later: a write stall
+     that outlasts a failover must not read as a pass. The search keeps polling until
+     --timeout only to report how late the event was.
   7. revokes the token it issued (the log source is kept; it is harmless and reused)
+
+Failover drills: run it while a host is down. Deploying a log source publishes a new
+Vector configuration to every ingest host, so it never redeploys one that is
+already deployed (the HA guide: make such changes in a quiet period).
 
 TLS: https URLs are verified. Pass --ca-file for a private CA. There is no option
 to skip verification.
@@ -105,7 +114,12 @@ def main() -> int:
     ap.add_argument("--env-file", default="~/nano/.env", help="read only for NANO_SCHEMA_PROFILE")
     ap.add_argument("--profile", choices=["ocsf", "udm"])
     ap.add_argument("--ca-file")
-    ap.add_argument("--timeout", type=int, default=240, help="seconds to wait for the event to be searchable")
+    ap.add_argument("--timeout", type=int, default=240,
+                    help="seconds to keep polling search, to report how late a stalled write lands")
+    ap.add_argument("--write-sla", type=int, default=60,
+                    help="FAIL when the event takes longer than this many seconds to become searchable")
+    ap.add_argument("--redeploy", action="store_true",
+                    help="deploy the smoke log source even if it is already deployed (never during a failover drill)")
     ap.add_argument("--require-licence", action="store_true", help="fail (not warn) when the licence is not valid")
     a = ap.parse_args()
     app = a.app_url.rstrip("/")
@@ -198,6 +212,14 @@ def main() -> int:
             add("source", "FAIL", f"import {parser_path} -> {st} {short(raw, 100)}")
             return finish()
     deployed, attempts = False, 0
+    already = False
+    if not a.redeploy:
+        st, data, _ = c.api("GET", app, f"/api/log-sources/{log_source_id}")
+        src = (data.get("log_source") or data.get("data") or data) if isinstance(data, dict) else {}
+        already = st == 200 and isinstance(src, dict) and src.get("deployed") is True and src.get("enabled", True) is not False
+    if already:
+        deployed = True
+        add("source", "PASS", f"json_generic ({profile}) log source {log_source_id} already deployed (not redeployed)")
     while not deployed and attempts < 3:  # deploy is idempotent; small hosts can time out transiently
         attempts += 1
         st, data, raw = c.api("POST", app, f"/api/log-sources/{log_source_id}/deploy", {}, timeout=180)
@@ -207,11 +229,12 @@ def main() -> int:
     # In 2.0.x role-split installs the app host has no local Vector, so deploy can report
     # success=false ("No reload was delivered to Vector") even though the new config
     # generation reaches every ingest host. Ingest -> search below is the real proof.
-    add("source", "PASS" if deployed else "WARN",
-        f"json_generic ({profile}) log source {log_source_id} deploy -> {st} (attempts={attempts})"
-        + ("" if deployed else f" reported not deployed: {short(raw, 200)}; continuing, ingest->search decides"))
-    if st != 200:
-        return finish()
+    if not already:
+        add("source", "PASS" if deployed else "WARN",
+            f"json_generic ({profile}) log source {log_source_id} deploy -> {st} (attempts={attempts})"
+            + ("" if deployed else f" reported not deployed: {short(raw, 200)}; continuing, ingest->search decides"))
+        if st != 200:
+            return finish()
     run = "nds" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
     st, data, raw = c.api("POST", app, "/api/ingest-tokens", {"name": f"{run}-smoke", "source_id": log_source_id})
     ingest_token = (data or {}).get("token") if isinstance(data, dict) else None
@@ -228,12 +251,13 @@ def main() -> int:
                  "message": f"nano-deploy smoke test {mark}", "smoke_mark": mark,
                  "src_ip": "10.1.2.3", "dest_ip": "10.4.5.6", "dest_port": 443, "action": "allow",
                  "hostname": "nano-deploy-smoke"}
-        accepted, deadline = None, time.time() + 90
+        accepted, deadline, t_accept = None, time.time() + 90, None
         while time.time() < deadline:
             st, _, raw = c.http("POST", ingest + "/ingest/", event,
                                 {"Authorization": "Bearer " + ingest_token, "X-Source-Type": "json_generic"})
             accepted = st
             if 200 <= st < 300:
+                t_accept = time.time()
                 break
             time.sleep(5)  # token and parser deploy propagate to Vector within seconds
         add("ingest", "PASS" if accepted and 200 <= accepted < 300 else "FAIL",
@@ -243,7 +267,8 @@ def main() -> int:
 
         # 6. search
         start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat().replace("+00:00", "Z")
-        found, t0, deadline = 0, time.time(), time.time() + a.timeout
+        t0 = t_accept or time.time()
+        found, deadline = 0, t0 + max(a.timeout, a.write_sla)
         while time.time() < deadline and not found:
             end = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)).isoformat().replace("+00:00", "Z")
             st, data, raw = c.api("POST", app, "/api/search", {
@@ -252,9 +277,16 @@ def main() -> int:
             results = (data or {}).get("results") or [] if isinstance(data, dict) else []
             found = sum(1 for r in results if mark in json.dumps(r))
             if not found:
-                time.sleep(5)
-        add("search", "PASS" if found else "FAIL",
-            f'search "{mark}" -> {found} hit(s) after {int(time.time() - t0)}s' + ("" if found else f" last status {st}"))
+                time.sleep(2)
+        latency = time.time() - t0
+        on_time = found and latency <= a.write_sla
+        detail = f'search "{mark}" -> {found} hit(s); write latency {latency:.0f}s (bound {a.write_sla}s)'
+        if found and not on_time:
+            detail += " -> WRITES STALLED: the event landed late. Check cluster-health.py on every host (gateways)"
+        elif not found:
+            detail += f" -> not searchable after {latency:.0f}s, last status {st}"
+        add("search", "PASS" if on_time else "FAIL", detail)
+        add("latency", "PASS" if on_time else "FAIL", f"write_latency_seconds={latency:.1f} bound={a.write_sla}")
     finally:
         # 7. cleanup
         if cred_id:

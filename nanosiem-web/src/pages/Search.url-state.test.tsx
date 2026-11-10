@@ -8,6 +8,7 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Search } from './Search';
+import { grantSearchAutoRun } from '@/lib/search-auto-run';
 
 const mocks = vi.hoisted(() => ({
   stream: vi.fn(), async: vi.fn(), fields: vi.fn(), legacy: vi.fn(),
@@ -84,7 +85,7 @@ const fragment = () => new URLSearchParams(location().split('|')[1]?.replace(/^#
 // #7041: hunt queries live in the fragment, so they never reach the server or
 // proxy access logs. Old `?q=` links still run and are migrated in place.
 it('migrates a legacy ?q= link into the fragment and still runs it over its bounds', async () => {
-  mount('/search?q=error&start=2026-10-17T12%3A00%3A00.000Z&end=2026-10-17T12%3A30%3A00.000Z&run=true');
+  mount(`/search?q=error&start=2026-10-17T12%3A00%3A00.000Z&end=2026-10-17T12%3A30%3A00.000Z&run=${grantSearchAutoRun('error')}`);
   await waitFor(() => expect(mocks.stream).toHaveBeenCalledTimes(1));
   expect((mocks.stream.mock.calls[0][0] as { query?: string }).query?.trim()).toBe('error');
   expect((mocks.stream.mock.calls[0][0] as { time_range?: unknown }).time_range).toEqual({
@@ -97,7 +98,7 @@ it('migrates a legacy ?q= link into the fragment and still runs it over its boun
 // NAN-3884: a relative pick stays relative in the URL after the run, so the
 // same link opened later re-resolves against "now".
 it('keeps a "Last 15 minutes" link relative after it runs', async () => {
-  mount('/search#q=error&time=Last+15+minutes&run=true');
+  mount(`/search#q=error&time=Last+15+minutes&run=${grantSearchAutoRun('error')}`);
   await waitFor(() => expect(mocks.stream).toHaveBeenCalledTimes(1));
   const range = (mocks.stream.mock.calls[0][0] as { time_range: { start: string; end: string } }).time_range;
   expect(Date.parse(range.end) - Date.parse(range.start)).toBe(15 * 60_000);
@@ -110,7 +111,7 @@ it('keeps a "Last 15 minutes" link relative after it runs', async () => {
 
 // #7030: a fired-rule pivot's absolute window wins over a relative preset.
 it('a fired-rule deep link honors absolute bounds over a relative preset', async () => {
-  mount('/search#q=error&time=Last+hour&start=2026-10-06T11%3A53%3A42.000Z&end=2026-10-06T12%3A53%3A42.999Z&run=true');
+  mount(`/search#q=error&time=Last+hour&start=2026-10-06T11%3A53%3A42.000Z&end=2026-10-06T12%3A53%3A42.999Z&run=${grantSearchAutoRun('error')}`);
   await waitFor(() => expect(mocks.stream).toHaveBeenCalledTimes(1));
   expect((mocks.stream.mock.calls[0][0] as { time_range?: unknown }).time_range).toEqual({
     start: '2026-10-06T11:53:42.000Z', end: '2026-10-06T12:53:42.999Z',
@@ -120,7 +121,7 @@ it('a fired-rule deep link honors absolute bounds over a relative preset', async
 // NAN-4927 review: `view=rarity` is fragment state owned by Search; a run
 // keeps it and nothing writes it back to the query string.
 it('keeps #view=rarity in the fragment across a run, never in the query string', async () => {
-  mount('/search#q=error&time=Last+15+minutes&view=rarity&run=true');
+  mount(`/search#q=error&time=Last+15+minutes&view=rarity&run=${grantSearchAutoRun('error')}`);
   await waitFor(() => expect(mocks.stream).toHaveBeenCalledTimes(1));
   await waitFor(() => expect(fragment().get('run')).toBeNull());
   expect(fragment().get('view')).toBe('rarity');

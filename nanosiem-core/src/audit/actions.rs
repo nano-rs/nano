@@ -957,6 +957,16 @@ pub const INGEST_TOKEN_BOUND: &str = "ingest_token_bound";
 pub const INGEST_TOKEN_SETTINGS_UPDATED: &str = "ingest_token_settings_updated";
 
 // =============================================================================
+// Ingestion Pause Actions (NAN-5217)
+// =============================================================================
+
+/// Ingestion was paused cluster-wide (details.source: `disk_pressure` or
+/// `manual`)
+pub const INGESTION_PAUSED: &str = "ingestion_paused";
+/// Ingestion was resumed after a pause
+pub const INGESTION_RESUMED: &str = "ingestion_resumed";
+
+// =============================================================================
 // IP Allowlist Actions
 // =============================================================================
 
@@ -1063,6 +1073,11 @@ pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
     INGEST_TOKEN_REVOKED,
     INGEST_TOKEN_BOUND,
     INGEST_TOKEN_SETTINGS_UPDATED,
+    // Ingestion pause / resume (NAN-5217) — an admin action or a disk-pressure
+    // transition, both rare. Durable: a lost record would hide why data
+    // stopped arriving.
+    INGESTION_PAUSED,
+    INGESTION_RESUMED,
     // Federated identity — JIT provisioning of a new user on first OIDC login.
     OIDC_USER_PROVISIONED,
     // Session termination — administrative, low-volume.
@@ -1119,6 +1134,8 @@ mod durable_classifier_tests {
             "ingest_token_revoked",
             "ingest_token_bound",
             "ingest_token_settings_updated",
+            "ingestion_paused",
+            "ingestion_resumed",
             "oidc_user_provisioned",
             "session_terminated",
             "user_sessions_terminated",

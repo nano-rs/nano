@@ -9,21 +9,40 @@ Conventions below: `H` is `user@host`, `SSH="ssh -o BatchMode=yes"`, the
 install directory is `~/nano` for the SSH user, and `V` is the release (for
 example `2.0.4`). Before each step, show the operator the commands and ask.
 
-## Step 0: check the bundle locally (read-only)
+## Step 0: fetch and verify the bundle locally
+
+With the operator's enrollment values file (downloads only; nothing on the host
+changes):
+
+The operator downloads three files from the deployment's page in app.nano.rs
+(**1 · Get the installer**; only an owner or admin can, and no API fetches
+them with the licence token): `nano-compose-enterprise-$V.tar.gz`, `.sha256`
+and `.sha256.sig`. Verify the signature, then the checksum, with nano's
+release key from the public Self-run install guide (never from inside the
+archive). The exact commands and the key are in
+[cloud-vm.md](cloud-vm.md#6-licence-download-verify-install), step 2:
 
 ```bash
-shasum -a 256 nano-compose-enterprise-$V.tar.gz    # or sha256sum
+bash scripts/fetch-bundle.sh --enrollment ./nano-deploy-work/enrollment.env \
+  --out ./nano-deploy-work/bundle --version $V
+cd ./nano-deploy-work/bundle
 tar -tzf nano-compose-enterprise-$V.tar.gz | head -3   # top directory: nano-$V/
 ```
 
-Compare the digest with the value published by nano. On a mismatch, stop.
+Continue only after it prints `VERIFIED nano-compose-enterprise-$V.tar.gz`. It
+checks the pinned release key, the signature on the `.sha256` and the bundle
+against that signed line, and keeps nothing on a failure. If the operator gave
+you files instead, run the same checks (Self-run docs, "Get the bundle"), not
+`sha256sum -c`.
 
 ## Step 1: host prerequisites (only if preflight failed on them)
 
 Propose the minimum fix for each `FAIL` and run it only after approval. On
 Debian or Ubuntu, install Docker Engine and the Compose plugin from Docker's
-official apt repository (docs.docker.com/engine/install). Do not use the
-distribution's `docker.io` package when it is older than 24. Then:
+official apt repository (docs.docker.com/engine/install), the tested path. A
+distribution package (Ubuntu's `docker.io` with `docker-compose-v2`) is fine
+when it is Docker 24 or newer with the Compose v2 plugin; preflight checks
+the versions. Then:
 
 ```bash
 sudo apt-get install -y git curl openssl python3 tar iproute2
@@ -47,8 +66,11 @@ the compose files, scripts and image lock are one release artifact.
 ## Step 3: registry login (mutating, secret)
 
 The registry host is the prefix of the image lines in `images.enterprise.customer.lock`
-(for example `us-central1-docker.pkg.dev`). Copy the operator's credential file
-and log in from stdin:
+(for example `us-central1-docker.pkg.dev`). Get a one-hour credential with the
+licence values just before this step (`bash scripts/fetch-bundle.sh --enrollment
+./nano-deploy-work/enrollment.env --version $V --registry-cred
+./nano-deploy-work/registry.cred`, user `oauth2accesstoken`), or use the
+operator's credential file. Copy it and log in from stdin:
 
 ```bash
 scp -p "$REGISTRY_CRED_FILE" $H:~/.nano-registry-cred
@@ -157,6 +179,11 @@ Then go to [verify.md](verify.md).
 - A step failed: fix the cause and re-run the same step. Re-running
   `./install.sh` is the normal recovery.
 - Never run `docker compose down -v` to retry; it deletes all data.
+- Install stopped before the admin was created (the UI shows the setup page):
+  re-run Step 8, which creates it. Or the operator finishes in the browser:
+  the setup page asks for the setup token, `NANO_SETUP_TOKEN` in `~/nano/.env`.
+  The operator reads it on the host; never print it yourself. Once an admin
+  exists the token is not needed.
 - Leftover secret files: `~/.nano-admin-credentials` stays until the operator
   has signed in and stored the password in their password manager. Then offer
   to delete it (`shred -u`).

@@ -16,6 +16,11 @@ product's files.
   re-run. Pass `NANO_ADMIN_EMAIL`, `NANO_ADMIN_NAME` and `NANO_ADMIN_PASSWORD`
   again (the skill sources `~/.nano-admin-credentials`). Once setup is
   initialized, later runs skip admin creation.
+- **From 2.0.8, first-admin setup needs the setup token.** `install.sh`
+  generates `NANO_SETUP_TOKEN` into `.env` (on the app host; it travels with
+  the shared `.env`) and sends it itself. Helm generates `setup_token` in the
+  chart secret. Only the web setup page after an interrupted install asks for
+  it. Installs that already have an admin are unaffected.
 - **Role split: `cluster.deployment_id` becomes `NANO_DEPLOYMENT_ID`.** The
   renderer writes the inventory's `deployment_id` into `.nano-role.env`,
   which overrides `.env`. Set it to the app.nano.rs deployment ID, or licence
@@ -24,16 +29,6 @@ product's files.
   --dry-run` can refuse an install licensed online and report `C05 licence
   state is missing or expired`. Contact nano support before you upgrade. Do
   not bypass the check.
-- **Role split: never put `ingest` on the `app` host.** On a host with both
-  roles, the ingest Vector service re-owns the shared `vector-dynamic`
-  volume (`chown 100:101`) that `nano-api` (uid 999) writes. The API logs
-  `Vector configuration reconciliation failed ... Permission denied`, never
-  publishes a config generation, the local `vector-config-consumer` stays
-  unhealthy (HTTP 404, "no generation published"), and the install aborts
-  before admin creation. Re-running does not help. Validated on 2.0.0; the
-  same compose lines are on main. Keep ingest on dedicated or ClickHouse
-  hosts. If an install already has app+ingest on one host, stop and contact
-  nano support: removing a role changes the durable topology.
 - **Role split: log-source deploy reports failure although it worked.** The
   app host has no local Vector, so `POST /api/log-sources/{id}/deploy` can
   answer `success=false` with "No reload was delivered to Vector", while the
@@ -51,12 +46,25 @@ product's files.
   Make sure senders buffer and retry. With several app hosts, each ingest
   host's `app-api-proxy` fails over to another app host, so losing one app
   host no longer stops ingest; losing all of them still does.
+- **Docker-published ports bypass UFW.** Role-split hosts publish app,
+  ingest, PostgreSQL, Patroni, etcd, Valkey and Sentinel ports through Docker.
+  On a host with a public address and only UFW, they are reachable from the
+  internet. Apply the `DOCKER-USER` rules before the first install
+  ([multi-node-ha.md](multi-node-ha.md#firewall)) and prove it with
+  `preflight.sh --exposure-probe`. Don't use the inventory's `bind_address`
+  as the fix: the installer health-checks the edges on `localhost`.
 - **Docker in LXC containers** (Proxmox CT and similar) needs `nesting=1`
   (and usually `keyctl=1`) on the container. It is fine for labs. Use VMs in
   production.
 
 ## 2.0.0
 
+- **Role split: `ingest` on the `app` host deadlocks the install.** On a host
+  with both roles, the ingest Vector service re-owned the shared
+  `vector-dynamic` volume that `nano-api` writes, so the API never published a
+  Vector configuration and the install aborted before admin creation. Fixed in
+  2.0.1: the API now has its own volume. On 2.0.4 and later both roles may
+  share a host, although the standard layouts keep them apart.
 - **Single node: the licence never checks in.** The 2.0.0 single-node compose
   does not pass `LICENSE_URL` and `LICENSE_TOKEN` to `nano-api` and
   `nano-jobs`, so the enrollment values in `.env` have no effect. Fixed after

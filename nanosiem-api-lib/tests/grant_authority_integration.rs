@@ -414,9 +414,11 @@ async fn least_privilege_api_key_can_provision_users_and_rotate_oidc_secrets() {
         .await
         .expect("a users:edit key must be able to set a user's groups back to the baseline");
 
-    // OIDC provider create/update/enable — `ensure_oidc_jit_grant_authority`
-    // validates exactly this call, and `update_requires_grant_authority` makes a
-    // secret rotation (`enabled: None`) take the same path.
+    // OIDC provider update — `ensure_oidc_jit_grant_authority` validates exactly
+    // this call, and `update_requires_grant_authority` makes a secret rotation
+    // (`enabled: None`) take this path. Create, enable and issuer/client-id
+    // changes need administrator authority instead (NAN-5238,
+    // sso_trust_authority_integration).
     let sso_key = Uuid::now_v7();
     insert_api_key(
         &pool,

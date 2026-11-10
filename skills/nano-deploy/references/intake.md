@@ -61,16 +61,22 @@ confirm them. Never disable host key checking.
 
 ## D. Release, licence and credentials
 
-All of these come from **app.nano.rs → Deployments → your Self-run deployment**,
-or from your nano contact while the portal delivery is rolling out.
+All of these come from **app.nano.rs → Deployments → your Self-run
+deployment**. Only an owner or admin of the organization can open the
+downloads. If the page says bundle downloads are being enabled, the operator
+emails support@nano.rs.
 
-1. Release version (for example `2.0.4`). Use the newest release unless the
+1. Release version (for example `2.0.7`). Use the newest release unless the
    operator pins one. Check [known-issues.md](known-issues.md).
-2. Enterprise compose bundle: where the operator saved
-   `nano-compose-enterprise-<version>.tar.gz` (a local path or a download URL)
-   and its published SHA-256.
-3. Registry pull credential: the path of a file holding the credential, and
-   the username nano gave with it. You log in with `--password-stdin`.
+2. Enterprise compose bundle: normally nothing to ask. With the enrollment
+   values (item 4) you download and verify it yourself with
+   `scripts/fetch-bundle.sh`. Ask only if the operator already downloaded
+   `nano-compose-enterprise-<version>.tar.gz` with its `.sha256` and
+   `.sha256.sig`; verify those the same way before use.
+3. Registry pull credential: normally nothing to ask. `scripts/fetch-bundle.sh
+   --registry-cred FILE` writes one (user `oauth2accesstoken`, one hour). Or
+   the path of a credential file the operator got from the deployment's page.
+   You log in with `--password-stdin`.
 4. Enrollment values: the path of a file (mode `0600`) holding exactly these
    three lines from the deployment page. The token is shown only once:
 
@@ -80,6 +86,9 @@ or from your nano contact while the portal delivery is rolling out.
    NANO_DEPLOYMENT_ID=<deployment id>
    ```
 
+   Only `LICENSE_TOKEN` is a secret. The deployment ID is an identifier: the
+   inventory, the installer's output and `render-inventory.py --identity-only`
+   print it, and that is fine.
    Air-gapped sites get an offline licence file instead. See
    [operate.md](operate.md#offline-licence).
 5. Admin account: email and display name. The password is generated on the
@@ -95,10 +104,18 @@ or from your nano contact while the portal delivery is rolling out.
    with it (zone, rack or hypervisor host). Spot or preemptible VMs: say so.
    If they are to be created: the cloud and region (AWS, Azure or GCP; three
    availability zones are needed).
-2. How users and log senders reach nano: a managed cloud load balancer, two
-   HAProxy hosts with a floating address (needs VRRP and one L2 network), or
-   one HAProxy host (a single point of failure at the edge, for example when
-   there is no managed LB and no VRRP). The LB hosts' private addresses.
+2. How users and log senders reach nano (High availability guide, "Load
+   balancer options"):
+   - a managed cloud load balancer (recommended on any cloud);
+   - two HAProxy hosts with keepalived and a floating address (needs VRRP and
+     one L2 network; most public clouds block VRRP);
+   - two HAProxy hosts, both addresses in DNS with the DNS provider's
+     health-checked failover (no floating address; failover takes the TTL plus
+     the check interval, roughly 1-2 minutes; senders must retry and re-resolve
+     DNS);
+   - one HAProxy host: a single point of failure at the edge.
+   The LB hosts' private addresses. A small spare VM (2 vCPU / 2 GB) per
+   HAProxy host keeps it off the PostgreSQL hosts.
 3. Average event size, if known (EDR JSON is often ~2.3 KB; the default is
    1 KB). Ask which sources dominate the volume.
 4. Retention split: how many days must be fast to search (hot, on local
@@ -128,7 +145,7 @@ paths to them:
 ```markdown
 # nano Self-run intake: <deployment name>
 - topology: single | ha3 | helm | n-vm (existing hosts.txt | aws | azure | gcp; region, max VMs, budget, LB)
-- version: 2.0.x   bundle: <path or url>   sha256: <hex>
+- version: 2.0.x   bundle: <path to the 3 files, or link file>   sha256: <hex>   signature: verified | not yet
 - volume: <eps> EPS, <gb> GB/day, retention <days> d, 12-month growth <x>
 - hosts:
   | name | address | ssh | roles |

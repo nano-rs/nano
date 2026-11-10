@@ -63,8 +63,13 @@ a stored credential. A health check alone is not enough.
 ## Upgrade
 
 1. Read the release notes and [known-issues.md](known-issues.md). Get the
-   signed release tar `nano-<version>-enterprise.tar` (the upgrade artifact)
-   and verify its digest. Do not unpack or repack it.
+   signed release tar `nano-<version>-enterprise.tar` (the upgrade artifact):
+   an owner or admin downloads it from the deployment's page in app.nano.rs,
+   under **Advanced: firewall, proxy and air-gapped installs** (the link lasts
+   15 minutes). Verify its digest. Do not unpack or repack it. This is the one
+   upgrade procedure for Compose installs, single node and role split alike,
+   as in the public Upgrade guide; do not upgrade by re-running `install.sh`
+   from a new bundle.
 2. Make sure the backup key exists.
 3. **Dry run** (read-only), single node:
 

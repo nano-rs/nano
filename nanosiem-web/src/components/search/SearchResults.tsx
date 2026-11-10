@@ -122,6 +122,7 @@ import { nplQuotedBody, nplRegexBody } from '@/lib/npl-quote';
 // previously carried a quote-only copy that split inside `field=/re|gex/`.
 import { getBaseSearch, buildGroupByQuery } from '@/lib/npl-pipeline';
 import { csvCell } from '@/lib/csv-safe';
+import { grantSearchAutoRun } from '@/lib/search-auto-run';
 
 function formatCacheAge(timestamp: number): string {
   const seconds = Math.floor((Date.now() - timestamp) / 1000);
@@ -789,9 +790,10 @@ export function FieldValueMenu({
               // Filter on the canonical identifier field, not the clicked OCSF
               // field, so `| asset` can resolve the identifier (NAN-1452).
               const assetField = ENTITY_TYPE_TO_ASSET_FIELD[entityType ?? ''] ?? fieldName;
+              const assetQuery = `${assetField}="${escapeValue(stringValue)}" | asset field=${assetField}`;
               const params = new URLSearchParams({
-                q: `${assetField}="${escapeValue(stringValue)}" | asset field=${assetField}`,
-                run: 'true',
+                q: assetQuery,
+                run: grantSearchAutoRun(assetQuery),
               });
               // Center the (≤6h) asset window on the clicked event so it isn't
               // empty when drilling from older events; fall back to a recent

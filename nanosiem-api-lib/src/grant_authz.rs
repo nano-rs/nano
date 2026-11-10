@@ -185,6 +185,22 @@ impl GrantErr {
         }
     }
 
+    /// NAN-5238: the action needs administrator authority — every permission in
+    /// the catalog — and the caller does not hold all of it. The message names
+    /// the action (`reason`) and how many permissions are missing, not which:
+    /// the list is the whole catalog minus the caller's set and says nothing
+    /// actionable.
+    fn admin_required(reason: &str, missing: usize) -> Self {
+        GrantErr {
+            status: StatusCode::FORBIDDEN,
+            code: "admin_authority_required",
+            message: format!(
+                "{reason} requires administrator authority \
+                 (you are missing {missing} permission(s) an administrator holds)."
+            ),
+        }
+    }
+
     /// Reject a grant that references a role that does not exist (400) rather
     /// than treating its absent permissions as a harmless empty set. Without
     /// this, a nonexistent role id passes the subset check and then partially
@@ -798,6 +814,63 @@ pub async fn ensure_can_grant_permissions(
     snapshot.commit().await
 }
 
+/// NAN-5238: administrator authority, defined structurally.
+///
+/// The caller must currently hold `required_permission` AND every permission in
+/// the `permissions` catalog — the full set the built-in Admin role is seeded
+/// with (migration 033 and every later permission migration grant each new
+/// permission to Admin). No role name is consulted, so a custom role that
+/// carries the whole catalog qualifies and a role merely *named* Admin does not.
+///
+/// The check runs on the same repeatable-read [`authority_snapshot`] as every
+/// other grant check, so for an API key the held set is its frozen permission
+/// array clamped to what its owner holds now, and the returned
+/// [`GrantAuthorityStamp`] must be locked and re-verified by the writer in the
+/// mutating transaction (a caller demoted after this check is refused there).
+///
+/// `reason` is the action being refused, phrased as a sentence subject, e.g.
+/// `"Changing SSO trust settings"`.
+///
+/// Fails closed on an empty catalog: an unreadable or unseeded catalog must
+/// never make the check vacuous.
+pub async fn ensure_admin_authority(
+    auth: &AuthContext,
+    pool: &PgPool,
+    required_permission: &str,
+    reason: &str,
+) -> Result<GrantAuthorityStamp, GrantErr> {
+    let mut snapshot = authority_snapshot(pool, auth).await?;
+    ensure_holds_current(
+        &snapshot.permissions,
+        &BTreeSet::from([required_permission.to_string()]),
+    )?;
+    let catalog: Vec<String> = sqlx::query_scalar("SELECT id::text FROM permissions")
+        .fetch_all(&mut *snapshot.tx)
+        .await
+        .map_err(GrantErr::repo)?;
+    let catalog: BTreeSet<String> = catalog.into_iter().collect();
+    ensure_holds_admin_catalog(&snapshot.permissions, &catalog, reason)?;
+    snapshot.commit().await
+}
+
+/// Pure half of [`ensure_admin_authority`]: `held` must cover a non-empty
+/// `catalog`.
+fn ensure_holds_admin_catalog(
+    held: &BTreeSet<String>,
+    catalog: &BTreeSet<String>,
+    reason: &str,
+) -> Result<(), GrantErr> {
+    if catalog.is_empty() {
+        return Err(GrantErr::admin_required(reason, 0));
+    }
+    let missing = catalog.difference(held).count();
+    if missing == 0 {
+        Ok(())
+    } else {
+        Err(GrantErr::admin_required(reason, missing))
+    }
+}
+
 /// Authoritatively validate a source-scope mutation against current PostgreSQL
 /// state, bypassing the short-lived resolver cache used for ordinary reads.
 pub async fn ensure_can_mutate_source(
@@ -972,6 +1045,37 @@ mod tests {
         );
         // Order is preserved and nothing but Everyone is removed.
         assert_eq!(strip_implicit_everyone(&[other]), vec![other]);
+    }
+
+    /// NAN-5238: administrator authority is the whole catalog, fail-closed.
+    #[test]
+    fn admin_authority_needs_the_whole_catalog() {
+        let catalog = set(&["settings:system", "users:edit", "roles:edit"]);
+        assert!(ensure_holds_admin_catalog(&catalog, &catalog, "X").is_ok());
+        // A superset (e.g. a stale permission no longer in the catalog) is fine.
+        let mut more = catalog.clone();
+        more.insert("legacy:perm".into());
+        assert!(ensure_holds_admin_catalog(&more, &catalog, "X").is_ok());
+
+        let err = ensure_holds_admin_catalog(
+            &set(&["settings:system"]),
+            &catalog,
+            "Changing SSO trust settings",
+        )
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.code, "admin_authority_required");
+        assert!(err
+            .message
+            .starts_with("Changing SSO trust settings requires administrator authority"));
+        assert!(err.message.contains("missing 2 permission"));
+    }
+
+    #[test]
+    fn admin_authority_fails_closed_on_an_empty_catalog() {
+        let err = ensure_holds_admin_catalog(&set(&["settings:system"]), &set(&[]), "X")
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
 
     #[test]

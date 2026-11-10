@@ -169,8 +169,17 @@ pub struct NewLookupTable {
     pub primary_key: Option<String>,
 }
 
+/// Longest prefix of a generated physical name kept before a uniqueness
+/// suffix, in bytes. `48 + "_" + 12 hex` (create) and `48 + "_stg_" + 8 hex`
+/// (replace staging) both stay under PostgreSQL's 63-byte identifier limit.
+pub(crate) const PHYSICAL_NAME_BASE_MAX_BYTES: usize = 48;
+
 impl NewLookupTable {
-    /// Generate the actual PostgreSQL table name
+    /// Sanitized `lookup_<name>` form of the logical name.
+    ///
+    /// NOT unique: sanitization folds case and punctuation, so `Foo-Bar` and
+    /// `foo_bar` share it. Never use it as a physical table name for a new
+    /// generation — use [`Self::generate_unique_table_name`] (NAN-5230).
     pub fn generate_table_name(&self) -> String {
         // Sanitize the name and prefix with lookup_
         let sanitized = self
@@ -186,6 +195,34 @@ impl NewLookupTable {
             })
             .collect::<String>();
         format!("lookup_{}", sanitized)
+    }
+
+    /// [`Self::generate_table_name`] bounded to
+    /// [`PHYSICAL_NAME_BASE_MAX_BYTES`] on a char boundary, ready for a suffix.
+    pub(crate) fn physical_name_base(&self) -> String {
+        let mut base = String::new();
+        for c in self.generate_table_name().chars() {
+            if base.len() + c.len_utf8() > PHYSICAL_NAME_BASE_MAX_BYTES {
+                break;
+            }
+            base.push(c);
+        }
+        base
+    }
+
+    /// A fresh physical table name for a NEW lookup (NAN-5230).
+    ///
+    /// Two logical names can sanitize to the same `lookup_<name>`; a create
+    /// that reused that name would write into — and on failure clean up —
+    /// another lookup's table. The random suffix gives every create its own
+    /// generation. Readers resolve the physical name through the registry,
+    /// so existing lookups keep the names they already have.
+    pub fn generate_unique_table_name(&self) -> String {
+        format!(
+            "{}_{}",
+            self.physical_name_base(),
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        )
     }
 }
 

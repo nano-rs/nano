@@ -133,7 +133,8 @@ pub async fn run(request: &PipePreviewRequest) -> Result<PipePreviewResponse, St
         .extension_vrl
         .as_deref()
         .filter(|ext| !ext.trim().is_empty());
-    let validator = crate::parsers::VrlValidator::new();
+    // Already inside the preview worker process: execute here (NAN-5234).
+    let validator = crate::parsers::VrlValidator::new().inside_worker();
     let mut warnings = vec![
         "Preview simulates the pipeline in isolation: platform normalization, sink encoding, \
          sampling and live Vector state are not modelled. Implicit timezones use UTC."

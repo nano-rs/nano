@@ -125,7 +125,7 @@ encryption on, versioning on:
 
 - `<name>-cold`: ClickHouse cold tier. Configure it after install in
   **Settings → Storage & Retention** (endpoint `https://s3.<region>.amazonaws.com`).
-  Today moves are free-space driven; TTL-driven moves are NAN-5183.
+  Today moves are free-space driven; TTL-driven moves are planned.
 - `<name>-backup`: `scripts/nano backup` / the automatic backup service
   (`NANO_BACKUP_DESTINATION=s3`). Backups hold metadata by default, not event
   data. Add a lifecycle rule for old noncurrent versions.

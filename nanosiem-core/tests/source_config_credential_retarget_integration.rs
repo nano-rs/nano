@@ -102,7 +102,7 @@ async fn editor_cannot_move_bound_credential_to_another_broker() {
     let service = SourceConfigService::new(pool.clone());
 
     let err = service
-        .update(config_id, retarget("broker.elsewhere.example:9093"), editor())
+        .update(config_id, retarget("broker.elsewhere.example:9093"), editor(), true)
         .await
         .expect_err("an Editor must not repoint a bound credential");
     assert!(
@@ -115,7 +115,7 @@ async fn editor_cannot_move_bound_credential_to_another_broker() {
     let mut rebind = retarget("broker.elsewhere.example:9093");
     rebind.credential_id = Some(credential_id);
     let err = service
-        .update(config_id, rebind, editor())
+        .update(config_id, rebind, editor(), true)
         .await
         .expect_err("echoing the bound credential id does not authorize a move");
     assert!(matches!(err, SourceConfigServiceError::CredentialRetargetRequired));
@@ -132,7 +132,7 @@ async fn credential_editor_can_move_bound_credential() {
     let service = SourceConfigService::new(pool.clone());
 
     let updated = service
-        .update(config_id, retarget("kafka-new.corp.example:9093"), admin())
+        .update(config_id, retarget("kafka-new.corp.example:9093"), admin(), true)
         .await
         .expect("credentials:edit holder may move the source");
     assert_eq!(
@@ -161,6 +161,7 @@ async fn editor_non_host_edits_still_work() {
                 ..Default::default()
             },
             editor(),
+            true,
         )
         .await
         .expect("non-connection edit by an Editor");
@@ -178,6 +179,7 @@ async fn editor_non_host_edits_still_work() {
                 ..Default::default()
             },
             editor(),
+            true,
         )
         .await
         .expect("same-host connection edit by an Editor");
@@ -268,6 +270,7 @@ async fn editor_cannot_bind_a_credential_to_an_existing_config() {
                 ..Default::default()
             },
             editor(),
+            true,
         )
         .await
         .expect_err("binding a credential needs credentials:edit");
@@ -288,6 +291,7 @@ async fn editor_cannot_bind_a_credential_to_an_existing_config() {
                 ..Default::default()
             },
             admin(),
+            true,
         )
         .await
         .expect("credentials:edit holder may bind");

@@ -194,6 +194,11 @@ pub enum SourceConfigServiceError {
     /// different connection host, which requires credential-owner permission.
     #[error("Missing permission: credentials:edit")]
     CredentialRetargetRequired,
+    /// NAN-5232: the publication reconciler renders every deployed source
+    /// from its saved row, so a saved render-affecting change to a deployed
+    /// source (or its routing rules) is a deploy and needs `source_configs:deploy`.
+    #[error("Missing permission: source_configs:deploy")]
+    DeployPermissionRequired,
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
     #[error("Credentials backend error: {0}")]
@@ -560,11 +565,17 @@ impl SourceConfigService {
     }
 
     /// Update a source configuration
+    ///
+    /// `deploy_authorized` is whether the caller holds `source_configs:deploy`.
+    /// Without it, a change that alters the rendered Vector config of a
+    /// DEPLOYED source is refused with `DeployPermissionRequired` (NAN-5232):
+    /// the publication reconciler would otherwise put it live without a deploy.
     pub async fn update(
         &self,
         id: Uuid,
         mut request: UpdateSourceConfiguration,
         credential_use: CredentialUseGrant,
+        deploy_authorized: bool,
     ) -> Result<SourceConfiguration, SourceConfigServiceError> {
         // A caller that explicitly supplies a credential reference must be
         // denied before any resource or credential lookup.
@@ -620,6 +631,15 @@ impl SourceConfigService {
             Self::validate_connection_config(&effective_type, &merged)?;
 
             request.connection_config = Some(merged);
+        }
+
+        // NAN-5232: compared against the merged (real-secret) payload, so a
+        // read-modify-write that echoes redacted values back is not a change.
+        if existing.deployed
+            && !deploy_authorized
+            && Self::update_changes_rendered_config(&existing, &request)
+        {
+            return Err(SourceConfigServiceError::DeployPermissionRequired);
         }
 
         // NAN-5147: a bound stored credential is presented to whatever host the
@@ -770,6 +790,60 @@ impl SourceConfigService {
         }
 
         Ok(updated.redacted())
+    }
+
+    /// Whether `request` changes an input of the rendered Vector config of
+    /// `existing` (NAN-5232).
+    ///
+    /// These are exactly the fields `render_pull_source` /
+    /// `render_system_source_config` and the on-disk path read: the name (TOML
+    /// header, component names, file stem), driver, connection payload, bound
+    /// credential and fallback `source_type`. `description` and `enabled` are
+    /// not rendered (`deployed`, not `enabled`, decides publication), so they
+    /// stay edit-only. A field equal to the stored value is not a change, so
+    /// the UI's whole-object PUT of an unrelated edit passes.
+    ///
+    /// A field list rather than a render diff: rendering a pull source
+    /// materializes its live credential files, which an unauthorized
+    /// candidate must not do.
+    pub(crate) fn update_changes_rendered_config(
+        existing: &SourceConfiguration,
+        request: &UpdateSourceConfiguration,
+    ) -> bool {
+        fn non_empty(value: Option<&str>) -> Option<&str> {
+            value.filter(|v| !v.is_empty())
+        }
+        request.name.as_ref().is_some_and(|v| *v != existing.name)
+            || request
+                .config_type
+                .as_ref()
+                .is_some_and(|v| *v != existing.config_type)
+            || request
+                .connection_config
+                .as_ref()
+                .is_some_and(|v| *v != existing.connection_config)
+            || request
+                .credential_id
+                .is_some_and(|v| Some(v) != existing.credential_id)
+            || request.default_source_type.as_ref().is_some_and(|v| {
+                non_empty(Some(v.as_str())) != non_empty(existing.default_source_type.as_deref())
+            })
+    }
+
+    /// Routing rules are rendered into a source's routing transform, so a
+    /// rule change on a DEPLOYED source is a deploy (NAN-5232).
+    async fn ensure_rule_change_allowed(
+        &self,
+        source_configuration_id: Uuid,
+        deploy_authorized: bool,
+    ) -> Result<(), SourceConfigServiceError> {
+        if deploy_authorized {
+            return Ok(());
+        }
+        if self.repository.get(source_configuration_id).await?.deployed {
+            return Err(SourceConfigServiceError::DeployPermissionRequired);
+        }
+        Ok(())
     }
 
     /// Reject control chars / newlines in a source-config name. The name lands
@@ -1060,14 +1134,21 @@ impl SourceConfigService {
     }
 
     /// Create a routing rule
+    ///
+    /// `deploy_authorized`: see [`Self::update`] — a rule on a deployed source
+    /// needs `source_configs:deploy` (NAN-5232).
     pub async fn create_rule(
         &self,
         source_configuration_id: Uuid,
         mut request: NewRoutingRule,
+        deploy_authorized: bool,
     ) -> Result<RoutingRule, SourceConfigServiceError> {
         // Reject an unknown match type before the parent lookup.
         Self::validate_match_type(&request.match_type)?;
         let parent = self.repository.get(source_configuration_id).await?;
+        if parent.deployed && !deploy_authorized {
+            return Err(SourceConfigServiceError::DeployPermissionRequired);
+        }
         Self::validate_new_routing_rule(&parent.config_type, &mut request)?;
 
         Ok(self
@@ -1127,7 +1208,13 @@ impl SourceConfigService {
         &self,
         rule_id: Uuid,
         mut request: UpdateRoutingRule,
+        deploy_authorized: bool,
     ) -> Result<RoutingRule, SourceConfigServiceError> {
+        if !deploy_authorized {
+            let rule = self.repository.get_rule(rule_id).await?;
+            self.ensure_rule_change_allowed(rule.source_configuration_id, false)
+                .await?;
+        }
         // Validate match type if provided
         if let Some(ref match_type) = request.match_type {
             if super::types::MatchType::from_str(match_type).is_none() {
@@ -1427,7 +1514,16 @@ impl SourceConfigService {
     }
 
     /// Delete a routing rule
-    pub async fn delete_rule(&self, rule_id: Uuid) -> Result<(), SourceConfigServiceError> {
+    pub async fn delete_rule(
+        &self,
+        rule_id: Uuid,
+        deploy_authorized: bool,
+    ) -> Result<(), SourceConfigServiceError> {
+        if !deploy_authorized {
+            let rule = self.repository.get_rule(rule_id).await?;
+            self.ensure_rule_change_allowed(rule.source_configuration_id, false)
+                .await?;
+        }
         Ok(self.repository.delete_rule(rule_id).await?)
     }
 
@@ -1436,7 +1532,10 @@ impl SourceConfigService {
         &self,
         source_configuration_id: Uuid,
         rule_order: Vec<Uuid>,
+        deploy_authorized: bool,
     ) -> Result<Vec<RoutingRule>, SourceConfigServiceError> {
+        self.ensure_rule_change_allowed(source_configuration_id, deploy_authorized)
+            .await?;
         Ok(self
             .repository
             .reorder_rules(source_configuration_id, rule_order)

@@ -375,3 +375,27 @@ async fn an_event_too_large_to_send_fails_the_page_without_skipping_it() {
     assert!(hec.events.lock().unwrap().is_empty(), "nothing of the page was sent around the oversized record");
     assert!(never_advanced(&store.commits()));
 }
+
+/// NAN-5217: while nano's ingestion pause is on, the runner claims nothing,
+/// so the vendor is never read and no cursor moves; after resume the same
+/// feed runs from where it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_ingestion_pause_stops_pulling_until_resumed() {
+    let (_vendor, hec, store, runner, _seq, feed) = setup().await;
+    store.set_ingestion_paused(true);
+    let tick = runner.tick().await.unwrap();
+    assert!(tick.ingestion_paused);
+    assert_eq!(tick.claimed, 0);
+    assert!(runner.drain().await.is_empty(), "no run started");
+    assert!(hec.events.lock().unwrap().is_empty());
+    assert!(store.commits().is_empty(), "no cursor written while paused");
+    assert!(store.checkpoint(feed.feed_id, "system_log").is_none());
+
+    store.set_ingestion_paused(false);
+    let tick = runner.tick().await.unwrap();
+    assert!(!tick.ingestion_paused);
+    assert_eq!(tick.claimed, 1);
+    let rec = runner.drain().await.remove(0);
+    assert_eq!(rec.status, RunStatus::Success, "{:?}", rec.error);
+    assert_eq!(hec.events.lock().unwrap().len(), 3, "every event delivered once after resume");
+}

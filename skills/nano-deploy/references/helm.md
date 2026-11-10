@@ -118,7 +118,12 @@ curl -fsS https://APP_FQDN/api/health
 
 The first admin is created on the one-time setup page in the UI. Ask the
 operator to do it, or use `POST /api/setup/initialize` with a password file
-they provide. Then run the smoke test from a machine that can reach both
+they provide. Both need the setup token, key `setup_token` in the chart's
+secret (`nano-secrets`, or your `existingSecret`). The operator reads it on
+their machine (do not print it yourself):
+`kubectl -n nano get secret nano-secrets -o jsonpath='{.data.setup_token}' | base64 -d`.
+The API call sends it as `Authorization: Bearer <token>`, read from a file.
+Once the admin exists the token is no longer needed. Then run the smoke test from a machine that can reach both
 hostnames, with the admin credential file there:
 
 ```bash

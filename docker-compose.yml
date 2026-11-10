@@ -143,6 +143,8 @@ services:
       CLICKHOUSE_SELF_USER: nanosiem
       # Authentication
       JWT_SECRET: ${JWT_SECRET:-}
+      # NAN-5237: first-admin setup bearer (scripts/dev-env.sh generates it).
+      NANO_SETUP_TOKEN: ${NANO_SETUP_TOKEN:-}
       # NAN-2042: shared service credential for private routes (/metrics).
       # Dev default only; Prometheus below presents the same value.
       NANO_SERVICE_TOKEN: ${NANO_SERVICE_TOKEN:-nanosiem-dev-service-token}
@@ -453,7 +455,7 @@ services:
     #            the token. Silent.
     # So never drop the flag, and after any Vector bump confirm env-driven values
     # resolve at runtime (send HEC with the real token and with the literal).
-    image: ghcr.io/nano-rs/vector:0.61.0-nano.7-debian@sha256:119dc25de7b6840285ac80d5c027ea7308513a334d0a0713b3352b5b30328c9c
+    image: ghcr.io/nano-rs/vector:0.61.0-nano.8-debian@sha256:da4473df93316e11ede7417f521c734c42defe11134cfe591bf815a54b19355f
     container_name: nanosiem-vector
     network_mode: "service:vector-netns"
     security_opt:

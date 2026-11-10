@@ -2184,6 +2184,14 @@ class ApiClient {
     return this._storage.getStorageOverview();
   }
 
+  async pauseIngestion(reason?: string): Promise<import('./types').IngestionPauseStatus> {
+    return this._storage.pauseIngestion(reason);
+  }
+
+  async resumeIngestion(): Promise<import('./types').IngestionPauseStatus> {
+    return this._storage.resumeIngestion();
+  }
+
   // Risk
   async getRiskConfig(): Promise<import('./types').RiskConfig> {
     return this._risk.getRiskConfig();

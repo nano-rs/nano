@@ -62,6 +62,52 @@ pub fn revocation_fail_closed_from_env() -> bool {
         .unwrap_or(false)
 }
 
+/// NAN-5243: how long a durable revocation keeps retrying SETEX + WAIT
+/// (covers a Sentinel failover and the router moving to the new master).
+const REVOCATION_DURABLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// NAN-5243: PostgreSQL (`revoked_tokens`) is the durable record of logouts.
+/// Every API/search process re-reads it into its local denylist on this
+/// interval, so a revocation the shared Valkey lost (resync, restart) is
+/// enforced again within one interval everywhere.
+pub const REVOCATION_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Periodically merge PostgreSQL's unexpired revocations into `map`.
+pub fn spawn_revocation_sync(pool: sqlx::PgPool, map: Arc<DashMap<Uuid, i64>>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(REVOCATION_SYNC_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut failures: u64 = 0;
+        loop {
+            interval.tick().await;
+            match merge_revoked_tokens(&pool, &map).await {
+                Ok(_) if failures > 0 => {
+                    tracing::info!(failures, "revoked-token sync from PostgreSQL recovered");
+                    failures = 0;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // First failure, then about once a minute while it lasts.
+                    if failures % 12 == 0 {
+                        tracing::warn!(%error, failures = failures + 1, "revoked-token sync from PostgreSQL failed; retrying");
+                    }
+                    failures += 1;
+                }
+            }
+        }
+    })
+}
+
+/// `connected_slaves` of the Valkey this connection reaches (None: unknown).
+async fn connected_replicas(conn: &mut redis::aio::ConnectionManager) -> Option<i64> {
+    let info: String = bounded(redis::cmd("INFO").arg("replication").query_async(conn))
+        .await
+        .ok()?;
+    info.lines()
+        .find_map(|line| line.trim().strip_prefix("connected_slaves:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
 /// Bound on the replica acknowledgement round trip itself.
 const REVOCATION_WAIT_BOUND: std::time::Duration = std::time::Duration::from_millis(1_000);
 
@@ -304,6 +350,8 @@ pub struct TokenService {
     /// status cannot be read. Off unless the HA render sets
     /// `NANO_AUTH_REVOCATION_FAIL_CLOSED=true`.
     revocation_fail_closed: std::sync::atomic::AtomicBool,
+    /// `NANO_VALKEY_WAIT_REPLICAS` (0 = single Valkey, no replica wait).
+    wait_replicas: std::sync::atomic::AtomicI64,
 }
 
 impl TokenService {
@@ -319,6 +367,7 @@ impl TokenService {
             revoked_jtis: Arc::new(DashMap::new()),
             redis: Arc::new(OnceLock::new()),
             revocation_fail_closed: std::sync::atomic::AtomicBool::new(revocation_fail_closed_from_env()),
+            wait_replicas: std::sync::atomic::AtomicI64::new(revocation_wait_replicas().unwrap_or(0)),
         }
     }
 
@@ -340,6 +389,12 @@ impl TokenService {
     pub fn set_revocation_fail_closed(&self, fail_closed: bool) {
         self.revocation_fail_closed
             .store(fail_closed, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Replicas a revocation must reach before it counts as durable (0 = none).
+    pub fn set_revocation_wait_replicas(&self, replicas: i64) {
+        self.wait_replicas
+            .store(replicas.max(0), std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn revocation_fail_closed(&self) -> bool {
@@ -612,57 +667,95 @@ impl TokenService {
     /// Revoke a token by its JTI. Writes to the local `DashMap` and, if
     /// Redis is configured, to the shared denylist so other pods see the
     /// revocation immediately. The Redis key TTL is set to the remaining
-    /// token lifetime so entries are auto-pruned.
+    /// token lifetime so entries are auto-pruned. Best effort; callers that
+    /// must not claim success on a lost revocation use
+    /// [`TokenService::revoke_token_durable`].
     pub async fn revoke_token(&self, jti: Uuid, exp: i64) {
+        if let Err(error) = self.revoke_token_durable(jti, exp).await {
+            tracing::warn!(jti = %jti, %error, "revocation not confirmed on the shared denylist");
+        }
+    }
+
+    /// NAN-5243: revoke and, with replicated Valkey (`NANO_VALKEY_WAIT_REPLICAS`),
+    /// report whether a replica holds the revocation.
+    ///
+    /// A write the router sent to an isolated old master is acknowledged by
+    /// no replica of the elected master, and is discarded when Sentinel
+    /// resyncs that node. So each attempt is SETEX + bounded WAIT, retried
+    /// for up to [`REVOCATION_DURABLE_BUDGET`] (long enough for the router to
+    /// move to the new master) while the master has a replica attached. With
+    /// no replica attached (one of two members down) there is nothing to wait
+    /// for: it returns at once. In fail-closed (HA) mode an unconfirmed
+    /// revocation is [`TokenError::RevocationUnavailable`]; the logout path
+    /// only logs it, because the revocation is durable in PostgreSQL, which
+    /// every API/search process re-reads ([`spawn_revocation_sync`]), and the
+    /// local `DashMap` always records it.
+    pub async fn revoke_token_durable(&self, jti: Uuid, exp: i64) -> Result<(), TokenError> {
         self.revoked_jtis.insert(jti, exp);
         self.prune_expired_revocations();
 
-        if let Some(redis) = self.redis.get() {
-            let now = Utc::now().timestamp();
-            let ttl_secs = (exp - now).max(1) as u64;
-            let key = format!("{}{}", REDIS_REVOKED_JTI_PREFIX, jti);
+        let Some(redis) = self.redis.get() else {
+            return if self.revocation_fail_closed() {
+                Err(TokenError::RevocationUnavailable)
+            } else {
+                Ok(())
+            };
+        };
+        let now = Utc::now().timestamp();
+        let ttl_secs = (exp - now).max(1) as u64;
+        let key = format!("{}{}", REDIS_REVOKED_JTI_PREFIX, jti);
+        let replicas = Some(self.wait_replicas.load(std::sync::atomic::Ordering::SeqCst)).filter(|count| *count > 0);
+        let deadline = tokio::time::Instant::now() + REVOCATION_DURABLE_BUDGET;
+        let mut last_error: String;
+        loop {
             // ConnectionManager is a cheap, multiplexed clone: never hold the
             // Mutex across retries or the WAIT (it would queue every request).
             let mut conn = redis.lock().await.clone();
-            let mut result: redis::RedisResult<()> = bounded(conn.set_ex(&key, 1u8, ttl_secs)).await;
-            for _ in 1..REDIS_ATTEMPTS {
-                if result.is_ok() {
-                    break;
-                }
-                tokio::time::sleep(REDIS_RETRY_DELAY).await;
-                result = bounded(conn.set_ex(&key, 1u8, ttl_secs)).await;
+            match bounded(conn.set_ex::<_, _, ()>(&key, 1u8, ttl_secs)).await {
+                Err(e) => last_error = e.to_string(),
+                Ok(()) => match replicas {
+                    None => return Ok(()),
+                    Some(replicas) => {
+                        let acked: redis::RedisResult<i64> = tokio::time::timeout(
+                            REVOCATION_WAIT_BOUND,
+                            redis::cmd("WAIT")
+                                .arg(replicas)
+                                .arg(REVOCATION_WAIT_TIMEOUT_MS)
+                                .query_async(&mut conn),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(redis::RedisError::from(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "Valkey WAIT timed out",
+                            )))
+                        });
+                        match acked {
+                            Ok(count) if count >= replicas => return Ok(()),
+                            Ok(count) => {
+                                last_error = format!("{count} of {replicas} replicas acknowledged");
+                                if connected_replicas(&mut conn).await == Some(0) {
+                                    // Degraded set (a member is down): no
+                                    // replica can acknowledge; don't stall.
+                                    last_error.push_str("; no replica attached");
+                                    break;
+                                }
+                            }
+                            Err(e) => last_error = e.to_string(),
+                        }
+                    }
+                },
             }
-            if let Err(e) = result {
-                // Local + PG paths still record the revocation; log and continue.
-                tracing::warn!(jti = %jti, error = %e, "failed to write revoked JTI to Redis");
-            } else if let Some(replicas) = revocation_wait_replicas() {
-                // NAN-5214: with Sentinel-managed Valkey, replication is async.
-                // Wait (bounded) until a replica holds the revocation so a
-                // master failover right after a logout cannot lose it.
-                let acked: redis::RedisResult<i64> = tokio::time::timeout(
-                    REVOCATION_WAIT_BOUND,
-                    redis::cmd("WAIT")
-                        .arg(replicas)
-                        .arg(REVOCATION_WAIT_TIMEOUT_MS)
-                        .query_async(&mut conn),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(redis::RedisError::from(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Valkey WAIT timed out",
-                    )))
-                });
-                match acked {
-                    Ok(count) if count >= replicas => {}
-                    Ok(count) => tracing::warn!(
-                        jti = %jti,
-                        acked = count,
-                        "revoked JTI not yet on a Valkey replica"
-                    ),
-                    Err(e) => tracing::warn!(jti = %jti, error = %e, "Valkey WAIT failed"),
-                }
+            if tokio::time::Instant::now() + REDIS_RETRY_DELAY >= deadline {
+                break;
             }
+            tokio::time::sleep(REDIS_RETRY_DELAY).await;
+        }
+        tracing::warn!(jti = %jti, error = %last_error, "revoked JTI not confirmed on a Valkey replica");
+        if self.revocation_fail_closed() {
+            Err(TokenError::RevocationUnavailable)
+        } else {
+            Ok(())
         }
     }
 
@@ -765,6 +858,7 @@ impl TokenService {
             revoked_jtis: denylist,
             redis: Arc::new(OnceLock::new()),
             revocation_fail_closed: std::sync::atomic::AtomicBool::new(revocation_fail_closed_from_env()),
+            wait_replicas: std::sync::atomic::AtomicI64::new(revocation_wait_replicas().unwrap_or(0)),
         }
     }
 }
@@ -777,18 +871,8 @@ pub async fn load_revoked_tokens(
     pool: &sqlx::PgPool,
     map: &DashMap<Uuid, i64>,
 ) -> Result<usize, sqlx::Error> {
+    let count = merge_revoked_tokens(pool, map).await?;
     let now = Utc::now().timestamp();
-    let rows = sqlx::query_as::<_, (Uuid, i64)>(
-        "SELECT jti, expires_at FROM revoked_tokens WHERE expires_at > $1",
-    )
-    .bind(now)
-    .fetch_all(pool)
-    .await?;
-
-    let count = rows.len();
-    for (jti, exp) in rows {
-        map.insert(jti, exp);
-    }
 
     // Clean up expired entries in PG
     let _ = sqlx::query("DELETE FROM revoked_tokens WHERE expires_at <= $1")
@@ -800,7 +884,7 @@ pub async fn load_revoked_tokens(
 }
 
 /// Persist a revoked JTI to PostgreSQL (call alongside in-memory revoke_token).
-pub async fn persist_revoked_token(pool: &sqlx::PgPool, jti: Uuid, exp: i64) {
+pub async fn persist_revoked_token(pool: &sqlx::PgPool, jti: Uuid, exp: i64) -> Result<(), sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO revoked_tokens (jti, expires_at) VALUES ($1, $2) ON CONFLICT (jti) DO NOTHING",
     )
@@ -809,9 +893,26 @@ pub async fn persist_revoked_token(pool: &sqlx::PgPool, jti: Uuid, exp: i64) {
     .execute(pool)
     .await;
 
-    if let Err(e) = result {
+    if let Err(e) = &result {
         tracing::warn!(jti = %jti, error = %e, "Failed to persist token revocation to database");
     }
+    result.map(|_| ())
+}
+
+/// Merge PostgreSQL's unexpired revocations into `map` (read-only).
+async fn merge_revoked_tokens(pool: &sqlx::PgPool, map: &DashMap<Uuid, i64>) -> Result<usize, sqlx::Error> {
+    let now = Utc::now().timestamp();
+    let rows = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT jti, expires_at FROM revoked_tokens WHERE expires_at > $1",
+    )
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
+    let count = rows.len();
+    for (jti, exp) in rows {
+        map.insert(jti, exp);
+    }
+    Ok(count)
 }
 
 /// Claims for refresh tokens (minimal)
@@ -1187,6 +1288,20 @@ mod tests {
     /// A RESP server that answers `+OK` to every command until killed, then
     /// refuses connections: Valkey reachable at connect, gone afterwards.
     async fn start_fake_valkey() -> (String, Vec<tokio::task::JoinHandle<()>>, Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>) {
+        start_fake_valkey_acking(
+            Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            Arc::new(std::sync::atomic::AtomicI64::new(1)),
+        )
+        .await
+    }
+
+    /// As [`start_fake_valkey`], answering `WAIT` with the current `acks`
+    /// (how many replicas hold the write) and `INFO` with `attached`
+    /// (`connected_slaves`) instead of `+OK`.
+    async fn start_fake_valkey_acking(
+        acks: Arc<std::sync::atomic::AtomicI64>,
+        attached: Arc<std::sync::atomic::AtomicI64>,
+    ) -> (String, Vec<tokio::task::JoinHandle<()>>, Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("redis://{}", listener.local_addr().unwrap());
@@ -1194,6 +1309,8 @@ mod tests {
         let tracked = Arc::clone(&connections);
         let acceptor = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
+                let acks = Arc::clone(&acks);
+                let attached = Arc::clone(&attached);
                 let handle = tokio::spawn(async move {
                     let mut buffer: Vec<u8> = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -1206,8 +1323,26 @@ mod tests {
                         // Count complete RESP arrays; answer each with +OK.
                         loop {
                             let Some(consumed) = complete_resp_command(&buffer) else { break };
+                            let command = &buffer[..consumed];
+                            let is = |name: &[u8]| {
+                                command.windows(name.len() + 2).any(|w| {
+                                    w[..2] == *b"\r\n" && w[2..].eq_ignore_ascii_case(name)
+                                })
+                            };
+                            let (is_wait, is_info) = (is(b"WAIT"), is(b"INFO"));
                             buffer.drain(..consumed);
-                            if socket.write_all(b"+OK\r\n").await.is_err() {
+                            let reply = if is_wait {
+                                format!(":{}\r\n", acks.load(std::sync::atomic::Ordering::SeqCst))
+                            } else if is_info {
+                                let body = format!(
+                                    "# Replication\r\nrole:master\r\nconnected_slaves:{}\r\n",
+                                    attached.load(std::sync::atomic::Ordering::SeqCst)
+                                );
+                                format!("${}\r\n{}\r\n", body.len(), body)
+                            } else {
+                                "+OK\r\n".to_string()
+                            };
+                            if socket.write_all(reply.as_bytes()).await.is_err() {
                                 return;
                             }
                         }
@@ -1311,6 +1446,99 @@ mod tests {
             service.validate_access_token_async(&token).await,
             Err(TokenError::RevocationUnavailable)
         ));
+    }
+
+    async fn durable_fixture(
+        fail_closed: bool,
+        acks: i64,
+    ) -> (TokenService, Arc<std::sync::atomic::AtomicI64>, Vec<tokio::task::JoinHandle<()>>, Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>) {
+        durable_fixture_attached(fail_closed, acks, 1).await
+    }
+
+    async fn durable_fixture_attached(
+        fail_closed: bool,
+        acks: i64,
+        attached: i64,
+    ) -> (TokenService, Arc<std::sync::atomic::AtomicI64>, Vec<tokio::task::JoinHandle<()>>, Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>) {
+        let acks = Arc::new(std::sync::atomic::AtomicI64::new(acks));
+        let (url, acceptor, connections) = start_fake_valkey_acking(
+            Arc::clone(&acks),
+            Arc::new(std::sync::atomic::AtomicI64::new(attached)),
+        )
+        .await;
+        let service = create_test_service();
+        service.set_revocation_fail_closed(fail_closed);
+        service.set_revocation_wait_replicas(1);
+        service.set_redis(redis_denylist_from_url(&url).await.expect("fake Valkey connects"));
+        (service, acks, acceptor, connections)
+    }
+
+    /// NAN-5243: a revocation no replica acknowledged (the write went to an
+    /// isolated old master) is not durable: HA logout must not report success.
+    #[tokio::test]
+    async fn durable_revocation_without_a_replica_ack_fails_in_ha() {
+        let (service, _acks, _acceptor, _connections) = durable_fixture(true, 0).await;
+        let jti = Uuid::now_v7();
+        let started = std::time::Instant::now();
+        let result = service.revoke_token_durable(jti, Utc::now().timestamp() + 60).await;
+        assert!(matches!(result, Err(TokenError::RevocationUnavailable)), "{result:?}");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(3), "gave up after {:?}", started.elapsed());
+        assert!(started.elapsed() < std::time::Duration::from_secs(7), "took {:?}", started.elapsed());
+        // This process still refuses the token at once.
+        assert!(service.is_revoked(&jti));
+    }
+
+    /// NAN-5243: retrying covers the router moving to the newly promoted
+    /// master: once a replica acknowledges, the revocation is durable.
+    #[tokio::test]
+    async fn durable_revocation_retries_until_a_replica_acknowledges() {
+        let (service, acks, _acceptor, _connections) = durable_fixture(true, 0).await;
+        let flip = Arc::clone(&acks);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+            flip.store(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let result = service.revoke_token_durable(Uuid::now_v7(), Utc::now().timestamp() + 60).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(1_200));
+    }
+
+    #[tokio::test]
+    async fn durable_revocation_acknowledged_at_once_succeeds_without_retrying() {
+        let (service, _acks, _acceptor, _connections) = durable_fixture(true, 1).await;
+        let started = std::time::Instant::now();
+        assert!(service.revoke_token_durable(Uuid::now_v7(), Utc::now().timestamp() + 60).await.is_ok());
+        assert!(started.elapsed() < std::time::Duration::from_millis(1_000), "took {:?}", started.elapsed());
+    }
+
+    /// NAN-5243 review: a two-member set with one member down has no replica
+    /// attached; WAIT can never succeed, so do not stall (logout then rests
+    /// on PostgreSQL and only logs this).
+    #[tokio::test]
+    async fn durable_revocation_with_no_replica_attached_returns_at_once() {
+        let (service, _acks, _acceptor, _connections) = durable_fixture_attached(true, 0, 0).await;
+        let jti = Uuid::now_v7();
+        let started = std::time::Instant::now();
+        let result = service.revoke_token_durable(jti, Utc::now().timestamp() + 60).await;
+        assert!(matches!(result, Err(TokenError::RevocationUnavailable)), "{result:?}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(1_000), "took {:?}", started.elapsed());
+        assert!(service.is_revoked(&jti));
+    }
+
+    /// Single-node / one-app installs (no fail-closed flag) keep best effort.
+    #[tokio::test]
+    async fn durable_revocation_without_the_ha_flag_is_best_effort() {
+        let (service, _acks, _acceptor, _connections) = durable_fixture(false, 0).await;
+        assert!(service.revoke_token_durable(Uuid::now_v7(), Utc::now().timestamp() + 60).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn durable_revocation_with_valkey_down_fails_in_ha() {
+        let (service, _acks, acceptor, connections) = durable_fixture(true, 1).await;
+        kill_fake_valkey(acceptor, connections).await;
+        let result = service.revoke_token_durable(Uuid::now_v7(), Utc::now().timestamp() + 60).await;
+        assert!(matches!(result, Err(TokenError::RevocationUnavailable)), "{result:?}");
     }
 
     /// NAN-5214 (review M2): concurrent checks with Valkey down must not

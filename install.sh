@@ -106,8 +106,13 @@ ROLE_ARG=""
 INVENTORY_ARG=""
 TOPOLOGY_MIGRATION_SHA=""
 ENV_TEMP_FILE=""
+# NAN-5237: 0600 files holding the setup-token header / initialize response.
+SETUP_HEADER_FILE=""
+SETUP_RESPONSE_FILE=""
 cleanup_env_temp() {
     [[ -z "$ENV_TEMP_FILE" ]] || rm -f -- "$ENV_TEMP_FILE"
+    [[ -z "$SETUP_HEADER_FILE" ]] || rm -f -- "$SETUP_HEADER_FILE"
+    [[ -z "$SETUP_RESPONSE_FILE" ]] || rm -f -- "$SETUP_RESPONSE_FILE"
 }
 trap cleanup_env_temp EXIT
 while [[ $# -gt 0 ]]; do
@@ -180,7 +185,23 @@ esac
 # All traffic goes through the nginx reverse proxy on port 80. The internal
 # nano-api / nano-search ports are not exposed to the host by default.
 HOST_PORT="${NANO_HOST_PORT:-80}"
-API_BASE="http://localhost:${HOST_PORT}"
+
+# The host the installer's own health/readiness probes reach the published
+# edges on. A role-split host publishes its edges on the inventory's
+# `bind_address` (NANO_CLUSTER_BIND_ADDRESS). A wildcard (0.0.0.0 / ::) or no
+# bind address listens on loopback too, so the probes keep using localhost; a
+# specific private address does not, so the probes must use that address.
+# Usage: edge_probe_host [bind-address]; prints a URL host (IPv6 bracketed).
+edge_probe_host() {
+    case "${1:-}" in
+        "" | 0.0.0.0 | "::" | "[::]" | "*") printf 'localhost' ;;
+        \[*\]) printf '%s' "$1" ;;
+        *:*) printf '[%s]' "$1" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+EDGE_PROBE_HOST=localhost
+API_BASE="http://${EDGE_PROBE_HOST}:${HOST_PORT}"
 # Extra curl flags for installer -> edge calls (see the TLS overlay below).
 API_CURL_ARGS=()
 
@@ -191,7 +212,9 @@ API_CURL_ARGS=()
 api_call() {
     local out="$1" code
     shift
-    code=$(curl -sS --max-redirs 0 -o "$out" -w '%{http_code}' \
+    # --noproxy: these calls go to this host's own edge (loopback or the
+    # private bind_address), never through an operator HTTP(S)_PROXY.
+    code=$(curl -sS --noproxy '*' --max-redirs 0 -o "$out" -w '%{http_code}' \
         ${API_CURL_ARGS[@]+"${API_CURL_ARGS[@]}"} "$@" </dev/null 2>/dev/null) || code="${code:-000}"
     printf '%s' "${code:-000}"
     [[ "$code" == 2[0-9][0-9] ]]
@@ -2085,7 +2108,8 @@ PY
     fi
     COMPOSE_ARGS=(--env-file .env --env-file .nano-role.env -f "$COMPOSE_FILE")
     HOST_PORT="$NANO_APP_PORT"
-    API_BASE="http://localhost:${HOST_PORT}"
+    EDGE_PROBE_HOST=$(edge_probe_host "${NANO_CLUSTER_BIND_ADDRESS:-}")
+    API_BASE="http://${EDGE_PROBE_HOST}:${HOST_PORT}"
 else
     COMPOSE_ARGS=(-f "$COMPOSE_FILE")
 fi
@@ -2166,10 +2190,11 @@ fi
 # Record the resolved release + image source in .env (a re-run upgrades an
 # existing install to this checkout's release) and export them, since the shell
 # environment wins over .env during compose interpolation.
-for kv in "NANO_EDITION=$NANO_EDITION" "NANO_VERSION=$NANO_VERSION" "NANO_IMAGE_PREFIX=$NANO_IMAGE_PREFIX"; do
-    # Append the effective assignment so a symlinked .env remains a link.
-    echo "$kv" >> .env
-done
+# Replace, never append: re-runs used to add a duplicate block each time, so
+# .env grew and the copies on different hosts drifted apart. The rewrite is
+# atomic and resolves a symlinked .env, which therefore stays a link.
+nano_env_set_keys .env "NANO_EDITION=$NANO_EDITION" "NANO_VERSION=$NANO_VERSION" "NANO_IMAGE_PREFIX=$NANO_IMAGE_PREFIX" \
+    || fail "Could not record NANO_EDITION/NANO_VERSION/NANO_IMAGE_PREFIX in .env."
 export NANO_VERSION NANO_IMAGE_PREFIX
 
 if [[ "${NANO_PREPARE_ONLY:-0}" == "1" ]]; then
@@ -2381,14 +2406,14 @@ if [[ "$HAS_APP" == "1" ]]; then
         ok "ClickHouse asynchronous loaders ready"
     fi
 elif [[ "$HAS_INGEST" == "1" ]]; then
-    INGEST_HEALTH_URL="http://localhost:${NANO_INGEST_PORT}/healthz"
+    INGEST_HEALTH_URL="http://${EDGE_PROBE_HOST}:${NANO_INGEST_PORT}/healthz"
     log "Waiting for the ingest edge at $INGEST_HEALTH_URL"
     deadline=$(( $(date +%s) + 120 ))
     while (( $(date +%s) < deadline )); do
-        curl -fsS -o /dev/null "$INGEST_HEALTH_URL" </dev/null && break
+        curl -fsS --noproxy '*' -o /dev/null "$INGEST_HEALTH_URL" </dev/null && break
         sleep 2
     done
-    curl -fsS -o /dev/null "$INGEST_HEALTH_URL" </dev/null \
+    curl -fsS --noproxy '*' -o /dev/null "$INGEST_HEALTH_URL" </dev/null \
         || fail "Ingest edge did not become healthy. Check 'docker compose ${COMPOSE_ARGS[*]} logs vector vector-config-consumer ingest-edge'."
     ok "Ingest edge healthy"
 else
@@ -2456,18 +2481,58 @@ else
             fi
             validate_admin_password "$ADMIN_PASSWORD"
         fi
+        # NAN-5237: nano-api accepts first-admin setup only with the setup
+        # token from .env (generated with the other secrets). It is sent from
+        # a 0600 header file, never on the curl command line.
+        SETUP_TOKEN=$(env_value NANO_SETUP_TOKEN)
+        if [[ -n "$SETUP_TOKEN" ]]; then
+            if [[ -t 1 ]]; then
+                log "Setup token (only needed to finish setup in the browser if this run is interrupted): $SETUP_TOKEN"
+            else
+                log "Setup token: NANO_SETUP_TOKEN in $NANO_INSTALL_DIR/.env (only needed to finish setup in the browser if this run is interrupted)"
+            fi
+        fi
         log "Creating admin user $ADMIN_EMAIL"
         payload=$(printf '{"email":%s,"name":%s,"password":%s}' \
             "$(json_escape "$ADMIN_EMAIL")" \
             "$(json_escape "$ADMIN_NAME")" \
             "$(json_escape "$ADMIN_PASSWORD")")
-        if ! init_code=$(api_call /dev/null -X POST \
+        # The EXIT trap removes the header file on any exit; while it exists,
+        # INT/TERM become an exit so that trap also runs on an interrupt.
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        SETUP_HEADER_FILE=$(mktemp "${TMPDIR:-/tmp}/nano-setup-header.XXXXXX")
+        SETUP_RESPONSE_FILE=$(mktemp "${TMPDIR:-/tmp}/nano-setup-response.XXXXXX")
+        [[ -z "$SETUP_TOKEN" ]] || printf 'Authorization: Bearer %s\n' "$SETUP_TOKEN" > "$SETUP_HEADER_FILE"
+        init_ok=1
+        init_code=$(api_call "$SETUP_RESPONSE_FILE" -X POST \
             -H "Content-Type: application/json" \
+            -H "@$SETUP_HEADER_FILE" \
             -d "$payload" \
-            "${API_BASE}/api/setup/initialize"); then
-            fail "Admin initialization failed (HTTP $init_code from ${API_BASE}/api/setup/initialize). Check 'docker compose ${COMPOSE_ARGS[*]} logs nano-api nginx'."
+            "${API_BASE}/api/setup/initialize") || init_ok=0
+        rm -f -- "$SETUP_HEADER_FILE"
+        SETUP_HEADER_FILE=""
+        trap - INT TERM
+        init_already_done=0
+        # Another app host can finish setup between the status check above
+        # and this call; nano-api then answers 409 already_initialized (or
+        # users_exist). That is the same outcome as the status check.
+        if [[ "$init_ok" == 0 && "$init_code" == 409 ]] \
+            && grep -Eq '"error"[[:space:]]*:[[:space:]]*"(already_initialized|users_exist)"' "$SETUP_RESPONSE_FILE"; then
+            init_already_done=1
         fi
-        ok "Admin user created"
+        rm -f -- "$SETUP_RESPONSE_FILE"
+        SETUP_RESPONSE_FILE=""
+        if [[ "$init_already_done" == 1 ]]; then
+            warn "System is already initialized — skipping admin creation."
+        elif [[ "$init_ok" == 0 ]]; then
+            case "$init_code" in
+                401|403) fail "Admin initialization was refused (HTTP $init_code): nano-api did not accept the setup token. Check that NANO_SETUP_TOKEN in $NANO_INSTALL_DIR/.env is set and that nano-api was started with this .env, then re-run." ;;
+            esac
+            fail "Admin initialization failed (HTTP $init_code from ${API_BASE}/api/setup/initialize). Check 'docker compose ${COMPOSE_ARGS[*]} logs nano-api nginx'."
+        else
+            ok "Admin user created"
+        fi
     fi
     import_offline_license
 fi

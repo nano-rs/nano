@@ -381,6 +381,16 @@ impl DetectionService {
         results: &mut [serde_json::Value],
         time_range: &TimeRangeInput,
     ) {
+        // NAN-5227: a row's `source_type` is its origin only while it is the
+        // base-search column. When a stage can write that field, the value is
+        // rule-controlled: move it aside so every reader falls back to the
+        // stamp below, and stamp every row.
+        let provenance = super::provenance::RowProvenance::for_rule_query(&rule.query);
+        if provenance.untrusted_source_type {
+            for event in results.iter_mut() {
+                super::provenance::demote_rule_source_type(event);
+            }
+        }
         let lacks_source_type = |event: &serde_json::Value| {
             event
                 .get("source_type")
@@ -486,6 +496,15 @@ impl DetectionService {
                 return;
             }
             DatasetProvenance::SourceDerived => {}
+        }
+
+        // NAN-5227: the companion scans the base search only. Rows a subsearch
+        // contributed (append / join / IN [...]) cannot be attributed by it.
+        if provenance.has_subsearch {
+            debug!(rule_id = %rule.id,
+                "NAN-5227: rule has a subsearch the source_type companion cannot attribute; failing closed with the full restricted set");
+            apply(results, &restricted_stamp());
+            return;
         }
 
         let Some(companion) = Self::source_type_companion_query(&rule.query) else {

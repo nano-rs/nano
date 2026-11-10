@@ -305,6 +305,11 @@ services:
       POSTGRES_DICT_HOST: postgres
       POSTGRES_DICT_PASSWORD: ${POSTGRES_PASSWORD}
       JWT_SECRET: ${JWT_SECRET}
+      # NAN-5237: first-admin setup (POST /api/setup/initialize) requires
+      # this bearer while the system is uninitialized. install.sh generates
+      # it into .env. Unset: setup is accepted only from loopback on the API
+      # host itself, which no request through nginx is.
+      NANO_SETUP_TOKEN: ${NANO_SETUP_TOKEN:-}
       NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY}
       CORS_ORIGINS: ${BASE_URL:-http://localhost}
       # NAN-5015: only nginx (on this private network) may vouch for a client

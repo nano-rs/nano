@@ -171,6 +171,54 @@ pub fn request_error(error: reqwest::Error) -> String {
     error.without_url().to_string()
 }
 
+/// NAN-5225: the stored API key was entered for one destination. Message for
+/// an update that moves the provider elsewhere without re-supplying it.
+pub const AI_KEY_DESTINATION_CHANGED: &str =
+    "The provider endpoint (base_url / api_base scheme, host or port) changed, so the stored \
+     API key is not carried over. Re-enter the API key for the new endpoint, or send an empty \
+     api_key to remove it.";
+
+/// Whether `new` sends requests somewhere other than `stored`. Every key in
+/// [`AI_PROVIDER_URL_KEYS`] is compared by origin; adding a URL where none was
+/// stored (vendor default endpoint → operator endpoint) or removing one (back
+/// to the vendor default) is a change. An unparseable URL never matches.
+pub fn ai_destination_changed(stored: &serde_json::Value, new: &serde_json::Value) -> bool {
+    AI_PROVIDER_URL_KEYS.iter().any(|key| {
+        match (config_url(stored, key), config_url(new, key)) {
+            (None, None) => false,
+            (Some(old), Some(new)) => !crate::scheduler::same_url_origin(&old, &new),
+            _ => true,
+        }
+    })
+}
+
+/// NAN-5225: an update that replaces `config` (`new_config` is `Some`) with a
+/// different destination while a key is stored must also carry `api_key` (a
+/// new key, or blank to remove it); otherwise the stored key would follow the
+/// new URL. Same-destination edits and providers without a key are unchanged.
+pub fn ensure_api_key_follows_destination(
+    stored_config: Option<&serde_json::Value>,
+    new_config: Option<&serde_json::Value>,
+    has_stored_key: bool,
+    api_key_supplied: bool,
+) -> Result<(), &'static str> {
+    let Some(new_config) = new_config else {
+        return Ok(());
+    };
+    if !has_stored_key || api_key_supplied {
+        return Ok(());
+    }
+    let empty = serde_json::Value::Object(Default::default());
+    if ai_destination_changed(stored_config.unwrap_or(&empty), new_config) {
+        return Err(AI_KEY_DESTINATION_CHANGED);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "ai_provider_safety_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ai_provider_destination_tests.rs"]
+mod destination_tests;

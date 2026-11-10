@@ -12,7 +12,7 @@
 //! - Critical (default 90%): Emit warning audit event; force drops even with tiering active
 //! - Emergency (default 95%): Optionally pause ingestion
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use clickhouse::Client as ClickHouseClient;
@@ -26,6 +26,7 @@ use utoipa::ToSchema;
 use crate::audit::{AuditEmitter, AuditEvent, AuditSource};
 use crate::db::dual_pool::on_cluster_clause;
 use crate::db::NotificationRepository;
+use crate::settings::ingestion_pause::{IngestionPauseService, IngestionPauseSource};
 use crate::health::{HealthIssueType, HealthRepository};
 use crate::models::notification::{NewNotification, NotificationType};
 use crate::system_health::{
@@ -461,8 +462,10 @@ pub struct DiskPressureService {
     system_health_repo: SystemHealthRepository,
     /// Configuration
     config: DiskPressureConfig,
-    /// Shared flag to pause ingestion
-    ingestion_paused: Arc<AtomicBool>,
+    /// NAN-5217: the cluster-wide ingestion pause (PostgreSQL + ClickHouse
+    /// guard). Shared with the API so the status and the admin actions see
+    /// the same state on every host.
+    ingestion_pause: Arc<IngestionPauseService>,
     /// Running counter of dropped partition-dates
     partitions_dropped: std::sync::atomic::AtomicU64,
     /// NAN-4933: the jobs lease epoch, set by `start`. Every partition drop
@@ -478,7 +481,7 @@ impl DiskPressureService {
         pg_pool: PgPool,
         audit_emitter: AuditEmitter,
         config: DiskPressureConfig,
-        ingestion_paused: Arc<AtomicBool>,
+        ingestion_pause: Arc<IngestionPauseService>,
     ) -> Self {
         let notification_repo = NotificationRepository::new(pg_pool.clone());
         let health_repo = HealthRepository::new(pg_pool.clone());
@@ -491,11 +494,17 @@ impl DiskPressureService {
             health_repo,
             system_health_repo,
             config,
-            ingestion_paused,
+            ingestion_pause,
             partitions_dropped: std::sync::atomic::AtomicU64::new(0),
             fence: std::sync::OnceLock::new(),
             database: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Whether the emergency level pauses ingestion
+    /// (`DISK_PRESSURE_PAUSE_INGESTION`).
+    pub fn auto_pause_enabled(&self) -> bool {
+        self.config.pause_ingestion
     }
 
     // -- Warm TTL management ------------------------------------------------
@@ -720,7 +729,14 @@ impl DiskPressureService {
             level,
             estimated_retention_days,
             partitions_dropped: self.partitions_dropped.load(Ordering::Relaxed),
-            ingestion_paused: self.ingestion_paused.load(Ordering::Relaxed),
+            // NAN-5217: PostgreSQL, not this process's memory: only the jobs
+            // leader decides a pause, and every app host must report it.
+            ingestion_paused: self
+                .ingestion_pause
+                .state()
+                .await
+                .map(|s| s.paused)
+                .unwrap_or(false),
             high_watermark: self.config.high_watermark,
             low_watermark: self.config.low_watermark,
             critical_threshold: self.config.critical_threshold,
@@ -848,8 +864,20 @@ impl DiskPressureService {
 
     // -- Main check cycle --------------------------------------------------
 
-    /// Run one check cycle: read disk usage → classify → take action.
+    /// Run one check cycle: the disk check, then (always, even when the disk
+    /// read failed) reconcile the ingestion-pause ClickHouse guard with the
+    /// PostgreSQL flag, so a stale guard heals without a working disk read.
     async fn run_check_cycle(&self) {
+        self.check_disk_pressure().await;
+        // NAN-5217: converge the ClickHouse guard with the PostgreSQL flag
+        // (a failed DDL, a restarted node, a pause set on another host).
+        if let Err(error) = self.ingestion_pause.reconcile().await {
+            warn!(%error, "ingestion pause reconcile failed");
+        }
+    }
+
+    /// Read disk usage → classify → take action.
+    async fn check_disk_pressure(&self) {
         let (total, free) = match self.get_disk_usage().await {
             Ok(v) => v,
             Err(e) => {
@@ -877,11 +905,7 @@ impl DiskPressureService {
                 self.track_pressure_issue(usage, "emergency").await;
 
                 if self.config.pause_ingestion {
-                    let was_paused = self.ingestion_paused.swap(true, Ordering::SeqCst);
-                    if !was_paused {
-                        warn!("Ingestion PAUSED due to emergency disk pressure");
-                        self.set_ingestion_paused_db(true).await;
-                    }
+                    self.auto_pause(usage).await;
                 }
 
                 // Still try to relieve pressure
@@ -925,12 +949,9 @@ impl DiskPressureService {
                     warn!(%error, "Failed to resolve disk-pressure system health event");
                 }
 
-                // Un-pause ingestion if it was paused and we're back to normal
-                let was_paused = self.ingestion_paused.swap(false, Ordering::SeqCst);
-                if was_paused {
-                    info!("Ingestion RESUMED — disk pressure back to normal");
-                    self.set_ingestion_paused_db(false).await;
-                }
+                // Lift an automatic pause now that we're back to normal (a
+                // manual pause stays until an administrator lifts it).
+                self.auto_resume(usage, "disk pressure back to normal").await;
             }
         }
     }
@@ -989,9 +1010,9 @@ impl DiskPressureService {
         match outcome {
             DropLoopOutcome::Relieved => {
                 info!("Disk usage below low watermark — stopping drops");
-                // Un-pause ingestion now that we have headroom
-                self.ingestion_paused.store(false, Ordering::SeqCst);
-                self.set_ingestion_paused_db(false).await;
+                // Lift an automatic pause now that we have headroom.
+                self.auto_resume(current_usage, "disk usage below the low watermark")
+                    .await;
             }
             DropLoopOutcome::MaxDrops => warn!(
                 "Reached max drops per cycle ({}) — will continue next cycle",
@@ -1004,17 +1025,57 @@ impl DiskPressureService {
         }
     }
 
-    // -- PostgreSQL persistence (multi-node visibility) --------------------
+    // -- Ingestion pause (NAN-5217) ----------------------------------------
 
-    /// Persist ingestion_paused flag to PostgreSQL so all nodes see the same state.
-    async fn set_ingestion_paused_db(&self, paused: bool) {
-        if let Err(e) =
-            sqlx::query("UPDATE system_settings SET ingestion_paused = $1 WHERE id = 'default'")
-                .bind(paused)
-                .execute(&self.pg_pool)
-                .await
+    /// Pause ingestion cluster-wide at the emergency level, and audit the
+    /// transition once.
+    async fn auto_pause(&self, usage: f64) {
+        let reason = format!(
+            "Emergency disk pressure: ClickHouse disk {:.1}% used (threshold {:.0}%)",
+            usage * 100.0,
+            self.config.emergency_threshold * 100.0
+        );
+        match self
+            .ingestion_pause
+            .pause(IngestionPauseSource::DiskPressure, Some(&reason), None)
+            .await
         {
-            warn!("Failed to persist ingestion_paused={} to DB: {}", paused, e);
+            Ok((_, true)) => {
+                warn!("Ingestion PAUSED due to emergency disk pressure");
+                self.emit_pause_audit(crate::audit::INGESTION_PAUSED, usage, &reason)
+                    .await;
+            }
+            Ok((_, false)) => {}
+            Err(error) => error!(%error, "Failed to pause ingestion at emergency disk pressure"),
+        }
+    }
+
+    /// Lift an automatic pause (never a manual one), and audit the transition.
+    async fn auto_resume(&self, usage: f64, why: &str) {
+        match self.ingestion_pause.resume(true).await {
+            Ok((_, true)) => {
+                info!("Ingestion RESUMED — {why}");
+                self.emit_pause_audit(crate::audit::INGESTION_RESUMED, usage, why)
+                    .await;
+            }
+            Ok((_, false)) => {}
+            Err(error) => warn!(%error, "Failed to resume ingestion after disk pressure"),
+        }
+    }
+
+    async fn emit_pause_audit(&self, action: &str, usage: f64, reason: &str) {
+        let event = AuditEvent::builder(AuditSource::Storage, action)
+            .resource("ingestion", None, Some("ingestion".to_string()))
+            .success(true)
+            .details(serde_json::json!({
+                "source": IngestionPauseSource::DiskPressure.as_str(),
+                "reason": reason,
+                "usage_fraction": usage,
+                "emergency_threshold": self.config.emergency_threshold,
+            }))
+            .build();
+        if let Err(e) = self.audit_emitter.emit_durable(&event).await {
+            warn!("Failed to emit {action} audit event: {e}");
         }
     }
 

@@ -860,6 +860,7 @@ bootstrap_admin() {
     local api; api="http://127.0.0.1:$(env_get "$RUN_DIR/run.env" E2E_API_PORT)"
     E2E_API_URL="$api" E2E_ADMIN_EMAIL="admin@e2e.nano.local" \
     E2E_ADMIN_PASSWORD="$(env_get "$RUN_DIR/compose.env" NANO_ADMIN_PASSWORD)" \
+    E2E_SETUP_TOKEN="$(env_get "$RUN_DIR/compose.env" NANO_SETUP_TOKEN)" \
     E2E_OUT="$RUN_DIR/admin.env" \
         "$VENV/bin/python" -I -m nano_e2e.bootstrap \
         || die "admin bootstrap failed (see $RUN_DIR/pids/api.log)"
@@ -898,6 +899,8 @@ write_stack_env() {
             put NANOSIEM_VECTOR_METRICS_URL "http://127.0.0.1:$vmet/metrics"
             put NANOSIEM_API_KEY "$(env_get "$a" NANOSIEM_API_KEY)"
             put NANO_ADMIN_EMAIL "admin@e2e.nano.local"; put NANO_ADMIN_PASSWORD "$(env_get "$c" NANO_ADMIN_PASSWORD)"
+            # NAN-5237: first-run setup bearer (docker app mode; native has none).
+            put NANO_SETUP_TOKEN "$(env_get "$c" NANO_SETUP_TOKEN)"
             # First-run setup left to the scenarios (UI suite: in the browser).
             # The harness writes admin.env + the key back into this file after.
             put E2E_ADMIN_DEFERRED "$(env_get "$r" E2E_ADMIN_DEFERRED)"

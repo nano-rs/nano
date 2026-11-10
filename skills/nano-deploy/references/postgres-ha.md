@@ -1,6 +1,6 @@
 # PostgreSQL + Valkey failover (Compose role split)
 
-Since NAN-5214, two or three `postgres` hosts in the inventory turn on
+From nano 2.0.7, two or three `postgres` hosts in the inventory turn on
 automatic failover for PostgreSQL (Patroni + etcd) and, with two or more app
 hosts, for the shared Valkey (Sentinel). One `postgres` host renders exactly
 as before. The authority is the **Multi-node Self-run** guide, section
@@ -23,10 +23,11 @@ as before. The authority is the **Multi-node Self-run** guide, section
 
 ## What survives (tell the operator)
 
-- Loss of any one postgres host: PostgreSQL fails over with a write gap of
-  about 10-15 s (raise `cluster.postgres_ha.ttl` on slow networks to avoid
-  false failovers),
-  Valkey in about 10 s. Logins, rules, alerting and search continue; in-flight
+- Loss of any one postgres host: writes, sign-ins and searches pause about
+  a short pause, typically a few seconds and up to about 30 s, while a standby
+  is promoted. Raising
+  `cluster.postgres_ha.ttl` on a slow network avoids false failovers but makes
+  the pause longer. Valkey fails over in about 10 s. Logins, rules, alerting and search continue; in-flight
   requests during the window fail and are retried by the UI and agents.
 - Loss of two postgres hosts: etcd loses quorum and no automatic failover
   is possible. Treat it as an outage and escalate.
@@ -40,7 +41,12 @@ as before. The authority is the **Multi-node Self-run** guide, section
 2. Install the postgres hosts (any order, close together). The first postgres
    host in inventory order initialises; the others clone it.
 3. Check: `exec postgres-ha patronictl -c /run/patroni/patroni.yml list` shows
-   one `Leader`, one `Sync Standby`, one `Replica`, zero lag.
+   one `Leader`, one `Sync Standby`, one `Replica`, zero lag. One postgres host
+   records `NANO_PG_HA_SYSTEM_ID` in its `.env` and prints "The shared .env
+   changed": stream **that postgres host's** `.env` to every other host, the
+   first app host included ([multi-node-ha.md](multi-node-ha.md) Step 5, with
+   that host as the source), before any other installer run, and check the
+   digests match. From then on, the first app host's copy is current again.
 4. Keeper, ClickHouse, app and ingest hosts as in [multi-node-ha.md](multi-node-ha.md).
 
 ## Converting an existing single-postgres install
@@ -63,7 +69,10 @@ as before. The authority is the **Multi-node Self-run** guide, section
 | 2379, 2380 etcd | DCS hosts | the other DCS hosts and the postgres hosts |
 | 6379 Valkey, 26379 Sentinel | postgres / DCS hosts | each other and every app host |
 
-All are Docker-published: restrict them in `DOCKER-USER`.
+All are Docker-published, so UFW does not see them: restrict them in
+`DOCKER-USER` before the first install
+([multi-node-ha.md](multi-node-ha.md#firewall); `plan.py --firewall-script`
+prints the rules).
 
 ## Operations
 

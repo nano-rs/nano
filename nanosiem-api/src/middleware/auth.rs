@@ -43,6 +43,9 @@ const PUBLIC_ENDPOINTS: &[&str] = &[
     // NAN-4907: nginx auth_request for the OTLP edge. Authenticates the
     // sender's source-bound ingest token itself, without a user session.
     "/api/internal/otlp-auth",
+    // NAN-5217: the ingest edge's pause-admission auth_request. Its caller is
+    // an ingest sender; the answer is only "paused or not".
+    "/api/internal/ingest-admission",
     // NAN-5204: the nano-backup sidecar's status report. The handler gates on
     // its own NANO_BACKUP_STATUS_TOKEN bearer and 404s when none is set.
     "/api/internal/backup-status",
@@ -771,6 +774,8 @@ mod tests {
         assert!(!is_public_endpoint("/api/internal/other"));
         // NAN-5204: exact path only.
         assert!(is_public_endpoint("/api/internal/backup-status"));
+        assert!(is_public_endpoint("/api/internal/ingest-admission"));
+        assert!(!is_public_endpoint("/api/internal/ingest-admission/x"));
         assert!(!is_public_endpoint("/api/internal/backup-status/x"));
 
         assert!(!is_public_endpoint("/api/search"));

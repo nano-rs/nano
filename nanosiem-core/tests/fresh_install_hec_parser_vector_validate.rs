@@ -17,7 +17,7 @@
 //! helper the source-config undeploy calls. Needs docker:
 //!
 //! ```text
-//! NANOSIEM_TEST_VECTOR_IMAGE=ghcr.io/nano-rs/vector:0.61.0-nano.7-debian \
+//! NANOSIEM_TEST_VECTOR_IMAGE=ghcr.io/nano-rs/vector:0.61.0-nano.8-debian \
 //!   cargo test -p nanosiem-core --test fresh_install_hec_parser_vector_validate -- --ignored --test-threads=1
 //! ```
 

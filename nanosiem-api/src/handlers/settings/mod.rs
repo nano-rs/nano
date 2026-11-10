@@ -21,6 +21,7 @@ mod ai_providers;
 // NAN-3226: "Internal domains" (enterprise overlay migration 9000074).
 #[cfg(feature = "enterprise")]
 mod internal_domains;
+mod ingestion;
 mod operational;
 mod retention;
 mod risk;
@@ -32,6 +33,7 @@ mod webhooks;
 pub use ai_providers::*;
 #[cfg(feature = "enterprise")]
 pub use internal_domains::*;
+pub use ingestion::*;
 pub use operational::*;
 pub use retention::*;
 pub use risk::*;
@@ -86,6 +88,10 @@ impl utoipa::OpenApi for SettingsApiDoc {
                 internal_domains::get_internal_domains,
                 internal_domains::update_internal_domains,
                 retention::get_storage_overview,
+                ingestion::get_ingestion_pause,
+                ingestion::pause_ingestion,
+                ingestion::resume_ingestion,
+                ingestion::ingest_admission,
                 retention::get_clickhouse_storage_stats,
                 retention::update_clickhouse_retention,
                 retention::run_clickhouse_retention_now,
@@ -191,6 +197,10 @@ impl utoipa::OpenApi for SettingsApiDoc {
                     nanosiem_core::settings::SearchAdmissionConfig,
                     nanosiem_core::settings::SearchQueryLimitsConfig,
                     retention::DiskPressureStatusResponse,
+                    ingestion::IngestionPauseStatusResponse,
+                    ingestion::PauseIngestionRequest,
+                    nanosiem_core::settings::IngestionPauseSource,
+                    nanosiem_core::settings::IngestionGuardState,
                     tier::TierStatusResponse,
                     tier::TierUsageResponse,
                     tier::SetTierRequest,
@@ -246,6 +256,10 @@ impl utoipa::OpenApi for SettingsApiDoc {
                 risk::get_risk_config,
                 risk::update_risk_config,
                 retention::get_storage_overview,
+                ingestion::get_ingestion_pause,
+                ingestion::pause_ingestion,
+                ingestion::resume_ingestion,
+                ingestion::ingest_admission,
                 retention::get_clickhouse_storage_stats,
                 retention::update_clickhouse_retention,
                 retention::run_clickhouse_retention_now,
@@ -313,6 +327,10 @@ impl utoipa::OpenApi for SettingsApiDoc {
                     nanosiem_core::settings::SearchAdmissionConfig,
                     nanosiem_core::settings::SearchQueryLimitsConfig,
                     retention::DiskPressureStatusResponse,
+                    ingestion::IngestionPauseStatusResponse,
+                    ingestion::PauseIngestionRequest,
+                    nanosiem_core::settings::IngestionPauseSource,
+                    nanosiem_core::settings::IngestionGuardState,
                     tier::TierStatusResponse,
                     tier::TierUsageResponse,
                     tier::SetTierRequest,

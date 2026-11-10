@@ -85,6 +85,13 @@ For non-interactive installs, pre-set `NANO_ADMIN_EMAIL`,
 before piping. See [`.env.opensource.example`](./.env.opensource.example) for
 the full env-var surface.
 
+**Setup token.** Until the first admin exists, creating it needs the setup
+token that `install.sh` generates (`NANO_SETUP_TOKEN` in `~/nano/.env`). The
+installer uses it itself, so a normal install asks for nothing. If an install
+stops before the admin is created, re-run `./install.sh`, or open the web UI
+and enter the token on the setup page. An install that already has an admin
+never needs it.
+
 ### Deploy with your AI agent (nano Self-run)
 
 The [`nano-deploy`](skills/nano-deploy/SKILL.md) agent skill lets Claude Code,

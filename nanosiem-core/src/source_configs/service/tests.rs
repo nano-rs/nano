@@ -2665,7 +2665,7 @@ fn aws_sqs_client_concurrency_stays_top_level() {
 /// NAN-3604 end to end: the generated aws_s3 block (tuned and untuned) must
 /// pass `vector validate` on the pinned Vector image. Ignored by default (needs
 /// docker); run with
-/// `NANOSIEM_TEST_VECTOR_IMAGE=ghcr.io/nano-rs/vector:0.61.0-nano.7-debian
+/// `NANOSIEM_TEST_VECTOR_IMAGE=ghcr.io/nano-rs/vector:0.61.0-nano.8-debian
 ///  cargo test -p nanosiem-core --lib s3_generated_config_passes_vector_validate -- --ignored`.
 #[test]
 #[ignore = "requires docker and NANOSIEM_TEST_VECTOR_IMAGE (the pinned Vector image)"]
@@ -2718,7 +2718,7 @@ fn s3_generated_config_passes_vector_validate() {
 /// NAN-4935: the generated gcp_pubsub block (with a credentials_path, as for
 /// an authorized_user ADC credential) must pass `vector validate` on the
 /// pinned image. Ignored by default (needs docker); run with
-/// `NANOSIEM_TEST_VECTOR_IMAGE=ghcr.io/nano-rs/vector:0.61.0-nano.7-debian
+/// `NANOSIEM_TEST_VECTOR_IMAGE=ghcr.io/nano-rs/vector:0.61.0-nano.8-debian
 ///  cargo test -p nanosiem-core --lib gcp_generated_config_passes_vector_validate -- --ignored`.
 #[test]
 #[ignore = "requires docker and NANOSIEM_TEST_VECTOR_IMAGE (the pinned Vector image)"]

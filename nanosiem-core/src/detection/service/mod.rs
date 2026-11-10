@@ -17,6 +17,7 @@ mod analysis;
 #[cfg(test)]
 mod cooldown_tests;
 mod execution;
+mod provenance;
 pub(crate) mod helpers;
 mod retro_hunt;
 mod rules;

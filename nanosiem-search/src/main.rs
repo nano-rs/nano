@@ -139,6 +139,14 @@ async fn async_main() -> Result<()> {
             tracing::info!("REDIS_URL not set — JWT JTI denylist is per-pod (cross-pod logout revocation disabled)");
         }
 
+        // NAN-5243: merge PostgreSQL's logout revocations (the durable record)
+        // into the local denylist at boot and every few seconds, so a
+        // revocation the shared Valkey lost is still enforced here.
+        nanosiem_core::auth::token::spawn_revocation_sync(
+            dual_pool.postgres().clone(),
+            token_service.revoked_jtis_handle(),
+        );
+
         // Create API key service for validating X-API-Key headers
         let api_key_repo = ApiKeyRepository::new(dual_pool.postgres().clone());
         let rate_limit_repo = RateLimitRepository::new(dual_pool.postgres().clone());

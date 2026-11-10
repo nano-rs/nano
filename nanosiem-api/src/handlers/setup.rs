@@ -8,11 +8,20 @@
 //! - get_setup_status() - Check if system is initialized
 //! - initialize_system() - Create initial admin account
 
-use axum::{extract::State, http::StatusCode, Json};
+use std::net::SocketAddr;
+
+use axum::{
+    extract::{ConnectInfo, State},
+    http::{header, HeaderMap, StatusCode},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use nanosiem_core::auth::{builtin_groups, builtin_roles, config_keys, CreateUserRequest};
+use nanosiem_core::auth::first_admin::{
+    self, claim_first_admin, FirstAdminError, SetupRefusal, SetupToken,
+};
+use nanosiem_core::auth::{CreateUserRequest, UserRepositoryError};
 
 use crate::handlers::AuditExt;
 use crate::state::AppState;
@@ -27,6 +36,10 @@ pub struct SetupStatusResponse {
     pub initialized: bool,
     /// Whether any users exist in the system
     pub has_users: bool,
+    /// Whether `POST /api/setup/initialize` needs the installer's setup token
+    /// (`Authorization: Bearer <NANO_SETUP_TOKEN>`). Always false once the
+    /// system is initialized. The token itself is never returned.
+    pub setup_token_required: bool,
 }
 
 /// Setup error response
@@ -66,7 +79,7 @@ pub async fn get_setup_status(
     State(state): State<AppState>,
 ) -> Result<Json<SetupStatusResponse>, (StatusCode, Json<SetupError>)> {
     // Check if system_initialized flag is set
-    let initialized = check_system_initialized(&state).await.map_err(|e| {
+    let initialized = first_admin::is_system_initialized(&state.pool).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(SetupError::new("database_error", &e.to_string())),
@@ -84,6 +97,7 @@ pub async fn get_setup_status(
     Ok(Json(SetupStatusResponse {
         initialized,
         has_users,
+        setup_token_required: !initialized && SetupToken::from_env().is_configured(),
     }))
 }
 
@@ -123,50 +137,38 @@ pub struct InitializeSystemResponse {
     responses(
         (status = 200, description = "System initialized successfully", body = InitializeSystemResponse),
         (status = 400, description = "Validation error", body = SetupError),
+        (status = 401, description = "Setup token required: send Authorization: Bearer <NANO_SETUP_TOKEN>", body = SetupError),
+        (status = 403, description = "Wrong setup token, or no setup token is configured and the caller is not on the API host", body = SetupError),
         (status = 409, description = "System already initialized or users exist", body = SetupError),
         (status = 500, description = "Database error", body = SetupError),
     ),
-    security(())
+    security(("bearer_auth" = []))
 )]
 pub async fn initialize_system(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<InitializeSystemRequest>,
 ) -> Result<Json<InitializeSystemResponse>, (StatusCode, Json<SetupError>)> {
-    // Check if system is already initialized
-    let initialized = check_system_initialized(&state).await.map_err(|e| {
+    // An initialized system answers 409 to everyone, token or not: setup is
+    // over, and `GET /api/setup/status` already says so publicly. The
+    // authoritative re-check happens inside the claim transaction.
+    let initialized = first_admin::is_system_initialized(&state.pool).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(SetupError::new("database_error", &e.to_string())),
         )
     })?;
-
     if initialized {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(SetupError::new(
-                "already_initialized",
-                "System has already been initialized. Setup is not available.",
-            )),
-        ));
+        return Err(already_initialized());
     }
 
-    // Check if any users already exist
-    let has_users = state.user_repo.has_users().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(SetupError::new("database_error", &e.to_string())),
-        )
-    })?;
-
-    if has_users {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(SetupError::new(
-                "users_exist",
-                "Users already exist in the system. Cannot run setup.",
-            )),
-        ));
-    }
+    // NAN-5237: only the installer (setup token) or, with no token
+    // configured, a caller on the API host itself may create the first Admin.
+    let admitted_by = match authorize_setup(&SetupToken::from_env(), &headers, peer)? {
+        first_admin::SetupAdmission::Token => "setup_token",
+        first_admin::SetupAdmission::Loopback => "loopback",
+    };
 
     // Validate the request
     if request.email.is_empty() {
@@ -202,66 +204,36 @@ pub async fn initialize_system(
         group_ids: vec![], // Will be added to Everyone group automatically
     };
 
-    let user = state
-        .user_repo
-        .create_user(&create_request)
+    let user = claim_first_admin(&state.pool, &create_request)
         .await
         .map_err(|e| {
             let (status, error_type, message) = match &e {
-                nanosiem_core::auth::UserRepositoryError::EmailExists(_) => {
+                FirstAdminError::AlreadyInitialized => return already_initialized(),
+                FirstAdminError::UsersExist => (
+                    StatusCode::CONFLICT,
+                    "users_exist",
+                    "Users already exist in the system. Cannot run setup.",
+                ),
+                FirstAdminError::User(UserRepositoryError::EmailExists(_)) => {
                     (StatusCode::CONFLICT, "email_exists", "Email already exists")
                 }
-                nanosiem_core::auth::UserRepositoryError::PasswordRequirementsNotMet(msg) => {
+                FirstAdminError::User(UserRepositoryError::PasswordRequirementsNotMet(msg)) => {
                     (StatusCode::BAD_REQUEST, "password_requirements", msg.as_str())
                 }
-                nanosiem_core::auth::UserRepositoryError::PasswordHashError(msg) => {
+                FirstAdminError::User(UserRepositoryError::PasswordHashError(msg)) => {
                     (StatusCode::BAD_REQUEST, "password_error", msg.as_str())
                 }
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "database_error",
-                    "Failed to create user",
-                ),
+                _ => {
+                    tracing::error!(error = %e, "first-admin setup failed");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "database_error",
+                        "Failed to initialize the system",
+                    )
+                }
             };
             (status, Json(SetupError::new(error_type, message)))
         })?;
-
-    // Create an "Admins" group and assign the Admin role to it
-    let admins_group_id = create_admins_group(&state).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(SetupError::new(
-                "database_error",
-                &format!("Failed to create Admins group: {}", e),
-            )),
-        )
-    })?;
-
-    // Add the user to the Admins group
-    state
-        .user_repo
-        .set_user_groups(user.id, &[admins_group_id, builtin_groups::EVERYONE_ID])
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(SetupError::new(
-                    "database_error",
-                    &format!("Failed to add user to Admins group: {}", e),
-                )),
-            )
-        })?;
-
-    // Mark system as initialized
-    set_system_initialized(&state).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(SetupError::new(
-                "database_error",
-                &format!("Failed to mark system as initialized: {}", e),
-            )),
-        )
-    })?;
 
     // Log the setup completion to the ClickHouse audit store (system-of-record).
     state.emit_audit(
@@ -270,6 +242,7 @@ pub async fn initialize_system(
             .resource("system", None, None)
             .details(serde_json::json!({
                 "admin_email": request.email,
+                "admitted_by": admitted_by,
             }))
             .build(),
     );
@@ -305,71 +278,86 @@ pub async fn initialize_system(
     }))
 }
 
-/// Check if the system has been initialized
-async fn check_system_initialized(state: &AppState) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query_scalar::<_, serde_json::Value>(
-        "SELECT value FROM system_config WHERE key = $1",
+fn already_initialized() -> (StatusCode, Json<SetupError>) {
+    (
+        StatusCode::CONFLICT,
+        Json(SetupError::new(
+            "already_initialized",
+            "System has already been initialized. Setup is not available.",
+        )),
     )
-    .bind(config_keys::SYSTEM_INITIALIZED)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    match result {
-        Some(value) => Ok(value.as_bool().unwrap_or(false)),
-        None => Ok(false),
-    }
 }
 
-/// Mark the system as initialized
-async fn set_system_initialized(state: &AppState) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO system_config (key, value, updated_at)
-        VALUES ($1, $2, NOW())
-        ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()
-        "#,
-    )
-    .bind(config_keys::SYSTEM_INITIALIZED)
-    .bind(serde_json::json!(true))
-    .execute(&state.pool)
-    .await?;
-
-    Ok(())
+/// Headers a reverse proxy adds to say who the real client is. Any of them
+/// means the request did not come straight from a process on this host.
+fn is_forwarding_header(name: &str) -> bool {
+    matches!(
+        name,
+        "forwarded"
+            | "x-real-ip"
+            | "true-client-ip"
+            | "cf-connecting-ip"
+            | "x-client-ip"
+            | "x-cluster-client-ip"
+            | "fastly-client-ip"
+    ) || name.starts_with("x-forwarded-")
 }
 
-/// Create the Admins group with Admin role
-async fn create_admins_group(state: &AppState) -> Result<Uuid, sqlx::Error> {
-    // Check if Admins group already exists
-    let existing = sqlx::query_scalar::<_, Uuid>("SELECT id FROM groups WHERE name = 'Admins'")
-        .fetch_optional(&state.pool)
-        .await?;
-
-    if let Some(id) = existing {
-        return Ok(id);
-    }
-
-    // Create the Admins group
-    let group_id = sqlx::query_scalar::<_, Uuid>(
-        r#"
-        INSERT INTO groups (name, description, is_system)
-        VALUES ('Admins', 'System administrators with full access', FALSE)
-        RETURNING id
-        "#,
-    )
-    .fetch_one(&state.pool)
-    .await?;
-
-    // Assign the Admin role to the Admins group
-    sqlx::query(
-        "INSERT INTO group_roles (group_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-    )
-    .bind(group_id)
-    .bind(builtin_roles::ADMIN_ID)
-    .execute(&state.pool)
-    .await?;
-
-    Ok(group_id)
+/// NAN-5237 admission for first-admin setup; see
+/// [`nanosiem_core::auth::first_admin`] for the rule. The token is never
+/// logged or echoed.
+pub(crate) fn authorize_setup(
+    token: &SetupToken,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Result<first_admin::SetupAdmission, (StatusCode, Json<SetupError>)> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let authorization = match (values.next(), values.next()) {
+        (Some(v), None) => v.to_str().ok(),
+        _ => None,
+    };
+    let forwarded = headers.keys().any(|name| is_forwarding_header(name.as_str()));
+    token
+        .admit(authorization, Some(peer.ip()), forwarded)
+        .map_err(|refusal| {
+            tracing::warn!(
+                peer = %peer.ip(),
+                refusal = ?refusal,
+                "refused first-admin setup request"
+            );
+            match refusal {
+                SetupRefusal::TokenMissing => (
+                    StatusCode::UNAUTHORIZED,
+                    Json(SetupError::new(
+                        "setup_token_required",
+                        "Setup token required. The installer prints it; it is also NANO_SETUP_TOKEN in the install directory's .env (Helm: the chart's secret).",
+                    )),
+                ),
+                SetupRefusal::TokenInvalid => (
+                    StatusCode::FORBIDDEN,
+                    Json(SetupError::new("invalid_setup_token", "The setup token is not correct.")),
+                ),
+                SetupRefusal::TokenPlaceholder => (
+                    StatusCode::FORBIDDEN,
+                    Json(SetupError::new(
+                        "setup_token_placeholder",
+                        "NANO_SETUP_TOKEN is still a placeholder. Set it to a generated value (openssl rand -hex 32) and restart nano-api.",
+                    )),
+                ),
+                SetupRefusal::NotLocal => (
+                    StatusCode::FORBIDDEN,
+                    Json(SetupError::new(
+                        "setup_not_local",
+                        "No setup token is configured, so setup is accepted only from the API host itself. Set NANO_SETUP_TOKEN for nano-api, or re-run the installer.",
+                    )),
+                ),
+            }
+        })
 }
+
+#[cfg(test)]
+#[path = "setup_tests.rs"]
+mod tests;
 
 #[derive(utoipa::OpenApi)]
 #[openapi(

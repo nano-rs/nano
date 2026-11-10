@@ -47,6 +47,20 @@ drop_on_abort = true
 drop_on_error = true
 reroute_dropped = true
 source = '''
+# NAN-5233: this lane writes identity / IP-context enrichment that applies to
+# every search, so it accepts only a multiplex credential (route `*`: the
+# platform credential nano-api / nano-jobs hold, or the install token in
+# legacy multiplex mode). The fork stamps a listed token's route as
+# `%nano_credential_name` (event metadata: a sender cannot set it); a token
+# bound to a log source carries that source's route key and is refused here.
+# No credential stamp means the static `auth` above accepted the request (the
+# explicit NANO_INGEST_STATIC_FALLBACK / unauthenticated opt-ins only).
+nano_credential_id = to_string(%nano_credential_id) ?? ""
+if nano_credential_id != "" && (to_string(%nano_credential_name) ?? "") != "*" {
+    log("Refusing a push-enrichment record: its ingest token is bound to a log source, and this lane accepts only the platform credential", level: "warn")
+    abort
+}
+
 raw = to_string(.message) ?? ""
 parsed, err = parse_json(raw)
 if err != null || !is_object(parsed) {

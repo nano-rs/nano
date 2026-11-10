@@ -380,6 +380,21 @@ impl PgFeedStore {
 
 #[async_trait::async_trait]
 impl FeedStore for PgFeedStore {
+    async fn ingestion_paused(&self) -> bool {
+        match sqlx::query_scalar::<_, bool>(
+            "SELECT ingestion_paused FROM public.system_settings WHERE id = 'default'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(paused) => paused.unwrap_or(false),
+            Err(error) => {
+                tracing::warn!(%error, "connector runner: ingestion pause state unreadable; not pausing");
+                false
+            }
+        }
+    }
+
     async fn claim_due(
         &self,
         node: &str,

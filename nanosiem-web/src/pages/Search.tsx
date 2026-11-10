@@ -4,7 +4,7 @@ import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { SearchFooterProvider, PHASE2_REPORTING_MODES, type Phase2Status } from '@/components/search/footer-reporter';
 import { LiveRunProvider } from '@/components/search/live-run-context';
 import { useQueryClient, useQuery } from '@tanstack/react-query';
-import { Link as RouterLink, useNavigate } from 'react-router-dom';
+import { Link as RouterLink, useLocation, useNavigate } from 'react-router-dom';
 // #7041: hunt queries live in the URL fragment, never the request URL.
 import { useSearchFragmentParams } from '@/hooks/use-search-fragment-params';
 import { searchQueryForUrl } from '@/lib/search-query-url';
@@ -19,6 +19,7 @@ import { formatTimelineLabel, parseUTCTimestamp } from '@/lib/date-utils';
 import { cn, injectBeforeFirstPipe, isClickHouseDefault, stripComments } from '@/lib/utils';
 import { searchTimingBreakdown, type SearchTimingBreakdown } from '@/lib/search-timing';
 import { safeRandomUUID } from '@/lib/uuid';
+import { consumeSearchAutoRun, isOutsideArrival, isSearchAutoRunGranted, rememberTabSearch, tabAlreadyRan } from '@/lib/search-auto-run';
 import {
   Search as SearchIcon,
   ChevronDown,
@@ -389,7 +390,29 @@ export function Search() {
   const urlQuery = searchParams.get('q') || '';
   const urlMode = (searchParams.get('mode') as 'piped' | 'sql' | 'natural') || 'piped';
   const urlShortId = searchParams.get('s') || '';
-  const urlAutoRun = searchParams.get('run') === 'true';
+  // NAN-5235: `run` only auto-runs with a live in-app grant for this exact
+  // query (see lib/search-auto-run). Anything else loads the query and asks.
+  const urlRunToken = searchParams.get('run');
+  const urlAutoRun = useMemo(
+    () => isSearchAutoRunGranted(urlRunToken, urlQuery),
+    [urlRunToken, urlQuery],
+  );
+  const urlRunUngranted = !!urlRunToken && !!urlQuery && !urlAutoRun;
+  // NAN-5235: the first history entry of this document (key "default") is an
+  // arrival from outside the app: a link, a bookmark, a typed URL. In-app
+  // navigations carry their own key, which survives a reload in
+  // history.state and which another site cannot set. The return to the
+  // original URL after sign-in is marked as an outside arrival too. Read once.
+  const routerLocation = useLocation();
+  const routerLocationRef = useRef(routerLocation);
+  routerLocationRef.current = routerLocation;
+  const arrivedFromOutsideRef = useRef(isOutsideArrival(routerLocation));
+  const mayRunUrlQueryOnArrival = (q: string) => !arrivedFromOutsideRef.current || tabAlreadyRan(q);
+  // The same rule for a URL change after mount (back/forward, or a fragment
+  // navigation another window performed): only an entry this app created in
+  // its own history may run its query; anything else loads and asks.
+  const mayRunUrlQueryAt = (location: { key: string; state: unknown }, q: string) =>
+    !isOutsideArrival(location) || tabAlreadyRan(q);
   const urlJobId = searchParams.get('job_id') || '';
   const urlAiMode = searchParams.get('ai') === 'true'; // Enable AI refinement mode
   const urlPrevalence = searchParams.get('prevalence') ? parseInt(searchParams.get('prevalence')!, 10) : 100;
@@ -429,6 +452,8 @@ export function Search() {
   const [queryReviewSuggestions, setQueryReviewSuggestions] = useState<import('@/lib/api/types').ReviewQuerySuggestion[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
+  // NAN-5235: a linked query is loaded but waits for an explicit Run.
+  const [linkedRunPending, setLinkedRunPending] = useState(false);
   const [isAggregateQuery, setIsAggregateQuery] = useState(false);
   const [displayType, setDisplayType] = useState<import('@/lib/api/types').DisplayType | undefined>(undefined);
   const [columnOrder, setColumnOrder] = useState<string[] | undefined>(undefined);
@@ -1918,6 +1943,9 @@ export function Search() {
       setSearchError({ code: 'EMPTY_QUERY', message: 'Please enter a search query' });
       return;
     }
+    // NAN-5235: this tab ran it, so a reload or back-navigation may re-run it.
+    rememberTabSearch(currentQuery);
+    setLinkedRunPending(false);
 
     // NAN-173: Block SQL execution without permission
     if (currentMode === 'sql' && !canSql) {
@@ -2838,6 +2866,12 @@ export function Search() {
         : shared.time_range_preset
           ? { type: 'preset', preset: shared.time_range_preset }
           : { type: 'preset', preset: 'Last hour' };
+      // NAN-5235: a shared link opened from outside the app loads the search
+      // and waits for Run, like any other outside link.
+      if (!mayRunUrlQueryAt(routerLocationRef.current, shared.query)) {
+        setLinkedRunPending(true);
+        return;
+      }
       setTimeout(() => handleSearch(1, false, shared.query, shared.query_mode as 'piped' | 'sql', loadedTimeRange, true), 100);
     } catch (err) {
       setSearchError(handleError(err, 'Failed to load shared search'));
@@ -3621,6 +3655,7 @@ export function Search() {
     // Only auto-run if the run param is set and we have a query that hasn't been auto-run yet
     if (urlAutoRun && urlQuery && lastAutoRunQueryRef.current !== urlQuery) {
       lastAutoRunQueryRef.current = urlQuery;
+      consumeSearchAutoRun(urlRunToken);
       setFieldsPanelVisible(true);
 
       // Enable AI mode if coming from notebook AI suggestion
@@ -3653,6 +3688,19 @@ export function Search() {
       return () => clearTimeout(timer);
     }
   }, [urlAutoRun, urlQuery, urlAiMode]);
+
+  // NAN-5235: a `run` param without a grant (an external link, a bookmark, a
+  // legacy `run=true`) never forces a run. Drop it from the URL; the
+  // passive-load effect below decides, and prompts on an outside arrival.
+  useEffect(() => {
+    if (!urlRunUngranted) return;
+    if (!mayRunUrlQueryOnArrival(urlQuery)) setLinkedRunPending(true);
+    const params = new URLSearchParams(searchParams);
+    params.delete('run');
+    params.delete('ai');
+    prevUrlRef.current = params.toString();
+    setSearchParams(params, { replace: true });
+  }, [urlRunUngranted]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Load results from a completed async job (e.g. from ActiveSearchesPanel or notification link)
   const lastJobIdRef = useRef<string | null>(null);
@@ -3759,6 +3807,13 @@ export function Search() {
           // No cached explanation - that's fine, just run the search
         });
       
+      // NAN-5235: a URL query runs on arrival only from an in-app navigation
+      // or if this tab already ran it (reload, back/forward). A link from
+      // outside the app loads the query and asks for an explicit Run.
+      if (!mayRunUrlQueryOnArrival(urlQuery)) {
+        setLinkedRunPending(true);
+        return;
+      }
       const timer = setTimeout(() => handleSearch(1, false, urlQuery, queryMode, timeRange, true), 100); // NAN-1602: URL-driven (passive) load → use cache + badge
       return () => clearTimeout(timer);
     }
@@ -3831,8 +3886,21 @@ export function Search() {
       // Also update the prevTimeRangeRef to prevent the timeRange effect from triggering
       prevTimeRangeRef.current = historyTimeRange;
       
-      // If there's a query in the URL, check cache first, then fall back to search
-      if (currentUrlQuery.trim() && currentUrlMode !== 'natural') {
+      // NAN-5235: a history entry this app did not create (a fragment
+      // navigation another window performed on this tab) loads its query
+      // and waits for Run; it never executes on its own.
+      const urlChangeMayRun = mayRunUrlQueryAt(routerLocation, currentUrlQuery);
+      if (currentUrlQuery.trim() && currentUrlMode !== 'natural' && !urlChangeMayRun) {
+        setSearchResults([]);
+        setHistogramData([]);
+        setServerFieldStats(null);
+        setHasSearched(false);
+        setLinkedRunPending(true);
+        setTimeout(() => {
+          isRestoringFromHistory.current = false;
+        }, 50);
+      } else if (currentUrlQuery.trim() && currentUrlMode !== 'natural') {
+        // If there's a query in the URL, check cache first, then fall back to search
         const cacheKey = buildCacheKey(currentUrlQuery, historyTimeRange, normalizedMode, urlDataset);
         // NAN-3884: a relative range in the URL (`time=Last 7 days`) means
         // "re-resolve against now", so back-nav re-runs it, as it did when
@@ -4366,6 +4434,25 @@ export function Search() {
                   </DropdownMenuContent>
                 </DropdownMenu>
               </div>
+            )}
+            {linkedRunPending && query?.trim() && (
+              <span
+                role="status"
+                data-testid="linked-query-run-prompt"
+                className="inline-flex items-center gap-1.5 font-mono text-[10.5px] text-muted-foreground whitespace-nowrap shrink-0"
+              >
+                linked query · review, then
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLinkedRunPending(false);
+                    handleSearch(1, false, query, queryMode, timeRange);
+                  }}
+                  className="px-1.5 py-0.5 rounded border border-border text-foreground hover:bg-foreground/[0.04]"
+                >
+                  Run
+                </button>
+              </span>
             )}
             {!tailActive && tailStoppedForRange && hasSearched && query?.trim() && (
               <span

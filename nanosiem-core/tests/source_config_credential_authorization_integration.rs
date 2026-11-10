@@ -162,6 +162,7 @@ async fn credential_bearing_mutations_and_deployments_fail_closed() {
                 ..Default::default()
             },
             denied,
+            true,
         )
         .await
         .expect_err("saved credential must protect otherwise credentialless updates");

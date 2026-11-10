@@ -387,6 +387,13 @@ pub fn create_router(state: AppState) -> Router {
             "/api/internal/otlp-auth",
             get(handlers::ingest_tokens::authenticate_otlp),
         )
+        // NAN-5217: nginx auth_request for every ingest location (pause
+        // admission). Exempt from user-session auth (PUBLIC_ENDPOINTS); it
+        // reveals only whether ingestion is paused.
+        .route(
+            "/api/internal/ingest-admission",
+            get(handlers::ingest_admission),
+        )
         // NAN-5204: the nano-backup sidecar's status report. Exempt from
         // user-session auth (PUBLIC_ENDPOINTS), the IP allowlist and the
         // backup mutation fence; the handler enforces the
@@ -1499,6 +1506,15 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/settings/storage/overview",
             get(handlers::get_storage_overview),
+        )
+        // NAN-5217: cluster-wide ingestion pause (manual + disk pressure).
+        .route(
+            "/api/settings/ingestion/pause",
+            get(handlers::get_ingestion_pause).post(handlers::pause_ingestion),
+        )
+        .route(
+            "/api/settings/ingestion/resume",
+            post(handlers::resume_ingestion),
         )
         // ClickHouse storage settings
         .route(

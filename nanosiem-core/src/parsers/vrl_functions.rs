@@ -98,7 +98,7 @@ pub const PARSER_EXCLUDED_VRL_FUNCTIONS: &[&str] = &[
 pub const ENRICHMENT_EXTRA_VRL_FUNCTIONS: &[&str] = &["log"];
 
 /// Which registry a program compiles against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum VrlRegistry {
     /// Event parsers (log sources, extensions, AI drafts, source-config remaps).
     #[default]

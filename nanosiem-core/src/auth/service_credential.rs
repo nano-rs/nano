@@ -131,7 +131,8 @@ impl ServiceCredential {
     }
 }
 
-fn is_loopback(ip: IpAddr) -> bool {
+/// Loopback peer, including an IPv4-mapped loopback on a dual-stack socket.
+pub fn is_loopback(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback(),
         // `::ffff:127.0.0.1` from a dual-stack socket is still loopback.
@@ -141,7 +142,8 @@ fn is_loopback(ip: IpAddr) -> bool {
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// Constant-time byte comparison (length is not treated as secret).
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

@@ -15,6 +15,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Search } from './Search';
 import { EditorView } from '@codemirror/view';
 import userEvent from '@testing-library/user-event';
+import { grantSearchAutoRun } from '@/lib/search-auto-run';
 
 const mocks = vi.hoisted(() => ({
   stream: vi.fn(), async: vi.fn(), fields: vi.fn(), legacy: vi.fn(),
@@ -134,7 +135,7 @@ it('an explicit Enter after a passive URL load runs live (bypassing the cache)',
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const { container } = render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={['/search?q=source_type%3D%22okta%22&run=true']}><Search /></MemoryRouter>
+      <MemoryRouter initialEntries={[`/search?q=source_type%3D%22okta%22&run=${grantSearchAutoRun('source_type="okta"')}`]}><Search /></MemoryRouter>
     </QueryClientProvider>,
   );
   await waitFor(() => expect(searches()).toBe(1));

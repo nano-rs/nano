@@ -3,7 +3,7 @@
 // Open-core dashboard intake. Replaces the AI-driven HeroIntake when melod
 // isn't available. Takes a raw IOC (IP, domain, hash, user, URL) or free-text
 // search term, classifies it, builds the appropriate nPL query, and lands the
-// user on /search with run=true so the result executes immediately.
+// user on /search with a run grant so the result executes immediately.
 //
 // The point isn't to be clever — analysts already know how to write
 // `src_ip="..." OR dest_ip="..."`. The point is "paste-and-pivot" speed for
@@ -17,6 +17,7 @@ import { buildFieldFilter, type SchemaProfileId, type SemanticField } from '@/li
 import { useSchemaFieldMap } from '@/hooks/useSchemaFieldMap';
 import { isInternalName } from '@/lib/internal-domains';
 import { useInternalDomains } from '@/hooks/use-internal-domains';
+import { withSearchAutoRun } from '@/lib/search-auto-run';
 
 export type IocKind = 'ipv4' | 'ipv6' | 'sha256' | 'sha1' | 'md5' | 'email' | 'url' | 'domain' | 'host' | 'text';
 
@@ -105,7 +106,7 @@ export function QuickPivotIntake() {
 
   const run = guard(() => {
     const q = buildQuery(kind, trimmed, profile);
-    navigate(`/search#q=${encodeURIComponent(q)}&run=true`);
+    navigate(withSearchAutoRun(`/search#q=${encodeURIComponent(q)}`));
   });
   const submit = () => {
     if (!trimmed) return;
